@@ -1,0 +1,26 @@
+[package]
+build = "build.rs"
+name = "sark-client"
+version.workspace = true
+edition.workspace = true
+description = "Simple Asynchronous Rust webKit - Client"
+authors.workspace = true
+repository.workspace = true
+license.workspace = true
+
+[features]
+default = []
+
+[dependencies]
+sark-core.workspace = true
+dope.workspace = true
+o3.workspace = true
+cartel-core = "0.1"
+http = "1.4.0"
+flate2 = "1"
+
+[dev-dependencies]
+dope-gen.workspace = true
+dope-extra.workspace = true
+pin-project.workspace = true
+

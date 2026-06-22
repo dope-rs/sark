@@ -1,0 +1,23 @@
+[package]
+name = "sark-grpc"
+version.workspace = true
+edition.workspace = true
+description = "gRPC protocol layer for the sark/dope stack"
+authors.workspace = true
+repository.workspace = true
+license.workspace = true
+
+[dependencies]
+shin = "0.1.0"
+sark-core.workspace = true
+sark-h2.workspace = true
+dope.workspace = true
+dope-extra.workspace = true
+dope-gen.workspace = true
+dope-tls.workspace = true
+prost.workspace = true
+pin-project.workspace = true
+
+[dev-dependencies]
+o3.workspace = true
+

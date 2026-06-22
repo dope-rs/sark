@@ -1,0 +1,44 @@
+[workspace]
+resolver = "2"
+members = [
+    "client",
+    "core",
+    "gen",
+    "grpc",
+    "grpc-build",
+    "h2",
+    "h3",
+    "json",
+    "sark",
+    "ws",
+]
+
+[workspace.package]
+edition = "2024"
+version = "0.2.0"
+description = "the L7 layer for dope"
+repository = "https://github.com/dope-rs/sark"
+license = "MIT"
+authors = ["inq <gofiri@gmail.com>"]
+
+[workspace.dependencies]
+dope = "0.3"
+dope-extra = "0.3"
+dope-gen = "0.3"
+dope-tls = "0.3"
+o3 = "0.1.0"
+pin-project = "1"
+prost = "0.14.3"
+prost-build = "0.14.3"
+sark-core = { path = "core", version = "0.2.0" }
+sark-gen = { path = "gen", version = "0.2.0" }
+sark-h2 = { path = "h2", version = "0.2.0" }
+sark-json = { path = "json", version = "0.2.0" }
+sark-ws = { path = "ws", version = "0.2.0" }
+sark = { path = "sark", version = "0.2.0" }
+
+[profile.release]
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+debug = "line-tables-only"

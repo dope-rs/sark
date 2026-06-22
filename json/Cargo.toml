@@ -1,0 +1,14 @@
+[package]
+name = "sark-json"
+version.workspace = true
+edition.workspace = true
+description.workspace = true
+repository.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+o3.workspace = true
+http = "1.4.0"
+sark-core.workspace = true
+

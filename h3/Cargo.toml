@@ -1,0 +1,21 @@
+[package]
+name = "sark-h3"
+version.workspace = true
+edition.workspace = true
+description = "HTTP/3 protocol primitives for sark stack"
+authors.workspace = true
+repository.workspace = true
+license.workspace = true
+
+[dependencies]
+sark-core.workspace = true
+sark.workspace = true
+dope-quic = "0.1"
+
+[dev-dependencies]
+sark-gen.workspace = true
+dope.workspace = true
+http = "1.4.0"
+ring = "0.17"
+shin = "0.1.0"
+
