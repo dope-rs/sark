@@ -1,0 +1,33 @@
+[package]
+name = "sark"
+version.workspace = true
+edition.workspace = true
+description = "Simple Asynchronous Rust webKit - Server"
+authors.workspace = true
+repository.workspace = true
+license.workspace = true
+
+[features]
+default = []
+
+[dependencies]
+sark-core.workspace = true
+sark-gen.workspace = true
+sark-json.workspace = true
+dope.workspace = true
+dope-extra.workspace = true
+dope-gen.workspace = true
+o3.workspace = true
+dope-tls.workspace = true
+shin = "0.1.0"
+http = "1.4.0"
+httparse = "1.10.1"
+memchr = "2.7"
+pin-project.workspace = true
+
+[dev-dependencies]
+cartel-redis = "0.1"
+cartel-pg = "0.1"
+cartel-gen = "0.1"
+sark-ws.workspace = true
+

@@ -1,0 +1,206 @@
+use proc_macro2::TokenStream;
+use quote::{format_ident, quote};
+use syn::{Error, Ident, LitStr, Result, Type};
+
+use crate::codegen::value::Value;
+use crate::model::PathAttrField;
+use crate::util::{TypeExt, ValueKind};
+
+pub(super) struct Params<'a> {
+    pub(super) vis: &'a syn::Visibility,
+    pub(super) ident: &'a Ident,
+    pub(super) inner_ident: &'a Ident,
+    pub(super) raw_ident: &'a Ident,
+    pub(super) fields: &'a [PathAttrField],
+}
+
+impl<'a> Params<'a> {
+    pub(super) fn build(self) -> Result<TokenStream> {
+        let Self {
+            vis,
+            ident,
+            inner_ident,
+            raw_ident,
+            fields,
+        } = self;
+        if fields.is_empty() {
+            return Ok(quote! {
+                #[allow(non_camel_case_types, dead_code)]
+                #vis type #inner_ident<'req> = sark::service::EmptyParamsInner<'req>;
+                #[allow(non_camel_case_types, dead_code)]
+                #vis type #ident = #inner_ident<'static>;
+                #[allow(non_camel_case_types, dead_code)]
+                #vis type #raw_ident = sark::service::EmptyParamsRaw;
+            });
+        }
+        let field_ident: Vec<&Ident> = fields.iter().map(|f| &f.ident).collect();
+        let path_ident: Vec<Ident> = fields
+            .iter()
+            .map(|f| format_ident!("{}", f.path.value()))
+            .collect();
+        let field_ty_ref: Vec<Type> = fields
+            .iter()
+            .map(|f| {
+                let mut ty = f.ty.clone();
+                ty.rewrite_local_to_ref();
+                ty
+            })
+            .collect();
+        let raw_field_ty: Vec<TokenStream> = fields
+            .iter()
+            .map(|f| match f.ty.value_kind()? {
+                ValueKind::Local => Ok(quote! { Option<std::ops::Range<usize>> }),
+                _ if f.ty.value_optional() => {
+                    let ty = &f.ty;
+                    Ok(quote! { #ty })
+                }
+                _ => {
+                    let ty = &f.ty;
+                    Ok(quote! { Option<#ty> })
+                }
+            })
+            .collect::<Result<_>>()?;
+        let build_field_exprs: Vec<_> = fields
+            .iter()
+            .zip(path_ident.iter())
+            .map(|(f, raw)| Self::path_field_expr(&f.ident, raw, &f.ty, f.default.as_ref()))
+            .collect::<Result<_>>()?;
+        let capture_binds: Vec<Ident> = (0..fields.len())
+            .map(|idx| format_ident!("cap{}", idx))
+            .collect();
+        let capture_ty: Vec<TokenStream> = capture_binds
+            .iter()
+            .map(|_| quote!(sark::service::PathCapture))
+            .collect();
+        let raw_capture_inits: Vec<TokenStream> = fields
+            .iter()
+            .zip(path_ident.iter())
+            .zip(capture_binds.iter())
+            .map(|((f, raw), cap)| {
+                let value = match f.ty.value_kind()? {
+                    ValueKind::Local | ValueKind::Range => {
+                        quote! { Some(#cap.start..#cap.end) }
+                    }
+                    _ => {
+                        let inner = f.ty.value_inner();
+                        quote! {
+                            Some(<#inner as sark::service::FieldValue>::parse_path(
+                                path, #cap.start, #cap.end,
+                            )?)
+                        }
+                    }
+                };
+                Ok(quote! { #raw: #value, })
+            })
+            .collect::<Result<_>>()?;
+        Ok(quote! {
+            #[allow(non_camel_case_types)]
+            #vis struct #inner_ident<'req> {
+                #( pub #field_ident: #field_ty_ref, )*
+                #[doc(hidden)]
+                pub __sark_m: ::core::marker::PhantomData<&'req ()>,
+            }
+
+            #[allow(non_camel_case_types, dead_code)]
+            #vis type #ident = #inner_ident<'static>;
+
+            #[allow(non_camel_case_types)]
+            #[derive(Default)]
+            #vis struct #raw_ident { #( pub #path_ident: #raw_field_ty, )* }
+
+            impl sark::service::RouteParams for #raw_ident {
+                type Raw = Self;
+                type Captures = ( #( #capture_ty, )* );
+
+                fn from_raw(_req: &sark::Request, raw: Self::Raw) -> Option<Self> {
+                    Some(raw)
+                }
+
+                fn from_captures<P: sark::service::PathProbe>(
+                    path: &P,
+                    captures: Self::Captures,
+                ) -> Option<Self> {
+                    let _ = path;
+                    let ( #( #capture_binds, )* ) = captures;
+                    Some(Self { #( #raw_capture_inits )* })
+                }
+            }
+
+            impl<'req> sark::service::RouteParams for #inner_ident<'req> {
+                type Raw = #raw_ident;
+                type Captures =
+                    <#raw_ident as sark::service::RouteParams>::Captures;
+
+                fn from_raw(
+                    req: &sark::Request,
+                    raw: Self::Raw,
+                ) -> Option<Self> {
+                    let #raw_ident { #( #path_ident, )* } = raw;
+                    Some(Self {
+                        #( #build_field_exprs, )*
+                        __sark_m: ::core::marker::PhantomData,
+                    })
+                }
+
+                fn from_captures<P: sark::service::PathProbe>(
+                    path: &P,
+                    captures: Self::Captures,
+                ) -> Option<Self> {
+                    let _ = (path, captures);
+                    None
+                }
+            }
+
+            impl<'req> sark::service::RouteParamsRef<'req> for #inner_ident<'req> {
+                fn from_raw_ref(
+                    req: &sark::request::Ref<'req, ()>,
+                    raw: <Self as sark::service::RouteParams>::Raw,
+                ) -> Option<Self> {
+                    let #raw_ident { #( #path_ident, )* } = raw;
+                    Some(Self {
+                        #( #build_field_exprs, )*
+                        __sark_m: ::core::marker::PhantomData,
+                    })
+                }
+            }
+        })
+    }
+
+    fn path_field_expr(
+        ident: &Ident,
+        raw: &Ident,
+        ty: &Type,
+        default: Option<&LitStr>,
+    ) -> Result<TokenStream> {
+        Ok(match ty.value_kind()? {
+            ValueKind::Local if ty.value_optional() => quote! {
+                #ident: #raw.map(|range| {
+                    req.path_local(range).expect(
+                        "request path local range invariant: stored range must be readable"
+                    )
+                })
+            },
+            ValueKind::Local => {
+                let default = default.ok_or_else(|| {
+                    Error::new_spanned(
+                        ty,
+                        "non-Option request path LocalFrameBytes fields require default = \"...\"",
+                    )
+                })?;
+                let fallback = Value::build_default_local_expr(default);
+                quote! {
+                    #ident: #raw.map(|range| {
+                        req.path_local(range).expect(
+                            "request path local range invariant: stored range must be readable"
+                        )
+                    }).unwrap_or_else(|| #fallback)
+                }
+            }
+            _ if ty.value_optional() => quote! { #ident: #raw },
+            _ => {
+                let unwrap = Value::build_required_or_default_expr(ty, default, quote!(#raw))?;
+                quote! { #ident: #unwrap }
+            }
+        })
+    }
+}
