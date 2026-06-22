@@ -3,11 +3,11 @@ use dope::manifold::Outcome;
 use dope::manifold::listener::{self, Application};
 use dope::transport::link::Slot;
 use dope::transport::wire::{Identity, RecvChunk};
-use crate::mask::Mask;
 
 use crate::crypto::Crypto;
 use crate::fragment::{FragmentBuffer, Push};
 use crate::frame::FrameHead;
+use crate::mask::Mask;
 
 const MAX_HANDSHAKE_BYTES: usize = 16 * 1024;
 const WS_MAX_MESSAGE: usize = 16 * 1024 * 1024;

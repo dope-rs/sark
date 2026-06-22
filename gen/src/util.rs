@@ -21,6 +21,7 @@ pub(super) struct FieldAttr {
 
 pub(super) trait TypeExt {
     fn option_inner(&self) -> Option<&Type>;
+    fn vec_inner(&self) -> Option<&Type>;
     fn value_inner(&self) -> &Type;
     fn value_optional(&self) -> bool;
     fn is_plain_ident(&self, want: &str) -> bool;
@@ -42,6 +43,23 @@ impl TypeExt for Type {
         };
         let seg = path.path.segments.last()?;
         if seg.ident != "Option" {
+            return None;
+        }
+        let PathArguments::AngleBracketed(args) = &seg.arguments else {
+            return None;
+        };
+        match args.args.first()? {
+            GenericArgument::Type(inner) => Some(inner),
+            _ => None,
+        }
+    }
+
+    fn vec_inner(&self) -> Option<&Type> {
+        let Type::Path(path) = self else {
+            return None;
+        };
+        let seg = path.path.segments.last()?;
+        if seg.ident != "Vec" {
             return None;
         }
         let PathArguments::AngleBracketed(args) = &seg.arguments else {

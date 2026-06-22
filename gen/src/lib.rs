@@ -1,3 +1,33 @@
+//! `#[sark_gen::json]` derives compact JSON encode/decode for named structs.
+//! Fields default to scalars (`u64`, `bool`, `LocalFrameBytes`, `Option<T>`). Two
+//! `#[field(...)]` attributes compose nested documents:
+//!
+//! - `#[field(nested)]` on a field whose type is another `#[sark_gen::json]` struct
+//!   emits `"key":{...}` using that type's own encoder.
+//! - `#[field(seq)]` on a `Vec<LocalFrameBytes>` emits a JSON string array
+//!   `"key":["a","b"]`; combine with `nested` (`#[field(seq, nested)]`) on a
+//!   `Vec<T>` of json structs to emit an array of objects `"key":[{...},{...}]`.
+//!
+//! Empty vectors encode as `[]`. `nested`/`seq` are not supported with `exact`.
+//!
+//! ```ignore
+//! #[sark_gen::json(ordered)]
+//! struct Rating { score: u64, count: u64 }
+//!
+//! #[sark_gen::json(ordered)]
+//! struct Item {
+//!     id: u64,
+//!     #[field(seq)] tags: Vec<LocalFrameBytes>,
+//!     #[field(nested)] rating: Rating,
+//! }
+//!
+//! #[sark_gen::json(ordered)]
+//! struct ItemsResponse {
+//!     #[field(seq, nested)] items: Vec<Item>,
+//!     count: u64,
+//! }
+//! ```
+
 use proc_macro::TokenStream;
 use syn::{Item, ItemStruct, parse_macro_input};
 

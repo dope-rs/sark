@@ -70,18 +70,18 @@ checksum = "8ae3f5d315924270530207e2a68396c3cc547f6dca3fbdca317cfb1a51edb593"
 
 [[package]]
 name = "cartel-core"
-version = "0.1.0"
+version = "0.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e5973101c1aeb2ce05ec5a2f90b93ff234c3efda591ac5d6709c3b1598bf3bbc"
+checksum = "06224f2f7d3a06e6c6ae8073222c3de9fa797c11a1b27ea38133517955278cbe"
 dependencies = [
  "dope",
 ]
 
 [[package]]
 name = "cartel-gen"
-version = "0.1.0"
+version = "0.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "453ac2a0036e42d426702c842e6d0b45f1d8848c9a3da65d8c23193707fe02f1"
+checksum = "bcc2f664d0dc24e3328b4868c3d0e1bdda5c6c286690545a5636add25ac95f5d"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -90,9 +90,9 @@ dependencies = [
 
 [[package]]
 name = "cartel-pg"
-version = "0.1.0"
+version = "0.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "eba41f169d35358ef742aa1bad4e74be4dbc378b5c6cfe0d3767077314a48a0d"
+checksum = "52525ffabdba1ad429492f73ab7d8af6f7c41dfc2d715372ce63b5210f1415ac"
 dependencies = [
  "base64",
  "cartel-core",
@@ -108,9 +108,9 @@ dependencies = [
 
 [[package]]
 name = "cartel-redis"
-version = "0.1.0"
+version = "0.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "97a46dfde3e3f76e9c7288b23b5e35be49d08cb1ec7c5f387f8f8aeec8f2f32f"
+checksum = "e4ba1647a8ed898390fe6c5fbc0cc6f33c187b1fa51c6dda84cb82c30759fe5d"
 dependencies = [
  "cartel-core",
  "dope",
@@ -273,9 +273,9 @@ dependencies = [
 
 [[package]]
 name = "dope"
-version = "0.3.0"
+version = "0.3.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7eff6d6291d502fcfe3be40056f22d81e75552132fbc6d882a973e4a959af906"
+checksum = "f7ea38e23ebd397f04011c234131400055ba439b4901168542e6073c35222cae"
 dependencies = [
  "io-uring",
  "libc",
@@ -285,9 +285,9 @@ dependencies = [
 
 [[package]]
 name = "dope-extra"
-version = "0.3.0"
+version = "0.3.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ea5c365dbd768a3c8a9aefb952ad5f902939831f58b61de76b6941a85b3cbbcc"
+checksum = "46777ef2b220de91292e32658f6dc8c164204b95771eed3a88241151eb61fd9c"
 dependencies = [
  "dope",
  "libc",
@@ -296,9 +296,9 @@ dependencies = [
 
 [[package]]
 name = "dope-gen"
-version = "0.3.0"
+version = "0.3.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2e6f13afa97beb68ffb0106c46bccb8b205fa98b564637ebcd19fa74240f361a"
+checksum = "49696b9ab700e60659b8b89a594aad432b45260d12a0014e1a0d7ba01cef385b"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -864,7 +864,7 @@ dependencies = [
 
 [[package]]
 name = "sark"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "cartel-gen",
  "cartel-pg",
@@ -887,7 +887,7 @@ dependencies = [
 
 [[package]]
 name = "sark-client"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "cartel-core",
  "dope",
@@ -902,7 +902,7 @@ dependencies = [
 
 [[package]]
 name = "sark-core"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "criterion",
  "http",
@@ -918,7 +918,7 @@ dependencies = [
 
 [[package]]
 name = "sark-gen"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "dope",
  "o3",
@@ -929,7 +929,7 @@ dependencies = [
 
 [[package]]
 name = "sark-grpc"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "dope",
  "dope-extra",
@@ -945,14 +945,14 @@ dependencies = [
 
 [[package]]
 name = "sark-grpc-build"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "prost-build",
 ]
 
 [[package]]
 name = "sark-h2"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "dope",
  "dope-extra",
@@ -966,7 +966,7 @@ dependencies = [
 
 [[package]]
 name = "sark-h3"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "dope",
  "dope-quic",
@@ -980,7 +980,7 @@ dependencies = [
 
 [[package]]
 name = "sark-json"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "http",
  "o3",
@@ -989,7 +989,7 @@ dependencies = [
 
 [[package]]
 name = "sark-ws"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "dope",
  "dope-extra",

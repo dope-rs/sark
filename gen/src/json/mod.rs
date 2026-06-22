@@ -248,12 +248,12 @@ impl<'a> Plan<'a> {
             .zip(heads.iter())
         {
             let head_lit = syn::LitByteStr::new(head, Span::call_site());
-            let write = Encode::write_expr(ty, fmode.raw, fmode.plain, quote!(self.#ident))?;
+            let write = Encode::write_expr(ty, *fmode, quote!(self.#ident))?;
             encoders.push(quote! {
                 __out.extend_from_slice(#head_lit);
                 #write
             });
-            let len = Encode::len_expr(ty, fmode.raw, quote!(self.#ident))?;
+            let len = Encode::len_expr(ty, *fmode, quote!(self.#ident))?;
             let head_len = head.len();
             leners.push(quote!(#head_len + (#len)));
         }
@@ -289,6 +289,7 @@ impl<'a> Plan<'a> {
 
     fn has_owned(&self) -> bool {
         self.mode.preserve
+            || self.modes.iter().any(|fmode| fmode.nested || fmode.seq)
             || self.tys.iter().any(|ty| {
                 let base = ty.option_inner().unwrap_or(ty);
                 base.is_plain_ident("LocalFrameBytes")
@@ -374,6 +375,13 @@ pub(super) fn attr(mode: JsonMode, mut st: ItemStruct) -> Result<TokenStream> {
         names,
         modes,
     };
+
+    if mode.exact && plan.modes.iter().any(|fmode| fmode.nested || fmode.seq) {
+        return Err(syn::Error::new(
+            Span::call_site(),
+            "#[field(nested)] and #[field(seq)] are not supported with `exact`",
+        ));
+    }
 
     let locals = plan.locals();
     let match_arms = plan.match_arms()?;
