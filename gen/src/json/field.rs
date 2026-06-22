@@ -6,6 +6,8 @@ pub(super) struct FieldMode {
     pub(super) raw: bool,
     pub(super) unused: bool,
     pub(super) plain: bool,
+    pub(super) nested: bool,
+    pub(super) seq: bool,
 }
 
 impl FieldMode {
@@ -37,10 +39,14 @@ impl FieldMode {
                         mode.unused = true;
                     } else if item == "plain" {
                         mode.plain = true;
+                    } else if item == "nested" {
+                        mode.nested = true;
+                    } else if item == "seq" {
+                        mode.seq = true;
                     } else {
                         return Err(syn::Error::new_spanned(
                             item,
-                            "#[field(...)] supports only `raw`, `unused`, or `plain`",
+                            "#[field(...)] supports only `raw`, `unused`, `plain`, `nested`, or `seq`",
                         ));
                     }
                 }

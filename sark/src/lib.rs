@@ -12,6 +12,7 @@ pub mod fiber;
 pub mod parser;
 #[doc(hidden)]
 pub use parser::framer;
+pub mod fs;
 pub mod middleware;
 pub mod request;
 #[doc(hidden)]

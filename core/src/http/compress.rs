@@ -1,3 +1,15 @@
+//! Built-in gzip response compression (libdeflater). `Gzip::with_thread_local`
+//! borrows a per-thread encoder (level 3) so a handler can compress a body when
+//! `Accept-Encoding` includes `gzip` without per-request allocation; `encode`
+//! returns the gzip bytes. This is sark's standard compression path — response
+//! bodies are never hand-rolled.
+//!
+//! ```no_run
+//! use sark_core::http::compress::Gzip;
+//! let body: &[u8] = b"hello";
+//! let zipped = Gzip::with_thread_local(|gz| gz.encode(body).to_vec());
+//! ```
+
 use std::cell::RefCell;
 
 use libdeflater::{CompressionLvl, Compressor};
