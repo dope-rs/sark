@@ -38,6 +38,7 @@ impl Default for Config {
 #[derive(Clone, Debug)]
 pub struct Cfg {
     pub bind: SocketAddr,
+    pub readiness: Option<SocketAddr>,
     pub max_conn: usize,
     pub backlog: i32,
     pub grpc: Config,
@@ -45,6 +46,25 @@ pub struct Cfg {
 
 pub type Env = Bundle<Tcp, Identity, Throughput>;
 pub type TlsEnv = Bundle<Tcp, Tls, Throughput>;
+
+fn listener_config(bind: SocketAddr, cfg: &Cfg) -> config::Config<Tcp> {
+    config::Config::<Tcp> {
+        max_conn: cfg.max_conn,
+        bind,
+        backlog: cfg.backlog,
+        stream_opts: Default::default(),
+        listener_opts: dope::transport::config::tcp::ListenerOpts {
+            reuseport: dope::transport::config::SocketToggle::Enabled,
+            per_ip_cap: Some((cfg.max_conn / 2) as u32),
+            ..Default::default()
+        },
+    }
+}
+
+fn driver_config(cfg: &Cfg, ctx: &Ctx) -> dope::DriverCfg {
+    <dope::DriverCfg as DriverConfig>::for_tcp_profile::<Throughput>(cfg.max_conn)
+        .with_cpu_id(Some(ctx.cpu))
+}
 
 #[pin_project::pin_project]
 #[derive(dope_gen::Dispatcher)]
@@ -60,29 +80,14 @@ pub fn serve<H: Handler>(
     ctx: Ctx,
     shutdown: Option<&Trigger>,
 ) -> io::Result<()> {
-    let listener_cfg = config::Config::<Tcp> {
-        max_conn: cfg.max_conn,
-        bind: cfg.bind,
-        backlog: cfg.backlog,
-        stream_opts: Default::default(),
-        listener_opts: dope::transport::config::tcp::ListenerOpts {
-            reuseport: dope::transport::config::SocketToggle::Enabled,
-            per_ip_cap: Some((cfg.max_conn / 2) as u32),
-            ..Default::default()
-        },
-    };
-    let driver_cfg = <dope::DriverCfg as DriverConfig>::for_tcp_profile::<Throughput>(cfg.max_conn)
-        .with_cpu_id(Some(ctx.cpu));
-    let mut exec = Executor::new(driver_cfg)?;
+    let mut exec = Executor::new(driver_config(&cfg, &ctx))?;
     let drv = exec.driver_mut();
     if let Some(trigger) = shutdown {
         trigger.register(drv);
     }
-    let listener = Listener::<0, App<H>, Env>::open_in(
-        App::with_config(handler, cfg.grpc),
-        listener_cfg,
-        drv,
-    )?;
+    let mut app = App::with_config(handler, cfg.grpc.clone());
+    app.liveness_fallback = cfg.readiness.is_some();
+    let listener = Listener::<0, App<H>, Env>::open_in(app, listener_config(cfg.bind, &cfg), drv)?;
     let mut app = core::pin::pin!(Dispatcher { listener });
     exec.run(app.as_mut())
 }
@@ -93,6 +98,9 @@ struct TlsDispatcher<H: Handler> {
     #[pin]
     #[manifold]
     listener: Listener<0, App<H, Tls>, TlsEnv>,
+    #[pin]
+    #[manifold(optional)]
+    readiness: Option<Listener<1, liveness::Liveness, Env>>,
 }
 
 pub fn serve_tls<H: Handler>(
@@ -102,32 +110,93 @@ pub fn serve_tls<H: Handler>(
     ctx: Ctx,
     shutdown: Option<&Trigger>,
 ) -> io::Result<()> {
-    let listener_cfg = config::Config::<Tcp> {
-        max_conn: cfg.max_conn,
-        bind: cfg.bind,
-        backlog: cfg.backlog,
-        stream_opts: Default::default(),
-        listener_opts: dope::transport::config::tcp::ListenerOpts {
-            reuseport: dope::transport::config::SocketToggle::Enabled,
-            per_ip_cap: Some((cfg.max_conn / 2) as u32),
-            ..Default::default()
-        },
-    };
-    let driver_cfg = <dope::DriverCfg as DriverConfig>::for_tcp_profile::<Throughput>(cfg.max_conn)
-        .with_cpu_id(Some(ctx.cpu));
-    let mut exec = Executor::new(driver_cfg)?;
+    let mut exec = Executor::new(driver_config(&cfg, &ctx))?;
     let drv = exec.driver_mut();
     if let Some(trigger) = shutdown {
         trigger.register(drv);
     }
     let mut listener = Listener::<0, App<H, Tls>, TlsEnv>::open_in(
-        App::with_config(handler, cfg.grpc),
-        listener_cfg,
+        App::with_config(handler, cfg.grpc.clone()),
+        listener_config(cfg.bind, &cfg),
         drv,
     )?;
     listener.set_cfg(Endpoint::Server(Box::new(tls_cfg)));
-    let mut app = core::pin::pin!(TlsDispatcher { listener });
+    let readiness = match cfg.readiness {
+        Some(addr) => Some(Listener::<1, liveness::Liveness, Env>::open_in(
+            liveness::Liveness,
+            listener_config(addr, &cfg),
+            drv,
+        )?),
+        None => None,
+    };
+    let mut app = core::pin::pin!(TlsDispatcher {
+        listener,
+        readiness,
+    });
     exec.run(app.as_mut())
+}
+
+mod liveness {
+    use super::{Application, Driver, Identity, RecvChunk, Slot, Wire, listener, manifold};
+
+    const RESPONSE: &[u8] =
+        b"HTTP/1.1 200 OK\r\ncontent-length: 0\r\nconnection: close\r\n\r\n";
+
+    const H2_PREFACE: &[u8] = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
+
+    pub fn is_plain_request(first: &[u8]) -> bool {
+        let n = first.len().min(H2_PREFACE.len());
+        first[..n] != H2_PREFACE[..n]
+    }
+
+    pub fn respond<W: Wire, C: Default + 'static>(
+        slot: &mut Slot<W, listener::State<C>>,
+        aux: &mut listener::Aux,
+        driver: &mut Driver,
+    ) {
+        if slot.core.is_send_inflight() {
+            return;
+        }
+        let ud = slot.token();
+        let buf = aux.write_buf_for(slot);
+        buf[..RESPONSE.len()].copy_from_slice(RESPONSE);
+        slot.core.set_close_after();
+        slot.submit_buffered(buf, RESPONSE.len(), ud, driver);
+    }
+
+    pub struct Liveness;
+
+    impl Application for Liveness {
+        type Conn = ();
+        type Wire = Identity;
+
+        fn on_chunk(
+            &mut self,
+            slot: &mut Slot<Identity, listener::State<()>>,
+            _chunk: RecvChunk<'_>,
+            aux: &mut listener::Aux,
+            driver: &mut Driver,
+        ) -> manifold::Outcome {
+            respond(slot, aux, driver);
+            manifold::Outcome::Ok
+        }
+
+        fn on_send(
+            &mut self,
+            _slot: &mut Slot<Identity, listener::State<()>>,
+            _sent: usize,
+            _aux: &mut listener::Aux,
+            _driver: &mut Driver,
+        ) {
+        }
+
+        fn on_close(
+            &mut self,
+            _slot: &mut Slot<Identity, listener::State<()>>,
+            _aux: &mut listener::Aux,
+        ) {
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -667,6 +736,7 @@ pub struct ConnState {
     h2: Conn<ServerRole>,
     streams: BTreeMap<StreamId, StreamState>,
     pending: BTreeMap<StreamId, PendingResponse>,
+    probed: bool,
 }
 
 impl Default for ConnState {
@@ -675,6 +745,7 @@ impl Default for ConnState {
             h2: Conn::<ServerRole>::new(),
             streams: BTreeMap::new(),
             pending: BTreeMap::new(),
+            probed: false,
         }
     }
 }
@@ -700,6 +771,7 @@ struct PendingResponse {
 pub struct App<H: Handler, W: Wire = Identity> {
     handler: H,
     config: Config,
+    liveness_fallback: bool,
     _wire: ::std::marker::PhantomData<W>,
 }
 
@@ -712,6 +784,7 @@ impl<H: Handler, W: Wire> App<H, W> {
         Self {
             handler,
             config,
+            liveness_fallback: false,
             _wire: ::std::marker::PhantomData,
         }
     }
@@ -937,6 +1010,13 @@ impl<H: Handler, W: Wire> Application for App<H, W> {
         driver: &mut Driver,
     ) -> manifold::Outcome {
         let bytes = chunk.as_slice();
+        if self.liveness_fallback && !slot.state.conn.probed {
+            slot.state.conn.probed = true;
+            if liveness::is_plain_request(bytes) {
+                liveness::respond(slot, aux, driver);
+                return manifold::Outcome::Ok;
+            }
+        }
         let state = &mut slot.state.conn;
         if state.h2.goaway_sent() || state.h2.goaway_received().is_some() {
             return manifold::Outcome::Ok;
