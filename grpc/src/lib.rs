@@ -15,6 +15,6 @@ pub use sark_h2::StreamId;
 pub use server::{
     LiveMessage, LiveResponse, LiveStreaming, LiveStreamingHandler, LiveTrailers, Request,
     Response, Routes, StreamMode, StreamReply, Streaming, StreamingHandler, StreamingRequest,
-    StreamingResponse, Unary, UnaryHandler, UnaryRequest, UnaryResponse, serve,
+    StreamingResponse, Unary, UnaryHandler, UnaryRequest, UnaryResponse, serve, serve_tls,
 };
 pub use status::{Code, Status};
