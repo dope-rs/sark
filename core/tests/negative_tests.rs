@@ -141,8 +141,7 @@ fn scan_content_length_with_whitespace() {
         name: "Content-Length",
         value: b"  42  ",
     }];
-    let s = Parse::header_scan(headers).unwrap();
-    assert_eq!(s.content_length, Some(42));
+    assert!(Parse::header_scan(headers).is_err());
 }
 
 #[test]
@@ -270,7 +269,7 @@ fn parse_cl_with_whitespace() {
         name: "Content-Length",
         value: b"  42  ",
     }];
-    assert_eq!(Parse::content_length(headers).unwrap(), Some(42));
+    assert!(Parse::content_length(headers).is_err());
 }
 
 #[test]
@@ -620,9 +619,7 @@ fn response_tab_in_header_value() {
 fn content_length_with_plus_sign() {
     let raw = b"HTTP/1.1 200 OK\r\nContent-Length: +5\r\n\r\nhello";
     let result = Parse::response(raw, sark_core::http::codec::DecodeMode::Response);
-    assert!(result.is_ok());
-    let resp = result.unwrap().unwrap();
-    assert_eq!(resp.body_str(), Some("hello"));
+    assert!(result.is_err());
 }
 
 #[test]
@@ -661,9 +658,7 @@ fn response_empty_reason_phrase() {
 fn chunked_with_trailing_whitespace_in_size() {
     let raw = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n 5 \r\nhello\r\n0\r\n\r\n";
     let result = Parse::response(raw, sark_core::http::codec::DecodeMode::Response);
-    assert!(result.is_ok());
-    let resp = result.unwrap().unwrap();
-    assert_eq!(resp.body_str(), Some("hello"));
+    assert!(result.is_err());
 }
 
 #[test]
@@ -682,10 +677,8 @@ fn response_header_value_with_equals_semicolons() {
 #[test]
 fn decode_head_with_both_cl_and_te_chunked() {
     let raw = b"HTTP/1.1 200 OK\r\nContent-Length: 100\r\nTransfer-Encoding: chunked\r\n\r\n";
-    let head = Parse::head(raw, sark_core::http::codec::DecodeMode::Response)
-        .unwrap()
-        .unwrap();
-    assert!(matches!(head.body_kind, BodyKind::Chunked));
+    let result = Parse::head(raw, sark_core::http::codec::DecodeMode::Response);
+    assert!(result.is_err());
 }
 
 #[test]

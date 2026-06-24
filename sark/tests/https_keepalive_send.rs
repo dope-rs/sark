@@ -60,7 +60,7 @@ struct TlsClient {
 impl TlsClient {
     fn connect(addr: std::net::SocketAddr) -> Self {
         let signing = SigningKey::from_seed(&SEED).expect("signing key");
-        let expected_pubkey = *signing.pubkey();
+        let expected_pubkey = *signing.pubkey().unwrap();
         let state = State::new_client(shin::client::Config {
             verifier: shin::client::Verifier::RawPublicKey { expected_pubkey },
             transport_params: Vec::new(),

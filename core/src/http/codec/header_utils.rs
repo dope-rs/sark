@@ -103,11 +103,20 @@ impl Header {
     }
 
     pub fn content_length(value: &[u8]) -> Result<usize> {
-        let text = std::str::from_utf8(value)
-            .map_err(|_| Error::BadRequest("Invalid Content-Length".into()))?;
-        text.trim()
-            .parse::<usize>()
-            .map_err(|_| Error::BadRequest("Invalid Content-Length".into()))
+        if value.is_empty() {
+            return Err(Error::BadRequest("Invalid Content-Length".into()));
+        }
+        let mut len: usize = 0;
+        for &b in value {
+            if !b.is_ascii_digit() {
+                return Err(Error::BadRequest("Invalid Content-Length".into()));
+            }
+            len = len
+                .checked_mul(10)
+                .and_then(|n| n.checked_add((b - b'0') as usize))
+                .ok_or_else(|| Error::BadRequest("Invalid Content-Length".into()))?;
+        }
+        Ok(len)
     }
 
     pub fn has_name(headers: &[httparse::Header<'_>], name: &str) -> bool {
@@ -148,4 +157,44 @@ mod private {
 
     impl SealedHeaderLookup for http::HeaderMap {}
     impl SealedHeaderLookup for crate::http::HeaderList {}
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn content_length_digits_accepted() {
+        assert_eq!(Header::content_length(b"5").unwrap(), 5);
+        assert_eq!(Header::content_length(b"0").unwrap(), 0);
+        assert_eq!(Header::content_length(b"1234").unwrap(), 1234);
+    }
+
+    #[test]
+    fn content_length_plus_prefix_rejected() {
+        assert!(Header::content_length(b"+5").is_err());
+    }
+
+    #[test]
+    fn content_length_whitespace_rejected() {
+        assert!(Header::content_length(b" 5").is_err());
+        assert!(Header::content_length(b"5 ").is_err());
+        assert!(Header::content_length(b"5\r").is_err());
+    }
+
+    #[test]
+    fn content_length_empty_rejected() {
+        assert!(Header::content_length(b"").is_err());
+    }
+
+    #[test]
+    fn content_length_non_digit_rejected() {
+        assert!(Header::content_length(b"abc").is_err());
+        assert!(Header::content_length(b"5a").is_err());
+    }
+
+    #[test]
+    fn content_length_overflow_rejected() {
+        assert!(Header::content_length(b"99999999999999999999999999").is_err());
+    }
 }

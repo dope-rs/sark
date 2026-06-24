@@ -29,7 +29,7 @@ fn pair() -> (Conn, Conn) {
     let mut seed = [0u8; 32];
     SystemRandom::new().fill(&mut seed).unwrap();
     let signing = SigningKey::from_seed(&seed).unwrap();
-    let server_pubkey = *signing.pubkey();
+    let server_pubkey = *signing.pubkey().unwrap();
     let mut server = Conn::new_server(CID.to_vec(), CID.to_vec(), CID.to_vec(), signing, config());
     let mut client = Conn::new_client(CID.to_vec(), CID.to_vec(), server_pubkey, config());
     let now = Instant::now();

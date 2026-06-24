@@ -139,8 +139,7 @@ pub fn serve_tls<H: Handler>(
 mod liveness {
     use super::{Application, Driver, Identity, RecvChunk, Slot, Wire, listener, manifold};
 
-    const RESPONSE: &[u8] =
-        b"HTTP/1.1 200 OK\r\ncontent-length: 0\r\nconnection: close\r\n\r\n";
+    const RESPONSE: &[u8] = b"HTTP/1.1 200 OK\r\ncontent-length: 0\r\nconnection: close\r\n\r\n";
 
     const H2_PREFACE: &[u8] = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
 
