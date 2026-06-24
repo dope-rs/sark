@@ -151,11 +151,43 @@ impl<H: Handler> Application for App<H> {
         aux: &mut listener::Aux,
         driver: &mut Driver,
     ) -> Outcome {
-        let bytes = chunk.as_slice();
         if slot.state.conn.phase == Phase::Closed {
             return Outcome::Ok;
         }
-        slot.state.conn.acc.extend_from_slice(bytes);
+        slot.state.conn.acc.extend_from_slice(chunk.as_slice());
+        if !slot.core.is_send_inflight() {
+            self.pump(slot, aux, driver);
+        }
+        Outcome::Ok
+    }
+
+    fn on_send(
+        &mut self,
+        slot: &mut Slot<Identity, listener::State<ConnState>>,
+        _sent: usize,
+        aux: &mut listener::Aux,
+        driver: &mut Driver,
+    ) {
+        if slot.state.conn.phase != Phase::Closed {
+            self.pump(slot, aux, driver);
+        }
+    }
+
+    fn on_close(
+        &mut self,
+        _slot: &mut Slot<Identity, listener::State<ConnState>>,
+        _aux: &mut listener::Aux,
+    ) {
+    }
+}
+
+impl<H: Handler> App<H> {
+    fn pump(
+        &self,
+        slot: &mut Slot<Identity, listener::State<ConnState>>,
+        aux: &mut listener::Aux,
+        driver: &mut Driver,
+    ) {
         let send_ud = slot.token();
         let write_buf = aux.write_buf_for(slot);
         let (written, close_after) = {
@@ -172,28 +204,11 @@ impl<H: Handler> Application for App<H> {
         if close_after {
             slot.core.set_close_after();
         }
-        slot.submit_buffered(write_buf, written, send_ud, driver);
-        Outcome::Ok
+        if written > 0 {
+            slot.submit_buffered(write_buf, written, send_ud, driver);
+        }
     }
 
-    fn on_send(
-        &mut self,
-        _slot: &mut Slot<Identity, listener::State<ConnState>>,
-        _sent: usize,
-        _aux: &mut listener::Aux,
-        _driver: &mut Driver,
-    ) {
-    }
-
-    fn on_close(
-        &mut self,
-        _slot: &mut Slot<Identity, listener::State<ConnState>>,
-        _aux: &mut listener::Aux,
-    ) {
-    }
-}
-
-impl<H: Handler> App<H> {
     fn try_handshake(&self, state: &mut ConnState, response: &mut Response<'_>) {
         if state.acc.len() > MAX_HANDSHAKE_BYTES {
             state.phase = Phase::Closed;

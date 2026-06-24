@@ -4,8 +4,8 @@ use std::thread;
 use std::time::Duration;
 
 use dope_extra::testing::{ephemeral_addr, run_with_trigger};
-use sark_grpc::server::{self, Cfg, Handler, Request, Response};
 use sark_grpc::Status;
+use sark_grpc::server::{self, Cfg, Handler, Request, Response};
 use shin::server::{CertSource, Config as TlsConfig};
 use shin::sig::SigningKey;
 
@@ -32,7 +32,9 @@ fn connect_retry(addr: SocketAddr) -> TcpStream {
 fn probe_liveness(addr: SocketAddr) -> String {
     let mut stream = connect_retry(addr);
     stream
-        .write_all(b"GET /baseline11?a=1&b=1 HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+        .write_all(
+            b"GET /baseline11?a=1&b=1 HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+        )
         .expect("write request");
     let mut buf = Vec::new();
     stream.read_to_end(&mut buf).expect("read response");

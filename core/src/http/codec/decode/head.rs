@@ -92,8 +92,10 @@ impl crate::http::codec::Parse {
                     headers.push((name, value));
                 }
 
-                if has_transfer_encoding {
-                    content_length = None;
+                if has_transfer_encoding && content_length.is_some() {
+                    return Err(Error::BadRequest(
+                        "Content-Length with Transfer-Encoding is not allowed".into(),
+                    ));
                 }
 
                 Ok(Some(ParsedHead {
@@ -191,5 +193,36 @@ impl crate::http::codec::Parse {
         } else {
             Ok(Self::build_response(head, body_data, &[]))
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn cl_and_te_coexistence_rejected() {
+        let raw = b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\nTransfer-Encoding: chunked\r\n\r\n";
+        assert!(crate::http::codec::Parse::parse(raw).is_err());
+    }
+
+    #[test]
+    fn valid_single_content_length_accepted() {
+        let raw = b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\n";
+        let head = crate::http::codec::Parse::parse(raw).unwrap().unwrap();
+        assert_eq!(head.content_length, Some(5));
+        assert!(!head.is_chunked);
+    }
+
+    #[test]
+    fn valid_te_chunked_alone_accepted() {
+        let raw = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n";
+        let head = crate::http::codec::Parse::parse(raw).unwrap().unwrap();
+        assert!(head.is_chunked);
+        assert_eq!(head.content_length, None);
+    }
+
+    #[test]
+    fn response_content_length_plus_prefix_rejected() {
+        let raw = b"HTTP/1.1 200 OK\r\nContent-Length: +5\r\n\r\n";
+        assert!(crate::http::codec::Parse::parse(raw).is_err());
     }
 }

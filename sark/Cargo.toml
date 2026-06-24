@@ -19,15 +19,15 @@ dope-extra.workspace = true
 dope-gen.workspace = true
 o3.workspace = true
 dope-tls.workspace = true
-shin = "0.1.0"
+shin = "0.3"
 http = "1.4.0"
 httparse = "1.10.1"
 memchr = "2.7"
 pin-project.workspace = true
 
 [dev-dependencies]
-cartel-redis = "0.1"
-cartel-pg = "0.1"
-cartel-gen = "0.1"
+cartel-redis = "0.2"
+cartel-pg = "0.2"
+cartel-gen = "0.2"
 sark-ws.workspace = true
 

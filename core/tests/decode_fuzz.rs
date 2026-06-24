@@ -100,9 +100,7 @@ fn chunked_extremely_large_chunk_size() {
 fn mixed_content_length_and_transfer_encoding() {
     let raw = b"HTTP/1.1 200 OK\r\nContent-Length: 100\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n0\r\n\r\n";
     let result = Parse::response(raw, sark_core::http::codec::DecodeMode::Response);
-    assert!(result.is_ok());
-    let resp = result.unwrap().unwrap();
-    assert_eq!(resp.body_str(), Some("hello"));
+    assert!(result.is_err());
 }
 
 #[test]
@@ -231,9 +229,7 @@ fn pipelined_responses_extra_data() {
 fn chunked_with_whitespace_in_size() {
     let raw = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n  5  \r\nhello\r\n0\r\n\r\n";
     let result = Parse::response(raw, sark_core::http::codec::DecodeMode::Response);
-    assert!(result.is_ok());
-    let resp = result.unwrap().unwrap();
-    assert_eq!(resp.body_str(), Some("hello"));
+    assert!(result.is_err());
 }
 
 #[test]

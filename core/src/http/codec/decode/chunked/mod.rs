@@ -7,6 +7,26 @@ use crate::error::{Error, Result};
 
 const MAX_BODY_SIZE: usize = 100 * 1024 * 1024;
 
+fn parse_chunk_size(bytes: &[u8]) -> Result<usize> {
+    if bytes.is_empty() {
+        return Err(Error::BadRequest("Empty chunk size".into()));
+    }
+    let mut size: usize = 0;
+    for &b in bytes {
+        let digit = match b {
+            b'0'..=b'9' => (b - b'0') as usize,
+            b'a'..=b'f' => (b - b'a' + 10) as usize,
+            b'A'..=b'F' => (b - b'A' + 10) as usize,
+            _ => return Err(Error::BadRequest("Invalid chunk size".into())),
+        };
+        size = size
+            .checked_mul(16)
+            .and_then(|s| s.checked_add(digit))
+            .ok_or_else(|| Error::BadRequest("Chunk size overflow".into()))?;
+    }
+    Ok(size)
+}
+
 pub(crate) struct DecodeResult {
     pub(crate) body: Vec<u8>,
     pub(crate) trailers: Vec<(HeaderName, HeaderValue)>,
@@ -61,12 +81,12 @@ impl BodyDecoder {
                         None => return Ok((pos, DecodeEvent::NeedMore)),
                     };
 
-                    let size_str = std::str::from_utf8(&buf[pos..crlf])
-                        .map_err(|_| Error::BadRequest("Invalid chunk size encoding".into()))?;
-                    let size_str = size_str.split(';').next().unwrap_or("").trim();
-                    let chunk_size = usize::from_str_radix(size_str, 16).map_err(|_| {
-                        Error::BadRequest(format!("Invalid chunk size: {:?}", size_str).into())
-                    })?;
+                    let line = &buf[pos..crlf];
+                    let size_bytes = match line.iter().position(|&b| b == b';') {
+                        Some(semi) => &line[..semi],
+                        None => line,
+                    };
+                    let chunk_size = parse_chunk_size(size_bytes)?;
 
                     if chunk_size > self.max_body || self.body_len + chunk_size > self.max_body {
                         return Err(Error::PayloadTooLarge(
@@ -160,5 +180,68 @@ impl crate::http::codec::Parse {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn chunk_size_plus_prefix_rejected() {
+        assert!(parse_chunk_size(b"+a").is_err());
+    }
+
+    #[test]
+    fn chunk_size_minus_prefix_rejected() {
+        assert!(parse_chunk_size(b"-a").is_err());
+    }
+
+    #[test]
+    fn chunk_size_surrounding_whitespace_rejected() {
+        assert!(parse_chunk_size(b" 5 ").is_err());
+        assert!(parse_chunk_size(b"\t5").is_err());
+        assert!(parse_chunk_size(b"5 ").is_err());
+    }
+
+    #[test]
+    fn chunk_size_empty_rejected() {
+        assert!(parse_chunk_size(b"").is_err());
+    }
+
+    #[test]
+    fn chunk_size_valid_hex_accepted() {
+        assert_eq!(parse_chunk_size(b"a").unwrap(), 10);
+        assert_eq!(parse_chunk_size(b"1F").unwrap(), 31);
+        assert_eq!(parse_chunk_size(b"0").unwrap(), 0);
+    }
+
+    #[test]
+    fn chunk_size_huge_hex_overflows() {
+        assert!(parse_chunk_size(b"ffffffffffffffffff").is_err());
+    }
+
+    #[test]
+    fn chunk_extension_after_size_accepted() {
+        let raw = b"5;name=value\r\nhello\r\n0\r\n\r\n";
+        let body = crate::http::codec::Parse::chunked_body(raw)
+            .unwrap()
+            .unwrap();
+        assert_eq!(body, b"hello");
+    }
+
+    #[test]
+    fn normal_chunked_body_accepted() {
+        let raw = b"5\r\nhello\r\n0\r\n\r\n";
+        let body = crate::http::codec::Parse::chunked_body(raw)
+            .unwrap()
+            .unwrap();
+        assert_eq!(body, b"hello");
+    }
+
+    #[test]
+    fn chunk_size_whitespace_in_stream_rejected() {
+        let raw = b" 5 \r\nhello\r\n0\r\n\r\n";
+        assert!(crate::http::codec::Parse::chunked_body(raw).is_err());
     }
 }

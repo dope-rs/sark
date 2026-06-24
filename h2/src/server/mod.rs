@@ -102,3 +102,51 @@ pub fn serve_tls<H: Handler>(
     let mut app = core::pin::pin!(TlsDispatcher { listener });
     exec.run(app.as_mut())
 }
+
+#[cfg(feature = "rustls")]
+pub type RustlsTlsEnv = Bundle<Tcp, dope_tls::RustlsTls, Throughput>;
+
+#[cfg(feature = "rustls")]
+#[pin_project::pin_project]
+#[derive(dope_gen::Dispatcher)]
+struct RustlsTlsDispatcher<H: Handler> {
+    #[pin]
+    #[manifold]
+    listener: Listener<0, App<H, dope_tls::RustlsTls>, RustlsTlsEnv>,
+}
+
+#[cfg(feature = "rustls")]
+pub fn serve_tls_rustls<H: Handler>(
+    handler: H,
+    cfg: Cfg,
+    tls_cfg: std::sync::Arc<rustls::ServerConfig>,
+    ctx: Ctx,
+    shutdown: Option<&Trigger>,
+) -> io::Result<()> {
+    let listener_cfg = Config::<Tcp> {
+        max_conn: cfg.max_conn,
+        bind: cfg.bind,
+        backlog: cfg.backlog,
+        stream_opts: Default::default(),
+        listener_opts: dope::transport::config::tcp::ListenerOpts {
+            reuseport: dope::transport::config::SocketToggle::Enabled,
+            per_ip_cap: Some((cfg.max_conn / 2) as u32),
+            ..Default::default()
+        },
+    };
+    let driver_cfg = <dope::DriverCfg as DriverConfig>::for_tcp_profile::<Throughput>(cfg.max_conn)
+        .with_cpu_id(Some(ctx.cpu));
+    let mut exec = Executor::new(driver_cfg)?;
+    let drv = exec.driver_mut();
+    if let Some(trigger) = shutdown {
+        trigger.register(drv);
+    }
+    let mut listener = Listener::<0, App<H, dope_tls::RustlsTls>, RustlsTlsEnv>::open_in(
+        App::new(handler),
+        listener_cfg,
+        drv,
+    )?;
+    listener.set_cfg(dope_tls::RustlsEndpoint::Server(tls_cfg));
+    let mut app = core::pin::pin!(RustlsTlsDispatcher { listener });
+    exec.run(app.as_mut())
+}

@@ -15,27 +15,28 @@ members = [
 
 [workspace.package]
 edition = "2024"
-version = "0.2.2"
+version = "0.3.0"
 description = "the L7 layer for dope"
 repository = "https://github.com/dope-rs/sark"
 license = "MIT"
 authors = ["inq <gofiri@gmail.com>"]
 
 [workspace.dependencies]
-dope = "0.3"
-dope-extra = "0.3"
-dope-gen = "0.3"
-dope-tls = "0.3"
+dope = "0.4"
+dope-extra = "0.4"
+dope-gen = "0.4"
+dope-tls = "0.4"
 o3 = "0.1.0"
 pin-project = "1"
 prost = "0.14.3"
 prost-build = "0.14.3"
-sark-core = { path = "core", version = "0.2.2" }
-sark-gen = { path = "gen", version = "0.2.2" }
-sark-h2 = { path = "h2", version = "0.2.2" }
-sark-json = { path = "json", version = "0.2.2" }
-sark-ws = { path = "ws", version = "0.2.2" }
-sark = { path = "sark", version = "0.2.2" }
+sark-core = { path = "core", version = "0.3.0" }
+sark-gen = { path = "gen", version = "0.3.0" }
+sark-h2 = { path = "h2", version = "0.3.0" }
+sark-json = { path = "json", version = "0.3.0" }
+sark-ws = { path = "ws", version = "0.3.0" }
+sark = { path = "sark", version = "0.3.0" }
+
 
 [profile.release]
 lto = "fat"
