@@ -104,7 +104,7 @@ pub fn serve_tls<H: Handler>(
 }
 
 #[cfg(feature = "rustls")]
-pub type RustlsTlsEnv = Bundle<Tcp, dope_tls::RustlsTls, Throughput>;
+pub type RustlsTlsEnv = Bundle<Tcp, dope_tls::RustTls, Throughput>;
 
 #[cfg(feature = "rustls")]
 #[pin_project::pin_project]
@@ -112,7 +112,7 @@ pub type RustlsTlsEnv = Bundle<Tcp, dope_tls::RustlsTls, Throughput>;
 struct RustlsTlsDispatcher<H: Handler> {
     #[pin]
     #[manifold]
-    listener: Listener<0, App<H, dope_tls::RustlsTls>, RustlsTlsEnv>,
+    listener: Listener<0, App<H, dope_tls::RustTls>, RustlsTlsEnv>,
 }
 
 #[cfg(feature = "rustls")]
@@ -141,12 +141,12 @@ pub fn serve_tls_rustls<H: Handler>(
     if let Some(trigger) = shutdown {
         trigger.register(drv);
     }
-    let mut listener = Listener::<0, App<H, dope_tls::RustlsTls>, RustlsTlsEnv>::open_in(
+    let mut listener = Listener::<0, App<H, dope_tls::RustTls>, RustlsTlsEnv>::open_in(
         App::new(handler),
         listener_cfg,
         drv,
     )?;
-    listener.set_cfg(dope_tls::RustlsEndpoint::Server(tls_cfg));
+    listener.set_cfg(dope_tls::RustTlsEndpoint::Server(tls_cfg));
     let mut app = core::pin::pin!(RustlsTlsDispatcher { listener });
     exec.run(app.as_mut())
 }
