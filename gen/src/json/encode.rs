@@ -66,47 +66,43 @@ impl Encode {
     ) -> Result<TokenStream> {
         if fmode.seq {
             let elem = if fmode.nested {
-                quote!(sark::json::JsonEncode::write_json(__e, __out);)
+                quote!(sark::json::JsonEncode::write_into(__e, __w);)
             } else {
-                quote!(sark::json::Encode::extend_str(__e.as_bytes(), __out);)
+                quote!(__w.put_str(__e.as_bytes());)
             };
             return Ok(quote! {{
-                __out.extend_from_slice(b"[");
+                __w.put(b"[");
                 let mut __first = true;
                 for __e in (#access).iter() {
                     if !__first {
-                        __out.extend_from_slice(b",");
+                        __w.put(b",");
                     }
                     __first = false;
                     #elem
                 }
-                __out.extend_from_slice(b"]");
+                __w.put(b"]");
             }});
         }
         if fmode.nested {
-            return Ok(quote!(sark::json::JsonEncode::write_json(&#access, __out);));
+            return Ok(quote!(sark::json::JsonEncode::write_into(&#access, __w);));
         }
         let class = Classified::of(ty)?;
         let write = match class.scalar {
-            Scalar::U64 => quote!(sark::json::Encode::extend_u64(__out, #access);),
+            Scalar::U64 => quote!(__w.put_u64(#access);),
             Scalar::Bool => quote! {
                 if #access {
-                    __out.extend_from_slice(b"true");
+                    __w.put(b"true");
                 } else {
-                    __out.extend_from_slice(b"false");
+                    __w.put(b"false");
                 }
             },
             Scalar::LocalFrameBytes | Scalar::InlineToken => {
                 if fmode.raw {
-                    quote!(__out.extend_from_slice(#access.as_bytes());)
+                    quote!(__w.put(#access.as_bytes());)
                 } else if fmode.plain {
-                    quote! {
-                        __out.extend_from_slice(b"\"");
-                        __out.extend_from_slice(#access.as_bytes());
-                        __out.extend_from_slice(b"\"");
-                    }
+                    quote!(__w.put_str_plain(#access.as_bytes());)
                 } else {
-                    quote!(sark::json::Encode::extend_str(#access.as_bytes(), __out);)
+                    quote!(__w.put_str(#access.as_bytes());)
                 }
             }
         };
@@ -114,7 +110,7 @@ impl Encode {
             quote! {
                 match #access {
                     Some(value) => { #write }
-                    None => { __out.extend_from_slice(b"null"); }
+                    None => { __w.put(b"null"); }
                 }
             }
         } else {

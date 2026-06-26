@@ -250,7 +250,7 @@ impl<'a> Plan<'a> {
             let head_lit = syn::LitByteStr::new(head, Span::call_site());
             let write = Encode::write_expr(ty, *fmode, quote!(self.#ident))?;
             encoders.push(quote! {
-                __out.extend_from_slice(#head_lit);
+                __w.put(#head_lit);
                 #write
             });
             let len = Encode::len_expr(ty, *fmode, quote!(self.#ident))?;
@@ -576,9 +576,9 @@ pub(super) fn attr(mode: JsonMode, mut st: ItemStruct) -> Result<TokenStream> {
                 1usize #( + #leners )*
             }
 
-            fn write_json(&self, __out: &mut o3::buffer::Owned) {
+            fn write_into(&self, __w: &mut sark::json::Writer<'_>) {
                 #( #encoders )*
-                __out.extend_from_slice(b"}");
+                __w.put(b"}");
             }
         }
 

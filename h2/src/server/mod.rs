@@ -17,7 +17,7 @@ pub type TlsEnv = Bundle<Tcp, Tls, Throughput>;
 
 mod app;
 
-pub use app::{App, ConnState, Handler};
+pub use app::{App, ConnState, Handler, Request, Response};
 
 #[derive(Clone, Debug)]
 pub struct Cfg {
@@ -28,10 +28,10 @@ pub struct Cfg {
 
 #[pin_project::pin_project]
 #[derive(dope_gen::Dispatcher)]
-struct Dispatcher<H: Handler> {
+struct Dispatcher<'h, H: Handler> {
     #[pin]
     #[manifold]
-    listener: Listener<0, App<H>, Env>,
+    listener: Listener<0, App<'h, H>, Env>,
 }
 
 pub fn serve<H: Handler>(
@@ -58,17 +58,17 @@ pub fn serve<H: Handler>(
     if let Some(trigger) = shutdown {
         trigger.register(drv);
     }
-    let listener = Listener::<0, App<H>, Env>::open_in(App::new(handler), listener_cfg, drv)?;
+    let listener = Listener::<0, App<H>, Env>::open_in(App::new(&handler), listener_cfg, drv)?;
     let mut app = core::pin::pin!(Dispatcher { listener });
     exec.run(app.as_mut())
 }
 
 #[pin_project::pin_project]
 #[derive(dope_gen::Dispatcher)]
-struct TlsDispatcher<H: Handler> {
+struct TlsDispatcher<'h, H: Handler> {
     #[pin]
     #[manifold]
-    listener: Listener<0, App<H, Tls>, TlsEnv>,
+    listener: Listener<0, App<'h, H, Tls>, TlsEnv>,
 }
 
 pub fn serve_tls<H: Handler>(
@@ -97,7 +97,7 @@ pub fn serve_tls<H: Handler>(
         trigger.register(drv);
     }
     let mut listener =
-        Listener::<0, App<H, Tls>, TlsEnv>::open_in(App::new(handler), listener_cfg, drv)?;
+        Listener::<0, App<H, Tls>, TlsEnv>::open_in(App::new(&handler), listener_cfg, drv)?;
     listener.set_cfg(Endpoint::Server(Box::new(tls_cfg)));
     let mut app = core::pin::pin!(TlsDispatcher { listener });
     exec.run(app.as_mut())
@@ -109,10 +109,10 @@ pub type RustlsTlsEnv = Bundle<Tcp, dope_tls::RustTls, Throughput>;
 #[cfg(feature = "rustls")]
 #[pin_project::pin_project]
 #[derive(dope_gen::Dispatcher)]
-struct RustlsTlsDispatcher<H: Handler> {
+struct RustlsTlsDispatcher<'h, H: Handler> {
     #[pin]
     #[manifold]
-    listener: Listener<0, App<H, dope_tls::RustTls>, RustlsTlsEnv>,
+    listener: Listener<0, App<'h, H, dope_tls::RustTls>, RustlsTlsEnv>,
 }
 
 #[cfg(feature = "rustls")]
@@ -142,7 +142,7 @@ pub fn serve_tls_rustls<H: Handler>(
         trigger.register(drv);
     }
     let mut listener = Listener::<0, App<H, dope_tls::RustTls>, RustlsTlsEnv>::open_in(
-        App::new(handler),
+        App::new(&handler),
         listener_cfg,
         drv,
     )?;

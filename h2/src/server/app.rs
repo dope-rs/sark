@@ -1,21 +1,99 @@
+use std::collections::BTreeMap;
+use std::future::Future;
 use std::marker::PhantomData;
+use std::task::{Context, Poll};
 
 use dope::Driver;
+use dope::fiber::{Fiber, Slab, TaskId};
 use dope::manifold::Outcome;
 use dope::manifold::listener::{self, Application};
 use dope::transport::link::Slot;
 use dope::transport::wire::{Identity, RecvChunk, Wire};
+use o3::buffer::Shared;
 
 use crate::conn::{self, Conn, ConnError, Settings};
 use crate::frame::{ErrorCode, ParseError};
+use crate::hpack::OwnedHeader;
 use crate::role::ServerRole;
+use crate::stream::StreamId;
+
+pub const HANDLER_SLAB_CAP: usize = 256;
+const OUTBOUND_SOFT_CAP: usize = 64 * 1024;
+
+pub struct Request {
+    pub headers: Vec<OwnedHeader>,
+    pub body: Vec<u8>,
+}
+
+pub struct Response {
+    pub headers: Vec<OwnedHeader>,
+    pub body: Shared,
+}
+
+impl Response {
+    pub fn new(headers: Vec<OwnedHeader>, body: Shared) -> Self {
+        Self { headers, body }
+    }
+}
 
 pub trait Handler: 'static {
-    fn on_event(&mut self, event: conn::Event, conn: &mut Conn<ServerRole>);
+    type Fut<'h>: Future<Output = Response> + 'h
+    where
+        Self: 'h;
+
+    fn on_request<'h>(&'h self, req: Request) -> Fiber<'h, Self::Fut<'h>>;
+}
+
+/// A request being assembled across its HEADERS -> DATA* -> trailers event
+/// sequence. Buffered until the terminating end_stream so the handler receives
+/// the complete header list and body in one `Request`.
+struct Incoming {
+    headers: Vec<OwnedHeader>,
+    body: Vec<u8>,
+}
+
+impl From<Incoming> for Request {
+    fn from(inc: Incoming) -> Self {
+        Request {
+            headers: inc.headers,
+            body: inc.body,
+        }
+    }
+}
+
+struct PendingBody {
+    stream_id: StreamId,
+    body: Shared,
+    off: usize,
+    stalled: bool,
+}
+
+impl PendingBody {
+    fn pump(&mut self, conn: &mut Conn<ServerRole>) -> Result<bool, ConnError> {
+        loop {
+            if self.off >= self.body.len() {
+                return Ok(true);
+            }
+            if conn.outbound().len() >= OUTBOUND_SOFT_CAP {
+                self.stalled = false;
+                return Ok(false);
+            }
+            let rest = &self.body.as_slice()[self.off..];
+            let n = conn.send_data(self.stream_id, rest, true)?;
+            if n == 0 {
+                self.stalled = true;
+                return Ok(false);
+            }
+            self.off += n;
+        }
+    }
 }
 
 pub struct ConnState {
     pub conn: Conn<ServerRole>,
+    incoming: BTreeMap<StreamId, Incoming>,
+    pending: Vec<PendingBody>,
+    waiting: Vec<(StreamId, TaskId)>,
 }
 
 impl Default for ConnState {
@@ -25,33 +103,34 @@ impl Default for ConnState {
                 max_concurrent_streams: Some(256),
                 ..Settings::DEFAULT
             }),
+            incoming: BTreeMap::new(),
+            pending: Vec::new(),
+            waiting: Vec::new(),
         }
     }
 }
 
-pub struct App<H: Handler, W: Wire = Identity> {
-    user: H,
+pub struct App<'h, H: Handler, W: Wire = Identity> {
+    user: &'h H,
+    slab: Slab<'h, H::Fut<'h>, HANDLER_SLAB_CAP>,
     _wire: PhantomData<W>,
 }
 
-impl<H: Handler, W: Wire> App<H, W> {
-    pub fn new(user: H) -> Self {
+impl<'h, H: Handler, W: Wire> App<'h, H, W> {
+    pub fn new(user: &'h H) -> Self {
         Self {
             user,
+            slab: Slab::new(),
             _wire: PhantomData,
         }
     }
 
     pub fn handler(&self) -> &H {
-        &self.user
-    }
-
-    pub fn handler_mut(&mut self) -> &mut H {
-        &mut self.user
+        self.user
     }
 }
 
-impl<H: Handler, W: Wire> Application for App<H, W> {
+impl<'h, H: Handler, W: Wire> Application for App<'h, H, W> {
     type Conn = ConnState;
     type Wire = W;
 
@@ -73,36 +152,228 @@ impl<H: Handler, W: Wire> Application for App<H, W> {
             Self::flush_into(slot, aux, driver, true);
             return Outcome::Ok;
         }
-        while let Some(ev) = state.conn.poll_event() {
-            let release = ev.release_hint();
-            self.user.on_event(ev, &mut state.conn);
-            if let Some((stream_id, n)) = release {
-                let _ = state.conn.release_capacity(stream_id, n);
-            }
-        }
-        let close_after = state.conn.goaway_sent();
+        self.drain_events(slot, driver);
+        let close_after = slot.state.conn.conn.goaway_sent();
         Self::flush_into(slot, aux, driver, close_after);
         Outcome::Ok
     }
 
     fn on_send(
         &mut self,
-        _slot: &mut Slot<W, listener::State<ConnState>>,
+        slot: &mut Slot<W, listener::State<ConnState>>,
         _sent: usize,
-        _aux: &mut listener::Aux,
-        _driver: &mut Driver,
+        aux: &mut listener::Aux,
+        driver: &mut Driver,
     ) {
+        Self::pump_pending(&mut slot.state.conn);
+        let close_after = slot.state.conn.conn.goaway_sent();
+        if !slot.state.conn.conn.outbound().is_empty() {
+            Self::flush_into(slot, aux, driver, close_after);
+        }
+    }
+
+    fn on_wake(
+        &mut self,
+        slot: &mut Slot<W, listener::State<ConnState>>,
+        aux: &mut listener::Aux,
+        driver: &mut Driver,
+    ) {
+        if slot.state.conn.waiting.is_empty() {
+            return;
+        }
+        let waker = slot.make_waker(driver);
+        let mut cx = Context::from_waker(&waker);
+        let conn_ptr: *mut ConnState = &mut slot.state.conn;
+        // SAFETY: conn_ptr aliases slot.state.conn; the poll loop below touches only state.conn / state.waiting / self.slab through conn_ptr and never re-borrows slot.state.conn via slot (slot is used only for make_waker, already dropped), so &mut ConnState and &mut Slot stay disjoint.
+        let cstate: &mut ConnState = unsafe { &mut *conn_ptr };
+        let mut i = 0;
+        while i < cstate.waiting.len() {
+            let (stream_id, ref task) = cstate.waiting[i];
+            match self.slab.poll(task, &mut cx) {
+                Poll::Ready(resp) => {
+                    let (_, task) = cstate.waiting.swap_remove(i);
+                    self.slab.release(task);
+                    Self::begin_response(cstate, stream_id, resp);
+                }
+                Poll::Pending => i += 1,
+            }
+        }
+        let close_after = cstate.conn.goaway_sent();
+        if !cstate.conn.outbound().is_empty() {
+            Self::flush_into(slot, aux, driver, close_after);
+        }
     }
 
     fn on_close(
         &mut self,
-        _slot: &mut Slot<W, listener::State<ConnState>>,
+        slot: &mut Slot<W, listener::State<ConnState>>,
         _aux: &mut listener::Aux,
     ) {
+        for (_, task) in slot.state.conn.waiting.drain(..) {
+            self.slab.release(task);
+        }
+        slot.state.conn.pending.clear();
+        slot.state.conn.incoming.clear();
     }
 }
 
-impl<H: Handler, W: Wire> App<H, W> {
+impl<'h, H: Handler, W: Wire> App<'h, H, W> {
+    fn drain_events(
+        &mut self,
+        slot: &mut Slot<W, listener::State<ConnState>>,
+        driver: &mut Driver,
+    ) {
+        let conn_ptr: *mut ConnState = &mut slot.state.conn;
+        // SAFETY: conn_ptr aliases slot.state.conn; this fn touches slot only via make_waker (which borrows the parker, not state) before re-deriving the waker, and otherwise drives state.conn / self.slab through conn_ptr, keeping &mut ConnState disjoint from any &mut Slot use.
+        let cstate: &mut ConnState = unsafe { &mut *conn_ptr };
+        let waker = slot.make_waker(driver);
+        let mut cx = Context::from_waker(&waker);
+        while let Some(ev) = cstate.conn.poll_event() {
+            let release = ev.release_hint();
+            match ev {
+                conn::Event::Headers {
+                    stream_id,
+                    headers,
+                    end_stream,
+                    trailing,
+                } => {
+                    if trailing {
+                        // Trailers terminate a bodied request: flush whatever was
+                        // buffered, appending the trailer fields to the head list.
+                        if let Some(mut inc) = cstate.incoming.remove(&stream_id) {
+                            inc.headers.extend(headers);
+                            self.dispatch(cstate, stream_id, inc.into(), &mut cx);
+                        }
+                    } else if end_stream {
+                        let req = Request {
+                            headers,
+                            body: Vec::new(),
+                        };
+                        self.dispatch(cstate, stream_id, req, &mut cx);
+                    } else {
+                        cstate.incoming.insert(
+                            stream_id,
+                            Incoming {
+                                headers,
+                                body: Vec::new(),
+                            },
+                        );
+                    }
+                }
+                conn::Event::Data {
+                    stream_id,
+                    data,
+                    end_stream,
+                } => {
+                    if end_stream {
+                        if let Some(mut inc) = cstate.incoming.remove(&stream_id) {
+                            inc.body.extend_from_slice(&data);
+                            self.dispatch(cstate, stream_id, inc.into(), &mut cx);
+                        }
+                    } else if let Some(inc) = cstate.incoming.get_mut(&stream_id) {
+                        inc.body.extend_from_slice(&data);
+                    }
+                }
+                conn::Event::StreamReset { stream_id, .. } => {
+                    cstate.incoming.remove(&stream_id);
+                    cstate.pending.retain(|p| p.stream_id != stream_id);
+                    if let Some(pos) = cstate.waiting.iter().position(|(s, _)| *s == stream_id) {
+                        let (_, task) = cstate.waiting.swap_remove(pos);
+                        self.slab.release(task);
+                    }
+                }
+                _ => {}
+            }
+            if let Some((stream_id, n)) = release {
+                let _ = cstate.conn.release_capacity(stream_id, n);
+            }
+        }
+        // Window updates in this batch are coalesced into one resume pass.
+        Self::resume_pending(cstate);
+    }
+
+    fn dispatch(
+        &mut self,
+        cstate: &mut ConnState,
+        stream_id: StreamId,
+        req: Request,
+        cx: &mut Context<'_>,
+    ) {
+        let fiber = self.user.on_request(req);
+        match self.slab.alloc(fiber) {
+            Some(task) => match self.slab.poll(&task, cx) {
+                Poll::Ready(resp) => {
+                    self.slab.release(task);
+                    Self::begin_response(cstate, stream_id, resp);
+                }
+                Poll::Pending => cstate.waiting.push((stream_id, task)),
+            },
+            None => {
+                let _ = cstate
+                    .conn
+                    .reset_stream(stream_id, ErrorCode::RefusedStream);
+            }
+        }
+    }
+
+    fn begin_response(cstate: &mut ConnState, stream_id: StreamId, resp: Response) {
+        if !cstate.conn.has_stream(stream_id) {
+            return;
+        }
+        let end_stream = resp.body.is_empty();
+        if cstate
+            .conn
+            .send_response(
+                stream_id,
+                resp.headers.iter().map(|h| h.as_ref()),
+                end_stream,
+            )
+            .is_err()
+        {
+            return;
+        }
+        if end_stream {
+            return;
+        }
+        let mut body = PendingBody {
+            stream_id,
+            body: resp.body,
+            off: 0,
+            stalled: false,
+        };
+        match body.pump(&mut cstate.conn) {
+            Ok(true) => {}
+            Ok(false) | Err(_) => cstate.pending.push(body),
+        }
+    }
+
+    fn resume_pending(cstate: &mut ConnState) {
+        if !cstate.conn.take_window_opened() {
+            return;
+        }
+        for body in cstate.pending.iter_mut() {
+            body.stalled = false;
+        }
+        Self::pump_pending(cstate);
+    }
+
+    fn pump_pending(cstate: &mut ConnState) {
+        let ConnState { conn, pending, .. } = cstate;
+        let mut i = 0;
+        while i < pending.len() {
+            if pending[i].stalled || conn.outbound().len() >= OUTBOUND_SOFT_CAP {
+                i += 1;
+                continue;
+            }
+            match pending[i].pump(conn) {
+                Ok(true) | Err(_) => {
+                    pending.swap_remove(i);
+                }
+                Ok(false) => i += 1,
+            }
+        }
+    }
+
     fn flush_into(
         slot: &mut Slot<W, listener::State<ConnState>>,
         aux: &mut listener::Aux,
@@ -141,5 +412,265 @@ impl<H: Handler, W: Wire> App<H, W> {
             ConnError::StreamLimit => ErrorCode::RefusedStream,
             ConnError::HeaderListTooLarge | ConnError::Overload => ErrorCode::EnhanceYourCalm,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::conn::CLIENT_PREFACE;
+    use crate::frame::{self, FrameHeader, WindowUpdate};
+    use crate::hpack::{Encoder, Header};
+
+    type TestApp = App<'static, NoopHandler>;
+
+    struct NoopHandler;
+
+    impl Handler for NoopHandler {
+        type Fut<'h> = std::future::Ready<Response>;
+
+        fn on_request<'h>(&'h self, _req: Request) -> Fiber<'h, Self::Fut<'h>> {
+            Fiber::new(std::future::ready(Response::new(
+                Vec::new(),
+                Shared::from(Vec::new()),
+            )))
+        }
+    }
+
+    fn open_stream(cstate: &mut ConnState, stream_id: StreamId) {
+        cstate.conn.drain_outbound(cstate.conn.outbound().len());
+        cstate.conn.ingest(CLIENT_PREFACE).unwrap();
+        let mut enc = Encoder::new(4096);
+        let mut block = Vec::new();
+        enc.encode(
+            [
+                Header {
+                    name: b":method",
+                    value: b"GET",
+                },
+                Header {
+                    name: b":scheme",
+                    value: b"http",
+                },
+                Header {
+                    name: b":path",
+                    value: b"/",
+                },
+                Header {
+                    name: b":authority",
+                    value: b"x",
+                },
+            ],
+            &mut block,
+        );
+        let mut frame = Vec::new();
+        crate::frame::Headers {
+            stream_id,
+            end_stream: true,
+            end_headers: true,
+            priority: None,
+            block_fragment: &block,
+        }
+        .encode(&mut frame);
+        cstate.conn.ingest(&frame).unwrap();
+        while cstate.conn.poll_event().is_some() {}
+        cstate.conn.drain_outbound(cstate.conn.outbound().len());
+    }
+
+    fn ingest_window_update(cstate: &mut ConnState, stream_id: StreamId, increment: u32) {
+        let mut bytes = Vec::new();
+        WindowUpdate {
+            stream_id,
+            increment,
+        }
+        .encode(&mut bytes);
+        cstate.conn.ingest(&bytes).unwrap();
+        while cstate.conn.poll_event().is_some() {}
+        TestApp::resume_pending(cstate);
+    }
+
+    fn collect_data(out: &[u8]) -> (Vec<u8>, bool) {
+        let mut pos = 0;
+        let mut body = Vec::new();
+        let mut saw_end = false;
+        while pos < out.len() {
+            let h = FrameHeader::parse(&out[pos..]).unwrap();
+            let total = 9 + h.length as usize;
+            if h.kind == frame::Type::Data {
+                assert!(!saw_end, "DATA after END_STREAM");
+                let payload = &out[pos + 9..pos + total];
+                body.extend_from_slice(payload);
+                if h.flags.has(frame::Flags::END_STREAM) {
+                    saw_end = true;
+                }
+            }
+            pos += total;
+        }
+        (body, saw_end)
+    }
+
+    fn drain_data(cstate: &mut ConnState, acc: &mut Vec<u8>, end: &mut bool) {
+        let out = cstate.conn.outbound().to_vec();
+        let (body, saw_end) = collect_data(&out);
+        acc.extend_from_slice(&body);
+        *end |= saw_end;
+        cstate.conn.drain_outbound(cstate.conn.outbound().len());
+    }
+
+    #[test]
+    fn body_larger_than_window_delivered_across_stream_and_conn_updates() {
+        let mut cstate = ConnState::default();
+        let stream_id = StreamId(1);
+        open_stream(&mut cstate, stream_id);
+
+        let total = 200_000usize;
+        let payload: Vec<u8> = (0..total).map(|i| (i % 251) as u8).collect();
+        let resp = Response::new(
+            vec![OwnedHeader::new(b":status", b"200")],
+            Shared::from(payload.clone()),
+        );
+        TestApp::begin_response(&mut cstate, stream_id, resp);
+
+        let mut acc = Vec::new();
+        let mut end = false;
+        drain_data(&mut cstate, &mut acc, &mut end);
+
+        assert!(acc.len() <= 65_535, "stalled at the initial send window");
+        assert!(!end, "END_STREAM must not be set before the true end");
+
+        loop {
+            if end {
+                break;
+            }
+            ingest_window_update(&mut cstate, StreamId::CONNECTION, 50_000);
+            ingest_window_update(&mut cstate, stream_id, 50_000);
+            drain_data(&mut cstate, &mut acc, &mut end);
+        }
+
+        assert_eq!(acc, payload, "all body bytes delivered intact and in order");
+        assert!(end, "END_STREAM seen at the true end");
+    }
+
+    #[test]
+    fn awaiting_handler_suspends_then_pump_after_ready() {
+        use std::cell::Cell;
+        use std::pin::Pin;
+        use std::task::Poll;
+
+        struct OnceReady {
+            polled: Cell<bool>,
+            out: Cell<Option<Response>>,
+        }
+
+        impl Future for OnceReady {
+            type Output = Response;
+            fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Response> {
+                if self.polled.get() {
+                    Poll::Ready(self.out.take().unwrap())
+                } else {
+                    self.polled.set(true);
+                    cx.waker().wake_by_ref();
+                    Poll::Pending
+                }
+            }
+        }
+
+        let mut cstate = ConnState::default();
+        let stream_id = StreamId(1);
+        open_stream(&mut cstate, stream_id);
+
+        let resp = Response::new(
+            vec![OwnedHeader::new(b":status", b"200")],
+            Shared::from(b"deferred".to_vec()),
+        );
+        let fut = OnceReady {
+            polled: Cell::new(false),
+            out: Cell::new(Some(resp)),
+        };
+        let mut slab: Slab<'static, OnceReady, HANDLER_SLAB_CAP> = Slab::new();
+        let waker = std::task::Waker::noop();
+        let mut cx = Context::from_waker(waker);
+
+        let task = slab.alloc(Fiber::new(fut)).unwrap();
+        assert!(matches!(slab.poll(&task, &mut cx), Poll::Pending));
+        cstate.waiting.push((stream_id, task));
+
+        let (_, task) = cstate.waiting.pop().unwrap();
+        let resp = match slab.poll(&task, &mut cx) {
+            Poll::Ready(r) => r,
+            Poll::Pending => panic!("expected ready on second poll"),
+        };
+        slab.release(task);
+        TestApp::begin_response(&mut cstate, stream_id, resp);
+
+        let mut acc = Vec::new();
+        let mut end = false;
+        drain_data(&mut cstate, &mut acc, &mut end);
+        assert_eq!(acc, b"deferred");
+        assert!(end);
+    }
+
+    #[test]
+    fn sync_handler_completes_inline_without_suspension() {
+        let mut cstate = ConnState::default();
+        let mut app: TestApp = App::new(&NoopHandler);
+        let stream_id = StreamId(1);
+        open_stream(&mut cstate, stream_id);
+
+        let body = Shared::from(b"small body".to_vec());
+        let resp = Response::new(vec![OwnedHeader::new(b":status", b"200")], body);
+        TestApp::begin_response(&mut cstate, stream_id, resp);
+
+        assert!(
+            cstate.waiting.is_empty(),
+            "a non-awaiting handler retains nothing"
+        );
+        assert!(
+            cstate.pending.is_empty(),
+            "a small body fits the window and leaves no pending pump"
+        );
+        let _ = &mut app;
+
+        let mut acc = Vec::new();
+        let mut end = false;
+        drain_data(&mut cstate, &mut acc, &mut end);
+        assert_eq!(acc, b"small body");
+        assert!(end);
+    }
+
+    #[test]
+    fn connection_level_update_alone_resumes() {
+        let mut cstate = ConnState::default();
+        let s1 = StreamId(1);
+        open_stream(&mut cstate, s1);
+
+        let total = 120_000usize;
+        let payload = vec![7u8; total];
+        let resp = Response::new(
+            vec![OwnedHeader::new(b":status", b"200")],
+            Shared::from(payload.clone()),
+        );
+        TestApp::begin_response(&mut cstate, s1, resp);
+
+        let mut acc = Vec::new();
+        let mut end = false;
+        drain_data(&mut cstate, &mut acc, &mut end);
+        let first = acc.len();
+        assert!(first <= 65_535);
+        assert!(!end);
+
+        ingest_window_update(&mut cstate, s1, 200_000);
+        drain_data(&mut cstate, &mut acc, &mut end);
+        assert_eq!(
+            acc.len(),
+            first,
+            "stream update alone cannot exceed the conn window"
+        );
+        assert!(!end);
+
+        ingest_window_update(&mut cstate, StreamId::CONNECTION, 200_000);
+        drain_data(&mut cstate, &mut acc, &mut end);
+        assert_eq!(acc, payload);
+        assert!(end);
     }
 }

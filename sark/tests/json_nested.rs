@@ -1,6 +1,24 @@
 use o3::buffer::Shared;
-use sark::json::{JsonDecode, JsonEncode};
+use sark::json::{JsonDecode, JsonEncode, Scratch};
 use sark_core::http::LocalFrameBytes;
+
+#[sark_gen::json(ordered)]
+struct Message {
+    message: LocalFrameBytes,
+}
+
+#[allow(non_snake_case)]
+#[sark_gen::json(ordered)]
+struct World {
+    id: u64,
+    randomNumber: u64,
+}
+
+#[sark_gen::json(ordered)]
+struct Fortune {
+    id: u64,
+    message: LocalFrameBytes,
+}
 
 #[sark_gen::json(ordered)]
 struct Rating {
@@ -137,6 +155,71 @@ fn array_elements_are_escaped() {
             .unwrap()
             .contains(r#""tags":["a\"b","c\nd"],"#)
     );
+}
+
+#[test]
+fn tfb_message_shape() {
+    let value = Message {
+        message: lfb(b"Hello, World!"),
+    };
+    assert_eq!(encode(&value), br#"{"message":"Hello, World!"}"#);
+}
+
+#[test]
+fn world_shape() {
+    let value = World {
+        id: 4242,
+        randomNumber: 88,
+    };
+    assert_eq!(encode(&value), br#"{"id":4242,"randomNumber":88}"#);
+}
+
+#[test]
+fn fortune_shape_with_escapes() {
+    let value = Fortune {
+        id: 11,
+        message: lfb(b"<script>alert(\"x\")</script>\n\tend"),
+    };
+    let bytes = encode(&value);
+    assert_eq!(
+        bytes,
+        &br#"{"id":11,"message":"<script>alert(\"x\")</script>\n\tend"}"#[..]
+    );
+}
+
+#[test]
+fn control_chars_six_byte_escape_identity() {
+    let value = Fortune {
+        id: 0,
+        message: lfb(&[0x00, b'a', 0x1f, b'b']),
+    };
+    let bytes = encode(&value);
+    let mut expected = Vec::new();
+    expected.extend_from_slice(br#"{"id":0,"message":""#);
+    expected.extend_from_slice(b"\\u0000a\\u001fb");
+    expected.extend_from_slice(br#""}"#);
+    assert_eq!(bytes, expected);
+}
+
+#[test]
+fn scratch_reuse_yields_identical_bytes() {
+    let scratch: Scratch<Item> = Scratch::new();
+    let mut prev: Option<Vec<u8>> = None;
+    for _ in 0..5 {
+        let mut items = scratch.take();
+        items.push(sample_item());
+        items.push(sample_item());
+        let response = ItemsResponse { items, count: 2 };
+        let bytes = encode(&response);
+        if let Some(ref expected) = prev {
+            assert_eq!(
+                &bytes, expected,
+                "scratch reuse must produce identical bytes"
+            );
+        }
+        scratch.give(response.items);
+        prev = Some(bytes);
+    }
 }
 
 #[test]

@@ -1,5 +1,98 @@
 use o3::buffer::Owned;
 
+pub struct Writer<'a> {
+    buf: &'a mut Owned,
+    ptr: *mut u8,
+    cap: usize,
+    len: usize,
+}
+
+impl<'a> Writer<'a> {
+    pub fn new(buf: &'a mut Owned, estimate: usize) -> Self {
+        let len = buf.len();
+        buf.reserve(estimate);
+        let cap = buf.capacity();
+        let spare = buf.spare_capacity_mut();
+        let ptr = spare.as_mut_ptr().cast::<u8>();
+        // SAFETY: spare_capacity_mut starts at base + len, so base = spare - len is in-bounds.
+        let ptr = unsafe { ptr.sub(len) };
+        Self { buf, ptr, cap, len }
+    }
+
+    #[cold]
+    fn grow(&mut self, additional: usize) {
+        // SAFETY: self.len bytes were written into buf's spare region.
+        unsafe { self.buf.set_len(self.len) };
+        self.buf.reserve(additional);
+        self.cap = self.buf.capacity();
+        let len = self.len;
+        let spare = self.buf.spare_capacity_mut();
+        // SAFETY: spare starts at base + len, so base = spare - len is in-bounds.
+        self.ptr = unsafe { spare.as_mut_ptr().cast::<u8>().sub(len) };
+    }
+
+    pub fn put(&mut self, src: &[u8]) {
+        let need = self.len + src.len();
+        if need > self.cap {
+            self.grow(src.len());
+        }
+        // SAFETY: need <= cap holds after grow, so ptr + len .. + src.len() stays in-bounds.
+        unsafe {
+            std::ptr::copy_nonoverlapping(src.as_ptr(), self.ptr.add(self.len), src.len());
+        }
+        self.len = need;
+    }
+
+    pub fn put_str(&mut self, value: &[u8]) {
+        self.put(b"\"");
+        let mut start = 0usize;
+        let mut idx = 0usize;
+        while idx < value.len() {
+            if let Some(token) = Encode::esc_token(value[idx]) {
+                if start != idx {
+                    self.put(&value[start..idx]);
+                }
+                self.put(token.as_bytes());
+                idx += 1;
+                start = idx;
+                continue;
+            }
+            idx += 1;
+        }
+        if start != value.len() {
+            self.put(&value[start..]);
+        }
+        self.put(b"\"");
+    }
+
+    pub fn put_str_plain(&mut self, value: &[u8]) {
+        self.put(b"\"");
+        self.put(value);
+        self.put(b"\"");
+    }
+
+    pub fn put_u64(&mut self, value: u64) {
+        if value == 0 {
+            self.put(b"0");
+            return;
+        }
+        let mut digits = [0u8; 20];
+        let mut idx = digits.len();
+        let mut value = value;
+        while value != 0 {
+            idx -= 1;
+            digits[idx] = b'0' + (value % 10) as u8;
+            value /= 10;
+        }
+        self.put(&digits[idx..]);
+    }
+
+    pub fn finish(self) {
+        // SAFETY: self.len bytes were written into buf's spare region.
+        unsafe { self.buf.set_len(self.len) };
+    }
+}
+
 pub struct Encode;
 
 impl Encode {
@@ -19,45 +112,6 @@ impl Encode {
         2 + Self::esc_len(value)
     }
 
-    pub fn extend_str(value: &[u8], out: &mut Owned) {
-        out.extend_from_slice(b"\"");
-        let mut start = 0usize;
-        let mut idx = 0usize;
-        while idx < value.len() {
-            let esc = Self::esc_token(value[idx]);
-            if let Some(token) = esc {
-                if start != idx {
-                    out.extend_from_slice(&value[start..idx]);
-                }
-                out.extend_from_slice(token.as_bytes());
-                idx += 1;
-                start = idx;
-                continue;
-            }
-            idx += 1;
-        }
-        if start != value.len() {
-            out.extend_from_slice(&value[start..]);
-        }
-        out.extend_from_slice(b"\"");
-    }
-
-    pub fn extend_u64(out: &mut Owned, value: u64) {
-        if value == 0 {
-            out.extend_from_slice(b"0");
-            return;
-        }
-        let mut digits = [0u8; 20];
-        let mut idx = digits.len();
-        let mut value = value;
-        while value != 0 {
-            idx -= 1;
-            digits[idx] = b'0' + (value % 10) as u8;
-            value /= 10;
-        }
-        out.extend_from_slice(&digits[idx..]);
-    }
-
     fn esc_len(value: &[u8]) -> usize {
         let mut len = 0usize;
         let mut idx = 0usize;
@@ -69,10 +123,9 @@ impl Encode {
     }
 
     fn esc_size(byte: u8) -> usize {
-        match byte {
-            b'"' | b'\\' | 0x08 | b'\n' | 0x0c | b'\r' | b'\t' => 2,
-            0x00..=0x1f => 6,
-            _ => 1,
+        match Self::esc_token(byte) {
+            Some(token) => token.len(),
+            None => 1,
         }
     }
 

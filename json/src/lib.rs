@@ -6,12 +6,14 @@ mod encode;
 mod error;
 mod parse;
 mod scan;
+mod scratch;
 mod traits;
 
 pub use body::InlineToken;
-pub use encode::Encode;
+pub use encode::{Encode, Writer};
 pub use parse::Parse;
 pub use scan::Scan;
+pub use scratch::Scratch;
 pub use traits::{JsonDecode, JsonEncode, JsonPreserve, JsonScan};
 
 pub type Result<T> = sark_core::error::Result<T>;

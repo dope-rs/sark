@@ -53,6 +53,14 @@ pub struct Ctx<'a> {
 impl<'a> Ctx<'a> {
     pub fn parse(req_bytes: &'a [u8], parsed: &'a crate::parser::framer::ParsedHead<'a>) -> Self {
         let method_key = crate::service::Key::from_bytes(parsed.method);
+        Self::parse_with_key(req_bytes, parsed, method_key)
+    }
+
+    pub fn parse_with_key(
+        req_bytes: &'a [u8],
+        parsed: &'a crate::parser::framer::ParsedHead<'a>,
+        method_key: crate::service::Key,
+    ) -> Self {
         let target = parsed.target;
         let path_end = target
             .iter()

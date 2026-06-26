@@ -30,4 +30,9 @@ cartel-redis = "0.2"
 cartel-pg = "0.2"
 cartel-gen = "0.2"
 sark-ws.workspace = true
+criterion = { version = "0.5", default-features = false, features = ["cargo_bench_support"] }
+
+[[bench]]
+name = "head_parse"
+harness = false
 

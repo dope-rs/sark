@@ -1,39 +1,36 @@
 use std::env;
+use std::future::ready;
 use std::net::SocketAddr;
 
+use dope::fiber::Fiber;
 use dope::launcher::Launcher;
-use sark_h2::server::{Cfg, Handler, serve};
-use sark_h2::{Conn, Header, ServerRole, conn};
+use o3::buffer::Shared;
+use sark_h2::hpack::OwnedHeader;
+use sark_h2::server::{Cfg, Handler, Request, Response, serve};
 
 struct Echo;
 
 impl Handler for Echo {
-    fn on_event(&mut self, event: conn::Event, conn: &mut Conn<ServerRole>) {
-        if let conn::Event::Headers {
-            stream_id,
-            end_stream,
-            ..
-        } = event
-        {
-            if !end_stream {
-                return;
-            }
-            let status = Header {
-                name: b":status",
-                value: b"200",
-            };
-            let content_type = Header {
-                name: b"content-type",
-                value: b"text/plain",
-            };
-            let content_length = Header {
-                name: b"content-length",
-                value: b"19",
-            };
-            let body: &[u8] = b"hello from sark-h2\n";
-            let _ = conn.send_response(stream_id, &[status, content_type, content_length], false);
-            let _ = conn.send_data(stream_id, body, true);
-        }
+    type Fut<'h> = std::future::Ready<Response>;
+
+    fn on_request<'h>(&'h self, req: Request) -> Fiber<'h, Self::Fut<'h>> {
+        let path = req
+            .headers
+            .iter()
+            .find(|h| h.name == b":path")
+            .map(|h| h.value.clone())
+            .unwrap_or_default();
+        let body: Shared = if path == b"/large" {
+            Shared::from(vec![b'x'; 1 << 20])
+        } else {
+            Shared::from(b"hello from sark-h2\n".to_vec())
+        };
+        let headers = vec![
+            OwnedHeader::new(b":status", b"200"),
+            OwnedHeader::new(b"content-type", b"text/plain"),
+            OwnedHeader::new(b"content-length", body.len().to_string().as_bytes()),
+        ];
+        Fiber::new(ready(Response::new(headers, body)))
     }
 }
 

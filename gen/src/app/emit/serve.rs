@@ -913,17 +913,17 @@ impl<'a> ServeEmit<'a> {
             }
         };
         let ctx_build = if static_tree.is_empty() && param_dfa.is_empty() {
-            quote! {}
+            quote! { let _ = method_key; }
         } else {
             quote! {
-                let ctx = ::sark::dispatch::Ctx::parse(req_bytes, head);
+                let ctx = ::sark::dispatch::Ctx::parse_with_key(req_bytes, head, method_key);
             }
         };
         let static_method_path = if static_tree.is_empty() {
             quote! {}
         } else {
             quote! {
-                let __method = ctx.method_key;
+                let __method = method_key;
                 let __path = ctx.slice_path.bytes();
             }
         };
@@ -1058,6 +1058,7 @@ impl<'a> ServeEmit<'a> {
                     state: &'d #state_ty,
                     req_bytes: &'buf [u8],
                     head: &::sark::framer::ParsedHead<'buf>,
+                    method_key: ::sark::service::Key,
                     date: &[u8; 29],
                     write: &mut [u8],
                     conn: &mut ::sark::dispatch::conn_state::ConnState,
@@ -1078,15 +1079,17 @@ impl<'a> ServeEmit<'a> {
                     write: &mut [u8],
                     conn: &mut ::sark::dispatch::conn_state::ConnState,
                 ) -> ::sark::dispatch::ConsumeOutcome {
-                    let ::std::option::Option::Some(head) =
-                        ::sark::framer::Http::parse_head(bytes)
+                    let ::std::option::Option::Some(__fused) =
+                        ::sark::framer::Http::parse_head_fused(bytes)
                     else {
                         return ::sark::dispatch::ConsumeOutcome::NeedMore { permit, content_length: ::std::option::Option::None };
                     };
+                    let head = __fused.head;
+                    let method_key = __fused.method_key;
                     let date = *::sark::date::DateHost::date_stamp(self).buf();
                     let state_ref: &'d #state_ty = self.state;
                     Self::dispatch_request(
-                        self, permit, state_ref, bytes, &head, &date, write, conn,
+                        self, permit, state_ref, bytes, &head, method_key, &date, write, conn,
                     )
                 }
             }
