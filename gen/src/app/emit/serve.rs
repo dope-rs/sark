@@ -1094,7 +1094,7 @@ impl<'a> ServeEmit<'a> {
 
             impl #f_idents_def ::sark::dispatch::H1Project<__W> for #name #f_idents_use
             where #( #route_bounds )* {
-                fn project_on_chunk<__C, __PJ>(
+                fn on_chunk_proj<__C, __PJ>(
                     &mut self,
                     slot: &mut #proj_slot_ty,
                     bytes: &[u8],
@@ -1108,7 +1108,7 @@ impl<'a> ServeEmit<'a> {
                 }
 
                 #[allow(clippy::too_many_arguments)]
-                fn project_on_send<__C, __PJ>(
+                fn on_send_proj<__C, __PJ>(
                     &mut self,
                     slot: &mut #proj_slot_ty,
                     project: __PJ,
@@ -1119,7 +1119,7 @@ impl<'a> ServeEmit<'a> {
                     #on_send_complete_body
                 }
 
-                fn project_on_wake<__C, __PJ>(
+                fn on_wake_proj<__C, __PJ>(
                     &mut self,
                     slot: &mut #proj_slot_ty,
                     project: __PJ,
@@ -1129,7 +1129,7 @@ impl<'a> ServeEmit<'a> {
                     #on_wake_proj_body
                 }
 
-                fn project_on_close<__C, __PJ>(
+                fn on_close_proj<__C, __PJ>(
                     &mut self,
                     slot: &mut #proj_slot_ty,
                     project: __PJ,
@@ -1231,7 +1231,7 @@ impl<'a> ServeEmit<'a> {
                     aux: &mut ::dope::manifold::listener::Aux,
                     driver: &mut ::dope::Driver,
                 ) {
-                    <Self as ::sark::dispatch::H1Project<__W>>::project_on_send(
+                    <Self as ::sark::dispatch::H1Project<__W>>::on_send_proj(
                         self, slot, ::sark::dispatch::identity_mut, sent, aux, driver,
                     );
                 }
@@ -1245,7 +1245,7 @@ impl<'a> ServeEmit<'a> {
                     aux: &mut ::dope::manifold::listener::Aux,
                     driver: &mut ::dope::Driver,
                 ) {
-                    <Self as ::sark::dispatch::H1Project<__W>>::project_on_wake(
+                    <Self as ::sark::dispatch::H1Project<__W>>::on_wake_proj(
                         self, slot, ::sark::dispatch::identity_mut, aux, driver,
                     );
                 }
@@ -1258,7 +1258,7 @@ impl<'a> ServeEmit<'a> {
                     >,
                     _aux: &mut ::dope::manifold::listener::Aux,
                 ) {
-                    <Self as ::sark::dispatch::H1Project<__W>>::project_on_close(
+                    <Self as ::sark::dispatch::H1Project<__W>>::on_close_proj(
                         self, slot, ::sark::dispatch::identity_mut, _aux,
                     );
                 }

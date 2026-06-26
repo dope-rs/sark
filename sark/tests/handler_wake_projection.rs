@@ -86,7 +86,7 @@ where
         driver: &mut Driver,
     ) -> Outcome {
         let bytes = chunk.as_slice();
-        if self.inner.project_on_chunk(slot, bytes, aux, driver, proj) {
+        if self.inner.on_chunk_proj(slot, bytes, aux, driver, proj) {
             Outcome::Overrun
         } else {
             Outcome::Ok
@@ -100,7 +100,7 @@ where
         aux: &mut Aux,
         driver: &mut Driver,
     ) {
-        self.inner.project_on_send(slot, proj, sent, aux, driver);
+        self.inner.on_send_proj(slot, proj, sent, aux, driver);
     }
 
     fn on_wake(
@@ -109,11 +109,11 @@ where
         aux: &mut Aux,
         driver: &mut Driver,
     ) {
-        self.inner.project_on_wake(slot, proj, aux, driver);
+        self.inner.on_wake_proj(slot, proj, aux, driver);
     }
 
     fn on_close(&mut self, slot: &mut Slot<Self::Wire, State<Self::Conn>>, aux: &mut Aux) {
-        self.inner.project_on_close(slot, proj, aux);
+        self.inner.on_close_proj(slot, proj, aux);
     }
 }
 

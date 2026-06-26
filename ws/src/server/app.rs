@@ -334,8 +334,7 @@ impl<H: Handler> App<H> {
     }
 
     fn validate_handshake(head: &str, expected_path: &str) -> Result<String, ()> {
-        let mut lines = head.split("\r\n");
-        let request = lines.next().unwrap_or("");
+        let (request, rest) = head.split_once("\r\n").unwrap_or((head, ""));
         let mut parts = request.split_whitespace();
         let method = parts.next().unwrap_or("");
         let target = parts.next().unwrap_or("");
@@ -350,22 +349,18 @@ impl<H: Handler> App<H> {
         let mut connection = None::<&str>;
         let mut ws_version = None::<&str>;
         let mut key = None::<&str>;
-        for line in lines {
-            if line.is_empty() {
+        for (name, value) in sark_core::http::head::header_lines(rest.as_bytes()) {
+            let Ok(value) = std::str::from_utf8(value) else {
                 continue;
-            }
-            if let Some((name, value)) = line.split_once(':') {
-                let name = name.trim();
-                let value = value.trim();
-                if name.eq_ignore_ascii_case("upgrade") {
-                    upgrade = Some(value);
-                } else if name.eq_ignore_ascii_case("connection") {
-                    connection = Some(value);
-                } else if name.eq_ignore_ascii_case("sec-websocket-version") {
-                    ws_version = Some(value);
-                } else if name.eq_ignore_ascii_case("sec-websocket-key") {
-                    key = Some(value);
-                }
+            };
+            if name.eq_ignore_ascii_case(b"upgrade") {
+                upgrade = Some(value);
+            } else if name.eq_ignore_ascii_case(b"connection") {
+                connection = Some(value);
+            } else if name.eq_ignore_ascii_case(b"sec-websocket-version") {
+                ws_version = Some(value);
+            } else if name.eq_ignore_ascii_case(b"sec-websocket-key") {
+                key = Some(value);
             }
         }
         let upgrade = upgrade.ok_or(())?;

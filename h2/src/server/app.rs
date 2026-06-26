@@ -12,7 +12,7 @@ use dope::transport::wire::{Identity, RecvChunk, Wire};
 use o3::buffer::Shared;
 
 use crate::conn::{self, Conn, ConnError, Settings};
-use crate::frame::{ErrorCode, ParseError};
+use crate::frame::ErrorCode;
 use crate::hpack::{Header, OwnedHeader};
 use crate::role::ServerRole;
 use crate::stream::StreamId;
@@ -166,7 +166,7 @@ impl<'h, H: Handler, W: Wire> Application for App<'h, H, W> {
             return Outcome::Ok;
         }
         if let Err(e) = state.conn.ingest(bytes) {
-            let code = Self::map_error(&e);
+            let code = ErrorCode::from(&e);
             state.conn.goaway(code, b"");
             Self::flush_into(slot, aux, driver, true);
             return Outcome::Ok;
@@ -405,35 +405,11 @@ impl<'h, H: Handler, W: Wire> App<'h, H, W> {
         let send_ud = slot.token();
         let write_buf = aux.write_buf_for(slot);
         let state = &mut slot.state.conn;
-        let out = state.conn.outbound();
-        let n = out.len().min(write_buf.len());
-        write_buf[..n].copy_from_slice(&out[..n]);
-        state.conn.drain_outbound(n);
+        let n = state.conn.drain_into(write_buf);
         if close_after {
             slot.core.set_close_after();
         }
         slot.submit_buffered(write_buf, n, send_ud, driver);
-    }
-
-    fn map_error(e: &ConnError) -> ErrorCode {
-        match e {
-            ConnError::BadPreface
-            | ConnError::Protocol
-            | ConnError::BadStream
-            | ConnError::Continuation
-            | ConnError::BadSettings
-            | ConnError::StreamGoneAway => ErrorCode::ProtocolError,
-            ConnError::StreamClosed => ErrorCode::StreamClosed,
-            ConnError::ParseError(ParseError::FrameSize)
-            | ConnError::ParseError(ParseError::BadLength) => ErrorCode::FrameSize,
-            ConnError::ParseError(_) => ErrorCode::ProtocolError,
-            ConnError::FlowControl => ErrorCode::FlowControl,
-            ConnError::FrameSize => ErrorCode::FrameSize,
-            ConnError::Hpack(_) => ErrorCode::Compression,
-            ConnError::GoAwayReceived(c) => *c,
-            ConnError::StreamLimit => ErrorCode::RefusedStream,
-            ConnError::HeaderListTooLarge | ConnError::Overload => ErrorCode::EnhanceYourCalm,
-        }
     }
 }
 

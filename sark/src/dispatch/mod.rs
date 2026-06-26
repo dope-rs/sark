@@ -1115,7 +1115,7 @@ impl Pipeline {
 }
 
 pub trait H1Project<W: Wire> {
-    fn project_on_chunk<C, PJ>(
+    fn on_chunk_proj<C, PJ>(
         &mut self,
         slot: &mut link::Slot<W, listener::State<C>>,
         bytes: &[u8],
@@ -1127,7 +1127,7 @@ pub trait H1Project<W: Wire> {
         C: Default + 'static,
         PJ: Fn(&mut C) -> &mut conn_state::ConnState;
 
-    fn project_on_send<C, PJ>(
+    fn on_send_proj<C, PJ>(
         &mut self,
         slot: &mut link::Slot<W, listener::State<C>>,
         project: PJ,
@@ -1138,7 +1138,7 @@ pub trait H1Project<W: Wire> {
         C: Default + 'static,
         PJ: Fn(&mut C) -> &mut conn_state::ConnState;
 
-    fn project_on_wake<C, PJ>(
+    fn on_wake_proj<C, PJ>(
         &mut self,
         slot: &mut link::Slot<W, listener::State<C>>,
         project: PJ,
@@ -1148,7 +1148,7 @@ pub trait H1Project<W: Wire> {
         C: Default + 'static,
         PJ: Fn(&mut C) -> &mut conn_state::ConnState;
 
-    fn project_on_close<C, PJ>(
+    fn on_close_proj<C, PJ>(
         &mut self,
         slot: &mut link::Slot<W, listener::State<C>>,
         project: PJ,
