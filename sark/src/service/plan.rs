@@ -74,7 +74,7 @@ impl<'a> SliceValue<'a> {
     }
 
     fn bytes(&self) -> &[u8] {
-        &self.raw[self.start..self.end]
+        self.raw.get(self.start..self.end).unwrap_or(&[])
     }
 }
 

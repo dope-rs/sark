@@ -19,6 +19,7 @@ struct LoopOutcome {
     final_action: Option<Outcome>,
     split: Option<(usize, o3::buffer::Shared)>,
     close_after: bool,
+    head_pending: bool,
 }
 
 pub struct Pipeline;
@@ -71,6 +72,7 @@ impl Pipeline {
             final_action: None,
             split: None,
             close_after,
+            head_pending: false,
         };
         let mut permit = DispatchPermit::new();
         loop {
@@ -84,6 +86,7 @@ impl Pipeline {
             let outcome = app.try_consume(permit, rest, &mut write_buf[out.cursor..], state);
             permit = match outcome {
                 ConsumeOutcome::NeedMore { content_length, .. } => {
+                    out.head_pending = content_length.is_none();
                     if let Some(total) = content_length
                         && state.pipeline.expected_total.is_none()
                         && total > work_buf.len()
@@ -301,7 +304,7 @@ impl Pipeline {
         }
     }
 
-    pub fn run<H, W>(
+    pub fn run<'t, H, W>(
         app: &mut H,
         bytes: &[u8],
         slot: &mut link::Slot<W, listener::State<ConnState>>,
@@ -309,7 +312,7 @@ impl Pipeline {
         driver: &mut Driver,
     ) -> bool
     where
-        H: Routing,
+        H: Routing + crate::timer::TimerHost<'t>,
         W: Wire,
     {
         if let Some(ret) = Self::fast_path(&mut slot.state.conn, &mut slot.core, bytes) {
@@ -343,17 +346,76 @@ impl Pipeline {
         let out = Self::batch(&mut slot.state.conn, app, work_buf, write_buf, close_after);
         drop(peeked);
 
-        Self::emit(slot, aux, driver, out, use_accum, bytes)
+        let head_pending = out.head_pending;
+        let overrun = Self::emit(slot, aux, driver, out, use_accum, bytes);
+        Self::manage_head_deadline(app, slot, driver, head_pending);
+        overrun
     }
 
-    pub fn on_send_complete<H, W>(
+    fn head_still_pending(state: &ConnState) -> bool {
+        match state.recv.accum.as_ref().and_then(|a| a.peek()) {
+            Some(s) => memchr::memmem::find(s.as_slice(), b"\r\n\r\n").is_none(),
+            None => false,
+        }
+    }
+
+    fn manage_head_deadline<'t, H, W>(
+        app: &H,
+        slot: &mut link::Slot<W, listener::State<ConnState>>,
+        driver: &mut Driver,
+        head_pending: bool,
+    ) where
+        H: crate::timer::TimerHost<'t>,
+        W: Wire,
+    {
+        if head_pending && Self::head_still_pending(&slot.state.conn) {
+            if slot.state.conn.head_deadline.is_none() {
+                let waker = slot.make_waker(driver);
+                let timer = crate::timer::TimerHost::timer(app);
+                let deadline = std::time::Instant::now() + timer.head_timeout();
+                if let Some(ticket) = timer.arm(deadline, &waker) {
+                    slot.state.conn.head_deadline = Some(ticket);
+                }
+            }
+        } else if let Some(ticket) = slot.state.conn.head_deadline.take() {
+            crate::timer::TimerHost::timer(app).cancel(ticket);
+        }
+    }
+
+    pub fn poll_head_deadline<'t, H, W>(
+        app: &H,
+        slot: &mut link::Slot<W, listener::State<ConnState>>,
+        aux: &mut listener::Aux,
+        driver: &mut Driver,
+    ) -> bool
+    where
+        H: crate::timer::TimerHost<'t>,
+        W: Wire,
+    {
+        let Some(ticket) = slot.state.conn.head_deadline else {
+            return false;
+        };
+        let timer = crate::timer::TimerHost::timer(app);
+        if !timer.is_fired(ticket) {
+            return false;
+        }
+        slot.state.conn.head_deadline = None;
+        timer.cancel(ticket);
+        slot.core.set_close_after();
+        let buf = aux.write_buf_for(slot);
+        let ud = slot.token();
+        slot.submit_split_static(buf, 0, crate::CANNED_408, ud, driver);
+        true
+    }
+
+    pub fn on_send_complete<'t, H, W>(
         app: &mut H,
         _sent: usize,
         slot: &mut link::Slot<W, listener::State<ConnState>>,
         aux: &mut listener::Aux,
         driver: &mut Driver,
     ) where
-        H: Routing,
+        H: Routing + crate::timer::TimerHost<'t>,
         W: Wire,
     {
         if slot.state.conn.async_state.stream_slot.is_some() {

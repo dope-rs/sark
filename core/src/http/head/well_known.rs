@@ -8,8 +8,11 @@ use super::apply::{
     ae_line, apply_accept_encoding, apply_connection, apply_content_length, apply_expect,
     apply_host, apply_transfer_encoding, clen_line, conn_line, expect_line, host_line, te_line,
 };
-use super::byte::{is_header_name_byte, trim_ws_range};
-use super::error::{ERR_INVALID_HEADER_NAME, ERR_TOO_MANY_HEADERS, bad_request};
+use super::byte::{is_header_name_byte, trim_ws_range, value_has_forbidden_byte};
+use super::error::{
+    ERR_HEADER_LINE_TOO_LONG, ERR_INVALID_HEADER_NAME, ERR_INVALID_HEADER_VALUE,
+    ERR_TOO_MANY_HEADERS, bad_request,
+};
 use super::flags::Flags;
 use super::input::{BytesScan, HeadInput, HeaderLineScan};
 use super::visitor::{Known, Visitor};
@@ -26,6 +29,8 @@ const PROBE_AE: u64 = 18446743456935273313u64;
 const PROBE_UA: u64 = u64::from_le_bytes([b'u', b's', b'e', b'r', b'-', 0xff, 0xff, 0xff]);
 
 const AE_NAME_LOWER: &[u8; 16] = b"accept-encoding:";
+
+pub const MAX_HEADER_LINE_BYTES: usize = 8 * 1024;
 
 pub fn unknown_line<V: Visitor>(
     bytes: &[u8],
@@ -225,6 +230,9 @@ fn unknown_fast_skip<V: Visitor>(
     let Some(line_end) = BytesScan::find_crlf_from(bytes, colon_idx + 1) else {
         return Ok(None);
     };
+    if value_has_forbidden_byte(&bytes[colon_idx + 1..line_end]) {
+        return Err(bad_request(ERR_INVALID_HEADER_VALUE));
+    }
     if *header_count == max_header_count {
         return Err(bad_request(ERR_TOO_MANY_HEADERS));
     }
@@ -246,6 +254,38 @@ fn ua_tail_matches(rest: &[u8]) -> bool {
 }
 
 pub fn apply_well_known_header_contig<V: Visitor>(
+    rest: &[u8],
+    scan: &mut codec::HeaderScan,
+    flags: &mut Flags,
+    visitor: &mut V,
+    header_count: &mut usize,
+    max_header_count: usize,
+) -> Result<Option<usize>> {
+    if rest.len() <= MAX_HEADER_LINE_BYTES {
+        return apply_well_known_header_contig_inner(
+            rest,
+            scan,
+            flags,
+            visitor,
+            header_count,
+            max_header_count,
+        );
+    }
+    let capped = &rest[..MAX_HEADER_LINE_BYTES];
+    match apply_well_known_header_contig_inner(
+        capped,
+        scan,
+        flags,
+        visitor,
+        header_count,
+        max_header_count,
+    )? {
+        Some(out) => Ok(Some(out)),
+        None => Err(bad_request(ERR_HEADER_LINE_TOO_LONG)),
+    }
+}
+
+fn apply_well_known_header_contig_inner<V: Visitor>(
     rest: &[u8],
     scan: &mut codec::HeaderScan,
     flags: &mut Flags,
@@ -307,6 +347,9 @@ pub fn apply_well_known_header<I: HeadInput + ?Sized>(
     let _ = input;
     let _ = line_start;
     let _ = scan_info;
+    if line.len() > MAX_HEADER_LINE_BYTES {
+        return Err(bad_request(ERR_HEADER_LINE_TOO_LONG));
+    }
     if colon_idx == 0 {
         return Err(bad_request(ERR_INVALID_HEADER_NAME));
     }

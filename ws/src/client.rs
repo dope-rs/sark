@@ -1,7 +1,6 @@
 use std::future::{Future, poll_fn};
 use std::pin::Pin;
 use std::task::Poll;
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use dope::fiber::{Fiber, Holding};
 use dope::manifold::connector;
@@ -13,6 +12,8 @@ use dope::runtime::token::Token;
 use dope::transport::Transport;
 use dope::{WakeRef, WakerSet};
 use o3::buffer::Shared;
+use rand_chacha::ChaCha20Rng;
+use rand_core::{RngCore, SeedableRng};
 
 const DEFAULT_MAX_MESSAGE: usize = 16 * 1024 * 1024;
 const DEFAULT_MAX_OUTBOUND_FRAME: usize = 16 * 1024 * 1024;
@@ -220,35 +221,21 @@ impl connector::Lifecycle for ConnState {
 
 #[derive(Default)]
 struct MaskRng {
-    state: u64,
+    stream: Option<ChaCha20Rng>,
 }
 
 impl MaskRng {
-    fn fill(&mut self, buf: &mut [u8]) {
-        let mut s = self.state;
-        if s == 0 {
-            let now = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .map(|d| d.as_nanos() as u64)
-                .unwrap_or(0xCAFE_BABE_DEAD_BEEF);
-            s = now ^ (buf.as_ptr() as u64).rotate_left(17);
-            if s == 0 {
-                s = 0x9E37_79B9_7F4A_7C15;
-            }
-        }
-        for chunk in buf.chunks_mut(8) {
-            s ^= s << 13;
-            s ^= s >> 7;
-            s ^= s << 17;
-            let bytes = s.to_le_bytes();
-            chunk.copy_from_slice(&bytes[..chunk.len()]);
-        }
-        self.state = s;
+    fn stream(&mut self) -> &mut ChaCha20Rng {
+        self.stream.get_or_insert_with(|| {
+            let mut seed = [0u8; 32];
+            getrandom::fill(&mut seed).expect("OS CSPRNG (getrandom) unavailable");
+            ChaCha20Rng::from_seed(seed)
+        })
     }
 
     fn mask(&mut self) -> [u8; 4] {
         let mut buf = [0u8; 4];
-        self.fill(&mut buf);
+        self.stream().fill_bytes(&mut buf);
         buf
     }
 }
@@ -432,7 +419,7 @@ impl<H: Handler> connector::Session for Session<H> {
         let state = &mut *ctx.state;
         let out = &mut ctx.sink;
         let mut key_raw = [0u8; 16];
-        state.rng.fill(&mut key_raw);
+        getrandom::fill(&mut key_raw).expect("OS CSPRNG (getrandom) unavailable");
         let key_b64 = crate::crypto::Crypto::base64_encode(&key_raw);
         debug_assert_eq!(key_b64.len(), 24);
         let mut key = [0u8; 24];
@@ -788,5 +775,70 @@ impl Validate {
 
     fn header_value(s: &str) -> bool {
         !s.bytes().any(|b| matches!(b, b'\r' | b'\n'))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn legacy_xorshift(seed: u64, n: usize) -> Vec<[u8; 4]> {
+        let mut s = if seed == 0 {
+            0x9E37_79B9_7F4A_7C15
+        } else {
+            seed
+        };
+        let mut out = Vec::with_capacity(n);
+        for _ in 0..n {
+            s ^= s << 13;
+            s ^= s >> 7;
+            s ^= s << 17;
+            let b = s.to_le_bytes();
+            out.push([b[0], b[1], b[2], b[3]]);
+        }
+        out
+    }
+
+    #[test]
+    fn masks_are_not_legacy_xorshift_sequence() {
+        let mut rng = MaskRng::default();
+        let got: Vec<[u8; 4]> = (0..256).map(|_| rng.mask()).collect();
+        assert!(got.iter().any(|m| *m != got[0]));
+        for seed in [1u64, 0x9E37_79B9_7F4A_7C15, 0xCAFE_BABE_DEAD_BEEF] {
+            assert_ne!(legacy_xorshift(seed, got.len()), got);
+        }
+    }
+
+    #[test]
+    fn distinct_connections_produce_distinct_masks() {
+        let mut a = MaskRng::default();
+        let mut b = MaskRng::default();
+        let sa: Vec<[u8; 4]> = (0..32).map(|_| a.mask()).collect();
+        let sb: Vec<[u8; 4]> = (0..32).map(|_| b.mask()).collect();
+        assert_ne!(sa, sb);
+    }
+
+    #[test]
+    fn masks_statistical_sanity() {
+        let mut rng = MaskRng::default();
+        let mut counts = [0u32; 256];
+        let draws = 4096;
+        let mut seen = std::collections::HashSet::new();
+        for _ in 0..draws {
+            let m = rng.mask();
+            seen.insert(m);
+            for b in m {
+                counts[b as usize] += 1;
+            }
+        }
+        let mean = (draws * 4) / 256;
+        for c in counts {
+            assert!(c > 0, "byte value never appeared");
+            assert!(c < (mean as u32) * 4, "byte value over-represented: {c}");
+        }
+        assert!(
+            seen.len() > draws * 9 / 10,
+            "too many repeated 4-byte masks"
+        );
     }
 }

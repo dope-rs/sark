@@ -53,6 +53,7 @@ fn main() {
         bind,
         max_conn: 1024,
         backlog: 4096,
+        head_timeout: std::time::Duration::from_secs(10),
     };
 
     run_with_trigger(

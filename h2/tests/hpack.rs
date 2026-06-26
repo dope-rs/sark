@@ -561,3 +561,66 @@ mod header_list_bound {
         assert_eq!(emitted, 1);
     }
 }
+
+mod c1_length_overflow {
+    use super::*;
+
+    fn encode_int(value: u64, prefix_bits: u8, first_high: u8, out: &mut Vec<u8>) {
+        let max_prefix: u64 = (1u64 << prefix_bits) - 1;
+        if value < max_prefix {
+            out.push(first_high | value as u8);
+            return;
+        }
+        out.push(first_high | max_prefix as u8);
+        let mut rem = value - max_prefix;
+        while rem >= 128 {
+            out.push((rem & 0x7f) as u8 | 0x80);
+            rem >>= 7;
+        }
+        out.push(rem as u8);
+    }
+
+    #[test]
+    fn literal_length_near_u64_max_is_clean_error_no_panic() {
+        let cases: [u64; 8] = [
+            u64::MAX,
+            u64::MAX - 1,
+            u64::MAX - 6,
+            u64::MAX - 11,
+            0xFFFF_FFFF_FFFF_FFFA,
+            0x8000_0000_0000_0000,
+            0xFFFF_FFFF_0000_0000,
+            0x0000_0001_0000_0000,
+        ];
+        for &len in &cases {
+            let mut bytes = vec![0x00u8];
+            encode_int(len, 7, 0x00, &mut bytes);
+            bytes.extend_from_slice(&[0xAA, 0xBB, 0xCC]);
+            let mut dec = Decoder::new(4096);
+            let res = dec.decode(&bytes, |_, _| {});
+            assert!(
+                res.is_err(),
+                "len={len:#x} must be a clean error, not a panic"
+            );
+        }
+    }
+
+    #[test]
+    fn literal_length_over_sane_cap_rejected() {
+        let mut bytes = vec![0x00u8];
+        encode_int((1u64 << 24) + 1, 7, 0x00, &mut bytes);
+        bytes.extend_from_slice(&[0u8; 16]);
+        let mut dec = Decoder::new(4096);
+        assert_eq!(dec.decode(&bytes, |_, _| {}), Err(DecoderError::BadString));
+    }
+
+    #[test]
+    fn normal_literal_still_decodes() {
+        let bytes: &[u8] = &[0x00, 0x03, b'f', b'o', b'o', 0x03, b'b', b'a', b'r'];
+        let mut dec = Decoder::new(4096);
+        let mut got: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+        dec.decode(bytes, |n, v| got.push((n.to_vec(), v.to_vec())))
+            .unwrap();
+        assert_eq!(got, vec![(b"foo".to_vec(), b"bar".to_vec())]);
+    }
+}

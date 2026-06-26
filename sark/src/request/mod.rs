@@ -106,11 +106,14 @@ struct UriPathOps;
 
 impl UriPathOps {
     fn end_from(frame: &[u8], uri_range: &Range<usize>) -> usize {
-        frame[uri_range.clone()]
-            .iter()
-            .position(|b| *b == b'?')
-            .map(|off| uri_range.start + off)
-            .unwrap_or(uri_range.end)
+        match frame.get(uri_range.clone()) {
+            Some(seg) => seg
+                .iter()
+                .position(|b| *b == b'?')
+                .map(|off| uri_range.start + off)
+                .unwrap_or(uri_range.end),
+            None => uri_range.end,
+        }
     }
 }
 
@@ -262,7 +265,7 @@ impl Request<()> {
     pub fn new(method: Method, uri_raw: impl AsRef<[u8]>) -> Self {
         let uri_raw = uri_raw.as_ref();
         let uri_raw = if uri_raw.is_empty() { b"/" } else { uri_raw };
-        assert!(
+        debug_assert!(
             uri_raw.first() == Some(&b'/') || uri_raw == b"*",
             "request new uri must be origin-form path or asterisk form",
         );
@@ -340,7 +343,7 @@ impl Request<()> {
     }
 
     fn assert_uri_path_end(uri_range: &Range<usize>, uri_path_end: usize) {
-        assert!(
+        debug_assert!(
             uri_range.start <= uri_path_end && uri_path_end <= uri_range.end,
             "uri_path_end must be inside uri_range"
         );
@@ -520,7 +523,7 @@ impl<'req> Ref<'req, ()> {
         body: &'req [u8],
     ) -> Self {
         let uri_path_end = UriPathOps::end_from(head, &uri_range);
-        assert!(
+        debug_assert!(
             uri_range.start <= uri_path_end && uri_path_end <= uri_range.end,
             "uri_path_end must be inside uri_range"
         );

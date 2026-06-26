@@ -52,9 +52,7 @@ fn scan_duplicate_content_length_different_values() {
             value: b"99",
         },
     ];
-    let s = Parse::header_scan(headers).unwrap();
-    assert!(s.duplicate_content_length);
-    assert_eq!(s.content_length, Some(99));
+    assert!(Parse::header_scan(headers).is_err());
 }
 
 #[test]

@@ -560,6 +560,7 @@ pub(super) fn attr(mode: JsonMode, mut st: ItemStruct) -> Result<TokenStream> {
 
         impl sark::json::JsonDecode for #name {
             fn decode_json(__bytes: o3::buffer::Shared) -> sark::json::Result<Self> {
+                let __sark_depth = sark::json::DepthGuard::enter()?;
                 let __raw = __bytes.as_ref();
                 let mut __idx = 0usize;
                 sark::json::Scan::ws(__raw, &mut __idx);

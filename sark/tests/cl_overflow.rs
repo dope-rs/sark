@@ -85,6 +85,7 @@ fn bad_content_length_does_not_panic_and_server_survives() {
         bind,
         max_conn: 16,
         backlog: 16,
+        head_timeout: std::time::Duration::from_secs(10),
     };
 
     run_with_trigger(

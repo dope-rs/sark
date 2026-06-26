@@ -18,4 +18,6 @@ pub use flags::{Flags, SeenHeaderHandler};
 pub use input::{BytesScan, HeadInput, HeaderLineScan};
 pub use parsed::ParsedRequest;
 pub use visitor::{Known, Visitor};
-pub use well_known::{apply_well_known_header, apply_well_known_header_contig, unknown_line};
+pub use well_known::{
+    MAX_HEADER_LINE_BYTES, apply_well_known_header, apply_well_known_header_contig, unknown_line,
+};

@@ -174,11 +174,10 @@ impl<'a> Params<'a> {
     ) -> Result<TokenStream> {
         Ok(match ty.value_kind()? {
             ValueKind::Local if ty.value_optional() => quote! {
-                #ident: #raw.map(|range| {
-                    req.path_local(range).expect(
-                        "request path local range invariant: stored range must be readable"
-                    )
-                })
+                #ident: match #raw {
+                    Some(range) => Some(req.path_local(range)?),
+                    None => None,
+                }
             },
             ValueKind::Local => {
                 let default = default.ok_or_else(|| {
@@ -189,11 +188,10 @@ impl<'a> Params<'a> {
                 })?;
                 let fallback = Value::build_default_local_expr(default);
                 quote! {
-                    #ident: #raw.map(|range| {
-                        req.path_local(range).expect(
-                            "request path local range invariant: stored range must be readable"
-                        )
-                    }).unwrap_or_else(|| #fallback)
+                    #ident: match #raw {
+                        Some(range) => req.path_local(range)?,
+                        None => #fallback,
+                    }
                 }
             }
             _ if ty.value_optional() => quote! { #ident: #raw },

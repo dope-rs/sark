@@ -39,6 +39,7 @@ fn main() -> std::io::Result<()> {
         bind,
         max_conn: 1024,
         backlog: 1024,
+        head_timeout: std::time::Duration::from_secs(10),
     };
 
     eprintln!("sark download example: GET http://{bind}/download/<n>");

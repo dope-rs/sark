@@ -88,17 +88,30 @@ impl KnownHeaderImpl for ContentLengthHeader {
 }
 
 impl KnownHeaderImpl for TransferEncodingHeader {
-    type Parsed = u8;
+    type Parsed = bool;
 
-    fn parse_value(value: &[u8]) -> Result<u8> {
-        Ok(parse_csv(value, CSV_CHUNKED_BIT))
+    fn parse_value(value: &[u8]) -> Result<bool> {
+        te_request_chunked_final(value)
     }
-    fn parse_line(raw: &[u8]) -> Result<(u8, usize)> {
-        Ok(parse_csv_line(raw, CSV_CHUNKED_BIT))
+    fn parse_line(raw: &[u8]) -> Result<(bool, usize)> {
+        match trim_line(raw)? {
+            Some((_tail_end, value_start, value_end)) => {
+                let is_chunked = te_request_chunked_final(&raw[value_start..value_end])?;
+                Ok((is_chunked, value_end - value_start))
+            }
+            None => {
+                let is_chunked = te_request_chunked_final(raw)?;
+                Ok((is_chunked, raw.len()))
+            }
+        }
     }
-    fn apply_parsed(scan: &mut codec::HeaderScan, _flags: &mut Flags, found: u8) -> Result<()> {
+    fn apply_parsed(
+        scan: &mut codec::HeaderScan,
+        _flags: &mut Flags,
+        is_chunked: bool,
+    ) -> Result<()> {
         scan.has_transfer_encoding = true;
-        if (found & CSV_CHUNKED_BIT) != 0 {
+        if is_chunked {
             scan.is_chunked_transfer = true;
         }
         Ok(())
@@ -457,15 +470,64 @@ pub fn te_line(
     if let Some(out) = te_fast_chunked(raw, scan, flags)? {
         return Ok(Some(out));
     }
-    let Some((found, tail_end, value_start, value_end)) = csv_line(raw, CSV_CHUNKED_BIT)? else {
+    let Some((tail_end, value_start, value_end)) = trim_line(raw)? else {
         return Ok(None);
     };
     flags.mark_seen::<TransferEncodingHeader>()?;
     scan.has_transfer_encoding = true;
-    if (found & CSV_CHUNKED_BIT) != 0 {
+    if te_request_chunked_final(&raw[value_start..value_end])? {
         scan.is_chunked_transfer = true;
     }
     Ok(Some((tail_end, value_start, value_end)))
+}
+
+fn te_invalid_transfer_encoding() -> Error {
+    Error::BadRequest("Invalid Transfer-Encoding".into())
+}
+
+fn te_invalid_ordering() -> Error {
+    Error::BadRequest("Invalid Transfer-Encoding ordering".into())
+}
+
+fn te_request_chunked_final(value: &[u8]) -> Result<bool> {
+    let mut saw_chunked = false;
+    let mut last_is_chunked = false;
+    let mut start = 0usize;
+    let mut idx = 0usize;
+    let len = value.len();
+    loop {
+        if idx == len || value[idx] == b',' {
+            let mut lo = start;
+            let mut hi = idx;
+            while lo < hi && is_ascii_ws(value[lo]) {
+                lo += 1;
+            }
+            while hi > lo && is_ascii_ws(value[hi - 1]) {
+                hi -= 1;
+            }
+            if hi <= lo {
+                return Err(te_invalid_transfer_encoding());
+            }
+            let token = &value[lo..hi];
+            if !token.is_ascii() {
+                return Err(te_invalid_transfer_encoding());
+            }
+            let is_chunked = token_eq_ci(token, b"chunked");
+            if saw_chunked && (!last_is_chunked || !is_chunked) {
+                return Err(te_invalid_ordering());
+            }
+            if is_chunked {
+                saw_chunked = true;
+            }
+            last_is_chunked = is_chunked;
+            if idx == len {
+                break;
+            }
+            start = idx + 1;
+        }
+        idx += 1;
+    }
+    Ok(saw_chunked && last_is_chunked)
 }
 
 fn te_fast_chunked(

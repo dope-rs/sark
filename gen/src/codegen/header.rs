@@ -162,7 +162,10 @@ impl KnownKind {
         skip_apply: bool,
     ) -> TokenStream {
         let capture_body = capture.map(|field| {
-            let raw_expr = quote! { &rest[colon_idx + 1 + value_start..colon_idx + 1 + value_end] };
+            let raw_expr = quote! {
+                rest.get(colon_idx + 1 + value_start..colon_idx + 1 + value_end)
+                    .ok_or_else(|| sark::error::Error::BadRequest("Invalid header value".into()))?
+            };
             let abs_start = quote! { line_start + colon_idx + 1 + value_start };
             let abs_end = quote! { line_start + colon_idx + 1 + value_end };
             Assign::emit(&field.ident, field.kind, raw_expr, abs_start, abs_end)
@@ -170,14 +173,7 @@ impl KnownKind {
         let maybe_assign = if skip_apply {
             TokenStream::new()
         } else {
-            capture_body
-                .map(|assign| {
-                    quote! {
-                        let raw = &rest[colon_idx + 1 + value_start..colon_idx + 1 + value_end];
-                        #assign
-                    }
-                })
-                .unwrap_or_default()
+            capture_body.unwrap_or_default()
         };
         let line_fn = self.line_fn();
         quote! {{
@@ -781,7 +777,10 @@ impl Emit {
         let mut action_specs = Vec::new();
         for field in &plan.custom {
             let action = format_ident!("Custom{}", field.slot);
-            let raw_expr = quote! { &rest[colon_idx + 1 + value_start..colon_idx + 1 + value_end] };
+            let raw_expr = quote! {
+                rest.get(colon_idx + 1 + value_start..colon_idx + 1 + value_end)
+                    .ok_or_else(|| sark::error::Error::BadRequest("Invalid header value".into()))?
+            };
             let abs_start = quote! { line_start + colon_idx + 1 + value_start };
             let abs_end = quote! { line_start + colon_idx + 1 + value_end };
             let assign = Assign::emit(&field.ident, field.kind, raw_expr, abs_start, abs_end);

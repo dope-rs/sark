@@ -232,7 +232,7 @@ fn run_thread(pg: PgArgs, cfg: ServerCfg, ctx: Ctx, shutdown: Option<&Trigger>) 
     };
     {
         let handler = http.handler_mut();
-        handler.bind_timer(timer_handle);
+        handler.bind_timer(timer_handle, cfg.head_timeout);
         let stamp = std::ptr::NonNull::from(handler.date_stamp());
         app.as_mut().project().date.get_mut().bind(stamp);
     }
@@ -264,6 +264,7 @@ fn main() -> io::Result<()> {
         bind,
         max_conn: 1024,
         backlog: 1024,
+        head_timeout: std::time::Duration::from_secs(10),
     };
 
     eprintln!("sark pg: listening on http://{bind}, upstream pg {pg_addr}, pick={policy:?}");

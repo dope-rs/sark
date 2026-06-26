@@ -15,7 +15,8 @@ sark = { path = "../sark" }
 sark-core = { path = "../core" }
 sark-gen = { path = "../gen" }
 sark-json = { path = "../json" }
-o3 = "0.1.0"
+o3 = "0.2"
+http = "1"
 
 [[bin]]
 name = "head_differential"

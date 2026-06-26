@@ -7,6 +7,22 @@ use crate::http::codec::Header;
 
 const MAX_HEADERS: usize = 100;
 
+fn is_forbidden_trailer(name: &HeaderName) -> bool {
+    matches!(
+        name.as_str(),
+        "content-length"
+            | "transfer-encoding"
+            | "host"
+            | "trailer"
+            | "connection"
+            | "keep-alive"
+            | "te"
+            | "upgrade"
+            | "proxy-authenticate"
+            | "proxy-authorization"
+    )
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DecodeMode {
     Response,
@@ -119,6 +135,9 @@ impl crate::http::codec::Parse {
             resp.headers_mut().insert(name, value);
         }
         for (name, value) in trailers {
+            if is_forbidden_trailer(name) {
+                continue;
+            }
             resp.headers_mut().insert(name.clone(), value.clone());
         }
         if !body.is_empty() {

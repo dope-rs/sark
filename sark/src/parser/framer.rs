@@ -33,18 +33,19 @@ impl Http {
         if line.len() < 9 {
             return None;
         }
+        let sp2 = line.len() - 9;
+        if line[sp2] != b' ' {
+            return None;
+        }
         let (method_key, sp1) = Self::method_word(line);
-        if sp1 >= line.len() {
+        if sp1 >= sp2 {
             return None;
         }
         let method = &line[..sp1];
         if method.is_empty() {
             return None;
         }
-        let target_start = sp1 + 1;
-        let rel = memchr::memchr(b' ', &line[target_start..])?;
-        let sp2 = target_start + rel;
-        let target = &line[target_start..sp2];
+        let target = &line[sp1 + 1..sp2];
         if target.is_empty() {
             return None;
         }

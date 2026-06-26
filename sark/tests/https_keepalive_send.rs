@@ -185,6 +185,7 @@ fn https_cfg(bind: std::net::SocketAddr) -> HttpsCfg {
             bind,
             max_conn: 16,
             backlog: 16,
+            head_timeout: std::time::Duration::from_secs(10),
         },
         tls: shin::server::Config {
             source: shin::server::CertSource::RawPublicKey {
@@ -221,6 +222,7 @@ fn https_keepalive_serves_two_requests() {
             bind,
             max_conn: 16,
             backlog: 16,
+            head_timeout: std::time::Duration::from_secs(10),
         },
         tls: shin::server::Config {
             source: shin::server::CertSource::RawPublicKey {

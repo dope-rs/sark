@@ -11,12 +11,16 @@ use crate::status::{Code, Status};
 #[derive(Clone, Debug)]
 pub struct Config {
     pub max_message_len: usize,
+    pub max_buffered_len: usize,
+    pub max_buffered_msgs: usize,
 }
 
 impl Default for Config {
     fn default() -> Self {
         Self {
             max_message_len: 4 * 1024 * 1024,
+            max_buffered_len: 16 * 1024 * 1024,
+            max_buffered_msgs: 8192,
         }
     }
 }
@@ -157,6 +161,7 @@ struct ResponseState {
     metadata: Metadata,
     deframer: Deframer,
     messages: Vec<MessageFrame>,
+    buffered_len: usize,
 }
 
 #[derive(Clone, Debug)]
@@ -234,6 +239,7 @@ impl Session {
                 metadata: Metadata::new(),
                 deframer: Deframer::new(self.config.max_message_len),
                 messages: Vec::new(),
+                buffered_len: 0,
             },
         );
         Ok(stream_id)
@@ -374,12 +380,24 @@ impl Session {
                 conn::Event::Data {
                     stream_id, data, ..
                 } => {
+                    let max_buffered_len = self.config.max_buffered_len;
+                    let max_buffered_msgs = self.config.max_buffered_msgs;
                     let stream = self.stream_mut(stream_id)?;
                     let mut messages = Vec::new();
                     stream
                         .deframer
                         .push(&data, &mut messages)
                         .map_err(Status::from_frame_err)?;
+                    let added: usize = messages.iter().map(|message| message.payload.len()).sum();
+                    stream.buffered_len = stream.buffered_len.saturating_add(added);
+                    if stream.buffered_len > max_buffered_len
+                        || stream.messages.len() + messages.len() > max_buffered_msgs
+                    {
+                        return Err(Status::new(
+                            Code::ResourceExhausted,
+                            "stream buffer limit exceeded",
+                        ));
+                    }
                     stream.messages.extend(messages.iter().cloned());
                     self.events.extend(
                         messages

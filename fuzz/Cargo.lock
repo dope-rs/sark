@@ -54,9 +54,9 @@ dependencies = [
 
 [[package]]
 name = "dope"
-version = "0.4.4"
+version = "0.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4fa66ca7147459147169ddaa5ad009fa1de2e74baf68e5cd75a6b83a0facdf69"
+checksum = "b1f2af5f0b2507932706f970ded9a6c4de89431a9f855a7d61a0c7e698857781"
 dependencies = [
  "io-uring",
  "libc",
@@ -66,9 +66,9 @@ dependencies = [
 
 [[package]]
 name = "dope-extra"
-version = "0.4.4"
+version = "0.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9ac13251d300efb03cff0d7b03560d065699f236db1384781fbeb71c453ac9e6"
+checksum = "c1ce0d8ae99e97adb8a9b4247d382d0726ee84c01547e2151909dd967d2ca411"
 dependencies = [
  "dope",
  "libc",
@@ -77,9 +77,9 @@ dependencies = [
 
 [[package]]
 name = "dope-gen"
-version = "0.4.4"
+version = "0.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "fc1382b7cee0eefcbd82a177f86130079338e14d934ff946c8b3d263aef8409d"
+checksum = "8352e7b40f75f8af0e895b272048761eb16809c91f387d5d3cdac28c0b05a029"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -88,9 +88,9 @@ dependencies = [
 
 [[package]]
 name = "dope-tls"
-version = "0.5.1"
+version = "0.6.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "069dfe3e8bce9ba651001826d3fc350a83be7eea62957b34c565e3e5e6a61cca"
+checksum = "6c9396db331682a3e5ef84809f1b86bf40599ba4326c47d81b2e15ff7d7fc1c7"
 dependencies = [
  "dope",
  "libc",
@@ -223,9 +223,9 @@ checksum = "88904434abc2901f197fe8cc55f0445e7ded921dba5911dad2e2b39b48e663c4"
 
 [[package]]
 name = "o3"
-version = "0.1.0"
+version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8c88b3f162754d64cb7402cc8a57d8cc1d1298961cacaf892885572961f72f7b"
+checksum = "369ef165ff65d97941107ca797faa68e43fa7cef2323512db9c0b3434922c3a5"
 dependencies = [
  "libc",
 ]
@@ -311,7 +311,7 @@ checksum = "9774ba4a74de5f7b1c1451ed6cd5285a32eddb5cccb8cc655a4e50009e06477f"
 
 [[package]]
 name = "sark"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "dope",
  "dope-extra",
@@ -330,7 +330,7 @@ dependencies = [
 
 [[package]]
 name = "sark-core"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "http",
  "httparse",
@@ -348,6 +348,7 @@ name = "sark-fuzz"
 version = "0.0.0"
 dependencies = [
  "arbitrary",
+ "http",
  "httparse",
  "libfuzzer-sys",
  "o3",
@@ -359,7 +360,7 @@ dependencies = [
 
 [[package]]
 name = "sark-gen"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "dope",
  "o3",
@@ -370,7 +371,7 @@ dependencies = [
 
 [[package]]
 name = "sark-json"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "http",
  "o3",
@@ -434,9 +435,9 @@ dependencies = [
 
 [[package]]
 name = "shin"
-version = "0.3.1"
+version = "0.3.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "19fe6c45e7aa4bfd3ec6776978095eff571dc3ea7a91bf6ce48c974087deda90"
+checksum = "5a10cddc4d4991f721e480d80f9825b5e1113b02750f8eaa612a23b42266ff88"
 dependencies = [
  "ring",
  "subtle",
@@ -505,9 +506,9 @@ checksum = "ccf3ec651a847eb01de73ccad15eb7d99f80485de043efb2f370cd654f4ea44b"
 
 [[package]]
 name = "wasip2"
-version = "1.0.4+wasi-0.2.12"
+version = "1.0.3+wasi-0.2.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b67efb37e106e55ce722a510d6b5f9c17f083e5fc79afc2badeb12cc313d9487"
+checksum = "20064672db26d7cdc89c7798c48a0fdfac8213434a1186e5ef29fd560ae223d6"
 dependencies = [
  "wit-bindgen",
 ]

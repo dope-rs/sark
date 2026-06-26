@@ -73,7 +73,7 @@ impl Value {
             let fallback = Self::build_default_typed_expr(ty, default)?;
             return Ok(quote! { #value.unwrap_or_else(|| #fallback) });
         }
-        Ok(quote! { #value.expect("required value missing after successful parse") })
+        Ok(quote! { #value? })
     }
 
     pub(crate) fn build_parse_expr(kind: ValueKind, range_expr: TokenStream) -> TokenStream {
@@ -100,18 +100,24 @@ impl Value {
             format!("non-Option {prefix} typed fields require default = \"...\"");
         Ok(match ty.value_kind()? {
             ValueKind::Local if ty.value_optional() => quote! {
-                #ident.map(|range| {
-                    #local_read.expect(#invariant)
-                })
+                match #ident {
+                    Some(range) => Some(
+                        #local_read.ok_or_else(|| sark::error::Error::BadRequest(#invariant.into()))?
+                    ),
+                    None => None,
+                }
             },
             ValueKind::Local => {
                 let default =
                     default.ok_or_else(|| syn::Error::new_spanned(ty, require_default.as_str()))?;
                 let fallback = Self::build_default_local_expr(default);
                 quote! {
-                    #ident.map(|range| {
-                        #local_read.expect(#invariant)
-                    }).unwrap_or_else(|| #fallback)
+                    match #ident {
+                        Some(range) => {
+                            #local_read.ok_or_else(|| sark::error::Error::BadRequest(#invariant.into()))?
+                        }
+                        None => #fallback,
+                    }
                 }
             }
             _ if ty.value_optional() => quote! { #ident },
