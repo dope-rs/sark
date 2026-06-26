@@ -19,6 +19,17 @@ pub struct AsyncConnState {
     pub pending_wake: Option<(u8, ::dope::fiber::TaskId)>,
 }
 
+impl AsyncConnState {
+    #[inline]
+    pub fn wake_route_id(&self) -> Option<u8> {
+        match (&self.pending_wake, &self.stream_slot) {
+            (Some(p), _) => Some(p.0),
+            (None, Some(p)) => Some(p.0),
+            (None, None) => None,
+        }
+    }
+}
+
 pub enum Outcome {
     Send {
         written: usize,

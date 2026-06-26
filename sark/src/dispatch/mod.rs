@@ -14,7 +14,7 @@ use dope::manifold::listener;
 use dope::transport::link;
 use dope::transport::wire::Wire;
 use o3::buffer::Shared;
-pub use pipeline::Pipeline;
+pub use pipeline::{Pipeline, identity_mut};
 use preser::Slot;
 pub use routing::Routing;
 use sark_core::http::{CHUNK_TERMINATOR, FixedResponseInner, Shape};
@@ -915,9 +915,25 @@ impl Pipeline {
         S2: Future<Output = Option<Shared>> + 'd,
         W: Wire,
     {
+        Self::stream_coalesce_proj(slab, slot, aux, driver, identity_mut)
+    }
+
+    pub fn stream_coalesce_proj<'d, S2, W, C, PJ, const N: usize>(
+        slab: &mut dope::fiber::Slab<'d, S2, N>,
+        slot: &mut link::Slot<W, listener::State<C>>,
+        aux: &mut listener::Aux,
+        driver: &mut Driver,
+        project: PJ,
+    ) -> usize
+    where
+        S2: Future<Output = Option<Shared>> + 'd,
+        W: Wire,
+        C: Default + 'static,
+        PJ: Fn(&mut C) -> &mut conn_state::ConnState,
+    {
         use conn_state::StreamPhase;
-        let conn_ptr: *mut conn_state::ConnState = &mut slot.state.conn;
-        // SAFETY: conn_ptr aliases slot.state.conn; below never re-borrows slot.state.conn via slot (only slot.core / wire / state.send), keeping &mut ConnState and &mut Slot disjoint.
+        let conn_ptr: *mut conn_state::ConnState = project(&mut slot.state.conn);
+        // SAFETY: conn_ptr aliases the projected slot.state.conn; below never re-borrows slot.state.conn via slot (only slot.core / wire / state.send), keeping &mut ConnState and &mut Slot disjoint.
         let conn: &mut conn_state::ConnState = unsafe { &mut *conn_ptr };
         let Some((stream_route_id, token)) = conn.async_state.stream_slot.take() else {
             return 0;
@@ -990,8 +1006,8 @@ impl Pipeline {
         }
     }
 
-    pub fn reborrow_write_buf<'a, W: Wire>(
-        slot: &mut link::Slot<W, listener::State<conn_state::ConnState>>,
+    pub fn reborrow_write_buf<'a, W: Wire, C: Default + 'static>(
+        slot: &mut link::Slot<W, listener::State<C>>,
         aux: &'a mut listener::Aux,
     ) -> &'a mut [u8] {
         aux.write_buf_for(slot)
@@ -1006,10 +1022,25 @@ impl Pipeline {
         Fut: Future<Output = P> + 'd,
         W: Wire,
     {
+        Self::fiber_wake_proj(slab, slot, driver, identity_mut)
+    }
+
+    pub fn fiber_wake_proj<'d, Fut, P, W, C, PJ, const N: usize>(
+        slab: &mut dope::fiber::Slab<'d, Fut, N>,
+        slot: &mut link::Slot<W, listener::State<C>>,
+        driver: &mut Driver,
+        project: PJ,
+    ) -> Option<P>
+    where
+        Fut: Future<Output = P> + 'd,
+        W: Wire,
+        C: Default + 'static,
+        PJ: Fn(&mut C) -> &mut conn_state::ConnState,
+    {
         let waker = slot.make_waker(driver);
         let mut cx = Context::from_waker(&waker);
-        let conn_ptr: *mut conn_state::ConnState = &mut slot.state.conn;
-        // SAFETY: conn_ptr aliases slot.state.conn; this fn never re-borrows slot.state.conn via slot (only slot.make_waker / slot is otherwise unused after this point), so the &mut ConnState and &mut Slot stay disjoint.
+        let conn_ptr: *mut conn_state::ConnState = project(&mut slot.state.conn);
+        // SAFETY: conn_ptr aliases the projected slot.state.conn; this fn never re-borrows slot.state.conn via slot (only slot.make_waker / slot is otherwise unused after this point), so the &mut ConnState and &mut Slot stay disjoint.
         let conn: &mut conn_state::ConnState = unsafe { &mut *conn_ptr };
         let token = conn.async_state.pending_wake.as_ref().map(|p| &p.1)?;
         match slab.poll(token, &mut cx) {
@@ -1081,4 +1112,48 @@ impl Pipeline {
             None => ConsumeOutcome::Close(crate::CANNED_503),
         }
     }
+}
+
+pub trait H1Project<W: Wire> {
+    fn project_on_chunk<C, PJ>(
+        &mut self,
+        slot: &mut link::Slot<W, listener::State<C>>,
+        bytes: &[u8],
+        aux: &mut listener::Aux,
+        driver: &mut Driver,
+        project: PJ,
+    ) -> bool
+    where
+        C: Default + 'static,
+        PJ: Fn(&mut C) -> &mut conn_state::ConnState;
+
+    fn project_on_send<C, PJ>(
+        &mut self,
+        slot: &mut link::Slot<W, listener::State<C>>,
+        project: PJ,
+        sent: usize,
+        aux: &mut listener::Aux,
+        driver: &mut Driver,
+    ) where
+        C: Default + 'static,
+        PJ: Fn(&mut C) -> &mut conn_state::ConnState;
+
+    fn project_on_wake<C, PJ>(
+        &mut self,
+        slot: &mut link::Slot<W, listener::State<C>>,
+        project: PJ,
+        aux: &mut listener::Aux,
+        driver: &mut Driver,
+    ) where
+        C: Default + 'static,
+        PJ: Fn(&mut C) -> &mut conn_state::ConnState;
+
+    fn project_on_close<C, PJ>(
+        &mut self,
+        slot: &mut link::Slot<W, listener::State<C>>,
+        project: PJ,
+        aux: &mut listener::Aux,
+    ) where
+        C: Default + 'static,
+        PJ: Fn(&mut C) -> &mut conn_state::ConnState;
 }

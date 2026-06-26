@@ -13,7 +13,7 @@ use o3::buffer::Shared;
 
 use crate::conn::{self, Conn, ConnError, Settings};
 use crate::frame::{ErrorCode, ParseError};
-use crate::hpack::OwnedHeader;
+use crate::hpack::{Header, OwnedHeader};
 use crate::role::ServerRole;
 use crate::stream::StreamId;
 
@@ -28,11 +28,16 @@ pub struct Request {
 pub struct Response {
     pub headers: Vec<OwnedHeader>,
     pub body: Shared,
+    pub trailers: Vec<OwnedHeader>,
 }
 
 impl Response {
     pub fn new(headers: Vec<OwnedHeader>, body: Shared) -> Self {
-        Self { headers, body }
+        Self {
+            headers,
+            body,
+            trailers: Vec::new(),
+        }
     }
 }
 
@@ -66,12 +71,25 @@ struct PendingBody {
     body: Shared,
     off: usize,
     stalled: bool,
+    trailers: Vec<OwnedHeader>,
+    trailers_sent: bool,
 }
 
 impl PendingBody {
+    fn emit_trailers(&mut self, conn: &mut Conn<ServerRole>) -> Result<(), ConnError> {
+        if self.trailers.is_empty() || self.trailers_sent {
+            return Ok(());
+        }
+        let fields: Vec<Header<'_>> = self.trailers.iter().map(|h| h.as_ref()).collect();
+        conn.send_trailers(self.stream_id, &fields)?;
+        self.trailers_sent = true;
+        Ok(())
+    }
+
     fn pump(&mut self, conn: &mut Conn<ServerRole>) -> Result<bool, ConnError> {
         loop {
             if self.off >= self.body.len() {
+                self.emit_trailers(conn)?;
                 return Ok(true);
             }
             if conn.outbound().len() >= OUTBOUND_SOFT_CAP {
@@ -79,7 +97,8 @@ impl PendingBody {
                 return Ok(false);
             }
             let rest = &self.body.as_slice()[self.off..];
-            let n = conn.send_data(self.stream_id, rest, true)?;
+            let end_stream = self.trailers.is_empty();
+            let n = conn.send_data(self.stream_id, rest, end_stream)?;
             if n == 0 {
                 self.stalled = true;
                 return Ok(false);
@@ -320,7 +339,8 @@ impl<'h, H: Handler, W: Wire> App<'h, H, W> {
         if !cstate.conn.has_stream(stream_id) {
             return;
         }
-        let end_stream = resp.body.is_empty();
+        let has_trailers = !resp.trailers.is_empty();
+        let end_stream = resp.body.is_empty() && !has_trailers;
         if cstate
             .conn
             .send_response(
@@ -340,6 +360,8 @@ impl<'h, H: Handler, W: Wire> App<'h, H, W> {
             body: resp.body,
             off: 0,
             stalled: false,
+            trailers: resp.trailers,
+            trailers_sent: false,
         };
         match body.pump(&mut cstate.conn) {
             Ok(true) => {}
@@ -672,5 +694,90 @@ mod tests {
         drain_data(&mut cstate, &mut acc, &mut end);
         assert_eq!(acc, payload);
         assert!(end);
+    }
+
+    fn walk_frames(out: &[u8]) -> (Vec<u8>, bool, usize, bool, bool) {
+        let mut pos = 0;
+        let mut data = Vec::new();
+        let mut data_end_stream = false;
+        let mut header_frames = 0usize;
+        let mut trailers_end_stream = false;
+        let mut trailers_after_data = false;
+        while pos < out.len() {
+            let h = FrameHeader::parse(&out[pos..]).unwrap();
+            let total = 9 + h.length as usize;
+            let payload = &out[pos + 9..pos + total];
+            match h.kind {
+                frame::Type::Data => {
+                    data.extend_from_slice(payload);
+                    if h.flags.has(frame::Flags::END_STREAM) {
+                        data_end_stream = true;
+                    }
+                }
+                frame::Type::Headers => {
+                    header_frames += 1;
+                    if header_frames == 2 {
+                        trailers_after_data = !data.is_empty();
+                        if h.flags.has(frame::Flags::END_STREAM) {
+                            trailers_end_stream = true;
+                        }
+                    }
+                }
+                _ => {}
+            }
+            pos += total;
+        }
+        (
+            data,
+            data_end_stream,
+            header_frames,
+            trailers_end_stream,
+            trailers_after_data,
+        )
+    }
+
+    #[test]
+    fn trailers_emitted_after_body_with_end_stream() {
+        let mut cstate = ConnState::default();
+        let stream_id = StreamId(1);
+        open_stream(&mut cstate, stream_id);
+
+        let mut resp = Response::new(
+            vec![OwnedHeader::new(b":status", b"200")],
+            Shared::from(b"hello".to_vec()),
+        );
+        resp.trailers = vec![OwnedHeader::new(b"grpc-status", b"0")];
+        TestApp::begin_response(&mut cstate, stream_id, resp);
+
+        let out = cstate.conn.outbound().to_vec();
+        let (data, data_end, headers, trailers_end, trailers_after_data) = walk_frames(&out);
+        assert_eq!(data, b"hello");
+        assert!(
+            !data_end,
+            "DATA must not carry END_STREAM when trailers follow"
+        );
+        assert_eq!(headers, 2, "response HEADERS then trailing HEADERS");
+        assert!(trailers_end, "trailing HEADERS must carry END_STREAM");
+        assert!(trailers_after_data, "trailers follow the DATA frame");
+    }
+
+    #[test]
+    fn trailers_with_empty_body_emit_without_data() {
+        let mut cstate = ConnState::default();
+        let stream_id = StreamId(1);
+        open_stream(&mut cstate, stream_id);
+
+        let mut resp = Response::new(
+            vec![OwnedHeader::new(b":status", b"200")],
+            Shared::from(Vec::new()),
+        );
+        resp.trailers = vec![OwnedHeader::new(b"grpc-status", b"5")];
+        TestApp::begin_response(&mut cstate, stream_id, resp);
+
+        let out = cstate.conn.outbound().to_vec();
+        let (data, _, headers, trailers_end, _) = walk_frames(&out);
+        assert!(data.is_empty(), "no DATA frame for an empty body");
+        assert_eq!(headers, 2, "response HEADERS then trailing HEADERS");
+        assert!(trailers_end, "trailing HEADERS must carry END_STREAM");
     }
 }

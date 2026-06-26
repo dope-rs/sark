@@ -204,45 +204,60 @@ impl Pipeline {
         out
     }
 
-    fn emit<W: Wire>(
-        slot: &mut link::Slot<W, listener::State<ConnState>>,
+    fn emit<W: Wire, C: Default + 'static, P: Fn(&mut C) -> &mut ConnState>(
+        slot: &mut link::Slot<W, listener::State<C>>,
         aux: &mut listener::Aux,
         driver: &mut Driver,
         out: LoopOutcome,
         use_accum: bool,
         plaintext: &[u8],
+        project: &P,
     ) -> bool {
-        let pending = slot.state.conn.async_state.pending_wake.is_some()
-            || slot.state.conn.async_state.stream_slot.is_some();
+        let pending = project(&mut slot.state.conn)
+            .async_state
+            .pending_wake
+            .is_some()
+            || project(&mut slot.state.conn)
+                .async_state
+                .stream_slot
+                .is_some();
         let will_freeze =
             pending && matches!(out.final_action, Some(Outcome::Park | Outcome::Send { .. }));
 
         if will_freeze {
             if !use_accum
-                && Self::absorb(&mut slot.state.conn, &mut slot.core, &plaintext[out.off..])
+                && Self::absorb(
+                    project(&mut slot.state.conn),
+                    &mut slot.core,
+                    &plaintext[out.off..],
+                )
             {
                 return true;
             }
         } else if use_accum {
-            if let Some(accum) = slot.state.conn.recv.accum.as_mut() {
+            if let Some(accum) = project(&mut slot.state.conn).recv.accum.as_mut() {
                 accum.advance(out.off);
                 if accum.is_empty() {
-                    slot.state.conn.recv.accum = None;
+                    project(&mut slot.state.conn).recv.accum = None;
                 } else {
                     accum.compact();
                 }
             }
             if out.batched > 0 {
-                slot.state.conn.pipeline.expected_total = None;
-                slot.state.conn.recv.reset_limit();
+                project(&mut slot.state.conn).pipeline.expected_total = None;
+                project(&mut slot.state.conn).recv.reset_limit();
             }
-        } else if Self::absorb(&mut slot.state.conn, &mut slot.core, &plaintext[out.off..]) {
+        } else if Self::absorb(
+            project(&mut slot.state.conn),
+            &mut slot.core,
+            &plaintext[out.off..],
+        ) {
             return true;
         }
 
         if will_freeze {
-            slot.state.conn.deferred_close = out.close_after;
-            slot.state.conn.recv.freeze();
+            project(&mut slot.state.conn).deferred_close = out.close_after;
+            project(&mut slot.state.conn).recv.freeze();
             match out.final_action {
                 Some(Outcome::Send { written, .. }) => {
                     let buf = aux.write_buf_for(slot);
@@ -267,7 +282,7 @@ impl Pipeline {
             false
         } else if out.cursor > 0 {
             if let Some(Outcome::Close(reason)) = out.final_action {
-                slot.state.conn.deferred_action = Some(DeferredAction::Close(reason));
+                project(&mut slot.state.conn).deferred_action = Some(DeferredAction::Close(reason));
             }
             if out.close_after {
                 slot.core.set_close_after();
@@ -315,15 +330,32 @@ impl Pipeline {
         H: Routing + crate::timer::TimerHost<'t>,
         W: Wire,
     {
-        if let Some(ret) = Self::fast_path(&mut slot.state.conn, &mut slot.core, bytes) {
+        Self::run_proj(app, bytes, slot, aux, driver, identity_mut)
+    }
+
+    pub fn run_proj<'t, H, W, C, P>(
+        app: &mut H,
+        bytes: &[u8],
+        slot: &mut link::Slot<W, listener::State<C>>,
+        aux: &mut listener::Aux,
+        driver: &mut Driver,
+        project: P,
+    ) -> bool
+    where
+        H: Routing + crate::timer::TimerHost<'t>,
+        W: Wire,
+        C: Default + 'static,
+        P: Fn(&mut C) -> &mut ConnState,
+    {
+        if let Some(ret) = Self::fast_path(project(&mut slot.state.conn), &mut slot.core, bytes) {
             return ret;
         }
 
-        let use_accum = slot.state.conn.recv.accum.is_some();
+        let use_accum = project(&mut slot.state.conn).recv.accum.is_some();
         if use_accum
             && !bytes.is_empty()
             && matches!(
-                slot.state.conn.recv.extend_existing(bytes),
+                project(&mut slot.state.conn).recv.extend_existing(bytes),
                 ExtendOutcome::Overrun
             )
         {
@@ -332,7 +364,11 @@ impl Pipeline {
         }
 
         let peeked: Option<o3::buffer::Shared> = if use_accum {
-            slot.state.conn.recv.accum.as_ref().and_then(|a| a.peek())
+            project(&mut slot.state.conn)
+                .recv
+                .accum
+                .as_ref()
+                .and_then(|a| a.peek())
         } else {
             None
         };
@@ -343,12 +379,18 @@ impl Pipeline {
 
         let close_after = slot.core.close_after();
         let write_buf = aux.write_buf_for(slot);
-        let out = Self::batch(&mut slot.state.conn, app, work_buf, write_buf, close_after);
+        let out = Self::batch(
+            project(&mut slot.state.conn),
+            app,
+            work_buf,
+            write_buf,
+            close_after,
+        );
         drop(peeked);
 
         let head_pending = out.head_pending;
-        let overrun = Self::emit(slot, aux, driver, out, use_accum, bytes);
-        Self::manage_head_deadline(app, slot, driver, head_pending);
+        let overrun = Self::emit(slot, aux, driver, out, use_accum, bytes, &project);
+        Self::manage_head_deadline(app, slot, driver, head_pending, &project);
         overrun
     }
 
@@ -359,25 +401,28 @@ impl Pipeline {
         }
     }
 
-    fn manage_head_deadline<'t, H, W>(
+    fn manage_head_deadline<'t, H, W, C, P>(
         app: &H,
-        slot: &mut link::Slot<W, listener::State<ConnState>>,
+        slot: &mut link::Slot<W, listener::State<C>>,
         driver: &mut Driver,
         head_pending: bool,
+        project: &P,
     ) where
         H: crate::timer::TimerHost<'t>,
         W: Wire,
+        C: Default + 'static,
+        P: Fn(&mut C) -> &mut ConnState,
     {
-        if head_pending && Self::head_still_pending(&slot.state.conn) {
-            if slot.state.conn.head_deadline.is_none() {
+        if head_pending && Self::head_still_pending(project(&mut slot.state.conn)) {
+            if project(&mut slot.state.conn).head_deadline.is_none() {
                 let waker = slot.make_waker(driver);
                 let timer = crate::timer::TimerHost::timer(app);
                 let deadline = std::time::Instant::now() + timer.head_timeout();
                 if let Some(ticket) = timer.arm(deadline, &waker) {
-                    slot.state.conn.head_deadline = Some(ticket);
+                    project(&mut slot.state.conn).head_deadline = Some(ticket);
                 }
             }
-        } else if let Some(ticket) = slot.state.conn.head_deadline.take() {
+        } else if let Some(ticket) = project(&mut slot.state.conn).head_deadline.take() {
             crate::timer::TimerHost::timer(app).cancel(ticket);
         }
     }
@@ -392,14 +437,30 @@ impl Pipeline {
         H: crate::timer::TimerHost<'t>,
         W: Wire,
     {
-        let Some(ticket) = slot.state.conn.head_deadline else {
+        Self::poll_head_deadline_proj(app, slot, aux, driver, identity_mut)
+    }
+
+    pub fn poll_head_deadline_proj<'t, H, W, C, P>(
+        app: &H,
+        slot: &mut link::Slot<W, listener::State<C>>,
+        aux: &mut listener::Aux,
+        driver: &mut Driver,
+        project: P,
+    ) -> bool
+    where
+        H: crate::timer::TimerHost<'t>,
+        W: Wire,
+        C: Default + 'static,
+        P: Fn(&mut C) -> &mut ConnState,
+    {
+        let Some(ticket) = project(&mut slot.state.conn).head_deadline else {
             return false;
         };
         let timer = crate::timer::TimerHost::timer(app);
         if !timer.is_fired(ticket) {
             return false;
         }
-        slot.state.conn.head_deadline = None;
+        project(&mut slot.state.conn).head_deadline = None;
         timer.cancel(ticket);
         slot.core.set_close_after();
         let buf = aux.write_buf_for(slot);
@@ -408,9 +469,24 @@ impl Pipeline {
         true
     }
 
+    pub fn cancel_head_deadline_proj<'t, H, W, C, P>(
+        app: &H,
+        slot: &mut link::Slot<W, listener::State<C>>,
+        project: P,
+    ) where
+        H: crate::timer::TimerHost<'t>,
+        W: Wire,
+        C: Default + 'static,
+        P: Fn(&mut C) -> &mut ConnState,
+    {
+        if let Some(ticket) = project(&mut slot.state.conn).head_deadline.take() {
+            crate::timer::TimerHost::timer(app).cancel(ticket);
+        }
+    }
+
     pub fn on_send_complete<'t, H, W>(
         app: &mut H,
-        _sent: usize,
+        sent: usize,
         slot: &mut link::Slot<W, listener::State<ConnState>>,
         aux: &mut listener::Aux,
         driver: &mut Driver,
@@ -418,10 +494,32 @@ impl Pipeline {
         H: Routing + crate::timer::TimerHost<'t>,
         W: Wire,
     {
-        if slot.state.conn.async_state.stream_slot.is_some() {
+        Self::on_send_complete_proj(app, sent, slot, aux, driver, identity_mut)
+    }
+
+    pub fn on_send_complete_proj<'t, H, W, C, P>(
+        app: &mut H,
+        _sent: usize,
+        slot: &mut link::Slot<W, listener::State<C>>,
+        aux: &mut listener::Aux,
+        driver: &mut Driver,
+        project: P,
+    ) where
+        H: Routing + crate::timer::TimerHost<'t>,
+        W: Wire,
+        C: Default + 'static,
+        P: Fn(&mut C) -> &mut ConnState,
+    {
+        if project(&mut slot.state.conn)
+            .async_state
+            .stream_slot
+            .is_some()
+        {
             return;
         }
-        if let Some(DeferredAction::Close(reason)) = slot.state.conn.deferred_action.take() {
+        if let Some(DeferredAction::Close(reason)) =
+            project(&mut slot.state.conn).deferred_action.take()
+        {
             slot.core.set_close_after();
             if !reason.is_empty() {
                 let buf = aux.write_buf_for(slot);
@@ -430,8 +528,12 @@ impl Pipeline {
             }
             return;
         }
-        if slot.state.conn.recv.accum.is_some() && !slot.state.conn.recv.is_frozen() {
-            let _ = Self::run(app, &[], slot, aux, driver);
+        if project(&mut slot.state.conn).recv.accum.is_some()
+            && !project(&mut slot.state.conn).recv.is_frozen()
+        {
+            let _ = Self::run_proj(app, &[], slot, aux, driver, &project);
         }
     }
 }
+
+pub use sark_core::identity_mut;

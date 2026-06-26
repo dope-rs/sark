@@ -559,7 +559,8 @@ impl<'a> ServeEmit<'a> {
                     Conn = ::sark::dispatch::conn_state::ConnState,
                     Wire = __W,
                 > + ::sark::date::DateHost
-                  + ::sark::timer::TimerHost<'d> + 'd
+                  + ::sark::timer::TimerHost<'d>
+                  + ::sark::dispatch::H1Project<__W> + 'd
             }
         };
         quote! {
@@ -969,16 +970,17 @@ impl<'a> ServeEmit<'a> {
                         on_wake_arms.push(quote! {
                             #slot_lit => {
                                 if let ::std::option::Option::Some(__resp) =
-                                    ::sark::dispatch::Pipeline::fiber_wake(
-                                        &mut self.fiber_slabs.#slab_idx, slot, driver,
+                                    ::sark::dispatch::Pipeline::fiber_wake_proj(
+                                        &mut self.fiber_slabs.#slab_idx, slot, driver, &project,
                                     )
                                 {
                                     let __date = *::sark::date::DateHost::date_stamp(self).buf();
-                                    let __deferred_close = slot.state.conn.deferred_close;
+                                    let __deferred_close =
+                                        project(&mut slot.state.conn).deferred_close;
                                     ::sark::dispatch::Pipeline::finish_pending::<#route_ty, _, _>(
                                         __resp, slot, aux, driver, &__date, __deferred_close,
                                     );
-                                    slot.state.conn.recv.unfreeze();
+                                    project(&mut slot.state.conn).recv.unfreeze();
                                 }
                             }
                         });
@@ -997,11 +999,12 @@ impl<'a> ServeEmit<'a> {
                             }
                         });
                         let pump = quote! {
-                            let __written = ::sark::dispatch::Pipeline::stream_coalesce(
+                            let __written = ::sark::dispatch::Pipeline::stream_coalesce_proj(
                                 &mut self.stream_slabs.#slab_idx,
                                 slot,
                                 aux,
                                 driver,
+                                &project,
                             );
                             if __written > 0 {
                                 let __buf = ::sark::dispatch::Pipeline::reborrow_write_buf(slot, aux);
@@ -1028,27 +1031,113 @@ impl<'a> ServeEmit<'a> {
 
         let on_send_complete_body = if stream_pump_arms.is_empty() {
             quote! {
-                ::sark::dispatch::pipeline::Pipeline::on_send_complete(self, sent, slot, aux, driver);
+                ::sark::dispatch::pipeline::Pipeline::on_send_complete_proj(
+                    self, sent, slot, aux, driver, &project,
+                );
             }
         } else {
             quote! {
                 if let ::std::option::Option::Some(route_id) =
-                    slot.state.conn.async_state.stream_slot.as_ref().map(|__p| __p.0)
+                    project(&mut slot.state.conn).async_state.stream_slot.as_ref().map(|__p| __p.0)
                 {
                     match route_id {
                         #( #stream_pump_arms )*
                         _ => {}
                     }
-                    if slot.state.conn.async_state.stream_slot.is_some() {
+                    if project(&mut slot.state.conn).async_state.stream_slot.is_some() {
                         return;
                     }
                 }
-                ::sark::dispatch::pipeline::Pipeline::on_send_complete(self, sent, slot, aux, driver);
+                ::sark::dispatch::pipeline::Pipeline::on_send_complete_proj(
+                    self, sent, slot, aux, driver, &project,
+                );
+            }
+        };
+
+        let proj_bound = quote! {
+            __C: ::core::default::Default + 'static,
+            __PJ: ::core::ops::Fn(&mut __C) -> &mut ::sark::dispatch::conn_state::ConnState,
+        };
+        let proj_slot_ty = quote! {
+            ::dope::transport::link::Slot<__W, ::dope::manifold::listener::State<__C>>
+        };
+        let on_wake_proj_body = quote! {
+            if ::sark::dispatch::pipeline::Pipeline::poll_head_deadline_proj(
+                self, slot, aux, driver, &project,
+            ) {
+                return;
+            }
+            let route_id = match project(&mut slot.state.conn).async_state.wake_route_id() {
+                ::std::option::Option::Some(__id) => __id,
+                ::std::option::Option::None => return,
+            };
+            match route_id {
+                #( #on_wake_arms )*
+                _ => {}
+            }
+        };
+        let on_close_proj_body = quote! {
+            ::sark::dispatch::pipeline::Pipeline::cancel_head_deadline_proj(self, slot, &project);
+            let state = project(&mut slot.state.conn);
+            let route_id = match state.async_state.wake_route_id() {
+                ::std::option::Option::Some(__id) => __id,
+                ::std::option::Option::None => return,
+            };
+            match route_id {
+                #( #on_close_arms )*
+                _ => {}
             }
         };
 
         quote! {
             #cache_decl
+
+            impl #f_idents_def ::sark::dispatch::H1Project<__W> for #name #f_idents_use
+            where #( #route_bounds )* {
+                fn project_on_chunk<__C, __PJ>(
+                    &mut self,
+                    slot: &mut #proj_slot_ty,
+                    bytes: &[u8],
+                    aux: &mut ::dope::manifold::listener::Aux,
+                    driver: &mut ::dope::Driver,
+                    project: __PJ,
+                ) -> bool where #proj_bound {
+                    ::sark::dispatch::pipeline::Pipeline::run_proj(
+                        self, bytes, slot, aux, driver, project,
+                    )
+                }
+
+                #[allow(clippy::too_many_arguments)]
+                fn project_on_send<__C, __PJ>(
+                    &mut self,
+                    slot: &mut #proj_slot_ty,
+                    project: __PJ,
+                    sent: usize,
+                    aux: &mut ::dope::manifold::listener::Aux,
+                    driver: &mut ::dope::Driver,
+                ) where #proj_bound {
+                    #on_send_complete_body
+                }
+
+                fn project_on_wake<__C, __PJ>(
+                    &mut self,
+                    slot: &mut #proj_slot_ty,
+                    project: __PJ,
+                    aux: &mut ::dope::manifold::listener::Aux,
+                    driver: &mut ::dope::Driver,
+                ) where #proj_bound {
+                    #on_wake_proj_body
+                }
+
+                fn project_on_close<__C, __PJ>(
+                    &mut self,
+                    slot: &mut #proj_slot_ty,
+                    project: __PJ,
+                    _aux: &mut ::dope::manifold::listener::Aux,
+                ) where #proj_bound {
+                    #on_close_proj_body
+                }
+            }
 
             impl #f_idents_def #name #f_idents_use where #( #route_bounds )* {
                 #[allow(clippy::too_many_arguments)]
@@ -1142,7 +1231,9 @@ impl<'a> ServeEmit<'a> {
                     aux: &mut ::dope::manifold::listener::Aux,
                     driver: &mut ::dope::Driver,
                 ) {
-                    #on_send_complete_body
+                    <Self as ::sark::dispatch::H1Project<__W>>::project_on_send(
+                        self, slot, ::sark::dispatch::identity_mut, sent, aux, driver,
+                    );
                 }
 
                 fn on_wake(
@@ -1154,21 +1245,9 @@ impl<'a> ServeEmit<'a> {
                     aux: &mut ::dope::manifold::listener::Aux,
                     driver: &mut ::dope::Driver,
                 ) {
-                    if ::sark::dispatch::pipeline::Pipeline::poll_head_deadline(self, slot, aux, driver) {
-                        return;
-                    }
-                    let route_id = match (
-                        &slot.state.conn.async_state.pending_wake,
-                        &slot.state.conn.async_state.stream_slot,
-                    ) {
-                        (::std::option::Option::Some(__p), _) => __p.0,
-                        (::std::option::Option::None, ::std::option::Option::Some(__p)) => __p.0,
-                        (::std::option::Option::None, ::std::option::Option::None) => return,
-                    };
-                    match route_id {
-                        #( #on_wake_arms )*
-                        _ => {}
-                    }
+                    <Self as ::sark::dispatch::H1Project<__W>>::project_on_wake(
+                        self, slot, ::sark::dispatch::identity_mut, aux, driver,
+                    );
                 }
 
                 fn on_close(
@@ -1179,24 +1258,9 @@ impl<'a> ServeEmit<'a> {
                     >,
                     _aux: &mut ::dope::manifold::listener::Aux,
                 ) {
-                    if let ::std::option::Option::Some(__ticket) =
-                        slot.state.conn.head_deadline.take()
-                    {
-                        ::sark::timer::TimerHost::timer(self).cancel(__ticket);
-                    }
-                    let state = &mut slot.state.conn;
-                    let route_id = match (
-                        &state.async_state.pending_wake,
-                        &state.async_state.stream_slot,
-                    ) {
-                        (::std::option::Option::Some(__p), _) => __p.0,
-                        (::std::option::Option::None, ::std::option::Option::Some(__p)) => __p.0,
-                        (::std::option::Option::None, ::std::option::Option::None) => return,
-                    };
-                    match route_id {
-                        #( #on_close_arms )*
-                        _ => {}
-                    }
+                    <Self as ::sark::dispatch::H1Project<__W>>::project_on_close(
+                        self, slot, ::sark::dispatch::identity_mut, _aux,
+                    );
                 }
             }
         }

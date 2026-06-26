@@ -202,6 +202,8 @@ mod liveness {
     }
 }
 
+pub use liveness::is_plain_request;
+
 #[derive(Clone, Debug)]
 pub struct Request {
     pub stream_id: StreamId,
@@ -1063,16 +1065,17 @@ impl<H: Handler, W: Wire> App<H, W> {
         state.drive_pending();
     }
 
-    fn flush_into(
-        slot: &mut Slot<W, listener::State<ConnState>>,
+    fn flush_into_proj<C: Default + 'static, P: Fn(&mut C) -> &mut ConnState>(
+        slot: &mut Slot<W, listener::State<C>>,
         aux: &mut listener::Aux,
         driver: &mut Driver,
         close_after: bool,
+        project: &P,
     ) {
         if slot.core.is_send_inflight() {
             return;
         }
-        let out_is_empty = slot.state.conn.h2.outbound().is_empty();
+        let out_is_empty = project(&mut slot.state.conn).h2.outbound().is_empty();
         if out_is_empty {
             if close_after {
                 slot.core.set_close_after();
@@ -1081,7 +1084,7 @@ impl<H: Handler, W: Wire> App<H, W> {
         }
         let send_ud = slot.token();
         let write_buf = aux.write_buf_for(slot);
-        let state = &mut slot.state.conn;
+        let state = project(&mut slot.state.conn);
         let out = state.h2.outbound();
         let n = out.len().min(write_buf.len());
         write_buf[..n].copy_from_slice(&out[..n]);
@@ -1091,6 +1094,64 @@ impl<H: Handler, W: Wire> App<H, W> {
             slot.core.set_close_after();
         }
         slot.submit_buffered(write_buf, n, send_ud, driver);
+    }
+
+    pub fn on_chunk_proj<C: Default + 'static>(
+        &mut self,
+        slot: &mut Slot<W, listener::State<C>>,
+        project: impl Fn(&mut C) -> &mut ConnState,
+        chunk: RecvChunk<'_>,
+        aux: &mut listener::Aux,
+        driver: &mut Driver,
+    ) -> manifold::Outcome {
+        let bytes = chunk.as_slice();
+        if self.liveness_fallback && !project(&mut slot.state.conn).probed {
+            project(&mut slot.state.conn).probed = true;
+            if liveness::is_plain_request(bytes) {
+                liveness::respond(slot, aux, driver);
+                return manifold::Outcome::Ok;
+            }
+        }
+        {
+            let state = project(&mut slot.state.conn);
+            if state.h2.goaway_sent() || state.h2.goaway_received().is_some() {
+                return manifold::Outcome::Ok;
+            }
+            if let Err(e) = state.h2.ingest(bytes) {
+                let code = ConnState::map_conn_err(&e);
+                state.h2.goaway(code, b"");
+                Self::flush_into_proj(slot, aux, driver, true, &project);
+                return manifold::Outcome::Ok;
+            }
+            self.drain_events(state);
+            state.drive_pending();
+        }
+        let close_after = project(&mut slot.state.conn).h2.goaway_sent();
+        Self::flush_into_proj(slot, aux, driver, close_after, &project);
+        manifold::Outcome::Ok
+    }
+
+    pub fn on_send_proj<C: Default + 'static>(
+        &mut self,
+        slot: &mut Slot<W, listener::State<C>>,
+        _sent: usize,
+        project: impl Fn(&mut C) -> &mut ConnState,
+        aux: &mut listener::Aux,
+        driver: &mut Driver,
+    ) {
+        let close_after = project(&mut slot.state.conn).h2.goaway_sent();
+        Self::flush_into_proj(slot, aux, driver, close_after, &project);
+    }
+
+    pub fn on_wake_proj<C: Default + 'static>(
+        &mut self,
+        slot: &mut Slot<W, listener::State<C>>,
+        project: impl Fn(&mut C) -> &mut ConnState,
+        aux: &mut listener::Aux,
+        driver: &mut Driver,
+    ) {
+        let close_after = project(&mut slot.state.conn).h2.goaway_sent();
+        Self::flush_into_proj(slot, aux, driver, close_after, &project);
     }
 }
 
@@ -1105,40 +1166,17 @@ impl<H: Handler, W: Wire> Application for App<H, W> {
         aux: &mut listener::Aux,
         driver: &mut Driver,
     ) -> manifold::Outcome {
-        let bytes = chunk.as_slice();
-        if self.liveness_fallback && !slot.state.conn.probed {
-            slot.state.conn.probed = true;
-            if liveness::is_plain_request(bytes) {
-                liveness::respond(slot, aux, driver);
-                return manifold::Outcome::Ok;
-            }
-        }
-        let state = &mut slot.state.conn;
-        if state.h2.goaway_sent() || state.h2.goaway_received().is_some() {
-            return manifold::Outcome::Ok;
-        }
-        if let Err(e) = state.h2.ingest(bytes) {
-            let code = ConnState::map_conn_err(&e);
-            state.h2.goaway(code, b"");
-            Self::flush_into(slot, aux, driver, true);
-            return manifold::Outcome::Ok;
-        }
-        self.drain_events(state);
-        state.drive_pending();
-        let close_after = state.h2.goaway_sent();
-        Self::flush_into(slot, aux, driver, close_after);
-        manifold::Outcome::Ok
+        self.on_chunk_proj(slot, identity_mut, chunk, aux, driver)
     }
 
     fn on_send(
         &mut self,
         slot: &mut Slot<W, listener::State<ConnState>>,
-        _sent: usize,
+        sent: usize,
         aux: &mut listener::Aux,
         driver: &mut Driver,
     ) {
-        let close_after = slot.state.conn.h2.goaway_sent();
-        Self::flush_into(slot, aux, driver, close_after);
+        self.on_send_proj(slot, sent, identity_mut, aux, driver)
     }
 
     fn defer_close(&self, slot: &Slot<W, listener::State<ConnState>>) -> bool {
@@ -1151,8 +1189,7 @@ impl<H: Handler, W: Wire> Application for App<H, W> {
         aux: &mut listener::Aux,
         driver: &mut Driver,
     ) {
-        let close_after = slot.state.conn.h2.goaway_sent();
-        Self::flush_into(slot, aux, driver, close_after);
+        self.on_wake_proj(slot, identity_mut, aux, driver)
     }
 
     fn on_close(
@@ -1162,6 +1199,8 @@ impl<H: Handler, W: Wire> Application for App<H, W> {
     ) {
     }
 }
+
+use sark_core::identity_mut;
 
 impl ConnState {
     fn enqueue_response(&mut self, stream_id: StreamId, response: Response) {
