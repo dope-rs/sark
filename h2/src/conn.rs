@@ -143,6 +143,29 @@ impl From<hpack::DecoderError> for ConnError {
     }
 }
 
+impl From<&ConnError> for ErrorCode {
+    fn from(e: &ConnError) -> Self {
+        match e {
+            ConnError::BadPreface
+            | ConnError::Protocol
+            | ConnError::BadStream
+            | ConnError::Continuation
+            | ConnError::BadSettings
+            | ConnError::StreamGoneAway => ErrorCode::ProtocolError,
+            ConnError::StreamClosed => ErrorCode::StreamClosed,
+            ConnError::ParseError(ParseError::FrameSize)
+            | ConnError::ParseError(ParseError::BadLength) => ErrorCode::FrameSize,
+            ConnError::ParseError(_) => ErrorCode::ProtocolError,
+            ConnError::FlowControl => ErrorCode::FlowControl,
+            ConnError::FrameSize => ErrorCode::FrameSize,
+            ConnError::Hpack(_) => ErrorCode::Compression,
+            ConnError::GoAwayReceived(c) => *c,
+            ConnError::StreamLimit => ErrorCode::RefusedStream,
+            ConnError::HeaderListTooLarge | ConnError::Overload => ErrorCode::EnhanceYourCalm,
+        }
+    }
+}
+
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 enum StreamClass {
     Connection,
@@ -347,6 +370,13 @@ impl<R: Role> Conn<R> {
     pub fn drain_outbound(&mut self, n: usize) {
         let n = n.min(self.outbound.len());
         self.outbound.drain(..n);
+    }
+
+    pub fn drain_into(&mut self, write_buf: &mut [u8]) -> usize {
+        let n = self.outbound.len().min(write_buf.len());
+        write_buf[..n].copy_from_slice(&self.outbound[..n]);
+        self.drain_outbound(n);
+        n
     }
 
     pub fn poll_event(&mut self) -> Option<Event> {

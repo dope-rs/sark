@@ -13,8 +13,8 @@ use dope::wire::Identity;
 use dope::{Driver, DriverConfig, Executor, manifold};
 use dope_extra::Trigger;
 use dope_tls::{Endpoint, Tls};
-use sark_h2::frame::ParseError;
-use sark_h2::{Conn, ConnError, ErrorCode, ServerRole, StreamId, conn};
+use sark_core::identity_mut;
+use sark_h2::{Conn, ErrorCode, ServerRole, StreamId, conn};
 
 use crate::Codec;
 use crate::frame::{Deframer, MessageFrame};
@@ -145,11 +145,15 @@ mod liveness {
 
     const RESPONSE: &[u8] = b"HTTP/1.1 200 OK\r\ncontent-length: 0\r\nconnection: close\r\n\r\n";
 
-    const H2_PREFACE: &[u8] = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
+    pub const H2_PREFACE: &[u8] = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
+
+    pub fn is_h2_preface_prefix(buf: &[u8]) -> bool {
+        let n = buf.len().min(H2_PREFACE.len());
+        buf[..n] == H2_PREFACE[..n]
+    }
 
     pub fn is_plain_request(first: &[u8]) -> bool {
-        let n = first.len().min(H2_PREFACE.len());
-        first[..n] != H2_PREFACE[..n]
+        !is_h2_preface_prefix(first)
     }
 
     pub fn respond<W: Wire, C: Default + 'static>(
@@ -202,7 +206,7 @@ mod liveness {
     }
 }
 
-pub use liveness::is_plain_request;
+pub use liveness::{H2_PREFACE, is_h2_preface_prefix, is_plain_request};
 
 #[derive(Clone, Debug)]
 pub struct Request {
@@ -1085,10 +1089,7 @@ impl<H: Handler, W: Wire> App<H, W> {
         let send_ud = slot.token();
         let write_buf = aux.write_buf_for(slot);
         let state = project(&mut slot.state.conn);
-        let out = state.h2.outbound();
-        let n = out.len().min(write_buf.len());
-        write_buf[..n].copy_from_slice(&out[..n]);
-        state.h2.drain_outbound(n);
+        let n = state.h2.drain_into(write_buf);
         let close_now = close_after && state.h2.outbound().is_empty();
         if close_now {
             slot.core.set_close_after();
@@ -1118,7 +1119,7 @@ impl<H: Handler, W: Wire> App<H, W> {
                 return manifold::Outcome::Ok;
             }
             if let Err(e) = state.h2.ingest(bytes) {
-                let code = ConnState::map_conn_err(&e);
+                let code = ErrorCode::from(&e);
                 state.h2.goaway(code, b"");
                 Self::flush_into_proj(slot, aux, driver, true, &project);
                 return manifold::Outcome::Ok;
@@ -1199,8 +1200,6 @@ impl<H: Handler, W: Wire> Application for App<H, W> {
     ) {
     }
 }
-
-use sark_core::identity_mut;
 
 impl ConnState {
     fn enqueue_response(&mut self, stream_id: StreamId, response: Response) {
@@ -1305,27 +1304,6 @@ impl ConnState {
         if let Ok(trailers) = HeaderBlock::for_trailers(&status, &Metadata::new()) {
             let h2_trailers = trailers.as_h2();
             let _ = self.h2.send_trailers(stream_id, &h2_trailers);
-        }
-    }
-
-    fn map_conn_err(e: &ConnError) -> ErrorCode {
-        match e {
-            ConnError::BadPreface
-            | ConnError::Protocol
-            | ConnError::BadStream
-            | ConnError::Continuation
-            | ConnError::BadSettings
-            | ConnError::StreamGoneAway => ErrorCode::ProtocolError,
-            ConnError::StreamClosed => ErrorCode::StreamClosed,
-            ConnError::ParseError(ParseError::FrameSize)
-            | ConnError::ParseError(ParseError::BadLength) => ErrorCode::FrameSize,
-            ConnError::ParseError(_) => ErrorCode::ProtocolError,
-            ConnError::FlowControl => ErrorCode::FlowControl,
-            ConnError::FrameSize => ErrorCode::FrameSize,
-            ConnError::Hpack(_) => ErrorCode::Compression,
-            ConnError::HeaderListTooLarge | ConnError::Overload => ErrorCode::EnhanceYourCalm,
-            ConnError::GoAwayReceived(c) => *c,
-            ConnError::StreamLimit => ErrorCode::RefusedStream,
         }
     }
 }
