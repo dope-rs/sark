@@ -126,8 +126,17 @@ pub struct ConnState {
     pub deferred_close: bool,
     pub conn_id: ::dope::runtime::token::Token,
     pub chunked_body: Option<o3::buffer::Shared>,
+    pub retained_req: Option<o3::buffer::Shared>,
+    pub recv_view: Option<o3::buffer::Shared>,
     pub pipeline: PipelineState,
     pub head_deadline: Option<crate::timer::Ticket>,
+}
+
+impl ConnState {
+    pub fn release_req(&mut self) {
+        self.retained_req = None;
+        self.chunked_body = None;
+    }
 }
 
 impl Default for ConnState {
@@ -143,6 +152,8 @@ impl Default for ConnState {
                 ::dope::runtime::token::Epoch::INITIAL,
             ),
             chunked_body: None,
+            retained_req: None,
+            recv_view: None,
             pipeline: PipelineState::default(),
             head_deadline: None,
         }

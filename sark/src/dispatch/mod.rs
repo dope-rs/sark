@@ -140,6 +140,22 @@ impl Ctx<'_> {
         })
     }
 
+    fn retain_req(
+        view: Option<&o3::buffer::Shared>,
+        req_bytes: &[u8],
+        len: usize,
+    ) -> o3::buffer::Shared {
+        if let Some(view) = view {
+            let base = view.as_slice().as_ptr() as usize;
+            if let Some(off) = (req_bytes.as_ptr() as usize).checked_sub(base)
+                && off + len <= view.len()
+            {
+                return view.slice(off..off + len);
+            }
+        }
+        o3::buffer::Shared::copy_from_slice(&req_bytes[..len])
+    }
+
     fn assemble_static<R: RouteSpec>(
         &self,
         raw_params: <R as RouteSpec>::RawParams,
@@ -156,7 +172,14 @@ impl Ctx<'_> {
         if let Some(decoded) = chunked_body {
             conn.chunked_body = Some(decoded);
         }
-        let req = &self.req_bytes[..total];
+        let retain = if conn.chunked_body.is_some() {
+            head_len
+        } else {
+            total
+        };
+        let retained = Self::retain_req(conn.recv_view.as_ref(), self.req_bytes, retain);
+        let slot = conn.retained_req.insert(retained);
+        let req: &[u8] = slot.as_ref();
         if let Some(qrange) = self.query_range.clone()
             && <<R as RouteSpec>::Request as RouteRequestImpl>::parse_query_raw(
                 &mut raw_headers,
@@ -175,7 +198,10 @@ impl Ctx<'_> {
             Some(shared) => shared.as_ref(),
             None => &req[head_len..],
         };
-        // SAFETY: borrows the conn recv buffer (frozen) for the head, and conn.chunked_body (alive until slab.release) for the body — 'static sound for fiber/stream lifetime.
+        // SAFETY: req borrows conn.retained_req (refcounts the recv accum, COW-kept
+        // against later mutation), body borrows conn.retained_req or conn.chunked_body
+        // — both conn-owned, freed at slab.release → 'static-sound for the fiber/stream
+        // lifetime.
         let request = unsafe {
             Request::from_borrowed_static(http_method, target_range, &req[..head_len], body_bytes)
         };
@@ -977,7 +1003,7 @@ impl Pipeline {
                         slab.release(token);
                         conn.async_state.stream_phase = StreamPhase::Streaming;
                         conn.recv.unfreeze();
-                        conn.chunked_body = None;
+                        conn.release_req();
                         if conn.deferred_close {
                             slot.core.set_close_after();
                         }
@@ -997,7 +1023,7 @@ impl Pipeline {
                 slab.release(token);
                 conn.async_state.stream_phase = StreamPhase::Streaming;
                 conn.recv.unfreeze();
-                conn.chunked_body = None;
+                conn.release_req();
                 if conn.deferred_close {
                     slot.core.set_close_after();
                 }
@@ -1048,7 +1074,7 @@ impl Pipeline {
                 if let Some((_, owned)) = conn.async_state.pending_wake.take() {
                     slab.release(owned);
                 }
-                conn.chunked_body = None;
+                conn.release_req();
                 Some(resp)
             }
             Poll::Pending => None,
