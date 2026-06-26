@@ -244,6 +244,23 @@ impl Response {
     pub fn push_message(&mut self, payload: Vec<u8>) {
         self.messages.push(payload);
     }
+
+    pub fn encode_body(&self, out: &mut Vec<u8>) -> Result<(), Status> {
+        encode_frames(&self.messages, out)
+    }
+}
+
+fn encode_frames(messages: &[Vec<u8>], out: &mut Vec<u8>) -> Result<(), Status> {
+    out.reserve(messages.iter().map(|p| p.len() + 5).sum());
+    for payload in messages {
+        MessageFrame::encode(false, payload, out)
+            .map_err(|_| Status::new(Code::Internal, "response message too large"))?;
+    }
+    Ok(())
+}
+
+fn compression_unsupported() -> Status {
+    Status::new(Code::Unimplemented, "compressed messages are not supported")
 }
 
 impl Default for Response {
@@ -463,6 +480,68 @@ impl<H: Handler> Handler for Routes<H> {
         };
         route.handler.on_request(request, response);
     }
+}
+
+fn dispatch_request(
+    handler: &mut (impl Handler + ?Sized),
+    stream_id: StreamId,
+    head: RequestHead,
+    messages: Vec<MessageFrame>,
+    trailers: Metadata,
+) -> Result<Response, Status> {
+    if messages.iter().any(|message| message.compressed) {
+        return Err(compression_unsupported());
+    }
+    let mut response = Response::new();
+    handler.on_request(
+        Request {
+            stream_id,
+            head,
+            messages,
+            trailers,
+        },
+        &mut response,
+    );
+    Ok(response)
+}
+
+/// Drive `handler` for one buffered unary/server-streaming call whose `body` is
+/// the raw gRPC length-prefixed request frames. Pairs with [`Response::encode_body`].
+///
+/// The whole `body` is held in memory, so bounding its size is the caller's job;
+/// only `config.max_message_len` is enforced here.
+///
+/// ```
+/// use sark_grpc::server::{dispatch_buffered, Config, Handler, Request, Response, Routes};
+/// use sark_grpc::headers::RequestHead;
+///
+/// struct Echo;
+/// impl Handler for Echo {
+///     fn on_request(&mut self, req: Request, res: &mut Response) {
+///         req.messages.iter().for_each(|m| res.push_message(m.payload.clone()));
+///     }
+/// }
+///
+/// let mut routes = Routes::new();
+/// routes.push(b"/svc", Echo);
+/// let head = RequestHead { path: b"/svc".to_vec(), authority: None, metadata: Default::default() };
+/// let response = dispatch_buffered(&mut routes, head, &[], &Config::default());
+/// let mut wire = Vec::new();
+/// response.encode_body(&mut wire).unwrap();
+/// ```
+pub fn dispatch_buffered(
+    handler: &mut (impl Handler + ?Sized),
+    head: RequestHead,
+    body: &[u8],
+    config: &Config,
+) -> Response {
+    let mut deframer = Deframer::new(config.max_message_len);
+    let mut messages = Vec::new();
+    if let Err(err) = deframer.push(body, &mut messages) {
+        return Response::with_status(Status::from_frame_err(err));
+    }
+    dispatch_request(handler, StreamId(0), head, messages, Metadata::new())
+        .unwrap_or_else(Response::with_status)
 }
 
 #[derive(Clone, Debug)]
@@ -1016,10 +1095,7 @@ impl<H: Handler, W: Wire> App<H, W> {
         for message in messages {
             if message.compressed {
                 state.streams.remove(&stream_id);
-                state.send_error(
-                    stream_id,
-                    Status::new(Code::Unimplemented, "compressed messages are not supported"),
-                );
+                state.send_error(stream_id, compression_unsupported());
                 return;
             }
             let mut reply = StreamReply::new();
@@ -1049,24 +1125,19 @@ impl<H: Handler, W: Wire> App<H, W> {
             state.drive_pending();
             return;
         }
-        if stream.messages.iter().any(|m| m.compressed) {
-            state.send_error(
-                stream_id,
-                Status::new(Code::Unimplemented, "compressed messages are not supported"),
-            );
-            return;
-        }
-
-        let request = Request {
+        match dispatch_request(
+            &mut self.handler,
             stream_id,
-            head: stream.head,
-            messages: stream.messages,
-            trailers: stream.trailers,
-        };
-        let mut response = Response::new();
-        self.handler.on_request(request, &mut response);
-        state.enqueue_response(stream_id, response);
-        state.drive_pending();
+            stream.head,
+            stream.messages,
+            stream.trailers,
+        ) {
+            Ok(response) => {
+                state.enqueue_response(stream_id, response);
+                state.drive_pending();
+            }
+            Err(status) => state.send_error(stream_id, status),
+        }
     }
 
     fn flush_into_proj<C: Default + 'static, P: Fn(&mut C) -> &mut ConnState>(
@@ -1228,14 +1299,9 @@ impl ConnState {
         };
 
         let mut body = Vec::new();
-        for payload in reply.messages {
-            if MessageFrame::encode(false, &payload, &mut body).is_err() {
-                self.send_error(
-                    stream_id,
-                    Status::new(Code::Internal, "response message too large"),
-                );
-                return;
-            }
+        if let Err(status) = encode_frames(&reply.messages, &mut body) {
+            self.send_error(stream_id, status);
+            return;
         }
 
         let trailers = if let Some(status) = reply.status {
