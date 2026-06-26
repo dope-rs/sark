@@ -57,6 +57,9 @@ impl FrameHead {
                     buf[offset + 7],
                 ]);
                 offset += 8;
+                if raw & 0x8000_0000_0000_0000 != 0 {
+                    return Err(FrameError::LengthOverflow);
+                }
                 usize::try_from(raw).map_err(|_| FrameError::LengthOverflow)?
             }
             _ => unreachable!(),
@@ -98,6 +101,14 @@ impl FrameHead {
         }))
     }
 
+    #[cfg(test)]
+    fn extended_len_frame(raw_len: u64) -> Vec<u8> {
+        let mut v = vec![0x82, 0x80 | 127];
+        v.extend_from_slice(&raw_len.to_be_bytes());
+        v.extend_from_slice(&[0, 0, 0, 0]);
+        v
+    }
+
     pub fn encode_header(out: &mut Vec<u8>, opcode: u8, payload_len: usize, masked: bool) {
         out.push(0x80 | (opcode & 0x0f));
         Self::encode_len(out, payload_len, masked);
@@ -114,5 +125,25 @@ impl FrameHead {
             out.push(mask_bit | 127);
             out.extend_from_slice(&(payload_len as u64).to_be_bytes());
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rejects_64bit_length_with_msb_set() {
+        let buf = FrameHead::extended_len_frame(0x8000_0000_0000_0000);
+        assert!(matches!(
+            FrameHead::parse(&buf, 0, usize::MAX),
+            Err(FrameError::LengthOverflow)
+        ));
+    }
+
+    #[test]
+    fn accepts_64bit_length_without_msb() {
+        let buf = FrameHead::extended_len_frame(70_000);
+        assert!(matches!(FrameHead::parse(&buf, 0, 100_000), Ok(None)));
     }
 }

@@ -1,5 +1,5 @@
 use core::marker::PhantomData;
-use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::collections::{BTreeMap, VecDeque};
 
 use crate::frame::{
     self, Continuation, Data, ErrorCode, Flags, FrameHeader, GoAway, HEADER_LEN, Headers,
@@ -209,11 +209,17 @@ struct PendingHeaders {
     stream_id: StreamId,
     kind: PendingKind,
     buf: Vec<u8>,
+    continuations: u32,
 }
 
 const DEFAULT_MAX_HEADER_LIST_SIZE: u32 = 16_384;
+const DEFAULT_MAX_CONCURRENT_STREAMS: u32 = 256;
 const MAX_INBOUND_BUFFER: usize = 1 << 20;
+const MAX_OUTBOUND_BUFFER: usize = 1 << 20;
 const MAX_EVENTS: usize = 1 << 16;
+const MAX_RESET_STREAMS: u32 = 100;
+const RESET_RING_CAP: usize = 256;
+const MAX_CONTINUATION_FRAMES: u32 = 64;
 
 pub struct Conn<R: Role> {
     role: PhantomData<R>,
@@ -246,7 +252,8 @@ pub struct Conn<R: Role> {
     per_stream_recv_window: BTreeMap<StreamId, flow::Window>,
     conn_pending_release: u32,
     per_stream_pending_release: BTreeMap<StreamId, u32>,
-    peer_end_streamed: BTreeSet<StreamId>,
+    reset_streams: VecDeque<StreamId>,
+    peer_reset_count: u32,
     send_window_opened: bool,
 }
 
@@ -260,6 +267,9 @@ impl<R: Role> Conn<R> {
         let mut local = local;
         if R::IS_SERVER {
             local.enable_push = false;
+            if local.max_concurrent_streams.is_none() {
+                local.max_concurrent_streams = Some(DEFAULT_MAX_CONCURRENT_STREAMS);
+            }
         }
         if local.max_header_list_size.is_none() {
             local.max_header_list_size = Some(DEFAULT_MAX_HEADER_LIST_SIZE);
@@ -292,7 +302,8 @@ impl<R: Role> Conn<R> {
             per_stream_recv_window: BTreeMap::new(),
             conn_pending_release: 0,
             per_stream_pending_release: BTreeMap::new(),
-            peer_end_streamed: BTreeSet::new(),
+            reset_streams: VecDeque::new(),
+            peer_reset_count: 0,
             send_window_opened: false,
         };
         if R::PREFACE_SENDS_FIRST {
@@ -360,6 +371,10 @@ impl<R: Role> Conn<R> {
 
     pub fn active_count(&self) -> usize {
         self.streams.len()
+    }
+
+    pub fn tracked_closed_count(&self) -> usize {
+        self.reset_streams.len()
     }
 
     pub fn stream_send_window(&self, id: StreamId) -> Option<flow::Window> {
@@ -467,6 +482,9 @@ impl<R: Role> Conn<R> {
         if self.events.len() > MAX_EVENTS {
             return Err(ConnError::Overload);
         }
+        if self.outbound.len() > MAX_OUTBOUND_BUFFER {
+            return Err(ConnError::Overload);
+        }
         Ok(())
     }
 
@@ -506,6 +524,12 @@ impl<R: Role> Conn<R> {
 
     fn emit_rst(&mut self, stream_id: StreamId, error: ErrorCode) {
         RstStream { stream_id, error }.encode(&mut self.outbound);
+    }
+
+    fn rst_evict(&mut self, stream_id: StreamId, error: ErrorCode) {
+        self.emit_rst(stream_id, error);
+        self.mark_reset(stream_id);
+        self.evict_stream(stream_id);
     }
 
     fn emit_headers<'a, I>(
@@ -568,19 +592,23 @@ impl<R: Role> Conn<R> {
             Side::Remote => stream.state.recv(ev)?,
         };
         stream.state = next;
-        let peer_es = side == Side::Remote
-            && matches!(
-                ev,
-                stream::Event::Headers { end_stream: true }
-                    | stream::Event::Data { end_stream: true }
-            );
-        if peer_es {
-            self.peer_end_streamed.insert(id);
-        }
         if next == stream::State::Closed {
+            if matches!(ev, stream::Event::RstStream) {
+                self.mark_reset(id);
+            }
             self.evict_stream(id);
         }
         Ok(())
+    }
+
+    fn mark_reset(&mut self, id: StreamId) {
+        if self.reset_streams.contains(&id) {
+            return;
+        }
+        if self.reset_streams.len() >= RESET_RING_CAP {
+            self.reset_streams.pop_front();
+        }
+        self.reset_streams.push_back(id);
     }
 
     fn is_peer_initiated(id: StreamId) -> bool {
@@ -607,17 +635,17 @@ impl<R: Role> Conn<R> {
             return StreamClass::Active;
         }
         if Self::is_peer_initiated(id) && id.0 <= self.last_peer_stream_id {
-            return if self.peer_end_streamed.contains(&id) {
-                StreamClass::ClosedEnd
-            } else {
+            return if self.reset_streams.contains(&id) {
                 StreamClass::ClosedRst
+            } else {
+                StreamClass::ClosedEnd
             };
         }
         if Self::is_local_initiated(id) && id.0 < self.next_local_id.peek().0 {
-            return if self.peer_end_streamed.contains(&id) {
-                StreamClass::ClosedEnd
-            } else {
+            return if self.reset_streams.contains(&id) {
                 StreamClass::ClosedRst
+            } else {
+                StreamClass::ClosedEnd
             };
         }
         StreamClass::Idle
@@ -663,9 +691,11 @@ impl<R: Role> Conn<R> {
                         return Ok(());
                     }
                     let length =
-                        u32::from_be_bytes([0, self.inbound[0], self.inbound[1], self.inbound[2]])
-                            as usize;
-                    let total = HEADER_LEN + length;
+                        u32::from_be_bytes([0, self.inbound[0], self.inbound[1], self.inbound[2]]);
+                    if length > self.local_settings.max_frame_size {
+                        return Err(ConnError::FrameSize);
+                    }
+                    let total = HEADER_LEN + length as usize;
                     if self.inbound.len() < total {
                         return Ok(());
                     }
@@ -674,12 +704,12 @@ impl<R: Role> Conn<R> {
                 }
                 Err(e) => return Err(e.into()),
             };
+            if header.length > self.local_settings.max_frame_size {
+                return Err(ConnError::FrameSize);
+            }
             let total = HEADER_LEN + header.length as usize;
             if self.inbound.len() < total {
                 return Ok(());
-            }
-            if header.length > self.local_settings.max_frame_size {
-                return Err(ConnError::FrameSize);
             }
             if self.pending_headers.is_some() && header.kind != frame::Type::Continuation {
                 return Err(ConnError::Continuation);
@@ -893,8 +923,7 @@ impl<R: Role> Conn<R> {
                 Validate::response(&headers, trailing)
             };
             if valid.is_err() || over_limit {
-                self.emit_rst(stream_id, ErrorCode::ProtocolError);
-                self.evict_stream(stream_id);
+                self.rst_evict(stream_id, ErrorCode::ProtocolError);
                 return Ok(());
             }
             match self.advance_stream(
@@ -905,8 +934,7 @@ impl<R: Role> Conn<R> {
                 Ok(()) => {}
                 Err(TransitionError::Protocol) => return Err(ConnError::Protocol),
                 Err(TransitionError::StreamClosed) => {
-                    self.emit_rst(stream_id, ErrorCode::StreamClosed);
-                    self.evict_stream(stream_id);
+                    self.rst_evict(stream_id, ErrorCode::StreamClosed);
                     return Ok(());
                 }
             }
@@ -930,6 +958,7 @@ impl<R: Role> Conn<R> {
                     trailing,
                 },
                 buf: block_fragment,
+                continuations: 0,
             });
         }
         Ok(())
@@ -973,8 +1002,7 @@ impl<R: Role> Conn<R> {
             Ok(()) => {}
             Err(TransitionError::Protocol) => return Err(ConnError::Protocol),
             Err(TransitionError::StreamClosed) => {
-                self.emit_rst(stream_id, ErrorCode::StreamClosed);
-                self.evict_stream(stream_id);
+                self.rst_evict(stream_id, ErrorCode::StreamClosed);
                 return Ok(());
             }
         }
@@ -1056,6 +1084,13 @@ impl<R: Role> Conn<R> {
         if pending.stream_id != stream_id {
             return Err(ConnError::Continuation);
         }
+        if block_fragment.is_empty() && !end_headers {
+            return Err(ConnError::Continuation);
+        }
+        pending.continuations = pending.continuations.saturating_add(1);
+        if pending.continuations > MAX_CONTINUATION_FRAMES {
+            return Err(ConnError::Overload);
+        }
         if block_fragment.len() > cap.saturating_sub(pending.buf.len()) {
             return Err(ConnError::HeaderListTooLarge);
         }
@@ -1074,8 +1109,7 @@ impl<R: Role> Conn<R> {
                         Validate::response(&headers, trailing)
                     };
                     if valid.is_err() || over_limit {
-                        self.emit_rst(pending.stream_id, ErrorCode::ProtocolError);
-                        self.evict_stream(pending.stream_id);
+                        self.rst_evict(pending.stream_id, ErrorCode::ProtocolError);
                         return Ok(());
                     }
                     match self.advance_stream(
@@ -1088,8 +1122,7 @@ impl<R: Role> Conn<R> {
                             return Err(ConnError::Protocol);
                         }
                         Err(TransitionError::StreamClosed) => {
-                            self.emit_rst(pending.stream_id, ErrorCode::StreamClosed);
-                            self.evict_stream(pending.stream_id);
+                            self.rst_evict(pending.stream_id, ErrorCode::StreamClosed);
                             return Ok(());
                         }
                     }
@@ -1106,8 +1139,7 @@ impl<R: Role> Conn<R> {
                 PendingKind::PushPromise { promised } => {
                     let valid = Validate::request(&headers, false);
                     if valid.is_err() || over_limit {
-                        self.emit_rst(promised, ErrorCode::ProtocolError);
-                        self.evict_stream(promised);
+                        self.rst_evict(promised, ErrorCode::ProtocolError);
                         return Ok(());
                     }
                     self.events.push_back(Event::PushPromise {
@@ -1134,6 +1166,10 @@ impl<R: Role> Conn<R> {
             stream_id: r.stream_id,
             error: r.error,
         });
+        self.peer_reset_count = self.peer_reset_count.saturating_add(1);
+        if self.peer_reset_count > MAX_RESET_STREAMS {
+            return Err(ConnError::Overload);
+        }
         Ok(())
     }
 
@@ -1176,6 +1212,7 @@ impl<R: Role> Conn<R> {
                 stream_id,
                 kind: PendingKind::PushPromise { promised },
                 buf: block_fragment,
+                continuations: 0,
             });
         }
         Ok(())

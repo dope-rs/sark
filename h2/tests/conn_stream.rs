@@ -1389,3 +1389,177 @@ fn post_goaway_peer_headers_refused_not_fatal() {
         Some((StreamId(3), ErrorCode::RefusedStream))
     );
 }
+
+mod hardening {
+    use sark_h2::frame::Flags;
+
+    use super::*;
+
+    #[test]
+    fn rapid_reset_flood_triggers_overload() {
+        let mut conn = server();
+        prime_server(&mut conn);
+        let block = full_block();
+        let mut id = 1u32;
+        let mut triggered = false;
+        for _ in 0..200 {
+            let mut bytes = headers_frame_bytes(id, false, true, &block);
+            bytes.extend_from_slice(&rst_frame_bytes(id, ErrorCode::Cancel));
+            match conn.ingest(&bytes) {
+                Ok(()) => {
+                    while conn.poll_event().is_some() {}
+                    conn.drain_outbound(conn.outbound().len());
+                }
+                Err(e) => {
+                    assert_eq!(e, ConnError::Overload);
+                    triggered = true;
+                    break;
+                }
+            }
+            id += 2;
+        }
+        assert!(triggered, "rapid HEADERS+RST flood must trigger Overload");
+    }
+
+    #[test]
+    fn ping_flood_without_draining_outbound_is_bounded() {
+        let mut conn = server();
+        prime_server(&mut conn);
+        conn.drain_outbound(conn.outbound().len());
+        let ping = ping_frame_bytes([1, 2, 3, 4, 5, 6, 7, 8]);
+        let mut triggered = false;
+        for _ in 0..400_000 {
+            match conn.ingest(&ping) {
+                Ok(()) => while conn.poll_event().is_some() {},
+                Err(e) => {
+                    assert_eq!(e, ConnError::Overload);
+                    triggered = true;
+                    break;
+                }
+            }
+        }
+        assert!(
+            triggered,
+            "PING flood with a non-draining peer must force-close"
+        );
+        assert!(
+            conn.outbound().len() <= (1 << 20) + 17,
+            "outbound must stay bounded, got {}",
+            conn.outbound().len()
+        );
+    }
+
+    #[test]
+    fn completed_streams_leave_tracking_bounded() {
+        let mut conn = server();
+        prime_server(&mut conn);
+        let block = full_block();
+        let mut id = 1u32;
+        for _ in 0..1000 {
+            conn.ingest(&headers_frame_bytes(id, true, true, &block))
+                .unwrap();
+            while conn.poll_event().is_some() {}
+            conn.send_response(
+                StreamId(id),
+                [Header {
+                    name: b":status",
+                    value: b"200",
+                }],
+                true,
+            )
+            .unwrap();
+            conn.drain_outbound(conn.outbound().len());
+            id += 2;
+        }
+        assert_eq!(conn.active_count(), 0);
+        assert_eq!(
+            conn.tracked_closed_count(),
+            0,
+            "normally-completed streams must not accumulate in tracking state"
+        );
+    }
+
+    #[test]
+    fn oversized_declared_frame_rejected_before_buffering() {
+        let mut conn = server();
+        prime_server(&mut conn);
+        let mut hdr = Vec::new();
+        FrameHeader {
+            length: 16_777_000,
+            kind: frame::Type::Data,
+            flags: Flags(0),
+            stream_id: StreamId(1),
+        }
+        .encode(&mut hdr);
+        let err = conn.ingest(&hdr).unwrap_err();
+        assert_eq!(err, ConnError::FrameSize);
+    }
+
+    #[test]
+    fn oversized_unknown_frame_rejected_before_buffering() {
+        let mut conn = server();
+        prime_server(&mut conn);
+        let big: u32 = 16_777_000;
+        let mut hdr = Vec::new();
+        hdr.push((big >> 16) as u8);
+        hdr.push((big >> 8) as u8);
+        hdr.push(big as u8);
+        hdr.push(0xFF);
+        hdr.push(0x00);
+        hdr.extend_from_slice(&0u32.to_be_bytes());
+        let err = conn.ingest(&hdr).unwrap_err();
+        assert_eq!(err, ConnError::FrameSize);
+    }
+
+    #[test]
+    fn empty_non_final_continuation_rejected() {
+        let mut conn = server();
+        prime_server(&mut conn);
+        let block = full_block();
+        conn.ingest(&headers_frame_bytes(1, false, false, &block))
+            .unwrap();
+        let err = conn.ingest(&continuation_bytes(1, false, &[])).unwrap_err();
+        assert_eq!(err, ConnError::Continuation);
+    }
+
+    #[test]
+    fn continuation_frame_count_cap_rejected() {
+        let mut conn = server();
+        prime_server(&mut conn);
+        conn.ingest(&headers_frame_bytes(1, false, false, &[]))
+            .unwrap();
+        let mut err = None;
+        for _ in 0..200 {
+            match conn.ingest(&continuation_bytes(1, false, &[0x00])) {
+                Ok(()) => {}
+                Err(e) => {
+                    err = Some(e);
+                    break;
+                }
+            }
+        }
+        assert_eq!(err, Some(ConnError::Overload));
+    }
+
+    #[test]
+    fn default_server_enforces_finite_stream_limit() {
+        let mut conn = server();
+        prime_server(&mut conn);
+        assert_eq!(conn.local_settings().max_concurrent_streams, Some(256));
+        let block = full_block();
+        let mut id = 1u32;
+        for _ in 0..256 {
+            conn.ingest(&headers_frame_bytes(id, false, true, &block))
+                .unwrap();
+            while conn.poll_event().is_some() {}
+            id += 2;
+        }
+        assert_eq!(conn.active_count(), 256);
+        conn.drain_outbound(conn.outbound().len());
+        conn.ingest(&headers_frame_bytes(id, false, true, &block))
+            .unwrap();
+        let rst = first_outbound_rst(conn.outbound()).expect("RST emitted for refused stream");
+        assert_eq!(rst.1, ErrorCode::RefusedStream);
+        assert_eq!(conn.active_count(), 256);
+    }
+}

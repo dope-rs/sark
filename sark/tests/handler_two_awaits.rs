@@ -43,6 +43,7 @@ fn handler_two_await_chain() {
         bind,
         max_conn: 16,
         backlog: 16,
+        head_timeout: std::time::Duration::from_secs(10),
     };
 
     run_with_trigger(

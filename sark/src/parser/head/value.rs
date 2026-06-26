@@ -28,11 +28,17 @@ impl<'a, I: HeadInput + ?Sized> InputHeaderValue<'a, I> {
     }
 
     fn local(&self) -> &LocalFrameBytes {
-        self.local.get_or_init(|| {
-            self.input
-                .copy_range_local(self.span())
-                .expect("header value invariant: input range must be readable")
-        })
+        self.local
+            .get_or_init(|| match self.input.copy_range_local(self.span()) {
+                Some(v) => v,
+                None => {
+                    debug_assert!(
+                        false,
+                        "header value invariant: input range must be readable"
+                    );
+                    LocalFrameBytes::from_shared(o3::buffer::Shared::copy_from_slice(b""))
+                }
+            })
     }
 
     fn eq_input(&self, expected: &[u8], ignore_ascii_case: bool) -> bool {

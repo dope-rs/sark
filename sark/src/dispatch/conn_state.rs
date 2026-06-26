@@ -116,6 +116,7 @@ pub struct ConnState {
     pub conn_id: ::dope::runtime::token::Token,
     pub chunked_body: Option<o3::buffer::Shared>,
     pub pipeline: PipelineState,
+    pub head_deadline: Option<crate::timer::Ticket>,
 }
 
 impl Default for ConnState {
@@ -132,6 +133,7 @@ impl Default for ConnState {
             ),
             chunked_body: None,
             pipeline: PipelineState::default(),
+            head_deadline: None,
         }
     }
 }

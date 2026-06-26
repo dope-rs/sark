@@ -34,6 +34,8 @@ pub const CANNED_400: &[u8] =
 pub const CANNED_404: &[u8] =
     b"HTTP/1.1 404 Not Found\r\nServer: sark\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
 #[doc(hidden)]
+pub const CANNED_408: &[u8] = b"HTTP/1.1 408 Request Timeout\r\nServer: sark\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+#[doc(hidden)]
 pub const CANNED_413: &[u8] = b"HTTP/1.1 413 Payload Too Large\r\nServer: sark\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
 #[doc(hidden)]
 pub const CANNED_500: &[u8] = b"HTTP/1.1 500 Internal Server Error\r\nServer: sark\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";

@@ -14,4 +14,7 @@ dope-extra.workspace = true
 dope-gen.workspace = true
 o3.workspace = true
 pin-project.workspace = true
+getrandom = "0.4"
+rand_chacha = "0.9"
+rand_core = "0.9"
 

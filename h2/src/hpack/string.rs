@@ -5,6 +5,8 @@ use super::integer::Integer;
 
 pub(super) struct Codec;
 
+pub(super) const MAX_LITERAL_LEN: usize = 1 << 24;
+
 impl Codec {
     pub(super) fn encode(input: &[u8], huffman: bool, out: &mut Vec<u8>) {
         if huffman {
@@ -23,17 +25,21 @@ impl Codec {
         }
         let huffman = (buf[0] & 0x80) != 0;
         let (len, n) = Integer::decode(buf, 7)?;
+        if len > MAX_LITERAL_LEN as u64 {
+            return Err(DecoderError::BadString);
+        }
         let len = len as usize;
-        if buf.len() < n + len {
+        if n > buf.len() || len > buf.len() - n {
             return Err(DecoderError::NeedMore);
         }
-        let payload = &buf[n..n + len];
+        let end = n.checked_add(len).ok_or(DecoderError::BadString)?;
+        let payload = &buf[n..end];
         scratch.clear();
         if huffman {
             HpackHuffman::decode(payload, scratch).map_err(|_| DecoderError::BadString)?;
         } else {
             scratch.extend_from_slice(payload);
         }
-        Ok(n + len)
+        Ok(end)
     }
 }

@@ -42,6 +42,15 @@ enum Header {
     ObsFold,
     NullInName,
     NullInValue,
+    TeChunkedNotLast,
+    TeGzipChunked,
+    TeUnknownCoding,
+    TeDoubleChunked,
+    BareLfInValue,
+    BareCrInValue,
+    ControlInValue,
+    DelInValue,
+    OverLongValue,
     Raw(Vec<u8>, Vec<u8>),
 }
 
@@ -106,6 +115,19 @@ fn header_line(h: &Header) -> Vec<u8> {
         Header::ObsFold => b"X-Fold: a\r\n b".to_vec(),
         Header::NullInName => b"X-N\x00ull: v".to_vec(),
         Header::NullInValue => b"X-Val: v\x00x".to_vec(),
+        Header::TeChunkedNotLast => b"Transfer-Encoding: chunked, gzip".to_vec(),
+        Header::TeGzipChunked => b"Transfer-Encoding: gzip, chunked".to_vec(),
+        Header::TeUnknownCoding => b"Transfer-Encoding: gzip".to_vec(),
+        Header::TeDoubleChunked => b"Transfer-Encoding: chunked, chunked".to_vec(),
+        Header::BareLfInValue => b"X-Smuggle: foo\nbar".to_vec(),
+        Header::BareCrInValue => b"X-Smuggle: foo\rbar".to_vec(),
+        Header::ControlInValue => b"X-Smuggle: foo\x07bar".to_vec(),
+        Header::DelInValue => b"X-Smuggle: foo\x7fbar".to_vec(),
+        Header::OverLongValue => {
+            let mut out = b"X-Long: ".to_vec();
+            out.resize(out.len() + 9000, b'a');
+            out
+        }
         Header::Raw(n, v) => {
             let mut out = n.clone();
             out.push(b':');
@@ -177,7 +199,110 @@ fn httparse_request_line(buf: &[u8]) -> Option<(Vec<u8>, Vec<u8>, u8)> {
     }
 }
 
+fn drive_request_header_scan(buf: &[u8], headers_start: usize) {
+    use sark_core::http::codec::HeaderScan;
+    use sark_core::http::head::{Flags, apply_well_known_header_contig};
+
+    let mut scan = HeaderScan::default();
+    let mut flags = Flags::default();
+    let mut header_count = 0usize;
+    let mut pos = headers_start;
+    loop {
+        if pos + 2 > buf.len() {
+            return;
+        }
+        let rest = &buf[pos..];
+        match apply_well_known_header_contig(rest, &mut scan, &mut flags, &mut (), &mut header_count, 128) {
+            Ok(Some(0)) => break,
+            Ok(Some(rel)) => pos += rel + 2,
+            Ok(None) => return,
+            Err(_) => return,
+        }
+    }
+    let _ = scan.validate_for_request();
+}
+
+fn drive_httparse_header_scan(buf: &[u8]) {
+    let mut headers = [httparse::EMPTY_HEADER; 64];
+    let mut req = httparse::Request::new(&mut headers);
+    if let Ok(httparse::Status::Complete(_)) = req.parse(buf) {
+        let _ = sark_core::http::codec::Parse::header_scan(req.headers);
+    }
+}
+
+fn drive_slice_probes(buf: &[u8]) {
+    use sark::service::{HeaderValue, PathProbe, SlicePath, SliceValue};
+
+    let bounds = [
+        0usize,
+        1,
+        buf.len() / 2,
+        buf.len(),
+        buf.len() + 1,
+        buf.len().wrapping_add(1024),
+        usize::MAX,
+    ];
+    for &s in &bounds {
+        for &e in &bounds {
+            let v = SliceValue::new(buf, s..e);
+            let _ = v.len();
+            let _ = v.is_empty();
+            let _ = v.eq_bytes(b"chunked");
+            let _ = v.eq_ignore_ascii_case(b"keep-alive");
+            let _ = v.as_range();
+            let _ = v.copy_local();
+            let _ = v.parse_usize();
+            let _ = v.parse_u64();
+
+            let p = SlicePath::new(buf);
+            let _ = p.eq_range(s, e, b"x");
+            let _ = p.eq_range_ignore_ascii_case(s, e, b"x");
+            let _ = p.parse_range_usize(s, e);
+            let _ = p.parse_range_u64(s, e);
+            let _ = p.copy_range_local(s, e);
+            let cur = s.min(buf.len());
+            let _ = p.next_seg(cur);
+            let _ = p.probe_literal(cur, b"v");
+        }
+    }
+}
+
+fn drive_request_path(buf: &[u8], head: &sark::framer::ParsedHead<'_>) {
+    use sark::request::Ref;
+
+    let base = buf.as_ptr() as usize;
+    let target_off = head.target.as_ptr() as usize - base;
+    let uri_range = target_off..(target_off + head.target.len());
+    let method = http::Method::from_bytes(head.method).unwrap_or(http::Method::GET);
+    let head_bytes = &buf[..head.headers_start.min(buf.len())];
+    let r = Ref::<'_, ()>::from_slice(method, uri_range, head_bytes, b"");
+
+    let _ = r.path_view();
+    let _ = r.query_range();
+    let _ = r.uri_path_end();
+    let _ = r.uri_range();
+    let _ = r.path_param_view("id");
+    let _ = r.path_param_u64("id");
+
+    let ranges = [
+        0usize..0,
+        0..usize::MAX,
+        usize::MAX..0,
+        5..1,
+        0..(head_bytes.len() + 4096),
+    ];
+    for range in ranges {
+        let _ = r.at(&range);
+        let _ = r.local_at(range.clone());
+        let _ = r.path_at(&range);
+        let _ = r.path_local(range);
+    }
+}
+
 fn check(buf: &[u8]) {
+    drive_httparse_header_scan(buf);
+    drive_slice_probes(buf);
+
     let parsed = Http::parse_head(buf);
     let oracle = httparse_request_line(buf);
 
@@ -202,6 +327,9 @@ fn check(buf: &[u8]) {
     }
 
     if let Some(head) = parsed {
+        drive_request_header_scan(buf, head.headers_start);
+        drive_request_path(buf, &head);
+
         let version_ok = head.version == b"HTTP/1.1" || head.version == b"HTTP/1.0";
         assert!(version_ok, "accepted bad version {:?}", head.version);
 

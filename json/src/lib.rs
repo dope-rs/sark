@@ -2,18 +2,19 @@ use http::StatusCode;
 use sark_core::http::Response;
 
 mod body;
+mod depth;
 mod encode;
 mod error;
 mod parse;
 mod scan;
-mod scratch;
 mod traits;
 
 pub use body::InlineToken;
+pub use depth::{DepthGuard, MAX_DEPTH};
 pub use encode::{Encode, Writer};
+pub use o3::pool::Scratch;
 pub use parse::Parse;
 pub use scan::Scan;
-pub use scratch::Scratch;
 pub use traits::{JsonDecode, JsonEncode, JsonPreserve, JsonScan};
 
 pub type Result<T> = sark_core::error::Result<T>;

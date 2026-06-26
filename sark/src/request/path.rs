@@ -259,8 +259,8 @@ pub struct BodyChainIter<'a> {
 
 impl<'a> BodyChainIter<'a> {
     pub(super) fn new(chain: &'a SplitFrameChain, range: Range<usize>) -> Self {
-        assert!(range.start <= range.end, "invalid body chunk range");
-        assert!(
+        debug_assert!(range.start <= range.end, "invalid body chunk range");
+        debug_assert!(
             range.end <= chain.len(),
             "body chunk range exceeds split-chain length"
         );

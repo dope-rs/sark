@@ -48,6 +48,46 @@ struct ItemsResponse {
     count: u64,
 }
 
+#[sark_gen::json]
+struct Node {
+    #[field(seq, nested)]
+    children: Vec<Node>,
+}
+
+fn nested_node_json(depth: usize) -> String {
+    let mut s = String::with_capacity(depth * 14 + 2);
+    for _ in 0..depth {
+        s.push_str("{\"children\":[");
+    }
+    for _ in 0..depth {
+        s.push_str("]}");
+    }
+    s
+}
+
+#[test]
+fn recursive_typed_shallow_decodes() {
+    let json = nested_node_json(16);
+    let decoded = Node::decode_json_borrowed(json.as_bytes()).expect("shallow recursive decodes");
+    let mut node = &decoded;
+    let mut levels = 1;
+    while let Some(child) = node.children.first() {
+        node = child;
+        levels += 1;
+    }
+    assert_eq!(levels, 16);
+}
+
+#[test]
+fn recursive_typed_deep_errors_without_overflow() {
+    let json = nested_node_json(5_000);
+    let result = Node::decode_json_borrowed(json.as_bytes());
+    assert!(
+        result.is_err(),
+        "deeply nested typed JSON must yield a decode error, not a stack overflow"
+    );
+}
+
 fn lfb(value: &'static [u8]) -> LocalFrameBytes {
     LocalFrameBytes::from_shared(Shared::from_static(value))
 }

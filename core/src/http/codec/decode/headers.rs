@@ -92,11 +92,16 @@ impl crate::http::codec::Parse {
 
         for h in headers.iter().filter(|h| !h.name.is_empty()) {
             if h.name.eq_ignore_ascii_case("content-length") {
+                let len = Header::content_length(h.value)?;
                 if saw_content_length {
+                    if content_length != Some(len) {
+                        return Err(Error::BadRequest(
+                            "Multiple Content-Length headers are not allowed".into(),
+                        ));
+                    }
                     duplicate_content_length = true;
                 }
                 saw_content_length = true;
-                let len = Header::content_length(h.value)?;
                 content_length = Some(len);
                 continue;
             }

@@ -23,6 +23,7 @@ pub struct ServerCfg {
     pub bind: SocketAddr,
     pub max_conn: usize,
     pub backlog: i32,
+    pub head_timeout: std::time::Duration,
 }
 
 #[derive(Clone)]
@@ -96,7 +97,7 @@ impl Build {
         let timer_handle = app.as_mut().timer_handle();
         let stamp = {
             let handler = app.as_mut().project().inner.handler_mut_pin();
-            handler.bind_timer(timer_handle);
+            handler.bind_timer(timer_handle, cfg.head_timeout);
             NonNull::from(handler.date_stamp())
         };
         app.as_mut().project().date.get_mut().bind(stamp);
@@ -141,7 +142,7 @@ impl Build {
         let timer_handle = app.as_mut().timer_handle();
         let stamp = {
             let handler = app.as_mut().project().inner.handler_mut_pin();
-            handler.bind_timer(timer_handle);
+            handler.bind_timer(timer_handle, cfg.server.head_timeout);
             NonNull::from(handler.date_stamp())
         };
         app.as_mut().project().date.get_mut().bind(stamp);

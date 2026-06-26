@@ -1154,6 +1154,9 @@ impl<'a> ServeEmit<'a> {
                     aux: &mut ::dope::manifold::listener::Aux,
                     driver: &mut ::dope::Driver,
                 ) {
+                    if ::sark::dispatch::pipeline::Pipeline::poll_head_deadline(self, slot, aux, driver) {
+                        return;
+                    }
                     let route_id = match (
                         &slot.state.conn.async_state.pending_wake,
                         &slot.state.conn.async_state.stream_slot,
@@ -1176,6 +1179,11 @@ impl<'a> ServeEmit<'a> {
                     >,
                     _aux: &mut ::dope::manifold::listener::Aux,
                 ) {
+                    if let ::std::option::Option::Some(__ticket) =
+                        slot.state.conn.head_deadline.take()
+                    {
+                        ::sark::timer::TimerHost::timer(self).cancel(__ticket);
+                    }
                     let state = &mut slot.state.conn;
                     let route_id = match (
                         &state.async_state.pending_wake,

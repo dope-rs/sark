@@ -147,7 +147,7 @@ fn run_thread(
     };
     {
         let handler = http.handler_mut();
-        handler.bind_timer(timer_handle);
+        handler.bind_timer(timer_handle, cfg.head_timeout);
         let stamp = std::ptr::NonNull::from(handler.date_stamp());
         app.as_mut().project().date.get_mut().bind(stamp);
     }
@@ -169,6 +169,7 @@ fn main() -> io::Result<()> {
         bind,
         max_conn: 1024,
         backlog: 1024,
+        head_timeout: std::time::Duration::from_secs(10),
     };
 
     eprintln!("sark http_with_redis: listening on http://{bind}, upstream redis {redis_addr}");

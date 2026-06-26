@@ -15,7 +15,7 @@ default = []
 sark-core.workspace = true
 dope.workspace = true
 o3.workspace = true
-cartel-core = "0.2"
+cartel-core = "0.3"
 http = "1.4.0"
 flate2 = "1"
 

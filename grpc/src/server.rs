@@ -25,12 +25,16 @@ use crate::status::{Code, Status};
 #[derive(Clone, Debug)]
 pub struct Config {
     pub max_message_len: usize,
+    pub max_buffered_len: usize,
+    pub max_buffered_msgs: usize,
 }
 
 impl Default for Config {
     fn default() -> Self {
         Self {
             max_message_len: 4 * 1024 * 1024,
+            max_buffered_len: 16 * 1024 * 1024,
+            max_buffered_msgs: 8192,
         }
     }
 }
@@ -242,23 +246,55 @@ impl Default for Response {
     }
 }
 
+#[derive(Clone, Debug, Default)]
+pub struct StreamRoutes {
+    map: BTreeMap<StreamId, usize>,
+}
+
+impl StreamRoutes {
+    fn bind(&mut self, stream_id: StreamId, route: usize) {
+        self.map.insert(stream_id, route);
+    }
+
+    fn route(&self, stream_id: StreamId) -> Option<usize> {
+        self.map.get(&stream_id).copied()
+    }
+
+    fn release(&mut self, stream_id: StreamId) -> Option<usize> {
+        self.map.remove(&stream_id)
+    }
+}
+
 pub trait Handler: 'static {
     fn on_start(
         &mut self,
+        routes: &mut StreamRoutes,
         stream_id: StreamId,
         head: &RequestHead,
         reply: &mut StreamReply,
     ) -> StreamMode {
-        let _ = (stream_id, head, reply);
+        let _ = (routes, stream_id, head, reply);
         StreamMode::Buffered
     }
 
-    fn on_message(&mut self, stream_id: StreamId, message: MessageFrame, reply: &mut StreamReply) {
-        let _ = (stream_id, message, reply);
+    fn on_message(
+        &mut self,
+        routes: &mut StreamRoutes,
+        stream_id: StreamId,
+        message: MessageFrame,
+        reply: &mut StreamReply,
+    ) {
+        let _ = (routes, stream_id, message, reply);
     }
 
-    fn on_trailers(&mut self, stream_id: StreamId, trailers: Metadata, reply: &mut StreamReply) {
-        let _ = (stream_id, trailers, reply);
+    fn on_trailers(
+        &mut self,
+        routes: &mut StreamRoutes,
+        stream_id: StreamId,
+        trailers: Metadata,
+        reply: &mut StreamReply,
+    ) {
+        let _ = (routes, stream_id, trailers, reply);
     }
 
     fn on_request(&mut self, request: Request, response: &mut Response);
@@ -329,7 +365,6 @@ impl Default for StreamReply {
 
 pub struct Routes<H: Handler> {
     routes: Vec<Route<H>>,
-    active: BTreeMap<StreamId, usize>,
 }
 
 struct Route<H: Handler> {
@@ -339,10 +374,7 @@ struct Route<H: Handler> {
 
 impl<H: Handler> Routes<H> {
     pub fn new() -> Self {
-        Self {
-            routes: Vec::new(),
-            active: BTreeMap::new(),
-        }
+        Self { routes: Vec::new() }
     }
 
     pub fn route(mut self, path: &[u8], handler: H) -> Self {
@@ -367,6 +399,7 @@ impl<H: Handler> Default for Routes<H> {
 impl<H: Handler> Handler for Routes<H> {
     fn on_start(
         &mut self,
+        routes: &mut StreamRoutes,
         stream_id: StreamId,
         head: &RequestHead,
         reply: &mut StreamReply,
@@ -376,29 +409,41 @@ impl<H: Handler> Handler for Routes<H> {
         };
         let mode = self.routes[route_idx]
             .handler
-            .on_start(stream_id, head, reply);
+            .on_start(routes, stream_id, head, reply);
         if mode == StreamMode::Live {
-            self.active.insert(stream_id, route_idx);
+            routes.bind(stream_id, route_idx);
         }
         mode
     }
 
-    fn on_message(&mut self, stream_id: StreamId, message: MessageFrame, reply: &mut StreamReply) {
-        let Some(&route_idx) = self.active.get(&stream_id) else {
+    fn on_message(
+        &mut self,
+        routes: &mut StreamRoutes,
+        stream_id: StreamId,
+        message: MessageFrame,
+        reply: &mut StreamReply,
+    ) {
+        let Some(route_idx) = routes.route(stream_id) else {
             return;
         };
         self.routes[route_idx]
             .handler
-            .on_message(stream_id, message, reply);
+            .on_message(routes, stream_id, message, reply);
     }
 
-    fn on_trailers(&mut self, stream_id: StreamId, trailers: Metadata, reply: &mut StreamReply) {
-        let Some(route_idx) = self.active.remove(&stream_id) else {
+    fn on_trailers(
+        &mut self,
+        routes: &mut StreamRoutes,
+        stream_id: StreamId,
+        trailers: Metadata,
+        reply: &mut StreamReply,
+    ) {
+        let Some(route_idx) = routes.release(stream_id) else {
             return;
         };
         self.routes[route_idx]
             .handler
-            .on_trailers(stream_id, trailers, reply);
+            .on_trailers(routes, stream_id, trailers, reply);
     }
 
     fn on_request(&mut self, request: Request, response: &mut Response) {
@@ -691,15 +736,24 @@ impl<H: StreamingHandler> Handler for Streaming<H> {
 impl<H: LiveStreamingHandler> Handler for LiveStreaming<H> {
     fn on_start(
         &mut self,
+        routes: &mut StreamRoutes,
         stream_id: StreamId,
         head: &RequestHead,
         reply: &mut StreamReply,
     ) -> StreamMode {
+        let _ = routes;
         reply.apply_live(self.handler.on_start(stream_id, head), &mut self.codec);
         StreamMode::Live
     }
 
-    fn on_message(&mut self, stream_id: StreamId, message: MessageFrame, reply: &mut StreamReply) {
+    fn on_message(
+        &mut self,
+        routes: &mut StreamRoutes,
+        stream_id: StreamId,
+        message: MessageFrame,
+        reply: &mut StreamReply,
+    ) {
+        let _ = routes;
         let decoded = match self.codec.decode(&message.payload) {
             Ok(decoded) => decoded,
             Err(status) => {
@@ -716,7 +770,14 @@ impl<H: LiveStreamingHandler> Handler for LiveStreaming<H> {
         );
     }
 
-    fn on_trailers(&mut self, stream_id: StreamId, trailers: Metadata, reply: &mut StreamReply) {
+    fn on_trailers(
+        &mut self,
+        routes: &mut StreamRoutes,
+        stream_id: StreamId,
+        trailers: Metadata,
+        reply: &mut StreamReply,
+    ) {
+        let _ = routes;
         reply.apply_live(
             self.handler.on_trailers(LiveTrailers {
                 stream_id,
@@ -735,6 +796,7 @@ pub struct ConnState {
     h2: Conn<ServerRole>,
     streams: BTreeMap<StreamId, StreamState>,
     pending: BTreeMap<StreamId, PendingResponse>,
+    live_routes: StreamRoutes,
     probed: bool,
 }
 
@@ -744,6 +806,7 @@ impl Default for ConnState {
             h2: Conn::<ServerRole>::new(),
             streams: BTreeMap::new(),
             pending: BTreeMap::new(),
+            live_routes: StreamRoutes::default(),
             probed: false,
         }
     }
@@ -756,6 +819,7 @@ struct StreamState {
     messages: Vec<MessageFrame>,
     trailers: Metadata,
     mode: StreamMode,
+    buffered_len: usize,
 }
 
 #[derive(Clone, Debug)]
@@ -838,6 +902,7 @@ impl<H: Handler, W: Wire> App<H, W> {
             }
             conn::Event::StreamReset { stream_id, .. } => {
                 state.streams.remove(&stream_id);
+                state.live_routes.release(stream_id);
             }
             _ => {}
         }
@@ -853,7 +918,9 @@ impl<H: Handler, W: Wire> App<H, W> {
         match RequestHead::parse_h2(&fields) {
             Ok(head) => {
                 let mut reply = StreamReply::new();
-                let mode = self.handler.on_start(stream_id, &head, &mut reply);
+                let mode =
+                    self.handler
+                        .on_start(&mut state.live_routes, stream_id, &head, &mut reply);
                 state.streams.insert(
                     stream_id,
                     StreamState {
@@ -862,6 +929,7 @@ impl<H: Handler, W: Wire> App<H, W> {
                         messages: Vec::new(),
                         trailers: Metadata::new(),
                         mode,
+                        buffered_len: 0,
                     },
                 );
                 state.enqueue_reply(stream_id, reply);
@@ -894,7 +962,7 @@ impl<H: Handler, W: Wire> App<H, W> {
     }
 
     fn on_data(&mut self, state: &mut ConnState, stream_id: StreamId, data: &[u8]) {
-        let (mode, messages) = {
+        let (mode, messages, over_limit) = {
             let Some(stream) = state.streams.get_mut(&stream_id) else {
                 state.send_error(
                     stream_id,
@@ -902,13 +970,37 @@ impl<H: Handler, W: Wire> App<H, W> {
                 );
                 return;
             };
+            let before = stream.messages.len();
             if let Err(err) = stream.deframer.push(data, &mut stream.messages) {
                 state.streams.remove(&stream_id);
                 state.send_error(stream_id, Status::from_frame_err(err));
                 return;
             }
-            (stream.mode, core::mem::take(&mut stream.messages))
+            let over_limit = if stream.mode == StreamMode::Live {
+                false
+            } else {
+                let added: usize = stream.messages[before..]
+                    .iter()
+                    .map(|message| message.payload.len())
+                    .sum();
+                stream.buffered_len = stream.buffered_len.saturating_add(added);
+                stream.buffered_len > self.config.max_buffered_len
+                    || stream.messages.len() > self.config.max_buffered_msgs
+            };
+            (
+                stream.mode,
+                core::mem::take(&mut stream.messages),
+                over_limit,
+            )
         };
+        if over_limit {
+            state.streams.remove(&stream_id);
+            state.send_error(
+                stream_id,
+                Status::new(Code::ResourceExhausted, "stream buffer limit exceeded"),
+            );
+            return;
+        }
         if mode != StreamMode::Live {
             if let Some(stream) = state.streams.get_mut(&stream_id) {
                 stream.messages = messages;
@@ -925,7 +1017,8 @@ impl<H: Handler, W: Wire> App<H, W> {
                 return;
             }
             let mut reply = StreamReply::new();
-            self.handler.on_message(stream_id, message, &mut reply);
+            self.handler
+                .on_message(&mut state.live_routes, stream_id, message, &mut reply);
             state.enqueue_reply(stream_id, reply);
         }
         state.drive_pending();
@@ -937,8 +1030,12 @@ impl<H: Handler, W: Wire> App<H, W> {
         };
         if stream.mode == StreamMode::Live {
             let mut reply = StreamReply::new();
-            self.handler
-                .on_trailers(stream_id, stream.trailers, &mut reply);
+            self.handler.on_trailers(
+                &mut state.live_routes,
+                stream_id,
+                stream.trailers,
+                &mut reply,
+            );
             if reply.status.is_none() {
                 reply.status = Some(Status::ok());
             }
@@ -1221,5 +1318,186 @@ impl PendingResponse {
         } else {
             Ok(false)
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::cell::RefCell;
+    use std::rc::Rc;
+
+    use super::*;
+
+    struct Recorder {
+        id: usize,
+        log: Rc<RefCell<Vec<(usize, StreamId)>>>,
+    }
+
+    impl Handler for Recorder {
+        fn on_start(
+            &mut self,
+            _routes: &mut StreamRoutes,
+            _stream_id: StreamId,
+            _head: &RequestHead,
+            _reply: &mut StreamReply,
+        ) -> StreamMode {
+            StreamMode::Live
+        }
+
+        fn on_message(
+            &mut self,
+            _routes: &mut StreamRoutes,
+            stream_id: StreamId,
+            _message: MessageFrame,
+            _reply: &mut StreamReply,
+        ) {
+            self.log.borrow_mut().push((self.id, stream_id));
+        }
+
+        fn on_request(&mut self, _request: Request, _response: &mut Response) {}
+    }
+
+    struct Nop;
+
+    impl Handler for Nop {
+        fn on_request(&mut self, _request: Request, _response: &mut Response) {}
+    }
+
+    fn head(path: &[u8]) -> RequestHead {
+        RequestHead {
+            path: path.to_vec(),
+            authority: None,
+            metadata: Metadata::new(),
+        }
+    }
+
+    fn framed_messages(count: usize, size: usize) -> Vec<u8> {
+        let mut out = Vec::new();
+        let payload = vec![0u8; size];
+        for _ in 0..count {
+            MessageFrame::encode(false, &payload, &mut out).unwrap();
+        }
+        out
+    }
+
+    #[test]
+    fn live_routes_are_per_connection() {
+        let log = Rc::new(RefCell::new(Vec::new()));
+        let mut routes = Routes::new()
+            .route(
+                b"/a",
+                Recorder {
+                    id: 0,
+                    log: log.clone(),
+                },
+            )
+            .route(
+                b"/b",
+                Recorder {
+                    id: 1,
+                    log: log.clone(),
+                },
+            );
+        let mut conn_a = StreamRoutes::default();
+        let mut conn_b = StreamRoutes::default();
+        let mut reply = StreamReply::new();
+
+        assert_eq!(
+            routes.on_start(&mut conn_a, StreamId(1), &head(b"/a"), &mut reply),
+            StreamMode::Live
+        );
+        assert_eq!(
+            routes.on_start(&mut conn_b, StreamId(1), &head(b"/b"), &mut reply),
+            StreamMode::Live
+        );
+
+        let message = MessageFrame {
+            compressed: false,
+            payload: vec![1, 2, 3],
+        };
+        routes.on_message(&mut conn_a, StreamId(1), message.clone(), &mut reply);
+        routes.on_message(&mut conn_b, StreamId(1), message, &mut reply);
+
+        let log = log.borrow();
+        assert!(
+            log.contains(&(0, StreamId(1))),
+            "connection A stream 1 must route to /a"
+        );
+        assert!(
+            log.contains(&(1, StreamId(1))),
+            "connection B stream 1 must route to /b despite the shared stream id"
+        );
+        assert_eq!(log.len(), 2);
+    }
+
+    #[test]
+    fn stream_reset_purges_live_route() {
+        let log = Rc::new(RefCell::new(Vec::new()));
+        let mut routes = Routes::new().route(
+            b"/a",
+            Recorder {
+                id: 0,
+                log: log.clone(),
+            },
+        );
+        let mut conn = StreamRoutes::default();
+        let mut reply = StreamReply::new();
+
+        routes.on_start(&mut conn, StreamId(7), &head(b"/a"), &mut reply);
+        assert!(conn.route(StreamId(7)).is_some());
+
+        conn.release(StreamId(7));
+        assert!(
+            conn.route(StreamId(7)).is_none(),
+            "a reset stream must purge its live route entry"
+        );
+
+        let message = MessageFrame {
+            compressed: false,
+            payload: Vec::new(),
+        };
+        routes.on_message(&mut conn, StreamId(7), message, &mut reply);
+        assert!(
+            log.borrow().is_empty(),
+            "a purged stream must not dispatch further messages"
+        );
+    }
+
+    #[test]
+    fn buffered_stream_over_cap_is_bounded() {
+        let cfg = Config {
+            max_message_len: 1 << 20,
+            max_buffered_len: 1000,
+            max_buffered_msgs: 1 << 20,
+        };
+        let mut app = App::<Nop>::with_config(Nop, cfg.clone());
+        let mut state = ConnState::default();
+        state.streams.insert(
+            StreamId(1),
+            StreamState {
+                head: head(b"/svc"),
+                deframer: Deframer::new(cfg.max_message_len),
+                messages: Vec::new(),
+                trailers: Metadata::new(),
+                mode: StreamMode::Buffered,
+                buffered_len: 0,
+            },
+        );
+
+        app.on_data(&mut state, StreamId(1), &framed_messages(5, 100));
+        assert_eq!(
+            state
+                .streams
+                .get(&StreamId(1))
+                .expect("stream retained under cap")
+                .buffered_len,
+            500
+        );
+
+        app.on_data(&mut state, StreamId(1), &framed_messages(6, 100));
+        assert!(
+            state.streams.get(&StreamId(1)).is_none(),
+            "buffered stream exceeding the cap must be dropped to bound memory"
+        );
     }
 }
