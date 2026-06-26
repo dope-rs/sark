@@ -1001,7 +1001,7 @@ dependencies = [
 
 [[package]]
 name = "sark"
-version = "0.6.3"
+version = "0.6.4"
 dependencies = [
  "cartel-gen",
  "cartel-pg",
@@ -1025,7 +1025,7 @@ dependencies = [
 
 [[package]]
 name = "sark-client"
-version = "0.6.3"
+version = "0.6.4"
 dependencies = [
  "cartel-core",
  "dope",
@@ -1040,7 +1040,7 @@ dependencies = [
 
 [[package]]
 name = "sark-core"
-version = "0.6.3"
+version = "0.6.4"
 dependencies = [
  "criterion",
  "http",
@@ -1056,7 +1056,7 @@ dependencies = [
 
 [[package]]
 name = "sark-gen"
-version = "0.6.3"
+version = "0.6.4"
 dependencies = [
  "dope",
  "o3",
@@ -1067,7 +1067,7 @@ dependencies = [
 
 [[package]]
 name = "sark-grpc"
-version = "0.6.3"
+version = "0.6.4"
 dependencies = [
  "dope",
  "dope-extra",
@@ -1083,14 +1083,14 @@ dependencies = [
 
 [[package]]
 name = "sark-grpc-build"
-version = "0.6.3"
+version = "0.6.4"
 dependencies = [
  "prost-build",
 ]
 
 [[package]]
 name = "sark-h2"
-version = "0.6.3"
+version = "0.6.4"
 dependencies = [
  "dope",
  "dope-extra",
@@ -1105,7 +1105,7 @@ dependencies = [
 
 [[package]]
 name = "sark-h3"
-version = "0.6.3"
+version = "0.6.4"
 dependencies = [
  "dope",
  "dope-quic",
@@ -1119,7 +1119,7 @@ dependencies = [
 
 [[package]]
 name = "sark-json"
-version = "0.6.3"
+version = "0.6.4"
 dependencies = [
  "http",
  "o3",
@@ -1128,7 +1128,7 @@ dependencies = [
 
 [[package]]
 name = "sark-ws"
-version = "0.6.3"
+version = "0.6.4"
 dependencies = [
  "dope",
  "dope-extra",
