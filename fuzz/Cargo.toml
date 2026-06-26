@@ -1,0 +1,28 @@
+[package]
+name = "sark-fuzz"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+arbitrary = { version = "1", features = ["derive"] }
+httparse = "1.10"
+sark = { path = "../sark" }
+sark-core = { path = "../core" }
+sark-gen = { path = "../gen" }
+sark-json = { path = "../json" }
+o3 = "0.1.0"
+
+[[bin]]
+name = "head_differential"
+path = "fuzz_targets/head_differential.rs"
+test = false
+doc = false
+bench = false
+
+[profile.release]
+debug = 1

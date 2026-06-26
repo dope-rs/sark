@@ -1,13 +1,15 @@
 use o3::buffer::Owned;
-use sark_json::Encode;
+use sark_json::{Encode, Writer};
 
 fn check(value: &[u8]) {
     let mut out = Owned::new();
-    Encode::extend_str(value, &mut out);
+    let mut w = Writer::new(&mut out, 0);
+    w.put_str(value);
+    w.finish();
     assert_eq!(
         Encode::str_len(value),
         out.as_ref().len(),
-        "str_len must match extend_str output for {value:?}"
+        "str_len must match put_str output for {value:?}"
     );
 }
 

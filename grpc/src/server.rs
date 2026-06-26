@@ -1159,7 +1159,7 @@ impl ConnState {
             let h2_headers = headers.as_h2();
             if self
                 .h2
-                .send_response(stream_id, &h2_headers, false)
+                .send_response(stream_id, h2_headers.iter().copied(), false)
                 .is_err()
             {
                 let _ = self.h2.reset_stream(stream_id, ErrorCode::InternalError);
@@ -1198,7 +1198,7 @@ impl PendingResponse {
     fn drive(&mut self, conn: &mut Conn<ServerRole>, stream_id: StreamId) -> Result<bool, ()> {
         if !self.headers_sent {
             let h2_headers = self.headers.as_h2();
-            conn.send_response(stream_id, &h2_headers, false)
+            conn.send_response(stream_id, h2_headers.iter().copied(), false)
                 .map_err(|_| ())?;
             self.headers_sent = true;
         }

@@ -688,7 +688,7 @@ fn server_send_response_emits_headers() {
 
     conn.send_response(
         StreamId(1),
-        &[Header {
+        [Header {
             name: b":status",
             value: b"200",
         }],
@@ -712,7 +712,7 @@ fn send_trailers_emits_final_headers() {
     let _ = conn.poll_event().unwrap();
     conn.send_response(
         StreamId(1),
-        &[Header {
+        [Header {
             name: b":status",
             value: b"200",
         }],
@@ -1232,7 +1232,7 @@ fn closed_after_end_stream_data_yields_connection_stream_closed_error() {
     let _ = conn.poll_event().unwrap();
     conn.send_response(
         StreamId(1),
-        &[Header {
+        [Header {
             name: b":status",
             value: b"200",
         }],
@@ -1256,7 +1256,7 @@ fn closed_after_end_stream_headers_yields_connection_stream_closed_error() {
     let _ = conn.poll_event().unwrap();
     conn.send_response(
         StreamId(1),
-        &[Header {
+        [Header {
             name: b":status",
             value: b"200",
         }],

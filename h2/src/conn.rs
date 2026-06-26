@@ -247,6 +247,7 @@ pub struct Conn<R: Role> {
     conn_pending_release: u32,
     per_stream_pending_release: BTreeMap<StreamId, u32>,
     peer_end_streamed: BTreeSet<StreamId>,
+    send_window_opened: bool,
 }
 
 impl<R: Role> Conn<R> {
@@ -292,6 +293,7 @@ impl<R: Role> Conn<R> {
             conn_pending_release: 0,
             per_stream_pending_release: BTreeMap::new(),
             peer_end_streamed: BTreeSet::new(),
+            send_window_opened: false,
         };
         if R::PREFACE_SENDS_FIRST {
             conn.outbound.extend_from_slice(CLIENT_PREFACE);
@@ -338,6 +340,14 @@ impl<R: Role> Conn<R> {
 
     pub fn poll_event(&mut self) -> Option<Event> {
         self.events.pop_front()
+    }
+
+    /// Consume the coalesced "peer opened our send window" signal accumulated
+    /// since the last call. Set whenever a WINDOW_UPDATE or an initial-window
+    /// SETTINGS increase grows a send window; a flood of such frames collapses
+    /// to a single signal instead of one event per frame.
+    pub fn take_window_opened(&mut self) -> bool {
+        std::mem::take(&mut self.send_window_opened)
     }
 
     pub fn has_stream(&self, id: StreamId) -> bool {
@@ -436,7 +446,7 @@ impl<R: Role> Conn<R> {
         if !self.has_stream(stream_id) {
             return Err(ConnError::BadStream);
         }
-        self.emit_headers(stream_id, headers, true)?;
+        self.emit_headers(stream_id, headers.iter().copied(), true)?;
         self.advance_stream(
             stream_id,
             stream::Event::Headers { end_stream: true },
@@ -498,14 +508,17 @@ impl<R: Role> Conn<R> {
         RstStream { stream_id, error }.encode(&mut self.outbound);
     }
 
-    fn emit_headers(
+    fn emit_headers<'a, I>(
         &mut self,
         stream_id: StreamId,
-        headers: &[hpack::Header<'_>],
+        headers: I,
         end_stream: bool,
-    ) -> Result<(), ConnError> {
+    ) -> Result<(), ConnError>
+    where
+        I: IntoIterator<Item = hpack::Header<'a>>,
+    {
         let mut block = Vec::new();
-        self.encoder.encode(headers.iter().copied(), &mut block);
+        self.encoder.encode(headers, &mut block);
         let max_frame = self.peer_settings.max_frame_size as usize;
         if block.len() <= max_frame {
             Headers {
@@ -704,6 +717,9 @@ impl<R: Role> Conn<R> {
                         self.inbound.drain(..total);
                         self.emit_settings_ack();
                         self.events.push_back(Event::SettingsApplied);
+                        if delta > 0 {
+                            self.send_window_opened = true;
+                        }
                         continue;
                     }
                 }
@@ -1004,10 +1020,11 @@ impl<R: Role> Conn<R> {
 
     fn handle_window_update_frame(&mut self, parsed: WindowUpdate) -> Result<(), ConnError> {
         if parsed.stream_id.is_zero() {
-            return self
-                .send_window
+            self.send_window
                 .increase(parsed.increment)
-                .map_err(ConnError::from);
+                .map_err(ConnError::from)?;
+            self.send_window_opened = true;
+            return Ok(());
         }
         match self.classify_stream(parsed.stream_id) {
             StreamClass::Connection => Err(ConnError::Protocol),
@@ -1018,7 +1035,9 @@ impl<R: Role> Conn<R> {
                     .per_stream_send_window
                     .get_mut(&parsed.stream_id)
                     .ok_or(ConnError::Protocol)?;
-                w.increase(parsed.increment).map_err(ConnError::from)
+                w.increase(parsed.increment).map_err(ConnError::from)?;
+                self.send_window_opened = true;
+                Ok(())
             }
         }
     }
@@ -1182,7 +1201,7 @@ impl Conn<crate::role::ClientRole> {
             id,
             flow::Window::with(self.local_settings.initial_window_size as i32),
         );
-        self.emit_headers(id, headers, end_stream)?;
+        self.emit_headers(id, headers.iter().copied(), end_stream)?;
         self.advance_stream(id, stream::Event::Headers { end_stream }, Side::Local)
             .map_err(|_| ConnError::Protocol)?;
         Ok(id)
@@ -1190,12 +1209,15 @@ impl Conn<crate::role::ClientRole> {
 }
 
 impl Conn<crate::role::ServerRole> {
-    pub fn send_response(
+    pub fn send_response<'a, I>(
         &mut self,
         stream_id: StreamId,
-        headers: &[hpack::Header<'_>],
+        headers: I,
         end_stream: bool,
-    ) -> Result<(), ConnError> {
+    ) -> Result<(), ConnError>
+    where
+        I: IntoIterator<Item = hpack::Header<'a>>,
+    {
         if !self.has_stream(stream_id) {
             return Err(ConnError::BadStream);
         }

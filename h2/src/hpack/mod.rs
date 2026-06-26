@@ -21,6 +21,13 @@ pub struct OwnedHeader {
 }
 
 impl OwnedHeader {
+    pub fn new(name: &[u8], value: &[u8]) -> Self {
+        Self {
+            name: name.to_vec(),
+            value: value.to_vec(),
+        }
+    }
+
     pub fn from(h: Header<'_>) -> Self {
         Self {
             name: h.name.to_vec(),
