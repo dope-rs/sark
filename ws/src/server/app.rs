@@ -45,6 +45,8 @@ impl Default for ConnState {
     }
 }
 
+use sark_core::identity_mut;
+
 #[derive(Debug, Clone, Copy)]
 pub enum Message<'a> {
     Text(&'a str),
@@ -184,34 +186,17 @@ impl<H: Handler> Application for App<H> {
         aux: &mut listener::Aux,
         driver: &mut Driver,
     ) -> Outcome {
-        if slot.state.conn.phase == Phase::Closed {
-            return Outcome::Ok;
-        }
-        slot.state.conn.acc.extend_from_slice(chunk.as_slice());
-        if slot.state.conn.acc.len() > WS_MAX_ACC {
-            slot.state.conn.phase = Phase::Closed;
-            slot.state.conn.acc = Vec::new();
-            if !slot.core.is_send_inflight() {
-                self.emit_close(slot, CLOSE_MESSAGE_TOO_BIG, aux, driver);
-            }
-            return Outcome::CloseAfter;
-        }
-        if !slot.core.is_send_inflight() {
-            self.pump(slot, aux, driver);
-        }
-        Outcome::Ok
+        self.on_chunk_proj(slot, identity_mut, chunk, aux, driver)
     }
 
     fn on_send(
         &mut self,
         slot: &mut Slot<Identity, listener::State<ConnState>>,
-        _sent: usize,
+        sent: usize,
         aux: &mut listener::Aux,
         driver: &mut Driver,
     ) {
-        if slot.state.conn.phase != Phase::Closed {
-            self.pump(slot, aux, driver);
-        }
+        self.on_send_proj(slot, sent, identity_mut, aux, driver)
     }
 
     fn on_close(
@@ -223,17 +208,60 @@ impl<H: Handler> Application for App<H> {
 }
 
 impl<H: Handler> App<H> {
-    fn pump(
-        &self,
-        slot: &mut Slot<Identity, listener::State<ConnState>>,
+    pub fn on_chunk_proj<C: Default + 'static>(
+        &mut self,
+        slot: &mut Slot<Identity, listener::State<C>>,
+        project: impl Fn(&mut C) -> &mut ConnState,
+        chunk: RecvChunk<'_>,
         aux: &mut listener::Aux,
         driver: &mut Driver,
+    ) -> Outcome {
+        if project(&mut slot.state.conn).phase == Phase::Closed {
+            return Outcome::Ok;
+        }
+        project(&mut slot.state.conn)
+            .acc
+            .extend_from_slice(chunk.as_slice());
+        if project(&mut slot.state.conn).acc.len() > WS_MAX_ACC {
+            let state = project(&mut slot.state.conn);
+            state.phase = Phase::Closed;
+            state.acc = Vec::new();
+            if !slot.core.is_send_inflight() {
+                self.emit_close_proj(slot, CLOSE_MESSAGE_TOO_BIG, aux, driver, &project);
+            }
+            return Outcome::CloseAfter;
+        }
+        if !slot.core.is_send_inflight() {
+            self.pump_proj(slot, aux, driver, &project);
+        }
+        Outcome::Ok
+    }
+
+    pub fn on_send_proj<C: Default + 'static>(
+        &mut self,
+        slot: &mut Slot<Identity, listener::State<C>>,
+        _sent: usize,
+        project: impl Fn(&mut C) -> &mut ConnState,
+        aux: &mut listener::Aux,
+        driver: &mut Driver,
+    ) {
+        if project(&mut slot.state.conn).phase != Phase::Closed {
+            self.pump_proj(slot, aux, driver, &project);
+        }
+    }
+
+    fn pump_proj<C: Default + 'static, P: Fn(&mut C) -> &mut ConnState>(
+        &self,
+        slot: &mut Slot<Identity, listener::State<C>>,
+        aux: &mut listener::Aux,
+        driver: &mut Driver,
+        project: &P,
     ) {
         let send_ud = slot.token();
         let write_buf = aux.write_buf_for(slot);
         let (written, close_after) = {
             let mut response = Response::new(&mut *write_buf);
-            let state = &mut slot.state.conn;
+            let state = project(&mut slot.state.conn);
             if state.phase == Phase::Handshake {
                 self.try_handshake(state, &mut response);
             }
@@ -250,12 +278,13 @@ impl<H: Handler> App<H> {
         }
     }
 
-    fn emit_close(
+    fn emit_close_proj<C: Default + 'static, P: Fn(&mut C) -> &mut ConnState>(
         &self,
-        slot: &mut Slot<Identity, listener::State<ConnState>>,
+        slot: &mut Slot<Identity, listener::State<C>>,
         code: u16,
         aux: &mut listener::Aux,
         driver: &mut Driver,
+        _project: &P,
     ) {
         let send_ud = slot.token();
         let write_buf = aux.write_buf_for(slot);
@@ -568,6 +597,43 @@ mod tests {
         assert!(close_after);
         assert!(phase == Phase::Closed);
         assert_eq!(server_close_code(&buf[..written]), Some(1002));
+    }
+
+    #[test]
+    fn projection_matches_direct() {
+        enum Wrap {
+            Pad(u32),
+            Ws(ConnState),
+        }
+        fn proj(w: &mut Wrap) -> &mut ConnState {
+            match w {
+                Wrap::Ws(c) => c,
+                Wrap::Pad(_) => unreachable!(),
+            }
+        }
+
+        let app = echo_app(WS_MAX_MESSAGE);
+        let input = client_frame(0x1, b"hello world");
+
+        let mut buf_direct = [0u8; 64];
+        let (written_direct, close_direct, phase_direct) =
+            drive(&app, input.clone(), &mut buf_direct);
+
+        let mut wrap = Wrap::Ws(ConnState::default());
+        proj(&mut wrap).acc = input;
+        let mut buf_proj = [0u8; 64];
+        let (written_proj, close_proj) = {
+            let mut response = Response::new(&mut buf_proj);
+            app.drive_frames(proj(&mut wrap), &mut response);
+            (response.written, response.close_after)
+        };
+        let phase_proj = proj(&mut wrap).phase;
+
+        assert_eq!(written_direct, written_proj);
+        assert_eq!(close_direct, close_proj);
+        assert!(phase_direct == phase_proj);
+        assert_eq!(&buf_direct[..written_direct], &buf_proj[..written_proj]);
+        let _ = matches!(Wrap::Pad(0), Wrap::Pad(_));
     }
 
     #[test]
