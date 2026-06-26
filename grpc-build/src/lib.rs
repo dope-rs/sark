@@ -303,14 +303,14 @@ fn emit_routes_enum(service: &Service, trait_name: &str, routes_enum: &str, buf:
 
     let _ = writeln!(
         buf,
-        "    fn on_start(&mut self, stream_id: ::sark_grpc::StreamId, head: &::sark_grpc::RequestHead, reply: &mut ::sark_grpc::StreamReply) -> ::sark_grpc::StreamMode {{"
+        "    fn on_start(&mut self, routes: &mut ::sark_grpc::server::StreamRoutes, stream_id: ::sark_grpc::StreamId, head: &::sark_grpc::RequestHead, reply: &mut ::sark_grpc::StreamReply) -> ::sark_grpc::StreamMode {{"
     );
     let _ = writeln!(buf, "        match self {{");
     for method in &service.methods {
         let variant = variant_name(service, method);
         let _ = writeln!(
             buf,
-            "            {routes_enum}::{variant}(h) => h.on_start(stream_id, head, reply),"
+            "            {routes_enum}::{variant}(h) => h.on_start(routes, stream_id, head, reply),"
         );
     }
     let _ = writeln!(buf, "        }}");
@@ -318,14 +318,14 @@ fn emit_routes_enum(service: &Service, trait_name: &str, routes_enum: &str, buf:
 
     let _ = writeln!(
         buf,
-        "    fn on_message(&mut self, stream_id: ::sark_grpc::StreamId, message: ::sark_grpc::MessageFrame, reply: &mut ::sark_grpc::StreamReply) {{"
+        "    fn on_message(&mut self, routes: &mut ::sark_grpc::server::StreamRoutes, stream_id: ::sark_grpc::StreamId, message: ::sark_grpc::MessageFrame, reply: &mut ::sark_grpc::StreamReply) {{"
     );
     let _ = writeln!(buf, "        match self {{");
     for method in &service.methods {
         let variant = variant_name(service, method);
         let _ = writeln!(
             buf,
-            "            {routes_enum}::{variant}(h) => h.on_message(stream_id, message, reply),"
+            "            {routes_enum}::{variant}(h) => h.on_message(routes, stream_id, message, reply),"
         );
     }
     let _ = writeln!(buf, "        }}");
@@ -333,14 +333,14 @@ fn emit_routes_enum(service: &Service, trait_name: &str, routes_enum: &str, buf:
 
     let _ = writeln!(
         buf,
-        "    fn on_trailers(&mut self, stream_id: ::sark_grpc::StreamId, trailers: ::sark_grpc::Metadata, reply: &mut ::sark_grpc::StreamReply) {{"
+        "    fn on_trailers(&mut self, routes: &mut ::sark_grpc::server::StreamRoutes, stream_id: ::sark_grpc::StreamId, trailers: ::sark_grpc::Metadata, reply: &mut ::sark_grpc::StreamReply) {{"
     );
     let _ = writeln!(buf, "        match self {{");
     for method in &service.methods {
         let variant = variant_name(service, method);
         let _ = writeln!(
             buf,
-            "            {routes_enum}::{variant}(h) => h.on_trailers(stream_id, trailers, reply),"
+            "            {routes_enum}::{variant}(h) => h.on_trailers(routes, stream_id, trailers, reply),"
         );
     }
     let _ = writeln!(buf, "        }}");
