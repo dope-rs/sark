@@ -36,6 +36,17 @@ impl Pipeline {
         false
     }
 
+    fn drain_consumed(state: &mut ConnState, off: usize) {
+        if let Some(accum) = state.recv.accum.as_mut() {
+            accum.advance(off);
+            if accum.is_empty() {
+                state.recv.accum = None;
+            } else {
+                accum.compact();
+            }
+        }
+    }
+
     fn fast_path(state: &mut ConnState, core: &mut link::Core, bytes: &[u8]) -> Option<bool> {
         if state.recv.is_frozen() {
             Self::absorb(state, core, bytes);
@@ -225,24 +236,21 @@ impl Pipeline {
             pending && matches!(out.final_action, Some(Outcome::Park | Outcome::Send { .. }));
 
         if will_freeze {
-            if !use_accum
-                && Self::absorb(
-                    project(&mut slot.state.conn),
-                    &mut slot.core,
-                    &plaintext[out.off..],
-                )
-            {
+            // The in-flight request now borrows conn.retained_req, not the recv buffer,
+            // so drop its consumed bytes here instead of replaying them after the await.
+            if use_accum {
+                Self::drain_consumed(project(&mut slot.state.conn), out.off);
+                project(&mut slot.state.conn).pipeline.expected_total = None;
+                project(&mut slot.state.conn).recv.reset_limit();
+            } else if Self::absorb(
+                project(&mut slot.state.conn),
+                &mut slot.core,
+                &plaintext[out.off..],
+            ) {
                 return true;
             }
         } else if use_accum {
-            if let Some(accum) = project(&mut slot.state.conn).recv.accum.as_mut() {
-                accum.advance(out.off);
-                if accum.is_empty() {
-                    project(&mut slot.state.conn).recv.accum = None;
-                } else {
-                    accum.compact();
-                }
-            }
+            Self::drain_consumed(project(&mut slot.state.conn), out.off);
             if out.batched > 0 {
                 project(&mut slot.state.conn).pipeline.expected_total = None;
                 project(&mut slot.state.conn).recv.reset_limit();
@@ -377,6 +385,7 @@ impl Pipeline {
             None => bytes,
         };
 
+        project(&mut slot.state.conn).recv_view = peeked.clone();
         let close_after = slot.core.close_after();
         let write_buf = aux.write_buf_for(slot);
         let out = Self::batch(
@@ -387,6 +396,7 @@ impl Pipeline {
             close_after,
         );
         drop(peeked);
+        project(&mut slot.state.conn).recv_view = None;
 
         let head_pending = out.head_pending;
         let overrun = Self::emit(slot, aux, driver, out, use_accum, bytes, &project);
