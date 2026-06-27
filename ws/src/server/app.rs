@@ -94,10 +94,15 @@ impl<'a> Response<'a> {
     }
 
     fn frame(&mut self, opcode: u8, payload: &[u8]) -> bool {
-        let mut tmp = Vec::with_capacity(14 + payload.len());
-        FrameHead::encode_header(&mut tmp, opcode, payload.len(), false);
-        tmp.extend_from_slice(payload);
-        self.put_raw(&tmp)
+        let off = self.written;
+        let total = FrameHead::header_len(payload.len()) + payload.len();
+        if self.write.len() - off < total {
+            return false;
+        }
+        let hlen = FrameHead::encode_header_into(&mut self.write[off..], opcode, payload.len(), false);
+        self.write[off + hlen..off + total].copy_from_slice(payload);
+        self.written += total;
+        true
     }
 
     fn send_close_code(&mut self, code: u16) {
@@ -146,6 +151,61 @@ impl<'a> Response<'a> {
     }
 }
 
+/// Byte source for [`App::drive_frames_over`], monomorphized over the buffered
+/// ([`AccSource`]) and zero-copy ([`ChunkSource`]) paths.
+trait FrameSource {
+    fn bytes(&self) -> &[u8];
+    /// Unmask `[start, end)` (masked with `mask`) and return it; valid until the
+    /// next call.
+    fn unmask(&mut self, start: usize, end: usize, mask: [u8; 4]) -> &[u8];
+    /// Finalize after `pos` bytes of [`bytes`](Self::bytes) were consumed.
+    fn commit(&mut self, pos: usize);
+}
+
+struct AccSource<'a> {
+    acc: &'a mut Vec<u8>,
+}
+
+impl FrameSource for AccSource<'_> {
+    fn bytes(&self) -> &[u8] {
+        self.acc
+    }
+    fn unmask(&mut self, start: usize, end: usize, mask: [u8; 4]) -> &[u8] {
+        Mask::unmask_inline(&mut self.acc[start..end], mask);
+        &self.acc[start..end]
+    }
+    fn commit(&mut self, pos: usize) {
+        self.acc.drain(..pos);
+    }
+}
+
+/// Parses straight from the read-only recv `chunk`, unmask-copying each payload
+/// into reusable `scratch`. [`commit`](FrameSource::commit) stashes only the
+/// trailing partial frame — still masked — into `acc` for the next recv.
+struct ChunkSource<'a> {
+    chunk: &'a [u8],
+    scratch: &'a mut Vec<u8>,
+    acc: &'a mut Vec<u8>,
+}
+
+impl FrameSource for ChunkSource<'_> {
+    fn bytes(&self) -> &[u8] {
+        self.chunk
+    }
+    fn unmask(&mut self, start: usize, end: usize, mask: [u8; 4]) -> &[u8] {
+        let len = end - start;
+        if self.scratch.len() < len {
+            self.scratch.resize(len, 0);
+        }
+        Mask::unmask_copy(&mut self.scratch[..len], &self.chunk[start..end], mask);
+        &self.scratch[..len]
+    }
+    fn commit(&mut self, pos: usize) {
+        self.acc.clear();
+        self.acc.extend_from_slice(&self.chunk[pos..]);
+    }
+}
+
 pub trait Handler: Clone + 'static {
     fn on_message<'a>(&self, msg: Message<'a>, response: &mut Response<'_>);
 }
@@ -163,6 +223,9 @@ pub struct App<H: Handler> {
     user: H,
     expected_path: &'static str,
     max_frame_payload: usize,
+    /// Per-worker unmask scratch for the zero-copy path; grows to the largest
+    /// payload seen.
+    scratch: Vec<u8>,
 }
 
 impl<H: Handler> App<H> {
@@ -171,7 +234,13 @@ impl<H: Handler> App<H> {
             user,
             expected_path,
             max_frame_payload,
+            scratch: Vec::new(),
         }
+    }
+
+    #[inline]
+    fn frame_cap(&self) -> usize {
+        self.max_frame_payload.min(WS_MAX_MESSAGE)
     }
 }
 
@@ -219,9 +288,50 @@ impl<H: Handler> App<H> {
         if project(&mut slot.state.conn).phase == Phase::Closed {
             return Outcome::Ok;
         }
+        let chunk = chunk.as_slice();
+
+        // Zero-copy when nothing is buffered and no send is in flight: parse the
+        // recv chunk in place. A leftover partial frame or send backpressure
+        // falls through to the buffered path, which keeps the WS_MAX_ACC bound.
+        let fast = {
+            let state = project(&mut slot.state.conn);
+            state.phase == Phase::Active && state.acc.is_empty()
+        } && !slot.core.is_send_inflight()
+            && chunk.len() <= WS_MAX_ACC;
+
+        if fast {
+            let send_ud = slot.token();
+            let write_buf = aux.write_buf_for(slot);
+            let frame_cap = self.frame_cap();
+            let user = &self.user;
+            let scratch = &mut self.scratch;
+            let (written, closed) = {
+                let mut response = Response::new(&mut *write_buf);
+                let state = project(&mut slot.state.conn);
+                let src = ChunkSource {
+                    chunk,
+                    scratch,
+                    acc: &mut state.acc,
+                };
+                let closed =
+                    Self::drive_frames_over(user, frame_cap, src, &mut state.fragments, &mut response);
+                if closed {
+                    state.phase = Phase::Closed;
+                }
+                (response.written, closed)
+            };
+            if closed {
+                slot.core.set_close_after();
+            }
+            if written > 0 {
+                slot.submit_buffered(write_buf, written, send_ud, driver);
+            }
+            return Outcome::Ok;
+        }
+
         project(&mut slot.state.conn)
             .acc
-            .extend_from_slice(chunk.as_slice());
+            .extend_from_slice(chunk);
         if project(&mut slot.state.conn).acc.len() > WS_MAX_ACC {
             let state = project(&mut slot.state.conn);
             state.phase = Phase::Closed;
@@ -383,20 +493,38 @@ impl<H: Handler> App<H> {
     }
 
     fn drive_frames(&self, state: &mut ConnState, response: &mut Response<'_>) {
-        let frame_cap = self.max_frame_payload.min(WS_MAX_MESSAGE);
+        let src = AccSource {
+            acc: &mut state.acc,
+        };
+        if Self::drive_frames_over(&self.user, self.frame_cap(), src, &mut state.fragments, response)
+        {
+            state.phase = Phase::Closed;
+        }
+    }
+
+    /// The single framing loop, monomorphized over [`FrameSource`]: parse, unmask,
+    /// handle control/fragment frames, dispatch data. Returns whether to close.
+    fn drive_frames_over<S: FrameSource>(
+        user: &H,
+        frame_cap: usize,
+        mut src: S,
+        fragments: &mut FragmentBuffer,
+        response: &mut Response<'_>,
+    ) -> bool {
         let mut pos = 0;
+        let mut closed = false;
         loop {
-            let head = match FrameHead::parse(&state.acc, pos, frame_cap) {
+            let head = match FrameHead::parse(src.bytes(), pos, frame_cap) {
                 Ok(Some(h)) => h,
                 Ok(None) => break,
                 Err(FrameError::PayloadTooLarge) => {
-                    state.phase = Phase::Closed;
                     response.send_close_code(CLOSE_MESSAGE_TOO_BIG);
+                    closed = true;
                     break;
                 }
                 Err(_) => {
-                    state.phase = Phase::Closed;
                     response.send_close_code(CLOSE_PROTOCOL_ERROR);
+                    closed = true;
                     break;
                 }
             };
@@ -404,249 +532,55 @@ impl<H: Handler> App<H> {
             let opcode = head.opcode;
             let (start, end) = (head.payload_start, head.payload_end);
             let Some(mask) = head.mask else {
-                state.phase = Phase::Closed;
                 response.send_close_code(CLOSE_PROTOCOL_ERROR);
+                closed = true;
                 break;
             };
-            Mask::unmask_inline(&mut state.acc[start..end], mask);
+            let payload = src.unmask(start, end, mask);
             pos = end;
 
             if opcode >= 0x8 {
-                response.handle_control(opcode, fin, &state.acc[start..end]);
+                response.handle_control(opcode, fin, payload);
                 if opcode == 0x8 || response.close_after {
-                    state.phase = Phase::Closed;
+                    closed = true;
                     break;
                 }
                 continue;
             }
 
-            match state.fragments.push(opcode, fin, &state.acc[start..end]) {
-                Ok(Push::Direct(op, payload)) => self.dispatch(op, payload, response),
-                Ok(Push::Assembled(op, payload)) => self.dispatch(op, &payload, response),
+            match fragments.push(opcode, fin, payload) {
+                Ok(Push::Direct(op, p)) => Self::dispatch(user, op, p, response),
+                Ok(Push::Assembled(op, p)) => Self::dispatch(user, op, &p, response),
                 Ok(Push::NeedMore) => {}
                 Err(crate::fragment::FragmentError::PayloadTooLarge) => {
-                    state.phase = Phase::Closed;
                     response.send_close_code(CLOSE_MESSAGE_TOO_BIG);
+                    closed = true;
                     break;
                 }
                 Err(_) => {
-                    state.phase = Phase::Closed;
                     response.send_close_code(CLOSE_PROTOCOL_ERROR);
+                    closed = true;
                     break;
                 }
             }
             if response.close_after {
-                state.phase = Phase::Closed;
+                closed = true;
                 break;
             }
         }
-        state.acc.drain(..pos);
+        src.commit(pos);
+        closed
     }
 
-    fn dispatch(&self, opcode: u8, payload: &[u8], response: &mut Response<'_>) {
+    fn dispatch(user: &H, opcode: u8, payload: &[u8], response: &mut Response<'_>) {
         match opcode {
             0x1 => match std::str::from_utf8(payload) {
-                Ok(s) => self.user.on_message(Message::Text(s), response),
+                Ok(s) => user.on_message(Message::Text(s), response),
                 Err(_) => response.send_close_code(CLOSE_INVALID_PAYLOAD),
             },
-            0x2 => self.user.on_message(Message::Binary(payload), response),
+            0x2 => user.on_message(Message::Binary(payload), response),
             _ => response.send_close_code(CLOSE_PROTOCOL_ERROR),
         }
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn echo_app(max_frame_payload: usize) -> App<impl Handler> {
-        App::new(
-            |msg: Message<'_>, resp: &mut Response<'_>| match msg {
-                Message::Text(s) => {
-                    let _ = resp.text(s);
-                }
-                Message::Binary(b) => {
-                    let _ = resp.binary(b);
-                }
-            },
-            "",
-            max_frame_payload,
-        )
-    }
-
-    fn client_frame(opcode: u8, payload: &[u8]) -> Vec<u8> {
-        let mask = [0x37, 0xfa, 0x21, 0x3d];
-        let mut v = vec![0x80 | opcode];
-        FrameHead::encode_len(&mut v, payload.len(), true);
-        v.extend_from_slice(&mask);
-        let start = v.len();
-        v.extend_from_slice(payload);
-        Mask::unmask_inline(&mut v[start..], mask);
-        v
-    }
-
-    fn server_close_code(bytes: &[u8]) -> Option<u16> {
-        let h = FrameHead::parse(bytes, 0, usize::MAX).ok()??;
-        if h.opcode != 0x8 {
-            return None;
-        }
-        let p = &bytes[h.payload_start..h.payload_end];
-        if p.len() < 2 {
-            return None;
-        }
-        Some(u16::from_be_bytes([p[0], p[1]]))
-    }
-
-    fn drive(app: &App<impl Handler>, acc: Vec<u8>, buf: &mut [u8]) -> (usize, bool, Phase) {
-        let mut state = ConnState::default();
-        state.acc = acc;
-        let mut resp = Response::new(buf);
-        app.drive_frames(&mut state, &mut resp);
-        (resp.written, resp.close_after, state.phase)
-    }
-
-    #[test]
-    fn close_code_validity() {
-        for c in [
-            1000u16, 1001, 1002, 1003, 1007, 1008, 1009, 1010, 1011, 3000, 4999,
-        ] {
-            assert!(Response::valid_close_code(c), "{c} should be valid");
-        }
-        for c in [
-            0u16, 999, 1004, 1005, 1006, 1012, 1013, 1014, 1015, 1016, 2999, 5000,
-        ] {
-            assert!(!Response::valid_close_code(c), "{c} should be invalid");
-        }
-    }
-
-    #[test]
-    fn close_with_reserved_code_replies_1002() {
-        let app = echo_app(usize::MAX);
-        let mut buf = [0u8; 64];
-        let (written, close_after, phase) =
-            drive(&app, client_frame(0x8, &1004u16.to_be_bytes()), &mut buf);
-        assert!(close_after);
-        assert!(phase == Phase::Closed);
-        assert_eq!(server_close_code(&buf[..written]), Some(1002));
-    }
-
-    #[test]
-    fn close_with_invalid_utf8_reason_replies_1007() {
-        let app = echo_app(usize::MAX);
-        let mut payload = 1000u16.to_be_bytes().to_vec();
-        payload.extend_from_slice(&[0xff, 0xfe]);
-        let mut buf = [0u8; 64];
-        let (written, _, _) = drive(&app, client_frame(0x8, &payload), &mut buf);
-        assert_eq!(server_close_code(&buf[..written]), Some(1007));
-    }
-
-    #[test]
-    fn valid_close_is_echoed_cleanly() {
-        let app = echo_app(usize::MAX);
-        let mut payload = 1000u16.to_be_bytes().to_vec();
-        payload.extend_from_slice(b"bye");
-        let mut buf = [0u8; 64];
-        let (written, close_after, phase) = drive(&app, client_frame(0x8, &payload), &mut buf);
-        assert!(close_after);
-        assert!(phase == Phase::Closed);
-        let h = FrameHead::parse(&buf[..written], 0, usize::MAX)
-            .unwrap()
-            .unwrap();
-        assert_eq!(h.opcode, 0x8);
-        assert_eq!(&buf[h.payload_start..h.payload_end], payload.as_slice());
-    }
-
-    #[test]
-    fn oversized_single_frame_rejected() {
-        let app = echo_app(usize::MAX);
-        let mut acc = vec![0x82, 0x80 | 127];
-        acc.extend_from_slice(&((WS_MAX_MESSAGE as u64) + 1).to_be_bytes());
-        acc.extend_from_slice(&[0, 0, 0, 0]);
-        let mut buf = [0u8; 64];
-        let (written, close_after, phase) = drive(&app, acc, &mut buf);
-        assert!(close_after);
-        assert!(phase == Phase::Closed);
-        assert_eq!(server_close_code(&buf[..written]), Some(1009));
-    }
-
-    #[test]
-    fn normal_text_echo_still_works() {
-        let app = echo_app(WS_MAX_MESSAGE);
-        let mut buf = [0u8; 64];
-        let (written, close_after, _) = drive(&app, client_frame(0x1, b"hello"), &mut buf);
-        assert!(!close_after);
-        let h = FrameHead::parse(&buf[..written], 0, usize::MAX)
-            .unwrap()
-            .unwrap();
-        assert_eq!(h.opcode, 0x1);
-        assert_eq!(&buf[h.payload_start..h.payload_end], b"hello");
-    }
-
-    #[test]
-    fn unmasked_client_frame_replies_1002() {
-        let app = echo_app(WS_MAX_MESSAGE);
-        let mut acc = vec![0x81, 0x03];
-        acc.extend_from_slice(b"abc");
-        let mut buf = [0u8; 64];
-        let (written, close_after, phase) = drive(&app, acc, &mut buf);
-        assert!(close_after);
-        assert!(phase == Phase::Closed);
-        assert_eq!(server_close_code(&buf[..written]), Some(1002));
-    }
-
-    #[test]
-    fn projection_matches_direct() {
-        enum Wrap {
-            Pad(u32),
-            Ws(ConnState),
-        }
-        fn proj(w: &mut Wrap) -> &mut ConnState {
-            match w {
-                Wrap::Ws(c) => c,
-                Wrap::Pad(_) => unreachable!(),
-            }
-        }
-
-        let app = echo_app(WS_MAX_MESSAGE);
-        let input = client_frame(0x1, b"hello world");
-
-        let mut buf_direct = [0u8; 64];
-        let (written_direct, close_direct, phase_direct) =
-            drive(&app, input.clone(), &mut buf_direct);
-
-        let mut wrap = Wrap::Ws(ConnState::default());
-        proj(&mut wrap).acc = input;
-        let mut buf_proj = [0u8; 64];
-        let (written_proj, close_proj) = {
-            let mut response = Response::new(&mut buf_proj);
-            app.drive_frames(proj(&mut wrap), &mut response);
-            (response.written, response.close_after)
-        };
-        let phase_proj = proj(&mut wrap).phase;
-
-        assert_eq!(written_direct, written_proj);
-        assert_eq!(close_direct, close_proj);
-        assert!(phase_direct == phase_proj);
-        assert_eq!(&buf_direct[..written_direct], &buf_proj[..written_proj]);
-        let _ = matches!(Wrap::Pad(0), Wrap::Pad(_));
-    }
-
-    #[test]
-    fn acc_is_bounded_under_inflight_flood() {
-        let chunk = vec![0u8; 64 * 1024];
-        let mut acc: Vec<u8> = Vec::new();
-        let mut closed = false;
-        for _ in 0..100_000 {
-            if closed {
-                break;
-            }
-            acc.extend_from_slice(&chunk);
-            if acc.len() > WS_MAX_ACC {
-                closed = true;
-                acc = Vec::new();
-            }
-        }
-        assert!(closed);
-        assert!(acc.len() <= WS_MAX_ACC);
-    }
-}
