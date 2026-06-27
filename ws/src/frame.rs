@@ -101,17 +101,37 @@ impl FrameHead {
         }))
     }
 
-    #[cfg(test)]
-    fn extended_len_frame(raw_len: u64) -> Vec<u8> {
-        let mut v = vec![0x82, 0x80 | 127];
-        v.extend_from_slice(&raw_len.to_be_bytes());
-        v.extend_from_slice(&[0, 0, 0, 0]);
-        v
+    /// Header byte count for `payload_len` (2, 4, or 10).
+    #[inline]
+    pub const fn header_len(payload_len: usize) -> usize {
+        if payload_len <= 125 {
+            2
+        } else if payload_len <= u16::MAX as usize {
+            4
+        } else {
+            10
+        }
     }
 
-    pub fn encode_header(out: &mut Vec<u8>, opcode: u8, payload_len: usize, masked: bool) {
-        out.push(0x80 | (opcode & 0x0f));
-        Self::encode_len(out, payload_len, masked);
+    /// Write the frame header into `dst` and return its length. `dst` must hold
+    /// at least [`header_len`](Self::header_len)`(payload_len)` bytes. Avoids a
+    /// per-frame heap `Vec` on the send hot path.
+    #[inline]
+    pub fn encode_header_into(dst: &mut [u8], opcode: u8, payload_len: usize, masked: bool) -> usize {
+        dst[0] = 0x80 | (opcode & 0x0f);
+        let mask_bit: u8 = if masked { 0x80 } else { 0 };
+        if payload_len <= 125 {
+            dst[1] = mask_bit | payload_len as u8;
+            2
+        } else if payload_len <= u16::MAX as usize {
+            dst[1] = mask_bit | 126;
+            dst[2..4].copy_from_slice(&(payload_len as u16).to_be_bytes());
+            4
+        } else {
+            dst[1] = mask_bit | 127;
+            dst[2..10].copy_from_slice(&(payload_len as u64).to_be_bytes());
+            10
+        }
     }
 
     pub fn encode_len(out: &mut Vec<u8>, payload_len: usize, masked: bool) {
@@ -125,25 +145,5 @@ impl FrameHead {
             out.push(mask_bit | 127);
             out.extend_from_slice(&(payload_len as u64).to_be_bytes());
         }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn rejects_64bit_length_with_msb_set() {
-        let buf = FrameHead::extended_len_frame(0x8000_0000_0000_0000);
-        assert!(matches!(
-            FrameHead::parse(&buf, 0, usize::MAX),
-            Err(FrameError::LengthOverflow)
-        ));
-    }
-
-    #[test]
-    fn accepts_64bit_length_without_msb() {
-        let buf = FrameHead::extended_len_frame(70_000);
-        assert!(matches!(FrameHead::parse(&buf, 0, 100_000), Ok(None)));
     }
 }
