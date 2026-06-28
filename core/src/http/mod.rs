@@ -20,6 +20,6 @@ pub use response::{
     HotTextInner, InlineHeaderValue, IntoBody, IntoHeaderName, IntoHeaderValue, IntoServeResponse,
     IntoServeResponseStatic, IterStream, MonoResponseInner, NeverStream, Response, ResponsePlan,
     ResponsePlanInner, Serve, ServeInner, Shape, Stream, TextBody, TextItem, TextItemInner,
-    TextSpec,
+    TextSpec, apply_head_skip,
 };
 pub use varint::VarInt;

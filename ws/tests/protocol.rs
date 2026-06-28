@@ -25,7 +25,8 @@ fn close_codes_validated() {
         ];
         for &(code, expect) in cases {
             let (mut sock, mut buf) = connect(bind);
-            sock.write_all(&masked(0x8, true, &code.to_be_bytes())).unwrap();
+            sock.write_all(&masked(0x8, true, &code.to_be_bytes()))
+                .unwrap();
             let (op, payload) = next_message(&mut sock, &mut buf);
             assert_eq!(op, 0x8, "code {code}");
             assert_eq!(close_code(&payload), Some(expect), "code {code}");

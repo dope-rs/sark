@@ -6,7 +6,7 @@ use syn::{
 };
 
 use crate::model::{
-    DefineRouteEntry, DefineRouteInput, HeaderAttrField, PathAttrField, QueryAttrField,
+    DefineRouteEntry, DefineRouteInput, HeadSkip, HeaderAttrField, PathAttrField, QueryAttrField,
     RequestKind, ResponseKind,
 };
 use crate::util::{AttributeSliceExt, FieldAttr};
@@ -20,6 +20,7 @@ pub(super) type RouteCfg = (
     Option<ResponseKind>,
     Option<RequestKind>,
     Option<syn::Expr>,
+    HeadSkip,
 );
 type StructRouteCfg = (
     Vec<HeaderAttrField>,
@@ -33,6 +34,7 @@ type StructRouteCfg = (
     ResponseKind,
     RequestKind,
     Option<syn::Expr>,
+    HeadSkip,
 );
 
 impl Parse for DefineRouteInput {
@@ -199,6 +201,7 @@ pub(super) fn parse_struct_route_cfg(st: &mut ItemStruct) -> Result<StructRouteC
         response_body_kind,
         request_body_kind,
         max_body,
+        head_skip,
     ) = take_route_cfg_attrs(&mut st.attrs)?;
     let state_ty = state_ty.unwrap_or_else(|| syn::parse_quote!(()));
     let response_body_kind = response_body_kind.unwrap_or_default();
@@ -260,6 +263,7 @@ pub(super) fn parse_struct_route_cfg(st: &mut ItemStruct) -> Result<StructRouteC
         response_body_kind,
         request_body_kind,
         max_body,
+        head_skip,
     ))
 }
 
@@ -272,6 +276,7 @@ pub(super) fn take_route_cfg_attrs(attrs: &mut Vec<Attribute>) -> Result<RouteCf
     let mut response_body_kind: Option<ResponseKind> = None;
     let mut request_body_kind: Option<RequestKind> = None;
     let mut max_body: Option<syn::Expr> = None;
+    let mut head_skip = HeadSkip::default();
     let mut kept = Vec::with_capacity(attrs.len());
     for attr in attrs.drain(..) {
         if attr.path().is_ident("state") {
@@ -319,6 +324,19 @@ pub(super) fn take_route_cfg_attrs(attrs: &mut Vec<Attribute>) -> Result<RouteCf
                 return Err(syn::Error::new_spanned(attr, "duplicate #[max_body(...)]"));
             }
             max_body = Some(attr.parse_args::<syn::Expr>()?);
+        } else if attr.path().is_ident("skip") {
+            attr.parse_nested_meta(|meta| {
+                if meta.path.is_ident("date") {
+                    head_skip.date = true;
+                } else if meta.path.is_ident("server") {
+                    head_skip.server = true;
+                } else {
+                    return Err(
+                        meta.error("unknown #[skip(...)] target; expected `date` | `server`")
+                    );
+                }
+                Ok(())
+            })?;
         } else {
             kept.push(attr);
         }
@@ -333,6 +351,7 @@ pub(super) fn take_route_cfg_attrs(attrs: &mut Vec<Attribute>) -> Result<RouteCf
         response_body_kind,
         request_body_kind,
         max_body,
+        head_skip,
     ))
 }
 

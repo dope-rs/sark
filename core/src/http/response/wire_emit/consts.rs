@@ -6,5 +6,12 @@ pub(super) const TE_LINE: &[u8] = b"Transfer-Encoding: chunked\r\n";
 
 pub(in crate::http::response) const STATUS_LINE_PREFIX: &[u8] = b"HTTP/1.1 ";
 
+/// Wire length of an HTTP-date value (`Mon, 01 Jan 2000 00:00:00 GMT`).
+pub(in crate::http::response) const DATE_LEN: usize = 29;
+
+/// `date_offset` sentinel meaning the `Date` line was stripped (`#[skip(date)]`),
+/// so there is no placeholder to patch per request.
+pub(in crate::http::response) const NO_DATE: usize = usize::MAX;
+
 pub(in crate::http::response) const SERVER_DATE_TERMINATOR_LEN: usize =
-    SERVER_LINE.len() + DATE_PREFIX.len() + 29 + CRLF.len() + CRLF.len();
+    SERVER_LINE.len() + DATE_PREFIX.len() + DATE_LEN + CRLF.len() + CRLF.len();

@@ -18,6 +18,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "alloc-no-stdlib"
+version = "2.0.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "cc7bb162ec39d46ab1ca8c77bf72e890535becd1751bb45f64c597edb4c8c6b3"
+
+[[package]]
+name = "alloc-stdlib"
+version = "0.2.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0e76a019e91224d279006ff972f1e984179a6e9feb050adba6ce8274aef23195"
+dependencies = [
+ "alloc-no-stdlib",
+]
+
+[[package]]
 name = "anes"
 version = "0.1.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -82,6 +97,27 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d2f6c7dbe95a6ed67ad9f18e57daf93a2f034c524b99fd2b76d18fdfeb6660aa"
 dependencies = [
  "hybrid-array",
+]
+
+[[package]]
+name = "brotli"
+version = "8.0.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5cc91aac060a7a1e25823bdccbfb6af1875b88f17c6daac97894eed8207166b3"
+dependencies = [
+ "alloc-no-stdlib",
+ "alloc-stdlib",
+ "brotli-decompressor",
+]
+
+[[package]]
+name = "brotli-decompressor"
+version = "5.0.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3a32acac15fe1967bc3986b2a6347dffc965602354ea6f450ad07e8bfd253583"
+dependencies = [
+ "alloc-no-stdlib",
+ "alloc-stdlib",
 ]
 
 [[package]]
@@ -320,9 +356,9 @@ dependencies = [
 
 [[package]]
 name = "dope"
-version = "0.5.0"
+version = "0.5.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b1f2af5f0b2507932706f970ded9a6c4de89431a9f855a7d61a0c7e698857781"
+checksum = "e99b299e88af89ad6b5cd727bda218da2b496b6ecc66b2608e6b5711f6f5fd23"
 dependencies = [
  "io-uring",
  "libc",
@@ -332,9 +368,9 @@ dependencies = [
 
 [[package]]
 name = "dope-extra"
-version = "0.5.0"
+version = "0.5.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c1ce0d8ae99e97adb8a9b4247d382d0726ee84c01547e2151909dd967d2ca411"
+checksum = "f42f0ec8d8fe9963cd7c911d1ff348d53d9454876b27a5595bd838fb626d56f1"
 dependencies = [
  "dope",
  "libc",
@@ -343,9 +379,9 @@ dependencies = [
 
 [[package]]
 name = "dope-gen"
-version = "0.5.0"
+version = "0.5.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8352e7b40f75f8af0e895b272048761eb16809c91f387d5d3cdac28c0b05a029"
+checksum = "bd962b20728d72a4fed80a6733d8e8eb7d8a7402b78a13de9ce3eaa83bf7d356"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -559,9 +595,9 @@ checksum = "6dbf3de79e51f3d586ab4cb9d5c3e2c14aa28ed23d180cf89b4df0454a69cc87"
 
 [[package]]
 name = "hybrid-array"
-version = "0.4.12"
+version = "0.4.13"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9155a582abd142abc056962c29e3ce5ff2ad5469f4246b537ed42c5deba857da"
+checksum = "818356c5132c1fede50f837ca96afbe78ff42413047f4abb886217845e1b6c8c"
 dependencies = [
  "typenum",
 ]
@@ -1001,7 +1037,7 @@ dependencies = [
 
 [[package]]
 name = "sark"
-version = "0.7.0"
+version = "0.8.0"
 dependencies = [
  "cartel-gen",
  "cartel-pg",
@@ -1025,7 +1061,7 @@ dependencies = [
 
 [[package]]
 name = "sark-client"
-version = "0.7.0"
+version = "0.8.0"
 dependencies = [
  "cartel-core",
  "dope",
@@ -1040,8 +1076,9 @@ dependencies = [
 
 [[package]]
 name = "sark-core"
-version = "0.7.0"
+version = "0.8.0"
 dependencies = [
+ "brotli",
  "criterion",
  "http",
  "httparse",
@@ -1056,7 +1093,7 @@ dependencies = [
 
 [[package]]
 name = "sark-gen"
-version = "0.7.0"
+version = "0.8.0"
 dependencies = [
  "dope",
  "o3",
@@ -1067,7 +1104,7 @@ dependencies = [
 
 [[package]]
 name = "sark-grpc"
-version = "0.7.0"
+version = "0.8.0"
 dependencies = [
  "dope",
  "dope-extra",
@@ -1083,14 +1120,14 @@ dependencies = [
 
 [[package]]
 name = "sark-grpc-build"
-version = "0.7.0"
+version = "0.8.0"
 dependencies = [
  "prost-build",
 ]
 
 [[package]]
 name = "sark-h2"
-version = "0.7.0"
+version = "0.8.0"
 dependencies = [
  "dope",
  "dope-extra",
@@ -1105,7 +1142,7 @@ dependencies = [
 
 [[package]]
 name = "sark-h3"
-version = "0.7.0"
+version = "0.8.0"
 dependencies = [
  "dope",
  "dope-quic",
@@ -1119,7 +1156,7 @@ dependencies = [
 
 [[package]]
 name = "sark-json"
-version = "0.7.0"
+version = "0.8.0"
 dependencies = [
  "http",
  "o3",
@@ -1128,7 +1165,7 @@ dependencies = [
 
 [[package]]
 name = "sark-ws"
-version = "0.7.0"
+version = "0.8.0"
 dependencies = [
  "dope",
  "dope-extra",

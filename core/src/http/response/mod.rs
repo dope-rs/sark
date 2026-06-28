@@ -29,6 +29,7 @@ pub use owned::Response;
 pub use serve::{IntoServeResponse, IntoServeResponseStatic, Serve, ServeInner};
 pub use shape::{NeverStream, Shape};
 pub use stream::{CHUNK_TERMINATOR, IterStream, Stream};
+pub use wire_emit::apply_head_skip;
 
 use super::request::LocalFrameBytesRef;
 
