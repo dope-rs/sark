@@ -27,9 +27,9 @@ pub fn apply_head_skip(
     if emit_date && emit_server {
         return date_offset;
     }
-    // Tail layout from `Out::put_server_date_terminator`:
-    //   SERVER_LINE | DATE_PREFIX | <DATE_LEN date> | CRLF | CRLF
+    //   SERVER_LINE | DATE_PREFIX | <DATE_LEN date> | CRLF | CRLF   (body may trail)
     let term_start = date_offset - consts::DATE_PREFIX.len() - consts::SERVER_LINE.len();
+    let term_end = term_start + SERVER_DATE_TERMINATOR_LEN;
     let mut tail = Vec::with_capacity(SERVER_DATE_TERMINATOR_LEN);
     if emit_server {
         tail.extend_from_slice(consts::SERVER_LINE);
@@ -44,7 +44,6 @@ pub fn apply_head_skip(
         NO_DATE
     };
     tail.extend_from_slice(CRLF);
-    template.truncate(term_start);
-    template.extend_from_slice(&tail);
+    template.splice(term_start..term_end, tail);
     new_offset
 }
