@@ -15,7 +15,7 @@ dope-quic = "0.3"
 [dev-dependencies]
 sark-gen.workspace = true
 dope.workspace = true
-http = "1.4.0"
+http = "1.4.2"
 ring = "0.17"
 shin = "0.3"
 

@@ -20,9 +20,9 @@ dope-gen.workspace = true
 o3.workspace = true
 dope-tls.workspace = true
 shin = "0.3"
-http = "1.4.0"
+http = "1.4.2"
 httparse = "1.10.1"
-memchr = "2.7"
+memchr = "2.8"
 pin-project.workspace = true
 
 [dev-dependencies]
