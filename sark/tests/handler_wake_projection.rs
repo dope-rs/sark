@@ -45,7 +45,7 @@ sark_gen::define_route! {
     }
 }
 
-#[allow(dead_code)]
+#[allow(dead_code, clippy::large_enum_variant)]
 enum Wrap {
     Pad(u32),
     H1(ConnState),

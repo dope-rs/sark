@@ -84,6 +84,7 @@ impl Parse for JsonMode {
 struct Plan<'a> {
     mode: &'a JsonMode,
     idents: Vec<Ident>,
+    binds: Vec<Ident>,
     tys: Vec<Type>,
     names: Vec<Vec<u8>>,
     modes: Vec<FieldMode>,
@@ -91,17 +92,17 @@ struct Plan<'a> {
 
 impl<'a> Plan<'a> {
     fn locals(&self) -> Vec<TokenStream> {
-        self.idents
+        self.binds
             .iter()
             .zip(self.tys.iter())
             .zip(self.modes.iter())
-            .map(|((ident, ty), fmode)| {
+            .map(|((bind, ty), fmode)| {
                 if fmode.unused && self.mode.preserve {
                     quote!()
                 } else if ty.option_inner().is_some() {
-                    quote!(let mut #ident = None;)
+                    quote!(let mut #bind = None;)
                 } else {
-                    quote!(let mut #ident: Option<#ty> = None;)
+                    quote!(let mut #bind: Option<#ty> = None;)
                 }
             })
             .collect()
@@ -109,12 +110,12 @@ impl<'a> Plan<'a> {
 
     fn match_arms(&self) -> Result<Vec<TokenStream>> {
         let entries = self
-            .idents
+            .binds
             .iter()
             .zip(self.names.iter())
             .zip(self.tys.iter())
             .zip(self.modes.iter())
-            .map(|(((ident, name), ty), fmode)| {
+            .map(|(((bind, name), ty), fmode)| {
                 let lit = syn::LitByteStr::new(name.as_slice(), Span::call_site());
                 let decode = Decode::expr(ty, *fmode)?;
                 Ok(if fmode.unused && self.mode.preserve {
@@ -133,8 +134,8 @@ impl<'a> Plan<'a> {
                         name.len(),
                         quote! {
                             if __name == #lit {
-                                if #ident.is_none() {
-                                    #ident = Some(#decode);
+                                if #bind.is_none() {
+                                    #bind = Some(#decode);
                                 } else {
                                     sark::json::Scan::skip_value(__raw, &mut __idx)?;
                                 }
@@ -151,16 +152,17 @@ impl<'a> Plan<'a> {
     fn finals(&self) -> Result<Vec<TokenStream>> {
         self.idents
             .iter()
+            .zip(self.binds.iter())
             .zip(self.tys.iter())
             .zip(self.modes.iter())
-            .map(|((ident, ty), fmode)| {
+            .map(|(((ident, bind), ty), fmode)| {
                 if fmode.unused && self.mode.preserve {
                     Decode::empty(ty).map(|empty| quote!(#ident: #empty))
                 } else if ty.option_inner().is_some() {
-                    Ok(quote!(#ident: #ident))
+                    Ok(quote!(#ident: #bind))
                 } else {
                     Ok(quote! {
-                        #ident: #ident.ok_or_else(|| {
+                        #ident: #bind.ok_or_else(|| {
                             sark::json::Json::bad_request(
                                 concat!("Missing JSON field: ", stringify!(#ident)),
                             )
@@ -172,13 +174,13 @@ impl<'a> Plan<'a> {
     }
 
     fn ordered_steps(&self) -> Result<Vec<TokenStream>> {
-        self.idents
+        self.binds
             .iter()
             .zip(self.tys.iter())
             .zip(self.names.iter())
             .zip(self.modes.iter())
             .enumerate()
-            .map(|(idx, (((ident, ty), name), fmode))| {
+            .map(|(idx, (((bind, ty), name), fmode))| {
                 let name = syn::LitByteStr::new(name, Span::call_site());
                 let decode = Decode::expr(ty, *fmode)?;
                 let first = idx == 0;
@@ -191,7 +193,7 @@ impl<'a> Plan<'a> {
                 } else {
                     quote! {
                         sark::json::Scan::expect_prop(__raw, &mut __idx, #first, #name)?;
-                        #ident = Some(#decode);
+                        #bind = Some(#decode);
                     }
                 })
             })
@@ -199,12 +201,12 @@ impl<'a> Plan<'a> {
     }
 
     fn exact_steps(&self) -> Result<Vec<TokenStream>> {
-        self.idents
+        self.binds
             .iter()
             .zip(self.tys.iter())
             .zip(self.names.iter())
             .zip(self.modes.iter())
-            .map(|(((ident, ty), name), fmode)| {
+            .map(|(((bind, ty), name), fmode)| {
                 let lit = syn::LitByteStr::new(name, Span::call_site());
                 let decode = Decode::expr(ty, *fmode)?;
                 Ok(if fmode.unused && self.mode.preserve {
@@ -214,7 +216,7 @@ impl<'a> Plan<'a> {
                 } else {
                     quote! {
                         sark::json::Scan::seek_name(__raw, &mut __idx, #lit)?;
-                        #ident = Some(#decode);
+                        #bind = Some(#decode);
                     }
                 })
             })
@@ -308,9 +310,9 @@ impl<'a> Plan<'a> {
 pub(super) fn attr(mode: JsonMode, mut st: ItemStruct) -> Result<TokenStream> {
     let name = st.ident.clone();
     let raw_field = Ident::new("__json_raw", Span::call_site());
-    let (fields, modes) = match &mut st.fields {
+    let (fields, modes, name_overrides) = match &mut st.fields {
         Fields::Named(named) => {
-            let modes = named
+            let parsed = named
                 .named
                 .iter()
                 .map(|field| FieldMode::from_field(field, mode.plain))
@@ -323,7 +325,7 @@ pub(super) fn attr(mode: JsonMode, mut st: ItemStruct) -> Result<TokenStream> {
                         && !attr.path().is_ident("field")
                 });
             }
-            for (field, mode) in named.named.iter_mut().zip(modes.iter()) {
+            for (field, (mode, _)) in named.named.iter_mut().zip(parsed.iter()) {
                 if mode.unused {
                     field.attrs.push(syn::parse_quote!(#[allow(dead_code)]));
                 }
@@ -340,9 +342,11 @@ pub(super) fn attr(mode: JsonMode, mut st: ItemStruct) -> Result<TokenStream> {
             } else {
                 named.named.len()
             };
+            let (modes, names): (Vec<_>, Vec<_>) = parsed.into_iter().take(keep).unzip();
             (
                 named.named.iter().take(keep).collect::<Vec<_>>(),
-                modes.into_iter().take(keep).collect::<Vec<_>>(),
+                modes,
+                names,
             )
         }
         _ => {
@@ -365,12 +369,21 @@ pub(super) fn attr(mode: JsonMode, mut st: ItemStruct) -> Result<TokenStream> {
     let tys: Vec<_> = fields.iter().map(|field| field.ty.clone()).collect();
     let names: Vec<_> = idents
         .iter()
-        .map(|ident| ident.to_string().into_bytes())
+        .zip(name_overrides.iter())
+        .map(|(ident, over)| {
+            over.clone()
+                .unwrap_or_else(|| ident.to_string())
+                .into_bytes()
+        })
         .collect::<Vec<_>>();
+    let binds: Vec<_> = (0..idents.len())
+        .map(|idx| Ident::new(&format!("__f{idx}"), Span::call_site()))
+        .collect();
 
     let plan = Plan {
         mode: &mode,
         idents,
+        binds,
         tys,
         names,
         modes,

@@ -58,7 +58,7 @@ fn tls_config() -> TlsConfig {
         },
         transport_params: Vec::new(),
         alpn_protocols: Vec::new(),
-        ticket_secret: None,
+        ticket_keys: None,
         accept_early_data: false,
     }
 }

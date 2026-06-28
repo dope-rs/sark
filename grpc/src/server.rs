@@ -1579,7 +1579,7 @@ mod tests {
 
         app.on_data(&mut state, StreamId(1), &framed_messages(6, 100));
         assert!(
-            state.streams.get(&StreamId(1)).is_none(),
+            !state.streams.contains_key(&StreamId(1)),
             "buffered stream exceeding the cap must be dropped to bound memory"
         );
     }

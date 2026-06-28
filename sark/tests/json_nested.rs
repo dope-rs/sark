@@ -7,11 +7,11 @@ struct Message {
     message: LocalFrameBytes,
 }
 
-#[allow(non_snake_case)]
 #[sark_gen::json(ordered)]
 struct World {
     id: u64,
-    randomNumber: u64,
+    #[field(name = "randomNumber")]
+    random_number: u64,
 }
 
 #[sark_gen::json(ordered)]
@@ -209,9 +209,13 @@ fn tfb_message_shape() {
 fn world_shape() {
     let value = World {
         id: 4242,
-        randomNumber: 88,
+        random_number: 88,
     };
     assert_eq!(encode(&value), br#"{"id":4242,"randomNumber":88}"#);
+
+    let decoded = World::decode_json_borrowed(br#"{"id":4242,"randomNumber":88}"#).expect("decode");
+    assert_eq!(decoded.id, 4242);
+    assert_eq!(decoded.random_number, 88);
 }
 
 #[test]

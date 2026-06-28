@@ -1500,12 +1500,7 @@ mod hardening {
         let mut conn = server();
         prime_server(&mut conn);
         let big: u32 = 16_777_000;
-        let mut hdr = Vec::new();
-        hdr.push((big >> 16) as u8);
-        hdr.push((big >> 8) as u8);
-        hdr.push(big as u8);
-        hdr.push(0xFF);
-        hdr.push(0x00);
+        let mut hdr = vec![(big >> 16) as u8, (big >> 8) as u8, big as u8, 0xFF, 0x00];
         hdr.extend_from_slice(&0u32.to_be_bytes());
         let err = conn.ingest(&hdr).unwrap_err();
         assert_eq!(err, ConnError::FrameSize);
