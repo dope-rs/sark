@@ -89,10 +89,10 @@ fn http_get_close(addr: std::net::SocketAddr, path: &str) -> Vec<u8> {
     let mut buf = Vec::new();
     let mut chunk = [0u8; 4096];
     loop {
-        // The response head fully determines the Server/Date policy under test;
-        // stop once the blank line terminating it has arrived (a static response
-        // streams its body as a separate segment).
-        if buf.windows(4).any(|w| w == b"\r\n\r\n") {
+        if let Some(hdr_end) = buf.windows(4).position(|w| w == b"\r\n\r\n").map(|i| i + 4)
+            && let Some(cl) = content_length(&buf[..hdr_end])
+            && buf.len() >= hdr_end + cl
+        {
             break;
         }
         match stream.read(&mut chunk) {
@@ -103,6 +103,14 @@ fn http_get_close(addr: std::net::SocketAddr, path: &str) -> Vec<u8> {
         }
     }
     buf
+}
+
+fn content_length(headers: &[u8]) -> Option<usize> {
+    let text = std::str::from_utf8(headers).ok()?;
+    text.split("\r\n")
+        .filter_map(|line| line.split_once(':'))
+        .find(|(name, _)| name.eq_ignore_ascii_case("content-length"))
+        .and_then(|(_, v)| v.trim().parse().ok())
 }
 
 #[test]
@@ -129,6 +137,10 @@ fn skip_attribute_trims_static_response_headers() {
                 "lean content-length: {lean_resp:?}"
             );
             assert!(
+                lean_resp.ends_with("\r\n\r\nok"),
+                "lean body must arrive: {lean_resp:?}"
+            );
+            assert!(
                 !lean_resp.contains("Server:"),
                 "lean must omit Server: {lean_resp:?}"
             );
@@ -150,6 +162,10 @@ fn skip_attribute_trims_static_response_headers() {
                 full_resp.contains("Date: "),
                 "full keeps Date: {full_resp:?}"
             );
+            assert!(
+                full_resp.ends_with("\r\n\r\nok"),
+                "full body must arrive: {full_resp:?}"
+            );
 
             let no_server_resp =
                 String::from_utf8(http_get_close(bind, "/no-server")).expect("utf8");
@@ -161,6 +177,10 @@ fn skip_attribute_trims_static_response_headers() {
                 no_server_resp.contains("Date: "),
                 "no-server keeps patchable Date: {no_server_resp:?}"
             );
+            assert!(
+                no_server_resp.ends_with("\r\n\r\nok"),
+                "no-server body must arrive: {no_server_resp:?}"
+            );
 
             let no_date_resp = String::from_utf8(http_get_close(bind, "/no-date")).expect("utf8");
             assert!(
@@ -170,6 +190,10 @@ fn skip_attribute_trims_static_response_headers() {
             assert!(
                 !no_date_resp.contains("Date:"),
                 "no-date must omit Date: {no_date_resp:?}"
+            );
+            assert!(
+                no_date_resp.ends_with("\r\n\r\nok"),
+                "no-date body must arrive: {no_date_resp:?}"
             );
         },
     );
