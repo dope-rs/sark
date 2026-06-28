@@ -16,7 +16,7 @@ sark-core.workspace = true
 dope.workspace = true
 o3.workspace = true
 cartel-core = "0.3"
-http = "1.4.0"
+http = "1.4.2"
 flate2 = "1"
 
 [dev-dependencies]
