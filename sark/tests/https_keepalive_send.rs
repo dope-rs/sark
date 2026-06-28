@@ -193,7 +193,7 @@ fn https_cfg(bind: std::net::SocketAddr) -> HttpsCfg {
             },
             transport_params: Vec::new(),
             alpn_protocols: Vec::new(),
-            ticket_secret: None,
+            ticket_keys: None,
             accept_early_data: false,
         },
     }
@@ -217,23 +217,7 @@ fn https_streams_large_body() {
 #[test]
 fn https_keepalive_serves_two_requests() {
     let bind = ephemeral_addr();
-    let cfg = HttpsCfg {
-        server: ServerCfg {
-            bind,
-            max_conn: 16,
-            backlog: 16,
-            head_timeout: std::time::Duration::from_secs(10),
-        },
-        tls: shin::server::Config {
-            source: shin::server::CertSource::RawPublicKey {
-                signing_key: SigningKey::from_seed(&SEED).expect("signing key"),
-            },
-            transport_params: Vec::new(),
-            alpn_protocols: Vec::new(),
-            ticket_secret: None,
-            accept_early_data: false,
-        },
-    };
+    let cfg = https_cfg(bind);
 
     run_with_trigger(
         bind,

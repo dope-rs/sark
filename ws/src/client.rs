@@ -13,7 +13,7 @@ use dope::transport::Transport;
 use dope::{WakeRef, WakerSet};
 use o3::buffer::Shared;
 use rand_chacha::ChaCha20Rng;
-use rand_core::{RngCore, SeedableRng};
+use rand_core::{Rng, SeedableRng};
 
 const DEFAULT_MAX_MESSAGE: usize = 16 * 1024 * 1024;
 const DEFAULT_MAX_OUTBOUND_FRAME: usize = 16 * 1024 * 1024;
