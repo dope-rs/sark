@@ -26,6 +26,7 @@ pub(crate) struct Cfg<'a> {
     pub(crate) parsed_body_ty: Option<&'a TokenStream>,
     pub(crate) parse_body_body: Option<&'a TokenStream>,
     pub(crate) max_body: Option<&'a syn::Expr>,
+    pub(crate) head_skip: crate::model::HeadSkip,
 }
 
 impl Cfg<'_> {
@@ -94,6 +95,17 @@ impl Cfg<'_> {
             Some(expr) => quote! { const MAX_BODY: usize = #expr; },
             None => quote! {},
         };
+        // Trait defaults to `true`; emit an override only when `#[skip(...)]` opts out.
+        let emit_date_token = if self.head_skip.date {
+            quote! { const EMIT_DATE: bool = false; }
+        } else {
+            quote! {}
+        };
+        let emit_server_token = if self.head_skip.server {
+            quote! { const EMIT_SERVER: bool = false; }
+        } else {
+            quote! {}
+        };
 
         quote! {
             impl sark::service::RouteSpec for #name {
@@ -116,6 +128,8 @@ impl Cfg<'_> {
                 const REQUEST_BODY_KIND: sark::http::body_kind::RequestKind = #request_body_kind_tokens;
                 const STREAMING_BODY: bool = <#request_ident>::STREAMING_BODY;
                 #max_body_token
+                #emit_date_token
+                #emit_server_token
 
                 type Captures =
                     <#raw_params_ident as sark::service::RouteParams>::Captures;

@@ -23,7 +23,10 @@ fn echo_roundtrips_through_fastpath() {
         sock.write_all(&batch).unwrap();
 
         assert_eq!(next_message(&mut sock, &mut buf), (0x1, b"alpha".to_vec()));
-        assert_eq!(next_message(&mut sock, &mut buf), (0x2, b"bravo!!".to_vec()));
+        assert_eq!(
+            next_message(&mut sock, &mut buf),
+            (0x2, b"bravo!!".to_vec())
+        );
         assert_eq!(next_message(&mut sock, &mut buf), (0x1, Vec::new()));
         assert_eq!(next_message(&mut sock, &mut buf), (0x2, big));
 
@@ -38,7 +41,10 @@ fn echo_roundtrips_through_fastpath() {
         sock.write_all(&frame[..3]).unwrap();
         std::thread::sleep(Duration::from_millis(50));
         sock.write_all(&frame[3..]).unwrap();
-        assert_eq!(next_message(&mut sock, &mut buf), (0x1, b"charlie".to_vec()));
+        assert_eq!(
+            next_message(&mut sock, &mut buf),
+            (0x1, b"charlie".to_vec())
+        );
 
         // Ping -> pong with same payload.
         sock.write_all(&masked(0x9, true, b"hb")).unwrap();

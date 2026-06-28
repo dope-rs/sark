@@ -590,7 +590,13 @@ impl Pipeline {
         }
         if <R as RouteSpec>::STATIC_RESPONSE && static_body {
             return match Shape::preserialize_static(&resp) {
-                Some((head_template, date_offset, body)) => {
+                Some((mut head_template, date_offset, body)) => {
+                    let date_offset = sark_core::http::apply_head_skip(
+                        &mut head_template,
+                        date_offset,
+                        <R as RouteSpec>::EMIT_DATE,
+                        <R as RouteSpec>::EMIT_SERVER,
+                    );
                     let hdr = FixedResponseInner::write_preserialized(
                         write,
                         &head_template,
@@ -611,7 +617,13 @@ impl Pipeline {
             };
         }
         if <R as RouteSpec>::STATIC_RESPONSE {
-            let (template, date_offset) = Shape::preserialize(&resp);
+            let (mut template, date_offset) = Shape::preserialize(&resp);
+            let date_offset = sark_core::http::apply_head_skip(
+                &mut template,
+                date_offset,
+                <R as RouteSpec>::EMIT_DATE,
+                <R as RouteSpec>::EMIT_SERVER,
+            );
             let n = FixedResponseInner::write_preserialized(write, &template, date_offset, date);
             cache.store_fixed(template, date_offset);
             return match n {

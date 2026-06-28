@@ -671,29 +671,26 @@ fn trim_line(raw: &[u8]) -> Result<Option<(usize, usize, usize)>> {
         idx += 1;
     }
     let value_start = idx;
-    let mut value_end = value_start;
-    loop {
-        if idx >= raw.len() {
-            return Ok(None);
-        }
-        let b = raw[idx];
-        if b == b'\r' {
-            if idx + 1 >= raw.len() {
-                return Ok(None);
-            }
-            if raw[idx + 1] != b'\n' {
-                return Err(invalid_header_value());
-            }
-            return Ok(Some((idx, value_start, value_end)));
-        }
-        if b == b'\n' {
-            return Err(invalid_header_value());
-        }
-        if !is_ascii_ws(b) {
-            value_end = idx + 1;
-        }
-        idx += 1;
+    // Find the line terminator with a SIMD scan instead of a per-byte loop; a
+    // bare LF before the CR is rejected exactly as the scalar loop did.
+    let Some(rel) = memchr::memchr2(b'\r', b'\n', &raw[value_start..]) else {
+        return Ok(None);
+    };
+    let cr = value_start + rel;
+    if raw[cr] == b'\n' {
+        return Err(invalid_header_value());
     }
+    if cr + 1 >= raw.len() {
+        return Ok(None);
+    }
+    if raw[cr + 1] != b'\n' {
+        return Err(invalid_header_value());
+    }
+    let mut value_end = cr;
+    while value_end > value_start && is_ascii_ws(raw[value_end - 1]) {
+        value_end -= 1;
+    }
+    Ok(Some((cr, value_start, value_end)))
 }
 
 fn parse_content_length_line(raw: &[u8]) -> Result<(usize, usize)> {

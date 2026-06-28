@@ -99,7 +99,8 @@ impl<'a> Response<'a> {
         if self.write.len() - off < total {
             return false;
         }
-        let hlen = FrameHead::encode_header_into(&mut self.write[off..], opcode, payload.len(), false);
+        let hlen =
+            FrameHead::encode_header_into(&mut self.write[off..], opcode, payload.len(), false);
         self.write[off + hlen..off + total].copy_from_slice(payload);
         self.written += total;
         true
@@ -313,8 +314,13 @@ impl<H: Handler> App<H> {
                     scratch,
                     acc: &mut state.acc,
                 };
-                let closed =
-                    Self::drive_frames_over(user, frame_cap, src, &mut state.fragments, &mut response);
+                let closed = Self::drive_frames_over(
+                    user,
+                    frame_cap,
+                    src,
+                    &mut state.fragments,
+                    &mut response,
+                );
                 if closed {
                     state.phase = Phase::Closed;
                 }
@@ -329,9 +335,7 @@ impl<H: Handler> App<H> {
             return Outcome::Ok;
         }
 
-        project(&mut slot.state.conn)
-            .acc
-            .extend_from_slice(chunk);
+        project(&mut slot.state.conn).acc.extend_from_slice(chunk);
         if project(&mut slot.state.conn).acc.len() > WS_MAX_ACC {
             let state = project(&mut slot.state.conn);
             state.phase = Phase::Closed;
@@ -496,8 +500,13 @@ impl<H: Handler> App<H> {
         let src = AccSource {
             acc: &mut state.acc,
         };
-        if Self::drive_frames_over(&self.user, self.frame_cap(), src, &mut state.fragments, response)
-        {
+        if Self::drive_frames_over(
+            &self.user,
+            self.frame_cap(),
+            src,
+            &mut state.fragments,
+            response,
+        ) {
             state.phase = Phase::Closed;
         }
     }
@@ -583,4 +592,3 @@ impl<H: Handler> App<H> {
         }
     }
 }
-

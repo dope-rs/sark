@@ -1,7 +1,7 @@
 use http::StatusCode;
 use o3::buffer::{Owned, Shared};
 
-use super::wire_emit::{ContentLength, HeadWrite, Out};
+use super::wire_emit::{ContentLength, DATE_LEN, HeadWrite, NO_DATE, Out};
 use super::{HeadInner, HeadersInner, InlineHeaderValue};
 
 #[derive(Clone, Debug)]
@@ -62,7 +62,9 @@ impl<'req> FixedResponseInner<'req> {
             return None;
         }
         out[..total].copy_from_slice(template);
-        out[date_offset..date_offset + 29].copy_from_slice(date);
+        if date_offset != NO_DATE {
+            out[date_offset..date_offset + DATE_LEN].copy_from_slice(date);
+        }
         Some(total)
     }
 

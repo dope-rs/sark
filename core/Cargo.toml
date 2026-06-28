@@ -12,6 +12,7 @@ path = "src/lib.rs"
 
 [dependencies]
 o3.workspace = true
+brotli = { version = "8", default-features = false, features = ["std"] }
 http = "1.4.0"
 httparse = "1.10.1"
 libdeflater = "1.25"

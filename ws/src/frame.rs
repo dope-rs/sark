@@ -117,7 +117,12 @@ impl FrameHead {
     /// at least [`header_len`](Self::header_len)`(payload_len)` bytes. Avoids a
     /// per-frame heap `Vec` on the send hot path.
     #[inline]
-    pub fn encode_header_into(dst: &mut [u8], opcode: u8, payload_len: usize, masked: bool) -> usize {
+    pub fn encode_header_into(
+        dst: &mut [u8],
+        opcode: u8,
+        payload_len: usize,
+        masked: bool,
+    ) -> usize {
         dst[0] = 0x80 | (opcode & 0x0f);
         let mask_bit: u8 = if masked { 0x80 } else { 0 };
         if payload_len <= 125 {

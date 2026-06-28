@@ -29,6 +29,7 @@ pub(super) fn attr_fn(mut fun: ItemFn) -> Result<TokenStream> {
         response_body_kind_attr,
         request_body_kind_attr,
         max_body_attr,
+        head_skip,
     ) = take_route_cfg_attrs(&mut fun.attrs)?;
     let response_body_kind =
         response_body_kind_attr.unwrap_or_else(|| infer_response_body_kind(&output));
@@ -174,6 +175,12 @@ pub(super) fn attr_fn(mut fun: ItemFn) -> Result<TokenStream> {
     attrs.push(syn::parse_quote!(#[request(#request_ty)]));
     if let Some(expr) = &max_body_attr {
         attrs.push(syn::parse_quote!(#[max_body(#expr)]));
+    }
+    match (head_skip.date, head_skip.server) {
+        (false, false) => {}
+        (true, false) => attrs.push(syn::parse_quote!(#[skip(date)])),
+        (false, true) => attrs.push(syn::parse_quote!(#[skip(server)])),
+        (true, true) => attrs.push(syn::parse_quote!(#[skip(date, server)])),
     }
     let st: ItemStruct = syn::parse_quote! {
         #(#attrs)*
@@ -438,6 +445,7 @@ fn attr(
         response_body_kind,
         request_body_kind,
         max_body,
+        head_skip,
     ) = parse_struct_route_cfg(&mut st)?;
     let name = st.ident.clone();
     let request_ty = request_ty.ok_or_else(|| {
@@ -508,6 +516,7 @@ fn attr(
         parsed_body_ty: parsed_body_ty_tokens.as_ref(),
         parse_body_body: parse_body_body_tokens.as_ref(),
         max_body: max_body.as_ref(),
+        head_skip,
     }
     .build();
     let body_call = if body_ty.is_some() {
