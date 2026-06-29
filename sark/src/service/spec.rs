@@ -144,10 +144,9 @@ pub trait RouteSpec {
     );
     const MAX_BODY: usize = 1024 * 1024;
 
-    /// Emit the `Date` response header. `#[skip(date)]` sets this `false` for a
-    /// route, trimming the header from its (static) responses.
+    /// Emit the `Date` response header; `#[skip(date)]` sets this `false`.
     const EMIT_DATE: bool = true;
-    /// Emit the `Server` response header. `#[skip(server)]` sets this `false`.
+    /// Emit the `Server` response header; `#[skip(server)]` sets this `false`.
     const EMIT_SERVER: bool = true;
 
     fn parse_body<'req>(raw: &'req [u8]) -> sark_core::error::Result<Self::ParsedBody<'req>>;

@@ -35,10 +35,10 @@ where
         out: &mut [u8],
         off: &mut usize,
         date: &[u8; 29],
-    ) {
+    ) -> usize {
         Out::put_status_line(out, off, self.status_str, self.reason);
         self.headers.write_headers(out, off);
         self.framing.write_framing(out, off);
-        Out::put_server_date_terminator(out, off, date);
+        Out::put_server_date_terminator(out, off, date)
     }
 }

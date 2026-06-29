@@ -27,7 +27,6 @@ struct PingReply {
     body: &'static [u8],
 }
 
-// Opts out of both Server and Date for this (static) route.
 #[sark_gen::handler]
 #[static_response]
 #[skip(date, server)]
@@ -38,7 +37,6 @@ fn lean(_req: LeanRequest, _state: &()) -> PingReply {
     }
 }
 
-// Control: default behavior keeps Server and Date.
 #[sark_gen::handler]
 #[static_response]
 fn full(_req: FullRequest, _state: &()) -> PingReply {
@@ -48,8 +46,6 @@ fn full(_req: FullRequest, _state: &()) -> PingReply {
     }
 }
 
-// Single-skip cases: Date is dropped while Server stays patchable, and vice
-// versa (exercises the offset shift in `apply_head_skip`).
 #[sark_gen::handler]
 #[static_response]
 #[skip(server)]
@@ -163,6 +159,10 @@ fn skip_attribute_trims_static_response_headers() {
                 "full keeps Date: {full_resp:?}"
             );
             assert!(
+                !full_resp.contains("Mon, 01 Jan 2000"),
+                "full Date must be patched at the live offset, not the placeholder: {full_resp:?}"
+            );
+            assert!(
                 full_resp.ends_with("\r\n\r\nok"),
                 "full body must arrive: {full_resp:?}"
             );
@@ -176,6 +176,10 @@ fn skip_attribute_trims_static_response_headers() {
             assert!(
                 no_server_resp.contains("Date: "),
                 "no-server keeps patchable Date: {no_server_resp:?}"
+            );
+            assert!(
+                !no_server_resp.contains("Mon, 01 Jan 2000"),
+                "no-server Date must be patched at the shifted offset: {no_server_resp:?}"
             );
             assert!(
                 no_server_resp.ends_with("\r\n\r\nok"),
