@@ -1,7 +1,7 @@
 use http::StatusCode;
 use o3::buffer::{Owned, Shared};
 
-use super::wire_emit::{ContentLength, DATE_LEN, HeadWrite, NO_DATE, Out};
+use super::wire_emit::{ContentLength, DATE_LEN, HeadWrite, Out, PLACEHOLDER_DATE};
 use super::{HeadInner, HeadersInner, InlineHeaderValue};
 
 #[derive(Clone, Debug)]
@@ -54,7 +54,7 @@ impl<'req> FixedResponseInner<'req> {
     pub fn write_preserialized(
         out: &mut [u8],
         template: &[u8],
-        date_offset: usize,
+        date_offset: Option<usize>,
         date: &[u8; 29],
     ) -> Option<usize> {
         let total = template.len();
@@ -62,47 +62,40 @@ impl<'req> FixedResponseInner<'req> {
             return None;
         }
         out[..total].copy_from_slice(template);
-        if date_offset != NO_DATE {
-            out[date_offset..date_offset + DATE_LEN].copy_from_slice(date);
+        if let Some(off) = date_offset {
+            out[off..off + DATE_LEN].copy_from_slice(date);
         }
         Some(total)
     }
 
+    fn head_write(&self) -> (HeadWrite<'_, HeadInner<'req>, ContentLength<'_>>, &[u8]) {
+        let head = HeadWrite {
+            status_str: self.status.as_str().as_bytes(),
+            reason: self
+                .status
+                .canonical_reason()
+                .map(str::as_bytes)
+                .unwrap_or(b""),
+            headers: &self.head,
+            framing: ContentLength(self.body_len_ascii.as_bytes()),
+        };
+        (head, self.body.as_ref())
+    }
+
     pub fn preserialize(&self) -> (Vec<u8>, usize) {
-        let dummy_date: &[u8; 29] = b"Mon, 01 Jan 2000 00:00:00 GMT";
-        let mut buf = vec![0u8; 4096];
-        let n = self
-            .write_into_slice(&mut buf, dummy_date)
-            .expect("preserialize: 4096 must be enough for any response");
-        buf.truncate(n);
-        let date_offset = buf
-            .windows(29)
-            .position(|w| w == dummy_date)
-            .expect("preserialize: dummy date must appear in output");
+        let (head, body) = self.head_write();
+        let mut buf = vec![0u8; head.wire_len() + body.len()];
+        let mut off = 0usize;
+        let date_offset = head.write(&mut buf, &mut off, PLACEHOLDER_DATE);
+        Out::put(&mut buf, &mut off, body);
         (buf, date_offset)
     }
 
     pub fn write_into_slice(&self, out: &mut [u8], date: &[u8; 29]) -> Option<usize> {
-        let status_str = self.status.as_str().as_bytes();
-        let reason = self
-            .status
-            .canonical_reason()
-            .map(str::as_bytes)
-            .unwrap_or(b"");
-        let cl_body = self.body_len_ascii.as_bytes();
-        let body = self.body.as_ref();
-
-        let head = HeadWrite {
-            status_str,
-            reason,
-            headers: &self.head,
-            framing: ContentLength(cl_body),
-        };
-        let total = head.wire_len() + body.len();
-        if out.len() < total {
+        let (head, body) = self.head_write();
+        if out.len() < head.wire_len() + body.len() {
             return None;
         }
-
         let mut off = 0usize;
         head.write(out, &mut off, date);
         Out::put(out, &mut off, body);
@@ -110,19 +103,7 @@ impl<'req> FixedResponseInner<'req> {
     }
 
     pub fn write_head_split(self, out: &mut [u8], date: &[u8; 29]) -> Option<(usize, Shared)> {
-        let status_str = self.status.as_str().as_bytes();
-        let reason = self
-            .status
-            .canonical_reason()
-            .map(str::as_bytes)
-            .unwrap_or(b"");
-        let cl_body = self.body_len_ascii.as_bytes();
-        let head = HeadWrite {
-            status_str,
-            reason,
-            headers: &self.head,
-            framing: ContentLength(cl_body),
-        };
+        let (head, _) = self.head_write();
         if out.len() < head.wire_len() {
             return None;
         }

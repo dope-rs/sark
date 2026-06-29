@@ -5,11 +5,11 @@ use sark_core::http::FixedResponseInner;
 pub enum Content {
     Fixed {
         template: Vec<u8>,
-        date_offset: usize,
+        date_offset: Option<usize>,
     },
     Static {
         head_template: Vec<u8>,
-        date_offset: usize,
+        date_offset: Option<usize>,
         body: &'static [u8],
     },
 }
@@ -50,14 +50,19 @@ impl<'a> Slot<'a> {
         }
     }
 
-    pub fn store_fixed(&self, template: Vec<u8>, date_offset: usize) {
+    pub fn store_fixed(&self, template: Vec<u8>, date_offset: Option<usize>) {
         let _ = self.slot.set(Content::Fixed {
             template,
             date_offset,
         });
     }
 
-    pub fn store_static(&self, head_template: Vec<u8>, date_offset: usize, body: &'static [u8]) {
+    pub fn store_static(
+        &self,
+        head_template: Vec<u8>,
+        date_offset: Option<usize>,
+        body: &'static [u8],
+    ) {
         let _ = self.slot.set(Content::Static {
             head_template,
             date_offset,

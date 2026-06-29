@@ -671,8 +671,6 @@ fn trim_line(raw: &[u8]) -> Result<Option<(usize, usize, usize)>> {
         idx += 1;
     }
     let value_start = idx;
-    // Find the line terminator with a SIMD scan instead of a per-byte loop; a
-    // bare LF before the CR is rejected exactly as the scalar loop did.
     let Some(rel) = memchr::memchr2(b'\r', b'\n', &raw[value_start..]) else {
         return Ok(None);
     };

@@ -1,8 +1,43 @@
 use http::{HeaderValue, StatusCode};
 use o3::buffer::Shared;
 
-use super::wire_emit::{CL_PREFIX, CRLF, Out, SERVER_DATE_TERMINATOR_LEN, STATUS_LINE_PREFIX};
+use super::wire_emit::{CRLF, ContentLength, HeadWrite, HeaderSection, Out, PLACEHOLDER_DATE};
 use super::{HeadInner, HeaderList, HeadersInner, HotBodyInner, HotHeadInner, IntoHeaderName};
+
+struct MonoHeaders<'a, 'req> {
+    head: &'a HotHeadInner<'req>,
+    dynamic: Option<&'a HeaderList>,
+}
+
+impl HeaderSection for MonoHeaders<'_, '_> {
+    fn header_len(&self) -> usize {
+        let head = match self.head {
+            HotHeadInner::Wire(bytes) => bytes.len(),
+            HotHeadInner::Direct(head) => head.wire_len(),
+        };
+        head + self.dynamic.map_or(0, HeaderList::wire_len)
+    }
+
+    fn write_headers(&self, out: &mut [u8], off: &mut usize) {
+        match self.head {
+            HotHeadInner::Wire(bytes) => Out::put(out, off, bytes),
+            HotHeadInner::Direct(head) => {
+                let written = head
+                    .write_slice(&mut out[*off..])
+                    .expect("HeadWrite invariant: head buffer reserved via wire_len");
+                *off += written;
+            }
+        }
+        if let Some(h) = self.dynamic {
+            for (name, value) in h.iter() {
+                Out::put(out, off, name.as_str().as_bytes());
+                Out::put(out, off, b": ");
+                Out::put(out, off, value.as_bytes());
+                Out::put(out, off, CRLF);
+            }
+        }
+    }
+}
 
 #[derive(Clone, Debug)]
 pub struct MonoResponseInner<'req> {
@@ -53,8 +88,8 @@ impl<'req> MonoResponseInner<'req> {
     }
 
     pub fn write_into_slice(&self, out: &mut [u8], date: &[u8; 29]) -> Option<usize> {
+        let (mut off, _) = self.write_head_into(out, date)?;
         let body_len = self.body.body_len();
-        let mut off = self.write_head_into(out, date, body_len)?;
         if out.len() - off < body_len {
             return None;
         }
@@ -71,13 +106,12 @@ impl<'req> MonoResponseInner<'req> {
             HotBodyInner::StaticSlice(s) => *s,
             _ => return None,
         };
-        let off = self.write_head_into(out, date, body.len())?;
+        let (off, _) = self.write_head_into(out, date)?;
         Some((off, body))
     }
 
     pub fn write_head_split(self, out: &mut [u8], date: &[u8; 29]) -> Option<(usize, Shared)> {
-        let body_len = self.body.body_len();
-        let off = self.write_head_into(out, date, body_len)?;
+        let (off, _) = self.write_head_into(out, date)?;
         Some((off, self.body.into_shared()))
     }
 
@@ -86,77 +120,42 @@ impl<'req> MonoResponseInner<'req> {
             HotBodyInner::StaticSlice(s) => *s,
             _ => return None,
         };
-        let dummy_date: &[u8; 29] = b"Mon, 01 Jan 2000 00:00:00 GMT";
-        let mut buf = vec![0u8; 4096];
-        let n = self.write_head_into(&mut buf, dummy_date, body.len())?;
-        buf.truncate(n);
-        let date_offset = buf
-            .windows(29)
-            .position(|w| w == dummy_date)
-            .expect("preserialize_static: dummy date must appear");
+        let mut buf = vec![0u8; self.with_head(|head| head.wire_len())];
+        let (_, date_offset) = self.write_head_into(&mut buf, PLACEHOLDER_DATE)?;
         Some((buf, date_offset, body))
     }
 
-    fn write_head_into(&self, out: &mut [u8], date: &[u8; 29], body_len: usize) -> Option<usize> {
-        let status_str = self.status.as_str().as_bytes();
-        let reason = self
-            .status
-            .canonical_reason()
-            .map(str::as_bytes)
-            .unwrap_or(b"");
-
+    fn with_head<R>(
+        &self,
+        f: impl FnOnce(&HeadWrite<'_, MonoHeaders<'_, 'req>, ContentLength<'_>>) -> R,
+    ) -> R {
         let mut cl_raw = [0u8; 20];
-        let cl_n = crate::http::codec::Wire::write_dec(body_len, &mut cl_raw);
-        let cl_body = &cl_raw[..cl_n];
-
-        let head_wire_len = match &self.head {
-            HotHeadInner::Wire(bytes) => bytes.len(),
-            HotHeadInner::Direct(head) => head.wire_len(),
+        let cl_n = crate::http::codec::Wire::write_dec(self.body.body_len(), &mut cl_raw);
+        let section = MonoHeaders {
+            head: &self.head,
+            dynamic: self.headers.as_deref(),
         };
-        let dyn_hdr_len = self.headers.as_deref().map_or(0, |h| h.wire_len());
+        let head = HeadWrite {
+            status_str: self.status.as_str().as_bytes(),
+            reason: self
+                .status
+                .canonical_reason()
+                .map(str::as_bytes)
+                .unwrap_or(b""),
+            headers: &section,
+            framing: ContentLength(&cl_raw[..cl_n]),
+        };
+        f(&head)
+    }
 
-        let head_total = STATUS_LINE_PREFIX.len()
-            + status_str.len()
-            + 1
-            + reason.len()
-            + CRLF.len()
-            + head_wire_len
-            + dyn_hdr_len
-            + CL_PREFIX.len()
-            + cl_body.len()
-            + CRLF.len()
-            + SERVER_DATE_TERMINATOR_LEN;
-        let _ = body_len;
-        if out.len() < head_total {
-            return None;
-        }
-
-        let mut off = 0usize;
-        Out::put_status_line(out, &mut off, status_str, reason);
-
-        match &self.head {
-            HotHeadInner::Wire(bytes) => Out::put(out, &mut off, bytes),
-            HotHeadInner::Direct(head) => {
-                let written = head
-                    .write_slice(&mut out[off..])
-                    .expect("wire_len reserved above");
-                off += written;
+    fn write_head_into(&self, out: &mut [u8], date: &[u8; 29]) -> Option<(usize, usize)> {
+        self.with_head(|head| {
+            if out.len() < head.wire_len() {
+                return None;
             }
-        }
-
-        if let Some(h) = self.headers.as_deref() {
-            for (name, value) in h.iter() {
-                Out::put(out, &mut off, name.as_str().as_bytes());
-                Out::put(out, &mut off, b": ");
-                Out::put(out, &mut off, value.as_bytes());
-                Out::put(out, &mut off, CRLF);
-            }
-        }
-
-        Out::put(out, &mut off, CL_PREFIX);
-        Out::put(out, &mut off, cl_body);
-        Out::put(out, &mut off, CRLF);
-        Out::put_server_date_terminator(out, &mut off, date);
-        Some(off)
+            let mut off = 0usize;
+            let date_offset = head.write(out, &mut off, date);
+            Some((off, date_offset))
+        })
     }
 }

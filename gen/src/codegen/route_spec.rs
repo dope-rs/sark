@@ -95,7 +95,6 @@ impl Cfg<'_> {
             Some(expr) => quote! { const MAX_BODY: usize = #expr; },
             None => quote! {},
         };
-        // Trait defaults to `true`; emit an override only when `#[skip(...)]` opts out.
         let emit_date_token = if self.head_skip.date {
             quote! { const EMIT_DATE: bool = false; }
         } else {

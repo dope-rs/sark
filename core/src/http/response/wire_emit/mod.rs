@@ -4,30 +4,30 @@ mod head_write;
 mod headers;
 mod out;
 
-pub(super) use consts::{CL_PREFIX, CRLF, SERVER_DATE_TERMINATOR_LEN, STATUS_LINE_PREFIX};
-pub(in crate::http::response) use consts::{DATE_LEN, NO_DATE};
+pub(super) use consts::{CRLF, SERVER_DATE_TERMINATOR_LEN};
+pub(in crate::http::response) use consts::{DATE_LEN, PLACEHOLDER_DATE};
 pub(super) use framing::{ContentLength, TransferEncodingChunked};
 pub(super) use head_write::HeadWrite;
 pub(super) use headers::HeaderSection;
 pub(super) use out::Out;
 
-/// Rewrites the cached head template's `Server`/`Date` terminator in place to
-/// honor a route's `#[skip(...)]` policy. The template is built once and cached,
-/// so this runs once per route — not per request.
+/// Rewrites a cached head's `Server`/`Date` terminator for a route's
+/// `#[skip(...)]` policy, returning the per-request `Date` patch offset (`None`
+/// when the line is dropped). Runs once per route at build time, never per
+/// request. Assumes the terminator is the final contiguous block:
 ///
-/// Argument order matches the rest of the codebase: `(date, server)`. Returns
-/// the date-placeholder offset to patch each request, or [`NO_DATE`] when
-/// `emit_date` is false.
+/// ```text
+/// SERVER_LINE | DATE_PREFIX | <DATE_LEN date> | CRLF | CRLF   (body may trail)
+/// ```
 pub fn apply_head_skip(
     template: &mut Vec<u8>,
     date_offset: usize,
     emit_date: bool,
     emit_server: bool,
-) -> usize {
+) -> Option<usize> {
     if emit_date && emit_server {
-        return date_offset;
+        return Some(date_offset);
     }
-    //   SERVER_LINE | DATE_PREFIX | <DATE_LEN date> | CRLF | CRLF   (body may trail)
     let term_start = date_offset - consts::DATE_PREFIX.len() - consts::SERVER_LINE.len();
     let term_end = term_start + SERVER_DATE_TERMINATOR_LEN;
     let mut tail = Vec::with_capacity(SERVER_DATE_TERMINATOR_LEN);
@@ -39,9 +39,9 @@ pub fn apply_head_skip(
         let off = term_start + tail.len();
         tail.extend_from_slice(&[0u8; DATE_LEN]);
         tail.extend_from_slice(CRLF);
-        off
+        Some(off)
     } else {
-        NO_DATE
+        None
     };
     tail.extend_from_slice(CRLF);
     template.splice(term_start..term_end, tail);

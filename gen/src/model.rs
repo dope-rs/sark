@@ -15,8 +15,6 @@ pub(super) enum RequestKind {
     Spilled,
 }
 
-/// Response headers a route opts out of via `#[skip(...)]`. Both default to
-/// `false` (emit the header).
 #[derive(Clone, Copy, PartialEq, Eq, Default)]
 pub(super) struct HeadSkip {
     pub(super) date: bool,

@@ -28,11 +28,13 @@ impl Out {
         out: &mut [u8],
         off: &mut usize,
         date: &[u8; 29],
-    ) {
+    ) -> usize {
         Self::put(out, off, SERVER_LINE);
         Self::put(out, off, DATE_PREFIX);
+        let date_offset = *off;
         Self::put(out, off, date);
         Self::put(out, off, CRLF);
         Self::put(out, off, CRLF);
+        date_offset
     }
 }
