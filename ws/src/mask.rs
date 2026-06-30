@@ -62,8 +62,8 @@ cfg_select! {
                 __m128i, __m256i, _mm256_loadu_si256, _mm256_set1_epi32, _mm256_storeu_si256,
                 _mm256_xor_si256, _mm_loadu_si128, _mm_set1_epi32, _mm_storeu_si128, _mm_xor_si128,
             };
-            let key = i32::from_ne_bytes(mask);
-            let key32 = _mm256_set1_epi32(key);
+            let key_bits = i32::from_ne_bytes(mask);
+            let key32 = _mm256_set1_epi32(key_bits);
             let mut i = 0;
             while i + 32 <= len {
                 // SAFETY: i + 32 <= len bounds the 32-byte load/store windows.
@@ -72,7 +72,7 @@ cfg_select! {
                 i += 32;
             }
             if i + 16 <= len {
-                let key16 = _mm_set1_epi32(key);
+                let key16 = _mm_set1_epi32(key_bits);
                 // SAFETY: i + 16 <= len bounds the 16-byte load/store windows.
                 let v = unsafe { _mm_loadu_si128(src.add(i) as *const __m128i) };
                 unsafe { _mm_storeu_si128(dst.add(i) as *mut __m128i, _mm_xor_si128(v, key16)) };
@@ -81,11 +81,12 @@ cfg_select! {
             unsafe { unmask_tail(dst, src, i, len, mask) };
         }
 
+        #[target_feature(enable = "sse2")]
         unsafe fn unmask_sse2(dst: *mut u8, src: *const u8, len: usize, mask: [u8; 4]) {
             use core::arch::x86_64::{
                 __m128i, _mm_loadu_si128, _mm_set1_epi32, _mm_storeu_si128, _mm_xor_si128,
             };
-            let key = unsafe { _mm_set1_epi32(i32::from_ne_bytes(mask)) };
+            let key = _mm_set1_epi32(i32::from_ne_bytes(mask));
             let mut i = 0;
             while i + 16 <= len {
                 // SAFETY: i + 16 <= len bounds the 16-byte load/store windows.

@@ -181,60 +181,60 @@ cfg_select! {
 
         const LANE_MASK: u32 = 0xFFFF;
 
-        unsafe fn lane_eq(chunk: __m128i, byte: u8) -> __m128i {
-            unsafe { _mm_cmpeq_epi8(chunk, _mm_set1_epi8(byte as i8)) }
+        #[target_feature(enable = "sse2")]
+        fn lane_eq(chunk: __m128i, byte: u8) -> __m128i {
+            _mm_cmpeq_epi8(chunk, _mm_set1_epi8(byte as i8))
         }
 
-        unsafe fn in_range(chunk: __m128i, lo: u8, hi: u8) -> __m128i {
-            unsafe {
-                let clamped =
-                    _mm_min_epu8(_mm_max_epu8(chunk, _mm_set1_epi8(lo as i8)), _mm_set1_epi8(hi as i8));
-                _mm_cmpeq_epi8(chunk, clamped)
-            }
+        #[target_feature(enable = "sse2")]
+        fn in_range(chunk: __m128i, lo: u8, hi: u8) -> __m128i {
+            let clamped =
+                _mm_min_epu8(_mm_max_epu8(chunk, _mm_set1_epi8(lo as i8)), _mm_set1_epi8(hi as i8));
+            _mm_cmpeq_epi8(chunk, clamped)
         }
 
-        unsafe fn valid_mask(chunk: __m128i) -> __m128i {
-            unsafe {
-                let alpha_num = _mm_or_si128(
-                    _mm_or_si128(in_range(chunk, b'A', b'Z'), in_range(chunk, b'a', b'z')),
-                    in_range(chunk, b'0', b'9'),
-                );
-                let punct = _mm_or_si128(
+        #[target_feature(enable = "sse2")]
+        fn valid_mask(chunk: __m128i) -> __m128i {
+            let alpha_num = _mm_or_si128(
+                _mm_or_si128(in_range(chunk, b'A', b'Z'), in_range(chunk, b'a', b'z')),
+                in_range(chunk, b'0', b'9'),
+            );
+            let punct = _mm_or_si128(
+                _mm_or_si128(
                     _mm_or_si128(
-                        _mm_or_si128(
-                            _mm_or_si128(lane_eq(chunk, b'!'), lane_eq(chunk, b'#')),
-                            _mm_or_si128(lane_eq(chunk, b'$'), lane_eq(chunk, b'%')),
-                        ),
-                        _mm_or_si128(
-                            _mm_or_si128(lane_eq(chunk, b'&'), lane_eq(chunk, b'\'')),
-                            _mm_or_si128(lane_eq(chunk, b'*'), lane_eq(chunk, b'+')),
-                        ),
+                        _mm_or_si128(lane_eq(chunk, b'!'), lane_eq(chunk, b'#')),
+                        _mm_or_si128(lane_eq(chunk, b'$'), lane_eq(chunk, b'%')),
                     ),
                     _mm_or_si128(
-                        _mm_or_si128(
-                            _mm_or_si128(lane_eq(chunk, b'-'), lane_eq(chunk, b'.')),
-                            _mm_or_si128(lane_eq(chunk, b'^'), lane_eq(chunk, b'_')),
-                        ),
-                        _mm_or_si128(
-                            lane_eq(chunk, b'`'),
-                            _mm_or_si128(lane_eq(chunk, b'|'), lane_eq(chunk, b'~')),
-                        ),
+                        _mm_or_si128(lane_eq(chunk, b'&'), lane_eq(chunk, b'\'')),
+                        _mm_or_si128(lane_eq(chunk, b'*'), lane_eq(chunk, b'+')),
                     ),
-                );
-                _mm_or_si128(alpha_num, punct)
-            }
+                ),
+                _mm_or_si128(
+                    _mm_or_si128(
+                        _mm_or_si128(lane_eq(chunk, b'-'), lane_eq(chunk, b'.')),
+                        _mm_or_si128(lane_eq(chunk, b'^'), lane_eq(chunk, b'_')),
+                    ),
+                    _mm_or_si128(
+                        lane_eq(chunk, b'`'),
+                        _mm_or_si128(lane_eq(chunk, b'|'), lane_eq(chunk, b'~')),
+                    ),
+                ),
+            );
+            _mm_or_si128(alpha_num, punct)
         }
 
-        unsafe fn scan_header_name_sse2(bytes: &[u8], start: usize) -> HeaderNameOutcome {
+        #[target_feature(enable = "sse2")]
+        fn scan_header_name_sse2(bytes: &[u8], start: usize) -> HeaderNameOutcome {
             let mut idx = start;
             let len = bytes.len();
             while idx + 16 <= len {
                 // SAFETY: idx + 16 <= len bounds the 16-byte load inside bytes.
                 let chunk = unsafe { _mm_loadu_si128(bytes.as_ptr().add(idx) as *const __m128i) };
-                let hit_v = unsafe { _mm_or_si128(lane_eq(chunk, b':'), lane_eq(chunk, b'\r')) };
-                let valid_or_hit = unsafe { _mm_or_si128(valid_mask(chunk), hit_v) };
-                let hit = unsafe { _mm_movemask_epi8(hit_v) } as u32;
-                let invalid = unsafe { _mm_movemask_epi8(valid_or_hit) } as u32 ^ LANE_MASK;
+                let hit_v = _mm_or_si128(lane_eq(chunk, b':'), lane_eq(chunk, b'\r'));
+                let valid_or_hit = _mm_or_si128(valid_mask(chunk), hit_v);
+                let hit = _mm_movemask_epi8(hit_v) as u32;
+                let invalid = _mm_movemask_epi8(valid_or_hit) as u32 ^ LANE_MASK;
                 if invalid != 0 {
                     let inv_off = invalid.trailing_zeros();
                     if hit != 0 && hit.trailing_zeros() < inv_off {
