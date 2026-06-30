@@ -17,5 +17,8 @@ sark-gen.workspace = true
 dope.workspace = true
 http = "1.4.2"
 ring = "0.17"
-shin = "0.7"
+# Must track dope-quic's shin version: the tests build a SigningKey that is
+# passed straight into dope-quic's Conn::new_server, so it has to be the exact
+# same shin crate version that dope-quic compiles against.
+shin = "0.8"
 

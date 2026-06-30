@@ -421,9 +421,9 @@ dependencies = [
 
 [[package]]
 name = "dope-quic"
-version = "0.5.0"
+version = "0.5.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a61b598cd75cc71e9cf380dbfa88d6438bf9603acd2c50b86a27d793e25084fe"
+checksum = "cab4925ade745050e1c92a1d432e7e6b75ac4a7c1beff935e883b7b2b6aaf374"
 dependencies = [
  "dope",
  "dope-gen",
@@ -436,9 +436,9 @@ dependencies = [
 
 [[package]]
 name = "dope-tls"
-version = "0.8.0"
+version = "0.9.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "46cfc0e9cac6cc1975deab97fa718cdacc9fc0a5c0f14528cd6b2cfa26859cc3"
+checksum = "0a5af394c381626a55bd36b9c23e3af772966b2937b33ebccf9d4e73ae81a3c3"
 dependencies = [
  "dope",
  "libc",
@@ -1111,7 +1111,7 @@ dependencies = [
 
 [[package]]
 name = "sark"
-version = "0.8.4"
+version = "0.8.5"
 dependencies = [
  "cartel-gen",
  "cartel-pg",
@@ -1135,7 +1135,7 @@ dependencies = [
 
 [[package]]
 name = "sark-client"
-version = "0.8.4"
+version = "0.8.5"
 dependencies = [
  "cartel-core",
  "dope",
@@ -1150,7 +1150,7 @@ dependencies = [
 
 [[package]]
 name = "sark-core"
-version = "0.8.4"
+version = "0.8.5"
 dependencies = [
  "brotli",
  "criterion",
@@ -1167,7 +1167,7 @@ dependencies = [
 
 [[package]]
 name = "sark-gen"
-version = "0.8.4"
+version = "0.8.5"
 dependencies = [
  "dope",
  "o3",
@@ -1178,7 +1178,7 @@ dependencies = [
 
 [[package]]
 name = "sark-grpc"
-version = "0.8.4"
+version = "0.8.5"
 dependencies = [
  "dope",
  "dope-extra",
@@ -1194,14 +1194,14 @@ dependencies = [
 
 [[package]]
 name = "sark-grpc-build"
-version = "0.8.4"
+version = "0.8.5"
 dependencies = [
  "prost-build",
 ]
 
 [[package]]
 name = "sark-h2"
-version = "0.8.4"
+version = "0.8.5"
 dependencies = [
  "dope",
  "dope-extra",
@@ -1216,7 +1216,7 @@ dependencies = [
 
 [[package]]
 name = "sark-h3"
-version = "0.8.4"
+version = "0.8.5"
 dependencies = [
  "dope",
  "dope-quic",
@@ -1230,7 +1230,7 @@ dependencies = [
 
 [[package]]
 name = "sark-json"
-version = "0.8.4"
+version = "0.8.5"
 dependencies = [
  "http",
  "o3",
@@ -1239,7 +1239,7 @@ dependencies = [
 
 [[package]]
 name = "sark-ws"
-version = "0.8.4"
+version = "0.8.5"
 dependencies = [
  "dope",
  "dope-extra",
@@ -1330,9 +1330,9 @@ dependencies = [
 
 [[package]]
 name = "shin"
-version = "0.7.0"
+version = "0.8.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "05cab1b518ee86d87f298dc380d376159b46b0dcf5e02ab5c698410819efa9bb"
+checksum = "8b289f0257618060f758866cd162ff200dbce56cc2e0d7fce421e5d6e7577d97"
 dependencies = [
  "ml-kem",
  "rand_core",

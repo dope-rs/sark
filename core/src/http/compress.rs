@@ -1,8 +1,7 @@
-//! Built-in gzip response compression (libdeflater). `Gzip::with_thread_local`
-//! borrows a per-thread encoder (level 3) so a handler can compress a body when
-//! `Accept-Encoding` includes `gzip` without per-request allocation; `encode`
-//! returns the gzip bytes. This is sark's standard compression path — response
-//! bodies are never hand-rolled.
+//! Built-in gzip/brotli response compression. `with_thread_local` borrows a
+//! per-thread encoder so a handler can compress a body without per-request
+//! allocation; `encode` returns the compressed bytes. This is sark's standard
+//! compression path — response bodies are never hand-rolled.
 //!
 //! ```no_run
 //! use sark_core::http::compress::Gzip;
@@ -11,8 +10,15 @@
 //! ```
 
 use std::cell::RefCell;
+use std::thread::LocalKey;
 
 use libdeflater::{CompressionLvl, Compressor};
+
+const BUF_CAP: usize = 64 * 1024;
+
+fn with_slot<E, R>(slot: &'static LocalKey<RefCell<E>>, f: impl FnOnce(&mut E) -> R) -> R {
+    slot.with(|cell| f(&mut cell.borrow_mut()))
+}
 
 pub struct Gzip {
     encoder: Compressor,
@@ -20,19 +26,18 @@ pub struct Gzip {
 }
 
 impl Gzip {
+    const LEVEL: i32 = 3;
+
     fn new(level: i32) -> Self {
         let lvl = CompressionLvl::new(level).unwrap_or(CompressionLvl::fastest());
         Self {
             encoder: Compressor::new(lvl),
-            buf: Vec::with_capacity(64 * 1024),
+            buf: Vec::with_capacity(BUF_CAP),
         }
     }
 
     pub fn encode(&mut self, src: &[u8]) -> &[u8] {
         let cap = self.encoder.gzip_compress_bound(src.len());
-        if self.buf.capacity() < cap {
-            self.buf.reserve(cap - self.buf.capacity());
-        }
         self.buf.resize(cap, 0);
         let n = self
             .encoder
@@ -44,15 +49,14 @@ impl Gzip {
 
     pub fn with_thread_local<R>(f: impl FnOnce(&mut Gzip) -> R) -> R {
         thread_local! {
-            static SLOT: RefCell<Gzip> = RefCell::new(Gzip::new(3));
+            static SLOT: RefCell<Gzip> = RefCell::new(Gzip::new(Gzip::LEVEL));
         }
-        SLOT.with(|cell| f(&mut cell.borrow_mut()))
+        with_slot(&SLOT, f)
     }
 }
 
 /// Brotli response compression. `br` typically yields a smaller body than gzip
-/// for text/JSON. `with_thread_local` borrows a per-thread encoder so a handler
-/// compresses without per-request setup; `encode` returns the brotli bytes.
+/// for text/JSON.
 ///
 /// ```no_run
 /// use sark_core::http::compress::Brotli;
@@ -65,6 +69,10 @@ pub struct Brotli {
 }
 
 impl Brotli {
+    /// `5`/`22`: compression-ratio vs throughput balance for runtime JSON.
+    const QUALITY: i32 = 5;
+    const LGWIN: i32 = 22;
+
     fn new(quality: i32, lgwin: i32) -> Self {
         let params = brotli::enc::BrotliEncoderParams {
             quality,
@@ -73,12 +81,14 @@ impl Brotli {
         };
         Self {
             params,
-            buf: Vec::with_capacity(64 * 1024),
+            buf: Vec::with_capacity(BUF_CAP),
         }
     }
 
     pub fn encode(&mut self, src: &[u8]) -> &[u8] {
         self.buf.clear();
+        self.buf
+            .reserve(brotli::enc::BrotliEncoderMaxCompressedSize(src.len()));
         let mut reader = src;
         brotli::BrotliCompress(&mut reader, &mut self.buf, &self.params)
             .expect("brotli compress into Vec is infallible");
@@ -86,10 +96,9 @@ impl Brotli {
     }
 
     pub fn with_thread_local<R>(f: impl FnOnce(&mut Brotli) -> R) -> R {
-        // quality 5 / window 22: ratio/throughput balance for runtime JSON.
         thread_local! {
-            static SLOT: RefCell<Brotli> = RefCell::new(Brotli::new(5, 22));
+            static SLOT: RefCell<Brotli> = RefCell::new(Brotli::new(Brotli::QUALITY, Brotli::LGWIN));
         }
-        SLOT.with(|cell| f(&mut cell.borrow_mut()))
+        with_slot(&SLOT, f)
     }
 }
