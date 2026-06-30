@@ -45,6 +45,57 @@ cfg_select! {
             unsafe { unmask_tail(dst, src, i, len, mask) };
         }
     }
+    target_arch = "x86_64" => {
+        unsafe fn unmask_raw(dst: *mut u8, src: *const u8, len: usize, mask: [u8; 4]) {
+            if is_x86_feature_detected!("avx2") {
+                // SAFETY: guarded by the avx2 runtime check.
+                unsafe { unmask_avx2(dst, src, len, mask) }
+            } else {
+                // SAFETY: sse2 is guaranteed on the x86_64 baseline.
+                unsafe { unmask_sse2(dst, src, len, mask) }
+            }
+        }
+
+        #[target_feature(enable = "avx2")]
+        unsafe fn unmask_avx2(dst: *mut u8, src: *const u8, len: usize, mask: [u8; 4]) {
+            use core::arch::x86_64::{
+                __m128i, __m256i, _mm256_loadu_si256, _mm256_set1_epi32, _mm256_storeu_si256,
+                _mm256_xor_si256, _mm_loadu_si128, _mm_set1_epi32, _mm_storeu_si128, _mm_xor_si128,
+            };
+            let key = i32::from_ne_bytes(mask);
+            let key32 = _mm256_set1_epi32(key);
+            let mut i = 0;
+            while i + 32 <= len {
+                // SAFETY: i + 32 <= len bounds the 32-byte load/store windows.
+                let v = unsafe { _mm256_loadu_si256(src.add(i) as *const __m256i) };
+                unsafe { _mm256_storeu_si256(dst.add(i) as *mut __m256i, _mm256_xor_si256(v, key32)) };
+                i += 32;
+            }
+            if i + 16 <= len {
+                let key16 = _mm_set1_epi32(key);
+                // SAFETY: i + 16 <= len bounds the 16-byte load/store windows.
+                let v = unsafe { _mm_loadu_si128(src.add(i) as *const __m128i) };
+                unsafe { _mm_storeu_si128(dst.add(i) as *mut __m128i, _mm_xor_si128(v, key16)) };
+                i += 16;
+            }
+            unsafe { unmask_tail(dst, src, i, len, mask) };
+        }
+
+        unsafe fn unmask_sse2(dst: *mut u8, src: *const u8, len: usize, mask: [u8; 4]) {
+            use core::arch::x86_64::{
+                __m128i, _mm_loadu_si128, _mm_set1_epi32, _mm_storeu_si128, _mm_xor_si128,
+            };
+            let key = unsafe { _mm_set1_epi32(i32::from_ne_bytes(mask)) };
+            let mut i = 0;
+            while i + 16 <= len {
+                // SAFETY: i + 16 <= len bounds the 16-byte load/store windows.
+                let v = unsafe { _mm_loadu_si128(src.add(i) as *const __m128i) };
+                unsafe { _mm_storeu_si128(dst.add(i) as *mut __m128i, _mm_xor_si128(v, key)) };
+                i += 16;
+            }
+            unsafe { unmask_tail(dst, src, i, len, mask) };
+        }
+    }
     _ => {
         #[inline]
         unsafe fn unmask_raw(dst: *mut u8, src: *const u8, len: usize, mask: [u8; 4]) {
