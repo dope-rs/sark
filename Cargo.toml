@@ -18,16 +18,16 @@ members = [
 
 [workspace.package]
 edition = "2024"
-version = "0.8.5"
+version = "0.8.6"
 description = "the L7 layer for dope"
 repository = "https://github.com/dope-rs/sark"
 license = "MIT"
 authors = ["inq <gofiri@gmail.com>"]
 
 [workspace.dependencies]
-dope = "0.5"
-dope-extra = "0.5"
-dope-gen = "0.5"
+dope = "0.5.7"
+dope-extra = "0.5.7"
+dope-gen = "0.5.7"
 dope-tls = "0.9"
 o3 = "0.2"
 pin-project = "1"

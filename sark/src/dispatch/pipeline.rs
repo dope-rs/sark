@@ -400,8 +400,26 @@ impl Pipeline {
 
         let head_pending = out.head_pending;
         let overrun = Self::emit(slot, aux, driver, out, use_accum, bytes, &project);
+        if !overrun {
+            Self::drain_stream_body(slot, driver, &project);
+        }
         Self::manage_head_deadline(app, slot, driver, head_pending, &project);
         overrun
+    }
+
+    fn drain_stream_body<W, C, P>(
+        slot: &mut link::Slot<W, listener::State<C>>,
+        driver: &mut Driver,
+        project: &P,
+    ) where
+        W: Wire,
+        C: Default + 'static,
+        P: Fn(&mut C) -> &mut ConnState,
+    {
+        let remaining = project(&mut slot.state.conn).pipeline.stream_body_remaining;
+        if remaining > 0 && slot.begin_discard(remaining as u64, driver) {
+            project(&mut slot.state.conn).pipeline.stream_body_remaining = 0;
+        }
     }
 
     fn head_still_pending(state: &ConnState) -> bool {
