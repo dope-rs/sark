@@ -14,6 +14,7 @@ use dope::{Driver, DriverConfig, Executor, manifold};
 use dope_extra::Trigger;
 use dope_tls::{Endpoint, Tls};
 use sark_core::identity_mut;
+use sark_h2::tuning::Tuning;
 use sark_h2::{Conn, ErrorCode, ServerRole, StreamId, conn};
 
 use crate::Codec;
@@ -27,14 +28,16 @@ pub struct Config {
     pub max_message_len: usize,
     pub max_buffered_len: usize,
     pub max_buffered_msgs: usize,
+    pub max_conn_buffered_len: usize,
 }
 
 impl Default for Config {
     fn default() -> Self {
         Self {
             max_message_len: 4 * 1024 * 1024,
-            max_buffered_len: 16 * 1024 * 1024,
+            max_buffered_len: <Throughput as Tuning>::MAX_BODY_LEN,
             max_buffered_msgs: 8192,
+            max_conn_buffered_len: <Throughput as Tuning>::MAX_CONN_BUFFERED_LEN,
         }
     }
 }
@@ -882,6 +885,7 @@ pub struct ConnState {
     streams: BTreeMap<StreamId, StreamState>,
     pending: BTreeMap<StreamId, PendingResponse>,
     live_routes: StreamRoutes,
+    buffered_total: usize,
     probed: bool,
 }
 
@@ -892,6 +896,7 @@ impl Default for ConnState {
             streams: BTreeMap::new(),
             pending: BTreeMap::new(),
             live_routes: StreamRoutes::default(),
+            buffered_total: 0,
             probed: false,
         }
     }
@@ -986,7 +991,7 @@ impl<H: Handler, W: Wire> App<H, W> {
                 }
             }
             conn::Event::StreamReset { stream_id, .. } => {
-                state.streams.remove(&stream_id);
+                state.remove_stream(stream_id);
                 state.live_routes.release(stream_id);
             }
             _ => {}
@@ -1040,14 +1045,14 @@ impl<H: Handler, W: Wire> App<H, W> {
                 stream.trailers = metadata;
             }
             Err(status) => {
-                state.streams.remove(&stream_id);
+                state.remove_stream(stream_id);
                 state.send_error(stream_id, status);
             }
         }
     }
 
     fn on_data(&mut self, state: &mut ConnState, stream_id: StreamId, data: &[u8]) {
-        let (mode, messages, over_limit) = {
+        let (mode, messages, over_limit, added) = {
             let Some(stream) = state.streams.get_mut(&stream_id) else {
                 state.send_error(
                     stream_id,
@@ -1057,29 +1062,32 @@ impl<H: Handler, W: Wire> App<H, W> {
             };
             let before = stream.messages.len();
             if let Err(err) = stream.deframer.push(data, &mut stream.messages) {
-                state.streams.remove(&stream_id);
+                state.remove_stream(stream_id);
                 state.send_error(stream_id, Status::from_frame_err(err));
                 return;
             }
-            let over_limit = if stream.mode == StreamMode::Live {
-                false
+            let (over_limit, added) = if stream.mode == StreamMode::Live {
+                (false, 0)
             } else {
                 let added: usize = stream.messages[before..]
                     .iter()
                     .map(|message| message.payload.len())
                     .sum();
                 stream.buffered_len = stream.buffered_len.saturating_add(added);
-                stream.buffered_len > self.config.max_buffered_len
-                    || stream.messages.len() > self.config.max_buffered_msgs
+                let over = stream.buffered_len > self.config.max_buffered_len
+                    || stream.messages.len() > self.config.max_buffered_msgs;
+                (over, added)
             };
             (
                 stream.mode,
                 core::mem::take(&mut stream.messages),
                 over_limit,
+                added,
             )
         };
-        if over_limit {
-            state.streams.remove(&stream_id);
+        state.buffered_total = state.buffered_total.saturating_add(added);
+        if over_limit || state.buffered_total > self.config.max_conn_buffered_len {
+            state.remove_stream(stream_id);
             state.send_error(
                 stream_id,
                 Status::new(Code::ResourceExhausted, "stream buffer limit exceeded"),
@@ -1094,7 +1102,7 @@ impl<H: Handler, W: Wire> App<H, W> {
         }
         for message in messages {
             if message.compressed {
-                state.streams.remove(&stream_id);
+                state.remove_stream(stream_id);
                 state.send_error(stream_id, compression_unsupported());
                 return;
             }
@@ -1107,7 +1115,7 @@ impl<H: Handler, W: Wire> App<H, W> {
     }
 
     fn finish_stream(&mut self, state: &mut ConnState, stream_id: StreamId) {
-        let Some(stream) = state.streams.remove(&stream_id) else {
+        let Some(stream) = state.remove_stream(stream_id) else {
             return;
         };
         if stream.mode == StreamMode::Live {
@@ -1273,6 +1281,12 @@ impl<H: Handler, W: Wire> Application for App<H, W> {
 }
 
 impl ConnState {
+    fn remove_stream(&mut self, stream_id: StreamId) -> Option<StreamState> {
+        let stream = self.streams.remove(&stream_id)?;
+        self.buffered_total = self.buffered_total.saturating_sub(stream.buffered_len);
+        Some(stream)
+    }
+
     fn enqueue_response(&mut self, stream_id: StreamId, response: Response) {
         let reply = StreamReply {
             metadata: response.metadata,
@@ -1552,21 +1566,25 @@ mod tests {
             max_message_len: 1 << 20,
             max_buffered_len: 1000,
             max_buffered_msgs: 1 << 20,
+            max_conn_buffered_len: 2500,
         };
         let mut app = App::<Nop>::with_config(Nop, cfg.clone());
         let mut state = ConnState::default();
-        state.streams.insert(
-            StreamId(1),
-            StreamState {
-                head: head(b"/svc"),
-                deframer: Deframer::new(cfg.max_message_len),
-                messages: Vec::new(),
-                trailers: Metadata::new(),
-                mode: StreamMode::Buffered,
-                buffered_len: 0,
-            },
-        );
+        let open = |state: &mut ConnState, id: u32| {
+            state.streams.insert(
+                StreamId(id),
+                StreamState {
+                    head: head(b"/svc"),
+                    deframer: Deframer::new(cfg.max_message_len),
+                    messages: Vec::new(),
+                    trailers: Metadata::new(),
+                    mode: StreamMode::Buffered,
+                    buffered_len: 0,
+                },
+            );
+        };
 
+        open(&mut state, 1);
         app.on_data(&mut state, StreamId(1), &framed_messages(5, 100));
         assert_eq!(
             state
@@ -1580,7 +1598,35 @@ mod tests {
         app.on_data(&mut state, StreamId(1), &framed_messages(6, 100));
         assert!(
             !state.streams.contains_key(&StreamId(1)),
-            "buffered stream exceeding the cap must be dropped to bound memory"
+            "stream over its per-stream cap must be dropped to bound memory"
+        );
+        assert_eq!(
+            state.buffered_total, 0,
+            "dropping a stream must release its bytes from the connection budget"
+        );
+
+        open(&mut state, 3);
+        open(&mut state, 5);
+        open(&mut state, 7);
+        app.on_data(&mut state, StreamId(3), &framed_messages(9, 100));
+        app.on_data(&mut state, StreamId(5), &framed_messages(9, 100));
+        assert_eq!(state.buffered_total, 1800);
+
+        app.on_data(&mut state, StreamId(7), &framed_messages(9, 100));
+        assert!(
+            !state.streams.contains_key(&StreamId(7)),
+            "a stream tipping the connection-wide cap must be dropped even while under its own cap"
+        );
+        assert_eq!(
+            state.buffered_total, 1800,
+            "the dropped stream's bytes must return to the connection budget"
+        );
+
+        open(&mut state, 9);
+        app.on_data(&mut state, StreamId(9), &framed_messages(6, 100));
+        assert!(
+            state.streams.contains_key(&StreamId(9)),
+            "budget freed by the drop must admit a fresh stream under the cap"
         );
     }
 }

@@ -92,11 +92,7 @@ impl<H: Handler> connector::Session for Session<H> {
             return;
         }
         while let Some(ev) = conn.poll_event() {
-            let release = ev.release_hint();
             self.handler.on_event(ev, conn);
-            if let Some((stream_id, n)) = release {
-                let _ = conn.release_capacity(stream_id, n);
-            }
         }
         Self::drain_into(conn, ctx.sink);
     }

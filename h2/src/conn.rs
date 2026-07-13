@@ -1,12 +1,15 @@
 use core::marker::PhantomData;
 use std::collections::{BTreeMap, VecDeque};
 
+use dope::runtime::profile::Throughput;
+
 use crate::frame::{
     self, Continuation, Data, ErrorCode, Flags, FrameHeader, GoAway, HEADER_LEN, Headers,
     ParseError, Ping, Priority, PushPromise, RstStream, SettingId, WindowUpdate,
 };
 use crate::role::Role;
 use crate::stream::{self, Side, Stream, StreamId, TransitionError};
+use crate::tuning::Tuning;
 use crate::validate::Validate;
 use crate::{flow, hpack};
 
@@ -211,17 +214,6 @@ pub enum Event {
     },
 }
 
-impl Event {
-    pub(super) fn release_hint(&self) -> Option<(StreamId, usize)> {
-        match self {
-            Event::Data {
-                stream_id, data, ..
-            } => Some((*stream_id, data.len())),
-            _ => None,
-        }
-    }
-}
-
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum PendingKind {
     Headers { end_stream: bool, trailing: bool },
@@ -261,6 +253,7 @@ pub struct Conn<R: Role> {
 
     send_window: flow::Window,
     recv_window: flow::Window,
+    recv_window_target: u32,
 
     events: VecDeque<Event>,
 
@@ -282,10 +275,20 @@ pub struct Conn<R: Role> {
 
 impl<R: Role> Conn<R> {
     pub fn new() -> Self {
-        Self::with_local_settings(Settings::DEFAULT)
+        Self::with_tuning::<Throughput>()
     }
 
-    pub fn with_local_settings(local: Settings) -> Self {
+    pub fn with_tuning<P: Tuning>() -> Self {
+        Self::with_local_settings(
+            Settings {
+                initial_window_size: P::STREAM_RECV_WINDOW,
+                ..Settings::DEFAULT
+            },
+            P::CONN_RECV_WINDOW,
+        )
+    }
+
+    pub fn with_local_settings(local: Settings, recv_window_target: u32) -> Self {
         let peer = Settings::DEFAULT;
         let mut local = local;
         if R::IS_SERVER {
@@ -313,6 +316,7 @@ impl<R: Role> Conn<R> {
             peer_settings: peer,
             send_window: flow::Window::new(),
             recv_window: flow::Window::new(),
+            recv_window_target,
             events: VecDeque::new(),
             encoder: hpack::Encoder::new(local.header_table_size as usize),
             decoder,
@@ -336,6 +340,10 @@ impl<R: Role> Conn<R> {
         }
         conn.emit_initial_settings();
         conn.initial_settings_sent = true;
+        let bump = recv_window_target.saturating_sub(flow::Window::INITIAL as u32);
+        if bump > 0 && conn.recv_window.increase(bump).is_ok() {
+            conn.emit_window_update(StreamId::CONNECTION, bump);
+        }
         conn
     }
 
@@ -1028,6 +1036,7 @@ impl<R: Role> Conn<R> {
                 .ok_or(ConnError::Protocol)?;
             sw.consume(n).map_err(|_| ConnError::FlowControl)?;
         }
+        self.replenish_recv(stream_id, n)?;
         match self.advance_stream(stream_id, stream::Event::Data { end_stream }, Side::Remote) {
             Ok(()) => {}
             Err(TransitionError::Protocol) => return Err(ConnError::Protocol),
@@ -1044,12 +1053,12 @@ impl<R: Role> Conn<R> {
         Ok(())
     }
 
-    pub fn release_capacity(&mut self, stream_id: StreamId, n: usize) -> Result<(), ConnError> {
+    fn replenish_recv(&mut self, stream_id: StreamId, n: usize) -> Result<(), ConnError> {
         if n == 0 {
             return Ok(());
         }
         let n32 = u32::try_from(n).map_err(|_| ConnError::FlowControl)?;
-        let conn_threshold = (self.local_settings.initial_window_size / 2).max(1);
+        let conn_threshold = (self.recv_window_target / 2).max(1);
         self.conn_pending_release = self.conn_pending_release.saturating_add(n32);
         if self.conn_pending_release >= conn_threshold {
             let inc = self.conn_pending_release;

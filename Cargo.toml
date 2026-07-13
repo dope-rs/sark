@@ -18,7 +18,7 @@ members = [
 
 [workspace.package]
 edition = "2024"
-version = "0.8.6"
+version = "0.8.7"
 description = "the L7 layer for dope"
 repository = "https://github.com/dope-rs/sark"
 license = "MIT"

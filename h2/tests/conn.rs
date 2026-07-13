@@ -129,8 +129,8 @@ fn server_chunked_preface_then_event() {
 #[test]
 fn server_peer_settings_applied_emits_ack_and_event() {
     let mut conn = server();
-    let (_h, init_total) = drain_initial_settings_frame(conn.outbound());
-    conn.drain_outbound(init_total);
+    let (_h, _init_total) = drain_initial_settings_frame(conn.outbound());
+    conn.drain_outbound(conn.outbound().len());
     conn.ingest(CLIENT_PREFACE).unwrap();
     assert_eq!(conn.poll_event().unwrap(), conn::Event::PrefaceComplete);
 

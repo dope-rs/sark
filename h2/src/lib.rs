@@ -8,6 +8,7 @@ pub mod frame;
 pub mod hpack;
 pub mod server;
 pub mod stream;
+pub mod tuning;
 
 pub use conn::{CLIENT_PREFACE, Conn, ConnError, Settings};
 pub use frame::{ErrorCode, Flags, Frame, FrameHeader};

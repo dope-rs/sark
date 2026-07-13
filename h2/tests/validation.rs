@@ -15,17 +15,23 @@ fn client() -> Conn<ClientRole> {
 }
 
 fn client_with_header_list_limit(max: u32) -> Conn<ClientRole> {
-    Conn::<ClientRole>::with_local_settings(Settings {
-        max_header_list_size: Some(max),
-        ..Settings::DEFAULT
-    })
+    Conn::<ClientRole>::with_local_settings(
+        Settings {
+            max_header_list_size: Some(max),
+            ..Settings::DEFAULT
+        },
+        65_535,
+    )
 }
 
 fn server_with_header_list_limit(max: u32) -> Conn<ServerRole> {
-    Conn::<ServerRole>::with_local_settings(Settings {
-        max_header_list_size: Some(max),
-        ..Settings::DEFAULT
-    })
+    Conn::<ServerRole>::with_local_settings(
+        Settings {
+            max_header_list_size: Some(max),
+            ..Settings::DEFAULT
+        },
+        65_535,
+    )
 }
 
 fn prime_server(conn: &mut Conn<ServerRole>) {

@@ -340,7 +340,13 @@ fn continuation_wrong_stream_id_errors() {
 
 #[test]
 fn data_recv_emits_event_and_window_updates() {
-    let mut conn = server();
+    let mut conn = Conn::<ServerRole>::with_local_settings(
+        Settings {
+            initial_window_size: 20_000,
+            ..Settings::DEFAULT
+        },
+        20_000,
+    );
     prime_server(&mut conn);
 
     let block = encode_hpack(&[
@@ -396,18 +402,83 @@ fn data_recv_emits_event_and_window_updates() {
     };
 
     assert_eq!(count_wu(conn.outbound()), 0);
-
-    conn.release_capacity(StreamId(1), payload.len()).unwrap();
-    assert_eq!(count_wu(conn.outbound()), 0);
-
     conn.drain_outbound(conn.outbound().len());
-    for _ in 0..3 {
-        let chunk = vec![0u8; 12_000];
-        conn.ingest(&data_frame_bytes(1, false, &chunk)).unwrap();
-        let _ = conn.poll_event().unwrap();
-        conn.release_capacity(StreamId(1), chunk.len()).unwrap();
-    }
+
+    let chunk = vec![0u8; 12_000];
+    conn.ingest(&data_frame_bytes(1, false, &chunk)).unwrap();
+    let _ = conn.poll_event().unwrap();
     assert_eq!(count_wu(conn.outbound()), 2);
+}
+
+fn conn_window_update_increment(out: &[u8]) -> Option<u32> {
+    let mut pos = 0;
+    while pos < out.len() {
+        let h = FrameHeader::parse(&out[pos..]).unwrap();
+        if h.kind == frame::Type::WindowUpdate && h.stream_id == StreamId(0) {
+            let b = &out[pos + 9..pos + 13];
+            return Some(u32::from_be_bytes([b[0], b[1], b[2], b[3]]) & 0x7fff_ffff);
+        }
+        pos += 9 + h.length as usize;
+    }
+    None
+}
+
+#[test]
+fn initial_handshake_bumps_connection_window() {
+    let conn = server();
+    let target = conn.recv_window().available() as u32;
+    let inc = conn_window_update_increment(conn.outbound())
+        .expect("handshake emits a connection WINDOW_UPDATE");
+    assert!(inc > 0);
+    assert_eq!(inc, target - 65_535);
+}
+
+#[test]
+fn sustained_upload_auto_replenishes_without_stall() {
+    let mut conn = Conn::<ServerRole>::with_local_settings(
+        Settings {
+            initial_window_size: 40_000,
+            ..Settings::DEFAULT
+        },
+        40_000,
+    );
+    prime_server(&mut conn);
+
+    let block = encode_hpack(&[
+        Header {
+            name: b":method",
+            value: b"POST",
+        },
+        Header {
+            name: b":scheme",
+            value: b"http",
+        },
+        Header {
+            name: b":path",
+            value: b"/",
+        },
+        Header {
+            name: b":authority",
+            value: b"x",
+        },
+    ]);
+    conn.ingest(&headers_frame_bytes(1, false, true, &block))
+        .unwrap();
+    let _ = conn.poll_event().unwrap();
+    conn.drain_outbound(conn.outbound().len());
+
+    let mut delivered = 0usize;
+    for _ in 0..20 {
+        let chunk = vec![7u8; 10_000];
+        conn.ingest(&data_frame_bytes(1, false, &chunk)).unwrap();
+        while let Some(ev) = conn.poll_event() {
+            if let conn::Event::Data { data, .. } = ev {
+                delivered += data.len();
+            }
+        }
+    }
+    assert_eq!(delivered, 200_000);
+    assert!(conn_window_update_increment(conn.outbound()).is_some());
 }
 
 #[test]
@@ -448,7 +519,7 @@ fn data_end_stream_to_half_closed_remote() {
 fn data_exceeding_recv_window_flow_control() {
     let mut local = Settings::DEFAULT;
     local.max_frame_size = 16_777_215;
-    let mut conn = Conn::<ServerRole>::with_local_settings(local);
+    let mut conn = Conn::<ServerRole>::with_local_settings(local, 65_535);
     conn.drain_outbound(conn.outbound().len());
     conn.ingest(CLIENT_PREFACE).unwrap();
     while conn.poll_event().is_some() {}
@@ -504,7 +575,7 @@ fn frame_exceeding_max_frame_size_errors() {
 fn max_concurrent_streams_refuses_new() {
     let mut local = Settings::DEFAULT;
     local.max_concurrent_streams = Some(3);
-    let mut conn = Conn::<ServerRole>::with_local_settings(local);
+    let mut conn = Conn::<ServerRole>::with_local_settings(local, 65_535);
     conn.drain_outbound(conn.outbound().len());
     conn.ingest(CLIENT_PREFACE).unwrap();
     while conn.poll_event().is_some() {}

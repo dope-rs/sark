@@ -7,18 +7,24 @@ use dope::Driver;
 use dope::fiber::{Fiber, Slab, TaskId};
 use dope::manifold::Outcome;
 use dope::manifold::listener::{self, Application};
+use dope::runtime::profile::Throughput;
 use dope::transport::link::Slot;
 use dope::transport::wire::{Identity, RecvChunk, Wire};
 use o3::buffer::Shared;
 
-use crate::conn::{self, Conn, ConnError, Settings};
+use crate::conn::{self, Conn, ConnError};
 use crate::frame::ErrorCode;
 use crate::hpack::{Header, OwnedHeader};
 use crate::role::ServerRole;
 use crate::stream::StreamId;
+use crate::tuning::Tuning;
+
+type ServerProfile = Throughput;
 
 pub const HANDLER_SLAB_CAP: usize = 256;
 const OUTBOUND_SOFT_CAP: usize = 64 * 1024;
+const MAX_BODY_LEN: usize = <ServerProfile as Tuning>::MAX_BODY_LEN;
+const MAX_CONN_BUFFERED_LEN: usize = <ServerProfile as Tuning>::MAX_CONN_BUFFERED_LEN;
 
 pub struct Request {
     pub headers: Vec<OwnedHeader>,
@@ -113,19 +119,26 @@ pub struct ConnState {
     incoming: BTreeMap<StreamId, Incoming>,
     pending: Vec<PendingBody>,
     waiting: Vec<(StreamId, TaskId)>,
+    buffered_total: usize,
 }
 
 impl Default for ConnState {
     fn default() -> Self {
         Self {
-            conn: Conn::<ServerRole>::with_local_settings(Settings {
-                max_concurrent_streams: Some(256),
-                ..Settings::DEFAULT
-            }),
+            conn: Conn::<ServerRole>::with_tuning::<ServerProfile>(),
             incoming: BTreeMap::new(),
             pending: Vec::new(),
             waiting: Vec::new(),
+            buffered_total: 0,
         }
+    }
+}
+
+impl ConnState {
+    fn take_incoming(&mut self, stream_id: StreamId) -> Option<Incoming> {
+        let inc = self.incoming.remove(&stream_id)?;
+        self.buffered_total = self.buffered_total.saturating_sub(inc.body.len());
+        Some(inc)
     }
 }
 
@@ -248,7 +261,6 @@ impl<'h, H: Handler, W: Wire> App<'h, H, W> {
         let waker = slot.make_waker(driver);
         let mut cx = Context::from_waker(&waker);
         while let Some(ev) = cstate.conn.poll_event() {
-            let release = ev.release_hint();
             match ev {
                 conn::Event::Headers {
                     stream_id,
@@ -257,9 +269,7 @@ impl<'h, H: Handler, W: Wire> App<'h, H, W> {
                     trailing,
                 } => {
                     if trailing {
-                        // Trailers terminate a bodied request: flush whatever was
-                        // buffered, appending the trailer fields to the head list.
-                        if let Some(mut inc) = cstate.incoming.remove(&stream_id) {
+                        if let Some(mut inc) = cstate.take_incoming(stream_id) {
                             inc.headers.extend(headers);
                             self.dispatch(cstate, stream_id, inc.into(), &mut cx);
                         }
@@ -285,16 +295,25 @@ impl<'h, H: Handler, W: Wire> App<'h, H, W> {
                     end_stream,
                 } => {
                     if end_stream {
-                        if let Some(mut inc) = cstate.incoming.remove(&stream_id) {
+                        if let Some(mut inc) = cstate.take_incoming(stream_id) {
                             inc.body.extend_from_slice(&data);
                             self.dispatch(cstate, stream_id, inc.into(), &mut cx);
                         }
                     } else if let Some(inc) = cstate.incoming.get_mut(&stream_id) {
                         inc.body.extend_from_slice(&data);
+                        let body_len = inc.body.len();
+                        cstate.buffered_total += data.len();
+                        if body_len > MAX_BODY_LEN || cstate.buffered_total > MAX_CONN_BUFFERED_LEN
+                        {
+                            cstate.take_incoming(stream_id);
+                            let _ = cstate
+                                .conn
+                                .reset_stream(stream_id, ErrorCode::EnhanceYourCalm);
+                        }
                     }
                 }
                 conn::Event::StreamReset { stream_id, .. } => {
-                    cstate.incoming.remove(&stream_id);
+                    cstate.take_incoming(stream_id);
                     cstate.pending.retain(|p| p.stream_id != stream_id);
                     if let Some(pos) = cstate.waiting.iter().position(|(s, _)| *s == stream_id) {
                         let (_, task) = cstate.waiting.swap_remove(pos);
@@ -303,11 +322,7 @@ impl<'h, H: Handler, W: Wire> App<'h, H, W> {
                 }
                 _ => {}
             }
-            if let Some((stream_id, n)) = release {
-                let _ = cstate.conn.release_capacity(stream_id, n);
-            }
         }
-        // Window updates in this batch are coalesced into one resume pass.
         Self::resume_pending(cstate);
     }
 

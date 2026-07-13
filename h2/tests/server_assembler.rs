@@ -131,7 +131,6 @@ fn round_trip(
                     end_stream,
                 } if stream_id == sid => {
                     body.extend_from_slice(&data);
-                    let _ = client.release_capacity(stream_id, data.len());
                     if end_stream {
                         break 'outer;
                     }
