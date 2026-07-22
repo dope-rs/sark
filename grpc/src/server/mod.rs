@@ -1,4 +1,5 @@
 use std::io;
+use std::marker::PhantomData;
 use std::net::SocketAddr;
 use std::pin::Pin;
 
@@ -392,6 +393,49 @@ pub trait Handler: 'static {
     fn request(&mut self, request: Request<'_>, response: &mut Response);
 }
 
+/// A route handler that borrows one service owned by its dispatcher.
+///
+/// Unlike cloning a reference-counted interior-mutable handle into every
+/// route, this makes the single mutable service borrow explicit at dispatch
+/// and has no runtime ownership or borrow bookkeeping.
+pub trait ServiceHandler<S>: 'static {
+    fn start(
+        &mut self,
+        service: &mut S,
+        routes: &mut StreamRoutes,
+        stream_id: StreamId,
+        head: &RequestHead,
+        reply: &mut StreamReply,
+    ) -> StreamMode {
+        let _ = (service, routes, stream_id, head, reply);
+        StreamMode::Buffered
+    }
+
+    fn message(
+        &mut self,
+        service: &mut S,
+        routes: &mut StreamRoutes,
+        stream_id: StreamId,
+        message: MessageFrame,
+        reply: &mut StreamReply,
+    ) {
+        let _ = (service, routes, stream_id, message, reply);
+    }
+
+    fn trailers(
+        &mut self,
+        service: &mut S,
+        routes: &mut StreamRoutes,
+        stream_id: StreamId,
+        trailers: Metadata,
+        reply: &mut StreamReply,
+    ) {
+        let _ = (service, routes, stream_id, trailers, reply);
+    }
+
+    fn request(&mut self, service: &mut S, request: Request<'_>, response: &mut Response);
+}
+
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum StreamMode {
     Buffered,
@@ -551,6 +595,105 @@ impl<H: Handler> Handler for Routes<H> {
     }
 }
 
+/// Path dispatcher that owns its service exactly once.
+pub struct ServiceRoutes<S, H: ServiceHandler<S>> {
+    service: S,
+    routes: Vec<ServiceRoute<H>>,
+}
+
+struct ServiceRoute<H> {
+    path: Vec<u8>,
+    handler: H,
+}
+
+impl<S, H: ServiceHandler<S>> ServiceRoutes<S, H> {
+    pub fn new(service: S) -> Self {
+        Self {
+            service,
+            routes: Vec::new(),
+        }
+    }
+
+    pub fn push(&mut self, path: &[u8], handler: H) {
+        self.routes.push(ServiceRoute {
+            path: path.to_vec(),
+            handler,
+        });
+    }
+}
+
+impl<S: 'static, H: ServiceHandler<S>> Handler for ServiceRoutes<S, H> {
+    fn start(
+        &mut self,
+        routes: &mut StreamRoutes,
+        stream_id: StreamId,
+        head: &RequestHead,
+        reply: &mut StreamReply,
+    ) -> StreamMode {
+        let Some(route_idx) = self.routes.iter().position(|route| route.path == head.path) else {
+            return StreamMode::Buffered;
+        };
+        let mode =
+            self.routes[route_idx]
+                .handler
+                .start(&mut self.service, routes, stream_id, head, reply);
+        if mode == StreamMode::Live {
+            routes.bind(stream_id, route_idx);
+        }
+        mode
+    }
+
+    fn message(
+        &mut self,
+        routes: &mut StreamRoutes,
+        stream_id: StreamId,
+        message: MessageFrame,
+        reply: &mut StreamReply,
+    ) {
+        let Some(route_idx) = routes.route(stream_id) else {
+            return;
+        };
+        self.routes[route_idx].handler.message(
+            &mut self.service,
+            routes,
+            stream_id,
+            message,
+            reply,
+        );
+    }
+
+    fn trailers(
+        &mut self,
+        routes: &mut StreamRoutes,
+        stream_id: StreamId,
+        trailers: Metadata,
+        reply: &mut StreamReply,
+    ) {
+        let Some(route_idx) = routes.release(stream_id) else {
+            return;
+        };
+        self.routes[route_idx].handler.trailers(
+            &mut self.service,
+            routes,
+            stream_id,
+            trailers,
+            reply,
+        );
+    }
+
+    fn request(&mut self, request: Request<'_>, response: &mut Response) {
+        let Some(route) = self
+            .routes
+            .iter_mut()
+            .find(|route| route.path == request.head.path)
+        else {
+            response.status = Status::new(Code::Unimplemented, "unknown gRPC method");
+            return;
+        };
+        route.handler.request(&mut self.service, request, response);
+    }
+}
+
 fn dispatch_request(
     handler: &mut (impl Handler + ?Sized),
     stream_id: StreamId,
@@ -670,6 +813,18 @@ pub trait UnaryHandler: 'static {
     fn unary(&mut self, request: UnaryRequest<Self::Request>) -> UnaryResponse<Self::Response>;
 }
 
+pub trait UnaryService<S>: 'static {
+    type Request;
+    type Response;
+    type Codec: Codec<Decode = Self::Request, Encode = Self::Response>;
+
+    fn unary(
+        &mut self,
+        service: &mut S,
+        request: UnaryRequest<Self::Request>,
+    ) -> UnaryResponse<Self::Response>;
+}
+
 #[derive(Clone, Debug)]
 pub struct StreamingRequest<T> {
     pub stream_id: StreamId,
@@ -713,6 +868,18 @@ pub trait StreamingHandler: 'static {
 
     fn stream(
         &mut self,
+        request: StreamingRequest<Self::Request>,
+    ) -> StreamingResponse<Self::Response>;
+}
+
+pub trait StreamingService<S>: 'static {
+    type Request;
+    type Response;
+    type Codec: Codec<Decode = Self::Request, Encode = Self::Response>;
+
+    fn stream(
+        &mut self,
+        service: &mut S,
         request: StreamingRequest<Self::Request>,
     ) -> StreamingResponse<Self::Response>;
 }
@@ -804,6 +971,18 @@ pub struct Streaming<H: StreamingHandler> {
     codec: H::Codec,
 }
 
+pub struct ServiceUnary<S, H: UnaryService<S>> {
+    handler: H,
+    codec: H::Codec,
+    service: PhantomData<fn(&mut S)>,
+}
+
+pub struct ServiceStreaming<S, H: StreamingService<S>> {
+    handler: H,
+    codec: H::Codec,
+    service: PhantomData<fn(&mut S)>,
+}
+
 pub struct LiveStreaming<H: LiveStreamingHandler> {
     handler: H,
     codec: H::Codec,
@@ -821,83 +1000,139 @@ impl<H: StreamingHandler> Streaming<H> {
     }
 }
 
+impl<S, H: UnaryService<S>> ServiceUnary<S, H> {
+    pub fn new(handler: H, codec: H::Codec) -> Self {
+        Self {
+            handler,
+            codec,
+            service: PhantomData,
+        }
+    }
+}
+
+impl<S, H: StreamingService<S>> ServiceStreaming<S, H> {
+    pub fn new(handler: H, codec: H::Codec) -> Self {
+        Self {
+            handler,
+            codec,
+            service: PhantomData,
+        }
+    }
+}
+
 impl<H: LiveStreamingHandler> LiveStreaming<H> {
     pub fn new(handler: H, codec: H::Codec) -> Self {
         Self { handler, codec }
     }
 }
 
-impl<H: UnaryHandler> Handler for Unary<H> {
-    fn request(&mut self, request: Request<'_>, response: &mut Response) {
-        let mut messages = request.messages.iter();
-        let Some(message) = messages.next() else {
-            response.status = Status::new(Code::InvalidArgument, "unary request needs one message");
-            return;
-        };
-        if messages.next().is_some() {
-            response.status = Status::new(Code::InvalidArgument, "unary request needs one message");
+fn dispatch_unary<C: Codec>(
+    codec: &mut C,
+    request: Request<'_>,
+    response: &mut Response,
+    invoke: impl FnOnce(UnaryRequest<C::Decode>) -> UnaryResponse<C::Encode>,
+) {
+    let mut messages = request.messages.iter();
+    let Some(message) = messages.next() else {
+        response.status = Status::new(Code::InvalidArgument, "unary request needs one message");
+        return;
+    };
+    if messages.next().is_some() {
+        response.status = Status::new(Code::InvalidArgument, "unary request needs one message");
+        return;
+    }
+    let decoded = match codec.decode(message.payload.as_slice()) {
+        Ok(decoded) => decoded,
+        Err(status) => {
+            response.status = status;
             return;
         }
-        let decoded = match self.codec.decode(message.payload.as_slice()) {
-            Ok(decoded) => decoded,
+    };
+    let unary_response = invoke(UnaryRequest {
+        stream_id: request.stream_id,
+        head: request.head,
+        message: decoded,
+        trailers: request.trailers,
+    });
+    response.metadata = unary_response.metadata;
+    response.trailers = unary_response.trailers;
+    response.status = unary_response.status;
+    if let Some(message) = unary_response.message {
+        let mut encoded = Vec::new();
+        match codec.encode(&message, &mut encoded) {
+            Ok(()) => response.push_message(encoded),
+            Err(status) => response.status = status,
+        }
+    }
+}
+
+fn dispatch_streaming<C: Codec>(
+    codec: &mut C,
+    request: Request<'_>,
+    response: &mut Response,
+    invoke: impl FnOnce(StreamingRequest<C::Decode>) -> StreamingResponse<C::Encode>,
+) {
+    let mut messages = Vec::with_capacity(request.messages.len());
+    for message in request.messages.iter() {
+        match codec.decode(message.payload.as_slice()) {
+            Ok(decoded) => messages.push(decoded),
             Err(status) => {
                 response.status = status;
                 return;
             }
-        };
-        let unary_request = UnaryRequest {
-            stream_id: request.stream_id,
-            head: request.head,
-            message: decoded,
-            trailers: request.trailers,
-        };
-        let unary_response = self.handler.unary(unary_request);
-        response.metadata = unary_response.metadata;
-        response.trailers = unary_response.trailers;
-        response.status = unary_response.status;
-        if let Some(message) = unary_response.message {
-            let mut encoded = Vec::new();
-            match self.codec.encode(&message, &mut encoded) {
-                Ok(()) => response.push_message(encoded),
-                Err(status) => response.status = status,
+        }
+    }
+    let stream_response = invoke(StreamingRequest {
+        stream_id: request.stream_id,
+        head: request.head,
+        messages,
+        trailers: request.trailers,
+    });
+    response.metadata = stream_response.metadata;
+    response.trailers = stream_response.trailers;
+    response.status = stream_response.status;
+    for message in stream_response.messages {
+        let mut encoded = Vec::new();
+        match codec.encode(&message, &mut encoded) {
+            Ok(()) => response.push_message(encoded),
+            Err(status) => {
+                response.status = status;
+                response.messages.clear();
+                return;
             }
         }
     }
 }
 
+impl<H: UnaryHandler> Handler for Unary<H> {
+    fn request(&mut self, request: Request<'_>, response: &mut Response) {
+        dispatch_unary(&mut self.codec, request, response, |request| {
+            self.handler.unary(request)
+        });
+    }
+}
+
 impl<H: StreamingHandler> Handler for Streaming<H> {
     fn request(&mut self, request: Request<'_>, response: &mut Response) {
-        let mut messages = Vec::with_capacity(request.messages.len());
-        for message in request.messages.iter() {
-            match self.codec.decode(message.payload.as_slice()) {
-                Ok(decoded) => messages.push(decoded),
-                Err(status) => {
-                    response.status = status;
-                    return;
-                }
-            }
-        }
-        let stream_request = StreamingRequest {
-            stream_id: request.stream_id,
-            head: request.head,
-            messages,
-            trailers: request.trailers,
-        };
-        let stream_response = self.handler.stream(stream_request);
-        response.metadata = stream_response.metadata;
-        response.trailers = stream_response.trailers;
-        response.status = stream_response.status;
-        for message in stream_response.messages {
-            let mut encoded = Vec::new();
-            match self.codec.encode(&message, &mut encoded) {
-                Ok(()) => response.push_message(encoded),
-                Err(status) => {
-                    response.status = status;
-                    response.messages.clear();
-                    return;
-                }
-            }
-        }
+        dispatch_streaming(&mut self.codec, request, response, |request| {
+            self.handler.stream(request)
+        });
+    }
+}
+
+impl<S: 'static, H: UnaryService<S>> ServiceHandler<S> for ServiceUnary<S, H> {
+    fn request(&mut self, service: &mut S, request: Request<'_>, response: &mut Response) {
+        dispatch_unary(&mut self.codec, request, response, |request| {
+            self.handler.unary(service, request)
+        });
+    }
+}
+
+impl<S: 'static, H: StreamingService<S>> ServiceHandler<S> for ServiceStreaming<S, H> {
+    fn request(&mut self, service: &mut S, request: Request<'_>, response: &mut Response) {
+        dispatch_streaming(&mut self.codec, request, response, |request| {
+            self.handler.stream(service, request)
+        });
     }
 }
 

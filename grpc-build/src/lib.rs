@@ -1,9 +1,12 @@
-use std::fmt::Write;
 use std::io;
 use std::path::Path;
 
+use heck::{ToSnakeCase, ToUpperCamelCase};
+use proc_macro2::{Ident, Literal, Span, TokenStream};
 pub use prost_build;
 use prost_build::{Method, Service, ServiceGenerator};
+use quote::{format_ident, quote};
+use syn::Type;
 
 pub struct Config {
     prost: prost_build::Config,
@@ -47,353 +50,427 @@ pub struct SarkServiceGenerator;
 
 impl ServiceGenerator for SarkServiceGenerator {
     fn generate(&mut self, service: Service, buf: &mut String) {
-        generate_service(&service, buf);
+        buf.push('\n');
+        buf.push_str(&generate_service(&service).to_string());
     }
 }
 
-fn generate_service(service: &Service, buf: &mut String) {
-    let trait_name = format!("{}Service", service.name);
-    let routes_fn = format!("{}_routes", to_snake(&service.name));
-    let client_name = format!("{}Client", service.name);
-    let shared_ty = "::std::rc::Rc<::std::cell::RefCell<S>>";
+fn generate_service(service: &Service) -> TokenStream {
+    let service_name = rust_ident(&service.name, "service");
+    let trait_name = format_ident!("{}Service", service_name);
+    let routes_fn = format_ident!("{}_routes", service.proto_name.to_snake_case());
+    let routes_enum = format_ident!("__SarkGrpc{}Routes", service_name);
+    let client_name = format_ident!("{}Client", service_name);
+    let methods = service
+        .methods
+        .iter()
+        .map(|method| GeneratedMethod::new(service, method, &service_name))
+        .collect::<Vec<_>>();
 
-    let _ = writeln!(buf);
-    let _ = writeln!(buf, "pub trait {trait_name}: 'static {{");
-    for method in &service.methods {
-        let req_ty = &method.input_type;
-        let resp_ty = &method.output_type;
-        let method_name = &method.name;
-        if method.client_streaming || method.server_streaming {
-            let _ = writeln!(
-                buf,
-                "    fn {method_name}(&mut self, request: ::sark_grpc::StreamingRequest<{req_ty}>) -> ::sark_grpc::StreamingResponse<{resp_ty}>;"
-            );
+    let trait_methods = methods.iter().map(emit_trait_method);
+    let server_wrappers = methods
+        .iter()
+        .map(|method| emit_server_wrapper(method, &trait_name));
+    let routes = emit_routes_enum(&methods, &trait_name, &routes_enum);
+    let registrations = methods.iter().map(|method| {
+        let GeneratedMethod {
+            descriptor,
+            variant,
+            wrapper,
+            request,
+            response,
+            path,
+            ..
+        } = method;
+        if descriptor.client_streaming || descriptor.server_streaming {
+            quote! {
+                routes.push(
+                    #path,
+                    #routes_enum::#variant(::sark_grpc::ServiceStreaming::new(
+                        #wrapper,
+                        ::sark_grpc::ProstCodec::<#response, #request>::new(),
+                    )),
+                );
+            }
         } else {
-            let _ = writeln!(
-                buf,
-                "    fn {method_name}(&mut self, request: ::sark_grpc::UnaryRequest<{req_ty}>) -> ::sark_grpc::UnaryResponse<{resp_ty}>;"
-            );
+            quote! {
+                routes.push(
+                    #path,
+                    #routes_enum::#variant(::sark_grpc::ServiceUnary::new(
+                        #wrapper,
+                        ::sark_grpc::ProstCodec::<#response, #request>::new(),
+                    )),
+                );
+            }
         }
-    }
-    let _ = writeln!(buf, "}}");
-    let _ = writeln!(buf);
+    });
+    let client = emit_client(&methods, &client_name);
 
-    for method in &service.methods {
-        emit_server_wrapper(service, method, &trait_name, buf);
-    }
-
-    let routes_enum = routes_enum_name(service);
-    emit_routes_enum(service, &trait_name, &routes_enum, buf);
-
-    let _ = writeln!(
-        buf,
-        "pub fn {routes_fn}<S: {trait_name}>(service: S) -> ::sark_grpc::Routes<{routes_enum}<S>> {{"
-    );
-    let _ = writeln!(
-        buf,
-        "    let shared: {shared_ty} = ::std::rc::Rc::new(::std::cell::RefCell::new(service));"
-    );
-    let _ = writeln!(buf, "    let mut routes = ::sark_grpc::Routes::new();");
-    for method in &service.methods {
-        let wrapper = wrapper_name(service, method);
-        let variant = variant_name(service, method);
-        let path = grpc_path(service, method);
-        if method.client_streaming || method.server_streaming {
-            let _ = writeln!(
-                buf,
-                "    routes.push(b\"{path}\", {routes_enum}::{variant}(::sark_grpc::Streaming::new({wrapper} {{ inner: shared.clone() }}, ::sark_grpc::ProstCodec::<{}, {}>::new())));",
-                method.output_type, method.input_type
-            );
-        } else {
-            let _ = writeln!(
-                buf,
-                "    routes.push(b\"{path}\", {routes_enum}::{variant}(::sark_grpc::Unary::new({wrapper} {{ inner: shared.clone() }}, ::sark_grpc::ProstCodec::<{}, {}>::new())));",
-                method.output_type, method.input_type
-            );
+    quote! {
+        pub trait #trait_name: 'static {
+            #(#trait_methods)*
         }
-    }
-    let _ = writeln!(buf, "    routes");
-    let _ = writeln!(buf, "}}");
-    let _ = writeln!(buf);
 
-    emit_client(service, &client_name, buf);
+        #(#server_wrappers)*
+
+        #routes
+
+        pub fn #routes_fn<S: #trait_name>(
+            service: S,
+        ) -> ::sark_grpc::ServiceRoutes<S, #routes_enum<S>> {
+            let mut routes = ::sark_grpc::ServiceRoutes::new(service);
+            #(#registrations)*
+            routes
+        }
+
+        #client
+    }
 }
 
-fn emit_server_wrapper(service: &Service, method: &Method, trait_name: &str, buf: &mut String) {
-    let wrapper = wrapper_name(service, method);
-    let req_ty = &method.input_type;
-    let resp_ty = &method.output_type;
-    let method_name = &method.name;
-    let _ = writeln!(buf, "pub struct {wrapper}<S: {trait_name}> {{");
-    let _ = writeln!(
-        buf,
-        "    pub inner: ::std::rc::Rc<::std::cell::RefCell<S>>,"
-    );
-    let _ = writeln!(buf, "}}");
-    if method.client_streaming || method.server_streaming {
-        let _ = writeln!(
-            buf,
-            "impl<S: {trait_name}> ::sark_grpc::StreamingHandler for {wrapper}<S> {{"
-        );
-        let _ = writeln!(buf, "    type Request = {req_ty};");
-        let _ = writeln!(buf, "    type Response = {resp_ty};");
-        let _ = writeln!(
-            buf,
-            "    type Codec = ::sark_grpc::ProstCodec<{resp_ty}, {req_ty}>;"
-        );
-        let _ = writeln!(
-            buf,
-            "    fn stream(&mut self, request: ::sark_grpc::StreamingRequest<{req_ty}>) -> ::sark_grpc::StreamingResponse<{resp_ty}> {{"
-        );
-        let _ = writeln!(
-            buf,
-            "        self.inner.borrow_mut().{method_name}(request)"
-        );
-        let _ = writeln!(buf, "    }}");
-        let _ = writeln!(buf, "}}");
+struct GeneratedMethod<'a> {
+    descriptor: &'a Method,
+    name: Ident,
+    variant: Ident,
+    wrapper: Ident,
+    request: Type,
+    response: Type,
+    path: Literal,
+    open_name: Ident,
+    send_name: Ident,
+    finish_name: Ident,
+    poll_name: Ident,
+    decode_name: Ident,
+}
+
+impl<'a> GeneratedMethod<'a> {
+    fn new(service: &Service, method: &'a Method, service_name: &Ident) -> Self {
+        let name = rust_ident(&method.name, "method");
+        let variant = generated_ident(&method.proto_name.to_upper_camel_case());
+        let wrapper = format_ident!("__SarkGrpc{}{}", service_name, variant);
+        let helper_stem = method.proto_name.to_snake_case();
+        Self {
+            descriptor: method,
+            name,
+            variant,
+            wrapper,
+            request: rust_type(&method.input_type, method, "input"),
+            response: rust_type(&method.output_type, method, "output"),
+            path: Literal::byte_string(grpc_path(service, method).as_bytes()),
+            open_name: format_ident!("open_{helper_stem}"),
+            send_name: format_ident!("send_{helper_stem}"),
+            finish_name: format_ident!("finish_{helper_stem}"),
+            poll_name: format_ident!("poll_{helper_stem}"),
+            decode_name: format_ident!("decode_{helper_stem}"),
+        }
+    }
+}
+
+fn emit_trait_method(method: &GeneratedMethod<'_>) -> TokenStream {
+    let GeneratedMethod {
+        descriptor,
+        name,
+        request,
+        response,
+        ..
+    } = method;
+    if descriptor.client_streaming || descriptor.server_streaming {
+        quote! {
+            fn #name(
+                &mut self,
+                request: ::sark_grpc::StreamingRequest<#request>,
+            ) -> ::sark_grpc::StreamingResponse<#response>;
+        }
     } else {
-        let _ = writeln!(
-            buf,
-            "impl<S: {trait_name}> ::sark_grpc::UnaryHandler for {wrapper}<S> {{"
-        );
-        let _ = writeln!(buf, "    type Request = {req_ty};");
-        let _ = writeln!(buf, "    type Response = {resp_ty};");
-        let _ = writeln!(
-            buf,
-            "    type Codec = ::sark_grpc::ProstCodec<{resp_ty}, {req_ty}>;"
-        );
-        let _ = writeln!(
-            buf,
-            "    fn unary(&mut self, request: ::sark_grpc::UnaryRequest<{req_ty}>) -> ::sark_grpc::UnaryResponse<{resp_ty}> {{"
-        );
-        let _ = writeln!(
-            buf,
-            "        self.inner.borrow_mut().{method_name}(request)"
-        );
-        let _ = writeln!(buf, "    }}");
-        let _ = writeln!(buf, "}}");
-    }
-    let _ = writeln!(buf);
-}
-
-fn emit_client(service: &Service, client_name: &str, buf: &mut String) {
-    let _ = writeln!(buf, "pub struct {client_name};");
-    let _ = writeln!(buf, "impl {client_name} {{");
-    for method in &service.methods {
-        let path = grpc_path(service, method);
-        let req_ty = &method.input_type;
-        let resp_ty = &method.output_type;
-        let method_name = &method.name;
-        let open_name = format!("open_{method_name}");
-        let send_name = format!("send_{method_name}");
-        let finish_name = format!("finish_{method_name}");
-        let poll_name = format!("poll_{method_name}");
-        let decode_name = format!("decode_{method_name}");
-        if method.client_streaming {
-            let _ = writeln!(
-                buf,
-                "    pub fn {method_name}(session: &mut ::sark_grpc::Session, authority: ::core::option::Option<&[u8]>, metadata: &::sark_grpc::Metadata, messages: &[{req_ty}]) -> ::core::result::Result<::sark_grpc::StreamId, ::sark_grpc::Status> {{"
-            );
-            let _ = writeln!(
-                buf,
-                "        let mut codec = ::sark_grpc::ProstCodec::<{req_ty}, {resp_ty}>::new();"
-            );
-            let _ = writeln!(
-                buf,
-                "        session.start_streaming(b\"{path}\", authority, metadata, &mut codec, messages)"
-            );
-            let _ = writeln!(buf, "    }}");
-            let _ = writeln!(
-                buf,
-                "    pub fn {open_name}(session: &mut ::sark_grpc::Session, authority: ::core::option::Option<&[u8]>, metadata: &::sark_grpc::Metadata) -> ::core::result::Result<::sark_grpc::StreamId, ::sark_grpc::Status> {{"
-            );
-            let _ = writeln!(
-                buf,
-                "        session.start_stream_raw(b\"{path}\", authority, metadata)"
-            );
-            let _ = writeln!(buf, "    }}");
-            let _ = writeln!(
-                buf,
-                "    pub fn {send_name}(session: &mut ::sark_grpc::Session, stream_id: ::sark_grpc::StreamId, request: &{req_ty}) -> ::core::result::Result<(), ::sark_grpc::Status> {{"
-            );
-            let _ = writeln!(
-                buf,
-                "        let mut codec = ::sark_grpc::ProstCodec::<{req_ty}, {resp_ty}>::new();"
-            );
-            let _ = writeln!(
-                buf,
-                "        session.send_message(stream_id, &mut codec, request)"
-            );
-            let _ = writeln!(buf, "    }}");
-            let _ = writeln!(
-                buf,
-                "    pub fn {finish_name}(session: &mut ::sark_grpc::Session, stream_id: ::sark_grpc::StreamId) -> ::core::result::Result<(), ::sark_grpc::Status> {{"
-            );
-            let _ = writeln!(buf, "        session.finish_send(stream_id)");
-            let _ = writeln!(buf, "    }}");
-        } else if method.server_streaming {
-            let _ = writeln!(
-                buf,
-                "    pub fn {method_name}(session: &mut ::sark_grpc::Session, authority: ::core::option::Option<&[u8]>, metadata: &::sark_grpc::Metadata, request: &{req_ty}) -> ::core::result::Result<::sark_grpc::StreamId, ::sark_grpc::Status> {{"
-            );
-            let _ = writeln!(
-                buf,
-                "        let stream_id = session.start_stream_raw(b\"{path}\", authority, metadata)?;"
-            );
-            let _ = writeln!(
-                buf,
-                "        let mut codec = ::sark_grpc::ProstCodec::<{req_ty}, {resp_ty}>::new();"
-            );
-            let _ = writeln!(
-                buf,
-                "        session.send_message(stream_id, &mut codec, request)?;"
-            );
-            let _ = writeln!(buf, "        session.finish_send(stream_id)?;");
-            let _ = writeln!(buf, "        ::core::result::Result::Ok(stream_id)");
-            let _ = writeln!(buf, "    }}");
-        } else {
-            let _ = writeln!(
-                buf,
-                "    pub fn {method_name}(session: &mut ::sark_grpc::Session, authority: ::core::option::Option<&[u8]>, metadata: &::sark_grpc::Metadata, request: &{req_ty}) -> ::core::result::Result<::sark_grpc::StreamId, ::sark_grpc::Status> {{"
-            );
-            let _ = writeln!(
-                buf,
-                "        let mut codec = ::sark_grpc::ProstCodec::<{req_ty}, {resp_ty}>::new();"
-            );
-            let _ = writeln!(
-                buf,
-                "        session.start_unary(b\"{path}\", authority, metadata, &mut codec, request)"
-            );
-            let _ = writeln!(buf, "    }}");
+        quote! {
+            fn #name(
+                &mut self,
+                request: ::sark_grpc::UnaryRequest<#request>,
+            ) -> ::sark_grpc::UnaryResponse<#response>;
         }
-        if !method.server_streaming {
-            let _ = writeln!(
-                buf,
-                "    pub fn {decode_name}(result: ::sark_grpc::UnaryResult) -> ::core::result::Result<{resp_ty}, ::sark_grpc::Status> {{"
-            );
-            let _ = writeln!(
-                buf,
-                "        let mut codec = ::sark_grpc::ProstCodec::<{req_ty}, {resp_ty}>::new();"
-            );
-            let _ = writeln!(buf, "        result.decode_single(&mut codec)");
-            let _ = writeln!(buf, "    }}");
+    }
+}
+
+fn emit_server_wrapper(method: &GeneratedMethod<'_>, trait_name: &Ident) -> TokenStream {
+    let GeneratedMethod {
+        descriptor,
+        name,
+        wrapper,
+        request,
+        response,
+        ..
+    } = method;
+    if descriptor.client_streaming || descriptor.server_streaming {
+        quote! {
+            pub struct #wrapper;
+
+            impl<S: #trait_name> ::sark_grpc::StreamingService<S> for #wrapper {
+                type Request = #request;
+                type Response = #response;
+                type Codec = ::sark_grpc::ProstCodec<#response, #request>;
+
+                fn stream(
+                    &mut self,
+                    service: &mut S,
+                    request: ::sark_grpc::StreamingRequest<#request>,
+                ) -> ::sark_grpc::StreamingResponse<#response> {
+                    service.#name(request)
+                }
+            }
         }
-        let _ = writeln!(
-            buf,
-            "    pub fn {poll_name}(session: &mut ::sark_grpc::Session) -> ::core::option::Option<::core::result::Result<::sark_grpc::TypedStreamEvent<{resp_ty}>, ::sark_grpc::Status>> {{"
-        );
-        let _ = writeln!(buf, "        let event = session.poll_event()?;");
-        let _ = writeln!(
-            buf,
-            "        let mut codec = ::sark_grpc::ProstCodec::<{req_ty}, {resp_ty}>::new();"
-        );
-        let _ = writeln!(
-            buf,
-            "        ::core::option::Option::Some(event.decode(&mut codec))"
-        );
-        let _ = writeln!(buf, "    }}");
-    }
-    let _ = writeln!(buf, "}}");
-}
-
-fn emit_routes_enum(service: &Service, trait_name: &str, routes_enum: &str, buf: &mut String) {
-    let _ = writeln!(buf, "pub enum {routes_enum}<S: {trait_name}> {{");
-    for method in &service.methods {
-        let variant = variant_name(service, method);
-        let handler_ty = variant_handler_type(service, method);
-        let _ = writeln!(buf, "    {variant}({handler_ty}),");
-    }
-    let _ = writeln!(buf, "}}");
-
-    let _ = writeln!(
-        buf,
-        "impl<S: {trait_name}> ::sark_grpc::server::Handler for {routes_enum}<S> {{"
-    );
-
-    let _ = writeln!(
-        buf,
-        "    fn start(&mut self, routes: &mut ::sark_grpc::server::StreamRoutes, stream_id: ::sark_grpc::StreamId, head: &::sark_grpc::RequestHead, reply: &mut ::sark_grpc::StreamReply) -> ::sark_grpc::StreamMode {{"
-    );
-    let _ = writeln!(buf, "        match self {{");
-    for method in &service.methods {
-        let variant = variant_name(service, method);
-        let _ = writeln!(
-            buf,
-            "            {routes_enum}::{variant}(h) => h.start(routes, stream_id, head, reply),"
-        );
-    }
-    let _ = writeln!(buf, "        }}");
-    let _ = writeln!(buf, "    }}");
-
-    let _ = writeln!(
-        buf,
-        "    fn message(&mut self, routes: &mut ::sark_grpc::server::StreamRoutes, stream_id: ::sark_grpc::StreamId, message: ::sark_grpc::MessageFrame, reply: &mut ::sark_grpc::StreamReply) {{"
-    );
-    let _ = writeln!(buf, "        match self {{");
-    for method in &service.methods {
-        let variant = variant_name(service, method);
-        let _ = writeln!(
-            buf,
-            "            {routes_enum}::{variant}(h) => h.message(routes, stream_id, message, reply),"
-        );
-    }
-    let _ = writeln!(buf, "        }}");
-    let _ = writeln!(buf, "    }}");
-
-    let _ = writeln!(
-        buf,
-        "    fn trailers(&mut self, routes: &mut ::sark_grpc::server::StreamRoutes, stream_id: ::sark_grpc::StreamId, trailers: ::sark_grpc::Metadata, reply: &mut ::sark_grpc::StreamReply) {{"
-    );
-    let _ = writeln!(buf, "        match self {{");
-    for method in &service.methods {
-        let variant = variant_name(service, method);
-        let _ = writeln!(
-            buf,
-            "            {routes_enum}::{variant}(h) => h.trailers(routes, stream_id, trailers, reply),"
-        );
-    }
-    let _ = writeln!(buf, "        }}");
-    let _ = writeln!(buf, "    }}");
-
-    let _ = writeln!(
-        buf,
-        "    fn request(&mut self, request: ::sark_grpc::Request<'_>, response: &mut ::sark_grpc::Response) {{"
-    );
-    let _ = writeln!(buf, "        match self {{");
-    for method in &service.methods {
-        let variant = variant_name(service, method);
-        let _ = writeln!(
-            buf,
-            "            {routes_enum}::{variant}(h) => h.request(request, response),"
-        );
-    }
-    let _ = writeln!(buf, "        }}");
-    let _ = writeln!(buf, "    }}");
-
-    let _ = writeln!(buf, "}}");
-    let _ = writeln!(buf);
-}
-
-fn variant_handler_type(service: &Service, method: &Method) -> String {
-    let wrapper = wrapper_name(service, method);
-    if method.client_streaming || method.server_streaming {
-        format!("::sark_grpc::Streaming<{wrapper}<S>>")
     } else {
-        format!("::sark_grpc::Unary<{wrapper}<S>>")
+        quote! {
+            pub struct #wrapper;
+
+            impl<S: #trait_name> ::sark_grpc::UnaryService<S> for #wrapper {
+                type Request = #request;
+                type Response = #response;
+                type Codec = ::sark_grpc::ProstCodec<#response, #request>;
+
+                fn unary(
+                    &mut self,
+                    service: &mut S,
+                    request: ::sark_grpc::UnaryRequest<#request>,
+                ) -> ::sark_grpc::UnaryResponse<#response> {
+                    service.#name(request)
+                }
+            }
+        }
     }
 }
 
-fn routes_enum_name(service: &Service) -> String {
-    format!("__SarkGrpc{}Routes", service.name)
+fn emit_client(methods: &[GeneratedMethod<'_>], client_name: &Ident) -> TokenStream {
+    let methods = methods.iter().map(emit_client_method);
+    quote! {
+        pub struct #client_name;
+
+        impl #client_name {
+            #(#methods)*
+        }
+    }
 }
 
-fn variant_name(service: &Service, method: &Method) -> String {
-    let _ = service;
-    to_upper_camel(&method.name)
+fn emit_client_method(method: &GeneratedMethod<'_>) -> TokenStream {
+    let GeneratedMethod {
+        descriptor,
+        name,
+        request,
+        response,
+        path,
+        open_name,
+        send_name,
+        finish_name,
+        poll_name,
+        decode_name,
+        ..
+    } = method;
+
+    let start = if descriptor.client_streaming {
+        quote! {
+            pub fn #name(
+                session: &mut ::sark_grpc::Session,
+                authority: ::core::option::Option<&[u8]>,
+                metadata: &::sark_grpc::Metadata,
+                messages: &[#request],
+            ) -> ::core::result::Result<::sark_grpc::StreamId, ::sark_grpc::Status> {
+                let mut codec = ::sark_grpc::ProstCodec::<#request, #response>::new();
+                session.start_streaming(#path, authority, metadata, &mut codec, messages)
+            }
+
+            pub fn #open_name(
+                session: &mut ::sark_grpc::Session,
+                authority: ::core::option::Option<&[u8]>,
+                metadata: &::sark_grpc::Metadata,
+            ) -> ::core::result::Result<::sark_grpc::StreamId, ::sark_grpc::Status> {
+                session.start_stream_raw(#path, authority, metadata)
+            }
+
+            pub fn #send_name(
+                session: &mut ::sark_grpc::Session,
+                stream_id: ::sark_grpc::StreamId,
+                request: &#request,
+            ) -> ::core::result::Result<(), ::sark_grpc::Status> {
+                let mut codec = ::sark_grpc::ProstCodec::<#request, #response>::new();
+                session.send_message(stream_id, &mut codec, request)
+            }
+
+            pub fn #finish_name(
+                session: &mut ::sark_grpc::Session,
+                stream_id: ::sark_grpc::StreamId,
+            ) -> ::core::result::Result<(), ::sark_grpc::Status> {
+                session.finish_send(stream_id)
+            }
+        }
+    } else if descriptor.server_streaming {
+        quote! {
+            pub fn #name(
+                session: &mut ::sark_grpc::Session,
+                authority: ::core::option::Option<&[u8]>,
+                metadata: &::sark_grpc::Metadata,
+                request: &#request,
+            ) -> ::core::result::Result<::sark_grpc::StreamId, ::sark_grpc::Status> {
+                let stream_id = session.start_stream_raw(#path, authority, metadata)?;
+                let mut codec = ::sark_grpc::ProstCodec::<#request, #response>::new();
+                session.send_message(stream_id, &mut codec, request)?;
+                session.finish_send(stream_id)?;
+                ::core::result::Result::Ok(stream_id)
+            }
+        }
+    } else {
+        quote! {
+            pub fn #name(
+                session: &mut ::sark_grpc::Session,
+                authority: ::core::option::Option<&[u8]>,
+                metadata: &::sark_grpc::Metadata,
+                request: &#request,
+            ) -> ::core::result::Result<::sark_grpc::StreamId, ::sark_grpc::Status> {
+                let mut codec = ::sark_grpc::ProstCodec::<#request, #response>::new();
+                session.start_unary(#path, authority, metadata, &mut codec, request)
+            }
+        }
+    };
+
+    let decode = (!descriptor.server_streaming).then(|| {
+        quote! {
+            pub fn #decode_name(
+                result: ::sark_grpc::UnaryResult,
+            ) -> ::core::result::Result<#response, ::sark_grpc::Status> {
+                let mut codec = ::sark_grpc::ProstCodec::<#request, #response>::new();
+                result.decode_single(&mut codec)
+            }
+        }
+    });
+
+    quote! {
+        #start
+        #decode
+
+        pub fn #poll_name(
+            session: &mut ::sark_grpc::Session,
+        ) -> ::core::option::Option<
+            ::core::result::Result<
+                ::sark_grpc::TypedStreamEvent<#response>,
+                ::sark_grpc::Status,
+            >,
+        > {
+            let event = session.poll_event()?;
+            let mut codec = ::sark_grpc::ProstCodec::<#request, #response>::new();
+            ::core::option::Option::Some(event.decode(&mut codec))
+        }
+    }
 }
 
-fn wrapper_name(service: &Service, method: &Method) -> String {
-    format!("__SarkGrpc{}{}", service.name, to_upper_camel(&method.name))
+fn emit_routes_enum(
+    methods: &[GeneratedMethod<'_>],
+    trait_name: &Ident,
+    routes_enum: &Ident,
+) -> TokenStream {
+    let variants = methods.iter().map(|method| {
+        let GeneratedMethod {
+            descriptor,
+            variant,
+            wrapper,
+            ..
+        } = method;
+        if descriptor.client_streaming || descriptor.server_streaming {
+            quote!(#variant(::sark_grpc::ServiceStreaming<S, #wrapper>),)
+        } else {
+            quote!(#variant(::sark_grpc::ServiceUnary<S, #wrapper>),)
+        }
+    });
+    let start_arms = methods.iter().map(|method| {
+        let variant = &method.variant;
+        quote! {
+            #routes_enum::#variant(handler) =>
+                ::sark_grpc::server::ServiceHandler::start(
+                    handler, service, routes, stream_id, head, reply,
+                ),
+        }
+    });
+    let message_arms = methods.iter().map(|method| {
+        let variant = &method.variant;
+        quote! {
+            #routes_enum::#variant(handler) =>
+                ::sark_grpc::server::ServiceHandler::message(
+                    handler, service, routes, stream_id, message, reply,
+                ),
+        }
+    });
+    let trailers_arms = methods.iter().map(|method| {
+        let variant = &method.variant;
+        quote! {
+            #routes_enum::#variant(handler) =>
+                ::sark_grpc::server::ServiceHandler::trailers(
+                    handler, service, routes, stream_id, trailers, reply,
+                ),
+        }
+    });
+    let request_arms = methods.iter().map(|method| {
+        let variant = &method.variant;
+        quote! {
+            #routes_enum::#variant(handler) =>
+                ::sark_grpc::server::ServiceHandler::request(
+                    handler, service, request, response,
+                ),
+        }
+    });
+
+    quote! {
+        pub enum #routes_enum<S: #trait_name> {
+            #(#variants)*
+        }
+
+        impl<S: #trait_name> ::sark_grpc::server::ServiceHandler<S> for #routes_enum<S> {
+            fn start(
+                &mut self,
+                service: &mut S,
+                routes: &mut ::sark_grpc::server::StreamRoutes,
+                stream_id: ::sark_grpc::StreamId,
+                head: &::sark_grpc::RequestHead,
+                reply: &mut ::sark_grpc::StreamReply,
+            ) -> ::sark_grpc::StreamMode {
+                match self {
+                    #(#start_arms)*
+                }
+            }
+
+            fn message(
+                &mut self,
+                service: &mut S,
+                routes: &mut ::sark_grpc::server::StreamRoutes,
+                stream_id: ::sark_grpc::StreamId,
+                message: ::sark_grpc::MessageFrame,
+                reply: &mut ::sark_grpc::StreamReply,
+            ) {
+                match self {
+                    #(#message_arms)*
+                }
+            }
+
+            fn trailers(
+                &mut self,
+                service: &mut S,
+                routes: &mut ::sark_grpc::server::StreamRoutes,
+                stream_id: ::sark_grpc::StreamId,
+                trailers: ::sark_grpc::Metadata,
+                reply: &mut ::sark_grpc::StreamReply,
+            ) {
+                match self {
+                    #(#trailers_arms)*
+                }
+            }
+
+            fn request(
+                &mut self,
+                service: &mut S,
+                request: ::sark_grpc::Request<'_>,
+                response: &mut ::sark_grpc::Response,
+            ) {
+                match self {
+                    #(#request_arms)*
+                }
+            }
+        }
+    }
 }
 
 fn grpc_path(service: &Service, method: &Method) -> String {
@@ -407,33 +484,101 @@ fn grpc_path(service: &Service, method: &Method) -> String {
     }
 }
 
-fn to_upper_camel(input: &str) -> String {
-    let mut out = String::new();
-    let mut upper = true;
-    for ch in input.chars() {
-        if ch == '_' {
-            upper = true;
-        } else if upper {
-            out.extend(ch.to_uppercase());
-            upper = false;
-        } else {
-            out.push(ch);
-        }
-    }
-    out
+fn rust_ident(input: &str, kind: &str) -> Ident {
+    syn::parse_str(input).unwrap_or_else(|error| {
+        panic!("prost-build returned an invalid Rust {kind} name `{input}`: {error}")
+    })
 }
 
-fn to_snake(input: &str) -> String {
-    let mut out = String::new();
-    for (i, ch) in input.chars().enumerate() {
-        if ch.is_ascii_uppercase() {
-            if i > 0 {
-                out.push('_');
-            }
-            out.push(ch.to_ascii_lowercase());
-        } else {
-            out.push(ch);
+fn generated_ident(input: &str) -> Ident {
+    syn::parse_str(input).unwrap_or_else(|_| Ident::new(&format!("{input}_"), Span::call_site()))
+}
+
+fn rust_type(input: &str, method: &Method, direction: &str) -> Type {
+    syn::parse_str(input).unwrap_or_else(|error| {
+        panic!(
+            "prost-build returned an invalid Rust {direction} type `{input}` for RPC `{}`: {error}",
+            method.proto_name,
+        )
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use prost_build::{Comments, Method, Service, ServiceGenerator};
+
+    use super::SarkServiceGenerator;
+
+    fn method(
+        name: &str,
+        proto_name: &str,
+        client_streaming: bool,
+        server_streaming: bool,
+    ) -> Method {
+        Method {
+            name: name.into(),
+            proto_name: proto_name.into(),
+            comments: Comments::default(),
+            input_type: "Input".into(),
+            output_type: "Output".into(),
+            input_proto_type: ".use.case.Input".into(),
+            output_proto_type: ".use.case.Output".into(),
+            options: Default::default(),
+            client_streaming,
+            server_streaming,
         }
     }
-    out
+
+    fn generate(methods: Vec<Method>) -> String {
+        let service = Service {
+            name: "Proof".into(),
+            proto_name: "Proof".into(),
+            package: "use.case".into(),
+            comments: Comments::default(),
+            methods,
+            options: Default::default(),
+        };
+        let mut generated = String::new();
+        SarkServiceGenerator.generate(service, &mut generated);
+        syn::parse_file(&generated).expect("generated service must be valid Rust syntax");
+        generated
+    }
+
+    fn compact(source: &str) -> String {
+        source.chars().filter(|ch| !ch.is_whitespace()).collect()
+    }
+
+    #[test]
+    fn generated_routes_own_the_service_without_rc_or_dynamic_borrows() {
+        let generated = generate(vec![method("echo", "Echo", false, false)]);
+        let compact = compact(&generated);
+
+        assert!(compact.contains("ServiceRoutes<S,__SarkGrpcProofRoutes<S>>"));
+        assert!(compact.contains("ServiceUnary::new(__SarkGrpcProofEcho"));
+        assert!(!generated.contains("Rc"));
+        assert!(!generated.contains("RefCell"));
+        assert!(!generated.contains("borrow_mut"));
+        assert!(!generated.contains("shared.clone"));
+    }
+
+    #[test]
+    fn every_streaming_shape_generates_valid_rust() {
+        generate(vec![
+            method("unary", "Unary", false, false),
+            method("upload", "Upload", true, false),
+            method("watch", "Watch", false, true),
+            method("chat", "Chat", true, true),
+        ]);
+    }
+
+    #[test]
+    fn raw_method_identifiers_do_not_leak_into_composed_names() {
+        let generated = compact(&generate(vec![method("r#type", "Type", false, false)]));
+
+        assert!(generated.contains("fnr#type("));
+        assert!(generated.contains("__SarkGrpcProofRoutes::Type("));
+        assert!(generated.contains("fndecode_type("));
+        assert!(generated.contains("fnpoll_type("));
+        assert!(!generated.contains("R#type"));
+    }
 }

@@ -3,7 +3,7 @@ use std::time::{Duration, Instant};
 
 use cartel_core::{Arena, ArenaConfig, ArenaLane, Limits};
 use dope::driver::token::Token;
-use o3::cell::{RawCell, RegionToken};
+use o3::cell::{RegionCell, RegionToken};
 use o3::collections::SlotQueue;
 use sark_core::http::Response;
 
@@ -23,7 +23,7 @@ struct Connection {
 pub(super) struct ConnectionPool<'d> {
     entries: Box<[Connection]>,
     arena: Arena<'d, Outcome>,
-    ready: RawCell<SlotQueue<Token>>,
+    ready: RegionCell<'d, SlotQueue<Token>>,
     live: Cell<usize>,
 }
 
@@ -45,7 +45,7 @@ impl<'d> ConnectionPool<'d> {
             arena: Arena::new(ArenaConfig::new(
                 capacity, entries, entries, limit, entries, limits,
             )),
-            ready: RawCell::new(SlotQueue::with_capacity(capacity)),
+            ready: RegionCell::new(SlotQueue::with_capacity(capacity)),
             live: Cell::new(0),
         }
     }
@@ -55,29 +55,25 @@ impl<'d> ConnectionPool<'d> {
         (entry.id.get() == Some(id)).then_some(entry)
     }
 
-    fn push_ready(&self, entry: &Connection, id: Token) {
+    fn push_ready(&self, token: &mut RegionToken<'d>, entry: &Connection, id: Token) {
         if entry.queued.replace(true) {
             return;
         }
-        unsafe {
-            self.ready.with_mut(|ready| {
-                ready
-                    .vacant_entry(id.slot().raw() as usize)
-                    .expect("ready queue entry must be vacant")
-                    .push_back(id);
-            })
-        };
+        self.ready
+            .borrow_mut(token)
+            .vacant_entry(id.slot().raw() as usize)
+            .expect("ready queue entry must be vacant")
+            .push_back(id);
     }
 
-    fn pop_ready(&self) -> Option<Token> {
-        unsafe { self.ready.with_mut(SlotQueue::pop_front) }
+    fn pop_ready(&self, token: &mut RegionToken<'d>) -> Option<Token> {
+        self.ready.borrow_mut(token).pop_front()
     }
 
-    fn remove_ready(&self, id: Token) {
-        unsafe {
-            self.ready
-                .with_mut(|ready| ready.remove(id.slot().raw() as usize))
-        };
+    fn remove_ready(&self, token: &mut RegionToken<'d>, id: Token) {
+        self.ready
+            .borrow_mut(token)
+            .remove(id.slot().raw() as usize);
     }
 
     pub(super) fn has_connection(&self) -> bool {
@@ -96,7 +92,7 @@ impl<'d> ConnectionPool<'d> {
         }
         entry.last_activity.set(Some(now));
         entry.keepalive.set(None);
-        self.push_ready(entry, id);
+        self.push_ready(token, entry, id);
     }
 
     pub(super) fn push_response(
@@ -119,7 +115,7 @@ impl<'d> ConnectionPool<'d> {
         self.arena.try_push(token, lane, outcome, bytes, 1);
         self.arena.complete(token, lane);
         if self.arena.can_register(token, lane) {
-            self.push_ready(entry, id);
+            self.push_ready(token, entry, id);
         }
     }
 
@@ -135,7 +131,7 @@ impl<'d> ConnectionPool<'d> {
         entry.last_activity.set(None);
         entry.keepalive.set(None);
         entry.queued.set(false);
-        self.remove_ready(id);
+        self.remove_ready(token, id);
     }
 
     pub(super) fn acquire(
@@ -145,7 +141,7 @@ impl<'d> ConnectionPool<'d> {
         idle_timeout: Duration,
         mut recycle: impl FnMut(Token),
     ) -> Option<Token> {
-        while let Some(id) = self.pop_ready() {
+        while let Some(id) = self.pop_ready(token) {
             let Some(entry) = self.entry(id) else {
                 continue;
             };
@@ -180,7 +176,7 @@ impl<'d> ConnectionPool<'d> {
         if let Some(entry) = self.entry(id) {
             entry.last_activity.set(Some(now));
             if self.arena.can_register(token, id.slot().raw() as usize) {
-                self.push_ready(entry, id);
+                self.push_ready(token, entry, id);
             }
         }
     }
@@ -189,7 +185,7 @@ impl<'d> ConnectionPool<'d> {
         if let Some(entry) = self.entry(id)
             && self.arena.can_register(token, id.slot().raw() as usize)
         {
-            self.push_ready(entry, id);
+            self.push_ready(token, entry, id);
         }
     }
 }

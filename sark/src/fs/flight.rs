@@ -2,9 +2,10 @@ use std::pin::Pin;
 use std::task::Poll;
 
 use dope_fiber::{Context, Fiber, WaitQueue, Waiter};
-use o3::cell::RawCell;
 use o3::collections::{FixedHashTable, PinSlab, SlabKey};
+use pin_project::pinned_drop;
 
+use super::access::ProofCell;
 use super::cache::Asset;
 use super::loader::LoadError;
 
@@ -18,20 +19,41 @@ enum FlightTag {}
 
 type FlightKey = SlabKey<FlightTag>;
 
+#[pin_project::pin_project]
 struct Flight {
     hash: u64,
     key: Box<[u8]>,
     waiters: usize,
     waiter_capacity: usize,
     outcome: Option<Outcome>,
+    #[pin]
     wake: WaitQueue,
 }
 
 impl Flight {
-    fn wait_queue(&self) -> Pin<&WaitQueue> {
-        // SAFETY: Flight is inserted into PinSlab before this method is called,
-        // and entries are never moved until every waiter has detached.
-        unsafe { Pin::new_unchecked(&self.wake) }
+    fn wait_queue(self: Pin<&Self>) -> Pin<&WaitQueue> {
+        self.project_ref().wake
+    }
+
+    fn attach_waiter(self: Pin<&mut Self>) -> bool {
+        let this = self.project();
+        if *this.waiters == *this.waiter_capacity {
+            return false;
+        }
+        *this.waiters += 1;
+        true
+    }
+
+    fn detach_waiter(self: Pin<&mut Self>) -> bool {
+        let waiters = self.project().waiters;
+        *waiters -= 1;
+        *waiters == 0
+    }
+
+    fn complete(self: Pin<&mut Self>, outcome: Outcome) {
+        let this = self.project();
+        *this.outcome = Some(outcome);
+        this.wake.as_ref().wake();
     }
 }
 
@@ -75,23 +97,16 @@ impl Flights {
         }
         self.entries.remove(key);
     }
-
-    fn flight_mut(&mut self, key: FlightKey) -> Option<&mut Flight> {
-        let flight = self.entries.get_mut(key)?;
-        // SAFETY: only non-structural fields are mutated; the pinned WaitQueue
-        // is never moved or replaced while the Flight remains in PinSlab.
-        Some(unsafe { flight.get_unchecked_mut() })
-    }
 }
 
 pub(super) struct Hub {
-    flights: RawCell<Flights>,
+    flights: ProofCell<Flights>,
 }
 
 impl Hub {
     pub(super) fn new(capacity: usize) -> Self {
         Self {
-            flights: RawCell::new(Flights::with_capacity(capacity)),
+            flights: ProofCell::new(Flights::with_capacity(capacity)),
         }
     }
 
@@ -101,11 +116,10 @@ impl Hub {
                 return Start::Untracked;
             }
             if let Some(key) = flights.find(hash, key) {
-                let flight = flights.flight_mut(key).expect("flight missing");
-                if flight.waiters == flight.waiter_capacity {
+                let flight = flights.entries.get_mut(key).expect("flight missing");
+                if !flight.attach_waiter() {
                     return Start::Overloaded;
                 }
-                flight.waiters += 1;
                 return Start::Follower(Wait {
                     hub: self,
                     key,
@@ -151,17 +165,17 @@ impl Hub {
             if waiters == 0 {
                 flights.remove(key);
             } else {
-                let flight = flights.flight_mut(key).expect("flight missing");
-                flight.outcome = Some(outcome);
-                flight.wait_queue().wake();
+                flights
+                    .entries
+                    .get_mut(key)
+                    .expect("flight missing")
+                    .complete(outcome);
             }
         });
     }
 
     fn with_flights<R>(&self, operation: impl FnOnce(&mut Flights) -> R) -> R {
-        // SAFETY: Hub is owned by Rc-backed, thread-local ServeDir state. The
-        // closure completes synchronously and no Hub operation re-enters it.
-        unsafe { self.flights.with_mut(operation) }
+        self.flights.with_mut(operation)
     }
 }
 
@@ -187,9 +201,11 @@ impl Drop for Leader<'_> {
     }
 }
 
+#[pin_project::pin_project(PinnedDrop)]
 pub(super) struct Wait<'a, 'd> {
     hub: &'a Hub,
     key: FlightKey,
+    #[pin]
     waiter: Waiter<'d>,
     done: bool,
 }
@@ -198,40 +214,43 @@ impl<'d> Fiber<'d> for Wait<'_, 'd> {
     type Output = Outcome;
 
     fn poll(self: Pin<&mut Self>, cx: Pin<&mut Context<'_, 'd>>) -> Poll<Self::Output> {
-        // SAFETY: Wait is pinned for the duration of Fiber::poll. We mutate only
-        // scalar bookkeeping and never move the waiter field.
-        let this = unsafe { self.get_unchecked_mut() };
-        this.hub.with_flights(|flights| {
+        let this = self.project();
+        let hub = *this.hub;
+        let key = *this.key;
+        hub.with_flights(|flights| {
             let Some(outcome) = flights
                 .entries
-                .get(this.key)
+                .get(key)
                 .map(|flight| flight.outcome.clone())
             else {
-                this.done = true;
+                *this.done = true;
                 return Poll::Ready(Outcome::Failed(LoadError::NotFound));
             };
             if let Some(outcome) = outcome {
-                pinned_waiter(&this.waiter).unregister();
-                let flight = flights.flight_mut(this.key).expect("flight missing");
-                flight.waiters -= 1;
-                let remove = flight.waiters == 0;
+                this.waiter.as_ref().unregister();
+                let remove = flights
+                    .entries
+                    .get_mut(key)
+                    .expect("flight missing")
+                    .detach_waiter();
                 if remove {
-                    flights.remove(this.key);
+                    flights.remove(key);
                 }
-                this.done = true;
+                *this.done = true;
                 return Poll::Ready(outcome);
             }
-            let registered = flights.entries.get(this.key).is_some_and(|flight| {
+            let registered = flights.entries.get(key).is_some_and(|flight| {
                 flight
                     .wait_queue()
-                    .try_register(pinned_waiter(&this.waiter), cx.as_ref())
+                    .try_register(this.waiter.as_ref(), cx.as_ref())
             });
             if !registered {
                 flights
-                    .flight_mut(this.key)
+                    .entries
+                    .get_mut(key)
                     .expect("flight missing")
-                    .waiters -= 1;
-                this.done = true;
+                    .detach_waiter();
+                *this.done = true;
                 return Poll::Ready(Outcome::Failed(LoadError::Overloaded));
             }
             Poll::Pending
@@ -239,20 +258,24 @@ impl<'d> Fiber<'d> for Wait<'_, 'd> {
     }
 }
 
-impl Drop for Wait<'_, '_> {
-    fn drop(&mut self) {
-        if self.done {
+#[pinned_drop]
+impl PinnedDrop for Wait<'_, '_> {
+    fn drop(self: Pin<&mut Self>) {
+        let this = self.project();
+        if *this.done {
             return;
         }
-        pinned_waiter(&self.waiter).unregister();
-        self.hub.with_flights(|flights| {
-            let Some(flight) = flights.flight_mut(self.key) else {
+        this.waiter.as_ref().unregister();
+        let hub = *this.hub;
+        let key = *this.key;
+        hub.with_flights(|flights| {
+            let Some(mut flight) = flights.entries.get_mut(key) else {
                 return;
             };
-            flight.waiters -= 1;
-            let remove = flight.waiters == 0 && flight.outcome.is_some();
+            let completed = flight.outcome.is_some();
+            let remove = flight.as_mut().detach_waiter() && completed;
             if remove {
-                flights.remove(self.key);
+                flights.remove(key);
             }
         });
     }
@@ -265,8 +288,31 @@ pub(super) enum Start<'a, 'd> {
     Overloaded,
 }
 
-fn pinned_waiter<'a, 'd>(waiter: &'a Waiter<'d>) -> Pin<&'a Waiter<'d>> {
-    // SAFETY: callers only pass waiter fields belonging to pinned Wait values;
-    // the field is never moved until it is unregistered or dropped.
-    unsafe { Pin::new_unchecked(waiter) }
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn dropped_follower_detaches_before_leader_completion() {
+        let hub = Hub::new(1);
+        let start: Start<'_, 'static> = hub.begin(1, b"asset");
+        let leader = match start {
+            Start::Leader(leader) => leader,
+            _ => panic!("first request must lead"),
+        };
+        let start: Start<'_, 'static> = hub.begin(1, b"asset");
+        let follower = match start {
+            Start::Follower(follower) => follower,
+            _ => panic!("second request must follow"),
+        };
+
+        drop(follower);
+        hub.with_flights(|flights| {
+            let key = flights.find(1, b"asset").expect("flight missing");
+            assert_eq!(flights.entries.get(key).expect("flight missing").waiters, 0);
+        });
+
+        leader.finish(Outcome::Failed(LoadError::NotFound));
+        hub.with_flights(|flights| assert!(flights.find(1, b"asset").is_none()));
+    }
 }

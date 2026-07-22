@@ -1,0 +1,5 @@
+error[E0599]: no method named `clone` found for struct `ServeDir` in the current scope
+ --> tests/ui/serve_dir_runtime_cannot_clone.rs:6:31
+  |
+6 |     let _second_owner = serve.clone();
+  |                               ^^^^^ method not found in `ServeDir`

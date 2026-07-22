@@ -1,9 +1,9 @@
 use std::time::{Duration, Instant, SystemTime};
 
 use o3::buffer::Shared;
-use o3::cell::RawCell;
 use o3::collections::{FixedHashTable, Slab, SlabKey};
 
+use super::access::ProofCell;
 use super::encoding::Encoding;
 
 #[derive(Clone)]
@@ -202,13 +202,13 @@ pub(super) enum Lookup {
 }
 
 pub(super) struct Cache {
-    shard: RawCell<Shard>,
+    shard: ProofCell<Shard>,
 }
 
 impl Cache {
     pub(super) fn new(capacity: usize) -> Self {
         Self {
-            shard: RawCell::new(Shard::with_capacity(capacity)),
+            shard: ProofCell::new(Shard::with_capacity(capacity)),
         }
     }
 
@@ -264,8 +264,6 @@ impl Cache {
     }
 
     fn with_shard<R>(&self, operation: impl FnOnce(&mut Shard) -> R) -> R {
-        // SAFETY: ServeDir and its state are thread-local (`Rc`). Every access to
-        // the cache is completed synchronously and this method never re-enters.
-        unsafe { self.shard.with_mut(operation) }
+        self.shard.with_mut(operation)
     }
 }

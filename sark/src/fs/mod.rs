@@ -1,5 +1,6 @@
 //! Asynchronous static-file serving with bounded caching and single-flight loading.
 
+mod access;
 mod cache;
 mod encoding;
 mod flight;
@@ -9,7 +10,6 @@ mod resolver;
 use std::hash::{BuildHasher, Hasher};
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
-use std::rc::Rc;
 use std::time::Duration;
 
 use cache::{Asset, Cache, Lookup, Variant};
@@ -46,7 +46,7 @@ struct Config {
 struct SharedState {
     config: Config,
     hash_state: hash::State,
-    read_budget: Pin<Rc<ByteBudget>>,
+    read_budget: Pin<Box<ByteBudget>>,
     cache: Cache,
     flights: flight::Hub,
 }
@@ -60,7 +60,7 @@ impl SharedState {
         };
         let flight_capacity = config.flight_capacity;
         Self {
-            read_budget: Rc::pin(ByteBudget::new(config.read_budget)),
+            read_budget: Box::pin(ByteBudget::new(config.read_budget)),
             cache: Cache::new(cache_entries),
             flights: flight::Hub::new(flight_capacity),
             config,
@@ -75,15 +75,14 @@ impl SharedState {
     }
 }
 
-#[derive(Clone)]
 pub struct ServeDir {
-    state: Rc<SharedState>,
+    state: SharedState,
 }
 
 impl ServeDir {
     pub fn new(root: impl AsRef<Path>, hash_state: hash::State) -> Self {
         Self {
-            state: Rc::new(SharedState::new(
+            state: SharedState::new(
                 Config {
                     root: root.as_ref().to_path_buf(),
                     precompressed_br: false,
@@ -96,14 +95,14 @@ impl ServeDir {
                     read_budget: DEFAULT_READ_BUDGET,
                 },
                 hash_state,
-            )),
+            ),
         }
     }
 
     fn reconfigure(mut self, update: impl FnOnce(&mut Config)) -> Self {
         let mut config = self.state.config.clone();
         update(&mut config);
-        self.state = Rc::new(SharedState::new(config, self.state.hash_state));
+        self.state = SharedState::new(config, self.state.hash_state);
         self
     }
 
