@@ -74,12 +74,6 @@ pub enum Consumption {
     Discard { head: usize, body: usize },
 }
 
-#[derive(Default)]
-pub struct PipelineState {
-    pub pending_frame: PendingFrame,
-    pub discard_body_remaining: usize,
-}
-
 pub struct DispatchPermit {
     _priv: (),
 }
@@ -126,7 +120,7 @@ pub struct ConnState {
     pub deferred_close: bool,
     pub conn_id: ::dope::driver::token::Token,
     pub recv_view: Option<o3::buffer::Shared>,
-    pub pipeline: PipelineState,
+    pub pipeline: super::pipeline::Pipeline,
     pub head_deadline: Option<crate::timer::Ticket>,
 }
 
@@ -143,7 +137,7 @@ impl Default for ConnState {
                 ::dope::driver::token::Epoch::INITIAL,
             ),
             recv_view: None,
-            pipeline: PipelineState::default(),
+            pipeline: super::pipeline::Pipeline::default(),
             head_deadline: None,
         }
     }

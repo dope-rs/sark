@@ -50,6 +50,12 @@ where
         out.freeze()
     }
 
+    pub(crate) fn encoded_body(&self) -> Shared {
+        let mut body = vec![0; self.body_len];
+        self.body.encode_into(&mut body);
+        Shared::from(body)
+    }
+
     fn head_write(&self) -> HeadWrite<'_, HeadInner<'req, N>, ContentLength> {
         HeadWrite {
             status_str: self.status.as_str().as_bytes(),

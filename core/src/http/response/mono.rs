@@ -1,5 +1,5 @@
 use http::{HeaderValue, StatusCode};
-use o3::buffer::Shared;
+use o3::buffer::{Owned, Shared};
 
 use super::wire_emit::{CRLF, ContentLength, HeadWrite, HeaderSection, Out};
 use super::{DEFAULT_HEADER_CAPACITY, HeaderList, HotBodyInner, HotHeadInner, IntoHeaderName};
@@ -71,6 +71,19 @@ impl<'req, const N: usize> MonoResponseInner<'req, N> {
     {
         let _ = self.headers_mut().insert(name, value);
         self
+    }
+
+    pub fn wire_headers(&self) -> Shared {
+        let section = MonoHeaders {
+            head: &self.head,
+            dynamic: self.headers.as_deref(),
+        };
+        let mut out = Owned::with_capacity(section.header_len());
+        let mut bytes = vec![0; section.header_len()];
+        let mut offset = 0;
+        section.write_headers(&mut bytes, &mut offset);
+        out.extend_from_slice(&bytes);
+        out.freeze()
     }
 
     pub fn write_into_slice(&self, out: &mut [u8], date: &[u8; 29]) -> Option<usize> {

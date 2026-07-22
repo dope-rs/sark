@@ -1,7 +1,7 @@
 use sark_core::http::OwnedField;
 use sark_h2::hpack::{Header, HeaderBlock as H2HeaderBlock};
 
-use crate::metadata::{Metadata, MetadataError};
+use crate::metadata::Metadata;
 use crate::status::{Code, Status};
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -182,55 +182,5 @@ impl ResponseHead {
         Ok(ResponseHead {
             metadata: Metadata::from_h2_fields(headers)?,
         })
-    }
-}
-
-impl Status {
-    pub fn parse_h2_trailers(headers: &[OwnedField]) -> Result<(Status, Metadata), Status> {
-        let raw_code = headers
-            .iter()
-            .find(|h| h.name == b"grpc-status")
-            .map(|h| h.value.as_slice());
-        let Some(raw_code) = raw_code else {
-            return Err(Status::new(Code::Internal, "missing grpc-status"));
-        };
-        let Some(code) = Code::parse_ascii(raw_code) else {
-            return Err(Status::new(Code::Internal, "invalid grpc-status"));
-        };
-        let message = headers
-            .iter()
-            .find(|h| h.name == b"grpc-message")
-            .map(|h| Status::decode_message(&h.value))
-            .unwrap_or_default();
-        let metadata = Metadata::from_h2_fields(headers)?;
-        Ok((Status::new(code, message), metadata))
-    }
-}
-
-impl Metadata {
-    pub fn from_h2_fields(headers: &[OwnedField]) -> Result<Metadata, Status> {
-        let mut metadata = Metadata::new();
-        for h in headers {
-            if h.name.starts_with(b":") || Self::is_reserved(&h.name) {
-                continue;
-            }
-            metadata
-                .push(&h.name, &h.value)
-                .map_err(Status::from_metadata_err)?;
-        }
-        Ok(metadata)
-    }
-
-    pub(super) fn is_reserved(name: &[u8]) -> bool {
-        matches!(
-            name,
-            b"content-type" | b"te" | b"grpc-status" | b"grpc-message" | b"grpc-status-details-bin"
-        )
-    }
-}
-
-impl Status {
-    pub fn from_metadata_err(err: MetadataError) -> Status {
-        Status::new(Code::Internal, format!("bad metadata: {err:?}"))
     }
 }

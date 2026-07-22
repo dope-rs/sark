@@ -1,11 +1,11 @@
-mod parse;
-
 use http::{HeaderName, HeaderValue};
-use parse::Framing;
 
 use crate::error::{Error, Result};
+use crate::http::codec::ParsedRequestHead;
 
 const MAX_BODY_SIZE: usize = 100 * 1024 * 1024;
+const MAX_TRAILER_COUNT: usize = 128;
+const MAX_TRAILER_BYTES: usize = 16 * 1024;
 
 fn parse_chunk_size(bytes: &[u8]) -> Result<usize> {
     if bytes.is_empty() {
@@ -58,6 +58,8 @@ impl Default for BodyDecoder {
 }
 
 impl BodyDecoder {
+    pub const DEFAULT_MAX_BODY: usize = MAX_BODY_SIZE;
+
     pub fn new() -> Self {
         Self::with_limit(MAX_BODY_SIZE)
     }
@@ -76,7 +78,7 @@ impl BodyDecoder {
         loop {
             match self.state {
                 State::SizeLine => {
-                    let crlf = match Framing::find_crlf(&buf[pos..]) {
+                    let crlf = match Self::find_crlf(&buf[pos..]) {
                         Some(offset) => pos + offset,
                         None => return Ok((pos, DecodeEvent::NeedMore)),
                     };
@@ -116,7 +118,7 @@ impl BodyDecoder {
                     self.state = State::SizeLine;
                     return Ok((pos, DecodeEvent::Chunk(chunk)));
                 }
-                State::Trailers => match Framing::parse_trailers(&buf[pos..])? {
+                State::Trailers => match Self::parse_trailers(&buf[pos..])? {
                     Some((trailers, consumed)) => {
                         pos += consumed;
                         self.state = State::Done;
@@ -128,17 +130,8 @@ impl BodyDecoder {
             }
         }
     }
-}
 
-impl crate::http::codec::Parse {
-    pub(crate) fn try_decode_chunked(buf: &[u8]) -> Result<Option<DecodeResult>> {
-        Self::try_decode_chunked_limited(buf, MAX_BODY_SIZE)
-    }
-
-    pub(crate) fn try_decode_chunked_limited(
-        buf: &[u8],
-        max_body: usize,
-    ) -> Result<Option<DecodeResult>> {
+    pub(crate) fn decode_all(buf: &[u8], max_body: usize) -> Result<Option<DecodeResult>> {
         let mut decoder = BodyDecoder::with_limit(max_body);
         let mut body = Vec::new();
         let mut input = buf;
@@ -157,11 +150,11 @@ impl crate::http::codec::Parse {
         }
     }
 
-    pub fn chunked_body(buf: &[u8]) -> Result<Option<Vec<u8>>> {
-        Ok(Self::try_decode_chunked(buf)?.map(|r| r.body))
+    pub fn body(buf: &[u8]) -> Result<Option<Vec<u8>>> {
+        Ok(Self::decode_all(buf, MAX_BODY_SIZE)?.map(|result| result.body))
     }
 
-    pub fn chunked_body_consumed(
+    pub fn body_consumed(
         buf: &[u8],
         max_body: usize,
     ) -> Result<Option<(usize, o3::buffer::Shared)>> {
@@ -183,5 +176,46 @@ impl crate::http::codec::Parse {
                 }
             }
         }
+    }
+
+    fn parse_trailers(buf: &[u8]) -> Result<Option<(Vec<(HeaderName, HeaderValue)>, usize)>> {
+        if buf.starts_with(b"\r\n") {
+            return Ok(Some((Vec::new(), 2)));
+        }
+
+        let end = match ParsedRequestHead::head_end(buf) {
+            Some(range) => range.end,
+            None => return Ok(None),
+        };
+        let mut trailers = Vec::new();
+        let mut trailer_bytes = 0usize;
+        for line in buf[..end].split(|&byte| byte == b'\n') {
+            let line = line.strip_suffix(b"\r").unwrap_or(line);
+            if line.is_empty() {
+                continue;
+            }
+            trailer_bytes = trailer_bytes.saturating_add(line.len());
+            if trailer_bytes > MAX_TRAILER_BYTES {
+                return Err(Error::BadRequest("Trailer section too large".into()));
+            }
+            if let Some(colon) = line.iter().position(|&byte| byte == b':') {
+                let name = HeaderName::from_bytes(&line[..colon])
+                    .map_err(|_| Error::BadRequest("Invalid trailer header name".into()))?;
+                let value = line[colon + 1..]
+                    .strip_prefix(b" ")
+                    .unwrap_or(&line[colon + 1..]);
+                let value = HeaderValue::from_bytes(value)
+                    .map_err(|_| Error::BadRequest("Invalid trailer header value".into()))?;
+                if trailers.len() >= MAX_TRAILER_COUNT {
+                    return Err(Error::BadRequest("Too many trailers".into()));
+                }
+                trailers.push((name, value));
+            }
+        }
+        Ok(Some((trailers, end)))
+    }
+
+    fn find_crlf(buf: &[u8]) -> Option<usize> {
+        buf.windows(2).position(|window| window == b"\r\n")
     }
 }

@@ -93,12 +93,3 @@ where
         })
     }
 }
-
-impl<S> super::IntoServeResponse<'static> for Stream<S> {
-    fn into_serve_response(self) -> super::ServeInner<'static> {
-        unreachable!(
-            "Stream::into_serve_response — Stream routes \
-             route through Stream::write_head_stream"
-        )
-    }
-}

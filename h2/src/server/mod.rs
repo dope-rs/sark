@@ -14,6 +14,7 @@ pub type TlsEnv = Bundle<Tcp, Tls, Throughput>;
 
 mod app;
 mod body;
+pub mod driver;
 
 pub use app::{App, ConnState, Handler, Request, Response, SyncApp, SyncConnState, SyncHandler};
 pub use body::Body;

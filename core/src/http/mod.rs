@@ -31,13 +31,13 @@ pub use huffman::{HpackHuffman, HpackHuffmanError};
 pub use o3::buffer::{Borrowed, Bytes, Retained};
 pub use request::PathParamRanges;
 pub use response::{
-    Body, BodyInner, CHUNK_TERMINATOR, Chunked, DEFAULT_HEADER_CAPACITY, EncodedBody,
-    EncodedResponse, EncodedResponseInner, FixedResponse, FixedResponseInner, HeadInner,
-    HeaderItem, HeaderItemInner, HeaderList, HeaderNameRef, HeaderNameToken,
-    HeaderStaticValueToken, HeaderValueInner, Headers, HeadersInner, HotBodyInner, HotHeadInner,
-    HotTextInner, InlineHeaderValue, IntoBody, IntoHeaderName, IntoHeaderValue, IntoServeResponse,
-    IterStream, MonoResponseInner, NeverStream, OwnedShape, Response, ResponsePlan,
-    ResponsePlanInner, Serve, ServeInner, Shape, StaticResponseInner, Stream, TextBody, TextItem,
-    TextItemInner, TextSpec, apply_head_skip,
+    Body, BodyInner, CHUNK_TERMINATOR, CacheTemplate, Chunked, Compression,
+    DEFAULT_HEADER_CAPACITY, Egress, EncodedBody, EncodedResponse, EncodedResponseInner,
+    FixedResponse, FixedResponseInner, HeadInner, HeaderItem, HeaderItemInner, HeaderList,
+    HeaderNameRef, HeaderNameToken, HeaderStaticValueToken, HeaderValueInner, Headers,
+    HeadersInner, HotBodyInner, HotHeadInner, HotTextInner, InlineHeaderValue, IntoBody,
+    IntoHeaderName, IntoHeaderValue, IntoServeResponse, IterStream, MonoResponseInner, NeverStream,
+    OwnedShape, Response, ResponsePlan, ResponsePlanInner, ResponseView, Serve, ServeInner, Shape,
+    StaticResponseInner, Stream, TextBody, TextItem, TextItemInner, TextSpec, apply_head_skip,
 };
 pub use varint::VarInt;

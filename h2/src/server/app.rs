@@ -454,6 +454,21 @@ impl<'h, H: SyncHandler, W: Wire> SyncApp<'h, H, W> {
     }
 }
 
+struct SyncTransport<'a, 'h, H: SyncHandler, W: Wire> {
+    app: &'a SyncApp<'h, H, W>,
+    state: &'a mut ConnectionState,
+}
+
+impl<H: SyncHandler, W: Wire> super::driver::Transport for SyncTransport<'_, '_, H, W> {
+    fn connection(&mut self) -> &mut Conn<ServerRole> {
+        &mut self.state.connection
+    }
+
+    fn drain_events(&mut self) -> usize {
+        self.app.drain_events(self.state)
+    }
+}
+
 impl<'d, H: SyncHandler + 'd, W: Wire> Application<'d> for SyncApp<'d, H, W> {
     type Conn = SyncConnState;
     type Wire = W;
@@ -467,20 +482,9 @@ impl<'d, H: SyncHandler + 'd, W: Wire> Application<'d> for SyncApp<'d, H, W> {
     ) -> Outcome {
         let this = self.get_mut();
         let state = &mut slot.state.conn.state;
-        if state.connection.goaway_sent() || state.connection.goaway_received().is_some() {
-            return Outcome::Ok;
-        }
-        let mut result = state.connection.ingest(chunk.as_slice());
-        let error = loop {
-            let drained = this.drain_events(state);
-            match result {
-                Ok(()) => break None,
-                Err(conn::ConnError::Overload) if drained != 0 => {
-                    result = state.connection.resume();
-                }
-                Err(error) => break Some(error),
-            }
-        };
+        let error = super::driver::Driver::new(&mut SyncTransport { app: this, state })
+            .ingest(chunk.as_slice())
+            .err();
         if let Some(error) = error {
             let _ = state.connection.goaway(ErrorCode::from(&error), b"");
             flush_into(slot, aux, driver, true);
@@ -1090,6 +1094,22 @@ impl<'d, H: Handler + 'd, W: Wire> Drop for App<'d, H, W> {
     }
 }
 
+struct AsyncTransport<'a, 'turn, 'd, H: Handler + 'd, W: Wire> {
+    app: &'a mut App<'d, H, W>,
+    slot: &'a mut Slot<'d, W, listener::State<ConnState>>,
+    driver: &'a mut DriverContext<'turn, 'd>,
+}
+
+impl<'d, H: Handler + 'd, W: Wire> super::driver::Transport for AsyncTransport<'_, '_, 'd, H, W> {
+    fn connection(&mut self) -> &mut Conn<ServerRole> {
+        &mut self.slot.state.conn.state.connection
+    }
+
+    fn drain_events(&mut self) -> usize {
+        self.app.drain_events(self.slot, self.driver)
+    }
+}
+
 impl<'d, H: Handler + 'd, W: Wire> Application<'d> for App<'d, H, W> {
     type Conn = ConnState;
     type Wire = W;
@@ -1102,22 +1122,13 @@ impl<'d, H: Handler + 'd, W: Wire> Application<'d> for App<'d, H, W> {
         driver: &mut DriverContext<'_, 'd>,
     ) -> Outcome {
         let this = self.get_mut();
-        if slot.state.conn.state.connection.goaway_sent()
-            || slot.state.conn.state.connection.goaway_received().is_some()
-        {
-            return Outcome::Ok;
-        }
-        let mut result = slot.state.conn.state.connection.ingest(chunk.as_slice());
-        let error = loop {
-            let drained = this.drain_events(slot, driver);
-            match result {
-                Ok(()) => break None,
-                Err(conn::ConnError::Overload) if drained != 0 => {
-                    result = slot.state.conn.state.connection.resume();
-                }
-                Err(error) => break Some(error),
-            }
-        };
+        let error = super::driver::Driver::new(&mut AsyncTransport {
+            app: this,
+            slot,
+            driver,
+        })
+        .ingest(chunk.as_slice())
+        .err();
         if let Some(error) = error {
             let state = &mut slot.state.conn.state;
             let _ = state.connection.goaway(ErrorCode::from(&error), b"");

@@ -2,7 +2,8 @@
 
 use arbitrary::Arbitrary;
 use libfuzzer_sys::fuzz_target;
-use sark::framer::Http;
+use sark::framer::FusedHead;
+use sark_core::http::codec::{HeaderScan, ParsedRequestHead};
 
 #[derive(Arbitrary, Debug)]
 enum Method {
@@ -233,7 +234,7 @@ fn drive_httparse_header_scan(buf: &[u8]) {
     let mut headers = [httparse::EMPTY_HEADER; 64];
     let mut req = httparse::Request::new(&mut headers);
     if let Ok(httparse::Status::Complete(_)) = req.parse(buf) {
-        let _ = sark_core::http::codec::Parse::header_scan(req.headers);
+        let _ = HeaderScan::parse(req.headers);
     }
 }
 
@@ -274,7 +275,7 @@ fn drive_slice_probes(buf: &[u8]) {
     }
 }
 
-fn drive_request_path(buf: &[u8], head: &sark::framer::ParsedHead<'_>) {
+fn drive_request_path(buf: &[u8], head: &ParsedRequestHead<'_>) {
     use sark::request::Ref;
 
     let base = buf.as_ptr() as usize;
@@ -301,10 +302,10 @@ fn check(buf: &[u8]) {
     drive_httparse_header_scan(buf);
     drive_slice_probes(buf);
 
-    let parsed = Http::parse_head(buf);
+    let parsed = ParsedRequestHead::parse(buf);
     let oracle = httparse_request_line(buf);
 
-    let fused = Http::parse_head_fused(buf);
+    let fused = FusedHead::parse(buf);
     match (&parsed, &fused) {
         (Some(a), Some(f)) => {
             assert_eq!(a.method, f.head.method, "fused method drift");

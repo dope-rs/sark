@@ -3,7 +3,7 @@ use o3::collections::{FixedHashTable, FixedQueue, Slab, SlabKey};
 use sark_h2::{ClientRole, Conn, ConnError, ErrorCode, StreamId, conn};
 
 use crate::Codec;
-use crate::frame::{DataChunk, Deframer, FrameError, MessageFrame};
+use crate::frame::{DataChunk, Deframer, MessageFrame};
 use crate::headers::{HeaderBlock, ResponseHead};
 use crate::metadata::Metadata;
 use crate::status::{Code, Status};
@@ -932,44 +932,5 @@ impl PendingRequest {
 impl Default for Session {
     fn default() -> Self {
         Self::new()
-    }
-}
-
-impl Status {
-    pub fn from_conn_err(err: ConnError) -> Status {
-        let code = match err {
-            ConnError::StreamGoneAway | ConnError::GoAwayReceived(_) => Code::Unavailable,
-            ConnError::StreamLimit => Code::ResourceExhausted,
-            ConnError::FlowControl => Code::ResourceExhausted,
-            ConnError::Overload => Code::ResourceExhausted,
-            ConnError::StreamClosed => Code::Unavailable,
-            _ => Code::Internal,
-        };
-        Status::new(code, format!("HTTP/2 error: {err:?}"))
-    }
-
-    pub fn from_frame_err(err: FrameError) -> Status {
-        match err {
-            FrameError::BadCompressionFlag(_) => {
-                Status::new(Code::InvalidArgument, "bad gRPC compression flag")
-            }
-            FrameError::MessageTooLarge { .. } => {
-                Status::new(Code::ResourceExhausted, "gRPC message too large")
-            }
-            FrameError::LengthOverflow => {
-                Status::new(Code::Internal, "gRPC message length overflow")
-            }
-            FrameError::Capacity => {
-                Status::new(Code::ResourceExhausted, "gRPC message pool is full")
-            }
-        }
-    }
-
-    pub fn from_reset_err(error: ErrorCode) -> Status {
-        match error {
-            ErrorCode::Cancel => Status::new(Code::Cancelled, "HTTP/2 stream cancelled"),
-            ErrorCode::RefusedStream => Status::new(Code::Unavailable, "HTTP/2 stream refused"),
-            _ => Status::new(Code::Internal, format!("HTTP/2 stream reset: {error:?}")),
-        }
     }
 }

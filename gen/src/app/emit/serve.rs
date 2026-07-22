@@ -1280,7 +1280,7 @@ impl<'a> ServeEmit<'a> {
                     permit: ::sark::dispatch::conn_state::DispatchPermit,
                     state: &'d #state_ty,
                     req_bytes: &'buf [u8],
-                    head: &::sark::framer::ParsedHead<'buf>,
+                    head: &::sark::sark_core::http::codec::ParsedRequestHead<'buf>,
                     method_key: ::sark::service::Key,
                     date: &[u8; 29],
                     write: &mut [u8],
@@ -1341,7 +1341,7 @@ impl<'a> ServeEmit<'a> {
                 ) -> ::sark::dispatch::ConsumeOutcome {
                     let this = self.get_mut();
                     let ::core::option::Option::Some(fused) =
-                        ::sark::framer::Http::parse_head_fused(bytes)
+                        ::sark::framer::FusedHead::parse(bytes)
                     else {
                         return ::sark::dispatch::ConsumeOutcome::NeedMore {
                             permit,

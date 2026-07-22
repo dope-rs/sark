@@ -1,7 +1,7 @@
 use dope::manifold::connector;
 use o3::buffer;
 use sark_core::http::codec::chunked::{BodyDecoder, DecodeEvent};
-use sark_core::http::codec::{BodyKind, DecodeMode, Parse};
+use sark_core::http::codec::{BodyKind, DecodeMode, ResponseDecoder};
 
 const DEFAULT_MAX_RESPONSE_BODY: usize = 16 * 1024 * 1024;
 
@@ -48,7 +48,7 @@ impl connector::Codec for Codec {
     fn parse(&self, state: &mut ParseState, buf: &buffer::Shared) -> Option<(Head, usize)> {
         let bytes = buf.as_ref();
         if state.framing.is_none() {
-            let head = match Parse::head(bytes, DecodeMode::Response) {
+            let head = match ResponseDecoder::new(DecodeMode::Response).head(bytes) {
                 Ok(Some(h)) => h,
                 Ok(None) => return None,
                 Err(_) => return None,

@@ -21,8 +21,14 @@ pub struct HeaderScan {
     pub accept_encoding_gzip: bool,
 }
 
-impl crate::http::codec::Parse {
-    pub(super) fn parse_transfer_encoding_value(value: &[u8]) -> Result<TransferEncodingInfo> {
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum BodyFraming {
+    Length(usize),
+    Chunked,
+}
+
+impl HeaderScan {
+    pub(super) fn transfer_encoding(value: &[u8]) -> Result<TransferEncodingInfo> {
         let mut saw_any = false;
         let mut saw_chunked = false;
         let mut last_is_chunked = false;
@@ -81,7 +87,7 @@ impl crate::http::codec::Parse {
         })
     }
 
-    pub fn header_scan(headers: &[httparse::Header<'_>]) -> Result<HeaderScan> {
+    pub fn parse(headers: &[httparse::Header<'_>]) -> Result<Self> {
         let mut content_length: Option<usize> = None;
         let mut saw_content_length = false;
         let mut has_transfer_encoding = false;
@@ -107,7 +113,7 @@ impl crate::http::codec::Parse {
             }
 
             if h.name.eq_ignore_ascii_case("transfer-encoding") {
-                let te = Self::parse_transfer_encoding_value(h.value)?;
+                let te = Self::transfer_encoding(h.value)?;
                 has_transfer_encoding = has_transfer_encoding || te.has_transfer_encoding;
                 if te.is_chunked {
                     is_chunked_transfer = true;
@@ -149,5 +155,27 @@ impl crate::http::codec::Parse {
                 h.name.eq_ignore_ascii_case("transfer-encoding")
                     && Header::has_token(h.value, b"chunked")
             })
+    }
+
+    pub fn validate_for_request(&self) -> Result<BodyFraming> {
+        if self.duplicate_content_length {
+            return Err(Error::BadRequest(
+                "Multiple Content-Length headers are not allowed".into(),
+            ));
+        }
+        if self.has_transfer_encoding {
+            if self.content_length.is_some() {
+                return Err(Error::BadRequest(
+                    "Content-Length with Transfer-Encoding is not allowed".into(),
+                ));
+            }
+            if self.is_chunked_transfer {
+                return Ok(BodyFraming::Chunked);
+            }
+            return Err(Error::BadRequest(
+                "Transfer-Encoding is not supported".into(),
+            ));
+        }
+        Ok(BodyFraming::Length(self.content_length.unwrap_or(0)))
     }
 }

@@ -3,6 +3,8 @@ use http::{HeaderName, HeaderValue, StatusCode};
 use crate::error::{Error, Result};
 use crate::http::Response;
 use crate::http::codec::Header;
+use crate::http::codec::decode::HeaderScan;
+use crate::http::codec::decode::chunked::BodyDecoder;
 
 const MAX_HEADERS: usize = 100;
 
@@ -56,8 +58,16 @@ pub struct DecodedHead {
     pub body_kind: BodyKind,
 }
 
-impl crate::http::codec::Parse {
-    pub fn status_has_no_body(status: StatusCode) -> bool {
+pub struct ResponseDecoder {
+    mode: DecodeMode,
+}
+
+impl ResponseDecoder {
+    pub const fn new(mode: DecodeMode) -> Self {
+        Self { mode }
+    }
+
+    fn status_has_no_body(status: StatusCode) -> bool {
         let code = status.as_u16();
         code < 200 || code == 204 || code == 304
     }
@@ -98,7 +108,7 @@ impl crate::http::codec::Parse {
                         content_length = Some(len);
                     }
                     if name == "transfer-encoding" {
-                        let te = Self::parse_transfer_encoding_value(value.as_bytes())?;
+                        let te = HeaderScan::transfer_encoding(value.as_bytes())?;
                         has_transfer_encoding = has_transfer_encoding || te.has_transfer_encoding;
                         if te.is_chunked {
                             is_chunked = true;
@@ -145,13 +155,13 @@ impl crate::http::codec::Parse {
         resp
     }
 
-    pub fn head(buf: &[u8], mode: DecodeMode) -> Result<Option<DecodedHead>> {
+    pub fn head(&self, buf: &[u8]) -> Result<Option<DecodedHead>> {
         let head = match Self::parse(buf)? {
             Some(h) => h,
             None => return Ok(None),
         };
 
-        let body_kind = if mode.is_head() || Self::status_has_no_body(head.status) {
+        let body_kind = if self.mode.is_head() || Self::status_has_no_body(head.status) {
             BodyKind::NoBody
         } else if head.is_chunked {
             BodyKind::Chunked
@@ -169,20 +179,20 @@ impl crate::http::codec::Parse {
         }))
     }
 
-    pub fn response(buf: &[u8], mode: DecodeMode) -> Result<Option<Response>> {
+    pub fn response(&self, buf: &[u8]) -> Result<Option<Response>> {
         let head = match Self::parse(buf)? {
             Some(h) => h,
             None => return Ok(None),
         };
 
-        if mode.is_head() || Self::status_has_no_body(head.status) {
+        if self.mode.is_head() || Self::status_has_no_body(head.status) {
             return Ok(Some(Self::build_response(head, &[], &[])));
         }
 
         let body_data = &buf[head.header_len..];
 
         if head.is_chunked {
-            match Self::try_decode_chunked(body_data)? {
+            match BodyDecoder::decode_all(body_data, BodyDecoder::DEFAULT_MAX_BODY)? {
                 Some(result) => Ok(Some(Self::build_response(
                     head,
                     &result.body,
@@ -199,13 +209,13 @@ impl crate::http::codec::Parse {
         }
     }
 
-    pub fn response_after_eof(buf: &[u8]) -> Result<Response> {
+    pub fn response_after_eof(&self, buf: &[u8]) -> Result<Response> {
         let head = Self::parse(buf)?
             .ok_or_else(|| Error::BadRequest("Incomplete HTTP response".into()))?;
         let body_data = &buf[head.header_len..];
 
         if head.is_chunked {
-            let result = Self::try_decode_chunked(body_data)?
+            let result = BodyDecoder::decode_all(body_data, BodyDecoder::DEFAULT_MAX_BODY)?
                 .ok_or_else(|| Error::BadRequest("Incomplete chunked response".into()))?;
             Ok(Self::build_response(head, &result.body, &result.trailers))
         } else {

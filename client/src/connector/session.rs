@@ -15,7 +15,7 @@ use o3::cell::RawCell;
 use o3::collections::SlotQueue;
 use o3::mem::ByteBudget;
 use sark_core::http::Response;
-use sark_core::http::codec::{DecodeMode, HeaderLookup, Parse};
+use sark_core::http::codec::{DecodeMode, HeaderLookup, ResponseDecoder};
 
 use crate::connector::codec::{self, Head};
 use crate::connector::error::Error;
@@ -514,7 +514,7 @@ impl<'d> connector::Session<'d> for Session<'d> {
         let buffered = head.full.len();
         let bytes = head.full.as_ref();
         let (outcome, keep_alive, keepalive_timeout) =
-            match Parse::response(bytes, DecodeMode::Response) {
+            match ResponseDecoder::new(DecodeMode::Response).response(bytes) {
                 Ok(Some(mut resp)) => {
                     let keep = Self::should_keep_alive(&resp);
                     let timeout = Self::keepalive_timeout(&resp);

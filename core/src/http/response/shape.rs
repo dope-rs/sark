@@ -1,118 +1,111 @@
-use dope_fiber::{Context, Fiber};
 use http::StatusCode;
-use o3::buffer::Shared;
+use o3::buffer::{Pooled, Shared};
+
+use crate::http::compress::Gzip;
 
 use super::{
-    Chunked, EncodedBody, EncodedResponseInner, FixedResponseInner, MonoResponseInner, ServeInner,
-    StaticResponseInner, Stream,
+    Chunked, EncodedBody, EncodedResponseInner, FixedResponseInner, MonoResponseInner, NeverStream,
+    ServeInner, StaticResponseInner, Stream,
 };
 
-pub struct NeverStream(std::marker::PhantomData<()>);
+pub enum Egress<S> {
+    Inline { written: usize },
+    Static { head: usize, body: &'static [u8] },
+    Shared { head: usize, body: Shared },
+    Pooled { head: usize, body: Pooled },
+    Stream { head: usize, stream: S },
+    Failed,
+}
 
-impl<'d> Fiber<'d> for NeverStream {
-    type Output = Option<Shared>;
-    fn poll(
-        self: std::pin::Pin<&mut Self>,
-        _cx: std::pin::Pin<&mut Context<'_, 'd>>,
-    ) -> std::task::Poll<Self::Output> {
-        unreachable!("NeverStream polled — non-Stream Shape")
-    }
+pub enum Compression<T, S> {
+    Plain(T),
+    Compressed(Egress<S>),
+}
+
+pub enum CacheTemplate {
+    Inline {
+        bytes: Vec<u8>,
+        date_offset: usize,
+    },
+    Static {
+        head: Vec<u8>,
+        date_offset: usize,
+        body: &'static [u8],
+    },
+}
+
+pub struct ResponseView {
+    pub status: StatusCode,
+    pub headers: Shared,
+    pub body: Shared,
 }
 
 pub trait Shape<'req>: Sized {
     type StreamInner: 'static;
 
-    fn write_into_slice(&self, out: &mut [u8], date: &[u8; 29]) -> Option<usize> {
-        let _ = (out, date);
-        unreachable!("Shape::write_into_slice called on non-Fixed shape")
-    }
+    fn egress(self, out: &mut [u8], date: &[u8; 29]) -> Egress<Self::StreamInner>;
 
-    fn preserialize(&self) -> (Vec<u8>, usize) {
-        unreachable!("Shape::preserialize called on non-Fixed shape")
-    }
-
-    fn write_head_only(&self, out: &mut [u8], date: &[u8; 29]) -> Option<(usize, &'static [u8])> {
-        let _ = (out, date);
-        unreachable!("Shape::write_head_only called on non-Static-body shape")
-    }
-
-    fn write_head_split(self, out: &mut [u8], date: &[u8; 29]) -> Option<(usize, Shared)> {
-        let _ = (out, date);
-        None
-    }
-
-    fn preserialize_static(&self) -> Option<(Vec<u8>, usize, &'static [u8])> {
-        None
-    }
-
-    fn write_head_stream(
+    fn compress(
         self,
-        out: &mut [u8],
-        date: &[u8; 29],
-    ) -> Option<(usize, Self::StreamInner)> {
-        let _ = (out, date);
-        unreachable!("Shape::write_head_stream called on non-Stream-body shape")
+        _gzip: &mut Gzip,
+        _out: &mut [u8],
+        _date: &[u8; 29],
+    ) -> Compression<Self, Self::StreamInner> {
+        Compression::Plain(self)
     }
 
-    fn body_for_gzip(&self) -> Option<&[u8]> {
+    fn cache_template(&self) -> Option<CacheTemplate> {
         None
     }
 
-    fn write_gzip_head(self, out: &mut [u8], date: &[u8; 29], body_len: usize) -> Option<usize> {
-        let _ = (out, date, body_len);
-        unreachable!("Shape::write_gzip_head called on shape without body_for_gzip")
-    }
-
-    fn status(&self) -> StatusCode {
-        unreachable!("Shape::status called on shape without a status line")
-    }
-
-    fn body_bytes(&self) -> &[u8] {
-        &[]
-    }
-
-    fn headers_wire(&self) -> Shared {
-        Shared::new()
+    fn response_view(&self) -> Option<ResponseView> {
+        None
     }
 }
 
 impl<'req, const N: usize> Shape<'req> for FixedResponseInner<'req, N> {
     type StreamInner = NeverStream;
 
-    fn write_into_slice(&self, out: &mut [u8], date: &[u8; 29]) -> Option<usize> {
-        FixedResponseInner::write_into_slice(self, out, date)
-    }
-
-    fn write_head_split(self, out: &mut [u8], date: &[u8; 29]) -> Option<(usize, Shared)> {
-        FixedResponseInner::write_head_split(self, out, date)
-    }
-
-    fn preserialize(&self) -> (Vec<u8>, usize) {
-        FixedResponseInner::preserialize(self)
-    }
-
-    fn body_for_gzip(&self) -> Option<&[u8]> {
-        if self.has_content_encoding() {
-            None
-        } else {
-            Some(self.body_ref())
+    fn egress(self, out: &mut [u8], date: &[u8; 29]) -> Egress<Self::StreamInner> {
+        if let Some(written) = self.write_into_slice(out, date) {
+            return Egress::Inline { written };
+        }
+        match self.write_head_split(out, date) {
+            Some((head, body)) => Egress::Shared { head, body },
+            None => Egress::Failed,
         }
     }
 
-    fn write_gzip_head(self, out: &mut [u8], date: &[u8; 29], body_len: usize) -> Option<usize> {
-        FixedResponseInner::write_gzip_head(self, out, date, body_len)
+    fn compress(
+        self,
+        gzip: &mut Gzip,
+        out: &mut [u8],
+        date: &[u8; 29],
+    ) -> Compression<Self, Self::StreamInner> {
+        if self.has_content_encoding() || self.body_ref().is_empty() {
+            return Compression::Plain(self);
+        }
+        let Some(body) = gzip.encode(self.body_ref()) else {
+            return Compression::Plain(self);
+        };
+        let body_len = body.len();
+        match self.write_gzip_head(out, date, body_len) {
+            Some(head) => Compression::Compressed(Egress::Pooled { head, body }),
+            None => Compression::Compressed(Egress::Failed),
+        }
     }
 
-    fn status(&self) -> StatusCode {
-        FixedResponseInner::status(self)
+    fn cache_template(&self) -> Option<CacheTemplate> {
+        let (bytes, date_offset) = self.preserialize();
+        Some(CacheTemplate::Inline { bytes, date_offset })
     }
 
-    fn body_bytes(&self) -> &[u8] {
-        self.body_ref()
-    }
-
-    fn headers_wire(&self) -> Shared {
-        self.wire_headers()
+    fn response_view(&self) -> Option<ResponseView> {
+        Some(ResponseView {
+            status: self.status(),
+            headers: self.wire_headers(),
+            body: self.body.clone(),
+        })
     }
 }
 
@@ -122,80 +115,91 @@ where
 {
     type StreamInner = NeverStream;
 
-    fn write_into_slice(&self, out: &mut [u8], date: &[u8; 29]) -> Option<usize> {
-        EncodedResponseInner::write_into_slice(self, out, date)
+    fn egress(self, out: &mut [u8], date: &[u8; 29]) -> Egress<Self::StreamInner> {
+        if let Some(written) = self.write_into_slice(out, date) {
+            return Egress::Inline { written };
+        }
+        match self.write_head_split(out, date) {
+            Some((head, body)) => Egress::Shared { head, body },
+            None => Egress::Failed,
+        }
     }
 
-    fn write_head_split(self, out: &mut [u8], date: &[u8; 29]) -> Option<(usize, Shared)> {
-        EncodedResponseInner::write_head_split(self, out, date)
+    fn cache_template(&self) -> Option<CacheTemplate> {
+        let (bytes, date_offset) = self.preserialize();
+        Some(CacheTemplate::Inline { bytes, date_offset })
     }
 
-    fn preserialize(&self) -> (Vec<u8>, usize) {
-        EncodedResponseInner::preserialize(self)
-    }
-
-    fn status(&self) -> StatusCode {
-        EncodedResponseInner::status(self)
-    }
-
-    fn headers_wire(&self) -> Shared {
-        EncodedResponseInner::wire_headers(self)
+    fn response_view(&self) -> Option<ResponseView> {
+        Some(ResponseView {
+            status: self.status(),
+            headers: self.wire_headers(),
+            body: self.encoded_body(),
+        })
     }
 }
 
 impl<'req, const N: usize> Shape<'req> for MonoResponseInner<'req, N> {
     type StreamInner = NeverStream;
 
-    fn write_into_slice(&self, out: &mut [u8], date: &[u8; 29]) -> Option<usize> {
-        MonoResponseInner::write_into_slice(self, out, date)
+    fn egress(self, out: &mut [u8], date: &[u8; 29]) -> Egress<Self::StreamInner> {
+        if let Some(written) = self.write_into_slice(out, date) {
+            return Egress::Inline { written };
+        }
+        match self.write_head_split(out, date) {
+            Some((head, body)) => Egress::Shared { head, body },
+            None => Egress::Failed,
+        }
     }
 
-    fn write_head_split(self, out: &mut [u8], date: &[u8; 29]) -> Option<(usize, Shared)> {
-        MonoResponseInner::write_head_split(self, out, date)
+    fn response_view(&self) -> Option<ResponseView> {
+        Some(ResponseView {
+            status: self.status(),
+            headers: self.wire_headers(),
+            body: self.body.clone().into_shared(),
+        })
     }
 }
 
 impl<'req, const N: usize> Shape<'req> for StaticResponseInner<'req, N> {
     type StreamInner = NeverStream;
 
-    fn write_into_slice(&self, out: &mut [u8], date: &[u8; 29]) -> Option<usize> {
-        StaticResponseInner::write_into_slice(self, out, date)
+    fn egress(self, out: &mut [u8], date: &[u8; 29]) -> Egress<Self::StreamInner> {
+        match self.write_head_only(out, date) {
+            Some((head, body)) => Egress::Static { head, body },
+            None => Egress::Failed,
+        }
     }
 
-    fn write_head_only(&self, out: &mut [u8], date: &[u8; 29]) -> Option<(usize, &'static [u8])> {
-        StaticResponseInner::write_head_only(self, out, date)
+    fn cache_template(&self) -> Option<CacheTemplate> {
+        let (head, date_offset, body) = self.preserialize_static();
+        Some(CacheTemplate::Static {
+            head,
+            date_offset,
+            body,
+        })
     }
 
-    fn write_head_split(self, out: &mut [u8], date: &[u8; 29]) -> Option<(usize, Shared)> {
-        StaticResponseInner::write_head_split(self, out, date)
-    }
-
-    fn preserialize_static(&self) -> Option<(Vec<u8>, usize, &'static [u8])> {
-        Some(StaticResponseInner::preserialize_static(self))
-    }
-
-    fn status(&self) -> StatusCode {
-        StaticResponseInner::status(self)
-    }
-
-    fn body_bytes(&self) -> &[u8] {
-        self.body_ref()
-    }
-
-    fn headers_wire(&self) -> Shared {
-        StaticResponseInner::wire_headers(self)
+    fn response_view(&self) -> Option<ResponseView> {
+        Some(ResponseView {
+            status: self.status(),
+            headers: self.wire_headers(),
+            body: Shared::from_static(self.body_ref()),
+        })
     }
 }
 
 impl<'req> Shape<'req> for Chunked {
     type StreamInner = NeverStream;
 
-    fn write_into_slice(&self, out: &mut [u8], date: &[u8; 29]) -> Option<usize> {
-        Self::write_into_slice(self, out, date)
-    }
-
-    fn write_head_split(self, out: &mut [u8], date: &[u8; 29]) -> Option<(usize, Shared)> {
-        Chunked::write_head_split(self, out, date)
+    fn egress(self, out: &mut [u8], date: &[u8; 29]) -> Egress<Self::StreamInner> {
+        if let Some(written) = self.write_into_slice(out, date) {
+            return Egress::Inline { written };
+        }
+        match self.write_head_split(out, date) {
+            Some((head, body)) => Egress::Shared { head, body },
+            None => Egress::Failed,
+        }
     }
 }
 
@@ -205,72 +209,52 @@ where
 {
     type StreamInner = S;
 
-    fn write_head_stream(self, out: &mut [u8], date: &[u8; 29]) -> Option<(usize, S)> {
-        Stream::<S>::write_head_stream(self, out, date)
+    fn egress(self, out: &mut [u8], date: &[u8; 29]) -> Egress<Self::StreamInner> {
+        match self.write_head_stream(out, date) {
+            Some((head, stream)) => Egress::Stream { head, stream },
+            None => Egress::Failed,
+        }
     }
 }
 
 impl<'req, const N: usize> Shape<'req> for ServeInner<'req, N> {
     type StreamInner = NeverStream;
 
-    fn write_into_slice(&self, out: &mut [u8], date: &[u8; 29]) -> Option<usize> {
+    fn egress(self, out: &mut [u8], date: &[u8; 29]) -> Egress<Self::StreamInner> {
         match self {
-            Self::Fixed(f) => f.write_into_slice(out, date),
-            Self::Mono(m) => m.write_into_slice(out, date),
-            Self::Chunked(c) => c.write_into_slice(out, date),
+            Self::Fixed(response) => response.egress(out, date),
+            Self::Mono(response) => response.egress(out, date),
+            Self::Chunked(response) => response.egress(out, date),
         }
     }
 
-    fn preserialize(&self) -> (Vec<u8>, usize) {
+    fn compress(
+        self,
+        gzip: &mut Gzip,
+        out: &mut [u8],
+        date: &[u8; 29],
+    ) -> Compression<Self, Self::StreamInner> {
         match self {
-            Self::Fixed(f) => f.preserialize(),
-            Self::Mono(_) | Self::Chunked(_) => {
-                unreachable!("Shape::preserialize: STATIC_RESPONSE route returned non-Fixed")
-            }
+            Self::Fixed(response) => match response.compress(gzip, out, date) {
+                Compression::Plain(response) => Compression::Plain(Self::Fixed(response)),
+                Compression::Compressed(egress) => Compression::Compressed(egress),
+            },
+            response => Compression::Plain(response),
         }
     }
 
-    fn write_head_split(self, out: &mut [u8], date: &[u8; 29]) -> Option<(usize, Shared)> {
+    fn cache_template(&self) -> Option<CacheTemplate> {
         match self {
-            Self::Mono(m) => MonoResponseInner::write_head_split(m, out, date),
-            Self::Chunked(c) => Chunked::write_head_split(c, out, date),
-            Self::Fixed(f) => FixedResponseInner::write_head_split(f, out, date),
+            Self::Fixed(response) => response.cache_template(),
+            Self::Mono(_) | Self::Chunked(_) => None,
         }
     }
 
-    fn body_for_gzip(&self) -> Option<&[u8]> {
+    fn response_view(&self) -> Option<ResponseView> {
         match self {
-            Self::Fixed(f) if !f.has_content_encoding() => Some(f.body_ref()),
-            _ => None,
-        }
-    }
-
-    fn write_gzip_head(self, out: &mut [u8], date: &[u8; 29], body_len: usize) -> Option<usize> {
-        match self {
-            Self::Fixed(f) => FixedResponseInner::write_gzip_head(f, out, date, body_len),
-            _ => unreachable!("write_gzip_head on non-Fixed ServeInner"),
-        }
-    }
-
-    fn status(&self) -> StatusCode {
-        match self {
-            Self::Fixed(f) => f.status(),
-            Self::Mono(m) => m.status(),
-            Self::Chunked(_) => StatusCode::OK,
-        }
-    }
-
-    fn body_bytes(&self) -> &[u8] {
-        match self {
-            Self::Fixed(f) => f.body_ref(),
-            Self::Mono(_) | Self::Chunked(_) => &[],
-        }
-    }
-
-    fn headers_wire(&self) -> Shared {
-        match self {
-            Self::Fixed(f) => f.wire_headers(),
-            Self::Mono(_) | Self::Chunked(_) => Shared::new(),
+            Self::Fixed(response) => response.response_view(),
+            Self::Mono(response) => response.response_view(),
+            Self::Chunked(_) => None,
         }
     }
 }

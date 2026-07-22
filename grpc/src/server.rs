@@ -1130,6 +1130,23 @@ pub struct App<H: Handler, W: Wire = Identity> {
     _wire: ::std::marker::PhantomData<W>,
 }
 
+struct GrpcTransport<'a, H: Handler, W: Wire> {
+    app: &'a mut App<H, W>,
+    state: &'a mut ConnState,
+}
+
+impl<H: Handler, W: Wire> sark_h2::server::driver::Transport for GrpcTransport<'_, H, W> {
+    fn connection(&mut self) -> &mut Conn<ServerRole> {
+        &mut self.state.h2
+    }
+
+    fn drain_events(&mut self) -> usize {
+        let drained = self.app.drain_events(self.state);
+        self.state.drive_pending();
+        drained
+    }
+}
+
 impl<H: Handler, W: Wire> App<H, W> {
     pub fn new(handler: H) -> Self {
         Self::with_config(handler, Limits::default())
@@ -1431,24 +1448,12 @@ impl<H: Handler, W: Wire> App<H, W> {
                 return manifold::Outcome::Ok;
             }
         }
-        let error = {
-            let state = project(&mut slot.state.conn);
-            if state.h2.goaway_sent() || state.h2.goaway_received().is_some() {
-                return manifold::Outcome::Ok;
-            }
-            let mut result = state.h2.ingest(bytes);
-            loop {
-                let drained = self.drain_events(state);
-                state.drive_pending();
-                match result {
-                    Ok(()) => break None,
-                    Err(conn::ConnError::Overload) if drained != 0 => {
-                        result = state.h2.resume();
-                    }
-                    Err(error) => break Some(error),
-                }
-            }
-        };
+        let error = sark_h2::server::driver::Driver::new(&mut GrpcTransport {
+            app: self,
+            state: project(&mut slot.state.conn),
+        })
+        .ingest(bytes)
+        .err();
         if let Some(error) = error {
             let state = project(&mut slot.state.conn);
             let code = ErrorCode::from(&error);

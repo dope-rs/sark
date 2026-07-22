@@ -410,7 +410,7 @@ impl<H: Handler> App<H> {
             response.close_after = true;
             return;
         }
-        let Some(crlf) = sark_core::http::codec::Parse::find_double_crlf(&state.acc) else {
+        let Some(crlf) = sark_core::http::codec::ParsedRequestHead::head_end(&state.acc) else {
             return;
         };
         let head_len = crlf.end;

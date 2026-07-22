@@ -1,11 +1,10 @@
 use http::Method;
-
-use crate::parser::framer::ParsedHead;
+use sark_core::http::codec::ParsedRequestHead;
 
 pub struct Ctx<'a> {
     pub method: &'a Method,
     pub head_bytes: &'a [u8],
-    pub head: &'a ParsedHead<'a>,
+    pub head: &'a ParsedRequestHead<'a>,
     pub date: &'a [u8; 29],
 }
 

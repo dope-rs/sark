@@ -1,4 +1,8 @@
-use crate::metadata::Metadata;
+use sark_core::http::OwnedField;
+use sark_h2::{ConnError, ErrorCode};
+
+use crate::frame::FrameError;
+use crate::metadata::{Metadata, MetadataError};
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 #[repr(u8)]
@@ -161,6 +165,67 @@ impl Status {
             b'a'..=b'f' => Some(10 + b - b'a'),
             b'A'..=b'F' => Some(10 + b - b'A'),
             _ => None,
+        }
+    }
+
+    pub fn parse_h2_trailers(headers: &[OwnedField]) -> Result<(Status, Metadata), Status> {
+        let raw_code = headers
+            .iter()
+            .find(|header| header.name == b"grpc-status")
+            .map(|header| header.value.as_slice());
+        let Some(raw_code) = raw_code else {
+            return Err(Status::new(Code::Internal, "missing grpc-status"));
+        };
+        let Some(code) = Code::parse_ascii(raw_code) else {
+            return Err(Status::new(Code::Internal, "invalid grpc-status"));
+        };
+        let message = headers
+            .iter()
+            .find(|header| header.name == b"grpc-message")
+            .map(|header| Status::decode_message(&header.value))
+            .unwrap_or_default();
+        let metadata = Metadata::from_h2_fields(headers)?;
+        Ok((Status::new(code, message), metadata))
+    }
+
+    pub fn from_metadata_err(error: MetadataError) -> Status {
+        Status::new(Code::Internal, format!("bad metadata: {error:?}"))
+    }
+
+    pub fn from_conn_err(error: ConnError) -> Status {
+        let code = match error {
+            ConnError::StreamGoneAway | ConnError::GoAwayReceived(_) => Code::Unavailable,
+            ConnError::StreamLimit | ConnError::FlowControl | ConnError::Overload => {
+                Code::ResourceExhausted
+            }
+            ConnError::StreamClosed => Code::Unavailable,
+            _ => Code::Internal,
+        };
+        Status::new(code, format!("HTTP/2 error: {error:?}"))
+    }
+
+    pub fn from_frame_err(error: FrameError) -> Status {
+        match error {
+            FrameError::BadCompressionFlag(_) => {
+                Status::new(Code::InvalidArgument, "bad gRPC compression flag")
+            }
+            FrameError::MessageTooLarge { .. } => {
+                Status::new(Code::ResourceExhausted, "gRPC message too large")
+            }
+            FrameError::LengthOverflow => {
+                Status::new(Code::Internal, "gRPC message length overflow")
+            }
+            FrameError::Capacity => {
+                Status::new(Code::ResourceExhausted, "gRPC message pool is full")
+            }
+        }
+    }
+
+    pub fn from_reset_err(error: ErrorCode) -> Status {
+        match error {
+            ErrorCode::Cancel => Status::new(Code::Cancelled, "HTTP/2 stream cancelled"),
+            ErrorCode::RefusedStream => Status::new(Code::Unavailable, "HTTP/2 stream refused"),
+            _ => Status::new(Code::Internal, format!("HTTP/2 stream reset: {error:?}")),
         }
     }
 }

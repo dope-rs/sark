@@ -293,7 +293,7 @@ impl connector::Codec for Codec {
 impl Codec {
     fn parse_handshake_response(buf: &Shared, state: &mut State) -> Option<(Head, usize)> {
         let bytes = buf.as_slice();
-        let head_len = sark_core::http::codec::Parse::find_double_crlf(bytes)?.end;
+        let head_len = sark_core::http::codec::ParsedRequestHead::head_end(bytes)?.end;
         let head = std::str::from_utf8(&bytes[..head_len]).ok()?;
 
         let status_ok = head.starts_with("HTTP/1.1 101");

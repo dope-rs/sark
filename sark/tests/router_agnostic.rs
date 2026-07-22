@@ -2,7 +2,7 @@ use http::{Method, StatusCode};
 use o3::buffer::{Bytes, Retained};
 use sark::dispatch::{Decode, Pipeline};
 use sark::service::{RouteRequestImpl, RouteSpec, SliceValue};
-use sark_core::http::Shape;
+use sark_core::http::{CacheTemplate, Shape};
 
 #[sark_gen::response(raw)]
 struct Reply {
@@ -102,11 +102,13 @@ fn agnostic_dispatch_routes_feeds_invokes_encodes() {
 }
 
 fn write_response<'r, R: RouteSpec>(resp: &R::Response<'r>) -> Vec<u8> {
-    let mut buf = vec![0u8; 4096];
-    let date = [b' '; 29];
-    let n = Shape::write_into_slice(resp, &mut buf, &date).expect("write response");
-    buf.truncate(n);
-    buf
+    match resp.cache_template().expect("cacheable response") {
+        CacheTemplate::Inline { bytes, .. } => bytes,
+        CacheTemplate::Static { mut head, body, .. } => {
+            head.extend_from_slice(body);
+            head
+        }
+    }
 }
 
 #[test]
@@ -126,7 +128,9 @@ fn agnostic_core_runs_without_h1_buffer() {
     )
     .expect("build_and_invoke");
     assert_eq!(resp.status(), StatusCode::OK);
-    let (_, _, body) = Shape::preserialize_static(&resp).expect("static body");
+    let CacheTemplate::Static { body, .. } = resp.cache_template().expect("static body") else {
+        panic!("expected static response")
+    };
     assert_eq!(body, b"ok");
     let bytes = write_response::<plain_h>(&resp);
     assert!(bytes.starts_with(b"HTTP/1.1 200"));

@@ -33,7 +33,11 @@ struct LoopOutcome {
     head_pending: bool,
 }
 
-pub struct Pipeline;
+#[derive(Default)]
+pub struct Pipeline {
+    pub(super) pending_frame: PendingFrame,
+    pub(super) discard_body_remaining: usize,
+}
 
 impl Pipeline {
     fn absorb(state: &mut ConnState, bytes: &[u8]) -> bool {
@@ -50,31 +54,36 @@ impl Pipeline {
         state.recv.advance(off);
     }
 
-    fn finish_frame(state: &mut ConnState) {
-        state.pipeline.pending_frame = PendingFrame::Head;
-        state.recv.restrict_to_head();
+    fn finish_frame(&mut self, recv: &mut super::conn_state::Recv) {
+        self.pending_frame = PendingFrame::Head;
+        recv.restrict_to_head();
     }
 
-    fn await_frame(state: &mut ConnState, need: NeedMore, available: usize) -> bool {
+    fn await_frame(
+        &mut self,
+        recv: &mut super::conn_state::Recv,
+        need: NeedMore,
+        available: usize,
+    ) -> bool {
         match need {
             NeedMore::Head => {
-                state.pipeline.pending_frame = PendingFrame::Head;
-                state.recv.restrict_to_head();
+                self.pending_frame = PendingFrame::Head;
+                recv.restrict_to_head();
                 true
             }
             NeedMore::FixedBody(total) => {
                 let frame = PendingFrame::FixedBody(total);
-                let changed = state.pipeline.pending_frame != frame;
-                state.pipeline.pending_frame = frame;
-                state.recv.permit_body();
+                let changed = self.pending_frame != frame;
+                self.pending_frame = frame;
+                recv.permit_body();
                 if changed && total > available {
-                    let _ = state.recv.try_reserve_to(total.min(RESERVE_CAP));
+                    let _ = recv.try_reserve_to(total.min(RESERVE_CAP));
                 }
                 false
             }
             NeedMore::ChunkedBody => {
-                state.pipeline.pending_frame = PendingFrame::ChunkedBody;
-                state.recv.permit_body();
+                self.pending_frame = PendingFrame::ChunkedBody;
+                recv.permit_body();
                 false
             }
         }
@@ -120,7 +129,8 @@ impl Pipeline {
                 state.pipeline.discard_body_remaining > 0
             }
         };
-        Self::finish_frame(state);
+        let ConnState { pipeline, recv, .. } = state;
+        pipeline.finish_frame(recv);
         discarding
     }
 
@@ -154,7 +164,8 @@ impl Pipeline {
                     .try_consume(permit, rest, &mut write_buf[out.cursor..], state);
             permit = match outcome {
                 ConsumeOutcome::NeedMore { state: need, .. } => {
-                    out.head_pending = Self::await_frame(state, need, rest.len());
+                    let ConnState { pipeline, recv, .. } = state;
+                    out.head_pending = pipeline.await_frame(recv, need, rest.len());
                     break;
                 }
                 ConsumeOutcome::Complete {
@@ -230,7 +241,8 @@ impl Pipeline {
                     out.close_after |= close;
                     out.cursor += written;
                     out.off += consumed;
-                    Self::finish_frame(state);
+                    let ConnState { pipeline, recv, .. } = state;
+                    pipeline.finish_frame(recv);
                     out.final_action = Some(Outcome::Send {
                         written,
                         close_after: close,
@@ -240,7 +252,8 @@ impl Pipeline {
                 ConsumeOutcome::Park { consumed, close } => {
                     out.close_after |= close;
                     out.off += consumed;
-                    Self::finish_frame(state);
+                    let ConnState { pipeline, recv, .. } = state;
+                    pipeline.finish_frame(recv);
                     out.final_action = Some(Outcome::Park);
                     break;
                 }

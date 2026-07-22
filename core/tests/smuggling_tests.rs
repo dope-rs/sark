@@ -1,5 +1,5 @@
 use sark_core::error::Result;
-use sark_core::http::codec::{BodyFraming, DecodeMode, HeaderScan, Parse};
+use sark_core::http::codec::{BodyFraming, DecodeMode, HeaderScan, ResponseDecoder};
 use sark_core::http::head::{Flags, MAX_HEADER_LINE_BYTES, apply_well_known_header_contig};
 
 fn scan_request(block: &[u8]) -> Result<BodyFraming> {
@@ -126,7 +126,10 @@ fn moderate_header_line_accepted() {
 fn injected_trailers_dropped_from_response() {
     let raw: &[u8] = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n\
 0\r\nContent-Length: 999\r\nHost: evil\r\nConnection: close\r\nX-Good: yes\r\n\r\n";
-    let resp = Parse::response(raw, DecodeMode::Response).unwrap().unwrap();
+    let resp = ResponseDecoder::new(DecodeMode::Response)
+        .response(raw)
+        .unwrap()
+        .unwrap();
     assert!(resp.headers().get("content-length").is_none());
     assert!(resp.headers().get("host").is_none());
     assert!(resp.headers().get("connection").is_none());

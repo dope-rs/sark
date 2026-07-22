@@ -18,7 +18,9 @@ pub use pipeline::{Pipeline, identity_mut};
 use response_cache::Cache;
 pub use routing::Routing;
 use sark_core::http::compress::Gzip;
-use sark_core::http::{CHUNK_TERMINATOR, FixedResponseInner, OwnedShape, Shape};
+use sark_core::http::{
+    CHUNK_TERMINATOR, CacheTemplate, Compression, Egress, FixedResponseInner, OwnedShape, Shape,
+};
 
 use crate::service::{self, RouteRequestImpl, RouteSpec, SlicePath, manifold};
 use crate::{CANNED_400, CANNED_500, request};
@@ -42,7 +44,7 @@ impl service::Key {
 }
 
 pub struct Ctx<'a> {
-    pub head: &'a crate::parser::framer::ParsedHead<'a>,
+    pub head: &'a sark_core::http::codec::ParsedRequestHead<'a>,
     pub method_key: crate::service::Key,
     pub slice_path: SlicePath<'a>,
     pub target_off: usize,
@@ -52,14 +54,17 @@ pub struct Ctx<'a> {
 }
 
 impl<'a> Ctx<'a> {
-    pub fn parse(req_bytes: &'a [u8], parsed: &'a crate::parser::framer::ParsedHead<'a>) -> Self {
+    pub fn parse(
+        req_bytes: &'a [u8],
+        parsed: &'a sark_core::http::codec::ParsedRequestHead<'a>,
+    ) -> Self {
         let method_key = crate::service::Key::from_bytes(parsed.method);
         Self::parse_with_key(req_bytes, parsed, method_key)
     }
 
     pub fn parse_with_key(
         req_bytes: &'a [u8],
-        parsed: &'a crate::parser::framer::ParsedHead<'a>,
+        parsed: &'a sark_core::http::codec::ParsedRequestHead<'a>,
         method_key: crate::service::Key,
     ) -> Self {
         let target = parsed.target;
@@ -151,22 +156,18 @@ where
             body.len(),
             state,
         ) {
-            Ok(response) => {
-                let static_body = matches!(
-                    R::RESPONSE_BODY_KIND,
-                    sark_core::http::body_kind::ResponseKind::Static,
-                )
-                .then(|| Shape::preserialize_static(&response))
-                .flatten()
-                .map(|(_, _, body)| body);
-                ResponseEncoder::emit(
-                    encoder,
-                    Shape::status(&response),
-                    AsRef::as_ref(&Shape::headers_wire(&response)),
-                    static_body.unwrap_or_else(|| Shape::body_bytes(&response)),
-                );
-                Decoded::Emitted
-            }
+            Ok(response) => match response.response_view() {
+                Some(view) => {
+                    ResponseEncoder::emit(
+                        encoder,
+                        view.status,
+                        view.headers.as_ref(),
+                        view.body.as_ref(),
+                    );
+                    Decoded::Emitted
+                }
+                None => Decoded::Unsupported,
+            },
             Err(_) => Decoded::Bad,
         }
     }
@@ -364,6 +365,31 @@ impl<R: RouteSpec> Framed<R> {
 }
 
 impl Outcome {
+    fn from_egress<S>(egress: Egress<S>, close_after: bool) -> Self {
+        match egress {
+            Egress::Inline { written } => Outcome::Send {
+                written,
+                close_after,
+            },
+            Egress::Static { head, body } => Outcome::SendStatic {
+                hdr_written: head,
+                body,
+                close_after,
+            },
+            Egress::Shared { head, body } => Outcome::SendSplit {
+                hdr_written: head,
+                body,
+                close_after,
+            },
+            Egress::Pooled { head, body } => Outcome::SendPooled {
+                hdr_written: head,
+                body,
+                close_after,
+            },
+            Egress::Stream { .. } | Egress::Failed => Outcome::Close(CANNED_500),
+        }
+    }
+
     pub fn into_consume(
         self,
         permit: conn_state::DispatchPermit,
@@ -440,20 +466,7 @@ impl Outcome {
         date: &[u8; 29],
         close_after: bool,
     ) -> Self {
-        match Shape::write_into_slice(&resp, write, date) {
-            Some(written) => Outcome::Send {
-                written,
-                close_after,
-            },
-            None => match Shape::write_head_split(resp, write, date) {
-                Some((hdr_written, body)) => Outcome::SendSplit {
-                    hdr_written,
-                    body,
-                    close_after,
-                },
-                None => Outcome::Close(CANNED_500),
-            },
-        }
+        Self::from_egress(resp.egress(write, date), close_after)
     }
 }
 
@@ -841,7 +854,8 @@ impl<R: RouteSpec> DiscardFraming<R> {
 
 impl<R: RouteSpec> Framing<R> {
     fn from_ctx(ctx: &Ctx<'_>) -> Result<Self, RequestErr> {
-        use sark_core::http::codec::{BodyFraming, Parse};
+        use sark_core::http::codec::BodyFraming;
+        use sark_core::http::codec::chunked::BodyDecoder;
         let req_bytes = ctx.req_bytes;
         let base = FramingBase::<R>::from_ctx(ctx)?;
         let head_len = base.head_len;
@@ -859,7 +873,7 @@ impl<R: RouteSpec> Framing<R> {
                     return Err(RequestErr::Bad(CANNED_400));
                 }
                 let chunked_section = &req_bytes[head_len..];
-                match Parse::chunked_body_consumed(chunked_section, <R as RouteSpec>::MAX_BODY) {
+                match BodyDecoder::body_consumed(chunked_section, <R as RouteSpec>::MAX_BODY) {
                     Ok(None) => {
                         return Err(RequestErr::NeedMore(conn_state::NeedMore::ChunkedBody));
                     }
@@ -916,41 +930,57 @@ impl Pipeline {
     ) -> Outcome {
         use sark_core::http::body_kind::ResponseKind;
 
-        let static_body = matches!(<R as RouteSpec>::RESPONSE_BODY_KIND, ResponseKind::Static);
-        if accept_gzip
+        let resp = if accept_gzip
             && !<R as RouteSpec>::STATIC_RESPONSE
             && matches!(<R as RouteSpec>::RESPONSE_BODY_KIND, ResponseKind::Inline)
-            && let Some(plain) = Shape::body_for_gzip(&resp)
-            && !plain.is_empty()
-            && let Some(compressed) = gzip.encode(plain)
         {
-            let body_len = compressed.len();
-            return match Shape::write_gzip_head(resp, write, date, body_len) {
-                Some(hdr_written) => Outcome::SendPooled {
-                    hdr_written,
-                    body: compressed,
-                    close_after: false,
-                },
-                None => Outcome::Close(CANNED_500),
-            };
-        }
-        if <R as RouteSpec>::STATIC_RESPONSE && static_body {
-            return match Shape::preserialize_static(&resp) {
-                Some((mut head_template, date_offset, body)) => {
+            match resp.compress(gzip, write, date) {
+                Compression::Plain(resp) => resp,
+                Compression::Compressed(egress) => {
+                    return Outcome::from_egress(egress, false);
+                }
+            }
+        } else {
+            resp
+        };
+        if <R as RouteSpec>::STATIC_RESPONSE {
+            return match resp.cache_template() {
+                Some(CacheTemplate::Inline {
+                    mut bytes,
+                    date_offset,
+                }) => {
                     let date_offset = sark_core::http::apply_head_skip(
-                        &mut head_template,
+                        &mut bytes,
                         date_offset,
                         <R as RouteSpec>::EMIT_DATE,
                         <R as RouteSpec>::EMIT_SERVER,
                     );
-                    let hdr = FixedResponseInner::write_preserialized(
-                        write,
-                        &head_template,
+                    let written =
+                        FixedResponseInner::write_preserialized(write, &bytes, date_offset, date);
+                    cache.insert_fixed(bytes, date_offset);
+                    match written {
+                        Some(written) => Outcome::Send {
+                            written,
+                            close_after: false,
+                        },
+                        None => Outcome::Close(CANNED_500),
+                    }
+                }
+                Some(CacheTemplate::Static {
+                    mut head,
+                    date_offset,
+                    body,
+                }) => {
+                    let date_offset = sark_core::http::apply_head_skip(
+                        &mut head,
                         date_offset,
-                        date,
+                        <R as RouteSpec>::EMIT_DATE,
+                        <R as RouteSpec>::EMIT_SERVER,
                     );
-                    cache.insert_static(head_template, date_offset, body);
-                    match hdr {
+                    let written =
+                        FixedResponseInner::write_preserialized(write, &head, date_offset, date);
+                    cache.insert_static(head, date_offset, body);
+                    match written {
                         Some(hdr_written) => Outcome::SendStatic {
                             hdr_written,
                             body,
@@ -961,39 +991,6 @@ impl Pipeline {
                 }
                 None => Outcome::Close(CANNED_500),
             };
-        }
-        if <R as RouteSpec>::STATIC_RESPONSE {
-            let (mut template, date_offset) = Shape::preserialize(&resp);
-            let date_offset = sark_core::http::apply_head_skip(
-                &mut template,
-                date_offset,
-                <R as RouteSpec>::EMIT_DATE,
-                <R as RouteSpec>::EMIT_SERVER,
-            );
-            let n = FixedResponseInner::write_preserialized(write, &template, date_offset, date);
-            cache.insert_fixed(template, date_offset);
-            return match n {
-                Some(n) => Outcome::Send {
-                    written: n,
-                    close_after: false,
-                },
-                None => Outcome::Close(CANNED_500),
-            };
-        }
-        if static_body {
-            return match Shape::write_head_only(&resp, write, date) {
-                Some((hdr_written, body)) => Outcome::SendStatic {
-                    hdr_written,
-                    body,
-                    close_after: false,
-                },
-                None => Outcome::Close(CANNED_500),
-            };
-        }
-        if matches!(<R as RouteSpec>::RESPONSE_BODY_KIND, ResponseKind::Stream) {
-            unreachable!(
-                "finish_sync: Stream routes go through route_sync_stream, not finish_sync"
-            );
         }
         Outcome::write_shape(resp, write, date, false)
     }
@@ -1274,8 +1271,13 @@ impl Pipeline {
             Ok(response) => response,
             Err(reason) => return ConsumeOutcome::Close(reason),
         };
-        let Some((written, stream)) = Shape::write_head_stream(response, write, date) else {
-            return ConsumeOutcome::Close(CANNED_500);
+        let (written, stream) = match response.egress(write, date) {
+            Egress::Stream { head, stream } => (head, stream),
+            Egress::Inline { .. }
+            | Egress::Static { .. }
+            | Egress::Shared { .. }
+            | Egress::Pooled { .. }
+            | Egress::Failed => return ConsumeOutcome::Close(CANNED_500),
         };
         let task = entry.insert(wrap(stream));
         conn.async_state.task = Some(task.erase());

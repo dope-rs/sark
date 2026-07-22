@@ -2,8 +2,9 @@ use std::hint::black_box;
 
 use criterion::{Criterion, criterion_group, criterion_main};
 use sark::dispatch::Ctx;
-use sark::framer::Http;
+use sark::framer::FusedHead;
 use sark::service::Key;
+use sark_core::http::codec::ParsedRequestHead;
 
 fn fixtures() -> Vec<(&'static str, &'static [u8])> {
     vec![
@@ -24,7 +25,7 @@ fn fixtures() -> Vec<(&'static str, &'static [u8])> {
 }
 
 fn baseline_pipeline(buf: &[u8]) -> Option<(Key, usize, usize)> {
-    let head = Http::parse_head(buf)?;
+    let head = ParsedRequestHead::parse(buf)?;
     let ctx = Ctx::parse(buf, &head);
     Some((
         ctx.method_key,
@@ -34,7 +35,7 @@ fn baseline_pipeline(buf: &[u8]) -> Option<(Key, usize, usize)> {
 }
 
 fn fused_pipeline(buf: &[u8]) -> Option<(Key, usize, usize)> {
-    let fused = Http::parse_head_fused(buf)?;
+    let fused = FusedHead::parse(buf)?;
     let ctx = Ctx::parse_with_key(buf, &fused.head, fused.method_key);
     Some((
         ctx.method_key,
