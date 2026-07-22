@@ -1,4 +1,6 @@
+mod egress;
 mod role;
+mod stream_registry;
 mod validate;
 
 pub mod client;

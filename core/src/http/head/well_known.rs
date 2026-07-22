@@ -4,10 +4,7 @@
     clippy::collapsible_if
 )]
 
-use super::apply::{
-    ae_line, apply_accept_encoding, apply_connection, apply_content_length, apply_expect,
-    apply_host, apply_transfer_encoding, clen_line, conn_line, expect_line, host_line, te_line,
-};
+use super::KnownHeader;
 use super::byte::trim_ws_range;
 use super::error::{
     ERR_HEADER_LINE_TOO_LONG, ERR_INVALID_HEADER_NAME, ERR_INVALID_HEADER_VALUE,
@@ -118,7 +115,7 @@ impl WellKnownProbe for HostProbe {
         flags: &mut Flags,
         value_rest: &[u8],
     ) -> Result<Option<(usize, usize, usize)>> {
-        host_line(scan, flags, value_rest)
+        KnownHeader::Host.scan_line(scan, flags, value_rest)
     }
 }
 
@@ -135,7 +132,7 @@ impl WellKnownProbe for ExpectProbe {
         flags: &mut Flags,
         value_rest: &[u8],
     ) -> Result<Option<(usize, usize, usize)>> {
-        expect_line(scan, flags, value_rest)
+        KnownHeader::Expect.scan_line(scan, flags, value_rest)
     }
 }
 
@@ -154,7 +151,7 @@ impl WellKnownProbe for ConnProbe {
         flags: &mut Flags,
         value_rest: &[u8],
     ) -> Result<Option<(usize, usize, usize)>> {
-        conn_line(scan, flags, value_rest)
+        KnownHeader::Connection.scan_line(scan, flags, value_rest)
     }
 }
 
@@ -175,7 +172,7 @@ impl WellKnownProbe for ClenProbe {
         flags: &mut Flags,
         value_rest: &[u8],
     ) -> Result<Option<(usize, usize, usize)>> {
-        clen_line(scan, flags, value_rest)
+        KnownHeader::ContentLength.scan_line(scan, flags, value_rest)
     }
 }
 
@@ -196,7 +193,7 @@ impl WellKnownProbe for TeProbe {
         flags: &mut Flags,
         value_rest: &[u8],
     ) -> Result<Option<(usize, usize, usize)>> {
-        te_line(scan, flags, value_rest)
+        KnownHeader::TransferEncoding.scan_line(scan, flags, value_rest)
     }
 }
 
@@ -217,7 +214,7 @@ impl WellKnownProbe for AeProbe {
         flags: &mut Flags,
         value_rest: &[u8],
     ) -> Result<Option<(usize, usize, usize)>> {
-        ae_line(scan, flags, value_rest)
+        KnownHeader::AcceptEncoding.scan_line(scan, flags, value_rest)
     }
 }
 
@@ -417,12 +414,12 @@ pub fn apply_well_known_header<I: HeadInput + ?Sized>(
     };
     let raw = &line[value_start..value_end];
     match action {
-        Action::Host => apply_host(scan, flags),
-        Action::Connection => apply_connection(scan, flags, raw),
-        Action::ContentLength => apply_content_length(scan, flags, raw),
-        Action::TransferEncoding => apply_transfer_encoding(scan, flags, raw),
-        Action::Expect => apply_expect(scan, flags, raw),
-        Action::AcceptEncoding => apply_accept_encoding(scan, flags, raw),
+        Action::Host => KnownHeader::Host.apply(scan, flags, raw),
+        Action::Connection => KnownHeader::Connection.apply(scan, flags, raw),
+        Action::ContentLength => KnownHeader::ContentLength.apply(scan, flags, raw),
+        Action::TransferEncoding => KnownHeader::TransferEncoding.apply(scan, flags, raw),
+        Action::Expect => KnownHeader::Expect.apply(scan, flags, raw),
+        Action::AcceptEncoding => KnownHeader::AcceptEncoding.apply(scan, flags, raw),
         Action::Unknown => Ok(()),
     }
 }

@@ -6,15 +6,14 @@ use dope::DriverContext;
 use dope::manifold::Outcome;
 use dope::manifold::listener::{self, Application, SlotEgress};
 use dope::runtime::profile::Throughput;
-use dope_fiber::{
-    Context, ErasedTaskId, Fiber, Slab, SlotExt as _, TaskContext, TaskId, TaskQueue, Waker,
-};
+use dope_fiber::{Context, ErasedTaskId, Fiber, Slab, SlotExt as _, TaskId, TaskQueue, Waker};
 use dope_net::link::slot::Slot;
 use dope_net::wire::Wire;
 use dope_net::wire::identity::Identity;
 use o3::buffer::RetainBytes;
 use o3::collections::{FixedHashTable, FixedQueue};
 
+use super::task::{BoundTask, RunningTask, TaskMap, TaskTarget, TaskWake, listener_waker};
 use super::{Body, Config};
 use crate::conn::{self, Conn, ConnError};
 use crate::frame::ErrorCode;
@@ -23,11 +22,6 @@ use crate::role::ServerRole;
 use crate::stream::StreamId;
 
 type ServerProfile = Throughput;
-
-/// The listener keeps the ready target alive while the returned waker is used.
-unsafe fn rebrand_waker<'from, 'to>(waker: Waker<'from>) -> Waker<'to> {
-    unsafe { std::mem::transmute(waker) }
-}
 
 #[derive(Clone, Copy)]
 struct Limits {
@@ -522,137 +516,6 @@ impl<'d, H: SyncHandler + 'd, W: Wire> Application<'d> for SyncApp<'d, H, W> {
     }
 }
 
-type TaskTarget = Option<ErasedTaskId>;
-
-struct TaskWake<'d> {
-    task: TaskContext<TaskTarget>,
-    bound: bool,
-    driver: PhantomData<fn(&'d ()) -> &'d ()>,
-}
-
-impl<'d> TaskWake<'d> {
-    fn new() -> Self {
-        Self {
-            task: TaskContext::with_target(None),
-            bound: false,
-            driver: PhantomData,
-        }
-    }
-
-    unsafe fn bind(
-        mut self: Pin<&mut Self>,
-        key: ErasedTaskId,
-        ready: Pin<&TaskQueue<TaskTarget>>,
-        parent: Waker<'_>,
-    ) {
-        let this = unsafe { self.as_mut().get_unchecked_mut() };
-        let task = unsafe { Pin::new_unchecked(&this.task) };
-        let _ = unsafe { task.bind_child(ready, Some(key), parent) };
-        this.bound = true;
-    }
-
-    fn waker(self: Pin<&Self>) -> Waker<'d> {
-        unsafe { self.map_unchecked(|this| &this.task).context_unchecked() }
-    }
-
-    unsafe fn unbind(mut self: Pin<&mut Self>) {
-        let this = unsafe { self.as_mut().get_unchecked_mut() };
-        if !this.bound {
-            return;
-        }
-        unsafe { Pin::new_unchecked(&this.task).unbind() };
-        this.bound = false;
-    }
-
-    fn at_mut(wakes: Pin<&mut [Self]>, index: usize) -> Pin<&mut Self> {
-        unsafe { wakes.map_unchecked_mut(|wakes| &mut wakes[index]) }
-    }
-}
-
-struct UnbindOnDrop<'a, 'd>(Option<Pin<&'a mut TaskWake<'d>>>);
-
-impl Drop for UnbindOnDrop<'_, '_> {
-    fn drop(&mut self) {
-        unsafe { self.0.take().unwrap().unbind() };
-    }
-}
-
-struct RunningTask {
-    connection_id: dope::driver::token::Token,
-    stream_id: StreamId,
-    task: TaskId,
-    key: ErasedTaskId,
-    previous: Option<u32>,
-    next: Option<u32>,
-}
-
-#[derive(Clone, Copy)]
-struct TaskMapEntry {
-    connection_id: dope::driver::token::Token,
-    stream_id: StreamId,
-    index: u32,
-}
-
-struct TaskMap {
-    entries: FixedHashTable<TaskMapEntry>,
-}
-
-impl TaskMap {
-    fn with_capacity(capacity: usize) -> Self {
-        Self {
-            entries: FixedHashTable::with_capacity(capacity),
-        }
-    }
-
-    fn hash(connection_id: dope::driver::token::Token, stream_id: StreamId) -> u64 {
-        let value = connection_id.raw() ^ u64::from(stream_id.0).wrapping_mul(0x9E37_79B9);
-        value.wrapping_mul(0x9E37_79B9_7F4A_7C15)
-    }
-
-    fn insert(
-        &mut self,
-        connection_id: dope::driver::token::Token,
-        stream_id: StreamId,
-        index: usize,
-    ) -> bool {
-        self.entries
-            .try_insert(
-                Self::hash(connection_id, stream_id),
-                TaskMapEntry {
-                    connection_id,
-                    stream_id,
-                    index: index as u32,
-                },
-                |entry| entry.connection_id == connection_id && entry.stream_id == stream_id,
-            )
-            .is_ok()
-    }
-
-    fn remove(
-        &mut self,
-        connection_id: dope::driver::token::Token,
-        stream_id: StreamId,
-    ) -> Option<usize> {
-        self.entries
-            .remove(Self::hash(connection_id, stream_id), |entry| {
-                entry.connection_id == connection_id && entry.stream_id == stream_id
-            })
-            .map(|entry| entry.index as usize)
-    }
-
-    fn get(&self, connection_id: dope::driver::token::Token, stream_id: StreamId) -> Option<usize> {
-        self.entries
-            .get(Self::hash(connection_id, stream_id), |entry| {
-                entry.connection_id == connection_id && entry.stream_id == stream_id
-            })
-            .map(|entry| entry.index as usize)
-    }
-
-    fn is_empty(&self) -> bool {
-        self.entries.is_empty()
-    }
-}
-
 pub struct ConnState {
     state: ConnectionState,
     ready: TaskQueue<TaskTarget>,
@@ -870,7 +733,7 @@ impl<'d, H: Handler + 'd, W: Wire> App<'d, H, W> {
         driver: &mut DriverContext<'_, 'd>,
     ) -> usize {
         let connection_id = slot.token();
-        let parent = unsafe { rebrand_waker(slot.waker()) };
+        let parent = unsafe { listener_waker(slot.waker()) };
         let state = &mut slot.state.conn;
         let mut drained = 0;
         while let Some(event) = state.state.connection.poll_event() {
@@ -1067,7 +930,7 @@ impl<'d, H: Handler + 'd, W: Wire> App<'d, H, W> {
 
     fn release_bound_task(&mut self, index: usize, task: TaskId) {
         let App { slab, wakes, .. } = self;
-        let unbind = UnbindOnDrop(Some(TaskWake::at_mut(wakes.as_mut(), index)));
+        let unbind = BoundTask::new(TaskWake::at_mut(wakes.as_mut(), index));
         let removed = slab.remove(task);
         debug_assert!(removed, "live task must be removable");
         drop(unbind);
@@ -1167,7 +1030,7 @@ impl<'d, H: Handler + 'd, W: Wire> Application<'d> for App<'d, H, W> {
             return;
         }
         let connection_id = slot.token();
-        let parent = unsafe { rebrand_waker(slot.waker()) };
+        let parent = unsafe { listener_waker(slot.waker()) };
         {
             let state = &mut slot.state.conn;
             let ready = unsafe { Pin::new_unchecked(&state.ready) };

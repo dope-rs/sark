@@ -16,7 +16,7 @@ use dope_net::wire::Wire;
 use o3::buffer::Shared;
 pub use pipeline::{Pipeline, identity_mut};
 use response_cache::Cache;
-pub use routing::Routing;
+pub use routing::{H1Host, RouteCore, Routing};
 use sark_core::http::compress::Gzip;
 use sark_core::http::{
     CHUNK_TERMINATOR, CacheTemplate, Compression, Egress, FixedResponseInner, OwnedShape, Shape,
@@ -24,24 +24,6 @@ use sark_core::http::{
 
 use crate::service::{self, RouteRequestImpl, RouteSpec, SlicePath, manifold};
 use crate::{CANNED_400, CANNED_500, request};
-
-impl service::Key {
-    pub fn miss_tag(maybe: Option<Self>, path_hit: bool) -> u64 {
-        let method_tag = match maybe {
-            None => 0u64,
-            Some(service::Key::Other) => 1u64,
-            Some(service::Key::Get) => 2u64,
-            Some(service::Key::Post) => 3u64,
-            Some(service::Key::Put) => 4u64,
-            Some(service::Key::Patch) => 5u64,
-            Some(service::Key::Delete) => 6u64,
-            Some(service::Key::Head) => 7u64,
-            Some(service::Key::Options) => 8u64,
-        };
-        let path_tag = if path_hit { 1u64 } else { 0u64 };
-        (path_tag << 8) | method_tag
-    }
-}
 
 pub struct Ctx<'a> {
     pub head: &'a sark_core::http::codec::ParsedRequestHead<'a>,

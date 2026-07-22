@@ -555,7 +555,6 @@ impl<'a> ServeEmit<'a> {
         let route_bounds = &self.spec.route_bounds;
         let indices = &self.spec.idx;
         let core_ident = format_ident!("{}Core", name);
-        let host_ident = format_ident!("{}Host", name);
         let tasks = task_specs(self.spec);
         let futures: Vec<_> = tasks.iter().map(|task| &task.future).collect();
         let makers: Vec<_> = tasks.iter().map(|task| &task.maker).collect();
@@ -646,18 +645,6 @@ impl<'a> ServeEmit<'a> {
         };
         let generic_use = quote! {
             <'d, __W, #( #futures, )* #( #makers, )*>
-        };
-        let host_generic_def = quote! {
-            <
-                '__a,
-                'd,
-                __W: ::dope_net::wire::Wire,
-                #( #futures, )*
-                #( #makers, )*
-            >
-        };
-        let host_generic_use = quote! {
-            <'__a, 'd, __W, #( #futures, )* #( #makers, )*>
         };
         let dispatch_for = |index: usize, raw_params: TokenStream| {
             let route = &routes[index];
@@ -955,10 +942,7 @@ impl<'a> ServeEmit<'a> {
         };
         let send_body = if tasks.is_empty() {
             quote! {
-                let mut host = #host_ident {
-                    core: self,
-                    date,
-                };
+                let mut host = ::sark::dispatch::H1Host::new(self, date);
                 ::sark::dispatch::Pipeline::send_complete_proj(
                     ::core::pin::Pin::new(&mut host),
                     sent,
@@ -981,10 +965,7 @@ impl<'a> ServeEmit<'a> {
                         }
                     }
                 }
-                let mut host = #host_ident {
-                    core: self,
-                    date,
-                };
+                let mut host = ::sark::dispatch::H1Host::new(self, date);
                 ::sark::dispatch::Pipeline::send_complete_proj(
                     ::core::pin::Pin::new(&mut host),
                     sent,
@@ -1092,26 +1073,6 @@ impl<'a> ServeEmit<'a> {
             >
         };
         quote! {
-            struct #host_ident #host_generic_def
-            where
-                #( #route_bounds )*
-                #( #maker_bounds )*
-            {
-                core: ::core::pin::Pin<&'__a mut #core_ident #generic_use>,
-                date: &'__a ::sark::date::Stamp,
-            }
-
-            impl #host_generic_def ::sark::timer::TimerHost<'d>
-                for #host_ident #host_generic_use
-            where
-                #( #route_bounds )*
-                #( #maker_bounds )*
-            {
-                fn timer(&self) -> &::sark::Timer<'d> {
-                    &self.core.as_ref().get_ref().timer
-                }
-            }
-
             impl #generic_def #core_ident #generic_use
             where
                 #( #route_bounds )*
@@ -1129,10 +1090,7 @@ impl<'a> ServeEmit<'a> {
                 where
                     #projection_bounds
                 {
-                    let mut host = #host_ident {
-                        core: self,
-                        date,
-                    };
+                    let mut host = ::sark::dispatch::H1Host::new(self, date);
                     ::sark::dispatch::Pipeline::run_proj(
                         ::core::pin::Pin::new(&mut host),
                         bytes,
@@ -1327,19 +1285,23 @@ impl<'a> ServeEmit<'a> {
                 }
             }
 
-            impl #host_generic_def ::sark::dispatch::Routing for #host_ident #host_generic_use
+            impl #generic_def ::sark::dispatch::RouteCore<'d> for #core_ident #generic_use
             where
                 #( #route_bounds )*
                 #( #maker_bounds )*
             {
+                fn timer(&self) -> &::sark::Timer<'d> {
+                    &self.timer
+                }
+
                 fn try_consume(
                     self: ::core::pin::Pin<&mut Self>,
+                    stamp: &::sark::date::Stamp,
                     permit: ::sark::dispatch::conn_state::DispatchPermit,
                     bytes: &[u8],
                     write: &mut [u8],
                     conn: &mut ::sark::dispatch::conn_state::ConnState,
                 ) -> ::sark::dispatch::ConsumeOutcome {
-                    let this = self.get_mut();
                     let ::core::option::Option::Some(fused) =
                         ::sark::framer::FusedHead::parse(bytes)
                     else {
@@ -1348,12 +1310,12 @@ impl<'a> ServeEmit<'a> {
                             state: ::sark::dispatch::conn_state::NeedMore::Head,
                         };
                     };
-                    let date = this.date.load();
+                    let date = stamp.load();
                     let state: &'d #state_ty = unsafe {
-                        &*(&this.core.as_ref().get_ref().state as *const #state_ty)
+                        &*(&self.as_ref().get_ref().state as *const #state_ty)
                     };
                     #core_ident::dispatch_request(
-                        this.core.as_mut(),
+                        self,
                         permit,
                         state,
                         bytes,
@@ -1379,10 +1341,10 @@ impl<'a> ServeEmit<'a> {
                     conn: &mut ::sark::dispatch::conn_state::ConnState,
                 ) -> ::sark::dispatch::ConsumeOutcome {
                     let (core, date) = self.__project();
-                    let mut host = #host_ident {
+                    let mut host = ::sark::dispatch::H1Host::new(
                         core,
-                        date: date.as_ref().get_ref(),
-                    };
+                        date.as_ref().get_ref(),
+                    );
                     ::sark::dispatch::Routing::try_consume(
                         ::core::pin::Pin::new(&mut host),
                         permit,

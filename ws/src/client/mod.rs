@@ -3,6 +3,11 @@ use std::marker::PhantomData;
 use std::pin::Pin;
 use std::task::Poll;
 
+mod handshake;
+mod masking;
+
+use masking::MaskSequence;
+
 use dope::driver::token::Token;
 use dope::manifold::connector;
 use dope::manifold::connector::Connector;
@@ -13,8 +18,6 @@ use dope_fiber::WaitQueue;
 use dope_fiber::{Fiber, poll_fn};
 use dope_net::Transport;
 use o3::buffer::Shared;
-use rand_chacha::ChaCha20Rng;
-use rand_core::{Rng, SeedableRng};
 
 const DEFAULT_MAX_MESSAGE: usize = 16 * 1024 * 1024;
 const DEFAULT_MAX_OUTBOUND_FRAME: usize = 16 * 1024 * 1024;
@@ -59,7 +62,7 @@ pub trait Handler {
 
 pub struct SendCtx<'a> {
     sink: &'a mut Queue<IOV_CAP>,
-    rng: &'a MaskRng,
+    rng: &'a MaskSequence,
     max_frame_payload: usize,
 }
 
@@ -85,9 +88,8 @@ impl SendCtx<'_> {
     }
 
     fn message(&mut self, opcode: u8, payload: &[u8]) -> Result<(), Error> {
-        Encode::frames_into(
+        FrameEncoder::new(self.rng).enqueue(
             self.sink,
-            self.rng,
             opcode,
             payload,
             self.max_frame_payload.max(1),
@@ -99,14 +101,7 @@ impl SendCtx<'_> {
         if payload.len() > 125 {
             return Err(Error::MessageTooLarge);
         }
-        Encode::frames_into(
-            self.sink,
-            self.rng,
-            opcode,
-            payload,
-            payload.len().max(1),
-            true,
-        )
+        FrameEncoder::new(self.rng).enqueue(self.sink, opcode, payload, payload.len().max(1), true)
     }
 }
 
@@ -136,7 +131,7 @@ impl Config {
 
     pub fn user_agent(mut self, user_agent: impl Into<String>) -> Result<Self, Error> {
         let user_agent = user_agent.into();
-        if !Validate::header_value(&user_agent) {
+        if !handshake::header_value(&user_agent) {
             return Err(Error::InvalidHeader);
         }
         self.user_agent = user_agent;
@@ -150,7 +145,7 @@ impl Config {
     ) -> Result<Self, Error> {
         let name = name.into();
         let value = value.into();
-        if !Validate::header_name(&name) || !Validate::header_value(&value) {
+        if !handshake::header_name(&name) || !handshake::header_value(&value) {
             return Err(Error::InvalidHeader);
         }
         self.headers.push((name, value));
@@ -219,61 +214,19 @@ impl connector::Lifecycle for ConnState {
     }
 }
 
-#[derive(Default)]
-struct MaskRng {
-    stream: Cell<Option<ChaCha20Rng>>,
-}
-
-impl MaskRng {
-    fn mask(&self) -> [u8; 4] {
-        let mut stream = self.stream.take().unwrap_or_else(|| {
-            let mut seed = [0u8; 32];
-            getrandom::fill(&mut seed).expect("OS CSPRNG (getrandom) unavailable");
-            ChaCha20Rng::from_seed(seed)
-        });
-        let mut buf = [0u8; 4];
-        stream.fill_bytes(&mut buf);
-        self.stream.set(Some(stream));
-        buf
-    }
-}
-
 pub struct Codec {
     config: Config,
 }
 
 impl Codec {
     fn handshake_request(&self, key_b64: &[u8; 24], headers: &[(String, String)]) -> Vec<u8> {
-        let extra_headers: usize = headers
-            .iter()
-            .map(|(name, value)| name.len() + value.len() + 4)
-            .sum();
-        let mut req = Vec::with_capacity(
-            192 + self.config.host.len() + self.config.path.len() + extra_headers,
-        );
-        req.extend_from_slice(b"GET ");
-        req.extend_from_slice(self.config.path.as_bytes());
-        req.extend_from_slice(b" HTTP/1.1\r\nHost: ");
-        req.extend_from_slice(self.config.host.as_bytes());
-        req.extend_from_slice(b"\r\nUser-Agent: ");
-        req.extend_from_slice(self.config.user_agent.as_bytes());
-        req.extend_from_slice(b"\r\nAccept: ");
-        req.push(b'*');
-        req.push(b'/');
-        req.push(b'*');
-        req.extend_from_slice(
-            b"\r\nUpgrade: websocket\r\nSec-WebSocket-Version: 13\r\nSec-WebSocket-Key: ",
-        );
-        req.extend_from_slice(key_b64);
-        req.extend_from_slice(b"\r\nConnection: Upgrade\r\n");
-        for (name, value) in headers {
-            req.extend_from_slice(name.as_bytes());
-            req.extend_from_slice(b": ");
-            req.extend_from_slice(value.as_bytes());
-            req.extend_from_slice(b"\r\n");
-        }
-        req.extend_from_slice(b"\r\n");
-        req
+        handshake::request(
+            &self.config.host,
+            &self.config.path,
+            &self.config.user_agent,
+            key_b64,
+            headers,
+        )
     }
 }
 
@@ -374,7 +327,7 @@ impl Codec {
 pub struct SharedState {
     conn_id: Cell<Option<Token>>,
     active_waiters: Pin<Box<WaitQueue>>,
-    rng: MaskRng,
+    rng: MaskSequence,
 }
 
 impl SharedState {
@@ -382,7 +335,7 @@ impl SharedState {
         Self {
             conn_id: Cell::new(None),
             active_waiters: Box::pin(WaitQueue::with_capacity(waiter_capacity)),
-            rng: MaskRng::default(),
+            rng: MaskSequence::default(),
         }
     }
 
@@ -488,7 +441,7 @@ impl<'d, H: Handler> connector::Session<'d> for Session<'d, H> {
         if self.handler.handshake_headers(&mut headers).is_err()
             || !headers
                 .iter()
-                .all(|(name, value)| Validate::header_name(name) && Validate::header_value(value))
+                .all(|(name, value)| handshake::header_name(name) && handshake::header_value(value))
         {
             state.closing = true;
             return;
@@ -591,11 +544,11 @@ where
     }
 
     pub fn try_send_text(&self, payload: &[u8]) -> Result<(), Error> {
-        Encode::message_now(self.port, 0x1, payload)
+        Outbound::new(self.port).message(0x1, payload)
     }
 
     pub fn try_send_binary(&self, payload: &[u8]) -> Result<(), Error> {
-        Encode::message_now(self.port, 0x2, payload)
+        Outbound::new(self.port).message(0x2, payload)
     }
 }
 
@@ -655,42 +608,45 @@ where
         &'b self,
         payload: &'b [u8],
     ) -> impl Fiber<'d, Output = Result<(), Error>> + 'b {
-        Encode::encode::<false, ID, H, S, E>(*self, 0x1, payload)
+        Outbound::new(self.port).send::<false>(0x1, payload)
     }
 
     fn send_binary<'b>(
         &'b self,
         payload: &'b [u8],
     ) -> impl Fiber<'d, Output = Result<(), Error>> + 'b {
-        Encode::encode::<false, ID, H, S, E>(*self, 0x2, payload)
+        Outbound::new(self.port).send::<false>(0x2, payload)
     }
 
     fn send_ping<'b>(
         &'b self,
         payload: &'b [u8],
     ) -> impl Fiber<'d, Output = Result<(), Error>> + 'b {
-        Encode::encode::<true, ID, H, S, E>(*self, 0x9, payload)
+        Outbound::new(self.port).send::<true>(0x9, payload)
     }
 
     fn close<'b>(&'b self, payload: &'b [u8]) -> impl Fiber<'d, Output = Result<(), Error>> + 'b {
-        Encode::encode::<true, ID, H, S, E>(*self, 0x8, payload)
+        Outbound::new(self.port).send::<true>(0x8, payload)
     }
 }
 
-struct Encode;
+#[derive(Clone, Copy)]
+struct Outbound<'p, 'd> {
+    port: &'p Port<'d>,
+}
 
-impl Encode {
-    fn encode<'a, 'd, 'b, const CONTROL: bool, const ID: u8, H, S, E>(
-        handle: WsHandle<'a, 'd, ID, H, S, E>,
+impl<'p, 'd> Outbound<'p, 'd> {
+    fn new(port: &'p Port<'d>) -> Self {
+        Self { port }
+    }
+
+    fn send<'b, const CONTROL: bool>(
+        self,
         opcode: u8,
         payload: &'b [u8],
     ) -> impl Fiber<'d, Output = Result<(), Error>> + 'b
     where
-        H: Handler + 'd,
-        S: Dialer<E::Transport> + 'd,
-        E: Env + 'd,
-        E::Transport: Transport<Addr: Clone>,
-        'a: 'b,
+        'p: 'b,
         'd: 'b,
     {
         poll_fn(move |_cx| {
@@ -698,50 +654,31 @@ impl Encode {
                 return Poll::Ready(Err(Error::MessageTooLarge));
             }
             let result = if CONTROL {
-                Self::frames_now(handle.port, opcode, payload, payload.len().max(1), true)
+                self.frames(opcode, payload, payload.len().max(1), true)
             } else {
-                Self::message_now(handle.port, opcode, payload)
+                self.message(opcode, payload)
             };
             Poll::Ready(result)
         })
     }
 
-    fn message_now(port: &Port<'_>, opcode: u8, payload: &[u8]) -> Result<(), Error> {
-        let max = port.codec.config.max_outbound_frame_payload.max(1);
-        Self::frames_now(port, opcode, payload, max, false)
+    fn message(self, opcode: u8, payload: &[u8]) -> Result<(), Error> {
+        let max = self.port.codec.config.max_outbound_frame_payload.max(1);
+        self.frames(opcode, payload, max, false)
     }
 
-    fn frames_now(
-        port: &Port<'_>,
+    fn frames(
+        self,
         opcode: u8,
         payload: &[u8],
         max_payload: usize,
         control: bool,
     ) -> Result<(), Error> {
-        let shared = &port.shared;
+        let shared = &self.port.shared;
         let conn_id = shared.conn_id.get().ok_or(Error::NotConnected)?;
-        let Some(result) = port.io.with_sender(conn_id, |sender| {
-            if control || payload.len() <= max_payload {
-                let frame = Self::client_frame(&shared.rng, opcode, true, payload);
-                if sender.try_enqueue(frame).is_err() {
-                    return Err(Error::Backpressure);
-                }
-            } else {
-                let mut off = 0;
-                let mut first = true;
-                while off < payload.len() {
-                    let end = (off + max_payload).min(payload.len());
-                    let fin = end == payload.len();
-                    let op = if first { opcode } else { 0x0 };
-                    let frame = Self::client_frame(&shared.rng, op, fin, &payload[off..end]);
-                    if sender.try_enqueue(frame).is_err() {
-                        return Err(Error::Backpressure);
-                    }
-                    first = false;
-                    off = end;
-                }
-            }
-            Ok(())
+        let encoder = FrameEncoder::new(&shared.rng);
+        let Some(result) = self.port.io.with_sender(conn_id, |mut sender| {
+            encoder.enqueue(&mut sender, opcode, payload, max_payload, control)
         }) else {
             shared.conn_id.set(None);
             shared.wake();
@@ -749,18 +686,30 @@ impl Encode {
         };
         result
     }
+}
 
-    fn frames_into(
-        sink: &mut Queue<IOV_CAP>,
-        rng: &MaskRng,
+#[derive(Clone, Copy)]
+struct FrameEncoder<'a> {
+    masks: &'a MaskSequence,
+}
+
+impl<'a> FrameEncoder<'a> {
+    fn new(masks: &'a MaskSequence) -> Self {
+        Self { masks }
+    }
+
+    fn enqueue<S: FrameSink + ?Sized>(
+        self,
+        sink: &mut S,
         opcode: u8,
         payload: &[u8],
         max_payload: usize,
         control: bool,
     ) -> Result<(), Error> {
         if control || payload.len() <= max_payload {
-            sink.try_enqueue(Self::client_frame(rng, opcode, true, payload))
-                .map_err(|_| Error::Backpressure)?;
+            if !sink.push_frame(self.frame(opcode, true, payload)) {
+                return Err(Error::Backpressure);
+            }
             return Ok(());
         }
         let mut off = 0;
@@ -769,16 +718,17 @@ impl Encode {
             let end = (off + max_payload).min(payload.len());
             let fin = end == payload.len();
             let op = if first { opcode } else { 0x0 };
-            sink.try_enqueue(Self::client_frame(rng, op, fin, &payload[off..end]))
-                .map_err(|_| Error::Backpressure)?;
+            if !sink.push_frame(self.frame(op, fin, &payload[off..end])) {
+                return Err(Error::Backpressure);
+            }
             first = false;
             off = end;
         }
         Ok(())
     }
 
-    fn client_frame(rng: &MaskRng, opcode: u8, fin: bool, payload: &[u8]) -> Shared {
-        let mask = rng.mask();
+    fn frame(self, opcode: u8, fin: bool, payload: &[u8]) -> Shared {
+        let mask = self.masks.next();
         let mut frame = Vec::with_capacity(14 + payload.len());
         frame.push(if fin { 0x80 | opcode } else { opcode });
         crate::frame::FrameHead::encode_len(&mut frame, payload.len(), true);
@@ -790,36 +740,18 @@ impl Encode {
     }
 }
 
-struct Validate;
+trait FrameSink {
+    fn push_frame(&mut self, frame: Shared) -> bool;
+}
 
-impl Validate {
-    fn header_name(s: &str) -> bool {
-        !s.is_empty()
-            && s.bytes().all(|b| {
-                matches!(
-                    b,
-                    b'!' | b'#'
-                        | b'$'
-                        | b'%'
-                        | b'&'
-                        | b'\''
-                        | b'*'
-                        | b'+'
-                        | b'-'
-                        | b'.'
-                        | b'^'
-                        | b'_'
-                        | b'`'
-                        | b'|'
-                        | b'~'
-                        | b'0'..=b'9'
-                        | b'A'..=b'Z'
-                        | b'a'..=b'z'
-                )
-            })
+impl FrameSink for Queue<IOV_CAP> {
+    fn push_frame(&mut self, frame: Shared) -> bool {
+        self.try_enqueue(frame).is_ok()
     }
+}
 
-    fn header_value(s: &str) -> bool {
-        !s.bytes().any(|b| matches!(b, b'\r' | b'\n'))
+impl FrameSink for connector::Sender<'_, '_, Shared> {
+    fn push_frame(&mut self, frame: Shared) -> bool {
+        self.try_enqueue(frame).is_ok()
     }
 }

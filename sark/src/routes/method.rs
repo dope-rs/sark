@@ -11,6 +11,22 @@ pub enum Key {
 }
 
 impl Key {
+    pub fn miss_tag(maybe: Option<Self>, path_hit: bool) -> u64 {
+        let method_tag = match maybe {
+            None => 0u64,
+            Some(Self::Other) => 1u64,
+            Some(Self::Get) => 2u64,
+            Some(Self::Post) => 3u64,
+            Some(Self::Put) => 4u64,
+            Some(Self::Patch) => 5u64,
+            Some(Self::Delete) => 6u64,
+            Some(Self::Head) => 7u64,
+            Some(Self::Options) => 8u64,
+        };
+        let path_tag = if path_hit { 1u64 } else { 0u64 };
+        (path_tag << 8) | method_tag
+    }
+
     pub fn from_method(method: &http::Method) -> Self {
         Self::from_bytes(method.as_str().as_bytes())
     }

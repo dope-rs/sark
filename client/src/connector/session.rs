@@ -1,27 +1,23 @@
-use std::cell::Cell;
 use std::io::{self, Read};
 use std::pin::Pin;
-use std::rc::Rc;
 use std::time::{Duration, Instant};
 
-use cartel_core::{Arena, Limits};
+use cartel_core::Arena;
 use dope::driver::token::Token;
 use dope::manifold::connector;
 use dope::manifold::timer::Timer;
 use dope::runtime::Idle;
 use dope_fiber::WaitQueue;
 use o3::buffer::{Lease, Pool as BufferPool, PoolLayout};
-use o3::cell::RawCell;
-use o3::collections::SlotQueue;
-use o3::mem::ByteBudget;
 use sark_core::http::Response;
 use sark_core::http::codec::{DecodeMode, HeaderLookup, ResponseDecoder};
 
 use crate::connector::codec::{self, Head};
 use crate::connector::error::Error;
+use crate::connector::pool::ConnectionPool;
 use crate::connector::retry::RetryPolicy;
 
-pub(super) type Outcome = Result<Response, Error>;
+pub(super) use crate::connector::pool::Outcome;
 
 pub(super) const DEFAULT_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 
@@ -34,8 +30,6 @@ pub const DEFAULT_RESPONSE_BUFFER_CAPACITY: usize = 64 * 1024 * 1024;
 pub const DEFAULT_REQUEST_SLOTS: u32 = 256;
 
 pub const DEFAULT_REQUEST_CAPACITY: u32 = 64 * 1024;
-
-const KEEPALIVE_MARGIN: Duration = Duration::from_secs(1);
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum DecompressionPolicy {
@@ -66,74 +60,8 @@ impl connector::Lifecycle for ConnState {
     }
 }
 
-struct ConnEntry<'d> {
-    conn_id: Cell<Option<Token>>,
-    arena: Arena<'d, Outcome>,
-    last_activity: Cell<Option<Instant>>,
-    keepalive: Cell<Option<Duration>>,
-    queued: Cell<bool>,
-}
-
-struct Pool<'d> {
-    entries: Box<[ConnEntry<'d>]>,
-    ready: RawCell<SlotQueue<Token>>,
-    live: Cell<usize>,
-    _budget: Pin<Rc<ByteBudget>>,
-}
-
-impl<'d> Pool<'d> {
-    fn new(capacity: usize, max_inflight: usize, limit: usize) -> Self {
-        let budget = Rc::pin(ByteBudget::new(limit));
-        let limits = Limits::new(1, limit, 1);
-        Self {
-            entries: (0..capacity)
-                .map(|_| ConnEntry {
-                    conn_id: Cell::new(None),
-                    arena: Arena::with_shared_budget(max_inflight, limits, budget.clone()),
-                    last_activity: Cell::new(None),
-                    keepalive: Cell::new(None),
-                    queued: Cell::new(false),
-                })
-                .collect(),
-            ready: RawCell::new(SlotQueue::with_capacity(capacity)),
-            live: Cell::new(0),
-            _budget: budget,
-        }
-    }
-
-    fn entry<'a>(&'a self, conn_id: Token) -> Option<&'a ConnEntry<'d>> {
-        let entry = self.entries.get(conn_id.slot().raw() as usize)?;
-        (entry.conn_id.get() == Some(conn_id)).then_some(entry)
-    }
-
-    fn push_ready(&self, entry: &ConnEntry<'d>, conn_id: Token) {
-        if entry.queued.replace(true) {
-            return;
-        }
-        unsafe {
-            self.ready.with_mut(|ready| {
-                ready
-                    .vacant_entry(conn_id.slot().raw() as usize)
-                    .expect("ready queue entry must be vacant")
-                    .push_back(conn_id);
-            })
-        };
-    }
-
-    fn pop_ready(&self) -> Option<Token> {
-        unsafe { self.ready.with_mut(SlotQueue::pop_front) }
-    }
-
-    fn remove_ready(&self, conn_id: Token) {
-        unsafe {
-            self.ready
-                .with_mut(|ready| ready.remove(conn_id.slot().raw() as usize))
-        };
-    }
-}
-
 pub struct Shared<'d> {
-    pool: Pool<'d>,
+    pool: ConnectionPool<'d>,
     active_waiters: Pin<Box<WaitQueue>>,
     pub(super) host: String,
     pub(super) origin: http::Uri,
@@ -146,11 +74,11 @@ pub struct Shared<'d> {
 
 impl<'d> Shared<'d> {
     pub fn has_connection(&self) -> bool {
-        self.pool.live.get() != 0
+        self.pool.has_connection()
     }
 
     pub(super) fn connection_count(&self) -> usize {
-        self.pool.live.get()
+        self.pool.connection_count()
     }
 
     pub(super) fn wake(&self) {
@@ -166,13 +94,7 @@ impl<'d> Shared<'d> {
     }
 
     fn note_connect(&self, conn_id: Token, now: Instant) {
-        let entry = &self.pool.entries[conn_id.slot().raw() as usize];
-        if entry.conn_id.replace(Some(conn_id)).is_none() {
-            self.pool.live.set(self.pool.live.get() + 1);
-        }
-        entry.last_activity.set(Some(now));
-        entry.keepalive.set(None);
-        self.pool.push_ready(entry, conn_id);
+        self.pool.note_connect(conn_id, now);
         self.wake();
     }
 
@@ -184,32 +106,13 @@ impl<'d> Shared<'d> {
         keepalive: Option<Duration>,
         now: Instant,
     ) {
-        let Some(entry) = self.pool.entry(conn_id) else {
-            return;
-        };
-        entry.last_activity.set(Some(now));
-        if keepalive.is_some() {
-            entry.keepalive.set(keepalive);
-        }
-        entry.arena.try_push(outcome, bytes, 1);
-        entry.arena.complete();
-        if entry.arena.can_register() {
-            self.pool.push_ready(entry, conn_id);
-        }
+        self.pool
+            .push_response(conn_id, outcome, bytes, keepalive, now);
         self.wake();
     }
 
     pub(super) fn close_connection(&self, conn_id: Token) {
-        let Some(entry) = self.pool.entry(conn_id) else {
-            return;
-        };
-        entry.arena.fail_all(|| Err(Error::Closed));
-        entry.conn_id.set(None);
-        self.pool.live.set(self.pool.live.get() - 1);
-        entry.last_activity.set(None);
-        entry.keepalive.set(None);
-        entry.queued.set(false);
-        self.pool.remove_ready(conn_id);
+        self.pool.close(conn_id);
         self.wake();
     }
 
@@ -219,52 +122,27 @@ impl<'d> Shared<'d> {
         idle_timeout: Duration,
         mut recycle: impl FnMut(Token),
     ) -> Option<Token> {
-        while let Some(conn_id) = self.pool.pop_ready() {
-            let Some(entry) = self.pool.entry(conn_id) else {
-                continue;
-            };
-            entry.queued.set(false);
-            let limit = entry
-                .keepalive
-                .get()
-                .map(|k| k.saturating_sub(KEEPALIVE_MARGIN))
-                .unwrap_or(idle_timeout);
-            let stale = entry
-                .last_activity
-                .get()
-                .is_some_and(|last| now.saturating_duration_since(last) >= limit);
-            if stale {
-                self.close_connection(conn_id);
-                recycle(conn_id);
-                continue;
-            }
-            if !entry.arena.can_register() {
-                continue;
-            }
-            return Some(conn_id);
+        let mut closed = false;
+        let acquired = self.pool.acquire(now, idle_timeout, |conn_id| {
+            closed = true;
+            recycle(conn_id);
+        });
+        if closed {
+            self.wake();
         }
-        None
+        acquired
     }
 
     pub fn arena(&'d self, conn_id: Token) -> Option<&'d Arena<'d, Outcome>> {
-        Some(&self.pool.entry(conn_id)?.arena)
+        self.pool.arena(conn_id)
     }
 
     pub fn submitted(&self, conn_id: Token, now: Instant) {
-        if let Some(entry) = self.pool.entry(conn_id) {
-            entry.last_activity.set(Some(now));
-            if entry.arena.can_register() {
-                self.pool.push_ready(entry, conn_id);
-            }
-        }
+        self.pool.submitted(conn_id, now);
     }
 
     pub fn make_available(&self, conn_id: Token) {
-        if let Some(entry) = self.pool.entry(conn_id)
-            && entry.arena.can_register()
-        {
-            self.pool.push_ready(entry, conn_id);
-        }
+        self.pool.make_available(conn_id);
     }
 }
 
@@ -418,7 +296,7 @@ impl<'d> Port<'d> {
             request_capacity: _,
         } = config;
         let shared = Shared {
-            pool: Pool::new(
+            pool: ConnectionPool::new(
                 capacity,
                 max_inflight_per_connection,
                 response_buffer_capacity,

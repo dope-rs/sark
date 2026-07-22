@@ -2,6 +2,12 @@ use std::io;
 use std::net::SocketAddr;
 use std::pin::Pin;
 
+mod call;
+mod egress;
+
+use call::{CallRecord, CallStore, MessageNode, MessageNodeKey, MessageNodeTag, StreamState};
+use egress::{PendingResponse, ReplyBatch, ReplyBatchTag, ResponseDrive};
+
 use dope::manifold::env::Bundle;
 use dope::manifold::listener::{self, Application, Listener};
 use dope::runtime::profile::Throughput;
@@ -13,7 +19,7 @@ use dope_net::wire::identity::Identity;
 use dope_net::{tcp, tcp::Tcp};
 use dope_tls::tls::{Endpoint, Tls};
 use o3::buffer::{RetainBytes, SharedPool};
-use o3::collections::{FixedHashTable, FixedQueue, Slab, SlabKey};
+use o3::collections::{FixedHashTable, FixedQueue, Slab};
 use sark_core::identity_mut;
 use sark_h2::tuning::Tuning;
 use sark_h2::{Conn, ErrorCode, ServerRole, StreamId, conn};
@@ -1031,15 +1037,13 @@ impl<H: LiveStreamingHandler> Handler for LiveStreaming<H> {
 
 pub struct ConnState {
     h2: Conn<ServerRole>,
-    calls: FixedHashTable<CallRecord>,
+    calls: CallStore,
     pending: FixedQueue<StreamId>,
     replies: Slab<ReplyBatch, ReplyBatchTag>,
-    messages: Slab<MessageNode, MessageNodeTag>,
     pending_len: usize,
     pending_capacity: usize,
     live_routes: StreamRoutes,
     message_pool: SharedPool,
-    buffered_total: usize,
     probed: bool,
 }
 
@@ -1058,10 +1062,9 @@ impl ConnState {
         });
         Self {
             h2,
-            calls: FixedHashTable::with_capacity(capacity),
+            calls: CallStore::with_capacity(capacity, limits.max_buffered_msgs),
             pending: FixedQueue::with_capacity(capacity),
             replies: Slab::with_capacity(limits.max_pending_replies),
-            messages: Slab::with_capacity(limits.max_buffered_msgs),
             pending_len: 0,
             pending_capacity: limits.max_pending_len,
             live_routes: StreamRoutes::with_capacity(capacity),
@@ -1069,57 +1072,9 @@ impl ConnState {
                 limits.max_fragmented_messages,
                 limits.max_message_len.max(1),
             ),
-            buffered_total: 0,
             probed: false,
         }
     }
-}
-
-struct CallRecord {
-    stream_id: StreamId,
-    stream: Option<StreamState>,
-    pending: Option<PendingResponse>,
-    queued: bool,
-}
-
-struct StreamState {
-    head: RequestHead,
-    deframer: Deframer,
-    message_head: Option<MessageNodeKey>,
-    message_tail: Option<MessageNodeKey>,
-    message_count: usize,
-    trailers: Metadata,
-    mode: StreamMode,
-    buffered_len: usize,
-}
-
-enum MessageNodeTag {}
-
-type MessageNodeKey = SlabKey<MessageNodeTag>;
-
-struct MessageNode {
-    message: MessageFrame,
-    next: Option<MessageNodeKey>,
-}
-
-#[derive(Clone, Debug)]
-struct PendingResponse {
-    headers: HeaderBlock,
-    head: Option<ReplyBatchKey>,
-    tail: Option<ReplyBatchKey>,
-    trailers: Option<HeaderBlock>,
-    headers_sent: bool,
-    message_pos: usize,
-    frame_pos: usize,
-}
-
-enum ReplyBatchTag {}
-
-type ReplyBatchKey = SlabKey<ReplyBatchTag>;
-
-struct ReplyBatch {
-    messages: Vec<Vec<u8>>,
-    next: Option<ReplyBatchKey>,
 }
 
 #[pin_project::pin_project]
@@ -1295,23 +1250,15 @@ impl<H: Handler, W: Wire> App<H, W> {
         let mut data = DataChunk::new(data);
         while !data.is_empty() {
             let (next, mode) = {
-                let Some(stream) = state
-                    .calls
-                    .get_mut(ConnState::call_hash(stream_id), |call| {
-                        call.stream_id == stream_id
-                    })
-                    .and_then(|call| call.stream.as_mut())
-                else {
+                let message_pool = &state.message_pool;
+                let Some(stream) = state.calls.stream_mut(stream_id) else {
                     state.send_error(
                         stream_id,
                         Status::new(Code::Internal, "DATA before gRPC headers"),
                     );
                     return;
                 };
-                (
-                    stream.deframer.next(&mut data, &state.message_pool),
-                    stream.mode,
-                )
+                (stream.deframer.next(&mut data, message_pool), stream.mode)
             };
             let message = match next {
                 Ok(next) => next,
@@ -1344,7 +1291,8 @@ impl<H: Handler, W: Wire> App<H, W> {
                     || stream.message_count == self.config.max_buffered_msgs
             };
             if over_limit
-                || state.buffered_total.saturating_add(added) > self.config.max_conn_buffered_len
+                || state.calls.buffered_total().saturating_add(added)
+                    > self.config.max_conn_buffered_len
                 || state.push_message(stream_id, message).is_err()
             {
                 state.remove_stream(stream_id);
@@ -1354,7 +1302,7 @@ impl<H: Handler, W: Wire> App<H, W> {
                 );
                 return;
             }
-            state.buffered_total += added;
+            state.calls.add_buffered(added);
             state.stream_mut(stream_id).unwrap().buffered_len += added;
         }
         state.drive_pending();
@@ -1382,7 +1330,7 @@ impl<H: Handler, W: Wire> App<H, W> {
         let message_head = stream.message_head;
         let messages = MessageList {
             repr: MessageListRepr::Chain {
-                nodes: &state.messages,
+                nodes: state.calls.messages(),
                 next: message_head,
             },
             len: stream.message_count,
@@ -1543,14 +1491,8 @@ impl<'d, H: Handler, W: Wire> Application<'d> for App<H, W> {
 }
 
 impl ConnState {
-    fn call_hash(stream_id: StreamId) -> u64 {
-        u64::from(stream_id.0)
-    }
-
     fn call_mut(&mut self, stream_id: StreamId) -> Option<&mut CallRecord> {
-        self.calls.get_mut(Self::call_hash(stream_id), |call| {
-            call.stream_id == stream_id
-        })
+        self.calls.get_mut(stream_id)
     }
 
     fn stream_mut(&mut self, stream_id: StreamId) -> Option<&mut StreamState> {
@@ -1558,18 +1500,7 @@ impl ConnState {
     }
 
     fn insert_stream(&mut self, stream_id: StreamId, stream: StreamState) -> bool {
-        self.calls
-            .try_insert(
-                Self::call_hash(stream_id),
-                CallRecord {
-                    stream_id,
-                    stream: Some(stream),
-                    pending: None,
-                    queued: false,
-                },
-                |call| call.stream_id == stream_id,
-            )
-            .is_ok()
+        self.calls.insert(stream_id, stream)
     }
 
     fn push_message(
@@ -1577,42 +1508,15 @@ impl ConnState {
         stream_id: StreamId,
         message: MessageFrame,
     ) -> Result<(), MessageFrame> {
-        let Some((tail, count)) = self
-            .stream_mut(stream_id)
-            .map(|stream| (stream.message_tail, stream.message_count))
-        else {
-            return Err(message);
-        };
-        let key = match self.messages.insert(MessageNode {
-            message,
-            next: None,
-        }) {
-            Ok(key) => key,
-            Err(node) => return Err(node.message),
-        };
-        if let Some(tail) = tail {
-            self.messages.get_mut(tail).unwrap().next = Some(key);
-        }
-        let stream = self.stream_mut(stream_id).unwrap();
-        if stream.message_head.is_none() {
-            stream.message_head = Some(key);
-        }
-        stream.message_tail = Some(key);
-        stream.message_count = count + 1;
-        Ok(())
+        self.calls.push_message(stream_id, message)
     }
 
-    fn clear_messages(&mut self, mut next: Option<MessageNodeKey>) {
-        while let Some(key) = next {
-            let node = self.messages.remove(key).unwrap();
-            next = node.next;
-        }
+    fn clear_messages(&mut self, next: Option<MessageNodeKey>) {
+        self.calls.clear_messages(next);
     }
 
     fn remove_stream(&mut self, stream_id: StreamId) -> Option<StreamState> {
-        let call = self.calls.remove(Self::call_hash(stream_id), |call| {
-            call.stream_id == stream_id
-        })?;
+        let call = self.calls.remove(stream_id)?;
         if call.queued {
             self.pending.retain(|pending| *pending != stream_id);
         }
@@ -1620,29 +1524,16 @@ impl ConnState {
             self.release_response(pending);
         }
         let stream = call.stream?;
-        self.buffered_total = self.buffered_total.saturating_sub(stream.buffered_len);
-        self.clear_messages(stream.message_head);
+        self.calls.release_stream(&stream);
         Some(stream)
     }
 
     fn take_stream(&mut self, stream_id: StreamId) -> Option<StreamState> {
-        let stream = self.call_mut(stream_id)?.stream.take()?;
-        self.buffered_total = self.buffered_total.saturating_sub(stream.buffered_len);
-        Some(stream)
+        self.calls.take_stream(stream_id)
     }
 
     fn remove_empty_call(&mut self, stream_id: StreamId) {
-        let empty = self
-            .calls
-            .get(Self::call_hash(stream_id), |call| {
-                call.stream_id == stream_id
-            })
-            .is_some_and(|call| call.stream.is_none() && call.pending.is_none());
-        if empty {
-            let _ = self.calls.remove(Self::call_hash(stream_id), |call| {
-                call.stream_id == stream_id
-            });
-        }
+        self.calls.remove_empty(stream_id);
     }
 
     fn enqueue_response(&mut self, stream_id: StreamId, response: Response) {
@@ -1856,93 +1747,5 @@ impl ConnState {
             let h2_trailers = trailers.as_h2();
             let _ = self.h2.send_trailers(stream_id, &h2_trailers);
         }
-    }
-}
-
-enum ResponseDrive {
-    Complete,
-    Blocked,
-    Idle,
-}
-
-impl PendingResponse {
-    fn drive(
-        &mut self,
-        conn: &mut Conn<ServerRole>,
-        replies: &mut Slab<ReplyBatch, ReplyBatchTag>,
-        pending_len: &mut usize,
-        stream_id: StreamId,
-    ) -> Result<ResponseDrive, ()> {
-        if !self.headers_sent {
-            let h2_headers = self.headers.as_h2();
-            conn.send_response(stream_id, h2_headers.iter().copied(), false)
-                .map_err(|_| ())?;
-            self.headers_sent = true;
-        }
-
-        while let Some(key) = self.head {
-            let message_len = {
-                let batch = replies.get(key).unwrap();
-                if self.message_pos == batch.messages.len() {
-                    let batch = replies.remove(key).unwrap();
-                    self.head = batch.next;
-                    if self.head.is_none() {
-                        self.tail = None;
-                    }
-                    self.message_pos = 0;
-                    continue;
-                }
-                batch.messages[self.message_pos].len()
-            };
-            let header = MessageFrame::header(false, message_len).map_err(|_| ())?;
-            let n = {
-                let payload = &replies.get(key).unwrap().messages[self.message_pos];
-                if self.frame_pos < header.len() {
-                    conn.send_data_parts(stream_id, &header[self.frame_pos..], payload, false)
-                } else {
-                    conn.send_data(stream_id, &payload[self.frame_pos - header.len()..], false)
-                }
-            }
-            .map_err(|_| ())?;
-            if n == 0 {
-                return Ok(ResponseDrive::Blocked);
-            }
-            self.frame_pos += n;
-            *pending_len -= n;
-            if self.frame_pos == header.len() + message_len {
-                self.message_pos += 1;
-                self.frame_pos = 0;
-            }
-        }
-
-        if let Some(trailers) = &self.trailers {
-            let h2_trailers = trailers.as_h2();
-            conn.send_trailers(stream_id, &h2_trailers)
-                .map_err(|_| ())?;
-            Ok(ResponseDrive::Complete)
-        } else {
-            Ok(ResponseDrive::Idle)
-        }
-    }
-
-    fn remaining_len(&self, replies: &Slab<ReplyBatch, ReplyBatchTag>) -> usize {
-        let mut total = 0usize;
-        let mut key = self.head;
-        let mut first = true;
-        while let Some(current) = key {
-            let batch = replies.get(current).unwrap();
-            let start = if first { self.message_pos } else { 0 };
-            for (index, message) in batch.messages[start..].iter().enumerate() {
-                let len = message.len() + 5;
-                total += if first && index == 0 {
-                    len - self.frame_pos
-                } else {
-                    len
-                };
-            }
-            first = false;
-            key = batch.next;
-        }
-        total
     }
 }

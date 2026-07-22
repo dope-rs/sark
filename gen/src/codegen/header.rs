@@ -61,16 +61,21 @@ const KNOWN_HEADERS: [KnownHeaderSpec; 5] = [
 ];
 
 impl KnownHeaderSpec {
-    fn helper_ident(&self) -> Ident {
-        format_ident!("apply_{}", self.suffix.to_ascii_lowercase())
+    fn variant(&self) -> Ident {
+        match self.suffix {
+            "HOST" => format_ident!("Host"),
+            "CONNECTION" => format_ident!("Connection"),
+            "CONTENT_LENGTH" => format_ident!("ContentLength"),
+            "TRANSFER_ENCODING" => format_ident!("TransferEncoding"),
+            "EXPECT" => format_ident!("Expect"),
+            _ => unreachable!(),
+        }
     }
 
     fn apply_call(&self) -> TokenStream {
-        let helper = self.helper_ident();
-        if self.suffix == "HOST" {
-            quote! { sark::sark_core::http::head::#helper(scan, flags)?; }
-        } else {
-            quote! { sark::sark_core::http::head::#helper(scan, flags, raw)?; }
+        let variant = self.variant();
+        quote! {
+            sark::sark_core::http::head::KnownHeader::#variant.apply(scan, flags, raw)?;
         }
     }
 }
@@ -145,13 +150,15 @@ impl KnownKind {
         }
     }
 
-    fn line_fn(self) -> TokenStream {
+    fn header(self) -> TokenStream {
         match self {
-            Self::Host => quote!(sark::sark_core::http::head::host_line),
-            Self::Expect => quote!(sark::sark_core::http::head::expect_line),
-            Self::Connection => quote!(sark::sark_core::http::head::conn_line),
-            Self::ContentLength => quote!(sark::sark_core::http::head::clen_line),
-            Self::TransferEncoding => quote!(sark::sark_core::http::head::te_line),
+            Self::Host => quote!(sark::sark_core::http::head::KnownHeader::Host),
+            Self::Expect => quote!(sark::sark_core::http::head::KnownHeader::Expect),
+            Self::Connection => quote!(sark::sark_core::http::head::KnownHeader::Connection),
+            Self::ContentLength => quote!(sark::sark_core::http::head::KnownHeader::ContentLength),
+            Self::TransferEncoding => {
+                quote!(sark::sark_core::http::head::KnownHeader::TransferEncoding)
+            }
         }
     }
 
@@ -175,10 +182,10 @@ impl KnownKind {
         } else {
             capture_body.unwrap_or_default()
         };
-        let line_fn = self.line_fn();
+        let header = self.header();
         quote! {{
             let Some((tail_end, value_start, value_end)) =
-                #line_fn(scan, flags, &rest[colon_idx + 1..])?
+                #header.scan_line(scan, flags, &rest[colon_idx + 1..])?
             else {
                 return Ok(None);
             };

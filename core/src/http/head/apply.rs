@@ -173,6 +173,7 @@ impl KnownHeaderImpl for ConnHeader {
 
 #[derive(Clone, Copy)]
 pub enum KnownHeader {
+    AcceptEncoding,
     ContentLength,
     TransferEncoding,
     Expect,
@@ -187,6 +188,7 @@ impl KnownHeader {
             6 if name.eq_ignore_ascii_case(b"expect") => Some(Self::Expect),
             10 if name.eq_ignore_ascii_case(b"connection") => Some(Self::Connection),
             14 if name.eq_ignore_ascii_case(b"content-length") => Some(Self::ContentLength),
+            15 if name.eq_ignore_ascii_case(b"accept-encoding") => Some(Self::AcceptEncoding),
             17 if name.eq_ignore_ascii_case(b"transfer-encoding") => Some(Self::TransferEncoding),
             _ => None,
         }
@@ -199,6 +201,7 @@ impl KnownHeader {
         value: &[u8],
     ) -> Result<()> {
         match self {
+            Self::AcceptEncoding => apply_accept_encoding(scan, flags, value),
             Self::ContentLength => ContentLengthHeader::dispatch_value(scan, flags, value),
             Self::TransferEncoding => TransferEncodingHeader::dispatch_value(scan, flags, value),
             Self::Expect => ExpectHeader::dispatch_value(scan, flags, value),
@@ -214,6 +217,9 @@ impl KnownHeader {
         raw: &[u8],
     ) -> Result<usize> {
         match self {
+            Self::AcceptEncoding => Ok(ae_line(scan, flags, raw)?
+                .map(|(tail_end, _, _)| tail_end)
+                .unwrap_or(0)),
             Self::ContentLength => ContentLengthHeader::dispatch_line(scan, flags, raw),
             Self::TransferEncoding => TransferEncodingHeader::dispatch_line(scan, flags, raw),
             Self::Expect => ExpectHeader::dispatch_line(scan, flags, raw),
@@ -221,41 +227,25 @@ impl KnownHeader {
             Self::Connection => ConnHeader::dispatch_line(scan, flags, raw),
         }
     }
+
+    pub fn scan_line(
+        self,
+        scan: &mut codec::HeaderScan,
+        flags: &mut Flags,
+        raw: &[u8],
+    ) -> Result<Option<(usize, usize, usize)>> {
+        match self {
+            Self::AcceptEncoding => ae_line(scan, flags, raw),
+            Self::ContentLength => clen_line(scan, flags, raw),
+            Self::TransferEncoding => te_line(scan, flags, raw),
+            Self::Expect => expect_line(scan, flags, raw),
+            Self::Host => host_line(scan, flags, raw),
+            Self::Connection => conn_line(scan, flags, raw),
+        }
+    }
 }
 
-pub fn apply_host(scan: &mut codec::HeaderScan, flags: &mut Flags) -> Result<()> {
-    KnownHeader::Host.apply(scan, flags, b"")
-}
-
-pub fn apply_expect(scan: &mut codec::HeaderScan, flags: &mut Flags, value: &[u8]) -> Result<()> {
-    KnownHeader::Expect.apply(scan, flags, value)
-}
-
-pub fn apply_connection(
-    scan: &mut codec::HeaderScan,
-    flags: &mut Flags,
-    value: &[u8],
-) -> Result<()> {
-    KnownHeader::Connection.apply(scan, flags, value)
-}
-
-pub fn apply_content_length(
-    scan: &mut codec::HeaderScan,
-    flags: &mut Flags,
-    value: &[u8],
-) -> Result<()> {
-    KnownHeader::ContentLength.apply(scan, flags, value)
-}
-
-pub fn apply_transfer_encoding(
-    scan: &mut codec::HeaderScan,
-    flags: &mut Flags,
-    value: &[u8],
-) -> Result<()> {
-    KnownHeader::TransferEncoding.apply(scan, flags, value)
-}
-
-pub fn apply_accept_encoding(
+fn apply_accept_encoding(
     scan: &mut codec::HeaderScan,
     _flags: &mut Flags,
     raw: &[u8],
@@ -290,7 +280,7 @@ pub fn apply_accept_encoding(
     Ok(())
 }
 
-pub fn host_line(
+fn host_line(
     _scan: &mut codec::HeaderScan,
     flags: &mut Flags,
     raw: &[u8],
@@ -303,7 +293,7 @@ pub fn host_line(
     Ok(Some((tail_end, value_start, value_end)))
 }
 
-pub fn expect_line(
+fn expect_line(
     scan: &mut codec::HeaderScan,
     flags: &mut Flags,
     raw: &[u8],
@@ -351,7 +341,7 @@ fn expect_fast_continue(
     Ok(Some((body_end, value_start, body_end)))
 }
 
-pub fn conn_line(
+fn conn_line(
     _scan: &mut codec::HeaderScan,
     flags: &mut Flags,
     raw: &[u8],
@@ -439,7 +429,7 @@ fn clen_fast(
     Ok(Some((value_end, value_start, value_end)))
 }
 
-pub fn clen_line(
+fn clen_line(
     scan: &mut codec::HeaderScan,
     flags: &mut Flags,
     raw: &[u8],
@@ -462,7 +452,7 @@ pub fn clen_line(
     Ok(Some((tail_end, value_start, value_end)))
 }
 
-pub fn te_line(
+fn te_line(
     scan: &mut codec::HeaderScan,
     flags: &mut Flags,
     raw: &[u8],
@@ -544,7 +534,7 @@ fn te_fast_chunked(
     Ok(Some((body_end, value_start, body_end)))
 }
 
-pub(super) fn ae_line(
+fn ae_line(
     scan: &mut codec::HeaderScan,
     _flags: &mut Flags,
     raw: &[u8],

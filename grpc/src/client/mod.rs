@@ -1,5 +1,9 @@
-use o3::buffer::{Bytes, Pooled, Retained, SharedPool};
-use o3::collections::{FixedHashTable, FixedQueue, Slab, SlabKey};
+mod request;
+
+use request::{PendingRequest, PendingRequestKey, PendingRequestTag, RequestDrive};
+
+use o3::buffer::{Bytes, Retained, SharedPool};
+use o3::collections::{FixedHashTable, FixedQueue, Slab};
 use sark_h2::{ClientRole, Conn, ConnError, ErrorCode, StreamId, conn};
 
 use crate::Codec;
@@ -163,17 +167,6 @@ struct ResponseState {
 enum ResponseMode {
     Unary,
     Streaming,
-}
-
-enum PendingRequestTag {}
-
-type PendingRequestKey = SlabKey<PendingRequestTag>;
-
-struct PendingRequest {
-    bytes: Pooled,
-    pos: usize,
-    end_stream: bool,
-    next: Option<PendingRequestKey>,
 }
 
 struct StreamRecord {
@@ -900,32 +893,6 @@ impl Session {
             let _ = self.h2.reset_stream(stream_id, ErrorCode::Cancel);
             self.remove_stream(stream_id);
         }
-    }
-}
-
-enum RequestDrive {
-    Complete,
-    Blocked,
-}
-
-impl PendingRequest {
-    fn drive(
-        &mut self,
-        conn: &mut Conn<ClientRole>,
-        stream_id: StreamId,
-    ) -> Result<RequestDrive, ConnError> {
-        while self.pos < self.bytes.len() {
-            let n = conn.send_data(
-                stream_id,
-                &self.bytes.as_slice()[self.pos..],
-                self.end_stream,
-            )?;
-            if n == 0 {
-                return Ok(RequestDrive::Blocked);
-            }
-            self.pos += n;
-        }
-        Ok(RequestDrive::Complete)
     }
 }
 

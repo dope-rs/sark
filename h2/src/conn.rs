@@ -4,14 +4,16 @@ use std::fmt;
 
 use dope::runtime::profile::Throughput;
 use o3::buffer::{ByteRing, Pooled, SharedPool};
-use o3::collections::{FixedHashTable, FixedQueue};
+use o3::collections::FixedQueue;
 
+use crate::egress::Egress;
 use crate::frame::{
-    self, Continuation, Data, ErrorCode, Flags, FrameBuf, FrameHeader, GoAway, HEADER_LEN, Headers,
-    ParseError, Ping, Priority, RstStream, SettingId, WindowUpdate,
+    self, Data, ErrorCode, Flags, FrameBuf, FrameHeader, GoAway, HEADER_LEN, ParseError, Ping,
+    Priority, RstStream, SettingId, WindowUpdate,
 };
 use crate::role::Role;
 use crate::stream::{self, Side, Stream, StreamId, TransitionError};
+use crate::stream_registry::{StreamClass, StreamRecord, StreamRegistry};
 use crate::tuning::Tuning;
 use crate::validate::Validate;
 use crate::{flow, hpack};
@@ -92,7 +94,7 @@ impl Settings {
         out.extend_from_slice(&value.to_be_bytes());
     }
 
-    fn param_count(&self) -> usize {
+    pub(crate) fn param_count(&self) -> usize {
         2 + self.max_concurrent_streams.is_some() as usize
             + 2
             + self.max_header_list_size.is_some() as usize
@@ -200,15 +202,6 @@ impl From<&ConnError> for ErrorCode {
             ConnError::HeaderListTooLarge | ConnError::Overload => ErrorCode::EnhanceYourCalm,
         }
     }
-}
-
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
-enum StreamClass {
-    Connection,
-    Active,
-    ClosedRst,
-    ClosedEnd,
-    Idle,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -324,22 +317,13 @@ const DEFAULT_EVENT_CAPACITY: usize = 1 << 13;
 const DEFAULT_DATA_EVENTS: usize = 64;
 const DEFAULT_HEADER_EVENTS: usize = 64;
 const MAX_RESET_STREAMS: u32 = 100;
-const RESET_RING_CAP: usize = 256;
 const MAX_CONTINUATION_FRAMES: u32 = 64;
-
-struct StreamRecord {
-    stream: Stream,
-    send_window: flow::Window,
-    recv_window: flow::Window,
-    pending_release: u32,
-}
 
 pub struct Conn<R: Role> {
     role: PhantomData<R>,
 
     inbound: ByteRing,
-    outbound: ByteRing,
-    outbound_capacity: usize,
+    egress: Egress,
 
     preface_done: bool,
     initial_settings_sent: bool,
@@ -358,19 +342,12 @@ pub struct Conn<R: Role> {
     data_pool: SharedPool,
     header_pool: SharedPool,
 
-    encoder: hpack::Encoder,
-    send_header_block: Vec<u8>,
     recv_header_block: Vec<u8>,
     decoder: hpack::Decoder,
-    streams: FixedHashTable<StreamRecord>,
-    local_streams: usize,
-    peer_streams: usize,
-    next_local_id: stream::IdGen,
-    last_peer_stream_id: u32,
+    streams: StreamRegistry<R>,
     pending_headers: Option<PendingHeaders>,
     pending_headers_cap: usize,
     conn_pending_release: u32,
-    reset_streams: FixedQueue<StreamId>,
     peer_reset_count: u32,
     send_window_opened: bool,
 }
@@ -465,8 +442,11 @@ impl<R: Role> Conn<R> {
         let mut conn = Self {
             role: PhantomData,
             inbound: ByteRing::with_capacity(inbound_capacity),
-            outbound: ByteRing::with_capacity(outbound_capacity),
-            outbound_capacity,
+            egress: Egress::new(
+                outbound_capacity,
+                local.header_table_size as usize,
+                header_list_cap,
+            ),
             preface_done: false,
             initial_settings_sent: false,
             peer_settings_received: false,
@@ -480,24 +460,22 @@ impl<R: Role> Conn<R> {
             events: FixedQueue::with_capacity(event_capacity),
             data_pool: SharedPool::new(data_capacity, local.max_frame_size as usize),
             header_pool: SharedPool::new(header_capacity, header_list_cap),
-            encoder: hpack::Encoder::new(local.header_table_size as usize),
-            send_header_block: Vec::with_capacity(header_list_cap),
             recv_header_block: Vec::with_capacity(header_list_cap),
             decoder,
-            streams: FixedHashTable::with_capacity(stream_capacity),
-            local_streams: 0,
-            peer_streams: 0,
-            next_local_id: stream::IdGen::new(R::FIRST_LOCAL_STREAM_ID),
-            last_peer_stream_id: 0,
+            streams: StreamRegistry::new(stream_capacity),
             pending_headers: None,
             pending_headers_cap: header_list_cap,
             conn_pending_release: 0,
-            reset_streams: FixedQueue::with_capacity(RESET_RING_CAP),
             peer_reset_count: 0,
             send_window_opened: false,
         };
         if R::PREFACE_SENDS_FIRST {
-            if conn.outbound.try_extend_from_slice(CLIENT_PREFACE).is_err() {
+            if conn
+                .egress
+                .raw_mut()
+                .try_extend_from_slice(CLIENT_PREFACE)
+                .is_err()
+            {
                 unreachable!();
             }
             conn.preface_done = true;
@@ -543,26 +521,19 @@ impl<R: Role> Conn<R> {
     }
 
     pub fn outbound(&self) -> &[u8] {
-        self.outbound.as_slices().0
+        self.egress.first()
     }
 
     pub fn outbound_slices(&self) -> (&[u8], &[u8]) {
-        self.outbound.as_slices()
+        self.egress.slices()
     }
 
     pub fn drain_outbound(&mut self, n: usize) {
-        self.outbound.consume(n.min(self.outbound.len()));
+        self.egress.drain(n);
     }
 
     pub fn drain_into(&mut self, write_buf: &mut [u8]) -> usize {
-        let (first, second) = self.outbound.as_slices();
-        let first_len = first.len().min(write_buf.len());
-        write_buf[..first_len].copy_from_slice(&first[..first_len]);
-        let second_len = second.len().min(write_buf.len() - first_len);
-        write_buf[first_len..first_len + second_len].copy_from_slice(&second[..second_len]);
-        let n = first_len + second_len;
-        self.drain_outbound(n);
-        n
+        self.egress.drain_into(write_buf)
     }
 
     pub fn poll_event(&mut self) -> Option<Event> {
@@ -598,10 +569,7 @@ impl<R: Role> Conn<R> {
     }
 
     fn prepare_outbound(&mut self, additional: usize) -> Result<(), ConnError> {
-        if additional > self.outbound.remaining() {
-            return Err(ConnError::Overload);
-        }
-        Ok(())
+        self.egress.reserve(additional)
     }
 
     pub fn take_window_opened(&mut self) -> bool {
@@ -617,11 +585,11 @@ impl<R: Role> Conn<R> {
     }
 
     pub fn active_count(&self) -> usize {
-        self.streams.len()
+        self.streams.active_count()
     }
 
     pub fn tracked_closed_count(&self) -> usize {
-        self.reset_streams.len()
+        self.streams.reset_count()
     }
 
     pub fn stream_send_window(&self, id: StreamId) -> Option<flow::Window> {
@@ -635,18 +603,18 @@ impl<R: Role> Conn<R> {
     pub fn ping(&mut self, opaque: [u8; 8]) -> Result<(), ConnError> {
         self.prepare_outbound(HEADER_LEN + opaque.len())?;
         let frame = Ping { ack: false, opaque };
-        frame.encode(&mut self.outbound);
+        frame.encode(self.egress.raw_mut());
         Ok(())
     }
 
     pub fn goaway(&mut self, error: ErrorCode, debug: &[u8]) -> Result<(), ConnError> {
         self.prepare_outbound(HEADER_LEN + 8 + debug.len())?;
         let frame = GoAway {
-            last_stream_id: StreamId(self.last_peer_stream_id),
+            last_stream_id: StreamId(self.streams.last_peer_id()),
             error,
             debug,
         };
-        frame.encode(&mut self.outbound);
+        frame.encode(self.egress.raw_mut());
         self.goaway_sent = true;
         Ok(())
     }
@@ -656,7 +624,7 @@ impl<R: Role> Conn<R> {
             return Err(ConnError::BadStream);
         }
         self.prepare_outbound(HEADER_LEN + 4)?;
-        RstStream { stream_id, error }.encode(&mut self.outbound);
+        RstStream { stream_id, error }.encode(self.egress.raw_mut());
         self.advance_stream(stream_id, stream::Event::RstStream, Side::Local)
             .map_err(|_| ConnError::Protocol)?;
         Ok(())
@@ -689,9 +657,7 @@ impl<R: Role> Conn<R> {
         let avail = {
             let record = self
                 .streams
-                .get_mut(Self::stream_hash(stream_id), |record| {
-                    record.stream.id == stream_id
-                })
+                .get_mut(stream_id)
                 .ok_or(ConnError::BadStream)?;
             flow::Pair {
                 conn: &mut self.send_window,
@@ -707,9 +673,7 @@ impl<R: Role> Conn<R> {
         if send_n > 0 {
             let record = self
                 .streams
-                .get_mut(Self::stream_hash(stream_id), |record| {
-                    record.stream.id == stream_id
-                })
+                .get_mut(stream_id)
                 .ok_or(ConnError::BadStream)?;
             let mut pair = flow::Pair {
                 conn: &mut self.send_window,
@@ -719,7 +683,7 @@ impl<R: Role> Conn<R> {
         }
         let last_chunk = send_n == len;
         let es = end_stream && last_chunk;
-        Data::encode_parts(stream_id, es, first, second, send_n, &mut self.outbound);
+        Data::encode_parts(stream_id, es, first, second, send_n, self.egress.raw_mut());
         self.advance_stream(
             stream_id,
             stream::Event::Data { end_stream: es },
@@ -757,54 +721,26 @@ impl<R: Role> Conn<R> {
 
     pub fn resume(&mut self) -> Result<(), ConnError> {
         self.drive()?;
-        if self.outbound.len() > self.outbound_capacity {
+        if self.egress.over_capacity() {
             return Err(ConnError::Overload);
         }
         Ok(())
     }
 
     fn emit_initial_settings(&mut self) {
-        let count = self.local_settings.param_count();
-        let length = (count * 6) as u32;
-        FrameHeader {
-            length,
-            kind: frame::Type::Settings,
-            flags: Flags(0),
-            stream_id: StreamId(0),
-        }
-        .encode(&mut self.outbound);
-        self.local_settings.encode(&mut self.outbound);
+        self.egress.initial_settings(&self.local_settings);
     }
 
     fn emit_settings_ack(&mut self) -> Result<(), ConnError> {
-        self.prepare_outbound(HEADER_LEN)?;
-        FrameHeader {
-            length: 0,
-            kind: frame::Type::Settings,
-            flags: Flags(Flags::ACK),
-            stream_id: StreamId(0),
-        }
-        .encode(&mut self.outbound);
-        Ok(())
+        self.egress.settings_ack()
     }
 
     fn emit_window_update(&mut self, stream_id: StreamId, increment: u32) -> Result<(), ConnError> {
-        if increment == 0 {
-            return Ok(());
-        }
-        self.prepare_outbound(HEADER_LEN + 4)?;
-        WindowUpdate {
-            stream_id,
-            increment,
-        }
-        .encode(&mut self.outbound);
-        Ok(())
+        self.egress.window_update(stream_id, increment)
     }
 
     fn emit_rst(&mut self, stream_id: StreamId, error: ErrorCode) -> Result<(), ConnError> {
-        self.prepare_outbound(HEADER_LEN + 4)?;
-        RstStream { stream_id, error }.encode(&mut self.outbound);
-        Ok(())
+        self.egress.reset(stream_id, error)
     }
 
     fn rst_evict(&mut self, stream_id: StreamId, error: ErrorCode) -> Result<(), ConnError> {
@@ -823,55 +759,9 @@ impl<R: Role> Conn<R> {
     where
         I: IntoIterator<Item = hpack::Header<'a>>,
     {
-        let mut block = core::mem::take(&mut self.send_header_block);
-        block.clear();
-        self.encoder.encode(headers, &mut block);
         let max_frame = self.peer_settings.max_frame_size as usize;
-        let frames = block.len().max(1).div_ceil(max_frame);
-        let additional = frames
-            .checked_mul(HEADER_LEN)
-            .and_then(|headers| block.len().checked_add(headers))
-            .ok_or(ConnError::FrameSize);
-        let result = additional.and_then(|additional| self.prepare_outbound(additional));
-        if result.is_err() {
-            self.send_header_block = block;
-            return result;
-        }
-        if block.len() <= max_frame {
-            Headers {
-                stream_id,
-                end_stream,
-                end_headers: true,
-                priority: None,
-                block_fragment: &block,
-            }
-            .encode(&mut self.outbound);
-        } else {
-            let (first, rest) = block.split_at(max_frame);
-            Headers {
-                stream_id,
-                end_stream,
-                end_headers: false,
-                priority: None,
-                block_fragment: first,
-            }
-            .encode(&mut self.outbound);
-            let mut pos = 0;
-            while pos < rest.len() {
-                let take = (rest.len() - pos).min(max_frame);
-                let end = pos + take;
-                let last = end == rest.len();
-                Continuation {
-                    stream_id,
-                    end_headers: last,
-                    block_fragment: &rest[pos..end],
-                }
-                .encode(&mut self.outbound);
-                pos = end;
-            }
-        }
-        self.send_header_block = block;
-        Ok(())
+        self.egress
+            .headers(stream_id, headers, end_stream, max_frame)
     }
 
     fn advance_stream(
@@ -896,135 +786,66 @@ impl<R: Role> Conn<R> {
     }
 
     fn mark_reset(&mut self, id: StreamId) {
-        if self.reset_streams.contains(&id) {
-            return;
-        }
-        if self.reset_streams.is_full() {
-            self.reset_streams.pop_front();
-        }
-        self.reset_streams.vacant_entry().unwrap().push_back(id);
+        self.streams.mark_reset(id);
     }
 
     fn is_peer_initiated(id: StreamId) -> bool {
-        if R::IS_SERVER {
-            id.is_client()
-        } else {
-            id.is_server()
-        }
-    }
-
-    fn is_local_initiated(id: StreamId) -> bool {
-        if R::IS_SERVER {
-            id.is_server()
-        } else {
-            id.is_client()
-        }
-    }
-
-    fn stream_hash(id: StreamId) -> u64 {
-        u64::from(id.0)
+        StreamRegistry::<R>::is_peer_initiated(id)
     }
 
     fn stream(&self, id: StreamId) -> Option<&StreamRecord> {
-        self.streams
-            .get(Self::stream_hash(id), |record| record.stream.id == id)
+        self.streams.get(id)
     }
 
     fn stream_mut(&mut self, id: StreamId) -> Option<&mut StreamRecord> {
-        self.streams
-            .get_mut(Self::stream_hash(id), |record| record.stream.id == id)
+        self.streams.get_mut(id)
     }
 
     fn track_stream(&mut self, stream: Stream) -> Result<(), Stream> {
-        let id = stream.id;
-        let record = StreamRecord {
+        self.streams.insert(
             stream,
-            send_window: flow::Window::with(self.peer_settings.initial_window_size as i32),
-            recv_window: flow::Window::with(self.local_settings.initial_window_size as i32),
-            pending_release: 0,
-        };
-        match self
-            .streams
-            .try_insert(Self::stream_hash(id), record, |record| {
-                record.stream.id == id
-            }) {
-            Ok(()) => {
-                if Self::is_local_initiated(id) {
-                    self.local_streams += 1;
-                } else {
-                    self.peer_streams += 1;
-                }
-                Ok(())
-            }
-            Err(record) => Err(record.stream),
-        }
+            self.peer_settings.initial_window_size,
+            self.local_settings.initial_window_size,
+        )
     }
 
     fn can_track_peer_stream(&self) -> bool {
-        self.peer_streams < self.local_settings.max_concurrent_streams.unwrap() as usize
-            && self.active_count() < self.streams.capacity()
+        self.streams.can_accept_peer(
+            self.local_settings
+                .max_concurrent_streams
+                .unwrap_or(u32::MAX) as usize,
+        )
     }
 
     fn can_track_local_stream(&self) -> bool {
-        self.local_streams
-            < self
-                .peer_settings
+        self.streams.can_open_local(
+            self.peer_settings
                 .max_concurrent_streams
-                .map_or(usize::MAX, |limit| limit as usize)
-            && self.active_count() < self.streams.capacity()
+                .map_or(usize::MAX, |limit| limit as usize),
+        )
     }
 
     fn reserve_promised_stream(&mut self, id: StreamId) -> Result<bool, ConnError> {
-        if !Self::is_peer_initiated(id) || id.0 <= self.last_peer_stream_id {
+        if !Self::is_peer_initiated(id) || id.0 <= self.streams.last_peer_id() {
             return Err(ConnError::Protocol);
         }
         if !self.can_track_peer_stream() {
             self.emit_rst(id, ErrorCode::RefusedStream)?;
-            self.last_peer_stream_id = id.0;
+            self.streams.observe_peer(id);
             return Ok(false);
         }
         self.track_stream(Stream::reserve_remote(id))
             .map_err(|_| ConnError::Protocol)?;
-        self.last_peer_stream_id = id.0;
+        self.streams.observe_peer(id);
         Ok(true)
     }
 
     fn classify_stream(&self, id: StreamId) -> StreamClass {
-        if id.0 == 0 {
-            return StreamClass::Connection;
-        }
-        if self.stream(id).is_some() {
-            return StreamClass::Active;
-        }
-        if Self::is_peer_initiated(id) && id.0 <= self.last_peer_stream_id {
-            return if self.reset_streams.contains(&id) {
-                StreamClass::ClosedRst
-            } else {
-                StreamClass::ClosedEnd
-            };
-        }
-        if Self::is_local_initiated(id) && id.0 < self.next_local_id.peek().0 {
-            return if self.reset_streams.contains(&id) {
-                StreamClass::ClosedRst
-            } else {
-                StreamClass::ClosedEnd
-            };
-        }
-        StreamClass::Idle
+        self.streams.classify(id)
     }
 
     fn evict_stream(&mut self, id: StreamId) {
-        if self
-            .streams
-            .remove(Self::stream_hash(id), |record| record.stream.id == id)
-            .is_some()
-        {
-            if Self::is_local_initiated(id) {
-                self.local_streams -= 1;
-            } else {
-                self.peer_streams -= 1;
-            }
-        }
+        self.streams.remove(id);
     }
 
     fn decode_block(&mut self, block: &[u8]) -> Result<(hpack::HeaderBlock, bool), ConnError> {
@@ -1167,22 +988,15 @@ impl<R: Role> Conn<R> {
                         if delta != 0 {
                             let delta32 = delta as i32;
                             for record in self.streams.values_mut() {
-                                let mut window = record.send_window;
-                                window.adjust_initial(delta32).map_err(ConnError::from)?;
-                            }
-                        }
-                        self.peer_settings = next_settings;
-                        if let Some(max_size) = encoder_size {
-                            self.encoder.set_max_size(max_size);
-                        }
-                        if delta != 0 {
-                            let delta32 = delta as i32;
-                            for record in self.streams.values_mut() {
                                 record
                                     .send_window
                                     .adjust_initial(delta32)
                                     .map_err(ConnError::from)?;
                             }
+                        }
+                        self.peer_settings = next_settings;
+                        if let Some(max_size) = encoder_size {
+                            self.egress.set_header_table_size(max_size);
                         }
                         self.consume_inbound(total);
                         self.emit_settings_ack()?;
@@ -1208,7 +1022,7 @@ impl<R: Role> Conn<R> {
                         };
                         self.prepare_outbound(HEADER_LEN + 8)?;
                         self.consume_inbound(total);
-                        pong.encode(&mut self.outbound);
+                        pong.encode(self.egress.raw_mut());
                         self.push_event(Event::Ping {
                             ack: false,
                             opaque: parsed.opaque,
@@ -1463,15 +1277,15 @@ impl<R: Role> Conn<R> {
                 }
                 if !self.can_track_peer_stream() {
                     self.emit_rst(stream_id, ErrorCode::RefusedStream)?;
-                    self.last_peer_stream_id = stream_id.0;
+                    self.streams.observe_peer(stream_id);
                     return Ok(());
                 }
                 if self.track_stream(Stream::new(stream_id)).is_err() {
                     self.emit_rst(stream_id, ErrorCode::RefusedStream)?;
-                    self.last_peer_stream_id = stream_id.0;
+                    self.streams.observe_peer(stream_id);
                     return Ok(());
                 }
-                self.last_peer_stream_id = stream_id.0;
+                self.streams.observe_peer(stream_id);
             }
             StreamClass::Active => {}
         }
@@ -1779,7 +1593,7 @@ impl Conn<crate::role::ClientRole> {
         if !self.can_track_local_stream() {
             return Err(ConnError::StreamLimit);
         }
-        let id = self.next_local_id.next_id().ok_or(ConnError::StreamLimit)?;
+        let id = self.streams.next_local_id().ok_or(ConnError::StreamLimit)?;
         self.track_stream(Stream::new(id))
             .map_err(|_| ConnError::StreamLimit)?;
         self.emit_headers(id, headers.iter().copied(), end_stream)?;

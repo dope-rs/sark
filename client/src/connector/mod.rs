@@ -2,6 +2,7 @@ mod client;
 pub use client::HttpHandle;
 mod codec;
 mod error;
+mod pool;
 mod redirect;
 mod retry;
 mod session;

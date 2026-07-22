@@ -592,9 +592,7 @@ fn bind_date<'scope, 'd: 'scope, const LISTENER_ID: u8, const DATE_ID: u8, A, T,
 {
     let mut dispatcher = dispatcher.borrow_pin_mut(session.token());
     let projected = dispatcher.as_mut().project();
-    let handler = projected.listener.handler_mut();
-    let stamp = DateHost::stamp(handler.as_ref());
-    unsafe { projected.date.bind(stamp) };
+    bind_listener_date(projected.listener, projected.date);
 }
 
 fn bind_resource_date<
@@ -620,9 +618,21 @@ fn bind_resource_date<
 {
     let mut dispatcher = dispatcher.borrow_pin_mut(session.token());
     let projected = dispatcher.as_mut().project();
-    let handler = projected.listener.handler_mut();
+    bind_listener_date(projected.listener, projected.date);
+}
+
+fn bind_listener_date<'d, const LISTENER_ID: u8, const DATE_ID: u8, A, T, W, P>(
+    mut listener: core::pin::Pin<&mut TimedListener<'d, LISTENER_ID, A, Bundle<T, W, P>>>,
+    date: core::pin::Pin<&mut Updater<DATE_ID>>,
+) where
+    A: Application<'d, Wire = W> + DateHost + TimerHost<'d>,
+    T: Transport,
+    W: Wire,
+    P: RuntimeProfile,
+{
+    let handler = listener.as_mut().handler_mut();
     let stamp = DateHost::stamp(handler.as_ref());
-    unsafe { projected.date.bind(stamp) };
+    unsafe { date.bind(stamp) };
 }
 
 fn clone_listener_config(config: &listener::Config<Tcp>) -> listener::Config<Tcp> {
