@@ -23,14 +23,14 @@ enum SplitBody {
     Pooled(o3::buffer::Pooled),
 }
 
-struct LoopOutcome {
+pub(super) struct LoopOutcome {
     off: usize,
     cursor: usize,
     batched: u32,
     final_action: Option<Outcome>,
     split: Option<(usize, SplitBody)>,
     close_after: bool,
-    head_pending: bool,
+    pub(super) head_pending: bool,
 }
 
 #[derive(Default)]
@@ -89,7 +89,7 @@ impl Pipeline {
         }
     }
 
-    fn fast_path(state: &mut ConnState, bytes: &[u8]) -> (Option<bool>, bool) {
+    pub(super) fn fast_path(state: &mut ConnState, bytes: &[u8]) -> (Option<bool>, bool) {
         if state.recv.is_frozen() {
             let close = matches!(state.recv.extend_backlog(bytes), ExtendOutcome::Overrun);
             return (Some(false), close);
@@ -134,9 +134,10 @@ impl Pipeline {
         discarding
     }
 
-    fn batch<H: Routing>(
+    pub(super) fn batch<'d, H: Routing<'d>>(
         state: &mut ConnState,
         mut app: Pin<&mut H>,
+        scope: dope_fiber::FiberScope<'d>,
         work_buf: &[u8],
         write_buf: &mut [u8],
         close_after: bool,
@@ -161,7 +162,7 @@ impl Pipeline {
             }
             let outcome =
                 app.as_mut()
-                    .try_consume(permit, rest, &mut write_buf[out.cursor..], state);
+                    .try_consume(scope, permit, rest, &mut write_buf[out.cursor..], state);
             permit = match outcome {
                 ConsumeOutcome::NeedMore { state: need, .. } => {
                     let ConnState { pipeline, recv, .. } = state;
@@ -266,7 +267,7 @@ impl Pipeline {
         out
     }
 
-    fn emit<'d, W: Wire, C: Default + 'static, P: Fn(&mut C) -> &mut ConnState>(
+    pub(super) fn emit<'d, W: Wire, C: Default + 'static, P: Fn(&mut C) -> &mut ConnState>(
         slot: &mut link::slot::Slot<'d, W, listener::State<C>>,
         aux: &mut listener::Aux,
         driver: &mut DriverContext<'_, 'd>,
@@ -363,247 +364,6 @@ impl Pipeline {
             close || !act.apply(slot, aux, driver)
         } else {
             false
-        }
-    }
-
-    pub fn run<'d, H, W>(
-        app: Pin<&mut H>,
-        bytes: &[u8],
-        slot: &mut link::slot::Slot<'d, W, listener::State<ConnState>>,
-        aux: &mut listener::Aux,
-        driver: &mut DriverContext<'_, 'd>,
-    ) -> bool
-    where
-        H: Routing + crate::timer::TimerHost<'d>,
-        W: Wire,
-    {
-        Self::run_proj(app, bytes, slot, aux, driver, identity_mut)
-    }
-
-    pub fn run_proj<'d, H, W, C, P>(
-        mut app: Pin<&mut H>,
-        bytes: &[u8],
-        slot: &mut link::slot::Slot<'d, W, listener::State<C>>,
-        aux: &mut listener::Aux,
-        driver: &mut DriverContext<'_, 'd>,
-        project: P,
-    ) -> bool
-    where
-        H: Routing + crate::timer::TimerHost<'d>,
-        W: Wire,
-        C: Default + 'static,
-        P: Fn(&mut C) -> &mut ConnState,
-    {
-        let (fast, close) = Self::fast_path(project(&mut slot.state.conn), bytes);
-        if close {
-            slot.set_close_after();
-        }
-        if let Some(ret) = fast {
-            return ret;
-        }
-
-        let use_accumulator = project(&mut slot.state.conn).recv.is_accumulating();
-        if use_accumulator
-            && !bytes.is_empty()
-            && matches!(
-                project(&mut slot.state.conn).recv.extend_existing(bytes),
-                ExtendOutcome::Overrun
-            )
-        {
-            slot.set_close_after();
-            return true;
-        }
-
-        let peeked: Option<o3::buffer::Shared> = if use_accumulator {
-            project(&mut slot.state.conn).recv.snapshot()
-        } else {
-            None
-        };
-        let work_buf: &[u8] = match &peeked {
-            Some(s) => s.as_slice(),
-            None => bytes,
-        };
-
-        project(&mut slot.state.conn).recv_view = peeked.clone();
-        let close_after = slot.close_after();
-        let mut write_buf = aux.write_buf_for(slot);
-        let out = Self::batch(
-            project(&mut slot.state.conn),
-            app.as_mut(),
-            work_buf,
-            &mut write_buf,
-            close_after,
-        );
-        drop(peeked);
-        project(&mut slot.state.conn).recv_view = None;
-
-        let head_pending = out.head_pending;
-        let overrun = Self::emit(slot, aux, driver, out, use_accumulator, bytes, &project);
-        if !overrun {
-            Self::begin_body_discard(slot, driver, &project);
-        }
-        let deadline_overrun = Self::manage_head_deadline(
-            app.as_ref().get_ref(),
-            slot,
-            head_pending,
-            driver.turn_now(),
-            &project,
-        );
-        overrun || deadline_overrun
-    }
-
-    fn begin_body_discard<'d, W, C, P>(
-        slot: &mut link::slot::Slot<'d, W, listener::State<C>>,
-        driver: &mut DriverContext<'_, 'd>,
-        project: &P,
-    ) where
-        W: Wire,
-        C: Default + 'static,
-        P: Fn(&mut C) -> &mut ConnState,
-    {
-        let remaining = project(&mut slot.state.conn)
-            .pipeline
-            .discard_body_remaining;
-        if remaining > 0 && slot.begin_discard(driver, remaining as u64) {
-            project(&mut slot.state.conn)
-                .pipeline
-                .discard_body_remaining = 0;
-        }
-    }
-
-    fn manage_head_deadline<'d, H, W, C, P>(
-        app: &H,
-        slot: &mut link::slot::Slot<'d, W, listener::State<C>>,
-        head_pending: bool,
-        now: std::time::Instant,
-        project: &P,
-    ) -> bool
-    where
-        H: crate::timer::TimerHost<'d>,
-        W: Wire,
-        C: Default + 'static,
-        P: Fn(&mut C) -> &mut ConnState,
-    {
-        if head_pending {
-            if project(&mut slot.state.conn).head_deadline.is_none() {
-                let timer = crate::timer::TimerHost::timer(app);
-                let deadline = now + timer.head_timeout();
-                let wake = dope_fiber::Waker::from_ready(slot.driver(), slot.ready_key());
-                if let Some(ticket) = timer.arm(deadline, wake) {
-                    project(&mut slot.state.conn).head_deadline = Some(ticket);
-                } else {
-                    return true;
-                }
-            }
-        } else if let Some(ticket) = project(&mut slot.state.conn).head_deadline.take() {
-            crate::timer::TimerHost::timer(app).cancel(ticket);
-        }
-        false
-    }
-
-    pub fn poll_head_deadline<'d, H, W>(
-        app: &H,
-        slot: &mut link::slot::Slot<'d, W, listener::State<ConnState>>,
-        aux: &mut listener::Aux,
-        driver: &mut DriverContext<'_, 'd>,
-    ) -> bool
-    where
-        H: crate::timer::TimerHost<'d>,
-        W: Wire,
-    {
-        Self::poll_head_deadline_proj(app, slot, aux, driver, identity_mut)
-    }
-
-    pub fn poll_head_deadline_proj<'d, H, W, C, P>(
-        app: &H,
-        slot: &mut link::slot::Slot<'d, W, listener::State<C>>,
-        aux: &mut listener::Aux,
-        driver: &mut DriverContext<'_, 'd>,
-        project: P,
-    ) -> bool
-    where
-        H: crate::timer::TimerHost<'d>,
-        W: Wire,
-        C: Default + 'static,
-        P: Fn(&mut C) -> &mut ConnState,
-    {
-        let Some(ticket) = project(&mut slot.state.conn).head_deadline else {
-            return false;
-        };
-        let timer = crate::timer::TimerHost::timer(app);
-        if !timer.is_fired(ticket) {
-            return false;
-        }
-        project(&mut slot.state.conn).head_deadline = None;
-        timer.cancel(ticket);
-        slot.set_close_after();
-        let buf = aux.write_buf_for(slot);
-        let ud = slot.token();
-        slot.submit_split_static(buf, 0, crate::CANNED_408, ud, driver);
-        true
-    }
-
-    pub fn cancel_head_deadline_proj<'d, H, W, C, P>(
-        app: &H,
-        slot: &mut link::slot::Slot<'d, W, listener::State<C>>,
-        project: P,
-    ) where
-        H: crate::timer::TimerHost<'d>,
-        W: Wire,
-        C: Default + 'static,
-        P: Fn(&mut C) -> &mut ConnState,
-    {
-        if let Some(ticket) = project(&mut slot.state.conn).head_deadline.take() {
-            crate::timer::TimerHost::timer(app).cancel(ticket);
-        }
-    }
-
-    pub fn send_complete<'d, H, W>(
-        app: Pin<&mut H>,
-        sent: usize,
-        slot: &mut link::slot::Slot<'d, W, listener::State<ConnState>>,
-        aux: &mut listener::Aux,
-        driver: &mut DriverContext<'_, 'd>,
-    ) where
-        H: Routing + crate::timer::TimerHost<'d>,
-        W: Wire,
-    {
-        Self::send_complete_proj(app, sent, slot, aux, driver, identity_mut)
-    }
-
-    pub fn send_complete_proj<'d, H, W, C, P>(
-        mut app: Pin<&mut H>,
-        _sent: usize,
-        slot: &mut link::slot::Slot<'d, W, listener::State<C>>,
-        aux: &mut listener::Aux,
-        driver: &mut DriverContext<'_, 'd>,
-        project: P,
-    ) where
-        H: Routing + crate::timer::TimerHost<'d>,
-        W: Wire,
-        C: Default + 'static,
-        P: Fn(&mut C) -> &mut ConnState,
-    {
-        if project(&mut slot.state.conn).async_state.task_stream
-            && project(&mut slot.state.conn).async_state.has_task()
-        {
-            return;
-        }
-        if let Some(DeferredAction::Close(reason)) =
-            project(&mut slot.state.conn).deferred_action.take()
-        {
-            slot.set_close_after();
-            if !reason.is_empty() {
-                let buf = aux.write_buf_for(slot);
-                let ud = slot.token();
-                slot.submit_split_static(buf, 0, reason, ud, driver);
-            }
-            return;
-        }
-        if project(&mut slot.state.conn).recv.is_accumulating()
-            && !project(&mut slot.state.conn).recv.is_frozen()
-        {
-            let _ = Self::run_proj(app.as_mut(), &[], slot, aux, driver, &project);
         }
     }
 }

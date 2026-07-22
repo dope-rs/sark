@@ -1,14 +1,5 @@
+use super::KnownHeader;
 use crate::error::Result;
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Known {
-    Host,
-    Expect,
-    Connection,
-    ContentLength,
-    TransferEncoding,
-    AcceptEncoding,
-}
 
 pub trait Visitor {
     type Parsed;
@@ -19,7 +10,7 @@ pub trait Visitor {
         let _ = (parsed, raw);
         Ok(())
     }
-    fn known(&mut self, key: Known, value: &[u8]) -> Result<()> {
+    fn known(&mut self, key: KnownHeader, value: &[u8]) -> Result<()> {
         let _ = (key, value);
         Ok(())
     }

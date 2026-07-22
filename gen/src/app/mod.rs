@@ -5,7 +5,8 @@ mod spec;
 use proc_macro2::TokenStream;
 use syn::{LitStr, Result};
 
-use crate::model::{AppDispatchInput, AppRouteInput, DefineRouteEntry, DefineRouteInput};
+use crate::define_route_input::{DefineRouteEntry, DefineRouteInput};
+use crate::model::{AppDispatchInput, AppRouteInput};
 
 pub(super) fn define_route(input: DefineRouteInput) -> Result<TokenStream> {
     let DefineRouteInput {

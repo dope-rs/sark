@@ -81,14 +81,12 @@ impl Mode {
         let mut body_is_static_slice = false;
         let mut dynamic = Vec::new();
         let mut all_fields = Vec::new();
-        let mut all_field_types = Vec::new();
         for field in fields.iter_mut() {
             let ident = field
                 .ident
                 .clone()
                 .ok_or_else(|| Error::new(Span::call_site(), "named field required"))?;
             all_fields.push(ident.clone());
-            all_field_types.push(field.ty.clone());
             if ident == "status" {
                 status_ident = Some(ident.clone());
             }
@@ -149,25 +147,25 @@ impl Mode {
         };
         let fixed_ret = match self {
             Mode::Json => quote! {
-                ::sark::sark_core::http::EncodedResponseInner<
+                ::sark::sark_core::http::EncodedResponse<
                     #serve_lt,
                     ::sark::json::JsonBody<#body_ty>,
                     #header_count,
                 >
             },
             Mode::Raw if has_borrowed => {
-                quote!(::sark::sark_core::http::FixedResponseInner<'req, #header_count>)
+                quote!(::sark::sark_core::http::FixedResponse<'req, #header_count>)
             }
             Mode::Raw => {
-                quote!(::sark::sark_core::http::FixedResponseInner<'static, #header_count>)
+                quote!(::sark::sark_core::http::FixedResponse<'static, #header_count>)
             }
         };
         let destructure = quote! { let Self { #( #all_fields, )* } = self; };
         let headers_build = headers.build_expr();
         let static_wire = &headers.static_wire;
         let response_ctor = match self {
-            Mode::Json => quote!(::sark::sark_core::http::EncodedResponseInner::direct),
-            Mode::Raw => quote!(::sark::sark_core::http::FixedResponseInner::direct),
+            Mode::Json => quote!(::sark::sark_core::http::EncodedResponse::direct),
+            Mode::Raw => quote!(::sark::sark_core::http::FixedResponse::direct),
         };
         let into_fixed_body = quote! {
             #destructure
@@ -231,7 +229,6 @@ impl Mode {
             };
             quote! {
                 impl ::sark::sark_core::http::__private::GeneratedResponse for #inner_name {
-                    type Fields = ( #( #all_field_types, )* );
                     type Shape = #owned_shape;
 
                     const BODY_KIND: ::sark::sark_core::http::body_kind::ResponseKind =
@@ -286,7 +283,7 @@ impl Mode {
                         for #inner_name<'req>
                     {
                         type Kind = ::sark::service::manifold::Sync;
-                        type Shape = ::sark::sark_core::http::FixedResponseInner<'req, #header_count>;
+                        type Shape = ::sark::sark_core::http::FixedResponse<'req, #header_count>;
                         type Stream = ::sark::sark_core::http::NeverStream;
 
                         const BODY_KIND: ::sark::sark_core::http::body_kind::ResponseKind =
@@ -306,7 +303,7 @@ impl Mode {
                 )
             } else {
                 (
-                    quote!(::sark::sark_core::http::FixedResponseInner<'req, #header_count>),
+                    quote!(::sark::sark_core::http::FixedResponse<'req, #header_count>),
                     quote!(self.into_fixed()),
                 )
             };
@@ -360,13 +357,13 @@ impl HeaderEmit {
         }
         let (item_path, headers_path) = if has_borrowed {
             (
-                quote!(::sark::sark_core::http::HeaderItemInner::<'req>),
-                quote!(::sark::sark_core::http::HeadersInner::<'req, #header_count>),
+                quote!(::sark::sark_core::http::HeaderItem::<'req>),
+                quote!(::sark::sark_core::http::Headers::<'req, #header_count>),
             )
         } else {
             (
                 quote!(::sark::sark_core::http::HeaderItem),
-                quote!(::sark::sark_core::http::HeadersInner::<'static, #header_count>),
+                quote!(::sark::sark_core::http::Headers::<'static, #header_count>),
             )
         };
         let mut dyn_items = Vec::with_capacity(dynamic.len());

@@ -3,7 +3,7 @@ use quote::{format_ident, quote};
 use syn::Result;
 
 use crate::codegen::header::BytesMatch;
-use crate::codegen::value::{QueryScanLoop, Value};
+use crate::codegen::value::{ParsedValue, QueryScan};
 use crate::model::QueryAttrField;
 use crate::util::TypeExt;
 
@@ -22,14 +22,11 @@ impl<'a> Query<'a> {
 
     pub(super) fn set_slice_direct(&self) -> Result<TokenStream> {
         self.states_loop(|field| {
-            Ok(Value::build_parse_expr(
-                field.ty.value_kind()?,
-                quote!(range.clone()),
-            ))
+            Ok(ParsedValue::new(field.ty.value_kind()?, quote!(range.clone())).emit())
         })
     }
 
-    pub(super) fn parse_direct() -> Result<TokenStream> {
+    pub(super) fn parse_direct() -> TokenStream {
         let per_segment = quote! {
             Self::set_query_slice_raw(
                 headers,
@@ -38,7 +35,7 @@ impl<'a> Query<'a> {
                 value_start_abs..value_end_abs,
             )?;
         };
-        Ok(QueryScanLoop::build(&per_segment))
+        QueryScan::new(per_segment).emit()
     }
 
     fn skippable(field: &QueryAttrField) -> bool {
@@ -56,7 +53,7 @@ impl<'a> Query<'a> {
             .map(|(idx, field)| {
                 let ident = &field.ident;
                 let name =
-                    BytesMatch::exact(&format_ident!("name"), field.query.value().as_bytes());
+                    BytesMatch::Exact.emit(&format_ident!("name"), field.query.value().as_bytes());
                 let state = idx as u8;
                 let next = state.saturating_add(1);
                 let assign = assign_for(field)?;

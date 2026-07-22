@@ -612,7 +612,7 @@ fn multiple_transfer_encoding_headers() {
     let raw = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: gzip\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n0\r\n\r\n";
     let result = ResponseDecoder::new(DecodeMode::Response).response(raw);
     if let Ok(Some(resp)) = result {
-        assert_eq!(resp.body_str(), Some("hello"));
+        assert_eq!(std::str::from_utf8(resp.body()).ok(), Some("hello"));
     }
 }
 

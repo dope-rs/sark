@@ -1,8 +1,8 @@
 use proc_macro2::TokenStream;
 use quote::{format_ident, quote};
-use syn::{Error, Ident, LitStr, Result, Type};
+use syn::{Ident, LitStr, Result, Type};
 
-use crate::codegen::value::Value;
+use crate::codegen::value::ValueBinding;
 use crate::model::PathAttrField;
 use crate::util::{TypeExt, ValueKind};
 
@@ -174,17 +174,10 @@ impl<'a> Params<'a> {
                 }
             },
             ValueKind::Bytes => {
-                let default = default.ok_or_else(|| {
-                    Error::new_spanned(
-                        ty,
-                        "non-Option request path Bytes<Retained> fields require default = \"...\"",
-                    )
-                })?;
-                let fallback = if borrowed {
-                    Value::build_default_borrowed_expr(default)
-                } else {
-                    Value::build_default_retained_expr(default)
-                };
+                let fallback = ValueBinding::new(ty, default).default_bytes_expr(
+                    borrowed,
+                    "non-Option request path Bytes<Retained> fields require default = \"...\"",
+                )?;
                 quote! {
                     #ident: match #raw {
                         Some(range) => req.path_frame(range)?,
@@ -194,7 +187,8 @@ impl<'a> Params<'a> {
             }
             _ if ty.value_optional() => quote! { #ident: #raw },
             _ => {
-                let unwrap = Value::build_required_or_default_expr(ty, default, quote!(#raw))?;
+                let unwrap =
+                    ValueBinding::new(ty, default).required_or_default_expr(quote!(#raw))?;
                 quote! { #ident: #unwrap }
             }
         })

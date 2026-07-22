@@ -224,7 +224,7 @@ fn pipelined_responses_extra_data() {
     let result = ResponseDecoder::new(DecodeMode::Response).response(raw);
     assert!(result.is_ok());
     let resp = result.unwrap().unwrap();
-    assert_eq!(resp.body_str(), Some("hello"));
+    assert_eq!(std::str::from_utf8(resp.body()).ok(), Some("hello"));
 }
 
 #[test]
@@ -248,7 +248,7 @@ fn content_length_with_leading_zeros() {
     let result = ResponseDecoder::new(DecodeMode::Response).response(raw);
     assert!(result.is_ok());
     let resp = result.unwrap().unwrap();
-    assert_eq!(resp.body_str(), Some("hello"));
+    assert_eq!(std::str::from_utf8(resp.body()).ok(), Some("hello"));
 }
 
 #[test]
@@ -257,7 +257,7 @@ fn content_length_with_whitespace() {
     let result = ResponseDecoder::new(DecodeMode::Response).response(raw);
     assert!(result.is_ok());
     let resp = result.unwrap().unwrap();
-    assert_eq!(resp.body_str(), Some("hello"));
+    assert_eq!(std::str::from_utf8(resp.body()).ok(), Some("hello"));
 }
 
 #[test]
@@ -282,7 +282,7 @@ fn chunked_with_multiple_extensions() {
     let result = ResponseDecoder::new(DecodeMode::Response).response(raw);
     assert!(result.is_ok());
     let resp = result.unwrap().unwrap();
-    assert_eq!(resp.body_str(), Some("hello"));
+    assert_eq!(std::str::from_utf8(resp.body()).ok(), Some("hello"));
 }
 
 #[test]
@@ -292,7 +292,10 @@ fn chunked_lowercase_hex() {
     let result = ResponseDecoder::new(DecodeMode::Response).response(raw);
     assert!(result.is_ok());
     let resp = result.unwrap().unwrap();
-    assert_eq!(resp.body_str(), Some("012345678901234"));
+    assert_eq!(
+        std::str::from_utf8(resp.body()).ok(),
+        Some("012345678901234")
+    );
 }
 
 #[test]
@@ -314,7 +317,7 @@ fn crlf_in_chunk_data() {
     let raw = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n7\r\nab\r\ncd\r\n0\r\n\r\n";
     let result = ResponseDecoder::new(DecodeMode::Response).response(raw);
     match result {
-        Ok(Some(resp)) => assert_eq!(resp.body_str(), Some("ab\r\ncd")),
+        Ok(Some(resp)) => assert_eq!(std::str::from_utf8(resp.body()).ok(), Some("ab\r\ncd")),
         Ok(None) => {}
         Err(_) => {}
     }
@@ -326,7 +329,7 @@ fn transfer_encoding_case_insensitive() {
     let result = ResponseDecoder::new(DecodeMode::Response).response(raw);
     assert!(result.is_ok());
     let resp = result.unwrap().unwrap();
-    assert_eq!(resp.body_str(), Some("hello"));
+    assert_eq!(std::str::from_utf8(resp.body()).ok(), Some("hello"));
 }
 
 #[test]
@@ -335,5 +338,5 @@ fn content_length_case_insensitive() {
     let result = ResponseDecoder::new(DecodeMode::Response).response(raw);
     assert!(result.is_ok());
     let resp = result.unwrap().unwrap();
-    assert_eq!(resp.body_str(), Some("hello"));
+    assert_eq!(std::str::from_utf8(resp.body()).ok(), Some("hello"));
 }

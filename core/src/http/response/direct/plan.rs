@@ -1,31 +1,29 @@
 use http::StatusCode;
 use o3::buffer::{Borrowed, Bytes, Owned, Retained, Shared};
 
-use super::super::{HotBodyInner, HotHeadInner, IntoBody, MonoResponseInner};
+use super::super::{Body, HotBodyInner, HotHeadInner, MonoResponseInner, TextBody};
 use super::head::HeadInner;
-use super::headers::{HeaderAssert, HeaderNameToken, HeaderStaticValueToken, HeadersInner};
-use super::value::{InlineHeaderValue, TextSpec};
+use super::headers::{HeaderNameToken, HeaderStaticValueToken, Headers};
+use super::value::InlineHeaderValue;
 
 #[derive(Clone, Debug)]
-pub struct ResponsePlanInner<'req> {
+pub struct ResponsePlan<'req> {
     pub(in crate::http::response) status: StatusCode,
     pub(in crate::http::response) head: HeadInner<'req>,
 }
 
-pub type ResponsePlan = ResponsePlanInner<'static>;
-
-impl<'req> ResponsePlanInner<'req> {
+impl<'req> ResponsePlan<'req> {
     pub fn with_capacity(status: StatusCode) -> Self {
         Self {
             status,
-            head: HeadInner::new(b"", HeadersInner::new()),
+            head: HeadInner::new(b"", Headers::new()),
         }
     }
 
     pub fn from_static(status: StatusCode, static_headers: &'static [u8]) -> Self {
         Self {
             status,
-            head: HeadInner::new(static_headers, HeadersInner::new()),
+            head: HeadInner::new(static_headers, Headers::new()),
         }
     }
 
@@ -76,7 +74,7 @@ impl<'req> ResponsePlanInner<'req> {
     }
 
     fn push_str_value(&mut self, name: HeaderNameToken, value: &str) -> &mut Self {
-        HeaderAssert::value(value);
+        HeaderStaticValueToken::validate(value);
         if value.len() <= 31 {
             self.head
                 .headers_mut()
@@ -94,7 +92,7 @@ impl<'req> ResponsePlanInner<'req> {
         name: HeaderNameToken,
         value: Bytes<Borrowed<'req>>,
     ) -> &mut Self {
-        HeaderAssert::value_bytes(value.as_slice());
+        HeaderStaticValueToken::validate_bytes(value.as_slice());
         self.head.headers_mut().push_borrowed(name, value);
         self
     }
@@ -104,34 +102,34 @@ impl<'req> ResponsePlanInner<'req> {
         name: HeaderNameToken,
         value: Bytes<Retained>,
     ) -> &mut Self {
-        HeaderAssert::value_bytes(value.as_slice());
+        HeaderStaticValueToken::validate_bytes(value.as_slice());
         self.head.headers_mut().push_retained(name, value);
         self
     }
 
     pub fn respond_mono<B>(self, body: B) -> MonoResponseInner<'req>
     where
-        B: IntoBody<'req>,
+        B: Into<Body<'req>>,
     {
         let status = self.status;
         MonoResponseInner {
             status,
             headers: None,
             head: HotHeadInner::Direct(self.head),
-            body: HotBodyInner::from(body.into_response_body()),
+            body: HotBodyInner::from(body.into()),
         }
     }
 
     pub fn respond_text<T>(self, body: T) -> MonoResponseInner<'req>
     where
-        T: TextSpec<'req>,
+        T: Into<TextBody<'req>>,
     {
         let status = self.status;
         MonoResponseInner {
             status,
             headers: None,
             head: HotHeadInner::Direct(self.head),
-            body: HotBodyInner::Text(body.into_hot_text()),
+            body: HotBodyInner::Text(body.into()),
         }
     }
 }

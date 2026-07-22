@@ -1,6 +1,6 @@
 use std::cell::OnceCell;
 
-use sark_core::http::FixedResponseInner;
+use sark_core::http::FixedResponse;
 
 pub enum Entry {
     Fixed {
@@ -42,13 +42,13 @@ impl<'a> Cache<'a> {
             Some(Entry::Fixed {
                 template,
                 date_offset,
-            }) => FixedResponseInner::write_preserialized(write, template, *date_offset, date)
+            }) => FixedResponse::write_preserialized(write, template, *date_offset, date)
                 .map(|written| Cached::Fixed { written }),
             Some(Entry::Static {
                 head_template,
                 date_offset,
                 body,
-            }) => FixedResponseInner::write_preserialized(write, head_template, *date_offset, date)
+            }) => FixedResponse::write_preserialized(write, head_template, *date_offset, date)
                 .map(|hdr_written| Cached::Static { hdr_written, body }),
             None => None,
         }

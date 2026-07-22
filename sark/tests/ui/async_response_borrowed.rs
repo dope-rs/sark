@@ -25,6 +25,6 @@ async fn borrowed(_request: Req, _state: &()) -> BorrowedReply<'static> {
 fn require_owned<T: OwnedShape>() {}
 
 fn main() {
-    require_owned::<FixedResponse>();
-    require_owned::<Serve>();
+    require_owned::<FixedResponse<'static>>();
+    require_owned::<Serve<'static>>();
 }

@@ -4,10 +4,7 @@ use std::ops::Range;
 
 use sark_core::error::Result;
 use sark_core::http::codec::HeaderScan;
-use sark_core::http::head::{
-    BytesScan, Flags, HeadInput, HeaderLineScan, apply_well_known_header,
-    apply_well_known_header_contig,
-};
+use sark_core::http::head::{Flags, HeadInput, HeaderLineScan, WellKnownHeaders};
 
 use super::plan::HeaderValue;
 use super::spec::RouteParams;
@@ -43,7 +40,7 @@ pub trait RouteRequestImpl {
     }
 
     fn scan_header_contig(rest: &[u8]) -> Result<Option<HeaderLineScan>> {
-        Ok(BytesScan::find_header_line_from(rest, 0))
+        Ok(HeaderLineScan::find(rest, 0))
     }
 
     fn apply_header_contig<I: HeadInput + ?Sized>(
@@ -56,7 +53,12 @@ pub trait RouteRequestImpl {
         header_count: &mut usize,
         max_header_count: usize,
     ) -> Result<Option<usize>> {
-        apply_well_known_header_contig(rest, scan, flags, &mut (), header_count, max_header_count)
+        WellKnownHeaders::new(scan, flags).apply_contiguous(
+            rest,
+            &mut (),
+            header_count,
+            max_header_count,
+        )
     }
 
     fn apply_header<I: HeadInput + ?Sized>(
@@ -71,17 +73,8 @@ pub trait RouteRequestImpl {
         flags: &mut Flags,
         scan_info: Option<&HeaderLineScan>,
     ) -> Result<()> {
-        apply_well_known_header(
-            input,
-            line,
-            line_start,
-            colon_idx,
-            pretrim_start,
-            pretrim_end,
-            scan,
-            flags,
-            scan_info,
-        )
+        let _ = (input, line_start, scan_info);
+        WellKnownHeaders::new(scan, flags).apply(line, colon_idx, pretrim_start, pretrim_end)
     }
 
     fn set_header_raw<V: HeaderValue>(

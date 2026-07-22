@@ -47,7 +47,7 @@ impl Config<'_> {
             ..
         } = *self;
 
-        let default_response_ty = quote!(sark_core::http::ServeInner<'__req>);
+        let default_response_ty = quote!(sark_core::http::Serve<'__req>);
         let native_response_shape = native_response_ty.map(|ty| {
             quote! {
                 <#ty as sark::service::manifold::NativeResponse<'__req>>::Shape

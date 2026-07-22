@@ -1,8 +1,10 @@
 use http::StatusCode;
 use o3::buffer::{Owned, Shared};
 
-use super::wire_emit::{ContentLength, DATE_LEN, HeadWrite, HeaderSection, Out, PLACEHOLDER_DATE};
-use super::{DEFAULT_HEADER_CAPACITY, HeadInner, HeadersInner};
+use super::wire_emit::{
+    ContentLength, DATE_LEN, HeadWrite, HeaderSection, PLACEHOLDER_DATE, WireWriter,
+};
+use super::{DEFAULT_HEADER_CAPACITY, HeadInner, Headers};
 
 const GZIP_HEADERS: &[u8] = b"Content-Encoding: gzip\r\nVary: Accept-Encoding\r\n";
 
@@ -13,30 +15,24 @@ impl<const N: usize> HeaderSection for GzipHeaders<'_, '_, N> {
         self.0.wire_len() + GZIP_HEADERS.len()
     }
 
-    fn write_headers(&self, out: &mut [u8], off: &mut usize) {
-        let written = self
-            .0
-            .write_slice(&mut out[*off..])
-            .expect("HeadWrite invariant: head buffer reserved via wire_len");
-        *off += written;
-        Out::put(out, off, GZIP_HEADERS);
+    fn write_headers(&self, out: &mut WireWriter<'_>) {
+        self.0.write_headers(out);
+        out.put(GZIP_HEADERS);
     }
 }
 
 #[derive(Clone, Debug)]
-pub struct FixedResponseInner<'req, const N: usize = DEFAULT_HEADER_CAPACITY> {
+pub struct FixedResponse<'req, const N: usize = DEFAULT_HEADER_CAPACITY> {
     pub(super) status: StatusCode,
     pub(super) head: HeadInner<'req, N>,
     pub(super) body: Shared,
 }
 
-pub type FixedResponse = FixedResponseInner<'static>;
-
-impl<'req, const N: usize> FixedResponseInner<'req, N> {
+impl<'req, const N: usize> FixedResponse<'req, N> {
     pub fn direct<B>(
         status: StatusCode,
         static_headers: &'static [u8],
-        headers: HeadersInner<'req, N>,
+        headers: Headers<'req, N>,
         body: B,
     ) -> Self
     where
@@ -94,10 +90,9 @@ impl<'req, const N: usize> FixedResponseInner<'req, N> {
     pub fn preserialize(&self) -> (Vec<u8>, usize) {
         let (head, body) = self.head_write();
         let mut buf = vec![0u8; head.wire_len() + body.len()];
-        let mut off = 0usize;
-        let date_offset = head.write(&mut buf, &mut off, PLACEHOLDER_DATE);
-        Out::put(&mut buf, &mut off, body);
-        (buf, date_offset)
+        let written = head.write(&mut buf, PLACEHOLDER_DATE);
+        WireWriter::at(&mut buf, written.len).put(body);
+        (buf, written.date_offset)
     }
 
     pub fn write_into_slice(&self, out: &mut [u8], date: &[u8; 29]) -> Option<usize> {
@@ -105,10 +100,10 @@ impl<'req, const N: usize> FixedResponseInner<'req, N> {
         if out.len() < head.wire_len() + body.len() {
             return None;
         }
-        let mut off = 0usize;
-        head.write(out, &mut off, date);
-        Out::put(out, &mut off, body);
-        Some(off)
+        let written = head.write(out, date);
+        let mut out = WireWriter::at(out, written.len);
+        out.put(body);
+        Some(out.len())
     }
 
     pub fn write_head_split(self, out: &mut [u8], date: &[u8; 29]) -> Option<(usize, Shared)> {
@@ -116,9 +111,8 @@ impl<'req, const N: usize> FixedResponseInner<'req, N> {
         if out.len() < head.wire_len() {
             return None;
         }
-        let mut off = 0usize;
-        head.write(out, &mut off, date);
-        Some((off, self.body))
+        let written = head.write(out, date);
+        Some((written.len, self.body))
     }
 
     pub fn write_gzip_head(
@@ -141,13 +135,11 @@ impl<'req, const N: usize> FixedResponseInner<'req, N> {
         if out.len() < head.wire_len() {
             return None;
         }
-        let mut off = 0usize;
-        head.write(out, &mut off, date);
-        Some(off)
+        Some(head.write(out, date).len)
     }
 }
 
-impl FixedResponseInner<'static> {
+impl FixedResponse<'static> {
     pub fn write_preserialized(
         out: &mut [u8],
         template: &[u8],

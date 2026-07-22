@@ -119,7 +119,7 @@ where
 {
     const ID: u8 = ID;
 
-    fn dispatch(self: Pin<&mut Self>, ev: Event, driver: &mut DriverContext<'_, 'd>) {
+    fn dispatch(self: Pin<&mut Self>, ev: Event<'d>, driver: &mut DriverContext<'_, 'd>) {
         dope::manifold::Manifold::dispatch(self.project().inner, ev, driver)
     }
 

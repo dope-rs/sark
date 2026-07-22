@@ -2,7 +2,7 @@ use std::cell::OnceCell;
 
 use o3::buffer::{Bytes, Retained};
 use sark_core::error::Result;
-use sark_core::http::head::{HeadInput, is_ascii_ws};
+use sark_core::http::head::{HeadInput, HeaderLine};
 
 use crate::service::HeaderValue;
 
@@ -85,7 +85,7 @@ impl<'a, I: HeadInput + ?Sized> InputHeaderValue<'a, I> {
                 return;
             }
             for &b in bytes {
-                if is_ascii_ws(b) {
+                if HeaderLine::is_whitespace(b) {
                     if saw_digit {
                         trailing_ws = true;
                     }

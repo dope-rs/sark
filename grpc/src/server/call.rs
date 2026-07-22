@@ -1,4 +1,4 @@
-use o3::collections::{FixedHashTable, Slab, SlabKey};
+use o3::collections::{FixedHashTable, FixedQueue, Slab, SlabKey};
 use sark_h2::StreamId;
 
 use super::egress::PendingResponse;
@@ -7,23 +7,51 @@ use crate::headers::RequestHead;
 use crate::metadata::Metadata;
 use crate::server::StreamMode;
 
-pub(super) enum MessageNodeTag {}
-pub(super) type MessageNodeKey = SlabKey<MessageNodeTag>;
+enum MessageNodeTag {}
+type MessageNodeKey = SlabKey<MessageNodeTag>;
 
-pub(super) struct MessageNode {
-    pub(super) message: MessageFrame,
-    pub(super) next: Option<MessageNodeKey>,
+struct MessageNode {
+    message: MessageFrame,
+    next: Option<MessageNodeKey>,
 }
 
 pub(super) struct StreamState {
     pub(super) head: RequestHead,
     pub(super) deframer: Deframer,
-    pub(super) message_head: Option<MessageNodeKey>,
-    pub(super) message_tail: Option<MessageNodeKey>,
+    message_head: Option<MessageNodeKey>,
+    message_tail: Option<MessageNodeKey>,
     pub(super) message_count: usize,
     pub(super) trailers: Metadata,
     pub(super) mode: StreamMode,
     pub(super) buffered_len: usize,
+}
+
+#[derive(Clone, Copy)]
+pub(super) struct MessageChain {
+    head: Option<MessageNodeKey>,
+    len: usize,
+}
+
+impl StreamState {
+    pub(super) fn new(head: RequestHead, max_message_len: usize, mode: StreamMode) -> Self {
+        Self {
+            head,
+            deframer: Deframer::new(max_message_len),
+            message_head: None,
+            message_tail: None,
+            message_count: 0,
+            trailers: Metadata::new(),
+            mode,
+            buffered_len: 0,
+        }
+    }
+
+    pub(super) fn message_chain(&self) -> MessageChain {
+        MessageChain {
+            head: self.message_head,
+            len: self.message_count,
+        }
+    }
 }
 
 pub(super) struct CallRecord {
@@ -39,6 +67,87 @@ pub(super) struct CallStore {
     buffered_total: usize,
 }
 
+pub struct MessageList<'a> {
+    repr: MessageListRepr<'a>,
+    len: usize,
+}
+
+enum MessageListRepr<'a> {
+    Chain {
+        nodes: &'a Slab<MessageNode, MessageNodeTag>,
+        next: Option<MessageNodeKey>,
+    },
+    Queue(&'a FixedQueue<MessageFrame>),
+}
+
+impl<'a> MessageList<'a> {
+    pub(super) fn from_queue(queue: &'a FixedQueue<MessageFrame>) -> Self {
+        Self {
+            len: queue.len(),
+            repr: MessageListRepr::Queue(queue),
+        }
+    }
+
+    pub fn len(&self) -> usize {
+        self.len
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    pub fn iter(&self) -> MessageIter<'_> {
+        let repr = match &self.repr {
+            MessageListRepr::Chain { nodes, next } => MessageIterRepr::Chain { nodes, next: *next },
+            MessageListRepr::Queue(queue) => MessageIterRepr::Queue { queue, index: 0 },
+        };
+        MessageIter { repr }
+    }
+}
+
+impl<'a> IntoIterator for &'a MessageList<'_> {
+    type Item = &'a MessageFrame;
+    type IntoIter = MessageIter<'a>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.iter()
+    }
+}
+
+pub struct MessageIter<'a> {
+    repr: MessageIterRepr<'a>,
+}
+
+enum MessageIterRepr<'a> {
+    Chain {
+        nodes: &'a Slab<MessageNode, MessageNodeTag>,
+        next: Option<MessageNodeKey>,
+    },
+    Queue {
+        queue: &'a FixedQueue<MessageFrame>,
+        index: usize,
+    },
+}
+
+impl<'a> Iterator for MessageIter<'a> {
+    type Item = &'a MessageFrame;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        match &mut self.repr {
+            MessageIterRepr::Chain { nodes, next } => {
+                let node = nodes.get((*next)?)?;
+                *next = node.next;
+                Some(&node.message)
+            }
+            MessageIterRepr::Queue { queue, index } => {
+                let message = queue.get(*index)?;
+                *index += 1;
+                Some(message)
+            }
+        }
+    }
+}
+
 impl CallStore {
     pub(super) fn with_capacity(streams: usize, messages: usize) -> Self {
         Self {
@@ -48,13 +157,9 @@ impl CallStore {
         }
     }
 
-    fn hash(stream_id: StreamId) -> u64 {
-        u64::from(stream_id.0)
-    }
-
     pub(super) fn get_mut(&mut self, stream_id: StreamId) -> Option<&mut CallRecord> {
         self.records
-            .get_mut(Self::hash(stream_id), |call| call.stream_id == stream_id)
+            .get_mut(u64::from(stream_id.0), |call| call.stream_id == stream_id)
     }
 
     pub(super) fn stream_mut(&mut self, stream_id: StreamId) -> Option<&mut StreamState> {
@@ -64,7 +169,7 @@ impl CallStore {
     pub(super) fn insert(&mut self, stream_id: StreamId, stream: StreamState) -> bool {
         self.records
             .try_insert(
-                Self::hash(stream_id),
+                u64::from(stream_id.0),
                 CallRecord {
                     stream_id,
                     stream: Some(stream),
@@ -80,42 +185,64 @@ impl CallStore {
         &mut self,
         stream_id: StreamId,
         message: MessageFrame,
-    ) -> Result<(), MessageFrame> {
-        let Some((tail, count)) = self
-            .stream_mut(stream_id)
-            .map(|stream| (stream.message_tail, stream.message_count))
+        max_stream_len: usize,
+        max_messages: usize,
+        max_total_len: usize,
+    ) -> Result<(), ()> {
+        let added = message.payload.len();
+        let Self {
+            records,
+            messages,
+            buffered_total,
+        } = self;
+        let Some(stream) = records
+            .get_mut(u64::from(stream_id.0), |call| call.stream_id == stream_id)
+            .and_then(|call| call.stream.as_mut())
         else {
-            return Err(message);
+            return Err(());
         };
-        let key = match self.messages.insert(MessageNode {
+        if stream.buffered_len.saturating_add(added) > max_stream_len
+            || stream.message_count == max_messages
+            || buffered_total.saturating_add(added) > max_total_len
+        {
+            return Err(());
+        }
+        let key = match messages.insert(MessageNode {
             message,
             next: None,
         }) {
             Ok(key) => key,
-            Err(node) => return Err(node.message),
+            Err(_) => return Err(()),
         };
-        if let Some(tail) = tail {
-            self.messages.get_mut(tail).unwrap().next = Some(key);
+        if let Some(tail) = stream.message_tail {
+            let Some(node) = messages.get_mut(tail) else {
+                let _ = messages.remove(key);
+                return Err(());
+            };
+            node.next = Some(key);
         }
-        let stream = self.stream_mut(stream_id).unwrap();
         if stream.message_head.is_none() {
             stream.message_head = Some(key);
         }
         stream.message_tail = Some(key);
-        stream.message_count = count + 1;
+        stream.message_count += 1;
+        stream.buffered_len += added;
+        *buffered_total += added;
         Ok(())
     }
 
-    pub(super) fn clear_messages(&mut self, mut next: Option<MessageNodeKey>) {
+    fn clear_messages(&mut self, mut next: Option<MessageNodeKey>) {
         while let Some(key) = next {
-            let node = self.messages.remove(key).unwrap();
+            let Some(node) = self.messages.remove(key) else {
+                break;
+            };
             next = node.next;
         }
     }
 
     pub(super) fn remove(&mut self, stream_id: StreamId) -> Option<CallRecord> {
         self.records
-            .remove(Self::hash(stream_id), |call| call.stream_id == stream_id)
+            .remove(u64::from(stream_id.0), |call| call.stream_id == stream_id)
     }
 
     pub(super) fn release_stream(&mut self, stream: &StreamState) {
@@ -132,24 +259,26 @@ impl CallStore {
     pub(super) fn remove_empty(&mut self, stream_id: StreamId) {
         let empty = self
             .records
-            .get(Self::hash(stream_id), |call| call.stream_id == stream_id)
+            .get(u64::from(stream_id.0), |call| call.stream_id == stream_id)
             .is_some_and(|call| call.stream.is_none() && call.pending.is_none());
         if empty {
             let _ = self
                 .records
-                .remove(Self::hash(stream_id), |call| call.stream_id == stream_id);
+                .remove(u64::from(stream_id.0), |call| call.stream_id == stream_id);
         }
     }
 
-    pub(super) fn messages(&self) -> &Slab<MessageNode, MessageNodeTag> {
-        &self.messages
+    pub(super) fn message_list(&self, chain: MessageChain) -> MessageList<'_> {
+        MessageList {
+            repr: MessageListRepr::Chain {
+                nodes: &self.messages,
+                next: chain.head,
+            },
+            len: chain.len,
+        }
     }
 
-    pub(super) fn buffered_total(&self) -> usize {
-        self.buffered_total
-    }
-
-    pub(super) fn add_buffered(&mut self, bytes: usize) {
-        self.buffered_total += bytes;
+    pub(super) fn release_messages(&mut self, chain: MessageChain) {
+        self.clear_messages(chain.head);
     }
 }

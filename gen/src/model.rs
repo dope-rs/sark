@@ -20,26 +20,6 @@ pub(super) struct AppDispatchInput {
     pub(super) routes: Vec<AppRouteInput>,
 }
 
-pub(super) struct DefineRouteInput {
-    pub(super) vis: Visibility,
-    pub(super) name: Ident,
-    pub(super) state_ty: Type,
-    pub(super) entries: Vec<DefineRouteEntry>,
-}
-
-pub(super) enum DefineRouteEntry {
-    Service {
-        method: Ident,
-        path: LitStr,
-        ty: TypePath,
-    },
-    Scope {
-        prefix: LitStr,
-        wraps: Vec<TypePath>,
-        children: Vec<DefineRouteEntry>,
-    },
-}
-
 #[derive(Clone)]
 pub(super) struct HeaderAttrField {
     pub(super) ident: Ident,

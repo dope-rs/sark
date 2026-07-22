@@ -1,0 +1,17 @@
+error: body! placeholder count mismatch: expected 1, got 0
+ --> tests/ui/body_macro_invalid.rs:2:29
+  |
+2 |     let _ = sark_gen::body!("{}");
+  |                             ^^^^
+
+error: body! has unmatched '{'
+ --> tests/ui/body_macro_invalid.rs:3:29
+  |
+3 |     let _ = sark_gen::body!("{");
+  |                             ^^^
+
+error: body! supports only '{}' placeholders
+ --> tests/ui/body_macro_invalid.rs:4:29
+  |
+4 |     let _ = sark_gen::body!("{named}");
+  |                             ^^^^^^^^^

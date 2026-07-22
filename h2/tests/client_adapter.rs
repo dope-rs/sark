@@ -76,7 +76,7 @@ fn collect_sink(sink: &connector::state::Queue<{ connector::state::IOV_CAP }>) -
 fn connect_emits_preface_and_settings() {
     let mut session = Session::new(CapturingHandler::new());
     let mut state = ConnState::default();
-    let arena = egress::queue::Arena::with_capacity(ARENA_CAPACITY);
+    let arena = egress::arena::Arena::with_capacity(ARENA_CAPACITY);
     let mut sink = arena.queue::<{ connector::state::IOV_CAP }>();
     session.connect(&mut state, &mut sink);
     let bytes = collect_sink(&sink);
@@ -105,7 +105,7 @@ fn codec_parse_returns_full_buffer() {
 fn response_ingests_and_emits_events() {
     let mut session = Session::new(CapturingHandler::new());
     let mut state = ConnState::default();
-    let arena = egress::queue::Arena::with_capacity(ARENA_CAPACITY);
+    let arena = egress::arena::Arena::with_capacity(ARENA_CAPACITY);
     let mut sink = arena.queue::<{ connector::state::IOV_CAP }>();
     session.connect(&mut state, &mut sink);
     drop(sink);
@@ -131,7 +131,7 @@ fn response_ingests_and_emits_events() {
 fn wants_close_after_goaway_in() {
     let mut session = Session::new(CapturingHandler::new());
     let mut state = ConnState::default();
-    let arena = egress::queue::Arena::with_capacity(ARENA_CAPACITY);
+    let arena = egress::arena::Arena::with_capacity(ARENA_CAPACITY);
     let mut sink = arena.queue::<{ connector::state::IOV_CAP }>();
     session.connect(&mut state, &mut sink);
     drop(sink);

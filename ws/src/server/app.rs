@@ -453,7 +453,7 @@ impl<H: Handler> App<H> {
         let mut connection = None::<&str>;
         let mut ws_version = None::<&str>;
         let mut key = None::<&str>;
-        for (name, value) in sark_core::http::head::header_lines(rest.as_bytes()) {
+        for (name, value) in sark_core::http::head::HeaderLines::new(rest.as_bytes()) {
             let Ok(value) = std::str::from_utf8(value) else {
                 continue;
             };

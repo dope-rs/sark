@@ -6,27 +6,65 @@ use super::field::FieldMode;
 use super::scalar::{Classified, Scalar};
 use crate::util::TypeExt;
 
-pub(super) struct Encode;
+pub(super) struct Encoder<'a> {
+    ty: &'a Type,
+    mode: FieldMode,
+    access: TokenStream,
+    class: Option<Classified>,
+}
 
-impl Encode {
-    pub(super) fn len_expr(
-        ty: &Type,
-        fmode: FieldMode,
-        access: TokenStream,
-    ) -> Result<TokenStream> {
+impl<'a> Encoder<'a> {
+    pub(super) fn new(ty: &'a Type, mode: FieldMode, access: TokenStream) -> Result<Self> {
+        let class = if mode.nested {
+            if mode.seq && ty.vec_inner().is_none() {
+                return Err(syn::Error::new_spanned(
+                    ty,
+                    "#[field(seq)] requires a Vec<T> field",
+                ));
+            }
+            None
+        } else if mode.seq {
+            let elem = ty.vec_inner().ok_or_else(|| {
+                syn::Error::new_spanned(ty, "#[field(seq)] requires a Vec<T> field")
+            })?;
+            let class = Classified::of(elem)?;
+            if class.optional {
+                return Err(syn::Error::new_spanned(
+                    elem,
+                    "sequence field elements cannot be Option<T>",
+                ));
+            }
+            Some(class)
+        } else {
+            Some(Classified::of(ty)?)
+        };
+        Ok(Self {
+            ty,
+            mode,
+            access,
+            class,
+        })
+    }
+
+    pub(super) fn len_expr(&self) -> Result<TokenStream> {
+        let fmode = self.mode;
+        let access = &self.access;
         if fmode.seq {
             let elem = if fmode.nested {
                 quote!(sark::json::JsonEncode::json_len(__e))
             } else {
-                let class = Classified::of(ty.vec_inner().ok_or_else(|| {
-                    syn::Error::new_spanned(ty, "sequence field must use Vec<T>")
-                })?)?;
+                let Some(class) = self.class else {
+                    return Err(syn::Error::new_spanned(
+                        self.ty,
+                        "missing sequence element classification",
+                    ));
+                };
                 let bytes = match class.scalar {
                     Scalar::String | Scalar::InlineToken => quote!(__e.as_bytes()),
                     Scalar::Shared | Scalar::Retained => quote!(__e.as_slice()),
                     _ => {
                         return Err(syn::Error::new_spanned(
-                            ty,
+                            self.ty,
                             "sequence field element must be a byte string",
                         ));
                     }
@@ -55,7 +93,12 @@ impl Encode {
         if fmode.nested {
             return Ok(quote!(sark::json::JsonEncode::json_len(&#access)));
         }
-        let class = Classified::of(ty)?;
+        let Some(class) = self.class else {
+            return Err(syn::Error::new_spanned(
+                self.ty,
+                "missing scalar classification",
+            ));
+        };
         let len = match class.scalar {
             Scalar::U64 => quote!(sark::json::Encode::u64_len(#access)),
             Scalar::I64 => quote!(sark::json::Encode::i64_len(#access)),
@@ -102,24 +145,25 @@ impl Encode {
         })
     }
 
-    pub(super) fn write_expr(
-        ty: &Type,
-        fmode: FieldMode,
-        access: TokenStream,
-    ) -> Result<TokenStream> {
+    pub(super) fn write_expr(&self) -> Result<TokenStream> {
+        let fmode = self.mode;
+        let access = &self.access;
         if fmode.seq {
             let elem = if fmode.nested {
                 quote!(sark::json::JsonEncode::write_into(__e, __w);)
             } else {
-                let class = Classified::of(ty.vec_inner().ok_or_else(|| {
-                    syn::Error::new_spanned(ty, "sequence field must use Vec<T>")
-                })?)?;
+                let Some(class) = self.class else {
+                    return Err(syn::Error::new_spanned(
+                        self.ty,
+                        "missing sequence element classification",
+                    ));
+                };
                 let bytes = match class.scalar {
                     Scalar::String | Scalar::InlineToken => quote!(__e.as_bytes()),
                     Scalar::Shared | Scalar::Retained => quote!(__e.as_slice()),
                     _ => {
                         return Err(syn::Error::new_spanned(
-                            ty,
+                            self.ty,
                             "sequence field element must be a byte string",
                         ));
                     }
@@ -148,7 +192,12 @@ impl Encode {
         if fmode.nested {
             return Ok(quote!(sark::json::JsonEncode::write_into(&#access, __w);));
         }
-        let class = Classified::of(ty)?;
+        let Some(class) = self.class else {
+            return Err(syn::Error::new_spanned(
+                self.ty,
+                "missing scalar classification",
+            ));
+        };
         let write = match class.scalar {
             Scalar::U64 => quote!(__w.put_u64(#access);),
             Scalar::I64 => quote!(__w.put_i64(#access);),

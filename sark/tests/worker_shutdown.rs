@@ -16,7 +16,7 @@ use sark::{Throughput, driver};
 struct Park;
 
 impl<'d> Dispatcher<'d> for Park {
-    fn dispatch(self: Pin<&mut Self>, _event: Event, _driver: &mut DriverContext<'_, 'd>) {
+    fn dispatch(self: Pin<&mut Self>, _event: Event<'d>, _driver: &mut DriverContext<'_, 'd>) {
         let _ = self;
     }
 
@@ -65,5 +65,11 @@ fn first_worker_error_shuts_down_peer_drivers() {
         },
     );
 
-    assert_eq!(result.unwrap_err().to_string(), "first worker failed");
+    let error = result.unwrap_err();
+    assert!(error.to_string().starts_with("launcher worker "));
+    let source = error
+        .get_ref()
+        .and_then(std::error::Error::source)
+        .expect("worker failure retains its source");
+    assert_eq!(source.to_string(), "first worker failed");
 }

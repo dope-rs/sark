@@ -1,7 +1,12 @@
+use super::WireWriter;
 use super::consts::{CRLF, SERVER_DATE_TERMINATOR_LEN, STATUS_LINE_PREFIX};
 use super::framing::Framing;
 use super::headers::HeaderSection;
-use super::out::Out;
+
+pub(in crate::http::response) struct WrittenHead {
+    pub(in crate::http::response) len: usize,
+    pub(in crate::http::response) date_offset: usize,
+}
 
 pub(in crate::http::response) struct HeadWrite<'a, H, F>
 where
@@ -30,15 +35,15 @@ where
             + SERVER_DATE_TERMINATOR_LEN
     }
 
-    pub(in crate::http::response) fn write(
-        &self,
-        out: &mut [u8],
-        off: &mut usize,
-        date: &[u8; 29],
-    ) -> usize {
-        Out::put_status_line(out, off, self.status_str, self.reason);
-        self.headers.write_headers(out, off);
-        self.framing.write_framing(out, off);
-        Out::put_server_date_terminator(out, off, date)
+    pub(in crate::http::response) fn write(&self, out: &mut [u8], date: &[u8; 29]) -> WrittenHead {
+        let mut out = WireWriter::new(out);
+        out.put_status_line(self.status_str, self.reason);
+        self.headers.write_headers(&mut out);
+        self.framing.write_framing(&mut out);
+        let date_offset = out.put_server_date_terminator(date);
+        WrittenHead {
+            len: out.len(),
+            date_offset,
+        }
     }
 }

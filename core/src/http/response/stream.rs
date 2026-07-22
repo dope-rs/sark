@@ -3,7 +3,7 @@ use std::task::Poll;
 
 use dope_fiber::{Context, Fiber};
 use http::StatusCode;
-use o3::buffer::{Owned, Shared};
+use o3::buffer::Shared;
 
 use super::wire_emit::{HeadWrite, TransferEncodingChunked};
 
@@ -11,7 +11,7 @@ pub const CHUNK_TERMINATOR: &[u8; 5] = b"0\r\n\r\n";
 
 pub struct Stream<S> {
     status: StatusCode,
-    wire_headers: Shared,
+    wire_headers: Vec<Shared>,
     stream: S,
 }
 
@@ -33,26 +33,18 @@ impl<S> Stream<S> {
     pub fn new(stream: S) -> Self {
         Self {
             status: StatusCode::OK,
-            wire_headers: Shared::new(),
+            wire_headers: Vec::new(),
             stream,
         }
     }
 
     pub fn header(mut self, name: &[u8], value: &[u8]) -> Self {
-        let capacity = self
-            .wire_headers
-            .len()
-            .checked_add(name.len())
-            .and_then(|len| len.checked_add(value.len()))
-            .and_then(|len| len.checked_add(4))
-            .expect("stream header length overflow");
-        let mut buf = Owned::with_capacity(capacity);
-        buf.extend_from_slice(self.wire_headers.as_ref());
+        let mut buf = Vec::new();
         buf.extend_from_slice(name);
         buf.extend_from_slice(b": ");
         buf.extend_from_slice(value);
         buf.extend_from_slice(b"\r\n");
-        self.wire_headers = buf.freeze();
+        self.wire_headers.push(Shared::from(buf));
         self
     }
 
@@ -67,16 +59,15 @@ impl<S> Stream<S> {
         let head = HeadWrite {
             status_str,
             reason,
-            headers: self.wire_headers.as_ref(),
+            headers: self.wire_headers.as_slice(),
             framing: TransferEncodingChunked,
         };
         if out.len() < head.wire_len() {
             return None;
         }
 
-        let mut off = 0usize;
-        head.write(out, &mut off, date);
-        Some((off, self.stream))
+        let written = head.write(out, date);
+        Some((written.len, self.stream))
     }
 }
 

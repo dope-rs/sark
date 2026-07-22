@@ -2,7 +2,7 @@ use proc_macro2::TokenStream;
 use quote::quote;
 use syn::{Ident, Result, Type};
 
-use crate::codegen::value::Value;
+use crate::codegen::value::ValueBinding;
 use crate::model::{HeaderAttrField, QueryAttrField};
 use crate::util::TypeExt;
 
@@ -23,9 +23,7 @@ impl<'a> Hidden<'a> {
         headers
             .iter()
             .map(|f| {
-                Value::build_header_query_field(
-                    &f.ty,
-                    f.default.as_ref(),
+                ValueBinding::new(&f.ty, f.default.as_ref()).header_query_field(
                     &f.ident,
                     quote!(req.frame_at(range)),
                     "request header/query",
@@ -33,9 +31,7 @@ impl<'a> Hidden<'a> {
                 )
             })
             .chain(queries.iter().map(|f| {
-                Value::build_header_query_field(
-                    &f.ty,
-                    f.default.as_ref(),
+                ValueBinding::new(&f.ty, f.default.as_ref()).header_query_field(
                     &f.ident,
                     quote!(req.frame_at(range)),
                     "request header/query",

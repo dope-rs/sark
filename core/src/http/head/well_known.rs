@@ -1,19 +1,12 @@
-#![allow(
-    clippy::too_many_arguments,
-    clippy::collapsible_match,
-    clippy::collapsible_if
-)]
-
 use super::KnownHeader;
-use super::byte::trim_ws_range;
 use super::error::{
     ERR_HEADER_LINE_TOO_LONG, ERR_INVALID_HEADER_NAME, ERR_INVALID_HEADER_VALUE,
-    ERR_TOO_MANY_HEADERS, bad_request,
+    ERR_TOO_MANY_HEADERS,
 };
 use super::flags::Flags;
-use super::input::{BytesScan, HeadInput, HeaderLineScan};
-use super::visitor::{Known, Visitor};
-use crate::error::Result;
+use super::input::HeaderLine;
+use super::visitor::Visitor;
+use crate::error::{Error, Result};
 use crate::http::codec;
 use sark_protocol::is_header_name_byte;
 
@@ -26,400 +19,274 @@ const PROBE_TE: u64 = 18446743469971042932u64;
 const PROBE_AE: u64 = 18446743456935273313u64;
 const PROBE_UA: u64 = u64::from_le_bytes([b'u', b's', b'e', b'r', b'-', 0xff, 0xff, 0xff]);
 
-const AE_NAME_LOWER: &[u8; 16] = b"accept-encoding:";
-
 pub const MAX_HEADER_LINE_BYTES: usize = 8 * 1024;
 
-pub fn unknown_line<V: Visitor>(
-    bytes: &[u8],
-    start: usize,
-    visitor: &mut V,
-    header_count: &mut usize,
-    max_header_count: usize,
-) -> Result<Option<usize>> {
-    let Some((name_end, name_term)) = BytesScan::find_name_end_valid(bytes, start)? else {
-        return Ok(None);
-    };
-    let colon_idx = if name_term == b':' {
-        if name_end == 0 {
-            return Err(bad_request(ERR_INVALID_HEADER_NAME));
-        }
-        name_end
-    } else {
-        if name_end + 1 >= bytes.len() {
-            return Ok(None);
-        }
-        if bytes[name_end + 1] == b'\n' {
-            if name_end == 0 {
-                return Ok(Some(0));
-            }
-            return Err(bad_request(ERR_INVALID_HEADER_NAME));
-        }
-        return Err(bad_request(ERR_INVALID_HEADER_NAME));
-    };
-    unknown_fast_skip(bytes, colon_idx, visitor, header_count, max_header_count)
+pub struct WellKnownHeaders<'a> {
+    scan: &'a mut codec::HeaderScan,
+    flags: &'a mut Flags,
 }
 
-trait WellKnownProbe {
-    const COLON_IDX: usize;
-    const TOTAL_LEN: usize;
-    const KEY: Known;
+impl<'a> WellKnownHeaders<'a> {
+    pub fn new(scan: &'a mut codec::HeaderScan, flags: &'a mut Flags) -> Self {
+        Self { scan, flags }
+    }
 
-    fn tail_matches(rest: &[u8]) -> bool;
-
-    fn line(
-        scan: &mut codec::HeaderScan,
-        flags: &mut Flags,
-        value_rest: &[u8],
-    ) -> Result<Option<(usize, usize, usize)>>;
-
-    fn dispatch<V: Visitor>(
+    pub fn apply_contiguous<V: Visitor>(
+        &mut self,
         rest: &[u8],
-        scan: &mut codec::HeaderScan,
-        flags: &mut Flags,
         visitor: &mut V,
         header_count: &mut usize,
         max_header_count: usize,
     ) -> Result<Option<usize>> {
-        if rest.len() >= Self::TOTAL_LEN && Self::tail_matches(rest) {
-            let colon_idx = Self::COLON_IDX;
-            let Some((tail_end, value_start, value_end)) =
-                Self::line(scan, flags, &rest[colon_idx + 1..])?
-            else {
+        if rest.len() <= MAX_HEADER_LINE_BYTES {
+            return self.apply_contiguous_inner(rest, visitor, header_count, max_header_count);
+        }
+        let capped = &rest[..MAX_HEADER_LINE_BYTES];
+        match self.apply_contiguous_inner(capped, visitor, header_count, max_header_count)? {
+            Some(out) => Ok(Some(out)),
+            None => Err(Error::bad_request(ERR_HEADER_LINE_TOO_LONG)),
+        }
+    }
+
+    pub fn apply_unknown_contiguous<V: Visitor>(
+        &mut self,
+        bytes: &[u8],
+        start: usize,
+        visitor: &mut V,
+        header_count: &mut usize,
+        max_header_count: usize,
+    ) -> Result<Option<usize>> {
+        let Some((name_end, name_term)) = HeaderLine::new(bytes).find_name_end_valid(start)? else {
+            return Ok(None);
+        };
+        let colon_idx = if name_term == b':' {
+            if name_end == 0 {
+                return Err(Error::bad_request(ERR_INVALID_HEADER_NAME));
+            }
+            name_end
+        } else {
+            if name_end + 1 >= bytes.len() {
                 return Ok(None);
+            }
+            if bytes[name_end + 1] == b'\n' {
+                if name_end == 0 {
+                    return Ok(Some(0));
+                }
+                return Err(Error::bad_request(ERR_INVALID_HEADER_NAME));
+            }
+            return Err(Error::bad_request(ERR_INVALID_HEADER_NAME));
+        };
+        self.apply_unknown_value(bytes, colon_idx, visitor, header_count, max_header_count)
+    }
+
+    pub fn apply(
+        &mut self,
+        line: &[u8],
+        colon_idx: usize,
+        pretrim_start: Option<usize>,
+        pretrim_end: Option<usize>,
+    ) -> Result<()> {
+        if line.len() > MAX_HEADER_LINE_BYTES {
+            return Err(Error::bad_request(ERR_HEADER_LINE_TOO_LONG));
+        }
+        if colon_idx == 0 {
+            return Err(Error::bad_request(ERR_INVALID_HEADER_NAME));
+        }
+        let Some(name) = line.get(..colon_idx) else {
+            return Err(Error::bad_request(ERR_INVALID_HEADER_NAME));
+        };
+        if name.iter().any(|raw| !is_header_name_byte(*raw)) {
+            return Err(Error::bad_request(ERR_INVALID_HEADER_NAME));
+        }
+        let Some(header) = KnownHeader::from_name(name) else {
+            return Ok(());
+        };
+        let (value_start, value_end) = if let Some(start) = pretrim_start {
+            (
+                start.min(line.len()),
+                pretrim_end.unwrap_or(line.len()).min(line.len()),
+            )
+        } else {
+            let Some(range) = HeaderLine::new(line).trimmed_range(colon_idx + 1, line.len()) else {
+                return Err(Error::bad_request(ERR_INVALID_HEADER_VALUE));
             };
-            if *header_count == max_header_count {
-                return Err(bad_request(ERR_TOO_MANY_HEADERS));
+            range
+        };
+        let Some(raw) = line.get(value_start..value_end) else {
+            return Err(Error::bad_request(ERR_INVALID_HEADER_VALUE));
+        };
+        header.apply(self.scan, self.flags, raw)
+    }
+
+    fn apply_contiguous_inner<V: Visitor>(
+        &mut self,
+        rest: &[u8],
+        visitor: &mut V,
+        header_count: &mut usize,
+        max_header_count: usize,
+    ) -> Result<Option<usize>> {
+        let &[a, b, c, d, e, f, g, h, ..] = rest else {
+            return self.apply_unknown_contiguous(rest, 0, visitor, header_count, max_header_count);
+        };
+        let probe_key = u64::from_le_bytes([a, b, c, d, e, f, g, h]) | MATCH_MASK;
+        match probe_key {
+            PROBE_HOST => self.apply_known_contiguous(
+                rest,
+                KnownHeader::Host,
+                4,
+                8,
+                visitor,
+                header_count,
+                max_header_count,
+            ),
+            PROBE_EXPECT => self.apply_known_contiguous(
+                rest,
+                KnownHeader::Expect,
+                6,
+                7,
+                visitor,
+                header_count,
+                max_header_count,
+            ),
+            PROBE_CONN => self.apply_known_contiguous(
+                rest,
+                KnownHeader::Connection,
+                10,
+                11,
+                visitor,
+                header_count,
+                max_header_count,
+            ),
+            PROBE_CLEN => self.apply_known_contiguous(
+                rest,
+                KnownHeader::ContentLength,
+                14,
+                15,
+                visitor,
+                header_count,
+                max_header_count,
+            ),
+            PROBE_TE => self.apply_known_contiguous(
+                rest,
+                KnownHeader::TransferEncoding,
+                17,
+                18,
+                visitor,
+                header_count,
+                max_header_count,
+            ),
+            PROBE_AE if rest.get(6) == Some(&b':') => {
+                self.apply_unknown_value(rest, 6, visitor, header_count, max_header_count)
             }
-            *header_count += 1;
-            if V::WANTS_KNOWN {
-                let off = colon_idx + 1;
-                visitor.known(Self::KEY, &rest[off + value_start..off + value_end])?;
+            PROBE_AE => self.apply_known_contiguous(
+                rest,
+                KnownHeader::AcceptEncoding,
+                15,
+                16,
+                visitor,
+                header_count,
+                max_header_count,
+            ),
+            PROBE_UA if Self::user_agent_tail_matches(rest) => {
+                self.apply_unknown_value(rest, 10, visitor, header_count, max_header_count)
             }
-            return Ok(Some(colon_idx + 1 + tail_end));
+            _ => self.apply_unknown_contiguous(rest, 0, visitor, header_count, max_header_count),
         }
-        unknown_line(rest, 5, visitor, header_count, max_header_count)
     }
-}
 
-struct HostProbe;
-impl WellKnownProbe for HostProbe {
-    const COLON_IDX: usize = 4;
-    const TOTAL_LEN: usize = 8;
-    const KEY: Known = Known::Host;
-    fn tail_matches(_rest: &[u8]) -> bool {
-        true
-    }
-    fn line(
-        scan: &mut codec::HeaderScan,
-        flags: &mut Flags,
-        value_rest: &[u8],
-    ) -> Result<Option<(usize, usize, usize)>> {
-        KnownHeader::Host.scan_line(scan, flags, value_rest)
-    }
-}
-
-struct ExpectProbe;
-impl WellKnownProbe for ExpectProbe {
-    const COLON_IDX: usize = 6;
-    const TOTAL_LEN: usize = 7;
-    const KEY: Known = Known::Expect;
-    fn tail_matches(rest: &[u8]) -> bool {
-        (u16::from_le_bytes(rest[5..7].try_into().unwrap()) | 8224u16) == 14964u16
-    }
-    fn line(
-        scan: &mut codec::HeaderScan,
-        flags: &mut Flags,
-        value_rest: &[u8],
-    ) -> Result<Option<(usize, usize, usize)>> {
-        KnownHeader::Expect.scan_line(scan, flags, value_rest)
-    }
-}
-
-struct ConnProbe;
-impl WellKnownProbe for ConnProbe {
-    const COLON_IDX: usize = 10;
-    const TOTAL_LEN: usize = 11;
-    const KEY: Known = Known::Connection;
-    fn tail_matches(rest: &[u8]) -> bool {
-        let w: &[u8; 6] = rest[5..11].try_into().unwrap();
-        (u32::from_le_bytes(w[0..4].try_into().unwrap()) | 538976288u32) == 1869182051u32
-            && (u16::from_le_bytes(w[4..6].try_into().unwrap()) | 8224u16) == 14958u16
-    }
-    fn line(
-        scan: &mut codec::HeaderScan,
-        flags: &mut Flags,
-        value_rest: &[u8],
-    ) -> Result<Option<(usize, usize, usize)>> {
-        KnownHeader::Connection.scan_line(scan, flags, value_rest)
-    }
-}
-
-struct ClenProbe;
-impl WellKnownProbe for ClenProbe {
-    const COLON_IDX: usize = 14;
-    const TOTAL_LEN: usize = 15;
-    const KEY: Known = Known::ContentLength;
-    fn tail_matches(rest: &[u8]) -> bool {
-        let w: &[u8; 10] = rest[5..15].try_into().unwrap();
-        (u64::from_le_bytes(w[0..8].try_into().unwrap()) | 2314885530818453536u64)
-            == 8387794212886508654u64
-            && (u64::from_le_bytes(w[2..10].try_into().unwrap()) | 2314885530818453536u64)
-                == 4208741839360322605u64
-    }
-    fn line(
-        scan: &mut codec::HeaderScan,
-        flags: &mut Flags,
-        value_rest: &[u8],
-    ) -> Result<Option<(usize, usize, usize)>> {
-        KnownHeader::ContentLength.scan_line(scan, flags, value_rest)
-    }
-}
-
-struct TeProbe;
-impl WellKnownProbe for TeProbe {
-    const COLON_IDX: usize = 17;
-    const TOTAL_LEN: usize = 18;
-    const KEY: Known = Known::TransferEncoding;
-    fn tail_matches(rest: &[u8]) -> bool {
-        let w: &[u8; 13] = rest[5..18].try_into().unwrap();
-        (u64::from_le_bytes(w[0..8].try_into().unwrap()) | 2314885530818453536u64)
-            == 8026380341737579878u64
-            && (u64::from_le_bytes(w[5..13].try_into().unwrap()) | 2314885530818453536u64)
-                == 4208453775736660846u64
-    }
-    fn line(
-        scan: &mut codec::HeaderScan,
-        flags: &mut Flags,
-        value_rest: &[u8],
-    ) -> Result<Option<(usize, usize, usize)>> {
-        KnownHeader::TransferEncoding.scan_line(scan, flags, value_rest)
-    }
-}
-
-struct AeProbe;
-impl WellKnownProbe for AeProbe {
-    const COLON_IDX: usize = 15;
-    const TOTAL_LEN: usize = 16;
-    const KEY: Known = Known::AcceptEncoding;
-    fn tail_matches(rest: &[u8]) -> bool {
-        let mut buf = [0u8; 16];
-        for i in 0..16 {
-            buf[i] = rest[i] | 0x20;
+    fn apply_known_contiguous<V: Visitor>(
+        &mut self,
+        rest: &[u8],
+        header: KnownHeader,
+        colon_idx: usize,
+        minimum_len: usize,
+        visitor: &mut V,
+        header_count: &mut usize,
+        max_header_count: usize,
+    ) -> Result<Option<usize>> {
+        if rest.len() < minimum_len || !Self::tail_matches(header, rest) {
+            return self.apply_unknown_contiguous(rest, 5, visitor, header_count, max_header_count);
         }
-        &buf[..16] == AE_NAME_LOWER.as_slice()
+        let Some(value_rest) = rest.get(colon_idx + 1..) else {
+            return Ok(None);
+        };
+        let Some((tail_end, value_start, value_end)) =
+            header.scan_line(self.scan, self.flags, value_rest)?
+        else {
+            return Ok(None);
+        };
+        Self::count_header(header_count, max_header_count)?;
+        if V::WANTS_KNOWN {
+            let Some(value) = value_rest.get(value_start..value_end) else {
+                return Err(Error::bad_request(ERR_INVALID_HEADER_VALUE));
+            };
+            visitor.known(header, value)?;
+        }
+        Ok(Some(colon_idx + 1 + tail_end))
     }
-    fn line(
-        scan: &mut codec::HeaderScan,
-        flags: &mut Flags,
-        value_rest: &[u8],
-    ) -> Result<Option<(usize, usize, usize)>> {
-        KnownHeader::AcceptEncoding.scan_line(scan, flags, value_rest)
-    }
-}
 
-fn unknown_fast_skip<V: Visitor>(
-    bytes: &[u8],
-    colon_idx: usize,
-    visitor: &mut V,
-    header_count: &mut usize,
-    max_header_count: usize,
-) -> Result<Option<usize>> {
-    let line_end = match crate::simd::scan_header_value(bytes, colon_idx + 1) {
-        crate::simd::HeaderValueOutcome::Found { pos } => pos,
-        crate::simd::HeaderValueOutcome::Invalid => {
-            return Err(bad_request(ERR_INVALID_HEADER_VALUE));
-        }
-        crate::simd::HeaderValueOutcome::None => return Ok(None),
-    };
-    if *header_count == max_header_count {
-        return Err(bad_request(ERR_TOO_MANY_HEADERS));
-    }
-    *header_count += 1;
-    let name = &bytes[..colon_idx];
-    let (vs, ve) = trim_ws_range(bytes, colon_idx + 1, line_end);
-    visitor.unknown(name, &bytes[vs..ve])?;
-    Ok(Some(line_end))
-}
-
-fn ua_tail_matches(rest: &[u8]) -> bool {
-    rest.len() >= 11
-        && {
-            (u32::from_le_bytes(rest[5..9].try_into().unwrap()) | 0x20202020u32)
-                == u32::from_le_bytes(*b"agen")
-        }
-        && (rest[9] | 0x20) == b't'
-        && rest[10] == b':'
-}
-
-pub fn apply_well_known_header_contig<V: Visitor>(
-    rest: &[u8],
-    scan: &mut codec::HeaderScan,
-    flags: &mut Flags,
-    visitor: &mut V,
-    header_count: &mut usize,
-    max_header_count: usize,
-) -> Result<Option<usize>> {
-    if rest.len() <= MAX_HEADER_LINE_BYTES {
-        return apply_well_known_header_contig_inner(
-            rest,
-            scan,
-            flags,
-            visitor,
-            header_count,
-            max_header_count,
-        );
-    }
-    let capped = &rest[..MAX_HEADER_LINE_BYTES];
-    match apply_well_known_header_contig_inner(
-        capped,
-        scan,
-        flags,
-        visitor,
-        header_count,
-        max_header_count,
-    )? {
-        Some(out) => Ok(Some(out)),
-        None => Err(bad_request(ERR_HEADER_LINE_TOO_LONG)),
-    }
-}
-
-fn apply_well_known_header_contig_inner<V: Visitor>(
-    rest: &[u8],
-    scan: &mut codec::HeaderScan,
-    flags: &mut Flags,
-    visitor: &mut V,
-    header_count: &mut usize,
-    max_header_count: usize,
-) -> Result<Option<usize>> {
-    if rest.is_empty() {
-        return Ok(None);
-    }
-    if rest.len() < 8 {
-        return unknown_line(rest, 0, visitor, header_count, max_header_count);
-    }
-    let probe_word = u64::from_le_bytes(rest[..8].try_into().unwrap());
-    let probe_key = probe_word | MATCH_MASK;
-    match probe_key {
-        PROBE_HOST => {
-            HostProbe::dispatch(rest, scan, flags, visitor, header_count, max_header_count)
-        }
-        PROBE_EXPECT => {
-            ExpectProbe::dispatch(rest, scan, flags, visitor, header_count, max_header_count)
-        }
-        PROBE_CONN => {
-            ConnProbe::dispatch(rest, scan, flags, visitor, header_count, max_header_count)
-        }
-        PROBE_CLEN => {
-            ClenProbe::dispatch(rest, scan, flags, visitor, header_count, max_header_count)
-        }
-        PROBE_TE => TeProbe::dispatch(rest, scan, flags, visitor, header_count, max_header_count),
-        PROBE_AE => {
-            if rest[6] == b':' {
-                unknown_fast_skip(rest, 6, visitor, header_count, max_header_count)
-            } else {
-                AeProbe::dispatch(rest, scan, flags, visitor, header_count, max_header_count)
+    fn apply_unknown_value<V: Visitor>(
+        &mut self,
+        bytes: &[u8],
+        colon_idx: usize,
+        visitor: &mut V,
+        header_count: &mut usize,
+        max_header_count: usize,
+    ) -> Result<Option<usize>> {
+        let line_end = match crate::simd::scan_header_value(bytes, colon_idx + 1) {
+            crate::simd::HeaderValueOutcome::Found { pos } => pos,
+            crate::simd::HeaderValueOutcome::Invalid => {
+                return Err(Error::bad_request(ERR_INVALID_HEADER_VALUE));
             }
-        }
-        PROBE_UA => {
-            if ua_tail_matches(rest) {
-                unknown_fast_skip(rest, 10, visitor, header_count, max_header_count)
-            } else {
-                unknown_line(rest, 0, visitor, header_count, max_header_count)
-            }
-        }
-        _ => unknown_line(rest, 0, visitor, header_count, max_header_count),
+            crate::simd::HeaderValueOutcome::None => return Ok(None),
+        };
+        Self::count_header(header_count, max_header_count)?;
+        let Some(name) = bytes.get(..colon_idx) else {
+            return Err(Error::bad_request(ERR_INVALID_HEADER_NAME));
+        };
+        let Some((value_start, value_end)) =
+            HeaderLine::new(bytes).trimmed_range(colon_idx + 1, line_end)
+        else {
+            return Err(Error::bad_request(ERR_INVALID_HEADER_VALUE));
+        };
+        let Some(value) = bytes.get(value_start..value_end) else {
+            return Err(Error::bad_request(ERR_INVALID_HEADER_VALUE));
+        };
+        visitor.unknown(name, value)?;
+        Ok(Some(line_end))
     }
-}
 
-pub fn apply_well_known_header<I: HeadInput + ?Sized>(
-    input: &I,
-    line: &[u8],
-    line_start: usize,
-    colon_idx: usize,
-    pretrim_start: Option<usize>,
-    pretrim_end: Option<usize>,
-    scan: &mut codec::HeaderScan,
-    flags: &mut Flags,
-    scan_info: Option<&HeaderLineScan>,
-) -> Result<()> {
-    let _ = input;
-    let _ = line_start;
-    let _ = scan_info;
-    if line.len() > MAX_HEADER_LINE_BYTES {
-        return Err(bad_request(ERR_HEADER_LINE_TOO_LONG));
+    fn count_header(header_count: &mut usize, max_header_count: usize) -> Result<()> {
+        if *header_count >= max_header_count {
+            return Err(Error::bad_request(ERR_TOO_MANY_HEADERS));
+        }
+        *header_count += 1;
+        Ok(())
     }
-    if colon_idx == 0 {
-        return Err(bad_request(ERR_INVALID_HEADER_NAME));
-    }
-    let name = &line[..colon_idx];
-    for &raw in name {
-        if !is_header_name_byte(raw) {
-            return Err(bad_request(ERR_INVALID_HEADER_NAME));
+
+    fn tail_matches(header: KnownHeader, rest: &[u8]) -> bool {
+        match header {
+            KnownHeader::Host => true,
+            KnownHeader::Expect => rest
+                .get(5..7)
+                .is_some_and(|tail| tail.eq_ignore_ascii_case(b"t:")),
+            KnownHeader::Connection => rest
+                .get(5..11)
+                .is_some_and(|tail| tail.eq_ignore_ascii_case(b"ction:")),
+            KnownHeader::ContentLength => rest
+                .get(5..15)
+                .is_some_and(|tail| tail.eq_ignore_ascii_case(b"nt-length:")),
+            KnownHeader::TransferEncoding => rest
+                .get(5..18)
+                .is_some_and(|tail| tail.eq_ignore_ascii_case(b"fer-encoding:")),
+            KnownHeader::AcceptEncoding => rest
+                .get(5..16)
+                .is_some_and(|tail| tail.eq_ignore_ascii_case(b"t-encoding:")),
         }
     }
-    enum Action {
-        Unknown,
-        Host,
-        Connection,
-        ContentLength,
-        TransferEncoding,
-        Expect,
-        AcceptEncoding,
-    }
-    let mut action = Action::Unknown;
-    match name.len() {
-        4 => {
-            if name.eq_ignore_ascii_case(b"host") {
-                action = Action::Host;
-            }
-        }
-        6 => {
-            if name.eq_ignore_ascii_case(b"expect") {
-                action = Action::Expect;
-            }
-        }
-        10 => {
-            if name.eq_ignore_ascii_case(b"connection") {
-                action = Action::Connection;
-            }
-        }
-        14 => {
-            if name.eq_ignore_ascii_case(b"content-length") {
-                action = Action::ContentLength;
-            }
-        }
-        15 => {
-            if name.eq_ignore_ascii_case(b"accept-encoding") {
-                action = Action::AcceptEncoding;
-            }
-        }
-        17 => {
-            if name.eq_ignore_ascii_case(b"transfer-encoding") {
-                action = Action::TransferEncoding;
-            }
-        }
-        _ => {}
-    }
-    if matches!(action, Action::Unknown) {
-        return Ok(());
-    }
-    let (value_start, value_end) = if let Some(start) = pretrim_start {
-        (
-            start.min(line.len()),
-            pretrim_end.unwrap_or(line.len()).min(line.len()),
-        )
-    } else {
-        trim_ws_range(line, colon_idx + 1, line.len())
-    };
-    let raw = &line[value_start..value_end];
-    match action {
-        Action::Host => KnownHeader::Host.apply(scan, flags, raw),
-        Action::Connection => KnownHeader::Connection.apply(scan, flags, raw),
-        Action::ContentLength => KnownHeader::ContentLength.apply(scan, flags, raw),
-        Action::TransferEncoding => KnownHeader::TransferEncoding.apply(scan, flags, raw),
-        Action::Expect => KnownHeader::Expect.apply(scan, flags, raw),
-        Action::AcceptEncoding => KnownHeader::AcceptEncoding.apply(scan, flags, raw),
-        Action::Unknown => Ok(()),
+
+    fn user_agent_tail_matches(rest: &[u8]) -> bool {
+        rest.get(5..11)
+            .is_some_and(|tail| tail.eq_ignore_ascii_case(b"agent:"))
     }
 }

@@ -55,6 +55,10 @@ pub enum ErrorBodyFormat {
 }
 
 impl Error {
+    pub fn bad_request(message: impl Into<Cow<'static, str>>) -> Self {
+        Self::BadRequest(message.into())
+    }
+
     pub fn invalid_integer_header() -> Self {
         Self::BadRequest("Invalid integer header".into())
     }

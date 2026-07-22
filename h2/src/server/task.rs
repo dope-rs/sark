@@ -1,75 +1,23 @@
-use core::marker::PhantomData;
-use core::pin::Pin;
-
 use dope::driver::token::Token;
-use dope_fiber::{ErasedTaskId, TaskContext, TaskId, TaskQueue, Waker};
+use dope_fiber::{ErasedTaskId, TaskId};
 use o3::collections::FixedHashTable;
 
 use crate::stream::StreamId;
 
-pub(crate) type TaskTarget = Option<ErasedTaskId>;
+#[derive(Clone, Copy)]
+pub(crate) struct TaskTarget(Option<ErasedTaskId>);
 
-/// The listener owns the ready target for the lifetime of every child task.
-pub(crate) unsafe fn listener_waker<'from, 'to>(waker: Waker<'from>) -> Waker<'to> {
-    unsafe { core::mem::transmute(waker) }
-}
-
-pub(crate) struct TaskWake<'d> {
-    task: TaskContext<TaskTarget>,
-    pub(crate) bound: bool,
-    driver: PhantomData<fn(&'d ()) -> &'d ()>,
-}
-
-impl<'d> TaskWake<'d> {
-    pub(crate) fn new() -> Self {
-        Self {
-            task: TaskContext::with_target(None),
-            bound: false,
-            driver: PhantomData,
-        }
+impl TaskTarget {
+    pub(crate) const fn idle() -> Self {
+        Self(None)
     }
 
-    pub(crate) unsafe fn bind(
-        mut self: Pin<&mut Self>,
-        key: ErasedTaskId,
-        ready: Pin<&TaskQueue<TaskTarget>>,
-        parent: Waker<'_>,
-    ) {
-        let this = unsafe { self.as_mut().get_unchecked_mut() };
-        let task = unsafe { Pin::new_unchecked(&this.task) };
-        let _ = unsafe { task.bind_child(ready, Some(key), parent) };
-        this.bound = true;
+    pub(crate) const fn task(key: ErasedTaskId) -> Self {
+        Self(Some(key))
     }
 
-    pub(crate) fn waker(self: Pin<&Self>) -> Waker<'d> {
-        unsafe { self.map_unchecked(|this| &this.task).context_unchecked() }
-    }
-
-    unsafe fn unbind(mut self: Pin<&mut Self>) {
-        let this = unsafe { self.as_mut().get_unchecked_mut() };
-        if !this.bound {
-            return;
-        }
-        unsafe { Pin::new_unchecked(&this.task).unbind() };
-        this.bound = false;
-    }
-
-    pub(crate) fn at_mut(wakes: Pin<&mut [Self]>, index: usize) -> Pin<&mut Self> {
-        unsafe { wakes.map_unchecked_mut(|wakes| &mut wakes[index]) }
-    }
-}
-
-pub(crate) struct BoundTask<'a, 'd>(Option<Pin<&'a mut TaskWake<'d>>>);
-
-impl<'a, 'd> BoundTask<'a, 'd> {
-    pub(crate) fn new(wake: Pin<&'a mut TaskWake<'d>>) -> Self {
-        Self(Some(wake))
-    }
-}
-
-impl Drop for BoundTask<'_, '_> {
-    fn drop(&mut self) {
-        unsafe { self.0.take().unwrap().unbind() };
+    pub(crate) const fn key(self) -> Option<ErasedTaskId> {
+        self.0
     }
 }
 

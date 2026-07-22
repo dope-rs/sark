@@ -6,14 +6,10 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use dope::driver::token::{Epoch, SlotIndex, Token, kind};
 use dope::manifold::Manifold;
-use dope::platform::Platform;
 use dope::runtime::Idle;
-use dope::{Driver, DriverContext, Event, EventRef, Submission};
+use dope::{DriverContext, Event, EventRef, Sqe, Submission, TimerSpec};
 
 const UPDATE_INTERVAL: Duration = Duration::from_secs(1);
-
-type Sqe = <Driver as Platform>::Sqe;
-type TimerSpec = <Driver as Platform>::TimerSpec;
 
 pub struct Stamp {
     buf: Cell<[u8; 29]>,
@@ -192,7 +188,7 @@ impl<const ID: u8> Updater<ID> {
 impl<'d, const ID: u8> Manifold<'d> for Updater<ID> {
     const ID: u8 = ID;
 
-    fn dispatch(self: Pin<&mut Self>, event: Event, _driver: &mut DriverContext<'_, 'd>) {
+    fn dispatch(self: Pin<&mut Self>, event: Event<'d>, _driver: &mut DriverContext<'_, 'd>) {
         let this = self.get_mut();
         if this.state != TimerState::Armed {
             return;

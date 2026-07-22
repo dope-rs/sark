@@ -4,22 +4,34 @@ use syn::{Result, Type};
 
 use super::scalar::{Classified, Scalar};
 
-pub(super) struct Scan;
+pub(super) struct FieldScanner<'a> {
+    name: &'a [u8],
+    ty: &'a Type,
+    iter_expr: TokenStream,
+}
 
-impl Scan {
-    pub(super) fn field(name: &[u8], ty: &Type, iter_expr: TokenStream) -> Result<TokenStream> {
+impl<'a> FieldScanner<'a> {
+    pub(super) fn new(name: &'a [u8], ty: &'a Type, iter_expr: TokenStream) -> Self {
+        Self {
+            name,
+            ty,
+            iter_expr,
+        }
+    }
+
+    pub(super) fn emit(self) -> Result<TokenStream> {
         let tag = {
-            let mut out = Vec::with_capacity(name.len() + 3);
+            let mut out = Vec::with_capacity(self.name.len() + 3);
             out.push(b'"');
-            out.extend_from_slice(name);
+            out.extend_from_slice(self.name);
             out.extend_from_slice(b"\":");
             out
         };
         let tag = syn::LitByteStr::new(&tag, Span::call_site());
-        let class = Classified::of(ty)?;
+        let class = Classified::of(self.ty)?;
         if class.optional {
             return Err(syn::Error::new_spanned(
-                ty,
+                self.ty,
                 "`exact` scan does not support Option fields",
             ));
         }
@@ -40,11 +52,12 @@ impl Scan {
             ),
             _ => {
                 return Err(syn::Error::new_spanned(
-                    ty,
+                    self.ty,
                     "`exact` scan currently supports only Bytes<Retained> or InlineToken fields",
                 ));
             }
         };
+        let iter_expr = self.iter_expr;
         Ok(quote! {
             let mut __tag_idx = 0usize;
             #init

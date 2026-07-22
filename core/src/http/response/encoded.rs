@@ -2,7 +2,7 @@ use http::StatusCode;
 use o3::buffer::{Owned, Shared};
 
 use super::wire_emit::{ContentLength, HeadWrite, PLACEHOLDER_DATE};
-use super::{DEFAULT_HEADER_CAPACITY, HeadInner, HeadersInner};
+use super::{DEFAULT_HEADER_CAPACITY, HeadInner, Headers};
 
 pub trait EncodedBody: Sized {
     fn encoded_len(&self) -> usize;
@@ -12,23 +12,21 @@ pub trait EncodedBody: Sized {
     fn into_shared(self, encoded_len: usize) -> Shared;
 }
 
-pub struct EncodedResponseInner<'req, B, const N: usize = DEFAULT_HEADER_CAPACITY> {
+pub struct EncodedResponse<'req, B, const N: usize = DEFAULT_HEADER_CAPACITY> {
     status: StatusCode,
     head: HeadInner<'req, N>,
     body: B,
     body_len: usize,
 }
 
-pub type EncodedResponse<B> = EncodedResponseInner<'static, B>;
-
-impl<'req, B, const N: usize> EncodedResponseInner<'req, B, N>
+impl<'req, B, const N: usize> EncodedResponse<'req, B, N>
 where
     B: EncodedBody,
 {
     pub fn direct(
         status: StatusCode,
         static_headers: &'static [u8],
-        headers: HeadersInner<'req, N>,
+        headers: Headers<'req, N>,
         body: B,
     ) -> Self {
         let body_len = body.encoded_len();
@@ -74,10 +72,10 @@ where
         let head_len = head.wire_len();
         let body_len = self.body_len;
         let mut out = vec![0u8; head_len + body_len];
-        let mut offset = 0usize;
-        let date_offset = head.write(&mut out, &mut offset, PLACEHOLDER_DATE);
-        self.body.encode_into(&mut out[offset..offset + body_len]);
-        (out, date_offset)
+        let written = head.write(&mut out, PLACEHOLDER_DATE);
+        self.body
+            .encode_into(&mut out[written.len..written.len + body_len]);
+        (out, written.date_offset)
     }
 
     pub fn write_into_slice(&self, out: &mut [u8], date: &[u8; 29]) -> Option<usize> {
@@ -88,9 +86,8 @@ where
         if out.len() < total {
             return None;
         }
-        let mut offset = 0usize;
-        head.write(out, &mut offset, date);
-        self.body.encode_into(&mut out[offset..total]);
+        let written = head.write(out, date);
+        self.body.encode_into(&mut out[written.len..total]);
         Some(total)
     }
 
@@ -99,8 +96,7 @@ where
         if out.len() < head.wire_len() {
             return None;
         }
-        let mut offset = 0usize;
-        head.write(out, &mut offset, date);
-        Some((offset, self.body.into_shared(self.body_len)))
+        let written = head.write(out, date);
+        Some((written.len, self.body.into_shared(self.body_len)))
     }
 }

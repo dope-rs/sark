@@ -4,8 +4,8 @@ use o3::buffer::{Pooled, Shared};
 use crate::http::compress::Gzip;
 
 use super::{
-    Chunked, EncodedBody, EncodedResponseInner, FixedResponseInner, MonoResponseInner, NeverStream,
-    ServeInner, StaticResponseInner, Stream,
+    Chunked, EncodedBody, EncodedResponse, FixedResponse, MonoResponseInner, NeverStream, Serve,
+    StaticResponseInner, Stream,
 };
 
 pub enum Egress<S> {
@@ -17,21 +17,62 @@ pub enum Egress<S> {
     Failed,
 }
 
-pub enum Compression<T, S> {
-    Plain(T),
-    Compressed(Egress<S>),
-}
-
 pub enum CacheTemplate {
     Inline {
         bytes: Vec<u8>,
-        date_offset: usize,
+        date_offset: Option<usize>,
     },
     Static {
         head: Vec<u8>,
-        date_offset: usize,
+        date_offset: Option<usize>,
         body: &'static [u8],
     },
+}
+
+impl CacheTemplate {
+    pub fn configure_head(&mut self, emit_date: bool, emit_server: bool) {
+        let (template, date_offset) = match self {
+            Self::Inline { bytes, date_offset } => (bytes, date_offset),
+            Self::Static {
+                head, date_offset, ..
+            } => (head, date_offset),
+        };
+        if let Some(offset) = *date_offset {
+            if emit_date && emit_server {
+                return;
+            }
+            let term_start =
+                offset - super::wire_emit::DATE_PREFIX.len() - super::wire_emit::SERVER_LINE.len();
+            let term_end = term_start + super::wire_emit::SERVER_DATE_TERMINATOR_LEN;
+            let mut tail = Vec::with_capacity(super::wire_emit::SERVER_DATE_TERMINATOR_LEN);
+            if emit_server {
+                tail.extend_from_slice(super::wire_emit::SERVER_LINE);
+            }
+            *date_offset = if emit_date {
+                tail.extend_from_slice(super::wire_emit::DATE_PREFIX);
+                let offset = term_start + tail.len();
+                tail.extend_from_slice(&[0u8; super::wire_emit::DATE_LEN]);
+                tail.extend_from_slice(super::wire_emit::CRLF);
+                Some(offset)
+            } else {
+                None
+            };
+            tail.extend_from_slice(super::wire_emit::CRLF);
+            template.splice(term_start..term_end, tail);
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Preparation {
+    Plain,
+    Compress,
+    Cache,
+}
+
+pub enum Prepared<S> {
+    Egress(Egress<S>),
+    Cache(CacheTemplate),
 }
 
 pub struct ResponseView {
@@ -43,61 +84,49 @@ pub struct ResponseView {
 pub trait Shape<'req>: Sized {
     type StreamInner: 'static;
 
-    fn egress(self, out: &mut [u8], date: &[u8; 29]) -> Egress<Self::StreamInner>;
-
-    fn compress(
+    fn prepare(
         self,
-        _gzip: &mut Gzip,
-        _out: &mut [u8],
-        _date: &[u8; 29],
-    ) -> Compression<Self, Self::StreamInner> {
-        Compression::Plain(self)
-    }
-
-    fn cache_template(&self) -> Option<CacheTemplate> {
-        None
-    }
+        mode: Preparation,
+        gzip: Option<&mut Gzip>,
+        out: &mut [u8],
+        date: &[u8; 29],
+    ) -> Prepared<Self::StreamInner>;
 
     fn response_view(&self) -> Option<ResponseView> {
         None
     }
 }
 
-impl<'req, const N: usize> Shape<'req> for FixedResponseInner<'req, N> {
+impl<'req, const N: usize> Shape<'req> for FixedResponse<'req, N> {
     type StreamInner = NeverStream;
 
-    fn egress(self, out: &mut [u8], date: &[u8; 29]) -> Egress<Self::StreamInner> {
-        if let Some(written) = self.write_into_slice(out, date) {
-            return Egress::Inline { written };
-        }
-        match self.write_head_split(out, date) {
-            Some((head, body)) => Egress::Shared { head, body },
-            None => Egress::Failed,
-        }
-    }
-
-    fn compress(
+    fn prepare(
         self,
-        gzip: &mut Gzip,
+        mode: Preparation,
+        gzip: Option<&mut Gzip>,
         out: &mut [u8],
         date: &[u8; 29],
-    ) -> Compression<Self, Self::StreamInner> {
-        if self.has_content_encoding() || self.body_ref().is_empty() {
-            return Compression::Plain(self);
+    ) -> Prepared<Self::StreamInner> {
+        if mode == Preparation::Cache {
+            let (bytes, date_offset) = self.preserialize();
+            return Prepared::Cache(CacheTemplate::Inline {
+                bytes,
+                date_offset: Some(date_offset),
+            });
         }
-        let Some(body) = gzip.encode(self.body_ref()) else {
-            return Compression::Plain(self);
-        };
-        let body_len = body.len();
-        match self.write_gzip_head(out, date, body_len) {
-            Some(head) => Compression::Compressed(Egress::Pooled { head, body }),
-            None => Compression::Compressed(Egress::Failed),
+        if mode == Preparation::Compress
+            && !self.has_content_encoding()
+            && !self.body_ref().is_empty()
+            && let Some(body) = gzip.and_then(|gzip| gzip.encode(self.body_ref()))
+        {
+            let body_len = body.len();
+            let egress = match self.write_gzip_head(out, date, body_len) {
+                Some(head) => Egress::Pooled { head, body },
+                None => Egress::Failed,
+            };
+            return Prepared::Egress(egress);
         }
-    }
-
-    fn cache_template(&self) -> Option<CacheTemplate> {
-        let (bytes, date_offset) = self.preserialize();
-        Some(CacheTemplate::Inline { bytes, date_offset })
+        Prepared::Egress(fixed_egress(self, out, date))
     }
 
     fn response_view(&self) -> Option<ResponseView> {
@@ -109,25 +138,35 @@ impl<'req, const N: usize> Shape<'req> for FixedResponseInner<'req, N> {
     }
 }
 
-impl<'req, B, const N: usize> Shape<'req> for EncodedResponseInner<'req, B, N>
+impl<'req, B, const N: usize> Shape<'req> for EncodedResponse<'req, B, N>
 where
     B: EncodedBody,
 {
     type StreamInner = NeverStream;
 
-    fn egress(self, out: &mut [u8], date: &[u8; 29]) -> Egress<Self::StreamInner> {
-        if let Some(written) = self.write_into_slice(out, date) {
-            return Egress::Inline { written };
+    fn prepare(
+        self,
+        mode: Preparation,
+        _gzip: Option<&mut Gzip>,
+        out: &mut [u8],
+        date: &[u8; 29],
+    ) -> Prepared<Self::StreamInner> {
+        if mode == Preparation::Cache {
+            let (bytes, date_offset) = self.preserialize();
+            return Prepared::Cache(CacheTemplate::Inline {
+                bytes,
+                date_offset: Some(date_offset),
+            });
         }
-        match self.write_head_split(out, date) {
-            Some((head, body)) => Egress::Shared { head, body },
-            None => Egress::Failed,
-        }
-    }
-
-    fn cache_template(&self) -> Option<CacheTemplate> {
-        let (bytes, date_offset) = self.preserialize();
-        Some(CacheTemplate::Inline { bytes, date_offset })
+        let egress = if let Some(written) = self.write_into_slice(out, date) {
+            Egress::Inline { written }
+        } else {
+            match self.write_head_split(out, date) {
+                Some((head, body)) => Egress::Shared { head, body },
+                None => Egress::Failed,
+            }
+        };
+        Prepared::Egress(egress)
     }
 
     fn response_view(&self) -> Option<ResponseView> {
@@ -142,14 +181,25 @@ where
 impl<'req, const N: usize> Shape<'req> for MonoResponseInner<'req, N> {
     type StreamInner = NeverStream;
 
-    fn egress(self, out: &mut [u8], date: &[u8; 29]) -> Egress<Self::StreamInner> {
-        if let Some(written) = self.write_into_slice(out, date) {
-            return Egress::Inline { written };
+    fn prepare(
+        self,
+        mode: Preparation,
+        _gzip: Option<&mut Gzip>,
+        out: &mut [u8],
+        date: &[u8; 29],
+    ) -> Prepared<Self::StreamInner> {
+        if mode == Preparation::Cache {
+            return Prepared::Egress(Egress::Failed);
         }
-        match self.write_head_split(out, date) {
-            Some((head, body)) => Egress::Shared { head, body },
-            None => Egress::Failed,
-        }
+        let egress = if let Some(written) = self.write_into_slice(out, date) {
+            Egress::Inline { written }
+        } else {
+            match self.write_head_split(out, date) {
+                Some((head, body)) => Egress::Shared { head, body },
+                None => Egress::Failed,
+            }
+        };
+        Prepared::Egress(egress)
     }
 
     fn response_view(&self) -> Option<ResponseView> {
@@ -164,19 +214,24 @@ impl<'req, const N: usize> Shape<'req> for MonoResponseInner<'req, N> {
 impl<'req, const N: usize> Shape<'req> for StaticResponseInner<'req, N> {
     type StreamInner = NeverStream;
 
-    fn egress(self, out: &mut [u8], date: &[u8; 29]) -> Egress<Self::StreamInner> {
-        match self.write_head_only(out, date) {
+    fn prepare(
+        self,
+        mode: Preparation,
+        _gzip: Option<&mut Gzip>,
+        out: &mut [u8],
+        date: &[u8; 29],
+    ) -> Prepared<Self::StreamInner> {
+        if mode == Preparation::Cache {
+            let (head, date_offset, body) = self.preserialize_static();
+            return Prepared::Cache(CacheTemplate::Static {
+                head,
+                date_offset: Some(date_offset),
+                body,
+            });
+        }
+        Prepared::Egress(match self.write_head_only(out, date) {
             Some((head, body)) => Egress::Static { head, body },
             None => Egress::Failed,
-        }
-    }
-
-    fn cache_template(&self) -> Option<CacheTemplate> {
-        let (head, date_offset, body) = self.preserialize_static();
-        Some(CacheTemplate::Static {
-            head,
-            date_offset,
-            body,
         })
     }
 
@@ -192,14 +247,25 @@ impl<'req, const N: usize> Shape<'req> for StaticResponseInner<'req, N> {
 impl<'req> Shape<'req> for Chunked {
     type StreamInner = NeverStream;
 
-    fn egress(self, out: &mut [u8], date: &[u8; 29]) -> Egress<Self::StreamInner> {
-        if let Some(written) = self.write_into_slice(out, date) {
-            return Egress::Inline { written };
+    fn prepare(
+        self,
+        mode: Preparation,
+        _gzip: Option<&mut Gzip>,
+        out: &mut [u8],
+        date: &[u8; 29],
+    ) -> Prepared<Self::StreamInner> {
+        if mode == Preparation::Cache {
+            return Prepared::Egress(Egress::Failed);
         }
-        match self.write_head_split(out, date) {
-            Some((head, body)) => Egress::Shared { head, body },
-            None => Egress::Failed,
-        }
+        let egress = if let Some(written) = self.write_into_slice(out, date) {
+            Egress::Inline { written }
+        } else {
+            match self.write_head_split(out, date) {
+                Some((head, body)) => Egress::Shared { head, body },
+                None => Egress::Failed,
+            }
+        };
+        Prepared::Egress(egress)
     }
 }
 
@@ -209,44 +275,37 @@ where
 {
     type StreamInner = S;
 
-    fn egress(self, out: &mut [u8], date: &[u8; 29]) -> Egress<Self::StreamInner> {
-        match self.write_head_stream(out, date) {
+    fn prepare(
+        self,
+        mode: Preparation,
+        _gzip: Option<&mut Gzip>,
+        out: &mut [u8],
+        date: &[u8; 29],
+    ) -> Prepared<Self::StreamInner> {
+        if mode == Preparation::Cache {
+            return Prepared::Egress(Egress::Failed);
+        }
+        Prepared::Egress(match self.write_head_stream(out, date) {
             Some((head, stream)) => Egress::Stream { head, stream },
             None => Egress::Failed,
-        }
+        })
     }
 }
 
-impl<'req, const N: usize> Shape<'req> for ServeInner<'req, N> {
+impl<'req, const N: usize> Shape<'req> for Serve<'req, N> {
     type StreamInner = NeverStream;
 
-    fn egress(self, out: &mut [u8], date: &[u8; 29]) -> Egress<Self::StreamInner> {
-        match self {
-            Self::Fixed(response) => response.egress(out, date),
-            Self::Mono(response) => response.egress(out, date),
-            Self::Chunked(response) => response.egress(out, date),
-        }
-    }
-
-    fn compress(
+    fn prepare(
         self,
-        gzip: &mut Gzip,
+        mode: Preparation,
+        gzip: Option<&mut Gzip>,
         out: &mut [u8],
         date: &[u8; 29],
-    ) -> Compression<Self, Self::StreamInner> {
+    ) -> Prepared<Self::StreamInner> {
         match self {
-            Self::Fixed(response) => match response.compress(gzip, out, date) {
-                Compression::Plain(response) => Compression::Plain(Self::Fixed(response)),
-                Compression::Compressed(egress) => Compression::Compressed(egress),
-            },
-            response => Compression::Plain(response),
-        }
-    }
-
-    fn cache_template(&self) -> Option<CacheTemplate> {
-        match self {
-            Self::Fixed(response) => response.cache_template(),
-            Self::Mono(_) | Self::Chunked(_) => None,
+            Self::Fixed(response) => response.prepare(mode, gzip, out, date),
+            Self::Mono(response) => response.prepare(mode, gzip, out, date),
+            Self::Chunked(response) => response.prepare(mode, gzip, out, date),
         }
     }
 
@@ -256,5 +315,19 @@ impl<'req, const N: usize> Shape<'req> for ServeInner<'req, N> {
             Self::Mono(response) => response.response_view(),
             Self::Chunked(_) => None,
         }
+    }
+}
+
+fn fixed_egress<'req, const N: usize>(
+    response: FixedResponse<'req, N>,
+    out: &mut [u8],
+    date: &[u8; 29],
+) -> Egress<NeverStream> {
+    if let Some(written) = response.write_into_slice(out, date) {
+        return Egress::Inline { written };
+    }
+    match response.write_head_split(out, date) {
+        Some((head, body)) => Egress::Shared { head, body },
+        None => Egress::Failed,
     }
 }

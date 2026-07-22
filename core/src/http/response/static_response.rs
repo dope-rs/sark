@@ -1,8 +1,8 @@
 use http::StatusCode;
 use o3::buffer::{Owned, Shared};
 
-use super::wire_emit::{ContentLength, HeadWrite, Out, PLACEHOLDER_DATE};
-use super::{DEFAULT_HEADER_CAPACITY, HeadInner, HeadersInner};
+use super::wire_emit::{ContentLength, HeadWrite, PLACEHOLDER_DATE, WireWriter};
+use super::{DEFAULT_HEADER_CAPACITY, HeadInner, Headers};
 
 /// A response whose body is guaranteed to live for the entire process.
 ///
@@ -19,7 +19,7 @@ impl<'req, const N: usize> StaticResponseInner<'req, N> {
     pub fn direct(
         status: StatusCode,
         static_headers: &'static [u8],
-        headers: HeadersInner<'req, N>,
+        headers: Headers<'req, N>,
         body: &'static [u8],
     ) -> Self {
         Self {
@@ -62,10 +62,10 @@ impl<'req, const N: usize> StaticResponseInner<'req, N> {
         if out.len() < total {
             return None;
         }
-        let mut off = 0usize;
-        head.write(out, &mut off, date);
-        Out::put(out, &mut off, self.body);
-        Some(off)
+        let written = head.write(out, date);
+        let mut out = WireWriter::at(out, written.len);
+        out.put(self.body);
+        Some(out.len())
     }
 
     pub fn write_head_only(
@@ -77,9 +77,8 @@ impl<'req, const N: usize> StaticResponseInner<'req, N> {
         if out.len() < head.wire_len() {
             return None;
         }
-        let mut off = 0usize;
-        head.write(out, &mut off, date);
-        Some((off, self.body))
+        let written = head.write(out, date);
+        Some((written.len, self.body))
     }
 
     pub fn write_head_split(self, out: &mut [u8], date: &[u8; 29]) -> Option<(usize, Shared)> {
@@ -90,8 +89,7 @@ impl<'req, const N: usize> StaticResponseInner<'req, N> {
     pub fn preserialize_static(&self) -> (Vec<u8>, usize, &'static [u8]) {
         let head = self.head_write();
         let mut out = vec![0u8; head.wire_len()];
-        let mut off = 0usize;
-        let date_offset = head.write(&mut out, &mut off, PLACEHOLDER_DATE);
-        (out, date_offset, self.body)
+        let written = head.write(&mut out, PLACEHOLDER_DATE);
+        (out, written.date_offset, self.body)
     }
 }

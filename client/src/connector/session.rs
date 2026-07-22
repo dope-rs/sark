@@ -2,13 +2,14 @@ use std::io::{self, Read};
 use std::pin::Pin;
 use std::time::{Duration, Instant};
 
-use cartel_core::Arena;
+use cartel_core::ArenaLane;
 use dope::driver::token::Token;
 use dope::manifold::connector;
 use dope::manifold::timer::Timer;
 use dope::runtime::Idle;
 use dope_fiber::WaitQueue;
 use o3::buffer::{Lease, Pool as BufferPool, PoolLayout};
+use o3::cell::RegionToken;
 use sark_core::http::Response;
 use sark_core::http::codec::{DecodeMode, HeaderLookup, ResponseDecoder};
 
@@ -93,13 +94,14 @@ impl<'d> Shared<'d> {
         self.active_waiters.as_ref().try_register(waiter, context)
     }
 
-    fn note_connect(&self, conn_id: Token, now: Instant) {
-        self.pool.note_connect(conn_id, now);
+    fn note_connect(&self, token: &mut RegionToken<'d>, conn_id: Token, now: Instant) {
+        self.pool.note_connect(token, conn_id, now);
         self.wake();
     }
 
     fn push_response(
         &self,
+        token: &mut RegionToken<'d>,
         conn_id: Token,
         outcome: Outcome,
         bytes: usize,
@@ -107,23 +109,24 @@ impl<'d> Shared<'d> {
         now: Instant,
     ) {
         self.pool
-            .push_response(conn_id, outcome, bytes, keepalive, now);
+            .push_response(token, conn_id, outcome, bytes, keepalive, now);
         self.wake();
     }
 
-    pub(super) fn close_connection(&self, conn_id: Token) {
-        self.pool.close(conn_id);
+    pub(super) fn close_connection(&self, token: &mut RegionToken<'d>, conn_id: Token) {
+        self.pool.close(token, conn_id);
         self.wake();
     }
 
     pub fn acquire(
         &self,
+        token: &mut RegionToken<'d>,
         now: Instant,
         idle_timeout: Duration,
         mut recycle: impl FnMut(Token),
     ) -> Option<Token> {
         let mut closed = false;
-        let acquired = self.pool.acquire(now, idle_timeout, |conn_id| {
+        let acquired = self.pool.acquire(token, now, idle_timeout, |conn_id| {
             closed = true;
             recycle(conn_id);
         });
@@ -133,16 +136,16 @@ impl<'d> Shared<'d> {
         acquired
     }
 
-    pub fn arena(&'d self, conn_id: Token) -> Option<&'d Arena<'d, Outcome>> {
+    pub fn arena(&'d self, conn_id: Token) -> Option<ArenaLane<'d, Outcome>> {
         self.pool.arena(conn_id)
     }
 
-    pub fn submitted(&self, conn_id: Token, now: Instant) {
-        self.pool.submitted(conn_id, now);
+    pub fn submitted(&self, token: &mut RegionToken<'d>, conn_id: Token, now: Instant) {
+        self.pool.submitted(token, conn_id, now);
     }
 
-    pub fn make_available(&self, conn_id: Token) {
-        self.pool.make_available(conn_id);
+    pub fn make_available(&self, token: &mut RegionToken<'d>, conn_id: Token) {
+        self.pool.make_available(token, conn_id);
     }
 }
 
@@ -373,13 +376,16 @@ impl<'d> connector::Session<'d> for Session<'d> {
     type Send = Lease<'d>;
 
     fn connect(&mut self, ctx: &mut connector::Ctx<'_, 'd, Self>) {
-        self.port.shared.note_connect(ctx.conn_id, Instant::now());
+        self.port
+            .shared
+            .note_connect(ctx.region, ctx.conn_id, Instant::now());
     }
 
     fn response(&mut self, head: Head, ctx: &mut connector::Ctx<'_, 'd, Self>) {
         if let Some(reason) = head.error {
             let bytes = head.full.len();
             self.port.shared.push_response(
+                ctx.region,
                 ctx.conn_id,
                 Err(Error::Parse(reason.into())),
                 bytes,
@@ -420,6 +426,7 @@ impl<'d> connector::Session<'d> for Session<'d> {
             .as_ref()
             .map_or(buffered, |response| buffered.max(response.body().len()));
         self.port.shared.push_response(
+            ctx.region,
             ctx.conn_id,
             outcome,
             buffered,
@@ -430,7 +437,7 @@ impl<'d> connector::Session<'d> for Session<'d> {
 
     fn disconnect(&mut self, ctx: &mut connector::Ctx<'_, 'd, Self>) {
         self.port.io.deactivate(ctx.conn_id);
-        self.port.shared.close_connection(ctx.conn_id);
+        self.port.shared.close_connection(ctx.region, ctx.conn_id);
         ctx.state.pending_close = false;
     }
 

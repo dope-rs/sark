@@ -3,16 +3,16 @@ use o3::buffer::Shared;
 use sark_core::http::codec::HeaderScan;
 use sark_core::http::compress::Gzip;
 use sark_core::http::head::Flags;
-use sark_core::http::{FixedResponseInner, HeadersInner, head};
+use sark_core::http::{FixedResponse, Headers, head};
 
 #[test]
 fn fixed_response_gzip_head_writes_content_encoding_and_vary() {
     let payload = b"{\"hello\":\"world\",\"hello\":\"world\",\"hello\":\"world\"}".to_vec();
     let body = Shared::copy_from_slice(&payload);
-    let fixed: FixedResponseInner<'static, 0> = FixedResponseInner::direct(
+    let fixed: FixedResponse<'static, 0> = FixedResponse::direct(
         StatusCode::OK,
         b"content-type: application/json\r\n",
-        HeadersInner::from_items([]),
+        Headers::from_items([]),
         body,
     );
 
@@ -43,10 +43,8 @@ fn header_scan_detects_accept_encoding_gzip() {
     let mut pos = headers_start;
     loop {
         let rest = &req[pos..];
-        match head::apply_well_known_header_contig(
+        match head::WellKnownHeaders::new(&mut scan, &mut flags).apply_contiguous(
             rest,
-            &mut scan,
-            &mut flags,
             &mut (),
             &mut hc,
             32,
@@ -70,10 +68,8 @@ fn header_scan_detects_only_br_not_gzip() {
     let mut pos = headers_start;
     loop {
         let rest = &req[pos..];
-        match head::apply_well_known_header_contig(
+        match head::WellKnownHeaders::new(&mut scan, &mut flags).apply_contiguous(
             rest,
-            &mut scan,
-            &mut flags,
             &mut (),
             &mut hc,
             32,
@@ -97,10 +93,8 @@ fn header_scan_detects_gzip_with_qvalue() {
     let mut pos = headers_start;
     loop {
         let rest = &req[pos..];
-        match head::apply_well_known_header_contig(
+        match head::WellKnownHeaders::new(&mut scan, &mut flags).apply_contiguous(
             rest,
-            &mut scan,
-            &mut flags,
             &mut (),
             &mut hc,
             32,

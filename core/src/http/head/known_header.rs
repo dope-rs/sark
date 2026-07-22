@@ -1,5 +1,7 @@
-use super::byte::is_ascii_ws;
+//! Parsing and state updates for HTTP headers with protocol-level semantics.
+
 use super::flags::{Flags, SeenHeaderHandler};
+use super::input::HeaderLine;
 use crate::error::{Error, Result};
 use crate::http::codec;
 use crate::utils::bytes::{Ascii, Word};
@@ -171,7 +173,7 @@ impl KnownHeaderImpl for ConnHeader {
     }
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum KnownHeader {
     AcceptEncoding,
     ContentLength,
@@ -259,10 +261,10 @@ fn apply_accept_encoding(
             .unwrap_or(raw.len());
         let mut vs = start;
         let mut ve = end;
-        while vs < ve && is_ascii_ws(raw[vs]) {
+        while vs < ve && HeaderLine::is_whitespace(raw[vs]) {
             vs += 1;
         }
-        while ve > vs && is_ascii_ws(raw[ve - 1]) {
+        while ve > vs && HeaderLine::is_whitespace(raw[ve - 1]) {
             ve -= 1;
         }
         if vs < ve {
@@ -489,10 +491,10 @@ fn te_request_chunked_final(value: &[u8]) -> Result<bool> {
         if idx == len || value[idx] == b',' {
             let mut lo = start;
             let mut hi = idx;
-            while lo < hi && is_ascii_ws(value[lo]) {
+            while lo < hi && HeaderLine::is_whitespace(value[lo]) {
                 lo += 1;
             }
-            while hi > lo && is_ascii_ws(value[hi - 1]) {
+            while hi > lo && HeaderLine::is_whitespace(value[hi - 1]) {
                 hi -= 1;
             }
             if hi <= lo {
@@ -558,7 +560,7 @@ fn ae_token_main(token: &[u8]) -> &[u8] {
     let mut end = 0usize;
     while end < token.len() {
         let b = token[end];
-        if b == b';' || is_ascii_ws(b) {
+        if b == b';' || HeaderLine::is_whitespace(b) {
             break;
         }
         end += 1;
@@ -576,7 +578,7 @@ fn invalid_header_value() -> Error {
 
 fn scan_content_length_value(raw: &[u8]) -> Result<Option<(usize, usize, usize)>> {
     let mut idx = 0usize;
-    while idx < raw.len() && is_ascii_ws(raw[idx]) {
+    while idx < raw.len() && HeaderLine::is_whitespace(raw[idx]) {
         idx += 1;
     }
     let start = idx;
@@ -612,7 +614,7 @@ impl<'a> Iterator for CsvScan<'a> {
         if self.pos > self.raw.len() {
             return None;
         }
-        while self.pos < self.raw.len() && is_ascii_ws(self.raw[self.pos]) {
+        while self.pos < self.raw.len() && HeaderLine::is_whitespace(self.raw[self.pos]) {
             self.pos += 1;
         }
         let start = self.pos;
@@ -621,7 +623,7 @@ impl<'a> Iterator for CsvScan<'a> {
         }
         let end = self.pos;
         let mut stop = end;
-        while stop > start && is_ascii_ws(self.raw[stop - 1]) {
+        while stop > start && HeaderLine::is_whitespace(self.raw[stop - 1]) {
             stop -= 1;
         }
         self.pos = end.saturating_add(1);
@@ -645,11 +647,11 @@ fn parse_csv(raw: &[u8], want: u8) -> u8 {
 
 fn trim_len(raw: &[u8]) -> usize {
     let mut start = 0usize;
-    while start < raw.len() && is_ascii_ws(raw[start]) {
+    while start < raw.len() && HeaderLine::is_whitespace(raw[start]) {
         start += 1;
     }
     let mut end = raw.len();
-    while end > start && is_ascii_ws(raw[end - 1]) {
+    while end > start && HeaderLine::is_whitespace(raw[end - 1]) {
         end -= 1;
     }
     end - start
@@ -657,7 +659,7 @@ fn trim_len(raw: &[u8]) -> usize {
 
 fn trim_line(raw: &[u8]) -> Result<Option<(usize, usize, usize)>> {
     let mut idx = 0usize;
-    while idx < raw.len() && is_ascii_ws(raw[idx]) {
+    while idx < raw.len() && HeaderLine::is_whitespace(raw[idx]) {
         idx += 1;
     }
     let value_start = idx;
@@ -675,7 +677,7 @@ fn trim_line(raw: &[u8]) -> Result<Option<(usize, usize, usize)>> {
         return Err(invalid_header_value());
     }
     let mut value_end = cr;
-    while value_end > value_start && is_ascii_ws(raw[value_end - 1]) {
+    while value_end > value_start && HeaderLine::is_whitespace(raw[value_end - 1]) {
         value_end -= 1;
     }
     Ok(Some((cr, value_start, value_end)))
@@ -684,7 +686,7 @@ fn trim_line(raw: &[u8]) -> Result<Option<(usize, usize, usize)>> {
 fn parse_content_length_line(raw: &[u8]) -> Result<(usize, usize)> {
     let (value, start, end) = scan_content_length_value(raw)?.ok_or_else(invalid_content_length)?;
     let mut idx = end;
-    while idx < raw.len() && is_ascii_ws(raw[idx]) {
+    while idx < raw.len() && HeaderLine::is_whitespace(raw[idx]) {
         idx += 1;
     }
     if idx != raw.len() {
@@ -698,7 +700,7 @@ fn parse_clen(raw: &[u8]) -> Result<Option<(usize, usize, usize, usize)>> {
         return Ok(None);
     };
     let mut idx = value_end;
-    while idx < raw.len() && is_ascii_ws(raw[idx]) {
+    while idx < raw.len() && HeaderLine::is_whitespace(raw[idx]) {
         idx += 1;
     }
     if idx >= raw.len() {
@@ -718,7 +720,7 @@ fn parse_clen(raw: &[u8]) -> Result<Option<(usize, usize, usize, usize)>> {
 
 fn trim_left(raw: &[u8]) -> usize {
     let mut start = 0usize;
-    while start < raw.len() && is_ascii_ws(raw[start]) {
+    while start < raw.len() && HeaderLine::is_whitespace(raw[start]) {
         start += 1;
     }
     start
@@ -783,11 +785,11 @@ fn walk_csv_line<A: Copy, F: FnMut(A, &[u8]) -> A>(
             return Err(invalid_header_value());
         }
         let mut t_lo = idx;
-        while t_lo < end && is_ascii_ws(raw[t_lo]) {
+        while t_lo < end && HeaderLine::is_whitespace(raw[t_lo]) {
             t_lo += 1;
         }
         let mut t_hi = end;
-        while t_hi > t_lo && is_ascii_ws(raw[t_hi - 1]) {
+        while t_hi > t_lo && HeaderLine::is_whitespace(raw[t_hi - 1]) {
             t_hi -= 1;
         }
         if t_hi > t_lo {

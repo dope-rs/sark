@@ -4,7 +4,7 @@ use o3::buffer::Shared;
 use super::Response;
 use super::body::Body;
 use super::header::HeaderList;
-use super::wire_emit::{CRLF, HeadWrite, Out, TransferEncodingChunked};
+use super::wire_emit::{CRLF, HeadWrite, TransferEncodingChunked, WireWriter};
 use crate::http::codec::Wire;
 
 #[derive(Clone, Debug)]
@@ -59,19 +59,19 @@ impl Chunked {
         len + Self::ZERO_CHUNK.len()
     }
 
-    fn write_body(&self, dst: &mut [u8], off: &mut usize) {
+    fn write_body(&self, out: &mut WireWriter<'_>) {
         for part in &self.parts {
             if part.is_empty() {
                 continue;
             }
             let mut hex = [0u8; 16];
             let hex_n = Wire::write_hex(part.len(), &mut hex);
-            Out::put(dst, off, &hex[..hex_n]);
-            Out::put(dst, off, CRLF);
-            Out::put(dst, off, part.as_ref());
-            Out::put(dst, off, CRLF);
+            out.put(&hex[..hex_n]);
+            out.put(CRLF);
+            out.put(part.as_ref());
+            out.put(CRLF);
         }
-        Out::put(dst, off, Self::ZERO_CHUNK);
+        out.put(Self::ZERO_CHUNK);
     }
 
     fn head(&self) -> HeadWrite<'_, [u8], TransferEncodingChunked> {
@@ -94,10 +94,10 @@ impl Chunked {
             return None;
         }
 
-        let mut off = 0usize;
-        head.write(out, &mut off, date);
-        self.write_body(out, &mut off);
-        Some(off)
+        let written = head.write(out, date);
+        let mut out = WireWriter::at(out, written.len);
+        self.write_body(&mut out);
+        Some(out.len())
     }
 
     pub fn write_head_split(self, out: &mut [u8], date: &[u8; 29]) -> Option<(usize, Shared)> {
@@ -105,12 +105,10 @@ impl Chunked {
         if out.len() < head.wire_len() {
             return None;
         }
-        let mut off = 0usize;
-        head.write(out, &mut off, date);
+        let written = head.write(out, date);
 
         let mut body = vec![0u8; self.body_wire_len()];
-        let mut boff = 0usize;
-        self.write_body(&mut body, &mut boff);
-        Some((off, Shared::from(body)))
+        self.write_body(&mut WireWriter::new(&mut body));
+        Some((written.len, Shared::from(body)))
     }
 }

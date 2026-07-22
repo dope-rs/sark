@@ -7,7 +7,7 @@ use dope_extra::harness::Harness;
 use sark_grpc::Status;
 use sark_grpc::headers::HeaderBlock;
 use sark_grpc::metadata::Metadata;
-use sark_grpc::server::{self, Config, Handler, Limits, Request, Response};
+use sark_grpc::server::{Config, Handler, Limits, Request, Response};
 use sark_h2::{ClientRole, Conn, ErrorCode, StreamId, conn};
 
 struct Nop;
@@ -44,7 +44,7 @@ fn configured_capacity_is_built_at_accept() {
     };
     harness
         .run_with_trigger(
-            move |context, trigger| server::serve(Nop, config, context, Some(trigger)),
+            move |context, trigger| config.serve(Nop, context, Some(trigger)),
             |bind| {
                 let mut transport = connect(bind);
                 transport

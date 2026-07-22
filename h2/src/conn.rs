@@ -3,14 +3,14 @@ use core::ops::Deref;
 use std::fmt;
 
 use dope::runtime::profile::Throughput;
-use o3::buffer::{ByteRing, Pooled, SharedPool};
-use o3::collections::FixedQueue;
+use o3::buffer::Pooled;
 
 use crate::egress::Egress;
 use crate::frame::{
-    self, Data, ErrorCode, Flags, FrameBuf, FrameHeader, GoAway, HEADER_LEN, ParseError, Ping,
-    Priority, RstStream, SettingId, WindowUpdate,
+    self, Data, ErrorCode, Flags, FrameBuf, GoAway, HEADER_LEN, ParseError, Ping, Priority,
+    RstStream, SettingId, WindowUpdate,
 };
+use crate::ingress::{Ingress, PendingHeaders, PendingKind};
 use crate::role::Role;
 use crate::stream::{self, Side, Stream, StreamId, TransitionError};
 use crate::stream_registry::{StreamClass, StreamRecord, StreamRegistry};
@@ -297,18 +297,6 @@ impl fmt::Debug for DataPayload {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-enum PendingKind {
-    Headers { end_stream: bool, trailing: bool },
-    PushPromise { promised: StreamId },
-}
-
-struct PendingHeaders {
-    stream_id: StreamId,
-    kind: PendingKind,
-    continuations: u32,
-}
-
 const DEFAULT_MAX_HEADER_LIST_SIZE: u32 = 16_384;
 const DEFAULT_MAX_ACTIVE_STREAMS: usize = 256;
 const DEFAULT_INBOUND_CAPACITY: usize = 1 << 20;
@@ -322,10 +310,9 @@ const MAX_CONTINUATION_FRAMES: u32 = 64;
 pub struct Conn<R: Role> {
     role: PhantomData<R>,
 
-    inbound: ByteRing,
+    ingress: Ingress,
     egress: Egress,
 
-    preface_done: bool,
     initial_settings_sent: bool,
     peer_settings_received: bool,
     goaway_sent: bool,
@@ -338,15 +325,7 @@ pub struct Conn<R: Role> {
     recv_window: flow::Window,
     recv_window_target: u32,
 
-    events: FixedQueue<Event>,
-    data_pool: SharedPool,
-    header_pool: SharedPool,
-
-    recv_header_block: Vec<u8>,
-    decoder: hpack::Decoder,
     streams: StreamRegistry<R>,
-    pending_headers: Option<PendingHeaders>,
-    pending_headers_cap: usize,
     conn_pending_release: u32,
     peer_reset_count: u32,
     send_window_opened: bool,
@@ -437,17 +416,23 @@ impl<R: Role> Conn<R> {
             "outbound capacity is too small"
         );
         let header_list_cap = local.max_header_list_size.unwrap() as usize;
-        let mut decoder = hpack::Decoder::new(local.header_table_size as usize);
-        decoder.set_max_header_list_size(Some(header_list_cap));
         let mut conn = Self {
             role: PhantomData,
-            inbound: ByteRing::with_capacity(inbound_capacity),
+            ingress: Ingress::new(
+                inbound_capacity,
+                event_capacity,
+                data_capacity,
+                local.max_frame_size as usize,
+                header_capacity,
+                local.header_table_size as usize,
+                header_list_cap,
+                R::PREFACE_SENDS_FIRST,
+            ),
             egress: Egress::new(
                 outbound_capacity,
                 local.header_table_size as usize,
                 header_list_cap,
             ),
-            preface_done: false,
             initial_settings_sent: false,
             peer_settings_received: false,
             goaway_sent: false,
@@ -457,14 +442,7 @@ impl<R: Role> Conn<R> {
             send_window: flow::Window::new(),
             recv_window: flow::Window::new(),
             recv_window_target,
-            events: FixedQueue::with_capacity(event_capacity),
-            data_pool: SharedPool::new(data_capacity, local.max_frame_size as usize),
-            header_pool: SharedPool::new(header_capacity, header_list_cap),
-            recv_header_block: Vec::with_capacity(header_list_cap),
-            decoder,
             streams: StreamRegistry::new(stream_capacity),
-            pending_headers: None,
-            pending_headers_cap: header_list_cap,
             conn_pending_release: 0,
             peer_reset_count: 0,
             send_window_opened: false,
@@ -478,11 +456,7 @@ impl<R: Role> Conn<R> {
             {
                 unreachable!();
             }
-            conn.preface_done = true;
-            conn.events
-                .vacant_entry()
-                .unwrap()
-                .push_back(Event::PrefaceComplete);
+            conn.ingress.complete_preface();
         }
         conn.emit_initial_settings();
         conn.initial_settings_sent = true;
@@ -537,35 +511,15 @@ impl<R: Role> Conn<R> {
     }
 
     pub fn poll_event(&mut self) -> Option<Event> {
-        self.events.pop_front()
+        self.ingress.poll_event()
     }
 
     fn push_event(&mut self, event: Event) -> Result<(), ConnError> {
-        self.events
-            .push_back(event)
-            .map_err(|_| ConnError::Overload)
+        self.ingress.push_event(event)
     }
 
     fn ensure_event_capacity(&self) -> Result<(), ConnError> {
-        if self.events.is_full() {
-            Err(ConnError::Overload)
-        } else {
-            Ok(())
-        }
-    }
-
-    fn inbound_len(&self) -> usize {
-        self.inbound.len()
-    }
-
-    fn consume_inbound(&mut self, n: usize) {
-        self.inbound.consume(n);
-    }
-
-    fn prepare_inbound(&mut self, additional: usize) -> Result<(), ConnError> {
-        (additional <= self.inbound.remaining())
-            .then_some(())
-            .ok_or(ConnError::Overload)
+        self.ingress.ensure_event_capacity()
     }
 
     fn prepare_outbound(&mut self, additional: usize) -> Result<(), ConnError> {
@@ -712,10 +666,7 @@ impl<R: Role> Conn<R> {
     }
 
     pub fn ingest(&mut self, bytes: &[u8]) -> Result<(), ConnError> {
-        self.prepare_inbound(bytes.len())?;
-        self.inbound
-            .try_extend_from_slice(bytes)
-            .map_err(|_| ConnError::Overload)?;
+        self.ingress.append(bytes)?;
         self.resume()
     }
 
@@ -848,91 +799,24 @@ impl<R: Role> Conn<R> {
         self.streams.remove(id);
     }
 
-    fn decode_block(&mut self, block: &[u8]) -> Result<(hpack::HeaderBlock, bool), ConnError> {
-        let mut lease = self.header_pool.try_acquire().ok_or(ConnError::Overload)?;
-        let mut overflow = false;
-        let over_limit = self.decoder.decode_bounded(block, |n, v| {
-            if overflow {
-                return;
-            }
-            let Ok(name_len) = u32::try_from(n.len()) else {
-                overflow = true;
-                return;
-            };
-            let Ok(value_len) = u32::try_from(v.len()) else {
-                overflow = true;
-                return;
-            };
-            let mut writer = lease.spare_writer();
-            overflow = writer
-                .try_extend_from_slice(&name_len.to_ne_bytes())
-                .and_then(|()| writer.try_extend_from_slice(&value_len.to_ne_bytes()))
-                .and_then(|()| writer.try_extend_from_slice(n))
-                .and_then(|()| writer.try_extend_from_slice(v))
-                .is_err();
-        })?;
-        if overflow {
-            return Err(ConnError::Overload);
-        }
-        Ok((hpack::HeaderBlock::from_pooled(lease.freeze()), over_limit))
-    }
-
     fn decode_recv_block(&mut self) -> Result<(hpack::HeaderBlock, bool), ConnError> {
-        let mut block = core::mem::take(&mut self.recv_header_block);
-        let decoded = self.decode_block(&block);
-        block.clear();
-        self.recv_header_block = block;
-        decoded
+        self.ingress.decode_headers()
     }
 
     fn drive(&mut self) -> Result<(), ConnError> {
-        if !R::PREFACE_SENDS_FIRST && !self.preface_done {
-            if self.inbound_len() < CLIENT_PREFACE.len() {
-                return Ok(());
-            }
-            let (first, second) = self
-                .inbound
-                .range_slices(0, CLIENT_PREFACE.len())
-                .ok_or(ConnError::BadPreface)?;
-            if first != &CLIENT_PREFACE[..first.len()] || second != &CLIENT_PREFACE[first.len()..] {
-                return Err(ConnError::BadPreface);
-            }
-            self.ensure_event_capacity()?;
-            self.consume_inbound(CLIENT_PREFACE.len());
-            self.preface_done = true;
-            self.push_event(Event::PrefaceComplete)?;
+        if !self.ingress.accept_preface()? {
+            return Ok(());
         }
 
         loop {
-            let header = match self.parse_frame_header() {
-                Ok(header) => header,
-                Err(ParseError::NeedMore) => return Ok(()),
-                Err(ParseError::BadType(_)) => {
-                    let mut prefix = [0; 3];
-                    if !self.inbound.copy_range_into(0, &mut prefix) {
-                        return Ok(());
-                    }
-                    let length = u32::from_be_bytes([0, prefix[0], prefix[1], prefix[2]]);
-                    if length > self.local_settings.max_frame_size {
-                        return Err(ConnError::FrameSize);
-                    }
-                    let total = HEADER_LEN + length as usize;
-                    if self.inbound_len() < total {
-                        return Ok(());
-                    }
-                    self.consume_inbound(total);
-                    continue;
-                }
-                Err(error) => return Err(error.into()),
-            };
-            if header.length > self.local_settings.max_frame_size {
-                return Err(ConnError::FrameSize);
-            }
-            let total = HEADER_LEN + header.length as usize;
-            if self.inbound_len() < total {
+            let Some(header) = self
+                .ingress
+                .next_frame(self.local_settings.max_frame_size)?
+            else {
                 return Ok(());
-            }
-            if self.pending_headers.is_some() && header.kind != frame::Type::Continuation {
+            };
+            let total = HEADER_LEN + header.length as usize;
+            if self.ingress.has_pending_headers() && header.kind != frame::Type::Continuation {
                 return Err(ConnError::Continuation);
             }
             let emits_event = match header.kind {
@@ -969,9 +853,7 @@ impl<R: Role> Conn<R> {
                         let mut offset = 0;
                         while offset < header.length as usize {
                             let mut chunk = [0; 6];
-                            let copied = self
-                                .inbound
-                                .copy_range_into(HEADER_LEN + offset, &mut chunk);
+                            let copied = self.ingress.copy(HEADER_LEN + offset, &mut chunk);
                             debug_assert!(copied);
                             let id_raw = u16::from_be_bytes([chunk[0], chunk[1]]);
                             let val = u32::from_be_bytes([chunk[2], chunk[3], chunk[4], chunk[5]]);
@@ -998,7 +880,7 @@ impl<R: Role> Conn<R> {
                         if let Some(max_size) = encoder_size {
                             self.egress.set_header_table_size(max_size);
                         }
-                        self.consume_inbound(total);
+                        self.ingress.consume(total);
                         self.emit_settings_ack()?;
                         self.push_event(Event::SettingsApplied)?;
                         if delta > 0 {
@@ -1012,7 +894,7 @@ impl<R: Role> Conn<R> {
                     if header.length != payload.len() as u32 {
                         return Err(ParseError::FrameSize.into());
                     }
-                    let copied = self.inbound.copy_range_into(HEADER_LEN, &mut payload);
+                    let copied = self.ingress.copy(HEADER_LEN, &mut payload);
                     debug_assert!(copied);
                     let parsed = Ping::parse(header, &payload)?;
                     if !parsed.ack {
@@ -1021,7 +903,7 @@ impl<R: Role> Conn<R> {
                             opaque: parsed.opaque,
                         };
                         self.prepare_outbound(HEADER_LEN + 8)?;
-                        self.consume_inbound(total);
+                        self.ingress.consume(total);
                         pong.encode(self.egress.raw_mut());
                         self.push_event(Event::Ping {
                             ack: false,
@@ -1039,28 +921,16 @@ impl<R: Role> Conn<R> {
                         return Err(ParseError::FrameSize.into());
                     }
                     let mut prefix = [0; 8];
-                    let copied = self.inbound.copy_range_into(HEADER_LEN, &mut prefix);
+                    let copied = self.ingress.copy(HEADER_LEN, &mut prefix);
                     debug_assert!(copied);
                     let parsed = GoAway::parse(header, &prefix)?;
                     let debug_len = header.length as usize - prefix.len();
-                    let mut lease = self.data_pool.try_acquire().ok_or(ConnError::Overload)?;
-                    let (first, second) = self
-                        .inbound
-                        .range_slices(HEADER_LEN + prefix.len(), debug_len)
-                        .ok_or(ConnError::FrameSize)?;
-                    let mut writer = lease.spare_writer();
-                    writer
-                        .try_extend_from_slice(first)
-                        .map_err(|_| ConnError::Overload)?;
-                    writer
-                        .try_extend_from_slice(second)
-                        .map_err(|_| ConnError::Overload)?;
-                    drop(writer);
+                    let debug = self.ingress.data(HEADER_LEN + prefix.len(), debug_len)?;
                     self.goaway_received = Some(parsed.error);
                     self.push_event(Event::GoAway {
                         last_stream_id: parsed.last_stream_id,
                         error: parsed.error,
-                        debug: DataPayload(lease.freeze()),
+                        debug: DataPayload(debug),
                     })?;
                 }
                 frame::Type::WindowUpdate => {
@@ -1068,10 +938,10 @@ impl<R: Role> Conn<R> {
                     if header.length != payload.len() as u32 {
                         return Err(ParseError::FrameSize.into());
                     }
-                    let copied = self.inbound.copy_range_into(HEADER_LEN, &mut payload);
+                    let copied = self.ingress.copy(HEADER_LEN, &mut payload);
                     debug_assert!(copied);
                     let parsed = WindowUpdate::parse(header, &payload)?;
-                    self.consume_inbound(total);
+                    self.ingress.consume(total);
                     self.handle_window_update_frame(parsed)?;
                     continue;
                 }
@@ -1080,27 +950,27 @@ impl<R: Role> Conn<R> {
                         return Err(ParseError::Protocol.into());
                     }
                     self.prepare_outbound(HEADER_LEN + 4)?;
-                    self.recv_header_block.clear();
-                    let (mut start, mut len) = self.unpadded_payload(header)?;
+                    self.ingress.clear_headers();
+                    let (mut start, mut len) = self.ingress.unpadded_payload(header)?;
                     if header.flags.has(Flags::PRIORITY) {
                         if len < 5 {
                             return Err(ParseError::FrameSize.into());
                         }
                         let mut priority = [0; 5];
-                        let copied = self.inbound.copy_range_into(start, &mut priority);
+                        let copied = self.ingress.copy(start, &mut priority);
                         debug_assert!(copied);
                         let _ = frame::PriorityFields::parse(&priority)?;
                         start += priority.len();
                         len -= priority.len();
                     }
-                    if len > self.pending_headers_cap {
+                    if len > self.ingress.header_remaining() {
                         return Err(ConnError::HeaderListTooLarge);
                     }
-                    self.extend_recv_header_block(start, len)?;
+                    self.ingress.extend_headers(start, len)?;
                     let sid = header.stream_id;
                     let end_stream = header.flags.has(Flags::END_STREAM);
                     let end_headers = header.flags.has(Flags::END_HEADERS);
-                    self.consume_inbound(total);
+                    self.ingress.consume(total);
                     self.handle_headers_frame(sid, end_stream, end_headers)?;
                     continue;
                 }
@@ -1109,24 +979,12 @@ impl<R: Role> Conn<R> {
                         return Err(ParseError::Protocol.into());
                     }
                     self.prepare_outbound(2 * (HEADER_LEN + 4))?;
-                    let (start, len) = self.unpadded_payload(header)?;
-                    let mut lease = self.data_pool.try_acquire().ok_or(ConnError::Overload)?;
-                    let (first, second) = self
-                        .inbound
-                        .range_slices(start, len)
-                        .ok_or(ConnError::FrameSize)?;
-                    let mut writer = lease.spare_writer();
-                    writer
-                        .try_extend_from_slice(first)
-                        .map_err(|_| ConnError::Overload)?;
-                    writer
-                        .try_extend_from_slice(second)
-                        .map_err(|_| ConnError::Overload)?;
-                    drop(writer);
+                    let (start, len) = self.ingress.unpadded_payload(header)?;
+                    let data = self.ingress.data(start, len)?;
                     let stream_id = header.stream_id;
                     let end_stream = header.flags.has(Flags::END_STREAM);
-                    let payload = DataPayload(lease.freeze());
-                    self.consume_inbound(total);
+                    let payload = DataPayload(data);
+                    self.ingress.consume(total);
                     self.handle_data_frame(stream_id, end_stream, payload)?;
                     continue;
                 }
@@ -1136,17 +994,13 @@ impl<R: Role> Conn<R> {
                     }
                     self.prepare_outbound(HEADER_LEN + 4)?;
                     let len = header.length as usize;
-                    if len
-                        > self
-                            .pending_headers_cap
-                            .saturating_sub(self.recv_header_block.len())
-                    {
+                    if len > self.ingress.header_remaining() {
                         return Err(ConnError::HeaderListTooLarge);
                     }
-                    self.extend_recv_header_block(HEADER_LEN, len)?;
+                    self.ingress.extend_headers(HEADER_LEN, len)?;
                     let stream_id = header.stream_id;
                     let end_headers = header.flags.has(Flags::END_HEADERS);
-                    self.consume_inbound(total);
+                    self.ingress.consume(total);
                     self.handle_continuation_frame(stream_id, end_headers, len)?;
                     continue;
                 }
@@ -1155,10 +1009,10 @@ impl<R: Role> Conn<R> {
                     if header.length != payload.len() as u32 {
                         return Err(ParseError::FrameSize.into());
                     }
-                    let copied = self.inbound.copy_range_into(HEADER_LEN, &mut payload);
+                    let copied = self.ingress.copy(HEADER_LEN, &mut payload);
                     debug_assert!(copied);
                     let parsed = RstStream::parse(header, &payload)?;
-                    self.consume_inbound(total);
+                    self.ingress.consume(total);
                     self.handle_rst_frame(parsed)?;
                     continue;
                 }
@@ -1167,24 +1021,24 @@ impl<R: Role> Conn<R> {
                         return Err(ParseError::Protocol.into());
                     }
                     self.prepare_outbound(HEADER_LEN + 4)?;
-                    self.recv_header_block.clear();
-                    let (start, len) = self.unpadded_payload(header)?;
+                    self.ingress.clear_headers();
+                    let (start, len) = self.ingress.unpadded_payload(header)?;
                     if len < 4 {
                         return Err(ParseError::FrameSize.into());
                     }
                     let mut promised = [0; 4];
-                    let copied = self.inbound.copy_range_into(start, &mut promised);
+                    let copied = self.ingress.copy(start, &mut promised);
                     debug_assert!(copied);
                     let promised = StreamId::from_u32_masked(u32::from_be_bytes(promised));
                     let block_start = start + 4;
                     let block_len = len - 4;
-                    if block_len > self.pending_headers_cap {
+                    if block_len > self.ingress.header_remaining() {
                         return Err(ConnError::HeaderListTooLarge);
                     }
-                    self.extend_recv_header_block(block_start, block_len)?;
+                    self.ingress.extend_headers(block_start, block_len)?;
                     let stream_id = header.stream_id;
                     let end_headers = header.flags.has(Flags::END_HEADERS);
-                    self.consume_inbound(total);
+                    self.ingress.consume(total);
                     self.handle_push_promise_frame(stream_id, promised, end_headers)?;
                     continue;
                 }
@@ -1193,57 +1047,13 @@ impl<R: Role> Conn<R> {
                     if header.length != payload.len() as u32 {
                         return Err(ParseError::FrameSize.into());
                     }
-                    let copied = self.inbound.copy_range_into(HEADER_LEN, &mut payload);
+                    let copied = self.ingress.copy(HEADER_LEN, &mut payload);
                     debug_assert!(copied);
                     let _ = Priority::parse(header, &payload)?;
                 }
             }
-            self.consume_inbound(total);
+            self.ingress.consume(total);
         }
-    }
-
-    fn parse_frame_header(&self) -> Result<FrameHeader, ParseError> {
-        let Some((first, second)) = self.inbound.range_slices(0, HEADER_LEN) else {
-            return Err(ParseError::NeedMore);
-        };
-        if second.is_empty() {
-            return FrameHeader::parse(first);
-        }
-        let mut bytes = [0; HEADER_LEN];
-        bytes[..first.len()].copy_from_slice(first);
-        bytes[first.len()..].copy_from_slice(second);
-        FrameHeader::parse(&bytes)
-    }
-
-    fn unpadded_payload(&self, header: FrameHeader) -> Result<(usize, usize), ParseError> {
-        let mut start = HEADER_LEN;
-        let mut len = header.length as usize;
-        if !header.flags.has(Flags::PADDED) {
-            return Ok((start, len));
-        }
-        if len == 0 {
-            return Err(ParseError::Padding);
-        }
-        let mut byte = [0; 1];
-        let copied = self.inbound.copy_range_into(start, &mut byte);
-        debug_assert!(copied);
-        let padding = byte[0] as usize;
-        if padding + 1 > len {
-            return Err(ParseError::Padding);
-        }
-        start += 1;
-        len -= padding + 1;
-        Ok((start, len))
-    }
-
-    fn extend_recv_header_block(&mut self, start: usize, len: usize) -> Result<(), ConnError> {
-        let (first, second) = self
-            .inbound
-            .range_slices(start, len)
-            .ok_or(ConnError::FrameSize)?;
-        self.recv_header_block.extend_from_slice(first);
-        self.recv_header_block.extend_from_slice(second);
-        Ok(())
     }
 
     fn handle_headers_frame(
@@ -1323,7 +1133,7 @@ impl<R: Role> Conn<R> {
                 trailing,
             })?;
         } else {
-            self.pending_headers = Some(PendingHeaders {
+            self.ingress.start_headers(PendingHeaders {
                 stream_id,
                 kind: PendingKind::Headers {
                     end_stream,
@@ -1452,8 +1262,8 @@ impl<R: Role> Conn<R> {
         fragment_len: usize,
     ) -> Result<(), ConnError> {
         let pending = self
-            .pending_headers
-            .as_mut()
+            .ingress
+            .pending_headers_mut()
             .ok_or(ConnError::Continuation)?;
         if pending.stream_id != stream_id {
             return Err(ConnError::Continuation);
@@ -1466,7 +1276,7 @@ impl<R: Role> Conn<R> {
             return Err(ConnError::Overload);
         }
         if end_headers {
-            let pending = self.pending_headers.take().unwrap();
+            let pending = self.ingress.take_pending_headers().unwrap();
             let (headers, over_limit) = self.decode_recv_block()?;
             match pending.kind {
                 PendingKind::Headers {
@@ -1571,7 +1381,7 @@ impl<R: Role> Conn<R> {
                 headers,
             })?;
         } else {
-            self.pending_headers = Some(PendingHeaders {
+            self.ingress.start_headers(PendingHeaders {
                 stream_id,
                 kind: PendingKind::PushPromise { promised },
                 continuations: 0,

@@ -1,6 +1,5 @@
 use o3::buffer::{Borrowed, Bytes, Owned, Retained, Shared};
 
-use super::super::{HotTextInner, TextItemInner};
 use super::headers::HeaderNameToken;
 
 #[derive(Clone)]
@@ -94,21 +93,19 @@ impl<'req> HeaderValueInner<'req> {
 }
 
 #[derive(Clone, Debug)]
-pub struct HeaderItemInner<'req> {
+pub struct HeaderItem<'req> {
     pub(super) name: HeaderNameToken,
     pub(super) value: HeaderValueInner<'req>,
 }
 
-pub type HeaderItem = HeaderItemInner<'static>;
-
-impl<'req> HeaderItemInner<'req> {
+impl<'req> HeaderItem<'req> {
     pub fn from_value<V>(name: HeaderNameToken, value: V) -> Self
     where
-        V: IntoHeaderValue<'req>,
+        V: Into<HeaderValueInner<'req>>,
     {
         Self {
             name,
-            value: value.into_header_value(),
+            value: value.into(),
         }
     }
 
@@ -132,70 +129,44 @@ impl<'req> HeaderItemInner<'req> {
     }
 }
 
-pub trait IntoHeaderValue<'req> {
-    fn into_header_value(self) -> HeaderValueInner<'req>;
-}
-
-impl<'req> IntoHeaderValue<'req> for HeaderValueInner<'req> {
-    fn into_header_value(self) -> Self {
-        self
+impl<'req> From<InlineHeaderValue> for HeaderValueInner<'req> {
+    fn from(value: InlineHeaderValue) -> Self {
+        Self::Inline(value)
     }
 }
 
-impl<'req> IntoHeaderValue<'req> for InlineHeaderValue {
-    fn into_header_value(self) -> HeaderValueInner<'req> {
-        HeaderValueInner::Inline(self)
+impl<'req> From<Bytes<Borrowed<'req>>> for HeaderValueInner<'req> {
+    fn from(value: Bytes<Borrowed<'req>>) -> Self {
+        Self::Borrowed(value)
     }
 }
 
-impl<'req> IntoHeaderValue<'req> for Bytes<Borrowed<'req>> {
-    fn into_header_value(self) -> HeaderValueInner<'req> {
-        HeaderValueInner::Borrowed(self)
+impl<'req> From<Bytes<Retained>> for HeaderValueInner<'req> {
+    fn from(value: Bytes<Retained>) -> Self {
+        Self::Retained(value)
     }
 }
 
-impl<'req> IntoHeaderValue<'req> for Bytes<Retained> {
-    fn into_header_value(self) -> HeaderValueInner<'req> {
-        HeaderValueInner::Retained(self)
+impl<'req> From<Shared> for HeaderValueInner<'req> {
+    fn from(value: Shared) -> Self {
+        Self::Shared(value)
     }
 }
 
-impl<'req> IntoHeaderValue<'req> for Shared {
-    fn into_header_value(self) -> HeaderValueInner<'req> {
-        HeaderValueInner::Shared(self)
+impl<'req> From<Owned> for HeaderValueInner<'req> {
+    fn from(value: Owned) -> Self {
+        Self::Shared(value.freeze())
     }
 }
 
-impl<'req> IntoHeaderValue<'req> for Owned {
-    fn into_header_value(self) -> HeaderValueInner<'req> {
-        HeaderValueInner::Shared(self.freeze())
+impl<'req> From<String> for HeaderValueInner<'req> {
+    fn from(value: String) -> Self {
+        Self::Shared(Shared::from(value.into_bytes()))
     }
 }
 
-impl<'req> IntoHeaderValue<'req> for String {
-    fn into_header_value(self) -> HeaderValueInner<'req> {
-        HeaderValueInner::Shared(Shared::from(self.into_bytes()))
-    }
-}
-
-impl<'req> IntoHeaderValue<'req> for &'static str {
-    fn into_header_value(self) -> HeaderValueInner<'req> {
-        HeaderValueInner::Static(self.as_bytes())
-    }
-}
-
-pub trait TextSpec<'req> {
-    fn into_hot_text(self) -> HotTextInner<'req>;
-}
-
-impl<'req, const N: usize> TextSpec<'req> for [TextItemInner<'req>; N] {
-    fn into_hot_text(self) -> HotTextInner<'req> {
-        HotTextInner::from_items(self)
-    }
-}
-
-impl<'req> TextSpec<'req> for HotTextInner<'req> {
-    fn into_hot_text(self) -> Self {
-        self
+impl<'req> From<&'static str> for HeaderValueInner<'req> {
+    fn from(value: &'static str) -> Self {
+        Self::Static(value.as_bytes())
     }
 }

@@ -20,12 +20,8 @@ impl TaskSpec<'_> {
         let route = self.route;
         let future = &self.future;
         quote! {
-            ::sark::fiber::RequestDomain<
-                <<#route as ::sark::service::RouteSpec>::Kind
-                    as ::sark::service::manifold::Kind<'d, #route, #future>>::Task,
-                <<#route as ::sark::service::RouteSpec>::Kind
-                    as ::sark::service::manifold::Kind<'d, #route, #future>>::Owner,
-            >
+            <<#route as ::sark::service::RouteSpec>::Kind
+                as ::sark::service::manifold::Kind<'d, #route, #future>>::Task
         }
     }
 }
@@ -238,7 +234,7 @@ impl<'a> ServeEmit<'a> {
 
                 fn known(
                     &mut self,
-                    _key: ::sark::http::head::Known,
+                    _key: ::sark::http::head::KnownHeader,
                     _value: &[u8],
                 ) -> ::sark::error::Result<()> {
                     Ok(())
@@ -302,7 +298,12 @@ impl<'a> ServeEmit<'a> {
                 quote! {
                     <#route as ::sark::service::RouteSpec>::Kind:
                         ::sark::service::manifold::InvokeKind<#route>
-                        + ::sark::service::manifold::Kind<'d, #route, #future>
+                        + ::sark::service::manifold::Kind<
+                            'd,
+                            #route,
+                            #future,
+                            Owner = (),
+                        >
                 }
             })
             .collect();
@@ -496,7 +497,7 @@ impl<'a> ServeEmit<'a> {
                     + ::sark::timer::TimerHost<'d>
                     + ::sark::dispatch::H1Project<'d, __W>
                     + ::sark::dispatch::Decode
-                    + ::sark::dispatch::Routing
+                    + ::sark::dispatch::Routing<'d>
                     + 'd
                 where
                     #( #route_bounds )*
@@ -615,7 +616,12 @@ impl<'a> ServeEmit<'a> {
                         ) -> #future,
                     <#route as ::sark::service::RouteSpec>::Kind:
                         ::sark::service::manifold::InvokeKind<#route>
-                        + ::sark::service::manifold::Kind<'d, #route, #future>
+                        + ::sark::service::manifold::Kind<
+                            'd,
+                            #route,
+                            #future,
+                            Owner = (),
+                        >
                         + ::sark::dispatch::Dispatch<'d, #route, #state_ty, #future>
                         + ::sark::dispatch::Complete<'d, #route, #future>
                         + ::sark::dispatch::DecodeRoute<#route, #state_ty>,
@@ -661,22 +667,21 @@ impl<'a> ServeEmit<'a> {
                     syn::Index::from(route_cache_slots[index].expect("sync route cache slot"));
                 return quote! {
                     #setup
-                    return ::sark::dispatch::Pipeline::route_manifold::<#route, #state_ty>(
+                    return ::sark::dispatch::SyncRoute::new(
+                        &ctx,
+                        date,
+                        ::sark::dispatch::response_cache::Cache::new(
+                            &this.response_cache[#cache_index],
+                        ),
+                        &mut this.gzip,
+                        write,
+                    ).dispatch::<#route, #state_ty>(
                         permit,
                         ::sark::dispatch::Matched {
                             route,
                             raw_params: #raw_params,
                         },
                         state,
-                        &ctx,
-                        (
-                            date,
-                            ::sark::dispatch::response_cache::Cache::new(
-                                &this.response_cache[#cache_index],
-                            ),
-                            &mut this.gzip,
-                            write,
-                        ),
                     );
                 };
             };
@@ -702,8 +707,9 @@ impl<'a> ServeEmit<'a> {
                         #state_ty,
                         #future,
                     >>::dispatch::<#task_type, #task_tag, _, _, { #capacity }>(
-                    permit,
-                    ::sark::dispatch::Matched {
+                        permit,
+                        scope,
+                        ::sark::dispatch::Matched {
                         route,
                         raw_params: #raw_params,
                     },
@@ -719,7 +725,7 @@ impl<'a> ServeEmit<'a> {
                     &mut this.gzip,
                     write,
                     producer,
-                    ::sark::fiber::RequestDomain::new,
+                    |task, ()| task,
                 );
                 if conn.async_state.task.is_some() {
                     conn.async_state.task_route = #task_route;
@@ -888,7 +894,8 @@ impl<'a> ServeEmit<'a> {
                 let task_route = task.slot as u16;
                 quote! {
                     #task_route => {
-                        let written = ::sark::dispatch::Pipeline::task_poll_proj(
+                        let task_runner = ::sark::dispatch::TaskRunner::new(&task_date);
+                        let written = task_runner.poll(
                             unsafe {
                                 ::core::pin::Pin::new_unchecked(&mut this.tasks.#task_index)
                             },
@@ -896,7 +903,6 @@ impl<'a> ServeEmit<'a> {
                             aux,
                             driver,
                             &project,
-                            &task_date,
                             |output, task_slot, task_aux, task_driver, task_date, close| {
                                 <<#route as ::sark::service::RouteSpec>::Kind
                                     as ::sark::dispatch::Complete<
@@ -914,8 +920,7 @@ impl<'a> ServeEmit<'a> {
                             },
                         );
                         if written > 0 {
-                            let buffer =
-                                ::sark::dispatch::Pipeline::reborrow_write_buf(slot, aux);
+                            let buffer = task_runner.write_buf(slot, aux);
                             let token = slot.token();
                             ::dope::manifold::listener::SlotEgress::submit_buffered(
                                 slot,
@@ -943,8 +948,9 @@ impl<'a> ServeEmit<'a> {
         let send_body = if tasks.is_empty() {
             quote! {
                 let mut host = ::sark::dispatch::H1Host::new(self, date);
-                ::sark::dispatch::Pipeline::send_complete_proj(
+                ::sark::dispatch::H1Driver::new(
                     ::core::pin::Pin::new(&mut host),
+                ).send_complete_proj(
                     sent,
                     slot,
                     aux,
@@ -966,8 +972,9 @@ impl<'a> ServeEmit<'a> {
                     }
                 }
                 let mut host = ::sark::dispatch::H1Host::new(self, date);
-                ::sark::dispatch::Pipeline::send_complete_proj(
+                ::sark::dispatch::H1Driver::new(
                     ::core::pin::Pin::new(&mut host),
+                ).send_complete_proj(
                     sent,
                     slot,
                     aux,
@@ -979,8 +986,7 @@ impl<'a> ServeEmit<'a> {
         let wake_body = if tasks.is_empty() {
             quote! {
                 let this = unsafe { self.as_mut().get_unchecked_mut() };
-                let _ = ::sark::dispatch::Pipeline::poll_head_deadline_proj(
-                    this,
+                let _ = ::sark::dispatch::HeadDeadline::new(this).poll_proj(
                     slot,
                     aux,
                     driver,
@@ -990,8 +996,7 @@ impl<'a> ServeEmit<'a> {
         } else {
             quote! {
                 let this = unsafe { self.as_mut().get_unchecked_mut() };
-                if ::sark::dispatch::Pipeline::poll_head_deadline_proj(
-                    this,
+                if ::sark::dispatch::HeadDeadline::new(this).poll_proj(
                     slot,
                     aux,
                     driver,
@@ -1031,8 +1036,7 @@ impl<'a> ServeEmit<'a> {
         let close_body = if tasks.is_empty() {
             quote! {
                 let this = unsafe { self.get_unchecked_mut() };
-                ::sark::dispatch::Pipeline::cancel_head_deadline_proj(
-                    this,
+                ::sark::dispatch::HeadDeadline::new(this).cancel_proj(
                     slot,
                     &project,
                 );
@@ -1040,8 +1044,7 @@ impl<'a> ServeEmit<'a> {
         } else {
             quote! {
                 let this = unsafe { self.get_unchecked_mut() };
-                ::sark::dispatch::Pipeline::cancel_head_deadline_proj(
-                    this,
+                ::sark::dispatch::HeadDeadline::new(this).cancel_proj(
                     slot,
                     &project,
                 );
@@ -1091,8 +1094,9 @@ impl<'a> ServeEmit<'a> {
                     #projection_bounds
                 {
                     let mut host = ::sark::dispatch::H1Host::new(self, date);
-                    ::sark::dispatch::Pipeline::run_proj(
+                    ::sark::dispatch::H1Driver::new(
                         ::core::pin::Pin::new(&mut host),
+                    ).run_proj(
                         bytes,
                         slot,
                         aux,
@@ -1235,6 +1239,7 @@ impl<'a> ServeEmit<'a> {
                 #[allow(clippy::too_many_arguments)]
                 fn dispatch_request<'buf>(
                     self: ::core::pin::Pin<&mut Self>,
+                    scope: ::sark::fiber::FiberScope<'d>,
                     permit: ::sark::dispatch::conn_state::DispatchPermit,
                     state: &'d #state_ty,
                     req_bytes: &'buf [u8],
@@ -1297,6 +1302,7 @@ impl<'a> ServeEmit<'a> {
                 fn try_consume(
                     self: ::core::pin::Pin<&mut Self>,
                     stamp: &::sark::date::Stamp,
+                    scope: ::sark::fiber::FiberScope<'d>,
                     permit: ::sark::dispatch::conn_state::DispatchPermit,
                     bytes: &[u8],
                     write: &mut [u8],
@@ -1316,6 +1322,7 @@ impl<'a> ServeEmit<'a> {
                     };
                     #core_ident::dispatch_request(
                         self,
+                        scope,
                         permit,
                         state,
                         bytes,
@@ -1328,13 +1335,14 @@ impl<'a> ServeEmit<'a> {
                 }
             }
 
-            impl #generic_def ::sark::dispatch::Routing for #name #generic_use
+            impl #generic_def ::sark::dispatch::Routing<'d> for #name #generic_use
             where
                 #( #route_bounds )*
                 #( #maker_bounds )*
             {
                 fn try_consume(
                     self: ::core::pin::Pin<&mut Self>,
+                    scope: ::sark::fiber::FiberScope<'d>,
                     permit: ::sark::dispatch::conn_state::DispatchPermit,
                     bytes: &[u8],
                     write: &mut [u8],
@@ -1347,6 +1355,7 @@ impl<'a> ServeEmit<'a> {
                     );
                     ::sark::dispatch::Routing::try_consume(
                         ::core::pin::Pin::new(&mut host),
+                        scope,
                         permit,
                         bytes,
                         write,

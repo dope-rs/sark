@@ -1,6 +1,6 @@
 use sark_grpc::frame::MessageFrame;
 use sark_grpc::headers::RequestHead;
-use sark_grpc::server::{Handler, Limits, Request, Response, Routes, dispatch_buffered};
+use sark_grpc::server::{Handler, Limits, Request, Response, Routes};
 use sark_grpc::status::Code;
 
 struct Echo;
@@ -33,7 +33,7 @@ fn framed(count: usize, size: usize, compressed: bool) -> Vec<u8> {
 #[test]
 fn drives_handler_and_reframes_to_original_wire() {
     let body = framed(2, 4, false);
-    let response = dispatch_buffered(&mut Echo, head(b"/svc"), &body, &Limits::default());
+    let response = Limits::default().dispatch_buffered(&mut Echo, head(b"/svc"), &body);
     assert_eq!(response.status.code(), Code::Ok);
     assert_eq!(response.messages.len(), 2);
     let mut wire = Vec::new();
@@ -50,25 +50,21 @@ fn over_long_message_is_rejected() {
         max_message_len: 2,
         ..Limits::default()
     };
-    let response = dispatch_buffered(&mut Echo, head(b"/svc"), &framed(1, 8, false), &config);
+    let response = config.dispatch_buffered(&mut Echo, head(b"/svc"), &framed(1, 8, false));
     assert_ne!(response.status.code(), Code::Ok);
     assert!(response.messages.is_empty());
 }
 
 #[test]
 fn compressed_message_is_unimplemented() {
-    let response = dispatch_buffered(
-        &mut Echo,
-        head(b"/svc"),
-        &framed(1, 4, true),
-        &Limits::default(),
-    );
+    let response =
+        Limits::default().dispatch_buffered(&mut Echo, head(b"/svc"), &framed(1, 4, true));
     assert_eq!(response.status.code(), Code::Unimplemented);
 }
 
 #[test]
 fn unknown_method_is_unimplemented() {
     let mut routes: Routes<Echo> = Routes::new();
-    let response = dispatch_buffered(&mut routes, head(b"/missing"), &[], &Limits::default());
+    let response = Limits::default().dispatch_buffered(&mut routes, head(b"/missing"), &[]);
     assert_eq!(response.status.code(), Code::Unimplemented);
 }

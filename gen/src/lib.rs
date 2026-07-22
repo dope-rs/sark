@@ -32,12 +32,13 @@ use proc_macro::TokenStream;
 use syn::{Item, ItemStruct, parse_macro_input};
 
 mod app;
-mod attr;
+mod body_input;
 mod codegen;
-mod fixed;
+mod define_route_input;
+mod handler;
 mod json;
+mod lifetimes;
 mod model;
-mod parse;
 mod request;
 mod response;
 mod route_compiler;
@@ -45,15 +46,21 @@ mod util;
 
 #[proc_macro]
 pub fn body(input: TokenStream) -> TokenStream {
-    fixed::TextInput::body(input)
+    let input = parse_macro_input!(input as body_input::BodyInput);
+    input.expand().into()
+}
+
+fn emit(result: syn::Result<proc_macro2::TokenStream>) -> TokenStream {
+    match result {
+        Ok(tokens) => tokens.into(),
+        Err(error) => error.into_compile_error().into(),
+    }
 }
 
 #[proc_macro]
 pub fn define_route(input: TokenStream) -> TokenStream {
-    let input = parse_macro_input!(input as model::DefineRouteInput);
-    app::define_route(input)
-        .unwrap_or_else(|err| err.to_compile_error())
-        .into()
+    let input = parse_macro_input!(input as define_route_input::DefineRouteInput);
+    emit(app::define_route(input))
 }
 
 #[proc_macro_attribute]
@@ -67,39 +74,32 @@ pub fn handler(attr_args: TokenStream, item: TokenStream) -> TokenStream {
         .into();
     }
     let item = parse_macro_input!(item as Item);
-    match item {
-        Item::Fn(fun) => attr::attr_fn(fun)
-            .unwrap_or_else(|err| err.to_compile_error())
-            .into(),
-        other => syn::Error::new_spanned(other, "#[sark_gen::handler] supports only fn")
-            .to_compile_error()
-            .into(),
-    }
+    emit(match item {
+        Item::Fn(fun) => handler::Handler::new(fun).and_then(handler::Handler::expand),
+        other => Err(syn::Error::new_spanned(
+            other,
+            "#[sark_gen::handler] supports only fn",
+        )),
+    })
 }
 
 #[proc_macro_attribute]
 pub fn json(attr: TokenStream, item: TokenStream) -> TokenStream {
     let st = parse_macro_input!(item as ItemStruct);
     let mode = parse_macro_input!(attr as json::JsonMode);
-    json::attr(mode, st)
-        .unwrap_or_else(|err| err.to_compile_error())
-        .into()
+    emit(mode.expand(st))
 }
 
 #[proc_macro_attribute]
 pub fn request(attr: TokenStream, item: TokenStream) -> TokenStream {
     let mode = parse_macro_input!(attr as request::Mode);
     let st = parse_macro_input!(item as ItemStruct);
-    mode.expand(st)
-        .unwrap_or_else(|err| err.to_compile_error())
-        .into()
+    emit(mode.expand(st))
 }
 
 #[proc_macro_attribute]
 pub fn response(attr: TokenStream, item: TokenStream) -> TokenStream {
     let mode = parse_macro_input!(attr as response::Mode);
     let st = parse_macro_input!(item as ItemStruct);
-    mode.expand(st)
-        .unwrap_or_else(|err| err.to_compile_error())
-        .into()
+    emit(mode.expand(st))
 }

@@ -1,4 +1,7 @@
-use dope::manifold::listener::recv;
+use dope::DriverContext;
+use dope::manifold::listener::{self, SlotEgress, recv};
+use dope_net::link;
+use dope_net::wire::Wire;
 
 pub const RECV_HEAD_CAP: usize = 64 * 1024;
 pub const RECV_BODY_CAP: usize = 4 * 1024 * 1024;
@@ -48,6 +51,77 @@ pub enum Outcome {
     },
     Park,
     Close(&'static [u8]),
+}
+
+impl Outcome {
+    pub fn into_consume(
+        self,
+        permit: DispatchPermit,
+        consumption: Consumption,
+        conn_close: bool,
+    ) -> ConsumeOutcome {
+        match self {
+            response @ (Outcome::Send { .. }
+            | Outcome::SendStatic { .. }
+            | Outcome::SendSplit { .. }
+            | Outcome::SendPooled { .. }) => ConsumeOutcome::Complete {
+                permit,
+                consumption,
+                response,
+                conn_close,
+            },
+            Outcome::Park => match consumption {
+                Consumption::Buffered(consumed) => ConsumeOutcome::Park {
+                    consumed,
+                    close: conn_close,
+                },
+                Consumption::Discard { .. } => ConsumeOutcome::Close(crate::CANNED_500),
+            },
+            Outcome::Close(reason) => ConsumeOutcome::Close(reason),
+        }
+    }
+
+    pub fn apply<'d, W: Wire, C: Default + 'static>(
+        self,
+        slot: &mut link::slot::Slot<'d, W, listener::State<C>>,
+        aux: &mut listener::Aux,
+        driver: &mut DriverContext<'_, 'd>,
+    ) -> bool {
+        let close_after = match &self {
+            Outcome::Park => return true,
+            Outcome::Close(reason) => {
+                slot.set_close_after();
+                if !reason.is_empty() {
+                    let buf = aux.write_buf_for(slot);
+                    let user_data = slot.token();
+                    return slot.submit_split_static(buf, 0, reason, user_data, driver);
+                }
+                return true;
+            }
+            Outcome::Send { close_after, .. }
+            | Outcome::SendStatic { close_after, .. }
+            | Outcome::SendSplit { close_after, .. }
+            | Outcome::SendPooled { close_after, .. } => *close_after,
+        };
+        if close_after {
+            slot.set_close_after();
+        }
+        let buf = aux.write_buf_for(slot);
+        let user_data = slot.token();
+        match self {
+            Outcome::Send { written, .. } => slot.submit_buffered(buf, written, user_data, driver),
+            Outcome::SendStatic {
+                hdr_written, body, ..
+            } => slot.submit_split_static(buf, hdr_written, body, user_data, driver),
+            Outcome::SendSplit {
+                hdr_written, body, ..
+            } => slot.submit_split_shared(buf, hdr_written, body, user_data, driver),
+            Outcome::SendPooled {
+                hdr_written, body, ..
+            } => slot.submit_split_pooled(buf, hdr_written, body, user_data, driver),
+            Outcome::Park | Outcome::Close(_) => unreachable!(),
+        }
+    }
 }
 
 pub enum DeferredAction {

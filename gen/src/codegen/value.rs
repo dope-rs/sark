@@ -1,5 +1,7 @@
 #![allow(clippy::too_many_arguments)]
 
+use std::collections::BTreeMap;
+
 use proc_macro2::{Ident, Span, TokenStream};
 use quote::{format_ident, quote};
 use syn::{LitByteStr, LitStr, Result, Type};
@@ -7,24 +9,38 @@ use syn::{LitByteStr, LitStr, Result, Type};
 use super::header::BytesMatch;
 use crate::util::{TypeExt, ValueKind};
 
-pub(crate) struct Value;
+pub(crate) struct LengthArms {
+    groups: BTreeMap<usize, Vec<TokenStream>>,
+}
 
-impl Value {
-    pub(crate) fn group_arms_by_length(
-        items: impl IntoIterator<Item = (usize, TokenStream)>,
-    ) -> Vec<TokenStream> {
-        let mut groups: std::collections::BTreeMap<usize, Vec<TokenStream>> =
-            std::collections::BTreeMap::new();
+impl LengthArms {
+    pub(crate) fn collect(items: impl IntoIterator<Item = (usize, TokenStream)>) -> Self {
+        let mut groups: BTreeMap<usize, Vec<TokenStream>> = BTreeMap::new();
         for (len, check) in items {
             groups.entry(len).or_default().push(check);
         }
-        groups
+        Self { groups }
+    }
+
+    pub(crate) fn emit(self) -> Vec<TokenStream> {
+        self.groups
             .into_iter()
             .map(|(len, checks)| quote! { #len => { #( #checks )* } })
             .collect()
     }
+}
 
-    pub(crate) fn build_default_retained_expr(default: &LitStr) -> TokenStream {
+pub(crate) struct ValueBinding<'a> {
+    ty: &'a Type,
+    default: Option<&'a LitStr>,
+}
+
+impl<'a> ValueBinding<'a> {
+    pub(crate) fn new(ty: &'a Type, default: Option<&'a LitStr>) -> Self {
+        Self { ty, default }
+    }
+
+    fn default_retained_expr(default: &LitStr) -> TokenStream {
         let bytes = LitByteStr::new(default.value().as_bytes(), default.span());
         quote! {
             sark_core::http::Bytes::<sark_core::http::Retained>::from(
@@ -33,18 +49,18 @@ impl Value {
         }
     }
 
-    pub(crate) fn build_default_borrowed_expr(default: &LitStr) -> TokenStream {
+    fn default_borrowed_expr(default: &LitStr) -> TokenStream {
         let bytes = LitByteStr::new(default.value().as_bytes(), default.span());
         quote! {
             sark_core::http::Bytes::<sark_core::http::Borrowed<'static>>::from(#bytes)
         }
     }
 
-    pub(crate) fn build_default_typed_expr(ty: &Type, default: &LitStr) -> Result<TokenStream> {
-        let kind = ty.value_kind()?;
+    fn default_typed_expr(&self, default: &LitStr) -> Result<TokenStream> {
+        let kind = self.ty.value_kind()?;
         let raw = default.value();
         match kind {
-            ValueKind::Bytes => Ok(Self::build_default_retained_expr(default)),
+            ValueKind::Bytes => Ok(Self::default_retained_expr(default)),
             ValueKind::U64 => {
                 let n: u64 = raw
                     .parse()
@@ -73,31 +89,31 @@ impl Value {
         }
     }
 
-    pub(crate) fn build_required_or_default_expr(
-        ty: &Type,
-        default: Option<&LitStr>,
-        value: TokenStream,
+    pub(crate) fn default_bytes_expr(
+        &self,
+        borrowed: bool,
+        missing_message: &str,
     ) -> Result<TokenStream> {
-        if let Some(default) = default {
-            let fallback = Self::build_default_typed_expr(ty, default)?;
+        let default = self
+            .default
+            .ok_or_else(|| syn::Error::new_spanned(self.ty, missing_message))?;
+        Ok(if borrowed {
+            Self::default_borrowed_expr(default)
+        } else {
+            Self::default_retained_expr(default)
+        })
+    }
+
+    pub(crate) fn required_or_default_expr(&self, value: TokenStream) -> Result<TokenStream> {
+        if let Some(default) = self.default {
+            let fallback = self.default_typed_expr(default)?;
             return Ok(quote! { #value.unwrap_or_else(|| #fallback) });
         }
         Ok(quote! { #value? })
     }
 
-    pub(crate) fn build_parse_expr(kind: ValueKind, range_expr: TokenStream) -> TokenStream {
-        match kind {
-            ValueKind::Range | ValueKind::Bytes => quote! { Some(#range_expr) },
-            _ => quote! {{
-                let value = sark::service::SliceValue::new(input, #range_expr);
-                Some(sark::service::FieldValue::parse_value(&value)?)
-            }},
-        }
-    }
-
-    pub(crate) fn build_header_query_field(
-        ty: &Type,
-        default: Option<&LitStr>,
+    pub(crate) fn header_query_field(
+        &self,
         ident: &Ident,
         frame_read: TokenStream,
         prefix: &str,
@@ -108,8 +124,8 @@ impl Value {
             format!("non-Option {prefix} Bytes<Retained> fields require default = \"...\"");
         let require_typed_default =
             format!("non-Option {prefix} typed fields require default = \"...\"");
-        Ok(match ty.value_kind()? {
-            ValueKind::Bytes if ty.value_optional() => quote! {
+        Ok(match self.ty.value_kind()? {
+            ValueKind::Bytes if self.ty.value_optional() => quote! {
                 match #ident {
                     Some(range) => Some(
                         #frame_read.ok_or_else(|| sark::error::Error::BadRequest(#invariant.into()))?
@@ -118,13 +134,7 @@ impl Value {
                 }
             },
             ValueKind::Bytes => {
-                let default =
-                    default.ok_or_else(|| syn::Error::new_spanned(ty, require_default.as_str()))?;
-                let fallback = if borrowed {
-                    Self::build_default_borrowed_expr(default)
-                } else {
-                    Self::build_default_retained_expr(default)
-                };
+                let fallback = self.default_bytes_expr(borrowed, &require_default)?;
                 quote! {
                     match #ident {
                         Some(range) => {
@@ -134,53 +144,115 @@ impl Value {
                     }
                 }
             }
-            _ if ty.value_optional() => quote! { #ident },
+            _ if self.ty.value_optional() => quote! { #ident },
             _ => {
-                let default = default
-                    .ok_or_else(|| syn::Error::new_spanned(ty, require_typed_default.as_str()))?;
-                let fallback = Self::build_default_typed_expr(ty, default)?;
+                let default = self.default.ok_or_else(|| {
+                    syn::Error::new_spanned(self.ty, require_typed_default.as_str())
+                })?;
+                let fallback = self.default_typed_expr(default)?;
                 quote! { #ident.unwrap_or_else(|| #fallback) }
             }
         })
     }
+}
 
-    pub(crate) fn build_slots<'a>(
-        slot_ident: &Ident,
+pub(crate) struct ParsedValue {
+    kind: ValueKind,
+    range: TokenStream,
+}
+
+impl ParsedValue {
+    pub(crate) fn new(kind: ValueKind, range: TokenStream) -> Self {
+        Self { kind, range }
+    }
+
+    pub(crate) fn emit(self) -> TokenStream {
+        let Self { kind, range } = self;
+        match kind {
+            ValueKind::Range | ValueKind::Bytes => quote! { Some(#range) },
+            _ => quote! {{
+                let value = sark::service::SliceValue::new(input, #range);
+                Some(sark::service::FieldValue::parse_value(&value)?)
+            }},
+        }
+    }
+}
+
+#[derive(Clone)]
+pub(super) struct FieldSpec {
+    pub(super) slot: u8,
+    pub(super) variant: Ident,
+    pub(super) ident: Ident,
+    pub(super) bytes: Vec<u8>,
+    pub(super) kind: ValueKind,
+}
+
+pub(crate) struct FieldPlan {
+    entries: Vec<FieldSpec>,
+}
+
+impl FieldPlan {
+    pub(crate) fn collect<'a>(
         entries: impl IntoIterator<Item = (&'a Ident, Vec<u8>, &'a Type)>,
-        canonical_name: bool,
-    ) -> Result<(
-        TokenStream,
-        TokenStream,
-        TokenStream,
-        TokenStream,
-        TokenStream,
-        TokenStream,
-    )> {
-        let entries: Vec<_> = entries
+    ) -> Result<Self> {
+        let entries = entries
             .into_iter()
             .enumerate()
             .map(|(idx, (ident, bytes, ty))| {
-                Ok((format_ident!("S{}", idx), ident, bytes, ty.value_kind()?))
+                let slot = u8::try_from(idx).map_err(|_| {
+                    syn::Error::new_spanned(
+                        ident,
+                        "too many generated request fields; maximum is 256",
+                    )
+                })?;
+                Ok(FieldSpec {
+                    slot,
+                    variant: format_ident!("S{}", idx),
+                    ident: ident.clone(),
+                    bytes,
+                    kind: ty.value_kind()?,
+                })
             })
-            .collect::<Result<Vec<_>>>()?;
-        let variants: Vec<_> = entries.iter().map(|(slot, _, _, _)| slot).collect();
+            .collect::<Result<_>>()?;
+        Ok(Self { entries })
+    }
+
+    pub(super) fn entries(&self) -> &[FieldSpec] {
+        &self.entries
+    }
+
+    pub(crate) fn slots(
+        &self,
+        slot_ident: &Ident,
+        canonical_name: bool,
+    ) -> (
+        TokenStream,
+        TokenStream,
+        TokenStream,
+        TokenStream,
+        TokenStream,
+        TokenStream,
+    ) {
+        let variants: Vec<_> = self.entries.iter().map(|field| &field.variant).collect();
         let enum_tokens = quote! {
             #[derive(Clone, Copy)]
             enum #slot_ident { #( #variants, )* }
         };
-        let slot_probe_match =
-            Self::group_arms_by_length(entries.iter().map(|(slot, _, bytes, _)| {
-                let cond = if canonical_name {
-                    let lit = LitByteStr::new(bytes.as_slice(), Span::call_site());
-                    quote! { name.eq_ignore_ascii_case(#lit) }
-                } else {
-                    BytesMatch::exact(&format_ident!("name"), bytes)
-                };
-                (
-                    bytes.len(),
-                    quote! { if #cond { return Some(#slot_ident::#slot); } },
-                )
-            }));
+        let slot_probe_match = LengthArms::collect(self.entries.iter().map(|field| {
+            let slot = &field.variant;
+            let bytes = &field.bytes;
+            let cond = if canonical_name {
+                let lit = LitByteStr::new(bytes.as_slice(), Span::call_site());
+                quote! { name.eq_ignore_ascii_case(#lit) }
+            } else {
+                BytesMatch::Exact.emit(&format_ident!("name"), bytes)
+            };
+            (
+                bytes.len(),
+                quote! { if #cond { return Some(#slot_ident::#slot); } },
+            )
+        }))
+        .emit();
         let slot_probe_fn = quote! {
             match name.len() {
                 #( #slot_probe_match )*
@@ -188,14 +260,14 @@ impl Value {
             }
             None
         };
-        let slot_probe_u8_arms = Self::group_arms_by_length(entries.iter().enumerate().map(
-            |(idx, (_slot, _, bytes, _))| {
-                let lower = bytes.iter().map(u8::to_ascii_lowercase).collect::<Vec<_>>();
-                let cond = BytesMatch::exact(&format_ident!("name"), lower.as_slice());
-                let idx = idx as u8;
-                (bytes.len(), quote! { if #cond { return Some(#idx); } })
-            },
-        ));
+        let slot_probe_u8_arms = LengthArms::collect(self.entries.iter().map(|field| {
+            let bytes = &field.bytes;
+            let lower = bytes.iter().map(u8::to_ascii_lowercase).collect::<Vec<_>>();
+            let cond = BytesMatch::Exact.emit(&format_ident!("name"), lower.as_slice());
+            let idx = field.slot;
+            (bytes.len(), quote! { if #cond { return Some(#idx); } })
+        }))
+        .emit();
         let slot_probe_u8_fn = quote! {
             match name.len() {
                 #( #slot_probe_u8_arms )*
@@ -203,9 +275,12 @@ impl Value {
             }
             None
         };
-        let set_arms: Vec<_> = entries
+        let set_arms: Vec<_> = self
+            .entries
             .iter()
-            .map(|(slot, ident, _, _)| {
+            .map(|field| {
+                let slot = &field.variant;
+                let ident = &field.ident;
                 quote! {
                     #slot_ident::#slot => {
                         if headers.#ident.is_none() {
@@ -221,12 +296,13 @@ impl Value {
             }
             Ok(())
         };
-        let set_u8_arms: Vec<_> = entries
+        let set_u8_arms: Vec<_> = self
+            .entries
             .iter()
-            .enumerate()
-            .map(|(idx, (_slot, ident, _, _))| {
+            .map(|field| {
+                let ident = &field.ident;
                 let assign = quote! { Some(sark::service::FieldValue::parse_value(value)?) };
-                let idx = idx as u8;
+                let idx = field.slot;
                 quote! {
                     #idx => {
                         if headers.#ident.is_none() {
@@ -243,48 +319,35 @@ impl Value {
             }
             Ok(())
         };
-        let set_name_fn = Self::set_name(
-            entries
+        let set_name_fn = Self::emit_set_name(
+            self.entries
                 .iter()
-                .map(|(_slot, ident, bytes, _)| (*ident, bytes.as_slice())),
+                .map(|field| (&field.ident, field.bytes.as_slice())),
             canonical_name,
         );
-        Ok((
+        (
             enum_tokens,
             slot_probe_fn,
             set_fn,
             set_name_fn,
             slot_probe_u8_fn,
             set_u8_fn,
-        ))
+        )
     }
 
-    pub(crate) fn build_set_name<'a>(
-        entries: impl IntoIterator<Item = (&'a Ident, Vec<u8>, &'a Type)>,
-        canonical_name: bool,
-    ) -> Result<TokenStream> {
-        let entries: Vec<_> = entries
-            .into_iter()
-            .map(|(ident, bytes, ty)| Ok((ident, bytes, ty.value_kind()?)))
-            .collect::<Result<Vec<_>>>()?;
-        Ok(Self::set_name(
-            entries
+    pub(crate) fn set_name(&self, canonical_name: bool) -> TokenStream {
+        Self::emit_set_name(
+            self.entries
                 .iter()
-                .map(|(ident, bytes, _)| (*ident, bytes.as_slice())),
+                .map(|field| (&field.ident, field.bytes.as_slice())),
             canonical_name,
-        ))
+        )
     }
 
-    pub(crate) fn build_parse_query<'a>(
-        entries: impl IntoIterator<Item = (&'a Ident, Vec<u8>, &'a Type)>,
-    ) -> Result<TokenStream> {
-        let entries: Vec<_> = entries
-            .into_iter()
-            .map(|(ident, bytes, ty)| Ok((ident, bytes, ty.value_kind()?)))
-            .collect::<Result<Vec<_>>>()?;
+    pub(crate) fn parse_query(&self) -> TokenStream {
         let match_arms = Self::name_match_arms(
-            &entries,
-            |kind| Self::build_parse_expr(kind, quote!(value_start_abs..value_end_abs)),
+            &self.entries,
+            |kind| ParsedValue::new(kind, quote!(value_start_abs..value_end_abs)).emit(),
             false,
         );
         let per_segment = quote! {
@@ -293,32 +356,26 @@ impl Value {
                 _ => {}
             }
         };
-        Ok(QueryScanLoop::build(&per_segment))
+        QueryScan::new(per_segment).emit()
     }
 
-    pub(crate) fn build_set_slice<'a>(
-        entries: impl IntoIterator<Item = (&'a Ident, Vec<u8>, &'a Type)>,
-    ) -> Result<TokenStream> {
-        let entries: Vec<_> = entries
-            .into_iter()
-            .map(|(ident, bytes, ty)| Ok((ident, bytes, ty.value_kind()?)))
-            .collect::<Result<Vec<_>>>()?;
+    pub(crate) fn set_slice(&self) -> TokenStream {
         let match_arms = Self::name_match_arms(
-            &entries,
-            |kind| Self::build_parse_expr(kind, quote!(range)),
+            &self.entries,
+            |kind| ParsedValue::new(kind, quote!(range)).emit(),
             true,
         );
-        Ok(quote! {
+        quote! {
             match name.len() {
                 #( #match_arms )*
                 _ => {}
             }
             Ok(())
-        })
+        }
     }
 
     fn name_match_arms<F>(
-        entries: &[(&Ident, Vec<u8>, ValueKind)],
+        entries: &[FieldSpec],
         parsed_for: F,
         with_return: bool,
     ) -> Vec<TokenStream>
@@ -330,9 +387,11 @@ impl Value {
         } else {
             TokenStream::new()
         };
-        Self::group_arms_by_length(entries.iter().map(|(ident, bytes, kind)| {
+        LengthArms::collect(entries.iter().map(|field| {
+            let ident = &field.ident;
+            let bytes = &field.bytes;
             let lit = LitByteStr::new(bytes.as_slice(), Span::call_site());
-            let parsed = parsed_for(*kind);
+            let parsed = parsed_for(field.kind);
             (
                 bytes.len(),
                 quote! {
@@ -345,13 +404,14 @@ impl Value {
                 },
             )
         }))
+        .emit()
     }
 
-    fn set_name<'a>(
+    fn emit_set_name<'a>(
         items: impl IntoIterator<Item = (&'a Ident, &'a [u8])>,
         canonical_name: bool,
     ) -> TokenStream {
-        let arms = Value::group_arms_by_length(items.into_iter().map(|(ident, bytes)| {
+        let arms = LengthArms::collect(items.into_iter().map(|(ident, bytes)| {
             let lit = LitByteStr::new(bytes, Span::call_site());
             let cond = if canonical_name {
                 quote! { name.eq_ignore_ascii_case(#lit) }
@@ -370,7 +430,8 @@ impl Value {
                     }
                 },
             )
-        }));
+        }))
+        .emit();
         quote! {
             match name.len() {
                 #( #arms )*
@@ -381,15 +442,24 @@ impl Value {
     }
 }
 
-pub(crate) struct QueryScanLoop;
+pub(crate) struct QueryScan {
+    per_segment: TokenStream,
+}
 
-impl QueryScanLoop {
-    pub(crate) fn build(per_segment: &TokenStream) -> TokenStream {
+impl QueryScan {
+    pub(crate) fn new(per_segment: TokenStream) -> Self {
+        Self { per_segment }
+    }
+
+    pub(crate) fn emit(self) -> TokenStream {
+        let per_segment = self.per_segment;
         quote! {
             if range.start >= range.end {
                 return Ok(());
             }
-            let bytes = &input[range.clone()];
+            let bytes = input.get(range.clone()).ok_or_else(|| {
+                sark::error::Error::BadRequest("Invalid query range".into())
+            })?;
             let mut seg_start = 0usize;
             let mut eq_idx = usize::MAX;
             let mut idx = 0usize;

@@ -1,7 +1,7 @@
-use sark_core::http::head::header_lines;
+use sark_core::http::head::HeaderLines;
 
 fn collect(wire: &[u8]) -> Vec<(String, String)> {
-    header_lines(wire)
+    HeaderLines::new(wire)
         .map(|(n, v)| {
             (
                 String::from_utf8_lossy(n).into_owned(),

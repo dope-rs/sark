@@ -12,6 +12,7 @@ use dope_fiber::{Either, Fiber, TimerExt as _, poll_fn, race, wait_fn};
 use dope_net::Transport;
 use http::Method;
 use o3::buffer::{Lease, Pool};
+use o3::cell::RegionToken;
 use sark_core::http::Response;
 
 use crate::connector::error::Error;
@@ -22,7 +23,7 @@ struct ExtractResponse;
 
 type HandleMarker<'a, S, E> = PhantomData<(&'a (), fn() -> (S, E))>;
 
-unsafe impl Extract<Outcome> for ExtractResponse {
+impl Extract<Outcome> for ExtractResponse {
     type Output = Outcome;
 
     fn extract(slot: &mut Slot<Outcome>) -> Option<Self::Output> {
@@ -216,27 +217,42 @@ where
                 body,
             )?;
             let mut request = Some(request);
-            let acquire = wait_fn(move |cx, waiter| {
+            let acquire = wait_fn(move |mut cx, waiter| {
                 let now = Instant::now();
                 let shared = &handle.port.shared;
                 let idle = shared.idle_timeout;
-                let chosen = shared.acquire(now, idle, |token| handle.port.io.close(token));
+                let chosen = shared.acquire(cx.as_mut().region_token(), now, idle, |token| {
+                    handle.port.io.close(token)
+                });
                 match chosen {
                     Some(token) => {
                         let req = request.take().expect("dispatch enqueue polled twice");
-                        Poll::Ready(Enqueue::submit(handle, token, req).map(|reply| (token, reply)))
+                        Poll::Ready(
+                            Enqueue::submit(handle, token, req, cx.as_mut().region_token())
+                                .map(|reply| (token, reply)),
+                        )
                     }
                     None => {
                         if !shared.try_register_active(waiter, cx.as_ref()) {
                             return Poll::Ready(Err(Error::Backpressure));
                         }
-                        let chosen = shared.acquire(now, idle, |token| handle.port.io.close(token));
+                        let chosen = shared.acquire(
+                            cx.as_mut().region_token(),
+                            now,
+                            idle,
+                            |token| handle.port.io.close(token),
+                        );
                         match chosen {
                             Some(token) => {
                                 shared.wake();
                                 let req = request.take().expect("dispatch enqueue polled twice");
                                 Poll::Ready(
-                                    Enqueue::submit(handle, token, req)
+                                    Enqueue::submit(
+                                        handle,
+                                        token,
+                                        req,
+                                        cx.as_mut().region_token(),
+                                    )
                                         .map(|reply| (token, reply)),
                                 )
                             }
@@ -270,6 +286,7 @@ impl Enqueue {
         handle: HttpHandle<'a, 'd, ID, S, E>,
         conn_id: Token,
         request: Lease<'d>,
+        region: &mut RegionToken<'d>,
     ) -> Result<Reply<'d, Outcome, ExtractResponse>, Error>
     where
         S: Dialer<E::Transport> + 'd,
@@ -278,20 +295,20 @@ impl Enqueue {
     {
         let shared = &handle.port.shared;
         if !handle.port.io.is_active(conn_id) {
-            shared.close_connection(conn_id);
+            shared.close_connection(region, conn_id);
             return Err(Error::NotConnected);
         }
         let arena = shared.arena(conn_id).ok_or(Error::NotConnected)?;
-        if !arena.can_register() {
+        if !arena.can_register(region) {
             return Err(Error::Backpressure);
         }
         if handle.port.io.try_enqueue(conn_id, request).is_err() {
-            shared.make_available(conn_id);
+            shared.make_available(region, conn_id);
             return Err(Error::Backpressure);
         }
         let mut reply = Reply::new();
-        assert!(reply.try_attach(arena));
-        shared.submitted(conn_id, Instant::now());
+        assert!(reply.try_attach(region, arena));
+        shared.submitted(region, conn_id, Instant::now());
         Ok(reply)
     }
 }

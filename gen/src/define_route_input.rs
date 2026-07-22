@@ -1,14 +1,27 @@
 use syn::parse::{Parse, ParseStream};
 use syn::punctuated::Punctuated;
-use syn::{Attribute, Ident, LitStr, Result, Token, Type, Visibility, braced};
+use syn::{Ident, LitStr, Result, Token, Type, TypePath, Visibility, braced};
 
-use crate::model::{DefineRouteEntry, DefineRouteInput, HeadSkip};
-
-pub(super) struct RouteConfig {
-    pub static_response: bool,
-    pub max_body: Option<syn::Expr>,
-    pub head_skip: HeadSkip,
+pub(super) struct DefineRouteInput {
+    pub(super) vis: Visibility,
+    pub(super) name: Ident,
+    pub(super) state_ty: Type,
+    pub(super) entries: Vec<DefineRouteEntry>,
 }
+
+pub(super) enum DefineRouteEntry {
+    Service {
+        method: Ident,
+        path: LitStr,
+        ty: TypePath,
+    },
+    Scope {
+        prefix: LitStr,
+        wraps: Vec<TypePath>,
+        children: Vec<DefineRouteEntry>,
+    },
+}
+
 impl Parse for DefineRouteInput {
     fn parse(input: ParseStream<'_>) -> Result<Self> {
         let vis = input.parse::<Visibility>()?;
@@ -40,23 +53,11 @@ fn parse_define_route_entries(input: ParseStream<'_>) -> Result<Vec<DefineRouteE
 }
 
 fn parse_define_route_entry(input: ParseStream<'_>) -> Result<DefineRouteEntry> {
-    if input.peek(syn::Ident)
-        && input
-            .fork()
-            .parse::<Ident>()
-            .map(|i| i == "scope")
-            .unwrap_or(false)
-    {
+    if next_ident_is(input, "scope")? {
         let _ = input.parse::<Ident>()?;
         let prefix = input.parse::<LitStr>()?;
         let mut wraps = Vec::new();
-        if input.peek(syn::Ident)
-            && input
-                .fork()
-                .parse::<Ident>()
-                .map(|i| i == "with")
-                .unwrap_or(false)
-        {
+        if next_ident_is(input, "with")? {
             input.parse::<Ident>()?;
             let wrap_body;
             syn::parenthesized!(wrap_body in input);
@@ -105,13 +106,7 @@ fn parse_route_type(input: ParseStream<'_>) -> Result<syn::TypePath> {
     let marker = if input.peek(Token![async]) {
         input.parse::<Token![async]>()?;
         Some("__SarkAsyncRoute")
-    } else if input.peek(Ident)
-        && input
-            .fork()
-            .parse::<Ident>()
-            .map(|ident| ident == "stream")
-            .unwrap_or(false)
-    {
+    } else if next_ident_is(input, "stream")? {
         input.parse::<Ident>()?;
         Some("__SarkStreamRoute")
     } else {
@@ -139,40 +134,9 @@ fn parse_route_type(input: ParseStream<'_>) -> Result<syn::TypePath> {
     Ok(syn::parse_quote!(#marker<#route, { #capacity }>))
 }
 
-pub(super) fn take_route_config(attrs: &mut Vec<Attribute>) -> Result<RouteConfig> {
-    let mut static_response = false;
-    let mut max_body: Option<syn::Expr> = None;
-    let mut head_skip = HeadSkip::default();
-    let mut kept = Vec::with_capacity(attrs.len());
-    for attr in attrs.drain(..) {
-        if attr.path().is_ident("static_response") {
-            static_response = true;
-        } else if attr.path().is_ident("max_body") {
-            if max_body.is_some() {
-                return Err(syn::Error::new_spanned(attr, "duplicate #[max_body(...)]"));
-            }
-            max_body = Some(attr.parse_args::<syn::Expr>()?);
-        } else if attr.path().is_ident("skip") {
-            attr.parse_nested_meta(|meta| {
-                if meta.path.is_ident("date") {
-                    head_skip.date = true;
-                } else if meta.path.is_ident("server") {
-                    head_skip.server = true;
-                } else {
-                    return Err(
-                        meta.error("unknown #[skip(...)] target; expected `date` | `server`")
-                    );
-                }
-                Ok(())
-            })?;
-        } else {
-            kept.push(attr);
-        }
+fn next_ident_is(input: ParseStream<'_>, expected: &str) -> Result<bool> {
+    if !input.peek(Ident) {
+        return Ok(false);
     }
-    *attrs = kept;
-    Ok(RouteConfig {
-        static_response,
-        max_body,
-        head_skip,
-    })
+    Ok(input.fork().parse::<Ident>()? == expected)
 }

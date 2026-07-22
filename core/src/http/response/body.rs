@@ -1,9 +1,9 @@
-use o3::buffer::{Borrowed, Bytes, Retained, Shared};
+use o3::buffer::{Borrowed, Bytes, Owned, Retained, Shared};
 
 use super::TextBody;
 
 #[derive(Clone)]
-pub enum BodyInner<'req> {
+pub enum Body<'req> {
     Owned(Vec<u8>),
     Shared(Shared),
     Borrowed(Bytes<Borrowed<'req>>),
@@ -11,9 +11,7 @@ pub enum BodyInner<'req> {
     StaticSlice(&'static [u8]),
 }
 
-pub type Body = BodyInner<'static>;
-
-impl<'req> std::fmt::Debug for BodyInner<'req> {
+impl<'req> std::fmt::Debug for Body<'req> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Owned(buf) => f
@@ -40,7 +38,7 @@ impl<'req> std::fmt::Debug for BodyInner<'req> {
     }
 }
 
-impl<'req> BodyInner<'req> {
+impl<'req> Body<'req> {
     pub(crate) fn empty() -> Self {
         Self::Owned(Vec::new())
     }
@@ -92,16 +90,6 @@ impl<'req> BodyInner<'req> {
         }
     }
 
-    pub(super) fn into_static(self) -> Body {
-        match self {
-            Self::Owned(buf) => BodyInner::Owned(buf),
-            Self::Shared(buf) => BodyInner::Shared(buf),
-            Self::Borrowed(buf) => BodyInner::Shared(Shared::copy_from_slice(buf.as_slice())),
-            Self::Retained(buf) => BodyInner::Retained(buf),
-            Self::StaticSlice(buf) => BodyInner::StaticSlice(buf),
-        }
-    }
-
     pub(crate) fn as_owned_mut(&mut self) -> &mut Vec<u8> {
         if matches!(
             self,
@@ -117,84 +105,56 @@ impl<'req> BodyInner<'req> {
     }
 }
 
-pub trait IntoBody<'req>: sealed::SealedBody {
-    fn into_response_body(self) -> BodyInner<'req>;
-}
-
-impl<'req> IntoBody<'req> for BodyInner<'req> {
-    fn into_response_body(self) -> Self {
-        self
+impl<'req> From<Owned> for Body<'req> {
+    fn from(body: Owned) -> Self {
+        Self::Shared(body.freeze())
     }
 }
 
-impl<'req> IntoBody<'req> for o3::buffer::Owned {
-    fn into_response_body(self) -> BodyInner<'req> {
-        BodyInner::Shared(self.freeze())
+impl<'req> From<Shared> for Body<'req> {
+    fn from(body: Shared) -> Self {
+        Self::Shared(body)
     }
 }
 
-impl<'req> IntoBody<'req> for Shared {
-    fn into_response_body(self) -> BodyInner<'req> {
-        BodyInner::Shared(self)
+impl<'req> From<Bytes<Borrowed<'req>>> for Body<'req> {
+    fn from(body: Bytes<Borrowed<'req>>) -> Self {
+        Self::Borrowed(body)
     }
 }
 
-impl<'req> IntoBody<'req> for Bytes<Borrowed<'req>> {
-    fn into_response_body(self) -> BodyInner<'req> {
-        BodyInner::Borrowed(self)
+impl<'req> From<Bytes<Retained>> for Body<'req> {
+    fn from(body: Bytes<Retained>) -> Self {
+        Self::Retained(body)
     }
 }
 
-impl<'req> IntoBody<'req> for Bytes<Retained> {
-    fn into_response_body(self) -> BodyInner<'req> {
-        BodyInner::Retained(self)
+impl<'req> From<TextBody<'req>> for Body<'req> {
+    fn from(body: TextBody<'req>) -> Self {
+        Self::Shared(body.into_bytes())
     }
 }
 
-impl<'req> IntoBody<'req> for TextBody {
-    fn into_response_body(self) -> BodyInner<'req> {
-        BodyInner::Shared(self.into_bytes())
+impl<'req> From<Vec<u8>> for Body<'req> {
+    fn from(body: Vec<u8>) -> Self {
+        Self::Owned(body)
     }
 }
 
-impl<'req> IntoBody<'req> for Vec<u8> {
-    fn into_response_body(self) -> BodyInner<'req> {
-        BodyInner::Owned(self)
+impl<'req> From<String> for Body<'req> {
+    fn from(body: String) -> Self {
+        Self::Owned(body.into_bytes())
     }
 }
 
-impl<'req> IntoBody<'req> for String {
-    fn into_response_body(self) -> BodyInner<'req> {
-        BodyInner::Owned(self.into_bytes())
+impl<'req> From<&[u8]> for Body<'req> {
+    fn from(body: &[u8]) -> Self {
+        Self::Owned(body.to_vec())
     }
 }
 
-impl<'req> IntoBody<'req> for &[u8] {
-    fn into_response_body(self) -> BodyInner<'req> {
-        BodyInner::Owned(self.to_vec())
+impl<'req> From<&str> for Body<'req> {
+    fn from(body: &str) -> Self {
+        Self::Owned(body.as_bytes().to_vec())
     }
-}
-
-impl<'req> IntoBody<'req> for &str {
-    fn into_response_body(self) -> BodyInner<'req> {
-        BodyInner::Owned(self.as_bytes().to_vec())
-    }
-}
-
-mod sealed {
-    use super::super::TextBody;
-    use super::BodyInner;
-
-    pub trait SealedBody {}
-
-    impl<'req> SealedBody for BodyInner<'req> {}
-    impl SealedBody for TextBody {}
-    impl SealedBody for o3::buffer::Owned {}
-    impl SealedBody for o3::buffer::Shared {}
-    impl SealedBody for o3::buffer::Bytes<o3::buffer::Borrowed<'_>> {}
-    impl SealedBody for o3::buffer::Bytes<o3::buffer::Retained> {}
-    impl SealedBody for Vec<u8> {}
-    impl SealedBody for String {}
-    impl SealedBody for &[u8] {}
-    impl SealedBody for &str {}
 }

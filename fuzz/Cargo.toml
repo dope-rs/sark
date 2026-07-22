@@ -15,7 +15,7 @@ sark = { path = "../sark" }
 sark-core = { path = "../core" }
 sark-gen = { path = "../gen" }
 sark-json = { path = "../json" }
-o3 = "0.4"
+o3 = "0.6"
 http = "1"
 
 [[bin]]

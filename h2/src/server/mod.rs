@@ -14,11 +14,14 @@ pub type TlsEnv = Bundle<Tcp, Tls, Throughput>;
 
 mod app;
 mod body;
+mod connection;
 pub mod driver;
+mod scheduler;
 mod task;
 
-pub use app::{App, ConnState, Handler, Request, Response, SyncApp, SyncConnState, SyncHandler};
+pub use app::{App, ConnState, Handler, SyncApp, SyncConnState, SyncHandler};
 pub use body::Body;
+pub use connection::{Request, Response};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Config {

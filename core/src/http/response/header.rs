@@ -2,7 +2,7 @@ use std::slice;
 
 use http::{HeaderName, HeaderValue};
 
-use super::{HeaderNameRef, IntoHeaderName};
+use super::HeaderNameRef;
 
 #[derive(Clone, Default, PartialEq, Eq)]
 pub struct HeaderList {
@@ -91,14 +91,10 @@ impl HeaderList {
         self.get(name).is_some()
     }
 
-    pub fn insert<N>(&mut self, name: N, value: HeaderValue) -> Option<HeaderValue>
-    where
-        N: IntoHeaderName,
-    {
-        let name = name.into_header_name();
-        let added = HeaderEntryWire::len(name.as_str(), value.as_bytes());
+    pub fn insert(&mut self, name: HeaderName, value: HeaderValue) -> Option<HeaderValue> {
+        let added = header_wire_len(name.as_str(), value.as_bytes());
         if let Some(index) = self.entries.iter().position(|(n, _)| *n == name) {
-            let removed_old = HeaderEntryWire::len(
+            let removed_old = header_wire_len(
                 self.entries[index].0.as_str(),
                 self.entries[index].1.as_bytes(),
             );
@@ -121,7 +117,7 @@ impl HeaderList {
             .iter()
             .position(|(n, _)| n.as_str().eq_ignore_ascii_case(name.as_header_name()))?;
         let (removed_name, removed_value) = self.entries.remove(index);
-        self.wire_len -= HeaderEntryWire::len(removed_name.as_str(), removed_value.as_bytes());
+        self.wire_len -= header_wire_len(removed_name.as_str(), removed_value.as_bytes());
         self.dedup_by_name(&removed_name, 0);
         Some(removed_value)
     }
@@ -130,7 +126,7 @@ impl HeaderList {
         let mut scan = start;
         while scan < self.entries.len() {
             if self.entries[scan].0 == *name {
-                self.wire_len -= HeaderEntryWire::len(
+                self.wire_len -= header_wire_len(
                     self.entries[scan].0.as_str(),
                     self.entries[scan].1.as_bytes(),
                 );
@@ -142,12 +138,8 @@ impl HeaderList {
     }
 }
 
-struct HeaderEntryWire;
-
-impl HeaderEntryWire {
-    fn len(name: &str, value: &[u8]) -> usize {
-        name.len() + 2 + value.len() + 2
-    }
+fn header_wire_len(name: &str, value: &[u8]) -> usize {
+    name.len() + 2 + value.len() + 2
 }
 
 impl From<Vec<(HeaderName, HeaderValue)>> for HeaderList {

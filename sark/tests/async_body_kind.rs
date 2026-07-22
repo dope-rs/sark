@@ -56,7 +56,7 @@ fn owned_generated_responses_keep_their_concrete_shape() {
             .is_some()
     );
 
-    let _: sark_core::http::FixedResponseInner<'_, 0> =
+    let _: sark_core::http::FixedResponse<'_, 0> =
         NativeResponse::into_route_response(OwnedReply {
             status: StatusCode::OK,
             body: b"ok".to_vec(),

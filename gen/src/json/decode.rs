@@ -6,22 +6,29 @@ use super::field::FieldMode;
 use super::scalar::{Classified, Scalar};
 use crate::util::TypeExt;
 
-pub(super) struct Decode;
+pub(super) struct Decoder<'a> {
+    ty: &'a Type,
+    mode: FieldMode,
+}
 
-impl Decode {
-    pub(super) fn expr(ty: &Type, field_mode: FieldMode) -> Result<TokenStream> {
-        if field_mode.seq {
-            let push = if field_mode.nested {
-                let elem = ty.vec_inner().ok_or_else(|| {
-                    syn::Error::new_spanned(ty, "#[field(seq, nested)] requires a Vec<T> field")
-                })?;
+impl<'a> Decoder<'a> {
+    pub(super) fn new(ty: &'a Type, mode: FieldMode) -> Self {
+        Self { ty, mode }
+    }
+
+    pub(super) fn expr(&self) -> Result<TokenStream> {
+        if self.mode.seq {
+            let elem = self.ty.vec_inner().ok_or_else(|| {
+                syn::Error::new_spanned(self.ty, "#[field(seq)] requires a Vec<T> field")
+            })?;
+            let push = if self.mode.nested {
                 quote!(__v.push(
                     <#elem as sark::json::JsonDecode>::decode_json_borrowed(&__raw[__vs..__idx])?
                 );)
             } else {
                 quote!(__v.push(sark::json::Parse::frame(&__bytes, &mut __idx)?);)
             };
-            let capture = if field_mode.nested {
+            let capture = if self.mode.nested {
                 quote! {
                     let __vs = __idx;
                     sark::json::Scan::skip_value(__raw, &mut __idx)?;
@@ -50,7 +57,8 @@ impl Decode {
                 __v
             }});
         }
-        if field_mode.nested {
+        if self.mode.nested {
+            let ty = self.ty;
             return Ok(quote! {{
                 sark::json::Scan::ws(__raw, &mut __idx);
                 let __vs = __idx;
@@ -58,27 +66,27 @@ impl Decode {
                 <#ty as sark::json::JsonDecode>::decode_json_borrowed(&__raw[__vs..__idx])?
             }});
         }
-        let class = Classified::of(ty)?;
+        let class = Classified::of(self.ty)?;
         let decode = match class.scalar {
             Scalar::U64 => quote!(sark::json::Parse::u64(__raw, &mut __idx)?),
             Scalar::I64 | Scalar::F64 | Scalar::String | Scalar::Shared => {
                 return Err(syn::Error::new_spanned(
-                    ty,
+                    self.ty,
                     "this JSON field type requires `#[sark_gen::json(encode)]`",
                 ));
             }
             Scalar::Bool => quote!(sark::json::Parse::bool(__raw, &mut __idx)?),
             Scalar::Retained => {
-                if field_mode.raw {
+                if self.mode.raw {
                     quote!(sark::json::Parse::frame_raw(&__bytes, &mut __idx)?)
-                } else if field_mode.plain {
+                } else if self.mode.plain {
                     quote!(sark::json::Parse::frame_plain(&__bytes, &mut __idx)?)
                 } else {
                     quote!(sark::json::Parse::frame(&__bytes, &mut __idx)?)
                 }
             }
             Scalar::InlineToken => {
-                if field_mode.plain && !field_mode.raw {
+                if self.mode.plain && !self.mode.raw {
                     quote!(sark::json::Parse::inline_plain(__raw, &mut __idx)?)
                 } else {
                     quote!(sark::json::Parse::inline_raw(__raw, &mut __idx)?)
@@ -98,8 +106,8 @@ impl Decode {
         })
     }
 
-    pub(super) fn empty(ty: &Type) -> Result<TokenStream> {
-        let class = Classified::of(ty)?;
+    pub(super) fn empty(&self) -> Result<TokenStream> {
+        let class = Classified::of(self.ty)?;
         if class.optional {
             return Ok(quote!(None));
         }
@@ -107,7 +115,7 @@ impl Decode {
             Scalar::U64 => quote!(0u64),
             Scalar::I64 | Scalar::F64 | Scalar::String | Scalar::Shared => {
                 return Err(syn::Error::new_spanned(
-                    ty,
+                    self.ty,
                     "this JSON field type requires `#[sark_gen::json(encode)]`",
                 ));
             }

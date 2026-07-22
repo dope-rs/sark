@@ -1,6 +1,6 @@
 use sark_core::error::Result;
 use sark_core::http::codec::{BodyFraming, DecodeMode, HeaderScan, ResponseDecoder};
-use sark_core::http::head::{Flags, MAX_HEADER_LINE_BYTES, apply_well_known_header_contig};
+use sark_core::http::head::{Flags, MAX_HEADER_LINE_BYTES, WellKnownHeaders};
 
 fn scan_request(block: &[u8]) -> Result<BodyFraming> {
     let mut scan = HeaderScan::default();
@@ -9,8 +9,12 @@ fn scan_request(block: &[u8]) -> Result<BodyFraming> {
     let mut pos = 0usize;
     loop {
         let rest = &block[pos..];
-        match apply_well_known_header_contig(rest, &mut scan, &mut flags, &mut (), &mut count, 128)?
-        {
+        match WellKnownHeaders::new(&mut scan, &mut flags).apply_contiguous(
+            rest,
+            &mut (),
+            &mut count,
+            128,
+        )? {
             Some(0) => break,
             Some(rel) => pos += rel + 2,
             None => panic!("incomplete header block in test fixture"),

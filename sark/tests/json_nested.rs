@@ -2,6 +2,9 @@ use o3::buffer::{Bytes, Retained, Shared};
 use sark::json::{JsonDecode, JsonEncode, ScratchVec};
 
 #[sark_gen::json(ordered)]
+struct EmptyJson {}
+
+#[sark_gen::json(ordered)]
 struct Message {
     message: Bytes<Retained>,
 }
@@ -99,6 +102,12 @@ fn encode<T: JsonEncode>(value: &T) -> Vec<u8> {
         "json_len must equal encoded length"
     );
     out
+}
+
+#[test]
+fn empty_object_round_trips() {
+    assert_eq!(encode(&EmptyJson {}), b"{}");
+    EmptyJson::decode_json_borrowed(b"{}").expect("empty object decodes");
 }
 
 fn sample_item() -> Item {

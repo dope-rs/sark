@@ -28,9 +28,9 @@ memchr = "2.8"
 pin-project.workspace = true
 
 [dev-dependencies]
-cartel-redis = "0.5"
-cartel-pg = "0.5"
-cartel-gen = "0.5"
+cartel-redis = "0.6"
+cartel-pg = "0.6"
+cartel-gen = "0.6"
 sark-ws.workspace = true
 criterion = { version = "0.8", default-features = false, features = ["cargo_bench_support"] }
 trybuild = "1"

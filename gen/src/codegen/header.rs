@@ -4,12 +4,10 @@ use std::collections::BTreeMap;
 
 use proc_macro2::{Ident, Span, TokenStream};
 use quote::{format_ident, quote};
-use syn::{LitByteStr, Result, Type};
+use syn::{LitByteStr, Result};
 
-use super::value::Value;
-use crate::util::{TypeExt, ValueKind};
-
-pub(crate) struct Emit;
+use super::value::{FieldPlan, FieldSpec, LengthArms};
+use crate::util::ValueKind;
 
 #[derive(Clone, Copy, Default)]
 pub(crate) enum HeaderValueMode {
@@ -31,190 +29,42 @@ pub(crate) struct HeaderParserConfig {
     pub(crate) apply: HeaderApplyMode,
 }
 
-#[derive(Clone, Copy)]
-struct KnownHeaderSpec {
-    suffix: &'static str,
-    bytes: &'static [u8],
-}
-
-const KNOWN_HEADERS: [KnownHeaderSpec; 5] = [
-    KnownHeaderSpec {
-        suffix: "HOST",
-        bytes: b"host",
-    },
-    KnownHeaderSpec {
-        suffix: "CONNECTION",
-        bytes: b"connection",
-    },
-    KnownHeaderSpec {
-        suffix: "CONTENT_LENGTH",
-        bytes: b"content-length",
-    },
-    KnownHeaderSpec {
-        suffix: "TRANSFER_ENCODING",
-        bytes: b"transfer-encoding",
-    },
-    KnownHeaderSpec {
-        suffix: "EXPECT",
-        bytes: b"expect",
-    },
+const KNOWN_HEADERS: [KnownKind; 6] = [
+    KnownKind::Host,
+    KnownKind::Connection,
+    KnownKind::ContentLength,
+    KnownKind::TransferEncoding,
+    KnownKind::Expect,
+    KnownKind::AcceptEncoding,
 ];
 
-impl KnownHeaderSpec {
-    fn variant(&self) -> Ident {
-        match self.suffix {
-            "HOST" => format_ident!("Host"),
-            "CONNECTION" => format_ident!("Connection"),
-            "CONTENT_LENGTH" => format_ident!("ContentLength"),
-            "TRANSFER_ENCODING" => format_ident!("TransferEncoding"),
-            "EXPECT" => format_ident!("Expect"),
-            _ => unreachable!(),
-        }
-    }
+trait HeaderAssignment {
+    fn assignment(
+        &self,
+        raw_expr: TokenStream,
+        abs_start: TokenStream,
+        abs_end: TokenStream,
+    ) -> TokenStream;
 
-    fn apply_call(&self) -> TokenStream {
-        let variant = self.variant();
-        quote! {
-            sark::sark_core::http::head::KnownHeader::#variant.apply(scan, flags, raw)?;
-        }
-    }
+    fn integer_assignment(&self, ty: TokenStream, raw_expr: &TokenStream) -> TokenStream;
 }
 
-#[derive(Clone)]
-struct HeaderField {
-    slot: u8,
-    ident: Ident,
-    bytes: Vec<u8>,
-    kind: ValueKind,
-}
-
-struct HeaderPlan {
-    known: Vec<Option<HeaderField>>,
-    custom: Vec<HeaderField>,
-}
-
-impl HeaderPlan {
-    fn collect<'a>(
-        entries: impl IntoIterator<Item = (&'a Ident, Vec<u8>, &'a Type)>,
-    ) -> Result<Self> {
-        let mut known = vec![None; KNOWN_HEADERS.len()];
-        let mut custom = Vec::new();
-        for (idx, (ident, bytes, ty)) in entries.into_iter().enumerate() {
-            let field = HeaderField {
-                slot: idx as u8,
-                ident: ident.clone(),
-                bytes: bytes.iter().map(u8::to_ascii_lowercase).collect(),
-                kind: ty.value_kind()?,
-            };
-            if let Some(known_idx) = KNOWN_HEADERS
-                .iter()
-                .position(|known| known.bytes == field.bytes)
-            {
-                known[known_idx] = Some(field);
-            } else {
-                custom.push(field);
-            }
-        }
-        Ok(Self { known, custom })
-    }
-
-    fn is_empty(&self) -> bool {
-        self.custom.is_empty() && self.known.iter().all(Option::is_none)
-    }
-}
-
-struct ActionSpec {
-    variant: Ident,
-    bytes: Vec<u8>,
-    body: TokenStream,
-}
-
-#[derive(Clone, Copy)]
-enum KnownKind {
-    Host,
-    Connection,
-    ContentLength,
-    TransferEncoding,
-    Expect,
-}
-
-impl KnownKind {
-    fn from_index(idx: usize) -> Self {
-        match idx {
-            0 => Self::Host,
-            1 => Self::Connection,
-            2 => Self::ContentLength,
-            3 => Self::TransferEncoding,
-            4 => Self::Expect,
-            _ => unreachable!(),
-        }
-    }
-
-    fn header(self) -> TokenStream {
-        match self {
-            Self::Host => quote!(sark::sark_core::http::head::KnownHeader::Host),
-            Self::Expect => quote!(sark::sark_core::http::head::KnownHeader::Expect),
-            Self::Connection => quote!(sark::sark_core::http::head::KnownHeader::Connection),
-            Self::ContentLength => quote!(sark::sark_core::http::head::KnownHeader::ContentLength),
-            Self::TransferEncoding => {
-                quote!(sark::sark_core::http::head::KnownHeader::TransferEncoding)
-            }
-        }
-    }
-
-    fn build_contig_arm(
-        self,
-        capture: Option<&HeaderField>,
-        count_tail: &TokenStream,
-        skip_apply: bool,
-    ) -> TokenStream {
-        let capture_body = capture.map(|field| {
-            let raw_expr = quote! {
-                rest.get(colon_idx + 1 + value_start..colon_idx + 1 + value_end)
-                    .ok_or_else(|| sark::error::Error::BadRequest("Invalid header value".into()))?
-            };
-            let abs_start = quote! { line_start + colon_idx + 1 + value_start };
-            let abs_end = quote! { line_start + colon_idx + 1 + value_end };
-            Assign::emit(&field.ident, field.kind, raw_expr, abs_start, abs_end)
-        });
-        let maybe_assign = if skip_apply {
-            TokenStream::new()
-        } else {
-            capture_body.unwrap_or_default()
-        };
-        let header = self.header();
-        quote! {{
-            let Some((tail_end, value_start, value_end)) =
-                #header.scan_line(scan, flags, &rest[colon_idx + 1..])?
-            else {
-                return Ok(None);
-            };
-            let _ = (value_start, value_end);
-            #count_tail
-            #maybe_assign
-            return Ok(Some(colon_idx + 1 + tail_end));
-        }}
-    }
-}
-
-struct Assign;
-
-impl Assign {
-    fn emit(
-        ident: &Ident,
-        kind: ValueKind,
+impl HeaderAssignment for FieldSpec {
+    fn assignment(
+        &self,
         raw_expr: TokenStream,
         abs_start: TokenStream,
         abs_end: TokenStream,
     ) -> TokenStream {
-        match kind {
+        let ident = &self.ident;
+        match self.kind {
             ValueKind::Range | ValueKind::Bytes => quote! {
                 if headers.#ident.is_none() {
                     headers.#ident = Some((#abs_start)..(#abs_end));
                 }
             },
-            ValueKind::Usize => Self::integer(ident, quote!(usize), &raw_expr),
-            ValueKind::U64 => Self::integer(ident, quote!(u64), &raw_expr),
+            ValueKind::Usize => self.integer_assignment(quote!(usize), &raw_expr),
+            ValueKind::U64 => self.integer_assignment(quote!(u64), &raw_expr),
             ValueKind::Bool => quote! {
                 if headers.#ident.is_none() {
                     let raw = #raw_expr;
@@ -239,7 +89,8 @@ impl Assign {
         }
     }
 
-    fn integer(ident: &Ident, ty: TokenStream, raw_expr: &TokenStream) -> TokenStream {
+    fn integer_assignment(&self, ty: TokenStream, raw_expr: &TokenStream) -> TokenStream {
+        let ident = &self.ident;
         quote! {
             if headers.#ident.is_none() {
                 let raw = #raw_expr;
@@ -272,18 +123,175 @@ impl Assign {
     }
 }
 
-pub(crate) struct BytesMatch;
+struct HeaderPlan {
+    known: Vec<Option<FieldSpec>>,
+    custom: Vec<FieldSpec>,
+}
+
+impl HeaderPlan {
+    fn collect(fields: &FieldPlan) -> Self {
+        let mut known = vec![None; KNOWN_HEADERS.len()];
+        let mut custom = Vec::new();
+        for mut field in fields.entries().iter().cloned() {
+            field.bytes.make_ascii_lowercase();
+            if let Some(known_idx) = KNOWN_HEADERS
+                .iter()
+                .position(|known| known.bytes() == field.bytes)
+            {
+                known[known_idx] = Some(field);
+            } else {
+                custom.push(field);
+            }
+        }
+        Self { known, custom }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.custom.is_empty() && self.known.iter().all(Option::is_none)
+    }
+}
+
+pub(crate) struct HeaderEmitter {
+    plan: HeaderPlan,
+    config: HeaderParserConfig,
+}
+
+impl HeaderEmitter {
+    pub(crate) fn new(fields: &FieldPlan, config: HeaderParserConfig) -> Self {
+        Self {
+            plan: HeaderPlan::collect(fields),
+            config,
+        }
+    }
+
+    pub(crate) fn needs_known_header(&self) -> bool {
+        self.plan.known.iter().any(Option::is_some)
+    }
+}
+
+struct ActionSpec {
+    variant: Ident,
+    bytes: Vec<u8>,
+    body: TokenStream,
+}
+
+#[derive(Clone, Copy)]
+enum KnownKind {
+    Host,
+    Connection,
+    ContentLength,
+    TransferEncoding,
+    Expect,
+    AcceptEncoding,
+}
+
+impl KnownKind {
+    fn bytes(self) -> &'static [u8] {
+        match self {
+            Self::Host => b"host",
+            Self::Connection => b"connection",
+            Self::ContentLength => b"content-length",
+            Self::TransferEncoding => b"transfer-encoding",
+            Self::Expect => b"expect",
+            Self::AcceptEncoding => b"accept-encoding",
+        }
+    }
+
+    fn suffix(self) -> &'static str {
+        match self {
+            Self::Host => "HOST",
+            Self::Connection => "CONNECTION",
+            Self::ContentLength => "CONTENT_LENGTH",
+            Self::TransferEncoding => "TRANSFER_ENCODING",
+            Self::Expect => "EXPECT",
+            Self::AcceptEncoding => "ACCEPT_ENCODING",
+        }
+    }
+
+    fn variant(self) -> Ident {
+        match self {
+            Self::Host => format_ident!("Host"),
+            Self::Connection => format_ident!("Connection"),
+            Self::ContentLength => format_ident!("ContentLength"),
+            Self::TransferEncoding => format_ident!("TransferEncoding"),
+            Self::Expect => format_ident!("Expect"),
+            Self::AcceptEncoding => format_ident!("AcceptEncoding"),
+        }
+    }
+
+    fn apply_call(self) -> TokenStream {
+        let variant = self.variant();
+        quote! {
+            sark::sark_core::http::head::KnownHeader::#variant.apply(scan, flags, raw)?;
+        }
+    }
+
+    fn header(self) -> TokenStream {
+        match self {
+            Self::Host => quote!(sark::sark_core::http::head::KnownHeader::Host),
+            Self::Expect => quote!(sark::sark_core::http::head::KnownHeader::Expect),
+            Self::Connection => quote!(sark::sark_core::http::head::KnownHeader::Connection),
+            Self::ContentLength => quote!(sark::sark_core::http::head::KnownHeader::ContentLength),
+            Self::TransferEncoding => {
+                quote!(sark::sark_core::http::head::KnownHeader::TransferEncoding)
+            }
+            Self::AcceptEncoding => {
+                quote!(sark::sark_core::http::head::KnownHeader::AcceptEncoding)
+            }
+        }
+    }
+
+    fn build_contig_arm(
+        self,
+        capture: Option<&FieldSpec>,
+        count_tail: &TokenStream,
+        skip_apply: bool,
+    ) -> TokenStream {
+        let capture_body = capture.map(|field| {
+            let raw_expr = quote! {
+                rest.get(colon_idx + 1 + value_start..colon_idx + 1 + value_end)
+                    .ok_or_else(|| sark::error::Error::BadRequest("Invalid header value".into()))?
+            };
+            let abs_start = quote! { line_start + colon_idx + 1 + value_start };
+            let abs_end = quote! { line_start + colon_idx + 1 + value_end };
+            field.assignment(raw_expr, abs_start, abs_end)
+        });
+        let maybe_assign = if skip_apply {
+            TokenStream::new()
+        } else {
+            match capture_body {
+                Some(tokens) => tokens,
+                None => TokenStream::new(),
+            }
+        };
+        let header = self.header();
+        quote! {{
+            let Some((tail_end, value_start, value_end)) =
+                #header.scan_line(scan, flags, &rest[colon_idx + 1..])?
+            else {
+                return Ok(None);
+            };
+            let _ = (value_start, value_end);
+            #count_tail
+            #maybe_assign
+            return Ok(Some(colon_idx + 1 + tail_end));
+        }}
+    }
+}
+
+#[derive(Clone, Copy)]
+pub(crate) enum BytesMatch {
+    Exact,
+    Folded,
+}
 
 impl BytesMatch {
-    pub(crate) fn exact(name_ident: &Ident, bytes: &[u8]) -> TokenStream {
-        Self::build(name_ident, bytes, false)
+    pub(crate) fn emit(self, name_ident: &Ident, bytes: &[u8]) -> TokenStream {
+        self.build(name_ident, bytes)
     }
 
-    fn fold(name_ident: &Ident, bytes: &[u8]) -> TokenStream {
-        Self::build(name_ident, bytes, true)
-    }
-
-    fn build(name_ident: &Ident, bytes: &[u8], folded: bool) -> TokenStream {
+    fn build(self, name_ident: &Ident, bytes: &[u8]) -> TokenStream {
+        let folded = matches!(self, Self::Folded);
         let chunk = format_ident!("__c");
         let mut checks = Vec::new();
         if folded && bytes.len() > 8 {
@@ -298,21 +306,21 @@ impl BytesMatch {
                 offsets.push(tail_offset);
             }
             for offset in offsets {
-                checks.push(Self::chunk_check(&chunk, bytes, offset, 8, folded));
+                checks.push(self.chunk_check(&chunk, bytes, offset, 8));
             }
             return Self::wrap(&chunk, name_ident, bytes.len(), checks);
         }
         let mut offset = 0usize;
         while offset + 8 <= bytes.len() {
-            checks.push(Self::chunk_check(&chunk, bytes, offset, 8, folded));
+            checks.push(self.chunk_check(&chunk, bytes, offset, 8));
             offset += 8;
         }
         if offset + 4 <= bytes.len() {
-            checks.push(Self::chunk_check(&chunk, bytes, offset, 4, folded));
+            checks.push(self.chunk_check(&chunk, bytes, offset, 4));
             offset += 4;
         }
         if offset + 2 <= bytes.len() {
-            checks.push(Self::chunk_check(&chunk, bytes, offset, 2, folded));
+            checks.push(self.chunk_check(&chunk, bytes, offset, 2));
             offset += 2;
         }
         if offset < bytes.len() {
@@ -326,57 +334,35 @@ impl BytesMatch {
         Self::wrap(&chunk, name_ident, bytes.len(), checks)
     }
 
-    fn chunk_check(
-        chunk: &Ident,
-        bytes: &[u8],
-        offset: usize,
-        width: usize,
-        folded: bool,
-    ) -> TokenStream {
+    fn chunk_check(self, chunk: &Ident, bytes: &[u8], offset: usize, width: usize) -> TokenStream {
         let c = &bytes[offset..offset + width];
         let end = offset + width;
-        if folded {
+        let indices: Vec<_> = (offset..end).collect();
+        let read = match width {
+            8 => quote! { u64::from_le_bytes([#(#chunk[#indices]),*]) },
+            4 => quote! { u32::from_le_bytes([#(#chunk[#indices]),*]) },
+            2 => quote! { u16::from_le_bytes([#(#chunk[#indices]),*]) },
+            _ => return quote!(false),
+        };
+        let word = Self::little_endian_word(c);
+        if matches!(self, Self::Folded) {
             let mut mask_bytes = vec![0u8; width];
             for (idx, &b) in c.iter().enumerate() {
                 if Self::can_fold_or(b) {
                     mask_bytes[idx] = 0x20;
                 }
             }
-            match width {
-                8 => {
-                    let word = u64::from_le_bytes(c.try_into().unwrap());
-                    let mask = u64::from_le_bytes(mask_bytes.as_slice().try_into().unwrap());
-                    quote! { (u64::from_le_bytes(#chunk[#offset..#end].try_into().unwrap()) | #mask) == #word }
-                }
-                4 => {
-                    let word = u32::from_le_bytes(c.try_into().unwrap());
-                    let mask = u32::from_le_bytes(mask_bytes.as_slice().try_into().unwrap());
-                    quote! { (u32::from_le_bytes(#chunk[#offset..#end].try_into().unwrap()) | #mask) == #word }
-                }
-                2 => {
-                    let word = u16::from_le_bytes(c.try_into().unwrap());
-                    let mask = u16::from_le_bytes(mask_bytes.as_slice().try_into().unwrap());
-                    quote! { (u16::from_le_bytes(#chunk[#offset..#end].try_into().unwrap()) | #mask) == #word }
-                }
-                _ => unreachable!(),
-            }
+            let mask = Self::little_endian_word(&mask_bytes);
+            quote! { ((#read as u64) | #mask) == #word }
         } else {
-            match width {
-                8 => {
-                    let word = u64::from_le_bytes(c.try_into().unwrap());
-                    quote! { u64::from_le_bytes(#chunk[#offset..#end].try_into().unwrap()) == #word }
-                }
-                4 => {
-                    let word = u32::from_le_bytes(c.try_into().unwrap());
-                    quote! { u32::from_le_bytes(#chunk[#offset..#end].try_into().unwrap()) == #word }
-                }
-                2 => {
-                    let word = u16::from_le_bytes(c.try_into().unwrap());
-                    quote! { u16::from_le_bytes(#chunk[#offset..#end].try_into().unwrap()) == #word }
-                }
-                _ => unreachable!(),
-            }
+            quote! { (#read as u64) == #word }
         }
+    }
+
+    fn little_endian_word(bytes: &[u8]) -> u64 {
+        bytes.iter().enumerate().fold(0u64, |word, (idx, byte)| {
+            word | (u64::from(*byte) << (idx * 8))
+        })
     }
 
     fn wrap(
@@ -402,12 +388,12 @@ impl BytesMatch {
 type ProbeKey = (usize, u64, u64, u64);
 type ActionRow = (Vec<u8>, Vec<u8>, TokenStream);
 
-impl Emit {
-    fn prefix_cases(action_specs: &[ActionSpec], unknown_miss: &TokenStream) -> TokenStream {
+impl HeaderEmitter {
+    fn prefix_cases(&self, action_specs: &[ActionSpec], unknown_miss: &TokenStream) -> TokenStream {
         let mut prefix_groups: BTreeMap<ProbeKey, Vec<ActionRow>> = BTreeMap::new();
         for spec in action_specs {
             let (probe_len, probe_word, probe_mask, probe_active, tail) =
-                Self::probe_meta(&spec.bytes);
+                self.probe_meta(&spec.bytes);
             prefix_groups
                 .entry((probe_len, probe_word, probe_mask, probe_active))
                 .or_default()
@@ -426,7 +412,7 @@ impl Emit {
         if can_match {
             let mut match_arms = Vec::new();
             for ((probe_len, probe_word, _, _), group) in groups {
-                let checks = Self::group_checks(probe_len, &group);
+                let checks = self.group_checks(probe_len, &group);
                 let fallback_idx = probe_len.min(5);
                 let probe_key = probe_word | match_mask;
                 match_arms.push(quote! {
@@ -451,8 +437,8 @@ impl Emit {
 
         let mut cases: Vec<(u8, TokenStream, TokenStream)> = Vec::new();
         for ((probe_len, probe_word, probe_mask, probe_active), group) in groups {
-            let priority = Self::prefix_priority(&group[0].0);
-            let checks = Self::group_checks(probe_len, &group);
+            let priority = self.prefix_priority(&group[0].0);
+            let checks = self.group_checks(probe_len, &group);
             let fallback_idx = probe_len.min(5);
             let cond = quote! { ((__probe_word | #probe_mask) & #probe_active) == #probe_word };
             let body = quote! {
@@ -487,7 +473,7 @@ impl Emit {
         }
     }
 
-    fn group_checks(probe_len: usize, group: &[ActionRow]) -> Vec<TokenStream> {
+    fn group_checks(&self, probe_len: usize, group: &[ActionRow]) -> Vec<TokenStream> {
         group
             .iter()
             .map(|(bytes, tail, body)| {
@@ -500,7 +486,7 @@ impl Emit {
                     }
                 } else {
                     let tail_ident = format_ident!("tail");
-                    let cond = BytesMatch::fold(&tail_ident, tail);
+                    let cond = BytesMatch::Folded.emit(&tail_ident, tail);
                     quote! {
                         if rest.len() >= #total_len {
                             let #tail_ident = &rest[#probe_len..#total_len];
@@ -515,7 +501,7 @@ impl Emit {
             .collect()
     }
 
-    fn probe_meta(bytes: &[u8]) -> (usize, u64, u64, u64, Vec<u8>) {
+    fn probe_meta(&self, bytes: &[u8]) -> (usize, u64, u64, u64, Vec<u8>) {
         let mut full = Vec::with_capacity(bytes.len() + 1);
         full.extend_from_slice(bytes);
         full.push(b':');
@@ -545,7 +531,7 @@ impl Emit {
         )
     }
 
-    fn prefix_priority(bytes: &[u8]) -> u8 {
+    fn prefix_priority(&self, bytes: &[u8]) -> u8 {
         match bytes {
             b if b.starts_with(b"host") => 0,
             b if b.starts_with(b"conne") => 1,
@@ -558,48 +544,36 @@ impl Emit {
     }
 }
 
-impl Emit {
-    pub(crate) fn scan() -> Result<TokenStream> {
-        Ok(quote! {
-            Ok(sark::sark_core::http::head::BytesScan::find_header_line_from(rest, 0))
-        })
-    }
-
-    pub(crate) fn apply<'a>(
-        entries: impl IntoIterator<Item = (&'a Ident, Vec<u8>, &'a Type)>,
-        cfg: HeaderParserConfig,
-    ) -> Result<TokenStream> {
-        let plan = HeaderPlan::collect(entries)?;
+impl HeaderEmitter {
+    pub(crate) fn apply(&self) -> Result<TokenStream> {
+        let plan = &self.plan;
+        let cfg = self.config;
         let skip_value = matches!(cfg.value, HeaderValueMode::Skip);
         let skip_apply = matches!(cfg.apply, HeaderApplyMode::Skip);
         if plan.is_empty() && !skip_value {
             return Ok(quote! {
-                return sark::sark_core::http::head::apply_well_known_header(
-                    input,
+                let _ = (input, line_start, scan_info);
+                return sark::sark_core::http::head::WellKnownHeaders::new(scan, flags).apply(
                     line,
-                    line_start,
                     colon_idx,
                     pretrim_start,
                     pretrim_end,
-                    scan,
-                    flags,
-                    scan_info,
                 );
             });
         }
         let raw = format_ident!("__raw");
-        let name_valid = Self::header_name_valid(&raw);
+        let name_valid = self.header_name_valid(&raw);
         let action_enum = format_ident!("__HeaderAction");
         let mut action_specs = Vec::new();
         for (idx, known) in KNOWN_HEADERS.iter().enumerate() {
             let capture = plan.known[idx].clone();
-            let action = format_ident!("Known{}", known.suffix);
+            let action = format_ident!("Known{}", known.suffix());
             let apply = known.apply_call();
             let arm = if let Some(field) = capture {
                 let raw_expr = quote! { raw };
                 let abs_start = quote! { line_start + value_start };
                 let abs_end = quote! { line_start + value_end };
-                let assign = Assign::emit(&field.ident, field.kind, raw_expr, abs_start, abs_end);
+                let assign = field.assignment(raw_expr, abs_start, abs_end);
                 let maybe_assign = if skip_apply {
                     TokenStream::new()
                 } else {
@@ -618,7 +592,7 @@ impl Emit {
             };
             action_specs.push(ActionSpec {
                 variant: action,
-                bytes: known.bytes.to_vec(),
+                bytes: known.bytes().to_vec(),
                 body: arm,
             });
         }
@@ -627,7 +601,7 @@ impl Emit {
             let raw_expr = quote! { raw };
             let abs_start = quote! { line_start + value_start };
             let abs_end = quote! { line_start + value_end };
-            let assign = Assign::emit(&field.ident, field.kind, raw_expr, abs_start, abs_end);
+            let assign = field.assignment(raw_expr, abs_start, abs_end);
             let maybe_assign = if skip_apply {
                 TokenStream::new()
             } else {
@@ -642,7 +616,7 @@ impl Emit {
                 }},
             });
         }
-        let action_select_arms = Self::action_select(&action_enum, &action_specs, true);
+        let action_select_arms = self.action_select(&action_enum, &action_specs, true);
         let action_variants: Vec<_> = action_specs.iter().map(|spec| &spec.variant).collect();
         let action_arms: Vec<_> = action_specs
             .iter()
@@ -657,7 +631,9 @@ impl Emit {
                 return Err(sark_core::error::Error::BadRequest("Invalid header name".into()));
             }
             let _ = scan_info;
-            let name = &line[..colon_idx];
+            let Some(name) = line.get(..colon_idx) else {
+                return Err(sark_core::error::Error::BadRequest("Invalid header name".into()));
+            };
             for &#raw in name {
                 if !(#name_valid) {
                     return Err(sark_core::error::Error::BadRequest("Invalid header name".into()));
@@ -683,7 +659,10 @@ impl Emit {
             let mut value_end = line.len();
             if let Some(start) = pretrim_start {
                 value_start = start.min(line.len());
-                value_end = pretrim_end.unwrap_or(line.len()).min(line.len());
+                value_end = match pretrim_end {
+                    Some(end) => end.min(line.len()),
+                    None => line.len(),
+                };
             } else {
                 while value_start < line.len() && (line[value_start] == b' ' || line[value_start] == b'\t') {
                     value_start += 1;
@@ -692,7 +671,9 @@ impl Emit {
                     value_end -= 1;
                 }
             }
-            let raw = &line[value_start..value_end];
+            let Some(raw) = line.get(value_start..value_end) else {
+                return Err(sark_core::error::Error::BadRequest("Invalid header value".into()));
+            };
             match action {
                 #( #action_arms )*
                 #action_enum::Unknown => Ok(()),
@@ -700,19 +681,15 @@ impl Emit {
         })
     }
 
-    pub(crate) fn contig<'a>(
-        entries: impl IntoIterator<Item = (&'a Ident, Vec<u8>, &'a Type)>,
-        cfg: HeaderParserConfig,
-    ) -> Result<TokenStream> {
-        let plan = HeaderPlan::collect(entries)?;
+    pub(crate) fn contiguous(&self) -> Result<TokenStream> {
+        let plan = &self.plan;
+        let cfg = self.config;
         let skip_value = matches!(cfg.value, HeaderValueMode::Skip);
         let skip_apply = matches!(cfg.apply, HeaderApplyMode::Skip);
         if plan.is_empty() && !skip_value {
             return Ok(quote! {
-                return sark::sark_core::http::head::apply_well_known_header_contig(
+                return sark::sark_core::http::head::WellKnownHeaders::new(scan, flags).apply_contiguous(
                     rest,
-                    scan,
-                    flags,
                     &mut (),
                     header_count,
                     max_header_count,
@@ -720,7 +697,7 @@ impl Emit {
             });
         }
         let raw = format_ident!("__raw");
-        let name_valid = Self::header_name_valid(&raw);
+        let name_valid = self.header_name_valid(&raw);
         if plan.custom.iter().any(|field| field.bytes.len() < 4) {
             return Err(syn::Error::new(
                 Span::call_site(),
@@ -735,7 +712,7 @@ impl Emit {
         }
 
         let count_tail = quote! {
-            if *header_count == max_header_count {
+            if *header_count >= max_header_count {
                 return Err(sark::error::Error::BadRequest("Too many headers".into()));
             }
             *header_count += 1;
@@ -772,14 +749,23 @@ impl Emit {
             let tail_end = __value_idx - (colon_idx + 1);
         };
         let unknown_dispatch = quote! {
-            let Some(__line_end) = sark::sark_core::http::head::BytesScan::find_crlf_from(rest, colon_idx + 1) else {
-                return Ok(None);
-            };
-            #count_tail
-            return Ok(Some(__line_end));
+            return sark::sark_core::http::head::WellKnownHeaders::new(scan, flags)
+                .apply_unknown_contiguous(
+                    rest,
+                    colon_idx,
+                    &mut (),
+                    header_count,
+                    max_header_count,
+                );
         };
         let unknown_miss = quote! {
-            return sark::sark_core::http::head::unknown_line(rest, idx, &mut (), header_count, max_header_count);
+            return sark::sark_core::http::head::WellKnownHeaders::new(scan, flags).apply_unknown_contiguous(
+                rest,
+                idx,
+                &mut (),
+                header_count,
+                max_header_count,
+            );
         };
         let mut action_specs = Vec::new();
         for field in &plan.custom {
@@ -790,7 +776,7 @@ impl Emit {
             };
             let abs_start = quote! { line_start + colon_idx + 1 + value_start };
             let abs_end = quote! { line_start + colon_idx + 1 + value_end };
-            let assign = Assign::emit(&field.ident, field.kind, raw_expr, abs_start, abs_end);
+            let assign = field.assignment(raw_expr, abs_start, abs_end);
             let maybe_assign = if skip_apply {
                 TokenStream::new()
             } else {
@@ -816,24 +802,20 @@ impl Emit {
 
         for (idx, known) in KNOWN_HEADERS.iter().enumerate() {
             let capture = plan.known[idx].clone();
-            let action = format_ident!("Known{}", known.suffix);
+            let action = format_ident!("Known{}", known.suffix());
             let body = if skip_value {
                 unknown_dispatch.clone()
             } else {
-                KnownKind::from_index(idx).build_contig_arm(
-                    capture.as_ref(),
-                    &count_tail,
-                    skip_apply,
-                )
+                known.build_contig_arm(capture.as_ref(), &count_tail, skip_apply)
             };
             action_specs.push(ActionSpec {
                 variant: action,
-                bytes: known.bytes.to_vec(),
+                bytes: known.bytes().to_vec(),
                 body,
             });
         }
 
-        let prefix_detect = Self::prefix_cases(&action_specs, &unknown_miss);
+        let prefix_detect = self.prefix_cases(&action_specs, &unknown_miss);
 
         Ok(quote! {
             let colon_idx = 'name: {
@@ -872,14 +854,17 @@ impl Emit {
                     }
                 }
 
-                let __probe_word = u64::from_le_bytes(rest[..8].try_into().unwrap());
+                let Some(__probe) = rest.first_chunk::<8>() else {
+                    return Ok(None);
+                };
+                let __probe_word = u64::from_le_bytes(*__probe);
                 #prefix_detect
             };
             #unknown_dispatch
         })
     }
 
-    fn header_name_valid(raw: &Ident) -> TokenStream {
+    fn header_name_valid(&self, raw: &Ident) -> TokenStream {
         quote! {
             #raw.is_ascii_alphanumeric()
                 || matches!(
@@ -903,11 +888,12 @@ impl Emit {
     }
 
     fn action_select(
+        &self,
         action_enum: &Ident,
         action_specs: &[ActionSpec],
         canonical_name: bool,
     ) -> Vec<TokenStream> {
-        Value::group_arms_by_length(action_specs.iter().map(|spec| {
+        LengthArms::collect(action_specs.iter().map(|spec| {
             let lit = LitByteStr::new(spec.bytes.as_slice(), Span::call_site());
             let variant = &spec.variant;
             let cond = if canonical_name {
@@ -924,5 +910,6 @@ impl Emit {
                 },
             )
         }))
+        .emit()
     }
 }

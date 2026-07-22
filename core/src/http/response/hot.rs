@@ -1,21 +1,17 @@
 use o3::buffer::{Borrowed, Bytes, Owned, Retained, Shared};
 
 use super::direct::INLINE_HOT_TEXT_PARTS;
-use super::{BodyInner, DEFAULT_HEADER_CAPACITY, HeadInner};
+use super::{Body, DEFAULT_HEADER_CAPACITY, HeadInner};
 
 #[derive(Clone)]
-pub enum TextItemInner<'req> {
+pub enum TextItem<'req> {
     Static(&'static [u8]),
     Shared(Shared),
     Borrowed(Bytes<Borrowed<'req>>),
     Retained(Bytes<Retained>),
 }
 
-pub type TextItem = TextItemInner<'static>;
-
-pub type TextBody = HotTextInner<'static>;
-
-impl<'req> std::fmt::Debug for TextItemInner<'req> {
+impl<'req> std::fmt::Debug for TextItem<'req> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Static(bytes) => f
@@ -38,7 +34,7 @@ impl<'req> std::fmt::Debug for TextItemInner<'req> {
     }
 }
 
-impl<'req> TextItemInner<'req> {
+impl<'req> TextItem<'req> {
     pub(crate) fn placeholder() -> Self {
         Self::Static(&[])
     }
@@ -77,20 +73,20 @@ impl<'req, const N: usize> HotHeadInner<'req, N> {
     }
 }
 
-pub struct HotTextInner<'req> {
-    items: [TextItemInner<'req>; INLINE_HOT_TEXT_PARTS],
+pub struct TextBody<'req> {
+    items: [TextItem<'req>; INLINE_HOT_TEXT_PARTS],
     len: u8,
     body_len: usize,
 }
 
-impl<'req> Clone for HotTextInner<'req> {
+impl<'req> Clone for TextBody<'req> {
     fn clone(&self) -> Self {
         let len = usize::from(self.len);
         let items = std::array::from_fn(|idx| {
             if idx < len {
                 self.items[idx].clone()
             } else {
-                TextItemInner::placeholder()
+                TextItem::placeholder()
             }
         });
         Self {
@@ -101,7 +97,7 @@ impl<'req> Clone for HotTextInner<'req> {
     }
 }
 
-impl<'req> std::fmt::Debug for HotTextInner<'req> {
+impl<'req> std::fmt::Debug for TextBody<'req> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("HotText")
             .field("len", &self.len)
@@ -110,22 +106,22 @@ impl<'req> std::fmt::Debug for HotTextInner<'req> {
     }
 }
 
-impl<'req> Default for HotTextInner<'req> {
+impl<'req> Default for TextBody<'req> {
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl<'req> HotTextInner<'req> {
+impl<'req> TextBody<'req> {
     pub fn new() -> Self {
         Self {
-            items: std::array::from_fn(|_| TextItemInner::placeholder()),
+            items: std::array::from_fn(|_| TextItem::placeholder()),
             len: 0,
             body_len: 0,
         }
     }
 
-    pub fn from_items<const N: usize>(items: [TextItemInner<'req>; N]) -> Self {
+    pub fn from_items<const N: usize>(items: [TextItem<'req>; N]) -> Self {
         assert!(
             N <= INLINE_HOT_TEXT_PARTS,
             "hot text part overflow: max {}",
@@ -138,7 +134,7 @@ impl<'req> HotTextInner<'req> {
                 body_len += item.len();
                 item
             }
-            None => TextItemInner::placeholder(),
+            None => TextItem::placeholder(),
         });
         Self {
             items: entries,
@@ -163,21 +159,21 @@ impl<'req> HotTextInner<'req> {
 
     pub fn push_static(&mut self, bytes: &'static [u8]) -> &mut Self {
         if !bytes.is_empty() {
-            self.push_item(TextItemInner::Static(bytes));
+            self.push_item(TextItem::Static(bytes));
         }
         self
     }
 
     pub fn push_borrowed(&mut self, bytes: Bytes<Borrowed<'req>>) -> &mut Self {
         if !bytes.is_empty() {
-            self.push_item(TextItemInner::Borrowed(bytes));
+            self.push_item(TextItem::Borrowed(bytes));
         }
         self
     }
 
     pub fn push_retained(&mut self, bytes: Bytes<Retained>) -> &mut Self {
         if !bytes.is_empty() {
-            self.push_item(TextItemInner::Retained(bytes));
+            self.push_item(TextItem::Retained(bytes));
         }
         self
     }
@@ -201,7 +197,7 @@ impl<'req> HotTextInner<'req> {
         out.freeze()
     }
 
-    fn push_item(&mut self, item: TextItemInner<'req>) {
+    fn push_item(&mut self, item: TextItem<'req>) {
         assert!(
             usize::from(self.len) < INLINE_HOT_TEXT_PARTS,
             "hot text part overflow: max {}",
@@ -213,6 +209,12 @@ impl<'req> HotTextInner<'req> {
     }
 }
 
+impl<'req, const N: usize> From<[TextItem<'req>; N]> for TextBody<'req> {
+    fn from(items: [TextItem<'req>; N]) -> Self {
+        Self::from_items(items)
+    }
+}
+
 #[allow(clippy::large_enum_variant)]
 #[derive(Clone)]
 pub enum HotBodyInner<'req> {
@@ -220,7 +222,7 @@ pub enum HotBodyInner<'req> {
     Shared(Shared),
     Borrowed(Bytes<Borrowed<'req>>),
     Retained(Bytes<Retained>),
-    Text(HotTextInner<'req>),
+    Text(TextBody<'req>),
     StaticSlice(&'static [u8]),
 }
 
@@ -278,19 +280,19 @@ impl<'req> HotBodyInner<'req> {
     }
 }
 
-impl<'req> From<BodyInner<'req>> for HotBodyInner<'req> {
-    fn from(body: BodyInner<'req>) -> Self {
+impl<'req> From<Body<'req>> for HotBodyInner<'req> {
+    fn from(body: Body<'req>) -> Self {
         match body {
-            BodyInner::Owned(body) => Self::Owned(body),
-            BodyInner::Shared(body) => Self::Shared(body),
-            BodyInner::Borrowed(body) => Self::Borrowed(body),
-            BodyInner::Retained(body) => Self::Retained(body),
-            BodyInner::StaticSlice(body) => Self::StaticSlice(body),
+            Body::Owned(body) => Self::Owned(body),
+            Body::Shared(body) => Self::Shared(body),
+            Body::Borrowed(body) => Self::Borrowed(body),
+            Body::Retained(body) => Self::Retained(body),
+            Body::StaticSlice(body) => Self::StaticSlice(body),
         }
     }
 }
 
-impl From<HotBodyInner<'static>> for BodyInner<'static> {
+impl From<HotBodyInner<'static>> for Body<'static> {
     fn from(body: HotBodyInner<'static>) -> Self {
         match body {
             HotBodyInner::Owned(body) => Self::Owned(body),

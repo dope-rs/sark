@@ -5,8 +5,9 @@ use std::pin::Pin;
 mod call;
 mod egress;
 
-use call::{CallRecord, CallStore, MessageNode, MessageNodeKey, MessageNodeTag, StreamState};
-use egress::{PendingResponse, ReplyBatch, ReplyBatchTag, ResponseDrive};
+use call::{CallRecord, CallStore, StreamState};
+pub use call::{MessageIter, MessageList};
+use egress::Egress;
 
 use dope::manifold::env::Bundle;
 use dope::manifold::listener::{self, Application, Listener};
@@ -19,7 +20,7 @@ use dope_net::wire::identity::Identity;
 use dope_net::{tcp, tcp::Tcp};
 use dope_tls::tls::{Endpoint, Tls};
 use o3::buffer::{RetainBytes, SharedPool};
-use o3::collections::{FixedHashTable, FixedQueue, Slab};
+use o3::collections::{FixedHashTable, FixedQueue};
 use sark_core::identity_mut;
 use sark_h2::tuning::Tuning;
 use sark_h2::{Conn, ErrorCode, ServerRole, StreamId, conn};
@@ -66,27 +67,8 @@ pub struct Config {
     pub grpc: Limits,
 }
 
-pub type Env = Bundle<Tcp, Identity, Throughput>;
-pub type TlsEnv = Bundle<Tcp, Tls, Throughput>;
-
-fn listener_config(bind: SocketAddr, cfg: &Config) -> listener::Config<Tcp> {
-    listener::Config::<Tcp> {
-        max_connections: cfg.max_connections,
-        bind,
-        backlog: cfg.backlog,
-        stream: Default::default(),
-        transport: tcp::listener::Config {
-            reuse_port: true,
-            per_ip_limit: Some((cfg.max_connections / 2) as u32),
-            ..Default::default()
-        },
-        egress: Default::default(),
-    }
-}
-
-fn driver_config(cfg: &Config) -> dope::driver::Config {
-    dope::driver::Config::for_tcp_profile::<Throughput>(cfg.max_connections)
-}
+type Env = Bundle<Tcp, Identity, Throughput>;
+type TlsEnv = Bundle<Tcp, Tls, Throughput>;
 
 #[pin_project::pin_project]
 #[derive(dope_gen::Dispatcher)]
@@ -94,34 +76,6 @@ struct Dispatcher<'d, H: Handler> {
     #[pin]
     #[manifold]
     listener: Listener<'d, 0, App<H>, Env>,
-}
-
-pub fn serve<H: Handler>(
-    handler: H,
-    cfg: Config,
-    context: WorkerContext,
-    shutdown: Option<&ShutdownTrigger>,
-) -> io::Result<()> {
-    let exec = Executor::with_seed(driver_config(&cfg), context.seed())?;
-    exec.enter(|mut sess| {
-        let hash_builder = sess.seed().derive(dope::hash::domain::ACCEPT).state();
-        let mut app = App::with_config(handler, cfg.grpc.clone());
-        app.liveness_fallback = cfg.readiness.is_some();
-        let listener = {
-            let mut driver = sess.driver_access();
-            if let Some(trigger) = shutdown {
-                trigger.try_register(&mut driver)?;
-            }
-            Listener::<0, App<H>, Env>::open_in(
-                app,
-                listener_config(cfg.bind, &cfg),
-                hash_builder,
-                &mut driver,
-            )?
-        };
-        let app = core::pin::pin!(o3::cell::BrandCell::new(Dispatcher { listener }));
-        sess.run(app.as_ref())
-    })
 }
 
 #[pin_project::pin_project]
@@ -135,46 +89,93 @@ struct TlsDispatcher<'d, H: Handler> {
     readiness: Option<Listener<'d, 1, liveness::Liveness, Env>>,
 }
 
-pub fn serve_tls<H: Handler>(
-    handler: H,
-    cfg: Config,
-    tls_cfg: shin::server::Config,
-    context: WorkerContext,
-    shutdown: Option<&ShutdownTrigger>,
-) -> io::Result<()> {
-    let exec = Executor::with_seed(driver_config(&cfg), context.seed())?;
-    exec.enter(|mut sess| {
-        let accept_hash = sess.seed().derive(dope::hash::domain::ACCEPT).state();
-        let readiness_hash = sess.seed().derive(dope::hash::domain::ACCEPT ^ 1).state();
-        let (listener, readiness) = {
-            let mut driver = sess.driver_access();
-            if let Some(trigger) = shutdown {
-                trigger.try_register(&mut driver)?;
-            }
-            let mut listener = Listener::<0, App<H, Tls>, TlsEnv>::open_in(
-                App::with_config(handler, cfg.grpc.clone()),
-                listener_config(cfg.bind, &cfg),
-                accept_hash,
-                &mut driver,
-            )?;
-            listener.set_config(Endpoint::Server(Box::new(tls_cfg)));
-            let readiness = match cfg.readiness {
-                Some(addr) => Some(Listener::<1, liveness::Liveness, Env>::open_in(
-                    liveness::Liveness,
-                    listener_config(addr, &cfg),
-                    readiness_hash,
+impl Config {
+    fn listener_config(&self, bind: SocketAddr) -> listener::Config<Tcp> {
+        listener::Config::<Tcp> {
+            max_connections: self.max_connections,
+            bind,
+            backlog: self.backlog,
+            stream: Default::default(),
+            transport: tcp::listener::Config {
+                reuse_port: true,
+                per_ip_limit: Some((self.max_connections / 2) as u32),
+                ..Default::default()
+            },
+            egress: Default::default(),
+        }
+    }
+
+    pub fn serve<H: Handler>(
+        self,
+        handler: H,
+        context: WorkerContext,
+        shutdown: Option<&ShutdownTrigger>,
+    ) -> io::Result<()> {
+        let driver = dope::driver::Config::for_tcp_profile::<Throughput>(self.max_connections);
+        let exec = Executor::with_seed(driver, context.seed())?;
+        exec.enter(|mut sess| {
+            let hash_builder = sess.seed().derive(dope::hash::domain::ACCEPT).state();
+            let mut app = App::with_config(handler, self.grpc.clone());
+            app.liveness_fallback = self.readiness.is_some();
+            let listener = {
+                let mut driver = sess.driver_access();
+                if let Some(trigger) = shutdown {
+                    trigger.try_register(&mut driver)?;
+                }
+                Listener::<0, App<H>, Env>::open_in(
+                    app,
+                    self.listener_config(self.bind),
+                    hash_builder,
                     &mut driver,
-                )?),
-                None => None,
+                )?
             };
-            (listener, readiness)
-        };
-        let app = core::pin::pin!(o3::cell::BrandCell::new(TlsDispatcher {
-            listener,
-            readiness,
-        }));
-        sess.run(app.as_ref())
-    })
+            let app = core::pin::pin!(o3::cell::BrandCell::new(Dispatcher { listener }));
+            sess.run(app.as_ref())
+        })
+    }
+
+    pub fn serve_tls<H: Handler>(
+        self,
+        handler: H,
+        tls_cfg: shin::server::Config,
+        context: WorkerContext,
+        shutdown: Option<&ShutdownTrigger>,
+    ) -> io::Result<()> {
+        let driver = dope::driver::Config::for_tcp_profile::<Throughput>(self.max_connections);
+        let exec = Executor::with_seed(driver, context.seed())?;
+        exec.enter(|mut sess| {
+            let accept_hash = sess.seed().derive(dope::hash::domain::ACCEPT).state();
+            let readiness_hash = sess.seed().derive(dope::hash::domain::ACCEPT ^ 1).state();
+            let (listener, readiness) = {
+                let mut driver = sess.driver_access();
+                if let Some(trigger) = shutdown {
+                    trigger.try_register(&mut driver)?;
+                }
+                let mut listener = Listener::<0, App<H, Tls>, TlsEnv>::open_in(
+                    App::with_config(handler, self.grpc.clone()),
+                    self.listener_config(self.bind),
+                    accept_hash,
+                    &mut driver,
+                )?;
+                listener.set_config(Endpoint::Server(Box::new(tls_cfg)));
+                let readiness = match self.readiness {
+                    Some(addr) => Some(Listener::<1, liveness::Liveness, Env>::open_in(
+                        liveness::Liveness,
+                        self.listener_config(addr),
+                        readiness_hash,
+                        &mut driver,
+                    )?),
+                    None => None,
+                };
+                (listener, readiness)
+            };
+            let app = core::pin::pin!(o3::cell::BrandCell::new(TlsDispatcher {
+                listener,
+                readiness,
+            }));
+            sess.run(app.as_ref())
+        })
+    }
 }
 
 mod liveness {
@@ -184,39 +185,37 @@ mod liveness {
 
     const RESPONSE: &[u8] = b"HTTP/1.1 200 OK\r\ncontent-length: 0\r\nconnection: close\r\n\r\n";
 
-    pub const H2_PREFACE: &[u8] = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
-
-    pub fn is_h2_preface_prefix(buf: &[u8]) -> bool {
-        let n = buf.len().min(H2_PREFACE.len());
-        buf[..n] == H2_PREFACE[..n]
-    }
-
-    pub fn is_plain_request(first: &[u8]) -> bool {
-        !is_h2_preface_prefix(first)
-    }
-
-    pub fn respond<'d, W: Wire, C: Default + 'static>(
-        slot: &mut Slot<'d, W, listener::State<C>>,
-        aux: &mut listener::Aux,
-        driver: &mut DriverContext<'_, 'd>,
-    ) {
-        if slot.is_send_inflight() {
-            return;
-        }
-        let ud = slot.token();
-        let mut buf = aux.write_buf_for(slot);
-        buf[..RESPONSE.len()].copy_from_slice(RESPONSE);
-        slot.set_close_after();
-        dope::manifold::listener::SlotEgress::submit_buffered(
-            slot,
-            buf,
-            RESPONSE.len(),
-            ud,
-            driver,
-        );
-    }
-
     pub struct Liveness;
+
+    impl Liveness {
+        const H2_PREFACE: &'static [u8] = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
+
+        pub(super) fn is_plain_request(first: &[u8]) -> bool {
+            let n = first.len().min(Self::H2_PREFACE.len());
+            first[..n] != Self::H2_PREFACE[..n]
+        }
+
+        pub(super) fn respond<'d, W: Wire, C: Default + 'static>(
+            slot: &mut Slot<'d, W, listener::State<C>>,
+            aux: &mut listener::Aux,
+            driver: &mut DriverContext<'_, 'd>,
+        ) {
+            if slot.is_send_inflight() {
+                return;
+            }
+            let ud = slot.token();
+            let mut buf = aux.write_buf_for(slot);
+            buf[..RESPONSE.len()].copy_from_slice(RESPONSE);
+            slot.set_close_after();
+            dope::manifold::listener::SlotEgress::submit_buffered(
+                slot,
+                buf,
+                RESPONSE.len(),
+                ud,
+                driver,
+            );
+        }
+    }
 
     impl<'d> Application<'d> for Liveness {
         type Conn = ();
@@ -229,7 +228,7 @@ mod liveness {
             aux: &mut listener::Aux,
             driver: &mut DriverContext<'_, 'd>,
         ) -> manifold::Outcome {
-            respond(slot, aux, driver);
+            Self::respond(slot, aux, driver);
             manifold::Outcome::Ok
         }
 
@@ -247,82 +246,6 @@ mod liveness {
             _slot: &mut Slot<'d, Identity, listener::State<()>>,
             _aux: &mut listener::Aux,
         ) {
-        }
-    }
-}
-
-pub use liveness::{H2_PREFACE, is_h2_preface_prefix, is_plain_request};
-
-pub struct MessageList<'a> {
-    repr: MessageListRepr<'a>,
-    len: usize,
-}
-
-enum MessageListRepr<'a> {
-    Chain {
-        nodes: &'a Slab<MessageNode, MessageNodeTag>,
-        next: Option<MessageNodeKey>,
-    },
-    Queue(&'a FixedQueue<MessageFrame>),
-}
-
-impl MessageList<'_> {
-    pub fn len(&self) -> usize {
-        self.len
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.len == 0
-    }
-
-    pub fn iter(&self) -> MessageIter<'_> {
-        let repr = match &self.repr {
-            MessageListRepr::Chain { nodes, next } => MessageIterRepr::Chain { nodes, next: *next },
-            MessageListRepr::Queue(queue) => MessageIterRepr::Queue { queue, index: 0 },
-        };
-        MessageIter { repr }
-    }
-}
-
-impl<'a> IntoIterator for &'a MessageList<'_> {
-    type Item = &'a MessageFrame;
-    type IntoIter = MessageIter<'a>;
-
-    fn into_iter(self) -> Self::IntoIter {
-        self.iter()
-    }
-}
-
-pub struct MessageIter<'a> {
-    repr: MessageIterRepr<'a>,
-}
-
-enum MessageIterRepr<'a> {
-    Chain {
-        nodes: &'a Slab<MessageNode, MessageNodeTag>,
-        next: Option<MessageNodeKey>,
-    },
-    Queue {
-        queue: &'a FixedQueue<MessageFrame>,
-        index: usize,
-    },
-}
-
-impl<'a> Iterator for MessageIter<'a> {
-    type Item = &'a MessageFrame;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        match &mut self.repr {
-            MessageIterRepr::Chain { nodes, next } => {
-                let node = nodes.get((*next)?)?;
-                *next = node.next;
-                Some(&node.message)
-            }
-            MessageIterRepr::Queue { queue, index } => {
-                let message = queue.get(*index)?;
-                *index += 1;
-                Some(message)
-            }
         }
     }
 }
@@ -364,17 +287,13 @@ impl Response {
     }
 
     pub fn encode_body(&self, out: &mut Vec<u8>) -> Result<(), Status> {
-        encode_frames(&self.messages, out)
+        out.reserve(self.messages.iter().map(|payload| payload.len() + 5).sum());
+        for payload in &self.messages {
+            MessageFrame::encode(false, payload, out)
+                .map_err(|_| Status::new(Code::Internal, "response message too large"))?;
+        }
+        Ok(())
     }
-}
-
-fn encode_frames(messages: &[Vec<u8>], out: &mut Vec<u8>) -> Result<(), Status> {
-    out.reserve(messages.iter().map(|p| p.len() + 5).sum());
-    for payload in messages {
-        MessageFrame::encode(false, payload, out)
-            .map_err(|_| Status::new(Code::Internal, "response message too large"))?;
-    }
-    Ok(())
 }
 
 fn compression_unsupported() -> Status {
@@ -655,50 +574,56 @@ fn dispatch_request(
     Ok(response)
 }
 
-pub fn dispatch_buffered(
-    handler: &mut (impl Handler + ?Sized),
-    head: RequestHead,
-    body: &[u8],
-    config: &Limits,
-) -> Response {
-    let mut deframer = Deframer::new(config.max_message_len);
-    let input_pool = SharedPool::new(1, body.len().max(1));
-    let mut lease = input_pool.try_acquire().unwrap();
-    if lease.spare_writer().try_extend_from_slice(body).is_err() {
-        return Response::with_status(Status::new(Code::ResourceExhausted, "request is too large"));
-    }
-    let mut input = DataChunk::from_pooled(lease.freeze());
-    let fragment_pool = SharedPool::new(1, config.max_message_len.max(1));
-    let capacity = config
-        .max_buffered_msgs
-        .min(body.len() / 5 + usize::from(!body.is_empty()));
-    let mut queue = FixedQueue::with_capacity(capacity);
-    while !input.is_empty() {
-        match deframer.next(&mut input, &fragment_pool) {
-            Ok(Some(message)) => {
-                if queue.push_back(message).is_err() {
-                    return Response::with_status(Status::new(
-                        Code::ResourceExhausted,
-                        "request message buffer is full",
-                    ));
-                }
-            }
-            Ok(None) => continue,
-            Err(error) => return Response::with_status(Status::from_frame_err(error)),
+impl Limits {
+    pub fn dispatch_buffered(
+        &self,
+        handler: &mut (impl Handler + ?Sized),
+        head: RequestHead,
+        body: &[u8],
+    ) -> Response {
+        let mut deframer = Deframer::new(self.max_message_len);
+        let input_pool = SharedPool::new(1, body.len().max(1));
+        let Some(mut lease) = input_pool.try_acquire() else {
+            return Response::with_status(Status::new(
+                Code::ResourceExhausted,
+                "request buffer is unavailable",
+            ));
+        };
+        if lease.spare_writer().try_extend_from_slice(body).is_err() {
+            return Response::with_status(Status::new(
+                Code::ResourceExhausted,
+                "request is too large",
+            ));
         }
+        let mut input = DataChunk::from_pooled(lease.freeze());
+        let fragment_pool = SharedPool::new(1, self.max_message_len.max(1));
+        let capacity = self
+            .max_buffered_msgs
+            .min(body.len() / 5 + usize::from(!body.is_empty()));
+        let mut queue = FixedQueue::with_capacity(capacity);
+        while !input.is_empty() {
+            match deframer.next(&mut input, &fragment_pool) {
+                Ok(Some(message)) => {
+                    if queue.push_back(message).is_err() {
+                        return Response::with_status(Status::new(
+                            Code::ResourceExhausted,
+                            "request message buffer is full",
+                        ));
+                    }
+                }
+                Ok(None) => continue,
+                Err(error) => return Response::with_status(Status::from_frame_err(error)),
+            }
+        }
+        dispatch_request(
+            handler,
+            StreamId(0),
+            head,
+            MessageList::from_queue(&queue),
+            Metadata::new(),
+        )
+        .unwrap_or_else(Response::with_status)
     }
-    let len = queue.len();
-    dispatch_request(
-        handler,
-        StreamId(0),
-        head,
-        MessageList {
-            repr: MessageListRepr::Queue(&queue),
-            len,
-        },
-        Metadata::new(),
-    )
-    .unwrap_or_else(Response::with_status)
 }
 
 #[derive(Clone, Debug)]
@@ -1038,10 +963,7 @@ impl<H: LiveStreamingHandler> Handler for LiveStreaming<H> {
 pub struct ConnState {
     h2: Conn<ServerRole>,
     calls: CallStore,
-    pending: FixedQueue<StreamId>,
-    replies: Slab<ReplyBatch, ReplyBatchTag>,
-    pending_len: usize,
-    pending_capacity: usize,
+    egress: Egress,
     live_routes: StreamRoutes,
     message_pool: SharedPool,
     probed: bool,
@@ -1063,10 +985,11 @@ impl ConnState {
         Self {
             h2,
             calls: CallStore::with_capacity(capacity, limits.max_buffered_msgs),
-            pending: FixedQueue::with_capacity(capacity),
-            replies: Slab::with_capacity(limits.max_pending_replies),
-            pending_len: 0,
-            pending_capacity: limits.max_pending_len,
+            egress: Egress::with_capacity(
+                capacity,
+                limits.max_pending_replies,
+                limits.max_pending_len,
+            ),
             live_routes: StreamRoutes::with_capacity(capacity),
             message_pool: SharedPool::new(
                 limits.max_fragmented_messages,
@@ -1195,16 +1118,7 @@ impl<H: Handler, W: Wire> App<H, W> {
                     .start(&mut state.live_routes, stream_id, &head, &mut reply);
                 if !state.insert_stream(
                     stream_id,
-                    StreamState {
-                        head,
-                        deframer: Deframer::new(self.config.max_message_len),
-                        message_head: None,
-                        message_tail: None,
-                        message_count: 0,
-                        trailers: Metadata::new(),
-                        mode,
-                        buffered_len: 0,
-                    },
+                    StreamState::new(head, self.config.max_message_len, mode),
                 ) {
                     state.live_routes.release(stream_id);
                     state.send_error(
@@ -1284,16 +1198,16 @@ impl<H: Handler, W: Wire> App<H, W> {
                 state.drive_pending();
                 continue;
             }
-            let added = message.payload.len();
-            let over_limit = {
-                let stream = state.stream_mut(stream_id).unwrap();
-                stream.buffered_len.saturating_add(added) > self.config.max_buffered_len
-                    || stream.message_count == self.config.max_buffered_msgs
-            };
-            if over_limit
-                || state.calls.buffered_total().saturating_add(added)
-                    > self.config.max_conn_buffered_len
-                || state.push_message(stream_id, message).is_err()
+            if state
+                .calls
+                .push_message(
+                    stream_id,
+                    message,
+                    self.config.max_buffered_len,
+                    self.config.max_buffered_msgs,
+                    self.config.max_conn_buffered_len,
+                )
+                .is_err()
             {
                 state.remove_stream(stream_id);
                 state.send_error(
@@ -1302,8 +1216,6 @@ impl<H: Handler, W: Wire> App<H, W> {
                 );
                 return;
             }
-            state.calls.add_buffered(added);
-            state.stream_mut(stream_id).unwrap().buffered_len += added;
         }
         state.drive_pending();
     }
@@ -1327,14 +1239,8 @@ impl<H: Handler, W: Wire> App<H, W> {
             state.drive_pending();
             return;
         }
-        let message_head = stream.message_head;
-        let messages = MessageList {
-            repr: MessageListRepr::Chain {
-                nodes: state.calls.messages(),
-                next: message_head,
-            },
-            len: stream.message_count,
-        };
+        let message_chain = stream.message_chain();
+        let messages = state.calls.message_list(message_chain);
         let response = dispatch_request(
             &mut self.handler,
             stream_id,
@@ -1342,7 +1248,7 @@ impl<H: Handler, W: Wire> App<H, W> {
             messages,
             stream.trailers,
         );
-        state.clear_messages(message_head);
+        state.calls.release_messages(message_chain);
         match response {
             Ok(response) => {
                 state.enqueue_response(stream_id, response);
@@ -1391,8 +1297,8 @@ impl<H: Handler, W: Wire> App<H, W> {
         let bytes = chunk.as_slice();
         if self.liveness_fallback && !project(&mut slot.state.conn).probed {
             project(&mut slot.state.conn).probed = true;
-            if liveness::is_plain_request(bytes) {
-                liveness::respond(slot, aux, driver);
+            if liveness::Liveness::is_plain_request(bytes) {
+                liveness::Liveness::respond(slot, aux, driver);
                 return manifold::Outcome::Ok;
             }
         }
@@ -1443,7 +1349,10 @@ impl<'d, H: Handler, W: Wire> Application<'d> for App<H, W> {
     type Wire = W;
 
     fn connection(self: Pin<&Self>) -> Self::Conn {
-        ConnState::with_limits(&self.get_ref().config)
+        let app = self.get_ref();
+        let mut state = ConnState::with_limits(&app.config);
+        state.probed = !app.liveness_fallback;
+        state
     }
 
     fn chunk<R: RetainBytes>(
@@ -1503,26 +1412,9 @@ impl ConnState {
         self.calls.insert(stream_id, stream)
     }
 
-    fn push_message(
-        &mut self,
-        stream_id: StreamId,
-        message: MessageFrame,
-    ) -> Result<(), MessageFrame> {
-        self.calls.push_message(stream_id, message)
-    }
-
-    fn clear_messages(&mut self, next: Option<MessageNodeKey>) {
-        self.calls.clear_messages(next);
-    }
-
     fn remove_stream(&mut self, stream_id: StreamId) -> Option<StreamState> {
-        let call = self.calls.remove(stream_id)?;
-        if call.queued {
-            self.pending.retain(|pending| *pending != stream_id);
-        }
-        if let Some(pending) = call.pending {
-            self.release_response(pending);
-        }
+        let mut call = self.calls.remove(stream_id)?;
+        self.egress.detach(stream_id, &mut call);
         let stream = call.stream?;
         self.calls.release_stream(&stream);
         Some(stream)
@@ -1530,10 +1422,6 @@ impl ConnState {
 
     fn take_stream(&mut self, stream_id: StreamId) -> Option<StreamState> {
         self.calls.take_stream(stream_id)
-    }
-
-    fn remove_empty_call(&mut self, stream_id: StreamId) {
-        self.calls.remove_empty(stream_id);
     }
 
     fn enqueue_response(&mut self, stream_id: StreamId, response: Response) {
@@ -1547,185 +1435,13 @@ impl ConnState {
     }
 
     fn enqueue_reply(&mut self, stream_id: StreamId, reply: StreamReply) {
-        if reply.messages.is_empty()
-            && reply.status.is_none()
-            && reply.metadata.entries().is_empty()
-        {
-            return;
-        }
-        let headers = match HeaderBlock::for_response(&reply.metadata) {
-            Ok(headers) => headers,
-            Err(status) => {
-                self.send_error(stream_id, status);
-                return;
-            }
-        };
-
-        let mut added = 0usize;
-        for message in &reply.messages {
-            if MessageFrame::header(false, message.len()).is_err() {
-                self.send_error(
-                    stream_id,
-                    Status::new(Code::Internal, "response message too large"),
-                );
-                return;
-            }
-            let Some(next) = added.checked_add(message.len() + 5) else {
-                self.send_error(
-                    stream_id,
-                    Status::new(Code::ResourceExhausted, "pending response bytes are full"),
-                );
-                return;
-            };
-            added = next;
-        }
-        if added > self.pending_capacity.saturating_sub(self.pending_len) {
-            self.send_error(
-                stream_id,
-                Status::new(Code::ResourceExhausted, "pending response bytes are full"),
-            );
-            return;
-        }
-
-        let trailers = if let Some(status) = reply.status {
-            match HeaderBlock::for_trailers(&status, &reply.trailers) {
-                Ok(trailers) => Some(trailers),
-                Err(status) => {
-                    self.send_error(stream_id, status);
-                    return;
-                }
-            }
-        } else {
-            None
-        };
-
-        let Some((tail, queued)) = self.call_mut(stream_id).map(|call| {
-            (
-                call.pending.as_ref().and_then(|pending| pending.tail),
-                call.queued,
-            )
-        }) else {
-            self.send_error(
-                stream_id,
-                Status::new(Code::Internal, "reply for unknown gRPC stream"),
-            );
-            return;
-        };
-
-        let batch = if reply.messages.is_empty() {
-            None
-        } else {
-            match self.replies.insert(ReplyBatch {
-                messages: reply.messages,
-                next: None,
-            }) {
-                Ok(key) => Some(key),
-                Err(_) => {
-                    self.send_error(
-                        stream_id,
-                        Status::new(
-                            Code::ResourceExhausted,
-                            "pending response messages are full",
-                        ),
-                    );
-                    return;
-                }
-            }
-        };
-        if let (Some(tail), Some(batch)) = (tail, batch) {
-            self.replies.get_mut(tail).unwrap().next = Some(batch);
-        }
-
-        let needs_queue;
-        let call = self.call_mut(stream_id).unwrap();
-        match call.pending.as_mut() {
-            Some(pending) => {
-                if pending.head.is_none() {
-                    pending.head = batch;
-                }
-                if batch.is_some() {
-                    pending.tail = batch;
-                }
-                if trailers.is_some() {
-                    pending.trailers = trailers;
-                }
-                needs_queue = !queued;
-            }
-            None => {
-                call.pending = Some(PendingResponse {
-                    headers,
-                    head: batch,
-                    tail: batch,
-                    trailers,
-                    headers_sent: false,
-                    message_pos: 0,
-                    frame_pos: 0,
-                });
-                needs_queue = true;
-            }
-        }
-        self.pending_len += added;
-        if needs_queue {
-            if self.pending.is_full() {
-                self.send_error(
-                    stream_id,
-                    Status::new(Code::ResourceExhausted, "pending response queue is full"),
-                );
-                return;
-            }
-            self.call_mut(stream_id).unwrap().queued = true;
-            self.pending.vacant_entry().unwrap().push_back(stream_id);
+        if let Err(status) = self.egress.enqueue(&mut self.calls, stream_id, reply) {
+            self.send_error(stream_id, status);
         }
     }
 
     fn drive_pending(&mut self) {
-        let len = self.pending.len();
-        for _ in 0..len {
-            let stream_id = self.pending.pop_front().unwrap();
-            let Some(mut pending) = self.call_mut(stream_id).and_then(|call| {
-                call.queued = false;
-                call.pending.take()
-            }) else {
-                continue;
-            };
-            match pending.drive(
-                &mut self.h2,
-                &mut self.replies,
-                &mut self.pending_len,
-                stream_id,
-            ) {
-                Ok(ResponseDrive::Complete) => {
-                    self.remove_empty_call(stream_id);
-                }
-                Ok(ResponseDrive::Blocked) => {
-                    if let Some(call) = self.call_mut(stream_id) {
-                        call.pending = Some(pending);
-                        call.queued = true;
-                        self.pending.vacant_entry().unwrap().push_back(stream_id);
-                    }
-                }
-                Ok(ResponseDrive::Idle) => {
-                    if let Some(call) = self.call_mut(stream_id) {
-                        call.pending = Some(pending);
-                    }
-                }
-                Err(()) => {
-                    self.release_response(pending);
-                    self.remove_empty_call(stream_id);
-                }
-            }
-        }
-    }
-
-    fn release_response(&mut self, pending: PendingResponse) {
-        self.pending_len = self
-            .pending_len
-            .saturating_sub(pending.remaining_len(&self.replies));
-        let mut key = pending.head;
-        while let Some(current) = key {
-            let batch = self.replies.remove(current).unwrap();
-            key = batch.next;
-        }
+        self.egress.drive(&mut self.calls, &mut self.h2);
     }
 
     fn send_error(&mut self, stream_id: StreamId, status: Status) {

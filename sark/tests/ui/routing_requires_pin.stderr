@@ -14,7 +14,7 @@ error[E0308]: mismatched types
    |           ^^^^^^^^ expected `Pin<&mut _>`, found `&mut ...`
    |
    = note:         expected struct `Pin<&mut _>`
-           found mutable reference `&mut impl Application<'_, Conn = sark::dispatch::conn_state::ConnState, Wire = _> + sark::date::DateHost + TimerHost<'_> + sark::dispatch::H1Project<'_, _> + sark::dispatch::Decode + sark::dispatch::Routing + '_`
+           found mutable reference `&mut impl Application<'_, Conn = sark::dispatch::conn_state::ConnState, Wire = _> + sark::date::DateHost + TimerHost<'_> + sark::dispatch::H1Project<'_, _> + sark::dispatch::Decode + sark::dispatch::Routing<'_> + '_`
 note: method defined here
   --> src/dispatch/routing.rs
    |

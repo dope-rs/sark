@@ -1,8 +1,8 @@
-use http::{HeaderValue, StatusCode};
-use o3::buffer::{Owned, Shared};
+use http::{HeaderName, HeaderValue, StatusCode};
+use o3::buffer::Shared;
 
-use super::wire_emit::{CRLF, ContentLength, HeadWrite, HeaderSection, Out};
-use super::{DEFAULT_HEADER_CAPACITY, HeaderList, HotBodyInner, HotHeadInner, IntoHeaderName};
+use super::wire_emit::{CRLF, ContentLength, HeadWrite, HeaderSection, WireWriter};
+use super::{DEFAULT_HEADER_CAPACITY, HeaderList, HotBodyInner, HotHeadInner};
 
 struct MonoHeaders<'a, 'req, const N: usize> {
     head: &'a HotHeadInner<'req, N>,
@@ -18,22 +18,17 @@ impl<const N: usize> HeaderSection for MonoHeaders<'_, '_, N> {
         head + self.dynamic.map_or(0, HeaderList::wire_len)
     }
 
-    fn write_headers(&self, out: &mut [u8], off: &mut usize) {
+    fn write_headers(&self, out: &mut WireWriter<'_>) {
         match self.head {
-            HotHeadInner::Wire(bytes) => Out::put(out, off, bytes),
-            HotHeadInner::Direct(head) => {
-                let written = head
-                    .write_slice(&mut out[*off..])
-                    .expect("HeadWrite invariant: head buffer reserved via wire_len");
-                *off += written;
-            }
+            HotHeadInner::Wire(bytes) => out.put(bytes),
+            HotHeadInner::Direct(head) => head.write_headers(out),
         }
         if let Some(h) = self.dynamic {
             for (name, value) in h.iter() {
-                Out::put(out, off, name.as_str().as_bytes());
-                Out::put(out, off, b": ");
-                Out::put(out, off, value.as_bytes());
-                Out::put(out, off, CRLF);
+                out.put(name.as_str().as_bytes());
+                out.put(b": ");
+                out.put(value.as_bytes());
+                out.put(CRLF);
             }
         }
     }
@@ -65,10 +60,7 @@ impl<'req, const N: usize> MonoResponseInner<'req, N> {
             .as_mut()
     }
 
-    pub fn insert_header<H>(&mut self, name: H, value: HeaderValue) -> &mut Self
-    where
-        H: IntoHeaderName,
-    {
+    pub fn insert_header(&mut self, name: HeaderName, value: HeaderValue) -> &mut Self {
         let _ = self.headers_mut().insert(name, value);
         self
     }
@@ -78,12 +70,9 @@ impl<'req, const N: usize> MonoResponseInner<'req, N> {
             head: &self.head,
             dynamic: self.headers.as_deref(),
         };
-        let mut out = Owned::with_capacity(section.header_len());
         let mut bytes = vec![0; section.header_len()];
-        let mut offset = 0;
-        section.write_headers(&mut bytes, &mut offset);
-        out.extend_from_slice(&bytes);
-        out.freeze()
+        section.write_headers(&mut WireWriter::new(&mut bytes));
+        Shared::from(bytes)
     }
 
     pub fn write_into_slice(&self, out: &mut [u8], date: &[u8; 29]) -> Option<usize> {
@@ -127,9 +116,8 @@ impl<'req, const N: usize> MonoResponseInner<'req, N> {
             if out.len() < head.wire_len() {
                 return None;
             }
-            let mut off = 0usize;
-            let date_offset = head.write(out, &mut off, date);
-            Some((off, date_offset))
+            let written = head.write(out, date);
+            Some((written.len, written.date_offset))
         })
     }
 }

@@ -1,8 +1,7 @@
 use dope_fiber::{Fiber, Ready};
 use o3::buffer::Shared;
 use sark_core::http::{
-    Chunked, FixedResponseInner, IntoServeResponse, MonoResponseInner, Response, ServeInner, Shape,
-    StaticResponseInner, Stream,
+    Chunked, FixedResponse, MonoResponseInner, Response, Serve, Shape, StaticResponseInner, Stream,
 };
 
 use super::spec::RouteSpec;
@@ -77,7 +76,7 @@ where
 
 native_response!(Chunked, Inline);
 
-impl<'req, const N: usize> NativeResponse<'req> for ServeInner<'req, N> {
+impl<'req, const N: usize> NativeResponse<'req> for Serve<'req, N> {
     type Kind = Sync;
     type Shape = Self;
     type Stream = sark_core::http::NeverStream;
@@ -90,7 +89,7 @@ impl<'req, const N: usize> NativeResponse<'req> for ServeInner<'req, N> {
     }
 }
 
-impl<'req, const N: usize> NativeResponse<'req> for FixedResponseInner<'req, N> {
+impl<'req, const N: usize> NativeResponse<'req> for FixedResponse<'req, N> {
     type Kind = Sync;
     type Shape = Self;
     type Stream = sark_core::http::NeverStream;
@@ -131,14 +130,14 @@ impl<'req, const N: usize> NativeResponse<'req> for StaticResponseInner<'req, N>
 
 impl<'req> NativeResponse<'req> for Response {
     type Kind = Sync;
-    type Shape = ServeInner<'req>;
+    type Shape = Serve<'req>;
     type Stream = sark_core::http::NeverStream;
 
     const BODY_KIND: sark_core::http::body_kind::ResponseKind =
         sark_core::http::body_kind::ResponseKind::Inline;
 
     fn into_route_response(self) -> Self::Shape {
-        IntoServeResponse::into_serve_response(self)
+        self.into()
     }
 }
 
@@ -169,8 +168,8 @@ where
     R: RouteSpec,
     F: Fiber<'d, Output = R::AsyncResponse> + 'd,
 {
-    type Owner = request::RequestStorage;
-    type Task = F;
+    type Owner = ();
+    type Task = dope_fiber::OwnerFiber<F, request::RequestStorage>;
     type Output = R::AsyncResponse;
 
     const STREAM: bool = false;

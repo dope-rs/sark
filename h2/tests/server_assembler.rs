@@ -334,7 +334,7 @@ struct DropLive<M> {
 impl<'d, M: Manifold<'d>> Manifold<'d> for DropLive<M> {
     const ID: u8 = M::ID;
 
-    fn dispatch(self: Pin<&mut Self>, ev: dope::Event, driver: &mut DriverContext<'_, 'd>) {
+    fn dispatch(self: Pin<&mut Self>, ev: dope::Event<'d>, driver: &mut DriverContext<'_, 'd>) {
         M::dispatch(
             unsafe { self.map_unchecked_mut(|s| &mut s.inner) },
             ev,
@@ -378,7 +378,7 @@ struct PanicIsolated<'d> {
 impl<'d> Manifold<'d> for PanicIsolated<'d> {
     const ID: u8 = 0;
 
-    fn dispatch(self: Pin<&mut Self>, ev: dope::Event, driver: &mut DriverContext<'_, 'd>) {
+    fn dispatch(self: Pin<&mut Self>, ev: dope::Event<'d>, driver: &mut DriverContext<'_, 'd>) {
         Manifold::dispatch(
             unsafe { self.map_unchecked_mut(|s| &mut s.inner) },
             ev,

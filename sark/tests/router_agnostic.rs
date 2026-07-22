@@ -1,8 +1,8 @@
 use http::{Method, StatusCode};
 use o3::buffer::{Bytes, Retained};
-use sark::dispatch::{Decode, Pipeline};
+use sark::dispatch::{Decode, Invocation};
 use sark::service::{RouteRequestImpl, RouteSpec, SliceValue};
-use sark_core::http::{CacheTemplate, Shape};
+use sark_core::http::{CacheTemplate, Preparation, Prepared, Shape};
 
 #[sark_gen::response(raw)]
 struct Reply {
@@ -101,8 +101,13 @@ fn agnostic_dispatch_routes_feeds_invokes_encodes() {
     assert_eq!(cap3.calls, 0);
 }
 
-fn write_response<'r, R: RouteSpec>(resp: &R::Response<'r>) -> Vec<u8> {
-    match resp.cache_template().expect("cacheable response") {
+fn write_response<'r, R: RouteSpec>(resp: R::Response<'r>) -> Vec<u8> {
+    let mut out = [];
+    let Prepared::Cache(template) = resp.prepare(Preparation::Cache, None, &mut out, &[0; 29])
+    else {
+        panic!("cacheable response")
+    };
+    match template {
         CacheTemplate::Inline { bytes, .. } => bytes,
         CacheTemplate::Static { mut head, body, .. } => {
             head.extend_from_slice(body);
@@ -116,23 +121,11 @@ fn agnostic_core_runs_without_h1_buffer() {
     let route = plain_h;
     let raw_params = <plain_h as RouteSpec>::RawParams::default();
     let raw_headers = <plain_h as RouteSpec>::RawHeaders::default();
-    let resp = Pipeline::build_and_invoke::<plain_h, sark::EmptyState>(
-        &route,
-        raw_params,
-        raw_headers,
-        0..0,
-        &[],
-        &[],
-        0,
-        sark::EmptyState::REF,
-    )
-    .expect("build_and_invoke");
+    let resp = Invocation::new(0..0, &[], &[], 0)
+        .invoke(&route, raw_params, raw_headers, sark::EmptyState::REF)
+        .expect("build_and_invoke");
     assert_eq!(resp.status(), StatusCode::OK);
-    let CacheTemplate::Static { body, .. } = resp.cache_template().expect("static body") else {
-        panic!("expected static response")
-    };
-    assert_eq!(body, b"ok");
-    let bytes = write_response::<plain_h>(&resp);
+    let bytes = write_response::<plain_h>(resp);
     assert!(bytes.starts_with(b"HTTP/1.1 200"));
     assert!(bytes.ends_with(b"ok"));
 }
@@ -154,18 +147,10 @@ fn synthesized_header_pair_flows_through_route() {
     )
     .expect("set_header_raw");
 
-    let resp = Pipeline::build_and_invoke::<named_h, sark::EmptyState>(
-        &route,
-        raw_params,
-        raw_headers,
-        0..0,
-        head,
-        &[],
-        0,
-        sark::EmptyState::REF,
-    )
-    .expect("build_and_invoke");
-    let bytes = write_response::<named_h>(&resp);
+    let resp = Invocation::new(0..0, head, &[], 0)
+        .invoke(&route, raw_params, raw_headers, sark::EmptyState::REF)
+        .expect("build_and_invoke");
+    let bytes = write_response::<named_h>(resp);
     assert!(
         bytes.starts_with(b"HTTP/1.1 418"),
         "x-name fed as a (name,value) pair must reach the handler"

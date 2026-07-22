@@ -5,7 +5,7 @@ use std::time::Duration;
 
 use dope_extra::harness::Harness;
 use sark_grpc::Status;
-use sark_grpc::server::{self, Config, Handler, Request, Response};
+use sark_grpc::server::{Config, Handler, Request, Response};
 use shin::server::{CertSource, Config as TlsConfig};
 use shin::sig::SigningKey;
 
@@ -70,7 +70,7 @@ fn h2c_answers_plaintext_liveness() {
     let cfg = grpc_cfg(bind, Some(bind));
     harness
         .run_with_trigger(
-            move |ctx, trigger| server::serve(NopHandler, cfg.clone(), ctx, Some(trigger)),
+            move |ctx, trigger| cfg.clone().serve(NopHandler, ctx, Some(trigger)),
             |bind| {
                 let response = probe_liveness(bind);
                 assert!(
@@ -89,7 +89,7 @@ fn h2c_preface_is_not_treated_as_liveness() {
     let cfg = grpc_cfg(bind, Some(bind));
     harness
         .run_with_trigger(
-            move |ctx, trigger| server::serve(NopHandler, cfg.clone(), ctx, Some(trigger)),
+            move |ctx, trigger| cfg.clone().serve(NopHandler, ctx, Some(trigger)),
             |bind| {
                 let mut stream = connect_retry(bind);
                 stream
@@ -119,7 +119,8 @@ fn tls_answers_plaintext_liveness_on_sidecar_port() {
     harness
         .run_with_trigger(
             move |ctx, trigger| {
-                server::serve_tls(NopHandler, cfg.clone(), tls_config(), ctx, Some(trigger))
+                cfg.clone()
+                    .serve_tls(NopHandler, tls_config(), ctx, Some(trigger))
             },
             move |_tls_bind| {
                 let response = probe_liveness(readiness);

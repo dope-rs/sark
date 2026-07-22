@@ -2,14 +2,14 @@ use http::{HeaderName, HeaderValue, StatusCode};
 use o3::buffer::Shared;
 use serde::Serialize;
 
-use super::{Body, BodyInner, FixedResponseInner, HeaderList, IntoBody, MonoResponseInner};
+use super::{Body, FixedResponse, HeaderList, MonoResponseInner};
 
 #[derive(Clone)]
 pub struct Response {
     pub(super) status: StatusCode,
     pub(super) headers: HeaderList,
     pub(super) wire_headers: Vec<u8>,
-    pub(super) body: Body,
+    pub(super) body: Body<'static>,
     pub(super) chunked_parts: Option<Vec<Shared>>,
 }
 
@@ -100,7 +100,7 @@ impl Response {
     pub fn content_type(&mut self, value: &'static str) -> &mut Self {
         let _ = self
             .headers
-            .insert("content-type", HeaderValue::from_static(value));
+            .insert(http::header::CONTENT_TYPE, HeaderValue::from_static(value));
         self
     }
 
@@ -154,18 +154,14 @@ impl Response {
 
     pub fn set_body<B>(&mut self, body: B)
     where
-        B: IntoBody<'static>,
+        B: Into<Body<'static>>,
     {
-        self.body = body.into_response_body().into_static();
+        self.body = body.into();
     }
 
     pub fn set_body_str(&mut self, body: &str) -> &mut Self {
-        self.body = BodyInner::Owned(body.as_bytes().to_vec());
+        self.body = Body::Owned(body.as_bytes().to_vec());
         self
-    }
-
-    pub fn body_str(&self) -> Option<&str> {
-        std::str::from_utf8(self.body.as_bytes()).ok()
     }
 
     pub fn push_chunk(&mut self, data: impl Into<Shared>) {
@@ -196,19 +192,19 @@ impl<const N: usize> From<MonoResponseInner<'static, N>> for Response {
             status: response.status,
             headers: response.headers.map(|h| *h).unwrap_or_default(),
             wire_headers: response.head.into_bytes().as_ref().to_vec(),
-            body: BodyInner::from(response.body),
+            body: Body::from(response.body),
             chunked_parts: None,
         }
     }
 }
 
-impl<const N: usize> From<FixedResponseInner<'static, N>> for Response {
-    fn from(response: FixedResponseInner<'static, N>) -> Self {
+impl<const N: usize> From<FixedResponse<'static, N>> for Response {
+    fn from(response: FixedResponse<'static, N>) -> Self {
         Self {
             status: response.status,
             headers: HeaderList::new(),
             wire_headers: response.wire_headers().as_ref().to_vec(),
-            body: BodyInner::Shared(response.body),
+            body: Body::Shared(response.body),
             chunked_parts: None,
         }
     }

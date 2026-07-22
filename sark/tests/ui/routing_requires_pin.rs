@@ -24,7 +24,7 @@ sark_gen::define_route! {
     }
 }
 
-fn main() {
+fn requires_pin<'d>(scope: sark::fiber::FiberScope<'d>) {
     let mut app = App::new(
         (),
         sark::app::Config {
@@ -36,9 +36,12 @@ fn main() {
     let mut conn = sark::dispatch::conn_state::ConnState::default();
     Routing::try_consume(
         &mut app,
+        scope,
         sark::dispatch::conn_state::DispatchPermit::new(),
         b"GET / HTTP/1.1\r\n\r\n",
         &mut write,
         &mut conn,
     );
 }
+
+fn main() {}

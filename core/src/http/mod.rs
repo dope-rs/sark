@@ -12,17 +12,12 @@ pub mod head;
 #[doc(hidden)]
 pub mod __private {
     pub trait GeneratedResponse: 'static {
-        type Fields;
         type Shape: super::Shape<'static>;
 
         const BODY_KIND: super::body_kind::ResponseKind;
 
         fn into_owned_shape(self) -> Self::Shape;
     }
-
-    pub trait OwnedShape {}
-
-    pub trait OwnedValue: 'static {}
 }
 
 pub use field::{Field, OwnedField};
@@ -31,13 +26,11 @@ pub use huffman::{HpackHuffman, HpackHuffmanError};
 pub use o3::buffer::{Borrowed, Bytes, Retained};
 pub use request::PathParamRanges;
 pub use response::{
-    Body, BodyInner, CHUNK_TERMINATOR, CacheTemplate, Chunked, Compression,
-    DEFAULT_HEADER_CAPACITY, Egress, EncodedBody, EncodedResponse, EncodedResponseInner,
-    FixedResponse, FixedResponseInner, HeadInner, HeaderItem, HeaderItemInner, HeaderList,
-    HeaderNameRef, HeaderNameToken, HeaderStaticValueToken, HeaderValueInner, Headers,
-    HeadersInner, HotBodyInner, HotHeadInner, HotTextInner, InlineHeaderValue, IntoBody,
-    IntoHeaderName, IntoHeaderValue, IntoServeResponse, IterStream, MonoResponseInner, NeverStream,
-    OwnedShape, Response, ResponsePlan, ResponsePlanInner, ResponseView, Serve, ServeInner, Shape,
-    StaticResponseInner, Stream, TextBody, TextItem, TextItemInner, TextSpec, apply_head_skip,
+    Body, CHUNK_TERMINATOR, CacheTemplate, Chunked, DEFAULT_HEADER_CAPACITY, Egress, EncodedBody,
+    EncodedResponse, FixedResponse, HeadInner, HeaderItem, HeaderList, HeaderNameRef,
+    HeaderNameToken, HeaderStaticValueToken, HeaderValueInner, Headers, HotBodyInner, HotHeadInner,
+    InlineHeaderValue, IterStream, MonoResponseInner, NeverStream, OwnedShape, Preparation,
+    Prepared, Response, ResponsePlan, ResponseView, Serve, Shape, StaticResponseInner, Stream,
+    TextBody, TextItem,
 };
 pub use varint::VarInt;
