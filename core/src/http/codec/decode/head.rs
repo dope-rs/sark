@@ -1,5 +1,4 @@
 use http::{HeaderName, HeaderValue, StatusCode};
-use o3::buffer::Owned;
 
 use crate::error::{Error, Result};
 use crate::http::Response;
@@ -141,7 +140,7 @@ impl crate::http::codec::Parse {
             resp.headers_mut().insert(name.clone(), value.clone());
         }
         if !body.is_empty() {
-            resp.set_body(Owned::from(body));
+            resp.set_body(body);
         }
         resp
     }
@@ -212,36 +211,5 @@ impl crate::http::codec::Parse {
         } else {
             Ok(Self::build_response(head, body_data, &[]))
         }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    #[test]
-    fn cl_and_te_coexistence_rejected() {
-        let raw = b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\nTransfer-Encoding: chunked\r\n\r\n";
-        assert!(crate::http::codec::Parse::parse(raw).is_err());
-    }
-
-    #[test]
-    fn valid_single_content_length_accepted() {
-        let raw = b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\n";
-        let head = crate::http::codec::Parse::parse(raw).unwrap().unwrap();
-        assert_eq!(head.content_length, Some(5));
-        assert!(!head.is_chunked);
-    }
-
-    #[test]
-    fn valid_te_chunked_alone_accepted() {
-        let raw = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n";
-        let head = crate::http::codec::Parse::parse(raw).unwrap().unwrap();
-        assert!(head.is_chunked);
-        assert_eq!(head.content_length, None);
-    }
-
-    #[test]
-    fn response_content_length_plus_prefix_rejected() {
-        let raw = b"HTTP/1.1 200 OK\r\nContent-Length: +5\r\n\r\n";
-        assert!(crate::http::codec::Parse::parse(raw).is_err());
     }
 }

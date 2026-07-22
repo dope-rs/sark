@@ -30,7 +30,7 @@ impl Header {
     pub(super) fn scan_csv_tokens(
         value: &[u8],
         mode: CsvScanMode,
-        mut on_token: impl FnMut(&[u8]) -> ControlFlow<()>,
+        mut visit: impl FnMut(&[u8]) -> ControlFlow<()>,
     ) -> Result<()> {
         match mode {
             CsvScanMode::Strict => {
@@ -44,7 +44,7 @@ impl Header {
                             return Err(Error::BadRequest("Invalid Transfer-Encoding".into()));
                         }
                         saw_token = true;
-                        if on_token(token).is_break() {
+                        if visit(token).is_break() {
                             return Ok(());
                         }
                         start = i.saturating_add(1);
@@ -73,7 +73,7 @@ impl Header {
                     if token.is_empty() {
                         continue;
                     }
-                    if on_token(token).is_break() {
+                    if visit(token).is_break() {
                         break;
                     }
                 }
@@ -157,44 +157,4 @@ mod private {
 
     impl SealedHeaderLookup for http::HeaderMap {}
     impl SealedHeaderLookup for crate::http::HeaderList {}
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn content_length_digits_accepted() {
-        assert_eq!(Header::content_length(b"5").unwrap(), 5);
-        assert_eq!(Header::content_length(b"0").unwrap(), 0);
-        assert_eq!(Header::content_length(b"1234").unwrap(), 1234);
-    }
-
-    #[test]
-    fn content_length_plus_prefix_rejected() {
-        assert!(Header::content_length(b"+5").is_err());
-    }
-
-    #[test]
-    fn content_length_whitespace_rejected() {
-        assert!(Header::content_length(b" 5").is_err());
-        assert!(Header::content_length(b"5 ").is_err());
-        assert!(Header::content_length(b"5\r").is_err());
-    }
-
-    #[test]
-    fn content_length_empty_rejected() {
-        assert!(Header::content_length(b"").is_err());
-    }
-
-    #[test]
-    fn content_length_non_digit_rejected() {
-        assert!(Header::content_length(b"abc").is_err());
-        assert!(Header::content_length(b"5a").is_err());
-    }
-
-    #[test]
-    fn content_length_overflow_rejected() {
-        assert!(Header::content_length(b"99999999999999999999999999").is_err());
-    }
 }

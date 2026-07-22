@@ -1,14 +1,15 @@
 #![cfg(target_os = "linux")]
 #![allow(clippy::too_many_arguments)]
 
+mod support;
+
 use std::io::{Read, Write};
 use std::net::TcpStream;
 use std::time::Duration;
 
-use dope_extra::testing::run_with_trigger;
+use dope_extra::harness::Harness;
 use http::StatusCode;
-use o3::buffer::Owned;
-use sark::{Build, ServerCfg, body};
+use sark::{Executor, Throughput, body, driver};
 
 #[sark_gen::request]
 struct PingReq {}
@@ -16,12 +17,12 @@ struct PingReq {}
 #[sark_gen::response(raw)]
 struct PingReply {
     status: StatusCode,
-    body: Owned,
+    body: Vec<u8>,
 }
 
 #[sark_gen::handler]
 fn ping(_req: PingReq, _state: &()) -> PingReply {
-    let mut body = Owned::new();
+    let mut body = Vec::new();
     body.extend_from_slice(b"pong");
     PingReply {
         status: StatusCode::OK,
@@ -35,7 +36,7 @@ struct EchoReq {}
 #[sark_gen::response(raw)]
 struct EchoReply {
     status: StatusCode,
-    body: Owned,
+    body: Vec<u8>,
 }
 
 #[sark_gen::handler]
@@ -81,22 +82,26 @@ fn read_head(sock: &mut TcpStream) -> Vec<u8> {
 #[test]
 fn bad_content_length_does_not_panic_and_server_survives() {
     let bind: std::net::SocketAddr = "127.0.0.1:18920".parse().unwrap();
-    let cfg = ServerCfg {
-        bind,
-        max_conn: 16,
-        backlog: 16,
-        head_timeout: std::time::Duration::from_secs(10),
-    };
+    let server = support::http_server(bind, Duration::from_secs(10));
 
-    run_with_trigger(
-        bind,
-        |ctx, trigger| {
-            Build::http(
-                cl_overflow_dispatch::new(&()),
-                cfg.clone(),
-                ctx,
-                Some(trigger),
-            )
+    Harness::new(bind).run_with_trigger(
+        |_ctx, trigger| {
+            let driver_config =
+                driver::Config::for_tcp_profile::<Throughput>(support::MAX_CONNECTIONS);
+            let executor = Executor::new(driver_config)?;
+            executor.enter(|mut session| {
+                server.clone().serve(
+                    &mut session,
+                    ClOverflowDispatch::new(
+                        (),
+                        sark::app::Config {
+                            timer_capacity: support::MAX_CONNECTIONS.saturating_mul(2),
+                            task_capacity: support::MAX_CONNECTIONS,
+                        },
+                    ),
+                    Some(trigger),
+                )
+            })
         },
         |bind| {
             let bad_clens: &[&str] = &[
@@ -147,5 +152,5 @@ fn bad_content_length_does_not_panic_and_server_survives() {
             assert!(resp.contains("200 "), "well-formed POST failed: {resp}");
             assert!(resp.contains("echoed"), "echo handler not reached: {resp}");
         },
-    );
+    ).expect("harness");
 }

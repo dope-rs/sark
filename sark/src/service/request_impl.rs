@@ -10,19 +10,29 @@ use sark_core::http::head::{
 };
 
 use super::plan::HeaderValue;
-use super::spec::{HeaderParams, RouteParams, RouteParamsRef};
-use crate::{Request, request};
+use super::spec::RouteParams;
+use crate::request;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BodyPolicy {
+    Buffered,
+    Discarded,
+}
 
 pub trait RouteRequestImpl {
     type HeaderSlot: Copy;
     type RawHeaders: Default;
     type RawParams: Default;
-    type ParamsInner<'req>: RouteParams<Raw = Self::RawParams>;
-    type HeadersInner<'req>: HeaderParams;
+    type Params<'req>: RouteParams<'req, Raw = Self::RawParams>;
+    type Headers<'req>;
+    type ParsedBody<'req>;
 
     const NEED_HEADER: bool = false;
     const NEED_KNOWN_HEADER: bool = false;
     const NEED_QUERY: bool = false;
+    const BODY_POLICY: BodyPolicy = BodyPolicy::Buffered;
+
+    fn parse_body<'req>(raw: &'req [u8]) -> Result<Self::ParsedBody<'req>>;
 
     fn header_slot_bytes(_name: &[u8]) -> Option<Self::HeaderSlot> {
         None
@@ -123,27 +133,18 @@ pub trait RouteRequestImpl {
         Ok(())
     }
 
-    fn build_headers(
-        req: &Request,
+    fn build_headers<'req>(
+        req: &request::Ref<'req>,
         headers: Self::RawHeaders,
-    ) -> Result<Self::HeadersInner<'static>>;
+    ) -> Result<Self::Headers<'req>>;
 
-    fn build_params(req: &Request, params: Self::RawParams) -> Option<Self::ParamsInner<'static>> {
-        <Self::ParamsInner<'static> as RouteParams>::from_raw(req, params)
-    }
-
-    fn build_headers_ref<'req>(
-        req: &request::Ref<'req, ()>,
-        headers: Self::RawHeaders,
-    ) -> Result<Self::HeadersInner<'req>>;
-
-    fn build_params_ref<'req>(
-        req: &request::Ref<'req, ()>,
+    fn build_params<'req>(
+        req: &request::Ref<'req>,
         params: Self::RawParams,
-    ) -> Option<Self::ParamsInner<'req>>
+    ) -> Option<Self::Params<'req>>
     where
-        Self::ParamsInner<'req>: RouteParamsRef<'req>,
+        Self::Params<'req>: RouteParams<'req>,
     {
-        <Self::ParamsInner<'req> as RouteParamsRef<'req>>::from_raw_ref(req, params)
+        <Self::Params<'req> as RouteParams<'req>>::from_raw(req, params)
     }
 }

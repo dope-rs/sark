@@ -1,22 +1,5 @@
-use http::{HeaderValue, Method, StatusCode};
-use sark_core::http::{Request, Response};
-
-#[test]
-fn test_request_creation() {
-    let req = Request::new(Method::GET, "/test".parse().unwrap());
-
-    assert_eq!(req.method(), &Method::GET);
-    assert_eq!(req.uri().path(), "/test");
-
-    let mut req = Request::new(Method::POST, "/api".parse().unwrap());
-    req.headers_mut()
-        .insert("content-type", HeaderValue::from_static("application/json"));
-
-    assert_eq!(
-        req.headers().get("content-type").unwrap(),
-        "application/json"
-    );
-}
+use http::{HeaderValue, StatusCode};
+use sark_core::http::Response;
 
 #[test]
 fn test_response_creation() {

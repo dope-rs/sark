@@ -2,6 +2,8 @@ use proc_macro2::{Ident, TokenStream};
 use quote::quote;
 use syn::{Type, TypePath};
 
+use super::RouteKind;
+
 pub(super) struct ArmsData {
     pub(super) parts_aliases: Vec<TokenStream>,
     pub(super) route_bounds: Vec<TokenStream>,
@@ -14,7 +16,7 @@ pub(super) struct ArmsData {
 
 pub(super) fn build_arms(
     routes: &[TypePath],
-    kinds: &[crate::model::RouteKind],
+    kinds: &[RouteKind],
     state_ty: &Type,
     params_alias: &[Ident],
     headers_alias: &[Ident],
@@ -37,19 +39,26 @@ pub(super) fn build_arms(
         .iter()
         .zip(kinds.iter())
         .map(|(route, kind)| {
-            let trait_bound = match kind {
-                crate::model::RouteKind::Stream => quote! {
-                    sark::service::manifold::StreamRoute<#state_ty>
-                },
-                crate::model::RouteKind::Fiber => quote! {
-                    sark::fiber::Route<#state_ty>
-                },
-                crate::model::RouteKind::Sync => quote! {
-                    sark::service::manifold::Route<#state_ty>
-                },
+            let (kind, invoke) = match kind {
+                RouteKind::Sync => (
+                    quote!(sark::service::manifold::Sync),
+                    quote!(sark::service::manifold::Route<#state_ty>),
+                ),
+                RouteKind::Fiber => (
+                    quote!(sark::service::manifold::NativeFiber),
+                    quote!(sark::service::manifold::TaskRoute<'d, #state_ty>),
+                ),
+                RouteKind::Stream => (
+                    quote!(sark::service::manifold::NativeStream),
+                    quote! {
+                        sark::service::manifold::Route<#state_ty>
+                            + sark::service::manifold::TaskRoute<'d, #state_ty>
+                    },
+                ),
             };
             quote! {
-                #route: sark::service::RouteSpec + #trait_bound,
+                #route: sark::service::RouteSpec<Kind = #kind>
+                    + #invoke,
             }
         })
         .collect();

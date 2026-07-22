@@ -12,7 +12,7 @@ use raw_body::RawBody;
 use syn::parse::{Parse, ParseStream};
 use syn::{Error, Fields, Ident, ItemStruct, Result, Token, Type};
 
-use crate::codegen::header::{Emit, HeaderApplyMode, HeaderParserCfg, HeaderValueMode};
+use crate::codegen::header::{Emit, HeaderApplyMode, HeaderParserConfig, HeaderValueMode};
 use crate::codegen::value::Value;
 use crate::model::{HeaderAttrField, PathAttrField, QueryAttrField};
 use crate::util::{AttributeSliceExt, FieldAttr, TypeExt};
@@ -92,30 +92,28 @@ impl Parse for Mode {
 }
 
 impl Mode {
+    pub(super) fn empty() -> Self {
+        Self {
+            ordered: false,
+            value: HeaderValueMode::Full,
+            apply: HeaderApplyMode::Full,
+        }
+    }
+
     pub(super) fn expand(self, mut st: ItemStruct) -> Result<TokenStream> {
         let ordered = self.ordered;
-        let parser_cfg = HeaderParserCfg {
+        let parser_cfg = HeaderParserConfig {
             value: self.value,
             apply: self.apply,
         };
-        let value_mode_name = match self.value {
-            HeaderValueMode::Full => "full",
-            HeaderValueMode::Skip => "skip",
-        };
-        let apply_mode_name = match self.apply {
-            HeaderApplyMode::Full => "full",
-            HeaderApplyMode::Skip => "skip",
-        };
         let name = st.ident.clone();
         let vis = st.vis.clone();
-        let inner_name = format_ident!("{}Inner", name);
-        let headers_ident = format_ident!("{}Headers", name);
+        let inner_name = format_ident!("{}View", name);
         let raw_headers_ident = format_ident!("{}HeadersRaw", name);
         let header_slot_ident = format_ident!("{}HeaderSlot", name);
-        let params_ident = format_ident!("{}Params", name);
         let raw_params_ident = format_ident!("{}ParamsRaw", name);
-        let headers_inner_ident = format_ident!("{}HeadersInner", name);
-        let params_inner_ident = format_ident!("{}ParamsInner", name);
+        let headers_inner_ident = format_ident!("{}Headers", name);
+        let params_inner_ident = format_ident!("{}Params", name);
         let mut body_ty: Option<Type> = None;
         let mut kept = Vec::with_capacity(st.attrs.len());
         for attr in st.attrs.drain(..) {
@@ -139,10 +137,9 @@ impl Mode {
         let mut header_fields = Vec::<HeaderAttrField>::new();
         let mut query_fields = Vec::<QueryAttrField>::new();
         let mut path_fields = Vec::<PathAttrField>::new();
-        let mut ctor_init = Vec::new();
         let mut ctor_init_ref = Vec::new();
         let mut raw_body_field = None::<(Ident, Type)>;
-        let mut stream_body_field = None::<(Ident, Type)>;
+        let mut body_len_field = None::<(Ident, Type)>;
 
         for field in &mut named.named {
             let ident = field
@@ -162,16 +159,16 @@ impl Mode {
                 .attrs
                 .iter()
                 .any(|attr| attr.path().is_ident("raw_body"));
-            let is_stream_body = field
+            let is_body_len = field
                 .attrs
                 .iter()
-                .any(|attr| attr.path().is_ident("stream_body"));
+                .any(|attr| attr.path().is_ident("body_len"));
             let kinds = [
                 header.is_some(),
                 query.is_some(),
                 path.is_some(),
                 is_raw_body,
-                is_stream_body,
+                is_body_len,
             ]
             .into_iter()
             .filter(|v| *v)
@@ -179,7 +176,7 @@ impl Mode {
             if kinds > 1 {
                 return Err(Error::new_spanned(
                     field,
-                    "request field must have exactly one of #[header(...)], #[query(...)], #[path(...)], #[raw_body], or #[stream_body]",
+                    "request field must have exactly one of #[header(...)], #[query(...)], #[path(...)], #[raw_body], or #[body_len]",
                 ));
             }
             if let Some(FieldAttr {
@@ -193,7 +190,6 @@ impl Mode {
                     default,
                     ty: field.ty.clone(),
                 });
-                ctor_init.push(quote!(#ident: headers.#ident));
                 ctor_init_ref.push(quote!(#ident: headers.#ident));
             } else if let Some(FieldAttr {
                 name: query,
@@ -206,7 +202,6 @@ impl Mode {
                     default,
                     ty: field.ty.clone(),
                 });
-                ctor_init.push(quote!(#ident: headers.#ident));
                 ctor_init_ref.push(quote!(#ident: headers.#ident));
             } else if let Some(FieldAttr {
                 name: path,
@@ -219,28 +214,24 @@ impl Mode {
                     default,
                     ty: field.ty.clone(),
                 });
-                ctor_init.push(quote!(#ident: params.#ident));
                 ctor_init_ref.push(quote!(#ident: params.#ident));
             } else if is_raw_body {
                 if raw_body_field.is_some() {
                     return Err(Error::new_spanned(field, "duplicate #[raw_body]"));
                 }
-                let raw_body_expr = RawBody::field_expr(&field.ty)?;
+                let raw_body_ref_expr = RawBody::borrowed_field_expr(&field.ty)?;
                 raw_body_field = Some((ident.clone(), field.ty.clone()));
-                ctor_init.push(quote!(#ident: #raw_body_expr));
-                ctor_init_ref.push(quote!(#ident: #raw_body_expr));
-            } else if is_stream_body {
-                if stream_body_field.is_some() {
-                    return Err(Error::new_spanned(field, "duplicate #[stream_body]"));
+                ctor_init_ref.push(quote!(#ident: #raw_body_ref_expr));
+            } else if is_body_len {
+                if body_len_field.is_some() {
+                    return Err(Error::new_spanned(field, "duplicate #[body_len]"));
                 }
-                stream_body_field = Some((ident.clone(), field.ty.clone()));
-                ctor_init
-                    .push(quote!(#ident: ::sark::request::BodyLen::from_declared(raw_body.len())));
+                body_len_field = Some((ident.clone(), field.ty.clone()));
                 ctor_init_ref.push(quote!(#ident: ::sark::request::BodyLen::from_declared(req.declared_body_len())));
             } else {
                 return Err(Error::new_spanned(
                     field,
-                    "#[sark_gen::request] fields require #[header(...)], #[query(...)], #[path(...)], #[raw_body], or #[stream_body]",
+                    "#[sark_gen::request] fields require #[header(...)], #[query(...)], #[path(...)], #[raw_body], or #[body_len]",
                 ));
             }
             field.attrs.retain(|attr| {
@@ -248,81 +239,110 @@ impl Mode {
                     && !attr.path().is_ident("query")
                     && !attr.path().is_ident("path")
                     && !attr.path().is_ident("raw_body")
-                    && !attr.path().is_ident("stream_body")
+                    && !attr.path().is_ident("body_len")
             });
         }
 
-        let has_local_field = header_fields.iter().any(|f| f.ty.has_local_frame_bytes())
-            || query_fields.iter().any(|f| f.ty.has_local_frame_bytes())
-            || path_fields.iter().any(|f| f.ty.has_local_frame_bytes());
-        if has_local_field {
-            for field in &mut named.named {
-                field.ty.rewrite_local_to_ref();
+        if let Some(body_ty) = &body_ty {
+            if raw_body_field.is_some() {
+                return Err(Error::new_spanned(
+                    body_ty,
+                    "#[json_body(...)] and #[raw_body] are mutually exclusive",
+                ));
             }
-        } else {
-            named.named.push(syn::parse_quote! {
-                #[doc(hidden)]
-                pub __sark_req_marker: ::core::marker::PhantomData<&'req ()>
-            });
-            ctor_init.push(quote!(__sark_req_marker: ::core::marker::PhantomData));
-            ctor_init_ref.push(quote!(__sark_req_marker: ::core::marker::PhantomData));
+            named.named.push(syn::parse_quote!(#vis body: #body_ty));
+            ctor_init_ref.push(quote!(body));
         }
-        st.ident = inner_name.clone();
-        if !st
+
+        let borrowed_byte_fields: Vec<Ident> = header_fields
+            .iter()
+            .filter(|field| field.ty.has_retained_bytes())
+            .map(|field| field.ident.clone())
+            .chain(
+                query_fields
+                    .iter()
+                    .filter(|field| field.ty.has_retained_bytes())
+                    .map(|field| field.ident.clone()),
+            )
+            .chain(
+                path_fields
+                    .iter()
+                    .filter(|field| field.ty.has_retained_bytes())
+                    .map(|field| field.ident.clone()),
+            )
+            .collect();
+        let mut borrowed_st = st.clone();
+        let Fields::Named(borrowed_named) = &mut borrowed_st.fields else {
+            unreachable!("named fields validated above")
+        };
+        for field in &mut borrowed_named.named {
+            if raw_body_field
+                .as_ref()
+                .is_some_and(|(ident, _)| field.ident.as_ref() == Some(ident))
+            {
+                field.ty = RawBody::borrowed_type(&field.ty)?;
+            } else if field
+                .ident
+                .as_ref()
+                .is_some_and(|ident| borrowed_byte_fields.contains(ident))
+            {
+                field.ty.rewrite_retained_to_borrowed();
+            }
+        }
+        borrowed_named.named.push(syn::parse_quote! {
+            #[doc(hidden)]
+            pub __sark_req_marker: ::core::marker::PhantomData<&'req ()>
+        });
+        ctor_init_ref.push(quote!(__sark_req_marker: ::core::marker::PhantomData));
+        borrowed_st.ident = inner_name.clone();
+        if !borrowed_st
             .generics
             .params
             .iter()
             .any(|p| matches!(p, syn::GenericParam::Lifetime(lt) if lt.lifetime.ident == "req"))
         {
-            st.generics.params.insert(0, syn::parse_quote!('req));
+            borrowed_st
+                .generics
+                .params
+                .insert(0, syn::parse_quote!('req));
         }
-        let alias_decl = quote! {
-            #[allow(non_camel_case_types, dead_code)]
-            #vis type #name = #inner_name<'static>;
-        };
+        st.attrs.push(syn::parse_quote!(#[allow(dead_code)]));
+        borrowed_st
+            .attrs
+            .push(syn::parse_quote!(#[allow(dead_code)]));
 
-        let from_parts = if let Some(body_ty) = &body_ty {
-            named.named.push(syn::parse_quote!(#vis body: #body_ty));
-            ctor_init.push(quote!(body));
-            ctor_init_ref.push(quote!(body));
+        let parsed_body_impl = if let Some(body_ty) = &body_ty {
             quote! {
-                #vis fn from_parts(
-                    params: #params_ident,
-                    headers: #headers_ident,
-                    body: #body_ty,
-                    raw_body: sark::request::Body,
-                ) -> Self {
-                    let _ = &params;
-                    let _ = &headers;
-                    let _ = &raw_body;
-                    Self { #(#ctor_init,)* }
+                type ParsedBody<'req> = #body_ty;
+
+                fn parse_body<'req>(raw: &'req [u8]) -> sark::error::Result<Self::ParsedBody<'req>> {
+                    <#body_ty as sark::json::JsonDecode>::decode_json_borrowed(raw)
                 }
             }
         } else {
             quote! {
-                #vis fn from_parts(
-                    params: #params_ident,
-                    headers: #headers_ident,
-                    raw_body: sark::request::Body,
-                ) -> Self {
-                    let _ = &params;
-                    let _ = &headers;
-                    let _ = &raw_body;
-                    Self { #(#ctor_init,)* }
+                type ParsedBody<'req> = ();
+
+                fn parse_body<'req>(raw: &'req [u8]) -> sark::error::Result<Self::ParsedBody<'req>> {
+                    let _ = raw;
+                    Ok(())
                 }
             }
         };
 
         let header_tokens = if header_fields.is_empty() && query_fields.is_empty() {
             quote! {
-                type #headers_ident = sark::service::NoHeaders;
-                type #raw_headers_ident = sark::service::NoHeaders;
-                #[allow(non_camel_case_types, unused_lifetimes, dead_code)]
-                type #headers_inner_ident<'req> = sark::service::NoHeaders;
+                #[allow(non_camel_case_types, dead_code)]
+                #[derive(Default)]
+                struct #raw_headers_ident;
+
+                #[allow(non_camel_case_types, dead_code)]
+                struct #headers_inner_ident<'req> {
+                    marker: ::core::marker::PhantomData<&'req ()>,
+                }
             }
         } else {
             Hidden {
-                name: &headers_ident,
                 inner_name: &headers_inner_ident,
                 raw_name: &raw_headers_ident,
                 headers: &header_fields,
@@ -342,8 +362,11 @@ impl Mode {
             header_set_u8_fn,
         ) = if header_fields.is_empty() {
             (
-                quote! { () },
-                quote! { type #header_slot_ident = (); },
+                quote! { #header_slot_ident },
+                quote! {
+                    #[derive(Clone, Copy)]
+                    struct #header_slot_ident;
+                },
                 quote! { None },
                 quote! { Ok(()) },
                 quote! { Ok(()) },
@@ -429,37 +452,27 @@ impl Mode {
         let need_query = !query_fields.is_empty();
 
         let build_headers = if header_fields.is_empty() && query_fields.is_empty() {
-            quote!(Ok(sark::service::NoHeaders))
-        } else {
-            let raw_field_ident: Vec<&Ident> = header_fields
-                .iter()
-                .map(|f| &f.ident)
-                .chain(query_fields.iter().map(|f| &f.ident))
-                .collect();
-            let typed_field_expr = Hidden::header_query_exprs(&header_fields, &query_fields)?;
             quote! {
-                let #raw_headers_ident { #( #raw_field_ident, )* .. } = headers;
-                Ok(#headers_ident {
-                    #( #raw_field_ident: #typed_field_expr, )*
-                    __sark_m: ::core::marker::PhantomData,
+                let _ = headers;
+                Ok(#headers_inner_ident {
+                    marker: ::core::marker::PhantomData,
                 })
             }
-        };
-        let build_headers_ref = if header_fields.is_empty() && query_fields.is_empty() {
-            quote!(Ok(sark::service::NoHeaders))
         } else {
-            quote!(#headers_inner_ident::<'req>::from_raw_ref(req, headers))
+            quote!(#headers_inner_ident::<'req>::from_raw(req, headers))
         };
         let params_tokens = Params {
             vis: &vis,
-            ident: &params_ident,
             inner_ident: &params_inner_ident,
             raw_ident: &raw_params_ident,
             fields: &path_fields,
         }
         .build()?;
-        let need_path = !path_fields.is_empty();
-        let streaming_body = stream_body_field.is_some();
+        let body_policy = if body_ty.is_some() || raw_body_field.is_some() {
+            quote!(sark::service::BodyPolicy::Buffered)
+        } else {
+            quote!(sark::service::BodyPolicy::Discarded)
+        };
 
         let header_methods = if header_fields.is_empty() {
             TokenStream::new()
@@ -574,25 +587,19 @@ impl Mode {
         } else {
             TokenStream::new()
         };
-        let raw_body_bind = if raw_body_field.is_some() {
-            quote!(let raw_body = req.body_owned();)
-        } else {
-            TokenStream::new()
-        };
-        let from_parts_ref_impl = quote! {
+        let from_parts_impl = quote! {
             impl<'req> #inner_name<'req> {
                 #[allow(unused_variables, dead_code)]
-                #vis fn from_parts_ref(
+                #vis fn from_parts(
                     params: #params_inner_ident<'req>,
                     headers: #headers_inner_ident<'req>,
                     parsed_body: #parsed_body_param_ty,
-                    req: &sark::request::Ref<'req, #headers_inner_ident<'req>>,
+                    req: &sark::request::Ref<'req>,
                 ) -> Self {
                     let _ = &params;
                     let _ = &headers;
                     let _ = req;
                     #body_bind
-                    #raw_body_bind
                     Self { #(#ctor_init_ref,)* }
                 }
             }
@@ -600,47 +607,33 @@ impl Mode {
 
         Ok(quote! {
             #st
-            #alias_decl
+            #borrowed_st
             #header_tokens
             #params_tokens
-            #from_parts_ref_impl
+            #from_parts_impl
             #header_slot_enum
-
-            impl #name {
-                #vis const NEED_PATH: bool = #need_path;
-                #vis const VALUE_PARSER: &'static str = #value_mode_name;
-                #vis const APPLY_PARSER: &'static str = #apply_mode_name;
-                #vis const STREAMING_BODY: bool = #streaming_body;
-
-                #from_parts
-            }
 
             impl sark::service::RouteRequestImpl for #name {
                 type HeaderSlot = #header_slot_ty;
                 type RawHeaders = #raw_headers_ident;
                 type RawParams = #raw_params_ident;
-                type ParamsInner<'req> = #params_inner_ident<'req>;
-                type HeadersInner<'req> = #headers_inner_ident<'req>;
+                type Params<'req> = #params_inner_ident<'req>;
+                type Headers<'req> = #headers_inner_ident<'req>;
+                #parsed_body_impl
 
                 const NEED_HEADER: bool = #need_header;
                 const NEED_KNOWN_HEADER: bool = #need_known_header;
                 const NEED_QUERY: bool = #need_query;
+                const BODY_POLICY: sark::service::BodyPolicy = #body_policy;
 
                 #header_methods
                 #query_methods
 
-                fn build_headers(
-                    req: &sark::Request,
+                fn build_headers<'req>(
+                    req: &sark::request::Ref<'req>,
                     headers: Self::RawHeaders,
-                ) -> sark::error::Result<Self::HeadersInner<'static>> {
+                ) -> sark::error::Result<Self::Headers<'req>> {
                     #build_headers
-                }
-
-                fn build_headers_ref<'req>(
-                    req: &sark::request::Ref<'req, ()>,
-                    headers: Self::RawHeaders,
-                ) -> sark::error::Result<Self::HeadersInner<'req>> {
-                    #build_headers_ref
                 }
 
             }

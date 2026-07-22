@@ -1,11 +1,11 @@
 use dope::manifold::connector;
 use o3::buffer::Shared;
 
-use crate::conn::{self, Conn};
+use crate::conn::{self, Conn, ConnError};
 use crate::role::ClientRole;
 
 pub trait Handler: 'static {
-    fn on_event(&mut self, event: conn::Event, conn: &mut Conn<ClientRole>);
+    fn event(&mut self, event: conn::Event, conn: &mut Conn<ClientRole>);
 }
 
 #[derive(Default)]
@@ -71,47 +71,72 @@ impl<H: Handler> Session<H> {
     pub fn handler_mut(&mut self) -> &mut H {
         &mut self.handler
     }
+
+    pub fn connect(
+        &mut self,
+        state: &mut ConnState,
+        sink: &mut connector::state::Queue<{ connector::state::IOV_CAP }>,
+    ) {
+        Self::drain_into(&mut state.conn, sink);
+    }
+
+    pub fn response(
+        &mut self,
+        head: Head,
+        state: &mut ConnState,
+        sink: &mut connector::state::Queue<{ connector::state::IOV_CAP }>,
+    ) {
+        let Head(buf) = head;
+        let conn = &mut state.conn;
+        let mut result = conn.ingest(buf.as_slice());
+        loop {
+            let mut drained = false;
+            while let Some(ev) = conn.poll_event() {
+                drained = true;
+                self.handler.event(ev, conn);
+            }
+            match result {
+                Ok(()) => break,
+                Err(ConnError::Overload) if drained => result = conn.resume(),
+                Err(_) => return,
+            }
+        }
+        Self::drain_into(conn, sink);
+    }
 }
 
-impl<H: Handler> connector::Session for Session<H> {
+impl<'d, H: Handler> connector::Session<'d> for Session<H> {
     type Codec = Codec;
     type ConnState = ConnState;
+    type Send = o3::buffer::Shared;
 
     fn codec(&self) -> &Codec {
         &self.codec
     }
 
-    fn connect(&mut self, ctx: &mut connector::Ctx<'_, Self>) {
-        Self::drain_into(&mut ctx.state.conn, ctx.sink);
+    fn connect(&mut self, ctx: &mut connector::Ctx<'_, 'd, Self>) {
+        self.connect(ctx.state, ctx.sink);
     }
 
-    fn response(&mut self, head: Head, ctx: &mut connector::Ctx<'_, Self>) {
-        let Head(buf) = head;
-        let conn = &mut ctx.state.conn;
-        if conn.ingest(buf.as_slice()).is_err() {
-            return;
-        }
-        while let Some(ev) = conn.poll_event() {
-            self.handler.on_event(ev, conn);
-        }
-        Self::drain_into(conn, ctx.sink);
+    fn response(&mut self, head: Head, ctx: &mut connector::Ctx<'_, 'd, Self>) {
+        self.response(head, ctx.state, ctx.sink);
     }
 
-    fn disconnect(&mut self, _ctx: &mut connector::Ctx<'_, Self>) {}
+    fn disconnect(&mut self, _ctx: &mut connector::Ctx<'_, 'd, Self>) {}
 }
 
 impl<H: Handler> Session<H> {
     fn drain_into(
         conn: &mut Conn<ClientRole>,
-        sink: &mut connector::session::Queue<{ connector::session::IOV_CAP }>,
+        sink: &mut connector::state::Queue<{ connector::state::IOV_CAP }>,
     ) {
         let out = conn.outbound();
         if out.is_empty() {
             return;
         }
-        let owned: Vec<u8> = out.to_vec();
-        let len = owned.len();
-        sink.push(Shared::from(owned));
-        conn.drain_outbound(len);
+        let len = out.len();
+        if sink.try_enqueue(Shared::copy_from_slice(out)).is_ok() {
+            conn.drain_outbound(len);
+        }
     }
 }

@@ -1,10 +1,10 @@
 //! `#[sark_gen::json]` derives compact JSON encode/decode for named structs.
-//! Fields default to scalars (`u64`, `bool`, `LocalFrameBytes`, `Option<T>`). Two
+//! Fields default to scalars (`u64`, `bool`, `Bytes<Retained>`, `Option<T>`). Two
 //! `#[field(...)]` attributes compose nested documents:
 //!
 //! - `#[field(nested)]` on a field whose type is another `#[sark_gen::json]` struct
 //!   emits `"key":{...}` using that type's own encoder.
-//! - `#[field(seq)]` on a `Vec<LocalFrameBytes>` emits a JSON string array
+//! - `#[field(seq)]` on a `Vec<Bytes<Retained>>` emits a JSON string array
 //!   `"key":["a","b"]`; combine with `nested` (`#[field(seq, nested)]`) on a
 //!   `Vec<T>` of json structs to emit an array of objects `"key":[{...},{...}]`.
 //!
@@ -17,7 +17,7 @@
 //! #[sark_gen::json(ordered)]
 //! struct Item {
 //!     id: u64,
-//!     #[field(seq)] tags: Vec<LocalFrameBytes>,
+//!     #[field(seq)] tags: Vec<Bytes<Retained>>,
 //!     #[field(nested)] rating: Rating,
 //! }
 //!

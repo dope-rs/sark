@@ -1,7 +1,7 @@
 use std::cell::OnceCell;
 
+use o3::buffer::{Bytes, Retained};
 use sark_core::error::Result;
-use sark_core::http::LocalFrameBytes;
 use sark_core::http::head::{HeadInput, is_ascii_ws};
 
 use crate::service::HeaderValue;
@@ -10,7 +10,7 @@ pub(super) struct InputHeaderValue<'a, I: HeadInput + ?Sized> {
     input: &'a I,
     start: usize,
     end: usize,
-    local: OnceCell<LocalFrameBytes>,
+    frame: OnceCell<Bytes<Retained>>,
 }
 
 impl<'a, I: HeadInput + ?Sized> InputHeaderValue<'a, I> {
@@ -19,7 +19,7 @@ impl<'a, I: HeadInput + ?Sized> InputHeaderValue<'a, I> {
             input,
             start: range.start,
             end: range.end,
-            local: OnceCell::new(),
+            frame: OnceCell::new(),
         }
     }
 
@@ -27,16 +27,16 @@ impl<'a, I: HeadInput + ?Sized> InputHeaderValue<'a, I> {
         self.start..self.end
     }
 
-    fn local(&self) -> &LocalFrameBytes {
-        self.local
-            .get_or_init(|| match self.input.copy_range_local(self.span()) {
+    fn frame(&self) -> &Bytes<Retained> {
+        self.frame
+            .get_or_init(|| match self.input.copy_range_frame(self.span()) {
                 Some(v) => v,
                 None => {
                     debug_assert!(
                         false,
                         "header value invariant: input range must be readable"
                     );
-                    LocalFrameBytes::from_shared(o3::buffer::Shared::copy_from_slice(b""))
+                    Bytes::<Retained>::copy_from_slice(b"")
                 }
             })
     }
@@ -133,11 +133,11 @@ impl<I: HeadInput + ?Sized> HeaderValue for InputHeaderValue<'_, I> {
         self.span()
     }
 
-    fn copy_local(&self) -> sark_core::http::LocalFrameBytes {
+    fn copy_frame(&self) -> sark_core::http::Bytes<Retained> {
         if let Some(bytes) = self.input.slice_range(self.span()) {
-            return LocalFrameBytes::from_shared(o3::buffer::Shared::copy_from_slice(bytes));
+            return Bytes::<Retained>::copy_from_slice(bytes);
         }
-        self.local().clone()
+        self.frame().clone()
     }
 
     fn parse_usize(&self) -> Result<usize> {

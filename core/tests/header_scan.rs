@@ -1,4 +1,7 @@
-use sark_core::simd::{HeaderNameOutcome, scan_header_name};
+use sark_core::simd::{
+    HeaderNameOutcome, HeaderValueOutcome, request_target_is_valid, scan_header_name,
+    scan_header_value,
+};
 
 fn naive(bytes: &[u8], start: usize) -> HeaderNameOutcome {
     let mut idx = start;
@@ -70,6 +73,82 @@ fn matches_naive_at_lane_boundaries() {
                 assert_eq!(
                     scan_header_name(&v, 0),
                     naive(&v, 0),
+                    "len={len} pos={pos} byte={byte:#x}",
+                );
+            }
+        }
+    }
+}
+
+fn naive_value(bytes: &[u8], start: usize) -> HeaderValueOutcome {
+    let mut idx = start;
+    while idx < bytes.len() {
+        let byte = bytes[idx];
+        if byte == b'\r' {
+            if idx + 1 == bytes.len() {
+                return HeaderValueOutcome::None;
+            }
+            return if bytes[idx + 1] == b'\n' {
+                HeaderValueOutcome::Found { pos: idx }
+            } else {
+                HeaderValueOutcome::Invalid
+            };
+        }
+        if (byte < 0x20 && byte != b'\t') || byte == 0x7f {
+            return HeaderValueOutcome::Invalid;
+        }
+        idx += 1;
+    }
+    HeaderValueOutcome::None
+}
+
+#[test]
+fn value_scan_matches_naive_across_simd_boundaries() {
+    for len in [0usize, 1, 15, 16, 17, 31, 32, 33, 63, 64, 65] {
+        let visible = vec![b'a'; len];
+        for &start in &[0usize, 1, 7, 15, 16, 17, 31] {
+            assert_eq!(
+                scan_header_value(&visible, start),
+                naive_value(&visible, start),
+                "visible len={len} start={start}",
+            );
+        }
+        for pos in [0, len / 2, len.saturating_sub(1)] {
+            if len == 0 {
+                continue;
+            }
+            for &byte in &[b'\t', b'\n', b'\r', 0, 0x1f, 0x7f, 0x80] {
+                let mut value = visible.clone();
+                value[pos] = byte;
+                if byte == b'\r' && pos + 1 < len {
+                    value[pos + 1] = b'\n';
+                }
+                assert_eq!(
+                    scan_header_value(&value, 0),
+                    naive_value(&value, 0),
+                    "len={len} pos={pos} byte={byte:#x}",
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn request_target_validation_matches_scalar_across_simd_boundaries() {
+    for len in [0usize, 1, 15, 16, 17, 31, 32, 33, 63, 64, 65] {
+        let valid = vec![b'a'; len];
+        assert!(request_target_is_valid(&valid));
+        for pos in [0, len / 2, len.saturating_sub(1)] {
+            if len == 0 {
+                continue;
+            }
+            for &byte in &[0, b'\t', b' ', 0x1f, 0x20, 0x21, 0x7e, 0x7f, 0x80] {
+                let mut target = valid.clone();
+                target[pos] = byte;
+                let scalar = !target.iter().any(|&b| b <= 0x20 || b == 0x7f);
+                assert_eq!(
+                    request_target_is_valid(&target),
+                    scalar,
                     "len={len} pos={pos} byte={byte:#x}",
                 );
             }

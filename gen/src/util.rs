@@ -7,7 +7,7 @@ use syn::{
 #[derive(Clone, Copy)]
 pub(super) enum ValueKind {
     Range,
-    Local,
+    Bytes,
     Usize,
     U64,
     Bool,
@@ -25,11 +25,13 @@ pub(super) trait TypeExt {
     fn value_inner(&self) -> &Type;
     fn value_optional(&self) -> bool;
     fn is_plain_ident(&self, want: &str) -> bool;
+    fn is_bytes_with_storage(&self, want: &str) -> bool;
     fn is_inline_token(&self) -> bool;
     fn is_static_byte_slice(&self) -> bool;
     fn is_range_usize(&self) -> bool;
-    fn has_local_frame_bytes(&self) -> bool;
-    fn rewrite_local_to_ref(&mut self);
+    fn has_retained_bytes(&self) -> bool;
+    fn has_borrowed_bytes(&self) -> bool;
+    fn rewrite_retained_to_borrowed(&mut self);
     fn value_kind(&self) -> Result<ValueKind>;
     fn raw_field_ty(&self) -> Result<Type>;
     fn type_ident(&self) -> Result<Ident>;
@@ -89,6 +91,25 @@ impl TypeExt for Type {
             .is_some_and(|seg| seg.ident == want)
     }
 
+    fn is_bytes_with_storage(&self, want: &str) -> bool {
+        let Type::Path(path) = self else {
+            return false;
+        };
+        let Some(seg) = path.path.segments.last() else {
+            return false;
+        };
+        if seg.ident != "Bytes" {
+            return false;
+        }
+        let PathArguments::AngleBracketed(args) = &seg.arguments else {
+            return false;
+        };
+        if args.args.len() != 1 {
+            return false;
+        }
+        matches!(args.args.first(), Some(GenericArgument::Type(storage)) if storage.is_plain_ident(want))
+    }
+
     fn is_inline_token(&self) -> bool {
         self.is_plain_ident("InlineToken")
     }
@@ -134,23 +155,35 @@ impl TypeExt for Type {
     fn unsupported_field_error(&self) -> syn::Error {
         syn::Error::new_spanned(
             self,
-            "unsupported field type; use Option<LocalFrameBytes>, Option<Range<usize>>, or Option<T> with a supported typed parser",
+            "unsupported field type; use Option<Bytes<Retained>>, Option<Range<usize>>, or Option<T> with a supported typed parser",
         )
     }
 
-    fn has_local_frame_bytes(&self) -> bool {
-        if self.is_plain_ident("LocalFrameBytes") {
+    fn has_retained_bytes(&self) -> bool {
+        if self.is_bytes_with_storage("Retained") {
             return true;
         }
         if let Some(inner) = self.option_inner() {
-            return inner.is_plain_ident("LocalFrameBytes");
+            return inner.is_bytes_with_storage("Retained");
         }
         false
     }
 
-    fn rewrite_local_to_ref(&mut self) {
-        if self.is_plain_ident("LocalFrameBytes") {
-            *self = syn::parse_quote!(::sark::sark_core::http::LocalFrameBytesRef<'req>);
+    fn has_borrowed_bytes(&self) -> bool {
+        if self.is_bytes_with_storage("Borrowed") {
+            return true;
+        }
+        if let Some(inner) = self.option_inner() {
+            return inner.is_bytes_with_storage("Borrowed");
+        }
+        false
+    }
+
+    fn rewrite_retained_to_borrowed(&mut self) {
+        if self.is_bytes_with_storage("Retained") {
+            *self = syn::parse_quote!(
+                ::sark::sark_core::http::Bytes<::sark::sark_core::http::Borrowed<'req>>
+            );
             return;
         }
         if let Type::Path(path) = self
@@ -160,9 +193,11 @@ impl TypeExt for Type {
         {
             for arg in &mut args.args {
                 if let GenericArgument::Type(inner) = arg
-                    && inner.is_plain_ident("LocalFrameBytes")
+                    && inner.is_bytes_with_storage("Retained")
                 {
-                    *inner = syn::parse_quote!(::sark::sark_core::http::LocalFrameBytesRef<'req>);
+                    *inner = syn::parse_quote!(
+                        ::sark::sark_core::http::Bytes<::sark::sark_core::http::Borrowed<'req>>
+                    );
                 }
             }
         }
@@ -170,7 +205,7 @@ impl TypeExt for Type {
 
     fn raw_field_ty(&self) -> Result<Type> {
         match self.value_kind()? {
-            ValueKind::Local => Ok(syn::parse_quote! { Option<std::ops::Range<usize>> }),
+            ValueKind::Bytes => Ok(syn::parse_quote! { Option<std::ops::Range<usize>> }),
             _ if self.value_optional() => Ok(self.clone()),
             _ => {
                 let ty = self;
@@ -184,8 +219,8 @@ impl TypeExt for Type {
         if inner.is_range_usize() {
             return Ok(ValueKind::Range);
         }
-        if inner.is_plain_ident("LocalFrameBytes") {
-            return Ok(ValueKind::Local);
+        if inner.is_bytes_with_storage("Retained") {
+            return Ok(ValueKind::Bytes);
         }
         if inner.is_plain_ident("usize") {
             return Ok(ValueKind::Usize);

@@ -37,6 +37,8 @@ struct FakeTransport {
 }
 
 impl StreamTransport for FakeTransport {
+    type SendError = std::convert::Infallible;
+
     fn recv_stream(&mut self, stream_id: u64, out: &mut Vec<u8>) -> usize {
         let bytes = self.recv.remove(&stream_id).unwrap_or_default();
         let n = bytes.len();
@@ -48,21 +50,29 @@ impl StreamTransport for FakeTransport {
         self.recv_fin.contains(&stream_id)
     }
 
-    fn send_stream(&mut self, stream_id: u64, bytes: &[u8]) {
+    fn send_stream(&mut self, stream_id: u64, bytes: &[u8]) -> Result<(), Self::SendError> {
         self.sent
             .entry(stream_id)
             .or_default()
             .extend_from_slice(bytes);
+        Ok(())
     }
 
-    fn finish_stream(&mut self, stream_id: u64) {
+    fn finish_stream(&mut self, stream_id: u64) -> Result<(), Self::SendError> {
         self.sent_fin.insert(stream_id);
+        Ok(())
     }
 }
 
 #[test]
 fn h3_request_routes_and_responds() {
-    let app = h3_app::new::<dope::wire::Identity>(sark::EmptyState::REF);
+    let app = H3App::new::<dope_net::wire::identity::Identity>(
+        sark::EmptyState,
+        sark::app::Config {
+            timer_capacity: 0,
+            task_capacity: 0,
+        },
+    );
 
     let mut client = Conn::with_role(Role::Client);
     client
@@ -79,7 +89,7 @@ fn h3_request_routes_and_responds() {
         .unwrap();
 
     let mut wire = FakeTransport::default();
-    pump_writes(&mut client, &mut wire);
+    pump_writes(&mut client, &mut wire).unwrap();
 
     let mut server = Conn::with_role(Role::Server);
     wire.recv.insert(0, wire.sent.remove(&0).unwrap());
@@ -118,7 +128,7 @@ fn h3_request_routes_and_responds() {
     assert!(routed);
 
     let mut back = FakeTransport::default();
-    pump_writes(&mut server, &mut back);
+    pump_writes(&mut server, &mut back).unwrap();
     back.recv.insert(0, back.sent.remove(&0).unwrap());
     if back.sent_fin.contains(&0) {
         back.recv_fin.insert(0);

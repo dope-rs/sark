@@ -1,14 +1,26 @@
-use o3::buffer::Owned;
-use sark_json::{Encode, Writer};
+use sark_core::http::EncodedBody;
+use sark_json::{Encode, JsonBody, JsonEncode, Write, Writer};
+
+struct LengthMismatch;
+
+impl JsonEncode for LengthMismatch {
+    fn json_len(&self) -> usize {
+        0
+    }
+
+    fn write_into<W: Write>(&self, writer: &mut W) {
+        writer.put(b"x");
+    }
+}
 
 fn check(value: &[u8]) {
-    let mut out = Owned::new();
+    let mut out = Vec::new();
     let mut w = Writer::new(&mut out, 0);
     w.put_str(value);
     w.finish();
     assert_eq!(
         Encode::str_len(value),
-        out.as_ref().len(),
+        out.len(),
         "str_len must match put_str output for {value:?}"
     );
 }
@@ -31,4 +43,10 @@ fn other_control_chars_are_six_bytes() {
 fn common_escapes_and_plain() {
     check(b"\"\\\n\r\t");
     check(b"hello world");
+}
+
+#[test]
+#[should_panic(expected = "JsonEncode wrote beyond json_len")]
+fn length_mismatch_panics() {
+    JsonBody::new(LengthMismatch).encode_into(&mut []);
 }

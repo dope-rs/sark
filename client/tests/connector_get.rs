@@ -3,7 +3,7 @@ mod common;
 use std::net::SocketAddr;
 
 use common::run_get;
-use sark_client::connector::Session;
+use sark_client::connector::Config;
 
 #[test]
 fn connector_plaintext_get() {
@@ -17,7 +17,7 @@ fn connector_plaintext_get() {
 
     let resp = run_get(
         addr,
-        Session::new("127.0.0.1"),
+        Config::new("127.0.0.1"),
         "/api/v3/ticker/price?symbol=BTCUSDT",
     )
     .expect("http get");

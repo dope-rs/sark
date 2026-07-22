@@ -1,11 +1,14 @@
 use core::marker::PhantomData;
-use std::collections::{BTreeMap, VecDeque};
+use core::ops::Deref;
+use std::fmt;
 
 use dope::runtime::profile::Throughput;
+use o3::buffer::{ByteRing, Pooled, SharedPool};
+use o3::collections::{FixedHashTable, FixedQueue};
 
 use crate::frame::{
-    self, Continuation, Data, ErrorCode, Flags, FrameHeader, GoAway, HEADER_LEN, Headers,
-    ParseError, Ping, Priority, PushPromise, RstStream, SettingId, WindowUpdate,
+    self, Continuation, Data, ErrorCode, Flags, FrameBuf, FrameHeader, GoAway, HEADER_LEN, Headers,
+    ParseError, Ping, Priority, RstStream, SettingId, WindowUpdate,
 };
 use crate::role::Role;
 use crate::stream::{self, Side, Stream, StreamId, TransitionError};
@@ -67,7 +70,7 @@ impl Settings {
         Ok(())
     }
 
-    pub fn encode(&self, out: &mut Vec<u8>) {
+    pub fn encode(&self, out: &mut impl FrameBuf) {
         Self::push_param(out, SettingId::HeaderTableSize, self.header_table_size);
         Self::push_param(
             out,
@@ -84,7 +87,7 @@ impl Settings {
         }
     }
 
-    fn push_param(out: &mut Vec<u8>, id: SettingId, value: u32) {
+    fn push_param(out: &mut impl FrameBuf, id: SettingId, value: u32) {
         out.extend_from_slice(&(id as u16).to_be_bytes());
         out.extend_from_slice(&value.to_be_bytes());
     }
@@ -99,6 +102,36 @@ impl Settings {
 impl Default for Settings {
     fn default() -> Self {
         Self::DEFAULT
+    }
+}
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct Config {
+    pub local_settings: Settings,
+    pub recv_window_target: u32,
+    pub stream_capacity: usize,
+    pub event_capacity: usize,
+    pub data_capacity: usize,
+    pub header_capacity: usize,
+    pub inbound_capacity: usize,
+    pub outbound_capacity: usize,
+}
+
+impl Default for Config {
+    fn default() -> Self {
+        Self {
+            local_settings: Settings {
+                initial_window_size: <Throughput as Tuning>::STREAM_RECV_WINDOW,
+                ..Settings::DEFAULT
+            },
+            recv_window_target: <Throughput as Tuning>::CONN_RECV_WINDOW,
+            stream_capacity: <Throughput as Tuning>::MAX_ACTIVE_STREAMS,
+            event_capacity: DEFAULT_EVENT_CAPACITY,
+            data_capacity: DEFAULT_DATA_EVENTS,
+            header_capacity: DEFAULT_HEADER_EVENTS,
+            inbound_capacity: DEFAULT_INBOUND_CAPACITY,
+            outbound_capacity: DEFAULT_OUTBOUND_CAPACITY,
+        }
     }
 }
 
@@ -190,17 +223,17 @@ pub enum Event {
     GoAway {
         last_stream_id: StreamId,
         error: ErrorCode,
-        debug: Vec<u8>,
+        debug: DataPayload,
     },
     Headers {
         stream_id: StreamId,
-        headers: Vec<hpack::OwnedHeader>,
+        headers: hpack::HeaderBlock,
         end_stream: bool,
         trailing: bool,
     },
     Data {
         stream_id: StreamId,
-        data: Vec<u8>,
+        data: DataPayload,
         end_stream: bool,
     },
     StreamReset {
@@ -210,8 +243,65 @@ pub enum Event {
     PushPromise {
         stream_id: StreamId,
         promised_stream_id: StreamId,
-        headers: Vec<hpack::OwnedHeader>,
+        headers: hpack::HeaderBlock,
     },
+}
+
+#[derive(Clone)]
+pub struct DataPayload(Pooled);
+
+impl Deref for DataPayload {
+    type Target = [u8];
+
+    fn deref(&self) -> &Self::Target {
+        self.0.as_slice()
+    }
+}
+
+impl AsRef<[u8]> for DataPayload {
+    fn as_ref(&self) -> &[u8] {
+        self
+    }
+}
+
+impl DataPayload {
+    pub fn into_pooled(self) -> Pooled {
+        self.0
+    }
+}
+
+impl PartialEq for DataPayload {
+    fn eq(&self, other: &Self) -> bool {
+        self.as_ref() == other.as_ref()
+    }
+}
+
+impl PartialEq<[u8]> for DataPayload {
+    fn eq(&self, other: &[u8]) -> bool {
+        self.as_ref() == other
+    }
+}
+
+impl<const N: usize> PartialEq<[u8; N]> for DataPayload {
+    fn eq(&self, other: &[u8; N]) -> bool {
+        self.as_ref() == other
+    }
+}
+
+impl<const N: usize> PartialEq<&[u8; N]> for DataPayload {
+    fn eq(&self, other: &&[u8; N]) -> bool {
+        self.as_ref() == *other
+    }
+}
+
+impl Eq for DataPayload {}
+
+impl fmt::Debug for DataPayload {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("DataPayload")
+            .field("len", &self.len())
+            .finish()
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -223,24 +313,33 @@ enum PendingKind {
 struct PendingHeaders {
     stream_id: StreamId,
     kind: PendingKind,
-    buf: Vec<u8>,
     continuations: u32,
 }
 
 const DEFAULT_MAX_HEADER_LIST_SIZE: u32 = 16_384;
-const DEFAULT_MAX_CONCURRENT_STREAMS: u32 = 256;
-const MAX_INBOUND_BUFFER: usize = 1 << 20;
-const MAX_OUTBOUND_BUFFER: usize = 1 << 20;
-const MAX_EVENTS: usize = 1 << 16;
+const DEFAULT_MAX_ACTIVE_STREAMS: usize = 256;
+const DEFAULT_INBOUND_CAPACITY: usize = 1 << 20;
+const DEFAULT_OUTBOUND_CAPACITY: usize = 1 << 20;
+const DEFAULT_EVENT_CAPACITY: usize = 1 << 13;
+const DEFAULT_DATA_EVENTS: usize = 64;
+const DEFAULT_HEADER_EVENTS: usize = 64;
 const MAX_RESET_STREAMS: u32 = 100;
 const RESET_RING_CAP: usize = 256;
 const MAX_CONTINUATION_FRAMES: u32 = 64;
 
+struct StreamRecord {
+    stream: Stream,
+    send_window: flow::Window,
+    recv_window: flow::Window,
+    pending_release: u32,
+}
+
 pub struct Conn<R: Role> {
     role: PhantomData<R>,
 
-    inbound: Vec<u8>,
-    outbound: Vec<u8>,
+    inbound: ByteRing,
+    outbound: ByteRing,
+    outbound_capacity: usize,
 
     preface_done: bool,
     initial_settings_sent: bool,
@@ -255,20 +354,23 @@ pub struct Conn<R: Role> {
     recv_window: flow::Window,
     recv_window_target: u32,
 
-    events: VecDeque<Event>,
+    events: FixedQueue<Event>,
+    data_pool: SharedPool,
+    header_pool: SharedPool,
 
     encoder: hpack::Encoder,
+    send_header_block: Vec<u8>,
+    recv_header_block: Vec<u8>,
     decoder: hpack::Decoder,
-    streams: BTreeMap<StreamId, Stream>,
+    streams: FixedHashTable<StreamRecord>,
+    local_streams: usize,
+    peer_streams: usize,
     next_local_id: stream::IdGen,
     last_peer_stream_id: u32,
     pending_headers: Option<PendingHeaders>,
     pending_headers_cap: usize,
-    per_stream_send_window: BTreeMap<StreamId, flow::Window>,
-    per_stream_recv_window: BTreeMap<StreamId, flow::Window>,
     conn_pending_release: u32,
-    per_stream_pending_release: BTreeMap<StreamId, u32>,
-    reset_streams: VecDeque<StreamId>,
+    reset_streams: FixedQueue<StreamId>,
     peer_reset_count: u32,
     send_window_opened: bool,
 }
@@ -279,34 +381,92 @@ impl<R: Role> Conn<R> {
     }
 
     pub fn with_tuning<P: Tuning>() -> Self {
-        Self::with_local_settings(
-            Settings {
+        Self::with_config(Config {
+            local_settings: Settings {
                 initial_window_size: P::STREAM_RECV_WINDOW,
                 ..Settings::DEFAULT
             },
-            P::CONN_RECV_WINDOW,
-        )
+            recv_window_target: P::CONN_RECV_WINDOW,
+            stream_capacity: P::MAX_ACTIVE_STREAMS,
+            event_capacity: DEFAULT_EVENT_CAPACITY,
+            data_capacity: DEFAULT_DATA_EVENTS,
+            header_capacity: DEFAULT_HEADER_EVENTS,
+            inbound_capacity: DEFAULT_INBOUND_CAPACITY,
+            outbound_capacity: DEFAULT_OUTBOUND_CAPACITY,
+        })
     }
 
     pub fn with_local_settings(local: Settings, recv_window_target: u32) -> Self {
+        let stream_capacity = local
+            .max_concurrent_streams
+            .map_or(DEFAULT_MAX_ACTIVE_STREAMS, |limit| (limit as usize).max(1));
+        Self::with_config(Config {
+            local_settings: local,
+            recv_window_target,
+            stream_capacity,
+            event_capacity: DEFAULT_EVENT_CAPACITY,
+            data_capacity: DEFAULT_DATA_EVENTS,
+            header_capacity: DEFAULT_HEADER_EVENTS,
+            inbound_capacity: DEFAULT_INBOUND_CAPACITY,
+            outbound_capacity: DEFAULT_OUTBOUND_CAPACITY,
+        })
+    }
+
+    pub fn with_config(config: Config) -> Self {
+        let Config {
+            local_settings: local,
+            recv_window_target,
+            stream_capacity,
+            event_capacity,
+            data_capacity,
+            header_capacity,
+            inbound_capacity,
+            outbound_capacity,
+        } = config;
+        assert!(stream_capacity > 0, "stream capacity must be positive");
+        assert!(event_capacity > 0, "event capacity must be positive");
+        assert!(data_capacity > 0, "data capacity must be positive");
+        assert!(header_capacity > 0, "header capacity must be positive");
+        assert!(inbound_capacity > 0, "inbound capacity must be positive");
+        assert!(outbound_capacity > 0, "outbound capacity must be positive");
+        let capacity = u32::try_from(stream_capacity).expect("stream capacity overflow");
         let peer = Settings::DEFAULT;
         let mut local = local;
         if R::IS_SERVER {
             local.enable_push = false;
-            if local.max_concurrent_streams.is_none() {
-                local.max_concurrent_streams = Some(DEFAULT_MAX_CONCURRENT_STREAMS);
-            }
         }
+        local.max_concurrent_streams = Some(
+            local
+                .max_concurrent_streams
+                .map_or(capacity, |limit| limit.min(capacity)),
+        );
         if local.max_header_list_size.is_none() {
             local.max_header_list_size = Some(DEFAULT_MAX_HEADER_LIST_SIZE);
         }
+        let initial_outbound = HEADER_LEN
+            + local.param_count() * 6
+            + if R::PREFACE_SENDS_FIRST {
+                CLIENT_PREFACE.len()
+            } else {
+                0
+            }
+            + if recv_window_target > flow::Window::INITIAL as u32 {
+                HEADER_LEN + 4
+            } else {
+                0
+            };
+        assert!(
+            outbound_capacity >= initial_outbound,
+            "outbound capacity is too small"
+        );
         let header_list_cap = local.max_header_list_size.unwrap() as usize;
         let mut decoder = hpack::Decoder::new(local.header_table_size as usize);
         decoder.set_max_header_list_size(Some(header_list_cap));
         let mut conn = Self {
             role: PhantomData,
-            inbound: Vec::new(),
-            outbound: Vec::new(),
+            inbound: ByteRing::with_capacity(inbound_capacity),
+            outbound: ByteRing::with_capacity(outbound_capacity),
+            outbound_capacity,
             preface_done: false,
             initial_settings_sent: false,
             peer_settings_received: false,
@@ -317,32 +477,43 @@ impl<R: Role> Conn<R> {
             send_window: flow::Window::new(),
             recv_window: flow::Window::new(),
             recv_window_target,
-            events: VecDeque::new(),
+            events: FixedQueue::with_capacity(event_capacity),
+            data_pool: SharedPool::new(data_capacity, local.max_frame_size as usize),
+            header_pool: SharedPool::new(header_capacity, header_list_cap),
             encoder: hpack::Encoder::new(local.header_table_size as usize),
+            send_header_block: Vec::with_capacity(header_list_cap),
+            recv_header_block: Vec::with_capacity(header_list_cap),
             decoder,
-            streams: BTreeMap::new(),
+            streams: FixedHashTable::with_capacity(stream_capacity),
+            local_streams: 0,
+            peer_streams: 0,
             next_local_id: stream::IdGen::new(R::FIRST_LOCAL_STREAM_ID),
             last_peer_stream_id: 0,
             pending_headers: None,
             pending_headers_cap: header_list_cap,
-            per_stream_send_window: BTreeMap::new(),
-            per_stream_recv_window: BTreeMap::new(),
             conn_pending_release: 0,
-            per_stream_pending_release: BTreeMap::new(),
-            reset_streams: VecDeque::new(),
+            reset_streams: FixedQueue::with_capacity(RESET_RING_CAP),
             peer_reset_count: 0,
             send_window_opened: false,
         };
         if R::PREFACE_SENDS_FIRST {
-            conn.outbound.extend_from_slice(CLIENT_PREFACE);
+            if conn.outbound.try_extend_from_slice(CLIENT_PREFACE).is_err() {
+                unreachable!();
+            }
             conn.preface_done = true;
-            conn.events.push_back(Event::PrefaceComplete);
+            conn.events
+                .vacant_entry()
+                .unwrap()
+                .push_back(Event::PrefaceComplete);
         }
         conn.emit_initial_settings();
         conn.initial_settings_sent = true;
         let bump = recv_window_target.saturating_sub(flow::Window::INITIAL as u32);
-        if bump > 0 && conn.recv_window.increase(bump).is_ok() {
-            conn.emit_window_update(StreamId::CONNECTION, bump);
+        if bump > 0
+            && conn.recv_window.increase(bump).is_ok()
+            && conn.emit_window_update(StreamId::CONNECTION, bump).is_err()
+        {
+            unreachable!();
         }
         conn
     }
@@ -372,17 +543,24 @@ impl<R: Role> Conn<R> {
     }
 
     pub fn outbound(&self) -> &[u8] {
-        &self.outbound
+        self.outbound.as_slices().0
+    }
+
+    pub fn outbound_slices(&self) -> (&[u8], &[u8]) {
+        self.outbound.as_slices()
     }
 
     pub fn drain_outbound(&mut self, n: usize) {
-        let n = n.min(self.outbound.len());
-        self.outbound.drain(..n);
+        self.outbound.consume(n.min(self.outbound.len()));
     }
 
     pub fn drain_into(&mut self, write_buf: &mut [u8]) -> usize {
-        let n = self.outbound.len().min(write_buf.len());
-        write_buf[..n].copy_from_slice(&self.outbound[..n]);
+        let (first, second) = self.outbound.as_slices();
+        let first_len = first.len().min(write_buf.len());
+        write_buf[..first_len].copy_from_slice(&first[..first_len]);
+        let second_len = second.len().min(write_buf.len() - first_len);
+        write_buf[first_len..first_len + second_len].copy_from_slice(&second[..second_len]);
+        let n = first_len + second_len;
         self.drain_outbound(n);
         n
     }
@@ -391,20 +569,51 @@ impl<R: Role> Conn<R> {
         self.events.pop_front()
     }
 
-    /// Consume the coalesced "peer opened our send window" signal accumulated
-    /// since the last call. Set whenever a WINDOW_UPDATE or an initial-window
-    /// SETTINGS increase grows a send window; a flood of such frames collapses
-    /// to a single signal instead of one event per frame.
+    fn push_event(&mut self, event: Event) -> Result<(), ConnError> {
+        self.events
+            .push_back(event)
+            .map_err(|_| ConnError::Overload)
+    }
+
+    fn ensure_event_capacity(&self) -> Result<(), ConnError> {
+        if self.events.is_full() {
+            Err(ConnError::Overload)
+        } else {
+            Ok(())
+        }
+    }
+
+    fn inbound_len(&self) -> usize {
+        self.inbound.len()
+    }
+
+    fn consume_inbound(&mut self, n: usize) {
+        self.inbound.consume(n);
+    }
+
+    fn prepare_inbound(&mut self, additional: usize) -> Result<(), ConnError> {
+        (additional <= self.inbound.remaining())
+            .then_some(())
+            .ok_or(ConnError::Overload)
+    }
+
+    fn prepare_outbound(&mut self, additional: usize) -> Result<(), ConnError> {
+        if additional > self.outbound.remaining() {
+            return Err(ConnError::Overload);
+        }
+        Ok(())
+    }
+
     pub fn take_window_opened(&mut self) -> bool {
         std::mem::take(&mut self.send_window_opened)
     }
 
     pub fn has_stream(&self, id: StreamId) -> bool {
-        self.streams.contains_key(&id)
+        self.stream(id).is_some()
     }
 
     pub fn stream_state(&self, id: StreamId) -> Option<stream::State> {
-        self.streams.get(&id).map(|s| s.state)
+        self.stream(id).map(|record| record.stream.state)
     }
 
     pub fn active_count(&self) -> usize {
@@ -416,19 +625,22 @@ impl<R: Role> Conn<R> {
     }
 
     pub fn stream_send_window(&self, id: StreamId) -> Option<flow::Window> {
-        self.per_stream_send_window.get(&id).copied()
+        self.stream(id).map(|record| record.send_window)
     }
 
     pub fn stream_recv_window(&self, id: StreamId) -> Option<flow::Window> {
-        self.per_stream_recv_window.get(&id).copied()
+        self.stream(id).map(|record| record.recv_window)
     }
 
-    pub fn ping(&mut self, opaque: [u8; 8]) {
+    pub fn ping(&mut self, opaque: [u8; 8]) -> Result<(), ConnError> {
+        self.prepare_outbound(HEADER_LEN + opaque.len())?;
         let frame = Ping { ack: false, opaque };
         frame.encode(&mut self.outbound);
+        Ok(())
     }
 
-    pub fn goaway(&mut self, error: ErrorCode, debug: &[u8]) {
+    pub fn goaway(&mut self, error: ErrorCode, debug: &[u8]) -> Result<(), ConnError> {
+        self.prepare_outbound(HEADER_LEN + 8 + debug.len())?;
         let frame = GoAway {
             last_stream_id: StreamId(self.last_peer_stream_id),
             error,
@@ -436,12 +648,14 @@ impl<R: Role> Conn<R> {
         };
         frame.encode(&mut self.outbound);
         self.goaway_sent = true;
+        Ok(())
     }
 
     pub fn reset_stream(&mut self, stream_id: StreamId, error: ErrorCode) -> Result<(), ConnError> {
         if !self.has_stream(stream_id) {
             return Err(ConnError::BadStream);
         }
+        self.prepare_outbound(HEADER_LEN + 4)?;
         RstStream { stream_id, error }.encode(&mut self.outbound);
         self.advance_stream(stream_id, stream::Event::RstStream, Side::Local)
             .map_err(|_| ConnError::Protocol)?;
@@ -454,34 +668,58 @@ impl<R: Role> Conn<R> {
         data: &[u8],
         end_stream: bool,
     ) -> Result<usize, ConnError> {
+        self.send_data_parts(stream_id, data, &[], end_stream)
+    }
+
+    pub fn send_data_parts(
+        &mut self,
+        stream_id: StreamId,
+        first: &[u8],
+        second: &[u8],
+        end_stream: bool,
+    ) -> Result<usize, ConnError> {
         if !self.has_stream(stream_id) {
             return Err(ConnError::BadStream);
         }
-        let sw = self
-            .per_stream_send_window
-            .get_mut(&stream_id)
-            .ok_or(ConnError::BadStream)?;
-        let mut pair = flow::Pair {
-            conn: &mut self.send_window,
-            stream: sw,
+        let len = first
+            .len()
+            .checked_add(second.len())
+            .ok_or(ConnError::FrameSize)?;
+        let max_frame = self.peer_settings.max_frame_size as usize;
+        let avail = {
+            let record = self
+                .streams
+                .get_mut(Self::stream_hash(stream_id), |record| {
+                    record.stream.id == stream_id
+                })
+                .ok_or(ConnError::BadStream)?;
+            flow::Pair {
+                conn: &mut self.send_window,
+                stream: &mut record.send_window,
+            }
+            .available()
         };
-        let avail = pair.available();
-        if avail == 0 && !data.is_empty() {
+        if avail == 0 && len != 0 {
             return Ok(0);
         }
-        let max_frame = self.peer_settings.max_frame_size as usize;
-        let send_n = data.len().min(avail).min(max_frame);
+        let send_n = len.min(avail).min(max_frame);
+        self.prepare_outbound(HEADER_LEN + send_n)?;
         if send_n > 0 {
+            let record = self
+                .streams
+                .get_mut(Self::stream_hash(stream_id), |record| {
+                    record.stream.id == stream_id
+                })
+                .ok_or(ConnError::BadStream)?;
+            let mut pair = flow::Pair {
+                conn: &mut self.send_window,
+                stream: &mut record.send_window,
+            };
             pair.consume(send_n).map_err(ConnError::from)?;
         }
-        let last_chunk = send_n == data.len();
+        let last_chunk = send_n == len;
         let es = end_stream && last_chunk;
-        Data {
-            stream_id,
-            end_stream: es,
-            payload: &data[..send_n],
-        }
-        .encode(&mut self.outbound);
+        Data::encode_parts(stream_id, es, first, second, send_n, &mut self.outbound);
         self.advance_stream(
             stream_id,
             stream::Event::Data { end_stream: es },
@@ -510,17 +748,16 @@ impl<R: Role> Conn<R> {
     }
 
     pub fn ingest(&mut self, bytes: &[u8]) -> Result<(), ConnError> {
-        self.inbound.extend_from_slice(bytes);
+        self.prepare_inbound(bytes.len())?;
+        self.inbound
+            .try_extend_from_slice(bytes)
+            .map_err(|_| ConnError::Overload)?;
+        self.resume()
+    }
+
+    pub fn resume(&mut self) -> Result<(), ConnError> {
         self.drive()?;
-        let inbound_cap =
-            MAX_INBOUND_BUFFER.max(self.local_settings.max_frame_size as usize + HEADER_LEN);
-        if self.inbound.len() > inbound_cap {
-            return Err(ConnError::Overload);
-        }
-        if self.events.len() > MAX_EVENTS {
-            return Err(ConnError::Overload);
-        }
-        if self.outbound.len() > MAX_OUTBOUND_BUFFER {
+        if self.outbound.len() > self.outbound_capacity {
             return Err(ConnError::Overload);
         }
         Ok(())
@@ -539,7 +776,8 @@ impl<R: Role> Conn<R> {
         self.local_settings.encode(&mut self.outbound);
     }
 
-    fn emit_settings_ack(&mut self) {
+    fn emit_settings_ack(&mut self) -> Result<(), ConnError> {
+        self.prepare_outbound(HEADER_LEN)?;
         FrameHeader {
             length: 0,
             kind: frame::Type::Settings,
@@ -547,27 +785,33 @@ impl<R: Role> Conn<R> {
             stream_id: StreamId(0),
         }
         .encode(&mut self.outbound);
+        Ok(())
     }
 
-    fn emit_window_update(&mut self, stream_id: StreamId, increment: u32) {
+    fn emit_window_update(&mut self, stream_id: StreamId, increment: u32) -> Result<(), ConnError> {
         if increment == 0 {
-            return;
+            return Ok(());
         }
+        self.prepare_outbound(HEADER_LEN + 4)?;
         WindowUpdate {
             stream_id,
             increment,
         }
         .encode(&mut self.outbound);
+        Ok(())
     }
 
-    fn emit_rst(&mut self, stream_id: StreamId, error: ErrorCode) {
+    fn emit_rst(&mut self, stream_id: StreamId, error: ErrorCode) -> Result<(), ConnError> {
+        self.prepare_outbound(HEADER_LEN + 4)?;
         RstStream { stream_id, error }.encode(&mut self.outbound);
+        Ok(())
     }
 
-    fn rst_evict(&mut self, stream_id: StreamId, error: ErrorCode) {
-        self.emit_rst(stream_id, error);
+    fn rst_evict(&mut self, stream_id: StreamId, error: ErrorCode) -> Result<(), ConnError> {
+        self.emit_rst(stream_id, error)?;
         self.mark_reset(stream_id);
         self.evict_stream(stream_id);
+        Ok(())
     }
 
     fn emit_headers<'a, I>(
@@ -579,9 +823,20 @@ impl<R: Role> Conn<R> {
     where
         I: IntoIterator<Item = hpack::Header<'a>>,
     {
-        let mut block = Vec::new();
+        let mut block = core::mem::take(&mut self.send_header_block);
+        block.clear();
         self.encoder.encode(headers, &mut block);
         let max_frame = self.peer_settings.max_frame_size as usize;
+        let frames = block.len().max(1).div_ceil(max_frame);
+        let additional = frames
+            .checked_mul(HEADER_LEN)
+            .and_then(|headers| block.len().checked_add(headers))
+            .ok_or(ConnError::FrameSize);
+        let result = additional.and_then(|additional| self.prepare_outbound(additional));
+        if result.is_err() {
+            self.send_header_block = block;
+            return result;
+        }
         if block.len() <= max_frame {
             Headers {
                 stream_id,
@@ -615,6 +870,7 @@ impl<R: Role> Conn<R> {
                 pos = end;
             }
         }
+        self.send_header_block = block;
         Ok(())
     }
 
@@ -624,7 +880,7 @@ impl<R: Role> Conn<R> {
         ev: stream::Event,
         side: Side,
     ) -> Result<(), TransitionError> {
-        let stream = self.streams.get_mut(&id).ok_or(TransitionError::Protocol)?;
+        let stream = &mut self.stream_mut(id).ok_or(TransitionError::Protocol)?.stream;
         let next = match side {
             Side::Local => stream.state.send(ev)?,
             Side::Remote => stream.state.recv(ev)?,
@@ -643,10 +899,10 @@ impl<R: Role> Conn<R> {
         if self.reset_streams.contains(&id) {
             return;
         }
-        if self.reset_streams.len() >= RESET_RING_CAP {
+        if self.reset_streams.is_full() {
             self.reset_streams.pop_front();
         }
-        self.reset_streams.push_back(id);
+        self.reset_streams.vacant_entry().unwrap().push_back(id);
     }
 
     fn is_peer_initiated(id: StreamId) -> bool {
@@ -665,11 +921,79 @@ impl<R: Role> Conn<R> {
         }
     }
 
+    fn stream_hash(id: StreamId) -> u64 {
+        u64::from(id.0)
+    }
+
+    fn stream(&self, id: StreamId) -> Option<&StreamRecord> {
+        self.streams
+            .get(Self::stream_hash(id), |record| record.stream.id == id)
+    }
+
+    fn stream_mut(&mut self, id: StreamId) -> Option<&mut StreamRecord> {
+        self.streams
+            .get_mut(Self::stream_hash(id), |record| record.stream.id == id)
+    }
+
+    fn track_stream(&mut self, stream: Stream) -> Result<(), Stream> {
+        let id = stream.id;
+        let record = StreamRecord {
+            stream,
+            send_window: flow::Window::with(self.peer_settings.initial_window_size as i32),
+            recv_window: flow::Window::with(self.local_settings.initial_window_size as i32),
+            pending_release: 0,
+        };
+        match self
+            .streams
+            .try_insert(Self::stream_hash(id), record, |record| {
+                record.stream.id == id
+            }) {
+            Ok(()) => {
+                if Self::is_local_initiated(id) {
+                    self.local_streams += 1;
+                } else {
+                    self.peer_streams += 1;
+                }
+                Ok(())
+            }
+            Err(record) => Err(record.stream),
+        }
+    }
+
+    fn can_track_peer_stream(&self) -> bool {
+        self.peer_streams < self.local_settings.max_concurrent_streams.unwrap() as usize
+            && self.active_count() < self.streams.capacity()
+    }
+
+    fn can_track_local_stream(&self) -> bool {
+        self.local_streams
+            < self
+                .peer_settings
+                .max_concurrent_streams
+                .map_or(usize::MAX, |limit| limit as usize)
+            && self.active_count() < self.streams.capacity()
+    }
+
+    fn reserve_promised_stream(&mut self, id: StreamId) -> Result<bool, ConnError> {
+        if !Self::is_peer_initiated(id) || id.0 <= self.last_peer_stream_id {
+            return Err(ConnError::Protocol);
+        }
+        if !self.can_track_peer_stream() {
+            self.emit_rst(id, ErrorCode::RefusedStream)?;
+            self.last_peer_stream_id = id.0;
+            return Ok(false);
+        }
+        self.track_stream(Stream::reserve_remote(id))
+            .map_err(|_| ConnError::Protocol)?;
+        self.last_peer_stream_id = id.0;
+        Ok(true)
+    }
+
     fn classify_stream(&self, id: StreamId) -> StreamClass {
         if id.0 == 0 {
             return StreamClass::Connection;
         }
-        if self.streams.contains_key(&id) {
+        if self.stream(id).is_some() {
             return StreamClass::Active;
         }
         if Self::is_peer_initiated(id) && id.0 <= self.last_peer_stream_id {
@@ -690,101 +1014,179 @@ impl<R: Role> Conn<R> {
     }
 
     fn evict_stream(&mut self, id: StreamId) {
-        self.streams.remove(&id);
-        self.per_stream_send_window.remove(&id);
-        self.per_stream_recv_window.remove(&id);
-        self.per_stream_pending_release.remove(&id);
+        if self
+            .streams
+            .remove(Self::stream_hash(id), |record| record.stream.id == id)
+            .is_some()
+        {
+            if Self::is_local_initiated(id) {
+                self.local_streams -= 1;
+            } else {
+                self.peer_streams -= 1;
+            }
+        }
     }
 
-    fn decode_block(&mut self, block: &[u8]) -> Result<(Vec<hpack::OwnedHeader>, bool), ConnError> {
-        let mut headers = Vec::new();
+    fn decode_block(&mut self, block: &[u8]) -> Result<(hpack::HeaderBlock, bool), ConnError> {
+        let mut lease = self.header_pool.try_acquire().ok_or(ConnError::Overload)?;
+        let mut overflow = false;
         let over_limit = self.decoder.decode_bounded(block, |n, v| {
-            headers.push(hpack::OwnedHeader {
-                name: n.to_vec(),
-                value: v.to_vec(),
-            });
+            if overflow {
+                return;
+            }
+            let Ok(name_len) = u32::try_from(n.len()) else {
+                overflow = true;
+                return;
+            };
+            let Ok(value_len) = u32::try_from(v.len()) else {
+                overflow = true;
+                return;
+            };
+            let mut writer = lease.spare_writer();
+            overflow = writer
+                .try_extend_from_slice(&name_len.to_ne_bytes())
+                .and_then(|()| writer.try_extend_from_slice(&value_len.to_ne_bytes()))
+                .and_then(|()| writer.try_extend_from_slice(n))
+                .and_then(|()| writer.try_extend_from_slice(v))
+                .is_err();
         })?;
-        Ok((headers, over_limit))
+        if overflow {
+            return Err(ConnError::Overload);
+        }
+        Ok((hpack::HeaderBlock::from_pooled(lease.freeze()), over_limit))
+    }
+
+    fn decode_recv_block(&mut self) -> Result<(hpack::HeaderBlock, bool), ConnError> {
+        let mut block = core::mem::take(&mut self.recv_header_block);
+        let decoded = self.decode_block(&block);
+        block.clear();
+        self.recv_header_block = block;
+        decoded
     }
 
     fn drive(&mut self) -> Result<(), ConnError> {
         if !R::PREFACE_SENDS_FIRST && !self.preface_done {
-            if self.inbound.len() < CLIENT_PREFACE.len() {
+            if self.inbound_len() < CLIENT_PREFACE.len() {
                 return Ok(());
             }
-            if &self.inbound[..CLIENT_PREFACE.len()] != CLIENT_PREFACE {
+            let (first, second) = self
+                .inbound
+                .range_slices(0, CLIENT_PREFACE.len())
+                .ok_or(ConnError::BadPreface)?;
+            if first != &CLIENT_PREFACE[..first.len()] || second != &CLIENT_PREFACE[first.len()..] {
                 return Err(ConnError::BadPreface);
             }
-            self.inbound.drain(..CLIENT_PREFACE.len());
+            self.ensure_event_capacity()?;
+            self.consume_inbound(CLIENT_PREFACE.len());
             self.preface_done = true;
-            self.events.push_back(Event::PrefaceComplete);
+            self.push_event(Event::PrefaceComplete)?;
         }
 
         loop {
-            let header = match FrameHeader::parse(&self.inbound) {
-                Ok(h) => h,
+            let header = match self.parse_frame_header() {
+                Ok(header) => header,
                 Err(ParseError::NeedMore) => return Ok(()),
                 Err(ParseError::BadType(_)) => {
-                    if self.inbound.len() < HEADER_LEN {
+                    let mut prefix = [0; 3];
+                    if !self.inbound.copy_range_into(0, &mut prefix) {
                         return Ok(());
                     }
-                    let length =
-                        u32::from_be_bytes([0, self.inbound[0], self.inbound[1], self.inbound[2]]);
+                    let length = u32::from_be_bytes([0, prefix[0], prefix[1], prefix[2]]);
                     if length > self.local_settings.max_frame_size {
                         return Err(ConnError::FrameSize);
                     }
                     let total = HEADER_LEN + length as usize;
-                    if self.inbound.len() < total {
+                    if self.inbound_len() < total {
                         return Ok(());
                     }
-                    self.inbound.drain(..total);
+                    self.consume_inbound(total);
                     continue;
                 }
-                Err(e) => return Err(e.into()),
+                Err(error) => return Err(error.into()),
             };
             if header.length > self.local_settings.max_frame_size {
                 return Err(ConnError::FrameSize);
             }
             let total = HEADER_LEN + header.length as usize;
-            if self.inbound.len() < total {
+            if self.inbound_len() < total {
                 return Ok(());
             }
             if self.pending_headers.is_some() && header.kind != frame::Type::Continuation {
                 return Err(ConnError::Continuation);
             }
-            let payload_end = total;
-            let payload_start = HEADER_LEN;
+            let emits_event = match header.kind {
+                frame::Type::Settings
+                | frame::Type::Ping
+                | frame::Type::GoAway
+                | frame::Type::Data
+                | frame::Type::RstStream => true,
+                frame::Type::Headers | frame::Type::PushPromise | frame::Type::Continuation => {
+                    header.flags.has(Flags::END_HEADERS)
+                }
+                frame::Type::WindowUpdate | frame::Type::Priority => false,
+            };
+            if emits_event {
+                self.ensure_event_capacity()?;
+            }
             match header.kind {
                 frame::Type::Settings => {
-                    let payload = &self.inbound[payload_start..payload_end];
-                    let parsed = frame::Settings::parse(header, payload)?;
-                    if parsed.ack {
+                    let ack = header.flags.has(Flags::ACK);
+                    if !header.stream_id.is_zero() {
+                        return Err(ParseError::Protocol.into());
+                    }
+                    if (ack && header.length != 0) || !header.length.is_multiple_of(6) {
+                        return Err(ParseError::FrameSize.into());
+                    }
+                    if ack {
                         self.peer_settings_received = true;
-                        self.events.push_back(Event::SettingsAck);
+                        self.push_event(Event::SettingsAck)?;
                     } else {
+                        self.prepare_outbound(HEADER_LEN)?;
+                        let mut next_settings = self.peer_settings;
+                        let mut encoder_size = None;
                         let prev_iws = self.peer_settings.initial_window_size as i64;
-                        let params: Vec<u8> = parsed.params.to_vec();
-                        for chunk in params.chunks_exact(6) {
+                        let mut offset = 0;
+                        while offset < header.length as usize {
+                            let mut chunk = [0; 6];
+                            let copied = self
+                                .inbound
+                                .copy_range_into(HEADER_LEN + offset, &mut chunk);
+                            debug_assert!(copied);
                             let id_raw = u16::from_be_bytes([chunk[0], chunk[1]]);
                             let val = u32::from_be_bytes([chunk[2], chunk[3], chunk[4], chunk[5]]);
                             if let Some(id) = SettingId::from_u16(id_raw) {
-                                self.peer_settings.apply(id, val)?;
+                                next_settings.apply(id, val)?;
                                 if id == SettingId::HeaderTableSize {
-                                    self.encoder.set_max_size(val as usize);
+                                    encoder_size = Some(val as usize);
                                 }
                             }
+                            offset += 6;
                         }
-                        let new_iws = self.peer_settings.initial_window_size as i64;
+                        let new_iws = next_settings.initial_window_size as i64;
                         let delta = new_iws - prev_iws;
                         if delta != 0 {
                             let delta32 = delta as i32;
-                            for w in self.per_stream_send_window.values_mut() {
-                                w.adjust_initial(delta32).map_err(ConnError::from)?;
+                            for record in self.streams.values_mut() {
+                                let mut window = record.send_window;
+                                window.adjust_initial(delta32).map_err(ConnError::from)?;
                             }
                         }
-                        self.inbound.drain(..total);
-                        self.emit_settings_ack();
-                        self.events.push_back(Event::SettingsApplied);
+                        self.peer_settings = next_settings;
+                        if let Some(max_size) = encoder_size {
+                            self.encoder.set_max_size(max_size);
+                        }
+                        if delta != 0 {
+                            let delta32 = delta as i32;
+                            for record in self.streams.values_mut() {
+                                record
+                                    .send_window
+                                    .adjust_initial(delta32)
+                                    .map_err(ConnError::from)?;
+                            }
+                        }
+                        self.consume_inbound(total);
+                        self.emit_settings_ack()?;
+                        self.push_event(Event::SettingsApplied)?;
                         if delta > 0 {
                             self.send_window_opened = true;
                         }
@@ -792,114 +1194,242 @@ impl<R: Role> Conn<R> {
                     }
                 }
                 frame::Type::Ping => {
-                    let payload = &self.inbound[payload_start..payload_end];
-                    let parsed = Ping::parse(header, payload)?;
+                    let mut payload = [0; 8];
+                    if header.length != payload.len() as u32 {
+                        return Err(ParseError::FrameSize.into());
+                    }
+                    let copied = self.inbound.copy_range_into(HEADER_LEN, &mut payload);
+                    debug_assert!(copied);
+                    let parsed = Ping::parse(header, &payload)?;
                     if !parsed.ack {
                         let pong = Ping {
                             ack: true,
                             opaque: parsed.opaque,
                         };
-                        self.inbound.drain(..total);
+                        self.prepare_outbound(HEADER_LEN + 8)?;
+                        self.consume_inbound(total);
                         pong.encode(&mut self.outbound);
-                        self.events.push_back(Event::Ping {
+                        self.push_event(Event::Ping {
                             ack: false,
                             opaque: parsed.opaque,
-                        });
+                        })?;
                         continue;
-                    } else {
-                        self.events.push_back(Event::Ping {
-                            ack: true,
-                            opaque: parsed.opaque,
-                        });
                     }
+                    self.push_event(Event::Ping {
+                        ack: true,
+                        opaque: parsed.opaque,
+                    })?;
                 }
                 frame::Type::GoAway => {
-                    let payload = &self.inbound[payload_start..payload_end];
-                    let parsed = GoAway::parse(header, payload)?;
+                    if header.length < 8 {
+                        return Err(ParseError::FrameSize.into());
+                    }
+                    let mut prefix = [0; 8];
+                    let copied = self.inbound.copy_range_into(HEADER_LEN, &mut prefix);
+                    debug_assert!(copied);
+                    let parsed = GoAway::parse(header, &prefix)?;
+                    let debug_len = header.length as usize - prefix.len();
+                    let mut lease = self.data_pool.try_acquire().ok_or(ConnError::Overload)?;
+                    let (first, second) = self
+                        .inbound
+                        .range_slices(HEADER_LEN + prefix.len(), debug_len)
+                        .ok_or(ConnError::FrameSize)?;
+                    let mut writer = lease.spare_writer();
+                    writer
+                        .try_extend_from_slice(first)
+                        .map_err(|_| ConnError::Overload)?;
+                    writer
+                        .try_extend_from_slice(second)
+                        .map_err(|_| ConnError::Overload)?;
+                    drop(writer);
                     self.goaway_received = Some(parsed.error);
-                    let debug = parsed.debug.to_vec();
-                    let last = parsed.last_stream_id;
-                    let err = parsed.error;
-                    self.events.push_back(Event::GoAway {
-                        last_stream_id: last,
-                        error: err,
-                        debug,
-                    });
+                    self.push_event(Event::GoAway {
+                        last_stream_id: parsed.last_stream_id,
+                        error: parsed.error,
+                        debug: DataPayload(lease.freeze()),
+                    })?;
                 }
                 frame::Type::WindowUpdate => {
-                    let payload = &self.inbound[payload_start..payload_end];
-                    let parsed = WindowUpdate::parse(header, payload)?;
-                    self.inbound.drain(..total);
+                    let mut payload = [0; 4];
+                    if header.length != payload.len() as u32 {
+                        return Err(ParseError::FrameSize.into());
+                    }
+                    let copied = self.inbound.copy_range_into(HEADER_LEN, &mut payload);
+                    debug_assert!(copied);
+                    let parsed = WindowUpdate::parse(header, &payload)?;
+                    self.consume_inbound(total);
                     self.handle_window_update_frame(parsed)?;
                     continue;
                 }
                 frame::Type::Headers => {
-                    let (sid, es, eh, frag) = {
-                        let parsed =
-                            Headers::parse(header, &self.inbound[payload_start..payload_end])?;
-                        (
-                            parsed.stream_id,
-                            parsed.end_stream,
-                            parsed.end_headers,
-                            parsed.block_fragment.to_vec(),
-                        )
-                    };
-                    self.inbound.drain(..total);
-                    self.handle_headers_frame(sid, es, eh, frag)?;
+                    if header.stream_id.is_zero() {
+                        return Err(ParseError::Protocol.into());
+                    }
+                    self.prepare_outbound(HEADER_LEN + 4)?;
+                    self.recv_header_block.clear();
+                    let (mut start, mut len) = self.unpadded_payload(header)?;
+                    if header.flags.has(Flags::PRIORITY) {
+                        if len < 5 {
+                            return Err(ParseError::FrameSize.into());
+                        }
+                        let mut priority = [0; 5];
+                        let copied = self.inbound.copy_range_into(start, &mut priority);
+                        debug_assert!(copied);
+                        let _ = frame::PriorityFields::parse(&priority)?;
+                        start += priority.len();
+                        len -= priority.len();
+                    }
+                    if len > self.pending_headers_cap {
+                        return Err(ConnError::HeaderListTooLarge);
+                    }
+                    self.extend_recv_header_block(start, len)?;
+                    let sid = header.stream_id;
+                    let end_stream = header.flags.has(Flags::END_STREAM);
+                    let end_headers = header.flags.has(Flags::END_HEADERS);
+                    self.consume_inbound(total);
+                    self.handle_headers_frame(sid, end_stream, end_headers)?;
                     continue;
                 }
                 frame::Type::Data => {
-                    let (sid, es, payload) = {
-                        let parsed =
-                            Data::parse(header, &self.inbound[payload_start..payload_end])?;
-                        (parsed.stream_id, parsed.end_stream, parsed.payload.to_vec())
-                    };
-                    self.inbound.drain(..total);
-                    self.handle_data_frame(sid, es, payload)?;
+                    if header.stream_id.is_zero() {
+                        return Err(ParseError::Protocol.into());
+                    }
+                    self.prepare_outbound(2 * (HEADER_LEN + 4))?;
+                    let (start, len) = self.unpadded_payload(header)?;
+                    let mut lease = self.data_pool.try_acquire().ok_or(ConnError::Overload)?;
+                    let (first, second) = self
+                        .inbound
+                        .range_slices(start, len)
+                        .ok_or(ConnError::FrameSize)?;
+                    let mut writer = lease.spare_writer();
+                    writer
+                        .try_extend_from_slice(first)
+                        .map_err(|_| ConnError::Overload)?;
+                    writer
+                        .try_extend_from_slice(second)
+                        .map_err(|_| ConnError::Overload)?;
+                    drop(writer);
+                    let stream_id = header.stream_id;
+                    let end_stream = header.flags.has(Flags::END_STREAM);
+                    let payload = DataPayload(lease.freeze());
+                    self.consume_inbound(total);
+                    self.handle_data_frame(stream_id, end_stream, payload)?;
                     continue;
                 }
                 frame::Type::Continuation => {
-                    let (sid, eh, frag) = {
-                        let parsed =
-                            Continuation::parse(header, &self.inbound[payload_start..payload_end])?;
-                        (
-                            parsed.stream_id,
-                            parsed.end_headers,
-                            parsed.block_fragment.to_vec(),
-                        )
-                    };
-                    self.inbound.drain(..total);
-                    self.handle_continuation_frame(sid, eh, frag)?;
+                    if header.stream_id.is_zero() {
+                        return Err(ParseError::Protocol.into());
+                    }
+                    self.prepare_outbound(HEADER_LEN + 4)?;
+                    let len = header.length as usize;
+                    if len
+                        > self
+                            .pending_headers_cap
+                            .saturating_sub(self.recv_header_block.len())
+                    {
+                        return Err(ConnError::HeaderListTooLarge);
+                    }
+                    self.extend_recv_header_block(HEADER_LEN, len)?;
+                    let stream_id = header.stream_id;
+                    let end_headers = header.flags.has(Flags::END_HEADERS);
+                    self.consume_inbound(total);
+                    self.handle_continuation_frame(stream_id, end_headers, len)?;
                     continue;
                 }
                 frame::Type::RstStream => {
-                    let parsed =
-                        RstStream::parse(header, &self.inbound[payload_start..payload_end])?;
-                    self.inbound.drain(..total);
+                    let mut payload = [0; 4];
+                    if header.length != payload.len() as u32 {
+                        return Err(ParseError::FrameSize.into());
+                    }
+                    let copied = self.inbound.copy_range_into(HEADER_LEN, &mut payload);
+                    debug_assert!(copied);
+                    let parsed = RstStream::parse(header, &payload)?;
+                    self.consume_inbound(total);
                     self.handle_rst_frame(parsed)?;
                     continue;
                 }
                 frame::Type::PushPromise => {
-                    let (sid, promised, eh, frag) = {
-                        let parsed =
-                            PushPromise::parse(header, &self.inbound[payload_start..payload_end])?;
-                        (
-                            parsed.stream_id,
-                            parsed.promised_stream_id,
-                            parsed.end_headers,
-                            parsed.block_fragment.to_vec(),
-                        )
-                    };
-                    self.inbound.drain(..total);
-                    self.handle_push_promise_frame(sid, promised, eh, frag)?;
+                    if header.stream_id.is_zero() {
+                        return Err(ParseError::Protocol.into());
+                    }
+                    self.prepare_outbound(HEADER_LEN + 4)?;
+                    self.recv_header_block.clear();
+                    let (start, len) = self.unpadded_payload(header)?;
+                    if len < 4 {
+                        return Err(ParseError::FrameSize.into());
+                    }
+                    let mut promised = [0; 4];
+                    let copied = self.inbound.copy_range_into(start, &mut promised);
+                    debug_assert!(copied);
+                    let promised = StreamId::from_u32_masked(u32::from_be_bytes(promised));
+                    let block_start = start + 4;
+                    let block_len = len - 4;
+                    if block_len > self.pending_headers_cap {
+                        return Err(ConnError::HeaderListTooLarge);
+                    }
+                    self.extend_recv_header_block(block_start, block_len)?;
+                    let stream_id = header.stream_id;
+                    let end_headers = header.flags.has(Flags::END_HEADERS);
+                    self.consume_inbound(total);
+                    self.handle_push_promise_frame(stream_id, promised, end_headers)?;
                     continue;
                 }
                 frame::Type::Priority => {
-                    let _ = Priority::parse(header, &self.inbound[payload_start..payload_end])?;
+                    let mut payload = [0; 5];
+                    if header.length != payload.len() as u32 {
+                        return Err(ParseError::FrameSize.into());
+                    }
+                    let copied = self.inbound.copy_range_into(HEADER_LEN, &mut payload);
+                    debug_assert!(copied);
+                    let _ = Priority::parse(header, &payload)?;
                 }
             }
-            self.inbound.drain(..total);
+            self.consume_inbound(total);
         }
+    }
+
+    fn parse_frame_header(&self) -> Result<FrameHeader, ParseError> {
+        let Some((first, second)) = self.inbound.range_slices(0, HEADER_LEN) else {
+            return Err(ParseError::NeedMore);
+        };
+        if second.is_empty() {
+            return FrameHeader::parse(first);
+        }
+        let mut bytes = [0; HEADER_LEN];
+        bytes[..first.len()].copy_from_slice(first);
+        bytes[first.len()..].copy_from_slice(second);
+        FrameHeader::parse(&bytes)
+    }
+
+    fn unpadded_payload(&self, header: FrameHeader) -> Result<(usize, usize), ParseError> {
+        let mut start = HEADER_LEN;
+        let mut len = header.length as usize;
+        if !header.flags.has(Flags::PADDED) {
+            return Ok((start, len));
+        }
+        if len == 0 {
+            return Err(ParseError::Padding);
+        }
+        let mut byte = [0; 1];
+        let copied = self.inbound.copy_range_into(start, &mut byte);
+        debug_assert!(copied);
+        let padding = byte[0] as usize;
+        if padding + 1 > len {
+            return Err(ParseError::Padding);
+        }
+        start += 1;
+        len -= padding + 1;
+        Ok((start, len))
+    }
+
+    fn extend_recv_header_block(&mut self, start: usize, len: usize) -> Result<(), ConnError> {
+        let (first, second) = self
+            .inbound
+            .range_slices(start, len)
+            .ok_or(ConnError::FrameSize)?;
+        self.recv_header_block.extend_from_slice(first);
+        self.recv_header_block.extend_from_slice(second);
+        Ok(())
     }
 
     fn handle_headers_frame(
@@ -907,7 +1437,6 @@ impl<R: Role> Conn<R> {
         stream_id: StreamId,
         end_stream: bool,
         end_headers: bool,
-        block_fragment: Vec<u8>,
     ) -> Result<(), ConnError> {
         if stream_id.is_zero() {
             return Err(ConnError::Protocol);
@@ -916,7 +1445,7 @@ impl<R: Role> Conn<R> {
             StreamClass::Connection => return Err(ConnError::Protocol),
             StreamClass::ClosedEnd => return Err(ConnError::StreamClosed),
             StreamClass::ClosedRst => {
-                self.emit_rst(stream_id, ErrorCode::StreamClosed);
+                self.emit_rst(stream_id, ErrorCode::StreamClosed)?;
                 return Ok(());
             }
             StreamClass::Idle => {
@@ -929,39 +1458,33 @@ impl<R: Role> Conn<R> {
                     return Err(ConnError::Protocol);
                 }
                 if self.goaway_sent {
-                    self.emit_rst(stream_id, ErrorCode::RefusedStream);
+                    self.emit_rst(stream_id, ErrorCode::RefusedStream)?;
                     return Ok(());
                 }
-                if let Some(max) = self.local_settings.max_concurrent_streams
-                    && self.active_count() >= max as usize
-                {
-                    self.emit_rst(stream_id, ErrorCode::RefusedStream);
+                if !self.can_track_peer_stream() {
+                    self.emit_rst(stream_id, ErrorCode::RefusedStream)?;
                     self.last_peer_stream_id = stream_id.0;
                     return Ok(());
                 }
-                self.streams.insert(stream_id, Stream::new(stream_id));
-                self.per_stream_send_window.insert(
-                    stream_id,
-                    flow::Window::with(self.peer_settings.initial_window_size as i32),
-                );
-                self.per_stream_recv_window.insert(
-                    stream_id,
-                    flow::Window::with(self.local_settings.initial_window_size as i32),
-                );
+                if self.track_stream(Stream::new(stream_id)).is_err() {
+                    self.emit_rst(stream_id, ErrorCode::RefusedStream)?;
+                    self.last_peer_stream_id = stream_id.0;
+                    return Ok(());
+                }
                 self.last_peer_stream_id = stream_id.0;
             }
             StreamClass::Active => {}
         }
         let trailing = self.is_trailing(stream_id);
         if end_headers {
-            let (headers, over_limit) = self.decode_block(&block_fragment)?;
+            let (headers, over_limit) = self.decode_recv_block()?;
             let valid = if R::IS_SERVER {
                 Validate::request(&headers, trailing)
             } else {
                 Validate::response(&headers, trailing)
             };
             if valid.is_err() || over_limit {
-                self.rst_evict(stream_id, ErrorCode::ProtocolError);
+                self.rst_evict(stream_id, ErrorCode::ProtocolError)?;
                 return Ok(());
             }
             match self.advance_stream(
@@ -972,30 +1495,26 @@ impl<R: Role> Conn<R> {
                 Ok(()) => {}
                 Err(TransitionError::Protocol) => return Err(ConnError::Protocol),
                 Err(TransitionError::StreamClosed) => {
-                    self.rst_evict(stream_id, ErrorCode::StreamClosed);
+                    self.rst_evict(stream_id, ErrorCode::StreamClosed)?;
                     return Ok(());
                 }
             }
-            if let Some(s) = self.streams.get_mut(&stream_id) {
-                s.peer_headers_received = true;
+            if let Some(record) = self.stream_mut(stream_id) {
+                record.stream.peer_headers_received = true;
             }
-            self.events.push_back(Event::Headers {
+            self.push_event(Event::Headers {
                 stream_id,
                 headers,
                 end_stream,
                 trailing,
-            });
+            })?;
         } else {
-            if block_fragment.len() > self.pending_headers_cap {
-                return Err(ConnError::HeaderListTooLarge);
-            }
             self.pending_headers = Some(PendingHeaders {
                 stream_id,
                 kind: PendingKind::Headers {
                     end_stream,
                     trailing,
                 },
-                buf: block_fragment,
                 continuations: 0,
             });
         }
@@ -1003,9 +1522,8 @@ impl<R: Role> Conn<R> {
     }
 
     fn is_trailing(&self, stream_id: StreamId) -> bool {
-        self.streams
-            .get(&stream_id)
-            .map(|s| s.peer_headers_received)
+        self.stream(stream_id)
+            .map(|record| record.stream.peer_headers_received)
             .unwrap_or(false)
     }
 
@@ -1013,14 +1531,14 @@ impl<R: Role> Conn<R> {
         &mut self,
         stream_id: StreamId,
         end_stream: bool,
-        payload: Vec<u8>,
+        payload: DataPayload,
     ) -> Result<(), ConnError> {
         match self.classify_stream(stream_id) {
             StreamClass::Connection => return Err(ConnError::Protocol),
             StreamClass::Idle => return Err(ConnError::Protocol),
             StreamClass::ClosedEnd => return Err(ConnError::StreamClosed),
             StreamClass::ClosedRst => {
-                self.emit_rst(stream_id, ErrorCode::StreamClosed);
+                self.emit_rst(stream_id, ErrorCode::StreamClosed)?;
                 return Ok(());
             }
             StreamClass::Active => {}
@@ -1030,26 +1548,26 @@ impl<R: Role> Conn<R> {
             .consume(n)
             .map_err(|_| ConnError::FlowControl)?;
         {
-            let sw = self
-                .per_stream_recv_window
-                .get_mut(&stream_id)
-                .ok_or(ConnError::Protocol)?;
-            sw.consume(n).map_err(|_| ConnError::FlowControl)?;
+            self.stream_mut(stream_id)
+                .ok_or(ConnError::Protocol)?
+                .recv_window
+                .consume(n)
+                .map_err(|_| ConnError::FlowControl)?;
         }
         self.replenish_recv(stream_id, n)?;
         match self.advance_stream(stream_id, stream::Event::Data { end_stream }, Side::Remote) {
             Ok(()) => {}
             Err(TransitionError::Protocol) => return Err(ConnError::Protocol),
             Err(TransitionError::StreamClosed) => {
-                self.rst_evict(stream_id, ErrorCode::StreamClosed);
+                self.rst_evict(stream_id, ErrorCode::StreamClosed)?;
                 return Ok(());
             }
         }
-        self.events.push_back(Event::Data {
+        self.push_event(Event::Data {
             stream_id,
             data: payload,
             end_stream,
-        });
+        })?;
         Ok(())
     }
 
@@ -1064,23 +1582,27 @@ impl<R: Role> Conn<R> {
             let inc = self.conn_pending_release;
             self.conn_pending_release = 0;
             self.recv_window.increase(inc).map_err(ConnError::from)?;
-            self.emit_window_update(StreamId::CONNECTION, inc);
+            self.emit_window_update(StreamId::CONNECTION, inc)?;
         }
-        if self.per_stream_recv_window.contains_key(&stream_id) {
-            let stream_threshold = (self.local_settings.initial_window_size / 2).max(1);
-            let pending = self
-                .per_stream_pending_release
-                .entry(stream_id)
-                .or_insert(0);
-            *pending = pending.saturating_add(n32);
-            if *pending >= stream_threshold {
-                let inc = *pending;
-                *pending = 0;
-                if let Some(sw) = self.per_stream_recv_window.get_mut(&stream_id) {
-                    sw.increase(inc).map_err(ConnError::from)?;
-                }
-                self.emit_window_update(stream_id, inc);
+        let stream_threshold = (self.local_settings.initial_window_size / 2).max(1);
+        let stream_increment = if let Some(record) = self.stream_mut(stream_id) {
+            record.pending_release = record.pending_release.saturating_add(n32);
+            if record.pending_release >= stream_threshold {
+                let increment = record.pending_release;
+                record.pending_release = 0;
+                record
+                    .recv_window
+                    .increase(increment)
+                    .map_err(ConnError::from)?;
+                Some(increment)
+            } else {
+                None
             }
+        } else {
+            None
+        };
+        if let Some(increment) = stream_increment {
+            self.emit_window_update(stream_id, increment)?;
         }
         Ok(())
     }
@@ -1098,11 +1620,11 @@ impl<R: Role> Conn<R> {
             StreamClass::Idle => Err(ConnError::Protocol),
             StreamClass::ClosedRst | StreamClass::ClosedEnd => Ok(()),
             StreamClass::Active => {
-                let w = self
-                    .per_stream_send_window
-                    .get_mut(&parsed.stream_id)
-                    .ok_or(ConnError::Protocol)?;
-                w.increase(parsed.increment).map_err(ConnError::from)?;
+                self.stream_mut(parsed.stream_id)
+                    .ok_or(ConnError::Protocol)?
+                    .send_window
+                    .increase(parsed.increment)
+                    .map_err(ConnError::from)?;
                 self.send_window_opened = true;
                 Ok(())
             }
@@ -1113,9 +1635,8 @@ impl<R: Role> Conn<R> {
         &mut self,
         stream_id: StreamId,
         end_headers: bool,
-        block_fragment: Vec<u8>,
+        fragment_len: usize,
     ) -> Result<(), ConnError> {
-        let cap = self.pending_headers_cap;
         let pending = self
             .pending_headers
             .as_mut()
@@ -1123,20 +1644,16 @@ impl<R: Role> Conn<R> {
         if pending.stream_id != stream_id {
             return Err(ConnError::Continuation);
         }
-        if block_fragment.is_empty() && !end_headers {
+        if fragment_len == 0 && !end_headers {
             return Err(ConnError::Continuation);
         }
         pending.continuations = pending.continuations.saturating_add(1);
         if pending.continuations > MAX_CONTINUATION_FRAMES {
             return Err(ConnError::Overload);
         }
-        if block_fragment.len() > cap.saturating_sub(pending.buf.len()) {
-            return Err(ConnError::HeaderListTooLarge);
-        }
-        pending.buf.extend_from_slice(&block_fragment);
         if end_headers {
             let pending = self.pending_headers.take().unwrap();
-            let (headers, over_limit) = self.decode_block(&pending.buf)?;
+            let (headers, over_limit) = self.decode_recv_block()?;
             match pending.kind {
                 PendingKind::Headers {
                     end_stream,
@@ -1148,7 +1665,7 @@ impl<R: Role> Conn<R> {
                         Validate::response(&headers, trailing)
                     };
                     if valid.is_err() || over_limit {
-                        self.rst_evict(pending.stream_id, ErrorCode::ProtocolError);
+                        self.rst_evict(pending.stream_id, ErrorCode::ProtocolError)?;
                         return Ok(());
                     }
                     match self.advance_stream(
@@ -1161,31 +1678,34 @@ impl<R: Role> Conn<R> {
                             return Err(ConnError::Protocol);
                         }
                         Err(TransitionError::StreamClosed) => {
-                            self.rst_evict(pending.stream_id, ErrorCode::StreamClosed);
+                            self.rst_evict(pending.stream_id, ErrorCode::StreamClosed)?;
                             return Ok(());
                         }
                     }
-                    if let Some(s) = self.streams.get_mut(&pending.stream_id) {
-                        s.peer_headers_received = true;
+                    if let Some(record) = self.stream_mut(pending.stream_id) {
+                        record.stream.peer_headers_received = true;
                     }
-                    self.events.push_back(Event::Headers {
+                    self.push_event(Event::Headers {
                         stream_id: pending.stream_id,
                         headers,
                         end_stream,
                         trailing,
-                    });
+                    })?;
                 }
                 PendingKind::PushPromise { promised } => {
                     let valid = Validate::request(&headers, false);
                     if valid.is_err() || over_limit {
-                        self.rst_evict(promised, ErrorCode::ProtocolError);
+                        self.rst_evict(promised, ErrorCode::ProtocolError)?;
                         return Ok(());
                     }
-                    self.events.push_back(Event::PushPromise {
+                    if !self.reserve_promised_stream(promised)? {
+                        return Ok(());
+                    }
+                    self.push_event(Event::PushPromise {
                         stream_id: pending.stream_id,
                         promised_stream_id: promised,
                         headers,
-                    });
+                    })?;
                 }
             }
         }
@@ -1199,16 +1719,17 @@ impl<R: Role> Conn<R> {
             StreamClass::ClosedRst | StreamClass::ClosedEnd => return Ok(()),
             StreamClass::Active => {}
         }
-        self.advance_stream(r.stream_id, stream::Event::RstStream, Side::Remote)
-            .map_err(|_| ConnError::Protocol)?;
-        self.events.push_back(Event::StreamReset {
-            stream_id: r.stream_id,
-            error: r.error,
-        });
-        self.peer_reset_count = self.peer_reset_count.saturating_add(1);
-        if self.peer_reset_count > MAX_RESET_STREAMS {
+        let peer_reset_count = self.peer_reset_count.saturating_add(1);
+        if peer_reset_count > MAX_RESET_STREAMS {
             return Err(ConnError::Overload);
         }
+        self.advance_stream(r.stream_id, stream::Event::RstStream, Side::Remote)
+            .map_err(|_| ConnError::Protocol)?;
+        self.push_event(Event::StreamReset {
+            stream_id: r.stream_id,
+            error: r.error,
+        })?;
+        self.peer_reset_count = peer_reset_count;
         Ok(())
     }
 
@@ -1217,40 +1738,28 @@ impl<R: Role> Conn<R> {
         stream_id: StreamId,
         promised: StreamId,
         end_headers: bool,
-        block_fragment: Vec<u8>,
     ) -> Result<(), ConnError> {
         if R::IS_SERVER {
             return Err(ConnError::Protocol);
         }
         if end_headers {
-            let (headers, over_limit) = self.decode_block(&block_fragment)?;
+            let (headers, over_limit) = self.decode_recv_block()?;
             if Validate::request(&headers, false).is_err() || over_limit {
-                self.emit_rst(promised, ErrorCode::ProtocolError);
+                self.emit_rst(promised, ErrorCode::ProtocolError)?;
                 return Ok(());
             }
-            self.streams
-                .insert(promised, Stream::reserve_remote(promised));
-            self.per_stream_send_window.insert(
-                promised,
-                flow::Window::with(self.peer_settings.initial_window_size as i32),
-            );
-            self.per_stream_recv_window.insert(
-                promised,
-                flow::Window::with(self.local_settings.initial_window_size as i32),
-            );
-            self.events.push_back(Event::PushPromise {
+            if !self.reserve_promised_stream(promised)? {
+                return Ok(());
+            }
+            self.push_event(Event::PushPromise {
                 stream_id,
                 promised_stream_id: promised,
                 headers,
-            });
+            })?;
         } else {
-            if block_fragment.len() > self.pending_headers_cap {
-                return Err(ConnError::HeaderListTooLarge);
-            }
             self.pending_headers = Some(PendingHeaders {
                 stream_id,
                 kind: PendingKind::PushPromise { promised },
-                buf: block_fragment,
                 continuations: 0,
             });
         }
@@ -1267,16 +1776,12 @@ impl Conn<crate::role::ClientRole> {
         if self.goaway_received.is_some() || self.goaway_sent {
             return Err(ConnError::StreamGoneAway);
         }
+        if !self.can_track_local_stream() {
+            return Err(ConnError::StreamLimit);
+        }
         let id = self.next_local_id.next_id().ok_or(ConnError::StreamLimit)?;
-        self.streams.insert(id, Stream::new(id));
-        self.per_stream_send_window.insert(
-            id,
-            flow::Window::with(self.peer_settings.initial_window_size as i32),
-        );
-        self.per_stream_recv_window.insert(
-            id,
-            flow::Window::with(self.local_settings.initial_window_size as i32),
-        );
+        self.track_stream(Stream::new(id))
+            .map_err(|_| ConnError::StreamLimit)?;
         self.emit_headers(id, headers.iter().copied(), end_stream)?;
         self.advance_stream(id, stream::Event::Headers { end_stream }, Side::Local)
             .map_err(|_| ConnError::Protocol)?;

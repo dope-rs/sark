@@ -1,36 +1,28 @@
 use std::env;
-use std::future::ready;
 use std::net::SocketAddr;
 
-use dope::fiber::Fiber;
-use dope::launcher::Launcher;
-use o3::buffer::Shared;
-use sark_h2::hpack::OwnedHeader;
-use sark_h2::server::{Cfg, Handler, Request, Response, serve};
+use dope::runtime::{Launcher, WorkerContext, WorkerEntry};
+use sark_h2::server::{Body, Config, Response, serve_sync};
 
-struct Echo;
+struct Worker;
 
-impl Handler for Echo {
-    type Fut<'h> = std::future::Ready<Response>;
+impl WorkerEntry for Worker {
+    type Input = Config;
 
-    fn on_request<'h>(&'h self, req: Request) -> Fiber<'h, Self::Fut<'h>> {
-        let path = req
-            .headers
-            .iter()
-            .find(|h| h.name == b":path")
-            .map(|h| h.value.clone())
-            .unwrap_or_default();
-        let body: Shared = if path == b"/large" {
-            Shared::from(vec![b'x'; 1 << 20])
-        } else {
-            Shared::from(b"hello from sark-h2\n".to_vec())
-        };
-        let headers = vec![
-            OwnedHeader::new(b":status", b"200"),
-            OwnedHeader::new(b"content-type", b"text/plain"),
-            OwnedHeader::new(b"content-length", body.len().to_string().as_bytes()),
-        ];
-        Fiber::new(ready(Response::new(headers, body)))
+    fn run(config: Self::Input, context: WorkerContext) -> std::io::Result<()> {
+        let large = Body::repeat(b'x', 1 << 20);
+        serve_sync(
+            move |request| {
+                if request.path().is_some_and(|path| path == b"/large") {
+                    Response::text(large.clone())
+                } else {
+                    Response::text(b"hello from sark-h2\n")
+                }
+            },
+            config,
+            context,
+            None,
+        )
     }
 }
 
@@ -40,11 +32,21 @@ fn main() -> std::io::Result<()> {
         .and_then(|s| s.parse().ok())
         .unwrap_or(18080);
     let bind: SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
-    let cfg = Cfg {
-        bind,
-        max_conn: 1024,
-        backlog: 256,
+    let config = Config {
+        bind_addr: bind,
+        max_connections: 1024,
+        max_connections_per_ip: 512,
+        listen_backlog: 256,
+        max_handler_tasks: 0,
+        max_request_body_bytes: 16 << 20,
+        max_connection_body_bytes: 64 << 20,
+        max_outbound_bytes: 64 << 10,
+        socket_receive_buffer_bytes: None,
+        socket_send_buffer_bytes: None,
+        tcp_fast_open_backlog: None,
+        receive_buffer_bytes: 64 << 10,
+        receive_buffer_count: 1024,
     };
     eprintln!("echo_server: listening on {bind}");
-    Launcher::new(vec![0u16]).run(move |ctx| serve(Echo, cfg.clone(), ctx, None))
+    Launcher::unbound(1)?.run::<Worker>(vec![config])
 }

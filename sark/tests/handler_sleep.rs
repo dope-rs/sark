@@ -1,13 +1,14 @@
 #![cfg(target_os = "linux")]
 
+mod support;
+
 use std::io::{Read, Write};
 use std::net::TcpStream;
 use std::time::{Duration, Instant};
 
-use dope_extra::testing::run_with_trigger;
+use dope_extra::harness::Harness;
 use http::StatusCode;
-use o3::buffer::Owned;
-use sark::{Build, ServerCfg};
+use sark::{Executor, Throughput, driver};
 
 #[sark_gen::request]
 struct EmptyReq {}
@@ -15,13 +16,13 @@ struct EmptyReq {}
 #[sark_gen::response(raw)]
 struct Reply {
     status: StatusCode,
-    body: Owned,
+    body: Vec<u8>,
 }
 
 #[sark_gen::handler]
 async fn sleep_handler(_req: EmptyReq, _state: &(), timer: sark::Timer) -> Reply {
     timer.sleep(Duration::from_millis(100)).await;
-    let mut body = Owned::new();
+    let mut body = Vec::new();
     body.extend_from_slice(b"slept 100ms");
     Reply {
         status: StatusCode::OK,
@@ -31,39 +32,52 @@ async fn sleep_handler(_req: EmptyReq, _state: &(), timer: sark::Timer) -> Reply
 
 sark_gen::define_route! {
     SleepDispatch: () => {
-        GET "/sleep" => async sleep_handler,
+        GET "/sleep" => async(capacity = 32) sleep_handler,
     }
 }
 
 #[test]
 fn handler_awaits_timer() {
     let bind: std::net::SocketAddr = "127.0.0.1:18890".parse().unwrap();
-    let cfg = ServerCfg {
-        bind,
-        max_conn: 16,
-        backlog: 16,
-        head_timeout: std::time::Duration::from_secs(10),
-    };
+    let server = support::http_server(bind, Duration::from_secs(10));
 
-    run_with_trigger(
-        bind,
-        |ctx, trigger| Build::http(sleep_dispatch::new(&()), cfg.clone(), ctx, Some(trigger)),
-        |bind| {
-            let mut sock = TcpStream::connect(bind).expect("connect");
-            let start = Instant::now();
-            sock.write_all(b"GET /sleep HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n")
-                .unwrap();
-            let mut resp = String::new();
-            sock.read_to_string(&mut resp).unwrap();
-            let elapsed = start.elapsed();
+    Harness::new(bind)
+        .run_with_trigger(
+            |_ctx, trigger| {
+                let driver_config =
+                    driver::Config::for_tcp_profile::<Throughput>(support::MAX_CONNECTIONS);
+                let executor = Executor::new(driver_config)?;
+                executor.enter(|mut session| {
+                    server.clone().serve(
+                        &mut session,
+                        SleepDispatch::new(
+                            (),
+                            sark::app::Config {
+                                timer_capacity: support::MAX_CONNECTIONS.saturating_mul(2),
+                                task_capacity: support::MAX_CONNECTIONS,
+                            },
+                        ),
+                        Some(trigger),
+                    )
+                })
+            },
+            |bind| {
+                let mut sock = TcpStream::connect(bind).expect("connect");
+                let start = Instant::now();
+                sock.write_all(b"GET /sleep HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n")
+                    .unwrap();
+                let mut resp = String::new();
+                sock.read_to_string(&mut resp).unwrap();
+                let elapsed = start.elapsed();
 
-            assert!(
-                elapsed >= Duration::from_millis(90),
-                "elapsed: {:?}",
-                elapsed
-            );
-            assert!(resp.contains("200 OK"), "resp: {}", resp);
-            assert!(resp.contains("slept 100ms"), "resp: {}", resp);
-        },
-    );
+                assert!(
+                    elapsed >= Duration::from_millis(90),
+                    "elapsed: {:?}",
+                    elapsed
+                );
+                assert!(resp.contains("200 OK"), "resp: {}", resp);
+                assert!(resp.contains("slept 100ms"), "resp: {}", resp);
+            },
+        )
+        .expect("harness");
 }

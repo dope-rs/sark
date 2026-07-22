@@ -5,6 +5,7 @@ mod string;
 
 use dynamic_table::DynamicTable;
 use integer::Integer;
+use o3::buffer::{Pooled, SharedPool};
 use static_table::StaticTable;
 use string::Codec;
 
@@ -12,6 +13,12 @@ use string::Codec;
 pub struct Header<'a> {
     pub name: &'a [u8],
     pub value: &'a [u8],
+}
+
+impl<'a> Header<'a> {
+    pub const fn new(name: &'a [u8], value: &'a [u8]) -> Self {
+        Self { name, value }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -40,6 +47,127 @@ impl OwnedHeader {
             name: &self.name,
             value: &self.value,
         }
+    }
+}
+
+#[derive(Clone)]
+pub struct HeaderBlock {
+    first: Pooled,
+    second: Option<Pooled>,
+}
+
+impl HeaderBlock {
+    pub(crate) fn from_pooled(pooled: Pooled) -> Self {
+        Self {
+            first: pooled,
+            second: None,
+        }
+    }
+
+    pub fn iter(&self) -> HeaderBlockIter<'_> {
+        HeaderBlockIter {
+            current: self.first.as_slice(),
+            second: self.second.as_ref().map(Pooled::as_slice),
+        }
+    }
+
+    pub fn from_headers(headers: &[Header<'_>]) -> Self {
+        let capacity = headers.iter().fold(0usize, |size, header| {
+            size.checked_add(8 + header.name.len() + header.value.len())
+                .expect("header block size overflow")
+        });
+        let pool = SharedPool::new(1, capacity.max(1));
+        let mut lease = pool.try_acquire().unwrap();
+        for header in headers {
+            let name_len = u32::try_from(header.name.len())
+                .expect("header name length overflow")
+                .to_ne_bytes();
+            let value_len = u32::try_from(header.value.len())
+                .expect("header value length overflow")
+                .to_ne_bytes();
+            let mut writer = lease.spare_writer();
+            writer.try_extend_from_slice(&name_len).unwrap();
+            writer.try_extend_from_slice(&value_len).unwrap();
+            writer.try_extend_from_slice(header.name).unwrap();
+            writer.try_extend_from_slice(header.value).unwrap();
+        }
+        Self::from_pooled(lease.freeze())
+    }
+
+    pub fn append(&mut self, other: Self) -> Result<(), Self> {
+        if self.second.is_some() || other.second.is_some() {
+            return Err(other);
+        }
+        self.second = Some(other.first);
+        Ok(())
+    }
+
+    pub fn to_owned(&self) -> Vec<OwnedHeader> {
+        self.iter()
+            .map(|header| OwnedHeader::new(header.name, header.value))
+            .collect()
+    }
+}
+
+impl std::fmt::Debug for HeaderBlock {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_list().entries(self.iter()).finish()
+    }
+}
+
+impl PartialEq for HeaderBlock {
+    fn eq(&self, other: &Self) -> bool {
+        self.iter().eq(other.iter())
+    }
+}
+
+impl Eq for HeaderBlock {}
+
+impl<'a> IntoIterator for &'a HeaderBlock {
+    type Item = Header<'a>;
+    type IntoIter = HeaderBlockIter<'a>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.iter()
+    }
+}
+
+pub struct HeaderBlockIter<'a> {
+    current: &'a [u8],
+    second: Option<&'a [u8]>,
+}
+
+impl<'a> Iterator for HeaderBlockIter<'a> {
+    type Item = Header<'a>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.current.is_empty() {
+            self.current = self.second.take()?;
+        }
+        if self.current.len() < 8 {
+            self.current = &[];
+            self.second = None;
+            return None;
+        }
+        let name_len = u32::from_ne_bytes(self.current[..4].try_into().unwrap()) as usize;
+        let value_len = u32::from_ne_bytes(self.current[4..8].try_into().unwrap()) as usize;
+        let Some(end) = 8usize
+            .checked_add(name_len)
+            .and_then(|end| end.checked_add(value_len))
+        else {
+            self.current = &[];
+            self.second = None;
+            return None;
+        };
+        if end > self.current.len() {
+            self.current = &[];
+            self.second = None;
+            return None;
+        }
+        let name = &self.current[8..8 + name_len];
+        let value = &self.current[8 + name_len..end];
+        self.current = &self.current[end..];
+        Some(Header { name, value })
     }
 }
 
@@ -120,7 +248,7 @@ impl Encoder {
             }
         }
         Codec::encode(h.value, self.use_huffman, out);
-        self.dyn_table.insert(h.name.to_vec(), h.value.to_vec());
+        self.dyn_table.insert(h.name, h.value);
     }
 }
 
@@ -259,14 +387,13 @@ impl Decoder {
             consumed += Codec::decode_into(rest, &mut self.name_scratch)?;
         } else {
             let (sn, _) = Self::lookup(&self.dyn_table, name_idx)?;
-            let owned: Vec<u8> = sn.to_vec();
             self.name_scratch.clear();
-            self.name_scratch.extend_from_slice(&owned);
+            self.name_scratch.extend_from_slice(sn);
         }
         consumed += Codec::decode_into(&rest[consumed..], &mut self.value_scratch)?;
         if index_it {
             self.dyn_table
-                .insert(self.name_scratch.clone(), self.value_scratch.clone());
+                .insert(&self.name_scratch, &self.value_scratch);
         }
         emit(&self.name_scratch, &self.value_scratch);
         Ok(consumed)

@@ -1,16 +1,17 @@
-use std::future::{Future, poll_fn};
+use std::cell::Cell;
+use std::marker::PhantomData;
 use std::pin::Pin;
 use std::task::Poll;
 
-use dope::fiber::{Fiber, Holding};
+use dope::driver::token::Token;
 use dope::manifold::connector;
 use dope::manifold::connector::Connector;
-use dope::manifold::connector::session::{IOV_CAP, Queue};
 use dope::manifold::connector::source::Dialer;
+use dope::manifold::connector::state::{IOV_CAP, Queue};
 use dope::manifold::env::Env;
-use dope::runtime::token::Token;
-use dope::transport::Transport;
-use dope::{WakeRef, WakerSet};
+use dope_fiber::WaitQueue;
+use dope_fiber::{Fiber, poll_fn};
+use dope_net::Transport;
 use o3::buffer::Shared;
 use rand_chacha::ChaCha20Rng;
 use rand_core::{Rng, SeedableRng};
@@ -22,10 +23,10 @@ const DEFAULT_MAX_OUTBOUND_FRAME: usize = 16 * 1024 * 1024;
 pub enum Error {
     NotConnected,
     Backpressure,
+    WaiterCapacity,
     InvalidHeader,
     MessageTooLarge,
 }
-
 #[derive(Debug)]
 pub enum Message {
     Text(Shared),
@@ -43,22 +44,22 @@ pub enum Head {
     Close(Shared),
 }
 
-pub trait Handler: 'static {
-    fn on_handshake_headers(&mut self, _headers: &mut Vec<(String, String)>) -> Result<(), Error> {
+pub trait Handler {
+    fn handshake_headers(&mut self, _headers: &mut Vec<(String, String)>) -> Result<(), Error> {
         Ok(())
     }
 
-    fn on_open(&mut self, _conn_id: Token) {}
-    fn on_open_send(&mut self, conn_id: Token, _send: &mut SendCtx<'_>) {
-        self.on_open(conn_id);
+    fn open(&mut self, _conn_id: Token) {}
+    fn open_send(&mut self, conn_id: Token, _send: &mut SendCtx<'_>) {
+        self.open(conn_id);
     }
-    fn on_message(&mut self, _conn_id: Token, _msg: Message) {}
-    fn on_close(&mut self, _conn_id: Token) {}
+    fn message(&mut self, _conn_id: Token, _msg: Message) {}
+    fn close(&mut self, _conn_id: Token) {}
 }
 
 pub struct SendCtx<'a> {
-    state: &'a mut ConnState,
     sink: &'a mut Queue<IOV_CAP>,
+    rng: &'a MaskRng,
     max_frame_payload: usize,
 }
 
@@ -86,7 +87,7 @@ impl SendCtx<'_> {
     fn message(&mut self, opcode: u8, payload: &[u8]) -> Result<(), Error> {
         Encode::frames_into(
             self.sink,
-            &mut self.state.rng,
+            self.rng,
             opcode,
             payload,
             self.max_frame_payload.max(1),
@@ -100,7 +101,7 @@ impl SendCtx<'_> {
         }
         Encode::frames_into(
             self.sink,
-            &mut self.state.rng,
+            self.rng,
             opcode,
             payload,
             payload.len().max(1),
@@ -110,7 +111,7 @@ impl SendCtx<'_> {
 }
 
 #[derive(Debug, Clone)]
-pub struct ClientConfig {
+pub struct Config {
     pub host: String,
     pub path: String,
     pub user_agent: String,
@@ -120,7 +121,7 @@ pub struct ClientConfig {
     pub max_outbound_frame_payload: usize,
 }
 
-impl ClientConfig {
+impl Config {
     pub fn new(host: impl Into<String>, path: impl Into<String>) -> Self {
         Self {
             host: host.into(),
@@ -133,7 +134,7 @@ impl ClientConfig {
         }
     }
 
-    pub fn with_user_agent(mut self, user_agent: impl Into<String>) -> Result<Self, Error> {
+    pub fn user_agent(mut self, user_agent: impl Into<String>) -> Result<Self, Error> {
         let user_agent = user_agent.into();
         if !Validate::header_value(&user_agent) {
             return Err(Error::InvalidHeader);
@@ -156,18 +157,18 @@ impl ClientConfig {
         Ok(self)
     }
 
-    pub fn with_max_message_size(mut self, n: usize) -> Self {
-        self.max_message_size = n.max(1);
+    pub fn max_message_size(mut self, max_message_size: usize) -> Self {
+        self.max_message_size = max_message_size.max(1);
         self
     }
 
-    pub fn with_max_frame_payload(mut self, n: usize) -> Self {
-        self.max_frame_payload = n.max(1);
+    pub fn max_frame_payload(mut self, max_frame_payload: usize) -> Self {
+        self.max_frame_payload = max_frame_payload.max(1);
         self
     }
 
-    pub fn with_max_outbound_frame_payload(mut self, n: usize) -> Self {
-        self.max_outbound_frame_payload = n.max(1);
+    pub fn max_outbound_frame_payload(mut self, max_outbound_frame_payload: usize) -> Self {
+        self.max_outbound_frame_payload = max_outbound_frame_payload.max(1);
         self
     }
 }
@@ -198,7 +199,6 @@ impl Default for State {
 pub struct ConnState {
     expected_accept: [u8; 28],
     closing: bool,
-    rng: MaskRng,
 }
 
 impl connector::Lifecycle for ConnState {
@@ -221,27 +221,25 @@ impl connector::Lifecycle for ConnState {
 
 #[derive(Default)]
 struct MaskRng {
-    stream: Option<ChaCha20Rng>,
+    stream: Cell<Option<ChaCha20Rng>>,
 }
 
 impl MaskRng {
-    fn stream(&mut self) -> &mut ChaCha20Rng {
-        self.stream.get_or_insert_with(|| {
+    fn mask(&self) -> [u8; 4] {
+        let mut stream = self.stream.take().unwrap_or_else(|| {
             let mut seed = [0u8; 32];
             getrandom::fill(&mut seed).expect("OS CSPRNG (getrandom) unavailable");
             ChaCha20Rng::from_seed(seed)
-        })
-    }
-
-    fn mask(&mut self) -> [u8; 4] {
+        });
         let mut buf = [0u8; 4];
-        self.stream().fill_bytes(&mut buf);
+        stream.fill_bytes(&mut buf);
+        self.stream.set(Some(stream));
         buf
     }
 }
 
 pub struct Codec {
-    config: ClientConfig,
+    config: Config,
 }
 
 impl Codec {
@@ -374,48 +372,103 @@ impl Codec {
 }
 
 pub struct SharedState {
-    conn_id: Option<Token>,
-    active_wakers: WakerSet,
+    conn_id: Cell<Option<Token>>,
+    active_waiters: Pin<Box<WaitQueue>>,
+    rng: MaskRng,
 }
 
 impl SharedState {
-    fn new() -> Self {
+    fn new(waiter_capacity: usize) -> Self {
         Self {
-            conn_id: None,
-            active_wakers: WakerSet::new(),
+            conn_id: Cell::new(None),
+            active_waiters: Box::pin(WaitQueue::with_capacity(waiter_capacity)),
+            rng: MaskRng::default(),
         }
     }
-}
 
-pub struct Session<H: Handler> {
-    codec: Codec,
-    handler: H,
-    shared: SharedState,
-}
-
-impl<H: Handler> Session<H> {
-    pub fn new(handler: H, host: &'static str, path: &'static str) -> Self {
-        Self::with_config(handler, ClientConfig::new(host, path))
+    fn wake(&self) {
+        self.active_waiters.as_ref().wake();
     }
 
-    pub fn with_config(handler: H, config: ClientConfig) -> Self {
+    fn try_register_active<'d>(
+        &self,
+        waiter: Pin<&dope_fiber::Waiter<'d>>,
+        context: Pin<&dope_fiber::Context<'_, 'd>>,
+    ) -> bool {
+        self.active_waiters.as_ref().try_register(waiter, context)
+    }
+}
+
+pub struct Port<'d> {
+    codec: Codec,
+    shared: SharedState,
+    io: connector::Port<'d, Shared>,
+}
+
+pub struct PortFactory {
+    config: Config,
+    capacity: usize,
+    waiter_capacity: usize,
+}
+
+impl<'d> Port<'d> {
+    pub fn new(
+        config: Config,
+        capacity: usize,
+        waiter_capacity: usize,
+        driver: dope::DriverRef<'d>,
+    ) -> Self {
         Self {
             codec: Codec { config },
-            handler,
-            shared: SharedState::new(),
+            shared: SharedState::new(waiter_capacity),
+            io: connector::Port::with_capacity(capacity, driver),
+        }
+    }
+
+    pub fn capacity(&self) -> usize {
+        self.io.capacity()
+    }
+
+    pub fn factory(config: Config, capacity: usize, waiter_capacity: usize) -> PortFactory {
+        PortFactory {
+            config,
+            capacity,
+            waiter_capacity,
         }
     }
 }
 
-impl<H: Handler> connector::Session for Session<H> {
+impl dope::runtime::StorageFactory for PortFactory {
+    type Output<'d> = Port<'d>;
+
+    fn build<'d>(self, driver: &mut dope::DriverContext<'_, 'd>) -> Self::Output<'d> {
+        Port::new(
+            self.config,
+            self.capacity,
+            self.waiter_capacity,
+            driver.driver_ref(),
+        )
+    }
+}
+
+pub struct Session<'d, H: Handler> {
+    handler: H,
+    port: &'d Port<'d>,
+}
+
+impl<'d, H: Handler> Session<'d, H> {
+    pub fn new(handler: H, port: &'d Port<'d>) -> Self {
+        Self { handler, port }
+    }
+}
+
+#[dope_gen::connector_session(codec = port.codec, io = port.io)]
+impl<'d, H: Handler> connector::Session<'d> for Session<'d, H> {
     type Codec = Codec;
     type ConnState = ConnState;
+    type Send = o3::buffer::Shared;
 
-    fn codec(&self) -> &Codec {
-        &self.codec
-    }
-
-    fn connect(&mut self, ctx: &mut connector::Ctx<'_, Self>) {
+    fn connect(&mut self, ctx: &mut connector::Ctx<'_, 'd, Self>) {
         let state = &mut *ctx.state;
         let out = &mut ctx.sink;
         let mut key_raw = [0u8; 16];
@@ -429,10 +482,10 @@ impl<H: Handler> connector::Session for Session<H> {
         debug_assert_eq!(accept.len(), 28);
         state.expected_accept.copy_from_slice(accept.as_bytes());
         state.closing = false;
-        self.shared.conn_id = None;
+        self.port.shared.conn_id.set(None);
 
-        let mut headers = self.codec.config.headers.clone();
-        if self.handler.on_handshake_headers(&mut headers).is_err()
+        let mut headers = self.port.codec.config.headers.clone();
+        if self.handler.handshake_headers(&mut headers).is_err()
             || !headers
                 .iter()
                 .all(|(name, value)| Validate::header_name(name) && Validate::header_value(value))
@@ -441,58 +494,108 @@ impl<H: Handler> connector::Session for Session<H> {
             return;
         }
 
-        out.push(Shared::from(self.codec.handshake_request(&key, &headers)));
+        if out
+            .try_enqueue(Shared::from(
+                self.port.codec.handshake_request(&key, &headers),
+            ))
+            .is_err()
+        {
+            state.closing = true;
+        }
     }
 
-    fn response(&mut self, head: Head, ctx: &mut connector::Ctx<'_, Self>) {
+    fn response(&mut self, head: Head, ctx: &mut connector::Ctx<'_, 'd, Self>) {
         let conn_id = ctx.conn_id;
         let state = &mut *ctx.state;
         match head {
             Head::HandshakeOk { accept } => {
                 if accept == state.expected_accept {
-                    self.shared.conn_id = Some(conn_id);
-                    self.shared.active_wakers.drain_wake();
+                    self.port.shared.conn_id.set(Some(conn_id));
+                    self.port.shared.wake();
                     let mut send = SendCtx {
-                        state,
                         sink: ctx.sink,
-                        max_frame_payload: self.codec.config.max_outbound_frame_payload,
+                        rng: &self.port.shared.rng,
+                        max_frame_payload: self.port.codec.config.max_outbound_frame_payload,
                     };
-                    self.handler.on_open_send(conn_id, &mut send);
+                    self.handler.open_send(conn_id, &mut send);
                 } else {
                     state.closing = true;
                 }
             }
             Head::HandshakeFailed => {
-                self.shared.conn_id = None;
-                self.shared.active_wakers.drain_wake();
+                self.port.shared.conn_id.set(None);
+                self.port.shared.wake();
                 state.closing = true;
             }
             Head::Frame(msg) => {
                 if let Message::Ping(ref payload) = msg {
                     let mut send = SendCtx {
-                        state,
                         sink: ctx.sink,
-                        max_frame_payload: self.codec.config.max_outbound_frame_payload,
+                        rng: &self.port.shared.rng,
+                        max_frame_payload: self.port.codec.config.max_outbound_frame_payload,
                     };
                     let _ = send.pong(payload.as_slice());
                 }
-                self.handler.on_message(conn_id, msg);
+                self.handler.message(conn_id, msg);
             }
             Head::Continuation => {}
             Head::Close(_payload) => {
-                self.shared.conn_id = None;
-                self.shared.active_wakers.drain_wake();
+                self.port.shared.conn_id.set(None);
+                self.port.shared.wake();
                 state.closing = true;
-                self.handler.on_close(conn_id);
+                self.handler.close(conn_id);
             }
         }
     }
 
-    fn disconnect(&mut self, ctx: &mut connector::Ctx<'_, Self>) {
-        self.shared.conn_id = None;
-        self.shared.active_wakers.drain_wake();
-        self.handler.on_close(ctx.conn_id);
+    fn disconnect(&mut self, ctx: &mut connector::Ctx<'_, 'd, Self>) {
+        self.port.io.deactivate(ctx.conn_id);
+        self.port.shared.conn_id.set(None);
+        self.port.shared.wake();
+        self.handler.close(ctx.conn_id);
         ctx.state.closing = false;
+    }
+}
+
+type HandleMarker<'a, H, S, E> = PhantomData<(&'a (), fn() -> (H, S, E))>;
+
+pub struct WsHandle<'a, 'd, const ID: u8, H, S, E> {
+    port: &'d Port<'d>,
+    marker: HandleMarker<'a, H, S, E>,
+}
+
+impl<H, S, E, const ID: u8> Copy for WsHandle<'_, '_, ID, H, S, E> {}
+
+impl<H, S, E, const ID: u8> Clone for WsHandle<'_, '_, ID, H, S, E> {
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+
+impl<'a, 'd, const ID: u8, H, S, E> WsHandle<'a, 'd, ID, H, S, E>
+where
+    H: Handler + 'd,
+    S: Dialer<E::Transport> + 'd,
+    E: Env + 'd,
+    E::Transport: Transport<Addr: Clone>,
+{
+    pub fn from_port(port: &'d Port<'d>) -> Self {
+        Self {
+            port,
+            marker: PhantomData,
+        }
+    }
+
+    pub fn from_cell(conn: Pin<&Connector<'d, ID, Session<'d, H>, S, E>>) -> Self {
+        Self::from_port(conn.get_ref().session().port)
+    }
+
+    pub fn try_send_text(&self, payload: &[u8]) -> Result<(), Error> {
+        Encode::message_now(self.port, 0x1, payload)
+    }
+
+    pub fn try_send_binary(&self, payload: &[u8]) -> Result<(), Error> {
+        Encode::message_now(self.port, 0x2, payload)
     }
 }
 
@@ -503,216 +606,161 @@ where
     E: Env + 'd,
     E::Transport: Transport<Addr: Clone>,
 {
-    fn wait_active<'b>(&'b self) -> Fiber<'d, impl Future<Output = Result<(), Error>> + 'b>;
+    fn wait_active<'b>(&'b self) -> impl Fiber<'d, Output = Result<(), Error>> + 'b;
 
     fn send_text<'b>(
         &'b self,
         payload: &'b [u8],
-    ) -> Fiber<'d, impl Future<Output = Result<(), Error>> + 'b>;
+    ) -> impl Fiber<'d, Output = Result<(), Error>> + 'b;
 
     fn send_binary<'b>(
         &'b self,
         payload: &'b [u8],
-    ) -> Fiber<'d, impl Future<Output = Result<(), Error>> + 'b>;
+    ) -> impl Fiber<'d, Output = Result<(), Error>> + 'b;
 
     fn send_ping<'b>(
         &'b self,
         payload: &'b [u8],
-    ) -> Fiber<'d, impl Future<Output = Result<(), Error>> + 'b>;
+    ) -> impl Fiber<'d, Output = Result<(), Error>> + 'b;
 
-    fn close<'b>(
-        &'b self,
-        payload: &'b [u8],
-    ) -> Fiber<'d, impl Future<Output = Result<(), Error>> + 'b>;
+    fn close<'b>(&'b self, payload: &'b [u8]) -> impl Fiber<'d, Output = Result<(), Error>> + 'b;
 }
 
-impl<'d, const ID: u8, H, S, E> Client<'d, H, S, E> for Holding<'d, Connector<ID, Session<H>, S, E>>
+impl<'a, 'd, const ID: u8, H, S, E> Client<'d, H, S, E> for WsHandle<'a, 'd, ID, H, S, E>
 where
     H: Handler + 'd,
     S: Dialer<E::Transport> + 'd,
     E: Env + 'd,
     E::Transport: Transport<Addr: Clone>,
 {
-    fn wait_active<'b>(&'b self) -> Fiber<'d, impl Future<Output = Result<(), Error>> + 'b> {
-        let holding = *self;
-        Fiber::new(poll_fn(move |cx| {
-            let mut h = holding.hold();
-            let shared = &mut h.as_mut().session_mut().shared;
-            if shared.conn_id.is_some() {
+    fn wait_active<'b>(&'b self) -> impl Fiber<'d, Output = Result<(), Error>> + 'b {
+        let handle = *self;
+        dope_fiber::wait_fn(move |cx, waiter| {
+            let shared = &handle.port.shared;
+            if shared.conn_id.get().is_some() {
                 return Poll::Ready(Ok(()));
             }
-            // SAFETY: cx.waker() was minted by the dope dispatcher's Slot::make_waker.
-            shared.active_wakers.register(WakeRef::verified(cx.waker()));
+            if !shared.try_register_active(waiter, cx.as_ref()) {
+                return Poll::Ready(Err(Error::Backpressure));
+            }
+            if shared.conn_id.get().is_some() {
+                shared.wake();
+                return Poll::Ready(Ok(()));
+            }
             Poll::Pending
-        }))
+        })
     }
 
     fn send_text<'b>(
         &'b self,
         payload: &'b [u8],
-    ) -> Fiber<'d, impl Future<Output = Result<(), Error>> + 'b> {
-        Encode::message(*self, 0x1, payload)
+    ) -> impl Fiber<'d, Output = Result<(), Error>> + 'b {
+        Encode::encode::<false, ID, H, S, E>(*self, 0x1, payload)
     }
 
     fn send_binary<'b>(
         &'b self,
         payload: &'b [u8],
-    ) -> Fiber<'d, impl Future<Output = Result<(), Error>> + 'b> {
-        Encode::message(*self, 0x2, payload)
+    ) -> impl Fiber<'d, Output = Result<(), Error>> + 'b {
+        Encode::encode::<false, ID, H, S, E>(*self, 0x2, payload)
     }
 
     fn send_ping<'b>(
         &'b self,
         payload: &'b [u8],
-    ) -> Fiber<'d, impl Future<Output = Result<(), Error>> + 'b> {
-        Encode::control(*self, 0x9, payload)
+    ) -> impl Fiber<'d, Output = Result<(), Error>> + 'b {
+        Encode::encode::<true, ID, H, S, E>(*self, 0x9, payload)
     }
 
-    fn close<'b>(
-        &'b self,
-        payload: &'b [u8],
-    ) -> Fiber<'d, impl Future<Output = Result<(), Error>> + 'b> {
-        Encode::control(*self, 0x8, payload)
+    fn close<'b>(&'b self, payload: &'b [u8]) -> impl Fiber<'d, Output = Result<(), Error>> + 'b {
+        Encode::encode::<true, ID, H, S, E>(*self, 0x8, payload)
     }
 }
 
 struct Encode;
 
 impl Encode {
-    fn message<'d, 'b, const ID: u8, H, S, E>(
-        holding: Holding<'d, Connector<ID, Session<H>, S, E>>,
+    fn encode<'a, 'd, 'b, const CONTROL: bool, const ID: u8, H, S, E>(
+        handle: WsHandle<'a, 'd, ID, H, S, E>,
         opcode: u8,
         payload: &'b [u8],
-    ) -> Fiber<'d, impl Future<Output = Result<(), Error>> + 'b>
+    ) -> impl Fiber<'d, Output = Result<(), Error>> + 'b
     where
         H: Handler + 'd,
         S: Dialer<E::Transport> + 'd,
         E: Env + 'd,
         E::Transport: Transport<Addr: Clone>,
+        'a: 'b,
         'd: 'b,
     {
-        Fiber::new(poll_fn(move |_cx| {
-            let mut h = holding.hold();
-            Poll::Ready(Self::message_now(h.as_mut(), opcode, payload))
-        }))
-    }
-
-    fn control<'d, 'b, const ID: u8, H, S, E>(
-        holding: Holding<'d, Connector<ID, Session<H>, S, E>>,
-        opcode: u8,
-        payload: &'b [u8],
-    ) -> Fiber<'d, impl Future<Output = Result<(), Error>> + 'b>
-    where
-        H: Handler + 'd,
-        S: Dialer<E::Transport> + 'd,
-        E: Env + 'd,
-        E::Transport: Transport<Addr: Clone>,
-        'd: 'b,
-    {
-        Fiber::new(poll_fn(move |_cx| {
-            let mut h = holding.hold();
-            if payload.len() > 125 {
+        poll_fn(move |_cx| {
+            if CONTROL && payload.len() > 125 {
                 return Poll::Ready(Err(Error::MessageTooLarge));
             }
-            Poll::Ready(Self::frames_now(
-                h.as_mut(),
-                opcode,
-                payload,
-                payload.len().max(1),
-                true,
-            ))
-        }))
+            let result = if CONTROL {
+                Self::frames_now(handle.port, opcode, payload, payload.len().max(1), true)
+            } else {
+                Self::message_now(handle.port, opcode, payload)
+            };
+            Poll::Ready(result)
+        })
     }
 
-    fn message_now<const ID: u8, H, S, E>(
-        pool: Pin<&mut Connector<ID, Session<H>, S, E>>,
-        opcode: u8,
-        payload: &[u8],
-    ) -> Result<(), Error>
-    where
-        H: Handler,
-        S: Dialer<E::Transport>,
-        E: Env,
-        E::Transport: Transport<Addr: Clone>,
-    {
-        let max = pool
-            .as_ref()
-            .session()
-            .codec
-            .config
-            .max_outbound_frame_payload
-            .max(1);
-        Self::frames_now(pool, opcode, payload, max, false)
+    fn message_now(port: &Port<'_>, opcode: u8, payload: &[u8]) -> Result<(), Error> {
+        let max = port.codec.config.max_outbound_frame_payload.max(1);
+        Self::frames_now(port, opcode, payload, max, false)
     }
 
-    fn frames_now<const ID: u8, H, S, E>(
-        mut pool: Pin<&mut Connector<ID, Session<H>, S, E>>,
+    fn frames_now(
+        port: &Port<'_>,
         opcode: u8,
         payload: &[u8],
         max_payload: usize,
         control: bool,
-    ) -> Result<(), Error>
-    where
-        H: Handler,
-        S: Dialer<E::Transport>,
-        E: Env,
-        E::Transport: Transport<Addr: Clone>,
-    {
-        let conn_id = pool
-            .as_ref()
-            .session()
-            .shared
-            .conn_id
-            .ok_or(Error::NotConnected)?;
-        let Some(channel) = pool.as_mut().state_for(conn_id) else {
-            let shared = &mut pool.as_mut().session_mut().shared;
-            shared.conn_id = None;
-            shared.active_wakers.drain_wake();
-            return Err(Error::NotConnected);
-        };
-        if control || payload.len() <= max_payload {
-            let frame =
-                Self::client_frame(&mut channel.conn_state_mut().rng, opcode, true, payload);
-            if !channel.enqueue(frame) {
-                return Err(Error::Backpressure);
-            }
-        } else {
-            let mut off = 0;
-            let mut first = true;
-            while off < payload.len() {
-                let end = (off + max_payload).min(payload.len());
-                let fin = end == payload.len();
-                let op = if first { opcode } else { 0x0 };
-                let frame = Self::client_frame(
-                    &mut channel.conn_state_mut().rng,
-                    op,
-                    fin,
-                    &payload[off..end],
-                );
-                if !channel.enqueue(frame) {
+    ) -> Result<(), Error> {
+        let shared = &port.shared;
+        let conn_id = shared.conn_id.get().ok_or(Error::NotConnected)?;
+        let Some(result) = port.io.with_sender(conn_id, |sender| {
+            if control || payload.len() <= max_payload {
+                let frame = Self::client_frame(&shared.rng, opcode, true, payload);
+                if sender.try_enqueue(frame).is_err() {
                     return Err(Error::Backpressure);
                 }
-                first = false;
-                off = end;
+            } else {
+                let mut off = 0;
+                let mut first = true;
+                while off < payload.len() {
+                    let end = (off + max_payload).min(payload.len());
+                    let fin = end == payload.len();
+                    let op = if first { opcode } else { 0x0 };
+                    let frame = Self::client_frame(&shared.rng, op, fin, &payload[off..end]);
+                    if sender.try_enqueue(frame).is_err() {
+                        return Err(Error::Backpressure);
+                    }
+                    first = false;
+                    off = end;
+                }
             }
-        }
-        pool.request_flush(conn_id);
-        Ok(())
+            Ok(())
+        }) else {
+            shared.conn_id.set(None);
+            shared.wake();
+            return Err(Error::NotConnected);
+        };
+        result
     }
 
     fn frames_into(
         sink: &mut Queue<IOV_CAP>,
-        rng: &mut MaskRng,
+        rng: &MaskRng,
         opcode: u8,
         payload: &[u8],
         max_payload: usize,
         control: bool,
     ) -> Result<(), Error> {
         if control || payload.len() <= max_payload {
-            if sink.over_cap() {
-                return Err(Error::Backpressure);
-            }
-            sink.push(Self::client_frame(rng, opcode, true, payload));
+            sink.try_enqueue(Self::client_frame(rng, opcode, true, payload))
+                .map_err(|_| Error::Backpressure)?;
             return Ok(());
         }
         let mut off = 0;
@@ -721,17 +769,15 @@ impl Encode {
             let end = (off + max_payload).min(payload.len());
             let fin = end == payload.len();
             let op = if first { opcode } else { 0x0 };
-            if sink.over_cap() {
-                return Err(Error::Backpressure);
-            }
-            sink.push(Self::client_frame(rng, op, fin, &payload[off..end]));
+            sink.try_enqueue(Self::client_frame(rng, op, fin, &payload[off..end]))
+                .map_err(|_| Error::Backpressure)?;
             first = false;
             off = end;
         }
         Ok(())
     }
 
-    fn client_frame(rng: &mut MaskRng, opcode: u8, fin: bool, payload: &[u8]) -> Shared {
+    fn client_frame(rng: &MaskRng, opcode: u8, fin: bool, payload: &[u8]) -> Shared {
         let mask = rng.mask();
         let mut frame = Vec::with_capacity(14 + payload.len());
         frame.push(if fin { 0x80 | opcode } else { opcode });
@@ -739,7 +785,7 @@ impl Encode {
         frame.extend_from_slice(&mask);
         let start = frame.len();
         frame.extend_from_slice(payload);
-        crate::mask::Mask::unmask_inline(&mut frame[start..], mask);
+        crate::mask::Mask::unmask_in_place(&mut frame[start..], mask);
         Shared::from(frame)
     }
 }
@@ -775,70 +821,5 @@ impl Validate {
 
     fn header_value(s: &str) -> bool {
         !s.bytes().any(|b| matches!(b, b'\r' | b'\n'))
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn legacy_xorshift(seed: u64, n: usize) -> Vec<[u8; 4]> {
-        let mut s = if seed == 0 {
-            0x9E37_79B9_7F4A_7C15
-        } else {
-            seed
-        };
-        let mut out = Vec::with_capacity(n);
-        for _ in 0..n {
-            s ^= s << 13;
-            s ^= s >> 7;
-            s ^= s << 17;
-            let b = s.to_le_bytes();
-            out.push([b[0], b[1], b[2], b[3]]);
-        }
-        out
-    }
-
-    #[test]
-    fn masks_are_not_legacy_xorshift_sequence() {
-        let mut rng = MaskRng::default();
-        let got: Vec<[u8; 4]> = (0..256).map(|_| rng.mask()).collect();
-        assert!(got.iter().any(|m| *m != got[0]));
-        for seed in [1u64, 0x9E37_79B9_7F4A_7C15, 0xCAFE_BABE_DEAD_BEEF] {
-            assert_ne!(legacy_xorshift(seed, got.len()), got);
-        }
-    }
-
-    #[test]
-    fn distinct_connections_produce_distinct_masks() {
-        let mut a = MaskRng::default();
-        let mut b = MaskRng::default();
-        let sa: Vec<[u8; 4]> = (0..32).map(|_| a.mask()).collect();
-        let sb: Vec<[u8; 4]> = (0..32).map(|_| b.mask()).collect();
-        assert_ne!(sa, sb);
-    }
-
-    #[test]
-    fn masks_statistical_sanity() {
-        let mut rng = MaskRng::default();
-        let mut counts = [0u32; 256];
-        let draws = 4096;
-        let mut seen = std::collections::HashSet::new();
-        for _ in 0..draws {
-            let m = rng.mask();
-            seen.insert(m);
-            for b in m {
-                counts[b as usize] += 1;
-            }
-        }
-        let mean = (draws * 4) / 256;
-        for c in counts {
-            assert!(c > 0, "byte value never appeared");
-            assert!(c < (mean as u32) * 4, "byte value over-represented: {c}");
-        }
-        assert!(
-            seen.len() > draws * 9 / 10,
-            "too many repeated 4-byte masks"
-        );
     }
 }

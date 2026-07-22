@@ -19,7 +19,7 @@ impl Decode {
                     <#elem as sark::json::JsonDecode>::decode_json_borrowed(&__raw[__vs..__idx])?
                 );)
             } else {
-                quote!(__v.push(sark::json::Parse::local(__bytes.clone(), __raw, &mut __idx)?);)
+                quote!(__v.push(sark::json::Parse::frame(&__bytes, &mut __idx)?);)
             };
             let capture = if field_mode.nested {
                 quote! {
@@ -61,26 +61,20 @@ impl Decode {
         let class = Classified::of(ty)?;
         let decode = match class.scalar {
             Scalar::U64 => quote!(sark::json::Parse::u64(__raw, &mut __idx)?),
+            Scalar::I64 | Scalar::F64 | Scalar::String | Scalar::Shared => {
+                return Err(syn::Error::new_spanned(
+                    ty,
+                    "this JSON field type requires `#[sark_gen::json(encode)]`",
+                ));
+            }
             Scalar::Bool => quote!(sark::json::Parse::bool(__raw, &mut __idx)?),
-            Scalar::LocalFrameBytes => {
+            Scalar::Retained => {
                 if field_mode.raw {
-                    quote!(sark::json::Parse::local_raw(
-                        __bytes.clone(),
-                        __raw,
-                        &mut __idx
-                    )?)
+                    quote!(sark::json::Parse::frame_raw(&__bytes, &mut __idx)?)
                 } else if field_mode.plain {
-                    quote!(sark::json::Parse::local_plain(
-                        __bytes.clone(),
-                        __raw,
-                        &mut __idx
-                    )?)
+                    quote!(sark::json::Parse::frame_plain(&__bytes, &mut __idx)?)
                 } else {
-                    quote!(sark::json::Parse::local(
-                        __bytes.clone(),
-                        __raw,
-                        &mut __idx
-                    )?)
+                    quote!(sark::json::Parse::frame(&__bytes, &mut __idx)?)
                 }
             }
             Scalar::InlineToken => {
@@ -111,8 +105,14 @@ impl Decode {
         }
         Ok(match class.scalar {
             Scalar::U64 => quote!(0u64),
+            Scalar::I64 | Scalar::F64 | Scalar::String | Scalar::Shared => {
+                return Err(syn::Error::new_spanned(
+                    ty,
+                    "this JSON field type requires `#[sark_gen::json(encode)]`",
+                ));
+            }
             Scalar::Bool => quote!(false),
-            Scalar::LocalFrameBytes => quote!(sark::json::Parse::empty_local()),
+            Scalar::Retained => quote!(sark::json::Parse::empty_frame()),
             Scalar::InlineToken => quote!(sark::json::InlineToken::new()),
         })
     }

@@ -13,7 +13,6 @@ fn echo_roundtrips_through_fastpath() {
     run_echo(|bind| {
         let (mut sock, mut buf) = connect(bind);
 
-        // Batch of complete frames in one write -> single recv, fast path.
         let mut batch = Vec::new();
         batch.extend_from_slice(&masked(0x1, true, b"alpha"));
         batch.extend_from_slice(&masked(0x2, true, b"bravo!!"));
@@ -30,13 +29,10 @@ fn echo_roundtrips_through_fastpath() {
         assert_eq!(next_message(&mut sock, &mut buf), (0x1, Vec::new()));
         assert_eq!(next_message(&mut sock, &mut buf), (0x2, big));
 
-        // Fragmented message: server reassembles, echoes one text frame.
         sock.write_all(&masked(0x1, false, b"foo")).unwrap();
         sock.write_all(&masked(0x0, true, b"bar")).unwrap();
         assert_eq!(next_message(&mut sock, &mut buf), (0x1, b"foobar".to_vec()));
 
-        // Split a frame across two writes -> partial tail stashed, then drained
-        // by the buffered path on the next recv.
         let frame = masked(0x1, true, b"charlie");
         sock.write_all(&frame[..3]).unwrap();
         std::thread::sleep(Duration::from_millis(50));
@@ -46,7 +42,6 @@ fn echo_roundtrips_through_fastpath() {
             (0x1, b"charlie".to_vec())
         );
 
-        // Ping -> pong with same payload.
         sock.write_all(&masked(0x9, true, b"hb")).unwrap();
         assert_eq!(next_message(&mut sock, &mut buf), (0xA, b"hb".to_vec()));
     });

@@ -1,15 +1,15 @@
-use o3::buffer::{Owned, Shared};
+use o3::buffer::{Borrowed, Bytes, Owned, Retained, Shared};
 
 use super::super::{HotTextInner, TextItemInner};
 use super::headers::HeaderNameToken;
-use crate::http::request::LocalFrameBytesRef;
 
 #[derive(Clone)]
 pub enum HeaderValueInner<'req> {
     Static(&'static [u8]),
     Inline(InlineHeaderValue),
     Shared(Shared),
-    Local(LocalFrameBytesRef<'req>),
+    Borrowed(Bytes<Borrowed<'req>>),
+    Retained(Bytes<Retained>),
 }
 
 #[derive(Clone, Copy)]
@@ -31,12 +31,6 @@ impl InlineHeaderValue {
             bytes,
             len: value.len() as u8,
         }
-    }
-
-    pub fn from_decimal(value: usize) -> Self {
-        let mut raw = [0u8; 20];
-        let n = crate::http::codec::Wire::write_dec(value, &mut raw);
-        Self::new(&raw[..n])
     }
 
     pub fn as_bytes(&self) -> &[u8] {
@@ -67,8 +61,12 @@ impl<'req> std::fmt::Debug for HeaderValueInner<'req> {
                 .debug_struct("HeaderValue::Shared")
                 .field("len", &value.len())
                 .finish(),
-            Self::Local(value) => f
-                .debug_struct("HeaderValue::Local")
+            Self::Borrowed(value) => f
+                .debug_struct("HeaderValue::Borrowed")
+                .field("len", &value.len())
+                .finish(),
+            Self::Retained(value) => f
+                .debug_struct("HeaderValue::Retained")
                 .field("len", &value.len())
                 .finish(),
         }
@@ -81,7 +79,8 @@ impl<'req> HeaderValueInner<'req> {
             Self::Static(value) => value,
             Self::Inline(value) => value.as_bytes(),
             Self::Shared(value) => value.as_ref(),
-            Self::Local(value) => value.as_bytes(),
+            Self::Borrowed(value) => value.as_slice(),
+            Self::Retained(value) => value.as_slice(),
         }
     }
 
@@ -149,9 +148,15 @@ impl<'req> IntoHeaderValue<'req> for InlineHeaderValue {
     }
 }
 
-impl<'req> IntoHeaderValue<'req> for LocalFrameBytesRef<'req> {
+impl<'req> IntoHeaderValue<'req> for Bytes<Borrowed<'req>> {
     fn into_header_value(self) -> HeaderValueInner<'req> {
-        HeaderValueInner::Local(self)
+        HeaderValueInner::Borrowed(self)
+    }
+}
+
+impl<'req> IntoHeaderValue<'req> for Bytes<Retained> {
+    fn into_header_value(self) -> HeaderValueInner<'req> {
+        HeaderValueInner::Retained(self)
     }
 }
 

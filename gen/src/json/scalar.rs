@@ -5,8 +5,12 @@ use crate::util::TypeExt;
 #[derive(Clone, Copy)]
 pub(super) enum Scalar {
     U64,
+    I64,
+    F64,
     Bool,
-    LocalFrameBytes,
+    String,
+    Shared,
+    Retained,
     InlineToken,
 }
 
@@ -24,16 +28,24 @@ impl Classified {
         };
         let scalar = if inner.is_plain_ident("u64") {
             Scalar::U64
+        } else if inner.is_plain_ident("i64") {
+            Scalar::I64
+        } else if inner.is_plain_ident("f64") {
+            Scalar::F64
         } else if inner.is_plain_ident("bool") {
             Scalar::Bool
-        } else if inner.is_plain_ident("LocalFrameBytes") {
-            Scalar::LocalFrameBytes
+        } else if inner.is_plain_ident("String") {
+            Scalar::String
+        } else if inner.is_plain_ident("Shared") {
+            Scalar::Shared
+        } else if inner.is_bytes_with_storage("Retained") {
+            Scalar::Retained
         } else if inner.is_inline_token() {
             Scalar::InlineToken
         } else {
             return Err(syn::Error::new_spanned(
                 ty,
-                "unsupported #[sark_gen::json] field type; use u64, bool, LocalFrameBytes, or Option<T>",
+                "unsupported #[sark_gen::json] field type",
             ));
         };
         Ok(Self { scalar, optional })

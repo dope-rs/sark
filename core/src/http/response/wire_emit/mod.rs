@@ -11,14 +11,6 @@ pub(super) use head_write::HeadWrite;
 pub(super) use headers::HeaderSection;
 pub(super) use out::Out;
 
-/// Rewrites a cached head's `Server`/`Date` terminator for a route's
-/// `#[skip(...)]` policy, returning the per-request `Date` patch offset (`None`
-/// when the line is dropped). Runs once per route at build time, never per
-/// request. Assumes the terminator is the final contiguous block:
-///
-/// ```text
-/// SERVER_LINE | DATE_PREFIX | <DATE_LEN date> | CRLF | CRLF   (body may trail)
-/// ```
 pub fn apply_head_skip(
     template: &mut Vec<u8>,
     date_offset: usize,

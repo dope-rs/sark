@@ -1,17 +1,19 @@
 #![cfg(target_os = "linux")]
 #![allow(clippy::too_many_arguments)]
 
+mod support;
+
 use std::collections::VecDeque;
-use std::future::Future;
 use std::io::{Read, Write};
 use std::net::TcpStream;
 use std::pin::Pin;
-use std::task::{Context, Poll};
+use std::task::Poll;
 use std::time::Duration;
 
-use dope_extra::testing::run_with_trigger;
+use dope_extra::harness::Harness;
+use dope_fiber::{Context, Fiber};
 use o3::buffer::Shared;
-use sark::{Build, ServerCfg};
+use sark::{Executor, Throughput, driver};
 use sark_core::http::Stream;
 
 const CHUNK_TERMINATOR_BYTES: &[u8] = b"0\r\n\r\n";
@@ -31,10 +33,10 @@ impl DelayedChunks {
         }
     }
 
-    fn arm_pend(&mut self, cx: &mut Context<'_>) -> Poll<()> {
+    fn arm_pend(&mut self, cx: Pin<&mut Context<'_, '_>>) -> Poll<()> {
         if self.pend_next {
             self.pend_next = false;
-            cx.waker().wake_by_ref();
+            cx.wake();
             return Poll::Pending;
         }
         self.pend_next = true;
@@ -42,10 +44,9 @@ impl DelayedChunks {
     }
 }
 
-impl Future for DelayedChunks {
+impl<'d> Fiber<'d> for DelayedChunks {
     type Output = Option<Shared>;
-
-    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Shared>> {
+    fn poll(self: Pin<&mut Self>, cx: Pin<&mut Context<'_, 'd>>) -> Poll<Option<Shared>> {
         let this = self.get_mut();
         if this.chunks.is_empty() {
             return Poll::Ready(None);
@@ -73,100 +74,106 @@ fn stream_handler(_req: EmptyReq, _state: &()) -> Stream<DelayedChunks> {
 
 sark_gen::define_route! {
     StreamPendingDispatch: () => {
-        GET "/stream" => stream stream_handler,
+        GET "/stream" => stream(capacity = 32) stream_handler,
     }
 }
 
 #[test]
 fn pending_chunk_producer_completes_the_response() {
     let bind: std::net::SocketAddr = "127.0.0.1:18921".parse().unwrap();
-    let cfg = ServerCfg {
-        bind,
-        max_conn: 16,
-        backlog: 16,
-        head_timeout: std::time::Duration::from_secs(10),
-    };
+    let server = support::http_server(bind, Duration::from_secs(10));
 
-    run_with_trigger(
-        bind,
-        |ctx, trigger| {
-            Build::http(
-                stream_pending_dispatch::new(&()),
-                cfg.clone(),
-                ctx,
-                Some(trigger),
-            )
-        },
-        |bind| {
-            let mut sock = TcpStream::connect(bind).expect("connect");
-            sock.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
+    Harness::new(bind)
+        .run_with_trigger(
+            |_ctx, trigger| {
+                let driver_config =
+                    driver::Config::for_tcp_profile::<Throughput>(support::MAX_CONNECTIONS);
+                let executor = Executor::new(driver_config)?;
+                executor.enter(|mut session| {
+                    server.clone().serve(
+                        &mut session,
+                        StreamPendingDispatch::new(
+                            (),
+                            sark::app::Config {
+                                timer_capacity: support::MAX_CONNECTIONS.saturating_mul(2),
+                                task_capacity: support::MAX_CONNECTIONS,
+                            },
+                        ),
+                        Some(trigger),
+                    )
+                })
+            },
+            |bind| {
+                let mut sock = TcpStream::connect(bind).expect("connect");
+                sock.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
 
-            sock.write_all(b"GET /stream HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n")
-                .unwrap();
-            let mut resp = Vec::new();
-            let mut chunk = [0u8; 4096];
-            loop {
-                match sock.read(&mut chunk) {
-                    Ok(0) => break,
-                    Ok(n) => {
-                        resp.extend_from_slice(&chunk[..n]);
-                        if resp.ends_with(CHUNK_TERMINATOR_BYTES) {
+                sock.write_all(b"GET /stream HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n")
+                    .unwrap();
+                let mut resp = Vec::new();
+                let mut chunk = [0u8; 4096];
+                loop {
+                    match sock.read(&mut chunk) {
+                        Ok(0) => break,
+                        Ok(n) => {
+                            resp.extend_from_slice(&chunk[..n]);
+                            if resp.ends_with(CHUNK_TERMINATOR_BYTES) {
+                                break;
+                            }
+                        }
+                        Err(e)
+                            if e.kind() == std::io::ErrorKind::WouldBlock
+                                || e.kind() == std::io::ErrorKind::TimedOut =>
+                        {
                             break;
                         }
+                        Err(e) => panic!("read: {e}"),
                     }
-                    Err(e)
-                        if e.kind() == std::io::ErrorKind::WouldBlock
-                            || e.kind() == std::io::ErrorKind::TimedOut =>
-                    {
+                }
+                let resp_str = String::from_utf8_lossy(&resp);
+
+                assert!(resp_str.contains("200 OK"), "resp: {resp_str}");
+                assert!(
+                    resp_str
+                        .to_lowercase()
+                        .contains("transfer-encoding: chunked"),
+                    "resp: {resp_str}"
+                );
+                assert!(
+                    resp.ends_with(CHUNK_TERMINATOR_BYTES),
+                    "stream never completed (wedged?): {resp_str}"
+                );
+
+                let body_start = resp
+                    .windows(4)
+                    .position(|w| w == b"\r\n\r\n")
+                    .map(|i| i + 4)
+                    .expect("header terminator");
+                let body = &resp[body_start..];
+
+                let mut cursor = 0usize;
+                let mut reassembled = Vec::new();
+                loop {
+                    let line_end = body[cursor..]
+                        .windows(2)
+                        .position(|w| w == b"\r\n")
+                        .expect("chunk size CRLF")
+                        + cursor;
+                    let size_str = std::str::from_utf8(&body[cursor..line_end]).expect("hex utf8");
+                    let size = usize::from_str_radix(size_str.trim(), 16).expect("hex parse");
+                    cursor = line_end + 2;
+                    if size == 0 {
                         break;
                     }
-                    Err(e) => panic!("read: {e}"),
+                    reassembled.extend_from_slice(&body[cursor..cursor + size]);
+                    cursor += size;
+                    assert_eq!(&body[cursor..cursor + 2], b"\r\n", "chunk CRLF");
+                    cursor += 2;
                 }
-            }
-            let resp_str = String::from_utf8_lossy(&resp);
-
-            assert!(resp_str.contains("200 OK"), "resp: {resp_str}");
-            assert!(
-                resp_str
-                    .to_lowercase()
-                    .contains("transfer-encoding: chunked"),
-                "resp: {resp_str}"
-            );
-            assert!(
-                resp.ends_with(CHUNK_TERMINATOR_BYTES),
-                "stream never completed (wedged?): {resp_str}"
-            );
-
-            let body_start = resp
-                .windows(4)
-                .position(|w| w == b"\r\n\r\n")
-                .map(|i| i + 4)
-                .expect("header terminator");
-            let body = &resp[body_start..];
-
-            let mut cursor = 0usize;
-            let mut reassembled = Vec::new();
-            loop {
-                let line_end = body[cursor..]
-                    .windows(2)
-                    .position(|w| w == b"\r\n")
-                    .expect("chunk size CRLF")
-                    + cursor;
-                let size_str = std::str::from_utf8(&body[cursor..line_end]).expect("hex utf8");
-                let size = usize::from_str_radix(size_str.trim(), 16).expect("hex parse");
-                cursor = line_end + 2;
-                if size == 0 {
-                    break;
-                }
-                reassembled.extend_from_slice(&body[cursor..cursor + size]);
-                cursor += size;
-                assert_eq!(&body[cursor..cursor + 2], b"\r\n", "chunk CRLF");
-                cursor += 2;
-            }
-            assert_eq!(
-                reassembled, b"alpha-beta-gamma",
-                "reassembled body: {resp_str}"
-            );
-        },
-    );
+                assert_eq!(
+                    reassembled, b"alpha-beta-gamma",
+                    "reassembled body: {resp_str}"
+                );
+            },
+        )
+        .expect("harness");
 }

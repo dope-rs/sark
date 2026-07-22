@@ -1,13 +1,14 @@
-use o3::buffer::{Owned, Shared};
+use o3::buffer::{Borrowed, Bytes, Owned, Retained, Shared};
 
 use super::direct::INLINE_HOT_TEXT_PARTS;
-use super::{BodyInner, HeadInner, LocalFrameBytesRef};
+use super::{BodyInner, DEFAULT_HEADER_CAPACITY, HeadInner};
 
 #[derive(Clone)]
 pub enum TextItemInner<'req> {
     Static(&'static [u8]),
     Shared(Shared),
-    Local(LocalFrameBytesRef<'req>),
+    Borrowed(Bytes<Borrowed<'req>>),
+    Retained(Bytes<Retained>),
 }
 
 pub type TextItem = TextItemInner<'static>;
@@ -25,8 +26,12 @@ impl<'req> std::fmt::Debug for TextItemInner<'req> {
                 .debug_struct("TextItem::Shared")
                 .field("len", &bytes.len())
                 .finish(),
-            Self::Local(bytes) => f
-                .debug_struct("TextItem::Local")
+            Self::Borrowed(bytes) => f
+                .debug_struct("TextItem::Borrowed")
+                .field("len", &bytes.len())
+                .finish(),
+            Self::Retained(bytes) => f
+                .debug_struct("TextItem::Retained")
                 .field("len", &bytes.len())
                 .finish(),
         }
@@ -42,7 +47,8 @@ impl<'req> TextItemInner<'req> {
         match self {
             Self::Static(bytes) => bytes,
             Self::Shared(bytes) => bytes.as_ref(),
-            Self::Local(bytes) => bytes.as_bytes(),
+            Self::Borrowed(bytes) => bytes.as_slice(),
+            Self::Retained(bytes) => bytes.as_slice(),
         }
     }
 
@@ -53,18 +59,18 @@ impl<'req> TextItemInner<'req> {
 
 #[allow(clippy::large_enum_variant)]
 #[derive(Clone, Debug)]
-pub enum HotHeadInner<'req> {
+pub enum HotHeadInner<'req, const N: usize = DEFAULT_HEADER_CAPACITY> {
     Wire(Shared),
-    Direct(HeadInner<'req>),
+    Direct(HeadInner<'req, N>),
 }
 
-impl<'req> HotHeadInner<'req> {
+impl<'req, const N: usize> HotHeadInner<'req, N> {
     pub(super) fn into_bytes(self) -> Shared {
         match self {
             Self::Wire(bytes) => bytes,
             Self::Direct(head) => {
                 let mut out = Owned::with_capacity(head.wire_len());
-                head.write_into(&mut out);
+                head.write_into_owned(&mut out);
                 out.freeze()
             }
         }
@@ -162,9 +168,16 @@ impl<'req> HotTextInner<'req> {
         self
     }
 
-    pub fn push_local(&mut self, bytes: LocalFrameBytesRef<'req>) -> &mut Self {
+    pub fn push_borrowed(&mut self, bytes: Bytes<Borrowed<'req>>) -> &mut Self {
         if !bytes.is_empty() {
-            self.push_item(TextItemInner::Local(bytes));
+            self.push_item(TextItemInner::Borrowed(bytes));
+        }
+        self
+    }
+
+    pub fn push_retained(&mut self, bytes: Bytes<Retained>) -> &mut Self {
+        if !bytes.is_empty() {
+            self.push_item(TextItemInner::Retained(bytes));
         }
         self
     }
@@ -203,9 +216,10 @@ impl<'req> HotTextInner<'req> {
 #[allow(clippy::large_enum_variant)]
 #[derive(Clone)]
 pub enum HotBodyInner<'req> {
-    Owned(Owned),
+    Owned(Vec<u8>),
     Shared(Shared),
-    Local(LocalFrameBytesRef<'req>),
+    Borrowed(Bytes<Borrowed<'req>>),
+    Retained(Bytes<Retained>),
     Text(HotTextInner<'req>),
     StaticSlice(&'static [u8]),
 }
@@ -215,7 +229,8 @@ impl<'req> HotBodyInner<'req> {
         match self {
             Self::Owned(body) => body.len(),
             Self::Shared(body) => body.len(),
-            Self::Local(body) => body.len(),
+            Self::Borrowed(body) => body.len(),
+            Self::Retained(body) => body.len(),
             Self::Text(body) => body.len(),
             Self::StaticSlice(body) => body.len(),
         }
@@ -224,7 +239,7 @@ impl<'req> HotBodyInner<'req> {
     pub(crate) fn write_to(&self, out: &mut [u8]) -> usize {
         match self {
             Self::Owned(body) => {
-                let s = body.as_ref();
+                let s = body.as_slice();
                 out[..s.len()].copy_from_slice(s);
                 s.len()
             }
@@ -233,8 +248,13 @@ impl<'req> HotBodyInner<'req> {
                 out[..s.len()].copy_from_slice(s);
                 s.len()
             }
-            Self::Local(body) => {
-                let s = body.as_bytes();
+            Self::Borrowed(body) => {
+                let s = body.as_slice();
+                out[..s.len()].copy_from_slice(s);
+                s.len()
+            }
+            Self::Retained(body) => {
+                let s = body.as_slice();
                 out[..s.len()].copy_from_slice(s);
                 s.len()
             }
@@ -248,9 +268,10 @@ impl<'req> HotBodyInner<'req> {
 
     pub(crate) fn into_shared(self) -> Shared {
         match self {
-            Self::Owned(body) => body.freeze(),
+            Self::Owned(body) => Shared::from(body),
             Self::Shared(body) => body,
-            Self::Local(body) => Shared::copy_from_slice(body.as_bytes()),
+            Self::Borrowed(body) => Shared::copy_from_slice(body.as_slice()),
+            Self::Retained(body) => body.into_shared(),
             Self::Text(body) => body.into_bytes(),
             Self::StaticSlice(body) => Shared::from_static(body),
         }
@@ -262,7 +283,8 @@ impl<'req> From<BodyInner<'req>> for HotBodyInner<'req> {
         match body {
             BodyInner::Owned(body) => Self::Owned(body),
             BodyInner::Shared(body) => Self::Shared(body),
-            BodyInner::Local(body) => Self::Local(body),
+            BodyInner::Borrowed(body) => Self::Borrowed(body),
+            BodyInner::Retained(body) => Self::Retained(body),
             BodyInner::StaticSlice(body) => Self::StaticSlice(body),
         }
     }
@@ -273,7 +295,8 @@ impl From<HotBodyInner<'static>> for BodyInner<'static> {
         match body {
             HotBodyInner::Owned(body) => Self::Owned(body),
             HotBodyInner::Shared(body) => Self::Shared(body),
-            HotBodyInner::Local(body) => Self::Local(body),
+            HotBodyInner::Borrowed(body) => Self::Shared(Shared::copy_from_slice(body.as_slice())),
+            HotBodyInner::Retained(body) => Self::Retained(body),
             HotBodyInner::Text(body) => Self::Shared(body.into_bytes()),
             HotBodyInner::StaticSlice(body) => Self::StaticSlice(body),
         }
@@ -291,8 +314,12 @@ impl<'req> std::fmt::Debug for HotBodyInner<'req> {
                 .debug_struct("HotBody::Shared")
                 .field("len", &body.len())
                 .finish(),
-            Self::Local(body) => f
-                .debug_struct("HotBody::Local")
+            Self::Borrowed(body) => f
+                .debug_struct("HotBody::Borrowed")
+                .field("len", &body.len())
+                .finish(),
+            Self::Retained(body) => f
+                .debug_struct("HotBody::Retained")
                 .field("len", &body.len())
                 .finish(),
             Self::Text(body) => f

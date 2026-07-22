@@ -277,7 +277,7 @@ fn server_ping_ack_no_pong() {
 fn server_caller_emits_goaway() {
     let mut conn = server();
     conn.drain_outbound(conn.outbound().len());
-    conn.goaway(ErrorCode::ProtocolError, b"oops");
+    conn.goaway(ErrorCode::ProtocolError, b"oops").unwrap();
     let out = conn.outbound();
     let h = FrameHeader::parse(out).unwrap();
     assert_eq!(h.kind, frame::Type::GoAway);
@@ -452,7 +452,7 @@ fn outbound_drain_progresses() {
 fn caller_ping_appends_frame() {
     let mut conn = server();
     let before = conn.outbound().len();
-    conn.ping([7u8; 8]);
+    conn.ping([7u8; 8]).unwrap();
     let after = conn.outbound();
     assert!(after.len() > before);
     let frame_start = &after[before..];

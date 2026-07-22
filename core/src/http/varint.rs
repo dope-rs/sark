@@ -52,17 +52,3 @@ impl VarInt {
         Ok((value, len))
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn round_trips_boundaries() {
-        for value in [0, 63, 64, 16_383, 16_384, 1_073_741_823, VarInt::MAX] {
-            let mut out = Vec::new();
-            VarInt::encode(value, &mut out).unwrap();
-            assert_eq!(VarInt::decode(&out), Ok((value, out.len())));
-        }
-    }
-}

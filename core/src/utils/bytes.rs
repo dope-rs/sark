@@ -43,7 +43,6 @@ impl Word {
 pub struct Ascii;
 
 impl Ascii {
-    #[inline(always)]
     pub fn fold_usize(mut acc: usize, chunk: &[u8]) -> Option<usize> {
         for &b in chunk {
             if !b.is_ascii_digit() {
@@ -54,7 +53,6 @@ impl Ascii {
         Some(acc)
     }
 
-    #[inline(always)]
     pub fn fold_u64(mut acc: u64, chunk: &[u8]) -> Option<u64> {
         for &b in chunk {
             if !b.is_ascii_digit() {
@@ -65,7 +63,6 @@ impl Ascii {
         Some(acc)
     }
 
-    #[inline(always)]
     pub fn parse_usize(bytes: &[u8]) -> Option<usize> {
         if bytes.is_empty() {
             return None;
@@ -73,7 +70,6 @@ impl Ascii {
         Self::fold_usize(0, bytes)
     }
 
-    #[inline(always)]
     pub fn parse_u64(bytes: &[u8]) -> Option<u64> {
         if bytes.is_empty() {
             return None;

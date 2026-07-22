@@ -1,5 +1,5 @@
 use http::StatusCode;
-use o3::buffer::{Owned, Shared};
+use o3::buffer::Shared;
 
 use super::Response;
 use super::body::Body;
@@ -24,7 +24,7 @@ impl Chunked {
         Response {
             status: self.status,
             headers: self.headers,
-            wire_headers: Owned::from(self.wire_headers.as_ref()),
+            wire_headers: self.wire_headers.as_ref().to_vec(),
             body: Body::empty(),
             chunked_parts: Some(self.parts),
         }
@@ -111,6 +111,6 @@ impl Chunked {
         let mut body = vec![0u8; self.body_wire_len()];
         let mut boff = 0usize;
         self.write_body(&mut body, &mut boff);
-        Some((off, Shared::copy_from_slice(&body)))
+        Some((off, Shared::from(body)))
     }
 }

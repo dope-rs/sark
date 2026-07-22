@@ -10,15 +10,15 @@ license.workspace = true
 [dependencies]
 sark-core.workspace = true
 sark.workspace = true
-dope-quic = "0.5"
+dope-quic = "0.6.0"
 
 [dev-dependencies]
 sark-gen.workspace = true
 dope.workspace = true
+dope-net.workspace = true
 http = "1.4.2"
 ring = "0.17"
 # Must track dope-quic's shin version: the tests build a SigningKey that is
 # passed straight into dope-quic's Conn::new_server, so it has to be the exact
 # same shin crate version that dope-quic compiles against.
-shin = "0.8"
-
+shin = "0.10"

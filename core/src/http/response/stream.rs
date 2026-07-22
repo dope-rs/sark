@@ -1,7 +1,7 @@
-use std::future::Future;
 use std::pin::Pin;
-use std::task::{Context, Poll};
+use std::task::Poll;
 
+use dope_fiber::{Context, Fiber};
 use http::StatusCode;
 use o3::buffer::{Owned, Shared};
 
@@ -9,10 +9,7 @@ use super::wire_emit::{HeadWrite, TransferEncodingChunked};
 
 pub const CHUNK_TERMINATOR: &[u8; 5] = b"0\r\n\r\n";
 
-pub struct Stream<S>
-where
-    S: Future<Output = Option<Shared>> + 'static,
-{
+pub struct Stream<S> {
     status: StatusCode,
     wire_headers: Shared,
     stream: S,
@@ -22,21 +19,17 @@ pub struct IterStream<I> {
     iter: I,
 }
 
-impl<I> Future for IterStream<I>
+impl<'d, I> Fiber<'d> for IterStream<I>
 where
     I: Iterator<Item = Shared> + Unpin + 'static,
 {
     type Output = Option<Shared>;
-
-    fn poll(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Option<Shared>> {
+    fn poll(self: Pin<&mut Self>, _cx: Pin<&mut Context<'_, 'd>>) -> Poll<Option<Shared>> {
         Poll::Ready(self.get_mut().iter.next())
     }
 }
 
-impl<S> Stream<S>
-where
-    S: Future<Output = Option<Shared>> + 'static,
-{
+impl<S> Stream<S> {
     pub fn new(stream: S) -> Self {
         Self {
             status: StatusCode::OK,
@@ -46,8 +39,14 @@ where
     }
 
     pub fn header(mut self, name: &[u8], value: &[u8]) -> Self {
-        let mut buf =
-            Owned::with_capacity(self.wire_headers.len() + name.len() + 2 + value.len() + 2);
+        let capacity = self
+            .wire_headers
+            .len()
+            .checked_add(name.len())
+            .and_then(|len| len.checked_add(value.len()))
+            .and_then(|len| len.checked_add(4))
+            .expect("stream header length overflow");
+        let mut buf = Owned::with_capacity(capacity);
         buf.extend_from_slice(self.wire_headers.as_ref());
         buf.extend_from_slice(name);
         buf.extend_from_slice(b": ");
@@ -95,10 +94,7 @@ where
     }
 }
 
-impl<S> super::IntoServeResponse<'static> for Stream<S>
-where
-    S: Future<Output = Option<Shared>> + 'static,
-{
+impl<S> super::IntoServeResponse<'static> for Stream<S> {
     fn into_serve_response(self) -> super::ServeInner<'static> {
         unreachable!(
             "Stream::into_serve_response — Stream routes \

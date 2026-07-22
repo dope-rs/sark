@@ -11,4 +11,4 @@ authors.workspace = true
 o3.workspace = true
 http = "1.4.2"
 sark-core.workspace = true
-
+ryu = "1.0.23"

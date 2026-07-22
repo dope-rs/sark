@@ -1,0 +1,17 @@
+error: response header name contains invalid HTTP token byte 0x20 at byte 1
+ --> tests/ui/response_header_validation.rs:5:14
+  |
+5 |     #[header("x bad")]
+  |              ^^^^^^^
+
+error: response header `Server` is managed by Sark and cannot be overridden
+  --> tests/ui/response_header_validation.rs:10:10
+   |
+10 | #[header("Server", "mine")]
+   |          ^^^^^^^^
+
+error: static response header value contains CR/LF at byte 5
+  --> tests/ui/response_header_validation.rs:17:20
+   |
+17 | #[header("x-safe", "first\r\nsecond")]
+   |                    ^^^^^^^^^^^^^^^^^

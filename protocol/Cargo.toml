@@ -1,0 +1,11 @@
+[package]
+name = "sark-protocol"
+version.workspace = true
+edition.workspace = true
+description = "Shared wire-protocol invariants for Sark"
+authors.workspace = true
+repository.workspace = true
+license.workspace = true
+
+[lib]
+path = "src/lib.rs"

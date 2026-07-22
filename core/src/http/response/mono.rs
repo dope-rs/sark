@@ -1,15 +1,15 @@
 use http::{HeaderValue, StatusCode};
 use o3::buffer::Shared;
 
-use super::wire_emit::{CRLF, ContentLength, HeadWrite, HeaderSection, Out, PLACEHOLDER_DATE};
-use super::{HeadInner, HeaderList, HeadersInner, HotBodyInner, HotHeadInner, IntoHeaderName};
+use super::wire_emit::{CRLF, ContentLength, HeadWrite, HeaderSection, Out};
+use super::{DEFAULT_HEADER_CAPACITY, HeaderList, HotBodyInner, HotHeadInner, IntoHeaderName};
 
-struct MonoHeaders<'a, 'req> {
-    head: &'a HotHeadInner<'req>,
+struct MonoHeaders<'a, 'req, const N: usize> {
+    head: &'a HotHeadInner<'req, N>,
     dynamic: Option<&'a HeaderList>,
 }
 
-impl HeaderSection for MonoHeaders<'_, '_> {
+impl<const N: usize> HeaderSection for MonoHeaders<'_, '_, N> {
     fn header_len(&self) -> usize {
         let head = match self.head {
             HotHeadInner::Wire(bytes) => bytes.len(),
@@ -40,28 +40,14 @@ impl HeaderSection for MonoHeaders<'_, '_> {
 }
 
 #[derive(Clone, Debug)]
-pub struct MonoResponseInner<'req> {
+pub struct MonoResponseInner<'req, const N: usize = DEFAULT_HEADER_CAPACITY> {
     pub(super) status: StatusCode,
     pub(super) headers: Option<Box<HeaderList>>,
-    pub(super) head: HotHeadInner<'req>,
+    pub(super) head: HotHeadInner<'req, N>,
     pub(super) body: HotBodyInner<'req>,
 }
 
-impl<'req> MonoResponseInner<'req> {
-    pub fn from_static_slice_body(
-        status: StatusCode,
-        static_headers: &'static [u8],
-        headers: HeadersInner<'req>,
-        body: &'static [u8],
-    ) -> Self {
-        Self {
-            status,
-            headers: None,
-            head: HotHeadInner::Direct(HeadInner::new(static_headers, headers)),
-            body: HotBodyInner::StaticSlice(body),
-        }
-    }
-
+impl<'req, const N: usize> MonoResponseInner<'req, N> {
     pub fn status(&self) -> StatusCode {
         self.status
     }
@@ -79,9 +65,9 @@ impl<'req> MonoResponseInner<'req> {
             .as_mut()
     }
 
-    pub fn insert_header<N>(&mut self, name: N, value: HeaderValue) -> &mut Self
+    pub fn insert_header<H>(&mut self, name: H, value: HeaderValue) -> &mut Self
     where
-        N: IntoHeaderName,
+        H: IntoHeaderName,
     {
         let _ = self.headers_mut().insert(name, value);
         self
@@ -97,40 +83,15 @@ impl<'req> MonoResponseInner<'req> {
         Some(off)
     }
 
-    pub fn write_head_only(
-        &self,
-        out: &mut [u8],
-        date: &[u8; 29],
-    ) -> Option<(usize, &'static [u8])> {
-        let body = match &self.body {
-            HotBodyInner::StaticSlice(s) => *s,
-            _ => return None,
-        };
-        let (off, _) = self.write_head_into(out, date)?;
-        Some((off, body))
-    }
-
     pub fn write_head_split(self, out: &mut [u8], date: &[u8; 29]) -> Option<(usize, Shared)> {
         let (off, _) = self.write_head_into(out, date)?;
         Some((off, self.body.into_shared()))
     }
 
-    pub fn preserialize_static(&self) -> Option<(Vec<u8>, usize, &'static [u8])> {
-        let body = match &self.body {
-            HotBodyInner::StaticSlice(s) => *s,
-            _ => return None,
-        };
-        let mut buf = vec![0u8; self.with_head(|head| head.wire_len())];
-        let (_, date_offset) = self.write_head_into(&mut buf, PLACEHOLDER_DATE)?;
-        Some((buf, date_offset, body))
-    }
-
     fn with_head<R>(
         &self,
-        f: impl FnOnce(&HeadWrite<'_, MonoHeaders<'_, 'req>, ContentLength<'_>>) -> R,
+        f: impl FnOnce(&HeadWrite<'_, MonoHeaders<'_, 'req, N>, ContentLength>) -> R,
     ) -> R {
-        let mut cl_raw = [0u8; 20];
-        let cl_n = crate::http::codec::Wire::write_dec(self.body.body_len(), &mut cl_raw);
         let section = MonoHeaders {
             head: &self.head,
             dynamic: self.headers.as_deref(),
@@ -143,7 +104,7 @@ impl<'req> MonoResponseInner<'req> {
                 .map(str::as_bytes)
                 .unwrap_or(b""),
             headers: &section,
-            framing: ContentLength(&cl_raw[..cl_n]),
+            framing: ContentLength(self.body.body_len()),
         };
         f(&head)
     }

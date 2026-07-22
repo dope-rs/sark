@@ -1,12 +1,14 @@
 #![allow(clippy::too_many_arguments)]
 
+mod support;
+
 use std::io::{Read, Write};
 use std::net::TcpStream;
 use std::time::Duration;
 
-use dope_extra::testing::run_with_trigger;
+use dope_extra::harness::Harness;
 use http::StatusCode;
-use sark::{Build, ServerCfg};
+use sark::{Executor, Throughput, driver};
 
 #[sark_gen::request]
 struct LeanRequest {}
@@ -112,16 +114,27 @@ fn content_length(headers: &[u8]) -> Option<usize> {
 #[test]
 fn skip_attribute_trims_static_response_headers() {
     let bind: std::net::SocketAddr = "127.0.0.1:38771".parse().unwrap();
-    let cfg = ServerCfg {
-        bind,
-        max_conn: 16,
-        backlog: 16,
-        head_timeout: std::time::Duration::from_secs(10),
-    };
+    let server = support::http_server(bind, Duration::from_secs(10));
 
-    run_with_trigger(
-        bind,
-        |ctx, trigger| Build::http(skip_dispatch::new(&()), cfg.clone(), ctx, Some(trigger)),
+    Harness::new(bind).run_with_trigger(
+        |_ctx, trigger| {
+            let driver_config =
+                driver::Config::for_tcp_profile::<Throughput>(support::MAX_CONNECTIONS);
+            let executor = Executor::new(driver_config)?;
+            executor.enter(|mut session| {
+                server.clone().serve(
+                    &mut session,
+                    SkipDispatch::new(
+                        (),
+                        sark::app::Config {
+                            timer_capacity: support::MAX_CONNECTIONS.saturating_mul(2),
+                            task_capacity: support::MAX_CONNECTIONS,
+                        },
+                    ),
+                    Some(trigger),
+                )
+            })
+        },
         |bind| {
             let lean_resp = String::from_utf8(http_get_close(bind, "/lean")).expect("utf8");
             assert!(
@@ -200,5 +213,5 @@ fn skip_attribute_trims_static_response_headers() {
                 "no-date body must arrive: {no_date_resp:?}"
             );
         },
-    );
+    ).expect("harness");
 }

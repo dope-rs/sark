@@ -5,9 +5,7 @@ mod spec;
 use proc_macro2::TokenStream;
 use syn::{LitStr, Result};
 
-use crate::model::{
-    AppDispatchInput, AppRouteInput, DefineRouteEntry, DefineRouteInput, RouteKind,
-};
+use crate::model::{AppDispatchInput, AppRouteInput, DefineRouteEntry, DefineRouteInput};
 
 pub(super) fn define_route(input: DefineRouteInput) -> Result<TokenStream> {
     let DefineRouteInput {
@@ -48,29 +46,13 @@ fn flatten_entries(
 ) -> Result<()> {
     for entry in entries {
         match entry {
-            DefineRouteEntry::Service {
-                method,
-                path,
-                ty,
-                kind,
-                capacity,
-            } => {
-                if let Some(cap) = capacity.as_ref()
-                    && matches!(kind, RouteKind::Sync)
-                {
-                    return Err(syn::Error::new_spanned(
-                        cap,
-                        "`capacity` applies only to `async` or `stream` routes",
-                    ));
-                }
+            DefineRouteEntry::Service { method, path, ty } => {
                 let full = format!("{prefix}{}", path.value());
                 out.push(AppRouteInput {
                     route: ty,
                     method,
                     path: LitStr::new(&full, path.span()),
                     wraps: inherited_wraps.to_vec(),
-                    kind,
-                    capacity,
                 });
             }
             DefineRouteEntry::Scope {

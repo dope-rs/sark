@@ -1,18 +1,21 @@
 use http::StatusCode;
 
-use super::{Chunked, FixedResponseInner, HotBodyInner, HotHeadInner, MonoResponseInner, Response};
+use super::{
+    Chunked, DEFAULT_HEADER_CAPACITY, FixedResponseInner, HotBodyInner, HotHeadInner,
+    MonoResponseInner, Response,
+};
 
 #[allow(clippy::large_enum_variant)]
 #[derive(Clone, Debug)]
-pub enum ServeInner<'req> {
+pub enum ServeInner<'req, const N: usize = DEFAULT_HEADER_CAPACITY> {
     Chunked(Chunked),
-    Fixed(FixedResponseInner<'req>),
-    Mono(MonoResponseInner<'req>),
+    Fixed(FixedResponseInner<'req, N>),
+    Mono(MonoResponseInner<'req, N>),
 }
 
 pub type Serve = ServeInner<'static>;
 
-impl<'req> ServeInner<'req> {
+impl<'req, const N: usize> ServeInner<'req, N> {
     pub fn status(&self) -> StatusCode {
         match self {
             Self::Chunked(response) => response.status(),
@@ -38,7 +41,7 @@ impl From<Response> for ServeInner<'static> {
             return Self::Chunked(Chunked::from_parts(
                 value.status,
                 value.headers,
-                value.wire_headers.freeze(),
+                o3::buffer::Shared::from(value.wire_headers),
                 parts,
             ));
         }
@@ -50,33 +53,29 @@ impl From<Response> for ServeInner<'static> {
         Self::Mono(MonoResponseInner {
             status: value.status,
             headers,
-            head: HotHeadInner::Wire(value.wire_headers.freeze()),
+            head: HotHeadInner::Wire(o3::buffer::Shared::from(value.wire_headers)),
             body: HotBodyInner::from(value.body),
         })
     }
 }
 
-impl<'req> From<MonoResponseInner<'req>> for ServeInner<'req> {
-    fn from(value: MonoResponseInner<'req>) -> Self {
+impl<'req, const N: usize> From<MonoResponseInner<'req, N>> for ServeInner<'req, N> {
+    fn from(value: MonoResponseInner<'req, N>) -> Self {
         Self::Mono(value)
     }
 }
 
-impl<'req> From<FixedResponseInner<'req>> for ServeInner<'req> {
-    fn from(value: FixedResponseInner<'req>) -> Self {
+impl<'req, const N: usize> From<FixedResponseInner<'req, N>> for ServeInner<'req, N> {
+    fn from(value: FixedResponseInner<'req, N>) -> Self {
         Self::Fixed(value)
     }
 }
 
-pub trait IntoServeResponse<'req> {
-    fn into_serve_response(self) -> ServeInner<'req>;
+pub trait IntoServeResponse<'req, const N: usize = 4> {
+    fn into_serve_response(self) -> ServeInner<'req, N>;
 }
 
-pub trait IntoServeResponseStatic<'req> {
-    fn into_serve_response_static(self) -> ServeInner<'req>;
-}
-
-impl<'req> IntoServeResponse<'req> for ServeInner<'req> {
+impl<'req, const N: usize> IntoServeResponse<'req, N> for ServeInner<'req, N> {
     fn into_serve_response(self) -> Self {
         self
     }
@@ -88,14 +87,14 @@ impl IntoServeResponse<'static> for Response {
     }
 }
 
-impl<'req> IntoServeResponse<'req> for MonoResponseInner<'req> {
-    fn into_serve_response(self) -> ServeInner<'req> {
+impl<'req, const N: usize> IntoServeResponse<'req, N> for MonoResponseInner<'req, N> {
+    fn into_serve_response(self) -> ServeInner<'req, N> {
         ServeInner::Mono(self)
     }
 }
 
-impl<'req> IntoServeResponse<'req> for FixedResponseInner<'req> {
-    fn into_serve_response(self) -> ServeInner<'req> {
+impl<'req, const N: usize> IntoServeResponse<'req, N> for FixedResponseInner<'req, N> {
+    fn into_serve_response(self) -> ServeInner<'req, N> {
         ServeInner::Fixed(self)
     }
 }

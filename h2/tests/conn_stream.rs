@@ -1032,6 +1032,155 @@ fn client_push_promise_recv_registers_promised_stream() {
 }
 
 #[test]
+fn fragmented_push_promise_respects_stream_capacity() {
+    let mut conn = Conn::<ClientRole>::with_config(conn::Config {
+        local_settings: Settings::DEFAULT,
+        recv_window_target: 65_535,
+        stream_capacity: 2,
+        ..conn::Config::default()
+    });
+    prime_client(&mut conn);
+    conn.start_request(
+        &[
+            Header {
+                name: b":method",
+                value: b"GET",
+            },
+            Header {
+                name: b":scheme",
+                value: b"http",
+            },
+            Header {
+                name: b":path",
+                value: b"/",
+            },
+            Header {
+                name: b":authority",
+                value: b"x",
+            },
+        ],
+        true,
+    )
+    .unwrap();
+    conn.drain_outbound(conn.outbound().len());
+
+    let block = full_block();
+    conn.ingest(&push_promise_bytes(1, 2, false, &block[..1]))
+        .unwrap();
+    conn.ingest(&continuation_bytes(1, true, &block[1..]))
+        .unwrap();
+    assert_eq!(
+        conn.stream_state(StreamId(2)),
+        Some(stream::State::ReservedRemote)
+    );
+
+    while conn.poll_event().is_some() {}
+    conn.ingest(&push_promise_bytes(1, 4, true, &block))
+        .unwrap();
+    assert_eq!(
+        first_outbound_rst(conn.outbound()),
+        Some((StreamId(4), ErrorCode::RefusedStream))
+    );
+    assert!(!conn.has_stream(StreamId(4)));
+}
+
+#[test]
+fn resource_capacity_is_reused_after_stream_close() {
+    let mut local = Settings::DEFAULT;
+    local.max_concurrent_streams = Some(10);
+    let mut conn = Conn::<ServerRole>::with_config(conn::Config {
+        local_settings: local,
+        recv_window_target: 65_535,
+        stream_capacity: 1,
+        ..conn::Config::default()
+    });
+    prime_server(&mut conn);
+    let block = full_block();
+
+    conn.ingest(&headers_frame_bytes(1, true, true, &block))
+        .unwrap();
+    while conn.poll_event().is_some() {}
+    conn.drain_outbound(conn.outbound().len());
+    conn.ingest(&headers_frame_bytes(3, true, true, &block))
+        .unwrap();
+    assert_eq!(
+        first_outbound_rst(conn.outbound()),
+        Some((StreamId(3), ErrorCode::RefusedStream))
+    );
+
+    conn.send_response(
+        StreamId(1),
+        [Header {
+            name: b":status",
+            value: b"200",
+        }],
+        true,
+    )
+    .unwrap();
+    assert_eq!(conn.active_count(), 0);
+    conn.drain_outbound(conn.outbound().len());
+    conn.ingest(&headers_frame_bytes(5, true, true, &block))
+        .unwrap();
+    assert!(conn.has_stream(StreamId(5)));
+}
+
+#[test]
+fn peer_limit_is_reused_after_local_stream_close() {
+    let mut conn = Conn::<ClientRole>::with_config(conn::Config {
+        local_settings: Settings::DEFAULT,
+        recv_window_target: 65_535,
+        stream_capacity: 2,
+        ..conn::Config::default()
+    });
+    prime_client(&mut conn);
+    conn.ingest(&settings_frame_bytes(
+        &[(SettingId::MaxConcurrentStreams as u16, 1)],
+        false,
+    ))
+    .unwrap();
+    while conn.poll_event().is_some() {}
+
+    let request = [Header {
+        name: b":method",
+        value: b"GET",
+    }];
+    assert_eq!(conn.start_request(&request, true).unwrap(), StreamId(1));
+    assert_eq!(
+        conn.start_request(&request, true),
+        Err(ConnError::StreamLimit)
+    );
+
+    let response = encode_hpack(&[Header {
+        name: b":status",
+        value: b"200",
+    }]);
+    conn.ingest(&headers_frame_bytes(1, true, true, &response))
+        .unwrap();
+    while conn.poll_event().is_some() {}
+    assert_eq!(conn.start_request(&request, true).unwrap(), StreamId(3));
+}
+
+#[test]
+fn zero_protocol_limit_keeps_resource_capacity_valid() {
+    let mut local = Settings::DEFAULT;
+    local.max_concurrent_streams = Some(0);
+    let mut conn = Conn::<ServerRole>::with_config(conn::Config {
+        local_settings: local,
+        recv_window_target: 65_535,
+        stream_capacity: 1,
+        ..conn::Config::default()
+    });
+    prime_server(&mut conn);
+    conn.ingest(&headers_frame_bytes(1, true, true, &full_block()))
+        .unwrap();
+    assert_eq!(conn.active_count(), 0);
+    assert_eq!(
+        first_outbound_rst(conn.outbound()),
+        Some((StreamId(1), ErrorCode::RefusedStream))
+    );
+}
+
+#[test]
 fn goaway_last_stream_id_reflects_highest_peer_id() {
     let mut conn = server();
     prime_server(&mut conn);
@@ -1065,7 +1214,7 @@ fn goaway_last_stream_id_reflects_highest_peer_id() {
     let _ = conn.poll_event().unwrap();
 
     conn.drain_outbound(conn.outbound().len());
-    conn.goaway(ErrorCode::NoError, b"bye");
+    conn.goaway(ErrorCode::NoError, b"bye").unwrap();
 
     let out = conn.outbound();
     let h = FrameHeader::parse(out).unwrap();
@@ -1447,7 +1596,7 @@ fn continuation_flood_exceeding_header_cap_rejected() {
 fn post_goaway_peer_headers_refused_not_fatal() {
     let mut conn = server();
     prime_server(&mut conn);
-    conn.goaway(ErrorCode::NoError, b"");
+    conn.goaway(ErrorCode::NoError, b"").unwrap();
     conn.drain_outbound(conn.outbound().len());
 
     let block = full_block();

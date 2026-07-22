@@ -8,7 +8,7 @@ use super::apply::{
     ae_line, apply_accept_encoding, apply_connection, apply_content_length, apply_expect,
     apply_host, apply_transfer_encoding, clen_line, conn_line, expect_line, host_line, te_line,
 };
-use super::byte::{is_header_name_byte, trim_ws_range, value_has_forbidden_byte};
+use super::byte::trim_ws_range;
 use super::error::{
     ERR_HEADER_LINE_TOO_LONG, ERR_INVALID_HEADER_NAME, ERR_INVALID_HEADER_VALUE,
     ERR_TOO_MANY_HEADERS, bad_request,
@@ -18,6 +18,7 @@ use super::input::{BytesScan, HeadInput, HeaderLineScan};
 use super::visitor::{Known, Visitor};
 use crate::error::Result;
 use crate::http::codec;
+use sark_protocol::is_header_name_byte;
 
 const MATCH_MASK: u64 = u64::from_le_bytes([0x20, 0x20, 0x20, 0x20, 0x20, 0xff, 0xff, 0xff]);
 const PROBE_HOST: u64 = 18446743225259749224u64;
@@ -227,12 +228,13 @@ fn unknown_fast_skip<V: Visitor>(
     header_count: &mut usize,
     max_header_count: usize,
 ) -> Result<Option<usize>> {
-    let Some(line_end) = BytesScan::find_crlf_from(bytes, colon_idx + 1) else {
-        return Ok(None);
+    let line_end = match crate::simd::scan_header_value(bytes, colon_idx + 1) {
+        crate::simd::HeaderValueOutcome::Found { pos } => pos,
+        crate::simd::HeaderValueOutcome::Invalid => {
+            return Err(bad_request(ERR_INVALID_HEADER_VALUE));
+        }
+        crate::simd::HeaderValueOutcome::None => return Ok(None),
     };
-    if value_has_forbidden_byte(&bytes[colon_idx + 1..line_end]) {
-        return Err(bad_request(ERR_INVALID_HEADER_VALUE));
-    }
     if *header_count == max_header_count {
         return Err(bad_request(ERR_TOO_MANY_HEADERS));
     }
@@ -247,7 +249,7 @@ fn ua_tail_matches(rest: &[u8]) -> bool {
     rest.len() >= 11
         && {
             (u32::from_le_bytes(rest[5..9].try_into().unwrap()) | 0x20202020u32)
-                == u32::from_le_bytes([b'a', b'g', b'e', b'n'])
+                == u32::from_le_bytes(*b"agen")
         }
         && (rest[9] | 0x20) == b't'
         && rest[10] == b':'

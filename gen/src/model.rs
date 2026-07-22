@@ -1,31 +1,9 @@
 use syn::{Ident, LitStr, Type, TypePath, Visibility};
 
 #[derive(Clone, Copy, PartialEq, Eq, Default)]
-pub(super) enum ResponseKind {
-    #[default]
-    Inline,
-    Static,
-    Stream,
-}
-
-#[derive(Clone, Copy, PartialEq, Eq, Default)]
-pub(super) enum RequestKind {
-    #[default]
-    Inline,
-    Spilled,
-}
-
-#[derive(Clone, Copy, PartialEq, Eq, Default)]
 pub(super) struct HeadSkip {
     pub(super) date: bool,
     pub(super) server: bool,
-}
-
-#[derive(Clone, Copy, PartialEq, Eq)]
-pub(super) enum RouteKind {
-    Sync,
-    Fiber,
-    Stream,
 }
 
 pub(super) struct AppRouteInput {
@@ -33,8 +11,6 @@ pub(super) struct AppRouteInput {
     pub(super) method: Ident,
     pub(super) path: LitStr,
     pub(super) wraps: Vec<TypePath>,
-    pub(super) kind: RouteKind,
-    pub(super) capacity: Option<syn::LitInt>,
 }
 
 pub(super) struct AppDispatchInput {
@@ -56,8 +32,6 @@ pub(super) enum DefineRouteEntry {
         method: Ident,
         path: LitStr,
         ty: TypePath,
-        kind: RouteKind,
-        capacity: Option<syn::LitInt>,
     },
     Scope {
         prefix: LitStr,

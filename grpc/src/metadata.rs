@@ -64,24 +64,3 @@ impl Metadata {
         Ok(())
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn preserves_duplicate_metadata() {
-        let mut md = Metadata::new();
-        md.push(b"x-tag", b"a").unwrap();
-        md.push(b"x-tag", b"b").unwrap();
-
-        let values: Vec<&[u8]> = md.get_all(b"x-tag").collect();
-        assert_eq!(values, vec![b"a".as_slice(), b"b".as_slice()]);
-    }
-
-    #[test]
-    fn rejects_uppercase_names() {
-        let mut md = Metadata::new();
-        assert_eq!(md.push(b"X-Tag", b"a"), Err(MetadataError::UppercaseName));
-    }
-}

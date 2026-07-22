@@ -1,8 +1,9 @@
-use dope::Driver;
+use dope::DriverContext;
 use dope::manifold::Outcome;
-use dope::manifold::listener::{self, Application};
-use dope::transport::link::Slot;
-use dope::transport::wire::{Identity, RecvChunk};
+use dope::manifold::listener::{self, Application, SlotEgress};
+use dope_net::link::slot::Slot;
+use dope_net::wire::identity::Identity;
+use o3::buffer::RetainBytes;
 
 use crate::crypto::Crypto;
 use crate::fragment::{FragmentBuffer, Push};
@@ -152,14 +153,9 @@ impl<'a> Response<'a> {
     }
 }
 
-/// Byte source for [`App::drive_frames_over`], monomorphized over the buffered
-/// ([`AccSource`]) and zero-copy ([`ChunkSource`]) paths.
 trait FrameSource {
     fn bytes(&self) -> &[u8];
-    /// Unmask `[start, end)` (masked with `mask`) and return it; valid until the
-    /// next call.
     fn unmask(&mut self, start: usize, end: usize, mask: [u8; 4]) -> &[u8];
-    /// Finalize after `pos` bytes of [`bytes`](Self::bytes) were consumed.
     fn commit(&mut self, pos: usize);
 }
 
@@ -172,7 +168,7 @@ impl FrameSource for AccSource<'_> {
         self.acc
     }
     fn unmask(&mut self, start: usize, end: usize, mask: [u8; 4]) -> &[u8] {
-        Mask::unmask_inline(&mut self.acc[start..end], mask);
+        Mask::unmask_in_place(&mut self.acc[start..end], mask);
         &self.acc[start..end]
     }
     fn commit(&mut self, pos: usize) {
@@ -180,9 +176,6 @@ impl FrameSource for AccSource<'_> {
     }
 }
 
-/// Parses straight from the read-only recv `chunk`, unmask-copying each payload
-/// into reusable `scratch`. [`commit`](FrameSource::commit) stashes only the
-/// trailing partial frame — still masked — into `acc` for the next recv.
 struct ChunkSource<'a> {
     chunk: &'a [u8],
     scratch: &'a mut Vec<u8>,
@@ -208,24 +201,23 @@ impl FrameSource for ChunkSource<'_> {
 }
 
 pub trait Handler: Clone + 'static {
-    fn on_message<'a>(&self, msg: Message<'a>, response: &mut Response<'_>);
+    fn message<'a>(&self, msg: Message<'a>, response: &mut Response<'_>);
 }
 
 impl<F> Handler for F
 where
     F: Fn(Message<'_>, &mut Response<'_>) + Clone + 'static,
 {
-    fn on_message<'a>(&self, msg: Message<'a>, response: &mut Response<'_>) {
+    fn message<'a>(&self, msg: Message<'a>, response: &mut Response<'_>) {
         (self)(msg, response)
     }
 }
 
+#[pin_project::pin_project]
 pub struct App<H: Handler> {
     user: H,
     expected_path: &'static str,
     max_frame_payload: usize,
-    /// Per-worker unmask scratch for the zero-copy path; grows to the largest
-    /// payload seen.
     scratch: Vec<u8>,
 }
 
@@ -239,75 +231,73 @@ impl<H: Handler> App<H> {
         }
     }
 
-    #[inline]
     fn frame_cap(&self) -> usize {
         self.max_frame_payload.min(WS_MAX_MESSAGE)
     }
 }
 
-impl<H: Handler> Application for App<H> {
+impl<'d, H: Handler> Application<'d> for App<H> {
     type Conn = ConnState;
     type Wire = Identity;
 
-    fn on_chunk(
-        &mut self,
-        slot: &mut Slot<Identity, listener::State<ConnState>>,
-        chunk: RecvChunk<'_>,
+    fn chunk<R: RetainBytes>(
+        self: std::pin::Pin<&mut Self>,
+        slot: &mut Slot<'d, Identity, listener::State<ConnState>>,
+        chunk: R,
         aux: &mut listener::Aux,
-        driver: &mut Driver,
+        driver: &mut DriverContext<'_, 'd>,
     ) -> Outcome {
-        self.on_chunk_proj(slot, identity_mut, chunk, aux, driver)
+        self.get_mut()
+            .chunk_proj(slot, identity_mut, chunk, aux, driver)
     }
 
-    fn on_send(
-        &mut self,
-        slot: &mut Slot<Identity, listener::State<ConnState>>,
+    fn send(
+        self: std::pin::Pin<&mut Self>,
+        slot: &mut Slot<'d, Identity, listener::State<ConnState>>,
         sent: usize,
         aux: &mut listener::Aux,
-        driver: &mut Driver,
+        driver: &mut DriverContext<'_, 'd>,
     ) {
-        self.on_send_proj(slot, sent, identity_mut, aux, driver)
+        self.get_mut()
+            .send_proj(slot, sent, identity_mut, aux, driver)
     }
 
-    fn on_close(
-        &mut self,
-        _slot: &mut Slot<Identity, listener::State<ConnState>>,
+    fn close(
+        self: std::pin::Pin<&mut Self>,
+        _slot: &mut Slot<'d, Identity, listener::State<ConnState>>,
         _aux: &mut listener::Aux,
     ) {
     }
 }
 
 impl<H: Handler> App<H> {
-    pub fn on_chunk_proj<C: Default + 'static>(
+    pub fn chunk_proj<'d, C: Default + 'static, R: RetainBytes>(
         &mut self,
-        slot: &mut Slot<Identity, listener::State<C>>,
+        slot: &mut Slot<'d, Identity, listener::State<C>>,
         project: impl Fn(&mut C) -> &mut ConnState,
-        chunk: RecvChunk<'_>,
+        chunk: R,
         aux: &mut listener::Aux,
-        driver: &mut Driver,
+        driver: &mut DriverContext<'_, 'd>,
     ) -> Outcome {
         if project(&mut slot.state.conn).phase == Phase::Closed {
             return Outcome::Ok;
         }
         let chunk = chunk.as_slice();
 
-        // Zero-copy when nothing is buffered and no send is in flight: parse the
-        // recv chunk in place. A leftover partial frame or send backpressure
-        // falls through to the buffered path, which keeps the WS_MAX_ACC bound.
         let fast = {
             let state = project(&mut slot.state.conn);
             state.phase == Phase::Active && state.acc.is_empty()
-        } && !slot.core.is_send_inflight()
+        } && !slot.is_send_inflight()
             && chunk.len() <= WS_MAX_ACC;
 
         if fast {
             let send_ud = slot.token();
-            let write_buf = aux.write_buf_for(slot);
+            let mut write_buf = aux.write_buf_for(slot);
             let frame_cap = self.frame_cap();
             let user = &self.user;
             let scratch = &mut self.scratch;
             let (written, closed) = {
-                let mut response = Response::new(&mut *write_buf);
+                let mut response = Response::new(&mut write_buf);
                 let state = project(&mut slot.state.conn);
                 let src = ChunkSource {
                     chunk,
@@ -327,7 +317,7 @@ impl<H: Handler> App<H> {
                 (response.written, closed)
             };
             if closed {
-                slot.core.set_close_after();
+                slot.set_close_after();
             }
             if written > 0 {
                 slot.submit_buffered(write_buf, written, send_ud, driver);
@@ -340,41 +330,41 @@ impl<H: Handler> App<H> {
             let state = project(&mut slot.state.conn);
             state.phase = Phase::Closed;
             state.acc = Vec::new();
-            if !slot.core.is_send_inflight() {
+            if !slot.is_send_inflight() {
                 self.emit_close_proj(slot, CLOSE_MESSAGE_TOO_BIG, aux, driver, &project);
             }
             return Outcome::CloseAfter;
         }
-        if !slot.core.is_send_inflight() {
+        if !slot.is_send_inflight() {
             self.pump_proj(slot, aux, driver, &project);
         }
         Outcome::Ok
     }
 
-    pub fn on_send_proj<C: Default + 'static>(
+    pub fn send_proj<'d, C: Default + 'static>(
         &mut self,
-        slot: &mut Slot<Identity, listener::State<C>>,
+        slot: &mut Slot<'d, Identity, listener::State<C>>,
         _sent: usize,
         project: impl Fn(&mut C) -> &mut ConnState,
         aux: &mut listener::Aux,
-        driver: &mut Driver,
+        driver: &mut DriverContext<'_, 'd>,
     ) {
         if project(&mut slot.state.conn).phase != Phase::Closed {
             self.pump_proj(slot, aux, driver, &project);
         }
     }
 
-    fn pump_proj<C: Default + 'static, P: Fn(&mut C) -> &mut ConnState>(
+    fn pump_proj<'d, C: Default + 'static, P: Fn(&mut C) -> &mut ConnState>(
         &self,
-        slot: &mut Slot<Identity, listener::State<C>>,
+        slot: &mut Slot<'d, Identity, listener::State<C>>,
         aux: &mut listener::Aux,
-        driver: &mut Driver,
+        driver: &mut DriverContext<'_, 'd>,
         project: &P,
     ) {
         let send_ud = slot.token();
-        let write_buf = aux.write_buf_for(slot);
+        let mut write_buf = aux.write_buf_for(slot);
         let (written, close_after) = {
-            let mut response = Response::new(&mut *write_buf);
+            let mut response = Response::new(&mut write_buf);
             let state = project(&mut slot.state.conn);
             if state.phase == Phase::Handshake {
                 self.try_handshake(state, &mut response);
@@ -385,29 +375,29 @@ impl<H: Handler> App<H> {
             (response.written, response.close_after)
         };
         if close_after {
-            slot.core.set_close_after();
+            slot.set_close_after();
         }
         if written > 0 {
             slot.submit_buffered(write_buf, written, send_ud, driver);
         }
     }
 
-    fn emit_close_proj<C: Default + 'static, P: Fn(&mut C) -> &mut ConnState>(
+    fn emit_close_proj<'d, C: Default + 'static, P: Fn(&mut C) -> &mut ConnState>(
         &self,
-        slot: &mut Slot<Identity, listener::State<C>>,
+        slot: &mut Slot<'d, Identity, listener::State<C>>,
         code: u16,
         aux: &mut listener::Aux,
-        driver: &mut Driver,
+        driver: &mut DriverContext<'_, 'd>,
         _project: &P,
     ) {
         let send_ud = slot.token();
-        let write_buf = aux.write_buf_for(slot);
+        let mut write_buf = aux.write_buf_for(slot);
         let written = {
-            let mut response = Response::new(&mut *write_buf);
+            let mut response = Response::new(&mut write_buf);
             response.send_close_code(code);
             response.written
         };
-        slot.core.set_close_after();
+        slot.set_close_after();
         if written > 0 {
             slot.submit_buffered(write_buf, written, send_ud, driver);
         }
@@ -511,8 +501,6 @@ impl<H: Handler> App<H> {
         }
     }
 
-    /// The single framing loop, monomorphized over [`FrameSource`]: parse, unmask,
-    /// handle control/fragment frames, dispatch data. Returns whether to close.
     fn drive_frames_over<S: FrameSource>(
         user: &H,
         frame_cap: usize,
@@ -584,10 +572,10 @@ impl<H: Handler> App<H> {
     fn dispatch(user: &H, opcode: u8, payload: &[u8], response: &mut Response<'_>) {
         match opcode {
             0x1 => match std::str::from_utf8(payload) {
-                Ok(s) => user.on_message(Message::Text(s), response),
+                Ok(s) => user.message(Message::Text(s), response),
                 Err(_) => response.send_close_code(CLOSE_INVALID_PAYLOAD),
             },
-            0x2 => user.on_message(Message::Binary(payload), response),
+            0x2 => user.message(Message::Binary(payload), response),
             _ => response.send_close_code(CLOSE_PROTOCOL_ERROR),
         }
     }

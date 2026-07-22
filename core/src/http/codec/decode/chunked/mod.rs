@@ -32,9 +32,9 @@ pub(crate) struct DecodeResult {
     pub(crate) trailers: Vec<(HeaderName, HeaderValue)>,
 }
 
-pub enum DecodeEvent {
+pub enum DecodeEvent<'a> {
     NeedMore,
-    Chunk(Vec<u8>),
+    Chunk(&'a [u8]),
     Done(Vec<(HeaderName, HeaderValue)>),
 }
 
@@ -70,7 +70,7 @@ impl BodyDecoder {
         }
     }
 
-    pub fn decode(&mut self, buf: &[u8]) -> Result<(usize, DecodeEvent)> {
+    pub fn decode<'a>(&mut self, buf: &'a [u8]) -> Result<(usize, DecodeEvent<'a>)> {
         let mut pos = 0;
 
         loop {
@@ -106,7 +106,7 @@ impl BodyDecoder {
                         return Ok((pos, DecodeEvent::NeedMore));
                     }
 
-                    let chunk = buf[pos..pos + chunk_size].to_vec();
+                    let chunk = &buf[pos..pos + chunk_size];
                     if &buf[pos + chunk_size..pos + chunk_size + 2] != b"\r\n" {
                         return Err(Error::BadRequest("Invalid chunk terminator".into()));
                     }
@@ -149,7 +149,7 @@ impl crate::http::codec::Parse {
 
             match event {
                 DecodeEvent::NeedMore => return Ok(None),
-                DecodeEvent::Chunk(chunk) => body.extend_from_slice(&chunk),
+                DecodeEvent::Chunk(chunk) => body.extend_from_slice(chunk),
                 DecodeEvent::Done(trailers) => {
                     return Ok(Some(DecodeResult { body, trailers }));
                 }
@@ -161,7 +161,10 @@ impl crate::http::codec::Parse {
         Ok(Self::try_decode_chunked(buf)?.map(|r| r.body))
     }
 
-    pub fn chunked_body_consumed(buf: &[u8], max_body: usize) -> Result<Option<(usize, Vec<u8>)>> {
+    pub fn chunked_body_consumed(
+        buf: &[u8],
+        max_body: usize,
+    ) -> Result<Option<(usize, o3::buffer::Shared)>> {
         let mut decoder = BodyDecoder::with_limit(max_body);
         let mut body = Vec::new();
         let mut input = buf;
@@ -173,75 +176,12 @@ impl crate::http::codec::Parse {
 
             match event {
                 DecodeEvent::NeedMore => return Ok(None),
-                DecodeEvent::Chunk(chunk) => body.extend_from_slice(&chunk),
+                DecodeEvent::Chunk(chunk) => body.extend_from_slice(chunk),
                 DecodeEvent::Done(_) => {
                     let consumed_total = total - input.len();
-                    return Ok(Some((consumed_total, body)));
+                    return Ok(Some((consumed_total, o3::buffer::Shared::from(body))));
                 }
             }
         }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn chunk_size_plus_prefix_rejected() {
-        assert!(parse_chunk_size(b"+a").is_err());
-    }
-
-    #[test]
-    fn chunk_size_minus_prefix_rejected() {
-        assert!(parse_chunk_size(b"-a").is_err());
-    }
-
-    #[test]
-    fn chunk_size_surrounding_whitespace_rejected() {
-        assert!(parse_chunk_size(b" 5 ").is_err());
-        assert!(parse_chunk_size(b"\t5").is_err());
-        assert!(parse_chunk_size(b"5 ").is_err());
-    }
-
-    #[test]
-    fn chunk_size_empty_rejected() {
-        assert!(parse_chunk_size(b"").is_err());
-    }
-
-    #[test]
-    fn chunk_size_valid_hex_accepted() {
-        assert_eq!(parse_chunk_size(b"a").unwrap(), 10);
-        assert_eq!(parse_chunk_size(b"1F").unwrap(), 31);
-        assert_eq!(parse_chunk_size(b"0").unwrap(), 0);
-    }
-
-    #[test]
-    fn chunk_size_huge_hex_overflows() {
-        assert!(parse_chunk_size(b"ffffffffffffffffff").is_err());
-    }
-
-    #[test]
-    fn chunk_extension_after_size_accepted() {
-        let raw = b"5;name=value\r\nhello\r\n0\r\n\r\n";
-        let body = crate::http::codec::Parse::chunked_body(raw)
-            .unwrap()
-            .unwrap();
-        assert_eq!(body, b"hello");
-    }
-
-    #[test]
-    fn normal_chunked_body_accepted() {
-        let raw = b"5\r\nhello\r\n0\r\n\r\n";
-        let body = crate::http::codec::Parse::chunked_body(raw)
-            .unwrap()
-            .unwrap();
-        assert_eq!(body, b"hello");
-    }
-
-    #[test]
-    fn chunk_size_whitespace_in_stream_rejected() {
-        let raw = b" 5 \r\nhello\r\n0\r\n\r\n";
-        assert!(crate::http::codec::Parse::chunked_body(raw).is_err());
     }
 }

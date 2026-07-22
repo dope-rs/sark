@@ -1,5 +1,4 @@
-use o3::buffer::Shared;
-use sark_core::http::LocalFrameBytes;
+use o3::buffer::{Bytes, Retained, Shared};
 
 use crate::Result;
 use crate::body::InlineToken;
@@ -9,7 +8,8 @@ use crate::scan::Scan;
 pub struct Parse;
 
 impl Parse {
-    pub fn local(owner: Shared, input: &[u8], idx: &mut usize) -> Result<LocalFrameBytes> {
+    pub fn frame(owner: &Shared, idx: &mut usize) -> Result<Bytes<Retained>> {
+        let input = owner.as_slice();
         if *idx >= input.len() {
             return Err(Fail::bad());
         }
@@ -24,15 +24,12 @@ impl Parse {
             let mut esc = raw_start;
             while esc < raw_end {
                 if input[esc] == b'\\' {
-                    let decoded = Scan::decode_str(&input[raw_start..raw_end])?;
-                    return Ok(LocalFrameBytes::from_shared(Shared::from(decoded)));
+                    let decoded = Shared::from(Scan::decode_str(&input[raw_start..raw_end])?);
+                    return Ok(Bytes::<Retained>::from(decoded));
                 }
                 esc += 1;
             }
-            return Ok(LocalFrameBytes::from_shared_range(
-                owner,
-                raw_start..raw_end,
-            ));
+            return Ok(Bytes::<Retained>::from(owner.slice(raw_start..raw_end)));
         }
         let start = *idx;
         Scan::skip_value(input, idx)?;
@@ -40,14 +37,15 @@ impl Parse {
         if end <= start {
             return Err(Fail::bad());
         }
-        Ok(LocalFrameBytes::from_shared_range(owner, start..end))
+        Ok(Bytes::<Retained>::from(owner.slice(start..end)))
     }
 
-    pub fn empty_local() -> LocalFrameBytes {
-        LocalFrameBytes::from_shared(Shared::new())
+    pub fn empty_frame() -> Bytes<Retained> {
+        Bytes::<Retained>::from(Shared::new())
     }
 
-    pub fn local_plain(owner: Shared, input: &[u8], idx: &mut usize) -> Result<LocalFrameBytes> {
+    pub fn frame_plain(owner: &Shared, idx: &mut usize) -> Result<Bytes<Retained>> {
+        let input = owner.as_slice();
         Scan::expect_byte(input, idx, b'"')?;
         let start = *idx;
         while *idx < input.len() {
@@ -55,7 +53,7 @@ impl Parse {
                 b'"' => {
                     let end = *idx;
                     *idx += 1;
-                    return Ok(LocalFrameBytes::from_shared_range(owner, start..end));
+                    return Ok(Bytes::<Retained>::from(owner.slice(start..end)));
                 }
                 b'\\' => return Err(Fail::bad()),
                 _ => *idx += 1,
@@ -83,7 +81,8 @@ impl Parse {
         Err(Fail::bad())
     }
 
-    pub fn local_raw(owner: Shared, input: &[u8], idx: &mut usize) -> Result<LocalFrameBytes> {
+    pub fn frame_raw(owner: &Shared, idx: &mut usize) -> Result<Bytes<Retained>> {
+        let input = owner.as_slice();
         let start = *idx;
         while *idx < input.len() {
             match input[*idx] {
@@ -95,7 +94,7 @@ impl Parse {
         if end <= start {
             return Err(Fail::bad());
         }
-        Ok(LocalFrameBytes::from_shared_range(owner, start..end))
+        Ok(Bytes::<Retained>::from(owner.slice(start..end)))
     }
 
     pub fn inline_raw<const N: usize>(input: &[u8], idx: &mut usize) -> Result<InlineToken<N>> {

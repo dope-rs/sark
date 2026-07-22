@@ -1,267 +1,402 @@
-use std::collections::BTreeMap;
-use std::future::Future;
 use std::marker::PhantomData;
-use std::task::{Context, Poll};
+use std::pin::Pin;
+use std::task::Poll;
 
-use dope::Driver;
-use dope::fiber::{Fiber, Slab, TaskId};
+use dope::DriverContext;
 use dope::manifold::Outcome;
-use dope::manifold::listener::{self, Application};
+use dope::manifold::listener::{self, Application, SlotEgress};
 use dope::runtime::profile::Throughput;
-use dope::transport::link::Slot;
-use dope::transport::wire::{Identity, RecvChunk, Wire};
-use o3::buffer::Shared;
+use dope_fiber::{
+    Context, ErasedTaskId, Fiber, Slab, SlotExt as _, TaskContext, TaskId, TaskQueue, Waker,
+};
+use dope_net::link::slot::Slot;
+use dope_net::wire::Wire;
+use dope_net::wire::identity::Identity;
+use o3::buffer::RetainBytes;
+use o3::collections::{FixedHashTable, FixedQueue};
 
+use super::{Body, Config};
 use crate::conn::{self, Conn, ConnError};
 use crate::frame::ErrorCode;
-use crate::hpack::{Header, OwnedHeader};
+use crate::hpack::{Header, HeaderBlock, OwnedHeader};
 use crate::role::ServerRole;
 use crate::stream::StreamId;
-use crate::tuning::Tuning;
 
 type ServerProfile = Throughput;
 
-pub const HANDLER_SLAB_CAP: usize = 256;
-const OUTBOUND_SOFT_CAP: usize = 64 * 1024;
-const MAX_BODY_LEN: usize = <ServerProfile as Tuning>::MAX_BODY_LEN;
-const MAX_CONN_BUFFERED_LEN: usize = <ServerProfile as Tuning>::MAX_CONN_BUFFERED_LEN;
-
-pub struct Request {
-    pub headers: Vec<OwnedHeader>,
-    pub body: Vec<u8>,
+/// The listener keeps the ready target alive while the returned waker is used.
+unsafe fn rebrand_waker<'from, 'to>(waker: Waker<'from>) -> Waker<'to> {
+    unsafe { std::mem::transmute(waker) }
 }
 
-pub struct Response {
-    pub headers: Vec<OwnedHeader>,
-    pub body: Shared,
-    pub trailers: Vec<OwnedHeader>,
+#[derive(Clone, Copy)]
+struct Limits {
+    max_request_body_bytes: usize,
+    max_connection_body_bytes: usize,
+    max_outbound_bytes: usize,
 }
 
-impl Response {
-    pub fn new(headers: Vec<OwnedHeader>, body: Shared) -> Self {
+impl From<Config> for Limits {
+    fn from(config: Config) -> Self {
         Self {
-            headers,
-            body,
-            trailers: Vec::new(),
+            max_request_body_bytes: config.max_request_body_bytes,
+            max_connection_body_bytes: config.max_connection_body_bytes,
+            max_outbound_bytes: config.max_outbound_bytes,
         }
     }
 }
 
+pub struct Request {
+    pub headers: HeaderBlock,
+    pub body: Vec<u8>,
+}
+
+impl Request {
+    pub fn header(&self, name: &[u8]) -> Option<&[u8]> {
+        self.headers
+            .iter()
+            .find(|header| header.name == name)
+            .map(|header| header.value)
+    }
+
+    pub fn path(&self) -> Option<&[u8]> {
+        self.header(b":path")
+    }
+}
+
+enum ResponseHeaders {
+    Owned(Vec<OwnedHeader>),
+    Static(&'static [Header<'static>]),
+}
+
+pub struct Response {
+    headers: ResponseHeaders,
+    body: Body,
+    pub trailers: Vec<OwnedHeader>,
+}
+
+impl Response {
+    pub fn new(headers: Vec<OwnedHeader>, body: impl Into<Body>) -> Self {
+        Self {
+            headers: ResponseHeaders::Owned(headers),
+            body: body.into(),
+            trailers: Vec::new(),
+        }
+    }
+
+    pub fn from_static(headers: &'static [Header<'static>], body: impl Into<Body>) -> Self {
+        Self {
+            headers: ResponseHeaders::Static(headers),
+            body: body.into(),
+            trailers: Vec::new(),
+        }
+    }
+
+    pub fn text(body: impl Into<Body>) -> Self {
+        const HEADERS: &[Header<'static>] = &[
+            Header::new(b":status", b"200"),
+            Header::new(b"content-type", b"text/plain; charset=utf-8"),
+        ];
+        Self::from_static(HEADERS, body)
+    }
+
+    pub fn body(&self) -> &Body {
+        &self.body
+    }
+}
+
 pub trait Handler: 'static {
-    type Fut<'h>: Future<Output = Response> + 'h
+    type Fut<'h>: Fiber<'h, Output = Response> + 'h
     where
         Self: 'h;
 
-    fn on_request<'h>(&'h self, req: Request) -> Fiber<'h, Self::Fut<'h>>;
+    fn request<'h>(&'h self, request: Request) -> Self::Fut<'h>;
 }
 
-/// A request being assembled across its HEADERS -> DATA* -> trailers event
-/// sequence. Buffered until the terminating end_stream so the handler receives
-/// the complete header list and body in one `Request`.
+pub trait SyncHandler: 'static {
+    fn request(&self, request: Request) -> Response;
+}
+
+impl<F> SyncHandler for F
+where
+    F: Fn(Request) -> Response + 'static,
+{
+    fn request(&self, request: Request) -> Response {
+        self(request)
+    }
+}
+
 struct Incoming {
-    headers: Vec<OwnedHeader>,
+    stream_id: StreamId,
+    headers: HeaderBlock,
     body: Vec<u8>,
 }
 
 impl From<Incoming> for Request {
-    fn from(inc: Incoming) -> Self {
-        Request {
-            headers: inc.headers,
-            body: inc.body,
+    fn from(incoming: Incoming) -> Self {
+        Self {
+            headers: incoming.headers,
+            body: incoming.body,
         }
     }
 }
 
 struct PendingBody {
     stream_id: StreamId,
-    body: Shared,
-    off: usize,
+    body: Body,
+    offset: usize,
     stalled: bool,
     trailers: Vec<OwnedHeader>,
     trailers_sent: bool,
 }
 
 impl PendingBody {
-    fn emit_trailers(&mut self, conn: &mut Conn<ServerRole>) -> Result<(), ConnError> {
+    fn emit_trailers(&mut self, connection: &mut Conn<ServerRole>) -> Result<(), ConnError> {
         if self.trailers.is_empty() || self.trailers_sent {
             return Ok(());
         }
-        let fields: Vec<Header<'_>> = self.trailers.iter().map(|h| h.as_ref()).collect();
-        conn.send_trailers(self.stream_id, &fields)?;
+        let fields: Vec<Header<'_>> = self.trailers.iter().map(OwnedHeader::as_ref).collect();
+        connection.send_trailers(self.stream_id, &fields)?;
         self.trailers_sent = true;
         Ok(())
     }
 
-    fn pump(&mut self, conn: &mut Conn<ServerRole>) -> Result<bool, ConnError> {
+    fn pump(
+        &mut self,
+        connection: &mut Conn<ServerRole>,
+        max_outbound_bytes: usize,
+    ) -> Result<bool, ConnError> {
         loop {
-            if self.off >= self.body.len() {
-                self.emit_trailers(conn)?;
+            if self.offset >= self.body.len() {
+                self.emit_trailers(connection)?;
                 return Ok(true);
             }
-            if conn.outbound().len() >= OUTBOUND_SOFT_CAP {
+            if connection.outbound().len() >= max_outbound_bytes {
                 self.stalled = false;
                 return Ok(false);
             }
-            let rest = &self.body.as_slice()[self.off..];
+            let remaining = &self.body.as_slice()[self.offset..];
             let end_stream = self.trailers.is_empty();
-            let n = conn.send_data(self.stream_id, rest, end_stream)?;
-            if n == 0 {
+            let written = connection.send_data(self.stream_id, remaining, end_stream)?;
+            if written == 0 {
                 self.stalled = true;
                 return Ok(false);
             }
-            self.off += n;
+            self.offset += written;
         }
     }
 }
 
-pub struct ConnState {
-    pub conn: Conn<ServerRole>,
-    incoming: BTreeMap<StreamId, Incoming>,
-    pending: Vec<PendingBody>,
-    waiting: Vec<(StreamId, TaskId)>,
-    buffered_total: usize,
+struct ConnectionState {
+    connection: Conn<ServerRole>,
+    incoming: FixedHashTable<Incoming>,
+    pending: FixedQueue<PendingBody>,
+    buffered_body_bytes: usize,
 }
 
-impl Default for ConnState {
+impl Default for ConnectionState {
     fn default() -> Self {
+        let connection = Conn::<ServerRole>::with_tuning::<ServerProfile>();
+        let capacity = connection.local_settings().max_concurrent_streams.unwrap() as usize;
         Self {
-            conn: Conn::<ServerRole>::with_tuning::<ServerProfile>(),
-            incoming: BTreeMap::new(),
-            pending: Vec::new(),
-            waiting: Vec::new(),
-            buffered_total: 0,
+            connection,
+            incoming: FixedHashTable::with_capacity(capacity),
+            pending: FixedQueue::with_capacity(capacity),
+            buffered_body_bytes: 0,
         }
     }
 }
 
-impl ConnState {
+impl ConnectionState {
+    fn incoming(&self, stream_id: StreamId) -> Option<&Incoming> {
+        self.incoming
+            .get(u64::from(stream_id.0), |entry| entry.stream_id == stream_id)
+    }
+
+    fn incoming_mut(&mut self, stream_id: StreamId) -> Option<&mut Incoming> {
+        self.incoming
+            .get_mut(u64::from(stream_id.0), |entry| entry.stream_id == stream_id)
+    }
+
+    fn insert_incoming(&mut self, incoming: Incoming) -> bool {
+        let stream_id = incoming.stream_id;
+        self.incoming
+            .try_insert(u64::from(stream_id.0), incoming, |entry| {
+                entry.stream_id == stream_id
+            })
+            .is_ok()
+    }
+
     fn take_incoming(&mut self, stream_id: StreamId) -> Option<Incoming> {
-        let inc = self.incoming.remove(&stream_id)?;
-        self.buffered_total = self.buffered_total.saturating_sub(inc.body.len());
-        Some(inc)
+        let incoming = self
+            .incoming
+            .remove(u64::from(stream_id.0), |entry| entry.stream_id == stream_id)?;
+        self.buffered_body_bytes = self.buffered_body_bytes.saturating_sub(incoming.body.len());
+        Some(incoming)
+    }
+
+    fn receive_data(
+        &mut self,
+        stream_id: StreamId,
+        data: &[u8],
+        end_stream: bool,
+        limits: Limits,
+    ) -> Option<Request> {
+        let body_bytes = self
+            .incoming(stream_id)?
+            .body
+            .len()
+            .saturating_add(data.len());
+        let connection_body_bytes = self.buffered_body_bytes.saturating_add(data.len());
+        if body_bytes > limits.max_request_body_bytes
+            || connection_body_bytes > limits.max_connection_body_bytes
+        {
+            self.take_incoming(stream_id);
+            let _ = self
+                .connection
+                .reset_stream(stream_id, ErrorCode::EnhanceYourCalm);
+            return None;
+        }
+        let incoming = self.incoming_mut(stream_id).unwrap();
+        incoming.body.extend_from_slice(data);
+        self.buffered_body_bytes = connection_body_bytes;
+        end_stream
+            .then(|| self.take_incoming(stream_id).map(Request::from))
+            .flatten()
+    }
+
+    fn begin_response(&mut self, stream_id: StreamId, response: Response, limits: Limits) {
+        if !self.connection.has_stream(stream_id) {
+            return;
+        }
+        let has_trailers = !response.trailers.is_empty();
+        let end_stream = response.body.is_empty() && !has_trailers;
+        let sent = match &response.headers {
+            ResponseHeaders::Owned(headers) => self.connection.send_response(
+                stream_id,
+                headers.iter().map(OwnedHeader::as_ref),
+                end_stream,
+            ),
+            ResponseHeaders::Static(headers) => {
+                self.connection
+                    .send_response(stream_id, headers.iter().copied(), end_stream)
+            }
+        };
+        if sent.is_err() || end_stream {
+            return;
+        }
+        let mut body = PendingBody {
+            stream_id,
+            body: response.body,
+            offset: 0,
+            stalled: false,
+            trailers: response.trailers,
+            trailers_sent: false,
+        };
+        match body.pump(&mut self.connection, limits.max_outbound_bytes) {
+            Ok(true) => {}
+            Ok(false) | Err(_) => match self.pending.vacant_entry() {
+                Some(entry) => entry.push_back(body),
+                None => {
+                    let _ = self
+                        .connection
+                        .reset_stream(stream_id, ErrorCode::EnhanceYourCalm);
+                }
+            },
+        }
+    }
+
+    fn resume_pending(&mut self, limits: Limits) {
+        if !self.connection.take_window_opened() {
+            return;
+        }
+        self.pump_pending(limits, true);
+    }
+
+    fn pump_pending(&mut self, limits: Limits, resume: bool) {
+        let len = self.pending.len();
+        for _ in 0..len {
+            let mut body = self.pending.pop_front().unwrap();
+            if resume {
+                body.stalled = false;
+            }
+            if body.stalled || self.connection.outbound().len() >= limits.max_outbound_bytes {
+                self.pending.vacant_entry().unwrap().push_back(body);
+                continue;
+            }
+            if matches!(
+                body.pump(&mut self.connection, limits.max_outbound_bytes),
+                Ok(false)
+            ) {
+                self.pending.vacant_entry().unwrap().push_back(body);
+            }
+        }
+    }
+
+    fn reset_stream(&mut self, stream_id: StreamId) {
+        self.take_incoming(stream_id);
+        self.pending.retain(|body| body.stream_id != stream_id);
     }
 }
 
-pub struct App<'h, H: Handler, W: Wire = Identity> {
-    user: &'h H,
-    slab: Slab<'h, H::Fut<'h>, HANDLER_SLAB_CAP>,
-    _wire: PhantomData<W>,
+trait ConnectionContainer: Default + 'static {
+    fn connection(&mut self) -> &mut ConnectionState;
 }
 
-impl<'h, H: Handler, W: Wire> App<'h, H, W> {
-    pub fn new(user: &'h H) -> Self {
+fn flush_into<'d, W, C>(
+    slot: &mut Slot<'d, W, listener::State<C>>,
+    aux: &mut listener::Aux,
+    driver: &mut DriverContext<'_, 'd>,
+    close_after: bool,
+) where
+    W: Wire,
+    C: ConnectionContainer,
+{
+    let send_token = slot.token();
+    let mut write_buffer = aux.write_buf_for(slot);
+    let state = slot.state.conn.connection();
+    let written = state.connection.drain_into(&mut write_buffer);
+    if close_after {
+        slot.set_close_after();
+    }
+    slot.submit_buffered(write_buffer, written, send_token, driver);
+}
+
+#[derive(Default)]
+pub struct SyncConnState {
+    state: ConnectionState,
+}
+
+impl ConnectionContainer for SyncConnState {
+    fn connection(&mut self) -> &mut ConnectionState {
+        &mut self.state
+    }
+}
+
+pub struct SyncApp<'h, H: SyncHandler, W: Wire = Identity> {
+    user: &'h H,
+    limits: Limits,
+    wire: PhantomData<fn() -> W>,
+}
+
+impl<'h, H: SyncHandler, W: Wire> SyncApp<'h, H, W> {
+    pub fn new(user: &'h H, config: Config) -> Self {
         Self {
             user,
-            slab: Slab::new(),
-            _wire: PhantomData,
+            limits: config.into(),
+            wire: PhantomData,
         }
     }
 
     pub fn handler(&self) -> &H {
         self.user
     }
-}
 
-impl<'h, H: Handler, W: Wire> Application for App<'h, H, W> {
-    type Conn = ConnState;
-    type Wire = W;
-
-    fn on_chunk(
-        &mut self,
-        slot: &mut Slot<W, listener::State<ConnState>>,
-        chunk: RecvChunk<'_>,
-        aux: &mut listener::Aux,
-        driver: &mut Driver,
-    ) -> Outcome {
-        let bytes = chunk.as_slice();
-        let state = &mut slot.state.conn;
-        if state.conn.goaway_sent() || state.conn.goaway_received().is_some() {
-            return Outcome::Ok;
-        }
-        if let Err(e) = state.conn.ingest(bytes) {
-            let code = ErrorCode::from(&e);
-            state.conn.goaway(code, b"");
-            Self::flush_into(slot, aux, driver, true);
-            return Outcome::Ok;
-        }
-        self.drain_events(slot, driver);
-        let close_after = slot.state.conn.conn.goaway_sent();
-        Self::flush_into(slot, aux, driver, close_after);
-        Outcome::Ok
-    }
-
-    fn on_send(
-        &mut self,
-        slot: &mut Slot<W, listener::State<ConnState>>,
-        _sent: usize,
-        aux: &mut listener::Aux,
-        driver: &mut Driver,
-    ) {
-        Self::pump_pending(&mut slot.state.conn);
-        let close_after = slot.state.conn.conn.goaway_sent();
-        if !slot.state.conn.conn.outbound().is_empty() {
-            Self::flush_into(slot, aux, driver, close_after);
-        }
-    }
-
-    fn on_wake(
-        &mut self,
-        slot: &mut Slot<W, listener::State<ConnState>>,
-        aux: &mut listener::Aux,
-        driver: &mut Driver,
-    ) {
-        if slot.state.conn.waiting.is_empty() {
-            return;
-        }
-        let waker = slot.make_waker(driver);
-        let mut cx = Context::from_waker(&waker);
-        let conn_ptr: *mut ConnState = &mut slot.state.conn;
-        // SAFETY: conn_ptr aliases slot.state.conn; the poll loop below touches only state.conn / state.waiting / self.slab through conn_ptr and never re-borrows slot.state.conn via slot (slot is used only for make_waker, already dropped), so &mut ConnState and &mut Slot stay disjoint.
-        let cstate: &mut ConnState = unsafe { &mut *conn_ptr };
-        let mut i = 0;
-        while i < cstate.waiting.len() {
-            let (stream_id, ref task) = cstate.waiting[i];
-            match self.slab.poll(task, &mut cx) {
-                Poll::Ready(resp) => {
-                    let (_, task) = cstate.waiting.swap_remove(i);
-                    self.slab.release(task);
-                    Self::begin_response(cstate, stream_id, resp);
-                }
-                Poll::Pending => i += 1,
-            }
-        }
-        let close_after = cstate.conn.goaway_sent();
-        if !cstate.conn.outbound().is_empty() {
-            Self::flush_into(slot, aux, driver, close_after);
-        }
-    }
-
-    fn on_close(
-        &mut self,
-        slot: &mut Slot<W, listener::State<ConnState>>,
-        _aux: &mut listener::Aux,
-    ) {
-        for (_, task) in slot.state.conn.waiting.drain(..) {
-            self.slab.release(task);
-        }
-        slot.state.conn.pending.clear();
-        slot.state.conn.incoming.clear();
-    }
-}
-
-impl<'h, H: Handler, W: Wire> App<'h, H, W> {
-    fn drain_events(
-        &mut self,
-        slot: &mut Slot<W, listener::State<ConnState>>,
-        driver: &mut Driver,
-    ) {
-        let conn_ptr: *mut ConnState = &mut slot.state.conn;
-        // SAFETY: conn_ptr aliases slot.state.conn; this fn touches slot only via make_waker (which borrows the parker, not state) before re-deriving the waker, and otherwise drives state.conn / self.slab through conn_ptr, keeping &mut ConnState disjoint from any &mut Slot use.
-        let cstate: &mut ConnState = unsafe { &mut *conn_ptr };
-        let waker = slot.make_waker(driver);
-        let mut cx = Context::from_waker(&waker);
-        while let Some(ev) = cstate.conn.poll_event() {
-            match ev {
+    fn drain_events(&self, state: &mut ConnectionState) -> usize {
+        let mut drained = 0;
+        while let Some(event) = state.connection.poll_event() {
+            drained += 1;
+            match event {
                 conn::Event::Headers {
                     stream_id,
                     headers,
@@ -269,24 +404,33 @@ impl<'h, H: Handler, W: Wire> App<'h, H, W> {
                     trailing,
                 } => {
                     if trailing {
-                        if let Some(mut inc) = cstate.take_incoming(stream_id) {
-                            inc.headers.extend(headers);
-                            self.dispatch(cstate, stream_id, inc.into(), &mut cx);
+                        if let Some(mut incoming) = state.take_incoming(stream_id) {
+                            if incoming.headers.append(headers).is_err() {
+                                let _ = state
+                                    .connection
+                                    .reset_stream(stream_id, ErrorCode::EnhanceYourCalm);
+                                continue;
+                            }
+                            let response = self.user.request(incoming.into());
+                            state.begin_response(stream_id, response, self.limits);
                         }
                     } else if end_stream {
-                        let req = Request {
+                        let request = Request {
                             headers,
                             body: Vec::new(),
                         };
-                        self.dispatch(cstate, stream_id, req, &mut cx);
+                        let response = self.user.request(request);
+                        state.begin_response(stream_id, response, self.limits);
                     } else {
-                        cstate.incoming.insert(
+                        if !state.insert_incoming(Incoming {
                             stream_id,
-                            Incoming {
-                                headers,
-                                body: Vec::new(),
-                            },
-                        );
+                            headers,
+                            body: Vec::new(),
+                        }) {
+                            let _ = state
+                                .connection
+                                .reset_stream(stream_id, ErrorCode::EnhanceYourCalm);
+                        }
                     }
                 }
                 conn::Event::Data {
@@ -294,481 +438,786 @@ impl<'h, H: Handler, W: Wire> App<'h, H, W> {
                     data,
                     end_stream,
                 } => {
-                    if end_stream {
-                        if let Some(mut inc) = cstate.take_incoming(stream_id) {
-                            inc.body.extend_from_slice(&data);
-                            self.dispatch(cstate, stream_id, inc.into(), &mut cx);
+                    if let Some(request) =
+                        state.receive_data(stream_id, &data, end_stream, self.limits)
+                    {
+                        let response = self.user.request(request);
+                        state.begin_response(stream_id, response, self.limits);
+                    }
+                }
+                conn::Event::StreamReset { stream_id, .. } => state.reset_stream(stream_id),
+                _ => {}
+            }
+        }
+        state.resume_pending(self.limits);
+        drained
+    }
+}
+
+impl<'d, H: SyncHandler + 'd, W: Wire> Application<'d> for SyncApp<'d, H, W> {
+    type Conn = SyncConnState;
+    type Wire = W;
+
+    fn chunk<R: RetainBytes>(
+        self: Pin<&mut Self>,
+        slot: &mut Slot<'d, W, listener::State<SyncConnState>>,
+        chunk: R,
+        aux: &mut listener::Aux,
+        driver: &mut DriverContext<'_, 'd>,
+    ) -> Outcome {
+        let this = self.get_mut();
+        let state = &mut slot.state.conn.state;
+        if state.connection.goaway_sent() || state.connection.goaway_received().is_some() {
+            return Outcome::Ok;
+        }
+        let mut result = state.connection.ingest(chunk.as_slice());
+        let error = loop {
+            let drained = this.drain_events(state);
+            match result {
+                Ok(()) => break None,
+                Err(conn::ConnError::Overload) if drained != 0 => {
+                    result = state.connection.resume();
+                }
+                Err(error) => break Some(error),
+            }
+        };
+        if let Some(error) = error {
+            let _ = state.connection.goaway(ErrorCode::from(&error), b"");
+            flush_into(slot, aux, driver, true);
+            return Outcome::Ok;
+        }
+        let close_after = slot.state.conn.state.connection.goaway_sent();
+        flush_into(slot, aux, driver, close_after);
+        Outcome::Ok
+    }
+
+    fn send(
+        self: Pin<&mut Self>,
+        slot: &mut Slot<'d, W, listener::State<SyncConnState>>,
+        _sent: usize,
+        aux: &mut listener::Aux,
+        driver: &mut DriverContext<'_, 'd>,
+    ) {
+        let limits = self.get_mut().limits;
+        let state = &mut slot.state.conn.state;
+        state.pump_pending(limits, false);
+        let close_after = state.connection.goaway_sent();
+        if !state.connection.outbound().is_empty() {
+            flush_into(slot, aux, driver, close_after);
+        }
+    }
+
+    fn close(
+        self: Pin<&mut Self>,
+        slot: &mut Slot<'d, W, listener::State<SyncConnState>>,
+        _aux: &mut listener::Aux,
+    ) {
+        let state = &mut slot.state.conn.state;
+        state.pending.clear();
+        state.incoming.clear();
+    }
+}
+
+type TaskTarget = Option<ErasedTaskId>;
+
+struct TaskWake<'d> {
+    task: TaskContext<TaskTarget>,
+    bound: bool,
+    driver: PhantomData<fn(&'d ()) -> &'d ()>,
+}
+
+impl<'d> TaskWake<'d> {
+    fn new() -> Self {
+        Self {
+            task: TaskContext::with_target(None),
+            bound: false,
+            driver: PhantomData,
+        }
+    }
+
+    unsafe fn bind(
+        mut self: Pin<&mut Self>,
+        key: ErasedTaskId,
+        ready: Pin<&TaskQueue<TaskTarget>>,
+        parent: Waker<'_>,
+    ) {
+        let this = unsafe { self.as_mut().get_unchecked_mut() };
+        let task = unsafe { Pin::new_unchecked(&this.task) };
+        let _ = unsafe { task.bind_child(ready, Some(key), parent) };
+        this.bound = true;
+    }
+
+    fn waker(self: Pin<&Self>) -> Waker<'d> {
+        unsafe { self.map_unchecked(|this| &this.task).context_unchecked() }
+    }
+
+    unsafe fn unbind(mut self: Pin<&mut Self>) {
+        let this = unsafe { self.as_mut().get_unchecked_mut() };
+        if !this.bound {
+            return;
+        }
+        unsafe { Pin::new_unchecked(&this.task).unbind() };
+        this.bound = false;
+    }
+
+    fn at_mut(wakes: Pin<&mut [Self]>, index: usize) -> Pin<&mut Self> {
+        unsafe { wakes.map_unchecked_mut(|wakes| &mut wakes[index]) }
+    }
+}
+
+struct UnbindOnDrop<'a, 'd>(Option<Pin<&'a mut TaskWake<'d>>>);
+
+impl Drop for UnbindOnDrop<'_, '_> {
+    fn drop(&mut self) {
+        unsafe { self.0.take().unwrap().unbind() };
+    }
+}
+
+struct RunningTask {
+    connection_id: dope::driver::token::Token,
+    stream_id: StreamId,
+    task: TaskId,
+    key: ErasedTaskId,
+    previous: Option<u32>,
+    next: Option<u32>,
+}
+
+#[derive(Clone, Copy)]
+struct TaskMapEntry {
+    connection_id: dope::driver::token::Token,
+    stream_id: StreamId,
+    index: u32,
+}
+
+struct TaskMap {
+    entries: FixedHashTable<TaskMapEntry>,
+}
+
+impl TaskMap {
+    fn with_capacity(capacity: usize) -> Self {
+        Self {
+            entries: FixedHashTable::with_capacity(capacity),
+        }
+    }
+
+    fn hash(connection_id: dope::driver::token::Token, stream_id: StreamId) -> u64 {
+        let value = connection_id.raw() ^ u64::from(stream_id.0).wrapping_mul(0x9E37_79B9);
+        value.wrapping_mul(0x9E37_79B9_7F4A_7C15)
+    }
+
+    fn insert(
+        &mut self,
+        connection_id: dope::driver::token::Token,
+        stream_id: StreamId,
+        index: usize,
+    ) -> bool {
+        self.entries
+            .try_insert(
+                Self::hash(connection_id, stream_id),
+                TaskMapEntry {
+                    connection_id,
+                    stream_id,
+                    index: index as u32,
+                },
+                |entry| entry.connection_id == connection_id && entry.stream_id == stream_id,
+            )
+            .is_ok()
+    }
+
+    fn remove(
+        &mut self,
+        connection_id: dope::driver::token::Token,
+        stream_id: StreamId,
+    ) -> Option<usize> {
+        self.entries
+            .remove(Self::hash(connection_id, stream_id), |entry| {
+                entry.connection_id == connection_id && entry.stream_id == stream_id
+            })
+            .map(|entry| entry.index as usize)
+    }
+
+    fn get(&self, connection_id: dope::driver::token::Token, stream_id: StreamId) -> Option<usize> {
+        self.entries
+            .get(Self::hash(connection_id, stream_id), |entry| {
+                entry.connection_id == connection_id && entry.stream_id == stream_id
+            })
+            .map(|entry| entry.index as usize)
+    }
+
+    fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+}
+
+pub struct ConnState {
+    state: ConnectionState,
+    ready: TaskQueue<TaskTarget>,
+    task_head: Option<u32>,
+}
+
+impl Default for ConnState {
+    fn default() -> Self {
+        Self {
+            state: ConnectionState::default(),
+            ready: TaskQueue::new(),
+            task_head: None,
+        }
+    }
+}
+
+impl ConnectionContainer for ConnState {
+    fn connection(&mut self) -> &mut ConnectionState {
+        &mut self.state
+    }
+}
+
+impl ConnState {
+    unsafe fn ready_pin(&self) -> Pin<&TaskQueue<TaskTarget>> {
+        unsafe { Pin::new_unchecked(&self.ready) }
+    }
+}
+
+pub struct App<'d, H: Handler + 'd, W: Wire = Identity> {
+    user: &'d H,
+    limits: Limits,
+    slab: Slab<'d, H::Fut<'d>>,
+    tasks: Box<[Option<RunningTask>]>,
+    wakes: Pin<Box<[TaskWake<'d>]>>,
+    task_map: TaskMap,
+    wire: PhantomData<fn() -> W>,
+}
+
+trait TaskPollState<'d, H: Handler + 'd, W: Wire> {
+    fn index(&self) -> usize;
+    fn task<'a>(&'a self, tasks: &'a [Option<RunningTask>]) -> Option<&'a TaskId>;
+    fn release(&mut self, app: &mut App<'d, H, W>, task_head: &mut Option<u32>)
+    -> Option<StreamId>;
+}
+
+struct NewTask {
+    task: Option<TaskId>,
+    index: usize,
+}
+
+impl NewTask {
+    fn new(task: TaskId) -> Self {
+        let index = task.index();
+        Self {
+            task: Some(task),
+            index,
+        }
+    }
+}
+
+impl<'d, H: Handler + 'd, W: Wire> TaskPollState<'d, H, W> for NewTask {
+    fn index(&self) -> usize {
+        self.index
+    }
+
+    fn task<'a>(&'a self, _tasks: &'a [Option<RunningTask>]) -> Option<&'a TaskId> {
+        self.task.as_ref()
+    }
+
+    fn release(
+        &mut self,
+        app: &mut App<'d, H, W>,
+        _task_head: &mut Option<u32>,
+    ) -> Option<StreamId> {
+        let task = self.task.take()?;
+        app.release_bound_task(self.index, task);
+        None
+    }
+}
+
+struct RegisteredTask {
+    index: usize,
+}
+
+impl<'d, H: Handler + 'd, W: Wire> TaskPollState<'d, H, W> for RegisteredTask {
+    fn index(&self) -> usize {
+        self.index
+    }
+
+    fn task<'a>(&'a self, tasks: &'a [Option<RunningTask>]) -> Option<&'a TaskId> {
+        tasks
+            .get(self.index)
+            .and_then(Option::as_ref)
+            .map(|task| &task.task)
+    }
+
+    fn release(
+        &mut self,
+        app: &mut App<'d, H, W>,
+        task_head: &mut Option<u32>,
+    ) -> Option<StreamId> {
+        app.release_task(task_head, self.index)
+    }
+}
+
+struct TaskPoll<'a, 'd, H: Handler + 'd, W: Wire, S: TaskPollState<'d, H, W>> {
+    app: &'a mut App<'d, H, W>,
+    task_head: &'a mut Option<u32>,
+    poll_state: S,
+}
+
+impl<'a, 'd, H, W, S> TaskPoll<'a, 'd, H, W, S>
+where
+    H: Handler + 'd,
+    W: Wire,
+    S: TaskPollState<'d, H, W>,
+{
+    fn new(app: &'a mut App<'d, H, W>, task_head: &'a mut Option<u32>, poll_state: S) -> Self {
+        Self {
+            app,
+            task_head,
+            poll_state,
+        }
+    }
+
+    fn poll(&mut self, driver: &mut DriverContext<'_, 'd>) -> Option<Poll<Response>> {
+        let index = self.poll_state.index();
+        let App {
+            slab, tasks, wakes, ..
+        } = self.app;
+        let task = self.poll_state.task(tasks)?;
+        let wake = TaskWake::at_mut(wakes.as_mut(), index);
+        let waker = wake.as_ref().waker();
+        let mut context = std::pin::pin!(Context::from_waker(waker, driver.reborrow()));
+        slab.poll(task, context.as_mut())
+    }
+
+    fn complete(mut self) -> Option<StreamId> {
+        let stream_id = self.poll_state.release(self.app, self.task_head);
+        std::mem::forget(self);
+        stream_id
+    }
+
+    fn preserve(self) {
+        std::mem::forget(self);
+    }
+}
+
+impl<'a, 'd, H: Handler + 'd, W: Wire> TaskPoll<'a, 'd, H, W, NewTask> {
+    unsafe fn bind(
+        &mut self,
+        key: ErasedTaskId,
+        ready: Pin<&TaskQueue<TaskTarget>>,
+        parent: Waker<'_>,
+    ) {
+        let wake = TaskWake::at_mut(self.app.wakes.as_mut(), self.poll_state.index);
+        unsafe { wake.bind(key, ready, parent) };
+    }
+
+    fn register(
+        mut self,
+        connection_id: dope::driver::token::Token,
+        stream_id: StreamId,
+        key: ErasedTaskId,
+    ) -> bool {
+        let registered = self.app.register_task(
+            self.task_head,
+            self.poll_state.index,
+            &mut self.poll_state.task,
+            connection_id,
+            stream_id,
+            key,
+        );
+        if registered {
+            std::mem::forget(self);
+        }
+        registered
+    }
+}
+
+impl<'d, H, W, S> Drop for TaskPoll<'_, 'd, H, W, S>
+where
+    H: Handler + 'd,
+    W: Wire,
+    S: TaskPollState<'d, H, W>,
+{
+    fn drop(&mut self) {
+        let _ = self.poll_state.release(self.app, self.task_head);
+    }
+}
+
+impl<'d, H: Handler + 'd, W: Wire> App<'d, H, W> {
+    pub fn new(user: &'d H, config: Config) -> Self {
+        let capacity = config.max_handler_tasks;
+        assert!(capacity > 0);
+        assert!(u32::try_from(capacity).is_ok());
+        Self {
+            user,
+            limits: config.into(),
+            slab: Slab::with_capacity(capacity),
+            tasks: (0..capacity).map(|_| None).collect(),
+            wakes: Box::into_pin((0..capacity).map(|_| TaskWake::new()).collect()),
+            task_map: TaskMap::with_capacity(capacity),
+            wire: PhantomData,
+        }
+    }
+
+    pub fn handler(&self) -> &H {
+        self.user
+    }
+
+    fn drain_events(
+        &mut self,
+        slot: &mut Slot<'d, W, listener::State<ConnState>>,
+        driver: &mut DriverContext<'_, 'd>,
+    ) -> usize {
+        let connection_id = slot.token();
+        let parent = unsafe { rebrand_waker(slot.waker()) };
+        let state = &mut slot.state.conn;
+        let mut drained = 0;
+        while let Some(event) = state.state.connection.poll_event() {
+            drained += 1;
+            match event {
+                conn::Event::Headers {
+                    stream_id,
+                    headers,
+                    end_stream,
+                    trailing,
+                } => {
+                    if trailing {
+                        if let Some(mut incoming) = state.state.take_incoming(stream_id) {
+                            if incoming.headers.append(headers).is_err() {
+                                let _ = state
+                                    .state
+                                    .connection
+                                    .reset_stream(stream_id, ErrorCode::EnhanceYourCalm);
+                                continue;
+                            }
+                            self.dispatch(
+                                connection_id,
+                                state,
+                                stream_id,
+                                incoming.into(),
+                                parent,
+                                driver,
+                            );
                         }
-                    } else if let Some(inc) = cstate.incoming.get_mut(&stream_id) {
-                        inc.body.extend_from_slice(&data);
-                        let body_len = inc.body.len();
-                        cstate.buffered_total += data.len();
-                        if body_len > MAX_BODY_LEN || cstate.buffered_total > MAX_CONN_BUFFERED_LEN
-                        {
-                            cstate.take_incoming(stream_id);
-                            let _ = cstate
-                                .conn
+                    } else if end_stream {
+                        let request = Request {
+                            headers,
+                            body: Vec::new(),
+                        };
+                        self.dispatch(connection_id, state, stream_id, request, parent, driver);
+                    } else {
+                        if !state.state.insert_incoming(Incoming {
+                            stream_id,
+                            headers,
+                            body: Vec::new(),
+                        }) {
+                            let _ = state
+                                .state
+                                .connection
                                 .reset_stream(stream_id, ErrorCode::EnhanceYourCalm);
                         }
                     }
                 }
-                conn::Event::StreamReset { stream_id, .. } => {
-                    cstate.take_incoming(stream_id);
-                    cstate.pending.retain(|p| p.stream_id != stream_id);
-                    if let Some(pos) = cstate.waiting.iter().position(|(s, _)| *s == stream_id) {
-                        let (_, task) = cstate.waiting.swap_remove(pos);
-                        self.slab.release(task);
+                conn::Event::Data {
+                    stream_id,
+                    data,
+                    end_stream,
+                } => {
+                    if let Some(request) =
+                        state
+                            .state
+                            .receive_data(stream_id, &data, end_stream, self.limits)
+                    {
+                        self.dispatch(connection_id, state, stream_id, request, parent, driver);
                     }
+                }
+                conn::Event::StreamReset { stream_id, .. } => {
+                    state.state.reset_stream(stream_id);
+                    self.cancel_task(state, connection_id, stream_id);
                 }
                 _ => {}
             }
         }
-        Self::resume_pending(cstate);
+        state.state.resume_pending(self.limits);
+        drained
     }
 
     fn dispatch(
         &mut self,
-        cstate: &mut ConnState,
+        connection_id: dope::driver::token::Token,
+        state: &mut ConnState,
         stream_id: StreamId,
-        req: Request,
-        cx: &mut Context<'_>,
+        request: Request,
+        parent: Waker<'_>,
+        driver: &mut DriverContext<'_, 'd>,
     ) {
-        let fiber = self.user.on_request(req);
-        match self.slab.alloc(fiber) {
-            Some(task) => match self.slab.poll(&task, cx) {
-                Poll::Ready(resp) => {
-                    self.slab.release(task);
-                    Self::begin_response(cstate, stream_id, resp);
-                }
-                Poll::Pending => cstate.waiting.push((stream_id, task)),
-            },
-            None => {
-                let _ = cstate
-                    .conn
-                    .reset_stream(stream_id, ErrorCode::RefusedStream);
-            }
-        }
-    }
-
-    fn begin_response(cstate: &mut ConnState, stream_id: StreamId, resp: Response) {
-        if !cstate.conn.has_stream(stream_id) {
+        let Some(entry) = self.slab.vacant_entry() else {
+            let _ = state
+                .state
+                .connection
+                .reset_stream(stream_id, ErrorCode::RefusedStream);
             return;
-        }
-        let has_trailers = !resp.trailers.is_empty();
-        let end_stream = resp.body.is_empty() && !has_trailers;
-        if cstate
-            .conn
-            .send_response(
-                stream_id,
-                resp.headers.iter().map(|h| h.as_ref()),
-                end_stream,
-            )
-            .is_err()
-        {
-            return;
-        }
-        if end_stream {
-            return;
-        }
-        let mut body = PendingBody {
-            stream_id,
-            body: resp.body,
-            off: 0,
-            stalled: false,
-            trailers: resp.trailers,
-            trailers_sent: false,
         };
-        match body.pump(&mut cstate.conn) {
-            Ok(true) => {}
-            Ok(false) | Err(_) => cstate.pending.push(body),
-        }
-    }
-
-    fn resume_pending(cstate: &mut ConnState) {
-        if !cstate.conn.take_window_opened() {
-            return;
-        }
-        for body in cstate.pending.iter_mut() {
-            body.stalled = false;
-        }
-        Self::pump_pending(cstate);
-    }
-
-    fn pump_pending(cstate: &mut ConnState) {
-        let ConnState { conn, pending, .. } = cstate;
-        let mut i = 0;
-        while i < pending.len() {
-            if pending[i].stalled || conn.outbound().len() >= OUTBOUND_SOFT_CAP {
-                i += 1;
-                continue;
+        let fiber = self.user.request(request);
+        let task = entry.insert(fiber);
+        let key = task.erase();
+        let task = TaskId::from_erased(key);
+        let ready = unsafe { Pin::new_unchecked(&state.ready) };
+        let mut task = TaskPoll::new(self, &mut state.task_head, NewTask::new(task));
+        unsafe { task.bind(key, ready, parent) };
+        match task.poll(driver) {
+            Some(Poll::Ready(response)) => {
+                let _ = task.complete();
+                state.state.begin_response(stream_id, response, self.limits);
             }
-            match pending[i].pump(conn) {
-                Ok(true) | Err(_) => {
-                    pending.swap_remove(i);
+            Some(Poll::Pending) => {
+                if !task.register(connection_id, stream_id, key) {
+                    let _ = state
+                        .state
+                        .connection
+                        .reset_stream(stream_id, ErrorCode::RefusedStream);
                 }
-                Ok(false) => i += 1,
+            }
+            None => {
+                debug_assert!(false, "live task must exist in fiber slab");
+                let _ = task.complete();
+                let _ = state
+                    .state
+                    .connection
+                    .reset_stream(stream_id, ErrorCode::InternalError);
             }
         }
     }
 
-    fn flush_into(
-        slot: &mut Slot<W, listener::State<ConnState>>,
-        aux: &mut listener::Aux,
-        driver: &mut Driver,
-        close_after: bool,
-    ) {
-        let send_ud = slot.token();
-        let write_buf = aux.write_buf_for(slot);
-        let state = &mut slot.state.conn;
-        let n = state.conn.drain_into(write_buf);
-        if close_after {
-            slot.core.set_close_after();
+    fn register_task(
+        &mut self,
+        task_head: &mut Option<u32>,
+        index: usize,
+        task: &mut Option<TaskId>,
+        connection_id: dope::driver::token::Token,
+        stream_id: StreamId,
+        key: ErasedTaskId,
+    ) -> bool {
+        let Some(slot) = self.tasks.get(index) else {
+            return false;
+        };
+        if slot.is_some() {
+            return false;
         }
-        slot.submit_buffered(write_buf, n, send_ud, driver);
+        if let Some(next) = *task_head {
+            let Some(next_task) = self.tasks.get(next as usize).and_then(Option::as_ref) else {
+                return false;
+            };
+            if next_task.connection_id != connection_id {
+                return false;
+            }
+        }
+        if !self.task_map.insert(connection_id, stream_id, index) {
+            return false;
+        }
+        let Some(task) = task.take() else {
+            self.task_map.remove(connection_id, stream_id);
+            return false;
+        };
+        self.tasks[index] = Some(RunningTask {
+            connection_id,
+            stream_id,
+            task,
+            key,
+            previous: None,
+            next: *task_head,
+        });
+        let next = *task_head;
+        *task_head = Some(index as u32);
+        if let Some(next) = next
+            && let Some(next) = self.tasks[next as usize].as_mut()
+        {
+            next.previous = Some(index as u32);
+        }
+        true
+    }
+
+    fn release_task(&mut self, task_head: &mut Option<u32>, index: usize) -> Option<StreamId> {
+        let running = self.tasks.get_mut(index)?.take()?;
+        let RunningTask {
+            connection_id,
+            stream_id,
+            task,
+            previous,
+            next,
+            ..
+        } = running;
+        self.task_map.remove(connection_id, stream_id);
+        if let Some(previous) = previous {
+            if let Some(previous) = self.tasks[previous as usize].as_mut() {
+                previous.next = next;
+            }
+        } else if *task_head == Some(index as u32) {
+            *task_head = next;
+        }
+        if let Some(next) = next
+            && let Some(next) = self.tasks[next as usize].as_mut()
+        {
+            next.previous = previous;
+        }
+        self.release_bound_task(index, task);
+        Some(stream_id)
+    }
+
+    fn release_bound_task(&mut self, index: usize, task: TaskId) {
+        let App { slab, wakes, .. } = self;
+        let unbind = UnbindOnDrop(Some(TaskWake::at_mut(wakes.as_mut(), index)));
+        let removed = slab.remove(task);
+        debug_assert!(removed, "live task must be removable");
+        drop(unbind);
+    }
+
+    fn cancel_task(
+        &mut self,
+        state: &mut ConnState,
+        connection_id: dope::driver::token::Token,
+        stream_id: StreamId,
+    ) {
+        let Some(index) = self.task_map.get(connection_id, stream_id) else {
+            return;
+        };
+        self.release_task(&mut state.task_head, index);
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::conn::CLIENT_PREFACE;
-    use crate::frame::{self, FrameHeader, WindowUpdate};
-    use crate::hpack::{Encoder, Header};
-
-    type TestApp = App<'static, NoopHandler>;
-
-    struct NoopHandler;
-
-    impl Handler for NoopHandler {
-        type Fut<'h> = std::future::Ready<Response>;
-
-        fn on_request<'h>(&'h self, _req: Request) -> Fiber<'h, Self::Fut<'h>> {
-            Fiber::new(std::future::ready(Response::new(
-                Vec::new(),
-                Shared::from(Vec::new()),
-            )))
-        }
+impl<'d, H: Handler + 'd, W: Wire> Drop for App<'d, H, W> {
+    fn drop(&mut self) {
+        assert!(self.tasks.iter().all(Option::is_none));
+        assert!(self.task_map.is_empty());
+        assert!(self.wakes.iter().all(|wake| !wake.bound));
     }
+}
 
-    fn open_stream(cstate: &mut ConnState, stream_id: StreamId) {
-        cstate.conn.drain_outbound(cstate.conn.outbound().len());
-        cstate.conn.ingest(CLIENT_PREFACE).unwrap();
-        let mut enc = Encoder::new(4096);
-        let mut block = Vec::new();
-        enc.encode(
-            [
-                Header {
-                    name: b":method",
-                    value: b"GET",
-                },
-                Header {
-                    name: b":scheme",
-                    value: b"http",
-                },
-                Header {
-                    name: b":path",
-                    value: b"/",
-                },
-                Header {
-                    name: b":authority",
-                    value: b"x",
-                },
-            ],
-            &mut block,
-        );
-        let mut frame = Vec::new();
-        crate::frame::Headers {
-            stream_id,
-            end_stream: true,
-            end_headers: true,
-            priority: None,
-            block_fragment: &block,
+impl<'d, H: Handler + 'd, W: Wire> Application<'d> for App<'d, H, W> {
+    type Conn = ConnState;
+    type Wire = W;
+
+    fn chunk<R: RetainBytes>(
+        self: Pin<&mut Self>,
+        slot: &mut Slot<'d, W, listener::State<ConnState>>,
+        chunk: R,
+        aux: &mut listener::Aux,
+        driver: &mut DriverContext<'_, 'd>,
+    ) -> Outcome {
+        let this = self.get_mut();
+        if slot.state.conn.state.connection.goaway_sent()
+            || slot.state.conn.state.connection.goaway_received().is_some()
+        {
+            return Outcome::Ok;
         }
-        .encode(&mut frame);
-        cstate.conn.ingest(&frame).unwrap();
-        while cstate.conn.poll_event().is_some() {}
-        cstate.conn.drain_outbound(cstate.conn.outbound().len());
-    }
-
-    fn ingest_window_update(cstate: &mut ConnState, stream_id: StreamId, increment: u32) {
-        let mut bytes = Vec::new();
-        WindowUpdate {
-            stream_id,
-            increment,
-        }
-        .encode(&mut bytes);
-        cstate.conn.ingest(&bytes).unwrap();
-        while cstate.conn.poll_event().is_some() {}
-        TestApp::resume_pending(cstate);
-    }
-
-    fn collect_data(out: &[u8]) -> (Vec<u8>, bool) {
-        let mut pos = 0;
-        let mut body = Vec::new();
-        let mut saw_end = false;
-        while pos < out.len() {
-            let h = FrameHeader::parse(&out[pos..]).unwrap();
-            let total = 9 + h.length as usize;
-            if h.kind == frame::Type::Data {
-                assert!(!saw_end, "DATA after END_STREAM");
-                let payload = &out[pos + 9..pos + total];
-                body.extend_from_slice(payload);
-                if h.flags.has(frame::Flags::END_STREAM) {
-                    saw_end = true;
+        let mut result = slot.state.conn.state.connection.ingest(chunk.as_slice());
+        let error = loop {
+            let drained = this.drain_events(slot, driver);
+            match result {
+                Ok(()) => break None,
+                Err(conn::ConnError::Overload) if drained != 0 => {
+                    result = slot.state.conn.state.connection.resume();
                 }
+                Err(error) => break Some(error),
             }
-            pos += total;
+        };
+        if let Some(error) = error {
+            let state = &mut slot.state.conn.state;
+            let _ = state.connection.goaway(ErrorCode::from(&error), b"");
+            flush_into(slot, aux, driver, true);
+            return Outcome::Ok;
         }
-        (body, saw_end)
+        let close_after = slot.state.conn.state.connection.goaway_sent();
+        flush_into(slot, aux, driver, close_after);
+        Outcome::Ok
     }
 
-    fn drain_data(cstate: &mut ConnState, acc: &mut Vec<u8>, end: &mut bool) {
-        let out = cstate.conn.outbound().to_vec();
-        let (body, saw_end) = collect_data(&out);
-        acc.extend_from_slice(&body);
-        *end |= saw_end;
-        cstate.conn.drain_outbound(cstate.conn.outbound().len());
+    fn send(
+        self: Pin<&mut Self>,
+        slot: &mut Slot<'d, W, listener::State<ConnState>>,
+        _sent: usize,
+        aux: &mut listener::Aux,
+        driver: &mut DriverContext<'_, 'd>,
+    ) {
+        let limits = self.get_mut().limits;
+        let state = &mut slot.state.conn.state;
+        state.pump_pending(limits, false);
+        let close_after = state.connection.goaway_sent();
+        if !state.connection.outbound().is_empty() {
+            flush_into(slot, aux, driver, close_after);
+        }
     }
 
-    #[test]
-    fn body_larger_than_window_delivered_across_stream_and_conn_updates() {
-        let mut cstate = ConnState::default();
-        let stream_id = StreamId(1);
-        open_stream(&mut cstate, stream_id);
-
-        let total = 200_000usize;
-        let payload: Vec<u8> = (0..total).map(|i| (i % 251) as u8).collect();
-        let resp = Response::new(
-            vec![OwnedHeader::new(b":status", b"200")],
-            Shared::from(payload.clone()),
-        );
-        TestApp::begin_response(&mut cstate, stream_id, resp);
-
-        let mut acc = Vec::new();
-        let mut end = false;
-        drain_data(&mut cstate, &mut acc, &mut end);
-
-        assert!(acc.len() <= 65_535, "stalled at the initial send window");
-        assert!(!end, "END_STREAM must not be set before the true end");
-
-        loop {
-            if end {
-                break;
-            }
-            ingest_window_update(&mut cstate, StreamId::CONNECTION, 50_000);
-            ingest_window_update(&mut cstate, stream_id, 50_000);
-            drain_data(&mut cstate, &mut acc, &mut end);
+    fn activate(
+        self: Pin<&mut Self>,
+        slot: &mut Slot<'d, W, listener::State<ConnState>>,
+        aux: &mut listener::Aux,
+        driver: &mut DriverContext<'_, 'd>,
+    ) {
+        let this = self.get_mut();
+        if unsafe { slot.state.conn.ready_pin() }.is_empty() {
+            return;
         }
-
-        assert_eq!(acc, payload, "all body bytes delivered intact and in order");
-        assert!(end, "END_STREAM seen at the true end");
-    }
-
-    #[test]
-    fn awaiting_handler_suspends_then_pump_after_ready() {
-        use std::cell::Cell;
-        use std::pin::Pin;
-        use std::task::Poll;
-
-        struct OnceReady {
-            polled: Cell<bool>,
-            out: Cell<Option<Response>>,
-        }
-
-        impl Future for OnceReady {
-            type Output = Response;
-            fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Response> {
-                if self.polled.get() {
-                    Poll::Ready(self.out.take().unwrap())
-                } else {
-                    self.polled.set(true);
-                    cx.waker().wake_by_ref();
-                    Poll::Pending
+        let connection_id = slot.token();
+        let parent = unsafe { rebrand_waker(slot.waker()) };
+        {
+            let state = &mut slot.state.conn;
+            let ready = unsafe { Pin::new_unchecked(&state.ready) };
+            let snapshot = unsafe { ready.snapshot(parent) };
+            for key in snapshot.flatten() {
+                let index = key.index();
+                let Some((running_key, running_connection_id)) = this
+                    .tasks
+                    .get(index)
+                    .and_then(Option::as_ref)
+                    .map(|running| (running.key, running.connection_id))
+                else {
+                    continue;
+                };
+                if running_key != key || running_connection_id != connection_id {
+                    continue;
                 }
-            }
-        }
-
-        let mut cstate = ConnState::default();
-        let stream_id = StreamId(1);
-        open_stream(&mut cstate, stream_id);
-
-        let resp = Response::new(
-            vec![OwnedHeader::new(b":status", b"200")],
-            Shared::from(b"deferred".to_vec()),
-        );
-        let fut = OnceReady {
-            polled: Cell::new(false),
-            out: Cell::new(Some(resp)),
-        };
-        let mut slab: Slab<'static, OnceReady, HANDLER_SLAB_CAP> = Slab::new();
-        let waker = std::task::Waker::noop();
-        let mut cx = Context::from_waker(waker);
-
-        let task = slab.alloc(Fiber::new(fut)).unwrap();
-        assert!(matches!(slab.poll(&task, &mut cx), Poll::Pending));
-        cstate.waiting.push((stream_id, task));
-
-        let (_, task) = cstate.waiting.pop().unwrap();
-        let resp = match slab.poll(&task, &mut cx) {
-            Poll::Ready(r) => r,
-            Poll::Pending => panic!("expected ready on second poll"),
-        };
-        slab.release(task);
-        TestApp::begin_response(&mut cstate, stream_id, resp);
-
-        let mut acc = Vec::new();
-        let mut end = false;
-        drain_data(&mut cstate, &mut acc, &mut end);
-        assert_eq!(acc, b"deferred");
-        assert!(end);
-    }
-
-    #[test]
-    fn sync_handler_completes_inline_without_suspension() {
-        let mut cstate = ConnState::default();
-        let mut app: TestApp = App::new(&NoopHandler);
-        let stream_id = StreamId(1);
-        open_stream(&mut cstate, stream_id);
-
-        let body = Shared::from(b"small body".to_vec());
-        let resp = Response::new(vec![OwnedHeader::new(b":status", b"200")], body);
-        TestApp::begin_response(&mut cstate, stream_id, resp);
-
-        assert!(
-            cstate.waiting.is_empty(),
-            "a non-awaiting handler retains nothing"
-        );
-        assert!(
-            cstate.pending.is_empty(),
-            "a small body fits the window and leaves no pending pump"
-        );
-        let _ = &mut app;
-
-        let mut acc = Vec::new();
-        let mut end = false;
-        drain_data(&mut cstate, &mut acc, &mut end);
-        assert_eq!(acc, b"small body");
-        assert!(end);
-    }
-
-    #[test]
-    fn connection_level_update_alone_resumes() {
-        let mut cstate = ConnState::default();
-        let s1 = StreamId(1);
-        open_stream(&mut cstate, s1);
-
-        let total = 120_000usize;
-        let payload = vec![7u8; total];
-        let resp = Response::new(
-            vec![OwnedHeader::new(b":status", b"200")],
-            Shared::from(payload.clone()),
-        );
-        TestApp::begin_response(&mut cstate, s1, resp);
-
-        let mut acc = Vec::new();
-        let mut end = false;
-        drain_data(&mut cstate, &mut acc, &mut end);
-        let first = acc.len();
-        assert!(first <= 65_535);
-        assert!(!end);
-
-        ingest_window_update(&mut cstate, s1, 200_000);
-        drain_data(&mut cstate, &mut acc, &mut end);
-        assert_eq!(
-            acc.len(),
-            first,
-            "stream update alone cannot exceed the conn window"
-        );
-        assert!(!end);
-
-        ingest_window_update(&mut cstate, StreamId::CONNECTION, 200_000);
-        drain_data(&mut cstate, &mut acc, &mut end);
-        assert_eq!(acc, payload);
-        assert!(end);
-    }
-
-    fn walk_frames(out: &[u8]) -> (Vec<u8>, bool, usize, bool, bool) {
-        let mut pos = 0;
-        let mut data = Vec::new();
-        let mut data_end_stream = false;
-        let mut header_frames = 0usize;
-        let mut trailers_end_stream = false;
-        let mut trailers_after_data = false;
-        while pos < out.len() {
-            let h = FrameHeader::parse(&out[pos..]).unwrap();
-            let total = 9 + h.length as usize;
-            let payload = &out[pos + 9..pos + total];
-            match h.kind {
-                frame::Type::Data => {
-                    data.extend_from_slice(payload);
-                    if h.flags.has(frame::Flags::END_STREAM) {
-                        data_end_stream = true;
+                let mut task = TaskPoll::new(this, &mut state.task_head, RegisteredTask { index });
+                match task.poll(driver) {
+                    Some(Poll::Ready(response)) => {
+                        let Some(stream_id) = task.complete() else {
+                            debug_assert!(false, "registered task must be releasable");
+                            continue;
+                        };
+                        state.state.begin_response(stream_id, response, this.limits);
                     }
-                }
-                frame::Type::Headers => {
-                    header_frames += 1;
-                    if header_frames == 2 {
-                        trailers_after_data = !data.is_empty();
-                        if h.flags.has(frame::Flags::END_STREAM) {
-                            trailers_end_stream = true;
+                    Some(Poll::Pending) => task.preserve(),
+                    None => {
+                        debug_assert!(false, "live task must exist in fiber slab");
+                        if let Some(stream_id) = task.complete() {
+                            let _ = state
+                                .state
+                                .connection
+                                .reset_stream(stream_id, ErrorCode::InternalError);
                         }
                     }
                 }
-                _ => {}
             }
-            pos += total;
         }
-        (
-            data,
-            data_end_stream,
-            header_frames,
-            trailers_end_stream,
-            trailers_after_data,
-        )
+        let close_after = slot.state.conn.state.connection.goaway_sent();
+        if !slot.state.conn.state.connection.outbound().is_empty() {
+            flush_into(slot, aux, driver, close_after);
+        }
     }
 
-    #[test]
-    fn trailers_emitted_after_body_with_end_stream() {
-        let mut cstate = ConnState::default();
-        let stream_id = StreamId(1);
-        open_stream(&mut cstate, stream_id);
-
-        let mut resp = Response::new(
-            vec![OwnedHeader::new(b":status", b"200")],
-            Shared::from(b"hello".to_vec()),
-        );
-        resp.trailers = vec![OwnedHeader::new(b"grpc-status", b"0")];
-        TestApp::begin_response(&mut cstate, stream_id, resp);
-
-        let out = cstate.conn.outbound().to_vec();
-        let (data, data_end, headers, trailers_end, trailers_after_data) = walk_frames(&out);
-        assert_eq!(data, b"hello");
-        assert!(
-            !data_end,
-            "DATA must not carry END_STREAM when trailers follow"
-        );
-        assert_eq!(headers, 2, "response HEADERS then trailing HEADERS");
-        assert!(trailers_end, "trailing HEADERS must carry END_STREAM");
-        assert!(trailers_after_data, "trailers follow the DATA frame");
-    }
-
-    #[test]
-    fn trailers_with_empty_body_emit_without_data() {
-        let mut cstate = ConnState::default();
-        let stream_id = StreamId(1);
-        open_stream(&mut cstate, stream_id);
-
-        let mut resp = Response::new(
-            vec![OwnedHeader::new(b":status", b"200")],
-            Shared::from(Vec::new()),
-        );
-        resp.trailers = vec![OwnedHeader::new(b"grpc-status", b"5")];
-        TestApp::begin_response(&mut cstate, stream_id, resp);
-
-        let out = cstate.conn.outbound().to_vec();
-        let (data, _, headers, trailers_end, _) = walk_frames(&out);
-        assert!(data.is_empty(), "no DATA frame for an empty body");
-        assert_eq!(headers, 2, "response HEADERS then trailing HEADERS");
-        assert!(trailers_end, "trailing HEADERS must carry END_STREAM");
+    fn close(
+        self: Pin<&mut Self>,
+        slot: &mut Slot<'d, W, listener::State<ConnState>>,
+        _aux: &mut listener::Aux,
+    ) {
+        let this = self.get_mut();
+        let state = &mut slot.state.conn;
+        while let Some(index) = state.task_head {
+            if this
+                .release_task(&mut state.task_head, index as usize)
+                .is_none()
+            {
+                state.task_head = None;
+            }
+        }
+        state.state.pending.clear();
+        state.state.incoming.clear();
     }
 }

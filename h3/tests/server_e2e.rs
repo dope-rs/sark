@@ -1,6 +1,6 @@
 use std::time::Instant;
 
-use dope_quic::{Conn, ConnConfig, ConnHandle, Handler, transport_params};
+use dope_quic::{Conn, ConnHandle, Handler, conn, transport_params};
 use ring::rand::{SecureRandom, SystemRandom};
 use sark_core::http::Field;
 use sark_h3::dope::{Server, Session};
@@ -32,8 +32,8 @@ sark_gen::define_route! {
     }
 }
 
-fn config() -> ConnConfig {
-    ConnConfig {
+fn config() -> conn::Config {
+    conn::Config {
         transport_params: transport_params::Params {
             max_idle_timeout_ms: 30_000,
             initial_max_data: 1 << 20,
@@ -53,8 +53,9 @@ fn pair() -> (Conn, Conn) {
     SystemRandom::new().fill(&mut seed).unwrap();
     let signing = SigningKey::from_seed(&seed).unwrap();
     let server_pubkey = *signing.pubkey().unwrap();
-    let mut server = Conn::new_server(CID.to_vec(), CID.to_vec(), CID.to_vec(), signing, config());
-    let mut client = Conn::new_client(CID.to_vec(), CID.to_vec(), server_pubkey, config());
+    let mut server =
+        Conn::new_server(CID.to_vec(), CID.to_vec(), CID.to_vec(), signing, config()).unwrap();
+    let mut client = Conn::new_client(CID.to_vec(), CID.to_vec(), server_pubkey, config()).unwrap();
     let now = Instant::now();
     for _ in 0..3 {
         drain(&mut client, &mut server, now);
@@ -73,7 +74,7 @@ fn drain(from: &mut Conn, into: &mut Conn, now: Instant) {
 
 fn pump_client(session: &mut Session, quic: &mut Conn) {
     while let Some(event) = quic.poll_stream_event() {
-        session.on_quic_stream_event(quic, event).unwrap();
+        session.quic_stream_event(quic, event).unwrap();
     }
 }
 
@@ -82,9 +83,15 @@ fn server_handler_routes_over_quic() {
     let (mut server_quic, mut client_quic) = pair();
     let handle = ConnHandle(0);
 
-    let app = srv_app::new::<dope::wire::Identity>(sark::EmptyState::REF);
+    let app = SrvApp::new::<dope_net::wire::identity::Identity>(
+        sark::EmptyState,
+        sark::app::Config {
+            timer_capacity: 0,
+            task_capacity: 0,
+        },
+    );
     let mut server = Server::new(app);
-    server.on_established(&mut server_quic, handle);
+    server.established(&mut server_quic, handle);
 
     let mut client = Session::with_role(Role::Client);
     client.start_control_stream(&mut client_quic).unwrap();
@@ -92,7 +99,7 @@ fn server_handler_routes_over_quic() {
     let now = Instant::now();
     drain(&mut client_quic, &mut server_quic, now);
     while let Some(event) = server_quic.poll_stream_event() {
-        server.on_stream_event(&mut server_quic, handle, event);
+        server.stream_event(&mut server_quic, handle, event);
     }
     drain(&mut server_quic, &mut client_quic, now);
     pump_client(&mut client, &mut client_quic);
@@ -112,11 +119,11 @@ fn server_handler_routes_over_quic() {
             true,
         )
         .unwrap();
-    client.flush(&mut client_quic);
+    client.flush(&mut client_quic).unwrap();
 
     drain(&mut client_quic, &mut server_quic, now);
     while let Some(event) = server_quic.poll_stream_event() {
-        server.on_stream_event(&mut server_quic, handle, event);
+        server.stream_event(&mut server_quic, handle, event);
     }
     drain(&mut server_quic, &mut client_quic, now);
     pump_client(&mut client, &mut client_quic);

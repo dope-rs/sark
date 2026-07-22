@@ -211,15 +211,18 @@ impl Scan {
                 b'"' => {
                     let _ = Self::str_slice(input, idx)?;
                 }
-                b if b == open => {
+                b'{' | b'[' => {
+                    if depth >= crate::MAX_DEPTH as usize {
+                        return Err(Fail::with("JSON nesting too deep"));
+                    }
                     depth += 1;
                     *idx += 1;
                 }
-                b if b == close => {
+                b @ (b'}' | b']') => {
                     depth -= 1;
                     *idx += 1;
                     if depth == 0 {
-                        return Ok(());
+                        return if b == close { Ok(()) } else { Err(Fail::bad()) };
                     }
                 }
                 _ => {

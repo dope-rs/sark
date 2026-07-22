@@ -7,7 +7,7 @@ use std::thread;
 use std::time::Duration;
 
 use common::run_get;
-use sark_client::connector::Session;
+use sark_client::connector::Config;
 
 struct Server {
     addr: String,
@@ -100,7 +100,7 @@ where
 }
 
 fn run_redirect(addr: SocketAddr, path: &'static str) -> Result<sark_core::http::Response, String> {
-    run_get(addr, Session::new("127.0.0.1"), path)
+    run_get(addr, Config::new("127.0.0.1"), path)
 }
 
 #[test]
@@ -134,6 +134,44 @@ fn redirect_chain_followed() {
     let resp = run_redirect(addr, "/a").expect("chain followed");
     assert_eq!(resp.status().as_u16(), 200);
     assert_eq!(std::str::from_utf8(resp.body()).unwrap(), "done");
+}
+
+#[test]
+fn relative_redirect_keeps_directory() {
+    let server = spawn_redirect_server(|path| {
+        if path == "/dir/start" {
+            b"HTTP/1.1 302 Found\r\nLocation: next\r\nContent-Length: 0\r\nConnection: keep-alive\r\n\r\n".to_vec()
+        } else if path == "/dir/next" {
+            b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: keep-alive\r\n\r\nok".to_vec()
+        } else {
+            b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: keep-alive\r\n\r\n"
+                .to_vec()
+        }
+    });
+    let addr: SocketAddr = server.addr.parse().expect("addr");
+
+    let response = run_redirect(addr, "/dir/start").expect("relative redirect followed");
+    assert_eq!(response.status().as_u16(), 200);
+    assert_eq!(response.body(), b"ok");
+}
+
+#[test]
+fn query_redirect_keeps_path() {
+    let server = spawn_redirect_server(|path| {
+        if path == "/item?step=1" {
+            b"HTTP/1.1 302 Found\r\nLocation: ?step=2\r\nContent-Length: 0\r\nConnection: keep-alive\r\n\r\n".to_vec()
+        } else if path == "/item?step=2" {
+            b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: keep-alive\r\n\r\nok".to_vec()
+        } else {
+            b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: keep-alive\r\n\r\n"
+                .to_vec()
+        }
+    });
+    let addr: SocketAddr = server.addr.parse().expect("addr");
+
+    let response = run_redirect(addr, "/item?step=1").expect("query redirect followed");
+    assert_eq!(response.status().as_u16(), 200);
+    assert_eq!(response.body(), b"ok");
 }
 
 #[test]

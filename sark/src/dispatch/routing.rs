@@ -1,8 +1,10 @@
+use std::pin::Pin;
+
 use super::conn_state::{ConnState, ConsumeOutcome, DispatchPermit};
 
 pub trait Routing {
     fn try_consume(
-        &mut self,
+        self: Pin<&mut Self>,
         permit: DispatchPermit,
         bytes: &[u8],
         write: &mut [u8],

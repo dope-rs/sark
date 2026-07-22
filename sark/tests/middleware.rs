@@ -1,14 +1,16 @@
 #![allow(clippy::too_many_arguments)]
 
+mod support;
+
 use std::io::{Read, Write};
 use std::net::TcpStream;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Duration;
 
-use dope_extra::testing::run_with_trigger;
+use dope_extra::harness::Harness;
 use http::StatusCode;
 use sark::middleware::{self, Capture, Middleware};
-use sark::{Build, ServerCfg};
+use sark::{Executor, Throughput, driver};
 
 static ACCESS_LOG_HITS: AtomicU32 = AtomicU32::new(0);
 static HANDLER_HITS: AtomicU32 = AtomicU32::new(0);
@@ -44,12 +46,12 @@ struct Req {}
 #[sark_gen::response(raw)]
 struct Resp {
     status: StatusCode,
-    body: o3::buffer::Owned,
+    body: Vec<u8>,
 }
 
 fn ok_body(body: &'static [u8]) -> Resp {
     HANDLER_HITS.fetch_add(1, Ordering::Relaxed);
-    let mut buf = o3::buffer::Owned::new();
+    let mut buf = Vec::new();
     buf.extend_from_slice(body);
     Resp {
         status: StatusCode::OK,
@@ -125,75 +127,88 @@ fn status_line(buf: &[u8]) -> &[u8] {
 #[test]
 fn middleware_integration() {
     let bind: std::net::SocketAddr = "127.0.0.1:38766".parse().unwrap();
-    let cfg = ServerCfg {
-        bind,
-        max_conn: 16,
-        backlog: 16,
-        head_timeout: std::time::Duration::from_secs(10),
-    };
+    let server = support::http_server(bind, Duration::from_secs(10));
 
-    run_with_trigger(
-        bind,
-        |ctx, trigger| Build::http(mw_dispatch::new(&()), cfg.clone(), ctx, Some(trigger)),
-        |bind| {
-            ACCESS_LOG_HITS.store(0, Ordering::Relaxed);
-            HANDLER_HITS.store(0, Ordering::Relaxed);
+    Harness::new(bind)
+        .run_with_trigger(
+            |_ctx, trigger| {
+                let driver_config =
+                    driver::Config::for_tcp_profile::<Throughput>(support::MAX_CONNECTIONS);
+                let executor = Executor::new(driver_config)?;
+                executor.enter(|mut session| {
+                    server.clone().serve(
+                        &mut session,
+                        MwDispatch::new(
+                            (),
+                            sark::app::Config {
+                                timer_capacity: support::MAX_CONNECTIONS.saturating_mul(2),
+                                task_capacity: support::MAX_CONNECTIONS,
+                            },
+                        ),
+                        Some(trigger),
+                    )
+                })
+            },
+            |bind| {
+                ACCESS_LOG_HITS.store(0, Ordering::Relaxed);
+                HANDLER_HITS.store(0, Ordering::Relaxed);
 
-            let resp = http_get_close(bind, "/log-pass");
-            assert_eq!(status_line(&resp), b"HTTP/1.1 200 OK", "log-pass status");
-            assert_eq!(ACCESS_LOG_HITS.load(Ordering::Relaxed), 1);
-            assert_eq!(HANDLER_HITS.load(Ordering::Relaxed), 1);
+                let resp = http_get_close(bind, "/log-pass");
+                assert_eq!(status_line(&resp), b"HTTP/1.1 200 OK", "log-pass status");
+                assert_eq!(ACCESS_LOG_HITS.load(Ordering::Relaxed), 1);
+                assert_eq!(HANDLER_HITS.load(Ordering::Relaxed), 1);
 
-            let resp = http_get_close(bind, "/protected/secret");
-            assert_eq!(
-                status_line(&resp),
-                b"HTTP/1.1 401 Unauthorized",
-                "secret status"
-            );
-            assert_eq!(
-                ACCESS_LOG_HITS.load(Ordering::Relaxed),
-                1,
-                "access log not invoked outside its scope"
-            );
-            assert_eq!(
-                HANDLER_HITS.load(Ordering::Relaxed),
-                1,
-                "blocked handler must not run"
-            );
+                let resp = http_get_close(bind, "/protected/secret");
+                assert_eq!(
+                    status_line(&resp),
+                    b"HTTP/1.1 401 Unauthorized",
+                    "secret status"
+                );
+                assert_eq!(
+                    ACCESS_LOG_HITS.load(Ordering::Relaxed),
+                    1,
+                    "access log not invoked outside its scope"
+                );
+                assert_eq!(
+                    HANDLER_HITS.load(Ordering::Relaxed),
+                    1,
+                    "blocked handler must not run"
+                );
 
-            let resp = http_get_close(bind, "/nested/inner/x");
-            assert_eq!(
-                status_line(&resp),
-                b"HTTP/1.1 401 Unauthorized",
-                "nested status"
-            );
-            assert_eq!(
-                ACCESS_LOG_HITS.load(Ordering::Relaxed),
-                2,
-                "outer access log ran before inner auth blocked"
-            );
-            assert_eq!(
-                HANDLER_HITS.load(Ordering::Relaxed),
-                1,
-                "blocked handler must not run"
-            );
+                let resp = http_get_close(bind, "/nested/inner/x");
+                assert_eq!(
+                    status_line(&resp),
+                    b"HTTP/1.1 401 Unauthorized",
+                    "nested status"
+                );
+                assert_eq!(
+                    ACCESS_LOG_HITS.load(Ordering::Relaxed),
+                    2,
+                    "outer access log ran before inner auth blocked"
+                );
+                assert_eq!(
+                    HANDLER_HITS.load(Ordering::Relaxed),
+                    1,
+                    "blocked handler must not run"
+                );
 
-            let resp = http_get_close(bind, "/open");
-            assert_eq!(status_line(&resp), b"HTTP/1.1 200 OK", "open status");
-            assert_eq!(HANDLER_HITS.load(Ordering::Relaxed), 2);
-            assert_eq!(
-                ACCESS_LOG_HITS.load(Ordering::Relaxed),
-                2,
-                "access log untouched for non-wrapped route"
-            );
+                let resp = http_get_close(bind, "/open");
+                assert_eq!(status_line(&resp), b"HTTP/1.1 200 OK", "open status");
+                assert_eq!(HANDLER_HITS.load(Ordering::Relaxed), 2);
+                assert_eq!(
+                    ACCESS_LOG_HITS.load(Ordering::Relaxed),
+                    2,
+                    "access log untouched for non-wrapped route"
+                );
 
-            let resp = http_get_close(bind, "/nonexistent");
-            assert_eq!(status_line(&resp), b"HTTP/1.1 404 Not Found", "404 status");
-            assert_eq!(
-                ACCESS_LOG_HITS.load(Ordering::Relaxed),
-                2,
-                "404 must not run any middleware"
-            );
-        },
-    );
+                let resp = http_get_close(bind, "/nonexistent");
+                assert_eq!(status_line(&resp), b"HTTP/1.1 404 Not Found", "404 status");
+                assert_eq!(
+                    ACCESS_LOG_HITS.load(Ordering::Relaxed),
+                    2,
+                    "404 must not run any middleware"
+                );
+            },
+        )
+        .expect("harness");
 }

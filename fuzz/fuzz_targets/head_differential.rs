@@ -212,7 +212,14 @@ fn drive_request_header_scan(buf: &[u8], headers_start: usize) {
             return;
         }
         let rest = &buf[pos..];
-        match apply_well_known_header_contig(rest, &mut scan, &mut flags, &mut (), &mut header_count, 128) {
+        match apply_well_known_header_contig(
+            rest,
+            &mut scan,
+            &mut flags,
+            &mut (),
+            &mut header_count,
+            128,
+        ) {
             Ok(Some(0)) => break,
             Ok(Some(rel)) => pos += rel + 2,
             Ok(None) => return,
@@ -250,7 +257,7 @@ fn drive_slice_probes(buf: &[u8]) {
             let _ = v.eq_bytes(b"chunked");
             let _ = v.eq_ignore_ascii_case(b"keep-alive");
             let _ = v.as_range();
-            let _ = v.copy_local();
+            let _ = v.copy_frame();
             let _ = v.parse_usize();
             let _ = v.parse_u64();
 
@@ -259,7 +266,7 @@ fn drive_slice_probes(buf: &[u8]) {
             let _ = p.eq_range_ignore_ascii_case(s, e, b"x");
             let _ = p.parse_range_usize(s, e);
             let _ = p.parse_range_u64(s, e);
-            let _ = p.copy_range_local(s, e);
+            let _ = p.copy_range_frame(s, e);
             let cur = s.min(buf.len());
             let _ = p.next_seg(cur);
             let _ = p.probe_literal(cur, b"v");
@@ -273,29 +280,20 @@ fn drive_request_path(buf: &[u8], head: &sark::framer::ParsedHead<'_>) {
     let base = buf.as_ptr() as usize;
     let target_off = head.target.as_ptr() as usize - base;
     let uri_range = target_off..(target_off + head.target.len());
-    let method = http::Method::from_bytes(head.method).unwrap_or(http::Method::GET);
     let head_bytes = &buf[..head.headers_start.min(buf.len())];
-    let r = Ref::<'_, ()>::from_slice(method, uri_range, head_bytes, b"");
+    let r = Ref::<'_>::from_slice(uri_range, head_bytes, b"");
 
-    let _ = r.path_view();
-    let _ = r.query_range();
-    let _ = r.uri_path_end();
-    let _ = r.uri_range();
-    let _ = r.path_param_view("id");
-    let _ = r.path_param_u64("id");
-
+    let reversed = [usize::MAX, 0, 5, 1];
     let ranges = [
         0usize..0,
         0..usize::MAX,
-        usize::MAX..0,
-        5..1,
+        reversed[0]..reversed[1],
+        reversed[2]..reversed[3],
         0..(head_bytes.len() + 4096),
     ];
     for range in ranges {
-        let _ = r.at(&range);
-        let _ = r.local_at(range.clone());
-        let _ = r.path_at(&range);
-        let _ = r.path_local(range);
+        let _ = r.frame_at(range.clone());
+        let _ = r.path_frame(range);
     }
 }
 
@@ -323,7 +321,10 @@ fn check(buf: &[u8]) {
             );
         }
         (None, None) => {}
-        (a, f) => panic!("fused accept/reject drift: parse_head={a:?} fused={:?}", f.is_some()),
+        (a, f) => panic!(
+            "fused accept/reject drift: parse_head={a:?} fused={:?}",
+            f.is_some()
+        ),
     }
 
     if let Some(head) = parsed {
@@ -342,7 +343,10 @@ fn check(buf: &[u8]) {
         );
 
         assert!(head.headers_start >= 2, "headers_start too small");
-        assert!(head.headers_start <= buf.len(), "headers_start out of range");
+        assert!(
+            head.headers_start <= buf.len(),
+            "headers_start out of range"
+        );
         assert_eq!(
             &buf[head.headers_start - 2..head.headers_start],
             b"\r\n",
@@ -373,10 +377,7 @@ fn check(buf: &[u8]) {
                 None => &op[..],
             };
             if !op.is_empty() && op[0] == b'/' {
-                assert_eq!(
-                    target_no_query, op_no_query,
-                    "path disagrees with httparse"
-                );
+                assert_eq!(target_no_query, op_no_query, "path disagrees with httparse");
             }
         }
     }

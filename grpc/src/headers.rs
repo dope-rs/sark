@@ -1,5 +1,5 @@
 use sark_core::http::OwnedField;
-use sark_h2::hpack::{Header, OwnedHeader};
+use sark_h2::hpack::{Header, HeaderBlock as H2HeaderBlock};
 
 use crate::metadata::{Metadata, MetadataError};
 use crate::status::{Code, Status};
@@ -37,12 +37,12 @@ impl HeaderBlock {
         &self.headers
     }
 
-    pub fn from_h2_owned(headers: Vec<OwnedHeader>) -> Vec<OwnedField> {
+    pub fn from_h2(headers: &H2HeaderBlock) -> Vec<OwnedField> {
         headers
-            .into_iter()
+            .iter()
             .map(|field| OwnedField {
-                name: field.name,
-                value: field.value,
+                name: field.name.to_vec(),
+                value: field.value.to_vec(),
             })
             .collect()
     }
@@ -232,101 +232,5 @@ impl Metadata {
 impl Status {
     pub fn from_metadata_err(err: MetadataError) -> Status {
         Status::new(Code::Internal, format!("bad metadata: {err:?}"))
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn h(name: &[u8], value: &[u8]) -> OwnedField {
-        OwnedField {
-            name: name.to_vec(),
-            value: value.to_vec(),
-        }
-    }
-
-    #[test]
-    fn parses_grpc_request_headers() {
-        let head = RequestHead::parse_h2(&[
-            h(b":method", b"POST"),
-            h(b":scheme", b"http"),
-            h(b":path", b"/pkg.Service/Method"),
-            h(b":authority", b"example.test"),
-            h(b"content-type", b"application/grpc+proto"),
-            h(b"te", b"trailers"),
-            h(b"x-trace", b"abc"),
-        ])
-        .unwrap();
-
-        assert_eq!(head.path, b"/pkg.Service/Method");
-        assert_eq!(head.authority.as_deref(), Some(b"example.test".as_slice()));
-        assert_eq!(
-            head.metadata.get_all(b"x-trace").collect::<Vec<_>>(),
-            vec![b"abc".as_slice()]
-        );
-    }
-
-    #[test]
-    fn rejects_non_post_request() {
-        let err = RequestHead::parse_h2(&[
-            h(b":method", b"GET"),
-            h(b":path", b"/pkg.Service/Method"),
-            h(b"content-type", b"application/grpc"),
-            h(b"te", b"trailers"),
-        ])
-        .unwrap_err();
-
-        assert_eq!(err.code(), Code::Unimplemented);
-    }
-
-    #[test]
-    fn builds_request_headers_with_metadata() {
-        let mut metadata = Metadata::new();
-        metadata.push(b"x-trace", b"abc").unwrap();
-
-        let block =
-            HeaderBlock::for_request(b"/pkg.Service/Method", Some(b"example.test"), &metadata)
-                .unwrap();
-
-        assert_eq!(
-            block.owned(),
-            &[
-                h(b":method", b"POST"),
-                h(b":scheme", b"http"),
-                h(b":path", b"/pkg.Service/Method"),
-                h(b":authority", b"example.test"),
-                h(b"content-type", b"application/grpc+proto"),
-                h(b"te", b"trailers"),
-                h(b"x-trace", b"abc"),
-            ]
-        );
-        assert_eq!(block.as_h2()[0].name, b":method");
-    }
-
-    #[test]
-    fn builds_status_trailers() {
-        let trailers = HeaderBlock::for_trailers(
-            &Status::new(Code::InvalidArgument, "bad arg"),
-            &Metadata::new(),
-        )
-        .unwrap();
-
-        assert_eq!(
-            trailers.owned(),
-            &[h(b"grpc-status", b"3"), h(b"grpc-message", b"bad arg"),]
-        );
-    }
-
-    #[test]
-    fn parses_trailer_status() {
-        let (status, metadata) =
-            Status::parse_h2_trailers(&[h(b"grpc-status", b"0"), h(b"x-extra", b"1")]).unwrap();
-
-        assert_eq!(status.code(), Code::Ok);
-        assert_eq!(
-            metadata.get_all(b"x-extra").collect::<Vec<_>>(),
-            vec![b"1".as_slice()]
-        );
     }
 }

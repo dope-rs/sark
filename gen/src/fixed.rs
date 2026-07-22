@@ -46,7 +46,7 @@ impl TextInput {
             .map(|((value, raw), expr)| {
                 quote! {
                     let #value = (#expr);
-                    let #raw = #value.as_bytes();
+                    let #raw: &[u8] = ::core::convert::AsRef::<[u8]>::as_ref(&#value);
                 }
             });
 
@@ -82,8 +82,7 @@ impl TextInput {
         Ok(quote!({
             #(#binds)*
             let __body_cap = 0usize #(+ #caps)*;
-            let mut __body_buf =
-                <::o3::buffer::Owned>::with_capacity(__body_cap);
+            let mut __body_buf = Vec::with_capacity(__body_cap);
             #(#writes)*
             __body_buf
         }))

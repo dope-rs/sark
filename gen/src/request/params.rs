@@ -8,7 +8,6 @@ use crate::util::{TypeExt, ValueKind};
 
 pub(super) struct Params<'a> {
     pub(super) vis: &'a syn::Visibility,
-    pub(super) ident: &'a Ident,
     pub(super) inner_ident: &'a Ident,
     pub(super) raw_ident: &'a Ident,
     pub(super) fields: &'a [PathAttrField],
@@ -18,7 +17,6 @@ impl<'a> Params<'a> {
     pub(super) fn build(self) -> Result<TokenStream> {
         let Self {
             vis,
-            ident,
             inner_ident,
             raw_ident,
             fields,
@@ -26,11 +24,37 @@ impl<'a> Params<'a> {
         if fields.is_empty() {
             return Ok(quote! {
                 #[allow(non_camel_case_types, dead_code)]
-                #vis type #inner_ident<'req> = sark::service::EmptyParamsInner<'req>;
+                #vis struct #inner_ident<'req> {
+                    marker: ::core::marker::PhantomData<&'req ()>,
+                }
+
                 #[allow(non_camel_case_types, dead_code)]
-                #vis type #ident = #inner_ident<'static>;
-                #[allow(non_camel_case_types, dead_code)]
-                #vis type #raw_ident = sark::service::EmptyParamsRaw;
+                #[derive(Default)]
+                #vis struct #raw_ident;
+
+                impl ::sark::service::RawRouteParams for #raw_ident {
+                    type Captures = ();
+
+                    fn from_captures<P: ::sark::service::PathProbe>(
+                        _path: &P,
+                        _captures: Self::Captures,
+                    ) -> ::core::option::Option<Self> {
+                        ::core::option::Option::Some(Self)
+                    }
+                }
+
+                impl<'req> ::sark::service::RouteParams<'req> for #inner_ident<'req> {
+                    type Raw = #raw_ident;
+
+                    fn from_raw(
+                        _req: &::sark::request::Ref<'req>,
+                        _raw: Self::Raw,
+                    ) -> ::core::option::Option<Self> {
+                        ::core::option::Option::Some(Self {
+                            marker: ::core::marker::PhantomData,
+                        })
+                    }
+                }
             });
         }
         let field_ident: Vec<&Ident> = fields.iter().map(|f| &f.ident).collect();
@@ -42,14 +66,14 @@ impl<'a> Params<'a> {
             .iter()
             .map(|f| {
                 let mut ty = f.ty.clone();
-                ty.rewrite_local_to_ref();
+                ty.rewrite_retained_to_borrowed();
                 ty
             })
             .collect();
         let raw_field_ty: Vec<TokenStream> = fields
             .iter()
             .map(|f| match f.ty.value_kind()? {
-                ValueKind::Local => Ok(quote! { Option<std::ops::Range<usize>> }),
+                ValueKind::Bytes => Ok(quote! { Option<std::ops::Range<usize>> }),
                 _ if f.ty.value_optional() => {
                     let ty = &f.ty;
                     Ok(quote! { #ty })
@@ -60,10 +84,10 @@ impl<'a> Params<'a> {
                 }
             })
             .collect::<Result<_>>()?;
-        let build_field_exprs: Vec<_> = fields
+        let build_borrowed_field_exprs: Vec<_> = fields
             .iter()
             .zip(path_ident.iter())
-            .map(|(f, raw)| Self::path_field_expr(&f.ident, raw, &f.ty, f.default.as_ref()))
+            .map(|(f, raw)| Self::path_field_expr(&f.ident, raw, &f.ty, f.default.as_ref(), true))
             .collect::<Result<_>>()?;
         let capture_binds: Vec<Ident> = (0..fields.len())
             .map(|idx| format_ident!("cap{}", idx))
@@ -78,7 +102,7 @@ impl<'a> Params<'a> {
             .zip(capture_binds.iter())
             .map(|((f, raw), cap)| {
                 let value = match f.ty.value_kind()? {
-                    ValueKind::Local | ValueKind::Range => {
+                    ValueKind::Bytes | ValueKind::Range => {
                         quote! { Some(#cap.start..#cap.end) }
                     }
                     _ => {
@@ -94,27 +118,19 @@ impl<'a> Params<'a> {
             })
             .collect::<Result<_>>()?;
         Ok(quote! {
-            #[allow(non_camel_case_types)]
+            #[allow(non_camel_case_types, dead_code)]
             #vis struct #inner_ident<'req> {
                 #( pub #field_ident: #field_ty_ref, )*
                 #[doc(hidden)]
                 pub __sark_m: ::core::marker::PhantomData<&'req ()>,
             }
 
-            #[allow(non_camel_case_types, dead_code)]
-            #vis type #ident = #inner_ident<'static>;
-
             #[allow(non_camel_case_types)]
             #[derive(Default)]
             #vis struct #raw_ident { #( pub #path_ident: #raw_field_ty, )* }
 
-            impl sark::service::RouteParams for #raw_ident {
-                type Raw = Self;
+            impl sark::service::RawRouteParams for #raw_ident {
                 type Captures = ( #( #capture_ty, )* );
-
-                fn from_raw(_req: &sark::Request, raw: Self::Raw) -> Option<Self> {
-                    Some(raw)
-                }
 
                 fn from_captures<P: sark::service::PathProbe>(
                     path: &P,
@@ -126,39 +142,16 @@ impl<'a> Params<'a> {
                 }
             }
 
-            impl<'req> sark::service::RouteParams for #inner_ident<'req> {
+            impl<'req> sark::service::RouteParams<'req> for #inner_ident<'req> {
                 type Raw = #raw_ident;
-                type Captures =
-                    <#raw_ident as sark::service::RouteParams>::Captures;
 
                 fn from_raw(
-                    req: &sark::Request,
+                    req: &sark::request::Ref<'req>,
                     raw: Self::Raw,
                 ) -> Option<Self> {
                     let #raw_ident { #( #path_ident, )* } = raw;
                     Some(Self {
-                        #( #build_field_exprs, )*
-                        __sark_m: ::core::marker::PhantomData,
-                    })
-                }
-
-                fn from_captures<P: sark::service::PathProbe>(
-                    path: &P,
-                    captures: Self::Captures,
-                ) -> Option<Self> {
-                    let _ = (path, captures);
-                    None
-                }
-            }
-
-            impl<'req> sark::service::RouteParamsRef<'req> for #inner_ident<'req> {
-                fn from_raw_ref(
-                    req: &sark::request::Ref<'req, ()>,
-                    raw: <Self as sark::service::RouteParams>::Raw,
-                ) -> Option<Self> {
-                    let #raw_ident { #( #path_ident, )* } = raw;
-                    Some(Self {
-                        #( #build_field_exprs, )*
+                        #( #build_borrowed_field_exprs, )*
                         __sark_m: ::core::marker::PhantomData,
                     })
                 }
@@ -171,25 +164,30 @@ impl<'a> Params<'a> {
         raw: &Ident,
         ty: &Type,
         default: Option<&LitStr>,
+        borrowed: bool,
     ) -> Result<TokenStream> {
         Ok(match ty.value_kind()? {
-            ValueKind::Local if ty.value_optional() => quote! {
+            ValueKind::Bytes if ty.value_optional() => quote! {
                 #ident: match #raw {
-                    Some(range) => Some(req.path_local(range)?),
+                    Some(range) => Some(req.path_frame(range)?),
                     None => None,
                 }
             },
-            ValueKind::Local => {
+            ValueKind::Bytes => {
                 let default = default.ok_or_else(|| {
                     Error::new_spanned(
                         ty,
-                        "non-Option request path LocalFrameBytes fields require default = \"...\"",
+                        "non-Option request path Bytes<Retained> fields require default = \"...\"",
                     )
                 })?;
-                let fallback = Value::build_default_local_expr(default);
+                let fallback = if borrowed {
+                    Value::build_default_borrowed_expr(default)
+                } else {
+                    Value::build_default_retained_expr(default)
+                };
                 quote! {
                     #ident: match #raw {
-                        Some(range) => req.path_local(range)?,
+                        Some(range) => req.path_frame(range)?,
                         None => #fallback,
                     }
                 }

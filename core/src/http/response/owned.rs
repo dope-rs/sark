@@ -1,5 +1,5 @@
 use http::{HeaderName, HeaderValue, StatusCode};
-use o3::buffer::{Owned, Shared};
+use o3::buffer::Shared;
 use serde::Serialize;
 
 use super::{Body, BodyInner, FixedResponseInner, HeaderList, IntoBody, MonoResponseInner};
@@ -8,7 +8,7 @@ use super::{Body, BodyInner, FixedResponseInner, HeaderList, IntoBody, MonoRespo
 pub struct Response {
     pub(super) status: StatusCode,
     pub(super) headers: HeaderList,
-    pub(super) wire_headers: Owned,
+    pub(super) wire_headers: Vec<u8>,
     pub(super) body: Body,
     pub(super) chunked_parts: Option<Vec<Shared>>,
 }
@@ -30,7 +30,7 @@ impl Response {
         Self {
             status,
             headers: HeaderList::new(),
-            wire_headers: Owned::new(),
+            wire_headers: Vec::new(),
             body: Body::empty(),
             chunked_parts: None,
         }
@@ -140,11 +140,11 @@ impl Response {
         self.body.is_shared()
     }
 
-    pub fn body_mut(&mut self) -> &mut Owned {
+    pub fn body_mut(&mut self) -> &mut Vec<u8> {
         self.body.as_owned_mut()
     }
 
-    pub fn into_body(self) -> Owned {
+    pub fn into_body(self) -> Vec<u8> {
         self.body.into_owned()
     }
 
@@ -156,11 +156,11 @@ impl Response {
     where
         B: IntoBody<'static>,
     {
-        self.body = body.into_response_body();
+        self.body = body.into_response_body().into_static();
     }
 
     pub fn set_body_str(&mut self, body: &str) -> &mut Self {
-        self.body = BodyInner::Owned(Owned::from(body.as_bytes()));
+        self.body = BodyInner::Owned(body.as_bytes().to_vec());
         self
     }
 
@@ -183,42 +183,31 @@ impl Response {
     }
 
     fn assert_wire_header_name(name: &str) {
-        assert!(!name.is_empty(), "wire header name must not be empty");
         assert!(
-            !name
-                .as_bytes()
-                .iter()
-                .any(|b| *b == b':' || *b == b'\r' || *b == b'\n'),
-            "wire header name must not contain separators"
-        );
-        assert!(
-            !matches!(
-                name,
-                "date" | "server" | "content-length" | "connection" | "transfer-encoding"
-            ),
-            "wire header must not override managed headers: {name}"
+            sark_protocol::validate_response_header_name(name).is_ok(),
+            "invalid or managed wire header name: {name}"
         );
     }
 }
 
-impl From<MonoResponseInner<'static>> for Response {
-    fn from(response: MonoResponseInner<'static>) -> Self {
+impl<const N: usize> From<MonoResponseInner<'static, N>> for Response {
+    fn from(response: MonoResponseInner<'static, N>) -> Self {
         Self {
             status: response.status,
             headers: response.headers.map(|h| *h).unwrap_or_default(),
-            wire_headers: Owned::from(response.head.into_bytes().as_ref()),
+            wire_headers: response.head.into_bytes().as_ref().to_vec(),
             body: BodyInner::from(response.body),
             chunked_parts: None,
         }
     }
 }
 
-impl From<FixedResponseInner<'static>> for Response {
-    fn from(response: FixedResponseInner<'static>) -> Self {
+impl<const N: usize> From<FixedResponseInner<'static, N>> for Response {
+    fn from(response: FixedResponseInner<'static, N>) -> Self {
         Self {
             status: response.status,
             headers: HeaderList::new(),
-            wire_headers: Owned::from(response.wire_headers().as_ref()),
+            wire_headers: response.wire_headers().as_ref().to_vec(),
             body: BodyInner::Shared(response.body),
             chunked_parts: None,
         }

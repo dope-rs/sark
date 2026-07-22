@@ -1,11 +1,10 @@
 use http::StatusCode;
-use o3::buffer::{Owned, Shared};
+use o3::buffer::{Borrowed, Bytes, Owned, Retained, Shared};
 
 use super::super::{HotBodyInner, HotHeadInner, IntoBody, MonoResponseInner};
 use super::head::HeadInner;
 use super::headers::{HeaderAssert, HeaderNameToken, HeaderStaticValueToken, HeadersInner};
 use super::value::{InlineHeaderValue, TextSpec};
-use crate::http::request::LocalFrameBytesRef;
 
 #[derive(Clone, Debug)]
 pub struct ResponsePlanInner<'req> {
@@ -48,21 +47,19 @@ impl<'req> ResponsePlanInner<'req> {
 
     pub fn wire_headers(&self) -> Shared {
         let mut out = Owned::with_capacity(self.head.wire_len());
-        self.head.write_into(&mut out);
+        self.head.write_into_owned(&mut out);
         out.freeze()
     }
 
     pub fn push_static(&mut self, name: &'static str, value: &'static str) -> &mut Self {
-        HeaderAssert::name(name);
-        HeaderAssert::value(value);
-        let token = HeaderStaticValueToken::new(value);
-        self.head.headers_mut().push_static(name, token);
+        let name = HeaderNameToken::new(name);
+        let value = HeaderStaticValueToken::new(value);
+        self.head.headers_mut().push_static(name, value);
         self
     }
 
     pub fn push(&mut self, name: &'static str, value: &str) -> &mut Self {
-        HeaderAssert::name(name);
-        self.push_str_value(name, value)
+        self.push_str_value(HeaderNameToken::new(name), value)
     }
 
     pub fn push_token_static(
@@ -70,15 +67,15 @@ impl<'req> ResponsePlanInner<'req> {
         name: HeaderNameToken,
         value: HeaderStaticValueToken,
     ) -> &mut Self {
-        self.head.headers_mut().push_static(name.as_str(), value);
+        self.head.headers_mut().push_static(name, value);
         self
     }
 
     pub fn push_token(&mut self, name: HeaderNameToken, value: &str) -> &mut Self {
-        self.push_str_value(name.as_str(), value)
+        self.push_str_value(name, value)
     }
 
-    fn push_str_value(&mut self, name: &'static str, value: &str) -> &mut Self {
+    fn push_str_value(&mut self, name: HeaderNameToken, value: &str) -> &mut Self {
         HeaderAssert::value(value);
         if value.len() <= 31 {
             self.head
@@ -92,13 +89,23 @@ impl<'req> ResponsePlanInner<'req> {
         self
     }
 
-    pub fn push_local_token(
+    pub fn push_borrowed_token(
         &mut self,
         name: HeaderNameToken,
-        value: LocalFrameBytesRef<'req>,
+        value: Bytes<Borrowed<'req>>,
     ) -> &mut Self {
-        HeaderAssert::value_bytes(value.as_bytes());
-        self.head.headers_mut().push_local(name.as_str(), value);
+        HeaderAssert::value_bytes(value.as_slice());
+        self.head.headers_mut().push_borrowed(name, value);
+        self
+    }
+
+    pub fn push_retained_token(
+        &mut self,
+        name: HeaderNameToken,
+        value: Bytes<Retained>,
+    ) -> &mut Self {
+        HeaderAssert::value_bytes(value.as_slice());
+        self.head.headers_mut().push_retained(name, value);
         self
     }
 

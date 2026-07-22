@@ -101,8 +101,6 @@ impl FrameHead {
         }))
     }
 
-    /// Header byte count for `payload_len` (2, 4, or 10).
-    #[inline]
     pub const fn header_len(payload_len: usize) -> usize {
         if payload_len <= 125 {
             2
@@ -113,10 +111,6 @@ impl FrameHead {
         }
     }
 
-    /// Write the frame header into `dst` and return its length. `dst` must hold
-    /// at least [`header_len`](Self::header_len)`(payload_len)` bytes. Avoids a
-    /// per-frame heap `Vec` on the send hot path.
-    #[inline]
     pub fn encode_header_into(
         dst: &mut [u8],
         opcode: u8,

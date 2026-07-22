@@ -1,10 +1,9 @@
-use o3::buffer::Shared;
-use sark::json::{JsonDecode, JsonEncode, Scratch};
-use sark_core::http::LocalFrameBytes;
+use o3::buffer::{Bytes, Retained, Shared};
+use sark::json::{JsonDecode, JsonEncode, ScratchVec};
 
 #[sark_gen::json(ordered)]
 struct Message {
-    message: LocalFrameBytes,
+    message: Bytes<Retained>,
 }
 
 #[sark_gen::json(ordered)]
@@ -17,7 +16,7 @@ struct World {
 #[sark_gen::json(ordered)]
 struct Fortune {
     id: u64,
-    message: LocalFrameBytes,
+    message: Bytes<Retained>,
 }
 
 #[sark_gen::json(ordered)]
@@ -29,13 +28,13 @@ struct Rating {
 #[sark_gen::json(ordered)]
 struct Item {
     id: u64,
-    name: LocalFrameBytes,
-    category: LocalFrameBytes,
+    name: Bytes<Retained>,
+    category: Bytes<Retained>,
     price: u64,
     quantity: u64,
     active: bool,
     #[field(seq)]
-    tags: Vec<LocalFrameBytes>,
+    tags: Vec<Bytes<Retained>>,
     #[field(nested)]
     rating: Rating,
     total: u64,
@@ -88,18 +87,18 @@ fn recursive_typed_deep_errors_without_overflow() {
     );
 }
 
-fn lfb(value: &'static [u8]) -> LocalFrameBytes {
-    LocalFrameBytes::from_shared(Shared::from_static(value))
+fn lfb(value: &'static [u8]) -> Bytes<Retained> {
+    Bytes::<Retained>::from(Shared::from_static(value))
 }
 
 fn encode<T: JsonEncode>(value: &T) -> Vec<u8> {
     let out = value.encode_json();
     assert_eq!(
         value.json_len(),
-        out.as_ref().len(),
+        out.len(),
         "json_len must equal encoded length"
     );
-    out.as_ref().to_vec()
+    out
 }
 
 fn sample_item() -> Item {
@@ -247,7 +246,7 @@ fn control_chars_six_byte_escape_identity() {
 
 #[test]
 fn scratch_reuse_yields_identical_bytes() {
-    let scratch: Scratch<Item> = Scratch::new();
+    let scratch: ScratchVec<Item> = ScratchVec::new();
     let mut prev: Option<Vec<u8>> = None;
     for _ in 0..5 {
         let mut items = scratch.take();
@@ -261,7 +260,7 @@ fn scratch_reuse_yields_identical_bytes() {
                 "scratch reuse must produce identical bytes"
             );
         }
-        scratch.give(response.items);
+        scratch.put(response.items);
         prev = Some(bytes);
     }
 }
@@ -273,18 +272,18 @@ fn round_trips_through_decode() {
         count: 2,
     };
     let encoded = response.encode_json();
-    let decoded = ItemsResponse::decode_json(encoded.freeze()).expect("decode");
+    let decoded = ItemsResponse::decode_json(Shared::from(encoded)).expect("decode");
     assert_eq!(decoded.count, 2);
     assert_eq!(decoded.items.len(), 2);
     let item = &decoded.items[0];
     assert_eq!(item.id, 1);
-    assert_eq!(item.name.as_bytes(), b"Alpha");
-    assert_eq!(item.category.as_bytes(), b"electronics");
+    assert_eq!(item.name.as_slice(), b"Alpha");
+    assert_eq!(item.category.as_slice(), b"electronics");
     assert_eq!(item.price, 328);
     assert!(item.active);
     assert_eq!(item.tags.len(), 2);
-    assert_eq!(item.tags[0].as_bytes(), b"fast");
-    assert_eq!(item.tags[1].as_bytes(), b"new");
+    assert_eq!(item.tags[0].as_slice(), b"fast");
+    assert_eq!(item.tags[1].as_slice(), b"new");
     assert_eq!(item.rating.score, 48);
     assert_eq!(item.rating.count, 127);
     assert_eq!(item.total, 14760);

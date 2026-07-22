@@ -1,26 +1,27 @@
 pub mod conn_state;
 pub mod pipeline;
-pub mod preser;
+pub mod response_cache;
 pub mod routing;
 
-use std::future::Future;
-use std::mem;
 use std::ops::Range;
-use std::task::{Context, Poll};
+use std::pin::Pin;
+use std::task::Poll;
 
 pub use conn_state::{ConsumeOutcome, Outcome};
-use dope::Driver;
+use dope::DriverContext;
 use dope::manifold::listener;
-use dope::transport::link;
-use dope::transport::wire::Wire;
+use dope::manifold::listener::SlotEgress;
+use dope_net::link;
+use dope_net::wire::Wire;
 use o3::buffer::Shared;
 pub use pipeline::{Pipeline, identity_mut};
-use preser::Slot;
+use response_cache::Cache;
 pub use routing::Routing;
-use sark_core::http::{CHUNK_TERMINATOR, FixedResponseInner, Shape};
+use sark_core::http::compress::Gzip;
+use sark_core::http::{CHUNK_TERMINATOR, FixedResponseInner, OwnedShape, Shape};
 
 use crate::service::{self, RouteRequestImpl, RouteSpec, SlicePath, manifold};
-use crate::{CANNED_400, CANNED_500, Request, request};
+use crate::{CANNED_400, CANNED_500, request};
 
 impl service::Key {
     pub fn miss_tag(maybe: Option<Self>, path_hit: bool) -> u64 {
@@ -103,7 +104,7 @@ pub enum Decoded {
 pub trait Decode {
     fn dispatch_decoded<E: ResponseEncoder>(
         &self,
-        method: http::Method,
+        _method: http::Method,
         path: &[u8],
         headers: &[(&[u8], Range<usize>)],
         head_bytes: &[u8],
@@ -112,18 +113,123 @@ pub trait Decode {
     ) -> Decoded;
 }
 
-struct StaticRequest<R: RouteSpec> {
-    request: Request,
-    params: <R as RouteSpec>::Params<'static>,
-    headers: <R as RouteSpec>::Headers<'static>,
-    body: <R as RouteSpec>::ParsedBody<'static>,
+pub trait DecodeRoute<R: RouteSpec, S> {
+    #[allow(clippy::too_many_arguments)]
+    fn decode<E: ResponseEncoder>(
+        route: &R,
+        raw_params: R::RawParams,
+        raw_headers: R::RawHeaders,
+        _method: http::Method,
+        head: &[u8],
+        body: &[u8],
+        state: &S,
+        encoder: &mut E,
+    ) -> Decoded;
+}
+
+impl<R, S> DecodeRoute<R, S> for manifold::Sync
+where
+    R: RouteSpec + manifold::Route<S> + 'static,
+{
+    fn decode<E: ResponseEncoder>(
+        route: &R,
+        raw_params: R::RawParams,
+        raw_headers: R::RawHeaders,
+        _method: http::Method,
+        head: &[u8],
+        body: &[u8],
+        state: &S,
+        encoder: &mut E,
+    ) -> Decoded {
+        match Pipeline::build_and_invoke::<R, S>(
+            route,
+            raw_params,
+            raw_headers,
+            0..0,
+            head,
+            body,
+            body.len(),
+            state,
+        ) {
+            Ok(response) => {
+                let static_body = matches!(
+                    R::RESPONSE_BODY_KIND,
+                    sark_core::http::body_kind::ResponseKind::Static,
+                )
+                .then(|| Shape::preserialize_static(&response))
+                .flatten()
+                .map(|(_, _, body)| body);
+                ResponseEncoder::emit(
+                    encoder,
+                    Shape::status(&response),
+                    AsRef::as_ref(&Shape::headers_wire(&response)),
+                    static_body.unwrap_or_else(|| Shape::body_bytes(&response)),
+                );
+                Decoded::Emitted
+            }
+            Err(_) => Decoded::Bad,
+        }
+    }
+}
+
+impl<R: RouteSpec, S> DecodeRoute<R, S> for manifold::NativeFiber {
+    fn decode<E: ResponseEncoder>(
+        _route: &R,
+        _raw_params: R::RawParams,
+        _raw_headers: R::RawHeaders,
+        _method: http::Method,
+        _head: &[u8],
+        _body: &[u8],
+        _state: &S,
+        _encoder: &mut E,
+    ) -> Decoded {
+        Decoded::Unsupported
+    }
+}
+
+impl<R: RouteSpec, S> DecodeRoute<R, S> for manifold::NativeStream {
+    fn decode<E: ResponseEncoder>(
+        _route: &R,
+        _raw_params: R::RawParams,
+        _raw_headers: R::RawHeaders,
+        _method: http::Method,
+        _head: &[u8],
+        _body: &[u8],
+        _state: &S,
+        _encoder: &mut E,
+    ) -> Decoded {
+        Decoded::Unsupported
+    }
+}
+
+struct RequestDomainInput<R: RouteSpec> {
+    storage: request::RequestStorage,
+    raw_params: <R as RouteSpec>::RawParams,
+    raw_headers: <R as RouteSpec>::RawHeaders,
+    target: Range<usize>,
     total: usize,
     conn_close: bool,
 }
 
 enum RequestErr {
-    NeedMore(Option<usize>),
+    NeedMore(conn_state::NeedMore),
     Bad(&'static [u8]),
+}
+
+fn assemble_matched<'r, R: RouteSpec>(
+    permit: conn_state::DispatchPermit,
+    matched: Matched<'r, R>,
+    ctx: &Ctx<'_>,
+    conn: &mut conn_state::ConnState,
+) -> Result<(&'r R, RequestDomainInput<R>), conn_state::ConsumeOutcome> {
+    let Matched { route, raw_params } = matched;
+    match ctx.assemble_domain::<R>(raw_params, conn) {
+        Ok(request) => Ok((route, request)),
+        Err(RequestErr::NeedMore(state)) => {
+            Err(conn_state::ConsumeOutcome::NeedMore { permit, state })
+        }
+        Err(RequestErr::Bad(reason)) => Err(conn_state::ConsumeOutcome::Close(reason)),
+    }
 }
 
 impl Ctx<'_> {
@@ -156,11 +262,11 @@ impl Ctx<'_> {
         o3::buffer::Shared::copy_from_slice(&req_bytes[..len])
     }
 
-    fn assemble_static<R: RouteSpec>(
+    fn assemble_domain<R: RouteSpec>(
         &self,
         raw_params: <R as RouteSpec>::RawParams,
         conn: &mut conn_state::ConnState,
-    ) -> Result<StaticRequest<R>, RequestErr> {
+    ) -> Result<RequestDomainInput<R>, RequestErr> {
         let Framing {
             mut raw_headers,
             head_len,
@@ -169,17 +275,13 @@ impl Ctx<'_> {
             chunked_body,
             accept_gzip: _,
         } = Framing::<R>::from_ctx(self)?;
-        if let Some(decoded) = chunked_body {
-            conn.chunked_body = Some(decoded);
-        }
-        let retain = if conn.chunked_body.is_some() {
+        let retain = if chunked_body.is_some() {
             head_len
         } else {
             total
         };
         let retained = Self::retain_req(conn.recv_view.as_ref(), self.req_bytes, retain);
-        let slot = conn.retained_req.insert(retained);
-        let req: &[u8] = slot.as_ref();
+        let req: &[u8] = retained.as_ref();
         if let Some(qrange) = self.query_range.clone()
             && <<R as RouteSpec>::Request as RouteRequestImpl>::parse_query_raw(
                 &mut raw_headers,
@@ -190,44 +292,15 @@ impl Ctx<'_> {
         {
             return Err(RequestErr::Bad(CANNED_400));
         }
-        let Ok(http_method) = self.http_method() else {
+        if self.http_method().is_err() {
             return Err(RequestErr::Bad(CANNED_400));
-        };
+        }
         let target_range = self.target_off..(self.target_off + self.target_len);
-        let body_bytes: &[u8] = match &conn.chunked_body {
-            Some(shared) => shared.as_ref(),
-            None => &req[head_len..],
-        };
-        // SAFETY: req borrows conn.retained_req (refcounts the recv accum, COW-kept
-        // against later mutation), body borrows conn.retained_req or conn.chunked_body
-        // — both conn-owned, freed at slab.release → 'static-sound for the fiber/stream
-        // lifetime.
-        let request = unsafe {
-            Request::from_borrowed_static(http_method, target_range, &req[..head_len], body_bytes)
-        };
-        let Some(params) =
-            <<R as RouteSpec>::Request as RouteRequestImpl>::build_params(&request, raw_params)
-        else {
-            return Err(RequestErr::Bad(CANNED_400));
-        };
-        let headers = match <<R as RouteSpec>::Request as RouteRequestImpl>::build_headers(
-            &request,
+        Ok(RequestDomainInput {
+            storage: request::RequestStorage::new(retained, chunked_body, head_len),
+            raw_params,
             raw_headers,
-        ) {
-            Ok(h) => h,
-            Err(_) => return Err(RequestErr::Bad(CANNED_400)),
-        };
-        let body_borrowed = match <R as RouteSpec>::parse_body(body_bytes) {
-            Ok(b) => b,
-            Err(_) => return Err(RequestErr::Bad(CANNED_400)),
-        };
-        // SAFETY: parsed body borrows from the same frozen storage as `request`.
-        let body = unsafe { Pipeline::lift_parsed_body_to_static::<R>(body_borrowed) };
-        Ok(StaticRequest {
-            request,
-            params,
-            headers,
-            body,
+            target: target_range,
             total,
             conn_close,
         })
@@ -294,73 +367,55 @@ impl Outcome {
     pub fn into_consume(
         self,
         permit: conn_state::DispatchPermit,
-        consumed: usize,
+        consumption: conn_state::Consumption,
         conn_close: bool,
     ) -> conn_state::ConsumeOutcome {
         use conn_state::ConsumeOutcome;
         match self {
-            Outcome::Send {
-                written,
-                close_after,
-            } => ConsumeOutcome::Done {
+            response @ (Outcome::Send { .. }
+            | Outcome::SendStatic { .. }
+            | Outcome::SendSplit { .. }
+            | Outcome::SendPooled { .. }) => ConsumeOutcome::Complete {
                 permit,
-                consumed,
-                written,
-                close: close_after || conn_close,
+                consumption,
+                response,
+                conn_close,
             },
-            Outcome::SendStatic {
-                hdr_written,
-                body,
-                close_after,
-            } => ConsumeOutcome::DoneStatic {
-                permit,
-                consumed,
-                hdr_written,
-                body,
-                close: close_after || conn_close,
-            },
-            Outcome::SendSplit {
-                hdr_written,
-                body,
-                close_after,
-            } => ConsumeOutcome::DoneSplit {
-                permit,
-                consumed,
-                hdr_written,
-                body,
-                close: close_after || conn_close,
-            },
-            Outcome::Park => ConsumeOutcome::Park {
-                consumed,
-                close: conn_close,
+            Outcome::Park => match consumption {
+                conn_state::Consumption::Buffered(consumed) => ConsumeOutcome::Park {
+                    consumed,
+                    close: conn_close,
+                },
+                conn_state::Consumption::Discard { .. } => ConsumeOutcome::Close(CANNED_500),
             },
             Outcome::Close(reason) => ConsumeOutcome::Close(reason),
         }
     }
 
-    pub fn apply<W: Wire, C: Default + 'static>(
+    pub fn apply<'d, W: Wire, C: Default + 'static>(
         self,
-        slot: &mut link::Slot<W, listener::State<C>>,
+        slot: &mut link::slot::Slot<'d, W, listener::State<C>>,
         aux: &mut listener::Aux,
-        driver: &mut Driver,
-    ) {
+        driver: &mut DriverContext<'_, 'd>,
+    ) -> bool {
         let close_after = match &self {
-            Outcome::Park => return,
+            Outcome::Park => return true,
             Outcome::Close(reason) => {
-                slot.core.set_close_after();
+                slot.set_close_after();
                 if !reason.is_empty() {
                     let buf = aux.write_buf_for(slot);
                     let ud = slot.token();
-                    slot.submit_split_static(buf, 0, reason, ud, driver);
+                    return slot.submit_split_static(buf, 0, reason, ud, driver);
                 }
-                return;
+                return true;
             }
             Outcome::Send { close_after, .. }
             | Outcome::SendStatic { close_after, .. }
-            | Outcome::SendSplit { close_after, .. } => *close_after,
+            | Outcome::SendSplit { close_after, .. }
+            | Outcome::SendPooled { close_after, .. } => *close_after,
         };
         if close_after {
-            slot.core.set_close_after();
+            slot.set_close_after();
         }
         let buf = aux.write_buf_for(slot);
         let ud = slot.token();
@@ -372,12 +427,15 @@ impl Outcome {
             Outcome::SendSplit {
                 hdr_written, body, ..
             } => slot.submit_split_shared(buf, hdr_written, body, ud, driver),
+            Outcome::SendPooled {
+                hdr_written, body, ..
+            } => slot.submit_split_pooled(buf, hdr_written, body, ud, driver),
             Outcome::Park | Outcome::Close(_) => unreachable!(),
         }
     }
 
-    fn write_response<R: RouteSpec>(
-        resp: <R as RouteSpec>::Response<'_>,
+    fn write_shape<'req, S: Shape<'req>>(
+        resp: S,
         write: &mut [u8],
         date: &[u8; 29],
         close_after: bool,
@@ -404,6 +462,295 @@ pub struct Matched<'r, R: RouteSpec> {
     pub raw_params: <R as RouteSpec>::RawParams,
 }
 
+pub enum TaskPoll {
+    Complete,
+    Stream(Option<Shared>),
+}
+
+pub trait Complete<'d, R, F>: service::manifold::Kind<'d, R, F>
+where
+    R: RouteSpec,
+{
+    fn complete<'a, W: Wire, C: Default + 'static>(
+        output: <Self as service::manifold::Kind<'d, R, F>>::Output,
+        slot: &mut link::slot::Slot<'a, W, listener::State<C>>,
+        aux: &mut listener::Aux,
+        driver: &mut DriverContext<'_, 'a>,
+        date: &[u8; 29],
+        close: bool,
+    ) -> TaskPoll;
+}
+
+impl<'d, R: RouteSpec, F> Complete<'d, R, F> for service::manifold::Sync {
+    fn complete<'a, W: Wire, C: Default + 'static>(
+        _output: <Self as service::manifold::Kind<'d, R, F>>::Output,
+        _slot: &mut link::slot::Slot<'a, W, listener::State<C>>,
+        _aux: &mut listener::Aux,
+        _driver: &mut DriverContext<'_, 'a>,
+        _date: &[u8; 29],
+        _close: bool,
+    ) -> TaskPoll {
+        unreachable!()
+    }
+}
+
+impl<'d, R, F> Complete<'d, R, F> for service::manifold::NativeFiber
+where
+    R: RouteSpec,
+    F: dope_fiber::Fiber<'d, Output = R::AsyncResponse> + 'd,
+{
+    fn complete<'a, W: Wire, C: Default + 'static>(
+        output: <Self as service::manifold::Kind<'d, R, F>>::Output,
+        slot: &mut link::slot::Slot<'a, W, listener::State<C>>,
+        aux: &mut listener::Aux,
+        driver: &mut DriverContext<'_, 'a>,
+        date: &[u8; 29],
+        close: bool,
+    ) -> TaskPoll {
+        Pipeline::finish_pending::<R, W, C>(output, slot, aux, driver, date, close);
+        TaskPoll::Complete
+    }
+}
+
+impl<'d, R, F> Complete<'d, R, F> for service::manifold::NativeStream
+where
+    R: RouteSpec,
+    R::Stream: dope_fiber::Fiber<'d, Output = Option<Shared>> + 'd,
+{
+    fn complete<'a, W: Wire, C: Default + 'static>(
+        output: <Self as service::manifold::Kind<'d, R, F>>::Output,
+        _slot: &mut link::slot::Slot<'a, W, listener::State<C>>,
+        _aux: &mut listener::Aux,
+        _driver: &mut DriverContext<'_, 'a>,
+        _date: &[u8; 29],
+        _close: bool,
+    ) -> TaskPoll {
+        TaskPoll::Stream(output)
+    }
+}
+
+pub trait Dispatch<'d, R, S, F>
+where
+    R: RouteSpec,
+{
+    #[allow(clippy::too_many_arguments)]
+    fn dispatch<T, Tag, MK, Wrap, const N: usize>(
+        permit: conn_state::DispatchPermit,
+        matched: Matched<'d, R>,
+        tasks: Pin<&mut crate::fiber::FixedSlab<'d, T, N, Tag>>,
+        state: &'d S,
+        ctx: &Ctx<'_>,
+        timer: &'d crate::Timer<'d>,
+        conn: &mut conn_state::ConnState,
+        date: &[u8; 29],
+        cache: Cache<'_>,
+        gzip: &mut Gzip,
+        write: &mut [u8],
+        make: MK,
+        wrap: Wrap,
+    ) -> conn_state::ConsumeOutcome
+    where
+        T: dope_fiber::Fiber<'d> + 'd,
+        MK: FnOnce(
+            &'d R,
+            <R as RouteSpec>::Params<'d>,
+            request::Ref<'d>,
+            <R as RouteSpec>::Headers<'d>,
+            R::ParsedBody<'d>,
+            &'d S,
+            &'d crate::Timer<'d>,
+        ) -> F,
+        Wrap: FnOnce(
+            <Self as service::manifold::Kind<'d, R, F>>::Task,
+            <Self as service::manifold::Kind<'d, R, F>>::Owner,
+        ) -> T,
+        Self: service::manifold::Kind<'d, R, F>;
+}
+
+impl<'d, R, S, F> Dispatch<'d, R, S, F> for service::manifold::Sync
+where
+    R: RouteSpec + manifold::Route<S> + 'static,
+{
+    fn dispatch<T, Tag, MK, Wrap, const N: usize>(
+        permit: conn_state::DispatchPermit,
+        matched: Matched<'d, R>,
+        _tasks: Pin<&mut crate::fiber::FixedSlab<'d, T, N, Tag>>,
+        state: &'d S,
+        ctx: &Ctx<'_>,
+        _timer: &'d crate::Timer<'d>,
+        _conn: &mut conn_state::ConnState,
+        date: &[u8; 29],
+        cache: Cache<'_>,
+        gzip: &mut Gzip,
+        write: &mut [u8],
+        _make: MK,
+        _wrap: Wrap,
+    ) -> conn_state::ConsumeOutcome
+    where
+        T: dope_fiber::Fiber<'d> + 'd,
+        MK: FnOnce(
+            &'d R,
+            <R as RouteSpec>::Params<'d>,
+            request::Ref<'d>,
+            <R as RouteSpec>::Headers<'d>,
+            R::ParsedBody<'d>,
+            &'d S,
+            &'d crate::Timer<'d>,
+        ) -> F,
+        Wrap: FnOnce(
+            <Self as service::manifold::Kind<'d, R, F>>::Task,
+            <Self as service::manifold::Kind<'d, R, F>>::Owner,
+        ) -> T,
+        Self: service::manifold::Kind<'d, R, F>,
+    {
+        Pipeline::route_manifold(permit, matched, state, ctx, (date, cache, gzip, write))
+    }
+}
+
+impl<'d, R, S, F> Dispatch<'d, R, S, F> for service::manifold::NativeFiber
+where
+    R: RouteSpec + 'static,
+    S: 'd,
+    F: dope_fiber::Fiber<'d, Output = R::AsyncResponse> + 'd,
+    service::manifold::NativeFiber:
+        service::manifold::Kind<'d, R, F, Task = F, Owner = request::RequestStorage>,
+{
+    fn dispatch<T, Tag, MK, Wrap, const N: usize>(
+        permit: conn_state::DispatchPermit,
+        matched: Matched<'d, R>,
+        mut tasks: Pin<&mut crate::fiber::FixedSlab<'d, T, N, Tag>>,
+        state: &'d S,
+        ctx: &Ctx<'_>,
+        timer: &'d crate::Timer<'d>,
+        conn: &mut conn_state::ConnState,
+        _date: &[u8; 29],
+        _cache: Cache<'_>,
+        _gzip: &mut Gzip,
+        _write: &mut [u8],
+        make: MK,
+        wrap: Wrap,
+    ) -> conn_state::ConsumeOutcome
+    where
+        T: dope_fiber::Fiber<'d> + 'd,
+        MK: FnOnce(
+            &'d R,
+            <R as RouteSpec>::Params<'d>,
+            request::Ref<'d>,
+            <R as RouteSpec>::Headers<'d>,
+            R::ParsedBody<'d>,
+            &'d S,
+            &'d crate::Timer<'d>,
+        ) -> F,
+        Wrap: FnOnce(
+            <Self as service::manifold::Kind<'d, R, F>>::Task,
+            <Self as service::manifold::Kind<'d, R, F>>::Owner,
+        ) -> T,
+        Self: service::manifold::Kind<'d, R, F>,
+    {
+        let (
+            route,
+            RequestDomainInput {
+                storage,
+                raw_params,
+                raw_headers,
+                target,
+                total,
+                conn_close,
+            },
+        ) = match assemble_matched(permit, matched, ctx, conn) {
+            Ok(request) => request,
+            Err(outcome) => return outcome,
+        };
+        let (head, body) = unsafe { storage.task_views() };
+        let request = request::Ref::<'d>::from_slice(target, head, body);
+        let Some(params) =
+            <<R as RouteSpec>::Request as RouteRequestImpl>::build_params(&request, raw_params)
+        else {
+            return conn_state::ConsumeOutcome::Close(CANNED_400);
+        };
+        let headers = match <<R as RouteSpec>::Request as RouteRequestImpl>::build_headers(
+            &request,
+            raw_headers,
+        ) {
+            Ok(headers) => headers,
+            Err(_) => return conn_state::ConsumeOutcome::Close(CANNED_400),
+        };
+        let body = match <R as RouteSpec>::parse_body(body) {
+            Ok(body) => body,
+            Err(_) => return conn_state::ConsumeOutcome::Close(CANNED_400),
+        };
+        let Some(entry) = tasks.as_mut().vacant_entry() else {
+            return conn_state::ConsumeOutcome::Close(crate::CANNED_503);
+        };
+        let task = wrap(
+            make(route, params, request, headers, body, state, timer),
+            storage,
+        );
+        let task = entry.insert(task);
+        conn.async_state.task = Some(task.erase());
+        conn.async_state.task_stream = false;
+        conn_state::ConsumeOutcome::Park {
+            consumed: total,
+            close: conn_close,
+        }
+    }
+}
+
+impl<'d, R, S, F> Dispatch<'d, R, S, F> for service::manifold::NativeStream
+where
+    R: RouteSpec + manifold::Route<S> + 'static,
+    for<'req> R::Response<'req>: Shape<'req, StreamInner = R::Stream>,
+    R::Stream: dope_fiber::Fiber<'d, Output = Option<Shared>> + 'd,
+    S: 'd,
+    service::manifold::NativeStream:
+        service::manifold::Kind<'d, R, F, Task = R::Stream, Owner = ()>,
+{
+    fn dispatch<T, Tag, MK, Wrap, const N: usize>(
+        permit: conn_state::DispatchPermit,
+        matched: Matched<'d, R>,
+        tasks: Pin<&mut crate::fiber::FixedSlab<'d, T, N, Tag>>,
+        state: &'d S,
+        ctx: &Ctx<'_>,
+        _timer: &'d crate::Timer<'d>,
+        conn: &mut conn_state::ConnState,
+        date: &[u8; 29],
+        _cache: Cache<'_>,
+        _gzip: &mut Gzip,
+        write: &mut [u8],
+        _make: MK,
+        wrap: Wrap,
+    ) -> conn_state::ConsumeOutcome
+    where
+        T: dope_fiber::Fiber<'d> + 'd,
+        MK: FnOnce(
+            &'d R,
+            <R as RouteSpec>::Params<'d>,
+            request::Ref<'d>,
+            <R as RouteSpec>::Headers<'d>,
+            R::ParsedBody<'d>,
+            &'d S,
+            &'d crate::Timer<'d>,
+        ) -> F,
+        Wrap: FnOnce(
+            <Self as service::manifold::Kind<'d, R, F>>::Task,
+            <Self as service::manifold::Kind<'d, R, F>>::Owner,
+        ) -> T,
+        Self: service::manifold::Kind<'d, R, F>,
+    {
+        Pipeline::route_native_stream(
+            permit,
+            matched,
+            tasks,
+            state,
+            ctx,
+            write,
+            date,
+            conn,
+            |task| wrap(task, ()),
+        )
+    }
+}
+
 struct FramingBase<R: RouteSpec> {
     raw_headers: <R as RouteSpec>::RawHeaders,
     head_len: usize,
@@ -422,11 +769,12 @@ struct Framing<R: RouteSpec> {
     accept_gzip: bool,
 }
 
-struct StreamFraming<R: RouteSpec> {
+struct DiscardFraming<R: RouteSpec> {
     raw_headers: <R as RouteSpec>::RawHeaders,
     head_len: usize,
     body_total: usize,
     conn_close: bool,
+    accept_gzip: bool,
 }
 
 impl<R: RouteSpec> FramingBase<R> {
@@ -442,7 +790,7 @@ impl<R: RouteSpec> FramingBase<R> {
                     flags,
                     accept_gzip,
                 } => (headers, head_len, body_framing, flags, accept_gzip),
-                Framed::NeedMore => return Err(RequestErr::NeedMore(None)),
+                Framed::NeedMore => return Err(RequestErr::NeedMore(conn_state::NeedMore::Head)),
                 Framed::Bad => return Err(RequestErr::Bad(CANNED_400)),
             };
         let is_bodyless_method = head.method == b"GET" || head.method == b"HEAD";
@@ -468,7 +816,7 @@ impl<R: RouteSpec> FramingBase<R> {
     }
 }
 
-impl<R: RouteSpec> StreamFraming<R> {
+impl<R: RouteSpec> DiscardFraming<R> {
     fn from_ctx(ctx: &Ctx<'_>) -> Result<Self, RequestErr> {
         use sark_core::http::codec::BodyFraming;
         let base = FramingBase::<R>::from_ctx(ctx)?;
@@ -481,11 +829,12 @@ impl<R: RouteSpec> StreamFraming<R> {
                 return Err(RequestErr::Bad(CANNED_400));
             }
         };
-        Ok(StreamFraming {
+        Ok(DiscardFraming {
             raw_headers: base.raw_headers,
             head_len: base.head_len,
             body_total,
             conn_close: base.conn_close,
+            accept_gzip: base.accept_gzip,
         })
     }
 }
@@ -501,7 +850,7 @@ impl<R: RouteSpec> Framing<R> {
                 base.checked_length(n)?;
                 let total = head_len.saturating_add(n);
                 if req_bytes.len() < total {
-                    return Err(RequestErr::NeedMore(Some(total)));
+                    return Err(RequestErr::NeedMore(conn_state::NeedMore::FixedBody(total)));
                 }
                 (total, None)
             }
@@ -511,11 +860,12 @@ impl<R: RouteSpec> Framing<R> {
                 }
                 let chunked_section = &req_bytes[head_len..];
                 match Parse::chunked_body_consumed(chunked_section, <R as RouteSpec>::MAX_BODY) {
-                    Ok(None) => return Err(RequestErr::NeedMore(None)),
-                    Ok(Some((consumed, decoded))) => (
-                        head_len.saturating_add(consumed),
-                        Some(Shared::from(decoded)),
-                    ),
+                    Ok(None) => {
+                        return Err(RequestErr::NeedMore(conn_state::NeedMore::ChunkedBody));
+                    }
+                    Ok(Some((consumed, decoded))) => {
+                        (head_len.saturating_add(consumed), Some(decoded))
+                    }
                     Err(sark_core::error::Error::PayloadTooLarge(_)) => {
                         return Err(RequestErr::Bad(crate::CANNED_413));
                     }
@@ -535,30 +885,20 @@ impl<R: RouteSpec> Framing<R> {
 }
 
 impl Pipeline {
-    unsafe fn lift_parsed_body_to_static<R: RouteSpec>(
-        body: <R as RouteSpec>::ParsedBody<'_>,
-    ) -> <R as RouteSpec>::ParsedBody<'static> {
-        // SAFETY: ParsedBody differs only in lifetime → identical layout; transmute_copy is used because the compiler cannot prove size-equality for the GAT.
-        unsafe {
-            let md = mem::ManuallyDrop::new(body);
-            mem::transmute_copy(&*md)
-        }
-    }
-
     fn try_static_response_hit<R: RouteSpec>(
         write: &mut [u8],
         date: &[u8; 29],
-        cache: &Slot<'_>,
+        cache: &Cache<'_>,
     ) -> Option<Outcome> {
         if !<R as RouteSpec>::STATIC_RESPONSE {
             return None;
         }
-        Some(match cache.try_hit(write, date)? {
-            preser::Hit::Fixed { written } => Outcome::Send {
+        Some(match cache.write(write, date)? {
+            response_cache::Cached::Fixed { written } => Outcome::Send {
                 written,
                 close_after: false,
             },
-            preser::Hit::Static { hdr_written, body } => Outcome::SendStatic {
+            response_cache::Cached::Static { hdr_written, body } => Outcome::SendStatic {
                 hdr_written,
                 body,
                 close_after: false,
@@ -567,10 +907,11 @@ impl Pipeline {
     }
 
     fn finish_sync<R: RouteSpec>(
-        mut resp: <R as RouteSpec>::Response<'_>,
+        resp: <R as RouteSpec>::Response<'_>,
         write: &mut [u8],
         date: &[u8; 29],
-        cache: Slot<'_>,
+        cache: Cache<'_>,
+        gzip: &mut Gzip,
         accept_gzip: bool,
     ) -> Outcome {
         use sark_core::http::body_kind::ResponseKind;
@@ -581,12 +922,17 @@ impl Pipeline {
             && matches!(<R as RouteSpec>::RESPONSE_BODY_KIND, ResponseKind::Inline)
             && let Some(plain) = Shape::body_for_gzip(&resp)
             && !plain.is_empty()
+            && let Some(compressed) = gzip.encode(plain)
         {
-            let compressed = sark_core::http::compress::Gzip::with_thread_local(|g| {
-                let bytes = g.encode(plain);
-                o3::buffer::Shared::from(bytes.to_vec())
-            });
-            Shape::apply_gzip_body(&mut resp, compressed);
+            let body_len = compressed.len();
+            return match Shape::write_gzip_head(resp, write, date, body_len) {
+                Some(hdr_written) => Outcome::SendPooled {
+                    hdr_written,
+                    body: compressed,
+                    close_after: false,
+                },
+                None => Outcome::Close(CANNED_500),
+            };
         }
         if <R as RouteSpec>::STATIC_RESPONSE && static_body {
             return match Shape::preserialize_static(&resp) {
@@ -603,7 +949,7 @@ impl Pipeline {
                         date_offset,
                         date,
                     );
-                    cache.store_static(head_template, date_offset, body);
+                    cache.insert_static(head_template, date_offset, body);
                     match hdr {
                         Some(hdr_written) => Outcome::SendStatic {
                             hdr_written,
@@ -625,7 +971,7 @@ impl Pipeline {
                 <R as RouteSpec>::EMIT_SERVER,
             );
             let n = FixedResponseInner::write_preserialized(write, &template, date_offset, date);
-            cache.store_fixed(template, date_offset);
+            cache.insert_fixed(template, date_offset);
             return match n {
                 Some(n) => Outcome::Send {
                     written: n,
@@ -649,7 +995,7 @@ impl Pipeline {
                 "finish_sync: Stream routes go through route_sync_stream, not finish_sync"
             );
         }
-        Outcome::write_response::<R>(resp, write, date, false)
+        Outcome::write_shape(resp, write, date, false)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -657,32 +1003,32 @@ impl Pipeline {
         route: &'a R,
         raw_params: <R as RouteSpec>::RawParams,
         raw_headers: <R as RouteSpec>::RawHeaders,
-        http_method: http::Method,
         target_range: Range<usize>,
         head_bytes: &'req [u8],
         body_bytes: &'req [u8],
+        declared_body_len: usize,
         state: &'a S,
     ) -> Result<<R as RouteSpec>::Response<'req>, &'static [u8]>
     where
         R: RouteSpec + manifold::Route<S> + 'static,
         'req: 'a,
     {
-        let request_ref_bare =
-            request::Ref::<'_, ()>::from_slice(http_method, target_range, head_bytes, body_bytes);
-        let Some(params) = <<R as RouteSpec>::Request as RouteRequestImpl>::build_params_ref(
+        let mut request_ref_bare =
+            request::Ref::<'_>::from_slice(target_range, head_bytes, body_bytes);
+        request_ref_bare.set_declared_body_len(declared_body_len);
+        let Some(params) = <<R as RouteSpec>::Request as RouteRequestImpl>::build_params(
             &request_ref_bare,
             raw_params,
         ) else {
             return Err(CANNED_400);
         };
-        let headers = match <<R as RouteSpec>::Request as RouteRequestImpl>::build_headers_ref(
+        let headers = match <<R as RouteSpec>::Request as RouteRequestImpl>::build_headers(
             &request_ref_bare,
             raw_headers,
         ) {
             Ok(h) => h,
             Err(_) => return Err(CANNED_400),
         };
-        let request_ref = request_ref_bare.with_headers_ready::<<R as RouteSpec>::Headers<'_>>();
         let parsed_body = match <R as RouteSpec>::parse_body(body_bytes) {
             Ok(b) => b,
             Err(_) => return Err(CANNED_400),
@@ -690,7 +1036,7 @@ impl Pipeline {
         Ok(<R as manifold::Route<S>>::invoke(
             route,
             params,
-            &request_ref,
+            &request_ref_bare,
             headers,
             parsed_body,
             state,
@@ -702,15 +1048,23 @@ impl Pipeline {
         matched: Matched<'_, R>,
         state: &S,
         ctx: &Ctx<'_>,
-        date: &[u8; 29],
-        cache: Slot<'_>,
-        write: &mut [u8],
+        response: (&[u8; 29], Cache<'_>, &mut Gzip, &mut [u8]),
     ) -> conn_state::ConsumeOutcome
     where
         R: RouteSpec + manifold::Route<S> + 'static,
     {
-        if <R as RouteSpec>::STREAMING_BODY {
-            return Self::route_manifold_stream::<R, S>(permit, matched, state, ctx, date, write);
+        let (date, cache, gzip, write) = response;
+        if matches!(
+            <R as RouteSpec>::BODY_POLICY,
+            service::BodyPolicy::Discarded
+        ) {
+            return Self::route_manifold_discard::<R, S>(
+                permit,
+                matched,
+                state,
+                ctx,
+                (date, cache, gzip, write),
+            );
         }
         use conn_state::ConsumeOutcome;
         let Matched { route, raw_params } = matched;
@@ -723,17 +1077,14 @@ impl Pipeline {
             accept_gzip,
         } = match Framing::<R>::from_ctx(ctx) {
             Ok(x) => x,
-            Err(RequestErr::NeedMore(content_length)) => {
-                return ConsumeOutcome::NeedMore {
-                    permit,
-                    content_length,
-                };
+            Err(RequestErr::NeedMore(state)) => {
+                return ConsumeOutcome::NeedMore { permit, state };
             }
             Err(RequestErr::Bad(reason)) => return ConsumeOutcome::Close(reason),
         };
         let req = &ctx.req_bytes[..total];
         if let Some(out) = Self::try_static_response_hit::<R>(write, date, &cache) {
-            return out.into_consume(permit, total, conn_close);
+            return out.into_consume(permit, conn_state::Consumption::Buffered(total), conn_close);
         }
         if let Some(qrange) = ctx.query_range.clone()
             && <<R as RouteSpec>::Request as RouteRequestImpl>::parse_query_raw(
@@ -749,56 +1100,60 @@ impl Pipeline {
             Some(shared) => shared.as_ref(),
             None => &req[head_len..],
         };
-        let http_method = match ctx.http_method() {
-            Ok(m) => m,
-            Err(_) => return ConsumeOutcome::Close(CANNED_400),
-        };
+        if ctx.http_method().is_err() {
+            return ConsumeOutcome::Close(CANNED_400);
+        }
         let target_range = ctx.target_off..(ctx.target_off + ctx.target_len);
         let out = match Self::build_and_invoke::<R, S>(
             route,
             raw_params,
             raw_headers,
-            http_method,
             target_range,
             &req[..head_len],
             body_bytes,
+            body_bytes.len(),
             state,
         ) {
-            Ok(resp) => Self::finish_sync::<R>(resp, write, date, cache, accept_gzip),
+            Ok(resp) => Self::finish_sync::<R>(resp, write, date, cache, gzip, accept_gzip),
             Err(reason) => return ConsumeOutcome::Close(reason),
         };
-        out.into_consume(permit, total, conn_close)
+        out.into_consume(permit, conn_state::Consumption::Buffered(total), conn_close)
     }
 
-    fn route_manifold_stream<R, S>(
+    fn route_manifold_discard<R, S>(
         permit: conn_state::DispatchPermit,
         matched: Matched<'_, R>,
         state: &S,
         ctx: &Ctx<'_>,
-        date: &[u8; 29],
-        write: &mut [u8],
+        response: (&[u8; 29], Cache<'_>, &mut Gzip, &mut [u8]),
     ) -> conn_state::ConsumeOutcome
     where
         R: RouteSpec + manifold::Route<S> + 'static,
     {
         use conn_state::ConsumeOutcome;
+        let (date, cache, gzip, write) = response;
         let Matched { route, raw_params } = matched;
-        let StreamFraming {
+        let DiscardFraming {
             mut raw_headers,
             head_len,
             body_total,
             conn_close,
-        } = match StreamFraming::<R>::from_ctx(ctx) {
+            accept_gzip,
+        } = match DiscardFraming::<R>::from_ctx(ctx) {
             Ok(x) => x,
-            Err(RequestErr::NeedMore(content_length)) => {
-                return ConsumeOutcome::NeedMore {
-                    permit,
-                    content_length,
-                };
+            Err(RequestErr::NeedMore(state)) => {
+                return ConsumeOutcome::NeedMore { permit, state };
             }
             Err(RequestErr::Bad(reason)) => return ConsumeOutcome::Close(reason),
         };
         let req_head = &ctx.req_bytes[..head_len];
+        let consumption = conn_state::Consumption::Discard {
+            head: head_len,
+            body: body_total,
+        };
+        if let Some(out) = Self::try_static_response_hit::<R>(write, date, &cache) {
+            return out.into_consume(permit, consumption, conn_close);
+        }
         if let Some(qrange) = ctx.query_range.clone()
             && <<R as RouteSpec>::Request as RouteRequestImpl>::parse_query_raw(
                 &mut raw_headers,
@@ -809,70 +1164,31 @@ impl Pipeline {
         {
             return ConsumeOutcome::Close(CANNED_400);
         }
-        let body_bytes: &[u8] = &[];
-        let http_method = match ctx.http_method() {
-            Ok(m) => m,
-            Err(_) => return ConsumeOutcome::Close(CANNED_400),
-        };
-        let target_range = ctx.target_off..(ctx.target_off + ctx.target_len);
-        let mut request_ref_bare =
-            request::Ref::<'_, ()>::from_slice(http_method, target_range, req_head, body_bytes);
-        request_ref_bare.set_declared_body_len(body_total);
-        let Some(params) = <<R as RouteSpec>::Request as RouteRequestImpl>::build_params_ref(
-            &request_ref_bare,
-            raw_params,
-        ) else {
+        if ctx.http_method().is_err() {
             return ConsumeOutcome::Close(CANNED_400);
-        };
-        let headers = match <<R as RouteSpec>::Request as RouteRequestImpl>::build_headers_ref(
-            &request_ref_bare,
-            raw_headers,
-        ) {
-            Ok(h) => h,
-            Err(_) => return ConsumeOutcome::Close(CANNED_400),
-        };
-        let request_ref = request_ref_bare.with_headers_ready::<<R as RouteSpec>::Headers<'_>>();
-        let parsed_body = match <R as RouteSpec>::parse_body(body_bytes) {
-            Ok(b) => b,
-            Err(_) => return ConsumeOutcome::Close(CANNED_400),
-        };
-        let resp = <R as manifold::Route<S>>::invoke(
-            route,
-            params,
-            &request_ref,
-            headers,
-            parsed_body,
-            state,
-        );
-        let written = match Shape::write_into_slice(&resp, write, date) {
-            Some(n) => n,
-            None => match Shape::write_head_split(resp, write, date) {
-                Some((hdr_written, body)) => {
-                    let body_end = hdr_written + body.len();
-                    if body_end <= write.len() {
-                        write[hdr_written..body_end].copy_from_slice(body.as_ref());
-                        body_end
-                    } else {
-                        return ConsumeOutcome::Close(CANNED_500);
-                    }
-                }
-                None => return ConsumeOutcome::Close(CANNED_500),
-            },
-        };
-        ConsumeOutcome::StreamArmed {
-            permit,
-            head_consumed: head_len,
-            body_total,
-            written,
-            close: conn_close,
         }
+        let target_range = ctx.target_off..(ctx.target_off + ctx.target_len);
+        let out = match Self::build_and_invoke::<R, S>(
+            route,
+            raw_params,
+            raw_headers,
+            target_range,
+            req_head,
+            &[],
+            body_total,
+            state,
+        ) {
+            Ok(resp) => Self::finish_sync::<R>(resp, write, date, cache, gzip, accept_gzip),
+            Err(reason) => return ConsumeOutcome::Close(reason),
+        };
+        out.into_consume(permit, consumption, conn_close)
     }
 
-    pub fn finish_pending<R: RouteSpec, W: Wire, C: Default + 'static>(
-        resp: <R as RouteSpec>::Response<'static>,
-        slot: &mut link::Slot<W, listener::State<C>>,
+    pub fn finish_pending<'d, R: RouteSpec, W: Wire, C: Default + 'static>(
+        resp: <R as RouteSpec>::AsyncResponse,
+        slot: &mut link::slot::Slot<'d, W, listener::State<C>>,
         aux: &mut listener::Aux,
-        driver: &mut Driver,
+        driver: &mut DriverContext<'_, 'd>,
         date: &[u8; 29],
         close: bool,
     ) {
@@ -880,315 +1196,277 @@ impl Pipeline {
         if matches!(<R as RouteSpec>::RESPONSE_BODY_KIND, ResponseKind::Stream) {
             unreachable!("finish_pending: Stream routes go through finish_pending_stream");
         }
+        let resp = resp.into_shape();
         let outcome = {
-            let write = aux.write_buf_for(slot);
-            Outcome::write_response::<R>(resp, write, date, close)
+            let mut write = aux.write_buf_for(slot);
+            Outcome::write_shape(resp, &mut write, date, close)
         };
         outcome.apply(slot, aux, driver);
     }
 
     #[allow(clippy::too_many_arguments)]
-    pub fn route_sync_stream<'d, R, S, S2, const N: usize, const ROUTE_ID: u8>(
+    pub fn route_native_stream<'d, R, S, T, Tag, Wrap, const N: usize>(
         permit: conn_state::DispatchPermit,
         matched: Matched<'d, R>,
-        stream_slab: &mut dope::fiber::Slab<'d, S2, N>,
+        mut tasks: Pin<&mut crate::fiber::FixedSlab<'d, T, N, Tag>>,
         state: &'d S,
         ctx: &Ctx<'_>,
         write: &mut [u8],
         date: &[u8; 29],
         conn: &mut conn_state::ConnState,
+        wrap: Wrap,
     ) -> conn_state::ConsumeOutcome
     where
-        R: RouteSpec + manifold::StreamRoute<S> + 'static,
-        for<'req> <R as RouteSpec>::Response<'req>: Shape<'req, StreamInner = S2>,
-        S: 'd,
-        S2: Future<Output = Option<Shared>> + 'd,
+        R: RouteSpec + manifold::Route<S> + 'static,
+        for<'req> R::Response<'req>: Shape<'req, StreamInner = R::Stream>,
+        R::Stream: dope_fiber::Fiber<'d, Output = Option<Shared>> + 'd,
+        T: dope_fiber::Fiber<'d> + 'd,
+        Wrap: FnOnce(R::Stream) -> T,
     {
         use conn_state::ConsumeOutcome;
         let Matched { route, raw_params } = matched;
-        let StaticRequest {
-            request,
-            params,
-            headers,
-            body,
+        let Framing {
+            mut raw_headers,
+            head_len,
             total,
             conn_close,
-        } = match ctx.assemble_static::<R>(raw_params, conn) {
-            Ok(r) => r,
-            Err(RequestErr::NeedMore(content_length)) => {
-                return ConsumeOutcome::NeedMore {
-                    permit,
-                    content_length,
-                };
+            chunked_body,
+            accept_gzip: _,
+        } = match Framing::<R>::from_ctx(ctx) {
+            Ok(framing) => framing,
+            Err(RequestErr::NeedMore(state)) => {
+                return ConsumeOutcome::NeedMore { permit, state };
             }
             Err(RequestErr::Bad(reason)) => return ConsumeOutcome::Close(reason),
         };
-        let resp =
-            <R as manifold::StreamRoute<S>>::invoke(route, params, request, headers, body, state);
-        let Some((hdr_written, sark_stream)) = Shape::write_head_stream(resp, write, date) else {
+        let req = &ctx.req_bytes[..total];
+        if let Some(query) = ctx.query_range.clone()
+            && <<R as RouteSpec>::Request as RouteRequestImpl>::parse_query_raw(
+                &mut raw_headers,
+                req,
+                query,
+            )
+            .is_err()
+        {
+            return ConsumeOutcome::Close(CANNED_400);
+        }
+        let body = match chunked_body.as_ref() {
+            Some(shared) => shared.as_ref(),
+            None => &req[head_len..],
+        };
+        if ctx.http_method().is_err() {
+            return ConsumeOutcome::Close(CANNED_400);
+        }
+        let target = ctx.target_off..(ctx.target_off + ctx.target_len);
+        let Some(entry) = tasks.as_mut().vacant_entry() else {
+            return ConsumeOutcome::Close(crate::CANNED_503);
+        };
+        let response = match Self::build_and_invoke::<R, S>(
+            route,
+            raw_params,
+            raw_headers,
+            target,
+            &req[..head_len],
+            body,
+            body.len(),
+            state,
+        ) {
+            Ok(response) => response,
+            Err(reason) => return ConsumeOutcome::Close(reason),
+        };
+        let Some((written, stream)) = Shape::write_head_stream(response, write, date) else {
             return ConsumeOutcome::Close(CANNED_500);
         };
-        match stream_slab.alloc(dope::fiber::Fiber::new(sark_stream)) {
-            Some(slot_idx) => {
-                conn.async_state.stream_slot = Some((ROUTE_ID, slot_idx));
-                conn.async_state.stream_phase = conn_state::StreamPhase::Streaming;
-                conn.async_state.stream_pending = None;
-                ConsumeOutcome::Streamed {
-                    consumed: total,
-                    written: hdr_written,
-                    close: conn_close,
-                }
-            }
-            None => ConsumeOutcome::Close(crate::CANNED_503),
+        let task = entry.insert(wrap(stream));
+        conn.async_state.task = Some(task.erase());
+        conn.async_state.task_stream = true;
+        conn.async_state.stream_phase = conn_state::StreamPhase::Streaming;
+        conn.async_state.stream_pending = None;
+        ConsumeOutcome::Streamed {
+            consumed: total,
+            written,
+            close: conn_close,
         }
     }
 
-    pub fn stream_coalesce<'d, S2, W, const N: usize>(
-        slab: &mut dope::fiber::Slab<'d, S2, N>,
-        slot: &mut link::Slot<W, listener::State<conn_state::ConnState>>,
+    pub fn task_poll_proj<'d, T, Tag, W, C, PJ, Classify, const N: usize>(
+        mut tasks: Pin<&mut crate::fiber::FixedSlab<'d, T, N, Tag>>,
+        slot: &mut link::slot::Slot<'d, W, listener::State<C>>,
         aux: &mut listener::Aux,
-        driver: &mut Driver,
-    ) -> usize
-    where
-        S2: Future<Output = Option<Shared>> + 'd,
-        W: Wire,
-    {
-        Self::stream_coalesce_proj(slab, slot, aux, driver, identity_mut)
-    }
-
-    pub fn stream_coalesce_proj<'d, S2, W, C, PJ, const N: usize>(
-        slab: &mut dope::fiber::Slab<'d, S2, N>,
-        slot: &mut link::Slot<W, listener::State<C>>,
-        aux: &mut listener::Aux,
-        driver: &mut Driver,
+        driver: &mut DriverContext<'_, 'd>,
         project: PJ,
+        date: &[u8; 29],
+        mut classify: Classify,
     ) -> usize
     where
-        S2: Future<Output = Option<Shared>> + 'd,
+        T: dope_fiber::Fiber<'d> + 'd,
         W: Wire,
         C: Default + 'static,
         PJ: Fn(&mut C) -> &mut conn_state::ConnState,
+        Classify: FnMut(
+            T::Output,
+            &mut link::slot::Slot<'d, W, listener::State<C>>,
+            &mut listener::Aux,
+            &mut DriverContext<'_, 'd>,
+            &[u8; 29],
+            bool,
+        ) -> TaskPoll,
     {
         use conn_state::StreamPhase;
         let conn_ptr: *mut conn_state::ConnState = project(&mut slot.state.conn);
-        // SAFETY: conn_ptr aliases the projected slot.state.conn; below never re-borrows slot.state.conn via slot (only slot.core / wire / state.send), keeping &mut ConnState and &mut Slot disjoint.
-        let conn: &mut conn_state::ConnState = unsafe { &mut *conn_ptr };
-        let Some((stream_route_id, token)) = conn.async_state.stream_slot.take() else {
+        let conn = unsafe { &mut *conn_ptr };
+        let Some(task) = conn.async_state.task.take() else {
             return 0;
         };
-        let waker = slot.make_waker(driver);
-        let mut cx = Context::from_waker(&waker);
+        let task = crate::fiber::TaskId::<Tag>::from_erased(task);
         let mut cursor = 0;
         loop {
-            let (framed, is_terminator) = match conn.async_state.stream_pending.take() {
+            let (framed, terminating) = match conn.async_state.stream_pending.take() {
                 Some(stashed) => (
                     stashed,
                     conn.async_state.stream_phase == StreamPhase::Terminating,
                 ),
                 None => match conn.async_state.stream_phase {
                     StreamPhase::Terminating => (Shared::from_static(CHUNK_TERMINATOR), true),
-                    StreamPhase::Streaming => match slab.poll(&token, &mut cx) {
-                        Poll::Ready(Some(raw)) => {
-                            if raw.is_empty() {
-                                continue;
+                    StreamPhase::Streaming => {
+                        let poll = {
+                            let mut context = std::pin::pin!(dope_fiber::Context::from_ready(
+                                slot.driver(),
+                                slot.ready_key(),
+                                driver.reborrow(),
+                            ));
+                            tasks.as_mut().poll(&task, context.as_mut())
+                        };
+                        let Some(poll) = poll else {
+                            debug_assert!(false, "live task must exist in fiber slab");
+                            conn.async_state.task_stream = false;
+                            conn.recv.unfreeze();
+                            if conn.deferred_close {
+                                slot.set_close_after();
                             }
-                            (sark_core::http::codec::Wire::chunk_frame(raw), false)
+                            return 0;
+                        };
+                        match poll {
+                            Poll::Pending => {
+                                conn.async_state.task = Some(task.erase());
+                                return cursor;
+                            }
+                            Poll::Ready(output) => {
+                                match classify(output, slot, aux, driver, date, conn.deferred_close)
+                                {
+                                    TaskPoll::Complete => {
+                                        let removed = tasks.as_mut().remove(task);
+                                        debug_assert!(removed, "live task must be removable");
+                                        conn.async_state.task_stream = false;
+                                        conn.recv.unfreeze();
+                                        if conn.deferred_close {
+                                            slot.set_close_after();
+                                        }
+                                        return 0;
+                                    }
+                                    TaskPoll::Stream(Some(raw)) => {
+                                        if raw.is_empty() {
+                                            continue;
+                                        }
+                                        (sark_core::http::codec::Wire::chunk_frame(raw), false)
+                                    }
+                                    TaskPoll::Stream(None) => {
+                                        conn.async_state.stream_phase = StreamPhase::Terminating;
+                                        continue;
+                                    }
+                                }
+                            }
                         }
-                        Poll::Ready(None) => {
-                            conn.async_state.stream_phase = StreamPhase::Terminating;
-                            continue;
-                        }
-                        Poll::Pending => {
-                            conn.async_state.stream_slot = Some((stream_route_id, token));
-                            return cursor;
-                        }
-                    },
+                    }
                 },
             };
-            let write_cap = aux.write_buf_for(slot).len();
-            if write_cap.saturating_sub(cursor) < framed.len() {
-                if framed.len() > write_cap {
-                    let buf = aux.write_buf_for(slot);
-                    let ud = slot.token();
-                    slot.submit_split_shared(buf, cursor, framed, ud, driver);
-                    if is_terminator {
-                        slab.release(token);
+            let capacity = aux.write_buf_for(slot).len();
+            if capacity.saturating_sub(cursor) < framed.len() {
+                if framed.len() > capacity {
+                    let buffer = aux.write_buf_for(slot);
+                    let token = slot.token();
+                    slot.submit_split_shared(buffer, cursor, framed, token, driver);
+                    if terminating {
+                        let removed = tasks.as_mut().remove(task);
+                        debug_assert!(removed, "live task must be removable");
+                        conn.async_state.task_stream = false;
                         conn.async_state.stream_phase = StreamPhase::Streaming;
                         conn.recv.unfreeze();
-                        conn.release_req();
                         if conn.deferred_close {
-                            slot.core.set_close_after();
+                            slot.set_close_after();
                         }
                     } else {
-                        conn.async_state.stream_slot = Some((stream_route_id, token));
+                        conn.async_state.task = Some(task.erase());
                     }
                     return 0;
                 }
-                conn.async_state.stream_slot = Some((stream_route_id, token));
+                conn.async_state.task = Some(task.erase());
                 conn.async_state.stream_pending = Some(framed);
                 return cursor;
             }
-            let flen = framed.len();
-            aux.write_buf_for(slot)[cursor..cursor + flen].copy_from_slice(framed.as_ref());
-            cursor += flen;
-            if is_terminator {
-                slab.release(token);
+            let end = cursor + framed.len();
+            aux.write_buf_for(slot)[cursor..end].copy_from_slice(framed.as_ref());
+            cursor = end;
+            if terminating {
+                let removed = tasks.as_mut().remove(task);
+                debug_assert!(removed, "live task must be removable");
+                conn.async_state.task_stream = false;
                 conn.async_state.stream_phase = StreamPhase::Streaming;
                 conn.recv.unfreeze();
-                conn.release_req();
                 if conn.deferred_close {
-                    slot.core.set_close_after();
+                    slot.set_close_after();
                 }
                 return cursor;
             }
-        }
-    }
-
-    pub fn reborrow_write_buf<'a, W: Wire, C: Default + 'static>(
-        slot: &mut link::Slot<W, listener::State<C>>,
-        aux: &'a mut listener::Aux,
-    ) -> &'a mut [u8] {
-        aux.write_buf_for(slot)
-    }
-
-    pub fn fiber_wake<'d, Fut, P, W, const N: usize>(
-        slab: &mut dope::fiber::Slab<'d, Fut, N>,
-        slot: &mut link::Slot<W, listener::State<conn_state::ConnState>>,
-        driver: &mut Driver,
-    ) -> Option<P>
-    where
-        Fut: Future<Output = P> + 'd,
-        W: Wire,
-    {
-        Self::fiber_wake_proj(slab, slot, driver, identity_mut)
-    }
-
-    pub fn fiber_wake_proj<'d, Fut, P, W, C, PJ, const N: usize>(
-        slab: &mut dope::fiber::Slab<'d, Fut, N>,
-        slot: &mut link::Slot<W, listener::State<C>>,
-        driver: &mut Driver,
-        project: PJ,
-    ) -> Option<P>
-    where
-        Fut: Future<Output = P> + 'd,
-        W: Wire,
-        C: Default + 'static,
-        PJ: Fn(&mut C) -> &mut conn_state::ConnState,
-    {
-        let waker = slot.make_waker(driver);
-        let mut cx = Context::from_waker(&waker);
-        let conn_ptr: *mut conn_state::ConnState = project(&mut slot.state.conn);
-        // SAFETY: conn_ptr aliases the projected slot.state.conn; this fn never re-borrows slot.state.conn via slot (only slot.make_waker / slot is otherwise unused after this point), so the &mut ConnState and &mut Slot stay disjoint.
-        let conn: &mut conn_state::ConnState = unsafe { &mut *conn_ptr };
-        let token = conn.async_state.pending_wake.as_ref().map(|p| &p.1)?;
-        match slab.poll(token, &mut cx) {
-            Poll::Ready(resp) => {
-                if let Some((_, owned)) = conn.async_state.pending_wake.take() {
-                    slab.release(owned);
-                }
-                conn.release_req();
-                Some(resp)
-            }
-            Poll::Pending => None,
         }
     }
 
     #[allow(clippy::too_many_arguments)]
-    pub fn route_fiber<'d, R, S, P, MP, Fut, const N: usize, const ROUTE_ID: u8>(
-        permit: conn_state::DispatchPermit,
-        matched: Matched<'d, R>,
-        slab: &mut dope::fiber::Slab<'d, Fut, N>,
-        state: &'d S,
-        ctx: &Ctx<'_>,
-        timer: crate::timer::Timer<'d>,
-        conn: &mut conn_state::ConnState,
-        make_fiber: MP,
-    ) -> conn_state::ConsumeOutcome
-    where
-        R: RouteSpec + crate::fiber::Route<S> + 'static,
-        S: 'd,
-        P: 'd,
-        Fut: Future<Output = P> + 'd,
-        MP: FnOnce(
-            &'d R,
-            <R as RouteSpec>::Params<'static>,
-            Request,
-            <R as RouteSpec>::Headers<'static>,
-            <R as RouteSpec>::ParsedBody<'static>,
-            &'d S,
-            crate::timer::Timer<'d>,
-        ) -> dope::fiber::Fiber<'d, Fut>,
-    {
-        use conn_state::ConsumeOutcome;
-        let Matched { route, raw_params } = matched;
-        let StaticRequest {
-            request,
-            params,
-            headers,
-            body,
-            total,
-            conn_close,
-        } = match ctx.assemble_static::<R>(raw_params, conn) {
-            Ok(r) => r,
-            Err(RequestErr::NeedMore(content_length)) => {
-                return ConsumeOutcome::NeedMore {
-                    permit,
-                    content_length,
-                };
-            }
-            Err(RequestErr::Bad(reason)) => return ConsumeOutcome::Close(reason),
-        };
-        let fiber = make_fiber(route, params, request, headers, body, state, timer);
-        match slab.alloc(fiber) {
-            Some(slot_idx) => {
-                conn.async_state.pending_wake = Some((ROUTE_ID, slot_idx));
-                ConsumeOutcome::Park {
-                    consumed: total,
-                    close: conn_close,
-                }
-            }
-            None => ConsumeOutcome::Close(crate::CANNED_503),
-        }
+    pub fn reborrow_write_buf<'d, 'a, W: Wire, C: Default + 'static>(
+        slot: &mut link::slot::Slot<'d, W, listener::State<C>>,
+        aux: &'a mut listener::Aux,
+    ) -> listener::WriteBuf<'a> {
+        aux.write_buf_for(slot)
     }
 }
 
-pub trait H1Project<W: Wire> {
-    fn on_chunk_proj<C, PJ>(
-        &mut self,
-        slot: &mut link::Slot<W, listener::State<C>>,
+pub trait H1Project<'d, W: Wire> {
+    fn chunk_proj<C, PJ>(
+        self: Pin<&mut Self>,
+        slot: &mut link::slot::Slot<'d, W, listener::State<C>>,
         bytes: &[u8],
         aux: &mut listener::Aux,
-        driver: &mut Driver,
+        driver: &mut DriverContext<'_, 'd>,
         project: PJ,
     ) -> bool
     where
         C: Default + 'static,
         PJ: Fn(&mut C) -> &mut conn_state::ConnState;
 
-    fn on_send_proj<C, PJ>(
-        &mut self,
-        slot: &mut link::Slot<W, listener::State<C>>,
+    fn send_proj<C, PJ>(
+        self: Pin<&mut Self>,
+        slot: &mut link::slot::Slot<'d, W, listener::State<C>>,
         project: PJ,
         sent: usize,
         aux: &mut listener::Aux,
-        driver: &mut Driver,
+        driver: &mut DriverContext<'_, 'd>,
     ) where
         C: Default + 'static,
         PJ: Fn(&mut C) -> &mut conn_state::ConnState;
 
-    fn on_wake_proj<C, PJ>(
-        &mut self,
-        slot: &mut link::Slot<W, listener::State<C>>,
+    fn activate_proj<C, PJ>(
+        self: Pin<&mut Self>,
+        slot: &mut link::slot::Slot<'d, W, listener::State<C>>,
         project: PJ,
         aux: &mut listener::Aux,
-        driver: &mut Driver,
+        driver: &mut DriverContext<'_, 'd>,
     ) where
         C: Default + 'static,
         PJ: Fn(&mut C) -> &mut conn_state::ConnState;
 
-    fn on_close_proj<C, PJ>(
-        &mut self,
-        slot: &mut link::Slot<W, listener::State<C>>,
+    fn close_proj<C, PJ>(
+        self: Pin<&mut Self>,
+        slot: &mut link::slot::Slot<'d, W, listener::State<C>>,
         project: PJ,
         aux: &mut listener::Aux,
     ) where

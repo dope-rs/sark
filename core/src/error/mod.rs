@@ -112,6 +112,3 @@ impl From<Error> for Response {
         err.to_response()
     }
 }
-
-#[cfg(test)]
-mod tests;

@@ -1,4 +1,4 @@
-use crate::hpack::OwnedHeader;
+use crate::hpack::HeaderBlock;
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub(super) enum Reason {
@@ -21,7 +21,7 @@ pub(super) enum Reason {
 pub(super) struct Validate;
 
 impl Validate {
-    pub(super) fn request(headers: &[OwnedHeader], trailing: bool) -> Result<(), Reason> {
+    pub(super) fn request(headers: &HeaderBlock, trailing: bool) -> Result<(), Reason> {
         let mut saw_regular = false;
         let mut has_method = false;
         let mut has_scheme = false;
@@ -31,8 +31,8 @@ impl Validate {
         let mut path_empty = true;
 
         for h in headers {
-            let name = h.name.as_slice();
-            let value = h.value.as_slice();
+            let name = h.name;
+            let value = h.value;
             if name.is_empty() {
                 return Err(Reason::EmptyName);
             }
@@ -101,13 +101,13 @@ impl Validate {
         Ok(())
     }
 
-    pub(super) fn response(headers: &[OwnedHeader], trailing: bool) -> Result<(), Reason> {
+    pub(super) fn response(headers: &HeaderBlock, trailing: bool) -> Result<(), Reason> {
         let mut saw_regular = false;
         let mut has_status = false;
 
         for h in headers {
-            let name = h.name.as_slice();
-            let value = h.value.as_slice();
+            let name = h.name;
+            let value = h.value;
             if name.is_empty() {
                 return Err(Reason::EmptyName);
             }

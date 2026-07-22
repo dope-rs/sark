@@ -15,10 +15,10 @@ pub trait HeadInput {
     }
     fn find_crlf_from(&self, start: usize) -> Option<usize>;
     fn slice_range(&self, range: std::ops::Range<usize>) -> Option<&[u8]>;
-    fn copy_range_local(
+    fn copy_range_frame(
         &self,
         range: std::ops::Range<usize>,
-    ) -> Option<crate::http::LocalFrameBytes>;
+    ) -> Option<o3::buffer::Bytes<o3::buffer::Retained>>;
     fn copy_range_into(&self, range: std::ops::Range<usize>, out: &mut [u8]);
     fn for_each_slice<F>(&self, range: std::ops::Range<usize>, f: F)
     where
@@ -51,13 +51,13 @@ impl HeadInput for [u8] {
         out[..need].copy_from_slice(&self[range]);
     }
 
-    fn copy_range_local(
+    fn copy_range_frame(
         &self,
         range: std::ops::Range<usize>,
-    ) -> Option<crate::http::LocalFrameBytes> {
+    ) -> Option<o3::buffer::Bytes<o3::buffer::Retained>> {
         self.get(range)
             .map(o3::buffer::Shared::copy_from_slice)
-            .map(crate::http::LocalFrameBytes::from_shared)
+            .map(o3::buffer::Bytes::<o3::buffer::Retained>::from)
     }
 
     fn for_each_slice<F>(&self, range: std::ops::Range<usize>, mut f: F)

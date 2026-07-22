@@ -3,7 +3,7 @@ mod common;
 use std::net::SocketAddr;
 
 use common::{run_get, spawn_raw_server};
-use sark_client::connector::Session;
+use sark_client::connector::Config;
 
 #[test]
 fn connector_chunked_get() {
@@ -15,25 +15,17 @@ fn connector_chunked_get() {
     });
     let addr: SocketAddr = server.addr().parse().expect("addr");
 
-    let resp = run_get(addr, Session::new("127.0.0.1"), "/chunked").expect("http get");
+    let resp = run_get(addr, Config::new("127.0.0.1"), "/chunked").expect("http get");
     assert_eq!(resp.status().as_u16(), 200);
     let body = std::str::from_utf8(resp.body()).expect("utf8 body");
     assert_eq!(body, "hello, world");
 }
 
-/// Large chunked body + `Connection: close` — the shape of betradar's dated
-/// schedule pages (~2.8 MB, Transfer-Encoding: chunked, Connection: close, no
-/// Content-Length). Small chunked works; this guards that a multi-megabyte
-/// chunked body spanning many recv buffers is reassembled in full instead of
-/// failing with "connection closed" (the startup `feed::schedule` GET failures).
 #[test]
 fn connector_chunked_get_large_body() {
     const CHUNK: usize = 16 * 1024;
-    const CHUNKS: usize = 160; // ~2.5 MB total
+    const CHUNKS: usize = 160;
     let server = spawn_raw_server(|stream, _req| {
-        // The shared listener is non-blocking; accepted streams may inherit it, and
-        // a non-blocking write_all of a multi-MB body truncates at the socket buffer.
-        // Force blocking so the full body is actually delivered.
         let _ = stream.set_nonblocking(false);
         let mut resp = Vec::with_capacity(CHUNK * CHUNKS + 4096);
         resp.extend_from_slice(
@@ -51,7 +43,7 @@ fn connector_chunked_get_large_body() {
     });
     let addr: SocketAddr = server.addr().parse().expect("addr");
 
-    let resp = run_get(addr, Session::new("127.0.0.1"), "/big-chunked").expect("http get");
+    let resp = run_get(addr, Config::new("127.0.0.1"), "/big-chunked").expect("http get");
     assert_eq!(resp.status().as_u16(), 200);
     assert_eq!(
         resp.body().len(),
@@ -71,7 +63,7 @@ fn connector_chunked_get_with_trailers() {
     });
     let addr: SocketAddr = server.addr().parse().expect("addr");
 
-    let resp = run_get(addr, Session::new("127.0.0.1"), "/chunked-trailers").expect("http get");
+    let resp = run_get(addr, Config::new("127.0.0.1"), "/chunked-trailers").expect("http get");
     assert_eq!(resp.status().as_u16(), 200);
     let body = std::str::from_utf8(resp.body()).expect("utf8 body");
     assert_eq!(body, "abcdef");

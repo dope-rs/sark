@@ -3,27 +3,31 @@ use std::net::SocketAddr;
 use std::time::Duration;
 
 use cartel_gen::{pg_instance, query_group};
-use cartel_pg::{self, Config, PgHolding, PgOps, PgPool, PgTable, PickPolicy};
-use dope::launcher::{Ctx, Launcher};
-use dope::manifold::connector::Connector;
+use cartel_pg::{Client, Config, PgOps, PgPool, PgTable, PickPolicy, Port, port};
 use dope::manifold::connector::source::Static;
 use dope::manifold::env::Bundle;
-use dope::manifold::listener::{Listener, config};
-use dope::runtime::profile::Throughput;
-use dope::transport::Tcp;
-use dope::wire::Identity;
-use dope::{DriverConfig, Executor};
-use dope_extra::Trigger;
+use dope_net::tcp::Tcp;
+use dope_net::wire::identity::Identity;
 use http::StatusCode;
-use o3::buffer::Owned;
-use sark::date::{DateHost, Updater};
-use sark::timer::TimerHost;
-use sark::{Application, ServerCfg};
-use sark_core::http::LocalFrameBytes;
+use o3::buffer::{Bytes, Retained};
+use sark::{HttpServer, Throughput, app, driver, listener, tcp};
 
 type Env = Bundle<Tcp, Identity, Throughput>;
-type PgClient<'d> = PgHolding<'d, Db, Static<Tcp>, Env>;
-type PgConnector = Connector<0, cartel_pg::Session<Db>, Static<Tcp>, Env>;
+
+const MAX_CONNECTIONS: usize = 1024;
+const HTTP_LISTENER_ID: u8 = 0;
+const DATE_UPDATER_ID: u8 = 1;
+const PG_CONNECTOR_ID: u8 = 2;
+const PG_CONNECTIONS: usize = 4;
+const PG_PENDING_REQUESTS_PER_CONNECTION: usize = 16;
+const PG_REQUEST_ENTRIES: usize = PG_CONNECTIONS * PG_PENDING_REQUESTS_PER_CONNECTION;
+const PG_REQUEST_FRAME_CAPACITY: usize = 4 * 1024;
+const PG_RESPONSE_BUFFER_CAPACITY: usize = 256 * 1024 * 1024;
+const PG_RESPONSE_ROW_CAPACITY: usize = 65_536;
+const PG_INFLIGHT: usize = PG_REQUEST_ENTRIES;
+const PG_WAITERS: usize = PG_REQUEST_ENTRIES;
+const PG_NOTIFICATIONS: usize = 1024;
+const PG_RECONNECT_BACKOFF: Duration = Duration::from_millis(500);
 
 #[derive(PgTable, Debug)]
 struct User {
@@ -35,209 +39,206 @@ struct User {
 #[query_group]
 impl User {
     fn by_id(id: i64) -> User {
-        User::filter(|u| u.id == id).one()
+        User::filter(|user| user.id == id).one()
     }
 
     fn above(min_id: i64) -> Vec<User> {
-        User::filter(|u| u.id > min_id).all()
+        User::filter(|user| user.id > min_id).all()
     }
 
     fn rename(id: i64, new_name: String) {
-        User::filter(|u| u.id == id).update(|u| u.name = new_name)
+        User::filter(|user| user.id == id).update(|user| user.name = new_name)
     }
 }
 
 pg_instance! { Db: User }
 
-#[derive(Clone)]
+#[derive(Clone, Copy)]
 struct AppState<'d> {
-    pg: PgClient<'d>,
+    pg: Client<'d, Db>,
 }
 
-#[sark_gen::response(raw)]
-#[header("content-type", "text/plain; charset=utf-8")]
-struct PlainTextResponse {
+#[sark_gen::json(ordered)]
+struct RenameBody {
+    name: Bytes<Retained>,
+}
+
+#[sark_gen::json(encode)]
+struct UserView {
+    id: u64,
+    name: String,
+}
+
+#[sark_gen::json(encode)]
+struct PgBody {
+    ok: bool,
+    #[field(seq, nested)]
+    users: Vec<UserView>,
+    error: String,
+}
+
+#[sark_gen::response(json)]
+#[header("content-type", "application/json")]
+struct PgResponse {
     status: StatusCode,
-    body: Owned,
-    #[header("x-pg-key")]
-    pg_key: LocalFrameBytes,
+    body: PgBody,
+}
+
+fn response(status: StatusCode, body: PgBody) -> PgResponse {
+    PgResponse { status, body }
+}
+
+fn pg_error(error: cartel_pg::Error) -> PgResponse {
+    let status = if matches!(&error, cartel_pg::Error::NotFound) {
+        StatusCode::NOT_FOUND
+    } else {
+        StatusCode::BAD_GATEWAY
+    };
+    response(
+        status,
+        PgBody {
+            ok: false,
+            users: Vec::new(),
+            error: error.to_string(),
+        },
+    )
 }
 
 #[sark_gen::request(ordered)]
 struct UserByIdRequest {
-    #[path("id", default = "0")]
-    pub id: LocalFrameBytes,
+    #[path("id")]
+    id: usize,
 }
 
 #[sark_gen::request(ordered)]
+#[json_body(RenameBody)]
 struct TxRequest {
-    #[path("id", default = "0")]
-    pub id: LocalFrameBytes,
-    #[path("name", default = "")]
-    pub name: LocalFrameBytes,
+    #[path("id")]
+    id: usize,
 }
 
-#[sark_gen::request(ordered)]
-struct ListRequest {}
-
 #[sark_gen::handler]
-async fn get_user(request: UserByIdRequest, state: &AppState<'_>) -> PlainTextResponseInner<'req> {
-    let id: i64 = parse_i64(request.id.as_bytes()).unwrap_or(0);
-    let body_str = match User::by_id(&state.pg, id).await {
-        Ok(u) => format!("user {}: {}\n", u.id, u.name),
-        Err(e) => format!("pg error: {}\n", e),
+async fn get_user(request: UserByIdRequest, state: &AppState<'_>) -> PgResponse {
+    let Ok(id) = i64::try_from(request.id) else {
+        return response(
+            StatusCode::BAD_REQUEST,
+            PgBody {
+                ok: false,
+                users: Vec::new(),
+                error: String::from("id must be positive"),
+            },
+        );
     };
-    PlainTextResponseInner {
-        status: StatusCode::OK,
-        body: bytes_from_str(&body_str),
-        pg_key: request.id,
+    if id <= 0 {
+        return response(
+            StatusCode::BAD_REQUEST,
+            PgBody {
+                ok: false,
+                users: Vec::new(),
+                error: String::from("id must be positive"),
+            },
+        );
+    }
+    match User::by_id(&state.pg, id).await {
+        Ok(user) => response(
+            StatusCode::OK,
+            PgBody {
+                ok: true,
+                users: vec![UserView {
+                    id: user.id as u64,
+                    name: user.name,
+                }],
+                error: String::new(),
+            },
+        ),
+        Err(error) => pg_error(error),
     }
 }
 
 #[sark_gen::handler]
-async fn rename_in_tx(request: TxRequest, state: &AppState<'_>) -> PlainTextResponseInner<'req> {
-    let id: i64 = parse_i64(request.id.as_bytes()).unwrap_or(0);
-    let name = std::str::from_utf8(request.name.as_bytes())
-        .unwrap_or("")
-        .to_owned();
-    let body_str = match state.pg.begin().await {
-        Ok(tx) => {
-            let view = async {
-                User::rename(&tx, id, name).await?;
-                User::by_id(&tx, id).await
-            }
-            .await;
-            tx.rollback().await.ok();
-            match view {
-                Ok(u) => format!("inside-tx user {}: {}\n", u.id, u.name),
-                Err(e) => format!("inside-tx error: {}\n", e),
-            }
+async fn rename_in_tx(request: TxRequest, state: &AppState<'_>) -> PgResponse {
+    let name = match std::str::from_utf8(request.body.name.as_slice()) {
+        Ok(name) if !name.is_empty() && name.len() <= 128 => name.to_owned(),
+        _ => {
+            return response(
+                StatusCode::BAD_REQUEST,
+                PgBody {
+                    ok: false,
+                    users: Vec::new(),
+                    error: String::from("name must be valid UTF-8 and 1..=128 bytes"),
+                },
+            );
         }
-        Err(e) => format!("begin error: {}\n", e),
     };
-    PlainTextResponseInner {
-        status: StatusCode::OK,
-        body: bytes_from_str(&body_str),
-        pg_key: request.id,
+    let Ok(id) = i64::try_from(request.id) else {
+        return response(
+            StatusCode::BAD_REQUEST,
+            PgBody {
+                ok: false,
+                users: Vec::new(),
+                error: String::from("id must be positive"),
+            },
+        );
+    };
+    if id <= 0 {
+        return response(
+            StatusCode::BAD_REQUEST,
+            PgBody {
+                ok: false,
+                users: Vec::new(),
+                error: String::from("id must be positive"),
+            },
+        );
+    }
+    match state.pg.begin().await {
+        Ok(transaction) => match User::rename(&transaction, id, name).await {
+            Ok(()) => match transaction.commit().await {
+                Ok(()) => response(
+                    StatusCode::OK,
+                    PgBody {
+                        ok: true,
+                        users: Vec::new(),
+                        error: String::new(),
+                    },
+                ),
+                Err(error) => pg_error(error),
+            },
+            Err(error) => {
+                let _ = transaction.rollback().await;
+                pg_error(error)
+            }
+        },
+        Err(error) => pg_error(error),
     }
 }
 
 #[sark_gen::handler]
-async fn list_users(_request: ListRequest, state: &AppState<'_>) -> PlainTextResponseInner<'req> {
-    let body_str = match User::above(&state.pg, 0).await {
-        Ok(users) => {
-            let mut s = String::new();
-            for u in users {
-                s.push_str(&format!("{}: {}\n", u.id, u.name));
-            }
-            s
-        }
-        Err(e) => format!("pg error: {}\n", e),
-    };
-    PlainTextResponseInner {
-        status: StatusCode::OK,
-        body: bytes_from_str(&body_str),
-        pg_key: LocalFrameBytes::from_slice(b""),
+async fn list_users(state: &AppState<'_>) -> PgResponse {
+    match User::above(&state.pg, 0).await {
+        Ok(users) => response(
+            StatusCode::OK,
+            PgBody {
+                ok: true,
+                users: users
+                    .into_iter()
+                    .map(|user| UserView {
+                        id: user.id as u64,
+                        name: user.name,
+                    })
+                    .collect(),
+                error: String::new(),
+            },
+        ),
+        Err(error) => pg_error(error),
     }
 }
 
 sark_gen::define_route! {
-    PgApp: AppState<'d> => {
-        GET "/users/:id" => async get_user,
-        POST "/tx/:id/:name" => async rename_in_tx,
-        GET "/users" => async list_users,
+    PgApp: AppState<'_> => {
+        GET "/users/:id" => async(capacity = MAX_CONNECTIONS) get_user,
+        POST "/tx/:id" => async(capacity = MAX_CONNECTIONS) rename_in_tx,
+        GET "/users" => async(capacity = MAX_CONNECTIONS) list_users,
     }
-}
-
-fn parse_i64(b: &[u8]) -> Option<i64> {
-    std::str::from_utf8(b).ok()?.parse().ok()
-}
-
-fn bytes_from_str(s: &str) -> Owned {
-    let mut buf = Owned::with_capacity(s.len());
-    buf.extend_from_slice(s.as_bytes());
-    buf
-}
-
-#[pin_project::pin_project]
-#[derive(dope_gen::Dispatcher)]
-struct Dispatcher<'d, P>
-where
-    P: Application<Conn = sark::dispatch::conn_state::ConnState, Wire = dope::wire::Identity>
-        + DateHost
-        + TimerHost<'d>,
-{
-    #[pin]
-    #[manifold(optional)]
-    http: Option<Listener<1, P, Env>>,
-    #[pin]
-    #[manifold]
-    date: Updater<2>,
-    #[pin]
-    #[manifold]
-    pg: PgConnector,
-    #[pin]
-    #[manifold]
-    timer: dope::manifold::timer::Timer<{ sark::timer::SARK_TIMER_ID }>,
-    _ph: std::marker::PhantomData<&'d ()>,
-}
-
-struct PgArgs {
-    addr: SocketAddr,
-    config: Config,
-    policy: PickPolicy,
-}
-
-fn run_thread(pg: PgArgs, cfg: ServerCfg, ctx: Ctx, shutdown: Option<&Trigger>) -> io::Result<()> {
-    let driver_cfg =
-        <dope::DriverCfg as dope::DriverConfig>::for_tcp_profile::<Throughput>(cfg.max_conn)
-            .with_cpu_id(Some(ctx.cpu));
-    let mut exec = Executor::new(driver_cfg)?;
-
-    let pg_conn = {
-        let drv = exec.driver_mut();
-        if let Some(trigger) = shutdown {
-            trigger.register(drv);
-        }
-        Connector::new(
-            cartel_pg::Session::new(pg.config),
-            Static::<Tcp>::new(vec![pg.addr], Duration::from_millis(500)),
-            4,
-            drv,
-        )
-    };
-    let mut app = core::pin::pin!(Dispatcher::<_> {
-        http: None::<Listener<1, _, Env>>,
-        date: Updater::<2>::new(),
-        pg: pg_conn,
-        timer: dope::manifold::timer::Timer::new(),
-        _ph: std::marker::PhantomData,
-    });
-    let client = app.as_mut().pg_handle();
-    let timer_handle = app.as_mut().timer_handle();
-    client.set_pick_policy(pg.policy);
-
-    let listener_cfg = config::Config::<Tcp> {
-        max_conn: cfg.max_conn,
-        bind: cfg.bind,
-        backlog: cfg.backlog,
-        stream_opts: Default::default(),
-        listener_opts: Default::default(),
-    };
-    let state: &'static AppState = Box::leak(Box::new(AppState { pg: client }));
-    let app_state = pg_app::new(state);
-    let mut http = {
-        let drv = exec.driver_mut();
-        Listener::<1, _, Env>::open_in(app_state, listener_cfg, drv)?
-    };
-    {
-        let handler = http.handler_mut();
-        handler.bind_timer(timer_handle, cfg.head_timeout);
-        let stamp = std::ptr::NonNull::from(handler.date_stamp());
-        app.as_mut().project().date.get_mut().bind(stamp);
-    }
-    app.as_mut().project().http.set(Some(http));
-    exec.run(app.as_mut())
 }
 
 fn main() -> io::Result<()> {
@@ -260,21 +261,69 @@ fn main() -> io::Result<()> {
         "li" | "least_inflight" | "least-inflight" => PickPolicy::LeastInflight,
         _ => PickPolicy::RoundRobin,
     };
-    let cfg = ServerCfg {
-        bind,
-        max_conn: 1024,
-        backlog: 1024,
-        head_timeout: std::time::Duration::from_secs(10),
-    };
+    let pg_config = Config::new(pg_user, pg_password, pg_database);
+    let port_config = port::Config::new(port::Capacities {
+        connections: PG_CONNECTIONS,
+        request_entries: PG_REQUEST_ENTRIES,
+        request_bytes: PG_REQUEST_FRAME_CAPACITY,
+        response_entries: PG_RESPONSE_ROW_CAPACITY,
+        response_bytes: PG_RESPONSE_BUFFER_CAPACITY,
+        inflight: PG_INFLIGHT,
+        waiters: PG_WAITERS,
+        notifications: PG_NOTIFICATIONS,
+    })
+    .map_err(io::Error::other)?;
+    let server = HttpServer::<HTTP_LISTENER_ID, DATE_UPDATER_ID, Throughput>::new(
+        listener::Config::<Tcp> {
+            bind,
+            max_connections: MAX_CONNECTIONS,
+            backlog: 1024,
+            stream: tcp::stream::Config {
+                no_delay: Some(true),
+                ..Default::default()
+            },
+            transport: tcp::listener::Config {
+                reuse_port: true,
+                ..Default::default()
+            },
+            egress: Default::default(),
+        },
+        Duration::from_secs(10),
+    );
 
     eprintln!("sark pg: listening on http://{bind}, upstream pg {pg_addr}, pick={policy:?}");
 
-    Launcher::new(vec![0u16]).run(move |ctx| {
-        let pg = PgArgs {
-            addr: pg_addr,
-            config: Config::new(pg_user.clone(), pg_password.clone(), pg_database.clone()),
-            policy,
-        };
-        run_thread(pg, cfg.clone(), ctx, None)
-    })
+    server.run_with_storage(
+        vec![0u16],
+        |_| driver::Config::for_tcp_profile::<Throughput>(MAX_CONNECTIONS),
+        move |_, _| Port::<Db>::factory(pg_config.clone(), port_config),
+        move |server, session| {
+            let backoff = session
+                .seed()
+                .derive(dope::hash::domain::BACKOFF ^ PG_CONNECTOR_ID as u64)
+                .state();
+            let port = session.storage() as *const Port<'_, Db>;
+            // The pool is owned by the session and the connector resource is
+            // torn down before that session can return.
+            let port = unsafe { &*port };
+            let client = port.client();
+            client.set_pick_policy(policy);
+            let connector = {
+                let mut driver = session.driver_access();
+                port.connect::<PG_CONNECTOR_ID, _, Env>(
+                    Static::<Tcp>::new(vec![pg_addr], PG_RECONNECT_BACKOFF, backoff),
+                    &mut driver,
+                )?
+            };
+            let state = AppState { pg: client };
+            let app = PgApp::new(
+                state,
+                app::Config {
+                    timer_capacity: MAX_CONNECTIONS.saturating_mul(2),
+                    task_capacity: MAX_CONNECTIONS,
+                },
+            );
+            server.serve_with_resource(session, app, connector, None)
+        },
+    )
 }

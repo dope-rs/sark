@@ -19,8 +19,6 @@ fn scan_request(block: &[u8]) -> Result<BodyFraming> {
     scan.validate_for_request()
 }
 
-// H4 — Transfer-Encoding "chunked must be last" on the request path.
-
 #[test]
 fn te_chunked_not_last_rejected() {
     assert!(scan_request(b"Transfer-Encoding: chunked, gzip\r\n\r\n").is_err());
@@ -55,8 +53,6 @@ fn te_double_chunked_accepted_chunked_is_final() {
     );
 }
 
-// L10 — duplicate Content-Length on the request path.
-
 #[test]
 fn conflicting_duplicate_content_length_rejected_contig() {
     assert!(scan_request(b"Content-Length: 5\r\nContent-Length: 7\r\n\r\n").is_err());
@@ -74,8 +70,6 @@ fn single_content_length_accepted() {
         BodyFraming::Length(5)
     );
 }
-
-// M4 — control bytes in unknown (uncaptured) header values.
 
 #[test]
 fn bare_lf_in_unknown_value_rejected() {
@@ -110,8 +104,6 @@ fn htab_in_unknown_value_accepted() {
     );
 }
 
-// M12 — total/per-line head size cap.
-
 #[test]
 fn over_long_header_line_rejected() {
     let mut block = Vec::new();
@@ -130,8 +122,6 @@ fn moderate_header_line_accepted() {
     assert_eq!(scan_request(&block).unwrap(), BodyFraming::Length(0));
 }
 
-// M6 — chunked-response trailers must not leak framing/hop-by-hop/Host into the map.
-
 #[test]
 fn injected_trailers_dropped_from_response() {
     let raw: &[u8] = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n\
@@ -145,8 +135,6 @@ fn injected_trailers_dropped_from_response() {
         Some(b"yes".as_ref())
     );
 }
-
-// Well-formed benchmark-shaped requests must still parse.
 
 #[test]
 fn well_formed_requests_still_parse() {

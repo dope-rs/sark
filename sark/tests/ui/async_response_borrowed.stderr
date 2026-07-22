@@ -1,0 +1,96 @@
+error[E0277]: the trait bound `BorrowedReply<'static>: OwnedShape` is not satisfied
+  --> tests/ui/async_response_borrowed.rs:17:50
+   |
+17 | async fn borrowed(_request: Req, _state: &()) -> BorrowedReply<'static> {
+   |                                                  ^^^^^^^^^^^^^^^^^^^^^^ unsatisfied trait bound
+   |
+help: the trait `sark::http::__private::GeneratedResponse` is not implemented for `BorrowedReply<'static>`
+  --> tests/ui/async_response_borrowed.rs:9:1
+   |
+ 9 | struct BorrowedReply<'req> {
+   | ^^^^^^^^^^^^^^^^^^^^^^^^^^
+help: the following other types implement trait `OwnedShape`
+  --> $WORKSPACE/core/src/http/response/owned_shape.rs
+   |
+   | impl OwnedShape for Response {
+   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^ `sark::http::Response`
+...
+   | impl OwnedShape for Chunked {
+   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^ `sark::http::Chunked`
+   = note: required for `BorrowedReply<'static>` to implement `OwnedShape`
+note: required by a bound in `sark::service::RouteSpec::AsyncResponse`
+  --> src/service/spec.rs
+   |
+   |     type AsyncResponse: sark_core::http::OwnedShape;
+   |                         ^^^^^^^^^^^^^^^^^^^^^^^^^^^ required by this bound in `RouteSpec::AsyncResponse`
+
+error[E0277]: the trait bound `BorrowedReply<'static>: sark::http::__private::OwnedShape` is not satisfied
+  --> tests/ui/async_response_borrowed.rs:17:50
+   |
+17 | async fn borrowed(_request: Req, _state: &()) -> BorrowedReply<'static> {
+   |                                                  ^^^^^^^^^^^^^^^^^^^^^^ unsatisfied trait bound
+   |
+help: the trait `sark::http::__private::GeneratedResponse` is not implemented for `BorrowedReply<'static>`
+  --> tests/ui/async_response_borrowed.rs:9:1
+   |
+ 9 | struct BorrowedReply<'req> {
+   | ^^^^^^^^^^^^^^^^^^^^^^^^^^
+help: the following other types implement trait `sark::http::__private::OwnedShape`
+  --> $WORKSPACE/core/src/http/response/owned_shape.rs
+   |
+   | impl super::super::__private::OwnedShape for Response {}
+   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ `sark::http::Response`
+...
+   | impl super::super::__private::OwnedShape for Chunked {}
+   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ `sark::http::Chunked`
+   = note: required for `BorrowedReply<'static>` to implement `sark::http::__private::OwnedShape`
+note: required by a bound in `sark::http::OwnedShape::BODY_KIND`
+  --> $WORKSPACE/core/src/http/response/owned_shape.rs
+   |
+   | pub trait OwnedShape: super::super::__private::OwnedShape + 'static {
+   |                       ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ required by this bound in `OwnedShape::BODY_KIND`
+...
+   |     const BODY_KIND: super::super::body_kind::ResponseKind;
+   |           --------- required by a bound in this associated constant
+
+error[E0277]: the trait bound `FixedResponseInner<'static, 4>: OwnedShape` is not satisfied
+  --> tests/ui/async_response_borrowed.rs:28:21
+   |
+28 |     require_owned::<FixedResponse>();
+   |                     ^^^^^^^^^^^^^ the trait `sark::http::__private::GeneratedResponse` is not implemented for `FixedResponseInner<'static, 4>`
+   |
+help: the following other types implement trait `OwnedShape`
+  --> $WORKSPACE/core/src/http/response/owned_shape.rs
+   |
+   | impl OwnedShape for Response {
+   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^ `sark::http::Response`
+...
+   | impl OwnedShape for Chunked {
+   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^ `sark::http::Chunked`
+   = note: required for `FixedResponseInner<'static, 4>` to implement `OwnedShape`
+note: required by a bound in `require_owned`
+  --> tests/ui/async_response_borrowed.rs:25:21
+   |
+25 | fn require_owned<T: OwnedShape>() {}
+   |                     ^^^^^^^^^^ required by this bound in `require_owned`
+
+error[E0277]: the trait bound `ServeInner<'static, 4>: OwnedShape` is not satisfied
+  --> tests/ui/async_response_borrowed.rs:29:21
+   |
+29 |     require_owned::<Serve>();
+   |                     ^^^^^ the trait `sark::http::__private::GeneratedResponse` is not implemented for `ServeInner<'static, 4>`
+   |
+help: the following other types implement trait `OwnedShape`
+  --> $WORKSPACE/core/src/http/response/owned_shape.rs
+   |
+   | impl OwnedShape for Response {
+   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^ `sark::http::Response`
+...
+   | impl OwnedShape for Chunked {
+   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^ `sark::http::Chunked`
+   = note: required for `ServeInner<'static, 4>` to implement `OwnedShape`
+note: required by a bound in `require_owned`
+  --> tests/ui/async_response_borrowed.rs:25:21
+   |
+25 | fn require_owned<T: OwnedShape>() {}
+   |                     ^^^^^^^^^^ required by this bound in `require_owned`

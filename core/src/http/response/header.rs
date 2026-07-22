@@ -10,6 +10,11 @@ pub struct HeaderList {
     wire_len: usize,
 }
 
+static EMPTY_HEADER_LIST: HeaderList = HeaderList {
+    entries: Vec::new(),
+    wire_len: 0,
+};
+
 impl std::fmt::Debug for HeaderList {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let mut list = f.debug_list();
@@ -41,9 +46,7 @@ impl HeaderList {
     }
 
     pub(super) fn empty_static() -> &'static Self {
-        use std::sync::OnceLock;
-        static EMPTY: OnceLock<HeaderList> = OnceLock::new();
-        EMPTY.get_or_init(HeaderList::new)
+        &EMPTY_HEADER_LIST
     }
 
     pub fn with_capacity(capacity: usize) -> Self {

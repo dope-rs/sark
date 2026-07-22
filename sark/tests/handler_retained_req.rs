@@ -1,20 +1,22 @@
 #![cfg(target_os = "linux")]
 
+mod support;
+
 use std::io::{Read, Write};
 use std::net::TcpStream;
 use std::time::Duration;
 
-use dope_extra::testing::run_with_trigger;
+use dope_extra::harness::Harness;
 use http::StatusCode;
-use o3::buffer::{Owned, Shared};
-use sark::{Build, ServerCfg};
+use o3::buffer::Shared;
+use sark::{Executor, Throughput, driver};
 
 #[sark_gen::request(ordered)]
 struct EchoReq {
     #[path("id", default = "MISSING")]
-    pub id: sark_core::http::LocalFrameBytes,
+    pub id: o3::buffer::Bytes<o3::buffer::Retained>,
     #[header("x-echo-marker", default = "MISSING")]
-    pub marker: sark_core::http::LocalFrameBytes,
+    pub marker: o3::buffer::Bytes<o3::buffer::Retained>,
     #[raw_body]
     pub payload: Shared,
 }
@@ -22,17 +24,17 @@ struct EchoReq {
 #[sark_gen::response(raw)]
 struct Reply {
     status: StatusCode,
-    body: Owned,
+    body: Vec<u8>,
 }
 
 #[sark_gen::handler]
 async fn echo_handler(request: EchoReq, _state: &(), timer: sark::Timer) -> Reply {
     timer.sleep(Duration::from_millis(40)).await;
-    let mut body = Owned::new();
+    let mut body = Vec::new();
     body.extend_from_slice(b"id=");
-    body.extend_from_slice(request.id.as_bytes());
+    body.extend_from_slice(request.id.as_slice());
     body.extend_from_slice(b" marker=");
-    body.extend_from_slice(request.marker.as_bytes());
+    body.extend_from_slice(request.marker.as_slice());
     body.extend_from_slice(b" payload=");
     body.extend_from_slice(request.payload.as_slice());
     Reply {
@@ -43,7 +45,7 @@ async fn echo_handler(request: EchoReq, _state: &(), timer: sark::Timer) -> Repl
 
 sark_gen::define_route! {
     EchoDispatch: () => {
-        POST "/echo/:id" => async echo_handler,
+        POST "/echo/:id" => async(capacity = 32) echo_handler,
     }
 }
 
@@ -59,13 +61,8 @@ fn expect(id: &str, marker: &str, body: &str) -> String {
     format!("id={id} marker={marker} payload={body}")
 }
 
-fn cfg(bind: std::net::SocketAddr) -> ServerCfg {
-    ServerCfg {
-        bind,
-        max_conn: 16,
-        backlog: 16,
-        head_timeout: Duration::from_secs(10),
-    }
+fn server(bind: std::net::SocketAddr) -> support::TestHttpServer {
+    support::http_server(bind, Duration::from_secs(10))
 }
 
 fn read_body(sock: &mut TcpStream, acc: &mut Vec<u8>) -> (u16, String) {
@@ -94,84 +91,109 @@ fn read_body(sock: &mut TcpStream, acc: &mut Vec<u8>) -> (u16, String) {
     }
 }
 
-/// req1 lands in the recv accum (head, then body across two reads), so its retained
-/// bytes are a zero-copy slice of the accum. While req1 is still awaiting, req2 arrives
-/// and mutates that same accum — the slice must stay intact via copy-on-write.
 #[test]
 fn accum_zero_copy_retain_survives_cow_during_await() {
     let bind: std::net::SocketAddr = "127.0.0.1:18923".parse().unwrap();
-    run_with_trigger(
-        bind,
-        |ctx, trigger| Build::http(echo_dispatch::new(&()), cfg(bind), ctx, Some(trigger)),
-        |bind| {
-            let mut sock = TcpStream::connect(bind).expect("connect");
-            sock.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
-            sock.set_nodelay(true).unwrap();
+    Harness::new(bind)
+        .run_with_trigger(
+            |_ctx, trigger| {
+                let driver_config =
+                    driver::Config::for_tcp_profile::<Throughput>(support::MAX_CONNECTIONS);
+                let executor = Executor::new(driver_config)?;
+                executor.enter(|mut session| {
+                    server(bind).serve(
+                        &mut session,
+                        EchoDispatch::new(
+                            (),
+                            sark::app::Config {
+                                timer_capacity: 32,
+                                task_capacity: support::MAX_CONNECTIONS,
+                            },
+                        ),
+                        Some(trigger),
+                    )
+                })
+            },
+            |bind| {
+                let mut sock = TcpStream::connect(bind).expect("connect");
+                sock.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
+                sock.set_nodelay(true).unwrap();
 
-            let r1 = req("REQ1ID", "MARKER-ONE", "BODY-REQ1-AAAA");
-            let head_end = r1.windows(4).position(|w| w == b"\r\n\r\n").unwrap() + 4;
-            let r2 = req("REQ2ID", "MARKER-TWO", "BODY-REQ2-BBBB");
+                let r1 = req("REQ1ID", "MARKER-ONE", "BODY-REQ1-AAAA");
+                let head_end = r1.windows(4).position(|w| w == b"\r\n\r\n").unwrap() + 4;
+                let r2 = req("REQ2ID", "MARKER-TWO", "BODY-REQ2-BBBB");
 
-            // Head first → server reserves the accum and waits for the body.
-            sock.write_all(&r1[..head_end]).unwrap();
-            std::thread::sleep(Duration::from_millis(15));
-            // Body → req1 dispatches from the accum (zero-copy retain), then awaits.
-            sock.write_all(&r1[head_end..]).unwrap();
-            std::thread::sleep(Duration::from_millis(15));
-            // req2 mutates the accum while req1's retained slice is still alive.
-            sock.write_all(&r2).unwrap();
+                sock.write_all(&r1[..head_end]).unwrap();
+                std::thread::sleep(Duration::from_millis(15));
+                sock.write_all(&r1[head_end..]).unwrap();
+                std::thread::sleep(Duration::from_millis(15));
+                sock.write_all(&r2).unwrap();
 
-            let mut acc = Vec::new();
-            let (s1, b1) = read_body(&mut sock, &mut acc);
-            let (s2, b2) = read_body(&mut sock, &mut acc);
+                let mut acc = Vec::new();
+                let (s1, b1) = read_body(&mut sock, &mut acc);
+                let (s2, b2) = read_body(&mut sock, &mut acc);
 
-            assert_eq!(s1, 200, "resp1: {b1:?}");
-            assert_eq!(
-                b1,
-                expect("REQ1ID", "MARKER-ONE", "BODY-REQ1-AAAA"),
-                "req1 head/body corrupted by accum mutation during await (COW failed?)"
-            );
-            assert_eq!(s2, 200, "resp2: {b2:?}");
-            assert_eq!(b2, expect("REQ2ID", "MARKER-TWO", "BODY-REQ2-BBBB"));
-        },
-    );
+                assert_eq!(s1, 200, "resp1: {b1:?}");
+                assert_eq!(
+                    b1,
+                    expect("REQ1ID", "MARKER-ONE", "BODY-REQ1-AAAA"),
+                    "req1 head/body corrupted by accum mutation during await (COW failed?)"
+                );
+                assert_eq!(s2, 200, "resp2: {b2:?}");
+                assert_eq!(b2, expect("REQ2ID", "MARKER-TWO", "BODY-REQ2-BBBB"));
+            },
+        )
+        .expect("harness");
 }
 
-/// req1 arrives whole in one read (socket fast-path), so its retained bytes are an
-/// owned copy, not an accum slice. After req1 awaits, req2 reuses the socket buffer —
-/// req1's head and body must survive because the copy is independent.
 #[test]
 fn socket_fast_path_retain_survives_buffer_reuse() {
     let bind: std::net::SocketAddr = "127.0.0.1:18924".parse().unwrap();
-    run_with_trigger(
-        bind,
-        |ctx, trigger| Build::http(echo_dispatch::new(&()), cfg(bind), ctx, Some(trigger)),
-        |bind| {
-            let mut sock = TcpStream::connect(bind).expect("connect");
-            sock.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
-            sock.set_nodelay(true).unwrap();
+    Harness::new(bind)
+        .run_with_trigger(
+            |_ctx, trigger| {
+                let driver_config =
+                    driver::Config::for_tcp_profile::<Throughput>(support::MAX_CONNECTIONS);
+                let executor = Executor::new(driver_config)?;
+                executor.enter(|mut session| {
+                    server(bind).serve(
+                        &mut session,
+                        EchoDispatch::new(
+                            (),
+                            sark::app::Config {
+                                timer_capacity: 32,
+                                task_capacity: support::MAX_CONNECTIONS,
+                            },
+                        ),
+                        Some(trigger),
+                    )
+                })
+            },
+            |bind| {
+                let mut sock = TcpStream::connect(bind).expect("connect");
+                sock.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
+                sock.set_nodelay(true).unwrap();
 
-            let r1 = req("REQ1ID", "MARKER-ONE", "BODY-REQ1-AAAA");
-            let r2 = req("REQ2ID", "MARKER-TWO", "BODY-REQ2-BBBB");
+                let r1 = req("REQ1ID", "MARKER-ONE", "BODY-REQ1-AAAA");
+                let r2 = req("REQ2ID", "MARKER-TWO", "BODY-REQ2-BBBB");
 
-            // Whole request in one write → socket fast-path, retained by copy.
-            sock.write_all(&r1).unwrap();
-            std::thread::sleep(Duration::from_millis(15));
-            // Second request reuses the recv buffer while req1 is still awaiting.
-            sock.write_all(&r2).unwrap();
+                sock.write_all(&r1).unwrap();
+                std::thread::sleep(Duration::from_millis(15));
+                sock.write_all(&r2).unwrap();
 
-            let mut acc = Vec::new();
-            let (s1, b1) = read_body(&mut sock, &mut acc);
-            let (s2, b2) = read_body(&mut sock, &mut acc);
+                let mut acc = Vec::new();
+                let (s1, b1) = read_body(&mut sock, &mut acc);
+                let (s2, b2) = read_body(&mut sock, &mut acc);
 
-            assert_eq!(s1, 200, "resp1: {b1:?}");
-            assert_eq!(
-                b1,
-                expect("REQ1ID", "MARKER-ONE", "BODY-REQ1-AAAA"),
-                "req1 corrupted after socket buffer reuse (retain copy failed?)"
-            );
-            assert_eq!(s2, 200, "resp2: {b2:?}");
-            assert_eq!(b2, expect("REQ2ID", "MARKER-TWO", "BODY-REQ2-BBBB"));
-        },
-    );
+                assert_eq!(s1, 200, "resp1: {b1:?}");
+                assert_eq!(
+                    b1,
+                    expect("REQ1ID", "MARKER-ONE", "BODY-REQ1-AAAA"),
+                    "req1 corrupted after socket buffer reuse (retain copy failed?)"
+                );
+                assert_eq!(s2, 200, "resp2: {b2:?}");
+                assert_eq!(b2, expect("REQ2ID", "MARKER-TWO", "BODY-REQ2-BBBB"));
+            },
+        )
+        .expect("harness");
 }

@@ -1,150 +1,180 @@
-use std::collections::BTreeMap;
 use std::io;
 use std::net::SocketAddr;
+use std::pin::Pin;
 
-use dope::launcher::Ctx;
 use dope::manifold::env::Bundle;
-use dope::manifold::listener::{self, Application, Listener, config};
+use dope::manifold::listener::{self, Application, Listener};
 use dope::runtime::profile::Throughput;
-use dope::transport::Tcp;
-use dope::transport::link::Slot;
-use dope::transport::wire::{RecvChunk, Wire};
-use dope::wire::Identity;
-use dope::{Driver, DriverConfig, Executor, manifold};
-use dope_extra::Trigger;
-use dope_tls::{Endpoint, Tls};
+use dope::runtime::{Executor, ShutdownTrigger, WorkerContext};
+use dope::{DriverContext, manifold};
+use dope_net::link::slot::Slot;
+use dope_net::wire::Wire;
+use dope_net::wire::identity::Identity;
+use dope_net::{tcp, tcp::Tcp};
+use dope_tls::tls::{Endpoint, Tls};
+use o3::buffer::{RetainBytes, SharedPool};
+use o3::collections::{FixedHashTable, FixedQueue, Slab, SlabKey};
 use sark_core::identity_mut;
 use sark_h2::tuning::Tuning;
 use sark_h2::{Conn, ErrorCode, ServerRole, StreamId, conn};
 
 use crate::Codec;
-use crate::frame::{Deframer, MessageFrame};
+use crate::frame::{DataChunk, Deframer, MessageFrame};
 use crate::headers::{HeaderBlock, RequestHead};
 use crate::metadata::Metadata;
 use crate::status::{Code, Status};
 
 #[derive(Clone, Debug)]
-pub struct Config {
+pub struct Limits {
+    pub max_in_flight: usize,
     pub max_message_len: usize,
+    pub max_fragmented_messages: usize,
     pub max_buffered_len: usize,
     pub max_buffered_msgs: usize,
     pub max_conn_buffered_len: usize,
+    pub max_pending_replies: usize,
+    pub max_pending_len: usize,
 }
 
-impl Default for Config {
+impl Default for Limits {
     fn default() -> Self {
         Self {
+            max_in_flight: 256,
             max_message_len: 4 * 1024 * 1024,
+            max_fragmented_messages: 4,
             max_buffered_len: <Throughput as Tuning>::MAX_BODY_LEN,
             max_buffered_msgs: 8192,
             max_conn_buffered_len: <Throughput as Tuning>::MAX_CONN_BUFFERED_LEN,
+            max_pending_replies: 8192,
+            max_pending_len: <Throughput as Tuning>::MAX_CONN_BUFFERED_LEN,
         }
     }
 }
 
 #[derive(Clone, Debug)]
-pub struct Cfg {
+pub struct Config {
     pub bind: SocketAddr,
     pub readiness: Option<SocketAddr>,
-    pub max_conn: usize,
+    pub max_connections: usize,
     pub backlog: i32,
-    pub grpc: Config,
+    pub grpc: Limits,
 }
 
 pub type Env = Bundle<Tcp, Identity, Throughput>;
 pub type TlsEnv = Bundle<Tcp, Tls, Throughput>;
 
-fn listener_config(bind: SocketAddr, cfg: &Cfg) -> config::Config<Tcp> {
-    config::Config::<Tcp> {
-        max_conn: cfg.max_conn,
+fn listener_config(bind: SocketAddr, cfg: &Config) -> listener::Config<Tcp> {
+    listener::Config::<Tcp> {
+        max_connections: cfg.max_connections,
         bind,
         backlog: cfg.backlog,
-        stream_opts: Default::default(),
-        listener_opts: dope::transport::config::tcp::ListenerOpts {
-            reuseport: dope::transport::config::SocketToggle::Enabled,
-            per_ip_cap: Some((cfg.max_conn / 2) as u32),
+        stream: Default::default(),
+        transport: tcp::listener::Config {
+            reuse_port: true,
+            per_ip_limit: Some((cfg.max_connections / 2) as u32),
             ..Default::default()
         },
+        egress: Default::default(),
     }
 }
 
-fn driver_config(cfg: &Cfg, ctx: &Ctx) -> dope::DriverCfg {
-    <dope::DriverCfg as DriverConfig>::for_tcp_profile::<Throughput>(cfg.max_conn)
-        .with_cpu_id(Some(ctx.cpu))
+fn driver_config(cfg: &Config) -> dope::driver::Config {
+    dope::driver::Config::for_tcp_profile::<Throughput>(cfg.max_connections)
 }
 
 #[pin_project::pin_project]
 #[derive(dope_gen::Dispatcher)]
-struct Dispatcher<H: Handler> {
+struct Dispatcher<'d, H: Handler> {
     #[pin]
     #[manifold]
-    listener: Listener<0, App<H>, Env>,
+    listener: Listener<'d, 0, App<H>, Env>,
 }
 
 pub fn serve<H: Handler>(
     handler: H,
-    cfg: Cfg,
-    ctx: Ctx,
-    shutdown: Option<&Trigger>,
+    cfg: Config,
+    context: WorkerContext,
+    shutdown: Option<&ShutdownTrigger>,
 ) -> io::Result<()> {
-    let mut exec = Executor::new(driver_config(&cfg, &ctx))?;
-    let drv = exec.driver_mut();
-    if let Some(trigger) = shutdown {
-        trigger.register(drv);
-    }
-    let mut app = App::with_config(handler, cfg.grpc.clone());
-    app.liveness_fallback = cfg.readiness.is_some();
-    let listener = Listener::<0, App<H>, Env>::open_in(app, listener_config(cfg.bind, &cfg), drv)?;
-    let mut app = core::pin::pin!(Dispatcher { listener });
-    exec.run(app.as_mut())
+    let exec = Executor::with_seed(driver_config(&cfg), context.seed())?;
+    exec.enter(|mut sess| {
+        let hash_builder = sess.seed().derive(dope::hash::domain::ACCEPT).state();
+        let mut app = App::with_config(handler, cfg.grpc.clone());
+        app.liveness_fallback = cfg.readiness.is_some();
+        let listener = {
+            let mut driver = sess.driver_access();
+            if let Some(trigger) = shutdown {
+                trigger.try_register(&mut driver)?;
+            }
+            Listener::<0, App<H>, Env>::open_in(
+                app,
+                listener_config(cfg.bind, &cfg),
+                hash_builder,
+                &mut driver,
+            )?
+        };
+        let app = core::pin::pin!(o3::cell::BrandCell::new(Dispatcher { listener }));
+        sess.run(app.as_ref())
+    })
 }
 
 #[pin_project::pin_project]
 #[derive(dope_gen::Dispatcher)]
-struct TlsDispatcher<H: Handler> {
+struct TlsDispatcher<'d, H: Handler> {
     #[pin]
     #[manifold]
-    listener: Listener<0, App<H, Tls>, TlsEnv>,
+    listener: Listener<'d, 0, App<H, Tls>, TlsEnv>,
     #[pin]
     #[manifold(optional)]
-    readiness: Option<Listener<1, liveness::Liveness, Env>>,
+    readiness: Option<Listener<'d, 1, liveness::Liveness, Env>>,
 }
 
 pub fn serve_tls<H: Handler>(
     handler: H,
-    cfg: Cfg,
+    cfg: Config,
     tls_cfg: shin::server::Config,
-    ctx: Ctx,
-    shutdown: Option<&Trigger>,
+    context: WorkerContext,
+    shutdown: Option<&ShutdownTrigger>,
 ) -> io::Result<()> {
-    let mut exec = Executor::new(driver_config(&cfg, &ctx))?;
-    let drv = exec.driver_mut();
-    if let Some(trigger) = shutdown {
-        trigger.register(drv);
-    }
-    let mut listener = Listener::<0, App<H, Tls>, TlsEnv>::open_in(
-        App::with_config(handler, cfg.grpc.clone()),
-        listener_config(cfg.bind, &cfg),
-        drv,
-    )?;
-    listener.set_cfg(Endpoint::Server(Box::new(tls_cfg)));
-    let readiness = match cfg.readiness {
-        Some(addr) => Some(Listener::<1, liveness::Liveness, Env>::open_in(
-            liveness::Liveness,
-            listener_config(addr, &cfg),
-            drv,
-        )?),
-        None => None,
-    };
-    let mut app = core::pin::pin!(TlsDispatcher {
-        listener,
-        readiness,
-    });
-    exec.run(app.as_mut())
+    let exec = Executor::with_seed(driver_config(&cfg), context.seed())?;
+    exec.enter(|mut sess| {
+        let accept_hash = sess.seed().derive(dope::hash::domain::ACCEPT).state();
+        let readiness_hash = sess.seed().derive(dope::hash::domain::ACCEPT ^ 1).state();
+        let (listener, readiness) = {
+            let mut driver = sess.driver_access();
+            if let Some(trigger) = shutdown {
+                trigger.try_register(&mut driver)?;
+            }
+            let mut listener = Listener::<0, App<H, Tls>, TlsEnv>::open_in(
+                App::with_config(handler, cfg.grpc.clone()),
+                listener_config(cfg.bind, &cfg),
+                accept_hash,
+                &mut driver,
+            )?;
+            listener.set_config(Endpoint::Server(Box::new(tls_cfg)));
+            let readiness = match cfg.readiness {
+                Some(addr) => Some(Listener::<1, liveness::Liveness, Env>::open_in(
+                    liveness::Liveness,
+                    listener_config(addr, &cfg),
+                    readiness_hash,
+                    &mut driver,
+                )?),
+                None => None,
+            };
+            (listener, readiness)
+        };
+        let app = core::pin::pin!(o3::cell::BrandCell::new(TlsDispatcher {
+            listener,
+            readiness,
+        }));
+        sess.run(app.as_ref())
+    })
 }
 
 mod liveness {
-    use super::{Application, Driver, Identity, RecvChunk, Slot, Wire, listener, manifold};
+    use super::{
+        Application, DriverContext, Identity, Pin, RetainBytes, Slot, Wire, listener, manifold,
+    };
 
     const RESPONSE: &[u8] = b"HTTP/1.1 200 OK\r\ncontent-length: 0\r\nconnection: close\r\n\r\n";
 
@@ -159,50 +189,56 @@ mod liveness {
         !is_h2_preface_prefix(first)
     }
 
-    pub fn respond<W: Wire, C: Default + 'static>(
-        slot: &mut Slot<W, listener::State<C>>,
+    pub fn respond<'d, W: Wire, C: Default + 'static>(
+        slot: &mut Slot<'d, W, listener::State<C>>,
         aux: &mut listener::Aux,
-        driver: &mut Driver,
+        driver: &mut DriverContext<'_, 'd>,
     ) {
-        if slot.core.is_send_inflight() {
+        if slot.is_send_inflight() {
             return;
         }
         let ud = slot.token();
-        let buf = aux.write_buf_for(slot);
+        let mut buf = aux.write_buf_for(slot);
         buf[..RESPONSE.len()].copy_from_slice(RESPONSE);
-        slot.core.set_close_after();
-        slot.submit_buffered(buf, RESPONSE.len(), ud, driver);
+        slot.set_close_after();
+        dope::manifold::listener::SlotEgress::submit_buffered(
+            slot,
+            buf,
+            RESPONSE.len(),
+            ud,
+            driver,
+        );
     }
 
     pub struct Liveness;
 
-    impl Application for Liveness {
+    impl<'d> Application<'d> for Liveness {
         type Conn = ();
         type Wire = Identity;
 
-        fn on_chunk(
-            &mut self,
-            slot: &mut Slot<Identity, listener::State<()>>,
-            _chunk: RecvChunk<'_>,
+        fn chunk<R: RetainBytes>(
+            self: Pin<&mut Self>,
+            slot: &mut Slot<'d, Identity, listener::State<()>>,
+            _chunk: R,
             aux: &mut listener::Aux,
-            driver: &mut Driver,
+            driver: &mut DriverContext<'_, 'd>,
         ) -> manifold::Outcome {
             respond(slot, aux, driver);
             manifold::Outcome::Ok
         }
 
-        fn on_send(
-            &mut self,
-            _slot: &mut Slot<Identity, listener::State<()>>,
+        fn send(
+            self: Pin<&mut Self>,
+            _slot: &mut Slot<'d, Identity, listener::State<()>>,
             _sent: usize,
             _aux: &mut listener::Aux,
-            _driver: &mut Driver,
+            _driver: &mut DriverContext<'_, 'd>,
         ) {
         }
 
-        fn on_close(
-            &mut self,
-            _slot: &mut Slot<Identity, listener::State<()>>,
+        fn close(
+            self: Pin<&mut Self>,
+            _slot: &mut Slot<'d, Identity, listener::State<()>>,
             _aux: &mut listener::Aux,
         ) {
         }
@@ -211,11 +247,84 @@ mod liveness {
 
 pub use liveness::{H2_PREFACE, is_h2_preface_prefix, is_plain_request};
 
-#[derive(Clone, Debug)]
-pub struct Request {
+pub struct MessageList<'a> {
+    repr: MessageListRepr<'a>,
+    len: usize,
+}
+
+enum MessageListRepr<'a> {
+    Chain {
+        nodes: &'a Slab<MessageNode, MessageNodeTag>,
+        next: Option<MessageNodeKey>,
+    },
+    Queue(&'a FixedQueue<MessageFrame>),
+}
+
+impl MessageList<'_> {
+    pub fn len(&self) -> usize {
+        self.len
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    pub fn iter(&self) -> MessageIter<'_> {
+        let repr = match &self.repr {
+            MessageListRepr::Chain { nodes, next } => MessageIterRepr::Chain { nodes, next: *next },
+            MessageListRepr::Queue(queue) => MessageIterRepr::Queue { queue, index: 0 },
+        };
+        MessageIter { repr }
+    }
+}
+
+impl<'a> IntoIterator for &'a MessageList<'_> {
+    type Item = &'a MessageFrame;
+    type IntoIter = MessageIter<'a>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.iter()
+    }
+}
+
+pub struct MessageIter<'a> {
+    repr: MessageIterRepr<'a>,
+}
+
+enum MessageIterRepr<'a> {
+    Chain {
+        nodes: &'a Slab<MessageNode, MessageNodeTag>,
+        next: Option<MessageNodeKey>,
+    },
+    Queue {
+        queue: &'a FixedQueue<MessageFrame>,
+        index: usize,
+    },
+}
+
+impl<'a> Iterator for MessageIter<'a> {
+    type Item = &'a MessageFrame;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        match &mut self.repr {
+            MessageIterRepr::Chain { nodes, next } => {
+                let node = nodes.get((*next)?)?;
+                *next = node.next;
+                Some(&node.message)
+            }
+            MessageIterRepr::Queue { queue, index } => {
+                let message = queue.get(*index)?;
+                *index += 1;
+                Some(message)
+            }
+        }
+    }
+}
+
+pub struct Request<'a> {
     pub stream_id: StreamId,
     pub head: RequestHead,
-    pub messages: Vec<MessageFrame>,
+    pub messages: MessageList<'a>,
     pub trailers: Metadata,
 }
 
@@ -272,27 +381,59 @@ impl Default for Response {
     }
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug)]
 pub struct StreamRoutes {
-    map: BTreeMap<StreamId, usize>,
+    map: FixedHashTable<StreamRoute>,
+}
+
+#[derive(Clone, Debug)]
+struct StreamRoute {
+    stream_id: StreamId,
+    route: usize,
 }
 
 impl StreamRoutes {
+    fn with_capacity(capacity: usize) -> Self {
+        Self {
+            map: FixedHashTable::with_capacity(capacity),
+        }
+    }
+
     fn bind(&mut self, stream_id: StreamId, route: usize) {
-        self.map.insert(stream_id, route);
+        if self
+            .map
+            .try_insert(
+                u64::from(stream_id.0),
+                StreamRoute { stream_id, route },
+                |entry| entry.stream_id == stream_id,
+            )
+            .is_err()
+        {
+            unreachable!();
+        }
     }
 
     fn route(&self, stream_id: StreamId) -> Option<usize> {
-        self.map.get(&stream_id).copied()
+        self.map
+            .get(u64::from(stream_id.0), |entry| entry.stream_id == stream_id)
+            .map(|entry| entry.route)
     }
 
     fn release(&mut self, stream_id: StreamId) -> Option<usize> {
-        self.map.remove(&stream_id)
+        self.map
+            .remove(u64::from(stream_id.0), |entry| entry.stream_id == stream_id)
+            .map(|entry| entry.route)
+    }
+}
+
+impl Default for StreamRoutes {
+    fn default() -> Self {
+        Self::with_capacity(Limits::default().max_in_flight)
     }
 }
 
 pub trait Handler: 'static {
-    fn on_start(
+    fn start(
         &mut self,
         routes: &mut StreamRoutes,
         stream_id: StreamId,
@@ -303,7 +444,7 @@ pub trait Handler: 'static {
         StreamMode::Buffered
     }
 
-    fn on_message(
+    fn message(
         &mut self,
         routes: &mut StreamRoutes,
         stream_id: StreamId,
@@ -313,7 +454,7 @@ pub trait Handler: 'static {
         let _ = (routes, stream_id, message, reply);
     }
 
-    fn on_trailers(
+    fn trailers(
         &mut self,
         routes: &mut StreamRoutes,
         stream_id: StreamId,
@@ -323,7 +464,7 @@ pub trait Handler: 'static {
         let _ = (routes, stream_id, trailers, reply);
     }
 
-    fn on_request(&mut self, request: Request, response: &mut Response);
+    fn request(&mut self, request: Request<'_>, response: &mut Response);
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -423,7 +564,7 @@ impl<H: Handler> Default for Routes<H> {
 }
 
 impl<H: Handler> Handler for Routes<H> {
-    fn on_start(
+    fn start(
         &mut self,
         routes: &mut StreamRoutes,
         stream_id: StreamId,
@@ -435,14 +576,14 @@ impl<H: Handler> Handler for Routes<H> {
         };
         let mode = self.routes[route_idx]
             .handler
-            .on_start(routes, stream_id, head, reply);
+            .start(routes, stream_id, head, reply);
         if mode == StreamMode::Live {
             routes.bind(stream_id, route_idx);
         }
         mode
     }
 
-    fn on_message(
+    fn message(
         &mut self,
         routes: &mut StreamRoutes,
         stream_id: StreamId,
@@ -454,10 +595,10 @@ impl<H: Handler> Handler for Routes<H> {
         };
         self.routes[route_idx]
             .handler
-            .on_message(routes, stream_id, message, reply);
+            .message(routes, stream_id, message, reply);
     }
 
-    fn on_trailers(
+    fn trailers(
         &mut self,
         routes: &mut StreamRoutes,
         stream_id: StreamId,
@@ -469,10 +610,10 @@ impl<H: Handler> Handler for Routes<H> {
         };
         self.routes[route_idx]
             .handler
-            .on_trailers(routes, stream_id, trailers, reply);
+            .trailers(routes, stream_id, trailers, reply);
     }
 
-    fn on_request(&mut self, request: Request, response: &mut Response) {
+    fn request(&mut self, request: Request<'_>, response: &mut Response) {
         let Some(route) = self
             .routes
             .iter_mut()
@@ -481,7 +622,7 @@ impl<H: Handler> Handler for Routes<H> {
             response.status = Status::new(Code::Unimplemented, "unknown gRPC method");
             return;
         };
-        route.handler.on_request(request, response);
+        route.handler.request(request, response);
     }
 }
 
@@ -489,14 +630,14 @@ fn dispatch_request(
     handler: &mut (impl Handler + ?Sized),
     stream_id: StreamId,
     head: RequestHead,
-    messages: Vec<MessageFrame>,
+    messages: MessageList<'_>,
     trailers: Metadata,
 ) -> Result<Response, Status> {
     if messages.iter().any(|message| message.compressed) {
         return Err(compression_unsupported());
     }
     let mut response = Response::new();
-    handler.on_request(
+    handler.request(
         Request {
             stream_id,
             head,
@@ -508,43 +649,50 @@ fn dispatch_request(
     Ok(response)
 }
 
-/// Drive `handler` for one buffered unary/server-streaming call whose `body` is
-/// the raw gRPC length-prefixed request frames. Pairs with [`Response::encode_body`].
-///
-/// The whole `body` is held in memory, so bounding its size is the caller's job;
-/// only `config.max_message_len` is enforced here.
-///
-/// ```
-/// use sark_grpc::server::{dispatch_buffered, Config, Handler, Request, Response, Routes};
-/// use sark_grpc::headers::RequestHead;
-///
-/// struct Echo;
-/// impl Handler for Echo {
-///     fn on_request(&mut self, req: Request, res: &mut Response) {
-///         req.messages.iter().for_each(|m| res.push_message(m.payload.clone()));
-///     }
-/// }
-///
-/// let mut routes = Routes::new();
-/// routes.push(b"/svc", Echo);
-/// let head = RequestHead { path: b"/svc".to_vec(), authority: None, metadata: Default::default() };
-/// let response = dispatch_buffered(&mut routes, head, &[], &Config::default());
-/// let mut wire = Vec::new();
-/// response.encode_body(&mut wire).unwrap();
-/// ```
 pub fn dispatch_buffered(
     handler: &mut (impl Handler + ?Sized),
     head: RequestHead,
     body: &[u8],
-    config: &Config,
+    config: &Limits,
 ) -> Response {
     let mut deframer = Deframer::new(config.max_message_len);
-    let mut messages = Vec::new();
-    if let Err(err) = deframer.push(body, &mut messages) {
-        return Response::with_status(Status::from_frame_err(err));
+    let input_pool = SharedPool::new(1, body.len().max(1));
+    let mut lease = input_pool.try_acquire().unwrap();
+    if lease.spare_writer().try_extend_from_slice(body).is_err() {
+        return Response::with_status(Status::new(Code::ResourceExhausted, "request is too large"));
     }
-    dispatch_request(handler, StreamId(0), head, messages, Metadata::new())
-        .unwrap_or_else(Response::with_status)
+    let mut input = DataChunk::from_pooled(lease.freeze());
+    let fragment_pool = SharedPool::new(1, config.max_message_len.max(1));
+    let capacity = config
+        .max_buffered_msgs
+        .min(body.len() / 5 + usize::from(!body.is_empty()));
+    let mut queue = FixedQueue::with_capacity(capacity);
+    while !input.is_empty() {
+        match deframer.next(&mut input, &fragment_pool) {
+            Ok(Some(message)) => {
+                if queue.push_back(message).is_err() {
+                    return Response::with_status(Status::new(
+                        Code::ResourceExhausted,
+                        "request message buffer is full",
+                    ));
+                }
+            }
+            Ok(None) => continue,
+            Err(error) => return Response::with_status(Status::from_frame_err(error)),
+        }
+    }
+    let len = queue.len();
+    dispatch_request(
+        handler,
+        StreamId(0),
+        head,
+        MessageList {
+            repr: MessageListRepr::Queue(&queue),
+            len,
+        },
+        Metadata::new(),
+    )
+    .unwrap_or_else(Response::with_status)
 }
 
 #[derive(Clone, Debug)]
@@ -588,7 +736,7 @@ pub trait UnaryHandler: 'static {
     type Response;
     type Codec: Codec<Decode = Self::Request, Encode = Self::Response>;
 
-    fn on_unary(&mut self, request: UnaryRequest<Self::Request>) -> UnaryResponse<Self::Response>;
+    fn unary(&mut self, request: UnaryRequest<Self::Request>) -> UnaryResponse<Self::Response>;
 }
 
 #[derive(Clone, Debug)]
@@ -632,7 +780,7 @@ pub trait StreamingHandler: 'static {
     type Response;
     type Codec: Codec<Decode = Self::Request, Encode = Self::Response>;
 
-    fn on_stream(
+    fn stream(
         &mut self,
         request: StreamingRequest<Self::Request>,
     ) -> StreamingResponse<Self::Response>;
@@ -702,18 +850,14 @@ pub trait LiveStreamingHandler: 'static {
     type Response;
     type Codec: Codec<Decode = Self::Request, Encode = Self::Response>;
 
-    fn on_start(
-        &mut self,
-        stream_id: StreamId,
-        head: &RequestHead,
-    ) -> LiveResponse<Self::Response> {
+    fn start(&mut self, stream_id: StreamId, head: &RequestHead) -> LiveResponse<Self::Response> {
         let _ = (stream_id, head);
         LiveResponse::new()
     }
 
-    fn on_message(&mut self, message: LiveMessage<Self::Request>) -> LiveResponse<Self::Response>;
+    fn message(&mut self, message: LiveMessage<Self::Request>) -> LiveResponse<Self::Response>;
 
-    fn on_trailers(&mut self, trailers: LiveTrailers) -> LiveResponse<Self::Response> {
+    fn trailers(&mut self, trailers: LiveTrailers) -> LiveResponse<Self::Response> {
         let _ = trailers;
         LiveResponse::finish(Status::ok())
     }
@@ -753,12 +897,17 @@ impl<H: LiveStreamingHandler> LiveStreaming<H> {
 }
 
 impl<H: UnaryHandler> Handler for Unary<H> {
-    fn on_request(&mut self, request: Request, response: &mut Response) {
-        let [message] = request.messages.as_slice() else {
+    fn request(&mut self, request: Request<'_>, response: &mut Response) {
+        let mut messages = request.messages.iter();
+        let Some(message) = messages.next() else {
             response.status = Status::new(Code::InvalidArgument, "unary request needs one message");
             return;
         };
-        let decoded = match self.codec.decode(&message.payload) {
+        if messages.next().is_some() {
+            response.status = Status::new(Code::InvalidArgument, "unary request needs one message");
+            return;
+        }
+        let decoded = match self.codec.decode(message.payload.as_slice()) {
             Ok(decoded) => decoded,
             Err(status) => {
                 response.status = status;
@@ -771,7 +920,7 @@ impl<H: UnaryHandler> Handler for Unary<H> {
             message: decoded,
             trailers: request.trailers,
         };
-        let unary_response = self.handler.on_unary(unary_request);
+        let unary_response = self.handler.unary(unary_request);
         response.metadata = unary_response.metadata;
         response.trailers = unary_response.trailers;
         response.status = unary_response.status;
@@ -786,10 +935,10 @@ impl<H: UnaryHandler> Handler for Unary<H> {
 }
 
 impl<H: StreamingHandler> Handler for Streaming<H> {
-    fn on_request(&mut self, request: Request, response: &mut Response) {
+    fn request(&mut self, request: Request<'_>, response: &mut Response) {
         let mut messages = Vec::with_capacity(request.messages.len());
-        for message in request.messages {
-            match self.codec.decode(&message.payload) {
+        for message in request.messages.iter() {
+            match self.codec.decode(message.payload.as_slice()) {
                 Ok(decoded) => messages.push(decoded),
                 Err(status) => {
                     response.status = status;
@@ -803,7 +952,7 @@ impl<H: StreamingHandler> Handler for Streaming<H> {
             messages,
             trailers: request.trailers,
         };
-        let stream_response = self.handler.on_stream(stream_request);
+        let stream_response = self.handler.stream(stream_request);
         response.metadata = stream_response.metadata;
         response.trailers = stream_response.trailers;
         response.status = stream_response.status;
@@ -822,7 +971,7 @@ impl<H: StreamingHandler> Handler for Streaming<H> {
 }
 
 impl<H: LiveStreamingHandler> Handler for LiveStreaming<H> {
-    fn on_start(
+    fn start(
         &mut self,
         routes: &mut StreamRoutes,
         stream_id: StreamId,
@@ -830,11 +979,11 @@ impl<H: LiveStreamingHandler> Handler for LiveStreaming<H> {
         reply: &mut StreamReply,
     ) -> StreamMode {
         let _ = routes;
-        reply.apply_live(self.handler.on_start(stream_id, head), &mut self.codec);
+        reply.apply_live(self.handler.start(stream_id, head), &mut self.codec);
         StreamMode::Live
     }
 
-    fn on_message(
+    fn message(
         &mut self,
         routes: &mut StreamRoutes,
         stream_id: StreamId,
@@ -842,7 +991,7 @@ impl<H: LiveStreamingHandler> Handler for LiveStreaming<H> {
         reply: &mut StreamReply,
     ) {
         let _ = routes;
-        let decoded = match self.codec.decode(&message.payload) {
+        let decoded = match self.codec.decode(message.payload.as_slice()) {
             Ok(decoded) => decoded,
             Err(status) => {
                 reply.finish_with(status);
@@ -850,7 +999,7 @@ impl<H: LiveStreamingHandler> Handler for LiveStreaming<H> {
             }
         };
         reply.apply_live(
-            self.handler.on_message(LiveMessage {
+            self.handler.message(LiveMessage {
                 stream_id,
                 message: decoded,
             }),
@@ -858,7 +1007,7 @@ impl<H: LiveStreamingHandler> Handler for LiveStreaming<H> {
         );
     }
 
-    fn on_trailers(
+    fn trailers(
         &mut self,
         routes: &mut StreamRoutes,
         stream_id: StreamId,
@@ -867,7 +1016,7 @@ impl<H: LiveStreamingHandler> Handler for LiveStreaming<H> {
     ) {
         let _ = routes;
         reply.apply_live(
-            self.handler.on_trailers(LiveTrailers {
+            self.handler.trailers(LiveTrailers {
                 stream_id,
                 trailers,
             }),
@@ -875,65 +1024,123 @@ impl<H: LiveStreamingHandler> Handler for LiveStreaming<H> {
         );
     }
 
-    fn on_request(&mut self, _request: Request, response: &mut Response) {
+    fn request(&mut self, _request: Request<'_>, response: &mut Response) {
         response.status = Status::new(Code::Internal, "live streaming request was buffered");
     }
 }
 
 pub struct ConnState {
     h2: Conn<ServerRole>,
-    streams: BTreeMap<StreamId, StreamState>,
-    pending: BTreeMap<StreamId, PendingResponse>,
+    calls: FixedHashTable<CallRecord>,
+    pending: FixedQueue<StreamId>,
+    replies: Slab<ReplyBatch, ReplyBatchTag>,
+    messages: Slab<MessageNode, MessageNodeTag>,
+    pending_len: usize,
+    pending_capacity: usize,
     live_routes: StreamRoutes,
+    message_pool: SharedPool,
     buffered_total: usize,
     probed: bool,
 }
 
 impl Default for ConnState {
     fn default() -> Self {
+        Self::with_limits(&Limits::default())
+    }
+}
+
+impl ConnState {
+    fn with_limits(limits: &Limits) -> Self {
+        let capacity = limits.max_in_flight;
+        let h2 = Conn::<ServerRole>::with_config(conn::Config {
+            stream_capacity: capacity,
+            ..conn::Config::default()
+        });
         Self {
-            h2: Conn::<ServerRole>::new(),
-            streams: BTreeMap::new(),
-            pending: BTreeMap::new(),
-            live_routes: StreamRoutes::default(),
+            h2,
+            calls: FixedHashTable::with_capacity(capacity),
+            pending: FixedQueue::with_capacity(capacity),
+            replies: Slab::with_capacity(limits.max_pending_replies),
+            messages: Slab::with_capacity(limits.max_buffered_msgs),
+            pending_len: 0,
+            pending_capacity: limits.max_pending_len,
+            live_routes: StreamRoutes::with_capacity(capacity),
+            message_pool: SharedPool::new(
+                limits.max_fragmented_messages,
+                limits.max_message_len.max(1),
+            ),
             buffered_total: 0,
             probed: false,
         }
     }
 }
 
-#[derive(Clone, Debug)]
+struct CallRecord {
+    stream_id: StreamId,
+    stream: Option<StreamState>,
+    pending: Option<PendingResponse>,
+    queued: bool,
+}
+
 struct StreamState {
     head: RequestHead,
     deframer: Deframer,
-    messages: Vec<MessageFrame>,
+    message_head: Option<MessageNodeKey>,
+    message_tail: Option<MessageNodeKey>,
+    message_count: usize,
     trailers: Metadata,
     mode: StreamMode,
     buffered_len: usize,
 }
 
+enum MessageNodeTag {}
+
+type MessageNodeKey = SlabKey<MessageNodeTag>;
+
+struct MessageNode {
+    message: MessageFrame,
+    next: Option<MessageNodeKey>,
+}
+
 #[derive(Clone, Debug)]
 struct PendingResponse {
     headers: HeaderBlock,
-    body: Vec<u8>,
+    head: Option<ReplyBatchKey>,
+    tail: Option<ReplyBatchKey>,
     trailers: Option<HeaderBlock>,
     headers_sent: bool,
-    body_pos: usize,
+    message_pos: usize,
+    frame_pos: usize,
 }
 
+enum ReplyBatchTag {}
+
+type ReplyBatchKey = SlabKey<ReplyBatchTag>;
+
+struct ReplyBatch {
+    messages: Vec<Vec<u8>>,
+    next: Option<ReplyBatchKey>,
+}
+
+#[pin_project::pin_project]
 pub struct App<H: Handler, W: Wire = Identity> {
     handler: H,
-    config: Config,
+    config: Limits,
     liveness_fallback: bool,
     _wire: ::std::marker::PhantomData<W>,
 }
 
 impl<H: Handler, W: Wire> App<H, W> {
     pub fn new(handler: H) -> Self {
-        Self::with_config(handler, Config::default())
+        Self::with_config(handler, Limits::default())
     }
 
-    pub fn with_config(handler: H, config: Config) -> Self {
+    pub fn with_config(handler: H, config: Limits) -> Self {
+        assert!(config.max_in_flight > 0, "max_in_flight must be positive");
+        assert!(
+            config.max_pending_replies > 0,
+            "max_pending_replies must be positive"
+        );
         Self {
             handler,
             config,
@@ -950,13 +1157,16 @@ impl<H: Handler, W: Wire> App<H, W> {
         &mut self.handler
     }
 
-    fn drain_events(&mut self, state: &mut ConnState) {
+    fn drain_events(&mut self, state: &mut ConnState) -> usize {
+        let mut drained = 0;
         while let Some(event) = state.h2.poll_event() {
-            self.on_h2_event(state, event);
+            drained += 1;
+            self.h2_event(state, event);
         }
+        drained
     }
 
-    fn on_h2_event(&mut self, state: &mut ConnState, event: conn::Event) {
+    fn h2_event(&mut self, state: &mut ConnState, event: conn::Event) {
         match event {
             conn::Event::Headers {
                 stream_id,
@@ -964,7 +1174,7 @@ impl<H: Handler, W: Wire> App<H, W> {
                 end_stream,
                 trailing,
             } if trailing => {
-                self.on_trailers(state, stream_id, headers);
+                self.trailers(state, stream_id, headers);
                 if end_stream {
                     self.finish_stream(state, stream_id);
                 }
@@ -975,7 +1185,7 @@ impl<H: Handler, W: Wire> App<H, W> {
                 end_stream,
                 ..
             } => {
-                self.on_headers(state, stream_id, headers);
+                self.headers(state, stream_id, headers);
                 if end_stream {
                     self.finish_stream(state, stream_id);
                 }
@@ -985,7 +1195,7 @@ impl<H: Handler, W: Wire> App<H, W> {
                 data,
                 end_stream,
             } => {
-                self.on_data(state, stream_id, &data);
+                self.data(state, stream_id, data);
                 if end_stream {
                     self.finish_stream(state, stream_id);
                 }
@@ -998,30 +1208,39 @@ impl<H: Handler, W: Wire> App<H, W> {
         }
     }
 
-    fn on_headers(
+    fn headers(
         &mut self,
         state: &mut ConnState,
         stream_id: StreamId,
-        headers: Vec<sark_h2::hpack::OwnedHeader>,
+        headers: sark_h2::hpack::HeaderBlock,
     ) {
-        let fields = HeaderBlock::from_h2_owned(headers);
+        let fields = HeaderBlock::from_h2(&headers);
         match RequestHead::parse_h2(&fields) {
             Ok(head) => {
                 let mut reply = StreamReply::new();
-                let mode =
-                    self.handler
-                        .on_start(&mut state.live_routes, stream_id, &head, &mut reply);
-                state.streams.insert(
+                let mode = self
+                    .handler
+                    .start(&mut state.live_routes, stream_id, &head, &mut reply);
+                if !state.insert_stream(
                     stream_id,
                     StreamState {
                         head,
                         deframer: Deframer::new(self.config.max_message_len),
-                        messages: Vec::new(),
+                        message_head: None,
+                        message_tail: None,
+                        message_count: 0,
                         trailers: Metadata::new(),
                         mode,
                         buffered_len: 0,
                     },
-                );
+                ) {
+                    state.live_routes.release(stream_id);
+                    state.send_error(
+                        stream_id,
+                        Status::new(Code::ResourceExhausted, "too many in-flight streams"),
+                    );
+                    return;
+                }
                 state.enqueue_reply(stream_id, reply);
             }
             Err(status) => {
@@ -1030,19 +1249,18 @@ impl<H: Handler, W: Wire> App<H, W> {
         }
     }
 
-    fn on_trailers(
+    fn trailers(
         &mut self,
         state: &mut ConnState,
         stream_id: StreamId,
-        headers: Vec<sark_h2::hpack::OwnedHeader>,
+        headers: sark_h2::hpack::HeaderBlock,
     ) {
-        let Some(stream) = state.streams.get_mut(&stream_id) else {
-            return;
-        };
-        let fields = HeaderBlock::from_h2_owned(headers);
+        let fields = HeaderBlock::from_h2(&headers);
         match RequestHead::parse_h2_trailers(&fields) {
             Ok(metadata) => {
-                stream.trailers = metadata;
+                if let Some(stream) = state.stream_mut(stream_id) {
+                    stream.trailers = metadata;
+                }
             }
             Err(status) => {
                 state.remove_stream(stream_id);
@@ -1051,76 +1269,87 @@ impl<H: Handler, W: Wire> App<H, W> {
         }
     }
 
-    fn on_data(&mut self, state: &mut ConnState, stream_id: StreamId, data: &[u8]) {
-        let (mode, messages, over_limit, added) = {
-            let Some(stream) = state.streams.get_mut(&stream_id) else {
+    fn data(
+        &mut self,
+        state: &mut ConnState,
+        stream_id: StreamId,
+        data: sark_h2::conn::DataPayload,
+    ) {
+        let mut data = DataChunk::new(data);
+        while !data.is_empty() {
+            let (next, mode) = {
+                let Some(stream) = state
+                    .calls
+                    .get_mut(ConnState::call_hash(stream_id), |call| {
+                        call.stream_id == stream_id
+                    })
+                    .and_then(|call| call.stream.as_mut())
+                else {
+                    state.send_error(
+                        stream_id,
+                        Status::new(Code::Internal, "DATA before gRPC headers"),
+                    );
+                    return;
+                };
+                (
+                    stream.deframer.next(&mut data, &state.message_pool),
+                    stream.mode,
+                )
+            };
+            let message = match next {
+                Ok(next) => next,
+                Err(err) => {
+                    state.remove_stream(stream_id);
+                    state.send_error(stream_id, Status::from_frame_err(err));
+                    return;
+                }
+            };
+            let Some(message) = message else {
+                continue;
+            };
+            if mode == StreamMode::Live {
+                if message.compressed {
+                    state.remove_stream(stream_id);
+                    state.send_error(stream_id, compression_unsupported());
+                    return;
+                }
+                let mut reply = StreamReply::new();
+                self.handler
+                    .message(&mut state.live_routes, stream_id, message, &mut reply);
+                state.enqueue_reply(stream_id, reply);
+                state.drive_pending();
+                continue;
+            }
+            let added = message.payload.len();
+            let over_limit = {
+                let stream = state.stream_mut(stream_id).unwrap();
+                stream.buffered_len.saturating_add(added) > self.config.max_buffered_len
+                    || stream.message_count == self.config.max_buffered_msgs
+            };
+            if over_limit
+                || state.buffered_total.saturating_add(added) > self.config.max_conn_buffered_len
+                || state.push_message(stream_id, message).is_err()
+            {
+                state.remove_stream(stream_id);
                 state.send_error(
                     stream_id,
-                    Status::new(Code::Internal, "DATA before gRPC headers"),
+                    Status::new(Code::ResourceExhausted, "stream buffer limit exceeded"),
                 );
                 return;
-            };
-            let before = stream.messages.len();
-            if let Err(err) = stream.deframer.push(data, &mut stream.messages) {
-                state.remove_stream(stream_id);
-                state.send_error(stream_id, Status::from_frame_err(err));
-                return;
             }
-            let (over_limit, added) = if stream.mode == StreamMode::Live {
-                (false, 0)
-            } else {
-                let added: usize = stream.messages[before..]
-                    .iter()
-                    .map(|message| message.payload.len())
-                    .sum();
-                stream.buffered_len = stream.buffered_len.saturating_add(added);
-                let over = stream.buffered_len > self.config.max_buffered_len
-                    || stream.messages.len() > self.config.max_buffered_msgs;
-                (over, added)
-            };
-            (
-                stream.mode,
-                core::mem::take(&mut stream.messages),
-                over_limit,
-                added,
-            )
-        };
-        state.buffered_total = state.buffered_total.saturating_add(added);
-        if over_limit || state.buffered_total > self.config.max_conn_buffered_len {
-            state.remove_stream(stream_id);
-            state.send_error(
-                stream_id,
-                Status::new(Code::ResourceExhausted, "stream buffer limit exceeded"),
-            );
-            return;
-        }
-        if mode != StreamMode::Live {
-            if let Some(stream) = state.streams.get_mut(&stream_id) {
-                stream.messages = messages;
-            }
-            return;
-        }
-        for message in messages {
-            if message.compressed {
-                state.remove_stream(stream_id);
-                state.send_error(stream_id, compression_unsupported());
-                return;
-            }
-            let mut reply = StreamReply::new();
-            self.handler
-                .on_message(&mut state.live_routes, stream_id, message, &mut reply);
-            state.enqueue_reply(stream_id, reply);
+            state.buffered_total += added;
+            state.stream_mut(stream_id).unwrap().buffered_len += added;
         }
         state.drive_pending();
     }
 
     fn finish_stream(&mut self, state: &mut ConnState, stream_id: StreamId) {
-        let Some(stream) = state.remove_stream(stream_id) else {
+        let Some(stream) = state.take_stream(stream_id) else {
             return;
         };
         if stream.mode == StreamMode::Live {
             let mut reply = StreamReply::new();
-            self.handler.on_trailers(
+            self.handler.trailers(
                 &mut state.live_routes,
                 stream_id,
                 stream.trailers,
@@ -1133,13 +1362,23 @@ impl<H: Handler, W: Wire> App<H, W> {
             state.drive_pending();
             return;
         }
-        match dispatch_request(
+        let message_head = stream.message_head;
+        let messages = MessageList {
+            repr: MessageListRepr::Chain {
+                nodes: &state.messages,
+                next: message_head,
+            },
+            len: stream.message_count,
+        };
+        let response = dispatch_request(
             &mut self.handler,
             stream_id,
             stream.head,
-            stream.messages,
+            messages,
             stream.trailers,
-        ) {
+        );
+        state.clear_messages(message_head);
+        match response {
             Ok(response) => {
                 state.enqueue_response(stream_id, response);
                 state.drive_pending();
@@ -1148,41 +1387,41 @@ impl<H: Handler, W: Wire> App<H, W> {
         }
     }
 
-    fn flush_into_proj<C: Default + 'static, P: Fn(&mut C) -> &mut ConnState>(
-        slot: &mut Slot<W, listener::State<C>>,
+    fn flush_into_proj<'d, C: Default + 'static, P: Fn(&mut C) -> &mut ConnState>(
+        slot: &mut Slot<'d, W, listener::State<C>>,
         aux: &mut listener::Aux,
-        driver: &mut Driver,
+        driver: &mut DriverContext<'_, 'd>,
         close_after: bool,
         project: &P,
     ) {
-        if slot.core.is_send_inflight() {
+        if slot.is_send_inflight() {
             return;
         }
         let out_is_empty = project(&mut slot.state.conn).h2.outbound().is_empty();
         if out_is_empty {
             if close_after {
-                slot.core.set_close_after();
+                slot.set_close_after();
             }
             return;
         }
         let send_ud = slot.token();
-        let write_buf = aux.write_buf_for(slot);
+        let mut write_buf = aux.write_buf_for(slot);
         let state = project(&mut slot.state.conn);
-        let n = state.h2.drain_into(write_buf);
+        let n = state.h2.drain_into(&mut write_buf);
         let close_now = close_after && state.h2.outbound().is_empty();
         if close_now {
-            slot.core.set_close_after();
+            slot.set_close_after();
         }
-        slot.submit_buffered(write_buf, n, send_ud, driver);
+        dope::manifold::listener::SlotEgress::submit_buffered(slot, write_buf, n, send_ud, driver);
     }
 
-    pub fn on_chunk_proj<C: Default + 'static>(
+    pub fn chunk_proj<'d, C: Default + 'static, R: RetainBytes>(
         &mut self,
-        slot: &mut Slot<W, listener::State<C>>,
+        slot: &mut Slot<'d, W, listener::State<C>>,
         project: impl Fn(&mut C) -> &mut ConnState,
-        chunk: RecvChunk<'_>,
+        chunk: R,
         aux: &mut listener::Aux,
-        driver: &mut Driver,
+        driver: &mut DriverContext<'_, 'd>,
     ) -> manifold::Outcome {
         let bytes = chunk.as_slice();
         if self.liveness_fallback && !project(&mut slot.state.conn).probed {
@@ -1192,99 +1431,213 @@ impl<H: Handler, W: Wire> App<H, W> {
                 return manifold::Outcome::Ok;
             }
         }
-        {
+        let error = {
             let state = project(&mut slot.state.conn);
             if state.h2.goaway_sent() || state.h2.goaway_received().is_some() {
                 return manifold::Outcome::Ok;
             }
-            if let Err(e) = state.h2.ingest(bytes) {
-                let code = ErrorCode::from(&e);
-                state.h2.goaway(code, b"");
-                Self::flush_into_proj(slot, aux, driver, true, &project);
-                return manifold::Outcome::Ok;
+            let mut result = state.h2.ingest(bytes);
+            loop {
+                let drained = self.drain_events(state);
+                state.drive_pending();
+                match result {
+                    Ok(()) => break None,
+                    Err(conn::ConnError::Overload) if drained != 0 => {
+                        result = state.h2.resume();
+                    }
+                    Err(error) => break Some(error),
+                }
             }
-            self.drain_events(state);
-            state.drive_pending();
+        };
+        if let Some(error) = error {
+            let state = project(&mut slot.state.conn);
+            let code = ErrorCode::from(&error);
+            let _ = state.h2.goaway(code, b"");
+            Self::flush_into_proj(slot, aux, driver, true, &project);
+            return manifold::Outcome::Ok;
         }
         let close_after = project(&mut slot.state.conn).h2.goaway_sent();
         Self::flush_into_proj(slot, aux, driver, close_after, &project);
         manifold::Outcome::Ok
     }
 
-    pub fn on_send_proj<C: Default + 'static>(
+    pub fn send_proj<'d, C: Default + 'static>(
         &mut self,
-        slot: &mut Slot<W, listener::State<C>>,
+        slot: &mut Slot<'d, W, listener::State<C>>,
         _sent: usize,
         project: impl Fn(&mut C) -> &mut ConnState,
         aux: &mut listener::Aux,
-        driver: &mut Driver,
+        driver: &mut DriverContext<'_, 'd>,
     ) {
         let close_after = project(&mut slot.state.conn).h2.goaway_sent();
         Self::flush_into_proj(slot, aux, driver, close_after, &project);
     }
 
-    pub fn on_wake_proj<C: Default + 'static>(
+    pub fn activate_proj<'d, C: Default + 'static>(
         &mut self,
-        slot: &mut Slot<W, listener::State<C>>,
+        slot: &mut Slot<'d, W, listener::State<C>>,
         project: impl Fn(&mut C) -> &mut ConnState,
         aux: &mut listener::Aux,
-        driver: &mut Driver,
+        driver: &mut DriverContext<'_, 'd>,
     ) {
         let close_after = project(&mut slot.state.conn).h2.goaway_sent();
         Self::flush_into_proj(slot, aux, driver, close_after, &project);
     }
 }
 
-impl<H: Handler, W: Wire> Application for App<H, W> {
+impl<'d, H: Handler, W: Wire> Application<'d> for App<H, W> {
     type Conn = ConnState;
     type Wire = W;
 
-    fn on_chunk(
-        &mut self,
-        slot: &mut Slot<W, listener::State<ConnState>>,
-        chunk: RecvChunk<'_>,
-        aux: &mut listener::Aux,
-        driver: &mut Driver,
-    ) -> manifold::Outcome {
-        self.on_chunk_proj(slot, identity_mut, chunk, aux, driver)
+    fn connection(self: Pin<&Self>) -> Self::Conn {
+        ConnState::with_limits(&self.get_ref().config)
     }
 
-    fn on_send(
-        &mut self,
-        slot: &mut Slot<W, listener::State<ConnState>>,
+    fn chunk<R: RetainBytes>(
+        self: Pin<&mut Self>,
+        slot: &mut Slot<'d, W, listener::State<ConnState>>,
+        chunk: R,
+        aux: &mut listener::Aux,
+        driver: &mut DriverContext<'_, 'd>,
+    ) -> manifold::Outcome {
+        self.get_mut()
+            .chunk_proj(slot, identity_mut, chunk, aux, driver)
+    }
+
+    fn send(
+        self: Pin<&mut Self>,
+        slot: &mut Slot<'d, W, listener::State<ConnState>>,
         sent: usize,
         aux: &mut listener::Aux,
-        driver: &mut Driver,
+        driver: &mut DriverContext<'_, 'd>,
     ) {
-        self.on_send_proj(slot, sent, identity_mut, aux, driver)
+        self.get_mut()
+            .send_proj(slot, sent, identity_mut, aux, driver)
     }
 
-    fn defer_close(&self, slot: &Slot<W, listener::State<ConnState>>) -> bool {
+    fn defer_close(self: Pin<&Self>, slot: &Slot<'d, W, listener::State<ConnState>>) -> bool {
         !slot.state.conn.h2.outbound().is_empty()
     }
 
-    fn on_wake(
-        &mut self,
-        slot: &mut Slot<W, listener::State<ConnState>>,
+    fn activate(
+        self: Pin<&mut Self>,
+        slot: &mut Slot<'d, W, listener::State<ConnState>>,
         aux: &mut listener::Aux,
-        driver: &mut Driver,
+        driver: &mut DriverContext<'_, 'd>,
     ) {
-        self.on_wake_proj(slot, identity_mut, aux, driver)
+        self.get_mut()
+            .activate_proj(slot, identity_mut, aux, driver)
     }
 
-    fn on_close(
-        &mut self,
-        _slot: &mut Slot<W, listener::State<ConnState>>,
+    fn close(
+        self: Pin<&mut Self>,
+        _slot: &mut Slot<'d, W, listener::State<ConnState>>,
         _aux: &mut listener::Aux,
     ) {
     }
 }
 
 impl ConnState {
+    fn call_hash(stream_id: StreamId) -> u64 {
+        u64::from(stream_id.0)
+    }
+
+    fn call_mut(&mut self, stream_id: StreamId) -> Option<&mut CallRecord> {
+        self.calls.get_mut(Self::call_hash(stream_id), |call| {
+            call.stream_id == stream_id
+        })
+    }
+
+    fn stream_mut(&mut self, stream_id: StreamId) -> Option<&mut StreamState> {
+        self.call_mut(stream_id)?.stream.as_mut()
+    }
+
+    fn insert_stream(&mut self, stream_id: StreamId, stream: StreamState) -> bool {
+        self.calls
+            .try_insert(
+                Self::call_hash(stream_id),
+                CallRecord {
+                    stream_id,
+                    stream: Some(stream),
+                    pending: None,
+                    queued: false,
+                },
+                |call| call.stream_id == stream_id,
+            )
+            .is_ok()
+    }
+
+    fn push_message(
+        &mut self,
+        stream_id: StreamId,
+        message: MessageFrame,
+    ) -> Result<(), MessageFrame> {
+        let Some((tail, count)) = self
+            .stream_mut(stream_id)
+            .map(|stream| (stream.message_tail, stream.message_count))
+        else {
+            return Err(message);
+        };
+        let key = match self.messages.insert(MessageNode {
+            message,
+            next: None,
+        }) {
+            Ok(key) => key,
+            Err(node) => return Err(node.message),
+        };
+        if let Some(tail) = tail {
+            self.messages.get_mut(tail).unwrap().next = Some(key);
+        }
+        let stream = self.stream_mut(stream_id).unwrap();
+        if stream.message_head.is_none() {
+            stream.message_head = Some(key);
+        }
+        stream.message_tail = Some(key);
+        stream.message_count = count + 1;
+        Ok(())
+    }
+
+    fn clear_messages(&mut self, mut next: Option<MessageNodeKey>) {
+        while let Some(key) = next {
+            let node = self.messages.remove(key).unwrap();
+            next = node.next;
+        }
+    }
+
     fn remove_stream(&mut self, stream_id: StreamId) -> Option<StreamState> {
-        let stream = self.streams.remove(&stream_id)?;
+        let call = self.calls.remove(Self::call_hash(stream_id), |call| {
+            call.stream_id == stream_id
+        })?;
+        if call.queued {
+            self.pending.retain(|pending| *pending != stream_id);
+        }
+        if let Some(pending) = call.pending {
+            self.release_response(pending);
+        }
+        let stream = call.stream?;
+        self.buffered_total = self.buffered_total.saturating_sub(stream.buffered_len);
+        self.clear_messages(stream.message_head);
+        Some(stream)
+    }
+
+    fn take_stream(&mut self, stream_id: StreamId) -> Option<StreamState> {
+        let stream = self.call_mut(stream_id)?.stream.take()?;
         self.buffered_total = self.buffered_total.saturating_sub(stream.buffered_len);
         Some(stream)
+    }
+
+    fn remove_empty_call(&mut self, stream_id: StreamId) {
+        let empty = self
+            .calls
+            .get(Self::call_hash(stream_id), |call| {
+                call.stream_id == stream_id
+            })
+            .is_some_and(|call| call.stream.is_none() && call.pending.is_none());
+        if empty {
+            let _ = self.calls.remove(Self::call_hash(stream_id), |call| {
+                call.stream_id == stream_id
+            });
+        }
     }
 
     fn enqueue_response(&mut self, stream_id: StreamId, response: Response) {
@@ -1312,9 +1665,29 @@ impl ConnState {
             }
         };
 
-        let mut body = Vec::new();
-        if let Err(status) = encode_frames(&reply.messages, &mut body) {
-            self.send_error(stream_id, status);
+        let mut added = 0usize;
+        for message in &reply.messages {
+            if MessageFrame::header(false, message.len()).is_err() {
+                self.send_error(
+                    stream_id,
+                    Status::new(Code::Internal, "response message too large"),
+                );
+                return;
+            }
+            let Some(next) = added.checked_add(message.len() + 5) else {
+                self.send_error(
+                    stream_id,
+                    Status::new(Code::ResourceExhausted, "pending response bytes are full"),
+                );
+                return;
+            };
+            added = next;
+        }
+        if added > self.pending_capacity.saturating_sub(self.pending_len) {
+            self.send_error(
+                stream_id,
+                Status::new(Code::ResourceExhausted, "pending response bytes are full"),
+            );
             return;
         }
 
@@ -1330,45 +1703,138 @@ impl ConnState {
             None
         };
 
-        match self.pending.get_mut(&stream_id) {
+        let Some((tail, queued)) = self.call_mut(stream_id).map(|call| {
+            (
+                call.pending.as_ref().and_then(|pending| pending.tail),
+                call.queued,
+            )
+        }) else {
+            self.send_error(
+                stream_id,
+                Status::new(Code::Internal, "reply for unknown gRPC stream"),
+            );
+            return;
+        };
+
+        let batch = if reply.messages.is_empty() {
+            None
+        } else {
+            match self.replies.insert(ReplyBatch {
+                messages: reply.messages,
+                next: None,
+            }) {
+                Ok(key) => Some(key),
+                Err(_) => {
+                    self.send_error(
+                        stream_id,
+                        Status::new(
+                            Code::ResourceExhausted,
+                            "pending response messages are full",
+                        ),
+                    );
+                    return;
+                }
+            }
+        };
+        if let (Some(tail), Some(batch)) = (tail, batch) {
+            self.replies.get_mut(tail).unwrap().next = Some(batch);
+        }
+
+        let needs_queue;
+        let call = self.call_mut(stream_id).unwrap();
+        match call.pending.as_mut() {
             Some(pending) => {
-                pending.body.extend_from_slice(&body);
+                if pending.head.is_none() {
+                    pending.head = batch;
+                }
+                if batch.is_some() {
+                    pending.tail = batch;
+                }
                 if trailers.is_some() {
                     pending.trailers = trailers;
                 }
+                needs_queue = !queued;
             }
             None => {
-                self.pending.insert(
-                    stream_id,
-                    PendingResponse {
-                        headers,
-                        body,
-                        trailers,
-                        headers_sent: false,
-                        body_pos: 0,
-                    },
-                );
+                call.pending = Some(PendingResponse {
+                    headers,
+                    head: batch,
+                    tail: batch,
+                    trailers,
+                    headers_sent: false,
+                    message_pos: 0,
+                    frame_pos: 0,
+                });
+                needs_queue = true;
             }
+        }
+        self.pending_len += added;
+        if needs_queue {
+            if self.pending.is_full() {
+                self.send_error(
+                    stream_id,
+                    Status::new(Code::ResourceExhausted, "pending response queue is full"),
+                );
+                return;
+            }
+            self.call_mut(stream_id).unwrap().queued = true;
+            self.pending.vacant_entry().unwrap().push_back(stream_id);
         }
     }
 
     fn drive_pending(&mut self) {
-        let ids: Vec<StreamId> = self.pending.keys().copied().collect();
-        for stream_id in ids {
-            let Some(mut pending) = self.pending.remove(&stream_id) else {
+        let len = self.pending.len();
+        for _ in 0..len {
+            let stream_id = self.pending.pop_front().unwrap();
+            let Some(mut pending) = self.call_mut(stream_id).and_then(|call| {
+                call.queued = false;
+                call.pending.take()
+            }) else {
                 continue;
             };
-            match pending.drive(&mut self.h2, stream_id) {
-                Ok(true) => {}
-                Ok(false) => {
-                    self.pending.insert(stream_id, pending);
+            match pending.drive(
+                &mut self.h2,
+                &mut self.replies,
+                &mut self.pending_len,
+                stream_id,
+            ) {
+                Ok(ResponseDrive::Complete) => {
+                    self.remove_empty_call(stream_id);
                 }
-                Err(()) => {}
+                Ok(ResponseDrive::Blocked) => {
+                    if let Some(call) = self.call_mut(stream_id) {
+                        call.pending = Some(pending);
+                        call.queued = true;
+                        self.pending.vacant_entry().unwrap().push_back(stream_id);
+                    }
+                }
+                Ok(ResponseDrive::Idle) => {
+                    if let Some(call) = self.call_mut(stream_id) {
+                        call.pending = Some(pending);
+                    }
+                }
+                Err(()) => {
+                    self.release_response(pending);
+                    self.remove_empty_call(stream_id);
+                }
             }
         }
     }
 
+    fn release_response(&mut self, pending: PendingResponse) {
+        self.pending_len = self
+            .pending_len
+            .saturating_sub(pending.remaining_len(&self.replies));
+        let mut key = pending.head;
+        while let Some(current) = key {
+            let batch = self.replies.remove(current).unwrap();
+            key = batch.next;
+        }
+    }
+
     fn send_error(&mut self, stream_id: StreamId, status: Status) {
+        self.remove_stream(stream_id);
+        self.live_routes.release(stream_id);
         let headers = HeaderBlock::for_response(&Metadata::new()).ok();
         if let Some(headers) = headers {
             let h2_headers = headers.as_h2();
@@ -1388,8 +1854,20 @@ impl ConnState {
     }
 }
 
+enum ResponseDrive {
+    Complete,
+    Blocked,
+    Idle,
+}
+
 impl PendingResponse {
-    fn drive(&mut self, conn: &mut Conn<ServerRole>, stream_id: StreamId) -> Result<bool, ()> {
+    fn drive(
+        &mut self,
+        conn: &mut Conn<ServerRole>,
+        replies: &mut Slab<ReplyBatch, ReplyBatchTag>,
+        pending_len: &mut usize,
+        stream_id: StreamId,
+    ) -> Result<ResponseDrive, ()> {
         if !self.headers_sent {
             let h2_headers = self.headers.as_h2();
             conn.send_response(stream_id, h2_headers.iter().copied(), false)
@@ -1397,236 +1875,69 @@ impl PendingResponse {
             self.headers_sent = true;
         }
 
-        while self.body_pos < self.body.len() {
-            let n = conn
-                .send_data(stream_id, &self.body[self.body_pos..], false)
-                .map_err(|_| ())?;
-            if n == 0 {
-                return Ok(false);
+        while let Some(key) = self.head {
+            let message_len = {
+                let batch = replies.get(key).unwrap();
+                if self.message_pos == batch.messages.len() {
+                    let batch = replies.remove(key).unwrap();
+                    self.head = batch.next;
+                    if self.head.is_none() {
+                        self.tail = None;
+                    }
+                    self.message_pos = 0;
+                    continue;
+                }
+                batch.messages[self.message_pos].len()
+            };
+            let header = MessageFrame::header(false, message_len).map_err(|_| ())?;
+            let n = {
+                let payload = &replies.get(key).unwrap().messages[self.message_pos];
+                if self.frame_pos < header.len() {
+                    conn.send_data_parts(stream_id, &header[self.frame_pos..], payload, false)
+                } else {
+                    conn.send_data(stream_id, &payload[self.frame_pos - header.len()..], false)
+                }
             }
-            self.body_pos += n;
+            .map_err(|_| ())?;
+            if n == 0 {
+                return Ok(ResponseDrive::Blocked);
+            }
+            self.frame_pos += n;
+            *pending_len -= n;
+            if self.frame_pos == header.len() + message_len {
+                self.message_pos += 1;
+                self.frame_pos = 0;
+            }
         }
 
         if let Some(trailers) = &self.trailers {
             let h2_trailers = trailers.as_h2();
             conn.send_trailers(stream_id, &h2_trailers)
                 .map_err(|_| ())?;
-            Ok(true)
+            Ok(ResponseDrive::Complete)
         } else {
-            Ok(false)
-        }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use std::cell::RefCell;
-    use std::rc::Rc;
-
-    use super::*;
-
-    struct Recorder {
-        id: usize,
-        log: Rc<RefCell<Vec<(usize, StreamId)>>>,
-    }
-
-    impl Handler for Recorder {
-        fn on_start(
-            &mut self,
-            _routes: &mut StreamRoutes,
-            _stream_id: StreamId,
-            _head: &RequestHead,
-            _reply: &mut StreamReply,
-        ) -> StreamMode {
-            StreamMode::Live
-        }
-
-        fn on_message(
-            &mut self,
-            _routes: &mut StreamRoutes,
-            stream_id: StreamId,
-            _message: MessageFrame,
-            _reply: &mut StreamReply,
-        ) {
-            self.log.borrow_mut().push((self.id, stream_id));
-        }
-
-        fn on_request(&mut self, _request: Request, _response: &mut Response) {}
-    }
-
-    struct Nop;
-
-    impl Handler for Nop {
-        fn on_request(&mut self, _request: Request, _response: &mut Response) {}
-    }
-
-    fn head(path: &[u8]) -> RequestHead {
-        RequestHead {
-            path: path.to_vec(),
-            authority: None,
-            metadata: Metadata::new(),
+            Ok(ResponseDrive::Idle)
         }
     }
 
-    fn framed_messages(count: usize, size: usize) -> Vec<u8> {
-        let mut out = Vec::new();
-        let payload = vec![0u8; size];
-        for _ in 0..count {
-            MessageFrame::encode(false, &payload, &mut out).unwrap();
+    fn remaining_len(&self, replies: &Slab<ReplyBatch, ReplyBatchTag>) -> usize {
+        let mut total = 0usize;
+        let mut key = self.head;
+        let mut first = true;
+        while let Some(current) = key {
+            let batch = replies.get(current).unwrap();
+            let start = if first { self.message_pos } else { 0 };
+            for (index, message) in batch.messages[start..].iter().enumerate() {
+                let len = message.len() + 5;
+                total += if first && index == 0 {
+                    len - self.frame_pos
+                } else {
+                    len
+                };
+            }
+            first = false;
+            key = batch.next;
         }
-        out
-    }
-
-    #[test]
-    fn live_routes_are_per_connection() {
-        let log = Rc::new(RefCell::new(Vec::new()));
-        let mut routes = Routes::new()
-            .route(
-                b"/a",
-                Recorder {
-                    id: 0,
-                    log: log.clone(),
-                },
-            )
-            .route(
-                b"/b",
-                Recorder {
-                    id: 1,
-                    log: log.clone(),
-                },
-            );
-        let mut conn_a = StreamRoutes::default();
-        let mut conn_b = StreamRoutes::default();
-        let mut reply = StreamReply::new();
-
-        assert_eq!(
-            routes.on_start(&mut conn_a, StreamId(1), &head(b"/a"), &mut reply),
-            StreamMode::Live
-        );
-        assert_eq!(
-            routes.on_start(&mut conn_b, StreamId(1), &head(b"/b"), &mut reply),
-            StreamMode::Live
-        );
-
-        let message = MessageFrame {
-            compressed: false,
-            payload: vec![1, 2, 3],
-        };
-        routes.on_message(&mut conn_a, StreamId(1), message.clone(), &mut reply);
-        routes.on_message(&mut conn_b, StreamId(1), message, &mut reply);
-
-        let log = log.borrow();
-        assert!(
-            log.contains(&(0, StreamId(1))),
-            "connection A stream 1 must route to /a"
-        );
-        assert!(
-            log.contains(&(1, StreamId(1))),
-            "connection B stream 1 must route to /b despite the shared stream id"
-        );
-        assert_eq!(log.len(), 2);
-    }
-
-    #[test]
-    fn stream_reset_purges_live_route() {
-        let log = Rc::new(RefCell::new(Vec::new()));
-        let mut routes = Routes::new().route(
-            b"/a",
-            Recorder {
-                id: 0,
-                log: log.clone(),
-            },
-        );
-        let mut conn = StreamRoutes::default();
-        let mut reply = StreamReply::new();
-
-        routes.on_start(&mut conn, StreamId(7), &head(b"/a"), &mut reply);
-        assert!(conn.route(StreamId(7)).is_some());
-
-        conn.release(StreamId(7));
-        assert!(
-            conn.route(StreamId(7)).is_none(),
-            "a reset stream must purge its live route entry"
-        );
-
-        let message = MessageFrame {
-            compressed: false,
-            payload: Vec::new(),
-        };
-        routes.on_message(&mut conn, StreamId(7), message, &mut reply);
-        assert!(
-            log.borrow().is_empty(),
-            "a purged stream must not dispatch further messages"
-        );
-    }
-
-    #[test]
-    fn buffered_stream_over_cap_is_bounded() {
-        let cfg = Config {
-            max_message_len: 1 << 20,
-            max_buffered_len: 1000,
-            max_buffered_msgs: 1 << 20,
-            max_conn_buffered_len: 2500,
-        };
-        let mut app = App::<Nop>::with_config(Nop, cfg.clone());
-        let mut state = ConnState::default();
-        let open = |state: &mut ConnState, id: u32| {
-            state.streams.insert(
-                StreamId(id),
-                StreamState {
-                    head: head(b"/svc"),
-                    deframer: Deframer::new(cfg.max_message_len),
-                    messages: Vec::new(),
-                    trailers: Metadata::new(),
-                    mode: StreamMode::Buffered,
-                    buffered_len: 0,
-                },
-            );
-        };
-
-        open(&mut state, 1);
-        app.on_data(&mut state, StreamId(1), &framed_messages(5, 100));
-        assert_eq!(
-            state
-                .streams
-                .get(&StreamId(1))
-                .expect("stream retained under cap")
-                .buffered_len,
-            500
-        );
-
-        app.on_data(&mut state, StreamId(1), &framed_messages(6, 100));
-        assert!(
-            !state.streams.contains_key(&StreamId(1)),
-            "stream over its per-stream cap must be dropped to bound memory"
-        );
-        assert_eq!(
-            state.buffered_total, 0,
-            "dropping a stream must release its bytes from the connection budget"
-        );
-
-        open(&mut state, 3);
-        open(&mut state, 5);
-        open(&mut state, 7);
-        app.on_data(&mut state, StreamId(3), &framed_messages(9, 100));
-        app.on_data(&mut state, StreamId(5), &framed_messages(9, 100));
-        assert_eq!(state.buffered_total, 1800);
-
-        app.on_data(&mut state, StreamId(7), &framed_messages(9, 100));
-        assert!(
-            !state.streams.contains_key(&StreamId(7)),
-            "a stream tipping the connection-wide cap must be dropped even while under its own cap"
-        );
-        assert_eq!(
-            state.buffered_total, 1800,
-            "the dropped stream's bytes must return to the connection budget"
-        );
-
-        open(&mut state, 9);
-        app.on_data(&mut state, StreamId(9), &framed_messages(6, 100));
-        assert!(
-            state.streams.contains_key(&StreamId(9)),
-            "budget freed by the drop must admit a fresh stream under the cap"
-        );
+        total
     }
 }

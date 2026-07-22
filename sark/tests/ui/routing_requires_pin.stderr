@@ -1,0 +1,22 @@
+error[E0308]: mismatched types
+  --> tests/ui/routing_requires_pin.rs:38:9
+   |
+21 | / sark_gen::define_route! {
+22 | |     App: () => {
+23 | |         GET "/" => handle,
+24 | |     }
+25 | | }
+   | |_- the found opaque type
+...
+37 |       Routing::try_consume(
+   |       -------------------- arguments to this function are incorrect
+38 |           &mut app,
+   |           ^^^^^^^^ expected `Pin<&mut _>`, found `&mut ...`
+   |
+   = note:         expected struct `Pin<&mut _>`
+           found mutable reference `&mut impl Application<'_, Conn = sark::dispatch::conn_state::ConnState, Wire = _> + sark::date::DateHost + TimerHost<'_> + sark::dispatch::H1Project<'_, _> + sark::dispatch::Decode + sark::dispatch::Routing + '_`
+note: method defined here
+  --> src/dispatch/routing.rs
+   |
+   |     fn try_consume(
+   |        ^^^^^^^^^^^

@@ -7,7 +7,6 @@ use crate::model::{HeaderAttrField, QueryAttrField};
 use crate::util::TypeExt;
 
 pub(super) struct Hidden<'a> {
-    pub(super) name: &'a Ident,
     pub(super) inner_name: &'a Ident,
     pub(super) raw_name: &'a Ident,
     pub(super) headers: &'a [HeaderAttrField],
@@ -19,6 +18,7 @@ impl<'a> Hidden<'a> {
     pub(super) fn header_query_exprs(
         headers: &[HeaderAttrField],
         queries: &[QueryAttrField],
+        borrowed: bool,
     ) -> Result<Vec<TokenStream>> {
         headers
             .iter()
@@ -27,8 +27,9 @@ impl<'a> Hidden<'a> {
                     &f.ty,
                     f.default.as_ref(),
                     &f.ident,
-                    quote!(req.local_at(range)),
+                    quote!(req.frame_at(range)),
                     "request header/query",
+                    borrowed,
                 )
             })
             .chain(queries.iter().map(|f| {
@@ -36,8 +37,9 @@ impl<'a> Hidden<'a> {
                     &f.ty,
                     f.default.as_ref(),
                     &f.ident,
-                    quote!(req.local_at(range)),
+                    quote!(req.frame_at(range)),
                     "request header/query",
+                    borrowed,
                 )
             }))
             .collect()
@@ -45,7 +47,6 @@ impl<'a> Hidden<'a> {
 
     pub(super) fn build(self) -> Result<TokenStream> {
         let Self {
-            name,
             inner_name,
             raw_name,
             headers,
@@ -66,7 +67,7 @@ impl<'a> Hidden<'a> {
             .iter()
             .map(|ty| {
                 let mut ty = (*ty).clone();
-                ty.rewrite_local_to_ref();
+                ty.rewrite_retained_to_borrowed();
                 ty
             })
             .collect();
@@ -79,27 +80,22 @@ impl<'a> Hidden<'a> {
         } else {
             quote! {}
         };
-        let typed_field_expr = Self::header_query_exprs(headers, queries)?;
+        let typed_field_expr = Self::header_query_exprs(headers, queries, true)?;
         Ok(quote! {
-            #[allow(non_camel_case_types)]
+            #[allow(non_camel_case_types, dead_code)]
             struct #inner_name<'req> {
                 #( #all_ident: #all_ty_ref, )*
                 #[doc(hidden)]
                 __sark_m: ::core::marker::PhantomData<&'req ()>,
             }
 
-            #[allow(non_camel_case_types, dead_code)]
-            type #name = #inner_name<'static>;
-
             #[derive(Default)]
             struct #raw_name { #( #all_ident: #raw_ty, )* #query_state }
 
-            impl<'req> sark::service::HeaderParams for #inner_name<'req> {}
-
             impl<'req> #inner_name<'req> {
                 #[allow(dead_code, unused_variables)]
-                fn from_raw_ref(
-                    req: &sark::request::Ref<'req, ()>,
+                fn from_raw(
+                    req: &sark::request::Ref<'req>,
                     headers: #raw_name,
                 ) -> sark::error::Result<Self> {
                     let #raw_name { #( #all_ident, )* .. } = headers;

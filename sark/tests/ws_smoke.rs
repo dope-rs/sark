@@ -1,21 +1,21 @@
 use std::cell::RefCell;
-use std::future::poll_fn;
 use std::marker::PhantomData;
 use std::pin::pin;
 use std::rc::Rc;
 use std::task::Poll;
 use std::time::Duration;
 
-use dope::fiber::Fiber;
+use dope::driver;
+use dope::driver::token::Token;
 use dope::manifold::connector::Connector;
 use dope::manifold::connector::source::Static;
 use dope::manifold::env::Bundle;
-use dope::runtime::profile::Production;
-use dope::runtime::token::Token;
-use dope::transport::Tcp;
-use dope::wire::Identity;
-use dope::{DriverCfg, DriverConfig, Executor};
-use dope_extra::testing::{ephemeral_addr, run_with_trigger};
+use dope::runtime::Executor;
+use dope::runtime::profile::Balanced;
+use dope_extra::harness::Harness;
+use dope_fiber::{SessionExt as _, poll_fn};
+use dope_net::tcp::Tcp;
+use dope_net::wire::identity::Identity;
 use sark_ws::client::{self, Client};
 use sark_ws::server;
 
@@ -31,11 +31,11 @@ struct CaptureHandler {
 }
 
 impl client::Handler for CaptureHandler {
-    fn on_open(&mut self, conn_id: Token) {
+    fn open(&mut self, conn_id: Token) {
         self.state.borrow_mut().conn_id = Some(conn_id);
     }
 
-    fn on_message(&mut self, _conn_id: Token, msg: client::Message) {
+    fn message(&mut self, _conn_id: Token, msg: client::Message) {
         if let client::Message::Text(bytes) = msg
             && let Ok(s) = std::str::from_utf8(bytes.as_slice())
         {
@@ -43,18 +43,23 @@ impl client::Handler for CaptureHandler {
         }
     }
 
-    fn on_close(&mut self, _conn_id: Token) {}
+    fn close<'d>(&mut self, _conn_id: Token) {}
 }
 
-type ClientWs =
-    Connector<0, client::Session<CaptureHandler>, Static<Tcp>, Bundle<Tcp, Identity, Production>>;
+type ClientWs<'d> = Connector<
+    'd,
+    0,
+    client::Session<'d, CaptureHandler>,
+    Static<Tcp>,
+    Bundle<Tcp, Identity, Balanced>,
+>;
 
 #[pin_project::pin_project]
 #[derive(dope_gen::Dispatcher)]
 struct ConnRt<'d> {
     #[pin]
     #[manifold]
-    conn: ClientWs,
+    conn: ClientWs<'d>,
     _ph: PhantomData<&'d ()>,
 }
 
@@ -68,61 +73,84 @@ fn ws_pong(msg: server::Message<'_>, response: &mut server::Response<'_>) {
 
 #[test]
 fn ws_codec_smoke() {
-    let addr = ephemeral_addr();
-    let cfg = server::Cfg {
+    let harness = Harness::bind().expect("harness");
+    let addr = harness.addr();
+    let cfg = server::Config {
         bind: addr,
-        max_conn: 1024,
+        max_connections: 1024,
         backlog: 4096,
         path: "/ws",
         max_frame_payload: 16 * 1024 * 1024,
     };
 
-    run_with_trigger(
-        addr,
-        |ctx, trigger| {
-            type Handler = for<'a, 'b, 'c> fn(server::Message<'a>, &'b mut server::Response<'c>);
-            sark_ws::server::serve(ws_pong as Handler, cfg.clone(), ctx, Some(trigger))
-        },
-        |addr| {
-            let mut exec =
-                Executor::new(DriverCfg::for_tcp_profile::<Production>(8)).expect("driver");
-            let driver = exec.driver_mut();
-            let state = Rc::new(RefCell::new(Captured::default()));
-            let handler = CaptureHandler {
-                state: state.clone(),
-            };
-            let upstreams = Static::<Tcp>::new(vec![addr], Duration::from_millis(200));
-            let mut rt = pin!(ConnRt {
-                conn: Connector::new(
-                    client::Session::new(handler, "127.0.0.1", "/ws"),
-                    upstreams,
-                    1,
-                    driver,
-                ),
-                _ph: PhantomData,
-            });
-            let client = rt.as_mut().conn_handle();
+    harness
+        .run_with_trigger(
+            |ctx, trigger| {
+                type Handler =
+                    for<'a, 'b, 'c> fn(server::Message<'a>, &'b mut server::Response<'c>);
+                sark_ws::server::serve(ws_pong as Handler, cfg.clone(), ctx, Some(trigger))
+            },
+            |addr| {
+                let exec = Executor::new(driver::Config::for_tcp_profile::<Balanced>(8))
+                    .expect("driver")
+                    .with_storage_factory(client::Port::factory(
+                        client::Config::new("127.0.0.1", "/ws"),
+                        1,
+                        16,
+                    ));
+                exec.enter(|mut sess| {
+                    let backoff = sess.seed().derive(dope::hash::domain::BACKOFF).state();
+                    let port = sess.storage() as *const client::Port<'_>;
+                    let mut driver = sess.driver_access();
+                    // The port is executor-owned and the connector cannot
+                    // escape this session closure.
+                    let port = unsafe { &*port };
+                    let state = Rc::new(RefCell::new(Captured::default()));
+                    let handler = CaptureHandler {
+                        state: state.clone(),
+                    };
+                    let upstreams =
+                        Static::<Tcp>::new(vec![addr], Duration::from_millis(200), backoff);
+                    let conn = {
+                        Connector::new(
+                            client::Session::new(handler, port),
+                            upstreams,
+                            port.capacity(),
+                            &mut driver,
+                        )
+                        .expect("connector")
+                    };
+                    let rt = pin!(o3::cell::BrandCell::new(ConnRt {
+                        conn,
+                        _ph: PhantomData,
+                    }));
+                    let client = client::WsHandle::from_cell(ConnRt::conn_ref(
+                        rt.as_ref().borrow_pin(sess.token()),
+                    ));
 
-            let state_fut = state.clone();
-            let reply = dope_extra::block_on(
-                &mut exec,
-                rt.as_mut(),
-                Fiber::new(async move {
-                    client.wait_active().await.expect("ws active");
-                    client.send_text(b"ping").await.expect("send text");
+                    let state_fut = state.clone();
+                    sess.block_on(rt.as_ref(), client.wait_active())
+                        .expect("runtime")
+                        .expect("ws active");
+                    sess.block_on(rt.as_ref(), client.send_text(b"ping"))
+                        .expect("runtime")
+                        .expect("send text");
+                    let reply = sess
+                        .block_on(
+                            rt.as_ref(),
+                            poll_fn(|cx| {
+                                if let Some(r) = state_fut.borrow().reply.clone() {
+                                    return Poll::Ready(r);
+                                }
+                                cx.wake();
+                                Poll::Pending
+                            }),
+                        )
+                        .expect("runtime");
 
-                    poll_fn(|cx| {
-                        if let Some(r) = state_fut.borrow().reply.clone() {
-                            return Poll::Ready(r);
-                        }
-                        cx.waker().wake_by_ref();
-                        Poll::Pending
-                    })
-                    .await
-                }),
-            );
-
-            assert_eq!(reply, "pong");
-        },
-    );
+                    assert_eq!(reply, "pong");
+                })
+            },
+        )
+        .expect("harness");
 }

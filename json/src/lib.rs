@@ -6,14 +6,16 @@ mod depth;
 mod encode;
 mod error;
 mod parse;
+mod response;
 mod scan;
 mod traits;
 
 pub use body::InlineToken;
-pub use depth::{DepthGuard, MAX_DEPTH};
-pub use encode::{Encode, Writer};
-pub use o3::pool::Scratch;
+pub use depth::MAX_DEPTH;
+pub use encode::{Encode, Write, Writer};
+pub use o3::mem::ScratchVec;
 pub use parse::Parse;
+pub use response::JsonBody;
 pub use scan::Scan;
 pub use traits::{JsonDecode, JsonEncode, JsonPreserve, JsonScan};
 
@@ -42,7 +44,7 @@ impl Json {
         let body = if let Some(raw) = value.raw_json() {
             raw.clone()
         } else {
-            value.encode_json().freeze()
+            o3::buffer::Shared::from(value.encode_json())
         };
         let mut response = Response::new(status);
         response.content_type("application/json");

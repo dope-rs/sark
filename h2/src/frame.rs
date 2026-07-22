@@ -1,5 +1,31 @@
 use crate::stream::StreamId;
 
+pub trait FrameBuf {
+    fn push(&mut self, byte: u8);
+    fn extend_from_slice(&mut self, bytes: &[u8]);
+}
+
+impl FrameBuf for Vec<u8> {
+    fn push(&mut self, byte: u8) {
+        Vec::push(self, byte);
+    }
+
+    fn extend_from_slice(&mut self, bytes: &[u8]) {
+        Vec::extend_from_slice(self, bytes);
+    }
+}
+
+impl FrameBuf for o3::buffer::ByteRing {
+    fn push(&mut self, byte: u8) {
+        self.try_push(byte).expect("prepared frame capacity");
+    }
+
+    fn extend_from_slice(&mut self, bytes: &[u8]) {
+        self.try_extend_from_slice(bytes)
+            .expect("prepared frame capacity");
+    }
+}
+
 #[repr(u8)]
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum Type {
@@ -167,7 +193,7 @@ impl FrameHeader {
         })
     }
 
-    pub fn encode(&self, out: &mut Vec<u8>) {
+    pub fn encode(&self, out: &mut impl FrameBuf) {
         let len = self.length & 0x00ff_ffff;
         out.push((len >> 16) as u8);
         out.push((len >> 8) as u8);
@@ -217,7 +243,7 @@ impl PriorityFields {
         })
     }
 
-    pub fn encode(&self, out: &mut Vec<u8>) {
+    pub fn encode(&self, out: &mut impl FrameBuf) {
         let mut raw = self.dependency.masked();
         if self.exclusive {
             raw |= 0x8000_0000;
@@ -245,20 +271,37 @@ impl<'a> Data<'a> {
         })
     }
 
-    pub fn encode(&self, out: &mut Vec<u8>) {
-        let flags = if self.end_stream {
-            Flags::END_STREAM
-        } else {
-            0
-        };
+    pub fn encode(&self, out: &mut impl FrameBuf) {
+        Self::encode_parts(
+            self.stream_id,
+            self.end_stream,
+            self.payload,
+            &[],
+            self.payload.len(),
+            out,
+        );
+    }
+
+    pub(crate) fn encode_parts(
+        stream_id: StreamId,
+        end_stream: bool,
+        first: &[u8],
+        second: &[u8],
+        len: usize,
+        out: &mut impl FrameBuf,
+    ) {
+        debug_assert!(len <= first.len().saturating_add(second.len()));
+        let flags = if end_stream { Flags::END_STREAM } else { 0 };
         FrameHeader {
-            length: self.payload.len() as u32,
+            length: len as u32,
             kind: Type::Data,
             flags: Flags(flags),
-            stream_id: self.stream_id,
+            stream_id,
         }
         .encode(out);
-        out.extend_from_slice(self.payload);
+        let first_len = len.min(first.len());
+        out.extend_from_slice(&first[..first_len]);
+        out.extend_from_slice(&second[..len - first_len]);
     }
 }
 
@@ -293,7 +336,7 @@ impl<'a> Headers<'a> {
         })
     }
 
-    pub fn encode(&self, out: &mut Vec<u8>) {
+    pub fn encode(&self, out: &mut impl FrameBuf) {
         let mut flags: u8 = 0;
         if self.end_stream {
             flags |= Flags::END_STREAM;
@@ -339,7 +382,7 @@ impl Priority {
         })
     }
 
-    pub fn encode(&self, out: &mut Vec<u8>) {
+    pub fn encode(&self, out: &mut impl FrameBuf) {
         FrameHeader {
             length: 5,
             kind: Type::Priority,
@@ -370,7 +413,7 @@ impl RstStream {
         })
     }
 
-    pub fn encode(&self, out: &mut Vec<u8>) {
+    pub fn encode(&self, out: &mut impl FrameBuf) {
         FrameHeader {
             length: 4,
             kind: Type::RstStream,
@@ -404,7 +447,7 @@ impl<'a> Settings<'a> {
         })
     }
 
-    pub fn encode(&self, out: &mut Vec<u8>) {
+    pub fn encode(&self, out: &mut impl FrameBuf) {
         let flags = if self.ack { Flags::ACK } else { 0 };
         FrameHeader {
             length: self.params.len() as u32,
@@ -468,7 +511,7 @@ impl<'a> PushPromise<'a> {
         })
     }
 
-    pub fn encode(&self, out: &mut Vec<u8>) {
+    pub fn encode(&self, out: &mut impl FrameBuf) {
         let flags = if self.end_headers {
             Flags::END_HEADERS
         } else {
@@ -507,7 +550,7 @@ impl Ping {
         })
     }
 
-    pub fn encode(&self, out: &mut Vec<u8>) {
+    pub fn encode(&self, out: &mut impl FrameBuf) {
         let flags = if self.ack { Flags::ACK } else { 0 };
         FrameHeader {
             length: 8,
@@ -544,7 +587,7 @@ impl<'a> GoAway<'a> {
         })
     }
 
-    pub fn encode(&self, out: &mut Vec<u8>) {
+    pub fn encode(&self, out: &mut impl FrameBuf) {
         let length = (8 + self.debug.len()) as u32;
         FrameHeader {
             length,
@@ -582,7 +625,7 @@ impl WindowUpdate {
         })
     }
 
-    pub fn encode(&self, out: &mut Vec<u8>) {
+    pub fn encode(&self, out: &mut impl FrameBuf) {
         FrameHeader {
             length: 4,
             kind: Type::WindowUpdate,
@@ -612,7 +655,7 @@ impl<'a> Continuation<'a> {
         })
     }
 
-    pub fn encode(&self, out: &mut Vec<u8>) {
+    pub fn encode(&self, out: &mut impl FrameBuf) {
         let flags = if self.end_headers {
             Flags::END_HEADERS
         } else {
@@ -673,7 +716,7 @@ impl<'a> Frame<'a> {
         })
     }
 
-    pub fn encode(&self, out: &mut Vec<u8>) {
+    pub fn encode(&self, out: &mut impl FrameBuf) {
         match self {
             Self::Data(f) => f.encode(out),
             Self::Headers(f) => f.encode(out),

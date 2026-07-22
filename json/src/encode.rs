@@ -1,49 +1,7 @@
-use o3::buffer::Owned;
+pub trait Write {
+    fn put(&mut self, src: &[u8]);
 
-pub struct Writer<'a> {
-    buf: &'a mut Owned,
-    ptr: *mut u8,
-    cap: usize,
-    len: usize,
-}
-
-impl<'a> Writer<'a> {
-    pub fn new(buf: &'a mut Owned, estimate: usize) -> Self {
-        let len = buf.len();
-        buf.reserve(estimate);
-        let cap = buf.capacity();
-        let spare = buf.spare_capacity_mut();
-        let ptr = spare.as_mut_ptr().cast::<u8>();
-        // SAFETY: spare_capacity_mut starts at base + len, so base = spare - len is in-bounds.
-        let ptr = unsafe { ptr.sub(len) };
-        Self { buf, ptr, cap, len }
-    }
-
-    #[cold]
-    fn grow(&mut self, additional: usize) {
-        // SAFETY: self.len bytes were written into buf's spare region.
-        unsafe { self.buf.set_len(self.len) };
-        self.buf.reserve(additional);
-        self.cap = self.buf.capacity();
-        let len = self.len;
-        let spare = self.buf.spare_capacity_mut();
-        // SAFETY: spare starts at base + len, so base = spare - len is in-bounds.
-        self.ptr = unsafe { spare.as_mut_ptr().cast::<u8>().sub(len) };
-    }
-
-    pub fn put(&mut self, src: &[u8]) {
-        let need = self.len + src.len();
-        if need > self.cap {
-            self.grow(src.len());
-        }
-        // SAFETY: need <= cap holds after grow, so ptr + len .. + src.len() stays in-bounds.
-        unsafe {
-            std::ptr::copy_nonoverlapping(src.as_ptr(), self.ptr.add(self.len), src.len());
-        }
-        self.len = need;
-    }
-
-    pub fn put_str(&mut self, value: &[u8]) {
+    fn put_str(&mut self, value: &[u8]) {
         self.put(b"\"");
         let mut start = 0usize;
         let mut idx = 0usize;
@@ -65,13 +23,13 @@ impl<'a> Writer<'a> {
         self.put(b"\"");
     }
 
-    pub fn put_str_plain(&mut self, value: &[u8]) {
+    fn put_str_plain(&mut self, value: &[u8]) {
         self.put(b"\"");
         self.put(value);
         self.put(b"\"");
     }
 
-    pub fn put_u64(&mut self, value: u64) {
+    fn put_u64(&mut self, value: u64) {
         if value == 0 {
             self.put(b"0");
             return;
@@ -87,9 +45,77 @@ impl<'a> Writer<'a> {
         self.put(&digits[idx..]);
     }
 
-    pub fn finish(self) {
-        // SAFETY: self.len bytes were written into buf's spare region.
-        unsafe { self.buf.set_len(self.len) };
+    fn put_i64(&mut self, value: i64) {
+        if value < 0 {
+            self.put(b"-");
+        }
+        self.put_u64(value.unsigned_abs());
+    }
+
+    fn put_f64(&mut self, value: f64) {
+        if value.is_finite() {
+            self.put(ryu::Buffer::new().format_finite(value).as_bytes());
+        } else {
+            self.put(b"null");
+        }
+    }
+}
+
+pub struct Writer<'a> {
+    inner: &'a mut Vec<u8>,
+    start: usize,
+}
+
+impl<'a> Writer<'a> {
+    pub fn new(buf: &'a mut Vec<u8>, estimate: usize) -> Self {
+        let start = buf.len();
+        buf.reserve(estimate);
+        Self { inner: buf, start }
+    }
+
+    pub fn finish(self) -> usize {
+        self.inner.len() - self.start
+    }
+}
+
+impl Write for Writer<'_> {
+    fn put(&mut self, src: &[u8]) {
+        self.inner.extend_from_slice(src);
+    }
+}
+
+impl Write for o3::buffer::Owned {
+    fn put(&mut self, src: &[u8]) {
+        self.extend_from_slice(src);
+    }
+}
+
+pub(crate) struct SliceWriter<'a> {
+    out: &'a mut [u8],
+    len: usize,
+}
+
+impl<'a> SliceWriter<'a> {
+    pub(crate) fn new(out: &'a mut [u8]) -> Self {
+        Self { out, len: 0 }
+    }
+
+    pub(crate) fn finish(self) -> usize {
+        self.len
+    }
+}
+
+impl Write for SliceWriter<'_> {
+    fn put(&mut self, src: &[u8]) {
+        let end = self
+            .len
+            .checked_add(src.len())
+            .expect("JSON output length overflow");
+        self.out
+            .get_mut(self.len..end)
+            .expect("JsonEncode wrote beyond json_len")
+            .copy_from_slice(src);
+        self.len = end;
     }
 }
 
@@ -106,6 +132,18 @@ impl Encode {
             value /= 10;
         }
         digits
+    }
+
+    pub fn i64_len(value: i64) -> usize {
+        Self::u64_len(value.unsigned_abs()) + usize::from(value < 0)
+    }
+
+    pub fn f64_len(value: f64) -> usize {
+        if value.is_finite() {
+            ryu::Buffer::new().format_finite(value).len()
+        } else {
+            4
+        }
     }
 
     pub fn str_len(value: &[u8]) -> usize {

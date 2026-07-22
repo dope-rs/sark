@@ -6,10 +6,7 @@ mod spec;
 pub use plan::{
     FieldValue, FullHeadPlan, HeadParts, HeadPlan, HeaderValue, PathProbe, SlicePath, SliceValue,
 };
-pub use request_impl::RouteRequestImpl;
-pub use spec::{
-    EmptyParamsInner, EmptyParamsRaw, HeaderParams, NoHeaders, NoParams, PathCapture, RouteParams,
-    RouteParamsRef, RouteSpec,
-};
+pub use request_impl::{BodyPolicy, RouteRequestImpl};
+pub use spec::{PathCapture, RawRouteParams, RouteParams, RouteSpec};
 
 pub use crate::routes::method::Key;

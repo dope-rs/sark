@@ -3,28 +3,26 @@ use o3::buffer::Shared;
 use sark_core::http::codec::HeaderScan;
 use sark_core::http::compress::Gzip;
 use sark_core::http::head::Flags;
-use sark_core::http::{FixedResponseInner, Headers, Shape, head};
+use sark_core::http::{FixedResponseInner, HeadersInner, head};
 
 #[test]
-fn fixed_response_apply_gzip_writes_content_encoding_and_vary() {
+fn fixed_response_gzip_head_writes_content_encoding_and_vary() {
     let payload = b"{\"hello\":\"world\",\"hello\":\"world\",\"hello\":\"world\"}".to_vec();
-    let body = Shared::from(payload.clone());
-    let mut fixed: FixedResponseInner<'static> = FixedResponseInner::direct(
+    let body = Shared::copy_from_slice(&payload);
+    let fixed: FixedResponseInner<'static, 0> = FixedResponseInner::direct(
         StatusCode::OK,
         b"content-type: application/json\r\n",
-        Headers::from_items([]),
+        HeadersInner::from_items([]),
         body,
     );
 
-    let compressed = Gzip::with_thread_local(|g| Shared::from(g.encode(&payload).to_vec()));
+    let compressed = Shared::copy_from_slice(Gzip::new().encode(&payload).unwrap().as_ref());
     let plain_clen = payload.len();
-    fixed.apply_gzip(compressed.clone());
-
     let mut out = vec![0u8; 1024];
     let date = b"Mon, 01 Jan 2026 00:00:00 GMT";
-    let n =
-        <FixedResponseInner<'static> as Shape<'static>>::write_into_slice(&fixed, &mut out, date)
-            .expect("fits");
+    let n = fixed
+        .write_gzip_head(&mut out, date, compressed.len())
+        .expect("fits");
     let bytes = &out[..n];
     let body_off = bytes.windows(4).position(|w| w == b"\r\n\r\n").unwrap() + 4;
     let head_text = std::str::from_utf8(&bytes[..body_off]).unwrap();
@@ -32,7 +30,7 @@ fn fixed_response_apply_gzip_writes_content_encoding_and_vary() {
     assert!(head_text.contains("Vary: Accept-Encoding\r\n"));
     assert!(head_text.contains(&format!("Content-Length: {}\r\n", compressed.len())));
     assert!(!head_text.contains(&format!("Content-Length: {}\r\n", plain_clen)));
-    assert_eq!(&bytes[body_off..], compressed.as_ref());
+    assert!(bytes[body_off..].is_empty());
 }
 
 #[test]
@@ -121,12 +119,12 @@ fn gzip_encoder_round_trip_through_libdeflater_decode() {
     use libdeflater::Decompressor;
 
     let original = b"hello hello hello hello hello hello hello hello hello hello".repeat(8);
-    let compressed = Gzip::with_thread_local(|g| g.encode(&original).to_vec());
+    let compressed = Gzip::new().encode(&original).unwrap();
 
     let mut dec = Decompressor::new();
     let mut out = vec![0u8; original.len() * 2];
     let n = dec
-        .gzip_decompress(&compressed, &mut out)
+        .gzip_decompress(compressed.as_ref(), &mut out)
         .expect("decompress");
     assert_eq!(&out[..n], original.as_slice());
 }

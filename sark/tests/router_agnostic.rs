@@ -1,4 +1,5 @@
 use http::{Method, StatusCode};
+use o3::buffer::{Bytes, Retained};
 use sark::dispatch::{Decode, Pipeline};
 use sark::service::{RouteRequestImpl, RouteSpec, SliceValue};
 use sark_core::http::Shape;
@@ -23,12 +24,12 @@ fn plain_h(_req: PlainReq, _state: &sark::EmptyState) -> Reply {
 #[sark_gen::request]
 struct NamedReq {
     #[header("x-name", default = "none")]
-    x_name: LocalFrameBytes,
+    x_name: Bytes<Retained>,
 }
 
 #[sark_gen::handler]
 fn named_h(req: NamedReq, _state: &sark::EmptyState) -> Reply {
-    let status = if req.x_name.as_bytes() == b"alice" {
+    let status = if req.x_name.as_slice() == b"alice" {
         StatusCode::IM_A_TEAPOT
     } else {
         StatusCode::OK
@@ -65,7 +66,13 @@ impl sark::dispatch::ResponseEncoder for Capture {
 
 #[test]
 fn agnostic_dispatch_routes_feeds_invokes_encodes() {
-    let app = agn_app::new::<dope::wire::Identity>(sark::EmptyState::REF);
+    let app = AgnApp::new::<dope_net::wire::identity::Identity>(
+        sark::EmptyState,
+        sark::app::Config {
+            timer_capacity: 1,
+            task_capacity: 1,
+        },
+    );
 
     let mut cap = Capture::default();
     let out = app.dispatch_decoded(Method::GET, b"/json", &[], &[], &[], &mut cap);
@@ -111,15 +118,16 @@ fn agnostic_core_runs_without_h1_buffer() {
         &route,
         raw_params,
         raw_headers,
-        Method::GET,
         0..0,
         &[],
         &[],
+        0,
         sark::EmptyState::REF,
     )
     .expect("build_and_invoke");
     assert_eq!(resp.status(), StatusCode::OK);
-    assert_eq!(resp.body_bytes(), b"ok");
+    let (_, _, body) = Shape::preserialize_static(&resp).expect("static body");
+    assert_eq!(body, b"ok");
     let bytes = write_response::<plain_h>(&resp);
     assert!(bytes.starts_with(b"HTTP/1.1 200"));
     assert!(bytes.ends_with(b"ok"));
@@ -146,10 +154,10 @@ fn synthesized_header_pair_flows_through_route() {
         &route,
         raw_params,
         raw_headers,
-        Method::GET,
         0..0,
         head,
         &[],
+        0,
         sark::EmptyState::REF,
     )
     .expect("build_and_invoke");

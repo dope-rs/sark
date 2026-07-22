@@ -1,7 +1,7 @@
 use std::ops::Range;
 
+use o3::buffer::{Bytes, Retained};
 use sark_core::error::Result;
-use sark_core::http::LocalFrameBytes;
 use sark_core::utils::bytes::Ascii;
 
 use crate::routes::path::seg_next;
@@ -19,41 +19,41 @@ pub trait HeaderValue {
 
     fn as_range(&self) -> Range<usize>;
 
-    fn copy_local(&self) -> LocalFrameBytes;
+    fn copy_frame(&self) -> Bytes<Retained>;
 
     fn parse_usize(&self) -> Result<usize>;
 
     fn parse_u64(&self) -> Result<u64>;
 }
 
-impl HeaderValue for LocalFrameBytes {
+impl HeaderValue for Bytes<Retained> {
     fn len(&self) -> usize {
         self.len()
     }
 
     fn eq_bytes(&self, expected: &[u8]) -> bool {
-        self.as_bytes() == expected
+        self.as_slice() == expected
     }
 
     fn eq_ignore_ascii_case(&self, expected: &[u8]) -> bool {
-        self.as_bytes().eq_ignore_ascii_case(expected)
+        self.as_slice().eq_ignore_ascii_case(expected)
     }
 
     fn as_range(&self) -> Range<usize> {
         0..self.len()
     }
 
-    fn copy_local(&self) -> LocalFrameBytes {
+    fn copy_frame(&self) -> Bytes<Retained> {
         self.clone()
     }
 
     fn parse_usize(&self) -> Result<usize> {
-        Ascii::parse_usize(self.as_bytes())
+        Ascii::parse_usize(self.as_slice())
             .ok_or_else(sark_core::error::Error::invalid_integer_header)
     }
 
     fn parse_u64(&self) -> Result<u64> {
-        Ascii::parse_u64(self.as_bytes())
+        Ascii::parse_u64(self.as_slice())
             .ok_or_else(sark_core::error::Error::invalid_integer_header)
     }
 }
@@ -95,8 +95,8 @@ impl HeaderValue for SliceValue<'_> {
         self.start..self.end
     }
 
-    fn copy_local(&self) -> LocalFrameBytes {
-        LocalFrameBytes::from_shared(o3::buffer::Shared::copy_from_slice(self.bytes()))
+    fn copy_frame(&self) -> Bytes<Retained> {
+        Bytes::<Retained>::copy_from_slice(self.bytes())
     }
 
     fn parse_usize(&self) -> Result<usize> {
@@ -132,19 +132,17 @@ impl FieldValue for Range<usize> {
     }
 }
 
-impl FieldValue for LocalFrameBytes {
+impl FieldValue for Bytes<Retained> {
     fn parse_value<V: HeaderValue>(value: &V) -> Result<Self> {
-        Ok(value.copy_local())
+        Ok(value.copy_frame())
     }
 
     fn parse_value_bytes(value: &[u8], _abs_start: usize) -> Result<Self> {
-        Ok(LocalFrameBytes::from_shared(
-            o3::buffer::Shared::copy_from_slice(value),
-        ))
+        Ok(Bytes::<Retained>::copy_from_slice(value))
     }
 
     fn parse_path<P: PathProbe>(path: &P, start: usize, end: usize) -> Option<Self> {
-        path.copy_range_local(start, end)
+        path.copy_range_frame(start, end)
     }
 }
 
@@ -230,7 +228,7 @@ pub trait PathProbe {
 
     fn parse_range_u64(&self, start: usize, end: usize) -> Option<u64>;
 
-    fn copy_range_local(&self, start: usize, end: usize) -> Option<LocalFrameBytes>;
+    fn copy_range_frame(&self, start: usize, end: usize) -> Option<Bytes<Retained>>;
 
     fn next_seg(&self, idx: usize) -> Option<(usize, usize, usize)>;
 
@@ -299,13 +297,11 @@ impl PathProbe for SlicePath<'_> {
         Ascii::parse_u64(&self.raw[start..end])
     }
 
-    fn copy_range_local(&self, start: usize, end: usize) -> Option<LocalFrameBytes> {
+    fn copy_range_frame(&self, start: usize, end: usize) -> Option<Bytes<Retained>> {
         if end < start || end > self.raw.len() {
             return None;
         }
-        Some(LocalFrameBytes::from_shared(
-            o3::buffer::Shared::copy_from_slice(&self.raw[start..end]),
-        ))
+        Some(Bytes::<Retained>::copy_from_slice(&self.raw[start..end]))
     }
 
     fn next_seg(&self, idx: usize) -> Option<(usize, usize, usize)> {
@@ -322,40 +318,6 @@ impl PathProbe for SlicePath<'_> {
             return None;
         }
         Some(end)
-    }
-}
-
-impl PathProbe for crate::request::PathView<'_> {
-    fn len(&self) -> usize {
-        (*self).len()
-    }
-
-    fn eq_bytes(&self, expected: &[u8]) -> bool {
-        (*self).eq_bytes(expected)
-    }
-
-    fn eq_range(&self, start: usize, end: usize, expected: &[u8]) -> bool {
-        (*self).eq_range(start, end, expected)
-    }
-
-    fn eq_range_ignore_ascii_case(&self, start: usize, end: usize, expected: &[u8]) -> bool {
-        (*self).eq_range_ignore_ascii_case(start, end, expected)
-    }
-
-    fn parse_range_usize(&self, start: usize, end: usize) -> Option<usize> {
-        (*self).parse_usize_range(start, end)
-    }
-
-    fn parse_range_u64(&self, start: usize, end: usize) -> Option<u64> {
-        (*self).parse_u64_range(start, end)
-    }
-
-    fn copy_range_local(&self, start: usize, end: usize) -> Option<LocalFrameBytes> {
-        (*self).copy_range_local(start, end)
-    }
-
-    fn next_seg(&self, idx: usize) -> Option<(usize, usize, usize)> {
-        (*self).next_seg(idx)
     }
 }
 

@@ -2,7 +2,7 @@
 
 use super::{
     FixedResponseInner, HeadInner, HeaderItemInner, HeaderValueInner, HeadersInner, HotBodyInner,
-    HotHeadInner, HotTextInner, MonoResponseInner, ServeInner, TextItemInner,
+    HotHeadInner, HotTextInner, MonoResponseInner, ServeInner, StaticResponseInner, TextItemInner,
 };
 
 fn _text_item<'short, 'long: 'short>(x: TextItemInner<'long>) -> TextItemInner<'short> {
@@ -39,6 +39,11 @@ fn _fixed_response<'short, 'long: 'short>(
     x
 }
 fn _mono_response<'short, 'long: 'short>(x: MonoResponseInner<'long>) -> MonoResponseInner<'short> {
+    x
+}
+fn _static_response<'short, 'long: 'short>(
+    x: StaticResponseInner<'long>,
+) -> StaticResponseInner<'short> {
     x
 }
 fn _serve_response<'short, 'long: 'short>(x: ServeInner<'long>) -> ServeInner<'short> {

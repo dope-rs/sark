@@ -5,6 +5,13 @@ pub enum HeaderNameOutcome {
     None,
 }
 
+#[derive(Debug, PartialEq, Eq)]
+pub enum HeaderValueOutcome {
+    Found { pos: usize },
+    Invalid,
+    None,
+}
+
 fn is_header_name_byte(b: u8) -> bool {
     b.is_ascii_alphanumeric()
         || matches!(
@@ -41,14 +48,51 @@ fn scan_header_name_scalar(bytes: &[u8], start: usize) -> HeaderNameOutcome {
     HeaderNameOutcome::None
 }
 
+fn scan_header_value_scalar(bytes: &[u8], start: usize) -> HeaderValueOutcome {
+    let mut idx = start;
+    while idx < bytes.len() {
+        let byte = bytes[idx];
+        if byte == b'\r' {
+            if idx + 1 == bytes.len() {
+                return HeaderValueOutcome::None;
+            }
+            return if bytes[idx + 1] == b'\n' {
+                HeaderValueOutcome::Found { pos: idx }
+            } else {
+                HeaderValueOutcome::Invalid
+            };
+        }
+        if (byte < 0x20 && byte != b'\t') || byte == 0x7f {
+            return HeaderValueOutcome::Invalid;
+        }
+        idx += 1;
+    }
+    HeaderValueOutcome::None
+}
+
+fn request_target_is_valid_scalar(bytes: &[u8]) -> bool {
+    !bytes.iter().any(|&byte| byte <= 0x20 || byte == 0x7f)
+}
+
 cfg_select! {
     target_arch = "aarch64" => {
         pub fn scan_header_name(bytes: &[u8], start: usize) -> HeaderNameOutcome {
             if start >= bytes.len() {
                 return HeaderNameOutcome::None;
             }
-            // SAFETY: aarch64 baseline always includes the neon target feature.
             unsafe { scan_header_name_neon(bytes, start) }
+        }
+
+        pub fn scan_header_value(bytes: &[u8], start: usize) -> HeaderValueOutcome {
+            if start >= bytes.len() {
+                return HeaderValueOutcome::None;
+            }
+            unsafe { scan_header_value_neon(bytes, start) }
+        }
+
+        #[inline]
+        pub fn request_target_is_valid(bytes: &[u8]) -> bool {
+            unsafe { request_target_is_valid_neon(bytes) }
         }
 
         use core::arch::aarch64::{
@@ -136,7 +180,6 @@ cfg_select! {
             let colon_v = vdupq_n_u8(b':');
             let cr_v = vdupq_n_u8(b'\r');
             while idx + 16 <= len {
-                // SAFETY: idx + 16 <= len bounds the 16-byte load inside bytes.
                 let chunk = unsafe { vld1q_u8(bytes.as_ptr().add(idx)) };
                 let hit = vorrq_u8(vceqq_u8(chunk, colon_v), vceqq_u8(chunk, cr_v));
                 let valid_or_hit = vorrq_u8(valid_mask(chunk), hit);
@@ -164,19 +207,64 @@ cfg_select! {
             }
             scan_header_name_scalar(bytes, idx)
         }
+
+        #[target_feature(enable = "neon")]
+        fn scan_header_value_neon(bytes: &[u8], start: usize) -> HeaderValueOutcome {
+            let mut idx = start;
+            let len = bytes.len();
+            let ctl_max = vdupq_n_u8(0x1f);
+            let tab = vdupq_n_u8(b'\t');
+            let del = vdupq_n_u8(0x7f);
+            while idx + 16 <= len {
+                let chunk = unsafe { vld1q_u8(bytes.as_ptr().add(idx)) };
+                let low_ctl = vandq_u8(vcleq_u8(chunk, ctl_max), vmvnq_u8(vceqq_u8(chunk, tab)));
+                let special = vorrq_u8(low_ctl, vceqq_u8(chunk, del));
+                if let Some(offset) = first_match(special) {
+                    return scan_header_value_scalar(bytes, idx + offset);
+                }
+                idx += 16;
+            }
+            scan_header_value_scalar(bytes, idx)
+        }
+
+        #[target_feature(enable = "neon")]
+        fn request_target_is_valid_neon(bytes: &[u8]) -> bool {
+            let mut chunks = bytes.chunks_exact(16);
+            let space = vdupq_n_u8(0x20);
+            let del = vdupq_n_u8(0x7f);
+            for chunk in &mut chunks {
+                let vector = unsafe { vld1q_u8(chunk.as_ptr()) };
+                let invalid = vorrq_u8(vcleq_u8(vector, space), vceqq_u8(vector, del));
+                if first_match(invalid).is_some() {
+                    return false;
+                }
+            }
+            request_target_is_valid_scalar(chunks.remainder())
+        }
     }
     target_arch = "x86_64" => {
         pub fn scan_header_name(bytes: &[u8], start: usize) -> HeaderNameOutcome {
             if start >= bytes.len() {
                 return HeaderNameOutcome::None;
             }
-            // SAFETY: sse2 is guaranteed on the x86_64 baseline.
             unsafe { scan_header_name_sse2(bytes, start) }
         }
 
+        pub fn scan_header_value(bytes: &[u8], start: usize) -> HeaderValueOutcome {
+            if start >= bytes.len() {
+                return HeaderValueOutcome::None;
+            }
+            unsafe { scan_header_value_sse2(bytes, start) }
+        }
+
+        #[inline]
+        pub fn request_target_is_valid(bytes: &[u8]) -> bool {
+            unsafe { request_target_is_valid_sse2(bytes) }
+        }
+
         use core::arch::x86_64::{
-            __m128i, _mm_cmpeq_epi8, _mm_loadu_si128, _mm_max_epu8, _mm_min_epu8,
-            _mm_movemask_epi8, _mm_or_si128, _mm_set1_epi8,
+            __m128i, _mm_andnot_si128, _mm_cmpeq_epi8, _mm_loadu_si128,
+            _mm_max_epu8, _mm_min_epu8, _mm_movemask_epi8, _mm_or_si128, _mm_set1_epi8,
         };
 
         const LANE_MASK: u32 = 0xFFFF;
@@ -229,7 +317,6 @@ cfg_select! {
             let mut idx = start;
             let len = bytes.len();
             while idx + 16 <= len {
-                // SAFETY: idx + 16 <= len bounds the 16-byte load inside bytes.
                 let chunk = unsafe { _mm_loadu_si128(bytes.as_ptr().add(idx) as *const __m128i) };
                 let hit_v = _mm_or_si128(lane_eq(chunk, b':'), lane_eq(chunk, b'\r'));
                 let valid_or_hit = _mm_or_si128(valid_mask(chunk), hit_v);
@@ -251,6 +338,46 @@ cfg_select! {
             }
             scan_header_name_scalar(bytes, idx)
         }
+
+        #[target_feature(enable = "sse2")]
+        fn scan_header_value_sse2(bytes: &[u8], start: usize) -> HeaderValueOutcome {
+            let mut idx = start;
+            let len = bytes.len();
+            while idx + 16 <= len {
+                let chunk = unsafe { _mm_loadu_si128(bytes.as_ptr().add(idx) as *const __m128i) };
+                let low_ctl = _mm_andnot_si128(
+                    lane_eq(chunk, b'\t'),
+                    _mm_cmpeq_epi8(
+                        _mm_min_epu8(chunk, _mm_set1_epi8(0x1f)),
+                        chunk,
+                    ),
+                );
+                let special = _mm_or_si128(low_ctl, lane_eq(chunk, 0x7f));
+                let mask = _mm_movemask_epi8(special) as u32;
+                if mask != 0 {
+                    return scan_header_value_scalar(bytes, idx + mask.trailing_zeros() as usize);
+                }
+                idx += 16;
+            }
+            scan_header_value_scalar(bytes, idx)
+        }
+
+        #[target_feature(enable = "sse2")]
+        fn request_target_is_valid_sse2(bytes: &[u8]) -> bool {
+            let mut chunks = bytes.chunks_exact(16);
+            for chunk in &mut chunks {
+                let vector = unsafe { _mm_loadu_si128(chunk.as_ptr() as *const __m128i) };
+                let low = _mm_cmpeq_epi8(
+                    _mm_min_epu8(vector, _mm_set1_epi8(0x20)),
+                    vector,
+                );
+                let invalid = _mm_or_si128(low, lane_eq(vector, 0x7f));
+                if _mm_movemask_epi8(invalid) != 0 {
+                    return false;
+                }
+            }
+            request_target_is_valid_scalar(chunks.remainder())
+        }
     }
     _ => {
         pub fn scan_header_name(bytes: &[u8], start: usize) -> HeaderNameOutcome {
@@ -258,6 +385,19 @@ cfg_select! {
                 return HeaderNameOutcome::None;
             }
             scan_header_name_scalar(bytes, start)
+        }
+
+
+        pub fn scan_header_value(bytes: &[u8], start: usize) -> HeaderValueOutcome {
+            if start >= bytes.len() {
+                return HeaderValueOutcome::None;
+            }
+            scan_header_value_scalar(bytes, start)
+        }
+
+        #[inline]
+        pub fn request_target_is_valid(bytes: &[u8]) -> bool {
+            request_target_is_valid_scalar(bytes)
         }
     }
 }

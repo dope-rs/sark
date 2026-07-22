@@ -1,14 +1,16 @@
 #![cfg(target_os = "linux")]
 
+mod support;
+
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpStream};
 use std::time::Duration;
 
-use dope_extra::testing::{ephemeral_addr, run_with_trigger};
+use dope_extra::harness::Harness;
 use http::StatusCode;
-use o3::buffer::Owned;
 use sark::request::BodyLen;
-use sark::{Build, ServerCfg};
+use sark::service::{BodyPolicy, RouteRequestImpl};
+use sark::{Executor, Throughput, driver};
 
 #[sark_gen::request]
 struct PingReq {}
@@ -16,12 +18,12 @@ struct PingReq {}
 #[sark_gen::response(raw)]
 struct PingReply {
     status: StatusCode,
-    body: Owned,
+    body: Vec<u8>,
 }
 
 #[sark_gen::handler]
 fn ping(_req: PingReq, _state: &()) -> PingReply {
-    let mut body = Owned::new();
+    let mut body = Vec::new();
     body.extend_from_slice(b"pong");
     PingReply {
         status: StatusCode::OK,
@@ -31,20 +33,20 @@ fn ping(_req: PingReq, _state: &()) -> PingReply {
 
 #[sark_gen::request]
 struct UpReq {
-    #[stream_body]
+    #[body_len]
     payload: BodyLen,
 }
 
 #[sark_gen::response(raw)]
 struct UpReply {
     status: StatusCode,
-    body: Owned,
+    body: Vec<u8>,
 }
 
 #[sark_gen::handler]
 #[max_body(16 * 1024 * 1024)]
 fn up(req: UpReq, _state: &()) -> UpReply {
-    let mut body = Owned::new();
+    let mut body = Vec::new();
     body.extend_from_slice(req.payload.len().to_string().as_bytes());
     UpReply {
         status: StatusCode::OK,
@@ -59,29 +61,39 @@ sark_gen::define_route! {
     }
 }
 
-fn cfg() -> ServerCfg {
-    ServerCfg {
-        bind: ephemeral_addr(),
-        max_conn: 16,
-        backlog: 16,
-        head_timeout: Duration::from_secs(10),
-    }
+#[test]
+fn request_macro_selects_discard_policy_at_compile_time() {
+    assert_eq!(PingReq::BODY_POLICY, BodyPolicy::Discarded);
+    assert_eq!(UpReq::BODY_POLICY, BodyPolicy::Discarded);
 }
 
-fn serve(cfg: ServerCfg, client: impl FnOnce(SocketAddr)) {
-    let bind = cfg.bind;
-    run_with_trigger(
-        bind,
-        move |ctx, trigger| {
-            Build::http(
-                stream_discard_dispatch::new(&()),
-                cfg.clone(),
-                ctx,
-                Some(trigger),
-            )
-        },
-        client,
-    );
+fn serve(client: impl FnOnce(SocketAddr)) {
+    let harness = Harness::bind().expect("harness");
+    let bind = harness.addr();
+    let server = support::http_server(bind, Duration::from_secs(10));
+    harness
+        .run_with_trigger(
+            move |_ctx, trigger| {
+                let driver_config =
+                    driver::Config::for_tcp_profile::<Throughput>(support::MAX_CONNECTIONS);
+                let executor = Executor::new(driver_config)?;
+                executor.enter(|mut session| {
+                    server.clone().serve(
+                        &mut session,
+                        StreamDiscardDispatch::new(
+                            (),
+                            sark::app::Config {
+                                timer_capacity: support::MAX_CONNECTIONS.saturating_mul(2),
+                                task_capacity: support::MAX_CONNECTIONS,
+                            },
+                        ),
+                        Some(trigger),
+                    )
+                })
+            },
+            client,
+        )
+        .expect("harness");
 }
 
 fn content_length(head: &[u8]) -> usize {
@@ -151,7 +163,7 @@ fn upload_head(sock: &mut TcpStream, total: usize) -> String {
 
 #[test]
 fn large_body_is_drained_and_conn_reusable() {
-    serve(cfg(), |bind| {
+    serve(|bind| {
         let total: usize = 8 * 1024 * 1024;
         let mut sock = TcpStream::connect(bind).expect("connect");
         let resp = upload_head(&mut sock, total);
@@ -169,7 +181,7 @@ fn large_body_is_drained_and_conn_reusable() {
 
 #[test]
 fn body_tail_and_pipelined_request_in_one_segment() {
-    serve(cfg(), |bind| {
+    serve(|bind| {
         let total: usize = 256 * 1024;
         let mut sock = TcpStream::connect(bind).expect("connect");
         let prefix = vec![0x11u8; 1000];
@@ -193,7 +205,7 @@ fn body_tail_and_pipelined_request_in_one_segment() {
 
 #[test]
 fn small_body_in_first_chunk_needs_no_discard() {
-    serve(cfg(), |bind| {
+    serve(|bind| {
         let mut sock = TcpStream::connect(bind).expect("connect");
         let body = b"tiny";
         let req = format!(
@@ -209,8 +221,51 @@ fn small_body_in_first_chunk_needs_no_discard() {
 }
 
 #[test]
+fn deep_large_body_pipeline_does_not_enter_the_recv_backlog() {
+    serve(|bind| {
+        const DEPTH: usize = 8;
+        const BODY_LEN: usize = 1024 * 1024;
+
+        let mut sock = TcpStream::connect(bind).expect("connect");
+        sock.set_write_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        let body = [0xa5; 64 * 1024];
+        for _ in 0..DEPTH {
+            let head =
+                format!("POST /up HTTP/1.1\r\nHost: x\r\nContent-Length: {BODY_LEN}\r\n\r\n");
+            sock.write_all(head.as_bytes()).unwrap();
+            for _ in 0..BODY_LEN / body.len() {
+                sock.write_all(&body).unwrap();
+            }
+        }
+
+        sock.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        let mut responses = Vec::new();
+        let mut chunk = [0; 4096];
+        while responses
+            .windows(b"HTTP/1.1 200".len())
+            .filter(|window| *window == b"HTTP/1.1 200")
+            .count()
+            < DEPTH
+        {
+            let n = sock.read(&mut chunk).expect("read pipelined responses");
+            assert_ne!(n, 0, "server closed before every pipelined response");
+            responses.extend_from_slice(&chunk[..n]);
+        }
+        let expected_len = BODY_LEN.to_string();
+        assert_eq!(
+            responses
+                .windows(expected_len.len())
+                .filter(|window| *window == expected_len.as_bytes())
+                .count(),
+            DEPTH
+        );
+    });
+}
+
+#[test]
 fn peer_close_mid_body_does_not_wedge_server() {
-    serve(cfg(), |bind| {
+    serve(|bind| {
         let total: usize = 4 * 1024 * 1024;
         let mut sock = TcpStream::connect(bind).expect("connect");
         let resp = upload_head(&mut sock, total);

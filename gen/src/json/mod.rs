@@ -27,6 +27,7 @@ pub(super) struct JsonMode {
     pub(super) preserve: bool,
     pub(super) exact: bool,
     pub(super) plain: bool,
+    pub(super) encode_only: bool,
 }
 
 impl Parse for JsonMode {
@@ -37,12 +38,14 @@ impl Parse for JsonMode {
                 preserve: false,
                 exact: false,
                 plain: false,
+                encode_only: false,
             });
         }
         let mut kind = JsonKind::Unordered;
         let mut preserve = false;
         let mut exact = false;
         let mut plain = false;
+        let mut encode_only = false;
         while !input.is_empty() {
             let ident = input.parse::<Ident>()?;
             if ident == "ordered" {
@@ -55,10 +58,12 @@ impl Parse for JsonMode {
                 exact = true;
             } else if ident == "plain" {
                 plain = true;
+            } else if ident == "encode" {
+                encode_only = true;
             } else {
                 return Err(syn::Error::new_spanned(
                     ident,
-                    "#[sark_gen::json] supports only `ordered`, `unordered`, `preserve`, `exact`, or `plain`",
+                    "#[sark_gen::json] supports only `ordered`, `unordered`, `preserve`, `exact`, `plain`, or `encode`",
                 ));
             }
             if input.is_empty() {
@@ -72,11 +77,18 @@ impl Parse for JsonMode {
                 "`exact` requires `ordered`",
             ));
         }
+        if encode_only && (preserve || exact) {
+            return Err(syn::Error::new(
+                Span::call_site(),
+                "`encode` cannot be combined with `preserve` or `exact`",
+            ));
+        }
         Ok(Self {
             kind,
             preserve,
             exact,
             plain,
+            encode_only,
         })
     }
 }
@@ -294,7 +306,7 @@ impl<'a> Plan<'a> {
             || self.modes.iter().any(|fmode| fmode.nested || fmode.seq)
             || self.tys.iter().any(|ty| {
                 let base = ty.option_inner().unwrap_or(ty);
-                base.is_plain_ident("LocalFrameBytes")
+                base.is_bytes_with_storage("Retained")
             })
     }
 
@@ -330,14 +342,14 @@ pub(super) fn attr(mode: JsonMode, mut st: ItemStruct) -> Result<TokenStream> {
                     field.attrs.push(syn::parse_quote!(#[allow(dead_code)]));
                 }
             }
-            if mode.preserve {
+            if mode.preserve && !mode.encode_only {
                 named.named.push(syn::parse_quote!(
                     #[doc(hidden)]
                     #[allow(dead_code)]
                     pub __json_raw: o3::buffer::Shared
                 ));
             }
-            let keep = if mode.preserve {
+            let keep = if mode.preserve && !mode.encode_only {
                 named.named.len().saturating_sub(1)
             } else {
                 named.named.len()
@@ -396,19 +408,43 @@ pub(super) fn attr(mode: JsonMode, mut st: ItemStruct) -> Result<TokenStream> {
         ));
     }
 
+    let (encoders, leners) = plan.encoders_and_leners()?;
+    if mode.encode_only {
+        let owned_types = &plan.tys;
+        st.attrs.retain(|attr| !attr.path().is_ident("json"));
+        return Ok(quote! {
+            #st
+
+            impl ::sark::sark_core::http::__private::OwnedValue for #name
+            where
+                (#(#owned_types,)*): ::sark::sark_core::http::__private::OwnedValue,
+            {}
+
+            impl sark::json::JsonEncode for #name {
+                fn json_len(&self) -> usize {
+                    1usize #( + #leners )*
+                }
+
+                fn write_into<__W: sark::json::Write>(&self, __w: &mut __W) {
+                    #( #encoders )*
+                    __w.put(b"}");
+                }
+            }
+        });
+    }
+
     let locals = plan.locals();
     let match_arms = plan.match_arms()?;
     let finals = plan.finals()?;
     let ordered_steps = plan.ordered_steps()?;
     let exact_steps = plan.exact_steps()?;
-    let (encoders, leners) = plan.encoders_and_leners()?;
     let scan_fields = plan.scan_fields()?;
     let scan_one = plan.scan_one()?;
     let has_owned = plan.has_owned();
 
     let scan_prelude = if mode.preserve {
         quote! {
-            let mut __raw_acc = o3::buffer::Owned::new();
+            let mut __raw_acc = Vec::new();
             for __chunk in __chunks.iter().copied() {
                 __raw_acc.extend_from_slice(__chunk);
             }
@@ -417,7 +453,7 @@ pub(super) fn attr(mode: JsonMode, mut st: ItemStruct) -> Result<TokenStream> {
         quote! {}
     };
     let scan_tail = if mode.preserve {
-        quote!(#raw_field: __raw_acc.freeze(),)
+        quote!(#raw_field: o3::buffer::Shared::from(__raw_acc),)
     } else {
         quote! {}
     };
@@ -459,11 +495,13 @@ pub(super) fn attr(mode: JsonMode, mut st: ItemStruct) -> Result<TokenStream> {
                     where
                         I: IntoIterator<Item = &'a [u8]>,
                     {
-                        let mut __out = o3::buffer::Owned::new();
+                        let mut __out = Vec::new();
                         for __chunk in chunks {
                             __out.extend_from_slice(__chunk);
                         }
-                        <Self as sark::json::JsonDecode>::decode_json(__out.freeze())
+                        <Self as sark::json::JsonDecode>::decode_json(
+                            o3::buffer::Shared::from(__out)
+                        )
                     }
                 }
             }
@@ -573,7 +611,6 @@ pub(super) fn attr(mode: JsonMode, mut st: ItemStruct) -> Result<TokenStream> {
 
         impl sark::json::JsonDecode for #name {
             fn decode_json(__bytes: o3::buffer::Shared) -> sark::json::Result<Self> {
-                let __sark_depth = sark::json::DepthGuard::enter()?;
                 let __raw = __bytes.as_ref();
                 let mut __idx = 0usize;
                 sark::json::Scan::ws(__raw, &mut __idx);
@@ -590,7 +627,7 @@ pub(super) fn attr(mode: JsonMode, mut st: ItemStruct) -> Result<TokenStream> {
                 1usize #( + #leners )*
             }
 
-            fn write_into(&self, __w: &mut sark::json::Writer<'_>) {
+            fn write_into<__W: sark::json::Write>(&self, __w: &mut __W) {
                 #( #encoders )*
                 __w.put(b"}");
             }

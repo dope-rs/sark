@@ -24,12 +24,14 @@ impl Scan {
             ));
         }
         let (init, push, finish) = match class.scalar {
-            Scalar::LocalFrameBytes => (
-                quote!(let mut __value = o3::buffer::Owned::with_capacity(24);),
+            Scalar::Retained => (
+                quote!(let mut __value = Vec::with_capacity(24);),
                 quote!(__value.extend_from_slice(&[__b]);),
-                quote!(sark::sark_core::http::LocalFrameBytes::from_shared(
-                    __value.freeze()
-                )),
+                quote!(sark::sark_core::http::Bytes::<
+                    sark::sark_core::http::Retained,
+                >::from_shared(o3::buffer::Shared::from(
+                    __value
+                ))),
             ),
             Scalar::InlineToken => (
                 quote!(let mut __value = sark::json::InlineToken::new();),
@@ -39,7 +41,7 @@ impl Scan {
             _ => {
                 return Err(syn::Error::new_spanned(
                     ty,
-                    "`exact` scan currently supports only LocalFrameBytes or InlineToken fields",
+                    "`exact` scan currently supports only Bytes<Retained> or InlineToken fields",
                 ));
             }
         };

@@ -10,7 +10,6 @@ use common::{close_code, connect, masked, next_message, run_echo};
 #[test]
 fn close_codes_validated() {
     run_echo(|bind| {
-        // Valid codes echo back unchanged; everything else is answered with 1002.
         let cases: &[(u16, u16)] = &[
             (1000, 1000),
             (1003, 1003),
@@ -64,7 +63,6 @@ fn valid_close_is_echoed_with_reason() {
 fn oversized_frame_replies_1009() {
     run_echo(|bind| {
         let (mut sock, mut buf) = connect(bind);
-        // 64-bit length header alone declares > max_frame_payload (16 MiB).
         let mut frame = vec![0x82u8, 0x80 | 127];
         frame.extend_from_slice(&((16 * 1024 * 1024u64) + 1).to_be_bytes());
         frame.extend_from_slice(&[0, 0, 0, 0]); // mask

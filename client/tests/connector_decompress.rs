@@ -4,7 +4,7 @@ use std::io::Write;
 use std::net::SocketAddr;
 
 use common::{run_get, spawn_raw_server};
-use sark_client::connector::{DecompressionPolicy, Session};
+use sark_client::connector::{Config, DecompressionPolicy};
 
 fn gzip(data: &[u8]) -> Vec<u8> {
     let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
@@ -17,7 +17,7 @@ fn run_get_policy(
     policy: DecompressionPolicy,
     path: &'static str,
 ) -> Result<sark_core::http::Response, String> {
-    run_get(addr, Session::with_decompression("127.0.0.1", policy), path)
+    run_get(addr, Config::with_decompression("127.0.0.1", policy), path)
 }
 
 #[test]
@@ -78,9 +78,9 @@ fn decompression_bomb_rejected() {
     });
     let addr: SocketAddr = server.addr().parse().expect("addr");
 
-    let mut session = Session::with_decompression("127.0.0.1", DecompressionPolicy::Strict);
-    session.max_response_body(4096);
-    let err = run_get(addr, session, "/").expect_err("decompression bomb must be rejected");
+    let config = Config::with_decompression("127.0.0.1", DecompressionPolicy::Strict)
+        .max_response_body(4096);
+    let err = run_get(addr, config, "/").expect_err("decompression bomb must be rejected");
     assert!(err.contains("size limit"), "err was: {err}");
 }
 

@@ -24,10 +24,19 @@ impl Value {
             .collect()
     }
 
-    pub(crate) fn build_default_local_expr(default: &LitStr) -> TokenStream {
+    pub(crate) fn build_default_retained_expr(default: &LitStr) -> TokenStream {
         let bytes = LitByteStr::new(default.value().as_bytes(), default.span());
         quote! {
-            sark_core::http::LocalFrameBytes::from_shared(::o3::buffer::Shared::from_static(#bytes))
+            sark_core::http::Bytes::<sark_core::http::Retained>::from(
+                ::o3::buffer::Shared::from_static(#bytes)
+            )
+        }
+    }
+
+    pub(crate) fn build_default_borrowed_expr(default: &LitStr) -> TokenStream {
+        let bytes = LitByteStr::new(default.value().as_bytes(), default.span());
+        quote! {
+            sark_core::http::Bytes::<sark_core::http::Borrowed<'static>>::from(#bytes)
         }
     }
 
@@ -35,7 +44,7 @@ impl Value {
         let kind = ty.value_kind()?;
         let raw = default.value();
         match kind {
-            ValueKind::Local => Ok(Self::build_default_local_expr(default)),
+            ValueKind::Bytes => Ok(Self::build_default_retained_expr(default)),
             ValueKind::U64 => {
                 let n: u64 = raw
                     .parse()
@@ -78,7 +87,7 @@ impl Value {
 
     pub(crate) fn build_parse_expr(kind: ValueKind, range_expr: TokenStream) -> TokenStream {
         match kind {
-            ValueKind::Range | ValueKind::Local => quote! { Some(#range_expr) },
+            ValueKind::Range | ValueKind::Bytes => quote! { Some(#range_expr) },
             _ => quote! {{
                 let value = sark::service::SliceValue::new(input, #range_expr);
                 Some(sark::service::FieldValue::parse_value(&value)?)
@@ -90,31 +99,36 @@ impl Value {
         ty: &Type,
         default: Option<&LitStr>,
         ident: &Ident,
-        local_read: TokenStream,
+        frame_read: TokenStream,
         prefix: &str,
+        borrowed: bool,
     ) -> Result<TokenStream> {
-        let invariant = format!("{prefix} local range invariant: stored range must be readable");
+        let invariant = format!("{prefix} frame range invariant: stored range must be readable");
         let require_default =
-            format!("non-Option {prefix} LocalFrameBytes fields require default = \"...\"");
+            format!("non-Option {prefix} Bytes<Retained> fields require default = \"...\"");
         let require_typed_default =
             format!("non-Option {prefix} typed fields require default = \"...\"");
         Ok(match ty.value_kind()? {
-            ValueKind::Local if ty.value_optional() => quote! {
+            ValueKind::Bytes if ty.value_optional() => quote! {
                 match #ident {
                     Some(range) => Some(
-                        #local_read.ok_or_else(|| sark::error::Error::BadRequest(#invariant.into()))?
+                        #frame_read.ok_or_else(|| sark::error::Error::BadRequest(#invariant.into()))?
                     ),
                     None => None,
                 }
             },
-            ValueKind::Local => {
+            ValueKind::Bytes => {
                 let default =
                     default.ok_or_else(|| syn::Error::new_spanned(ty, require_default.as_str()))?;
-                let fallback = Self::build_default_local_expr(default);
+                let fallback = if borrowed {
+                    Self::build_default_borrowed_expr(default)
+                } else {
+                    Self::build_default_retained_expr(default)
+                };
                 quote! {
                     match #ident {
                         Some(range) => {
-                            #local_read.ok_or_else(|| sark::error::Error::BadRequest(#invariant.into()))?
+                            #frame_read.ok_or_else(|| sark::error::Error::BadRequest(#invariant.into()))?
                         }
                         None => #fallback,
                     }

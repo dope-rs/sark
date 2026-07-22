@@ -13,13 +13,14 @@ default = []
 [dependencies]
 sark-core.workspace = true
 dope.workspace = true
+dope-net.workspace = true
+dope-fiber.workspace = true
+dope-gen.workspace = true
 o3.workspace = true
-cartel-core = "0.3"
+cartel-core = "0.5"
 http = "1.4.2"
 flate2 = "1"
 
 [dev-dependencies]
-dope-gen.workspace = true
 dope-extra.workspace = true
 pin-project.workspace = true
-

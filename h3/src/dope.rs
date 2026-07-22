@@ -31,6 +31,8 @@ impl<'a> QuicTransport<'a> {
 }
 
 impl StreamTransport for QuicTransport<'_> {
+    type SendError = dope_quic::StreamError;
+
     fn recv_stream(&mut self, stream_id: u64, out: &mut Vec<u8>) -> usize {
         self.conn.stream_recv(stream_id, out)
     }
@@ -39,12 +41,12 @@ impl StreamTransport for QuicTransport<'_> {
         self.conn.stream_recv_eof(stream_id)
     }
 
-    fn send_stream(&mut self, stream_id: u64, bytes: &[u8]) {
-        self.conn.stream_send(stream_id, bytes);
+    fn send_stream(&mut self, stream_id: u64, bytes: &[u8]) -> Result<(), Self::SendError> {
+        self.conn.stream_send(stream_id, bytes)
     }
 
-    fn finish_stream(&mut self, stream_id: u64) {
-        self.conn.stream_send_fin(stream_id);
+    fn finish_stream(&mut self, stream_id: u64) -> Result<(), Self::SendError> {
+        self.conn.stream_send_fin(stream_id)
     }
 }
 
@@ -79,7 +81,7 @@ impl Session {
         let stream_id = quic.open_uni_stream()?;
         self.h3.start_control_stream(StreamId::new(stream_id))?;
         self.control_stream_id = Some(stream_id);
-        self.flush(quic);
+        self.flush(quic)?;
         Ok(stream_id)
     }
 
@@ -87,7 +89,7 @@ impl Session {
         Ok(quic.open_bidi_stream()?)
     }
 
-    pub fn on_quic_stream_event(
+    pub fn quic_stream_event(
         &mut self,
         quic: &mut dope_quic::Conn,
         event: dope_quic::StreamEvent,
@@ -119,13 +121,13 @@ impl Session {
         if transport.conn.stream_recv_eof(stream_id) {
             self.fin_pumped.insert(stream_id);
         }
-        self.flush(transport.conn);
+        self.flush(transport.conn)?;
         Ok(())
     }
 
-    pub fn flush(&mut self, quic: &mut dope_quic::Conn) {
+    pub fn flush(&mut self, quic: &mut dope_quic::Conn) -> Result<(), Error> {
         let mut transport = QuicTransport::new(quic);
-        pump_writes(&mut self.h3, &mut transport);
+        pump_writes(&mut self.h3, &mut transport).map_err(Error::QuicStream)
     }
 
     pub fn poll_event(&mut self) -> Option<crate::Event> {
@@ -266,9 +268,12 @@ impl<R: sark::dispatch::Decode> Server<R> {
 }
 
 impl<R: sark::dispatch::Decode + 'static> dope_quic::Handler for Server<R> {
-    fn on_established(&mut self, conn: &mut dope_quic::Conn, handle: dope_quic::ConnHandle) {
+    fn established(&mut self, conn: &mut dope_quic::Conn, handle: dope_quic::ConnHandle) {
         let mut h3 = Session::with_role(Role::Server);
-        let _ = h3.start_control_stream(conn);
+        if h3.start_control_stream(conn).is_err() {
+            conn.close(crate::ErrorCode::Internal as u64, Vec::new());
+            return;
+        }
         self.sessions.insert(
             handle,
             ServerSession {
@@ -278,7 +283,7 @@ impl<R: sark::dispatch::Decode + 'static> dope_quic::Handler for Server<R> {
         );
     }
 
-    fn on_stream_event(
+    fn stream_event(
         &mut self,
         conn: &mut dope_quic::Conn,
         handle: dope_quic::ConnHandle,
@@ -288,7 +293,8 @@ impl<R: sark::dispatch::Decode + 'static> dope_quic::Handler for Server<R> {
         let Some(session) = sessions.get_mut(&handle) else {
             return;
         };
-        if session.h3.on_quic_stream_event(conn, event).is_err() {
+        if session.h3.quic_stream_event(conn, event).is_err() {
+            conn.close(crate::ErrorCode::Internal as u64, Vec::new());
             return;
         }
         while let Some(event) = session.h3.poll_event() {
@@ -314,10 +320,12 @@ impl<R: sark::dispatch::Decode + 'static> dope_quic::Handler for Server<R> {
                 _ => {}
             }
         }
-        session.h3.flush(conn);
+        if session.h3.flush(conn).is_err() {
+            conn.close(crate::ErrorCode::Internal as u64, Vec::new());
+        }
     }
 
-    fn on_close(&mut self, handle: dope_quic::ConnHandle) {
+    fn close(&mut self, handle: dope_quic::ConnHandle) {
         self.sessions.remove(&handle);
     }
 }

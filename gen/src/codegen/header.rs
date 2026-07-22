@@ -26,7 +26,7 @@ pub(crate) enum HeaderApplyMode {
 }
 
 #[derive(Clone, Copy, Default)]
-pub(crate) struct HeaderParserCfg {
+pub(crate) struct HeaderParserConfig {
     pub(crate) value: HeaderValueMode,
     pub(crate) apply: HeaderApplyMode,
 }
@@ -201,7 +201,7 @@ impl Assign {
         abs_end: TokenStream,
     ) -> TokenStream {
         match kind {
-            ValueKind::Range | ValueKind::Local => quote! {
+            ValueKind::Range | ValueKind::Bytes => quote! {
                 if headers.#ident.is_none() {
                     headers.#ident = Some((#abs_start)..(#abs_end));
                 }
@@ -560,7 +560,7 @@ impl Emit {
 
     pub(crate) fn apply<'a>(
         entries: impl IntoIterator<Item = (&'a Ident, Vec<u8>, &'a Type)>,
-        cfg: HeaderParserCfg,
+        cfg: HeaderParserConfig,
     ) -> Result<TokenStream> {
         let plan = HeaderPlan::collect(entries)?;
         let skip_value = matches!(cfg.value, HeaderValueMode::Skip);
@@ -695,7 +695,7 @@ impl Emit {
 
     pub(crate) fn contig<'a>(
         entries: impl IntoIterator<Item = (&'a Ident, Vec<u8>, &'a Type)>,
-        cfg: HeaderParserCfg,
+        cfg: HeaderParserConfig,
     ) -> Result<TokenStream> {
         let plan = HeaderPlan::collect(entries)?;
         let skip_value = matches!(cfg.value, HeaderValueMode::Skip);

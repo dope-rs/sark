@@ -16,7 +16,7 @@ fn matches_naive_aligned() {
 
         let mut a = payload.clone();
         let mut b = payload.clone();
-        Mask::unmask_inline(&mut a, mask);
+        Mask::unmask_in_place(&mut a, mask);
         naive_unmask(&mut b, mask);
         assert_eq!(a, b, "mismatch at len={len}");
     }
@@ -27,8 +27,8 @@ fn round_trip() {
     let mask = [0x12, 0x34, 0x56, 0x78];
     let original: Vec<u8> = (0u8..=255).cycle().take(2003).collect();
     let mut buf = original.clone();
-    Mask::unmask_inline(&mut buf, mask);
-    Mask::unmask_inline(&mut buf, mask);
+    Mask::unmask_in_place(&mut buf, mask);
+    Mask::unmask_in_place(&mut buf, mask);
     assert_eq!(buf, original);
 }
 
@@ -41,7 +41,7 @@ fn copy_matches_inline() {
         let mask = [0x37, 0xfa, 0x21, 0x3d];
 
         let mut inline = src.clone();
-        Mask::unmask_inline(&mut inline, mask);
+        Mask::unmask_in_place(&mut inline, mask);
 
         let mut dst = vec![0xAAu8; len + 4]; // oversized dst must leave the tail untouched
         Mask::unmask_copy(&mut dst, &src, mask);

@@ -6,7 +6,6 @@ pub(super) const TE_LINE: &[u8] = b"Transfer-Encoding: chunked\r\n";
 
 pub(in crate::http::response) const STATUS_LINE_PREFIX: &[u8] = b"HTTP/1.1 ";
 
-/// Wire length of an HTTP-date value (`Mon, 01 Jan 2000 00:00:00 GMT`).
 pub(in crate::http::response) const DATE_LEN: usize = 29;
 
 pub(in crate::http::response) const PLACEHOLDER_DATE: &[u8; DATE_LEN] =

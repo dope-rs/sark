@@ -1,6 +1,6 @@
 use std::time::Instant;
 
-use dope_quic::{Conn, ConnConfig, transport_params};
+use dope_quic::{Conn, conn, transport_params};
 use ring::rand::{SecureRandom, SystemRandom};
 use sark_core::http::Field;
 use sark_h3::dope::Session;
@@ -9,8 +9,8 @@ use shin::sig::SigningKey;
 
 const CID: [u8; 8] = [0x13, 0x37, 0x13, 0x37, 0x13, 0x37, 0x13, 0x37];
 
-fn config() -> ConnConfig {
-    ConnConfig {
+fn config() -> conn::Config {
+    conn::Config {
         transport_params: transport_params::Params {
             max_idle_timeout_ms: 30_000,
             initial_max_data: 1 << 20,
@@ -30,8 +30,9 @@ fn pair() -> (Conn, Conn) {
     SystemRandom::new().fill(&mut seed).unwrap();
     let signing = SigningKey::from_seed(&seed).unwrap();
     let server_pubkey = *signing.pubkey().unwrap();
-    let mut server = Conn::new_server(CID.to_vec(), CID.to_vec(), CID.to_vec(), signing, config());
-    let mut client = Conn::new_client(CID.to_vec(), CID.to_vec(), server_pubkey, config());
+    let mut server =
+        Conn::new_server(CID.to_vec(), CID.to_vec(), CID.to_vec(), signing, config()).unwrap();
+    let mut client = Conn::new_client(CID.to_vec(), CID.to_vec(), server_pubkey, config()).unwrap();
     let now = Instant::now();
     for _ in 0..3 {
         drain(&mut client, &mut server, now);
@@ -50,7 +51,7 @@ fn drain(from: &mut Conn, into: &mut Conn, now: Instant) {
 
 fn pump_quic_events(session: &mut Session, quic: &mut Conn) {
     while let Some(event) = quic.poll_stream_event() {
-        session.on_quic_stream_event(quic, event).unwrap();
+        session.quic_stream_event(quic, event).unwrap();
     }
 }
 
@@ -89,7 +90,7 @@ fn settings_exchange_and_request_stream_round_trip_over_quic() {
         .h3_mut()
         .send_data(StreamId::new(stream_id), b"hello", true)
         .unwrap();
-    client_h3.flush(&mut client_quic);
+    client_h3.flush(&mut client_quic).unwrap();
 
     let t2 = Instant::now();
     drain(&mut client_quic, &mut server_quic, t2);

@@ -1,36 +1,37 @@
 #![cfg(target_os = "linux")]
 
+mod support;
+
 use std::io::{Read, Write};
 use std::net::TcpStream;
 use std::time::Duration;
 
-use dope_extra::testing::run_with_trigger;
+use dope_extra::harness::Harness;
 use http::StatusCode;
-use o3::buffer::Owned;
-use sark::{Build, ServerCfg};
+use sark::{Executor, Throughput, driver};
 
 #[sark_gen::request(ordered)]
 struct EchoReq {
     #[path("id", default = "MISSING")]
-    pub id: sark_core::http::LocalFrameBytes,
+    pub id: o3::buffer::Bytes<o3::buffer::Retained>,
     #[header("x-echo-marker", default = "MISSING")]
-    pub marker: sark_core::http::LocalFrameBytes,
+    pub marker: o3::buffer::Bytes<o3::buffer::Retained>,
 }
 
 #[sark_gen::response(raw)]
 struct Reply {
     status: StatusCode,
-    body: Owned,
+    body: Vec<u8>,
 }
 
 #[sark_gen::handler]
 async fn echo_handler(request: EchoReq, _state: &(), timer: sark::Timer) -> Reply {
     timer.sleep(Duration::from_millis(20)).await;
-    let mut body = Owned::new();
+    let mut body = Vec::new();
     body.extend_from_slice(b"id=");
-    body.extend_from_slice(request.id.as_bytes());
+    body.extend_from_slice(request.id.as_slice());
     body.extend_from_slice(b" marker=");
-    body.extend_from_slice(request.marker.as_bytes());
+    body.extend_from_slice(request.marker.as_slice());
     Reply {
         status: StatusCode::OK,
         body,
@@ -39,7 +40,7 @@ async fn echo_handler(request: EchoReq, _state: &(), timer: sark::Timer) -> Repl
 
 sark_gen::define_route! {
     EchoDispatch: () => {
-        GET "/echo/:id" => async echo_handler,
+        GET "/echo/:id" => async(capacity = 32) echo_handler,
     }
 }
 
@@ -103,16 +104,27 @@ fn content_length(head: &[u8]) -> Option<usize> {
 #[test]
 fn async_handler_keeps_request_bytes_after_pipelined_request() {
     let bind: std::net::SocketAddr = "127.0.0.1:18922".parse().unwrap();
-    let cfg = ServerCfg {
-        bind,
-        max_conn: 16,
-        backlog: 16,
-        head_timeout: std::time::Duration::from_secs(10),
-    };
+    let server = support::http_server(bind, Duration::from_secs(10));
 
-    run_with_trigger(
-        bind,
-        |ctx, trigger| Build::http(echo_dispatch::new(&()), cfg.clone(), ctx, Some(trigger)),
+    Harness::new(bind).run_with_trigger(
+        |_ctx, trigger| {
+            let driver_config =
+                driver::Config::for_tcp_profile::<Throughput>(support::MAX_CONNECTIONS);
+            let executor = Executor::new(driver_config)?;
+            executor.enter(|mut session| {
+                server.clone().serve(
+                    &mut session,
+                    EchoDispatch::new(
+                        (),
+                        sark::app::Config {
+                            timer_capacity: support::MAX_CONNECTIONS.saturating_mul(2),
+                            task_capacity: support::MAX_CONNECTIONS,
+                        },
+                    ),
+                    Some(trigger),
+                )
+            })
+        },
         |bind| {
             let mut sock = TcpStream::connect(bind).expect("connect");
             sock.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
@@ -141,5 +153,5 @@ fn async_handler_keeps_request_bytes_after_pipelined_request() {
                 "id=ZZZZZZZZZZZZZZZZZZZZZZZZZZZZ marker=ZZZZZZZZZZZZZZZZZZZZZZZZ"
             );
         },
-    );
+    ).expect("harness");
 }

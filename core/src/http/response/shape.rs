@@ -1,25 +1,26 @@
-use std::future::Future;
-
+use dope_fiber::{Context, Fiber};
 use http::StatusCode;
 use o3::buffer::Shared;
 
-use super::{Chunked, FixedResponseInner, MonoResponseInner, ServeInner, Stream};
+use super::{
+    Chunked, EncodedBody, EncodedResponseInner, FixedResponseInner, MonoResponseInner, ServeInner,
+    StaticResponseInner, Stream,
+};
 
 pub struct NeverStream(std::marker::PhantomData<()>);
 
-impl Future for NeverStream {
+impl<'d> Fiber<'d> for NeverStream {
     type Output = Option<Shared>;
-
     fn poll(
         self: std::pin::Pin<&mut Self>,
-        _cx: &mut std::task::Context<'_>,
+        _cx: std::pin::Pin<&mut Context<'_, 'd>>,
     ) -> std::task::Poll<Self::Output> {
         unreachable!("NeverStream polled — non-Stream Shape")
     }
 }
 
 pub trait Shape<'req>: Sized {
-    type StreamInner: Future<Output = Option<Shared>> + 'static;
+    type StreamInner: 'static;
 
     fn write_into_slice(&self, out: &mut [u8], date: &[u8; 29]) -> Option<usize> {
         let _ = (out, date);
@@ -57,8 +58,9 @@ pub trait Shape<'req>: Sized {
         None
     }
 
-    fn apply_gzip_body(&mut self, _compressed: Shared) {
-        unreachable!("Shape::apply_gzip_body called on shape without body_for_gzip")
+    fn write_gzip_head(self, out: &mut [u8], date: &[u8; 29], body_len: usize) -> Option<usize> {
+        let _ = (out, date, body_len);
+        unreachable!("Shape::write_gzip_head called on shape without body_for_gzip")
     }
 
     fn status(&self) -> StatusCode {
@@ -70,11 +72,11 @@ pub trait Shape<'req>: Sized {
     }
 
     fn headers_wire(&self) -> Shared {
-        Shared::from(::std::vec::Vec::new())
+        Shared::new()
     }
 }
 
-impl<'req> Shape<'req> for FixedResponseInner<'req> {
+impl<'req, const N: usize> Shape<'req> for FixedResponseInner<'req, N> {
     type StreamInner = NeverStream;
 
     fn write_into_slice(&self, out: &mut [u8], date: &[u8; 29]) -> Option<usize> {
@@ -97,8 +99,8 @@ impl<'req> Shape<'req> for FixedResponseInner<'req> {
         }
     }
 
-    fn apply_gzip_body(&mut self, compressed: Shared) {
-        FixedResponseInner::apply_gzip(self, compressed)
+    fn write_gzip_head(self, out: &mut [u8], date: &[u8; 29], body_len: usize) -> Option<usize> {
+        FixedResponseInner::write_gzip_head(self, out, date, body_len)
     }
 
     fn status(&self) -> StatusCode {
@@ -114,23 +116,74 @@ impl<'req> Shape<'req> for FixedResponseInner<'req> {
     }
 }
 
-impl<'req> Shape<'req> for MonoResponseInner<'req> {
+impl<'req, B, const N: usize> Shape<'req> for EncodedResponseInner<'req, B, N>
+where
+    B: EncodedBody,
+{
+    type StreamInner = NeverStream;
+
+    fn write_into_slice(&self, out: &mut [u8], date: &[u8; 29]) -> Option<usize> {
+        EncodedResponseInner::write_into_slice(self, out, date)
+    }
+
+    fn write_head_split(self, out: &mut [u8], date: &[u8; 29]) -> Option<(usize, Shared)> {
+        EncodedResponseInner::write_head_split(self, out, date)
+    }
+
+    fn preserialize(&self) -> (Vec<u8>, usize) {
+        EncodedResponseInner::preserialize(self)
+    }
+
+    fn status(&self) -> StatusCode {
+        EncodedResponseInner::status(self)
+    }
+
+    fn headers_wire(&self) -> Shared {
+        EncodedResponseInner::wire_headers(self)
+    }
+}
+
+impl<'req, const N: usize> Shape<'req> for MonoResponseInner<'req, N> {
     type StreamInner = NeverStream;
 
     fn write_into_slice(&self, out: &mut [u8], date: &[u8; 29]) -> Option<usize> {
         MonoResponseInner::write_into_slice(self, out, date)
     }
 
-    fn write_head_only(&self, out: &mut [u8], date: &[u8; 29]) -> Option<(usize, &'static [u8])> {
-        MonoResponseInner::write_head_only(self, out, date)
-    }
-
     fn write_head_split(self, out: &mut [u8], date: &[u8; 29]) -> Option<(usize, Shared)> {
         MonoResponseInner::write_head_split(self, out, date)
     }
+}
+
+impl<'req, const N: usize> Shape<'req> for StaticResponseInner<'req, N> {
+    type StreamInner = NeverStream;
+
+    fn write_into_slice(&self, out: &mut [u8], date: &[u8; 29]) -> Option<usize> {
+        StaticResponseInner::write_into_slice(self, out, date)
+    }
+
+    fn write_head_only(&self, out: &mut [u8], date: &[u8; 29]) -> Option<(usize, &'static [u8])> {
+        StaticResponseInner::write_head_only(self, out, date)
+    }
+
+    fn write_head_split(self, out: &mut [u8], date: &[u8; 29]) -> Option<(usize, Shared)> {
+        StaticResponseInner::write_head_split(self, out, date)
+    }
 
     fn preserialize_static(&self) -> Option<(Vec<u8>, usize, &'static [u8])> {
-        MonoResponseInner::preserialize_static(self)
+        Some(StaticResponseInner::preserialize_static(self))
+    }
+
+    fn status(&self) -> StatusCode {
+        StaticResponseInner::status(self)
+    }
+
+    fn body_bytes(&self) -> &[u8] {
+        self.body_ref()
+    }
+
+    fn headers_wire(&self) -> Shared {
+        StaticResponseInner::wire_headers(self)
     }
 }
 
@@ -148,7 +201,7 @@ impl<'req> Shape<'req> for Chunked {
 
 impl<'req, S> Shape<'req> for Stream<S>
 where
-    S: Future<Output = Option<Shared>> + 'static,
+    S: 'static,
 {
     type StreamInner = S;
 
@@ -157,7 +210,7 @@ where
     }
 }
 
-impl<'req> Shape<'req> for ServeInner<'req> {
+impl<'req, const N: usize> Shape<'req> for ServeInner<'req, N> {
     type StreamInner = NeverStream;
 
     fn write_into_slice(&self, out: &mut [u8], date: &[u8; 29]) -> Option<usize> {
@@ -177,25 +230,11 @@ impl<'req> Shape<'req> for ServeInner<'req> {
         }
     }
 
-    fn write_head_only(&self, out: &mut [u8], date: &[u8; 29]) -> Option<(usize, &'static [u8])> {
-        match self {
-            Self::Mono(m) => MonoResponseInner::write_head_only(m, out, date),
-            Self::Fixed(_) | Self::Chunked(_) => None,
-        }
-    }
-
     fn write_head_split(self, out: &mut [u8], date: &[u8; 29]) -> Option<(usize, Shared)> {
         match self {
             Self::Mono(m) => MonoResponseInner::write_head_split(m, out, date),
             Self::Chunked(c) => Chunked::write_head_split(c, out, date),
             Self::Fixed(f) => FixedResponseInner::write_head_split(f, out, date),
-        }
-    }
-
-    fn preserialize_static(&self) -> Option<(Vec<u8>, usize, &'static [u8])> {
-        match self {
-            Self::Mono(m) => MonoResponseInner::preserialize_static(m),
-            Self::Fixed(_) | Self::Chunked(_) => None,
         }
     }
 
@@ -206,10 +245,10 @@ impl<'req> Shape<'req> for ServeInner<'req> {
         }
     }
 
-    fn apply_gzip_body(&mut self, compressed: Shared) {
+    fn write_gzip_head(self, out: &mut [u8], date: &[u8; 29], body_len: usize) -> Option<usize> {
         match self {
-            Self::Fixed(f) => f.apply_gzip(compressed),
-            _ => unreachable!("apply_gzip_body on non-Fixed ServeInner"),
+            Self::Fixed(f) => FixedResponseInner::write_gzip_head(f, out, date, body_len),
+            _ => unreachable!("write_gzip_head on non-Fixed ServeInner"),
         }
     }
 
@@ -231,7 +270,7 @@ impl<'req> Shape<'req> for ServeInner<'req> {
     fn headers_wire(&self) -> Shared {
         match self {
             Self::Fixed(f) => f.wire_headers(),
-            Self::Mono(_) | Self::Chunked(_) => Shared::from(::std::vec::Vec::new()),
+            Self::Mono(_) | Self::Chunked(_) => Shared::new(),
         }
     }
 }

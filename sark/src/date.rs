@@ -1,14 +1,23 @@
+use std::cell::Cell;
 use std::pin::Pin;
 use std::ptr::NonNull;
+use std::sync::OnceLock;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use dope::driver::token::{Epoch, SlotIndex, Token, kind};
 use dope::manifold::Manifold;
-use dope::runtime::token::{Epoch, LocalIdx, Token};
-use dope::sqe::{Sqe, Timespec};
-use dope::{Drive, Driver};
+use dope::platform::Platform;
+use dope::runtime::Idle;
+use dope::{Driver, DriverContext, Event, EventRef, Submission};
+
+const UPDATE_INTERVAL: Duration = Duration::from_secs(1);
+
+type Sqe = <Driver as Platform>::Sqe;
+type TimerSpec = <Driver as Platform>::TimerSpec;
 
 pub struct Stamp {
-    buf: [u8; 29],
+    buf: Cell<[u8; 29]>,
+    _marker: core::marker::PhantomPinned,
 }
 
 impl Default for Stamp {
@@ -20,16 +29,17 @@ impl Default for Stamp {
 impl Stamp {
     pub fn new() -> Self {
         Self {
-            buf: Self::snapshot_now(),
+            buf: Cell::new(Self::snapshot_now()),
+            _marker: core::marker::PhantomPinned,
         }
     }
 
-    pub fn buf(&self) -> &[u8; 29] {
-        &self.buf
+    pub fn load(&self) -> [u8; 29] {
+        self.buf.get()
     }
 
-    pub fn refresh(&mut self) {
-        self.buf = Self::snapshot_now();
+    fn refresh(&self) {
+        self.buf.set(Self::snapshot_now());
     }
 
     #[cold]
@@ -118,12 +128,20 @@ impl Stamp {
 }
 
 pub trait DateHost {
-    fn date_stamp(&self) -> &Stamp;
+    fn stamp(self: Pin<&Self>) -> Pin<&Stamp>;
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum TimerState {
+    Disarmed,
+    Armed,
+    CancelPending,
+    Stopped,
 }
 
 pub struct Updater<const ID: u8> {
     stamp: Option<NonNull<Stamp>>,
-    armed: bool,
+    state: TimerState,
 }
 
 impl<const ID: u8> Default for Updater<ID> {
@@ -136,37 +154,133 @@ impl<const ID: u8> Updater<ID> {
     pub fn new() -> Self {
         Self {
             stamp: None,
-            armed: false,
+            state: TimerState::Disarmed,
         }
     }
 
-    pub fn bind(&mut self, stamp: NonNull<Stamp>) {
-        self.stamp = Some(stamp);
+    fn token() -> Token {
+        Token::new(ID, SlotIndex::new(0), Epoch::INITIAL)
+    }
+
+    fn timer_spec() -> &'static TimerSpec {
+        static TIMER: OnceLock<TimerSpec> = OnceLock::new();
+        TIMER.get_or_init(|| TimerSpec::from(UPDATE_INTERVAL))
+    }
+
+    fn try_arm(&mut self, driver: &mut DriverContext<'_, '_>) {
+        if driver
+            .push(Sqe::interval(Self::timer_spec(), Self::token()))
+            .is_ok()
+        {
+            self.state = TimerState::Armed;
+        }
+    }
+
+    fn try_cancel(&mut self, driver: &mut DriverContext<'_, '_>) {
+        if driver.push(Sqe::cancel(Self::token(), kind::TIMER)).is_ok() {
+            self.state = TimerState::Stopped;
+        }
+    }
+
+    /// # Safety
+    /// `stamp` must remain pinned and live while `self` is active.
+    pub(crate) unsafe fn bind(self: Pin<&mut Self>, stamp: Pin<&Stamp>) {
+        self.get_mut().stamp = Some(NonNull::from(stamp.get_ref()));
     }
 }
 
-impl<const ID: u8> Manifold for Updater<ID> {
+impl<'d, const ID: u8> Manifold<'d> for Updater<ID> {
     const ID: u8 = ID;
 
-    fn dispatch(self: Pin<&mut Self>, ev: dope::Event, _driver: &mut Driver) {
+    fn dispatch(self: Pin<&mut Self>, event: Event, _driver: &mut DriverContext<'_, 'd>) {
         let this = self.get_mut();
-        if let dope::Event::Timer(_) = ev
-            && let Some(mut stamp) = this.stamp
+        if this.state != TimerState::Armed {
+            return;
+        }
+        if matches!(
+            event.as_ref(),
+            EventRef::Timer(token) if token.same_target(Self::token())
+        ) && let Some(stamp) = this.stamp
         {
-            // SAFETY: `stamp` is the App-owned `Stamp` in the same pinned per-core Dispatcher; the single-threaded loop never overlaps this refresh with a request's read of the same buffer.
-            unsafe { stamp.as_mut() }.refresh();
+            unsafe { stamp.as_ref() }.refresh();
         }
     }
 
-    fn pre_park(self: Pin<&mut Self>, driver: &mut Driver) {
-        let this = self.get_mut();
-        if !this.armed && this.stamp.is_some() {
-            static TS: std::sync::OnceLock<Timespec> = std::sync::OnceLock::new();
-            let ts: &'static Timespec = TS.get_or_init(|| Timespec::from(Duration::from_secs(1)));
-            let ud = Token::new(ID, LocalIdx::new(0), Epoch::ZERO);
-            if driver.push(Sqe::interval(ts, ud)).is_ok() {
-                this.armed = true;
-            }
+    fn pre_park(mut self: Pin<&mut Self>, driver: &mut DriverContext<'_, 'd>) {
+        let this = self.as_mut().get_mut();
+        match this.state {
+            TimerState::Disarmed if this.stamp.is_some() => this.try_arm(driver),
+            TimerState::CancelPending => this.try_cancel(driver),
+            TimerState::Disarmed | TimerState::Armed | TimerState::Stopped => {}
         }
+    }
+
+    fn idle(self: Pin<&Self>) -> Idle {
+        Idle::Park(None)
+    }
+
+    fn shutdown(mut self: Pin<&mut Self>, driver: &mut DriverContext<'_, 'd>) {
+        let this = self.as_mut().get_mut();
+        match this.state {
+            TimerState::Armed => {
+                this.state = TimerState::CancelPending;
+                this.try_cancel(driver);
+            }
+            TimerState::Disarmed => this.state = TimerState::Stopped,
+            TimerState::CancelPending => this.try_cancel(driver),
+            TimerState::Stopped => {}
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::pin::pin;
+    use std::ptr::NonNull;
+    use std::time::Duration;
+
+    use dope::driver;
+    use dope::runtime::profile::Throughput;
+    use dope::runtime::{Executor, ShutdownTrigger};
+
+    use super::{Stamp, TimerState, Updater};
+
+    #[pin_project::pin_project]
+    #[derive(dope_gen::Dispatcher)]
+    struct App {
+        #[pin]
+        #[manifold]
+        date: Updater<7>,
+    }
+
+    #[test]
+    fn updater_refreshes_from_the_recurring_driver_event() {
+        let stamp = pin!(Stamp::new());
+        let initial = stamp.load();
+        let updater = Updater {
+            stamp: Some(NonNull::from(stamp.as_ref().get_ref())),
+            state: TimerState::Disarmed,
+        };
+        let trigger = ShutdownTrigger::new().expect("shutdown trigger");
+        let fire = trigger.try_clone().expect("clone shutdown trigger");
+        let shutdown = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(1_250));
+            fire.fire().expect("fire shutdown");
+        });
+
+        let config = driver::Config::for_tcp_profile::<Throughput>(1);
+        Executor::new(config)
+            .expect("executor")
+            .enter(|mut session| {
+                trigger
+                    .try_register(&mut session.driver_access())
+                    .expect("register shutdown trigger");
+                session
+                    .with_app(App { date: updater }, |mut app| app.run())
+                    .expect("run updater");
+            });
+        shutdown.join().expect("shutdown thread");
+
+        assert_ne!(stamp.load(), initial);
     }
 }

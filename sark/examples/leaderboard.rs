@@ -1,250 +1,255 @@
 use std::io;
 use std::net::SocketAddr;
 
-use cartel_redis::{DEFAULT_BACKOFF, Ops, Session};
-use dope::fiber::Holding;
-use dope::launcher::{Ctx, Launcher};
-use dope::manifold::connector::Connector;
+use cartel_redis::{Connect, DEFAULT_BACKOFF, Ops, Redis};
 use dope::manifold::connector::source::Static;
 use dope::manifold::env::Bundle;
-use dope::manifold::listener::{Listener, config};
-use dope::runtime::profile::Throughput;
-use dope::transport::Tcp;
-use dope::wire::Identity;
-use dope::{DriverConfig, Executor};
-use dope_extra::Trigger;
+use dope_net::tcp::Tcp;
+use dope_net::wire::identity::Identity;
 use http::StatusCode;
-use o3::buffer::{Owned, Shared};
-use sark::date::{DateHost, Updater};
-use sark::timer::TimerHost;
-use sark::{Application, ServerCfg};
-use sark_core::http::LocalFrameBytes;
+use o3::buffer::{Bytes, Retained};
+use sark::{HttpServer, Throughput, app, driver, listener, tcp};
 
 const BOARD_KEY: &[u8] = b"sark:leaderboard";
+const MAX_CONNECTIONS: usize = 1024;
+const HTTP_LISTENER_ID: u8 = 0;
+const DATE_UPDATER_ID: u8 = 1;
+const REDIS_CONNECTOR_ID: u8 = 2;
+
+mod support;
 
 type Env = Bundle<Tcp, Identity, Throughput>;
-type RedisConnector = Connector<0, Session, Static<Tcp>, Env>;
-type RedisClient<'d> = Holding<'d, RedisConnector>;
 
-#[derive(Clone)]
+#[derive(Clone, Copy)]
 struct AppState<'d> {
-    redis: RedisClient<'d>,
+    redis: Redis<'d>,
 }
 
-#[sark_gen::response(raw)]
+#[sark_gen::json(ordered)]
+struct PostScoreBody {
+    user: Bytes<Retained>,
+    value: Bytes<Retained>,
+}
+
+#[sark_gen::json(encode)]
+struct PostScoreResult {
+    ok: bool,
+    added: u64,
+    total: u64,
+    error: String,
+}
+
+#[sark_gen::json(encode)]
+struct Score {
+    user: o3::buffer::Shared,
+    score: f64,
+}
+
+#[sark_gen::json(encode)]
+struct TopResult {
+    ok: bool,
+    #[field(seq, nested)]
+    scores: Vec<Score>,
+    error: String,
+}
+
+#[sark_gen::json(encode)]
+struct RankResult {
+    ok: bool,
+    found: bool,
+    user: o3::buffer::Shared,
+    rank: u64,
+    error: String,
+}
+
+#[sark_gen::response(json)]
 #[header("content-type", "application/json")]
-struct JsonResponse {
+struct PostScoreResponse {
     status: StatusCode,
-    body: Owned,
-    #[header("x-board-key")]
-    board_key: LocalFrameBytes,
+    body: PostScoreResult,
+}
+
+#[sark_gen::response(json)]
+#[header("content-type", "application/json")]
+struct TopResponse {
+    status: StatusCode,
+    body: TopResult,
+}
+
+#[sark_gen::response(json)]
+#[header("content-type", "application/json")]
+struct RankResponse {
+    status: StatusCode,
+    body: RankResult,
 }
 
 #[sark_gen::request(ordered)]
-struct PostScoreRequest {
-    #[query("user", default = "")]
-    pub user: LocalFrameBytes,
-    #[query("value", default = "")]
-    pub value: LocalFrameBytes,
-}
+#[json_body(PostScoreBody)]
+struct PostScoreRequest {}
 
 #[sark_gen::request(ordered)]
 struct GetTopRequest {
     #[query("n", default = "10")]
-    pub n: LocalFrameBytes,
+    n: usize,
 }
 
 #[sark_gen::request(ordered)]
 struct GetRankRequest {
     #[path("user", default = "")]
-    pub user: LocalFrameBytes,
+    user: Bytes<Retained>,
 }
 
 #[sark_gen::handler]
-async fn post_score(request: PostScoreRequest, state: &AppState<'_>) -> JsonResponseInner<'req> {
-    let user = request.user.as_bytes().to_vec();
-    let value: Option<f64> = std::str::from_utf8(request.value.as_bytes())
+async fn post_score(request: PostScoreRequest, state: &AppState<'_>) -> PostScoreResponse {
+    let user = request.body.user.into_shared();
+    let value = std::str::from_utf8(request.body.value.as_slice())
         .ok()
-        .and_then(|s| s.parse().ok());
-    let body = match value {
-        Some(v) if !user.is_empty() => match state.redis.zadd(BOARD_KEY, v, &user).await {
-            Ok(added) => match state.redis.zcard(BOARD_KEY).await {
-                Ok(total) => format!("{{\"ok\":true,\"added\":{},\"total\":{}}}\n", added, total),
-                Err(e) => format!("{{\"error\":\"{}\"}}\n", e),
+        .and_then(|value| value.parse::<f64>().ok());
+    let Some(value) = value.filter(|value| value.is_finite() && !user.is_empty()) else {
+        return PostScoreResponse {
+            status: StatusCode::BAD_REQUEST,
+            body: PostScoreResult {
+                ok: false,
+                added: 0,
+                total: 0,
+                error: String::from("user must be non-empty and value must be finite"),
             },
-            Err(e) => format!("{{\"error\":\"{}\"}}\n", e),
+        };
+    };
+    let redis = state.redis;
+    match redis.zadd(BOARD_KEY, value, user).await {
+        Ok(added) => match redis.zcard(BOARD_KEY).await {
+            Ok(total) => PostScoreResponse {
+                status: StatusCode::CREATED,
+                body: PostScoreResult {
+                    ok: true,
+                    added,
+                    total,
+                    error: String::new(),
+                },
+            },
+            Err(error) => PostScoreResponse {
+                status: StatusCode::BAD_GATEWAY,
+                body: PostScoreResult {
+                    ok: false,
+                    added,
+                    total: 0,
+                    error: error.to_string(),
+                },
+            },
         },
-        _ => "{\"error\":\"missing user or value\"}\n".to_string(),
-    };
-    JsonResponseInner {
-        status: StatusCode::OK,
-        body: bytes_from_str(&body),
-        board_key: LocalFrameBytes::from_slice(BOARD_KEY),
+        Err(error) => PostScoreResponse {
+            status: StatusCode::BAD_GATEWAY,
+            body: PostScoreResult {
+                ok: false,
+                added: 0,
+                total: 0,
+                error: error.to_string(),
+            },
+        },
     }
 }
 
 #[sark_gen::handler]
-async fn get_top(request: GetTopRequest, state: &AppState<'_>) -> JsonResponseInner<'req> {
-    let n: i64 = std::str::from_utf8(request.n.as_bytes())
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(10);
-    let stop = (n - 1).max(0);
-    let stop_str = stop.to_string();
-    let body = match state
-        .redis
-        .cmd::<Vec<(Shared, f64)>>(&[
-            b"ZREVRANGE",
-            BOARD_KEY,
-            b"0",
-            stop_str.as_bytes(),
-            b"WITHSCORES",
-        ])
-        .await
-    {
-        Ok(rows) => format_top(&rows),
-        Err(e) => format!("{{\"error\":\"{}\"}}\n", e),
-    };
-    JsonResponseInner {
-        status: StatusCode::OK,
-        body: bytes_from_str(&body),
-        board_key: LocalFrameBytes::from_slice(BOARD_KEY),
+async fn get_top(request: GetTopRequest, state: &AppState<'_>) -> TopResponse {
+    if !(1..=100).contains(&request.n) {
+        return TopResponse {
+            status: StatusCode::BAD_REQUEST,
+            body: TopResult {
+                ok: false,
+                scores: Vec::new(),
+                error: String::from("n must be between 1 and 100"),
+            },
+        };
     }
-}
-
-#[sark_gen::handler]
-async fn get_rank(request: GetRankRequest, state: &AppState<'_>) -> JsonResponseInner<'req> {
-    let user = request.user.as_bytes().to_vec();
-    let user_str = String::from_utf8_lossy(&user).into_owned();
-    let body = match state
+    match state
         .redis
-        .cmd::<Option<u64>>(&[b"ZREVRANK", BOARD_KEY, &user])
+        .zrev_range_with_scores(BOARD_KEY, 0, request.n as i64 - 1)
         .await
     {
-        Ok(Some(rank)) => {
-            let score = state.redis.zscore(BOARD_KEY, &user).await.ok().flatten();
-            let score_str = score
-                .map(|s| format!("{}", s))
-                .unwrap_or_else(|| "null".to_string());
-            format!(
-                "{{\"user\":\"{}\",\"rank\":{},\"score\":{}}}\n",
-                user_str, rank, score_str
-            )
+        Ok(rows) => {
+            let scores = rows
+                .into_iter()
+                .map(|(member, score)| Score {
+                    user: member,
+                    score,
+                })
+                .collect();
+            TopResponse {
+                status: StatusCode::OK,
+                body: TopResult {
+                    ok: true,
+                    scores,
+                    error: String::new(),
+                },
+            }
         }
-        Ok(None) => "{\"error\":\"not found\"}\n".to_string(),
-        Err(e) => format!("{{\"error\":\"{}\"}}\n", e),
-    };
-    JsonResponseInner {
-        status: StatusCode::OK,
-        body: bytes_from_str(&body),
-        board_key: LocalFrameBytes::from_slice(BOARD_KEY),
+        Err(error) => TopResponse {
+            status: StatusCode::BAD_GATEWAY,
+            body: TopResult {
+                ok: false,
+                scores: Vec::new(),
+                error: error.to_string(),
+            },
+        },
+    }
+}
+
+#[sark_gen::handler]
+async fn get_rank(request: GetRankRequest, state: &AppState<'_>) -> RankResponse {
+    let user = o3::buffer::Shared::copy_from_slice(request.user.as_slice());
+    if user.is_empty() {
+        return RankResponse {
+            status: StatusCode::BAD_REQUEST,
+            body: RankResult {
+                ok: false,
+                found: false,
+                user: o3::buffer::Shared::new(),
+                rank: 0,
+                error: String::from("user must be non-empty"),
+            },
+        };
+    }
+    match state.redis.zrev_rank(BOARD_KEY, user.clone()).await {
+        Ok(Some(rank)) => RankResponse {
+            status: StatusCode::OK,
+            body: RankResult {
+                ok: true,
+                found: true,
+                user,
+                rank,
+                error: String::new(),
+            },
+        },
+        Ok(None) => RankResponse {
+            status: StatusCode::NOT_FOUND,
+            body: RankResult {
+                ok: true,
+                found: false,
+                user,
+                rank: 0,
+                error: String::from("not found"),
+            },
+        },
+        Err(error) => RankResponse {
+            status: StatusCode::BAD_GATEWAY,
+            body: RankResult {
+                ok: false,
+                found: false,
+                user,
+                rank: 0,
+                error: error.to_string(),
+            },
+        },
     }
 }
 
 sark_gen::define_route! {
-    LeaderboardApp: AppState<'d> => {
-        POST "/score" => async post_score,
-        GET "/top" => async get_top,
-        GET "/rank/:user" => async get_rank,
+    LeaderboardApp: AppState<'_> => {
+        POST "/score" => async(capacity = MAX_CONNECTIONS) post_score,
+        GET "/top" => async(capacity = MAX_CONNECTIONS) get_top,
+        GET "/rank/:user" => async(capacity = MAX_CONNECTIONS) get_rank,
     }
-}
-
-fn format_top(rows: &[(Shared, f64)]) -> String {
-    let mut out = String::from("[");
-    for (i, (member, score)) in rows.iter().enumerate() {
-        if i > 0 {
-            out.push(',');
-        }
-        let user = String::from_utf8_lossy(member.as_slice());
-        out.push_str(&format!("{{\"user\":\"{}\",\"score\":{}}}", user, score));
-    }
-    out.push_str("]\n");
-    out
-}
-
-fn bytes_from_str(s: &str) -> Owned {
-    let mut buf = Owned::with_capacity(s.len());
-    buf.extend_from_slice(s.as_bytes());
-    buf
-}
-
-#[pin_project::pin_project]
-#[derive(dope_gen::Dispatcher)]
-struct Dispatcher<'d, P>
-where
-    P: Application<Conn = sark::dispatch::conn_state::ConnState, Wire = dope::wire::Identity>
-        + DateHost
-        + TimerHost<'d>,
-{
-    #[pin]
-    #[manifold(optional)]
-    http: Option<Listener<1, P, Env>>,
-    #[pin]
-    #[manifold]
-    date: Updater<2>,
-    #[pin]
-    #[manifold]
-    redis: RedisConnector,
-    #[pin]
-    #[manifold]
-    timer: dope::manifold::timer::Timer<{ sark::timer::SARK_TIMER_ID }>,
-    _ph: std::marker::PhantomData<&'d ()>,
-}
-
-fn run_thread(
-    redis_addr: SocketAddr,
-    cfg: ServerCfg,
-    ctx: Ctx,
-    shutdown: Option<&Trigger>,
-) -> io::Result<()> {
-    let driver_cfg =
-        <dope::DriverCfg as dope::DriverConfig>::for_tcp_profile::<Throughput>(cfg.max_conn)
-            .with_cpu_id(Some(ctx.cpu));
-    let mut exec = Executor::new(driver_cfg)?;
-
-    let redis_conn = {
-        let drv = exec.driver_mut();
-        if let Some(trigger) = shutdown {
-            trigger.register(drv);
-        }
-        Connector::new(
-            Session::new(),
-            Static::<Tcp>::new(vec![redis_addr], DEFAULT_BACKOFF),
-            1,
-            drv,
-        )
-    };
-    let mut app = core::pin::pin!(Dispatcher::<_> {
-        http: None::<Listener<1, _, Env>>,
-        date: Updater::<2>::new(),
-        redis: redis_conn,
-        timer: dope::manifold::timer::Timer::new(),
-        _ph: std::marker::PhantomData,
-    });
-    let client = app.as_mut().redis_handle();
-    let timer_handle = app.as_mut().timer_handle();
-
-    let listener_cfg = config::Config::<Tcp> {
-        max_conn: cfg.max_conn,
-        bind: cfg.bind,
-        backlog: cfg.backlog,
-        stream_opts: Default::default(),
-        listener_opts: Default::default(),
-    };
-    let state: &'static AppState = Box::leak(Box::new(AppState { redis: client }));
-    let app_state = leaderboard_app::new(state);
-    let mut http = {
-        let drv = exec.driver_mut();
-        Listener::<1, _, Env>::open_in(app_state, listener_cfg, drv)?
-    };
-    {
-        let handler = http.handler_mut();
-        handler.bind_timer(timer_handle, cfg.head_timeout);
-        let stamp = std::ptr::NonNull::from(handler.date_stamp());
-        app.as_mut().project().date.get_mut().bind(stamp);
-    }
-    app.as_mut().project().http.set(Some(http));
-    exec.run(app.as_mut())
 }
 
 fn main() -> io::Result<()> {
@@ -256,15 +261,58 @@ fn main() -> io::Result<()> {
         .unwrap_or_else(|_| "127.0.0.1:6379".to_string())
         .parse()
         .expect("invalid REDIS_ADDR");
-
-    let cfg = ServerCfg {
-        bind,
-        max_conn: 1024,
-        backlog: 1024,
-        head_timeout: std::time::Duration::from_secs(10),
-    };
+    let server = HttpServer::<HTTP_LISTENER_ID, DATE_UPDATER_ID, Throughput>::new(
+        listener::Config::<Tcp> {
+            bind,
+            max_connections: MAX_CONNECTIONS,
+            backlog: 1024,
+            stream: tcp::stream::Config {
+                no_delay: Some(true),
+                ..Default::default()
+            },
+            transport: tcp::listener::Config {
+                reuse_port: true,
+                ..Default::default()
+            },
+            egress: Default::default(),
+        },
+        std::time::Duration::from_secs(10),
+    );
 
     eprintln!("sark leaderboard: listening on http://{bind}, upstream redis {redis_addr}");
+    let redis_factory = support::redis_config().map_err(io::Error::other)?.factory();
 
-    Launcher::new(vec![0u16]).run(move |ctx| run_thread(redis_addr, cfg.clone(), ctx, None))
+    server.run_with_storage(
+        vec![0u16],
+        |_| driver::Config::for_tcp_profile::<Throughput>(MAX_CONNECTIONS),
+        move |_, _| redis_factory,
+        move |server, session| {
+            let backoff = session
+                .seed()
+                .derive(dope::hash::domain::BACKOFF ^ REDIS_CONNECTOR_ID as u64)
+                .state();
+            let store = session.storage() as *const cartel_redis::Store<'_>;
+            // The store remains owned by the executor for the lifetime branded
+            // into both the Redis handle and connector.
+            let redis = unsafe { (&*store).redis() };
+            let connector = {
+                let mut driver = session.driver_access();
+                redis.connect::<REDIS_CONNECTOR_ID, _, Env>(
+                    Connect {
+                        topology: Static::<Tcp>::new(vec![redis_addr], DEFAULT_BACKOFF, backoff),
+                    },
+                    &mut driver,
+                )?
+            };
+            let state = AppState { redis };
+            let app = LeaderboardApp::new(
+                state,
+                app::Config {
+                    timer_capacity: MAX_CONNECTIONS.saturating_mul(2),
+                    task_capacity: MAX_CONNECTIONS,
+                },
+            );
+            server.serve_with_resource(session, app, connector, None)
+        },
+    )
 }

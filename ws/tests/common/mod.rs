@@ -6,11 +6,11 @@ use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpStream};
 use std::time::Duration;
 
-use dope_extra::testing::{ephemeral_addr, run_with_trigger};
+use dope_extra::harness::Harness;
 use sark_ws::crypto::Crypto;
 use sark_ws::frame::FrameHead;
 use sark_ws::mask::Mask;
-use sark_ws::server::{self, Cfg, Message, Response};
+use sark_ws::server::{self, Config, Message, Response};
 
 const KEY: &str = "dGhlIHNhbXBsZSBub25jZQ==";
 
@@ -22,7 +22,7 @@ pub fn masked(opcode: u8, fin: bool, payload: &[u8]) -> Vec<u8> {
     v.extend_from_slice(&mask);
     let start = v.len();
     v.extend_from_slice(payload);
-    Mask::unmask_inline(&mut v[start..], mask);
+    Mask::unmask_in_place(&mut v[start..], mask);
     v
 }
 
@@ -84,27 +84,29 @@ pub fn run_echo<C, R>(client: C) -> R
 where
     C: FnOnce(SocketAddr) -> R,
 {
-    let bind = ephemeral_addr();
-    let cfg = Cfg {
+    let harness = Harness::bind().expect("harness");
+    let bind = harness.addr();
+    let cfg = Config {
         bind,
-        max_conn: 16,
+        max_connections: 16,
         backlog: 16,
         path: "/",
         max_frame_payload: 16 * 1024 * 1024,
     };
-    run_with_trigger(
-        bind,
-        move |ctx, trigger| {
-            let echo = |msg: Message<'_>, resp: &mut Response<'_>| match msg {
-                Message::Text(s) => {
-                    let _ = resp.text(s);
-                }
-                Message::Binary(b) => {
-                    let _ = resp.binary(b);
-                }
-            };
-            server::serve(echo, cfg.clone(), ctx, Some(trigger))
-        },
-        client,
-    )
+    harness
+        .run_with_trigger(
+            move |ctx, trigger| {
+                let echo = |msg: Message<'_>, resp: &mut Response<'_>| match msg {
+                    Message::Text(s) => {
+                        let _ = resp.text(s);
+                    }
+                    Message::Binary(b) => {
+                        let _ = resp.binary(b);
+                    }
+                };
+                server::serve(echo, cfg.clone(), ctx, Some(trigger))
+            },
+            client,
+        )
+        .expect("harness")
 }

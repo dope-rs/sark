@@ -3,16 +3,15 @@ mod common;
 use std::net::SocketAddr;
 
 use common::{run_get, spawn_raw_server};
-use sark_client::connector::Session;
+use sark_client::connector::Config;
 
 fn run_get_cap(
     addr: SocketAddr,
     cap: usize,
     path: &'static str,
 ) -> Result<sark_core::http::Response, String> {
-    let mut session = Session::new("127.0.0.1");
-    session.max_response_body(cap);
-    run_get(addr, session, path)
+    let config = Config::new("127.0.0.1").max_response_body(cap);
+    run_get(addr, config, path)
 }
 
 #[test]

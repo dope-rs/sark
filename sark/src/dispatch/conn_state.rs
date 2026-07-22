@@ -13,20 +13,16 @@ pub enum StreamPhase {
 
 #[derive(Default)]
 pub struct AsyncConnState {
-    pub stream_slot: Option<(u8, ::dope::fiber::TaskId)>,
+    pub task: Option<crate::fiber::ErasedTaskId>,
+    pub task_route: u16,
+    pub task_stream: bool,
     pub stream_pending: Option<o3::buffer::Shared>,
     pub stream_phase: StreamPhase,
-    pub pending_wake: Option<(u8, ::dope::fiber::TaskId)>,
 }
 
 impl AsyncConnState {
-    #[inline]
-    pub fn wake_route_id(&self) -> Option<u8> {
-        match (&self.pending_wake, &self.stream_slot) {
-            (Some(p), _) => Some(p.0),
-            (None, Some(p)) => Some(p.0),
-            (None, None) => None,
-        }
+    pub fn has_task(&self) -> bool {
+        self.task.is_some()
     }
 }
 
@@ -45,6 +41,11 @@ pub enum Outcome {
         body: o3::buffer::Shared,
         close_after: bool,
     },
+    SendPooled {
+        hdr_written: usize,
+        body: o3::buffer::Pooled,
+        close_after: bool,
+    },
     Park,
     Close(&'static [u8]),
 }
@@ -53,10 +54,30 @@ pub enum DeferredAction {
     Close(&'static [u8]),
 }
 
+#[derive(Clone, Copy, Default, PartialEq, Eq)]
+pub enum PendingFrame {
+    #[default]
+    Head,
+    FixedBody(usize),
+    ChunkedBody,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum NeedMore {
+    Head,
+    FixedBody(usize),
+    ChunkedBody,
+}
+
+pub enum Consumption {
+    Buffered(usize),
+    Discard { head: usize, body: usize },
+}
+
 #[derive(Default)]
 pub struct PipelineState {
-    pub expected_total: Option<u32>,
-    pub stream_body_remaining: u32,
+    pub pending_frame: PendingFrame,
+    pub discard_body_remaining: usize,
 }
 
 pub struct DispatchPermit {
@@ -78,37 +99,16 @@ impl DispatchPermit {
 pub enum ConsumeOutcome {
     NeedMore {
         permit: DispatchPermit,
-        content_length: Option<usize>,
+        state: NeedMore,
     },
-    Done {
+    Complete {
         permit: DispatchPermit,
-        consumed: usize,
-        written: usize,
-        close: bool,
-    },
-    DoneStatic {
-        permit: DispatchPermit,
-        consumed: usize,
-        hdr_written: usize,
-        body: &'static [u8],
-        close: bool,
-    },
-    DoneSplit {
-        permit: DispatchPermit,
-        consumed: usize,
-        hdr_written: usize,
-        body: o3::buffer::Shared,
-        close: bool,
+        consumption: Consumption,
+        response: Outcome,
+        conn_close: bool,
     },
     Streamed {
         consumed: usize,
-        written: usize,
-        close: bool,
-    },
-    StreamArmed {
-        permit: DispatchPermit,
-        head_consumed: usize,
-        body_total: usize,
         written: usize,
         close: bool,
     },
@@ -124,19 +124,10 @@ pub struct ConnState {
     pub async_state: AsyncConnState,
     pub deferred_action: Option<DeferredAction>,
     pub deferred_close: bool,
-    pub conn_id: ::dope::runtime::token::Token,
-    pub chunked_body: Option<o3::buffer::Shared>,
-    pub retained_req: Option<o3::buffer::Shared>,
+    pub conn_id: ::dope::driver::token::Token,
     pub recv_view: Option<o3::buffer::Shared>,
     pub pipeline: PipelineState,
     pub head_deadline: Option<crate::timer::Ticket>,
-}
-
-impl ConnState {
-    pub fn release_req(&mut self) {
-        self.retained_req = None;
-        self.chunked_body = None;
-    }
 }
 
 impl Default for ConnState {
@@ -146,13 +137,11 @@ impl Default for ConnState {
             async_state: AsyncConnState::default(),
             deferred_action: None,
             deferred_close: false,
-            conn_id: ::dope::runtime::token::Token::new(
+            conn_id: ::dope::driver::token::Token::new(
                 0,
-                ::dope::runtime::token::LocalIdx::new(0),
-                ::dope::runtime::token::Epoch::INITIAL,
+                ::dope::driver::token::SlotIndex::new(0),
+                ::dope::driver::token::Epoch::INITIAL,
             ),
-            chunked_body: None,
-            retained_req: None,
             recv_view: None,
             pipeline: PipelineState::default(),
             head_deadline: None,

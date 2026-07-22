@@ -31,29 +31,3 @@ impl OwnedField {
         }
     }
 }
-
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct FieldBlock {
-    fields: Vec<OwnedField>,
-}
-
-impl FieldBlock {
-    pub fn new() -> Self {
-        Self { fields: Vec::new() }
-    }
-
-    pub fn push(&mut self, name: &[u8], value: &[u8]) {
-        self.fields.push(OwnedField {
-            name: name.to_vec(),
-            value: value.to_vec(),
-        });
-    }
-
-    pub fn fields(&self) -> &[OwnedField] {
-        &self.fields
-    }
-
-    pub fn as_fields(&self) -> impl Iterator<Item = Field<'_>> {
-        self.fields.iter().map(OwnedField::as_ref)
-    }
-}

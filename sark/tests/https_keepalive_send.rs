@@ -2,10 +2,10 @@ use std::io::{Read, Write};
 use std::net::TcpStream;
 use std::time::Duration;
 
-use dope_extra::testing::{ephemeral_addr, run_with_trigger};
-use dope_tls::State;
+use dope_extra::harness::Harness;
+use dope_tls::state::State;
 use http::StatusCode;
-use sark::{Build, HttpsCfg, ServerCfg};
+use sark::{Executor, Throughput, driver};
 use shin::sig::SigningKey;
 
 const SEED: [u8; 32] = [7u8; 32];
@@ -16,12 +16,12 @@ struct HelloRequest {}
 #[sark_gen::response(raw)]
 struct HelloReply {
     status: StatusCode,
-    body: o3::buffer::Owned,
+    body: Vec<u8>,
 }
 
 #[sark_gen::handler]
 fn hello(_req: HelloRequest, _state: &()) -> HelloReply {
-    let mut body = o3::buffer::Owned::new();
+    let mut body = Vec::new();
     body.extend_from_slice(b"hello");
     HelloReply {
         status: StatusCode::OK,
@@ -33,7 +33,7 @@ const BIG_LEN: usize = 512 * 1024;
 
 #[sark_gen::handler]
 fn big(_req: HelloRequest, _state: &()) -> HelloReply {
-    let mut body = o3::buffer::Owned::new();
+    let mut body = Vec::new();
     let chunk = [b'x'; 1024];
     for _ in 0..(BIG_LEN / 1024) {
         body.extend_from_slice(&chunk);
@@ -103,7 +103,7 @@ impl TlsClient {
         }
         self.state.read_tcp(&chunk[..n]).expect("read_tcp");
         while let Some(app) = self.state.pull_app() {
-            self.plain.extend_from_slice(&app);
+            self.plain.extend_from_slice(app.as_ref());
         }
         n
     }
@@ -179,15 +179,11 @@ fn assert_big(resp: &[u8]) {
     assert!(body.iter().all(|&b| b == b'x'), "body content");
 }
 
-fn https_cfg(bind: std::net::SocketAddr) -> HttpsCfg {
-    HttpsCfg {
-        server: ServerCfg {
-            bind,
-            max_conn: 16,
-            backlog: 16,
-            head_timeout: std::time::Duration::from_secs(10),
-        },
-        tls: shin::server::Config {
+fn server(bind: std::net::SocketAddr) -> support::TestHttpsServer {
+    support::https_server(
+        bind,
+        Duration::from_secs(10),
+        shin::server::Config {
             source: shin::server::CertSource::RawPublicKey {
                 signing_key: SigningKey::from_seed(&SEED).expect("signing key"),
             },
@@ -196,38 +192,77 @@ fn https_cfg(bind: std::net::SocketAddr) -> HttpsCfg {
             ticket_keys: None,
             accept_early_data: false,
         },
-    }
+    )
 }
 
 #[test]
 fn https_streams_large_body() {
-    let bind = ephemeral_addr();
-    let cfg = https_cfg(bind);
-    run_with_trigger(
-        bind,
-        move |ctx, trigger| Build::https(tls_dispatch::new(&()), cfg.clone(), ctx, Some(trigger)),
-        |bind| {
-            let mut client = TlsClient::connect(bind);
-            client.request("/big", bind);
-            assert_big(&client.response());
-        },
-    );
+    let harness = Harness::bind().expect("harness");
+    let bind = harness.addr();
+    let server = server(bind);
+    harness
+        .run_with_trigger(
+            move |_ctx, trigger| {
+                let driver_config =
+                    driver::Config::for_tcp_profile::<Throughput>(support::MAX_CONNECTIONS);
+                let executor = Executor::new(driver_config)?;
+                executor.enter(|mut session| {
+                    server.clone().serve(
+                        &mut session,
+                        TlsDispatch::new(
+                            (),
+                            sark::app::Config {
+                                timer_capacity: support::MAX_CONNECTIONS.saturating_mul(2),
+                                task_capacity: support::MAX_CONNECTIONS,
+                            },
+                        ),
+                        Some(trigger),
+                    )
+                })
+            },
+            |bind| {
+                let mut client = TlsClient::connect(bind);
+                client.request("/big", bind);
+                assert_big(&client.response());
+            },
+        )
+        .expect("harness");
 }
 
 #[test]
 fn https_keepalive_serves_two_requests() {
-    let bind = ephemeral_addr();
-    let cfg = https_cfg(bind);
+    let harness = Harness::bind().expect("harness");
+    let bind = harness.addr();
+    let server = server(bind);
 
-    run_with_trigger(
-        bind,
-        move |ctx, trigger| Build::https(tls_dispatch::new(&()), cfg.clone(), ctx, Some(trigger)),
-        |bind| {
-            let mut client = TlsClient::connect(bind);
-            client.request("/hello", bind);
-            assert_hello(&client.response());
-            client.request("/hello", bind);
-            assert_hello(&client.response());
-        },
-    );
+    harness
+        .run_with_trigger(
+            move |_ctx, trigger| {
+                let driver_config =
+                    driver::Config::for_tcp_profile::<Throughput>(support::MAX_CONNECTIONS);
+                let executor = Executor::new(driver_config)?;
+                executor.enter(|mut session| {
+                    server.clone().serve(
+                        &mut session,
+                        TlsDispatch::new(
+                            (),
+                            sark::app::Config {
+                                timer_capacity: support::MAX_CONNECTIONS.saturating_mul(2),
+                                task_capacity: support::MAX_CONNECTIONS,
+                            },
+                        ),
+                        Some(trigger),
+                    )
+                })
+            },
+            |bind| {
+                let mut client = TlsClient::connect(bind);
+                client.request("/hello", bind);
+                assert_hello(&client.response());
+                client.request("/hello", bind);
+                assert_hello(&client.response());
+            },
+        )
+        .expect("harness");
 }
+mod support;
