@@ -1,175 +1,14 @@
 mod dynamic_table;
-mod integer;
 mod static_table;
 mod string;
 
 use dynamic_table::DynamicTable;
-use integer::Integer;
-use o3::buffer::{Pooled, SharedPool};
+pub use sark_core::http::{
+    Field as Header, OwnedField as OwnedHeader, PooledFieldBlock as HeaderBlock,
+};
+use sark_core::http::{PrefixedInt, PrefixedIntError};
 use static_table::StaticTable;
 use string::Codec;
-
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
-pub struct Header<'a> {
-    pub name: &'a [u8],
-    pub value: &'a [u8],
-}
-
-impl<'a> Header<'a> {
-    pub const fn new(name: &'a [u8], value: &'a [u8]) -> Self {
-        Self { name, value }
-    }
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct OwnedHeader {
-    pub name: Vec<u8>,
-    pub value: Vec<u8>,
-}
-
-impl OwnedHeader {
-    pub fn new(name: &[u8], value: &[u8]) -> Self {
-        Self {
-            name: name.to_vec(),
-            value: value.to_vec(),
-        }
-    }
-
-    pub fn from(h: Header<'_>) -> Self {
-        Self {
-            name: h.name.to_vec(),
-            value: h.value.to_vec(),
-        }
-    }
-
-    pub fn as_ref(&self) -> Header<'_> {
-        Header {
-            name: &self.name,
-            value: &self.value,
-        }
-    }
-}
-
-#[derive(Clone)]
-pub struct HeaderBlock {
-    first: Pooled,
-    second: Option<Pooled>,
-}
-
-impl HeaderBlock {
-    pub(crate) fn from_pooled(pooled: Pooled) -> Self {
-        Self {
-            first: pooled,
-            second: None,
-        }
-    }
-
-    pub fn iter(&self) -> HeaderBlockIter<'_> {
-        HeaderBlockIter {
-            current: self.first.as_slice(),
-            second: self.second.as_ref().map(Pooled::as_slice),
-        }
-    }
-
-    pub fn from_headers(headers: &[Header<'_>]) -> Self {
-        let capacity = headers.iter().fold(0usize, |size, header| {
-            size.checked_add(8 + header.name.len() + header.value.len())
-                .expect("header block size overflow")
-        });
-        let pool = SharedPool::new(1, capacity.max(1));
-        let mut lease = pool.try_acquire().unwrap();
-        for header in headers {
-            let name_len = u32::try_from(header.name.len())
-                .expect("header name length overflow")
-                .to_ne_bytes();
-            let value_len = u32::try_from(header.value.len())
-                .expect("header value length overflow")
-                .to_ne_bytes();
-            let mut writer = lease.spare_writer();
-            writer.try_extend_from_slice(&name_len).unwrap();
-            writer.try_extend_from_slice(&value_len).unwrap();
-            writer.try_extend_from_slice(header.name).unwrap();
-            writer.try_extend_from_slice(header.value).unwrap();
-        }
-        Self::from_pooled(lease.freeze())
-    }
-
-    pub fn append(&mut self, other: Self) -> Result<(), Self> {
-        if self.second.is_some() || other.second.is_some() {
-            return Err(other);
-        }
-        self.second = Some(other.first);
-        Ok(())
-    }
-
-    pub fn to_owned(&self) -> Vec<OwnedHeader> {
-        self.iter()
-            .map(|header| OwnedHeader::new(header.name, header.value))
-            .collect()
-    }
-}
-
-impl std::fmt::Debug for HeaderBlock {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_list().entries(self.iter()).finish()
-    }
-}
-
-impl PartialEq for HeaderBlock {
-    fn eq(&self, other: &Self) -> bool {
-        self.iter().eq(other.iter())
-    }
-}
-
-impl Eq for HeaderBlock {}
-
-impl<'a> IntoIterator for &'a HeaderBlock {
-    type Item = Header<'a>;
-    type IntoIter = HeaderBlockIter<'a>;
-
-    fn into_iter(self) -> Self::IntoIter {
-        self.iter()
-    }
-}
-
-pub struct HeaderBlockIter<'a> {
-    current: &'a [u8],
-    second: Option<&'a [u8]>,
-}
-
-impl<'a> Iterator for HeaderBlockIter<'a> {
-    type Item = Header<'a>;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        if self.current.is_empty() {
-            self.current = self.second.take()?;
-        }
-        if self.current.len() < 8 {
-            self.current = &[];
-            self.second = None;
-            return None;
-        }
-        let name_len = u32::from_ne_bytes(self.current[..4].try_into().unwrap()) as usize;
-        let value_len = u32::from_ne_bytes(self.current[4..8].try_into().unwrap()) as usize;
-        let Some(end) = 8usize
-            .checked_add(name_len)
-            .and_then(|end| end.checked_add(value_len))
-        else {
-            self.current = &[];
-            self.second = None;
-            return None;
-        };
-        if end > self.current.len() {
-            self.current = &[];
-            self.second = None;
-            return None;
-        }
-        let name = &self.current[8..8 + name_len];
-        let value = &self.current[8 + name_len..end];
-        self.current = &self.current[end..];
-        Some(Header { name, value })
-    }
-}
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum DecoderError {
@@ -180,6 +19,15 @@ pub enum DecoderError {
     BadDynSizeUpdate,
     Truncated,
     HeaderListTooLarge,
+}
+
+impl From<PrefixedIntError> for DecoderError {
+    fn from(error: PrefixedIntError) -> Self {
+        match error {
+            PrefixedIntError::NeedMore => Self::NeedMore,
+            PrefixedIntError::Overflow => Self::BadInteger,
+        }
+    }
 }
 
 pub struct Encoder {
@@ -216,7 +64,7 @@ impl Encoder {
         I: IntoIterator<Item = Header<'a>>,
     {
         if let Some(n) = self.pending_size_update.take() {
-            Integer::encode(n as u64, 5, 0x20, out);
+            PrefixedInt::encode(n as u64, 5, 0x20, out);
         }
         for h in headers {
             self.encode_one(h, out);
@@ -225,12 +73,12 @@ impl Encoder {
 
     pub fn encode_one(&mut self, h: Header<'_>, out: &mut Vec<u8>) {
         if let Some(idx) = StaticTable::find(h.name, h.value) {
-            Integer::encode(idx as u64, 7, 0x80, out);
+            PrefixedInt::encode(idx as u64, 7, 0x80, out);
             return;
         }
         if let Some(dyn_idx) = self.dyn_table.find(h.name, h.value) {
             let absolute = StaticTable::LEN + 1 + dyn_idx;
-            Integer::encode(absolute as u64, 7, 0x80, out);
+            PrefixedInt::encode(absolute as u64, 7, 0x80, out);
             return;
         }
         let name_idx = StaticTable::find_name(h.name).or_else(|| {
@@ -240,7 +88,7 @@ impl Encoder {
         });
         match name_idx {
             Some(idx) => {
-                Integer::encode(idx as u64, 6, 0x40, out);
+                PrefixedInt::encode(idx as u64, 6, 0x40, out);
             }
             None => {
                 out.push(0x40);
@@ -329,7 +177,7 @@ impl Decoder {
         while pos < buf.len() {
             let first = buf[pos];
             if first & 0x80 != 0 {
-                let (idx, n) = Integer::decode(&buf[pos..], 7)?;
+                let (idx, n) = PrefixedInt::decode(&buf[pos..], 7)?;
                 pos += n;
                 if idx == 0 {
                     return Err(DecoderError::BadIndex);
@@ -338,12 +186,12 @@ impl Decoder {
                 let (name, value) = Self::lookup(&self.dyn_table, idx)?;
                 emit(name, value);
             } else if first & 0xC0 == 0x40 {
-                let (name_idx, n) = Integer::decode(&buf[pos..], 6)?;
+                let (name_idx, n) = PrefixedInt::decode(&buf[pos..], 6)?;
                 pos += n;
                 let consumed = self.literal(&buf[pos..], name_idx as usize, true, &mut emit)?;
                 pos += consumed;
             } else if first & 0xE0 == 0x20 {
-                let (new_size, n) = Integer::decode(&buf[pos..], 5)?;
+                let (new_size, n) = PrefixedInt::decode(&buf[pos..], 5)?;
                 pos += n;
                 let new_size = new_size as usize;
                 if new_size > self.max_size_setting {
@@ -351,7 +199,7 @@ impl Decoder {
                 }
                 self.dyn_table.set_max(new_size);
             } else {
-                let (name_idx, n) = Integer::decode(&buf[pos..], 4)?;
+                let (name_idx, n) = PrefixedInt::decode(&buf[pos..], 4)?;
                 pos += n;
                 let consumed = self.literal(&buf[pos..], name_idx as usize, false, &mut emit)?;
                 pos += consumed;

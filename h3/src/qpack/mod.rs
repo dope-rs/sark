@@ -3,7 +3,7 @@ mod static_table;
 mod table;
 
 pub use instruction::{DecoderInstruction, EncoderInstruction};
-use sark_core::http::{Field, HpackHuffman, OwnedField};
+use sark_core::http::{Field, HpackHuffman, OwnedField, PrefixedInt, PrefixedIntError};
 pub use static_table::StaticTable;
 pub use table::DynamicTable;
 
@@ -16,6 +16,15 @@ pub enum DecoderError {
     EncoderStream,
     DecoderStream,
     BadLiteral,
+}
+
+impl From<PrefixedIntError> for DecoderError {
+    fn from(error: PrefixedIntError) -> Self {
+        match error {
+            PrefixedIntError::NeedMore => Self::NeedMore,
+            PrefixedIntError::Overflow => Self::BadInteger,
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -33,6 +42,7 @@ pub struct Encoder {
     use_huffman: bool,
     table: DynamicTable,
     encoder_stream: Vec<u8>,
+    section: Vec<u8>,
     known_received_count: u64,
     max_blocked_streams: u64,
 }
@@ -43,6 +53,7 @@ impl Encoder {
             use_huffman: false,
             table: DynamicTable::new(0),
             encoder_stream: Vec::new(),
+            section: Vec::new(),
             known_received_count: 0,
             max_blocked_streams: 0,
         }
@@ -53,6 +64,7 @@ impl Encoder {
             use_huffman: false,
             table: DynamicTable::new(max_table_capacity),
             encoder_stream: Vec::new(),
+            section: Vec::new(),
             known_received_count: 0,
             max_blocked_streams: 0,
         }
@@ -113,12 +125,12 @@ impl Encoder {
     where
         I: IntoIterator<Item = Field<'a>>,
     {
-        let fields: Vec<Field<'a>> = fields.into_iter().collect();
         let base = self.table.insert_count();
-        let mut reps = Vec::new();
+        let mut reps = core::mem::take(&mut self.section);
+        reps.clear();
         let mut required_insert_count = 0u64;
 
-        for field in fields.iter().copied() {
+        for field in fields {
             if let Some(index) = StaticTable::find(field) {
                 Self::encode_indexed_static(index, &mut reps);
                 continue;
@@ -160,6 +172,8 @@ impl Encoder {
         PrefixedInt::encode(encoded_required_insert_count, 8, 0, out);
         Self::encode_delta_base(required_insert_count, base, out);
         out.extend_from_slice(&reps);
+        reps.clear();
+        self.section = reps;
     }
 
     fn find_exact_for_reference(&self, field: Field<'_>) -> Option<u64> {
@@ -553,67 +567,6 @@ impl StringLiteral {
             0x80
         } else {
             1u8 << prefix_bits
-        }
-    }
-}
-
-pub(super) struct PrefixedInt;
-
-impl PrefixedInt {
-    pub(super) fn encode(value: u64, prefix_bits: u8, prefix_byte: u8, out: &mut Vec<u8>) {
-        let max_prefix = (1u64 << prefix_bits) - 1;
-        let mask = if prefix_bits == 8 {
-            0
-        } else {
-            !((1u8 << prefix_bits).wrapping_sub(1))
-        };
-        let high = prefix_byte & mask;
-        if value < max_prefix {
-            out.push(high | value as u8);
-            return;
-        }
-        out.push(high | max_prefix as u8);
-        let mut remaining = value - max_prefix;
-        while remaining >= 128 {
-            out.push(((remaining & 0x7f) as u8) | 0x80);
-            remaining >>= 7;
-        }
-        out.push(remaining as u8);
-    }
-
-    pub(super) fn decode(buf: &[u8], prefix_bits: u8) -> Result<(u64, usize), DecoderError> {
-        if buf.is_empty() {
-            return Err(DecoderError::NeedMore);
-        }
-        let max_prefix = (1u64 << prefix_bits) - 1;
-        let mask = if prefix_bits == 8 {
-            u8::MAX
-        } else {
-            max_prefix as u8
-        };
-        let first = (buf[0] & mask) as u64;
-        if first < max_prefix {
-            return Ok((first, 1));
-        }
-        let mut value = max_prefix;
-        let mut shift = 0u32;
-        let mut pos = 1usize;
-        loop {
-            if pos >= buf.len() {
-                return Err(DecoderError::NeedMore);
-            }
-            let b = buf[pos];
-            pos += 1;
-            let chunk = (b & 0x7f) as u64;
-            let shifted = chunk.checked_shl(shift).ok_or(DecoderError::BadInteger)?;
-            value = value.checked_add(shifted).ok_or(DecoderError::BadInteger)?;
-            if b & 0x80 == 0 {
-                return Ok((value, pos));
-            }
-            shift = shift.checked_add(7).ok_or(DecoderError::BadInteger)?;
-            if shift >= 64 {
-                return Err(DecoderError::BadInteger);
-            }
         }
     }
 }

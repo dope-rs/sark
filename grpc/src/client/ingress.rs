@@ -4,7 +4,7 @@ use sark_h2::{ClientRole, Conn, ConnError, StreamId, conn};
 
 use crate::Codec;
 use crate::frame::{DataChunk, MessageFrame};
-use crate::headers::{HeaderBlock, ResponseHead};
+use crate::headers::ResponseHead;
 use crate::metadata::Metadata;
 use crate::status::{Code, Status};
 
@@ -188,8 +188,7 @@ impl Ingress {
                     end_stream,
                     trailing,
                 } if trailing => {
-                    let fields = HeaderBlock::from_h2(&headers);
-                    let (status, trailers) = Status::parse_h2_trailers(&fields)?;
+                    let (status, trailers) = Status::parse_h2_trailers(&headers)?;
                     self.finish_stream(calls, egress, stream_id, status, trailers)?;
                     if !end_stream {
                         return Err(Status::new(Code::Internal, "trailers without END_STREAM"));
@@ -201,8 +200,7 @@ impl Ingress {
                     end_stream,
                     ..
                 } => {
-                    let fields = HeaderBlock::from_h2(&headers);
-                    let head = ResponseHead::parse_h2(&fields)?;
+                    let head = ResponseHead::parse_h2(&headers)?;
                     let metadata = head.metadata;
                     let mode = self.response_mut(calls, stream_id)?.mode;
                     match mode {
@@ -215,7 +213,7 @@ impl Ingress {
                         })?,
                     }
                     if end_stream {
-                        let (status, trailers) = Status::parse_h2_trailers(&fields)?;
+                        let (status, trailers) = Status::parse_h2_trailers(&headers)?;
                         self.finish_stream(calls, egress, stream_id, status, trailers)?;
                     }
                 }

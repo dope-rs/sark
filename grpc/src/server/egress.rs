@@ -247,8 +247,7 @@ impl PendingResponse {
         stream_id: StreamId,
     ) -> Result<ResponseDrive, ()> {
         if !self.headers_sent {
-            let h2_headers = self.headers.as_h2();
-            conn.send_response(stream_id, h2_headers.iter().copied(), false)
+            conn.send_response(stream_id, self.headers.iter(), false)
                 .map_err(|_| ())?;
             self.headers_sent = true;
         }
@@ -308,8 +307,7 @@ impl PendingResponse {
         }
 
         if let Some(trailers) = &self.trailers {
-            let h2_trailers = trailers.as_h2();
-            conn.send_trailers(stream_id, &h2_trailers)
+            conn.send_trailers_fields(stream_id, trailers.iter())
                 .map_err(|_| ())?;
             Ok(ResponseDrive::Complete)
         } else {

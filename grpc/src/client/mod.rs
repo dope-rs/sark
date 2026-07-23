@@ -140,10 +140,9 @@ impl Session {
         mode: ResponseMode,
     ) -> Result<StreamId, Status> {
         let headers = HeaderBlock::for_request(path, authority, metadata)?;
-        let h2_headers = headers.as_h2();
         let stream_id = self
             .h2
-            .start_request(&h2_headers, false)
+            .start_request_fields(headers.iter(), false)
             .map_err(Status::from_conn_err)?;
         if !self.calls.insert(stream_id, mode) {
             let _ = self.h2.reset_stream(stream_id, ErrorCode::RefusedStream);

@@ -115,8 +115,10 @@ impl PendingBody {
         if self.trailers.is_empty() || self.trailers_sent {
             return Ok(());
         }
-        let fields: Vec<Header<'_>> = self.trailers.iter().map(OwnedHeader::as_ref).collect();
-        connection.send_trailers(self.stream_id, &fields)?;
+        connection.send_trailers_fields(
+            self.stream_id,
+            self.trailers.iter().map(OwnedHeader::as_ref),
+        )?;
         self.trailers_sent = true;
         Ok(())
     }

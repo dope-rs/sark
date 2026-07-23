@@ -53,9 +53,14 @@ fn configured_capacity_is_built_at_accept() {
                 let mut client = Conn::<ClientRole>::new();
                 let headers =
                     HeaderBlock::for_request(b"/svc/Method", None, &Metadata::new()).unwrap();
-                let fields = headers.as_h2();
-                assert_eq!(client.start_request(&fields, true).unwrap(), StreamId(1));
-                assert_eq!(client.start_request(&fields, true).unwrap(), StreamId(3));
+                assert_eq!(
+                    client.start_request_fields(headers.iter(), true).unwrap(),
+                    StreamId(1)
+                );
+                assert_eq!(
+                    client.start_request_fields(headers.iter(), true).unwrap(),
+                    StreamId(3)
+                );
                 transport.write_all(client.outbound()).unwrap();
                 client.drain_outbound(client.outbound().len());
 

@@ -1,7 +1,8 @@
-use sark_core::http::OwnedField;
+use sark_core::http::{FieldBlock, FieldStorage};
 use sark_h2::{ConnError, ErrorCode};
 
 use crate::frame::FrameError;
+use crate::headers::ParsedFields;
 use crate::metadata::{Metadata, MetadataError};
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -111,24 +112,34 @@ impl Status {
         Ok(Self::new(code, raw_message))
     }
 
-    pub fn write_grpc_status_value(&self, out: &mut Vec<u8>) {
+    pub fn grpc_status_value(&self) -> ([u8; 2], usize) {
         let code = self.code.as_u8();
         if code >= 10 {
-            out.push(b'1');
-            out.push(b'0' + (code - 10));
+            ([b'1', b'0' + (code - 10)], 2)
         } else {
-            out.push(b'0' + code);
+            ([b'0' + code, 0], 1)
         }
     }
 
-    pub fn encode_message(message: &str, out: &mut Vec<u8>) {
+    pub fn encoded_message_len(message: &str) -> usize {
+        message.as_bytes().iter().fold(0usize, |len, &byte| {
+            len.checked_add(if matches!(byte, b' '..=b'~') && byte != b'%' {
+                1
+            } else {
+                3
+            })
+            .expect("encoded gRPC message length overflow")
+        })
+    }
+
+    pub fn encode_message(message: &str, mut emit: impl FnMut(u8)) {
         for &b in message.as_bytes() {
             match b {
-                b' '..=b'~' if b != b'%' => out.push(b),
+                b' '..=b'~' if b != b'%' => emit(b),
                 _ => {
-                    out.push(b'%');
-                    out.push(Self::hex(b >> 4));
-                    out.push(Self::hex(b & 0x0f));
+                    emit(b'%');
+                    emit(Self::hex(b >> 4));
+                    emit(Self::hex(b & 0x0f));
                 }
             }
         }
@@ -168,24 +179,22 @@ impl Status {
         }
     }
 
-    pub fn parse_h2_trailers(headers: &[OwnedField]) -> Result<(Status, Metadata), Status> {
-        let raw_code = headers
-            .iter()
-            .find(|header| header.name == b"grpc-status")
-            .map(|header| header.value.as_slice());
+    pub fn parse_h2_trailers<S: FieldStorage>(
+        headers: &FieldBlock<S>,
+    ) -> Result<(Status, Metadata), Status> {
+        let parsed = ParsedFields::parse(headers)?;
+        let raw_code = parsed.grpc_status;
         let Some(raw_code) = raw_code else {
             return Err(Status::new(Code::Internal, "missing grpc-status"));
         };
         let Some(code) = Code::parse_ascii(raw_code) else {
             return Err(Status::new(Code::Internal, "invalid grpc-status"));
         };
-        let message = headers
-            .iter()
-            .find(|header| header.name == b"grpc-message")
-            .map(|header| Status::decode_message(&header.value))
+        let message = parsed
+            .grpc_message
+            .map(Status::decode_message)
             .unwrap_or_default();
-        let metadata = Metadata::from_h2_fields(headers)?;
-        Ok((Status::new(code, message), metadata))
+        Ok((Status::new(code, message), parsed.metadata))
     }
 
     pub fn from_metadata_err(error: MetadataError) -> Status {

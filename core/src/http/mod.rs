@@ -2,6 +2,7 @@ pub mod body_kind;
 pub mod compress;
 pub mod field;
 pub mod huffman;
+mod prefixed_int;
 mod request;
 mod response;
 pub mod scan;
@@ -21,10 +22,14 @@ pub mod __private {
     }
 }
 
-pub use field::{Field, OwnedField};
+pub use field::{
+    Field, FieldBlock, FieldStorage, FieldValueWriter, OwnedField, OwnedFieldBlock,
+    PackedFieldIter, PackedFields, PooledFieldBlock, VecFieldBlock,
+};
 pub use http::{Method, StatusCode};
 pub use huffman::{HpackHuffman, HpackHuffmanError};
 pub use o3::buffer::{Borrowed, Bytes, Retained};
+pub use prefixed_int::{PrefixedInt, PrefixedIntError};
 pub use request::PathParamRanges;
 pub use response::{
     Body, CHUNK_TERMINATOR, CacheTemplate, Chunked, DEFAULT_HEADER_CAPACITY, Egress, EncodedBody,

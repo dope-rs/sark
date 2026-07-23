@@ -33,9 +33,8 @@ fn client_buffered_stream_over_cap_is_resource_exhausted() {
     while server.poll_event().is_some() {}
 
     let resp_headers = HeaderBlock::for_response(&Metadata::new()).expect("response headers");
-    let h2_headers = resp_headers.as_h2();
     server
-        .send_response(stream_id, h2_headers.iter().copied(), false)
+        .send_response(stream_id, resp_headers.iter(), false)
         .expect("send response headers");
 
     let body = framed(15, 100);

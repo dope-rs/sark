@@ -17,14 +17,16 @@ fn unary_response_has_one_owner() {
 
     let headers = HeaderBlock::for_response(&Metadata::new()).unwrap();
     server
-        .send_response(stream_id, headers.as_h2().iter().copied(), false)
+        .send_response(stream_id, headers.iter(), false)
         .unwrap();
     let frame = MessageFrame::header(false, 8).unwrap();
     server
         .send_data_parts(stream_id, &frame, b"response", false)
         .unwrap();
     let trailers = HeaderBlock::for_trailers(&Status::ok(), &Metadata::new()).unwrap();
-    server.send_trailers(stream_id, &trailers.as_h2()).unwrap();
+    server
+        .send_trailers_fields(stream_id, trailers.iter())
+        .unwrap();
 
     client.ingest(server.outbound()).unwrap();
     assert!(client.poll_event().is_none());

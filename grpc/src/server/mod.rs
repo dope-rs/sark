@@ -1344,8 +1344,7 @@ impl<H: Handler, W: Wire> App<H, W> {
         stream_id: StreamId,
         headers: sark_h2::hpack::HeaderBlock,
     ) {
-        let fields = HeaderBlock::from_h2(&headers);
-        match RequestHead::parse_h2(&fields) {
+        match RequestHead::parse_h2(&headers) {
             Ok(head) => {
                 let mut reply = StreamReply::new();
                 let mode = self
@@ -1376,8 +1375,7 @@ impl<H: Handler, W: Wire> App<H, W> {
         stream_id: StreamId,
         headers: sark_h2::hpack::HeaderBlock,
     ) {
-        let fields = HeaderBlock::from_h2(&headers);
-        match RequestHead::parse_h2_trailers(&fields) {
+        match RequestHead::parse_h2_trailers(&headers) {
             Ok(metadata) => {
                 if let Some(stream) = state.stream_mut(stream_id) {
                     stream.trailers = metadata;
@@ -1683,20 +1681,17 @@ impl ConnState {
         self.remove_stream(stream_id);
         self.live_routes.release(stream_id);
         let headers = HeaderBlock::for_response(&Metadata::new()).ok();
-        if let Some(headers) = headers {
-            let h2_headers = headers.as_h2();
-            if self
+        if let Some(headers) = headers
+            && self
                 .h2
-                .send_response(stream_id, h2_headers.iter().copied(), false)
+                .send_response(stream_id, headers.iter(), false)
                 .is_err()
-            {
-                let _ = self.h2.reset_stream(stream_id, ErrorCode::InternalError);
-                return;
-            }
+        {
+            let _ = self.h2.reset_stream(stream_id, ErrorCode::InternalError);
+            return;
         }
         if let Ok(trailers) = HeaderBlock::for_trailers(&status, &Metadata::new()) {
-            let h2_trailers = trailers.as_h2();
-            let _ = self.h2.send_trailers(stream_id, &h2_trailers);
+            let _ = self.h2.send_trailers_fields(stream_id, trailers.iter());
         }
     }
 }

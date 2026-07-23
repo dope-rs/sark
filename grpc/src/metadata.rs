@@ -64,19 +64,6 @@ impl Metadata {
         Ok(())
     }
 
-    pub fn from_h2_fields(headers: &[OwnedField]) -> Result<Metadata, Status> {
-        let mut metadata = Metadata::new();
-        for header in headers {
-            if header.name.starts_with(b":") || Self::is_reserved(&header.name) {
-                continue;
-            }
-            metadata
-                .push(&header.name, &header.value)
-                .map_err(Status::from_metadata_err)?;
-        }
-        Ok(metadata)
-    }
-
     pub(super) fn is_reserved(name: &[u8]) -> bool {
         matches!(
             name,
@@ -84,6 +71,3 @@ impl Metadata {
         )
     }
 }
-use sark_core::http::OwnedField;
-
-use crate::status::Status;

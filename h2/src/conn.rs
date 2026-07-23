@@ -652,10 +652,21 @@ impl<R: Role> Conn<R> {
         stream_id: StreamId,
         headers: &[hpack::Header<'_>],
     ) -> Result<(), ConnError> {
+        self.send_trailers_fields(stream_id, headers.iter().copied())
+    }
+
+    pub fn send_trailers_fields<'a, I>(
+        &mut self,
+        stream_id: StreamId,
+        headers: I,
+    ) -> Result<(), ConnError>
+    where
+        I: IntoIterator<Item = hpack::Header<'a>>,
+    {
         if !self.has_stream(stream_id) {
             return Err(ConnError::BadStream);
         }
-        self.emit_headers(stream_id, headers.iter().copied(), true)?;
+        self.emit_headers(stream_id, headers, true)?;
         self.advance_stream(
             stream_id,
             stream::Event::Headers { end_stream: true },
@@ -1397,6 +1408,17 @@ impl Conn<crate::role::ClientRole> {
         headers: &[hpack::Header<'_>],
         end_stream: bool,
     ) -> Result<StreamId, ConnError> {
+        self.start_request_fields(headers.iter().copied(), end_stream)
+    }
+
+    pub fn start_request_fields<'a, I>(
+        &mut self,
+        headers: I,
+        end_stream: bool,
+    ) -> Result<StreamId, ConnError>
+    where
+        I: IntoIterator<Item = hpack::Header<'a>>,
+    {
         if self.goaway_received.is_some() || self.goaway_sent {
             return Err(ConnError::StreamGoneAway);
         }
@@ -1406,7 +1428,7 @@ impl Conn<crate::role::ClientRole> {
         let id = self.streams.next_local_id().ok_or(ConnError::StreamLimit)?;
         self.track_stream(Stream::new(id))
             .map_err(|_| ConnError::StreamLimit)?;
-        self.emit_headers(id, headers.iter().copied(), end_stream)?;
+        self.emit_headers(id, headers, end_stream)?;
         self.advance_stream(id, stream::Event::Headers { end_stream }, Side::Local)
             .map_err(|_| ConnError::Protocol)?;
         Ok(id)
