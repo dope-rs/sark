@@ -1,7 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use sark::dispatch::Decode;
-use sark_core::http::{Field, OwnedField};
+use sark_core::http::{Field, VecFieldBlock};
 use sark_h3::dope::H3Encoder;
 use sark_h3::{Conn, Event, Role, StreamId, StreamTransport, pump_stream_event, pump_writes};
 
@@ -12,13 +12,20 @@ struct Reply {
 }
 
 #[sark_gen::request]
-struct JsonReq {}
+struct JsonReq {
+    #[header("x-name", default = "none")]
+    name: sark_core::http::Bytes<sark_core::http::Retained>,
+}
 
 #[sark_gen::handler]
-fn json_h(_req: JsonReq, _state: &sark::EmptyState) -> Reply {
+fn json_h(req: JsonReq, _state: &sark::EmptyState) -> Reply {
     Reply {
         status: http::StatusCode::OK,
-        body: b"hello-h3",
+        body: if req.name.as_slice() == b"alice" {
+            b"hello-h3"
+        } else {
+            b"missing-header"
+        },
     }
 }
 
@@ -85,6 +92,7 @@ fn h3_request_routes_and_responds() {
                 Field::new(b":scheme", b"https"),
                 Field::new(b":authority", b"x"),
                 Field::new(b":path", b"/json"),
+                Field::new(b"x-name", b"alice"),
             ],
             true,
         )
@@ -98,7 +106,7 @@ fn h3_request_routes_and_responds() {
     wire.recv_fin.insert(0);
     pump_stream_event(&mut server, &mut wire, 0).unwrap();
 
-    let mut pending: Option<(StreamId, Vec<OwnedField>)> = None;
+    let mut pending: Option<(StreamId, VecFieldBlock)> = None;
     let mut routed = false;
     while let Some(ev) = server.poll_event() {
         match ev {
@@ -114,8 +122,8 @@ fn h3_request_routes_and_responds() {
                         continue;
                     }
                     let start = head.len();
-                    head.extend_from_slice(&f.value);
-                    pairs.push((f.name.as_slice(), start..head.len()));
+                    head.extend_from_slice(f.value);
+                    pairs.push((f.name, start..head.len()));
                 }
                 let mut enc = H3Encoder::new(&mut server, stream_id);
                 let out =

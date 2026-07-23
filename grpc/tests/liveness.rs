@@ -56,10 +56,8 @@ fn tls_config() -> TlsConfig {
         source: CertSource::RawPublicKey {
             signing_key: SigningKey::from_seed(&SEED).expect("signing key"),
         },
-        transport_params: Vec::new(),
         alpn_protocols: Vec::new(),
         ticket_keys: None,
-        accept_early_data: false,
     }
 }
 

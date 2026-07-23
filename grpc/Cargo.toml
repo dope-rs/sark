@@ -9,7 +9,7 @@ license.workspace = true
 
 [dependencies]
 o3.workspace = true
-shin = "0.10"
+shin = "0.11"
 sark-core.workspace = true
 sark-h2.workspace = true
 dope.workspace = true

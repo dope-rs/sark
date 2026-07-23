@@ -290,6 +290,16 @@ impl HpackHuffman {
     }
 
     pub fn decode(input: &[u8], out: &mut Vec<u8>) -> Result<(), HpackHuffmanError> {
+        Self::decode_with(input, |byte| {
+            out.push(byte);
+            Ok(())
+        })
+    }
+
+    pub fn decode_with(
+        input: &[u8],
+        mut emit: impl FnMut(u8) -> Result<(), HpackHuffmanError>,
+    ) -> Result<(), HpackHuffmanError> {
         let mut buffer: u64 = 0;
         let mut bits_in: u32 = 0;
         let total_bits: u64 = (input.len() as u64) * 8;
@@ -315,7 +325,7 @@ impl HpackHuffman {
                     if consumed_bits + len as u64 > total_bits {
                         return Err(HpackHuffmanError);
                     }
-                    out.push(sym as u8);
+                    emit(sym as u8)?;
                     bits_in -= len;
                     consumed_bits += len as u64;
                     buffer &= (1u64 << bits_in) - 1;

@@ -1,4 +1,4 @@
-use sark_core::http::{Field, OwnedFieldBlock, PooledFieldBlock};
+use sark_core::http::{Field, OwnedFieldBlock, PooledFieldBlock, VecFieldBlock};
 
 #[test]
 fn owned_and_packed_storage_expose_the_same_fields() {
@@ -30,5 +30,46 @@ fn packed_blocks_append_without_repacking() {
             Field::new(b":status", b"200"),
             Field::new(b"grpc-status", b"0"),
         ]
+    );
+}
+
+#[test]
+fn generated_parts_are_written_directly_and_rollback_on_error() {
+    let mut fields = VecFieldBlock::new();
+    fields
+        .try_push_parts::<()>(
+            |name| {
+                name.extend_from_slice(b"x-generated");
+                Ok(())
+            },
+            |value, _| {
+                value.extend_from_slice(b"direct");
+                Ok(())
+            },
+        )
+        .unwrap();
+
+    let error = fields.try_push_parts(
+        |name| {
+            name.extend_from_slice(b"x-broken");
+            Ok(())
+        },
+        |value, _| {
+            value.extend_from_slice(b"partial");
+            Err("decode failed")
+        },
+    );
+
+    assert_eq!(error, Err("decode failed"));
+    assert_eq!(
+        fields.iter().collect::<Vec<_>>(),
+        [Field::new(b"x-generated", b"direct")]
+    );
+    assert_eq!(
+        fields
+            .iter_with_value_ranges()
+            .map(|(field, range)| (field, &fields.as_bytes()[range]))
+            .collect::<Vec<_>>(),
+        [(Field::new(b"x-generated", b"direct"), b"direct".as_slice())]
     );
 }

@@ -140,63 +140,48 @@ where
     listener: Listener<'d, 0, A, E>,
 }
 
-macro_rules! launch {
-    ($handler:expr, $session:ident, $listener:ident, $app:ty, $env:ty $(, $endpoint:expr)?) => {{
-        let hash_builder = $session
-            .seed()
-            .derive(dope::hash::domain::ACCEPT)
-            .state();
-        let listener = {
-            let mut driver = $session.driver_access();
-            Listener::<0, $app, $env>::open_in(
-                $handler,
-                $listener,
-                hash_builder,
-                &mut driver,
-            )?
-        };
-        $(let mut listener = listener;
-        listener.set_config($endpoint);)?
-        let app = core::pin::pin!(o3::cell::BrandCell::new(Server { listener }));
-        $session.run(app.as_ref())
-    }};
-}
-
-macro_rules! server {
-    ($(#[$attr:meta])* $name:ident, [$($bound:tt)*], $asynchronous:literal, $app:ident, $wire:ty, $env:ty $(, tls $tls_config:ident: $tls_type:ty => $endpoint:expr)?) => {
-        $(#[$attr])*
-        pub fn $name<H>(
-            handler: H,
-            config: Config,
-            $($tls_config: $tls_type,)?
-            context: WorkerContext,
-            shutdown: Option<&ShutdownTrigger>,
-        ) -> io::Result<()>
-        where
-            H: $($bound)*,
-        {
-            run(
-                handler,
-                config,
-                $asynchronous,
-                context,
-                shutdown,
-                |handler, mut session, listener_config, config| {
-                    launch!(
-                        $app::new(handler, config),
-                        session,
-                        listener_config,
-                        $app<H, $wire>,
-                        $env
-                        $(, $endpoint)?
-                    )
-                },
-            )
-        }
+fn start<'scope, 'd, A, E, S>(
+    app: A,
+    mut session: Session<'scope, 'd, S>,
+    listener_config: listener::Config<Tcp>,
+    wire_config: <A::Wire as dope_net::wire::Wire>::InitConfig,
+) -> io::Result<()>
+where
+    A: Application<'d>,
+    E: ManifoldEnv<Transport = Tcp, Wire = A::Wire>,
+{
+    let hash_builder = session.seed().derive(dope::hash::domain::ACCEPT).state();
+    let listener = {
+        let mut driver = session.driver_access();
+        Listener::<0, A, E>::open_in_with_wire(
+            app,
+            listener_config,
+            wire_config,
+            hash_builder,
+            &mut driver,
+        )?
     };
+    let server = core::pin::pin!(o3::cell::BrandCell::new(Server { listener }));
+    session.run(server.as_ref())
 }
 
-server!(serve, [Handler], true, App, Identity, Env);
+pub fn serve<H: Handler>(
+    handler: H,
+    config: Config,
+    context: WorkerContext,
+    shutdown: Option<&ShutdownTrigger>,
+) -> io::Result<()> {
+    run(
+        handler,
+        config,
+        true,
+        context,
+        shutdown,
+        |handler, session, listener, config| {
+            start::<App<H>, Env, _>(App::new(handler, config), session, listener, ())
+        },
+    )
+}
 
 pub fn serve_async<H: Handler>(
     handler: H,
@@ -207,53 +192,127 @@ pub fn serve_async<H: Handler>(
     serve(handler, config, context, shutdown)
 }
 
-server!(
-    serve_sync,
-    [Fn(Request) -> Response + 'static],
-    false,
-    SyncApp,
-    Identity,
-    Env
-);
-server!(
-    serve_tls,
-    [Handler],
-    true,
-    App,
-    Tls,
-    TlsEnv,
-    tls tls_config: shin::server::Config => Endpoint::Server(Box::new(tls_config))
-);
-server!(
-    serve_tls_sync,
-    [Fn(Request) -> Response + 'static],
-    false,
-    SyncApp,
-    Tls,
-    TlsEnv,
-    tls tls_config: shin::server::Config => Endpoint::Server(Box::new(tls_config))
-);
+pub fn serve_sync<H>(
+    handler: H,
+    config: Config,
+    context: WorkerContext,
+    shutdown: Option<&ShutdownTrigger>,
+) -> io::Result<()>
+where
+    H: Fn(Request) -> Response + 'static,
+{
+    run(
+        handler,
+        config,
+        false,
+        context,
+        shutdown,
+        |handler, session, listener, config| {
+            start::<SyncApp<H>, Env, _>(SyncApp::new(handler, config), session, listener, ())
+        },
+    )
+}
+
+pub fn serve_tls<H: Handler>(
+    handler: H,
+    config: Config,
+    tls_config: shin::server::Config,
+    context: WorkerContext,
+    shutdown: Option<&ShutdownTrigger>,
+) -> io::Result<()> {
+    let endpoint = Endpoint::server(tls_config).map_err(io::Error::other)?;
+    run(
+        handler,
+        config,
+        true,
+        context,
+        shutdown,
+        move |handler, session, listener, config| {
+            start::<App<H, Tls>, TlsEnv, _>(App::new(handler, config), session, listener, endpoint)
+        },
+    )
+}
+
+pub fn serve_tls_sync<H>(
+    handler: H,
+    config: Config,
+    tls_config: shin::server::Config,
+    context: WorkerContext,
+    shutdown: Option<&ShutdownTrigger>,
+) -> io::Result<()>
+where
+    H: Fn(Request) -> Response + 'static,
+{
+    let endpoint = Endpoint::server(tls_config).map_err(io::Error::other)?;
+    run(
+        handler,
+        config,
+        false,
+        context,
+        shutdown,
+        move |handler, session, listener, config| {
+            start::<SyncApp<H, Tls>, TlsEnv, _>(
+                SyncApp::new(handler, config),
+                session,
+                listener,
+                endpoint,
+            )
+        },
+    )
+}
 
 #[cfg(feature = "rustls")]
 pub type RustlsTlsEnv = Bundle<Tcp, dope_tls::rustls::RustTls, Throughput>;
 
-server!(
-    #[cfg(feature = "rustls")]
-    serve_tls_rustls,
-    [Handler],
-    true,
-    App,
-    dope_tls::rustls::RustTls,
-    RustlsTlsEnv,
-    tls tls_config: std::sync::Arc<rustls::ServerConfig> => dope_tls::rustls::RustTlsEndpoint::Server(tls_config)
-);
-server!(
-    #[cfg(feature = "rustls")]
-    serve_tls_rustls_sync,
-    [Fn(Request) -> Response + 'static],
-    false,
-    SyncApp,
-    dope_tls::rustls::RustTls,
-    RustlsTlsEnv,
-    tls tls_config: std::sync::Arc<rustls::ServerConfig> => dope_tls::rustls::RustTlsEndpoint::Server(tls_config)
-);
+#[cfg(feature = "rustls")]
+pub fn serve_tls_rustls<H: Handler>(
+    handler: H,
+    config: Config,
+    tls_config: std::sync::Arc<rustls::ServerConfig>,
+    context: WorkerContext,
+    shutdown: Option<&ShutdownTrigger>,
+) -> io::Result<()> {
+    run(
+        handler,
+        config,
+        true,
+        context,
+        shutdown,
+        move |handler, session, listener, config| {
+            start::<App<H, dope_tls::rustls::RustTls>, RustlsTlsEnv, _>(
+                App::new(handler, config),
+                session,
+                listener,
+                dope_tls::rustls::RustTlsEndpoint::Server(tls_config),
+            )
+        },
+    )
+}
+
+#[cfg(feature = "rustls")]
+pub fn serve_tls_rustls_sync<H>(
+    handler: H,
+    config: Config,
+    tls_config: std::sync::Arc<rustls::ServerConfig>,
+    context: WorkerContext,
+    shutdown: Option<&ShutdownTrigger>,
+) -> io::Result<()>
+where
+    H: Fn(Request) -> Response + 'static,
+{
+    run(
+        handler,
+        config,
+        false,
+        context,
+        shutdown,
+        move |handler, session, listener, config| {
+            start::<SyncApp<H, dope_tls::rustls::RustTls>, RustlsTlsEnv, _>(
+                SyncApp::new(handler, config),
+                session,
+                listener,
+                dope_tls::rustls::RustTlsEndpoint::Server(tls_config),
+            )
+        },
+    )
+}

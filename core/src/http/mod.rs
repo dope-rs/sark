@@ -24,7 +24,7 @@ pub mod __private {
 
 pub use field::{
     Field, FieldBlock, FieldStorage, FieldValueWriter, OwnedField, OwnedFieldBlock,
-    PackedFieldIter, PackedFields, PooledFieldBlock, VecFieldBlock,
+    PackedFieldIter, PackedFieldRangeIter, PackedFields, PooledFieldBlock, VecFieldBlock,
 };
 pub use http::{Method, StatusCode};
 pub use huffman::{HpackHuffman, HpackHuffmanError};

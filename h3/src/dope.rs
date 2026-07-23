@@ -211,7 +211,7 @@ impl sark::dispatch::ResponseEncoder for H3Encoder<'_> {
 
 #[derive(Default)]
 struct Pending {
-    fields: Option<Vec<sark::sark_core::http::OwnedField>>,
+    fields: Option<sark::sark_core::http::VecFieldBlock>,
     body: Vec<u8>,
 }
 
@@ -244,26 +244,30 @@ impl<R: sark::dispatch::Decode> Server<R> {
             return;
         };
         let mut method: Option<sark::sark_core::http::Method> = None;
-        let mut path: Option<Vec<u8>> = None;
-        let mut head: Vec<u8> = Vec::new();
+        let mut path: Option<&[u8]> = None;
         let mut pairs: Vec<(&[u8], core::ops::Range<usize>)> = Vec::new();
-        for field in &fields {
-            let name = field.name.as_slice();
+        for (field, value_range) in fields.iter_with_value_ranges() {
+            let name = field.name;
             if name == b":method" {
-                method = sark::sark_core::http::Method::from_bytes(&field.value).ok();
+                method = sark::sark_core::http::Method::from_bytes(field.value).ok();
             } else if name == b":path" {
-                path = Some(field.value.clone());
+                path = Some(field.value);
             } else if name.first() != Some(&b':') {
-                let start = head.len();
-                head.extend_from_slice(&field.value);
-                pairs.push((name, start..head.len()));
+                pairs.push((name, value_range));
             }
         }
         let (Some(method), Some(path)) = (method, path) else {
             return;
         };
         let mut encoder = H3Encoder::new(h3.h3_mut(), stream_id);
-        let _ = router.dispatch_decoded(method, &path, &pairs, &head, &pending.body, &mut encoder);
+        let _ = router.dispatch_decoded(
+            method,
+            path,
+            &pairs,
+            fields.as_bytes(),
+            &pending.body,
+            &mut encoder,
+        );
     }
 }
 
@@ -300,17 +304,21 @@ impl<R: sark::dispatch::Decode> dope_quic::Handler for Server<R> {
         while let Some(event) = session.h3.poll_event() {
             match event {
                 Event::Headers {
-                    stream_id, fields, ..
+                    stream_id,
+                    fields,
+                    trailing,
                 } => {
-                    session.pending.entry(stream_id.0).or_default().fields = Some(fields);
+                    if !trailing {
+                        session.pending.entry(stream_id.0).or_default().fields = Some(fields);
+                    }
                 }
                 Event::Data { stream_id, data } => {
-                    session
-                        .pending
-                        .entry(stream_id.0)
-                        .or_default()
-                        .body
-                        .extend_from_slice(&data);
+                    let body = &mut session.pending.entry(stream_id.0).or_default().body;
+                    if body.is_empty() {
+                        *body = data;
+                    } else {
+                        body.extend_from_slice(&data);
+                    }
                 }
                 Event::Finished { stream_id } => {
                     if let Some(pending) = session.pending.remove(&stream_id.0) {

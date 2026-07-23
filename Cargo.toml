@@ -26,12 +26,12 @@ license = "MIT"
 authors = ["inq <gofiri@gmail.com>"]
 
 [workspace.dependencies]
-dope = "0.10.1"
-dope-net = "0.10"
-dope-extra = "0.10"
-dope-fiber = "0.10"
-dope-gen = "0.10.1"
-dope-tls = "0.15"
+dope = "0.11.0"
+dope-net = "0.11"
+dope-extra = "0.11"
+dope-fiber = "0.11"
+dope-gen = "0.11.0"
+dope-tls = "0.16"
 o3 = "0.7"
 pin-project = "1"
 pin-project-lite = "0.2"

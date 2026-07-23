@@ -101,7 +101,9 @@ impl TlsClient {
         if n == 0 {
             return 0;
         }
-        self.state.read_tcp(&chunk[..n]).expect("read_tcp");
+        self.state
+            .read_client_tcp(&chunk[..n])
+            .expect("read_client_tcp");
         while let Some(app) = self.state.pull_app() {
             self.plain.extend_from_slice(app.as_ref());
         }
@@ -180,19 +182,24 @@ fn assert_big(resp: &[u8]) {
 }
 
 fn server(bind: std::net::SocketAddr) -> support::TestHttpsServer {
-    support::https_server(
-        bind,
-        Duration::from_secs(10),
-        shin::server::Config {
-            source: shin::server::CertSource::RawPublicKey {
-                signing_key: SigningKey::from_seed(&SEED).expect("signing key"),
-            },
-            transport_params: Vec::new(),
-            alpn_protocols: Vec::new(),
-            ticket_keys: None,
-            accept_early_data: false,
+    support::https_server(bind, Duration::from_secs(10))
+}
+
+fn tls_config() -> shin::server::Config {
+    shin::server::Config {
+        source: shin::server::CertSource::RawPublicKey {
+            signing_key: SigningKey::from_seed(&SEED).expect("signing key"),
         },
-    )
+        alpn_protocols: Vec::new(),
+        ticket_keys: None,
+    }
+}
+
+#[test]
+fn https_server_topology_is_send_and_clone_without_tls_state() {
+    fn assert_send_and_clone<T: Send + Clone>() {}
+
+    assert_send_and_clone::<support::TestHttpsServer>();
 }
 
 #[test]
@@ -209,7 +216,7 @@ fn https_streams_large_body() {
                 executor.enter(|mut session| {
                     let timer =
                         sark::Timer::with_capacity(support::MAX_CONNECTIONS.saturating_mul(2));
-                    server.clone().serve(
+                    server.serve(
                         &mut session,
                         TlsDispatch::new(
                             &(),
@@ -219,6 +226,7 @@ fn https_streams_large_body() {
                                 task_capacity: support::MAX_CONNECTIONS,
                             },
                         ),
+                        tls_config(),
                         Some(trigger),
                     )
                 })
@@ -247,7 +255,7 @@ fn https_keepalive_serves_two_requests() {
                 executor.enter(|mut session| {
                     let timer =
                         sark::Timer::with_capacity(support::MAX_CONNECTIONS.saturating_mul(2));
-                    server.clone().serve(
+                    server.serve(
                         &mut session,
                         TlsDispatch::new(
                             &(),
@@ -257,6 +265,7 @@ fn https_keepalive_serves_two_requests() {
                                 task_capacity: support::MAX_CONNECTIONS,
                             },
                         ),
+                        tls_config(),
                         Some(trigger),
                     )
                 })

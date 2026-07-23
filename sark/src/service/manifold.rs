@@ -41,23 +41,6 @@ pub trait NativeResponse<'req>: Sized {
     fn into_route_response(self) -> Self::Shape;
 }
 
-macro_rules! native_response {
-    ($ty:ty, $body_kind:ident) => {
-        impl<'req> NativeResponse<'req> for $ty {
-            type Kind = Sync;
-            type Shape = Self;
-            type Stream = sark_core::http::NeverStream;
-
-            const BODY_KIND: sark_core::http::body_kind::ResponseKind =
-                sark_core::http::body_kind::ResponseKind::$body_kind;
-
-            fn into_route_response(self) -> Self::Shape {
-                self
-            }
-        }
-    };
-}
-
 impl<'req, S> NativeResponse<'req> for Stream<S>
 where
     S: 'static,
@@ -74,7 +57,18 @@ where
     }
 }
 
-native_response!(Chunked, Inline);
+impl<'req> NativeResponse<'req> for Chunked {
+    type Kind = Sync;
+    type Shape = Self;
+    type Stream = sark_core::http::NeverStream;
+
+    const BODY_KIND: sark_core::http::body_kind::ResponseKind =
+        sark_core::http::body_kind::ResponseKind::Inline;
+
+    fn into_route_response(self) -> Self::Shape {
+        self
+    }
+}
 
 impl<'req, const N: usize> NativeResponse<'req> for Serve<'req, N> {
     type Kind = Sync;

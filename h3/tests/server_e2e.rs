@@ -1,6 +1,6 @@
 use std::time::Instant;
 
-use dope_quic::{Conn, ConnHandle, Handler, conn, transport_params};
+use dope_quic::{Conn, ConnHandle, Handler, ServerConn, conn, transport_params};
 use ring::rand::{SecureRandom, SystemRandom};
 use sark_core::http::Field;
 use sark_h3::dope::{Server, Session};
@@ -48,7 +48,7 @@ fn config() -> conn::Config {
     }
 }
 
-fn pair() -> (Conn, Conn) {
+fn pair() -> (ServerConn, Conn) {
     let mut seed = [0u8; 32];
     SystemRandom::new().fill(&mut seed).unwrap();
     let signing = SigningKey::from_seed(&seed).unwrap();
@@ -58,15 +58,21 @@ fn pair() -> (Conn, Conn) {
     let mut client = Conn::new_client(CID.to_vec(), CID.to_vec(), server_pubkey, config()).unwrap();
     let now = Instant::now();
     for _ in 0..3 {
-        drain(&mut client, &mut server, now);
-        drain(&mut server, &mut client, now);
+        drain_client(&mut client, &mut server, now);
+        drain_server(&mut server, &mut client, now);
     }
     assert!(client.is_established());
     assert!(server.is_established());
     (server, client)
 }
 
-fn drain(from: &mut Conn, into: &mut Conn, now: Instant) {
+fn drain_client(from: &mut Conn, into: &mut ServerConn, now: Instant) {
+    for pkt in from.send_packets(now) {
+        into.recv_packet(&pkt, now).expect("recv");
+    }
+}
+
+fn drain_server(from: &mut ServerConn, into: &mut Conn, now: Instant) {
     for pkt in from.send_packets(now) {
         into.recv_packet(&pkt, now).expect("recv");
     }
@@ -99,11 +105,11 @@ fn server_handler_routes_over_quic() {
     client.start_control_stream(&mut client_quic).unwrap();
 
     let now = Instant::now();
-    drain(&mut client_quic, &mut server_quic, now);
+    drain_client(&mut client_quic, &mut server_quic, now);
     while let Some(event) = server_quic.poll_stream_event() {
         server.stream_event(&mut server_quic, handle, event);
     }
-    drain(&mut server_quic, &mut client_quic, now);
+    drain_server(&mut server_quic, &mut client_quic, now);
     pump_client(&mut client, &mut client_quic);
 
     assert!(matches!(client.poll_event(), Some(Event::Settings(_))));
@@ -118,16 +124,24 @@ fn server_handler_routes_over_quic() {
                 Field::new(b":scheme", b"https"),
                 Field::new(b":path", b"/json"),
             ],
+            false,
+        )
+        .unwrap();
+    client
+        .h3_mut()
+        .send_headers(
+            StreamId::new(stream_id),
+            [Field::new(b"x-request-finished", b"true")],
             true,
         )
         .unwrap();
     client.flush(&mut client_quic).unwrap();
 
-    drain(&mut client_quic, &mut server_quic, now);
+    drain_client(&mut client_quic, &mut server_quic, now);
     while let Some(event) = server_quic.poll_stream_event() {
         server.stream_event(&mut server_quic, handle, event);
     }
-    drain(&mut server_quic, &mut client_quic, now);
+    drain_server(&mut server_quic, &mut client_quic, now);
     pump_client(&mut client, &mut client_quic);
 
     let mut status_ok = false;

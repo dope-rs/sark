@@ -152,13 +152,13 @@ impl Config {
                 if let Some(trigger) = shutdown {
                     trigger.try_register(&mut driver)?;
                 }
-                let mut listener = Listener::<0, App<H, Tls>, TlsEnv>::open_in(
+                let listener = Listener::<0, App<H, Tls>, TlsEnv>::open_in_with_wire(
                     App::with_config(handler, self.grpc.clone()),
                     self.listener_config(self.bind),
+                    Endpoint::server(tls_cfg).map_err(io::Error::other)?,
                     accept_hash,
                     &mut driver,
                 )?;
-                listener.set_config(Endpoint::Server(Box::new(tls_cfg)));
                 let readiness = match self.readiness {
                     Some(addr) => Some(Listener::<1, liveness::Liveness, Env>::open_in(
                         liveness::Liveness,

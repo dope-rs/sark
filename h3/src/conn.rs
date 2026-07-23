@@ -1,6 +1,6 @@
 use std::collections::{BTreeMap, VecDeque};
 
-use sark_core::http::{Field, OwnedField};
+use sark_core::http::{Field, VecFieldBlock};
 
 use crate::frame::{
     ErrorCode, Frame, ParseError, STREAM_TYPE_CONTROL, STREAM_TYPE_QPACK_DECODER,
@@ -41,7 +41,7 @@ pub enum Event {
     Settings(Settings),
     Headers {
         stream_id: StreamId,
-        fields: Vec<OwnedField>,
+        fields: VecFieldBlock,
         trailing: bool,
     },
     Data {
@@ -51,7 +51,7 @@ pub enum Event {
     PushPromise {
         stream_id: StreamId,
         push_id: u64,
-        fields: Vec<OwnedField>,
+        fields: VecFieldBlock,
     },
     CancelPush {
         push_id: u64,
@@ -73,7 +73,7 @@ pub enum Event {
     PushHeaders {
         stream_id: StreamId,
         push_id: u64,
-        fields: Vec<OwnedField>,
+        fields: VecFieldBlock,
         trailing: bool,
     },
     PushData {
@@ -420,7 +420,7 @@ impl Conn {
         stream_id: StreamId,
         block: &[u8],
         blocked: &mut Option<u64>,
-    ) -> Result<Option<Vec<OwnedField>>, ConnError> {
+    ) -> Result<Option<VecFieldBlock>, ConnError> {
         match self.qpack_decoder.decode_or_blocked(block)? {
             DecodeOutcome::Ready {
                 fields,

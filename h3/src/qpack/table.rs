@@ -71,15 +71,16 @@ impl DynamicTable {
         let Some(field) = self.get_relative(relative) else {
             return Err(DecoderError::InvalidReference);
         };
+        let field = OwnedField::from(field);
         self.insert(field)
     }
 
-    pub fn get_relative(&self, relative: u64) -> Option<OwnedField> {
+    pub fn get_relative(&self, relative: u64) -> Option<Field<'_>> {
         let index = usize::try_from(relative).ok()?;
-        self.entries.get(index).cloned()
+        self.entries.get(index).map(OwnedField::as_ref)
     }
 
-    pub fn get_absolute(&self, absolute: u64) -> Option<OwnedField> {
+    pub fn get_absolute(&self, absolute: u64) -> Option<Field<'_>> {
         if absolute >= self.insert_count {
             return None;
         }
@@ -87,7 +88,7 @@ impl DynamicTable {
         self.get_relative(relative)
     }
 
-    pub fn get_relative_to_base(&self, base: u64, relative: u64) -> Option<OwnedField> {
+    pub fn get_relative_to_base(&self, base: u64, relative: u64) -> Option<Field<'_>> {
         let absolute = base.checked_sub(relative)?.checked_sub(1)?;
         self.get_absolute(absolute)
     }

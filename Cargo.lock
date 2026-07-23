@@ -75,9 +75,9 @@ dependencies = [
 
 [[package]]
 name = "base64"
-version = "0.22.1"
+version = "0.23.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "72b3254f16251a8381aa12e40e3c4d2f0199f8c6508fbecb9d91f575e0fbb8c6"
+checksum = "b25655df2c3cdd83c5e5b293b88acd880332b2ddadd7c30ac43144fdc0033da9"
 
 [[package]]
 name = "base64ct"
@@ -108,9 +108,9 @@ checksum = "fc652a48c352aef3ea3aed32080501cf3ef6ed5da78602a020c991775b0aff04"
 
 [[package]]
 name = "cartel-core"
-version = "0.7.1"
+version = "0.8.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "26573b5b91321f14656f28686ce5008fd2a8563c823a2352d17c95cc52bf743d"
+checksum = "a302dfc4bd70f50eb8bb664b584f1f2e486ff0d8798f8778241ef0d1cede1a88"
 dependencies = [
  "dope",
  "dope-fiber",
@@ -121,9 +121,9 @@ dependencies = [
 
 [[package]]
 name = "cartel-gen"
-version = "0.7.1"
+version = "0.8.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "917491fa3fa3a2a8e7b6fa90578245f4cbfa4982b8a2ae3b7dea5c4264f0baba"
+checksum = "9f4bb72a8fccb110444a748d2d40926b92f1b1c3bdb46c36def40e6cbe52e0fe"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -132,9 +132,9 @@ dependencies = [
 
 [[package]]
 name = "cartel-pg"
-version = "0.7.1"
+version = "0.8.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c47e93f4ef79576b8c164d138da9ac235a00413929f70008d2497a4e304566dd"
+checksum = "ffd6dc59c4a0fc58fe684da368cbc364103c545881ecfcfc002b79fc1679b82c"
 dependencies = [
  "base64",
  "cartel-core",
@@ -154,9 +154,9 @@ dependencies = [
 
 [[package]]
 name = "cartel-redis"
-version = "0.7.1"
+version = "0.8.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "be60d9ce981a7eff8dc9f144ebfc5d3470afb1fee4d5793e62bc57524300c7c4"
+checksum = "ae554c2ab92d08cb13590d865cb93ac46458b26c7276f70bb79a93b59ae6298b"
 dependencies = [
  "cartel-core",
  "dope",
@@ -362,9 +362,9 @@ dependencies = [
 
 [[package]]
 name = "dope"
-version = "0.10.1"
+version = "0.11.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6663a539a09f44d07118448ba03d59b046b79562c18fede947da3b7508ec0299"
+checksum = "fb3557af6751f993f142cc01e1cc0e2482e2a5c72d16089308e0037447d22177"
 dependencies = [
  "dope-core",
  "dope-net",
@@ -377,9 +377,9 @@ dependencies = [
 
 [[package]]
 name = "dope-core"
-version = "0.10.1"
+version = "0.11.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2104900dd32d21d301cbd99ccddad3f415254771bb5b8d44d383a3eb745a8a67"
+checksum = "f357526c69523da2a841c4cbb6a5153f1762c8252816e2d3edb6c2f05f30f537"
 dependencies = [
  "io-uring",
  "libc",
@@ -388,9 +388,9 @@ dependencies = [
 
 [[package]]
 name = "dope-extra"
-version = "0.10.1"
+version = "0.11.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "94647608fed6eb5e17535b55c6286eef0b80845f9b41524c21038da142aedf91"
+checksum = "bc13c7202119179aa2313ce338f98a9630e4e4519dd2608b182bd745d15d9220"
 dependencies = [
  "dope",
  "dope-fiber",
@@ -401,9 +401,9 @@ dependencies = [
 
 [[package]]
 name = "dope-fiber"
-version = "0.10.1"
+version = "0.11.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d50c35cdb19132f793b6f9336f8b03fc4834bf784a1d27ae78a0188b29b19d4a"
+checksum = "dae026398e82d5f004a7077896244219a0e06df38af7f6bca7232f78cf7704e8"
 dependencies = [
  "dope",
  "dope-core",
@@ -416,9 +416,9 @@ dependencies = [
 
 [[package]]
 name = "dope-gen"
-version = "0.10.1"
+version = "0.11.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e89740008a1e53b02e40f03230a58bb15279815b1f9a1f78d7e52abb4d8fcce0"
+checksum = "cf11fa894093e6fb18654ccec9626166449c3ff81784aa1d62bd5b8be9888d63"
 dependencies = [
  "proc-macro-crate",
  "proc-macro2",
@@ -428,9 +428,9 @@ dependencies = [
 
 [[package]]
 name = "dope-net"
-version = "0.10.1"
+version = "0.11.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "973e9149845585c95c211a4489f860c3c4af73be591e110e9ece6b2ca144ab53"
+checksum = "13b3b9f6d01bce46b39155d4be6b27c144a0dd5505eef6bf686ab84e7a5d0746"
 dependencies = [
  "dope-core",
  "libc",
@@ -439,13 +439,11 @@ dependencies = [
 
 [[package]]
 name = "dope-quic"
-version = "0.8.0"
+version = "0.9.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "865100831ff076fb4f19fbae9d86cd741cc7277b06f2002fca51e6394c6f4dbb"
+checksum = "f7eb0a5c1ee26f29c0384a7b53648370f08ce1d5dcb77b5864312a69610cdb5e"
 dependencies = [
  "dope",
- "dope-gen",
- "dope-tls",
  "o3",
  "pin-project",
  "ring",
@@ -455,9 +453,9 @@ dependencies = [
 
 [[package]]
 name = "dope-tls"
-version = "0.15.0"
+version = "0.16.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "dc4f6828098fdd0c5c1f5f70f8249788c97a7fc107d7e40f0340bd7004d2dbbb"
+checksum = "c1d21273fef621dbf3c84973d5413189f6867598b4071a5fb3e4b1d648369b49"
 dependencies = [
  "dope-net",
  "rustls",
@@ -801,9 +799,9 @@ dependencies = [
 
 [[package]]
 name = "o3"
-version = "0.7.0"
+version = "0.7.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5a362be45c3547048a57f0bafc0ba8efa3fc088db690002ec727998a593390ad"
+checksum = "7d1458a5997a514e110cf4bdac34d48b3e23e76a914c2c0cab3c14b3c4b11429"
 
 [[package]]
 name = "once_cell"
@@ -1092,9 +1090,9 @@ dependencies = [
 
 [[package]]
 name = "rustls-pki-types"
-version = "1.15.0"
+version = "1.15.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "764899a24af3980067ee14bc143654f297b22eaebfe3c7b6b211920a5a59b046"
+checksum = "2f4925028c7eb5d1fcdaf196971378ed9d2c1c4efc7dc5d011256f76c99c0a96"
 dependencies = [
  "zeroize",
 ]
@@ -1366,9 +1364,9 @@ dependencies = [
 
 [[package]]
 name = "shin"
-version = "0.10.0"
+version = "0.11.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "833eebe144f8fcf560f31d38ddb6a97945dbe50ff66fde332a38261d78bc60b9"
+checksum = "4183056413ef579e2c04bd2e7ca25466c019523355bd26840fc073ed27763590"
 dependencies = [
  "ml-kem",
  "rand_core",

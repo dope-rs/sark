@@ -1,6 +1,6 @@
 use std::time::Instant;
 
-use dope_quic::{Conn, conn, transport_params};
+use dope_quic::{Conn, ServerConn, conn, transport_params};
 use ring::rand::{SecureRandom, SystemRandom};
 use sark_core::http::Field;
 use sark_h3::dope::Session;
@@ -25,7 +25,7 @@ fn config() -> conn::Config {
     }
 }
 
-fn pair() -> (Conn, Conn) {
+fn pair() -> (ServerConn, Conn) {
     let mut seed = [0u8; 32];
     SystemRandom::new().fill(&mut seed).unwrap();
     let signing = SigningKey::from_seed(&seed).unwrap();
@@ -35,15 +35,21 @@ fn pair() -> (Conn, Conn) {
     let mut client = Conn::new_client(CID.to_vec(), CID.to_vec(), server_pubkey, config()).unwrap();
     let now = Instant::now();
     for _ in 0..3 {
-        drain(&mut client, &mut server, now);
-        drain(&mut server, &mut client, now);
+        drain_client(&mut client, &mut server, now);
+        drain_server(&mut server, &mut client, now);
     }
     assert!(client.is_established());
     assert!(server.is_established());
     (server, client)
 }
 
-fn drain(from: &mut Conn, into: &mut Conn, now: Instant) {
+fn drain_client(from: &mut Conn, into: &mut ServerConn, now: Instant) {
+    for pkt in from.send_packets(now) {
+        into.recv_packet(&pkt, now).expect("recv");
+    }
+}
+
+fn drain_server(from: &mut ServerConn, into: &mut Conn, now: Instant) {
     for pkt in from.send_packets(now) {
         into.recv_packet(&pkt, now).expect("recv");
     }
@@ -65,9 +71,9 @@ fn settings_exchange_and_request_stream_round_trip_over_quic() {
     client_h3.start_control_stream(&mut client_quic).unwrap();
 
     let t1 = Instant::now();
-    drain(&mut client_quic, &mut server_quic, t1);
+    drain_client(&mut client_quic, &mut server_quic, t1);
     pump_quic_events(&mut server_h3, &mut server_quic);
-    drain(&mut server_quic, &mut client_quic, t1);
+    drain_server(&mut server_quic, &mut client_quic, t1);
     pump_quic_events(&mut client_h3, &mut client_quic);
 
     assert!(matches!(server_h3.poll_event(), Some(Event::Settings(_))));
@@ -93,7 +99,7 @@ fn settings_exchange_and_request_stream_round_trip_over_quic() {
     client_h3.flush(&mut client_quic).unwrap();
 
     let t2 = Instant::now();
-    drain(&mut client_quic, &mut server_quic, t2);
+    drain_client(&mut client_quic, &mut server_quic, t2);
     pump_quic_events(&mut server_h3, &mut server_quic);
 
     assert!(matches!(

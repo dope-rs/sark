@@ -31,89 +31,37 @@ pub struct Config {
     pub task_capacity: usize,
 }
 
-macro_rules! run_methods {
-    () => {
-        pub fn run<D, F>(self, cpu_ids: Vec<u16>, driver_config: D, worker: F) -> io::Result<()>
-        where
-            D: FnOnce(u16) -> driver::Config + Clone + Send,
-            F: for<'scope, 'd> FnOnce(Self, &mut Session<'scope, 'd>) -> io::Result<()>
-                + Clone
-                + Send,
-        {
-            run_server(self, cpu_ids, driver_config, worker)
-        }
-
-        pub fn run_with_storage<S, D, SF, F>(
-            self,
-            cpu_ids: Vec<u16>,
-            driver_config: D,
-            storage_factory: SF,
-            worker: F,
-        ) -> io::Result<()>
-        where
-            S: StorageFactory,
-            D: FnOnce(u16) -> driver::Config + Clone + Send,
-            SF: FnOnce(u16, dope::hash::Seed) -> S + Clone + Send,
-            F: for<'scope, 'd> FnOnce(
-                    Self,
-                    &mut Session<'scope, 'd, S::Output<'d>>,
-                ) -> io::Result<()>
-                + Clone
-                + Send,
-        {
-            run_server_with_storage(self, cpu_ids, driver_config, storage_factory, worker)
-        }
-
-        pub fn run_worker<F>(self, driver_config: driver::Config, worker: F) -> io::Result<()>
-        where
-            F: for<'scope, 'd> FnOnce(Self, &mut Session<'scope, 'd>) -> io::Result<()>,
-        {
-            run_server_worker(self, driver_config, worker)
-        }
-
-        pub fn run_worker_with_storage<S, F>(
-            self,
-            driver_config: driver::Config,
-            storage_factory: S,
-            worker: F,
-        ) -> io::Result<()>
-        where
-            S: StorageFactory,
-            F: for<'scope, 'd> FnOnce(
-                Self,
-                &mut Session<'scope, 'd, S::Output<'d>>,
-            ) -> io::Result<()>,
-        {
-            run_server_worker_with_storage(self, driver_config, storage_factory, worker)
-        }
-    };
-}
-
-pub struct HttpServer<const LISTENER_ID: u8, const DATE_ID: u8, P> {
+pub struct Server<const LISTENER_ID: u8, const DATE_ID: u8, P, W> {
     listener: listener::Config<Tcp>,
     head_timeout: Duration,
-    profile: PhantomData<fn() -> P>,
+    protocol: PhantomData<fn() -> (P, W)>,
 }
 
-impl<const LISTENER_ID: u8, const DATE_ID: u8, P> Clone for HttpServer<LISTENER_ID, DATE_ID, P> {
+pub type HttpServer<const LISTENER_ID: u8, const DATE_ID: u8, P> =
+    Server<LISTENER_ID, DATE_ID, P, Identity>;
+pub type HttpsServer<const LISTENER_ID: u8, const DATE_ID: u8, P> =
+    Server<LISTENER_ID, DATE_ID, P, Tls>;
+
+impl<const LISTENER_ID: u8, const DATE_ID: u8, P, W> Clone for Server<LISTENER_ID, DATE_ID, P, W> {
     fn clone(&self) -> Self {
         Self {
             listener: clone_listener_config(&self.listener),
             head_timeout: self.head_timeout,
-            profile: PhantomData,
+            protocol: PhantomData,
         }
     }
 }
 
-impl<const LISTENER_ID: u8, const DATE_ID: u8, P> HttpServer<LISTENER_ID, DATE_ID, P>
+impl<const LISTENER_ID: u8, const DATE_ID: u8, P, W> Server<LISTENER_ID, DATE_ID, P, W>
 where
     P: RuntimeProfile,
+    W: Wire,
 {
     pub fn new(listener: listener::Config<Tcp>, head_timeout: Duration) -> Self {
         Self {
             listener,
             head_timeout,
-            profile: PhantomData,
+            protocol: PhantomData,
         }
     }
 
@@ -125,8 +73,57 @@ where
         self.head_timeout
     }
 
-    run_methods!();
+    pub fn run<D, F>(self, cpu_ids: Vec<u16>, driver_config: D, worker: F) -> io::Result<()>
+    where
+        D: FnOnce(u16) -> driver::Config + Clone + Send,
+        F: for<'scope, 'd> FnOnce(Self, &mut Session<'scope, 'd>) -> io::Result<()> + Clone + Send,
+    {
+        run_server(self, cpu_ids, driver_config, worker)
+    }
 
+    pub fn run_with_storage<S, D, SF, F>(
+        self,
+        cpu_ids: Vec<u16>,
+        driver_config: D,
+        storage_factory: SF,
+        worker: F,
+    ) -> io::Result<()>
+    where
+        S: StorageFactory,
+        D: FnOnce(u16) -> driver::Config + Clone + Send,
+        SF: FnOnce(u16, dope::hash::Seed) -> S + Clone + Send,
+        F: for<'scope, 'd> FnOnce(Self, &mut Session<'scope, 'd, S::Output<'d>>) -> io::Result<()>
+            + Clone
+            + Send,
+    {
+        run_server_with_storage(self, cpu_ids, driver_config, storage_factory, worker)
+    }
+
+    pub fn run_worker<F>(self, driver_config: driver::Config, worker: F) -> io::Result<()>
+    where
+        F: for<'scope, 'd> FnOnce(Self, &mut Session<'scope, 'd>) -> io::Result<()>,
+    {
+        run_server_worker(self, driver_config, worker)
+    }
+
+    pub fn run_worker_with_storage<S, F>(
+        self,
+        driver_config: driver::Config,
+        storage_factory: S,
+        worker: F,
+    ) -> io::Result<()>
+    where
+        S: StorageFactory,
+        F: for<'scope, 'd> FnOnce(Self, &mut Session<'scope, 'd, S::Output<'d>>) -> io::Result<()>,
+    {
+        run_server_worker_with_storage(self, driver_config, storage_factory, worker)
+    }
+}
+
+impl<const LISTENER_ID: u8, const DATE_ID: u8, P> Server<LISTENER_ID, DATE_ID, P, Identity>
+where
+    P: RuntimeProfile,
+{
     pub fn serve<'scope, 'd: 'scope, A, S>(
         self,
         session: &mut Session<'scope, 'd, S>,
@@ -141,7 +138,7 @@ where
             app,
             self.listener,
             self.head_timeout,
-            |_| {},
+            (),
             shutdown,
         )
     }
@@ -163,76 +160,33 @@ where
             self.listener,
             self.head_timeout,
             resource,
-            |_| {},
+            (),
             shutdown,
         )
     }
 }
 
-pub struct HttpsServer<const LISTENER_ID: u8, const DATE_ID: u8, P> {
-    listener: listener::Config<Tcp>,
-    head_timeout: Duration,
-    tls: shin::server::Config,
-    profile: PhantomData<fn() -> P>,
-}
-
-impl<const LISTENER_ID: u8, const DATE_ID: u8, P> Clone for HttpsServer<LISTENER_ID, DATE_ID, P> {
-    fn clone(&self) -> Self {
-        Self {
-            listener: clone_listener_config(&self.listener),
-            head_timeout: self.head_timeout,
-            tls: self.tls.clone(),
-            profile: PhantomData,
-        }
-    }
-}
-
-impl<const LISTENER_ID: u8, const DATE_ID: u8, P> HttpsServer<LISTENER_ID, DATE_ID, P>
+impl<const LISTENER_ID: u8, const DATE_ID: u8, P> Server<LISTENER_ID, DATE_ID, P, Tls>
 where
     P: RuntimeProfile,
 {
-    pub fn new(
-        listener: listener::Config<Tcp>,
-        head_timeout: Duration,
-        tls: shin::server::Config,
-    ) -> Self {
-        Self {
-            listener,
-            head_timeout,
-            tls,
-            profile: PhantomData,
-        }
-    }
-
-    pub fn listener_config(&self) -> &listener::Config<Tcp> {
-        &self.listener
-    }
-
-    pub fn head_timeout(&self) -> Duration {
-        self.head_timeout
-    }
-
-    pub fn tls_config(&self) -> &shin::server::Config {
-        &self.tls
-    }
-
-    run_methods!();
-
     pub fn serve<'scope, 'd: 'scope, A, S>(
         self,
         session: &mut Session<'scope, 'd, S>,
         app: A,
+        tls: shin::server::Config,
         shutdown: Option<&ShutdownTrigger>,
     ) -> io::Result<()>
     where
         A: Application<'d, Wire = Tls> + DateHost + TimerHost<'d>,
     {
+        let endpoint = Endpoint::server(tls).map_err(io::Error::other)?;
         run::<LISTENER_ID, DATE_ID, A, Tls, P, S>(
             session,
             app,
             self.listener,
             self.head_timeout,
-            move |listener| listener.set_config(Endpoint::Server(Box::new(self.tls))),
+            endpoint,
             shutdown,
         )
     }
@@ -242,19 +196,21 @@ where
         session: &mut Session<'scope, 'd, S>,
         app: A,
         resource: R,
+        tls: shin::server::Config,
         shutdown: Option<&ShutdownTrigger>,
     ) -> io::Result<()>
     where
         A: Application<'d, Wire = Tls> + DateHost + TimerHost<'d>,
         R: Manifold<'d>,
     {
+        let endpoint = Endpoint::server(tls).map_err(io::Error::other)?;
         run_with_resource::<LISTENER_ID, DATE_ID, A, Tls, P, R, S>(
             session,
             app,
             self.listener,
             self.head_timeout,
             resource,
-            move |listener| listener.set_config(Endpoint::Server(Box::new(self.tls))),
+            endpoint,
             shutdown,
         )
     }
@@ -460,7 +416,7 @@ fn run<'scope, 'd: 'scope, const LISTENER_ID: u8, const DATE_ID: u8, A, W, P, S>
     app: A,
     listener: listener::Config<Tcp>,
     head_timeout: Duration,
-    configure: impl FnOnce(&mut Listener<'d, LISTENER_ID, A, Bundle<Tcp, W, P>>),
+    wire: W::InitConfig,
     shutdown: Option<&ShutdownTrigger>,
 ) -> io::Result<()>
 where
@@ -472,14 +428,13 @@ where
         .seed()
         .derive(dope::hash::domain::ACCEPT ^ LISTENER_ID as u64)
         .state();
-    let mut listener = {
+    let listener = {
         let mut driver = session.driver_access();
         if let Some(trigger) = shutdown {
             trigger.try_register(&mut driver)?;
         }
-        Listener::open_in(app, listener, hash_builder, &mut driver)?
+        Listener::open_in_with_wire(app, listener, wire, hash_builder, &mut driver)?
     };
-    configure(&mut listener);
     listener.handler().timer().set_head_timeout(head_timeout);
     let dispatcher = core::pin::pin!(Branded::new(Dispatcher::<
         'd,
@@ -502,7 +457,7 @@ fn run_with_resource<'scope, 'd: 'scope, const LISTENER_ID: u8, const DATE_ID: u
     listener: listener::Config<Tcp>,
     head_timeout: Duration,
     resource: R,
-    configure: impl FnOnce(&mut Listener<'d, LISTENER_ID, A, Bundle<Tcp, W, P>>),
+    wire: W::InitConfig,
     shutdown: Option<&ShutdownTrigger>,
 ) -> io::Result<()>
 where
@@ -515,14 +470,13 @@ where
         .seed()
         .derive(dope::hash::domain::ACCEPT ^ LISTENER_ID as u64)
         .state();
-    let mut listener = {
+    let listener = {
         let mut driver = session.driver_access();
         if let Some(trigger) = shutdown {
             trigger.try_register(&mut driver)?;
         }
-        Listener::open_in(app, listener, hash_builder, &mut driver)?
+        Listener::open_in_with_wire(app, listener, wire, hash_builder, &mut driver)?
     };
-    configure(&mut listener);
     listener.handler().timer().set_head_timeout(head_timeout);
     let dispatcher = core::pin::pin!(Branded::new(ResourceDispatcher::<
         'd,

@@ -1,4 +1,5 @@
 use std::fmt;
+use std::ops::Range;
 
 use o3::buffer::{Pooled, SharedPool, SpareWriter};
 
@@ -191,15 +192,17 @@ impl PackedWriter for SpareWriter<'_> {
 }
 
 fn write_packed_prefix(writer: &mut impl PackedWriter, name: &[u8], value_len: usize) {
-    let name_len = u32::try_from(name.len())
-        .expect("field name length overflow")
-        .to_ne_bytes();
-    let value_len = u32::try_from(value_len)
-        .expect("field value length overflow")
-        .to_ne_bytes();
+    let name_len = packed_len(name.len());
+    let value_len = packed_len(value_len);
     writer.extend(&name_len);
     writer.extend(&value_len);
     writer.extend(name);
+}
+
+fn packed_len(len: usize) -> [u8; 4] {
+    u32::try_from(len)
+        .expect("field component length overflow")
+        .to_ne_bytes()
 }
 
 fn write_packed_field(writer: &mut impl PackedWriter, field: Field<'_>) {
@@ -309,6 +312,49 @@ impl FieldBlock<PackedFields<Vec<u8>>> {
             "encoded field value length mismatch"
         );
     }
+
+    pub fn try_push_parts<E>(
+        &mut self,
+        encode_name: impl FnOnce(&mut FieldValueWriter<'_>) -> Result<(), E>,
+        encode_value: impl FnOnce(&mut FieldValueWriter<'_>, usize) -> Result<(), E>,
+    ) -> Result<(usize, usize), E> {
+        let field_start = self.storage.first.len();
+        self.storage.first.extend_from_slice(&[0; 8]);
+        let name_start = self.storage.first.len();
+        if let Err(error) = encode_name(&mut FieldValueWriter {
+            bytes: &mut self.storage.first,
+        }) {
+            self.storage.first.truncate(field_start);
+            return Err(error);
+        }
+        let value_start = self.storage.first.len();
+        let name_len = value_start - name_start;
+        if let Err(error) = encode_value(
+            &mut FieldValueWriter {
+                bytes: &mut self.storage.first,
+            },
+            name_len,
+        ) {
+            self.storage.first.truncate(field_start);
+            return Err(error);
+        }
+        let end = self.storage.first.len();
+        let value_len = end - value_start;
+        self.storage.first[field_start..field_start + 4].copy_from_slice(&packed_len(name_len));
+        self.storage.first[field_start + 4..name_start].copy_from_slice(&packed_len(value_len));
+        Ok((name_len, value_len))
+    }
+
+    pub fn as_bytes(&self) -> &[u8] {
+        &self.storage.first
+    }
+
+    pub fn iter_with_value_ranges(&self) -> PackedFieldRangeIter<'_> {
+        PackedFieldRangeIter {
+            current: &self.storage.first,
+            offset: 0,
+        }
+    }
 }
 
 impl Default for FieldBlock<PackedFields<Vec<u8>>> {
@@ -343,29 +389,50 @@ impl<'a> Iterator for PackedFieldIter<'a> {
         if self.current.is_empty() {
             self.current = self.second.take()?;
         }
-        if self.current.len() < 8 {
-            self.current = &[];
-            self.second = None;
-            return None;
-        }
-        let name_len = u32::from_ne_bytes(self.current[..4].try_into().ok()?) as usize;
-        let value_len = u32::from_ne_bytes(self.current[4..8].try_into().ok()?) as usize;
-        let Some(end) = 8usize
-            .checked_add(name_len)
-            .and_then(|end| end.checked_add(value_len))
-        else {
+        let Some((field, _, end)) = parse_packed_field(self.current) else {
             self.current = &[];
             self.second = None;
             return None;
         };
-        if end > self.current.len() {
-            self.current = &[];
-            self.second = None;
-            return None;
-        }
-        let name = &self.current[8..8 + name_len];
-        let value = &self.current[8 + name_len..end];
         self.current = &self.current[end..];
-        Some(Field::new(name, value))
+        Some(field)
     }
+}
+
+pub struct PackedFieldRangeIter<'a> {
+    current: &'a [u8],
+    offset: usize,
+}
+
+impl<'a> Iterator for PackedFieldRangeIter<'a> {
+    type Item = (Field<'a>, Range<usize>);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let Some((field, value_start, end)) = parse_packed_field(self.current) else {
+            self.current = &[];
+            return None;
+        };
+        let value_range = self.offset + value_start..self.offset + end;
+        self.current = &self.current[end..];
+        self.offset += end;
+        Some((field, value_range))
+    }
+}
+
+fn parse_packed_field(bytes: &[u8]) -> Option<(Field<'_>, usize, usize)> {
+    if bytes.len() < 8 {
+        return None;
+    }
+    let name_len = u32::from_ne_bytes(bytes[..4].try_into().ok()?) as usize;
+    let value_len = u32::from_ne_bytes(bytes[4..8].try_into().ok()?) as usize;
+    let value_start = 8usize.checked_add(name_len)?;
+    let end = value_start.checked_add(value_len)?;
+    if end > bytes.len() {
+        return None;
+    }
+    Some((
+        Field::new(&bytes[8..value_start], &bytes[value_start..end]),
+        value_start,
+        end,
+    ))
 }

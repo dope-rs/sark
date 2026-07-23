@@ -32,11 +32,7 @@ pub fn http_server(bind: SocketAddr, head_timeout: Duration) -> TestHttpServer {
     )
 }
 
-pub fn https_server(
-    bind: SocketAddr,
-    head_timeout: Duration,
-    tls: shin::server::Config,
-) -> TestHttpsServer {
+pub fn https_server(bind: SocketAddr, head_timeout: Duration) -> TestHttpsServer {
     HttpsServer::new(
         listener::Config::<Tcp> {
             bind,
@@ -50,6 +46,5 @@ pub fn https_server(
             egress: Default::default(),
         },
         head_timeout,
-        tls,
     )
 }

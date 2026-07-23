@@ -1,4 +1,4 @@
-use sark_core::http::{Field, OwnedField};
+use sark_core::http::Field;
 
 pub struct StaticTable;
 
@@ -116,12 +116,9 @@ const ENTRIES: &[(&str, &str)] = &[
 impl StaticTable {
     pub const LEN: u64 = ENTRIES.len() as u64;
 
-    pub fn get(index: u64) -> Option<OwnedField> {
+    pub fn get(index: u64) -> Option<Field<'static>> {
         let (name, value) = ENTRIES.get(usize::try_from(index).ok()?)?;
-        Some(OwnedField {
-            name: name.as_bytes().to_vec(),
-            value: value.as_bytes().to_vec(),
-        })
+        Some(Field::new(name.as_bytes(), value.as_bytes()))
     }
 
     pub fn name(index: u64) -> Option<&'static [u8]> {

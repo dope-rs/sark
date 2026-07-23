@@ -29,16 +29,9 @@ pub mod service;
 pub use dope::manifold::listener;
 #[doc(hidden)]
 pub use dope::manifold::listener::Application;
-pub use dope_fiber::fiber_fn;
+pub use dope_fiber::{fiber, fiber_fn};
 pub use dope_net::{tcp, tcp::Tcp};
 pub use sark_gen::body;
-
-#[macro_export]
-macro_rules! fiber {
-    ($($token:tt)*) => {
-        ::dope_fiber::fiber!($($token)*)
-    };
-}
 
 #[doc(hidden)]
 pub const CANNED_400: &[u8] =
