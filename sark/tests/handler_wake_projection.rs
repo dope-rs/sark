@@ -154,11 +154,13 @@ fn async_route_resumes_through_non_identity_projection() {
                     driver::Config::for_tcp_profile::<Throughput>(support::MAX_CONNECTIONS);
                 let executor = Executor::new(driver_config)?;
                 executor.enter(|mut session| {
+                    let timer = sark::Timer::with_capacity(32);
                     server.clone().serve(
                         &mut session,
                         Demux {
                             inner: SleepDispatch::new::<Identity>(
-                                (),
+                                &(),
+                                &timer,
                                 sark::app::Config {
                                     timer_capacity: 32,
                                     task_capacity: support::MAX_CONNECTIONS,

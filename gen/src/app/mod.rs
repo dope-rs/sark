@@ -70,3 +70,44 @@ fn flatten_entries(
     }
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn generated_task_storage_uses_safe_structural_projection() {
+        let input: DefineRouteInput = syn::parse_quote! {
+            ProjectionApp: () => {
+                GET "/sync" => SyncRoute,
+                GET "/async" => async(capacity = 2) AsyncRoute,
+                GET "/stream" => stream(capacity = 3) StreamRoute,
+            }
+        };
+        let generated = define_route(input).expect("route generation").to_string();
+
+        assert!(generated.contains("__pin_project"));
+        assert!(generated.contains("__task_slot_0000"));
+        assert!(generated.contains("__task_slot_0001"));
+        assert!(generated.contains("try_from_split_task"));
+        assert!(generated.contains("RequestTask"));
+        assert!(generated.contains("state : & 'env"));
+        for forbidden in [
+            "async move",
+            "unsafe",
+            "OwnerFiber",
+            "FiberScope",
+            "routes :",
+            "get_unchecked_mut",
+            "into_inner_unchecked",
+            "map_unchecked",
+            "new_unchecked",
+            "unreachable_unchecked",
+        ] {
+            assert!(
+                !generated.contains(forbidden),
+                "generated app contains manual projection `{forbidden}`",
+            );
+        }
+    }
+}

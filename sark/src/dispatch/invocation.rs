@@ -38,7 +38,6 @@ impl<'req> Invocation<'req> {
 
     pub fn invoke<'a, R, S>(
         self,
-        route: &'a R,
         raw_params: R::RawParams,
         raw_headers: R::RawHeaders,
         state: &'a S,
@@ -54,7 +53,7 @@ impl<'req> Invocation<'req> {
         };
         let headers = R::Request::build_headers(&request, raw_headers).map_err(|_| CANNED_400)?;
         let body = R::parse_body(self.body).map_err(|_| CANNED_400)?;
-        Ok(R::invoke(route, params, &request, headers, body, state))
+        Ok(R::invoke(params, &request, headers, body, state))
     }
 }
 
@@ -86,7 +85,7 @@ impl<'a, 'req, 'cache> SyncRoute<'a, 'req, 'cache> {
     pub fn dispatch<R, S>(
         self,
         permit: DispatchPermit,
-        matched: Matched<'_, R>,
+        matched: Matched<R>,
         state: &S,
     ) -> ConsumeOutcome
     where
@@ -102,13 +101,13 @@ impl<'a, 'req, 'cache> SyncRoute<'a, 'req, 'cache> {
     fn buffered<R, S>(
         self,
         permit: DispatchPermit,
-        matched: Matched<'_, R>,
+        matched: Matched<R>,
         state: &S,
     ) -> ConsumeOutcome
     where
         R: RouteSpec + manifold::Route<S> + 'static,
     {
-        let Matched { route, raw_params } = matched;
+        let Matched { raw_params } = matched;
         let Framing {
             mut raw_headers,
             head_len,
@@ -140,7 +139,7 @@ impl<'a, 'req, 'cache> SyncRoute<'a, 'req, 'cache> {
             body,
             body.len(),
         );
-        let response = match invocation.invoke(route, raw_params, raw_headers, state) {
+        let response = match invocation.invoke::<R, S>(raw_params, raw_headers, state) {
             Ok(response) => response,
             Err(reason) => return ConsumeOutcome::Close(reason),
         };
@@ -149,16 +148,11 @@ impl<'a, 'req, 'cache> SyncRoute<'a, 'req, 'cache> {
             .into_consume(permit, Consumption::Buffered(total), conn_close)
     }
 
-    fn discard<R, S>(
-        self,
-        permit: DispatchPermit,
-        matched: Matched<'_, R>,
-        state: &S,
-    ) -> ConsumeOutcome
+    fn discard<R, S>(self, permit: DispatchPermit, matched: Matched<R>, state: &S) -> ConsumeOutcome
     where
         R: RouteSpec + manifold::Route<S> + 'static,
     {
-        let Matched { route, raw_params } = matched;
+        let Matched { raw_params } = matched;
         let DiscardFraming {
             mut raw_headers,
             head_len,
@@ -189,7 +183,7 @@ impl<'a, 'req, 'cache> SyncRoute<'a, 'req, 'cache> {
             &[],
             body_total,
         );
-        let response = match invocation.invoke(route, raw_params, raw_headers, state) {
+        let response = match invocation.invoke::<R, S>(raw_params, raw_headers, state) {
             Ok(response) => response,
             Err(reason) => return ConsumeOutcome::Close(reason),
         };
@@ -244,23 +238,23 @@ impl<'a, 'req> StreamRoute<'a, 'req> {
     }
 
     #[allow(clippy::too_many_arguments)]
-    pub(super) fn dispatch<'d, R, S, T, Tag, Wrap, const N: usize>(
+    pub(super) fn dispatch<'env, 'd, R, S, T, Tag, Wrap, const N: usize>(
         self,
         permit: DispatchPermit,
-        matched: Matched<'d, R>,
+        matched: Matched<R>,
         mut tasks: Pin<&mut crate::fiber::FixedSlab<'d, T, N, Tag>>,
-        state: &'d S,
+        state: &'env S,
         wrap: Wrap,
     ) -> ConsumeOutcome
     where
         R: RouteSpec + manifold::Route<S> + 'static,
         for<'request> R::Response<'request>:
             sark_core::http::Shape<'request, StreamInner = R::Stream>,
-        R::Stream: dope_fiber::Fiber<'d, Output = Option<Shared>> + 'd,
-        T: dope_fiber::Fiber<'d> + 'd,
+        R::Stream: dope_fiber::Fiber<'d, Output = Option<Shared>>,
+        T: dope_fiber::Fiber<'d>,
         Wrap: FnOnce(R::Stream) -> T,
     {
-        let Matched { route, raw_params } = matched;
+        let Matched { raw_params } = matched;
         let Framing {
             mut raw_headers,
             head_len,
@@ -292,7 +286,7 @@ impl<'a, 'req> StreamRoute<'a, 'req> {
             body,
             body.len(),
         );
-        let response = match invocation.invoke(route, raw_params, raw_headers, state) {
+        let response = match invocation.invoke::<R, S>(raw_params, raw_headers, state) {
             Ok(response) => response,
             Err(reason) => return ConsumeOutcome::Close(reason),
         };

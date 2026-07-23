@@ -122,8 +122,7 @@ impl<'a> Ctx<'a> {
     }
 }
 
-pub struct Matched<'r, R: RouteSpec> {
-    pub route: &'r R,
+pub struct Matched<R: RouteSpec> {
     pub raw_params: R::RawParams,
 }
 
@@ -141,15 +140,15 @@ pub(super) enum RequestErr {
     Bad(&'static [u8]),
 }
 
-pub(super) fn assemble_matched<'r, R: RouteSpec>(
+pub(super) fn assemble_matched<R: RouteSpec>(
     permit: DispatchPermit,
-    matched: Matched<'r, R>,
+    matched: Matched<R>,
     ctx: &Ctx<'_>,
     conn: &mut ConnState,
-) -> Result<(&'r R, RequestDomainInput<R>), ConsumeOutcome> {
-    let Matched { route, raw_params } = matched;
+) -> Result<RequestDomainInput<R>, ConsumeOutcome> {
+    let Matched { raw_params } = matched;
     match ctx.assemble_domain::<R>(raw_params, conn) {
-        Ok(request) => Ok((route, request)),
+        Ok(request) => Ok(request),
         Err(RequestErr::NeedMore(state)) => Err(ConsumeOutcome::NeedMore { permit, state }),
         Err(RequestErr::Bad(reason)) => Err(ConsumeOutcome::Close(reason)),
     }

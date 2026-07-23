@@ -66,8 +66,10 @@ impl sark::dispatch::ResponseEncoder for Capture {
 
 #[test]
 fn agnostic_dispatch_routes_feeds_invokes_encodes() {
+    let timer = sark::Timer::with_capacity(1);
     let app = AgnApp::new::<dope_net::wire::identity::Identity>(
-        sark::EmptyState,
+        sark::EmptyState::REF,
+        &timer,
         sark::app::Config {
             timer_capacity: 1,
             task_capacity: 1,
@@ -118,11 +120,10 @@ fn write_response<'r, R: RouteSpec>(resp: R::Response<'r>) -> Vec<u8> {
 
 #[test]
 fn agnostic_core_runs_without_h1_buffer() {
-    let route = plain_h;
     let raw_params = <plain_h as RouteSpec>::RawParams::default();
     let raw_headers = <plain_h as RouteSpec>::RawHeaders::default();
     let resp = Invocation::new(0..0, &[], &[], 0)
-        .invoke(&route, raw_params, raw_headers, sark::EmptyState::REF)
+        .invoke::<plain_h, _>(raw_params, raw_headers, sark::EmptyState::REF)
         .expect("build_and_invoke");
     assert_eq!(resp.status(), StatusCode::OK);
     let bytes = write_response::<plain_h>(resp);
@@ -132,7 +133,6 @@ fn agnostic_core_runs_without_h1_buffer() {
 
 #[test]
 fn synthesized_header_pair_flows_through_route() {
-    let route = named_h;
     let raw_params = <named_h as RouteSpec>::RawParams::default();
     let mut raw_headers = <named_h as RouteSpec>::RawHeaders::default();
 
@@ -148,7 +148,7 @@ fn synthesized_header_pair_flows_through_route() {
     .expect("set_header_raw");
 
     let resp = Invocation::new(0..0, head, &[], 0)
-        .invoke(&route, raw_params, raw_headers, sark::EmptyState::REF)
+        .invoke::<named_h, _>(raw_params, raw_headers, sark::EmptyState::REF)
         .expect("build_and_invoke");
     let bytes = write_response::<named_h>(resp);
     assert!(

@@ -31,7 +31,7 @@ impl ParsedRequestHead<'_> {
         let version = &line[version_start..];
         if target.is_empty()
             || (version != b"HTTP/1.1" && version != b"HTTP/1.0")
-            || !crate::simd::request_target_is_valid(target)
+            || !crate::http::scan::request_target_is_valid(target)
         {
             return None;
         }

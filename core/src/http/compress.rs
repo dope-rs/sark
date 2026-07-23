@@ -4,20 +4,15 @@
 //! let zipped = Gzip::new().encode(body).unwrap();
 //! ```
 
-use std::ptr::NonNull;
-
-use libdeflate_sys::{
-    libdeflate_alloc_compressor, libdeflate_compressor, libdeflate_free_compressor,
-    libdeflate_gzip_compress, libdeflate_gzip_compress_bound,
-};
-use o3::buffer::{Pooled, SharedPool};
+use libdeflater::{CompressionLvl, Compressor};
+use o3::buffer::{InitializedSharedPool, Pooled};
 
 const GZIP_SLOTS: usize = 32;
 const GZIP_CAPACITY: usize = 256 * 1024;
 
 pub struct Gzip {
-    encoder: NonNull<libdeflate_compressor>,
-    pool: SharedPool,
+    encoder: Compressor,
+    pool: InitializedSharedPool,
 }
 
 impl Gzip {
@@ -28,45 +23,27 @@ impl Gzip {
     }
 
     pub fn with_pool(slots: usize, capacity: usize) -> Self {
-        let encoder = NonNull::new(unsafe { libdeflate_alloc_compressor(Self::LEVEL) })
-            .expect("libdeflate compressor allocation failed");
+        let level = CompressionLvl::new(Self::LEVEL).expect("valid libdeflate compression level");
         Self {
-            encoder,
-            pool: SharedPool::new(slots, capacity),
+            encoder: Compressor::new(level),
+            pool: InitializedSharedPool::new(slots, capacity),
         }
     }
 
     pub fn encode(&mut self, src: &[u8]) -> Option<Pooled> {
-        let cap = unsafe { libdeflate_gzip_compress_bound(self.encoder.as_ptr(), src.len()) };
+        let cap = self.encoder.gzip_compress_bound(src.len());
         if cap > self.pool.capacity() {
             return None;
         }
         let mut lease = self.pool.try_acquire()?;
-        let mut writer = lease.spare_writer();
-        let ptr = writer.as_mut_ptr();
-        let capacity = writer.remaining();
-        let n = unsafe {
-            libdeflate_gzip_compress(
-                self.encoder.as_ptr(),
-                src.as_ptr().cast(),
-                src.len(),
-                ptr.cast(),
-                capacity,
-            )
-        };
-        assert!(n != 0 && n <= capacity, "gzip_compress_bound undersized");
-        let output = unsafe { std::slice::from_raw_parts(ptr, n) };
-        writer
-            .try_commit_initialized(output)
+        let n = self
+            .encoder
+            .gzip_compress(src, lease.spare_mut())
             .expect("gzip_compress_bound undersized");
-        drop(writer);
+        lease
+            .try_advance(n)
+            .expect("gzip_compress_bound undersized");
         Some(lease.freeze())
-    }
-}
-
-impl Drop for Gzip {
-    fn drop(&mut self) {
-        unsafe { libdeflate_free_compressor(self.encoder.as_ptr()) };
     }
 }
 

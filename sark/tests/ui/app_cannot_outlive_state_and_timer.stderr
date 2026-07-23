@@ -1,0 +1,39 @@
+error[E0597]: `state` does not live long enough
+  --> tests/ui/app_cannot_outlive_state_and_timer.rs:28:9
+   |
+24 |   fn escape<'d>() -> impl sark::Application<'d, Wire = dope_net::wire::identity::Identity> {
+   |             -- lifetime `'d` defined here
+25 |       let state = ();
+   |           ----- binding `state` declared here
+26 |       let timer = sark::Timer::with_capacity(1);
+27 | /     App::new(
+28 | |         &state,
+   | |         ^^^^^^ borrowed value does not live long enough
+29 | |         &timer,
+30 | |         sark::app::Config {
+...  |
+33 | |         },
+34 | |     )
+   | |_____- argument requires that `state` is borrowed for `'d`
+35 |   }
+   |   - `state` dropped here while still borrowed
+
+error[E0597]: `timer` does not live long enough
+  --> tests/ui/app_cannot_outlive_state_and_timer.rs:29:9
+   |
+24 |   fn escape<'d>() -> impl sark::Application<'d, Wire = dope_net::wire::identity::Identity> {
+   |             -- lifetime `'d` defined here
+25 |       let state = ();
+26 |       let timer = sark::Timer::with_capacity(1);
+   |           ----- binding `timer` declared here
+27 | /     App::new(
+28 | |         &state,
+29 | |         &timer,
+   | |         ^^^^^^ borrowed value does not live long enough
+30 | |         sark::app::Config {
+...  |
+33 | |         },
+34 | |     )
+   | |_____- argument requires that `timer` is borrowed for `'d`
+35 |   }
+   |   - `timer` dropped here while still borrowed

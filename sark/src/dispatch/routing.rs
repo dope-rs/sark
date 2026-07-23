@@ -8,7 +8,6 @@ use crate::timer::{Timer, TimerHost};
 pub trait Routing<'d> {
     fn try_consume(
         self: Pin<&mut Self>,
-        scope: dope_fiber::FiberScope<'d>,
         permit: DispatchPermit,
         bytes: &[u8],
         write: &mut [u8],
@@ -22,7 +21,6 @@ pub trait RouteCore<'d> {
     fn try_consume(
         self: Pin<&mut Self>,
         date: &Stamp,
-        scope: dope_fiber::FiberScope<'d>,
         permit: DispatchPermit,
         bytes: &[u8],
         write: &mut [u8],
@@ -55,7 +53,6 @@ impl<'d, C: RouteCore<'d>> TimerHost<'d> for H1Host<'_, 'd, C> {
 impl<'d, C: RouteCore<'d>> Routing<'d> for H1Host<'_, 'd, C> {
     fn try_consume(
         self: Pin<&mut Self>,
-        scope: dope_fiber::FiberScope<'d>,
         permit: DispatchPermit,
         bytes: &[u8],
         write: &mut [u8],
@@ -64,6 +61,6 @@ impl<'d, C: RouteCore<'d>> Routing<'d> for H1Host<'_, 'd, C> {
         let this = self.get_mut();
         this.core
             .as_mut()
-            .try_consume(this.date, scope, permit, bytes, write, conn)
+            .try_consume(this.date, permit, bytes, write, conn)
     }
 }

@@ -4,6 +4,7 @@ pub mod field;
 pub mod huffman;
 mod request;
 mod response;
+pub mod scan;
 pub mod varint;
 
 pub mod codec;

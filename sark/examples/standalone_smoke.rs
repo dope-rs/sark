@@ -109,10 +109,12 @@ fn main() {
             |_ctx, trigger| {
                 let driver_config = driver::Config::for_tcp_profile::<Throughput>(MAX_CONNECTIONS);
                 server.clone().run_worker(driver_config, |server, session| {
+                    let timer = sark::Timer::with_capacity(MAX_CONNECTIONS.saturating_mul(2));
                     server.serve(
                         session,
                         SmokeDispatch::new(
-                            (),
+                            &(),
+                            &timer,
                             app::Config {
                                 timer_capacity: MAX_CONNECTIONS.saturating_mul(2),
                                 task_capacity: MAX_CONNECTIONS,

@@ -2,10 +2,10 @@ use std::pin::Pin;
 use std::task::Poll;
 
 use dope_fiber::{Context, Fiber, WaitQueue, Waiter};
+use o3::cell::CheckedCell;
 use o3::collections::{FixedHashTable, PinSlab, SlabKey};
 use pin_project::pinned_drop;
 
-use super::access::ProofCell;
 use super::cache::Asset;
 use super::loader::LoadError;
 
@@ -100,13 +100,13 @@ impl Flights {
 }
 
 pub(super) struct Hub {
-    flights: ProofCell<Flights>,
+    flights: CheckedCell<Flights>,
 }
 
 impl Hub {
     pub(super) fn new(capacity: usize) -> Self {
         Self {
-            flights: ProofCell::new(Flights::with_capacity(capacity)),
+            flights: CheckedCell::new(Flights::with_capacity(capacity)),
         }
     }
 

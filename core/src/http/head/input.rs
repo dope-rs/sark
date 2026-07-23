@@ -51,12 +51,12 @@ impl<'a> HeaderLine<'a> {
         &self,
         start: usize,
     ) -> Result<Option<(usize, u8)>, crate::error::Error> {
-        match crate::simd::scan_header_name(self.bytes, start) {
-            crate::simd::HeaderNameOutcome::Found { pos, byte } => Ok(Some((pos, byte))),
-            crate::simd::HeaderNameOutcome::Invalid => Err(crate::error::Error::BadRequest(
+        match crate::http::scan::scan_header_name(self.bytes, start) {
+            crate::http::scan::HeaderNameOutcome::Found { pos, byte } => Ok(Some((pos, byte))),
+            crate::http::scan::HeaderNameOutcome::Invalid => Err(crate::error::Error::BadRequest(
                 ERR_INVALID_HEADER_NAME.into(),
             )),
-            crate::simd::HeaderNameOutcome::None => Ok(None),
+            crate::http::scan::HeaderNameOutcome::None => Ok(None),
         }
     }
 

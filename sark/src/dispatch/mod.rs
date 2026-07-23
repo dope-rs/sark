@@ -21,7 +21,7 @@ pub use driver::{H1Driver, HeadDeadline};
 pub use invocation::{Invocation, SyncRoute};
 pub use pipeline::{Pipeline, identity_mut};
 pub use requests::{Ctx, Framed, Matched};
-pub use routes::{Complete, Dispatch, TaskPoll};
+pub use routes::{Complete, Dispatch, RequestTask, TaskPoll};
 pub use routing::{H1Host, RouteCore, Routing};
 use sark_core::http::Shape;
 pub use tasks::TaskRunner;
@@ -55,7 +55,6 @@ pub trait Decode {
 pub trait DecodeRoute<R: RouteSpec, S> {
     #[allow(clippy::too_many_arguments)]
     fn decode<E: ResponseEncoder>(
-        route: &R,
         raw_params: R::RawParams,
         raw_headers: R::RawHeaders,
         _method: http::Method,
@@ -71,7 +70,6 @@ where
     R: RouteSpec + manifold::Route<S> + 'static,
 {
     fn decode<E: ResponseEncoder>(
-        route: &R,
         raw_params: R::RawParams,
         raw_headers: R::RawHeaders,
         _method: http::Method,
@@ -80,8 +78,7 @@ where
         state: &S,
         encoder: &mut E,
     ) -> Decoded {
-        match Invocation::new(0..0, head, body, body.len()).invoke(
-            route,
+        match Invocation::new(0..0, head, body, body.len()).invoke::<R, S>(
             raw_params,
             raw_headers,
             state,
@@ -105,7 +102,6 @@ where
 
 impl<R: RouteSpec, S> DecodeRoute<R, S> for manifold::NativeFiber {
     fn decode<E: ResponseEncoder>(
-        _route: &R,
         _raw_params: R::RawParams,
         _raw_headers: R::RawHeaders,
         _method: http::Method,
@@ -120,7 +116,6 @@ impl<R: RouteSpec, S> DecodeRoute<R, S> for manifold::NativeFiber {
 
 impl<R: RouteSpec, S> DecodeRoute<R, S> for manifold::NativeStream {
     fn decode<E: ResponseEncoder>(
-        _route: &R,
         _raw_params: R::RawParams,
         _raw_headers: R::RawHeaders,
         _method: http::Method,

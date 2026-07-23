@@ -1,6 +1,8 @@
 #[doc(hidden)]
 pub use o3;
 #[doc(hidden)]
+pub use pin_project_lite::pin_project as __pin_project;
+#[doc(hidden)]
 pub use sark_core;
 pub use sark_core::{error, http, utils};
 pub mod app;

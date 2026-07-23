@@ -223,7 +223,6 @@ impl Handler {
             quote! {
                 impl #state_lt_use ::sark::service::manifold::Route<#state_ty_state> for #name {
                     fn invoke<'req, 'a>(
-                        &'a self,
                         params: <Self as ::sark::service::RouteSpec>::Params<'req>,
                         req: &::sark::request::Ref<'req>,
                         headers: <Self as ::sark::service::RouteSpec>::Headers<'req>,
@@ -260,7 +259,6 @@ impl Handler {
             quote! {
                 impl<'d> ::sark::service::manifold::TaskRoute<'d, #state_ty_d> for #name {
                     fn invoke_task<'req>(
-                        &'req self,
                         params: <Self as ::sark::service::RouteSpec>::Params<'req>,
                         req: ::sark::request::Ref<'req>,
                         headers: <Self as ::sark::service::RouteSpec>::Headers<'req>,
@@ -272,7 +270,6 @@ impl Handler {
                         #state_ty_d: 'req,
                         'd: 'req,
                     {
-                        let _ = self;
                         let request = #borrowed_request;
                         #hidden_fn(request, state #timer_call)
                     }
@@ -282,7 +279,6 @@ impl Handler {
             quote! {
                 impl<'d> ::sark::service::manifold::TaskRoute<'d, #state_ty_d> for #name {
                     fn invoke_task<'req>(
-                        &'req self,
                         _params: <Self as ::sark::service::RouteSpec>::Params<'req>,
                         _req: ::sark::request::Ref<'req>,
                         _headers: <Self as ::sark::service::RouteSpec>::Headers<'req>,

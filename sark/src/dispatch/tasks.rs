@@ -54,7 +54,7 @@ impl<'a> TaskRunner<'a> {
         mut classify: Classify,
     ) -> usize
     where
-        T: dope_fiber::Fiber<'d> + 'd,
+        T: dope_fiber::Fiber<'d>,
         W: Wire,
         C: Default + 'static,
         PJ: Fn(&mut C) -> &mut ConnState,
@@ -67,52 +67,55 @@ impl<'a> TaskRunner<'a> {
             bool,
         ) -> TaskPoll,
     {
-        let conn_ptr: *mut ConnState = project(&mut slot.state.conn);
-        let conn = unsafe { &mut *conn_ptr };
-        let Some(task) = conn.async_state.task.take() else {
+        let Some(task) = project(&mut slot.state.conn).async_state.task.take() else {
             return 0;
         };
         let task = crate::fiber::TaskId::<Tag>::from_erased(task);
         let mut cursor = 0;
         loop {
-            let (framed, terminating) = match conn.async_state.stream_pending.take() {
-                Some(stashed) => (
-                    stashed,
-                    conn.async_state.stream_phase == StreamPhase::Terminating,
-                ),
-                None => match conn.async_state.stream_phase {
-                    StreamPhase::Terminating => (Shared::from_static(CHUNK_TERMINATOR), true),
-                    StreamPhase::Streaming => {
-                        let poll = {
-                            let mut context = std::pin::pin!(dope_fiber::Context::from_ready(
-                                slot.driver(),
-                                slot.ready_key(),
-                                driver.reborrow(),
-                            ));
-                            tasks.as_mut().poll(&task, context.as_mut())
-                        };
-                        let Some(poll) = poll else {
-                            debug_assert!(false, "live task must exist in fiber slab");
-                            Self::release_connection(conn, slot);
-                            return 0;
-                        };
-                        match poll {
-                            Poll::Pending => {
-                                conn.async_state.task = Some(task.erase());
-                                return cursor;
-                            }
-                            Poll::Ready(output) => match classify(
-                                output,
-                                slot,
-                                aux,
-                                driver,
-                                self.date,
-                                conn.deferred_close,
-                            ) {
+            let next = {
+                let conn = project(&mut slot.state.conn);
+                match conn.async_state.stream_pending.take() {
+                    Some(stashed) => Some((
+                        stashed,
+                        conn.async_state.stream_phase == StreamPhase::Terminating,
+                    )),
+                    None => match conn.async_state.stream_phase {
+                        StreamPhase::Terminating => {
+                            Some((Shared::from_static(CHUNK_TERMINATOR), true))
+                        }
+                        StreamPhase::Streaming => None,
+                    },
+                }
+            };
+            let (framed, terminating) = match next {
+                Some(next) => next,
+                None => {
+                    let poll = {
+                        let mut context = std::pin::pin!(dope_fiber::Context::from_ready(
+                            slot.driver(),
+                            slot.ready_key(),
+                            driver.reborrow(),
+                        ));
+                        tasks.as_mut().poll(&task, context.as_mut())
+                    };
+                    let Some(poll) = poll else {
+                        debug_assert!(false, "live task must exist in fiber slab");
+                        Self::release_connection(slot, &project);
+                        return 0;
+                    };
+                    match poll {
+                        Poll::Pending => {
+                            project(&mut slot.state.conn).async_state.task = Some(task.erase());
+                            return cursor;
+                        }
+                        Poll::Ready(output) => {
+                            let close = project(&mut slot.state.conn).deferred_close;
+                            match classify(output, slot, aux, driver, self.date, close) {
                                 TaskPoll::Complete => {
                                     let removed = tasks.as_mut().remove(task);
                                     debug_assert!(removed, "live task must be removable");
-                                    Self::release_connection(conn, slot);
+                                    Self::release_connection(slot, &project);
                                     return 0;
                                 }
                                 TaskPoll::Stream(Some(raw)) => {
@@ -122,13 +125,14 @@ impl<'a> TaskRunner<'a> {
                                     (sark_core::http::codec::Wire::chunk_frame(raw), false)
                                 }
                                 TaskPoll::Stream(None) => {
-                                    conn.async_state.stream_phase = StreamPhase::Terminating;
+                                    project(&mut slot.state.conn).async_state.stream_phase =
+                                        StreamPhase::Terminating;
                                     continue;
                                 }
-                            },
+                            }
                         }
                     }
-                },
+                }
             };
             let capacity = aux.write_buf_for(slot).len();
             if capacity.saturating_sub(cursor) < framed.len() {
@@ -139,12 +143,13 @@ impl<'a> TaskRunner<'a> {
                     if terminating {
                         let removed = tasks.as_mut().remove(task);
                         debug_assert!(removed, "live task must be removable");
-                        Self::release_connection(conn, slot);
+                        Self::release_connection(slot, &project);
                     } else {
-                        conn.async_state.task = Some(task.erase());
+                        project(&mut slot.state.conn).async_state.task = Some(task.erase());
                     }
                     return 0;
                 }
+                let conn = project(&mut slot.state.conn);
                 conn.async_state.task = Some(task.erase());
                 conn.async_state.stream_pending = Some(framed);
                 return cursor;
@@ -155,7 +160,7 @@ impl<'a> TaskRunner<'a> {
             if terminating {
                 let removed = tasks.as_mut().remove(task);
                 debug_assert!(removed, "live task must be removable");
-                Self::release_connection(conn, slot);
+                Self::release_connection(slot, &project);
                 return cursor;
             }
         }
@@ -169,14 +174,22 @@ impl<'a> TaskRunner<'a> {
         aux.write_buf_for(slot)
     }
 
-    fn release_connection<W: Wire, C: Default + 'static>(
-        conn: &mut ConnState,
+    fn release_connection<W, C, PJ>(
         slot: &mut link::slot::Slot<'_, W, listener::State<C>>,
-    ) {
-        conn.async_state.task_stream = false;
-        conn.async_state.stream_phase = StreamPhase::Streaming;
-        conn.recv.unfreeze();
-        if conn.deferred_close {
+        project: &PJ,
+    ) where
+        W: Wire,
+        C: Default + 'static,
+        PJ: Fn(&mut C) -> &mut ConnState,
+    {
+        let deferred_close = {
+            let conn = project(&mut slot.state.conn);
+            conn.async_state.task_stream = false;
+            conn.async_state.stream_phase = StreamPhase::Streaming;
+            conn.recv.unfreeze();
+            conn.deferred_close
+        };
+        if deferred_close {
             slot.set_close_after();
         }
     }

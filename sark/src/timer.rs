@@ -128,8 +128,7 @@ where
         target: TypedToken<Self>,
         driver: &mut DriverContext<'_, 'd>,
     ) {
-        let typed =
-            unsafe { TypedToken::<Listener<'d, ID, P, E>>::new_unchecked(target.into_inner()) };
+        let typed = target.retag::<'d, Listener<'d, ID, P, E>>();
         dope::manifold::Manifold::activate(self.project().inner, typed, driver)
     }
 

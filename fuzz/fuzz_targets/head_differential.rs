@@ -202,29 +202,25 @@ fn httparse_request_line(buf: &[u8]) -> Option<(Vec<u8>, Vec<u8>, u8)> {
 
 fn drive_request_header_scan(buf: &[u8], headers_start: usize) {
     use sark_core::http::codec::HeaderScan;
-    use sark_core::http::head::{Flags, apply_well_known_header_contig};
+    use sark_core::http::head::{Flags, WellKnownHeaders};
 
     let mut scan = HeaderScan::default();
     let mut flags = Flags::default();
     let mut header_count = 0usize;
-    let mut pos = headers_start;
-    loop {
-        if pos + 2 > buf.len() {
-            return;
-        }
-        let rest = &buf[pos..];
-        match apply_well_known_header_contig(
-            rest,
-            &mut scan,
-            &mut flags,
-            &mut (),
-            &mut header_count,
-            128,
-        ) {
-            Ok(Some(0)) => break,
-            Ok(Some(rel)) => pos += rel + 2,
-            Ok(None) => return,
-            Err(_) => return,
+    {
+        let mut headers = WellKnownHeaders::new(&mut scan, &mut flags);
+        let mut pos = headers_start;
+        loop {
+            if pos + 2 > buf.len() {
+                return;
+            }
+            let rest = &buf[pos..];
+            match headers.apply_contiguous(rest, &mut (), &mut header_count, 128) {
+                Ok(Some(0)) => break,
+                Ok(Some(rel)) => pos += rel + 2,
+                Ok(None) => return,
+                Err(_) => return,
+            }
         }
     }
     let _ = scan.validate_for_request();

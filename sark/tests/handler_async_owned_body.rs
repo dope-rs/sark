@@ -110,12 +110,16 @@ fn async_handler_keeps_request_bytes_after_pipelined_request() {
         |_ctx, trigger| {
             let driver_config =
                 driver::Config::for_tcp_profile::<Throughput>(support::MAX_CONNECTIONS);
-            let executor = Executor::new(driver_config)?;
-            executor.enter(|mut session| {
-                server.clone().serve(
-                    &mut session,
-                    EchoDispatch::new(
-                        (),
+                let executor = Executor::new(driver_config)?;
+                executor.enter(|mut session| {
+                    let timer = sark::Timer::with_capacity(
+                        support::MAX_CONNECTIONS.saturating_mul(2),
+                    );
+                    server.clone().serve(
+                        &mut session,
+                        EchoDispatch::new(
+                            &(),
+                            &timer,
                         sark::app::Config {
                             timer_capacity: support::MAX_CONNECTIONS.saturating_mul(2),
                             task_capacity: support::MAX_CONNECTIONS,

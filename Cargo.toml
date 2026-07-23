@@ -19,30 +19,31 @@ members = [
 
 [workspace.package]
 edition = "2024"
-version = "0.10.0"
+version = "0.11.0"
 description = "the L7 layer for dope"
 repository = "https://github.com/dope-rs/sark"
 license = "MIT"
 authors = ["inq <gofiri@gmail.com>"]
 
 [workspace.dependencies]
-dope = "0.9"
-dope-net = "0.9"
-dope-extra = "0.9"
-dope-fiber = "0.9"
-dope-gen = "0.9"
-dope-tls = "0.13"
-o3 = "0.6"
+dope = "0.10.1"
+dope-net = "0.10"
+dope-extra = "0.10"
+dope-fiber = "0.10"
+dope-gen = "0.10.1"
+dope-tls = "0.15"
+o3 = "0.7"
 pin-project = "1"
+pin-project-lite = "0.2"
 prost = "0.14.4"
 prost-build = "0.14.4"
-sark-core = { path = "core", version = "0.10" }
-sark-gen = { path = "gen", version = "0.10" }
-sark-h2 = { path = "h2", version = "0.10" }
-sark-json = { path = "json", version = "0.10" }
-sark-protocol = { path = "protocol", version = "0.10" }
-sark-ws = { path = "ws", version = "0.10" }
-sark = { path = "sark", version = "0.10" }
+sark-core = { path = "core", version = "0.11" }
+sark-gen = { path = "gen", version = "0.11" }
+sark-h2 = { path = "h2", version = "0.11" }
+sark-json = { path = "json", version = "0.11" }
+sark-protocol = { path = "protocol", version = "0.11" }
+sark-ws = { path = "ws", version = "0.11" }
+sark = { path = "sark", version = "0.11" }
 
 [profile.release]
 lto = "fat"

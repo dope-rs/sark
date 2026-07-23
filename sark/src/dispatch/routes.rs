@@ -1,3 +1,4 @@
+use std::ops::Range;
 use std::pin::Pin;
 
 use dope::DriverContext;
@@ -13,9 +14,48 @@ use super::invocation::{StreamRoute, SyncRoute};
 use super::requests::{Ctx, Matched, RequestDomainInput, assemble_matched};
 use super::response_cache::Cache;
 use super::tasks::TaskRunner;
-use crate::CANNED_400;
 use crate::request;
 use crate::service::{self, RouteRequestImpl, RouteSpec, manifold};
+
+pub struct RequestTask<R, S>(core::marker::PhantomData<fn() -> (R, S)>);
+
+impl<'d, R, S> dope_fiber::SplitTask<'d> for RequestTask<R, S>
+where
+    R: RouteSpec + manifold::TaskRoute<'d, S> + 'static,
+    R::Kind: manifold::InvokeKind<R, Output = R::AsyncResponse>,
+{
+    type Input = (R::RawParams, R::RawHeaders, Range<usize>);
+    type State = S;
+    type Context = crate::Timer<'d>;
+    type Output = R::AsyncResponse;
+    type Error = &'static [u8];
+
+    fn build<'req>(
+        view: dope_fiber::SplitView<'req>,
+        (raw_params, raw_headers, target): Self::Input,
+        state: &'req Self::State,
+        timer: &'req Self::Context,
+    ) -> Result<impl dope_fiber::Fiber<'d, Output = Self::Output> + 'req, Self::Error>
+    where
+        'd: 'req,
+        S: 'req,
+    {
+        let (head, body) = view.into_parts();
+        let request = request::Ref::from_slice(target, head, body);
+        let params = R::Request::build_params(&request, raw_params).ok_or(crate::CANNED_400)?;
+        let headers =
+            R::Request::build_headers(&request, raw_headers).map_err(|_| crate::CANNED_400)?;
+        let parsed_body = R::parse_body(body).map_err(|_| crate::CANNED_400)?;
+        Ok(R::invoke_task(
+            params,
+            request,
+            headers,
+            parsed_body,
+            state,
+            timer,
+        ))
+    }
+}
 
 pub enum TaskPoll {
     Complete,
@@ -52,7 +92,7 @@ impl<'d, R: RouteSpec, F> Complete<'d, R, F> for service::manifold::Sync {
 impl<'d, R, F> Complete<'d, R, F> for service::manifold::NativeFiber
 where
     R: RouteSpec,
-    F: dope_fiber::Fiber<'d, Output = R::AsyncResponse> + 'd,
+    F: dope_fiber::Fiber<'d, Output = R::AsyncResponse>,
 {
     fn complete<'a, W: Wire, C: Default + 'static>(
         output: <Self as service::manifold::Kind<'d, R, F>>::Output,
@@ -70,7 +110,7 @@ where
 impl<'d, R, F> Complete<'d, R, F> for service::manifold::NativeStream
 where
     R: RouteSpec,
-    R::Stream: dope_fiber::Fiber<'d, Output = Option<Shared>> + 'd,
+    R::Stream: dope_fiber::Fiber<'d, Output = Option<Shared>>,
 {
     fn complete<'a, W: Wire, C: Default + 'static>(
         output: <Self as service::manifold::Kind<'d, R, F>>::Output,
@@ -84,19 +124,19 @@ where
     }
 }
 
-pub trait Dispatch<'d, R, S, F>
+pub trait Dispatch<'env, 'd, R, S, F>
 where
     R: RouteSpec,
+    'd: 'env,
 {
     #[allow(clippy::too_many_arguments)]
     fn dispatch<T, Tag, MK, Wrap, const N: usize>(
         permit: conn_state::DispatchPermit,
-        scope: dope_fiber::FiberScope<'d>,
-        matched: Matched<'d, R>,
+        matched: Matched<R>,
         tasks: Pin<&mut crate::fiber::FixedSlab<'d, T, N, Tag>>,
-        state: &'d S,
+        state: &'env S,
         ctx: &Ctx<'_>,
-        timer: &'d crate::Timer<'d>,
+        timer: &'env crate::Timer<'d>,
         conn: &mut conn_state::ConnState,
         date: &[u8; 29],
         cache: Cache<'_>,
@@ -106,16 +146,15 @@ where
         wrap: Wrap,
     ) -> conn_state::ConsumeOutcome
     where
-        T: dope_fiber::Fiber<'d> + 'd,
+        T: dope_fiber::Fiber<'d>,
         MK: FnOnce(
-            &'d R,
-            R::Params<'d>,
-            request::Ref<'d>,
-            R::Headers<'d>,
-            R::ParsedBody<'d>,
-            &'d S,
-            &'d crate::Timer<'d>,
-        ) -> F,
+            request::RequestStorage,
+            R::RawParams,
+            R::RawHeaders,
+            Range<usize>,
+            &'env S,
+            &'env crate::Timer<'d>,
+        ) -> Result<F, &'static [u8]>,
         Wrap: FnOnce(
             <Self as service::manifold::Kind<'d, R, F>>::Task,
             <Self as service::manifold::Kind<'d, R, F>>::Owner,
@@ -123,18 +162,18 @@ where
         Self: service::manifold::Kind<'d, R, F>;
 }
 
-impl<'d, R, S, F> Dispatch<'d, R, S, F> for service::manifold::Sync
+impl<'env, 'd, R, S, F> Dispatch<'env, 'd, R, S, F> for service::manifold::Sync
 where
     R: RouteSpec + manifold::Route<S> + 'static,
+    'd: 'env,
 {
     fn dispatch<T, Tag, MK, Wrap, const N: usize>(
         permit: conn_state::DispatchPermit,
-        _scope: dope_fiber::FiberScope<'d>,
-        matched: Matched<'d, R>,
+        matched: Matched<R>,
         _tasks: Pin<&mut crate::fiber::FixedSlab<'d, T, N, Tag>>,
-        state: &'d S,
+        state: &'env S,
         ctx: &Ctx<'_>,
-        _timer: &'d crate::Timer<'d>,
+        _timer: &'env crate::Timer<'d>,
         _conn: &mut conn_state::ConnState,
         date: &[u8; 29],
         cache: Cache<'_>,
@@ -144,16 +183,15 @@ where
         _wrap: Wrap,
     ) -> conn_state::ConsumeOutcome
     where
-        T: dope_fiber::Fiber<'d> + 'd,
+        T: dope_fiber::Fiber<'d>,
         MK: FnOnce(
-            &'d R,
-            R::Params<'d>,
-            request::Ref<'d>,
-            R::Headers<'d>,
-            R::ParsedBody<'d>,
-            &'d S,
-            &'d crate::Timer<'d>,
-        ) -> F,
+            request::RequestStorage,
+            R::RawParams,
+            R::RawHeaders,
+            Range<usize>,
+            &'env S,
+            &'env crate::Timer<'d>,
+        ) -> Result<F, &'static [u8]>,
         Wrap: FnOnce(
             <Self as service::manifold::Kind<'d, R, F>>::Task,
             <Self as service::manifold::Kind<'d, R, F>>::Owner,
@@ -164,27 +202,20 @@ where
     }
 }
 
-impl<'d, R, S, F> Dispatch<'d, R, S, F> for service::manifold::NativeFiber
+impl<'env, 'd, R, S, F> Dispatch<'env, 'd, R, S, F> for service::manifold::NativeFiber
 where
     R: RouteSpec + 'static,
-    S: 'd,
-    F: dope_fiber::Fiber<'d, Output = R::AsyncResponse> + 'd,
-    service::manifold::NativeFiber: service::manifold::Kind<
-            'd,
-            R,
-            F,
-            Task = dope_fiber::OwnerFiber<F, request::RequestStorage>,
-            Owner = (),
-        >,
+    F: dope_fiber::Fiber<'d, Output = R::AsyncResponse>,
+    'd: 'env,
+    service::manifold::NativeFiber: service::manifold::Kind<'d, R, F, Task = F, Owner = ()>,
 {
     fn dispatch<T, Tag, MK, Wrap, const N: usize>(
         permit: conn_state::DispatchPermit,
-        scope: dope_fiber::FiberScope<'d>,
-        matched: Matched<'d, R>,
+        matched: Matched<R>,
         mut tasks: Pin<&mut crate::fiber::FixedSlab<'d, T, N, Tag>>,
-        state: &'d S,
+        state: &'env S,
         ctx: &Ctx<'_>,
-        timer: &'d crate::Timer<'d>,
+        timer: &'env crate::Timer<'d>,
         conn: &mut conn_state::ConnState,
         _date: &[u8; 29],
         _cache: Cache<'_>,
@@ -194,52 +225,36 @@ where
         wrap: Wrap,
     ) -> conn_state::ConsumeOutcome
     where
-        T: dope_fiber::Fiber<'d> + 'd,
+        T: dope_fiber::Fiber<'d>,
         MK: FnOnce(
-            &'d R,
-            R::Params<'d>,
-            request::Ref<'d>,
-            R::Headers<'d>,
-            R::ParsedBody<'d>,
-            &'d S,
-            &'d crate::Timer<'d>,
-        ) -> F,
+            request::RequestStorage,
+            R::RawParams,
+            R::RawHeaders,
+            Range<usize>,
+            &'env S,
+            &'env crate::Timer<'d>,
+        ) -> Result<F, &'static [u8]>,
         Wrap: FnOnce(
             <Self as service::manifold::Kind<'d, R, F>>::Task,
             <Self as service::manifold::Kind<'d, R, F>>::Owner,
         ) -> T,
         Self: service::manifold::Kind<'d, R, F>,
     {
-        let (
-            route,
-            RequestDomainInput {
-                storage,
-                raw_params,
-                raw_headers,
-                target,
-                total,
-                conn_close,
-            },
-        ) = match assemble_matched(permit, matched, ctx, conn) {
+        let RequestDomainInput {
+            storage,
+            raw_params,
+            raw_headers,
+            target,
+            total,
+            conn_close,
+        } = match assemble_matched(permit, matched, ctx, conn) {
             Ok(request) => request,
             Err(outcome) => return outcome,
         };
         let Some(entry) = tasks.as_mut().vacant_entry() else {
             return conn_state::ConsumeOutcome::Close(crate::CANNED_503);
         };
-        let task = match dope_fiber::OwnerFiber::try_from_split(
-            storage,
-            scope,
-            |view| -> Result<F, &'static [u8]> {
-                let (head, body) = view.into_parts();
-                let request = request::Ref::<'d>::from_slice(target, head, body);
-                let params = R::Request::build_params(&request, raw_params).ok_or(CANNED_400)?;
-                let headers =
-                    R::Request::build_headers(&request, raw_headers).map_err(|_| CANNED_400)?;
-                let body = R::parse_body(body).map_err(|_| CANNED_400)?;
-                Ok(make(route, params, request, headers, body, state, timer))
-            },
-        ) {
+        let task = match make(storage, raw_params, raw_headers, target, state, timer) {
             Ok(task) => wrap(task, ()),
             Err(reason) => return conn_state::ConsumeOutcome::Close(reason),
         };
@@ -253,23 +268,22 @@ where
     }
 }
 
-impl<'d, R, S, F> Dispatch<'d, R, S, F> for service::manifold::NativeStream
+impl<'env, 'd, R, S, F> Dispatch<'env, 'd, R, S, F> for service::manifold::NativeStream
 where
     R: RouteSpec + manifold::Route<S> + 'static,
     for<'req> R::Response<'req>: Shape<'req, StreamInner = R::Stream>,
-    R::Stream: dope_fiber::Fiber<'d, Output = Option<Shared>> + 'd,
-    S: 'd,
+    R::Stream: dope_fiber::Fiber<'d, Output = Option<Shared>>,
+    'd: 'env,
     service::manifold::NativeStream:
         service::manifold::Kind<'d, R, F, Task = R::Stream, Owner = ()>,
 {
     fn dispatch<T, Tag, MK, Wrap, const N: usize>(
         permit: conn_state::DispatchPermit,
-        _scope: dope_fiber::FiberScope<'d>,
-        matched: Matched<'d, R>,
+        matched: Matched<R>,
         tasks: Pin<&mut crate::fiber::FixedSlab<'d, T, N, Tag>>,
-        state: &'d S,
+        state: &'env S,
         ctx: &Ctx<'_>,
-        _timer: &'d crate::Timer<'d>,
+        _timer: &'env crate::Timer<'d>,
         conn: &mut conn_state::ConnState,
         date: &[u8; 29],
         _cache: Cache<'_>,
@@ -279,16 +293,15 @@ where
         wrap: Wrap,
     ) -> conn_state::ConsumeOutcome
     where
-        T: dope_fiber::Fiber<'d> + 'd,
+        T: dope_fiber::Fiber<'d>,
         MK: FnOnce(
-            &'d R,
-            R::Params<'d>,
-            request::Ref<'d>,
-            R::Headers<'d>,
-            R::ParsedBody<'d>,
-            &'d S,
-            &'d crate::Timer<'d>,
-        ) -> F,
+            request::RequestStorage,
+            R::RawParams,
+            R::RawHeaders,
+            Range<usize>,
+            &'env S,
+            &'env crate::Timer<'d>,
+        ) -> Result<F, &'static [u8]>,
         Wrap: FnOnce(
             <Self as service::manifold::Kind<'d, R, F>>::Task,
             <Self as service::manifold::Kind<'d, R, F>>::Owner,

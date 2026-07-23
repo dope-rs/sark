@@ -45,10 +45,13 @@ fn handler_yields_chunked_response() {
                     driver::Config::for_tcp_profile::<Throughput>(support::MAX_CONNECTIONS);
                 let executor = Executor::new(driver_config)?;
                 executor.enter(|mut session| {
+                    let timer =
+                        sark::Timer::with_capacity(support::MAX_CONNECTIONS.saturating_mul(2));
                     server.clone().serve(
                         &mut session,
                         StreamDispatch::new(
-                            (),
+                            &(),
+                            &timer,
                             sark::app::Config {
                                 timer_capacity: support::MAX_CONNECTIONS.saturating_mul(2),
                                 task_capacity: support::MAX_CONNECTIONS,

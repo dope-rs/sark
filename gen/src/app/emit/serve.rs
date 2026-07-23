@@ -9,6 +9,7 @@ use crate::route_compiler::static_tree::StaticRoute;
 struct TaskSpec<'a> {
     route: &'a syn::TypePath,
     route_index: &'a syn::Index,
+    kind: &'a RouteKind,
     capacity: &'a syn::Expr,
     slot: usize,
     future: syn::Ident,
@@ -22,6 +23,42 @@ impl TaskSpec<'_> {
         quote! {
             <<#route as ::sark::service::RouteSpec>::Kind
                 as ::sark::service::manifold::Kind<'d, #route, #future>>::Task
+        }
+    }
+
+    fn producer_output(&self) -> TokenStream {
+        let route = self.route;
+        match self.kind {
+            RouteKind::Fiber => quote! {
+                <#route as ::sark::service::RouteSpec>::AsyncResponse
+            },
+            RouteKind::Stream => quote! {
+                <<#route as ::sark::service::RouteSpec>::Kind
+                    as ::sark::service::manifold::InvokeKind<#route>>::Output
+            },
+            RouteKind::Sync => unreachable!("sync routes have no task slot"),
+        }
+    }
+
+    fn slab_output(&self) -> TokenStream {
+        match self.kind {
+            RouteKind::Fiber => self.producer_output(),
+            RouteKind::Stream => quote! {
+                ::core::option::Option<::sark::o3::buffer::Shared>
+            },
+            RouteKind::Sync => unreachable!("sync routes have no task slot"),
+        }
+    }
+
+    fn slab_type(&self) -> TokenStream {
+        let route = self.route;
+        let future = &self.future;
+        match self.kind {
+            RouteKind::Fiber => quote!(#future),
+            RouteKind::Stream => {
+                quote!(<#route as ::sark::service::RouteSpec>::Stream)
+            }
+            RouteKind::Sync => unreachable!("sync routes have no task slot"),
         }
     }
 }
@@ -41,6 +78,7 @@ fn task_specs(spec: &Gen) -> Vec<TaskSpec<'_>> {
         .map(|(slot, (entry, route, route_index))| TaskSpec {
             route,
             route_index,
+            kind: &entry.kind,
             capacity: entry.capacity.as_ref().expect("async route capacity"),
             slot,
             future: format_ident!("__F{:04}", slot),
@@ -278,7 +316,6 @@ impl<'a> ServeEmit<'a> {
         let name = format_ident!("{}Inner", public_name);
         let core_ident = format_ident!("{}Core", name);
         let state_ty = &self.spec.state_ty;
-        let routes = &self.spec.routes;
         let sync_count = self
             .spec
             .route_specs
@@ -313,23 +350,35 @@ impl<'a> ServeEmit<'a> {
                 let route = task.route;
                 let future = &task.future;
                 let maker = &task.maker;
+                let output = task.producer_output();
                 quote! {
                     #future: ::sark::fiber::Fiber<
                             'd,
-                            Output = <<#route as ::sark::service::RouteSpec>::Kind
-                                as ::sark::service::manifold::InvokeKind<#route>>::Output,
-                        > + 'd,
+                            Output = #output,
+                        > + 'env,
                     #maker: ::core::marker::Copy
-                        + 'd
+                        + 'env
                         + ::core::ops::FnOnce(
-                            &'d #route,
-                            <#route as ::sark::service::RouteSpec>::Params<'d>,
-                            ::sark::request::Ref<'d>,
-                            <#route as ::sark::service::RouteSpec>::Headers<'d>,
-                            <#route as ::sark::service::RouteSpec>::ParsedBody<'d>,
-                            &'d #state_ty,
-                            &'d ::sark::Timer<'d>,
-                        ) -> #future,
+                            ::sark::request::RequestStorage,
+                            <#route as ::sark::service::RouteSpec>::RawParams,
+                            <#route as ::sark::service::RouteSpec>::RawHeaders,
+                            ::core::ops::Range<usize>,
+                            &'env #state_ty,
+                            &'env ::sark::Timer<'d>,
+                        ) -> ::core::result::Result<#future, &'static [u8]>,
+                }
+            })
+            .collect();
+        let slab_bounds: Vec<TokenStream> = tasks
+            .iter()
+            .map(|task| {
+                let task_type = task.slab_type();
+                let output = task.slab_output();
+                quote! {
+                    #task_type: ::sark::fiber::FixedSlabFiber<
+                        'd,
+                        #output,
+                    >,
                 }
             })
             .collect();
@@ -337,8 +386,41 @@ impl<'a> ServeEmit<'a> {
             .iter()
             .map(|task| {
                 let route = task.route;
-                quote! {
-                    <#route as ::sark::service::manifold::TaskRoute<'d, #state_ty>>::invoke_task
+                match task.kind {
+                    RouteKind::Fiber => quote! {
+                    |
+                        storage: ::sark::request::RequestStorage,
+                        raw_params: <#route as ::sark::service::RouteSpec>::RawParams,
+                        raw_headers: <#route as ::sark::service::RouteSpec>::RawHeaders,
+                        target: ::core::ops::Range<usize>,
+                        state: &'env #state_ty,
+                        timer: &'env ::sark::Timer<'d>,
+                    | {
+                        ::sark::fiber::try_from_split_task::<
+                            ::sark::dispatch::RequestTask<#route, #state_ty>,
+                        >(
+                            storage,
+                            (raw_params, raw_headers, target),
+                            state,
+                            timer,
+                        )
+                    }
+                    },
+                    RouteKind::Stream => quote! {
+                        |
+                            _storage: ::sark::request::RequestStorage,
+                            _raw_params: <#route as ::sark::service::RouteSpec>::RawParams,
+                            _raw_headers: <#route as ::sark::service::RouteSpec>::RawHeaders,
+                            _target: ::core::ops::Range<usize>,
+                            _state: &'env #state_ty,
+                            _timer: &'env ::sark::Timer<'d>,
+                        | {
+                            ::core::result::Result::<_, &'static [u8]>::Ok(
+                                ::sark::service::manifold::ready(),
+                            )
+                        }
+                    },
+                    RouteKind::Sync => unreachable!("sync routes have no task producer"),
                 }
             })
             .collect();
@@ -346,6 +428,9 @@ impl<'a> ServeEmit<'a> {
         let capacities: Vec<_> = tasks.iter().map(|task| task.capacity).collect();
         let task_tags: Vec<_> = (0..task_count)
             .map(|slot| format_ident!("__{}TaskTag{:04}", public_name, slot))
+            .collect();
+        let task_field_names: Vec<_> = (0..task_count)
+            .map(|slot| format_ident!("__task_slot_{slot:04}"))
             .collect();
         let task_slab_types: Vec<TokenStream> = task_types
             .iter()
@@ -357,7 +442,6 @@ impl<'a> ServeEmit<'a> {
                 }
             })
             .collect();
-        let route_values: Vec<TokenStream> = routes.iter().map(|route| quote!(#route)).collect();
         let constructor_module = {
             let value = public_name.to_string();
             let mut snake = String::with_capacity(value.len() + 4);
@@ -371,23 +455,24 @@ impl<'a> ServeEmit<'a> {
         };
         let app_generic_def = quote! {
             <
-                'd,
+                'env,
+                'd: 'env,
                 __W: ::dope_net::wire::Wire,
                 #( #futures, )*
                 #( #makers, )*
             >
         };
         let generic_use = quote! {
-            <'d, __W, #( #futures, )* #( #makers, )*>
+            <'env, 'd, __W, #( #futures, )* #( #makers, )*>
         };
         let build_return = quote! {
-            super::#name<'d, __W, #( #futures, )* #( #makers, )*>
+            super::#name<'env, 'd, __W, #( #futures, )* #( #makers, )*>
         };
         let task_fields = if tasks.is_empty() {
             TokenStream::new()
         } else {
             quote! {
-                tasks: ( #( #task_slab_types, )* ),
+                #( #[pin] #task_field_names: #task_slab_types, )*
                 task_producers: ( #( #makers, )* ),
                 task_capacity: usize,
                 active_tasks: usize,
@@ -397,7 +482,12 @@ impl<'a> ServeEmit<'a> {
             TokenStream::new()
         } else {
             quote! {
-                tasks: ( #( { let _ = #capacities; ::sark::fiber::FixedSlab::new() }, )* ),
+                #(
+                    #task_field_names: {
+                        let _ = #capacities;
+                        ::sark::fiber::FixedSlab::new()
+                    },
+                )*
                 task_producers: producers,
                 task_capacity: config.task_capacity,
                 active_tasks: 0,
@@ -428,33 +518,35 @@ impl<'a> ServeEmit<'a> {
             #task_count_assert
             #( struct #task_tags; )*
 
-            struct #core_ident #app_generic_def
-            where
-                #( #route_bounds )*
-                #( #maker_bounds )*
-                #( #kind_bounds, )*
-            {
-                response_cache: [
-                    ::core::cell::OnceCell<::sark::dispatch::response_cache::Entry>;
-                    #sync_count
-                ],
-                gzip: ::sark::sark_core::http::compress::Gzip,
-                #task_fields
-                timer: ::sark::Timer<'d>,
-                routes: ( #( #routes, )* ),
-                state: #state_ty,
-                marker: ::core::marker::PhantomData<__W>,
-                pin: ::core::marker::PhantomPinned,
+            ::sark::__pin_project! {
+                struct #core_ident #app_generic_def
+                where
+                    #( #slab_bounds )*
+                {
+                    response_cache: [
+                        ::core::cell::OnceCell<::sark::dispatch::response_cache::Entry>;
+                        #sync_count
+                    ],
+                    gzip: ::sark::sark_core::http::compress::Gzip,
+                    #task_fields
+                    timer: &'env ::sark::Timer<'d>,
+                    state: &'env #state_ty,
+                    marker: ::core::marker::PhantomData<__W>,
+                    #[pin]
+                    pin: ::core::marker::PhantomPinned,
+                }
             }
 
-            struct #name #app_generic_def
-            where
-                #( #route_bounds )*
-                #( #maker_bounds )*
-                #( #kind_bounds, )*
-            {
-                core: #core_ident #generic_use,
-                date: ::sark::date::Stamp,
+            ::sark::__pin_project! {
+                struct #name #app_generic_def
+                where
+                    #( #slab_bounds )*
+                {
+                    #[pin]
+                    core: #core_ident #generic_use,
+                    #[pin]
+                    date: ::sark::date::Stamp,
+                }
             }
 
             impl #app_generic_def #name #generic_use
@@ -469,13 +561,8 @@ impl<'a> ServeEmit<'a> {
                     ::core::pin::Pin<&mut #core_ident #generic_use>,
                     ::core::pin::Pin<&mut ::sark::date::Stamp>,
                 ) {
-                    let this = unsafe { ::core::pin::Pin::into_inner_unchecked(self) };
-                    unsafe {
-                        (
-                            ::core::pin::Pin::new_unchecked(&mut this.core),
-                            ::core::pin::Pin::new_unchecked(&mut this.date),
-                        )
-                    }
+                    let this = self.project();
+                    (this.core, this.date)
                 }
             }
 
@@ -483,10 +570,12 @@ impl<'a> ServeEmit<'a> {
 
             impl #public_name {
                 #vis fn new<
-                    'd,
+                    'env,
+                    'd: 'env,
                     __W: ::dope_net::wire::Wire,
                 >(
-                    state: #state_ty,
+                    state: &'env #state_ty,
+                    timer: &'env ::sark::Timer<'d>,
                     config: ::sark::app::Config,
                 ) -> impl ::dope::manifold::listener::Application<
                         'd,
@@ -498,12 +587,13 @@ impl<'a> ServeEmit<'a> {
                     + ::sark::dispatch::H1Project<'d, __W>
                     + ::sark::dispatch::Decode
                     + ::sark::dispatch::Routing<'d>
-                    + 'd
+                    + 'env
                 where
                     #( #route_bounds )*
                 {
                     #constructor_module::build(
                         state,
+                        timer,
                         config,
                         #producer_argument
                     )
@@ -514,12 +604,14 @@ impl<'a> ServeEmit<'a> {
                 use super::*;
 
                 pub(super) fn build<
-                    'd,
+                    'env,
+                    'd: 'env,
                     __W: ::dope_net::wire::Wire,
                     #( #futures, )*
                     #( #makers, )*
                 >(
-                    state: #state_ty,
+                    state: &'env #state_ty,
+                    timer: &'env ::sark::Timer<'d>,
                     config: ::sark::app::Config,
                     #producer_parameter
                 ) -> #build_return
@@ -536,8 +628,7 @@ impl<'a> ServeEmit<'a> {
                             ],
                             gzip: ::sark::sark_core::http::compress::Gzip::new(),
                             #task_initializers
-                            timer: ::sark::Timer::with_capacity(config.timer_capacity),
-                            routes: ( #( #route_values, )* ),
+                            timer,
                             state,
                             marker: ::core::marker::PhantomData,
                             pin: ::core::marker::PhantomPinned,
@@ -554,7 +645,6 @@ impl<'a> ServeEmit<'a> {
         let state_ty = &self.spec.state_ty;
         let routes = &self.spec.routes;
         let route_bounds = &self.spec.route_bounds;
-        let indices = &self.spec.idx;
         let core_ident = format_ident!("{}Core", name);
         let tasks = task_specs(self.spec);
         let futures: Vec<_> = tasks.iter().map(|task| &task.future).collect();
@@ -562,6 +652,9 @@ impl<'a> ServeEmit<'a> {
         let task_types: Vec<TokenStream> = tasks.iter().map(TaskSpec::task_type).collect();
         let task_tags: Vec<_> = (0..tasks.len())
             .map(|slot| format_ident!("__{}TaskTag{:04}", self.spec.name, slot))
+            .collect();
+        let task_field_names: Vec<_> = (0..tasks.len())
+            .map(|slot| format_ident!("__task_slot_{slot:04}"))
             .collect();
         let mut route_task_slots = vec![None; routes.len()];
         for task in &tasks {
@@ -597,23 +690,22 @@ impl<'a> ServeEmit<'a> {
                 let route = task.route;
                 let future = &task.future;
                 let maker = &task.maker;
+                let output = task.producer_output();
                 quote! {
                     #future: ::sark::fiber::Fiber<
                             'd,
-                            Output = <<#route as ::sark::service::RouteSpec>::Kind
-                                as ::sark::service::manifold::InvokeKind<#route>>::Output,
-                        > + 'd,
+                            Output = #output,
+                        > + 'env,
                     #maker: ::core::marker::Copy
-                        + 'd
+                        + 'env
                         + ::core::ops::FnOnce(
-                            &'d #route,
-                            <#route as ::sark::service::RouteSpec>::Params<'d>,
-                            ::sark::request::Ref<'d>,
-                            <#route as ::sark::service::RouteSpec>::Headers<'d>,
-                            <#route as ::sark::service::RouteSpec>::ParsedBody<'d>,
-                            &'d #state_ty,
-                            &'d ::sark::Timer<'d>,
-                        ) -> #future,
+                            ::sark::request::RequestStorage,
+                            <#route as ::sark::service::RouteSpec>::RawParams,
+                            <#route as ::sark::service::RouteSpec>::RawHeaders,
+                            ::core::ops::Range<usize>,
+                            &'env #state_ty,
+                            &'env ::sark::Timer<'d>,
+                        ) -> ::core::result::Result<#future, &'static [u8]>,
                     <#route as ::sark::service::RouteSpec>::Kind:
                         ::sark::service::manifold::InvokeKind<#route>
                         + ::sark::service::manifold::Kind<
@@ -622,7 +714,13 @@ impl<'a> ServeEmit<'a> {
                             #future,
                             Owner = (),
                         >
-                        + ::sark::dispatch::Dispatch<'d, #route, #state_ty, #future>
+                        + ::sark::dispatch::Dispatch<
+                            'env,
+                            'd,
+                            #route,
+                            #state_ty,
+                            #future,
+                        >
                         + ::sark::dispatch::Complete<'d, #route, #future>
                         + ::sark::dispatch::DecodeRoute<#route, #state_ty>,
                 }
@@ -643,24 +741,22 @@ impl<'a> ServeEmit<'a> {
             .collect();
         let generic_def = quote! {
             <
-                'd,
+                'env,
+                'd: 'env,
                 __W: ::dope_net::wire::Wire,
                 #( #futures, )*
                 #( #makers, )*
             >
         };
         let generic_use = quote! {
-            <'d, __W, #( #futures, )* #( #makers, )*>
+            <'env, 'd, __W, #( #futures, )* #( #makers, )*>
         };
         let dispatch_for = |index: usize, raw_params: TokenStream| {
             let route = &routes[index];
-            let route_index = &indices[index];
             let middleware = &wrap_before[index];
             let setup = quote! {
                 #middleware
-                let route: &'d #route =
-                    unsafe { &*(&this.routes.#route_index as *const #route) };
-                let state: &'d #state_ty = state;
+                let state: &'env #state_ty = state;
             };
             let Some(task_slot) = route_task_slots[index] else {
                 let cache_index =
@@ -673,12 +769,11 @@ impl<'a> ServeEmit<'a> {
                         ::sark::dispatch::response_cache::Cache::new(
                             &this.response_cache[#cache_index],
                         ),
-                        &mut this.gzip,
+                        this.gzip,
                         write,
                     ).dispatch::<#route, #state_ty>(
                         permit,
                         ::sark::dispatch::Matched {
-                            route,
                             raw_params: #raw_params,
                         },
                         state,
@@ -690,46 +785,43 @@ impl<'a> ServeEmit<'a> {
             let capacity = task.capacity;
             let task_type = &task_types[task_slot];
             let task_tag = &task_tags[task_slot];
+            let task_field = &task_field_names[task_slot];
             let task_index = syn::Index::from(task_slot);
             let task_route = task_slot as u16;
             quote! {
                 #setup
-                if this.active_tasks >= this.task_capacity {
+                if *this.active_tasks >= *this.task_capacity {
                     return ::sark::dispatch::ConsumeOutcome::Close(::sark::CANNED_503);
                 }
-                let timer: &'d ::sark::Timer<'d> =
-                    unsafe { &*(::sark::timer::TimerHost::timer(this) as *const _) };
+                let timer: &'env ::sark::Timer<'d> = *this.timer;
                 let producer = this.task_producers.#task_index;
                 let outcome = <<#route as ::sark::service::RouteSpec>::Kind
                     as ::sark::dispatch::Dispatch<
+                        'env,
                         'd,
                         #route,
                         #state_ty,
                         #future,
                     >>::dispatch::<#task_type, #task_tag, _, _, { #capacity }>(
                         permit,
-                        scope,
                         ::sark::dispatch::Matched {
-                        route,
-                        raw_params: #raw_params,
-                    },
-                    unsafe {
-                        ::core::pin::Pin::new_unchecked(&mut this.tasks.#task_index)
-                    },
+                            raw_params: #raw_params,
+                        },
+                    this.#task_field.as_mut(),
                     state,
                     &ctx,
                     timer,
                     conn,
                     date,
                     ::sark::dispatch::response_cache::Cache::empty(),
-                    &mut this.gzip,
+                    this.gzip,
                     write,
                     producer,
                     |task, ()| task,
                 );
                 if conn.async_state.task.is_some() {
                     conn.async_state.task_route = #task_route;
-                    this.active_tasks += 1;
+                    *this.active_tasks += 1;
                 }
                 return outcome;
             }
@@ -824,7 +916,6 @@ impl<'a> ServeEmit<'a> {
                 continue;
             }
             let route = &routes[index];
-            let route_index = &indices[index];
             decoded_routes.push(StaticRoute {
                 method: entry.meta.method,
                 path: entry.path.value().into_bytes(),
@@ -854,14 +945,13 @@ impl<'a> ServeEmit<'a> {
                     }
                     return <<#route as ::sark::service::RouteSpec>::Kind
                         as ::sark::dispatch::DecodeRoute<#route, #state_ty>>::decode(
-                        &self.routes.#route_index,
                         <<#route as ::sark::service::RouteSpec>::RawParams
                             as ::core::default::Default>::default(),
                         raw_headers,
                         ::core::clone::Clone::clone(&__http_method),
                         __head_bytes,
                         __body_bytes,
-                        &self.state,
+                        self.state,
                         __encoder,
                     );
                 },
@@ -890,15 +980,13 @@ impl<'a> ServeEmit<'a> {
             .map(|task| {
                 let route = task.route;
                 let future = &task.future;
-                let task_index = syn::Index::from(task.slot);
+                let task_field = &task_field_names[task.slot];
                 let task_route = task.slot as u16;
                 quote! {
                     #task_route => {
                         let task_runner = ::sark::dispatch::TaskRunner::new(&task_date);
                         let written = task_runner.poll(
-                            unsafe {
-                                ::core::pin::Pin::new_unchecked(&mut this.tasks.#task_index)
-                            },
+                            this.#task_field.as_mut(),
                             slot,
                             aux,
                             driver,
@@ -939,10 +1027,10 @@ impl<'a> ServeEmit<'a> {
             let task_date = date.load();
             match task_route {
                 #( #pump_arms )*
-                _ => unsafe { ::core::hint::unreachable_unchecked() },
+                _ => unreachable!("active task route is outside the generated route set"),
             }
             if !project(&mut slot.state.conn).async_state.has_task() {
-                this.active_tasks -= 1;
+                *this.active_tasks -= 1;
             }
         };
         let send_body = if tasks.is_empty() {
@@ -961,7 +1049,7 @@ impl<'a> ServeEmit<'a> {
         } else {
             quote! {
                 {
-                    let this = unsafe { self.as_mut().get_unchecked_mut() };
+                    let mut this = self.as_mut().project();
                     if project(&mut slot.state.conn).async_state.task_stream
                         && project(&mut slot.state.conn).async_state.has_task()
                     {
@@ -985,8 +1073,9 @@ impl<'a> ServeEmit<'a> {
         };
         let wake_body = if tasks.is_empty() {
             quote! {
-                let this = unsafe { self.as_mut().get_unchecked_mut() };
-                let _ = ::sark::dispatch::HeadDeadline::new(this).poll_proj(
+                let _ = ::sark::dispatch::HeadDeadline::new(
+                    self.as_ref().get_ref(),
+                ).poll_proj(
                     slot,
                     aux,
                     driver,
@@ -995,8 +1084,9 @@ impl<'a> ServeEmit<'a> {
             }
         } else {
             quote! {
-                let this = unsafe { self.as_mut().get_unchecked_mut() };
-                if ::sark::dispatch::HeadDeadline::new(this).poll_proj(
+                if ::sark::dispatch::HeadDeadline::new(
+                    self.as_ref().get_ref(),
+                ).poll_proj(
                     slot,
                     aux,
                     driver,
@@ -1004,6 +1094,7 @@ impl<'a> ServeEmit<'a> {
                 ) {
                     return;
                 }
+                let mut this = self.project();
                 if !project(&mut slot.state.conn).async_state.has_task() {
                     return;
                 }
@@ -1018,14 +1109,12 @@ impl<'a> ServeEmit<'a> {
         let release_arms: Vec<TokenStream> = tasks
             .iter()
             .map(|task| {
-                let task_index = syn::Index::from(task.slot);
+                let task_field = &task_field_names[task.slot];
                 let task_route = task.slot as u16;
                 let task_tag = &task_tags[task.slot];
                 quote! {
                     #task_route => {
-                        let slab = unsafe {
-                            ::core::pin::Pin::new_unchecked(&mut this.tasks.#task_index)
-                        };
+                        let slab = this.#task_field.as_mut();
                         slab.remove(
                             ::sark::fiber::TaskId::<#task_tag>::from_erased(task),
                         )
@@ -1035,19 +1124,22 @@ impl<'a> ServeEmit<'a> {
             .collect();
         let close_body = if tasks.is_empty() {
             quote! {
-                let this = unsafe { self.get_unchecked_mut() };
-                ::sark::dispatch::HeadDeadline::new(this).cancel_proj(
+                ::sark::dispatch::HeadDeadline::new(
+                    self.as_ref().get_ref(),
+                ).cancel_proj(
                     slot,
                     &project,
                 );
             }
         } else {
             quote! {
-                let this = unsafe { self.get_unchecked_mut() };
-                ::sark::dispatch::HeadDeadline::new(this).cancel_proj(
+                ::sark::dispatch::HeadDeadline::new(
+                    self.as_ref().get_ref(),
+                ).cancel_proj(
                     slot,
                     &project,
                 );
+                let mut this = self.project();
                 if let ::core::option::Option::Some(task) =
                     project(&mut slot.state.conn).async_state.task.take()
                 {
@@ -1056,7 +1148,7 @@ impl<'a> ServeEmit<'a> {
                         _ => false,
                     };
                     debug_assert!(removed, "live task must be removable");
-                    this.active_tasks -= 1;
+                    *this.active_tasks -= 1;
                     let state = project(&mut slot.state.conn);
                     state.async_state.task_stream = false;
                 }
@@ -1239,9 +1331,8 @@ impl<'a> ServeEmit<'a> {
                 #[allow(clippy::too_many_arguments)]
                 fn dispatch_request<'buf>(
                     self: ::core::pin::Pin<&mut Self>,
-                    scope: ::sark::fiber::FiberScope<'d>,
                     permit: ::sark::dispatch::conn_state::DispatchPermit,
-                    state: &'d #state_ty,
+                    state: &'env #state_ty,
                     req_bytes: &'buf [u8],
                     head: &::sark::sark_core::http::codec::ParsedRequestHead<'buf>,
                     method_key: ::sark::service::Key,
@@ -1249,7 +1340,7 @@ impl<'a> ServeEmit<'a> {
                     write: &mut [u8],
                     conn: &mut ::sark::dispatch::conn_state::ConnState,
                 ) -> ::sark::dispatch::ConsumeOutcome {
-                    let this = unsafe { self.get_unchecked_mut() };
+                    let mut this = self.project();
                     #dispatch_body
                 }
             }
@@ -1296,13 +1387,12 @@ impl<'a> ServeEmit<'a> {
                 #( #maker_bounds )*
             {
                 fn timer(&self) -> &::sark::Timer<'d> {
-                    &self.timer
+                    self.timer
                 }
 
                 fn try_consume(
                     self: ::core::pin::Pin<&mut Self>,
                     stamp: &::sark::date::Stamp,
-                    scope: ::sark::fiber::FiberScope<'d>,
                     permit: ::sark::dispatch::conn_state::DispatchPermit,
                     bytes: &[u8],
                     write: &mut [u8],
@@ -1317,12 +1407,9 @@ impl<'a> ServeEmit<'a> {
                         };
                     };
                     let date = stamp.load();
-                    let state: &'d #state_ty = unsafe {
-                        &*(&self.as_ref().get_ref().state as *const #state_ty)
-                    };
+                    let state: &'env #state_ty = self.as_ref().get_ref().state;
                     #core_ident::dispatch_request(
                         self,
-                        scope,
                         permit,
                         state,
                         bytes,
@@ -1342,7 +1429,6 @@ impl<'a> ServeEmit<'a> {
             {
                 fn try_consume(
                     self: ::core::pin::Pin<&mut Self>,
-                    scope: ::sark::fiber::FiberScope<'d>,
                     permit: ::sark::dispatch::conn_state::DispatchPermit,
                     bytes: &[u8],
                     write: &mut [u8],
@@ -1355,7 +1441,6 @@ impl<'a> ServeEmit<'a> {
                     );
                     ::sark::dispatch::Routing::try_consume(
                         ::core::pin::Pin::new(&mut host),
-                        scope,
                         permit,
                         bytes,
                         write,
@@ -1372,7 +1457,7 @@ impl<'a> ServeEmit<'a> {
                 fn stamp(
                     self: ::core::pin::Pin<&Self>,
                 ) -> ::core::pin::Pin<&::sark::date::Stamp> {
-                    unsafe { self.map_unchecked(|this| &this.date) }
+                    self.project_ref().date
                 }
             }
 
@@ -1382,7 +1467,7 @@ impl<'a> ServeEmit<'a> {
                 #( #maker_bounds )*
             {
                 fn timer(&self) -> &::sark::Timer<'d> {
-                    &self.core.timer
+                    self.core.timer
                 }
             }
 
@@ -1392,7 +1477,7 @@ impl<'a> ServeEmit<'a> {
                 #( #maker_bounds )*
             {
                 fn timer(&self) -> &::sark::Timer<'d> {
-                    &self.timer
+                    self.timer
                 }
             }
 

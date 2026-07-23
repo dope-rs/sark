@@ -233,12 +233,12 @@ impl<'a> WellKnownHeaders<'a> {
         header_count: &mut usize,
         max_header_count: usize,
     ) -> Result<Option<usize>> {
-        let line_end = match crate::simd::scan_header_value(bytes, colon_idx + 1) {
-            crate::simd::HeaderValueOutcome::Found { pos } => pos,
-            crate::simd::HeaderValueOutcome::Invalid => {
+        let line_end = match crate::http::scan::scan_header_value(bytes, colon_idx + 1) {
+            crate::http::scan::HeaderValueOutcome::Found { pos } => pos,
+            crate::http::scan::HeaderValueOutcome::Invalid => {
                 return Err(Error::bad_request(ERR_INVALID_HEADER_VALUE));
             }
-            crate::simd::HeaderValueOutcome::None => return Ok(None),
+            crate::http::scan::HeaderValueOutcome::None => return Ok(None),
         };
         Self::count_header(header_count, max_header_count)?;
         let Some(name) = bytes.get(..colon_idx) else {

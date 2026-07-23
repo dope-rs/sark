@@ -1,5 +1,5 @@
 error[E0308]: mismatched types
-  --> tests/ui/routing_requires_pin.rs:38:9
+  --> tests/ui/routing_requires_pin.rs:40:9
    |
 21 | / sark_gen::define_route! {
 22 | |     App: () => {
@@ -8,9 +8,9 @@ error[E0308]: mismatched types
 25 | | }
    | |_- the found opaque type
 ...
-37 |       Routing::try_consume(
+39 |       Routing::try_consume(
    |       -------------------- arguments to this function are incorrect
-38 |           &mut app,
+40 |           &mut app,
    |           ^^^^^^^^ expected `Pin<&mut _>`, found `&mut ...`
    |
    = note:         expected struct `Pin<&mut _>`

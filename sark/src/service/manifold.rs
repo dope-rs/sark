@@ -146,7 +146,7 @@ where
     R: RouteSpec,
 {
     type Owner;
-    type Task: Fiber<'d, Output = Self::Output> + 'd;
+    type Task: Fiber<'d, Output = Self::Output>;
     type Output;
 
     const STREAM: bool;
@@ -166,10 +166,10 @@ where
 impl<'d, R, F> Kind<'d, R, F> for NativeFiber
 where
     R: RouteSpec,
-    F: Fiber<'d, Output = R::AsyncResponse> + 'd,
+    F: Fiber<'d, Output = R::AsyncResponse>,
 {
     type Owner = ();
-    type Task = dope_fiber::OwnerFiber<F, request::RequestStorage>;
+    type Task = F;
     type Output = R::AsyncResponse;
 
     const STREAM: bool = false;
@@ -178,7 +178,7 @@ where
 impl<'d, R, F> Kind<'d, R, F> for NativeStream
 where
     R: RouteSpec,
-    R::Stream: Fiber<'d, Output = Option<Shared>> + 'd,
+    R::Stream: Fiber<'d, Output = Option<Shared>>,
 {
     type Owner = ();
     type Task = R::Stream;
@@ -189,7 +189,6 @@ where
 
 pub trait Route<State>: RouteSpec {
     fn invoke<'req, 'a>(
-        &'a self,
         params: <Self as RouteSpec>::Params<'req>,
         req: &request::Ref<'req>,
         headers: <Self as RouteSpec>::Headers<'req>,
@@ -205,7 +204,6 @@ where
     Self::Kind: InvokeKind<Self>,
 {
     fn invoke_task<'req>(
-        &'req self,
         params: <Self as RouteSpec>::Params<'req>,
         req: request::Ref<'req>,
         headers: <Self as RouteSpec>::Headers<'req>,

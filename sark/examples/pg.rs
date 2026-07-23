@@ -302,22 +302,16 @@ fn main() -> io::Result<()> {
                 .seed()
                 .derive(dope::hash::domain::BACKOFF ^ PG_CONNECTOR_ID as u64)
                 .state();
-            let port = session.storage() as *const Port<'_, Db>;
-            // The pool is owned by the session and the connector resource is
-            // torn down before that session can return.
-            let port = unsafe { &*port };
-            let client = port.client();
+            let (client, connector) = cartel_pg::attach::<PG_CONNECTOR_ID, Env, Db>(
+                session,
+                Static::<Tcp>::new(vec![pg_addr], PG_RECONNECT_BACKOFF, backoff),
+            )?;
             client.set_pick_policy(policy);
-            let connector = {
-                let mut driver = session.driver_access();
-                port.connect::<PG_CONNECTOR_ID, _, Env>(
-                    Static::<Tcp>::new(vec![pg_addr], PG_RECONNECT_BACKOFF, backoff),
-                    &mut driver,
-                )?
-            };
             let state = AppState { pg: client };
+            let timer = sark::Timer::with_capacity(MAX_CONNECTIONS.saturating_mul(2));
             let app = PgApp::new(
-                state,
+                &state,
+                &timer,
                 app::Config {
                     timer_capacity: MAX_CONNECTIONS.saturating_mul(2),
                     task_capacity: MAX_CONNECTIONS,

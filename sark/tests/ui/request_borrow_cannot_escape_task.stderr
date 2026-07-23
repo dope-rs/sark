@@ -1,0 +1,13 @@
+error: lifetime may not live long enough
+  --> tests/ui/request_borrow_cannot_escape_task.rs:24:5
+   |
+22 | #[sark_gen::handler]
+   | --------------------
+   | |
+   | lifetime `'req` defined here
+   | lifetime `'d` defined here
+23 | async fn leak(request: Request, state: &State<'_>) -> Reply {
+24 |     state.leaked.set(Some(request.payload));
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ argument requires that `'req` must outlive `'d`
+   |
+   = help: consider adding the following bound: `'req: 'd`

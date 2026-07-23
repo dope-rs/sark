@@ -66,10 +66,12 @@ fn partial_head_then_stall_is_closed_after_deadline() {
                     driver::Config::for_tcp_profile::<Throughput>(support::MAX_CONNECTIONS);
                 let executor = Executor::new(driver_config)?;
                 executor.enter(|mut session| {
+                    let timer = sark::Timer::with_capacity(32);
                     server(bind).serve(
                         &mut session,
                         SlowlorisDispatch::new(
-                            (),
+                            &(),
+                            &timer,
                             sark::app::Config {
                                 timer_capacity: 32,
                                 task_capacity: support::MAX_CONNECTIONS,
@@ -115,10 +117,12 @@ fn normal_fast_request_is_unaffected() {
                     driver::Config::for_tcp_profile::<Throughput>(support::MAX_CONNECTIONS);
                 let executor = Executor::new(driver_config)?;
                 executor.enter(|mut session| {
+                    let timer = sark::Timer::with_capacity(32);
                     server(bind).serve(
                         &mut session,
                         SlowlorisDispatch::new(
-                            (),
+                            &(),
+                            &timer,
                             sark::app::Config {
                                 timer_capacity: 32,
                                 task_capacity: support::MAX_CONNECTIONS,
@@ -154,10 +158,12 @@ fn slow_but_progressing_within_deadline_completes() {
                     driver::Config::for_tcp_profile::<Throughput>(support::MAX_CONNECTIONS);
                 let executor = Executor::new(driver_config)?;
                 executor.enter(|mut session| {
+                    let timer = sark::Timer::with_capacity(32);
                     server(bind).serve(
                         &mut session,
                         SlowlorisDispatch::new(
-                            (),
+                            &(),
+                            &timer,
                             sark::app::Config {
                                 timer_capacity: 32,
                                 task_capacity: support::MAX_CONNECTIONS,
@@ -201,10 +207,12 @@ fn exhausted_deadline_capacity_closes_the_untracked_connection() {
                     driver::Config::for_tcp_profile::<Throughput>(support::MAX_CONNECTIONS);
                 let executor = Executor::new(driver_config)?;
                 executor.enter(|mut session| {
+                    let timer = sark::Timer::with_capacity(1);
                     server(bind).serve(
                         &mut session,
                         SlowlorisDispatch::new(
-                            (),
+                            &(),
+                            &timer,
                             sark::app::Config {
                                 timer_capacity: 1,
                                 task_capacity: support::MAX_CONNECTIONS,

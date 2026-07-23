@@ -1,11 +1,9 @@
 use std::cell::Cell;
 use std::pin::Pin;
-use std::ptr::NonNull;
 use std::sync::OnceLock;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use dope::driver::token::{Epoch, SlotIndex, Token, kind};
-use dope::manifold::Manifold;
 use dope::runtime::Idle;
 use dope::{DriverContext, Event, EventRef, Sqe, Submission, TimerSpec};
 
@@ -136,7 +134,6 @@ enum TimerState {
 }
 
 pub struct Updater<const ID: u8> {
-    stamp: Option<NonNull<Stamp>>,
     state: TimerState,
 }
 
@@ -149,7 +146,6 @@ impl<const ID: u8> Default for Updater<ID> {
 impl<const ID: u8> Updater<ID> {
     pub fn new() -> Self {
         Self {
-            stamp: None,
             state: TimerState::Disarmed,
         }
     }
@@ -178,52 +174,43 @@ impl<const ID: u8> Updater<ID> {
         }
     }
 
-    /// # Safety
-    /// `stamp` must remain pinned and live while `self` is active.
-    pub(crate) unsafe fn bind(self: Pin<&mut Self>, stamp: Pin<&Stamp>) {
-        self.get_mut().stamp = Some(NonNull::from(stamp.get_ref()));
-    }
-}
-
-impl<'d, const ID: u8> Manifold<'d> for Updater<ID> {
-    const ID: u8 = ID;
-
-    fn dispatch(self: Pin<&mut Self>, event: Event<'d>, _driver: &mut DriverContext<'_, 'd>) {
-        let this = self.get_mut();
-        if this.state != TimerState::Armed {
+    pub(crate) fn dispatch<'d>(
+        &mut self,
+        event: Event<'d>,
+        stamp: &Stamp,
+        _driver: &mut DriverContext<'_, 'd>,
+    ) {
+        if self.state != TimerState::Armed {
             return;
         }
         if matches!(
             event.as_ref(),
             EventRef::Timer(token) if token.same_target(Self::token())
-        ) && let Some(stamp) = this.stamp
-        {
-            unsafe { stamp.as_ref() }.refresh();
+        ) {
+            stamp.refresh();
         }
     }
 
-    fn pre_park(mut self: Pin<&mut Self>, driver: &mut DriverContext<'_, 'd>) {
-        let this = self.as_mut().get_mut();
-        match this.state {
-            TimerState::Disarmed if this.stamp.is_some() => this.try_arm(driver),
-            TimerState::CancelPending => this.try_cancel(driver),
-            TimerState::Disarmed | TimerState::Armed | TimerState::Stopped => {}
+    pub(crate) fn pre_park<'d>(&mut self, driver: &mut DriverContext<'_, 'd>) {
+        match self.state {
+            TimerState::Disarmed => self.try_arm(driver),
+            TimerState::CancelPending => self.try_cancel(driver),
+            TimerState::Armed | TimerState::Stopped => {}
         }
     }
 
-    fn idle(self: Pin<&Self>) -> Idle {
+    pub(crate) fn idle(&self) -> Idle {
         Idle::Park(None)
     }
 
-    fn shutdown(mut self: Pin<&mut Self>, driver: &mut DriverContext<'_, 'd>) {
-        let this = self.as_mut().get_mut();
-        match this.state {
+    pub(crate) fn shutdown<'d>(&mut self, driver: &mut DriverContext<'_, 'd>) {
+        match self.state {
             TimerState::Armed => {
-                this.state = TimerState::CancelPending;
-                this.try_cancel(driver);
+                self.state = TimerState::CancelPending;
+                self.try_cancel(driver);
             }
-            TimerState::Disarmed => this.state = TimerState::Stopped,
-            TimerState::CancelPending => this.try_cancel(driver),
+            TimerState::Disarmed => self.state = TimerState::Stopped,
+            TimerState::CancelPending => self.try_cancel(driver),
             TimerState::Stopped => {}
         }
     }
@@ -231,32 +218,56 @@ impl<'d, const ID: u8> Manifold<'d> for Updater<ID> {
 
 #[cfg(test)]
 mod tests {
-    use std::pin::pin;
-    use std::ptr::NonNull;
+    use std::pin::{Pin, pin};
     use std::time::Duration;
 
     use dope::driver;
+    use dope::driver::token::Token;
     use dope::runtime::profile::Throughput;
-    use dope::runtime::{Executor, ShutdownTrigger};
+    use dope::runtime::{Dispatcher, Executor, Idle, ShutdownTrigger};
+    use dope::{DriverContext, Event};
 
     use super::{Stamp, TimerState, Updater};
 
-    #[pin_project::pin_project]
-    #[derive(dope_gen::Dispatcher)]
-    struct App {
-        #[pin]
-        #[manifold]
+    struct App<'a> {
+        stamp: &'a Stamp,
         date: Updater<7>,
+    }
+
+    impl<'d> Dispatcher<'d> for App<'_> {
+        fn dispatch(
+            mut self: Pin<&mut Self>,
+            event: Event<'d>,
+            driver: &mut DriverContext<'_, 'd>,
+        ) {
+            let this = self.as_mut().get_mut();
+            this.date.dispatch(event, this.stamp, driver);
+        }
+
+        fn activate(self: Pin<&mut Self>, _target: Token, _driver: &mut DriverContext<'_, 'd>) {}
+
+        fn pre_park(mut self: Pin<&mut Self>, driver: &mut DriverContext<'_, 'd>) {
+            self.as_mut().get_mut().date.pre_park(driver);
+        }
+
+        fn idle(self: Pin<&Self>) -> Idle {
+            self.get_ref().date.idle()
+        }
+
+        fn shutdown(mut self: Pin<&mut Self>, driver: &mut DriverContext<'_, 'd>) {
+            self.as_mut().get_mut().date.shutdown(driver);
+        }
     }
 
     #[test]
     fn updater_refreshes_from_the_recurring_driver_event() {
+        assert_eq!(
+            std::mem::size_of::<Updater<7>>(),
+            std::mem::size_of::<TimerState>(),
+        );
+
         let stamp = pin!(Stamp::new());
         let initial = stamp.load();
-        let updater = Updater {
-            stamp: Some(NonNull::from(stamp.as_ref().get_ref())),
-            state: TimerState::Disarmed,
-        };
         let trigger = ShutdownTrigger::new().expect("shutdown trigger");
         let fire = trigger.try_clone().expect("clone shutdown trigger");
         let shutdown = std::thread::spawn(move || {
@@ -272,7 +283,13 @@ mod tests {
                     .try_register(&mut session.driver_access())
                     .expect("register shutdown trigger");
                 session
-                    .with_app(App { date: updater }, |mut app| app.run())
+                    .with_app(
+                        App {
+                            stamp: stamp.as_ref().get_ref(),
+                            date: Updater::new(),
+                        },
+                        |mut app| app.run(),
+                    )
                     .expect("run updater");
             });
         shutdown.join().expect("shutdown thread");

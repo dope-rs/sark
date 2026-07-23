@@ -1,4 +1,4 @@
-use sark_core::simd::{
+use sark_core::http::scan::{
     HeaderNameOutcome, HeaderValueOutcome, request_target_is_valid, scan_header_name,
     scan_header_value,
 };

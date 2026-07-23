@@ -1,9 +1,9 @@
 use std::time::{Duration, Instant, SystemTime};
 
 use o3::buffer::Shared;
+use o3::cell::CheckedCell;
 use o3::collections::{FixedHashTable, Slab, SlabKey};
 
-use super::access::ProofCell;
 use super::encoding::Encoding;
 
 #[derive(Clone)]
@@ -202,13 +202,13 @@ pub(super) enum Lookup {
 }
 
 pub(super) struct Cache {
-    shard: ProofCell<Shard>,
+    shard: CheckedCell<Shard>,
 }
 
 impl Cache {
     pub(super) fn new(capacity: usize) -> Self {
         Self {
-            shard: ProofCell::new(Shard::with_capacity(capacity)),
+            shard: CheckedCell::new(Shard::with_capacity(capacity)),
         }
     }
 

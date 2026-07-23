@@ -34,7 +34,7 @@ impl FusedHead<'_> {
         if target.is_empty() {
             return None;
         }
-        if !sark_core::simd::request_target_is_valid(target) {
+        if !sark_core::http::scan::request_target_is_valid(target) {
             return None;
         }
         let version = &line[sp2 + 1..];

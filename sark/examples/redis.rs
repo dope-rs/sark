@@ -1,7 +1,7 @@
 use std::io;
 use std::net::SocketAddr;
 
-use cartel_redis::{Connect, DEFAULT_BACKOFF, Ops, Redis};
+use cartel_redis::{DEFAULT_BACKOFF, Ops, Redis};
 use dope::manifold::connector::source::Static;
 use dope::manifold::env::Bundle;
 use dope_net::tcp::Tcp;
@@ -131,22 +131,15 @@ fn main() -> io::Result<()> {
                 .seed()
                 .derive(dope::hash::domain::BACKOFF ^ REDIS_CONNECTOR_ID as u64)
                 .state();
-            let store = session.storage() as *const cartel_redis::Store<'_>;
-            // The store remains pinned in executor storage until after the
-            // connector resource and HTTP application are dropped.
-            let redis = unsafe { (&*store).redis() };
-            let connector = {
-                let mut driver = session.driver_access();
-                redis.connect::<REDIS_CONNECTOR_ID, _, Env>(
-                    Connect {
-                        topology: Static::<Tcp>::new(vec![redis_addr], DEFAULT_BACKOFF, backoff),
-                    },
-                    &mut driver,
-                )?
-            };
+            let (redis, connector) = cartel_redis::attach::<REDIS_CONNECTOR_ID, Env>(
+                session,
+                Static::<Tcp>::new(vec![redis_addr], DEFAULT_BACKOFF, backoff),
+            )?;
             let state = AppState { redis };
+            let timer = sark::Timer::with_capacity(MAX_CONNECTIONS.saturating_mul(2));
             let app = HttpWithRedisApp::new(
-                state,
+                &state,
+                &timer,
                 app::Config {
                     timer_capacity: MAX_CONNECTIONS.saturating_mul(2),
                     task_capacity: MAX_CONNECTIONS,

@@ -1,6 +1,5 @@
 //! Asynchronous static-file serving with bounded caching and single-flight loading.
 
-mod access;
 mod cache;
 mod encoding;
 mod flight;

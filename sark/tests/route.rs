@@ -71,8 +71,11 @@ sark_gen::define_route! {
 
 #[test]
 fn route_tags_are_distinct() {
+    let state = ();
+    let timer = sark::Timer::with_capacity(1);
     let app = BenchDispatch::new(
-        (),
+        &state,
+        &timer,
         sark::app::Config {
             timer_capacity: 1,
             task_capacity: 1,

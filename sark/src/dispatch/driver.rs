@@ -65,12 +65,10 @@ impl<'a, H> H1Driver<'a, H> {
 
         project(&mut slot.state.conn).recv_view = peeked.clone();
         let close_after = slot.close_after();
-        let scope = dope_fiber::FiberScope::from_driver(slot.driver());
         let mut write = aux.write_buf_for(slot);
         let out = Pipeline::batch(
             project(&mut slot.state.conn),
             self.app.as_mut(),
-            scope,
             work,
             &mut write,
             close_after,

@@ -107,7 +107,7 @@ fn run<H, F>(
 where
     H: 'static,
     F: for<'scope, 'd> FnOnce(
-        *const H,
+        &'d H,
         Session<'scope, 'd, H>,
         listener::Config<Tcp>,
         Config,
@@ -123,7 +123,7 @@ where
             if let Some(trigger) = shutdown {
                 trigger.try_register(&mut session.driver_access())?;
             }
-            let handler = session.storage() as *const H;
+            let handler = session.storage();
             launch(handler, session, listener, config)
         })
 }
@@ -183,7 +183,7 @@ macro_rules! server {
                 shutdown,
                 |handler, mut session, listener_config, config| {
                     launch!(
-                        $app::new(unsafe { &*handler }, config),
+                        $app::new(handler, config),
                         session,
                         listener_config,
                         $app<H, $wire>,

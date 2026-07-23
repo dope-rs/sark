@@ -267,7 +267,7 @@ impl<R: sark::dispatch::Decode> Server<R> {
     }
 }
 
-impl<R: sark::dispatch::Decode + 'static> dope_quic::Handler for Server<R> {
+impl<R: sark::dispatch::Decode> dope_quic::Handler for Server<R> {
     fn established(&mut self, conn: &mut dope_quic::Conn, handle: dope_quic::ConnHandle) {
         let mut h3 = Session::with_role(Role::Server);
         if h3.start_control_stream(conn).is_err() {

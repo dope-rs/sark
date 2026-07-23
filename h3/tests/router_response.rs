@@ -66,8 +66,10 @@ impl StreamTransport for FakeTransport {
 
 #[test]
 fn h3_request_routes_and_responds() {
+    let timer = sark::Timer::with_capacity(0);
     let app = H3App::new::<dope_net::wire::identity::Identity>(
-        sark::EmptyState,
+        sark::EmptyState::REF,
+        &timer,
         sark::app::Config {
             timer_capacity: 0,
             task_capacity: 0,

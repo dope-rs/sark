@@ -137,7 +137,6 @@ impl Pipeline {
     pub(super) fn batch<'d, H: Routing<'d>>(
         state: &mut ConnState,
         mut app: Pin<&mut H>,
-        scope: dope_fiber::FiberScope<'d>,
         work_buf: &[u8],
         write_buf: &mut [u8],
         close_after: bool,
@@ -162,7 +161,7 @@ impl Pipeline {
             }
             let outcome =
                 app.as_mut()
-                    .try_consume(scope, permit, rest, &mut write_buf[out.cursor..], state);
+                    .try_consume(permit, rest, &mut write_buf[out.cursor..], state);
             permit = match outcome {
                 ConsumeOutcome::NeedMore { state: need, .. } => {
                     let ConnState { pipeline, recv, .. } = state;

@@ -2,12 +2,15 @@ use std::io;
 use std::marker::PhantomData;
 use std::time::Duration;
 
-use dope::manifold::Manifold;
+use dope::driver::token::Token;
 use dope::manifold::env::Bundle;
 use dope::manifold::listener::{self, Application, Listener};
+use dope::manifold::{Manifold, TypedToken};
 use dope::runtime::{
-    Launcher, Session, ShutdownTrigger, StorageFactory, WorkerContext, WorkerEntry,
+    Dispatcher as RuntimeDispatcher, Idle, Launcher, Session, ShutdownTrigger, StorageFactory,
+    WorkerContext, WorkerEntry,
 };
+use dope::{DriverContext, Event};
 use dope_net::wire::Wire;
 use dope_net::wire::identity::Identity;
 use dope_net::{Transport, tcp::Tcp};
@@ -131,7 +134,7 @@ where
         shutdown: Option<&ShutdownTrigger>,
     ) -> io::Result<()>
     where
-        A: Application<'d, Wire = Identity> + DateHost + TimerHost<'d> + 'd,
+        A: Application<'d, Wire = Identity> + DateHost + TimerHost<'d>,
     {
         run::<LISTENER_ID, DATE_ID, A, Identity, P, S>(
             session,
@@ -151,8 +154,8 @@ where
         shutdown: Option<&ShutdownTrigger>,
     ) -> io::Result<()>
     where
-        A: Application<'d, Wire = Identity> + DateHost + TimerHost<'d> + 'd,
-        R: Manifold<'d> + 'd,
+        A: Application<'d, Wire = Identity> + DateHost + TimerHost<'d>,
+        R: Manifold<'d>,
     {
         run_with_resource::<LISTENER_ID, DATE_ID, A, Identity, P, R, S>(
             session,
@@ -222,7 +225,7 @@ where
         shutdown: Option<&ShutdownTrigger>,
     ) -> io::Result<()>
     where
-        A: Application<'d, Wire = Tls> + DateHost + TimerHost<'d> + 'd,
+        A: Application<'d, Wire = Tls> + DateHost + TimerHost<'d>,
     {
         run::<LISTENER_ID, DATE_ID, A, Tls, P, S>(
             session,
@@ -242,8 +245,8 @@ where
         shutdown: Option<&ShutdownTrigger>,
     ) -> io::Result<()>
     where
-        A: Application<'d, Wire = Tls> + DateHost + TimerHost<'d> + 'd,
-        R: Manifold<'d> + 'd,
+        A: Application<'d, Wire = Tls> + DateHost + TimerHost<'d>,
+        R: Manifold<'d>,
     {
         run_with_resource::<LISTENER_ID, DATE_ID, A, Tls, P, R, S>(
             session,
@@ -461,7 +464,7 @@ fn run<'scope, 'd: 'scope, const LISTENER_ID: u8, const DATE_ID: u8, A, W, P, S>
     shutdown: Option<&ShutdownTrigger>,
 ) -> io::Result<()>
 where
-    A: Application<'d, Wire = W> + DateHost + TimerHost<'d> + 'd,
+    A: Application<'d, Wire = W> + DateHost + TimerHost<'d>,
     W: Wire,
     P: RuntimeProfile,
 {
@@ -490,7 +493,6 @@ where
         listener: TimedListener::new(listener, session.driver()),
         date: Updater::new(),
     }));
-    bind_date(dispatcher.as_ref(), session);
     session.run(dispatcher.as_ref())
 }
 
@@ -504,10 +506,10 @@ fn run_with_resource<'scope, 'd: 'scope, const LISTENER_ID: u8, const DATE_ID: u
     shutdown: Option<&ShutdownTrigger>,
 ) -> io::Result<()>
 where
-    A: Application<'d, Wire = W> + DateHost + TimerHost<'d> + 'd,
+    A: Application<'d, Wire = W> + DateHost + TimerHost<'d>,
     W: Wire,
     P: RuntimeProfile,
-    R: Manifold<'d> + 'd,
+    R: Manifold<'d>,
 {
     let hash_builder = session
         .seed()
@@ -536,12 +538,10 @@ where
         date: Updater::new(),
         resource,
     }));
-    bind_resource_date(dispatcher.as_ref(), session);
     session.run(dispatcher.as_ref())
 }
 
 #[pin_project::pin_project]
-#[derive(dope_gen::Dispatcher)]
 struct Dispatcher<'d, const LISTENER_ID: u8, const DATE_ID: u8, A, T, W, P>
 where
     A: Application<'d, Wire = W> + DateHost + TimerHost<'d>,
@@ -550,15 +550,11 @@ where
     P: RuntimeProfile,
 {
     #[pin]
-    #[manifold]
     listener: TimedListener<'d, LISTENER_ID, A, Bundle<T, W, P>>,
-    #[pin]
-    #[manifold]
     date: Updater<DATE_ID>,
 }
 
 #[pin_project::pin_project]
-#[derive(dope_gen::Dispatcher)]
 struct ResourceDispatcher<'d, const LISTENER_ID: u8, const DATE_ID: u8, A, T, W, P, R>
 where
     A: Application<'d, Wire = W> + DateHost + TimerHost<'d>,
@@ -568,71 +564,169 @@ where
     R: Manifold<'d>,
 {
     #[pin]
-    #[manifold]
     listener: TimedListener<'d, LISTENER_ID, A, Bundle<T, W, P>>,
-    #[pin]
-    #[manifold]
     date: Updater<DATE_ID>,
     #[pin]
-    #[manifold]
     resource: R,
 }
 
-type ResourceCell<'d, const LISTENER_ID: u8, const DATE_ID: u8, A, T, W, P, R> =
-    Branded<'d, ResourceDispatcher<'d, LISTENER_ID, DATE_ID, A, T, W, P, R>>;
-
-fn bind_date<'scope, 'd: 'scope, const LISTENER_ID: u8, const DATE_ID: u8, A, T, W, P, S>(
-    dispatcher: core::pin::Pin<&Branded<'d, Dispatcher<'d, LISTENER_ID, DATE_ID, A, T, W, P>>>,
-    session: &mut Session<'scope, 'd, S>,
-) where
+impl<'d, const LISTENER_ID: u8, const DATE_ID: u8, A, T, W, P>
+    Dispatcher<'d, LISTENER_ID, DATE_ID, A, T, W, P>
+where
     A: Application<'d, Wire = W> + DateHost + TimerHost<'d>,
     T: Transport,
     W: Wire,
     P: RuntimeProfile,
 {
-    let mut dispatcher = dispatcher.borrow_pin_mut(session.token());
-    let projected = dispatcher.as_mut().project();
-    bind_listener_date(projected.listener, projected.date);
+    const ROUTES_UNIQUE: () = assert!(
+        LISTENER_ID != DATE_ID,
+        "listener and date manifolds require distinct route IDs"
+    );
 }
 
-fn bind_resource_date<
-    'scope,
-    'd: 'scope,
-    const LISTENER_ID: u8,
-    const DATE_ID: u8,
-    A,
-    T,
-    W,
-    P,
-    R,
-    S,
->(
-    dispatcher: core::pin::Pin<&ResourceCell<'d, LISTENER_ID, DATE_ID, A, T, W, P, R>>,
-    session: &mut Session<'scope, 'd, S>,
-) where
+impl<'d, const LISTENER_ID: u8, const DATE_ID: u8, A, T, W, P> RuntimeDispatcher<'d>
+    for Dispatcher<'d, LISTENER_ID, DATE_ID, A, T, W, P>
+where
+    A: Application<'d, Wire = W> + DateHost + TimerHost<'d>,
+    T: Transport,
+    W: Wire,
+    P: RuntimeProfile,
+{
+    fn dispatch(
+        mut self: core::pin::Pin<&mut Self>,
+        event: Event<'d>,
+        driver: &mut DriverContext<'_, 'd>,
+    ) {
+        let _: () = Self::ROUTES_UNIQUE;
+        let route = event.route();
+        if route == LISTENER_ID {
+            Manifold::dispatch(self.project().listener, event, driver);
+        } else if route == DATE_ID {
+            let mut fields = self.as_mut().project();
+            let handler = fields.listener.as_mut().handler_mut();
+            let stamp = DateHost::stamp(handler.as_ref());
+            fields.date.dispatch(event, stamp.get_ref(), driver);
+        }
+    }
+
+    fn activate(
+        self: core::pin::Pin<&mut Self>,
+        target: Token,
+        driver: &mut DriverContext<'_, 'd>,
+    ) {
+        let _: () = Self::ROUTES_UNIQUE;
+        if target.route() == LISTENER_ID {
+            let target =
+                TypedToken::<TimedListener<'d, LISTENER_ID, A, Bundle<T, W, P>>>::try_new::<'d>(
+                    target,
+                )
+                .expect("dispatcher selected the listener route");
+            Manifold::activate(self.project().listener, target, driver);
+        }
+    }
+
+    fn pre_park(mut self: core::pin::Pin<&mut Self>, driver: &mut DriverContext<'_, 'd>) {
+        let fields = self.as_mut().project();
+        Manifold::pre_park(fields.listener, driver);
+        fields.date.pre_park(driver);
+    }
+
+    fn idle(self: core::pin::Pin<&Self>) -> Idle {
+        let fields = self.project_ref();
+        Manifold::idle(fields.listener).reduce(fields.date.idle())
+    }
+
+    fn shutdown(mut self: core::pin::Pin<&mut Self>, driver: &mut DriverContext<'_, 'd>) {
+        let fields = self.as_mut().project();
+        Manifold::shutdown(fields.listener, driver);
+        fields.date.shutdown(driver);
+    }
+}
+
+impl<'d, const LISTENER_ID: u8, const DATE_ID: u8, A, T, W, P, R>
+    ResourceDispatcher<'d, LISTENER_ID, DATE_ID, A, T, W, P, R>
+where
     A: Application<'d, Wire = W> + DateHost + TimerHost<'d>,
     T: Transport,
     W: Wire,
     P: RuntimeProfile,
     R: Manifold<'d>,
 {
-    let mut dispatcher = dispatcher.borrow_pin_mut(session.token());
-    let projected = dispatcher.as_mut().project();
-    bind_listener_date(projected.listener, projected.date);
+    const ROUTES_UNIQUE: () = assert!(
+        LISTENER_ID != DATE_ID && LISTENER_ID != R::ID && DATE_ID != R::ID,
+        "listener, date, and resource manifolds require distinct route IDs"
+    );
 }
 
-fn bind_listener_date<'d, const LISTENER_ID: u8, const DATE_ID: u8, A, T, W, P>(
-    mut listener: core::pin::Pin<&mut TimedListener<'d, LISTENER_ID, A, Bundle<T, W, P>>>,
-    date: core::pin::Pin<&mut Updater<DATE_ID>>,
-) where
+impl<'d, const LISTENER_ID: u8, const DATE_ID: u8, A, T, W, P, R> RuntimeDispatcher<'d>
+    for ResourceDispatcher<'d, LISTENER_ID, DATE_ID, A, T, W, P, R>
+where
     A: Application<'d, Wire = W> + DateHost + TimerHost<'d>,
     T: Transport,
     W: Wire,
     P: RuntimeProfile,
+    R: Manifold<'d>,
 {
-    let handler = listener.as_mut().handler_mut();
-    let stamp = DateHost::stamp(handler.as_ref());
-    unsafe { date.bind(stamp) };
+    fn dispatch(
+        mut self: core::pin::Pin<&mut Self>,
+        event: Event<'d>,
+        driver: &mut DriverContext<'_, 'd>,
+    ) {
+        let _: () = Self::ROUTES_UNIQUE;
+        let route = event.route();
+        if route == LISTENER_ID {
+            Manifold::dispatch(self.project().listener, event, driver);
+        } else if route == DATE_ID {
+            let mut fields = self.as_mut().project();
+            let handler = fields.listener.as_mut().handler_mut();
+            let stamp = DateHost::stamp(handler.as_ref());
+            fields.date.dispatch(event, stamp.get_ref(), driver);
+        } else if route == R::ID {
+            Manifold::dispatch(self.project().resource, event, driver);
+        }
+    }
+
+    fn activate(
+        self: core::pin::Pin<&mut Self>,
+        target: Token,
+        driver: &mut DriverContext<'_, 'd>,
+    ) {
+        let _: () = Self::ROUTES_UNIQUE;
+        let route = target.route();
+        if route == LISTENER_ID {
+            let target =
+                TypedToken::<TimedListener<'d, LISTENER_ID, A, Bundle<T, W, P>>>::try_new::<'d>(
+                    target,
+                )
+                .expect("dispatcher selected the listener route");
+            Manifold::activate(self.project().listener, target, driver);
+        } else if route == R::ID {
+            let target = TypedToken::<R>::try_new::<'d>(target)
+                .expect("dispatcher selected the resource route");
+            Manifold::activate(self.project().resource, target, driver);
+        }
+    }
+
+    fn pre_park(mut self: core::pin::Pin<&mut Self>, driver: &mut DriverContext<'_, 'd>) {
+        let fields = self.as_mut().project();
+        Manifold::pre_park(fields.listener, driver);
+        fields.date.pre_park(driver);
+        Manifold::pre_park(fields.resource, driver);
+    }
+
+    fn idle(self: core::pin::Pin<&Self>) -> Idle {
+        let fields = self.project_ref();
+        Manifold::idle(fields.listener)
+            .reduce(fields.date.idle())
+            .reduce(Manifold::idle(fields.resource))
+    }
+
+    fn shutdown(mut self: core::pin::Pin<&mut Self>, driver: &mut DriverContext<'_, 'd>) {
+        let fields = self.as_mut().project();
+        Manifold::shutdown(fields.listener, driver);
+        fields.date.shutdown(driver);
+        Manifold::shutdown(fields.resource, driver);
+    }
 }
 
 fn clone_listener_config(config: &listener::Config<Tcp>) -> listener::Config<Tcp> {

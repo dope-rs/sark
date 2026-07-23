@@ -101,10 +101,12 @@ fn accum_zero_copy_retain_survives_cow_during_await() {
                     driver::Config::for_tcp_profile::<Throughput>(support::MAX_CONNECTIONS);
                 let executor = Executor::new(driver_config)?;
                 executor.enter(|mut session| {
+                    let timer = sark::Timer::with_capacity(32);
                     server(bind).serve(
                         &mut session,
                         EchoDispatch::new(
-                            (),
+                            &(),
+                            &timer,
                             sark::app::Config {
                                 timer_capacity: 32,
                                 task_capacity: support::MAX_CONNECTIONS,
@@ -156,10 +158,12 @@ fn socket_fast_path_retain_survives_buffer_reuse() {
                     driver::Config::for_tcp_profile::<Throughput>(support::MAX_CONNECTIONS);
                 let executor = Executor::new(driver_config)?;
                 executor.enter(|mut session| {
+                    let timer = sark::Timer::with_capacity(32);
                     server(bind).serve(
                         &mut session,
                         EchoDispatch::new(
-                            (),
+                            &(),
+                            &timer,
                             sark::app::Config {
                                 timer_capacity: 32,
                                 task_capacity: support::MAX_CONNECTIONS,

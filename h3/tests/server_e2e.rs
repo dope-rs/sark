@@ -83,8 +83,10 @@ fn server_handler_routes_over_quic() {
     let (mut server_quic, mut client_quic) = pair();
     let handle = ConnHandle(0);
 
+    let timer = sark::Timer::with_capacity(0);
     let app = SrvApp::new::<dope_net::wire::identity::Identity>(
-        sark::EmptyState,
+        sark::EmptyState::REF,
+        &timer,
         sark::app::Config {
             timer_capacity: 0,
             task_capacity: 0,
