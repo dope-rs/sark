@@ -19,8 +19,8 @@ dope-gen.workspace = true
 o3.workspace = true
 cartel-core = "0.7"
 http = "1.4.2"
-flate2 = "1"
 
 [dev-dependencies]
 dope-extra.workspace = true
+flate2 = "1"
 pin-project.workspace = true

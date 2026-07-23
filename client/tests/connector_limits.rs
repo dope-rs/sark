@@ -31,6 +31,10 @@ fn response_under_cap_succeeds() {
     let resp = run_get_cap(addr, 1024, "/").expect("under-cap response");
     assert_eq!(resp.status().as_u16(), 200);
     assert_eq!(std::str::from_utf8(resp.body()).unwrap(), "Hello, World!");
+    assert!(
+        resp.body_is_shared(),
+        "content-length body must retain the connector buffer"
+    );
 }
 
 #[test]

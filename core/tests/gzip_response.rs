@@ -1,7 +1,7 @@
 use http::StatusCode;
 use o3::buffer::Shared;
 use sark_core::http::codec::HeaderScan;
-use sark_core::http::compress::Gzip;
+use sark_core::http::compress::{Gunzip, GunzipError, GunzipOutput, Gzip};
 use sark_core::http::head::Flags;
 use sark_core::http::{FixedResponse, Headers, head};
 
@@ -121,4 +121,29 @@ fn gzip_encoder_round_trip_through_libdeflater_decode() {
         .gzip_decompress(compressed.as_ref(), &mut out)
         .expect("decompress");
     assert_eq!(&out[..n], original.as_slice());
+}
+
+#[test]
+fn gunzip_decodes_into_the_reusable_pool() {
+    let original = b"pooled gunzip body".repeat(64);
+    let compressed = Gzip::new().encode(&original).unwrap();
+    let output = Gunzip::new()
+        .decode(compressed.as_ref(), original.len())
+        .expect("decompress");
+
+    let GunzipOutput::Pooled(output) = output else {
+        panic!("small gunzip body must use the reusable pool");
+    };
+    assert_eq!(output.as_ref(), original);
+}
+
+#[test]
+fn gunzip_checks_the_declared_size_before_allocating() {
+    let original = vec![b'x'; 4096];
+    let compressed = Gzip::new().encode(&original).unwrap();
+    let error = Gunzip::new()
+        .decode(compressed.as_ref(), 1024)
+        .err()
+        .expect("size limit");
+    assert!(matches!(error, GunzipError::SizeLimit));
 }

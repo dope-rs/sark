@@ -1,4 +1,4 @@
-use std::io::{self, Read};
+use std::io;
 use std::pin::Pin;
 use std::time::{Duration, Instant};
 
@@ -9,9 +9,10 @@ use dope::manifold::timer::Timer;
 use dope::runtime::Idle;
 use dope_fiber::WaitQueue;
 use o3::buffer::{Lease, Pool as BufferPool, PoolLayout};
-use o3::cell::RegionToken;
+use o3::cell::{RegionCell, RegionToken};
 use sark_core::http::Response;
-use sark_core::http::codec::{DecodeMode, HeaderLookup, ResponseDecoder};
+use sark_core::http::codec::HeaderLookup;
+use sark_core::http::compress::{Gunzip, GunzipError};
 
 use crate::connector::codec::{self, Head};
 use crate::connector::error::Error;
@@ -64,6 +65,7 @@ impl connector::Lifecycle for ConnState {
 pub struct Shared<'d> {
     pool: ConnectionPool<'d>,
     active_waiters: Pin<Box<WaitQueue>>,
+    gunzip: RegionCell<'d, Gunzip>,
     pub(super) host: String,
     pub(super) origin: http::Uri,
     pub(super) decompression: DecompressionPolicy,
@@ -305,6 +307,7 @@ impl<'d> Port<'d> {
                 response_buffer_capacity,
             ),
             active_waiters: Box::pin(WaitQueue::with_capacity(timer_capacity)),
+            gunzip: RegionCell::new(Gunzip::new()),
             host,
             origin,
             decompression,
@@ -382,43 +385,36 @@ impl<'d> connector::Session<'d> for Session<'d> {
     }
 
     fn response(&mut self, head: Head, ctx: &mut connector::Ctx<'_, 'd, Self>) {
-        if let Some(reason) = head.error {
-            let bytes = head.full.len();
-            self.port.shared.push_response(
-                ctx.region,
-                ctx.conn_id,
-                Err(Error::Parse(reason.into())),
-                bytes,
-                None,
-                Instant::now(),
-            );
-            ctx.state.pending_close = true;
-            return;
-        }
-        let buffered = head.full.len();
-        let bytes = head.full.as_ref();
-        let (outcome, keep_alive, keepalive_timeout) =
-            match ResponseDecoder::new(DecodeMode::Response).response(bytes) {
-                Ok(Some(mut resp)) => {
-                    let keep = Self::should_keep_alive(&resp);
-                    let timeout = Self::keepalive_timeout(&resp);
-                    let outcome = match Self::decompress(
-                        &mut resp,
-                        self.port.shared.decompression,
-                        self.port.codec.max_response_body,
-                    ) {
-                        Ok(()) => Ok(resp),
-                        Err(e) => Err(e),
-                    };
-                    (outcome, keep, timeout)
-                }
-                Ok(None) => (
-                    Err(Error::Parse("incomplete response frame".into())),
-                    true,
+        let Head { response, buffered } = head;
+        let mut response = match response {
+            Ok(response) => response,
+            Err(reason) => {
+                self.port.shared.push_response(
+                    ctx.region,
+                    ctx.conn_id,
+                    Err(Error::Parse(reason)),
+                    buffered,
                     None,
-                ),
-                Err(e) => (Err(Error::Parse(e.to_string())), true, None),
-            };
+                    Instant::now(),
+                );
+                ctx.state.pending_close = true;
+                return;
+            }
+        };
+        let keep_alive = Self::should_keep_alive(&response);
+        let keepalive_timeout = Self::keepalive_timeout(&response);
+        let outcome = {
+            let gunzip = self.port.shared.gunzip.borrow_mut(ctx.region);
+            match Self::decompress(
+                gunzip,
+                &mut response,
+                self.port.shared.decompression,
+                self.port.codec.max_response_body,
+            ) {
+                Ok(()) => Ok(response),
+                Err(error) => Err(error),
+            }
+        };
         if !keep_alive {
             ctx.state.pending_close = true;
         }
@@ -487,6 +483,7 @@ impl Session<'_> {
     }
 
     fn decompress(
+        gunzip: &mut Gunzip,
         resp: &mut Response,
         policy: DecompressionPolicy,
         max_body: usize,
@@ -498,21 +495,18 @@ impl Session<'_> {
             return Ok(());
         }
 
-        let limit = max_body as u64;
-        let mut decoder = flate2::read::GzDecoder::new(resp.body()).take(limit + 1);
-        let mut decompressed = Vec::new();
-        match decoder.read_to_end(&mut decompressed) {
-            Ok(_) if decompressed.len() as u64 > limit => Err(Error::Parse(
-                "decompressed response body exceeds size limit".into(),
-            )),
-            Ok(_) => {
-                resp.set_body(decompressed);
+        match gunzip.decode(resp.body(), max_body) {
+            Ok(body) => {
+                resp.set_body(body);
                 resp.headers_mut().remove("content-encoding");
                 resp.headers_mut().remove("content-length");
                 Ok(())
             }
-            Err(e) if policy == DecompressionPolicy::Strict => {
-                Err(Error::Parse(format!("gzip decompression failed: {e}")))
+            Err(GunzipError::SizeLimit) => Err(Error::Parse(
+                "decompressed response body exceeds size limit".into(),
+            )),
+            Err(error) if policy == DecompressionPolicy::Strict => {
+                Err(Error::Parse(error.to_string()))
             }
             Err(_) => Ok(()),
         }

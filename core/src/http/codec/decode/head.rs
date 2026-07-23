@@ -1,10 +1,10 @@
 use http::{HeaderName, HeaderValue, StatusCode};
 
 use crate::error::{Error, Result};
-use crate::http::Response;
 use crate::http::codec::Header;
 use crate::http::codec::decode::HeaderScan;
 use crate::http::codec::decode::chunked::BodyDecoder;
+use crate::http::{Body, Response};
 
 const MAX_HEADERS: usize = 100;
 
@@ -36,14 +36,7 @@ impl DecodeMode {
     }
 }
 
-pub(super) struct ParsedHead {
-    pub(super) status: StatusCode,
-    pub(super) headers: Vec<(HeaderName, HeaderValue)>,
-    pub(super) header_len: usize,
-    pub(super) content_length: Option<usize>,
-    pub(super) is_chunked: bool,
-}
-
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum BodyKind {
     NoBody,
     ContentLength(usize),
@@ -56,6 +49,27 @@ pub struct DecodedHead {
     pub headers: Vec<(HeaderName, HeaderValue)>,
     pub header_len: usize,
     pub body_kind: BodyKind,
+}
+
+impl DecodedHead {
+    pub fn into_response<B, I>(self, body: B, trailers: I) -> Response
+    where
+        B: Into<Body<'static>>,
+        I: IntoIterator<Item = (HeaderName, HeaderValue)>,
+    {
+        let mut response = Response::new(self.status);
+        for (name, value) in self.headers {
+            response.headers_mut().insert(name, value);
+        }
+        for (name, value) in trailers {
+            if is_forbidden_trailer(&name) {
+                continue;
+            }
+            response.headers_mut().insert(name, value);
+        }
+        response.set_body(body);
+        response
+    }
 }
 
 pub struct ResponseDecoder {
@@ -72,7 +86,7 @@ impl ResponseDecoder {
         code < 200 || code == 204 || code == 304
     }
 
-    pub(super) fn parse(buf: &[u8]) -> Result<Option<ParsedHead>> {
+    fn parse(&self, buf: &[u8]) -> Result<Option<DecodedHead>> {
         let mut raw = [httparse::EMPTY_HEADER; MAX_HEADERS];
         let mut parsed = httparse::Response::new(&mut raw);
 
@@ -123,103 +137,69 @@ impl ResponseDecoder {
                     ));
                 }
 
-                Ok(Some(ParsedHead {
+                let body_kind = if self.mode.is_head() || Self::status_has_no_body(status) {
+                    BodyKind::NoBody
+                } else if is_chunked {
+                    BodyKind::Chunked
+                } else if let Some(len) = content_length {
+                    BodyKind::ContentLength(len)
+                } else {
+                    BodyKind::UntilEof
+                };
+
+                Ok(Some(DecodedHead {
                     status,
                     headers,
                     header_len,
-                    content_length,
-                    is_chunked,
+                    body_kind,
                 }))
             }
         }
     }
 
-    pub(super) fn build_response(
-        head: ParsedHead,
-        body: &[u8],
-        trailers: &[(HeaderName, HeaderValue)],
-    ) -> Response {
-        let mut resp = Response::new(head.status);
-        for (name, value) in head.headers {
-            resp.headers_mut().insert(name, value);
-        }
-        for (name, value) in trailers {
-            if is_forbidden_trailer(name) {
-                continue;
-            }
-            resp.headers_mut().insert(name.clone(), value.clone());
-        }
-        if !body.is_empty() {
-            resp.set_body(body);
-        }
-        resp
-    }
-
     pub fn head(&self, buf: &[u8]) -> Result<Option<DecodedHead>> {
-        let head = match Self::parse(buf)? {
-            Some(h) => h,
-            None => return Ok(None),
-        };
-
-        let body_kind = if self.mode.is_head() || Self::status_has_no_body(head.status) {
-            BodyKind::NoBody
-        } else if head.is_chunked {
-            BodyKind::Chunked
-        } else if let Some(len) = head.content_length {
-            BodyKind::ContentLength(len)
-        } else {
-            BodyKind::UntilEof
-        };
-
-        Ok(Some(DecodedHead {
-            status: head.status,
-            headers: head.headers,
-            header_len: head.header_len,
-            body_kind,
-        }))
+        self.parse(buf)
     }
 
     pub fn response(&self, buf: &[u8]) -> Result<Option<Response>> {
-        let head = match Self::parse(buf)? {
+        let head = match self.parse(buf)? {
             Some(h) => h,
             None => return Ok(None),
         };
-
-        if self.mode.is_head() || Self::status_has_no_body(head.status) {
-            return Ok(Some(Self::build_response(head, &[], &[])));
-        }
-
         let body_data = &buf[head.header_len..];
 
-        if head.is_chunked {
-            match BodyDecoder::decode_all(body_data, BodyDecoder::DEFAULT_MAX_BODY)? {
-                Some(result) => Ok(Some(Self::build_response(
-                    head,
-                    &result.body,
-                    &result.trailers,
-                ))),
-                None => Ok(None),
+        match head.body_kind {
+            BodyKind::NoBody => Ok(Some(head.into_response(&[][..], []))),
+            BodyKind::Chunked => {
+                match BodyDecoder::decode_all(body_data, BodyDecoder::DEFAULT_MAX_BODY)? {
+                    Some(result) => Ok(Some(head.into_response(result.body, result.trailers))),
+                    None => Ok(None),
+                }
             }
-        } else {
-            match head.content_length {
-                Some(len) if body_data.len() < len => Ok(None),
-                Some(len) => Ok(Some(Self::build_response(head, &body_data[..len], &[]))),
-                None => Ok(None),
-            }
+            BodyKind::ContentLength(len) if body_data.len() < len => Ok(None),
+            BodyKind::ContentLength(len) => Ok(Some(head.into_response(&body_data[..len], []))),
+            BodyKind::UntilEof => Ok(None),
         }
     }
 
     pub fn response_after_eof(&self, buf: &[u8]) -> Result<Response> {
-        let head = Self::parse(buf)?
+        let head = self
+            .parse(buf)?
             .ok_or_else(|| Error::BadRequest("Incomplete HTTP response".into()))?;
         let body_data = &buf[head.header_len..];
 
-        if head.is_chunked {
-            let result = BodyDecoder::decode_all(body_data, BodyDecoder::DEFAULT_MAX_BODY)?
-                .ok_or_else(|| Error::BadRequest("Incomplete chunked response".into()))?;
-            Ok(Self::build_response(head, &result.body, &result.trailers))
-        } else {
-            Ok(Self::build_response(head, body_data, &[]))
+        match head.body_kind {
+            BodyKind::Chunked => {
+                let result = BodyDecoder::decode_all(body_data, BodyDecoder::DEFAULT_MAX_BODY)?
+                    .ok_or_else(|| Error::BadRequest("Incomplete chunked response".into()))?;
+                Ok(head.into_response(result.body, result.trailers))
+            }
+            BodyKind::ContentLength(len) if body_data.len() < len => {
+                Err(Error::BadRequest("Incomplete HTTP response body".into()))
+            }
+            BodyKind::ContentLength(len) => Ok(head.into_response(&body_data[..len], [])),
+            BodyKind::NoBody => Ok(head.into_response(&[][..], [])),
+            BodyKind::UntilEof => Ok(head.into_response(body_data, [])),
         }
     }
 }

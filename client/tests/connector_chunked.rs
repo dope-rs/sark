@@ -67,4 +67,5 @@ fn connector_chunked_get_with_trailers() {
     assert_eq!(resp.status().as_u16(), 200);
     let body = std::str::from_utf8(resp.body()).expect("utf8 body");
     assert_eq!(body, "abcdef");
+    assert_eq!(resp.headers().get("x-checksum").unwrap(), "42");
 }
