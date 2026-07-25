@@ -1,5 +1,8 @@
 use std::collections::{BTreeMap, VecDeque};
+use std::mem;
+use std::ops::{Deref, Range};
 
+use o3::buffer::Shared;
 use sark_core::http::{Field, VecFieldBlock};
 
 use crate::frame::{
@@ -7,6 +10,7 @@ use crate::frame::{
     STREAM_TYPE_QPACK_ENCODER, Settings, TYPE_CANCEL_PUSH, TYPE_DATA, TYPE_GOAWAY, TYPE_HEADERS,
     TYPE_MAX_PUSH_ID, TYPE_SETTINGS,
 };
+use crate::payload::Payload;
 use crate::qpack::{self, DecodeOutcome, DecoderError};
 use crate::stream::{StreamId, UniStreamType};
 
@@ -46,7 +50,7 @@ pub enum Event {
     },
     Data {
         stream_id: StreamId,
-        data: Vec<u8>,
+        data: Payload,
     },
     PushPromise {
         stream_id: StreamId,
@@ -79,7 +83,7 @@ pub enum Event {
     PushData {
         stream_id: StreamId,
         push_id: u64,
-        data: Vec<u8>,
+        data: Payload,
     },
     PushFinished {
         stream_id: StreamId,
@@ -107,13 +111,153 @@ enum MessageState {
 
 #[derive(Clone, Debug, Default)]
 struct StreamState {
-    inbound: Vec<u8>,
+    inbound: Inbound,
     uni_type: Option<UniStreamType>,
     saw_settings: bool,
     message: MessageState,
     push_id: Option<u64>,
     fin_received: bool,
     blocked_required_insert_count: Option<u64>,
+}
+
+#[derive(Clone, Debug)]
+enum Inbound {
+    Unique { bytes: Vec<u8>, start: usize },
+    Shared(Shared),
+}
+
+impl Inbound {
+    fn as_slice(&self) -> &[u8] {
+        match self {
+            Self::Unique { bytes, start } => &bytes[*start..],
+            Self::Shared(bytes) => bytes.as_slice(),
+        }
+    }
+
+    fn append(&mut self, source: &[u8]) {
+        if source.is_empty() {
+            return;
+        }
+        match self {
+            Self::Unique { bytes, start } => {
+                Self::compact_unique(bytes, start);
+                bytes.extend_from_slice(source);
+            }
+            Self::Shared(bytes) => {
+                let mut joined = Vec::with_capacity(bytes.len() + source.len());
+                joined.extend_from_slice(bytes.as_slice());
+                joined.extend_from_slice(source);
+                *self = Self::from(joined);
+            }
+        }
+    }
+
+    fn append_owned(&mut self, source: Vec<u8>) {
+        if source.is_empty() {
+            return;
+        }
+        if self.is_empty() {
+            *self = Self::from(source);
+            return;
+        }
+        match self {
+            Self::Unique { bytes, start } => {
+                Self::compact_unique(bytes, start);
+                bytes.extend_from_slice(&source);
+            }
+            Self::Shared(bytes) => {
+                let mut joined = Vec::with_capacity(bytes.len() + source.len());
+                joined.extend_from_slice(bytes.as_slice());
+                joined.extend_from_slice(&source);
+                *self = Self::from(joined);
+            }
+        }
+    }
+
+    fn compact_unique(bytes: &mut Vec<u8>, start: &mut usize) {
+        if *start == 0 {
+            return;
+        }
+        let len = bytes.len() - *start;
+        bytes.copy_within(*start.., 0);
+        bytes.truncate(len);
+        *start = 0;
+    }
+
+    fn advance(&mut self, n: usize) {
+        assert!(n <= self.len(), "H3 inbound advance is out of bounds");
+        match self {
+            Self::Unique { bytes, start } => {
+                *start += n;
+                if *start == bytes.len() {
+                    self.clear();
+                }
+            }
+            Self::Shared(bytes) => {
+                bytes.advance(n);
+                if bytes.is_empty() {
+                    self.clear();
+                }
+            }
+        }
+    }
+
+    fn take_payload(&mut self, range: Range<usize>, frame_len: usize) -> Payload {
+        assert!(
+            range.start <= range.end
+                && range.end <= frame_len
+                && frame_len <= self.as_slice().len(),
+            "H3 payload frame range is out of bounds"
+        );
+        match mem::take(self) {
+            Self::Unique { bytes, start } if frame_len == bytes.len() - start => {
+                Payload::from_unique(bytes, start + range.start..start + range.end)
+            }
+            Self::Unique { bytes, start } => {
+                let mut owner = Shared::from(bytes);
+                let payload =
+                    Payload::from_shared(owner.slice(start + range.start..start + range.end));
+                owner.advance(start + frame_len);
+                *self = Self::Shared(owner);
+                payload
+            }
+            Self::Shared(mut owner) => {
+                let payload = Payload::from_shared(owner.slice(range));
+                owner.advance(frame_len);
+                if !owner.is_empty() {
+                    *self = Self::Shared(owner);
+                }
+                payload
+            }
+        }
+    }
+
+    fn clear(&mut self) {
+        *self = Self::default();
+    }
+}
+
+impl Default for Inbound {
+    fn default() -> Self {
+        Self::Unique {
+            bytes: Vec::new(),
+            start: 0,
+        }
+    }
+}
+
+impl From<Vec<u8>> for Inbound {
+    fn from(bytes: Vec<u8>) -> Self {
+        Self::Unique { bytes, start: 0 }
+    }
+}
+
+impl Deref for Inbound {
+    type Target = [u8];
+
+    fn deref(&self) -> &Self::Target {
+        self.as_slice()
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -241,9 +385,32 @@ impl Conn {
         fin: bool,
     ) -> Result<(), ConnError> {
         if stream_id.is_bidi() {
-            self.ingest_request_stream(stream_id, bytes, fin)
+            self.ingest_request_stream(stream_id, fin, |inbound| {
+                inbound.append(bytes);
+            })
         } else {
-            self.ingest_uni_stream(stream_id, bytes, fin)
+            self.ingest_uni_stream(stream_id, fin, |inbound| {
+                inbound.append(bytes);
+            })
+        }
+    }
+
+    /// Ingests a transport-owned receive batch, adopting its allocation when
+    /// this stream has no buffered partial frame.
+    pub fn ingest_stream_owned(
+        &mut self,
+        stream_id: StreamId,
+        bytes: Vec<u8>,
+        fin: bool,
+    ) -> Result<(), ConnError> {
+        if stream_id.is_bidi() {
+            self.ingest_request_stream(stream_id, fin, |inbound| {
+                inbound.append_owned(bytes);
+            })
+        } else {
+            self.ingest_uni_stream(stream_id, fin, |inbound| {
+                inbound.append_owned(bytes);
+            })
         }
     }
 
@@ -442,18 +609,20 @@ impl Conn {
         }
     }
 
-    fn ingest_request_stream(
+    fn ingest_request_stream<F>(
         &mut self,
         stream_id: StreamId,
-        bytes: &[u8],
         fin: bool,
-    ) -> Result<(), ConnError> {
+        append: F,
+    ) -> Result<(), ConnError>
+    where
+        F: FnOnce(&mut Inbound),
+    {
         let mut state = self.streams.remove(&stream_id).unwrap_or_default();
-        state.inbound.extend_from_slice(bytes);
+        append(&mut state.inbound);
         state.fin_received |= fin;
-        let mut consumed = 0usize;
-        while consumed < state.inbound.len() {
-            let rest = &state.inbound[consumed..];
+        while !state.inbound.is_empty() {
+            let rest = state.inbound.as_slice();
             let (frame, n) = match Frame::parse(rest, self.max_frame_size) {
                 Ok(parsed) => parsed,
                 Err(ParseError::NeedMore) => break,
@@ -489,10 +658,10 @@ impl Conn {
                         return Err(ConnError::FrameUnexpected);
                     }
                     state.message = MessageState::Data;
-                    self.events.push_back(Event::Data {
-                        stream_id,
-                        data: data.to_vec(),
-                    });
+                    let payload_start = n - data.len();
+                    let data = state.inbound.take_payload(payload_start..n, n);
+                    self.events.push_back(Event::Data { stream_id, data });
+                    continue;
                 }
                 Frame::PushPromise { push_id, block } => {
                     if self.role != Role::Client {
@@ -516,10 +685,7 @@ impl Conn {
                 Frame::Unknown { .. } => {}
                 _ => return Err(ConnError::FrameUnexpected),
             }
-            consumed += n;
-        }
-        if consumed > 0 {
-            state.inbound.drain(..consumed);
+            state.inbound.advance(n);
         }
         if state.fin_received {
             if !state.inbound.is_empty() || state.message == MessageState::Idle {
@@ -533,14 +699,17 @@ impl Conn {
         Ok(())
     }
 
-    fn ingest_uni_stream(
+    fn ingest_uni_stream<F>(
         &mut self,
         stream_id: StreamId,
-        bytes: &[u8],
         fin: bool,
-    ) -> Result<(), ConnError> {
+        append: F,
+    ) -> Result<(), ConnError>
+    where
+        F: FnOnce(&mut Inbound),
+    {
         let mut state = self.streams.remove(&stream_id).unwrap_or_default();
-        state.inbound.extend_from_slice(bytes);
+        append(&mut state.inbound);
         state.fin_received |= fin;
 
         if state.uni_type.is_none() {
@@ -555,7 +724,7 @@ impl Conn {
             let stream_type = UniStreamType::from_wire(stream_type);
             self.register_uni_stream(stream_id, stream_type)?;
             state.uni_type = Some(stream_type);
-            state.inbound.drain(..type_len);
+            state.inbound.advance(type_len);
         }
 
         let fin_received = state.fin_received;
@@ -570,7 +739,7 @@ impl Conn {
                     .ingest_encoder(&state.inbound)
                     .map_err(|_| ConnError::QpackEncoderStream)?;
                 if consumed > 0 {
-                    state.inbound.drain(..consumed);
+                    state.inbound.advance(consumed);
                     self.flush_qpack_decoder_stream();
                     self.retry_blocked_streams()?;
                 }
@@ -584,7 +753,7 @@ impl Conn {
                     .ingest_decoder(&state.inbound)
                     .map_err(|_| ConnError::QpackDecoderStream)?;
                 if consumed > 0 {
-                    state.inbound.drain(..consumed);
+                    state.inbound.advance(consumed);
                 }
                 if state.fin_received {
                     return Err(ConnError::ClosedCriticalStream);
@@ -646,9 +815,9 @@ impl Conn {
             .collect();
         for stream_id in stream_ids {
             if stream_id.is_bidi() {
-                self.ingest_request_stream(stream_id, &[], false)?;
+                self.ingest_request_stream(stream_id, false, |_| {})?;
             } else {
-                self.ingest_uni_stream(stream_id, &[], false)?;
+                self.ingest_uni_stream(stream_id, false, |_| {})?;
             }
         }
         Ok(())
@@ -660,9 +829,8 @@ impl Conn {
         state: &mut StreamState,
         fin: bool,
     ) -> Result<(), ConnError> {
-        let mut consumed = 0usize;
-        while consumed < state.inbound.len() {
-            let rest = &state.inbound[consumed..];
+        while !state.inbound.is_empty() {
+            let rest = state.inbound.as_slice();
             let (frame, n) = match Frame::parse(rest, self.max_frame_size) {
                 Ok(parsed) => parsed,
                 Err(ParseError::NeedMore) => break,
@@ -671,7 +839,6 @@ impl Conn {
             if !state.saw_settings && !matches!(frame, Frame::Settings(_)) {
                 return Err(ConnError::MissingSettings);
             }
-            consumed += n;
             match frame {
                 Frame::Settings(settings) => {
                     if state.saw_settings || self.peer_settings.is_some() {
@@ -704,9 +871,7 @@ impl Conn {
                 Frame::Unknown { .. } => {}
                 _ => return Err(ConnError::FrameUnexpected),
             }
-        }
-        if consumed > 0 {
-            state.inbound.drain(..consumed);
+            state.inbound.advance(n);
         }
         if fin {
             return Err(ConnError::ClosedCriticalStream);
@@ -728,18 +893,16 @@ impl Conn {
                 Err(_) => return Err(ConnError::Protocol),
             };
             state.push_id = Some(push_id);
-            state.inbound.drain(..n);
+            state.inbound.advance(n);
         }
         let push_id = state.push_id.expect("push id set above");
-        let mut consumed = 0usize;
-        while consumed < state.inbound.len() {
-            let rest = &state.inbound[consumed..];
+        while !state.inbound.is_empty() {
+            let rest = state.inbound.as_slice();
             let (frame, n) = match Frame::parse(rest, self.max_frame_size) {
                 Ok(parsed) => parsed,
                 Err(ParseError::NeedMore) => break,
                 Err(err) => return Err(err.into()),
             };
-            consumed += n;
             match frame {
                 Frame::Headers(block) => {
                     let (next_message, trailing) = match state.message {
@@ -770,18 +933,19 @@ impl Conn {
                         return Err(ConnError::FrameUnexpected);
                     }
                     state.message = MessageState::Data;
+                    let payload_start = n - data.len();
+                    let data = state.inbound.take_payload(payload_start..n, n);
                     self.events.push_back(Event::PushData {
                         stream_id,
                         push_id,
-                        data: data.to_vec(),
+                        data,
                     });
+                    continue;
                 }
                 Frame::Unknown { .. } => {}
                 _ => return Err(ConnError::FrameUnexpected),
             }
-        }
-        if consumed > 0 {
-            state.inbound.drain(..consumed);
+            state.inbound.advance(n);
         }
         if fin {
             if !state.inbound.is_empty() || state.message == MessageState::Idle {
@@ -839,5 +1003,99 @@ impl ConnError {
             Self::QpackDecoderStream => ErrorCode::QpackDecoderStream,
             Self::Protocol | Self::Parse(_) => ErrorCode::GeneralProtocol,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Conn, Event, Frame, MessageState, Role, StreamId, StreamState, TYPE_DATA};
+    use crate::FrameHeader;
+
+    #[test]
+    fn owned_ingest_adopts_a_fragmented_frame_allocation() {
+        let stream_id = StreamId::new(0);
+        let mut wire = Vec::new();
+        Frame::encode(0x21, b"fragment", &mut wire).unwrap();
+        let tail = wire.split_off(2);
+        let allocation = wire.as_ptr();
+        let mut conn = Conn::with_role(Role::Server);
+
+        conn.ingest_stream_owned(stream_id, wire, false).unwrap();
+
+        let state = conn.streams.get(&stream_id).unwrap();
+        assert_eq!(state.inbound.as_ptr(), allocation);
+        assert_eq!(state.inbound.len(), 2);
+
+        conn.ingest_stream_owned(stream_id, tail, false).unwrap();
+        assert!(conn.streams.get(&stream_id).unwrap().inbound.is_empty());
+    }
+
+    #[test]
+    fn fragmented_data_keeps_the_partial_allocation_through_the_event() {
+        let stream_id = StreamId::new(0);
+        let mut wire = Vec::with_capacity(128);
+        Frame::encode(TYPE_DATA, b"fragmented-body", &mut wire).unwrap();
+        let header_len = FrameHeader::parse(&wire).unwrap().header_len;
+        let tail = wire.split_off(header_len + 3);
+        let payload = wire.as_ptr().wrapping_add(header_len);
+        let mut conn = Conn::with_role(Role::Server);
+        conn.streams.insert(
+            stream_id,
+            StreamState {
+                message: MessageState::Headers,
+                ..StreamState::default()
+            },
+        );
+
+        conn.ingest_stream_owned(stream_id, wire, false).unwrap();
+        assert!(conn.poll_event().is_none());
+        conn.ingest_stream_owned(stream_id, tail, false).unwrap();
+
+        let Some(Event::Data { data, .. }) = conn.poll_event() else {
+            panic!("DATA event");
+        };
+        assert_eq!(data.as_slice(), b"fragmented-body");
+        assert_eq!(data.as_slice().as_ptr(), payload);
+    }
+
+    #[test]
+    fn multiple_data_events_share_one_large_receive_allocation() {
+        let stream_id = StreamId::new(0);
+        let first = vec![b'a'; 300];
+        let second = vec![b'b'; 300];
+        let mut wire = Vec::new();
+        Frame::encode(TYPE_DATA, &first, &mut wire).unwrap();
+        let second_frame = wire.len();
+        Frame::encode(TYPE_DATA, &second, &mut wire).unwrap();
+        let first_header = FrameHeader::parse(&wire).unwrap().header_len;
+        let second_header = FrameHeader::parse(&wire[second_frame..])
+            .unwrap()
+            .header_len;
+        let allocation = wire.as_ptr();
+        let mut conn = Conn::with_role(Role::Server);
+        conn.streams.insert(
+            stream_id,
+            StreamState {
+                message: MessageState::Headers,
+                ..StreamState::default()
+            },
+        );
+
+        conn.ingest_stream_owned(stream_id, wire, false).unwrap();
+
+        let Some(Event::Data { data: first, .. }) = conn.poll_event() else {
+            panic!("first DATA event");
+        };
+        let Some(Event::Data { data: second, .. }) = conn.poll_event() else {
+            panic!("second DATA event");
+        };
+        assert_eq!(
+            first.as_slice().as_ptr(),
+            allocation.wrapping_add(first_header)
+        );
+        assert_eq!(
+            second.as_slice().as_ptr(),
+            allocation.wrapping_add(second_frame + second_header)
+        );
     }
 }

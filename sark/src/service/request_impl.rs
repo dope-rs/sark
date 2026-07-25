@@ -8,6 +8,7 @@ use sark_core::http::head::{Flags, HeadInput, HeaderLineScan, WellKnownHeaders};
 
 use super::plan::HeaderValue;
 use super::spec::RouteParams;
+use crate::dispatch::BodySource;
 use crate::request;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -16,6 +17,50 @@ pub enum BodyPolicy {
     Discarded,
 }
 
+mod body_mode {
+    use super::BodyPolicy;
+    use crate::dispatch::BodySource;
+
+    pub trait Sealed {
+        const POLICY: BodyPolicy;
+
+        fn bytes<B: BodySource>(body: &mut B) -> &[u8];
+    }
+
+    pub enum Buffered {}
+
+    impl Sealed for Buffered {
+        const POLICY: BodyPolicy = BodyPolicy::Buffered;
+
+        fn bytes<B: BodySource>(body: &mut B) -> &[u8] {
+            body.contiguous()
+        }
+    }
+
+    pub enum Discarded {}
+
+    impl Sealed for Discarded {
+        const POLICY: BodyPolicy = BodyPolicy::Discarded;
+
+        fn bytes<B: BodySource>(_body: &mut B) -> &[u8] {
+            &[]
+        }
+    }
+}
+
+pub trait BodyMode: body_mode::Sealed {
+    const POLICY: BodyPolicy = <Self as body_mode::Sealed>::POLICY;
+
+    fn bytes<B: BodySource>(body: &mut B) -> &[u8] {
+        <Self as body_mode::Sealed>::bytes(body)
+    }
+}
+
+impl BodyMode for body_mode::Buffered {}
+impl BodyMode for body_mode::Discarded {}
+
+pub use body_mode::{Buffered, Discarded};
+
 pub trait RouteRequestImpl {
     type HeaderSlot: Copy;
     type RawHeaders: Default;
@@ -23,11 +68,12 @@ pub trait RouteRequestImpl {
     type Params<'req>: RouteParams<'req, Raw = Self::RawParams>;
     type Headers<'req>;
     type ParsedBody<'req>;
+    type BodyMode: BodyMode;
 
     const NEED_HEADER: bool = false;
     const NEED_KNOWN_HEADER: bool = false;
     const NEED_QUERY: bool = false;
-    const BODY_POLICY: BodyPolicy = BodyPolicy::Buffered;
+    const BODY_POLICY: BodyPolicy = <Self::BodyMode as BodyMode>::POLICY;
 
     fn parse_body<'req>(raw: &'req [u8]) -> Result<Self::ParsedBody<'req>>;
 

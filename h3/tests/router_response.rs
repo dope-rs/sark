@@ -46,11 +46,10 @@ struct FakeTransport {
 impl StreamTransport for FakeTransport {
     type SendError = std::convert::Infallible;
 
-    fn recv_stream(&mut self, stream_id: u64, out: &mut Vec<u8>) -> usize {
-        let bytes = self.recv.remove(&stream_id).unwrap_or_default();
-        let n = bytes.len();
-        out.extend_from_slice(&bytes);
-        n
+    fn recv_stream(&mut self, stream_id: u64) -> Option<Vec<u8>> {
+        self.recv
+            .remove(&stream_id)
+            .filter(|bytes| !bytes.is_empty())
     }
 
     fn recv_stream_finished(&self, stream_id: u64) -> bool {
@@ -115,19 +114,9 @@ fn h3_request_routes_and_responds() {
             } => pending = Some((stream_id, fields)),
             Event::Finished { stream_id } => {
                 let (_sid, fields) = pending.take().expect("headers before finish");
-                let mut head = Vec::new();
-                let mut pairs: Vec<(&[u8], std::ops::Range<usize>)> = Vec::new();
-                for f in &fields {
-                    if f.name.first() == Some(&b':') {
-                        continue;
-                    }
-                    let start = head.len();
-                    head.extend_from_slice(f.value);
-                    pairs.push((f.name, start..head.len()));
-                }
+                let prepared = app.prepare_decoded(fields).expect("known route");
                 let mut enc = H3Encoder::new(&mut server, stream_id);
-                let out =
-                    app.dispatch_decoded(http::Method::GET, b"/json", &pairs, &head, &[], &mut enc);
+                let out = app.dispatch_prepared(prepared, &[][..], &mut enc);
                 assert_eq!(out, sark::dispatch::Decoded::Emitted);
                 assert!(enc.ok());
                 routed = true;

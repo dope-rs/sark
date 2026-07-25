@@ -161,12 +161,12 @@ impl BodyPlan {
         }
     }
 
-    pub(super) fn policy(&self) -> TokenStream {
+    pub(super) fn mode(&self) -> TokenStream {
         match self.source {
             BodySource::Raw(_) | BodySource::Json(_) => {
-                quote!(sark::service::BodyPolicy::Buffered)
+                quote!(sark::service::body::Buffered)
             }
-            BodySource::Discarded => quote!(sark::service::BodyPolicy::Discarded),
+            BodySource::Discarded => quote!(sark::service::body::Discarded),
         }
     }
 }

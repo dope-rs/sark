@@ -394,7 +394,7 @@ impl Mode {
             fields: &path_fields,
         }
         .build()?;
-        let body_policy = body_plan.policy();
+        let body_mode = body_plan.mode();
 
         let header_methods = if header_fields.is_empty() {
             TokenStream::new()
@@ -535,11 +535,11 @@ impl Mode {
                 type Params<'req> = #params_inner_ident<'req>;
                 type Headers<'req> = #headers_inner_ident<'req>;
                 #parsed_body_impl
+                type BodyMode = #body_mode;
 
                 const NEED_HEADER: bool = #need_header;
                 const NEED_KNOWN_HEADER: bool = #need_known_header;
                 const NEED_QUERY: bool = #need_query;
-                const BODY_POLICY: sark::service::BodyPolicy = #body_policy;
 
                 #header_methods
                 #query_methods

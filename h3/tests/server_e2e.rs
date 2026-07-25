@@ -16,19 +16,26 @@ struct Reply {
 }
 
 #[sark_gen::request]
-struct JsonReq {}
+struct BodyReq {
+    #[raw_body]
+    payload: o3::buffer::Bytes<o3::buffer::Retained>,
+}
 
 #[sark_gen::handler]
-fn json_h(_req: JsonReq, _state: &sark::EmptyState) -> Reply {
+fn body_h(req: BodyReq, _state: &sark::EmptyState) -> Reply {
     Reply {
         status: http::StatusCode::OK,
-        body: b"hi-server",
+        body: if req.payload.as_slice() == b"abcdef" {
+            b"hi-server"
+        } else {
+            b"bad-body"
+        },
     }
 }
 
 sark_gen::define_route! {
     SrvApp: sark::EmptyState => {
-        GET "/json" => json_h,
+        POST "/body" => body_h,
     }
 }
 
@@ -120,20 +127,21 @@ fn server_handler_routes_over_quic() {
         .send_headers(
             StreamId::new(stream_id),
             [
-                Field::new(b":method", b"GET"),
+                Field::new(b":method", b"POST"),
                 Field::new(b":scheme", b"https"),
-                Field::new(b":path", b"/json"),
+                Field::new(b":path", b"/body"),
+                Field::new(b"content-length", b"6"),
             ],
             false,
         )
         .unwrap();
     client
         .h3_mut()
-        .send_headers(
-            StreamId::new(stream_id),
-            [Field::new(b"x-request-finished", b"true")],
-            true,
-        )
+        .send_data(StreamId::new(stream_id), b"abc", false)
+        .unwrap();
+    client
+        .h3_mut()
+        .send_data(StreamId::new(stream_id), b"def", true)
         .unwrap();
     client.flush(&mut client_quic).unwrap();
 

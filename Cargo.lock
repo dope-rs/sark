@@ -439,9 +439,9 @@ dependencies = [
 
 [[package]]
 name = "dope-quic"
-version = "0.9.0"
+version = "0.9.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f7eb0a5c1ee26f29c0384a7b53648370f08ce1d5dcb77b5864312a69610cdb5e"
+checksum = "62ac9380b2bd4f344df727b1f0b74ff0dc8515788989e9a4ab13223d20e53d9d"
 dependencies = [
  "dope",
  "o3",
@@ -1251,6 +1251,7 @@ dependencies = [
  "dope-net",
  "dope-quic",
  "http",
+ "o3",
  "ring",
  "sark",
  "sark-core",

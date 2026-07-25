@@ -113,7 +113,7 @@ fn settings_exchange_and_request_stream_round_trip_over_quic() {
         server_h3.poll_event(),
         Some(Event::Data {
             stream_id: StreamId(0),
-            data: b"hello".to_vec()
+            data: b"hello".to_vec().into()
         })
     );
     assert_eq!(

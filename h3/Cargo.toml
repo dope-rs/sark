@@ -10,7 +10,8 @@ license.workspace = true
 [dependencies]
 sark-core.workspace = true
 sark.workspace = true
-dope-quic = "0.9.0"
+dope-quic = "0.9.1"
+o3.workspace = true
 
 [dev-dependencies]
 sark-gen.workspace = true

@@ -1,8 +1,8 @@
-use http::{Method, StatusCode};
+use http::StatusCode;
 use o3::buffer::{Bytes, Retained};
 use sark::dispatch::{Decode, Invocation};
 use sark::service::{RouteRequestImpl, RouteSpec, SliceValue};
-use sark_core::http::{CacheTemplate, Preparation, Prepared, Shape};
+use sark_core::http::{CacheTemplate, Preparation, Prepared, Shape, VecFieldBlock};
 
 #[sark_gen::response(raw)]
 struct Reply {
@@ -40,10 +40,32 @@ fn named_h(req: NamedReq, _state: &sark::EmptyState) -> Reply {
     }
 }
 
+#[sark_gen::request]
+struct RoutedReq {
+    #[path("id", default = "none")]
+    id: Bytes<Retained>,
+    #[query("tag", default = "none")]
+    tag: Bytes<Retained>,
+}
+
+#[sark_gen::handler]
+fn routed_h(req: RoutedReq, _state: &sark::EmptyState) -> Reply {
+    let status = if req.id.as_slice() == b"42" && req.tag.as_slice() == b"rust" {
+        StatusCode::IM_A_TEAPOT
+    } else {
+        StatusCode::OK
+    };
+    Reply {
+        status,
+        body: b"ok",
+    }
+}
+
 sark_gen::define_route! {
     AgnApp: sark::EmptyState => {
         GET "/json" => plain_h,
         GET "/named" => named_h,
+        GET "/items/:id" => routed_h,
     }
 }
 
@@ -76,31 +98,46 @@ fn agnostic_dispatch_routes_feeds_invokes_encodes() {
         },
     );
 
+    let mut fields = VecFieldBlock::new();
+    fields.push(b":method", b"GET");
+    fields.push(b":path", b"/json");
+    let prepared = app.prepare_decoded(fields).expect("known route");
     let mut cap = Capture::default();
-    let out = app.dispatch_decoded(Method::GET, b"/json", &[], &[], &[], &mut cap);
+    let out = app.dispatch_prepared(prepared, &[][..], &mut cap);
     assert_eq!(out, sark::dispatch::Decoded::Emitted);
     assert_eq!(cap.status, Some(StatusCode::OK));
     assert_eq!(cap.body, b"ok");
     assert_eq!(cap.calls, 1);
     assert!(cap.headers.is_empty());
 
-    let head: &[u8] = b"alice";
+    let mut fields = VecFieldBlock::new();
+    fields.push(b":method", b"GET");
+    fields.push(b":path", b"/named");
+    fields.push(b"x-name", b"alice");
+    let prepared = app.prepare_decoded(fields).expect("known route");
     let mut cap2 = Capture::default();
-    let out2 = app.dispatch_decoded(
-        Method::GET,
-        b"/named",
-        &[(b"x-name", 0..head.len())],
-        head,
-        &[],
-        &mut cap2,
-    );
+    let out2 = app.dispatch_prepared(prepared, &[][..], &mut cap2);
     assert_eq!(out2, sark::dispatch::Decoded::Emitted);
     assert_eq!(cap2.status, Some(StatusCode::IM_A_TEAPOT));
 
+    let mut fields = VecFieldBlock::new();
+    fields.push(b":method", b"GET");
+    fields.push(b":path", b"/items/42?tag=rust");
+    let prepared = app
+        .prepare_decoded(fields)
+        .expect("parameterized route with query");
     let mut cap3 = Capture::default();
-    let out3 = app.dispatch_decoded(Method::GET, b"/nope", &[], &[], &[], &mut cap3);
-    assert_eq!(out3, sark::dispatch::Decoded::NotFound);
-    assert_eq!(cap3.calls, 0);
+    let out3 = app.dispatch_prepared(prepared, &[][..], &mut cap3);
+    assert_eq!(out3, sark::dispatch::Decoded::Emitted);
+    assert_eq!(cap3.status, Some(StatusCode::IM_A_TEAPOT));
+
+    let mut fields = VecFieldBlock::new();
+    fields.push(b":method", b"GET");
+    fields.push(b":path", b"/nope");
+    assert!(matches!(
+        app.prepare_decoded(fields),
+        Err(sark::dispatch::Decoded::NotFound)
+    ));
 }
 
 fn write_response<'r, R: RouteSpec>(resp: R::Response<'r>) -> Vec<u8> {

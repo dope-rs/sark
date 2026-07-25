@@ -1,6 +1,7 @@
 use sark::request::Ref;
 use sark::sark_core::http::codec::HeaderScan;
 use sark::sark_core::http::head::Flags;
+use sark::service::body::{Buffered, Discarded};
 use sark::service::{BodyPolicy, RouteParams, RouteRequestImpl};
 
 #[sark_gen::request]
@@ -136,7 +137,9 @@ fn captured_accept_encoding_still_updates_protocol_scan() {
 
     assert_eq!(tail, Some(input.len() - 2));
     assert_eq!(header_count, 1);
-    assert!(<EncodingReq as RouteRequestImpl>::NEED_KNOWN_HEADER);
+    const {
+        assert!(<EncodingReq as RouteRequestImpl>::NEED_KNOWN_HEADER);
+    }
     assert!(scan.accept_encoding_gzip);
     assert_eq!(headers.accept_encoding, Some(17..21));
 }
@@ -204,6 +207,12 @@ fn generated_query_parser_rejects_out_of_bounds_range() {
 
 #[test]
 fn body_plan_selects_buffering_from_its_source() {
+    fn buffered<T: RouteRequestImpl<BodyMode = Buffered>>() {}
+    fn discarded<T: RouteRequestImpl<BodyMode = Discarded>>() {}
+
+    buffered::<RawBodyReq>();
+    buffered::<JsonBodyReq>();
+    discarded::<BodyLenReq>();
     assert_eq!(RawBodyReq::BODY_POLICY, BodyPolicy::Buffered);
     assert_eq!(JsonBodyReq::BODY_POLICY, BodyPolicy::Buffered);
     assert_eq!(BodyLenReq::BODY_POLICY, BodyPolicy::Discarded);

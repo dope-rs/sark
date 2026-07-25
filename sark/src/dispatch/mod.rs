@@ -40,14 +40,79 @@ pub enum Decoded {
     Unsupported,
 }
 
+/// Body storage requirements selected while routing the request head.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct BodyPlan {
+    /// Whether the route observes body bytes or only their wire length.
+    pub policy: crate::service::BodyPolicy,
+    /// Maximum accepted wire-body length.
+    pub max_body: usize,
+    /// Length declared by the request head, when present.
+    pub content_length: Option<usize>,
+}
+
+/// A request head whose route and borrowed field ranges are already resolved.
+pub trait PreparedRequest {
+    fn body_plan(&self) -> BodyPlan;
+}
+
+/// Protocol-owned request body storage presented to a generated route.
+///
+/// `contiguous` may materialize segmented storage. Generated dispatch calls it
+/// only for request types whose body mode requires contiguous bytes. `body_len`
+/// is the received wire length, including for sources that discarded the bytes.
+pub trait BodySource {
+    fn body_len(&self) -> usize;
+    fn contiguous(&mut self) -> &[u8];
+}
+
+impl BodySource for &[u8] {
+    fn body_len(&self) -> usize {
+        <[u8]>::len(self)
+    }
+
+    fn contiguous(&mut self) -> &[u8] {
+        self
+    }
+}
+
+impl BodySource for Vec<u8> {
+    fn body_len(&self) -> usize {
+        Vec::len(self)
+    }
+
+    fn contiguous(&mut self) -> &[u8] {
+        self
+    }
+}
+
+#[doc(hidden)]
+pub struct DecodedCtx<'a> {
+    pub method_key: crate::service::Key,
+    pub slice_path: crate::service::SlicePath<'a>,
+}
+
+impl<'a> DecodedCtx<'a> {
+    pub fn new(method_key: crate::service::Key, path: &'a [u8]) -> Self {
+        Self {
+            method_key,
+            slice_path: crate::service::SlicePath::new(path),
+        }
+    }
+}
+
 pub trait Decode {
-    fn dispatch_decoded<E: ResponseEncoder>(
+    type Prepared: PreparedRequest;
+
+    fn prepare_decoded(
         &self,
-        _method: http::Method,
-        path: &[u8],
-        headers: &[(&[u8], Range<usize>)],
-        head_bytes: &[u8],
-        body_bytes: &[u8],
+        fields: sark_core::http::VecFieldBlock,
+    ) -> Result<Self::Prepared, Decoded>;
+
+    fn dispatch_prepared<B: BodySource, E: ResponseEncoder>(
+        &self,
+        prepared: Self::Prepared,
+        body: B,
         encoder: &mut E,
     ) -> Decoded;
 }
@@ -58,8 +123,10 @@ pub trait DecodeRoute<R: RouteSpec, S> {
         raw_params: R::RawParams,
         raw_headers: R::RawHeaders,
         _method: http::Method,
+        target: Range<usize>,
         head: &[u8],
         body: &[u8],
+        declared_body_len: usize,
         state: &S,
         encoder: &mut E,
     ) -> Decoded;
@@ -73,12 +140,14 @@ where
         raw_params: R::RawParams,
         raw_headers: R::RawHeaders,
         _method: http::Method,
+        target: Range<usize>,
         head: &[u8],
         body: &[u8],
+        declared_body_len: usize,
         state: &S,
         encoder: &mut E,
     ) -> Decoded {
-        match Invocation::new(0..0, head, body, body.len()).invoke::<R, S>(
+        match Invocation::new(target, head, body, declared_body_len).invoke::<R, S>(
             raw_params,
             raw_headers,
             state,
@@ -105,8 +174,10 @@ impl<R: RouteSpec, S> DecodeRoute<R, S> for manifold::NativeFiber {
         _raw_params: R::RawParams,
         _raw_headers: R::RawHeaders,
         _method: http::Method,
+        _target: Range<usize>,
         _head: &[u8],
         _body: &[u8],
+        _declared_body_len: usize,
         _state: &S,
         _encoder: &mut E,
     ) -> Decoded {
@@ -119,8 +190,10 @@ impl<R: RouteSpec, S> DecodeRoute<R, S> for manifold::NativeStream {
         _raw_params: R::RawParams,
         _raw_headers: R::RawHeaders,
         _method: http::Method,
+        _target: Range<usize>,
         _head: &[u8],
         _body: &[u8],
+        _declared_body_len: usize,
         _state: &S,
         _encoder: &mut E,
     ) -> Decoded {
