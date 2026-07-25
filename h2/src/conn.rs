@@ -1,22 +1,24 @@
 use core::marker::PhantomData;
 use core::ops::Deref;
 use std::fmt;
+use std::mem;
 
 use dope::runtime::profile::Throughput;
 use o3::buffer::Pooled;
 
 use crate::egress::Egress;
+use crate::flow::{self, Error, Window};
 use crate::frame::{
-    self, Data, ErrorCode, Flags, FrameBuf, GoAway, HEADER_LEN, ParseError, Ping, Priority,
-    RstStream, SettingId, WindowUpdate,
+    Data, ErrorCode, Flags, FrameBuf, GoAway, HEADER_LEN, ParseError, Ping, Priority,
+    PriorityFields, RstStream, SettingId, Type, WindowUpdate,
 };
-use crate::ingress::{Ingress, PendingHeaders, PendingKind};
-use crate::role::Role;
-use crate::stream::{self, Side, Stream, StreamId, TransitionError};
+use crate::hpack::{self, DecoderError};
+use crate::ingress::{Ingress, IngressConfig, PendingHeaders, PendingKind};
+use crate::role::{ClientRole, Role, ServerRole};
+use crate::stream::{self, Side, State, Stream, StreamId, TransitionError};
 use crate::stream_registry::{StreamClass, StreamRecord, StreamRegistry};
 use crate::tuning::Tuning;
 use crate::validate::Validate;
-use crate::{flow, hpack};
 
 pub const CLIENT_PREFACE: &[u8] = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
 
@@ -147,7 +149,7 @@ pub enum ConnError {
     FlowControl,
     GoAwayReceived(ErrorCode),
     StreamLimit,
-    Hpack(hpack::DecoderError),
+    Hpack(DecoderError),
     BadStream,
     Continuation,
     FrameSize,
@@ -162,20 +164,20 @@ impl From<ParseError> for ConnError {
     }
 }
 
-impl From<flow::Error> for ConnError {
-    fn from(e: flow::Error) -> Self {
+impl From<Error> for ConnError {
+    fn from(e: Error) -> Self {
         match e {
-            flow::Error::ZeroIncrement => ConnError::Protocol,
-            flow::Error::Overflow => ConnError::FlowControl,
-            flow::Error::Stalled => ConnError::FlowControl,
+            Error::ZeroIncrement => ConnError::Protocol,
+            Error::Overflow => ConnError::FlowControl,
+            Error::Stalled => ConnError::FlowControl,
         }
     }
 }
 
-impl From<hpack::DecoderError> for ConnError {
-    fn from(e: hpack::DecoderError) -> Self {
+impl From<DecoderError> for ConnError {
+    fn from(e: DecoderError) -> Self {
         match e {
-            hpack::DecoderError::HeaderListTooLarge => ConnError::HeaderListTooLarge,
+            DecoderError::HeaderListTooLarge => ConnError::HeaderListTooLarge,
             other => ConnError::Hpack(other),
         }
     }
@@ -321,8 +323,8 @@ pub struct Conn<R: Role> {
     local_settings: Settings,
     peer_settings: Settings,
 
-    send_window: flow::Window,
-    recv_window: flow::Window,
+    send_window: Window,
+    recv_window: Window,
     recv_window_target: u32,
 
     streams: StreamRegistry<R>,
@@ -406,7 +408,7 @@ impl<R: Role> Conn<R> {
             } else {
                 0
             }
-            + if recv_window_target > flow::Window::INITIAL as u32 {
+            + if recv_window_target > Window::INITIAL as u32 {
                 HEADER_LEN + 4
             } else {
                 0
@@ -418,16 +420,16 @@ impl<R: Role> Conn<R> {
         let header_list_cap = local.max_header_list_size.unwrap() as usize;
         let mut conn = Self {
             role: PhantomData,
-            ingress: Ingress::new(
+            ingress: Ingress::new(IngressConfig {
                 inbound_capacity,
                 event_capacity,
                 data_capacity,
-                local.max_frame_size as usize,
+                data_len: local.max_frame_size as usize,
                 header_capacity,
-                local.header_table_size as usize,
-                header_list_cap,
-                R::PREFACE_SENDS_FIRST,
-            ),
+                decoder_table_size: local.header_table_size as usize,
+                header_cap: header_list_cap,
+                preface_done: R::PREFACE_SENDS_FIRST,
+            }),
             egress: Egress::new(
                 outbound_capacity,
                 local.header_table_size as usize,
@@ -439,8 +441,8 @@ impl<R: Role> Conn<R> {
             goaway_received: None,
             local_settings: local,
             peer_settings: peer,
-            send_window: flow::Window::new(),
-            recv_window: flow::Window::new(),
+            send_window: Window::new(),
+            recv_window: Window::new(),
             recv_window_target,
             streams: StreamRegistry::new(stream_capacity),
             conn_pending_release: 0,
@@ -460,7 +462,7 @@ impl<R: Role> Conn<R> {
         }
         conn.emit_initial_settings();
         conn.initial_settings_sent = true;
-        let bump = recv_window_target.saturating_sub(flow::Window::INITIAL as u32);
+        let bump = recv_window_target.saturating_sub(Window::INITIAL as u32);
         if bump > 0
             && conn.recv_window.increase(bump).is_ok()
             && conn.emit_window_update(StreamId::CONNECTION, bump).is_err()
@@ -478,11 +480,11 @@ impl<R: Role> Conn<R> {
         &self.peer_settings
     }
 
-    pub fn send_window(&self) -> flow::Window {
+    pub fn send_window(&self) -> Window {
         self.send_window
     }
 
-    pub fn recv_window(&self) -> flow::Window {
+    pub fn recv_window(&self) -> Window {
         self.recv_window
     }
 
@@ -527,14 +529,14 @@ impl<R: Role> Conn<R> {
     }
 
     pub fn take_window_opened(&mut self) -> bool {
-        std::mem::take(&mut self.send_window_opened)
+        mem::take(&mut self.send_window_opened)
     }
 
     pub fn has_stream(&self, id: StreamId) -> bool {
         self.stream(id).is_some()
     }
 
-    pub fn stream_state(&self, id: StreamId) -> Option<stream::State> {
+    pub fn stream_state(&self, id: StreamId) -> Option<State> {
         self.stream(id).map(|record| record.stream.state)
     }
 
@@ -546,11 +548,11 @@ impl<R: Role> Conn<R> {
         self.streams.reset_count()
     }
 
-    pub fn stream_send_window(&self, id: StreamId) -> Option<flow::Window> {
+    pub fn stream_send_window(&self, id: StreamId) -> Option<Window> {
         self.stream(id).map(|record| record.send_window)
     }
 
-    pub fn stream_recv_window(&self, id: StreamId) -> Option<flow::Window> {
+    pub fn stream_recv_window(&self, id: StreamId) -> Option<Window> {
         self.stream(id).map(|record| record.recv_window)
     }
 
@@ -738,7 +740,7 @@ impl<R: Role> Conn<R> {
             Side::Remote => stream.state.recv(ev)?,
         };
         stream.state = next;
-        if next == stream::State::Closed {
+        if next == State::Closed {
             if matches!(ev, stream::Event::RstStream) {
                 self.mark_reset(id);
             }
@@ -827,25 +829,21 @@ impl<R: Role> Conn<R> {
                 return Ok(());
             };
             let total = HEADER_LEN + header.length as usize;
-            if self.ingress.has_pending_headers() && header.kind != frame::Type::Continuation {
+            if self.ingress.has_pending_headers() && header.kind != Type::Continuation {
                 return Err(ConnError::Continuation);
             }
             let emits_event = match header.kind {
-                frame::Type::Settings
-                | frame::Type::Ping
-                | frame::Type::GoAway
-                | frame::Type::Data
-                | frame::Type::RstStream => true,
-                frame::Type::Headers | frame::Type::PushPromise | frame::Type::Continuation => {
+                Type::Settings | Type::Ping | Type::GoAway | Type::Data | Type::RstStream => true,
+                Type::Headers | Type::PushPromise | Type::Continuation => {
                     header.flags.has(Flags::END_HEADERS)
                 }
-                frame::Type::WindowUpdate | frame::Type::Priority => false,
+                Type::WindowUpdate | Type::Priority => false,
             };
             if emits_event {
                 self.ensure_event_capacity()?;
             }
             match header.kind {
-                frame::Type::Settings => {
+                Type::Settings => {
                     let ack = header.flags.has(Flags::ACK);
                     if !header.stream_id.is_zero() {
                         return Err(ParseError::Protocol.into());
@@ -900,7 +898,7 @@ impl<R: Role> Conn<R> {
                         continue;
                     }
                 }
-                frame::Type::Ping => {
+                Type::Ping => {
                     let mut payload = [0; 8];
                     if header.length != payload.len() as u32 {
                         return Err(ParseError::FrameSize.into());
@@ -927,7 +925,7 @@ impl<R: Role> Conn<R> {
                         opaque: parsed.opaque,
                     })?;
                 }
-                frame::Type::GoAway => {
+                Type::GoAway => {
                     if header.length < 8 {
                         return Err(ParseError::FrameSize.into());
                     }
@@ -944,7 +942,7 @@ impl<R: Role> Conn<R> {
                         debug: DataPayload(debug),
                     })?;
                 }
-                frame::Type::WindowUpdate => {
+                Type::WindowUpdate => {
                     let mut payload = [0; 4];
                     if header.length != payload.len() as u32 {
                         return Err(ParseError::FrameSize.into());
@@ -956,7 +954,7 @@ impl<R: Role> Conn<R> {
                     self.handle_window_update_frame(parsed)?;
                     continue;
                 }
-                frame::Type::Headers => {
+                Type::Headers => {
                     if header.stream_id.is_zero() {
                         return Err(ParseError::Protocol.into());
                     }
@@ -970,7 +968,7 @@ impl<R: Role> Conn<R> {
                         let mut priority = [0; 5];
                         let copied = self.ingress.copy(start, &mut priority);
                         debug_assert!(copied);
-                        let _ = frame::PriorityFields::parse(&priority)?;
+                        let _ = PriorityFields::parse(&priority)?;
                         start += priority.len();
                         len -= priority.len();
                     }
@@ -985,7 +983,7 @@ impl<R: Role> Conn<R> {
                     self.handle_headers_frame(sid, end_stream, end_headers)?;
                     continue;
                 }
-                frame::Type::Data => {
+                Type::Data => {
                     if header.stream_id.is_zero() {
                         return Err(ParseError::Protocol.into());
                     }
@@ -999,7 +997,7 @@ impl<R: Role> Conn<R> {
                     self.handle_data_frame(stream_id, end_stream, payload)?;
                     continue;
                 }
-                frame::Type::Continuation => {
+                Type::Continuation => {
                     if header.stream_id.is_zero() {
                         return Err(ParseError::Protocol.into());
                     }
@@ -1015,7 +1013,7 @@ impl<R: Role> Conn<R> {
                     self.handle_continuation_frame(stream_id, end_headers, len)?;
                     continue;
                 }
-                frame::Type::RstStream => {
+                Type::RstStream => {
                     let mut payload = [0; 4];
                     if header.length != payload.len() as u32 {
                         return Err(ParseError::FrameSize.into());
@@ -1027,7 +1025,7 @@ impl<R: Role> Conn<R> {
                     self.handle_rst_frame(parsed)?;
                     continue;
                 }
-                frame::Type::PushPromise => {
+                Type::PushPromise => {
                     if header.stream_id.is_zero() {
                         return Err(ParseError::Protocol.into());
                     }
@@ -1053,7 +1051,7 @@ impl<R: Role> Conn<R> {
                     self.handle_push_promise_frame(stream_id, promised, end_headers)?;
                     continue;
                 }
-                frame::Type::Priority => {
+                Type::Priority => {
                     let mut payload = [0; 5];
                     if header.length != payload.len() as u32 {
                         return Err(ParseError::FrameSize.into());
@@ -1402,7 +1400,7 @@ impl<R: Role> Conn<R> {
     }
 }
 
-impl Conn<crate::role::ClientRole> {
+impl Conn<ClientRole> {
     pub fn start_request(
         &mut self,
         headers: &[hpack::Header<'_>],
@@ -1435,7 +1433,7 @@ impl Conn<crate::role::ClientRole> {
     }
 }
 
-impl Conn<crate::role::ServerRole> {
+impl Conn<ServerRole> {
     pub fn send_response<'a, I>(
         &mut self,
         stream_id: StreamId,

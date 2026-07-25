@@ -13,7 +13,7 @@ use o3::buffer::RetainBytes;
 
 use super::Config;
 use super::connection::{ConnectionState, Dispatch, EventSink, Limits, Request, Response};
-use super::scheduler::{Resumed, Scheduler, Started};
+use super::scheduler::{Resumed, Scheduler, StartContext, Started};
 use super::task::TaskTarget;
 use crate::conn::{Conn, ConnError};
 use crate::frame::ErrorCode;
@@ -291,12 +291,14 @@ where
     fn request(&mut self, stream_id: StreamId, request: Request) -> Dispatch {
         match self.scheduler.start(
             self.user.request(request),
-            self.connection_id,
-            stream_id,
-            self.task_head,
-            self.ready,
-            self.parent,
-            self.driver,
+            StartContext {
+                connection_id: self.connection_id,
+                stream_id,
+                task_head: self.task_head,
+                ready: self.ready,
+                parent: self.parent,
+                driver: self.driver,
+            },
         ) {
             Started::Ready(response) => Dispatch::Response(response),
             Started::Pending => Dispatch::Pending,

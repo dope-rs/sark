@@ -1,3 +1,5 @@
+//! General-purpose owned HTTP response.
+
 use http::{HeaderName, HeaderValue, StatusCode};
 use o3::buffer::Shared;
 use serde::Serialize;

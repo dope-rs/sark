@@ -353,7 +353,7 @@ impl JsonMode {
                 let fields = named
                     .named
                     .iter()
-                    .zip(parsed.into_iter())
+                    .zip(parsed)
                     .enumerate()
                     .map(|(idx, (field, (field_mode, name_override)))| {
                         let ident = field.ident.clone().ok_or_else(|| {

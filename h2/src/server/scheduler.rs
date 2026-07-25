@@ -22,6 +22,15 @@ pub(super) enum Resumed<T> {
     Stale,
 }
 
+pub(super) struct StartContext<'a, 'turn, 'd> {
+    pub(super) connection_id: Token,
+    pub(super) stream_id: StreamId,
+    pub(super) task_head: &'a mut Option<u32>,
+    pub(super) ready: Pin<&'a TaskQueue<TaskTarget>>,
+    pub(super) parent: dope_fiber::RootWaker<'d>,
+    pub(super) driver: &'a mut DriverContext<'turn, 'd>,
+}
+
 pub(super) struct Scheduler<'d, F>
 where
     F: Fiber<'d> + 'd,
@@ -48,13 +57,16 @@ where
     pub(super) fn start(
         &mut self,
         fiber: F,
-        connection_id: Token,
-        stream_id: StreamId,
-        task_head: &mut Option<u32>,
-        ready: Pin<&TaskQueue<TaskTarget>>,
-        parent: dope_fiber::RootWaker<'d>,
-        driver: &mut DriverContext<'_, 'd>,
+        context: StartContext<'_, '_, 'd>,
     ) -> Started<F::Output> {
+        let StartContext {
+            connection_id,
+            stream_id,
+            task_head,
+            ready,
+            parent,
+            driver,
+        } = context;
         let Some(task) = self.slab.insert(fiber) else {
             return Started::Refused;
         };

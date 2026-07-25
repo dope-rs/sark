@@ -18,6 +18,17 @@ pub(super) struct PendingHeaders {
     pub(super) continuations: u32,
 }
 
+pub(super) struct IngressConfig {
+    pub(super) inbound_capacity: usize,
+    pub(super) event_capacity: usize,
+    pub(super) data_capacity: usize,
+    pub(super) data_len: usize,
+    pub(super) header_capacity: usize,
+    pub(super) decoder_table_size: usize,
+    pub(super) header_cap: usize,
+    pub(super) preface_done: bool,
+}
+
 pub(super) struct Ingress {
     bytes: ByteRing,
     events: FixedQueue<Event>,
@@ -31,16 +42,17 @@ pub(super) struct Ingress {
 }
 
 impl Ingress {
-    pub(super) fn new(
-        inbound_capacity: usize,
-        event_capacity: usize,
-        data_capacity: usize,
-        data_len: usize,
-        header_capacity: usize,
-        decoder_table_size: usize,
-        header_cap: usize,
-        preface_done: bool,
-    ) -> Self {
+    pub(super) fn new(config: IngressConfig) -> Self {
+        let IngressConfig {
+            inbound_capacity,
+            event_capacity,
+            data_capacity,
+            data_len,
+            header_capacity,
+            decoder_table_size,
+            header_cap,
+            preface_done,
+        } = config;
         let mut decoder = hpack::Decoder::new(decoder_table_size);
         decoder.set_max_header_list_size(Some(header_cap));
         Self {

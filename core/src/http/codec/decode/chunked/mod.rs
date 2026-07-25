@@ -7,6 +7,9 @@ const MAX_BODY_SIZE: usize = 100 * 1024 * 1024;
 const MAX_TRAILER_COUNT: usize = 128;
 const MAX_TRAILER_BYTES: usize = 16 * 1024;
 
+type Trailers = Vec<(HeaderName, HeaderValue)>;
+type ParsedTrailers = Option<(Trailers, usize)>;
+
 fn parse_chunk_size(bytes: &[u8]) -> Result<usize> {
     if bytes.is_empty() {
         return Err(Error::BadRequest("Empty chunk size".into()));
@@ -29,13 +32,13 @@ fn parse_chunk_size(bytes: &[u8]) -> Result<usize> {
 
 pub(crate) struct DecodeResult {
     pub(crate) body: Vec<u8>,
-    pub(crate) trailers: Vec<(HeaderName, HeaderValue)>,
+    pub(crate) trailers: Trailers,
 }
 
 pub enum DecodeEvent<'a> {
     NeedMore,
     Chunk(&'a [u8]),
-    Done(Vec<(HeaderName, HeaderValue)>),
+    Done(Trailers),
 }
 
 enum State {
@@ -178,7 +181,7 @@ impl BodyDecoder {
         }
     }
 
-    fn parse_trailers(buf: &[u8]) -> Result<Option<(Vec<(HeaderName, HeaderValue)>, usize)>> {
+    fn parse_trailers(buf: &[u8]) -> Result<ParsedTrailers> {
         if buf.starts_with(b"\r\n") {
             return Ok(Some((Vec::new(), 2)));
         }

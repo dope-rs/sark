@@ -21,6 +21,23 @@ const PROBE_UA: u64 = u64::from_le_bytes([b'u', b's', b'e', b'r', b'-', 0xff, 0x
 
 pub const MAX_HEADER_LINE_BYTES: usize = 8 * 1024;
 
+#[derive(Clone, Copy)]
+struct KnownLine {
+    header: KnownHeader,
+    colon_idx: usize,
+    minimum_len: usize,
+}
+
+impl KnownLine {
+    const fn new(header: KnownHeader, colon_idx: usize, minimum_len: usize) -> Self {
+        Self {
+            header,
+            colon_idx,
+            minimum_len,
+        }
+    }
+}
+
 pub struct WellKnownHeaders<'a> {
     scan: &'a mut codec::HeaderScan,
     flags: &'a mut Flags,
@@ -132,45 +149,35 @@ impl<'a> WellKnownHeaders<'a> {
         match probe_key {
             PROBE_HOST => self.apply_known_contiguous(
                 rest,
-                KnownHeader::Host,
-                4,
-                8,
+                KnownLine::new(KnownHeader::Host, 4, 8),
                 visitor,
                 header_count,
                 max_header_count,
             ),
             PROBE_EXPECT => self.apply_known_contiguous(
                 rest,
-                KnownHeader::Expect,
-                6,
-                7,
+                KnownLine::new(KnownHeader::Expect, 6, 7),
                 visitor,
                 header_count,
                 max_header_count,
             ),
             PROBE_CONN => self.apply_known_contiguous(
                 rest,
-                KnownHeader::Connection,
-                10,
-                11,
+                KnownLine::new(KnownHeader::Connection, 10, 11),
                 visitor,
                 header_count,
                 max_header_count,
             ),
             PROBE_CLEN => self.apply_known_contiguous(
                 rest,
-                KnownHeader::ContentLength,
-                14,
-                15,
+                KnownLine::new(KnownHeader::ContentLength, 14, 15),
                 visitor,
                 header_count,
                 max_header_count,
             ),
             PROBE_TE => self.apply_known_contiguous(
                 rest,
-                KnownHeader::TransferEncoding,
-                17,
-                18,
+                KnownLine::new(KnownHeader::TransferEncoding, 17, 18),
                 visitor,
                 header_count,
                 max_header_count,
@@ -180,9 +187,7 @@ impl<'a> WellKnownHeaders<'a> {
             }
             PROBE_AE => self.apply_known_contiguous(
                 rest,
-                KnownHeader::AcceptEncoding,
-                15,
-                16,
+                KnownLine::new(KnownHeader::AcceptEncoding, 15, 16),
                 visitor,
                 header_count,
                 max_header_count,
@@ -197,13 +202,16 @@ impl<'a> WellKnownHeaders<'a> {
     fn apply_known_contiguous<V: Visitor>(
         &mut self,
         rest: &[u8],
-        header: KnownHeader,
-        colon_idx: usize,
-        minimum_len: usize,
+        line: KnownLine,
         visitor: &mut V,
         header_count: &mut usize,
         max_header_count: usize,
     ) -> Result<Option<usize>> {
+        let KnownLine {
+            header,
+            colon_idx,
+            minimum_len,
+        } = line;
         if rest.len() < minimum_len || !Self::tail_matches(header, rest) {
             return self.apply_unknown_contiguous(rest, 5, visitor, header_count, max_header_count);
         }
