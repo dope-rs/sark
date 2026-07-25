@@ -3,7 +3,7 @@ use std::{
     fmt::{self, Debug, Formatter},
 };
 
-use o3::buffer::{Borrowed, Bytes, Owned, Retained, Shared};
+use o3::buffer::{Borrowed, Bytes, CapacityError, Owned, Retained, Shared};
 
 use super::{Body, DEFAULT_HEADER_CAPACITY, HeadInner, direct::INLINE_HOT_TEXT_PARTS};
 
@@ -55,6 +55,15 @@ impl<'req> TextItem<'req> {
     pub(crate) fn len(&self) -> usize {
         self.as_bytes().len()
     }
+
+    fn into_shared(self) -> Shared {
+        match self {
+            Self::Static(bytes) => Shared::from_static(bytes),
+            Self::Shared(bytes) => bytes,
+            Self::Borrowed(bytes) => Shared::copy_from_slice(bytes.as_slice()),
+            Self::Retained(bytes) => bytes.into_shared(),
+        }
+    }
 }
 
 #[allow(clippy::large_enum_variant)]
@@ -68,11 +77,7 @@ impl<'req, const N: usize> HotHeadInner<'req, N> {
     pub(super) fn into_bytes(self) -> Shared {
         match self {
             Self::Wire(bytes) => bytes,
-            Self::Direct(head) => {
-                let mut out = Owned::with_capacity(head.wire_len());
-                head.write_into_owned(&mut out);
-                out.freeze()
-            }
+            Self::Direct(head) => head.wire_headers(),
         }
     }
 }
@@ -194,11 +199,26 @@ impl<'req> TextBody<'req> {
     }
 
     pub fn into_bytes(self) -> Shared {
-        let mut out = Owned::with_capacity(self.body_len);
-        for item in &self.items[..usize::from(self.len)] {
-            out.extend_from_slice(item.as_bytes());
+        let Self {
+            items,
+            len,
+            body_len,
+        } = self;
+        match len {
+            0 => Shared::new(),
+            1 => {
+                let [item, ..] = items;
+                item.into_shared()
+            }
+            _ => Owned::try_build_exact(body_len, |out| {
+                for item in items.into_iter().take(usize::from(len)) {
+                    out.try_extend_from_slice(item.as_bytes())?;
+                }
+                Ok::<_, CapacityError>(())
+            })
+            .expect("text body length mismatch")
+            .freeze(),
         }
-        out.freeze()
     }
 
     fn push_item(&mut self, item: TextItem<'req>) {

@@ -1,8 +1,20 @@
-use o3::buffer::{Owned, Shared};
+use std::convert::Infallible;
+
+use o3::buffer::{Owned, Shared, SpareWriter};
 use sark_core::http::EncodedBody;
 
 use crate::JsonEncode;
-use crate::encode::SliceWriter;
+use crate::encode::{SliceWriter, Write};
+
+struct ExactWriter<'a, 'buf>(&'a mut SpareWriter<'buf>);
+
+impl Write for ExactWriter<'_, '_> {
+    fn put(&mut self, src: &[u8]) {
+        self.0
+            .try_extend_from_slice(src)
+            .expect("JsonEncode wrote beyond json_len");
+    }
+}
 
 pub struct JsonBody<T>(T);
 
@@ -27,9 +39,11 @@ where
     }
 
     fn into_shared(self, encoded_len: usize) -> Shared {
-        let mut out = Owned::with_capacity(encoded_len);
-        self.0.write_into(&mut out);
-        assert_eq!(out.len(), encoded_len, "JsonEncode length mismatch");
-        out.freeze()
+        Owned::try_build_exact(encoded_len, |out| {
+            self.0.write_into(&mut ExactWriter(out));
+            Ok::<_, Infallible>(())
+        })
+        .expect("JsonEncode length mismatch")
+        .freeze()
     }
 }

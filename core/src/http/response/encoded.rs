@@ -1,5 +1,5 @@
 use http::StatusCode;
-use o3::buffer::{Owned, Shared};
+use o3::buffer::Shared;
 
 use super::wire_emit::{ContentLength, HeadWrite, PLACEHOLDER_DATE};
 use super::{DEFAULT_HEADER_CAPACITY, HeadInner, Headers};
@@ -43,9 +43,7 @@ where
     }
 
     pub fn wire_headers(&self) -> Shared {
-        let mut out = Owned::with_capacity(self.head.wire_len());
-        self.head.write_into_owned(&mut out);
-        out.freeze()
+        self.head.wire_headers()
     }
 
     pub(crate) fn encoded_body(&self) -> Shared {

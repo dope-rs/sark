@@ -1,4 +1,4 @@
-use o3::buffer::Shared;
+use o3::buffer::{Owned, Shared};
 
 pub struct Wire;
 
@@ -58,11 +58,13 @@ impl Wire {
             .checked_add(body.len())
             .and_then(|len| len.checked_add(2))
             .expect("chunk frame length overflow");
-        let mut framed = o3::buffer::Owned::with_capacity(capacity);
-        framed.extend_from_slice(&prefix[..prefix_len]);
-        framed.extend_from_slice(&body);
-        framed.extend_from_slice(b"\r\n");
-        framed.freeze()
+        Owned::try_build_exact(capacity, |out| {
+            out.try_extend_from_slice(&prefix[..prefix_len])?;
+            out.try_extend_from_slice(&body)?;
+            out.try_extend_from_slice(b"\r\n")
+        })
+        .expect("chunk frame length mismatch")
+        .freeze()
     }
 }
 

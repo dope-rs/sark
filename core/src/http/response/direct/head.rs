@@ -1,3 +1,5 @@
+use o3::buffer::{CapacityError, Owned, Shared, SpareWriter};
+
 use super::headers::{DEFAULT_HEADER_CAPACITY, Headers};
 
 #[derive(Clone, Debug)]
@@ -30,9 +32,18 @@ impl<'req, const N: usize> HeadInner<'req, N> {
         self.static_headers.len() + self.headers.wire_len()
     }
 
-    pub(crate) fn write_into_owned(&self, out: &mut o3::buffer::Owned) {
-        out.extend_from_slice(self.static_headers);
-        self.headers.write_into_owned(out);
+    pub(crate) fn wire_headers(&self) -> Shared {
+        if self.headers.is_empty() {
+            return Shared::from_static(self.static_headers);
+        }
+        Owned::try_build_exact(self.wire_len(), |out| self.write_into(out))
+            .expect("direct header wire length mismatch")
+            .freeze()
+    }
+
+    fn write_into(&self, out: &mut SpareWriter<'_>) -> Result<(), CapacityError> {
+        out.try_extend_from_slice(self.static_headers)?;
+        self.headers.write_into(out)
     }
 
     pub fn write_slice(&self, out: &mut [u8]) -> Option<usize> {

@@ -1,5 +1,5 @@
 use http::StatusCode;
-use o3::buffer::{Owned, Shared};
+use o3::buffer::Shared;
 
 use super::wire_emit::{
     ContentLength, DATE_LEN, HeadWrite, HeaderSection, PLACEHOLDER_DATE, WireWriter,
@@ -59,9 +59,7 @@ impl<'req, const N: usize> FixedResponse<'req, N> {
     }
 
     pub fn wire_headers(&self) -> Shared {
-        let mut out = Owned::with_capacity(self.head.wire_len());
-        self.head.write_into_owned(&mut out);
-        out.freeze()
+        self.head.wire_headers()
     }
 
     fn head_write(&self) -> (HeadWrite<'_, HeadInner<'req, N>, ContentLength>, &[u8]) {

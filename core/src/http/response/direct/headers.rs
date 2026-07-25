@@ -1,4 +1,4 @@
-use o3::buffer::{Borrowed, Bytes, Retained, Shared};
+use o3::buffer::{Borrowed, Bytes, CapacityError, Retained, Shared, SpareWriter};
 
 use super::value::{HeaderItem, HeaderValueInner, InlineHeaderValue};
 
@@ -108,14 +108,15 @@ impl<'req, const N: usize> Headers<'req, N> {
         self.push_value(name, HeaderValueInner::Retained(value))
     }
 
-    pub(super) fn write_into_owned(&self, out: &mut o3::buffer::Owned) {
+    pub(super) fn write_into(&self, out: &mut SpareWriter<'_>) -> Result<(), CapacityError> {
         for idx in 0..self.len {
             let header = &self.entries[idx];
-            out.extend_from_slice(header.name_bytes());
-            out.extend_from_slice(b": ");
-            out.extend_from_slice(header.value_bytes());
-            out.extend_from_slice(b"\r\n");
+            out.try_extend_from_slice(header.name_bytes())?;
+            out.try_extend_from_slice(b": ")?;
+            out.try_extend_from_slice(header.value_bytes())?;
+            out.try_extend_from_slice(b"\r\n")?;
         }
+        Ok(())
     }
 
     pub(super) fn write_wire(&self, out: &mut super::super::wire_emit::WireWriter<'_>) {

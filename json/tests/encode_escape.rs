@@ -13,6 +13,18 @@ impl JsonEncode for LengthMismatch {
     }
 }
 
+struct ShortWrite;
+
+impl JsonEncode for ShortWrite {
+    fn json_len(&self) -> usize {
+        2
+    }
+
+    fn write_into<W: Write>(&self, writer: &mut W) {
+        writer.put(b"x");
+    }
+}
+
 fn check(value: &[u8]) {
     let mut out = Vec::new();
     let mut w = Writer::new(&mut out, 0);
@@ -49,4 +61,10 @@ fn common_escapes_and_plain() {
 #[should_panic(expected = "JsonEncode wrote beyond json_len")]
 fn length_mismatch_panics() {
     JsonBody::new(LengthMismatch).encode_into(&mut []);
+}
+
+#[test]
+#[should_panic(expected = "JsonEncode length mismatch")]
+fn shared_length_mismatch_panics() {
+    JsonBody::new(ShortWrite).into_shared(2);
 }

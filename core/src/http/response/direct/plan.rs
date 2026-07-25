@@ -1,5 +1,5 @@
 use http::StatusCode;
-use o3::buffer::{Borrowed, Bytes, Owned, Retained, Shared};
+use o3::buffer::{Borrowed, Bytes, Retained, Shared};
 
 use super::super::{Body, HotBodyInner, HotHeadInner, MonoResponseInner, TextBody};
 use super::head::HeadInner;
@@ -44,9 +44,7 @@ impl<'req> ResponsePlan<'req> {
     }
 
     pub fn wire_headers(&self) -> Shared {
-        let mut out = Owned::with_capacity(self.head.wire_len());
-        self.head.write_into_owned(&mut out);
-        out.freeze()
+        self.head.wire_headers()
     }
 
     pub fn push_static(&mut self, name: &'static str, value: &'static str) -> &mut Self {
