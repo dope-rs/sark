@@ -1,7 +1,11 @@
+use std::{
+    array::from_fn,
+    fmt::{self, Debug, Formatter},
+};
+
 use o3::buffer::{Borrowed, Bytes, Owned, Retained, Shared};
 
-use super::direct::INLINE_HOT_TEXT_PARTS;
-use super::{Body, DEFAULT_HEADER_CAPACITY, HeadInner};
+use super::{Body, DEFAULT_HEADER_CAPACITY, HeadInner, direct::INLINE_HOT_TEXT_PARTS};
 
 #[derive(Clone)]
 pub enum TextItem<'req> {
@@ -11,8 +15,8 @@ pub enum TextItem<'req> {
     Retained(Bytes<Retained>),
 }
 
-impl<'req> std::fmt::Debug for TextItem<'req> {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl<'req> Debug for TextItem<'req> {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         match self {
             Self::Static(bytes) => f
                 .debug_struct("TextItem::Static")
@@ -82,7 +86,7 @@ pub struct TextBody<'req> {
 impl<'req> Clone for TextBody<'req> {
     fn clone(&self) -> Self {
         let len = usize::from(self.len);
-        let items = std::array::from_fn(|idx| {
+        let items = from_fn(|idx| {
             if idx < len {
                 self.items[idx].clone()
             } else {
@@ -97,8 +101,8 @@ impl<'req> Clone for TextBody<'req> {
     }
 }
 
-impl<'req> std::fmt::Debug for TextBody<'req> {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl<'req> Debug for TextBody<'req> {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         f.debug_struct("HotText")
             .field("len", &self.len)
             .field("body_len", &self.body_len)
@@ -115,7 +119,7 @@ impl<'req> Default for TextBody<'req> {
 impl<'req> TextBody<'req> {
     pub fn new() -> Self {
         Self {
-            items: std::array::from_fn(|_| TextItem::placeholder()),
+            items: from_fn(|_| TextItem::placeholder()),
             len: 0,
             body_len: 0,
         }
@@ -129,7 +133,7 @@ impl<'req> TextBody<'req> {
         );
         let mut iter = IntoIterator::into_iter(items);
         let mut body_len = 0usize;
-        let entries = std::array::from_fn(|_| match iter.next() {
+        let entries = from_fn(|_| match iter.next() {
             Some(item) => {
                 body_len += item.len();
                 item
@@ -305,8 +309,8 @@ impl From<HotBodyInner<'static>> for Body<'static> {
     }
 }
 
-impl<'req> std::fmt::Debug for HotBodyInner<'req> {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl<'req> Debug for HotBodyInner<'req> {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         match self {
             Self::Owned(body) => f
                 .debug_struct("HotBody::Owned")

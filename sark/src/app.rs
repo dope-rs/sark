@@ -1,8 +1,10 @@
-use std::io;
+use std::io::{self, Error};
 use std::marker::PhantomData;
+use std::pin::{Pin, pin};
 use std::time::Duration;
 
 use dope::driver::token::Token;
+use dope::hash::{Seed, domain::ACCEPT};
 use dope::manifold::env::Bundle;
 use dope::manifold::listener::{self, Application, Listener};
 use dope::manifold::{Manifold, TypedToken};
@@ -16,6 +18,7 @@ use dope_net::wire::identity::Identity;
 use dope_net::{Transport, tcp::Tcp};
 use dope_tls::tls::{Endpoint, Tls};
 use o3::cell::BrandCell as Branded;
+use shin::server;
 
 use crate::date::{DateHost, Updater};
 use crate::timer::{TimedListener, TimerHost};
@@ -91,7 +94,7 @@ where
     where
         S: StorageFactory,
         D: FnOnce(u16) -> driver::Config + Clone + Send,
-        SF: FnOnce(u16, dope::hash::Seed) -> S + Clone + Send,
+        SF: FnOnce(u16, Seed) -> S + Clone + Send,
         F: for<'scope, 'd> FnOnce(Self, &mut Session<'scope, 'd, S::Output<'d>>) -> io::Result<()>
             + Clone
             + Send,
@@ -174,13 +177,13 @@ where
         self,
         session: &mut Session<'scope, 'd, S>,
         app: A,
-        tls: shin::server::Config,
+        tls: server::Config,
         shutdown: Option<&ShutdownTrigger>,
     ) -> io::Result<()>
     where
         A: Application<'d, Wire = Tls> + DateHost + TimerHost<'d>,
     {
-        let endpoint = Endpoint::server(tls).map_err(io::Error::other)?;
+        let endpoint = Endpoint::server(tls).map_err(Error::other)?;
         run::<LISTENER_ID, DATE_ID, A, Tls, P, S>(
             session,
             app,
@@ -196,14 +199,14 @@ where
         session: &mut Session<'scope, 'd, S>,
         app: A,
         resource: R,
-        tls: shin::server::Config,
+        tls: server::Config,
         shutdown: Option<&ShutdownTrigger>,
     ) -> io::Result<()>
     where
         A: Application<'d, Wire = Tls> + DateHost + TimerHost<'d>,
         R: Manifold<'d>,
     {
-        let endpoint = Endpoint::server(tls).map_err(io::Error::other)?;
+        let endpoint = Endpoint::server(tls).map_err(Error::other)?;
         run_with_resource::<LISTENER_ID, DATE_ID, A, Tls, P, R, S>(
             session,
             app,
@@ -238,7 +241,7 @@ where
     T: Clone + Send,
     S: StorageFactory,
     D: FnOnce(u16) -> driver::Config + Clone + Send,
-    SF: FnOnce(u16, dope::hash::Seed) -> S + Clone + Send,
+    SF: FnOnce(u16, Seed) -> S + Clone + Send,
     F: for<'scope, 'd> FnOnce(T, &mut Session<'scope, 'd, S::Output<'d>>) -> io::Result<()>
         + Clone
         + Send,
@@ -316,7 +319,7 @@ where
     T: Send,
     S: StorageFactory,
     D: FnOnce(u16) -> driver::Config + Send,
-    SF: FnOnce(u16, dope::hash::Seed) -> S + Send,
+    SF: FnOnce(u16, Seed) -> S + Send,
     F: for<'scope, 'd> FnOnce(T, &mut Session<'scope, 'd, S::Output<'d>>) -> io::Result<()> + Send,
 {
     type Input = WorkerInput<T, (D, SF), F>;
@@ -346,7 +349,7 @@ where
 fn run_server_worker_with_context<T, F>(
     server: T,
     driver_config: driver::Config,
-    seed: Option<dope::hash::Seed>,
+    seed: Option<Seed>,
     worker_context: Option<&WorkerContext>,
     worker: F,
 ) -> io::Result<()>
@@ -388,7 +391,7 @@ where
 fn run_server_worker_with_storage_and_context<T, S, F>(
     server: T,
     driver_config: driver::Config,
-    seed: Option<dope::hash::Seed>,
+    seed: Option<Seed>,
     storage_factory: S,
     worker_context: Option<&WorkerContext>,
     worker: F,
@@ -424,10 +427,7 @@ where
     W: Wire,
     P: RuntimeProfile,
 {
-    let hash_builder = session
-        .seed()
-        .derive(dope::hash::domain::ACCEPT ^ LISTENER_ID as u64)
-        .state();
+    let hash_builder = session.seed().derive(ACCEPT ^ LISTENER_ID as u64).state();
     let listener = {
         let mut driver = session.driver_access();
         if let Some(trigger) = shutdown {
@@ -436,7 +436,7 @@ where
         Listener::open_in_with_wire(app, listener, wire, hash_builder, &mut driver)?
     };
     listener.handler().timer().set_head_timeout(head_timeout);
-    let dispatcher = core::pin::pin!(Branded::new(Dispatcher::<
+    let dispatcher = pin!(Branded::new(Dispatcher::<
         'd,
         LISTENER_ID,
         DATE_ID,
@@ -466,10 +466,7 @@ where
     P: RuntimeProfile,
     R: Manifold<'d>,
 {
-    let hash_builder = session
-        .seed()
-        .derive(dope::hash::domain::ACCEPT ^ LISTENER_ID as u64)
-        .state();
+    let hash_builder = session.seed().derive(ACCEPT ^ LISTENER_ID as u64).state();
     let listener = {
         let mut driver = session.driver_access();
         if let Some(trigger) = shutdown {
@@ -478,7 +475,7 @@ where
         Listener::open_in_with_wire(app, listener, wire, hash_builder, &mut driver)?
     };
     listener.handler().timer().set_head_timeout(head_timeout);
-    let dispatcher = core::pin::pin!(Branded::new(ResourceDispatcher::<
+    let dispatcher = pin!(Branded::new(ResourceDispatcher::<
         'd,
         LISTENER_ID,
         DATE_ID,
@@ -546,11 +543,7 @@ where
     W: Wire,
     P: RuntimeProfile,
 {
-    fn dispatch(
-        mut self: core::pin::Pin<&mut Self>,
-        event: Event<'d>,
-        driver: &mut DriverContext<'_, 'd>,
-    ) {
+    fn dispatch(mut self: Pin<&mut Self>, event: Event<'d>, driver: &mut DriverContext<'_, 'd>) {
         let _: () = Self::ROUTES_UNIQUE;
         let route = event.route();
         if route == LISTENER_ID {
@@ -563,11 +556,7 @@ where
         }
     }
 
-    fn activate(
-        self: core::pin::Pin<&mut Self>,
-        target: Token,
-        driver: &mut DriverContext<'_, 'd>,
-    ) {
+    fn activate(self: Pin<&mut Self>, target: Token, driver: &mut DriverContext<'_, 'd>) {
         let _: () = Self::ROUTES_UNIQUE;
         if target.route() == LISTENER_ID {
             let target =
@@ -579,18 +568,18 @@ where
         }
     }
 
-    fn pre_park(mut self: core::pin::Pin<&mut Self>, driver: &mut DriverContext<'_, 'd>) {
+    fn pre_park(mut self: Pin<&mut Self>, driver: &mut DriverContext<'_, 'd>) {
         let fields = self.as_mut().project();
         Manifold::pre_park(fields.listener, driver);
         fields.date.pre_park(driver);
     }
 
-    fn idle(self: core::pin::Pin<&Self>) -> Idle {
+    fn idle(self: Pin<&Self>) -> Idle {
         let fields = self.project_ref();
         Manifold::idle(fields.listener).reduce(fields.date.idle())
     }
 
-    fn shutdown(mut self: core::pin::Pin<&mut Self>, driver: &mut DriverContext<'_, 'd>) {
+    fn shutdown(mut self: Pin<&mut Self>, driver: &mut DriverContext<'_, 'd>) {
         let fields = self.as_mut().project();
         Manifold::shutdown(fields.listener, driver);
         fields.date.shutdown(driver);
@@ -621,11 +610,7 @@ where
     P: RuntimeProfile,
     R: Manifold<'d>,
 {
-    fn dispatch(
-        mut self: core::pin::Pin<&mut Self>,
-        event: Event<'d>,
-        driver: &mut DriverContext<'_, 'd>,
-    ) {
+    fn dispatch(mut self: Pin<&mut Self>, event: Event<'d>, driver: &mut DriverContext<'_, 'd>) {
         let _: () = Self::ROUTES_UNIQUE;
         let route = event.route();
         if route == LISTENER_ID {
@@ -640,11 +625,7 @@ where
         }
     }
 
-    fn activate(
-        self: core::pin::Pin<&mut Self>,
-        target: Token,
-        driver: &mut DriverContext<'_, 'd>,
-    ) {
+    fn activate(self: Pin<&mut Self>, target: Token, driver: &mut DriverContext<'_, 'd>) {
         let _: () = Self::ROUTES_UNIQUE;
         let route = target.route();
         if route == LISTENER_ID {
@@ -661,21 +642,21 @@ where
         }
     }
 
-    fn pre_park(mut self: core::pin::Pin<&mut Self>, driver: &mut DriverContext<'_, 'd>) {
+    fn pre_park(mut self: Pin<&mut Self>, driver: &mut DriverContext<'_, 'd>) {
         let fields = self.as_mut().project();
         Manifold::pre_park(fields.listener, driver);
         fields.date.pre_park(driver);
         Manifold::pre_park(fields.resource, driver);
     }
 
-    fn idle(self: core::pin::Pin<&Self>) -> Idle {
+    fn idle(self: Pin<&Self>) -> Idle {
         let fields = self.project_ref();
         Manifold::idle(fields.listener)
             .reduce(fields.date.idle())
             .reduce(Manifold::idle(fields.resource))
     }
 
-    fn shutdown(mut self: core::pin::Pin<&mut Self>, driver: &mut DriverContext<'_, 'd>) {
+    fn shutdown(mut self: Pin<&mut Self>, driver: &mut DriverContext<'_, 'd>) {
         let fields = self.as_mut().project();
         Manifold::shutdown(fields.listener, driver);
         fields.date.shutdown(driver);

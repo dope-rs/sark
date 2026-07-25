@@ -1,8 +1,10 @@
-use std::cell::OnceCell;
+use std::{cell::OnceCell, ops::Range};
 
 use o3::buffer::{Bytes, Retained};
-use sark_core::error::Result;
-use sark_core::http::head::{HeadInput, HeaderLine};
+use sark_core::{
+    error::{Error, Result},
+    http::head::{HeadInput, HeaderLine},
+};
 
 use crate::service::HeaderValue;
 
@@ -14,7 +16,7 @@ pub(super) struct InputHeaderValue<'a, I: HeadInput + ?Sized> {
 }
 
 impl<'a, I: HeadInput + ?Sized> InputHeaderValue<'a, I> {
-    pub(super) fn new(input: &'a I, range: std::ops::Range<usize>) -> Self {
+    pub(super) fn new(input: &'a I, range: Range<usize>) -> Self {
         Self {
             input,
             start: range.start,
@@ -23,7 +25,7 @@ impl<'a, I: HeadInput + ?Sized> InputHeaderValue<'a, I> {
         }
     }
 
-    fn span(&self) -> std::ops::Range<usize> {
+    fn span(&self) -> Range<usize> {
         self.start..self.end
     }
 
@@ -74,7 +76,7 @@ impl<'a, I: HeadInput + ?Sized> InputHeaderValue<'a, I> {
     fn parse_decimal_u64(&self) -> Result<u64> {
         let range = self.span();
         if range.start >= range.end {
-            return Err(sark_core::error::Error::invalid_integer_header());
+            return Err(Error::invalid_integer_header());
         }
         let mut saw_digit = false;
         let mut trailing_ws = false;
@@ -92,7 +94,7 @@ impl<'a, I: HeadInput + ?Sized> InputHeaderValue<'a, I> {
                     continue;
                 }
                 if !b.is_ascii_digit() || trailing_ws {
-                    invalid = Some(sark_core::error::Error::invalid_integer_header());
+                    invalid = Some(Error::invalid_integer_header());
                     return;
                 }
                 saw_digit = true;
@@ -100,7 +102,7 @@ impl<'a, I: HeadInput + ?Sized> InputHeaderValue<'a, I> {
                 out = match out.checked_mul(10).and_then(|v| v.checked_add(digit)) {
                     Some(v) => v,
                     None => {
-                        invalid = Some(sark_core::error::Error::invalid_integer_header());
+                        invalid = Some(Error::invalid_integer_header());
                         return;
                     }
                 };
@@ -110,7 +112,7 @@ impl<'a, I: HeadInput + ?Sized> InputHeaderValue<'a, I> {
             return Err(err);
         }
         if !saw_digit {
-            return Err(sark_core::error::Error::invalid_integer_header());
+            return Err(Error::invalid_integer_header());
         }
         Ok(out)
     }
@@ -129,11 +131,11 @@ impl<I: HeadInput + ?Sized> HeaderValue for InputHeaderValue<'_, I> {
         self.eq_input(expected, true)
     }
 
-    fn as_range(&self) -> std::ops::Range<usize> {
+    fn as_range(&self) -> Range<usize> {
         self.span()
     }
 
-    fn copy_frame(&self) -> sark_core::http::Bytes<Retained> {
+    fn copy_frame(&self) -> Bytes<Retained> {
         if let Some(bytes) = self.input.slice_range(self.span()) {
             return Bytes::<Retained>::copy_from_slice(bytes);
         }
@@ -142,7 +144,7 @@ impl<I: HeadInput + ?Sized> HeaderValue for InputHeaderValue<'_, I> {
 
     fn parse_usize(&self) -> Result<usize> {
         let out = self.parse_decimal_u64()?;
-        usize::try_from(out).map_err(|_| sark_core::error::Error::invalid_integer_header())
+        usize::try_from(out).map_err(|_| Error::invalid_integer_header())
     }
 
     fn parse_u64(&self) -> Result<u64> {

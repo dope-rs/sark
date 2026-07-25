@@ -1,23 +1,32 @@
-use std::io;
-use std::pin::Pin;
-use std::time::{Duration, Instant};
+use std::{
+    io,
+    pin::Pin,
+    time::{Duration, Instant},
+};
 
 use cartel_core::ArenaLane;
-use dope::driver::token::Token;
-use dope::manifold::connector;
-use dope::manifold::timer::Timer;
-use dope::runtime::Idle;
+use dope::{
+    driver::token::Token,
+    manifold::{connector, timer::Timer},
+    runtime::{Idle, StorageFactory},
+};
 use dope_fiber::WaitQueue;
-use o3::buffer::{Lease, Pool as BufferPool, PoolLayout};
-use o3::cell::{RegionCell, RegionToken};
-use sark_core::http::Response;
-use sark_core::http::codec::HeaderLookup;
-use sark_core::http::compress::{Gunzip, GunzipError};
+use o3::{
+    buffer::{Lease, Pool as BufferPool, PoolLayout},
+    cell::{RegionCell, RegionToken},
+};
+use sark_core::http::{
+    Response,
+    codec::HeaderLookup,
+    compress::{Gunzip, GunzipError},
+};
 
-use crate::connector::codec::{self, Head};
-use crate::connector::error::Error;
-use crate::connector::pool::ConnectionPool;
-use crate::connector::retry::RetryPolicy;
+use crate::connector::{
+    codec::{Codec, Head},
+    error::Error,
+    pool::ConnectionPool,
+    retry::RetryPolicy,
+};
 
 pub(super) use crate::connector::pool::Outcome;
 
@@ -46,10 +55,11 @@ pub struct ConnState {
 
 impl connector::Lifecycle for ConnState {
     fn wants_close(&self) -> connector::Close {
+        use dope::manifold::connector::Close;
         if self.pending_close {
-            connector::Close::Reconnect
+            Close::Reconnect
         } else {
-            connector::Close::Keep
+            Close::Keep
         }
     }
 
@@ -152,7 +162,7 @@ impl<'d> Shared<'d> {
 }
 
 pub struct Config {
-    codec: codec::Codec,
+    codec: Codec,
     host: String,
     origin: http::Uri,
     decompression: DecompressionPolicy,
@@ -173,7 +183,7 @@ impl Config {
             .parse()
             .expect("invalid HTTP host");
         Self {
-            codec: codec::Codec::default(),
+            codec: Codec::default(),
             host,
             origin,
             decompression: DecompressionPolicy::Strict,
@@ -236,21 +246,22 @@ impl Config {
     }
 
     fn request_pool_layout(&self) -> io::Result<PoolLayout> {
+        use std::io::ErrorKind;
         if self.request_slots == 0 {
             return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
+                ErrorKind::InvalidInput,
                 "request pool must have slots",
             ));
         }
         PoolLayout::new(self.request_slots, self.request_capacity)
-            .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))
+            .map_err(|error| io::Error::new(ErrorKind::InvalidInput, error))
     }
 }
 
 pub struct Port<'d> {
     pub(super) io: connector::Port<'d, Lease<'d>>,
     pub(super) shared: Shared<'d>,
-    codec: codec::Codec,
+    codec: Codec,
     timer: Timer<'d>,
     pub(super) requests: Pin<Box<BufferPool>>,
 }
@@ -348,7 +359,7 @@ impl<'d> Port<'d> {
     }
 }
 
-impl dope::runtime::StorageFactory for PortFactory {
+impl StorageFactory for PortFactory {
     type Output<'d> = Port<'d>;
 
     fn build<'d>(self, driver: &mut dope::DriverContext<'_, 'd>) -> Self::Output<'d> {
@@ -374,7 +385,7 @@ impl<'d> Session<'d> {
 
 #[dope_gen::connector_session(codec = port.codec, io = port.io)]
 impl<'d> connector::Session<'d> for Session<'d> {
-    type Codec = codec::Codec;
+    type Codec = Codec;
     type ConnState = ConnState;
     type Send = Lease<'d>;
 
@@ -448,13 +459,12 @@ impl<'d> connector::Session<'d> for Session<'d> {
 
 impl Session<'_> {
     fn should_keep_alive(resp: &Response) -> bool {
+        use http::header::{CONNECTION, CONTENT_LENGTH, TRANSFER_ENCODING};
         let headers = resp.headers();
-        if headers.has_token(http::header::CONNECTION, "close")
-            || headers.has_token(http::header::CONNECTION, "upgrade")
-        {
+        if headers.has_token(CONNECTION, "close") || headers.has_token(CONNECTION, "upgrade") {
             return false;
         }
-        if headers.has_token(http::header::CONNECTION, "keep-alive") {
+        if headers.has_token(CONNECTION, "keep-alive") {
             return true;
         }
 
@@ -463,12 +473,13 @@ impl Session<'_> {
             return true;
         }
 
-        headers.contains_key(http::header::CONTENT_LENGTH)
-            || headers.value_eq_ascii_case(http::header::TRANSFER_ENCODING, "chunked")
+        headers.contains_key(CONTENT_LENGTH)
+            || headers.value_eq_ascii_case(TRANSFER_ENCODING, "chunked")
     }
 
     fn keepalive_timeout(resp: &Response) -> Option<Duration> {
-        let name = http::header::HeaderName::from_static("keep-alive");
+        use http::header::HeaderName;
+        let name = HeaderName::from_static("keep-alive");
         let raw = resp.headers().get(name)?;
         let value = raw.to_str().ok()?;
         for part in value.split(',') {
@@ -488,9 +499,8 @@ impl Session<'_> {
         policy: DecompressionPolicy,
         max_body: usize,
     ) -> Result<(), Error> {
-        let is_gzip = resp
-            .headers()
-            .value_eq_ascii_case(http::header::CONTENT_ENCODING, "gzip");
+        use http::header::CONTENT_ENCODING;
+        let is_gzip = resp.headers().value_eq_ascii_case(CONTENT_ENCODING, "gzip");
         if !is_gzip || resp.body().is_empty() {
             return Ok(());
         }

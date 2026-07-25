@@ -1,14 +1,17 @@
-use std::pin::Pin;
+use std::{pin::Pin, time::Instant};
 
-use dope::DriverContext;
-use dope::manifold::listener::recv::ExtendOutcome;
-use dope::manifold::listener::{self, SlotEgress};
-use dope_net::link;
-use dope_net::wire::Wire;
+use dope::{
+    DriverContext,
+    manifold::listener::{self, SlotEgress, recv::ExtendOutcome},
+};
+use dope_net::{link::slot::Slot, wire::Wire};
 
-use super::conn_state::{ConnState, DeferredAction};
-use super::pipeline::Pipeline;
-use super::routing::Routing;
+use super::{
+    conn_state::{ConnState, DeferredAction},
+    pipeline::Pipeline,
+    routing::Routing,
+};
+use crate::timer::TimerHost;
 
 pub struct H1Driver<'a, H> {
     app: Pin<&'a mut H>,
@@ -22,13 +25,13 @@ impl<'a, H> H1Driver<'a, H> {
     pub fn run_proj<'d, W, C, P>(
         &mut self,
         bytes: &[u8],
-        slot: &mut link::slot::Slot<'d, W, listener::State<C>>,
+        slot: &mut Slot<'d, W, listener::State<C>>,
         aux: &mut listener::Aux,
         driver: &mut DriverContext<'_, 'd>,
         project: P,
     ) -> bool
     where
-        H: Routing<'d> + crate::timer::TimerHost<'d>,
+        H: Routing<'d> + TimerHost<'d>,
         W: Wire,
         C: Default + 'static,
         P: Fn(&mut C) -> &mut ConnState,
@@ -89,12 +92,12 @@ impl<'a, H> H1Driver<'a, H> {
     pub fn send_complete_proj<'d, W, C, P>(
         &mut self,
         _sent: usize,
-        slot: &mut link::slot::Slot<'d, W, listener::State<C>>,
+        slot: &mut Slot<'d, W, listener::State<C>>,
         aux: &mut listener::Aux,
         driver: &mut DriverContext<'_, 'd>,
         project: P,
     ) where
-        H: Routing<'d> + crate::timer::TimerHost<'d>,
+        H: Routing<'d> + TimerHost<'d>,
         W: Wire,
         C: Default + 'static,
         P: Fn(&mut C) -> &mut ConnState,
@@ -123,7 +126,7 @@ impl<'a, H> H1Driver<'a, H> {
     }
 
     fn begin_body_discard<'d, W, C, P>(
-        slot: &mut link::slot::Slot<'d, W, listener::State<C>>,
+        slot: &mut Slot<'d, W, listener::State<C>>,
         driver: &mut DriverContext<'_, 'd>,
         project: &P,
     ) where
@@ -153,13 +156,13 @@ impl<'a, H> HeadDeadline<'a, H> {
 
     pub fn poll_proj<'d, W, C, P>(
         &self,
-        slot: &mut link::slot::Slot<'d, W, listener::State<C>>,
+        slot: &mut Slot<'d, W, listener::State<C>>,
         aux: &mut listener::Aux,
         driver: &mut DriverContext<'_, 'd>,
         project: P,
     ) -> bool
     where
-        H: crate::timer::TimerHost<'d>,
+        H: TimerHost<'d>,
         W: Wire,
         C: Default + 'static,
         P: Fn(&mut C) -> &mut ConnState,
@@ -167,7 +170,7 @@ impl<'a, H> HeadDeadline<'a, H> {
         let Some(ticket) = project(&mut slot.state.conn).head_deadline else {
             return false;
         };
-        let timer = crate::timer::TimerHost::timer(self.app);
+        let timer = TimerHost::timer(self.app);
         if !timer.is_fired(ticket) {
             return false;
         }
@@ -180,39 +183,37 @@ impl<'a, H> HeadDeadline<'a, H> {
         true
     }
 
-    pub fn cancel_proj<'d, W, C, P>(
-        &self,
-        slot: &mut link::slot::Slot<'d, W, listener::State<C>>,
-        project: P,
-    ) where
-        H: crate::timer::TimerHost<'d>,
+    pub fn cancel_proj<'d, W, C, P>(&self, slot: &mut Slot<'d, W, listener::State<C>>, project: P)
+    where
+        H: TimerHost<'d>,
         W: Wire,
         C: Default + 'static,
         P: Fn(&mut C) -> &mut ConnState,
     {
         if let Some(ticket) = project(&mut slot.state.conn).head_deadline.take() {
-            crate::timer::TimerHost::timer(self.app).cancel(ticket);
+            TimerHost::timer(self.app).cancel(ticket);
         }
     }
 
     fn manage<'d, W, C, P>(
         &self,
-        slot: &mut link::slot::Slot<'d, W, listener::State<C>>,
+        slot: &mut Slot<'d, W, listener::State<C>>,
         head_pending: bool,
-        now: std::time::Instant,
+        now: Instant,
         project: &P,
     ) -> bool
     where
-        H: crate::timer::TimerHost<'d>,
+        H: TimerHost<'d>,
         W: Wire,
         C: Default + 'static,
         P: Fn(&mut C) -> &mut ConnState,
     {
         if head_pending {
             if project(&mut slot.state.conn).head_deadline.is_none() {
-                let timer = crate::timer::TimerHost::timer(self.app);
+                use dope_fiber::Waker;
+                let timer = TimerHost::timer(self.app);
                 let deadline = now + timer.head_timeout();
-                let wake = dope_fiber::Waker::from_ready(slot.driver(), slot.ready_key());
+                let wake = Waker::from_ready(slot.driver(), slot.ready_key());
                 if let Some(ticket) = timer.arm(deadline, wake) {
                     project(&mut slot.state.conn).head_deadline = Some(ticket);
                 } else {
@@ -220,7 +221,7 @@ impl<'a, H> HeadDeadline<'a, H> {
                 }
             }
         } else if let Some(ticket) = project(&mut slot.state.conn).head_deadline.take() {
-            crate::timer::TimerHost::timer(self.app).cancel(ticket);
+            TimerHost::timer(self.app).cancel(ticket);
         }
         false
     }

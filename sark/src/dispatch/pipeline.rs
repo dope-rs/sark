@@ -1,17 +1,19 @@
-use dope::DriverContext;
-use dope::manifold::listener;
-use dope::manifold::listener::SlotEgress;
-use dope::manifold::listener::recv::ExtendOutcome;
-use dope::manifold::listener::send::WRITE_BUF_CAP;
-use dope_net::link;
-use dope_net::wire::Wire;
 use std::pin::Pin;
 
-use super::conn_state::{
-    ConnState, ConsumeOutcome, Consumption, DeferredAction, DispatchPermit, NeedMore, Outcome,
-    PendingFrame,
+use dope::{
+    DriverContext,
+    manifold::listener::{self, SlotEgress, recv::ExtendOutcome, send::WRITE_BUF_CAP},
 };
-use super::routing::Routing;
+use dope_net::{link::slot::Slot, wire::Wire};
+use o3::buffer::{Pooled, Shared};
+
+use super::{
+    conn_state::{
+        ConnState, ConsumeOutcome, Consumption, DeferredAction, DispatchPermit, NeedMore, Outcome,
+        PendingFrame, Recv,
+    },
+    routing::Routing,
+};
 
 const MAX_PIPELINE_BATCH: u32 = 32;
 const WRITE_HEADROOM: usize = WRITE_BUF_CAP - 1024;
@@ -19,8 +21,8 @@ const RESERVE_CAP: usize = 64 * 1024;
 
 enum SplitBody {
     Static(&'static [u8]),
-    Shared(o3::buffer::Shared),
-    Pooled(o3::buffer::Pooled),
+    Shared(Shared),
+    Pooled(Pooled),
 }
 
 pub(super) struct LoopOutcome {
@@ -54,17 +56,12 @@ impl Pipeline {
         state.recv.advance(off);
     }
 
-    fn finish_frame(&mut self, recv: &mut super::conn_state::Recv) {
+    fn finish_frame(&mut self, recv: &mut Recv) {
         self.pending_frame = PendingFrame::Head;
         recv.restrict_to_head();
     }
 
-    fn await_frame(
-        &mut self,
-        recv: &mut super::conn_state::Recv,
-        need: NeedMore,
-        available: usize,
-    ) -> bool {
+    fn await_frame(&mut self, recv: &mut Recv, need: NeedMore, available: usize) -> bool {
         match need {
             NeedMore::Head => {
                 self.pending_frame = PendingFrame::Head;
@@ -267,7 +264,7 @@ impl Pipeline {
     }
 
     pub(super) fn emit<'d, W: Wire, C: Default + 'static, P: Fn(&mut C) -> &mut ConnState>(
-        slot: &mut link::slot::Slot<'d, W, listener::State<C>>,
+        slot: &mut Slot<'d, W, listener::State<C>>,
         aux: &mut listener::Aux,
         driver: &mut DriverContext<'_, 'd>,
         out: LoopOutcome,

@@ -4,7 +4,7 @@ use std::collections::BTreeMap;
 
 use proc_macro2::{Ident, Span, TokenStream};
 use quote::{format_ident, quote};
-use syn::{LitByteStr, LitStr, Result, Type};
+use syn::{Error, LitByteStr, LitStr, Result, Type};
 
 use super::header::BytesMatch;
 use crate::util::{TypeExt, ValueKind};
@@ -57,6 +57,7 @@ impl<'a> ValueBinding<'a> {
     }
 
     fn default_typed_expr(&self, default: &LitStr) -> Result<TokenStream> {
+        use syn::LitInt;
         let kind = self.ty.value_kind()?;
         let raw = default.value();
         match kind {
@@ -64,25 +65,26 @@ impl<'a> ValueBinding<'a> {
             ValueKind::U64 => {
                 let n: u64 = raw
                     .parse()
-                    .map_err(|_| syn::Error::new_spanned(default, "invalid u64 default literal"))?;
-                let lit = syn::LitInt::new(&format!("{n}u64"), default.span());
+                    .map_err(|_| Error::new_spanned(default, "invalid u64 default literal"))?;
+                let lit = LitInt::new(&format!("{n}u64"), default.span());
                 Ok(quote! { #lit })
             }
             ValueKind::Usize => {
-                let n: usize = raw.parse().map_err(|_| {
-                    syn::Error::new_spanned(default, "invalid usize default literal")
-                })?;
-                let lit = syn::LitInt::new(&format!("{n}usize"), default.span());
+                let n: usize = raw
+                    .parse()
+                    .map_err(|_| Error::new_spanned(default, "invalid usize default literal"))?;
+                let lit = LitInt::new(&format!("{n}usize"), default.span());
                 Ok(quote! { #lit })
             }
             ValueKind::Bool => {
-                let b: bool = raw.parse().map_err(|_| {
-                    syn::Error::new_spanned(default, "invalid bool default literal")
-                })?;
-                let lit = syn::LitBool::new(b, default.span());
+                use syn::LitBool;
+                let b: bool = raw
+                    .parse()
+                    .map_err(|_| Error::new_spanned(default, "invalid bool default literal"))?;
+                let lit = LitBool::new(b, default.span());
                 Ok(quote! { #lit })
             }
-            ValueKind::Range | ValueKind::Custom => Err(syn::Error::new_spanned(
+            ValueKind::Range | ValueKind::Custom => Err(Error::new_spanned(
                 default,
                 "default = \"...\" not supported for Range or custom field types",
             )),
@@ -96,7 +98,7 @@ impl<'a> ValueBinding<'a> {
     ) -> Result<TokenStream> {
         let default = self
             .default
-            .ok_or_else(|| syn::Error::new_spanned(self.ty, missing_message))?;
+            .ok_or_else(|| Error::new_spanned(self.ty, missing_message))?;
         Ok(if borrowed {
             Self::default_borrowed_expr(default)
         } else {
@@ -146,9 +148,9 @@ impl<'a> ValueBinding<'a> {
             }
             _ if self.ty.value_optional() => quote! { #ident },
             _ => {
-                let default = self.default.ok_or_else(|| {
-                    syn::Error::new_spanned(self.ty, require_typed_default.as_str())
-                })?;
+                let default = self
+                    .default
+                    .ok_or_else(|| Error::new_spanned(self.ty, require_typed_default.as_str()))?;
                 let fallback = self.default_typed_expr(default)?;
                 quote! { #ident.unwrap_or_else(|| #fallback) }
             }
@@ -200,10 +202,7 @@ impl FieldPlan {
             .enumerate()
             .map(|(idx, (ident, bytes, ty))| {
                 let slot = u8::try_from(idx).map_err(|_| {
-                    syn::Error::new_spanned(
-                        ident,
-                        "too many generated request fields; maximum is 256",
-                    )
+                    Error::new_spanned(ident, "too many generated request fields; maximum is 256")
                 })?;
                 Ok(FieldSpec {
                     slot,

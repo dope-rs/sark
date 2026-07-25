@@ -1,13 +1,25 @@
-use std::io;
-use std::net::SocketAddr;
+#[cfg(feature = "rustls")]
+use std::sync::Arc;
+use std::{
+    io::{self, Error},
+    net::SocketAddr,
+};
 
-use dope::manifold::env::{Bundle, Env as ManifoldEnv};
-use dope::manifold::listener::{self, Application, Listener};
-use dope::runtime::profile::Throughput;
-use dope::runtime::{Executor, Session, ShutdownTrigger, WorkerContext};
-use dope_net::wire::identity::Identity;
-use dope_net::{tcp, tcp::Tcp};
+use dope::{
+    manifold::{
+        env::{Bundle, Env as ManifoldEnv},
+        listener::{self, Application, Listener},
+    },
+    runtime::{Executor, Session, ShutdownTrigger, WorkerContext, profile::Throughput},
+};
+use dope_net::{
+    tcp::{self, Tcp},
+    wire::{Wire, identity::Identity},
+};
+#[cfg(feature = "rustls")]
+use dope_tls::rustls::{RustTls, RustTlsEndpoint};
 use dope_tls::tls::{Endpoint, Tls};
+use shin::server;
 
 pub type Env = Bundle<Tcp, Identity, Throughput>;
 pub type TlsEnv = Bundle<Tcp, Tls, Throughput>;
@@ -72,11 +84,12 @@ impl Config {
     }
 
     fn listener(self) -> listener::Config<Tcp> {
+        use dope_net::tcp::stream;
         listener::Config {
             max_connections: self.max_connections,
             bind: self.bind_addr,
             backlog: self.listen_backlog,
-            stream: tcp::stream::Config {
+            stream: stream::Config {
                 recv_buffer_size: self.socket_receive_buffer_bytes,
                 send_buffer_size: self.socket_send_buffer_bytes,
                 ..Default::default()
@@ -93,7 +106,8 @@ impl Config {
 }
 
 fn invalid_config(message: &'static str) -> io::Error {
-    io::Error::new(io::ErrorKind::InvalidInput, message)
+    use std::io::ErrorKind;
+    Error::new(ErrorKind::InvalidInput, message)
 }
 
 fn run<H, F>(
@@ -144,13 +158,16 @@ fn start<'scope, 'd, A, E, S>(
     app: A,
     mut session: Session<'scope, 'd, S>,
     listener_config: listener::Config<Tcp>,
-    wire_config: <A::Wire as dope_net::wire::Wire>::InitConfig,
+    wire_config: <A::Wire as Wire>::InitConfig,
 ) -> io::Result<()>
 where
     A: Application<'d>,
     E: ManifoldEnv<Transport = Tcp, Wire = A::Wire>,
 {
-    let hash_builder = session.seed().derive(dope::hash::domain::ACCEPT).state();
+    use core::pin::pin;
+
+    use dope::hash::domain::ACCEPT;
+    let hash_builder = session.seed().derive(ACCEPT).state();
     let listener = {
         let mut driver = session.driver_access();
         Listener::<0, A, E>::open_in_with_wire(
@@ -161,7 +178,7 @@ where
             &mut driver,
         )?
     };
-    let server = core::pin::pin!(o3::cell::BrandCell::new(Server { listener }));
+    let server = pin!(o3::cell::BrandCell::new(Server { listener }));
     session.run(server.as_ref())
 }
 
@@ -216,11 +233,11 @@ where
 pub fn serve_tls<H: Handler>(
     handler: H,
     config: Config,
-    tls_config: shin::server::Config,
+    tls_config: server::Config,
     context: WorkerContext,
     shutdown: Option<&ShutdownTrigger>,
 ) -> io::Result<()> {
-    let endpoint = Endpoint::server(tls_config).map_err(io::Error::other)?;
+    let endpoint = Endpoint::server(tls_config).map_err(Error::other)?;
     run(
         handler,
         config,
@@ -236,14 +253,14 @@ pub fn serve_tls<H: Handler>(
 pub fn serve_tls_sync<H>(
     handler: H,
     config: Config,
-    tls_config: shin::server::Config,
+    tls_config: server::Config,
     context: WorkerContext,
     shutdown: Option<&ShutdownTrigger>,
 ) -> io::Result<()>
 where
     H: Fn(Request) -> Response + 'static,
 {
-    let endpoint = Endpoint::server(tls_config).map_err(io::Error::other)?;
+    let endpoint = Endpoint::server(tls_config).map_err(Error::other)?;
     run(
         handler,
         config,
@@ -262,13 +279,13 @@ where
 }
 
 #[cfg(feature = "rustls")]
-pub type RustlsTlsEnv = Bundle<Tcp, dope_tls::rustls::RustTls, Throughput>;
+pub type RustlsTlsEnv = Bundle<Tcp, RustTls, Throughput>;
 
 #[cfg(feature = "rustls")]
 pub fn serve_tls_rustls<H: Handler>(
     handler: H,
     config: Config,
-    tls_config: std::sync::Arc<rustls::ServerConfig>,
+    tls_config: Arc<rustls::ServerConfig>,
     context: WorkerContext,
     shutdown: Option<&ShutdownTrigger>,
 ) -> io::Result<()> {
@@ -279,11 +296,11 @@ pub fn serve_tls_rustls<H: Handler>(
         context,
         shutdown,
         move |handler, session, listener, config| {
-            start::<App<H, dope_tls::rustls::RustTls>, RustlsTlsEnv, _>(
+            start::<App<H, RustTls>, RustlsTlsEnv, _>(
                 App::new(handler, config),
                 session,
                 listener,
-                dope_tls::rustls::RustTlsEndpoint::Server(tls_config),
+                RustTlsEndpoint::Server(tls_config),
             )
         },
     )
@@ -293,7 +310,7 @@ pub fn serve_tls_rustls<H: Handler>(
 pub fn serve_tls_rustls_sync<H>(
     handler: H,
     config: Config,
-    tls_config: std::sync::Arc<rustls::ServerConfig>,
+    tls_config: Arc<rustls::ServerConfig>,
     context: WorkerContext,
     shutdown: Option<&ShutdownTrigger>,
 ) -> io::Result<()>
@@ -307,11 +324,11 @@ where
         context,
         shutdown,
         move |handler, session, listener, config| {
-            start::<SyncApp<H, dope_tls::rustls::RustTls>, RustlsTlsEnv, _>(
+            start::<SyncApp<H, RustTls>, RustlsTlsEnv, _>(
                 SyncApp::new(handler, config),
                 session,
                 listener,
-                dope_tls::rustls::RustTlsEndpoint::Server(tls_config),
+                RustTlsEndpoint::Server(tls_config),
             )
         },
     )

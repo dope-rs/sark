@@ -1,23 +1,26 @@
-use std::cell::Cell;
-use std::marker::PhantomData;
-use std::pin::Pin;
-use std::task::Poll;
+use std::{cell::Cell, marker::PhantomData, pin::Pin, task::Poll};
+
+use dope::{
+    driver::token::Token,
+    manifold::{
+        connector::{
+            self, Connector,
+            source::Dialer,
+            state::{IOV_CAP, Queue},
+        },
+        env::Env,
+    },
+    runtime::StorageFactory,
+};
+use dope_fiber::{Fiber, WaitQueue, poll_fn};
+use dope_net::Transport;
+use o3::buffer::Shared;
+
+use self::masking::MaskSequence;
+use crate::{crypto::Crypto, fragment::FragmentBuffer, frame::FrameHead};
 
 mod handshake;
 mod masking;
-
-use masking::MaskSequence;
-
-use dope::driver::token::Token;
-use dope::manifold::connector;
-use dope::manifold::connector::Connector;
-use dope::manifold::connector::source::Dialer;
-use dope::manifold::connector::state::{IOV_CAP, Queue};
-use dope::manifold::env::Env;
-use dope_fiber::WaitQueue;
-use dope_fiber::{Fiber, poll_fn};
-use dope_net::Transport;
-use o3::buffer::Shared;
 
 const DEFAULT_MAX_MESSAGE: usize = 16 * 1024 * 1024;
 const DEFAULT_MAX_OUTBOUND_FRAME: usize = 16 * 1024 * 1024;
@@ -178,14 +181,14 @@ enum ClientPhase {
 
 pub struct State {
     phase: ClientPhase,
-    fragments: crate::fragment::FragmentBuffer,
+    fragments: FragmentBuffer,
 }
 
 impl Default for State {
     fn default() -> Self {
         Self {
             phase: ClientPhase::Connecting,
-            fragments: crate::fragment::FragmentBuffer::new(DEFAULT_MAX_MESSAGE),
+            fragments: FragmentBuffer::new(DEFAULT_MAX_MESSAGE),
         }
     }
 }
@@ -198,10 +201,11 @@ pub struct ConnState {
 
 impl connector::Lifecycle for ConnState {
     fn wants_close(&self) -> connector::Close {
+        use dope::manifold::connector::Close;
         if self.closing {
-            connector::Close::Reconnect
+            Close::Reconnect
         } else {
-            connector::Close::Keep
+            Close::Keep
         }
     }
 
@@ -245,12 +249,15 @@ impl connector::Codec for Codec {
 
 impl Codec {
     fn parse_handshake_response(buf: &Shared, state: &mut State) -> Option<(Head, usize)> {
+        use std::str::from_utf8;
+
+        use sark_core::http::codec::ParsedRequestHead;
         let bytes = buf.as_slice();
-        let head_len = sark_core::http::codec::ParsedRequestHead::head_end(bytes)?.end;
-        let head = std::str::from_utf8(&bytes[..head_len]).ok()?;
+        let head_len = ParsedRequestHead::head_end(bytes)?.end;
+        let head = from_utf8(&bytes[..head_len]).ok()?;
 
         let status_ok = head.starts_with("HTTP/1.1 101");
-        let accept = crate::crypto::Crypto::ws_accept(head);
+        let accept = Crypto::ws_accept(head);
 
         match (status_ok, accept) {
             (true, Some(accept)) => {
@@ -270,8 +277,7 @@ impl Codec {
             .set_max_payload(self.config.max_message_size)
             .ok()?;
         let bytes = buf.as_slice();
-        let head =
-            crate::frame::FrameHead::parse(bytes, 0, self.config.max_frame_payload).ok()??;
+        let head = FrameHead::parse(bytes, 0, self.config.max_frame_payload).ok()??;
         if bytes.len() < head.payload_end {
             return None;
         }
@@ -391,7 +397,7 @@ impl<'d> Port<'d> {
     }
 }
 
-impl dope::runtime::StorageFactory for PortFactory {
+impl StorageFactory for PortFactory {
     type Output<'d> = Port<'d>;
 
     fn build<'d>(self, driver: &mut dope::DriverContext<'_, 'd>) -> Self::Output<'d> {
@@ -419,19 +425,19 @@ impl<'d, H: Handler> Session<'d, H> {
 impl<'d, H: Handler> connector::Session<'d> for Session<'d, H> {
     type Codec = Codec;
     type ConnState = ConnState;
-    type Send = o3::buffer::Shared;
+    type Send = Shared;
 
     fn connect(&mut self, ctx: &mut connector::Ctx<'_, 'd, Self>) {
         let state = &mut *ctx.state;
         let out = &mut ctx.sink;
         let mut key_raw = [0u8; 16];
         getrandom::fill(&mut key_raw).expect("OS CSPRNG (getrandom) unavailable");
-        let key_b64 = crate::crypto::Crypto::base64_encode(&key_raw);
+        let key_b64 = Crypto::base64_encode(&key_raw);
         debug_assert_eq!(key_b64.len(), 24);
         let mut key = [0u8; 24];
         key.copy_from_slice(key_b64.as_bytes());
 
-        let accept = crate::crypto::Crypto::expected_accept(&key_b64);
+        let accept = Crypto::expected_accept(&key_b64);
         debug_assert_eq!(accept.len(), 28);
         state.expected_accept.copy_from_slice(accept.as_bytes());
         state.closing = false;
@@ -728,14 +734,15 @@ impl<'a> FrameEncoder<'a> {
     }
 
     fn frame(self, opcode: u8, fin: bool, payload: &[u8]) -> Shared {
+        use crate::mask::Mask;
         let mask = self.masks.next();
         let mut frame = Vec::with_capacity(14 + payload.len());
         frame.push(if fin { 0x80 | opcode } else { opcode });
-        crate::frame::FrameHead::encode_len(&mut frame, payload.len(), true);
+        FrameHead::encode_len(&mut frame, payload.len(), true);
         frame.extend_from_slice(&mask);
         let start = frame.len();
         frame.extend_from_slice(payload);
-        crate::mask::Mask::unmask_in_place(&mut frame[start..], mask);
+        Mask::unmask_in_place(&mut frame[start..], mask);
         Shared::from(frame)
     }
 }

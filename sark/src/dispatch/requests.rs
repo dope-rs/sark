@@ -1,17 +1,22 @@
 use std::ops::Range;
 
+use http::Method;
 use o3::buffer::Shared;
+use sark_core::error::Error;
+use sark_core::http::codec::chunked::BodyDecoder;
+use sark_core::http::codec::{BodyFraming, HeaderScan, ParsedRequestHead};
+use sark_core::http::head::Flags;
 
 use super::conn_state::{ConnState, ConsumeOutcome, DispatchPermit, NeedMore};
-use crate::CANNED_400;
-use crate::request;
-use crate::service::{self, RouteRequestImpl, RouteSpec, SlicePath};
+use crate::request::RequestStorage;
+use crate::service::{Key, RouteRequestImpl, RouteSpec, SlicePath};
+use crate::{CANNED_400, CANNED_413};
 
 const MAX_HEADER_COUNT: usize = 128;
 
 pub struct Ctx<'a> {
-    pub head: &'a sark_core::http::codec::ParsedRequestHead<'a>,
-    pub method_key: service::Key,
+    pub head: &'a ParsedRequestHead<'a>,
+    pub method_key: Key,
     pub slice_path: SlicePath<'a>,
     pub target_off: usize,
     pub target_len: usize,
@@ -20,18 +25,15 @@ pub struct Ctx<'a> {
 }
 
 impl<'a> Ctx<'a> {
-    pub fn parse(
-        req_bytes: &'a [u8],
-        parsed: &'a sark_core::http::codec::ParsedRequestHead<'a>,
-    ) -> Self {
-        let method_key = service::Key::from_bytes(parsed.method);
+    pub fn parse(req_bytes: &'a [u8], parsed: &'a ParsedRequestHead<'a>) -> Self {
+        let method_key = Key::from_bytes(parsed.method);
         Self::parse_with_key(req_bytes, parsed, method_key)
     }
 
     pub fn parse_with_key(
         req_bytes: &'a [u8],
-        parsed: &'a sark_core::http::codec::ParsedRequestHead<'a>,
-        method_key: service::Key,
+        parsed: &'a ParsedRequestHead<'a>,
+        method_key: Key,
     ) -> Self {
         let target = parsed.target;
         let path_end = target
@@ -58,16 +60,16 @@ impl<'a> Ctx<'a> {
         }
     }
 
-    pub(super) fn http_method(&self) -> Result<http::Method, ()> {
+    pub(super) fn http_method(&self) -> Result<Method, ()> {
         Ok(match self.method_key {
-            service::Key::Get => http::Method::GET,
-            service::Key::Post => http::Method::POST,
-            service::Key::Put => http::Method::PUT,
-            service::Key::Patch => http::Method::PATCH,
-            service::Key::Delete => http::Method::DELETE,
-            service::Key::Head => http::Method::HEAD,
-            service::Key::Options => http::Method::OPTIONS,
-            service::Key::Other => http::Method::from_bytes(self.head.method).map_err(|_| ())?,
+            Key::Get => Method::GET,
+            Key::Post => Method::POST,
+            Key::Put => Method::PUT,
+            Key::Patch => Method::PATCH,
+            Key::Delete => Method::DELETE,
+            Key::Head => Method::HEAD,
+            Key::Options => Method::OPTIONS,
+            Key::Other => Method::from_bytes(self.head.method).map_err(|_| ())?,
         })
     }
 
@@ -100,7 +102,7 @@ impl<'a> Ctx<'a> {
             return Err(RequestErr::Bad(CANNED_400));
         }
         Ok(RequestDomainInput {
-            storage: request::RequestStorage::new(retained, chunked_body, head_len),
+            storage: RequestStorage::new(retained, chunked_body, head_len),
             raw_params,
             raw_headers,
             target: self.target_off..(self.target_off + self.target_len),
@@ -127,7 +129,7 @@ pub struct Matched<R: RouteSpec> {
 }
 
 pub(super) struct RequestDomainInput<R: RouteSpec> {
-    pub(super) storage: request::RequestStorage,
+    pub(super) storage: RequestStorage,
     pub(super) raw_params: R::RawParams,
     pub(super) raw_headers: R::RawHeaders,
     pub(super) target: Range<usize>,
@@ -160,8 +162,8 @@ pub enum Framed<R: RouteSpec> {
     Ready {
         headers: R::RawHeaders,
         head_len: usize,
-        body_framing: sark_core::http::codec::BodyFraming,
-        flags: sark_core::http::head::Flags,
+        body_framing: BodyFraming,
+        flags: Flags,
         accept_gzip: bool,
     },
 }
@@ -169,8 +171,8 @@ pub enum Framed<R: RouteSpec> {
 impl<R: RouteSpec> Framed<R> {
     pub fn parse(req_bytes: &[u8], headers_start: usize) -> Self {
         let mut raw_headers = R::RawHeaders::default();
-        let mut scan = sark_core::http::codec::HeaderScan::default();
-        let mut flags = sark_core::http::head::Flags::default();
+        let mut scan = HeaderScan::default();
+        let mut flags = Flags::default();
         let mut header_count = 0usize;
         let mut pos = headers_start;
         let head_len = loop {
@@ -230,7 +232,7 @@ struct FramingBase<R: RouteSpec> {
     head_len: usize,
     conn_close: bool,
     accept_gzip: bool,
-    body_framing: sark_core::http::codec::BodyFraming,
+    body_framing: BodyFraming,
     is_bodyless_method: bool,
 }
 
@@ -261,7 +263,7 @@ impl<R: RouteSpec> FramingBase<R> {
 
     fn checked_length(&self, length: usize) -> Result<(), RequestErr> {
         if length > R::MAX_BODY {
-            return Err(RequestErr::Bad(crate::CANNED_413));
+            return Err(RequestErr::Bad(CANNED_413));
         }
         if length > 0 && self.is_bodyless_method {
             return Err(RequestErr::Bad(CANNED_400));
@@ -274,11 +276,11 @@ impl<R: RouteSpec> DiscardFraming<R> {
     pub(super) fn from_ctx(ctx: &Ctx<'_>) -> Result<Self, RequestErr> {
         let base = FramingBase::<R>::from_ctx(ctx)?;
         let body_total = match base.body_framing {
-            sark_core::http::codec::BodyFraming::Length(length) => {
+            BodyFraming::Length(length) => {
                 base.checked_length(length)?;
                 length
             }
-            sark_core::http::codec::BodyFraming::Chunked => {
+            BodyFraming::Chunked => {
                 return Err(RequestErr::Bad(CANNED_400));
             }
         };
@@ -297,7 +299,7 @@ impl<R: RouteSpec> Framing<R> {
         let base = FramingBase::<R>::from_ctx(ctx)?;
         let head_len = base.head_len;
         let (total, chunked_body) = match base.body_framing {
-            sark_core::http::codec::BodyFraming::Length(length) => {
+            BodyFraming::Length(length) => {
                 base.checked_length(length)?;
                 let total = head_len.saturating_add(length);
                 if ctx.req_bytes.len() < total {
@@ -305,21 +307,18 @@ impl<R: RouteSpec> Framing<R> {
                 }
                 (total, None)
             }
-            sark_core::http::codec::BodyFraming::Chunked => {
+            BodyFraming::Chunked => {
                 if base.is_bodyless_method {
                     return Err(RequestErr::Bad(CANNED_400));
                 }
                 let chunked = &ctx.req_bytes[head_len..];
-                match sark_core::http::codec::chunked::BodyDecoder::body_consumed(
-                    chunked,
-                    R::MAX_BODY,
-                ) {
+                match BodyDecoder::body_consumed(chunked, R::MAX_BODY) {
                     Ok(None) => return Err(RequestErr::NeedMore(NeedMore::ChunkedBody)),
                     Ok(Some((consumed, decoded))) => {
                         (head_len.saturating_add(consumed), Some(decoded))
                     }
-                    Err(sark_core::error::Error::PayloadTooLarge(_)) => {
-                        return Err(RequestErr::Bad(crate::CANNED_413));
+                    Err(Error::PayloadTooLarge(_)) => {
+                        return Err(RequestErr::Bad(CANNED_413));
                     }
                     Err(_) => return Err(RequestErr::Bad(CANNED_400)),
                 }

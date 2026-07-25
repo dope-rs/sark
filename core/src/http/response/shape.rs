@@ -38,26 +38,27 @@ impl CacheTemplate {
             } => (head, date_offset),
         };
         if let Some(offset) = *date_offset {
+            use super::wire_emit::{CRLF, DATE_PREFIX, SERVER_DATE_TERMINATOR_LEN, SERVER_LINE};
             if emit_date && emit_server {
                 return;
             }
-            let term_start =
-                offset - super::wire_emit::DATE_PREFIX.len() - super::wire_emit::SERVER_LINE.len();
-            let term_end = term_start + super::wire_emit::SERVER_DATE_TERMINATOR_LEN;
-            let mut tail = Vec::with_capacity(super::wire_emit::SERVER_DATE_TERMINATOR_LEN);
+            let term_start = offset - DATE_PREFIX.len() - SERVER_LINE.len();
+            let term_end = term_start + SERVER_DATE_TERMINATOR_LEN;
+            let mut tail = Vec::with_capacity(SERVER_DATE_TERMINATOR_LEN);
             if emit_server {
-                tail.extend_from_slice(super::wire_emit::SERVER_LINE);
+                tail.extend_from_slice(SERVER_LINE);
             }
             *date_offset = if emit_date {
-                tail.extend_from_slice(super::wire_emit::DATE_PREFIX);
+                use super::wire_emit::DATE_LEN;
+                tail.extend_from_slice(DATE_PREFIX);
                 let offset = term_start + tail.len();
-                tail.extend_from_slice(&[0u8; super::wire_emit::DATE_LEN]);
-                tail.extend_from_slice(super::wire_emit::CRLF);
+                tail.extend_from_slice(&[0u8; DATE_LEN]);
+                tail.extend_from_slice(CRLF);
                 Some(offset)
             } else {
                 None
             };
-            tail.extend_from_slice(super::wire_emit::CRLF);
+            tail.extend_from_slice(CRLF);
             template.splice(term_start..term_end, tail);
         }
     }

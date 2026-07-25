@@ -1,11 +1,8 @@
 use proc_macro2::TokenStream;
 use quote::{format_ident, quote};
-use syn::{FnArg, ItemFn, Result};
+use syn::{Error, FnArg, ItemFn, Result};
 
-use crate::codegen::route_spec;
-use crate::lifetimes::TypeLifetimes;
-use crate::model::HeadSkip;
-use crate::util::TypeExt;
+use crate::{codegen::route_spec, lifetimes::TypeLifetimes, model::HeadSkip, util::TypeExt};
 
 pub(super) struct Handler {
     fun: ItemFn,
@@ -20,18 +17,20 @@ struct HandlerConfig {
 
 impl Handler {
     pub(super) fn new(mut fun: ItemFn) -> Result<Self> {
+        use syn::Safety;
         fun.modifiers.require_empty()?;
-        if let syn::Safety::Unsafe(unsafe_token) = &fun.sig.safety {
-            return Err(syn::Error::new_spanned(
+        if let Safety::Unsafe(unsafe_token) = &fun.sig.safety {
+            return Err(Error::new_spanned(
                 unsafe_token,
                 "#[sark_gen::handler] does not support unsafe functions",
             ));
         }
 
         let generated_request = if fun.sig.inputs.len() == 1 {
+            use crate::request::Mode;
             let request_ident =
                 format_ident!("__Sark{}Request", upper_camel(&fun.sig.ident.to_string()));
-            let request = crate::request::Mode::empty().expand(syn::parse_quote! {
+            let request = Mode::empty().expand(syn::parse_quote! {
                 struct #request_ident {}
             })?;
             fun.sig
@@ -49,6 +48,7 @@ impl Handler {
     }
 
     pub(super) fn expand(mut self) -> Result<TokenStream> {
+        use syn::{ReturnType, Type};
         let HandlerConfig {
             static_response,
             max_body,
@@ -61,8 +61,8 @@ impl Handler {
         let vis = fun.vis.clone();
         let hidden_fn = format_ident!("__{}_fn", name);
         let output_ty = match &fun.sig.output {
-            syn::ReturnType::Type(_, ty) => (**ty).clone(),
-            syn::ReturnType::Default => syn::parse_quote!(()),
+            ReturnType::Type(_, ty) => (**ty).clone(),
+            ReturnType::Default => syn::parse_quote!(()),
         };
         fun.sig.ident = hidden_fn.clone();
 
@@ -70,19 +70,19 @@ impl Handler {
         let wants_timer = fun.sig.inputs.len() == 3;
 
         if is_async && TypeLifetimes::new(&output_ty).has_non_static() {
-            return Err(syn::Error::new_spanned(
+            return Err(Error::new_spanned(
                 &output_ty,
                 "async handler responses must own request-derived data",
             ));
         }
         if fun.sig.inputs.len() != 2 && !(is_async && wants_timer) {
-            return Err(syn::Error::new_spanned(
+            return Err(Error::new_spanned(
                 &fun.sig.inputs,
                 "#[sark_gen::handler] requires `(state)`, `(request, state)`, or async `(request, state, timer)`",
             ));
         }
         if wants_timer && !is_async {
-            return Err(syn::Error::new_spanned(
+            return Err(Error::new_spanned(
                 &fun.sig.inputs,
                 "#[sark_gen::handler] timer argument is only valid on `async` handlers",
             ));
@@ -91,7 +91,7 @@ impl Handler {
         let request_arg_ty = match fun.sig.inputs.first() {
             Some(FnArg::Typed(pat)) => (*pat.ty).clone(),
             other => {
-                return Err(syn::Error::new_spanned(
+                return Err(Error::new_spanned(
                     other,
                     "#[sark_gen::handler] request argument must be typed",
                 ));
@@ -100,16 +100,16 @@ impl Handler {
         let state_arg_ty = match fun.sig.inputs.iter().nth(1) {
             Some(FnArg::Typed(pat)) => (*pat.ty).clone(),
             other => {
-                return Err(syn::Error::new_spanned(
+                return Err(Error::new_spanned(
                     other,
                     "#[sark_gen::handler] state argument must be typed",
                 ));
             }
         };
         let state_arg_inner = match &state_arg_ty {
-            syn::Type::Reference(reference) => (*reference.elem).clone(),
+            Type::Reference(reference) => (*reference.elem).clone(),
             other => {
-                return Err(syn::Error::new_spanned(
+                return Err(Error::new_spanned(
                     other,
                     "#[sark_gen::handler] state argument must be a reference (`&T`)",
                 ));
@@ -321,7 +321,7 @@ impl Handler {
                 static_response = true;
             } else if attr.path().is_ident("max_body") {
                 if max_body.is_some() {
-                    return Err(syn::Error::new_spanned(attr, "duplicate #[max_body(...)]"));
+                    return Err(Error::new_spanned(attr, "duplicate #[max_body(...)]"));
                 }
                 max_body = Some(attr.parse_args::<syn::Expr>()?);
             } else if attr.path().is_ident("skip") {

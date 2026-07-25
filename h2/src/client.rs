@@ -1,8 +1,13 @@
-use dope::manifold::connector;
+use dope::manifold::connector::{
+    self,
+    state::{IOV_CAP, Queue},
+};
 use o3::buffer::Shared;
 
-use crate::conn::{self, Conn, ConnError};
-use crate::role::ClientRole;
+use crate::{
+    conn::{self, Conn, ConnError},
+    role::ClientRole,
+};
 
 pub trait Handler: 'static {
     fn event(&mut self, event: conn::Event, conn: &mut Conn<ClientRole>);
@@ -15,10 +20,11 @@ pub struct ConnState {
 
 impl connector::Lifecycle for ConnState {
     fn wants_close(&self) -> connector::Close {
+        use connector::Close;
         if self.conn.goaway_received().is_some() || self.conn.goaway_sent() {
-            connector::Close::Reconnect
+            Close::Reconnect
         } else {
-            connector::Close::Keep
+            Close::Keep
         }
     }
 
@@ -72,20 +78,11 @@ impl<H: Handler> Session<H> {
         &mut self.handler
     }
 
-    pub fn connect(
-        &mut self,
-        state: &mut ConnState,
-        sink: &mut connector::state::Queue<{ connector::state::IOV_CAP }>,
-    ) {
+    pub fn connect(&mut self, state: &mut ConnState, sink: &mut Queue<{ IOV_CAP }>) {
         Self::drain_into(&mut state.conn, sink);
     }
 
-    pub fn response(
-        &mut self,
-        head: Head,
-        state: &mut ConnState,
-        sink: &mut connector::state::Queue<{ connector::state::IOV_CAP }>,
-    ) {
+    pub fn response(&mut self, head: Head, state: &mut ConnState, sink: &mut Queue<{ IOV_CAP }>) {
         let Head(buf) = head;
         let conn = &mut state.conn;
         let mut result = conn.ingest(buf.as_slice());
@@ -108,7 +105,7 @@ impl<H: Handler> Session<H> {
 impl<'d, H: Handler> connector::Session<'d> for Session<H> {
     type Codec = Codec;
     type ConnState = ConnState;
-    type Send = o3::buffer::Shared;
+    type Send = Shared;
 
     fn codec(&self) -> &Codec {
         &self.codec
@@ -126,10 +123,7 @@ impl<'d, H: Handler> connector::Session<'d> for Session<H> {
 }
 
 impl<H: Handler> Session<H> {
-    fn drain_into(
-        conn: &mut Conn<ClientRole>,
-        sink: &mut connector::state::Queue<{ connector::state::IOV_CAP }>,
-    ) {
+    fn drain_into(conn: &mut Conn<ClientRole>, sink: &mut Queue<{ IOV_CAP }>) {
         let out = conn.outbound();
         if out.is_empty() {
             return;

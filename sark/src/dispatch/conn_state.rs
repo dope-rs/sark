@@ -1,7 +1,12 @@
-use dope::DriverContext;
-use dope::manifold::listener::{self, SlotEgress, recv};
-use dope_net::link;
-use dope_net::wire::Wire;
+use dope::{
+    DriverContext,
+    driver::token::Token,
+    manifold::listener::{self, SlotEgress, recv},
+};
+use dope_net::{link::slot::Slot, wire::Wire};
+use o3::buffer::{Pooled, Shared};
+
+use crate::{dispatch::pipeline::Pipeline, fiber::ErasedTaskId, timer::Ticket};
 
 pub const RECV_HEAD_CAP: usize = 64 * 1024;
 pub const RECV_BODY_CAP: usize = 4 * 1024 * 1024;
@@ -16,10 +21,10 @@ pub enum StreamPhase {
 
 #[derive(Default)]
 pub struct AsyncConnState {
-    pub task: Option<crate::fiber::ErasedTaskId>,
+    pub task: Option<ErasedTaskId>,
     pub task_route: u16,
     pub task_stream: bool,
-    pub stream_pending: Option<o3::buffer::Shared>,
+    pub stream_pending: Option<Shared>,
     pub stream_phase: StreamPhase,
 }
 
@@ -41,12 +46,12 @@ pub enum Outcome {
     },
     SendSplit {
         hdr_written: usize,
-        body: o3::buffer::Shared,
+        body: Shared,
         close_after: bool,
     },
     SendPooled {
         hdr_written: usize,
-        body: o3::buffer::Pooled,
+        body: Pooled,
         close_after: bool,
     },
     Park,
@@ -83,7 +88,7 @@ impl Outcome {
 
     pub fn apply<'d, W: Wire, C: Default + 'static>(
         self,
-        slot: &mut link::slot::Slot<'d, W, listener::State<C>>,
+        slot: &mut Slot<'d, W, listener::State<C>>,
         aux: &mut listener::Aux,
         driver: &mut DriverContext<'_, 'd>,
     ) -> bool {
@@ -192,26 +197,23 @@ pub struct ConnState {
     pub async_state: AsyncConnState,
     pub deferred_action: Option<DeferredAction>,
     pub deferred_close: bool,
-    pub conn_id: ::dope::driver::token::Token,
-    pub recv_view: Option<o3::buffer::Shared>,
-    pub pipeline: super::pipeline::Pipeline,
-    pub head_deadline: Option<crate::timer::Ticket>,
+    pub conn_id: Token,
+    pub recv_view: Option<Shared>,
+    pub pipeline: Pipeline,
+    pub head_deadline: Option<Ticket>,
 }
 
 impl Default for ConnState {
     fn default() -> Self {
+        use dope::driver::token::{Epoch, SlotIndex};
         Self {
             recv: Recv::default(),
             async_state: AsyncConnState::default(),
             deferred_action: None,
             deferred_close: false,
-            conn_id: ::dope::driver::token::Token::new(
-                0,
-                ::dope::driver::token::SlotIndex::new(0),
-                ::dope::driver::token::Epoch::INITIAL,
-            ),
+            conn_id: Token::new(0, SlotIndex::new(0), Epoch::INITIAL),
             recv_view: None,
-            pipeline: super::pipeline::Pipeline::default(),
+            pipeline: Pipeline::default(),
             head_deadline: None,
         }
     }

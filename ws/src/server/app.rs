@@ -1,14 +1,21 @@
-use dope::DriverContext;
-use dope::manifold::Outcome;
-use dope::manifold::listener::{self, Application, SlotEgress};
-use dope_net::link::slot::Slot;
-use dope_net::wire::identity::Identity;
+use std::{pin::Pin, str::from_utf8};
+
+use dope::{
+    DriverContext,
+    manifold::{
+        Outcome,
+        listener::{self, Application, SlotEgress},
+    },
+};
+use dope_net::{link::slot::Slot, wire::identity::Identity};
 use o3::buffer::RetainBytes;
 
-use crate::crypto::Crypto;
-use crate::fragment::{FragmentBuffer, Push};
-use crate::frame::{FrameError, FrameHead};
-use crate::mask::Mask;
+use crate::{
+    crypto::Crypto,
+    fragment::{FragmentBuffer, Push},
+    frame::{FrameError, FrameHead},
+    mask::Mask,
+};
 
 const MAX_HANDSHAKE_BYTES: usize = 16 * 1024;
 const WS_MAX_MESSAGE: usize = 16 * 1024 * 1024;
@@ -130,7 +137,7 @@ impl<'a> Response<'a> {
             self.send_close_code(CLOSE_PROTOCOL_ERROR);
             return;
         }
-        if std::str::from_utf8(&payload[2..]).is_err() {
+        if from_utf8(&payload[2..]).is_err() {
             self.send_close_code(CLOSE_INVALID_PAYLOAD);
             return;
         }
@@ -241,7 +248,7 @@ impl<'d, H: Handler> Application<'d> for App<H> {
     type Wire = Identity;
 
     fn chunk<R: RetainBytes>(
-        self: std::pin::Pin<&mut Self>,
+        self: Pin<&mut Self>,
         slot: &mut Slot<'d, Identity, listener::State<ConnState>>,
         chunk: R,
         aux: &mut listener::Aux,
@@ -252,7 +259,7 @@ impl<'d, H: Handler> Application<'d> for App<H> {
     }
 
     fn send(
-        self: std::pin::Pin<&mut Self>,
+        self: Pin<&mut Self>,
         slot: &mut Slot<'d, Identity, listener::State<ConnState>>,
         sent: usize,
         aux: &mut listener::Aux,
@@ -263,7 +270,7 @@ impl<'d, H: Handler> Application<'d> for App<H> {
     }
 
     fn close(
-        self: std::pin::Pin<&mut Self>,
+        self: Pin<&mut Self>,
         _slot: &mut Slot<'d, Identity, listener::State<ConnState>>,
         _aux: &mut listener::Aux,
     ) {
@@ -404,17 +411,18 @@ impl<H: Handler> App<H> {
     }
 
     fn try_handshake(&self, state: &mut ConnState, response: &mut Response<'_>) {
+        use sark_core::http::codec::ParsedRequestHead;
         if state.acc.len() > MAX_HANDSHAKE_BYTES {
             state.phase = Phase::Closed;
             response.put_raw(BAD_REQUEST);
             response.close_after = true;
             return;
         }
-        let Some(crlf) = sark_core::http::codec::ParsedRequestHead::head_end(&state.acc) else {
+        let Some(crlf) = ParsedRequestHead::head_end(&state.acc) else {
             return;
         };
         let head_len = crlf.end;
-        let key = std::str::from_utf8(&state.acc[..head_len])
+        let key = from_utf8(&state.acc[..head_len])
             .ok()
             .and_then(|s| Self::validate_handshake(s, self.expected_path).ok());
         let Some(key) = key else {
@@ -438,6 +446,7 @@ impl<H: Handler> App<H> {
     }
 
     fn validate_handshake(head: &str, expected_path: &str) -> Result<String, ()> {
+        use sark_core::http::head::HeaderLines;
         let (request, rest) = head.split_once("\r\n").unwrap_or((head, ""));
         let mut parts = request.split_whitespace();
         let method = parts.next().unwrap_or("");
@@ -453,8 +462,8 @@ impl<H: Handler> App<H> {
         let mut connection = None::<&str>;
         let mut ws_version = None::<&str>;
         let mut key = None::<&str>;
-        for (name, value) in sark_core::http::head::HeaderLines::new(rest.as_bytes()) {
-            let Ok(value) = std::str::from_utf8(value) else {
+        for (name, value) in HeaderLines::new(rest.as_bytes()) {
+            let Ok(value) = from_utf8(value) else {
                 continue;
             };
             if name.eq_ignore_ascii_case(b"upgrade") {
@@ -511,6 +520,7 @@ impl<H: Handler> App<H> {
         let mut pos = 0;
         let mut closed = false;
         loop {
+            use crate::fragment::FragmentError;
             let head = match FrameHead::parse(src.bytes(), pos, frame_cap) {
                 Ok(Some(h)) => h,
                 Ok(None) => break,
@@ -549,7 +559,7 @@ impl<H: Handler> App<H> {
                 Ok(Push::Direct(op, p)) => Self::dispatch(user, op, p, response),
                 Ok(Push::Assembled(op, p)) => Self::dispatch(user, op, &p, response),
                 Ok(Push::NeedMore) => {}
-                Err(crate::fragment::FragmentError::PayloadTooLarge) => {
+                Err(FragmentError::PayloadTooLarge) => {
                     response.send_close_code(CLOSE_MESSAGE_TOO_BIG);
                     closed = true;
                     break;
@@ -571,7 +581,7 @@ impl<H: Handler> App<H> {
 
     fn dispatch(user: &H, opcode: u8, payload: &[u8], response: &mut Response<'_>) {
         match opcode {
-            0x1 => match std::str::from_utf8(payload) {
+            0x1 => match from_utf8(payload) {
                 Ok(s) => user.message(Message::Text(s), response),
                 Err(_) => response.send_close_code(CLOSE_INVALID_PAYLOAD),
             },

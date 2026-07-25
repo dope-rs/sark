@@ -1,9 +1,11 @@
 use proc_macro2::TokenStream;
 use quote::quote;
-use syn::{Result, Type};
+use syn::{Error, Result, Type};
 
-use super::field::FieldMode;
-use super::scalar::{Classified, Scalar};
+use super::{
+    field::FieldMode,
+    scalar::{Classified, Scalar},
+};
 use crate::util::TypeExt;
 
 pub(super) struct Encoder<'a> {
@@ -17,19 +19,19 @@ impl<'a> Encoder<'a> {
     pub(super) fn new(ty: &'a Type, mode: FieldMode, access: TokenStream) -> Result<Self> {
         let class = if mode.nested {
             if mode.seq && ty.vec_inner().is_none() {
-                return Err(syn::Error::new_spanned(
+                return Err(Error::new_spanned(
                     ty,
                     "#[field(seq)] requires a Vec<T> field",
                 ));
             }
             None
         } else if mode.seq {
-            let elem = ty.vec_inner().ok_or_else(|| {
-                syn::Error::new_spanned(ty, "#[field(seq)] requires a Vec<T> field")
-            })?;
+            let elem = ty
+                .vec_inner()
+                .ok_or_else(|| Error::new_spanned(ty, "#[field(seq)] requires a Vec<T> field"))?;
             let class = Classified::of(elem)?;
             if class.optional {
-                return Err(syn::Error::new_spanned(
+                return Err(Error::new_spanned(
                     elem,
                     "sequence field elements cannot be Option<T>",
                 ));
@@ -54,7 +56,7 @@ impl<'a> Encoder<'a> {
                 quote!(sark::json::JsonEncode::json_len(__e))
             } else {
                 let Some(class) = self.class else {
-                    return Err(syn::Error::new_spanned(
+                    return Err(Error::new_spanned(
                         self.ty,
                         "missing sequence element classification",
                     ));
@@ -63,7 +65,7 @@ impl<'a> Encoder<'a> {
                     Scalar::String | Scalar::InlineToken => quote!(__e.as_bytes()),
                     Scalar::Shared | Scalar::Retained => quote!(__e.as_slice()),
                     _ => {
-                        return Err(syn::Error::new_spanned(
+                        return Err(Error::new_spanned(
                             self.ty,
                             "sequence field element must be a byte string",
                         ));
@@ -94,10 +96,7 @@ impl<'a> Encoder<'a> {
             return Ok(quote!(sark::json::JsonEncode::json_len(&#access)));
         }
         let Some(class) = self.class else {
-            return Err(syn::Error::new_spanned(
-                self.ty,
-                "missing scalar classification",
-            ));
+            return Err(Error::new_spanned(self.ty, "missing scalar classification"));
         };
         let len = match class.scalar {
             Scalar::U64 => quote!(sark::json::Encode::u64_len(#access)),
@@ -153,7 +152,7 @@ impl<'a> Encoder<'a> {
                 quote!(sark::json::JsonEncode::write_into(__e, __w);)
             } else {
                 let Some(class) = self.class else {
-                    return Err(syn::Error::new_spanned(
+                    return Err(Error::new_spanned(
                         self.ty,
                         "missing sequence element classification",
                     ));
@@ -162,7 +161,7 @@ impl<'a> Encoder<'a> {
                     Scalar::String | Scalar::InlineToken => quote!(__e.as_bytes()),
                     Scalar::Shared | Scalar::Retained => quote!(__e.as_slice()),
                     _ => {
-                        return Err(syn::Error::new_spanned(
+                        return Err(Error::new_spanned(
                             self.ty,
                             "sequence field element must be a byte string",
                         ));
@@ -193,10 +192,7 @@ impl<'a> Encoder<'a> {
             return Ok(quote!(sark::json::JsonEncode::write_into(&#access, __w);));
         }
         let Some(class) = self.class else {
-            return Err(syn::Error::new_spanned(
-                self.ty,
-                "missing scalar classification",
-            ));
+            return Err(Error::new_spanned(self.ty, "missing scalar classification"));
         };
         let write = match class.scalar {
             Scalar::U64 => quote!(__w.put_u64(#access);),

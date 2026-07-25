@@ -1,7 +1,7 @@
 use proc_macro2::Ident;
-use syn::punctuated::Punctuated;
 use syn::{
-    Attribute, Expr, ExprAssign, GenericArgument, LitStr, PathArguments, Result, Token, Type,
+    Attribute, Error, Expr, ExprAssign, GenericArgument, LitStr, PathArguments, Result, Token,
+    Type, punctuated::Punctuated,
 };
 
 #[derive(Clone, Copy)]
@@ -153,7 +153,7 @@ impl TypeExt for Type {
     }
 
     fn unsupported_field_error(&self) -> syn::Error {
-        syn::Error::new_spanned(
+        Error::new_spanned(
             self,
             "unsupported field type; use Option<Bytes<Retained>>, Option<Range<usize>>, or Option<T> with a supported typed parser",
         )
@@ -242,7 +242,7 @@ impl TypeExt for Type {
 
     fn type_ident(&self) -> Result<Ident> {
         let Type::Path(path) = self else {
-            return Err(syn::Error::new_spanned(
+            return Err(Error::new_spanned(
                 self,
                 "#[request(...)] requires a plain request type",
             ));
@@ -252,7 +252,7 @@ impl TypeExt for Type {
             .last()
             .map(|seg| seg.ident.clone())
             .ok_or_else(|| {
-                syn::Error::new_spanned(self, "#[request(...)] requires a plain request type")
+                Error::new_spanned(self, "#[request(...)] requires a plain request type")
             })
     }
 }
@@ -266,6 +266,7 @@ pub(super) trait AttributeSliceExt {
 impl AttributeSliceExt for [Attribute] {
     fn field_attr(&self, name: &str) -> Option<FieldAttr> {
         for attr in self {
+            use syn::Lit;
             if !attr.path().is_ident(name) {
                 continue;
             }
@@ -275,7 +276,7 @@ impl AttributeSliceExt for [Attribute] {
             let Expr::Lit(first) = args.first()? else {
                 return None;
             };
-            let syn::Lit::Str(base) = &first.lit else {
+            let Lit::Str(base) = &first.lit else {
                 return None;
             };
             let mut default = None;
@@ -292,7 +293,7 @@ impl AttributeSliceExt for [Attribute] {
                 let Expr::Lit(expr) = &**right else {
                     return None;
                 };
-                let syn::Lit::Str(lit) = &expr.lit else {
+                let Lit::Str(lit) = &expr.lit else {
                     return None;
                 };
                 default = Some(lit.clone());
@@ -312,7 +313,7 @@ impl AttributeSliceExt for [Attribute] {
                 continue;
             }
             if found.is_some() {
-                return Err(syn::Error::new_spanned(
+                return Err(Error::new_spanned(
                     attr,
                     "duplicate #[header(...)] attribute",
                 ));
@@ -334,7 +335,7 @@ impl AttributeSliceExt for [Attribute] {
                     } else {
                         "#[header(\"name\", \"value\")] is only valid on #[sark_gen::response] structs"
                     };
-                    return Err(syn::Error::new_spanned(attr, msg));
+                    return Err(Error::new_spanned(attr, msg));
                 }
                 let mut it = values.into_iter();
                 let name = it.next().unwrap();

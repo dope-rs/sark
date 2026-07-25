@@ -1,17 +1,19 @@
-use std::pin::Pin;
-use std::task::Poll;
+use std::{pin::Pin, task::Poll};
 
-use dope::DriverContext;
-use dope::manifold::listener::{self, SlotEgress};
-use dope_net::link;
-use dope_net::wire::Wire;
+use dope::{
+    DriverContext,
+    manifold::listener::{self, SlotEgress},
+};
+use dope_net::{link::slot::Slot, wire::Wire};
 use o3::buffer::Shared;
 use sark_core::http::{CHUNK_TERMINATOR, OwnedShape};
 
-use super::conn_state::{ConnState, StreamPhase};
-use super::egress::ResponseEgress;
-use super::routes::TaskPoll;
-use crate::service::RouteSpec;
+use super::{
+    conn_state::{ConnState, StreamPhase},
+    egress::ResponseEgress,
+    routes::TaskPoll,
+};
+use crate::{fiber::FixedSlab, service::RouteSpec};
 
 pub struct TaskRunner<'a> {
     date: &'a [u8; 29],
@@ -25,7 +27,7 @@ impl<'a> TaskRunner<'a> {
     pub fn finish<'d, R: RouteSpec, W: Wire, C: Default + 'static>(
         &self,
         response: R::AsyncResponse,
-        slot: &mut link::slot::Slot<'d, W, listener::State<C>>,
+        slot: &mut Slot<'d, W, listener::State<C>>,
         aux: &mut listener::Aux,
         driver: &mut DriverContext<'_, 'd>,
         close: bool,
@@ -46,8 +48,8 @@ impl<'a> TaskRunner<'a> {
 
     pub fn poll<'d, T, Tag, W, C, PJ, Classify, const N: usize>(
         &self,
-        mut tasks: Pin<&mut crate::fiber::FixedSlab<'d, T, N, Tag>>,
-        slot: &mut link::slot::Slot<'d, W, listener::State<C>>,
+        mut tasks: Pin<&mut FixedSlab<'d, T, N, Tag>>,
+        slot: &mut Slot<'d, W, listener::State<C>>,
         aux: &mut listener::Aux,
         driver: &mut DriverContext<'_, 'd>,
         project: PJ,
@@ -60,17 +62,18 @@ impl<'a> TaskRunner<'a> {
         PJ: Fn(&mut C) -> &mut ConnState,
         Classify: FnMut(
             T::Output,
-            &mut link::slot::Slot<'d, W, listener::State<C>>,
+            &mut Slot<'d, W, listener::State<C>>,
             &mut listener::Aux,
             &mut DriverContext<'_, 'd>,
             &[u8; 29],
             bool,
         ) -> TaskPoll,
     {
+        use crate::fiber::TaskId;
         let Some(task) = project(&mut slot.state.conn).async_state.task.take() else {
             return 0;
         };
-        let task = crate::fiber::TaskId::<Tag>::from_erased(task);
+        let task = TaskId::<Tag>::from_erased(task);
         let mut cursor = 0;
         loop {
             let next = {
@@ -92,7 +95,8 @@ impl<'a> TaskRunner<'a> {
                 Some(next) => next,
                 None => {
                     let poll = {
-                        let mut context = std::pin::pin!(dope_fiber::Context::from_ready(
+                        use std::pin::pin;
+                        let mut context = pin!(dope_fiber::Context::from_ready(
                             slot.driver(),
                             slot.ready_key(),
                             driver.reborrow(),
@@ -168,16 +172,14 @@ impl<'a> TaskRunner<'a> {
 
     pub fn write_buf<'d, 'slot, W: Wire, C: Default + 'static>(
         &self,
-        slot: &mut link::slot::Slot<'d, W, listener::State<C>>,
+        slot: &mut Slot<'d, W, listener::State<C>>,
         aux: &'slot mut listener::Aux,
     ) -> listener::WriteBuf<'slot> {
         aux.write_buf_for(slot)
     }
 
-    fn release_connection<W, C, PJ>(
-        slot: &mut link::slot::Slot<'_, W, listener::State<C>>,
-        project: &PJ,
-    ) where
+    fn release_connection<W, C, PJ>(slot: &mut Slot<'_, W, listener::State<C>>, project: &PJ)
+    where
         W: Wire,
         C: Default + 'static,
         PJ: Fn(&mut C) -> &mut ConnState,

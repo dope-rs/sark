@@ -1,13 +1,15 @@
 mod parts;
 
-use parts::build_arms;
 use proc_macro2::{Ident, TokenStream};
 use quote::format_ident;
-use syn::{GenericArgument, Index, LitStr, PathArguments, Type, TypePath, Visibility};
+use syn::{Error, GenericArgument, Index, LitStr, PathArguments, Type, TypePath, Visibility};
 
+use self::parts::build_arms;
 use super::plan::Meta;
-use crate::model::{AppDispatchInput, AppRouteInput};
-use crate::route_compiler::Method;
+use crate::{
+    model::{AppDispatchInput, AppRouteInput},
+    route_compiler::Method,
+};
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(super) enum RouteKind {
@@ -104,22 +106,23 @@ impl Gen {
 }
 
 fn normalize_state_lifetimes(mut ty: Type) -> Type {
+    use syn::visit_mut::VisitMut;
     struct Rewrite;
-    impl syn::visit_mut::VisitMut for Rewrite {
+    impl VisitMut for Rewrite {
         fn visit_lifetime_mut(&mut self, lt: &mut syn::Lifetime) {
             if lt.ident != "static" {
                 lt.ident = format_ident!("d");
             }
         }
     }
-    syn::visit_mut::VisitMut::visit_type_mut(&mut Rewrite, &mut ty);
+    VisitMut::visit_type_mut(&mut Rewrite, &mut ty);
     ty
 }
 
 fn build_route_entry(entry: AppRouteInput) -> syn::Result<Entry> {
     let path = entry.path;
     let method = Method::parse(&entry.method.to_string()).ok_or_else(|| {
-        syn::Error::new_spanned(
+        Error::new_spanned(
             &entry.method,
             "unsupported method; use one of GET/POST/PUT/PATCH/DELETE/HEAD/OPTIONS",
         )
@@ -137,6 +140,7 @@ fn build_route_entry(entry: AppRouteInput) -> syn::Result<Entry> {
 }
 
 fn unpack_route(route: TypePath) -> syn::Result<(TypePath, RouteKind, Option<syn::Expr>)> {
+    use syn::Expr;
     let Some(segment) = route.path.segments.last() else {
         return Ok((route, RouteKind::Sync, None));
     };
@@ -146,34 +150,23 @@ fn unpack_route(route: TypePath) -> syn::Result<(TypePath, RouteKind, Option<syn
         _ => return Ok((route, RouteKind::Sync, None)),
     };
     let PathArguments::AngleBracketed(arguments) = &segment.arguments else {
-        return Err(syn::Error::new_spanned(
-            route,
-            "invalid route storage metadata",
-        ));
+        return Err(Error::new_spanned(route, "invalid route storage metadata"));
     };
     let mut arguments = arguments.args.iter();
     let Some(GenericArgument::Type(Type::Path(route_type))) = arguments.next() else {
-        return Err(syn::Error::new_spanned(
-            route,
-            "invalid route type metadata",
-        ));
+        return Err(Error::new_spanned(route, "invalid route type metadata"));
     };
     let Some(GenericArgument::Const(capacity)) = arguments.next() else {
-        return Err(syn::Error::new_spanned(
-            route,
-            "invalid route capacity metadata",
-        ));
+        return Err(Error::new_spanned(route, "invalid route capacity metadata"));
     };
     if arguments.next().is_some() {
-        return Err(syn::Error::new_spanned(
-            route,
-            "invalid route storage metadata",
-        ));
+        return Err(Error::new_spanned(route, "invalid route storage metadata"));
     }
     let capacity = match capacity {
-        syn::Expr::Block(block) if block.block.stmts.len() == 1 => {
-            let syn::Stmt::Expr(capacity, None) = &block.block.stmts[0] else {
-                return Err(syn::Error::new_spanned(block, "invalid route capacity"));
+        Expr::Block(block) if block.block.stmts.len() == 1 => {
+            use syn::Stmt;
+            let Stmt::Expr(capacity, None) = &block.block.stmts[0] else {
+                return Err(Error::new_spanned(block, "invalid route capacity"));
             };
             capacity.clone()
         }

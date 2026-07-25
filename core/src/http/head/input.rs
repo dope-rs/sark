@@ -1,4 +1,10 @@
+use std::ops::Range;
+
+use o3::buffer::{Bytes, Retained, Shared};
+
 use super::error::ERR_INVALID_HEADER_NAME;
+use crate::error::Error;
+use crate::http::scan::{HeaderNameOutcome, scan_header_name};
 
 #[derive(Clone, Copy)]
 pub struct HeaderLine<'a> {
@@ -47,16 +53,11 @@ impl<'a> HeaderLine<'a> {
         None
     }
 
-    pub fn find_name_end_valid(
-        &self,
-        start: usize,
-    ) -> Result<Option<(usize, u8)>, crate::error::Error> {
-        match crate::http::scan::scan_header_name(self.bytes, start) {
-            crate::http::scan::HeaderNameOutcome::Found { pos, byte } => Ok(Some((pos, byte))),
-            crate::http::scan::HeaderNameOutcome::Invalid => Err(crate::error::Error::BadRequest(
-                ERR_INVALID_HEADER_NAME.into(),
-            )),
-            crate::http::scan::HeaderNameOutcome::None => Ok(None),
+    pub fn find_name_end_valid(&self, start: usize) -> Result<Option<(usize, u8)>, Error> {
+        match scan_header_name(self.bytes, start) {
+            HeaderNameOutcome::Found { pos, byte } => Ok(Some((pos, byte))),
+            HeaderNameOutcome::Invalid => Err(Error::BadRequest(ERR_INVALID_HEADER_NAME.into())),
+            HeaderNameOutcome::None => Ok(None),
         }
     }
 
@@ -123,13 +124,10 @@ pub trait HeadInput {
     fn is_empty(&self) -> bool {
         self.len() == 0
     }
-    fn slice_range(&self, range: std::ops::Range<usize>) -> Option<&[u8]>;
-    fn copy_range_frame(
-        &self,
-        range: std::ops::Range<usize>,
-    ) -> Option<o3::buffer::Bytes<o3::buffer::Retained>>;
-    fn copy_range_into(&self, range: std::ops::Range<usize>, out: &mut [u8]);
-    fn for_each_slice<F>(&self, range: std::ops::Range<usize>, f: F)
+    fn slice_range(&self, range: Range<usize>) -> Option<&[u8]>;
+    fn copy_range_frame(&self, range: Range<usize>) -> Option<Bytes<Retained>>;
+    fn copy_range_into(&self, range: Range<usize>, out: &mut [u8]);
+    fn for_each_slice<F>(&self, range: Range<usize>, f: F)
     where
         F: FnMut(&[u8]);
 }
@@ -139,11 +137,11 @@ impl HeadInput for [u8] {
         <[u8]>::len(self)
     }
 
-    fn slice_range(&self, range: std::ops::Range<usize>) -> Option<&[u8]> {
+    fn slice_range(&self, range: Range<usize>) -> Option<&[u8]> {
         self.get(range)
     }
 
-    fn copy_range_into(&self, range: std::ops::Range<usize>, out: &mut [u8]) {
+    fn copy_range_into(&self, range: Range<usize>, out: &mut [u8]) {
         assert!(
             range.start <= range.end && range.end <= self.len(),
             "head input copy range invariant: range out of bounds",
@@ -156,16 +154,13 @@ impl HeadInput for [u8] {
         out[..need].copy_from_slice(&self[range]);
     }
 
-    fn copy_range_frame(
-        &self,
-        range: std::ops::Range<usize>,
-    ) -> Option<o3::buffer::Bytes<o3::buffer::Retained>> {
+    fn copy_range_frame(&self, range: Range<usize>) -> Option<Bytes<Retained>> {
         self.get(range)
-            .map(o3::buffer::Shared::copy_from_slice)
-            .map(o3::buffer::Bytes::<o3::buffer::Retained>::from)
+            .map(Shared::copy_from_slice)
+            .map(Bytes::<Retained>::from)
     }
 
-    fn for_each_slice<F>(&self, range: std::ops::Range<usize>, mut f: F)
+    fn for_each_slice<F>(&self, range: Range<usize>, mut f: F)
     where
         F: FnMut(&[u8]),
     {

@@ -1,6 +1,11 @@
 use std::ops::ControlFlow;
 
-use crate::error::{Error, Result};
+use http::header::{HeaderName, HeaderValue};
+
+use crate::{
+    error::{Error, Result},
+    http::HeaderList,
+};
 
 #[derive(Clone, Copy)]
 pub(super) enum CsvScanMode {
@@ -125,36 +130,38 @@ impl Header {
 }
 
 pub trait HeaderLookup: private::SealedHeaderLookup {
-    fn header_value(&self, name: http::header::HeaderName) -> Option<&http::header::HeaderValue>;
+    fn header_value(&self, name: HeaderName) -> Option<&HeaderValue>;
 
-    fn has_token(&self, name: http::header::HeaderName, token: &str) -> bool {
+    fn has_token(&self, name: HeaderName, token: &str) -> bool {
         match self.header_value(name) {
             Some(v) => Header::has_token(v.as_bytes(), token.as_bytes()),
             None => false,
         }
     }
 
-    fn value_eq_ascii_case(&self, name: http::header::HeaderName, expected: &str) -> bool {
+    fn value_eq_ascii_case(&self, name: HeaderName, expected: &str) -> bool {
         self.header_value(name)
             .is_some_and(|value| value.as_bytes().eq_ignore_ascii_case(expected.as_bytes()))
     }
 }
 
 impl HeaderLookup for http::HeaderMap {
-    fn header_value(&self, name: http::header::HeaderName) -> Option<&http::header::HeaderValue> {
+    fn header_value(&self, name: HeaderName) -> Option<&HeaderValue> {
         self.get(name)
     }
 }
 
-impl HeaderLookup for crate::http::HeaderList {
-    fn header_value(&self, name: http::header::HeaderName) -> Option<&http::header::HeaderValue> {
+impl HeaderLookup for HeaderList {
+    fn header_value(&self, name: HeaderName) -> Option<&HeaderValue> {
         self.get(name)
     }
 }
 
 mod private {
+    use crate::http::HeaderList;
+
     pub trait SealedHeaderLookup {}
 
     impl SealedHeaderLookup for http::HeaderMap {}
-    impl SealedHeaderLookup for crate::http::HeaderList {}
+    impl SealedHeaderLookup for HeaderList {}
 }

@@ -1,7 +1,9 @@
 use dope_fiber::{Fiber, Ready};
 use o3::buffer::Shared;
+use sark_core::http::body_kind::ResponseKind;
 use sark_core::http::{
-    Chunked, FixedResponse, MonoResponseInner, Response, Serve, Shape, StaticResponseInner, Stream,
+    Chunked, FixedResponse, MonoResponseInner, NeverStream, Response, Serve, Shape,
+    StaticResponseInner, Stream,
 };
 
 use super::spec::RouteSpec;
@@ -36,7 +38,7 @@ pub trait NativeResponse<'req>: Sized {
     type Shape: Shape<'req>;
     type Stream: 'static;
 
-    const BODY_KIND: sark_core::http::body_kind::ResponseKind;
+    const BODY_KIND: ResponseKind;
 
     fn into_route_response(self) -> Self::Shape;
 }
@@ -49,8 +51,7 @@ where
     type Shape = Self;
     type Stream = S;
 
-    const BODY_KIND: sark_core::http::body_kind::ResponseKind =
-        sark_core::http::body_kind::ResponseKind::Stream;
+    const BODY_KIND: ResponseKind = ResponseKind::Stream;
 
     fn into_route_response(self) -> Self::Shape {
         self
@@ -60,10 +61,9 @@ where
 impl<'req> NativeResponse<'req> for Chunked {
     type Kind = Sync;
     type Shape = Self;
-    type Stream = sark_core::http::NeverStream;
+    type Stream = NeverStream;
 
-    const BODY_KIND: sark_core::http::body_kind::ResponseKind =
-        sark_core::http::body_kind::ResponseKind::Inline;
+    const BODY_KIND: ResponseKind = ResponseKind::Inline;
 
     fn into_route_response(self) -> Self::Shape {
         self
@@ -73,10 +73,9 @@ impl<'req> NativeResponse<'req> for Chunked {
 impl<'req, const N: usize> NativeResponse<'req> for Serve<'req, N> {
     type Kind = Sync;
     type Shape = Self;
-    type Stream = sark_core::http::NeverStream;
+    type Stream = NeverStream;
 
-    const BODY_KIND: sark_core::http::body_kind::ResponseKind =
-        sark_core::http::body_kind::ResponseKind::Inline;
+    const BODY_KIND: ResponseKind = ResponseKind::Inline;
 
     fn into_route_response(self) -> Self::Shape {
         self
@@ -86,10 +85,9 @@ impl<'req, const N: usize> NativeResponse<'req> for Serve<'req, N> {
 impl<'req, const N: usize> NativeResponse<'req> for FixedResponse<'req, N> {
     type Kind = Sync;
     type Shape = Self;
-    type Stream = sark_core::http::NeverStream;
+    type Stream = NeverStream;
 
-    const BODY_KIND: sark_core::http::body_kind::ResponseKind =
-        sark_core::http::body_kind::ResponseKind::Inline;
+    const BODY_KIND: ResponseKind = ResponseKind::Inline;
 
     fn into_route_response(self) -> Self::Shape {
         self
@@ -99,10 +97,9 @@ impl<'req, const N: usize> NativeResponse<'req> for FixedResponse<'req, N> {
 impl<'req, const N: usize> NativeResponse<'req> for MonoResponseInner<'req, N> {
     type Kind = Sync;
     type Shape = Self;
-    type Stream = sark_core::http::NeverStream;
+    type Stream = NeverStream;
 
-    const BODY_KIND: sark_core::http::body_kind::ResponseKind =
-        sark_core::http::body_kind::ResponseKind::Inline;
+    const BODY_KIND: ResponseKind = ResponseKind::Inline;
 
     fn into_route_response(self) -> Self::Shape {
         self
@@ -112,10 +109,9 @@ impl<'req, const N: usize> NativeResponse<'req> for MonoResponseInner<'req, N> {
 impl<'req, const N: usize> NativeResponse<'req> for StaticResponseInner<'req, N> {
     type Kind = Sync;
     type Shape = Self;
-    type Stream = sark_core::http::NeverStream;
+    type Stream = NeverStream;
 
-    const BODY_KIND: sark_core::http::body_kind::ResponseKind =
-        sark_core::http::body_kind::ResponseKind::Static;
+    const BODY_KIND: ResponseKind = ResponseKind::Static;
 
     fn into_route_response(self) -> Self::Shape {
         self
@@ -125,10 +121,9 @@ impl<'req, const N: usize> NativeResponse<'req> for StaticResponseInner<'req, N>
 impl<'req> NativeResponse<'req> for Response {
     type Kind = Sync;
     type Shape = Serve<'req>;
-    type Stream = sark_core::http::NeverStream;
+    type Stream = NeverStream;
 
-    const BODY_KIND: sark_core::http::body_kind::ResponseKind =
-        sark_core::http::body_kind::ResponseKind::Inline;
+    const BODY_KIND: ResponseKind = ResponseKind::Inline;
 
     fn into_route_response(self) -> Self::Shape {
         self.into()

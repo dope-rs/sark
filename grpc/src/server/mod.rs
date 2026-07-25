@@ -1,7 +1,7 @@
-use std::io;
+use std::io::{self, Error};
 use std::marker::PhantomData;
 use std::net::SocketAddr;
-use std::pin::Pin;
+use std::pin::{Pin, pin};
 
 mod call;
 mod egress;
@@ -11,26 +11,32 @@ pub use call::{MessageIter, MessageList};
 use egress::Egress;
 
 use dope::manifold::env::Bundle;
-use dope::manifold::listener::{self, Application, Listener};
+use dope::manifold::listener::{self, Application, Listener, SlotEgress};
 use dope::runtime::profile::Throughput;
 use dope::runtime::{Executor, ShutdownTrigger, WorkerContext};
 use dope::{DriverContext, manifold};
+use dope::{hash::domain::ACCEPT, manifold::Outcome};
 use dope_net::link::slot::Slot;
 use dope_net::wire::Wire;
 use dope_net::wire::identity::Identity;
 use dope_net::{tcp, tcp::Tcp};
 use dope_tls::tls::{Endpoint, Tls};
 use o3::buffer::{RetainBytes, SharedPool};
+use o3::cell::BrandCell;
 use o3::collections::{FixedHashTable, FixedQueue};
 use sark_core::identity_mut;
+use sark_h2::conn::{DataPayload, Event};
+use sark_h2::server::driver::{Driver, Transport};
 use sark_h2::tuning::Tuning;
-use sark_h2::{Conn, ErrorCode, ServerRole, StreamId, conn};
+use sark_h2::{Conn, ErrorCode, ServerRole, StreamId, conn, hpack};
+use shin::server;
 
 use crate::Codec;
 use crate::frame::{DataChunk, Deframer, MessageFrame};
 use crate::headers::{HeaderBlock, RequestHead};
 use crate::metadata::Metadata;
 use crate::status::{Code, Status};
+use liveness::Liveness;
 
 #[derive(Clone, Debug)]
 pub struct Limits {
@@ -115,7 +121,7 @@ impl Config {
         let driver = dope::driver::Config::for_tcp_profile::<Throughput>(self.max_connections);
         let exec = Executor::with_seed(driver, context.seed())?;
         exec.enter(|mut sess| {
-            let hash_builder = sess.seed().derive(dope::hash::domain::ACCEPT).state();
+            let hash_builder = sess.seed().derive(ACCEPT).state();
             let mut app = App::with_config(handler, self.grpc.clone());
             app.liveness_fallback = self.readiness.is_some();
             let listener = {
@@ -130,7 +136,7 @@ impl Config {
                     &mut driver,
                 )?
             };
-            let app = core::pin::pin!(o3::cell::BrandCell::new(Dispatcher { listener }));
+            let app = pin!(BrandCell::new(Dispatcher { listener }));
             sess.run(app.as_ref())
         })
     }
@@ -138,15 +144,15 @@ impl Config {
     pub fn serve_tls<H: Handler>(
         self,
         handler: H,
-        tls_cfg: shin::server::Config,
+        tls_cfg: server::Config,
         context: WorkerContext,
         shutdown: Option<&ShutdownTrigger>,
     ) -> io::Result<()> {
         let driver = dope::driver::Config::for_tcp_profile::<Throughput>(self.max_connections);
         let exec = Executor::with_seed(driver, context.seed())?;
         exec.enter(|mut sess| {
-            let accept_hash = sess.seed().derive(dope::hash::domain::ACCEPT).state();
-            let readiness_hash = sess.seed().derive(dope::hash::domain::ACCEPT ^ 1).state();
+            let accept_hash = sess.seed().derive(ACCEPT).state();
+            let readiness_hash = sess.seed().derive(ACCEPT ^ 1).state();
             let (listener, readiness) = {
                 let mut driver = sess.driver_access();
                 if let Some(trigger) = shutdown {
@@ -155,7 +161,7 @@ impl Config {
                 let listener = Listener::<0, App<H, Tls>, TlsEnv>::open_in_with_wire(
                     App::with_config(handler, self.grpc.clone()),
                     self.listener_config(self.bind),
-                    Endpoint::server(tls_cfg).map_err(io::Error::other)?,
+                    Endpoint::server(tls_cfg).map_err(Error::other)?,
                     accept_hash,
                     &mut driver,
                 )?;
@@ -170,7 +176,7 @@ impl Config {
                 };
                 (listener, readiness)
             };
-            let app = core::pin::pin!(o3::cell::BrandCell::new(TlsDispatcher {
+            let app = pin!(BrandCell::new(TlsDispatcher {
                 listener,
                 readiness,
             }));
@@ -181,7 +187,8 @@ impl Config {
 
 mod liveness {
     use super::{
-        Application, DriverContext, Identity, Pin, RetainBytes, Slot, Wire, listener, manifold,
+        Application, DriverContext, Identity, Outcome, Pin, RetainBytes, Slot, SlotEgress, Wire,
+        listener,
     };
 
     const RESPONSE: &[u8] = b"HTTP/1.1 200 OK\r\ncontent-length: 0\r\nconnection: close\r\n\r\n";
@@ -208,13 +215,7 @@ mod liveness {
             let mut buf = aux.write_buf_for(slot);
             buf[..RESPONSE.len()].copy_from_slice(RESPONSE);
             slot.set_close_after();
-            dope::manifold::listener::SlotEgress::submit_buffered(
-                slot,
-                buf,
-                RESPONSE.len(),
-                ud,
-                driver,
-            );
+            SlotEgress::submit_buffered(slot, buf, RESPONSE.len(), ud, driver);
         }
     }
 
@@ -228,9 +229,9 @@ mod liveness {
             _chunk: R,
             aux: &mut listener::Aux,
             driver: &mut DriverContext<'_, 'd>,
-        ) -> manifold::Outcome {
+        ) -> Outcome {
             Self::respond(slot, aux, driver);
-            manifold::Outcome::Ok
+            Outcome::Ok
         }
 
         fn send(
@@ -1240,7 +1241,7 @@ pub struct App<H: Handler, W: Wire = Identity> {
     handler: H,
     config: Limits,
     liveness_fallback: bool,
-    _wire: ::std::marker::PhantomData<W>,
+    _wire: PhantomData<W>,
 }
 
 struct GrpcTransport<'a, H: Handler, W: Wire> {
@@ -1248,7 +1249,7 @@ struct GrpcTransport<'a, H: Handler, W: Wire> {
     state: &'a mut ConnState,
 }
 
-impl<H: Handler, W: Wire> sark_h2::server::driver::Transport for GrpcTransport<'_, H, W> {
+impl<H: Handler, W: Wire> Transport for GrpcTransport<'_, H, W> {
     fn connection(&mut self) -> &mut Conn<ServerRole> {
         &mut self.state.h2
     }
@@ -1275,7 +1276,7 @@ impl<H: Handler, W: Wire> App<H, W> {
             handler,
             config,
             liveness_fallback: false,
-            _wire: ::std::marker::PhantomData,
+            _wire: PhantomData,
         }
     }
 
@@ -1296,9 +1297,9 @@ impl<H: Handler, W: Wire> App<H, W> {
         drained
     }
 
-    fn h2_event(&mut self, state: &mut ConnState, event: conn::Event) {
+    fn h2_event(&mut self, state: &mut ConnState, event: Event) {
         match event {
-            conn::Event::Headers {
+            Event::Headers {
                 stream_id,
                 headers,
                 end_stream,
@@ -1309,7 +1310,7 @@ impl<H: Handler, W: Wire> App<H, W> {
                     self.finish_stream(state, stream_id);
                 }
             }
-            conn::Event::Headers {
+            Event::Headers {
                 stream_id,
                 headers,
                 end_stream,
@@ -1320,7 +1321,7 @@ impl<H: Handler, W: Wire> App<H, W> {
                     self.finish_stream(state, stream_id);
                 }
             }
-            conn::Event::Data {
+            Event::Data {
                 stream_id,
                 data,
                 end_stream,
@@ -1330,7 +1331,7 @@ impl<H: Handler, W: Wire> App<H, W> {
                     self.finish_stream(state, stream_id);
                 }
             }
-            conn::Event::StreamReset { stream_id, .. } => {
+            Event::StreamReset { stream_id, .. } => {
                 state.remove_stream(stream_id);
                 state.live_routes.release(stream_id);
             }
@@ -1338,12 +1339,7 @@ impl<H: Handler, W: Wire> App<H, W> {
         }
     }
 
-    fn headers(
-        &mut self,
-        state: &mut ConnState,
-        stream_id: StreamId,
-        headers: sark_h2::hpack::HeaderBlock,
-    ) {
+    fn headers(&mut self, state: &mut ConnState, stream_id: StreamId, headers: hpack::HeaderBlock) {
         match RequestHead::parse_h2(&headers) {
             Ok(head) => {
                 let mut reply = StreamReply::new();
@@ -1373,7 +1369,7 @@ impl<H: Handler, W: Wire> App<H, W> {
         &mut self,
         state: &mut ConnState,
         stream_id: StreamId,
-        headers: sark_h2::hpack::HeaderBlock,
+        headers: hpack::HeaderBlock,
     ) {
         match RequestHead::parse_h2_trailers(&headers) {
             Ok(metadata) => {
@@ -1388,12 +1384,7 @@ impl<H: Handler, W: Wire> App<H, W> {
         }
     }
 
-    fn data(
-        &mut self,
-        state: &mut ConnState,
-        stream_id: StreamId,
-        data: sark_h2::conn::DataPayload,
-    ) {
+    fn data(&mut self, state: &mut ConnState, stream_id: StreamId, data: DataPayload) {
         let mut data = DataChunk::new(data);
         while !data.is_empty() {
             let (next, mode) = {
@@ -1516,7 +1507,7 @@ impl<H: Handler, W: Wire> App<H, W> {
         if close_now {
             slot.set_close_after();
         }
-        dope::manifold::listener::SlotEgress::submit_buffered(slot, write_buf, n, send_ud, driver);
+        SlotEgress::submit_buffered(slot, write_buf, n, send_ud, driver);
     }
 
     pub fn chunk_proj<'d, C: Default + 'static, R: RetainBytes>(
@@ -1526,16 +1517,16 @@ impl<H: Handler, W: Wire> App<H, W> {
         chunk: R,
         aux: &mut listener::Aux,
         driver: &mut DriverContext<'_, 'd>,
-    ) -> manifold::Outcome {
+    ) -> Outcome {
         let bytes = chunk.as_slice();
         if self.liveness_fallback && !project(&mut slot.state.conn).probed {
             project(&mut slot.state.conn).probed = true;
-            if liveness::Liveness::is_plain_request(bytes) {
-                liveness::Liveness::respond(slot, aux, driver);
-                return manifold::Outcome::Ok;
+            if Liveness::is_plain_request(bytes) {
+                Liveness::respond(slot, aux, driver);
+                return Outcome::Ok;
             }
         }
-        let error = sark_h2::server::driver::Driver::new(&mut GrpcTransport {
+        let error = Driver::new(&mut GrpcTransport {
             app: self,
             state: project(&mut slot.state.conn),
         })
@@ -1546,11 +1537,11 @@ impl<H: Handler, W: Wire> App<H, W> {
             let code = ErrorCode::from(&error);
             let _ = state.h2.goaway(code, b"");
             Self::flush_into_proj(slot, aux, driver, true, &project);
-            return manifold::Outcome::Ok;
+            return Outcome::Ok;
         }
         let close_after = project(&mut slot.state.conn).h2.goaway_sent();
         Self::flush_into_proj(slot, aux, driver, close_after, &project);
-        manifold::Outcome::Ok
+        Outcome::Ok
     }
 
     pub fn send_proj<'d, C: Default + 'static>(

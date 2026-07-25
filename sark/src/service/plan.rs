@@ -1,10 +1,16 @@
 use std::ops::Range;
 
 use o3::buffer::{Bytes, Retained};
-use sark_core::error::Result;
-use sark_core::utils::bytes::Ascii;
+use sark_core::{
+    error::{Error, Result},
+    http::{
+        codec::HeaderScan,
+        head::{Flags, HeadInput, HeaderLineScan},
+    },
+    utils::bytes::Ascii,
+};
 
-use crate::routes::path::seg_next;
+use crate::{routes::path::seg_next, service::Key};
 
 pub trait HeaderValue {
     fn len(&self) -> usize;
@@ -48,13 +54,11 @@ impl HeaderValue for Bytes<Retained> {
     }
 
     fn parse_usize(&self) -> Result<usize> {
-        Ascii::parse_usize(self.as_slice())
-            .ok_or_else(sark_core::error::Error::invalid_integer_header)
+        Ascii::parse_usize(self.as_slice()).ok_or_else(Error::invalid_integer_header)
     }
 
     fn parse_u64(&self) -> Result<u64> {
-        Ascii::parse_u64(self.as_slice())
-            .ok_or_else(sark_core::error::Error::invalid_integer_header)
+        Ascii::parse_u64(self.as_slice()).ok_or_else(Error::invalid_integer_header)
     }
 }
 
@@ -100,11 +104,11 @@ impl HeaderValue for SliceValue<'_> {
     }
 
     fn parse_usize(&self) -> Result<usize> {
-        Ascii::parse_usize(self.bytes()).ok_or_else(sark_core::error::Error::invalid_integer_header)
+        Ascii::parse_usize(self.bytes()).ok_or_else(Error::invalid_integer_header)
     }
 
     fn parse_u64(&self) -> Result<u64> {
-        Ascii::parse_u64(self.bytes()).ok_or_else(sark_core::error::Error::invalid_integer_header)
+        Ascii::parse_u64(self.bytes()).ok_or_else(Error::invalid_integer_header)
     }
 }
 
@@ -152,7 +156,7 @@ impl FieldValue for usize {
     }
 
     fn parse_value_bytes(value: &[u8], _abs_start: usize) -> Result<Self> {
-        Ascii::parse_usize(value).ok_or_else(sark_core::error::Error::invalid_integer_header)
+        Ascii::parse_usize(value).ok_or_else(Error::invalid_integer_header)
     }
 
     fn parse_path<P: PathProbe>(path: &P, start: usize, end: usize) -> Option<Self> {
@@ -166,7 +170,7 @@ impl FieldValue for u64 {
     }
 
     fn parse_value_bytes(value: &[u8], _abs_start: usize) -> Result<Self> {
-        Ascii::parse_u64(value).ok_or_else(sark_core::error::Error::invalid_integer_header)
+        Ascii::parse_u64(value).ok_or_else(Error::invalid_integer_header)
     }
 
     fn parse_path<P: PathProbe>(path: &P, start: usize, end: usize) -> Option<Self> {
@@ -182,9 +186,7 @@ impl FieldValue for bool {
         if value.eq_ignore_ascii_case(b"false") || value.eq_bytes(b"0") {
             return Ok(false);
         }
-        Err(sark_core::error::Error::BadRequest(
-            "Invalid boolean field".into(),
-        ))
+        Err(Error::BadRequest("Invalid boolean field".into()))
     }
 
     fn parse_value_bytes(value: &[u8], _abs_start: usize) -> Result<Self> {
@@ -194,9 +196,7 @@ impl FieldValue for bool {
         if value.eq_ignore_ascii_case(b"false") || value == b"0" {
             return Ok(false);
         }
-        Err(sark_core::error::Error::BadRequest(
-            "Invalid boolean field".into(),
-        ))
+        Err(Error::BadRequest("Invalid boolean field".into()))
     }
 
     fn parse_path<P: PathProbe>(path: &P, start: usize, end: usize) -> Option<Self> {
@@ -325,14 +325,10 @@ pub trait HeadPlan {
     type RouteKey;
 
     fn route<P: PathProbe>(&self, method: &http::Method, path: &P) -> Self::RouteKey {
-        self.route_key_probe(crate::service::Key::from_method(method), path)
+        self.route_key_probe(Key::from_method(method), path)
     }
 
-    fn route_key_probe<P: PathProbe>(
-        &self,
-        method_key: crate::service::Key,
-        path: &P,
-    ) -> Self::RouteKey;
+    fn route_key_probe<P: PathProbe>(&self, method_key: Key, path: &P) -> Self::RouteKey;
 }
 
 pub struct FullHeadPlan;
@@ -340,12 +336,7 @@ pub struct FullHeadPlan;
 impl HeadPlan for FullHeadPlan {
     type RouteKey = ();
 
-    fn route_key_probe<P: PathProbe>(
-        &self,
-        _method_key: crate::service::Key,
-        _path: &P,
-    ) -> Self::RouteKey {
-    }
+    fn route_key_probe<P: PathProbe>(&self, _method_key: Key, _path: &P) -> Self::RouteKey {}
 }
 
 pub trait HeadParts<K>: Sized {
@@ -367,7 +358,7 @@ pub trait HeadParts<K>: Sized {
         V: HeaderValue;
 
     #[allow(clippy::too_many_arguments)]
-    fn apply_header<I: sark_core::http::head::HeadInput + ?Sized>(
+    fn apply_header<I: HeadInput + ?Sized>(
         &mut self,
         input: &I,
         line: &[u8],
@@ -375,11 +366,12 @@ pub trait HeadParts<K>: Sized {
         colon_idx: usize,
         pretrim_start: Option<usize>,
         pretrim_end: Option<usize>,
-        scan: &mut sark_core::http::codec::HeaderScan,
-        flags: &mut sark_core::http::head::Flags,
-        scan_info: Option<&sark_core::http::head::HeaderLineScan>,
+        scan: &mut HeaderScan,
+        flags: &mut Flags,
+        scan_info: Option<&HeaderLineScan>,
     ) -> Result<()> {
-        crate::parser::head::HeaderApply::generic::<I, K, Self>(
+        use crate::parser::head::HeaderApply;
+        HeaderApply::generic::<I, K, Self>(
             input,
             line,
             line_start,
@@ -410,7 +402,8 @@ pub trait HeadParts<K>: Sized {
     }
 
     fn parse_query(&mut self, input: &[u8], range: Range<usize>) -> Result<()> {
-        crate::parser::head::query::parse_query_fields_input::<K, Self>(input, range, self)
+        use crate::parser::head::query::parse_query_fields_input;
+        parse_query_fields_input::<K, Self>(input, range, self)
     }
 }
 

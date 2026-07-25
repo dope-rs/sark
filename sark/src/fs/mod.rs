@@ -1,5 +1,8 @@
 //! Asynchronous static-file serving with bounded caching and single-flight loading.
 
+use std::time::SystemTime;
+
+use crate::fs::resolver::Resolver;
 mod cache;
 mod encoding;
 mod flight;
@@ -52,6 +55,7 @@ struct SharedState {
 
 impl SharedState {
     fn new(config: Config, hash_state: hash::State) -> Self {
+        use crate::fs::flight::Hub;
         let cache_entries = if config.cache_capacity == 0 {
             0
         } else {
@@ -61,7 +65,7 @@ impl SharedState {
         Self {
             read_budget: Box::pin(ByteBudget::new(config.read_budget)),
             cache: Cache::new(cache_entries),
-            flights: flight::Hub::new(flight_capacity),
+            flights: Hub::new(flight_capacity),
             config,
             hash_state,
         }
@@ -143,12 +147,7 @@ impl ServeDir {
             .lookup(self.state.hash(key), key, self.state.config.cache_valid)
     }
 
-    fn refresh_cached(
-        &self,
-        key: &[u8],
-        mtime: Option<std::time::SystemTime>,
-        size: u64,
-    ) -> Option<Asset> {
+    fn refresh_cached(&self, key: &[u8], mtime: Option<SystemTime>, size: u64) -> Option<Asset> {
         self.state
             .cache
             .refresh(self.state.hash(key), key, mtime, size)
@@ -214,7 +213,8 @@ impl ServeDir {
         relative_path: &[u8],
         accept_encoding: &[u8],
     ) -> Response {
-        let Some(relative) = resolver::Resolver::relative(relative_path) else {
+        use crate::fs::flight::{Outcome, Start};
+        let Some(relative) = Resolver::relative(relative_path) else {
             return Response::not_found();
         };
         let stale = match self.cached(relative_path) {
@@ -223,22 +223,22 @@ impl ServeDir {
             Lookup::Miss => false,
         };
         let leader = match self.begin_flight(relative_path) {
-            flight::Start::Leader(leader) => Some(leader),
-            flight::Start::Untracked => None,
-            flight::Start::Overloaded => return LoadError::Overloaded.response(),
-            flight::Start::Follower(wait) => {
+            Start::Leader(leader) => Some(leader),
+            Start::Untracked => None,
+            Start::Overloaded => return LoadError::Overloaded.response(),
+            Start::Follower(wait) => {
                 return match wait.await {
-                    flight::Outcome::Loaded(asset) => self.respond_asset(&asset, accept_encoding),
-                    flight::Outcome::Failed(error) => error.response(),
+                    Outcome::Loaded(asset) => self.respond_asset(&asset, accept_encoding),
+                    Outcome::Failed(error) => error.response(),
                 };
             }
         };
-        let base = resolver::Resolver::new(&self.state.config.root).resolve(relative);
+        let base = Resolver::new(&self.state.config.root).resolve(relative);
         if stale {
             let Some(metadata) = self.stat_async(files, &base).await else {
                 self.remove_cached(relative_path);
                 if let Some(leader) = leader {
-                    leader.finish(flight::Outcome::Failed(LoadError::NotFound));
+                    leader.finish(Outcome::Failed(LoadError::NotFound));
                 }
                 return Response::not_found();
             };
@@ -246,7 +246,7 @@ impl ServeDir {
                 self.refresh_cached(relative_path, metadata.modified(), metadata.len())
             {
                 if let Some(leader) = leader {
-                    leader.finish(flight::Outcome::Loaded(asset.clone()));
+                    leader.finish(Outcome::Loaded(asset.clone()));
                 }
                 return self.respond_asset(&asset, accept_encoding);
             }
@@ -255,13 +255,13 @@ impl ServeDir {
             Ok(asset) => {
                 self.install(relative_path, asset.clone());
                 if let Some(leader) = leader {
-                    leader.finish(flight::Outcome::Loaded(asset.clone()));
+                    leader.finish(Outcome::Loaded(asset.clone()));
                 }
                 self.respond_asset(&asset, accept_encoding)
             }
             Err(error) => {
                 if let Some(leader) = leader {
-                    leader.finish(flight::Outcome::Failed(error));
+                    leader.finish(Outcome::Failed(error));
                 }
                 error.response()
             }
@@ -278,12 +278,12 @@ impl ServeDir {
         let body = file.body;
         let mtime = file.metadata.modified();
         let size = file.metadata.len();
-        let mime = resolver::Resolver::content_type(&base);
+        let mime = Resolver::content_type(&base);
         let mut variants = [None, None];
         let mut bytes = body.len();
         for encoding in self.precompressed() {
             match self
-                .read_async(files, resolver::Resolver::sibling(&base, encoding))
+                .read_async(files, Resolver::sibling(&base, encoding))
                 .await
             {
                 Ok(file) => {
@@ -318,9 +318,10 @@ impl ServeDir {
         files: &Files<'d, ID, N>,
         path: &Path,
     ) -> Option<file::Metadata> {
+        use dope_fiber::file::Stat;
         let path = path.to_str()?;
         let path = OpenPath::new(path).ok()?;
-        let metadata = file::Stat::path(files, path).await.ok()?;
+        let metadata = Stat::path(files, path).await.ok()?;
         metadata.is_file().then_some(metadata)
     }
 }
