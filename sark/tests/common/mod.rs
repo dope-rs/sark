@@ -164,11 +164,11 @@ pub(crate) async fn read_response_dope_stream(
             return Ok(parsed);
         }
 
-        let (res, chunk) = stream.read(vec![0u8; 4096]).await;
-        let n = res?;
-        if n == 0 {
+        let (res, chunk) = stream.read(Vec::with_capacity(4096)).await;
+        res?;
+        if chunk.is_empty() {
             return Err(Error::new(ErrorKind::UnexpectedEof, "eof"));
         }
-        buf.extend_from_slice(&chunk[..n]);
+        buf.extend_from_slice(&chunk);
     }
 }

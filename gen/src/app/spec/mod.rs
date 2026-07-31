@@ -1,10 +1,7 @@
-mod parts;
-
 use proc_macro2::{Ident, TokenStream};
-use quote::format_ident;
+use quote::{format_ident, quote};
 use syn::{Error, GenericArgument, Index, LitStr, PathArguments, Type, TypePath, Visibility};
 
-use self::parts::build_arms;
 use super::plan::Meta;
 use crate::{
     model::{AppDispatchInput, AppRouteInput},
@@ -34,17 +31,7 @@ pub(super) struct Gen {
     pub(super) route_specs: Vec<Entry>,
     pub(super) routes: Vec<TypePath>,
     pub(super) idx: Vec<Index>,
-    pub(super) plan_ident: Ident,
-    pub(super) key_ident: Ident,
-    pub(super) parts_ident: Ident,
-    pub(super) key_vars: Vec<Ident>,
-    pub(super) parts_aliases: Vec<TokenStream>,
     pub(super) route_bounds: Vec<TokenStream>,
-    pub(super) parts_vars: Vec<TokenStream>,
-    pub(super) parts_header_bytes_arms: Vec<TokenStream>,
-    pub(super) parts_query_name_arms: Vec<TokenStream>,
-    pub(super) parts_query_slice_arms: Vec<TokenStream>,
-    pub(super) parts_query_parse_arms: Vec<TokenStream>,
 }
 
 impl Gen {
@@ -62,26 +49,7 @@ impl Gen {
             .map(|entry| entry.route.clone())
             .collect();
         let idx: Vec<Index> = (0..routes.len()).map(Index::from).collect();
-        let plan_ident = format_ident!("{}HeadPlan", name);
-        let key_ident = format_ident!("{}RouteKey", name);
-        let parts_ident = format_ident!("{}ParseParts", name);
-        let key_vars: Vec<_> = (0..routes.len()).map(|i| format_ident!("R{}", i)).collect();
-        let params_alias: Vec<_> = (0..routes.len())
-            .map(|i| format_ident!("{}ParamsTy{}", name, i))
-            .collect();
-        let headers_alias: Vec<_> = (0..routes.len())
-            .map(|i| format_ident!("{}HeadersTy{}", name, i))
-            .collect();
-        let kinds: Vec<RouteKind> = route_specs.iter().map(|entry| entry.kind).collect();
-        let arms = build_arms(
-            &routes,
-            &kinds,
-            &state_ty,
-            &params_alias,
-            &headers_alias,
-            &key_vars,
-            &parts_ident,
-        );
+        let route_bounds = build_route_bounds(&route_specs, &state_ty);
 
         Ok(Self {
             vis,
@@ -90,19 +58,35 @@ impl Gen {
             route_specs,
             routes,
             idx,
-            plan_ident,
-            key_ident,
-            parts_ident,
-            key_vars,
-            parts_aliases: arms.parts_aliases,
-            route_bounds: arms.route_bounds,
-            parts_vars: arms.parts_vars,
-            parts_header_bytes_arms: arms.parts_header_bytes_arms,
-            parts_query_name_arms: arms.parts_query_name_arms,
-            parts_query_slice_arms: arms.parts_query_slice_arms,
-            parts_query_parse_arms: arms.parts_query_parse_arms,
+            route_bounds,
         })
     }
+}
+
+fn build_route_bounds(entries: &[Entry], state_ty: &Type) -> Vec<TokenStream> {
+    entries
+        .iter()
+        .map(|entry| {
+            let route = &entry.route;
+            let (kind, invoke) = match entry.kind {
+                RouteKind::Sync => (
+                    quote!(sark::service::manifold::Sync),
+                    quote!(sark::service::manifold::Route<#state_ty>),
+                ),
+                RouteKind::Fiber => (
+                    quote!(sark::service::manifold::NativeFiber),
+                    quote!(sark::service::manifold::TaskRoute<'d, #state_ty>),
+                ),
+                RouteKind::Stream => (
+                    quote!(sark::service::manifold::NativeStream),
+                    quote!(sark::service::manifold::Route<#state_ty>),
+                ),
+            };
+            quote! {
+                #route: sark::service::RouteSpec<Kind = #kind> + #invoke,
+            }
+        })
+        .collect()
 }
 
 fn normalize_state_lifetimes(mut ty: Type) -> Type {

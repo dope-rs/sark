@@ -10,5 +10,9 @@ authors.workspace = true
 [dependencies]
 o3.workspace = true
 http = "1.4.2"
+memchr = "2.8"
 sark-core.workspace = true
 ryu = "1.0.23"
+
+[dev-dependencies]
+sark-gen.workspace = true

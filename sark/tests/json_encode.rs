@@ -24,6 +24,21 @@ struct OwnedText {
     retained: Bytes<Retained>,
 }
 
+#[sark_gen::json(encode)]
+struct OptionalOutput {
+    count: Option<u64>,
+    delta: Option<i64>,
+    score: Option<f64>,
+    ok: Option<bool>,
+    name: Option<String>,
+    shared: Option<Shared>,
+    retained: Option<Bytes<Retained>>,
+    #[field(raw)]
+    raw: Option<Shared>,
+    #[field(plain)]
+    plain: Option<Shared>,
+}
+
 #[sark_gen::request]
 struct OwnedRequest {}
 
@@ -90,4 +105,44 @@ fn shared_and_retained_bytes_form_owned_async_json() {
         output.encode_json().as_slice(),
         br#"{"shared":"a\"b","retained":"a\"b"}"#
     );
+}
+
+#[test]
+fn optional_fields_share_the_scalar_encoding_plan() {
+    let shared = Shared::from_static(b"a\"b");
+    let present = OptionalOutput {
+        count: Some(7),
+        delta: Some(-3),
+        score: Some(1.25),
+        ok: Some(true),
+        name: Some(String::from("x\"y")),
+        shared: Some(shared.clone()),
+        retained: Some(Bytes::<Retained>::from(shared)),
+        raw: Some(Shared::from_static(b"17")),
+        plain: Some(Shared::from_static(b"plain")),
+    };
+    let encoded = present.encode_json();
+    assert_eq!(
+        encoded.as_slice(),
+        br#"{"count":7,"delta":-3,"score":1.25,"ok":true,"name":"x\"y","shared":"a\"b","retained":"a\"b","raw":17,"plain":"plain"}"#
+    );
+    assert_eq!(encoded.len(), present.json_len());
+
+    let absent = OptionalOutput {
+        count: None,
+        delta: None,
+        score: None,
+        ok: None,
+        name: None,
+        shared: None,
+        retained: None,
+        raw: None,
+        plain: None,
+    };
+    let encoded = absent.encode_json();
+    assert_eq!(
+        encoded.as_slice(),
+        br#"{"count":null,"delta":null,"score":null,"ok":null,"name":null,"shared":null,"retained":null,"raw":null,"plain":null}"#
+    );
+    assert_eq!(encoded.len(), absent.json_len());
 }

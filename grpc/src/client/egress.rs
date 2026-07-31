@@ -1,4 +1,4 @@
-use o3::buffer::{Pooled, SharedPool};
+use o3::buffer::{Pooled, SharedPool, SharedPoolLayout};
 use o3::collections::{FixedQueue, Slab, SlabKey};
 use sark_h2::{ClientRole, Conn, ConnError, ErrorCode, StreamId};
 
@@ -54,11 +54,11 @@ pub(super) struct Egress {
 }
 
 impl Egress {
-    pub(super) fn with_config(config: &Config) -> Self {
+    pub(super) fn with_config(config: &Config, request_layout: SharedPoolLayout) -> Self {
         Self {
             pending: FixedQueue::with_capacity(config.max_in_flight),
             requests: Slab::with_capacity(config.max_pending_msgs),
-            request_pool: SharedPool::new(config.max_pending_msgs, config.max_pending_len),
+            request_pool: SharedPool::from_layout(request_layout),
             max_message_len: config.max_message_len,
         }
     }

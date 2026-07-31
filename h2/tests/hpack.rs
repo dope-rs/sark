@@ -1,3 +1,4 @@
+use sark_core::http::{HpackHuffmanSource, PrefixedInt};
 use sark_h2::hpack::{Decoder, DecoderError, Encoder, Header};
 
 type Pair = (Vec<u8>, Vec<u8>);
@@ -514,10 +515,66 @@ mod size_setting {
         enc.encode(std::iter::empty::<Header>(), &mut buf);
         assert_eq!(buf[0] & 0xe0, 0x20);
     }
+
+    #[test]
+    fn decoder_rejects_size_update_after_a_field() {
+        let bytes = [0x82, 0x20];
+        let mut decoder = Decoder::new(4096);
+        assert_eq!(
+            decoder.decode(&bytes, |_, _| {}),
+            Err(DecoderError::BadDynSizeUpdate)
+        );
+    }
+
+    #[test]
+    fn fragmented_decoder_rejects_size_update_after_a_field() {
+        let mut decoder = Decoder::new(4096);
+        let mut block = decoder.start_block();
+        decoder
+            .decode_fragment(&mut block, &[0x82], |_, _| {})
+            .unwrap();
+        assert_eq!(
+            decoder.decode_fragment(&mut block, &[0x3f, 0x01], |_, _| {}),
+            Err(DecoderError::BadDynSizeUpdate)
+        );
+    }
+
+    #[test]
+    fn multiple_leading_size_updates_are_accepted() {
+        let bytes = [0x20, 0x3f, 0x01, 0x82];
+        let mut decoder = Decoder::new(4096);
+        let mut emitted = Vec::new();
+        decoder
+            .decode(&bytes, |name, value| {
+                emitted.push((name.to_vec(), value.to_vec()));
+            })
+            .unwrap();
+        assert_eq!(decoder.dyn_max(), 32);
+        assert_eq!(emitted, [(b":method".to_vec(), b"GET".to_vec())]);
+    }
 }
 
 mod header_list_bound {
     use super::*;
+
+    fn encode_literal(bytes: &[u8], huffman: bool, out: &mut Vec<u8>) {
+        if huffman {
+            let source = HpackHuffmanSource::new(bytes);
+            PrefixedInt::<7>::new(source.encoded_len() as u64).encode(0x80, out);
+            source.encode(out);
+        } else {
+            PrefixedInt::<7>::new(bytes.len() as u64).encode(0x00, out);
+            out.extend_from_slice(bytes);
+        }
+    }
+
+    fn literal_block(indexing: bool, name: &[u8], value: &[u8]) -> Vec<u8> {
+        let mut block = Vec::new();
+        block.push(if indexing { 0x40 } else { 0x00 });
+        encode_literal(name, true, &mut block);
+        encode_literal(value, true, &mut block);
+        block
+    }
 
     #[test]
     fn running_total_rejects_hpack_bomb() {
@@ -559,6 +616,56 @@ mod header_list_bound {
         let over = dec.decode_bounded(&block, |_, _| emitted += 1).unwrap();
         assert!(!over);
         assert_eq!(emitted, 1);
+    }
+
+    #[test]
+    fn non_indexed_huffman_bomb_is_validated_without_emission() {
+        let value = vec![b'a'; 32 * 1024];
+        let block = literal_block(false, b"x", &value);
+        let mut decoder = Decoder::new(4096);
+        decoder.set_max_header_list_size(Some(64));
+
+        let mut emitted = 0;
+        assert_eq!(
+            decoder.decode_bounded(&block, |_, _| emitted += 1),
+            Ok(true)
+        );
+        assert_eq!(emitted, 0);
+        assert_eq!(decoder.dyn_len(), 0);
+    }
+
+    #[test]
+    fn over_limit_indexed_literal_still_synchronizes_dynamic_table() {
+        let value = vec![b'a'; 100];
+        let mut block = literal_block(true, b"x", &value);
+        block.push(0xbe);
+        let mut decoder = Decoder::new(4096);
+        decoder.set_max_header_list_size(Some(64));
+
+        let mut emitted = 0;
+        assert_eq!(
+            decoder.decode_bounded(&block, |_, _| emitted += 1),
+            Ok(true)
+        );
+        assert_eq!(emitted, 0);
+        assert_eq!(decoder.dyn_len(), 1);
+        assert_eq!(decoder.dyn_get(0), Some((&b"x"[..], &value[..])));
+    }
+
+    #[test]
+    fn discarded_huffman_tail_is_still_rejected() {
+        let mut block = Vec::new();
+        block.push(0x00);
+        encode_literal(b"x", false, &mut block);
+        PrefixedInt::<7>::new(4).encode(0x80, &mut block);
+        block.extend_from_slice(&[0xff; 4]);
+        let mut decoder = Decoder::new(4096);
+        decoder.set_max_header_list_size(Some(0));
+
+        assert_eq!(
+            decoder.decode_bounded(&block, |_, _| {}),
+            Err(DecoderError::BadString)
+        );
     }
 }
 
@@ -622,5 +729,139 @@ mod c1_length_overflow {
         dec.decode(bytes, |n, v| got.push((n.to_vec(), v.to_vec())))
             .unwrap();
         assert_eq!(got, vec![(b"foo".to_vec(), b"bar".to_vec())]);
+    }
+}
+
+mod incremental {
+    use super::*;
+
+    fn fixture() -> Vec<u8> {
+        let name = vec![b'z'; 160];
+        let value = vec![b'a'; 300];
+        let headers = [
+            Header {
+                name: b":method",
+                value: b"GET",
+            },
+            Header {
+                name: &name,
+                value: &value,
+            },
+            Header {
+                name: &name,
+                value: &value,
+            },
+        ];
+        let mut encoder = Encoder::new(4096);
+        encoder.set_max_size(1024);
+        let mut block = Vec::new();
+        encoder.encode(headers, &mut block);
+        block
+    }
+
+    fn decode_chunks<'a>(chunks: impl IntoIterator<Item = &'a [u8]>) -> (Vec<Pair>, Decoder) {
+        let mut decoder = Decoder::new(4096);
+        let mut block = decoder.start_block();
+        let mut fields = Vec::new();
+        for chunk in chunks {
+            decoder
+                .decode_fragment(&mut block, chunk, |name, value| {
+                    fields.push((name.to_vec(), value.to_vec()));
+                })
+                .unwrap();
+        }
+        assert!(!block.finish().unwrap());
+        (fields, decoder)
+    }
+
+    fn assert_result(fields: &[Pair], decoder: &Decoder) {
+        assert_eq!(fields.len(), 3);
+        assert_eq!(fields[0], (b":method".to_vec(), b"GET".to_vec()));
+        assert_eq!(fields[1].0, vec![b'z'; 160]);
+        assert_eq!(fields[1].1, vec![b'a'; 300]);
+        assert_eq!(fields[2], fields[1]);
+        assert_eq!(decoder.dyn_max(), 1024);
+        assert_eq!(decoder.dyn_len(), 1);
+        assert_eq!(
+            decoder.dyn_get(0),
+            Some((&vec![b'z'; 160][..], &vec![b'a'; 300][..]))
+        );
+    }
+
+    #[test]
+    fn every_single_fragment_boundary_preserves_decode_and_table_state() {
+        let encoded = fixture();
+        for split in 0..=encoded.len() {
+            let (fields, decoder) = decode_chunks([&encoded[..split], &encoded[split..]]);
+            assert_result(&fields, &decoder);
+        }
+    }
+
+    #[test]
+    fn byte_at_a_time_preserves_integer_string_and_huffman_state() {
+        let encoded = fixture();
+        let (fields, decoder) = decode_chunks(encoded.chunks(1));
+        assert_result(&fields, &decoder);
+    }
+
+    #[test]
+    fn invalid_huffman_is_rejected_at_every_fragment_boundary() {
+        let encoded = [0x00, 0x01, b'x', 0x84, 0xff, 0xff, 0xff, 0xff];
+        for split in 0..=encoded.len() {
+            let mut decoder = Decoder::new(4096);
+            let mut block = decoder.start_block();
+            let result = decoder
+                .decode_fragment(&mut block, &encoded[..split], |_, _| {})
+                .and_then(|()| decoder.decode_fragment(&mut block, &encoded[split..], |_, _| {}))
+                .and_then(|()| block.finish().map(|_| ()));
+            assert_eq!(result, Err(DecoderError::BadString));
+        }
+    }
+
+    #[test]
+    fn over_limit_fragmented_literal_still_synchronizes_dynamic_table() {
+        let encoded = fixture();
+        for split in 0..=encoded.len() {
+            let mut decoder = Decoder::new(4096);
+            decoder.set_max_header_list_size(Some(64));
+            let mut block = decoder.start_block();
+            let mut emitted = 0;
+            decoder
+                .decode_fragment(&mut block, &encoded[..split], |_, _| emitted += 1)
+                .unwrap();
+            decoder
+                .decode_fragment(&mut block, &encoded[split..], |_, _| emitted += 1)
+                .unwrap();
+            assert!(block.finish().unwrap());
+            assert_eq!(emitted, 1);
+            assert_eq!(decoder.dyn_len(), 1);
+            assert_eq!(
+                decoder.dyn_get(0),
+                Some((&vec![b'z'; 160][..], &vec![b'a'; 300][..]))
+            );
+        }
+    }
+
+    #[test]
+    fn every_incomplete_phase_is_rejected_at_block_end() {
+        for encoded in [
+            &[0xff][..],
+            &[0x40][..],
+            &[0x40, 0x03, b'a'][..],
+            &[0x40, 0x01, b'a'][..],
+            &[0x40, 0x01, b'a', 0x03, b'b'][..],
+            &[0x40, 0x01, b'a', 0x81][..],
+        ] {
+            let mut decoder = Decoder::new(4096);
+            let mut block = decoder.start_block();
+            decoder
+                .decode_fragment(&mut block, encoded, |_, _| {})
+                .unwrap();
+            assert_eq!(
+                block.finish(),
+                Err(DecoderError::NeedMore),
+                "{encoded:02x?}"
+            );
+        }
     }
 }

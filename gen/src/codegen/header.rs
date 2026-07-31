@@ -4,30 +4,10 @@ use std::collections::BTreeMap;
 
 use proc_macro2::{Ident, Span, TokenStream};
 use quote::{format_ident, quote};
-use syn::{LitByteStr, Result};
+use syn::Result;
 
-use super::value::{FieldPlan, FieldSpec, LengthArms};
+use super::value::{FieldPlan, FieldSpec};
 use crate::util::ValueKind;
-
-#[derive(Clone, Copy, Default)]
-pub(crate) enum HeaderValueMode {
-    #[default]
-    Full,
-    Skip,
-}
-
-#[derive(Clone, Copy, Default)]
-pub(crate) enum HeaderApplyMode {
-    #[default]
-    Full,
-    Skip,
-}
-
-#[derive(Clone, Copy, Default)]
-pub(crate) struct HeaderParserConfig {
-    pub(crate) value: HeaderValueMode,
-    pub(crate) apply: HeaderApplyMode,
-}
 
 const KNOWN_HEADERS: [KnownKind; 6] = [
     KnownKind::Host,
@@ -145,37 +125,28 @@ impl HeaderPlan {
         }
         Self { known, custom }
     }
-
-    fn is_empty(&self) -> bool {
-        self.custom.is_empty() && self.known.iter().all(Option::is_none)
-    }
 }
 
 pub(crate) struct HeaderEmitter {
     plan: HeaderPlan,
-    config: HeaderParserConfig,
+    full: bool,
 }
 
 impl HeaderEmitter {
-    pub(crate) fn new(fields: &FieldPlan, config: HeaderParserConfig) -> Self {
+    pub(crate) fn new(fields: &FieldPlan, full: bool) -> Self {
         Self {
             plan: HeaderPlan::collect(fields),
-            config,
+            full,
         }
-    }
-
-    pub(crate) fn needs_known_header(&self) -> bool {
-        self.plan.known.iter().any(Option::is_some)
     }
 }
 
 struct ActionSpec {
-    variant: Ident,
     bytes: Vec<u8>,
     body: TokenStream,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 enum KnownKind {
     Host,
     Connection,
@@ -186,6 +157,13 @@ enum KnownKind {
 }
 
 impl KnownKind {
+    fn mandatory(self) -> bool {
+        matches!(
+            self,
+            Self::Host | Self::Connection | Self::ContentLength | Self::TransferEncoding
+        )
+    }
+
     fn bytes(self) -> &'static [u8] {
         match self {
             Self::Host => b"host",
@@ -194,35 +172,6 @@ impl KnownKind {
             Self::TransferEncoding => b"transfer-encoding",
             Self::Expect => b"expect",
             Self::AcceptEncoding => b"accept-encoding",
-        }
-    }
-
-    fn suffix(self) -> &'static str {
-        match self {
-            Self::Host => "HOST",
-            Self::Connection => "CONNECTION",
-            Self::ContentLength => "CONTENT_LENGTH",
-            Self::TransferEncoding => "TRANSFER_ENCODING",
-            Self::Expect => "EXPECT",
-            Self::AcceptEncoding => "ACCEPT_ENCODING",
-        }
-    }
-
-    fn variant(self) -> Ident {
-        match self {
-            Self::Host => format_ident!("Host"),
-            Self::Connection => format_ident!("Connection"),
-            Self::ContentLength => format_ident!("ContentLength"),
-            Self::TransferEncoding => format_ident!("TransferEncoding"),
-            Self::Expect => format_ident!("Expect"),
-            Self::AcceptEncoding => format_ident!("AcceptEncoding"),
-        }
-    }
-
-    fn apply_call(self) -> TokenStream {
-        let variant = self.variant();
-        quote! {
-            sark::sark_core::http::head::KnownHeader::#variant.apply(scan, flags, raw)?;
         }
     }
 
@@ -245,9 +194,8 @@ impl KnownKind {
         self,
         capture: Option<&FieldSpec>,
         count_tail: &TokenStream,
-        skip_apply: bool,
     ) -> TokenStream {
-        let capture_body = capture.map(|field| {
+        let assignment = capture.map(|field| {
             let raw_expr = quote! {
                 rest.get(colon_idx + 1 + value_start..colon_idx + 1 + value_end)
                     .ok_or_else(|| sark::error::Error::BadRequest("Invalid header value".into()))?
@@ -256,14 +204,6 @@ impl KnownKind {
             let abs_end = quote! { line_start + colon_idx + 1 + value_end };
             field.assignment(raw_expr, abs_start, abs_end)
         });
-        let maybe_assign = if skip_apply {
-            TokenStream::new()
-        } else {
-            match capture_body {
-                Some(tokens) => tokens,
-                None => TokenStream::new(),
-            }
-        };
         let header = self.header();
         quote! {{
             let Some((tail_end, value_start, value_end)) =
@@ -273,7 +213,7 @@ impl KnownKind {
             };
             let _ = (value_start, value_end);
             #count_tail
-            #maybe_assign
+            #assignment
             return Ok(Some(colon_idx + 1 + tail_end));
         }}
     }
@@ -373,10 +313,11 @@ impl BytesMatch {
     ) -> TokenStream {
         let len = proc_macro2::Literal::usize_unsuffixed(len);
         quote! {
-            match #name_ident.first_chunk::<#len>() {
-                Some(#chunk) => true #( && #checks )*,
-                None => false,
-            }
+            #name_ident.len() == #len
+                && match #name_ident.first_chunk::<#len>() {
+                    Some(#chunk) => true #( && #checks )*,
+                    None => false,
+                }
         }
     }
 
@@ -545,157 +486,8 @@ impl HeaderEmitter {
 }
 
 impl HeaderEmitter {
-    pub(crate) fn apply(&self) -> Result<TokenStream> {
-        let plan = &self.plan;
-        let cfg = self.config;
-        let skip_value = matches!(cfg.value, HeaderValueMode::Skip);
-        let skip_apply = matches!(cfg.apply, HeaderApplyMode::Skip);
-        if plan.is_empty() && !skip_value {
-            return Ok(quote! {
-                let _ = (input, line_start, scan_info);
-                return sark::sark_core::http::head::WellKnownHeaders::new(scan, flags).apply(
-                    line,
-                    colon_idx,
-                    pretrim_start,
-                    pretrim_end,
-                );
-            });
-        }
-        let raw = format_ident!("__raw");
-        let name_valid = self.header_name_valid(&raw);
-        let action_enum = format_ident!("__HeaderAction");
-        let mut action_specs = Vec::new();
-        for (idx, known) in KNOWN_HEADERS.iter().enumerate() {
-            let capture = plan.known[idx].clone();
-            let action = format_ident!("Known{}", known.suffix());
-            let apply = known.apply_call();
-            let arm = if let Some(field) = capture {
-                let raw_expr = quote! { raw };
-                let abs_start = quote! { line_start + value_start };
-                let abs_end = quote! { line_start + value_end };
-                let assign = field.assignment(raw_expr, abs_start, abs_end);
-                let maybe_assign = if skip_apply {
-                    TokenStream::new()
-                } else {
-                    quote! { #assign }
-                };
-                quote! {{
-                    #apply
-                    #maybe_assign
-                    return Ok(());
-                }}
-            } else {
-                quote! {{
-                    #apply
-                    return Ok(());
-                }}
-            };
-            action_specs.push(ActionSpec {
-                variant: action,
-                bytes: known.bytes().to_vec(),
-                body: arm,
-            });
-        }
-        for field in &plan.custom {
-            let action = format_ident!("Custom{}", field.slot);
-            let raw_expr = quote! { raw };
-            let abs_start = quote! { line_start + value_start };
-            let abs_end = quote! { line_start + value_end };
-            let assign = field.assignment(raw_expr, abs_start, abs_end);
-            let maybe_assign = if skip_apply {
-                TokenStream::new()
-            } else {
-                quote! { #assign }
-            };
-            action_specs.push(ActionSpec {
-                variant: action.clone(),
-                bytes: field.bytes.clone(),
-                body: quote! {{
-                    #maybe_assign
-                    return Ok(());
-                }},
-            });
-        }
-        let action_select_arms = self.action_select(&action_enum, &action_specs, true);
-        let action_variants: Vec<_> = action_specs.iter().map(|spec| &spec.variant).collect();
-        let action_arms: Vec<_> = action_specs
-            .iter()
-            .map(|spec| {
-                let variant = &spec.variant;
-                let body = &spec.body;
-                quote! { #action_enum::#variant => #body }
-            })
-            .collect();
-        Ok(quote! {
-            if colon_idx == 0 {
-                return Err(sark_core::error::Error::BadRequest("Invalid header name".into()));
-            }
-            let _ = scan_info;
-            let Some(name) = line.get(..colon_idx) else {
-                return Err(sark_core::error::Error::BadRequest("Invalid header name".into()));
-            };
-            for &#raw in name {
-                if !(#name_valid) {
-                    return Err(sark_core::error::Error::BadRequest("Invalid header name".into()));
-                }
-            }
-            enum #action_enum {
-                Unknown,
-                #( #action_variants, )*
-            }
-            let mut action = #action_enum::Unknown;
-            match name.len() {
-                #( #action_select_arms )*
-                _ => {}
-            }
-            if matches!(action, #action_enum::Unknown) {
-                return Ok(());
-            }
-            if #skip_value {
-                return Ok(());
-            }
-
-            let mut value_start = colon_idx + 1;
-            let mut value_end = line.len();
-            if let Some(start) = pretrim_start {
-                value_start = start.min(line.len());
-                value_end = match pretrim_end {
-                    Some(end) => end.min(line.len()),
-                    None => line.len(),
-                };
-            } else {
-                while value_start < line.len() && (line[value_start] == b' ' || line[value_start] == b'\t') {
-                    value_start += 1;
-                }
-                while value_end > value_start && (line[value_end - 1] == b' ' || line[value_end - 1] == b'\t') {
-                    value_end -= 1;
-                }
-            }
-            let Some(raw) = line.get(value_start..value_end) else {
-                return Err(sark_core::error::Error::BadRequest("Invalid header value".into()));
-            };
-            match action {
-                #( #action_arms )*
-                #action_enum::Unknown => Ok(()),
-            }
-        })
-    }
-
     pub(crate) fn contiguous(&self) -> Result<TokenStream> {
         let plan = &self.plan;
-        let cfg = self.config;
-        let skip_value = matches!(cfg.value, HeaderValueMode::Skip);
-        let skip_apply = matches!(cfg.apply, HeaderApplyMode::Skip);
-        if plan.is_empty() && !skip_value {
-            return Ok(quote! {
-                return sark::sark_core::http::head::WellKnownHeaders::new(scan, flags).apply_contiguous(
-                    rest,
-                    &mut (),
-                    header_count,
-                    max_header_count,
-                );
-            });
-        }
         let raw = format_ident!("__raw");
         let name_valid = self.header_name_valid(&raw);
         if plan.custom.iter().any(|field| field.bytes.len() < 4) {
@@ -711,65 +503,151 @@ impl HeaderEmitter {
             ));
         }
 
-        let count_tail = quote! {
+        let max_header_line_bytes = quote!(sark::sark_core::http::head::MAX_HEADER_LINE_BYTES);
+        let line_too_long = quote! {
+            return Err(sark::error::Error::BadRequest(
+                "Header line too long".into(),
+            ));
+        };
+        let capped_rest = quote! {
+            let __capped = if rest.len() > #max_header_line_bytes {
+                &rest[..#max_header_line_bytes]
+            } else {
+                rest
+            };
+        };
+        let count_header = quote! {
             if *header_count >= max_header_count {
                 return Err(sark::error::Error::BadRequest("Too many headers".into()));
             }
             *header_count += 1;
         };
+        let count_tail = quote! {
+            if colon_idx + 1 + tail_end
+                > #max_header_line_bytes
+            {
+                #line_too_long
+            }
+            #count_header
+        };
+        let scan_value = quote! {
+            #capped_rest
+            let __line_end = match sark::sark_core::http::scan::scan_header_value(
+                __capped,
+                colon_idx + 1,
+            ) {
+                sark::sark_core::http::scan::HeaderValueOutcome::Found { pos } => pos,
+                sark::sark_core::http::scan::HeaderValueOutcome::Invalid => {
+                    return Err(sark::error::Error::BadRequest(
+                        "Invalid header value".into(),
+                    ));
+                }
+                sark::sark_core::http::scan::HeaderValueOutcome::None
+                    if rest.len() > #max_header_line_bytes =>
+                {
+                    #line_too_long
+                }
+                sark::sark_core::http::scan::HeaderValueOutcome::None => {
+                    return Ok(None);
+                }
+            };
+        };
         let trim_contig = quote! {
+            let __limit = rest.len().min(#max_header_line_bytes);
             let mut __value_idx = colon_idx + 1;
-            while __value_idx < rest.len() && (rest[__value_idx] == b' ' || rest[__value_idx] == b'\t') {
+            while __value_idx < __limit
+                && (rest[__value_idx] == b' ' || rest[__value_idx] == b'\t')
+            {
                 __value_idx += 1;
             }
             let value_start = __value_idx - (colon_idx + 1);
             let mut value_end = value_start;
             loop {
-                if __value_idx >= rest.len() {
+                if __value_idx >= __limit {
+                    if rest.len() > #max_header_line_bytes {
+                        #line_too_long
+                    }
                     return Ok(None);
                 }
-                let __b = rest[__value_idx];
-                if __b == b'\r' {
+                let __byte = rest[__value_idx];
+                if __byte == b'\r' {
                     if __value_idx + 1 >= rest.len() {
                         return Ok(None);
                     }
                     if rest[__value_idx + 1] != b'\n' {
-                        return Err(sark::error::Error::BadRequest("Invalid header value".into()));
+                        return Err(sark::error::Error::BadRequest(
+                            "Invalid header value".into(),
+                        ));
                     }
                     break;
                 }
-                if __b == b'\n' {
-                    return Err(sark::error::Error::BadRequest("Invalid header value".into()));
+                if (__byte < 0x20 && __byte != b'\t') || __byte == 0x7f {
+                    return Err(sark::error::Error::BadRequest(
+                        "Invalid header value".into(),
+                    ));
                 }
-                if __b != b' ' && __b != b'\t' {
+                if __byte != b' ' && __byte != b'\t' {
                     value_end = __value_idx + 1 - (colon_idx + 1);
                 }
                 __value_idx += 1;
             }
             let tail_end = __value_idx - (colon_idx + 1);
         };
-        let unknown_dispatch = quote! {
-            return sark::sark_core::http::head::WellKnownHeaders::new(scan, flags)
-                .apply_unknown_contiguous(
-                    rest,
-                    colon_idx,
-                    &mut (),
-                    header_count,
-                    max_header_count,
-                );
+        let unknown_value = quote! {
+            #scan_value
+            #count_header
+            return Ok(Some(__line_end));
         };
+        let unknown_dispatch = unknown_value.clone();
         let unknown_miss = quote! {
-            return sark::sark_core::http::head::WellKnownHeaders::new(scan, flags).apply_unknown_contiguous(
-                rest,
-                idx,
-                &mut (),
-                header_count,
-                max_header_count,
-            );
+            #capped_rest
+            let (name_end, name_term) =
+                match sark::sark_core::http::scan::scan_header_name(__capped, idx) {
+                    sark::sark_core::http::scan::HeaderNameOutcome::Found {
+                        pos,
+                        byte,
+                    } => (pos, byte),
+                    sark::sark_core::http::scan::HeaderNameOutcome::Invalid => {
+                        return Err(sark::error::Error::BadRequest(
+                            "Invalid header name".into(),
+                        ));
+                    }
+                    sark::sark_core::http::scan::HeaderNameOutcome::None
+                        if rest.len() > #max_header_line_bytes =>
+                    {
+                        #line_too_long
+                    }
+                    sark::sark_core::http::scan::HeaderNameOutcome::None => {
+                        return Ok(None);
+                    }
+            };
+            if name_term != b':' {
+                if name_end + 1 >= __capped.len() {
+                    return if rest.len() > #max_header_line_bytes {
+                        Err(sark::error::Error::BadRequest(
+                            "Header line too long".into(),
+                        ))
+                    } else {
+                        Ok(None)
+                    };
+                }
+                if __capped[name_end + 1] == b'\n' && name_end == 0 {
+                    return Ok(Some(0));
+                }
+                return Err(sark::error::Error::BadRequest(
+                    "Invalid header name".into(),
+                ));
+            }
+            if name_end == 0 {
+                return Err(sark::error::Error::BadRequest(
+                    "Invalid header name".into(),
+                ));
+            }
+            let colon_idx = name_end;
+            #unknown_value
         };
         let mut action_specs = Vec::new();
         for field in &plan.custom {
-            let action = format_ident!("Custom{}", field.slot);
             let raw_expr = quote! {
                 rest.get(colon_idx + 1 + value_start..colon_idx + 1 + value_end)
                     .ok_or_else(|| sark::error::Error::BadRequest("Invalid header value".into()))?
@@ -777,45 +655,66 @@ impl HeaderEmitter {
             let abs_start = quote! { line_start + colon_idx + 1 + value_start };
             let abs_end = quote! { line_start + colon_idx + 1 + value_end };
             let assign = field.assignment(raw_expr, abs_start, abs_end);
-            let maybe_assign = if skip_apply {
-                TokenStream::new()
-            } else {
-                quote! { #assign }
-            };
-            let body = if skip_value {
-                unknown_dispatch.clone()
-            } else {
-                quote! {{
+            action_specs.push(ActionSpec {
+                bytes: field.bytes.clone(),
+                body: quote! {{
                     #trim_contig
                     #count_tail
                     let _ = (value_start, value_end);
-                    #maybe_assign
+                    #assign
                     return Ok(Some(colon_idx + 1 + tail_end));
-                }}
-            };
-            action_specs.push(ActionSpec {
-                variant: action.clone(),
-                bytes: field.bytes.clone(),
-                body,
+                }},
             });
         }
 
+        let specialize_ignored = plan.custom.len() < 8;
         for (idx, known) in KNOWN_HEADERS.iter().enumerate() {
-            let capture = plan.known[idx].clone();
-            let action = format_ident!("Known{}", known.suffix());
-            let body = if skip_value {
+            let capture = plan.known[idx].as_ref();
+            let semantic = known.mandatory() || self.full || capture.is_some();
+            let body = if semantic {
+                known.build_contig_arm(capture, &count_tail)
+            } else if *known == KnownKind::AcceptEncoding {
+                let semantic_body = known.build_contig_arm(None, &count_tail);
+                quote! {{
+                    if __PARSE_ACCEPT_ENCODING {
+                        #semantic_body
+                    }
+                    #unknown_dispatch
+                }}
+            } else if specialize_ignored {
                 unknown_dispatch.clone()
             } else {
-                known.build_contig_arm(capture.as_ref(), &count_tail, skip_apply)
+                continue;
             };
             action_specs.push(ActionSpec {
-                variant: action,
                 bytes: known.bytes().to_vec(),
                 body,
             });
         }
 
+        for bytes in [b"accept".as_slice(), b"user-agent".as_slice()] {
+            if plan.custom.iter().any(|field| field.bytes == bytes) {
+                continue;
+            }
+            action_specs.push(ActionSpec {
+                bytes: bytes.to_vec(),
+                body: unknown_dispatch.clone(),
+            });
+        }
+
         let prefix_detect = self.prefix_cases(&action_specs, &unknown_miss);
+        let short_dispatch: Vec<TokenStream> = action_specs
+            .iter()
+            .map(|spec| {
+                let matches = BytesMatch::Folded.emit(&format_ident!("__name"), &spec.bytes);
+                let body = &spec.body;
+                quote! {
+                    if #matches {
+                        #body
+                    }
+                }
+            })
+            .collect();
 
         Ok(quote! {
             let colon_idx = 'name: {
@@ -860,6 +759,8 @@ impl HeaderEmitter {
                 let __probe_word = u64::from_le_bytes(*__probe);
                 #prefix_detect
             };
+            let __name = &rest[..colon_idx];
+            #( #short_dispatch )*
             #unknown_dispatch
         })
     }
@@ -885,31 +786,5 @@ impl HeaderEmitter {
                         | b'~'
                 )
         }
-    }
-
-    fn action_select(
-        &self,
-        action_enum: &Ident,
-        action_specs: &[ActionSpec],
-        canonical_name: bool,
-    ) -> Vec<TokenStream> {
-        LengthArms::collect(action_specs.iter().map(|spec| {
-            let lit = LitByteStr::new(spec.bytes.as_slice(), Span::call_site());
-            let variant = &spec.variant;
-            let cond = if canonical_name {
-                quote! { name.eq_ignore_ascii_case(#lit) }
-            } else {
-                quote! { name == #lit }
-            };
-            (
-                spec.bytes.len(),
-                quote! {
-                    if #cond {
-                        action = #action_enum::#variant;
-                    }
-                },
-            )
-        }))
-        .emit()
     }
 }

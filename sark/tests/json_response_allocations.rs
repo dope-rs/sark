@@ -3,8 +3,10 @@ use std::cell::Cell;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use http::StatusCode;
-use o3::buffer::{Bytes, Retained, Shared};
+use o3::buffer::{Borrowed, ByteSink, Bytes, CapacityError, Retained, Shared, SliceWriter};
+use sark::http::{EncodedBody, EncodedResponse};
 use sark::json::{JsonEncode, Write};
+use sark::service::manifold::NativeResponse;
 
 struct CountingAllocator;
 
@@ -16,6 +18,34 @@ thread_local! {
 
 #[global_allocator]
 static ALLOCATOR: CountingAllocator = CountingAllocator;
+
+struct RawBody<'req> {
+    key: Bytes<Borrowed<'req>>,
+    nonce: Bytes<Borrowed<'req>>,
+}
+
+impl EncodedBody for RawBody<'_> {
+    type Error = CapacityError;
+
+    fn encoded_len(&self) -> usize {
+        self.key.len() + 1 + self.nonce.len()
+    }
+
+    fn encode_into(&self, out: &mut [u8]) -> Result<(), Self::Error> {
+        let key = self.key.as_slice();
+        let nonce = self.nonce.as_slice();
+        SliceWriter::new(out).write_slices([key, b":", nonce])
+    }
+}
+
+#[sark_gen::response(encoded)]
+#[header("content-type", "text/plain")]
+struct RawReply<'req> {
+    status: StatusCode,
+    body: RawBody<'req>,
+    #[header("x-key")]
+    key: Bytes<Borrowed<'req>>,
+}
 
 unsafe impl GlobalAlloc for CountingAllocator {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
@@ -42,6 +72,32 @@ fn count_allocation() {
     if TRACK_ALLOCATIONS.try_with(Cell::get).unwrap_or(false) {
         ALLOCATIONS.fetch_add(1, Ordering::Relaxed);
     }
+}
+
+#[test]
+fn encoded_response_writes_a_borrowed_body_without_allocating() {
+    let key = Bytes::<Borrowed<'_>>::from(&b"alpha"[..]);
+    let nonce = Bytes::<Borrowed<'_>>::from(&b"42"[..]);
+    let response = RawReply {
+        status: StatusCode::OK,
+        body: RawBody { key, nonce },
+        key,
+    }
+    .into_fixed();
+    let response: EncodedResponse<'_, RawBody<'_>, 1, _> =
+        NativeResponse::into_route_response(response);
+
+    TRACK_ALLOCATIONS.with(|tracking| tracking.set(true));
+    let before = ALLOCATIONS.load(Ordering::Relaxed);
+    let mut out = [0u8; 512];
+    let written = response
+        .write_into_slice(&mut out, b"Thu, 01 Jan 1970 00:00:00 GMT")
+        .expect("response fits");
+    let after = ALLOCATIONS.load(Ordering::Relaxed);
+    TRACK_ALLOCATIONS.with(|tracking| tracking.set(false));
+
+    assert_eq!(after, before);
+    assert!(out[..written].ends_with(b"alpha:42"));
 }
 
 #[sark_gen::json(encode)]
@@ -96,8 +152,8 @@ impl JsonEncode for Counted {
         2
     }
 
-    fn write_into<W: Write>(&self, writer: &mut W) {
-        writer.put(b"{}");
+    fn write_into<W: Write>(&self, writer: &mut W) -> Result<(), W::Error> {
+        writer.put(b"{}")
     }
 }
 

@@ -8,9 +8,10 @@ use cartel_core::ArenaLane;
 use dope::{
     driver::token::Token,
     manifold::{connector, timer::Timer},
-    runtime::{Idle, StorageFactory},
+    runtime::{dispatcher::Idle, executor::StorageFactory},
 };
-use dope_fiber::WaitQueue;
+use dope_fiber::raw::task::Context;
+use dope_fiber::raw::wait::{WaitQueue, Waiter};
 use o3::{
     buffer::{Lease, Pool as BufferPool, PoolLayout},
     cell::{RegionCell, RegionToken},
@@ -22,9 +23,10 @@ use sark_core::http::{
 };
 
 use crate::connector::{
-    codec::{Codec, Head},
+    codec::{Codec, Emission, Head},
     error::Error,
-    pool::ConnectionPool,
+    pool::{ConnectionPool, ResponsePush},
+    response::ResponseEvent,
     retry::RetryPolicy,
 };
 
@@ -51,11 +53,13 @@ pub enum DecompressionPolicy {
 #[derive(Default)]
 pub struct ConnState {
     pending_close: bool,
+    response_close: bool,
+    keepalive_timeout: Option<Duration>,
 }
 
-impl connector::Lifecycle for ConnState {
-    fn wants_close(&self) -> connector::Close {
-        use dope::manifold::connector::Close;
+impl connector::lifecycle::Lifecycle for ConnState {
+    fn wants_close(&self) -> connector::lifecycle::Close {
+        use dope::manifold::connector::lifecycle::Close;
         if self.pending_close {
             Close::Reconnect
         } else {
@@ -75,7 +79,7 @@ impl connector::Lifecycle for ConnState {
 pub struct Shared<'d> {
     pool: ConnectionPool<'d>,
     active_waiters: Pin<Box<WaitQueue>>,
-    gunzip: RegionCell<'d, Gunzip>,
+    pub(super) gunzip: RegionCell<'d, Gunzip>,
     pub(super) host: String,
     pub(super) origin: http::Uri,
     pub(super) decompression: DecompressionPolicy,
@@ -100,8 +104,8 @@ impl<'d> Shared<'d> {
 
     pub(super) fn try_register_active(
         &self,
-        waiter: Pin<&dope_fiber::Waiter<'d>>,
-        context: Pin<&dope_fiber::Context<'_, 'd>>,
+        waiter: Pin<&Waiter<'d>>,
+        context: Pin<&Context<'_, 'd>>,
     ) -> bool {
         self.active_waiters.as_ref().try_register(waiter, context)
     }
@@ -115,13 +119,21 @@ impl<'d> Shared<'d> {
         &self,
         token: &mut RegionToken<'d>,
         conn_id: Token,
-        outcome: Outcome,
-        bytes: usize,
+        push: ResponsePush,
+    ) -> bool {
+        let pushed = self.pool.push_response(token, conn_id, push);
+        self.wake();
+        pushed
+    }
+
+    fn complete_response(
+        &self,
+        token: &mut RegionToken<'d>,
+        conn_id: Token,
         keepalive: Option<Duration>,
         now: Instant,
     ) {
-        self.pool
-            .push_response(token, conn_id, outcome, bytes, keepalive, now);
+        self.pool.complete_response(token, conn_id, keepalive, now);
         self.wake();
     }
 
@@ -259,11 +271,12 @@ impl Config {
 }
 
 pub struct Port<'d> {
-    pub(super) io: connector::Port<'d, Lease<'d>>,
+    pub(super) io: connector::port::Port<'d, Lease<'d>>,
     pub(super) shared: Shared<'d>,
-    codec: Codec,
+    pub(super) codec: Codec,
     timer: Timer<'d>,
-    pub(super) requests: Pin<Box<BufferPool>>,
+    pub(super) requests: BufferPool,
+    egress: dope_net::link::egress::storage::Storage,
 }
 
 pub struct PortFactory {
@@ -311,11 +324,13 @@ impl<'d> Port<'d> {
             request_slots: _,
             request_capacity: _,
         } = config;
+        let max_response_body = codec.max_response_body;
         let shared = Shared {
             pool: ConnectionPool::new(
                 capacity,
                 max_inflight_per_connection,
                 response_buffer_capacity,
+                max_response_body,
             ),
             active_waiters: Box::pin(WaitQueue::with_capacity(timer_capacity)),
             gunzip: RegionCell::new(Gunzip::new()),
@@ -328,16 +343,21 @@ impl<'d> Port<'d> {
             request_timeout,
         };
         Self {
-            io: connector::Port::with_capacity(capacity, driver),
+            io: connector::port::Port::with_capacity(capacity, driver),
             shared,
             codec,
             timer: Timer::with_capacity(timer_capacity, driver),
-            requests: Box::pin(BufferPool::new(request_pool)),
+            requests: BufferPool::from_layout(request_pool),
+            egress: dope_net::link::egress::storage::Storage::default(),
         }
     }
 
     pub fn capacity(&self) -> usize {
         self.io.capacity()
+    }
+
+    pub fn egress(&self) -> &dope_net::link::egress::storage::Storage {
+        &self.egress
     }
 
     pub fn factory(
@@ -384,65 +404,68 @@ impl<'d> Session<'d> {
 }
 
 #[dope_gen::connector_session(codec = port.codec, io = port.io)]
-impl<'d> connector::Session<'d> for Session<'d> {
+impl<'d> connector::session::Session<'d> for Session<'d> {
     type Codec = Codec;
     type ConnState = ConnState;
     type Send = Lease<'d>;
 
-    fn connect(&mut self, ctx: &mut connector::Ctx<'_, 'd, Self>) {
+    fn connect(&mut self, ctx: &mut connector::session::Ctx<'_, '_, 'd, Self>) {
         self.port
             .shared
             .note_connect(ctx.region, ctx.conn_id, Instant::now());
     }
 
-    fn response(&mut self, head: Head, ctx: &mut connector::Ctx<'_, 'd, Self>) {
-        let Head { response, buffered } = head;
-        let mut response = match response {
-            Ok(response) => response,
-            Err(reason) => {
-                self.port.shared.push_response(
-                    ctx.region,
-                    ctx.conn_id,
-                    Err(Error::Parse(reason)),
-                    buffered,
-                    None,
-                    Instant::now(),
-                );
-                ctx.state.pending_close = true;
-                return;
+    fn response(&mut self, head: Head, ctx: &mut connector::session::Ctx<'_, '_, 'd, Self>) {
+        let Head {
+            first,
+            second,
+            complete,
+        } = head;
+        for emission in [&first, &second].into_iter().flatten() {
+            match &emission.event {
+                Ok(ResponseEvent::Head(response)) => {
+                    ctx.state.response_close = !Self::should_keep_alive(response.as_response());
+                    ctx.state.keepalive_timeout = Self::keepalive_timeout(response.as_response());
+                }
+                Err(_) => ctx.state.response_close = true,
+                _ => {}
             }
-        };
-        let keep_alive = Self::should_keep_alive(&response);
-        let keepalive_timeout = Self::keepalive_timeout(&response);
-        let outcome = {
-            let gunzip = self.port.shared.gunzip.borrow_mut(ctx.region);
-            match Self::decompress(
-                gunzip,
-                &mut response,
-                self.port.shared.decompression,
-                self.port.codec.max_response_body,
-            ) {
-                Ok(()) => Ok(response),
-                Err(error) => Err(error),
-            }
-        };
-        if !keep_alive {
-            ctx.state.pending_close = true;
         }
-        let buffered = outcome
-            .as_ref()
-            .map_or(buffered, |response| buffered.max(response.body().len()));
-        self.port.shared.push_response(
-            ctx.region,
-            ctx.conn_id,
-            outcome,
-            buffered,
-            keepalive_timeout,
-            Instant::now(),
-        );
+
+        let mut emissions = [first, second].into_iter().flatten().peekable();
+        let mut pushed_any = false;
+        while let Some(emission) = emissions.next() {
+            pushed_any = true;
+            let terminal = complete && emissions.peek().is_none();
+            if !self.push_emission(emission, terminal, ctx) {
+                ctx.state.pending_close = true;
+                if !terminal {
+                    self.port.shared.complete_response(
+                        ctx.region,
+                        ctx.conn_id,
+                        ctx.state.keepalive_timeout.take(),
+                        Instant::now(),
+                    );
+                }
+                break;
+            }
+        }
+        if complete && !pushed_any {
+            self.port.shared.complete_response(
+                ctx.region,
+                ctx.conn_id,
+                ctx.state.keepalive_timeout.take(),
+                Instant::now(),
+            );
+        }
+        if complete {
+            ctx.state.pending_close |= ctx.state.response_close;
+            ctx.state.response_close = false;
+            ctx.state.keepalive_timeout = None;
+        }
     }
 
-    fn disconnect(&mut self, ctx: &mut connector::Ctx<'_, 'd, Self>) {
+    fn disconnect(&mut self, ctx: &mut connector::session::Ctx<'_, '_, 'd, Self>) {
         self.port.io.deactivate(ctx.conn_id);
         self.port.shared.close_connection(ctx.region, ctx.conn_id);
         ctx.state.pending_close = false;
@@ -457,7 +480,32 @@ impl<'d> connector::Session<'d> for Session<'d> {
     }
 }
 
-impl Session<'_> {
+impl<'d> Session<'d> {
+    fn push_emission(
+        &self,
+        emission: Emission,
+        complete: bool,
+        ctx: &mut connector::session::Ctx<'_, '_, 'd, Self>,
+    ) -> bool {
+        let outcome = emission.event.map_err(Error::Parse);
+        let parse_error = outcome.is_err();
+        let pushed = self.port.shared.push_response(
+            ctx.region,
+            ctx.conn_id,
+            ResponsePush {
+                outcome,
+                bytes: emission.bytes,
+                complete,
+                keepalive: ctx.state.keepalive_timeout,
+                now: Instant::now(),
+            },
+        );
+        if parse_error {
+            ctx.state.pending_close = true;
+        }
+        pushed
+    }
+
     fn should_keep_alive(resp: &Response) -> bool {
         use http::header::{CONNECTION, CONTENT_LENGTH, TRANSFER_ENCODING};
         let headers = resp.headers();
@@ -493,7 +541,7 @@ impl Session<'_> {
         None
     }
 
-    fn decompress(
+    pub(super) fn decompress(
         gunzip: &mut Gunzip,
         resp: &mut Response,
         policy: DecompressionPolicy,

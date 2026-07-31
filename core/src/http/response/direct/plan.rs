@@ -1,7 +1,7 @@
 use http::StatusCode;
 use o3::buffer::{Borrowed, Bytes, Retained, Shared};
 
-use super::super::{Body, HotBodyInner, HotHeadInner, MonoResponseInner, TextBody};
+use super::super::{Body, HotHeadInner, MonoResponseInner};
 use super::head::HeadInner;
 use super::headers::{HeaderNameToken, HeaderStaticValueToken, Headers};
 use super::value::InlineHeaderValue;
@@ -114,20 +114,7 @@ impl<'req> ResponsePlan<'req> {
             status,
             headers: None,
             head: HotHeadInner::Direct(self.head),
-            body: HotBodyInner::from(body.into()),
-        }
-    }
-
-    pub fn respond_text<T>(self, body: T) -> MonoResponseInner<'req>
-    where
-        T: Into<TextBody<'req>>,
-    {
-        let status = self.status;
-        MonoResponseInner {
-            status,
-            headers: None,
-            head: HotHeadInner::Direct(self.head),
-            body: HotBodyInner::Text(body.into()),
+            body: body.into(),
         }
     }
 }

@@ -74,14 +74,14 @@ impl<'req> Ref<'req> {
         if absolute.end > self.head.len() {
             return None;
         }
-        Some(Bytes::<Borrowed<'req>>::from(self.head).slice(absolute))
+        Bytes::<Borrowed<'req>>::from(self.head).get(absolute)
     }
 
     pub fn frame_at(&self, range: Range<usize>) -> Option<Bytes<Borrowed<'req>>> {
         if range.start > range.end || range.end > self.head.len() {
             return None;
         }
-        Some(Bytes::<Borrowed<'req>>::from(self.head).slice(range))
+        Bytes::<Borrowed<'req>>::from(self.head).get(range)
     }
 
     pub fn body_frame(&self) -> Bytes<Borrowed<'req>> {

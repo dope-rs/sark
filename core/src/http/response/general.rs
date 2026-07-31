@@ -4,7 +4,7 @@ use http::{HeaderName, HeaderValue, StatusCode};
 use o3::buffer::Shared;
 use serde::Serialize;
 
-use super::{Body, FixedResponse, HeaderList, MonoResponseInner};
+use super::{Body, FixedResponse, HeaderList, MonoResponseInner, StaticHeaders};
 
 #[derive(Clone)]
 pub struct Response {
@@ -194,14 +194,17 @@ impl<const N: usize> From<MonoResponseInner<'static, N>> for Response {
             status: response.status,
             headers: response.headers.map(|h| *h).unwrap_or_default(),
             wire_headers: response.head.into_bytes().as_ref().to_vec(),
-            body: Body::from(response.body),
+            body: response.body,
             chunked_parts: None,
         }
     }
 }
 
-impl<const N: usize> From<FixedResponse<'static, N>> for Response {
-    fn from(response: FixedResponse<'static, N>) -> Self {
+impl<const N: usize, H> From<FixedResponse<'static, N, H>> for Response
+where
+    H: StaticHeaders,
+{
+    fn from(response: FixedResponse<'static, N, H>) -> Self {
         Self {
             status: response.status,
             headers: HeaderList::new(),

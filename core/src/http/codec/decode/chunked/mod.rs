@@ -1,7 +1,7 @@
 use http::{HeaderName, HeaderValue};
 
 use crate::error::{Error, Result};
-use crate::http::codec::ParsedRequestHead;
+use crate::http::codec::request_head_end;
 
 const MAX_BODY_SIZE: usize = 100 * 1024 * 1024;
 const MAX_TRAILER_COUNT: usize = 128;
@@ -44,6 +44,7 @@ pub enum DecodeEvent<'a> {
 enum State {
     SizeLine,
     Data(usize),
+    DataEnd,
     Trailers,
     Done,
 }
@@ -93,7 +94,12 @@ impl BodyDecoder {
                     };
                     let chunk_size = parse_chunk_size(size_bytes)?;
 
-                    if chunk_size > self.max_body || self.body_len + chunk_size > self.max_body {
+                    if chunk_size > self.max_body
+                        || self
+                            .body_len
+                            .checked_add(chunk_size)
+                            .is_none_or(|total| total > self.max_body)
+                    {
                         return Err(Error::PayloadTooLarge(
                             "Chunked body exceeds size limit".into(),
                         ));
@@ -103,23 +109,34 @@ impl BodyDecoder {
                     if chunk_size == 0 {
                         self.state = State::Trailers;
                     } else {
+                        self.body_len += chunk_size;
                         self.state = State::Data(chunk_size);
                     }
                 }
-                State::Data(chunk_size) => {
-                    if buf.len() < pos + chunk_size + 2 {
+                State::Data(remaining) => {
+                    let available = buf.len().saturating_sub(pos);
+                    if available == 0 {
                         return Ok((pos, DecodeEvent::NeedMore));
                     }
-
-                    let chunk = &buf[pos..pos + chunk_size];
-                    if &buf[pos + chunk_size..pos + chunk_size + 2] != b"\r\n" {
+                    let take = remaining.min(available);
+                    let chunk = &buf[pos..pos + take];
+                    pos += take;
+                    self.state = if take == remaining {
+                        State::DataEnd
+                    } else {
+                        State::Data(remaining - take)
+                    };
+                    return Ok((pos, DecodeEvent::Chunk(chunk)));
+                }
+                State::DataEnd => {
+                    if buf.len() < pos + 2 {
+                        return Ok((pos, DecodeEvent::NeedMore));
+                    }
+                    if &buf[pos..pos + 2] != b"\r\n" {
                         return Err(Error::BadRequest("Invalid chunk terminator".into()));
                     }
-
-                    pos += chunk_size + 2;
-                    self.body_len += chunk_size;
+                    pos += 2;
                     self.state = State::SizeLine;
-                    return Ok((pos, DecodeEvent::Chunk(chunk)));
                 }
                 State::Trailers => match Self::parse_trailers(&buf[pos..])? {
                     Some((trailers, consumed)) => {
@@ -186,7 +203,7 @@ impl BodyDecoder {
             return Ok(Some((Vec::new(), 2)));
         }
 
-        let end = match ParsedRequestHead::head_end(buf) {
+        let end = match request_head_end(buf) {
             Some(range) => range.end,
             None => return Ok(None),
         };

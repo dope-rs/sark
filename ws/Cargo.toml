@@ -8,14 +8,18 @@ repository.workspace = true
 license.workspace = true
 
 [dependencies]
+sark.workspace = true
 sark-core.workspace = true
+sark-gen.workspace = true
 dope.workspace = true
 dope-net.workspace = true
 dope-fiber.workspace = true
-dope-extra.workspace = true
 dope-gen.workspace = true
 o3.workspace = true
 pin-project.workspace = true
 getrandom = "0.4"
 rand_chacha = "0.10"
 rand_core = "0.10"
+
+[dev-dependencies]
+dope-test.workspace = true

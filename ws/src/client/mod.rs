@@ -4,16 +4,23 @@ use dope::{
     driver::token::Token,
     manifold::{
         connector::{
-            self, Connector,
+            self,
+            port::{Port as ConnectorPort, Sender},
+            session::{Connector, Ctx},
             source::Dialer,
-            state::{IOV_CAP, Queue},
+            state::IOV_CAP,
         },
         env::Env,
     },
-    runtime::StorageFactory,
+    runtime::executor::StorageFactory,
 };
-use dope_fiber::{Fiber, WaitQueue, poll_fn};
+use dope_fiber::abi::Fiber;
+use dope_fiber::abi::pollfn::PollFn;
+use dope_fiber::raw::task::Context;
+use dope_fiber::raw::wait::{WaitQueue, Waiter};
+use dope_fiber::wait::WaitFn;
 use dope_net::Transport;
+use dope_net::link::egress::queue::Queue;
 use o3::buffer::Shared;
 
 use self::masking::MaskSequence;
@@ -56,20 +63,20 @@ pub trait Handler {
     }
 
     fn open(&mut self, _conn_id: Token) {}
-    fn open_send(&mut self, conn_id: Token, _send: &mut SendCtx<'_>) {
+    fn open_send(&mut self, conn_id: Token, _send: &mut SendCtx<'_, '_>) {
         self.open(conn_id);
     }
     fn message(&mut self, _conn_id: Token, _msg: Message) {}
     fn close(&mut self, _conn_id: Token) {}
 }
 
-pub struct SendCtx<'a> {
-    sink: &'a mut Queue<IOV_CAP>,
+pub struct SendCtx<'a, 'pool> {
+    sink: Queue<'a, 'pool, IOV_CAP>,
     rng: &'a MaskSequence,
     max_frame_payload: usize,
 }
 
-impl SendCtx<'_> {
+impl SendCtx<'_, '_> {
     pub fn text(&mut self, payload: &[u8]) -> Result<(), Error> {
         self.message(0x1, payload)
     }
@@ -92,7 +99,7 @@ impl SendCtx<'_> {
 
     fn message(&mut self, opcode: u8, payload: &[u8]) -> Result<(), Error> {
         FrameEncoder::new(self.rng).enqueue(
-            self.sink,
+            &mut self.sink,
             opcode,
             payload,
             self.max_frame_payload.max(1),
@@ -104,7 +111,13 @@ impl SendCtx<'_> {
         if payload.len() > 125 {
             return Err(Error::MessageTooLarge);
         }
-        FrameEncoder::new(self.rng).enqueue(self.sink, opcode, payload, payload.len().max(1), true)
+        FrameEncoder::new(self.rng).enqueue(
+            &mut self.sink,
+            opcode,
+            payload,
+            payload.len().max(1),
+            true,
+        )
     }
 }
 
@@ -199,9 +212,9 @@ pub struct ConnState {
     closing: bool,
 }
 
-impl connector::Lifecycle for ConnState {
-    fn wants_close(&self) -> connector::Close {
-        use dope::manifold::connector::Close;
+impl connector::lifecycle::Lifecycle for ConnState {
+    fn wants_close(&self) -> connector::lifecycle::Close {
+        use dope::manifold::connector::lifecycle::Close;
         if self.closing {
             Close::Reconnect
         } else {
@@ -234,7 +247,7 @@ impl Codec {
     }
 }
 
-impl connector::Codec for Codec {
+impl connector::codec::Codec for Codec {
     type Head = Head;
     type ParseState = State;
 
@@ -251,9 +264,9 @@ impl Codec {
     fn parse_handshake_response(buf: &Shared, state: &mut State) -> Option<(Head, usize)> {
         use std::str::from_utf8;
 
-        use sark_core::http::codec::ParsedRequestHead;
+        use sark_core::http::codec::request_head_end;
         let bytes = buf.as_slice();
-        let head_len = ParsedRequestHead::head_end(bytes)?.end;
+        let head_len = request_head_end(bytes)?.end;
         let head = from_utf8(&bytes[..head_len]).ok()?;
 
         let status_ok = head.starts_with("HTTP/1.1 101");
@@ -288,7 +301,7 @@ impl Codec {
         let opcode = head.opcode;
         let fin = head.fin;
         let consumed = head.payload_end;
-        let payload = buf.slice(head.payload_start..head.payload_end);
+        let payload = buf.get(head.payload_start..head.payload_end)?;
 
         if opcode >= 0x8 {
             if !fin || payload.len() > 125 {
@@ -351,8 +364,8 @@ impl SharedState {
 
     fn try_register_active<'d>(
         &self,
-        waiter: Pin<&dope_fiber::Waiter<'d>>,
-        context: Pin<&dope_fiber::Context<'_, 'd>>,
+        waiter: Pin<&Waiter<'d>>,
+        context: Pin<&Context<'_, 'd>>,
     ) -> bool {
         self.active_waiters.as_ref().try_register(waiter, context)
     }
@@ -361,7 +374,8 @@ impl SharedState {
 pub struct Port<'d> {
     codec: Codec,
     shared: SharedState,
-    io: connector::Port<'d, Shared>,
+    io: ConnectorPort<'d, Shared>,
+    egress: dope_net::link::egress::storage::Storage,
 }
 
 pub struct PortFactory {
@@ -380,12 +394,17 @@ impl<'d> Port<'d> {
         Self {
             codec: Codec { config },
             shared: SharedState::new(waiter_capacity),
-            io: connector::Port::with_capacity(capacity, driver),
+            io: ConnectorPort::with_capacity(capacity, driver),
+            egress: dope_net::link::egress::storage::Storage::default(),
         }
     }
 
     pub fn capacity(&self) -> usize {
         self.io.capacity()
+    }
+
+    pub fn egress(&self) -> &dope_net::link::egress::storage::Storage {
+        &self.egress
     }
 
     pub fn factory(config: Config, capacity: usize, waiter_capacity: usize) -> PortFactory {
@@ -422,12 +441,12 @@ impl<'d, H: Handler> Session<'d, H> {
 }
 
 #[dope_gen::connector_session(codec = port.codec, io = port.io)]
-impl<'d, H: Handler> connector::Session<'d> for Session<'d, H> {
+impl<'d, H: Handler> connector::session::Session<'d> for Session<'d, H> {
     type Codec = Codec;
     type ConnState = ConnState;
     type Send = Shared;
 
-    fn connect(&mut self, ctx: &mut connector::Ctx<'_, 'd, Self>) {
+    fn connect(&mut self, ctx: &mut Ctx<'_, '_, 'd, Self>) {
         let state = &mut *ctx.state;
         let out = &mut ctx.sink;
         let mut key_raw = [0u8; 16];
@@ -463,7 +482,7 @@ impl<'d, H: Handler> connector::Session<'d> for Session<'d, H> {
         }
     }
 
-    fn response(&mut self, head: Head, ctx: &mut connector::Ctx<'_, 'd, Self>) {
+    fn response(&mut self, head: Head, ctx: &mut Ctx<'_, '_, 'd, Self>) {
         let conn_id = ctx.conn_id;
         let state = &mut *ctx.state;
         match head {
@@ -472,7 +491,7 @@ impl<'d, H: Handler> connector::Session<'d> for Session<'d, H> {
                     self.port.shared.conn_id.set(Some(conn_id));
                     self.port.shared.wake();
                     let mut send = SendCtx {
-                        sink: ctx.sink,
+                        sink: ctx.sink.reborrow(),
                         rng: &self.port.shared.rng,
                         max_frame_payload: self.port.codec.config.max_outbound_frame_payload,
                     };
@@ -489,7 +508,7 @@ impl<'d, H: Handler> connector::Session<'d> for Session<'d, H> {
             Head::Frame(msg) => {
                 if let Message::Ping(ref payload) = msg {
                     let mut send = SendCtx {
-                        sink: ctx.sink,
+                        sink: ctx.sink.reborrow(),
                         rng: &self.port.shared.rng,
                         max_frame_payload: self.port.codec.config.max_outbound_frame_payload,
                     };
@@ -507,7 +526,7 @@ impl<'d, H: Handler> connector::Session<'d> for Session<'d, H> {
         }
     }
 
-    fn disconnect(&mut self, ctx: &mut connector::Ctx<'_, 'd, Self>) {
+    fn disconnect(&mut self, ctx: &mut Ctx<'_, '_, 'd, Self>) {
         self.port.io.deactivate(ctx.conn_id);
         self.port.shared.conn_id.set(None);
         self.port.shared.wake();
@@ -594,7 +613,7 @@ where
 {
     fn wait_active<'b>(&'b self) -> impl Fiber<'d, Output = Result<(), Error>> + 'b {
         let handle = *self;
-        dope_fiber::wait_fn(move |cx, waiter| {
+        WaitFn::new(move |cx, waiter| {
             let shared = &handle.port.shared;
             if shared.conn_id.get().is_some() {
                 return Poll::Ready(Ok(()));
@@ -655,7 +674,7 @@ impl<'p, 'd> Outbound<'p, 'd> {
         'p: 'b,
         'd: 'b,
     {
-        poll_fn(move |_cx| {
+        PollFn::new(move |_cx| {
             if CONTROL && payload.len() > 125 {
                 return Poll::Ready(Err(Error::MessageTooLarge));
             }
@@ -751,13 +770,13 @@ trait FrameSink {
     fn push_frame(&mut self, frame: Shared) -> bool;
 }
 
-impl FrameSink for Queue<IOV_CAP> {
+impl FrameSink for Queue<'_, '_, IOV_CAP> {
     fn push_frame(&mut self, frame: Shared) -> bool {
         self.try_enqueue(frame).is_ok()
     }
 }
 
-impl FrameSink for connector::Sender<'_, '_, Shared> {
+impl FrameSink for Sender<'_, '_, Shared> {
     fn push_frame(&mut self, frame: Shared) -> bool {
         self.try_enqueue(frame).is_ok()
     }

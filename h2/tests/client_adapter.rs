@@ -1,9 +1,13 @@
-use dope::manifold::connector::{self, Codec as _, Lifecycle as _};
+mod common;
+
+use common::sid;
+use dope::manifold::connector::{self, codec::Codec as _, lifecycle::Lifecycle as _};
 use dope_net::link::egress;
+use dope_net::link::egress::queue::Queue;
 use o3::buffer::Shared;
 use sark_h2::client::{Codec, ConnState, Handler, Head, Session, State};
 use sark_h2::frame::{self, Flags, GoAway, Settings};
-use sark_h2::{CLIENT_PREFACE, ClientRole, Conn, ErrorCode, FrameHeader, StreamId, conn};
+use sark_h2::{CLIENT_PREFACE, ClientRole, Conn, ErrorCode, FrameHeader, conn};
 
 const ARENA_CAPACITY: u32 = connector::state::IOV_CAP as u32;
 const _: () = assert!(connector::state::IOV_CAP <= u32::MAX as usize);
@@ -26,11 +30,7 @@ impl Handler for CapturingHandler {
 
 fn settings_ack_bytes() -> Vec<u8> {
     let mut out = Vec::new();
-    Settings {
-        ack: true,
-        params: &[],
-    }
-    .encode(&mut out);
+    Settings::new(true, &[]).unwrap().encode(&mut out);
     out
 }
 
@@ -39,33 +39,20 @@ fn settings_bytes(initial_window: u32) -> Vec<u8> {
     payload.extend_from_slice(&4u16.to_be_bytes());
     payload.extend_from_slice(&initial_window.to_be_bytes());
     let mut out = Vec::new();
-    Settings {
-        ack: false,
-        params: &payload,
-    }
-    .encode(&mut out);
+    Settings::new(false, &payload).unwrap().encode(&mut out);
     out
 }
 
 fn goaway_bytes(err: ErrorCode) -> Vec<u8> {
     let mut out = Vec::new();
-    GoAway {
-        last_stream_id: StreamId(0),
-        error: err,
-        debug: b"",
-    }
-    .encode(&mut out);
+    GoAway::new(sid(0), err, b"").unwrap().encode(&mut out);
     out
 }
 
-fn collect_sink(sink: &connector::state::Queue<{ connector::state::IOV_CAP }>) -> Vec<u8> {
+fn collect_sink(sink: &Queue<'_, '_, { connector::state::IOV_CAP }>) -> Vec<u8> {
     let mut acc = Vec::new();
     let mut i = 0;
-    loop {
-        let chunk = sink.pending_at(i);
-        if chunk.as_slice().is_empty() {
-            break;
-        }
+    while let Some(chunk) = sink.pending_at(i) {
         acc.extend_from_slice(chunk.as_slice());
         i += 1;
     }
@@ -76,8 +63,9 @@ fn collect_sink(sink: &connector::state::Queue<{ connector::state::IOV_CAP }>) -
 fn connect_emits_preface_and_settings() {
     let mut session = Session::new(CapturingHandler::new());
     let mut state = ConnState::default();
-    let arena = egress::arena::Arena::with_capacity(ARENA_CAPACITY);
-    let mut sink = arena.queue::<{ connector::state::IOV_CAP }>();
+    let storage = egress::storage::Storage::with_capacity(ARENA_CAPACITY);
+    let mut arena = storage.shared_arena(1);
+    let mut sink = arena.queue();
     session.connect(&mut state, &mut sink);
     let bytes = collect_sink(&sink);
     assert!(bytes.starts_with(CLIENT_PREFACE));
@@ -105,11 +93,15 @@ fn codec_parse_returns_full_buffer() {
 fn response_ingests_and_emits_events() {
     let mut session = Session::new(CapturingHandler::new());
     let mut state = ConnState::default();
-    let arena = egress::arena::Arena::with_capacity(ARENA_CAPACITY);
-    let mut sink = arena.queue::<{ connector::state::IOV_CAP }>();
-    session.connect(&mut state, &mut sink);
-    drop(sink);
-    let mut sink = arena.queue::<{ connector::state::IOV_CAP }>();
+    let storage = egress::storage::Storage::with_capacity(ARENA_CAPACITY);
+    let mut arena = storage.shared_arena(1);
+    {
+        let mut sink = arena.queue();
+        session.connect(&mut state, &mut sink);
+        let connected = collect_sink(&sink).len();
+        assert!(sink.try_ack(connected));
+    }
+    let mut sink = arena.queue();
 
     let peer = settings_bytes(65_535);
     let head = Head(Shared::copy_from_slice(&peer));
@@ -131,16 +123,18 @@ fn response_ingests_and_emits_events() {
 fn wants_close_after_goaway_in() {
     let mut session = Session::new(CapturingHandler::new());
     let mut state = ConnState::default();
-    let arena = egress::arena::Arena::with_capacity(ARENA_CAPACITY);
-    let mut sink = arena.queue::<{ connector::state::IOV_CAP }>();
-    session.connect(&mut state, &mut sink);
-    drop(sink);
-    let mut sink = arena.queue::<{ connector::state::IOV_CAP }>();
+    let storage = egress::storage::Storage::with_capacity(ARENA_CAPACITY);
+    let mut arena = storage.shared_arena(1);
+    {
+        let mut sink = arena.queue();
+        session.connect(&mut state, &mut sink);
+    }
+    let mut sink = arena.queue();
 
     let mut feed = settings_bytes(65_535);
     feed.extend_from_slice(&settings_ack_bytes());
     feed.extend_from_slice(&goaway_bytes(ErrorCode::EnhanceYourCalm));
     let head = Head(Shared::copy_from_slice(&feed));
     session.response(head, &mut state, &mut sink);
-    assert!(state.wants_close() == connector::Close::Reconnect);
+    assert!(state.wants_close() == connector::lifecycle::Close::Reconnect);
 }

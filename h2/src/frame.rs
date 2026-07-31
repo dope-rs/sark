@@ -1,28 +1,78 @@
+use o3::buffer::ByteSink;
+use o3::num::BoundedU32;
+
 use crate::stream::StreamId;
 
-pub trait FrameBuf {
-    fn push(&mut self, byte: u8);
-    fn extend_from_slice(&mut self, bytes: &[u8]);
+type FrameLengthValue = BoundedU32<0, 0x00ff_ffff>;
+type WindowIncrementValue = BoundedU32<1, 0x7fff_ffff>;
+
+#[repr(transparent)]
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct FrameLength(u32);
+
+impl FrameLength {
+    pub const MAX: u32 = 0x00ff_ffff;
+    pub const ZERO: Self = Self(0);
+    const FOUR: Self = Self(4);
+    const FIVE: Self = Self(5);
+    const EIGHT: Self = Self(8);
+
+    pub const fn new(value: u32) -> Option<Self> {
+        match FrameLengthValue::new(value) {
+            Some(value) => Some(Self(value.get())),
+            None => None,
+        }
+    }
+
+    pub const fn from_usize(value: usize) -> Option<Self> {
+        match FrameLengthValue::from_usize(value) {
+            Some(value) => Some(Self(value.get())),
+            None => None,
+        }
+    }
+
+    pub const fn as_u32(self) -> u32 {
+        self.0
+    }
+
+    pub const fn as_usize(self) -> usize {
+        self.0 as usize
+    }
+
+    const fn from_wire_bytes(high: u8, middle: u8, low: u8) -> Self {
+        Self(u32::from_be_bytes([0, high, middle, low]))
+    }
+
+    const fn wire_bytes(self) -> [u8; 3] {
+        let bytes = self.0.to_be_bytes();
+        [bytes[1], bytes[2], bytes[3]]
+    }
 }
 
-impl FrameBuf for Vec<u8> {
-    fn push(&mut self, byte: u8) {
-        Vec::push(self, byte);
+#[repr(transparent)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct WindowIncrement(u32);
+
+impl WindowIncrement {
+    pub const MAX: u32 = 0x7fff_ffff;
+
+    pub const fn new(value: u32) -> Option<Self> {
+        match WindowIncrementValue::new(value) {
+            Some(value) => Some(Self(value.get())),
+            None => None,
+        }
     }
 
-    fn extend_from_slice(&mut self, bytes: &[u8]) {
-        Vec::extend_from_slice(self, bytes);
-    }
-}
-
-impl FrameBuf for o3::buffer::ByteRing {
-    fn push(&mut self, byte: u8) {
-        self.try_push(byte).expect("prepared frame capacity");
+    pub const fn get(self) -> u32 {
+        self.0
     }
 
-    fn extend_from_slice(&mut self, bytes: &[u8]) {
-        self.try_extend_from_slice(bytes)
-            .expect("prepared frame capacity");
+    const fn from_wire(value: u32) -> Option<Self> {
+        Self::new(value & Self::MAX)
+    }
+
+    const fn wire_bytes(self) -> [u8; 4] {
+        self.0.to_be_bytes()
     }
 }
 
@@ -169,7 +219,7 @@ pub const HEADER_LEN: usize = 9;
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub struct FrameHeader {
-    pub length: u32,
+    pub length: FrameLength,
     pub kind: Type,
     pub flags: Flags,
     pub stream_id: StreamId,
@@ -180,11 +230,10 @@ impl FrameHeader {
         if buf.len() < HEADER_LEN {
             return Err(ParseError::NeedMore);
         }
-        let length = u32::from_be_bytes([0, buf[0], buf[1], buf[2]]);
+        let length = FrameLength::from_wire_bytes(buf[0], buf[1], buf[2]);
         let kind = Type::from_u8(buf[3]).map_err(ParseError::BadType)?;
         let flags = Flags(buf[4]);
-        let stream_id =
-            StreamId::from_u32_masked(u32::from_be_bytes([buf[5], buf[6], buf[7], buf[8]]));
+        let stream_id = StreamId::from_wire(u32::from_be_bytes([buf[5], buf[6], buf[7], buf[8]]));
         Ok(Self {
             length,
             kind,
@@ -193,14 +242,24 @@ impl FrameHeader {
         })
     }
 
-    pub fn encode(&self, out: &mut impl FrameBuf) {
-        let len = self.length & 0x00ff_ffff;
-        out.push((len >> 16) as u8);
-        out.push((len >> 8) as u8);
-        out.push(len as u8);
-        out.push(self.kind as u8);
-        out.push(self.flags.0);
-        out.extend_from_slice(&self.stream_id.masked().to_be_bytes());
+    pub(crate) fn wire_bytes(&self) -> [u8; HEADER_LEN] {
+        let len = self.length.wire_bytes();
+        let stream_id = self.stream_id.wire_bytes();
+        [
+            len[0],
+            len[1],
+            len[2],
+            self.kind as u8,
+            self.flags.0,
+            stream_id[0],
+            stream_id[1],
+            stream_id[2],
+            stream_id[3],
+        ]
+    }
+
+    pub fn encode<W: ByteSink>(&self, out: &mut W) -> Result<(), W::Error> {
+        out.write_slice(&self.wire_bytes())
     }
 
     fn require_stream(&self) -> Result<(), ParseError> {
@@ -234,7 +293,7 @@ impl PriorityFields {
         }
         let raw = u32::from_be_bytes([buf[0], buf[1], buf[2], buf[3]]);
         let exclusive = (raw & 0x8000_0000) != 0;
-        let dependency = StreamId::from_u32_masked(raw);
+        let dependency = StreamId::from_wire(raw);
         let weight = buf[4];
         Ok(Self {
             exclusive,
@@ -243,78 +302,166 @@ impl PriorityFields {
         })
     }
 
-    pub fn encode(&self, out: &mut impl FrameBuf) {
-        let mut raw = self.dependency.masked();
+    fn wire_bytes(&self) -> [u8; 5] {
+        let mut raw = self.dependency.as_u32();
         if self.exclusive {
             raw |= 0x8000_0000;
         }
-        out.extend_from_slice(&raw.to_be_bytes());
-        out.push(self.weight);
+        let dependency = raw.to_be_bytes();
+        [
+            dependency[0],
+            dependency[1],
+            dependency[2],
+            dependency[3],
+            self.weight,
+        ]
+    }
+
+    pub fn encode<W: ByteSink>(&self, out: &mut W) -> Result<(), W::Error> {
+        out.write_slice(&self.wire_bytes())
     }
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub struct Data<'a> {
-    pub stream_id: StreamId,
-    pub end_stream: bool,
-    pub payload: &'a [u8],
+    stream_id: StreamId,
+    end_stream: bool,
+    payload: &'a [u8],
+    length: FrameLength,
 }
 
 impl<'a> Data<'a> {
-    pub fn parse(header: FrameHeader, payload: &'a [u8]) -> Result<Self, ParseError> {
-        header.require_stream()?;
-        let body = header.flags.strip(payload)?;
-        Ok(Self {
-            stream_id: header.stream_id,
-            end_stream: header.flags.has(Flags::END_STREAM),
-            payload: body,
+    pub fn new(stream_id: StreamId, end_stream: bool, payload: &'a [u8]) -> Option<Self> {
+        if stream_id.is_zero() {
+            return None;
+        }
+        Some(Self {
+            stream_id,
+            end_stream,
+            payload,
+            length: FrameLength::from_usize(payload.len())?,
         })
     }
 
-    pub fn encode(&self, out: &mut impl FrameBuf) {
+    pub const fn stream_id(&self) -> StreamId {
+        self.stream_id
+    }
+
+    pub const fn end_stream(&self) -> bool {
+        self.end_stream
+    }
+
+    pub const fn payload(&self) -> &'a [u8] {
+        self.payload
+    }
+
+    pub fn parse(header: FrameHeader, payload: &'a [u8]) -> Result<Self, ParseError> {
+        header.require_stream()?;
+        let body = header.flags.strip(payload)?;
+        Self::new(header.stream_id, header.flags.has(Flags::END_STREAM), body)
+            .ok_or(ParseError::FrameSize)
+    }
+
+    pub fn encode<W: ByteSink>(&self, out: &mut W) -> Result<(), W::Error> {
         Self::encode_parts(
             self.stream_id,
             self.end_stream,
             self.payload,
             &[],
-            self.payload.len(),
+            self.length,
             out,
-        );
+        )
     }
 
-    pub(crate) fn encode_parts(
+    pub(crate) fn encode_parts<W: ByteSink>(
         stream_id: StreamId,
         end_stream: bool,
         first: &[u8],
         second: &[u8],
-        len: usize,
-        out: &mut impl FrameBuf,
-    ) {
+        length: FrameLength,
+        out: &mut W,
+    ) -> Result<(), W::Error> {
+        let len = length.as_usize();
         debug_assert!(len <= first.len().saturating_add(second.len()));
+        let header = Self::wire_header(stream_id, end_stream, length);
+        let first_len = len.min(first.len());
+        out.write_slices([&header, &first[..first_len], &second[..len - first_len]])
+    }
+
+    fn wire_header(stream_id: StreamId, end_stream: bool, length: FrameLength) -> [u8; HEADER_LEN] {
         let flags = if end_stream { Flags::END_STREAM } else { 0 };
         FrameHeader {
-            length: len as u32,
+            length,
             kind: Type::Data,
             flags: Flags(flags),
             stream_id,
         }
-        .encode(out);
-        let first_len = len.min(first.len());
-        out.extend_from_slice(&first[..first_len]);
-        out.extend_from_slice(&second[..len - first_len]);
+        .wire_bytes()
+    }
+
+    pub(crate) fn encode_header<W: ByteSink>(
+        stream_id: StreamId,
+        end_stream: bool,
+        length: FrameLength,
+        out: &mut W,
+    ) -> Result<(), W::Error> {
+        out.write_slice(&Self::wire_header(stream_id, end_stream, length))
     }
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub struct Headers<'a> {
-    pub stream_id: StreamId,
-    pub end_stream: bool,
-    pub end_headers: bool,
-    pub priority: Option<PriorityFields>,
-    pub block_fragment: &'a [u8],
+    stream_id: StreamId,
+    end_stream: bool,
+    end_headers: bool,
+    priority: Option<PriorityFields>,
+    block_fragment: &'a [u8],
+    length: FrameLength,
 }
 
 impl<'a> Headers<'a> {
+    pub fn new(
+        stream_id: StreamId,
+        end_stream: bool,
+        end_headers: bool,
+        priority: Option<PriorityFields>,
+        block_fragment: &'a [u8],
+    ) -> Option<Self> {
+        if stream_id.is_zero() {
+            return None;
+        }
+        let priority_len: usize = if priority.is_some() { 5 } else { 0 };
+        let length = priority_len.checked_add(block_fragment.len())?;
+        Some(Self {
+            stream_id,
+            end_stream,
+            end_headers,
+            priority,
+            block_fragment,
+            length: FrameLength::from_usize(length)?,
+        })
+    }
+
+    pub const fn stream_id(&self) -> StreamId {
+        self.stream_id
+    }
+
+    pub const fn end_stream(&self) -> bool {
+        self.end_stream
+    }
+
+    pub const fn end_headers(&self) -> bool {
+        self.end_headers
+    }
+
+    pub const fn priority(&self) -> Option<PriorityFields> {
+        self.priority
+    }
+
+    pub const fn block_fragment(&self) -> &'a [u8] {
+        self.block_fragment
+    }
+
     pub fn parse(header: FrameHeader, payload: &'a [u8]) -> Result<Self, ParseError> {
         header.require_stream()?;
         let unpadded = header.flags.strip(payload)?;
@@ -327,16 +474,17 @@ impl<'a> Headers<'a> {
         } else {
             (None, unpadded)
         };
-        Ok(Self {
-            stream_id: header.stream_id,
-            end_stream: header.flags.has(Flags::END_STREAM),
-            end_headers: header.flags.has(Flags::END_HEADERS),
+        Self::new(
+            header.stream_id,
+            header.flags.has(Flags::END_STREAM),
+            header.flags.has(Flags::END_HEADERS),
             priority,
-            block_fragment: rest,
-        })
+            rest,
+        )
+        .ok_or(ParseError::FrameSize)
     }
 
-    pub fn encode(&self, out: &mut impl FrameBuf) {
+    pub fn encode<W: ByteSink>(&self, out: &mut W) -> Result<(), W::Error> {
         let mut flags: u8 = 0;
         if self.end_stream {
             flags |= Flags::END_STREAM;
@@ -347,116 +495,153 @@ impl<'a> Headers<'a> {
         if self.priority.is_some() {
             flags |= Flags::PRIORITY;
         }
-        let priority_len = if self.priority.is_some() { 5 } else { 0 };
-        let length = (priority_len + self.block_fragment.len()) as u32;
-        FrameHeader {
-            length,
+        let header = FrameHeader {
+            length: self.length,
             kind: Type::Headers,
             flags: Flags(flags),
             stream_id: self.stream_id,
         }
-        .encode(out);
-        if let Some(pri) = self.priority {
-            pri.encode(out);
-        }
-        out.extend_from_slice(self.block_fragment);
+        .wire_bytes();
+        let priority = self.priority.map(|fields| fields.wire_bytes());
+        let priority = priority
+            .as_ref()
+            .map_or(&[][..], |fields| fields.as_slice());
+        out.write_slices([&header, priority, self.block_fragment])
     }
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub struct Priority {
-    pub stream_id: StreamId,
-    pub fields: PriorityFields,
+    stream_id: StreamId,
+    fields: PriorityFields,
 }
 
 impl Priority {
+    pub const fn new(stream_id: StreamId, fields: PriorityFields) -> Option<Self> {
+        if stream_id.is_zero() || stream_id.as_u32() == fields.dependency.as_u32() {
+            None
+        } else {
+            Some(Self { stream_id, fields })
+        }
+    }
+
+    pub const fn stream_id(&self) -> StreamId {
+        self.stream_id
+    }
+
+    pub const fn fields(&self) -> PriorityFields {
+        self.fields
+    }
+
     pub fn parse(header: FrameHeader, payload: &[u8]) -> Result<Self, ParseError> {
         if payload.len() != 5 {
             return Err(ParseError::FrameSize);
         }
         header.require_stream()?;
         let fields = PriorityFields::parse(payload)?;
-        Ok(Self {
-            stream_id: header.stream_id,
-            fields,
-        })
+        Self::new(header.stream_id, fields).ok_or(ParseError::Protocol)
     }
 
-    pub fn encode(&self, out: &mut impl FrameBuf) {
-        FrameHeader {
-            length: 5,
+    pub fn encode<W: ByteSink>(&self, out: &mut W) -> Result<(), W::Error> {
+        let header = FrameHeader {
+            length: FrameLength::FIVE,
             kind: Type::Priority,
             flags: Flags(0),
             stream_id: self.stream_id,
         }
-        .encode(out);
-        self.fields.encode(out);
+        .wire_bytes();
+        out.write_slices([&header, &self.fields.wire_bytes()])
     }
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub struct RstStream {
-    pub stream_id: StreamId,
-    pub error: ErrorCode,
+    stream_id: StreamId,
+    error: ErrorCode,
 }
 
 impl RstStream {
+    pub const fn new(stream_id: StreamId, error: ErrorCode) -> Option<Self> {
+        if stream_id.is_zero() {
+            None
+        } else {
+            Some(Self { stream_id, error })
+        }
+    }
+
+    pub const fn stream_id(&self) -> StreamId {
+        self.stream_id
+    }
+
+    pub const fn error(&self) -> ErrorCode {
+        self.error
+    }
+
     pub fn parse(header: FrameHeader, payload: &[u8]) -> Result<Self, ParseError> {
         if payload.len() != 4 {
             return Err(ParseError::FrameSize);
         }
         header.require_stream()?;
         let raw = u32::from_be_bytes([payload[0], payload[1], payload[2], payload[3]]);
-        Ok(Self {
-            stream_id: header.stream_id,
-            error: ErrorCode::from_u32(raw),
-        })
+        Self::new(header.stream_id, ErrorCode::from_u32(raw)).ok_or(ParseError::Protocol)
     }
 
-    pub fn encode(&self, out: &mut impl FrameBuf) {
-        FrameHeader {
-            length: 4,
+    pub fn encode<W: ByteSink>(&self, out: &mut W) -> Result<(), W::Error> {
+        let header = FrameHeader {
+            length: FrameLength::FOUR,
             kind: Type::RstStream,
             flags: Flags(0),
             stream_id: self.stream_id,
         }
-        .encode(out);
-        out.extend_from_slice(&(self.error as u32).to_be_bytes());
+        .wire_bytes();
+        out.write_slices([&header, &(self.error as u32).to_be_bytes()])
     }
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub struct Settings<'a> {
-    pub ack: bool,
-    pub params: &'a [u8],
+    ack: bool,
+    params: &'a [u8],
+    length: FrameLength,
 }
 
 impl<'a> Settings<'a> {
-    pub fn parse(header: FrameHeader, payload: &'a [u8]) -> Result<Self, ParseError> {
-        let ack = header.flags.has(Flags::ACK);
-        if ack && !payload.is_empty() {
-            return Err(ParseError::FrameSize);
+    pub fn new(ack: bool, params: &'a [u8]) -> Option<Self> {
+        if (ack && !params.is_empty()) || !params.len().is_multiple_of(6) {
+            return None;
         }
-        if !payload.is_empty() && !payload.len().is_multiple_of(6) {
-            return Err(ParseError::FrameSize);
-        }
-        header.require_connection()?;
-        Ok(Self {
+        Some(Self {
             ack,
-            params: payload,
+            params,
+            length: FrameLength::from_usize(params.len())?,
         })
     }
 
-    pub fn encode(&self, out: &mut impl FrameBuf) {
+    pub const fn ack(&self) -> bool {
+        self.ack
+    }
+
+    pub const fn params(&self) -> &'a [u8] {
+        self.params
+    }
+
+    pub fn parse(header: FrameHeader, payload: &'a [u8]) -> Result<Self, ParseError> {
+        let ack = header.flags.has(Flags::ACK);
+        let settings = Self::new(ack, payload).ok_or(ParseError::FrameSize)?;
+        header.require_connection()?;
+        Ok(settings)
+    }
+
+    pub fn encode<W: ByteSink>(&self, out: &mut W) -> Result<(), W::Error> {
         let flags = if self.ack { Flags::ACK } else { 0 };
-        FrameHeader {
-            length: self.params.len() as u32,
+        let header = FrameHeader {
+            length: self.length,
             kind: Type::Settings,
             flags: Flags(flags),
-            stream_id: StreamId(0),
+            stream_id: StreamId::CONNECTION,
         }
-        .encode(out);
-        out.extend_from_slice(self.params);
+        .wire_bytes();
+        out.write_slices([&header, self.params])
     }
 
     pub fn iter(&self) -> SettingsIter<'a> {
@@ -484,49 +669,88 @@ impl Iterator for SettingsIter<'_> {
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub struct PushPromise<'a> {
-    pub stream_id: StreamId,
-    pub promised_stream_id: StreamId,
-    pub end_headers: bool,
-    pub block_fragment: &'a [u8],
+    stream_id: StreamId,
+    promised_stream_id: StreamId,
+    end_headers: bool,
+    block_fragment: &'a [u8],
+    length: FrameLength,
 }
 
 impl<'a> PushPromise<'a> {
+    pub fn new(
+        stream_id: StreamId,
+        promised_stream_id: StreamId,
+        end_headers: bool,
+        block_fragment: &'a [u8],
+    ) -> Option<Self> {
+        if stream_id.is_zero() || promised_stream_id.is_zero() {
+            return None;
+        }
+        let length = 4usize.checked_add(block_fragment.len())?;
+        Some(Self {
+            stream_id,
+            promised_stream_id,
+            end_headers,
+            block_fragment,
+            length: FrameLength::from_usize(length)?,
+        })
+    }
+
+    pub const fn stream_id(&self) -> StreamId {
+        self.stream_id
+    }
+
+    pub const fn promised_stream_id(&self) -> StreamId {
+        self.promised_stream_id
+    }
+
+    pub const fn end_headers(&self) -> bool {
+        self.end_headers
+    }
+
+    pub const fn block_fragment(&self) -> &'a [u8] {
+        self.block_fragment
+    }
+
     pub fn parse(header: FrameHeader, payload: &'a [u8]) -> Result<Self, ParseError> {
         header.require_stream()?;
         let unpadded = header.flags.strip(payload)?;
         if unpadded.len() < 4 {
             return Err(ParseError::FrameSize);
         }
-        let promised = StreamId::from_u32_masked(u32::from_be_bytes([
+        let promised = StreamId::from_wire(u32::from_be_bytes([
             unpadded[0],
             unpadded[1],
             unpadded[2],
             unpadded[3],
         ]));
-        Ok(Self {
-            stream_id: header.stream_id,
-            promised_stream_id: promised,
-            end_headers: header.flags.has(Flags::END_HEADERS),
-            block_fragment: &unpadded[4..],
-        })
+        Self::new(
+            header.stream_id,
+            promised,
+            header.flags.has(Flags::END_HEADERS),
+            &unpadded[4..],
+        )
+        .ok_or(ParseError::Protocol)
     }
 
-    pub fn encode(&self, out: &mut impl FrameBuf) {
+    pub fn encode<W: ByteSink>(&self, out: &mut W) -> Result<(), W::Error> {
         let flags = if self.end_headers {
             Flags::END_HEADERS
         } else {
             0
         };
-        let length = (4 + self.block_fragment.len()) as u32;
-        FrameHeader {
-            length,
+        let header = FrameHeader {
+            length: self.length,
             kind: Type::PushPromise,
             flags: Flags(flags),
             stream_id: self.stream_id,
         }
-        .encode(out);
-        out.extend_from_slice(&self.promised_stream_id.masked().to_be_bytes());
-        out.extend_from_slice(self.block_fragment);
+        .wire_bytes();
+        out.write_slices([
+            &header,
+            &self.promised_stream_id.wire_bytes(),
+            self.block_fragment,
+        ])
     }
 }
 
@@ -550,125 +774,169 @@ impl Ping {
         })
     }
 
-    pub fn encode(&self, out: &mut impl FrameBuf) {
+    pub fn encode<W: ByteSink>(&self, out: &mut W) -> Result<(), W::Error> {
         let flags = if self.ack { Flags::ACK } else { 0 };
-        FrameHeader {
-            length: 8,
+        let header = FrameHeader {
+            length: FrameLength::EIGHT,
             kind: Type::Ping,
             flags: Flags(flags),
-            stream_id: StreamId(0),
+            stream_id: StreamId::CONNECTION,
         }
-        .encode(out);
-        out.extend_from_slice(&self.opaque);
+        .wire_bytes();
+        out.write_slices([&header, &self.opaque])
     }
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub struct GoAway<'a> {
-    pub last_stream_id: StreamId,
-    pub error: ErrorCode,
-    pub debug: &'a [u8],
+    last_stream_id: StreamId,
+    error: ErrorCode,
+    debug: &'a [u8],
+    length: FrameLength,
 }
 
 impl<'a> GoAway<'a> {
+    pub fn new(last_stream_id: StreamId, error: ErrorCode, debug: &'a [u8]) -> Option<Self> {
+        let length = 8usize.checked_add(debug.len())?;
+        Some(Self {
+            last_stream_id,
+            error,
+            debug,
+            length: FrameLength::from_usize(length)?,
+        })
+    }
+
+    pub const fn last_stream_id(&self) -> StreamId {
+        self.last_stream_id
+    }
+
+    pub const fn error(&self) -> ErrorCode {
+        self.error
+    }
+
+    pub const fn debug(&self) -> &'a [u8] {
+        self.debug
+    }
+
     pub fn parse(header: FrameHeader, payload: &'a [u8]) -> Result<Self, ParseError> {
         header.require_connection()?;
         if payload.len() < 8 {
             return Err(ParseError::FrameSize);
         }
-        let last = StreamId::from_u32_masked(u32::from_be_bytes([
+        let last = StreamId::from_wire(u32::from_be_bytes([
             payload[0], payload[1], payload[2], payload[3],
         ]));
         let err_raw = u32::from_be_bytes([payload[4], payload[5], payload[6], payload[7]]);
-        Ok(Self {
-            last_stream_id: last,
-            error: ErrorCode::from_u32(err_raw),
-            debug: &payload[8..],
-        })
+        Self::new(last, ErrorCode::from_u32(err_raw), &payload[8..]).ok_or(ParseError::FrameSize)
     }
 
-    pub fn encode(&self, out: &mut impl FrameBuf) {
-        let length = (8 + self.debug.len()) as u32;
-        FrameHeader {
-            length,
+    pub fn encode<W: ByteSink>(&self, out: &mut W) -> Result<(), W::Error> {
+        let header = FrameHeader {
+            length: self.length,
             kind: Type::GoAway,
             flags: Flags(0),
-            stream_id: StreamId(0),
+            stream_id: StreamId::CONNECTION,
         }
-        .encode(out);
-        out.extend_from_slice(&self.last_stream_id.masked().to_be_bytes());
-        out.extend_from_slice(&(self.error as u32).to_be_bytes());
-        out.extend_from_slice(self.debug);
+        .wire_bytes();
+        out.write_slices([
+            &header,
+            &self.last_stream_id.wire_bytes(),
+            &(self.error as u32).to_be_bytes(),
+            self.debug,
+        ])
     }
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub struct WindowUpdate {
     pub stream_id: StreamId,
-    pub increment: u32,
+    pub increment: WindowIncrement,
 }
 
 impl WindowUpdate {
-    const MASK: u32 = 0x7fff_ffff;
-
     pub fn parse(header: FrameHeader, payload: &[u8]) -> Result<Self, ParseError> {
         if payload.len() != 4 {
             return Err(ParseError::FrameSize);
         }
-        let inc = u32::from_be_bytes([payload[0], payload[1], payload[2], payload[3]]) & Self::MASK;
-        if inc == 0 {
-            return Err(ParseError::ZeroIncrement);
-        }
+        let increment = WindowIncrement::from_wire(u32::from_be_bytes([
+            payload[0], payload[1], payload[2], payload[3],
+        ]))
+        .ok_or(ParseError::ZeroIncrement)?;
         Ok(Self {
             stream_id: header.stream_id,
-            increment: inc,
+            increment,
         })
     }
 
-    pub fn encode(&self, out: &mut impl FrameBuf) {
-        FrameHeader {
-            length: 4,
+    pub fn encode<W: ByteSink>(&self, out: &mut W) -> Result<(), W::Error> {
+        let header = FrameHeader {
+            length: FrameLength::FOUR,
             kind: Type::WindowUpdate,
             flags: Flags(0),
             stream_id: self.stream_id,
         }
-        .encode(out);
-        let inc = self.increment & Self::MASK;
-        out.extend_from_slice(&inc.to_be_bytes());
+        .wire_bytes();
+        out.write_slices([&header, &self.increment.wire_bytes()])
     }
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub struct Continuation<'a> {
-    pub stream_id: StreamId,
-    pub end_headers: bool,
-    pub block_fragment: &'a [u8],
+    stream_id: StreamId,
+    end_headers: bool,
+    block_fragment: &'a [u8],
+    length: FrameLength,
 }
 
 impl<'a> Continuation<'a> {
-    pub fn parse(header: FrameHeader, payload: &'a [u8]) -> Result<Self, ParseError> {
-        header.require_stream()?;
-        Ok(Self {
-            stream_id: header.stream_id,
-            end_headers: header.flags.has(Flags::END_HEADERS),
-            block_fragment: payload,
+    pub fn new(stream_id: StreamId, end_headers: bool, block_fragment: &'a [u8]) -> Option<Self> {
+        if stream_id.is_zero() {
+            return None;
+        }
+        Some(Self {
+            stream_id,
+            end_headers,
+            block_fragment,
+            length: FrameLength::from_usize(block_fragment.len())?,
         })
     }
 
-    pub fn encode(&self, out: &mut impl FrameBuf) {
+    pub const fn stream_id(&self) -> StreamId {
+        self.stream_id
+    }
+
+    pub const fn end_headers(&self) -> bool {
+        self.end_headers
+    }
+
+    pub const fn block_fragment(&self) -> &'a [u8] {
+        self.block_fragment
+    }
+
+    pub fn parse(header: FrameHeader, payload: &'a [u8]) -> Result<Self, ParseError> {
+        header.require_stream()?;
+        Self::new(
+            header.stream_id,
+            header.flags.has(Flags::END_HEADERS),
+            payload,
+        )
+        .ok_or(ParseError::FrameSize)
+    }
+
+    pub fn encode<W: ByteSink>(&self, out: &mut W) -> Result<(), W::Error> {
         let flags = if self.end_headers {
             Flags::END_HEADERS
         } else {
             0
         };
-        FrameHeader {
-            length: self.block_fragment.len() as u32,
+        let header = FrameHeader {
+            length: self.length,
             kind: Type::Continuation,
             flags: Flags(flags),
             stream_id: self.stream_id,
         }
-        .encode(out);
-        out.extend_from_slice(self.block_fragment);
+        .wire_bytes();
+        out.write_slices([&header, self.block_fragment])
     }
 }
 
@@ -689,7 +957,7 @@ pub enum Frame<'a> {
 impl<'a> Frame<'a> {
     pub fn parse(buf: &'a [u8]) -> Result<(Self, usize), ParseError> {
         let header = FrameHeader::parse(buf)?;
-        let total = HEADER_LEN + header.length as usize;
+        let total = HEADER_LEN + header.length.as_usize();
         if buf.len() < total {
             return Err(ParseError::NeedMore);
         }
@@ -699,7 +967,7 @@ impl<'a> Frame<'a> {
     }
 
     pub fn parse_payload(header: FrameHeader, payload: &'a [u8]) -> Result<Self, ParseError> {
-        if payload.len() != header.length as usize {
+        if payload.len() != header.length.as_usize() {
             return Err(ParseError::BadLength);
         }
         Ok(match header.kind {
@@ -716,7 +984,7 @@ impl<'a> Frame<'a> {
         })
     }
 
-    pub fn encode(&self, out: &mut impl FrameBuf) {
+    pub fn encode<W: ByteSink>(&self, out: &mut W) -> Result<(), W::Error> {
         match self {
             Self::Data(f) => f.encode(out),
             Self::Headers(f) => f.encode(out),

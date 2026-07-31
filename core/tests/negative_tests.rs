@@ -1,4 +1,4 @@
-use sark_core::http::codec::chunked::BodyDecoder;
+use sark_core::http::codec::chunked::{BodyDecoder, DecodeEvent};
 use sark_core::http::codec::decode::BodyKind;
 use sark_core::http::codec::{DecodeMode, HeaderScan, ResponseDecoder};
 
@@ -474,6 +474,22 @@ fn chunked_body_multiple_chunks() {
 fn chunked_body_partial_returns_none() {
     let data = b"5\r\nhel";
     assert!(BodyDecoder::body(data).unwrap().is_none());
+}
+
+#[test]
+fn chunked_decoder_emits_partial_chunk_data() {
+    let mut decoder = BodyDecoder::with_limit(16);
+    let (consumed, event) = decoder.decode(b"10\r\nabc").unwrap();
+    assert_eq!(consumed, 7);
+    assert!(matches!(event, DecodeEvent::Chunk(b"abc")));
+
+    let (consumed, event) = decoder.decode(b"defghijklmnop").unwrap();
+    assert_eq!(consumed, 13);
+    assert!(matches!(event, DecodeEvent::Chunk(b"defghijklmnop")));
+
+    let (consumed, event) = decoder.decode(b"\r\n0\r\n\r\n").unwrap();
+    assert_eq!(consumed, 7);
+    assert!(matches!(event, DecodeEvent::Done(trailers) if trailers.is_empty()));
 }
 
 #[test]

@@ -5,13 +5,22 @@ use cartel_core::{Arena, ArenaConfig, ArenaLane, Limits};
 use dope::driver::token::Token;
 use o3::cell::{RegionCell, RegionToken};
 use o3::collections::SlotQueue;
-use sark_core::http::Response;
 
+use super::codec::{MAX_INFORMATIONAL_RESPONSES, STREAM_CHUNK_SIZE};
 use super::error::Error;
+use super::response::ResponseEvent;
 
-pub(super) type Outcome = Result<Response, Error>;
+pub(super) type Outcome = Result<ResponseEvent, Error>;
 
 const KEEPALIVE_MARGIN: Duration = Duration::from_secs(1);
+
+pub(super) struct ResponsePush {
+    pub outcome: Outcome,
+    pub bytes: usize,
+    pub complete: bool,
+    pub keepalive: Option<Duration>,
+    pub now: Instant,
+}
 
 struct Connection {
     id: Cell<Option<Token>>,
@@ -28,11 +37,29 @@ pub(super) struct ConnectionPool<'d> {
 }
 
 impl<'d> ConnectionPool<'d> {
-    pub(super) fn new(capacity: usize, max_inflight: usize, limit: usize) -> Self {
+    pub(super) fn new(
+        capacity: usize,
+        max_inflight: usize,
+        limit: usize,
+        max_response_body: usize,
+    ) -> Self {
         let entries = capacity
             .checked_mul(max_inflight)
             .expect("HTTP response entry capacity overflow");
-        let limits = Limits::new(1, limit, 1);
+        let per_entry_items = max_response_body
+            .div_ceil(STREAM_CHUNK_SIZE)
+            .saturating_mul(2)
+            .saturating_add(MAX_INFORMATIONAL_RESPONSES + 3);
+        let items = entries
+            .checked_mul(3)
+            .and_then(|base| {
+                limit
+                    .div_ceil(STREAM_CHUNK_SIZE)
+                    .checked_mul(2)
+                    .and_then(|body| base.checked_add(body))
+            })
+            .expect("HTTP response item capacity overflow");
+        let limits = Limits::new(per_entry_items, limit, per_entry_items);
         Self {
             entries: (0..capacity)
                 .map(|_| Connection {
@@ -43,7 +70,7 @@ impl<'d> ConnectionPool<'d> {
                 })
                 .collect(),
             arena: Arena::new(ArenaConfig::new(
-                capacity, entries, entries, limit, entries, limits,
+                capacity, entries, items, limit, items, limits,
             )),
             ready: RegionCell::new(SlotQueue::with_capacity(capacity)),
             live: Cell::new(0),
@@ -99,8 +126,37 @@ impl<'d> ConnectionPool<'d> {
         &self,
         token: &mut RegionToken<'d>,
         id: Token,
-        outcome: Outcome,
-        bytes: usize,
+        push: ResponsePush,
+    ) -> bool {
+        let ResponsePush {
+            outcome,
+            bytes,
+            complete,
+            keepalive,
+            now,
+        } = push;
+        let Some(entry) = self.entry(id) else {
+            return false;
+        };
+        entry.last_activity.set(Some(now));
+        if keepalive.is_some() {
+            entry.keepalive.set(keepalive);
+        }
+        let lane = id.slot().raw() as usize;
+        let pushed = self.arena.try_push(token, lane, outcome, bytes, 1);
+        if complete {
+            self.arena.complete(token, lane);
+        }
+        if complete && self.arena.can_register(token, lane) {
+            self.push_ready(token, entry, id);
+        }
+        pushed
+    }
+
+    pub(super) fn complete_response(
+        &self,
+        token: &mut RegionToken<'d>,
+        id: Token,
         keepalive: Option<Duration>,
         now: Instant,
     ) {
@@ -112,7 +168,6 @@ impl<'d> ConnectionPool<'d> {
             entry.keepalive.set(keepalive);
         }
         let lane = id.slot().raw() as usize;
-        self.arena.try_push(token, lane, outcome, bytes, 1);
         self.arena.complete(token, lane);
         if self.arena.can_register(token, lane) {
             self.push_ready(token, entry, id);

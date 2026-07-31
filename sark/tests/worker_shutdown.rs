@@ -8,7 +8,8 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Barrier};
 use std::time::Duration;
 
-use dope::runtime::{Dispatcher, Idle, Launcher};
+use dope::runtime::dispatcher::{Dispatcher, Idle};
+use dope::runtime::launcher::Launcher;
 use dope::{DriverContext, Event};
 use o3::cell::BrandCell as Branded;
 use sark::{Throughput, driver};

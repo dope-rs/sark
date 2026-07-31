@@ -12,15 +12,14 @@ use raw_body::BodyPlan;
 use syn::parse::{Parse, ParseStream};
 use syn::{Error, Fields, Ident, ItemStruct, Result, Token};
 
-use crate::codegen::header::{HeaderApplyMode, HeaderEmitter, HeaderParserConfig, HeaderValueMode};
+use crate::codegen::header::HeaderEmitter;
 use crate::codegen::value::FieldPlan;
 use crate::model::{HeaderAttrField, PathAttrField, QueryAttrField};
 use crate::util::{AttributeSliceExt, FieldAttr, TypeExt};
 
 pub(super) struct Mode {
     ordered: bool,
-    value: HeaderValueMode,
-    apply: HeaderApplyMode,
+    full: bool,
 }
 
 impl Parse for Mode {
@@ -28,66 +27,29 @@ impl Parse for Mode {
         if input.is_empty() {
             return Ok(Self {
                 ordered: false,
-                value: HeaderValueMode::Full,
-                apply: HeaderApplyMode::Full,
+                full: false,
             });
         }
         let mut ordered = false;
-        let mut value = HeaderValueMode::Full;
-        let mut apply = HeaderApplyMode::Full;
+        let mut full = false;
         while !input.is_empty() {
-            if input.peek(Ident) && !input.peek2(Token![=]) {
-                let ident = input.parse::<Ident>()?;
-                if ident != "ordered" {
-                    return Err(Error::new_spanned(
-                        ident,
-                        "#[sark_gen::request] supports only `ordered`, `value = full|skip`, and `apply = full|skip`",
-                    ));
-                }
+            let ident = input.parse::<Ident>()?;
+            if ident == "ordered" {
                 ordered = true;
+            } else if ident == "full" {
+                full = true;
             } else {
-                let key = input.parse::<Ident>()?;
-                input.parse::<Token![=]>()?;
-                let mode = input.parse::<Ident>()?;
-                if key != "value" && key != "apply" {
-                    return Err(Error::new_spanned(
-                        key,
-                        "#[sark_gen::request] supports only `ordered`, `value = full|skip`, and `apply = full|skip`",
-                    ));
-                }
-                match (key.to_string().as_str(), mode.to_string().as_str()) {
-                    ("value", "full") => value = HeaderValueMode::Full,
-                    ("value", "skip") => value = HeaderValueMode::Skip,
-                    ("apply", "full") => apply = HeaderApplyMode::Full,
-                    ("apply", "skip") => apply = HeaderApplyMode::Skip,
-                    ("value", _) => {
-                        return Err(Error::new_spanned(
-                            mode,
-                            "#[sark_gen::request] value mode must be `full` or `skip`",
-                        ));
-                    }
-                    ("apply", _) => {
-                        return Err(Error::new_spanned(
-                            mode,
-                            "#[sark_gen::request] apply mode must be `full` or `skip`",
-                        ));
-                    }
-                    _ => unreachable!(),
-                }
+                return Err(Error::new_spanned(
+                    ident,
+                    "#[sark_gen::request] supports only `ordered` and `full`",
+                ));
             }
             if input.is_empty() {
                 break;
             }
             input.parse::<Token![,]>()?;
         }
-        if matches!(value, HeaderValueMode::Skip) {
-            apply = HeaderApplyMode::Skip;
-        }
-        Ok(Self {
-            ordered,
-            value,
-            apply,
-        })
+        Ok(Self { ordered, full })
     }
 }
 
@@ -95,17 +57,13 @@ impl Mode {
     pub(super) fn empty() -> Self {
         Self {
             ordered: false,
-            value: HeaderValueMode::Full,
-            apply: HeaderApplyMode::Full,
+            full: false,
         }
     }
 
     pub(super) fn expand(self, mut st: ItemStruct) -> Result<TokenStream> {
         let ordered = self.ordered;
-        let parser_cfg = HeaderParserConfig {
-            value: self.value,
-            apply: self.apply,
-        };
+        let full = self.full;
         let name = st.ident.clone();
         let vis = st.vis.clone();
         let inner_name = format_ident!("{}View", name);
@@ -246,6 +204,7 @@ impl Mode {
         };
         for field in &mut borrowed_named.named {
             body_plan.rewrite_raw_field(field);
+            body_plan.rewrite_json_field(field);
             if field
                 .ident
                 .as_ref()
@@ -311,46 +270,29 @@ impl Mode {
                 .map(|f| (&f.ident, f.query.value().into_bytes(), &f.ty)),
         )?;
 
-        let (
-            header_slot_ty,
-            header_slot_enum,
-            header_slot_probe_fn,
-            header_set_fn,
-            header_set_name_fn,
-            header_slot_u8_fn,
-            header_set_u8_fn,
-        ) = if header_fields.is_empty() {
-            (
-                quote! { #header_slot_ident },
-                quote! {
-                    #[derive(Clone, Copy)]
-                    struct #header_slot_ident;
-                },
-                quote! { None },
-                quote! { Ok(()) },
-                quote! { Ok(()) },
-                quote! { None },
-                quote! { Ok(()) },
-            )
-        } else {
-            let (slot_enum, slot_probe_fn, set_fn, set_name_fn, slot_probe_u8_fn, set_u8_fn) =
-                header_plan.slots(&header_slot_ident, true);
-            (
-                quote! { #header_slot_ident },
-                slot_enum,
-                slot_probe_fn,
-                set_fn,
-                set_name_fn,
-                slot_probe_u8_fn,
-                set_u8_fn,
-            )
-        };
-        let header_emitter = HeaderEmitter::new(&header_plan, parser_cfg);
-        let header_scan_fn = quote! {
-            Ok(sark::sark_core::http::head::HeaderLineScan::find(rest, 0))
-        };
+        let (header_slot_ty, header_slot_enum, header_slot_probe_fn, header_set_fn) =
+            if header_fields.is_empty() {
+                (
+                    quote! { #header_slot_ident },
+                    quote! {
+                        #[derive(Clone, Copy)]
+                        struct #header_slot_ident;
+                    },
+                    quote! { None },
+                    quote! { Ok(()) },
+                )
+            } else {
+                let (slot_enum, slot_probe_fn, set_fn) =
+                    header_plan.slots(&header_slot_ident, true);
+                (
+                    quote! { #header_slot_ident },
+                    slot_enum,
+                    slot_probe_fn,
+                    set_fn,
+                )
+            };
+        let header_emitter = HeaderEmitter::new(&header_plan, full);
         let header_contig_fn = header_emitter.contiguous()?;
-        let header_apply_fn = header_emitter.apply()?;
         let query = Query::new(&query_fields);
         let query_set_name_fn = if query_fields.is_empty() {
             quote! { Ok(()) }
@@ -373,10 +315,6 @@ impl Mode {
         } else {
             query_plan.set_slice()
         };
-        let need_header = !(header_fields.is_empty() && query_fields.is_empty());
-        let need_known_header = header_emitter.needs_known_header();
-        let need_query = !query_fields.is_empty();
-
         let build_headers = if header_fields.is_empty() && query_fields.is_empty() {
             quote! {
                 let _ = headers;
@@ -396,51 +334,12 @@ impl Mode {
         .build()?;
         let body_mode = body_plan.mode();
 
-        let header_methods = if header_fields.is_empty() {
+        let header_slot_methods = if header_fields.is_empty() {
             TokenStream::new()
         } else {
             quote! {
                 fn header_slot_bytes(name: &[u8]) -> Option<Self::HeaderSlot> {
                     #header_slot_probe_fn
-                }
-
-                fn header_slot_u8(name: &[u8]) -> Option<u8> {
-                    #header_slot_u8_fn
-                }
-
-                fn scan_header_contig(
-                    rest: &[u8],
-                ) -> sark::error::Result<Option<sark::sark_core::http::head::HeaderLineScan>> {
-                    #header_scan_fn
-                }
-
-                #[allow(unreachable_code)]
-                fn apply_header_contig<I: sark::sark_core::http::head::HeadInput + ?Sized>(
-                    headers: &mut Self::RawHeaders,
-                    input: &I,
-                    rest: &[u8],
-                    line_start: usize,
-                    scan: &mut sark_core::http::codec::HeaderScan,
-                    flags: &mut sark::sark_core::http::head::Flags,
-                    header_count: &mut usize,
-                    max_header_count: usize,
-                ) -> sark::error::Result<Option<usize>> {
-                    #header_contig_fn
-                }
-
-                fn apply_header<I: sark::sark_core::http::head::HeadInput + ?Sized>(
-                    headers: &mut Self::RawHeaders,
-                    input: &I,
-                    line: &[u8],
-                    line_start: usize,
-                    colon_idx: usize,
-                    pretrim_start: Option<usize>,
-                    pretrim_end: Option<usize>,
-                    scan: &mut sark_core::http::codec::HeaderScan,
-                    flags: &mut sark::sark_core::http::head::Flags,
-                    scan_info: Option<&sark::sark_core::http::head::HeaderLineScan>,
-                ) -> sark::error::Result<()> {
-                    #header_apply_fn
                 }
 
                 fn set_header_raw<V: sark::service::HeaderValue>(
@@ -450,21 +349,69 @@ impl Mode {
                 ) -> sark::error::Result<()> {
                     #header_set_fn
                 }
+            }
+        };
+        let header_methods = quote! {
+                #header_slot_methods
 
-                fn set_header_name_raw<V: sark::service::HeaderValue>(
-                    headers: &mut Self::RawHeaders,
-                    name: &[u8],
-                    value: &V,
-                ) -> sark::error::Result<()> {
-                    #header_set_name_fn
+                fn parse_headers<const PARSE_ACCEPT_ENCODING: bool>(
+                    req_bytes: &[u8],
+                    headers_start: usize,
+                    max_header_count: usize,
+                ) -> sark::service::HeaderParse<Self::RawHeaders> {
+                    let mut raw_headers = #raw_headers_ident::default();
+                    let mut scan = sark::sark_core::http::codec::HeaderScan::default();
+                    let mut flags = sark::sark_core::http::head::Flags::default();
+                    let mut header_count = 0usize;
+                    let mut pos = headers_start;
+                    let head_len = loop {
+                        let Some(rest) = req_bytes.get(pos..) else {
+                            return sark::service::HeaderParse::NeedMore;
+                        };
+                        match Self::__sark_scan_header_line::<PARSE_ACCEPT_ENCODING>(
+                            &mut raw_headers,
+                            req_bytes,
+                            rest,
+                            pos,
+                            &mut scan,
+                            &mut flags,
+                            &mut header_count,
+                            max_header_count,
+                        ) {
+                            Ok(Some(0)) => break pos + 2,
+                            Ok(Some(relative)) => pos += relative + 2,
+                            Ok(None) => return sark::service::HeaderParse::NeedMore,
+                            Err(_) => return sark::service::HeaderParse::Bad,
+                        }
+                    };
+                    let body_framing = match scan.validate_for_request() {
+                        Ok(framing) => framing,
+                        Err(_) => return sark::service::HeaderParse::Bad,
+                    };
+                    sark::service::HeaderParse::Ready {
+                        headers: raw_headers,
+                        head_len,
+                        body_framing,
+                        flags,
+                        accept_gzip: scan.accept_encoding_gzip,
+                    }
                 }
-
-                fn set_header_u8<V: sark::service::HeaderValue>(
-                    headers: &mut Self::RawHeaders,
-                    slot: u8,
-                    value: &V,
-                ) -> sark::error::Result<()> {
-                    #header_set_u8_fn
+        };
+        let header_parser = quote! {
+            impl #name {
+                #[doc(hidden)]
+                #[allow(clippy::too_many_arguments, unreachable_code, unused_variables)]
+                fn __sark_scan_header_line<const __PARSE_ACCEPT_ENCODING: bool>(
+                    headers: &mut #raw_headers_ident,
+                    input: &[u8],
+                    rest: &[u8],
+                    line_start: usize,
+                    scan: &mut sark::sark_core::http::codec::HeaderScan,
+                    flags: &mut sark::sark_core::http::head::Flags,
+                    header_count: &mut usize,
+                    max_header_count: usize,
+                ) -> sark::error::Result<Option<usize>> {
+                    #header_contig_fn
                 }
             }
         };
@@ -527,6 +474,7 @@ impl Mode {
             #params_tokens
             #from_parts_impl
             #header_slot_enum
+            #header_parser
 
             impl sark::service::RouteRequestImpl for #name {
                 type HeaderSlot = #header_slot_ty;
@@ -537,9 +485,7 @@ impl Mode {
                 #parsed_body_impl
                 type BodyMode = #body_mode;
 
-                const NEED_HEADER: bool = #need_header;
-                const NEED_KNOWN_HEADER: bool = #need_known_header;
-                const NEED_QUERY: bool = #need_query;
+                const FULL: bool = #full;
 
                 #header_methods
                 #query_methods

@@ -1,5 +1,5 @@
 use dope::driver::token::Token;
-use dope_fiber::{ErasedTaskId, TaskId};
+use dope_fiber::slab::{ErasedTaskId, TaskId};
 use o3::collections::FixedHashTable;
 
 use crate::stream::StreamId;
@@ -8,10 +8,6 @@ use crate::stream::StreamId;
 pub(crate) struct TaskTarget(Option<ErasedTaskId>);
 
 impl TaskTarget {
-    pub(crate) const fn idle() -> Self {
-        Self(None)
-    }
-
     pub(crate) const fn task(key: ErasedTaskId) -> Self {
         Self(Some(key))
     }
@@ -49,7 +45,7 @@ impl TaskMap {
     }
 
     fn hash(connection_id: Token, stream_id: StreamId) -> u64 {
-        let value = connection_id.raw() ^ u64::from(stream_id.0).wrapping_mul(0x9E37_79B9);
+        let value = connection_id.raw() ^ u64::from(stream_id.as_u32()).wrapping_mul(0x9E37_79B9);
         value.wrapping_mul(0x9E37_79B9_7F4A_7C15)
     }
 

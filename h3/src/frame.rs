@@ -1,22 +1,22 @@
-use sark_core::http::{VarInt, varint};
+use dope_quic::varint::{Error as VarIntError, VarInt};
 
-pub const TYPE_DATA: u64 = 0x00;
-pub const TYPE_HEADERS: u64 = 0x01;
-pub const TYPE_CANCEL_PUSH: u64 = 0x03;
-pub const TYPE_SETTINGS: u64 = 0x04;
-pub const TYPE_PUSH_PROMISE: u64 = 0x05;
-pub const TYPE_GOAWAY: u64 = 0x07;
-pub const TYPE_MAX_PUSH_ID: u64 = 0x0d;
+pub const TYPE_DATA: VarInt = VarInt::from_u8(0x00);
+pub const TYPE_HEADERS: VarInt = VarInt::from_u8(0x01);
+pub const TYPE_CANCEL_PUSH: VarInt = VarInt::from_u8(0x03);
+pub const TYPE_SETTINGS: VarInt = VarInt::from_u8(0x04);
+pub const TYPE_PUSH_PROMISE: VarInt = VarInt::from_u8(0x05);
+pub const TYPE_GOAWAY: VarInt = VarInt::from_u8(0x07);
+pub const TYPE_MAX_PUSH_ID: VarInt = VarInt::from_u8(0x0d);
 
-pub const STREAM_TYPE_CONTROL: u64 = 0x00;
-pub const STREAM_TYPE_PUSH: u64 = 0x01;
-pub const STREAM_TYPE_QPACK_ENCODER: u64 = 0x02;
-pub const STREAM_TYPE_QPACK_DECODER: u64 = 0x03;
+pub const STREAM_TYPE_CONTROL: VarInt = VarInt::from_u8(0x00);
+pub const STREAM_TYPE_PUSH: VarInt = VarInt::from_u8(0x01);
+pub const STREAM_TYPE_QPACK_ENCODER: VarInt = VarInt::from_u8(0x02);
+pub const STREAM_TYPE_QPACK_DECODER: VarInt = VarInt::from_u8(0x03);
 
-pub const SETTINGS_QPACK_MAX_TABLE_CAPACITY: u64 = 0x01;
-pub const SETTINGS_MAX_FIELD_SECTION_SIZE: u64 = 0x06;
-pub const SETTINGS_QPACK_BLOCKED_STREAMS: u64 = 0x07;
-pub const SETTINGS_ENABLE_CONNECT_PROTOCOL: u64 = 0x08;
+pub const SETTINGS_QPACK_MAX_TABLE_CAPACITY: VarInt = VarInt::from_u8(0x01);
+pub const SETTINGS_MAX_FIELD_SECTION_SIZE: VarInt = VarInt::from_u8(0x06);
+pub const SETTINGS_QPACK_BLOCKED_STREAMS: VarInt = VarInt::from_u8(0x07);
+pub const SETTINGS_ENABLE_CONNECT_PROTOCOL: VarInt = VarInt::from_u8(0x08);
 
 #[repr(u64)]
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -52,19 +52,19 @@ pub enum ParseError {
     FrameTooLarge,
 }
 
-impl From<varint::Error> for ParseError {
-    fn from(err: varint::Error) -> Self {
+impl From<VarIntError> for ParseError {
+    fn from(err: VarIntError) -> Self {
         match err {
-            varint::Error::Underflow => Self::NeedMore,
-            varint::Error::TooLarge => Self::BadVarInt,
+            VarIntError::Underflow => Self::NeedMore,
+            VarIntError::TooLarge => Self::BadVarInt,
         }
     }
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub struct FrameHeader {
-    pub kind: u64,
-    pub length: u64,
+    pub kind: VarInt,
+    pub length: VarInt,
     pub header_len: usize,
 }
 
@@ -79,10 +79,9 @@ impl FrameHeader {
         })
     }
 
-    pub fn encode(&self, out: &mut Vec<u8>) -> Result<(), ParseError> {
-        VarInt::encode(self.kind, out)?;
-        VarInt::encode(self.length, out)?;
-        Ok(())
+    pub fn encode(&self, out: &mut impl Extend<u8>) {
+        self.kind.encode(out);
+        self.length.encode(out);
     }
 }
 
@@ -115,9 +114,9 @@ impl Settings {
         Ok(())
     }
 
-    fn push_setting(out: &mut Vec<u8>, id: u64, value: u64) -> Result<(), ParseError> {
-        VarInt::encode(id, out)?;
-        VarInt::encode(value, out)?;
+    fn push_setting(out: &mut Vec<u8>, id: VarInt, value: u64) -> Result<(), ParseError> {
+        id.encode(out);
+        VarInt::new(value).ok_or(ParseError::BadVarInt)?.encode(out);
         Ok(())
     }
 
@@ -140,24 +139,26 @@ impl Settings {
             match id {
                 SETTINGS_QPACK_MAX_TABLE_CAPACITY => {
                     Self::set_once(&mut seen, 0)?;
-                    out.qpack_max_table_capacity = value;
+                    out.qpack_max_table_capacity = value.get();
                 }
                 SETTINGS_MAX_FIELD_SECTION_SIZE => {
                     Self::set_once(&mut seen, 1)?;
-                    out.max_field_section_size = Some(value);
+                    out.max_field_section_size = Some(value.get());
                 }
                 SETTINGS_QPACK_BLOCKED_STREAMS => {
                     Self::set_once(&mut seen, 2)?;
-                    out.qpack_blocked_streams = value;
+                    out.qpack_blocked_streams = value.get();
                 }
                 SETTINGS_ENABLE_CONNECT_PROTOCOL => {
                     Self::set_once(&mut seen, 3)?;
-                    out.enable_connect_protocol = value == 1;
-                    if value > 1 {
+                    out.enable_connect_protocol = value.get() == 1;
+                    if value.get() > 1 {
                         return Err(ParseError::BadSettings);
                     }
                 }
-                0x02..=0x05 => return Err(ParseError::BadSettings),
+                _ if (0x02..=0x05).contains(&id.get()) => {
+                    return Err(ParseError::BadSettings);
+                }
                 _ => {}
             }
         }
@@ -169,18 +170,18 @@ impl Settings {
 pub enum Frame<'a> {
     Data(&'a [u8]),
     Headers(&'a [u8]),
-    CancelPush { push_id: u64 },
+    CancelPush { push_id: VarInt },
     Settings(Settings),
-    PushPromise { push_id: u64, block: &'a [u8] },
-    GoAway { id: u64 },
-    MaxPushId { push_id: u64 },
-    Unknown { kind: u64, payload: &'a [u8] },
+    PushPromise { push_id: VarInt, block: &'a [u8] },
+    GoAway { id: VarInt },
+    MaxPushId { push_id: VarInt },
+    Unknown { kind: VarInt, payload: &'a [u8] },
 }
 
 impl<'a> Frame<'a> {
     pub fn parse(buf: &'a [u8], max_frame_size: usize) -> Result<(Self, usize), ParseError> {
         let header = FrameHeader::parse(buf)?;
-        let len = usize::try_from(header.length).map_err(|_| ParseError::FrameTooLarge)?;
+        let len = usize::try_from(header.length.get()).map_err(|_| ParseError::FrameTooLarge)?;
         if len > max_frame_size {
             return Err(ParseError::FrameTooLarge);
         }
@@ -218,31 +219,33 @@ impl<'a> Frame<'a> {
         Ok((frame, end))
     }
 
-    pub fn encode(kind: u64, payload: &[u8], out: &mut Vec<u8>) -> Result<(), ParseError> {
-        VarInt::encode(kind, out)?;
-        VarInt::encode(payload.len() as u64, out)?;
+    pub fn encode(kind: VarInt, payload: &[u8], out: &mut Vec<u8>) -> Result<(), ParseError> {
+        kind.encode(out);
+        VarInt::from_usize(payload.len())
+            .ok_or(ParseError::FrameTooLarge)?
+            .encode(out);
         out.extend_from_slice(payload);
         Ok(())
     }
 
-    pub fn encode_varint(kind: u64, value: u64, out: &mut Vec<u8>) -> Result<(), ParseError> {
+    pub fn encode_varint(kind: VarInt, value: VarInt, out: &mut Vec<u8>) -> Result<(), ParseError> {
         let mut payload = Vec::new();
-        VarInt::encode(value, &mut payload)?;
+        value.encode(&mut payload);
         Self::encode(kind, &payload, out)
     }
 
     pub fn encode_push_promise(
-        push_id: u64,
+        push_id: VarInt,
         block: &[u8],
         out: &mut Vec<u8>,
     ) -> Result<(), ParseError> {
         let mut payload = Vec::new();
-        VarInt::encode(push_id, &mut payload)?;
+        push_id.encode(&mut payload);
         payload.extend_from_slice(block);
         Self::encode(TYPE_PUSH_PROMISE, &payload, out)
     }
 
-    fn parse_varint_payload(payload: &[u8]) -> Result<u64, ParseError> {
+    fn parse_varint_payload(payload: &[u8]) -> Result<VarInt, ParseError> {
         let (value, n) = VarInt::decode(payload)?;
         if n != payload.len() {
             return Err(ParseError::BadVarInt);

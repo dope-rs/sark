@@ -6,6 +6,7 @@ use sark_h3::dope::H3Encoder;
 use sark_h3::{Conn, Event, Role, StreamId, StreamTransport, pump_stream_event, pump_writes};
 
 #[sark_gen::response(raw)]
+#[header("content-type", "text/plain")]
 struct Reply {
     status: http::StatusCode,
     body: &'static [u8],
@@ -143,6 +144,11 @@ fn h3_request_routes_and_responds() {
                     fields
                         .iter()
                         .any(|f| f.name == b":status" && f.value == b"200")
+                );
+                assert!(
+                    fields
+                        .iter()
+                        .any(|f| f.name == b"content-type" && f.value == b"text/plain")
                 );
                 status_ok = true;
             }

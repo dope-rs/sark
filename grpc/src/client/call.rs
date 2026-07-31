@@ -46,7 +46,7 @@ impl CallStore {
     pub(super) fn insert(&mut self, stream_id: StreamId, mode: ResponseMode) -> bool {
         self.records
             .try_insert(
-                u64::from(stream_id.0),
+                u64::from(stream_id.as_u32()),
                 CallRecord {
                     stream_id,
                     response: ResponseState {
@@ -68,15 +68,16 @@ impl CallStore {
     }
 
     pub(super) fn get(&self, stream_id: StreamId) -> Option<&CallRecord> {
-        self.records.get(u64::from(stream_id.0), |record| {
+        self.records.get(u64::from(stream_id.as_u32()), |record| {
             record.stream_id == stream_id
         })
     }
 
     pub(super) fn get_mut(&mut self, stream_id: StreamId) -> Option<&mut CallRecord> {
-        self.records.get_mut(u64::from(stream_id.0), |record| {
-            record.stream_id == stream_id
-        })
+        self.records
+            .get_mut(u64::from(stream_id.as_u32()), |record| {
+                record.stream_id == stream_id
+            })
     }
 
     pub(super) fn response_mut(&mut self, stream_id: StreamId) -> Option<&mut ResponseState> {
@@ -84,8 +85,9 @@ impl CallStore {
     }
 
     pub(super) fn remove(&mut self, stream_id: StreamId) -> Option<CallRecord> {
-        self.records.remove(u64::from(stream_id.0), |record| {
-            record.stream_id == stream_id
-        })
+        self.records
+            .remove(u64::from(stream_id.as_u32()), |record| {
+                record.stream_id == stream_id
+            })
     }
 }

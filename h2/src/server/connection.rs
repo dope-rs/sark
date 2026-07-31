@@ -1,4 +1,3 @@
-use dope::runtime::profile::Throughput;
 use o3::collections::{FixedHashTable, FixedQueue};
 
 use super::{Body, Config};
@@ -7,8 +6,6 @@ use crate::frame::ErrorCode;
 use crate::hpack::{Header, HeaderBlock, OwnedHeader};
 use crate::role::ServerRole;
 use crate::stream::StreamId;
-
-type ServerProfile = Throughput;
 
 #[derive(Clone, Copy)]
 pub(super) struct Limits {
@@ -101,8 +98,9 @@ impl From<Incoming> for Request {
     }
 }
 
-struct PendingBody {
+struct PendingResponse {
     stream_id: StreamId,
+    headers: Option<ResponseHeaders>,
     body: Body,
     offset: usize,
     stalled: bool,
@@ -110,7 +108,7 @@ struct PendingBody {
     trailers_sent: bool,
 }
 
-impl PendingBody {
+impl PendingResponse {
     fn emit_trailers(&mut self, connection: &mut Conn<ServerRole>) -> Result<(), ConnError> {
         if self.trailers.is_empty() || self.trailers_sent {
             return Ok(());
@@ -128,18 +126,48 @@ impl PendingBody {
         connection: &mut Conn<ServerRole>,
         max_outbound_bytes: usize,
     ) -> Result<bool, ConnError> {
-        loop {
-            if self.offset >= self.body.len() {
-                self.emit_trailers(connection)?;
+        if let Some(headers) = self.headers.as_ref() {
+            let end_stream = self.body.is_empty() && self.trailers.is_empty();
+            let result = match headers {
+                ResponseHeaders::Owned(headers) => connection.send_response(
+                    self.stream_id,
+                    headers.iter().map(OwnedHeader::as_ref),
+                    end_stream,
+                ),
+                ResponseHeaders::Static(headers) => {
+                    connection.send_response(self.stream_id, headers.iter().copied(), end_stream)
+                }
+            };
+            match result {
+                Ok(()) => self.headers = None,
+                Err(ConnError::Overload) => return Ok(false),
+                Err(error) => return Err(error),
+            }
+            if end_stream {
                 return Ok(true);
             }
-            if connection.outbound().len() >= max_outbound_bytes {
+        }
+
+        loop {
+            if self.offset >= self.body.len() {
+                return match self.emit_trailers(connection) {
+                    Ok(()) => Ok(true),
+                    Err(ConnError::Overload) => Ok(false),
+                    Err(error) => Err(error),
+                };
+            }
+            if connection.outbound_len() >= max_outbound_bytes {
                 self.stalled = false;
                 return Ok(false);
             }
-            let remaining = &self.body.as_slice()[self.offset..];
+            let remaining = self.body.get(self.offset..).ok_or(ConnError::FrameSize)?;
             let end_stream = self.trailers.is_empty();
-            let written = connection.send_data(self.stream_id, remaining, end_stream)?;
+            let written = match connection.send_data_shared(self.stream_id, &remaining, end_stream)
+            {
+                Ok(written) => written,
+                Err(ConnError::Overload) => return Ok(false),
+                Err(error) => return Err(error),
+            };
             if written == 0 {
                 self.stalled = true;
                 return Ok(false);
@@ -163,13 +191,18 @@ pub(super) trait EventSink {
 pub(super) struct ConnectionState {
     pub(super) connection: Conn<ServerRole>,
     incoming: FixedHashTable<Incoming>,
-    pending: FixedQueue<PendingBody>,
+    pending: FixedQueue<PendingResponse>,
     buffered_body_bytes: usize,
 }
 
 impl Default for ConnectionState {
     fn default() -> Self {
-        let connection = Conn::<ServerRole>::with_tuning::<ServerProfile>();
+        Self::new(Conn::<ServerRole>::new())
+    }
+}
+
+impl ConnectionState {
+    pub(super) fn new(connection: Conn<ServerRole>) -> Self {
         let capacity = connection
             .local_settings()
             .max_concurrent_streams
@@ -181,23 +214,24 @@ impl Default for ConnectionState {
             buffered_body_bytes: 0,
         }
     }
-}
 
-impl ConnectionState {
     fn incoming(&self, stream_id: StreamId) -> Option<&Incoming> {
-        self.incoming
-            .get(u64::from(stream_id.0), |entry| entry.stream_id == stream_id)
+        self.incoming.get(u64::from(stream_id.as_u32()), |entry| {
+            entry.stream_id == stream_id
+        })
     }
 
     fn incoming_mut(&mut self, stream_id: StreamId) -> Option<&mut Incoming> {
         self.incoming
-            .get_mut(u64::from(stream_id.0), |entry| entry.stream_id == stream_id)
+            .get_mut(u64::from(stream_id.as_u32()), |entry| {
+                entry.stream_id == stream_id
+            })
     }
 
     fn insert_incoming(&mut self, incoming: Incoming) -> bool {
         let stream_id = incoming.stream_id;
         self.incoming
-            .try_insert(u64::from(stream_id.0), incoming, |entry| {
+            .try_insert(u64::from(stream_id.as_u32()), incoming, |entry| {
                 entry.stream_id == stream_id
             })
             .is_ok()
@@ -206,7 +240,9 @@ impl ConnectionState {
     fn take_incoming(&mut self, stream_id: StreamId) -> Option<Incoming> {
         let incoming = self
             .incoming
-            .remove(u64::from(stream_id.0), |entry| entry.stream_id == stream_id)?;
+            .remove(u64::from(stream_id.as_u32()), |entry| {
+                entry.stream_id == stream_id
+            })?;
         self.buffered_body_bytes = self.buffered_body_bytes.saturating_sub(incoming.body.len());
         Some(incoming)
     }
@@ -249,38 +285,34 @@ impl ConnectionState {
         if !self.connection.has_stream(stream_id) {
             return;
         }
-        let has_trailers = !response.trailers.is_empty();
-        let end_stream = response.body.is_empty() && !has_trailers;
-        let sent = match &response.headers {
-            ResponseHeaders::Owned(headers) => self.connection.send_response(
-                stream_id,
-                headers.iter().map(OwnedHeader::as_ref),
-                end_stream,
-            ),
-            ResponseHeaders::Static(headers) => {
-                self.connection
-                    .send_response(stream_id, headers.iter().copied(), end_stream)
-            }
-        };
-        if sent.is_err() || end_stream {
-            return;
-        }
-        let mut body = PendingBody {
+        let mut pending = PendingResponse {
             stream_id,
+            headers: Some(response.headers),
             body: response.body,
             offset: 0,
             stalled: false,
             trailers: response.trailers,
             trailers_sent: false,
         };
-        if !matches!(
-            body.pump(&mut self.connection, limits.max_outbound_bytes),
-            Ok(true)
-        ) && self.pending.push_back(body).is_err()
-        {
-            let _ = self
-                .connection
-                .reset_stream(stream_id, ErrorCode::EnhanceYourCalm);
+        let result = if self.connection.outbound_len() >= limits.max_outbound_bytes {
+            Ok(false)
+        } else {
+            pending.pump(&mut self.connection, limits.max_outbound_bytes)
+        };
+        match result {
+            Ok(true) => {}
+            Ok(false) => {
+                if self.pending.push_back(pending).is_err() {
+                    let _ = self
+                        .connection
+                        .reset_stream(stream_id, ErrorCode::EnhanceYourCalm);
+                }
+            }
+            Err(_) => {
+                let _ = self
+                    .connection
+                    .reset_stream(stream_id, ErrorCode::InternalError);
+            }
         }
     }
 
@@ -370,19 +402,25 @@ impl ConnectionState {
     pub(super) fn pump_pending(&mut self, limits: Limits, resume: bool) {
         let len = self.pending.len();
         for _ in 0..len {
-            let Some(mut body) = self.pending.pop_front() else {
+            let Some(mut pending_response) = self.pending.pop_front() else {
                 break;
             };
             if resume {
-                body.stalled = false;
+                pending_response.stalled = false;
             }
-            let pending = body.stalled
-                || self.connection.outbound().len() >= limits.max_outbound_bytes
-                || matches!(
-                    body.pump(&mut self.connection, limits.max_outbound_bytes),
-                    Ok(false)
-                );
-            if pending && self.pending.push_back(body).is_err() {
+            let stream_id = pending_response.stream_id;
+            let pending = pending_response.stalled
+                || self.connection.outbound_len() >= limits.max_outbound_bytes
+                || match pending_response.pump(&mut self.connection, limits.max_outbound_bytes) {
+                    Ok(done) => !done,
+                    Err(_) => {
+                        let _ = self
+                            .connection
+                            .reset_stream(stream_id, ErrorCode::InternalError);
+                        false
+                    }
+                };
+            if pending && self.pending.push_back(pending_response).is_err() {
                 debug_assert!(false, "pending response queue lost capacity");
                 break;
             }
@@ -391,7 +429,8 @@ impl ConnectionState {
 
     fn reset_stream(&mut self, stream_id: StreamId) {
         self.take_incoming(stream_id);
-        self.pending.retain(|body| body.stream_id != stream_id);
+        self.pending
+            .retain(|response| response.stream_id != stream_id);
     }
 
     pub(super) fn close(&mut self) {

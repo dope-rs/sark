@@ -1,7 +1,7 @@
 use sark_h2::conn::{Config, ConnError};
 use sark_h2::frame::Ping;
 use sark_h2::hpack::Header;
-use sark_h2::{ClientRole, Conn, ServerRole, conn};
+use sark_h2::{ClientRole, ConfigError, Conn, ServerRole, Settings, ValidatedConfig, conn};
 
 fn start_request(client: &mut Conn<ClientRole>) -> sark_h2::StreamId {
     client
@@ -17,12 +17,72 @@ fn start_request(client: &mut Conn<ClientRole>) -> sark_h2::StreamId {
         .unwrap()
 }
 
+fn server_config_error(config: Config) -> ConfigError {
+    match ValidatedConfig::<ServerRole>::new(config) {
+        Ok(_) => panic!("configuration unexpectedly validated"),
+        Err(error) => error,
+    }
+}
+
+#[test]
+fn config_validation_closes_every_initial_state_bound() {
+    assert_eq!(
+        server_config_error(Config {
+            event_capacity: 0,
+            ..Config::default()
+        }),
+        ConfigError::ZeroCapacity("event")
+    );
+    assert_eq!(
+        server_config_error(Config {
+            recv_window_target: 0x8000_0000,
+            ..Config::default()
+        }),
+        ConfigError::ReceiveWindowOverflow
+    );
+    assert_eq!(
+        server_config_error(Config {
+            local_settings: Settings {
+                initial_window_size: 0x8000_0000,
+                ..Settings::DEFAULT
+            },
+            ..Config::default()
+        }),
+        ConfigError::InitialWindowOverflow
+    );
+    assert_eq!(
+        server_config_error(Config {
+            local_settings: Settings {
+                max_frame_size: 16_383,
+                ..Settings::DEFAULT
+            },
+            ..Config::default()
+        }),
+        ConfigError::InvalidMaxFrameSize
+    );
+    assert!(matches!(
+        server_config_error(Config {
+            outbound_capacity: 1,
+            ..Config::default()
+        }),
+        ConfigError::OutboundTooSmall { .. }
+    ));
+}
+
+#[test]
+fn validated_config_is_a_reusable_construction_proof() {
+    let config = ValidatedConfig::<ServerRole>::new(Config::default()).unwrap();
+    let _first = Conn::from_config(config);
+    let _second = Conn::from_config(config);
+}
+
 #[test]
 fn event_capacity_is_hard_bound() {
     let mut client = Conn::<ClientRole>::with_config(Config {
         event_capacity: 1,
         ..Config::default()
-    });
+    })
+    .unwrap();
     assert!(client.poll_event().is_some());
     let mut server = Conn::<ServerRole>::new();
     server.ping([1; 8]).unwrap();
@@ -37,7 +97,8 @@ fn event_backpressure_does_not_reapply_frames() {
     let mut client = Conn::<ClientRole>::with_config(Config {
         event_capacity: 1,
         ..Config::default()
-    });
+    })
+    .unwrap();
     client.poll_event().unwrap();
     let mut server = Conn::<ServerRole>::new();
     server.ping([1; 8]).unwrap();
@@ -75,7 +136,8 @@ fn data_capacity_is_hard_bound() {
         event_capacity: 8,
         data_capacity: 1,
         ..Config::default()
-    });
+    })
+    .unwrap();
     let error = server.ingest(client.outbound()).unwrap_err();
     assert_eq!(error, ConnError::Overload);
 }
@@ -91,7 +153,8 @@ fn data_backpressure_retries_only_the_uncommitted_frame() {
         event_capacity: 8,
         data_capacity: 1,
         ..Config::default()
-    });
+    })
+    .unwrap();
     assert_eq!(server.ingest(client.outbound()), Err(ConnError::Overload));
     let mut first = None;
     while let Some(event) = server.poll_event() {
@@ -116,11 +179,38 @@ fn data_backpressure_retries_only_the_uncommitted_frame() {
 }
 
 #[test]
+fn header_pool_grows_to_its_bound_and_reuses_released_slots() {
+    let mut client = Conn::<ClientRole>::new();
+    for _ in 0..3 {
+        start_request(&mut client);
+    }
+    let mut server = Conn::<ServerRole>::with_config(Config {
+        event_capacity: 8,
+        header_capacity: 2,
+        ..Config::default()
+    })
+    .unwrap();
+
+    assert_eq!(server.ingest(client.outbound()), Err(ConnError::Overload));
+    let first_batch = std::iter::from_fn(|| server.poll_event())
+        .filter(|event| matches!(event, conn::Event::Headers { .. }))
+        .count();
+    assert_eq!(first_batch, 2);
+
+    server.resume().unwrap();
+    let second_batch = std::iter::from_fn(|| server.poll_event())
+        .filter(|event| matches!(event, conn::Event::Headers { .. }))
+        .count();
+    assert_eq!(second_batch, 1);
+}
+
+#[test]
 fn outbound_wrap_exposes_two_slices_without_compaction() {
     let mut conn = Conn::<ServerRole>::with_config(Config {
         outbound_capacity: 64,
         ..Config::default()
-    });
+    })
+    .unwrap();
     conn.drain_outbound(conn.outbound().len());
     conn.ping([1; 8]).unwrap();
     conn.ping([2; 8]).unwrap();
@@ -145,7 +235,8 @@ fn inbound_wrap_parses_frame_across_both_slices() {
     let mut server = Conn::<ServerRole>::with_config(Config {
         inbound_capacity: 64,
         ..Config::default()
-    });
+    })
+    .unwrap();
     for chunk in client.outbound().chunks(32) {
         server.ingest(chunk).unwrap();
     }

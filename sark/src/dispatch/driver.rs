@@ -2,7 +2,11 @@ use std::{pin::Pin, time::Instant};
 
 use dope::{
     DriverContext,
-    manifold::listener::{self, SlotEgress, recv::ExtendOutcome},
+    manifold::listener::{
+        egress::SlotEgress,
+        recv::ExtendOutcome,
+        state::{EgressCtx, State},
+    },
 };
 use dope_net::{link::slot::Slot, wire::Wire};
 
@@ -25,8 +29,8 @@ impl<'a, H> H1Driver<'a, H> {
     pub fn run_proj<'d, W, C, P>(
         &mut self,
         bytes: &[u8],
-        slot: &mut Slot<'d, W, listener::State<C>>,
-        aux: &mut listener::Aux,
+        slot: &mut Slot<'d, W, State<C>>,
+        egress: &mut EgressCtx<'_, '_>,
         driver: &mut DriverContext<'_, 'd>,
         project: P,
     ) -> bool
@@ -66,9 +70,11 @@ impl<'a, H> H1Driver<'a, H> {
             None => bytes,
         };
 
-        project(&mut slot.state.conn).recv_view = peeked.clone();
+        if let Some(view) = &peeked {
+            project(&mut slot.state.conn).recv_view = Some(view.clone());
+        }
         let close_after = slot.close_after();
-        let mut write = aux.write_buf_for(slot);
+        let mut write = egress.write_buf_for(slot);
         let out = Pipeline::batch(
             project(&mut slot.state.conn),
             self.app.as_mut(),
@@ -77,10 +83,12 @@ impl<'a, H> H1Driver<'a, H> {
             close_after,
         );
         drop(peeked);
-        project(&mut slot.state.conn).recv_view = None;
+        if use_accumulator {
+            project(&mut slot.state.conn).recv_view = None;
+        }
 
         let head_pending = out.head_pending;
-        let overrun = Pipeline::emit(slot, aux, driver, out, use_accumulator, bytes, &project);
+        let overrun = Pipeline::emit(slot, egress, driver, out, use_accumulator, bytes, &project);
         if !overrun {
             Self::begin_body_discard(slot, driver, &project);
         }
@@ -92,8 +100,8 @@ impl<'a, H> H1Driver<'a, H> {
     pub fn send_complete_proj<'d, W, C, P>(
         &mut self,
         _sent: usize,
-        slot: &mut Slot<'d, W, listener::State<C>>,
-        aux: &mut listener::Aux,
+        slot: &mut Slot<'d, W, State<C>>,
+        egress: &mut EgressCtx<'_, '_>,
         driver: &mut DriverContext<'_, 'd>,
         project: P,
     ) where
@@ -112,7 +120,7 @@ impl<'a, H> H1Driver<'a, H> {
         {
             slot.set_close_after();
             if !reason.is_empty() {
-                let buf = aux.write_buf_for(slot);
+                let buf = egress.write_buf_for(slot);
                 let user_data = slot.token();
                 slot.submit_split_static(buf, 0, reason, user_data, driver);
             }
@@ -121,12 +129,12 @@ impl<'a, H> H1Driver<'a, H> {
         if project(&mut slot.state.conn).recv.is_accumulating()
             && !project(&mut slot.state.conn).recv.is_frozen()
         {
-            let _ = self.run_proj(&[], slot, aux, driver, &project);
+            let _ = self.run_proj(&[], slot, egress, driver, &project);
         }
     }
 
     fn begin_body_discard<'d, W, C, P>(
-        slot: &mut Slot<'d, W, listener::State<C>>,
+        slot: &mut Slot<'d, W, State<C>>,
         driver: &mut DriverContext<'_, 'd>,
         project: &P,
     ) where
@@ -156,8 +164,8 @@ impl<'a, H> HeadDeadline<'a, H> {
 
     pub fn poll_proj<'d, W, C, P>(
         &self,
-        slot: &mut Slot<'d, W, listener::State<C>>,
-        aux: &mut listener::Aux,
+        slot: &mut Slot<'d, W, State<C>>,
+        egress: &mut EgressCtx<'_, '_>,
         driver: &mut DriverContext<'_, 'd>,
         project: P,
     ) -> bool
@@ -177,13 +185,13 @@ impl<'a, H> HeadDeadline<'a, H> {
         project(&mut slot.state.conn).head_deadline = None;
         timer.cancel(ticket);
         slot.set_close_after();
-        let buf = aux.write_buf_for(slot);
+        let buf = egress.write_buf_for(slot);
         let user_data = slot.token();
         slot.submit_split_static(buf, 0, crate::CANNED_408, user_data, driver);
         true
     }
 
-    pub fn cancel_proj<'d, W, C, P>(&self, slot: &mut Slot<'d, W, listener::State<C>>, project: P)
+    pub fn cancel_proj<'d, W, C, P>(&self, slot: &mut Slot<'d, W, State<C>>, project: P)
     where
         H: TimerHost<'d>,
         W: Wire,
@@ -197,7 +205,7 @@ impl<'a, H> HeadDeadline<'a, H> {
 
     fn manage<'d, W, C, P>(
         &self,
-        slot: &mut Slot<'d, W, listener::State<C>>,
+        slot: &mut Slot<'d, W, State<C>>,
         head_pending: bool,
         now: Instant,
         project: &P,
@@ -210,10 +218,10 @@ impl<'a, H> HeadDeadline<'a, H> {
     {
         if head_pending {
             if project(&mut slot.state.conn).head_deadline.is_none() {
-                use dope_fiber::Waker;
+                use dope_fiber::raw::task::RootWaker;
                 let timer = TimerHost::timer(self.app);
                 let deadline = now + timer.head_timeout();
-                let wake = Waker::from_ready(slot.driver(), slot.ready_key());
+                let wake = RootWaker::from_ready(slot.driver(), slot.ready_key());
                 if let Some(ticket) = timer.arm(deadline, wake) {
                     project(&mut slot.state.conn).head_deadline = Some(ticket);
                 } else {

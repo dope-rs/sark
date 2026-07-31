@@ -1,7 +1,6 @@
-pub use dope_fiber::{
-    ErasedTaskId, Fiber, FixedSlab, FixedSlabVacantEntry, OwnerFiber, SplitTask, TaskId,
-    try_from_split_task,
-};
+pub use dope_fiber::abi::Fiber;
+pub use dope_fiber::owner::SplitTask;
+pub use dope_fiber::slab::{ErasedTaskId, FixedSlab, FixedSlabVacantEntry, TaskId};
 
 #[doc(hidden)]
 pub trait FixedSlabFiber<'d, Output>: Fiber<'d, Output = Output> {}

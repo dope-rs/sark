@@ -9,4 +9,4 @@ pub(in crate::http::response) use consts::{DATE_LEN, PLACEHOLDER_DATE};
 pub(super) use framing::{ContentLength, TransferEncodingChunked};
 pub(super) use head_write::HeadWrite;
 pub(super) use headers::HeaderSection;
-pub(super) use writer::WireWriter;
+pub(super) use writer::{WireWriter, status_line_len};

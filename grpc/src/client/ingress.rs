@@ -1,4 +1,4 @@
-use o3::buffer::{Bytes, Retained, SharedPool};
+use o3::buffer::{Bytes, Retained, SharedPool, SharedPoolLayout};
 use o3::collections::FixedQueue;
 use sark_h2::{ClientRole, Conn, ConnError, StreamId, conn};
 
@@ -136,9 +136,9 @@ pub(super) struct Ingress {
 }
 
 impl Ingress {
-    pub(super) fn with_config(config: &Config) -> Self {
+    pub(super) fn with_config(config: &Config, message_layout: SharedPoolLayout) -> Self {
         Self {
-            message_pool: SharedPool::new(config.max_pending_msgs, config.max_message_len.max(1)),
+            message_pool: SharedPool::from_layout(message_layout),
             complete: FixedQueue::with_capacity(config.max_completed),
             events: FixedQueue::with_capacity(config.max_events),
             max_buffered_len: config.max_buffered_len,

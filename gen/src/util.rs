@@ -40,37 +40,11 @@ pub(super) trait TypeExt {
 
 impl TypeExt for Type {
     fn option_inner(&self) -> Option<&Type> {
-        let Type::Path(path) = self else {
-            return None;
-        };
-        let seg = path.path.segments.last()?;
-        if seg.ident != "Option" {
-            return None;
-        }
-        let PathArguments::AngleBracketed(args) = &seg.arguments else {
-            return None;
-        };
-        match args.args.first()? {
-            GenericArgument::Type(inner) => Some(inner),
-            _ => None,
-        }
+        generic_inner(self, "Option")
     }
 
     fn vec_inner(&self) -> Option<&Type> {
-        let Type::Path(path) = self else {
-            return None;
-        };
-        let seg = path.path.segments.last()?;
-        if seg.ident != "Vec" {
-            return None;
-        }
-        let PathArguments::AngleBracketed(args) = &seg.arguments else {
-            return None;
-        };
-        match args.args.first()? {
-            GenericArgument::Type(inner) => Some(inner),
-            _ => None,
-        }
+        generic_inner(self, "Vec")
     }
 
     fn value_inner(&self) -> &Type {
@@ -254,6 +228,23 @@ impl TypeExt for Type {
             .ok_or_else(|| {
                 Error::new_spanned(self, "#[request(...)] requires a plain request type")
             })
+    }
+}
+
+fn generic_inner<'a>(ty: &'a Type, want: &str) -> Option<&'a Type> {
+    let Type::Path(path) = ty else {
+        return None;
+    };
+    let seg = path.path.segments.last()?;
+    if seg.ident != want {
+        return None;
+    }
+    let PathArguments::AngleBracketed(args) = &seg.arguments else {
+        return None;
+    };
+    match args.args.first()? {
+        GenericArgument::Type(inner) => Some(inner),
+        _ => None,
     }
 }
 

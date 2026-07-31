@@ -4,8 +4,9 @@ use std::pin::{Pin, pin};
 use std::time::Duration;
 
 use dope::manifold::file::{FileManifold, Files};
-use dope::runtime::{Executor, Session};
-use dope_fiber::{Fiber, SessionExt as _};
+use dope::runtime::executor::{Executor, Session};
+use dope_fiber::abi::Fiber;
+use dope_fiber::extensions::SessionExt as _;
 use o3::cell::BrandCell as Branded;
 use sark::fs::ServeDir;
 use sark_core::http::{Response, StatusCode};
@@ -277,7 +278,7 @@ fn concurrent_async_reads_share_the_global_byte_budget() {
         .read_budget(4096);
 
     enter(|sess, host, files| {
-        let batch = dope_fiber::Batch::from_array([
+        let batch = dope_fiber::abi::batch::Batch::from_array([
             serve.serve_async(files, b"static/first.bin", b""),
             serve.serve_async(files, b"static/second.bin", b""),
         ]);
@@ -305,7 +306,7 @@ fn same_path_async_reads_share_one_budget_lease() {
         .read_budget(4096);
 
     enter(|sess, host, files| {
-        let batch = dope_fiber::Batch::from_array([
+        let batch = dope_fiber::abi::batch::Batch::from_array([
             serve.serve_async(files, b"static/shared.bin", b""),
             serve.serve_async(files, b"static/shared.bin", b""),
         ]);
@@ -336,7 +337,7 @@ fn concurrent_tiny_misses_use_only_the_read_budget() {
         .read_budget(9);
 
     enter(|sess, host, files| {
-        let batch = dope_fiber::Batch::from_array([
+        let batch = dope_fiber::abi::batch::Batch::from_array([
             serve.serve_async(files, b"static/0.bin", b""),
             serve.serve_async(files, b"static/1.bin", b""),
             serve.serve_async(files, b"static/2.bin", b""),

@@ -5,13 +5,13 @@ mod scalar;
 mod scan;
 
 use decode::Decoder;
-use encode::Encoder;
+use encode::ValuePlan;
 use field::FieldMode;
 use proc_macro2::{Span, TokenStream};
-use quote::quote;
+use quote::{format_ident, quote};
 use scan::FieldScanner;
 use syn::parse::{Parse, ParseStream};
-use syn::{Fields, Ident, ItemStruct, Result, Type};
+use syn::{Fields, Ident, ItemStruct, Result, Type, Visibility};
 
 use crate::codegen::value::LengthArms;
 use crate::util::TypeExt;
@@ -96,17 +96,59 @@ impl Parse for JsonMode {
 struct Plan<'a> {
     mode: &'a JsonMode,
     fields: Vec<JsonField>,
+    request_view: bool,
 }
 
 struct JsonField {
     ident: Ident,
     bind: Ident,
     ty: Type,
+    vis: Visibility,
     name: Vec<u8>,
     mode: FieldMode,
 }
 
+struct ObjectEmission {
+    lengths: Vec<TokenStream>,
+    writes: Vec<TokenStream>,
+}
+
+fn json_encode_impl(
+    impl_generics: TokenStream,
+    target: TokenStream,
+    object_base_len: usize,
+    object_open: &TokenStream,
+    lengths: &[TokenStream],
+    writes: &[TokenStream],
+) -> TokenStream {
+    quote! {
+        impl #impl_generics sark::json::JsonEncode for #target {
+            fn json_len(&self) -> usize {
+                #object_base_len #( + #lengths )*
+            }
+
+            fn write_into<__W: sark::json::Write>(
+                &self,
+                __w: &mut __W,
+            ) -> ::core::result::Result<(), __W::Error> {
+                #object_open
+                #( #writes )*
+                __w.put(b"}")?;
+                Ok(())
+            }
+        }
+    }
+}
+
 impl<'a> Plan<'a> {
+    fn decoder<'field>(&self, field: &'field JsonField) -> Decoder<'field> {
+        if self.request_view {
+            Decoder::request_view(&field.ty, field.mode)
+        } else {
+            Decoder::new(&field.ty, field.mode)
+        }
+    }
+
     fn locals(&self) -> Vec<TokenStream> {
         self.fields
             .iter()
@@ -143,7 +185,7 @@ impl<'a> Plan<'a> {
                         },
                     )
                 } else {
-                    let decode = Decoder::new(&field.ty, field.mode).expr()?;
+                    let decode = self.decoder(field).expr()?;
                     (
                         field.name.len(),
                         quote! {
@@ -170,7 +212,7 @@ impl<'a> Plan<'a> {
                 let ident = &field.ident;
                 let bind = &field.bind;
                 if field.mode.unused && self.mode.preserve {
-                    Decoder::new(&field.ty, field.mode)
+                    self.decoder(field)
                         .empty()
                         .map(|empty| quote!(#ident: #empty))
                 } else if field.ty.option_inner().is_some() {
@@ -203,7 +245,7 @@ impl<'a> Plan<'a> {
                         #skip
                     }
                 } else {
-                    let decode = Decoder::new(&field.ty, field.mode).expr()?;
+                    let decode = self.decoder(field).expr()?;
                     quote! {
                         sark::json::Scan::expect_prop(__raw, &mut __idx, #first, #name)?;
                         #bind = Some(#decode);
@@ -224,7 +266,7 @@ impl<'a> Plan<'a> {
                         sark::json::Scan::seek_name(__raw, &mut __idx, #lit)?;
                     }
                 } else {
-                    let decode = Decoder::new(&field.ty, field.mode).expr()?;
+                    let decode = self.decoder(field).expr()?;
                     quote! {
                         sark::json::Scan::seek_name(__raw, &mut __idx, #lit)?;
                         #bind = Some(#decode);
@@ -252,24 +294,24 @@ impl<'a> Plan<'a> {
             .collect()
     }
 
-    fn encoders_and_leners(&self) -> Result<(Vec<TokenStream>, Vec<TokenStream>)> {
+    fn encoding(&self) -> Result<ObjectEmission> {
         let heads = self.field_heads();
-        let mut encoders = Vec::with_capacity(self.fields.len());
-        let mut leners = Vec::with_capacity(self.fields.len());
+        let mut lengths = Vec::with_capacity(self.fields.len());
+        let mut writes = Vec::with_capacity(self.fields.len());
         for (field, head) in self.fields.iter().zip(heads.iter()) {
             let ident = &field.ident;
             let head_lit = syn::LitByteStr::new(head, Span::call_site());
-            let encoder = Encoder::new(&field.ty, field.mode, quote!(self.#ident))?;
-            let write = encoder.write_expr()?;
-            encoders.push(quote! {
-                __w.put(#head_lit);
+            let emission = ValuePlan::new(&field.ty, field.mode, quote!(self.#ident))?.emit();
+            let write = emission.write;
+            writes.push(quote! {
+                __w.put(#head_lit)?;
                 #write
             });
-            let len = encoder.len_expr()?;
+            let len = emission.len;
             let head_len = head.len();
-            leners.push(quote!(#head_len + (#len)));
+            lengths.push(quote!(#head_len + (#len)));
         }
-        Ok((encoders, leners))
+        Ok(ObjectEmission { lengths, writes })
     }
 
     fn scan_fields(&self) -> Result<Vec<TokenStream>> {
@@ -323,12 +365,91 @@ impl<'a> Plan<'a> {
             quote!(sark::json::Scan::skip_value(__raw, &mut __idx)?;)
         }
     }
+
+    fn decode_body(&self) -> Result<TokenStream> {
+        Ok(match (self.mode.kind, self.mode.exact) {
+            (JsonKind::Ordered, true) => {
+                let exact_steps = self.exact_steps()?;
+                quote! {
+                    #(
+                        #exact_steps
+                    )*
+                }
+            }
+            (JsonKind::Unordered, _) => {
+                let match_arms = self.match_arms()?;
+                quote! {
+                    loop {
+                        sark::json::Scan::ws(__raw, &mut __idx);
+                        if sark::json::Scan::eat_byte(__raw, &mut __idx, b'}') {
+                            break;
+                        }
+                        let __name = sark::json::Scan::str_slice(__raw, &mut __idx)?;
+                        sark::json::Scan::ws(__raw, &mut __idx);
+                        sark::json::Scan::expect_byte(__raw, &mut __idx, b':')?;
+                        sark::json::Scan::ws(__raw, &mut __idx);
+                        let mut __handled = false;
+                        match __name.len() {
+                            #( #match_arms )*
+                            _ => {}
+                        }
+                        if !__handled {
+                            sark::json::Scan::skip_value(__raw, &mut __idx)?;
+                        }
+                        sark::json::Scan::ws(__raw, &mut __idx);
+                        if sark::json::Scan::eat_byte(__raw, &mut __idx, b',') {
+                            continue;
+                        }
+                        sark::json::Scan::expect_byte(__raw, &mut __idx, b'}')?;
+                        break;
+                    }
+                }
+            }
+            (JsonKind::Ordered, false) => {
+                let ordered_steps = self.ordered_steps()?;
+                quote! {
+                    #(
+                        #ordered_steps
+                    )*
+                    sark::json::Scan::ws(__raw, &mut __idx);
+                    sark::json::Scan::expect_byte(__raw, &mut __idx, b'}')?;
+                }
+            }
+        })
+    }
+}
+
+fn request_view_scalar_type(ty: &Type, mode: FieldMode) -> Type {
+    if ty.is_bytes_with_storage("Retained") {
+        if mode.raw || mode.plain {
+            return syn::parse_quote!(
+                ::sark::sark_core::http::Bytes<::sark::sark_core::http::Borrowed<'req>>
+            );
+        }
+        return syn::parse_quote!(::sark::json::JsonBytes<'req>);
+    }
+    ty.clone()
+}
+
+fn request_view_type(ty: &Type, mode: FieldMode) -> Result<Type> {
+    if mode.seq || mode.nested {
+        return Err(syn::Error::new_spanned(
+            ty,
+            "request JSON views support only flat fields",
+        ));
+    }
+    if let Some(inner) = ty.option_inner() {
+        let inner = request_view_scalar_type(inner, mode);
+        return Ok(syn::parse_quote!(Option<#inner>));
+    }
+    Ok(request_view_scalar_type(ty, mode))
 }
 
 impl JsonMode {
     pub(super) fn expand(self, mut st: ItemStruct) -> Result<TokenStream> {
         let mode = self;
         let name = st.ident.clone();
+        let vis = st.vis.clone();
         let raw_field = Ident::new("__json_raw", Span::call_site());
         let fields = match &mut st.fields {
             Fields::Named(named) => {
@@ -367,6 +488,7 @@ impl JsonMode {
                             bind: Ident::new(&format!("__f{idx}"), Span::call_site()),
                             ident,
                             ty: field.ty.clone(),
+                            vis: field.vis.clone(),
                             name: field_name.into_bytes(),
                             mode: field_mode,
                         })
@@ -392,6 +514,7 @@ impl JsonMode {
         let plan = Plan {
             mode: &mode,
             fields,
+            request_view: false,
         };
 
         if mode.exact
@@ -406,33 +529,31 @@ impl JsonMode {
             ));
         }
 
-        let (encoders, leners) = plan.encoders_and_leners()?;
+        let ObjectEmission { lengths, writes } = plan.encoding()?;
         let object_base_len = if plan.fields.is_empty() {
             2usize
         } else {
             1usize
         };
         let object_open = if plan.fields.is_empty() {
-            quote!(__w.put(b"{");)
+            quote!(__w.put(b"{")?;)
         } else {
             TokenStream::new()
         };
+        let encode_impl = json_encode_impl(
+            TokenStream::new(),
+            quote!(#name),
+            object_base_len,
+            &object_open,
+            &lengths,
+            &writes,
+        );
         if mode.encode_only {
             st.attrs.retain(|attr| !attr.path().is_ident("json"));
             return Ok(quote! {
                 #st
 
-                impl sark::json::JsonEncode for #name {
-                    fn json_len(&self) -> usize {
-                        #object_base_len #( + #leners )*
-                    }
-
-                    fn write_into<__W: sark::json::Write>(&self, __w: &mut __W) {
-                        #object_open
-                        #( #encoders )*
-                        __w.put(b"}");
-                    }
-                }
+                #encode_impl
             });
         }
 
@@ -515,55 +636,7 @@ impl JsonMode {
             }
         };
 
-        let decode_body = match (mode.kind, mode.exact) {
-            (JsonKind::Ordered, true) => {
-                let exact_steps = plan.exact_steps()?;
-                quote! {
-                    #(
-                        #exact_steps
-                    )*
-                }
-            }
-            (JsonKind::Unordered, _) => {
-                let match_arms = plan.match_arms()?;
-                quote! {
-                    loop {
-                        sark::json::Scan::ws(__raw, &mut __idx);
-                        if sark::json::Scan::eat_byte(__raw, &mut __idx, b'}') {
-                            break;
-                        }
-                        let __name = sark::json::Scan::str_slice(__raw, &mut __idx)?;
-                        sark::json::Scan::ws(__raw, &mut __idx);
-                        sark::json::Scan::expect_byte(__raw, &mut __idx, b':')?;
-                        sark::json::Scan::ws(__raw, &mut __idx);
-                        let mut __handled = false;
-                        match __name.len() {
-                            #( #match_arms )*
-                            _ => {}
-                        }
-                        if !__handled {
-                            sark::json::Scan::skip_value(__raw, &mut __idx)?;
-                        }
-                        sark::json::Scan::ws(__raw, &mut __idx);
-                        if sark::json::Scan::eat_byte(__raw, &mut __idx, b',') {
-                            continue;
-                        }
-                        sark::json::Scan::expect_byte(__raw, &mut __idx, b'}')?;
-                        break;
-                    }
-                }
-            }
-            (JsonKind::Ordered, false) => {
-                let ordered_steps = plan.ordered_steps()?;
-                quote! {
-                    #(
-                        #ordered_steps
-                    )*
-                    sark::json::Scan::ws(__raw, &mut __idx);
-                    sark::json::Scan::expect_byte(__raw, &mut __idx, b'}')?;
-                }
-            }
-        };
+        let decode_body = plan.decode_body()?;
 
         let ctor = if mode.preserve {
             let ctor_args = plan.fields.iter().map(|field| {
@@ -621,10 +694,90 @@ impl JsonMode {
             }
         };
 
+        let request_view_impl = if mode.preserve
+            || plan
+                .fields
+                .iter()
+                .any(|field| field.mode.nested || field.mode.seq)
+        {
+            TokenStream::new()
+        } else {
+            let view_name = format_ident!("{}JsonView", name);
+            let view_fields = plan
+                .fields
+                .iter()
+                .map(|field| {
+                    Ok(JsonField {
+                        ident: field.ident.clone(),
+                        bind: field.bind.clone(),
+                        ty: request_view_type(&field.ty, field.mode)?,
+                        vis: field.vis.clone(),
+                        name: field.name.clone(),
+                        mode: field.mode,
+                    })
+                })
+                .collect::<Result<Vec<_>>>()?;
+            let view_plan = Plan {
+                mode: &mode,
+                fields: view_fields,
+                request_view: true,
+            };
+            let view_field_decls = view_plan.fields.iter().map(|field| {
+                let ident = &field.ident;
+                let ty = &field.ty;
+                let vis = &field.vis;
+                quote!(#vis #ident: #ty)
+            });
+            let view_locals = view_plan.locals();
+            let view_finals = view_plan.finals()?;
+            let view_decode_body = view_plan.decode_body()?;
+            let ObjectEmission {
+                lengths: view_lengths,
+                writes: view_writes,
+            } = view_plan.encoding()?;
+            let view_encode_impl = json_encode_impl(
+                quote!(<'req>),
+                quote!(#view_name<'req>),
+                object_base_len,
+                &object_open,
+                &view_lengths,
+                &view_writes,
+            );
+            quote! {
+                #[allow(dead_code)]
+                #vis struct #view_name<'req> {
+                    #( #view_field_decls, )*
+                    #[doc(hidden)]
+                    __sark_json_marker: ::core::marker::PhantomData<&'req ()>,
+                }
+
+                impl sark::json::JsonRequestDecode for #name {
+                    type View<'req> = #view_name<'req>;
+
+                    fn decode_request<'req>(
+                        __raw: &'req [u8],
+                    ) -> sark::json::Result<Self::View<'req>> {
+                        let mut __idx = 0usize;
+                        sark::json::Scan::ws(__raw, &mut __idx);
+                        sark::json::Scan::expect_byte(__raw, &mut __idx, b'{')?;
+                        #(#view_locals)*
+                        #view_decode_body
+                        Ok(#view_name {
+                            #(#view_finals,)*
+                            __sark_json_marker: ::core::marker::PhantomData,
+                        })
+                    }
+                }
+
+                #view_encode_impl
+            }
+        };
+
         st.attrs.retain(|attr| !attr.path().is_ident("json"));
         Ok(quote! {
             #st
             #ctor
+            #request_view_impl
 
             impl sark::json::JsonDecode for #name {
                 fn decode_json(__bytes: o3::buffer::Shared) -> sark::json::Result<Self> {
@@ -639,17 +792,7 @@ impl JsonMode {
                 #decode_borrowed
             }
 
-            impl sark::json::JsonEncode for #name {
-                fn json_len(&self) -> usize {
-                    #object_base_len #( + #leners )*
-                }
-
-                fn write_into<__W: sark::json::Write>(&self, __w: &mut __W) {
-                    #object_open
-                    #( #encoders )*
-                    __w.put(b"}");
-                }
-            }
+            #encode_impl
 
             #scan_impl
             #preserve_impl

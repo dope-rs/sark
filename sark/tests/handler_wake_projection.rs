@@ -8,10 +8,13 @@ use std::time::{Duration, Instant};
 
 use dope::DriverContext;
 use dope::manifold::Outcome;
-use dope::manifold::listener::{Application, Aux, State};
-use dope_extra::harness::Harness;
+use dope::manifold::listener::{
+    application::{Application, ApplicationHooks},
+    state::{EgressCtx, State},
+};
 use dope_net::link::slot::Slot;
 use dope_net::wire::identity::Identity;
+use dope_test::Harness;
 use http::StatusCode;
 use o3::buffer::RetainBytes;
 use sark::date::{DateHost, Stamp};
@@ -80,19 +83,28 @@ where
 {
     type Conn = Wrap;
     type Wire = Identity;
+    type Hooks = Self;
+}
 
+impl<'d, A> ApplicationHooks<'d, Demux<A>> for Demux<A>
+where
+    A: Application<'d, Conn = ConnState, Wire = Identity>
+        + DateHost
+        + TimerHost<'d>
+        + H1Project<'d, Identity>,
+{
     fn chunk<R: RetainBytes>(
-        self: std::pin::Pin<&mut Self>,
-        slot: &mut Slot<'d, Self::Wire, State<Self::Conn>>,
+        app: std::pin::Pin<&mut Demux<A>>,
+        slot: &mut Slot<'d, Identity, State<Wrap>>,
+        mut egress: EgressCtx<'_, '_>,
         chunk: R,
-        aux: &mut Aux,
         driver: &mut DriverContext<'_, 'd>,
     ) -> Outcome {
         let bytes = chunk.as_slice();
-        if self
+        if app
             .project()
             .inner
-            .chunk_proj(slot, bytes, aux, driver, proj)
+            .chunk_proj(slot, bytes, &mut egress, driver, proj)
         {
             Outcome::Overrun
         } else {
@@ -101,32 +113,34 @@ where
     }
 
     fn send(
-        self: std::pin::Pin<&mut Self>,
-        slot: &mut Slot<'d, Self::Wire, State<Self::Conn>>,
+        app: std::pin::Pin<&mut Demux<A>>,
+        slot: &mut Slot<'d, Identity, State<Wrap>>,
+        mut egress: EgressCtx<'_, '_>,
         sent: usize,
-        aux: &mut Aux,
         driver: &mut DriverContext<'_, 'd>,
     ) {
-        self.project()
+        app.project()
             .inner
-            .send_proj(slot, proj, sent, aux, driver);
+            .send_proj(slot, proj, sent, &mut egress, driver);
     }
 
     fn activate(
-        self: std::pin::Pin<&mut Self>,
-        slot: &mut Slot<'d, Self::Wire, State<Self::Conn>>,
-        aux: &mut Aux,
+        app: std::pin::Pin<&mut Demux<A>>,
+        slot: &mut Slot<'d, Identity, State<Wrap>>,
+        mut egress: EgressCtx<'_, '_>,
         driver: &mut DriverContext<'_, 'd>,
     ) {
-        self.project().inner.activate_proj(slot, proj, aux, driver);
+        app.project()
+            .inner
+            .activate_proj(slot, proj, &mut egress, driver);
     }
 
     fn close(
-        self: std::pin::Pin<&mut Self>,
-        slot: &mut Slot<'d, Self::Wire, State<Self::Conn>>,
-        aux: &mut Aux,
+        app: std::pin::Pin<&mut Demux<A>>,
+        slot: &mut Slot<'d, Identity, State<Wrap>>,
+        mut egress: EgressCtx<'_, '_>,
     ) {
-        self.project().inner.close_proj(slot, proj, aux);
+        app.project().inner.close_proj(slot, proj, &mut egress);
     }
 }
 
@@ -152,7 +166,8 @@ fn async_route_resumes_through_non_identity_projection() {
             |_ctx, trigger| {
                 let driver_config =
                     driver::Config::for_tcp_profile::<Throughput>(support::MAX_CONNECTIONS);
-                let executor = Executor::new(driver_config)?;
+                let executor = Executor::new(driver_config)?
+                    .with_storage(dope_net::link::egress::storage::Storage::default());
                 executor.enter(|mut session| {
                     let timer = sark::Timer::with_capacity(32);
                     server.clone().serve(

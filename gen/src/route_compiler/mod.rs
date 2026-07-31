@@ -52,6 +52,11 @@ impl Method {
         }
     }
 
+    pub(super) fn bit_token(self) -> TokenStream {
+        let key = self.key_token();
+        quote!(#key.bit())
+    }
+
     pub(super) fn key_token(self) -> TokenStream {
         let path: syn::Path = match self {
             Self::Get => parse_quote!(sark::service::Key::Get),
@@ -61,6 +66,19 @@ impl Method {
             Self::Delete => parse_quote!(sark::service::Key::Delete),
             Self::Head => parse_quote!(sark::service::Key::Head),
             Self::Options => parse_quote!(sark::service::Key::Options),
+        };
+        quote!(#path)
+    }
+
+    pub(super) fn http_token(self) -> TokenStream {
+        let path: syn::Path = match self {
+            Self::Get => parse_quote!(::http::Method::GET),
+            Self::Post => parse_quote!(::http::Method::POST),
+            Self::Put => parse_quote!(::http::Method::PUT),
+            Self::Patch => parse_quote!(::http::Method::PATCH),
+            Self::Delete => parse_quote!(::http::Method::DELETE),
+            Self::Head => parse_quote!(::http::Method::HEAD),
+            Self::Options => parse_quote!(::http::Method::OPTIONS),
         };
         quote!(#path)
     }

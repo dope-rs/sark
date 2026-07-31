@@ -1,10 +1,10 @@
 use http::Method;
-use sark_core::http::codec::ParsedRequestHead;
+use sark_core::http::codec::RequestLine;
 
 pub struct Ctx<'a> {
     pub method: &'a Method,
     pub head_bytes: &'a [u8],
-    pub head: &'a ParsedRequestHead<'a>,
+    pub head: &'a RequestLine<'a>,
     pub date: &'a [u8; 29],
 }
 

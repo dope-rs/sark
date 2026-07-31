@@ -1,16 +1,22 @@
-pub trait Write {
-    fn put(&mut self, src: &[u8]);
+use std::convert::Infallible;
 
-    fn put_str(&mut self, value: &[u8]) {
-        self.put(b"\"");
+use o3::buffer::ByteSink;
+
+pub trait Write: ByteSink {
+    fn put(&mut self, src: &[u8]) -> Result<(), Self::Error> {
+        self.write_slice(src)
+    }
+
+    fn put_str(&mut self, value: &[u8]) -> Result<(), Self::Error> {
+        self.put(b"\"")?;
         let mut start = 0usize;
         let mut idx = 0usize;
         while idx < value.len() {
             if let Some(token) = Encode::esc_token(value[idx]) {
                 if start != idx {
-                    self.put(&value[start..idx]);
+                    self.put(&value[start..idx])?;
                 }
-                self.put(token.as_bytes());
+                self.put(token.as_bytes())?;
                 idx += 1;
                 start = idx;
                 continue;
@@ -18,21 +24,18 @@ pub trait Write {
             idx += 1;
         }
         if start != value.len() {
-            self.put(&value[start..]);
+            self.put(&value[start..])?;
         }
-        self.put(b"\"");
+        self.put(b"\"")
     }
 
-    fn put_str_plain(&mut self, value: &[u8]) {
-        self.put(b"\"");
-        self.put(value);
-        self.put(b"\"");
+    fn put_str_plain(&mut self, value: &[u8]) -> Result<(), Self::Error> {
+        self.write_slices([b"\"".as_slice(), value, b"\"".as_slice()])
     }
 
-    fn put_u64(&mut self, value: u64) {
+    fn put_u64(&mut self, value: u64) -> Result<(), Self::Error> {
         if value == 0 {
-            self.put(b"0");
-            return;
+            return self.put(b"0");
         }
         let mut digits = [0u8; 20];
         let mut idx = digits.len();
@@ -42,24 +45,26 @@ pub trait Write {
             digits[idx] = b'0' + (value % 10) as u8;
             value /= 10;
         }
-        self.put(&digits[idx..]);
+        self.put(&digits[idx..])
     }
 
-    fn put_i64(&mut self, value: i64) {
+    fn put_i64(&mut self, value: i64) -> Result<(), Self::Error> {
         if value < 0 {
-            self.put(b"-");
+            self.put(b"-")?;
         }
-        self.put_u64(value.unsigned_abs());
+        self.put_u64(value.unsigned_abs())
     }
 
-    fn put_f64(&mut self, value: f64) {
+    fn put_f64(&mut self, value: f64) -> Result<(), Self::Error> {
         if value.is_finite() {
-            self.put(ryu::Buffer::new().format_finite(value).as_bytes());
+            self.put(ryu::Buffer::new().format_finite(value).as_bytes())
         } else {
-            self.put(b"null");
+            self.put(b"null")
         }
     }
 }
+
+impl<W: ByteSink + ?Sized> Write for W {}
 
 pub struct Writer<'a> {
     inner: &'a mut Vec<u8>,
@@ -78,44 +83,11 @@ impl<'a> Writer<'a> {
     }
 }
 
-impl Write for Writer<'_> {
-    fn put(&mut self, src: &[u8]) {
-        self.inner.extend_from_slice(src);
-    }
-}
+impl ByteSink for Writer<'_> {
+    type Error = Infallible;
 
-impl Write for o3::buffer::Owned {
-    fn put(&mut self, src: &[u8]) {
-        self.extend_from_slice(src);
-    }
-}
-
-pub(crate) struct SliceWriter<'a> {
-    out: &'a mut [u8],
-    len: usize,
-}
-
-impl<'a> SliceWriter<'a> {
-    pub(crate) fn new(out: &'a mut [u8]) -> Self {
-        Self { out, len: 0 }
-    }
-
-    pub(crate) fn finish(self) -> usize {
-        self.len
-    }
-}
-
-impl Write for SliceWriter<'_> {
-    fn put(&mut self, src: &[u8]) {
-        let end = self
-            .len
-            .checked_add(src.len())
-            .expect("JSON output length overflow");
-        self.out
-            .get_mut(self.len..end)
-            .expect("JsonEncode wrote beyond json_len")
-            .copy_from_slice(src);
-        self.len = end;
+    fn write_slices<const N: usize>(&mut self, slices: [&[u8]; N]) -> Result<(), Self::Error> {
+        self.inner.write_slices(slices)
     }
 }
 

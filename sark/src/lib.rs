@@ -1,4 +1,6 @@
 #[doc(hidden)]
+pub use memchr as __memchr;
+#[doc(hidden)]
 pub use o3;
 #[doc(hidden)]
 pub use pin_project_lite::pin_project as __pin_project;
@@ -13,9 +15,6 @@ pub mod dispatch;
 #[doc(hidden)]
 pub mod fiber;
 #[doc(hidden)]
-pub mod parser;
-#[doc(hidden)]
-pub use parser::framer;
 pub mod fs;
 pub mod middleware;
 pub mod request;
@@ -28,7 +27,7 @@ pub mod service;
 
 pub use dope::manifold::listener;
 #[doc(hidden)]
-pub use dope::manifold::listener::Application;
+pub use dope::manifold::listener::application::Application;
 pub use dope_fiber::{fiber, fiber_fn};
 pub use dope_net::{tcp, tcp::Tcp};
 pub use sark_gen::body;

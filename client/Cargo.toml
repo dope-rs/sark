@@ -17,10 +17,9 @@ dope-net.workspace = true
 dope-fiber.workspace = true
 dope-gen.workspace = true
 o3.workspace = true
-cartel-core = "0.8"
+cartel-core = "0.9"
 http = "1.4.2"
 
 [dev-dependencies]
-dope-extra.workspace = true
 flate2 = "1"
 pin-project.workspace = true

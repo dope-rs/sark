@@ -1,4 +1,4 @@
-use o3::buffer::{Owned, Shared};
+use o3::buffer::{ByteSink, Owned, Shared};
 
 pub struct Wire;
 
@@ -54,17 +54,19 @@ impl Wire {
 
     pub fn chunk_frame(body: Shared) -> Shared {
         let (prefix, prefix_len) = Self::chunk_prefix(body.len());
-        let capacity = prefix_len
-            .checked_add(body.len())
-            .and_then(|len| len.checked_add(2))
-            .expect("chunk frame length overflow");
-        Owned::try_build_exact(capacity, |out| {
-            out.try_extend_from_slice(&prefix[..prefix_len])?;
-            out.try_extend_from_slice(&body)?;
-            out.try_extend_from_slice(b"\r\n")
-        })
-        .expect("chunk frame length mismatch")
-        .freeze()
+        let capacity = prefix_len + body.len() + 2;
+        match Owned::try_build_exact(capacity, |out| {
+            out.write_slices([&prefix[..prefix_len], &body, b"\r\n"])
+        }) {
+            Ok(out) => out.freeze(),
+            Err(_) => {
+                let mut out = Vec::with_capacity(capacity);
+                match out.write_slices([&prefix[..prefix_len], &body, b"\r\n"]) {
+                    Ok(()) => Shared::from(out),
+                    Err(error) => match error {},
+                }
+            }
+        }
     }
 }
 

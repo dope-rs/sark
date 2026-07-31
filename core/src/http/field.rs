@@ -1,7 +1,8 @@
+use std::convert::Infallible;
 use std::fmt;
 use std::ops::Range;
 
-use o3::buffer::{Pooled, SharedPool, SpareWriter};
+use o3::buffer::{ByteSink, PoolLayoutError, Pooled, SharedPool, SharedPoolLayout};
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub struct Field<'a> {
@@ -174,51 +175,53 @@ pub struct PackedFields<S> {
     second: Option<S>,
 }
 
-trait PackedWriter {
-    fn extend(&mut self, bytes: &[u8]);
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum PackedFieldError<E> {
+    Write(E),
+    ComponentTooLarge { len: usize },
+    ValueLengthMismatch { expected: usize, actual: usize },
 }
 
-impl PackedWriter for Vec<u8> {
-    fn extend(&mut self, bytes: &[u8]) {
-        self.extend_from_slice(bytes);
+fn write_packed_prefix<W: ByteSink>(
+    writer: &mut W,
+    name: &[u8],
+    value_len: usize,
+) -> Result<(), PackedFieldError<W::Error>> {
+    let name_len = packed_len(name.len())?;
+    let value_len = packed_len(value_len)?;
+    writer
+        .write_slices([&name_len, &value_len, name])
+        .map_err(PackedFieldError::Write)
+}
+
+fn packed_len<E>(len: usize) -> Result<[u8; 4], PackedFieldError<E>> {
+    match u32::try_from(len) {
+        Ok(len) => Ok(len.to_ne_bytes()),
+        Err(_) => Err(PackedFieldError::ComponentTooLarge { len }),
     }
 }
 
-impl PackedWriter for SpareWriter<'_> {
-    fn extend(&mut self, bytes: &[u8]) {
-        self.try_extend_from_slice(bytes)
-            .expect("precomputed field block capacity");
-    }
+fn write_packed_field<W: ByteSink>(
+    writer: &mut W,
+    field: Field<'_>,
+) -> Result<(), PackedFieldError<W::Error>> {
+    let name_len = packed_len(field.name.len())?;
+    let value_len = packed_len(field.value.len())?;
+    writer
+        .write_slices([&name_len, &value_len, field.name, field.value])
+        .map_err(PackedFieldError::Write)
 }
 
-fn write_packed_prefix(writer: &mut impl PackedWriter, name: &[u8], value_len: usize) {
-    let name_len = packed_len(name.len());
-    let value_len = packed_len(value_len);
-    writer.extend(&name_len);
-    writer.extend(&value_len);
-    writer.extend(name);
-}
-
-fn packed_len(len: usize) -> [u8; 4] {
-    u32::try_from(len)
-        .expect("field component length overflow")
-        .to_ne_bytes()
-}
-
-fn write_packed_field(writer: &mut impl PackedWriter, field: Field<'_>) {
-    write_packed_prefix(writer, field.name, field.value.len());
-    writer.extend(field.value);
-}
-
-fn packed_capacity(fields: &[Field<'_>]) -> usize {
-    fields.iter().fold(0usize, |size, field| {
+fn packed_capacity(fields: &[Field<'_>]) -> Option<usize> {
+    fields.iter().try_fold(0usize, |size, field| {
+        u32::try_from(field.name.len()).ok()?;
+        u32::try_from(field.value.len()).ok()?;
         field
             .name
             .len()
-            .checked_add(field.value.len())
-            .and_then(|field_len| field_len.checked_add(8))
-            .and_then(|field_len| size.checked_add(field_len))
-            .expect("field block size overflow")
+            .checked_add(field.value.len())?
+            .checked_add(8)?
+            .checked_add(size)
     })
 }
 
@@ -253,19 +256,21 @@ impl FieldBlock<PackedFields<Pooled>> {
         Self::from_storage(PackedFields::new(pooled))
     }
 
-    pub fn from_fields(fields: &[Field<'_>]) -> Self {
-        let capacity = packed_capacity(fields);
-        let pool = SharedPool::new(1, capacity.max(1));
-        let mut lease = pool.try_acquire().expect("new field pool has one slot");
+    pub fn from_fields(fields: &[Field<'_>]) -> Result<Self, PoolLayoutError> {
+        let capacity = packed_capacity(fields).ok_or(PoolLayoutError::CapacityOverflow)?;
+        let layout = SharedPoolLayout::new(1, capacity.max(1))?;
+        let pool = SharedPool::from_layout(layout);
+        let mut lease = pool.try_acquire().ok_or(PoolLayoutError::SlotOverflow)?;
         let mut writer = lease.spare_writer();
         for field in fields {
-            write_packed_field(&mut writer, *field);
+            write_packed_field(&mut writer, *field)
+                .map_err(|_| PoolLayoutError::CapacityOverflow)?;
         }
         drop(writer);
-        Self::from_pooled(lease.freeze())
+        Ok(Self::from_pooled(lease.freeze()))
     }
 
-    pub fn from_headers(fields: &[Field<'_>]) -> Self {
+    pub fn from_headers(fields: &[Field<'_>]) -> Result<Self, PoolLayoutError> {
         Self::from_fields(fields)
     }
 
@@ -291,8 +296,8 @@ impl FieldBlock<PackedFields<Vec<u8>>> {
         Self::from_storage(PackedFields::new(Vec::with_capacity(capacity)))
     }
 
-    pub fn push(&mut self, name: &[u8], value: &[u8]) {
-        self.push_encoded(name, value.len(), |writer| writer.extend_from_slice(value));
+    pub fn push(&mut self, name: &[u8], value: &[u8]) -> Result<(), PackedFieldError<Infallible>> {
+        write_packed_field(&mut self.storage.first, Field::new(name, value))
     }
 
     pub fn push_encoded(
@@ -300,24 +305,29 @@ impl FieldBlock<PackedFields<Vec<u8>>> {
         name: &[u8],
         value_len: usize,
         encode: impl FnOnce(&mut FieldValueWriter<'_>),
-    ) {
-        write_packed_prefix(&mut self.storage.first, name, value_len);
+    ) -> Result<(), PackedFieldError<Infallible>> {
+        let field_start = self.storage.first.len();
+        write_packed_prefix(&mut self.storage.first, name, value_len)?;
         let start = self.storage.first.len();
         encode(&mut FieldValueWriter {
             bytes: &mut self.storage.first,
         });
-        assert_eq!(
-            self.storage.first.len() - start,
-            value_len,
-            "encoded field value length mismatch"
-        );
+        let actual = self.storage.first.len() - start;
+        if actual != value_len {
+            self.storage.first.truncate(field_start);
+            return Err(PackedFieldError::ValueLengthMismatch {
+                expected: value_len,
+                actual,
+            });
+        }
+        Ok(())
     }
 
     pub fn try_push_parts<E>(
         &mut self,
         encode_name: impl FnOnce(&mut FieldValueWriter<'_>) -> Result<(), E>,
         encode_value: impl FnOnce(&mut FieldValueWriter<'_>, usize) -> Result<(), E>,
-    ) -> Result<(usize, usize), E> {
+    ) -> Result<(usize, usize), PackedFieldError<E>> {
         let field_start = self.storage.first.len();
         self.storage.first.extend_from_slice(&[0; 8]);
         let name_start = self.storage.first.len();
@@ -325,7 +335,7 @@ impl FieldBlock<PackedFields<Vec<u8>>> {
             bytes: &mut self.storage.first,
         }) {
             self.storage.first.truncate(field_start);
-            return Err(error);
+            return Err(PackedFieldError::Write(error));
         }
         let value_start = self.storage.first.len();
         let name_len = value_start - name_start;
@@ -336,12 +346,26 @@ impl FieldBlock<PackedFields<Vec<u8>>> {
             name_len,
         ) {
             self.storage.first.truncate(field_start);
-            return Err(error);
+            return Err(PackedFieldError::Write(error));
         }
         let end = self.storage.first.len();
         let value_len = end - value_start;
-        self.storage.first[field_start..field_start + 4].copy_from_slice(&packed_len(name_len));
-        self.storage.first[field_start + 4..name_start].copy_from_slice(&packed_len(value_len));
+        let name_len_bytes = match packed_len(name_len) {
+            Ok(len) => len,
+            Err(error) => {
+                self.storage.first.truncate(field_start);
+                return Err(error);
+            }
+        };
+        let value_len_bytes = match packed_len(value_len) {
+            Ok(len) => len,
+            Err(error) => {
+                self.storage.first.truncate(field_start);
+                return Err(error);
+            }
+        };
+        self.storage.first[field_start..field_start + 4].copy_from_slice(&name_len_bytes);
+        self.storage.first[field_start + 4..name_start].copy_from_slice(&value_len_bytes);
         Ok((name_len, value_len))
     }
 

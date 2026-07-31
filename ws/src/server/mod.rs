@@ -3,8 +3,10 @@ use std::net::SocketAddr;
 
 use dope::manifold::env::Bundle;
 use dope::manifold::listener::Listener;
+use dope::runtime::launcher::WorkerContext;
 use dope::runtime::profile::Throughput;
-use dope::runtime::{ShutdownTrigger, WorkerContext};
+use dope::runtime::trigger::ShutdownTrigger;
+use dope_net::link::egress::storage::Storage as EgressStorage;
 use dope_net::tcp::Tcp;
 use dope_net::wire::identity::Identity;
 
@@ -28,7 +30,7 @@ pub struct Config {
 struct Dispatcher<'d, H: Handler> {
     #[pin]
     #[manifold]
-    listener: Listener<'d, 0, App<H>, WsEnv>,
+    listener: Listener<'d, 'd, 0, App<H>, WsEnv>,
 }
 
 pub fn serve<H: Handler>(
@@ -37,7 +39,7 @@ pub fn serve<H: Handler>(
     context: WorkerContext,
     shutdown: Option<&ShutdownTrigger>,
 ) -> io::Result<()> {
-    let listener_cfg = dope::manifold::listener::Config::<Tcp> {
+    let listener_cfg = dope::manifold::listener::config::Config::<Tcp> {
         max_connections: cfg.max_connections,
         bind: cfg.bind,
         backlog: cfg.backlog,
@@ -50,21 +52,25 @@ pub fn serve<H: Handler>(
         egress: Default::default(),
     };
     let driver_config = dope::driver::Config::for_tcp_profile::<Throughput>(cfg.max_connections);
-    dope::runtime::Executor::with_seed(driver_config, context.seed())?.enter(|mut sess| {
-        let hash_builder = sess.seed().derive(dope::hash::domain::ACCEPT).state();
-        let listener = {
-            let mut driver = sess.driver_access();
-            if let Some(trigger) = shutdown {
-                trigger.try_register(&mut driver)?;
-            }
-            Listener::<'_, 0, App<H>, WsEnv>::open_in(
-                App::new(handler, cfg.path, cfg.max_frame_payload),
-                listener_cfg,
-                hash_builder,
-                &mut driver,
-            )?
-        };
-        let app = core::pin::pin!(o3::cell::BrandCell::new(Dispatcher { listener }));
-        sess.run(app.as_ref())
-    })
+    dope::runtime::executor::Executor::with_seed(driver_config, context.seed())?
+        .with_storage(EgressStorage::default())
+        .enter(|mut sess| {
+            let egress = sess.storage();
+            let hash_builder = sess.seed().derive(dope::hash::domain::ACCEPT).state();
+            let listener = {
+                let mut driver = sess.driver_access();
+                if let Some(trigger) = shutdown {
+                    trigger.try_register(&mut driver)?;
+                }
+                Listener::<'_, '_, 0, App<H>, WsEnv>::open_in(
+                    App::new(handler, cfg.path, cfg.max_frame_payload),
+                    listener_cfg,
+                    hash_builder,
+                    egress,
+                    &mut driver,
+                )?
+            };
+            let app = core::pin::pin!(o3::cell::BrandCell::new(Dispatcher { listener }));
+            sess.run(app.as_ref())
+        })
 }

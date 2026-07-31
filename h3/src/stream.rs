@@ -1,3 +1,5 @@
+use dope_quic::varint::VarInt;
+
 #[derive(Copy, Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct StreamId(pub u64);
 
@@ -50,13 +52,13 @@ pub enum UniStreamType {
 }
 
 impl UniStreamType {
-    pub const fn from_wire(value: u64) -> Self {
+    pub const fn from_wire(value: VarInt) -> Self {
         match value {
             crate::frame::STREAM_TYPE_CONTROL => Self::Control,
             crate::frame::STREAM_TYPE_PUSH => Self::Push,
             crate::frame::STREAM_TYPE_QPACK_ENCODER => Self::QpackEncoder,
             crate::frame::STREAM_TYPE_QPACK_DECODER => Self::QpackDecoder,
-            value => Self::Unknown(value),
+            value => Self::Unknown(value.get()),
         }
     }
 

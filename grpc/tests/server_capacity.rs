@@ -3,12 +3,17 @@ use std::net::TcpStream;
 use std::thread;
 use std::time::Duration;
 
-use dope_extra::harness::Harness;
+use dope_test::Harness;
 use sark_grpc::Status;
 use sark_grpc::headers::HeaderBlock;
 use sark_grpc::metadata::Metadata;
-use sark_grpc::server::{Config, Handler, Limits, Request, Response};
+use sark_grpc::server::{Config, ConfigError, Handler, Limits, Request, Response, ValidatedLimits};
 use sark_h2::{ClientRole, Conn, ErrorCode, StreamId, conn};
+
+fn sid(raw: u32) -> StreamId {
+    assert!(raw <= StreamId::MAX, "invalid test stream ID");
+    StreamId::new(raw).expect("range checked above")
+}
 
 struct Nop;
 
@@ -23,9 +28,21 @@ fn connect(bind: std::net::SocketAddr) -> TcpStream {
 }
 
 impl Handler for Nop {
-    fn request(&mut self, _request: Request, response: &mut Response) {
+    fn request(&mut self, _context: &mut (), _request: Request, response: &mut Response) {
         response.status = Status::ok();
     }
+}
+
+#[test]
+fn invalid_limits_fail_before_listener_or_connection_construction() {
+    let result = ValidatedLimits::new(Limits {
+        max_in_flight: 0,
+        ..Limits::default()
+    });
+    assert!(matches!(
+        result,
+        Err(ConfigError::ZeroCapacity("max_in_flight"))
+    ));
 }
 
 #[test]
@@ -55,11 +72,11 @@ fn configured_capacity_is_built_at_accept() {
                     HeaderBlock::for_request(b"/svc/Method", None, &Metadata::new()).unwrap();
                 assert_eq!(
                     client.start_request_fields(headers.iter(), true).unwrap(),
-                    StreamId(1)
+                    sid(1)
                 );
                 assert_eq!(
                     client.start_request_fields(headers.iter(), true).unwrap(),
-                    StreamId(3)
+                    sid(3)
                 );
                 transport.write_all(client.outbound()).unwrap();
                 client.drain_outbound(client.outbound().len());
@@ -71,7 +88,7 @@ fn configured_capacity_is_built_at_accept() {
                 let mut refused = false;
                 while let Some(event) = client.poll_event() {
                     if let conn::Event::StreamReset { stream_id, error } = event {
-                        refused |= stream_id == StreamId(3) && error == ErrorCode::RefusedStream;
+                        refused |= stream_id == sid(3) && error == ErrorCode::RefusedStream;
                     }
                 }
                 assert!(refused);

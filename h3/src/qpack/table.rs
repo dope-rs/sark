@@ -50,18 +50,39 @@ impl DynamicTable {
     }
 
     pub fn insert(&mut self, field: OwnedField) -> Result<Option<u64>, DecoderError> {
-        let entry_size = Self::entry_size(field.name.len(), field.value.len());
+        let name_len = field.name.len();
+        let value_len = field.value.len();
+        self.insert_with(name_len, value_len, || field)
+    }
+
+    pub(super) fn insert_field(&mut self, field: Field<'_>) -> Result<Option<u64>, DecoderError> {
+        self.insert_with(field.name.len(), field.value.len(), || {
+            OwnedField::from(field)
+        })
+    }
+
+    fn insert_with(
+        &mut self,
+        name_len: usize,
+        value_len: usize,
+        make_field: impl FnOnce() -> OwnedField,
+    ) -> Result<Option<u64>, DecoderError> {
+        let Some(entry_size) = Self::entry_size(name_len, value_len) else {
+            return Ok(None);
+        };
         if entry_size > self.capacity {
             return Ok(None);
         }
-        while self.size + entry_size > self.capacity {
-            self.evict_oldest()?;
-        }
         let absolute = self.insert_count;
-        self.insert_count = self
+        let next_insert_count = self
             .insert_count
             .checked_add(1)
             .ok_or(DecoderError::BadInteger)?;
+        while self.size > self.capacity - entry_size {
+            self.evict_oldest()?;
+        }
+        let field = make_field();
+        self.insert_count = next_insert_count;
         self.size += entry_size;
         self.entries.push_front(field);
         Ok(Some(absolute))
@@ -130,14 +151,16 @@ impl DynamicTable {
         let Some(field) = self.entries.pop_back() else {
             return Err(DecoderError::EncoderStream);
         };
+        let entry_size = Self::entry_size(field.name.len(), field.value.len())
+            .ok_or(DecoderError::BadInteger)?;
         self.size = self
             .size
-            .checked_sub(Self::entry_size(field.name.len(), field.value.len()))
+            .checked_sub(entry_size)
             .ok_or(DecoderError::BadInteger)?;
         Ok(())
     }
 
-    fn entry_size(name_len: usize, value_len: usize) -> usize {
-        name_len + value_len + 32
+    fn entry_size(name_len: usize, value_len: usize) -> Option<usize> {
+        name_len.checked_add(value_len)?.checked_add(32)
     }
 }

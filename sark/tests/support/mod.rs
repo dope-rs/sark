@@ -14,7 +14,7 @@ pub type TestHttpsServer = HttpsServer<HTTP_LISTENER_ID, DATE_UPDATER_ID, Throug
 
 pub fn http_server(bind: SocketAddr, head_timeout: Duration) -> TestHttpServer {
     HttpServer::new(
-        listener::Config::<Tcp> {
+        listener::config::Config::<Tcp> {
             bind,
             max_connections: MAX_CONNECTIONS,
             backlog: 16,
@@ -34,7 +34,7 @@ pub fn http_server(bind: SocketAddr, head_timeout: Duration) -> TestHttpServer {
 
 pub fn https_server(bind: SocketAddr, head_timeout: Duration) -> TestHttpsServer {
     HttpsServer::new(
-        listener::Config::<Tcp> {
+        listener::config::Config::<Tcp> {
             bind,
             max_connections: MAX_CONNECTIONS,
             backlog: 16,

@@ -8,12 +8,12 @@ use std::thread;
 use std::time::Duration;
 
 use dope::driver;
-use dope::manifold::connector::Connector;
-use dope::manifold::connector::source::Static;
+use dope::manifold::connector::session::Connector;
+use dope::manifold::connector::source::health::Static;
 use dope::manifold::env::Bundle;
-use dope::runtime::Executor;
+use dope::runtime::executor::Executor;
 use dope::runtime::profile::Balanced;
-use dope_fiber::SessionExt as _;
+use dope_fiber::extensions::SessionExt as _;
 use dope_net::tcp::Tcp;
 use dope_net::wire::identity::Identity;
 use o3::cell::BrandCell as Branded;
@@ -44,16 +44,18 @@ pub(crate) fn run_gets(
         );
     exec.enter(|mut sess| {
         let backoff = sess.seed().derive(dope::hash::domain::BACKOFF).state();
-        // The port is stored for the full executor session. Preserve its driver
-        // lifetime brand while releasing the short borrow needed to access the
-        // driver itself.
-        let port = sess.storage() as *const Port<'_>;
-        let port = unsafe { &*port };
+        let port = sess.storage();
         let upstreams = Static::<Tcp>::new(vec![addr], Duration::from_millis(200), backoff);
         let conn = {
             let mut driver = sess.driver_access();
-            Connector::new(Session::new(port), upstreams, port.capacity(), &mut driver)
-                .expect("connector")
+            Connector::new(
+                Session::new(port),
+                upstreams,
+                port.capacity(),
+                port.egress(),
+                &mut driver,
+            )
+            .expect("connector")
         };
         let rt = pin!(Branded::new(ConnRt {
             conn,
@@ -91,15 +93,18 @@ pub(crate) fn run_gets_with_gap(
         );
     exec.enter(|mut sess| {
         let backoff = sess.seed().derive(dope::hash::domain::BACKOFF).state();
-        // See `run_gets`: the raw pointer only separates two non-overlapping
-        // borrows of the same session; the port never outlives the session.
-        let port = sess.storage() as *const Port<'_>;
-        let port = unsafe { &*port };
+        let port = sess.storage();
         let upstreams = Static::<Tcp>::new(vec![addr], Duration::from_millis(200), backoff);
         let conn = {
             let mut driver = sess.driver_access();
-            Connector::new(Session::new(port), upstreams, port.capacity(), &mut driver)
-                .expect("connector")
+            Connector::new(
+                Session::new(port),
+                upstreams,
+                port.capacity(),
+                port.egress(),
+                &mut driver,
+            )
+            .expect("connector")
         };
         let rt = pin!(Branded::new(ConnRt {
             conn,
@@ -143,14 +148,12 @@ pub(crate) fn run_get(
         );
     exec.enter(|mut sess| {
         let backoff = sess.seed().derive(dope::hash::domain::BACKOFF).state();
-        // See `run_gets`: retain the port's driver brand across the mutable
-        // driver access without extending the executor session itself.
-        let port = sess.storage() as *const Port<'_>;
-        let port = unsafe { &*port };
+        let port = sess.storage();
         let upstreams = Static::<Tcp>::new(vec![addr], Duration::from_millis(200), backoff);
         let conn = {
             let mut driver = sess.driver_access();
-            Connector::new(Session::new(port), upstreams, 1, &mut driver).expect("connector")
+            Connector::new(Session::new(port), upstreams, 1, port.egress(), &mut driver)
+                .expect("connector")
         };
         let rt = pin!(Branded::new(ConnRt {
             conn,
@@ -165,6 +168,67 @@ pub(crate) fn run_get(
         result
             .map_err(|error| error.to_string())?
             .map_err(|error| error.to_string())
+    })
+}
+
+pub(crate) fn run_stream_get(
+    addr: SocketAddr,
+    config: Config,
+    path: &'static str,
+) -> Result<(u16, Vec<u8>, usize, usize), String> {
+    use sark_client::connector::ResponseEvent;
+
+    let exec = Executor::new(driver::Config::for_tcp_profile::<Balanced>(4))
+        .expect("driver")
+        .with_storage_factory(
+            Port::factory(config, 1, 1).expect("the test request pool layout is valid"),
+        );
+    exec.enter(|mut sess| {
+        let backoff = sess.seed().derive(dope::hash::domain::BACKOFF).state();
+        let port = sess.storage();
+        let upstreams = Static::<Tcp>::new(vec![addr], Duration::from_millis(200), backoff);
+        let conn = {
+            let mut driver = sess.driver_access();
+            Connector::new(Session::new(port), upstreams, 1, port.egress(), &mut driver)
+                .expect("connector")
+        };
+        let rt = pin!(Branded::new(ConnRt {
+            conn,
+            _ph: PhantomData,
+        }));
+        let client = HttpHandle::from_cell(ConnRt::conn_ref(rt.as_ref().borrow_pin(sess.token())));
+
+        sess.block_on(rt.as_ref(), client.wait_active())
+            .map_err(|error| error.to_string())?
+            .map_err(|error| error.to_string())?;
+        let mut stream = sess
+            .block_on(rt.as_ref(), client.get_stream(path))
+            .map_err(|error| error.to_string())?
+            .map_err(|error| error.to_string())?;
+        let mut status = None;
+        let mut body = Vec::new();
+        let mut trailer_count = 0;
+        let mut informational_count = 0;
+        loop {
+            let event = sess
+                .block_on(rt.as_ref(), stream.next_event())
+                .map_err(|error| error.to_string())?;
+            let Some(event) = event else {
+                break;
+            };
+            match event.map_err(|error| error.to_string())? {
+                ResponseEvent::Informational(_) => informational_count += 1,
+                ResponseEvent::Head(response) => status = Some(response.status().as_u16()),
+                ResponseEvent::Data(data) => body.extend_from_slice(data.as_ref()),
+                ResponseEvent::Trailers(trailers) => trailer_count += trailers.len(),
+            }
+        }
+        Ok((
+            status.ok_or_else(|| "missing final response head".to_owned())?,
+            body,
+            trailer_count,
+            informational_count,
+        ))
     })
 }
 

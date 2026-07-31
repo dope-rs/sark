@@ -1,10 +1,13 @@
+mod common;
+
+use common::{flen, sid, win};
 use sark_h2::frame::{
     Frame, GoAway as GoAwayFrame, Ping as PingFrame, SettingId, Settings as SettingsFrame,
     WindowUpdate as WindowUpdateFrame,
 };
 use sark_h2::{
     CLIENT_PREFACE, ClientRole, Conn, ConnError, ErrorCode, FrameHeader, ServerRole, Settings,
-    StreamId, conn, frame,
+    conn, frame,
 };
 
 fn server() -> Conn<ServerRole> {
@@ -22,10 +25,7 @@ fn settings_frame_bytes(params: &[(u16, u32)], ack: bool) -> Vec<u8> {
         payload.extend_from_slice(&val.to_be_bytes());
     }
     let mut out = Vec::new();
-    let frame = SettingsFrame {
-        ack,
-        params: &payload,
-    };
+    let frame = SettingsFrame::new(ack, &payload).unwrap();
     frame.encode(&mut out);
     out
 }
@@ -38,20 +38,17 @@ fn ping_frame_bytes(opaque: [u8; 8], ack: bool) -> Vec<u8> {
 
 fn goaway_frame_bytes(last: u32, err: ErrorCode, debug: &[u8]) -> Vec<u8> {
     let mut out = Vec::new();
-    GoAwayFrame {
-        last_stream_id: StreamId(last),
-        error: err,
-        debug,
-    }
-    .encode(&mut out);
+    GoAwayFrame::new(sid(last), err, debug)
+        .unwrap()
+        .encode(&mut out);
     out
 }
 
 fn window_update_bytes(stream_id: u32, inc: u32) -> Vec<u8> {
     let mut out = Vec::new();
     WindowUpdateFrame {
-        stream_id: StreamId(stream_id),
-        increment: inc,
+        stream_id: sid(stream_id),
+        increment: win(inc),
     }
     .encode(&mut out);
     out
@@ -60,7 +57,7 @@ fn window_update_bytes(stream_id: u32, inc: u32) -> Vec<u8> {
 fn drain_initial_settings_frame(conn_outbound: &[u8]) -> (FrameHeader, usize) {
     let h = FrameHeader::parse(conn_outbound).unwrap();
     assert_eq!(h.kind, frame::Type::Settings);
-    let total = 9 + h.length as usize;
+    let total = 9 + h.length.as_usize();
     (h, total)
 }
 
@@ -143,7 +140,7 @@ fn server_peer_settings_applied_emits_ack_and_event() {
     let h = FrameHeader::parse(out).unwrap();
     assert_eq!(h.kind, frame::Type::Settings);
     assert!(h.flags.has(sark_h2::Flags::ACK));
-    assert_eq!(h.length, 0);
+    assert_eq!(h.length.as_u32(), 0);
     assert_eq!(conn.poll_event().unwrap(), conn::Event::SettingsApplied);
 }
 
@@ -207,11 +204,14 @@ fn server_settings_payload_not_multiple_of_six() {
 
     let bad_payload = vec![0u8; 7];
     let mut bytes = Vec::new();
-    SettingsFrame {
-        ack: false,
-        params: &bad_payload,
+    FrameHeader {
+        length: flen(bad_payload.len() as u32),
+        kind: frame::Type::Settings,
+        flags: sark_h2::Flags(0),
+        stream_id: sid(0),
     }
     .encode(&mut bytes);
+    bytes.extend_from_slice(&bad_payload);
     let err = conn.ingest(&bytes).unwrap_err();
     assert!(matches!(err, ConnError::ParseError(_)));
 }
@@ -225,11 +225,14 @@ fn server_settings_ack_with_payload_is_bad() {
 
     let payload = vec![0u8; 6];
     let mut bytes = Vec::new();
-    SettingsFrame {
-        ack: true,
-        params: &payload,
+    FrameHeader {
+        length: flen(payload.len() as u32),
+        kind: frame::Type::Settings,
+        flags: sark_h2::Flags(sark_h2::Flags::ACK),
+        stream_id: sid(0),
     }
     .encode(&mut bytes);
+    bytes.extend_from_slice(&payload);
     let err = conn.ingest(&bytes).unwrap_err();
     assert!(matches!(err, ConnError::ParseError(_)));
 }
@@ -301,7 +304,7 @@ fn server_peer_goaway_received() {
             error,
             debug,
         } => {
-            assert_eq!(last_stream_id, StreamId(7));
+            assert_eq!(last_stream_id, sid(7));
             assert_eq!(error, ErrorCode::InternalError);
             assert_eq!(debug, b"down");
         }
@@ -345,10 +348,10 @@ fn server_window_update_zero_protocol() {
     payload.extend_from_slice(&0u32.to_be_bytes());
     let mut bytes = Vec::new();
     FrameHeader {
-        length: 4,
+        length: flen(4),
         kind: frame::Type::WindowUpdate,
         flags: sark_h2::Flags(0),
-        stream_id: StreamId(0),
+        stream_id: sid(0),
     }
     .encode(&mut bytes);
     bytes.extend_from_slice(&payload);
@@ -366,10 +369,10 @@ fn server_headers_bad_hpack_block_yields_error() {
     let payload = vec![0u8; 4];
     let mut bytes = Vec::new();
     FrameHeader {
-        length: payload.len() as u32,
+        length: flen(payload.len() as u32),
         kind: frame::Type::Headers,
         flags: sark_h2::Flags(sark_h2::Flags::END_HEADERS | sark_h2::Flags::END_STREAM),
-        stream_id: StreamId(1),
+        stream_id: sid(1),
     }
     .encode(&mut bytes);
     bytes.extend_from_slice(&payload);
@@ -387,10 +390,10 @@ fn server_data_without_open_stream_protocol_error() {
     let payload = vec![0u8; 16];
     let mut bytes = Vec::new();
     FrameHeader {
-        length: payload.len() as u32,
+        length: flen(payload.len() as u32),
         kind: frame::Type::Data,
         flags: sark_h2::Flags(0),
-        stream_id: StreamId(1),
+        stream_id: sid(1),
     }
     .encode(&mut bytes);
     bytes.extend_from_slice(&payload);
@@ -408,10 +411,10 @@ fn server_rst_stream_on_idle_stream_protocol_error() {
     let payload = (ErrorCode::Cancel as u32).to_be_bytes();
     let mut bytes = Vec::new();
     FrameHeader {
-        length: 4,
+        length: flen(4),
         kind: frame::Type::RstStream,
         flags: sark_h2::Flags(0),
-        stream_id: StreamId(1),
+        stream_id: sid(1),
     }
     .encode(&mut bytes);
     bytes.extend_from_slice(&payload);

@@ -1,7 +1,9 @@
 use std::io::{self, Error};
 use std::marker::PhantomData;
 use std::net::SocketAddr;
+use std::ops::Deref;
 use std::pin::{Pin, pin};
+use std::{error, fmt};
 
 mod call;
 mod egress;
@@ -11,24 +13,33 @@ pub use call::{MessageIter, MessageList};
 use egress::Egress;
 
 use dope::manifold::env::Bundle;
-use dope::manifold::listener::{self, Application, Listener, SlotEgress};
+use dope::manifold::listener::{
+    Listener,
+    application::{Application, ApplicationHooks},
+    config,
+    egress::SlotEgress,
+    state::{EgressCtx, State},
+};
+use dope::runtime::executor::Executor;
+use dope::runtime::launcher::WorkerContext;
 use dope::runtime::profile::Throughput;
-use dope::runtime::{Executor, ShutdownTrigger, WorkerContext};
+use dope::runtime::trigger::ShutdownTrigger;
 use dope::{DriverContext, manifold};
 use dope::{hash::domain::ACCEPT, manifold::Outcome};
+use dope_net::link::egress::storage::Storage as EgressStorage;
 use dope_net::link::slot::Slot;
+use dope_net::tcp::{Tcp, listener};
 use dope_net::wire::Wire;
 use dope_net::wire::identity::Identity;
-use dope_net::{tcp, tcp::Tcp};
-use dope_tls::tls::{Endpoint, Tls};
-use o3::buffer::{RetainBytes, SharedPool};
+use dope_tls::tls::{Endpoint, SessionStorage, Tls};
+use o3::buffer::{PoolLayoutError, RetainBytes, SharedPool, SharedPoolLayout};
 use o3::cell::BrandCell;
 use o3::collections::{FixedHashTable, FixedQueue};
 use sark_core::identity_mut;
 use sark_h2::conn::{DataPayload, Event};
 use sark_h2::server::driver::{Driver, Transport};
 use sark_h2::tuning::Tuning;
-use sark_h2::{Conn, ErrorCode, ServerRole, StreamId, conn, hpack};
+use sark_h2::{Conn, ErrorCode, ServerRole, StreamId, ValidatedConfig, conn, hpack};
 use shin::server;
 
 use crate::Codec;
@@ -50,18 +61,110 @@ pub struct Limits {
     pub max_pending_len: usize,
 }
 
+const DEFAULT_MAX_MESSAGE_LEN: usize = 4 * 1024 * 1024;
+const DEFAULT_MAX_FRAGMENTED_MESSAGES: usize = 4;
+
 impl Default for Limits {
     fn default() -> Self {
         Self {
             max_in_flight: 256,
-            max_message_len: 4 * 1024 * 1024,
-            max_fragmented_messages: 4,
+            max_message_len: DEFAULT_MAX_MESSAGE_LEN,
+            max_fragmented_messages: DEFAULT_MAX_FRAGMENTED_MESSAGES,
             max_buffered_len: <Throughput as Tuning>::MAX_BODY_LEN,
             max_buffered_msgs: 8192,
             max_conn_buffered_len: <Throughput as Tuning>::MAX_CONN_BUFFERED_LEN,
             max_pending_replies: 8192,
             max_pending_len: <Throughput as Tuning>::MAX_CONN_BUFFERED_LEN,
         }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ConfigError {
+    ZeroCapacity(&'static str),
+    H2(sark_h2::ConfigError),
+    Pool(PoolLayoutError),
+}
+
+impl fmt::Display for ConfigError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::ZeroCapacity(name) => write!(formatter, "{name} capacity must be positive"),
+            Self::H2(error) => error.fmt(formatter),
+            Self::Pool(error) => error.fmt(formatter),
+        }
+    }
+}
+
+impl error::Error for ConfigError {}
+
+impl From<sark_h2::ConfigError> for ConfigError {
+    fn from(error: sark_h2::ConfigError) -> Self {
+        Self::H2(error)
+    }
+}
+
+impl From<PoolLayoutError> for ConfigError {
+    fn from(error: PoolLayoutError) -> Self {
+        Self::Pool(error)
+    }
+}
+
+#[derive(Clone)]
+pub struct ValidatedLimits {
+    limits: Limits,
+    h2: ValidatedConfig<ServerRole>,
+    message_layout: SharedPoolLayout,
+}
+
+impl ValidatedLimits {
+    pub fn new(limits: Limits) -> Result<Self, ConfigError> {
+        for (name, capacity) in [
+            ("max_in_flight", limits.max_in_flight),
+            ("max_pending_replies", limits.max_pending_replies),
+        ] {
+            if capacity == 0 {
+                return Err(ConfigError::ZeroCapacity(name));
+            }
+        }
+        let h2 = ValidatedConfig::new(conn::Config {
+            stream_capacity: limits.max_in_flight,
+            ..conn::Config::default()
+        })?;
+        let message_layout = SharedPoolLayout::new(
+            limits.max_fragmented_messages,
+            limits.max_message_len.max(1),
+        )?;
+        Ok(Self {
+            limits,
+            h2,
+            message_layout,
+        })
+    }
+
+    pub fn into_inner(self) -> Limits {
+        self.limits
+    }
+}
+
+impl Default for ValidatedLimits {
+    fn default() -> Self {
+        Self {
+            limits: Limits::default(),
+            h2: ValidatedConfig::default(),
+            message_layout: SharedPoolLayout::fixed::<
+                DEFAULT_MAX_FRAGMENTED_MESSAGES,
+                DEFAULT_MAX_MESSAGE_LEN,
+            >(),
+        }
+    }
+}
+
+impl Deref for ValidatedLimits {
+    type Target = Limits;
+
+    fn deref(&self) -> &Self::Target {
+        &self.limits
     }
 }
 
@@ -82,7 +185,7 @@ type TlsEnv = Bundle<Tcp, Tls, Throughput>;
 struct Dispatcher<'d, H: Handler> {
     #[pin]
     #[manifold]
-    listener: Listener<'d, 0, App<H>, Env>,
+    listener: Listener<'d, 'd, 0, App<H>, Env>,
 }
 
 #[pin_project::pin_project]
@@ -90,20 +193,20 @@ struct Dispatcher<'d, H: Handler> {
 struct TlsDispatcher<'d, H: Handler> {
     #[pin]
     #[manifold]
-    listener: Listener<'d, 0, App<H, Tls>, TlsEnv>,
+    listener: Listener<'d, 'd, 0, App<H, Tls>, TlsEnv>,
     #[pin]
     #[manifold(optional)]
-    readiness: Option<Listener<'d, 1, liveness::Liveness, Env>>,
+    readiness: Option<Listener<'d, 'd, 1, liveness::Liveness, Env>>,
 }
 
 impl Config {
-    fn listener_config(&self, bind: SocketAddr) -> listener::Config<Tcp> {
-        listener::Config::<Tcp> {
+    fn listener_config(&self, bind: SocketAddr) -> config::Config<Tcp> {
+        config::Config::<Tcp> {
             max_connections: self.max_connections,
             bind,
             backlog: self.backlog,
             stream: Default::default(),
-            transport: tcp::listener::Config {
+            transport: listener::Config {
                 reuse_port: true,
                 per_ip_limit: Some((self.max_connections / 2) as u32),
                 ..Default::default()
@@ -119,10 +222,13 @@ impl Config {
         shutdown: Option<&ShutdownTrigger>,
     ) -> io::Result<()> {
         let driver = dope::driver::Config::for_tcp_profile::<Throughput>(self.max_connections);
-        let exec = Executor::with_seed(driver, context.seed())?;
+        let exec =
+            Executor::with_seed(driver, context.seed())?.with_storage(EgressStorage::default());
         exec.enter(|mut sess| {
+            let egress = sess.storage();
             let hash_builder = sess.seed().derive(ACCEPT).state();
-            let mut app = App::with_config(handler, self.grpc.clone());
+            let mut app = App::with_config(handler, self.grpc.clone())
+                .map_err(|error| Error::new(io::ErrorKind::InvalidInput, error))?;
             app.liveness_fallback = self.readiness.is_some();
             let listener = {
                 let mut driver = sess.driver_access();
@@ -133,6 +239,7 @@ impl Config {
                     app,
                     self.listener_config(self.bind),
                     hash_builder,
+                    egress,
                     &mut driver,
                 )?
             };
@@ -144,25 +251,36 @@ impl Config {
     pub fn serve_tls<H: Handler>(
         self,
         handler: H,
-        tls_cfg: server::Config,
+        tls_cfg: server::config::Config,
         context: WorkerContext,
         shutdown: Option<&ShutdownTrigger>,
     ) -> io::Result<()> {
         let driver = dope::driver::Config::for_tcp_profile::<Throughput>(self.max_connections);
-        let exec = Executor::with_seed(driver, context.seed())?;
+        let tls_storage = SessionStorage::try_with_capacity(self.max_connections)?;
+        let exec = Executor::with_seed(driver, context.seed())?.with_storage((
+            EgressStorage::default(),
+            EgressStorage::default(),
+            tls_storage,
+        ));
         exec.enter(|mut sess| {
+            let (egress, readiness_egress, tls_storage) = sess.storage();
             let accept_hash = sess.seed().derive(ACCEPT).state();
             let readiness_hash = sess.seed().derive(ACCEPT ^ 1).state();
+            let wire = Endpoint::server(tls_cfg)
+                .map_err(Error::other)?
+                .bind(tls_storage);
             let (listener, readiness) = {
                 let mut driver = sess.driver_access();
                 if let Some(trigger) = shutdown {
                     trigger.try_register(&mut driver)?;
                 }
                 let listener = Listener::<0, App<H, Tls>, TlsEnv>::open_in_with_wire(
-                    App::with_config(handler, self.grpc.clone()),
+                    App::with_config(handler, self.grpc.clone())
+                        .map_err(|error| Error::new(io::ErrorKind::InvalidInput, error))?,
                     self.listener_config(self.bind),
-                    Endpoint::server(tls_cfg).map_err(Error::other)?,
+                    wire,
                     accept_hash,
+                    egress,
                     &mut driver,
                 )?;
                 let readiness = match self.readiness {
@@ -170,6 +288,7 @@ impl Config {
                         liveness::Liveness,
                         self.listener_config(addr),
                         readiness_hash,
+                        readiness_egress,
                         &mut driver,
                     )?),
                     None => None,
@@ -186,9 +305,11 @@ impl Config {
 }
 
 mod liveness {
+    use dope::manifold::listener::state::{EgressCtx, State};
+
     use super::{
-        Application, DriverContext, Identity, Outcome, Pin, RetainBytes, Slot, SlotEgress, Wire,
-        listener,
+        Application, ApplicationHooks, DriverContext, Identity, Outcome, Pin, RetainBytes, Slot,
+        SlotEgress, Wire,
     };
 
     const RESPONSE: &[u8] = b"HTTP/1.1 200 OK\r\ncontent-length: 0\r\nconnection: close\r\n\r\n";
@@ -204,15 +325,15 @@ mod liveness {
         }
 
         pub(super) fn respond<'d, W: Wire, C: Default + 'static>(
-            slot: &mut Slot<'d, W, listener::State<C>>,
-            aux: &mut listener::Aux,
+            slot: &mut Slot<'d, W, State<C>>,
+            egress: &mut EgressCtx<'_, '_>,
             driver: &mut DriverContext<'_, 'd>,
         ) {
             if slot.is_send_inflight() {
                 return;
             }
             let ud = slot.token();
-            let mut buf = aux.write_buf_for(slot);
+            let mut buf = egress.write_buf_for(slot);
             buf[..RESPONSE.len()].copy_from_slice(RESPONSE);
             slot.set_close_after();
             SlotEgress::submit_buffered(slot, buf, RESPONSE.len(), ud, driver);
@@ -222,32 +343,19 @@ mod liveness {
     impl<'d> Application<'d> for Liveness {
         type Conn = ();
         type Wire = Identity;
+        type Hooks = Self;
+    }
 
+    impl<'d> ApplicationHooks<'d, Liveness> for Liveness {
         fn chunk<R: RetainBytes>(
-            self: Pin<&mut Self>,
-            slot: &mut Slot<'d, Identity, listener::State<()>>,
+            _app: Pin<&mut Liveness>,
+            slot: &mut Slot<'d, Identity, State<()>>,
+            mut egress: EgressCtx<'_, '_>,
             _chunk: R,
-            aux: &mut listener::Aux,
             driver: &mut DriverContext<'_, 'd>,
         ) -> Outcome {
-            Self::respond(slot, aux, driver);
+            Self::respond(slot, &mut egress, driver);
             Outcome::Ok
-        }
-
-        fn send(
-            self: Pin<&mut Self>,
-            _slot: &mut Slot<'d, Identity, listener::State<()>>,
-            _sent: usize,
-            _aux: &mut listener::Aux,
-            _driver: &mut DriverContext<'_, 'd>,
-        ) {
-        }
-
-        fn close(
-            self: Pin<&mut Self>,
-            _slot: &mut Slot<'d, Identity, listener::State<()>>,
-            _aux: &mut listener::Aux,
-        ) {
         }
     }
 }
@@ -330,7 +438,7 @@ impl StreamRoutes {
         if self
             .map
             .try_insert(
-                u64::from(stream_id.0),
+                u64::from(stream_id.as_u32()),
                 StreamRoute { stream_id, route },
                 |entry| entry.stream_id == stream_id,
             )
@@ -342,13 +450,17 @@ impl StreamRoutes {
 
     fn route(&self, stream_id: StreamId) -> Option<usize> {
         self.map
-            .get(u64::from(stream_id.0), |entry| entry.stream_id == stream_id)
+            .get(u64::from(stream_id.as_u32()), |entry| {
+                entry.stream_id == stream_id
+            })
             .map(|entry| entry.route)
     }
 
     fn release(&mut self, stream_id: StreamId) -> Option<usize> {
         self.map
-            .remove(u64::from(stream_id.0), |entry| entry.stream_id == stream_id)
+            .remove(u64::from(stream_id.as_u32()), |entry| {
+                entry.stream_id == stream_id
+            })
             .map(|entry| entry.route)
     }
 }
@@ -359,82 +471,42 @@ impl Default for StreamRoutes {
     }
 }
 
-pub trait Handler: 'static {
+pub trait Handler<C = ()>: 'static {
     fn start(
         &mut self,
+        context: &mut C,
         routes: &mut StreamRoutes,
         stream_id: StreamId,
         head: &RequestHead,
         reply: &mut StreamReply,
     ) -> StreamMode {
-        let _ = (routes, stream_id, head, reply);
+        let _ = (context, routes, stream_id, head, reply);
         StreamMode::Buffered
     }
 
     fn message(
         &mut self,
+        context: &mut C,
         routes: &mut StreamRoutes,
         stream_id: StreamId,
         message: MessageFrame,
         reply: &mut StreamReply,
     ) {
-        let _ = (routes, stream_id, message, reply);
+        let _ = (context, routes, stream_id, message, reply);
     }
 
     fn trailers(
         &mut self,
+        context: &mut C,
         routes: &mut StreamRoutes,
         stream_id: StreamId,
         trailers: Metadata,
         reply: &mut StreamReply,
     ) {
-        let _ = (routes, stream_id, trailers, reply);
+        let _ = (context, routes, stream_id, trailers, reply);
     }
 
-    fn request(&mut self, request: Request<'_>, response: &mut Response);
-}
-
-/// A route handler that borrows one service owned by its dispatcher.
-///
-/// Unlike cloning a reference-counted interior-mutable handle into every
-/// route, this makes the single mutable service borrow explicit at dispatch
-/// and has no runtime ownership or borrow bookkeeping.
-pub trait ServiceHandler<S>: 'static {
-    fn start(
-        &mut self,
-        service: &mut S,
-        routes: &mut StreamRoutes,
-        stream_id: StreamId,
-        head: &RequestHead,
-        reply: &mut StreamReply,
-    ) -> StreamMode {
-        let _ = (service, routes, stream_id, head, reply);
-        StreamMode::Buffered
-    }
-
-    fn message(
-        &mut self,
-        service: &mut S,
-        routes: &mut StreamRoutes,
-        stream_id: StreamId,
-        message: MessageFrame,
-        reply: &mut StreamReply,
-    ) {
-        let _ = (service, routes, stream_id, message, reply);
-    }
-
-    fn trailers(
-        &mut self,
-        service: &mut S,
-        routes: &mut StreamRoutes,
-        stream_id: StreamId,
-        trailers: Metadata,
-        reply: &mut StreamReply,
-    ) {
-        let _ = (service, routes, stream_id, trailers, reply);
-    }
-
-    fn request(&mut self, service: &mut S, request: Request<'_>, response: &mut Response);
+    fn request(&mut self, context: &mut C, request: Request<'_>, response: &mut Response);
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -500,18 +572,31 @@ impl Default for StreamReply {
     }
 }
 
-pub struct Routes<H: Handler> {
+pub struct Routes<H, C = ()>
+where
+    H: Handler<C>,
+{
+    context: C,
     routes: Vec<Route<H>>,
 }
 
-struct Route<H: Handler> {
+struct Route<H> {
     path: Vec<u8>,
     handler: H,
 }
 
 impl<H: Handler> Routes<H> {
     pub fn new() -> Self {
-        Self { routes: Vec::new() }
+        Self::with_context(())
+    }
+}
+
+impl<H: Handler<C>, C> Routes<H, C> {
+    pub fn with_context(context: C) -> Self {
+        Self {
+            context,
+            routes: Vec::new(),
+        }
     }
 
     pub fn route(mut self, path: &[u8], handler: H) -> Self {
@@ -533,99 +618,10 @@ impl<H: Handler> Default for Routes<H> {
     }
 }
 
-impl<H: Handler> Handler for Routes<H> {
+impl<H: Handler<C>, C: 'static> Handler for Routes<H, C> {
     fn start(
         &mut self,
-        routes: &mut StreamRoutes,
-        stream_id: StreamId,
-        head: &RequestHead,
-        reply: &mut StreamReply,
-    ) -> StreamMode {
-        let Some(route_idx) = self.routes.iter().position(|route| route.path == head.path) else {
-            return StreamMode::Buffered;
-        };
-        let mode = self.routes[route_idx]
-            .handler
-            .start(routes, stream_id, head, reply);
-        if mode == StreamMode::Live {
-            routes.bind(stream_id, route_idx);
-        }
-        mode
-    }
-
-    fn message(
-        &mut self,
-        routes: &mut StreamRoutes,
-        stream_id: StreamId,
-        message: MessageFrame,
-        reply: &mut StreamReply,
-    ) {
-        let Some(route_idx) = routes.route(stream_id) else {
-            return;
-        };
-        self.routes[route_idx]
-            .handler
-            .message(routes, stream_id, message, reply);
-    }
-
-    fn trailers(
-        &mut self,
-        routes: &mut StreamRoutes,
-        stream_id: StreamId,
-        trailers: Metadata,
-        reply: &mut StreamReply,
-    ) {
-        let Some(route_idx) = routes.release(stream_id) else {
-            return;
-        };
-        self.routes[route_idx]
-            .handler
-            .trailers(routes, stream_id, trailers, reply);
-    }
-
-    fn request(&mut self, request: Request<'_>, response: &mut Response) {
-        let Some(route) = self
-            .routes
-            .iter_mut()
-            .find(|route| route.path == request.head.path)
-        else {
-            response.status = Status::new(Code::Unimplemented, "unknown gRPC method");
-            return;
-        };
-        route.handler.request(request, response);
-    }
-}
-
-/// Path dispatcher that owns its service exactly once.
-pub struct ServiceRoutes<S, H: ServiceHandler<S>> {
-    service: S,
-    routes: Vec<ServiceRoute<H>>,
-}
-
-struct ServiceRoute<H> {
-    path: Vec<u8>,
-    handler: H,
-}
-
-impl<S, H: ServiceHandler<S>> ServiceRoutes<S, H> {
-    pub fn new(service: S) -> Self {
-        Self {
-            service,
-            routes: Vec::new(),
-        }
-    }
-
-    pub fn push(&mut self, path: &[u8], handler: H) {
-        self.routes.push(ServiceRoute {
-            path: path.to_vec(),
-            handler,
-        });
-    }
-}
-
-impl<S: 'static, H: ServiceHandler<S>> Handler for ServiceRoutes<S, H> {
-    fn start(
-        &mut self,
+        _context: &mut (),
         routes: &mut StreamRoutes,
         stream_id: StreamId,
         head: &RequestHead,
@@ -637,7 +633,7 @@ impl<S: 'static, H: ServiceHandler<S>> Handler for ServiceRoutes<S, H> {
         let mode =
             self.routes[route_idx]
                 .handler
-                .start(&mut self.service, routes, stream_id, head, reply);
+                .start(&mut self.context, routes, stream_id, head, reply);
         if mode == StreamMode::Live {
             routes.bind(stream_id, route_idx);
         }
@@ -646,6 +642,7 @@ impl<S: 'static, H: ServiceHandler<S>> Handler for ServiceRoutes<S, H> {
 
     fn message(
         &mut self,
+        _context: &mut (),
         routes: &mut StreamRoutes,
         stream_id: StreamId,
         message: MessageFrame,
@@ -655,7 +652,7 @@ impl<S: 'static, H: ServiceHandler<S>> Handler for ServiceRoutes<S, H> {
             return;
         };
         self.routes[route_idx].handler.message(
-            &mut self.service,
+            &mut self.context,
             routes,
             stream_id,
             message,
@@ -665,6 +662,7 @@ impl<S: 'static, H: ServiceHandler<S>> Handler for ServiceRoutes<S, H> {
 
     fn trailers(
         &mut self,
+        _context: &mut (),
         routes: &mut StreamRoutes,
         stream_id: StreamId,
         trailers: Metadata,
@@ -674,7 +672,7 @@ impl<S: 'static, H: ServiceHandler<S>> Handler for ServiceRoutes<S, H> {
             return;
         };
         self.routes[route_idx].handler.trailers(
-            &mut self.service,
+            &mut self.context,
             routes,
             stream_id,
             trailers,
@@ -682,7 +680,7 @@ impl<S: 'static, H: ServiceHandler<S>> Handler for ServiceRoutes<S, H> {
         );
     }
 
-    fn request(&mut self, request: Request<'_>, response: &mut Response) {
+    fn request(&mut self, _context: &mut (), request: Request<'_>, response: &mut Response) {
         let Some(route) = self
             .routes
             .iter_mut()
@@ -691,7 +689,7 @@ impl<S: 'static, H: ServiceHandler<S>> Handler for ServiceRoutes<S, H> {
             response.status = Status::new(Code::Unimplemented, "unknown gRPC method");
             return;
         };
-        route.handler.request(&mut self.service, request, response);
+        route.handler.request(&mut self.context, request, response);
     }
 }
 
@@ -707,6 +705,7 @@ fn dispatch_request(
     }
     let mut response = Response::new();
     handler.request(
+        &mut (),
         Request {
             stream_id,
             head,
@@ -726,7 +725,12 @@ impl Limits {
         body: &[u8],
     ) -> Response {
         let mut deframer = Deframer::new(self.max_message_len);
-        let input_pool = SharedPool::new(1, body.len().max(1));
+        let Ok(input_pool) = SharedPool::try_new(1, body.len().max(1)) else {
+            return Response::with_status(Status::new(
+                Code::ResourceExhausted,
+                "request is too large",
+            ));
+        };
         let Some(mut lease) = input_pool.try_acquire() else {
             return Response::with_status(Status::new(
                 Code::ResourceExhausted,
@@ -740,7 +744,12 @@ impl Limits {
             ));
         }
         let mut input = DataChunk::from_pooled(lease.freeze());
-        let fragment_pool = SharedPool::new(1, self.max_message_len.max(1));
+        let Ok(fragment_pool) = SharedPool::try_new(1, self.max_message_len.max(1)) else {
+            return Response::with_status(Status::new(
+                Code::ResourceExhausted,
+                "request message buffer is unavailable",
+            ));
+        };
         let capacity = self
             .max_buffered_msgs
             .min(body.len() / 5 + usize::from(!body.is_empty()));
@@ -761,7 +770,7 @@ impl Limits {
         }
         dispatch_request(
             handler,
-            StreamId(0),
+            StreamId::CONNECTION,
             head,
             MessageList::from_queue(&queue),
             Metadata::new(),
@@ -806,22 +815,14 @@ impl<T> UnaryResponse<T> {
     }
 }
 
-pub trait UnaryHandler: 'static {
-    type Request;
-    type Response;
-    type Codec: Codec<Decode = Self::Request, Encode = Self::Response>;
-
-    fn unary(&mut self, request: UnaryRequest<Self::Request>) -> UnaryResponse<Self::Response>;
-}
-
-pub trait UnaryService<S>: 'static {
+pub trait UnaryHandler<C = ()>: 'static {
     type Request;
     type Response;
     type Codec: Codec<Decode = Self::Request, Encode = Self::Response>;
 
     fn unary(
         &mut self,
-        service: &mut S,
+        context: &mut C,
         request: UnaryRequest<Self::Request>,
     ) -> UnaryResponse<Self::Response>;
 }
@@ -862,25 +863,14 @@ impl<T> StreamingResponse<T> {
     }
 }
 
-pub trait StreamingHandler: 'static {
+pub trait StreamingHandler<C = ()>: 'static {
     type Request;
     type Response;
     type Codec: Codec<Decode = Self::Request, Encode = Self::Response>;
 
     fn stream(
         &mut self,
-        request: StreamingRequest<Self::Request>,
-    ) -> StreamingResponse<Self::Response>;
-}
-
-pub trait StreamingService<S>: 'static {
-    type Request;
-    type Response;
-    type Codec: Codec<Decode = Self::Request, Encode = Self::Response>;
-
-    fn stream(
-        &mut self,
-        service: &mut S,
+        context: &mut C,
         request: StreamingRequest<Self::Request>,
     ) -> StreamingResponse<Self::Response>;
 }
@@ -944,86 +934,91 @@ impl<T> Default for LiveResponse<T> {
     }
 }
 
-pub trait LiveStreamingHandler: 'static {
+pub trait LiveStreamingHandler<C = ()>: 'static {
     type Request;
     type Response;
     type Codec: Codec<Decode = Self::Request, Encode = Self::Response>;
 
-    fn start(&mut self, stream_id: StreamId, head: &RequestHead) -> LiveResponse<Self::Response> {
-        let _ = (stream_id, head);
+    fn start(
+        &mut self,
+        context: &mut C,
+        stream_id: StreamId,
+        head: &RequestHead,
+    ) -> LiveResponse<Self::Response> {
+        let _ = (context, stream_id, head);
         LiveResponse::new()
     }
 
-    fn message(&mut self, message: LiveMessage<Self::Request>) -> LiveResponse<Self::Response>;
+    fn message(
+        &mut self,
+        context: &mut C,
+        message: LiveMessage<Self::Request>,
+    ) -> LiveResponse<Self::Response>;
 
-    fn trailers(&mut self, trailers: LiveTrailers) -> LiveResponse<Self::Response> {
-        let _ = trailers;
+    fn trailers(
+        &mut self,
+        context: &mut C,
+        trailers: LiveTrailers,
+    ) -> LiveResponse<Self::Response> {
+        let _ = (context, trailers);
         LiveResponse::finish(Status::ok())
     }
 }
 
-pub struct Unary<H: UnaryHandler> {
+pub struct Unary<H, C = ()>
+where
+    H: UnaryHandler<C>,
+{
     handler: H,
     codec: H::Codec,
+    context: PhantomData<fn(&mut C)>,
 }
 
-pub struct Streaming<H: StreamingHandler> {
+pub struct Streaming<H, C = ()>
+where
+    H: StreamingHandler<C>,
+{
     handler: H,
     codec: H::Codec,
+    context: PhantomData<fn(&mut C)>,
 }
 
-pub struct ServiceUnary<S, H: UnaryService<S>> {
+pub struct LiveStreaming<H, C = ()>
+where
+    H: LiveStreamingHandler<C>,
+{
     handler: H,
     codec: H::Codec,
-    service: PhantomData<fn(&mut S)>,
+    context: PhantomData<fn(&mut C)>,
 }
 
-pub struct ServiceStreaming<S, H: StreamingService<S>> {
-    handler: H,
-    codec: H::Codec,
-    service: PhantomData<fn(&mut S)>,
-}
-
-pub struct LiveStreaming<H: LiveStreamingHandler> {
-    handler: H,
-    codec: H::Codec,
-}
-
-impl<H: UnaryHandler> Unary<H> {
-    pub fn new(handler: H, codec: H::Codec) -> Self {
-        Self { handler, codec }
-    }
-}
-
-impl<H: StreamingHandler> Streaming<H> {
-    pub fn new(handler: H, codec: H::Codec) -> Self {
-        Self { handler, codec }
-    }
-}
-
-impl<S, H: UnaryService<S>> ServiceUnary<S, H> {
+impl<H: UnaryHandler<C>, C> Unary<H, C> {
     pub fn new(handler: H, codec: H::Codec) -> Self {
         Self {
             handler,
             codec,
-            service: PhantomData,
+            context: PhantomData,
         }
     }
 }
 
-impl<S, H: StreamingService<S>> ServiceStreaming<S, H> {
+impl<H: StreamingHandler<C>, C> Streaming<H, C> {
     pub fn new(handler: H, codec: H::Codec) -> Self {
         Self {
             handler,
             codec,
-            service: PhantomData,
+            context: PhantomData,
         }
     }
 }
 
-impl<H: LiveStreamingHandler> LiveStreaming<H> {
+impl<H: LiveStreamingHandler<C>, C> LiveStreaming<H, C> {
     pub fn new(handler: H, codec: H::Codec) -> Self {
-        Self { handler, codec }
+        Self {
+            handler,
+            codec,
+            context: PhantomData,
+        }
     }
 }
 
@@ -1105,53 +1100,42 @@ fn dispatch_streaming<C: Codec>(
     }
 }
 
-impl<H: UnaryHandler> Handler for Unary<H> {
-    fn request(&mut self, request: Request<'_>, response: &mut Response) {
+impl<H: UnaryHandler<C>, C: 'static> Handler<C> for Unary<H, C> {
+    fn request(&mut self, context: &mut C, request: Request<'_>, response: &mut Response) {
         dispatch_unary(&mut self.codec, request, response, |request| {
-            self.handler.unary(request)
+            self.handler.unary(context, request)
         });
     }
 }
 
-impl<H: StreamingHandler> Handler for Streaming<H> {
-    fn request(&mut self, request: Request<'_>, response: &mut Response) {
+impl<H: StreamingHandler<C>, C: 'static> Handler<C> for Streaming<H, C> {
+    fn request(&mut self, context: &mut C, request: Request<'_>, response: &mut Response) {
         dispatch_streaming(&mut self.codec, request, response, |request| {
-            self.handler.stream(request)
+            self.handler.stream(context, request)
         });
     }
 }
 
-impl<S: 'static, H: UnaryService<S>> ServiceHandler<S> for ServiceUnary<S, H> {
-    fn request(&mut self, service: &mut S, request: Request<'_>, response: &mut Response) {
-        dispatch_unary(&mut self.codec, request, response, |request| {
-            self.handler.unary(service, request)
-        });
-    }
-}
-
-impl<S: 'static, H: StreamingService<S>> ServiceHandler<S> for ServiceStreaming<S, H> {
-    fn request(&mut self, service: &mut S, request: Request<'_>, response: &mut Response) {
-        dispatch_streaming(&mut self.codec, request, response, |request| {
-            self.handler.stream(service, request)
-        });
-    }
-}
-
-impl<H: LiveStreamingHandler> Handler for LiveStreaming<H> {
+impl<H: LiveStreamingHandler<C>, C: 'static> Handler<C> for LiveStreaming<H, C> {
     fn start(
         &mut self,
+        context: &mut C,
         routes: &mut StreamRoutes,
         stream_id: StreamId,
         head: &RequestHead,
         reply: &mut StreamReply,
     ) -> StreamMode {
         let _ = routes;
-        reply.apply_live(self.handler.start(stream_id, head), &mut self.codec);
+        reply.apply_live(
+            self.handler.start(context, stream_id, head),
+            &mut self.codec,
+        );
         StreamMode::Live
     }
 
     fn message(
         &mut self,
+        context: &mut C,
         routes: &mut StreamRoutes,
         stream_id: StreamId,
         message: MessageFrame,
@@ -1166,16 +1150,20 @@ impl<H: LiveStreamingHandler> Handler for LiveStreaming<H> {
             }
         };
         reply.apply_live(
-            self.handler.message(LiveMessage {
-                stream_id,
-                message: decoded,
-            }),
+            self.handler.message(
+                context,
+                LiveMessage {
+                    stream_id,
+                    message: decoded,
+                },
+            ),
             &mut self.codec,
         );
     }
 
     fn trailers(
         &mut self,
+        context: &mut C,
         routes: &mut StreamRoutes,
         stream_id: StreamId,
         trailers: Metadata,
@@ -1183,15 +1171,18 @@ impl<H: LiveStreamingHandler> Handler for LiveStreaming<H> {
     ) {
         let _ = routes;
         reply.apply_live(
-            self.handler.trailers(LiveTrailers {
-                stream_id,
-                trailers,
-            }),
+            self.handler.trailers(
+                context,
+                LiveTrailers {
+                    stream_id,
+                    trailers,
+                },
+            ),
             &mut self.codec,
         );
     }
 
-    fn request(&mut self, _request: Request<'_>, response: &mut Response) {
+    fn request(&mut self, _context: &mut C, _request: Request<'_>, response: &mut Response) {
         response.status = Status::new(Code::Internal, "live streaming request was buffered");
     }
 }
@@ -1207,30 +1198,23 @@ pub struct ConnState {
 
 impl Default for ConnState {
     fn default() -> Self {
-        Self::with_limits(&Limits::default())
+        Self::from_config(&ValidatedLimits::default())
     }
 }
 
 impl ConnState {
-    fn with_limits(limits: &Limits) -> Self {
-        let capacity = limits.max_in_flight;
-        let h2 = Conn::<ServerRole>::with_config(conn::Config {
-            stream_capacity: capacity,
-            ..conn::Config::default()
-        });
+    fn from_config(config: &ValidatedLimits) -> Self {
+        let capacity = config.max_in_flight;
         Self {
-            h2,
-            calls: CallStore::with_capacity(capacity, limits.max_buffered_msgs),
+            h2: Conn::from_config(config.h2),
+            calls: CallStore::with_capacity(capacity, config.max_buffered_msgs),
             egress: Egress::with_capacity(
                 capacity,
-                limits.max_pending_replies,
-                limits.max_pending_len,
+                config.max_pending_replies,
+                config.max_pending_len,
             ),
             live_routes: StreamRoutes::with_capacity(capacity),
-            message_pool: SharedPool::new(
-                limits.max_fragmented_messages,
-                limits.max_message_len.max(1),
-            ),
+            message_pool: SharedPool::from_layout(config.message_layout),
             probed: false,
         }
     }
@@ -1239,7 +1223,7 @@ impl ConnState {
 #[pin_project::pin_project]
 pub struct App<H: Handler, W: Wire = Identity> {
     handler: H,
-    config: Limits,
+    config: ValidatedLimits,
     liveness_fallback: bool,
     _wire: PhantomData<W>,
 }
@@ -1262,16 +1246,15 @@ impl<H: Handler, W: Wire> Transport for GrpcTransport<'_, H, W> {
 }
 
 impl<H: Handler, W: Wire> App<H, W> {
-    pub fn new(handler: H) -> Self {
+    pub fn new(handler: H) -> Result<Self, ConfigError> {
         Self::with_config(handler, Limits::default())
     }
 
-    pub fn with_config(handler: H, config: Limits) -> Self {
-        assert!(config.max_in_flight > 0, "max_in_flight must be positive");
-        assert!(
-            config.max_pending_replies > 0,
-            "max_pending_replies must be positive"
-        );
+    pub fn with_config(handler: H, config: Limits) -> Result<Self, ConfigError> {
+        Ok(Self::from_config(handler, ValidatedLimits::new(config)?))
+    }
+
+    pub fn from_config(handler: H, config: ValidatedLimits) -> Self {
         Self {
             handler,
             config,
@@ -1343,9 +1326,13 @@ impl<H: Handler, W: Wire> App<H, W> {
         match RequestHead::parse_h2(&headers) {
             Ok(head) => {
                 let mut reply = StreamReply::new();
-                let mode = self
-                    .handler
-                    .start(&mut state.live_routes, stream_id, &head, &mut reply);
+                let mode = self.handler.start(
+                    &mut (),
+                    &mut state.live_routes,
+                    stream_id,
+                    &head,
+                    &mut reply,
+                );
                 if !state.insert_stream(
                     stream_id,
                     StreamState::new(head, self.config.max_message_len, mode),
@@ -1416,8 +1403,13 @@ impl<H: Handler, W: Wire> App<H, W> {
                     return;
                 }
                 let mut reply = StreamReply::new();
-                self.handler
-                    .message(&mut state.live_routes, stream_id, message, &mut reply);
+                self.handler.message(
+                    &mut (),
+                    &mut state.live_routes,
+                    stream_id,
+                    message,
+                    &mut reply,
+                );
                 state.enqueue_reply(stream_id, reply);
                 state.drive_pending();
                 continue;
@@ -1451,6 +1443,7 @@ impl<H: Handler, W: Wire> App<H, W> {
         if stream.mode == StreamMode::Live {
             let mut reply = StreamReply::new();
             self.handler.trailers(
+                &mut (),
                 &mut state.live_routes,
                 stream_id,
                 stream.trailers,
@@ -1483,8 +1476,8 @@ impl<H: Handler, W: Wire> App<H, W> {
     }
 
     fn flush_into_proj<'d, C: Default + 'static, P: Fn(&mut C) -> &mut ConnState>(
-        slot: &mut Slot<'d, W, listener::State<C>>,
-        aux: &mut listener::Aux,
+        slot: &mut Slot<'d, W, State<C>>,
+        egress: &mut EgressCtx<'_, '_>,
         driver: &mut DriverContext<'_, 'd>,
         close_after: bool,
         project: &P,
@@ -1500,7 +1493,7 @@ impl<H: Handler, W: Wire> App<H, W> {
             return;
         }
         let send_ud = slot.token();
-        let mut write_buf = aux.write_buf_for(slot);
+        let mut write_buf = egress.write_buf_for(slot);
         let state = project(&mut slot.state.conn);
         let n = state.h2.drain_into(&mut write_buf);
         let close_now = close_after && state.h2.outbound().is_empty();
@@ -1512,17 +1505,17 @@ impl<H: Handler, W: Wire> App<H, W> {
 
     pub fn chunk_proj<'d, C: Default + 'static, R: RetainBytes>(
         &mut self,
-        slot: &mut Slot<'d, W, listener::State<C>>,
+        slot: &mut Slot<'d, W, State<C>>,
         project: impl Fn(&mut C) -> &mut ConnState,
         chunk: R,
-        aux: &mut listener::Aux,
+        egress: &mut EgressCtx<'_, '_>,
         driver: &mut DriverContext<'_, 'd>,
     ) -> Outcome {
         let bytes = chunk.as_slice();
         if self.liveness_fallback && !project(&mut slot.state.conn).probed {
             project(&mut slot.state.conn).probed = true;
             if Liveness::is_plain_request(bytes) {
-                Liveness::respond(slot, aux, driver);
+                Liveness::respond(slot, egress, driver);
                 return Outcome::Ok;
             }
         }
@@ -1536,90 +1529,86 @@ impl<H: Handler, W: Wire> App<H, W> {
             let state = project(&mut slot.state.conn);
             let code = ErrorCode::from(&error);
             let _ = state.h2.goaway(code, b"");
-            Self::flush_into_proj(slot, aux, driver, true, &project);
+            Self::flush_into_proj(slot, egress, driver, true, &project);
             return Outcome::Ok;
         }
         let close_after = project(&mut slot.state.conn).h2.goaway_sent();
-        Self::flush_into_proj(slot, aux, driver, close_after, &project);
+        Self::flush_into_proj(slot, egress, driver, close_after, &project);
         Outcome::Ok
     }
 
     pub fn send_proj<'d, C: Default + 'static>(
         &mut self,
-        slot: &mut Slot<'d, W, listener::State<C>>,
+        slot: &mut Slot<'d, W, State<C>>,
         _sent: usize,
         project: impl Fn(&mut C) -> &mut ConnState,
-        aux: &mut listener::Aux,
+        egress: &mut EgressCtx<'_, '_>,
         driver: &mut DriverContext<'_, 'd>,
     ) {
         let close_after = project(&mut slot.state.conn).h2.goaway_sent();
-        Self::flush_into_proj(slot, aux, driver, close_after, &project);
+        Self::flush_into_proj(slot, egress, driver, close_after, &project);
     }
 
     pub fn activate_proj<'d, C: Default + 'static>(
         &mut self,
-        slot: &mut Slot<'d, W, listener::State<C>>,
+        slot: &mut Slot<'d, W, State<C>>,
         project: impl Fn(&mut C) -> &mut ConnState,
-        aux: &mut listener::Aux,
+        egress: &mut EgressCtx<'_, '_>,
         driver: &mut DriverContext<'_, 'd>,
     ) {
         let close_after = project(&mut slot.state.conn).h2.goaway_sent();
-        Self::flush_into_proj(slot, aux, driver, close_after, &project);
+        Self::flush_into_proj(slot, egress, driver, close_after, &project);
     }
 }
 
 impl<'d, H: Handler, W: Wire> Application<'d> for App<H, W> {
     type Conn = ConnState;
     type Wire = W;
+    type Hooks = Self;
 
     fn connection(self: Pin<&Self>) -> Self::Conn {
         let app = self.get_ref();
-        let mut state = ConnState::with_limits(&app.config);
+        let mut state = ConnState::from_config(&app.config);
         state.probed = !app.liveness_fallback;
         state
     }
+}
 
+impl<'d, H: Handler, W: Wire> ApplicationHooks<'d, App<H, W>> for App<H, W> {
     fn chunk<R: RetainBytes>(
-        self: Pin<&mut Self>,
-        slot: &mut Slot<'d, W, listener::State<ConnState>>,
+        app: Pin<&mut App<H, W>>,
+        slot: &mut Slot<'d, W, State<ConnState>>,
+        mut egress: EgressCtx<'_, '_>,
         chunk: R,
-        aux: &mut listener::Aux,
         driver: &mut DriverContext<'_, 'd>,
     ) -> manifold::Outcome {
-        self.get_mut()
-            .chunk_proj(slot, identity_mut, chunk, aux, driver)
+        app.get_mut()
+            .chunk_proj(slot, identity_mut, chunk, &mut egress, driver)
     }
 
     fn send(
-        self: Pin<&mut Self>,
-        slot: &mut Slot<'d, W, listener::State<ConnState>>,
+        app: Pin<&mut App<H, W>>,
+        slot: &mut Slot<'d, W, State<ConnState>>,
+        mut egress: EgressCtx<'_, '_>,
         sent: usize,
-        aux: &mut listener::Aux,
         driver: &mut DriverContext<'_, 'd>,
     ) {
-        self.get_mut()
-            .send_proj(slot, sent, identity_mut, aux, driver)
+        app.get_mut()
+            .send_proj(slot, sent, identity_mut, &mut egress, driver)
     }
 
-    fn defer_close(self: Pin<&Self>, slot: &Slot<'d, W, listener::State<ConnState>>) -> bool {
+    fn defer_close(_app: Pin<&App<H, W>>, slot: &Slot<'d, W, State<ConnState>>) -> bool {
         !slot.state.conn.h2.outbound().is_empty()
     }
 
     fn activate(
-        self: Pin<&mut Self>,
-        slot: &mut Slot<'d, W, listener::State<ConnState>>,
-        aux: &mut listener::Aux,
+        app: Pin<&mut App<H, W>>,
+        slot: &mut Slot<'d, W, State<ConnState>>,
+        mut egress: EgressCtx<'_, '_>,
         driver: &mut DriverContext<'_, 'd>,
     ) {
-        self.get_mut()
-            .activate_proj(slot, identity_mut, aux, driver)
-    }
-
-    fn close(
-        self: Pin<&mut Self>,
-        _slot: &mut Slot<'d, W, listener::State<ConnState>>,
-        _aux: &mut listener::Aux,
-    ) {
+        app.get_mut()
+            .activate_proj(slot, identity_mut, &mut egress, driver)
     }
 }
 

@@ -1,10 +1,27 @@
 use std::hint::black_box;
 
 use criterion::{Criterion, criterion_group, criterion_main};
-use sark::dispatch::Ctx;
-use sark::framer::FusedHead;
-use sark::service::Key;
-use sark_core::http::codec::ParsedRequestHead;
+use o3::buffer::{Bytes, Retained};
+use sark::service::RouteRequestImpl;
+use sark_core::http::codec::RequestLine;
+
+#[sark_gen::request(ordered)]
+struct TwoQuery {
+    #[query("nonce", default = "none")]
+    nonce: Bytes<Retained>,
+    #[query("lane", default = "none")]
+    lane: Bytes<Retained>,
+}
+
+#[sark_gen::request(ordered)]
+struct ThreeQuery {
+    #[query("expand", default = "none")]
+    expand: Bytes<Retained>,
+    #[query("nonce", default = "none")]
+    nonce: Bytes<Retained>,
+    #[query("lane", default = "none")]
+    lane: Bytes<Retained>,
+}
 
 fn fixtures() -> Vec<(&'static str, &'static [u8])> {
     vec![
@@ -24,37 +41,48 @@ fn fixtures() -> Vec<(&'static str, &'static [u8])> {
     ]
 }
 
-fn baseline_pipeline(buf: &[u8]) -> Option<(Key, usize, usize)> {
-    let head = ParsedRequestHead::parse(buf)?;
-    let ctx = Ctx::parse(buf, &head);
-    Some((
-        ctx.method_key,
-        ctx.slice_path.bytes().len(),
-        head.headers_start,
-    ))
-}
-
-fn fused_pipeline(buf: &[u8]) -> Option<(Key, usize, usize)> {
-    let fused = FusedHead::parse(buf)?;
-    let ctx = Ctx::parse_with_key(buf, &fused.head, fused.method_key);
-    Some((
-        ctx.method_key,
-        ctx.slice_path.bytes().len(),
-        fused.head.headers_start,
-    ))
+fn parse_line(buf: &[u8]) -> Option<(usize, usize, usize)> {
+    let head = RequestLine::parse(buf).ok().flatten()?;
+    Some((head.method.len(), head.target.len(), head.headers_start))
 }
 
 fn bench_head(c: &mut Criterion) {
     let mut group = c.benchmark_group("head_parse");
     for (name, buf) in fixtures() {
-        group.bench_function(format!("baseline/{name}"), |b| {
-            b.iter(|| black_box(baseline_pipeline(black_box(buf))));
-        });
-        group.bench_function(format!("fused/{name}"), |b| {
-            b.iter(|| black_box(fused_pipeline(black_box(buf))));
+        group.bench_function(name, |b| {
+            b.iter(|| black_box(parse_line(black_box(buf))));
         });
     }
     group.finish();
+
+    let mut query = c.benchmark_group("query_parse");
+    let two = b"nonce=74828&lane=6";
+    query.bench_function("ordered_two", |b| {
+        b.iter(|| {
+            let mut headers = TwoQueryHeadersRaw::default();
+            <TwoQuery as RouteRequestImpl>::parse_query_raw(
+                &mut headers,
+                black_box(two),
+                0..two.len(),
+            )
+            .unwrap();
+            black_box(headers);
+        });
+    });
+    let three = b"expand=items&nonce=74828&lane=6";
+    query.bench_function("ordered_three", |b| {
+        b.iter(|| {
+            let mut headers = ThreeQueryHeadersRaw::default();
+            <ThreeQuery as RouteRequestImpl>::parse_query_raw(
+                &mut headers,
+                black_box(three),
+                0..three.len(),
+            )
+            .unwrap();
+            black_box(headers);
+        });
+    });
+    query.finish();
 }
 
 criterion_group!(benches, bench_head);

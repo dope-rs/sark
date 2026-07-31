@@ -1,173 +1,111 @@
-use crate::hpack::HeaderBlock;
+const METHOD: u8 = 1 << 0;
+const SCHEME: u8 = 1 << 1;
+const PATH: u8 = 1 << 2;
+const STATUS: u8 = 1 << 3;
+const REQUEST_REQUIRED: u8 = METHOD | SCHEME | PATH;
 
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
-pub(super) enum Reason {
-    UppercaseName,
-    EmptyName,
-    BadPseudo,
-    PseudoAfterRegular,
-    DuplicatePseudo,
-    MissingPseudo,
-    ResponsePseudoInRequest,
-    RequestPseudoInResponse,
-    PseudoInTrailers,
-    BadConnectionHeader,
-    BadTeValue,
-    EmptyPath,
-    BadScheme,
-    BadMethod,
+pub(super) trait HeaderKind {
+    const REQUEST: bool;
 }
 
-pub(super) struct Validate;
+pub(super) struct RequestHeaders;
+
+impl HeaderKind for RequestHeaders {
+    const REQUEST: bool = true;
+}
+
+pub(super) struct ResponseHeaders;
+
+impl HeaderKind for ResponseHeaders {
+    const REQUEST: bool = false;
+}
+
+pub(super) struct Validate {
+    seen: u8,
+    empty: u8,
+    request: bool,
+    saw_regular: bool,
+    trailing: bool,
+    invalid: bool,
+}
 
 impl Validate {
-    pub(super) fn request(headers: &HeaderBlock, trailing: bool) -> Result<(), Reason> {
-        let mut saw_regular = false;
-        let mut has_method = false;
-        let mut has_scheme = false;
-        let mut has_path = false;
-        let mut method_empty = true;
-        let mut scheme_empty = true;
-        let mut path_empty = true;
+    pub(super) const fn new<K: HeaderKind>(trailing: bool) -> Self {
+        Self {
+            seen: 0,
+            empty: 0,
+            request: K::REQUEST,
+            saw_regular: false,
+            trailing,
+            invalid: false,
+        }
+    }
 
-        for h in headers {
-            let name = h.name;
-            let value = h.value;
-            if name.is_empty() {
-                return Err(Reason::EmptyName);
+    pub(super) fn field(&mut self, name: &[u8], value: &[u8]) -> bool {
+        if self.invalid {
+            return false;
+        }
+        if name.is_empty() {
+            return self.reject();
+        }
+        if name[0] == b':' {
+            if self.saw_regular || self.trailing {
+                return self.reject();
             }
-            if name[0] == b':' {
-                if saw_regular {
-                    return Err(Reason::PseudoAfterRegular);
-                }
-                if trailing {
-                    return Err(Reason::PseudoInTrailers);
-                }
+            return if self.request {
                 match name {
-                    b":method" => {
-                        if has_method {
-                            return Err(Reason::DuplicatePseudo);
-                        }
-                        has_method = true;
-                        method_empty = value.is_empty();
-                    }
-                    b":scheme" => {
-                        if has_scheme {
-                            return Err(Reason::DuplicatePseudo);
-                        }
-                        has_scheme = true;
-                        scheme_empty = value.is_empty();
-                    }
-                    b":path" => {
-                        if has_path {
-                            return Err(Reason::DuplicatePseudo);
-                        }
-                        has_path = true;
-                        path_empty = value.is_empty();
-                    }
-                    b":authority" | b":protocol" => {}
-                    b":status" => return Err(Reason::ResponsePseudoInRequest),
-                    _ => return Err(Reason::BadPseudo),
+                    b":method" => self.mark(METHOD, value.is_empty()),
+                    b":scheme" => self.mark(SCHEME, value.is_empty()),
+                    b":path" => self.mark(PATH, value.is_empty()),
+                    b":authority" | b":protocol" => true,
+                    _ => self.reject(),
                 }
             } else {
-                Self::check_lowercase(name)?;
-                saw_regular = true;
-                Self::check_connection_field(name, value)?;
-            }
-        }
-
-        if trailing {
-            return Ok(());
-        }
-
-        if !has_method {
-            return Err(Reason::MissingPseudo);
-        }
-        if !has_scheme {
-            return Err(Reason::MissingPseudo);
-        }
-        if !has_path {
-            return Err(Reason::MissingPseudo);
-        }
-        if method_empty {
-            return Err(Reason::BadMethod);
-        }
-        if scheme_empty {
-            return Err(Reason::BadScheme);
-        }
-        if path_empty {
-            return Err(Reason::EmptyPath);
-        }
-        Ok(())
-    }
-
-    pub(super) fn response(headers: &HeaderBlock, trailing: bool) -> Result<(), Reason> {
-        let mut saw_regular = false;
-        let mut has_status = false;
-
-        for h in headers {
-            let name = h.name;
-            let value = h.value;
-            if name.is_empty() {
-                return Err(Reason::EmptyName);
-            }
-            if name[0] == b':' {
-                if saw_regular {
-                    return Err(Reason::PseudoAfterRegular);
-                }
-                if trailing {
-                    return Err(Reason::PseudoInTrailers);
-                }
                 match name {
-                    b":status" => {
-                        if has_status {
-                            return Err(Reason::DuplicatePseudo);
-                        }
-                        has_status = true;
-                    }
-                    b":method" | b":scheme" | b":path" | b":authority" | b":protocol" => {
-                        return Err(Reason::RequestPseudoInResponse);
-                    }
-                    _ => return Err(Reason::BadPseudo),
+                    b":status" => self.mark(STATUS, false),
+                    _ => self.reject(),
                 }
-            } else {
-                Self::check_lowercase(name)?;
-                saw_regular = true;
-                Self::check_connection_field(name, value)?;
-            }
+            };
         }
-
-        if trailing {
-            return Ok(());
+        if name.iter().any(u8::is_ascii_uppercase) {
+            return self.reject();
         }
-
-        if !has_status {
-            return Err(Reason::MissingPseudo);
-        }
-        Ok(())
-    }
-
-    fn check_lowercase(name: &[u8]) -> Result<(), Reason> {
-        for &b in name {
-            if b.is_ascii_uppercase() {
-                return Err(Reason::UppercaseName);
-            }
-        }
-        Ok(())
-    }
-
-    fn check_connection_field(name: &[u8], value: &[u8]) -> Result<(), Reason> {
+        self.saw_regular = true;
         match name {
             b"connection" | b"keep-alive" | b"proxy-connection" | b"transfer-encoding"
-            | b"upgrade" => Err(Reason::BadConnectionHeader),
-            b"te" => {
-                if value == b"trailers" {
-                    Ok(())
-                } else {
-                    Err(Reason::BadTeValue)
-                }
-            }
-            _ => Ok(()),
+            | b"upgrade" => self.reject(),
+            b"te" if value != b"trailers" => self.reject(),
+            _ => true,
         }
+    }
+
+    pub(super) fn finish(self) -> bool {
+        if self.invalid {
+            return false;
+        }
+        if self.trailing {
+            return true;
+        }
+        if self.request {
+            self.seen & REQUEST_REQUIRED == REQUEST_REQUIRED && self.empty & REQUEST_REQUIRED == 0
+        } else {
+            self.seen & STATUS != 0
+        }
+    }
+
+    fn mark(&mut self, bit: u8, empty: bool) -> bool {
+        if self.seen & bit != 0 {
+            return self.reject();
+        }
+        self.seen |= bit;
+        if empty {
+            self.empty |= bit;
+        }
+        true
+    }
+
+    fn reject(&mut self) -> bool {
+        self.invalid = true;
+        false
     }
 }

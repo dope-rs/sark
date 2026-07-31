@@ -1,12 +1,15 @@
 use std::alloc::{GlobalAlloc, Layout, System};
+use std::pin::Pin;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
+use dope::manifold::listener::application::Application;
 use sark_h2::hpack::{Header, HeaderBlock};
 use sark_h2::server::{Body, Config, Request, Response, SyncApp, SyncHandler};
 
 struct CountingAllocator;
 
 static ALLOCATIONS: AtomicUsize = AtomicUsize::new(0);
+static ALLOCATED_BYTES: AtomicUsize = AtomicUsize::new(0);
 
 #[global_allocator]
 static ALLOCATOR: CountingAllocator = CountingAllocator;
@@ -14,11 +17,13 @@ static ALLOCATOR: CountingAllocator = CountingAllocator;
 unsafe impl GlobalAlloc for CountingAllocator {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
         ALLOCATIONS.fetch_add(1, Ordering::Relaxed);
+        ALLOCATED_BYTES.fetch_add(layout.size(), Ordering::Relaxed);
         unsafe { System.alloc(layout) }
     }
 
     unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
         ALLOCATIONS.fetch_add(1, Ordering::Relaxed);
+        ALLOCATED_BYTES.fetch_add(layout.size(), Ordering::Relaxed);
         unsafe { System.alloc_zeroed(layout) }
     }
 
@@ -28,6 +33,7 @@ unsafe impl GlobalAlloc for CountingAllocator {
 
     unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
         ALLOCATIONS.fetch_add(1, Ordering::Relaxed);
+        ALLOCATED_BYTES.fetch_add(new_size, Ordering::Relaxed);
         unsafe { System.realloc(ptr, layout, new_size) }
     }
 }
@@ -36,10 +42,14 @@ fn allocations() -> usize {
     ALLOCATIONS.load(Ordering::Relaxed)
 }
 
+fn allocated_bytes() -> usize {
+    ALLOCATED_BYTES.load(Ordering::Relaxed)
+}
+
 #[test]
 fn repeated_body_allocates_once_and_reuse_allocates_nothing() {
     let before_repeat = allocations();
-    let large = Body::repeat(b'x', 1 << 20);
+    let large = Body::repeat(b'x', 1 << 20).unwrap();
     assert_eq!(allocations() - before_repeat, 1);
     assert_eq!(large.len(), 1 << 20);
     assert!(large.as_slice().iter().all(|byte| *byte == b'x'));
@@ -74,10 +84,18 @@ fn repeated_body_allocates_once_and_reuse_allocates_nothing() {
         receive_buffer_count: 1024,
     };
     let before_app = allocations();
-    let app: SyncApp<'_, _> = SyncApp::new(&handler, config);
+    let app: SyncApp<'_, _> = SyncApp::new(&handler, config).unwrap();
     assert_eq!(allocations(), before_app);
+    let before_connection = allocated_bytes();
+    let connection = Application::connection(Pin::new(&app));
+    let connection_bytes = allocated_bytes() - before_connection;
+    assert!(
+        connection_bytes < 512 << 10,
+        "server connection allocated {connection_bytes} bytes"
+    );
+    drop(connection);
     let request = Request {
-        headers: HeaderBlock::from_headers(&[Header::new(b":path", b"/large")]),
+        headers: HeaderBlock::from_headers(&[Header::new(b":path", b"/large")]).unwrap(),
         body: Vec::new(),
     };
     let before_response = allocations();

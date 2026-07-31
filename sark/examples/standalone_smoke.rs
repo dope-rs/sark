@@ -5,7 +5,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use dope_extra::harness::Harness;
+use dope_test::Harness;
 use http::StatusCode;
 use sark::{HttpServer, Tcp, Throughput, app, driver, listener, tcp};
 
@@ -87,7 +87,7 @@ fn main() {
     let deadline_secs: u64 = env_or("SARK_SMOKE_DEADLINE_SECS", duration_secs + 5);
 
     let server = HttpServer::<HTTP_LISTENER_ID, DATE_UPDATER_ID, Throughput>::new(
-        listener::Config::<Tcp> {
+        listener::config::Config::<Tcp> {
             bind,
             max_connections: MAX_CONNECTIONS,
             backlog: 4096,

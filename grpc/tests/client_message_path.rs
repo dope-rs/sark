@@ -11,14 +11,16 @@ fn pending_messages_use_configured_slots() {
         max_pending_msgs: 1,
         max_pending_len: 64,
         ..Config::default()
-    });
+    })
+    .unwrap();
     let server = sark_h2::Conn::<ServerRole>::with_config(conn::Config {
         local_settings: Settings {
             initial_window_size: 0,
             ..Settings::DEFAULT
         },
         ..conn::Config::default()
-    });
+    })
+    .unwrap();
     client.ingest(server.outbound()).unwrap();
 
     let first = client

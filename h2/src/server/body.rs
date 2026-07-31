@@ -1,4 +1,6 @@
-use o3::buffer::Shared;
+use std::ops::RangeFrom;
+
+use o3::buffer::{CapacityError, Shared};
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Body {
@@ -22,11 +24,13 @@ impl Body {
         Self { bytes }
     }
 
-    pub fn repeat(byte: u8, len: usize) -> Self {
+    pub fn repeat(byte: u8, len: usize) -> Result<Self, CapacityError> {
         if len == 0 {
-            return Self::empty();
+            return Ok(Self::empty());
         }
-        Self::from_shared(o3::buffer::Owned::filled(len, byte).freeze())
+        Ok(Self::from_shared(
+            o3::buffer::Owned::try_filled(len, byte)?.freeze(),
+        ))
     }
 
     pub fn len(&self) -> usize {
@@ -43,6 +47,10 @@ impl Body {
 
     pub fn into_shared(self) -> Shared {
         self.bytes
+    }
+
+    pub(crate) fn get(&self, range: RangeFrom<usize>) -> Option<Shared> {
+        self.bytes.get(range)
     }
 }
 

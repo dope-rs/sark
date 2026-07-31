@@ -10,7 +10,9 @@ pub(super) enum Scalar {
     Bool,
     String,
     Shared,
+    Borrowed,
     Retained,
+    JsonBytes,
     InlineToken,
 }
 
@@ -38,8 +40,12 @@ impl Classified {
             Scalar::String
         } else if inner.is_plain_ident("Shared") {
             Scalar::Shared
+        } else if inner.is_bytes_with_storage("Borrowed") {
+            Scalar::Borrowed
         } else if inner.is_bytes_with_storage("Retained") {
             Scalar::Retained
+        } else if inner.is_plain_ident("JsonBytes") {
+            Scalar::JsonBytes
         } else if inner.is_inline_token() {
             Scalar::InlineToken
         } else {

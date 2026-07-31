@@ -1,7 +1,11 @@
 use dope::{
     DriverContext,
     driver::token::Token,
-    manifold::listener::{self, SlotEgress, recv},
+    manifold::listener::{
+        egress::SlotEgress,
+        recv,
+        state::{EgressCtx, State},
+    },
 };
 use dope_net::{link::slot::Slot, wire::Wire};
 use o3::buffer::{Pooled, Shared};
@@ -10,7 +14,7 @@ use crate::{dispatch::pipeline::Pipeline, fiber::ErasedTaskId, timer::Ticket};
 
 pub const RECV_HEAD_CAP: usize = 64 * 1024;
 pub const RECV_BODY_CAP: usize = 4 * 1024 * 1024;
-pub type Recv = recv::State<RECV_HEAD_CAP, RECV_BODY_CAP>;
+pub type Recv = recv::Recv<RECV_HEAD_CAP, RECV_BODY_CAP>;
 
 #[derive(Clone, Copy, PartialEq, Eq, Default)]
 pub enum StreamPhase {
@@ -88,8 +92,8 @@ impl Outcome {
 
     pub fn apply<'d, W: Wire, C: Default + 'static>(
         self,
-        slot: &mut Slot<'d, W, listener::State<C>>,
-        aux: &mut listener::Aux,
+        slot: &mut Slot<'d, W, State<C>>,
+        egress: &mut EgressCtx<'_, '_>,
         driver: &mut DriverContext<'_, 'd>,
     ) -> bool {
         let close_after = match &self {
@@ -97,7 +101,7 @@ impl Outcome {
             Outcome::Close(reason) => {
                 slot.set_close_after();
                 if !reason.is_empty() {
-                    let buf = aux.write_buf_for(slot);
+                    let buf = egress.write_buf_for(slot);
                     let user_data = slot.token();
                     return slot.submit_split_static(buf, 0, reason, user_data, driver);
                 }
@@ -111,7 +115,7 @@ impl Outcome {
         if close_after {
             slot.set_close_after();
         }
-        let buf = aux.write_buf_for(slot);
+        let buf = egress.write_buf_for(slot);
         let user_data = slot.token();
         match self {
             Outcome::Send { written, .. } => slot.submit_buffered(buf, written, user_data, driver),
@@ -211,7 +215,7 @@ impl Default for ConnState {
             async_state: AsyncConnState::default(),
             deferred_action: None,
             deferred_close: false,
-            conn_id: Token::new(0, SlotIndex::new(0), Epoch::INITIAL),
+            conn_id: Token::new(0, SlotIndex::ZERO, Epoch::INITIAL),
             recv_view: None,
             pipeline: Pipeline::default(),
             head_deadline: None,

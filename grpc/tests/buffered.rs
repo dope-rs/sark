@@ -6,7 +6,7 @@ use sark_grpc::status::Code;
 struct Echo;
 
 impl Handler for Echo {
-    fn request(&mut self, request: Request, response: &mut Response) {
+    fn request(&mut self, _context: &mut (), request: Request, response: &mut Response) {
         for message in &request.messages {
             response.push_message(message.payload.as_slice().to_vec());
         }
@@ -52,6 +52,20 @@ fn over_long_message_is_rejected() {
     };
     let response = config.dispatch_buffered(&mut Echo, head(b"/svc"), &framed(1, 8, false));
     assert_ne!(response.status.code(), Code::Ok);
+    assert!(response.messages.is_empty());
+}
+
+#[test]
+fn impossible_message_pool_layout_is_resource_exhausted() {
+    let Ok(max_message_len) = usize::try_from(u64::from(u32::MAX) + 1) else {
+        return;
+    };
+    let config = Limits {
+        max_message_len,
+        ..Limits::default()
+    };
+    let response = config.dispatch_buffered(&mut Echo, head(b"/svc"), &[]);
+    assert_eq!(response.status.code(), Code::ResourceExhausted);
     assert!(response.messages.is_empty());
 }
 

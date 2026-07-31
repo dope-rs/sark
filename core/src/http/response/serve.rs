@@ -1,8 +1,7 @@
 use http::StatusCode;
 
 use super::{
-    Chunked, DEFAULT_HEADER_CAPACITY, FixedResponse, HotBodyInner, HotHeadInner, MonoResponseInner,
-    Response,
+    Chunked, DEFAULT_HEADER_CAPACITY, FixedResponse, HotHeadInner, MonoResponseInner, Response,
 };
 
 #[allow(clippy::large_enum_variant)]
@@ -52,7 +51,7 @@ impl From<Response> for Serve<'static> {
             status: value.status,
             headers,
             head: HotHeadInner::Wire(o3::buffer::Shared::from(value.wire_headers)),
-            body: HotBodyInner::from(value.body),
+            body: value.body,
         })
     }
 }

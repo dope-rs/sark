@@ -3,12 +3,14 @@ use quote::quote;
 use syn::parse::{Parse, ParseStream};
 use syn::{Error, Fields, Ident, ItemStruct, LitByteStr, LitStr, Result, Token, Type};
 
+use crate::lifetimes::TypeLifetimes;
 use crate::util::{AttributeSliceExt, TypeExt};
 
 #[derive(Clone, Copy)]
 pub(super) enum Mode {
     Json,
     Raw,
+    Encoded,
 }
 
 impl Parse for Mode {
@@ -21,7 +23,7 @@ impl Parse for Mode {
             if !input.is_empty() {
                 return Err(Error::new_spanned(
                     input.parse::<TokenStream>()?,
-                    "#[sark_gen::response] supports only `json` or `raw`",
+                    "#[sark_gen::response] supports only `json`, `raw`, or `encoded`",
                 ));
             }
             return Ok(Self::Json);
@@ -33,15 +35,24 @@ impl Parse for Mode {
                     let extra = input.parse::<Ident>()?;
                     return Err(Error::new_spanned(
                         extra,
-                        "#[sark_gen::response] supports only `json` or `raw`",
+                        "#[sark_gen::response] supports only `json`, `raw`, or `encoded`",
                     ));
                 }
             }
             return Ok(Self::Raw);
         }
+        if ident == "encoded" {
+            if !input.is_empty() {
+                return Err(Error::new_spanned(
+                    input.parse::<TokenStream>()?,
+                    "#[sark_gen::response] supports only `json`, `raw`, or `encoded`",
+                ));
+            }
+            return Ok(Self::Encoded);
+        }
         Err(Error::new_spanned(
             ident,
-            "#[sark_gen::response] supports only `json` or `raw`",
+            "#[sark_gen::response] supports only `json`, `raw`, or `encoded`",
         ))
     }
 }
@@ -58,10 +69,9 @@ impl Mode {
         // source-level response struct can legitimately have no runtime constructor.
         st.attrs.push(syn::parse_quote!(#[allow(dead_code)]));
         let has_borrowed = match &st.fields {
-            Fields::Named(fields) => fields
-                .named
-                .iter()
-                .any(|field| field.ty.has_borrowed_bytes()),
+            Fields::Named(fields) => fields.named.iter().any(|field| {
+                field.ty.has_borrowed_bytes() || TypeLifetimes::new(&field.ty).has_non_static()
+            }),
             _ => false,
         };
         let inner_name = public_name.clone();
@@ -130,12 +140,13 @@ impl Mode {
 
         let header_count = dynamic.len();
         let headers = HeaderEmit::new(has_borrowed, &dynamic, &static_headers)?;
+        let static_header_fields = quote!(::sark::sark_core::http::StaticHeaderFields);
 
         let body_build = match self {
             Mode::Json => quote! {
                 let __resp_body = ::sark::json::JsonBody::new(#body_ident);
             },
-            Mode::Raw => quote! {
+            Mode::Raw | Mode::Encoded => quote! {
                 let __resp_body = #body_ident;
             },
         };
@@ -151,27 +162,53 @@ impl Mode {
                     #serve_lt,
                     ::sark::json::JsonBody<#body_ty>,
                     #header_count,
+                    #static_header_fields,
                 >
             },
             Mode::Raw if has_borrowed => {
-                quote!(::sark::sark_core::http::FixedResponse<'req, #header_count>)
+                quote!(
+                    ::sark::sark_core::http::FixedResponse<
+                        'req,
+                        #header_count,
+                        #static_header_fields,
+                    >
+                )
             }
             Mode::Raw => {
-                quote!(::sark::sark_core::http::FixedResponse<'static, #header_count>)
+                quote!(
+                    ::sark::sark_core::http::FixedResponse<
+                        'static,
+                        #header_count,
+                        #static_header_fields,
+                    >
+                )
             }
+            Mode::Encoded => quote! {
+                ::sark::sark_core::http::EncodedResponse<
+                    #serve_lt,
+                    #body_ty,
+                    #header_count,
+                    #static_header_fields,
+                >
+            },
         };
         let destructure = quote! { let Self { #( #all_fields, )* } = self; };
         let headers_build = headers.build_expr();
-        let static_wire = &headers.static_wire;
         let response_ctor = match self {
-            Mode::Json => quote!(::sark::sark_core::http::EncodedResponse::direct),
-            Mode::Raw => quote!(::sark::sark_core::http::FixedResponse::direct),
+            Mode::Json => quote!(::sark::sark_core::http::EncodedResponse::structured),
+            Mode::Raw => quote!(::sark::sark_core::http::FixedResponse::structured),
+            Mode::Encoded => quote!(::sark::sark_core::http::EncodedResponse::structured),
         };
         let into_fixed_body = quote! {
             #destructure
             #body_build
             #headers_build
-            #response_ctor(#status_ident, #static_wire, __resp_headers, __resp_body)
+            #response_ctor(
+                #status_ident,
+                &__RESP_HEADER_TEMPLATE,
+                __resp_headers,
+                __resp_body,
+            )
         };
         let fixed_api = if matches!(self, Mode::Raw) && body_is_static_slice {
             quote!()
@@ -195,12 +232,16 @@ impl Mode {
                 impl #impl_generics #inner_name #ty_lifetime {
                     #vis fn into_static_response(
                         self,
-                    ) -> ::sark::sark_core::http::StaticResponseInner<#serve_lt, #header_count> {
+                    ) -> ::sark::sark_core::http::StaticResponseInner<
+                        #serve_lt,
+                        #header_count,
+                        #static_header_fields,
+                    > {
                         #destructure
                         #headers_build
-                        ::sark::sark_core::http::StaticResponseInner::direct(
+                        ::sark::sark_core::http::StaticResponseInner::structured(
                             #status_ident,
-                            #static_wire,
+                            &__RESP_HEADER_TEMPLATE,
                             __resp_headers,
                             #body_ident,
                         )
@@ -211,114 +252,67 @@ impl Mode {
         } else {
             quote!()
         };
-        let native_body_kind = if body_is_static_slice {
-            quote!(::sark::sark_core::http::body_kind::ResponseKind::Static)
-        } else {
-            quote!(::sark::sark_core::http::body_kind::ResponseKind::Inline)
-        };
         let owned_shape_impl = if !has_borrowed && st.generics.params.is_empty() {
-            let (owned_shape, into_shape) = if matches!(self, Mode::Json) {
-                (quote!(#fixed_ret), quote!(self.into_fixed()))
-            } else if body_is_static_slice {
-                (
-                    quote!(::sark::sark_core::http::StaticResponseInner<'static, #header_count>),
-                    quote!(self.into_static_response()),
-                )
-            } else {
-                (quote!(#fixed_ret), quote!(self.into_fixed()))
-            };
             quote! {
-                impl ::sark::sark_core::http::__private::GeneratedResponse for #inner_name {
-                    type Shape = #owned_shape;
-
-                    const BODY_KIND: ::sark::sark_core::http::body_kind::ResponseKind =
-                        #native_body_kind;
-
-                    fn into_owned_shape(self) -> Self::Shape {
-                        #into_shape
-                    }
-                }
+                impl ::sark::sark_core::http::__private::OwnedResponse for #inner_name {}
             }
         } else {
             quote!()
         };
-        let native_response_impl = if matches!(self, Mode::Json) {
-            quote! {
-                impl #impl_generics ::sark::service::manifold::NativeResponse<#serve_lt>
-                    for #inner_name #ty_lifetime
-                {
-                    type Kind = ::sark::service::manifold::Sync;
-                    type Shape = #fixed_ret;
-                    type Stream = ::sark::sark_core::http::NeverStream;
-
-                    const BODY_KIND: ::sark::sark_core::http::body_kind::ResponseKind =
-                        #native_body_kind;
-
-                    fn into_route_response(self) -> Self::Shape {
-                        self.into_fixed()
-                    }
-                }
-            }
-        } else if has_borrowed {
-            if body_is_static_slice {
-                quote! {
-                    impl<'req> ::sark::service::manifold::NativeResponse<'req>
-                        for #inner_name<'req>
-                    {
-                        type Kind = ::sark::service::manifold::Sync;
-                        type Shape = ::sark::sark_core::http::StaticResponseInner<'req, #header_count>;
-                        type Stream = ::sark::sark_core::http::NeverStream;
-
-                        const BODY_KIND: ::sark::sark_core::http::body_kind::ResponseKind =
-                            #native_body_kind;
-
-                        fn into_route_response(self) -> Self::Shape {
-                            self.into_static_response()
-                        }
-                    }
-                }
-            } else {
-                quote! {
-                    impl<'req> ::sark::service::manifold::NativeResponse<'req>
-                        for #inner_name<'req>
-                    {
-                        type Kind = ::sark::service::manifold::Sync;
-                        type Shape = ::sark::sark_core::http::FixedResponse<'req, #header_count>;
-                        type Stream = ::sark::sark_core::http::NeverStream;
-
-                        const BODY_KIND: ::sark::sark_core::http::body_kind::ResponseKind =
-                            #native_body_kind;
-
-                        fn into_route_response(self) -> Self::Shape {
-                            self.into_fixed()
-                        }
-                    }
-                }
-            }
-        } else {
-            let (native_shape, into_native) = if body_is_static_slice {
+        let (native_impl_generics, native_serve_lt, native_target, native_shape, into_native) =
+            if matches!(self, Mode::Json | Mode::Encoded) {
                 (
-                    quote!(::sark::sark_core::http::StaticResponseInner<'req, #header_count>),
-                    quote!(self.into_static_response()),
-                )
-            } else {
-                (
-                    quote!(::sark::sark_core::http::FixedResponse<'req, #header_count>),
+                    impl_generics.clone(),
+                    serve_lt.clone(),
+                    quote!(#inner_name #ty_lifetime),
+                    fixed_ret.clone(),
                     quote!(self.into_fixed()),
                 )
+            } else {
+                let (native_shape, into_native) = if body_is_static_slice {
+                    (
+                        quote!(
+                            ::sark::sark_core::http::StaticResponseInner<
+                                'req,
+                                #header_count,
+                                #static_header_fields,
+                            >
+                        ),
+                        quote!(self.into_static_response()),
+                    )
+                } else {
+                    (
+                        quote!(
+                            ::sark::sark_core::http::FixedResponse<
+                                'req,
+                                #header_count,
+                                #static_header_fields,
+                            >
+                        ),
+                        quote!(self.into_fixed()),
+                    )
+                };
+                let native_target = if has_borrowed {
+                    quote!(#inner_name<'req>)
+                } else {
+                    quote!(#inner_name)
+                };
+                (
+                    quote!(<'req>),
+                    quote!('req),
+                    native_target,
+                    native_shape,
+                    into_native,
+                )
             };
-            quote! {
-                impl<'req> ::sark::service::manifold::NativeResponse<'req> for #inner_name {
-                    type Kind = ::sark::service::manifold::Sync;
-                    type Shape = #native_shape;
-                    type Stream = ::sark::sark_core::http::NeverStream;
+        let native_response_impl = quote! {
+            impl #native_impl_generics
+                ::sark::sark_core::http::IntoResponseShape<#native_serve_lt> for #native_target
+            {
+                type Shape = #native_shape;
 
-                    const BODY_KIND: ::sark::sark_core::http::body_kind::ResponseKind =
-                        #native_body_kind;
-
-                    fn into_route_response(self) -> Self::Shape {
-                        #into_native
-                    }
+                fn into_response_shape(self) -> Self::Shape {
+                    #into_native
                 }
             }
         };
@@ -340,6 +334,7 @@ struct HeaderEmit {
     headers_path: TokenStream,
     dyn_items: Vec<TokenStream>,
     static_wire: LitByteStr,
+    static_fields: Vec<(LitByteStr, LitByteStr)>,
 }
 
 impl HeaderEmit {
@@ -379,28 +374,41 @@ impl HeaderEmit {
             });
         }
         let mut wire = Vec::new();
+        let mut static_fields = Vec::with_capacity(static_headers.len());
         for (name, value) in static_headers {
             validate_header_name(name)?;
             validate_header_value(value)?;
-            let name = name.value();
-            let value = value.value();
-            wire.extend_from_slice(name.as_bytes());
+            let name = LitByteStr::new(name.value().as_bytes(), name.span());
+            let value = LitByteStr::new(value.value().as_bytes(), value.span());
+            wire.extend_from_slice(&name.value());
             wire.extend_from_slice(b": ");
-            wire.extend_from_slice(value.as_bytes());
+            wire.extend_from_slice(&value.value());
             wire.extend_from_slice(b"\r\n");
+            static_fields.push((name, value));
         }
         let static_wire = LitByteStr::new(&wire, Span::call_site());
         Ok(Self {
             headers_path,
             dyn_items,
             static_wire,
+            static_fields,
         })
     }
 
     fn build_expr(&self) -> TokenStream {
         let headers_path = &self.headers_path;
         let items = &self.dyn_items;
+        let static_wire = &self.static_wire;
+        let static_fields = self
+            .static_fields
+            .iter()
+            .map(|(name, value)| quote!(::sark::sark_core::http::Field::new(#name, #value)));
         quote! {
+            const __RESP_HEADER_TEMPLATE: ::sark::sark_core::http::HeaderTemplate =
+                ::sark::sark_core::http::HeaderTemplate::new(
+                    #static_wire,
+                    &[ #( #static_fields, )* ],
+                );
             let __resp_headers = #headers_path::from_items([
                 #( #items, )*
             ]);

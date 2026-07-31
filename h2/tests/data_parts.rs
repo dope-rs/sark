@@ -16,7 +16,7 @@ fn data_parts_emit_one_frame() {
     let out = conn.outbound();
     let header = FrameHeader::parse(out).unwrap();
     assert_eq!(header.kind, Type::Data);
-    assert_eq!(header.length, 13);
+    assert_eq!(header.length.as_u32(), 13);
     assert!(header.flags.has(Flags::END_STREAM));
     assert_eq!(&out[HEADER_LEN..], b"headerpayload");
 

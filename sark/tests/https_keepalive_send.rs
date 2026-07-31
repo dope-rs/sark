@@ -2,11 +2,12 @@ use std::io::{Read, Write};
 use std::net::TcpStream;
 use std::time::Duration;
 
-use dope_extra::harness::Harness;
-use dope_tls::state::State;
+use dope_test::Harness;
+use dope_tls::state::{self, State};
+use dope_tls::tls::Tls;
 use http::StatusCode;
 use sark::{Executor, Throughput, driver};
-use shin::sig::SigningKey;
+use shin::crypto::sig::SigningKey;
 
 const SEED: [u8; 32] = [7u8; 32];
 
@@ -53,7 +54,7 @@ sark_gen::define_route! {
 
 struct TlsClient {
     stream: TcpStream,
-    state: State,
+    state: State<state::sessions::Client>,
     plain: Vec<u8>,
 }
 
@@ -61,8 +62,8 @@ impl TlsClient {
     fn connect(addr: std::net::SocketAddr) -> Self {
         let signing = SigningKey::from_seed(&SEED).expect("signing key");
         let expected_pubkey = *signing.pubkey().unwrap();
-        let state = State::new_client(shin::client::Config {
-            verifier: shin::client::Verifier::RawPublicKey { expected_pubkey },
+        let state = State::<state::sessions::Client>::new(shin::client::config::Config {
+            verifier: shin::client::config::Verifier::RawPublicKey { expected_pubkey },
             transport_params: Vec::new(),
             alpn_protocols: Vec::new(),
             resumption: None,
@@ -87,11 +88,13 @@ impl TlsClient {
 
     fn flush(&mut self) {
         loop {
-            let out = self.state.pull_send();
-            if out.is_empty() {
+            let pending = self.state.pending_send_slice();
+            if pending.is_empty() {
                 break;
             }
-            self.stream.write_all(&out).expect("write wire");
+            let len = pending.len();
+            self.stream.write_all(pending).expect("write wire");
+            self.state.consume_pending_send(len).expect("consume wire");
         }
     }
 
@@ -101,12 +104,10 @@ impl TlsClient {
         if n == 0 {
             return 0;
         }
+        let plain = &mut self.plain;
         self.state
-            .read_client_tcp(&chunk[..n])
-            .expect("read_client_tcp");
-        while let Some(app) = self.state.pull_app() {
-            self.plain.extend_from_slice(app.as_ref());
-        }
+            .read_tcp(&chunk[..n], |app| plain.extend_from_slice(app))
+            .expect("read_tcp");
         n
     }
 
@@ -185,9 +186,9 @@ fn server(bind: std::net::SocketAddr) -> support::TestHttpsServer {
     support::https_server(bind, Duration::from_secs(10))
 }
 
-fn tls_config() -> shin::server::Config {
-    shin::server::Config {
-        source: shin::server::CertSource::RawPublicKey {
+fn tls_config() -> shin::server::config::Config {
+    shin::server::config::Config {
+        source: shin::server::config::CertSource::RawPublicKey {
             signing_key: SigningKey::from_seed(&SEED).expect("signing key"),
         },
         alpn_protocols: Vec::new(),
@@ -212,7 +213,10 @@ fn https_streams_large_body() {
             move |_ctx, trigger| {
                 let driver_config =
                     driver::Config::for_tcp_profile::<Throughput>(support::MAX_CONNECTIONS);
-                let executor = Executor::new(driver_config)?;
+                let storage = sark::app::ServerStorage::<(), Tls>::try_with_capacity(
+                    support::MAX_CONNECTIONS,
+                )?;
+                let executor = Executor::new(driver_config)?.with_storage(storage);
                 executor.enter(|mut session| {
                     let timer =
                         sark::Timer::with_capacity(support::MAX_CONNECTIONS.saturating_mul(2));
@@ -251,7 +255,10 @@ fn https_keepalive_serves_two_requests() {
             move |_ctx, trigger| {
                 let driver_config =
                     driver::Config::for_tcp_profile::<Throughput>(support::MAX_CONNECTIONS);
-                let executor = Executor::new(driver_config)?;
+                let storage = sark::app::ServerStorage::<(), Tls>::try_with_capacity(
+                    support::MAX_CONNECTIONS,
+                )?;
+                let executor = Executor::new(driver_config)?.with_storage(storage);
                 executor.enter(|mut session| {
                     let timer =
                         sark::Timer::with_capacity(support::MAX_CONNECTIONS.saturating_mul(2));

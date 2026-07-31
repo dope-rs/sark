@@ -1,3 +1,3 @@
 pub mod connector;
 
-pub use connector::HttpHandle;
+pub use connector::{HttpHandle, ResponseEvent, ResponseHead, ResponseStream};

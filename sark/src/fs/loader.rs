@@ -3,9 +3,10 @@ use std::pin::Pin;
 use std::task::Poll;
 
 use dope::io::file::{O_CLOEXEC, O_RDONLY, OpenPath};
-use dope::manifold::file::Files;
-use dope_fiber::file;
-use dope_fiber::{Context, Fiber};
+use dope::manifold::file::{Files, metadata::Metadata, source::Source};
+use dope_fiber::abi::Fiber;
+use dope_fiber::file::{open::Open, read_exact::ReadExact, stat::Stat};
+use dope_fiber::raw::task::Context;
 use o3::buffer::Shared;
 use o3::mem::{ByteBudgetHandle, ByteLease};
 use sark_core::http::Response;
@@ -27,7 +28,7 @@ impl LoadError {
 
 pub(super) struct LoadedFile {
     pub(super) body: Shared,
-    pub(super) metadata: file::Metadata,
+    pub(super) metadata: Metadata,
 }
 
 pub(super) struct ReadFile<'f, 'b, 'd, const ID: u8, const N: usize> {
@@ -36,11 +37,10 @@ pub(super) struct ReadFile<'f, 'b, 'd, const ID: u8, const N: usize> {
     budget: ByteBudgetHandle<'b>,
     max_file_bytes: usize,
     lease: Option<ByteLease<'b>>,
-    metadata: Option<file::Metadata>,
-    source: Option<file::Source<'d>>,
-    open: Option<file::Open<'f, 'd, ID, N>>,
-    stat: Option<file::Stat<'f, 'd, ID, N>>,
-    read: Option<file::Read<'f, 'd, ID, N>>,
+    metadata: Option<Metadata>,
+    open: Option<Open<'f, 'd, ID, N>>,
+    stat: Option<Stat<'f, 'd, ID, N, Source<'d>>>,
+    read: Option<ReadExact<'f, 'd, ID, N>>,
     done: bool,
 }
 
@@ -58,7 +58,6 @@ impl<'f, 'b, 'd, const ID: u8, const N: usize> ReadFile<'f, 'b, 'd, ID, N> {
             max_file_bytes,
             lease: None,
             metadata: None,
-            source: None,
             open: None,
             stat: None,
             read: None,
@@ -100,7 +99,7 @@ impl<'f, 'b, 'd, const ID: u8, const N: usize> Fiber<'d> for ReadFile<'f, 'b, 'd
             let Ok(path) = OpenPath::new(path) else {
                 return this.fail(LoadError::NotFound);
             };
-            this.open = Some(file::Open::direct(this.files, path, O_RDONLY | O_CLOEXEC));
+            this.open = Some(Open::direct(this.files, path, O_RDONLY | O_CLOEXEC));
         }
 
         if let Some(open) = this.open.as_mut() {
@@ -111,15 +110,11 @@ impl<'f, 'b, 'd, const ID: u8, const N: usize> Fiber<'d> for ReadFile<'f, 'b, 'd
             let Ok(source) = result else {
                 return this.fail(LoadError::NotFound);
             };
-            this.source = Some(source);
-            this.stat = Some(file::Stat::source(
-                this.files,
-                this.source.as_ref().expect("file source missing"),
-            ));
+            this.stat = Some(Stat::source(this.files, source));
         }
 
         if let Some(stat) = this.stat.as_mut() {
-            let Poll::Ready(result) = Fiber::poll(Pin::new(stat), cx.as_mut()) else {
+            let Poll::Ready((source, result)) = Fiber::poll(Pin::new(stat), cx.as_mut()) else {
                 return Poll::Pending;
             };
             this.stat = None;
@@ -135,31 +130,26 @@ impl<'f, 'b, 'd, const ID: u8, const N: usize> Fiber<'d> for ReadFile<'f, 'b, 'd
             if expected > this.max_file_bytes {
                 return this.fail(LoadError::NotFound);
             }
+            let Ok(read_len) = u32::try_from(expected) else {
+                return this.fail(LoadError::NotFound);
+            };
             let Some(lease) = this.budget.try_acquire(expected) else {
                 return this.fail(LoadError::Overloaded);
             };
             this.lease = Some(lease);
             this.metadata = Some(metadata);
-            let source = this.source.take().expect("file source missing");
-            this.read = Some(file::Read::new(this.files, &source, vec![0; expected], 0));
+            this.read = Some(ReadExact::new(this.files, source, read_len, 0));
         }
 
         let read = this.read.as_mut().expect("read child missing");
-        let Poll::Ready((buffer, result)) = Fiber::poll(Pin::new(read), cx.as_mut()) else {
+        let Poll::Ready((source, buffer, result)) = Fiber::poll(Pin::new(read), cx.as_mut()) else {
             return Poll::Pending;
         };
         this.read = None;
-        let Ok(count) = result else {
+        drop(source);
+        let Ok(()) = result else {
             return this.fail(LoadError::NotFound);
         };
-        let expected = this
-            .metadata
-            .as_ref()
-            .and_then(|metadata| usize::try_from(metadata.len()).ok())
-            .expect("file metadata missing");
-        if count != expected || buffer.len() != expected {
-            return this.fail(LoadError::NotFound);
-        }
         let body = Shared::from(buffer);
         let metadata = this.metadata.take().expect("file metadata missing");
         this.release();

@@ -4,8 +4,8 @@ use std::sync::OnceLock;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use dope::driver::token::{Epoch, SlotIndex, Token, kind};
-use dope::runtime::Idle;
-use dope::{DriverContext, Event, EventRef, Sqe, Submission, TimerSpec};
+use dope::runtime::dispatcher::Idle;
+use dope::{DriverContext, Event, Sqe, Submission, TimerSpec};
 
 const UPDATE_INTERVAL: Duration = Duration::from_secs(1);
 
@@ -151,7 +151,7 @@ impl<const ID: u8> Updater<ID> {
     }
 
     fn token() -> Token {
-        Token::new(ID, SlotIndex::new(0), Epoch::INITIAL)
+        Token::new(ID, SlotIndex::ZERO, Epoch::INITIAL)
     }
 
     fn timer_spec() -> &'static TimerSpec {
@@ -183,10 +183,7 @@ impl<const ID: u8> Updater<ID> {
         if self.state != TimerState::Armed {
             return;
         }
-        if matches!(
-            event.as_ref(),
-            EventRef::Timer(token) if token.same_target(Self::token())
-        ) {
+        if matches!(event, Event::Timer(token, _) if token.same_target(Self::token())) {
             stamp.refresh();
         }
     }
@@ -223,8 +220,10 @@ mod tests {
 
     use dope::driver;
     use dope::driver::token::Token;
+    use dope::runtime::dispatcher::{Dispatcher, Idle};
+    use dope::runtime::executor::Executor;
     use dope::runtime::profile::Throughput;
-    use dope::runtime::{Dispatcher, Executor, Idle, ShutdownTrigger};
+    use dope::runtime::trigger::ShutdownTrigger;
     use dope::{DriverContext, Event};
 
     use super::{Stamp, TimerState, Updater};

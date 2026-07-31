@@ -1,6 +1,6 @@
 use sark_core::http::body_kind::ResponseKind;
 use sark_core::http::compress::Gzip;
-use sark_core::http::{CacheTemplate, Egress, Preparation, Prepared, Shape};
+use sark_core::http::{CacheTemplate, Egress, Preparation, Prepared, Shape, ShapeStream};
 
 use super::conn_state::Outcome;
 use super::response_cache::{Cache, Cached};
@@ -64,7 +64,7 @@ impl<'a> ResponseEgress<'a> {
     pub(super) fn stream<'req, S: Shape<'req>>(
         self,
         response: S,
-    ) -> Option<(usize, S::StreamInner)> {
+    ) -> Option<(usize, ShapeStream<'req, S>)> {
         match response.prepare(Preparation::Plain, None, self.write, self.date) {
             Prepared::Egress(Egress::Stream { head, stream }) => Some((head, stream)),
             Prepared::Egress(

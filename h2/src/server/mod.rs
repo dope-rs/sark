@@ -8,17 +8,23 @@ use std::{
 use dope::{
     manifold::{
         env::{Bundle, Env as ManifoldEnv},
-        listener::{self, Application, Listener},
+        listener::{self, Listener, application::Application},
     },
-    runtime::{Executor, Session, ShutdownTrigger, WorkerContext, profile::Throughput},
+    runtime::{
+        executor::{Executor, Session},
+        launcher::WorkerContext,
+        profile::Throughput,
+        trigger::ShutdownTrigger,
+    },
 };
 use dope_net::{
+    link::egress::storage::Storage as EgressStorage,
     tcp::{self, Tcp},
     wire::{Wire, identity::Identity},
 };
 #[cfg(feature = "rustls")]
 use dope_tls::rustls::{RustTls, RustTlsEndpoint};
-use dope_tls::tls::{Endpoint, Tls};
+use dope_tls::tls::{Endpoint, SessionStorage, Tls};
 use shin::server;
 
 pub type Env = Bundle<Tcp, Identity, Throughput>;
@@ -83,9 +89,9 @@ impl Config {
         Ok(self)
     }
 
-    fn listener(self) -> listener::Config<Tcp> {
+    fn listener(self) -> listener::config::Config<Tcp> {
         use dope_net::tcp::stream;
-        listener::Config {
+        listener::config::Config {
             max_connections: self.max_connections,
             bind: self.bind_addr,
             backlog: self.listen_backlog,
@@ -110,6 +116,16 @@ fn invalid_config(message: &'static str) -> io::Error {
     Error::new(ErrorKind::InvalidInput, message)
 }
 
+trait EgressHost {
+    fn egress(&self) -> &EgressStorage;
+}
+
+impl<T> EgressHost for (T, EgressStorage, SessionStorage) {
+    fn egress(&self) -> &EgressStorage {
+        &self.1
+    }
+}
+
 fn run<H, F>(
     handler: H,
     config: Config,
@@ -122,8 +138,8 @@ where
     H: 'static,
     F: for<'scope, 'd> FnOnce(
         &'d H,
-        Session<'scope, 'd, H>,
-        listener::Config<Tcp>,
+        Session<'scope, 'd, (H, EgressStorage, SessionStorage)>,
+        listener::config::Config<Tcp>,
         Config,
     ) -> io::Result<()>,
 {
@@ -131,13 +147,14 @@ where
     let listener = config.listener();
     let driver = dope::driver::Config::for_tcp_profile::<Throughput>(config.max_connections)
         .with_provided(config.receive_buffer_bytes, config.receive_buffer_count);
+    let tls_storage = SessionStorage::try_with_capacity(config.max_connections)?;
     Executor::with_seed(driver, context.seed())?
-        .with_storage(handler)
+        .with_storage((handler, EgressStorage::default(), tls_storage))
         .enter(|mut session| {
             if let Some(trigger) = shutdown {
                 trigger.try_register(&mut session.driver_access())?;
             }
-            let handler = session.storage();
+            let (handler, _, _) = session.storage();
             launch(handler, session, listener, config)
         })
 }
@@ -151,22 +168,24 @@ where
 {
     #[pin]
     #[manifold]
-    listener: Listener<'d, 0, A, E>,
+    listener: Listener<'d, 'd, 0, A, E>,
 }
 
 fn start<'scope, 'd, A, E, S>(
     app: A,
     mut session: Session<'scope, 'd, S>,
-    listener_config: listener::Config<Tcp>,
-    wire_config: <A::Wire as Wire>::InitConfig,
+    listener_config: listener::config::Config<Tcp>,
+    wire_config: <A::Wire as Wire>::InitConfig<'d>,
 ) -> io::Result<()>
 where
     A: Application<'d>,
     E: ManifoldEnv<Transport = Tcp, Wire = A::Wire>,
+    S: EgressHost,
 {
     use core::pin::pin;
 
     use dope::hash::domain::ACCEPT;
+    let egress = session.storage().egress();
     let hash_builder = session.seed().derive(ACCEPT).state();
     let listener = {
         let mut driver = session.driver_access();
@@ -175,6 +194,7 @@ where
             listener_config,
             wire_config,
             hash_builder,
+            egress,
             &mut driver,
         )?
     };
@@ -195,7 +215,9 @@ pub fn serve<H: Handler>(
         context,
         shutdown,
         |handler, session, listener, config| {
-            start::<App<H>, Env, _>(App::new(handler, config), session, listener, ())
+            let app = App::new(handler, config)
+                .map_err(|error| Error::new(io::ErrorKind::InvalidInput, error))?;
+            start::<App<H>, Env, _>(app, session, listener, ())
         },
     )
 }
@@ -225,7 +247,9 @@ where
         context,
         shutdown,
         |handler, session, listener, config| {
-            start::<SyncApp<H>, Env, _>(SyncApp::new(handler, config), session, listener, ())
+            let app = SyncApp::new(handler, config)
+                .map_err(|error| Error::new(io::ErrorKind::InvalidInput, error))?;
+            start::<SyncApp<H>, Env, _>(app, session, listener, ())
         },
     )
 }
@@ -233,7 +257,7 @@ where
 pub fn serve_tls<H: Handler>(
     handler: H,
     config: Config,
-    tls_config: server::Config,
+    tls_config: server::config::Config,
     context: WorkerContext,
     shutdown: Option<&ShutdownTrigger>,
 ) -> io::Result<()> {
@@ -245,7 +269,10 @@ pub fn serve_tls<H: Handler>(
         context,
         shutdown,
         move |handler, session, listener, config| {
-            start::<App<H, Tls>, TlsEnv, _>(App::new(handler, config), session, listener, endpoint)
+            let app = App::new(handler, config)
+                .map_err(|error| Error::new(io::ErrorKind::InvalidInput, error))?;
+            let wire = endpoint.bind(&session.storage().2);
+            start::<App<H, Tls>, TlsEnv, _>(app, session, listener, wire)
         },
     )
 }
@@ -253,7 +280,7 @@ pub fn serve_tls<H: Handler>(
 pub fn serve_tls_sync<H>(
     handler: H,
     config: Config,
-    tls_config: server::Config,
+    tls_config: server::config::Config,
     context: WorkerContext,
     shutdown: Option<&ShutdownTrigger>,
 ) -> io::Result<()>
@@ -268,12 +295,10 @@ where
         context,
         shutdown,
         move |handler, session, listener, config| {
-            start::<SyncApp<H, Tls>, TlsEnv, _>(
-                SyncApp::new(handler, config),
-                session,
-                listener,
-                endpoint,
-            )
+            let app = SyncApp::new(handler, config)
+                .map_err(|error| Error::new(io::ErrorKind::InvalidInput, error))?;
+            let wire = endpoint.bind(&session.storage().2);
+            start::<SyncApp<H, Tls>, TlsEnv, _>(app, session, listener, wire)
         },
     )
 }
@@ -296,8 +321,9 @@ pub fn serve_tls_rustls<H: Handler>(
         context,
         shutdown,
         move |handler, session, listener, config| {
+            let app = App::new(handler, config).map_err(Error::invalid_input)?;
             start::<App<H, RustTls>, RustlsTlsEnv, _>(
-                App::new(handler, config),
+                app,
                 session,
                 listener,
                 RustTlsEndpoint::Server(tls_config),
@@ -324,8 +350,9 @@ where
         context,
         shutdown,
         move |handler, session, listener, config| {
+            let app = SyncApp::new(handler, config).map_err(Error::invalid_input)?;
             start::<SyncApp<H, RustTls>, RustlsTlsEnv, _>(
-                SyncApp::new(handler, config),
+                app,
                 session,
                 listener,
                 RustTlsEndpoint::Server(tls_config),

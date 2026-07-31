@@ -3,6 +3,7 @@ use std::slice;
 use http::{HeaderName, HeaderValue};
 
 use super::HeaderNameRef;
+use crate::http::Field;
 
 #[derive(Clone, Default, PartialEq, Eq)]
 pub struct HeaderList {
@@ -70,6 +71,12 @@ impl HeaderList {
         }
     }
 
+    pub(crate) fn fields(&self) -> impl ExactSizeIterator<Item = Field<'_>> + '_ {
+        self.entries
+            .iter()
+            .map(|(name, value)| Field::new(name.as_str().as_bytes(), value.as_bytes()))
+    }
+
     pub fn wire_len(&self) -> usize {
         self.wire_len
     }
@@ -108,6 +115,18 @@ impl HeaderList {
         None
     }
 
+    pub fn extend_trailers(
+        &mut self,
+        trailers: impl IntoIterator<Item = (HeaderName, HeaderValue)>,
+    ) {
+        for (name, value) in trailers {
+            if is_forbidden_trailer(&name) {
+                continue;
+            }
+            let _ = self.insert(name, value);
+        }
+    }
+
     pub fn remove<K>(&mut self, name: K) -> Option<HeaderValue>
     where
         K: HeaderNameRef,
@@ -136,6 +155,22 @@ impl HeaderList {
             }
         }
     }
+}
+
+fn is_forbidden_trailer(name: &HeaderName) -> bool {
+    matches!(
+        name.as_str(),
+        "content-length"
+            | "transfer-encoding"
+            | "host"
+            | "trailer"
+            | "connection"
+            | "keep-alive"
+            | "te"
+            | "upgrade"
+            | "proxy-authenticate"
+            | "proxy-authorization"
+    )
 }
 
 fn header_wire_len(name: &str, value: &[u8]) -> usize {

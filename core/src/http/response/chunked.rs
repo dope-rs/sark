@@ -76,12 +76,7 @@ impl Chunked {
 
     fn head(&self) -> HeadWrite<'_, [u8], TransferEncodingChunked> {
         HeadWrite {
-            status_str: self.status.as_str().as_bytes(),
-            reason: self
-                .status
-                .canonical_reason()
-                .map(str::as_bytes)
-                .unwrap_or(b""),
+            status: self.status,
             headers: self.wire_headers.as_ref(),
             framing: TransferEncodingChunked,
         }

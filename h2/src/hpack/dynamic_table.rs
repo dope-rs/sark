@@ -103,6 +103,10 @@ impl DynamicTable {
         self.current_size += entry_size;
     }
 
+    pub(super) fn reject_oversized_insert(&mut self) {
+        self.clear();
+    }
+
     pub(super) fn get(&self, index: usize) -> Option<(&[u8], &[u8])> {
         let entry = self.entry(index)?;
         let start = entry.start as usize;
@@ -160,7 +164,13 @@ impl DynamicTable {
         let mut entries = vec![Entry::default(); capacity / Self::OVERHEAD].into_boxed_slice();
         let mut write = 0;
         for index in 0..self.len {
-            let (name, value) = self.get(index).unwrap();
+            let physical = Self::advance(self.front, index, self.entries.len());
+            let entry = self.entries[physical];
+            let source = entry.start as usize;
+            let name_end = source + entry.name_len as usize;
+            let value_end = name_end + entry.value_len as usize;
+            let name = &self.arena[source..name_end];
+            let value = &self.arena[name_end..value_end];
             let start = write;
             Self::write_mirrored(&mut arena, capacity, write, name);
             write = Self::advance(write, name.len(), capacity);

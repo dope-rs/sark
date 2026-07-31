@@ -1,4 +1,20 @@
+use http::StatusCode;
+
 use super::consts::{CRLF, DATE_PREFIX, SERVER_LINE, STATUS_LINE_PREFIX};
+
+const OK_STATUS_LINE: &[u8] = b"HTTP/1.1 200 OK\r\n";
+
+pub(in crate::http::response) fn status_line_len(status: StatusCode) -> usize {
+    if status == StatusCode::OK {
+        OK_STATUS_LINE.len()
+    } else {
+        STATUS_LINE_PREFIX.len() + status.as_str().len() + 1 + reason(status).len() + CRLF.len()
+    }
+}
+
+fn reason(status: StatusCode) -> &'static [u8] {
+    status.canonical_reason().map(str::as_bytes).unwrap_or(b"")
+}
 
 pub(in crate::http::response) struct WireWriter<'a> {
     out: &'a mut [u8],
@@ -28,7 +44,13 @@ impl<'a> WireWriter<'a> {
         self.offset += crate::http::codec::Wire::write_dec(value, &mut self.out[self.offset..]);
     }
 
-    pub(in crate::http::response) fn put_status_line(&mut self, status_str: &[u8], reason: &[u8]) {
+    pub(in crate::http::response) fn put_status_line(&mut self, status: StatusCode) {
+        if status == StatusCode::OK {
+            self.put(OK_STATUS_LINE);
+            return;
+        }
+        let status_str = status.as_str().as_bytes();
+        let reason = reason(status);
         self.put(STATUS_LINE_PREFIX);
         self.put(status_str);
         self.put(b" ");

@@ -17,8 +17,8 @@ use std::time::Duration;
 use cache::{Asset, Cache, Lookup, Variant};
 use dope::hash;
 use dope::io::file::OpenPath;
-use dope::manifold::file::Files;
-use dope_fiber::file;
+use dope::manifold::file::{Files, metadata::Metadata};
+use dope_fiber::file::stat::Stat;
 use encoding::Encoding;
 use loader::{LoadError, ReadFile};
 use o3::buffer::Shared;
@@ -317,8 +317,7 @@ impl ServeDir {
         &self,
         files: &Files<'d, ID, N>,
         path: &Path,
-    ) -> Option<file::Metadata> {
-        use dope_fiber::file::Stat;
+    ) -> Option<Metadata> {
         let path = path.to_str()?;
         let path = OpenPath::new(path).ok()?;
         let metadata = Stat::path(files, path).await.ok()?;

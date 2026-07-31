@@ -3,37 +3,75 @@ use std::pin::Pin;
 use std::task::Poll;
 use std::time::{Duration, Instant};
 
-use cartel_core::{Extract, Registrable, Reply, Slot};
+use cartel_core::{Extract, Registrable, ReplyStream, Slot};
 use dope::driver::token::Token;
-use dope::manifold::connector::Connector;
+use dope::manifold::connector::session::Connector;
 use dope::manifold::connector::source::Dialer;
 use dope::manifold::env::Env;
-use dope_fiber::{Either, Fiber, TimerExt as _, poll_fn, race, wait_fn};
+use dope_fiber::abi::Fiber;
+use dope_fiber::abi::pollfn::PollFn;
+use dope_fiber::abi::race::{Either, Race};
+use dope_fiber::sleep::TimerExt as _;
+use dope_fiber::wait::WaitFn;
 use dope_net::Transport;
 use http::Method;
-use o3::buffer::{Lease, Pool};
+use o3::buffer::{Lease, Pool, Shared as SharedBytes};
 use o3::cell::RegionToken;
 use sark_core::http::Response;
 
 use crate::connector::error::Error;
 use crate::connector::redirect::RedirectState;
+use crate::connector::response::ResponseEvent;
 use crate::connector::session::{Outcome, Port, Session};
 
-struct ExtractResponse;
+struct ExtractResponseEvent;
 
 type HandleMarker<'a, S, E> = PhantomData<(&'a (), fn() -> (S, E))>;
 
-impl Extract<Outcome> for ExtractResponse {
+impl Extract<Outcome> for ExtractResponseEvent {
     type Output = Outcome;
 
     fn extract(slot: &mut Slot<Outcome>) -> Option<Self::Output> {
-        if !slot.completed() {
-            return None;
+        if let Some(outcome) = slot.pop() {
+            return Some(outcome);
         }
         if slot.take_overflow() {
             return Some(Err(Error::CapacityOverflow));
         }
-        Some(slot.pop().unwrap_or(Err(Error::Closed)))
+        None
+    }
+}
+
+#[must_use = "the response stream must be consumed to observe the response"]
+pub struct ResponseStream<'d> {
+    conn_id: Token,
+    reply: ReplyStream<'d, Outcome, ExtractResponseEvent>,
+    done: bool,
+}
+
+impl<'d> ResponseStream<'d> {
+    /// Waits for the next response event.
+    ///
+    /// `None` is the typed end-of-response marker.
+    pub fn next_event(
+        &mut self,
+    ) -> impl Fiber<'d, Output = Option<Result<ResponseEvent, Error>>> + '_ {
+        let stream = self;
+        PollFn::new(move |cx| {
+            if stream.done {
+                return Poll::Ready(None);
+            }
+            let poll = Pin::new(&mut stream.reply).poll_next(cx);
+            if matches!(poll, Poll::Ready(None)) {
+                stream.done = true;
+            }
+            poll
+        })
+    }
+
+    /// Returns true after the end-of-response marker has been observed.
+    pub fn is_done(&self) -> bool {
+        self.done
     }
 }
 
@@ -81,7 +119,7 @@ where
 
     pub fn wait_active<'b>(&'b self) -> impl Fiber<'d, Output = Result<(), Error>> + 'b {
         let handle = self;
-        wait_fn(move |cx, waiter| {
+        WaitFn::new(move |cx, waiter| {
             let shared = &handle.port.shared;
             if shared.has_connection() {
                 return Poll::Ready(Ok(()));
@@ -99,7 +137,7 @@ where
 
     pub fn host<'b>(&'b self) -> impl Fiber<'d, Output = String> + 'b {
         let handle = self;
-        poll_fn(move |_cx| Poll::Ready(handle.port.shared.host.clone()))
+        PollFn::new(move |_cx| Poll::Ready(handle.port.shared.host.clone()))
     }
 
     pub fn get<'b>(
@@ -107,6 +145,17 @@ where
         path: &'b str,
     ) -> impl Fiber<'d, Output = Result<Response, Error>> + 'b {
         self.send(Method::GET, path, &[])
+    }
+
+    /// Dispatches a GET and returns its transfer-decoded event stream.
+    ///
+    /// Unlike [`Self::get`], this does not collect the body, follow redirects,
+    /// or apply content decoding.
+    pub fn get_stream<'b>(
+        &'b self,
+        path: &'b str,
+    ) -> impl Fiber<'d, Output = Result<ResponseStream<'d>, Error>> + 'b {
+        self.send_stream(Method::GET, path, &[])
     }
 
     pub fn send<'b>(
@@ -161,6 +210,58 @@ where
         })
     }
 
+    /// Dispatches a request and returns its transfer-decoded event stream.
+    ///
+    /// Unlike [`Self::send`], this does not collect the body, follow redirects,
+    /// or apply content decoding.
+    pub fn send_stream<'b>(
+        &'b self,
+        method: Method,
+        path: &'b str,
+        body: &'b [u8],
+    ) -> impl Fiber<'d, Output = Result<ResponseStream<'d>, Error>> + 'b {
+        self.send_stream_with_headers(method, path, &[], body)
+    }
+
+    /// Dispatches a request with headers and returns its response event stream.
+    ///
+    /// Retries only cover failures before the stream is returned. Redirect and
+    /// content-decoding policies belong to the buffered API.
+    pub fn send_stream_with_headers<'b>(
+        &'b self,
+        method: Method,
+        path: &'b str,
+        headers: &'b [(&'b str, &'b str)],
+        body: &'b [u8],
+    ) -> impl Fiber<'d, Output = Result<ResponseStream<'d>, Error>> + 'b {
+        let handle = *self;
+        let validation = <str as HeaderField>::validate_all(headers);
+        let retry = handle.port.shared.retry;
+        let timer: &'d _ = handle.port.timer();
+        dope_fiber::fiber!('d => async move {
+            validation?;
+            let attempts = retry.attempts(&method);
+            let mut attempt = 0;
+            loop {
+                match handle
+                    .dispatch_stream_once(&method, path, headers, body)
+                    .await
+                {
+                    Ok(stream) => return Ok(stream),
+                    Err(error)
+                        if retry.should_retry(&method, &error) && attempt + 1 < attempts =>
+                    {
+                        attempt += 1;
+                        timer
+                            .sleep(Duration::from_millis(25 * u64::from(attempt)))
+                            .await;
+                    }
+                    Err(error) => return Err(error),
+                }
+            }
+        })
+    }
+
     fn dispatch_with_retry<'b>(
         self,
         method: &'b Method,
@@ -206,10 +307,39 @@ where
     {
         let handle = self;
         dope_fiber::fiber!('d => async move {
+            let stream = handle
+                .dispatch_stream_once(method, path, headers, body)
+                .await?;
+            let conn_id = stream.conn_id;
+            let collect = collect_response(stream, handle.port.codec.max_response_body);
+            let deadline = handle.sleep(handle.port.shared.request_timeout);
+            let response = match Race::new(collect, deadline).await {
+                Either::Left(response) => response?,
+                Either::Right(()) => {
+                    handle.port.io.close(conn_id);
+                    return Err(Error::Timeout);
+                }
+            };
+            handle.decompress_response(response).await
+        })
+    }
+
+    fn dispatch_stream_once<'b>(
+        self,
+        method: &'b Method,
+        path: &'b str,
+        headers: &'b [(&'b str, &'b str)],
+        body: &'b [u8],
+    ) -> impl Fiber<'d, Output = Result<ResponseStream<'d>, Error>> + 'b
+    where
+        Self: 'b,
+    {
+        let handle = self;
+        dope_fiber::fiber!('d => async move {
             let shared = &handle.port.shared;
             let request_timeout = shared.request_timeout;
             let request = Encode::request(
-                handle.port.requests.as_ref(),
+                &handle.port.requests,
                 method,
                 path,
                 &shared.host,
@@ -217,7 +347,7 @@ where
                 body,
             )?;
             let mut request = Some(request);
-            let acquire = wait_fn(move |mut cx, waiter| {
+            let acquire = WaitFn::new(move |mut cx, waiter| {
                 let now = Instant::now();
                 let shared = &handle.port.shared;
                 let idle = shared.idle_timeout;
@@ -262,20 +392,159 @@ where
                 }
             });
             let acquire_deadline = handle.sleep(request_timeout);
-            let (conn_id, reply) = match race(acquire, acquire_deadline).await {
+            let (conn_id, reply) = match Race::new(acquire, acquire_deadline).await {
                 Either::Left(result) => result?,
                 Either::Right(()) => return Err(Error::Timeout),
             };
+            Ok(ResponseStream {
+                conn_id,
+                reply,
+                done: false,
+            })
+        })
+    }
 
-            let reply_deadline = handle.sleep(request_timeout);
-            match race(reply, reply_deadline).await {
-                Either::Left(outcome) => outcome,
-                Either::Right(()) => {
-                    handle.port.io.close(conn_id);
-                    Err(Error::Timeout)
+    fn decompress_response(
+        self,
+        response: Response,
+    ) -> impl Fiber<'d, Output = Result<Response, Error>> {
+        let mut response = Some(response);
+        PollFn::new(move |mut cx| {
+            let mut response = response
+                .take()
+                .expect("response decompression polled after completion");
+            let gunzip = self
+                .port
+                .shared
+                .gunzip
+                .borrow_mut(cx.as_mut().region_token());
+            Session::decompress(
+                gunzip,
+                &mut response,
+                self.port.shared.decompression,
+                self.port.codec.max_response_body,
+            )?;
+            Poll::Ready(Ok(response))
+        })
+    }
+}
+
+fn collect_response<'d>(
+    mut stream: ResponseStream<'d>,
+    max_body: usize,
+) -> impl Fiber<'d, Output = Result<Response, Error>> {
+    dope_fiber::fiber!('d => async move {
+        let mut response = None;
+        let mut body = BodyCollector::new(max_body);
+        let mut trailers_seen = false;
+        while let Some(outcome) = stream.next_event().await {
+            match outcome? {
+                ResponseEvent::Informational(_) if response.is_none() => {}
+                ResponseEvent::Informational(_) => {
+                    return Err(Error::Parse(
+                        "informational response after final response head".into(),
+                    ));
+                }
+                ResponseEvent::Head(head) if response.is_none() => {
+                    body.set_expected(content_length(head.as_response()));
+                    response = Some(head.into_response());
+                }
+                ResponseEvent::Head(_) => {
+                    return Err(Error::Parse("duplicate final response head".into()));
+                }
+                ResponseEvent::Data(data) if response.is_some() && !trailers_seen => {
+                    body.push(data)?;
+                }
+                ResponseEvent::Data(_) => {
+                    return Err(Error::Parse("response data outside body".into()));
+                }
+                ResponseEvent::Trailers(trailers)
+                    if response.is_some() && !trailers_seen =>
+                {
+                    trailers_seen = true;
+                    response
+                        .as_mut()
+                        .expect("response head checked")
+                        .headers_mut()
+                        .extend_trailers(
+                            trailers
+                                .iter()
+                                .map(|(name, value)| (name.clone(), value.clone())),
+                        );
+                }
+                ResponseEvent::Trailers(_) => {
+                    return Err(Error::Parse("duplicate response trailers".into()));
                 }
             }
-        })
+        }
+        let mut response =
+            response.ok_or_else(|| Error::Parse("response ended before final head".into()))?;
+        body.apply(&mut response);
+        Ok(response)
+    })
+}
+
+fn content_length(response: &Response) -> Option<usize> {
+    response
+        .headers()
+        .get(http::header::CONTENT_LENGTH)?
+        .to_str()
+        .ok()?
+        .parse()
+        .ok()
+}
+
+struct BodyCollector {
+    first: Option<SharedBytes>,
+    owned: Option<Vec<u8>>,
+    expected: Option<usize>,
+    len: usize,
+    max: usize,
+}
+
+impl BodyCollector {
+    fn new(max: usize) -> Self {
+        Self {
+            first: None,
+            owned: None,
+            expected: None,
+            len: 0,
+            max,
+        }
+    }
+
+    fn set_expected(&mut self, expected: Option<usize>) {
+        self.expected = expected.filter(|expected| *expected <= self.max);
+    }
+
+    fn push(&mut self, data: SharedBytes) -> Result<(), Error> {
+        self.len = self
+            .len
+            .checked_add(data.len())
+            .filter(|len| *len <= self.max)
+            .ok_or_else(|| Error::Parse("response body exceeds size limit".into()))?;
+        if let Some(owned) = self.owned.as_mut() {
+            owned.extend_from_slice(data.as_ref());
+            return Ok(());
+        }
+        let Some(first) = self.first.take() else {
+            self.first = Some(data);
+            return Ok(());
+        };
+        let capacity = self.expected.unwrap_or(self.len).max(self.len);
+        let mut owned = Vec::with_capacity(capacity);
+        owned.extend_from_slice(first.as_ref());
+        owned.extend_from_slice(data.as_ref());
+        self.owned = Some(owned);
+        Ok(())
+    }
+
+    fn apply(self, response: &mut Response) {
+        if let Some(owned) = self.owned {
+            response.set_body(owned);
+        } else if let Some(first) = self.first {
+            response.set_body(first);
+        }
     }
 }
 
@@ -287,7 +556,7 @@ impl Enqueue {
         conn_id: Token,
         request: Lease<'d>,
         region: &mut RegionToken<'d>,
-    ) -> Result<Reply<'d, Outcome, ExtractResponse>, Error>
+    ) -> Result<ReplyStream<'d, Outcome, ExtractResponseEvent>, Error>
     where
         S: Dialer<E::Transport> + 'd,
         E: Env + 'd,
@@ -306,7 +575,7 @@ impl Enqueue {
             shared.make_available(region, conn_id);
             return Err(Error::Backpressure);
         }
-        let mut reply = Reply::new();
+        let mut reply = ReplyStream::new();
         assert!(reply.try_attach(region, arena));
         shared.submitted(region, conn_id, Instant::now());
         Ok(reply)
@@ -317,7 +586,7 @@ struct Encode;
 
 impl Encode {
     fn request<'d>(
-        pool: Pin<&'d Pool>,
+        pool: &'d Pool,
         method: &Method,
         path: &str,
         host: &str,

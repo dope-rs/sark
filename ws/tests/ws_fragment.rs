@@ -7,16 +7,17 @@ use std::time::Duration;
 
 use dope::driver;
 use dope::driver::token::Token;
-use dope::manifold::connector::Connector;
-use dope::manifold::connector::source::Static;
+use dope::manifold::connector::session::Connector;
+use dope::manifold::connector::source::health::Static;
 use dope::manifold::env::Bundle;
-use dope::runtime::Executor;
+use dope::runtime::executor::Executor;
 use dope::runtime::profile::Balanced;
-use dope_extra::harness::Harness;
-use dope_fiber::{SessionExt as _, poll_fn};
+use dope_fiber::abi::pollfn::PollFn;
+use dope_fiber::extensions::SessionExt as _;
 use dope_net::tcp::Tcp;
 use dope_net::wire::identity::Identity;
-use sark_ws::client::{self, Client};
+use dope_test::Harness;
+use sark_ws::client::{self, Client, Config};
 use sark_ws::server;
 
 #[derive(Default)]
@@ -72,7 +73,7 @@ fn ws_pong(msg: server::Message<'_>, response: &mut server::Response<'_>) {
 }
 
 #[test]
-fn ws_codec_smoke() {
+fn ws_fragmented_message_reassembles() {
     let harness = Harness::bind().expect("harness");
     let addr = harness.addr();
     let cfg = server::Config {
@@ -91,20 +92,14 @@ fn ws_codec_smoke() {
                 sark_ws::server::serve(ws_pong as Handler, cfg.clone(), ctx, Some(trigger))
             },
             |addr| {
+                let client_cfg = Config::new("127.0.0.1", "/ws").max_outbound_frame_payload(2);
                 let exec = Executor::new(driver::Config::for_tcp_profile::<Balanced>(8))
                     .expect("driver")
-                    .with_storage_factory(client::Port::factory(
-                        client::Config::new("127.0.0.1", "/ws"),
-                        1,
-                        16,
-                    ));
+                    .with_storage_factory(client::Port::factory(client_cfg, 1, 16));
                 exec.enter(|mut sess| {
                     let backoff = sess.seed().derive(dope::hash::domain::BACKOFF).state();
-                    let port = sess.storage() as *const client::Port<'_>;
+                    let port = sess.storage();
                     let mut driver = sess.driver_access();
-                    // The port is executor-owned and the connector cannot
-                    // escape this session closure.
-                    let port = unsafe { &*port };
                     let state = Rc::new(RefCell::new(Captured::default()));
                     let handler = CaptureHandler {
                         state: state.clone(),
@@ -116,6 +111,7 @@ fn ws_codec_smoke() {
                             client::Session::new(handler, port),
                             upstreams,
                             port.capacity(),
+                            port.egress(),
                             &mut driver,
                         )
                         .expect("connector")
@@ -134,11 +130,11 @@ fn ws_codec_smoke() {
                         .expect("ws active");
                     sess.block_on(rt.as_ref(), client.send_text(b"ping"))
                         .expect("runtime")
-                        .expect("send text");
+                        .expect("send fragmented text");
                     let reply = sess
                         .block_on(
                             rt.as_ref(),
-                            poll_fn(|cx| {
+                            PollFn::new(|cx| {
                                 if let Some(r) = state_fut.borrow().reply.clone() {
                                     return Poll::Ready(r);
                                 }

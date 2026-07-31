@@ -7,7 +7,7 @@ use sark_h2::{Conn, ServerRole};
 
 #[test]
 fn unary_response_has_one_owner() {
-    let mut client = Session::new();
+    let mut client = Session::new().unwrap();
     let stream_id = client
         .start_unary_raw(b"/svc/Method", None, &Metadata::new(), b"request")
         .unwrap();

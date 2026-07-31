@@ -4,8 +4,14 @@ use std::pin::Pin;
 use dope::DriverContext;
 use dope::driver::token::Token;
 use dope::manifold::Outcome;
-use dope::manifold::listener::{self, Application, SlotEgress as _};
-use dope_fiber::{Fiber, SlotExt as _, TaskQueue};
+use dope::manifold::listener::{
+    application::{Application, ApplicationHooks},
+    egress::SlotEgress as _,
+    state::{EgressCtx, State},
+};
+use dope_fiber::abi::Fiber;
+use dope_fiber::raw::task::RootWaker;
+use dope_fiber::raw::task::queue::TaskQueue;
 use dope_net::link::slot::Slot;
 use dope_net::wire::Wire;
 use dope_net::wire::identity::Identity;
@@ -13,12 +19,33 @@ use o3::buffer::RetainBytes;
 
 use super::Config;
 use super::connection::{ConnectionState, Dispatch, EventSink, Limits, Request, Response};
+use super::driver;
 use super::scheduler::{Resumed, Scheduler, StartContext, Started};
 use super::task::TaskTarget;
-use crate::conn::{Conn, ConnError};
-use crate::frame::ErrorCode;
+use crate::conn::{self, ConfigError, Conn, ConnError, ValidatedConfig};
+use crate::frame::{ErrorCode, HEADER_LEN};
 use crate::role::ServerRole;
 use crate::stream::StreamId;
+
+const SERVER_EVENT_CAPACITY: usize = 64;
+
+fn protocol_config(config: Config) -> conn::Config {
+    let mut protocol = conn::Config::default();
+    // `chunk` retains the complete transport chunk before parsing it, so this
+    // bound must fit both one receive buffer and one maximum-sized peer frame.
+    protocol.inbound_capacity = config
+        .receive_buffer_bytes
+        .max(HEADER_LEN + protocol.local_settings.max_frame_size as usize);
+    let frame_headroom = HEADER_LEN + protocol.local_settings.max_frame_size as usize;
+    protocol.outbound_capacity = config
+        .max_outbound_bytes
+        .saturating_add(frame_headroom)
+        .max(protocol.initial_outbound_capacity::<ServerRole>());
+    // The driver drains and resumes parsing on overload. A bounded event burst
+    // therefore avoids provisioning the generic 8K-event queue per connection.
+    protocol.event_capacity = SERVER_EVENT_CAPACITY;
+    protocol
+}
 
 pub trait Handler: 'static {
     type Fut<'h>: Fiber<'h, Output = Response> + 'h
@@ -46,8 +73,8 @@ trait ConnectionContainer: Default + 'static {
 }
 
 fn flush_into<'d, W, C>(
-    slot: &mut Slot<'d, W, listener::State<C>>,
-    aux: &mut listener::Aux,
+    slot: &mut Slot<'d, W, State<C>>,
+    egress: &mut EgressCtx<'_, '_>,
     driver: &mut DriverContext<'_, 'd>,
     close_after: bool,
 ) where
@@ -55,18 +82,24 @@ fn flush_into<'d, W, C>(
     C: ConnectionContainer,
 {
     let send_token = slot.token();
-    let mut write_buffer = aux.write_buf_for(slot);
-    let state = slot.state.conn.connection();
-    let written = state.connection.drain_into(&mut write_buffer);
+    let mut write_buffer = egress.write_buf_for(slot);
     if close_after {
         slot.set_close_after();
     }
-    slot.submit_buffered(write_buffer, written, send_token, driver);
+    let state = slot.state.conn.connection();
+    match state.connection.take_write(&mut write_buffer) {
+        crate::conn::OutboundWrite::Buffered(written) => {
+            slot.submit_buffered(write_buffer, written, send_token, driver);
+        }
+        crate::conn::OutboundWrite::Split { prefix_len, body } => {
+            slot.submit_split_shared(write_buffer, prefix_len, body, send_token, driver);
+        }
+    }
 }
 
 fn finish_ingest<'d, W, C>(
-    slot: &mut Slot<'d, W, listener::State<C>>,
-    aux: &mut listener::Aux,
+    slot: &mut Slot<'d, W, State<C>>,
+    egress: &mut EgressCtx<'_, '_>,
     driver: &mut DriverContext<'_, 'd>,
     error: Option<ConnError>,
 ) -> Outcome
@@ -77,17 +110,17 @@ where
     if let Some(error) = error {
         let state = slot.state.conn.connection();
         let _ = state.connection.goaway(ErrorCode::from(&error), b"");
-        flush_into(slot, aux, driver, true);
+        flush_into(slot, egress, driver, true);
     } else {
-        flush_connection(slot, aux, driver);
+        flush_connection(slot, egress, driver);
     }
     Outcome::Ok
 }
 
 fn resume_egress<'d, W, C>(
-    slot: &mut Slot<'d, W, listener::State<C>>,
+    slot: &mut Slot<'d, W, State<C>>,
     limits: Limits,
-    aux: &mut listener::Aux,
+    egress: &mut EgressCtx<'_, '_>,
     driver: &mut DriverContext<'_, 'd>,
 ) where
     W: Wire,
@@ -95,14 +128,22 @@ fn resume_egress<'d, W, C>(
 {
     let state = slot.state.conn.connection();
     state.pump_pending(limits, false);
-    if !state.connection.outbound().is_empty() {
-        flush_connection(slot, aux, driver);
+    if state.connection.outbound_len() != 0 {
+        flush_connection(slot, egress, driver);
     }
 }
 
 #[derive(Default)]
 pub struct SyncConnState {
     state: ConnectionState,
+}
+
+impl SyncConnState {
+    fn new(protocol: ValidatedConfig<ServerRole>) -> Self {
+        Self {
+            state: ConnectionState::new(Conn::from_config(protocol)),
+        }
+    }
 }
 
 impl ConnectionContainer for SyncConnState {
@@ -114,16 +155,18 @@ impl ConnectionContainer for SyncConnState {
 pub struct SyncApp<'h, H: SyncHandler, W: Wire = Identity> {
     user: &'h H,
     limits: Limits,
+    protocol: ValidatedConfig<ServerRole>,
     wire: PhantomData<fn() -> W>,
 }
 
 impl<'h, H: SyncHandler, W: Wire> SyncApp<'h, H, W> {
-    pub fn new(user: &'h H, config: Config) -> Self {
-        Self {
+    pub fn new(user: &'h H, config: Config) -> Result<Self, ConfigError> {
+        Ok(Self {
             user,
             limits: config.into(),
+            protocol: ValidatedConfig::new(protocol_config(config))?,
             wire: PhantomData,
-        }
+        })
     }
 
     pub fn handler(&self) -> &H {
@@ -149,7 +192,7 @@ struct SyncTransport<'a, 'h, H: SyncHandler> {
     state: &'a mut ConnectionState,
 }
 
-impl<H: SyncHandler> super::driver::Transport for SyncTransport<'_, '_, H> {
+impl<H: SyncHandler> driver::Transport for SyncTransport<'_, '_, H> {
     fn connection(&mut self) -> &mut Conn<ServerRole> {
         &mut self.state.connection
     }
@@ -163,40 +206,49 @@ impl<H: SyncHandler> super::driver::Transport for SyncTransport<'_, '_, H> {
 impl<'d, H: SyncHandler + 'd, W: Wire> Application<'d> for SyncApp<'d, H, W> {
     type Conn = SyncConnState;
     type Wire = W;
+    type Hooks = Self;
 
+    fn connection(self: Pin<&Self>) -> Self::Conn {
+        SyncConnState::new(self.protocol)
+    }
+}
+
+impl<'d, H: SyncHandler + 'd, W: Wire> ApplicationHooks<'d, SyncApp<'d, H, W>>
+    for SyncApp<'d, H, W>
+{
     fn chunk<R: RetainBytes>(
-        self: Pin<&mut Self>,
-        slot: &mut Slot<'d, W, listener::State<SyncConnState>>,
+        app: Pin<&mut SyncApp<'d, H, W>>,
+        slot: &mut Slot<'d, W, State<SyncConnState>>,
+        mut egress: EgressCtx<'_, '_>,
         chunk: R,
-        aux: &mut listener::Aux,
         driver: &mut DriverContext<'_, 'd>,
     ) -> Outcome {
-        let this = self.get_mut();
+        let this = app.get_mut();
         let state = &mut slot.state.conn.state;
-        let error = super::driver::Driver::new(&mut SyncTransport {
+        let error = driver::Driver::new(&mut SyncTransport {
             user: this.user,
             limits: this.limits,
             state,
         })
-        .ingest(chunk.as_slice())
+        .ingest_retained(chunk.into_retained())
         .err();
-        finish_ingest(slot, aux, driver, error)
+        finish_ingest(slot, &mut egress, driver, error)
     }
 
     fn send(
-        self: Pin<&mut Self>,
-        slot: &mut Slot<'d, W, listener::State<SyncConnState>>,
+        app: Pin<&mut SyncApp<'d, H, W>>,
+        slot: &mut Slot<'d, W, State<SyncConnState>>,
+        mut egress: EgressCtx<'_, '_>,
         _sent: usize,
-        aux: &mut listener::Aux,
         driver: &mut DriverContext<'_, 'd>,
     ) {
-        resume_egress(slot, self.get_mut().limits, aux, driver);
+        resume_egress(slot, app.get_mut().limits, &mut egress, driver);
     }
 
     fn close(
-        self: Pin<&mut Self>,
-        slot: &mut Slot<'d, W, listener::State<SyncConnState>>,
-        _aux: &mut listener::Aux,
+        _app: Pin<&mut SyncApp<'d, H, W>>,
+        slot: &mut Slot<'d, W, State<SyncConnState>>,
+        _egress: EgressCtx<'_, '_>,
     ) {
         slot.state.conn.state.close();
     }
@@ -212,7 +264,17 @@ impl Default for ConnState {
     fn default() -> Self {
         Self {
             state: ConnectionState::default(),
-            ready: Box::pin(TaskQueue::new()),
+            ready: Box::pin(TaskQueue::with_capacity(0)),
+            task_head: None,
+        }
+    }
+}
+
+impl ConnState {
+    fn new(protocol: ValidatedConfig<ServerRole>) -> Self {
+        Self {
+            state: ConnectionState::new(Conn::from_config(protocol)),
+            ready: Box::pin(TaskQueue::with_capacity(0)),
             task_head: None,
         }
     }
@@ -227,18 +289,20 @@ impl ConnectionContainer for ConnState {
 pub struct App<'d, H: Handler + 'd, W: Wire = Identity> {
     user: &'d H,
     limits: Limits,
+    protocol: ValidatedConfig<ServerRole>,
     scheduler: Scheduler<'d, H::Fut<'d>>,
     wire: PhantomData<fn() -> W>,
 }
 
 impl<'d, H: Handler + 'd, W: Wire> App<'d, H, W> {
-    pub fn new(user: &'d H, config: Config) -> Self {
-        Self {
+    pub fn new(user: &'d H, config: Config) -> Result<Self, ConfigError> {
+        Ok(Self {
             user,
             limits: config.into(),
+            protocol: ValidatedConfig::new(protocol_config(config))?,
             scheduler: Scheduler::with_capacity(config.max_handler_tasks),
             wire: PhantomData,
-        }
+        })
     }
 
     pub fn handler(&self) -> &H {
@@ -247,11 +311,11 @@ impl<'d, H: Handler + 'd, W: Wire> App<'d, H, W> {
 
     fn drain_events(
         &mut self,
-        slot: &mut Slot<'d, W, listener::State<ConnState>>,
+        slot: &mut Slot<'d, W, State<ConnState>>,
         driver: &mut DriverContext<'_, 'd>,
     ) -> usize {
         let connection_id = slot.token();
-        let parent = slot.root_waker();
+        let parent = RootWaker::from_ready(slot.driver(), slot.ready_key());
         let ConnState {
             state,
             ready,
@@ -280,7 +344,7 @@ where
     connection_id: Token,
     ready: Pin<&'a TaskQueue<TaskTarget>>,
     task_head: &'a mut Option<u32>,
-    parent: dope_fiber::RootWaker<'d>,
+    parent: RootWaker<'d>,
     driver: &'a mut DriverContext<'turn, 'd>,
 }
 
@@ -315,11 +379,11 @@ where
 
 struct AsyncTransport<'a, 'turn, 'd, H: Handler + 'd, W: Wire> {
     app: &'a mut App<'d, H, W>,
-    slot: &'a mut Slot<'d, W, listener::State<ConnState>>,
+    slot: &'a mut Slot<'d, W, State<ConnState>>,
     driver: &'a mut DriverContext<'turn, 'd>,
 }
 
-impl<'d, H: Handler + 'd, W: Wire> super::driver::Transport for AsyncTransport<'_, '_, 'd, H, W> {
+impl<'d, H: Handler + 'd, W: Wire> driver::Transport for AsyncTransport<'_, '_, 'd, H, W> {
     fn connection(&mut self) -> &mut Conn<ServerRole> {
         &mut self.slot.state.conn.state.connection
     }
@@ -332,43 +396,50 @@ impl<'d, H: Handler + 'd, W: Wire> super::driver::Transport for AsyncTransport<'
 impl<'d, H: Handler + 'd, W: Wire> Application<'d> for App<'d, H, W> {
     type Conn = ConnState;
     type Wire = W;
+    type Hooks = Self;
 
+    fn connection(self: Pin<&Self>) -> Self::Conn {
+        ConnState::new(self.protocol)
+    }
+}
+
+impl<'d, H: Handler + 'd, W: Wire> ApplicationHooks<'d, App<'d, H, W>> for App<'d, H, W> {
     fn chunk<R: RetainBytes>(
-        self: Pin<&mut Self>,
-        slot: &mut Slot<'d, W, listener::State<ConnState>>,
+        app: Pin<&mut App<'d, H, W>>,
+        slot: &mut Slot<'d, W, State<ConnState>>,
+        mut egress: EgressCtx<'_, '_>,
         chunk: R,
-        aux: &mut listener::Aux,
         driver: &mut DriverContext<'_, 'd>,
     ) -> Outcome {
-        let this = self.get_mut();
-        let error = super::driver::Driver::new(&mut AsyncTransport {
+        let this = app.get_mut();
+        let error = driver::Driver::new(&mut AsyncTransport {
             app: this,
             slot,
             driver,
         })
-        .ingest(chunk.as_slice())
+        .ingest_retained(chunk.into_retained())
         .err();
-        finish_ingest(slot, aux, driver, error)
+        finish_ingest(slot, &mut egress, driver, error)
     }
 
     fn send(
-        self: Pin<&mut Self>,
-        slot: &mut Slot<'d, W, listener::State<ConnState>>,
+        app: Pin<&mut App<'d, H, W>>,
+        slot: &mut Slot<'d, W, State<ConnState>>,
+        mut egress: EgressCtx<'_, '_>,
         _sent: usize,
-        aux: &mut listener::Aux,
         driver: &mut DriverContext<'_, 'd>,
     ) {
-        resume_egress(slot, self.get_mut().limits, aux, driver);
+        resume_egress(slot, app.get_mut().limits, &mut egress, driver);
     }
 
     fn activate(
-        self: Pin<&mut Self>,
-        slot: &mut Slot<'d, W, listener::State<ConnState>>,
-        aux: &mut listener::Aux,
+        app: Pin<&mut App<'d, H, W>>,
+        slot: &mut Slot<'d, W, State<ConnState>>,
+        mut egress: EgressCtx<'_, '_>,
         driver: &mut DriverContext<'_, 'd>,
     ) {
-        let this = self.get_mut();
-        let parent = slot.root_waker();
+        let this = app.get_mut();
+        let parent = RootWaker::from_ready(slot.driver(), slot.ready_key());
         let connection_id = slot.token();
         let ConnState {
             state,
@@ -398,17 +469,17 @@ impl<'d, H: Handler + 'd, W: Wire> Application<'d> for App<'d, H, W> {
                 Resumed::Pending | Resumed::Failed(None) | Resumed::Stale => {}
             }
         }
-        if !state.connection.outbound().is_empty() {
-            flush_connection(slot, aux, driver);
+        if state.connection.outbound_len() != 0 {
+            flush_connection(slot, &mut egress, driver);
         }
     }
 
     fn close(
-        self: Pin<&mut Self>,
-        slot: &mut Slot<'d, W, listener::State<ConnState>>,
-        _aux: &mut listener::Aux,
+        app: Pin<&mut App<'d, H, W>>,
+        slot: &mut Slot<'d, W, State<ConnState>>,
+        _egress: EgressCtx<'_, '_>,
     ) {
-        let this = self.get_mut();
+        let this = app.get_mut();
         let state = &mut slot.state.conn;
         this.scheduler.close(&mut state.task_head);
         state.state.close();
@@ -416,13 +487,13 @@ impl<'d, H: Handler + 'd, W: Wire> Application<'d> for App<'d, H, W> {
 }
 
 fn flush_connection<'d, W, C>(
-    slot: &mut Slot<'d, W, listener::State<C>>,
-    aux: &mut listener::Aux,
+    slot: &mut Slot<'d, W, State<C>>,
+    egress: &mut EgressCtx<'_, '_>,
     driver: &mut DriverContext<'_, 'd>,
 ) where
     W: Wire,
     C: ConnectionContainer,
 {
     let close_after = slot.state.conn.connection().connection.goaway_sent();
-    flush_into(slot, aux, driver, close_after);
+    flush_into(slot, egress, driver, close_after);
 }

@@ -1,7 +1,16 @@
+use memchr::memchr2;
+
 use crate::Result;
 use crate::error::Fail;
 
 pub struct Scan;
+
+pub(crate) struct StringSpan {
+    pub(crate) start: usize,
+    pub(crate) end: usize,
+    pub(crate) escaped: bool,
+    pub(crate) decoded_len: usize,
+}
 
 impl Scan {
     pub fn ws(input: &[u8], idx: &mut usize) {
@@ -75,17 +84,16 @@ impl Scan {
 
     pub fn skip_plain_string(input: &[u8], idx: &mut usize) -> Result<()> {
         Self::expect_byte(input, idx, b'"')?;
-        while *idx < input.len() {
-            match input[*idx] {
-                b'"' => {
-                    *idx += 1;
-                    return Ok(());
-                }
-                b'\\' => return Err(Fail::bad()),
-                _ => *idx += 1,
-            }
+        let Some(relative) = memchr2(b'"', b'\\', &input[*idx..]) else {
+            *idx = input.len();
+            return Err(Fail::bad());
+        };
+        *idx += relative;
+        if input[*idx] == b'\\' {
+            return Err(Fail::bad());
         }
-        Err(Fail::bad())
+        *idx += 1;
+        Ok(())
     }
 
     pub fn skip_value(input: &[u8], idx: &mut usize) -> Result<()> {
@@ -154,17 +162,46 @@ impl Scan {
     }
 
     pub fn str_slice<'a>(input: &'a [u8], idx: &mut usize) -> Result<&'a [u8]> {
+        let span = Self::string_span(input, idx)?;
+        Ok(&input[span.start..span.end])
+    }
+
+    pub(crate) fn string_span(input: &[u8], idx: &mut usize) -> Result<StringSpan> {
         Self::expect_byte(input, idx, b'"')?;
         let start = *idx;
+        let Some(relative) = memchr2(b'"', b'\\', &input[start..]) else {
+            *idx = input.len();
+            return Err(Fail::bad());
+        };
+        *idx += relative;
+        if input[*idx] == b'"' {
+            let end = *idx;
+            *idx += 1;
+            return Ok(StringSpan {
+                start,
+                end,
+                escaped: false,
+                decoded_len: relative,
+            });
+        }
+
+        let mut escapes = 1;
+        *idx += 2;
         while *idx < input.len() {
             match input[*idx] {
                 b'\\' => {
+                    escapes += 1;
                     *idx += 2;
                 }
                 b'"' => {
                     let end = *idx;
                     *idx += 1;
-                    return Ok(&input[start..end]);
+                    return Ok(StringSpan {
+                        start,
+                        end,
+                        escaped: true,
+                        decoded_len: end - start - escapes,
+                    });
                 }
                 _ => {
                     *idx += 1;
@@ -172,35 +209,6 @@ impl Scan {
             }
         }
         Err(Fail::bad())
-    }
-
-    pub(super) fn decode_str(input: &[u8]) -> Result<Vec<u8>> {
-        let mut out = Vec::with_capacity(input.len());
-        let mut idx = 0usize;
-        while idx < input.len() {
-            match input[idx] {
-                b'\\' => {
-                    idx += 1;
-                    if idx >= input.len() {
-                        return Err(Fail::bad());
-                    }
-                    match input[idx] {
-                        b'"' => out.push(b'"'),
-                        b'\\' => out.push(b'\\'),
-                        b'/' => out.push(b'/'),
-                        b'b' => out.push(0x08),
-                        b'f' => out.push(0x0c),
-                        b'n' => out.push(b'\n'),
-                        b'r' => out.push(b'\r'),
-                        b't' => out.push(b'\t'),
-                        _ => return Err(Fail::bad()),
-                    }
-                }
-                b => out.push(b),
-            }
-            idx += 1;
-        }
-        Ok(out)
     }
 
     fn skip_group(input: &[u8], idx: &mut usize, open: u8, close: u8) -> Result<()> {

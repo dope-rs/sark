@@ -1,14 +1,16 @@
 mod instruction;
+mod literal;
 mod static_table;
 mod table;
 
 pub use instruction::{DecoderInstruction, EncoderInstruction};
 use sark_core::http::{
-    Field, FieldValueWriter, HpackHuffman, HpackHuffmanError, OwnedField, PrefixedInt,
-    PrefixedIntError, VecFieldBlock,
+    Field, OwnedField, PackedFieldError, PrefixedInt, PrefixedIntError, VecFieldBlock,
 };
 pub use static_table::StaticTable;
 pub use table::DynamicTable;
+
+use literal::Literal;
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum DecoderError {
@@ -39,6 +41,57 @@ pub enum DecodeOutcome {
     Blocked {
         required_insert_count: u64,
     },
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub struct EncodedSection {
+    encoded_required_insert_count: PrefixedInt<8>,
+    delta_base: PrefixedInt<7>,
+    delta_base_negative: bool,
+    field_lines: Vec<u8>,
+}
+
+impl EncodedSection {
+    fn new(
+        encoded_required_insert_count: u64,
+        required_insert_count: u64,
+        base: u64,
+        field_lines: Vec<u8>,
+    ) -> Self {
+        let (delta_base, delta_base_negative) = if base >= required_insert_count {
+            (base - required_insert_count, false)
+        } else {
+            (required_insert_count - base - 1, true)
+        };
+        Self {
+            encoded_required_insert_count: PrefixedInt::new(encoded_required_insert_count),
+            delta_base: PrefixedInt::new(delta_base),
+            delta_base_negative,
+            field_lines,
+        }
+    }
+
+    pub fn prefix_len(&self) -> usize {
+        self.encoded_required_insert_count.encoded_len() + self.delta_base.encoded_len()
+    }
+
+    pub fn encoded_len(&self) -> usize {
+        self.prefix_len() + self.field_lines.len()
+    }
+
+    pub fn encode_prefix(&self, out: &mut impl Extend<u8>) {
+        self.encoded_required_insert_count.encode(0, out);
+        self.delta_base
+            .encode(if self.delta_base_negative { 0x80 } else { 0 }, out);
+    }
+
+    pub fn field_lines(&self) -> &[u8] {
+        &self.field_lines
+    }
+
+    pub fn into_field_lines(self) -> Vec<u8> {
+        self.field_lines
+    }
 }
 
 pub struct Encoder {
@@ -92,7 +145,9 @@ impl Encoder {
     }
 
     pub fn take_encoder_instructions(&mut self) -> Vec<u8> {
-        core::mem::take(&mut self.encoder_stream)
+        let mut instructions = Vec::new();
+        core::mem::swap(&mut instructions, &mut self.encoder_stream);
+        instructions
     }
 
     pub fn ingest_decoder(&mut self, buf: &[u8]) -> Result<usize, DecoderError> {
@@ -128,6 +183,18 @@ impl Encoder {
     where
         I: IntoIterator<Item = Field<'a>>,
     {
+        let section = self.encode_section(fields);
+        section.encode_prefix(out);
+        out.extend_from_slice(section.field_lines());
+        let mut field_lines = section.into_field_lines();
+        field_lines.clear();
+        self.section = field_lines;
+    }
+
+    pub fn encode_section<'a, I>(&mut self, fields: I) -> EncodedSection
+    where
+        I: IntoIterator<Item = Field<'a>>,
+    {
         let base = self.table.insert_count();
         let mut reps = core::mem::take(&mut self.section);
         reps.clear();
@@ -160,23 +227,19 @@ impl Encoder {
             }
 
             self.encode_literal_name(field, &mut reps);
-            let owned = OwnedField {
-                name: field.name.to_vec(),
-                value: field.value.to_vec(),
-            };
-            if self.table.insert(owned.clone()).ok().flatten().is_some() {
-                EncoderInstruction::literal_insert(owned.name, owned.value)
-                    .encode(&mut self.encoder_stream);
+            if self.table.insert_field(field).ok().flatten().is_some() {
+                EncoderInstruction::encode_literal_insert(field, &mut self.encoder_stream);
             }
         }
 
         let encoded_required_insert_count =
             Self::encode_required_insert_count(required_insert_count, self.table.max_entries());
-        PrefixedInt::encode(encoded_required_insert_count, 8, 0, out);
-        Self::encode_delta_base(required_insert_count, base, out);
-        out.extend_from_slice(&reps);
-        reps.clear();
-        self.section = reps;
+        EncodedSection::new(
+            encoded_required_insert_count,
+            required_insert_count,
+            base,
+            reps,
+        )
     }
 
     fn find_exact_for_reference(&self, field: Field<'_>) -> Option<u64> {
@@ -194,8 +257,8 @@ impl Encoder {
     }
 
     fn encode_literal_name(&self, field: Field<'_>, out: &mut Vec<u8>) {
-        StringLiteral::encode(field.name, 3, self.use_huffman, 0x20, out);
-        StringLiteral::encode(field.value, 7, self.use_huffman, 0, out);
+        Literal::raw(field.name).encode::<3>(self.use_huffman, 0x20, out);
+        Literal::raw(field.value).encode::<7>(self.use_huffman, 0, out);
     }
 
     fn encode_required_insert_count(required_insert_count: u64, max_entries: u64) -> u64 {
@@ -209,14 +272,6 @@ impl Encoder {
         (required_insert_count % full_range) + 1
     }
 
-    fn encode_delta_base(required_insert_count: u64, base: u64, out: &mut Vec<u8>) {
-        if required_insert_count == 0 || base >= required_insert_count {
-            PrefixedInt::encode(base.saturating_sub(required_insert_count), 7, 0, out);
-        } else {
-            PrefixedInt::encode(required_insert_count - base - 1, 7, 0x80, out);
-        }
-    }
-
     fn encode_dynamic_index(absolute: u64, base: u64, out: &mut Vec<u8>) {
         if absolute < base {
             Self::encode_indexed_dynamic(base - absolute - 1, out);
@@ -226,20 +281,20 @@ impl Encoder {
     }
 
     fn encode_indexed_dynamic(relative: u64, out: &mut Vec<u8>) {
-        PrefixedInt::encode(relative, 6, 0x80, out);
+        PrefixedInt::<6>::new(relative).encode(0x80, out);
     }
 
     fn encode_indexed_post_base(post_base: u64, out: &mut Vec<u8>) {
-        PrefixedInt::encode(post_base, 4, 0x10, out);
+        PrefixedInt::<4>::new(post_base).encode(0x10, out);
     }
 
     fn encode_indexed_static(index: u64, out: &mut Vec<u8>) {
-        PrefixedInt::encode(index, 6, 0xc0, out);
+        PrefixedInt::<6>::new(index).encode(0xc0, out);
     }
 
     fn encode_literal_static_name(index: u64, value: &[u8], huffman: bool, out: &mut Vec<u8>) {
-        PrefixedInt::encode(index, 4, 0x50, out);
-        StringLiteral::encode(value, 7, huffman, 0, out);
+        PrefixedInt::<4>::new(index).encode(0x50, out);
+        Literal::raw(value).encode::<7>(huffman, 0, out);
     }
 
     fn encode_literal_dynamic_name(
@@ -250,11 +305,11 @@ impl Encoder {
         out: &mut Vec<u8>,
     ) {
         if absolute < base {
-            PrefixedInt::encode(base - absolute - 1, 4, 0x40, out);
+            PrefixedInt::<4>::new(base - absolute - 1).encode(0x40, out);
         } else {
-            PrefixedInt::encode(absolute - base, 3, 0x00, out);
+            PrefixedInt::<3>::new(absolute - base).encode(0x00, out);
         }
-        StringLiteral::encode(value, 7, huffman, 0, out);
+        Literal::raw(value).encode::<7>(huffman, 0, out);
     }
 }
 
@@ -290,7 +345,9 @@ impl Decoder {
     }
 
     pub fn take_decoder_instructions(&mut self) -> Vec<u8> {
-        core::mem::take(&mut self.decoder_stream)
+        let mut instructions = Vec::new();
+        core::mem::swap(&mut instructions, &mut self.decoder_stream);
+        instructions
     }
 
     pub fn ingest_encoder(&mut self, buf: &[u8]) -> Result<usize, DecoderError> {
@@ -362,14 +419,14 @@ impl Decoder {
 
     pub fn decode_or_blocked(&mut self, buf: &[u8]) -> Result<DecodeOutcome, DecoderError> {
         let mut pos = 0;
-        let (encoded_insert_count, n) = PrefixedInt::decode(buf, 8)?;
+        let (encoded_insert_count, n) = PrefixedInt::<8>::decode(buf)?;
         pos += n;
         let required_insert_count = Self::decode_required_insert_count(
-            encoded_insert_count,
+            encoded_insert_count.get(),
             self.table.insert_count(),
             self.table.max_entries(),
         )?;
-        let (delta_base, n) = PrefixedInt::decode(&buf[pos..], 7)?;
+        let (delta_base, n) = PrefixedInt::<7>::decode(&buf[pos..])?;
         let sign = (buf[pos] & 0x80) != 0;
         pos += n;
 
@@ -378,19 +435,33 @@ impl Decoder {
                 required_insert_count,
             });
         }
-        let base = Self::decode_base(required_insert_count, delta_base, sign)?;
+        let base = Self::decode_base(required_insert_count, delta_base.get(), sign)?;
 
         let mut fields = VecFieldBlock::with_capacity(
             self.max_field_section_size
                 .min(Self::INITIAL_FIELD_BLOCK_CAPACITY),
         );
         let mut total = 0usize;
+        macro_rules! push_literal {
+            ($name:expr) => {{
+                let (value, n) = Literal::parse::<7>(&buf[pos..])?;
+                pos += n;
+                Self::push_field(
+                    &mut fields,
+                    &mut total,
+                    $name,
+                    value,
+                    self.max_field_section_size,
+                )?;
+            }};
+        }
         while pos < buf.len() {
             let first = buf[pos];
             if first & 0x80 != 0 {
                 let is_static = first & 0x40 != 0;
-                let (index, n) = PrefixedInt::decode(&buf[pos..], 6)?;
+                let (index, n) = PrefixedInt::<6>::decode(&buf[pos..])?;
                 pos += n;
+                let index = index.get();
                 let field = if is_static {
                     StaticTable::get(index).ok_or(DecoderError::InvalidReference)?
                 } else {
@@ -401,51 +472,44 @@ impl Decoder {
                 Self::push_field(
                     &mut fields,
                     &mut total,
-                    DecodedString::raw(field.name),
-                    DecodedString::raw(field.value),
+                    Literal::raw(field.name),
+                    Literal::raw(field.value),
                     self.max_field_section_size,
                 )?;
                 continue;
             }
             if first & 0xc0 == 0x40 {
                 let is_static = first & 0x10 != 0;
-                let (index, n) = PrefixedInt::decode(&buf[pos..], 4)?;
+                let (index, n) = PrefixedInt::<4>::decode(&buf[pos..])?;
                 pos += n;
+                let index = index.get();
                 let name = if is_static {
                     StaticTable::name(index)
-                        .map(DecodedString::raw)
+                        .map(Literal::raw)
                         .ok_or(DecoderError::InvalidReference)?
                 } else {
-                    DecodedString::raw(
+                    Literal::raw(
                         self.table
                             .get_relative_to_base(base, index)
                             .ok_or(DecoderError::InvalidReference)?
                             .name,
                     )
                 };
-                let (value, n) = StringLiteral::parse(&buf[pos..], 7)?;
-                pos += n;
-                Self::push_field(
-                    &mut fields,
-                    &mut total,
-                    name,
-                    value,
-                    self.max_field_section_size,
-                )?;
+                push_literal!(name);
                 continue;
             }
             if first & 0xf0 == 0x10 {
-                let (index, n) = PrefixedInt::decode(&buf[pos..], 4)?;
+                let (index, n) = PrefixedInt::<4>::decode(&buf[pos..])?;
                 pos += n;
                 let field = self
                     .table
-                    .get_absolute(base + index)
+                    .get_absolute(base + index.get())
                     .ok_or(DecoderError::InvalidReference)?;
                 Self::push_field(
                     &mut fields,
                     &mut total,
-                    DecodedString::raw(field.name),
-                    DecodedString::raw(field.value),
+                    Literal::raw(field.name),
+                    Literal::raw(field.value),
                     self.max_field_section_size,
                 )?;
                 continue;
@@ -454,39 +518,23 @@ impl Decoder {
                 if first & 0x08 != 0 {
                     return Err(DecoderError::BadLiteral);
                 }
-                let (index, n) = PrefixedInt::decode(&buf[pos..], 3)?;
+                let (index, n) = PrefixedInt::<3>::decode(&buf[pos..])?;
                 pos += n;
-                let name = DecodedString::raw(
+                let name = Literal::raw(
                     self.table
-                        .get_absolute(base + index)
+                        .get_absolute(base + index.get())
                         .ok_or(DecoderError::InvalidReference)?
                         .name,
                 );
-                let (value, n) = StringLiteral::parse(&buf[pos..], 7)?;
-                pos += n;
-                Self::push_field(
-                    &mut fields,
-                    &mut total,
-                    name,
-                    value,
-                    self.max_field_section_size,
-                )?;
+                push_literal!(name);
                 continue;
             }
             if first & 0xe0 != 0x20 {
                 return Err(DecoderError::BadLiteral);
             }
-            let (name, n) = StringLiteral::parse(&buf[pos..], 3)?;
+            let (name, n) = Literal::parse::<3>(&buf[pos..])?;
             pos += n;
-            let (value, n) = StringLiteral::parse(&buf[pos..], 7)?;
-            pos += n;
-            Self::push_field(
-                &mut fields,
-                &mut total,
-                name,
-                value,
-                self.max_field_section_size,
-            )?;
+            push_literal!(name);
         }
         Ok(DecodeOutcome::Ready {
             fields,
@@ -546,17 +594,23 @@ impl Decoder {
     fn push_field(
         fields: &mut VecFieldBlock,
         total: &mut usize,
-        name: DecodedString<'_>,
-        value: DecodedString<'_>,
+        name: Literal<'_>,
+        value: Literal<'_>,
         max: usize,
     ) -> Result<(), DecoderError> {
         let remaining = max
             .checked_sub(total.checked_add(32).ok_or(DecoderError::BadInteger)?)
             .ok_or(DecoderError::BadLiteral)?;
-        let (name_len, value_len) = fields.try_push_parts(
-            |writer| name.write_to(writer, remaining).map(|_| ()),
-            |writer, name_len| value.write_to(writer, remaining - name_len).map(|_| ()),
-        )?;
+        let (name_len, value_len) = fields
+            .try_push_parts(
+                |writer| name.write_to(writer, remaining).map(|_| ()),
+                |writer, name_len| value.write_to(writer, remaining - name_len).map(|_| ()),
+            )
+            .map_err(|error| match error {
+                PackedFieldError::Write(error) => error,
+                PackedFieldError::ComponentTooLarge { .. }
+                | PackedFieldError::ValueLengthMismatch { .. } => DecoderError::BadLiteral,
+            })?;
         *total = Self::checked_total(*total, name_len, value_len, max)?;
         Ok(())
     }
@@ -576,111 +630,5 @@ impl Decoder {
             return Err(DecoderError::BadLiteral);
         }
         Ok(total)
-    }
-}
-
-pub(super) struct StringLiteral;
-
-#[derive(Copy, Clone)]
-struct DecodedString<'a> {
-    bytes: &'a [u8],
-    huffman: bool,
-}
-
-impl<'a> DecodedString<'a> {
-    const fn raw(bytes: &'a [u8]) -> Self {
-        Self {
-            bytes,
-            huffman: false,
-        }
-    }
-
-    fn write_to(
-        self,
-        out: &mut FieldValueWriter<'_>,
-        max_len: usize,
-    ) -> Result<usize, DecoderError> {
-        if self.huffman {
-            let mut len = 0usize;
-            HpackHuffman::decode_with(self.bytes, |byte| {
-                len = len.checked_add(1).ok_or(HpackHuffmanError)?;
-                if len > max_len {
-                    return Err(HpackHuffmanError);
-                }
-                out.push(byte);
-                Ok(())
-            })
-            .map_err(|_| DecoderError::BadLiteral)?;
-            Ok(len)
-        } else {
-            if self.bytes.len() > max_len {
-                return Err(DecoderError::BadLiteral);
-            }
-            out.extend_from_slice(self.bytes);
-            Ok(self.bytes.len())
-        }
-    }
-
-    fn to_vec(self) -> Result<Vec<u8>, DecoderError> {
-        let mut out = Vec::new();
-        if self.huffman {
-            HpackHuffman::decode(self.bytes, &mut out).map_err(|_| DecoderError::BadLiteral)?;
-        } else {
-            out.extend_from_slice(self.bytes);
-        }
-        Ok(out)
-    }
-}
-
-impl StringLiteral {
-    pub(super) fn encode(
-        value: &[u8],
-        prefix_bits: u8,
-        huffman: bool,
-        prefix_byte: u8,
-        out: &mut Vec<u8>,
-    ) {
-        if huffman {
-            let len = HpackHuffman::encoded_len(value);
-            let huffman_bit = Self::huffman_bit(prefix_bits);
-            PrefixedInt::encode(len as u64, prefix_bits, prefix_byte | huffman_bit, out);
-            HpackHuffman::encode(value, out);
-        } else {
-            PrefixedInt::encode(value.len() as u64, prefix_bits, prefix_byte, out);
-            out.extend_from_slice(value);
-        }
-    }
-
-    pub(super) fn decode(buf: &[u8], prefix_bits: u8) -> Result<(Vec<u8>, usize), DecoderError> {
-        let (literal, consumed) = Self::parse(buf, prefix_bits)?;
-        Ok((literal.to_vec()?, consumed))
-    }
-
-    fn parse(buf: &[u8], prefix_bits: u8) -> Result<(DecodedString<'_>, usize), DecoderError> {
-        if buf.is_empty() {
-            return Err(DecoderError::NeedMore);
-        }
-        let huffman = (buf[0] & Self::huffman_bit(prefix_bits)) != 0;
-        let (len, n) = PrefixedInt::decode(buf, prefix_bits)?;
-        let len = usize::try_from(len).map_err(|_| DecoderError::BadInteger)?;
-        let end = n.checked_add(len).ok_or(DecoderError::BadInteger)?;
-        if buf.len() < end {
-            return Err(DecoderError::NeedMore);
-        }
-        Ok((
-            DecodedString {
-                bytes: &buf[n..end],
-                huffman,
-            },
-            end,
-        ))
-    }
-
-    fn huffman_bit(prefix_bits: u8) -> u8 {
-        if prefix_bits == 7 {
-            0x80
-        } else {
-            1u8 << prefix_bits
-        }
     }
 }

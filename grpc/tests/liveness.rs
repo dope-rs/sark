@@ -3,18 +3,18 @@ use std::net::{SocketAddr, TcpStream};
 use std::thread;
 use std::time::Duration;
 
-use dope_extra::harness::Harness;
+use dope_test::Harness;
 use sark_grpc::Status;
 use sark_grpc::server::{Config, Handler, Request, Response};
-use shin::server::{CertSource, Config as TlsConfig};
-use shin::sig::SigningKey;
+use shin::crypto::sig::SigningKey;
+use shin::server::{config::CertSource, config::Config as TlsConfig};
 
 const SEED: [u8; 32] = [9u8; 32];
 
 struct NopHandler;
 
 impl Handler for NopHandler {
-    fn request(&mut self, _request: Request, response: &mut Response) {
+    fn request(&mut self, _context: &mut (), _request: Request, response: &mut Response) {
         response.status = Status::ok();
     }
 }

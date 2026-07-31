@@ -13,19 +13,19 @@ pub(crate) struct StaticRoute {
 }
 
 impl StaticRoute {
-    pub(crate) fn compile(routes: Vec<Self>) -> TokenStream {
+    pub(crate) fn compile_target(routes: Vec<Self>) -> TokenStream {
         if routes.is_empty() {
             return TokenStream::new();
         }
         let mut by_method: BTreeMap<u8, Vec<Self>> = BTreeMap::new();
-        for r in routes {
-            by_method.entry(r.method.ord()).or_default().push(r);
+        for route in routes {
+            by_method.entry(route.method.ord()).or_default().push(route);
         }
         let arms: Vec<TokenStream> = by_method
             .into_values()
             .map(|group| {
                 let key = group[0].method.key_token();
-                let len_tree = Self::build_len_tree(group);
+                let len_tree = Self::build_target_len_tree(group);
                 quote! { #key => { #len_tree } }
             })
             .collect();
@@ -37,24 +37,25 @@ impl StaticRoute {
         }
     }
 
-    fn build_len_tree(group: Vec<Self>) -> TokenStream {
+    fn build_target_len_tree(group: Vec<Self>) -> TokenStream {
         let mut by_len: BTreeMap<usize, Vec<Self>> = BTreeMap::new();
-        for r in group {
-            by_len.entry(r.path.len()).or_default().push(r);
+        for route in group {
+            by_len.entry(route.path.len()).or_default().push(route);
         }
-        let arms: Vec<TokenStream> = by_len
+        let probes: Vec<TokenStream> = by_len
             .into_iter()
-            .map(|(len, sub)| {
-                let byte_tree = Self::build_byte_tree(sub);
-                quote! { #len => { #byte_tree } }
+            .map(|(len, routes)| {
+                let byte_tree = Self::build_target_byte_tree(routes, len);
+                quote! {
+                    if __target.len() >= #len
+                        && (__target.len() == #len || __target[#len] == b'?')
+                    {
+                        #byte_tree
+                    }
+                }
             })
             .collect();
-        quote! {
-            match __path.len() {
-                #( #arms )*
-                _ => {}
-            }
-        }
+        quote! { #( #probes )* }
     }
 
     fn build_byte_tree(routes: Vec<Self>) -> TokenStream {
@@ -70,6 +71,15 @@ impl StaticRoute {
         let mut memo: BTreeMap<u64, (u64, Plan)> = BTreeMap::new();
         Plan::optimal(full, &routes, len, &mut memo);
         Plan::emit(full, &routes, &memo)
+    }
+
+    fn build_target_byte_tree(routes: Vec<Self>, len: usize) -> TokenStream {
+        let tree = Self::build_byte_tree(routes);
+        quote! {
+            let __path = &__target[..#len];
+            let __path_end = #len;
+            #tree
+        }
     }
 
     fn build_byte_tree_greedy(routes: Vec<Self>) -> TokenStream {

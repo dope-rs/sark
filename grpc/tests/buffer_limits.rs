@@ -21,7 +21,8 @@ fn client_buffered_stream_over_cap_is_resource_exhausted() {
         max_buffered_len: 1000,
         max_buffered_msgs: 1 << 20,
         ..Config::default()
-    });
+    })
+    .unwrap();
     let stream_id = client
         .start_stream_raw(b"/svc/Method", None, &Metadata::new())
         .expect("start stream");

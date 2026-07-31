@@ -206,6 +206,7 @@ impl Handler {
             headers_inner_ident: &request_headers_inner_ident,
             header_slot_ty: &header_slot_ty,
             static_response,
+            is_async,
             kind_ty: &kind_ty,
             native_response_ty,
             native_response_ty_static,
@@ -276,24 +277,7 @@ impl Handler {
                 }
             }
         } else {
-            quote! {
-                impl<'d> ::sark::service::manifold::TaskRoute<'d, #state_ty_d> for #name {
-                    fn invoke_task<'req>(
-                        _params: <Self as ::sark::service::RouteSpec>::Params<'req>,
-                        _req: ::sark::request::Ref<'req>,
-                        _headers: <Self as ::sark::service::RouteSpec>::Headers<'req>,
-                        _parsed_body: <Self as ::sark::service::RouteSpec>::ParsedBody<'req>,
-                        _state: &'req #state_ty_d,
-                        _timer: &'req ::sark::Timer<'d>,
-                    ) -> impl ::sark::fiber::Fiber<'d, Output = ()> + 'req
-                    where
-                        #state_ty_d: 'req,
-                        'd: 'req,
-                    {
-                        ::sark::service::manifold::ready()
-                    }
-                }
-            }
+            TokenStream::new()
         };
 
         Ok(quote! {

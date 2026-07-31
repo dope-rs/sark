@@ -89,12 +89,19 @@ mod tests {
         assert!(generated.contains("__pin_project"));
         assert!(generated.contains("__task_slot_0000"));
         assert!(generated.contains("__task_slot_0001"));
-        assert!(generated.contains("try_from_split_task"));
+        assert!(generated.contains("try_into_task"));
         assert!(generated.contains("RequestTask"));
+        assert!(generated.contains("FiberRoute"));
+        assert!(generated.contains("StreamRoute"));
         assert!(generated.contains("state : & 'env"));
+        assert!(!generated.contains("__F0001"));
+        assert!(!generated.contains("__MK0001"));
         for forbidden in [
             "async move",
             "unsafe",
+            "dispatch :: Dispatch",
+            "manifold :: Kind",
+            "manifold :: ready",
             "OwnerFiber",
             "FiberScope",
             "routes :",
@@ -107,6 +114,25 @@ mod tests {
             assert!(
                 !generated.contains(forbidden),
                 "generated app contains manual projection `{forbidden}`",
+            );
+        }
+    }
+
+    #[test]
+    fn generated_stream_storage_has_no_task_producer() {
+        let input: DefineRouteInput = syn::parse_quote! {
+            StreamApp: () => {
+                GET "/stream" => stream(capacity = 3) StreamRoute,
+            }
+        };
+        let generated = define_route(input).expect("route generation").to_string();
+
+        assert!(generated.contains("__task_slot_0000"));
+        assert!(generated.contains("StreamRoute"));
+        for forbidden in ["__F0000", "__MK0000", "task_producers", "try_into_task"] {
+            assert!(
+                !generated.contains(forbidden),
+                "stream app contains fiber-only storage `{forbidden}`",
             );
         }
     }

@@ -3,22 +3,10 @@ use std::ops::Range;
 use o3::buffer::{Bytes, Retained};
 use sark_core::{
     error::{Error, Result},
-    http::{
-        codec::HeaderScan,
-        head::{Flags, HeadInput, HeaderLineScan},
-    },
     utils::bytes::Ascii,
 };
 
-use crate::{routes::path::seg_next, service::Key};
-
 pub trait HeaderValue {
-    fn len(&self) -> usize;
-
-    fn is_empty(&self) -> bool {
-        self.len() == 0
-    }
-
     fn eq_bytes(&self, expected: &[u8]) -> bool;
 
     fn eq_ignore_ascii_case(&self, expected: &[u8]) -> bool;
@@ -33,10 +21,6 @@ pub trait HeaderValue {
 }
 
 impl HeaderValue for Bytes<Retained> {
-    fn len(&self) -> usize {
-        self.len()
-    }
-
     fn eq_bytes(&self, expected: &[u8]) -> bool {
         self.as_slice() == expected
     }
@@ -83,10 +67,6 @@ impl<'a> SliceValue<'a> {
 }
 
 impl HeaderValue for SliceValue<'_> {
-    fn len(&self) -> usize {
-        self.end.saturating_sub(self.start)
-    }
-
     fn eq_bytes(&self, expected: &[u8]) -> bool {
         self.bytes() == expected
     }
@@ -115,8 +95,6 @@ impl HeaderValue for SliceValue<'_> {
 pub trait FieldValue: Sized {
     fn parse_value<V: HeaderValue>(value: &V) -> Result<Self>;
 
-    fn parse_value_bytes(value: &[u8], abs_start: usize) -> Result<Self>;
-
     fn parse_path<P: PathProbe>(_path: &P, _start: usize, _end: usize) -> Option<Self> {
         None
     }
@@ -125,10 +103,6 @@ pub trait FieldValue: Sized {
 impl FieldValue for Range<usize> {
     fn parse_value<V: HeaderValue>(value: &V) -> Result<Self> {
         Ok(value.as_range())
-    }
-
-    fn parse_value_bytes(value: &[u8], abs_start: usize) -> Result<Self> {
-        Ok(abs_start..abs_start + value.len())
     }
 
     fn parse_path<P: PathProbe>(_path: &P, start: usize, end: usize) -> Option<Self> {
@@ -141,10 +115,6 @@ impl FieldValue for Bytes<Retained> {
         Ok(value.copy_frame())
     }
 
-    fn parse_value_bytes(value: &[u8], _abs_start: usize) -> Result<Self> {
-        Ok(Bytes::<Retained>::copy_from_slice(value))
-    }
-
     fn parse_path<P: PathProbe>(path: &P, start: usize, end: usize) -> Option<Self> {
         path.copy_range_frame(start, end)
     }
@@ -155,10 +125,6 @@ impl FieldValue for usize {
         value.parse_usize()
     }
 
-    fn parse_value_bytes(value: &[u8], _abs_start: usize) -> Result<Self> {
-        Ascii::parse_usize(value).ok_or_else(Error::invalid_integer_header)
-    }
-
     fn parse_path<P: PathProbe>(path: &P, start: usize, end: usize) -> Option<Self> {
         path.parse_range_usize(start, end)
     }
@@ -167,10 +133,6 @@ impl FieldValue for usize {
 impl FieldValue for u64 {
     fn parse_value<V: HeaderValue>(value: &V) -> Result<Self> {
         value.parse_u64()
-    }
-
-    fn parse_value_bytes(value: &[u8], _abs_start: usize) -> Result<Self> {
-        Ascii::parse_u64(value).ok_or_else(Error::invalid_integer_header)
     }
 
     fn parse_path<P: PathProbe>(path: &P, start: usize, end: usize) -> Option<Self> {
@@ -189,16 +151,6 @@ impl FieldValue for bool {
         Err(Error::BadRequest("Invalid boolean field".into()))
     }
 
-    fn parse_value_bytes(value: &[u8], _abs_start: usize) -> Result<Self> {
-        if value.eq_ignore_ascii_case(b"true") || value == b"1" {
-            return Ok(true);
-        }
-        if value.eq_ignore_ascii_case(b"false") || value == b"0" {
-            return Ok(false);
-        }
-        Err(Error::BadRequest("Invalid boolean field".into()))
-    }
-
     fn parse_path<P: PathProbe>(path: &P, start: usize, end: usize) -> Option<Self> {
         if path.eq_range_ignore_ascii_case(start, end, b"true") || path.eq_range(start, end, b"1") {
             return Some(true);
@@ -212,11 +164,7 @@ impl FieldValue for bool {
 }
 
 pub trait PathProbe {
-    fn len(&self) -> usize;
-
-    fn is_empty(&self) -> bool {
-        self.len() == 0
-    }
+    fn is_end(&self, idx: usize) -> bool;
 
     fn eq_bytes(&self, expected: &[u8]) -> bool;
 
@@ -240,33 +188,25 @@ pub trait PathProbe {
             None
         }
     }
-
-    fn first_seg(&self) -> Option<(usize, usize)> {
-        self.next_seg(0).map(|(start, end, _)| (start, end))
-    }
 }
 
-pub struct SlicePath<'a> {
+pub struct TargetPath<'a> {
     raw: &'a [u8],
 }
 
-impl<'a> SlicePath<'a> {
+impl<'a> TargetPath<'a> {
     pub const fn new(raw: &'a [u8]) -> Self {
         Self { raw }
     }
-
-    pub fn bytes(&self) -> &'a [u8] {
-        self.raw
-    }
 }
 
-impl PathProbe for SlicePath<'_> {
-    fn len(&self) -> usize {
-        self.raw.len()
+impl PathProbe for TargetPath<'_> {
+    fn is_end(&self, idx: usize) -> bool {
+        idx >= self.raw.len() || self.raw[idx] == b'?'
     }
 
     fn eq_bytes(&self, expected: &[u8]) -> bool {
-        self.raw == expected
+        self.raw.starts_with(expected) && self.is_end(expected.len())
     }
 
     fn eq_range(&self, start: usize, end: usize, expected: &[u8]) -> bool {
@@ -305,127 +245,26 @@ impl PathProbe for SlicePath<'_> {
     }
 
     fn next_seg(&self, idx: usize) -> Option<(usize, usize, usize)> {
-        seg_next(self.raw, idx)
+        if self.is_end(idx) || self.raw[idx] != b'/' {
+            return None;
+        }
+        let start = idx + 1;
+        let mut end = start;
+        while end < self.raw.len() && self.raw[end] != b'/' && self.raw[end] != b'?' {
+            end += 1;
+        }
+        Some((start, end, end))
     }
 
     fn probe_literal(&self, cur: usize, lit: &[u8]) -> Option<usize> {
-        let start = cur + 1;
-        let end = start + lit.len();
+        let start = cur.checked_add(1)?;
+        let end = start.checked_add(lit.len())?;
         if end > self.raw.len() || self.raw[start..end] != *lit {
             return None;
         }
-        if end < self.raw.len() && self.raw[end] != b'/' {
+        if end < self.raw.len() && self.raw[end] != b'/' && self.raw[end] != b'?' {
             return None;
         }
         Some(end)
-    }
-}
-
-pub trait HeadPlan {
-    type RouteKey;
-
-    fn route<P: PathProbe>(&self, method: &http::Method, path: &P) -> Self::RouteKey {
-        self.route_key_probe(Key::from_method(method), path)
-    }
-
-    fn route_key_probe<P: PathProbe>(&self, method_key: Key, path: &P) -> Self::RouteKey;
-}
-
-pub struct FullHeadPlan;
-
-impl HeadPlan for FullHeadPlan {
-    type RouteKey = ();
-
-    fn route_key_probe<P: PathProbe>(&self, _method_key: Key, _path: &P) -> Self::RouteKey {}
-}
-
-pub trait HeadParts<K>: Sized {
-    const NEED_FIELDS: bool;
-    const NEED_HEADER: bool = false;
-    const NEED_KNOWN_HEADER: bool = false;
-    const NEED_QUERY: bool = false;
-
-    fn new(route: K) -> Self;
-    fn wants_query(&self) -> bool {
-        false
-    }
-    fn route_tag(&self) -> u64 {
-        0
-    }
-
-    fn set_header_name<V>(&mut self, name: &[u8], value: &V) -> Result<()>
-    where
-        V: HeaderValue;
-
-    #[allow(clippy::too_many_arguments)]
-    fn apply_header<I: HeadInput + ?Sized>(
-        &mut self,
-        input: &I,
-        line: &[u8],
-        line_start: usize,
-        colon_idx: usize,
-        pretrim_start: Option<usize>,
-        pretrim_end: Option<usize>,
-        scan: &mut HeaderScan,
-        flags: &mut Flags,
-        scan_info: Option<&HeaderLineScan>,
-    ) -> Result<()> {
-        use crate::parser::head::HeaderApply;
-        HeaderApply::generic::<I, K, Self>(
-            input,
-            line,
-            line_start,
-            colon_idx,
-            pretrim_start,
-            pretrim_end,
-            self,
-            scan,
-            flags,
-            scan_info,
-        )
-    }
-
-    fn set_header<V>(&mut self, _slot: u8, _value: &V) -> Result<()>
-    where
-        V: HeaderValue,
-    {
-        Ok(())
-    }
-
-    fn set_query_name<V>(&mut self, name: &[u8], value: &V) -> Result<()>
-    where
-        V: HeaderValue;
-
-    fn set_query_slice(&mut self, name: &[u8], input: &[u8], range: Range<usize>) -> Result<()> {
-        let value = SliceValue::new(input, range);
-        self.set_query_name(name, &value)
-    }
-
-    fn parse_query(&mut self, input: &[u8], range: Range<usize>) -> Result<()> {
-        use crate::parser::head::query::parse_query_fields_input;
-        parse_query_fields_input::<K, Self>(input, range, self)
-    }
-}
-
-impl<K: Copy> HeadParts<K> for () {
-    const NEED_FIELDS: bool = true;
-    const NEED_HEADER: bool = false;
-    const NEED_KNOWN_HEADER: bool = false;
-    const NEED_QUERY: bool = false;
-
-    fn new(_route: K) -> Self {}
-
-    fn set_header_name<V>(&mut self, _name: &[u8], _value: &V) -> Result<()>
-    where
-        V: HeaderValue,
-    {
-        Ok(())
-    }
-
-    fn set_query_name<V>(&mut self, _name: &[u8], _value: &V) -> Result<()>
-    where
-        V: HeaderValue,
-    {
-        Ok(())
     }
 }

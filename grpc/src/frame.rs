@@ -46,20 +46,24 @@ impl MessageFrame {
 }
 
 pub(crate) struct DataChunk {
-    pooled: Option<Pooled>,
+    bytes: Option<Bytes<Retained>>,
     len: usize,
     pos: usize,
 }
 
 impl DataChunk {
     pub(crate) fn new(data: DataPayload) -> Self {
-        Self::from_pooled(data.into_pooled())
+        Self::from_retained(data.into_retained())
     }
 
     pub(crate) fn from_pooled(pooled: Pooled) -> Self {
-        let len = pooled.len();
+        Self::from_retained(Bytes::from(pooled))
+    }
+
+    fn from_retained(bytes: Bytes<Retained>) -> Self {
+        let len = bytes.len();
         Self {
-            pooled: Some(pooled),
+            bytes: Some(bytes),
             len,
             pos: 0,
         }
@@ -70,23 +74,23 @@ impl DataChunk {
     }
 
     fn remaining(&self) -> &[u8] {
-        &self.pooled.as_ref().unwrap().as_slice()[self.pos..]
+        &self.bytes.as_ref().unwrap().as_slice()[self.pos..]
     }
 
     fn advance(&mut self, len: usize) {
         self.pos += len;
     }
 
-    fn take_retained(&mut self, len: usize) -> Bytes<Retained> {
+    fn take_retained(&mut self, len: usize) -> Option<Bytes<Retained>> {
         let start = self.pos;
         let end = start + len;
-        let pooled = if end == self.len {
-            self.pooled.take().unwrap()
+        let bytes = if end == self.len {
+            self.bytes.take().unwrap()
         } else {
-            self.pooled.as_ref().unwrap().clone()
+            self.bytes.as_ref().unwrap().clone()
         };
         self.pos = end;
-        Bytes::<Retained>::from(pooled).slice(start..end)
+        bytes.get(start..end)
     }
 }
 
@@ -128,7 +132,7 @@ impl Deframer {
                 }
                 self.begin_body()?;
                 if self.needed == 0 {
-                    let payload = input.take_retained(0);
+                    let payload = input.take_retained(0).ok_or(FrameError::Capacity)?;
                     let message = MessageFrame {
                         compressed: self.compressed,
                         payload,
@@ -139,7 +143,9 @@ impl Deframer {
             }
 
             if self.body.is_none() && input.remaining().len() >= self.needed {
-                let payload = input.take_retained(self.needed);
+                let payload = input
+                    .take_retained(self.needed)
+                    .ok_or(FrameError::Capacity)?;
                 let message = MessageFrame {
                     compressed: self.compressed,
                     payload,

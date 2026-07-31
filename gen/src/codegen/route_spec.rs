@@ -16,6 +16,7 @@ pub(crate) struct Config<'a> {
     pub(crate) header_slot_ty: &'a TokenStream,
 
     pub(crate) static_response: bool,
+    pub(crate) is_async: bool,
     pub(crate) kind_ty: &'a TokenStream,
     pub(crate) native_response_ty: Option<&'a syn::Type>,
     pub(crate) native_response_ty_static: Option<&'a syn::Type>,
@@ -37,6 +38,7 @@ impl Config<'_> {
             headers_inner_ident,
             header_slot_ty,
             static_response,
+            is_async,
             kind_ty,
             native_response_ty,
             native_response_ty_static,
@@ -117,6 +119,13 @@ impl Config<'_> {
                 }
                 const STATIC_RESPONSE: bool = #static_response;
                 const RESPONSE_BODY_KIND: sark::http::body_kind::ResponseKind = #response_body_kind_tokens;
+                const PARSE_ACCEPT_ENCODING: bool =
+                    !#is_async
+                    && !Self::STATIC_RESPONSE
+                    && matches!(
+                        Self::RESPONSE_BODY_KIND,
+                        sark::http::body_kind::ResponseKind::Inline,
+                    );
                 #max_body_token
                 #emit_date_token
                 #emit_server_token

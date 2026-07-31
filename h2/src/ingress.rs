@@ -1,12 +1,15 @@
-use o3::buffer::{ByteRing, Pooled, SharedPool};
+use o3::buffer::{Bytes, Retained, SharedLease, SharedPool, SharedPoolLayout, SharedPoolPlan};
 use o3::collections::FixedQueue;
 
-use crate::conn::{CLIENT_PREFACE, ConnError, Event};
+use crate::conn::{CLIENT_PREFACE, ConnError, DataPayload, Event};
 use crate::frame::{Flags, FrameHeader, HEADER_LEN, ParseError};
+use crate::growing_pool::GrowingSharedPool;
 use crate::hpack;
+use crate::retained_segments::RetainedSegments;
 use crate::stream::StreamId;
+use crate::validate::{HeaderKind, Validate};
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum PendingKind {
     Headers { end_stream: bool, trailing: bool },
     PushPromise { promised: StreamId },
@@ -21,47 +24,92 @@ pub(super) struct PendingHeaders {
 pub(super) struct IngressConfig {
     pub(super) inbound_capacity: usize,
     pub(super) event_capacity: usize,
-    pub(super) data_capacity: usize,
-    pub(super) data_len: usize,
-    pub(super) header_capacity: usize,
+    pub(super) data_layout: SharedPoolLayout,
+    pub(super) header_plan: SharedPoolPlan,
     pub(super) decoder_table_size: usize,
     pub(super) header_cap: usize,
     pub(super) preface_done: bool,
 }
 
+struct ActiveHeaders {
+    block: hpack::DecoderBlock,
+    sink: HeaderSink,
+    wire_len: usize,
+}
+
+struct HeaderSink {
+    lease: SharedLease,
+    validation: Validate,
+    overflow: bool,
+}
+
+impl HeaderSink {
+    fn new<K: HeaderKind>(lease: SharedLease, trailing: bool) -> Self {
+        Self {
+            lease,
+            validation: Validate::new::<K>(trailing),
+            overflow: false,
+        }
+    }
+
+    fn field(&mut self, name: &[u8], value: &[u8]) {
+        if self.overflow || !self.validation.field(name, value) {
+            return;
+        }
+        let Ok(name_len) = u32::try_from(name.len()) else {
+            self.overflow = true;
+            return;
+        };
+        let Ok(value_len) = u32::try_from(value.len()) else {
+            self.overflow = true;
+            return;
+        };
+        let mut writer = self.lease.spare_writer();
+        self.overflow = writer
+            .try_extend_from_slice(&name_len.to_ne_bytes())
+            .and_then(|()| writer.try_extend_from_slice(&value_len.to_ne_bytes()))
+            .and_then(|()| writer.try_extend_from_slice(name))
+            .and_then(|()| writer.try_extend_from_slice(value))
+            .is_err();
+    }
+}
+
 pub(super) struct Ingress {
-    bytes: ByteRing,
+    bytes: RetainedSegments,
     events: FixedQueue<Event>,
-    data_pool: SharedPool,
-    header_pool: SharedPool,
-    header_block: Vec<u8>,
+    data_permits: SharedPool,
+    header_pool: GrowingSharedPool,
     decoder: hpack::Decoder,
+    active_headers: Option<ActiveHeaders>,
     pending_headers: Option<PendingHeaders>,
     header_cap: usize,
     preface_done: bool,
 }
 
 impl Ingress {
-    pub(super) fn new(config: IngressConfig) -> Self {
+    pub(super) fn from_config(config: IngressConfig) -> Self {
         let IngressConfig {
             inbound_capacity,
             event_capacity,
-            data_capacity,
-            data_len,
-            header_capacity,
+            data_layout,
+            header_plan,
             decoder_table_size,
             header_cap,
             preface_done,
         } = config;
         let mut decoder = hpack::Decoder::new(decoder_table_size);
         decoder.set_max_header_list_size(Some(header_cap));
+        let chunk_capacity = data_layout
+            .slots()
+            .saturating_add(header_plan.max_slots())
+            .saturating_add(1);
         Self {
-            bytes: ByteRing::with_capacity(inbound_capacity),
+            bytes: RetainedSegments::new(inbound_capacity, chunk_capacity),
             events: FixedQueue::with_capacity(event_capacity),
-            data_pool: SharedPool::new(data_capacity, data_len),
-            header_pool: SharedPool::new(header_capacity, header_cap),
-            header_block: Vec::with_capacity(header_cap),
+            data_permits: SharedPool::from_layout(data_layout),
+            header_pool: GrowingSharedPool::from_plan(header_plan),
             decoder,
+            active_headers: None,
             pending_headers: None,
             header_cap,
             preface_done,
@@ -69,12 +117,11 @@ impl Ingress {
     }
 
     pub(super) fn append(&mut self, bytes: &[u8]) -> Result<(), ConnError> {
-        if bytes.len() > self.bytes.remaining() {
-            return Err(ConnError::Overload);
-        }
-        self.bytes
-            .try_extend_from_slice(bytes)
-            .map_err(|_| ConnError::Overload)
+        self.append_retained(Bytes::<Retained>::copy_from_slice(bytes))
+    }
+
+    pub(super) fn append_retained(&mut self, bytes: Bytes<Retained>) -> Result<(), ConnError> {
+        self.bytes.push(bytes).map_err(|_| ConnError::Overload)
     }
 
     pub(super) fn accept_preface(&mut self) -> Result<bool, ConnError> {
@@ -84,15 +131,17 @@ impl Ingress {
         if self.bytes.len() < CLIENT_PREFACE.len() {
             return Ok(false);
         }
-        let (first, second) = self
-            .bytes
-            .range_slices(0, CLIENT_PREFACE.len())
-            .ok_or(ConnError::BadPreface)?;
-        if first != &CLIENT_PREFACE[..first.len()] || second != &CLIENT_PREFACE[first.len()..] {
+        let mut preface = [0; CLIENT_PREFACE.len()];
+        if !self.bytes.copy_range_into(0, &mut preface) {
+            return Ok(false);
+        }
+        if preface != CLIENT_PREFACE {
             return Err(ConnError::BadPreface);
         }
         self.ensure_event_capacity()?;
-        self.bytes.consume(CLIENT_PREFACE.len());
+        if !self.bytes.try_consume(CLIENT_PREFACE.len()) {
+            return Err(ConnError::FrameSize);
+        }
         self.preface_done = true;
         self.push_event(Event::PrefaceComplete)?;
         Ok(true)
@@ -100,10 +149,8 @@ impl Ingress {
 
     pub(super) fn complete_preface(&mut self) {
         debug_assert!(self.preface_done);
-        self.events
-            .vacant_entry()
-            .unwrap()
-            .push_back(Event::PrefaceComplete);
+        let inserted = self.events.push_back(Event::PrefaceComplete);
+        debug_assert!(inserted.is_ok());
     }
 
     pub(super) fn next_frame(
@@ -127,29 +174,26 @@ impl Ingress {
                     if self.bytes.len() < total {
                         return Ok(None);
                     }
-                    self.bytes.consume(total);
+                    if !self.bytes.try_consume(total) {
+                        return Err(ConnError::FrameSize);
+                    }
                     continue;
                 }
-                Err(error) => return Err(error.into()),
+                Err(error) => return Err(ConnError::ParseError(error)),
             };
-            if header.length > max_frame_size {
+            if header.length.as_u32() > max_frame_size {
                 return Err(ConnError::FrameSize);
             }
-            let total = HEADER_LEN + header.length as usize;
+            let total = HEADER_LEN + header.length.as_usize();
             return Ok((self.bytes.len() >= total).then_some(header));
         }
     }
 
     fn parse_frame_header(&self) -> Result<FrameHeader, ParseError> {
-        let Some((first, second)) = self.bytes.range_slices(0, HEADER_LEN) else {
-            return Err(ParseError::NeedMore);
-        };
-        if second.is_empty() {
-            return FrameHeader::parse(first);
-        }
         let mut bytes = [0; HEADER_LEN];
-        bytes[..first.len()].copy_from_slice(first);
-        bytes[first.len()..].copy_from_slice(second);
+        if !self.bytes.copy_range_into(0, &mut bytes) {
+            return Err(ParseError::NeedMore);
+        }
         FrameHeader::parse(&bytes)
     }
 
@@ -158,7 +202,7 @@ impl Ingress {
         header: FrameHeader,
     ) -> Result<(usize, usize), ParseError> {
         let mut start = HEADER_LEN;
-        let mut len = header.length as usize;
+        let mut len = header.length.as_usize();
         if !header.flags.has(Flags::PADDED) {
             return Ok((start, len));
         }
@@ -181,25 +225,25 @@ impl Ingress {
         self.bytes.copy_range_into(start, out)
     }
 
-    pub(super) fn data(&mut self, start: usize, len: usize) -> Result<Pooled, ConnError> {
-        let mut lease = self.data_pool.try_acquire().ok_or(ConnError::Overload)?;
-        let (first, second) = self
+    pub(super) fn data(&mut self, start: usize, len: usize) -> Result<DataPayload, ConnError> {
+        let permit = self
+            .data_permits
+            .try_acquire()
+            .ok_or(ConnError::Overload)?
+            .freeze();
+        let bytes = self
             .bytes
-            .range_slices(start, len)
+            .retained_range(start, len)
+            .map_err(|_| ConnError::Overload)?
             .ok_or(ConnError::FrameSize)?;
-        let mut writer = lease.spare_writer();
-        writer
-            .try_extend_from_slice(first)
-            .map_err(|_| ConnError::Overload)?;
-        writer
-            .try_extend_from_slice(second)
-            .map_err(|_| ConnError::Overload)?;
-        drop(writer);
-        Ok(lease.freeze())
+        Ok(DataPayload::from_retained(bytes, permit))
     }
 
-    pub(super) fn consume(&mut self, n: usize) {
-        self.bytes.consume(n);
+    pub(super) fn try_consume(&mut self, n: usize) -> Result<(), ConnError> {
+        self.bytes
+            .try_consume(n)
+            .then_some(())
+            .ok_or(ConnError::FrameSize)
     }
 
     pub(super) fn poll_event(&mut self) -> Option<Event> {
@@ -220,65 +264,149 @@ impl Ingress {
         }
     }
 
-    pub(super) fn clear_headers(&mut self) {
-        self.header_block.clear();
-    }
-
-    pub(super) fn header_remaining(&self) -> usize {
-        self.header_cap.saturating_sub(self.header_block.len())
-    }
-
-    pub(super) fn extend_headers(&mut self, start: usize, len: usize) -> Result<(), ConnError> {
-        if len > self.header_remaining() {
+    pub(super) fn begin_headers<K: HeaderKind>(
+        &mut self,
+        start: usize,
+        len: usize,
+        trailing: bool,
+    ) -> Result<(), ConnError> {
+        debug_assert!(self.active_headers.is_none());
+        if self.active_headers.is_some() {
+            return Err(ConnError::Continuation);
+        }
+        if len > self.header_cap {
             return Err(ConnError::HeaderListTooLarge);
         }
-        let (first, second) = self
-            .bytes
-            .range_slices(start, len)
-            .ok_or(ConnError::FrameSize)?;
-        self.header_block.extend_from_slice(first);
-        self.header_block.extend_from_slice(second);
+        let lease = self.header_pool.try_acquire().ok_or(ConnError::Overload)?;
+        let mut active = ActiveHeaders {
+            block: self.decoder.start_block(),
+            sink: HeaderSink::new::<K>(lease, trailing),
+            wire_len: len,
+        };
+        Self::decode_range(
+            &self.bytes,
+            &mut self.decoder,
+            &mut active.block,
+            &mut active.sink,
+            start,
+            len,
+        )?;
+        self.active_headers = Some(active);
         Ok(())
     }
 
-    pub(super) fn decode_headers(&mut self) -> Result<(hpack::HeaderBlock, bool), ConnError> {
-        let mut lease = self.header_pool.try_acquire().ok_or(ConnError::Overload)?;
-        let mut block = core::mem::take(&mut self.header_block);
-        let mut overflow = false;
-        let decoded = self.decoder.decode_bounded(&block, |name, value| {
-            if overflow {
-                return;
-            }
-            let Ok(name_len) = u32::try_from(name.len()) else {
-                overflow = true;
-                return;
-            };
-            let Ok(value_len) = u32::try_from(value.len()) else {
-                overflow = true;
-                return;
-            };
-            let mut writer = lease.spare_writer();
-            overflow = writer
-                .try_extend_from_slice(&name_len.to_ne_bytes())
-                .and_then(|()| writer.try_extend_from_slice(&value_len.to_ne_bytes()))
-                .and_then(|()| writer.try_extend_from_slice(name))
-                .and_then(|()| writer.try_extend_from_slice(value))
-                .is_err();
-        });
-        block.clear();
-        self.header_block = block;
-        let over_limit = decoded?;
-        if overflow {
-            return Err(ConnError::Overload);
+    pub(super) fn complete_headers<K: HeaderKind>(
+        &mut self,
+        start: usize,
+        len: usize,
+        trailing: bool,
+    ) -> Result<(hpack::HeaderBlock, bool), ConnError> {
+        if len > self.header_cap {
+            return Err(ConnError::HeaderListTooLarge);
         }
-        Ok((hpack::HeaderBlock::from_pooled(lease.freeze()), over_limit))
+        let lease = self.header_pool.try_acquire().ok_or(ConnError::Overload)?;
+        let mut sink = HeaderSink::new::<K>(lease, trailing);
+        if let Some(fragment) = self.bytes.contiguous_range(start, len) {
+            let over_limit = self.decoder.decode_bounded(fragment, |name, value| {
+                sink.field(name, value);
+            })?;
+            return Self::finish_sink(over_limit, sink);
+        }
+        let mut block = self.decoder.start_block();
+        Self::decode_range(
+            &self.bytes,
+            &mut self.decoder,
+            &mut block,
+            &mut sink,
+            start,
+            len,
+        )?;
+        Self::finish_decoded(block, sink)
+    }
+
+    pub(super) fn continue_headers(&mut self, start: usize, len: usize) -> Result<(), ConnError> {
+        let active = self
+            .active_headers
+            .as_mut()
+            .ok_or(ConnError::Continuation)?;
+        if len > self.header_cap.saturating_sub(active.wire_len) {
+            return Err(ConnError::HeaderListTooLarge);
+        }
+        active.wire_len += len;
+        Self::decode_range(
+            &self.bytes,
+            &mut self.decoder,
+            &mut active.block,
+            &mut active.sink,
+            start,
+            len,
+        )
+    }
+
+    pub(super) fn finish_headers(&mut self) -> Result<(hpack::HeaderBlock, bool), ConnError> {
+        let active = self.active_headers.take().ok_or(ConnError::Continuation)?;
+        Self::finish_decoded(active.block, active.sink)
+    }
+
+    fn decode_range(
+        bytes: &RetainedSegments,
+        decoder: &mut hpack::Decoder,
+        block: &mut hpack::DecoderBlock,
+        sink: &mut HeaderSink,
+        start: usize,
+        len: usize,
+    ) -> Result<(), ConnError> {
+        if let Some(fragment) = bytes.contiguous_range(start, len) {
+            decoder.decode_fragment(block, fragment, |name, value| {
+                sink.field(name, value);
+            })?;
+            return Ok(());
+        }
+        let mut decode_error = None;
+        let available = bytes.for_each_range(start, len, |fragment| {
+            if decode_error.is_none() {
+                decode_error = decoder
+                    .decode_fragment(block, fragment, |name, value| {
+                        sink.field(name, value);
+                    })
+                    .err();
+            }
+        });
+        if !available {
+            return Err(ConnError::FrameSize);
+        }
+        if let Some(error) = decode_error {
+            return Err(error.into());
+        }
+        Ok(())
+    }
+
+    fn finish_decoded(
+        block: hpack::DecoderBlock,
+        sink: HeaderSink,
+    ) -> Result<(hpack::HeaderBlock, bool), ConnError> {
+        let over_limit = block.finish()?;
+        Self::finish_sink(over_limit, sink)
+    }
+
+    fn finish_sink(
+        over_limit: bool,
+        sink: HeaderSink,
+    ) -> Result<(hpack::HeaderBlock, bool), ConnError> {
+        if sink.overflow {
+            return Err(ConnError::HeaderListTooLarge);
+        }
+        Ok((
+            hpack::HeaderBlock::from_pooled(sink.lease.freeze()),
+            over_limit || !sink.validation.finish(),
+        ))
     }
 
     pub(super) fn has_pending_headers(&self) -> bool {
         self.pending_headers.is_some()
     }
 
-    pub(super) fn start_headers(&mut self, pending: PendingHeaders) {
+    pub(super) fn start_pending_headers(&mut self, pending: PendingHeaders) {
         self.pending_headers = Some(pending);
     }
 

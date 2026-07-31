@@ -4,7 +4,7 @@ use std::time::Duration;
 
 use cartel_gen::{pg_instance, query_group};
 use cartel_pg::{Client, Config, PgOps, PgPool, PgTable, PickPolicy, Port, port};
-use dope::manifold::connector::source::Static;
+use dope::manifold::connector::source::health::Static;
 use dope::manifold::env::Bundle;
 use dope_net::tcp::Tcp;
 use dope_net::wire::identity::Identity;
@@ -274,7 +274,7 @@ fn main() -> io::Result<()> {
     })
     .map_err(io::Error::other)?;
     let server = HttpServer::<HTTP_LISTENER_ID, DATE_UPDATER_ID, Throughput>::new(
-        listener::Config::<Tcp> {
+        listener::config::Config::<Tcp> {
             bind,
             max_connections: MAX_CONNECTIONS,
             backlog: 1024,

@@ -1,6 +1,7 @@
 use std::ops::Range;
 use std::pin::Pin;
 
+use dope_fiber::abi::Fiber;
 use o3::buffer::Shared;
 use sark_core::http::compress::Gzip;
 
@@ -57,6 +58,57 @@ impl<'req> Invocation<'req> {
     }
 }
 
+macro_rules! framing_or_return {
+    ($permit:ident, $result:expr) => {
+        match $result {
+            Ok(framing) => framing,
+            Err(RequestErr::NeedMore(state)) => {
+                return ConsumeOutcome::NeedMore {
+                    permit: $permit,
+                    state,
+                };
+            }
+            Err(RequestErr::Bad(reason)) => return ConsumeOutcome::Close(reason),
+        }
+    };
+}
+
+macro_rules! parse_query_or_return {
+    ($ctx:expr, $route:ty, $raw_headers:expr, $request:expr) => {
+        if $ctx.parse_query::<$route>($raw_headers, $request).is_err() {
+            return ConsumeOutcome::Close(CANNED_400);
+        }
+    };
+}
+
+macro_rules! buffered_body {
+    ($chunked_body:expr, $request:expr, $head_len:expr) => {
+        match $chunked_body.as_ref() {
+            Some(shared) => shared.as_ref(),
+            None => &$request[$head_len..],
+        }
+    };
+}
+
+macro_rules! invoke_route_or_return {
+    (
+        $ctx:expr, $route:ty, $state_ty:ty;
+        $head:expr, $body:expr, $declared_body_len:expr;
+        $raw_params:expr, $raw_headers:expr, $state:expr
+    ) => {{
+        let invocation = Invocation::new(
+            $ctx.target_off..($ctx.target_off + $ctx.target_len),
+            $head,
+            $body,
+            $declared_body_len,
+        );
+        match invocation.invoke::<$route, $state_ty>($raw_params, $raw_headers, $state) {
+            Ok(response) => response,
+            Err(reason) => return ConsumeOutcome::Close(reason),
+        }
+    }};
+}
+
 pub struct SyncRoute<'a, 'req, 'cache> {
     ctx: &'a Ctx<'req>,
     date: &'a [u8; 29],
@@ -89,12 +141,11 @@ impl<'a, 'req, 'cache> SyncRoute<'a, 'req, 'cache> {
         state: &S,
     ) -> ConsumeOutcome
     where
-        R: RouteSpec + manifold::Route<S> + 'static,
+        R: RouteSpec<Kind = manifold::Sync> + manifold::Route<S> + 'static,
     {
-        if matches!(R::BODY_POLICY, service::BodyPolicy::Discarded) {
-            self.discard(permit, matched, state)
-        } else {
-            self.buffered(permit, matched, state)
+        match R::BODY_POLICY {
+            service::BodyPolicy::Buffered => self.buffered(permit, matched, state),
+            service::BodyPolicy::Discarded => self.discard(permit, matched, state),
         }
     }
 
@@ -115,34 +166,18 @@ impl<'a, 'req, 'cache> SyncRoute<'a, 'req, 'cache> {
             conn_close,
             chunked_body,
             accept_gzip,
-        } = match Framing::<R>::from_ctx(self.ctx) {
-            Ok(framing) => framing,
-            Err(RequestErr::NeedMore(state)) => {
-                return ConsumeOutcome::NeedMore { permit, state };
-            }
-            Err(RequestErr::Bad(reason)) => return ConsumeOutcome::Close(reason),
-        };
+        } = framing_or_return!(permit, Framing::<R>::from_ctx(self.ctx));
         let req = &self.ctx.req_bytes[..total];
         if let Some(outcome) = ResponseEgress::new(self.write, self.date).cached::<R>(&self.cache) {
             return outcome.into_consume(permit, Consumption::Buffered(total), conn_close);
         }
-        if self.parse_query::<R>(&mut raw_headers, req).is_err() {
-            return ConsumeOutcome::Close(CANNED_400);
-        }
-        let body = match chunked_body.as_ref() {
-            Some(shared) => shared.as_ref(),
-            None => &req[head_len..],
-        };
-        let invocation = Invocation::new(
-            self.ctx.target_off..(self.ctx.target_off + self.ctx.target_len),
-            &req[..head_len],
-            body,
-            body.len(),
+        parse_query_or_return!(self.ctx, R, &mut raw_headers, req);
+        let body = buffered_body!(chunked_body, req, head_len);
+        let response = invoke_route_or_return!(
+            self.ctx, R, S;
+            &req[..head_len], body, body.len();
+            raw_params, raw_headers, state
         );
-        let response = match invocation.invoke::<R, S>(raw_params, raw_headers, state) {
-            Ok(response) => response,
-            Err(reason) => return ConsumeOutcome::Close(reason),
-        };
         ResponseEgress::new(self.write, self.date)
             .route::<R>(response, self.cache, self.gzip, accept_gzip)
             .into_consume(permit, Consumption::Buffered(total), conn_close)
@@ -159,13 +194,7 @@ impl<'a, 'req, 'cache> SyncRoute<'a, 'req, 'cache> {
             body_total,
             conn_close,
             accept_gzip,
-        } = match DiscardFraming::<R>::from_ctx(self.ctx) {
-            Ok(framing) => framing,
-            Err(RequestErr::NeedMore(state)) => {
-                return ConsumeOutcome::NeedMore { permit, state };
-            }
-            Err(RequestErr::Bad(reason)) => return ConsumeOutcome::Close(reason),
-        };
+        } = framing_or_return!(permit, DiscardFraming::<R>::from_ctx(self.ctx));
         let head = &self.ctx.req_bytes[..head_len];
         let consumption = Consumption::Discard {
             head: head_len,
@@ -174,34 +203,15 @@ impl<'a, 'req, 'cache> SyncRoute<'a, 'req, 'cache> {
         if let Some(outcome) = ResponseEgress::new(self.write, self.date).cached::<R>(&self.cache) {
             return outcome.into_consume(permit, consumption, conn_close);
         }
-        if self.parse_query::<R>(&mut raw_headers, head).is_err() {
-            return ConsumeOutcome::Close(CANNED_400);
-        }
-        let invocation = Invocation::new(
-            self.ctx.target_off..(self.ctx.target_off + self.ctx.target_len),
-            head,
-            &[],
-            body_total,
+        parse_query_or_return!(self.ctx, R, &mut raw_headers, head);
+        let response = invoke_route_or_return!(
+            self.ctx, R, S;
+            head, &[], body_total;
+            raw_params, raw_headers, state
         );
-        let response = match invocation.invoke::<R, S>(raw_params, raw_headers, state) {
-            Ok(response) => response,
-            Err(reason) => return ConsumeOutcome::Close(reason),
-        };
         ResponseEgress::new(self.write, self.date)
             .route::<R>(response, self.cache, self.gzip, accept_gzip)
             .into_consume(permit, consumption, conn_close)
-    }
-
-    fn parse_query<R: RouteSpec>(
-        &self,
-        raw_headers: &mut R::RawHeaders,
-        request: &[u8],
-    ) -> Result<(), ()> {
-        if let Some(query) = self.ctx.query_range.clone() {
-            R::Request::parse_query_raw(raw_headers, request, query).map_err(|_| ())?;
-        }
-        self.ctx.http_method()?;
-        Ok(())
     }
 }
 
@@ -209,13 +219,13 @@ pub(super) fn stream_response<'req, S: sark_core::http::Shape<'req>>(
     response: S,
     write: &mut [u8],
     date: &[u8; 29],
-) -> Result<(usize, S::StreamInner), Outcome> {
+) -> Result<(usize, sark_core::http::ShapeStream<'req, S>), Outcome> {
     ResponseEgress::new(write, date)
         .stream(response)
         .ok_or(Outcome::Close(CANNED_500))
 }
 
-pub(super) struct StreamRoute<'a, 'req> {
+pub struct StreamRoute<'a, 'req> {
     ctx: &'a Ctx<'req>,
     write: &'a mut [u8],
     date: &'a [u8; 29],
@@ -223,7 +233,7 @@ pub(super) struct StreamRoute<'a, 'req> {
 }
 
 impl<'a, 'req> StreamRoute<'a, 'req> {
-    pub(super) fn new(
+    pub fn new(
         ctx: &'a Ctx<'req>,
         write: &'a mut [u8],
         date: &'a [u8; 29],
@@ -237,22 +247,18 @@ impl<'a, 'req> StreamRoute<'a, 'req> {
         }
     }
 
-    #[allow(clippy::too_many_arguments)]
-    pub(super) fn dispatch<'env, 'd, R, S, T, Tag, Wrap, const N: usize>(
+    pub fn dispatch<'env, 'd, R, S, Tag, const N: usize>(
         self,
         permit: DispatchPermit,
         matched: Matched<R>,
-        mut tasks: Pin<&mut crate::fiber::FixedSlab<'d, T, N, Tag>>,
+        mut tasks: Pin<&mut crate::fiber::FixedSlab<'d, R::Stream, N, Tag>>,
         state: &'env S,
-        wrap: Wrap,
     ) -> ConsumeOutcome
     where
-        R: RouteSpec + manifold::Route<S> + 'static,
-        for<'request> R::Response<'request>:
-            sark_core::http::Shape<'request, StreamInner = R::Stream>,
-        R::Stream: dope_fiber::Fiber<'d, Output = Option<Shared>>,
-        T: dope_fiber::Fiber<'d>,
-        Wrap: FnOnce(R::Stream) -> T,
+        R: RouteSpec<Kind = manifold::NativeStream> + manifold::Route<S> + 'static,
+        for<'request> <R::Response<'request> as sark_core::http::Shape<'request>>::Metadata:
+            sark_core::http::ShapeMetadata<Stream = R::Stream>,
+        R::Stream: Fiber<'d, Output = Option<Shared>>,
     {
         let Matched { raw_params } = matched;
         let Framing {
@@ -262,41 +268,25 @@ impl<'a, 'req> StreamRoute<'a, 'req> {
             conn_close,
             chunked_body,
             accept_gzip: _,
-        } = match Framing::<R>::from_ctx(self.ctx) {
-            Ok(framing) => framing,
-            Err(RequestErr::NeedMore(state)) => {
-                return ConsumeOutcome::NeedMore { permit, state };
-            }
-            Err(RequestErr::Bad(reason)) => return ConsumeOutcome::Close(reason),
-        };
+        } = framing_or_return!(permit, Framing::<R>::from_ctx(self.ctx));
         let request = &self.ctx.req_bytes[..total];
-        if self.parse_query::<R>(&mut raw_headers, request).is_err() {
-            return ConsumeOutcome::Close(CANNED_400);
-        }
-        let body = match chunked_body.as_ref() {
-            Some(shared) => shared.as_ref(),
-            None => &request[head_len..],
-        };
+        parse_query_or_return!(self.ctx, R, &mut raw_headers, request);
+        let body = buffered_body!(chunked_body, request, head_len);
         let Some(entry) = tasks.as_mut().vacant_entry() else {
             return ConsumeOutcome::Close(crate::CANNED_503);
         };
-        let invocation = Invocation::new(
-            self.ctx.target_off..(self.ctx.target_off + self.ctx.target_len),
-            &request[..head_len],
-            body,
-            body.len(),
+        let response = invoke_route_or_return!(
+            self.ctx, R, S;
+            &request[..head_len], body, body.len();
+            raw_params, raw_headers, state
         );
-        let response = match invocation.invoke::<R, S>(raw_params, raw_headers, state) {
-            Ok(response) => response,
-            Err(reason) => return ConsumeOutcome::Close(reason),
-        };
         let (written, stream) = match stream_response(response, self.write, self.date) {
             Ok(stream) => stream,
             Err(outcome) => {
                 return outcome.into_consume(permit, Consumption::Buffered(total), conn_close);
             }
         };
-        let task = entry.insert(wrap(stream));
+        let task = entry.insert(stream);
         self.conn.async_state.task = Some(task.erase());
         self.conn.async_state.task_stream = true;
         self.conn.async_state.stream_phase = StreamPhase::Streaming;
@@ -306,17 +296,5 @@ impl<'a, 'req> StreamRoute<'a, 'req> {
             written,
             close: conn_close,
         }
-    }
-
-    fn parse_query<R: RouteSpec>(
-        &self,
-        raw_headers: &mut R::RawHeaders,
-        request: &[u8],
-    ) -> Result<(), ()> {
-        if let Some(query) = self.ctx.query_range.clone() {
-            R::Request::parse_query_raw(raw_headers, request, query).map_err(|_| ())?;
-        }
-        self.ctx.http_method()?;
-        Ok(())
     }
 }

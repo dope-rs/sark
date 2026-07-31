@@ -8,22 +8,6 @@ use crate::http::{Body, Response};
 
 const MAX_HEADERS: usize = 100;
 
-fn is_forbidden_trailer(name: &HeaderName) -> bool {
-    matches!(
-        name.as_str(),
-        "content-length"
-            | "transfer-encoding"
-            | "host"
-            | "trailer"
-            | "connection"
-            | "keep-alive"
-            | "te"
-            | "upgrade"
-            | "proxy-authenticate"
-            | "proxy-authorization"
-    )
-}
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DecodeMode {
     Response,
@@ -61,12 +45,7 @@ impl DecodedHead {
         for (name, value) in self.headers {
             response.headers_mut().insert(name, value);
         }
-        for (name, value) in trailers {
-            if is_forbidden_trailer(&name) {
-                continue;
-            }
-            response.headers_mut().insert(name, value);
-        }
+        response.headers_mut().extend_trailers(trailers);
         response.set_body(body);
         response
     }

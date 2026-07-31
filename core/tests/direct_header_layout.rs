@@ -1,6 +1,8 @@
 use std::mem::size_of;
 
-use sark_core::http::{FixedResponse, HeaderItem, Headers, MonoResponseInner, StaticResponseInner};
+use sark_core::http::{
+    FixedResponse, HeaderItem, Headers, MonoResponseInner, StaticHeaderFields, StaticResponseInner,
+};
 
 #[test]
 fn exact_header_capacity_removes_unused_entries() {
@@ -28,6 +30,18 @@ fn exact_header_capacity_removes_unused_entries() {
 fn static_response_does_not_pay_for_hot_body_erasure() {
     assert!(
         size_of::<StaticResponseInner<'static, 2>>() < size_of::<MonoResponseInner<'static, 2>>()
+    );
+}
+
+#[test]
+fn structured_static_headers_shrink_generated_response_state() {
+    assert!(
+        size_of::<FixedResponse<'static, 0, StaticHeaderFields>>()
+            < size_of::<FixedResponse<'static, 0>>()
+    );
+    assert!(
+        size_of::<StaticResponseInner<'static, 0, StaticHeaderFields>>()
+            < size_of::<StaticResponseInner<'static, 0>>()
     );
 }
 

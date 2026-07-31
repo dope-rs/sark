@@ -5,7 +5,7 @@ use ring::rand::{SecureRandom, SystemRandom};
 use sark_core::http::Field;
 use sark_h3::dope::Session;
 use sark_h3::{Event, Role, StreamId};
-use shin::sig::SigningKey;
+use shin::crypto::sig::SigningKey;
 
 const CID: [u8; 8] = [0x13, 0x37, 0x13, 0x37, 0x13, 0x37, 0x13, 0x37];
 

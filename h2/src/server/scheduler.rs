@@ -3,7 +3,11 @@ use std::task::Poll;
 
 use dope::DriverContext;
 use dope::driver::token::Token;
-use dope_fiber::{ErasedTaskId, Fiber, TaskId, TaskQueue, TaskSlab};
+use dope_fiber::abi::Fiber;
+use dope_fiber::raw::slab::TaskSlab;
+use dope_fiber::raw::task::RootWaker;
+use dope_fiber::raw::task::queue::TaskQueue;
+use dope_fiber::slab::{ErasedTaskId, TaskId};
 
 use super::task::{RunningTask, TaskMap, TaskTarget};
 use crate::stream::StreamId;
@@ -27,7 +31,7 @@ pub(super) struct StartContext<'a, 'turn, 'd> {
     pub(super) stream_id: StreamId,
     pub(super) task_head: &'a mut Option<u32>,
     pub(super) ready: Pin<&'a TaskQueue<TaskTarget>>,
-    pub(super) parent: dope_fiber::RootWaker<'d>,
+    pub(super) parent: RootWaker<'d>,
     pub(super) driver: &'a mut DriverContext<'turn, 'd>,
 }
 
@@ -48,7 +52,7 @@ where
         assert!(capacity > 0);
         assert!(u32::try_from(capacity).is_ok());
         Self {
-            slab: TaskSlab::with_capacity(capacity, TaskTarget::idle()),
+            slab: TaskSlab::with_capacity(capacity),
             tasks: (0..capacity).map(|_| None).collect(),
             task_map: TaskMap::with_capacity(capacity),
         }
@@ -348,7 +352,7 @@ where
         &mut self,
         key: ErasedTaskId,
         ready: Pin<&TaskQueue<TaskTarget>>,
-        parent: dope_fiber::RootWaker<'d>,
+        parent: RootWaker<'d>,
     ) -> bool {
         let Some(task) = self.state.task.as_ref() else {
             return false;

@@ -1,45 +1,22 @@
-use super::super::__private::GeneratedResponse;
-use super::{Chunked, Response, Serve, Shape};
+use super::super::__private::OwnedResponse;
+use super::{IntoResponseShape, Shape, ShapeMetadata};
 
 pub trait OwnedShape: 'static {
     type Shape: Shape<'static>;
 
-    const BODY_KIND: super::super::body_kind::ResponseKind;
+    const BODY_KIND: super::super::body_kind::ResponseKind =
+        <<Self::Shape as Shape<'static>>::Metadata as ShapeMetadata>::BODY_KIND;
 
     fn into_shape(self) -> Self::Shape;
 }
 
 impl<T> OwnedShape for T
 where
-    T: GeneratedResponse,
+    T: OwnedResponse,
 {
-    type Shape = T::Shape;
-
-    const BODY_KIND: super::super::body_kind::ResponseKind = T::BODY_KIND;
+    type Shape = <T as IntoResponseShape<'static>>::Shape;
 
     fn into_shape(self) -> Self::Shape {
-        self.into_owned_shape()
-    }
-}
-
-impl OwnedShape for Response {
-    type Shape = Serve<'static>;
-
-    const BODY_KIND: super::super::body_kind::ResponseKind =
-        super::super::body_kind::ResponseKind::Inline;
-
-    fn into_shape(self) -> Self::Shape {
-        self.into()
-    }
-}
-
-impl OwnedShape for Chunked {
-    type Shape = Self;
-
-    const BODY_KIND: super::super::body_kind::ResponseKind =
-        super::super::body_kind::ResponseKind::Inline;
-
-    fn into_shape(self) -> Self::Shape {
-        self
+        self.into_response_shape()
     }
 }

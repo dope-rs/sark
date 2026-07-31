@@ -8,8 +8,8 @@ impl JsonEncode for LengthMismatch {
         0
     }
 
-    fn write_into<W: Write>(&self, writer: &mut W) {
-        writer.put(b"x");
+    fn write_into<W: Write>(&self, writer: &mut W) -> Result<(), W::Error> {
+        writer.put(b"x")
     }
 }
 
@@ -20,15 +20,15 @@ impl JsonEncode for ShortWrite {
         2
     }
 
-    fn write_into<W: Write>(&self, writer: &mut W) {
-        writer.put(b"x");
+    fn write_into<W: Write>(&self, writer: &mut W) -> Result<(), W::Error> {
+        writer.put(b"x")
     }
 }
 
 fn check(value: &[u8]) {
     let mut out = Vec::new();
     let mut w = Writer::new(&mut out, 0);
-    w.put_str(value);
+    w.put_str(value).unwrap();
     w.finish();
     assert_eq!(
         Encode::str_len(value),
@@ -58,13 +58,11 @@ fn common_escapes_and_plain() {
 }
 
 #[test]
-#[should_panic(expected = "JsonEncode wrote beyond json_len")]
-fn length_mismatch_panics() {
-    JsonBody::new(LengthMismatch).encode_into(&mut []);
+fn long_write_returns_capacity_error() {
+    assert!(JsonBody::new(LengthMismatch).encode_into(&mut []).is_err());
 }
 
 #[test]
-#[should_panic(expected = "JsonEncode length mismatch")]
-fn shared_length_mismatch_panics() {
-    JsonBody::new(ShortWrite).into_shared(2);
+fn short_write_returns_length_error() {
+    assert!(JsonBody::new(ShortWrite).into_shared(2).is_err());
 }

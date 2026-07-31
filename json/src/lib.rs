@@ -9,15 +9,17 @@ mod parse;
 mod response;
 mod scan;
 mod traits;
+mod view;
 
 pub use body::InlineToken;
 pub use depth::MAX_DEPTH;
 pub use encode::{Encode, Write, Writer};
 pub use o3::mem::ScratchVec;
-pub use parse::Parse;
+pub use parse::{Parse, ParseSource};
 pub use response::JsonBody;
 pub use scan::Scan;
-pub use traits::{JsonDecode, JsonEncode, JsonPreserve, JsonScan};
+pub use traits::{JsonDecode, JsonEncode, JsonPreserve, JsonRequestDecode, JsonScan};
+pub use view::JsonBytes;
 
 pub type Result<T> = sark_core::error::Result<T>;
 

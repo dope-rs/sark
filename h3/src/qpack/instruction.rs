@@ -1,4 +1,5 @@
-use super::{DecoderError, PrefixedInt, StringLiteral};
+use super::{DecoderError, PrefixedInt, literal::Literal};
+use sark_core::http::Field;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum EncoderInstruction {
@@ -20,21 +21,21 @@ pub enum EncoderInstruction {
 impl EncoderInstruction {
     pub fn encode(&self, out: &mut Vec<u8>) {
         match self {
-            Self::SetCapacity(capacity) => PrefixedInt::encode(*capacity, 5, 0x20, out),
+            Self::SetCapacity(capacity) => PrefixedInt::<5>::new(*capacity).encode(0x20, out),
             Self::InsertWithNameRef {
                 dynamic,
                 name_index,
                 value,
             } => {
                 let prefix = if *dynamic { 0x80 } else { 0xc0 };
-                PrefixedInt::encode(*name_index, 6, prefix, out);
-                StringLiteral::encode(value, 7, false, 0, out);
+                PrefixedInt::<6>::new(*name_index).encode(prefix, out);
+                Literal::raw(value).encode::<7>(false, 0, out);
             }
             Self::InsertWithLiteralName { name, value } => {
-                StringLiteral::encode(name, 5, false, 0x40, out);
-                StringLiteral::encode(value, 7, false, 0, out);
+                Literal::raw(name).encode::<5>(false, 0x40, out);
+                Literal::raw(value).encode::<7>(false, 0, out);
             }
-            Self::Duplicate { index } => PrefixedInt::encode(*index, 5, 0, out),
+            Self::Duplicate { index } => PrefixedInt::<5>::new(*index).encode(0, out),
         }
     }
 
@@ -45,34 +46,35 @@ impl EncoderInstruction {
         let first = buf[0];
         if first & 0x80 != 0 {
             let dynamic = first & 0x40 == 0;
-            let (name_index, mut pos) = PrefixedInt::decode(buf, 6)?;
-            let (value, n) = StringLiteral::decode(&buf[pos..], 7)?;
+            let (name_index, mut pos) = PrefixedInt::<6>::decode(buf)?;
+            let (value, n) = Literal::decode::<7>(&buf[pos..])?;
             pos += n;
             return Ok((
                 Self::InsertWithNameRef {
                     dynamic,
-                    name_index,
+                    name_index: name_index.get(),
                     value,
                 },
                 pos,
             ));
         }
         if first & 0xc0 == 0x40 {
-            let (name, mut pos) = StringLiteral::decode(buf, 5)?;
-            let (value, n) = StringLiteral::decode(&buf[pos..], 7)?;
+            let (name, mut pos) = Literal::decode::<5>(buf)?;
+            let (value, n) = Literal::decode::<7>(&buf[pos..])?;
             pos += n;
             return Ok((Self::InsertWithLiteralName { name, value }, pos));
         }
         if first & 0xe0 == 0x20 {
-            let (capacity, n) = PrefixedInt::decode(buf, 5)?;
-            return Ok((Self::SetCapacity(capacity), n));
+            let (capacity, n) = PrefixedInt::<5>::decode(buf)?;
+            return Ok((Self::SetCapacity(capacity.get()), n));
         }
-        let (index, n) = PrefixedInt::decode(buf, 5)?;
-        Ok((Self::Duplicate { index }, n))
+        let (index, n) = PrefixedInt::<5>::decode(buf)?;
+        Ok((Self::Duplicate { index: index.get() }, n))
     }
 
-    pub(super) fn literal_insert(name: Vec<u8>, value: Vec<u8>) -> Self {
-        Self::InsertWithLiteralName { name, value }
+    pub(super) fn encode_literal_insert(field: Field<'_>, out: &mut Vec<u8>) {
+        Literal::raw(field.name).encode::<5>(false, 0x40, out);
+        Literal::raw(field.value).encode::<7>(false, 0, out);
     }
 }
 
@@ -87,13 +89,13 @@ impl DecoderInstruction {
     pub fn encode(&self, out: &mut Vec<u8>) {
         match self {
             Self::SectionAcknowledgment { stream_id } => {
-                PrefixedInt::encode(*stream_id, 7, 0x80, out);
+                PrefixedInt::<7>::new(*stream_id).encode(0x80, out);
             }
             Self::StreamCancellation { stream_id } => {
-                PrefixedInt::encode(*stream_id, 6, 0x40, out);
+                PrefixedInt::<6>::new(*stream_id).encode(0x40, out);
             }
             Self::InsertCountIncrement { increment } => {
-                PrefixedInt::encode(*increment, 6, 0, out);
+                PrefixedInt::<6>::new(*increment).encode(0, out);
             }
         }
     }
@@ -104,14 +106,25 @@ impl DecoderInstruction {
         }
         let first = buf[0];
         if first & 0x80 != 0 {
-            let (stream_id, n) = PrefixedInt::decode(buf, 7)?;
-            return Ok((Self::SectionAcknowledgment { stream_id }, n));
+            let (stream_id, n) = PrefixedInt::<7>::decode(buf)?;
+            return Ok((
+                Self::SectionAcknowledgment {
+                    stream_id: stream_id.get(),
+                },
+                n,
+            ));
         }
         if first & 0xc0 == 0x40 {
-            let (stream_id, n) = PrefixedInt::decode(buf, 6)?;
-            return Ok((Self::StreamCancellation { stream_id }, n));
+            let (stream_id, n) = PrefixedInt::<6>::decode(buf)?;
+            return Ok((
+                Self::StreamCancellation {
+                    stream_id: stream_id.get(),
+                },
+                n,
+            ));
         }
-        let (increment, n) = PrefixedInt::decode(buf, 6)?;
+        let (increment, n) = PrefixedInt::<6>::decode(buf)?;
+        let increment = increment.get();
         if increment == 0 {
             return Err(DecoderError::DecoderStream);
         }

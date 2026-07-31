@@ -69,8 +69,10 @@ impl HeaderBlock {
         }
     }
 
-    pub fn push(&mut self, name: &[u8], value: &[u8]) {
-        self.fields.push(name, value);
+    pub fn push(&mut self, name: &[u8], value: &[u8]) -> Result<(), Status> {
+        self.fields
+            .push(name, value)
+            .map_err(|_| Status::new(Code::Internal, "gRPC header field exceeds wire bounds"))
     }
 
     pub fn iter(&self) -> impl Iterator<Item = Field<'_>> {
@@ -88,22 +90,22 @@ impl HeaderBlock {
     ) -> Result<HeaderBlock, Status> {
         RequestHead::validate_path(path)?;
         let mut out = HeaderBlock::new();
-        out.push(b":method", b"POST");
-        out.push(b":scheme", b"http");
-        out.push(b":path", path);
+        out.push(b":method", b"POST")?;
+        out.push(b":scheme", b"http")?;
+        out.push(b":path", path)?;
         if let Some(authority) = authority {
-            out.push(b":authority", authority);
+            out.push(b":authority", authority)?;
         }
-        out.push(b"content-type", b"application/grpc+proto");
-        out.push(b"te", b"trailers");
+        out.push(b"content-type", b"application/grpc+proto")?;
+        out.push(b"te", b"trailers")?;
         out.push_metadata(metadata)?;
         Ok(out)
     }
 
     pub fn for_response(metadata: &Metadata) -> Result<HeaderBlock, Status> {
         let mut out = HeaderBlock::new();
-        out.push(b":status", b"200");
-        out.push(b"content-type", b"application/grpc+proto");
+        out.push(b":status", b"200")?;
+        out.push(b"content-type", b"application/grpc+proto")?;
         out.push_metadata(metadata)?;
         Ok(out)
     }
@@ -111,14 +113,16 @@ impl HeaderBlock {
     pub fn for_trailers(status: &Status, metadata: &Metadata) -> Result<HeaderBlock, Status> {
         let mut out = HeaderBlock::new();
         let (code, code_len) = status.grpc_status_value();
-        out.push(b"grpc-status", &code[..code_len]);
+        out.push(b"grpc-status", &code[..code_len])?;
         if !status.message().is_empty() {
             let message = status.message();
-            out.fields.push_encoded(
-                b"grpc-message",
-                Status::encoded_message_len(message),
-                |writer| Status::encode_message(message, |byte| writer.push(byte)),
-            );
+            let message_len = Status::encoded_message_len(message)
+                .ok_or_else(|| Status::new(Code::Internal, "gRPC message length overflow"))?;
+            out.fields
+                .push_encoded(b"grpc-message", message_len, |writer| {
+                    Status::encode_message(message, |byte| writer.push(byte))
+                })
+                .map_err(|_| Status::new(Code::Internal, "gRPC message exceeds wire bounds"))?;
         }
         out.push_metadata(metadata)?;
         Ok(out)
@@ -129,7 +133,7 @@ impl HeaderBlock {
             if entry.name.starts_with(b":") || Metadata::is_reserved(&entry.name) {
                 return Err(Status::new(Code::Internal, "reserved metadata name"));
             }
-            self.push(&entry.name, &entry.value);
+            self.push(&entry.name, &entry.value)?;
         }
         Ok(())
     }

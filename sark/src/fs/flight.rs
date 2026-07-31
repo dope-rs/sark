@@ -1,7 +1,9 @@
 use std::pin::Pin;
 use std::task::Poll;
 
-use dope_fiber::{Context, Fiber, WaitQueue, Waiter};
+use dope_fiber::abi::Fiber;
+use dope_fiber::raw::task::Context;
+use dope_fiber::raw::wait::{WaitQueue, Waiter};
 use o3::cell::CheckedCell;
 use o3::collections::{FixedHashTable, PinSlab, SlabKey};
 use pin_project::pinned_drop;

@@ -8,6 +8,9 @@ use call::{CallStore, ResponseMode};
 use egress::Egress;
 use ingress::Ingress;
 
+use std::{error, fmt};
+
+use o3::buffer::{PoolLayoutError, SharedPoolLayout};
 use sark_h2::{ClientRole, Conn, ErrorCode, StreamId, conn};
 
 use crate::Codec;
@@ -42,6 +45,25 @@ impl Default for Config {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ConfigError {
+    ZeroCapacity(&'static str),
+    H2(sark_h2::ConfigError),
+    Pool(PoolLayoutError),
+}
+
+impl fmt::Display for ConfigError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::ZeroCapacity(name) => write!(formatter, "{name} capacity must be positive"),
+            Self::H2(error) => error.fmt(formatter),
+            Self::Pool(error) => error.fmt(formatter),
+        }
+    }
+}
+
+impl error::Error for ConfigError {}
+
 pub struct Session {
     h2: Conn<ClientRole>,
     calls: CallStore,
@@ -51,31 +73,37 @@ pub struct Session {
 }
 
 impl Session {
-    pub fn new() -> Self {
+    pub fn new() -> Result<Self, ConfigError> {
         Self::with_config(Config::default())
     }
 
-    pub fn with_config(config: Config) -> Self {
-        assert!(config.max_in_flight > 0, "max_in_flight must be positive");
-        assert!(
-            config.max_pending_msgs > 0,
-            "max_pending_msgs must be positive"
-        );
-        assert!(
-            config.max_pending_len > 0,
-            "max_pending_len must be positive"
-        );
+    pub fn with_config(config: Config) -> Result<Self, ConfigError> {
+        for (name, capacity) in [
+            ("max_in_flight", config.max_in_flight),
+            ("max_pending_msgs", config.max_pending_msgs),
+            ("max_pending_len", config.max_pending_len),
+        ] {
+            if capacity == 0 {
+                return Err(ConfigError::ZeroCapacity(name));
+            }
+        }
         let h2 = Conn::<ClientRole>::with_config(conn::Config {
             stream_capacity: config.max_in_flight,
             ..conn::Config::default()
-        });
-        Self {
+        })
+        .map_err(ConfigError::H2)?;
+        let request_layout = SharedPoolLayout::new(config.max_pending_msgs, config.max_pending_len)
+            .map_err(ConfigError::Pool)?;
+        let message_layout =
+            SharedPoolLayout::new(config.max_pending_msgs, config.max_message_len.max(1))
+                .map_err(ConfigError::Pool)?;
+        Ok(Self {
             h2,
             calls: CallStore::with_capacity(config.max_in_flight, config.max_message_len),
-            egress: Egress::with_config(&config),
-            ingress: Ingress::with_config(&config),
+            egress: Egress::with_config(&config, request_layout),
+            ingress: Ingress::with_config(&config, message_layout),
             encode_buf: Vec::with_capacity(config.max_message_len),
-        }
+        })
     }
 
     pub fn outbound(&self) -> &[u8] {
@@ -284,11 +312,5 @@ impl Session {
 
     fn abort_stream(&mut self, stream_id: StreamId) {
         self.egress.abort(&mut self.calls, &mut self.h2, stream_id);
-    }
-}
-
-impl Default for Session {
-    fn default() -> Self {
-        Self::new()
     }
 }

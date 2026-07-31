@@ -14,23 +14,26 @@ use std::pin::Pin;
 
 pub use conn_state::{ConsumeOutcome, Outcome};
 use dope::DriverContext;
-use dope::manifold::listener;
+use dope::manifold::Outcome as ListenerOutcome;
+use dope::manifold::listener::application::{Application, ApplicationHooks};
+use dope::manifold::listener::state::{EgressCtx, State};
 use dope_net::link;
 use dope_net::wire::Wire;
 pub use driver::{H1Driver, HeadDeadline};
-pub use invocation::{Invocation, SyncRoute};
+pub use invocation::{Invocation, StreamRoute, SyncRoute};
+use o3::buffer::RetainBytes;
 pub use pipeline::{Pipeline, identity_mut};
-pub use requests::{Ctx, Framed, Matched};
-pub use routes::{Complete, Dispatch, RequestTask, TaskPoll};
+pub use requests::{Ctx, Matched};
+pub use routes::{Complete, FiberRoute, RequestTask, TaskPoll};
 pub use routing::{H1Host, RouteCore, Routing};
-use sark_core::http::Shape;
+use sark_core::http::{ResponseSink, Shape};
 pub use tasks::TaskRunner;
 
 use crate::service::{RouteSpec, manifold};
 
-pub trait ResponseEncoder {
-    fn emit(&mut self, status: http::StatusCode, headers_wire: &[u8], body: &[u8]);
-}
+pub trait ResponseEncoder: ResponseSink {}
+
+impl<T> ResponseEncoder for T where T: ResponseSink {}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Decoded {
@@ -86,21 +89,6 @@ impl BodySource for Vec<u8> {
     }
 }
 
-#[doc(hidden)]
-pub struct DecodedCtx<'a> {
-    pub method_key: crate::service::Key,
-    pub slice_path: crate::service::SlicePath<'a>,
-}
-
-impl<'a> DecodedCtx<'a> {
-    pub fn new(method_key: crate::service::Key, path: &'a [u8]) -> Self {
-        Self {
-            method_key,
-            slice_path: crate::service::SlicePath::new(path),
-        }
-    }
-}
-
 pub trait Decode {
     type Prepared: PreparedRequest;
 
@@ -152,61 +140,48 @@ where
             raw_headers,
             state,
         ) {
-            Ok(response) => match response.response_view() {
-                Some(view) => {
-                    ResponseEncoder::emit(
-                        encoder,
-                        view.status,
-                        view.headers.as_ref(),
-                        view.body.as_ref(),
-                    );
+            Ok(response) => {
+                if response.emit(encoder) {
                     Decoded::Emitted
+                } else {
+                    Decoded::Unsupported
                 }
-                None => Decoded::Unsupported,
-            },
+            }
             Err(_) => Decoded::Bad,
         }
     }
 }
 
-impl<R: RouteSpec, S> DecodeRoute<R, S> for manifold::NativeFiber {
-    fn decode<E: ResponseEncoder>(
-        _raw_params: R::RawParams,
-        _raw_headers: R::RawHeaders,
-        _method: http::Method,
-        _target: Range<usize>,
-        _head: &[u8],
-        _body: &[u8],
-        _declared_body_len: usize,
-        _state: &S,
-        _encoder: &mut E,
-    ) -> Decoded {
-        Decoded::Unsupported
-    }
+macro_rules! unsupported_decode_routes {
+    ($($kind:ty),+ $(,)?) => {
+        $(
+            impl<R: RouteSpec, S> DecodeRoute<R, S> for $kind {
+                fn decode<E: ResponseEncoder>(
+                    _raw_params: R::RawParams,
+                    _raw_headers: R::RawHeaders,
+                    _method: http::Method,
+                    _target: Range<usize>,
+                    _head: &[u8],
+                    _body: &[u8],
+                    _declared_body_len: usize,
+                    _state: &S,
+                    _encoder: &mut E,
+                ) -> Decoded {
+                    Decoded::Unsupported
+                }
+            }
+        )+
+    };
 }
 
-impl<R: RouteSpec, S> DecodeRoute<R, S> for manifold::NativeStream {
-    fn decode<E: ResponseEncoder>(
-        _raw_params: R::RawParams,
-        _raw_headers: R::RawHeaders,
-        _method: http::Method,
-        _target: Range<usize>,
-        _head: &[u8],
-        _body: &[u8],
-        _declared_body_len: usize,
-        _state: &S,
-        _encoder: &mut E,
-    ) -> Decoded {
-        Decoded::Unsupported
-    }
-}
+unsupported_decode_routes!(manifold::NativeFiber, manifold::NativeStream);
 
 pub trait H1Project<'d, W: Wire> {
     fn chunk_proj<C, PJ>(
         self: Pin<&mut Self>,
-        slot: &mut link::slot::Slot<'d, W, listener::State<C>>,
+        slot: &mut link::slot::Slot<'d, W, State<C>>,
         bytes: &[u8],
-        aux: &mut listener::Aux,
+        egress: &mut EgressCtx<'_, '_>,
         driver: &mut DriverContext<'_, 'd>,
         project: PJ,
     ) -> bool
@@ -216,10 +191,10 @@ pub trait H1Project<'d, W: Wire> {
 
     fn send_proj<C, PJ>(
         self: Pin<&mut Self>,
-        slot: &mut link::slot::Slot<'d, W, listener::State<C>>,
+        slot: &mut link::slot::Slot<'d, W, State<C>>,
         project: PJ,
         sent: usize,
-        aux: &mut listener::Aux,
+        egress: &mut EgressCtx<'_, '_>,
         driver: &mut DriverContext<'_, 'd>,
     ) where
         C: Default + 'static,
@@ -227,9 +202,9 @@ pub trait H1Project<'d, W: Wire> {
 
     fn activate_proj<C, PJ>(
         self: Pin<&mut Self>,
-        slot: &mut link::slot::Slot<'d, W, listener::State<C>>,
+        slot: &mut link::slot::Slot<'d, W, State<C>>,
         project: PJ,
-        aux: &mut listener::Aux,
+        egress: &mut EgressCtx<'_, '_>,
         driver: &mut DriverContext<'_, 'd>,
     ) where
         C: Default + 'static,
@@ -237,10 +212,67 @@ pub trait H1Project<'d, W: Wire> {
 
     fn close_proj<C, PJ>(
         self: Pin<&mut Self>,
-        slot: &mut link::slot::Slot<'d, W, listener::State<C>>,
+        slot: &mut link::slot::Slot<'d, W, State<C>>,
         project: PJ,
-        aux: &mut listener::Aux,
+        egress: &mut EgressCtx<'_, '_>,
     ) where
         C: Default + 'static,
         PJ: Fn(&mut C) -> &mut conn_state::ConnState;
+}
+
+#[doc(hidden)]
+pub struct H1Hooks;
+
+impl<'d, A, W> ApplicationHooks<'d, A> for H1Hooks
+where
+    A: Application<'d, Conn = conn_state::ConnState, Wire = W> + H1Project<'d, W>,
+    W: Wire,
+{
+    fn chunk<R: RetainBytes>(
+        app: Pin<&mut A>,
+        slot: &mut link::slot::Slot<'d, W, State<conn_state::ConnState>>,
+        mut egress: EgressCtx<'_, '_>,
+        chunk: R,
+        driver: &mut DriverContext<'_, 'd>,
+    ) -> ListenerOutcome {
+        if A::chunk_proj(
+            app,
+            slot,
+            chunk.as_slice(),
+            &mut egress,
+            driver,
+            identity_mut,
+        ) {
+            ListenerOutcome::Overrun
+        } else {
+            ListenerOutcome::Ok
+        }
+    }
+
+    fn send(
+        app: Pin<&mut A>,
+        slot: &mut link::slot::Slot<'d, W, State<conn_state::ConnState>>,
+        mut egress: EgressCtx<'_, '_>,
+        sent: usize,
+        driver: &mut DriverContext<'_, 'd>,
+    ) {
+        A::send_proj(app, slot, identity_mut, sent, &mut egress, driver);
+    }
+
+    fn activate(
+        app: Pin<&mut A>,
+        slot: &mut link::slot::Slot<'d, W, State<conn_state::ConnState>>,
+        mut egress: EgressCtx<'_, '_>,
+        driver: &mut DriverContext<'_, 'd>,
+    ) {
+        A::activate_proj(app, slot, identity_mut, &mut egress, driver);
+    }
+
+    fn close(
+        app: Pin<&mut A>,
+        slot: &mut link::slot::Slot<'d, W, State<conn_state::ConnState>>,
+        mut egress: EgressCtx<'_, '_>,
+    ) {
+        A::close_proj(app, slot, identity_mut, &mut egress);
+    }
 }

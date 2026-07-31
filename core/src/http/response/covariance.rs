@@ -1,17 +1,11 @@
 #![allow(dead_code)]
 
 use super::{
-    FixedResponse, HeadInner, HeaderItem, HeaderValueInner, Headers, HotBodyInner, HotHeadInner,
-    MonoResponseInner, Serve, StaticResponseInner, TextBody, TextItem,
+    Body, FixedResponse, HeadInner, HeaderItem, HeaderValueInner, Headers, HotHeadInner,
+    MonoResponseInner, Serve, StaticResponseInner,
 };
 
-fn _text_item<'short, 'long: 'short>(x: TextItem<'long>) -> TextItem<'short> {
-    x
-}
-fn _hot_text<'short, 'long: 'short>(x: TextBody<'long>) -> TextBody<'short> {
-    x
-}
-fn _hot_body<'short, 'long: 'short>(x: HotBodyInner<'long>) -> HotBodyInner<'short> {
+fn _body<'short, 'long: 'short>(x: Body<'long>) -> Body<'short> {
     x
 }
 fn _direct_header_value<'short, 'long: 'short>(

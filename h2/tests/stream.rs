@@ -1,59 +1,62 @@
+mod common;
+
+use common::sid;
 use sark_h2::stream::{IdGen, TransitionError};
 use sark_h2::{Side, Stream, StreamId, stream};
 
 #[test]
 fn stream_id_classification() {
-    assert!(StreamId(0).is_zero());
-    assert!(!StreamId(0).is_client());
-    assert!(!StreamId(0).is_server());
+    assert!(sid(0).is_zero());
+    assert!(!sid(0).is_client());
+    assert!(!sid(0).is_server());
 
-    assert!(StreamId(1).is_client());
-    assert!(!StreamId(1).is_server());
-    assert!(!StreamId(1).is_zero());
+    assert!(sid(1).is_client());
+    assert!(!sid(1).is_server());
+    assert!(!sid(1).is_zero());
 
-    assert!(StreamId(2).is_server());
-    assert!(!StreamId(2).is_client());
+    assert!(sid(2).is_server());
+    assert!(!sid(2).is_client());
 
-    assert!(StreamId(3).is_client());
-    assert!(StreamId(4).is_server());
+    assert!(sid(3).is_client());
+    assert!(sid(4).is_server());
 }
 
 #[test]
 fn stream_id_const_connection() {
-    assert_eq!(StreamId::CONNECTION, StreamId(0));
+    assert_eq!(StreamId::CONNECTION, sid(0));
     assert!(StreamId::CONNECTION.is_zero());
 }
 
 #[test]
 fn id_gen_client_sequence() {
-    let mut g = IdGen::new(1);
-    assert_eq!(g.peek(), StreamId(1));
-    assert_eq!(g.next_id(), Some(StreamId(1)));
-    assert_eq!(g.next_id(), Some(StreamId(3)));
-    assert_eq!(g.next_id(), Some(StreamId(5)));
-    assert_eq!(g.peek(), StreamId(7));
+    let mut g = IdGen::new(sid(1));
+    assert_eq!(g.peek(), Some(sid(1)));
+    assert_eq!(g.next_id(), Some(sid(1)));
+    assert_eq!(g.next_id(), Some(sid(3)));
+    assert_eq!(g.next_id(), Some(sid(5)));
+    assert_eq!(g.peek(), Some(sid(7)));
 }
 
 #[test]
 fn id_gen_server_sequence() {
-    let mut g = IdGen::new(2);
-    assert_eq!(g.next_id(), Some(StreamId(2)));
-    assert_eq!(g.next_id(), Some(StreamId(4)));
-    assert_eq!(g.next_id(), Some(StreamId(6)));
+    let mut g = IdGen::new(sid(2));
+    assert_eq!(g.next_id(), Some(sid(2)));
+    assert_eq!(g.next_id(), Some(sid(4)));
+    assert_eq!(g.next_id(), Some(sid(6)));
 }
 
 #[test]
 fn id_gen_exhaustion_client() {
-    let mut g = IdGen::new(StreamId::MAX);
-    assert_eq!(g.next_id(), Some(StreamId(StreamId::MAX)));
+    let mut g = IdGen::new(sid(StreamId::MAX));
+    assert_eq!(g.next_id(), Some(sid(StreamId::MAX)));
     assert_eq!(g.next_id(), None);
     assert_eq!(g.next_id(), None);
 }
 
 #[test]
 fn id_gen_exhaustion_server() {
-    let mut g = IdGen::new(StreamId::MAX - 1);
-    assert_eq!(g.next_id(), Some(StreamId(StreamId::MAX - 1)));
+    let mut g = IdGen::new(sid(StreamId::MAX - 1));
+    assert_eq!(g.next_id(), Some(sid(StreamId::MAX - 1)));
     assert_eq!(g.next_id(), None);
 }
 
@@ -322,7 +325,7 @@ fn step_dispatches_by_side() {
 
 #[test]
 fn stream_struct_send_recv_mutates() {
-    let mut s = Stream::new(StreamId(1));
+    let mut s = Stream::new(sid(1));
     assert_eq!(s.state, stream::State::Idle);
 
     let next = s
@@ -342,10 +345,10 @@ fn stream_struct_send_recv_mutates() {
 
 #[test]
 fn stream_reserve_constructors() {
-    let s = Stream::reserve_local(StreamId(2));
+    let s = Stream::reserve_local(sid(2));
     assert_eq!(s.state, stream::State::ReservedLocal);
 
-    let s = Stream::reserve_remote(StreamId(2));
+    let s = Stream::reserve_remote(sid(2));
     assert_eq!(s.state, stream::State::ReservedRemote);
 }
 

@@ -5,6 +5,7 @@ use sark::service::{RouteRequestImpl, RouteSpec, SliceValue};
 use sark_core::http::{CacheTemplate, Preparation, Prepared, Shape, VecFieldBlock};
 
 #[sark_gen::response(raw)]
+#[header("content-type", "text/plain")]
 struct Reply {
     status: StatusCode,
     body: &'static [u8],
@@ -13,8 +14,19 @@ struct Reply {
 #[sark_gen::request]
 struct PlainReq {}
 
+#[sark_gen::request(full)]
+struct FullReq {}
+
 #[sark_gen::handler]
 fn plain_h(_req: PlainReq, _state: &sark::EmptyState) -> Reply {
+    Reply {
+        status: StatusCode::OK,
+        body: b"ok",
+    }
+}
+
+#[sark_gen::handler]
+fn full_h(_req: FullReq, _state: &sark::EmptyState) -> Reply {
     Reply {
         status: StatusCode::OK,
         body: b"ok",
@@ -64,6 +76,7 @@ fn routed_h(req: RoutedReq, _state: &sark::EmptyState) -> Reply {
 sark_gen::define_route! {
     AgnApp: sark::EmptyState => {
         GET "/json" => plain_h,
+        GET "/full" => full_h,
         GET "/named" => named_h,
         GET "/items/:id" => routed_h,
     }
@@ -77,11 +90,23 @@ struct Capture {
     calls: usize,
 }
 
-impl sark::dispatch::ResponseEncoder for Capture {
-    fn emit(&mut self, status: StatusCode, headers_wire: &[u8], body: &[u8]) {
+impl sark_core::http::ResponseSink for Capture {
+    fn emit<'a, 'body, I>(
+        &mut self,
+        status: StatusCode,
+        headers: I,
+        body: sark_core::http::Body<'body>,
+    ) where
+        I: Iterator<Item = sark_core::http::Field<'a>>,
+    {
         self.status = Some(status);
-        self.headers = headers_wire.to_vec();
-        self.body = body.to_vec();
+        for field in headers {
+            self.headers.extend_from_slice(field.name);
+            self.headers.extend_from_slice(b": ");
+            self.headers.extend_from_slice(field.value);
+            self.headers.extend_from_slice(b"\r\n");
+        }
+        self.body = body.as_bytes().to_vec();
         self.calls += 1;
     }
 }
@@ -99,8 +124,8 @@ fn agnostic_dispatch_routes_feeds_invokes_encodes() {
     );
 
     let mut fields = VecFieldBlock::new();
-    fields.push(b":method", b"GET");
-    fields.push(b":path", b"/json");
+    fields.push(b":method", b"GET").unwrap();
+    fields.push(b":path", b"/json").unwrap();
     let prepared = app.prepare_decoded(fields).expect("known route");
     let mut cap = Capture::default();
     let out = app.dispatch_prepared(prepared, &[][..], &mut cap);
@@ -108,12 +133,12 @@ fn agnostic_dispatch_routes_feeds_invokes_encodes() {
     assert_eq!(cap.status, Some(StatusCode::OK));
     assert_eq!(cap.body, b"ok");
     assert_eq!(cap.calls, 1);
-    assert!(cap.headers.is_empty());
+    assert_eq!(cap.headers, b"content-type: text/plain\r\n");
 
     let mut fields = VecFieldBlock::new();
-    fields.push(b":method", b"GET");
-    fields.push(b":path", b"/named");
-    fields.push(b"x-name", b"alice");
+    fields.push(b":method", b"GET").unwrap();
+    fields.push(b":path", b"/named").unwrap();
+    fields.push(b"x-name", b"alice").unwrap();
     let prepared = app.prepare_decoded(fields).expect("known route");
     let mut cap2 = Capture::default();
     let out2 = app.dispatch_prepared(prepared, &[][..], &mut cap2);
@@ -121,8 +146,8 @@ fn agnostic_dispatch_routes_feeds_invokes_encodes() {
     assert_eq!(cap2.status, Some(StatusCode::IM_A_TEAPOT));
 
     let mut fields = VecFieldBlock::new();
-    fields.push(b":method", b"GET");
-    fields.push(b":path", b"/items/42?tag=rust");
+    fields.push(b":method", b"GET").unwrap();
+    fields.push(b":path", b"/items/42?tag=rust").unwrap();
     let prepared = app
         .prepare_decoded(fields)
         .expect("parameterized route with query");
@@ -132,11 +157,27 @@ fn agnostic_dispatch_routes_feeds_invokes_encodes() {
     assert_eq!(cap3.status, Some(StatusCode::IM_A_TEAPOT));
 
     let mut fields = VecFieldBlock::new();
-    fields.push(b":method", b"GET");
-    fields.push(b":path", b"/nope");
+    fields.push(b":method", b"GET").unwrap();
+    fields.push(b":path", b"/nope").unwrap();
     assert!(matches!(
         app.prepare_decoded(fields),
         Err(sark::dispatch::Decoded::NotFound)
+    ));
+
+    let mut fields = VecFieldBlock::new();
+    fields.push(b":method", b"GET").unwrap();
+    fields.push(b":path", b"/json?ignored=\x01").unwrap();
+    assert!(
+        app.prepare_decoded(fields).is_ok(),
+        "unused target bytes stay outside the minimal route capability"
+    );
+
+    let mut fields = VecFieldBlock::new();
+    fields.push(b":method", b"GET").unwrap();
+    fields.push(b":path", b"/full?ignored=\x01").unwrap();
+    assert!(matches!(
+        app.prepare_decoded(fields),
+        Err(sark::dispatch::Decoded::Bad)
     ));
 }
 

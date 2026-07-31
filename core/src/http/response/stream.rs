@@ -1,7 +1,8 @@
 use std::pin::Pin;
 use std::task::Poll;
 
-use dope_fiber::{Context, Fiber};
+use dope_fiber::abi::Fiber;
+use dope_fiber::raw::task::Context;
 use http::StatusCode;
 use o3::buffer::Shared;
 
@@ -49,16 +50,8 @@ impl<S> Stream<S> {
     }
 
     pub fn write_head_stream(self, out: &mut [u8], date: &[u8; 29]) -> Option<(usize, S)> {
-        let status_str = self.status.as_str().as_bytes();
-        let reason = self
-            .status
-            .canonical_reason()
-            .map(str::as_bytes)
-            .unwrap_or(b"");
-
         let head = HeadWrite {
-            status_str,
-            reason,
+            status: self.status,
             headers: self.wire_headers.as_slice(),
             framing: TransferEncodingChunked,
         };

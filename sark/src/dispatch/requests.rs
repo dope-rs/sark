@@ -1,23 +1,19 @@
 use std::ops::Range;
 
-use http::Method;
 use o3::buffer::Shared;
 use sark_core::error::Error;
 use sark_core::http::codec::chunked::BodyDecoder;
-use sark_core::http::codec::{BodyFraming, HeaderScan, ParsedRequestHead};
-use sark_core::http::head::Flags;
+use sark_core::http::codec::{BodyFraming, RequestLine};
 
 use super::conn_state::{ConnState, ConsumeOutcome, DispatchPermit, NeedMore};
 use crate::request::RequestStorage;
-use crate::service::{Key, RouteRequestImpl, RouteSpec, SlicePath};
+use crate::service::{HeaderParse, RouteRequestImpl, RouteSpec};
 use crate::{CANNED_400, CANNED_413};
 
 const MAX_HEADER_COUNT: usize = 128;
 
 pub struct Ctx<'a> {
-    pub head: &'a ParsedRequestHead<'a>,
-    pub method_key: Key,
-    pub slice_path: SlicePath<'a>,
+    pub head: &'a RequestLine<'a>,
     pub target_off: usize,
     pub target_len: usize,
     pub query_range: Option<Range<usize>>,
@@ -25,22 +21,9 @@ pub struct Ctx<'a> {
 }
 
 impl<'a> Ctx<'a> {
-    pub fn parse(req_bytes: &'a [u8], parsed: &'a ParsedRequestHead<'a>) -> Self {
-        let method_key = Key::from_bytes(parsed.method);
-        Self::parse_with_key(req_bytes, parsed, method_key)
-    }
-
-    pub fn parse_with_key(
-        req_bytes: &'a [u8],
-        parsed: &'a ParsedRequestHead<'a>,
-        method_key: Key,
-    ) -> Self {
+    pub fn routed(req_bytes: &'a [u8], parsed: &'a RequestLine<'a>, path_end: usize) -> Self {
         let target = parsed.target;
-        let path_end = target
-            .iter()
-            .position(|&byte| byte == b'?')
-            .unwrap_or(target.len());
-        let slice_path = SlicePath::new(&target[..path_end]);
+        debug_assert!(path_end <= target.len());
         let req_base = req_bytes.as_ptr() as usize;
         let target_off = target.as_ptr() as usize - req_base;
         let target_len = target.len();
@@ -51,26 +34,11 @@ impl<'a> Ctx<'a> {
         };
         Self {
             head: parsed,
-            method_key,
-            slice_path,
             target_off,
             target_len,
             query_range,
             req_bytes,
         }
-    }
-
-    pub(super) fn http_method(&self) -> Result<Method, ()> {
-        Ok(match self.method_key {
-            Key::Get => Method::GET,
-            Key::Post => Method::POST,
-            Key::Put => Method::PUT,
-            Key::Patch => Method::PATCH,
-            Key::Delete => Method::DELETE,
-            Key::Head => Method::HEAD,
-            Key::Options => Method::OPTIONS,
-            Key::Other => Method::from_bytes(self.head.method).map_err(|_| ())?,
-        })
     }
 
     pub(super) fn assemble_domain<R: RouteSpec>(
@@ -93,12 +61,7 @@ impl<'a> Ctx<'a> {
         };
         let retained = Self::retain(conn.recv_view.as_ref(), self.req_bytes, retain);
         let req = retained.as_ref();
-        if let Some(query) = self.query_range.clone()
-            && R::Request::parse_query_raw(&mut raw_headers, req, query).is_err()
-        {
-            return Err(RequestErr::Bad(CANNED_400));
-        }
-        if self.http_method().is_err() {
+        if self.parse_query::<R>(&mut raw_headers, req).is_err() {
             return Err(RequestErr::Bad(CANNED_400));
         }
         Ok(RequestDomainInput {
@@ -111,13 +74,26 @@ impl<'a> Ctx<'a> {
         })
     }
 
+    pub(super) fn parse_query<R: RouteSpec>(
+        &self,
+        raw_headers: &mut R::RawHeaders,
+        request: &[u8],
+    ) -> Result<(), ()> {
+        if let Some(query) = self.query_range.clone() {
+            R::Request::parse_query_raw(raw_headers, request, query).map_err(|_| ())?;
+        }
+        Ok(())
+    }
+
     fn retain(view: Option<&Shared>, req_bytes: &[u8], len: usize) -> Shared {
         if let Some(view) = view {
             let base = view.as_slice().as_ptr() as usize;
             if let Some(offset) = (req_bytes.as_ptr() as usize).checked_sub(base)
-                && offset + len <= view.len()
+                && let Some(end) = offset.checked_add(len)
+                && end <= view.len()
+                && let Some(retained) = view.get(offset..end)
             {
-                return view.slice(offset..offset + len);
+                return retained;
             }
         }
         Shared::copy_from_slice(&req_bytes[..len])
@@ -156,60 +132,6 @@ pub(super) fn assemble_matched<R: RouteSpec>(
     }
 }
 
-pub enum Framed<R: RouteSpec> {
-    NeedMore,
-    Bad,
-    Ready {
-        headers: R::RawHeaders,
-        head_len: usize,
-        body_framing: BodyFraming,
-        flags: Flags,
-        accept_gzip: bool,
-    },
-}
-
-impl<R: RouteSpec> Framed<R> {
-    pub fn parse(req_bytes: &[u8], headers_start: usize) -> Self {
-        let mut raw_headers = R::RawHeaders::default();
-        let mut scan = HeaderScan::default();
-        let mut flags = Flags::default();
-        let mut header_count = 0usize;
-        let mut pos = headers_start;
-        let head_len = loop {
-            if pos + 2 > req_bytes.len() {
-                return Framed::NeedMore;
-            }
-            let rest = &req_bytes[pos..];
-            match R::Request::apply_header_contig(
-                &mut raw_headers,
-                req_bytes,
-                rest,
-                pos,
-                &mut scan,
-                &mut flags,
-                &mut header_count,
-                MAX_HEADER_COUNT,
-            ) {
-                Ok(Some(0)) => break pos + 2,
-                Ok(Some(relative)) => pos += relative + 2,
-                Ok(None) => return Framed::NeedMore,
-                Err(_) => return Framed::Bad,
-            }
-        };
-        let body_framing = match scan.validate_for_request() {
-            Ok(framing) => framing,
-            Err(_) => return Framed::Bad,
-        };
-        Framed::Ready {
-            headers: raw_headers,
-            head_len,
-            body_framing,
-            flags,
-            accept_gzip: scan.accept_encoding_gzip,
-        }
-    }
-}
-
 pub(super) struct Framing<R: RouteSpec> {
     pub(super) raw_headers: R::RawHeaders,
     pub(super) head_len: usize,
@@ -240,16 +162,16 @@ impl<R: RouteSpec> FramingBase<R> {
     fn from_ctx(ctx: &Ctx<'_>) -> Result<Self, RequestErr> {
         let head = ctx.head;
         let (raw_headers, head_len, body_framing, flags, accept_gzip) =
-            match Framed::<R>::parse(ctx.req_bytes, head.headers_start) {
-                Framed::Ready {
+            match R::parse_headers(ctx.req_bytes, head.headers_start, MAX_HEADER_COUNT) {
+                HeaderParse::Ready {
                     headers,
                     head_len,
                     body_framing,
                     flags,
                     accept_gzip,
                 } => (headers, head_len, body_framing, flags, accept_gzip),
-                Framed::NeedMore => return Err(RequestErr::NeedMore(NeedMore::Head)),
-                Framed::Bad => return Err(RequestErr::Bad(CANNED_400)),
+                HeaderParse::NeedMore => return Err(RequestErr::NeedMore(NeedMore::Head)),
+                HeaderParse::Bad => return Err(RequestErr::Bad(CANNED_400)),
             };
         Ok(Self {
             raw_headers,

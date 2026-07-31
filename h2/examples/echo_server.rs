@@ -1,7 +1,7 @@
 use std::env;
 use std::net::SocketAddr;
 
-use dope::runtime::{Launcher, WorkerContext, WorkerEntry};
+use dope::runtime::launcher::{Launcher, WorkerContext, WorkerEntry};
 use sark_h2::server::{Body, Config, Response, serve_sync};
 
 struct Worker;
@@ -10,7 +10,8 @@ impl WorkerEntry for Worker {
     type Input = Config;
 
     fn run(config: Self::Input, context: WorkerContext) -> std::io::Result<()> {
-        let large = Body::repeat(b'x', 1 << 20);
+        let large = Body::repeat(b'x', 1 << 20)
+            .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidInput, error))?;
         serve_sync(
             move |request| {
                 if request.path().is_some_and(|path| path == b"/large") {

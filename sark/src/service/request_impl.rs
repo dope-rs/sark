@@ -3,8 +3,8 @@
 use std::ops::Range;
 
 use sark_core::error::Result;
-use sark_core::http::codec::HeaderScan;
-use sark_core::http::head::{Flags, HeadInput, HeaderLineScan, WellKnownHeaders};
+use sark_core::http::codec::BodyFraming;
+use sark_core::http::head::Flags;
 
 use super::plan::HeaderValue;
 use super::spec::RouteParams;
@@ -61,6 +61,18 @@ impl BodyMode for body_mode::Discarded {}
 
 pub use body_mode::{Buffered, Discarded};
 
+pub enum HeaderParse<H> {
+    NeedMore,
+    Bad,
+    Ready {
+        headers: H,
+        head_len: usize,
+        body_framing: BodyFraming,
+        flags: Flags,
+        accept_gzip: bool,
+    },
+}
+
 pub trait RouteRequestImpl {
     type HeaderSlot: Copy;
     type RawHeaders: Default;
@@ -70,9 +82,7 @@ pub trait RouteRequestImpl {
     type ParsedBody<'req>;
     type BodyMode: BodyMode;
 
-    const NEED_HEADER: bool = false;
-    const NEED_KNOWN_HEADER: bool = false;
-    const NEED_QUERY: bool = false;
+    const FULL: bool = false;
     const BODY_POLICY: BodyPolicy = <Self::BodyMode as BodyMode>::POLICY;
 
     fn parse_body<'req>(raw: &'req [u8]) -> Result<Self::ParsedBody<'req>>;
@@ -81,67 +91,15 @@ pub trait RouteRequestImpl {
         None
     }
 
-    fn header_slot_u8(_name: &[u8]) -> Option<u8> {
-        None
-    }
-
-    fn scan_header_contig(rest: &[u8]) -> Result<Option<HeaderLineScan>> {
-        Ok(HeaderLineScan::find(rest, 0))
-    }
-
-    fn apply_header_contig<I: HeadInput + ?Sized>(
-        _headers: &mut Self::RawHeaders,
-        _input: &I,
-        rest: &[u8],
-        _line_start: usize,
-        scan: &mut HeaderScan,
-        flags: &mut Flags,
-        header_count: &mut usize,
+    fn parse_headers<const PARSE_ACCEPT_ENCODING: bool>(
+        req_bytes: &[u8],
+        headers_start: usize,
         max_header_count: usize,
-    ) -> Result<Option<usize>> {
-        WellKnownHeaders::new(scan, flags).apply_contiguous(
-            rest,
-            &mut (),
-            header_count,
-            max_header_count,
-        )
-    }
-
-    fn apply_header<I: HeadInput + ?Sized>(
-        _headers: &mut Self::RawHeaders,
-        input: &I,
-        line: &[u8],
-        line_start: usize,
-        colon_idx: usize,
-        pretrim_start: Option<usize>,
-        pretrim_end: Option<usize>,
-        scan: &mut HeaderScan,
-        flags: &mut Flags,
-        scan_info: Option<&HeaderLineScan>,
-    ) -> Result<()> {
-        let _ = (input, line_start, scan_info);
-        WellKnownHeaders::new(scan, flags).apply(line, colon_idx, pretrim_start, pretrim_end)
-    }
+    ) -> HeaderParse<Self::RawHeaders>;
 
     fn set_header_raw<V: HeaderValue>(
         _headers: &mut Self::RawHeaders,
         _slot: Self::HeaderSlot,
-        _value: &V,
-    ) -> Result<()> {
-        Ok(())
-    }
-
-    fn set_header_name_raw<V: HeaderValue>(
-        _headers: &mut Self::RawHeaders,
-        _name: &[u8],
-        _value: &V,
-    ) -> Result<()> {
-        Ok(())
-    }
-
-    fn set_header_u8<V: HeaderValue>(
-        _headers: &mut Self::RawHeaders,
-        _slot: u8,
         _value: &V,
     ) -> Result<()> {
         Ok(())

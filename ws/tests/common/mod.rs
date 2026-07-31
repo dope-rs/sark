@@ -6,7 +6,7 @@ use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpStream};
 use std::time::Duration;
 
-use dope_extra::harness::Harness;
+use dope_test::Harness;
 use sark_ws::crypto::Crypto;
 use sark_ws::frame::FrameHead;
 use sark_ws::mask::Mask;

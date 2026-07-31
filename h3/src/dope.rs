@@ -1,10 +1,12 @@
 use std::collections::{BTreeSet, HashMap};
+use std::iter;
 use std::mem;
 
-use dope_quic::{ConnHandle, Handler, StreamError, StreamEvent};
-use sark::dispatch::{BodyPlan, BodySource, Decode, PreparedRequest, ResponseEncoder};
-use sark::sark_core::http::{Field, StatusCode};
+use dope_quic::{ConnHandle, Handler, SendBuffer, StreamError, StreamEvent};
+use o3::buffer::{Bytes, InlineBytes, Retained, Shared};
+use sark::dispatch::{BodyPlan, BodySource, Decode, PreparedRequest};
 use sark::service::BodyPolicy;
+use sark_core::http::{Body, Field, ResponseSink, StatusCode};
 
 use crate::{
     Conn, ConnError, ErrorCode, Event, Payload, Role, StreamId, StreamTransport, pump_stream_event,
@@ -52,6 +54,29 @@ impl StreamTransport for QuicTransport<'_> {
 
     fn send_stream(&mut self, stream_id: u64, bytes: &[u8]) -> Result<(), Self::SendError> {
         self.conn.stream_send(stream_id, bytes)
+    }
+
+    fn send_stream_owned(&mut self, stream_id: u64, bytes: Vec<u8>) -> Result<(), Self::SendError> {
+        self.conn
+            .stream_send_buffer(stream_id, SendBuffer::Owned(bytes))
+    }
+
+    fn send_stream_inline(
+        &mut self,
+        stream_id: u64,
+        bytes: InlineBytes,
+    ) -> Result<(), Self::SendError> {
+        self.conn
+            .stream_send_buffer(stream_id, SendBuffer::Inline(bytes))
+    }
+
+    fn send_stream_retained(
+        &mut self,
+        stream_id: u64,
+        bytes: Bytes<Retained>,
+    ) -> Result<(), Self::SendError> {
+        self.conn
+            .stream_send_buffer(stream_id, SendBuffer::Retained(bytes))
     }
 
     fn finish_stream(&mut self, stream_id: u64) -> Result<(), Self::SendError> {
@@ -173,28 +198,14 @@ impl<'a> H3Encoder<'a> {
     }
 }
 
-impl ResponseEncoder for H3Encoder<'_> {
-    fn emit(&mut self, status: StatusCode, headers_wire: &[u8], body: &[u8]) {
+impl ResponseSink for H3Encoder<'_> {
+    fn emit<'a, 'body, I>(&mut self, status: StatusCode, headers: I, body: Body<'body>)
+    where
+        I: Iterator<Item = Field<'a>>,
+    {
         let status_str = status.as_str();
-        let mut fields: Vec<Field> = Vec::with_capacity(8);
-        fields.push(Field::new(b":status", status_str.as_bytes()));
-        for line in headers_wire.split(|&b| b == b'\n') {
-            let line = match line.strip_suffix(b"\r") {
-                Some(stripped) => stripped,
-                None => line,
-            };
-            if line.is_empty() {
-                continue;
-            }
-            if let Some(colon) = line.iter().position(|&b| b == b':') {
-                let name = &line[..colon];
-                let mut value = &line[colon + 1..];
-                while let Some((&b' ', rest)) = value.split_first() {
-                    value = rest;
-                }
-                fields.push(Field::new(name, value));
-            }
-        }
+        let fields = iter::once(Field::new(b":status", status_str.as_bytes()))
+            .chain(headers.map(|field| Field::new(field.name, field.value)));
         if self
             .conn
             .send_headers(self.stream_id, fields, false)
@@ -203,7 +214,24 @@ impl ResponseEncoder for H3Encoder<'_> {
             self.ok = false;
             return;
         }
-        if self.conn.send_data(self.stream_id, body, true).is_err() {
+        let result = match body {
+            Body::Owned(bytes) => self.conn.send_data_owned(self.stream_id, bytes, true),
+            Body::Shared(bytes) => {
+                self.conn
+                    .send_data_retained(self.stream_id, Bytes::<Retained>::from(bytes), true)
+            }
+            Body::Borrowed(bytes) => {
+                self.conn
+                    .send_data_owned(self.stream_id, bytes.as_slice().to_vec(), true)
+            }
+            Body::Retained(bytes) => self.conn.send_data_retained(self.stream_id, bytes, true),
+            Body::StaticSlice(bytes) => self.conn.send_data_retained(
+                self.stream_id,
+                Bytes::<Retained>::from(Shared::from_static(bytes)),
+                true,
+            ),
+        };
+        if result.is_err() {
             self.ok = false;
         }
     }

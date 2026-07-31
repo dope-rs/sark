@@ -127,13 +127,25 @@ impl BodyPlan {
         }
     }
 
+    pub(super) fn rewrite_json_field(&self, field: &mut syn::Field) {
+        let BodySource::Json(ty) = &self.source else {
+            return;
+        };
+        if field.ident.as_ref().is_some_and(|ident| ident == "body") {
+            field.ty = syn::parse_quote!(
+                <#ty as ::sark::json::JsonRequestDecode>::View<'req>
+            );
+        }
+    }
+
     pub(super) fn parsed_body_impl(&self) -> TokenStream {
         match &self.source {
             BodySource::Json(ty) => quote! {
-                type ParsedBody<'req> = #ty;
+                type ParsedBody<'req> =
+                    <#ty as sark::json::JsonRequestDecode>::View<'req>;
 
                 fn parse_body<'req>(raw: &'req [u8]) -> sark::error::Result<Self::ParsedBody<'req>> {
-                    <#ty as sark::json::JsonDecode>::decode_json_borrowed(raw)
+                    <#ty as sark::json::JsonRequestDecode>::decode_request(raw)
                 }
             },
             BodySource::Discarded | BodySource::Raw(_) => quote! {
@@ -149,7 +161,9 @@ impl BodyPlan {
 
     pub(super) fn parsed_body_param_ty(&self) -> TokenStream {
         match &self.source {
-            BodySource::Json(ty) => quote!(#ty),
+            BodySource::Json(ty) => {
+                quote!(<#ty as sark::json::JsonRequestDecode>::View<'req>)
+            }
             BodySource::Discarded | BodySource::Raw(_) => quote!(()),
         }
     }

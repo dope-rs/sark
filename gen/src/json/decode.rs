@@ -9,24 +9,58 @@ use crate::util::TypeExt;
 pub(super) struct Decoder<'a> {
     ty: &'a Type,
     mode: FieldMode,
+    request_view: bool,
 }
 
 impl<'a> Decoder<'a> {
     pub(super) fn new(ty: &'a Type, mode: FieldMode) -> Self {
-        Self { ty, mode }
+        Self {
+            ty,
+            mode,
+            request_view: false,
+        }
+    }
+
+    pub(super) fn request_view(ty: &'a Type, mode: FieldMode) -> Self {
+        Self {
+            ty,
+            mode,
+            request_view: true,
+        }
     }
 
     pub(super) fn expr(&self) -> Result<TokenStream> {
         if self.mode.seq {
+            if self.request_view {
+                return Err(syn::Error::new_spanned(
+                    self.ty,
+                    "request JSON views support only flat fields",
+                ));
+            }
             let elem = self.ty.vec_inner().ok_or_else(|| {
                 syn::Error::new_spanned(self.ty, "#[field(seq)] requires a Vec<T> field")
             })?;
             let push = if self.mode.nested {
                 quote!(__v.push(
-                    <#elem as sark::json::JsonDecode>::decode_json_borrowed(&__raw[__vs..__idx])?
+                    <#elem as sark::json::JsonDecode>::decode_json_borrowed(
+                        &__raw[__vs..__idx]
+                    )?
                 );)
             } else {
-                quote!(__v.push(sark::json::Parse::frame(&__bytes, &mut __idx)?);)
+                match Classified::of(elem)?.scalar {
+                    Scalar::Retained => {
+                        quote!(__v.push(sark::json::Parse::frame(
+                            &__bytes,
+                            &mut __idx,
+                        )?);)
+                    }
+                    _ => {
+                        return Err(syn::Error::new_spanned(
+                            elem,
+                            "unsupported JSON sequence field type",
+                        ));
+                    }
+                }
             };
             let capture = if self.mode.nested {
                 quote! {
@@ -58,12 +92,20 @@ impl<'a> Decoder<'a> {
             }});
         }
         if self.mode.nested {
+            if self.request_view {
+                return Err(syn::Error::new_spanned(
+                    self.ty,
+                    "request JSON views support only flat fields",
+                ));
+            }
             let ty = self.ty;
             return Ok(quote! {{
                 sark::json::Scan::ws(__raw, &mut __idx);
                 let __vs = __idx;
                 sark::json::Scan::skip_value(__raw, &mut __idx)?;
-                <#ty as sark::json::JsonDecode>::decode_json_borrowed(&__raw[__vs..__idx])?
+                <#ty as sark::json::JsonDecode>::decode_json_borrowed(
+                    &__raw[__vs..__idx]
+                )?
             }});
         }
         let class = Classified::of(self.ty)?;
@@ -76,7 +118,26 @@ impl<'a> Decoder<'a> {
                 ));
             }
             Scalar::Bool => quote!(sark::json::Parse::bool(__raw, &mut __idx)?),
+            Scalar::Borrowed => {
+                if !self.request_view {
+                    return Err(syn::Error::new_spanned(
+                        self.ty,
+                        "borrowed JSON bytes are available only in request views",
+                    ));
+                }
+                if self.mode.raw {
+                    quote!(sark::json::Parse::frame_raw(__raw, &mut __idx)?)
+                } else {
+                    quote!(sark::json::Parse::frame_plain(__raw, &mut __idx)?)
+                }
+            }
             Scalar::Retained => {
+                if self.request_view {
+                    return Err(syn::Error::new_spanned(
+                        self.ty,
+                        "retained JSON bytes must be rewritten for request views",
+                    ));
+                }
                 if self.mode.raw {
                     quote!(sark::json::Parse::frame_raw(&__bytes, &mut __idx)?)
                 } else if self.mode.plain {
@@ -84,6 +145,15 @@ impl<'a> Decoder<'a> {
                 } else {
                     quote!(sark::json::Parse::frame(&__bytes, &mut __idx)?)
                 }
+            }
+            Scalar::JsonBytes => {
+                if !self.request_view {
+                    return Err(syn::Error::new_spanned(
+                        self.ty,
+                        "JsonBytes is available only in request views",
+                    ));
+                }
+                quote!(sark::json::Parse::frame(__raw, &mut __idx)?)
             }
             Scalar::InlineToken => {
                 if self.mode.plain && !self.mode.raw {
@@ -120,7 +190,13 @@ impl<'a> Decoder<'a> {
                 ));
             }
             Scalar::Bool => quote!(false),
+            Scalar::Borrowed => {
+                quote!(sark::sark_core::http::Bytes::<
+                    sark::sark_core::http::Borrowed<'req>,
+                >::from(&[]))
+            }
             Scalar::Retained => quote!(sark::json::Parse::empty_frame()),
+            Scalar::JsonBytes => quote!(sark::json::Parse::empty_view()),
             Scalar::InlineToken => quote!(sark::json::InlineToken::new()),
         })
     }

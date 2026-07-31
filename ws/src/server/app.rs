@@ -4,11 +4,17 @@ use dope::{
     DriverContext,
     manifold::{
         Outcome,
-        listener::{self, Application, SlotEgress},
+        listener::{
+            application::{Application, ApplicationHooks},
+            egress::SlotEgress,
+            state::{EgressCtx, State},
+        },
     },
 };
 use dope_net::{link::slot::Slot, wire::identity::Identity};
-use o3::buffer::RetainBytes;
+use o3::buffer::{Bytes, RetainBytes, Retained};
+use sark::service::{HeaderParse, RouteRequestImpl};
+use sark_core::http::codec::RequestLine;
 
 use crate::{
     crypto::Crypto,
@@ -29,6 +35,18 @@ const HANDSHAKE_PREFIX: &[u8] = b"HTTP/1.1 101 Switching Protocols\r\nConnection
 const HANDSHAKE_SUFFIX: &[u8] = b"\r\n\r\n";
 const BAD_REQUEST: &[u8] =
     b"HTTP/1.1 400 Bad Request\r\nConnection: close\r\nContent-Length: 0\r\n\r\n";
+
+#[sark_gen::request]
+struct WsHandshakeRequest {
+    #[header("upgrade", default = "")]
+    upgrade: Bytes<Retained>,
+    #[header("connection", default = "")]
+    connection: Bytes<Retained>,
+    #[header("sec-websocket-version", default = "")]
+    version: Bytes<Retained>,
+    #[header("sec-websocket-key", default = "")]
+    key: Bytes<Retained>,
+}
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Phase {
@@ -246,44 +264,40 @@ impl<H: Handler> App<H> {
 impl<'d, H: Handler> Application<'d> for App<H> {
     type Conn = ConnState;
     type Wire = Identity;
+    type Hooks = Self;
+}
 
+impl<'d, H: Handler> ApplicationHooks<'d, App<H>> for App<H> {
     fn chunk<R: RetainBytes>(
-        self: Pin<&mut Self>,
-        slot: &mut Slot<'d, Identity, listener::State<ConnState>>,
+        app: Pin<&mut App<H>>,
+        slot: &mut Slot<'d, Identity, State<ConnState>>,
+        mut egress: EgressCtx<'_, '_>,
         chunk: R,
-        aux: &mut listener::Aux,
         driver: &mut DriverContext<'_, 'd>,
     ) -> Outcome {
-        self.get_mut()
-            .chunk_proj(slot, identity_mut, chunk, aux, driver)
+        app.get_mut()
+            .chunk_proj(slot, identity_mut, chunk, &mut egress, driver)
     }
 
     fn send(
-        self: Pin<&mut Self>,
-        slot: &mut Slot<'d, Identity, listener::State<ConnState>>,
+        app: Pin<&mut App<H>>,
+        slot: &mut Slot<'d, Identity, State<ConnState>>,
+        mut egress: EgressCtx<'_, '_>,
         sent: usize,
-        aux: &mut listener::Aux,
         driver: &mut DriverContext<'_, 'd>,
     ) {
-        self.get_mut()
-            .send_proj(slot, sent, identity_mut, aux, driver)
-    }
-
-    fn close(
-        self: Pin<&mut Self>,
-        _slot: &mut Slot<'d, Identity, listener::State<ConnState>>,
-        _aux: &mut listener::Aux,
-    ) {
+        app.get_mut()
+            .send_proj(slot, sent, identity_mut, &mut egress, driver)
     }
 }
 
 impl<H: Handler> App<H> {
     pub fn chunk_proj<'d, C: Default + 'static, R: RetainBytes>(
         &mut self,
-        slot: &mut Slot<'d, Identity, listener::State<C>>,
+        slot: &mut Slot<'d, Identity, State<C>>,
         project: impl Fn(&mut C) -> &mut ConnState,
         chunk: R,
-        aux: &mut listener::Aux,
+        egress: &mut EgressCtx<'_, '_>,
         driver: &mut DriverContext<'_, 'd>,
     ) -> Outcome {
         if project(&mut slot.state.conn).phase == Phase::Closed {
@@ -299,7 +313,7 @@ impl<H: Handler> App<H> {
 
         if fast {
             let send_ud = slot.token();
-            let mut write_buf = aux.write_buf_for(slot);
+            let mut write_buf = egress.write_buf_for(slot);
             let frame_cap = self.frame_cap();
             let user = &self.user;
             let scratch = &mut self.scratch;
@@ -338,38 +352,38 @@ impl<H: Handler> App<H> {
             state.phase = Phase::Closed;
             state.acc = Vec::new();
             if !slot.is_send_inflight() {
-                self.emit_close_proj(slot, CLOSE_MESSAGE_TOO_BIG, aux, driver, &project);
+                self.emit_close_proj(slot, CLOSE_MESSAGE_TOO_BIG, egress, driver, &project);
             }
             return Outcome::CloseAfter;
         }
         if !slot.is_send_inflight() {
-            self.pump_proj(slot, aux, driver, &project);
+            self.pump_proj(slot, egress, driver, &project);
         }
         Outcome::Ok
     }
 
     pub fn send_proj<'d, C: Default + 'static>(
         &mut self,
-        slot: &mut Slot<'d, Identity, listener::State<C>>,
+        slot: &mut Slot<'d, Identity, State<C>>,
         _sent: usize,
         project: impl Fn(&mut C) -> &mut ConnState,
-        aux: &mut listener::Aux,
+        egress: &mut EgressCtx<'_, '_>,
         driver: &mut DriverContext<'_, 'd>,
     ) {
         if project(&mut slot.state.conn).phase != Phase::Closed {
-            self.pump_proj(slot, aux, driver, &project);
+            self.pump_proj(slot, egress, driver, &project);
         }
     }
 
     fn pump_proj<'d, C: Default + 'static, P: Fn(&mut C) -> &mut ConnState>(
         &self,
-        slot: &mut Slot<'d, Identity, listener::State<C>>,
-        aux: &mut listener::Aux,
+        slot: &mut Slot<'d, Identity, State<C>>,
+        egress: &mut EgressCtx<'_, '_>,
         driver: &mut DriverContext<'_, 'd>,
         project: &P,
     ) {
         let send_ud = slot.token();
-        let mut write_buf = aux.write_buf_for(slot);
+        let mut write_buf = egress.write_buf_for(slot);
         let (written, close_after) = {
             let mut response = Response::new(&mut write_buf);
             let state = project(&mut slot.state.conn);
@@ -391,14 +405,14 @@ impl<H: Handler> App<H> {
 
     fn emit_close_proj<'d, C: Default + 'static, P: Fn(&mut C) -> &mut ConnState>(
         &self,
-        slot: &mut Slot<'d, Identity, listener::State<C>>,
+        slot: &mut Slot<'d, Identity, State<C>>,
         code: u16,
-        aux: &mut listener::Aux,
+        egress: &mut EgressCtx<'_, '_>,
         driver: &mut DriverContext<'_, 'd>,
         _project: &P,
     ) {
         let send_ud = slot.token();
-        let mut write_buf = aux.write_buf_for(slot);
+        let mut write_buf = egress.write_buf_for(slot);
         let written = {
             let mut response = Response::new(&mut write_buf);
             response.send_close_code(code);
@@ -411,20 +425,18 @@ impl<H: Handler> App<H> {
     }
 
     fn try_handshake(&self, state: &mut ConnState, response: &mut Response<'_>) {
-        use sark_core::http::codec::ParsedRequestHead;
+        use sark_core::http::codec::request_head_end;
         if state.acc.len() > MAX_HANDSHAKE_BYTES {
             state.phase = Phase::Closed;
             response.put_raw(BAD_REQUEST);
             response.close_after = true;
             return;
         }
-        let Some(crlf) = ParsedRequestHead::head_end(&state.acc) else {
+        let Some(crlf) = request_head_end(&state.acc) else {
             return;
         };
         let head_len = crlf.end;
-        let key = from_utf8(&state.acc[..head_len])
-            .ok()
-            .and_then(|s| Self::validate_handshake(s, self.expected_path).ok());
+        let key = Self::validate_handshake(&state.acc[..head_len], self.expected_path).ok();
         let Some(key) = key else {
             state.phase = Phase::Closed;
             response.put_raw(BAD_REQUEST);
@@ -445,53 +457,41 @@ impl<H: Handler> App<H> {
         state.acc.drain(..head_len);
     }
 
-    fn validate_handshake(head: &str, expected_path: &str) -> Result<String, ()> {
-        use sark_core::http::head::HeaderLines;
-        let (request, rest) = head.split_once("\r\n").unwrap_or((head, ""));
-        let mut parts = request.split_whitespace();
-        let method = parts.next().unwrap_or("");
-        let target = parts.next().unwrap_or("");
-        let version = parts.next().unwrap_or("");
-        if method != "GET" || version != "HTTP/1.1" {
+    fn validate_handshake(head: &[u8], expected_path: &str) -> Result<String, ()> {
+        let request = RequestLine::parse(head).map_err(|_| ())?.ok_or(())?;
+        if request.method != b"GET" || request.version != b"HTTP/1.1" {
             return Err(());
         }
-        if !expected_path.is_empty() && target != expected_path {
+        if !expected_path.is_empty() && request.target != expected_path.as_bytes() {
             return Err(());
         }
-        let mut upgrade = None::<&str>;
-        let mut connection = None::<&str>;
-        let mut ws_version = None::<&str>;
-        let mut key = None::<&str>;
-        for (name, value) in HeaderLines::new(rest.as_bytes()) {
-            let Ok(value) = from_utf8(value) else {
-                continue;
-            };
-            if name.eq_ignore_ascii_case(b"upgrade") {
-                upgrade = Some(value);
-            } else if name.eq_ignore_ascii_case(b"connection") {
-                connection = Some(value);
-            } else if name.eq_ignore_ascii_case(b"sec-websocket-version") {
-                ws_version = Some(value);
-            } else if name.eq_ignore_ascii_case(b"sec-websocket-key") {
-                key = Some(value);
-            }
-        }
-        let upgrade = upgrade.ok_or(())?;
+        let HeaderParse::Ready { headers, .. } =
+            WsHandshakeRequest::parse_headers::<false>(head, request.headers_start, 128)
+        else {
+            return Err(());
+        };
+        let header = |range: Option<std::ops::Range<usize>>| {
+            range
+                .and_then(|range| head.get(range))
+                .and_then(|value| from_utf8(value).ok())
+                .ok_or(())
+        };
+        let upgrade = header(headers.upgrade)?;
         if !upgrade.eq_ignore_ascii_case("websocket") {
             return Err(());
         }
-        let connection = connection.ok_or(())?;
+        let connection = header(headers.connection)?;
         if !connection
             .split(',')
             .any(|p| p.trim().eq_ignore_ascii_case("upgrade"))
         {
             return Err(());
         }
-        let ws_version = ws_version.ok_or(())?;
+        let ws_version = header(headers.version)?;
         if ws_version != "13" {
             return Err(());
         }
-        let key = key.ok_or(())?;
+        let key = header(headers.key)?;
         Ok(key.to_string())
     }
 

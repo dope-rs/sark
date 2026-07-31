@@ -2,7 +2,11 @@ use std::pin::Pin;
 
 use dope::{
     DriverContext,
-    manifold::listener::{self, SlotEgress, recv::ExtendOutcome, send::WRITE_BUF_CAP},
+    manifold::listener::{
+        egress::SlotEgress,
+        recv::ExtendOutcome,
+        state::{EgressCtx, State, WRITE_BUF_CAP},
+    },
 };
 use dope_net::{link::slot::Slot, wire::Wire};
 use o3::buffer::{Pooled, Shared};
@@ -52,8 +56,8 @@ impl Pipeline {
         false
     }
 
-    fn drain_consumed(state: &mut ConnState, off: usize) {
-        state.recv.advance(off);
+    fn drain_consumed(state: &mut ConnState, off: usize) -> bool {
+        state.recv.try_advance(off)
     }
 
     fn finish_frame(&mut self, recv: &mut Recv) {
@@ -264,8 +268,8 @@ impl Pipeline {
     }
 
     pub(super) fn emit<'d, W: Wire, C: Default + 'static, P: Fn(&mut C) -> &mut ConnState>(
-        slot: &mut Slot<'d, W, listener::State<C>>,
-        aux: &mut listener::Aux,
+        slot: &mut Slot<'d, W, State<C>>,
+        egress: &mut EgressCtx<'_, '_>,
         driver: &mut DriverContext<'_, 'd>,
         out: LoopOutcome,
         use_accumulator: bool,
@@ -276,15 +280,11 @@ impl Pipeline {
         let will_freeze =
             pending && matches!(out.final_action, Some(Outcome::Park | Outcome::Send { .. }));
 
-        if will_freeze {
-            if use_accumulator {
-                Self::drain_consumed(project(&mut slot.state.conn), out.off);
-            } else if Self::absorb(project(&mut slot.state.conn), &plaintext[out.off..]) {
+        if use_accumulator {
+            if !Self::drain_consumed(project(&mut slot.state.conn), out.off) {
                 slot.set_close_after();
                 return true;
             }
-        } else if use_accumulator {
-            Self::drain_consumed(project(&mut slot.state.conn), out.off);
         } else if Self::absorb(project(&mut slot.state.conn), &plaintext[out.off..]) {
             slot.set_close_after();
             return true;
@@ -295,7 +295,7 @@ impl Pipeline {
             project(&mut slot.state.conn).recv.freeze();
             let accepted = match out.final_action {
                 Some(Outcome::Send { written, .. }) => {
-                    let buf = aux.write_buf_for(slot);
+                    let buf = egress.write_buf_for(slot);
                     let ud = slot.token();
                     slot.submit_buffered(buf, written, ud, driver)
                 }
@@ -312,7 +312,7 @@ impl Pipeline {
             if out.close_after {
                 slot.set_close_after();
             }
-            let buf = aux.write_buf_for(slot);
+            let buf = egress.write_buf_for(slot);
             let ud = slot.token();
             let accepted = match body {
                 SplitBody::Static(body) => {
@@ -333,7 +333,7 @@ impl Pipeline {
             if out.close_after {
                 slot.set_close_after();
             }
-            let buf = aux.write_buf_for(slot);
+            let buf = egress.write_buf_for(slot);
             let ud = slot.token();
             !slot.submit_buffered(buf, out.cursor, ud, driver)
         } else if let Some(act) = out.final_action {
@@ -357,7 +357,7 @@ impl Pipeline {
                 other => other,
             };
             let close = matches!(act, Outcome::Close(r) if r.is_empty());
-            close || !act.apply(slot, aux, driver)
+            close || !act.apply(slot, egress, driver)
         } else {
             false
         }

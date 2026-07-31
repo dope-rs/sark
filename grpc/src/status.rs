@@ -121,14 +121,13 @@ impl Status {
         }
     }
 
-    pub fn encoded_message_len(message: &str) -> usize {
-        message.as_bytes().iter().fold(0usize, |len, &byte| {
+    pub fn encoded_message_len(message: &str) -> Option<usize> {
+        message.as_bytes().iter().try_fold(0usize, |len, &byte| {
             len.checked_add(if matches!(byte, b' '..=b'~') && byte != b'%' {
                 1
             } else {
                 3
             })
-            .expect("encoded gRPC message length overflow")
         })
     }
 

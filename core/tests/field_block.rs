@@ -1,4 +1,4 @@
-use sark_core::http::{Field, OwnedFieldBlock, PooledFieldBlock, VecFieldBlock};
+use sark_core::http::{Field, OwnedFieldBlock, PackedFieldError, PooledFieldBlock, VecFieldBlock};
 
 #[test]
 fn owned_and_packed_storage_expose_the_same_fields() {
@@ -7,7 +7,7 @@ fn owned_and_packed_storage_expose_the_same_fields() {
         Field::new(b"content-type", b"application/grpc"),
         Field::new(b"x-request-id", b"42"),
     ];
-    let packed = PooledFieldBlock::from_fields(&fields);
+    let packed = PooledFieldBlock::from_fields(&fields).unwrap();
     let mut owned = OwnedFieldBlock::new();
     for field in fields {
         owned.push(field.name, field.value);
@@ -19,8 +19,8 @@ fn owned_and_packed_storage_expose_the_same_fields() {
 
 #[test]
 fn packed_blocks_append_without_repacking() {
-    let mut headers = PooledFieldBlock::from_fields(&[Field::new(b":status", b"200")]);
-    let trailers = PooledFieldBlock::from_fields(&[Field::new(b"grpc-status", b"0")]);
+    let mut headers = PooledFieldBlock::from_fields(&[Field::new(b":status", b"200")]).unwrap();
+    let trailers = PooledFieldBlock::from_fields(&[Field::new(b"grpc-status", b"0")]).unwrap();
     headers.append(trailers).expect("second segment");
 
     let fields: Vec<_> = headers.iter().collect();
@@ -60,7 +60,7 @@ fn generated_parts_are_written_directly_and_rollback_on_error() {
         },
     );
 
-    assert_eq!(error, Err("decode failed"));
+    assert_eq!(error, Err(PackedFieldError::Write("decode failed")));
     assert_eq!(
         fields.iter().collect::<Vec<_>>(),
         [Field::new(b"x-generated", b"direct")]

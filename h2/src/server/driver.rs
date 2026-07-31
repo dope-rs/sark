@@ -1,3 +1,5 @@
+use o3::buffer::{Bytes, Retained};
+
 use crate::conn::{Conn, ConnError};
 use crate::role::ServerRole;
 
@@ -26,7 +28,22 @@ where
             return Ok(());
         }
 
-        let mut result = self.transport.connection().ingest(bytes);
+        let result = self.transport.connection().ingest(bytes);
+        self.drain(result)
+    }
+
+    pub fn ingest_retained(&mut self, bytes: Bytes<Retained>) -> Result<(), ConnError> {
+        if self.transport.connection().goaway_sent()
+            || self.transport.connection().goaway_received().is_some()
+        {
+            return Ok(());
+        }
+
+        let result = self.transport.connection().ingest_retained(bytes);
+        self.drain(result)
+    }
+
+    fn drain(&mut self, mut result: Result<(), ConnError>) -> Result<(), ConnError> {
         loop {
             let drained = self.transport.drain_events();
             match result {

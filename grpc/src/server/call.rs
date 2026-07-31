@@ -158,8 +158,9 @@ impl CallStore {
     }
 
     pub(super) fn get_mut(&mut self, stream_id: StreamId) -> Option<&mut CallRecord> {
-        self.records
-            .get_mut(u64::from(stream_id.0), |call| call.stream_id == stream_id)
+        self.records.get_mut(u64::from(stream_id.as_u32()), |call| {
+            call.stream_id == stream_id
+        })
     }
 
     pub(super) fn stream_mut(&mut self, stream_id: StreamId) -> Option<&mut StreamState> {
@@ -169,7 +170,7 @@ impl CallStore {
     pub(super) fn insert(&mut self, stream_id: StreamId, stream: StreamState) -> bool {
         self.records
             .try_insert(
-                u64::from(stream_id.0),
+                u64::from(stream_id.as_u32()),
                 CallRecord {
                     stream_id,
                     stream: Some(stream),
@@ -196,7 +197,9 @@ impl CallStore {
             buffered_total,
         } = self;
         let Some(stream) = records
-            .get_mut(u64::from(stream_id.0), |call| call.stream_id == stream_id)
+            .get_mut(u64::from(stream_id.as_u32()), |call| {
+                call.stream_id == stream_id
+            })
             .and_then(|call| call.stream.as_mut())
         else {
             return Err(());
@@ -241,8 +244,9 @@ impl CallStore {
     }
 
     pub(super) fn remove(&mut self, stream_id: StreamId) -> Option<CallRecord> {
-        self.records
-            .remove(u64::from(stream_id.0), |call| call.stream_id == stream_id)
+        self.records.remove(u64::from(stream_id.as_u32()), |call| {
+            call.stream_id == stream_id
+        })
     }
 
     pub(super) fn release_stream(&mut self, stream: &StreamState) {
@@ -259,12 +263,14 @@ impl CallStore {
     pub(super) fn remove_empty(&mut self, stream_id: StreamId) {
         let empty = self
             .records
-            .get(u64::from(stream_id.0), |call| call.stream_id == stream_id)
+            .get(u64::from(stream_id.as_u32()), |call| {
+                call.stream_id == stream_id
+            })
             .is_some_and(|call| call.stream.is_none() && call.pending.is_none());
         if empty {
-            let _ = self
-                .records
-                .remove(u64::from(stream_id.0), |call| call.stream_id == stream_id);
+            let _ = self.records.remove(u64::from(stream_id.as_u32()), |call| {
+                call.stream_id == stream_id
+            });
         }
     }
 

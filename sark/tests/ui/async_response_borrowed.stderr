@@ -4,19 +4,18 @@ error[E0277]: the trait bound `BorrowedReply<'static>: OwnedShape` is not satisf
 17 | async fn borrowed(_request: Req, _state: &()) -> BorrowedReply<'static> {
    |                                                  ^^^^^^^^^^^^^^^^^^^^^^ unsatisfied trait bound
    |
-help: the trait `sark::http::__private::GeneratedResponse` is not implemented for `BorrowedReply<'static>`
+help: the trait `sark::http::__private::OwnedResponse` is not implemented for `BorrowedReply<'static>`
   --> tests/ui/async_response_borrowed.rs:9:1
    |
  9 | struct BorrowedReply<'req> {
    | ^^^^^^^^^^^^^^^^^^^^^^^^^^
-help: the following other types implement trait `OwnedShape`
-  --> $WORKSPACE/core/src/http/response/owned_shape.rs
+help: the following other types implement trait `sark::http::__private::OwnedResponse`
+  --> $WORKSPACE/core/src/http/response/into_response_shape.rs
    |
-   | impl OwnedShape for Response {
-   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^ `sark::http::Response`
-...
-   | impl OwnedShape for Chunked {
-   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^ `sark::http::Chunked`
+   | impl super::super::__private::OwnedResponse for Response {}
+   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ `sark::http::Response`
+   | impl super::super::__private::OwnedResponse for super::Chunked {}
+   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ `sark::http::Chunked`
    = note: required for `BorrowedReply<'static>` to implement `OwnedShape`
 note: required by a bound in `sark::service::RouteSpec::AsyncResponse`
   --> src/service/spec.rs
@@ -30,35 +29,33 @@ error[E0277]: the trait bound `BorrowedReply<'static>: OwnedShape` is not satisf
 17 | async fn borrowed(_request: Req, _state: &()) -> BorrowedReply<'static> {
    |                                                  ^^^^^^^^^^^^^^^^^^^^^^ unsatisfied trait bound
    |
-help: the trait `sark::http::__private::GeneratedResponse` is not implemented for `BorrowedReply<'static>`
+help: the trait `sark::http::__private::OwnedResponse` is not implemented for `BorrowedReply<'static>`
   --> tests/ui/async_response_borrowed.rs:9:1
    |
  9 | struct BorrowedReply<'req> {
    | ^^^^^^^^^^^^^^^^^^^^^^^^^^
-help: the following other types implement trait `OwnedShape`
-  --> $WORKSPACE/core/src/http/response/owned_shape.rs
+help: the following other types implement trait `sark::http::__private::OwnedResponse`
+  --> $WORKSPACE/core/src/http/response/into_response_shape.rs
    |
-   | impl OwnedShape for Response {
-   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^ `sark::http::Response`
-...
-   | impl OwnedShape for Chunked {
-   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^ `sark::http::Chunked`
+   | impl super::super::__private::OwnedResponse for Response {}
+   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ `sark::http::Response`
+   | impl super::super::__private::OwnedResponse for super::Chunked {}
+   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ `sark::http::Chunked`
    = note: required for `BorrowedReply<'static>` to implement `OwnedShape`
 
 error[E0277]: the trait bound `FixedResponse<'static, 4>: OwnedShape` is not satisfied
   --> tests/ui/async_response_borrowed.rs:28:21
    |
 28 |     require_owned::<FixedResponse<'static>>();
-   |                     ^^^^^^^^^^^^^^^^^^^^^^ the trait `sark::http::__private::GeneratedResponse` is not implemented for `FixedResponse<'static, 4>`
+   |                     ^^^^^^^^^^^^^^^^^^^^^^ the trait `sark::http::__private::OwnedResponse` is not implemented for `FixedResponse<'static, 4>`
    |
-help: the following other types implement trait `OwnedShape`
-  --> $WORKSPACE/core/src/http/response/owned_shape.rs
+help: the following other types implement trait `sark::http::__private::OwnedResponse`
+  --> $WORKSPACE/core/src/http/response/into_response_shape.rs
    |
-   | impl OwnedShape for Response {
-   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^ `sark::http::Response`
-...
-   | impl OwnedShape for Chunked {
-   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^ `sark::http::Chunked`
+   | impl super::super::__private::OwnedResponse for Response {}
+   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ `sark::http::Response`
+   | impl super::super::__private::OwnedResponse for super::Chunked {}
+   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ `sark::http::Chunked`
    = note: required for `FixedResponse<'static, 4>` to implement `OwnedShape`
 note: required by a bound in `require_owned`
   --> tests/ui/async_response_borrowed.rs:25:21
@@ -70,16 +67,15 @@ error[E0277]: the trait bound `Serve<'static, 4>: OwnedShape` is not satisfied
   --> tests/ui/async_response_borrowed.rs:29:21
    |
 29 |     require_owned::<Serve<'static>>();
-   |                     ^^^^^^^^^^^^^^ the trait `sark::http::__private::GeneratedResponse` is not implemented for `Serve<'static, 4>`
+   |                     ^^^^^^^^^^^^^^ the trait `sark::http::__private::OwnedResponse` is not implemented for `Serve<'static, 4>`
    |
-help: the following other types implement trait `OwnedShape`
-  --> $WORKSPACE/core/src/http/response/owned_shape.rs
+help: the following other types implement trait `sark::http::__private::OwnedResponse`
+  --> $WORKSPACE/core/src/http/response/into_response_shape.rs
    |
-   | impl OwnedShape for Response {
-   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^ `sark::http::Response`
-...
-   | impl OwnedShape for Chunked {
-   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^ `sark::http::Chunked`
+   | impl super::super::__private::OwnedResponse for Response {}
+   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ `sark::http::Response`
+   | impl super::super::__private::OwnedResponse for super::Chunked {}
+   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ `sark::http::Chunked`
    = note: required for `Serve<'static, 4>` to implement `OwnedShape`
 note: required by a bound in `require_owned`
   --> tests/ui/async_response_borrowed.rs:25:21

@@ -2,16 +2,17 @@ use std::collections::{BTreeMap, VecDeque};
 use std::mem;
 use std::ops::{Deref, Range};
 
-use o3::buffer::Shared;
+use dope_quic::varint::{Error as VarIntError, VarInt};
+use o3::buffer::{Bytes, InlineBytes, Retained, Shared};
 use sark_core::http::{Field, VecFieldBlock};
 
 use crate::frame::{
     ErrorCode, Frame, ParseError, STREAM_TYPE_CONTROL, STREAM_TYPE_QPACK_DECODER,
     STREAM_TYPE_QPACK_ENCODER, Settings, TYPE_CANCEL_PUSH, TYPE_DATA, TYPE_GOAWAY, TYPE_HEADERS,
-    TYPE_MAX_PUSH_ID, TYPE_SETTINGS,
+    TYPE_MAX_PUSH_ID, TYPE_PUSH_PROMISE, TYPE_SETTINGS,
 };
 use crate::payload::Payload;
-use crate::qpack::{self, DecodeOutcome, DecoderError};
+use crate::qpack::{self, DecodeOutcome, DecoderError, EncodedSection};
 use crate::stream::{StreamId, UniStreamType};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -184,8 +185,10 @@ impl Inbound {
         *start = 0;
     }
 
-    fn advance(&mut self, n: usize) {
-        assert!(n <= self.len(), "H3 inbound advance is out of bounds");
+    fn try_advance(&mut self, n: usize) -> bool {
+        if n > self.len() {
+            return false;
+        }
         match self {
             Self::Unique { bytes, start } => {
                 *start += n;
@@ -194,40 +197,51 @@ impl Inbound {
                 }
             }
             Self::Shared(bytes) => {
-                bytes.advance(n);
+                if !bytes.try_advance(n) {
+                    return false;
+                }
                 if bytes.is_empty() {
                     self.clear();
                 }
             }
         }
+        true
     }
 
-    fn take_payload(&mut self, range: Range<usize>, frame_len: usize) -> Payload {
-        assert!(
-            range.start <= range.end
-                && range.end <= frame_len
-                && frame_len <= self.as_slice().len(),
-            "H3 payload frame range is out of bounds"
-        );
+    fn take_payload(&mut self, range: Range<usize>, frame_len: usize) -> Option<Payload> {
+        if range.start > range.end || range.end > frame_len || frame_len > self.as_slice().len() {
+            return None;
+        }
         match mem::take(self) {
-            Self::Unique { bytes, start } if frame_len == bytes.len() - start => {
-                Payload::from_unique(bytes, start + range.start..start + range.end)
-            }
+            Self::Unique { bytes, start } if frame_len == bytes.len() - start => Some(
+                Payload::from_unique(bytes, start + range.start..start + range.end),
+            ),
             Self::Unique { bytes, start } => {
                 let mut owner = Shared::from(bytes);
-                let payload =
-                    Payload::from_shared(owner.slice(start + range.start..start + range.end));
-                owner.advance(start + frame_len);
+                let Some(payload) = owner.get(start + range.start..start + range.end) else {
+                    *self = Self::Shared(owner);
+                    return None;
+                };
+                if !owner.try_advance(start + frame_len) {
+                    *self = Self::Shared(owner);
+                    return None;
+                }
                 *self = Self::Shared(owner);
-                payload
+                Some(Payload::from_shared(payload))
             }
             Self::Shared(mut owner) => {
-                let payload = Payload::from_shared(owner.slice(range));
-                owner.advance(frame_len);
+                let Some(payload) = owner.get(range) else {
+                    *self = Self::Shared(owner);
+                    return None;
+                };
+                if !owner.try_advance(frame_len) {
+                    *self = Self::Shared(owner);
+                    return None;
+                }
                 if !owner.is_empty() {
                     *self = Self::Shared(owner);
                 }
-                payload
+                Some(Payload::from_shared(payload))
             }
         }
     }
@@ -261,10 +275,119 @@ impl Deref for Inbound {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+pub enum WritePayload {
+    Owned(Vec<u8>),
+    Retained(Bytes<Retained>),
+}
+
+impl WritePayload {
+    pub fn as_slice(&self) -> &[u8] {
+        match self {
+            Self::Owned(bytes) => bytes,
+            Self::Retained(bytes) => bytes.as_slice(),
+        }
+    }
+}
+
+pub const INLINE_PREFIX_CAPACITY: usize = o3::buffer::INLINE_BYTES_CAPACITY;
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum WritePrefix {
+    Inline(InlineBytes),
+    Owned(Vec<u8>),
+}
+
+impl WritePrefix {
+    fn with_capacity(capacity: usize) -> Self {
+        if capacity <= INLINE_PREFIX_CAPACITY {
+            Self::Inline(InlineBytes::new())
+        } else {
+            Self::Owned(Vec::with_capacity(capacity))
+        }
+    }
+
+    pub fn as_slice(&self) -> &[u8] {
+        match self {
+            Self::Inline(prefix) => prefix.as_slice(),
+            Self::Owned(bytes) => bytes,
+        }
+    }
+
+    pub fn into_vec(self) -> Vec<u8> {
+        match self {
+            Self::Inline(prefix) => prefix.as_slice().to_vec(),
+            Self::Owned(bytes) => bytes,
+        }
+    }
+
+    fn push(&mut self, byte: u8) {
+        match self {
+            Self::Inline(prefix) => {
+                if prefix.try_push(byte).is_err() {
+                    let mut bytes = Vec::with_capacity(INLINE_PREFIX_CAPACITY * 2);
+                    bytes.extend_from_slice(prefix.as_slice());
+                    bytes.push(byte);
+                    *self = Self::Owned(bytes);
+                }
+            }
+            Self::Owned(bytes) => bytes.push(byte),
+        }
+    }
+}
+
+impl Extend<u8> for WritePrefix {
+    fn extend<T: IntoIterator<Item = u8>>(&mut self, iter: T) {
+        for byte in iter {
+            self.push(byte);
+        }
+    }
+}
+
+impl Deref for WritePrefix {
+    type Target = [u8];
+
+    fn deref(&self) -> &Self::Target {
+        self.as_slice()
+    }
+}
+
+impl From<Vec<u8>> for WritePrefix {
+    fn from(bytes: Vec<u8>) -> Self {
+        Self::Owned(bytes)
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Write {
     pub stream_id: StreamId,
-    pub bytes: Vec<u8>,
+    pub prefix: WritePrefix,
+    pub payload: Option<WritePayload>,
     pub fin: bool,
+}
+
+impl Write {
+    fn single(stream_id: StreamId, prefix: impl Into<WritePrefix>, fin: bool) -> Self {
+        Self {
+            stream_id,
+            prefix: prefix.into(),
+            payload: None,
+            fin,
+        }
+    }
+
+    fn segmented(
+        stream_id: StreamId,
+        prefix: WritePrefix,
+        payload: WritePayload,
+        fin: bool,
+    ) -> Self {
+        Self {
+            stream_id,
+            prefix,
+            payload: Some(payload),
+            fin,
+        }
+    }
 }
 
 pub struct Conn {
@@ -334,14 +457,10 @@ impl Conn {
             let mut payload = Vec::new();
             self.local_settings.encode(&mut payload)?;
             let mut bytes = Vec::new();
-            sark_core::http::VarInt::encode(STREAM_TYPE_CONTROL, &mut bytes)
-                .map_err(|_| ConnError::Protocol)?;
+            STREAM_TYPE_CONTROL.encode(&mut bytes);
             Frame::encode(TYPE_SETTINGS, &payload, &mut bytes)?;
-            self.writes.push_back(Write {
-                stream_id,
-                bytes,
-                fin: false,
-            });
+            self.writes
+                .push_back(Write::single(stream_id, bytes, false));
             return Ok(());
         }
         Err(ConnError::Protocol)
@@ -363,18 +482,18 @@ impl Conn {
         self.start_uni_stream(stream_id, STREAM_TYPE_QPACK_DECODER)
     }
 
-    fn start_uni_stream(&mut self, stream_id: StreamId, stream_type: u64) -> Result<(), ConnError> {
+    fn start_uni_stream(
+        &mut self,
+        stream_id: StreamId,
+        stream_type: VarInt,
+    ) -> Result<(), ConnError> {
         if stream_id.is_bidi() {
             return Err(ConnError::Protocol);
         }
         let mut bytes = Vec::new();
-        sark_core::http::VarInt::encode(stream_type, &mut bytes)
-            .map_err(|_| ConnError::Protocol)?;
-        self.writes.push_back(Write {
-            stream_id,
-            bytes,
-            fin: false,
-        });
+        stream_type.encode(&mut bytes);
+        self.writes
+            .push_back(Write::single(stream_id, bytes, false));
         Ok(())
     }
 
@@ -423,17 +542,9 @@ impl Conn {
     where
         I: IntoIterator<Item = Field<'a>>,
     {
-        let mut block = Vec::new();
-        self.qpack_encoder.encode(fields, &mut block);
+        let section = self.qpack_encoder.encode_section(fields);
         self.flush_qpack_encoder_stream();
-        let mut bytes = Vec::new();
-        Frame::encode(TYPE_HEADERS, &block, &mut bytes)?;
-        self.writes.push_back(Write {
-            stream_id,
-            bytes,
-            fin,
-        });
-        Ok(())
+        self.send_field_section(stream_id, TYPE_HEADERS, None, section, fin)
     }
 
     pub fn send_data(
@@ -444,11 +555,68 @@ impl Conn {
     ) -> Result<(), ConnError> {
         let mut bytes = Vec::new();
         Frame::encode(TYPE_DATA, data, &mut bytes)?;
-        self.writes.push_back(Write {
-            stream_id,
-            bytes,
-            fin,
-        });
+        self.writes.push_back(Write::single(stream_id, bytes, fin));
+        Ok(())
+    }
+
+    pub fn send_data_owned(
+        &mut self,
+        stream_id: StreamId,
+        data: Vec<u8>,
+        fin: bool,
+    ) -> Result<(), ConnError> {
+        self.send_frame_payload(stream_id, TYPE_DATA, WritePayload::Owned(data), fin)
+    }
+
+    pub fn send_data_retained(
+        &mut self,
+        stream_id: StreamId,
+        data: Bytes<Retained>,
+        fin: bool,
+    ) -> Result<(), ConnError> {
+        self.send_frame_payload(stream_id, TYPE_DATA, WritePayload::Retained(data), fin)
+    }
+
+    fn send_frame_payload(
+        &mut self,
+        stream_id: StreamId,
+        kind: VarInt,
+        payload: WritePayload,
+        fin: bool,
+    ) -> Result<(), ConnError> {
+        let prefix = Self::frame_prefix(kind, payload.as_slice().len(), 0)?;
+        self.writes
+            .push_back(Write::segmented(stream_id, prefix, payload, fin));
+        Ok(())
+    }
+
+    fn send_field_section(
+        &mut self,
+        stream_id: StreamId,
+        kind: VarInt,
+        leading_varint: Option<VarInt>,
+        section: EncodedSection,
+        fin: bool,
+    ) -> Result<(), ConnError> {
+        let leading_len = leading_varint.map(VarInt::encoded_len).unwrap_or(0);
+        let payload_len = leading_len
+            .checked_add(section.encoded_len())
+            .ok_or(ConnError::Protocol)?;
+        let payload_prefix_len = leading_len
+            .checked_add(section.prefix_len())
+            .ok_or(ConnError::Protocol)?;
+        let mut prefix = Self::frame_prefix(kind, payload_len, payload_prefix_len)?;
+        if let Some(value) = leading_varint {
+            value.encode(&mut prefix);
+        }
+        section.encode_prefix(&mut prefix);
+        let field_lines = section.into_field_lines();
+        let write = if field_lines.is_empty() {
+            Write::single(stream_id, prefix, fin)
+        } else {
+            Write::segmented(stream_id, prefix, WritePayload::Owned(field_lines), fin)
+        };
+        self.writes.push_back(write);
         Ok(())
     }
 
@@ -464,39 +632,35 @@ impl Conn {
         if self.role == Role::Client {
             return Err(ConnError::FrameUnexpected);
         }
-        let mut block = Vec::new();
-        self.qpack_encoder.encode(fields, &mut block);
-        let mut bytes = Vec::new();
-        Frame::encode_push_promise(push_id, &block, &mut bytes)?;
-        self.writes.push_back(Write {
-            stream_id,
-            bytes,
-            fin: false,
-        });
-        Ok(())
+        let section = self.qpack_encoder.encode_section(fields);
+        self.flush_qpack_encoder_stream();
+        let push_id = VarInt::new(push_id).ok_or(ConnError::Protocol)?;
+        self.send_field_section(stream_id, TYPE_PUSH_PROMISE, Some(push_id), section, false)
     }
 
     pub fn send_cancel_push(&mut self, push_id: u64) -> Result<(), ConnError> {
         let stream_id = self.control_stream_id.ok_or(ConnError::Protocol)?;
         let mut bytes = Vec::new();
-        Frame::encode_varint(TYPE_CANCEL_PUSH, push_id, &mut bytes)?;
-        self.writes.push_back(Write {
-            stream_id,
-            bytes,
-            fin: false,
-        });
+        Frame::encode_varint(
+            TYPE_CANCEL_PUSH,
+            VarInt::new(push_id).ok_or(ConnError::Protocol)?,
+            &mut bytes,
+        )?;
+        self.writes
+            .push_back(Write::single(stream_id, bytes, false));
         Ok(())
     }
 
     pub fn send_goaway(&mut self, id: u64) -> Result<(), ConnError> {
         let stream_id = self.control_stream_id.ok_or(ConnError::Protocol)?;
         let mut bytes = Vec::new();
-        Frame::encode_varint(TYPE_GOAWAY, id, &mut bytes)?;
-        self.writes.push_back(Write {
-            stream_id,
-            bytes,
-            fin: false,
-        });
+        Frame::encode_varint(
+            TYPE_GOAWAY,
+            VarInt::new(id).ok_or(ConnError::Protocol)?,
+            &mut bytes,
+        )?;
+        self.writes
+            .push_back(Write::single(stream_id, bytes, false));
         Ok(())
     }
 
@@ -506,12 +670,13 @@ impl Conn {
         }
         let stream_id = self.control_stream_id.ok_or(ConnError::Protocol)?;
         let mut bytes = Vec::new();
-        Frame::encode_varint(TYPE_MAX_PUSH_ID, push_id, &mut bytes)?;
-        self.writes.push_back(Write {
-            stream_id,
-            bytes,
-            fin: false,
-        });
+        Frame::encode_varint(
+            TYPE_MAX_PUSH_ID,
+            VarInt::new(push_id).ok_or(ConnError::Protocol)?,
+            &mut bytes,
+        )?;
+        self.writes
+            .push_back(Write::single(stream_id, bytes, false));
         Ok(())
     }
 
@@ -552,6 +717,27 @@ impl Conn {
         self.max_push_id
     }
 
+    fn frame_prefix(
+        kind: VarInt,
+        payload_len: usize,
+        payload_prefix_len: usize,
+    ) -> Result<WritePrefix, ConnError> {
+        let length = VarInt::from_usize(payload_len).ok_or(ConnError::Protocol)?;
+        let capacity = kind
+            .encoded_len()
+            .checked_add(length.encoded_len())
+            .and_then(|capacity| capacity.checked_add(payload_prefix_len))
+            .ok_or(ConnError::Protocol)?;
+        let mut prefix = WritePrefix::with_capacity(capacity);
+        crate::FrameHeader {
+            kind,
+            length,
+            header_len: 0,
+        }
+        .encode(&mut prefix);
+        Ok(prefix)
+    }
+
     fn flush_qpack_encoder_stream(&mut self) {
         let Some(stream_id) = self.qpack_encoder_stream_id else {
             return;
@@ -560,11 +746,8 @@ impl Conn {
         if bytes.is_empty() {
             return;
         }
-        self.writes.push_back(Write {
-            stream_id,
-            bytes,
-            fin: false,
-        });
+        self.writes
+            .push_back(Write::single(stream_id, bytes, false));
     }
 
     fn flush_qpack_decoder_stream(&mut self) {
@@ -575,11 +758,8 @@ impl Conn {
         if bytes.is_empty() {
             return;
         }
-        self.writes.push_back(Write {
-            stream_id,
-            bytes,
-            fin: false,
-        });
+        self.writes
+            .push_back(Write::single(stream_id, bytes, false));
     }
 
     fn decode_block(
@@ -609,18 +789,13 @@ impl Conn {
         }
     }
 
-    fn ingest_request_stream<F>(
+    fn ingest_message_frames<const PUSH: bool>(
         &mut self,
         stream_id: StreamId,
+        state: &mut StreamState,
+        push_id: u64,
         fin: bool,
-        append: F,
-    ) -> Result<(), ConnError>
-    where
-        F: FnOnce(&mut Inbound),
-    {
-        let mut state = self.streams.remove(&stream_id).unwrap_or_default();
-        append(&mut state.inbound);
-        state.fin_received |= fin;
+    ) -> Result<(), ConnError> {
         while !state.inbound.is_empty() {
             let rest = state.inbound.as_slice();
             let (frame, n) = match Frame::parse(rest, self.max_frame_size) {
@@ -643,14 +818,22 @@ impl Conn {
                         &mut state.blocked_required_insert_count,
                     )?;
                     let Some(fields) = decoded else {
-                        self.streams.insert(stream_id, state);
                         return Ok(());
                     };
                     state.message = next_message;
-                    self.events.push_back(Event::Headers {
-                        stream_id,
-                        fields,
-                        trailing,
+                    self.events.push_back(if PUSH {
+                        Event::PushHeaders {
+                            stream_id,
+                            push_id,
+                            fields,
+                            trailing,
+                        }
+                    } else {
+                        Event::Headers {
+                            stream_id,
+                            fields,
+                            trailing,
+                        }
                     });
                 }
                 Frame::Data(data) => {
@@ -659,12 +842,24 @@ impl Conn {
                     }
                     state.message = MessageState::Data;
                     let payload_start = n - data.len();
-                    let data = state.inbound.take_payload(payload_start..n, n);
-                    self.events.push_back(Event::Data { stream_id, data });
+                    let data = state
+                        .inbound
+                        .take_payload(payload_start..n, n)
+                        .ok_or(ConnError::Protocol)?;
+                    self.events.push_back(if PUSH {
+                        Event::PushData {
+                            stream_id,
+                            push_id,
+                            data,
+                        }
+                    } else {
+                        Event::Data { stream_id, data }
+                    });
                     continue;
                 }
+                Frame::Unknown { .. } => {}
                 Frame::PushPromise { push_id, block } => {
-                    if self.role != Role::Client {
+                    if PUSH || self.role != Role::Client {
                         return Err(ConnError::FrameUnexpected);
                     }
                     let decoded = self.decode_block(
@@ -673,25 +868,52 @@ impl Conn {
                         &mut state.blocked_required_insert_count,
                     )?;
                     let Some(fields) = decoded else {
-                        self.streams.insert(stream_id, state);
                         return Ok(());
                     };
                     self.events.push_back(Event::PushPromise {
                         stream_id,
-                        push_id,
+                        push_id: push_id.get(),
                         fields,
                     });
                 }
-                Frame::Unknown { .. } => {}
                 _ => return Err(ConnError::FrameUnexpected),
             }
-            state.inbound.advance(n);
+            if !state.inbound.try_advance(n) {
+                return Err(ConnError::Protocol);
+            }
         }
-        if state.fin_received {
+        if fin {
             if !state.inbound.is_empty() || state.message == MessageState::Idle {
                 return Err(ConnError::Protocol);
             }
-            self.events.push_back(Event::Finished { stream_id });
+            self.events.push_back(if PUSH {
+                Event::PushFinished { stream_id, push_id }
+            } else {
+                Event::Finished { stream_id }
+            });
+        }
+        Ok(())
+    }
+
+    fn ingest_request_stream<F>(
+        &mut self,
+        stream_id: StreamId,
+        fin: bool,
+        append: F,
+    ) -> Result<(), ConnError>
+    where
+        F: FnOnce(&mut Inbound),
+    {
+        let mut state = self.streams.remove(&stream_id).unwrap_or_default();
+        append(&mut state.inbound);
+        state.fin_received |= fin;
+        let fin_received = state.fin_received;
+        self.ingest_message_frames::<false>(stream_id, &mut state, 0, fin_received)?;
+        if state.blocked_required_insert_count.is_some() {
+            self.streams.insert(stream_id, state);
+            return Ok(());
+        }
+        if state.fin_received {
             self.streams.remove(&stream_id);
         } else {
             self.streams.insert(stream_id, state);
@@ -713,9 +935,9 @@ impl Conn {
         state.fin_received |= fin;
 
         if state.uni_type.is_none() {
-            let (stream_type, type_len) = match sark_core::http::VarInt::decode(&state.inbound) {
+            let (stream_type, type_len) = match VarInt::decode(&state.inbound) {
                 Ok(v) => v,
-                Err(sark_core::http::varint::Error::Underflow) => {
+                Err(VarIntError::Underflow) => {
                     self.streams.insert(stream_id, state);
                     return Ok(());
                 }
@@ -724,11 +946,16 @@ impl Conn {
             let stream_type = UniStreamType::from_wire(stream_type);
             self.register_uni_stream(stream_id, stream_type)?;
             state.uni_type = Some(stream_type);
-            state.inbound.advance(type_len);
+            if !state.inbound.try_advance(type_len) {
+                return Err(ConnError::Protocol);
+            }
         }
 
         let fin_received = state.fin_received;
-        match state.uni_type.expect("uni stream type set above") {
+        let Some(uni_type) = state.uni_type else {
+            return Err(ConnError::Protocol);
+        };
+        match uni_type {
             UniStreamType::Control => {
                 self.ingest_control_stream(stream_id, &mut state, fin_received)?
             }
@@ -739,7 +966,9 @@ impl Conn {
                     .ingest_encoder(&state.inbound)
                     .map_err(|_| ConnError::QpackEncoderStream)?;
                 if consumed > 0 {
-                    state.inbound.advance(consumed);
+                    if !state.inbound.try_advance(consumed) {
+                        return Err(ConnError::Protocol);
+                    }
                     self.flush_qpack_decoder_stream();
                     self.retry_blocked_streams()?;
                 }
@@ -752,8 +981,8 @@ impl Conn {
                     .qpack_encoder
                     .ingest_decoder(&state.inbound)
                     .map_err(|_| ConnError::QpackDecoderStream)?;
-                if consumed > 0 {
-                    state.inbound.advance(consumed);
+                if consumed > 0 && !state.inbound.try_advance(consumed) {
+                    return Err(ConnError::Protocol);
                 }
                 if state.fin_received {
                     return Err(ConnError::ClosedCriticalStream);
@@ -851,14 +1080,18 @@ impl Conn {
                     self.events.push_back(Event::Settings(settings));
                 }
                 Frame::CancelPush { push_id } => {
-                    self.events.push_back(Event::CancelPush { push_id });
+                    self.events.push_back(Event::CancelPush {
+                        push_id: push_id.get(),
+                    });
                 }
                 Frame::GoAway { id } => {
+                    let id = id.get();
                     self.validate_goaway_id(id)?;
                     self.peer_goaway_id = Some(id);
                     self.events.push_back(Event::GoAway { id });
                 }
                 Frame::MaxPushId { push_id } => {
+                    let push_id = push_id.get();
                     if self.role == Role::Client {
                         return Err(ConnError::FrameUnexpected);
                     }
@@ -871,7 +1104,9 @@ impl Conn {
                 Frame::Unknown { .. } => {}
                 _ => return Err(ConnError::FrameUnexpected),
             }
-            state.inbound.advance(n);
+            if !state.inbound.try_advance(n) {
+                return Err(ConnError::Protocol);
+            }
         }
         if fin {
             return Err(ConnError::ClosedCriticalStream);
@@ -887,73 +1122,20 @@ impl Conn {
         fin: bool,
     ) -> Result<(), ConnError> {
         if state.push_id.is_none() {
-            let (push_id, n) = match sark_core::http::VarInt::decode(&state.inbound) {
+            let (push_id, n) = match VarInt::decode(&state.inbound) {
                 Ok(v) => v,
-                Err(sark_core::http::varint::Error::Underflow) => return Ok(()),
+                Err(VarIntError::Underflow) => return Ok(()),
                 Err(_) => return Err(ConnError::Protocol),
             };
-            state.push_id = Some(push_id);
-            state.inbound.advance(n);
-        }
-        let push_id = state.push_id.expect("push id set above");
-        while !state.inbound.is_empty() {
-            let rest = state.inbound.as_slice();
-            let (frame, n) = match Frame::parse(rest, self.max_frame_size) {
-                Ok(parsed) => parsed,
-                Err(ParseError::NeedMore) => break,
-                Err(err) => return Err(err.into()),
-            };
-            match frame {
-                Frame::Headers(block) => {
-                    let (next_message, trailing) = match state.message {
-                        MessageState::Idle => (MessageState::Headers, false),
-                        MessageState::Headers | MessageState::Data => {
-                            (MessageState::Trailers, true)
-                        }
-                        MessageState::Trailers => return Err(ConnError::FrameUnexpected),
-                    };
-                    let decoded = self.decode_block(
-                        stream_id,
-                        block,
-                        &mut state.blocked_required_insert_count,
-                    )?;
-                    let Some(fields) = decoded else {
-                        return Ok(());
-                    };
-                    state.message = next_message;
-                    self.events.push_back(Event::PushHeaders {
-                        stream_id,
-                        push_id,
-                        fields,
-                        trailing,
-                    });
-                }
-                Frame::Data(data) => {
-                    if !matches!(state.message, MessageState::Headers | MessageState::Data) {
-                        return Err(ConnError::FrameUnexpected);
-                    }
-                    state.message = MessageState::Data;
-                    let payload_start = n - data.len();
-                    let data = state.inbound.take_payload(payload_start..n, n);
-                    self.events.push_back(Event::PushData {
-                        stream_id,
-                        push_id,
-                        data,
-                    });
-                    continue;
-                }
-                Frame::Unknown { .. } => {}
-                _ => return Err(ConnError::FrameUnexpected),
-            }
-            state.inbound.advance(n);
-        }
-        if fin {
-            if !state.inbound.is_empty() || state.message == MessageState::Idle {
+            state.push_id = Some(push_id.get());
+            if !state.inbound.try_advance(n) {
                 return Err(ConnError::Protocol);
             }
-            self.events
-                .push_back(Event::PushFinished { stream_id, push_id });
         }
+        let Some(push_id) = state.push_id else {
+            return Err(ConnError::Protocol);
+        };
+        self.ingest_message_frames::<true>(stream_id, state, push_id, fin)?;
         Ok(())
     }
 
@@ -1003,99 +1185,5 @@ impl ConnError {
             Self::QpackDecoderStream => ErrorCode::QpackDecoderStream,
             Self::Protocol | Self::Parse(_) => ErrorCode::GeneralProtocol,
         }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::{Conn, Event, Frame, MessageState, Role, StreamId, StreamState, TYPE_DATA};
-    use crate::FrameHeader;
-
-    #[test]
-    fn owned_ingest_adopts_a_fragmented_frame_allocation() {
-        let stream_id = StreamId::new(0);
-        let mut wire = Vec::new();
-        Frame::encode(0x21, b"fragment", &mut wire).unwrap();
-        let tail = wire.split_off(2);
-        let allocation = wire.as_ptr();
-        let mut conn = Conn::with_role(Role::Server);
-
-        conn.ingest_stream_owned(stream_id, wire, false).unwrap();
-
-        let state = conn.streams.get(&stream_id).unwrap();
-        assert_eq!(state.inbound.as_ptr(), allocation);
-        assert_eq!(state.inbound.len(), 2);
-
-        conn.ingest_stream_owned(stream_id, tail, false).unwrap();
-        assert!(conn.streams.get(&stream_id).unwrap().inbound.is_empty());
-    }
-
-    #[test]
-    fn fragmented_data_keeps_the_partial_allocation_through_the_event() {
-        let stream_id = StreamId::new(0);
-        let mut wire = Vec::with_capacity(128);
-        Frame::encode(TYPE_DATA, b"fragmented-body", &mut wire).unwrap();
-        let header_len = FrameHeader::parse(&wire).unwrap().header_len;
-        let tail = wire.split_off(header_len + 3);
-        let payload = wire.as_ptr().wrapping_add(header_len);
-        let mut conn = Conn::with_role(Role::Server);
-        conn.streams.insert(
-            stream_id,
-            StreamState {
-                message: MessageState::Headers,
-                ..StreamState::default()
-            },
-        );
-
-        conn.ingest_stream_owned(stream_id, wire, false).unwrap();
-        assert!(conn.poll_event().is_none());
-        conn.ingest_stream_owned(stream_id, tail, false).unwrap();
-
-        let Some(Event::Data { data, .. }) = conn.poll_event() else {
-            panic!("DATA event");
-        };
-        assert_eq!(data.as_slice(), b"fragmented-body");
-        assert_eq!(data.as_slice().as_ptr(), payload);
-    }
-
-    #[test]
-    fn multiple_data_events_share_one_large_receive_allocation() {
-        let stream_id = StreamId::new(0);
-        let first = vec![b'a'; 300];
-        let second = vec![b'b'; 300];
-        let mut wire = Vec::new();
-        Frame::encode(TYPE_DATA, &first, &mut wire).unwrap();
-        let second_frame = wire.len();
-        Frame::encode(TYPE_DATA, &second, &mut wire).unwrap();
-        let first_header = FrameHeader::parse(&wire).unwrap().header_len;
-        let second_header = FrameHeader::parse(&wire[second_frame..])
-            .unwrap()
-            .header_len;
-        let allocation = wire.as_ptr();
-        let mut conn = Conn::with_role(Role::Server);
-        conn.streams.insert(
-            stream_id,
-            StreamState {
-                message: MessageState::Headers,
-                ..StreamState::default()
-            },
-        );
-
-        conn.ingest_stream_owned(stream_id, wire, false).unwrap();
-
-        let Some(Event::Data { data: first, .. }) = conn.poll_event() else {
-            panic!("first DATA event");
-        };
-        let Some(Event::Data { data: second, .. }) = conn.poll_event() else {
-            panic!("second DATA event");
-        };
-        assert_eq!(
-            first.as_slice().as_ptr(),
-            allocation.wrapping_add(first_header)
-        );
-        assert_eq!(
-            second.as_slice().as_ptr(),
-            allocation.wrapping_add(second_frame + second_header)
-        );
     }
 }

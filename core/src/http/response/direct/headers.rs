@@ -1,10 +1,9 @@
-use o3::buffer::{Borrowed, Bytes, CapacityError, Retained, Shared, SpareWriter};
+use o3::buffer::{Borrowed, ByteSink, Bytes, Retained, Shared};
 
 use super::value::{HeaderItem, HeaderValueInner, InlineHeaderValue};
+use crate::http::Field;
 
 pub const DEFAULT_HEADER_CAPACITY: usize = 4;
-pub(in crate::http::response) const INLINE_HOT_TEXT_PARTS: usize = 10;
-
 pub struct Headers<'req, const N: usize = DEFAULT_HEADER_CAPACITY> {
     entries: [HeaderItem<'req>; N],
     len: usize,
@@ -80,6 +79,12 @@ impl<'req, const N: usize> Headers<'req, N> {
             .any(|e| e.name.as_str().eq_ignore_ascii_case("content-encoding"))
     }
 
+    pub(crate) fn fields(&self) -> impl ExactSizeIterator<Item = Field<'_>> + '_ {
+        self.entries[..self.len]
+            .iter()
+            .map(|item| Field::new(item.name_bytes(), item.value_bytes()))
+    }
+
     pub fn push_static(
         &mut self,
         name: HeaderNameToken,
@@ -108,13 +113,10 @@ impl<'req, const N: usize> Headers<'req, N> {
         self.push_value(name, HeaderValueInner::Retained(value))
     }
 
-    pub(super) fn write_into(&self, out: &mut SpareWriter<'_>) -> Result<(), CapacityError> {
+    pub(super) fn write_into<W: ByteSink>(&self, out: &mut W) -> Result<(), W::Error> {
         for idx in 0..self.len {
             let header = &self.entries[idx];
-            out.try_extend_from_slice(header.name_bytes())?;
-            out.try_extend_from_slice(b": ")?;
-            out.try_extend_from_slice(header.value_bytes())?;
-            out.try_extend_from_slice(b"\r\n")?;
+            out.write_slices([header.name_bytes(), b": ", header.value_bytes(), b"\r\n"])?;
         }
         Ok(())
     }

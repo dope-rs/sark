@@ -6,7 +6,7 @@ use std::io::{Read, Write};
 use std::net::TcpStream;
 use std::time::{Duration, Instant};
 
-use dope_extra::harness::Harness;
+use dope_test::Harness;
 use http::StatusCode;
 use sark::{Executor, Throughput, driver};
 
@@ -64,7 +64,8 @@ fn partial_head_then_stall_is_closed_after_deadline() {
             |_ctx, trigger| {
                 let driver_config =
                     driver::Config::for_tcp_profile::<Throughput>(support::MAX_CONNECTIONS);
-                let executor = Executor::new(driver_config)?;
+                let executor = Executor::new(driver_config)?
+                    .with_storage(dope_net::link::egress::storage::Storage::default());
                 executor.enter(|mut session| {
                     let timer = sark::Timer::with_capacity(32);
                     server(bind).serve(
@@ -115,7 +116,8 @@ fn normal_fast_request_is_unaffected() {
             |_ctx, trigger| {
                 let driver_config =
                     driver::Config::for_tcp_profile::<Throughput>(support::MAX_CONNECTIONS);
-                let executor = Executor::new(driver_config)?;
+                let executor = Executor::new(driver_config)?
+                    .with_storage(dope_net::link::egress::storage::Storage::default());
                 executor.enter(|mut session| {
                     let timer = sark::Timer::with_capacity(32);
                     server(bind).serve(
@@ -156,7 +158,8 @@ fn slow_but_progressing_within_deadline_completes() {
             |_ctx, trigger| {
                 let driver_config =
                     driver::Config::for_tcp_profile::<Throughput>(support::MAX_CONNECTIONS);
-                let executor = Executor::new(driver_config)?;
+                let executor = Executor::new(driver_config)?
+                    .with_storage(dope_net::link::egress::storage::Storage::default());
                 executor.enter(|mut session| {
                     let timer = sark::Timer::with_capacity(32);
                     server(bind).serve(
@@ -205,7 +208,8 @@ fn exhausted_deadline_capacity_closes_the_untracked_connection() {
             |_ctx, trigger| {
                 let driver_config =
                     driver::Config::for_tcp_profile::<Throughput>(support::MAX_CONNECTIONS);
-                let executor = Executor::new(driver_config)?;
+                let executor = Executor::new(driver_config)?
+                    .with_storage(dope_net::link::egress::storage::Storage::default());
                 executor.enter(|mut session| {
                     let timer = sark::Timer::with_capacity(1);
                     server(bind).serve(

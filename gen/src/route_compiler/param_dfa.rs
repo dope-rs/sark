@@ -34,7 +34,7 @@ impl ParamRoute {
             })
             .collect();
         quote! {
-            match ctx.method_key {
+            match __method {
                 #( #arms )*
                 _ => {}
             }
@@ -82,7 +82,10 @@ impl Node {
         let nx = format_ident!("__nx{}", depth);
 
         let none_arm = match &self.accept {
-            Some(body) => quote! { { #body } },
+            Some(body) => quote! {{
+                let __path_end = #cur;
+                #body
+            }},
             None => quote! {},
         };
 
@@ -96,7 +99,7 @@ impl Node {
                     quote! {
                         if let ::std::option::Option::Some(#nx) =
                             sark::service::PathProbe::probe_literal(
-                                &ctx.slice_path, #cur, #lit,
+                                &__route_path, #cur, #lit,
                             )
                         {
                             #sub
@@ -105,7 +108,7 @@ impl Node {
                 })
                 .collect();
             return quote! {
-                if #cur >= sark::service::PathProbe::len(&ctx.slice_path) {
+                if sark::service::PathProbe::is_end(&__route_path, #cur) {
                     #none_arm
                 } else {
                     #( #lit_arms )*
@@ -124,7 +127,7 @@ impl Node {
                 let sub = child.emit(quote!(#nx), depth + 1, params);
                 quote! {
                     if sark::service::PathProbe::eq_range(
-                        &ctx.slice_path, #s, #e, #lit,
+                        &__route_path, #s, #e, #lit,
                     ) {
                         #sub
                     }
@@ -147,7 +150,7 @@ impl Node {
         };
 
         quote! {
-            match sark::service::PathProbe::next_seg(&ctx.slice_path, #cur) {
+            match sark::service::PathProbe::next_seg(&__route_path, #cur) {
                 ::std::option::Option::None => {
                     #none_arm
                 }

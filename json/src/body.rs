@@ -15,6 +15,17 @@ impl<const N: usize> InlineToken<N> {
         }
     }
 
+    pub(crate) fn from_slice(bytes: &[u8]) -> Result<Self> {
+        let len = u8::try_from(bytes.len()).map_err(|_| Fail::bad())?;
+        if bytes.len() > N {
+            return Err(Fail::bad());
+        }
+        let mut out = Self::new();
+        out.bytes[..bytes.len()].copy_from_slice(bytes);
+        out.len = len;
+        Ok(out)
+    }
+
     pub fn push(&mut self, b: u8) -> Result<()> {
         let idx = self.len as usize;
         if idx >= N {

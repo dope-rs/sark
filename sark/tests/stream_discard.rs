@@ -6,7 +6,7 @@ use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpStream};
 use std::time::Duration;
 
-use dope_extra::harness::Harness;
+use dope_test::Harness;
 use http::StatusCode;
 use sark::request::BodyLen;
 use sark::service::{BodyPolicy, RouteRequestImpl};
@@ -76,7 +76,8 @@ fn serve(client: impl FnOnce(SocketAddr)) {
             move |_ctx, trigger| {
                 let driver_config =
                     driver::Config::for_tcp_profile::<Throughput>(support::MAX_CONNECTIONS);
-                let executor = Executor::new(driver_config)?;
+                let executor = Executor::new(driver_config)?
+                    .with_storage(dope_net::link::egress::storage::Storage::default());
                 executor.enter(|mut session| {
                     let timer =
                         sark::Timer::with_capacity(support::MAX_CONNECTIONS.saturating_mul(2));

@@ -2,7 +2,7 @@ use http::{HeaderName, HeaderValue, StatusCode};
 use o3::buffer::Shared;
 
 use super::wire_emit::{CRLF, ContentLength, HeadWrite, HeaderSection, WireWriter};
-use super::{DEFAULT_HEADER_CAPACITY, HeaderList, HotBodyInner, HotHeadInner};
+use super::{Body, DEFAULT_HEADER_CAPACITY, HeaderList, HotHeadInner};
 
 struct MonoHeaders<'a, 'req, const N: usize> {
     head: &'a HotHeadInner<'req, N>,
@@ -39,7 +39,7 @@ pub struct MonoResponseInner<'req, const N: usize = DEFAULT_HEADER_CAPACITY> {
     pub(super) status: StatusCode,
     pub(super) headers: Option<Box<HeaderList>>,
     pub(super) head: HotHeadInner<'req, N>,
-    pub(super) body: HotBodyInner<'req>,
+    pub(super) body: Body<'req>,
 }
 
 impl<'req, const N: usize> MonoResponseInner<'req, N> {
@@ -99,12 +99,7 @@ impl<'req, const N: usize> MonoResponseInner<'req, N> {
             dynamic: self.headers.as_deref(),
         };
         let head = HeadWrite {
-            status_str: self.status.as_str().as_bytes(),
-            reason: self
-                .status
-                .canonical_reason()
-                .map(str::as_bytes)
-                .unwrap_or(b""),
+            status: self.status,
             headers: &section,
             framing: ContentLength(self.body.body_len()),
         };

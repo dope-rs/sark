@@ -1,7 +1,5 @@
 use o3::buffer::{Borrowed, Bytes, Owned, Retained, Shared};
 
-use super::TextBody;
-
 #[derive(Clone)]
 pub enum Body<'req> {
     Owned(Vec<u8>),
@@ -53,7 +51,7 @@ impl<'req> Body<'req> {
         }
     }
 
-    pub(crate) fn as_bytes(&self) -> &[u8] {
+    pub fn as_bytes(&self) -> &[u8] {
         match self {
             Self::Owned(buf) => buf.as_ref(),
             Self::Shared(buf) => buf.as_ref(),
@@ -78,6 +76,20 @@ impl<'req> Body<'req> {
             Self::Retained(buf) => buf.into_shared(),
             Self::StaticSlice(buf) => Shared::from_static(buf),
         }
+    }
+
+    pub(crate) fn body_len(&self) -> usize {
+        self.len()
+    }
+
+    pub(crate) fn write_to(&self, out: &mut [u8]) -> usize {
+        let body = self.as_bytes();
+        out[..body.len()].copy_from_slice(body);
+        body.len()
+    }
+
+    pub(crate) fn into_shared(self) -> Shared {
+        self.into_bytes()
     }
 
     pub(crate) fn into_owned(self) -> Vec<u8> {
@@ -126,12 +138,6 @@ impl<'req> From<Bytes<Borrowed<'req>>> for Body<'req> {
 impl<'req> From<Bytes<Retained>> for Body<'req> {
     fn from(body: Bytes<Retained>) -> Self {
         Self::Retained(body)
-    }
-}
-
-impl<'req> From<TextBody<'req>> for Body<'req> {
-    fn from(body: TextBody<'req>) -> Self {
-        Self::Shared(body.into_bytes())
     }
 }
 

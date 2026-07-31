@@ -28,6 +28,15 @@ pub enum BodyFraming {
 }
 
 impl HeaderScan {
+    pub(crate) fn validate_request_framing_pair(&self) -> Result<()> {
+        if self.has_transfer_encoding && self.content_length.is_some() {
+            return Err(Error::BadRequest(
+                "Content-Length with Transfer-Encoding is not allowed".into(),
+            ));
+        }
+        Ok(())
+    }
+
     pub(super) fn transfer_encoding(value: &[u8]) -> Result<TransferEncodingInfo> {
         let mut saw_any = false;
         let mut saw_chunked = false;
@@ -163,12 +172,8 @@ impl HeaderScan {
                 "Multiple Content-Length headers are not allowed".into(),
             ));
         }
+        self.validate_request_framing_pair()?;
         if self.has_transfer_encoding {
-            if self.content_length.is_some() {
-                return Err(Error::BadRequest(
-                    "Content-Length with Transfer-Encoding is not allowed".into(),
-                ));
-            }
             if self.is_chunked_transfer {
                 return Ok(BodyFraming::Chunked);
             }

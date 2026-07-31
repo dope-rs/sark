@@ -55,3 +55,24 @@ fn response_over_cap_errors() {
     let err = run_get_cap(addr, 1024, "/").expect_err("over-cap must error");
     assert!(err.contains("size limit"), "err was: {err}");
 }
+
+#[test]
+fn aggregate_response_buffer_capacity_is_enforced() {
+    let server = spawn_raw_server(|stream, _req| {
+        let body = vec![b'x'; 1024];
+        let mut response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            body.len()
+        )
+        .into_bytes();
+        response.extend_from_slice(&body);
+        let _ = std::io::Write::write_all(stream, &response);
+    });
+    let addr: SocketAddr = server.addr().parse().expect("addr");
+    let config = Config::new("127.0.0.1")
+        .max_response_body(2048)
+        .response_buffer_capacity(128);
+
+    let error = run_get(addr, config, "/").expect_err("arena byte cap must reject response");
+    assert!(error.contains("capacity exceeded"), "error was: {error}");
+}

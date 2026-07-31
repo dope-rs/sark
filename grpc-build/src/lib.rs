@@ -86,7 +86,7 @@ fn generate_service(service: &Service) -> TokenStream {
             quote! {
                 routes.push(
                     #path,
-                    #routes_enum::#variant(::sark_grpc::ServiceStreaming::new(
+                    #routes_enum::#variant(::sark_grpc::Streaming::new(
                         #wrapper,
                         ::sark_grpc::ProstCodec::<#response, #request>::new(),
                     )),
@@ -96,7 +96,7 @@ fn generate_service(service: &Service) -> TokenStream {
             quote! {
                 routes.push(
                     #path,
-                    #routes_enum::#variant(::sark_grpc::ServiceUnary::new(
+                    #routes_enum::#variant(::sark_grpc::Unary::new(
                         #wrapper,
                         ::sark_grpc::ProstCodec::<#response, #request>::new(),
                     )),
@@ -117,8 +117,8 @@ fn generate_service(service: &Service) -> TokenStream {
 
         pub fn #routes_fn<S: #trait_name>(
             service: S,
-        ) -> ::sark_grpc::ServiceRoutes<S, #routes_enum<S>> {
-            let mut routes = ::sark_grpc::ServiceRoutes::new(service);
+        ) -> ::sark_grpc::Routes<#routes_enum<S>, S> {
+            let mut routes = ::sark_grpc::Routes::with_context(service);
             #(#registrations)*
             routes
         }
@@ -203,17 +203,17 @@ fn emit_server_wrapper(method: &GeneratedMethod<'_>, trait_name: &Ident) -> Toke
         quote! {
             pub struct #wrapper;
 
-            impl<S: #trait_name> ::sark_grpc::StreamingService<S> for #wrapper {
+            impl<S: #trait_name> ::sark_grpc::StreamingHandler<S> for #wrapper {
                 type Request = #request;
                 type Response = #response;
                 type Codec = ::sark_grpc::ProstCodec<#response, #request>;
 
                 fn stream(
                     &mut self,
-                    service: &mut S,
+                    context: &mut S,
                     request: ::sark_grpc::StreamingRequest<#request>,
                 ) -> ::sark_grpc::StreamingResponse<#response> {
-                    service.#name(request)
+                    context.#name(request)
                 }
             }
         }
@@ -221,17 +221,17 @@ fn emit_server_wrapper(method: &GeneratedMethod<'_>, trait_name: &Ident) -> Toke
         quote! {
             pub struct #wrapper;
 
-            impl<S: #trait_name> ::sark_grpc::UnaryService<S> for #wrapper {
+            impl<S: #trait_name> ::sark_grpc::UnaryHandler<S> for #wrapper {
                 type Request = #request;
                 type Response = #response;
                 type Codec = ::sark_grpc::ProstCodec<#response, #request>;
 
                 fn unary(
                     &mut self,
-                    service: &mut S,
+                    context: &mut S,
                     request: ::sark_grpc::UnaryRequest<#request>,
                 ) -> ::sark_grpc::UnaryResponse<#response> {
-                    service.#name(request)
+                    context.#name(request)
                 }
             }
         }
@@ -372,17 +372,17 @@ fn emit_routes_enum(
             ..
         } = method;
         if descriptor.client_streaming || descriptor.server_streaming {
-            quote!(#variant(::sark_grpc::ServiceStreaming<S, #wrapper>),)
+            quote!(#variant(::sark_grpc::Streaming<#wrapper, S>),)
         } else {
-            quote!(#variant(::sark_grpc::ServiceUnary<S, #wrapper>),)
+            quote!(#variant(::sark_grpc::Unary<#wrapper, S>),)
         }
     });
     let start_arms = methods.iter().map(|method| {
         let variant = &method.variant;
         quote! {
             #routes_enum::#variant(handler) =>
-                ::sark_grpc::server::ServiceHandler::start(
-                    handler, service, routes, stream_id, head, reply,
+                ::sark_grpc::server::Handler::start(
+                    handler, context, routes, stream_id, head, reply,
                 ),
         }
     });
@@ -390,8 +390,8 @@ fn emit_routes_enum(
         let variant = &method.variant;
         quote! {
             #routes_enum::#variant(handler) =>
-                ::sark_grpc::server::ServiceHandler::message(
-                    handler, service, routes, stream_id, message, reply,
+                ::sark_grpc::server::Handler::message(
+                    handler, context, routes, stream_id, message, reply,
                 ),
         }
     });
@@ -399,8 +399,8 @@ fn emit_routes_enum(
         let variant = &method.variant;
         quote! {
             #routes_enum::#variant(handler) =>
-                ::sark_grpc::server::ServiceHandler::trailers(
-                    handler, service, routes, stream_id, trailers, reply,
+                ::sark_grpc::server::Handler::trailers(
+                    handler, context, routes, stream_id, trailers, reply,
                 ),
         }
     });
@@ -408,8 +408,8 @@ fn emit_routes_enum(
         let variant = &method.variant;
         quote! {
             #routes_enum::#variant(handler) =>
-                ::sark_grpc::server::ServiceHandler::request(
-                    handler, service, request, response,
+                ::sark_grpc::server::Handler::request(
+                    handler, context, request, response,
                 ),
         }
     });
@@ -419,10 +419,10 @@ fn emit_routes_enum(
             #(#variants)*
         }
 
-        impl<S: #trait_name> ::sark_grpc::server::ServiceHandler<S> for #routes_enum<S> {
+        impl<S: #trait_name> ::sark_grpc::server::Handler<S> for #routes_enum<S> {
             fn start(
                 &mut self,
-                service: &mut S,
+                context: &mut S,
                 routes: &mut ::sark_grpc::server::StreamRoutes,
                 stream_id: ::sark_grpc::StreamId,
                 head: &::sark_grpc::RequestHead,
@@ -435,7 +435,7 @@ fn emit_routes_enum(
 
             fn message(
                 &mut self,
-                service: &mut S,
+                context: &mut S,
                 routes: &mut ::sark_grpc::server::StreamRoutes,
                 stream_id: ::sark_grpc::StreamId,
                 message: ::sark_grpc::MessageFrame,
@@ -448,7 +448,7 @@ fn emit_routes_enum(
 
             fn trailers(
                 &mut self,
-                service: &mut S,
+                context: &mut S,
                 routes: &mut ::sark_grpc::server::StreamRoutes,
                 stream_id: ::sark_grpc::StreamId,
                 trailers: ::sark_grpc::Metadata,
@@ -461,7 +461,7 @@ fn emit_routes_enum(
 
             fn request(
                 &mut self,
-                service: &mut S,
+                context: &mut S,
                 request: ::sark_grpc::Request<'_>,
                 response: &mut ::sark_grpc::Response,
             ) {
@@ -553,8 +553,14 @@ mod tests {
         let generated = generate(vec![method("echo", "Echo", false, false)]);
         let compact = compact(&generated);
 
-        assert!(compact.contains("ServiceRoutes<S,__SarkGrpcProofRoutes<S>>"));
-        assert!(compact.contains("ServiceUnary::new(__SarkGrpcProofEcho"));
+        assert!(compact.contains("Routes<__SarkGrpcProofRoutes<S>,S>"));
+        assert!(compact.contains("Unary::new(__SarkGrpcProofEcho"));
+        assert!(compact.contains("Handler<S>for__SarkGrpcProofRoutes<S>"));
+        assert!(compact.contains("Routes::with_context(service)"));
+        assert!(!generated.contains("ServiceHandler"));
+        assert!(!generated.contains("ServiceRoutes"));
+        assert!(!generated.contains("ServiceUnary"));
+        assert!(!generated.contains("ServiceStreaming"));
         assert!(!generated.contains("Rc"));
         assert!(!generated.contains("RefCell"));
         assert!(!generated.contains("borrow_mut"));

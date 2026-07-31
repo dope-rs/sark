@@ -1,3 +1,6 @@
+mod common;
+
+use common::sid;
 use sark_h2::frame::{
     self, Continuation as ContinuationFrame, Data as DataFrame, Headers as HeadersFrame,
 };
@@ -22,6 +25,7 @@ fn client_with_header_list_limit(max: u32) -> Conn<ClientRole> {
         },
         65_535,
     )
+    .unwrap()
 }
 
 fn server_with_header_list_limit(max: u32) -> Conn<ServerRole> {
@@ -32,6 +36,7 @@ fn server_with_header_list_limit(max: u32) -> Conn<ServerRole> {
         },
         65_535,
     )
+    .unwrap()
 }
 
 fn prime_server(conn: &mut Conn<ServerRole>) {
@@ -48,6 +53,10 @@ fn prime_client(conn: &mut Conn<ClientRole>) {
 
 fn encode_hpack(headers: &[Header<'_>]) -> Vec<u8> {
     let mut enc = Encoder::new(4096);
+    encode_hpack_with(&mut enc, headers)
+}
+
+fn encode_hpack_with(enc: &mut Encoder, headers: &[Header<'_>]) -> Vec<u8> {
     let mut out = Vec::new();
     enc.encode(headers.iter().copied(), &mut out);
     out
@@ -60,25 +69,17 @@ fn headers_frame_bytes(
     block: &[u8],
 ) -> Vec<u8> {
     let mut out = Vec::new();
-    HeadersFrame {
-        stream_id: StreamId(stream_id),
-        end_stream,
-        end_headers,
-        priority: None,
-        block_fragment: block,
-    }
-    .encode(&mut out);
+    HeadersFrame::new(sid(stream_id), end_stream, end_headers, None, block)
+        .unwrap()
+        .encode(&mut out);
     out
 }
 
 fn data_frame_bytes(stream_id: u32, end_stream: bool, payload: &[u8]) -> Vec<u8> {
     let mut out = Vec::new();
-    DataFrame {
-        stream_id: StreamId(stream_id),
-        end_stream,
-        payload,
-    }
-    .encode(&mut out);
+    DataFrame::new(sid(stream_id), end_stream, payload)
+        .unwrap()
+        .encode(&mut out);
     out
 }
 
@@ -86,7 +87,7 @@ fn first_outbound_rst(out: &[u8]) -> Option<(StreamId, ErrorCode)> {
     let mut pos = 0;
     while pos < out.len() {
         let h = FrameHeader::parse(&out[pos..]).ok()?;
-        let total = 9 + h.length as usize;
+        let total = 9 + h.length.as_usize();
         if h.kind == frame::Type::RstStream {
             let payload = &out[pos + 9..pos + total];
             let err = u32::from_be_bytes([payload[0], payload[1], payload[2], payload[3]]);
@@ -172,8 +173,8 @@ fn req_header_list_size_over_limit_rejected() {
     conn.ingest(&frame).unwrap();
     assert!(conn.poll_event().is_none());
     let rst = first_outbound_rst(conn.outbound()).expect("RST_STREAM emitted");
-    assert_eq!(rst, (StreamId(1), ErrorCode::ProtocolError));
-    assert!(!conn.has_stream(StreamId(1)));
+    assert_eq!(rst, (sid(1), ErrorCode::ProtocolError));
+    assert!(!conn.has_stream(sid(1)));
 }
 
 #[test]
@@ -206,7 +207,7 @@ fn req_uppercase_name_rejected() {
     conn.ingest(&frame).unwrap();
     assert!(conn.poll_event().is_none());
     let rst = first_outbound_rst(conn.outbound()).expect("RST_STREAM emitted");
-    assert_eq!(rst, (StreamId(1), ErrorCode::ProtocolError));
+    assert_eq!(rst, (sid(1), ErrorCode::ProtocolError));
 }
 
 #[test]
@@ -231,7 +232,7 @@ fn req_missing_method_rejected() {
     conn.ingest(&frame).unwrap();
     assert!(conn.poll_event().is_none());
     let rst = first_outbound_rst(conn.outbound()).expect("RST_STREAM emitted");
-    assert_eq!(rst, (StreamId(1), ErrorCode::ProtocolError));
+    assert_eq!(rst, (sid(1), ErrorCode::ProtocolError));
 }
 
 #[test]
@@ -256,7 +257,7 @@ fn req_missing_scheme_rejected() {
     conn.ingest(&frame).unwrap();
     assert!(conn.poll_event().is_none());
     let rst = first_outbound_rst(conn.outbound()).expect("RST_STREAM emitted");
-    assert_eq!(rst, (StreamId(1), ErrorCode::ProtocolError));
+    assert_eq!(rst, (sid(1), ErrorCode::ProtocolError));
 }
 
 #[test]
@@ -281,7 +282,7 @@ fn req_missing_path_rejected() {
     conn.ingest(&frame).unwrap();
     assert!(conn.poll_event().is_none());
     let rst = first_outbound_rst(conn.outbound()).expect("RST_STREAM emitted");
-    assert_eq!(rst, (StreamId(1), ErrorCode::ProtocolError));
+    assert_eq!(rst, (sid(1), ErrorCode::ProtocolError));
 }
 
 #[test]
@@ -310,7 +311,7 @@ fn req_empty_path_rejected() {
     conn.ingest(&frame).unwrap();
     assert!(conn.poll_event().is_none());
     let rst = first_outbound_rst(conn.outbound()).expect("RST_STREAM emitted");
-    assert_eq!(rst, (StreamId(1), ErrorCode::ProtocolError));
+    assert_eq!(rst, (sid(1), ErrorCode::ProtocolError));
 }
 
 #[test]
@@ -343,7 +344,7 @@ fn req_duplicate_method_rejected() {
     conn.ingest(&frame).unwrap();
     assert!(conn.poll_event().is_none());
     let rst = first_outbound_rst(conn.outbound()).expect("RST_STREAM emitted");
-    assert_eq!(rst, (StreamId(1), ErrorCode::ProtocolError));
+    assert_eq!(rst, (sid(1), ErrorCode::ProtocolError));
 }
 
 #[test]
@@ -376,7 +377,7 @@ fn req_duplicate_scheme_rejected() {
     conn.ingest(&frame).unwrap();
     assert!(conn.poll_event().is_none());
     let rst = first_outbound_rst(conn.outbound()).expect("RST_STREAM emitted");
-    assert_eq!(rst, (StreamId(1), ErrorCode::ProtocolError));
+    assert_eq!(rst, (sid(1), ErrorCode::ProtocolError));
 }
 
 #[test]
@@ -409,7 +410,7 @@ fn req_duplicate_path_rejected() {
     conn.ingest(&frame).unwrap();
     assert!(conn.poll_event().is_none());
     let rst = first_outbound_rst(conn.outbound()).expect("RST_STREAM emitted");
-    assert_eq!(rst, (StreamId(1), ErrorCode::ProtocolError));
+    assert_eq!(rst, (sid(1), ErrorCode::ProtocolError));
 }
 
 #[test]
@@ -438,7 +439,7 @@ fn req_unknown_pseudo_rejected() {
     conn.ingest(&frame).unwrap();
     assert!(conn.poll_event().is_none());
     let rst = first_outbound_rst(conn.outbound()).expect("RST_STREAM emitted");
-    assert_eq!(rst, (StreamId(1), ErrorCode::ProtocolError));
+    assert_eq!(rst, (sid(1), ErrorCode::ProtocolError));
 }
 
 #[test]
@@ -467,7 +468,7 @@ fn req_status_pseudo_rejected() {
     conn.ingest(&frame).unwrap();
     assert!(conn.poll_event().is_none());
     let rst = first_outbound_rst(conn.outbound()).expect("RST_STREAM emitted");
-    assert_eq!(rst, (StreamId(1), ErrorCode::ProtocolError));
+    assert_eq!(rst, (sid(1), ErrorCode::ProtocolError));
 }
 
 #[test]
@@ -496,7 +497,7 @@ fn req_pseudo_after_regular_rejected() {
     conn.ingest(&frame).unwrap();
     assert!(conn.poll_event().is_none());
     let rst = first_outbound_rst(conn.outbound()).expect("RST_STREAM emitted");
-    assert_eq!(rst, (StreamId(1), ErrorCode::ProtocolError));
+    assert_eq!(rst, (sid(1), ErrorCode::ProtocolError));
 }
 
 #[test]
@@ -508,7 +509,7 @@ fn req_connection_header_rejected() {
     conn.ingest(&frame).unwrap();
     assert!(conn.poll_event().is_none());
     let rst = first_outbound_rst(conn.outbound()).expect("RST_STREAM emitted");
-    assert_eq!(rst, (StreamId(1), ErrorCode::ProtocolError));
+    assert_eq!(rst, (sid(1), ErrorCode::ProtocolError));
 }
 
 #[test]
@@ -520,7 +521,7 @@ fn req_keep_alive_header_rejected() {
     conn.ingest(&frame).unwrap();
     assert!(conn.poll_event().is_none());
     let rst = first_outbound_rst(conn.outbound()).expect("RST_STREAM emitted");
-    assert_eq!(rst, (StreamId(1), ErrorCode::ProtocolError));
+    assert_eq!(rst, (sid(1), ErrorCode::ProtocolError));
 }
 
 #[test]
@@ -532,7 +533,7 @@ fn req_transfer_encoding_rejected() {
     conn.ingest(&frame).unwrap();
     assert!(conn.poll_event().is_none());
     let rst = first_outbound_rst(conn.outbound()).expect("RST_STREAM emitted");
-    assert_eq!(rst, (StreamId(1), ErrorCode::ProtocolError));
+    assert_eq!(rst, (sid(1), ErrorCode::ProtocolError));
 }
 
 #[test]
@@ -556,7 +557,7 @@ fn req_te_gzip_rejected() {
     conn.ingest(&frame).unwrap();
     assert!(conn.poll_event().is_none());
     let rst = first_outbound_rst(conn.outbound()).expect("RST_STREAM emitted");
-    assert_eq!(rst, (StreamId(1), ErrorCode::ProtocolError));
+    assert_eq!(rst, (sid(1), ErrorCode::ProtocolError));
 }
 
 #[test]
@@ -613,7 +614,7 @@ fn req_trailing_with_pseudo_rejected() {
     conn.ingest(&trailing).unwrap();
     assert!(conn.poll_event().is_none());
     let rst = first_outbound_rst(conn.outbound()).expect("RST_STREAM emitted");
-    assert_eq!(rst, (StreamId(1), ErrorCode::ProtocolError));
+    assert_eq!(rst, (sid(1), ErrorCode::ProtocolError));
 }
 
 #[test]
@@ -640,18 +641,15 @@ fn req_continuation_validates_on_assembly() {
     assert!(conn.poll_event().is_none());
     conn.ingest(&{
         let mut out = Vec::new();
-        ContinuationFrame {
-            stream_id: StreamId(1),
-            end_headers: true,
-            block_fragment: &block[split..],
-        }
-        .encode(&mut out);
+        ContinuationFrame::new(sid(1), true, &block[split..])
+            .unwrap()
+            .encode(&mut out);
         out
     })
     .unwrap();
     assert!(conn.poll_event().is_none());
     let rst = first_outbound_rst(conn.outbound()).expect("RST_STREAM emitted");
-    assert_eq!(rst, (StreamId(1), ErrorCode::ProtocolError));
+    assert_eq!(rst, (sid(1), ErrorCode::ProtocolError));
 }
 
 #[test]
@@ -666,19 +664,16 @@ fn req_continuation_header_list_size_over_limit_rejected_on_assembly() {
     assert!(conn.poll_event().is_none());
     conn.ingest(&{
         let mut out = Vec::new();
-        ContinuationFrame {
-            stream_id: StreamId(1),
-            end_headers: true,
-            block_fragment: &block[split..],
-        }
-        .encode(&mut out);
+        ContinuationFrame::new(sid(1), true, &block[split..])
+            .unwrap()
+            .encode(&mut out);
         out
     })
     .unwrap();
     assert!(conn.poll_event().is_none());
     let rst = first_outbound_rst(conn.outbound()).expect("RST_STREAM emitted");
-    assert_eq!(rst, (StreamId(1), ErrorCode::ProtocolError));
-    assert!(!conn.has_stream(StreamId(1)));
+    assert_eq!(rst, (sid(1), ErrorCode::ProtocolError));
+    assert!(!conn.has_stream(sid(1)));
 }
 
 #[test]
@@ -713,7 +708,7 @@ fn resp_full_status_ok() {
         name: b":status",
         value: b"200",
     }]);
-    let frame = headers_frame_bytes(id.0, true, true, &block);
+    let frame = headers_frame_bytes(id.as_u32(), true, true, &block);
     conn.ingest(&frame).unwrap();
     let ev = conn.poll_event().expect("Headers event");
     assert!(matches!(ev, conn::Event::Headers { .. }));
@@ -752,7 +747,7 @@ fn resp_header_list_size_over_limit_rejected() {
         name: b":status",
         value: b"200",
     }]);
-    let frame = headers_frame_bytes(id.0, true, true, &block);
+    let frame = headers_frame_bytes(id.as_u32(), true, true, &block);
     conn.ingest(&frame).unwrap();
     assert!(conn.poll_event().is_none());
     let rst = first_outbound_rst(conn.outbound()).expect("RST_STREAM emitted");
@@ -792,7 +787,7 @@ fn resp_missing_status_rejected() {
         name: b"content-type",
         value: b"text/plain",
     }]);
-    let frame = headers_frame_bytes(id.0, true, true, &block);
+    let frame = headers_frame_bytes(id.as_u32(), true, true, &block);
     conn.ingest(&frame).unwrap();
     assert!(conn.poll_event().is_none());
     let rst = first_outbound_rst(conn.outbound()).expect("RST_STREAM emitted");
@@ -837,7 +832,7 @@ fn resp_uppercase_rejected() {
             value: b"text/plain",
         },
     ]);
-    let frame = headers_frame_bytes(id.0, true, true, &block);
+    let frame = headers_frame_bytes(id.as_u32(), true, true, &block);
     conn.ingest(&frame).unwrap();
     assert!(conn.poll_event().is_none());
     let rst = first_outbound_rst(conn.outbound()).expect("RST_STREAM emitted");
@@ -882,7 +877,7 @@ fn resp_request_pseudo_rejected() {
             value: b"GET",
         },
     ]);
-    let frame = headers_frame_bytes(id.0, true, true, &block);
+    let frame = headers_frame_bytes(id.as_u32(), true, true, &block);
     conn.ingest(&frame).unwrap();
     assert!(conn.poll_event().is_none());
     let rst = first_outbound_rst(conn.outbound()).expect("RST_STREAM emitted");
@@ -927,7 +922,7 @@ fn resp_unknown_pseudo_rejected() {
             value: b"bar",
         },
     ]);
-    let frame = headers_frame_bytes(id.0, true, true, &block);
+    let frame = headers_frame_bytes(id.as_u32(), true, true, &block);
     conn.ingest(&frame).unwrap();
     assert!(conn.poll_event().is_none());
     let rst = first_outbound_rst(conn.outbound()).expect("RST_STREAM emitted");
@@ -955,7 +950,7 @@ fn server_stream_evicted_after_validation_failure() {
     ]);
     let frame = headers_frame_bytes(1, true, true, &block);
     conn.ingest(&frame).unwrap();
-    assert!(!conn.has_stream(StreamId(1)));
+    assert!(!conn.has_stream(sid(1)));
 }
 
 #[test]
@@ -985,8 +980,79 @@ fn server_continues_after_validation_failure() {
         .unwrap();
     let ev = conn.poll_event().expect("good Headers");
     if let conn::Event::Headers { stream_id, .. } = ev {
-        assert_eq!(stream_id, StreamId(3));
+        assert_eq!(stream_id, sid(3));
     } else {
         panic!("expected Headers");
     }
+}
+
+#[test]
+fn validation_failure_preserves_hpack_dynamic_table_updates() {
+    let mut conn = server();
+    prime_server(&mut conn);
+    let mut encoder = Encoder::new(4096);
+    let bad = encode_hpack_with(
+        &mut encoder,
+        &[
+            Header {
+                name: b":method",
+                value: b"GET",
+            },
+            Header {
+                name: b":scheme",
+                value: b"http",
+            },
+            Header {
+                name: b":path",
+                value: b"/",
+            },
+            Header {
+                name: b"connection",
+                value: b"close",
+            },
+            Header {
+                name: b"x-dynamic",
+                value: b"retained",
+            },
+        ],
+    );
+    conn.ingest(&headers_frame_bytes(1, true, true, &bad))
+        .unwrap();
+    assert!(conn.poll_event().is_none());
+
+    let good = encode_hpack_with(
+        &mut encoder,
+        &[
+            Header {
+                name: b":method",
+                value: b"GET",
+            },
+            Header {
+                name: b":scheme",
+                value: b"http",
+            },
+            Header {
+                name: b":path",
+                value: b"/",
+            },
+            Header {
+                name: b"x-dynamic",
+                value: b"retained",
+            },
+        ],
+    );
+    conn.ingest(&headers_frame_bytes(3, true, true, &good))
+        .unwrap();
+    let Some(conn::Event::Headers {
+        stream_id, headers, ..
+    }) = conn.poll_event()
+    else {
+        panic!("expected Headers");
+    };
+    assert_eq!(stream_id, sid(3));
+    assert!(
+        headers
+            .iter()
+            .any(|h| h.name == b"x-dynamic" && h.value == b"retained")
+    );
 }

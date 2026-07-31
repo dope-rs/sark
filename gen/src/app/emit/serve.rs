@@ -12,6 +12,11 @@ struct TaskSpec<'a> {
     kind: &'a RouteKind,
     capacity: &'a syn::Expr,
     slot: usize,
+    producer: Option<ProducerSpec>,
+}
+
+struct ProducerSpec {
+    slot: usize,
     future: syn::Ident,
     maker: syn::Ident,
 }
@@ -19,25 +24,26 @@ struct TaskSpec<'a> {
 impl TaskSpec<'_> {
     fn task_type(&self) -> TokenStream {
         let route = self.route;
-        let future = &self.future;
-        quote! {
-            <<#route as ::sark::service::RouteSpec>::Kind
-                as ::sark::service::manifold::Kind<'d, #route, #future>>::Task
+        match self.kind {
+            RouteKind::Fiber => {
+                let future = &self
+                    .producer
+                    .as_ref()
+                    .expect("fiber route task producer")
+                    .future;
+                quote!(#future)
+            }
+            RouteKind::Stream => {
+                quote!(<#route as ::sark::service::RouteSpec>::Stream)
+            }
+            RouteKind::Sync => unreachable!("sync routes have no task slot"),
         }
     }
 
     fn producer_output(&self) -> TokenStream {
         let route = self.route;
-        match self.kind {
-            RouteKind::Fiber => quote! {
-                <#route as ::sark::service::RouteSpec>::AsyncResponse
-            },
-            RouteKind::Stream => quote! {
-                <<#route as ::sark::service::RouteSpec>::Kind
-                    as ::sark::service::manifold::InvokeKind<#route>>::Output
-            },
-            RouteKind::Sync => unreachable!("sync routes have no task slot"),
-        }
+        debug_assert!(matches!(self.kind, RouteKind::Fiber));
+        quote!(<#route as ::sark::service::RouteSpec>::AsyncResponse)
     }
 
     fn slab_output(&self) -> TokenStream {
@@ -49,40 +55,104 @@ impl TaskSpec<'_> {
             RouteKind::Sync => unreachable!("sync routes have no task slot"),
         }
     }
-
-    fn slab_type(&self) -> TokenStream {
-        let route = self.route;
-        let future = &self.future;
-        match self.kind {
-            RouteKind::Fiber => quote!(#future),
-            RouteKind::Stream => {
-                quote!(<#route as ::sark::service::RouteSpec>::Stream)
-            }
-            RouteKind::Sync => unreachable!("sync routes have no task slot"),
-        }
-    }
 }
 
 fn task_specs(spec: &Gen) -> Vec<TaskSpec<'_>> {
-    spec.route_specs
+    let mut tasks = Vec::new();
+    let mut producer_slot = 0;
+    for ((entry, route), route_index) in spec
+        .route_specs
         .iter()
         .zip(spec.routes.iter())
         .zip(spec.idx.iter())
-        .filter_map(|((entry, route), route_index)| {
-            if entry.kind == RouteKind::Sync {
-                return None;
+    {
+        if entry.kind == RouteKind::Sync {
+            continue;
+        }
+        let producer = (entry.kind == RouteKind::Fiber).then(|| {
+            let slot = producer_slot;
+            producer_slot += 1;
+            ProducerSpec {
+                slot,
+                future: format_ident!("__F{:04}", slot),
+                maker: format_ident!("__MK{:04}", slot),
             }
-            Some((entry, route, route_index))
-        })
-        .enumerate()
-        .map(|(slot, (entry, route, route_index))| TaskSpec {
+        });
+        tasks.push(TaskSpec {
             route,
             route_index,
             kind: &entry.kind,
             capacity: entry.capacity.as_ref().expect("async route capacity"),
-            slot,
-            future: format_ident!("__F{:04}", slot),
-            maker: format_ident!("__MK{:04}", slot),
+            slot: tasks.len(),
+            producer,
+        });
+    }
+    tasks
+}
+
+fn producer_idents<'a>(tasks: &'a [TaskSpec<'_>]) -> (Vec<&'a syn::Ident>, Vec<&'a syn::Ident>) {
+    tasks
+        .iter()
+        .filter_map(|task| task.producer.as_ref())
+        .map(|producer| (&producer.future, &producer.maker))
+        .unzip()
+}
+
+fn producer_bounds(tasks: &[TaskSpec<'_>], state_ty: &syn::Type) -> Vec<TokenStream> {
+    tasks
+        .iter()
+        .filter_map(|task| {
+            let producer = task.producer.as_ref()?;
+            let route = task.route;
+            let future = &producer.future;
+            let maker = &producer.maker;
+            let output = task.producer_output();
+            Some(quote! {
+                #future: ::sark::fiber::Fiber<
+                        'd,
+                        Output = #output,
+                    > + 'env,
+                #maker: ::core::marker::Copy
+                    + 'env
+                    + ::core::ops::FnOnce(
+                        ::sark::request::RequestStorage,
+                        <#route as ::sark::service::RouteSpec>::RawParams,
+                        <#route as ::sark::service::RouteSpec>::RawHeaders,
+                        ::core::ops::Range<usize>,
+                        &'env #state_ty,
+                        &'env ::sark::Timer<'d>,
+                    ) -> ::core::result::Result<#future, &'static [u8]>,
+            })
+        })
+        .collect()
+}
+
+fn task_storage_bounds(tasks: &[TaskSpec<'_>]) -> Vec<TokenStream> {
+    tasks
+        .iter()
+        .map(|task| {
+            let task_type = task.task_type();
+            let output = task.slab_output();
+            quote! {
+                #task_type: ::sark::fiber::FixedSlabFiber<'d, #output>,
+            }
+        })
+        .collect()
+}
+
+fn stream_shape_bounds(tasks: &[TaskSpec<'_>]) -> Vec<TokenStream> {
+    tasks
+        .iter()
+        .filter(|task| matches!(task.kind, RouteKind::Stream))
+        .map(|task| {
+            let route = task.route;
+            quote! {
+                for<'__req> <<#route as ::sark::service::RouteSpec>::Response<'__req>
+                    as ::sark::sark_core::http::Shape<'__req>>::Metadata:
+                    ::sark::sark_core::http::ShapeMetadata<
+                        Stream = <#route as ::sark::service::RouteSpec>::Stream,
+                    >,
+            }
         })
         .collect()
 }
@@ -94,220 +164,6 @@ pub(super) struct ServeEmit<'a> {
 impl<'a> ServeEmit<'a> {
     pub(super) fn new(spec: &'a Gen) -> Self {
         Self { spec }
-    }
-
-    pub(super) fn head_parts(&self) -> TokenStream {
-        let routes = &self.spec.routes;
-        let key_ident = &self.spec.key_ident;
-        let parts_ident = &self.spec.parts_ident;
-        let key_vars = &self.spec.key_vars;
-        let parts_header_bytes_arms = &self.spec.parts_header_bytes_arms;
-        let parts_query_name_arms = &self.spec.parts_query_name_arms;
-        let parts_query_slice_arms = &self.spec.parts_query_slice_arms;
-        let parts_query_parse_arms = &self.spec.parts_query_parse_arms;
-        let route_tag_arms: Vec<TokenStream> = key_vars
-            .iter()
-            .enumerate()
-            .map(|(i, key)| {
-                let tag = (i as u64) + 1;
-                quote! { #parts_ident::#key { .. } => #tag, }
-            })
-            .collect();
-        quote! {
-            impl sark::service::HeadParts<#key_ident> for #parts_ident {
-                const NEED_FIELDS: bool = false;
-                const NEED_HEADER: bool = false #( || <<#routes as sark::service::RouteSpec>::Request as sark::service::RouteRequestImpl>::NEED_HEADER )*;
-                const NEED_KNOWN_HEADER: bool =
-                    false #( || <<#routes as sark::service::RouteSpec>::Request as sark::service::RouteRequestImpl>::NEED_KNOWN_HEADER )*;
-                const NEED_QUERY: bool = false #( || <<#routes as sark::service::RouteSpec>::Request as sark::service::RouteRequestImpl>::NEED_QUERY )*;
-
-                fn new(_route: #key_ident) -> Self {
-                    #parts_ident::Miss {
-                        method_key: None,
-                        path_hit: false,
-                    }
-                }
-
-                fn wants_query(&self) -> bool {
-                    match self {
-                        #( #parts_ident::#key_vars { .. } => <<#routes as sark::service::RouteSpec>::Request as sark::service::RouteRequestImpl>::NEED_QUERY, )*
-                        #parts_ident::Miss { .. } => false,
-                    }
-                }
-
-                fn route_tag(&self) -> u64 {
-                    match self {
-                        #( #route_tag_arms )*
-                        #parts_ident::Miss { method_key, path_hit } => {
-                            sark::service::Key::miss_tag(*method_key, *path_hit)
-                        }
-                    }
-                }
-
-                fn set_header_name<V>(&mut self, name: &[u8], value: &V) -> sark::error::Result<()>
-                where
-                    V: sark::service::HeaderValue,
-                {
-                    match self {
-                        #( #parts_header_bytes_arms )*
-                        #parts_ident::Miss { .. } => {}
-                    }
-                    Ok(())
-                }
-
-                fn apply_header<I: sark::sark_core::http::head::HeadInput + ?Sized>(
-                    &mut self,
-                    input: &I,
-                    line: &[u8],
-                    line_start: usize,
-                    colon_idx: usize,
-                    pretrim_start: Option<usize>,
-                    pretrim_end: Option<usize>,
-                    scan: &mut sark_core::http::codec::HeaderScan,
-                    flags: &mut sark::sark_core::http::head::Flags,
-                    scan_info: Option<&sark::sark_core::http::head::HeaderLineScan>,
-                ) -> sark::error::Result<()> {
-                    match self {
-                        #( #parts_ident::#key_vars { headers, .. } => <<#routes as sark::service::RouteSpec>::Request as sark::service::RouteRequestImpl>::apply_header(headers, input, line, line_start, colon_idx, pretrim_start, pretrim_end, scan, flags, scan_info), )*
-                        #parts_ident::Miss { .. } => sark::parser::head::HeaderApply::generic::<I, #key_ident, Self>(input, line, line_start, colon_idx, pretrim_start, pretrim_end, self, scan, flags, scan_info),
-                    }
-                }
-
-                fn set_header<V>(&mut self, slot: u8, value: &V) -> sark::error::Result<()>
-                where
-                    V: sark::service::HeaderValue,
-                {
-                    match self {
-                        #( #parts_ident::#key_vars { headers, .. } => <<#routes as sark::service::RouteSpec>::Request as sark::service::RouteRequestImpl>::set_header_u8(headers, slot, value)?, )*
-                        #parts_ident::Miss { .. } => {}
-                    }
-                    Ok(())
-                }
-
-                fn set_query_name<V>(&mut self, name: &[u8], value: &V) -> sark::error::Result<()>
-                where
-                    V: sark::service::HeaderValue,
-                {
-                    match self {
-                        #( #parts_query_name_arms )*
-                        #parts_ident::Miss { .. } => {}
-                    }
-                    Ok(())
-                }
-
-                fn set_query_slice(
-                    &mut self,
-                    name: &[u8],
-                    input: &[u8],
-                    range: std::ops::Range<usize>,
-                ) -> sark::error::Result<()> {
-                    match self {
-                        #( #parts_query_slice_arms )*
-                        #parts_ident::Miss { .. } => {}
-                    }
-                    Ok(())
-                }
-
-                fn parse_query(
-                    &mut self,
-                    input: &[u8],
-                    range: std::ops::Range<usize>,
-                ) -> sark::error::Result<()> {
-                    match self {
-                        #( #parts_query_parse_arms )*
-                        #parts_ident::Miss { .. } => {}
-                    }
-                    Ok(())
-                }
-            }
-        }
-    }
-
-    pub(super) fn head_visitor(&self) -> TokenStream {
-        let vis = &self.spec.vis;
-        let parts_ident = &self.spec.parts_ident;
-        let visitor_ident = format_ident!("{}Visitor", parts_ident);
-        let routes = &self.spec.routes;
-        quote! {
-            #[allow(dead_code)]
-            #vis struct #visitor_ident {
-                parts: #parts_ident,
-            }
-
-            #[allow(dead_code)]
-            impl #visitor_ident {
-                pub fn new() -> Self {
-                    Self {
-                        parts: #parts_ident::Miss {
-                            method_key: None,
-                            path_hit: false,
-                        },
-                    }
-                }
-
-                pub fn into_parts(self) -> #parts_ident {
-                    self.parts
-                }
-            }
-
-            impl Default for #visitor_ident {
-                fn default() -> Self {
-                    Self::new()
-                }
-            }
-
-            impl ::sark::http::head::Visitor for #visitor_ident {
-                type Parsed = ::sark::http::head::ParsedRequest;
-
-                const WANTS_KNOWN: bool =
-                    false #( || <<#routes as sark::service::RouteSpec>::Request as sark::service::RouteRequestImpl>::NEED_KNOWN_HEADER )*;
-
-                fn start_line(
-                    &mut self,
-                    _parsed: &Self::Parsed,
-                    _raw: &[u8],
-                ) -> ::sark::error::Result<()> {
-                    Ok(())
-                }
-
-                fn known(
-                    &mut self,
-                    _key: ::sark::http::head::KnownHeader,
-                    _value: &[u8],
-                ) -> ::sark::error::Result<()> {
-                    Ok(())
-                }
-
-                fn unknown(
-                    &mut self,
-                    _name: &[u8],
-                    _value: &[u8],
-                ) -> ::sark::error::Result<()> {
-                    Ok(())
-                }
-            }
-        }
-    }
-
-    pub(super) fn plan(&self) -> TokenStream {
-        let vis = &self.spec.vis;
-        let plan_ident = &self.spec.plan_ident;
-        let key_ident = &self.spec.key_ident;
-        quote! {
-            #vis struct #plan_ident;
-
-            impl sark::service::HeadPlan for #plan_ident {
-                type RouteKey = #key_ident;
-
-                fn route_key_probe<P: sark::service::PathProbe>(
-                    &self,
-                    _method_key: sark::service::Key,
-                    _path: &P,
-                ) -> Self::RouteKey {
-                    #key_ident::Miss
-                }
-            }
-        }
     }
 
     pub(super) fn app(&self) -> TokenStream {
@@ -325,69 +181,16 @@ impl<'a> ServeEmit<'a> {
         let route_bounds = &self.spec.route_bounds;
         let tasks = task_specs(self.spec);
         let task_count = tasks.len();
-        let futures: Vec<_> = tasks.iter().map(|task| &task.future).collect();
-        let makers: Vec<_> = tasks.iter().map(|task| &task.maker).collect();
-        let kind_bounds: Vec<TokenStream> = tasks
-            .iter()
-            .map(|task| {
-                let route = task.route;
-                let future = &task.future;
-                quote! {
-                    <#route as ::sark::service::RouteSpec>::Kind:
-                        ::sark::service::manifold::InvokeKind<#route>
-                        + ::sark::service::manifold::Kind<
-                            'd,
-                            #route,
-                            #future,
-                            Owner = (),
-                        >
-                }
-            })
-            .collect();
-        let maker_bounds: Vec<TokenStream> = tasks
-            .iter()
-            .map(|task| {
-                let route = task.route;
-                let future = &task.future;
-                let maker = &task.maker;
-                let output = task.producer_output();
-                quote! {
-                    #future: ::sark::fiber::Fiber<
-                            'd,
-                            Output = #output,
-                        > + 'env,
-                    #maker: ::core::marker::Copy
-                        + 'env
-                        + ::core::ops::FnOnce(
-                            ::sark::request::RequestStorage,
-                            <#route as ::sark::service::RouteSpec>::RawParams,
-                            <#route as ::sark::service::RouteSpec>::RawHeaders,
-                            ::core::ops::Range<usize>,
-                            &'env #state_ty,
-                            &'env ::sark::Timer<'d>,
-                        ) -> ::core::result::Result<#future, &'static [u8]>,
-                }
-            })
-            .collect();
-        let slab_bounds: Vec<TokenStream> = tasks
-            .iter()
-            .map(|task| {
-                let task_type = task.slab_type();
-                let output = task.slab_output();
-                quote! {
-                    #task_type: ::sark::fiber::FixedSlabFiber<
-                        'd,
-                        #output,
-                    >,
-                }
-            })
-            .collect();
+        let (futures, makers) = producer_idents(&tasks);
+        let maker_bounds = producer_bounds(&tasks, state_ty);
+        let slab_bounds = task_storage_bounds(&tasks);
+        let stream_bounds = stream_shape_bounds(&tasks);
         let producer_values: Vec<TokenStream> = tasks
             .iter()
-            .map(|task| {
+            .filter_map(|task| {
+                task.producer.as_ref()?;
                 let route = task.route;
-                match task.kind {
-                    RouteKind::Fiber => quote! {
+                Some(quote! {
                     |
                         storage: ::sark::request::RequestStorage,
                         raw_params: <#route as ::sark::service::RouteSpec>::RawParams,
@@ -396,32 +199,15 @@ impl<'a> ServeEmit<'a> {
                         state: &'env #state_ty,
                         timer: &'env ::sark::Timer<'d>,
                     | {
-                        ::sark::fiber::try_from_split_task::<
+                        storage.try_into_task::<
                             ::sark::dispatch::RequestTask<#route, #state_ty>,
                         >(
-                            storage,
                             (raw_params, raw_headers, target),
                             state,
                             timer,
                         )
                     }
-                    },
-                    RouteKind::Stream => quote! {
-                        |
-                            _storage: ::sark::request::RequestStorage,
-                            _raw_params: <#route as ::sark::service::RouteSpec>::RawParams,
-                            _raw_headers: <#route as ::sark::service::RouteSpec>::RawHeaders,
-                            _target: ::core::ops::Range<usize>,
-                            _state: &'env #state_ty,
-                            _timer: &'env ::sark::Timer<'d>,
-                        | {
-                            ::core::result::Result::<_, &'static [u8]>::Ok(
-                                ::sark::service::manifold::ready(),
-                            )
-                        }
-                    },
-                    RouteKind::Sync => unreachable!("sync routes have no task producer"),
-                }
+                })
             })
             .collect();
         let task_types: Vec<TokenStream> = tasks.iter().map(TaskSpec::task_type).collect();
@@ -468,12 +254,22 @@ impl<'a> ServeEmit<'a> {
         let build_return = quote! {
             super::#name<'env, 'd, __W, #( #futures, )* #( #makers, )*>
         };
+        let producer_field = if makers.is_empty() {
+            TokenStream::new()
+        } else {
+            quote! { task_producers: ( #( #makers, )* ), }
+        };
+        let producer_initializer = if makers.is_empty() {
+            TokenStream::new()
+        } else {
+            quote! { task_producers: producers, }
+        };
         let task_fields = if tasks.is_empty() {
             TokenStream::new()
         } else {
             quote! {
                 #( #[pin] #task_field_names: #task_slab_types, )*
-                task_producers: ( #( #makers, )* ),
+                #producer_field
                 task_capacity: usize,
                 active_tasks: usize,
             }
@@ -488,17 +284,17 @@ impl<'a> ServeEmit<'a> {
                         ::sark::fiber::FixedSlab::new()
                     },
                 )*
-                task_producers: producers,
+                #producer_initializer
                 task_capacity: config.task_capacity,
                 active_tasks: 0,
             }
         };
-        let producer_parameter = if tasks.is_empty() {
+        let producer_parameter = if makers.is_empty() {
             TokenStream::new()
         } else {
             quote! { producers: ( #( #makers, )* ), }
         };
-        let producer_argument = if tasks.is_empty() {
+        let producer_argument = if makers.is_empty() {
             TokenStream::new()
         } else {
             quote! { ( #( #producer_values, )* ), }
@@ -553,7 +349,7 @@ impl<'a> ServeEmit<'a> {
             where
                 #( #route_bounds )*
                 #( #maker_bounds )*
-                #( #kind_bounds, )*
+                #( #slab_bounds )*
             {
                 fn __project(
                     self: ::core::pin::Pin<&mut Self>,
@@ -577,7 +373,7 @@ impl<'a> ServeEmit<'a> {
                     state: &'env #state_ty,
                     timer: &'env ::sark::Timer<'d>,
                     config: ::sark::app::Config,
-                ) -> impl ::dope::manifold::listener::Application<
+                ) -> impl ::dope::manifold::listener::application::Application<
                         'd,
                         Conn = ::sark::dispatch::conn_state::ConnState,
                         Wire = __W,
@@ -590,6 +386,7 @@ impl<'a> ServeEmit<'a> {
                     + 'env
                 where
                     #( #route_bounds )*
+                    #( #stream_bounds )*
                 {
                     #constructor_module::build(
                         state,
@@ -618,7 +415,8 @@ impl<'a> ServeEmit<'a> {
                 where
                     #( #route_bounds )*
                     #( #maker_bounds )*
-                    #( #kind_bounds, )*
+                    #( #slab_bounds )*
+                    #( #stream_bounds )*
                 {
                     super::#name {
                         core: super::#core_ident {
@@ -647,9 +445,10 @@ impl<'a> ServeEmit<'a> {
         let route_bounds = &self.spec.route_bounds;
         let core_ident = format_ident!("{}Core", name);
         let tasks = task_specs(self.spec);
-        let futures: Vec<_> = tasks.iter().map(|task| &task.future).collect();
-        let makers: Vec<_> = tasks.iter().map(|task| &task.maker).collect();
+        let (futures, makers) = producer_idents(&tasks);
         let task_types: Vec<TokenStream> = tasks.iter().map(TaskSpec::task_type).collect();
+        let slab_bounds = task_storage_bounds(&tasks);
+        let stream_bounds = stream_shape_bounds(&tasks);
         let task_tags: Vec<_> = (0..tasks.len())
             .map(|slot| format_ident!("__{}TaskTag{:04}", self.spec.name, slot))
             .collect();
@@ -682,63 +481,73 @@ impl<'a> ServeEmit<'a> {
             .spec
             .route_specs
             .iter()
-            .map(|entry| build_wrap_before_chain(&entry.wraps))
+            .map(|entry| build_wrap_before_chain(&entry.wraps, entry.meta.method))
             .collect();
-        let maker_bounds: Vec<TokenStream> = tasks
+        let mut methods = Vec::new();
+        for entry in &self.spec.route_specs {
+            if !methods.contains(&entry.meta.method) {
+                methods.push(entry.meta.method);
+            }
+        }
+        methods.sort_by_key(|method| method.ord());
+        let method_bits: Vec<TokenStream> =
+            methods.iter().map(|method| method.bit_token()).collect();
+        let method_mask = quote!(0u8 #( | #method_bits )*);
+        let decoded_method_checks: Vec<TokenStream> = methods
             .iter()
-            .map(|task| {
-                let route = task.route;
-                let future = &task.future;
-                let maker = &task.maker;
-                let output = task.producer_output();
+            .map(|method| {
+                let http = method.http_token();
+                let key = method.key_token();
                 quote! {
-                    #future: ::sark::fiber::Fiber<
-                            'd,
-                            Output = #output,
-                        > + 'env,
-                    #maker: ::core::marker::Copy
-                        + 'env
-                        + ::core::ops::FnOnce(
-                            ::sark::request::RequestStorage,
-                            <#route as ::sark::service::RouteSpec>::RawParams,
-                            <#route as ::sark::service::RouteSpec>::RawHeaders,
-                            ::core::ops::Range<usize>,
-                            &'env #state_ty,
-                            &'env ::sark::Timer<'d>,
-                        ) -> ::core::result::Result<#future, &'static [u8]>,
+                    if __http_method == #http {
+                        ::core::option::Option::Some(#key)
+                    }
+                }
+            })
+            .collect();
+        let decoded_method_key = quote! {
+            let decoded_method_key = #( #decoded_method_checks else )*
+            {
+                ::core::option::Option::None
+            };
+        };
+        let maker_bounds = producer_bounds(&tasks, state_ty);
+        let completion_bounds: Vec<TokenStream> = tasks
+            .iter()
+            .zip(task_types.iter())
+            .map(|(task, task_type)| {
+                let route = task.route;
+                quote! {
                     <#route as ::sark::service::RouteSpec>::Kind:
-                        ::sark::service::manifold::InvokeKind<#route>
-                        + ::sark::service::manifold::Kind<
-                            'd,
-                            #route,
-                            #future,
-                            Owner = (),
-                        >
-                        + ::sark::dispatch::Dispatch<
-                            'env,
-                            'd,
-                            #route,
-                            #state_ty,
-                            #future,
-                        >
-                        + ::sark::dispatch::Complete<'d, #route, #future>
-                        + ::sark::dispatch::DecodeRoute<#route, #state_ty>,
+                        ::sark::dispatch::Complete<'d, #route, #task_type>,
                 }
             })
             .collect();
         let decode_bounds: Vec<TokenStream> = self
             .spec
-            .route_specs
+            .routes
             .iter()
-            .zip(routes.iter())
-            .filter(|(entry, _)| entry.kind == RouteKind::Sync)
-            .map(|(_, route)| {
+            .map(|route| {
                 quote! {
                     <#route as ::sark::service::RouteSpec>::Kind:
                         ::sark::dispatch::DecodeRoute<#route, #state_ty>,
                 }
             })
             .collect();
+        let base_bounds = quote! {
+            #( #route_bounds )*
+            #( #maker_bounds )*
+            #( #slab_bounds )*
+            #( #stream_bounds )*
+        };
+        let pump_bounds = quote! {
+            #base_bounds
+            #( #completion_bounds )*
+        };
+        let decoded_bounds = quote! {
+            #base_bounds
+            #( #decode_bounds )*
+        };
         let generic_def = quote! {
             <
                 'env,
@@ -755,6 +564,21 @@ impl<'a> ServeEmit<'a> {
             let route = &routes[index];
             let middleware = &wrap_before[index];
             let setup = quote! {
+                if <<#route as ::sark::service::RouteSpec>::Request
+                        as ::sark::service::RouteRequestImpl>::FULL
+                    && !::sark::sark_core::http::scan::request_target_is_valid(
+                        head.target,
+                    )
+                {
+                    return ::sark::dispatch::ConsumeOutcome::Close(
+                        ::sark::CANNED_400,
+                    );
+                }
+                let ctx = ::sark::dispatch::Ctx::routed(
+                    req_bytes,
+                    head,
+                    __path_end,
+                );
                 #middleware
                 let state: &'env #state_ty = state;
             };
@@ -781,44 +605,59 @@ impl<'a> ServeEmit<'a> {
                 };
             };
             let task = &tasks[task_slot];
-            let future = &task.future;
             let capacity = task.capacity;
-            let task_type = &task_types[task_slot];
             let task_tag = &task_tags[task_slot];
             let task_field = &task_field_names[task_slot];
-            let task_index = syn::Index::from(task_slot);
             let task_route = task_slot as u16;
+            let matched = quote! {
+                ::sark::dispatch::Matched {
+                    raw_params: #raw_params,
+                }
+            };
+            let dispatch = match task.kind {
+                RouteKind::Fiber => {
+                    let producer = task.producer.as_ref().expect("fiber route task producer");
+                    let future = &producer.future;
+                    let producer_index = syn::Index::from(producer.slot);
+                    quote! {
+                        {
+                            let timer: &'env ::sark::Timer<'d> = *this.timer;
+                            let producer = this.task_producers.#producer_index;
+                            ::sark::dispatch::FiberRoute::new(
+                                &ctx,
+                                state,
+                                timer,
+                                conn,
+                            ).dispatch::<#route, #future, #task_tag, _, { #capacity }>(
+                                permit,
+                                #matched,
+                                this.#task_field.as_mut(),
+                                producer,
+                            )
+                        }
+                    }
+                }
+                RouteKind::Stream => quote! {
+                    ::sark::dispatch::StreamRoute::new(
+                        &ctx,
+                        write,
+                        date,
+                        conn,
+                    ).dispatch::<#route, #state_ty, #task_tag, { #capacity }>(
+                        permit,
+                        #matched,
+                        this.#task_field.as_mut(),
+                        state,
+                    )
+                },
+                RouteKind::Sync => unreachable!("sync routes have no task slot"),
+            };
             quote! {
                 #setup
                 if *this.active_tasks >= *this.task_capacity {
                     return ::sark::dispatch::ConsumeOutcome::Close(::sark::CANNED_503);
                 }
-                let timer: &'env ::sark::Timer<'d> = *this.timer;
-                let producer = this.task_producers.#task_index;
-                let outcome = <<#route as ::sark::service::RouteSpec>::Kind
-                    as ::sark::dispatch::Dispatch<
-                        'env,
-                        'd,
-                        #route,
-                        #state_ty,
-                        #future,
-                    >>::dispatch::<#task_type, #task_tag, _, _, { #capacity }>(
-                        permit,
-                        ::sark::dispatch::Matched {
-                            raw_params: #raw_params,
-                        },
-                    this.#task_field.as_mut(),
-                    state,
-                    &ctx,
-                    timer,
-                    conn,
-                    date,
-                    ::sark::dispatch::response_cache::Cache::empty(),
-                    this.gzip,
-                    write,
-                    producer,
-                    |task, ()| task,
-                );
+                let outcome = #dispatch;
                 if conn.async_state.task.is_some() {
                     conn.async_state.task_route = #task_route;
                     *this.active_tasks += 1;
@@ -848,7 +687,7 @@ impl<'a> ServeEmit<'a> {
                     body: quote! {
                         let ::core::option::Option::Some(__raw) =
                             <#route as ::sark::service::RouteSpec>::from_captures(
-                                &ctx.slice_path,
+                                &__route_path,
                                 #captures,
                             )
                         else {
@@ -872,26 +711,7 @@ impl<'a> ServeEmit<'a> {
             }
         }
         let param_dfa = ParamRoute::compile(param_routes);
-        let static_tree = StaticRoute::compile(static_routes);
-        let context = if static_tree.is_empty() && param_dfa.is_empty() {
-            quote!(let _ = method_key;)
-        } else {
-            quote! {
-                let ctx = ::sark::dispatch::Ctx::parse_with_key(
-                    req_bytes,
-                    head,
-                    method_key,
-                );
-            }
-        };
-        let method_path = if static_tree.is_empty() {
-            TokenStream::new()
-        } else {
-            quote! {
-                let __method = method_key;
-                let __path = ctx.slice_path.bytes();
-            }
-        };
+        let static_tree = StaticRoute::compile_target(static_routes);
         let dispatch_body = quote! {
             let target = head.target;
             if target.first() != ::core::option::Option::Some(&b'/') {
@@ -903,8 +723,9 @@ impl<'a> ServeEmit<'a> {
                     },
                 );
             }
-            #context
-            #method_path
+            let __method = method;
+            let __target = target;
+            let __route_path = ::sark::service::TargetPath::new(target);
             #static_tree
             #param_dfa
             ::sark::dispatch::ConsumeOutcome::Close(::sark::CANNED_404)
@@ -950,6 +771,21 @@ impl<'a> ServeEmit<'a> {
             let route = &routes[index];
             let variant = &prepared_variants[index];
             quote! {
+                if <<#route as ::sark::service::RouteSpec>::Request
+                        as ::sark::service::RouteRequestImpl>::FULL
+                    && !::sark::sark_core::http::scan::request_target_is_valid(
+                        __request_target,
+                    )
+                {
+                    return ::core::result::Result::Err(
+                        ::sark::dispatch::Decoded::Bad,
+                    );
+                }
+                let __query_range =
+                    (__path_end < __request_target.len()).then(|| {
+                        (__target_range.start + __path_end + 1)
+                            ..__target_range.end
+                    });
                 let mut __raw_headers =
                     <<#route as ::sark::service::RouteSpec>::RawHeaders
                         as ::core::default::Default>::default();
@@ -997,7 +833,7 @@ impl<'a> ServeEmit<'a> {
                     fields: __fields,
                     raw_params: #raw_params,
                     raw_headers: __raw_headers,
-                    target: __target,
+                    target: __target_range,
                     method: __http_method,
                     content_length: __content_length,
                 });
@@ -1024,7 +860,7 @@ impl<'a> ServeEmit<'a> {
                     body: quote! {
                         let ::core::option::Option::Some(__raw) =
                             <#route as ::sark::service::RouteSpec>::from_captures(
-                                &ctx.slice_path,
+                                &__route_path,
                                 #captures,
                             )
                         else {
@@ -1047,7 +883,7 @@ impl<'a> ServeEmit<'a> {
                 });
             }
         }
-        let decoded_static_tree = StaticRoute::compile(decoded_static_routes);
+        let decoded_static_tree = StaticRoute::compile_target(decoded_static_routes);
         let decoded_param_dfa = ParamRoute::compile(decoded_param_routes);
         let dispatch_prepared_arms: Vec<TokenStream> = routes
             .iter()
@@ -1143,31 +979,27 @@ impl<'a> ServeEmit<'a> {
                 }
                 let (
                     ::core::option::Option::Some(__http_method),
-                    ::core::option::Option::Some(__target),
+                    ::core::option::Option::Some(__target_range),
                 ) = (__http_method, __target)
                 else {
                     return ::core::result::Result::Err(
                         ::sark::dispatch::Decoded::Bad,
                     );
                 };
-                let __request_target = &__head_bytes[__target.clone()];
+                let __request_target = &__head_bytes[__target_range.clone()];
                 if __request_target.first() != ::core::option::Option::Some(&b'/') {
                     return ::core::result::Result::Err(
                         ::sark::dispatch::Decoded::Bad,
                     );
                 }
-                let __path_end = __request_target
-                    .iter()
-                    .position(|__byte| *__byte == b'?')
-                    .unwrap_or(__request_target.len());
-                let __path = &__request_target[..__path_end];
-                let __query_range = (__path_end < __request_target.len()).then(|| {
-                    (__target.start + __path_end + 1)..__target.end
-                });
-                let __method = ::sark::service::Key::from_bytes(
-                    ::sark::sark_core::http::Method::as_str(&__http_method).as_bytes(),
-                );
-                let ctx = ::sark::dispatch::DecodedCtx::new(__method, __path);
+                #decoded_method_key
+                let ::core::option::Option::Some(__method) = decoded_method_key else {
+                    return ::core::result::Result::Err(
+                        ::sark::dispatch::Decoded::NotFound,
+                    );
+                };
+                let __target = __request_target;
+                let __route_path = ::sark::service::TargetPath::new(__request_target);
                 #decoded_static_tree
                 #decoded_param_dfa
                 ::core::result::Result::Err(::sark::dispatch::Decoded::NotFound)
@@ -1191,7 +1023,7 @@ impl<'a> ServeEmit<'a> {
             .iter()
             .map(|task| {
                 let route = task.route;
-                let future = &task.future;
+                let task_type = &task_types[task.slot];
                 let task_field = &task_field_names[task.slot];
                 let task_route = task.slot as u16;
                 quote! {
@@ -1200,19 +1032,19 @@ impl<'a> ServeEmit<'a> {
                         let written = task_runner.poll(
                             this.#task_field.as_mut(),
                             slot,
-                            aux,
+                            egress,
                             driver,
                             &project,
-                            |output, task_slot, task_aux, task_driver, task_date, close| {
+                            |output, task_slot, task_egress, task_driver, task_date, close| {
                                 <<#route as ::sark::service::RouteSpec>::Kind
                                     as ::sark::dispatch::Complete<
                                         'd,
                                         #route,
-                                        #future,
+                                        #task_type,
                                     >>::complete(
                                     output,
                                     task_slot,
-                                    task_aux,
+                                    task_egress,
                                     task_driver,
                                     task_date,
                                     close,
@@ -1220,9 +1052,9 @@ impl<'a> ServeEmit<'a> {
                             },
                         );
                         if written > 0 {
-                            let buffer = task_runner.write_buf(slot, aux);
+                            let buffer = task_runner.write_buf(slot, egress);
                             let token = slot.token();
-                            ::dope::manifold::listener::SlotEgress::submit_buffered(
+                            ::dope::manifold::listener::egress::SlotEgress::submit_buffered(
                                 slot,
                                 buffer,
                                 written,
@@ -1253,7 +1085,7 @@ impl<'a> ServeEmit<'a> {
                 ).send_complete_proj(
                     sent,
                     slot,
-                    aux,
+                    egress,
                     driver,
                     &project,
                 );
@@ -1277,7 +1109,7 @@ impl<'a> ServeEmit<'a> {
                 ).send_complete_proj(
                     sent,
                     slot,
-                    aux,
+                    egress,
                     driver,
                     &project,
                 );
@@ -1289,7 +1121,7 @@ impl<'a> ServeEmit<'a> {
                     self.as_ref().get_ref(),
                 ).poll_proj(
                     slot,
-                    aux,
+                    egress,
                     driver,
                     &project,
                 );
@@ -1300,7 +1132,7 @@ impl<'a> ServeEmit<'a> {
                     self.as_ref().get_ref(),
                 ).poll_proj(
                     slot,
-                    aux,
+                    egress,
                     driver,
                     &project,
                 ) {
@@ -1376,7 +1208,7 @@ impl<'a> ServeEmit<'a> {
             ::dope_net::link::slot::Slot<
                 'd,
                 __W,
-                ::dope::manifold::listener::State<__C>,
+                ::dope::manifold::listener::state::State<__C>,
             >
         };
         quote! {
@@ -1395,15 +1227,14 @@ impl<'a> ServeEmit<'a> {
 
             impl #generic_def #core_ident #generic_use
             where
-                #( #route_bounds )*
-                #( #maker_bounds )*
+                #pump_bounds
             {
                 fn chunk_proj<__C, __PJ>(
                     self: ::core::pin::Pin<&mut Self>,
                     date: &::sark::date::Stamp,
                     slot: &mut #projection_slot,
                     bytes: &[u8],
-                    aux: &mut ::dope::manifold::listener::Aux,
+                    egress: &mut ::dope::manifold::listener::state::EgressCtx<'_, '_>,
                     driver: &mut ::dope::DriverContext<'_, 'd>,
                     project: __PJ,
                 ) -> bool
@@ -1416,7 +1247,7 @@ impl<'a> ServeEmit<'a> {
                     ).run_proj(
                         bytes,
                         slot,
-                        aux,
+                        egress,
                         driver,
                         project,
                     )
@@ -1428,7 +1259,7 @@ impl<'a> ServeEmit<'a> {
                     slot: &mut #projection_slot,
                     project: __PJ,
                     sent: usize,
-                    aux: &mut ::dope::manifold::listener::Aux,
+                    egress: &mut ::dope::manifold::listener::state::EgressCtx<'_, '_>,
                     driver: &mut ::dope::DriverContext<'_, 'd>,
                 )
                 where
@@ -1442,7 +1273,7 @@ impl<'a> ServeEmit<'a> {
                     date: &::sark::date::Stamp,
                     slot: &mut #projection_slot,
                     project: __PJ,
-                    aux: &mut ::dope::manifold::listener::Aux,
+                    egress: &mut ::dope::manifold::listener::state::EgressCtx<'_, '_>,
                     driver: &mut ::dope::DriverContext<'_, 'd>,
                 )
                 where
@@ -1455,7 +1286,7 @@ impl<'a> ServeEmit<'a> {
                     self: ::core::pin::Pin<&mut Self>,
                     slot: &mut #projection_slot,
                     project: __PJ,
-                    _aux: &mut ::dope::manifold::listener::Aux,
+                    _egress: &mut ::dope::manifold::listener::state::EgressCtx<'_, '_>,
                 )
                 where
                     #projection_bounds
@@ -1467,14 +1298,13 @@ impl<'a> ServeEmit<'a> {
             impl #generic_def ::sark::dispatch::H1Project<'d, __W>
                 for #name #generic_use
             where
-                #( #route_bounds )*
-                #( #maker_bounds )*
+                #pump_bounds
             {
                 fn chunk_proj<__C, __PJ>(
                     self: ::core::pin::Pin<&mut Self>,
                     slot: &mut #projection_slot,
                     bytes: &[u8],
-                    aux: &mut ::dope::manifold::listener::Aux,
+                    egress: &mut ::dope::manifold::listener::state::EgressCtx<'_, '_>,
                     driver: &mut ::dope::DriverContext<'_, 'd>,
                     project: __PJ,
                 ) -> bool
@@ -1486,7 +1316,7 @@ impl<'a> ServeEmit<'a> {
                         date.as_ref().get_ref(),
                         slot,
                         bytes,
-                        aux,
+                        egress,
                         driver,
                         project,
                     )
@@ -1497,7 +1327,7 @@ impl<'a> ServeEmit<'a> {
                     slot: &mut #projection_slot,
                     project: __PJ,
                     sent: usize,
-                    aux: &mut ::dope::manifold::listener::Aux,
+                    egress: &mut ::dope::manifold::listener::state::EgressCtx<'_, '_>,
                     driver: &mut ::dope::DriverContext<'_, 'd>,
                 )
                 where
@@ -1509,7 +1339,7 @@ impl<'a> ServeEmit<'a> {
                         slot,
                         project,
                         sent,
-                        aux,
+                        egress,
                         driver,
                     );
                 }
@@ -1518,7 +1348,7 @@ impl<'a> ServeEmit<'a> {
                     self: ::core::pin::Pin<&mut Self>,
                     slot: &mut #projection_slot,
                     project: __PJ,
-                    aux: &mut ::dope::manifold::listener::Aux,
+                    egress: &mut ::dope::manifold::listener::state::EgressCtx<'_, '_>,
                     driver: &mut ::dope::DriverContext<'_, 'd>,
                 )
                 where
@@ -1529,7 +1359,7 @@ impl<'a> ServeEmit<'a> {
                         date.as_ref().get_ref(),
                         slot,
                         project,
-                        aux,
+                        egress,
                         driver,
                     );
                 }
@@ -1538,20 +1368,19 @@ impl<'a> ServeEmit<'a> {
                     self: ::core::pin::Pin<&mut Self>,
                     slot: &mut #projection_slot,
                     project: __PJ,
-                    aux: &mut ::dope::manifold::listener::Aux,
+                    egress: &mut ::dope::manifold::listener::state::EgressCtx<'_, '_>,
                 )
                 where
                     #projection_bounds
                 {
                     let (mut core, _) = self.__project();
-                    core.as_mut().close_proj(slot, project, aux);
+                    core.as_mut().close_proj(slot, project, egress);
                 }
             }
 
             impl #generic_def #core_ident #generic_use
             where
-                #( #route_bounds )*
-                #( #maker_bounds )*
+                #base_bounds
             {
                 #[allow(clippy::too_many_arguments)]
                 fn dispatch_request<'buf>(
@@ -1559,8 +1388,8 @@ impl<'a> ServeEmit<'a> {
                     permit: ::sark::dispatch::conn_state::DispatchPermit,
                     state: &'env #state_ty,
                     req_bytes: &'buf [u8],
-                    head: &::sark::sark_core::http::codec::ParsedRequestHead<'buf>,
-                    method_key: ::sark::service::Key,
+                    head: &::sark::sark_core::http::codec::RequestLine<'buf>,
+                    method: ::sark::service::Key,
                     date: &[u8; 29],
                     write: &mut [u8],
                     conn: &mut ::sark::dispatch::conn_state::ConnState,
@@ -1572,18 +1401,14 @@ impl<'a> ServeEmit<'a> {
 
             impl #generic_def ::sark::dispatch::Decode for #core_ident #generic_use
             where
-                #( #route_bounds )*
-                #( #maker_bounds )*
-                #( #decode_bounds )*
+                #decoded_bounds
             {
                 #decode_method
             }
 
             impl #generic_def ::sark::dispatch::Decode for #name #generic_use
             where
-                #( #route_bounds )*
-                #( #maker_bounds )*
-                #( #decode_bounds )*
+                #decoded_bounds
             {
                 type Prepared = #prepared_ident;
 
@@ -1620,8 +1445,7 @@ impl<'a> ServeEmit<'a> {
 
             impl #generic_def ::sark::dispatch::RouteCore<'d> for #core_ident #generic_use
             where
-                #( #route_bounds )*
-                #( #maker_bounds )*
+                #base_bounds
             {
                 fn timer(&self) -> &::sark::Timer<'d> {
                     self.timer
@@ -1635,13 +1459,31 @@ impl<'a> ServeEmit<'a> {
                     write: &mut [u8],
                     conn: &mut ::sark::dispatch::conn_state::ConnState,
                 ) -> ::sark::dispatch::ConsumeOutcome {
-                    let ::core::option::Option::Some(fused) =
-                        ::sark::framer::FusedHead::parse(bytes)
-                    else {
-                        return ::sark::dispatch::ConsumeOutcome::NeedMore {
-                            permit,
-                            state: ::sark::dispatch::conn_state::NeedMore::Head,
-                        };
+                    let mut method = ::core::option::Option::None;
+                    let head = match
+                        ::sark::sark_core::http::codec::RequestLine::parse_for::<
+                            { #method_mask },
+                        >(bytes, &mut method)
+                    {
+                        ::core::result::Result::Ok(
+                            ::core::option::Option::Some(head),
+                        ) => head,
+                        ::core::result::Result::Ok(::core::option::Option::None) => {
+                            return ::sark::dispatch::ConsumeOutcome::NeedMore {
+                                permit,
+                                state: ::sark::dispatch::conn_state::NeedMore::Head,
+                            };
+                        }
+                        ::core::result::Result::Err(()) => {
+                            return ::sark::dispatch::ConsumeOutcome::Close(
+                                ::sark::CANNED_400,
+                            );
+                        }
+                    };
+                    let ::core::option::Option::Some(method) = method else {
+                        return ::sark::dispatch::ConsumeOutcome::Close(
+                            ::sark::CANNED_404,
+                        );
                     };
                     let date = stamp.load();
                     let state: &'env #state_ty = self.as_ref().get_ref().state;
@@ -1650,8 +1492,8 @@ impl<'a> ServeEmit<'a> {
                         permit,
                         state,
                         bytes,
-                        &fused.head,
-                        fused.method_key,
+                        &head,
+                        method,
                         &date,
                         write,
                         conn,
@@ -1661,8 +1503,7 @@ impl<'a> ServeEmit<'a> {
 
             impl #generic_def ::sark::dispatch::Routing<'d> for #name #generic_use
             where
-                #( #route_bounds )*
-                #( #maker_bounds )*
+                #base_bounds
             {
                 fn try_consume(
                     self: ::core::pin::Pin<&mut Self>,
@@ -1688,8 +1529,7 @@ impl<'a> ServeEmit<'a> {
 
             impl #generic_def ::sark::date::DateHost for #name #generic_use
             where
-                #( #route_bounds )*
-                #( #maker_bounds )*
+                #base_bounds
             {
                 fn stamp(
                     self: ::core::pin::Pin<&Self>,
@@ -1700,8 +1540,7 @@ impl<'a> ServeEmit<'a> {
 
             impl #generic_def ::sark::timer::TimerHost<'d> for #name #generic_use
             where
-                #( #route_bounds )*
-                #( #maker_bounds )*
+                #base_bounds
             {
                 fn timer(&self) -> &::sark::Timer<'d> {
                     self.core.timer
@@ -1710,110 +1549,30 @@ impl<'a> ServeEmit<'a> {
 
             impl #generic_def ::sark::timer::TimerHost<'d> for #core_ident #generic_use
             where
-                #( #route_bounds )*
-                #( #maker_bounds )*
+                #base_bounds
             {
                 fn timer(&self) -> &::sark::Timer<'d> {
                     self.timer
                 }
             }
 
-            impl #generic_def ::dope::manifold::listener::Application<'d>
+            impl #generic_def ::dope::manifold::listener::application::Application<'d>
                 for #name #generic_use
             where
-                #( #route_bounds )*
-                #( #maker_bounds )*
+                #base_bounds
             {
                 type Conn = ::sark::dispatch::conn_state::ConnState;
                 type Wire = __W;
-
-                fn chunk<__R: ::sark::o3::buffer::RetainBytes>(
-                    self: ::core::pin::Pin<&mut Self>,
-                    slot: &mut ::dope_net::link::slot::Slot<
-                        'd,
-                        Self::Wire,
-                        ::dope::manifold::listener::State<Self::Conn>,
-                    >,
-                    chunk: __R,
-                    aux: &mut ::dope::manifold::listener::Aux,
-                    driver: &mut ::dope::DriverContext<'_, 'd>,
-                ) -> ::dope::manifold::Outcome {
-                    if <Self as ::sark::dispatch::H1Project<'d, __W>>::chunk_proj(
-                        self,
-                        slot,
-                        chunk.as_slice(),
-                        aux,
-                        driver,
-                        ::sark::dispatch::identity_mut,
-                    ) {
-                        ::dope::manifold::Outcome::Overrun
-                    } else {
-                        ::dope::manifold::Outcome::Ok
-                    }
-                }
-
-                fn send(
-                    self: ::core::pin::Pin<&mut Self>,
-                    slot: &mut ::dope_net::link::slot::Slot<
-                        'd,
-                        Self::Wire,
-                        ::dope::manifold::listener::State<Self::Conn>,
-                    >,
-                    sent: usize,
-                    aux: &mut ::dope::manifold::listener::Aux,
-                    driver: &mut ::dope::DriverContext<'_, 'd>,
-                ) {
-                    <Self as ::sark::dispatch::H1Project<'d, __W>>::send_proj(
-                        self,
-                        slot,
-                        ::sark::dispatch::identity_mut,
-                        sent,
-                        aux,
-                        driver,
-                    );
-                }
-
-                fn activate(
-                    self: ::core::pin::Pin<&mut Self>,
-                    slot: &mut ::dope_net::link::slot::Slot<
-                        'd,
-                        Self::Wire,
-                        ::dope::manifold::listener::State<Self::Conn>,
-                    >,
-                    aux: &mut ::dope::manifold::listener::Aux,
-                    driver: &mut ::dope::DriverContext<'_, 'd>,
-                ) {
-                    <Self as ::sark::dispatch::H1Project<'d, __W>>::activate_proj(
-                        self,
-                        slot,
-                        ::sark::dispatch::identity_mut,
-                        aux,
-                        driver,
-                    );
-                }
-
-                fn close(
-                    self: ::core::pin::Pin<&mut Self>,
-                    slot: &mut ::dope_net::link::slot::Slot<
-                        'd,
-                        Self::Wire,
-                        ::dope::manifold::listener::State<Self::Conn>,
-                    >,
-                    aux: &mut ::dope::manifold::listener::Aux,
-                ) {
-                    <Self as ::sark::dispatch::H1Project<'d, __W>>::close_proj(
-                        self,
-                        slot,
-                        ::sark::dispatch::identity_mut,
-                        aux,
-                    );
-                }
+                type Hooks = ::sark::dispatch::H1Hooks;
             }
         }
     }
 }
 
-fn build_wrap_before_chain(wraps: &[syn::TypePath]) -> TokenStream {
+fn build_wrap_before_chain(
+    wraps: &[syn::TypePath],
+    method: crate::route_compiler::Method,
+) -> TokenStream {
     if wraps.is_empty() {
         return quote!();
     }
@@ -1831,9 +1590,9 @@ fn build_wrap_before_chain(wraps: &[syn::TypePath]) -> TokenStream {
             }
         })
         .collect();
+    let method = method.http_token();
     quote! {
-        let __mw_method = ::http::Method::from_bytes(head.method)
-            .unwrap_or_else(|_| ::http::Method::GET);
+        let __mw_method = #method;
         let mut __mw_ctx = ::sark::middleware::Ctx {
             method: &__mw_method,
             head_bytes: req_bytes,

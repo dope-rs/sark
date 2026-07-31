@@ -36,7 +36,7 @@ fn main() -> std::io::Result<()> {
         .expect("invalid BIND");
 
     let server = HttpServer::<HTTP_LISTENER_ID, DATE_UPDATER_ID, Throughput>::new(
-        listener::Config::<Tcp> {
+        listener::config::Config::<Tcp> {
             bind,
             max_connections: MAX_CONNECTIONS,
             backlog: 1024,

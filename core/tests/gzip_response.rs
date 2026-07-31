@@ -2,8 +2,17 @@ use http::StatusCode;
 use o3::buffer::Shared;
 use sark_core::http::codec::HeaderScan;
 use sark_core::http::compress::{Gunzip, GunzipError, GunzipOutput, Gzip};
-use sark_core::http::head::Flags;
-use sark_core::http::{FixedResponse, Headers, head};
+use sark_core::http::head::{Flags, KnownHeader};
+use sark_core::http::{FixedResponse, Headers};
+
+fn accepts_gzip(value: &[u8]) -> bool {
+    let mut scan = HeaderScan::default();
+    let mut flags = Flags::default();
+    KnownHeader::AcceptEncoding
+        .apply(&mut scan, &mut flags, value)
+        .expect("valid Accept-Encoding");
+    scan.accept_encoding_gzip
+}
 
 #[test]
 fn fixed_response_gzip_head_writes_content_encoding_and_vary() {
@@ -35,77 +44,17 @@ fn fixed_response_gzip_head_writes_content_encoding_and_vary() {
 
 #[test]
 fn header_scan_detects_accept_encoding_gzip() {
-    let req = b"GET / HTTP/1.1\r\nHost: x\r\nAccept-Encoding: gzip, br\r\n\r\n";
-    let headers_start = req.windows(2).position(|w| w == b"\r\n").unwrap() + 2;
-    let mut scan = HeaderScan::default();
-    let mut flags = Flags::default();
-    let mut hc = 0usize;
-    let mut pos = headers_start;
-    loop {
-        let rest = &req[pos..];
-        match head::WellKnownHeaders::new(&mut scan, &mut flags).apply_contiguous(
-            rest,
-            &mut (),
-            &mut hc,
-            32,
-        ) {
-            Ok(Some(0)) => break,
-            Ok(Some(rel)) => pos += rel + 2,
-            Ok(None) => panic!("need more"),
-            Err(_) => panic!("bad"),
-        }
-    }
-    assert!(scan.accept_encoding_gzip);
+    assert!(accepts_gzip(b"gzip, br"));
 }
 
 #[test]
 fn header_scan_detects_only_br_not_gzip() {
-    let req = b"GET / HTTP/1.1\r\nHost: x\r\nAccept-Encoding: br\r\n\r\n";
-    let headers_start = req.windows(2).position(|w| w == b"\r\n").unwrap() + 2;
-    let mut scan = HeaderScan::default();
-    let mut flags = Flags::default();
-    let mut hc = 0usize;
-    let mut pos = headers_start;
-    loop {
-        let rest = &req[pos..];
-        match head::WellKnownHeaders::new(&mut scan, &mut flags).apply_contiguous(
-            rest,
-            &mut (),
-            &mut hc,
-            32,
-        ) {
-            Ok(Some(0)) => break,
-            Ok(Some(rel)) => pos += rel + 2,
-            Ok(None) => panic!("need more"),
-            Err(_) => panic!("bad"),
-        }
-    }
-    assert!(!scan.accept_encoding_gzip);
+    assert!(!accepts_gzip(b"br"));
 }
 
 #[test]
 fn header_scan_detects_gzip_with_qvalue() {
-    let req = b"GET / HTTP/1.1\r\nHost: x\r\nAccept-Encoding: gzip;q=1.0, deflate;q=0.5\r\n\r\n";
-    let headers_start = req.windows(2).position(|w| w == b"\r\n").unwrap() + 2;
-    let mut scan = HeaderScan::default();
-    let mut flags = Flags::default();
-    let mut hc = 0usize;
-    let mut pos = headers_start;
-    loop {
-        let rest = &req[pos..];
-        match head::WellKnownHeaders::new(&mut scan, &mut flags).apply_contiguous(
-            rest,
-            &mut (),
-            &mut hc,
-            32,
-        ) {
-            Ok(Some(0)) => break,
-            Ok(Some(rel)) => pos += rel + 2,
-            Ok(None) => panic!("need more"),
-            Err(_) => panic!("bad"),
-        }
-    }
-    assert!(scan.accept_encoding_gzip);
+    assert!(accepts_gzip(b"gzip;q=1.0, deflate;q=0.5"));
 }
 
 #[test]

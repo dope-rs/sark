@@ -10,8 +10,9 @@ use std::pin::Pin;
 use std::task::Poll;
 use std::time::Duration;
 
-use dope_extra::harness::Harness;
-use dope_fiber::{Context, Fiber};
+use dope_fiber::abi::Fiber;
+use dope_fiber::raw::task::Context;
+use dope_test::Harness;
 use o3::buffer::Shared;
 use sark::{Executor, Throughput, driver};
 use sark_core::http::Stream;
@@ -88,7 +89,8 @@ fn pending_chunk_producer_completes_the_response() {
             |_ctx, trigger| {
                 let driver_config =
                     driver::Config::for_tcp_profile::<Throughput>(support::MAX_CONNECTIONS);
-                let executor = Executor::new(driver_config)?;
+                let executor = Executor::new(driver_config)?
+                    .with_storage(dope_net::link::egress::storage::Storage::default());
                 executor.enter(|mut session| {
                     let timer =
                         sark::Timer::with_capacity(support::MAX_CONNECTIONS.saturating_mul(2));

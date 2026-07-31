@@ -182,7 +182,6 @@ impl ParsedValue {
 
 #[derive(Clone)]
 pub(super) struct FieldSpec {
-    pub(super) slot: u8,
     pub(super) variant: Ident,
     pub(super) ident: Ident,
     pub(super) bytes: Vec<u8>,
@@ -201,11 +200,7 @@ impl FieldPlan {
             .into_iter()
             .enumerate()
             .map(|(idx, (ident, bytes, ty))| {
-                let slot = u8::try_from(idx).map_err(|_| {
-                    Error::new_spanned(ident, "too many generated request fields; maximum is 256")
-                })?;
                 Ok(FieldSpec {
-                    slot,
                     variant: format_ident!("S{}", idx),
                     ident: ident.clone(),
                     bytes,
@@ -224,14 +219,7 @@ impl FieldPlan {
         &self,
         slot_ident: &Ident,
         canonical_name: bool,
-    ) -> (
-        TokenStream,
-        TokenStream,
-        TokenStream,
-        TokenStream,
-        TokenStream,
-        TokenStream,
-    ) {
+    ) -> (TokenStream, TokenStream, TokenStream) {
         let variants: Vec<_> = self.entries.iter().map(|field| &field.variant).collect();
         let enum_tokens = quote! {
             #[derive(Clone, Copy)]
@@ -259,21 +247,6 @@ impl FieldPlan {
             }
             None
         };
-        let slot_probe_u8_arms = LengthArms::collect(self.entries.iter().map(|field| {
-            let bytes = &field.bytes;
-            let lower = bytes.iter().map(u8::to_ascii_lowercase).collect::<Vec<_>>();
-            let cond = BytesMatch::Exact.emit(&format_ident!("name"), lower.as_slice());
-            let idx = field.slot;
-            (bytes.len(), quote! { if #cond { return Some(#idx); } })
-        }))
-        .emit();
-        let slot_probe_u8_fn = quote! {
-            match name.len() {
-                #( #slot_probe_u8_arms )*
-                _ => {}
-            }
-            None
-        };
         let set_arms: Vec<_> = self
             .entries
             .iter()
@@ -295,43 +268,7 @@ impl FieldPlan {
             }
             Ok(())
         };
-        let set_u8_arms: Vec<_> = self
-            .entries
-            .iter()
-            .map(|field| {
-                let ident = &field.ident;
-                let assign = quote! { Some(sark::service::FieldValue::parse_value(value)?) };
-                let idx = field.slot;
-                quote! {
-                    #idx => {
-                        if headers.#ident.is_none() {
-                            headers.#ident = #assign;
-                        }
-                    }
-                }
-            })
-            .collect();
-        let set_u8_fn = quote! {
-            match slot {
-                #( #set_u8_arms, )*
-                _ => {}
-            }
-            Ok(())
-        };
-        let set_name_fn = Self::emit_set_name(
-            self.entries
-                .iter()
-                .map(|field| (&field.ident, field.bytes.as_slice())),
-            canonical_name,
-        );
-        (
-            enum_tokens,
-            slot_probe_fn,
-            set_fn,
-            set_name_fn,
-            slot_probe_u8_fn,
-            set_u8_fn,
-        )
+        (enum_tokens, slot_probe_fn, set_fn)
     }
 
     pub(crate) fn set_name(&self, canonical_name: bool) -> TokenStream {
@@ -463,6 +400,10 @@ impl QueryScan {
             let mut eq_idx = usize::MAX;
             let mut idx = 0usize;
             while idx < bytes.len() {
+                let Some(offset) = ::sark::__memchr::memchr2(b'=', b'&', &bytes[idx..]) else {
+                    break;
+                };
+                idx += offset;
                 let b = bytes[idx];
                 if b == b'=' {
                     if eq_idx == usize::MAX {

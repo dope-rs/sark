@@ -1,28 +1,46 @@
+use o3::num::BoundedU32;
+
+type StreamIdValue = BoundedU32<0, 0x7fff_ffff>;
+
+#[repr(transparent)]
 #[derive(Copy, Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct StreamId(pub u32);
+pub struct StreamId(u32);
 
 impl StreamId {
     pub const CONNECTION: Self = Self(0);
+    pub const FIRST_CLIENT: Self = Self(1);
+    pub const FIRST_SERVER: Self = Self(2);
     pub const MAX: u32 = 0x7fff_ffff;
 
-    pub fn is_zero(self) -> bool {
+    pub const fn new(raw: u32) -> Option<Self> {
+        match StreamIdValue::new(raw) {
+            Some(value) => Some(Self(value.get())),
+            None => None,
+        }
+    }
+
+    pub const fn as_u32(self) -> u32 {
+        self.0
+    }
+
+    pub const fn is_zero(self) -> bool {
         self.0 == 0
     }
 
-    pub fn is_client(self) -> bool {
+    pub const fn is_client(self) -> bool {
         self.0 != 0 && self.0 % 2 == 1
     }
 
-    pub fn is_server(self) -> bool {
-        self.0 != 0 && self.0.is_multiple_of(2)
+    pub const fn is_server(self) -> bool {
+        self.0 != 0 && self.0 % 2 == 0
     }
 
-    pub fn from_u32_masked(raw: u32) -> Self {
+    pub(crate) const fn from_wire(raw: u32) -> Self {
         Self(raw & Self::MAX)
     }
 
-    pub fn masked(self) -> u32 {
-        self.0 & Self::MAX
+    pub(crate) const fn wire_bytes(self) -> [u8; 4] {
+        self.0.to_be_bytes()
     }
 }
 
@@ -57,93 +75,75 @@ pub enum TransitionError {
     StreamClosed,
 }
 
+macro_rules! directional_transitions {
+    (
+        $(
+            fn $name:ident {
+                own: { reserved: $own_reserved:ident, half_closed: $own_half:ident },
+                peer: { reserved: $peer_reserved:ident, half_closed: $peer_half:ident },
+            }
+        )+
+    ) => {
+        impl State {
+            $(
+                pub fn $name(self, ev: Event) -> Result<Self, TransitionError> {
+                    use Event::*;
+                    use State::*;
+                    use TransitionError::*;
+                    match (self, ev) {
+                        (_, RstStream) => Ok(Closed),
+
+                        (Idle, Headers { end_stream: false }) => Ok(Open),
+                        (Idle, Headers { end_stream: true }) => Ok($own_half),
+                        (Idle, PushPromise) => Err(Protocol),
+                        (Idle, Data { .. }) => Err(Protocol),
+
+                        ($own_reserved, Headers { end_stream: false }) => Ok($peer_half),
+                        ($own_reserved, Headers { end_stream: true }) => Ok(Closed),
+                        ($own_reserved, PushPromise) => Err(Protocol),
+                        ($own_reserved, Data { .. }) => Err(Protocol),
+
+                        ($peer_reserved, Headers { .. }) => Err(Protocol),
+                        ($peer_reserved, PushPromise) => Err(Protocol),
+                        ($peer_reserved, Data { .. }) => Err(Protocol),
+
+                        (Open, Headers { end_stream: false }) => Ok(Open),
+                        (Open, Headers { end_stream: true }) => Ok($own_half),
+                        (Open, Data { end_stream: false }) => Ok(Open),
+                        (Open, Data { end_stream: true }) => Ok($own_half),
+                        (Open, PushPromise) => Ok(Open),
+
+                        ($own_half, Headers { .. }) => Err(StreamClosed),
+                        ($own_half, Data { .. }) => Err(StreamClosed),
+                        ($own_half, PushPromise) => Err(StreamClosed),
+
+                        ($peer_half, Headers { end_stream: false }) => Ok($peer_half),
+                        ($peer_half, Headers { end_stream: true }) => Ok(Closed),
+                        ($peer_half, Data { end_stream: false }) => Ok($peer_half),
+                        ($peer_half, Data { end_stream: true }) => Ok(Closed),
+                        ($peer_half, PushPromise) => Ok($peer_half),
+
+                        (Closed, Headers { .. }) => Err(StreamClosed),
+                        (Closed, Data { .. }) => Err(StreamClosed),
+                        (Closed, PushPromise) => Err(StreamClosed),
+                    }
+                }
+            )+
+        }
+
+        impl Stream {
+            $(
+                pub fn $name(&mut self, ev: Event) -> Result<State, TransitionError> {
+                    let next = self.state.$name(ev)?;
+                    self.state = next;
+                    Ok(next)
+                }
+            )+
+        }
+    };
+}
+
 impl State {
-    pub fn send(self, ev: Event) -> Result<Self, TransitionError> {
-        use Event::*;
-        use State::*;
-        use TransitionError::*;
-        match (self, ev) {
-            (_, RstStream) => Ok(Closed),
-
-            (Idle, Headers { end_stream: false }) => Ok(Open),
-            (Idle, Headers { end_stream: true }) => Ok(HalfClosedLocal),
-            (Idle, PushPromise) => Err(Protocol),
-            (Idle, Data { .. }) => Err(Protocol),
-
-            (ReservedLocal, Headers { end_stream: false }) => Ok(HalfClosedRemote),
-            (ReservedLocal, Headers { end_stream: true }) => Ok(Closed),
-            (ReservedLocal, PushPromise) => Err(Protocol),
-            (ReservedLocal, Data { .. }) => Err(Protocol),
-
-            (ReservedRemote, Headers { .. }) => Err(Protocol),
-            (ReservedRemote, PushPromise) => Err(Protocol),
-            (ReservedRemote, Data { .. }) => Err(Protocol),
-
-            (Open, Headers { end_stream: false }) => Ok(Open),
-            (Open, Headers { end_stream: true }) => Ok(HalfClosedLocal),
-            (Open, Data { end_stream: false }) => Ok(Open),
-            (Open, Data { end_stream: true }) => Ok(HalfClosedLocal),
-            (Open, PushPromise) => Ok(Open),
-
-            (HalfClosedLocal, Headers { .. }) => Err(StreamClosed),
-            (HalfClosedLocal, Data { .. }) => Err(StreamClosed),
-            (HalfClosedLocal, PushPromise) => Err(StreamClosed),
-
-            (HalfClosedRemote, Headers { end_stream: false }) => Ok(HalfClosedRemote),
-            (HalfClosedRemote, Headers { end_stream: true }) => Ok(Closed),
-            (HalfClosedRemote, Data { end_stream: false }) => Ok(HalfClosedRemote),
-            (HalfClosedRemote, Data { end_stream: true }) => Ok(Closed),
-            (HalfClosedRemote, PushPromise) => Ok(HalfClosedRemote),
-
-            (Closed, Headers { .. }) => Err(StreamClosed),
-            (Closed, Data { .. }) => Err(StreamClosed),
-            (Closed, PushPromise) => Err(StreamClosed),
-        }
-    }
-
-    pub fn recv(self, ev: Event) -> Result<Self, TransitionError> {
-        use Event::*;
-        use State::*;
-        use TransitionError::*;
-        match (self, ev) {
-            (_, RstStream) => Ok(Closed),
-
-            (Idle, Headers { end_stream: false }) => Ok(Open),
-            (Idle, Headers { end_stream: true }) => Ok(HalfClosedRemote),
-            (Idle, PushPromise) => Err(Protocol),
-            (Idle, Data { .. }) => Err(Protocol),
-
-            (ReservedLocal, Headers { .. }) => Err(Protocol),
-            (ReservedLocal, PushPromise) => Err(Protocol),
-            (ReservedLocal, Data { .. }) => Err(Protocol),
-
-            (ReservedRemote, Headers { end_stream: false }) => Ok(HalfClosedLocal),
-            (ReservedRemote, Headers { end_stream: true }) => Ok(Closed),
-            (ReservedRemote, PushPromise) => Err(Protocol),
-            (ReservedRemote, Data { .. }) => Err(Protocol),
-
-            (Open, Headers { end_stream: false }) => Ok(Open),
-            (Open, Headers { end_stream: true }) => Ok(HalfClosedRemote),
-            (Open, Data { end_stream: false }) => Ok(Open),
-            (Open, Data { end_stream: true }) => Ok(HalfClosedRemote),
-            (Open, PushPromise) => Ok(Open),
-
-            (HalfClosedLocal, Headers { end_stream: false }) => Ok(HalfClosedLocal),
-            (HalfClosedLocal, Headers { end_stream: true }) => Ok(Closed),
-            (HalfClosedLocal, Data { end_stream: false }) => Ok(HalfClosedLocal),
-            (HalfClosedLocal, Data { end_stream: true }) => Ok(Closed),
-            (HalfClosedLocal, PushPromise) => Ok(HalfClosedLocal),
-
-            (HalfClosedRemote, Headers { .. }) => Err(StreamClosed),
-            (HalfClosedRemote, Data { .. }) => Err(StreamClosed),
-            (HalfClosedRemote, PushPromise) => Err(StreamClosed),
-
-            (Closed, Headers { .. }) => Err(StreamClosed),
-            (Closed, Data { .. }) => Err(StreamClosed),
-            (Closed, PushPromise) => Err(StreamClosed),
-        }
-    }
-
     pub fn step(self, ev: Event, side: Side) -> Result<Self, TransitionError> {
         match side {
             Side::Local => self.send(ev),
@@ -156,6 +156,17 @@ pub struct Stream {
     pub id: StreamId,
     pub state: State,
     pub peer_headers_received: bool,
+}
+
+directional_transitions! {
+    fn send {
+        own: { reserved: ReservedLocal, half_closed: HalfClosedLocal },
+        peer: { reserved: ReservedRemote, half_closed: HalfClosedRemote },
+    }
+    fn recv {
+        own: { reserved: ReservedRemote, half_closed: HalfClosedRemote },
+        peer: { reserved: ReservedLocal, half_closed: HalfClosedLocal },
+    }
 }
 
 impl Stream {
@@ -182,43 +193,28 @@ impl Stream {
             peer_headers_received: false,
         }
     }
-
-    pub fn send(&mut self, ev: Event) -> Result<State, TransitionError> {
-        let next = self.state.send(ev)?;
-        self.state = next;
-        Ok(next)
-    }
-
-    pub fn recv(&mut self, ev: Event) -> Result<State, TransitionError> {
-        let next = self.state.recv(ev)?;
-        self.state = next;
-        Ok(next)
-    }
 }
 
 pub struct IdGen {
-    next: u32,
+    next: Option<StreamId>,
     step: u32,
 }
 
 impl IdGen {
-    pub fn new(first: u32) -> Self {
+    pub fn new(first: StreamId) -> Self {
         Self {
-            next: first,
+            next: Some(first),
             step: 2,
         }
     }
 
     pub fn next_id(&mut self) -> Option<StreamId> {
-        if self.next > StreamId::MAX {
-            return None;
-        }
-        let id = StreamId(self.next);
-        self.next = self.next.wrapping_add(self.step);
+        let id = self.next?;
+        self.next = id.as_u32().checked_add(self.step).and_then(StreamId::new);
         Some(id)
     }
 
-    pub fn peek(&self) -> StreamId {
-        StreamId(self.next)
+    pub fn peek(&self) -> Option<StreamId> {
+        self.next
     }
 }

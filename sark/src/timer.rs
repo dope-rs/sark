@@ -2,15 +2,15 @@ use std::cell::{Cell, OnceCell};
 use std::pin::Pin;
 use std::time::{Duration, Instant};
 
-use dope::manifold::TypedToken;
 use dope::manifold::env::Env;
-use dope::manifold::listener::{Application, Listener};
+use dope::manifold::listener::{Listener, application::Application};
 use dope::manifold::timer;
 pub use dope::manifold::timer::Ticket;
-use dope::runtime::Idle;
+use dope::manifold::typed::TypedToken;
+use dope::runtime::dispatcher::Idle;
 use dope::{DriverContext, DriverRef, Event};
-use dope_fiber::TimerExt as _;
-use dope_fiber::Waker;
+use dope_fiber::raw::task::RootWaker;
+use dope_fiber::sleep::TimerExt as _;
 
 pub const SARK_TIMER_ID: u8 = 3;
 
@@ -54,12 +54,12 @@ impl<'d> Timer<'d> {
         self.head_timeout.get()
     }
 
-    pub fn sleep(&self, d: Duration) -> impl dope_fiber::Fiber<'d, Output = ()> + '_ {
+    pub fn sleep(&self, d: Duration) -> impl dope_fiber::abi::Fiber<'d, Output = ()> + '_ {
         self.inner().sleep(d)
     }
 
-    pub fn arm(&self, deadline: Instant, wake: Waker<'d>) -> Option<Ticket> {
-        self.inner().try_arm(deadline, wake.completion())
+    pub fn arm(&self, deadline: Instant, wake: RootWaker<'d>) -> Option<Ticket> {
+        self.inner().try_arm(deadline, wake.completion()).ok()
     }
 
     pub fn cancel(&self, ticket: Ticket) {
@@ -90,7 +90,7 @@ where
     E: Env<Wire = P::Wire>,
 {
     #[pin]
-    pub inner: Listener<'d, ID, P, E>,
+    pub inner: Listener<'d, 'd, ID, P, E>,
 }
 
 impl<'d, const ID: u8, P, E> TimedListener<'d, ID, P, E>
@@ -98,7 +98,7 @@ where
     P: Application<'d> + TimerHost<'d>,
     E: Env<Wire = P::Wire>,
 {
-    pub fn new(inner: Listener<'d, ID, P, E>, driver: DriverRef<'d>) -> Self {
+    pub fn new(inner: Listener<'d, 'd, ID, P, E>, driver: DriverRef<'d>) -> Self {
         inner.handler().timer().bind(driver);
         Self { inner }
     }
@@ -128,7 +128,7 @@ where
         target: TypedToken<Self>,
         driver: &mut DriverContext<'_, 'd>,
     ) {
-        let typed = target.retag::<'d, Listener<'d, ID, P, E>>();
+        let typed = target.retag::<'d, Listener<'d, 'd, ID, P, E>>();
         dope::manifold::Manifold::activate(self.project().inner, typed, driver)
     }
 

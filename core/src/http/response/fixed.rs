@@ -4,13 +4,19 @@ use o3::buffer::Shared;
 use super::wire_emit::{
     ContentLength, DATE_LEN, HeadWrite, HeaderSection, PLACEHOLDER_DATE, WireWriter,
 };
-use super::{DEFAULT_HEADER_CAPACITY, HeadInner, Headers};
+use super::{
+    DEFAULT_HEADER_CAPACITY, HeadInner, HeaderTemplate, Headers, StaticHeaderBytes,
+    StaticHeaderFields, StaticHeaders,
+};
 
 const GZIP_HEADERS: &[u8] = b"Content-Encoding: gzip\r\nVary: Accept-Encoding\r\n";
 
-struct GzipHeaders<'a, 'req, const N: usize>(&'a HeadInner<'req, N>);
+struct GzipHeaders<'a, 'req, const N: usize, S>(&'a HeadInner<'req, N, S>);
 
-impl<const N: usize> HeaderSection for GzipHeaders<'_, '_, N> {
+impl<const N: usize, S> HeaderSection for GzipHeaders<'_, '_, N, S>
+where
+    S: StaticHeaders,
+{
     fn header_len(&self) -> usize {
         self.0.wire_len() + GZIP_HEADERS.len()
     }
@@ -22,9 +28,9 @@ impl<const N: usize> HeaderSection for GzipHeaders<'_, '_, N> {
 }
 
 #[derive(Clone, Debug)]
-pub struct FixedResponse<'req, const N: usize = DEFAULT_HEADER_CAPACITY> {
+pub struct FixedResponse<'req, const N: usize = DEFAULT_HEADER_CAPACITY, S = StaticHeaderBytes> {
     pub(super) status: StatusCode,
-    pub(super) head: HeadInner<'req, N>,
+    pub(super) head: HeadInner<'req, N, S>,
     pub(super) body: Shared,
 }
 
@@ -45,7 +51,32 @@ impl<'req, const N: usize> FixedResponse<'req, N> {
             body,
         }
     }
+}
 
+impl<'req, const N: usize> FixedResponse<'req, N, StaticHeaderFields> {
+    #[doc(hidden)]
+    pub fn structured<B>(
+        status: StatusCode,
+        static_headers: &'static HeaderTemplate,
+        headers: Headers<'req, N>,
+        body: B,
+    ) -> Self
+    where
+        B: Into<Shared>,
+    {
+        let body = body.into();
+        Self {
+            status,
+            head: HeadInner::structured(static_headers, headers),
+            body,
+        }
+    }
+}
+
+impl<'req, const N: usize, S> FixedResponse<'req, N, S>
+where
+    S: StaticHeaders,
+{
     pub fn status(&self) -> StatusCode {
         self.status
     }
@@ -62,7 +93,7 @@ impl<'req, const N: usize> FixedResponse<'req, N> {
         self.head.wire_headers()
     }
 
-    fn head_write(&self) -> (HeadWrite<'_, HeadInner<'req, N>, ContentLength>, &[u8]) {
+    fn head_write(&self) -> (HeadWrite<'_, HeadInner<'req, N, S>, ContentLength>, &[u8]) {
         (
             self.head_write_with_len(self.body.len()),
             self.body.as_ref(),
@@ -72,14 +103,9 @@ impl<'req, const N: usize> FixedResponse<'req, N> {
     fn head_write_with_len(
         &self,
         body_len: usize,
-    ) -> HeadWrite<'_, HeadInner<'req, N>, ContentLength> {
+    ) -> HeadWrite<'_, HeadInner<'req, N, S>, ContentLength> {
         HeadWrite {
-            status_str: self.status.as_str().as_bytes(),
-            reason: self
-                .status
-                .canonical_reason()
-                .map(str::as_bytes)
-                .unwrap_or(b""),
+            status: self.status,
             headers: &self.head,
             framing: ContentLength(body_len),
         }
@@ -121,12 +147,7 @@ impl<'req, const N: usize> FixedResponse<'req, N> {
     ) -> Option<usize> {
         let headers = GzipHeaders(&self.head);
         let head = HeadWrite {
-            status_str: self.status.as_str().as_bytes(),
-            reason: self
-                .status
-                .canonical_reason()
-                .map(str::as_bytes)
-                .unwrap_or(b""),
+            status: self.status,
             headers: &headers,
             framing: ContentLength(body_len),
         };

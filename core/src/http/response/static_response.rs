@@ -2,17 +2,24 @@ use http::StatusCode;
 use o3::buffer::Shared;
 
 use super::wire_emit::{ContentLength, HeadWrite, PLACEHOLDER_DATE, WireWriter};
-use super::{DEFAULT_HEADER_CAPACITY, HeadInner, Headers};
+use super::{
+    DEFAULT_HEADER_CAPACITY, HeadInner, HeaderTemplate, Headers, StaticHeaderBytes,
+    StaticHeaderFields, StaticHeaders,
+};
 
 /// A response whose body is guaranteed to live for the entire process.
 ///
 /// Keeping the static slice directly avoids paying for the largest variant of
-/// `HotBodyInner` on generated static-response routes.
+/// `Body` on generated static-response routes.
 #[derive(Clone, Debug)]
-pub struct StaticResponseInner<'req, const N: usize = DEFAULT_HEADER_CAPACITY> {
-    status: StatusCode,
-    head: HeadInner<'req, N>,
-    body: &'static [u8],
+pub struct StaticResponseInner<
+    'req,
+    const N: usize = DEFAULT_HEADER_CAPACITY,
+    S = StaticHeaderBytes,
+> {
+    pub(super) status: StatusCode,
+    pub(super) head: HeadInner<'req, N, S>,
+    pub(super) body: &'static [u8],
 }
 
 impl<'req, const N: usize> StaticResponseInner<'req, N> {
@@ -28,7 +35,28 @@ impl<'req, const N: usize> StaticResponseInner<'req, N> {
             body,
         }
     }
+}
 
+impl<'req, const N: usize> StaticResponseInner<'req, N, StaticHeaderFields> {
+    #[doc(hidden)]
+    pub fn structured(
+        status: StatusCode,
+        static_headers: &'static HeaderTemplate,
+        headers: Headers<'req, N>,
+        body: &'static [u8],
+    ) -> Self {
+        Self {
+            status,
+            head: HeadInner::structured(static_headers, headers),
+            body,
+        }
+    }
+}
+
+impl<'req, const N: usize, S> StaticResponseInner<'req, N, S>
+where
+    S: StaticHeaders,
+{
     pub fn status(&self) -> StatusCode {
         self.status
     }
@@ -41,14 +69,9 @@ impl<'req, const N: usize> StaticResponseInner<'req, N> {
         self.head.wire_headers()
     }
 
-    fn head_write(&self) -> HeadWrite<'_, HeadInner<'req, N>, ContentLength> {
+    fn head_write(&self) -> HeadWrite<'_, HeadInner<'req, N, S>, ContentLength> {
         HeadWrite {
-            status_str: self.status.as_str().as_bytes(),
-            reason: self
-                .status
-                .canonical_reason()
-                .map(str::as_bytes)
-                .unwrap_or(b""),
+            status: self.status,
             headers: &self.head,
             framing: ContentLength(self.body.len()),
         }

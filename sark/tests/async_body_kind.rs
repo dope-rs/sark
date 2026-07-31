@@ -44,7 +44,7 @@ fn async_body_kind_follows_response_type() {
 
 #[test]
 fn owned_generated_responses_keep_their_concrete_shape() {
-    let static_shape: sark_core::http::StaticResponseInner<'_, 0> =
+    let static_shape: sark_core::http::StaticResponseInner<'_, 0, _> =
         NativeResponse::into_route_response(Reply {
             status: StatusCode::OK,
             body: b"ok",
@@ -56,7 +56,7 @@ fn owned_generated_responses_keep_their_concrete_shape() {
             .is_some()
     );
 
-    let _: sark_core::http::FixedResponse<'_, 0> =
+    let _: sark_core::http::FixedResponse<'_, 0, _> =
         NativeResponse::into_route_response(OwnedReply {
             status: StatusCode::OK,
             body: b"ok".to_vec(),
@@ -76,7 +76,7 @@ fn borrowed_static_response_uses_a_static_shape() {
         body: b"ok",
         value: Bytes::<Borrowed<'_>>::from(b"v"),
     };
-    let shape: sark_core::http::StaticResponseInner<'_, 1> =
+    let shape: sark_core::http::StaticResponseInner<'_, 1, _> =
         NativeResponse::into_route_response(response);
     let shape: Response<'_> = shape;
     let mut out = [0u8; 256];

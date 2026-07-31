@@ -6,37 +6,37 @@ mod prefixed_int;
 mod request;
 mod response;
 pub mod scan;
-pub mod varint;
 
 pub mod codec;
 pub mod head;
 
 #[doc(hidden)]
 pub mod __private {
-    pub trait GeneratedResponse: 'static {
-        type Shape: super::Shape<'static>;
-
-        const BODY_KIND: super::body_kind::ResponseKind;
-
-        fn into_owned_shape(self) -> Self::Shape;
-    }
+    pub trait OwnedResponse: super::IntoResponseShape<'static> + 'static {}
 }
 
 pub use field::{
     Field, FieldBlock, FieldStorage, FieldValueWriter, OwnedField, OwnedFieldBlock,
-    PackedFieldIter, PackedFieldRangeIter, PackedFields, PooledFieldBlock, VecFieldBlock,
+    PackedFieldError, PackedFieldIter, PackedFieldRangeIter, PackedFields, PooledFieldBlock,
+    VecFieldBlock,
 };
 pub use http::{Method, StatusCode};
-pub use huffman::{HpackHuffman, HpackHuffmanError};
+pub use huffman::{
+    HpackHuffmanDecodeError, HpackHuffmanDecoder, HpackHuffmanEncoded, HpackHuffmanError,
+    HpackHuffmanSource,
+};
 pub use o3::buffer::{Borrowed, Bytes, Retained};
+#[doc(hidden)]
+pub use prefixed_int::ValidPrefixedIntWidth;
 pub use prefixed_int::{PrefixedInt, PrefixedIntError};
 pub use request::PathParamRanges;
 pub use response::{
     Body, CHUNK_TERMINATOR, CacheTemplate, Chunked, DEFAULT_HEADER_CAPACITY, Egress, EncodedBody,
     EncodedResponse, FixedResponse, HeadInner, HeaderItem, HeaderList, HeaderNameRef,
-    HeaderNameToken, HeaderStaticValueToken, HeaderValueInner, Headers, HotBodyInner, HotHeadInner,
-    InlineHeaderValue, IterStream, MonoResponseInner, NeverStream, OwnedShape, Preparation,
-    Prepared, Response, ResponsePlan, ResponseView, Serve, Shape, StaticResponseInner, Stream,
-    TextBody, TextItem,
+    HeaderNameToken, HeaderStaticValueToken, HeaderTemplate, HeaderValueInner, Headers,
+    HotHeadInner, InlineHeaderValue, InlineShape, IntoResponseShape, IterStream, MonoResponseInner,
+    NeverStream, OwnedShape, Preparation, Prepared, Response, ResponsePlan, ResponseSink,
+    ResponseView, Serve, Shape, ShapeKind, ShapeMetadata, ShapeStream, StaticHeaderBytes,
+    StaticHeaderFields, StaticHeaders, StaticResponseInner, StaticShape, Stream, StreamShape,
+    StreamingShape, SyncShape, WireHeaderFields,
 };
-pub use varint::VarInt;

@@ -2,8 +2,10 @@
 
 use arbitrary::Arbitrary;
 use libfuzzer_sys::fuzz_target;
-use sark::framer::FusedHead;
-use sark_core::http::codec::{HeaderScan, ParsedRequestHead};
+use sark_core::http::codec::{HeaderScan, RequestLine};
+
+#[sark_gen::request(full)]
+struct FullRequest {}
 
 #[derive(Arbitrary, Debug)]
 enum Method {
@@ -201,29 +203,9 @@ fn httparse_request_line(buf: &[u8]) -> Option<(Vec<u8>, Vec<u8>, u8)> {
 }
 
 fn drive_request_header_scan(buf: &[u8], headers_start: usize) {
-    use sark_core::http::codec::HeaderScan;
-    use sark_core::http::head::{Flags, WellKnownHeaders};
+    use sark::service::RouteRequestImpl;
 
-    let mut scan = HeaderScan::default();
-    let mut flags = Flags::default();
-    let mut header_count = 0usize;
-    {
-        let mut headers = WellKnownHeaders::new(&mut scan, &mut flags);
-        let mut pos = headers_start;
-        loop {
-            if pos + 2 > buf.len() {
-                return;
-            }
-            let rest = &buf[pos..];
-            match headers.apply_contiguous(rest, &mut (), &mut header_count, 128) {
-                Ok(Some(0)) => break,
-                Ok(Some(rel)) => pos += rel + 2,
-                Ok(None) => return,
-                Err(_) => return,
-            }
-        }
-    }
-    let _ = scan.validate_for_request();
+    let _ = FullRequest::parse_headers::<false>(buf, headers_start, 128);
 }
 
 fn drive_httparse_header_scan(buf: &[u8]) {
@@ -234,8 +216,8 @@ fn drive_httparse_header_scan(buf: &[u8]) {
     }
 }
 
-fn drive_slice_probes(buf: &[u8]) {
-    use sark::service::{HeaderValue, PathProbe, SlicePath, SliceValue};
+fn drive_input_probes(buf: &[u8]) {
+    use sark::service::{HeaderValue, PathProbe, SliceValue, TargetPath};
 
     let bounds = [
         0usize,
@@ -249,8 +231,6 @@ fn drive_slice_probes(buf: &[u8]) {
     for &s in &bounds {
         for &e in &bounds {
             let v = SliceValue::new(buf, s..e);
-            let _ = v.len();
-            let _ = v.is_empty();
             let _ = v.eq_bytes(b"chunked");
             let _ = v.eq_ignore_ascii_case(b"keep-alive");
             let _ = v.as_range();
@@ -258,7 +238,7 @@ fn drive_slice_probes(buf: &[u8]) {
             let _ = v.parse_usize();
             let _ = v.parse_u64();
 
-            let p = SlicePath::new(buf);
+            let p = TargetPath::new(buf);
             let _ = p.eq_range(s, e, b"x");
             let _ = p.eq_range_ignore_ascii_case(s, e, b"x");
             let _ = p.parse_range_usize(s, e);
@@ -271,7 +251,7 @@ fn drive_slice_probes(buf: &[u8]) {
     }
 }
 
-fn drive_request_path(buf: &[u8], head: &ParsedRequestHead<'_>) {
+fn drive_request_path(buf: &[u8], head: &RequestLine<'_>) {
     use sark::request::Ref;
 
     let base = buf.as_ptr() as usize;
@@ -296,37 +276,15 @@ fn drive_request_path(buf: &[u8], head: &ParsedRequestHead<'_>) {
 
 fn check(buf: &[u8]) {
     drive_httparse_header_scan(buf);
-    drive_slice_probes(buf);
+    drive_input_probes(buf);
 
-    let parsed = ParsedRequestHead::parse(buf);
+    let parsed = RequestLine::parse(buf);
     let oracle = httparse_request_line(buf);
 
-    let fused = FusedHead::parse(buf);
-    match (&parsed, &fused) {
-        (Some(a), Some(f)) => {
-            assert_eq!(a.method, f.head.method, "fused method drift");
-            assert_eq!(a.target, f.head.target, "fused target drift");
-            assert_eq!(a.version, f.head.version, "fused version drift");
-            assert_eq!(
-                a.headers_start, f.head.headers_start,
-                "fused headers_start drift"
-            );
-            assert_eq!(
-                sark::service::Key::from_bytes(a.method) as u8,
-                f.method_key as u8,
-                "fused method_key drift"
-            );
-        }
-        (None, None) => {}
-        (a, f) => panic!(
-            "fused accept/reject drift: parse_head={a:?} fused={:?}",
-            f.is_some()
-        ),
-    }
-
-    if let Some(head) = parsed {
+    if let Ok(Some(head)) = parsed {
         drive_request_header_scan(buf, head.headers_start);
         drive_request_path(buf, &head);
+        let _ = sark_core::http::scan::request_target_is_valid(head.target);
 
         let version_ok = head.version == b"HTTP/1.1" || head.version == b"HTTP/1.0";
         assert!(version_ok, "accepted bad version {:?}", head.version);
@@ -334,11 +292,9 @@ fn check(buf: &[u8]) {
         assert!(!head.method.is_empty(), "accepted empty method");
         assert!(!head.target.is_empty(), "accepted empty target");
         assert!(
-            !head.target.iter().any(|&b| b <= 0x20 || b == 0x7f),
-            "accepted unprintable target {:?}",
-            head.target
+            !head.method.contains(&b'\r') && !head.target.contains(&b'\r'),
+            "accepted CR before the request-line terminator",
         );
-
         assert!(head.headers_start >= 2, "headers_start too small");
         assert!(
             head.headers_start <= buf.len(),

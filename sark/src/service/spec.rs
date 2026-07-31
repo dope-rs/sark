@@ -1,7 +1,7 @@
 use std::ops::Range;
 
 use super::PathProbe;
-use super::request_impl::RouteRequestImpl;
+use super::request_impl::{HeaderParse, RouteRequestImpl};
 use crate::request;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -77,9 +77,22 @@ pub trait RouteSpec {
         sark_core::http::body_kind::ResponseKind::Inline;
     const BODY_POLICY: super::BodyPolicy = <Self::Request as RouteRequestImpl>::BODY_POLICY;
     const MAX_BODY: usize = 1024 * 1024;
+    const PARSE_ACCEPT_ENCODING: bool = false;
 
     const EMIT_DATE: bool = true;
     const EMIT_SERVER: bool = true;
+
+    fn parse_headers(
+        req_bytes: &[u8],
+        headers_start: usize,
+        max_header_count: usize,
+    ) -> HeaderParse<Self::RawHeaders> {
+        if Self::PARSE_ACCEPT_ENCODING {
+            Self::Request::parse_headers::<true>(req_bytes, headers_start, max_header_count)
+        } else {
+            Self::Request::parse_headers::<false>(req_bytes, headers_start, max_header_count)
+        }
+    }
 
     fn parse_body<'req>(raw: &'req [u8]) -> sark_core::error::Result<Self::ParsedBody<'req>>;
 

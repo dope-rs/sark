@@ -2,8 +2,12 @@ use std::{pin::Pin, task::Poll};
 
 use dope::{
     DriverContext,
-    manifold::listener::{self, SlotEgress},
+    manifold::listener::{
+        egress::SlotEgress,
+        state::{EgressCtx, State, WriteBuf},
+    },
 };
+use dope_fiber::abi::Fiber;
 use dope_net::{link::slot::Slot, wire::Wire};
 use o3::buffer::Shared;
 use sark_core::http::{CHUNK_TERMINATOR, OwnedShape};
@@ -27,8 +31,8 @@ impl<'a> TaskRunner<'a> {
     pub fn finish<'d, R: RouteSpec, W: Wire, C: Default + 'static>(
         &self,
         response: R::AsyncResponse,
-        slot: &mut Slot<'d, W, listener::State<C>>,
-        aux: &mut listener::Aux,
+        slot: &mut Slot<'d, W, State<C>>,
+        egress: &mut EgressCtx<'_, '_>,
         driver: &mut DriverContext<'_, 'd>,
         close: bool,
     ) {
@@ -40,30 +44,30 @@ impl<'a> TaskRunner<'a> {
         }
         let response = response.into_shape();
         let outcome = {
-            let mut write = aux.write_buf_for(slot);
+            let mut write = egress.write_buf_for(slot);
             ResponseEgress::new(&mut write, self.date).plain(response, close)
         };
-        outcome.apply(slot, aux, driver);
+        outcome.apply(slot, egress, driver);
     }
 
     pub fn poll<'d, T, Tag, W, C, PJ, Classify, const N: usize>(
         &self,
         mut tasks: Pin<&mut FixedSlab<'d, T, N, Tag>>,
-        slot: &mut Slot<'d, W, listener::State<C>>,
-        aux: &mut listener::Aux,
+        slot: &mut Slot<'d, W, State<C>>,
+        egress: &mut EgressCtx<'_, '_>,
         driver: &mut DriverContext<'_, 'd>,
         project: PJ,
         mut classify: Classify,
     ) -> usize
     where
-        T: dope_fiber::Fiber<'d>,
+        T: Fiber<'d>,
         W: Wire,
         C: Default + 'static,
         PJ: Fn(&mut C) -> &mut ConnState,
         Classify: FnMut(
             T::Output,
-            &mut Slot<'d, W, listener::State<C>>,
-            &mut listener::Aux,
+            &mut Slot<'d, W, State<C>>,
+            &mut EgressCtx<'_, '_>,
             &mut DriverContext<'_, 'd>,
             &[u8; 29],
             bool,
@@ -96,7 +100,7 @@ impl<'a> TaskRunner<'a> {
                 None => {
                     let poll = {
                         use std::pin::pin;
-                        let mut context = pin!(dope_fiber::Context::from_ready(
+                        let mut context = pin!(dope_fiber::raw::task::Context::from_ready(
                             slot.driver(),
                             slot.ready_key(),
                             driver.reborrow(),
@@ -115,7 +119,7 @@ impl<'a> TaskRunner<'a> {
                         }
                         Poll::Ready(output) => {
                             let close = project(&mut slot.state.conn).deferred_close;
-                            match classify(output, slot, aux, driver, self.date, close) {
+                            match classify(output, slot, egress, driver, self.date, close) {
                                 TaskPoll::Complete => {
                                     let removed = tasks.as_mut().remove(task);
                                     debug_assert!(removed, "live task must be removable");
@@ -138,10 +142,10 @@ impl<'a> TaskRunner<'a> {
                     }
                 }
             };
-            let capacity = aux.write_buf_for(slot).len();
+            let capacity = egress.write_buf_for(slot).len();
             if capacity.saturating_sub(cursor) < framed.len() {
                 if framed.len() > capacity {
-                    let buffer = aux.write_buf_for(slot);
+                    let buffer = egress.write_buf_for(slot);
                     let token = slot.token();
                     slot.submit_split_shared(buffer, cursor, framed, token, driver);
                     if terminating {
@@ -159,7 +163,7 @@ impl<'a> TaskRunner<'a> {
                 return cursor;
             }
             let end = cursor + framed.len();
-            aux.write_buf_for(slot)[cursor..end].copy_from_slice(framed.as_ref());
+            egress.write_buf_for(slot)[cursor..end].copy_from_slice(framed.as_ref());
             cursor = end;
             if terminating {
                 let removed = tasks.as_mut().remove(task);
@@ -170,15 +174,15 @@ impl<'a> TaskRunner<'a> {
         }
     }
 
-    pub fn write_buf<'d, 'slot, W: Wire, C: Default + 'static>(
+    pub fn write_buf<'d, 'slot, 'pool, W: Wire, C: Default + 'static>(
         &self,
-        slot: &mut Slot<'d, W, listener::State<C>>,
-        aux: &'slot mut listener::Aux,
-    ) -> listener::WriteBuf<'slot> {
-        aux.write_buf_for(slot)
+        slot: &mut Slot<'d, W, State<C>>,
+        egress: &'slot mut EgressCtx<'_, 'pool>,
+    ) -> WriteBuf<'slot, 'pool> {
+        egress.write_buf_for(slot)
     }
 
-    fn release_connection<W, C, PJ>(slot: &mut Slot<'_, W, listener::State<C>>, project: &PJ)
+    fn release_connection<W, C, PJ>(slot: &mut Slot<'_, W, State<C>>, project: &PJ)
     where
         W: Wire,
         C: Default + 'static,

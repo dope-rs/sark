@@ -1,7 +1,9 @@
+use crate::stream::StreamId;
+
 pub trait Role: Copy + Default + 'static {
     const IS_SERVER: bool;
-    const FIRST_LOCAL_STREAM_ID: u32;
-    const FIRST_PEER_STREAM_ID: u32;
+    const FIRST_LOCAL_STREAM_ID: StreamId;
+    const FIRST_PEER_STREAM_ID: StreamId;
     const PREFACE_SENDS_FIRST: bool;
 }
 
@@ -10,8 +12,8 @@ pub struct ServerRole;
 
 impl Role for ServerRole {
     const IS_SERVER: bool = true;
-    const FIRST_LOCAL_STREAM_ID: u32 = 2;
-    const FIRST_PEER_STREAM_ID: u32 = 1;
+    const FIRST_LOCAL_STREAM_ID: StreamId = StreamId::FIRST_SERVER;
+    const FIRST_PEER_STREAM_ID: StreamId = StreamId::FIRST_CLIENT;
     const PREFACE_SENDS_FIRST: bool = false;
 }
 
@@ -20,7 +22,7 @@ pub struct ClientRole;
 
 impl Role for ClientRole {
     const IS_SERVER: bool = false;
-    const FIRST_LOCAL_STREAM_ID: u32 = 1;
-    const FIRST_PEER_STREAM_ID: u32 = 2;
+    const FIRST_LOCAL_STREAM_ID: StreamId = StreamId::FIRST_CLIENT;
+    const FIRST_PEER_STREAM_ID: StreamId = StreamId::FIRST_SERVER;
     const PREFACE_SENDS_FIRST: bool = true;
 }

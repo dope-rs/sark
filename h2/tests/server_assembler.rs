@@ -10,13 +10,19 @@ use std::time::Duration;
 
 use dope::DriverContext;
 use dope::manifold::Manifold;
-use dope::manifold::TypedToken;
 use dope::manifold::listener::{self, Listener};
+use dope::manifold::typed::TypedToken;
+use dope::runtime::dispatcher::Idle;
+use dope::runtime::executor::Executor;
+use dope::runtime::launcher::WorkerContext;
 use dope::runtime::profile::Throughput;
-use dope::runtime::{Executor, Idle, ShutdownTrigger, WorkerContext};
-use dope_extra::harness::Harness;
-use dope_fiber::{Context, Fiber, Ready, ready};
+use dope::runtime::trigger::ShutdownTrigger;
+use dope_fiber::abi::Fiber;
+use dope_fiber::abi::ready::Ready;
+use dope_fiber::raw::task::Context;
+use dope_net::link::egress::storage::Storage as EgressStorage;
 use dope_net::tcp::Tcp;
+use dope_test::Harness;
 use o3::buffer::Shared;
 use sark_h2::hpack::OwnedHeader;
 use sark_h2::server::{App, Body, Config, Env, Handler, Request, Response, serve, serve_sync};
@@ -58,7 +64,7 @@ impl Handler for Echo {
             OwnedHeader::new(b"x-method", method),
             OwnedHeader::new(b"x-has-path", if has_path { b"1" } else { b"0" }),
         ];
-        ready(Response::new(headers, Shared::copy_from_slice(&req.body)))
+        Ready::new(Response::new(headers, Shared::copy_from_slice(&req.body)))
     }
 }
 
@@ -347,7 +353,7 @@ impl<'d, M: Manifold<'d>> Manifold<'d> for DropLive<M> {
         target: TypedToken<Self>,
         driver: &mut DriverContext<'_, 'd>,
     ) {
-        let target = unsafe { TypedToken::<M>::new_unchecked(target.into_inner()) };
+        let target = target.retag::<'d, M>();
         M::activate(
             unsafe { self.map_unchecked_mut(|s| &mut s.inner) },
             target,
@@ -368,7 +374,7 @@ impl<'d, M: Manifold<'d>> Manifold<'d> for DropLive<M> {
     }
 }
 
-type PanicListener<'d> = Listener<'d, 0, App<'d, PanicHandler>, Env>;
+type PanicListener<'d> = Listener<'d, 'd, 0, App<'d, PanicHandler>, Env>;
 
 #[repr(transparent)]
 struct PanicIsolated<'d> {
@@ -391,7 +397,7 @@ impl<'d> Manifold<'d> for PanicIsolated<'d> {
         target: TypedToken<Self>,
         driver: &mut DriverContext<'_, 'd>,
     ) {
-        let target = unsafe { TypedToken::<PanicListener<'d>>::new_unchecked(target.into_inner()) };
+        let target = target.retag::<'d, PanicListener<'d>>();
         let inner = unsafe { self.map_unchecked_mut(|s| &mut s.inner) };
         let _ = std::panic::catch_unwind(AssertUnwindSafe(|| {
             Manifold::activate(inner, target, driver);
@@ -419,7 +425,7 @@ struct PanicDispatcher<'d> {
     listener: PanicIsolated<'d>,
 }
 
-type DropPendingListener<'d> = Listener<'d, 0, App<'d, DropPendingHandler>, Env>;
+type DropPendingListener<'d> = Listener<'d, 'd, 0, App<'d, DropPendingHandler>, Env>;
 
 #[pin_project::pin_project]
 #[derive(dope_gen::Dispatcher)]
@@ -435,7 +441,7 @@ fn serve_panic_isolated(
     context: WorkerContext,
     shutdown: &ShutdownTrigger,
 ) -> std::io::Result<()> {
-    let listener_cfg = listener::Config::<Tcp> {
+    let listener_cfg = listener::config::Config::<Tcp> {
         max_connections: cfg.max_connections,
         bind: cfg.bind_addr,
         backlog: cfg.listen_backlog,
@@ -446,19 +452,18 @@ fn serve_panic_isolated(
     let driver = dope::driver::Config::for_tcp_profile::<Throughput>(cfg.max_connections)
         .with_provided(cfg.receive_buffer_bytes, cfg.receive_buffer_count);
     Executor::with_seed(driver, context.seed())?
-        .with_storage(handler)
+        .with_storage((handler, EgressStorage::default()))
         .enter(|mut session| {
-            let handler = session.storage() as *const PanicHandler;
+            let (handler, egress) = session.storage();
             let hash_builder = session.seed().derive(dope::hash::domain::ACCEPT).state();
             let listener = {
                 let mut driver = session.driver_access();
                 shutdown.try_register(&mut driver)?;
                 Listener::<0, App<PanicHandler>, Env>::open_in(
-                    // The handler is owned by this executor session and the
-                    // dispatcher is dropped before the session returns.
-                    App::new(unsafe { &*handler }, cfg),
+                    App::new(handler, cfg).unwrap(),
                     listener_cfg,
                     hash_builder,
+                    egress,
                     &mut driver,
                 )?
             };
@@ -476,7 +481,7 @@ fn serve_drop_pending(
     shutdown: &ShutdownTrigger,
     completed: Arc<AtomicBool>,
 ) -> std::io::Result<()> {
-    let listener_cfg = listener::Config::<Tcp> {
+    let listener_cfg = listener::config::Config::<Tcp> {
         max_connections: cfg.max_connections,
         bind: cfg.bind_addr,
         backlog: cfg.listen_backlog,
@@ -487,19 +492,18 @@ fn serve_drop_pending(
     let driver = dope::driver::Config::for_tcp_profile::<Throughput>(cfg.max_connections)
         .with_provided(cfg.receive_buffer_bytes, cfg.receive_buffer_count);
     Executor::with_seed(driver, context.seed())?
-        .with_storage(handler)
+        .with_storage((handler, EgressStorage::default()))
         .enter(|mut session| {
-            let handler = session.storage() as *const DropPendingHandler;
+            let (handler, egress) = session.storage();
             let hash_builder = session.seed().derive(dope::hash::domain::ACCEPT).state();
             let listener = {
                 let mut driver = session.driver_access();
                 shutdown.try_register(&mut driver)?;
                 Listener::<0, App<DropPendingHandler>, Env>::open_in(
-                    // The handler and listener share the enclosing session's
-                    // lifetime; neither can escape this closure.
-                    App::new(unsafe { &*handler }, cfg),
+                    App::new(handler, cfg).unwrap(),
                     listener_cfg,
                     hash_builder,
+                    egress,
                     &mut driver,
                 )?
             };
@@ -1044,7 +1048,7 @@ fn sync_handler_serves_static_and_reusable_bodies() {
     harness
         .run_with_trigger(
             move |ctx, trigger| {
-                let large = Body::repeat(b'x', 1 << 20);
+                let large = Body::repeat(b'x', 1 << 20).unwrap();
                 serve_sync(
                     move |request| {
                         if request.path().is_some_and(|path| path == b"/large") {

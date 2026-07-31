@@ -2,7 +2,7 @@ mod common;
 
 use std::net::SocketAddr;
 
-use common::{run_get, spawn_raw_server};
+use common::{run_get, run_stream_get, spawn_raw_server};
 use sark_client::connector::Config;
 
 #[test]
@@ -54,6 +54,27 @@ fn connector_chunked_get_large_body() {
 }
 
 #[test]
+fn connector_single_chunk_can_exceed_ingress_capacity_with_framing() {
+    const BODY: usize = 16 * 1024 * 1024;
+    let server = spawn_raw_server(|stream, _req| {
+        let _ = stream.set_nonblocking(false);
+        let head = format!(
+            "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n{BODY:x}\r\n"
+        );
+        let _ = std::io::Write::write_all(stream, head.as_bytes());
+        let payload = vec![b'z'; BODY];
+        let _ = std::io::Write::write_all(stream, &payload);
+        let _ = std::io::Write::write_all(stream, b"\r\n0\r\n\r\n");
+    });
+    let addr: SocketAddr = server.addr().parse().expect("addr");
+
+    let config = Config::new("127.0.0.1").max_response_body(BODY);
+    let response = run_get(addr, config, "/single-large-chunk").expect("HTTP response");
+    assert_eq!(response.body().len(), BODY);
+    assert!(response.body().iter().all(|byte| *byte == b'z'));
+}
+
+#[test]
 fn connector_chunked_get_with_trailers() {
     let server = spawn_raw_server(|stream, _req| {
         let resp = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n\
@@ -68,4 +89,12 @@ fn connector_chunked_get_with_trailers() {
     let body = std::str::from_utf8(resp.body()).expect("utf8 body");
     assert_eq!(body, "abcdef");
     assert_eq!(resp.headers().get("x-checksum").unwrap(), "42");
+
+    let (status, body, trailers, informational) =
+        run_stream_get(addr, Config::new("127.0.0.1"), "/chunked-trailers")
+            .expect("streamed HTTP response");
+    assert_eq!(status, 200);
+    assert_eq!(body, b"abcdef");
+    assert_eq!(trailers, 1);
+    assert_eq!(informational, 0);
 }

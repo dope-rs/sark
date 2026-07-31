@@ -1,8 +1,6 @@
 use sark::request::Ref;
-use sark::sark_core::http::codec::HeaderScan;
-use sark::sark_core::http::head::Flags;
 use sark::service::body::{Buffered, Discarded};
-use sark::service::{BodyPolicy, RouteParams, RouteRequestImpl};
+use sark::service::{BodyPolicy, HeaderParse, RouteParams, RouteRequestImpl};
 
 #[sark_gen::request]
 struct PathReq {
@@ -22,11 +20,11 @@ struct EncodingReq {
     accept_encoding: o3::buffer::Bytes<o3::buffer::Retained>,
 }
 
-#[sark_gen::request(value = skip)]
-struct SkipValueReq {
-    #[header("x-token", default = "")]
-    x_token: o3::buffer::Bytes<o3::buffer::Retained>,
-}
+#[sark_gen::request]
+struct MinimalHeadReq {}
+
+#[sark_gen::request(full)]
+struct FullHeadReq {}
 
 #[sark_gen::request]
 struct QueryReq {
@@ -117,56 +115,118 @@ fn header_default_applies_when_absent() {
 
 #[test]
 fn captured_accept_encoding_still_updates_protocol_scan() {
-    let input: &[u8] = b"Accept-Encoding: gzip\r\n";
-    let mut headers = EncodingReqHeadersRaw::default();
-    let mut scan = HeaderScan::default();
-    let mut flags = Flags::default();
-    let mut header_count = 0;
+    let input: &[u8] = b"Accept-Encoding: gzip\r\n\r\n";
+    let HeaderParse::Ready {
+        headers,
+        accept_gzip,
+        ..
+    } = <EncodingReq as RouteRequestImpl>::parse_headers::<false>(input, 0, 16)
+    else {
+        panic!("valid Accept-Encoding header");
+    };
 
-    let tail = <EncodingReq as RouteRequestImpl>::apply_header_contig(
-        &mut headers,
-        input,
-        input,
-        0,
-        &mut scan,
-        &mut flags,
-        &mut header_count,
-        16,
-    )
-    .expect("valid Accept-Encoding header");
-
-    assert_eq!(tail, Some(input.len() - 2));
-    assert_eq!(header_count, 1);
-    const {
-        assert!(<EncodingReq as RouteRequestImpl>::NEED_KNOWN_HEADER);
-    }
-    assert!(scan.accept_encoding_gzip);
+    assert!(accept_gzip);
     assert_eq!(headers.accept_encoding, Some(17..21));
 }
 
 #[test]
-fn skipped_custom_header_value_is_still_validated() {
-    let input: &[u8] = b"X-Token: good\nbad\r\n";
-    let mut headers = SkipValueReqHeadersRaw::default();
-    let mut scan = HeaderScan::default();
-    let mut flags = Flags::default();
-    let mut header_count = 0;
+fn optional_known_headers_follow_capabilities() {
+    fn accept_gzip<R: RouteRequestImpl>(block: &[u8], enabled: bool) -> bool {
+        let parsed = if enabled {
+            R::parse_headers::<true>(block, 0, 16)
+        } else {
+            R::parse_headers::<false>(block, 0, 16)
+        };
+        let HeaderParse::Ready { accept_gzip, .. } = parsed else {
+            panic!("valid header block");
+        };
+        accept_gzip
+    }
 
-    let result = <SkipValueReq as RouteRequestImpl>::apply_header_contig(
-        &mut headers,
-        input,
-        input,
-        0,
-        &mut scan,
-        &mut flags,
-        &mut header_count,
-        16,
+    let block = b"Accept-Encoding: gzip\r\n\r\n";
+    assert!(!accept_gzip::<MinimalHeadReq>(block, false));
+    assert!(accept_gzip::<MinimalHeadReq>(block, true));
+
+    assert!(matches!(
+        FullHeadReq::parse_headers::<false>(
+            b"Expect: 100-continue\r\nExpect: 100-continue\r\n\r\n",
+            0,
+            16,
+        ),
+        HeaderParse::Bad,
+    ));
+    const {
+        assert!(!<MinimalHeadReq as RouteRequestImpl>::FULL);
+        assert!(<FullHeadReq as RouteRequestImpl>::FULL);
+    }
+}
+
+#[test]
+fn protocol_framing_is_always_parsed() {
+    let input: &[u8] = b"Content-Length: 41\r\n\r\n";
+    let HeaderParse::Ready { body_framing, .. } =
+        MinimalHeadReq::parse_headers::<false>(input, 0, 16)
+    else {
+        panic!("valid framing header");
+    };
+    assert_eq!(
+        body_framing,
+        sark::sark_core::http::codec::BodyFraming::Length(41)
     );
+}
 
+#[test]
+fn declared_custom_header_value_is_validated() {
+    let input: &[u8] = b"X-Token: good\nbad\r\n\r\n";
     assert!(
-        result.is_err(),
+        matches!(
+            HdrReq::parse_headers::<false>(input, 0, 16),
+            HeaderParse::Bad
+        ),
         "a bare LF must not bypass value validation"
     );
+}
+
+#[test]
+fn generated_unknown_header_scan_rejects_smuggling_bytes() {
+    for block in [
+        b"X-Smuggle: foo\nbar\r\n\r\n".as_slice(),
+        b"X-Smuggle: foo\rbar\r\n\r\n",
+        b"X-Smuggle: foo\x00bar\r\n\r\n",
+        b"X-Smuggle: foo\x07bar\r\n\r\n",
+        b"X-Smuggle: foo\x7fbar\r\n\r\n",
+    ] {
+        assert!(matches!(
+            MinimalHeadReq::parse_headers::<false>(block, 0, 16),
+            HeaderParse::Bad,
+        ));
+    }
+}
+
+#[test]
+fn generated_unknown_header_scan_accepts_visible_bytes_and_htab() {
+    assert!(matches!(
+        MinimalHeadReq::parse_headers::<false>(
+            b"Host: example.com\r\nUser-Agent: x/1\r\nX-Note: foo\tbar\r\n\r\n",
+            0,
+            16,
+        ),
+        HeaderParse::Ready { .. },
+    ));
+}
+
+#[test]
+fn generated_header_scan_enforces_line_limit() {
+    let mut block = Vec::from(b"X-Long: ".as_slice());
+    block.resize(
+        block.len() + sark::sark_core::http::head::MAX_HEADER_LINE_BYTES + 16,
+        b'a',
+    );
+    block.extend_from_slice(b"\r\n\r\n");
+    assert!(matches!(
+        MinimalHeadReq::parse_headers::<false>(&block, 0, 16),
+        HeaderParse::Bad,
+    ));
 }
 
 #[test]
@@ -192,6 +252,17 @@ fn shared_query_scan_drives_ordered_fields() {
 
     assert_eq!(headers.count, Some(41));
     assert_eq!(headers.limit, Some(7));
+}
+
+#[test]
+fn ordered_query_names_match_exactly() {
+    let input = b"countdown=41&limit=7";
+    let mut headers = OrderedQueryReqHeadersRaw::default();
+
+    let result =
+        <OrderedQueryReq as RouteRequestImpl>::parse_query_raw(&mut headers, input, 0..input.len());
+
+    assert!(result.is_err(), "a field-name prefix must not be accepted");
 }
 
 #[test]

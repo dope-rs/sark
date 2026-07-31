@@ -1,5 +1,7 @@
 mod egress;
+mod growing_pool;
 mod ingress;
+mod retained_segments;
 mod role;
 mod stream_registry;
 mod validate;
@@ -13,8 +15,8 @@ pub mod server;
 pub mod stream;
 pub mod tuning;
 
-pub use conn::{CLIENT_PREFACE, Conn, ConnError, Settings};
-pub use frame::{ErrorCode, Flags, Frame, FrameHeader};
+pub use conn::{CLIENT_PREFACE, ConfigError, Conn, ConnError, Settings, ValidatedConfig};
+pub use frame::{ErrorCode, Flags, Frame, FrameHeader, FrameLength, WindowIncrement};
 pub use hpack::Header;
 pub use role::{ClientRole, Role, ServerRole};
 pub use stream::{Side, Stream, StreamId};

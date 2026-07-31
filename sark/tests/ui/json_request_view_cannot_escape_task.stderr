@@ -1,0 +1,13 @@
+error: lifetime may not live long enough
+  --> tests/ui/json_request_view_cannot_escape_task.rs:27:5
+   |
+25 | #[sark_gen::handler]
+   | --------------------
+   | |
+   | lifetime `'req` defined here
+   | lifetime `'d` defined here
+26 | async fn leak(request: Request, state: &State<'_>) -> Reply {
+27 |     state.leaked.set(Some(request.body.payload));
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ argument requires that `'req` must outlive `'d`
+   |
+   = help: consider adding the following bound: `'req: 'd`

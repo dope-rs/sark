@@ -1,7 +1,8 @@
 use std::pin::Pin;
 use std::task::Poll;
 
-use dope_fiber::{Context, Fiber};
+use dope_fiber::abi::Fiber;
+use dope_fiber::raw::task::Context;
 use o3::buffer::Shared;
 
 pub enum NeverStream {}

@@ -5,7 +5,9 @@
 //! ```
 
 use libdeflater::{CompressionLvl, Compressor, DecompressionError, Decompressor};
-use o3::buffer::{Bytes, InitializedSharedPool, Pooled, Retained};
+use o3::buffer::{
+    Bytes, Initialized, PoolLayoutError, Pooled, Retained, SharedPool, SharedPoolLayout,
+};
 use thiserror::Error;
 
 use crate::http::Body;
@@ -14,38 +16,53 @@ const GZIP_SLOTS: usize = 32;
 const GZIP_CAPACITY: usize = 256 * 1024;
 
 pub struct Gzip {
+    inner: Option<GzipInner>,
+    layout: SharedPoolLayout,
+}
+
+struct GzipInner {
     encoder: Compressor,
-    pool: InitializedSharedPool,
+    pool: SharedPool<Initialized>,
 }
 
 impl Gzip {
     const LEVEL: i32 = 3;
+    const COMPRESSION_LEVEL: CompressionLvl = match CompressionLvl::new(Self::LEVEL) {
+        Ok(level) => level,
+        Err(_) => CompressionLvl::fastest(),
+    };
 
     pub fn new() -> Self {
-        Self::with_pool(GZIP_SLOTS, GZIP_CAPACITY)
+        Self {
+            inner: None,
+            layout: SharedPoolLayout::fixed::<GZIP_SLOTS, GZIP_CAPACITY>(),
+        }
     }
 
-    pub fn with_pool(slots: usize, capacity: usize) -> Self {
-        let level = CompressionLvl::new(Self::LEVEL).expect("valid libdeflate compression level");
-        Self {
-            encoder: Compressor::new(level),
-            pool: InitializedSharedPool::new(slots, capacity),
-        }
+    pub fn with_pool(slots: usize, capacity: usize) -> Result<Self, PoolLayoutError> {
+        Ok(Self {
+            inner: None,
+            layout: SharedPoolLayout::new(slots, capacity)?,
+        })
+    }
+
+    fn inner(&mut self) -> &mut GzipInner {
+        let layout = self.layout;
+        self.inner.get_or_insert_with(|| GzipInner {
+            encoder: Compressor::new(Self::COMPRESSION_LEVEL),
+            pool: SharedPool::<Initialized>::from_layout(layout),
+        })
     }
 
     pub fn encode(&mut self, src: &[u8]) -> Option<Pooled> {
-        let cap = self.encoder.gzip_compress_bound(src.len());
-        if cap > self.pool.capacity() {
+        let inner = self.inner();
+        let cap = inner.encoder.gzip_compress_bound(src.len());
+        if cap > inner.pool.capacity() {
             return None;
         }
-        let mut lease = self.pool.try_acquire()?;
-        let n = self
-            .encoder
-            .gzip_compress(src, lease.spare_mut())
-            .expect("gzip_compress_bound undersized");
-        lease
-            .try_advance(n)
-            .expect("gzip_compress_bound undersized");
+        let mut lease = inner.pool.try_acquire()?;
+        let n = inner.encoder.gzip_compress(src, lease.spare_mut()).ok()?;
+        lease.try_advance(n).ok()?;
         Some(lease.freeze())
     }
 }
@@ -80,19 +97,25 @@ pub enum GunzipError {
 
 pub struct Gunzip {
     decoder: Decompressor,
-    pool: InitializedSharedPool,
+    pool: SharedPool<Initialized>,
 }
 
 impl Gunzip {
     pub fn new() -> Self {
-        Self::with_pool(GZIP_SLOTS, GZIP_CAPACITY)
-    }
-
-    pub fn with_pool(slots: usize, capacity: usize) -> Self {
         Self {
             decoder: Decompressor::new(),
-            pool: InitializedSharedPool::new(slots, capacity),
+            pool: SharedPool::<Initialized>::from_layout(SharedPoolLayout::fixed::<
+                GZIP_SLOTS,
+                GZIP_CAPACITY,
+            >()),
         }
+    }
+
+    pub fn with_pool(slots: usize, capacity: usize) -> Result<Self, PoolLayoutError> {
+        Ok(Self {
+            decoder: Decompressor::new(),
+            pool: SharedPool::<Initialized>::from_layout(SharedPoolLayout::new(slots, capacity)?),
+        })
     }
 
     pub fn decode(&mut self, src: &[u8], max_size: usize) -> Result<GunzipOutput, GunzipError> {
@@ -109,7 +132,7 @@ impl Gunzip {
                 .gzip_decompress(src, &mut lease.spare_mut()[..expected])?;
             lease
                 .try_advance(written)
-                .expect("gunzip output exceeded its decoded size");
+                .map_err(|_| GunzipError::SizeLimit)?;
             return Ok(GunzipOutput::Pooled(lease.freeze()));
         }
 
@@ -123,13 +146,28 @@ impl Gunzip {
         if src.len() < 18 || !src.starts_with(&[0x1f, 0x8b, 0x08]) {
             return Err(DecompressionError::BadData.into());
         }
-        let footer = &src[src.len() - 4..];
-        Ok(u32::from_le_bytes(footer.try_into().expect("four-byte gzip footer")) as usize)
+        let mut footer = [0; 4];
+        footer.copy_from_slice(&src[src.len() - 4..]);
+        Ok(u32::from_le_bytes(footer) as usize)
     }
 }
 
 impl Default for Gunzip {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Gzip;
+
+    #[test]
+    fn gzip_allocates_its_pool_on_first_use() {
+        let mut gzip = Gzip::new();
+        assert!(gzip.inner.is_none());
+
+        assert!(gzip.encode(b"hello").is_some());
+        assert!(gzip.inner.is_some());
     }
 }

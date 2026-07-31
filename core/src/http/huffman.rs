@@ -1,5 +1,34 @@
-pub struct HpackHuffman;
+use core::convert::Infallible;
 
+#[repr(transparent)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+/// Bytes before HPACK/QPACK Huffman encoding.
+pub struct HpackHuffmanSource<'a>(&'a [u8]);
+
+#[repr(transparent)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+/// Bytes carrying an HPACK/QPACK Huffman bit stream.
+pub struct HpackHuffmanEncoded<'a>(&'a [u8]);
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+/// An invalid Huffman code, EOS symbol, or padding suffix.
+pub struct HpackHuffmanError;
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+/// Separates malformed input from a failure in the decoded-byte sink.
+pub enum HpackHuffmanDecodeError<E> {
+    InvalidEncoding(HpackHuffmanError),
+    Sink(E),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// Incremental HPACK/QPACK Huffman decoder state.
+pub struct HpackHuffmanDecoder {
+    state: u8,
+    maybe_eos: bool,
+}
+
+/// RFC 7541 Appendix B canonical codes, including EOS at index 256.
 pub const CODES: [(u32, u8); 257] = [
     (0x1ff8, 13),
     (0x7fffd8, 23),
@@ -260,19 +289,149 @@ pub const CODES: [(u32, u8); 257] = [
     (0x3fffffff, 30),
 ];
 
-impl HpackHuffman {
-    pub fn encoded_len(input: &[u8]) -> usize {
+const DECODED: u8 = 1;
+const ERROR: u8 = 2;
+const MAYBE_EOS: u8 = 4;
+const NO_NODE: u16 = u16::MAX;
+const NO_SYMBOL: u16 = u16::MAX;
+const NODE_COUNT: usize = CODES.len() * 2 - 1;
+const STATE_COUNT: usize = CODES.len() - 1;
+
+#[repr(C)]
+#[derive(Copy, Clone)]
+struct DecodeEntry {
+    next_state: u8,
+    byte: u8,
+    flags: u8,
+}
+
+impl DecodeEntry {
+    const EMPTY: Self = Self {
+        next_state: 0,
+        byte: 0,
+        flags: 0,
+    };
+}
+
+#[derive(Copy, Clone)]
+struct TreeNode {
+    children: [u16; 2],
+    symbol: u16,
+}
+
+impl TreeNode {
+    const EMPTY: Self = Self {
+        children: [NO_NODE; 2],
+        symbol: NO_SYMBOL,
+    };
+}
+
+const DECODE_TABLE: [[DecodeEntry; 16]; STATE_COUNT] = build_decode_table();
+
+const fn build_decode_table() -> [[DecodeEntry; 16]; STATE_COUNT] {
+    let mut nodes = [TreeNode::EMPTY; NODE_COUNT];
+    let mut node_count = 1usize;
+    let mut symbol = 0usize;
+    while symbol < CODES.len() {
+        let (code, code_len) = CODES[symbol];
+        let mut node = 0usize;
+        let mut bit = code_len as usize;
+        while bit != 0 {
+            bit -= 1;
+            let direction = ((code >> bit) & 1) as usize;
+            let child = nodes[node].children[direction];
+            if child == NO_NODE {
+                nodes[node].children[direction] = node_count as u16;
+                node = node_count;
+                node_count += 1;
+            } else {
+                node = child as usize;
+            }
+        }
+        nodes[node].symbol = symbol as u16;
+        symbol += 1;
+    }
+
+    let mut node_by_state = [0u16; STATE_COUNT];
+    let mut state_by_node = [0u8; NODE_COUNT];
+    let mut state_count = 0usize;
+    let mut node = 0usize;
+    while node < node_count {
+        if nodes[node].symbol == NO_SYMBOL {
+            node_by_state[state_count] = node as u16;
+            state_by_node[node] = state_count as u8;
+            state_count += 1;
+        }
+        node += 1;
+    }
+
+    let mut eos_prefix = [false; NODE_COUNT];
+    eos_prefix[0] = true;
+    node = 0;
+    let mut eos_bits = 0;
+    while eos_bits < 7 {
+        node = nodes[node].children[1] as usize;
+        eos_prefix[node] = true;
+        eos_bits += 1;
+    }
+
+    let mut table = [[DecodeEntry::EMPTY; 16]; STATE_COUNT];
+    let mut state = 0usize;
+    while state < state_count {
+        let mut nibble = 0usize;
+        while nibble < 16 {
+            node = node_by_state[state] as usize;
+            let mut byte = 0;
+            let mut flags = 0;
+            let mut remaining = 4usize;
+            while remaining != 0 {
+                remaining -= 1;
+                let direction = (nibble >> remaining) & 1;
+                node = nodes[node].children[direction] as usize;
+                let decoded = nodes[node].symbol;
+                if decoded != NO_SYMBOL {
+                    if decoded == 256 {
+                        flags |= ERROR;
+                        node = 0;
+                        break;
+                    }
+                    flags |= DECODED;
+                    byte = decoded as u8;
+                    node = 0;
+                }
+            }
+            if eos_prefix[node] {
+                flags |= MAYBE_EOS;
+            }
+            table[state][nibble] = DecodeEntry {
+                next_state: state_by_node[node],
+                byte,
+                flags,
+            };
+            nibble += 1;
+        }
+        state += 1;
+    }
+    table
+}
+
+impl<'a> HpackHuffmanSource<'a> {
+    pub const fn new(input: &'a [u8]) -> Self {
+        Self(input)
+    }
+
+    pub fn encoded_len(self) -> usize {
         let mut bits: u64 = 0;
-        for &b in input {
+        for &b in self.0 {
             bits += CODES[b as usize].1 as u64;
         }
         bits.div_ceil(8) as usize
     }
 
-    pub fn encode(input: &[u8], out: &mut Vec<u8>) {
+    pub fn encode(self, out: &mut Vec<u8>) {
         let mut buffer: u64 = 0;
         let mut bits_in: u32 = 0;
-        for &b in input {
+        for &b in self.0 {
             let (code, len) = CODES[b as usize];
             let len = len as u32;
             buffer = (buffer << len) | (code as u64);
@@ -288,73 +447,87 @@ impl HpackHuffman {
             out.push(buffer as u8);
         }
     }
+}
 
-    pub fn decode(input: &[u8], out: &mut Vec<u8>) -> Result<(), HpackHuffmanError> {
-        Self::decode_with(input, |byte| {
-            out.push(byte);
-            Ok(())
-        })
+impl<'a> HpackHuffmanEncoded<'a> {
+    pub const fn new(input: &'a [u8]) -> Self {
+        Self(input)
     }
 
-    pub fn decode_with(
+    pub fn decode(self, out: &mut Vec<u8>) -> Result<(), HpackHuffmanError> {
+        match self.decode_with(|byte| {
+            out.push(byte);
+            Ok::<_, Infallible>(())
+        }) {
+            Ok(()) => Ok(()),
+            Err(HpackHuffmanDecodeError::InvalidEncoding(error)) => Err(error),
+            Err(HpackHuffmanDecodeError::Sink(never)) => match never {},
+        }
+    }
+
+    pub fn decode_with<E>(
+        self,
+        emit: impl FnMut(u8) -> Result<(), E>,
+    ) -> Result<(), HpackHuffmanDecodeError<E>> {
+        let mut decoder = HpackHuffmanDecoder::new();
+        decoder.feed(self.0, emit)?;
+        decoder
+            .finish()
+            .map_err(HpackHuffmanDecodeError::InvalidEncoding)
+    }
+}
+
+impl HpackHuffmanDecoder {
+    pub const fn new() -> Self {
+        Self {
+            state: 0,
+            maybe_eos: true,
+        }
+    }
+
+    pub fn feed<E>(
+        &mut self,
         input: &[u8],
-        mut emit: impl FnMut(u8) -> Result<(), HpackHuffmanError>,
-    ) -> Result<(), HpackHuffmanError> {
-        let mut buffer: u64 = 0;
-        let mut bits_in: u32 = 0;
-        let total_bits: u64 = (input.len() as u64) * 8;
-        let mut consumed_bits: u64 = 0;
-        let mut input_pos: usize = 0;
-        loop {
-            while bits_in < 30 && input_pos < input.len() {
-                buffer = (buffer << 8) | (input[input_pos] as u64);
-                input_pos += 1;
-                bits_in += 8;
+        mut emit: impl FnMut(u8) -> Result<(), E>,
+    ) -> Result<(), HpackHuffmanDecodeError<E>> {
+        let mut state = self.state as usize;
+        let mut maybe_eos = self.maybe_eos;
+        for &byte in input {
+            let high = DECODE_TABLE[state][(byte >> 4) as usize];
+            if high.flags & ERROR != 0 {
+                return Err(HpackHuffmanDecodeError::InvalidEncoding(HpackHuffmanError));
             }
-            if bits_in == 0 {
-                return Ok(());
+            if high.flags & DECODED != 0 {
+                emit(high.byte).map_err(HpackHuffmanDecodeError::Sink)?;
             }
-            let mut matched = false;
-            for (sym, &(code, len)) in CODES.iter().take(256).enumerate() {
-                let len = len as u32;
-                if len > bits_in {
-                    continue;
-                }
-                let candidate = ((buffer >> (bits_in - len)) & ((1u64 << len) - 1)) as u32;
-                if candidate == code {
-                    if consumed_bits + len as u64 > total_bits {
-                        return Err(HpackHuffmanError);
-                    }
-                    emit(sym as u8)?;
-                    bits_in -= len;
-                    consumed_bits += len as u64;
-                    buffer &= (1u64 << bits_in) - 1;
-                    matched = true;
-                    break;
-                }
+            state = high.next_state as usize;
+
+            let low = DECODE_TABLE[state][(byte & 0x0f) as usize];
+            if low.flags & ERROR != 0 {
+                return Err(HpackHuffmanDecodeError::InvalidEncoding(HpackHuffmanError));
             }
-            if matched {
-                continue;
+            if low.flags & DECODED != 0 {
+                emit(low.byte).map_err(HpackHuffmanDecodeError::Sink)?;
             }
-            if input_pos >= input.len() {
-                let remaining = bits_in;
-                if remaining == 0 {
-                    return Ok(());
-                }
-                if remaining > 7 {
-                    return Err(HpackHuffmanError);
-                }
-                let expected = (1u64 << remaining) - 1;
-                let tail = buffer & expected;
-                if tail == expected {
-                    return Ok(());
-                }
-                return Err(HpackHuffmanError);
-            }
-            return Err(HpackHuffmanError);
+            state = low.next_state as usize;
+            maybe_eos = low.flags & MAYBE_EOS != 0;
+        }
+        self.state = state as u8;
+        self.maybe_eos = maybe_eos;
+        Ok(())
+    }
+
+    pub fn finish(self) -> Result<(), HpackHuffmanError> {
+        if self.state == 0 || self.maybe_eos {
+            Ok(())
+        } else {
+            Err(HpackHuffmanError)
         }
     }
 }
 
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
-pub struct HpackHuffmanError;
+impl Default for HpackHuffmanDecoder {
+    fn default() -> Self {
+        Self::new()
+    }
+}

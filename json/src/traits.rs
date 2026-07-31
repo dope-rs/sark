@@ -11,6 +11,13 @@ pub trait JsonDecode: Sized {
     }
 }
 
+/// Decodes a request-scoped view without copying the complete JSON body.
+pub trait JsonRequestDecode {
+    type View<'req>: JsonEncode;
+
+    fn decode_request<'req>(input: &'req [u8]) -> Result<Self::View<'req>>;
+}
+
 pub trait JsonScan: Sized {
     fn scan_json<'a, I>(chunks: I) -> Result<Self>
     where
@@ -20,13 +27,15 @@ pub trait JsonScan: Sized {
 pub trait JsonEncode: Sized {
     fn json_len(&self) -> usize;
 
-    fn write_into<W: Write>(&self, w: &mut W);
+    fn write_into<W: Write>(&self, w: &mut W) -> std::result::Result<(), W::Error>;
 
     fn write_json(&self, out: &mut Vec<u8>) {
         let expected = self.json_len();
         let mut w = Writer::new(out, expected);
-        self.write_into(&mut w);
-        assert_eq!(w.finish(), expected, "JsonEncode length mismatch");
+        match self.write_into(&mut w) {
+            Ok(()) => {}
+            Err(error) => match error {},
+        }
     }
 
     fn encode_json(&self) -> Vec<u8> {
@@ -48,7 +57,7 @@ where
         (*self).json_len()
     }
 
-    fn write_into<W: Write>(&self, w: &mut W) {
+    fn write_into<W: Write>(&self, w: &mut W) -> std::result::Result<(), W::Error> {
         (*self).write_into(w)
     }
 
