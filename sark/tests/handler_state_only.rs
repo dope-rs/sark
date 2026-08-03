@@ -27,13 +27,10 @@ sark_gen::define_route! {
 #[test]
 fn state_only_handler_builds_without_request_plumbing() {
     let state = State { value: b"ok" };
-    let timer = sark::Timer::with_capacity(1);
+    let timer = sark::Timer::new();
     let _ = App::new::<dope_net::wire::identity::Identity>(
         &state,
         &timer,
-        sark::app::Config {
-            timer_capacity: 1,
-            task_capacity: 1,
-        },
+        sark::app::Config { task_capacity: 1 },
     );
 }

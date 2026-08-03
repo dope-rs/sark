@@ -7,7 +7,7 @@ use std::{
 
 use dope::{
     manifold::{
-        env::{Bundle, Env as ManifoldEnv},
+        env::{self, Bundle},
         listener::{self, Listener, application::Application},
     },
     runtime::{
@@ -18,7 +18,7 @@ use dope::{
     },
 };
 use dope_net::{
-    link::egress::storage::Storage as EgressStorage,
+    link::egress,
     tcp::{self, Tcp},
     wire::{Wire, identity::Identity},
 };
@@ -117,11 +117,11 @@ fn invalid_config(message: &'static str) -> io::Error {
 }
 
 trait EgressHost {
-    fn egress(&self) -> &EgressStorage;
+    fn egress(&self) -> &egress::storage::Storage;
 }
 
-impl<T> EgressHost for (T, EgressStorage, SessionStorage) {
-    fn egress(&self) -> &EgressStorage {
+impl<T> EgressHost for (T, egress::storage::Storage, SessionStorage) {
+    fn egress(&self) -> &egress::storage::Storage {
         &self.1
     }
 }
@@ -138,7 +138,7 @@ where
     H: 'static,
     F: for<'scope, 'd> FnOnce(
         &'d H,
-        Session<'scope, 'd, (H, EgressStorage, SessionStorage)>,
+        Session<'scope, 'd, (H, egress::storage::Storage, SessionStorage)>,
         listener::config::Config<Tcp>,
         Config,
     ) -> io::Result<()>,
@@ -146,10 +146,10 @@ where
     let config = config.validate(asynchronous)?;
     let listener = config.listener();
     let driver = dope::driver::Config::for_tcp_profile::<Throughput>(config.max_connections)
-        .with_provided(config.receive_buffer_bytes, config.receive_buffer_count);
+        .with_recv(config.receive_buffer_bytes, config.receive_buffer_count);
     let tls_storage = SessionStorage::try_with_capacity(config.max_connections)?;
     Executor::with_seed(driver, context.seed())?
-        .with_storage((handler, EgressStorage::default(), tls_storage))
+        .with_storage((handler, egress::storage::Storage::default(), tls_storage))
         .enter(|mut session| {
             if let Some(trigger) = shutdown {
                 trigger.try_register(&mut session.driver_access())?;
@@ -164,7 +164,7 @@ where
 struct Server<'d, A, E>
 where
     A: Application<'d>,
-    E: ManifoldEnv<Wire = A::Wire>,
+    E: env::Env<Wire = A::Wire>,
 {
     #[pin]
     #[manifold]
@@ -179,7 +179,7 @@ fn start<'scope, 'd, A, E, S>(
 ) -> io::Result<()>
 where
     A: Application<'d>,
-    E: ManifoldEnv<Transport = Tcp, Wire = A::Wire>,
+    E: env::Env<Transport = Tcp, Wire = A::Wire>,
     S: EgressHost,
 {
     use core::pin::pin;

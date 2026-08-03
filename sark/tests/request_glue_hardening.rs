@@ -216,6 +216,35 @@ fn generated_unknown_header_scan_accepts_visible_bytes_and_htab() {
 }
 
 #[test]
+fn generated_ignored_header_scan_handles_lane_boundaries() {
+    let mut long = Vec::from(b"User-Agent: ".as_slice());
+    long.extend_from_slice(&[b'a'; 64]);
+    long.extend_from_slice(b"\r\n\r\n");
+    assert!(matches!(
+        MinimalHeadReq::parse_headers::<false>(&long, 0, 16),
+        HeaderParse::Ready { .. },
+    ));
+
+    let incomplete = b"User-Agent: 12345678901234\r";
+    assert!(matches!(
+        MinimalHeadReq::parse_headers::<false>(incomplete, 0, 16),
+        HeaderParse::NeedMore,
+    ));
+}
+
+#[test]
+fn generated_header_count_is_enforced_at_the_parse_loop() {
+    assert!(matches!(
+        MinimalHeadReq::parse_headers::<false>(b"\r\n", 0, 0),
+        HeaderParse::Ready { .. },
+    ));
+    assert!(matches!(
+        MinimalHeadReq::parse_headers::<false>(b"Host: example.com\r\n\r\n", 0, 0),
+        HeaderParse::Bad,
+    ));
+}
+
+#[test]
 fn generated_header_scan_enforces_line_limit() {
     let mut block = Vec::from(b"X-Long: ".as_slice());
     block.resize(

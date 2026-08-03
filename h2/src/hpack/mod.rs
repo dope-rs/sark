@@ -4,9 +4,9 @@ mod static_table;
 
 use dynamic_table::DynamicTable;
 use literal::Literal;
-pub use sark_core::http::{
-    Field as Header, OwnedField as OwnedHeader, PooledFieldBlock as HeaderBlock,
-};
+pub type Header<'a> = sark_core::http::Field<'a>;
+pub type OwnedHeader = sark_core::http::OwnedField;
+pub type HeaderBlock = sark_core::http::PooledFieldBlock;
 use sark_core::http::{HpackHuffmanDecoder, PrefixedInt, PrefixedIntError};
 use static_table::StaticTable;
 
@@ -32,6 +32,7 @@ pub struct Encoder {
     dyn_table: DynamicTable,
     max_size_setting: usize,
     pending_size_update: Option<usize>,
+    pending_reset: bool,
     use_huffman: bool,
 }
 
@@ -41,15 +42,21 @@ impl Encoder {
             dyn_table: DynamicTable::new(max_dyn_size),
             max_size_setting: max_dyn_size,
             pending_size_update: None,
+            pending_reset: false,
             use_huffman: true,
         }
     }
 
     pub fn set_max_size(&mut self, n: usize) {
-        self.max_size_setting = n;
-        if n < self.dyn_table.max_size() {
-            self.dyn_table.set_max(n);
+        if self
+            .pending_size_update
+            .is_some_and(|previous| n > previous)
+        {
+            self.dyn_table.set_max(0);
+            self.pending_reset = true;
         }
+        self.max_size_setting = n;
+        self.dyn_table.set_max(n);
         self.pending_size_update = Some(n);
     }
 
@@ -62,28 +69,41 @@ impl Encoder {
         I: IntoIterator<Item = Header<'a>>,
     {
         if let Some(n) = self.pending_size_update.take() {
-            PrefixedInt::<5>::new(n as u64).encode(0x20, out);
+            let reset = core::mem::take(&mut self.pending_reset);
+            if reset {
+                PrefixedInt::<5>::new(0).encode(0x20, out);
+            }
+            if !reset || n != 0 {
+                PrefixedInt::<5>::new(n as u64).encode(0x20, out);
+            }
         }
         for h in headers {
             self.encode_one(h, out);
         }
     }
 
+    pub(crate) fn discard_block(&mut self) {
+        self.dyn_table.set_max(0);
+        self.dyn_table.set_max(self.max_size_setting);
+        self.pending_size_update = Some(self.max_size_setting);
+        self.pending_reset = true;
+    }
+
     pub fn encode_one(&mut self, h: Header<'_>, out: &mut Vec<u8>) {
-        if let Some(idx) = StaticTable::find(h.name, h.value) {
-            PrefixedInt::<7>::new(idx as u64).encode(0x80, out);
+        let static_match = StaticTable::lookup(h.name, h.value);
+        if let Some(index) = static_match.as_ref().and_then(|found| found.exact) {
+            PrefixedInt::<7>::new(index as u64).encode(0x80, out);
             return;
         }
-        if let Some(dyn_idx) = self.dyn_table.find(h.name, h.value) {
+        let dynamic_match = self.dyn_table.lookup(h.name, h.value);
+        if let Some(dyn_idx) = dynamic_match.exact {
             let absolute = StaticTable::LEN + 1 + dyn_idx;
             PrefixedInt::<7>::new(absolute as u64).encode(0x80, out);
             return;
         }
-        let name_idx = StaticTable::find_name(h.name).or_else(|| {
-            self.dyn_table
-                .find_name(h.name)
-                .map(|i| StaticTable::LEN + 1 + i)
-        });
+        let name_idx = static_match
+            .map(|found| found.name)
+            .or_else(|| dynamic_match.name.map(|i| StaticTable::LEN + 1 + i));
         match name_idx {
             Some(idx) => {
                 PrefixedInt::<6>::new(idx as u64).encode(0x40, out);

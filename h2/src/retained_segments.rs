@@ -1,4 +1,6 @@
-use o3::buffer::{Bytes, CapacityError, Owned, Retained, SegmentQueue, Shared};
+use o3::buffer::{
+    Bytes, CapacityError, Owned, PrefixLength, Retained, SegmentQueue, Shared, ValidatedPrefix,
+};
 
 pub(crate) struct RetainedSegments {
     chunks: SegmentQueue<Bytes<Retained>>,
@@ -96,6 +98,24 @@ impl RetainedSegments {
 
     pub(crate) fn try_consume(&mut self, amount: usize) -> bool {
         self.chunks.try_consume_front(amount)
+    }
+
+    pub(crate) fn prepare_consume(
+        &mut self,
+        amount: usize,
+    ) -> Result<ValidatedPrefix<'_, Self, impl FnOnce(&mut Self, usize)>, CapacityError> {
+        ValidatedPrefix::try_new(self, amount, Self::consume_valid)
+    }
+
+    fn consume_valid(&mut self, amount: usize) {
+        let consumed = self.chunks.try_consume_front(amount);
+        debug_assert!(consumed);
+    }
+}
+
+impl PrefixLength for RetainedSegments {
+    fn prefix_len(&self) -> usize {
+        self.len()
     }
 }
 

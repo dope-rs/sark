@@ -102,14 +102,13 @@ fn accum_zero_copy_retain_survives_cow_during_await() {
                 let executor = Executor::new(driver_config)?
                     .with_storage(dope_net::link::egress::storage::Storage::default());
                 executor.enter(|mut session| {
-                    let timer = sark::Timer::with_capacity(32);
+                    let timer = sark::Timer::new();
                     server(bind).serve(
                         &mut session,
                         EchoDispatch::new(
                             &(),
                             &timer,
                             sark::app::Config {
-                                timer_capacity: 32,
                                 task_capacity: support::MAX_CONNECTIONS,
                             },
                         ),
@@ -160,14 +159,13 @@ fn socket_fast_path_retain_survives_buffer_reuse() {
                 let executor = Executor::new(driver_config)?
                     .with_storage(dope_net::link::egress::storage::Storage::default());
                 executor.enter(|mut session| {
-                    let timer = sark::Timer::with_capacity(32);
+                    let timer = sark::Timer::new();
                     server(bind).serve(
                         &mut session,
                         EchoDispatch::new(
                             &(),
                             &timer,
                             sark::app::Config {
-                                timer_capacity: 32,
                                 task_capacity: support::MAX_CONNECTIONS,
                             },
                         ),

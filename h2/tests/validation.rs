@@ -1,9 +1,8 @@
 mod common;
 
 use common::sid;
-use sark_h2::frame::{
-    self, Continuation as ContinuationFrame, Data as DataFrame, Headers as HeadersFrame,
-};
+use sark_core::http::{HeadDisposition, HeadPlan, KnownHeadName};
+use sark_h2::frame;
 use sark_h2::hpack::{Encoder, Header};
 use sark_h2::{
     CLIENT_PREFACE, ClientRole, Conn, ErrorCode, FrameHeader, ServerRole, Settings, StreamId, conn,
@@ -39,11 +38,31 @@ fn server_with_header_list_limit(max: u32) -> Conn<ServerRole> {
     .unwrap()
 }
 
-fn prime_server(conn: &mut Conn<ServerRole>) {
+fn prime_server<P: HeadPlan>(conn: &mut Conn<ServerRole, P>) {
     conn.drain_outbound(conn.outbound().len());
     conn.ingest(CLIENT_PREFACE).unwrap();
     while conn.poll_event().is_some() {}
     conn.drain_outbound(conn.outbound().len());
+}
+
+#[derive(Default)]
+struct DeclaredHeadPlan;
+
+impl HeadPlan for DeclaredHeadPlan {
+    type Selection = u8;
+    type Block = sark_core::http::DecodedFieldBlock;
+
+    fn disposition(&mut self, name: &[u8], _known: KnownHeadName, _: &[u8]) -> HeadDisposition {
+        if name.starts_with(b":") || matches!(name, b"content-length" | b"x-name") {
+            HeadDisposition::Raw
+        } else {
+            HeadDisposition::Discard
+        }
+    }
+
+    fn finish(self) -> u8 {
+        7
+    }
 }
 
 fn prime_client(conn: &mut Conn<ClientRole>) {
@@ -69,7 +88,7 @@ fn headers_frame_bytes(
     block: &[u8],
 ) -> Vec<u8> {
     let mut out = Vec::new();
-    HeadersFrame::new(sid(stream_id), end_stream, end_headers, None, block)
+    frame::Headers::new(sid(stream_id), end_stream, end_headers, None, block)
         .unwrap()
         .encode(&mut out);
     out
@@ -77,7 +96,7 @@ fn headers_frame_bytes(
 
 fn data_frame_bytes(stream_id: u32, end_stream: bool, payload: &[u8]) -> Vec<u8> {
     let mut out = Vec::new();
-    DataFrame::new(sid(stream_id), end_stream, payload)
+    frame::Data::new(sid(stream_id), end_stream, payload)
         .unwrap()
         .encode(&mut out);
     out
@@ -150,6 +169,30 @@ fn req_full_pseudo_set_accepted() {
     let ev = conn.poll_event().expect("Headers event");
     assert!(matches!(ev, conn::Event::Headers { .. }));
     assert!(first_outbound_rst(conn.outbound()).is_none());
+}
+
+#[test]
+fn typed_head_plan_retains_only_declared_request_fields() {
+    let mut conn = Conn::<ServerRole, DeclaredHeadPlan>::from_config_with_plan(
+        sark_h2::ValidatedConfig::default(),
+    );
+    prime_server(&mut conn);
+    let frame = headers_frame_bytes(
+        1,
+        true,
+        true,
+        &full_req(&[(b"x-ignored", b"discard-me"), (b"x-name", b"alice")]),
+    );
+    conn.ingest(&frame).unwrap();
+    let conn::Event::Headers {
+        headers, selection, ..
+    } = conn.poll_event().expect("Headers event")
+    else {
+        panic!("expected Headers event");
+    };
+    assert_eq!(selection, 7);
+    assert_eq!(headers.get(b"x-ignored"), None);
+    assert_eq!(headers.get(b"x-name"), Some(&b"alice"[..]));
 }
 
 #[test]
@@ -641,7 +684,7 @@ fn req_continuation_validates_on_assembly() {
     assert!(conn.poll_event().is_none());
     conn.ingest(&{
         let mut out = Vec::new();
-        ContinuationFrame::new(sid(1), true, &block[split..])
+        frame::Continuation::new(sid(1), true, &block[split..])
             .unwrap()
             .encode(&mut out);
         out
@@ -664,7 +707,7 @@ fn req_continuation_header_list_size_over_limit_rejected_on_assembly() {
     assert!(conn.poll_event().is_none());
     conn.ingest(&{
         let mut out = Vec::new();
-        ContinuationFrame::new(sid(1), true, &block[split..])
+        frame::Continuation::new(sid(1), true, &block[split..])
             .unwrap()
             .encode(&mut out);
         out

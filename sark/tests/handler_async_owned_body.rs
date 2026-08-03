@@ -112,16 +112,13 @@ fn async_handler_keeps_request_bytes_after_pipelined_request() {
                 driver::Config::for_tcp_profile::<Throughput>(support::MAX_CONNECTIONS);
                 let executor = Executor::new(driver_config)?.with_storage(dope_net::link::egress::storage::Storage::default());
                 executor.enter(|mut session| {
-                    let timer = sark::Timer::with_capacity(
-                        support::MAX_CONNECTIONS.saturating_mul(2),
-                    );
+                    let timer = sark::Timer::new();
                     server.clone().serve(
                         &mut session,
                         EchoDispatch::new(
                             &(),
                             &timer,
                         sark::app::Config {
-                            timer_capacity: support::MAX_CONNECTIONS.saturating_mul(2),
                             task_capacity: support::MAX_CONNECTIONS,
                         },
                     ),

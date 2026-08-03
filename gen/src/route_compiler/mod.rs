@@ -40,6 +40,20 @@ impl Seg {
 }
 
 impl Method {
+    pub(super) fn parse(value: &str) -> Option<Self> {
+        match value {
+            "GET" => Some(Self::Get),
+            "POST" => Some(Self::Post),
+            "PUT" => Some(Self::Put),
+            "PATCH" => Some(Self::Patch),
+            "DELETE" => Some(Self::Delete),
+            "HEAD" => Some(Self::Head),
+            "OPTIONS" => Some(Self::Options),
+            "WS" => Some(Self::Get),
+            _ => None,
+        }
+    }
+
     pub(super) fn ord(self) -> u8 {
         match self {
             Self::Get => 0,
@@ -68,6 +82,18 @@ impl Method {
             Self::Options => parse_quote!(sark::service::Key::Options),
         };
         quote!(#path)
+    }
+
+    pub(super) fn bytes_token(self) -> TokenStream {
+        match self {
+            Self::Get => quote!(b"GET"),
+            Self::Post => quote!(b"POST"),
+            Self::Put => quote!(b"PUT"),
+            Self::Patch => quote!(b"PATCH"),
+            Self::Delete => quote!(b"DELETE"),
+            Self::Head => quote!(b"HEAD"),
+            Self::Options => quote!(b"OPTIONS"),
+        }
     }
 
     pub(super) fn http_token(self) -> TokenStream {

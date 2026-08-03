@@ -82,12 +82,6 @@ impl<'req> Body<'req> {
         self.len()
     }
 
-    pub(crate) fn write_to(&self, out: &mut [u8]) -> usize {
-        let body = self.as_bytes();
-        out[..body.len()].copy_from_slice(body);
-        body.len()
-    }
-
     pub(crate) fn into_shared(self) -> Shared {
         self.into_bytes()
     }

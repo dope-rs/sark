@@ -1,7 +1,7 @@
 use http::{HeaderName, HeaderValue, StatusCode};
 use o3::buffer::Shared;
 
-use super::wire_emit::{CRLF, ContentLength, HeadWrite, HeaderSection, WireWriter};
+use super::wire_emit::{CRLF, ContentLength, HeadWrite, HeaderSection, ProvenWireWriter};
 use super::{Body, DEFAULT_HEADER_CAPACITY, HeaderList, HotHeadInner};
 
 struct MonoHeaders<'a, 'req, const N: usize> {
@@ -10,15 +10,15 @@ struct MonoHeaders<'a, 'req, const N: usize> {
 }
 
 impl<const N: usize> HeaderSection for MonoHeaders<'_, '_, N> {
-    fn header_len(&self) -> usize {
+    fn wire_len(&self) -> usize {
         let head = match self.head {
             HotHeadInner::Wire(bytes) => bytes.len(),
-            HotHeadInner::Direct(head) => head.wire_len(),
+            HotHeadInner::Direct(head) => HeaderSection::wire_len(head),
         };
-        head + self.dynamic.map_or(0, HeaderList::wire_len)
+        head.saturating_add(self.dynamic.map_or(0, HeaderList::wire_len))
     }
 
-    fn write_headers(&self, out: &mut WireWriter<'_>) {
+    fn write_headers(&self, out: &mut ProvenWireWriter<'_>) {
         match self.head {
             HotHeadInner::Wire(bytes) => out.put(bytes),
             HotHeadInner::Direct(head) => head.write_headers(out),
@@ -66,53 +66,47 @@ impl<'req, const N: usize> MonoResponseInner<'req, N> {
     }
 
     pub fn wire_headers(&self) -> Shared {
-        let section = MonoHeaders {
-            head: &self.head,
-            dynamic: self.headers.as_deref(),
-        };
-        let mut bytes = vec![0; section.header_len()];
-        section.write_headers(&mut WireWriter::new(&mut bytes));
+        let section = self.header_section();
+        let len = section.wire_len();
+        let mut bytes = vec![0; len];
+        let mut out = ProvenWireWriter::exact(&mut bytes);
+        section.write_headers(&mut out);
+        out.finish(len);
         Shared::from(bytes)
     }
 
     pub fn write_into_slice(&self, out: &mut [u8], date: &[u8; 29]) -> Option<usize> {
-        let (mut off, _) = self.write_head_into(out, date)?;
-        let body_len = self.body.body_len();
-        if out.len() - off < body_len {
-            return None;
-        }
-        off += self.body.write_to(&mut out[off..off + body_len]);
-        Some(off)
-    }
-
-    pub fn write_head_split(self, out: &mut [u8], date: &[u8; 29]) -> Option<(usize, Shared)> {
-        let (off, _) = self.write_head_into(out, date)?;
-        Some((off, self.body.into_shared()))
-    }
-
-    fn with_head<R>(
-        &self,
-        f: impl FnOnce(&HeadWrite<'_, MonoHeaders<'_, 'req, N>, ContentLength>) -> R,
-    ) -> R {
-        let section = MonoHeaders {
-            head: &self.head,
-            dynamic: self.headers.as_deref(),
-        };
+        let section = self.header_section();
         let head = HeadWrite {
             status: self.status,
             headers: &section,
             framing: ContentLength(self.body.body_len()),
         };
-        f(&head)
+        let total = head.wire_len().checked_add(self.body.body_len())?;
+        let mut out = ProvenWireWriter::new(out, total)?;
+        head.emit(&mut out, date);
+        out.put(self.body.as_bytes());
+        Some(out.finish(total))
     }
 
-    fn write_head_into(&self, out: &mut [u8], date: &[u8; 29]) -> Option<(usize, usize)> {
-        self.with_head(|head| {
-            if out.len() < head.wire_len() {
-                return None;
-            }
-            let written = head.write(out, date);
-            Some((written.len, written.date_offset))
-        })
+    pub fn write_head_split(self, out: &mut [u8], date: &[u8; 29]) -> Option<(usize, Shared)> {
+        let section = self.header_section();
+        let head = HeadWrite {
+            status: self.status,
+            headers: &section,
+            framing: ContentLength(self.body.body_len()),
+        };
+        let head_len = head.wire_len();
+        let mut out = ProvenWireWriter::new(out, head_len)?;
+        head.emit(&mut out, date);
+        let written = out.finish(head_len);
+        Some((written, self.body.into_shared()))
+    }
+
+    fn header_section(&self) -> MonoHeaders<'_, 'req, N> {
+        MonoHeaders {
+            head: &self.head,
+            dynamic: self.headers.as_deref(),
+        }
     }
 }

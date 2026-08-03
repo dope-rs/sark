@@ -1,61 +1,21 @@
-use std::marker::PhantomData;
 use std::ops::Range;
 use std::pin::Pin;
 
 use dope::DriverContext;
 use dope::manifold::listener::state::{EgressCtx, State};
 use dope_fiber::abi::Fiber;
-use dope_fiber::owner::{SplitTask, SplitView};
 use dope_net::link::slot::Slot;
 use dope_net::wire::Wire;
 use o3::buffer::Shared;
 
-use super::conn_state::{ConnState, ConsumeOutcome, DispatchPermit};
+use super::conn_state::{ConnState, ConsumeOutcome, DispatchPermit, Outcome};
 use super::requests::{Ctx, Matched, RequestDomainInput, assemble_matched};
 use super::tasks::TaskRunner;
 use crate::fiber::FixedSlab;
-use crate::request::{Ref, RequestStorage};
-use crate::service::manifold::{NativeFiber, NativeStream, TaskRoute};
-use crate::service::{RouteRequestImpl, RouteSpec};
-use crate::{CANNED_400, CANNED_503, Timer};
-
-pub struct RequestTask<R, S>(PhantomData<fn() -> (R, S)>);
-
-impl<'d, R, S> SplitTask<'d> for RequestTask<R, S>
-where
-    R: RouteSpec + TaskRoute<'d, S> + 'static,
-{
-    type Input = (R::RawParams, R::RawHeaders, Range<usize>);
-    type State = S;
-    type Context = Timer<'d>;
-    type Output = R::AsyncResponse;
-    type Error = &'static [u8];
-
-    fn build<'req>(
-        view: SplitView<'req>,
-        (raw_params, raw_headers, target): Self::Input,
-        state: &'req Self::State,
-        timer: &'req Self::Context,
-    ) -> Result<impl Fiber<'d, Output = Self::Output> + 'req, Self::Error>
-    where
-        'd: 'req,
-        S: 'req,
-    {
-        let (head, body) = view.into_parts();
-        let request = Ref::from_slice(target, head, body);
-        let params = R::Request::build_params(&request, raw_params).ok_or(CANNED_400)?;
-        let headers = R::Request::build_headers(&request, raw_headers).map_err(|_| CANNED_400)?;
-        let parsed_body = R::parse_body(body).map_err(|_| CANNED_400)?;
-        Ok(R::invoke_task(
-            params,
-            request,
-            headers,
-            parsed_body,
-            state,
-            timer,
-        ))
-    }
-}
+use crate::request::RequestStorage;
+use crate::service::RouteSpec;
+use crate::service::manifold::{NativeFiber, NativeStream};
+use crate::{CANNED_503, Timer};
 
 pub enum TaskPoll {
     Complete,
@@ -70,7 +30,7 @@ where
     fn complete<'a, W: Wire, C: Default + 'static>(
         output: <T as Fiber<'d>>::Output,
         slot: &mut Slot<'a, W, State<C>>,
-        egress: &mut EgressCtx<'_, '_>,
+        egress: &mut EgressCtx<'_, 'a, '_>,
         driver: &mut DriverContext<'_, 'a>,
         date: &[u8; 29],
         close: bool,
@@ -80,17 +40,24 @@ where
 impl<'d, R, F> Complete<'d, R, F> for NativeFiber
 where
     R: RouteSpec<Kind = NativeFiber>,
-    F: Fiber<'d, Output = R::AsyncResponse>,
+    F: Fiber<'d, Output = Result<R::AsyncResponse, &'static [u8]>>,
 {
     fn complete<'a, W: Wire, C: Default + 'static>(
         output: <F as Fiber<'d>>::Output,
         slot: &mut Slot<'a, W, State<C>>,
-        egress: &mut EgressCtx<'_, '_>,
+        egress: &mut EgressCtx<'_, 'a, '_>,
         driver: &mut DriverContext<'_, 'a>,
         date: &[u8; 29],
         close: bool,
     ) -> TaskPoll {
-        TaskRunner::new(date).finish::<R, W, C>(output, slot, egress, driver, close);
+        match output {
+            Ok(response) => {
+                TaskRunner::new(date).finish::<R, W, C>(response, slot, egress, driver, close);
+            }
+            Err(reason) => {
+                Outcome::Close(reason).apply(slot, egress, driver);
+            }
+        }
         TaskPoll::Complete
     }
 }
@@ -103,7 +70,7 @@ where
     fn complete<'a, W: Wire, C: Default + 'static>(
         output: <T as Fiber<'d>>::Output,
         _slot: &mut Slot<'a, W, State<C>>,
-        _egress: &mut EgressCtx<'_, '_>,
+        _egress: &mut EgressCtx<'_, 'a, '_>,
         _driver: &mut DriverContext<'_, 'a>,
         _date: &[u8; 29],
         _close: bool,
@@ -149,7 +116,7 @@ where
     ) -> ConsumeOutcome
     where
         R: RouteSpec<Kind = NativeFiber> + 'static,
-        F: Fiber<'d, Output = R::AsyncResponse>,
+        F: Fiber<'d, Output = Result<R::AsyncResponse, &'static [u8]>>,
         MK: FnOnce(
             RequestStorage,
             R::RawParams,
@@ -157,7 +124,7 @@ where
             Range<usize>,
             &'env S,
             &'env Timer<'d>,
-        ) -> Result<F, &'static [u8]>,
+        ) -> F,
     {
         let RequestDomainInput {
             storage,
@@ -173,17 +140,14 @@ where
         let Some(entry) = tasks.as_mut().vacant_entry() else {
             return ConsumeOutcome::Close(CANNED_503);
         };
-        let task = match make(
+        let task = make(
             storage,
             raw_params,
             raw_headers,
             target,
             self.state,
             self.timer,
-        ) {
-            Ok(task) => task,
-            Err(reason) => return ConsumeOutcome::Close(reason),
-        };
+        );
         let task = entry.insert(task);
         self.conn.async_state.task = Some(task.erase());
         self.conn.async_state.task_stream = false;

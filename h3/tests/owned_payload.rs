@@ -31,7 +31,7 @@ fn owned_response_data_keeps_its_allocation_segmented() {
 }
 
 #[test]
-fn qpack_field_lines_are_an_owned_payload_segment() {
+fn small_qpack_field_section_stays_inline() {
     let stream_id = StreamId::new(0);
     let mut sender = Conn::with_role(Role::Server);
 
@@ -50,10 +50,36 @@ fn qpack_field_lines_are_an_owned_payload_segment() {
     let frame = FrameHeader::parse(&write.prefix).unwrap();
     assert_eq!(frame.kind, TYPE_HEADERS);
     assert!(matches!(&write.prefix, WritePrefix::Inline(_)));
-    assert!(write.prefix.len() > frame.header_len);
+    assert_eq!(
+        frame.length.get() as usize,
+        write.prefix.len() - frame.header_len
+    );
+    assert!(write.payload.is_none());
+}
+
+#[test]
+fn large_qpack_field_section_stays_segmented() {
+    let stream_id = StreamId::new(0);
+    let mut sender = Conn::with_role(Role::Server);
+    let value = [b'x'; INLINE_PREFIX_CAPACITY];
+
+    sender
+        .send_headers(
+            stream_id,
+            [
+                Field::new(b":status", b"200"),
+                Field::new(b"x-large", &value),
+            ],
+            false,
+        )
+        .unwrap();
+
+    let write = sender.poll_write().unwrap();
+    let frame = FrameHeader::parse(&write.prefix).unwrap();
     let Some(WritePayload::Owned(field_lines)) = write.payload else {
-        panic!("owned QPACK field-line segment");
+        panic!("large QPACK field-line segment");
     };
+    assert!(matches!(&write.prefix, WritePrefix::Inline(_)));
     assert_eq!(
         frame.length.get() as usize,
         write.prefix.len() - frame.header_len + field_lines.len()
@@ -61,7 +87,7 @@ fn qpack_field_lines_are_an_owned_payload_segment() {
 }
 
 #[test]
-fn push_promise_keeps_qpack_field_lines_separate_from_its_prefix() {
+fn small_push_promise_stays_inline() {
     let stream_id = StreamId::new(0);
     let mut sender = Conn::with_role(Role::Server);
 
@@ -83,18 +109,14 @@ fn push_promise_keeps_qpack_field_lines_separate_from_its_prefix() {
     let (push_id, push_id_len) = VarInt::decode(&write.prefix[frame.header_len..]).unwrap();
     assert_eq!(push_id.get(), 64);
     assert!(write.prefix.len() > frame.header_len + push_id_len);
-    let Some(WritePayload::Owned(field_lines)) = write.payload else {
-        panic!("owned PUSH_PROMISE QPACK field-line segment");
-    };
     assert_eq!(
         frame.length.get() as usize,
-        write.prefix.len() - frame.header_len + field_lines.len()
+        write.prefix.len() - frame.header_len
     );
+    assert!(write.payload.is_none());
 
-    let mut encoded = write.prefix.into_vec();
-    encoded.extend_from_slice(&field_lines);
     assert!(matches!(
-        Frame::parse(&encoded, usize::MAX),
+        Frame::parse(&write.prefix, usize::MAX),
         Ok((
             Frame::PushPromise { push_id, block: _ },
             _
@@ -248,7 +270,7 @@ fn transport_keeps_frame_prefixes_inline() {
     pump_writes(&mut sender, &mut capture).unwrap();
 
     assert_eq!(capture.inline_writes, 2);
-    assert_eq!(capture.owned_writes, 2);
+    assert_eq!(capture.owned_writes, 1);
     assert_eq!(capture.finishes, 1);
 }
 

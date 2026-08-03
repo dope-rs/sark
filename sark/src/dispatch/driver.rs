@@ -30,7 +30,7 @@ impl<'a, H> H1Driver<'a, H> {
         &mut self,
         bytes: &[u8],
         slot: &mut Slot<'d, W, State<C>>,
-        egress: &mut EgressCtx<'_, '_>,
+        egress: &mut EgressCtx<'_, 'd, '_>,
         driver: &mut DriverContext<'_, 'd>,
         project: P,
     ) -> bool
@@ -93,7 +93,7 @@ impl<'a, H> H1Driver<'a, H> {
             Self::begin_body_discard(slot, driver, &project);
         }
         let deadline = HeadDeadline::new(self.app.as_ref().get_ref());
-        let deadline_overrun = deadline.manage(slot, head_pending, driver.turn_now(), &project);
+        let deadline_overrun = deadline.manage(slot, head_pending, driver.turn_now());
         overrun || deadline_overrun
     }
 
@@ -101,7 +101,7 @@ impl<'a, H> H1Driver<'a, H> {
         &mut self,
         _sent: usize,
         slot: &mut Slot<'d, W, State<C>>,
-        egress: &mut EgressCtx<'_, '_>,
+        egress: &mut EgressCtx<'_, 'd, '_>,
         driver: &mut DriverContext<'_, 'd>,
         project: P,
     ) where
@@ -162,74 +162,66 @@ impl<'a, H> HeadDeadline<'a, H> {
         Self { app }
     }
 
-    pub fn poll_proj<'d, W, C, P>(
+    pub fn poll_proj<'d, W, C>(
         &self,
         slot: &mut Slot<'d, W, State<C>>,
-        egress: &mut EgressCtx<'_, '_>,
+        egress: &mut EgressCtx<'_, 'd, '_>,
         driver: &mut DriverContext<'_, 'd>,
-        project: P,
     ) -> bool
     where
         H: TimerHost<'d>,
         W: Wire,
         C: Default + 'static,
-        P: Fn(&mut C) -> &mut ConnState,
     {
-        let Some(ticket) = project(&mut slot.state.conn).head_deadline else {
-            return false;
-        };
+        let target = slot.token();
         let timer = TimerHost::timer(self.app);
-        if !timer.is_fired(ticket) {
+        let wake = dope_fiber::raw::task::RootWaker::from_ready(slot.driver(), slot.ready_key());
+        if !timer.poll(target, driver.turn_now(), wake) {
             return false;
         }
-        project(&mut slot.state.conn).head_deadline = None;
-        timer.cancel(ticket);
+        assert!(
+            timer.cancel(target),
+            "polled head deadline must still belong to the connection"
+        );
         slot.set_close_after();
         let buf = egress.write_buf_for(slot);
-        let user_data = slot.token();
-        slot.submit_split_static(buf, 0, crate::CANNED_408, user_data, driver);
+        slot.submit_split_static(buf, 0, crate::CANNED_408, target, driver);
         true
     }
 
-    pub fn cancel_proj<'d, W, C, P>(&self, slot: &mut Slot<'d, W, State<C>>, project: P)
+    pub fn cancel_proj<'d, W, C>(&self, slot: &mut Slot<'d, W, State<C>>)
     where
         H: TimerHost<'d>,
         W: Wire,
         C: Default + 'static,
-        P: Fn(&mut C) -> &mut ConnState,
     {
-        if let Some(ticket) = project(&mut slot.state.conn).head_deadline.take() {
-            TimerHost::timer(self.app).cancel(ticket);
-        }
+        TimerHost::timer(self.app).cancel(slot.token());
     }
 
-    fn manage<'d, W, C, P>(
+    fn manage<'d, W, C>(
         &self,
         slot: &mut Slot<'d, W, State<C>>,
         head_pending: bool,
         now: Instant,
-        project: &P,
     ) -> bool
     where
         H: TimerHost<'d>,
         W: Wire,
         C: Default + 'static,
-        P: Fn(&mut C) -> &mut ConnState,
     {
+        let target = slot.token();
+        let timer = TimerHost::timer(self.app);
         if head_pending {
-            if project(&mut slot.state.conn).head_deadline.is_none() {
+            if !timer.is_armed(target) {
                 use dope_fiber::raw::task::RootWaker;
-                let timer = TimerHost::timer(self.app);
                 let deadline = now + timer.head_timeout();
                 let wake = RootWaker::from_ready(slot.driver(), slot.ready_key());
-                if let Some(ticket) = timer.arm(deadline, wake) {
-                    project(&mut slot.state.conn).head_deadline = Some(ticket);
-                } else {
+                if !timer.arm(target, deadline, wake) {
                     return true;
                 }
             }
-        } else if let Some(ticket) = project(&mut slot.state.conn).head_deadline.take() {
-            TimerHost::timer(self.app).cancel(ticket);
+        } else {
+            timer.cancel(target);
         }
         false
     }

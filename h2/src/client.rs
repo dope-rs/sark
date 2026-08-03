@@ -2,6 +2,7 @@ use dope::manifold::connector::state::IOV_CAP;
 use dope::manifold::connector::{codec, lifecycle, session};
 use dope_net::link::egress::queue::Queue;
 use o3::buffer::{Bytes, Retained, Shared};
+use o3::cell::RegionToken;
 
 use crate::{
     conn::{self, Conn, ConnError},
@@ -77,15 +78,21 @@ impl<H: Handler> Session<H> {
         &mut self.handler
     }
 
-    pub fn connect(&mut self, state: &mut ConnState, sink: &mut Queue<'_, '_, { IOV_CAP }>) {
-        Self::drain_into(&mut state.conn, sink);
+    pub fn connect<'d>(
+        &mut self,
+        state: &mut ConnState,
+        sink: &mut Queue<'_, 'd, '_, { IOV_CAP }>,
+        region: &mut RegionToken<'d>,
+    ) {
+        Self::drain_into(&mut state.conn, sink, region);
     }
 
-    pub fn response(
+    pub fn response<'d>(
         &mut self,
         head: Head,
         state: &mut ConnState,
-        sink: &mut Queue<'_, '_, { IOV_CAP }>,
+        sink: &mut Queue<'_, 'd, '_, { IOV_CAP }>,
+        region: &mut RegionToken<'d>,
     ) {
         let Head(buf) = head;
         let conn = &mut state.conn;
@@ -102,7 +109,7 @@ impl<H: Handler> Session<H> {
                 Err(_) => return,
             }
         }
-        Self::drain_into(conn, sink);
+        Self::drain_into(conn, sink, region);
     }
 }
 
@@ -116,24 +123,31 @@ impl<'d, H: Handler> session::Session<'d> for Session<H> {
     }
 
     fn connect(&mut self, ctx: &mut session::Ctx<'_, '_, 'd, Self>) {
-        self.connect(ctx.state, &mut ctx.sink);
+        self.connect(ctx.state, &mut ctx.sink, ctx.region);
     }
 
     fn response(&mut self, head: Head, ctx: &mut session::Ctx<'_, '_, 'd, Self>) {
-        self.response(head, ctx.state, &mut ctx.sink);
+        self.response(head, ctx.state, &mut ctx.sink, ctx.region);
     }
 
     fn disconnect(&mut self, _ctx: &mut session::Ctx<'_, '_, 'd, Self>) {}
 }
 
 impl<H: Handler> Session<H> {
-    fn drain_into(conn: &mut Conn<ClientRole>, sink: &mut Queue<'_, '_, { IOV_CAP }>) {
+    fn drain_into<'d>(
+        conn: &mut Conn<ClientRole>,
+        sink: &mut Queue<'_, 'd, '_, { IOV_CAP }>,
+        region: &mut RegionToken<'d>,
+    ) {
         let out = conn.outbound();
         if out.is_empty() {
             return;
         }
         let len = out.len();
-        if sink.try_enqueue(Shared::copy_from_slice(out)).is_ok() {
+        if sink
+            .try_enqueue(region, Shared::copy_from_slice(out))
+            .is_ok()
+        {
             conn.drain_outbound(len);
         }
     }

@@ -117,7 +117,12 @@ impl<'req> HeaderItem<'req> {
     }
 
     pub fn wire_len(&self) -> usize {
-        self.name.as_bytes().len() + 2 + self.value.len() + 2
+        self.name
+            .as_bytes()
+            .len()
+            .saturating_add(2)
+            .saturating_add(self.value.len())
+            .saturating_add(2)
     }
 
     pub fn name_bytes(&self) -> &'static [u8] {

@@ -1,1 +1,1 @@
-pub use sark_core::http::codec::MethodKey as Key;
+pub type Key = sark_core::http::codec::MethodKey;

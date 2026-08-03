@@ -375,15 +375,15 @@ impl connector::codec::Codec for Codec {
 
 #[cfg(test)]
 mod tests {
-    use dope::manifold::connector::codec::Codec as _;
+    use dope::manifold::connector::codec::Codec;
     use o3::buffer::Shared;
 
-    use super::{Codec, ParseState, ResponseEvent, STREAM_CHUNK_SIZE};
+    use super::{ParseState, ResponseEvent, STREAM_CHUNK_SIZE};
 
     #[test]
     fn content_length_data_retains_the_ingress_owner() {
         let response = Shared::from(b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhello".to_vec());
-        let codec = Codec::default();
+        let codec = super::Codec::default();
         let mut state = ParseState::default();
         let (_, head_len) = codec.parse(&mut state, &response).expect("response head");
         let body = response.get(head_len..).expect("response body");
@@ -406,7 +406,7 @@ mod tests {
         wire.extend_from_slice(b"\r\n");
         let wire = Shared::from(wire);
 
-        let codec = Codec::default();
+        let codec = super::Codec::default();
         let mut state = ParseState::default();
         let head = Shared::from_static(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n");
         let _ = codec.parse(&mut state, &head).expect("response head");

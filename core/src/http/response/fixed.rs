@@ -2,7 +2,7 @@ use http::StatusCode;
 use o3::buffer::Shared;
 
 use super::wire_emit::{
-    ContentLength, DATE_LEN, HeadWrite, HeaderSection, PLACEHOLDER_DATE, WireWriter,
+    ContentLength, DATE_LEN, HeadWrite, HeaderSection, PLACEHOLDER_DATE, ProvenWireWriter,
 };
 use super::{
     DEFAULT_HEADER_CAPACITY, HeadInner, HeaderTemplate, Headers, StaticHeaderBytes,
@@ -17,11 +17,11 @@ impl<const N: usize, S> HeaderSection for GzipHeaders<'_, '_, N, S>
 where
     S: StaticHeaders,
 {
-    fn header_len(&self) -> usize {
-        self.0.wire_len() + GZIP_HEADERS.len()
+    fn wire_len(&self) -> usize {
+        HeaderSection::wire_len(self.0).saturating_add(GZIP_HEADERS.len())
     }
 
-    fn write_headers(&self, out: &mut WireWriter<'_>) {
+    fn write_headers(&self, out: &mut ProvenWireWriter<'_>) {
         self.0.write_headers(out);
         out.put(GZIP_HEADERS);
     }
@@ -113,30 +113,30 @@ where
 
     pub fn preserialize(&self) -> (Vec<u8>, usize) {
         let (head, body) = self.head_write();
-        let mut buf = vec![0u8; head.wire_len() + body.len()];
-        let written = head.write(&mut buf, PLACEHOLDER_DATE);
-        WireWriter::at(&mut buf, written.len).put(body);
-        (buf, written.date_offset)
+        let total = head.wire_len().saturating_add(body.len());
+        let mut buf = vec![0u8; total];
+        let mut out = ProvenWireWriter::exact(&mut buf);
+        let date_offset = head.emit(&mut out, PLACEHOLDER_DATE);
+        out.put(body);
+        out.finish(total);
+        (buf, date_offset)
     }
 
     pub fn write_into_slice(&self, out: &mut [u8], date: &[u8; 29]) -> Option<usize> {
         let (head, body) = self.head_write();
-        if out.len() < head.wire_len() + body.len() {
-            return None;
-        }
-        let written = head.write(out, date);
-        let mut out = WireWriter::at(out, written.len);
+        let total = head.wire_len().checked_add(body.len())?;
+        let mut out = ProvenWireWriter::new(out, total)?;
+        head.emit(&mut out, date);
         out.put(body);
-        Some(out.len())
+        Some(out.finish(total))
     }
 
     pub fn write_head_split(self, out: &mut [u8], date: &[u8; 29]) -> Option<(usize, Shared)> {
         let (head, _) = self.head_write();
-        if out.len() < head.wire_len() {
-            return None;
-        }
-        let written = head.write(out, date);
-        Some((written.len, self.body))
+        let head_len = head.wire_len();
+        let mut out = ProvenWireWriter::new(out, head_len)?;
+        head.emit(&mut out, date);
+        Some((out.finish(head_len), self.body))
     }
 
     pub fn write_gzip_head(
@@ -151,10 +151,10 @@ where
             headers: &headers,
             framing: ContentLength(body_len),
         };
-        if out.len() < head.wire_len() {
-            return None;
-        }
-        Some(head.write(out, date).len)
+        let head_len = head.wire_len();
+        let mut out = ProvenWireWriter::new(out, head_len)?;
+        head.emit(&mut out, date);
+        Some(out.finish(head_len))
     }
 }
 

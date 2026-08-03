@@ -25,12 +25,11 @@ sark_gen::define_route! {
 }
 
 fn requires_pin() {
-    let timer = sark::Timer::with_capacity(1);
+    let timer = sark::Timer::new();
     let mut app = App::new(
         &(),
         &timer,
         sark::app::Config {
-            timer_capacity: 1,
             task_capacity: 1,
         },
     );

@@ -58,8 +58,9 @@ fn read_to_close(stream: &mut TcpStream) -> (Vec<u8>, Duration) {
 
 #[test]
 fn partial_head_then_stall_is_closed_after_deadline() {
-    let bind: std::net::SocketAddr = "127.0.0.1:38901".parse().unwrap();
-    Harness::new(bind)
+    let harness = Harness::bind().expect("reserve test address");
+    let bind = harness.addr();
+    harness
         .run_with_trigger(
             |_ctx, trigger| {
                 let driver_config =
@@ -67,14 +68,13 @@ fn partial_head_then_stall_is_closed_after_deadline() {
                 let executor = Executor::new(driver_config)?
                     .with_storage(dope_net::link::egress::storage::Storage::default());
                 executor.enter(|mut session| {
-                    let timer = sark::Timer::with_capacity(32);
+                    let timer = sark::Timer::new();
                     server(bind).serve(
                         &mut session,
                         SlowlorisDispatch::new(
                             &(),
                             &timer,
                             sark::app::Config {
-                                timer_capacity: 32,
                                 task_capacity: support::MAX_CONNECTIONS,
                             },
                         ),
@@ -110,8 +110,9 @@ fn partial_head_then_stall_is_closed_after_deadline() {
 
 #[test]
 fn normal_fast_request_is_unaffected() {
-    let bind: std::net::SocketAddr = "127.0.0.1:38902".parse().unwrap();
-    Harness::new(bind)
+    let harness = Harness::bind().expect("reserve test address");
+    let bind = harness.addr();
+    harness
         .run_with_trigger(
             |_ctx, trigger| {
                 let driver_config =
@@ -119,14 +120,13 @@ fn normal_fast_request_is_unaffected() {
                 let executor = Executor::new(driver_config)?
                     .with_storage(dope_net::link::egress::storage::Storage::default());
                 executor.enter(|mut session| {
-                    let timer = sark::Timer::with_capacity(32);
+                    let timer = sark::Timer::new();
                     server(bind).serve(
                         &mut session,
                         SlowlorisDispatch::new(
                             &(),
                             &timer,
                             sark::app::Config {
-                                timer_capacity: 32,
                                 task_capacity: support::MAX_CONNECTIONS,
                             },
                         ),
@@ -152,8 +152,9 @@ fn normal_fast_request_is_unaffected() {
 
 #[test]
 fn slow_but_progressing_within_deadline_completes() {
-    let bind: std::net::SocketAddr = "127.0.0.1:38903".parse().unwrap();
-    Harness::new(bind)
+    let harness = Harness::bind().expect("reserve test address");
+    let bind = harness.addr();
+    harness
         .run_with_trigger(
             |_ctx, trigger| {
                 let driver_config =
@@ -161,14 +162,13 @@ fn slow_but_progressing_within_deadline_completes() {
                 let executor = Executor::new(driver_config)?
                     .with_storage(dope_net::link::egress::storage::Storage::default());
                 executor.enter(|mut session| {
-                    let timer = sark::Timer::with_capacity(32);
+                    let timer = sark::Timer::new();
                     server(bind).serve(
                         &mut session,
                         SlowlorisDispatch::new(
                             &(),
                             &timer,
                             sark::app::Config {
-                                timer_capacity: 32,
                                 task_capacity: support::MAX_CONNECTIONS,
                             },
                         ),
@@ -201,24 +201,25 @@ fn slow_but_progressing_within_deadline_completes() {
 }
 
 #[test]
-fn exhausted_deadline_capacity_closes_the_untracked_connection() {
-    let bind: std::net::SocketAddr = "127.0.0.1:38904".parse().unwrap();
-    Harness::new(bind)
+fn zero_fast_timer_capacity_tracks_every_connection() {
+    let harness = Harness::bind().expect("reserve test address");
+    let bind = harness.addr();
+    harness
         .run_with_trigger(
             |_ctx, trigger| {
-                let driver_config =
+                let mut driver_config =
                     driver::Config::for_tcp_profile::<Throughput>(support::MAX_CONNECTIONS);
+                driver_config.timer_slots = 0;
                 let executor = Executor::new(driver_config)?
                     .with_storage(dope_net::link::egress::storage::Storage::default());
                 executor.enter(|mut session| {
-                    let timer = sark::Timer::with_capacity(1);
+                    let timer = sark::Timer::new();
                     server(bind).serve(
                         &mut session,
                         SlowlorisDispatch::new(
                             &(),
                             &timer,
                             sark::app::Config {
-                                timer_capacity: 1,
                                 task_capacity: support::MAX_CONNECTIONS,
                             },
                         ),
@@ -229,20 +230,38 @@ fn exhausted_deadline_capacity_closes_the_untracked_connection() {
             |bind| {
                 let mut tracked = TcpStream::connect(bind).expect("connect tracked");
                 tracked
+                    .set_read_timeout(Some(Duration::from_secs(2)))
+                    .expect("set timeout");
+                tracked
                     .write_all(b"GET /hello HTTP/1.1\r\nHost: tracked\r\n")
                     .expect("write tracked head");
                 std::thread::sleep(Duration::from_millis(50));
 
-                let mut untracked = TcpStream::connect(bind).expect("connect untracked");
-                untracked
+                let mut second = TcpStream::connect(bind).expect("connect second");
+                second
                     .set_read_timeout(Some(Duration::from_secs(2)))
                     .expect("set timeout");
-                untracked
-                    .write_all(b"GET /hello HTTP/1.1\r\nHost: untracked\r\n")
-                    .expect("write untracked head");
+                second
+                    .write_all(b"GET /hello HTTP/1.1\r\nHost: second\r\n")
+                    .expect("write second head");
 
-                let (_, elapsed) = read_to_close(&mut untracked);
-                assert!(elapsed < HEAD_TIMEOUT, "untracked close took {elapsed:?}");
+                let (second_reply, elapsed) = read_to_close(&mut second);
+                assert!(
+                    elapsed >= Duration::from_millis(300),
+                    "second connection closed before its deadline: {elapsed:?}"
+                );
+                assert!(
+                    elapsed < Duration::from_secs(2),
+                    "second connection was not deadline-tracked: {elapsed:?}"
+                );
+                let (first_reply, _) = read_to_close(&mut tracked);
+                for reply in [first_reply, second_reply] {
+                    let text = String::from_utf8_lossy(&reply);
+                    assert!(
+                        reply.is_empty() || text.contains("408"),
+                        "expected close or 408, got: {text:?}"
+                    );
+                }
             },
         )
         .expect("harness");

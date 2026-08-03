@@ -118,18 +118,12 @@ impl DynamicTable {
         ))
     }
 
-    pub(super) fn find(&self, name: &[u8], value: &[u8]) -> Option<usize> {
-        (0..self.len).find(|&index| {
+    pub(super) fn lookup(&self, name: &[u8], value: &[u8]) -> FieldMatch<usize> {
+        let candidates = (0..self.len).filter_map(|index| {
             self.get(index)
-                .is_some_and(|(entry_name, entry_value)| entry_name == name && entry_value == value)
-        })
-    }
-
-    pub(super) fn find_name(&self, name: &[u8]) -> Option<usize> {
-        (0..self.len).find(|&index| {
-            self.get(index)
-                .is_some_and(|(entry_name, _)| entry_name == name)
-        })
+                .map(|(name, value)| (index, Field::new(name, value)))
+        });
+        match_field_candidates(Field::new(name, value), candidates, |index| Some(index))
     }
 
     fn entry(&self, index: usize) -> Option<Entry> {
@@ -215,3 +209,4 @@ impl DynamicTable {
         }
     }
 }
+use sark_core::http::{Field, FieldMatch, match_field_candidates};

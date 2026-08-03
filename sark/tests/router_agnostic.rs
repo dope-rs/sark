@@ -1,8 +1,11 @@
 use http::StatusCode;
-use o3::buffer::{Bytes, Retained};
+use o3::buffer::{Bytes, Retained, SharedPool, SharedPoolLayout};
 use sark::dispatch::{Decode, Invocation};
 use sark::service::{RouteRequestImpl, RouteSpec, SliceValue};
-use sark_core::http::{CacheTemplate, Preparation, Prepared, Shape, VecFieldBlock};
+use sark_core::http::{
+    CacheTemplate, DecodedFieldBlock, Field, HeadBlock, HeadConsumer, HeadDisposition, HeadPlan,
+    HeadSection, PlannedHead, Preparation, Prepared, Shape,
+};
 
 #[sark_gen::response(raw)]
 #[header("content-type", "text/plain")]
@@ -111,22 +114,54 @@ impl sark_core::http::ResponseSink for Capture {
     }
 }
 
+fn select_for<R: Decode>(_: &R, fields: DecodedFieldBlock) -> PlannedHead<R::Plan> {
+    let mut section = HeadSection::<R::Plan>::new(true, false);
+    let mut retained = Vec::new();
+    for (field, _) in fields.iter_with_value_ranges() {
+        let decision = section.disposition(field.name, None, &retained);
+        assert!(section.decoded(decision, field, &retained));
+        let disposition = decision.disposition;
+        match disposition {
+            HeadDisposition::Discard | HeadDisposition::Skip => {}
+            HeadDisposition::Tagged(tag) => {
+                let prefix = tag.prefix(field.value.len()).unwrap();
+                let value_start = retained.len() + prefix.len();
+                retained.extend_from_slice(&prefix);
+                retained.extend_from_slice(field.value);
+                let value_range = value_start..value_start + field.value.len();
+                section.committed(disposition, value_range, &retained);
+            }
+            HeadDisposition::Raw => panic!("generated plan retained an untagged field"),
+        }
+    }
+    let (selection, valid) = section.finish();
+    assert!(valid);
+    let layout = SharedPoolLayout::new(1, retained.len().max(1)).unwrap();
+    let pool = SharedPool::from_layout(layout);
+    let mut lease = pool.try_acquire().unwrap();
+    lease
+        .spare_writer()
+        .try_extend_from_slice(&retained)
+        .unwrap();
+    let fields = <R::Plan as HeadPlan>::Block::from_pooled(lease.freeze());
+    PlannedHead::new(fields, selection)
+}
+
 #[test]
 fn agnostic_dispatch_routes_feeds_invokes_encodes() {
-    let timer = sark::Timer::with_capacity(1);
+    let timer = sark::Timer::new();
     let app = AgnApp::new::<dope_net::wire::identity::Identity>(
         sark::EmptyState::REF,
         &timer,
-        sark::app::Config {
-            timer_capacity: 1,
-            task_capacity: 1,
-        },
+        sark::app::Config { task_capacity: 1 },
     );
 
-    let mut fields = VecFieldBlock::new();
-    fields.push(b":method", b"GET").unwrap();
-    fields.push(b":path", b"/json").unwrap();
-    let prepared = app.prepare_decoded(fields).expect("known route");
+    let fields = DecodedFieldBlock::from_fields(&[
+        Field::new(b":method", b"GET"),
+        Field::new(b":path", b"/json"),
+    ])
+    .unwrap();
+    let prepared = app.prepare_full_head(fields).expect("known route");
     let mut cap = Capture::default();
     let out = app.dispatch_prepared(prepared, &[][..], &mut cap);
     assert_eq!(out, sark::dispatch::Decoded::Emitted);
@@ -135,50 +170,113 @@ fn agnostic_dispatch_routes_feeds_invokes_encodes() {
     assert_eq!(cap.calls, 1);
     assert_eq!(cap.headers, b"content-type: text/plain\r\n");
 
-    let mut fields = VecFieldBlock::new();
-    fields.push(b":method", b"GET").unwrap();
-    fields.push(b":path", b"/named").unwrap();
-    fields.push(b"x-name", b"alice").unwrap();
-    let prepared = app.prepare_decoded(fields).expect("known route");
+    let fields = DecodedFieldBlock::from_fields(&[
+        Field::new(b":method", b"GET"),
+        Field::new(b":path", b"/named"),
+        Field::new(b"x-name", b"alice"),
+    ])
+    .unwrap();
+    let prepared = app.prepare_full_head(fields).expect("known route");
     let mut cap2 = Capture::default();
     let out2 = app.dispatch_prepared(prepared, &[][..], &mut cap2);
     assert_eq!(out2, sark::dispatch::Decoded::Emitted);
     assert_eq!(cap2.status, Some(StatusCode::IM_A_TEAPOT));
 
-    let mut fields = VecFieldBlock::new();
-    fields.push(b":method", b"GET").unwrap();
-    fields.push(b":path", b"/items/42?tag=rust").unwrap();
+    let fields = DecodedFieldBlock::from_fields(&[
+        Field::new(b":method", b"GET"),
+        Field::new(b":path", b"/named"),
+        Field::new(b"x-ignored", b"before"),
+        Field::new(b"x-name", b"alice"),
+        Field::new(b"x-ignored", b"after"),
+    ])
+    .unwrap();
     let prepared = app
-        .prepare_decoded(fields)
+        .prepare_full_head(fields)
+        .expect("declared field after an ignored field");
+    let mut cap2 = Capture::default();
+    let out2 = app.dispatch_prepared(prepared, &[][..], &mut cap2);
+    assert_eq!(out2, sark::dispatch::Decoded::Emitted);
+    assert_eq!(cap2.status, Some(StatusCode::IM_A_TEAPOT));
+
+    let fields = DecodedFieldBlock::from_fields(&[
+        Field::new(b":method", b"GET"),
+        Field::new(b":scheme", b"https"),
+        Field::new(b":path", b"/items/42?tag=rust"),
+    ])
+    .unwrap();
+    let prepared = app
+        .prepare_full_head(fields)
         .expect("parameterized route with query");
     let mut cap3 = Capture::default();
     let out3 = app.dispatch_prepared(prepared, &[][..], &mut cap3);
     assert_eq!(out3, sark::dispatch::Decoded::Emitted);
     assert_eq!(cap3.status, Some(StatusCode::IM_A_TEAPOT));
 
-    let mut fields = VecFieldBlock::new();
-    fields.push(b":method", b"GET").unwrap();
-    fields.push(b":path", b"/nope").unwrap();
+    let fields = DecodedFieldBlock::from_fields(&[
+        Field::new(b":method", b"GET"),
+        Field::new(b":path", b"/nope"),
+    ])
+    .unwrap();
     assert!(matches!(
-        app.prepare_decoded(fields),
+        app.prepare_full_head(fields),
         Err(sark::dispatch::Decoded::NotFound)
     ));
 
-    let mut fields = VecFieldBlock::new();
-    fields.push(b":method", b"GET").unwrap();
-    fields.push(b":path", b"/json?ignored=\x01").unwrap();
+    let fields = DecodedFieldBlock::from_fields(&[
+        Field::new(b":method", b"GET"),
+        Field::new(b":path", b"/json?ignored=\x01"),
+    ])
+    .unwrap();
     assert!(
-        app.prepare_decoded(fields).is_ok(),
+        app.prepare_full_head(fields).is_ok(),
         "unused target bytes stay outside the minimal route capability"
     );
 
-    let mut fields = VecFieldBlock::new();
-    fields.push(b":method", b"GET").unwrap();
-    fields.push(b":path", b"/full?ignored=\x01").unwrap();
+    let fields = DecodedFieldBlock::from_fields(&[
+        Field::new(b":method", b"GET"),
+        Field::new(b":path", b"/full?ignored=\x01"),
+    ])
+    .unwrap();
     assert!(matches!(
-        app.prepare_decoded(fields),
+        app.prepare_full_head(fields),
         Err(sark::dispatch::Decoded::Bad)
     ));
+
+    let fields = DecodedFieldBlock::from_fields(&[
+        Field::new(b":method", b"GET"),
+        Field::new(b":path", b"/json"),
+        Field::new(b"x-regular", b"1"),
+        Field::new(b":authority", b"example.test"),
+    ])
+    .unwrap();
+    assert!(matches!(
+        app.prepare_full_head(fields),
+        Err(sark::dispatch::Decoded::Bad)
+    ));
+}
+
+#[test]
+fn planned_dispatch_extracts_only_the_chosen_parameter_route() {
+    let timer = sark::Timer::new();
+    let app = AgnApp::new::<dope_net::wire::identity::Identity>(
+        sark::EmptyState::REF,
+        &timer,
+        sark::app::Config { task_capacity: 1 },
+    );
+    let fields = DecodedFieldBlock::from_fields(&[
+        Field::new(b":method", b"GET"),
+        Field::new(b":scheme", b"https"),
+        Field::new(b":path", b"/items/42?tag=rust"),
+    ])
+    .unwrap();
+    let prepared = app
+        .prepare_planned_head(select_for(&app, fields))
+        .expect("planned parameter route");
+    let mut capture = Capture::default();
+    let outcome = app.dispatch_prepared(prepared, &[][..], &mut capture);
+
+    assert_eq!(outcome, sark::dispatch::Decoded::Emitted);
+    assert_eq!(capture.status, Some(StatusCode::IM_A_TEAPOT));
 }
 
 fn write_response<'r, R: RouteSpec>(resp: R::Response<'r>) -> Vec<u8> {

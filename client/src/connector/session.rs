@@ -6,14 +6,13 @@ use std::{
 
 use cartel_core::ArenaLane;
 use dope::{
-    driver::token::Token,
-    manifold::{connector, timer::Timer},
-    runtime::{dispatcher::Idle, executor::StorageFactory},
+    driver::timer::Timer, driver::token::Token, manifold::connector,
+    runtime::executor::StorageFactory,
 };
 use dope_fiber::raw::task::Context;
 use dope_fiber::raw::wait::{WaitQueue, Waiter};
 use o3::{
-    buffer::{Lease, Pool as BufferPool, PoolLayout},
+    buffer::{self, Lease, PoolLayout},
     cell::{RegionCell, RegionToken},
 };
 use sark_core::http::{
@@ -25,7 +24,7 @@ use sark_core::http::{
 use crate::connector::{
     codec::{Codec, Emission, Head},
     error::Error,
-    pool::{ConnectionPool, ResponsePush},
+    pool::{self, ConnectionPool, ResponsePush},
     response::ResponseEvent,
     retry::RetryPolicy,
 };
@@ -147,13 +146,15 @@ impl<'d> Shared<'d> {
         token: &mut RegionToken<'d>,
         now: Instant,
         idle_timeout: Duration,
-        mut recycle: impl FnMut(Token),
+        mut recycle: impl FnMut(&mut RegionToken<'d>, Token),
     ) -> Option<Token> {
         let mut closed = false;
-        let acquired = self.pool.acquire(token, now, idle_timeout, |conn_id| {
-            closed = true;
-            recycle(conn_id);
-        });
+        let acquired = self
+            .pool
+            .acquire(token, now, idle_timeout, |token, conn_id| {
+                closed = true;
+                recycle(token, conn_id);
+            });
         if closed {
             self.wake();
         }
@@ -176,7 +177,6 @@ impl<'d> Shared<'d> {
 pub struct Config {
     codec: Codec,
     host: String,
-    origin: http::Uri,
     decompression: DecompressionPolicy,
     max_redirects: u32,
     retry: RetryPolicy,
@@ -191,13 +191,9 @@ pub struct Config {
 impl Config {
     pub fn new(host: impl Into<String>) -> Self {
         let host = host.into();
-        let origin = format!("http://{host}/")
-            .parse()
-            .expect("invalid HTTP host");
         Self {
             codec: Codec::default(),
             host,
-            origin,
             decompression: DecompressionPolicy::Strict,
             max_redirects: 10,
             retry: RetryPolicy::default(),
@@ -268,22 +264,54 @@ impl Config {
         PoolLayout::new(self.request_slots, self.request_capacity)
             .map_err(|error| io::Error::new(ErrorKind::InvalidInput, error))
     }
+
+    fn port_plan(&self, capacity: usize) -> io::Result<PortPlan> {
+        let request_pool = self.request_pool_layout()?;
+        let origin = format!("http://{}/", self.host).parse().map_err(|error| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("invalid HTTP host: {error}"),
+            )
+        })?;
+        let connections = pool::Plan::new(
+            capacity,
+            self.max_inflight_per_connection,
+            self.response_buffer_capacity,
+            self.codec.max_response_body,
+        )
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "HTTP response pool capacity overflow",
+            )
+        })?;
+        Ok(PortPlan {
+            request_pool,
+            connections,
+            origin,
+        })
+    }
 }
 
 pub struct Port<'d> {
     pub(super) io: connector::port::Port<'d, Lease<'d>>,
     pub(super) shared: Shared<'d>,
     pub(super) codec: Codec,
-    timer: Timer<'d>,
-    pub(super) requests: BufferPool,
+    timer: &'d Timer<'d>,
+    pub(super) requests: buffer::Pool,
     egress: dope_net::link::egress::storage::Storage,
 }
 
 pub struct PortFactory {
     config: Config,
-    capacity: usize,
     timer_capacity: usize,
+    plan: PortPlan,
+}
+
+struct PortPlan {
     request_pool: PoolLayout,
+    connections: pool::Plan,
+    origin: http::Uri,
 }
 
 impl<'d> Port<'d> {
@@ -291,47 +319,40 @@ impl<'d> Port<'d> {
         config: Config,
         capacity: usize,
         timer_capacity: usize,
-        driver: dope::DriverRef<'d>,
+        driver: &mut dope::DriverContext<'_, 'd>,
     ) -> io::Result<Self> {
-        let request_pool = config.request_pool_layout()?;
-        Ok(Self::new_with_pool(
-            config,
-            capacity,
-            timer_capacity,
-            request_pool,
-            driver,
-        ))
+        let plan = config.port_plan(capacity)?;
+        Ok(Self::new_with_plan(config, timer_capacity, plan, driver))
     }
 
-    fn new_with_pool(
+    fn new_with_plan(
         config: Config,
-        capacity: usize,
         timer_capacity: usize,
-        request_pool: PoolLayout,
-        driver: dope::DriverRef<'d>,
+        plan: PortPlan,
+        driver: &mut dope::DriverContext<'_, 'd>,
     ) -> Self {
         let Config {
             codec,
             host,
-            origin,
             decompression,
             max_redirects,
             retry,
             idle_timeout,
             request_timeout,
-            max_inflight_per_connection,
-            response_buffer_capacity,
+            max_inflight_per_connection: _,
+            response_buffer_capacity: _,
             request_slots: _,
             request_capacity: _,
         } = config;
-        let max_response_body = codec.max_response_body;
+        let PortPlan {
+            request_pool,
+            connections,
+            origin,
+        } = plan;
+        let capacity = connections.capacity();
+        let driver_ref = driver.driver_ref();
         let shared = Shared {
-            pool: ConnectionPool::new(
-                capacity,
-                max_inflight_per_connection,
-                response_buffer_capacity,
-                max_response_body,
-            ),
+            pool: ConnectionPool::from_plan(connections),
             active_waiters: Box::pin(WaitQueue::with_capacity(timer_capacity)),
             gunzip: RegionCell::new(Gunzip::new()),
             host,
@@ -343,11 +364,15 @@ impl<'d> Port<'d> {
             request_timeout,
         };
         Self {
-            io: connector::port::Port::with_capacity(capacity, driver),
+            io: connector::port::Port::with_capacity(
+                capacity,
+                driver.region_token_ref(),
+                driver_ref,
+            ),
             shared,
             codec,
-            timer: Timer::with_capacity(timer_capacity, driver),
-            requests: BufferPool::from_layout(request_pool),
+            timer: driver.timer(),
+            requests: buffer::Pool::from_layout(request_pool),
             egress: dope_net::link::egress::storage::Storage::default(),
         }
     }
@@ -365,17 +390,16 @@ impl<'d> Port<'d> {
         capacity: usize,
         timer_capacity: usize,
     ) -> io::Result<PortFactory> {
-        let request_pool = config.request_pool_layout()?;
+        let plan = config.port_plan(capacity)?;
         Ok(PortFactory {
             config,
-            capacity,
             timer_capacity,
-            request_pool,
+            plan,
         })
     }
 
     pub(super) fn timer(&'d self) -> &'d Timer<'d> {
-        &self.timer
+        self.timer
     }
 }
 
@@ -383,13 +407,7 @@ impl StorageFactory for PortFactory {
     type Output<'d> = Port<'d>;
 
     fn build<'d>(self, driver: &mut dope::DriverContext<'_, 'd>) -> Self::Output<'d> {
-        Port::new_with_pool(
-            self.config,
-            self.capacity,
-            self.timer_capacity,
-            self.request_pool,
-            driver.driver_ref(),
-        )
+        Port::new_with_plan(self.config, self.timer_capacity, self.plan, driver)
     }
 }
 
@@ -466,17 +484,9 @@ impl<'d> connector::session::Session<'d> for Session<'d> {
     }
 
     fn disconnect(&mut self, ctx: &mut connector::session::Ctx<'_, '_, 'd, Self>) {
-        self.port.io.deactivate(ctx.conn_id);
+        self.port.io.deactivate(ctx.region, ctx.conn_id);
         self.port.shared.close_connection(ctx.region, ctx.conn_id);
         ctx.state.pending_close = false;
-    }
-
-    fn pre_park(&mut self) {
-        self.port.timer.expire(Instant::now());
-    }
-
-    fn idle(&self) -> Idle {
-        Idle::Park(self.port.timer.earliest())
     }
 }
 

@@ -11,11 +11,11 @@ use dope::manifold::env::Env;
 use dope_fiber::abi::Fiber;
 use dope_fiber::abi::pollfn::PollFn;
 use dope_fiber::abi::race::{Either, Race};
-use dope_fiber::sleep::TimerExt as _;
+use dope_fiber::sleep::TimerExt;
 use dope_fiber::wait::WaitFn;
 use dope_net::Transport;
 use http::Method;
-use o3::buffer::{Lease, Pool, Shared as SharedBytes};
+use o3::buffer::{self, Lease, Pool};
 use o3::cell::RegionToken;
 use sark_core::http::Response;
 
@@ -316,7 +316,14 @@ where
             let response = match Race::new(collect, deadline).await {
                 Either::Left(response) => response?,
                 Either::Right(()) => {
-                    handle.port.io.close(conn_id);
+                    PollFn::new(move |mut cx| {
+                        handle
+                            .port
+                            .io
+                            .close(cx.as_mut().region_token(), conn_id);
+                        Poll::Ready(())
+                    })
+                    .await;
                     return Err(Error::Timeout);
                 }
             };
@@ -351,9 +358,12 @@ where
                 let now = Instant::now();
                 let shared = &handle.port.shared;
                 let idle = shared.idle_timeout;
-                let chosen = shared.acquire(cx.as_mut().region_token(), now, idle, |token| {
-                    handle.port.io.close(token)
-                });
+                let chosen = shared.acquire(
+                    cx.as_mut().region_token(),
+                    now,
+                    idle,
+                    |region, token| handle.port.io.close(region, token),
+                );
                 match chosen {
                     Some(token) => {
                         let req = request.take().expect("dispatch enqueue polled twice");
@@ -370,7 +380,7 @@ where
                             cx.as_mut().region_token(),
                             now,
                             idle,
-                            |token| handle.port.io.close(token),
+                            |region, token| handle.port.io.close(region, token),
                         );
                         match chosen {
                             Some(token) => {
@@ -495,7 +505,7 @@ fn content_length(response: &Response) -> Option<usize> {
 }
 
 struct BodyCollector {
-    first: Option<SharedBytes>,
+    first: Option<buffer::Shared>,
     owned: Option<Vec<u8>>,
     expected: Option<usize>,
     len: usize,
@@ -517,7 +527,7 @@ impl BodyCollector {
         self.expected = expected.filter(|expected| *expected <= self.max);
     }
 
-    fn push(&mut self, data: SharedBytes) -> Result<(), Error> {
+    fn push(&mut self, data: buffer::Shared) -> Result<(), Error> {
         self.len = self
             .len
             .checked_add(data.len())
@@ -571,7 +581,12 @@ impl Enqueue {
         if !arena.can_register(region) {
             return Err(Error::Backpressure);
         }
-        if handle.port.io.try_enqueue(conn_id, request).is_err() {
+        if handle
+            .port
+            .io
+            .try_enqueue(region, conn_id, request)
+            .is_err()
+        {
             shared.make_available(region, conn_id);
             return Err(Error::Backpressure);
         }

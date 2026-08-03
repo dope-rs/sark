@@ -4,7 +4,7 @@ use o3::buffer::{ByteSink, Owned, Shared};
 
 use super::headers::{DEFAULT_HEADER_CAPACITY, Headers};
 use crate::http::Field;
-use crate::http::response::wire_emit::{HeaderSection, WireWriter};
+use crate::http::response::wire_emit::{HeaderSection, ProvenWireWriter};
 
 #[derive(Clone, Debug)]
 pub struct HeadInner<'req, const N: usize = DEFAULT_HEADER_CAPACITY, S = StaticHeaderBytes> {
@@ -177,7 +177,10 @@ where
     }
 
     pub fn wire_len(&self) -> usize {
-        self.static_headers.wire().len() + self.headers.wire_len()
+        self.static_headers
+            .wire()
+            .len()
+            .saturating_add(self.headers.wire_len())
     }
 
     pub(crate) fn wire_headers(&self) -> Shared {
@@ -223,10 +226,10 @@ impl<const N: usize, S> HeaderSection for HeadInner<'_, N, S>
 where
     S: StaticHeaders,
 {
-    fn header_len(&self) -> usize {
+    fn wire_len(&self) -> usize {
         Self::wire_len(self)
     }
-    fn write_headers(&self, out: &mut WireWriter<'_>) {
+    fn write_headers(&self, out: &mut ProvenWireWriter<'_>) {
         out.put(self.static_headers.wire());
         self.headers.write_wire(out);
     }

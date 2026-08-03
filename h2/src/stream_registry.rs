@@ -154,6 +154,13 @@ impl<R: Role> StreamRegistry<R> {
         if self.get(id).is_some() {
             return StreamClass::Active;
         }
+        self.classify_missing(id)
+    }
+
+    pub(crate) fn classify_missing(&self, id: StreamId) -> StreamClass {
+        if id.is_zero() {
+            return StreamClass::Connection;
+        }
         let previously_opened = if Self::is_peer_initiated(id) {
             id <= self.last_peer_id
         } else {
@@ -177,7 +184,11 @@ impl<R: Role> StreamRegistry<R> {
         self.last_peer_id = id;
     }
 
-    pub(crate) fn next_local_id(&mut self) -> Option<StreamId> {
-        self.next_local_id.next_id()
+    pub(crate) fn peek_local_id(&self) -> Option<StreamId> {
+        self.next_local_id.peek()
+    }
+
+    pub(crate) fn commit_local_id(&mut self, id: StreamId) {
+        self.next_local_id.commit(id);
     }
 }

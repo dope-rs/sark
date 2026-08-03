@@ -7,7 +7,7 @@ use dope_test::Harness;
 use sark_grpc::Status;
 use sark_grpc::server::{Config, Handler, Request, Response};
 use shin::crypto::sig::SigningKey;
-use shin::server::{config::CertSource, config::Config as TlsConfig};
+use shin::server::config::{self, CertSource};
 
 const SEED: [u8; 32] = [9u8; 32];
 
@@ -51,8 +51,8 @@ fn grpc_cfg(bind: SocketAddr, readiness: Option<SocketAddr>) -> Config {
     }
 }
 
-fn tls_config() -> TlsConfig {
-    TlsConfig {
+fn tls_config() -> config::Config {
+    config::Config {
         source: CertSource::RawPublicKey {
             signing_key: SigningKey::from_seed(&SEED).expect("signing key"),
         },

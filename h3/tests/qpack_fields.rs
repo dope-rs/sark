@@ -134,7 +134,11 @@ fn qpack_decodes_literals_and_table_references_into_one_packed_allocation() {
 
     let before = allocations();
     let decoded = decoder.decode(&literal_block).unwrap();
-    assert_eq!(allocations() - before, 1);
+    assert_eq!(
+        allocations() - before,
+        0,
+        "decoded fields must reuse their bounded pool"
+    );
     assert_eq!(decoded.iter().collect::<Vec<_>>(), literal_fields);
 
     let dynamic_field = Field::new(b"x-dynamic", b"retained once");
@@ -158,7 +162,7 @@ fn qpack_decodes_literals_and_table_references_into_one_packed_allocation() {
 
     let before = allocations();
     let decoded = decoder.decode(&referenced_block).unwrap();
-    assert_eq!(allocations() - before, 1);
+    assert_eq!(allocations() - before, 0);
     assert_eq!(decoded.iter().collect::<Vec<_>>(), [dynamic_field]);
 
     let mut limited = Decoder::new(41);
@@ -182,7 +186,7 @@ fn qpack_decodes_literals_and_table_references_into_one_packed_allocation() {
     );
     assert_eq!(
         allocations() - before,
-        1,
-        "Huffman expansion must stop before growing past the field-section budget"
+        0,
+        "Huffman expansion must stop inside the bounded field-section slot"
     );
 }

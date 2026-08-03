@@ -8,20 +8,23 @@ use o3::buffer::{
     ByteSink, Bytes, CapacityError, PoolLayoutError, Pooled, Retained, Shared, SharedPoolLayout,
     SharedPoolPlan,
 };
+use sark_core::http::{HeadPlan, RawHeadPlan};
 
-use crate::egress::Egress;
+use crate::egress::{COMMITTED_CONTROL_SLACK, Egress, EgressCapacity};
 use crate::flow::{self, Error, Window};
 use crate::frame::{
     Data, ErrorCode, Flags, FrameLength, GoAway, HEADER_LEN, ParseError, Ping, Priority,
     PriorityFields, RstStream, SettingId, Type, WindowIncrement, WindowUpdate,
 };
 use crate::hpack::{self, DecoderError};
-use crate::ingress::{Ingress, IngressConfig, PendingHeaders, PendingKind};
+use crate::ingress::{
+    Ingress, IngressConfig, PendingHeaderAction, PendingHeaders, PendingKind, PreparedHeadersEvent,
+};
+use crate::retained_segments::RetainedSegments;
 use crate::role::{ClientRole, Role, ServerRole};
 use crate::stream::{self, Side, State, Stream, StreamId, TransitionError};
 use crate::stream_registry::{StreamClass, StreamRecord, StreamRegistry};
 use crate::tuning::Tuning;
-use crate::validate::{RequestHeaders, ResponseHeaders};
 
 pub const CLIENT_PREFACE: &[u8] = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
 
@@ -193,9 +196,11 @@ impl Config {
 pub enum ConfigError {
     ZeroCapacity(&'static str),
     StreamCapacityOverflow,
+    HandlerCapacityOverflow,
     InitialWindowOverflow,
     ReceiveWindowOverflow,
     InvalidMaxFrameSize,
+    OutboundCapacityOverflow,
     OutboundTooSmall { required: usize, actual: usize },
     Pool(PoolLayoutError),
 }
@@ -211,6 +216,9 @@ impl fmt::Display for ConfigError {
         match self {
             Self::ZeroCapacity(name) => write!(formatter, "{name} capacity must be positive"),
             Self::StreamCapacityOverflow => formatter.write_str("stream capacity exceeds u32"),
+            Self::HandlerCapacityOverflow => {
+                formatter.write_str("handler task capacity exceeds supported indexing")
+            }
             Self::InitialWindowOverflow => {
                 formatter.write_str("initial stream window exceeds HTTP/2 maximum")
             }
@@ -219,6 +227,9 @@ impl fmt::Display for ConfigError {
             }
             Self::InvalidMaxFrameSize => {
                 formatter.write_str("maximum frame size is outside the HTTP/2 range")
+            }
+            Self::OutboundCapacityOverflow => {
+                formatter.write_str("outbound capacity cannot include control-frame slack")
             }
             Self::OutboundTooSmall { required, actual } => {
                 write!(
@@ -240,7 +251,7 @@ pub struct ValidatedConfig<R: Role> {
     stream_capacity: usize,
     event_capacity: usize,
     inbound_capacity: usize,
-    outbound_capacity: NonZeroUsize,
+    egress_capacity: EgressCapacity,
     data_layout: SharedPoolLayout,
     header_plan: SharedPoolPlan,
     header_list_cap: usize,
@@ -302,14 +313,15 @@ impl<R: Role> ValidatedConfig<R> {
                 actual: outbound_capacity,
             });
         }
+        let egress_capacity =
+            EgressCapacity::new(outbound_capacity).ok_or(ConfigError::OutboundCapacityOverflow)?;
         Ok(Self {
             local,
             recv_window_target,
             stream_capacity,
             event_capacity,
             inbound_capacity,
-            outbound_capacity: NonZeroUsize::new(outbound_capacity)
-                .ok_or(ConfigError::ZeroCapacity("outbound"))?,
+            egress_capacity,
             data_layout: SharedPoolLayout::new(data_capacity, 1)?,
             header_plan: SharedPoolPlan::new(header_capacity, header_list_cap)?,
             header_list_cap,
@@ -324,6 +336,7 @@ impl<R: Role> Default for ValidatedConfig<R> {
             assert!(DEFAULT_MAX_ACTIVE_STREAMS <= u32::MAX as usize);
             assert!(DEFAULT_INBOUND_CAPACITY != 0);
             assert!(DEFAULT_OUTBOUND_CAPACITY != 0);
+            assert!(DEFAULT_OUTBOUND_CAPACITY <= usize::MAX - COMMITTED_CONTROL_SLACK);
             assert!(DEFAULT_EVENT_CAPACITY != 0);
             assert!(<Throughput as Tuning>::STREAM_RECV_WINDOW <= Window::MAX as u32);
             assert!(<Throughput as Tuning>::CONN_RECV_WINDOW <= Window::MAX as u32);
@@ -347,7 +360,9 @@ impl<R: Role> Default for ValidatedConfig<R> {
             stream_capacity: DEFAULT_MAX_ACTIVE_STREAMS,
             event_capacity: DEFAULT_EVENT_CAPACITY,
             inbound_capacity: DEFAULT_INBOUND_CAPACITY,
-            outbound_capacity: NonZeroUsize::MIN.saturating_add(DEFAULT_OUTBOUND_CAPACITY - 1),
+            egress_capacity: EgressCapacity::saturating(
+                NonZeroUsize::MIN.saturating_add(DEFAULT_OUTBOUND_CAPACITY - 1),
+            ),
             data_layout: SharedPoolLayout::fixed::<DEFAULT_DATA_EVENTS, 1>(),
             header_plan: SharedPoolPlan::fixed::<
                 DEFAULT_HEADER_EVENTS,
@@ -432,7 +447,7 @@ impl From<&ConnError> for ErrorCode {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub enum Event {
+pub enum Event<S = (), B = hpack::HeaderBlock> {
     PrefaceComplete,
     SettingsApplied,
     SettingsAck,
@@ -447,7 +462,8 @@ pub enum Event {
     },
     Headers {
         stream_id: StreamId,
-        headers: hpack::HeaderBlock,
+        headers: B,
+        selection: S,
         end_stream: bool,
         trailing: bool,
     },
@@ -463,7 +479,8 @@ pub enum Event {
     PushPromise {
         stream_id: StreamId,
         promised_stream_id: StreamId,
-        headers: hpack::HeaderBlock,
+        headers: B,
+        selection: S,
     },
 }
 
@@ -550,10 +567,10 @@ const DEFAULT_HEADER_EVENTS: usize = 64;
 const MAX_RESET_STREAMS: u32 = 100;
 const MAX_CONTINUATION_FRAMES: u32 = 64;
 
-pub struct Conn<R: Role> {
+pub struct Conn<R: Role, F: HeadPlan = RawHeadPlan> {
     role: PhantomData<R>,
 
-    ingress: Ingress,
+    ingress: Ingress<F>,
     egress: Egress,
 
     initial_settings_sent: bool,
@@ -574,9 +591,30 @@ pub struct Conn<R: Role> {
     send_window_opened: bool,
 }
 
-struct DataPlan {
+struct PreparedData<'a> {
+    stream_id: StreamId,
     length: FrameLength,
     end_stream: bool,
+    next_state: State,
+    state: &'a mut State,
+    debit: flow::Debit<'a>,
+    egress: &'a mut Egress,
+}
+
+struct SentData {
+    length: usize,
+    closed: bool,
+}
+
+impl PreparedData<'_> {
+    fn commit(self) -> SentData {
+        self.debit.commit();
+        *self.state = self.next_state;
+        SentData {
+            length: self.length.as_usize(),
+            closed: self.next_state == State::Closed,
+        }
+    }
 }
 
 impl<R: Role> Conn<R> {
@@ -624,13 +662,19 @@ impl<R: Role> Conn<R> {
     }
 
     pub fn from_config(config: ValidatedConfig<R>) -> Self {
+        Self::from_config_with_plan(config)
+    }
+}
+
+impl<R: Role, F: HeadPlan> Conn<R, F> {
+    pub fn from_config_with_plan(config: ValidatedConfig<R>) -> Self {
         let ValidatedConfig {
             local,
             recv_window_target,
             stream_capacity,
             event_capacity,
             inbound_capacity,
-            outbound_capacity,
+            egress_capacity,
             data_layout,
             header_plan,
             header_list_cap,
@@ -649,7 +693,7 @@ impl<R: Role> Conn<R> {
                 preface_done: R::PREFACE_SENDS_FIRST,
             }),
             egress: Egress::from_capacity(
-                outbound_capacity,
+                egress_capacity,
                 local.header_table_size as usize,
                 header_list_cap,
             ),
@@ -738,11 +782,11 @@ impl<R: Role> Conn<R> {
         }
     }
 
-    pub fn poll_event(&mut self) -> Option<Event> {
+    pub fn poll_event(&mut self) -> Option<Event<F::Selection, F::Block>> {
         self.ingress.poll_event()
     }
 
-    fn push_event(&mut self, event: Event) -> Result<(), ConnError> {
+    fn push_event(&mut self, event: Event<F::Selection, F::Block>) -> Result<(), ConnError> {
         self.ingress.push_event(event)
     }
 
@@ -833,18 +877,25 @@ impl<R: Role> Conn<R> {
             .len()
             .checked_add(second.len())
             .ok_or(ConnError::FrameSize)?;
-        let Some(plan) = self.plan_data(stream_id, len, end_stream, false)? else {
+        let Some(prepared) = self.prepare_data(stream_id, len, end_stream)? else {
             return Ok(0);
         };
+        prepared
+            .egress
+            .reserve(HEADER_LEN + prepared.length.as_usize())?;
         Data::encode_parts(
-            stream_id,
-            plan.end_stream,
+            prepared.stream_id,
+            prepared.end_stream,
             first,
             second,
-            plan.length,
-            self.egress.raw_mut(),
+            prepared.length,
+            prepared.egress.raw_mut(),
         )?;
-        Ok(plan.length.as_usize())
+        let sent = prepared.commit();
+        if sent.closed {
+            self.evict_stream(stream_id);
+        }
+        Ok(sent.length)
     }
 
     pub fn send_data_shared(
@@ -853,77 +904,64 @@ impl<R: Role> Conn<R> {
         data: &Shared,
         end_stream: bool,
     ) -> Result<usize, ConnError> {
-        let Some(plan) = self.plan_data(stream_id, data.len(), end_stream, true)? else {
+        let Some(prepared) = self.prepare_data(stream_id, data.len(), end_stream)? else {
             return Ok(0);
         };
-        Data::encode_header(
-            stream_id,
-            plan.end_stream,
-            plan.length,
-            self.egress.raw_mut(),
-        )?;
         let data = data
-            .get(..plan.length.as_usize())
+            .get(..prepared.length.as_usize())
             .ok_or(ConnError::FrameSize)?;
-        self.egress.queue_shared(data);
-        Ok(plan.length.as_usize())
+        prepared
+            .egress
+            .reserve_split(HEADER_LEN, prepared.length.as_usize())?;
+        Data::encode_header(
+            prepared.stream_id,
+            prepared.end_stream,
+            prepared.length,
+            prepared.egress.raw_mut(),
+        )?;
+        prepared.egress.queue_shared(data);
+        let sent = prepared.commit();
+        if sent.closed {
+            self.evict_stream(stream_id);
+        }
+        Ok(sent.length)
     }
 
-    fn plan_data(
+    fn prepare_data(
         &mut self,
         stream_id: StreamId,
         len: usize,
         end_stream: bool,
-        split: bool,
-    ) -> Result<Option<DataPlan>, ConnError> {
-        if !self.has_stream(stream_id) {
-            return Err(ConnError::BadStream);
+    ) -> Result<Option<PreparedData<'_>>, ConnError> {
+        let max_frame = self.peer_settings.max_frame_size as usize;
+        let record = self
+            .streams
+            .get_mut(stream_id)
+            .ok_or(ConnError::BadStream)?;
+        let debit = flow::Pair {
+            conn: &mut self.send_window,
+            stream: &mut record.send_window,
         }
-        let avail = {
-            let record = self
-                .streams
-                .get_mut(stream_id)
-                .ok_or(ConnError::BadStream)?;
-            flow::Pair {
-                conn: &mut self.send_window,
-                stream: &mut record.send_window,
-            }
-            .available()
-        };
-        if avail == 0 && len != 0 {
+        .debit_up_to(len.min(max_frame));
+        let send_n = debit.len();
+        if send_n == 0 && len != 0 {
             return Ok(None);
         }
-        let send_n = len
-            .min(avail)
-            .min(self.peer_settings.max_frame_size as usize);
-        if split {
-            self.egress.reserve_split(HEADER_LEN, send_n)?;
-        } else {
-            self.prepare_outbound(HEADER_LEN + send_n)?;
-        }
-        if send_n > 0 {
-            let record = self
-                .streams
-                .get_mut(stream_id)
-                .ok_or(ConnError::BadStream)?;
-            let mut pair = flow::Pair {
-                conn: &mut self.send_window,
-                stream: &mut record.send_window,
-            };
-            pair.consume(send_n).map_err(ConnError::from)?;
-        }
         let last_chunk = send_n == len;
-        let es = end_stream && last_chunk;
-        self.advance_stream(
-            stream_id,
-            stream::Event::Data { end_stream: es },
-            Side::Local,
-        )
-        .map_err(|_| ConnError::Protocol)?;
+        let end_stream = end_stream && last_chunk;
         let length = FrameLength::from_usize(send_n).ok_or(ConnError::FrameSize)?;
-        Ok(Some(DataPlan {
+        let state = &mut record.stream.state;
+        let next_state = state
+            .send(stream::Event::Data { end_stream })
+            .map_err(|_| ConnError::Protocol)?;
+        Ok(Some(PreparedData {
+            stream_id,
             length,
-            end_stream: es,
+            end_stream,
+            next_state,
+            state,
+            debit,
+            egress: &mut self.egress,
         }))
     }
 
@@ -943,17 +981,7 @@ impl<R: Role> Conn<R> {
     where
         I: IntoIterator<Item = hpack::Header<'a>>,
     {
-        if !self.has_stream(stream_id) {
-            return Err(ConnError::BadStream);
-        }
-        self.emit_headers(stream_id, headers, true)?;
-        self.advance_stream(
-            stream_id,
-            stream::Event::Headers { end_stream: true },
-            Side::Local,
-        )
-        .map_err(|_| ConnError::Protocol)?;
-        Ok(())
+        self.send_headers_transition(stream_id, headers, true)
     }
 
     pub fn ingest(&mut self, bytes: &[u8]) -> Result<(), ConnError> {
@@ -987,17 +1015,6 @@ impl<R: Role> Conn<R> {
         self.egress.window_update(stream_id, increment)
     }
 
-    fn emit_rst(&mut self, stream_id: StreamId, error: ErrorCode) -> Result<(), ConnError> {
-        self.egress.reset(stream_id, error)
-    }
-
-    fn rst_evict(&mut self, stream_id: StreamId, error: ErrorCode) -> Result<(), ConnError> {
-        self.emit_rst(stream_id, error)?;
-        self.mark_reset(stream_id);
-        self.evict_stream(stream_id);
-        Ok(())
-    }
-
     fn emit_headers<'a, I>(
         &mut self,
         stream_id: StreamId,
@@ -1010,6 +1027,35 @@ impl<R: Role> Conn<R> {
         let max_frame = self.peer_settings.max_frame_size as usize;
         self.egress
             .headers(stream_id, headers, end_stream, max_frame)
+    }
+
+    fn send_headers_transition<'a, I>(
+        &mut self,
+        stream_id: StreamId,
+        headers: I,
+        end_stream: bool,
+    ) -> Result<(), ConnError>
+    where
+        I: IntoIterator<Item = hpack::Header<'a>>,
+    {
+        let event = stream::Event::Headers { end_stream };
+        let max_frame = self.peer_settings.max_frame_size as usize;
+        let next = {
+            let stream = &mut self
+                .streams
+                .get_mut(stream_id)
+                .ok_or(ConnError::BadStream)?
+                .stream;
+            let next = stream.state.send(event).map_err(|_| ConnError::Protocol)?;
+            self.egress
+                .headers(stream_id, headers, end_stream, max_frame)?;
+            stream.state = next;
+            next
+        };
+        if next == State::Closed {
+            self.evict_stream(stream_id);
+        }
+        Ok(())
     }
 
     fn advance_stream(
@@ -1053,35 +1099,12 @@ impl<R: Role> Conn<R> {
         )
     }
 
-    fn can_track_peer_stream(&self) -> bool {
-        self.streams.can_accept_peer(
-            self.local_settings
-                .max_concurrent_streams
-                .unwrap_or(u32::MAX) as usize,
-        )
-    }
-
     fn can_track_local_stream(&self) -> bool {
         self.streams.can_open_local(
             self.peer_settings
                 .max_concurrent_streams
                 .map_or(usize::MAX, |limit| limit as usize),
         )
-    }
-
-    fn reserve_promised_stream(&mut self, id: StreamId) -> Result<bool, ConnError> {
-        if !StreamRegistry::<R>::is_peer_initiated(id) || id <= self.streams.last_peer_id() {
-            return Err(ConnError::Protocol);
-        }
-        if !self.can_track_peer_stream() {
-            self.emit_rst(id, ErrorCode::RefusedStream)?;
-            self.streams.observe_peer(id);
-            return Ok(false);
-        }
-        self.track_stream(Stream::reserve_remote(id))
-            .map_err(|_| ConnError::Protocol)?;
-        self.streams.observe_peer(id);
-        Ok(true)
     }
 
     fn classify_stream(&self, id: StreamId) -> StreamClass {
@@ -1092,42 +1115,22 @@ impl<R: Role> Conn<R> {
         self.streams.remove(id);
     }
 
-    fn begin_inbound_block(
-        &mut self,
+    fn prepare_inbound_headers_event(
+        ingress: &mut Ingress<F>,
         start: usize,
         len: usize,
+        total: usize,
         trailing: bool,
-    ) -> Result<(), ConnError> {
-        if R::IS_SERVER {
-            self.ingress
-                .begin_headers::<RequestHeaders>(start, len, trailing)
-        } else {
-            self.ingress
-                .begin_headers::<ResponseHeaders>(start, len, trailing)
-        }
-    }
-
-    fn continue_inbound_block(&mut self, start: usize, len: usize) -> Result<(), ConnError> {
-        self.ingress.continue_headers(start, len)
-    }
-
-    fn complete_inbound_block(
-        &mut self,
-        start: usize,
-        len: usize,
-        trailing: bool,
-    ) -> Result<(hpack::HeaderBlock, bool), ConnError> {
-        if R::IS_SERVER {
-            self.ingress
-                .complete_headers::<RequestHeaders>(start, len, trailing)
-        } else {
-            self.ingress
-                .complete_headers::<ResponseHeaders>(start, len, trailing)
-        }
-    }
-
-    fn finish_inbound_block(&mut self) -> Result<(hpack::HeaderBlock, bool), ConnError> {
-        self.ingress.finish_headers()
+    ) -> Result<
+        crate::ingress::PreparedHeadersEvent<
+            '_,
+            impl FnOnce(&mut RetainedSegments, usize),
+            F::Selection,
+            F::Block,
+        >,
+        ConnError,
+    > {
+        ingress.prepare_headers_event(start, len, total, R::IS_SERVER, trailing)
     }
 
     fn drive(&mut self) -> Result<(), ConnError> {
@@ -1147,11 +1150,13 @@ impl<R: Role> Conn<R> {
                 return Err(ConnError::Continuation);
             }
             let emits_event = match header.kind {
-                Type::Settings | Type::Ping | Type::GoAway | Type::Data | Type::RstStream => true,
-                Type::Headers | Type::PushPromise | Type::Continuation => {
-                    header.flags.has(Flags::END_HEADERS)
-                }
-                Type::WindowUpdate | Type::Priority => false,
+                Type::Settings | Type::Ping | Type::GoAway | Type::RstStream => true,
+                Type::Headers
+                | Type::PushPromise
+                | Type::Continuation
+                | Type::Data
+                | Type::WindowUpdate
+                | Type::Priority => false,
             };
             if emits_event {
                 self.ensure_event_capacity()?;
@@ -1274,7 +1279,6 @@ impl<R: Role> Conn<R> {
                     if header.stream_id.is_zero() {
                         return Err(ParseError::Protocol.into());
                     }
-                    self.prepare_outbound(HEADER_LEN + 4)?;
                     let (mut start, mut len) = self.ingress.unpadded_payload(header)?;
                     if header.flags.has(Flags::PRIORITY) {
                         if len < 5 {
@@ -1290,33 +1294,27 @@ impl<R: Role> Conn<R> {
                     let sid = header.stream_id;
                     let end_stream = header.flags.has(Flags::END_STREAM);
                     let end_headers = header.flags.has(Flags::END_HEADERS);
-                    self.handle_headers_frame(sid, end_stream, end_headers, start, len)?;
-                    self.ingress.try_consume(total)?;
+                    self.handle_headers_frame(sid, end_stream, end_headers, start, len, total)?;
                     continue;
                 }
                 Type::Data => {
                     if header.stream_id.is_zero() {
                         return Err(ParseError::Protocol.into());
                     }
-                    self.prepare_outbound(2 * (HEADER_LEN + 4))?;
                     let (start, len) = self.ingress.unpadded_payload(header)?;
-                    let payload = self.ingress.data(start, len)?;
                     let stream_id = header.stream_id;
                     let end_stream = header.flags.has(Flags::END_STREAM);
-                    self.ingress.try_consume(total)?;
-                    self.handle_data_frame(stream_id, end_stream, payload)?;
+                    self.handle_data_frame(stream_id, end_stream, start, len, total)?;
                     continue;
                 }
                 Type::Continuation => {
                     if header.stream_id.is_zero() {
                         return Err(ParseError::Protocol.into());
                     }
-                    self.prepare_outbound(HEADER_LEN + 4)?;
                     let len = header.length.as_usize();
                     let stream_id = header.stream_id;
                     let end_headers = header.flags.has(Flags::END_HEADERS);
-                    self.handle_continuation_frame(stream_id, end_headers, HEADER_LEN, len)?;
-                    self.ingress.try_consume(total)?;
+                    self.handle_continuation_frame(stream_id, end_headers, HEADER_LEN, len, total)?;
                     continue;
                 }
                 Type::RstStream => {
@@ -1335,7 +1333,6 @@ impl<R: Role> Conn<R> {
                     if header.stream_id.is_zero() {
                         return Err(ParseError::Protocol.into());
                     }
-                    self.prepare_outbound(HEADER_LEN + 4)?;
                     let (start, len) = self.ingress.unpadded_payload(header)?;
                     if len < 4 {
                         return Err(ParseError::FrameSize.into());
@@ -1354,8 +1351,8 @@ impl<R: Role> Conn<R> {
                         end_headers,
                         block_start,
                         block_len,
+                        total,
                     )?;
-                    self.ingress.try_consume(total)?;
                     continue;
                 }
                 Type::Priority => {
@@ -1379,169 +1376,261 @@ impl<R: Role> Conn<R> {
         end_headers: bool,
         fragment_start: usize,
         fragment_len: usize,
+        total: usize,
     ) -> Result<(), ConnError> {
         if stream_id.is_zero() {
             return Err(ConnError::Protocol);
         }
-        match self.classify_stream(stream_id) {
-            StreamClass::Connection => return Err(ConnError::Protocol),
-            StreamClass::ClosedEnd => return Err(ConnError::StreamClosed),
-            StreamClass::ClosedRst => {
-                self.emit_rst(stream_id, ErrorCode::StreamClosed)?;
-                return Ok(());
+        let Conn {
+            ingress,
+            egress,
+            streams,
+            goaway_sent,
+            local_settings,
+            peer_settings,
+            ..
+        } = self;
+        if let Some(record) = streams.get_mut(stream_id) {
+            let trailing = record.stream.peer_headers_received;
+            if !end_headers {
+                ingress.begin_headers(fragment_start, fragment_len, R::IS_SERVER, trailing)?;
+                ingress.start_pending_headers(PendingHeaders {
+                    stream_id,
+                    kind: PendingKind::Headers {
+                        end_stream,
+                        trailing,
+                        action: PendingHeaderAction::Deliver,
+                    },
+                    continuations: 0,
+                });
+                return ingress.try_consume(total);
             }
-            StreamClass::Idle => {
-                let peer_init = if R::IS_SERVER {
-                    stream_id.is_client()
-                } else {
-                    stream_id.is_server()
-                };
-                if !peer_init {
+            let prepared = Self::prepare_inbound_headers_event(
+                ingress,
+                fragment_start,
+                fragment_len,
+                total,
+                trailing,
+            )?;
+            if prepared.is_invalid() {
+                prepared.discard();
+                streams.mark_reset(stream_id);
+                streams.remove(stream_id);
+                return egress.committed_reset(stream_id, ErrorCode::ProtocolError);
+            }
+            let next = match record
+                .stream
+                .state
+                .recv(stream::Event::Headers { end_stream })
+            {
+                Ok(next) => next,
+                Err(TransitionError::Protocol) => {
+                    prepared.discard();
                     return Err(ConnError::Protocol);
                 }
-                if self.goaway_sent {
-                    self.emit_rst(stream_id, ErrorCode::RefusedStream)?;
-                    return Ok(());
-                }
-                if !self.can_track_peer_stream() {
-                    self.emit_rst(stream_id, ErrorCode::RefusedStream)?;
-                    self.streams.observe_peer(stream_id);
-                    return Ok(());
-                }
-                if self.track_stream(Stream::new(stream_id)).is_err() {
-                    self.emit_rst(stream_id, ErrorCode::RefusedStream)?;
-                    self.streams.observe_peer(stream_id);
-                    return Ok(());
-                }
-                self.streams.observe_peer(stream_id);
-            }
-            StreamClass::Active => {}
-        }
-        let trailing = self.is_trailing(stream_id);
-        if end_headers {
-            let (headers, invalid) =
-                self.complete_inbound_block(fragment_start, fragment_len, trailing)?;
-            if invalid {
-                self.rst_evict(stream_id, ErrorCode::ProtocolError)?;
-                return Ok(());
-            }
-            match self.advance_stream(
-                stream_id,
-                stream::Event::Headers { end_stream },
-                Side::Remote,
-            ) {
-                Ok(()) => {}
-                Err(TransitionError::Protocol) => return Err(ConnError::Protocol),
                 Err(TransitionError::StreamClosed) => {
-                    self.rst_evict(stream_id, ErrorCode::StreamClosed)?;
-                    return Ok(());
+                    prepared.discard();
+                    streams.mark_reset(stream_id);
+                    streams.remove(stream_id);
+                    return egress.committed_reset(stream_id, ErrorCode::StreamClosed);
+                }
+            };
+            record.stream.state = next;
+            record.stream.peer_headers_received = true;
+            prepared.commit_headers(stream_id, end_stream, trailing);
+            if next == State::Closed {
+                streams.remove(stream_id);
+            }
+            return Ok(());
+        }
+
+        let (action, observe_peer) = match streams.classify_missing(stream_id) {
+            StreamClass::Connection | StreamClass::Active => return Err(ConnError::Protocol),
+            StreamClass::ClosedEnd => return Err(ConnError::StreamClosed),
+            StreamClass::ClosedRst => (PendingHeaderAction::Reset(ErrorCode::StreamClosed), false),
+            StreamClass::Idle => {
+                if !StreamRegistry::<R>::is_peer_initiated(stream_id) {
+                    return Err(ConnError::Protocol);
+                }
+                if *goaway_sent {
+                    (PendingHeaderAction::Reset(ErrorCode::RefusedStream), false)
+                } else if !streams.can_accept_peer(
+                    local_settings.max_concurrent_streams.unwrap_or(u32::MAX) as usize,
+                ) {
+                    (PendingHeaderAction::Reset(ErrorCode::RefusedStream), true)
+                } else {
+                    (PendingHeaderAction::Deliver, true)
                 }
             }
-            if let Some(record) = self.stream_mut(stream_id) {
-                record.stream.peer_headers_received = true;
+        };
+        if !end_headers {
+            ingress.begin_headers(fragment_start, fragment_len, R::IS_SERVER, false)?;
+            if action == PendingHeaderAction::Deliver {
+                if streams
+                    .insert(
+                        Stream::new(stream_id),
+                        peer_settings.initial_window_size,
+                        local_settings.initial_window_size,
+                    )
+                    .is_err()
+                {
+                    ingress.try_consume(total)?;
+                    return Err(ConnError::Protocol);
+                }
             }
-            self.push_event(Event::Headers {
-                stream_id,
-                headers,
-                end_stream,
-                trailing,
-            })?;
-        } else {
-            self.begin_inbound_block(fragment_start, fragment_len, trailing)?;
-            self.ingress.start_pending_headers(PendingHeaders {
+            if observe_peer {
+                streams.observe_peer(stream_id);
+            }
+            ingress.start_pending_headers(PendingHeaders {
                 stream_id,
                 kind: PendingKind::Headers {
                     end_stream,
-                    trailing,
+                    trailing: false,
+                    action,
                 },
                 continuations: 0,
             });
+            return ingress.try_consume(total);
         }
+        let prepared = Self::prepare_inbound_headers_event(
+            ingress,
+            fragment_start,
+            fragment_len,
+            total,
+            false,
+        )?;
+        if observe_peer {
+            streams.observe_peer(stream_id);
+        }
+        if let PendingHeaderAction::Reset(error) = action {
+            prepared.discard();
+            return egress.committed_reset(stream_id, error);
+        }
+        if prepared.is_invalid() {
+            prepared.discard();
+            streams.mark_reset(stream_id);
+            return egress.committed_reset(stream_id, ErrorCode::ProtocolError);
+        }
+        let mut stream = Stream::new(stream_id);
+        let next = match stream.recv(stream::Event::Headers { end_stream }) {
+            Ok(next) => next,
+            Err(_) => {
+                prepared.discard();
+                return Err(ConnError::Protocol);
+            }
+        };
+        stream.peer_headers_received = true;
+        if streams
+            .insert(
+                stream,
+                peer_settings.initial_window_size,
+                local_settings.initial_window_size,
+            )
+            .is_err()
+        {
+            prepared.discard();
+            return Err(ConnError::Protocol);
+        }
+        prepared.commit_headers(stream_id, end_stream, false);
+        debug_assert_ne!(next, State::Closed);
         Ok(())
-    }
-
-    fn is_trailing(&self, stream_id: StreamId) -> bool {
-        self.stream(stream_id)
-            .map(|record| record.stream.peer_headers_received)
-            .unwrap_or(false)
     }
 
     fn handle_data_frame(
         &mut self,
         stream_id: StreamId,
         end_stream: bool,
-        payload: DataPayload,
+        payload_start: usize,
+        payload_len: usize,
+        total: usize,
     ) -> Result<(), ConnError> {
-        match self.classify_stream(stream_id) {
-            StreamClass::Connection => return Err(ConnError::Protocol),
-            StreamClass::Idle => return Err(ConnError::Protocol),
-            StreamClass::ClosedEnd => return Err(ConnError::StreamClosed),
-            StreamClass::ClosedRst => {
-                self.emit_rst(stream_id, ErrorCode::StreamClosed)?;
-                return Ok(());
-            }
-            StreamClass::Active => {}
-        }
-        let n = payload.len();
-        self.recv_window
-            .consume(n)
-            .map_err(|_| ConnError::FlowControl)?;
-        {
-            self.stream_mut(stream_id)
-                .ok_or(ConnError::Protocol)?
-                .recv_window
-                .consume(n)
-                .map_err(|_| ConnError::FlowControl)?;
-        }
-        self.replenish_recv(stream_id, n)?;
-        match self.advance_stream(stream_id, stream::Event::Data { end_stream }, Side::Remote) {
-            Ok(()) => {}
-            Err(TransitionError::Protocol) => return Err(ConnError::Protocol),
-            Err(TransitionError::StreamClosed) => {
-                self.rst_evict(stream_id, ErrorCode::StreamClosed)?;
-                return Ok(());
-            }
-        }
-        self.push_event(Event::Data {
-            stream_id,
-            data: payload,
-            end_stream,
-        })?;
-        Ok(())
-    }
-
-    fn replenish_recv(&mut self, stream_id: StreamId, n: usize) -> Result<(), ConnError> {
-        if n == 0 {
-            return Ok(());
-        }
-        let n32 = u32::try_from(n).map_err(|_| ConnError::FlowControl)?;
         let conn_threshold = (self.recv_window_target / 2).max(1);
-        self.conn_pending_release = self.conn_pending_release.saturating_add(n32);
-        if self.conn_pending_release >= conn_threshold {
-            let inc = self.conn_pending_release;
-            self.conn_pending_release = 0;
-            self.recv_window.increase(inc).map_err(ConnError::from)?;
-            self.emit_window_update(StreamId::CONNECTION, inc)?;
-        }
         let stream_threshold = (self.local_settings.initial_window_size / 2).max(1);
-        let stream_increment = if let Some(record) = self.stream_mut(stream_id) {
-            record.pending_release = record.pending_release.saturating_add(n32);
-            if record.pending_release >= stream_threshold {
-                let increment = record.pending_release;
-                record.pending_release = 0;
-                record
-                    .recv_window
-                    .increase(increment)
-                    .map_err(ConnError::from)?;
-                Some(increment)
-            } else {
-                None
-            }
-        } else {
-            None
+        let Conn {
+            ingress,
+            egress,
+            recv_window,
+            streams,
+            conn_pending_release,
+            ..
+        } = self;
+        let Some(record) = streams.get_mut(stream_id) else {
+            return match streams.classify_missing(stream_id) {
+                StreamClass::Connection | StreamClass::Idle | StreamClass::Active => {
+                    ingress.prepare_frame(total)?.reject(ConnError::Protocol)
+                }
+                StreamClass::ClosedEnd => ingress
+                    .prepare_frame(total)?
+                    .reject(ConnError::StreamClosed),
+                StreamClass::ClosedRst => {
+                    let frame = ingress.prepare_frame(total)?;
+                    egress.data_control(stream_id, None, None, Some(ErrorCode::StreamClosed))?;
+                    frame.commit();
+                    Ok(())
+                }
+            };
         };
-        if let Some(increment) = stream_increment {
-            self.emit_window_update(stream_id, increment)?;
+        let next = match record.stream.state.recv(stream::Event::Data { end_stream }) {
+            Ok(next) => Some(next),
+            Err(TransitionError::StreamClosed) => None,
+            Err(TransitionError::Protocol) => {
+                return ingress.prepare_frame(total)?.reject(ConnError::Protocol);
+            }
+        };
+        let replenish_stream = next.is_some() && !end_stream;
+        let receive = flow::Pair {
+            conn: recv_window,
+            stream: &mut record.recv_window,
+        }
+        .receive(
+            payload_len,
+            flow::ReleasePair {
+                conn: conn_pending_release,
+                stream: &mut record.pending_release,
+                conn_threshold,
+                stream_threshold,
+            },
+            replenish_stream,
+        );
+        let receive = match receive {
+            Ok(receive) => receive,
+            Err(error) => {
+                return ingress.prepare_frame(total)?.reject(ConnError::from(error));
+            }
+        };
+        match next {
+            Some(next) => {
+                let data = ingress.prepare_data_event(payload_start, payload_len, total)?;
+                let connection_update = receive.conn_increment();
+                let stream_update = receive.stream_increment();
+                if connection_update.is_some() || stream_update.is_some() {
+                    egress.data_control(stream_id, connection_update, stream_update, None)?;
+                }
+                receive.commit();
+                record.stream.state = next;
+                data.frame.commit();
+                data.event.push_back(Event::Data {
+                    stream_id,
+                    data: data.payload,
+                    end_stream,
+                });
+                if next == State::Closed {
+                    streams.remove(stream_id);
+                }
+            }
+            None => {
+                let frame = ingress.prepare_frame(total)?;
+                egress.data_control(
+                    stream_id,
+                    receive.conn_increment(),
+                    None,
+                    Some(ErrorCode::StreamClosed),
+                )?;
+                receive.commit();
+                frame.commit();
+                streams.mark_reset(stream_id);
+                streams.remove(stream_id);
+            }
         }
         Ok(())
     }
@@ -1576,6 +1665,7 @@ impl<R: Role> Conn<R> {
         end_headers: bool,
         fragment_start: usize,
         fragment_len: usize,
+        total: usize,
     ) -> Result<(), ConnError> {
         let kind = {
             let pending = self
@@ -1594,70 +1684,123 @@ impl<R: Role> Conn<R> {
             }
             pending.kind
         };
-        match kind {
-            PendingKind::Headers { .. } => {
-                self.continue_inbound_block(fragment_start, fragment_len)?;
-            }
-            PendingKind::PushPromise { .. } => {
-                self.ingress
-                    .continue_headers(fragment_start, fragment_len)?;
-            }
-        }
-        if end_headers {
-            let Some(pending) = self.ingress.take_pending_headers() else {
-                return Err(ConnError::Continuation);
-            };
-            match pending.kind {
-                PendingKind::Headers {
-                    end_stream,
-                    trailing,
-                } => {
-                    let (headers, invalid) = self.finish_inbound_block()?;
-                    if invalid {
-                        self.rst_evict(pending.stream_id, ErrorCode::ProtocolError)?;
-                        return Ok(());
-                    }
-                    match self.advance_stream(
-                        pending.stream_id,
-                        stream::Event::Headers { end_stream },
-                        Side::Remote,
-                    ) {
-                        Ok(()) => {}
-                        Err(TransitionError::Protocol) => {
-                            return Err(ConnError::Protocol);
-                        }
-                        Err(TransitionError::StreamClosed) => {
-                            self.rst_evict(pending.stream_id, ErrorCode::StreamClosed)?;
-                            return Ok(());
-                        }
-                    }
-                    if let Some(record) = self.stream_mut(pending.stream_id) {
-                        record.stream.peer_headers_received = true;
-                    }
-                    self.push_event(Event::Headers {
-                        stream_id: pending.stream_id,
-                        headers,
-                        end_stream,
-                        trailing,
-                    })?;
-                }
-                PendingKind::PushPromise { promised } => {
-                    let (headers, invalid) = self.ingress.finish_headers()?;
-                    if invalid {
-                        self.rst_evict(promised, ErrorCode::ProtocolError)?;
-                        return Ok(());
-                    }
-                    if !self.reserve_promised_stream(promised)? {
-                        return Ok(());
-                    }
-                    self.push_event(Event::PushPromise {
-                        stream_id: pending.stream_id,
-                        promised_stream_id: promised,
-                        headers,
-                    })?;
+        if !end_headers {
+            match kind {
+                PendingKind::Headers { .. } | PendingKind::PushPromise { .. } => {
+                    self.ingress
+                        .continue_headers(fragment_start, fragment_len)?;
                 }
             }
+            return self.ingress.try_consume(total);
         }
+        let (prepared, pending) =
+            self.ingress
+                .prepare_continued_headers_event(fragment_start, fragment_len, total)?;
+        let Conn {
+            egress,
+            streams,
+            local_settings,
+            peer_settings,
+            ..
+        } = self;
+        match pending.kind {
+            PendingKind::Headers {
+                end_stream,
+                trailing,
+                action,
+            } => {
+                if let PendingHeaderAction::Reset(error) = action {
+                    prepared.discard();
+                    return egress.committed_reset(pending.stream_id, error);
+                }
+                let Some(record) = streams.get_mut(pending.stream_id) else {
+                    prepared.discard();
+                    return Err(ConnError::Protocol);
+                };
+                if prepared.is_invalid() {
+                    prepared.discard();
+                    streams.mark_reset(pending.stream_id);
+                    streams.remove(pending.stream_id);
+                    return egress.committed_reset(pending.stream_id, ErrorCode::ProtocolError);
+                }
+                let next = match record
+                    .stream
+                    .state
+                    .recv(stream::Event::Headers { end_stream })
+                {
+                    Ok(next) => next,
+                    Err(TransitionError::Protocol) => {
+                        prepared.discard();
+                        return Err(ConnError::Protocol);
+                    }
+                    Err(TransitionError::StreamClosed) => {
+                        prepared.discard();
+                        streams.mark_reset(pending.stream_id);
+                        streams.remove(pending.stream_id);
+                        return egress.committed_reset(pending.stream_id, ErrorCode::StreamClosed);
+                    }
+                };
+                record.stream.state = next;
+                record.stream.peer_headers_received = true;
+                prepared.commit_headers(pending.stream_id, end_stream, trailing);
+                if next == State::Closed {
+                    streams.remove(pending.stream_id);
+                }
+                Ok(())
+            }
+            PendingKind::PushPromise { promised } => Self::commit_push_promise(
+                egress,
+                streams,
+                local_settings,
+                peer_settings,
+                prepared,
+                pending.stream_id,
+                promised,
+            ),
+        }
+    }
+
+    fn commit_push_promise<C>(
+        egress: &mut Egress,
+        streams: &mut StreamRegistry<R>,
+        local_settings: &Settings,
+        peer_settings: &Settings,
+        prepared: PreparedHeadersEvent<'_, C, F::Selection, F::Block>,
+        stream_id: StreamId,
+        promised: StreamId,
+    ) -> Result<(), ConnError>
+    where
+        C: FnOnce(&mut RetainedSegments, usize),
+    {
+        if !StreamRegistry::<R>::is_peer_initiated(promised) || promised <= streams.last_peer_id() {
+            prepared.discard();
+            return Err(ConnError::Protocol);
+        }
+        if prepared.is_invalid() {
+            prepared.discard();
+            streams.mark_reset(promised);
+            return egress.committed_reset(promised, ErrorCode::ProtocolError);
+        }
+        if !streams
+            .can_accept_peer(local_settings.max_concurrent_streams.unwrap_or(u32::MAX) as usize)
+        {
+            prepared.discard();
+            streams.observe_peer(promised);
+            return egress.committed_reset(promised, ErrorCode::RefusedStream);
+        }
+        if streams
+            .insert(
+                Stream::reserve_remote(promised),
+                peer_settings.initial_window_size,
+                local_settings.initial_window_size,
+            )
+            .is_err()
+        {
+            prepared.discard();
+            return Err(ConnError::Protocol);
+        }
+        streams.observe_peer(promised);
+        prepared.commit_push_promise(stream_id, promised);
         Ok(())
     }
 
@@ -1689,48 +1832,47 @@ impl<R: Role> Conn<R> {
         end_headers: bool,
         fragment_start: usize,
         fragment_len: usize,
+        total: usize,
     ) -> Result<(), ConnError> {
         if R::IS_SERVER {
             return Err(ConnError::Protocol);
         }
         if end_headers {
-            let (headers, invalid) = self.ingress.complete_headers::<RequestHeaders>(
+            let prepared = self.ingress.prepare_headers_event(
                 fragment_start,
                 fragment_len,
+                total,
+                true,
                 false,
             )?;
-            if invalid {
-                self.emit_rst(promised, ErrorCode::ProtocolError)?;
-                return Ok(());
-            }
-            if !self.reserve_promised_stream(promised)? {
-                return Ok(());
-            }
-            self.push_event(Event::PushPromise {
+            return Self::commit_push_promise(
+                &mut self.egress,
+                &mut self.streams,
+                &self.local_settings,
+                &self.peer_settings,
+                prepared,
                 stream_id,
-                promised_stream_id: promised,
-                headers,
-            })?;
-        } else {
-            self.ingress
-                .begin_headers::<RequestHeaders>(fragment_start, fragment_len, false)?;
-            self.ingress.start_pending_headers(PendingHeaders {
-                stream_id,
-                kind: PendingKind::PushPromise { promised },
-                continuations: 0,
-            });
+                promised,
+            );
         }
-        Ok(())
+        self.ingress
+            .begin_headers(fragment_start, fragment_len, true, false)?;
+        self.ingress.start_pending_headers(PendingHeaders {
+            stream_id,
+            kind: PendingKind::PushPromise { promised },
+            continuations: 0,
+        });
+        self.ingress.try_consume(total)
     }
 }
 
-impl<R: Role> Default for Conn<R> {
+impl<R: Role, F: HeadPlan> Default for Conn<R, F> {
     fn default() -> Self {
-        Self::new()
+        Self::from_config_with_plan(ValidatedConfig::default())
     }
 }
 
-impl Conn<ClientRole> {
+impl<F: HeadPlan> Conn<ClientRole, F> {
     pub fn start_request(
         &mut self,
         headers: &[hpack::Header<'_>],
@@ -1753,17 +1895,23 @@ impl Conn<ClientRole> {
         if !self.can_track_local_stream() {
             return Err(ConnError::StreamLimit);
         }
-        let id = self.streams.next_local_id().ok_or(ConnError::StreamLimit)?;
-        self.track_stream(Stream::new(id))
-            .map_err(|_| ConnError::StreamLimit)?;
-        self.emit_headers(id, headers, end_stream)?;
-        self.advance_stream(id, stream::Event::Headers { end_stream }, Side::Local)
+        let id = self.streams.peek_local_id().ok_or(ConnError::StreamLimit)?;
+        let mut stream = Stream::new(id);
+        stream
+            .send(stream::Event::Headers { end_stream })
             .map_err(|_| ConnError::Protocol)?;
+        self.track_stream(stream)
+            .map_err(|_| ConnError::StreamLimit)?;
+        if let Err(error) = self.emit_headers(id, headers, end_stream) {
+            self.evict_stream(id);
+            return Err(error);
+        }
+        self.streams.commit_local_id(id);
         Ok(id)
     }
 }
 
-impl Conn<ServerRole> {
+impl<F: HeadPlan> Conn<ServerRole, F> {
     pub fn send_response<'a, I>(
         &mut self,
         stream_id: StreamId,
@@ -1773,16 +1921,6 @@ impl Conn<ServerRole> {
     where
         I: IntoIterator<Item = hpack::Header<'a>>,
     {
-        if !self.has_stream(stream_id) {
-            return Err(ConnError::BadStream);
-        }
-        self.emit_headers(stream_id, headers, end_stream)?;
-        self.advance_stream(
-            stream_id,
-            stream::Event::Headers { end_stream },
-            Side::Local,
-        )
-        .map_err(|_| ConnError::Protocol)?;
-        Ok(())
+        self.send_headers_transition(stream_id, headers, end_stream)
     }
 }

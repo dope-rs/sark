@@ -6,12 +6,11 @@ use dope::driver::token::Token;
 use dope::manifold::Outcome;
 use dope::manifold::listener::{
     application::{Application, ApplicationHooks},
-    egress::SlotEgress as _,
+    egress::SlotEgress,
     state::{EgressCtx, State},
 };
 use dope_fiber::abi::Fiber;
 use dope_fiber::raw::task::RootWaker;
-use dope_fiber::raw::task::queue::TaskQueue;
 use dope_net::link::slot::Slot;
 use dope_net::wire::Wire;
 use dope_net::wire::identity::Identity;
@@ -21,7 +20,6 @@ use super::Config;
 use super::connection::{ConnectionState, Dispatch, EventSink, Limits, Request, Response};
 use super::driver;
 use super::scheduler::{Resumed, Scheduler, StartContext, Started};
-use super::task::TaskTarget;
 use crate::conn::{self, ConfigError, Conn, ConnError, ValidatedConfig};
 use crate::frame::{ErrorCode, HEADER_LEN};
 use crate::role::ServerRole;
@@ -74,7 +72,7 @@ trait ConnectionContainer: Default + 'static {
 
 fn flush_into<'d, W, C>(
     slot: &mut Slot<'d, W, State<C>>,
-    egress: &mut EgressCtx<'_, '_>,
+    egress: &mut EgressCtx<'_, 'd, '_>,
     driver: &mut DriverContext<'_, 'd>,
     close_after: bool,
 ) where
@@ -99,7 +97,7 @@ fn flush_into<'d, W, C>(
 
 fn finish_ingest<'d, W, C>(
     slot: &mut Slot<'d, W, State<C>>,
-    egress: &mut EgressCtx<'_, '_>,
+    egress: &mut EgressCtx<'_, 'd, '_>,
     driver: &mut DriverContext<'_, 'd>,
     error: Option<ConnError>,
 ) -> Outcome
@@ -120,7 +118,7 @@ where
 fn resume_egress<'d, W, C>(
     slot: &mut Slot<'d, W, State<C>>,
     limits: Limits,
-    egress: &mut EgressCtx<'_, '_>,
+    egress: &mut EgressCtx<'_, 'd, '_>,
     driver: &mut DriverContext<'_, 'd>,
 ) where
     W: Wire,
@@ -219,7 +217,7 @@ impl<'d, H: SyncHandler + 'd, W: Wire> ApplicationHooks<'d, SyncApp<'d, H, W>>
     fn chunk<R: RetainBytes>(
         app: Pin<&mut SyncApp<'d, H, W>>,
         slot: &mut Slot<'d, W, State<SyncConnState>>,
-        mut egress: EgressCtx<'_, '_>,
+        mut egress: EgressCtx<'_, 'd, '_>,
         chunk: R,
         driver: &mut DriverContext<'_, 'd>,
     ) -> Outcome {
@@ -238,7 +236,7 @@ impl<'d, H: SyncHandler + 'd, W: Wire> ApplicationHooks<'d, SyncApp<'d, H, W>>
     fn send(
         app: Pin<&mut SyncApp<'d, H, W>>,
         slot: &mut Slot<'d, W, State<SyncConnState>>,
-        mut egress: EgressCtx<'_, '_>,
+        mut egress: EgressCtx<'_, 'd, '_>,
         _sent: usize,
         driver: &mut DriverContext<'_, 'd>,
     ) {
@@ -248,33 +246,22 @@ impl<'d, H: SyncHandler + 'd, W: Wire> ApplicationHooks<'d, SyncApp<'d, H, W>>
     fn close(
         _app: Pin<&mut SyncApp<'d, H, W>>,
         slot: &mut Slot<'d, W, State<SyncConnState>>,
-        _egress: EgressCtx<'_, '_>,
+        _egress: EgressCtx<'_, 'd, '_>,
     ) {
         slot.state.conn.state.close();
     }
 }
 
+#[derive(Default)]
 pub struct ConnState {
     state: ConnectionState,
-    ready: Pin<Box<TaskQueue<TaskTarget>>>,
     task_head: Option<u32>,
-}
-
-impl Default for ConnState {
-    fn default() -> Self {
-        Self {
-            state: ConnectionState::default(),
-            ready: Box::pin(TaskQueue::with_capacity(0)),
-            task_head: None,
-        }
-    }
 }
 
 impl ConnState {
     fn new(protocol: ValidatedConfig<ServerRole>) -> Self {
         Self {
             state: ConnectionState::new(Conn::from_config(protocol)),
-            ready: Box::pin(TaskQueue::with_capacity(0)),
             task_head: None,
         }
     }
@@ -296,11 +283,16 @@ pub struct App<'d, H: Handler + 'd, W: Wire = Identity> {
 
 impl<'d, H: Handler + 'd, W: Wire> App<'d, H, W> {
     pub fn new(user: &'d H, config: Config) -> Result<Self, ConfigError> {
+        if config.max_handler_tasks == 0 {
+            return Err(ConfigError::ZeroCapacity("handler task"));
+        }
+        let scheduler = Scheduler::try_with_capacity(config.max_handler_tasks)
+            .ok_or(ConfigError::HandlerCapacityOverflow)?;
         Ok(Self {
             user,
             limits: config.into(),
             protocol: ValidatedConfig::new(protocol_config(config))?,
-            scheduler: Scheduler::with_capacity(config.max_handler_tasks),
+            scheduler,
             wire: PhantomData,
         })
     }
@@ -316,17 +308,11 @@ impl<'d, H: Handler + 'd, W: Wire> App<'d, H, W> {
     ) -> usize {
         let connection_id = slot.token();
         let parent = RootWaker::from_ready(slot.driver(), slot.ready_key());
-        let ConnState {
-            state,
-            ready,
-            task_head,
-        } = &mut slot.state.conn;
-        let ready = ready.as_ref();
+        let ConnState { state, task_head } = &mut slot.state.conn;
         let mut sink = AsyncSink {
             user: self.user,
             scheduler: &mut self.scheduler,
             connection_id,
-            ready,
             task_head,
             parent,
             driver,
@@ -342,7 +328,6 @@ where
     user: &'d H,
     scheduler: &'a mut Scheduler<'d, H::Fut<'d>>,
     connection_id: Token,
-    ready: Pin<&'a TaskQueue<TaskTarget>>,
     task_head: &'a mut Option<u32>,
     parent: RootWaker<'d>,
     driver: &'a mut DriverContext<'turn, 'd>,
@@ -359,7 +344,6 @@ where
                 connection_id: self.connection_id,
                 stream_id,
                 task_head: self.task_head,
-                ready: self.ready,
                 parent: self.parent,
                 driver: self.driver,
             },
@@ -407,7 +391,7 @@ impl<'d, H: Handler + 'd, W: Wire> ApplicationHooks<'d, App<'d, H, W>> for App<'
     fn chunk<R: RetainBytes>(
         app: Pin<&mut App<'d, H, W>>,
         slot: &mut Slot<'d, W, State<ConnState>>,
-        mut egress: EgressCtx<'_, '_>,
+        mut egress: EgressCtx<'_, 'd, '_>,
         chunk: R,
         driver: &mut DriverContext<'_, 'd>,
     ) -> Outcome {
@@ -425,7 +409,7 @@ impl<'d, H: Handler + 'd, W: Wire> ApplicationHooks<'d, App<'d, H, W>> for App<'
     fn send(
         app: Pin<&mut App<'d, H, W>>,
         slot: &mut Slot<'d, W, State<ConnState>>,
-        mut egress: EgressCtx<'_, '_>,
+        mut egress: EgressCtx<'_, 'd, '_>,
         _sent: usize,
         driver: &mut DriverContext<'_, 'd>,
     ) {
@@ -435,25 +419,15 @@ impl<'d, H: Handler + 'd, W: Wire> ApplicationHooks<'d, App<'d, H, W>> for App<'
     fn activate(
         app: Pin<&mut App<'d, H, W>>,
         slot: &mut Slot<'d, W, State<ConnState>>,
-        mut egress: EgressCtx<'_, '_>,
+        mut egress: EgressCtx<'_, 'd, '_>,
         driver: &mut DriverContext<'_, 'd>,
     ) {
         let this = app.get_mut();
         let parent = RootWaker::from_ready(slot.driver(), slot.ready_key());
         let connection_id = slot.token();
-        let ConnState {
-            state,
-            ready,
-            task_head,
-        } = &mut slot.state.conn;
-        let ready = ready.as_ref();
-        if ready.is_empty() {
-            return;
-        }
-        let Some(snapshot) = ready.snapshot_root(parent) else {
-            return;
-        };
-        for key in snapshot.filter_map(TaskTarget::key) {
+        let ConnState { state, task_head } = &mut slot.state.conn;
+        this.scheduler.route_ready(parent);
+        while let Some(key) = this.scheduler.pop_ready(connection_id) {
             match this.scheduler.resume(key, connection_id, task_head, driver) {
                 Resumed::Ready(Some(stream_id), response) => {
                     state.begin_response(stream_id, response, this.limits);
@@ -477,7 +451,7 @@ impl<'d, H: Handler + 'd, W: Wire> ApplicationHooks<'d, App<'d, H, W>> for App<'
     fn close(
         app: Pin<&mut App<'d, H, W>>,
         slot: &mut Slot<'d, W, State<ConnState>>,
-        _egress: EgressCtx<'_, '_>,
+        _egress: EgressCtx<'_, 'd, '_>,
     ) {
         let this = app.get_mut();
         let state = &mut slot.state.conn;
@@ -488,7 +462,7 @@ impl<'d, H: Handler + 'd, W: Wire> ApplicationHooks<'d, App<'d, H, W>> for App<'
 
 fn flush_connection<'d, W, C>(
     slot: &mut Slot<'d, W, State<C>>,
-    egress: &mut EgressCtx<'_, '_>,
+    egress: &mut EgressCtx<'_, 'd, '_>,
     driver: &mut DriverContext<'_, 'd>,
 ) where
     W: Wire,

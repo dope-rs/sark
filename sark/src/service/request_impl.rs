@@ -73,8 +73,21 @@ pub enum HeaderParse<H> {
     },
 }
 
+#[doc(hidden)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HeaderLineOutcome {
+    Complete(usize),
+    NeedMore,
+    Bad,
+}
+
+pub trait HeaderSlot: Copy {
+    fn into_tag(self) -> u16;
+    fn from_tag(tag: u16) -> Option<Self>;
+}
+
 pub trait RouteRequestImpl {
-    type HeaderSlot: Copy;
+    type HeaderSlot: HeaderSlot;
     type RawHeaders: Default;
     type RawParams: Default;
     type Params<'req>: RouteParams<'req, Raw = Self::RawParams>;

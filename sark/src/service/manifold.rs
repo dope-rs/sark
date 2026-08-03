@@ -2,7 +2,8 @@ use dope_fiber::abi::Fiber;
 use sark_core::http::body_kind::ResponseKind;
 use sark_core::http::{IntoResponseShape, Shape, ShapeKind, ShapeMetadata, ShapeStream};
 
-pub use sark_core::http::{StreamShape as NativeStream, SyncShape as Sync};
+pub type NativeStream = sark_core::http::StreamShape;
+pub type Sync = sark_core::http::SyncShape;
 
 use super::spec::RouteSpec;
 use crate::request;
@@ -47,13 +48,13 @@ pub trait Route<State>: RouteSpec {
 
 pub trait TaskRoute<'d, State>: RouteSpec + Sized {
     fn invoke_task<'req>(
-        params: <Self as RouteSpec>::Params<'req>,
-        req: request::Ref<'req>,
-        headers: <Self as RouteSpec>::Headers<'req>,
-        parsed_body: <Self as RouteSpec>::ParsedBody<'req>,
+        storage: request::RequestStorage,
+        raw_params: <Self as RouteSpec>::RawParams,
+        raw_headers: <Self as RouteSpec>::RawHeaders,
+        target: std::ops::Range<usize>,
         state: &'req State,
         timer: &'req crate::Timer<'d>,
-    ) -> impl Fiber<'d, Output = Self::AsyncResponse> + 'req
+    ) -> impl Fiber<'d, Output = Result<Self::AsyncResponse, &'static [u8]>> + 'req
     where
         State: 'req,
         'd: 'req;

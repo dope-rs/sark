@@ -1,4 +1,4 @@
-use dope_quic::varint::{Error as VarIntError, VarInt};
+use dope_quic::varint::{self, VarInt};
 
 pub const TYPE_DATA: VarInt = VarInt::from_u8(0x00);
 pub const TYPE_HEADERS: VarInt = VarInt::from_u8(0x01);
@@ -52,11 +52,11 @@ pub enum ParseError {
     FrameTooLarge,
 }
 
-impl From<VarIntError> for ParseError {
-    fn from(err: VarIntError) -> Self {
+impl From<varint::Error> for ParseError {
+    fn from(err: varint::Error) -> Self {
         match err {
-            VarIntError::Underflow => Self::NeedMore,
-            VarIntError::TooLarge => Self::BadVarInt,
+            varint::Error::Underflow => Self::NeedMore,
+            varint::Error::TooLarge => Self::BadVarInt,
         }
     }
 }

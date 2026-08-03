@@ -277,6 +277,16 @@ impl Mode {
                     quote! {
                         #[derive(Clone, Copy)]
                         struct #header_slot_ident;
+
+                        impl sark::service::HeaderSlot for #header_slot_ident {
+                            fn into_tag(self) -> u16 {
+                                0
+                            }
+
+                            fn from_tag(_tag: u16) -> Option<Self> {
+                                None
+                            }
+                        }
                     },
                     quote! { None },
                     quote! { Ok(()) },
@@ -292,7 +302,11 @@ impl Mode {
                 )
             };
         let header_emitter = HeaderEmitter::new(&header_plan, full);
-        let header_contig_fn = header_emitter.contiguous()?;
+        let header_contig = header_emitter.contiguous()?;
+        let header_contig_fast = header_contig.fast;
+        let header_contig_ignored = header_contig.ignored;
+        let header_contig_unknown = header_contig.unknown;
+        let header_contig_short = header_contig.short;
         let query = Query::new(&query_fields);
         let query_set_name_fn = if query_fields.is_empty() {
             quote! { Ok(()) }
@@ -349,6 +363,7 @@ impl Mode {
                 ) -> sark::error::Result<()> {
                     #header_set_fn
                 }
+
             }
         };
         let header_methods = quote! {
@@ -375,13 +390,21 @@ impl Mode {
                             pos,
                             &mut scan,
                             &mut flags,
-                            &mut header_count,
-                            max_header_count,
                         ) {
-                            Ok(Some(0)) => break pos + 2,
-                            Ok(Some(relative)) => pos += relative + 2,
-                            Ok(None) => return sark::service::HeaderParse::NeedMore,
-                            Err(_) => return sark::service::HeaderParse::Bad,
+                            sark::service::HeaderLineOutcome::Complete(0) => break pos + 2,
+                            sark::service::HeaderLineOutcome::Complete(relative) => {
+                                if header_count >= max_header_count {
+                                    return sark::service::HeaderParse::Bad;
+                                }
+                                header_count += 1;
+                                pos += relative + 2;
+                            }
+                            sark::service::HeaderLineOutcome::NeedMore => {
+                                return sark::service::HeaderParse::NeedMore;
+                            }
+                            sark::service::HeaderLineOutcome::Bad => {
+                                return sark::service::HeaderParse::Bad;
+                            }
                         }
                     };
                     let body_framing = match scan.validate_for_request() {
@@ -400,7 +423,6 @@ impl Mode {
         let header_parser = quote! {
             impl #name {
                 #[doc(hidden)]
-                #[allow(clippy::too_many_arguments, unreachable_code, unused_variables)]
                 fn __sark_scan_header_line<const __PARSE_ACCEPT_ENCODING: bool>(
                     headers: &mut #raw_headers_ident,
                     input: &[u8],
@@ -408,10 +430,37 @@ impl Mode {
                     line_start: usize,
                     scan: &mut sark::sark_core::http::codec::HeaderScan,
                     flags: &mut sark::sark_core::http::head::Flags,
-                    header_count: &mut usize,
-                    max_header_count: usize,
-                ) -> sark::error::Result<Option<usize>> {
-                    #header_contig_fn
+                ) -> sark::service::HeaderLineOutcome {
+                    #header_contig_fast
+                }
+
+                #[doc(hidden)]
+                #[inline(never)]
+                fn __sark_scan_header_line_unknown<const __START: usize>(
+                    rest: &[u8],
+                ) -> sark::service::HeaderLineOutcome {
+                    #header_contig_unknown
+                }
+
+                #[doc(hidden)]
+                #[inline(never)]
+                fn __sark_scan_header_value_ignored<const __COLON_IDX: usize>(
+                    rest: &[u8],
+                ) -> sark::service::HeaderLineOutcome {
+                    #header_contig_ignored
+                }
+
+                #[doc(hidden)]
+                #[cold]
+                fn __sark_scan_header_line_short<const __PARSE_ACCEPT_ENCODING: bool>(
+                    headers: &mut #raw_headers_ident,
+                    input: &[u8],
+                    rest: &[u8],
+                    line_start: usize,
+                    scan: &mut sark::sark_core::http::codec::HeaderScan,
+                    flags: &mut sark::sark_core::http::head::Flags,
+                ) -> sark::service::HeaderLineOutcome {
+                    #header_contig_short
                 }
             }
         };

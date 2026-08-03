@@ -4,19 +4,11 @@ use std::collections::BTreeMap;
 
 use proc_macro2::{Ident, Span, TokenStream};
 use quote::{format_ident, quote};
+use sark_protocol::{KnownRequestHeadName, RequestHeadSemantic};
 use syn::Result;
 
 use super::value::{FieldPlan, FieldSpec};
 use crate::util::ValueKind;
-
-const KNOWN_HEADERS: [KnownKind; 6] = [
-    KnownKind::Host,
-    KnownKind::Connection,
-    KnownKind::ContentLength,
-    KnownKind::TransferEncoding,
-    KnownKind::Expect,
-    KnownKind::AcceptEncoding,
-];
 
 trait HeaderAssignment {
     fn assignment(
@@ -53,9 +45,7 @@ impl HeaderAssignment for FieldSpec {
                     } else if raw.eq_ignore_ascii_case(b"false") || raw == b"0" {
                         false
                     } else {
-                        return Err(sark_core::error::Error::BadRequest(
-                            "Invalid boolean field".into(),
-                        ));
+                        return sark::service::HeaderLineOutcome::Bad;
                     };
                     headers.#ident = Some(parsed);
                 }
@@ -63,7 +53,10 @@ impl HeaderAssignment for FieldSpec {
             ValueKind::Custom => quote! {
                 if headers.#ident.is_none() {
                     let value = sark::service::SliceValue::new(input, (#abs_start)..(#abs_end));
-                    headers.#ident = Some(sark::service::FieldValue::parse_value(&value)?);
+                    let Ok(value) = sark::service::FieldValue::parse_value(&value) else {
+                        return sark::service::HeaderLineOutcome::Bad;
+                    };
+                    headers.#ident = Some(value);
                 }
             },
         }
@@ -78,24 +71,19 @@ impl HeaderAssignment for FieldSpec {
                 let mut seen = false;
                 for &b in raw {
                     if !b.is_ascii_digit() {
-                        return Err(sark_core::error::Error::BadRequest(
-                            "Invalid integer header".into(),
-                        ));
+                        return sark::service::HeaderLineOutcome::Bad;
                     }
-                    value = value
+                    let Some(next) = value
                         .checked_mul(10)
                         .and_then(|v| v.checked_add((b - b'0') as #ty))
-                        .ok_or_else(|| {
-                            sark_core::error::Error::BadRequest(
-                                "Invalid integer header".into(),
-                            )
-                        })?;
+                    else {
+                        return sark::service::HeaderLineOutcome::Bad;
+                    };
+                    value = next;
                     seen = true;
                 }
                 if !seen {
-                    return Err(sark_core::error::Error::BadRequest(
-                        "Invalid integer header".into(),
-                    ));
+                    return sark::service::HeaderLineOutcome::Bad;
                 }
                 headers.#ident = Some(value);
             }
@@ -110,13 +98,13 @@ struct HeaderPlan {
 
 impl HeaderPlan {
     fn collect(fields: &FieldPlan) -> Self {
-        let mut known = vec![None; KNOWN_HEADERS.len()];
+        let mut known = vec![None; RequestHeadSemantic::HTTP1.len()];
         let mut custom = Vec::new();
         for mut field in fields.entries().iter().cloned() {
             field.bytes.make_ascii_lowercase();
-            if let Some(known_idx) = KNOWN_HEADERS
+            if let Some(known_idx) = RequestHeadSemantic::HTTP1
                 .iter()
-                .position(|known| known.bytes() == field.bytes)
+                .position(|known| known.wire_name() == field.bytes)
             {
                 known[known_idx] = Some(field);
             } else {
@@ -143,62 +131,64 @@ impl HeaderEmitter {
 
 struct ActionSpec {
     bytes: Vec<u8>,
-    body: TokenStream,
+    prefix_body: TokenStream,
+    short_body: Option<TokenStream>,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum KnownKind {
-    Host,
-    Connection,
-    ContentLength,
-    TransferEncoding,
-    Expect,
-    AcceptEncoding,
+pub(crate) struct Contiguous {
+    pub(crate) fast: TokenStream,
+    pub(crate) ignored: TokenStream,
+    pub(crate) unknown: TokenStream,
+    pub(crate) short: TokenStream,
 }
 
-impl KnownKind {
-    fn mandatory(self) -> bool {
-        matches!(
-            self,
-            Self::Host | Self::Connection | Self::ContentLength | Self::TransferEncoding
-        )
-    }
+trait Http1KnownHead {
+    fn header(self) -> TokenStream;
 
-    fn bytes(self) -> &'static [u8] {
-        match self {
-            Self::Host => b"host",
-            Self::Connection => b"connection",
-            Self::ContentLength => b"content-length",
-            Self::TransferEncoding => b"transfer-encoding",
-            Self::Expect => b"expect",
-            Self::AcceptEncoding => b"accept-encoding",
-        }
-    }
+    fn build_contig_arm(
+        self,
+        capture: Option<&FieldSpec>,
+        validate_tail: &TokenStream,
+    ) -> TokenStream;
+}
 
+impl Http1KnownHead for RequestHeadSemantic {
     fn header(self) -> TokenStream {
-        match self {
-            Self::Host => quote!(sark::sark_core::http::head::KnownHeader::Host),
-            Self::Expect => quote!(sark::sark_core::http::head::KnownHeader::Expect),
-            Self::Connection => quote!(sark::sark_core::http::head::KnownHeader::Connection),
-            Self::ContentLength => quote!(sark::sark_core::http::head::KnownHeader::ContentLength),
-            Self::TransferEncoding => {
+        match self.known() {
+            KnownRequestHeadName::Host => {
+                quote!(sark::sark_core::http::head::KnownHeader::Host)
+            }
+            KnownRequestHeadName::Expect => {
+                quote!(sark::sark_core::http::head::KnownHeader::Expect)
+            }
+            KnownRequestHeadName::Connection => {
+                quote!(sark::sark_core::http::head::KnownHeader::Connection)
+            }
+            KnownRequestHeadName::ContentLength => {
+                quote!(sark::sark_core::http::head::KnownHeader::ContentLength)
+            }
+            KnownRequestHeadName::TransferEncoding => {
                 quote!(sark::sark_core::http::head::KnownHeader::TransferEncoding)
             }
-            Self::AcceptEncoding => {
+            KnownRequestHeadName::AcceptEncoding => {
                 quote!(sark::sark_core::http::head::KnownHeader::AcceptEncoding)
             }
+            _ => unreachable!("non-HTTP/1 head semantic in HTTP/1 lowering"),
         }
     }
 
     fn build_contig_arm(
         self,
         capture: Option<&FieldSpec>,
-        count_tail: &TokenStream,
+        validate_tail: &TokenStream,
     ) -> TokenStream {
+        let colon_idx = self.wire_name().len();
         let assignment = capture.map(|field| {
             let raw_expr = quote! {
-                rest.get(colon_idx + 1 + value_start..colon_idx + 1 + value_end)
-                    .ok_or_else(|| sark::error::Error::BadRequest("Invalid header value".into()))?
+                match rest.get(colon_idx + 1 + value_start..colon_idx + 1 + value_end) {
+                    Some(raw) => raw,
+                    None => return sark::service::HeaderLineOutcome::Bad,
+                }
             };
             let abs_start = quote! { line_start + colon_idx + 1 + value_start };
             let abs_end = quote! { line_start + colon_idx + 1 + value_end };
@@ -206,15 +196,20 @@ impl KnownKind {
         });
         let header = self.header();
         quote! {{
-            let Some((tail_end, value_start, value_end)) =
-                #header.scan_line(scan, flags, &rest[colon_idx + 1..])?
-            else {
-                return Ok(None);
+            let colon_idx = #colon_idx;
+            let (tail_end, value_start, value_end) = match #header.scan_line(
+                scan,
+                flags,
+                &rest[colon_idx + 1..],
+            ) {
+                Ok(Some(value)) => value,
+                Ok(None) => return sark::service::HeaderLineOutcome::NeedMore,
+                Err(_) => return sark::service::HeaderLineOutcome::Bad,
             };
             let _ = (value_start, value_end);
-            #count_tail
+            #validate_tail
             #assignment
-            return Ok(Some(colon_idx + 1 + tail_end));
+            return sark::service::HeaderLineOutcome::Complete(colon_idx + 1 + tail_end);
         }}
     }
 }
@@ -330,7 +325,10 @@ type ProbeKey = (usize, u64, u64, u64);
 type ActionRow = (Vec<u8>, Vec<u8>, TokenStream);
 
 impl HeaderEmitter {
-    fn prefix_cases(&self, action_specs: &[ActionSpec], unknown_miss: &TokenStream) -> TokenStream {
+    fn prefix_cases<F>(&self, action_specs: &[ActionSpec], unknown_miss: &F) -> TokenStream
+    where
+        F: Fn(usize) -> TokenStream,
+    {
         let mut prefix_groups: BTreeMap<ProbeKey, Vec<ActionRow>> = BTreeMap::new();
         for spec in action_specs {
             let (probe_len, probe_word, probe_mask, probe_active, tail) =
@@ -338,7 +336,7 @@ impl HeaderEmitter {
             prefix_groups
                 .entry((probe_len, probe_word, probe_mask, probe_active))
                 .or_default()
-                .push((spec.bytes.clone(), tail, spec.body.clone()));
+                .push((spec.bytes.clone(), tail, spec.prefix_body.clone()));
         }
         let match_mask = u64::from_le_bytes([0x20, 0x20, 0x20, 0x20, 0x20, 0xff, 0xff, 0xff]);
         let fold_mask = u64::from_le_bytes([0x20, 0x20, 0x20, 0x20, 0x20, 0x00, 0x00, 0x00]);
@@ -353,24 +351,23 @@ impl HeaderEmitter {
         if can_match {
             let mut match_arms = Vec::new();
             for ((probe_len, probe_word, _, _), group) in groups {
-                let checks = self.group_checks(probe_len, &group);
                 let fallback_idx = probe_len.min(5);
                 let probe_key = probe_word | match_mask;
+                let miss = unknown_miss(fallback_idx);
+                let body = self.group_body(probe_len, &group, &miss);
                 match_arms.push(quote! {
                     #probe_key => {
-                        #( #checks )*
-                        let idx = #fallback_idx;
-                        #unknown_miss
+                        #body
                     }
                 });
             }
+            let miss = unknown_miss(0);
             return quote! {
                 let __probe_key = __probe_word | #match_mask;
                 match __probe_key {
                     #( #match_arms, )*
                     _ => {
-                        let idx = 0usize;
-                        #unknown_miss
+                        #miss
                     }
                 }
             };
@@ -379,27 +376,24 @@ impl HeaderEmitter {
         let mut cases: Vec<(u8, TokenStream, TokenStream)> = Vec::new();
         for ((probe_len, probe_word, probe_mask, probe_active), group) in groups {
             let priority = self.prefix_priority(&group[0].0);
-            let checks = self.group_checks(probe_len, &group);
             let fallback_idx = probe_len.min(5);
             let cond = quote! { ((__probe_word | #probe_mask) & #probe_active) == #probe_word };
-            let body = quote! {
-                #( #checks )*
-                let idx = #fallback_idx;
-                #unknown_miss
-            };
+            let miss = unknown_miss(fallback_idx);
+            let body = self.group_body(probe_len, &group, &miss);
             cases.push((priority, cond, body));
         }
         cases.sort_by_key(|case| case.0);
         let mut iter = cases.into_iter();
         let Some((_, first_cond, first_body)) = iter.next() else {
+            let miss = unknown_miss(0);
             return quote! {
-                let idx = 0usize;
-                #unknown_miss
+                #miss
             };
         };
         let rest: Vec<_> = iter.collect();
         let rest_conds: Vec<_> = rest.iter().map(|case| case.1.clone()).collect();
         let rest_bodies: Vec<_> = rest.iter().map(|case| case.2.clone()).collect();
+        let miss = unknown_miss(0);
         quote! {
             if #first_cond {
                 #first_body
@@ -408,9 +402,21 @@ impl HeaderEmitter {
                 #rest_bodies
             } )*
             else {
-                let idx = 0usize;
-                #unknown_miss
+                #miss
             }
+        }
+    }
+
+    fn group_body(&self, probe_len: usize, group: &[ActionRow], miss: &TokenStream) -> TokenStream {
+        if let [(_, tail, body)] = group
+            && tail.is_empty()
+        {
+            return body.clone();
+        }
+        let checks = self.group_checks(probe_len, group);
+        quote! {
+            #( #checks )*
+            #miss
         }
     }
 
@@ -421,10 +427,7 @@ impl HeaderEmitter {
                 let colon_idx = bytes.len();
                 let total_len = colon_idx + 1;
                 if tail.is_empty() {
-                    quote! {
-                        let colon_idx = #colon_idx;
-                        #body
-                    }
+                    body.clone()
                 } else {
                     let tail_ident = format_ident!("tail");
                     let cond = BytesMatch::Folded.emit(&tail_ident, tail);
@@ -432,7 +435,6 @@ impl HeaderEmitter {
                         if rest.len() >= #total_len {
                             let #tail_ident = &rest[#probe_len..#total_len];
                             if #cond {
-                                let colon_idx = #colon_idx;
                                 #body
                             }
                         }
@@ -474,7 +476,7 @@ impl HeaderEmitter {
 
     fn prefix_priority(&self, bytes: &[u8]) -> u8 {
         match bytes {
-            b if b.starts_with(b"host") => 0,
+            b if b.starts_with(RequestHeadSemantic::HOST.wire_name()) => 0,
             b if b.starts_with(b"conne") => 1,
             b if b.starts_with(b"x-ben") => 2,
             b if b.starts_with(b"conte") => 3,
@@ -486,10 +488,8 @@ impl HeaderEmitter {
 }
 
 impl HeaderEmitter {
-    pub(crate) fn contiguous(&self) -> Result<TokenStream> {
+    pub(crate) fn contiguous(&self) -> Result<Contiguous> {
         let plan = &self.plan;
-        let raw = format_ident!("__raw");
-        let name_valid = self.header_name_valid(&raw);
         if plan.custom.iter().any(|field| field.bytes.len() < 4) {
             return Err(syn::Error::new(
                 Span::call_site(),
@@ -505,9 +505,7 @@ impl HeaderEmitter {
 
         let max_header_line_bytes = quote!(sark::sark_core::http::head::MAX_HEADER_LINE_BYTES);
         let line_too_long = quote! {
-            return Err(sark::error::Error::BadRequest(
-                "Header line too long".into(),
-            ));
+            return sark::service::HeaderLineOutcome::Bad;
         };
         let capped_rest = quote! {
             let __capped = if rest.len() > #max_header_line_bytes {
@@ -516,19 +514,12 @@ impl HeaderEmitter {
                 rest
             };
         };
-        let count_header = quote! {
-            if *header_count >= max_header_count {
-                return Err(sark::error::Error::BadRequest("Too many headers".into()));
-            }
-            *header_count += 1;
-        };
-        let count_tail = quote! {
+        let validate_tail = quote! {
             if colon_idx + 1 + tail_end
                 > #max_header_line_bytes
             {
                 #line_too_long
             }
-            #count_header
         };
         let scan_value = quote! {
             #capped_rest
@@ -538,9 +529,7 @@ impl HeaderEmitter {
             ) {
                 sark::sark_core::http::scan::HeaderValueOutcome::Found { pos } => pos,
                 sark::sark_core::http::scan::HeaderValueOutcome::Invalid => {
-                    return Err(sark::error::Error::BadRequest(
-                        "Invalid header value".into(),
-                    ));
+                    return sark::service::HeaderLineOutcome::Bad;
                 }
                 sark::sark_core::http::scan::HeaderValueOutcome::None
                     if rest.len() > #max_header_line_bytes =>
@@ -548,7 +537,7 @@ impl HeaderEmitter {
                     #line_too_long
                 }
                 sark::sark_core::http::scan::HeaderValueOutcome::None => {
-                    return Ok(None);
+                    return sark::service::HeaderLineOutcome::NeedMore;
                 }
             };
         };
@@ -567,24 +556,20 @@ impl HeaderEmitter {
                     if rest.len() > #max_header_line_bytes {
                         #line_too_long
                     }
-                    return Ok(None);
+                    return sark::service::HeaderLineOutcome::NeedMore;
                 }
                 let __byte = rest[__value_idx];
                 if __byte == b'\r' {
                     if __value_idx + 1 >= rest.len() {
-                        return Ok(None);
+                        return sark::service::HeaderLineOutcome::NeedMore;
                     }
                     if rest[__value_idx + 1] != b'\n' {
-                        return Err(sark::error::Error::BadRequest(
-                            "Invalid header value".into(),
-                        ));
+                        return sark::service::HeaderLineOutcome::Bad;
                     }
                     break;
                 }
                 if (__byte < 0x20 && __byte != b'\t') || __byte == 0x7f {
-                    return Err(sark::error::Error::BadRequest(
-                        "Invalid header value".into(),
-                    ));
+                    return sark::service::HeaderLineOutcome::Bad;
                 }
                 if __byte != b' ' && __byte != b'\t' {
                     value_end = __value_idx + 1 - (colon_idx + 1);
@@ -593,13 +578,62 @@ impl HeaderEmitter {
             }
             let tail_end = __value_idx - (colon_idx + 1);
         };
-        let unknown_value = quote! {
+        let unknown_dispatch = quote! {
             #scan_value
-            #count_header
-            return Ok(Some(__line_end));
+            return sark::service::HeaderLineOutcome::Complete(__line_end);
         };
-        let unknown_dispatch = unknown_value.clone();
-        let unknown_miss = quote! {
+        let short_unknown = quote! {
+            #capped_rest
+            if __capped.len() < 16 {
+                let mut __cursor = idx;
+                let colon_idx = loop {
+                    if __cursor >= __capped.len() {
+                        return sark::service::HeaderLineOutcome::NeedMore;
+                    }
+                    let byte = __capped[__cursor];
+                    if byte == b':' {
+                        if __cursor == 0 {
+                            return sark::service::HeaderLineOutcome::Bad;
+                        }
+                        break __cursor;
+                    }
+                    if byte == b'\r' {
+                        if __cursor + 1 >= __capped.len() {
+                            return sark::service::HeaderLineOutcome::NeedMore;
+                        }
+                        if __capped[__cursor + 1] == b'\n' && __cursor == 0 {
+                            return sark::service::HeaderLineOutcome::Complete(0);
+                        }
+                        return sark::service::HeaderLineOutcome::Bad;
+                    }
+                    if !sark::sark_core::http::head::is_header_name_byte(byte) {
+                        return sark::service::HeaderLineOutcome::Bad;
+                    }
+                    __cursor += 1;
+                };
+                __cursor = colon_idx + 1;
+                loop {
+                    if __cursor >= __capped.len() {
+                        return sark::service::HeaderLineOutcome::NeedMore;
+                    }
+                    let byte = __capped[__cursor];
+                    if byte == b'\r' {
+                        if __cursor + 1 >= __capped.len() {
+                            return sark::service::HeaderLineOutcome::NeedMore;
+                        }
+                        if __capped[__cursor + 1] != b'\n' {
+                            return sark::service::HeaderLineOutcome::Bad;
+                        }
+                        return sark::service::HeaderLineOutcome::Complete(__cursor);
+                    }
+                    if (byte < 0x20 && byte != b'\t') || byte == 0x7f {
+                        return sark::service::HeaderLineOutcome::Bad;
+                    }
+                    __cursor += 1;
+                }
+            }
+        };
+        let unknown_name = quote! {
             #capped_rest
             let (name_end, name_term) =
                 match sark::sark_core::http::scan::scan_header_name(__capped, idx) {
@@ -608,9 +642,7 @@ impl HeaderEmitter {
                         byte,
                     } => (pos, byte),
                     sark::sark_core::http::scan::HeaderNameOutcome::Invalid => {
-                        return Err(sark::error::Error::BadRequest(
-                            "Invalid header name".into(),
-                        ));
+                        return sark::service::HeaderLineOutcome::Bad;
                     }
                     sark::sark_core::http::scan::HeaderNameOutcome::None
                         if rest.len() > #max_header_line_bytes =>
@@ -618,77 +650,98 @@ impl HeaderEmitter {
                         #line_too_long
                     }
                     sark::sark_core::http::scan::HeaderNameOutcome::None => {
-                        return Ok(None);
+                        return sark::service::HeaderLineOutcome::NeedMore;
                     }
             };
             if name_term != b':' {
                 if name_end + 1 >= __capped.len() {
                     return if rest.len() > #max_header_line_bytes {
-                        Err(sark::error::Error::BadRequest(
-                            "Header line too long".into(),
-                        ))
+                        sark::service::HeaderLineOutcome::Bad
                     } else {
-                        Ok(None)
+                        sark::service::HeaderLineOutcome::NeedMore
                     };
                 }
                 if __capped[name_end + 1] == b'\n' && name_end == 0 {
-                    return Ok(Some(0));
+                    return sark::service::HeaderLineOutcome::Complete(0);
                 }
-                return Err(sark::error::Error::BadRequest(
-                    "Invalid header name".into(),
-                ));
+                return sark::service::HeaderLineOutcome::Bad;
             }
             if name_end == 0 {
-                return Err(sark::error::Error::BadRequest(
-                    "Invalid header name".into(),
-                ));
+                return sark::service::HeaderLineOutcome::Bad;
             }
             let colon_idx = name_end;
-            #unknown_value
+        };
+        let unknown_call = |idx: usize| {
+            quote! {
+                return Self::__sark_scan_header_line_unknown::<#idx>(rest);
+            }
+        };
+        let ignored_call = |colon_idx: usize| {
+            quote! {
+                return Self::__sark_scan_header_value_ignored::<#colon_idx>(rest);
+            }
         };
         let mut action_specs = Vec::new();
         for field in &plan.custom {
+            let colon_idx = field.bytes.len();
             let raw_expr = quote! {
-                rest.get(colon_idx + 1 + value_start..colon_idx + 1 + value_end)
-                    .ok_or_else(|| sark::error::Error::BadRequest("Invalid header value".into()))?
+                match rest.get(colon_idx + 1 + value_start..colon_idx + 1 + value_end) {
+                    Some(raw) => raw,
+                    None => return sark::service::HeaderLineOutcome::Bad,
+                }
             };
             let abs_start = quote! { line_start + colon_idx + 1 + value_start };
             let abs_end = quote! { line_start + colon_idx + 1 + value_end };
             let assign = field.assignment(raw_expr, abs_start, abs_end);
+            let body = quote! {{
+                let colon_idx = #colon_idx;
+                #trim_contig
+                #validate_tail
+                let _ = (value_start, value_end);
+                #assign
+                return sark::service::HeaderLineOutcome::Complete(
+                    colon_idx + 1 + tail_end,
+                );
+            }};
             action_specs.push(ActionSpec {
                 bytes: field.bytes.clone(),
-                body: quote! {{
-                    #trim_contig
-                    #count_tail
-                    let _ = (value_start, value_end);
-                    #assign
-                    return Ok(Some(colon_idx + 1 + tail_end));
-                }},
+                prefix_body: body.clone(),
+                short_body: Some(body),
             });
         }
 
         let specialize_ignored = plan.custom.len() < 8;
-        for (idx, known) in KNOWN_HEADERS.iter().enumerate() {
+        for (idx, known) in RequestHeadSemantic::HTTP1.iter().copied().enumerate() {
             let capture = plan.known[idx].as_ref();
-            let semantic = known.mandatory() || self.full || capture.is_some();
-            let body = if semantic {
-                known.build_contig_arm(capture, &count_tail)
-            } else if *known == KnownKind::AcceptEncoding {
-                let semantic_body = known.build_contig_arm(None, &count_tail);
-                quote! {{
-                    if __PARSE_ACCEPT_ENCODING {
-                        #semantic_body
-                    }
-                    #unknown_dispatch
-                }}
+            let semantic = known.http1_mandatory() || self.full || capture.is_some();
+            let (prefix_body, short_body) = if semantic {
+                let body = known.build_contig_arm(capture, &validate_tail);
+                (body.clone(), Some(body))
+            } else if known.known() == KnownRequestHeadName::AcceptEncoding {
+                let semantic_body = known.build_contig_arm(None, &validate_tail);
+                let ignored = ignored_call(known.wire_name().len());
+                (
+                    quote! {{
+                        if __PARSE_ACCEPT_ENCODING {
+                            #semantic_body
+                        }
+                        #ignored
+                    }},
+                    Some(quote! {{
+                        if __PARSE_ACCEPT_ENCODING {
+                            #semantic_body
+                        }
+                    }}),
+                )
             } else if specialize_ignored {
-                unknown_dispatch.clone()
+                (ignored_call(known.wire_name().len()), None)
             } else {
                 continue;
             };
             action_specs.push(ActionSpec {
-                bytes: known.bytes().to_vec(),
-                body,
+                bytes: known.wire_name().to_vec(),
+                prefix_body,
+                short_body,
             });
         }
 
@@ -698,93 +751,131 @@ impl HeaderEmitter {
             }
             action_specs.push(ActionSpec {
                 bytes: bytes.to_vec(),
-                body: unknown_dispatch.clone(),
+                prefix_body: ignored_call(bytes.len()),
+                short_body: None,
             });
         }
 
-        let prefix_detect = self.prefix_cases(&action_specs, &unknown_miss);
+        let prefix_detect = self.prefix_cases(&action_specs, &unknown_call);
         let short_dispatch: Vec<TokenStream> = action_specs
             .iter()
-            .map(|spec| {
+            .filter_map(|spec| {
+                let body = spec.short_body.as_ref()?;
                 let matches = BytesMatch::Folded.emit(&format_ident!("__name"), &spec.bytes);
-                let body = &spec.body;
-                quote! {
+                Some(quote! {
                     if #matches {
                         #body
                     }
-                }
+                })
             })
             .collect();
+        let short_miss = quote! {
+            return Self::__sark_scan_header_line_short::<__PARSE_ACCEPT_ENCODING>(
+                headers,
+                input,
+                rest,
+                line_start,
+                scan,
+                flags,
+            );
+        };
 
-        Ok(quote! {
-            let colon_idx = 'name: {
-                if rest.is_empty() {
-                    return Ok(None);
-                }
-                if rest.len() < 8 {
-                    let mut idx = 0usize;
-                    loop {
-                        if idx >= rest.len() {
-                            return Ok(None);
-                        }
-                        let #raw = rest[idx];
-                        if #raw == b':' {
-                            if idx == 0 {
-                                return Err(sark::error::Error::BadRequest("Invalid header name".into()));
-                            }
-                            break 'name idx;
-                        }
-                        if #raw == b'\r' {
-                            if idx + 1 >= rest.len() {
-                                return Ok(None);
-                            }
-                            if rest[idx + 1] == b'\n' {
-                                if idx == 0 {
-                                    return Ok(Some(0));
-                                }
-                                return Err(sark::error::Error::BadRequest("Invalid header name".into()));
-                            }
-                            return Err(sark::error::Error::BadRequest("Invalid header name".into()));
-                        }
-                        if !(#name_valid) {
-                            return Err(sark::error::Error::BadRequest("Invalid header name".into()));
-                        }
-                        idx += 1;
-                    }
-                }
-
+        Ok(Contiguous {
+            fast: quote! {
                 let Some(__probe) = rest.first_chunk::<8>() else {
-                    return Ok(None);
+                    if rest.first() == Some(&b'\r') {
+                        if rest.len() == 1 {
+                            return sark::service::HeaderLineOutcome::NeedMore;
+                        }
+                        return if rest[1] == b'\n' {
+                            sark::service::HeaderLineOutcome::Complete(0)
+                        } else {
+                            sark::service::HeaderLineOutcome::Bad
+                        };
+                    }
+                    #short_miss
                 };
                 let __probe_word = u64::from_le_bytes(*__probe);
                 #prefix_detect
-            };
-            let __name = &rest[..colon_idx];
-            #( #short_dispatch )*
-            #unknown_dispatch
+            },
+            ignored: quote! {
+                let value_offset = __COLON_IDX + 1;
+                let value_rest = &rest[value_offset..];
+                let __value_limit = #max_header_line_bytes - value_offset;
+                let __capped = if value_rest.len() > __value_limit {
+                    &value_rest[..__value_limit]
+                } else {
+                    value_rest
+                };
+                let scan_start = if let Some(__lane) = __capped.first_chunk::<16>() {
+                    match sark::sark_core::http::scan::scan_header_value(__lane, 0) {
+                        sark::sark_core::http::scan::HeaderValueOutcome::Found { pos } => {
+                            return sark::service::HeaderLineOutcome::Complete(value_offset + pos);
+                        }
+                        sark::sark_core::http::scan::HeaderValueOutcome::Invalid => {
+                            return sark::service::HeaderLineOutcome::Bad;
+                        }
+                        sark::sark_core::http::scan::HeaderValueOutcome::None
+                            if __lane[15] == b'\r' => 15,
+                        sark::sark_core::http::scan::HeaderValueOutcome::None => 16,
+                    }
+                } else {
+                    let mut pos = 0usize;
+                    loop {
+                        if pos >= __capped.len() {
+                            if value_rest.len() > __value_limit {
+                                #line_too_long
+                            }
+                            return sark::service::HeaderLineOutcome::NeedMore;
+                        }
+                        let byte = __capped[pos];
+                        if byte == b'\r' {
+                            if pos + 1 >= __capped.len() {
+                                return sark::service::HeaderLineOutcome::NeedMore;
+                            }
+                            if __capped[pos + 1] != b'\n' {
+                                return sark::service::HeaderLineOutcome::Bad;
+                            }
+                            return sark::service::HeaderLineOutcome::Complete(value_offset + pos);
+                        }
+                        if (byte < 0x20 && byte != b'\t') || byte == 0x7f {
+                            return sark::service::HeaderLineOutcome::Bad;
+                        }
+                        pos += 1;
+                    }
+                };
+                let __value_end = match sark::sark_core::http::scan::scan_header_value(
+                    __capped,
+                    scan_start,
+                ) {
+                    sark::sark_core::http::scan::HeaderValueOutcome::Found { pos } => pos,
+                    sark::sark_core::http::scan::HeaderValueOutcome::Invalid => {
+                        return sark::service::HeaderLineOutcome::Bad;
+                    }
+                    sark::sark_core::http::scan::HeaderValueOutcome::None
+                        if value_rest.len() > __value_limit =>
+                    {
+                        #line_too_long
+                    }
+                    sark::sark_core::http::scan::HeaderValueOutcome::None => {
+                        return sark::service::HeaderLineOutcome::NeedMore;
+                    }
+                };
+                sark::service::HeaderLineOutcome::Complete(value_offset + __value_end)
+            },
+            unknown: quote! {
+                let idx = __START;
+                #short_unknown
+                #unknown_name
+                #unknown_dispatch
+            },
+            short: quote! {
+                let idx = 0usize;
+                #unknown_name
+                let __name = &rest[..colon_idx];
+                #( #short_dispatch )*
+                #unknown_dispatch
+            },
         })
-    }
-
-    fn header_name_valid(&self, raw: &Ident) -> TokenStream {
-        quote! {
-            #raw.is_ascii_alphanumeric()
-                || matches!(
-                    #raw,
-                    b'!' | b'#'
-                        | b'$'
-                        | b'%'
-                        | b'&'
-                        | b'\''
-                        | b'*'
-                        | b'+'
-                        | b'-'
-                        | b'.'
-                        | b'^'
-                        | b'_'
-                        | b'`'
-                        | b'|'
-                        | b'~'
-                )
-        }
     }
 }

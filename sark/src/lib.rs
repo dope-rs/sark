@@ -1,9 +1,20 @@
 #[doc(hidden)]
-pub use memchr as __memchr;
+pub mod __memchr {
+    pub use memchr::*;
+}
 #[doc(hidden)]
 pub use o3;
 #[doc(hidden)]
-pub use pin_project_lite::pin_project as __pin_project;
+pub mod __macro_support {
+    pub use pin_project_lite::pin_project;
+}
+#[doc(hidden)]
+#[macro_export]
+macro_rules! __pin_project {
+    ($($tokens:tt)*) => {
+        $crate::__macro_support::pin_project! { $($tokens)* }
+    };
+}
 #[doc(hidden)]
 pub use sark_core;
 pub use sark_core::{error, http, utils};
@@ -50,7 +61,9 @@ pub const CANNED_503: &[u8] = b"HTTP/1.1 503 Service Unavailable\r\nServer: sark
 pub use app::{
     Balanced, Executor, HttpServer, HttpsServer, LowLatency, RuntimeProfile, Throughput, driver,
 };
-pub use sark_json as json;
+pub mod json {
+    pub use sark_json::*;
+}
 
 pub struct EmptyState;
 

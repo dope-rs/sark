@@ -32,7 +32,7 @@ impl<'a> TaskRunner<'a> {
         &self,
         response: R::AsyncResponse,
         slot: &mut Slot<'d, W, State<C>>,
-        egress: &mut EgressCtx<'_, '_>,
+        egress: &mut EgressCtx<'_, 'd, '_>,
         driver: &mut DriverContext<'_, 'd>,
         close: bool,
     ) {
@@ -54,7 +54,7 @@ impl<'a> TaskRunner<'a> {
         &self,
         mut tasks: Pin<&mut FixedSlab<'d, T, N, Tag>>,
         slot: &mut Slot<'d, W, State<C>>,
-        egress: &mut EgressCtx<'_, '_>,
+        egress: &mut EgressCtx<'_, 'd, '_>,
         driver: &mut DriverContext<'_, 'd>,
         project: PJ,
         mut classify: Classify,
@@ -67,7 +67,7 @@ impl<'a> TaskRunner<'a> {
         Classify: FnMut(
             T::Output,
             &mut Slot<'d, W, State<C>>,
-            &mut EgressCtx<'_, '_>,
+            &mut EgressCtx<'_, 'd, '_>,
             &mut DriverContext<'_, 'd>,
             &[u8; 29],
             bool,
@@ -177,8 +177,8 @@ impl<'a> TaskRunner<'a> {
     pub fn write_buf<'d, 'slot, 'pool, W: Wire, C: Default + 'static>(
         &self,
         slot: &mut Slot<'d, W, State<C>>,
-        egress: &'slot mut EgressCtx<'_, 'pool>,
-    ) -> WriteBuf<'slot, 'pool> {
+        egress: &'slot mut EgressCtx<'_, 'd, 'pool>,
+    ) -> WriteBuf<'slot, 'd, 'pool> {
         egress.write_buf_for(slot)
     }
 

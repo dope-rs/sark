@@ -24,6 +24,9 @@ pub(crate) struct RunningTask {
     pub(crate) key: ErasedTaskId,
     pub(crate) previous: Option<u32>,
     pub(crate) next: Option<u32>,
+    pub(crate) ready: bool,
+    pub(crate) ready_previous: Option<u32>,
+    pub(crate) ready_next: Option<u32>,
 }
 
 #[derive(Clone, Copy)]

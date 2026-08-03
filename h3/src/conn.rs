@@ -1,10 +1,14 @@
-use std::collections::{BTreeMap, VecDeque};
+use std::alloc::Layout;
+use std::error;
+use std::fmt;
+use std::marker::PhantomData;
 use std::mem;
 use std::ops::{Deref, Range};
 
-use dope_quic::varint::{Error as VarIntError, VarInt};
-use o3::buffer::{Bytes, InlineBytes, Retained, Shared};
-use sark_core::http::{Field, VecFieldBlock};
+use dope_quic::varint::{self, VarInt};
+use o3::buffer::{Bytes, InlineBytes, PoolLayoutError, Retained, Shared, SharedPoolPlan};
+use o3::collections::{FixedHashTable, FixedHashTablePlan, FixedQueue};
+use sark_core::http::{DecodedFieldBlock, Field, HeadPlan, RawHeadPlan};
 
 use crate::frame::{
     ErrorCode, Frame, ParseError, STREAM_TYPE_CONTROL, STREAM_TYPE_QPACK_DECODER,
@@ -12,7 +16,7 @@ use crate::frame::{
     TYPE_MAX_PUSH_ID, TYPE_PUSH_PROMISE, TYPE_SETTINGS,
 };
 use crate::payload::Payload;
-use crate::qpack::{self, DecodeOutcome, DecoderError, EncodedSection};
+use crate::qpack::{self, DecoderError, EncodedSection, MessageDecodeOutcome};
 use crate::stream::{StreamId, UniStreamType};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -26,6 +30,8 @@ pub enum ConnError {
     Id,
     QpackEncoderStream,
     QpackDecoderStream,
+    Overload,
+    Message,
     Protocol,
 }
 
@@ -37,17 +43,22 @@ impl From<ParseError> for ConnError {
 
 impl From<DecoderError> for ConnError {
     fn from(err: DecoderError) -> Self {
-        Self::Qpack(err)
+        if err == DecoderError::Capacity {
+            Self::Overload
+        } else {
+            Self::Qpack(err)
+        }
     }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub enum Event {
+pub enum Event<S = (), B = DecodedFieldBlock> {
     Settings(Settings),
     Headers {
         stream_id: StreamId,
-        fields: VecFieldBlock,
-        trailing: bool,
+        fields: B,
+        selection: S,
+        section: HeaderSection,
     },
     Data {
         stream_id: StreamId,
@@ -56,7 +67,8 @@ pub enum Event {
     PushPromise {
         stream_id: StreamId,
         push_id: u64,
-        fields: VecFieldBlock,
+        fields: B,
+        selection: S,
     },
     CancelPush {
         push_id: u64,
@@ -78,8 +90,9 @@ pub enum Event {
     PushHeaders {
         stream_id: StreamId,
         push_id: u64,
-        fields: VecFieldBlock,
-        trailing: bool,
+        fields: B,
+        selection: S,
+        section: HeaderSection,
     },
     PushData {
         stream_id: StreamId,
@@ -95,10 +108,203 @@ pub enum Event {
     },
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u8)]
+pub enum HeaderSection {
+    Initial = 0,
+    Trailing = 1,
+    InitialEnd = 2,
+    TrailingEnd = 3,
+}
+
+impl HeaderSection {
+    const fn new(trailing: bool, end_stream: bool) -> Self {
+        match (trailing, end_stream) {
+            (false, false) => Self::Initial,
+            (true, false) => Self::Trailing,
+            (false, true) => Self::InitialEnd,
+            (true, true) => Self::TrailingEnd,
+        }
+    }
+
+    pub const fn trailing(self) -> bool {
+        self as u8 & 1 != 0
+    }
+
+    pub const fn end_stream(self) -> bool {
+        self as u8 & 2 != 0
+    }
+}
+
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum Role {
     Client,
     Server,
+}
+
+const DEFAULT_MAX_FRAME_SIZE: usize = 16 * 1024 * 1024;
+const DEFAULT_MAX_FIELD_SECTION_SIZE: usize = 64 * 1024;
+const DEFAULT_STREAM_CAPACITY: usize = 1024;
+const DEFAULT_EVENT_CAPACITY: usize = 1024;
+const DEFAULT_WRITE_CAPACITY: usize = 1024;
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Config {
+    pub local_settings: Settings,
+    pub max_frame_size: usize,
+    pub stream_capacity: usize,
+    pub event_capacity: usize,
+    pub write_capacity: usize,
+}
+
+impl Default for Config {
+    fn default() -> Self {
+        Self {
+            local_settings: Settings::default(),
+            max_frame_size: DEFAULT_MAX_FRAME_SIZE,
+            stream_capacity: DEFAULT_STREAM_CAPACITY,
+            event_capacity: DEFAULT_EVENT_CAPACITY,
+            write_capacity: DEFAULT_WRITE_CAPACITY,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ConfigError {
+    ZeroCapacity(&'static str),
+    CapacityOverflow(&'static str),
+    InvalidSetting(&'static str),
+    Pool(PoolLayoutError),
+}
+
+impl From<PoolLayoutError> for ConfigError {
+    fn from(error: PoolLayoutError) -> Self {
+        Self::Pool(error)
+    }
+}
+
+impl fmt::Display for ConfigError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::ZeroCapacity(name) => write!(formatter, "{name} capacity must be positive"),
+            Self::CapacityOverflow(name) => write!(formatter, "{name} capacity overflows layout"),
+            Self::InvalidSetting(name) => write!(formatter, "{name} exceeds the HTTP/3 limit"),
+            Self::Pool(error) => error.fmt(formatter),
+        }
+    }
+}
+
+impl error::Error for ConfigError {}
+
+#[derive(Clone, Debug)]
+pub struct ValidatedConfig {
+    local_settings: Settings,
+    max_frame_size: usize,
+    stream_table: FixedHashTablePlan<StreamEntry>,
+    event_capacity: usize,
+    write_capacity: usize,
+    max_field_section_size: usize,
+    max_qpack_table_capacity: usize,
+    field_pool: SharedPoolPlan,
+}
+
+impl ValidatedConfig {
+    pub fn new(config: Config) -> Result<Self, ConfigError> {
+        let Config {
+            local_settings,
+            max_frame_size,
+            stream_capacity,
+            event_capacity,
+            write_capacity,
+        } = config;
+        for (name, capacity) in [
+            ("frame", max_frame_size),
+            ("stream", stream_capacity),
+            ("event", event_capacity),
+            ("write", write_capacity),
+        ] {
+            if capacity == 0 {
+                return Err(ConfigError::ZeroCapacity(name));
+            }
+        }
+        for (name, value) in [
+            (
+                "qpack table capacity",
+                local_settings.qpack_max_table_capacity,
+            ),
+            (
+                "field section size",
+                local_settings.max_field_section_size.unwrap_or(0),
+            ),
+            (
+                "qpack blocked streams",
+                local_settings.qpack_blocked_streams,
+            ),
+        ] {
+            if VarInt::new(value).is_none() {
+                return Err(ConfigError::InvalidSetting(name));
+            }
+        }
+        let max_field_section_size = local_settings
+            .max_field_section_size
+            .map_or(Ok(DEFAULT_MAX_FIELD_SECTION_SIZE), usize::try_from)
+            .map_err(|_| ConfigError::CapacityOverflow("field section"))?;
+        let max_qpack_table_capacity = usize::try_from(local_settings.qpack_max_table_capacity)
+            .map_err(|_| ConfigError::CapacityOverflow("qpack table"))?;
+        let stream_table = FixedHashTablePlan::new(stream_capacity)
+            .ok_or(ConfigError::CapacityOverflow("stream"))?;
+        if Layout::array::<StreamId>(stream_capacity).is_err() {
+            return Err(ConfigError::CapacityOverflow("stream"));
+        }
+        if Layout::array::<Event>(event_capacity).is_err() {
+            return Err(ConfigError::CapacityOverflow("event"));
+        }
+        if Layout::array::<Write>(write_capacity).is_err() {
+            return Err(ConfigError::CapacityOverflow("write"));
+        }
+        Ok(Self {
+            local_settings,
+            max_frame_size,
+            stream_table,
+            event_capacity,
+            write_capacity,
+            max_field_section_size,
+            max_qpack_table_capacity,
+            field_pool: SharedPoolPlan::new(
+                qpack::Decoder::DEFAULT_FIELD_BLOCKS,
+                max_field_section_size.max(1),
+            )?,
+        })
+    }
+
+    pub fn local_settings(&self) -> &Settings {
+        &self.local_settings
+    }
+}
+
+impl Default for ValidatedConfig {
+    fn default() -> Self {
+        const {
+            assert!(DEFAULT_MAX_FRAME_SIZE != 0);
+            assert!(DEFAULT_STREAM_CAPACITY != 0);
+            assert!(DEFAULT_EVENT_CAPACITY != 0);
+            assert!(DEFAULT_WRITE_CAPACITY != 0);
+        }
+        Self {
+            local_settings: Settings::default(),
+            max_frame_size: DEFAULT_MAX_FRAME_SIZE,
+            stream_table: FixedHashTablePlan::new(DEFAULT_STREAM_CAPACITY)
+                .expect("default stream table layout"),
+            event_capacity: DEFAULT_EVENT_CAPACITY,
+            write_capacity: DEFAULT_WRITE_CAPACITY,
+            max_field_section_size: DEFAULT_MAX_FIELD_SECTION_SIZE,
+            max_qpack_table_capacity: 0,
+            field_pool: SharedPoolPlan::fixed::<
+                { qpack::Decoder::DEFAULT_FIELD_BLOCKS },
+                DEFAULT_MAX_FIELD_SECTION_SIZE,
+            >(),
+        }
+    }
 }
 
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
@@ -119,6 +325,122 @@ struct StreamState {
     push_id: Option<u64>,
     fin_received: bool,
     blocked_required_insert_count: Option<u64>,
+}
+
+#[derive(Clone, Debug)]
+struct StreamEntry {
+    id: StreamId,
+    state: StreamState,
+}
+
+struct StreamTable {
+    entries: FixedHashTable<StreamEntry>,
+}
+
+impl StreamTable {
+    fn from_plan(plan: FixedHashTablePlan<StreamEntry>) -> Self {
+        Self {
+            entries: FixedHashTable::from_plan(plan),
+        }
+    }
+
+    fn hash(id: StreamId) -> u64 {
+        id.index()
+    }
+
+    fn remove(&mut self, id: StreamId) -> Option<StreamState> {
+        if self.entries.is_empty() {
+            return None;
+        }
+        self.entries
+            .remove(Self::hash(id), |entry| entry.id == id)
+            .map(|entry| entry.state)
+    }
+
+    fn insert(&mut self, id: StreamId, state: StreamState) -> Result<(), ConnError> {
+        self.entries
+            .try_insert(Self::hash(id), StreamEntry { id, state }, |entry| {
+                entry.id == id
+            })
+            .map_err(|_| ConnError::Overload)
+    }
+
+    fn values(&self) -> impl Iterator<Item = &StreamEntry> {
+        self.entries.values()
+    }
+}
+
+#[derive(Default)]
+struct CriticalStreams {
+    control: Option<Box<CriticalStream>>,
+    qpack_encoder: Option<Box<CriticalStream>>,
+    qpack_decoder: Option<Box<CriticalStream>>,
+}
+
+struct CriticalStream {
+    id: StreamId,
+    state: Option<StreamState>,
+}
+
+impl CriticalStreams {
+    fn slot_mut(&mut self, stream_type: UniStreamType) -> Option<&mut Option<Box<CriticalStream>>> {
+        match stream_type {
+            UniStreamType::Control => Some(&mut self.control),
+            UniStreamType::QpackEncoder => Some(&mut self.qpack_encoder),
+            UniStreamType::QpackDecoder => Some(&mut self.qpack_decoder),
+            UniStreamType::Push | UniStreamType::Unknown(_) => None,
+        }
+    }
+
+    fn register(&mut self, stream_type: UniStreamType, id: StreamId) -> Result<(), ConnError> {
+        let Some(slot) = self.slot_mut(stream_type) else {
+            return Ok(());
+        };
+        if slot.is_some() {
+            return Err(ConnError::StreamCreation);
+        }
+        *slot = Some(Box::new(CriticalStream { id, state: None }));
+        Ok(())
+    }
+
+    fn take(&mut self, id: StreamId) -> Option<StreamState> {
+        for slot in [
+            &mut self.control,
+            &mut self.qpack_encoder,
+            &mut self.qpack_decoder,
+        ] {
+            if let Some(stream) = slot
+                && stream.id == id
+            {
+                return stream.state.take();
+            }
+        }
+        None
+    }
+
+    fn put(
+        &mut self,
+        stream_type: UniStreamType,
+        id: StreamId,
+        state: StreamState,
+    ) -> Result<(), ConnError> {
+        let slot = self
+            .slot_mut(stream_type)
+            .and_then(Option::as_mut)
+            .filter(|stream| stream.id == id)
+            .ok_or(ConnError::Protocol)?;
+        if slot.state.replace(state).is_some() {
+            return Err(ConnError::Protocol);
+        }
+        Ok(())
+    }
+
+    fn contains(&self, id: StreamId) -> bool {
+        [&self.control, &self.qpack_encoder, &self.qpack_decoder]
+            .into_iter()
+            .flatten()
+            .any(|stream| stream.id == id)
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -390,24 +712,24 @@ impl Write {
     }
 }
 
-pub struct Conn {
+pub struct Conn<P: HeadPlan = RawHeadPlan> {
     role: Role,
     local_settings: Settings,
     peer_settings: Option<Settings>,
     max_frame_size: usize,
     qpack_encoder: qpack::Encoder,
     qpack_decoder: qpack::Decoder,
-    streams: BTreeMap<StreamId, StreamState>,
-    events: VecDeque<Event>,
-    writes: VecDeque<Write>,
+    streams: StreamTable,
+    critical_streams: CriticalStreams,
+    retry_streams: FixedQueue<StreamId>,
+    events: FixedQueue<Event<P::Selection, P::Block>>,
+    writes: FixedQueue<Write>,
     control_stream_id: Option<StreamId>,
     qpack_encoder_stream_id: Option<StreamId>,
     qpack_decoder_stream_id: Option<StreamId>,
-    peer_control_stream_id: Option<StreamId>,
-    peer_qpack_encoder_stream_id: Option<StreamId>,
-    peer_qpack_decoder_stream_id: Option<StreamId>,
     peer_goaway_id: Option<u64>,
     max_push_id: Option<u64>,
+    head_plan: PhantomData<fn() -> P>,
 }
 
 impl Conn {
@@ -416,38 +738,52 @@ impl Conn {
     }
 
     pub fn with_role(role: Role) -> Self {
-        Self::with_role_and_settings(role, Settings::default())
+        Self::from_config(role, ValidatedConfig::default())
     }
 
-    pub fn with_settings(local_settings: Settings) -> Self {
-        Self::with_role_and_settings(Role::Client, local_settings)
+    pub fn with_config(role: Role, config: Config) -> Result<Self, ConfigError> {
+        Ok(Self::from_config(role, ValidatedConfig::new(config)?))
     }
 
-    pub fn with_role_and_settings(role: Role, local_settings: Settings) -> Self {
-        let max_field = local_settings
-            .max_field_section_size
-            .and_then(|n| usize::try_from(n).ok())
-            .unwrap_or(64 * 1024);
-        let max_qpack_table =
-            usize::try_from(local_settings.qpack_max_table_capacity).unwrap_or(usize::MAX);
+    pub fn from_config(role: Role, config: ValidatedConfig) -> Self {
+        Self::from_config_with_plan(role, config)
+    }
+}
+
+impl<P: HeadPlan> Conn<P> {
+    pub fn from_config_with_plan(role: Role, config: ValidatedConfig) -> Self {
+        let ValidatedConfig {
+            local_settings,
+            max_frame_size,
+            stream_table,
+            event_capacity,
+            write_capacity,
+            max_field_section_size,
+            max_qpack_table_capacity,
+            field_pool,
+        } = config;
         Self {
             role,
             local_settings,
             peer_settings: None,
-            max_frame_size: 16 * 1024 * 1024,
-            qpack_encoder: qpack::Encoder::with_dynamic_capacity(max_qpack_table),
-            qpack_decoder: qpack::Decoder::with_dynamic_capacity(max_field, max_qpack_table),
-            streams: BTreeMap::new(),
-            events: VecDeque::new(),
-            writes: VecDeque::new(),
+            max_frame_size,
+            qpack_encoder: qpack::Encoder::new(),
+            qpack_decoder: qpack::Decoder::with_pool_plan(
+                max_field_section_size,
+                max_qpack_table_capacity,
+                field_pool,
+            ),
+            retry_streams: FixedQueue::with_capacity(stream_table.capacity()),
+            streams: StreamTable::from_plan(stream_table),
+            critical_streams: CriticalStreams::default(),
+            events: FixedQueue::with_capacity(event_capacity),
+            writes: FixedQueue::with_capacity(write_capacity),
             control_stream_id: None,
             qpack_encoder_stream_id: None,
             qpack_decoder_stream_id: None,
-            peer_control_stream_id: None,
-            peer_qpack_encoder_stream_id: None,
-            peer_qpack_decoder_stream_id: None,
             peer_goaway_id: None,
             max_push_id: None,
+            head_plan: PhantomData,
         }
     }
 
@@ -459,8 +795,7 @@ impl Conn {
             let mut bytes = Vec::new();
             STREAM_TYPE_CONTROL.encode(&mut bytes);
             Frame::encode(TYPE_SETTINGS, &payload, &mut bytes)?;
-            self.writes
-                .push_back(Write::single(stream_id, bytes, false));
+            Self::enqueue(&mut self.writes, Write::single(stream_id, bytes, false))?;
             return Ok(());
         }
         Err(ConnError::Protocol)
@@ -470,16 +805,18 @@ impl Conn {
         if self.qpack_encoder_stream_id.is_some() {
             return Err(ConnError::Protocol);
         }
+        self.start_uni_stream(stream_id, STREAM_TYPE_QPACK_ENCODER)?;
         self.qpack_encoder_stream_id = Some(stream_id);
-        self.start_uni_stream(stream_id, STREAM_TYPE_QPACK_ENCODER)
+        Ok(())
     }
 
     pub fn start_qpack_decoder_stream(&mut self, stream_id: StreamId) -> Result<(), ConnError> {
         if self.qpack_decoder_stream_id.is_some() {
             return Err(ConnError::Protocol);
         }
+        self.start_uni_stream(stream_id, STREAM_TYPE_QPACK_DECODER)?;
         self.qpack_decoder_stream_id = Some(stream_id);
-        self.start_uni_stream(stream_id, STREAM_TYPE_QPACK_DECODER)
+        Ok(())
     }
 
     fn start_uni_stream(
@@ -492,9 +829,7 @@ impl Conn {
         }
         let mut bytes = Vec::new();
         stream_type.encode(&mut bytes);
-        self.writes
-            .push_back(Write::single(stream_id, bytes, false));
-        Ok(())
+        Self::enqueue(&mut self.writes, Write::single(stream_id, bytes, false))
     }
 
     pub fn ingest_stream(
@@ -543,7 +878,7 @@ impl Conn {
         I: IntoIterator<Item = Field<'a>>,
     {
         let section = self.qpack_encoder.encode_section(fields);
-        self.flush_qpack_encoder_stream();
+        self.flush_qpack_encoder_stream()?;
         self.send_field_section(stream_id, TYPE_HEADERS, None, section, fin)
     }
 
@@ -555,8 +890,7 @@ impl Conn {
     ) -> Result<(), ConnError> {
         let mut bytes = Vec::new();
         Frame::encode(TYPE_DATA, data, &mut bytes)?;
-        self.writes.push_back(Write::single(stream_id, bytes, fin));
-        Ok(())
+        Self::enqueue(&mut self.writes, Write::single(stream_id, bytes, fin))
     }
 
     pub fn send_data_owned(
@@ -585,9 +919,10 @@ impl Conn {
         fin: bool,
     ) -> Result<(), ConnError> {
         let prefix = Self::frame_prefix(kind, payload.as_slice().len(), 0)?;
-        self.writes
-            .push_back(Write::segmented(stream_id, prefix, payload, fin));
-        Ok(())
+        Self::enqueue(
+            &mut self.writes,
+            Write::segmented(stream_id, prefix, payload, fin),
+        )
     }
 
     fn send_field_section(
@@ -611,13 +946,14 @@ impl Conn {
         }
         section.encode_prefix(&mut prefix);
         let field_lines = section.into_field_lines();
-        let write = if field_lines.is_empty() {
+        let write = if field_lines.len() <= INLINE_PREFIX_CAPACITY.saturating_sub(prefix.len()) {
+            prefix.extend(field_lines.iter().copied());
+            self.qpack_encoder.recycle_section(field_lines);
             Write::single(stream_id, prefix, fin)
         } else {
             Write::segmented(stream_id, prefix, WritePayload::Owned(field_lines), fin)
         };
-        self.writes.push_back(write);
-        Ok(())
+        Self::enqueue(&mut self.writes, write)
     }
 
     pub fn send_push_promise<'a, I>(
@@ -633,7 +969,7 @@ impl Conn {
             return Err(ConnError::FrameUnexpected);
         }
         let section = self.qpack_encoder.encode_section(fields);
-        self.flush_qpack_encoder_stream();
+        self.flush_qpack_encoder_stream()?;
         let push_id = VarInt::new(push_id).ok_or(ConnError::Protocol)?;
         self.send_field_section(stream_id, TYPE_PUSH_PROMISE, Some(push_id), section, false)
     }
@@ -646,9 +982,7 @@ impl Conn {
             VarInt::new(push_id).ok_or(ConnError::Protocol)?,
             &mut bytes,
         )?;
-        self.writes
-            .push_back(Write::single(stream_id, bytes, false));
-        Ok(())
+        Self::enqueue(&mut self.writes, Write::single(stream_id, bytes, false))
     }
 
     pub fn send_goaway(&mut self, id: u64) -> Result<(), ConnError> {
@@ -659,9 +993,7 @@ impl Conn {
             VarInt::new(id).ok_or(ConnError::Protocol)?,
             &mut bytes,
         )?;
-        self.writes
-            .push_back(Write::single(stream_id, bytes, false));
-        Ok(())
+        Self::enqueue(&mut self.writes, Write::single(stream_id, bytes, false))
     }
 
     pub fn send_max_push_id(&mut self, push_id: u64) -> Result<(), ConnError> {
@@ -675,12 +1007,10 @@ impl Conn {
             VarInt::new(push_id).ok_or(ConnError::Protocol)?,
             &mut bytes,
         )?;
-        self.writes
-            .push_back(Write::single(stream_id, bytes, false));
-        Ok(())
+        Self::enqueue(&mut self.writes, Write::single(stream_id, bytes, false))
     }
 
-    pub fn poll_event(&mut self) -> Option<Event> {
+    pub fn poll_event(&mut self) -> Option<Event<P::Selection, P::Block>> {
         self.events.pop_front()
     }
 
@@ -693,24 +1023,39 @@ impl Conn {
     }
 
     pub fn set_qpack_encoder_capacity(&mut self, capacity: usize) -> Result<(), ConnError> {
+        if self.qpack_encoder_stream_id.is_none() {
+            return Err(ConnError::Protocol);
+        }
         self.qpack_encoder.set_dynamic_capacity(capacity)?;
-        self.flush_qpack_encoder_stream();
-        Ok(())
+        self.flush_qpack_encoder_stream()
     }
 
-    pub fn ingest_reset(&mut self, stream_id: StreamId, error_code: u64) {
-        self.streams.remove(&stream_id);
-        self.events.push_back(Event::Reset {
-            stream_id,
-            error_code,
-        });
+    pub fn ingest_reset(&mut self, stream_id: StreamId, error_code: u64) -> Result<(), ConnError> {
+        if self.critical_streams.contains(stream_id) {
+            return Err(ConnError::ClosedCriticalStream);
+        }
+        self.streams.remove(stream_id);
+        Self::enqueue(
+            &mut self.events,
+            Event::Reset {
+                stream_id,
+                error_code,
+            },
+        )
     }
 
-    pub fn ingest_stopped(&mut self, stream_id: StreamId, error_code: u64) {
-        self.events.push_back(Event::Stopped {
-            stream_id,
-            error_code,
-        });
+    pub fn ingest_stopped(
+        &mut self,
+        stream_id: StreamId,
+        error_code: u64,
+    ) -> Result<(), ConnError> {
+        Self::enqueue(
+            &mut self.events,
+            Event::Stopped {
+                stream_id,
+                error_code,
+            },
+        )
     }
 
     pub fn max_push_id(&self) -> Option<u64> {
@@ -738,28 +1083,34 @@ impl Conn {
         Ok(prefix)
     }
 
-    fn flush_qpack_encoder_stream(&mut self) {
-        let Some(stream_id) = self.qpack_encoder_stream_id else {
-            return;
-        };
-        let bytes = self.qpack_encoder.take_encoder_instructions();
-        if bytes.is_empty() {
-            return;
-        }
-        self.writes
-            .push_back(Write::single(stream_id, bytes, false));
+    fn enqueue<T>(queue: &mut FixedQueue<T>, value: T) -> Result<(), ConnError> {
+        queue.push_back(value).map_err(|_| ConnError::Overload)
     }
 
-    fn flush_qpack_decoder_stream(&mut self) {
-        let Some(stream_id) = self.qpack_decoder_stream_id else {
-            return;
+    fn flush_qpack_encoder_stream(&mut self) -> Result<(), ConnError> {
+        let Some(stream_id) = self.qpack_encoder_stream_id else {
+            return Ok(());
         };
-        let bytes = self.qpack_decoder.take_decoder_instructions();
-        if bytes.is_empty() {
-            return;
+        if !self.qpack_encoder.has_encoder_instructions() {
+            return Ok(());
         }
-        self.writes
-            .push_back(Write::single(stream_id, bytes, false));
+        let slot = self.writes.vacant_entry().ok_or(ConnError::Overload)?;
+        let bytes = self.qpack_encoder.take_encoder_instructions();
+        slot.push_back(Write::single(stream_id, bytes, false));
+        Ok(())
+    }
+
+    fn flush_qpack_decoder_stream(&mut self) -> Result<(), ConnError> {
+        let Some(stream_id) = self.qpack_decoder_stream_id else {
+            return Ok(());
+        };
+        if !self.qpack_decoder.has_decoder_instructions() {
+            return Ok(());
+        }
+        let slot = self.writes.vacant_entry().ok_or(ConnError::Overload)?;
+        let bytes = self.qpack_decoder.take_decoder_instructions();
+        slot.push_back(Write::single(stream_id, bytes, false));
+        Ok(())
     }
 
     fn decode_block(
@@ -767,20 +1118,29 @@ impl Conn {
         stream_id: StreamId,
         block: &[u8],
         blocked: &mut Option<u64>,
-    ) -> Result<Option<VecFieldBlock>, ConnError> {
-        match self.qpack_decoder.decode_or_blocked(block)? {
-            DecodeOutcome::Ready {
+        request: bool,
+        trailing: bool,
+    ) -> Result<Option<(P::Block, P::Selection)>, ConnError> {
+        let (outcome, valid) = self
+            .qpack_decoder
+            .decode_message_or_blocked::<P>(block, request, trailing)?;
+        if !valid {
+            return Err(ConnError::Message);
+        }
+        match outcome {
+            MessageDecodeOutcome::Ready {
                 fields,
+                selection,
                 required_insert_count,
             } => {
                 *blocked = None;
                 if required_insert_count > 0 {
                     self.qpack_decoder.acknowledge_section(stream_id.0);
-                    self.flush_qpack_decoder_stream();
+                    self.flush_qpack_decoder_stream()?;
                 }
-                Ok(Some(fields))
+                Ok(Some((fields, selection)))
             }
-            DecodeOutcome::Blocked {
+            MessageDecodeOutcome::Blocked {
                 required_insert_count,
             } => {
                 *blocked = Some(required_insert_count);
@@ -816,25 +1176,32 @@ impl Conn {
                         stream_id,
                         block,
                         &mut state.blocked_required_insert_count,
+                        !PUSH && self.role == Role::Server,
+                        trailing,
                     )?;
-                    let Some(fields) = decoded else {
+                    let Some((fields, selection)) = decoded else {
                         return Ok(());
                     };
                     state.message = next_message;
-                    self.events.push_back(if PUSH {
-                        Event::PushHeaders {
-                            stream_id,
-                            push_id,
-                            fields,
-                            trailing,
-                        }
-                    } else {
-                        Event::Headers {
-                            stream_id,
-                            fields,
-                            trailing,
-                        }
-                    });
+                    Self::enqueue(
+                        &mut self.events,
+                        if PUSH {
+                            Event::PushHeaders {
+                                stream_id,
+                                push_id,
+                                fields,
+                                selection,
+                                section: HeaderSection::new(trailing, fin && n == rest.len()),
+                            }
+                        } else {
+                            Event::Headers {
+                                stream_id,
+                                fields,
+                                selection,
+                                section: HeaderSection::new(trailing, fin && n == rest.len()),
+                            }
+                        },
+                    )?;
                 }
                 Frame::Data(data) => {
                     if !matches!(state.message, MessageState::Headers | MessageState::Data) {
@@ -846,15 +1213,18 @@ impl Conn {
                         .inbound
                         .take_payload(payload_start..n, n)
                         .ok_or(ConnError::Protocol)?;
-                    self.events.push_back(if PUSH {
-                        Event::PushData {
-                            stream_id,
-                            push_id,
-                            data,
-                        }
-                    } else {
-                        Event::Data { stream_id, data }
-                    });
+                    Self::enqueue(
+                        &mut self.events,
+                        if PUSH {
+                            Event::PushData {
+                                stream_id,
+                                push_id,
+                                data,
+                            }
+                        } else {
+                            Event::Data { stream_id, data }
+                        },
+                    )?;
                     continue;
                 }
                 Frame::Unknown { .. } => {}
@@ -866,15 +1236,21 @@ impl Conn {
                         stream_id,
                         block,
                         &mut state.blocked_required_insert_count,
+                        true,
+                        false,
                     )?;
-                    let Some(fields) = decoded else {
+                    let Some((fields, selection)) = decoded else {
                         return Ok(());
                     };
-                    self.events.push_back(Event::PushPromise {
-                        stream_id,
-                        push_id: push_id.get(),
-                        fields,
-                    });
+                    Self::enqueue(
+                        &mut self.events,
+                        Event::PushPromise {
+                            stream_id,
+                            push_id: push_id.get(),
+                            fields,
+                            selection,
+                        },
+                    )?;
                 }
                 _ => return Err(ConnError::FrameUnexpected),
             }
@@ -886,11 +1262,14 @@ impl Conn {
             if !state.inbound.is_empty() || state.message == MessageState::Idle {
                 return Err(ConnError::Protocol);
             }
-            self.events.push_back(if PUSH {
-                Event::PushFinished { stream_id, push_id }
-            } else {
-                Event::Finished { stream_id }
-            });
+            Self::enqueue(
+                &mut self.events,
+                if PUSH {
+                    Event::PushFinished { stream_id, push_id }
+                } else {
+                    Event::Finished { stream_id }
+                },
+            )?;
         }
         Ok(())
     }
@@ -904,19 +1283,17 @@ impl Conn {
     where
         F: FnOnce(&mut Inbound),
     {
-        let mut state = self.streams.remove(&stream_id).unwrap_or_default();
+        let mut state = self.streams.remove(stream_id).unwrap_or_default();
         append(&mut state.inbound);
         state.fin_received |= fin;
         let fin_received = state.fin_received;
         self.ingest_message_frames::<false>(stream_id, &mut state, 0, fin_received)?;
         if state.blocked_required_insert_count.is_some() {
-            self.streams.insert(stream_id, state);
+            self.streams.insert(stream_id, state)?;
             return Ok(());
         }
-        if state.fin_received {
-            self.streams.remove(&stream_id);
-        } else {
-            self.streams.insert(stream_id, state);
+        if !state.fin_received {
+            self.streams.insert(stream_id, state)?;
         }
         Ok(())
     }
@@ -930,15 +1307,19 @@ impl Conn {
     where
         F: FnOnce(&mut Inbound),
     {
-        let mut state = self.streams.remove(&stream_id).unwrap_or_default();
+        let mut state = self
+            .critical_streams
+            .take(stream_id)
+            .or_else(|| self.streams.remove(stream_id))
+            .unwrap_or_default();
         append(&mut state.inbound);
         state.fin_received |= fin;
 
         if state.uni_type.is_none() {
             let (stream_type, type_len) = match VarInt::decode(&state.inbound) {
                 Ok(v) => v,
-                Err(VarIntError::Underflow) => {
-                    self.streams.insert(stream_id, state);
+                Err(varint::Error::Underflow) => {
+                    self.streams.insert(stream_id, state)?;
                     return Ok(());
                 }
                 Err(_) => return Err(ConnError::Protocol),
@@ -969,7 +1350,7 @@ impl Conn {
                     if !state.inbound.try_advance(consumed) {
                         return Err(ConnError::Protocol);
                     }
-                    self.flush_qpack_decoder_stream();
+                    self.flush_qpack_decoder_stream()?;
                     self.retry_blocked_streams()?;
                 }
                 if state.fin_received {
@@ -996,10 +1377,12 @@ impl Conn {
         if state.fin_received && state.uni_type.is_some_and(UniStreamType::is_critical) {
             return Err(ConnError::ClosedCriticalStream);
         }
-        if state.fin_received {
-            self.streams.remove(&stream_id);
-        } else {
-            self.streams.insert(stream_id, state);
+        if !state.fin_received {
+            if uni_type.is_critical() {
+                self.critical_streams.put(uni_type, stream_id, state)?;
+            } else {
+                self.streams.insert(stream_id, state)?;
+            }
         }
         Ok(())
     }
@@ -1010,23 +1393,11 @@ impl Conn {
         stream_type: UniStreamType,
     ) -> Result<(), ConnError> {
         match stream_type {
-            UniStreamType::Control => Self::register_single_stream(
-                &mut self.peer_control_stream_id,
-                stream_id,
-                ConnError::StreamCreation,
-            ),
-            UniStreamType::QpackEncoder => Self::register_single_stream(
-                &mut self.peer_qpack_encoder_stream_id,
-                stream_id,
-                ConnError::StreamCreation,
-            ),
-            UniStreamType::QpackDecoder => Self::register_single_stream(
-                &mut self.peer_qpack_decoder_stream_id,
-                stream_id,
-                ConnError::StreamCreation,
-            ),
             UniStreamType::Push if self.role != Role::Client || !stream_id.is_server_uni() => {
                 Err(ConnError::StreamCreation)
+            }
+            UniStreamType::Control | UniStreamType::QpackEncoder | UniStreamType::QpackDecoder => {
+                self.critical_streams.register(stream_type, stream_id)
             }
             UniStreamType::Push | UniStreamType::Unknown(_) => Ok(()),
         }
@@ -1034,15 +1405,16 @@ impl Conn {
 
     fn retry_blocked_streams(&mut self) -> Result<(), ConnError> {
         let insert_count = self.qpack_decoder.dynamic_insert_count();
-        let stream_ids: Vec<StreamId> = self
-            .streams
-            .iter()
-            .filter_map(|(stream_id, state)| {
-                let required = state.blocked_required_insert_count?;
-                (required <= insert_count).then_some(*stream_id)
-            })
-            .collect();
-        for stream_id in stream_ids {
+        debug_assert!(self.retry_streams.is_empty());
+        for entry in self.streams.values() {
+            let Some(required) = entry.state.blocked_required_insert_count else {
+                continue;
+            };
+            if required <= insert_count {
+                Self::enqueue(&mut self.retry_streams, entry.id)?;
+            }
+        }
+        while let Some(stream_id) = self.retry_streams.pop_front() {
             if stream_id.is_bidi() {
                 self.ingest_request_stream(stream_id, false, |_| {})?;
             } else {
@@ -1068,38 +1440,45 @@ impl Conn {
             if !state.saw_settings && !matches!(frame, Frame::Settings(_)) {
                 return Err(ConnError::MissingSettings);
             }
+            if self.role == Role::Client
+                && matches!(&frame, Frame::CancelPush { .. } | Frame::MaxPushId { .. })
+            {
+                return Err(ConnError::FrameUnexpected);
+            }
             match frame {
                 Frame::Settings(settings) => {
                     if state.saw_settings || self.peer_settings.is_some() {
                         return Err(ConnError::Protocol);
                     }
                     state.saw_settings = true;
+                    self.qpack_encoder
+                        .set_max_dynamic_capacity(settings.qpack_max_table_capacity);
                     self.peer_settings = Some(settings.clone());
                     self.qpack_encoder
                         .set_max_blocked_streams(settings.qpack_blocked_streams);
-                    self.events.push_back(Event::Settings(settings));
+                    Self::enqueue(&mut self.events, Event::Settings(settings))?;
                 }
                 Frame::CancelPush { push_id } => {
-                    self.events.push_back(Event::CancelPush {
-                        push_id: push_id.get(),
-                    });
+                    Self::enqueue(
+                        &mut self.events,
+                        Event::CancelPush {
+                            push_id: push_id.get(),
+                        },
+                    )?;
                 }
                 Frame::GoAway { id } => {
                     let id = id.get();
                     self.validate_goaway_id(id)?;
                     self.peer_goaway_id = Some(id);
-                    self.events.push_back(Event::GoAway { id });
+                    Self::enqueue(&mut self.events, Event::GoAway { id })?;
                 }
                 Frame::MaxPushId { push_id } => {
                     let push_id = push_id.get();
-                    if self.role == Role::Client {
-                        return Err(ConnError::FrameUnexpected);
-                    }
                     if self.max_push_id.is_some_and(|prev| push_id < prev) {
                         return Err(ConnError::Id);
                     }
                     self.max_push_id = Some(push_id);
-                    self.events.push_back(Event::MaxPushId { push_id });
+                    Self::enqueue(&mut self.events, Event::MaxPushId { push_id })?;
                 }
                 Frame::Unknown { .. } => {}
                 _ => return Err(ConnError::FrameUnexpected),
@@ -1124,7 +1503,7 @@ impl Conn {
         if state.push_id.is_none() {
             let (push_id, n) = match VarInt::decode(&state.inbound) {
                 Ok(v) => v,
-                Err(VarIntError::Underflow) => return Ok(()),
+                Err(varint::Error::Underflow) => return Ok(()),
                 Err(_) => return Err(ConnError::Protocol),
             };
             state.push_id = Some(push_id.get());
@@ -1148,23 +1527,11 @@ impl Conn {
         }
         Ok(())
     }
-
-    fn register_single_stream(
-        slot: &mut Option<StreamId>,
-        stream_id: StreamId,
-        err: ConnError,
-    ) -> Result<(), ConnError> {
-        if slot.is_some() {
-            return Err(err);
-        }
-        *slot = Some(stream_id);
-        Ok(())
-    }
 }
 
-impl Default for Conn {
+impl<P: HeadPlan> Default for Conn<P> {
     fn default() -> Self {
-        Self::new()
+        Self::from_config_with_plan(Role::Client, ValidatedConfig::default())
     }
 }
 
@@ -1183,6 +1550,8 @@ impl ConnError {
             Self::Id => ErrorCode::Id,
             Self::QpackEncoderStream => ErrorCode::QpackEncoderStream,
             Self::QpackDecoderStream => ErrorCode::QpackDecoderStream,
+            Self::Overload => ErrorCode::ExcessiveLoad,
+            Self::Message => ErrorCode::Message,
             Self::Protocol | Self::Parse(_) => ErrorCode::GeneralProtocol,
         }
     }

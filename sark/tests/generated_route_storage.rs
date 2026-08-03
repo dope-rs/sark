@@ -74,28 +74,22 @@ sark_gen::define_route! {
 #[test]
 fn sync_only_app_has_no_legacy_task_slab() {
     let state = ();
-    let timer = sark::Timer::with_capacity(1);
+    let timer = sark::Timer::new();
     let _ = SyncStorageApp::new::<dope_net::wire::identity::Identity>(
         &state,
         &timer,
-        sark::app::Config {
-            timer_capacity: 1,
-            task_capacity: 1,
-        },
+        sark::app::Config { task_capacity: 1 },
     );
 }
 
 #[test]
 fn mixed_app_uses_route_capacities() {
     let state = ();
-    let timer = sark::Timer::with_capacity(1);
+    let timer = sark::Timer::new();
     let _ = MixedStorageApp::new::<dope_net::wire::identity::Identity>(
         &state,
         &timer,
-        sark::app::Config {
-            timer_capacity: 1,
-            task_capacity: 4,
-        },
+        sark::app::Config { task_capacity: 4 },
     );
 }
 
@@ -113,15 +107,13 @@ fn async_and_stream_routes_poll_their_own_slabs() {
                     .with_storage(dope_net::link::egress::storage::Storage::default());
                 executor.enter(|mut session| {
                     let state = ();
-                    let timer =
-                        sark::Timer::with_capacity(support::MAX_CONNECTIONS.saturating_mul(2));
+                    let timer = sark::Timer::new();
                     server.clone().serve(
                         &mut session,
                         MixedStorageApp::new(
                             &state,
                             &timer,
                             sark::app::Config {
-                                timer_capacity: support::MAX_CONNECTIONS.saturating_mul(2),
                                 task_capacity: support::MAX_CONNECTIONS,
                             },
                         ),

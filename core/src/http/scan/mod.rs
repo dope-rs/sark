@@ -11,14 +11,20 @@ mod aarch64;
 mod x86_64;
 
 #[cfg(all(target_arch = "aarch64", target_feature = "neon"))]
-use aarch64 as backend;
+mod backend {
+    pub(super) use super::aarch64::{request_target_is_valid, scan_header_name, scan_header_value};
+}
 #[cfg(not(any(
     all(target_arch = "aarch64", target_feature = "neon"),
     target_arch = "x86_64"
 )))]
-use scalar as backend;
+mod backend {
+    pub(super) use super::scalar::{request_target_is_valid, scan_header_name, scan_header_value};
+}
 #[cfg(target_arch = "x86_64")]
-use x86_64 as backend;
+mod backend {
+    pub(super) use super::x86_64::{request_target_is_valid, scan_header_name, scan_header_value};
+}
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum HeaderNameOutcome {

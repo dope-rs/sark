@@ -6,7 +6,7 @@ use dope_fiber::raw::task::Context;
 use http::StatusCode;
 use o3::buffer::Shared;
 
-use super::wire_emit::{HeadWrite, TransferEncodingChunked};
+use super::wire_emit::{HeadWrite, ProvenWireWriter, TransferEncodingChunked};
 
 pub const CHUNK_TERMINATOR: &[u8; 5] = b"0\r\n\r\n";
 
@@ -55,12 +55,10 @@ impl<S> Stream<S> {
             headers: self.wire_headers.as_slice(),
             framing: TransferEncodingChunked,
         };
-        if out.len() < head.wire_len() {
-            return None;
-        }
-
-        let written = head.write(out, date);
-        Some((written.len, self.stream))
+        let head_len = head.wire_len();
+        let mut out = ProvenWireWriter::new(out, head_len)?;
+        head.emit(&mut out, date);
+        Some((out.finish(head_len), self.stream))
     }
 }
 

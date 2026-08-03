@@ -79,15 +79,13 @@ fn serve(client: impl FnOnce(SocketAddr)) {
                 let executor = Executor::new(driver_config)?
                     .with_storage(dope_net::link::egress::storage::Storage::default());
                 executor.enter(|mut session| {
-                    let timer =
-                        sark::Timer::with_capacity(support::MAX_CONNECTIONS.saturating_mul(2));
+                    let timer = sark::Timer::new();
                     server.clone().serve(
                         &mut session,
                         StreamDiscardDispatch::new(
                             &(),
                             &timer,
                             sark::app::Config {
-                                timer_capacity: support::MAX_CONNECTIONS.saturating_mul(2),
                                 task_capacity: support::MAX_CONNECTIONS,
                             },
                         ),

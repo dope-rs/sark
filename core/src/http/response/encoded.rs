@@ -1,7 +1,7 @@
 use http::StatusCode;
 use o3::buffer::Shared;
 
-use super::wire_emit::{ContentLength, HeadWrite, PLACEHOLDER_DATE};
+use super::wire_emit::{ContentLength, HeadWrite, PLACEHOLDER_DATE, ProvenWireWriter};
 use super::{
     DEFAULT_HEADER_CAPACITY, HeadInner, HeaderTemplate, Headers, StaticHeaderBytes,
     StaticHeaderFields, StaticHeaders,
@@ -101,12 +101,13 @@ where
         let head = self.head_write();
         let head_len = head.wire_len();
         let body_len = self.body_len;
-        let mut out = vec![0u8; head_len + body_len];
-        let written = head.write(&mut out, PLACEHOLDER_DATE);
-        self.body
-            .encode_into(&mut out[written.len..written.len + body_len])
-            .ok()?;
-        Some((out, written.date_offset))
+        let total = head_len.checked_add(body_len)?;
+        let mut out = vec![0u8; total];
+        let mut writer = ProvenWireWriter::exact(&mut out);
+        let date_offset = head.emit(&mut writer, PLACEHOLDER_DATE);
+        self.body.encode_into(writer.take_exact(body_len)).ok()?;
+        writer.finish(total);
+        Some((out, date_offset))
     }
 
     pub fn write_into_slice(&self, out: &mut [u8], date: &[u8; 29]) -> Option<usize> {
@@ -114,21 +115,19 @@ where
         let head_len = head.wire_len();
         let body_len = self.body_len;
         let total = head_len.checked_add(body_len)?;
-        if out.len() < total {
-            return None;
-        }
-        let written = head.write(out, date);
-        self.body.encode_into(&mut out[written.len..total]).ok()?;
-        Some(total)
+        let mut out = ProvenWireWriter::new(out, total)?;
+        head.emit(&mut out, date);
+        self.body.encode_into(out.take_exact(body_len)).ok()?;
+        Some(out.finish(total))
     }
 
     pub fn write_head_split(self, out: &mut [u8], date: &[u8; 29]) -> Option<(usize, Shared)> {
         let head = self.head_write();
-        if out.len() < head.wire_len() {
-            return None;
-        }
-        let written = head.write(out, date);
+        let head_len = head.wire_len();
+        let mut out = ProvenWireWriter::new(out, head_len)?;
+        head.emit(&mut out, date);
+        let written = out.finish(head_len);
         let body = self.body.into_shared(self.body_len).ok()?;
-        Some((written.len, body))
+        Some((written, body))
     }
 }

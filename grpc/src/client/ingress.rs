@@ -187,6 +187,7 @@ impl Ingress {
                     headers,
                     end_stream,
                     trailing,
+                    ..
                 } if trailing => {
                     let (status, trailers) = Status::parse_h2_trailers(&headers)?;
                     self.finish_stream(calls, egress, stream_id, status, trailers)?;

@@ -1,4 +1,4 @@
-use o3::cell::BrandCell as Branded;
+use o3::cell;
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpStream};
 use std::panic::AssertUnwindSafe;
@@ -20,13 +20,14 @@ use dope::runtime::trigger::ShutdownTrigger;
 use dope_fiber::abi::Fiber;
 use dope_fiber::abi::ready::Ready;
 use dope_fiber::raw::task::Context;
-use dope_net::link::egress::storage::Storage as EgressStorage;
+use dope_net::link::egress;
 use dope_net::tcp::Tcp;
 use dope_test::Harness;
 use o3::buffer::Shared;
+use o3::cell::RegionToken;
 use sark_h2::hpack::OwnedHeader;
 use sark_h2::server::{App, Body, Config, Env, Handler, Request, Response, serve, serve_sync};
-use sark_h2::{ClientRole, Conn, ErrorCode, Header, StreamId, conn};
+use sark_h2::{ClientRole, ConfigError, Conn, ErrorCode, Header, StreamId, conn};
 
 fn server_config(bind_addr: SocketAddr, max_handler_tasks: usize) -> Config {
     Config {
@@ -365,8 +366,8 @@ impl<'d, M: Manifold<'d>> Manifold<'d> for DropLive<M> {
         M::pre_park(unsafe { self.map_unchecked_mut(|s| &mut s.inner) }, driver);
     }
 
-    fn idle(self: Pin<&Self>) -> Idle {
-        M::idle(unsafe { self.map_unchecked(|s| &s.inner) })
+    fn idle(self: Pin<&Self>, region: &RegionToken<'d>) -> Idle {
+        M::idle(unsafe { self.map_unchecked(|s| &s.inner) }, region)
     }
 
     fn shutdown(self: Pin<&mut Self>, _driver: &mut DriverContext<'_, 'd>) {
@@ -408,8 +409,8 @@ impl<'d> Manifold<'d> for PanicIsolated<'d> {
         Manifold::pre_park(unsafe { self.map_unchecked_mut(|s| &mut s.inner) }, driver);
     }
 
-    fn idle(self: Pin<&Self>) -> Idle {
-        Manifold::idle(unsafe { self.map_unchecked(|s| &s.inner) })
+    fn idle(self: Pin<&Self>, region: &RegionToken<'d>) -> Idle {
+        Manifold::idle(unsafe { self.map_unchecked(|s| &s.inner) }, region)
     }
 
     fn shutdown(self: Pin<&mut Self>, driver: &mut DriverContext<'_, 'd>) {
@@ -450,9 +451,9 @@ fn serve_panic_isolated(
         egress: Default::default(),
     };
     let driver = dope::driver::Config::for_tcp_profile::<Throughput>(cfg.max_connections)
-        .with_provided(cfg.receive_buffer_bytes, cfg.receive_buffer_count);
+        .with_recv(cfg.receive_buffer_bytes, cfg.receive_buffer_count);
     Executor::with_seed(driver, context.seed())?
-        .with_storage((handler, EgressStorage::default()))
+        .with_storage((handler, egress::storage::Storage::default()))
         .enter(|mut session| {
             let (handler, egress) = session.storage();
             let hash_builder = session.seed().derive(dope::hash::domain::ACCEPT).state();
@@ -467,7 +468,7 @@ fn serve_panic_isolated(
                     &mut driver,
                 )?
             };
-            let dispatcher = std::pin::pin!(Branded::new(PanicDispatcher {
+            let dispatcher = std::pin::pin!(cell::BrandCell::new(PanicDispatcher {
                 listener: PanicIsolated { inner: listener },
             }));
             session.run(dispatcher.as_ref())
@@ -490,9 +491,9 @@ fn serve_drop_pending(
         egress: Default::default(),
     };
     let driver = dope::driver::Config::for_tcp_profile::<Throughput>(cfg.max_connections)
-        .with_provided(cfg.receive_buffer_bytes, cfg.receive_buffer_count);
+        .with_recv(cfg.receive_buffer_bytes, cfg.receive_buffer_count);
     Executor::with_seed(driver, context.seed())?
-        .with_storage((handler, EgressStorage::default()))
+        .with_storage((handler, egress::storage::Storage::default()))
         .enter(|mut session| {
             let (handler, egress) = session.storage();
             let hash_builder = session.seed().derive(dope::hash::domain::ACCEPT).state();
@@ -508,7 +509,7 @@ fn serve_drop_pending(
                 )?
             };
             let result = {
-                let dispatcher = std::pin::pin!(Branded::new(DropPendingDispatcher {
+                let dispatcher = std::pin::pin!(cell::BrandCell::new(DropPendingDispatcher {
                     listener: DropLive { inner: listener },
                 }));
                 session.run(dispatcher.as_ref())
@@ -752,6 +753,70 @@ fn pending_handler_resumes_from_its_task_waker() {
                 });
                 assert_eq!(header_value(&headers, b":status"), Some(&b"200"[..]));
                 assert_eq!(body, b"yielded");
+            },
+        )
+        .expect("harness");
+}
+
+#[test]
+fn app_rejects_invalid_handler_capacity_before_allocating() {
+    let mut config = server_config("127.0.0.1:0".parse().expect("address"), 0);
+    let error = match App::<_, dope_net::wire::identity::Identity>::new(&YieldEcho, config) {
+        Ok(_) => panic!("zero task capacity must fail"),
+        Err(error) => error,
+    };
+    assert_eq!(error, ConfigError::ZeroCapacity("handler task"));
+
+    if let Ok(overflow) = usize::try_from(u64::from(u32::MAX) + 1) {
+        config.max_handler_tasks = overflow;
+        let error = match App::<_, dope_net::wire::identity::Identity>::new(&YieldEcho, config) {
+            Ok(_) => panic!("unindexable task capacity must fail"),
+            Err(error) => error,
+        };
+        assert_eq!(error, ConfigError::HandlerCapacityOverflow);
+    }
+}
+
+#[test]
+fn pending_handlers_on_distinct_connections_keep_their_ready_routing() {
+    let harness = Harness::bind().expect("harness");
+    let bind = harness.addr();
+    let cfg = server_config(bind, 32);
+    harness
+        .run_with_trigger(
+            move |ctx, trigger| serve(YieldEcho, cfg, ctx, Some(trigger)),
+            |addr| {
+                let mut first_stream = TcpStream::connect(addr).expect("first connect");
+                let mut second_stream = TcpStream::connect(addr).expect("second connect");
+                first_stream
+                    .set_read_timeout(Some(Duration::from_secs(3)))
+                    .expect("first timeout");
+                second_stream
+                    .set_read_timeout(Some(Duration::from_secs(3)))
+                    .expect("second timeout");
+
+                let mut first = Conn::<ClientRole>::new();
+                let first_id = first
+                    .start_request(&request_headers(b"/first"), false)
+                    .expect("first request");
+                send_all(&mut first, first_id, b"first", true);
+                flush(&mut first_stream, &mut first);
+
+                let mut second = Conn::<ClientRole>::new();
+                let second_id = second
+                    .start_request(&request_headers(b"/second"), false)
+                    .expect("second request");
+                send_all(&mut second, second_id, b"second", true);
+                flush(&mut second_stream, &mut second);
+
+                assert_eq!(
+                    read_response(&mut first_stream, &mut first, first_id).1,
+                    b"first"
+                );
+                assert_eq!(
+                    read_response(&mut second_stream, &mut second, second_id).1,
+                    b"second"
+                );
             },
         )
         .expect("harness");

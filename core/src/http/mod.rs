@@ -6,6 +6,7 @@ mod prefixed_int;
 mod request;
 mod response;
 pub mod scan;
+mod section;
 
 pub mod codec;
 pub mod head;
@@ -16,9 +17,9 @@ pub mod __private {
 }
 
 pub use field::{
-    Field, FieldBlock, FieldStorage, FieldValueWriter, OwnedField, OwnedFieldBlock,
-    PackedFieldError, PackedFieldIter, PackedFieldRangeIter, PackedFields, PooledFieldBlock,
-    VecFieldBlock,
+    DecodedFieldBlock, Field, FieldBlock, FieldMatch, FieldStorage, FieldValueWriter, OwnedField,
+    OwnedFieldBlock, PackedFieldError, PackedFieldIter, PackedFieldRangeIter, PackedFields,
+    PooledFieldBlock, VecFieldBlock, match_field_candidates,
 };
 pub use http::{Method, StatusCode};
 pub use huffman::{
@@ -39,4 +40,9 @@ pub use response::{
     ResponseView, Serve, Shape, ShapeKind, ShapeMetadata, ShapeStream, StaticHeaderBytes,
     StaticHeaderFields, StaticHeaders, StaticResponseInner, StaticShape, Stream, StreamShape,
     StreamingShape, SyncShape, WireHeaderFields,
+};
+#[doc(hidden)]
+pub use section::{
+    HeadBlock, HeadBytes, HeadConsumer, HeadDecision, HeadDisposition, HeadPlan, HeadSection,
+    HeadTag, KnownHeadName, PlannedFieldIter, PlannedFields, PlannedHead, RawHeadPlan,
 };

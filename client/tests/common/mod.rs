@@ -13,10 +13,10 @@ use dope::manifold::connector::source::health::Static;
 use dope::manifold::env::Bundle;
 use dope::runtime::executor::Executor;
 use dope::runtime::profile::Balanced;
-use dope_fiber::extensions::SessionExt as _;
+use dope_fiber::extensions::SessionExt;
 use dope_net::tcp::Tcp;
 use dope_net::wire::identity::Identity;
-use o3::cell::BrandCell as Branded;
+use o3::cell;
 use sark_client::connector::{Config, HttpHandle, Port, Session};
 
 pub(crate) type PlainHttp<'d> =
@@ -57,7 +57,7 @@ pub(crate) fn run_gets(
             )
             .expect("connector")
         };
-        let rt = pin!(Branded::new(ConnRt {
+        let rt = pin!(cell::BrandCell::new(ConnRt {
             conn,
             _ph: PhantomData,
         }));
@@ -106,7 +106,7 @@ pub(crate) fn run_gets_with_gap(
             )
             .expect("connector")
         };
-        let rt = pin!(Branded::new(ConnRt {
+        let rt = pin!(cell::BrandCell::new(ConnRt {
             conn,
             _ph: PhantomData,
         }));
@@ -155,7 +155,7 @@ pub(crate) fn run_get(
             Connector::new(Session::new(port), upstreams, 1, port.egress(), &mut driver)
                 .expect("connector")
         };
-        let rt = pin!(Branded::new(ConnRt {
+        let rt = pin!(cell::BrandCell::new(ConnRt {
             conn,
             _ph: PhantomData,
         }));
@@ -192,7 +192,7 @@ pub(crate) fn run_stream_get(
             Connector::new(Session::new(port), upstreams, 1, port.egress(), &mut driver)
                 .expect("connector")
         };
-        let rt = pin!(Branded::new(ConnRt {
+        let rt = pin!(cell::BrandCell::new(ConnRt {
             conn,
             _ph: PhantomData,
         }));

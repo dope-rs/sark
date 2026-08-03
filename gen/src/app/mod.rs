@@ -89,8 +89,7 @@ mod tests {
         assert!(generated.contains("__pin_project"));
         assert!(generated.contains("__task_slot_0000"));
         assert!(generated.contains("__task_slot_0001"));
-        assert!(generated.contains("try_into_task"));
-        assert!(generated.contains("RequestTask"));
+        assert!(generated.contains("invoke_task"));
         assert!(generated.contains("FiberRoute"));
         assert!(generated.contains("StreamRoute"));
         assert!(generated.contains("state : & 'env"));
@@ -104,6 +103,8 @@ mod tests {
             "manifold :: ready",
             "OwnerFiber",
             "FiberScope",
+            "RequestTask",
+            "try_into_task",
             "routes :",
             "get_unchecked_mut",
             "into_inner_unchecked",

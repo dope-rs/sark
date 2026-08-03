@@ -20,16 +20,16 @@ dope-fiber.workspace = true
 dope-gen.workspace = true
 o3.workspace = true
 dope-tls.workspace = true
-shin = "0.13"
-http = "1.4.2"
+shin.workspace = true
+http = "1.5.0"
 memchr = "2.8"
 pin-project.workspace = true
 pin-project-lite.workspace = true
 
 [dev-dependencies]
-cartel-redis = "0.9"
-cartel-pg = "0.9"
-cartel-gen = "0.9"
+cartel-redis.workspace = true
+cartel-pg.workspace = true
+cartel-gen.workspace = true
 dope-test.workspace = true
 criterion = { version = "0.8", default-features = false, features = ["cargo_bench_support"] }
 trybuild = "1"

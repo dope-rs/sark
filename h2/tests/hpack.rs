@@ -517,6 +517,21 @@ mod size_setting {
     }
 
     #[test]
+    fn encoder_reconciles_decrease_then_increase() {
+        let mut encoder = Encoder::new(4096);
+        encoder.set_max_size(1024);
+        encoder.set_max_size(2048);
+        let mut block = Vec::new();
+        encoder.encode(std::iter::empty::<Header>(), &mut block);
+
+        let (reset, reset_len) = PrefixedInt::<5>::decode(&block).unwrap();
+        let (final_size, final_len) = PrefixedInt::<5>::decode(&block[reset_len..]).unwrap();
+        assert_eq!(reset.get(), 0);
+        assert_eq!(final_size.get(), 2048);
+        assert_eq!(reset_len + final_len, block.len());
+    }
+
+    #[test]
     fn decoder_rejects_size_update_after_a_field() {
         let bytes = [0x82, 0x20];
         let mut decoder = Decoder::new(4096);

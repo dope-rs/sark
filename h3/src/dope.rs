@@ -2,25 +2,26 @@ use std::collections::{BTreeSet, HashMap};
 use std::iter;
 use std::mem;
 
-use dope_quic::{ConnHandle, Handler, SendBuffer, StreamError, StreamEvent};
+use dope_quic::conn::Handle;
+use dope_quic::{Handler, SendBuffer};
 use o3::buffer::{Bytes, InlineBytes, Retained, Shared};
 use sark::dispatch::{BodyPlan, BodySource, Decode, PreparedRequest};
 use sark::service::BodyPolicy;
-use sark_core::http::{Body, Field, ResponseSink, StatusCode};
+use sark_core::http::{Body, Field, HeadPlan, PlannedHead, RawHeadPlan, ResponseSink, StatusCode};
 
 use crate::{
-    Conn, ConnError, ErrorCode, Event, Payload, Role, StreamId, StreamTransport, pump_stream_event,
-    pump_writes,
+    Config, ConfigError, Conn, ConnError, ErrorCode, Event, Payload, Role, StreamId,
+    StreamTransport, ValidatedConfig, pump_stream_event, pump_writes,
 };
 
 #[derive(Debug)]
 pub enum Error {
-    QuicStream(StreamError),
+    QuicStream(dope_quic::conn::stream::Error),
     H3(ConnError),
 }
 
-impl From<StreamError> for Error {
-    fn from(err: StreamError) -> Self {
+impl From<dope_quic::conn::stream::Error> for Error {
+    fn from(err: dope_quic::conn::stream::Error) -> Self {
         Self::QuicStream(err)
     }
 }
@@ -32,17 +33,17 @@ impl From<ConnError> for Error {
 }
 
 pub struct QuicTransport<'a> {
-    conn: &'a mut dope_quic::Conn,
+    conn: &'a mut dope_quic::conn::Connection,
 }
 
 impl<'a> QuicTransport<'a> {
-    pub fn new(conn: &'a mut dope_quic::Conn) -> Self {
+    pub fn new(conn: &'a mut dope_quic::conn::Connection) -> Self {
         Self { conn }
     }
 }
 
 impl StreamTransport for QuicTransport<'_> {
-    type SendError = StreamError;
+    type SendError = dope_quic::conn::stream::Error;
 
     fn recv_stream(&mut self, stream_id: u64) -> Option<Vec<u8>> {
         self.conn.stream_recv_owned(stream_id)
@@ -82,12 +83,57 @@ impl StreamTransport for QuicTransport<'_> {
     fn finish_stream(&mut self, stream_id: u64) -> Result<(), Self::SendError> {
         self.conn.stream_send_fin(stream_id)
     }
+
+    fn send_write(&mut self, write: crate::Write) -> Result<(), Self::SendError> {
+        let first = match write.prefix {
+            crate::WritePrefix::Inline(bytes) => SendBuffer::Inline(bytes),
+            crate::WritePrefix::Owned(bytes) => SendBuffer::Owned(bytes),
+        };
+        let second = write.payload.map(|payload| match payload {
+            crate::WritePayload::Owned(bytes) => SendBuffer::Owned(bytes),
+            crate::WritePayload::Retained(bytes) => SendBuffer::Retained(bytes),
+        });
+        self.conn
+            .stream_send_parts(write.stream_id.0, first, second, write.fin)
+    }
 }
 
-pub struct Session {
-    h3: Conn,
-    fin_pumped: BTreeSet<u64>,
+pub struct Session<P: HeadPlan = RawHeadPlan> {
+    h3: Conn<P>,
+    finished_streams: FinishedStreams,
     control_stream_id: Option<u64>,
+}
+
+#[derive(Default)]
+struct FinishedStreams {
+    contiguous: [u64; 4],
+    out_of_order: BTreeSet<u64>,
+}
+
+impl FinishedStreams {
+    fn contains(&self, id: u64) -> bool {
+        (id >> 2) < self.contiguous[(id & 0x3) as usize] || self.out_of_order.contains(&id)
+    }
+
+    fn insert(&mut self, id: u64) {
+        let stream_type = (id & 0x3) as usize;
+        let index = id >> 2;
+        let contiguous = &mut self.contiguous[stream_type];
+        if index < *contiguous {
+            return;
+        }
+        if index > *contiguous {
+            self.out_of_order.insert(id);
+            return;
+        }
+        *contiguous += 1;
+        while self
+            .out_of_order
+            .remove(&((*contiguous << 2) | stream_type as u64))
+        {
+            *contiguous += 1;
+        }
+    }
 }
 
 impl Session {
@@ -96,22 +142,39 @@ impl Session {
     }
 
     pub fn with_role(role: Role) -> Self {
+        Self::from_config(role, ValidatedConfig::default())
+    }
+
+    pub fn with_config(role: Role, config: Config) -> Result<Self, ConfigError> {
+        Ok(Self::from_config(role, ValidatedConfig::new(config)?))
+    }
+
+    pub fn from_config(role: Role, config: ValidatedConfig) -> Self {
+        Self::from_config_with_plan(role, config)
+    }
+}
+
+impl<P: HeadPlan> Session<P> {
+    pub fn from_config_with_plan(role: Role, config: ValidatedConfig) -> Self {
         Self {
-            h3: Conn::with_role(role),
-            fin_pumped: BTreeSet::new(),
+            h3: Conn::from_config_with_plan(role, config),
+            finished_streams: FinishedStreams::default(),
             control_stream_id: None,
         }
     }
 
-    pub fn h3(&self) -> &crate::Conn {
+    pub fn h3(&self) -> &crate::Conn<P> {
         &self.h3
     }
 
-    pub fn h3_mut(&mut self) -> &mut crate::Conn {
+    pub fn h3_mut(&mut self) -> &mut crate::Conn<P> {
         &mut self.h3
     }
 
-    pub fn start_control_stream(&mut self, quic: &mut dope_quic::Conn) -> Result<u64, Error> {
+    pub fn start_control_stream(
+        &mut self,
+        quic: &mut dope_quic::conn::Connection,
+    ) -> Result<u64, Error> {
         let stream_id = quic.open_uni_stream()?;
         self.h3.start_control_stream(StreamId::new(stream_id))?;
         self.control_stream_id = Some(stream_id);
@@ -119,51 +182,64 @@ impl Session {
         Ok(stream_id)
     }
 
-    pub fn open_request_stream(&mut self, quic: &mut dope_quic::Conn) -> Result<u64, Error> {
+    pub fn open_request_stream(
+        &mut self,
+        quic: &mut dope_quic::conn::Connection,
+    ) -> Result<u64, Error> {
         Ok(quic.open_bidi_stream()?)
     }
 
     pub fn quic_stream_event(
         &mut self,
-        quic: &mut dope_quic::Conn,
-        event: StreamEvent,
+        quic: &mut dope_quic::conn::Connection,
+        event: dope_quic::conn::stream::Event,
+    ) -> Result<(), Error> {
+        self.receive_stream_event(quic, event)?;
+        self.flush(quic)
+    }
+
+    fn receive_stream_event(
+        &mut self,
+        quic: &mut dope_quic::conn::Connection,
+        event: dope_quic::conn::stream::Event,
     ) -> Result<(), Error> {
         let stream_id = match event {
-            StreamEvent::Data { stream_id } | StreamEvent::Finished { stream_id } => stream_id,
-            StreamEvent::Reset {
+            dope_quic::conn::stream::Event::Data { stream_id }
+            | dope_quic::conn::stream::Event::Finished { stream_id } => stream_id,
+            dope_quic::conn::stream::Event::Reset {
                 stream_id,
                 error_code,
             } => {
-                self.h3.ingest_reset(StreamId::new(stream_id), error_code);
-                self.fin_pumped.insert(stream_id);
+                self.h3.ingest_reset(StreamId::new(stream_id), error_code)?;
+                self.finished_streams.insert(stream_id);
                 return Ok(());
             }
-            StreamEvent::Stopped {
+            dope_quic::conn::stream::Event::Stopped {
                 stream_id,
                 error_code,
             } => {
-                self.h3.ingest_stopped(StreamId::new(stream_id), error_code);
+                self.h3
+                    .ingest_stopped(StreamId::new(stream_id), error_code)?;
                 return Ok(());
             }
         };
-        if self.fin_pumped.contains(&stream_id) {
+        if self.finished_streams.contains(stream_id) {
             return Ok(());
         }
         let mut transport = QuicTransport::new(quic);
         pump_stream_event(&mut self.h3, &mut transport, stream_id)?;
         if transport.conn.stream_recv_eof(stream_id) {
-            self.fin_pumped.insert(stream_id);
+            self.finished_streams.insert(stream_id);
         }
-        self.flush(transport.conn)?;
         Ok(())
     }
 
-    pub fn flush(&mut self, quic: &mut dope_quic::Conn) -> Result<(), Error> {
+    pub fn flush(&mut self, quic: &mut dope_quic::conn::Connection) -> Result<(), Error> {
         let mut transport = QuicTransport::new(quic);
         pump_writes(&mut self.h3, &mut transport).map_err(Error::QuicStream)
     }
 
-    pub fn poll_event(&mut self) -> Option<Event> {
+    pub fn poll_event(&mut self) -> Option<Event<P::Selection, P::Block>> {
         self.h3.poll_event()
     }
 
@@ -172,20 +248,20 @@ impl Session {
     }
 }
 
-impl Default for Session {
+impl<P: HeadPlan> Default for Session<P> {
     fn default() -> Self {
-        Self::new()
+        Self::from_config_with_plan(Role::Client, ValidatedConfig::default())
     }
 }
 
-pub struct H3Encoder<'a> {
-    conn: &'a mut Conn,
+pub struct H3Encoder<'a, P: HeadPlan = RawHeadPlan> {
+    conn: &'a mut Conn<P>,
     stream_id: StreamId,
     ok: bool,
 }
 
-impl<'a> H3Encoder<'a> {
-    pub fn new(conn: &'a mut Conn, stream_id: StreamId) -> Self {
+impl<'a, P: HeadPlan> H3Encoder<'a, P> {
+    pub fn new(conn: &'a mut Conn<P>, stream_id: StreamId) -> Self {
         Self {
             conn,
             stream_id,
@@ -198,7 +274,7 @@ impl<'a> H3Encoder<'a> {
     }
 }
 
-impl ResponseSink for H3Encoder<'_> {
+impl<P: HeadPlan> ResponseSink for H3Encoder<'_, P> {
     fn emit<'a, 'body, I>(&mut self, status: StatusCode, headers: I, body: Body<'body>)
     where
         I: Iterator<Item = Field<'a>>,
@@ -240,16 +316,19 @@ impl ResponseSink for H3Encoder<'_> {
 const DEFAULT_MAX_BODY_CHUNKS: usize = 4096;
 
 /// Resource bounds for the built-in HTTP/3 server adapter.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 pub struct ServerConfig {
     /// Maximum number of retained DATA payloads per buffered request.
     pub max_body_chunks: usize,
+    /// Validated per-connection HTTP/3 protocol limits.
+    pub protocol: ValidatedConfig,
 }
 
 impl Default for ServerConfig {
     fn default() -> Self {
         Self {
             max_body_chunks: DEFAULT_MAX_BODY_CHUNKS,
+            protocol: ValidatedConfig::default(),
         }
     }
 }
@@ -408,15 +487,15 @@ impl BodySource for PendingBody {
     }
 }
 
-struct ServerSession<P> {
-    h3: Session,
+/// HTTP/3 state owned directly by one QUIC connection slot.
+pub struct ServerSession<P, F: HeadPlan> {
+    h3: Session<F>,
     pending: HashMap<u64, Pending<P>>,
 }
 
 pub struct Server<R: Decode> {
     router: R,
     config: ServerConfig,
-    sessions: HashMap<ConnHandle, ServerSession<R::Prepared>>,
 }
 
 impl<R: Decode> Server<R> {
@@ -425,11 +504,7 @@ impl<R: Decode> Server<R> {
     }
 
     pub fn with_config(router: R, config: ServerConfig) -> Self {
-        Self {
-            router,
-            config,
-            sessions: HashMap::new(),
-        }
+        Self { router, config }
     }
 
     pub fn router(&self) -> &R {
@@ -438,39 +513,29 @@ impl<R: Decode> Server<R> {
 }
 
 impl<R: Decode> Server<R> {
-    fn respond(router: &R, h3: &mut Session, stream_id: StreamId, pending: Pending<R::Prepared>) {
+    fn respond(
+        router: &R,
+        h3: &mut Session<R::Plan>,
+        stream_id: StreamId,
+        pending: Pending<R::Prepared>,
+    ) {
         let mut encoder = H3Encoder::new(h3.h3_mut(), stream_id);
         let _ = router.dispatch_prepared(pending.prepared, pending.body, &mut encoder);
     }
-}
 
-impl<R: Decode> Handler for Server<R> {
-    fn established(&mut self, conn: &mut dope_quic::Conn, handle: ConnHandle) {
-        let mut h3 = Session::with_role(Role::Server);
-        if h3.start_control_stream(conn).is_err() {
-            conn.close(ErrorCode::Internal as u64, Vec::new());
-            return;
-        }
-        self.sessions.insert(
-            handle,
-            ServerSession {
-                h3,
-                pending: HashMap::new(),
-            },
-        );
-    }
-
-    fn stream_event(&mut self, conn: &mut dope_quic::Conn, handle: ConnHandle, event: StreamEvent) {
-        let Self {
-            router,
-            config,
-            sessions,
-        } = self;
-        let Some(session) = sessions.get_mut(&handle) else {
-            return;
-        };
-        if session.h3.quic_stream_event(conn, event).is_err() {
-            conn.close(ErrorCode::Internal as u64, Vec::new());
+    fn handle_stream_event<const FLUSH: bool>(
+        &mut self,
+        session: &mut ServerSession<R::Prepared, R::Plan>,
+        conn: &mut dope_quic::conn::Connection,
+        event: dope_quic::conn::stream::Event,
+    ) {
+        let Self { router, config } = self;
+        if let Err(error) = session.h3.receive_stream_event(conn, event) {
+            let code = match error {
+                Error::H3(error) => error.error_code(),
+                Error::QuicStream(_) => ErrorCode::Internal,
+            };
+            conn.close(code as u64, Vec::new());
             return;
         }
         while let Some(event) = session.h3.poll_event() {
@@ -478,10 +543,21 @@ impl<R: Decode> Handler for Server<R> {
                 Event::Headers {
                     stream_id,
                     fields,
-                    trailing,
+                    selection,
+                    section,
                 } => {
-                    if !trailing && let Ok(prepared) = router.prepare_decoded(fields) {
+                    if !section.trailing()
+                        && let Ok(prepared) =
+                            router.prepare_planned_head(PlannedHead::new(fields, selection))
+                    {
                         match Pending::new(prepared) {
+                            Ok(pending) if section.end_stream() => {
+                                if !pending.content_length_matches() {
+                                    conn.close(ErrorCode::Message as u64, Vec::new());
+                                    return;
+                                }
+                                Self::respond(router, &mut session.h3, stream_id, pending);
+                            }
                             Ok(pending) => {
                                 session.pending.insert(stream_id.0, pending);
                             }
@@ -512,22 +588,84 @@ impl<R: Decode> Handler for Server<R> {
                 _ => {}
             }
         }
-        if session.h3.flush(conn).is_err() {
+        if FLUSH && session.h3.flush(conn).is_err() {
             conn.close(ErrorCode::Internal as u64, Vec::new());
         }
     }
+}
 
-    fn close(&mut self, handle: ConnHandle) {
-        self.sessions.remove(&handle);
+impl<R: Decode> Handler for Server<R> {
+    type Connection = ServerSession<R::Prepared, R::Plan>;
+
+    fn create_connection(
+        &mut self,
+        _conn: &mut dope_quic::conn::Connection,
+        _handle: Handle,
+    ) -> Self::Connection {
+        ServerSession {
+            h3: Session::from_config_with_plan(Role::Server, self.config.protocol.clone()),
+            pending: HashMap::new(),
+        }
+    }
+
+    fn established(
+        &mut self,
+        session: &mut Self::Connection,
+        conn: &mut dope_quic::conn::Connection,
+        _handle: Handle,
+    ) {
+        if session.h3.start_control_stream(conn).is_err() {
+            conn.close(ErrorCode::Internal as u64, Vec::new());
+            return;
+        }
+    }
+
+    fn stream_event(
+        &mut self,
+        session: &mut Self::Connection,
+        conn: &mut dope_quic::conn::Connection,
+        _handle: Handle,
+        event: dope_quic::conn::stream::Event,
+    ) {
+        self.handle_stream_event::<true>(session, conn, event);
+    }
+
+    fn early_stream_event(
+        &mut self,
+        session: &mut Self::Connection,
+        conn: &mut dope_quic::conn::Connection,
+        _handle: Handle,
+        event: dope_quic::conn::stream::Event,
+    ) {
+        self.handle_stream_event::<false>(session, conn, event);
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{BodyError, Pending, PendingBody};
+    use super::{BodyError, FinishedStreams, Pending, PendingBody};
     use crate::Payload;
     use sark::dispatch::{BodyPlan, BodySource, PreparedRequest};
     use sark::service::BodyPolicy;
+
+    #[test]
+    fn finished_streams_compact_in_order_and_close_gaps() {
+        let mut streams = FinishedStreams::default();
+        streams.insert(8);
+        assert!(streams.contains(8));
+        assert!(!streams.contains(0));
+
+        streams.insert(0);
+        streams.insert(4);
+        assert!(streams.contains(0));
+        assert!(streams.contains(4));
+        assert!(streams.contains(8));
+        assert!(streams.out_of_order.is_empty());
+
+        streams.insert(3);
+        assert!(streams.contains(3));
+        assert!(!streams.contains(7));
+    }
 
     #[test]
     fn pending_body_keeps_a_single_data_allocation() {

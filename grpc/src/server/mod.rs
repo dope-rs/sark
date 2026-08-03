@@ -26,7 +26,7 @@ use dope::runtime::profile::Throughput;
 use dope::runtime::trigger::ShutdownTrigger;
 use dope::{DriverContext, manifold};
 use dope::{hash::domain::ACCEPT, manifold::Outcome};
-use dope_net::link::egress::storage::Storage as EgressStorage;
+use dope_net::link;
 use dope_net::link::slot::Slot;
 use dope_net::tcp::{Tcp, listener};
 use dope_net::wire::Wire;
@@ -222,8 +222,8 @@ impl Config {
         shutdown: Option<&ShutdownTrigger>,
     ) -> io::Result<()> {
         let driver = dope::driver::Config::for_tcp_profile::<Throughput>(self.max_connections);
-        let exec =
-            Executor::with_seed(driver, context.seed())?.with_storage(EgressStorage::default());
+        let exec = Executor::with_seed(driver, context.seed())?
+            .with_storage(link::egress::storage::Storage::default());
         exec.enter(|mut sess| {
             let egress = sess.storage();
             let hash_builder = sess.seed().derive(ACCEPT).state();
@@ -258,8 +258,8 @@ impl Config {
         let driver = dope::driver::Config::for_tcp_profile::<Throughput>(self.max_connections);
         let tls_storage = SessionStorage::try_with_capacity(self.max_connections)?;
         let exec = Executor::with_seed(driver, context.seed())?.with_storage((
-            EgressStorage::default(),
-            EgressStorage::default(),
+            link::egress::storage::Storage::default(),
+            link::egress::storage::Storage::default(),
             tls_storage,
         ));
         exec.enter(|mut sess| {
@@ -326,7 +326,7 @@ mod liveness {
 
         pub(super) fn respond<'d, W: Wire, C: Default + 'static>(
             slot: &mut Slot<'d, W, State<C>>,
-            egress: &mut EgressCtx<'_, '_>,
+            egress: &mut EgressCtx<'_, 'd, '_>,
             driver: &mut DriverContext<'_, 'd>,
         ) {
             if slot.is_send_inflight() {
@@ -350,7 +350,7 @@ mod liveness {
         fn chunk<R: RetainBytes>(
             _app: Pin<&mut Liveness>,
             slot: &mut Slot<'d, Identity, State<()>>,
-            mut egress: EgressCtx<'_, '_>,
+            mut egress: EgressCtx<'_, 'd, '_>,
             _chunk: R,
             driver: &mut DriverContext<'_, 'd>,
         ) -> Outcome {
@@ -1287,6 +1287,7 @@ impl<H: Handler, W: Wire> App<H, W> {
                 headers,
                 end_stream,
                 trailing,
+                ..
             } if trailing => {
                 self.trailers(state, stream_id, headers);
                 if end_stream {
@@ -1477,7 +1478,7 @@ impl<H: Handler, W: Wire> App<H, W> {
 
     fn flush_into_proj<'d, C: Default + 'static, P: Fn(&mut C) -> &mut ConnState>(
         slot: &mut Slot<'d, W, State<C>>,
-        egress: &mut EgressCtx<'_, '_>,
+        egress: &mut EgressCtx<'_, 'd, '_>,
         driver: &mut DriverContext<'_, 'd>,
         close_after: bool,
         project: &P,
@@ -1508,7 +1509,7 @@ impl<H: Handler, W: Wire> App<H, W> {
         slot: &mut Slot<'d, W, State<C>>,
         project: impl Fn(&mut C) -> &mut ConnState,
         chunk: R,
-        egress: &mut EgressCtx<'_, '_>,
+        egress: &mut EgressCtx<'_, 'd, '_>,
         driver: &mut DriverContext<'_, 'd>,
     ) -> Outcome {
         let bytes = chunk.as_slice();
@@ -1542,7 +1543,7 @@ impl<H: Handler, W: Wire> App<H, W> {
         slot: &mut Slot<'d, W, State<C>>,
         _sent: usize,
         project: impl Fn(&mut C) -> &mut ConnState,
-        egress: &mut EgressCtx<'_, '_>,
+        egress: &mut EgressCtx<'_, 'd, '_>,
         driver: &mut DriverContext<'_, 'd>,
     ) {
         let close_after = project(&mut slot.state.conn).h2.goaway_sent();
@@ -1553,7 +1554,7 @@ impl<H: Handler, W: Wire> App<H, W> {
         &mut self,
         slot: &mut Slot<'d, W, State<C>>,
         project: impl Fn(&mut C) -> &mut ConnState,
-        egress: &mut EgressCtx<'_, '_>,
+        egress: &mut EgressCtx<'_, 'd, '_>,
         driver: &mut DriverContext<'_, 'd>,
     ) {
         let close_after = project(&mut slot.state.conn).h2.goaway_sent();
@@ -1578,7 +1579,7 @@ impl<'d, H: Handler, W: Wire> ApplicationHooks<'d, App<H, W>> for App<H, W> {
     fn chunk<R: RetainBytes>(
         app: Pin<&mut App<H, W>>,
         slot: &mut Slot<'d, W, State<ConnState>>,
-        mut egress: EgressCtx<'_, '_>,
+        mut egress: EgressCtx<'_, 'd, '_>,
         chunk: R,
         driver: &mut DriverContext<'_, 'd>,
     ) -> manifold::Outcome {
@@ -1589,7 +1590,7 @@ impl<'d, H: Handler, W: Wire> ApplicationHooks<'d, App<H, W>> for App<H, W> {
     fn send(
         app: Pin<&mut App<H, W>>,
         slot: &mut Slot<'d, W, State<ConnState>>,
-        mut egress: EgressCtx<'_, '_>,
+        mut egress: EgressCtx<'_, 'd, '_>,
         sent: usize,
         driver: &mut DriverContext<'_, 'd>,
     ) {
@@ -1604,7 +1605,7 @@ impl<'d, H: Handler, W: Wire> ApplicationHooks<'d, App<H, W>> for App<H, W> {
     fn activate(
         app: Pin<&mut App<H, W>>,
         slot: &mut Slot<'d, W, State<ConnState>>,
-        mut egress: EgressCtx<'_, '_>,
+        mut egress: EgressCtx<'_, 'd, '_>,
         driver: &mut DriverContext<'_, 'd>,
     ) {
         app.get_mut()

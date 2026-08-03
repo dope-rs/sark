@@ -6,8 +6,8 @@ use std::time::Duration;
 use dope::manifold::file::{FileManifold, Files};
 use dope::runtime::executor::{Executor, Session};
 use dope_fiber::abi::Fiber;
-use dope_fiber::extensions::SessionExt as _;
-use o3::cell::BrandCell as Branded;
+use dope_fiber::extensions::SessionExt;
+use o3::cell;
 use sark::fs::ServeDir;
 use sark_core::http::{Response, StatusCode};
 
@@ -63,7 +63,7 @@ impl Drop for Fixture {
 
 fn run<'scope, 'd, F, T>(
     sess: &mut FileSession<'scope, 'd>,
-    host: Pin<&Branded<'d, Host<'d, 'scope>>>,
+    host: Pin<&cell::BrandCell<'d, Host<'d, 'scope>>>,
     fut: F,
 ) -> T
 where
@@ -79,7 +79,7 @@ fn cfg() -> dope::driver::Config {
 fn enter<R>(
     f: impl for<'scope, 'd> FnOnce(
         &mut FileSession<'scope, 'd>,
-        Pin<&Branded<'d, Host<'d, 'scope>>>,
+        Pin<&cell::BrandCell<'d, Host<'d, 'scope>>>,
         &'scope Files<'d, ID, SLOTS>,
     ) -> R,
 ) -> R {
@@ -88,7 +88,7 @@ fn enter<R>(
         .with_storage_factory(Files::<ID, SLOTS>::factory())
         .enter(|mut sess| {
             let files = sess.storage();
-            let manifold = pin!(Branded::new(Host {
+            let manifold = pin!(cell::BrandCell::new(Host {
                 files: files.manifold(),
             }));
             f(&mut sess, manifold.as_ref(), files)
@@ -97,7 +97,7 @@ fn enter<R>(
 
 fn serve_one<'scope, 'd>(
     sess: &mut FileSession<'scope, 'd>,
-    host: Pin<&Branded<'d, Host<'d, 'scope>>>,
+    host: Pin<&cell::BrandCell<'d, Host<'d, 'scope>>>,
     files: &'scope Files<'d, ID, SLOTS>,
     serve: &ServeDir,
     rel: &[u8],

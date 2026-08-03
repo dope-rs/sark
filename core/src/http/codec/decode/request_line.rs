@@ -1,4 +1,5 @@
 use std::ops::Range;
+use std::{error, fmt};
 
 const ALL_METHODS: u8 = (1 << 7) - 1;
 const SPACE_WORD: u64 = u64::from_le_bytes(*b"        ");
@@ -20,6 +21,17 @@ pub enum MethodKey {
     Options,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RequestLineError;
+
+impl fmt::Display for RequestLineError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("malformed HTTP request line")
+    }
+}
+
+impl error::Error for RequestLineError {}
+
 impl MethodKey {
     #[doc(hidden)]
     pub const fn bit(self) -> u8 {
@@ -36,7 +48,7 @@ pub struct RequestLine<'a> {
 }
 
 impl RequestLine<'_> {
-    pub fn parse(buf: &[u8]) -> Result<Option<RequestLine<'_>>, ()> {
+    pub fn parse(buf: &[u8]) -> Result<Option<RequestLine<'_>>, RequestLineError> {
         let mut method = None;
         Self::parse_for::<ALL_METHODS>(buf, &mut method)
     }
@@ -45,8 +57,7 @@ impl RequestLine<'_> {
     pub fn parse_for<'a, const METHODS: u8>(
         buf: &'a [u8],
         method_slot: &mut Option<MethodKey>,
-    ) -> Result<Option<RequestLine<'a>>, ()> {
-        *method_slot = None;
+    ) -> Result<Option<RequestLine<'a>>, RequestLineError> {
         let parsed = 'parse: {
             let (method_end, method_key) = match known_method::<METHODS>(buf) {
                 Some(known) => (known.0, Some(known.1)),
@@ -69,12 +80,13 @@ impl RequestLine<'_> {
             let Some(target_bytes) = buf.get(target_start..) else {
                 break 'parse None;
             };
-            let target_len = if target_bytes.first() == Some(&b'\r') {
-                break 'parse None;
-            } else if target_bytes.get(1) == Some(&b' ') {
+            let target_len = if target_bytes.get(1) == Some(&b' ') {
+                if target_bytes[0] == b'\r' {
+                    break 'parse None;
+                }
                 1
-            } else if let Some(word) = target_bytes.get(..8) {
-                let word = u64::from_le_bytes(word.try_into().expect("eight-byte slice"));
+            } else if let Some(word) = target_bytes.first_chunk::<8>() {
+                let word = u64::from_le_bytes(*word);
                 let space_x = word ^ SPACE_WORD;
                 let spaces = space_x.wrapping_sub(BYTE_LO) & !space_x & BYTE_HI;
                 let cr_x = word ^ CR_WORD;
@@ -115,7 +127,9 @@ impl RequestLine<'_> {
             let Some(suffix) = buf.get(version_start..version_start + 10) else {
                 break 'parse None;
             };
-            let version: &[u8; 8] = suffix[..8].try_into().expect("eight-byte version");
+            let Some(version) = suffix.first_chunk::<8>() else {
+                break 'parse None;
+            };
             let version_word = u64::from_ne_bytes(*version);
             if ((version_word ^ VERSION_BASE) & VERSION_MASK) != 0
                 || suffix[8] != b'\r'
@@ -135,7 +149,10 @@ impl RequestLine<'_> {
 
         match parsed {
             Some(request) => Ok(Some(request)),
-            None => reject(buf),
+            None => {
+                *method_slot = None;
+                reject(buf)
+            }
         }
     }
 }
@@ -160,11 +177,11 @@ fn known_method<const METHODS: u8>(buf: &[u8]) -> Option<(usize, MethodKey)> {
     }
 }
 
-fn reject<T>(buf: &[u8]) -> Result<Option<T>, ()> {
+fn reject<T>(buf: &[u8]) -> Result<Option<T>, RequestLineError> {
     match memchr::memchr(b'\r', buf) {
         None => Ok(None),
         Some(end) if end + 1 == buf.len() => Ok(None),
-        Some(_) => Err(()),
+        Some(_) => Err(RequestLineError),
     }
 }
 

@@ -53,7 +53,9 @@ impl<'req, const N: usize> Headers<'req, N> {
     }
 
     pub fn from_items(items: [HeaderItem<'req>; N]) -> Self {
-        let wire_len = items.iter().map(HeaderItem::wire_len).sum();
+        let wire_len = items
+            .iter()
+            .fold(0usize, |total, item| total.saturating_add(item.wire_len()));
         Self {
             entries: items,
             len: N,
@@ -121,7 +123,7 @@ impl<'req, const N: usize> Headers<'req, N> {
         Ok(())
     }
 
-    pub(super) fn write_wire(&self, out: &mut super::super::wire_emit::WireWriter<'_>) {
+    pub(super) fn write_wire(&self, out: &mut super::super::wire_emit::ProvenWireWriter<'_>) {
         for idx in 0..self.len {
             let header = &self.entries[idx];
             out.put(header.name_bytes());
@@ -153,7 +155,13 @@ impl<'req, const N: usize> Headers<'req, N> {
 
     fn push_value(&mut self, name: HeaderNameToken, value: HeaderValueInner<'req>) -> &mut Self {
         assert!(self.len < N, "direct header overflow: max {}", N);
-        self.wire_len += name.as_str().len() + 2 + value.len() + 2;
+        let added = name
+            .as_str()
+            .len()
+            .saturating_add(2)
+            .saturating_add(value.len())
+            .saturating_add(2);
+        self.wire_len = self.wire_len.saturating_add(added);
         self.entries[self.len] = HeaderItem { name, value };
         self.len += 1;
         self

@@ -1,10 +1,16 @@
-use proc_macro2::TokenStream;
+use proc_macro2::{Span, TokenStream};
 use quote::{format_ident, quote};
+use sark_protocol::RequestHeadSemantic;
+use syn::LitByteStr;
 
 use super::super::spec::{Gen, RouteKind};
 use crate::route_compiler::Seg;
 use crate::route_compiler::param_dfa::ParamRoute;
 use crate::route_compiler::static_tree::StaticRoute;
+
+fn head_name_literal(semantic: RequestHeadSemantic) -> LitByteStr {
+    LitByteStr::new(semantic.wire_name(), Span::call_site())
+}
 
 struct TaskSpec<'a> {
     route: &'a syn::TypePath,
@@ -43,7 +49,12 @@ impl TaskSpec<'_> {
     fn producer_output(&self) -> TokenStream {
         let route = self.route;
         debug_assert!(matches!(self.kind, RouteKind::Fiber));
-        quote!(<#route as ::sark::service::RouteSpec>::AsyncResponse)
+        quote!(
+            ::core::result::Result<
+                <#route as ::sark::service::RouteSpec>::AsyncResponse,
+                &'static [u8],
+            >
+        )
     }
 
     fn slab_output(&self) -> TokenStream {
@@ -121,7 +132,7 @@ fn producer_bounds(tasks: &[TaskSpec<'_>], state_ty: &syn::Type) -> Vec<TokenStr
                         ::core::ops::Range<usize>,
                         &'env #state_ty,
                         &'env ::sark::Timer<'d>,
-                    ) -> ::core::result::Result<#future, &'static [u8]>,
+                    ) -> #future,
             })
         })
         .collect()
@@ -199,10 +210,11 @@ impl<'a> ServeEmit<'a> {
                         state: &'env #state_ty,
                         timer: &'env ::sark::Timer<'d>,
                     | {
-                        storage.try_into_task::<
-                            ::sark::dispatch::RequestTask<#route, #state_ty>,
-                        >(
-                            (raw_params, raw_headers, target),
+                        <#route as ::sark::service::manifold::TaskRoute<'d, #state_ty>>::invoke_task(
+                            storage,
+                            raw_params,
+                            raw_headers,
+                            target,
                             state,
                             timer,
                         )
@@ -439,6 +451,9 @@ impl<'a> ServeEmit<'a> {
     }
 
     pub(super) fn handle_bytes(&self) -> TokenStream {
+        let method_head_name = head_name_literal(RequestHeadSemantic::METHOD);
+        let path_head_name = head_name_literal(RequestHeadSemantic::PATH);
+        let content_length_head_name = head_name_literal(RequestHeadSemantic::CONTENT_LENGTH);
         let name = format_ident!("{}Inner", self.spec.name);
         let state_ty = &self.spec.state_ty;
         let routes = &self.spec.routes;
@@ -507,6 +522,24 @@ impl<'a> ServeEmit<'a> {
             .collect();
         let decoded_method_key = quote! {
             let decoded_method_key = #( #decoded_method_checks else )*
+            {
+                ::core::option::Option::None
+            };
+        };
+        let head_method_checks: Vec<TokenStream> = methods
+            .iter()
+            .map(|method| {
+                let bytes = method.bytes_token();
+                let key = method.key_token();
+                quote! {
+                    if __method_bytes == #bytes {
+                        ::core::option::Option::Some(#key)
+                    }
+                }
+            })
+            .collect();
+        let head_method_key = quote! {
+            let __method_key = #( #head_method_checks else )*
             {
                 ::core::option::Option::None
             };
@@ -733,6 +766,9 @@ impl<'a> ServeEmit<'a> {
 
         let vis = &self.spec.vis;
         let prepared_ident = format_ident!("{}PreparedRequest", self.spec.name);
+        let head_plan_ident = format_ident!("{}HeadPlan", self.spec.name);
+        let head_route_ident = format_ident!("{}HeadRoute", self.spec.name);
+        let head_selection_ident = format_ident!("{}HeadSelection", self.spec.name);
         let prepared_variants: Vec<_> = (0..routes.len())
             .map(|index| format_ident!("R{index:04}"))
             .collect();
@@ -742,7 +778,7 @@ impl<'a> ServeEmit<'a> {
             .map(|(route, variant)| {
                 quote! {
                     #variant {
-                        fields: ::sark::sark_core::http::VecFieldBlock,
+                        fields: ::sark::sark_core::http::HeadBytes,
                         raw_params: <#route as ::sark::service::RouteSpec>::RawParams,
                         raw_headers: <#route as ::sark::service::RouteSpec>::RawHeaders,
                         target: ::core::ops::Range<usize>,
@@ -767,7 +803,7 @@ impl<'a> ServeEmit<'a> {
                 }
             })
             .collect();
-        let prepare_for = |index: usize, raw_params: TokenStream| {
+        let finish_for = |index: usize, raw_params: TokenStream| {
             let route = &routes[index];
             let variant = &prepared_variants[index];
             quote! {
@@ -786,36 +822,6 @@ impl<'a> ServeEmit<'a> {
                         (__target_range.start + __path_end + 1)
                             ..__target_range.end
                     });
-                let mut __raw_headers =
-                    <<#route as ::sark::service::RouteSpec>::RawHeaders
-                        as ::core::default::Default>::default();
-                for (__field, __range) in __fields.iter_with_value_ranges() {
-                    if __field.name.first() == ::core::option::Option::Some(&b':') {
-                        continue;
-                    }
-                    if let ::core::option::Option::Some(__slot) =
-                        <<#route as ::sark::service::RouteSpec>::Request
-                            as ::sark::service::RouteRequestImpl>::header_slot_bytes(
-                            __field.name,
-                        )
-                    {
-                        if <<#route as ::sark::service::RouteSpec>::Request
-                            as ::sark::service::RouteRequestImpl>::set_header_raw(
-                            &mut __raw_headers,
-                            __slot,
-                            &::sark::service::SliceValue::new(
-                                __head_bytes,
-                                __range,
-                            ),
-                        )
-                        .is_err()
-                        {
-                            return ::core::result::Result::Err(
-                                ::sark::dispatch::Decoded::Bad,
-                            );
-                        }
-                    }
-                }
                 if let ::core::option::Option::Some(__query) = __query_range.clone()
                     && <<#route as ::sark::service::RouteSpec>::Request
                         as ::sark::service::RouteRequestImpl>::parse_query_raw(
@@ -830,7 +836,7 @@ impl<'a> ServeEmit<'a> {
                     );
                 }
                 return ::core::result::Result::Ok(#prepared_ident::#variant {
-                    fields: __fields,
+                    fields: ::sark::sark_core::http::HeadBlock::into_bytes(__fields),
                     raw_params: #raw_params,
                     raw_headers: __raw_headers,
                     target: __target_range,
@@ -839,52 +845,388 @@ impl<'a> ServeEmit<'a> {
                 });
             }
         };
-        let mut decoded_static_routes = Vec::new();
-        let mut decoded_param_routes = Vec::new();
+        let parse_content_length = |value: TokenStream| {
+            quote! {
+                let ::core::result::Result::Ok(__length) =
+                    ::sark::sark_core::http::codec::Header::content_length(#value)
+                else {
+                    return ::core::result::Result::Err(::sark::dispatch::Decoded::Bad);
+                };
+                if __content_length.is_some_and(|__previous| __previous != __length) {
+                    return ::core::result::Result::Err(::sark::dispatch::Decoded::Bad);
+                }
+                __content_length = ::core::option::Option::Some(__length);
+            }
+        };
+        let set_header = |route: &syn::TypePath| {
+            quote! {
+                if <<#route as ::sark::service::RouteSpec>::Request
+                    as ::sark::service::RouteRequestImpl>::set_header_raw(
+                        &mut __raw_headers,
+                        __slot,
+                        &::sark::service::SliceValue::new(__head_bytes, __range),
+                    )
+                    .is_err()
+                {
+                    return ::core::result::Result::Err(
+                        ::sark::dispatch::Decoded::Bad,
+                    );
+                }
+            }
+        };
+        let prepare_for = |index: usize, raw_params: TokenStream| {
+            let route = &routes[index];
+            let finish = finish_for(index, raw_params);
+            let content_length = parse_content_length(quote!(__field.value));
+            let set_header = set_header(route);
+            quote! {
+                let mut __raw_headers =
+                    <<#route as ::sark::service::RouteSpec>::RawHeaders
+                        as ::core::default::Default>::default();
+                let mut __content_length = ::core::option::Option::None;
+                for (__field, __range) in
+                    __first_regular.into_iter().chain(__field_iter)
+                {
+                    if __field.name.first() == ::core::option::Option::Some(&b':') {
+                        return ::core::result::Result::Err(
+                            ::sark::dispatch::Decoded::Bad,
+                        );
+                    }
+                    if __field.name == #content_length_head_name {
+                        #content_length
+                    }
+                    if let ::core::option::Option::Some(__slot) =
+                        <<#route as ::sark::service::RouteSpec>::Request
+                            as ::sark::service::RouteRequestImpl>::header_slot_bytes(
+                                __field.name,
+                            )
+                    {
+                        #set_header
+                    }
+                }
+                #finish
+            }
+        };
+        let prepare_tagged_for = |index: usize, raw_params: TokenStream| {
+            let route = &routes[index];
+            let finish = finish_for(index, raw_params);
+            let content_length = parse_content_length(quote!(&__head_bytes[__range]));
+            let set_header = set_header(route);
+            quote! {
+                let mut __raw_headers =
+                    <<#route as ::sark::service::RouteSpec>::RawHeaders
+                        as ::core::default::Default>::default();
+                let mut __content_length = ::core::option::Option::None;
+                for (__tag, __range) in __field_iter {
+                    if __tag == ::sark::sark_core::http::HeadTag::CONTENT_LENGTH {
+                        #content_length
+                        continue;
+                    }
+                    let ::core::option::Option::Some(__slot) = __tag.user_slot() else {
+                        return ::core::result::Result::Err(
+                            ::sark::dispatch::Decoded::Bad,
+                        );
+                    };
+                    let ::core::option::Option::Some(__slot) =
+                        <<#route as ::sark::service::RouteSpec>::HeaderSlot
+                            as ::sark::service::HeaderSlot>::from_tag(__slot)
+                    else {
+                        return ::core::result::Result::Err(
+                            ::sark::dispatch::Decoded::Bad,
+                        );
+                    };
+                    #set_header
+                }
+                #finish
+            }
+        };
+        let param_for = |index: usize, prepared: TokenStream| {
+            let entry = &self.spec.route_specs[index];
+            let route = &routes[index];
+            let segments = Seg::segment(&entry.path.value());
+            let captures: Vec<_> = (0..segments
+                .iter()
+                .filter(|segment| matches!(segment, Seg::Param))
+                .count())
+                .map(|capture| format_ident!("__cap{}", capture))
+                .collect();
+            let captures = quote!(( #( #captures, )* ));
+            ParamRoute {
+                method: entry.meta.method,
+                segs: segments,
+                body: quote! {
+                    let ::core::option::Option::Some(__raw) =
+                        <#route as ::sark::service::RouteSpec>::from_captures(
+                            &__route_path,
+                            #captures,
+                        )
+                    else {
+                        return ::core::result::Result::Err(
+                            ::sark::dispatch::Decoded::NotFound,
+                        );
+                    };
+                    #prepared
+                },
+            }
+        };
+        let decoded_param_for = |index: usize| param_for(index, prepare_for(index, quote!(__raw)));
+        let planned_param_for =
+            |index: usize| param_for(index, prepare_tagged_for(index, quote!(__raw)));
+        let mut full_head_static_routes = Vec::new();
+        let mut full_head_param_routes = Vec::new();
         for (index, entry) in self.spec.route_specs.iter().enumerate() {
             let route = &routes[index];
             let path = entry.path.value();
             if route_has_param[index] {
-                let segments = Seg::segment(&path);
-                let captures: Vec<_> = (0..segments
-                    .iter()
-                    .filter(|segment| matches!(segment, Seg::Param))
-                    .count())
-                    .map(|capture| format_ident!("__cap{}", capture))
-                    .collect();
-                let captures = quote!(( #( #captures, )* ));
-                let prepared = prepare_for(index, quote!(__raw));
-                decoded_param_routes.push(ParamRoute {
-                    method: entry.meta.method,
-                    segs: segments,
-                    body: quote! {
-                        let ::core::option::Option::Some(__raw) =
-                            <#route as ::sark::service::RouteSpec>::from_captures(
-                                &__route_path,
-                                #captures,
-                            )
-                        else {
-                            return ::core::result::Result::Err(
-                                ::sark::dispatch::Decoded::NotFound,
-                            );
-                        };
-                        #prepared
-                    },
-                });
+                full_head_param_routes.push(decoded_param_for(index));
             } else {
                 let raw = quote! {
                     <<#route as ::sark::service::RouteSpec>::RawParams
                         as ::core::default::Default>::default()
                 };
-                decoded_static_routes.push(StaticRoute {
+                full_head_static_routes.push(StaticRoute {
                     method: entry.meta.method,
                     path: path.into_bytes(),
                     body: prepare_for(index, raw),
                 });
             }
         }
-        let decoded_static_tree = StaticRoute::compile_target(decoded_static_routes);
-        let decoded_param_dfa = ParamRoute::compile(decoded_param_routes);
+        let full_head_static_tree = StaticRoute::compile_target(full_head_static_routes);
+        let full_head_param_dfa = ParamRoute::compile(full_head_param_routes);
+        let planned_route_arms: Vec<TokenStream> = self
+            .spec
+            .route_specs
+            .iter()
+            .enumerate()
+            .map(|(index, entry)| {
+                let variant = &prepared_variants[index];
+                let http_method = entry.meta.method.http_token();
+                if route_has_param[index] {
+                    let method = entry.meta.method.key_token();
+                    let dfa = ParamRoute::compile(vec![planned_param_for(index)]);
+                    quote! {
+                        #head_route_ident::#variant => {
+                            let __method = #method;
+                            let __http_method = #http_method;
+                            let __route_path =
+                                ::sark::service::TargetPath::new(__request_target);
+                            #dfa
+                            ::core::result::Result::Err(
+                                ::sark::dispatch::Decoded::Bad,
+                            )
+                        }
+                    }
+                } else {
+                    let path_end = entry.path.value().len();
+                    let route = &routes[index];
+                    let raw = quote! {
+                        <<#route as ::sark::service::RouteSpec>::RawParams
+                            as ::core::default::Default>::default()
+                    };
+                    let prepared = prepare_tagged_for(index, raw);
+                    quote! {
+                        #head_route_ident::#variant => {
+                            let __http_method = #http_method;
+                            let __path_end = #path_end;
+                            #prepared
+                        }
+                    }
+                }
+            })
+            .collect();
+        let mut head_static_routes = Vec::new();
+        let mut head_param_routes = Vec::new();
+        for (index, entry) in self.spec.route_specs.iter().enumerate() {
+            let variant = &prepared_variants[index];
+            let body = quote! {
+                return ::core::option::Option::Some(#head_route_ident::#variant);
+            };
+            if route_has_param[index] {
+                head_param_routes.push(ParamRoute {
+                    method: entry.meta.method,
+                    segs: Seg::segment(&entry.path.value()),
+                    body,
+                });
+            } else {
+                head_static_routes.push(StaticRoute {
+                    method: entry.meta.method,
+                    path: entry.path.value().into_bytes(),
+                    body,
+                });
+            }
+        }
+        let head_static_tree = StaticRoute::compile_target(head_static_routes);
+        let head_param_dfa = ParamRoute::compile(head_param_routes);
+        let head_disposition_arms: Vec<TokenStream> = routes
+            .iter()
+            .zip(prepared_variants.iter())
+            .map(|(route, variant)| {
+                quote! {
+                    #head_route_ident::#variant => {
+                        let ::core::option::Option::Some(__slot) =
+                            <<#route as ::sark::service::RouteSpec>::Request
+                                as ::sark::service::RouteRequestImpl>::header_slot_bytes(
+                                    __name,
+                                )
+                        else {
+                            return ::sark::sark_core::http::HeadDisposition::Discard;
+                        };
+                        let __slot =
+                            <<#route as ::sark::service::RouteSpec>::HeaderSlot
+                                as ::sark::service::HeaderSlot>::into_tag(__slot);
+                        match ::sark::sark_core::http::HeadTag::user(__slot) {
+                            ::core::option::Option::Some(__tag) =>
+                                ::sark::sark_core::http::HeadDisposition::Tagged(__tag),
+                            ::core::option::Option::None =>
+                                ::sark::sark_core::http::HeadDisposition::Discard,
+                        }
+                    }
+                }
+            })
+            .collect();
+        let head_plan = quote! {
+            #[doc(hidden)]
+            enum #head_route_ident {
+                Pending,
+                Missing,
+                #( #prepared_variants, )*
+            }
+
+            #[doc(hidden)]
+            #vis struct #head_plan_ident {
+                method: ::core::option::Option<::sark::service::Key>,
+                target: ::core::option::Option<::core::ops::Range<usize>>,
+                route: #head_route_ident,
+            }
+
+            #[doc(hidden)]
+            #vis struct #head_selection_ident {
+                route: #head_route_ident,
+                target: ::core::option::Option<::core::ops::Range<usize>>,
+            }
+
+            impl #head_plan_ident {
+                #[allow(unused_variables)]
+                fn select(
+                    __method: ::sark::service::Key,
+                    __target: &[u8],
+                ) -> ::core::option::Option<#head_route_ident> {
+                    if __target.first() != ::core::option::Option::Some(&b'/') {
+                        return ::core::option::Option::None;
+                    }
+                    let __route_path = ::sark::service::TargetPath::new(__target);
+                    #head_static_tree
+                    #head_param_dfa
+                    ::core::option::Option::None
+                }
+
+                fn resolve(&mut self, __retained: &[u8]) {
+                    if !matches!(self.route, #head_route_ident::Pending) {
+                        return;
+                    }
+                    let (
+                        ::core::option::Option::Some(__method),
+                        ::core::option::Option::Some(__target),
+                    ) = (self.method, self.target.clone())
+                    else {
+                        return;
+                    };
+                    self.route = Self::select(__method, &__retained[__target])
+                        .unwrap_or(#head_route_ident::Missing);
+                }
+            }
+
+            impl ::core::default::Default for #head_plan_ident {
+                fn default() -> Self {
+                    Self {
+                        method: ::core::option::Option::None,
+                        target: ::core::option::Option::None,
+                        route: #head_route_ident::Pending,
+                    }
+                }
+            }
+
+            impl ::sark::sark_core::http::HeadPlan for #head_plan_ident {
+                type Selection = #head_selection_ident;
+                type Block = ::sark::sark_core::http::PlannedFields;
+                const INSPECT_DISCARDED: bool = false;
+
+                fn disposition(
+                    &mut self,
+                    __name: &[u8],
+                    __known: ::sark::sark_core::http::KnownHeadName,
+                    __retained: &[u8],
+                ) -> ::sark::sark_core::http::HeadDisposition {
+                    match __known {
+                        ::sark::sark_core::http::KnownHeadName::Method =>
+                            return ::sark::sark_core::http::HeadDisposition::Discard,
+                        ::sark::sark_core::http::KnownHeadName::Path => {
+                            return ::sark::sark_core::http::HeadDisposition::Tagged(
+                                ::sark::sark_core::http::HeadTag::PATH,
+                            );
+                        }
+                        ::sark::sark_core::http::KnownHeadName::ContentLength => {
+                            return ::sark::sark_core::http::HeadDisposition::Tagged(
+                                ::sark::sark_core::http::HeadTag::CONTENT_LENGTH,
+                            );
+                        }
+                        ::sark::sark_core::http::KnownHeadName::Te
+                        | ::sark::sark_core::http::KnownHeadName::Regular => {}
+                        _ => return ::sark::sark_core::http::HeadDisposition::Discard,
+                    }
+                    match self.route {
+                        #( #head_disposition_arms )*
+                        #head_route_ident::Pending | #head_route_ident::Missing =>
+                            ::sark::sark_core::http::HeadDisposition::Discard,
+                    }
+                }
+
+                fn decoded(
+                    &mut self,
+                    __field: ::sark::sark_core::http::Field<'_>,
+                    __known: ::sark::sark_core::http::KnownHeadName,
+                    __retained: &[u8],
+                ) {
+                    match __known {
+                        ::sark::sark_core::http::KnownHeadName::Method => {
+                            let __method_bytes = __field.value;
+                            #head_method_key
+                            self.method = __method_key;
+                            self.resolve(__retained);
+                        }
+                        ::sark::sark_core::http::KnownHeadName::Path => {
+                            if let ::core::option::Option::Some(__method) = self.method
+                            {
+                                self.route = Self::select(__method, __field.value)
+                                    .unwrap_or(#head_route_ident::Missing);
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+
+                fn committed(
+                    &mut self,
+                    __disposition: ::sark::sark_core::http::HeadDisposition,
+                    __value: ::core::ops::Range<usize>,
+                    _retained: &[u8],
+                ) {
+                    if __disposition == ::sark::sark_core::http::HeadDisposition::Tagged(
+                            ::sark::sark_core::http::HeadTag::PATH,
+                        )
+                    {
+                        self.target = ::core::option::Option::Some(__value);
+                    }
+                }
+
+                fn finish(self) -> Self::Selection {
+                    #head_selection_ident {
+                        route: self.route,
+                        target: self.target,
+                    }
+                }
+            }
+        };
         let dispatch_prepared_arms: Vec<TokenStream> = routes
             .iter()
             .zip(prepared_variants.iter())
@@ -920,20 +1262,23 @@ impl<'a> ServeEmit<'a> {
                 }
             })
             .collect();
-        let decode_method = quote! {
-            type Prepared = #prepared_ident;
-
-            fn prepare_decoded(
-                &self,
-                __fields: ::sark::sark_core::http::VecFieldBlock,
-            ) -> ::core::result::Result<Self::Prepared, ::sark::dispatch::Decoded> {
+        let prepare_body = |dispatch: TokenStream| {
+            quote! {
                 let __head_bytes = __fields.as_bytes();
                 let mut __http_method = ::core::option::Option::None;
                 let mut __target = ::core::option::Option::None;
-                let mut __content_length = ::core::option::Option::None;
-                for (__field, __range) in __fields.iter_with_value_ranges() {
+                let mut __field_iter = __fields.iter_with_value_ranges();
+                let __first_regular = loop {
+                    let ::core::option::Option::Some((__field, __range)) =
+                        __field_iter.next()
+                    else {
+                        break ::core::option::Option::None;
+                    };
+                    if __field.name.first() != ::core::option::Option::Some(&b':') {
+                        break ::core::option::Option::Some((__field, __range));
+                    }
                     match __field.name {
-                        b":method" => {
+                        #method_head_name => {
                             if __http_method.is_some() {
                                 return ::core::result::Result::Err(
                                     ::sark::dispatch::Decoded::Bad,
@@ -948,35 +1293,16 @@ impl<'a> ServeEmit<'a> {
                             };
                             __http_method = ::core::option::Option::Some(__method);
                         }
-                        b":path" => {
+                        #path_head_name => {
                             if __target.replace(__range).is_some() {
                                 return ::core::result::Result::Err(
                                     ::sark::dispatch::Decoded::Bad,
                                 );
                             }
                         }
-                        b"content-length" => {
-                            let ::core::result::Result::Ok(__length) =
-                                ::sark::sark_core::http::codec::Header::content_length(
-                                    __field.value,
-                                )
-                            else {
-                                return ::core::result::Result::Err(
-                                    ::sark::dispatch::Decoded::Bad,
-                                );
-                            };
-                            if __content_length
-                                .is_some_and(|__previous| __previous != __length)
-                            {
-                                return ::core::result::Result::Err(
-                                    ::sark::dispatch::Decoded::Bad,
-                                );
-                            }
-                            __content_length = ::core::option::Option::Some(__length);
-                        }
                         _ => {}
                     }
-                }
+                };
                 let (
                     ::core::option::Option::Some(__http_method),
                     ::core::option::Option::Some(__target_range),
@@ -992,17 +1318,76 @@ impl<'a> ServeEmit<'a> {
                         ::sark::dispatch::Decoded::Bad,
                     );
                 }
-                #decoded_method_key
-                let ::core::option::Option::Some(__method) = decoded_method_key else {
-                    return ::core::result::Result::Err(
-                        ::sark::dispatch::Decoded::NotFound,
-                    );
-                };
-                let __target = __request_target;
+                #dispatch
+            }
+        };
+        let decoded_route_path = route_has_param.iter().any(|has_param| *has_param).then(|| {
+            quote! {
                 let __route_path = ::sark::service::TargetPath::new(__request_target);
-                #decoded_static_tree
-                #decoded_param_dfa
-                ::core::result::Result::Err(::sark::dispatch::Decoded::NotFound)
+            }
+        });
+        let decoded_dispatch = quote! {
+            #decoded_method_key
+            let ::core::option::Option::Some(__method) = decoded_method_key else {
+                return ::core::result::Result::Err(
+                    ::sark::dispatch::Decoded::NotFound,
+                );
+            };
+            let __target = __request_target;
+            #decoded_route_path
+            #full_head_static_tree
+            #full_head_param_dfa
+            ::core::result::Result::Err(::sark::dispatch::Decoded::NotFound)
+        };
+        let planned_dispatch = quote! {
+            match __planned_route {
+                #( #planned_route_arms, )*
+                #head_route_ident::Pending => {
+                    ::core::result::Result::Err(::sark::dispatch::Decoded::Bad)
+                }
+                #head_route_ident::Missing => {
+                    ::core::result::Result::Err(::sark::dispatch::Decoded::NotFound)
+                }
+            }
+        };
+        let prepare_full_head_body = prepare_body(decoded_dispatch);
+        let prepare_planned_head_body = quote! {
+            let __head_bytes = __fields.as_bytes();
+            let ::core::option::Option::Some(__target_range) = __planned_target
+            else {
+                return ::core::result::Result::Err(::sark::dispatch::Decoded::Bad);
+            };
+            let __request_target = &__head_bytes[__target_range.clone()];
+            if __request_target.first() != ::core::option::Option::Some(&b'/') {
+                return ::core::result::Result::Err(::sark::dispatch::Decoded::Bad);
+            }
+            let mut __field_iter =
+                __fields.iter_from(__target_range.end);
+            #planned_dispatch
+        };
+        let decode_method = quote! {
+            type Prepared = #prepared_ident;
+            type Plan = #head_plan_ident;
+
+            fn prepare_full_head(
+                &self,
+                __fields: ::sark::sark_core::http::DecodedFieldBlock,
+            ) -> ::core::result::Result<Self::Prepared, ::sark::dispatch::Decoded> {
+                #prepare_full_head_body
+            }
+
+            fn prepare_planned_head(
+                &self,
+                __head: ::sark::sark_core::http::PlannedHead<#head_plan_ident>,
+            ) -> ::core::result::Result<Self::Prepared, ::sark::dispatch::Decoded> {
+                let (
+                    __fields,
+                    #head_selection_ident {
+                        route: __planned_route,
+                        target: __planned_target,
+                    },
+                ) = __head.into_parts();
+                #prepare_planned_head_body
             }
 
             fn dispatch_prepared<
@@ -1123,7 +1508,6 @@ impl<'a> ServeEmit<'a> {
                     slot,
                     egress,
                     driver,
-                    &project,
                 );
             }
         } else {
@@ -1134,7 +1518,6 @@ impl<'a> ServeEmit<'a> {
                     slot,
                     egress,
                     driver,
-                    &project,
                 ) {
                     return;
                 }
@@ -1172,7 +1555,6 @@ impl<'a> ServeEmit<'a> {
                     self.as_ref().get_ref(),
                 ).cancel_proj(
                     slot,
-                    &project,
                 );
             }
         } else {
@@ -1181,7 +1563,6 @@ impl<'a> ServeEmit<'a> {
                     self.as_ref().get_ref(),
                 ).cancel_proj(
                     slot,
-                    &project,
                 );
                 let mut this = self.project();
                 if let ::core::option::Option::Some(task) =
@@ -1212,6 +1593,8 @@ impl<'a> ServeEmit<'a> {
             >
         };
         quote! {
+            #head_plan
+
             #[doc(hidden)]
             #vis enum #prepared_ident {
                 #( #prepared_variant_defs )*
@@ -1234,7 +1617,7 @@ impl<'a> ServeEmit<'a> {
                     date: &::sark::date::Stamp,
                     slot: &mut #projection_slot,
                     bytes: &[u8],
-                    egress: &mut ::dope::manifold::listener::state::EgressCtx<'_, '_>,
+                    egress: &mut ::dope::manifold::listener::state::EgressCtx<'_, 'd, '_>,
                     driver: &mut ::dope::DriverContext<'_, 'd>,
                     project: __PJ,
                 ) -> bool
@@ -1259,7 +1642,7 @@ impl<'a> ServeEmit<'a> {
                     slot: &mut #projection_slot,
                     project: __PJ,
                     sent: usize,
-                    egress: &mut ::dope::manifold::listener::state::EgressCtx<'_, '_>,
+                    egress: &mut ::dope::manifold::listener::state::EgressCtx<'_, 'd, '_>,
                     driver: &mut ::dope::DriverContext<'_, 'd>,
                 )
                 where
@@ -1273,7 +1656,7 @@ impl<'a> ServeEmit<'a> {
                     date: &::sark::date::Stamp,
                     slot: &mut #projection_slot,
                     project: __PJ,
-                    egress: &mut ::dope::manifold::listener::state::EgressCtx<'_, '_>,
+                    egress: &mut ::dope::manifold::listener::state::EgressCtx<'_, 'd, '_>,
                     driver: &mut ::dope::DriverContext<'_, 'd>,
                 )
                 where
@@ -1286,7 +1669,7 @@ impl<'a> ServeEmit<'a> {
                     self: ::core::pin::Pin<&mut Self>,
                     slot: &mut #projection_slot,
                     project: __PJ,
-                    _egress: &mut ::dope::manifold::listener::state::EgressCtx<'_, '_>,
+                    _egress: &mut ::dope::manifold::listener::state::EgressCtx<'_, 'd, '_>,
                 )
                 where
                     #projection_bounds
@@ -1304,7 +1687,7 @@ impl<'a> ServeEmit<'a> {
                     self: ::core::pin::Pin<&mut Self>,
                     slot: &mut #projection_slot,
                     bytes: &[u8],
-                    egress: &mut ::dope::manifold::listener::state::EgressCtx<'_, '_>,
+                    egress: &mut ::dope::manifold::listener::state::EgressCtx<'_, 'd, '_>,
                     driver: &mut ::dope::DriverContext<'_, 'd>,
                     project: __PJ,
                 ) -> bool
@@ -1327,7 +1710,7 @@ impl<'a> ServeEmit<'a> {
                     slot: &mut #projection_slot,
                     project: __PJ,
                     sent: usize,
-                    egress: &mut ::dope::manifold::listener::state::EgressCtx<'_, '_>,
+                    egress: &mut ::dope::manifold::listener::state::EgressCtx<'_, 'd, '_>,
                     driver: &mut ::dope::DriverContext<'_, 'd>,
                 )
                 where
@@ -1348,7 +1731,7 @@ impl<'a> ServeEmit<'a> {
                     self: ::core::pin::Pin<&mut Self>,
                     slot: &mut #projection_slot,
                     project: __PJ,
-                    egress: &mut ::dope::manifold::listener::state::EgressCtx<'_, '_>,
+                    egress: &mut ::dope::manifold::listener::state::EgressCtx<'_, 'd, '_>,
                     driver: &mut ::dope::DriverContext<'_, 'd>,
                 )
                 where
@@ -1368,7 +1751,7 @@ impl<'a> ServeEmit<'a> {
                     self: ::core::pin::Pin<&mut Self>,
                     slot: &mut #projection_slot,
                     project: __PJ,
-                    egress: &mut ::dope::manifold::listener::state::EgressCtx<'_, '_>,
+                    egress: &mut ::dope::manifold::listener::state::EgressCtx<'_, 'd, '_>,
                 )
                 where
                     #projection_bounds
@@ -1411,17 +1794,31 @@ impl<'a> ServeEmit<'a> {
                 #decoded_bounds
             {
                 type Prepared = #prepared_ident;
+                type Plan = #head_plan_ident;
 
-                fn prepare_decoded(
+                fn prepare_full_head(
                     &self,
-                    fields: ::sark::sark_core::http::VecFieldBlock,
+                    fields: ::sark::sark_core::http::DecodedFieldBlock,
                 ) -> ::core::result::Result<
                     Self::Prepared,
                     ::sark::dispatch::Decoded,
                 > {
-                    ::sark::dispatch::Decode::prepare_decoded(
+                    ::sark::dispatch::Decode::prepare_full_head(
                         &self.core,
                         fields,
+                    )
+                }
+
+                fn prepare_planned_head(
+                    &self,
+                    head: ::sark::sark_core::http::PlannedHead<Self::Plan>,
+                ) -> ::core::result::Result<
+                    Self::Prepared,
+                    ::sark::dispatch::Decoded,
+                > {
+                    ::sark::dispatch::Decode::prepare_planned_head(
+                        &self.core,
+                        head,
                     )
                 }
 
@@ -1474,7 +1871,7 @@ impl<'a> ServeEmit<'a> {
                                 state: ::sark::dispatch::conn_state::NeedMore::Head,
                             };
                         }
-                        ::core::result::Result::Err(()) => {
+                        ::core::result::Result::Err(_) => {
                             return ::sark::dispatch::ConsumeOutcome::Close(
                                 ::sark::CANNED_400,
                             );

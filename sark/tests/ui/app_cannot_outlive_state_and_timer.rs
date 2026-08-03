@@ -23,12 +23,11 @@ sark_gen::define_route! {
 
 fn escape<'d>() -> impl sark::Application<'d, Wire = dope_net::wire::identity::Identity> {
     let state = ();
-    let timer = sark::Timer::with_capacity(1);
+    let timer = sark::Timer::new();
     App::new(
         &state,
         &timer,
         sark::app::Config {
-            timer_capacity: 1,
             task_capacity: 1,
         },
     )

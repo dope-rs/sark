@@ -36,32 +36,42 @@ pub(super) struct ConnectionPool<'d> {
     live: Cell<usize>,
 }
 
-impl<'d> ConnectionPool<'d> {
+#[derive(Clone, Copy)]
+pub(super) struct Plan {
+    capacity: usize,
+    arena: ArenaConfig,
+}
+
+impl Plan {
     pub(super) fn new(
         capacity: usize,
         max_inflight: usize,
         limit: usize,
         max_response_body: usize,
-    ) -> Self {
-        let entries = capacity
-            .checked_mul(max_inflight)
-            .expect("HTTP response entry capacity overflow");
+    ) -> Option<Self> {
+        let entries = capacity.checked_mul(max_inflight)?;
         let per_entry_items = max_response_body
             .div_ceil(STREAM_CHUNK_SIZE)
-            .saturating_mul(2)
-            .saturating_add(MAX_INFORMATIONAL_RESPONSES + 3);
-        let items = entries
-            .checked_mul(3)
-            .and_then(|base| {
-                limit
-                    .div_ceil(STREAM_CHUNK_SIZE)
-                    .checked_mul(2)
-                    .and_then(|body| base.checked_add(body))
-            })
-            .expect("HTTP response item capacity overflow");
+            .checked_mul(2)?
+            .checked_add(MAX_INFORMATIONAL_RESPONSES + 3)?;
+        let body_items = limit.div_ceil(STREAM_CHUNK_SIZE).checked_mul(2)?;
+        let items = entries.checked_mul(3)?.checked_add(body_items)?;
         let limits = Limits::new(per_entry_items, limit, per_entry_items);
+        Some(Self {
+            capacity,
+            arena: ArenaConfig::new(capacity, entries, items, limit, items, limits),
+        })
+    }
+
+    pub(super) fn capacity(self) -> usize {
+        self.capacity
+    }
+}
+
+impl<'d> ConnectionPool<'d> {
+    pub(super) fn from_plan(plan: Plan) -> Self {
         Self {
-            entries: (0..capacity)
+            entries: (0..plan.capacity)
                 .map(|_| Connection {
                     id: Cell::new(None),
                     last_activity: Cell::new(None),
@@ -69,10 +79,8 @@ impl<'d> ConnectionPool<'d> {
                     queued: Cell::new(false),
                 })
                 .collect(),
-            arena: Arena::new(ArenaConfig::new(
-                capacity, entries, items, limit, items, limits,
-            )),
-            ready: RegionCell::new(SlotQueue::with_capacity(capacity)),
+            arena: Arena::new(plan.arena),
+            ready: RegionCell::new(SlotQueue::with_capacity(plan.capacity)),
             live: Cell::new(0),
         }
     }
@@ -194,7 +202,7 @@ impl<'d> ConnectionPool<'d> {
         token: &mut RegionToken<'d>,
         now: Instant,
         idle_timeout: Duration,
-        mut recycle: impl FnMut(Token),
+        mut recycle: impl FnMut(&mut RegionToken<'d>, Token),
     ) -> Option<Token> {
         while let Some(id) = self.pop_ready(token) {
             let Some(entry) = self.entry(id) else {
@@ -212,7 +220,7 @@ impl<'d> ConnectionPool<'d> {
                 .is_some_and(|last| now.saturating_duration_since(last) >= limit);
             if stale {
                 self.close(token, id);
-                recycle(id);
+                recycle(token, id);
                 continue;
             }
             if self.arena.can_register(token, id.slot().raw() as usize) {

@@ -269,7 +269,7 @@ impl Pipeline {
 
     pub(super) fn emit<'d, W: Wire, C: Default + 'static, P: Fn(&mut C) -> &mut ConnState>(
         slot: &mut Slot<'d, W, State<C>>,
-        egress: &mut EgressCtx<'_, '_>,
+        egress: &mut EgressCtx<'_, 'd, '_>,
         driver: &mut DriverContext<'_, 'd>,
         out: LoopOutcome,
         use_accumulator: bool,

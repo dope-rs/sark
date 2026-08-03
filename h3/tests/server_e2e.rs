@@ -1,6 +1,7 @@
 use std::time::Instant;
 
-use dope_quic::{Conn, ConnHandle, Handler, ServerConn, conn, transport_params};
+use dope_quic::conn::{self, Connection, Handle};
+use dope_quic::{Handler, transport_params};
 use ring::rand::{SecureRandom, SystemRandom};
 use sark_core::http::Field;
 use sark_h3::dope::{Server, Session};
@@ -55,14 +56,16 @@ fn config() -> conn::Config {
     }
 }
 
-fn pair() -> (ServerConn, Conn) {
+fn pair() -> (dope_quic::conn::server::Connection, Connection) {
     let mut seed = [0u8; 32];
     SystemRandom::new().fill(&mut seed).unwrap();
     let signing = SigningKey::from_seed(&seed).unwrap();
     let server_pubkey = *signing.pubkey().unwrap();
     let mut server =
-        Conn::new_server(CID.to_vec(), CID.to_vec(), CID.to_vec(), signing, config()).unwrap();
-    let mut client = Conn::new_client(CID.to_vec(), CID.to_vec(), server_pubkey, config()).unwrap();
+        Connection::new_server(CID.to_vec(), CID.to_vec(), CID.to_vec(), signing, config())
+            .unwrap();
+    let mut client =
+        Connection::new_client(CID.to_vec(), CID.to_vec(), server_pubkey, config()).unwrap();
     let now = Instant::now();
     for _ in 0..3 {
         drain_client(&mut client, &mut server, now);
@@ -73,19 +76,27 @@ fn pair() -> (ServerConn, Conn) {
     (server, client)
 }
 
-fn drain_client(from: &mut Conn, into: &mut ServerConn, now: Instant) {
-    for pkt in from.send_packets(now) {
-        into.recv_packet(&pkt, now).expect("recv");
+fn drain_client(
+    from: &mut Connection,
+    into: &mut dope_quic::conn::server::Connection,
+    now: Instant,
+) {
+    for mut pkt in from.send_packets(now) {
+        into.recv_packet(&mut pkt, now).expect("recv");
     }
 }
 
-fn drain_server(from: &mut ServerConn, into: &mut Conn, now: Instant) {
-    for pkt in from.send_packets(now) {
-        into.recv_packet(&pkt, now).expect("recv");
+fn drain_server(
+    from: &mut dope_quic::conn::server::Connection,
+    into: &mut Connection,
+    now: Instant,
+) {
+    for mut pkt in from.send_packets(now) {
+        into.recv_packet(&mut pkt, now).expect("recv");
     }
 }
 
-fn pump_client(session: &mut Session, quic: &mut Conn) {
+fn pump_client(session: &mut Session, quic: &mut Connection) {
     while let Some(event) = quic.poll_stream_event() {
         session.quic_stream_event(quic, event).unwrap();
     }
@@ -94,19 +105,17 @@ fn pump_client(session: &mut Session, quic: &mut Conn) {
 #[test]
 fn server_handler_routes_over_quic() {
     let (mut server_quic, mut client_quic) = pair();
-    let handle = ConnHandle(0);
+    let handle = Handle(0);
 
-    let timer = sark::Timer::with_capacity(0);
+    let timer = sark::Timer::new();
     let app = SrvApp::new::<dope_net::wire::identity::Identity>(
         sark::EmptyState::REF,
         &timer,
-        sark::app::Config {
-            timer_capacity: 0,
-            task_capacity: 0,
-        },
+        sark::app::Config { task_capacity: 0 },
     );
     let mut server = Server::new(app);
-    server.established(&mut server_quic, handle);
+    let mut connection = server.create_connection(&mut server_quic, handle);
+    server.established(&mut connection, &mut server_quic, handle);
 
     let mut client = Session::with_role(Role::Client);
     client.start_control_stream(&mut client_quic).unwrap();
@@ -114,7 +123,7 @@ fn server_handler_routes_over_quic() {
     let now = Instant::now();
     drain_client(&mut client_quic, &mut server_quic, now);
     while let Some(event) = server_quic.poll_stream_event() {
-        server.stream_event(&mut server_quic, handle, event);
+        server.stream_event(&mut connection, &mut server_quic, handle, event);
     }
     drain_server(&mut server_quic, &mut client_quic, now);
     pump_client(&mut client, &mut client_quic);
@@ -147,7 +156,7 @@ fn server_handler_routes_over_quic() {
 
     drain_client(&mut client_quic, &mut server_quic, now);
     while let Some(event) = server_quic.poll_stream_event() {
-        server.stream_event(&mut server_quic, handle, event);
+        server.stream_event(&mut connection, &mut server_quic, handle, event);
     }
     drain_server(&mut server_quic, &mut client_quic, now);
     pump_client(&mut client, &mut client_quic);

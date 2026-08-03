@@ -8,7 +8,7 @@ repository.workspace = true
 license.workspace = true
 
 [dependencies]
-shin = "0.13"
+shin.workspace = true
 sark-core.workspace = true
 dope.workspace = true
 dope-net.workspace = true

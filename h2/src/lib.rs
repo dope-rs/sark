@@ -1,10 +1,8 @@
 mod egress;
-mod growing_pool;
 mod ingress;
 mod retained_segments;
 mod role;
 mod stream_registry;
-mod validate;
 
 pub mod client;
 pub mod conn;

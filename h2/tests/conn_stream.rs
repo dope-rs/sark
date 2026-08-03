@@ -1,15 +1,11 @@
 mod common;
 
 use common::{flen, sid, win};
-use sark_h2::frame::{
-    Continuation as ContinuationFrame, Data as DataFrame, Headers as HeadersFrame,
-    PushPromise as PushPromiseFrame, RstStream as RstStreamFrame, SettingId,
-    Settings as SettingsFrame, WindowUpdate as WindowUpdateFrame,
-};
+use sark_h2::frame::{self, SettingId};
 use sark_h2::hpack::{Encoder, Header};
 use sark_h2::{
     CLIENT_PREFACE, ClientRole, Conn, ConnError, ErrorCode, FrameHeader, ServerRole, Settings,
-    StreamId, conn, frame, stream,
+    StreamId, conn, stream,
 };
 
 fn server() -> Conn<ServerRole> {
@@ -27,7 +23,9 @@ fn settings_frame_bytes(params: &[(u16, u32)], ack: bool) -> Vec<u8> {
         payload.extend_from_slice(&val.to_be_bytes());
     }
     let mut out = Vec::new();
-    SettingsFrame::new(ack, &payload).unwrap().encode(&mut out);
+    frame::Settings::new(ack, &payload)
+        .unwrap()
+        .encode(&mut out);
     out
 }
 
@@ -56,7 +54,7 @@ fn headers_frame_bytes(
     block: &[u8],
 ) -> Vec<u8> {
     let mut out = Vec::new();
-    HeadersFrame::new(sid(stream_id), end_stream, end_headers, None, block)
+    frame::Headers::new(sid(stream_id), end_stream, end_headers, None, block)
         .unwrap()
         .encode(&mut out);
     out
@@ -64,7 +62,7 @@ fn headers_frame_bytes(
 
 fn continuation_bytes(stream_id: u32, end_headers: bool, block: &[u8]) -> Vec<u8> {
     let mut out = Vec::new();
-    ContinuationFrame::new(sid(stream_id), end_headers, block)
+    frame::Continuation::new(sid(stream_id), end_headers, block)
         .unwrap()
         .encode(&mut out);
     out
@@ -72,7 +70,7 @@ fn continuation_bytes(stream_id: u32, end_headers: bool, block: &[u8]) -> Vec<u8
 
 fn data_frame_bytes(stream_id: u32, end_stream: bool, payload: &[u8]) -> Vec<u8> {
     let mut out = Vec::new();
-    DataFrame::new(sid(stream_id), end_stream, payload)
+    frame::Data::new(sid(stream_id), end_stream, payload)
         .unwrap()
         .encode(&mut out);
     out
@@ -80,7 +78,7 @@ fn data_frame_bytes(stream_id: u32, end_stream: bool, payload: &[u8]) -> Vec<u8>
 
 fn rst_frame_bytes(stream_id: u32, error: ErrorCode) -> Vec<u8> {
     let mut out = Vec::new();
-    RstStreamFrame::new(sid(stream_id), error)
+    frame::RstStream::new(sid(stream_id), error)
         .unwrap()
         .encode(&mut out);
     out
@@ -88,7 +86,7 @@ fn rst_frame_bytes(stream_id: u32, error: ErrorCode) -> Vec<u8> {
 
 fn push_promise_bytes(stream_id: u32, promised: u32, end_headers: bool, block: &[u8]) -> Vec<u8> {
     let mut out = Vec::new();
-    PushPromiseFrame::new(sid(stream_id), sid(promised), end_headers, block)
+    frame::PushPromise::new(sid(stream_id), sid(promised), end_headers, block)
         .unwrap()
         .encode(&mut out);
     out
@@ -96,7 +94,7 @@ fn push_promise_bytes(stream_id: u32, promised: u32, end_headers: bool, block: &
 
 fn window_update_bytes(stream_id: u32, increment: u32) -> Vec<u8> {
     let mut out = Vec::new();
-    WindowUpdateFrame {
+    frame::WindowUpdate {
         stream_id: sid(stream_id),
         increment: win(increment),
     }
@@ -143,6 +141,7 @@ fn headers_recv_opens_stream() {
             headers,
             end_stream,
             trailing,
+            ..
         } => {
             assert_eq!(stream_id, sid(1));
             assert!(!end_stream);
@@ -602,6 +601,7 @@ fn data_exceeding_recv_window_flow_control() {
     let huge = vec![0u8; 65_536];
     let err = conn.ingest(&data_frame_bytes(1, false, &huge)).unwrap_err();
     assert_eq!(err, ConnError::FlowControl);
+    conn.resume().unwrap();
 }
 
 #[test]
@@ -902,6 +902,80 @@ fn client_send_trailers_closes_request_body() {
     assert_eq!(h.kind, frame::Type::Headers);
     assert_eq!(h.stream_id, id);
     assert_eq!(conn.stream_state(id), Some(stream::State::HalfClosedLocal));
+}
+
+#[test]
+fn invalid_client_trailers_do_not_emit_headers() {
+    let mut conn = client();
+    prime_client(&mut conn);
+    let id = conn
+        .start_request(
+            &[
+                Header::new(b":method", b"POST"),
+                Header::new(b":scheme", b"http"),
+                Header::new(b":path", b"/"),
+            ],
+            true,
+        )
+        .unwrap();
+    conn.drain_outbound(usize::MAX);
+
+    assert_eq!(
+        conn.send_trailers(id, &[Header::new(b"x-trailer", b"v")]),
+        Err(ConnError::Protocol)
+    );
+    assert!(conn.outbound().is_empty());
+    assert_eq!(conn.stream_state(id), Some(stream::State::HalfClosedLocal));
+}
+
+#[test]
+fn invalid_data_does_not_consume_flow_credit() {
+    let mut conn = client();
+    prime_client(&mut conn);
+    let id = conn
+        .start_request(
+            &[
+                Header::new(b":method", b"POST"),
+                Header::new(b":scheme", b"http"),
+                Header::new(b":path", b"/"),
+            ],
+            true,
+        )
+        .unwrap();
+    conn.drain_outbound(usize::MAX);
+    let conn_window = conn.send_window();
+    let stream_window = conn.stream_send_window(id).unwrap();
+
+    assert_eq!(
+        conn.send_data(id, b"rejected", false),
+        Err(ConnError::Protocol)
+    );
+    assert!(conn.outbound().is_empty());
+    assert_eq!(conn.send_window(), conn_window);
+    assert_eq!(conn.stream_send_window(id), Some(stream_window));
+    assert_eq!(conn.stream_state(id), Some(stream::State::HalfClosedLocal));
+}
+
+#[test]
+fn invalid_server_response_does_not_emit_headers() {
+    let mut conn = server();
+    prime_server(&mut conn);
+    conn.ingest(&headers_frame_bytes(1, false, true, &full_block()))
+        .unwrap();
+    let _ = conn.poll_event().unwrap();
+    conn.send_response(sid(1), [Header::new(b":status", b"200")], true)
+        .unwrap();
+    conn.drain_outbound(usize::MAX);
+
+    assert_eq!(
+        conn.send_response(sid(1), [Header::new(b":status", b"204")], false),
+        Err(ConnError::Protocol)
+    );
+    assert!(conn.outbound().is_empty());
+    assert_eq!(
+        conn.stream_state(sid(1)),
+        Some(stream::State::HalfClosedLocal)
+    );
 }
 
 #[test]
@@ -1573,6 +1647,7 @@ fn closed_after_end_stream_data_yields_connection_stream_closed_error() {
 
     let err = conn.ingest(&data_frame_bytes(1, false, b"x")).unwrap_err();
     assert_eq!(err, ConnError::StreamClosed);
+    conn.resume().unwrap();
 }
 
 #[test]

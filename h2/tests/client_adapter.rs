@@ -1,10 +1,11 @@
 mod common;
 
 use common::sid;
-use dope::manifold::connector::{self, codec::Codec as _, lifecycle::Lifecycle as _};
+use dope::manifold::connector;
 use dope_net::link::egress;
 use dope_net::link::egress::queue::Queue;
 use o3::buffer::Shared;
+use o3::cell::RegionToken;
 use sark_h2::client::{Codec, ConnState, Handler, Head, Session, State};
 use sark_h2::frame::{self, Flags, GoAway, Settings};
 use sark_h2::{CLIENT_PREFACE, ClientRole, Conn, ErrorCode, FrameHeader, conn};
@@ -49,10 +50,13 @@ fn goaway_bytes(err: ErrorCode) -> Vec<u8> {
     out
 }
 
-fn collect_sink(sink: &Queue<'_, '_, { connector::state::IOV_CAP }>) -> Vec<u8> {
+fn collect_sink<'d>(
+    sink: &Queue<'_, 'd, '_, { connector::state::IOV_CAP }>,
+    region: &RegionToken<'d>,
+) -> Vec<u8> {
     let mut acc = Vec::new();
     let mut i = 0;
-    while let Some(chunk) = sink.pending_at(i) {
+    while let Some(chunk) = sink.pending_at(region, i) {
         acc.extend_from_slice(chunk.as_slice());
         i += 1;
     }
@@ -61,18 +65,20 @@ fn collect_sink(sink: &Queue<'_, '_, { connector::state::IOV_CAP }>) -> Vec<u8> 
 
 #[test]
 fn connect_emits_preface_and_settings() {
-    let mut session = Session::new(CapturingHandler::new());
-    let mut state = ConnState::default();
-    let storage = egress::storage::Storage::with_capacity(ARENA_CAPACITY);
-    let mut arena = storage.shared_arena(1);
-    let mut sink = arena.queue();
-    session.connect(&mut state, &mut sink);
-    let bytes = collect_sink(&sink);
-    assert!(bytes.starts_with(CLIENT_PREFACE));
-    let after = &bytes[CLIENT_PREFACE.len()..];
-    let h = FrameHeader::parse(after).expect("settings header");
-    assert_eq!(h.kind, frame::Type::Settings);
-    assert!(h.flags.0 & Flags::ACK == 0);
+    RegionToken::scope(|mut region| {
+        let mut session = Session::new(CapturingHandler::new());
+        let mut state = ConnState::default();
+        let storage = egress::storage::Storage::with_capacity(ARENA_CAPACITY);
+        let mut arena = storage.shared_arena(&region, 1);
+        let mut sink = arena.queue();
+        session.connect(&mut state, &mut sink, &mut region);
+        let bytes = collect_sink(&sink, &region);
+        assert!(bytes.starts_with(CLIENT_PREFACE));
+        let after = &bytes[CLIENT_PREFACE.len()..];
+        let h = FrameHeader::parse(after).expect("settings header");
+        assert_eq!(h.kind, frame::Type::Settings);
+        assert!(h.flags.0 & Flags::ACK == 0);
+    });
 }
 
 #[test]
@@ -80,61 +86,68 @@ fn codec_parse_returns_full_buffer() {
     let codec = Codec;
     let mut state = State;
     let buf = Shared::copy_from_slice(&[1u8, 2, 3, 4]);
-    let (head, consumed) = codec.parse(&mut state, &buf).expect("parse");
+    let (head, consumed) = connector::codec::Codec::parse(&codec, &mut state, &buf).expect("parse");
     assert_eq!(consumed, 4);
     let Head(inner) = head;
     assert_eq!(inner.as_slice(), &[1, 2, 3, 4]);
 
     let empty = Shared::new();
-    assert!(codec.parse(&mut state, &empty).is_none());
+    assert!(connector::codec::Codec::parse(&codec, &mut state, &empty).is_none());
 }
 
 #[test]
 fn response_ingests_and_emits_events() {
-    let mut session = Session::new(CapturingHandler::new());
-    let mut state = ConnState::default();
-    let storage = egress::storage::Storage::with_capacity(ARENA_CAPACITY);
-    let mut arena = storage.shared_arena(1);
-    {
+    RegionToken::scope(|mut region| {
+        let mut session = Session::new(CapturingHandler::new());
+        let mut state = ConnState::default();
+        let storage = egress::storage::Storage::with_capacity(ARENA_CAPACITY);
+        let mut arena = storage.shared_arena(&region, 1);
+        {
+            let mut sink = arena.queue();
+            session.connect(&mut state, &mut sink, &mut region);
+            let connected = collect_sink(&sink, &region).len();
+            assert!(sink.try_ack(&mut region, connected));
+        }
         let mut sink = arena.queue();
-        session.connect(&mut state, &mut sink);
-        let connected = collect_sink(&sink).len();
-        assert!(sink.try_ack(connected));
-    }
-    let mut sink = arena.queue();
 
-    let peer = settings_bytes(65_535);
-    let head = Head(Shared::copy_from_slice(&peer));
-    session.response(head, &mut state, &mut sink);
-    assert!(
-        session
-            .handler()
-            .events
-            .iter()
-            .any(|e| matches!(e, conn::Event::SettingsApplied))
-    );
-    let ack_buf = collect_sink(&sink);
-    let h = FrameHeader::parse(&ack_buf).expect("settings ack header");
-    assert_eq!(h.kind, frame::Type::Settings);
-    assert!(h.flags.0 & Flags::ACK != 0);
+        let peer = settings_bytes(65_535);
+        let head = Head(Shared::copy_from_slice(&peer));
+        session.response(head, &mut state, &mut sink, &mut region);
+        assert!(
+            session
+                .handler()
+                .events
+                .iter()
+                .any(|e| matches!(e, conn::Event::SettingsApplied))
+        );
+        let ack_buf = collect_sink(&sink, &region);
+        let h = FrameHeader::parse(&ack_buf).expect("settings ack header");
+        assert_eq!(h.kind, frame::Type::Settings);
+        assert!(h.flags.0 & Flags::ACK != 0);
+    });
 }
 
 #[test]
 fn wants_close_after_goaway_in() {
-    let mut session = Session::new(CapturingHandler::new());
-    let mut state = ConnState::default();
-    let storage = egress::storage::Storage::with_capacity(ARENA_CAPACITY);
-    let mut arena = storage.shared_arena(1);
-    {
+    RegionToken::scope(|mut region| {
+        let mut session = Session::new(CapturingHandler::new());
+        let mut state = ConnState::default();
+        let storage = egress::storage::Storage::with_capacity(ARENA_CAPACITY);
+        let mut arena = storage.shared_arena(&region, 1);
+        {
+            let mut sink = arena.queue();
+            session.connect(&mut state, &mut sink, &mut region);
+        }
         let mut sink = arena.queue();
-        session.connect(&mut state, &mut sink);
-    }
-    let mut sink = arena.queue();
 
-    let mut feed = settings_bytes(65_535);
-    feed.extend_from_slice(&settings_ack_bytes());
-    feed.extend_from_slice(&goaway_bytes(ErrorCode::EnhanceYourCalm));
-    let head = Head(Shared::copy_from_slice(&feed));
-    session.response(head, &mut state, &mut sink);
-    assert!(state.wants_close() == connector::lifecycle::Close::Reconnect);
+        let mut feed = settings_bytes(65_535);
+        feed.extend_from_slice(&settings_ack_bytes());
+        feed.extend_from_slice(&goaway_bytes(ErrorCode::EnhanceYourCalm));
+        let head = Head(Shared::copy_from_slice(&feed));
+        session.response(head, &mut state, &mut sink, &mut region);
+        assert!(
+            connector::lifecycle::Lifecycle::wants_close(&state)
+                == connector::lifecycle::Close::Reconnect
+        );
+    });
 }

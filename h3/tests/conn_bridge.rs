@@ -1,6 +1,7 @@
 use std::time::Instant;
 
-use dope_quic::{Conn, ServerConn, conn, transport_params};
+use dope_quic::conn::{self, Connection, server};
+use dope_quic::transport_params;
 use ring::rand::{SecureRandom, SystemRandom};
 use sark_core::http::Field;
 use sark_h3::dope::Session;
@@ -25,14 +26,16 @@ fn config() -> conn::Config {
     }
 }
 
-fn pair() -> (ServerConn, Conn) {
+fn pair() -> (server::Connection, Connection) {
     let mut seed = [0u8; 32];
     SystemRandom::new().fill(&mut seed).unwrap();
     let signing = SigningKey::from_seed(&seed).unwrap();
     let server_pubkey = *signing.pubkey().unwrap();
     let mut server =
-        Conn::new_server(CID.to_vec(), CID.to_vec(), CID.to_vec(), signing, config()).unwrap();
-    let mut client = Conn::new_client(CID.to_vec(), CID.to_vec(), server_pubkey, config()).unwrap();
+        Connection::new_server(CID.to_vec(), CID.to_vec(), CID.to_vec(), signing, config())
+            .unwrap();
+    let mut client =
+        Connection::new_client(CID.to_vec(), CID.to_vec(), server_pubkey, config()).unwrap();
     let now = Instant::now();
     for _ in 0..3 {
         drain_client(&mut client, &mut server, now);
@@ -43,19 +46,19 @@ fn pair() -> (ServerConn, Conn) {
     (server, client)
 }
 
-fn drain_client(from: &mut Conn, into: &mut ServerConn, now: Instant) {
-    for pkt in from.send_packets(now) {
-        into.recv_packet(&pkt, now).expect("recv");
+fn drain_client(from: &mut Connection, into: &mut server::Connection, now: Instant) {
+    for mut pkt in from.send_packets(now) {
+        into.recv_packet(&mut pkt, now).expect("recv");
     }
 }
 
-fn drain_server(from: &mut ServerConn, into: &mut Conn, now: Instant) {
-    for pkt in from.send_packets(now) {
-        into.recv_packet(&pkt, now).expect("recv");
+fn drain_server(from: &mut server::Connection, into: &mut Connection, now: Instant) {
+    for mut pkt in from.send_packets(now) {
+        into.recv_packet(&mut pkt, now).expect("recv");
     }
 }
 
-fn pump_quic_events(session: &mut Session, quic: &mut Conn) {
+fn pump_quic_events(session: &mut Session, quic: &mut Connection) {
     while let Some(event) = quic.poll_stream_event() {
         session.quic_stream_event(quic, event).unwrap();
     }

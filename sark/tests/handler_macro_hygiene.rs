@@ -26,8 +26,29 @@ async fn standard_macros(_request: Request, _state: &()) -> Reply {
     }
 }
 
+#[sark_gen::handler]
+async fn early_return_preserves_nested_scopes(_request: Request, _state: &()) -> Reply {
+    let nested = |value| {
+        if value {
+            return true;
+        }
+        false
+    };
+    if nested(true) {
+        return Reply {
+            status: StatusCode::OK,
+            body: b"early",
+        };
+    }
+    Reply {
+        status: StatusCode::INTERNAL_SERVER_ERROR,
+        body: b"tail",
+    }
+}
+
 #[test]
 fn handler_canonicalizes_unqualified_standard_macros() {
     fn require_route<T: RouteSpec>() {}
     require_route::<standard_macros>();
+    require_route::<early_return_preserves_nested_scopes>();
 }

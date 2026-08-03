@@ -9,7 +9,8 @@ pub use dope_quic::varint::VarInt;
 pub use o3::buffer::InlineBytes;
 
 pub use conn::{
-    Conn, ConnError, Event, INLINE_PREFIX_CAPACITY, Role, Write, WritePayload, WritePrefix,
+    Config, ConfigError, Conn, ConnError, Event, HeaderSection, INLINE_PREFIX_CAPACITY, Role,
+    ValidatedConfig, Write, WritePayload, WritePrefix,
 };
 pub use frame::{
     ErrorCode, Frame, FrameHeader, ParseError, STREAM_TYPE_CONTROL, STREAM_TYPE_PUSH,

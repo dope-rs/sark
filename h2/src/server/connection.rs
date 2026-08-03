@@ -342,6 +342,7 @@ impl ConnectionState {
                     headers,
                     end_stream,
                     trailing,
+                    ..
                 } => {
                     if trailing {
                         if let Some(mut incoming) = self.take_incoming(stream_id) {

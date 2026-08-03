@@ -1,13 +1,9 @@
 mod common;
 
 use common::{flen, sid, win};
-use sark_h2::frame::{
-    Frame, GoAway as GoAwayFrame, Ping as PingFrame, SettingId, Settings as SettingsFrame,
-    WindowUpdate as WindowUpdateFrame,
-};
+use sark_h2::frame::{self, Frame, SettingId};
 use sark_h2::{
-    CLIENT_PREFACE, ClientRole, Conn, ConnError, ErrorCode, FrameHeader, ServerRole, Settings,
-    conn, frame,
+    CLIENT_PREFACE, ClientRole, Conn, ConnError, ErrorCode, FrameHeader, ServerRole, Settings, conn,
 };
 
 fn server() -> Conn<ServerRole> {
@@ -25,20 +21,20 @@ fn settings_frame_bytes(params: &[(u16, u32)], ack: bool) -> Vec<u8> {
         payload.extend_from_slice(&val.to_be_bytes());
     }
     let mut out = Vec::new();
-    let frame = SettingsFrame::new(ack, &payload).unwrap();
+    let frame = frame::Settings::new(ack, &payload).unwrap();
     frame.encode(&mut out);
     out
 }
 
 fn ping_frame_bytes(opaque: [u8; 8], ack: bool) -> Vec<u8> {
     let mut out = Vec::new();
-    PingFrame { ack, opaque }.encode(&mut out);
+    frame::Ping { ack, opaque }.encode(&mut out);
     out
 }
 
 fn goaway_frame_bytes(last: u32, err: ErrorCode, debug: &[u8]) -> Vec<u8> {
     let mut out = Vec::new();
-    GoAwayFrame::new(sid(last), err, debug)
+    frame::GoAway::new(sid(last), err, debug)
         .unwrap()
         .encode(&mut out);
     out
@@ -46,7 +42,7 @@ fn goaway_frame_bytes(last: u32, err: ErrorCode, debug: &[u8]) -> Vec<u8> {
 
 fn window_update_bytes(stream_id: u32, inc: u32) -> Vec<u8> {
     let mut out = Vec::new();
-    WindowUpdateFrame {
+    frame::WindowUpdate {
         stream_id: sid(stream_id),
         increment: win(inc),
     }

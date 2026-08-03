@@ -96,7 +96,7 @@ where
     fn chunk<R: RetainBytes>(
         app: std::pin::Pin<&mut Demux<A>>,
         slot: &mut Slot<'d, Identity, State<Wrap>>,
-        mut egress: EgressCtx<'_, '_>,
+        mut egress: EgressCtx<'_, 'd, '_>,
         chunk: R,
         driver: &mut DriverContext<'_, 'd>,
     ) -> Outcome {
@@ -115,7 +115,7 @@ where
     fn send(
         app: std::pin::Pin<&mut Demux<A>>,
         slot: &mut Slot<'d, Identity, State<Wrap>>,
-        mut egress: EgressCtx<'_, '_>,
+        mut egress: EgressCtx<'_, 'd, '_>,
         sent: usize,
         driver: &mut DriverContext<'_, 'd>,
     ) {
@@ -127,7 +127,7 @@ where
     fn activate(
         app: std::pin::Pin<&mut Demux<A>>,
         slot: &mut Slot<'d, Identity, State<Wrap>>,
-        mut egress: EgressCtx<'_, '_>,
+        mut egress: EgressCtx<'_, 'd, '_>,
         driver: &mut DriverContext<'_, 'd>,
     ) {
         app.project()
@@ -138,7 +138,7 @@ where
     fn close(
         app: std::pin::Pin<&mut Demux<A>>,
         slot: &mut Slot<'d, Identity, State<Wrap>>,
-        mut egress: EgressCtx<'_, '_>,
+        mut egress: EgressCtx<'_, 'd, '_>,
     ) {
         app.project().inner.close_proj(slot, proj, &mut egress);
     }
@@ -169,7 +169,7 @@ fn async_route_resumes_through_non_identity_projection() {
                 let executor = Executor::new(driver_config)?
                     .with_storage(dope_net::link::egress::storage::Storage::default());
                 executor.enter(|mut session| {
-                    let timer = sark::Timer::with_capacity(32);
+                    let timer = sark::Timer::new();
                     server.clone().serve(
                         &mut session,
                         Demux {
@@ -177,7 +177,6 @@ fn async_route_resumes_through_non_identity_projection() {
                                 &(),
                                 &timer,
                                 sark::app::Config {
-                                    timer_capacity: 32,
                                     task_capacity: support::MAX_CONNECTIONS,
                                 },
                             ),

@@ -1,7 +1,7 @@
 use http::StatusCode;
 use o3::buffer::Shared;
 
-use super::wire_emit::{ContentLength, HeadWrite, PLACEHOLDER_DATE, WireWriter};
+use super::wire_emit::{ContentLength, HeadWrite, PLACEHOLDER_DATE, ProvenWireWriter};
 use super::{
     DEFAULT_HEADER_CAPACITY, HeadInner, HeaderTemplate, Headers, StaticHeaderBytes,
     StaticHeaderFields, StaticHeaders,
@@ -80,13 +80,10 @@ where
     pub fn write_into_slice(&self, out: &mut [u8], date: &[u8; 29]) -> Option<usize> {
         let head = self.head_write();
         let total = head.wire_len().checked_add(self.body.len())?;
-        if out.len() < total {
-            return None;
-        }
-        let written = head.write(out, date);
-        let mut out = WireWriter::at(out, written.len);
+        let mut out = ProvenWireWriter::new(out, total)?;
+        head.emit(&mut out, date);
         out.put(self.body);
-        Some(out.len())
+        Some(out.finish(total))
     }
 
     pub fn write_head_only(
@@ -95,11 +92,10 @@ where
         date: &[u8; 29],
     ) -> Option<(usize, &'static [u8])> {
         let head = self.head_write();
-        if out.len() < head.wire_len() {
-            return None;
-        }
-        let written = head.write(out, date);
-        Some((written.len, self.body))
+        let head_len = head.wire_len();
+        let mut out = ProvenWireWriter::new(out, head_len)?;
+        head.emit(&mut out, date);
+        Some((out.finish(head_len), self.body))
     }
 
     pub fn write_head_split(self, out: &mut [u8], date: &[u8; 29]) -> Option<(usize, Shared)> {
@@ -109,8 +105,11 @@ where
 
     pub fn preserialize_static(&self) -> (Vec<u8>, usize, &'static [u8]) {
         let head = self.head_write();
-        let mut out = vec![0u8; head.wire_len()];
-        let written = head.write(&mut out, PLACEHOLDER_DATE);
-        (out, written.date_offset, self.body)
+        let head_len = head.wire_len();
+        let mut out = vec![0u8; head_len];
+        let mut writer = ProvenWireWriter::exact(&mut out);
+        let date_offset = head.emit(&mut writer, PLACEHOLDER_DATE);
+        writer.finish(head_len);
+        (out, date_offset, self.body)
     }
 }

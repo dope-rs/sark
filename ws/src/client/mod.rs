@@ -1,11 +1,15 @@
-use std::{cell::Cell, marker::PhantomData, pin::Pin, task::Poll};
+use std::{
+    cell::{Cell, RefCell},
+    marker::PhantomData,
+    pin::Pin,
+    task::Poll,
+};
 
 use dope::{
     driver::token::Token,
     manifold::{
         connector::{
-            self,
-            port::{Port as ConnectorPort, Sender},
+            self, port,
             session::{Connector, Ctx},
             source::Dialer,
             state::IOV_CAP,
@@ -16,12 +20,15 @@ use dope::{
 };
 use dope_fiber::abi::Fiber;
 use dope_fiber::abi::pollfn::PollFn;
+use dope_fiber::local::LocalContext;
 use dope_fiber::raw::task::Context;
 use dope_fiber::raw::wait::{WaitQueue, Waiter};
 use dope_fiber::wait::WaitFn;
 use dope_net::Transport;
 use dope_net::link::egress::queue::Queue;
 use o3::buffer::Shared;
+use o3::cell::RegionToken;
+use o3::collections::FixedQueue;
 
 use self::masking::MaskSequence;
 use crate::{crypto::Crypto, fragment::FragmentBuffer, frame::FrameHead};
@@ -31,6 +38,7 @@ mod masking;
 
 const DEFAULT_MAX_MESSAGE: usize = 16 * 1024 * 1024;
 const DEFAULT_MAX_OUTBOUND_FRAME: usize = 16 * 1024 * 1024;
+const DEFAULT_OUTBOUND_CAPACITY: usize = 1_024;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Error {
@@ -57,26 +65,35 @@ pub enum Head {
     Close(Shared),
 }
 
-pub trait Handler {
-    fn handshake_headers(&mut self, _headers: &mut Vec<(String, String)>) -> Result<(), Error> {
+pub trait Handler<'d> {
+    fn handshake_headers(
+        &mut self,
+        _headers: &mut Vec<(String, String)>,
+        _local: &mut LocalContext<'_, 'd>,
+    ) -> Result<(), Error> {
         Ok(())
     }
 
-    fn open(&mut self, _conn_id: Token) {}
-    fn open_send(&mut self, conn_id: Token, _send: &mut SendCtx<'_, '_>) {
-        self.open(conn_id);
+    fn open(&mut self, _conn_id: Token, _local: &mut LocalContext<'_, 'd>) {}
+    fn open_send(&mut self, conn_id: Token, _send: &mut SendCtx<'_, 'd, '_>) {
+        self.open(conn_id, &mut _send.local_context());
     }
-    fn message(&mut self, _conn_id: Token, _msg: Message) {}
-    fn close(&mut self, _conn_id: Token) {}
+    fn message(&mut self, _conn_id: Token, _msg: Message, _local: &mut LocalContext<'_, 'd>) {}
+    fn close(&mut self, _conn_id: Token, _local: &mut LocalContext<'_, 'd>) {}
 }
 
-pub struct SendCtx<'a, 'pool> {
-    sink: Queue<'a, 'pool, IOV_CAP>,
+pub struct SendCtx<'a, 'd, 'pool> {
+    sink: Queue<'a, 'd, 'pool, IOV_CAP>,
+    region: &'a mut RegionToken<'d>,
     rng: &'a MaskSequence,
     max_frame_payload: usize,
 }
 
-impl SendCtx<'_, '_> {
+impl<'a, 'd, 'pool> SendCtx<'a, 'd, 'pool> {
+    pub fn local_context(&mut self) -> LocalContext<'_, 'd> {
+        LocalContext::from_region(self.region)
+    }
+
     pub fn text(&mut self, payload: &[u8]) -> Result<(), Error> {
         self.message(0x1, payload)
     }
@@ -98,8 +115,10 @@ impl SendCtx<'_, '_> {
     }
 
     fn message(&mut self, opcode: u8, payload: &[u8]) -> Result<(), Error> {
+        let sink = &mut self.sink;
+        let region = &mut self.region;
         FrameEncoder::new(self.rng).enqueue(
-            &mut self.sink,
+            |frame| sink.try_enqueue(region, frame).is_ok(),
             opcode,
             payload,
             self.max_frame_payload.max(1),
@@ -111,8 +130,10 @@ impl SendCtx<'_, '_> {
         if payload.len() > 125 {
             return Err(Error::MessageTooLarge);
         }
+        let sink = &mut self.sink;
+        let region = &mut self.region;
         FrameEncoder::new(self.rng).enqueue(
-            &mut self.sink,
+            |frame| sink.try_enqueue(region, frame).is_ok(),
             opcode,
             payload,
             payload.len().max(1),
@@ -130,6 +151,7 @@ pub struct Config {
     pub max_frame_payload: usize,
     pub max_message_size: usize,
     pub max_outbound_frame_payload: usize,
+    pub outbound_capacity: usize,
 }
 
 impl Config {
@@ -142,6 +164,7 @@ impl Config {
             max_frame_payload: DEFAULT_MAX_MESSAGE,
             max_message_size: DEFAULT_MAX_MESSAGE,
             max_outbound_frame_payload: DEFAULT_MAX_OUTBOUND_FRAME,
+            outbound_capacity: DEFAULT_OUTBOUND_CAPACITY,
         }
     }
 
@@ -180,6 +203,11 @@ impl Config {
 
     pub fn max_outbound_frame_payload(mut self, max_outbound_frame_payload: usize) -> Self {
         self.max_outbound_frame_payload = max_outbound_frame_payload.max(1);
+        self
+    }
+
+    pub fn outbound_capacity(mut self, outbound_capacity: usize) -> Self {
+        self.outbound_capacity = outbound_capacity.max(1);
         self
     }
 }
@@ -347,14 +375,16 @@ pub struct SharedState {
     conn_id: Cell<Option<Token>>,
     active_waiters: Pin<Box<WaitQueue>>,
     rng: MaskSequence,
+    pending_egress: RefCell<FixedQueue<(Token, Shared)>>,
 }
 
 impl SharedState {
-    fn new(waiter_capacity: usize) -> Self {
+    fn new(waiter_capacity: usize, outbound_capacity: usize) -> Self {
         Self {
             conn_id: Cell::new(None),
             active_waiters: Box::pin(WaitQueue::with_capacity(waiter_capacity)),
             rng: MaskSequence::default(),
+            pending_egress: RefCell::new(FixedQueue::with_capacity(outbound_capacity)),
         }
     }
 
@@ -374,7 +404,7 @@ impl SharedState {
 pub struct Port<'d> {
     codec: Codec,
     shared: SharedState,
-    io: ConnectorPort<'d, Shared>,
+    io: port::Port<'d, Shared>,
     egress: dope_net::link::egress::storage::Storage,
 }
 
@@ -389,12 +419,13 @@ impl<'d> Port<'d> {
         config: Config,
         capacity: usize,
         waiter_capacity: usize,
-        driver: dope::DriverRef<'d>,
+        driver: &mut dope::DriverContext<'_, 'd>,
     ) -> Self {
+        let outbound_capacity = config.outbound_capacity;
         Self {
             codec: Codec { config },
-            shared: SharedState::new(waiter_capacity),
-            io: ConnectorPort::with_capacity(capacity, driver),
+            shared: SharedState::new(waiter_capacity, outbound_capacity),
+            io: port::Port::with_capacity(capacity, driver.region_token_ref(), driver.driver_ref()),
             egress: dope_net::link::egress::storage::Storage::default(),
         }
     }
@@ -420,28 +451,23 @@ impl StorageFactory for PortFactory {
     type Output<'d> = Port<'d>;
 
     fn build<'d>(self, driver: &mut dope::DriverContext<'_, 'd>) -> Self::Output<'d> {
-        Port::new(
-            self.config,
-            self.capacity,
-            self.waiter_capacity,
-            driver.driver_ref(),
-        )
+        Port::new(self.config, self.capacity, self.waiter_capacity, driver)
     }
 }
 
-pub struct Session<'d, H: Handler> {
+pub struct Session<'d, H: Handler<'d>> {
     handler: H,
     port: &'d Port<'d>,
 }
 
-impl<'d, H: Handler> Session<'d, H> {
+impl<'d, H: Handler<'d>> Session<'d, H> {
     pub fn new(handler: H, port: &'d Port<'d>) -> Self {
         Self { handler, port }
     }
 }
 
 #[dope_gen::connector_session(codec = port.codec, io = port.io)]
-impl<'d, H: Handler> connector::session::Session<'d> for Session<'d, H> {
+impl<'d, H: Handler<'d>> connector::session::Session<'d> for Session<'d, H> {
     type Codec = Codec;
     type ConnState = ConnState;
     type Send = Shared;
@@ -463,7 +489,11 @@ impl<'d, H: Handler> connector::session::Session<'d> for Session<'d, H> {
         self.port.shared.conn_id.set(None);
 
         let mut headers = self.port.codec.config.headers.clone();
-        if self.handler.handshake_headers(&mut headers).is_err()
+        let mut local = LocalContext::from_region(ctx.region);
+        if self
+            .handler
+            .handshake_headers(&mut headers, &mut local)
+            .is_err()
             || !headers
                 .iter()
                 .all(|(name, value)| handshake::header_name(name) && handshake::header_value(value))
@@ -473,9 +503,10 @@ impl<'d, H: Handler> connector::session::Session<'d> for Session<'d, H> {
         }
 
         if out
-            .try_enqueue(Shared::from(
-                self.port.codec.handshake_request(&key, &headers),
-            ))
+            .try_enqueue(
+                ctx.region,
+                Shared::from(self.port.codec.handshake_request(&key, &headers)),
+            )
             .is_err()
         {
             state.closing = true;
@@ -492,6 +523,7 @@ impl<'d, H: Handler> connector::session::Session<'d> for Session<'d, H> {
                     self.port.shared.wake();
                     let mut send = SendCtx {
                         sink: ctx.sink.reborrow(),
+                        region: ctx.region,
                         rng: &self.port.shared.rng,
                         max_frame_payload: self.port.codec.config.max_outbound_frame_payload,
                     };
@@ -509,29 +541,55 @@ impl<'d, H: Handler> connector::session::Session<'d> for Session<'d, H> {
                 if let Message::Ping(ref payload) = msg {
                     let mut send = SendCtx {
                         sink: ctx.sink.reborrow(),
+                        region: ctx.region,
                         rng: &self.port.shared.rng,
                         max_frame_payload: self.port.codec.config.max_outbound_frame_payload,
                     };
                     let _ = send.pong(payload.as_slice());
                 }
-                self.handler.message(conn_id, msg);
+                self.handler
+                    .message(conn_id, msg, &mut LocalContext::from_region(ctx.region));
             }
             Head::Continuation => {}
             Head::Close(_payload) => {
                 self.port.shared.conn_id.set(None);
                 self.port.shared.wake();
                 state.closing = true;
-                self.handler.close(conn_id);
+                self.handler
+                    .close(conn_id, &mut LocalContext::from_region(ctx.region));
             }
         }
     }
 
     fn disconnect(&mut self, ctx: &mut Ctx<'_, '_, 'd, Self>) {
-        self.port.io.deactivate(ctx.conn_id);
+        self.port.io.deactivate(ctx.region, ctx.conn_id);
         self.port.shared.conn_id.set(None);
         self.port.shared.wake();
-        self.handler.close(ctx.conn_id);
+        self.handler
+            .close(ctx.conn_id, &mut LocalContext::from_region(ctx.region));
         ctx.state.closing = false;
+    }
+
+    fn pre_park(&mut self, region: &mut RegionToken<'d>) {
+        loop {
+            let Some((target, frame)) = self.port.shared.pending_egress.borrow_mut().pop_front()
+            else {
+                break;
+            };
+            if let Err(frame) = self.port.io.try_enqueue(region, target, frame)
+                && self.port.io.is_active(target)
+            {
+                let restored = self
+                    .port
+                    .shared
+                    .pending_egress
+                    .borrow_mut()
+                    .push_front((target, frame))
+                    .is_ok();
+                debug_assert!(restored, "popped handoff slot must remain available");
+                break;
+            }
+        }
     }
 }
 
@@ -552,7 +610,7 @@ impl<H, S, E, const ID: u8> Clone for WsHandle<'_, '_, ID, H, S, E> {
 
 impl<'a, 'd, const ID: u8, H, S, E> WsHandle<'a, 'd, ID, H, S, E>
 where
-    H: Handler + 'd,
+    H: Handler<'d> + 'd,
     S: Dialer<E::Transport> + 'd,
     E: Env + 'd,
     E::Transport: Transport<Addr: Clone>,
@@ -569,17 +627,17 @@ where
     }
 
     pub fn try_send_text(&self, payload: &[u8]) -> Result<(), Error> {
-        Outbound::new(self.port).message(0x1, payload)
+        Outbound::new(self.port).message_pending(0x1, payload)
     }
 
     pub fn try_send_binary(&self, payload: &[u8]) -> Result<(), Error> {
-        Outbound::new(self.port).message(0x2, payload)
+        Outbound::new(self.port).message_pending(0x2, payload)
     }
 }
 
 pub trait Client<'d, H, S, E>
 where
-    H: Handler + 'd,
+    H: Handler<'d> + 'd,
     S: Dialer<E::Transport> + 'd,
     E: Env + 'd,
     E::Transport: Transport<Addr: Clone>,
@@ -606,7 +664,7 @@ where
 
 impl<'a, 'd, const ID: u8, H, S, E> Client<'d, H, S, E> for WsHandle<'a, 'd, ID, H, S, E>
 where
-    H: Handler + 'd,
+    H: Handler<'d> + 'd,
     S: Dialer<E::Transport> + 'd,
     E: Env + 'd,
     E::Transport: Transport<Addr: Clone>,
@@ -674,26 +732,38 @@ impl<'p, 'd> Outbound<'p, 'd> {
         'p: 'b,
         'd: 'b,
     {
-        PollFn::new(move |_cx| {
+        PollFn::new(move |mut cx| {
             if CONTROL && payload.len() > 125 {
                 return Poll::Ready(Err(Error::MessageTooLarge));
             }
             let result = if CONTROL {
-                self.frames(opcode, payload, payload.len().max(1), true)
+                self.frames(
+                    cx.as_mut().region_token(),
+                    opcode,
+                    payload,
+                    payload.len().max(1),
+                    true,
+                )
             } else {
-                self.message(opcode, payload)
+                self.message(cx.as_mut().region_token(), opcode, payload)
             };
             Poll::Ready(result)
         })
     }
 
-    fn message(self, opcode: u8, payload: &[u8]) -> Result<(), Error> {
+    fn message(
+        self,
+        region: &mut RegionToken<'d>,
+        opcode: u8,
+        payload: &[u8],
+    ) -> Result<(), Error> {
         let max = self.port.codec.config.max_outbound_frame_payload.max(1);
-        self.frames(opcode, payload, max, false)
+        self.frames(region, opcode, payload, max, false)
     }
 
     fn frames(
         self,
+        region: &mut RegionToken<'d>,
         opcode: u8,
         payload: &[u8],
         max_payload: usize,
@@ -702,13 +772,42 @@ impl<'p, 'd> Outbound<'p, 'd> {
         let shared = &self.port.shared;
         let conn_id = shared.conn_id.get().ok_or(Error::NotConnected)?;
         let encoder = FrameEncoder::new(&shared.rng);
-        let Some(result) = self.port.io.with_sender(conn_id, |mut sender| {
-            encoder.enqueue(&mut sender, opcode, payload, max_payload, control)
+        let Some(result) = self.port.io.with_sender(conn_id, |sender| {
+            encoder.enqueue(
+                |frame| sender.try_enqueue(region, frame).is_ok(),
+                opcode,
+                payload,
+                max_payload,
+                control,
+            )
         }) else {
             shared.conn_id.set(None);
             shared.wake();
             return Err(Error::NotConnected);
         };
+        result
+    }
+
+    fn message_pending(self, opcode: u8, payload: &[u8]) -> Result<(), Error> {
+        let max_payload = self.port.codec.config.max_outbound_frame_payload.max(1);
+        let shared = &self.port.shared;
+        let conn_id = shared.conn_id.get().ok_or(Error::NotConnected)?;
+        let required = payload.len().max(1).div_ceil(max_payload);
+        let mut pending = shared.pending_egress.borrow_mut();
+        if pending.capacity() - pending.len() < required {
+            return Err(Error::Backpressure);
+        }
+        let result = FrameEncoder::new(&shared.rng).enqueue(
+            |frame| pending.push_back((conn_id, frame)).is_ok(),
+            opcode,
+            payload,
+            max_payload,
+            false,
+        );
+        debug_assert!(
+            result.is_ok(),
+            "reserved handoff capacity must be sufficient"
+        );
         result
     }
 }
@@ -723,16 +822,16 @@ impl<'a> FrameEncoder<'a> {
         Self { masks }
     }
 
-    fn enqueue<S: FrameSink + ?Sized>(
+    fn enqueue(
         self,
-        sink: &mut S,
+        mut push: impl FnMut(Shared) -> bool,
         opcode: u8,
         payload: &[u8],
         max_payload: usize,
         control: bool,
     ) -> Result<(), Error> {
         if control || payload.len() <= max_payload {
-            if !sink.push_frame(self.frame(opcode, true, payload)) {
+            if !push(self.frame(opcode, true, payload)) {
                 return Err(Error::Backpressure);
             }
             return Ok(());
@@ -743,7 +842,7 @@ impl<'a> FrameEncoder<'a> {
             let end = (off + max_payload).min(payload.len());
             let fin = end == payload.len();
             let op = if first { opcode } else { 0x0 };
-            if !sink.push_frame(self.frame(op, fin, &payload[off..end])) {
+            if !push(self.frame(op, fin, &payload[off..end])) {
                 return Err(Error::Backpressure);
             }
             first = false;
@@ -763,21 +862,5 @@ impl<'a> FrameEncoder<'a> {
         frame.extend_from_slice(payload);
         Mask::unmask_in_place(&mut frame[start..], mask);
         Shared::from(frame)
-    }
-}
-
-trait FrameSink {
-    fn push_frame(&mut self, frame: Shared) -> bool;
-}
-
-impl FrameSink for Queue<'_, '_, IOV_CAP> {
-    fn push_frame(&mut self, frame: Shared) -> bool {
-        self.try_enqueue(frame).is_ok()
-    }
-}
-
-impl FrameSink for Sender<'_, '_, Shared> {
-    fn push_frame(&mut self, frame: Shared) -> bool {
-        self.try_enqueue(frame).is_ok()
     }
 }

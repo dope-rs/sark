@@ -4,7 +4,7 @@ use o3::buffer::Shared;
 use super::Response;
 use super::body::Body;
 use super::header::HeaderList;
-use super::wire_emit::{CRLF, HeadWrite, TransferEncodingChunked, WireWriter};
+use super::wire_emit::{CRLF, HeadWrite, ProvenWireWriter, TransferEncodingChunked};
 use crate::http::codec::Wire;
 
 #[derive(Clone, Debug)]
@@ -46,7 +46,7 @@ impl Chunked {
 
     const ZERO_CHUNK: &'static [u8] = b"0\r\n\r\n";
 
-    fn body_wire_len(&self) -> usize {
+    fn body_wire_len(&self) -> Option<usize> {
         let mut len = 0usize;
         for part in &self.parts {
             if part.is_empty() {
@@ -54,12 +54,16 @@ impl Chunked {
             }
             let mut hex = [0u8; 16];
             let hex_n = Wire::write_hex(part.len(), &mut hex);
-            len += hex_n + CRLF.len() + part.len() + CRLF.len();
+            len = len
+                .checked_add(hex_n)?
+                .checked_add(CRLF.len())?
+                .checked_add(part.len())?
+                .checked_add(CRLF.len())?;
         }
-        len + Self::ZERO_CHUNK.len()
+        len.checked_add(Self::ZERO_CHUNK.len())
     }
 
-    fn write_body(&self, out: &mut WireWriter<'_>) {
+    fn write_body(&self, out: &mut ProvenWireWriter<'_>) {
         for part in &self.parts {
             if part.is_empty() {
                 continue;
@@ -84,26 +88,25 @@ impl Chunked {
 
     pub fn write_into_slice(&self, out: &mut [u8], date: &[u8; 29]) -> Option<usize> {
         let head = self.head();
-        let total = head.wire_len() + self.body_wire_len();
-        if out.len() < total {
-            return None;
-        }
-
-        let written = head.write(out, date);
-        let mut out = WireWriter::at(out, written.len);
+        let total = head.wire_len().checked_add(self.body_wire_len()?)?;
+        let mut out = ProvenWireWriter::new(out, total)?;
+        head.emit(&mut out, date);
         self.write_body(&mut out);
-        Some(out.len())
+        Some(out.finish(total))
     }
 
     pub fn write_head_split(self, out: &mut [u8], date: &[u8; 29]) -> Option<(usize, Shared)> {
         let head = self.head();
-        if out.len() < head.wire_len() {
-            return None;
-        }
-        let written = head.write(out, date);
+        let head_len = head.wire_len();
+        let body_len = self.body_wire_len()?;
+        let mut out = ProvenWireWriter::new(out, head_len)?;
+        head.emit(&mut out, date);
+        let written = out.finish(head_len);
 
-        let mut body = vec![0u8; self.body_wire_len()];
-        self.write_body(&mut WireWriter::new(&mut body));
-        Some((written.len, Shared::from(body)))
+        let mut body = vec![0u8; body_len];
+        let mut out = ProvenWireWriter::exact(&mut body);
+        self.write_body(&mut out);
+        out.finish(body_len);
+        Some((written, Shared::from(body)))
     }
 }

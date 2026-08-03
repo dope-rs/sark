@@ -10,7 +10,7 @@ use dope::{
 use dope_net::{link::slot::Slot, wire::Wire};
 use o3::buffer::{Pooled, Shared};
 
-use crate::{dispatch::pipeline::Pipeline, fiber::ErasedTaskId, timer::Ticket};
+use crate::{dispatch::pipeline::Pipeline, fiber::ErasedTaskId};
 
 pub const RECV_HEAD_CAP: usize = 64 * 1024;
 pub const RECV_BODY_CAP: usize = 4 * 1024 * 1024;
@@ -93,7 +93,7 @@ impl Outcome {
     pub fn apply<'d, W: Wire, C: Default + 'static>(
         self,
         slot: &mut Slot<'d, W, State<C>>,
-        egress: &mut EgressCtx<'_, '_>,
+        egress: &mut EgressCtx<'_, 'd, '_>,
         driver: &mut DriverContext<'_, 'd>,
     ) -> bool {
         let close_after = match &self {
@@ -204,7 +204,6 @@ pub struct ConnState {
     pub conn_id: Token,
     pub recv_view: Option<Shared>,
     pub pipeline: Pipeline,
-    pub head_deadline: Option<Ticket>,
 }
 
 impl Default for ConnState {
@@ -218,7 +217,6 @@ impl Default for ConnState {
             conn_id: Token::new(0, SlotIndex::ZERO, Epoch::INITIAL),
             recv_view: None,
             pipeline: Pipeline::default(),
-            head_deadline: None,
         }
     }
 }

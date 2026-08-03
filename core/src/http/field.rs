@@ -16,6 +16,41 @@ impl<'a> Field<'a> {
     }
 }
 
+#[doc(hidden)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct FieldMatch<I> {
+    pub exact: Option<I>,
+    pub name: Option<I>,
+}
+
+#[doc(hidden)]
+pub fn match_field_candidates<'a, K, I>(
+    target: Field<'_>,
+    candidates: impl IntoIterator<Item = (K, Field<'a>)>,
+    mut classify: impl FnMut(K) -> Option<I>,
+) -> FieldMatch<I>
+where
+    I: Copy,
+{
+    let mut name = None;
+    for (key, candidate) in candidates {
+        if candidate.name != target.name {
+            continue;
+        }
+        let Some(index) = classify(key) else {
+            continue;
+        };
+        name.get_or_insert(index);
+        if candidate.value == target.value {
+            return FieldMatch {
+                exact: Some(index),
+                name,
+            };
+        }
+    }
+    FieldMatch { exact: None, name }
+}
+
 impl<'field> From<&Field<'field>> for Field<'field> {
     fn from(field: &Field<'field>) -> Self {
         *field
@@ -250,6 +285,7 @@ impl<S: AsRef<[u8]>> FieldStorage for PackedFields<S> {
 
 pub type PooledFieldBlock = FieldBlock<PackedFields<Pooled>>;
 pub type VecFieldBlock = FieldBlock<PackedFields<Vec<u8>>>;
+pub type DecodedFieldBlock = PooledFieldBlock;
 
 impl FieldBlock<PackedFields<Pooled>> {
     pub fn from_pooled(pooled: Pooled) -> Self {
@@ -284,6 +320,10 @@ impl FieldBlock<PackedFields<Pooled>> {
 
     pub fn to_owned(&self) -> Vec<OwnedField> {
         self.iter().map(OwnedField::from).collect()
+    }
+
+    pub(crate) fn into_primary(self) -> Pooled {
+        self.storage.first
     }
 }
 
@@ -368,15 +408,30 @@ impl FieldBlock<PackedFields<Vec<u8>>> {
         self.storage.first[field_start + 4..name_start].copy_from_slice(&value_len_bytes);
         Ok((name_len, value_len))
     }
+}
 
+impl<S: AsRef<[u8]>> FieldBlock<PackedFields<S>> {
     pub fn as_bytes(&self) -> &[u8] {
-        &self.storage.first
+        self.storage.first.as_ref()
     }
 
     pub fn iter_with_value_ranges(&self) -> PackedFieldRangeIter<'_> {
         PackedFieldRangeIter {
-            current: &self.storage.first,
+            current: self.storage.first.as_ref(),
             offset: 0,
+        }
+    }
+
+    #[doc(hidden)]
+    pub fn iter_with_value_ranges_from(&self, offset: usize) -> PackedFieldRangeIter<'_> {
+        PackedFieldRangeIter {
+            current: self
+                .storage
+                .first
+                .as_ref()
+                .get(offset..)
+                .unwrap_or_default(),
+            offset,
         }
     }
 }
@@ -459,4 +514,28 @@ fn parse_packed_field(bytes: &[u8]) -> Option<(Field<'_>, usize, usize)> {
         value_start,
         end,
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Field, match_field_candidates};
+
+    #[test]
+    fn field_matching_classifies_only_name_candidates_and_stops_at_exact() {
+        let candidates = [
+            (0, Field::new(b"other", b"target")),
+            (1, Field::new(b"name", b"older")),
+            (2, Field::new(b"name", b"target")),
+            (3, Field::new(b"name", b"newer")),
+        ];
+        let mut classified = Vec::new();
+        let found = match_field_candidates(Field::new(b"name", b"target"), candidates, |index| {
+            classified.push(index);
+            (index != 1).then_some(index)
+        });
+
+        assert_eq!(found.exact, Some(2));
+        assert_eq!(found.name, Some(2));
+        assert_eq!(classified, [1, 2]);
+    }
 }

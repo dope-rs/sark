@@ -1,9 +1,17 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use sark::dispatch::Decode;
-use sark_core::http::{Field, VecFieldBlock};
+use sark_core::http::{Field, PlannedHead};
 use sark_h3::dope::H3Encoder;
-use sark_h3::{Conn, Event, Role, StreamId, StreamTransport, pump_stream_event, pump_writes};
+use sark_h3::qpack::Encoder;
+use sark_h3::{
+    Conn, Event, Frame, Role, StreamId, StreamTransport, TYPE_HEADERS, pump_stream_event,
+    pump_writes,
+};
+
+fn routed_conn<R: Decode>(_: &R) -> Conn<R::Plan> {
+    Conn::from_config_with_plan(Role::Server, sark_h3::ValidatedConfig::default())
+}
 
 #[sark_gen::response(raw)]
 #[header("content-type", "text/plain")]
@@ -73,14 +81,11 @@ impl StreamTransport for FakeTransport {
 
 #[test]
 fn h3_request_routes_and_responds() {
-    let timer = sark::Timer::with_capacity(0);
+    let timer = sark::Timer::new();
     let app = H3App::new::<dope_net::wire::identity::Identity>(
         sark::EmptyState::REF,
         &timer,
-        sark::app::Config {
-            timer_capacity: 0,
-            task_capacity: 0,
-        },
+        sark::app::Config { task_capacity: 0 },
     );
 
     let mut client = Conn::with_role(Role::Client);
@@ -92,6 +97,7 @@ fn h3_request_routes_and_responds() {
                 Field::new(b":scheme", b"https"),
                 Field::new(b":authority", b"x"),
                 Field::new(b":path", b"/json"),
+                Field::new(b"x-ignored", b"discard-me"),
                 Field::new(b"x-name", b"alice"),
             ],
             true,
@@ -101,21 +107,26 @@ fn h3_request_routes_and_responds() {
     let mut wire = FakeTransport::default();
     pump_writes(&mut client, &mut wire).unwrap();
 
-    let mut server = Conn::with_role(Role::Server);
+    let mut server = routed_conn(&app);
     wire.recv.insert(0, wire.sent.remove(&0).unwrap());
     wire.recv_fin.insert(0);
     pump_stream_event(&mut server, &mut wire, 0).unwrap();
 
-    let mut pending: Option<(StreamId, VecFieldBlock)> = None;
+    let mut pending = None;
     let mut routed = false;
     while let Some(ev) = server.poll_event() {
         match ev {
             Event::Headers {
-                stream_id, fields, ..
-            } => pending = Some((stream_id, fields)),
+                stream_id,
+                fields,
+                selection,
+                ..
+            } => {
+                pending = Some((stream_id, PlannedHead::new(fields, selection)));
+            }
             Event::Finished { stream_id } => {
-                let (_sid, fields) = pending.take().expect("headers before finish");
-                let prepared = app.prepare_decoded(fields).expect("known route");
+                let (_sid, head) = pending.take().expect("headers before finish");
+                let prepared = app.prepare_planned_head(head).expect("known route");
                 let mut enc = H3Encoder::new(&mut server, stream_id);
                 let out = app.dispatch_prepared(prepared, &[][..], &mut enc);
                 assert_eq!(out, sark::dispatch::Decoded::Emitted);
@@ -160,4 +171,61 @@ fn h3_request_routes_and_responds() {
         }
     }
     assert!(status_ok && body_ok);
+}
+
+#[test]
+fn planned_huffman_values_decode_directly_into_their_final_sink() {
+    let timer = sark::Timer::new();
+    let app = H3App::new::<dope_net::wire::identity::Identity>(
+        sark::EmptyState::REF,
+        &timer,
+        sark::app::Config { task_capacity: 0 },
+    );
+    let mut qpack = Encoder::new();
+    qpack.set_huffman(true);
+    let mut block = Vec::new();
+    qpack.encode(
+        [
+            Field::new(b":path", b"/json"),
+            Field::new(b":scheme", b"https"),
+            Field::new(b":authority", b"x"),
+            Field::new(b":method", b"GET"),
+            Field::new(b"x-ignored", b"discarded huffman value"),
+            Field::new(b"x-name", b"alice"),
+        ],
+        &mut block,
+    );
+    let mut wire = Vec::new();
+    Frame::encode(TYPE_HEADERS, &block, &mut wire).unwrap();
+
+    let mut server = routed_conn(&app);
+    server
+        .ingest_stream_owned(StreamId::new(0), wire, true)
+        .unwrap();
+    let mut planned = None;
+    while let Some(event) = server.poll_event() {
+        if let Event::Headers {
+            fields, selection, ..
+        } = event
+        {
+            planned = Some(PlannedHead::new(fields, selection));
+        }
+    }
+    let prepared = app
+        .prepare_planned_head(planned.expect("decoded request head"))
+        .expect("known route");
+    let mut response = H3Encoder::new(&mut server, StreamId::new(0));
+    assert_eq!(
+        app.dispatch_prepared(prepared, &[][..], &mut response),
+        sark::dispatch::Decoded::Emitted,
+    );
+    assert!(response.ok());
+
+    let mut sent = FakeTransport::default();
+    pump_writes(&mut server, &mut sent).unwrap();
+    assert!(
+        sent.sent
+            .get(&0)
+            .is_some_and(|bytes| bytes.windows(b"hello-h3".len()).any(|w| w == b"hello-h3"))
+    );
 }

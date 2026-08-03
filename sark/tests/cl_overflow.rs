@@ -93,14 +93,13 @@ fn bad_content_length_does_not_panic_and_server_survives() {
             );
             executor.enter(|mut session| {
                 let timer =
-                    sark::Timer::with_capacity(support::MAX_CONNECTIONS.saturating_mul(2));
+                    sark::Timer::new();
                 server.clone().serve(
                     &mut session,
                     ClOverflowDispatch::new(
                         &(),
                         &timer,
                         sark::app::Config {
-                            timer_capacity: support::MAX_CONNECTIONS.saturating_mul(2),
                             task_capacity: support::MAX_CONNECTIONS,
                         },
                     ),

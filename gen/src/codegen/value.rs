@@ -221,9 +221,32 @@ impl FieldPlan {
         canonical_name: bool,
     ) -> (TokenStream, TokenStream, TokenStream) {
         let variants: Vec<_> = self.entries.iter().map(|field| &field.variant).collect();
+        let tag_arms: Vec<_> = self
+            .entries
+            .iter()
+            .enumerate()
+            .map(|(index, field)| {
+                let variant = &field.variant;
+                quote! { #index => Some(Self::#variant), }
+            })
+            .collect();
         let enum_tokens = quote! {
+            #[repr(u16)]
             #[derive(Clone, Copy)]
             enum #slot_ident { #( #variants, )* }
+
+            impl sark::service::HeaderSlot for #slot_ident {
+                fn into_tag(self) -> u16 {
+                    self as u16
+                }
+
+                fn from_tag(tag: u16) -> Option<Self> {
+                    match tag as usize {
+                        #( #tag_arms )*
+                        _ => None,
+                    }
+                }
+            }
         };
         let slot_probe_match = LengthArms::collect(self.entries.iter().map(|field| {
             let slot = &field.variant;

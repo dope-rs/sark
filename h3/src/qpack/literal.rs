@@ -1,14 +1,44 @@
+use core::convert::Infallible;
+
+use o3::buffer::ByteSink;
 use sark_core::http::{
-    FieldValueWriter, HpackHuffmanEncoded, HpackHuffmanError, HpackHuffmanSource, PrefixedInt,
-    ValidPrefixedIntWidth,
+    HpackHuffmanEncoded, HpackHuffmanError, HpackHuffmanSource, PrefixedInt, ValidPrefixedIntWidth,
 };
 
 use super::DecoderError;
+
+struct Discard;
+
+impl ByteSink for Discard {
+    type Error = Infallible;
+
+    fn write_slices<const N: usize>(&mut self, _slices: [&[u8]; N]) -> Result<(), Self::Error> {
+        Ok(())
+    }
+}
 
 #[derive(Copy, Clone)]
 pub(super) struct Literal<'a> {
     bytes: &'a [u8],
     huffman: bool,
+}
+
+pub(super) enum DecodedLiteral<'a, 'scratch> {
+    Borrowed(&'a [u8]),
+    Scratch(&'scratch [u8]),
+}
+
+impl<'a, 'scratch> DecodedLiteral<'a, 'scratch> {
+    pub(super) fn as_slice<'view>(&'view self) -> &'view [u8]
+    where
+        'a: 'view,
+        'scratch: 'view,
+    {
+        match self {
+            Self::Borrowed(bytes) => bytes,
+            Self::Scratch(bytes) => bytes,
+        }
+    }
 }
 
 impl<'a> Literal<'a> {
@@ -70,7 +100,7 @@ impl<'a> Literal<'a> {
 
     pub(super) fn write_to(
         self,
-        out: &mut FieldValueWriter<'_>,
+        out: &mut impl ByteSink,
         max_len: usize,
     ) -> Result<usize, DecoderError> {
         if self.huffman {
@@ -81,7 +111,7 @@ impl<'a> Literal<'a> {
                     if len > max_len {
                         return Err(HpackHuffmanError);
                     }
-                    out.push(byte);
+                    out.write_byte(byte).map_err(|_| HpackHuffmanError)?;
                     Ok(())
                 })
                 .map_err(|_| DecoderError::BadLiteral)?;
@@ -90,9 +120,43 @@ impl<'a> Literal<'a> {
             if self.bytes.len() > max_len {
                 return Err(DecoderError::BadLiteral);
             }
-            out.extend_from_slice(self.bytes);
+            out.write_slice(self.bytes)
+                .map_err(|_| DecoderError::Capacity)?;
             Ok(self.bytes.len())
         }
+    }
+
+    pub(super) const fn raw_bytes(self) -> Option<&'a [u8]> {
+        if self.huffman { None } else { Some(self.bytes) }
+    }
+
+    pub(super) fn decode_into<'scratch>(
+        self,
+        scratch: &'scratch mut Vec<u8>,
+        max_len: usize,
+    ) -> Result<DecodedLiteral<'a, 'scratch>, DecoderError> {
+        if let Some(bytes) = self.raw_bytes() {
+            return if bytes.len() <= max_len {
+                Ok(DecodedLiteral::Borrowed(bytes))
+            } else {
+                Err(DecoderError::BadLiteral)
+            };
+        }
+        scratch.clear();
+        HpackHuffmanEncoded::new(self.bytes)
+            .decode_with(|byte| {
+                if scratch.len() == max_len {
+                    return Err(HpackHuffmanError);
+                }
+                scratch.push(byte);
+                Ok(())
+            })
+            .map_err(|_| DecoderError::BadLiteral)?;
+        Ok(DecodedLiteral::Scratch(scratch))
+    }
+
+    pub(super) fn decoded_len(self, max_len: usize) -> Result<usize, DecoderError> {
+        self.write_to(&mut Discard, max_len)
     }
 
     fn into_vec(self) -> Result<Vec<u8>, DecoderError> {

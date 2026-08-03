@@ -59,14 +59,13 @@ fn main() -> std::io::Result<()> {
         vec![0u16],
         |_cpu| driver::Config::for_tcp_profile::<Throughput>(MAX_CONNECTIONS),
         |server, session| {
-            let timer = sark::Timer::with_capacity(MAX_CONNECTIONS.saturating_mul(2));
+            let timer = sark::Timer::new();
             server.serve(
                 session,
                 DownloadApp::new(
                     &(),
                     &timer,
                     app::Config {
-                        timer_capacity: MAX_CONNECTIONS.saturating_mul(2),
                         task_capacity: MAX_CONNECTIONS,
                     },
                 ),

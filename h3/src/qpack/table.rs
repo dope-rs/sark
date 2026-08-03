@@ -1,6 +1,6 @@
 use std::collections::VecDeque;
 
-use sark_core::http::{Field, OwnedField};
+use sark_core::http::{Field, FieldMatch, OwnedField, match_field_candidates};
 
 use super::DecoderError;
 
@@ -8,7 +8,7 @@ use super::DecoderError;
 pub struct DynamicTable {
     entries: VecDeque<OwnedField>,
     capacity: usize,
-    max_capacity: usize,
+    max_capacity: u64,
     size: usize,
     insert_count: u64,
 }
@@ -18,7 +18,7 @@ impl DynamicTable {
         Self {
             entries: VecDeque::new(),
             capacity: 0,
-            max_capacity,
+            max_capacity: max_capacity as u64,
             size: 0,
             insert_count: 0,
         }
@@ -28,12 +28,12 @@ impl DynamicTable {
         self.capacity
     }
 
-    pub fn max_capacity(&self) -> usize {
+    pub fn max_capacity(&self) -> u64 {
         self.max_capacity
     }
 
     pub fn max_entries(&self) -> u64 {
-        (self.max_capacity / 32) as u64
+        self.max_capacity / 32
     }
 
     pub fn insert_count(&self) -> u64 {
@@ -41,12 +41,17 @@ impl DynamicTable {
     }
 
     pub fn set_capacity(&mut self, capacity: usize) -> Result<(), DecoderError> {
-        if capacity > self.max_capacity {
+        if capacity as u64 > self.max_capacity {
             return Err(DecoderError::EncoderStream);
         }
         self.capacity = capacity;
         self.evict_to_capacity()?;
         Ok(())
+    }
+
+    pub(super) fn set_max_capacity(&mut self, max_capacity: u64) {
+        debug_assert!(self.capacity as u64 <= max_capacity);
+        self.max_capacity = max_capacity;
     }
 
     pub fn insert(&mut self, field: OwnedField) -> Result<Option<u64>, DecoderError> {
@@ -115,29 +120,28 @@ impl DynamicTable {
     }
 
     pub fn find_exact(&self, field: Field<'_>) -> Option<u64> {
-        self.entries
-            .iter()
-            .enumerate()
-            .find_map(|(relative, entry)| {
-                if entry.name == field.name && entry.value == field.value {
-                    Some(self.insert_count - relative as u64 - 1)
-                } else {
-                    None
-                }
-            })
+        self.lookup(field, |_| true).exact
     }
 
     pub fn find_name(&self, name: &[u8]) -> Option<u64> {
-        self.entries
+        self.lookup(Field::new(name, b""), |_| true).name
+    }
+
+    pub(crate) fn lookup(
+        &self,
+        field: Field<'_>,
+        mut usable: impl FnMut(u64) -> bool,
+    ) -> FieldMatch<u64> {
+        let insert_count = self.insert_count;
+        let candidates = self
+            .entries
             .iter()
             .enumerate()
-            .find_map(|(relative, entry)| {
-                if entry.name == name {
-                    Some(self.insert_count - relative as u64 - 1)
-                } else {
-                    None
-                }
-            })
+            .map(|(relative, entry)| (relative, entry.as_ref()));
+        match_field_candidates(field, candidates, |relative| {
+            let absolute = insert_count - relative as u64 - 1;
+            usable(absolute).then_some(absolute)
+        })
     }
 
     fn evict_to_capacity(&mut self) -> Result<(), DecoderError> {

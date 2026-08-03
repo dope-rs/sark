@@ -16,8 +16,8 @@ fn parses_only_request_line_structure() {
 #[test]
 fn distinguishes_incomplete_from_malformed() {
     assert!(matches!(RequestLine::parse(b"GET / HTTP/1.1\r"), Ok(None)));
-    assert!(matches!(RequestLine::parse(b"GET / HTTP/1.1\rx"), Err(())));
-    assert!(matches!(RequestLine::parse(b"GET / HTTP/2.0\r\n"), Err(())));
+    assert!(RequestLine::parse(b"GET / HTTP/1.1\rx").is_err());
+    assert!(RequestLine::parse(b"GET / HTTP/2.0\r\n").is_err());
 }
 
 #[test]
@@ -37,6 +37,22 @@ fn every_request_line_prefix_remains_incomplete() {
 }
 
 #[test]
+fn target_separator_matches_every_word_boundary() {
+    for len in 1..=32 {
+        let mut raw = b"GET ".to_vec();
+        let target_start = raw.len();
+        raw.extend(std::iter::repeat_n(b'a', len));
+        raw.extend_from_slice(b" HTTP/1.1\r\n");
+
+        let line = RequestLine::parse(&raw).unwrap().unwrap();
+        assert_eq!(line.target, &raw[target_start..target_start + len]);
+
+        raw[target_start + len - 1] = b'\r';
+        assert!(RequestLine::parse(&raw).is_err());
+    }
+}
+
+#[test]
 fn complete_bad_shapes_are_rejected() {
     for raw in [
         b" / HTTP/1.1\r\n".as_slice(),
@@ -48,7 +64,7 @@ fn complete_bad_shapes_are_rejected() {
         b"G\rET / HTTP/1.1\r\n",
         b"GET /\rhidden HTTP/1.1\r\n",
     ] {
-        assert!(matches!(RequestLine::parse(raw), Err(())), "{raw:?}");
+        assert!(RequestLine::parse(raw).is_err(), "{raw:?}");
     }
 }
 

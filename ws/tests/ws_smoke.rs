@@ -13,7 +13,7 @@ use dope::manifold::env::Bundle;
 use dope::runtime::executor::Executor;
 use dope::runtime::profile::Balanced;
 use dope_fiber::abi::pollfn::PollFn;
-use dope_fiber::extensions::SessionExt as _;
+use dope_fiber::extensions::SessionExt;
 use dope_net::tcp::Tcp;
 use dope_net::wire::identity::Identity;
 use dope_test::Harness;
@@ -31,12 +31,17 @@ struct CaptureHandler {
     state: Rc<RefCell<Captured>>,
 }
 
-impl client::Handler for CaptureHandler {
-    fn open(&mut self, conn_id: Token) {
+impl<'d> client::Handler<'d> for CaptureHandler {
+    fn open(&mut self, conn_id: Token, _local: &mut dope_fiber::local::LocalContext<'_, 'd>) {
         self.state.borrow_mut().conn_id = Some(conn_id);
     }
 
-    fn message(&mut self, _conn_id: Token, msg: client::Message) {
+    fn message(
+        &mut self,
+        _conn_id: Token,
+        msg: client::Message,
+        _local: &mut dope_fiber::local::LocalContext<'_, 'd>,
+    ) {
         if let client::Message::Text(bytes) = msg
             && let Ok(s) = std::str::from_utf8(bytes.as_slice())
         {
@@ -44,7 +49,7 @@ impl client::Handler for CaptureHandler {
         }
     }
 
-    fn close<'d>(&mut self, _conn_id: Token) {}
+    fn close(&mut self, _conn_id: Token, _local: &mut dope_fiber::local::LocalContext<'_, 'd>) {}
 }
 
 type ClientWs<'d> = Connector<

@@ -13,6 +13,33 @@ fn invalid_request_pool_is_rejected_at_factory_creation() {
 }
 
 #[test]
+fn invalid_host_is_rejected_at_factory_creation() {
+    let error = Port::factory(Config::new("bad\nhost"), 1, 1)
+        .err()
+        .expect("invalid host must be rejected");
+    assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+}
+
+#[test]
+fn overflowing_response_pool_is_rejected_at_factory_creation() {
+    let entries = Config::new("127.0.0.1")
+        .request_pool(1, 1)
+        .max_inflight_per_connection(2);
+    let error = Port::factory(entries, usize::MAX, 1)
+        .err()
+        .expect("entry count must overflow");
+    assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+
+    let items = Config::new("127.0.0.1")
+        .request_pool(1, 1)
+        .max_inflight_per_connection(1);
+    let error = Port::factory(items, usize::MAX / 2 + 1, 1)
+        .err()
+        .expect("item count must overflow");
+    assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+}
+
+#[test]
 fn pool_survives_connection_close_each_response() {
     let server = spawn_raw_server(|stream, _req| {
         let resp = raw_http_response(

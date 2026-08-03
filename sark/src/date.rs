@@ -225,6 +225,7 @@ mod tests {
     use dope::runtime::profile::Throughput;
     use dope::runtime::trigger::ShutdownTrigger;
     use dope::{DriverContext, Event};
+    use o3::cell::RegionToken;
 
     use super::{Stamp, TimerState, Updater};
 
@@ -249,7 +250,8 @@ mod tests {
             self.as_mut().get_mut().date.pre_park(driver);
         }
 
-        fn idle(self: Pin<&Self>) -> Idle {
+        fn idle(self: Pin<&Self>, region: &RegionToken<'d>) -> Idle {
+            let _ = region;
             self.get_ref().date.idle()
         }
 

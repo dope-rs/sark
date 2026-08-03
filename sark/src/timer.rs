@@ -1,49 +1,95 @@
 use std::cell::{Cell, OnceCell};
+use std::io;
 use std::pin::Pin;
 use std::time::{Duration, Instant};
 
+use dope::driver::timer;
+use dope::driver::token::Token;
 use dope::manifold::env::Env;
 use dope::manifold::listener::{Listener, application::Application};
-use dope::manifold::timer;
-pub use dope::manifold::timer::Ticket;
 use dope::manifold::typed::TypedToken;
 use dope::runtime::dispatcher::Idle;
-use dope::{DriverContext, DriverRef, Event};
+use dope::{DriverContext, Event};
 use dope_fiber::raw::task::RootWaker;
-use dope_fiber::sleep::TimerExt as _;
+use dope_fiber::sleep::TimerExt;
+use o3::cell::RegionToken;
+use pin_project::pin_project;
 
 pub const SARK_TIMER_ID: u8 = 3;
 
 pub const DEFAULT_HEAD_TIMEOUT: Duration = Duration::from_secs(10);
 
+#[pin_project]
+struct Entry<'d> {
+    target: Cell<Option<Token>>,
+    #[pin]
+    registration: timer::Registration<'d, 'd>,
+}
+
+struct Pool<'d> {
+    entries: Pin<Box<[Entry<'d>]>>,
+}
+
+impl<'d> Pool<'d> {
+    fn with_capacity(capacity: usize, timer: &'d timer::Timer<'d>) -> Self {
+        assert!(
+            capacity <= u32::MAX as usize,
+            "sark timer capacity exceeds u32::MAX"
+        );
+        let entries = (0..capacity)
+            .map(|_| Entry {
+                target: Cell::new(None),
+                registration: timer::Registration::new(timer),
+            })
+            .collect::<Vec<_>>()
+            .into_boxed_slice();
+        Self {
+            entries: Box::into_pin(entries),
+        }
+    }
+
+    fn entry(&self, slot: u32) -> Option<Pin<&Entry<'d>>> {
+        let entry = self.entries.as_ref().get_ref().get(slot as usize)?;
+        // SAFETY: projecting a shared reference to an element of a pinned
+        // boxed slice cannot move either the slice or the element.
+        Some(unsafe { Pin::new_unchecked(entry) })
+    }
+}
+
 pub struct Timer<'d> {
-    inner: OnceCell<timer::Timer<'d, SARK_TIMER_ID>>,
-    capacity: usize,
+    inner: OnceCell<&'d timer::Timer<'d>>,
+    pool: OnceCell<Pool<'d>>,
     head_timeout: Cell<Duration>,
 }
 
 impl<'d> Timer<'d> {
-    pub fn with_capacity(capacity: usize) -> Self {
+    pub fn new() -> Self {
         Self {
             inner: OnceCell::new(),
-            capacity,
+            pool: OnceCell::new(),
             head_timeout: Cell::new(DEFAULT_HEAD_TIMEOUT),
         }
     }
 
-    fn inner(&self) -> &timer::Timer<'d, SARK_TIMER_ID> {
+    fn inner(&self) -> &'d timer::Timer<'d> {
         self.inner
             .get()
             .expect("sark timer used before it was bound to a driver")
     }
 
-    pub(crate) fn bind(&self, driver: DriverRef<'d>) {
+    pub(crate) fn bind(&self, timer: &'d timer::Timer<'d>, connections: usize) -> io::Result<()> {
+        self.inner.set(timer).map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                "sark timer was bound more than once",
+            )
+        })?;
+        let set = self.pool.set(Pool::with_capacity(connections, timer));
         assert!(
-            self.inner
-                .set(timer::Timer::with_capacity(self.capacity, driver))
-                .is_ok(),
-            "sark timer bound more than once"
+            set.is_ok(),
+            "sark timer pool was initialized more than once"
         );
+        Ok(())
     }
 
     pub fn set_head_timeout(&self, d: Duration) {
@@ -58,24 +104,82 @@ impl<'d> Timer<'d> {
         self.inner().sleep(d)
     }
 
-    pub fn arm(&self, deadline: Instant, wake: RootWaker<'d>) -> Option<Ticket> {
-        self.inner().try_arm(deadline, wake.completion()).ok()
+    pub(crate) fn arm(&self, target: Token, deadline: Instant, wake: RootWaker<'d>) -> bool {
+        let pool = self
+            .pool
+            .get()
+            .expect("sark timer used before it was bound");
+        let Some(entry) = pool.entry(target.slot().raw()) else {
+            return false;
+        };
+        let fields = entry.project_ref();
+        fields.target.set(Some(target));
+        fields.registration.arm(deadline, wake.completion());
+        true
     }
 
-    pub fn cancel(&self, ticket: Ticket) {
-        self.inner().cancel(ticket);
+    pub(crate) fn cancel(&self, target: Token) -> bool {
+        let pool = self
+            .pool
+            .get()
+            .expect("sark timer used before it was bound");
+        let Some(entry) = pool.entry(target.slot().raw()) else {
+            return false;
+        };
+        if !entry
+            .target
+            .get()
+            .is_some_and(|current| current.same_target(target))
+        {
+            return false;
+        }
+        let fields = entry.project_ref();
+        fields.registration.cancel();
+        fields.target.set(None);
+        true
     }
 
-    pub fn is_fired(&self, ticket: Ticket) -> bool {
-        self.inner().is_fired(ticket)
+    pub(crate) fn poll(&self, target: Token, now: Instant, wake: RootWaker<'d>) -> bool {
+        let pool = self
+            .pool
+            .get()
+            .expect("sark timer used before it was bound");
+        let Some(entry) = pool.entry(target.slot().raw()) else {
+            return false;
+        };
+        if !entry
+            .target
+            .get()
+            .is_some_and(|current| current.same_target(target))
+        {
+            return false;
+        }
+        entry
+            .project_ref()
+            .registration
+            .poll(now, wake.completion())
+            .is_ready()
     }
 
-    pub fn tick(&self, now: Instant) {
-        self.inner().expire(now);
+    pub(crate) fn is_armed(&self, target: Token) -> bool {
+        let pool = self
+            .pool
+            .get()
+            .expect("sark timer used before it was bound");
+        let Some(entry) = pool.entry(target.slot().raw()) else {
+            return false;
+        };
+        entry
+            .target
+            .get()
+            .is_some_and(|current| current.same_target(target))
+            && entry.project_ref().registration.is_armed()
     }
+}
 
-    pub fn idle(&self) -> Idle {
-        Idle::Park(self.inner().earliest())
+impl<'d> Default for Timer<'d> {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -98,8 +202,7 @@ where
     P: Application<'d> + TimerHost<'d>,
     E: Env<Wire = P::Wire>,
 {
-    pub fn new(inner: Listener<'d, 'd, ID, P, E>, driver: DriverRef<'d>) -> Self {
-        inner.handler().timer().bind(driver);
+    pub fn new(inner: Listener<'d, 'd, ID, P, E>) -> Self {
         Self { inner }
     }
 
@@ -132,19 +235,12 @@ where
         dope::manifold::Manifold::activate(self.project().inner, typed, driver)
     }
 
-    fn pre_park(mut self: Pin<&mut Self>, driver: &mut DriverContext<'_, 'd>) {
-        self.as_ref()
-            .project_ref()
-            .inner
-            .handler()
-            .timer()
-            .tick(driver.turn_now());
-        dope::manifold::Manifold::pre_park(self.as_mut().project().inner, driver)
+    fn pre_park(self: Pin<&mut Self>, driver: &mut DriverContext<'_, 'd>) {
+        dope::manifold::Manifold::pre_park(self.project().inner, driver)
     }
 
-    fn idle(self: Pin<&Self>) -> Idle {
-        let timer_idle = self.project_ref().inner.handler().timer().idle();
-        dope::manifold::Manifold::idle(self.project_ref().inner).reduce(timer_idle)
+    fn idle(self: Pin<&Self>, region: &RegionToken<'d>) -> Idle {
+        dope::manifold::Manifold::idle(self.project_ref().inner, region)
     }
 
     fn shutdown(self: Pin<&mut Self>, driver: &mut DriverContext<'_, 'd>) {

@@ -64,7 +64,7 @@ pub trait RouteSpec {
     type RawParams: RawRouteParams<Captures = Self::Captures>;
     type Headers<'req>;
     type RawHeaders: Default;
-    type HeaderSlot: Copy;
+    type HeaderSlot: super::HeaderSlot;
     type Response<'req>: sark_core::http::Shape<'req>;
     type AsyncResponse: sark_core::http::OwnedShape;
     type Stream: 'static;

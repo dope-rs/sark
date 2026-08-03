@@ -1,4 +1,4 @@
-use sark_core::http::{Field, FieldBlock as Fields, FieldStorage, VecFieldBlock};
+use sark_core::http::{Field, FieldBlock, FieldStorage, VecFieldBlock};
 
 use crate::metadata::Metadata;
 use crate::status::{Code, Status};
@@ -16,7 +16,7 @@ pub(crate) struct ParsedFields<'a> {
 }
 
 impl<'a> ParsedFields<'a> {
-    pub(crate) fn parse<S: FieldStorage>(fields: &'a Fields<S>) -> Result<Self, Status> {
+    pub(crate) fn parse<S: FieldStorage>(fields: &'a FieldBlock<S>) -> Result<Self, Status> {
         let mut parsed = Self {
             method: None,
             path: None,
@@ -153,7 +153,7 @@ pub struct RequestHead {
 }
 
 impl RequestHead {
-    pub fn parse_h2<S: FieldStorage>(headers: &Fields<S>) -> Result<RequestHead, Status> {
+    pub fn parse_h2<S: FieldStorage>(headers: &FieldBlock<S>) -> Result<RequestHead, Status> {
         let parsed = ParsedFields::parse(headers)?;
 
         if parsed.method != Some(b"POST".as_slice()) {
@@ -183,7 +183,7 @@ impl RequestHead {
         })
     }
 
-    pub fn parse_h2_trailers<S: FieldStorage>(headers: &Fields<S>) -> Result<Metadata, Status> {
+    pub fn parse_h2_trailers<S: FieldStorage>(headers: &FieldBlock<S>) -> Result<Metadata, Status> {
         Ok(ParsedFields::parse(headers)?.metadata)
     }
 
@@ -201,7 +201,7 @@ pub struct ResponseHead {
 }
 
 impl ResponseHead {
-    pub fn parse_h2<S: FieldStorage>(headers: &Fields<S>) -> Result<ResponseHead, Status> {
+    pub fn parse_h2<S: FieldStorage>(headers: &FieldBlock<S>) -> Result<ResponseHead, Status> {
         let parsed = ParsedFields::parse(headers)?;
         if parsed.status != Some(b"200".as_slice()) {
             return Err(Status::new(Code::Unknown, "non-200 HTTP/2 response"));

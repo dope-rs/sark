@@ -4,6 +4,7 @@ use super::flags::{Flags, SeenHeaderHandler};
 use crate::error::{Error, Result};
 use crate::http::codec;
 use crate::utils::bytes::{Ascii, Word};
+use sark_protocol::KnownRequestHeadName;
 
 pub const CSV_CLOSE_BIT: u8 = 1 << 0;
 pub const CSV_KEEP_ALIVE_BIT: u8 = 1 << 1;
@@ -190,13 +191,13 @@ pub enum KnownHeader {
 
 impl KnownHeader {
     pub fn from_name(name: &[u8]) -> Option<Self> {
-        match name.len() {
-            4 if name.eq_ignore_ascii_case(b"host") => Some(Self::Host),
-            6 if name.eq_ignore_ascii_case(b"expect") => Some(Self::Expect),
-            10 if name.eq_ignore_ascii_case(b"connection") => Some(Self::Connection),
-            14 if name.eq_ignore_ascii_case(b"content-length") => Some(Self::ContentLength),
-            15 if name.eq_ignore_ascii_case(b"accept-encoding") => Some(Self::AcceptEncoding),
-            17 if name.eq_ignore_ascii_case(b"transfer-encoding") => Some(Self::TransferEncoding),
+        match KnownRequestHeadName::classify_http1(name)? {
+            KnownRequestHeadName::AcceptEncoding => Some(Self::AcceptEncoding),
+            KnownRequestHeadName::ContentLength => Some(Self::ContentLength),
+            KnownRequestHeadName::TransferEncoding => Some(Self::TransferEncoding),
+            KnownRequestHeadName::Expect => Some(Self::Expect),
+            KnownRequestHeadName::Host => Some(Self::Host),
+            KnownRequestHeadName::Connection => Some(Self::Connection),
             _ => None,
         }
     }

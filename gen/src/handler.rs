@@ -1,5 +1,6 @@
 use proc_macro2::TokenStream;
 use quote::{format_ident, quote};
+use syn::visit_mut::VisitMut;
 use syn::{Error, FnArg, ItemFn, Result};
 
 use crate::{codegen::route_spec, lifetimes::TypeLifetimes, model::HeadSkip, util::TypeExt};
@@ -13,6 +14,28 @@ struct HandlerConfig {
     static_response: bool,
     max_body: Option<syn::Expr>,
     head_skip: HeadSkip,
+}
+
+/// Lifts early returns from the user handler into the generated parse-error
+/// result without changing returns owned by nested control-flow scopes.
+struct LiftHandlerReturns;
+
+impl VisitMut for LiftHandlerReturns {
+    fn visit_expr_return_mut(&mut self, expression: &mut syn::ExprReturn) {
+        let value = expression
+            .expr
+            .take()
+            .unwrap_or_else(|| Box::new(syn::parse_quote!(())));
+        expression.expr = Some(Box::new(syn::parse_quote!(
+            ::core::result::Result::Ok(#value)
+        )));
+    }
+
+    fn visit_expr_async_mut(&mut self, _: &mut syn::ExprAsync) {}
+
+    fn visit_expr_closure_mut(&mut self, _: &mut syn::ExprClosure) {}
+
+    fn visit_item_mut(&mut self, _: &mut syn::Item) {}
 }
 
 impl Handler {
@@ -97,6 +120,15 @@ impl Handler {
                 ));
             }
         };
+        let request_pattern = match fun.sig.inputs.first() {
+            Some(FnArg::Typed(pat)) => pat.pat.clone(),
+            other => {
+                return Err(Error::new_spanned(
+                    other,
+                    "#[sark_gen::handler] request argument must be typed",
+                ));
+            }
+        };
         let state_arg_ty = match fun.sig.inputs.iter().nth(1) {
             Some(FnArg::Typed(pat)) => (*pat.ty).clone(),
             other => {
@@ -155,9 +187,6 @@ impl Handler {
         if state_has_lifetime && !is_async {
             fun.sig.generics.params.insert(0, syn::parse_quote!('state));
         }
-        if let Some(FnArg::Typed(pat)) = fun.sig.inputs.first_mut() {
-            *pat.ty = syn::parse_quote!(#request_inner_ident<'req>);
-        }
         if let Some(FnArg::Typed(pat)) = fun.sig.inputs.iter_mut().nth(1) {
             *pat.ty = if is_async {
                 syn::parse_quote!(&'req #hidden_state_ty)
@@ -169,12 +198,73 @@ impl Handler {
             *pat.ty = syn::parse_quote!(&'req ::sark::Timer<'d>);
         }
         if is_async {
+            let mut original_body = fun.block;
+            LiftHandlerReturns.visit_block_mut(&mut original_body);
+            let storage = format_ident!("__sark_storage");
+            let raw_params = format_ident!("__sark_raw_params");
+            let raw_headers = format_ident!("__sark_raw_headers");
+            let target = format_ident!("__sark_target");
+            let head = format_ident!("__sark_head");
+            let body = format_ident!("__sark_body");
+            let request = format_ident!("__sark_request");
+            let params = format_ident!("__sark_params");
+            let headers = format_ident!("__sark_headers");
+            let parsed_body = format_ident!("__sark_parsed_body");
+
+            if let Some(first) = fun.sig.inputs.first_mut() {
+                *first = syn::parse_quote!(#storage: ::sark::request::RequestStorage);
+            }
+            fun.sig.inputs.insert(
+                1,
+                syn::parse_quote!(
+                    #raw_params: <#name as ::sark::service::RouteSpec>::RawParams
+                ),
+            );
+            fun.sig.inputs.insert(
+                2,
+                syn::parse_quote!(
+                    #raw_headers: <#name as ::sark::service::RouteSpec>::RawHeaders
+                ),
+            );
+            fun.sig
+                .inputs
+                .insert(3, syn::parse_quote!(#target: ::core::ops::Range<usize>));
+            fun.sig.output = syn::parse_quote!(
+                -> ::core::result::Result<#output_ty, &'static [u8]>
+            );
+            fun.block = Box::new(syn::parse_quote!({
+                let (#head, #body) = #storage.as_parts();
+                let #request = ::sark::request::Ref::from_slice(#target, #head, #body);
+                let #params = <<#name as ::sark::service::RouteSpec>::Request
+                    as ::sark::service::RouteRequestImpl>::build_params(
+                    &#request,
+                    #raw_params,
+                )
+                .ok_or(::sark::CANNED_400)?;
+                let #headers = <<#name as ::sark::service::RouteSpec>::Request
+                    as ::sark::service::RouteRequestImpl>::build_headers(
+                    &#request,
+                    #raw_headers,
+                )
+                .map_err(|_| ::sark::CANNED_400)?;
+                let #parsed_body = <#name as ::sark::service::RouteSpec>::parse_body(#body)
+                    .map_err(|_| ::sark::CANNED_400)?;
+                let #request_pattern = #request_inner_ident::from_parts(
+                    #params,
+                    #headers,
+                    #parsed_body,
+                    &#request,
+                );
+                ::core::result::Result::Ok(#original_body)
+            }));
             let where_clause = fun.sig.generics.make_where_clause();
             where_clause
                 .predicates
                 .push(syn::parse_quote!(#hidden_state_ty: 'req));
             where_clause.predicates.push(syn::parse_quote!('d: 'req));
             fun.attrs.push(syn::parse_quote!(#[::sark::fiber_fn('d)]));
+        } else if let Some(FnArg::Typed(pat)) = fun.sig.inputs.first_mut() {
+            *pat.ty = syn::parse_quote!(#request_inner_ident<'req>);
         }
 
         let parsed_body_ty = quote! {
@@ -248,31 +338,25 @@ impl Handler {
         };
 
         let timer_call = wants_timer.then(|| quote!(, timer));
-        let borrowed_request = quote! {
-            #request_inner_ident::<'req>::from_parts(
-                params,
-                headers,
-                parsed_body,
-                &req,
-            )
-        };
         let task_impl = if is_async {
             quote! {
                 impl<'d> ::sark::service::manifold::TaskRoute<'d, #state_ty_d> for #name {
                     fn invoke_task<'req>(
-                        params: <Self as ::sark::service::RouteSpec>::Params<'req>,
-                        req: ::sark::request::Ref<'req>,
-                        headers: <Self as ::sark::service::RouteSpec>::Headers<'req>,
-                        parsed_body: <Self as ::sark::service::RouteSpec>::ParsedBody<'req>,
+                        storage: ::sark::request::RequestStorage,
+                        raw_params: <Self as ::sark::service::RouteSpec>::RawParams,
+                        raw_headers: <Self as ::sark::service::RouteSpec>::RawHeaders,
+                        target: ::core::ops::Range<usize>,
                         state: &'req #state_ty_d,
                         timer: &'req ::sark::Timer<'d>,
-                    ) -> impl ::sark::fiber::Fiber<'d, Output = #output_ty> + 'req
+                    ) -> impl ::sark::fiber::Fiber<
+                        'd,
+                        Output = ::core::result::Result<#output_ty, &'static [u8]>,
+                    > + 'req
                     where
                         #state_ty_d: 'req,
                         'd: 'req,
                     {
-                        let request = #borrowed_request;
-                        #hidden_fn(request, state #timer_call)
+                        #hidden_fn(storage, raw_params, raw_headers, target, state #timer_call)
                     }
                 }
             }

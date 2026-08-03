@@ -271,7 +271,7 @@ impl<'d, H: Handler> ApplicationHooks<'d, App<H>> for App<H> {
     fn chunk<R: RetainBytes>(
         app: Pin<&mut App<H>>,
         slot: &mut Slot<'d, Identity, State<ConnState>>,
-        mut egress: EgressCtx<'_, '_>,
+        mut egress: EgressCtx<'_, 'd, '_>,
         chunk: R,
         driver: &mut DriverContext<'_, 'd>,
     ) -> Outcome {
@@ -282,7 +282,7 @@ impl<'d, H: Handler> ApplicationHooks<'d, App<H>> for App<H> {
     fn send(
         app: Pin<&mut App<H>>,
         slot: &mut Slot<'d, Identity, State<ConnState>>,
-        mut egress: EgressCtx<'_, '_>,
+        mut egress: EgressCtx<'_, 'd, '_>,
         sent: usize,
         driver: &mut DriverContext<'_, 'd>,
     ) {
@@ -297,7 +297,7 @@ impl<H: Handler> App<H> {
         slot: &mut Slot<'d, Identity, State<C>>,
         project: impl Fn(&mut C) -> &mut ConnState,
         chunk: R,
-        egress: &mut EgressCtx<'_, '_>,
+        egress: &mut EgressCtx<'_, 'd, '_>,
         driver: &mut DriverContext<'_, 'd>,
     ) -> Outcome {
         if project(&mut slot.state.conn).phase == Phase::Closed {
@@ -367,7 +367,7 @@ impl<H: Handler> App<H> {
         slot: &mut Slot<'d, Identity, State<C>>,
         _sent: usize,
         project: impl Fn(&mut C) -> &mut ConnState,
-        egress: &mut EgressCtx<'_, '_>,
+        egress: &mut EgressCtx<'_, 'd, '_>,
         driver: &mut DriverContext<'_, 'd>,
     ) {
         if project(&mut slot.state.conn).phase != Phase::Closed {
@@ -378,7 +378,7 @@ impl<H: Handler> App<H> {
     fn pump_proj<'d, C: Default + 'static, P: Fn(&mut C) -> &mut ConnState>(
         &self,
         slot: &mut Slot<'d, Identity, State<C>>,
-        egress: &mut EgressCtx<'_, '_>,
+        egress: &mut EgressCtx<'_, 'd, '_>,
         driver: &mut DriverContext<'_, 'd>,
         project: &P,
     ) {
@@ -407,7 +407,7 @@ impl<H: Handler> App<H> {
         &self,
         slot: &mut Slot<'d, Identity, State<C>>,
         code: u16,
-        egress: &mut EgressCtx<'_, '_>,
+        egress: &mut EgressCtx<'_, 'd, '_>,
         driver: &mut DriverContext<'_, 'd>,
         _project: &P,
     ) {

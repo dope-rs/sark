@@ -1,13 +1,14 @@
-error: lifetime may not live long enough
-  --> tests/ui/json_request_view_cannot_escape_task.rs:27:5
+error[E0716]: temporary value dropped while borrowed
+  --> tests/ui/json_request_view_cannot_escape_task.rs:25:1
    |
 25 | #[sark_gen::handler]
-   | --------------------
-   | |
-   | lifetime `'req` defined here
+   | ^^^^^^^^^^^^^^^^^^^-
+   | |                  |
+   | |                  temporary value is freed at the end of this statement
+   | creates a temporary value which is freed while still in use
    | lifetime `'d` defined here
 26 | async fn leak(request: Request, state: &State<'_>) -> Reply {
 27 |     state.leaked.set(Some(request.body.payload));
-   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ argument requires that `'req` must outlive `'d`
+   |     -------------------------------------------- argument requires that borrow lasts for `'d`
    |
-   = help: consider adding the following bound: `'req: 'd`
+   = note: this error originates in the attribute macro `::sark::fiber_fn` (in Nightly builds, run with -Z macro-backtrace for more info)

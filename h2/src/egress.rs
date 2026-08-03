@@ -11,6 +11,32 @@ use crate::frame::{
 use crate::hpack;
 use crate::stream::StreamId;
 
+pub(crate) const COMMITTED_CONTROL_SLACK: usize = HEADER_LEN + 4;
+
+#[derive(Clone, Copy)]
+pub(crate) struct EgressCapacity {
+    logical: NonZeroUsize,
+    storage: NonZeroUsize,
+}
+
+impl EgressCapacity {
+    pub(crate) fn new(logical: usize) -> Option<Self> {
+        let logical = NonZeroUsize::new(logical)?;
+        let storage = logical
+            .get()
+            .checked_add(COMMITTED_CONTROL_SLACK)
+            .and_then(NonZeroUsize::new)?;
+        Some(Self { logical, storage })
+    }
+
+    pub(crate) const fn saturating(logical: NonZeroUsize) -> Self {
+        Self {
+            logical,
+            storage: logical.saturating_add(COMMITTED_CONTROL_SLACK),
+        }
+    }
+}
+
 struct SharedPayload {
     prefix_len: usize,
     body: Shared,
@@ -33,13 +59,14 @@ pub(crate) struct Egress {
 
 impl Egress {
     pub(crate) fn from_capacity(
-        capacity: NonZeroUsize,
+        capacity: EgressCapacity,
         table_size: usize,
         header_capacity: usize,
     ) -> Self {
+        let EgressCapacity { logical, storage } = capacity;
         Self {
-            bytes: ByteRing::with_capacity(capacity),
-            capacity: capacity.get(),
+            bytes: ByteRing::with_capacity(storage),
+            capacity: logical.get(),
             encoder: hpack::Encoder::new(table_size),
             header_block: Vec::with_capacity(header_capacity),
             payloads: VecDeque::new(),
@@ -207,12 +234,65 @@ impl Egress {
         Ok(())
     }
 
-    pub(crate) fn reset(&mut self, stream_id: StreamId, error: ErrorCode) -> Result<(), ConnError> {
-        self.reserve(HEADER_LEN + 4)?;
-        RstStream::new(stream_id, error)
-            .ok_or(ConnError::Protocol)?
-            .encode(self)?;
+    pub(crate) fn data_control(
+        &mut self,
+        stream_id: StreamId,
+        connection_update: Option<u32>,
+        stream_update: Option<u32>,
+        reset: Option<ErrorCode>,
+    ) -> Result<(), ConnError> {
+        let connection = Self::update_wire(StreamId::CONNECTION, connection_update)?;
+        let stream = Self::update_wire(stream_id, stream_update)?;
+        let reset = match reset {
+            Some(error) => Some(
+                RstStream::new(stream_id, error)
+                    .ok_or(ConnError::Protocol)?
+                    .wire_bytes(),
+            ),
+            None => None,
+        };
+        let connection = connection.as_ref().map_or(&[][..], |wire| wire.as_slice());
+        let stream = stream.as_ref().map_or(&[][..], |wire| wire.as_slice());
+        let reset = reset.as_ref().map_or(&[][..], |wire| wire.as_slice());
+        let additional = connection.len() + stream.len() + reset.len();
+        if additional == 0 {
+            return Ok(());
+        }
+        self.reserve(additional)?;
+        self.write_slices([connection, stream, reset])?;
         Ok(())
+    }
+
+    fn update_wire(
+        stream_id: StreamId,
+        increment: Option<u32>,
+    ) -> Result<Option<[u8; HEADER_LEN + 4]>, ConnError> {
+        let Some(increment) = increment else {
+            return Ok(None);
+        };
+        Ok(Some(
+            WindowUpdate {
+                stream_id,
+                increment: WindowIncrement::new(increment).ok_or(ConnError::FlowControl)?,
+            }
+            .wire_bytes(),
+        ))
+    }
+
+    pub(crate) fn committed_reset(
+        &mut self,
+        stream_id: StreamId,
+        error: ErrorCode,
+    ) -> Result<(), ConnError> {
+        let wire = RstStream::new(stream_id, error)
+            .ok_or(ConnError::Protocol)?
+            .wire_bytes();
+        self.write_slices([&wire])?;
+        if self.over_capacity() {
+            Err(ConnError::Overload)
+        } else {
+            Ok(())
+        }
     }
 
     pub(crate) fn set_header_table_size(&mut self, size: usize) {
@@ -239,6 +319,7 @@ impl Egress {
             .ok_or(ConnError::FrameSize);
         let result = additional.and_then(|additional| self.reserve(additional));
         if result.is_err() {
+            self.encoder.discard_block();
             self.header_block = block;
             return result;
         }

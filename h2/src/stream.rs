@@ -209,9 +209,14 @@ impl IdGen {
     }
 
     pub fn next_id(&mut self) -> Option<StreamId> {
-        let id = self.next?;
-        self.next = id.as_u32().checked_add(self.step).and_then(StreamId::new);
+        let id = self.peek()?;
+        self.commit(id);
         Some(id)
+    }
+
+    pub(crate) fn commit(&mut self, id: StreamId) {
+        debug_assert_eq!(self.next, Some(id));
+        self.next = id.as_u32().checked_add(self.step).and_then(StreamId::new);
     }
 
     pub fn peek(&self) -> Option<StreamId> {

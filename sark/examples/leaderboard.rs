@@ -296,12 +296,11 @@ fn main() -> io::Result<()> {
                 Static::<Tcp>::new(vec![redis_addr], DEFAULT_BACKOFF, backoff),
             )?;
             let state = AppState { redis };
-            let timer = sark::Timer::with_capacity(MAX_CONNECTIONS.saturating_mul(2));
+            let timer = sark::Timer::new();
             let app = LeaderboardApp::new(
                 &state,
                 &timer,
                 app::Config {
-                    timer_capacity: MAX_CONNECTIONS.saturating_mul(2),
                     task_capacity: MAX_CONNECTIONS,
                 },
             );

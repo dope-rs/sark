@@ -1,6 +1,7 @@
 use o3::buffer::{Bytes, InlineBytes, Retained};
+use sark_core::http::HeadPlan;
 
-use crate::conn::{Conn, ConnError, WritePayload, WritePrefix};
+use crate::conn::{Conn, ConnError, Write, WritePayload, WritePrefix};
 use crate::stream::StreamId;
 
 pub trait StreamTransport {
@@ -27,10 +28,27 @@ pub trait StreamTransport {
         self.send_stream(stream_id, bytes.as_slice())
     }
     fn finish_stream(&mut self, stream_id: u64) -> Result<(), Self::SendError>;
+
+    fn send_write(&mut self, write: Write) -> Result<(), Self::SendError> {
+        let stream_id = write.stream_id.0;
+        match write.prefix {
+            WritePrefix::Inline(prefix) => self.send_stream_inline(stream_id, prefix)?,
+            WritePrefix::Owned(bytes) => self.send_stream_owned(stream_id, bytes)?,
+        }
+        match write.payload {
+            Some(WritePayload::Owned(bytes)) => self.send_stream_owned(stream_id, bytes)?,
+            Some(WritePayload::Retained(bytes)) => self.send_stream_retained(stream_id, bytes)?,
+            None => {}
+        }
+        if write.fin {
+            self.finish_stream(stream_id)?;
+        }
+        Ok(())
+    }
 }
 
-pub fn pump_stream_event<T: StreamTransport>(
-    conn: &mut Conn,
+pub fn pump_stream_event<P: HeadPlan, T: StreamTransport>(
+    conn: &mut Conn<P>,
     transport: &mut T,
     stream_id: u64,
 ) -> Result<(), ConnError> {
@@ -43,26 +61,12 @@ pub fn pump_stream_event<T: StreamTransport>(
     }
 }
 
-pub fn pump_writes<T: StreamTransport>(
-    conn: &mut Conn,
+pub fn pump_writes<P: HeadPlan, T: StreamTransport>(
+    conn: &mut Conn<P>,
     transport: &mut T,
 ) -> Result<(), T::SendError> {
     while let Some(write) = conn.poll_write() {
-        let stream_id = write.stream_id.0;
-        match write.prefix {
-            WritePrefix::Inline(prefix) => transport.send_stream_inline(stream_id, prefix)?,
-            WritePrefix::Owned(bytes) => transport.send_stream_owned(stream_id, bytes)?,
-        }
-        match write.payload {
-            Some(WritePayload::Owned(bytes)) => transport.send_stream_owned(stream_id, bytes)?,
-            Some(WritePayload::Retained(bytes)) => {
-                transport.send_stream_retained(stream_id, bytes)?;
-            }
-            None => {}
-        }
-        if write.fin {
-            transport.finish_stream(stream_id)?;
-        }
+        transport.send_write(write)?;
     }
     Ok(())
 }

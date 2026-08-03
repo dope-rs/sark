@@ -586,7 +586,7 @@ impl RstStream {
         Self::new(header.stream_id, ErrorCode::from_u32(raw)).ok_or(ParseError::Protocol)
     }
 
-    pub fn encode<W: ByteSink>(&self, out: &mut W) -> Result<(), W::Error> {
+    pub(crate) fn wire_bytes(self) -> [u8; HEADER_LEN + 4] {
         let header = FrameHeader {
             length: FrameLength::FOUR,
             kind: Type::RstStream,
@@ -594,7 +594,15 @@ impl RstStream {
             stream_id: self.stream_id,
         }
         .wire_bytes();
-        out.write_slices([&header, &(self.error as u32).to_be_bytes()])
+        let error = (self.error as u32).to_be_bytes();
+        let mut wire = [0; HEADER_LEN + 4];
+        wire[..HEADER_LEN].copy_from_slice(&header);
+        wire[HEADER_LEN..].copy_from_slice(&error);
+        wire
+    }
+
+    pub fn encode<W: ByteSink>(&self, out: &mut W) -> Result<(), W::Error> {
+        out.write_slice(&self.wire_bytes())
     }
 }
 
@@ -868,7 +876,7 @@ impl WindowUpdate {
         })
     }
 
-    pub fn encode<W: ByteSink>(&self, out: &mut W) -> Result<(), W::Error> {
+    pub(crate) fn wire_bytes(self) -> [u8; HEADER_LEN + 4] {
         let header = FrameHeader {
             length: FrameLength::FOUR,
             kind: Type::WindowUpdate,
@@ -876,7 +884,15 @@ impl WindowUpdate {
             stream_id: self.stream_id,
         }
         .wire_bytes();
-        out.write_slices([&header, &self.increment.wire_bytes()])
+        let increment = self.increment.wire_bytes();
+        let mut wire = [0; HEADER_LEN + 4];
+        wire[..HEADER_LEN].copy_from_slice(&header);
+        wire[HEADER_LEN..].copy_from_slice(&increment);
+        wire
+    }
+
+    pub fn encode<W: ByteSink>(&self, out: &mut W) -> Result<(), W::Error> {
+        out.write_slice(&self.wire_bytes())
     }
 }
 

@@ -98,15 +98,13 @@ fn generated_routes_parse_only_declared_capabilities() {
                 let executor = Executor::new(config)?
                     .with_storage(dope_net::link::egress::storage::Storage::default());
                 executor.enter(|mut session| {
-                    let timer =
-                        sark::Timer::with_capacity(support::MAX_CONNECTIONS.saturating_mul(2));
+                    let timer = sark::Timer::new();
                     server.clone().serve(
                         &mut session,
                         SelectiveDispatch::new(
                             &(),
                             &timer,
                             sark::app::Config {
-                                timer_capacity: support::MAX_CONNECTIONS.saturating_mul(2),
                                 task_capacity: support::MAX_CONNECTIONS,
                             },
                         ),

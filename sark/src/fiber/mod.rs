@@ -1,5 +1,4 @@
 pub use dope_fiber::abi::Fiber;
-pub use dope_fiber::owner::SplitTask;
 pub use dope_fiber::slab::{ErasedTaskId, FixedSlab, FixedSlabVacantEntry, TaskId};
 
 #[doc(hidden)]

@@ -14,7 +14,6 @@ use std::pin::Pin;
 
 pub use conn_state::{ConsumeOutcome, Outcome};
 use dope::DriverContext;
-use dope::manifold::Outcome as ListenerOutcome;
 use dope::manifold::listener::application::{Application, ApplicationHooks};
 use dope::manifold::listener::state::{EgressCtx, State};
 use dope_net::link;
@@ -24,9 +23,9 @@ pub use invocation::{Invocation, StreamRoute, SyncRoute};
 use o3::buffer::RetainBytes;
 pub use pipeline::{Pipeline, identity_mut};
 pub use requests::{Ctx, Matched};
-pub use routes::{Complete, FiberRoute, RequestTask, TaskPoll};
+pub use routes::{Complete, FiberRoute, TaskPoll};
 pub use routing::{H1Host, RouteCore, Routing};
-use sark_core::http::{ResponseSink, Shape};
+use sark_core::http::{HeadPlan, PlannedHead, ResponseSink, Shape};
 pub use tasks::TaskRunner;
 
 use crate::service::{RouteSpec, manifold};
@@ -91,10 +90,16 @@ impl BodySource for Vec<u8> {
 
 pub trait Decode {
     type Prepared: PreparedRequest;
+    type Plan: HeadPlan;
 
-    fn prepare_decoded(
+    fn prepare_full_head(
         &self,
-        fields: sark_core::http::VecFieldBlock,
+        fields: sark_core::http::DecodedFieldBlock,
+    ) -> Result<Self::Prepared, Decoded>;
+
+    fn prepare_planned_head(
+        &self,
+        head: PlannedHead<Self::Plan>,
     ) -> Result<Self::Prepared, Decoded>;
 
     fn dispatch_prepared<B: BodySource, E: ResponseEncoder>(
@@ -181,7 +186,7 @@ pub trait H1Project<'d, W: Wire> {
         self: Pin<&mut Self>,
         slot: &mut link::slot::Slot<'d, W, State<C>>,
         bytes: &[u8],
-        egress: &mut EgressCtx<'_, '_>,
+        egress: &mut EgressCtx<'_, 'd, '_>,
         driver: &mut DriverContext<'_, 'd>,
         project: PJ,
     ) -> bool
@@ -194,7 +199,7 @@ pub trait H1Project<'d, W: Wire> {
         slot: &mut link::slot::Slot<'d, W, State<C>>,
         project: PJ,
         sent: usize,
-        egress: &mut EgressCtx<'_, '_>,
+        egress: &mut EgressCtx<'_, 'd, '_>,
         driver: &mut DriverContext<'_, 'd>,
     ) where
         C: Default + 'static,
@@ -204,7 +209,7 @@ pub trait H1Project<'d, W: Wire> {
         self: Pin<&mut Self>,
         slot: &mut link::slot::Slot<'d, W, State<C>>,
         project: PJ,
-        egress: &mut EgressCtx<'_, '_>,
+        egress: &mut EgressCtx<'_, 'd, '_>,
         driver: &mut DriverContext<'_, 'd>,
     ) where
         C: Default + 'static,
@@ -214,7 +219,7 @@ pub trait H1Project<'d, W: Wire> {
         self: Pin<&mut Self>,
         slot: &mut link::slot::Slot<'d, W, State<C>>,
         project: PJ,
-        egress: &mut EgressCtx<'_, '_>,
+        egress: &mut EgressCtx<'_, 'd, '_>,
     ) where
         C: Default + 'static,
         PJ: Fn(&mut C) -> &mut conn_state::ConnState;
@@ -231,10 +236,10 @@ where
     fn chunk<R: RetainBytes>(
         app: Pin<&mut A>,
         slot: &mut link::slot::Slot<'d, W, State<conn_state::ConnState>>,
-        mut egress: EgressCtx<'_, '_>,
+        mut egress: EgressCtx<'_, 'd, '_>,
         chunk: R,
         driver: &mut DriverContext<'_, 'd>,
-    ) -> ListenerOutcome {
+    ) -> dope::manifold::Outcome {
         if A::chunk_proj(
             app,
             slot,
@@ -243,16 +248,16 @@ where
             driver,
             identity_mut,
         ) {
-            ListenerOutcome::Overrun
+            dope::manifold::Outcome::Overrun
         } else {
-            ListenerOutcome::Ok
+            dope::manifold::Outcome::Ok
         }
     }
 
     fn send(
         app: Pin<&mut A>,
         slot: &mut link::slot::Slot<'d, W, State<conn_state::ConnState>>,
-        mut egress: EgressCtx<'_, '_>,
+        mut egress: EgressCtx<'_, 'd, '_>,
         sent: usize,
         driver: &mut DriverContext<'_, 'd>,
     ) {
@@ -262,7 +267,7 @@ where
     fn activate(
         app: Pin<&mut A>,
         slot: &mut link::slot::Slot<'d, W, State<conn_state::ConnState>>,
-        mut egress: EgressCtx<'_, '_>,
+        mut egress: EgressCtx<'_, 'd, '_>,
         driver: &mut DriverContext<'_, 'd>,
     ) {
         A::activate_proj(app, slot, identity_mut, &mut egress, driver);
@@ -271,7 +276,7 @@ where
     fn close(
         app: Pin<&mut A>,
         slot: &mut link::slot::Slot<'d, W, State<conn_state::ConnState>>,
-        mut egress: EgressCtx<'_, '_>,
+        mut egress: EgressCtx<'_, 'd, '_>,
     ) {
         A::close_proj(app, slot, identity_mut, &mut egress);
     }

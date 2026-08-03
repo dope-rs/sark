@@ -11,7 +11,7 @@ use std::time::Duration;
 use dope::runtime::dispatcher::{Dispatcher, Idle};
 use dope::runtime::launcher::Launcher;
 use dope::{DriverContext, Event};
-use o3::cell::BrandCell as Branded;
+use o3::cell::{self, RegionToken};
 use sark::{Throughput, driver};
 
 struct Park;
@@ -33,7 +33,7 @@ impl<'d> Dispatcher<'d> for Park {
         let _ = self;
     }
 
-    fn idle(self: Pin<&Self>) -> Idle {
+    fn idle(self: Pin<&Self>, _region: &RegionToken<'d>) -> Idle {
         let _ = self;
         Idle::Park(None)
     }
@@ -61,7 +61,7 @@ fn first_worker_error_shuts_down_peer_drivers() {
             if order.fetch_add(1, Ordering::AcqRel) == 0 {
                 return Err(io::Error::other("first worker failed"));
             }
-            let dispatcher = pin!(Branded::new(Park));
+            let dispatcher = pin!(cell::BrandCell::new(Park));
             session.run(dispatcher.as_ref())
         },
     );

@@ -6,7 +6,7 @@ use dope::manifold::listener::Listener;
 use dope::runtime::launcher::WorkerContext;
 use dope::runtime::profile::Throughput;
 use dope::runtime::trigger::ShutdownTrigger;
-use dope_net::link::egress::storage::Storage as EgressStorage;
+use dope_net::link::egress;
 use dope_net::tcp::Tcp;
 use dope_net::wire::identity::Identity;
 
@@ -53,7 +53,7 @@ pub fn serve<H: Handler>(
     };
     let driver_config = dope::driver::Config::for_tcp_profile::<Throughput>(cfg.max_connections);
     dope::runtime::executor::Executor::with_seed(driver_config, context.seed())?
-        .with_storage(EgressStorage::default())
+        .with_storage(egress::storage::Storage::default())
         .enter(|mut sess| {
             let egress = sess.storage();
             let hash_builder = sess.seed().derive(dope::hash::domain::ACCEPT).state();
