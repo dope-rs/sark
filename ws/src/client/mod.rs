@@ -60,10 +60,40 @@ pub enum Message {
 pub enum Head {
     HandshakeOk { accept: [u8; 28] },
     HandshakeFailed,
-    ProtocolError,
+    ProtocolError(ProtocolError),
     Frame(Message),
     Continuation,
     Close(Shared),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProtocolError {
+    MessageTooLarge,
+    FrameHeader {
+        error: crate::frame::FrameError,
+        prefix: [u8; 8],
+        available: usize,
+    },
+    MissingPayload,
+    MaskedServerFrame {
+        opcode: u8,
+        payload_len: usize,
+    },
+    InvalidControl {
+        opcode: u8,
+        fin: bool,
+        payload_len: usize,
+    },
+    InvalidOpcode {
+        opcode: u8,
+        fin: bool,
+    },
+    Fragment {
+        error: crate::fragment::FragmentError,
+        opcode: u8,
+        fin: bool,
+        payload_len: usize,
+    },
 }
 
 pub trait Handler<'d> {
@@ -80,6 +110,13 @@ pub trait Handler<'d> {
         self.open(conn_id, &mut _send.local_context());
     }
     fn message(&mut self, _conn_id: Token, _msg: Message, _local: &mut LocalContext<'_, 'd>) {}
+    fn protocol_error(
+        &mut self,
+        _conn_id: Token,
+        _error: ProtocolError,
+        _local: &mut LocalContext<'_, 'd>,
+    ) {
+    }
     fn close(&mut self, _conn_id: Token, _local: &mut LocalContext<'_, 'd>) {}
 }
 
@@ -322,31 +359,59 @@ impl Codec {
             .set_max_payload(self.config.max_message_size)
             .is_err()
         {
-            return Self::protocol_error(state, buf.len());
+            return Self::protocol_error(state, buf.len(), ProtocolError::MessageTooLarge);
         }
         let bytes = buf.as_slice();
         let head = match FrameHead::parse(bytes, 0, self.config.max_frame_payload) {
             Ok(Some(head)) => head,
             Ok(None) => return None,
-            Err(_) => return Self::protocol_error(state, bytes.len()),
+            Err(error) => {
+                let mut prefix = [0; 8];
+                let prefix_len = bytes.len().min(prefix.len());
+                prefix[..prefix_len].copy_from_slice(&bytes[..prefix_len]);
+                return Self::protocol_error(
+                    state,
+                    bytes.len(),
+                    ProtocolError::FrameHeader {
+                        error,
+                        prefix,
+                        available: bytes.len(),
+                    },
+                );
+            }
         };
         if bytes.len() < head.payload_end {
             return None;
         }
         if head.mask.is_some() {
-            return Self::protocol_error(state, head.payload_end);
+            return Self::protocol_error(
+                state,
+                head.payload_end,
+                ProtocolError::MaskedServerFrame {
+                    opcode: head.opcode,
+                    payload_len: head.payload_end - head.payload_start,
+                },
+            );
         }
 
         let opcode = head.opcode;
         let fin = head.fin;
         let consumed = head.payload_end;
         let Some(payload) = buf.get(head.payload_start..head.payload_end) else {
-            return Self::protocol_error(state, consumed);
+            return Self::protocol_error(state, consumed, ProtocolError::MissingPayload);
         };
 
         if opcode >= 0x8 {
             if !fin || payload.len() > 125 {
-                return Self::protocol_error(state, consumed);
+                return Self::protocol_error(
+                    state,
+                    consumed,
+                    ProtocolError::InvalidControl {
+                        opcode,
+                        fin,
+                        payload_len: payload.len(),
+                    },
+                );
             }
             return match opcode {
                 0x8 => {
@@ -355,7 +420,15 @@ impl Codec {
                 }
                 0x9 => Some((Head::Frame(Message::Ping(payload)), consumed)),
                 0xA => Some((Head::Frame(Message::Pong(payload)), consumed)),
-                _ => Self::protocol_error(state, consumed),
+                _ => Self::protocol_error(
+                    state,
+                    consumed,
+                    ProtocolError::InvalidControl {
+                        opcode,
+                        fin,
+                        payload_len: payload.len(),
+                    },
+                ),
             };
         }
 
@@ -365,7 +438,13 @@ impl Codec {
                 let msg = match op {
                     0x1 => Message::Text(payload),
                     0x2 => Message::Binary(payload),
-                    _ => return Self::protocol_error(state, consumed),
+                    _ => {
+                        return Self::protocol_error(
+                            state,
+                            consumed,
+                            ProtocolError::InvalidOpcode { opcode: op, fin },
+                        );
+                    }
                 };
                 Some((Head::Frame(msg), consumed))
             }
@@ -374,18 +453,37 @@ impl Codec {
                 let msg = match op {
                     0x1 => Message::Text(owned),
                     0x2 => Message::Binary(owned),
-                    _ => return Self::protocol_error(state, consumed),
+                    _ => {
+                        return Self::protocol_error(
+                            state,
+                            consumed,
+                            ProtocolError::InvalidOpcode { opcode: op, fin },
+                        );
+                    }
                 };
                 Some((Head::Frame(msg), consumed))
             }
             Ok(Push::NeedMore) => Some((Head::Continuation, consumed)),
-            Err(_) => Self::protocol_error(state, consumed),
+            Err(error) => Self::protocol_error(
+                state,
+                consumed,
+                ProtocolError::Fragment {
+                    error,
+                    opcode,
+                    fin,
+                    payload_len: payload.len(),
+                },
+            ),
         }
     }
 
-    fn protocol_error(state: &mut State, consumed: usize) -> Option<(Head, usize)> {
+    fn protocol_error(
+        state: &mut State,
+        consumed: usize,
+        error: ProtocolError,
+    ) -> Option<(Head, usize)> {
         state.phase = ClientPhase::Closed;
-        Some((Head::ProtocolError, consumed.max(1)))
+        Some((Head::ProtocolError(error), consumed.max(1)))
     }
 }
 
@@ -555,10 +653,15 @@ impl<'d, H: Handler<'d>> connector::session::Session<'d> for Session<'d, H> {
                 self.port.shared.wake();
                 state.closing = true;
             }
-            Head::ProtocolError => {
+            Head::ProtocolError(error) => {
                 self.port.shared.conn_id.set(None);
                 self.port.shared.wake();
                 state.closing = true;
+                self.handler.protocol_error(
+                    conn_id,
+                    error,
+                    &mut LocalContext::from_region(ctx.region),
+                );
             }
             Head::Frame(msg) => {
                 if let Message::Ping(ref payload) = msg {
@@ -905,16 +1008,16 @@ mod tests {
             config: Config::new("example.com", "/ws"),
         };
         for bytes in [
-            vec![0xc1, 0x00],                   // RSV bit without an extension
-            vec![0x81, 0x80, 0, 0, 0, 0],     // masked server frame
-            vec![0x8b, 0x00],                  // reserved control opcode
-            vec![0x80, 0x00],                  // continuation without a message
+            vec![0xc1, 0x00],             // RSV bit without an extension
+            vec![0x81, 0x80, 0, 0, 0, 0], // masked server frame
+            vec![0x8b, 0x00],             // reserved control opcode
+            vec![0x80, 0x00],             // continuation without a message
         ] {
             let mut state = active_state();
             let (head, consumed) = codec
                 .parse_active_frame(&Shared::from(bytes), &mut state)
                 .expect("malformed frame must produce a terminal event");
-            assert!(matches!(head, Head::ProtocolError));
+            assert!(matches!(head, Head::ProtocolError(_)));
             assert!(consumed > 0);
             assert_eq!(state.phase, ClientPhase::Closed);
         }
