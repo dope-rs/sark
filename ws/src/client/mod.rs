@@ -60,6 +60,7 @@ pub enum Message {
 pub enum Head {
     HandshakeOk { accept: [u8; 28] },
     HandshakeFailed,
+    ProtocolError,
     Frame(Message),
     Continuation,
     Close(Shared),
@@ -295,7 +296,10 @@ impl Codec {
         use sark_core::http::codec::request_head_end;
         let bytes = buf.as_slice();
         let head_len = request_head_end(bytes)?.end;
-        let head = from_utf8(&bytes[..head_len]).ok()?;
+        let Ok(head) = from_utf8(&bytes[..head_len]) else {
+            state.phase = ClientPhase::Closed;
+            return Some((Head::HandshakeFailed, head_len));
+        };
 
         let status_ok = head.starts_with("HTTP/1.1 101");
         let accept = Crypto::ws_accept(head);
@@ -313,27 +317,36 @@ impl Codec {
     }
 
     fn parse_active_frame(&self, buf: &Shared, state: &mut State) -> Option<(Head, usize)> {
-        state
+        if state
             .fragments
             .set_max_payload(self.config.max_message_size)
-            .ok()?;
+            .is_err()
+        {
+            return Self::protocol_error(state, buf.len());
+        }
         let bytes = buf.as_slice();
-        let head = FrameHead::parse(bytes, 0, self.config.max_frame_payload).ok()??;
+        let head = match FrameHead::parse(bytes, 0, self.config.max_frame_payload) {
+            Ok(Some(head)) => head,
+            Ok(None) => return None,
+            Err(_) => return Self::protocol_error(state, bytes.len()),
+        };
         if bytes.len() < head.payload_end {
             return None;
         }
         if head.mask.is_some() {
-            return None;
+            return Self::protocol_error(state, head.payload_end);
         }
 
         let opcode = head.opcode;
         let fin = head.fin;
         let consumed = head.payload_end;
-        let payload = buf.get(head.payload_start..head.payload_end)?;
+        let Some(payload) = buf.get(head.payload_start..head.payload_end) else {
+            return Self::protocol_error(state, consumed);
+        };
 
         if opcode >= 0x8 {
             if !fin || payload.len() > 125 {
-                return None;
+                return Self::protocol_error(state, consumed);
             }
             return match opcode {
                 0x8 => {
@@ -342,7 +355,7 @@ impl Codec {
                 }
                 0x9 => Some((Head::Frame(Message::Ping(payload)), consumed)),
                 0xA => Some((Head::Frame(Message::Pong(payload)), consumed)),
-                _ => None,
+                _ => Self::protocol_error(state, consumed),
             };
         }
 
@@ -352,7 +365,7 @@ impl Codec {
                 let msg = match op {
                     0x1 => Message::Text(payload),
                     0x2 => Message::Binary(payload),
-                    _ => return None,
+                    _ => return Self::protocol_error(state, consumed),
                 };
                 Some((Head::Frame(msg), consumed))
             }
@@ -361,13 +374,18 @@ impl Codec {
                 let msg = match op {
                     0x1 => Message::Text(owned),
                     0x2 => Message::Binary(owned),
-                    _ => return None,
+                    _ => return Self::protocol_error(state, consumed),
                 };
                 Some((Head::Frame(msg), consumed))
             }
             Ok(Push::NeedMore) => Some((Head::Continuation, consumed)),
-            Err(_) => None,
+            Err(_) => Self::protocol_error(state, consumed),
         }
+    }
+
+    fn protocol_error(state: &mut State, consumed: usize) -> Option<(Head, usize)> {
+        state.phase = ClientPhase::Closed;
+        Some((Head::ProtocolError, consumed.max(1)))
     }
 }
 
@@ -533,6 +551,11 @@ impl<'d, H: Handler<'d>> connector::session::Session<'d> for Session<'d, H> {
                 }
             }
             Head::HandshakeFailed => {
+                self.port.shared.conn_id.set(None);
+                self.port.shared.wake();
+                state.closing = true;
+            }
+            Head::ProtocolError => {
                 self.port.shared.conn_id.set(None);
                 self.port.shared.wake();
                 state.closing = true;
@@ -862,5 +885,52 @@ impl<'a> FrameEncoder<'a> {
         frame.extend_from_slice(payload);
         Mask::unmask_in_place(&mut frame[start..], mask);
         Shared::from(frame)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{ClientPhase, Codec, Config, Head, State};
+    use o3::buffer::Shared;
+
+    fn active_state() -> State {
+        let mut state = State::default();
+        state.phase = ClientPhase::Active;
+        state
+    }
+
+    #[test]
+    fn malformed_active_frame_is_terminal_instead_of_stalling_ingress() {
+        let codec = Codec {
+            config: Config::new("example.com", "/ws"),
+        };
+        for bytes in [
+            vec![0xc1, 0x00],                   // RSV bit without an extension
+            vec![0x81, 0x80, 0, 0, 0, 0],     // masked server frame
+            vec![0x8b, 0x00],                  // reserved control opcode
+            vec![0x80, 0x00],                  // continuation without a message
+        ] {
+            let mut state = active_state();
+            let (head, consumed) = codec
+                .parse_active_frame(&Shared::from(bytes), &mut state)
+                .expect("malformed frame must produce a terminal event");
+            assert!(matches!(head, Head::ProtocolError));
+            assert!(consumed > 0);
+            assert_eq!(state.phase, ClientPhase::Closed);
+        }
+    }
+
+    #[test]
+    fn incomplete_active_frame_still_waits_for_more_bytes() {
+        let codec = Codec {
+            config: Config::new("example.com", "/ws"),
+        };
+        let mut state = active_state();
+        assert!(
+            codec
+                .parse_active_frame(&Shared::from(vec![0x81]), &mut state)
+                .is_none()
+        );
+        assert_eq!(state.phase, ClientPhase::Active);
     }
 }
