@@ -1,362 +1,213 @@
-#[cfg(feature = "rustls")]
-use std::sync::Arc;
-use std::{
-    io::{self, Error},
-    net::SocketAddr,
-};
+use std::num::NonZero;
 
 use dope::{
+    core::{
+        driver::{route::KeyTag, settings, settings::errors},
+        io::socket::Listener,
+    },
     manifold::{
-        env::{self, Bundle},
-        listener::{self, Listener, application::Application},
+        app::env,
+        network::listener::{handler::failures, topology::Direct},
+        timing,
     },
-    runtime::{
-        executor::{Executor, Session},
-        launcher::WorkerContext,
-        profile::Throughput,
-        trigger::ShutdownTrigger,
-    },
+    net::{tcp, wire},
+    runtime::topology,
 };
-use dope_net::{
-    link::egress,
-    tcp::{self, Tcp},
-    wire::{Wire, identity::Identity},
+use runtime::modes;
+use sark_core::body::{self, credit::Limits};
+use service::Handler;
+#[doc(hidden)]
+pub use target::Target;
+
+use crate::{
+    conn::{config, outputs::limits},
+    frame,
 };
-#[cfg(feature = "rustls")]
-use dope_tls::rustls::{RustTls, RustTlsEndpoint};
-use dope_tls::tls::{Endpoint, SessionStorage, Tls};
-use shin::server;
 
-pub type Env = Bundle<Tcp, Identity, Throughput>;
-pub type TlsEnv = Bundle<Tcp, Tls, Throughput>;
+pub(crate) mod payload;
+#[doc(hidden)]
+pub mod response;
+#[doc(hidden)]
+pub mod runtime;
+pub mod service;
+pub(crate) mod state;
+pub mod sync;
+mod target;
+pub mod task;
 
-mod app;
-mod body;
-mod connection;
-pub mod driver;
-mod scheduler;
-mod task;
-
-pub use app::{App, ConnState, Handler, SyncApp, SyncConnState, SyncHandler};
-pub use body::Body;
-pub use connection::{Request, Response};
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// HTTP/2 request, connection, and outbound bounds.
+#[derive(Clone, Copy, PartialEq, Eq)]
 pub struct Config {
-    pub bind_addr: SocketAddr,
-    pub max_connections: usize,
-    pub max_connections_per_ip: u32,
-    pub listen_backlog: i32,
-    pub max_handler_tasks: usize,
     pub max_request_body_bytes: usize,
+    /// Maximum retained transport owners in one buffered request body.
+    pub max_request_body_chunks: usize,
     pub max_connection_body_bytes: usize,
+    /// Maximum retained transport owners across all request bodies.
+    pub max_connection_body_chunks: usize,
     pub max_outbound_bytes: usize,
-    pub socket_receive_buffer_bytes: Option<usize>,
-    pub socket_send_buffer_bytes: Option<usize>,
-    pub tcp_fast_open_backlog: Option<u32>,
-    pub receive_buffer_bytes: usize,
-    pub receive_buffer_count: u16,
 }
 
+pub const DEFAULT_MAX_REQUEST_BODY_CHUNKS: usize = body::DEFAULT_MAX_REQUEST_CHUNKS;
+pub const DEFAULT_MAX_CONNECTION_BODY_CHUNKS: usize = body::DEFAULT_MAX_CONNECTION_CHUNKS;
+
 impl Config {
-    fn validate(self, asynchronous: bool) -> io::Result<Self> {
-        if self.max_connections == 0 {
-            return Err(invalid_config("max_connections must be greater than zero"));
-        }
-        if asynchronous && self.max_handler_tasks == 0 {
-            return Err(invalid_config(
-                "max_handler_tasks must be greater than zero",
-            ));
-        }
+    pub fn validate(self) -> Result<Self, ConfigError> {
         if self.max_outbound_bytes == 0 {
-            return Err(invalid_config(
-                "max_outbound_bytes must be greater than zero",
-            ));
-        }
-        if self.receive_buffer_bytes == 0 {
-            return Err(invalid_config(
-                "receive_buffer_bytes must be greater than zero",
-            ));
-        }
-        if self.receive_buffer_count == 0 {
-            return Err(invalid_config(
-                "receive_buffer_count must be greater than zero",
-            ));
-        }
-        if u32::try_from(self.max_handler_tasks).is_err() {
-            return Err(invalid_config("max_handler_tasks exceeds u32::MAX"));
+            return Err(ConfigError::ZeroOutbound);
         }
         Ok(self)
     }
 
-    fn listener(self) -> listener::config::Config<Tcp> {
-        use dope_net::tcp::stream;
-        listener::config::Config {
-            max_connections: self.max_connections,
-            bind: self.bind_addr,
-            backlog: self.listen_backlog,
-            stream: stream::Config {
-                recv_buffer_size: self.socket_receive_buffer_bytes,
-                send_buffer_size: self.socket_send_buffer_bytes,
-                ..Default::default()
-            },
-            transport: tcp::listener::Config {
-                reuse_port: true,
-                fast_open_backlog: self.tcp_fast_open_backlog,
-                per_ip_limit: Some(self.max_connections_per_ip),
-                ..Default::default()
-            },
-            egress: Default::default(),
-        }
+    #[doc(hidden)]
+    pub const fn request(self, bytes: usize) -> Limits {
+        Limits::new(bytes, self.max_request_body_chunks)
+    }
+
+    #[doc(hidden)]
+    pub const fn connection(self) -> Limits {
+        Limits::new(
+            self.max_connection_body_bytes,
+            self.max_connection_body_chunks,
+        )
     }
 }
 
-fn invalid_config(message: &'static str) -> io::Error {
-    use std::io::ErrorKind;
-    Error::new(ErrorKind::InvalidInput, message)
-}
+const EVENT_CAPACITY: usize = 64;
 
-trait EgressHost {
-    fn egress(&self) -> &egress::storage::Storage;
-}
-
-impl<T> EgressHost for (T, egress::storage::Storage, SessionStorage) {
-    fn egress(&self) -> &egress::storage::Storage {
-        &self.1
-    }
-}
-
-fn run<H, F>(
-    handler: H,
+/// Server limits and protocol settings awaiting joint connection admission.
+pub struct Plan {
     config: Config,
-    asynchronous: bool,
-    context: WorkerContext,
-    shutdown: Option<&ShutdownTrigger>,
-    launch: F,
-) -> io::Result<()>
-where
-    H: 'static,
-    F: for<'scope, 'd> FnOnce(
-        &'d H,
-        Session<'scope, 'd, (H, egress::storage::Storage, SessionStorage)>,
-        listener::config::Config<Tcp>,
-        Config,
-    ) -> io::Result<()>,
-{
-    let config = config.validate(asynchronous)?;
-    let listener = config.listener();
-    let driver = dope::driver::Config::for_tcp_profile::<Throughput>(config.max_connections)
-        .with_recv(config.receive_buffer_bytes, config.receive_buffer_count);
-    let tls_storage = SessionStorage::try_with_capacity(config.max_connections)?;
-    Executor::with_seed(driver, context.seed())?
-        .with_storage((handler, egress::storage::Storage::default(), tls_storage))
-        .enter(|mut session| {
-            if let Some(trigger) = shutdown {
-                trigger.try_register(&mut session.driver_access())?;
-            }
-            let (handler, _, _) = session.storage();
-            launch(handler, session, listener, config)
+    receive: settings::Receive,
+    protocol: config::Config,
+}
+
+impl Plan {
+    pub fn new(config: Config, receive: settings::Receive) -> Result<Self, ConfigError> {
+        Ok(Self {
+            config: config.validate()?,
+            receive,
+            protocol: config::Config {
+                event_capacity: EVENT_CAPACITY,
+                ..config::Config::default()
+            },
         })
+    }
+
+    /// Selects protocol storage and settings before their single admission.
+    /// Receive geometry and outbound headroom remain derived from server limits.
+    pub fn with_config(mut self, protocol: config::Config) -> Self {
+        self.protocol = protocol;
+        self
+    }
+
+    /// Selects per-connection stream storage before protocol admission.
+    pub fn with_streams(mut self, streams: NonZero<usize>) -> Self {
+        self.protocol.stream_capacity = streams.get();
+        self
+    }
+
+    pub const fn config(&self) -> Config {
+        self.config
+    }
+
+    pub const fn receive(&self) -> settings::Receive {
+        self.receive
+    }
+
+    #[doc(hidden)]
+    pub const fn resident_len(&self) -> usize {
+        self.receive.buffers().into_nonzero().get() as usize
+            * self.receive.buffer_len().into_nonzero().get() as usize
+    }
+
+    pub fn build(&self) -> Result<config::Config, config::Error> {
+        self.build_for(self.protocol.stream_capacity)
+    }
+
+    pub fn build_for(&self, streams: usize) -> Result<config::Config, config::Error> {
+        let mut machine = config::Config {
+            stream_capacity: streams,
+            ..self.protocol
+        };
+        let extra = self.config.max_connection_body_chunks;
+        machine.payload_capacity = machine
+            .payload_capacity
+            .extend(extra)
+            .map_err(config::Error::PayloadCapacity)?;
+        let buffer = self.receive.buffer_len().into_nonzero();
+        let frame = machine.local_settings.max_frame_size;
+        let data_gap = frame::HEADER_LEN + frame.into_usize();
+        machine.inbound_capacity = buffer.get() as usize + data_gap - 1;
+        let headers = limits::Block::new(machine.hpack_encoder.header_list)?;
+        let head_gap = limits::Capacity::wire(headers)?.bytes();
+        let headroom = data_gap.max(head_gap);
+        machine.outbound_capacity = self.config.max_outbound_bytes.checked_add(headroom).ok_or(
+            config::Error::OutboundHeadroom {
+                base: self.config.max_outbound_bytes,
+                extra: headroom,
+            },
+        )?;
+        Ok(machine)
+    }
 }
 
-#[pin_project::pin_project]
-#[derive(dope_gen::Dispatcher)]
-struct Server<'d, A, E>
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ConfigError {
+    ZeroOutbound,
+}
+
+/// A synchronous manifold HTTP/2 server.
+pub struct Server<R> {
+    router: R,
+    plan: runtime::Plan<KeyTag<0>>,
+}
+
+impl<R> Server<R> {
+    pub fn new(router: R, plan: runtime::Plan<KeyTag<0>>) -> Self {
+        Self { router, plan }
+    }
+}
+
+impl<H: Handler> Server<service::Route<H>> {
+    pub fn from_handler(handler: H, plan: runtime::Plan<KeyTag<0>>) -> Self {
+        Self::new(service::Route::new(handler), plan)
+    }
+}
+
+impl<F> Server<service::Route<service::FromFn<F>>>
 where
-    A: Application<'d>,
-    E: env::Env<Wire = A::Wire>,
+    service::FromFn<F>: Handler,
 {
-    #[pin]
-    #[manifold]
-    listener: Listener<'d, 'd, 0, A, E>,
+    /// Builds a server from a function with a request-independent response type.
+    pub fn from_fn(function: F, plan: runtime::Plan<KeyTag<0>>) -> Self {
+        Self::from_handler(service::FromFn::new(function), plan)
+    }
 }
 
-fn start<'scope, 'd, A, E, S>(
-    app: A,
-    mut session: Session<'scope, 'd, S>,
-    listener_config: listener::config::Config<Tcp>,
-    wire_config: <A::Wire as Wire>::InitConfig<'d>,
-) -> io::Result<()>
+type Prepared<R> = topology::Prepared<
+    (),
+    Direct<
+        KeyTag<0>,
+        env::Bundle<tcp::Tcp, wire::Identity, timing::Throughput>,
+        runtime::Local<(R, failures::Close), modes::Sync>,
+    >,
+>;
+
+impl<R> Server<R>
 where
-    A: Application<'d>,
-    E: env::Env<Transport = Tcp, Wire = A::Wire>,
-    S: EgressHost,
+    R: for<'d> sync::Dispatch<'d>,
 {
-    use core::pin::pin;
+    pub fn prepare(self) -> Result<Prepared<R>, errors::Claim> {
+        self.plan
+            .with_plain::<_, modes::Sync>((self.router, failures::Close))
+            .for_install::<timing::Throughput>()
+    }
 
-    use dope::hash::domain::ACCEPT;
-    let egress = session.storage().egress();
-    let hash_builder = session.seed().derive(ACCEPT).state();
-    let listener = {
-        let mut driver = session.driver_access();
-        Listener::<0, A, E>::open_in_with_wire(
-            app,
-            listener_config,
-            wire_config,
-            hash_builder,
-            egress,
-            &mut driver,
-        )?
-    };
-    let server = pin!(o3::cell::BrandCell::new(Server { listener }));
-    session.run(server.as_ref())
-}
-
-pub fn serve<H: Handler>(
-    handler: H,
-    config: Config,
-    context: WorkerContext,
-    shutdown: Option<&ShutdownTrigger>,
-) -> io::Result<()> {
-    run(
-        handler,
-        config,
-        true,
-        context,
-        shutdown,
-        |handler, session, listener, config| {
-            let app = App::new(handler, config)
-                .map_err(|error| Error::new(io::ErrorKind::InvalidInput, error))?;
-            start::<App<H>, Env, _>(app, session, listener, ())
-        },
-    )
-}
-
-pub fn serve_async<H: Handler>(
-    handler: H,
-    config: Config,
-    context: WorkerContext,
-    shutdown: Option<&ShutdownTrigger>,
-) -> io::Result<()> {
-    serve(handler, config, context, shutdown)
-}
-
-pub fn serve_sync<H>(
-    handler: H,
-    config: Config,
-    context: WorkerContext,
-    shutdown: Option<&ShutdownTrigger>,
-) -> io::Result<()>
-where
-    H: Fn(Request) -> Response + 'static,
-{
-    run(
-        handler,
-        config,
-        false,
-        context,
-        shutdown,
-        |handler, session, listener, config| {
-            let app = SyncApp::new(handler, config)
-                .map_err(|error| Error::new(io::ErrorKind::InvalidInput, error))?;
-            start::<SyncApp<H>, Env, _>(app, session, listener, ())
-        },
-    )
-}
-
-pub fn serve_tls<H: Handler>(
-    handler: H,
-    config: Config,
-    tls_config: server::config::Config,
-    context: WorkerContext,
-    shutdown: Option<&ShutdownTrigger>,
-) -> io::Result<()> {
-    let endpoint = Endpoint::server(tls_config).map_err(Error::other)?;
-    run(
-        handler,
-        config,
-        true,
-        context,
-        shutdown,
-        move |handler, session, listener, config| {
-            let app = App::new(handler, config)
-                .map_err(|error| Error::new(io::ErrorKind::InvalidInput, error))?;
-            let wire = endpoint.bind(&session.storage().2);
-            start::<App<H, Tls>, TlsEnv, _>(app, session, listener, wire)
-        },
-    )
-}
-
-pub fn serve_tls_sync<H>(
-    handler: H,
-    config: Config,
-    tls_config: server::config::Config,
-    context: WorkerContext,
-    shutdown: Option<&ShutdownTrigger>,
-) -> io::Result<()>
-where
-    H: Fn(Request) -> Response + 'static,
-{
-    let endpoint = Endpoint::server(tls_config).map_err(Error::other)?;
-    run(
-        handler,
-        config,
-        false,
-        context,
-        shutdown,
-        move |handler, session, listener, config| {
-            let app = SyncApp::new(handler, config)
-                .map_err(|error| Error::new(io::ErrorKind::InvalidInput, error))?;
-            let wire = endpoint.bind(&session.storage().2);
-            start::<SyncApp<H, Tls>, TlsEnv, _>(app, session, listener, wire)
-        },
-    )
-}
-
-#[cfg(feature = "rustls")]
-pub type RustlsTlsEnv = Bundle<Tcp, RustTls, Throughput>;
-
-#[cfg(feature = "rustls")]
-pub fn serve_tls_rustls<H: Handler>(
-    handler: H,
-    config: Config,
-    tls_config: Arc<rustls::ServerConfig>,
-    context: WorkerContext,
-    shutdown: Option<&ShutdownTrigger>,
-) -> io::Result<()> {
-    run(
-        handler,
-        config,
-        true,
-        context,
-        shutdown,
-        move |handler, session, listener, config| {
-            let app = App::new(handler, config).map_err(Error::invalid_input)?;
-            start::<App<H, RustTls>, RustlsTlsEnv, _>(
-                app,
-                session,
-                listener,
-                RustTlsEndpoint::Server(tls_config),
-            )
-        },
-    )
-}
-
-#[cfg(feature = "rustls")]
-pub fn serve_tls_rustls_sync<H>(
-    handler: H,
-    config: Config,
-    tls_config: Arc<rustls::ServerConfig>,
-    context: WorkerContext,
-    shutdown: Option<&ShutdownTrigger>,
-) -> io::Result<()>
-where
-    H: Fn(Request) -> Response + 'static,
-{
-    run(
-        handler,
-        config,
-        false,
-        context,
-        shutdown,
-        move |handler, session, listener, config| {
-            let app = SyncApp::new(handler, config).map_err(Error::invalid_input)?;
-            start::<SyncApp<H, RustTls>, RustlsTlsEnv, _>(
-                app,
-                session,
-                listener,
-                RustTlsEndpoint::Server(tls_config),
-            )
-        },
-    )
+    pub fn prepare_on(self, listener: Listener) -> Result<Prepared<R>, errors::Claim> {
+        Self {
+            router: self.router,
+            plan: self.plan.with_bound(listener),
+        }
+        .prepare()
+    }
 }

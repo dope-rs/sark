@@ -1,0 +1,22 @@
+[package]
+name = "sark-http"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+description = "HTTP wire types, semantics, codecs, and ownership invariants for Sark"
+repository.workspace = true
+readme.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+dope-core.workspace = true
+dope-runtime.workspace = true
+o3.workspace = true
+# Byte search used by the framing scanners.
+memchr = "=2.8.3"
+# Raw deflate codec; the gzip header and trailer are written in this crate.
+miniz_oxide = { version = "0.8.9", default-features = false, features = ["with-alloc"] }
+
+[dev-dependencies]
+dope-test.workspace = true

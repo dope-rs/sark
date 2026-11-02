@@ -2,38 +2,25 @@
 name = "sark"
 version.workspace = true
 edition.workspace = true
-description = "Simple Asynchronous Rust webKit - Server"
+rust-version.workspace = true
+description = "Canonical Sark protocol and codegen facade"
 authors.workspace = true
 repository.workspace = true
+readme.workspace = true
 license.workspace = true
-
-[features]
-default = []
 
 [dependencies]
 sark-core.workspace = true
 sark-gen.workspace = true
-sark-json.workspace = true
-dope.workspace = true
-dope-net.workspace = true
-dope-fiber.workspace = true
-dope-gen.workspace = true
-o3.workspace = true
-dope-tls.workspace = true
-shin.workspace = true
-http = "1.5.0"
-memchr = "2.8"
-pin-project.workspace = true
-pin-project-lite.workspace = true
+sark-client.workspace = true
+sark-http.workspace = true
 
 [dev-dependencies]
-cartel-redis.workspace = true
-cartel-pg.workspace = true
-cartel-gen.workspace = true
+sark-h1.workspace = true
+sark-h2.workspace = true
+sark-json.workspace = true
 dope-test.workspace = true
-criterion = { version = "0.8", default-features = false, features = ["cargo_bench_support"] }
-trybuild = "1"
-
-[[bench]]
-name = "head_parse"
-harness = false
+dope.workspace = true
+sark-h3.workspace = true
+dope-quic.workspace = true
+o3.workspace = true

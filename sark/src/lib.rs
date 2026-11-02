@@ -1,72 +1,13 @@
-#[doc(hidden)]
-pub mod __memchr {
-    pub use memchr::*;
-}
-#[doc(hidden)]
-pub use o3;
-#[doc(hidden)]
-pub mod __macro_support {
-    pub use pin_project_lite::pin_project;
-}
-#[doc(hidden)]
-#[macro_export]
-macro_rules! __pin_project {
-    ($($tokens:tt)*) => {
-        $crate::__macro_support::pin_project! { $($tokens)* }
-    };
-}
-#[doc(hidden)]
-pub use sark_core;
-pub use sark_core::{error, http, utils};
-pub mod app;
-#[doc(hidden)]
-pub mod date;
-#[doc(hidden)]
-pub mod dispatch;
-#[doc(hidden)]
-pub mod fiber;
-#[doc(hidden)]
-pub mod fs;
-pub mod middleware;
-pub mod request;
-#[doc(hidden)]
-pub mod timer;
-pub use timer::{Timer, TimerHost};
+//! Canonical Sark protocol and generated-routing facade.
 
-pub mod routes;
-pub mod service;
-
-pub use dope::manifold::listener;
-#[doc(hidden)]
-pub use dope::manifold::listener::application::Application;
-pub use dope_fiber::{fiber, fiber_fn};
-pub use dope_net::{tcp, tcp::Tcp};
-pub use sark_gen::body;
-
-#[doc(hidden)]
-pub const CANNED_400: &[u8] =
-    b"HTTP/1.1 400 Bad Request\r\nServer: sark\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
-#[doc(hidden)]
-pub const CANNED_404: &[u8] =
-    b"HTTP/1.1 404 Not Found\r\nServer: sark\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
-#[doc(hidden)]
-pub const CANNED_408: &[u8] = b"HTTP/1.1 408 Request Timeout\r\nServer: sark\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
-#[doc(hidden)]
-pub const CANNED_413: &[u8] = b"HTTP/1.1 413 Payload Too Large\r\nServer: sark\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
-#[doc(hidden)]
-pub const CANNED_500: &[u8] = b"HTTP/1.1 500 Internal Server Error\r\nServer: sark\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
-#[doc(hidden)]
-pub const CANNED_503: &[u8] = b"HTTP/1.1 503 Service Unavailable\r\nServer: sark\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
-
-pub use app::{
-    Balanced, Executor, HttpServer, HttpsServer, LowLatency, RuntimeProfile, Throughput, driver,
+pub use sark_client as client;
+pub use sark_core as core;
+pub use sark_core::{
+    manifold::EmptyState,
+    request,
+    route::guard::{Guard, Head},
 };
-pub mod json {
-    pub use sark_json::*;
-}
-
-pub struct EmptyState;
-
-impl EmptyState {
-    pub const REF: &'static Self = &EmptyState;
-}
+pub use sark_gen::{
+    define_route, define_router, define_task_route, duplex, handler, header_name, request, response,
+};
+pub use sark_http as http;

@@ -1,0 +1,202 @@
+use std::{
+    cell, convert, marker::PhantomPinned, net::TcpListener, rc, sync::mpsc, thread, time::Duration,
+};
+
+use common::{
+    app::{self, meter::Meter},
+    client::{Probe, topology},
+};
+use dope::{
+    core::{
+        driver::{
+            life::recovery,
+            route::{FrameworkTag, Tag, kind},
+        },
+        io::{Reclaimed, socket::Backlog},
+    },
+    manifold::{app::env::quota, timing},
+    runtime::{
+        executor::session::Completion,
+        topology::{Plan, lending},
+    },
+};
+use dope_test::{alloc::Tracker, harness::server::Pair, reclaim};
+use sark_ws::{
+    client,
+    client::{channel, headers, mode},
+    server,
+};
+
+use crate::common::app::Reply;
+
+pub mod common;
+
+#[global_allocator]
+static ALLOCATOR: Tracker = Tracker::new();
+
+#[test]
+fn opening_has_one_owner() {
+    let mut retired = Vec::new();
+    {
+        let sock = TcpListener::bind("127.0.0.1:0").expect("bind allocation probe");
+        let addr = sock.local_addr().expect("allocation probe address");
+        let (tx, rx) = mpsc::channel();
+        let server = thread::spawn(move || {
+            let (stream, _) = sock.accept().expect("accept allocation probe");
+            let req = app::Upgrade::new(&stream)
+                .try_head()
+                .expect("WebSocket operation");
+            app::Upgrade::new(&stream)
+                .try_respond(
+                    &app::Head::new(&req)
+                        .try_accept()
+                        .expect("WebSocket operation"),
+                )
+                .expect("WebSocket operation");
+            rx.recv_timeout(Duration::from_secs(3))
+                .expect("client admitted allocation probe");
+            req
+        });
+
+        let proof = rc::Rc::new(cell::Cell::new(None));
+        let sink = rc::Rc::clone(&proof);
+        let auth = headers::Field::new("Authorization", String::from("Bearer token"))
+            .expect("valid borrowed authorization field");
+        let config = client::Config::new("127.0.0.1", "/ws");
+        let config = config.expect("WebSocket configuration");
+        let opened = topology::Plan::new(addr, config, 1, 16).enter(
+            move |domain| {
+                domain.run(
+                    channel::App::<_, mode::Observe>::new(Meter { proof: sink, auth }),
+                    |mut app| {
+                        app.wait(|result| {
+                            result
+                                .as_ref()
+                                .map_err(|cause| cause.cause())
+                                .expect("WebSocket wait");
+                        })
+                    },
+                )
+            },
+            recovery::Policy::new(|event| retired.push(event), common::recover),
+            |result| result.expect("WebSocket execution"),
+        );
+        opened
+            .as_ref()
+            .map_err(|cause| cause.kind())
+            .expect("WebSocket operation")
+            .as_ref()
+            .expect("WebSocket operation");
+        tx.send(()).expect("release allocation probe");
+        let req = server.join().expect("allocation probe server");
+        let proof = proof.take().expect("handshake allocation proof");
+
+        assert_eq!(proof.count, 1);
+        assert_eq!(proof.len, req.len());
+        assert!(proof.opened);
+        assert_eq!(proof.messages, [0; 4]);
+        assert!(proof.close.is_some());
+    };
+    assert!(
+        retired
+            .iter()
+            .all(|event| matches!(event, Reclaimed::Shutdown)),
+        "unexpected reports WebSocket client completion: {retired:?}"
+    );
+}
+
+#[test]
+fn codec_round_trip() {
+    {
+        let rig = Pair::bind().expect("harness");
+        let addr = rig.addr();
+        let cfg = server::Config {
+            bind: addr,
+            max_connections: 1024,
+            per_ip: Some(quota::PerIp::fixed::<512>()),
+            backlog: Backlog::fixed::<4096>(),
+            path: "/ws".into(),
+            max_frame_payload: 16 * 1024 * 1024,
+            max_message_size: 16 * 1024 * 1024,
+        };
+
+        rig.run(
+            |ctx, sock| {
+                let failures = cell::RefCell::new(Vec::new());
+                let failed = |error| failures.borrow_mut().push(error);
+                let install = server::Plan::new(cfg)
+                    .expect("WebSocket listener plan")
+                    .with_bound(Some(sock))
+                    .with_handler(Reply {
+                        text: "pong",
+                        _pin: PhantomPinned,
+                        failed: &failed,
+                    });
+                let prepared = Plan::new((), install)
+                    .for_install::<timing::Throughput>()
+                    .expect("WebSocket layout");
+                let mut reports = reclaim::Reports::new(
+                    prepared.layout(),
+                    [<FrameworkTag<kind::Any> as Tag>::ROUTE],
+                );
+                prepared.enter_with(
+                    ctx,
+                    |worker| {
+                        let mut finish = Completion::new();
+                        let result = worker.with(lending::Clean(&mut finish));
+                        result
+                            .expect("WebSocket installation")
+                            .expect("WebSocket session");
+                    },
+                    recovery::Policy::new(|event| reports.push(event), common::recover),
+                    |outcome| {
+                        outcome
+                            .as_ref()
+                            .map_err(|error| error.cause())
+                            .expect("WebSocket topology");
+                    },
+                );
+                assert!(
+                    failures.borrow().is_empty(),
+                    "WebSocket reply: {:?}",
+                    failures.borrow()
+                );
+                assert!(
+                    reports.events().expect("valid reclamation").is_empty(),
+                    "unexpected reports server operations: {reports:?}"
+                );
+                Ok::<(), convert::Infallible>(())
+            },
+            |addr| {
+                let mut retired = Vec::new();
+                let config = client::Config::new("127.0.0.1", "/ws");
+                let config = config.expect("WebSocket configuration");
+                Probe::new(addr, config)
+                    .echo(
+                        "ping",
+                        |result| {
+                            result
+                                .as_ref()
+                                .map_err(|cause| cause.cause())
+                                .expect("WebSocket wait");
+                        },
+                        recovery::Policy::new(|event| retired.push(event), common::recover),
+                        |result| {
+                            let seen = result.expect("WebSocket probe");
+                            assert_eq!(seen.reply(), Some("pong"));
+                        },
+                    )
+                    .as_ref()
+                    .map_err(|cause| cause.kind())
+                    .expect("WebSocket operation");
+                assert!(
+                    retired
+                        .iter()
+                        .all(|event| matches!(event, Reclaimed::Shutdown)),
+                    "unexpected reports WebSocket client completion: {retired:?}"
+                );
+            },
+        )
+        .expect("harness");
+    };
+}

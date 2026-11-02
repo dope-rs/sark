@@ -1,17 +1,20 @@
-use sark_h2::flow;
-use sark_h2::flow::{Pair, Window};
+use sark_h2::{
+    flow,
+    flow::{Pair, Window},
+    frame::numbers::Increment,
+};
 
 #[test]
 fn new_initial_value() {
     let w = Window::new();
-    assert_eq!(w.value, 65_535);
+    assert_eq!(w.value(), 65_535);
     assert_eq!(w.available(), 65_535);
     assert!(!w.is_stalled());
 }
 
 #[test]
 fn default_equals_new() {
-    assert_eq!(Window::default(), Window::new());
+    assert!((Window::default()) == (Window::new()));
 }
 
 #[test]
@@ -22,7 +25,7 @@ fn with_zero_is_stalled() {
 }
 
 #[test]
-fn with_negative_available_zero() {
+fn negative_has_no_credit() {
     let w = Window::with(-5);
     assert!(w.is_stalled());
     assert_eq!(w.available(), 0);
@@ -39,132 +42,113 @@ fn initial_constant() {
 }
 
 #[test]
-fn consume_basic() {
-    let mut w = Window::new();
-    assert!(w.consume(100).is_ok());
-    assert_eq!(w.value, 65_435);
-}
-
-#[test]
-fn consume_exact() {
-    let mut w = Window::with(100);
-    assert!(w.consume(100).is_ok());
-    assert_eq!(w.value, 0);
-    assert!(w.is_stalled());
-}
-
-#[test]
-fn consume_over_available_stalls() {
-    let mut w = Window::new();
-    assert_eq!(w.consume(70_000), Err(flow::Error::Stalled));
-    assert_eq!(w.value, 65_535);
-}
-
-#[test]
-fn consume_when_zero() {
-    let mut w = Window::with(0);
-    assert_eq!(w.consume(1), Err(flow::Error::Stalled));
-    assert_eq!(w.consume(0), Ok(()));
-}
-
-#[test]
-fn consume_when_negative_always_stalls() {
-    let mut w = Window::with(-100);
-    assert_eq!(w.consume(1), Err(flow::Error::Stalled));
-    assert_eq!(w.consume(50), Err(flow::Error::Stalled));
-    assert_eq!(w.value, -100);
-}
-
-#[test]
 fn increase_basic() {
     let mut w = Window::new();
-    assert!(w.increase(1000).is_ok());
-    assert_eq!(w.value, 66_535);
-}
-
-#[test]
-fn increase_zero_protocol_error() {
-    let mut w = Window::new();
-    assert_eq!(w.increase(0), Err(flow::Error::ZeroIncrement));
+    (w.increase(Increment::new(1000).expect("positive increment")))
+        .as_ref()
+        .expect("test operation must succeed");
+    assert_eq!(w.value(), 66_535);
 }
 
 #[test]
 fn increase_to_max_ok() {
     let mut w = Window::with(0);
-    assert!(w.increase(Window::MAX as u32).is_ok());
-    assert_eq!(w.value, Window::MAX);
+    (w.increase(Increment::new(Window::MAX as u32).expect("maximum increment")))
+        .as_ref()
+        .expect("test operation must succeed");
+    assert_eq!(w.value(), Window::MAX);
 }
 
 #[test]
-fn increase_overflow_above_max() {
+fn max_update_overflows() {
     let mut w = Window::with(1);
-    assert_eq!(w.increase(Window::MAX as u32), Err(flow::Error::Overflow));
+    let inc = Increment::new(Window::MAX as u32).expect("maximum increment");
+    assert!(
+        (w.increase(inc))
+            == (Err(flow::Increase {
+                value: 1,
+                committed: 1,
+                inc,
+            }))
+    );
 }
 
 #[test]
-fn increase_u32_high_bit_overflow() {
-    let mut w = Window::new();
-    assert_eq!(w.increase(0xffff_ffff), Err(flow::Error::Overflow));
-}
-
-#[test]
-fn increase_from_negative_recovers() {
+fn negative_update_recovers() {
     let mut w = Window::with(-50_000);
-    assert!(w.increase(60_000).is_ok());
-    assert_eq!(w.value, 10_000);
+    (w.increase(Increment::new(60_000).expect("positive increment")))
+        .as_ref()
+        .expect("test operation must succeed");
+    assert_eq!(w.value(), 10_000);
     assert!(!w.is_stalled());
 }
 
 #[test]
 fn adjust_initial_positive() {
     let mut w = Window::new();
-    assert!(w.adjust_initial(10_000).is_ok());
-    assert_eq!(w.value, 75_535);
+    (w.adjust(10_000))
+        .as_ref()
+        .expect("test operation must succeed");
+    assert_eq!(w.value(), 75_535);
 }
 
 #[test]
-fn adjust_initial_negative_to_negative() {
+fn adjust_stays_negative() {
     let mut w = Window::new();
-    assert!(w.adjust_initial(-100_000).is_ok());
-    assert_eq!(w.value, 65_535 - 100_000);
+    (w.adjust(-100_000))
+        .as_ref()
+        .expect("test operation must succeed");
+    assert_eq!(w.value(), 65_535 - 100_000);
     assert!(w.is_stalled());
     assert_eq!(w.available(), 0);
 }
 
 #[test]
-fn adjust_initial_then_consume_stalls() {
+fn adjust_then_recovers() {
     let mut w = Window::new();
-    w.adjust_initial(-100_000).unwrap();
-    assert_eq!(w.consume(1), Err(flow::Error::Stalled));
-}
-
-#[test]
-fn adjust_initial_then_increase_recovers() {
-    let mut w = Window::new();
-    w.adjust_initial(-200_000).unwrap();
+    w.adjust(-200_000)
+        .expect("the adjusted window remains in the i32 range");
     assert!(w.is_stalled());
-    w.increase(50_000).unwrap();
-    assert_eq!(w.value, 65_535 - 200_000 + 50_000);
+    (w.increase(Increment::new(50_000).expect("positive increment")))
+        .as_ref()
+        .expect("the first update remains below the window maximum");
+    assert_eq!(w.value(), 65_535 - 200_000 + 50_000);
     assert!(w.is_stalled());
-    w.increase(200_000).unwrap();
+    (w.increase(Increment::new(200_000).expect("positive increment")))
+        .as_ref()
+        .expect("the second update remains below the window maximum");
     assert!(!w.is_stalled());
 }
 
 #[test]
-fn adjust_initial_overflow_positive() {
+fn positive_adjust_fails() {
     let mut w = Window::with(Window::MAX);
-    assert_eq!(w.adjust_initial(1), Err(flow::Error::Overflow));
-    assert_eq!(w.value, Window::MAX);
+    assert_eq!(
+        w.adjust(1),
+        Err(flow::Adjust {
+            value: Window::MAX,
+            committed: Window::MAX,
+            delta: 1,
+        })
+    );
+    assert_eq!(w.value(), Window::MAX);
 }
 
 #[test]
-fn adjust_initial_overflow_negative() {
+fn negative_adjust_fails() {
     let mut w = Window::with(i32::MIN + 1);
-    assert_eq!(w.adjust_initial(-2), Err(flow::Error::Overflow));
+    assert_eq!(
+        w.adjust(-2),
+        Err(flow::Adjust {
+            value: i32::MIN + 1,
+            committed: i32::MIN + 1,
+            delta: -2,
+        })
+    );
 }
 
 #[test]
-fn pair_available_min_of_conn_and_stream() {
+fn pair_uses_minimum() {
     let mut c = Window::with(100);
     let mut s = Window::with(200);
     let p = Pair {
@@ -175,33 +159,7 @@ fn pair_available_min_of_conn_and_stream() {
 }
 
 #[test]
-fn pair_consume_drains_both() {
-    let mut c = Window::with(100);
-    let mut s = Window::with(200);
-    let mut p = Pair {
-        conn: &mut c,
-        stream: &mut s,
-    };
-    assert!(p.consume(50).is_ok());
-    assert_eq!(c.value, 50);
-    assert_eq!(s.value, 150);
-}
-
-#[test]
-fn pair_consume_over_min_stalls_without_partial() {
-    let mut c = Window::with(10);
-    let mut s = Window::with(200);
-    let mut p = Pair {
-        conn: &mut c,
-        stream: &mut s,
-    };
-    assert_eq!(p.consume(100), Err(flow::Error::Stalled));
-    assert_eq!(c.value, 10);
-    assert_eq!(s.value, 200);
-}
-
-#[test]
-fn pair_available_zero_when_conn_zero() {
+fn zero_conn_stalls() {
     let mut c = Window::with(0);
     let mut s = Window::with(100);
     let p = Pair {
@@ -212,7 +170,7 @@ fn pair_available_zero_when_conn_zero() {
 }
 
 #[test]
-fn pair_available_zero_when_stream_negative() {
+fn negative_stream_stalls() {
     let mut c = Window::with(100);
     let mut s = Window::with(-50);
     let p = Pair {
@@ -220,45 +178,4 @@ fn pair_available_zero_when_stream_negative() {
         stream: &mut s,
     };
     assert_eq!(p.available(), 0);
-}
-
-#[test]
-fn pair_consume_zero_ok() {
-    let mut c = Window::with(0);
-    let mut s = Window::with(0);
-    let mut p = Pair {
-        conn: &mut c,
-        stream: &mut s,
-    };
-    assert!(p.consume(0).is_ok());
-}
-
-#[test]
-fn isolation_other_stream_unaffected() {
-    let mut conn = Window::new();
-    let mut attacker = Window::new();
-    let mut victim = Window::new();
-    let attacker_value = attacker.value as usize;
-    {
-        let mut p = Pair {
-            conn: &mut conn,
-            stream: &mut attacker,
-        };
-        p.consume(attacker_value).unwrap();
-    }
-    assert_eq!(attacker.value, 0);
-    assert_eq!(victim.value, 65_535);
-    assert!(conn.value < 65_535);
-    let mut p = Pair {
-        conn: &mut conn,
-        stream: &mut victim,
-    };
-    assert!(p.available() < 65_535);
-    assert!(p.consume(p.available()).is_ok());
-}
-
-#[test]
-fn window_update_above_u32_via_high_bit_overflow() {
-    let mut w = Window::with(1);
-    assert_eq!(w.increase(0x8000_0000), Err(flow::Error::Overflow));
 }

@@ -2,25 +2,21 @@
 name = "sark-h2"
 version.workspace = true
 edition.workspace = true
-description = "HTTP/2 protocol primitives + client/server bootstrap for sark stack"
+rust-version.workspace = true
+description = "Fiber-free HTTP/2 protocol primitives and manifold server for sark"
 authors.workspace = true
 repository.workspace = true
+readme.workspace = true
 license.workspace = true
 
 [dependencies]
-shin.workspace = true
+sark-http.workspace = true
 sark-core.workspace = true
 dope.workspace = true
-dope-net.workspace = true
-dope-fiber.workspace = true
-dope-gen.workspace = true
-dope-tls.workspace = true
 o3.workspace = true
 pin-project.workspace = true
-rustls = { version = "0.23", optional = true }
 
 [dev-dependencies]
+clap.workspace = true
 dope-test.workspace = true
-
-[features]
-rustls = ["dep:rustls", "dope-tls/rustls"]
+dope-tls.workspace = true

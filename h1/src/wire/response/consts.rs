@@ -1,0 +1,10 @@
+pub(in crate::wire) const SERVER: &[u8] = b"Server: sark\r\n";
+pub(in crate::wire) const DATE: &[u8] = b"Date: ";
+pub(in crate::wire) const CRLF: &[u8] = b"\r\n";
+pub(super) const KEEP_ALIVE: &[u8] = b"Connection: keep-alive\r\n";
+pub(super) const CLOSE: &[u8] = b"Connection: close\r\n";
+pub(super) const CONTENT_LENGTH: &[u8] = b"Content-Length: ";
+pub(super) const CHUNKED: &[u8] = b"Transfer-Encoding: chunked\r\n";
+pub(super) const STATUS: &[u8] = b"HTTP/1.1 ";
+pub(in crate::wire) const DATE_LEN: usize = 29;
+pub(in crate::wire) const PLACEHOLDER_DATE: &[u8; DATE_LEN] = b"Mon, 01 Jan 2000 00:00:00 GMT";

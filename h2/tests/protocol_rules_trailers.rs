@@ -1,0 +1,239 @@
+use common::{
+    hpack::Fields,
+    protocol::{
+        Session,
+        rules::{Request, Settings, Wire},
+        session::{self, Frame},
+    },
+};
+use sark_h2::{
+    ServerRole,
+    conn::{event::Event, machine::Connection},
+    frame::payload::Continuation,
+    stream::Id,
+};
+pub mod common;
+
+use sark_core::manifold::stream::{Boundary, Section};
+use sark_h2::{frame, frame::numbers::ErrorCode};
+use sark_http::field::metadata::map::record::Entry;
+
+#[test]
+fn accepts_trailers() {
+    let mut conn = Connection::<ServerRole>::try_new().expect("server fixture");
+    Session::new(&mut conn)
+        .try_prime()
+        .expect("protocol fixture");
+    let initial = Frame::new(
+        1,
+        &Request::new(&[]).try_encode().expect("protocol fixture"),
+    )
+    .try_headers(Boundary::More, frame::Block::End)
+    .expect("protocol wire fixture");
+    conn.ingress()
+        .ingest(&initial)
+        .expect("initial request HEADERS frame fits ingress");
+    assert!(matches!(
+        conn.ingress().poll_event(),
+        Some(Event::Headers { .. })
+    ));
+    conn.ingress()
+        .ingest(
+            &session::Frame::new(1, b"x")
+                .try_data(Boundary::More)
+                .expect("protocol wire fixture"),
+        )
+        .expect("request DATA frame fits ingress");
+    assert!(matches!(
+        conn.ingress().poll_event(),
+        Some(Event::Data { .. })
+    ));
+    conn.transfer().drain(usize::MAX);
+
+    let block = Fields::new(&[Entry::new(b"x-trailer", b"v")])
+        .try_encode()
+        .expect("protocol fixture");
+    let trailing = Frame::new(1, &block)
+        .try_headers(Boundary::End, frame::Block::End)
+        .expect("protocol wire fixture");
+    conn.ingress()
+        .ingest(&trailing)
+        .expect("trailing HEADERS frame fits ingress");
+    let ev = conn.ingress().poll_event().expect("trailing Headers event");
+    assert!(matches!(
+        ev,
+        Event::Headers {
+            section: Section::Trailing,
+            boundary: Boundary::End,
+            ..
+        }
+    ));
+    assert!(
+        Wire::new(conn.output().first())
+            .try_reset()
+            .expect("protocol wire fixture")
+            .is_none()
+    );
+}
+
+#[test]
+fn rejects_pseudo_trailer() {
+    let mut conn = Connection::<ServerRole>::try_new().expect("server fixture");
+    Session::new(&mut conn)
+        .try_prime()
+        .expect("protocol fixture");
+    let initial = Frame::new(
+        1,
+        &Request::new(&[]).try_encode().expect("protocol fixture"),
+    )
+    .try_headers(Boundary::More, frame::Block::End)
+    .expect("protocol wire fixture");
+    conn.ingress()
+        .ingest(&initial)
+        .expect("initial request HEADERS frame fits ingress");
+    assert!(matches!(
+        conn.ingress().poll_event(),
+        Some(Event::Headers { .. })
+    ));
+    conn.ingress()
+        .ingest(
+            &session::Frame::new(1, b"x")
+                .try_data(Boundary::More)
+                .expect("protocol wire fixture"),
+        )
+        .expect("request DATA frame fits ingress");
+    assert!(matches!(
+        conn.ingress().poll_event(),
+        Some(Event::Data { .. })
+    ));
+    conn.transfer().drain(usize::MAX);
+
+    let block = Fields::new(&[Entry::new(b":method", b"GET")])
+        .try_encode()
+        .expect("protocol fixture");
+    let trailing = Frame::new(1, &block)
+        .try_headers(Boundary::End, frame::Block::End)
+        .expect("protocol wire fixture");
+    conn.ingress()
+        .ingest(&trailing)
+        .expect("pseudo trailer HEADERS frame fits ingress");
+    assert!(matches!(
+        conn.ingress().poll_event(),
+        Some(Event::StreamReset {
+            stream_id, error: ErrorCode::ProtocolError, ..
+        }) if stream_id == Id::new(1).expect("fixture domain")
+    ));
+    let rst = Wire::new(conn.output().first())
+        .try_reset()
+        .expect("protocol wire fixture")
+        .expect("RST_STREAM emitted");
+    assert!(
+        (rst)
+            == (
+                Id::new(1).expect("fixture domain"),
+                ErrorCode::ProtocolError
+            )
+    );
+}
+
+#[test]
+fn validates_continuation() {
+    let mut conn = Connection::<ServerRole>::try_new().expect("server fixture");
+    Session::new(&mut conn)
+        .try_prime()
+        .expect("protocol fixture");
+    let block = Fields::new(&[
+        Entry::new(b":scheme", b"http"),
+        Entry::new(b":path", b"/"),
+        Entry::new(b":authority", b"x"),
+    ])
+    .try_encode()
+    .expect("protocol fixture");
+    let split = block.len() / 2;
+    conn.ingress()
+        .ingest(
+            &Frame::new(1, &block[..split])
+                .try_headers(Boundary::End, frame::Block::More)
+                .expect("protocol wire fixture"),
+        )
+        .expect("partial request HEADERS frame fits ingress");
+    assert!(conn.ingress().poll_event().is_none());
+    conn.ingress()
+        .ingest(&{
+            let mut out = Vec::new();
+            Continuation::new(
+                Id::new(1).expect("fixture domain"),
+                frame::Block::End,
+                &block[split..],
+            )
+            .expect("remaining request bytes form a valid CONTINUATION")
+            .encode(&mut out)
+            .expect("frame allocation");
+            out
+        })
+        .expect("request CONTINUATION frame fits ingress");
+    assert!(conn.ingress().poll_event().is_none());
+    let rst = Wire::new(conn.output().first())
+        .try_reset()
+        .expect("protocol wire fixture")
+        .expect("RST_STREAM emitted");
+    assert!(
+        (rst)
+            == (
+                Id::new(1).expect("fixture domain"),
+                ErrorCode::ProtocolError
+            )
+    );
+}
+
+#[test]
+fn rejects_split_limit() {
+    let max = Request::new(&[]).size() - 1;
+    let mut conn = Settings::limited(max)
+        .try_connect::<ServerRole>()
+        .expect("header limit fixture");
+    Session::new(&mut conn)
+        .try_prime()
+        .expect("protocol fixture");
+    let block = Request::new(&[]).try_encode().expect("protocol fixture");
+    let split = block.len() / 2;
+    conn.ingress()
+        .ingest(
+            &Frame::new(1, &block[..split])
+                .try_headers(Boundary::End, frame::Block::More)
+                .expect("protocol wire fixture"),
+        )
+        .expect("partial oversized HEADERS frame fits ingress");
+    assert!(conn.ingress().poll_event().is_none());
+    conn.ingress()
+        .ingest(&{
+            let mut out = Vec::new();
+            Continuation::new(
+                Id::new(1).expect("fixture domain"),
+                frame::Block::End,
+                &block[split..],
+            )
+            .expect("remaining oversized bytes form a valid CONTINUATION")
+            .encode(&mut out)
+            .expect("frame allocation");
+            out
+        })
+        .expect("oversized CONTINUATION frame fits ingress");
+    assert!(conn.ingress().poll_event().is_none());
+    let rst = Wire::new(conn.output().first())
+        .try_reset()
+        .expect("protocol wire fixture")
+        .expect("RST_STREAM emitted");
+    assert!(
+        (rst)
+            == (
+                Id::new(1).expect("fixture domain"),
+                ErrorCode::ProtocolError
+            )
+    );
+    assert!(
+        !conn
+            .status()
+            .has_stream(Id::new(1).expect("fixture domain"))
+    );
+}

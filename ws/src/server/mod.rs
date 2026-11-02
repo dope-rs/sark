@@ -1,76 +1,182 @@
-use std::io;
-use std::net::SocketAddr;
+use std::net;
 
-use dope::manifold::env::Bundle;
-use dope::manifold::listener::Listener;
-use dope::runtime::launcher::WorkerContext;
-use dope::runtime::profile::Throughput;
-use dope::runtime::trigger::ShutdownTrigger;
-use dope_net::link::egress;
-use dope_net::tcp::Tcp;
-use dope_net::wire::identity::Identity;
+use dope::{
+    core::{
+        driver::route::KeyTag,
+        io::socket::{self, Listener, option},
+    },
+    manifold::{
+        self,
+        app::{env, env::quota},
+        network::listener::{config, topology::Direct},
+        timing,
+    },
+    net::{link::egress, tcp, wire},
+};
+use o3::buffer::{bytes::window::Snapshot, storage};
 
-pub type WsEnv = Bundle<Tcp, Identity, Throughput>;
+use crate::inbound;
 
-mod app;
+pub mod app;
+mod error;
+mod output;
+mod response;
+mod sources;
 
-pub use app::{App, ConnState, Handler, Message, Response};
+pub use error::Error;
+pub use response::Response;
 
-#[derive(Clone, Debug)]
+pub type Server<H> =
+    Direct<KeyTag<0>, env::Bundle<tcp::Tcp, wire::Identity, timing::Throughput>, app::App<H>>;
+
+const DEFAULT_MAX_MESSAGE: usize = 16 * 1024 * 1024;
+const WS_MAX_FRAME: usize = 16 * 1024 * 1024;
+const WS_MAX_ACC: usize = WS_MAX_FRAME + 64 * 1024;
+type Acc = Snapshot<WS_MAX_ACC>;
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Phase {
+    Handshake,
+    /// The opening failure was reported; its HTTP rejection still needs output.
+    OpeningRejected,
+    Active,
+    MessageTooBig,
+    /// The fault is final; its close frame still needs output capacity.
+    Rejected(inbound::Fault),
+    Closed,
+}
+
+pub struct ConnState {
+    phase: Phase,
+    eof: bool,
+    pending: Option<egress::NonEmpty<storage::Shared>>,
+    pub(super) acc: Acc,
+    pub(super) handshake_complete: bool,
+    pub(super) inbound: inbound::Inbound<inbound::ClientPeer>,
+}
+
+impl Default for ConnState {
+    fn default() -> Self {
+        Self::new(DEFAULT_MAX_MESSAGE)
+    }
+}
+
+impl ConnState {
+    fn new(max_message_size: usize) -> Self {
+        Self {
+            phase: Phase::Handshake,
+            eof: false,
+            pending: None,
+            acc: Acc::new(),
+            handshake_complete: false,
+            inbound: inbound::Inbound::new(max_message_size),
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+pub enum Message<'a> {
+    Text(&'a str),
+    Binary(&'a [u8]),
+}
+
+/// Validated opening request, borrowed until its response is committed.
+/// Authorize its origin and credentials through [`app::Sink::opening`].
+#[derive(Clone, Copy, Debug)]
+pub struct Opening<'a> {
+    pub authority: &'a str,
+    pub target: &'a str,
+    pub origin: Option<&'a [u8]>,
+    pub cookie: Option<&'a [u8]>,
+}
+
 pub struct Config {
-    pub bind: SocketAddr,
+    pub bind: net::SocketAddr,
     pub max_connections: usize,
-    pub backlog: i32,
-    pub path: &'static str,
+    pub per_ip: Option<quota::PerIp>,
+    pub backlog: socket::Backlog,
+    /// Exact opening target; an empty string accepts any target.
+    pub path: String,
+    /// Maximum payload bytes in one frame, capped at 16 MiB.
     pub max_frame_payload: usize,
+    /// Maximum aggregate payload bytes in one data message across its fragments.
+    /// Zero accepts only empty data messages; control frames remain independent.
+    pub max_message_size: usize,
 }
 
-#[pin_project::pin_project]
-#[derive(dope_gen::Dispatcher)]
-struct Dispatcher<'d, H: Handler> {
-    #[pin]
-    #[manifold]
-    listener: Listener<'d, 'd, 0, App<H>, WsEnv>,
+/// Fully configured WebSocket listener without a handler recipe.
+#[must_use = "a WebSocket plan must be completed into a topology component"]
+pub struct Plan {
+    listener: config::Prepared<tcp::Tcp>,
+    path: String,
+    max_frame_payload: usize,
+    max_message_size: usize,
+    bound: Option<Listener>,
 }
 
-pub fn serve<H: Handler>(
-    handler: H,
-    cfg: Config,
-    context: WorkerContext,
-    shutdown: Option<&ShutdownTrigger>,
-) -> io::Result<()> {
-    let listener_cfg = dope::manifold::listener::config::Config::<Tcp> {
-        max_connections: cfg.max_connections,
-        bind: cfg.bind,
-        backlog: cfg.backlog,
-        stream: Default::default(),
-        transport: dope_net::tcp::listener::Config {
-            reuse_port: true,
-            per_ip_limit: Some(u32::try_from(cfg.max_connections / 2).unwrap_or(u32::MAX)),
-            ..Default::default()
-        },
-        egress: Default::default(),
-    };
-    let driver_config = dope::driver::Config::for_tcp_profile::<Throughput>(cfg.max_connections);
-    dope::runtime::executor::Executor::with_seed(driver_config, context.seed())?
-        .with_storage(egress::storage::Storage::default())
-        .enter(|mut sess| {
-            let egress = sess.storage();
-            let hash_builder = sess.seed().derive(dope::hash::domain::ACCEPT).state();
-            let listener = {
-                let mut driver = sess.driver_access();
-                if let Some(trigger) = shutdown {
-                    trigger.try_register(&mut driver)?;
-                }
-                Listener::<'_, '_, 0, App<H>, WsEnv>::open_in(
-                    App::new(handler, cfg.path, cfg.max_frame_payload),
-                    listener_cfg,
-                    hash_builder,
-                    egress,
-                    &mut driver,
-                )?
-            };
-            let app = core::pin::pin!(o3::cell::BrandCell::new(Dispatcher { listener }));
-            sess.run(app.as_ref())
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ConfigError {
+    Listener(manifold::ConfigError),
+}
+
+impl Plan {
+    pub fn new(config: Config) -> Result<Self, ConfigError> {
+        let Config {
+            bind,
+            max_connections: max,
+            per_ip: limit,
+            backlog,
+            path,
+            max_frame_payload: frame,
+            max_message_size,
+        } = config;
+        let listener = config::Config::<tcp::Tcp> {
+            max_connections: max,
+            per_ip: limit,
+            direct_flights: max.into(),
+            bind,
+            backlog,
+            stream: tcp::StreamConfig {
+                no_delay: Some(option::Switch::On),
+                ..Default::default()
+            },
+            transport: tcp::Config::for_tcp(Some(socket::Reuse::Port), None),
+            egress: Default::default(),
+        }
+        .try_prepare()
+        .map_err(ConfigError::Listener)?;
+        Ok(Self {
+            listener,
+            path,
+            max_frame_payload: frame,
+            max_message_size,
+            bound: None,
         })
+    }
+
+    pub fn with_bound(mut self, bound: Option<Listener>) -> Self {
+        self.bound = bound;
+        self
+    }
+
+    pub fn with_reader<F: Fn(Message<'_>), E: Fn(Error)>(
+        self,
+        receive: F,
+        failure: E,
+    ) -> Server<app::Reader<F, E>> {
+        self.with_handler(app::Reader { receive, failure })
+    }
+
+    pub fn with_handler<H: app::Sink>(self, user: H) -> Server<H> {
+        Direct::new(
+            self.listener,
+            app::App::new(
+                user,
+                self.path,
+                self.max_frame_payload,
+                self.max_message_size,
+            ),
+        )
+        .with_bound(self.bound)
+    }
 }

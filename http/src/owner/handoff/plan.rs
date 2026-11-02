@@ -1,0 +1,194 @@
+use std::{convert::Infallible, ptr};
+
+use handoff::{Error, Origin, Pending, Ready, origin::Source, stage};
+use o3::buffer::{
+    bytes::scope,
+    hold::{self, evidence},
+    storage,
+};
+
+use crate::{owner::handoff, payload::owned, request::body};
+
+/// A selected response body, independent of the temporary header borrow.
+#[repr(transparent)]
+#[must_use = "resolve or finish the response owner handoff"]
+#[doc(hidden)]
+pub struct Plan<'req, 'd, S = Infallible, B = body::Retained<'req, 'd>> {
+    state: State<'req, 'd, S, B>,
+}
+
+impl<'req, 'd, S, B: stage::Body<'req, 'd>> Plan<'req, 'd, S, B> {
+    pub(crate) const fn new(state: State<'req, 'd, S, B>) -> Self {
+        Self { state }
+    }
+
+    pub(crate) fn try_borrow<H: scope::Source<Selection = S>>(
+        slot: &handoff::Slot<'req, 'd, H, B>,
+        bytes: &[u8],
+    ) -> Result<Self, owned::Error> {
+        let origin = slot.origin();
+        if bytes.is_empty() {
+            return Ok(Self::new(origin.clear()));
+        }
+        if let Source::Retained(body) = origin.source {
+            if body
+                .borrow()
+                .as_slice()
+                .is_some_and(|whole| ptr::eq(whole, bytes))
+            {
+                return Ok(Self::new(State::Body(body)));
+            }
+            if let Some(body) = body.borrow().try_slice(bytes)? {
+                return Ok(Self::new(State::Ready {
+                    origin,
+                    body: Ready::Linked(body),
+                }));
+            }
+        }
+        if let Some(selected) = slot.head.select(bytes) {
+            return Ok(Self::new(State::Head { origin, selected }));
+        }
+        Self::try_copy(origin, bytes)
+    }
+
+    pub(crate) fn try_retain(
+        origin: Origin<'req, 'd, B>,
+        view: body::Retained<'_, 'd>,
+    ) -> Result<Self, owned::Error> {
+        if let Source::Retained(body) = origin.source
+            && view.is_same(*body.borrow())
+        {
+            return Ok(Self::new(State::Body(body)));
+        }
+        let body = view.try_clone()?;
+        Ok(Self::new(State::Ready {
+            origin,
+            body: Ready::Segmented(body),
+        }))
+    }
+
+    pub(crate) fn try_view(
+        origin: Origin<'req, 'd, B>,
+        view: body::Ref<'_, '_>,
+    ) -> Result<Self, owned::Error> {
+        use handoff::copy;
+
+        let body = view.try_copy()?;
+        Ok(Self::new(State::Ready {
+            origin,
+            body: Ready::Copied(copy::Body::new(body)),
+        }))
+    }
+
+    fn try_copy(origin: Origin<'req, 'd, B>, bytes: &[u8]) -> Result<Self, owned::Error> {
+        use handoff::copy;
+
+        let body = storage::Shared::try_copy(bytes).map_err(owned::Error::Storage)?;
+        Ok(Self::new(State::Ready {
+            origin,
+            body: Ready::Copied(copy::Body::new(body)),
+        }))
+    }
+
+    pub fn stage(self) -> stage::State<'d, S, B> {
+        match self.state {
+            State::Ready { body, .. } => stage::State::Ready(body),
+            State::Body(body) => stage::State::Body(body),
+            State::Head { selected, .. } => stage::State::Head(selected),
+        }
+    }
+}
+
+impl<'req, 'd, B: stage::Body<'req, 'd>> Plan<'req, 'd, Infallible, B> {
+    pub fn detach(self) -> Pending<'d, evidence::Off, B::Deferred>
+    where
+        B::Deferred: stage::Deferred<'d>,
+    {
+        match self.state {
+            State::Ready { body, .. } => Pending::ready(body, evidence::Off),
+            State::Body(body) => Pending::body(body.defer(), evidence::Off),
+            State::Head { selected, .. } => match selected {},
+        }
+    }
+
+    pub fn try_detach(self) -> Result<Pending<'d, evidence::On, B::Deferred>, Error>
+    where
+        B::Deferred: stage::Deferred<'d>,
+    {
+        match self.state {
+            State::Ready { origin, body } => {
+                let charge = body.try_linked(origin).map_err(Error::Overflow)?;
+                Ok(Pending::ready(body, charge))
+            }
+            State::Body(body) => Ok(Pending::body(body.defer(), body.borrow().charge())),
+            State::Head { selected, .. } => match selected {},
+        }
+    }
+
+    pub fn finish(self) -> Result<Ready<'d>, Error> {
+        match self.state {
+            State::Ready { body, .. } => Ok(body),
+            State::Body(body) => body
+                .borrow()
+                .try_clone()
+                .map(Ready::Linked)
+                .map_err(Error::Retain),
+            State::Head { selected, .. } => match selected {},
+        }
+    }
+
+    pub fn try_finish(self) -> Result<(Ready<'d>, hold::Charge), Error> {
+        match self.state {
+            State::Ready { origin, body } => {
+                let charge = body.try_linked(origin).map_err(Error::Overflow)?;
+                Ok((body, charge))
+            }
+            State::Body(body) => {
+                let body = body.borrow();
+                let charge = body.charge();
+                let body = body.try_clone().map_err(Error::Retain)?;
+                Ok((Ready::Linked(body), charge))
+            }
+            State::Head { selected, .. } => match selected {},
+        }
+    }
+}
+
+const _: () = assert!(size_of::<Plan<'static, 'static>>() == size_of::<State<'static, 'static>>());
+
+pub(crate) enum State<'req, 'd, S = Infallible, B = body::Retained<'req, 'd>> {
+    Ready {
+        origin: Origin<'req, 'd, B>,
+        body: Ready<'d>,
+    },
+    Body(B),
+    Head {
+        origin: Origin<'req, 'd, B>,
+        selected: S,
+    },
+}
+
+const _: () = assert!(size_of::<State<'static, 'static>>() <= 11 * size_of::<usize>());
+
+impl<'req, 'd, 'id, B: stage::Body<'req, 'd>> Plan<'req, 'd, scope::Range<'id>, B> {
+    pub fn resolve_head<O>(
+        self,
+        head: O,
+        retain: impl FnOnce(O) -> scope::Owner<'id, storage::Shared>,
+    ) -> (Plan<'req, 'd, Infallible, B>, handoff::Head<O>) {
+        match self.state {
+            State::Ready { origin, body } => (
+                Plan::new(State::Ready { origin, body }),
+                handoff::Head::Passed(head),
+            ),
+            State::Body(body) => (Plan::new(State::Body(body)), handoff::Head::Passed(head)),
+            State::Head { origin, selected } => (
+                Plan::new(State::Ready {
+                    origin,
+                    body: Ready::Retained(retain(head).project(selected)),
+                }),
+                handoff::Head::Kept,
+            ),
+        }
+    }
+}

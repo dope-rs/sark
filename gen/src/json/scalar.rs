@@ -1,6 +1,4 @@
-use syn::{Result, Type};
-
-use crate::util::TypeExt;
+use crate::types;
 
 #[derive(Clone, Copy)]
 pub(super) enum Scalar {
@@ -11,9 +9,8 @@ pub(super) enum Scalar {
     String,
     Shared,
     Borrowed,
-    Retained,
-    JsonBytes,
-    InlineToken,
+    Bytes,
+    Token,
 }
 
 #[derive(Clone, Copy)]
@@ -23,33 +20,31 @@ pub(super) struct Classified {
 }
 
 impl Classified {
-    pub(super) fn of(ty: &Type) -> Result<Self> {
-        let (inner, optional) = match ty.option_inner() {
-            Some(inner) => (inner, true),
-            None => (ty, false),
-        };
-        let scalar = if inner.is_plain_ident("u64") {
+    pub(super) fn of(ty: &syn::Type) -> syn::Result<Self> {
+        let view = types::View::new(ty);
+        let optional = view.is_optional();
+        let inner = types::View::new(view.value());
+        let scalar = if inner.is_named("u64") {
             Scalar::U64
-        } else if inner.is_plain_ident("i64") {
+        } else if inner.is_named("i64") {
             Scalar::I64
-        } else if inner.is_plain_ident("f64") {
+        } else if inner.is_named("f64") {
             Scalar::F64
-        } else if inner.is_plain_ident("bool") {
+        } else if inner.is_named("bool") {
             Scalar::Bool
-        } else if inner.is_plain_ident("String") {
+        } else if inner.is_named("String") {
             Scalar::String
-        } else if inner.is_plain_ident("Shared") {
+        } else if inner.is_named("Shared") {
             Scalar::Shared
-        } else if inner.is_bytes_with_storage("Borrowed") {
+        } else if inner.is_slice() {
             Scalar::Borrowed
-        } else if inner.is_bytes_with_storage("Retained") {
-            Scalar::Retained
-        } else if inner.is_plain_ident("JsonBytes") {
-            Scalar::JsonBytes
-        } else if inner.is_inline_token() {
-            Scalar::InlineToken
+        } else if inner.is_named("Bytes") {
+            Scalar::Bytes
+        } else if inner.is_named("Token") {
+            Scalar::Token
         } else {
-            return Err(syn::Error::new_spanned(
+            use syn::Error;
+            return Err(Error::new_spanned(
                 ty,
                 "unsupported #[sark_gen::json] field type",
             ));

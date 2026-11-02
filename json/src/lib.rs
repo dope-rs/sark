@@ -1,60 +1,71 @@
-use http::StatusCode;
-use sark_core::http::Response;
+use std::{mem, result};
 
-mod body;
-mod depth;
-mod encode;
-mod error;
-mod parse;
-mod response;
-mod scan;
-mod traits;
-mod view;
+use o3::{
+    alloc,
+    buffer::{segments, storage, write::consume},
+    mem::rc,
+};
 
-pub use body::InlineToken;
-pub use depth::MAX_DEPTH;
-pub use encode::{Encode, Write, Writer};
-pub use o3::mem::ScratchVec;
-pub use parse::{Parse, ParseSource};
-pub use response::JsonBody;
-pub use scan::Scan;
-pub use traits::{JsonDecode, JsonEncode, JsonPreserve, JsonRequestDecode, JsonScan};
-pub use view::JsonBytes;
+mod bytes;
+pub mod input;
+mod nesting;
+pub mod parsing;
+pub mod segment;
+mod source;
+mod token;
+pub mod writing;
 
-pub type Result<T> = sark_core::error::Result<T>;
+pub use bytes::{
+    Bytes,
+    proofs::{Backing, Plain, PlainError, Raw, Text, TextValue},
+};
+pub(crate) use nesting::Nesting;
+#[doc(hidden)]
+pub use o3;
+/// Derives decoding/encoding on nongeneric structs; `encode`/`try_encode` also accept generics.
+/// `seq, nested` accepts `&Owner: IntoIterator` of owned/borrowed encoders; decoding requires `Vec<T>`.
+/// Exact writes are checked independently of sizing, even if the owner changes between traversals.
+pub use sark_gen::json;
+#[doc(hidden)]
+pub use sark_http;
+pub use source::Source;
+pub use token::Token;
 
-pub struct Json;
+#[derive(Debug)]
+pub enum Error {
+    Invalid,
+    Depth,
+    Token(consume::Error),
+    Storage(Storage),
+    Allocation(alloc::Error),
+    Exhausted(alloc::Exhausted),
+    Retain(rc::Error),
+    InputLength {
+        current: usize,
+        add: usize,
+    },
+    InputSegments {
+        current: segments::Count,
+        add: segments::Count,
+    },
+    OutputLength(consume::Error),
+}
 
-impl Json {
-    pub fn ok<T: JsonEncode>(value: T) -> Response {
-        Self::status(StatusCode::OK, value)
-    }
+#[derive(Debug)]
+pub enum Storage {
+    Capacity(consume::Error),
+    Exhausted(alloc::Exhausted),
+}
 
-    pub fn ok_preserve<T: JsonEncode + JsonPreserve>(value: T) -> Response {
-        Self::status_preserve(StatusCode::OK, value)
-    }
-
-    pub fn status<T: JsonEncode>(status: StatusCode, value: T) -> Response {
-        let body = value.encode_json();
-        let mut response = Response::new(status);
-        response.content_type("application/json");
-        response.set_body(body);
-        response
-    }
-
-    pub fn status_preserve<T: JsonEncode + JsonPreserve>(status: StatusCode, value: T) -> Response {
-        let body = if let Some(raw) = value.raw_json() {
-            raw.clone()
-        } else {
-            o3::buffer::Shared::from(value.encode_json())
-        };
-        let mut response = Response::new(status);
-        response.content_type("application/json");
-        response.set_body(body);
-        response
-    }
-
-    pub fn bad_request(msg: impl Into<String>) -> sark_core::error::Error {
-        error::Fail::with(msg)
+impl From<storage::AllocError> for Error {
+    fn from(error: storage::AllocError) -> Self {
+        Self::Storage(match error {
+            storage::AllocError::Capacity(error) => Storage::Capacity(error),
+            storage::AllocError::Exhausted(error) => Storage::Exhausted(error),
+        })
     }
 }
+
+type Result<T> = result::Result<T, Error>;
+
+const _: () = assert!(mem::size_of::<Error>() == mem::size_of::<usize>() * 3);

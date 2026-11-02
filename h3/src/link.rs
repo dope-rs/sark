@@ -1,0 +1,250 @@
+//! Typed transport ownership boundary.
+
+use std::num::NonZero;
+
+use dope_quic::wire::stream::Id;
+use o3::buffer::resident;
+use sark_core::manifold::stream::Boundary;
+use sark_http::{self, field::metadata::section::rules};
+
+use crate::conn::{
+    self, event,
+    io::{self, write},
+    output,
+};
+
+const RECEIVE_QUANTUM: usize = 32;
+const CREDIT_QUANTUM: usize = 32;
+pub(crate) const WRITE_QUANTUM: u8 = 32;
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum Flush {
+    Drained,
+    Pending,
+    Blocked,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum Status {
+    Open,
+    Suspended,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Drain {
+    No,
+    Yes,
+}
+
+/// Ownership result of one retained receive handoff.
+#[must_use]
+#[derive(PartialEq, Eq)]
+pub enum Handoff {
+    Rejected(conn::Error),
+    Accepted(Result<Status, conn::Error>),
+}
+
+impl Handoff {
+    pub(crate) fn into_result(self) -> Result<(), conn::Error> {
+        match self {
+            Self::Rejected(error) | Self::Accepted(Err(error)) => Err(error),
+            Self::Accepted(Ok(_)) => Ok(()),
+        }
+    }
+}
+
+/// One atomic receive-side transport handoff.
+#[must_use]
+pub enum Receive<'d, C> {
+    Pending,
+    Segment {
+        bytes: resident::Shared<'d>,
+        boundary: Boundary,
+        credit: C,
+    },
+    Finished,
+}
+
+/// One admitted write whose unchanged owner may return after backpressure.
+#[repr(transparent)]
+pub struct Write<'id, 'd>(write::Flight<'id, 'd>);
+
+impl<'id, 'd> Write<'id, 'd> {
+    fn new(write: write::Flight<'id, 'd>) -> Self {
+        Self(write)
+    }
+
+    pub const fn stream_id(&self) -> Id {
+        self.0.get().stream_id()
+    }
+
+    pub const fn boundary(&self) -> Boundary {
+        self.0.get().boundary()
+    }
+
+    pub const fn prefix(&self) -> &output::WritePrefix {
+        &self.0.get().prefix
+    }
+
+    pub fn payload(&self) -> Option<&output::WritePayload<'d>> {
+        self.0.payload.as_ref()
+    }
+
+    fn into_flight(self) -> write::Flight<'id, 'd> {
+        self.0
+    }
+}
+
+pub enum Outcome<'id, 'd> {
+    Accepted,
+    Blocked(Write<'id, 'd>),
+}
+
+pub trait Transport<'d> {
+    /// Attempts one indivisible owner handoff.
+    fn send_write<'id>(&mut self, write: Write<'id, 'd>) -> Outcome<'id, 'd>;
+
+    fn pump_writes<P: rules::Policy, A: rules::Push>(
+        &mut self,
+        conn: &mut conn::Connection<'d, P, A>,
+    ) -> Result<Flush, conn::Error> {
+        for _ in 0..WRITE_QUANTUM {
+            let feedback = conn.session.qpack_decoder;
+            let Some(taken) = conn.queues.take(&mut conn.qpack.feedback, feedback) else {
+                return Ok(Flush::Drained);
+            };
+            let done = taken.with(|write, prepared| match self.send_write(Write::new(write)) {
+                Outcome::Accepted => Some(prepared.commit()),
+                Outcome::Blocked(owner) => {
+                    prepared.restore(owner.into_flight());
+                    None
+                }
+            })?;
+            let Some(done) = done else {
+                return Ok(Flush::Blocked);
+            };
+            if done.is_feedback() {
+                conn.events().resume()?;
+            }
+        }
+        Ok(if conn.queues.has_write(&conn.qpack.feedback) {
+            Flush::Pending
+        } else {
+            Flush::Drained
+        })
+    }
+}
+
+const _: () = assert!(
+    core::mem::size_of::<Write<'static, 'static>>()
+        == core::mem::size_of::<output::Write<'static>>()
+);
+
+pub trait Recv<'d> {
+    type Credit;
+    type Error: From<conn::Error>;
+
+    /// Transfers one exact owner with its FIN fact.
+    fn recv_stream(&mut self, id: Id) -> Result<Receive<'d, Self::Credit>, Self::Error>;
+
+    /// Commits one successful owner handoff.
+    fn accept(&mut self, credit: Self::Credit) -> Result<(), Self::Error>;
+
+    /// Rolls back one failed owner handoff.
+    fn reject(&mut self, credit: Self::Credit);
+
+    /// Releases one non-empty byte credit; scheduling resumes bypass ownership.
+    fn release(&mut self, id: Id, bytes: NonZero<usize>) -> Result<(), Self::Error>;
+}
+
+/// Exclusive receive pump over one transport and its H3 connection.
+#[repr(C)]
+pub struct Pump<
+    'a,
+    'd,
+    R: Recv<'d>,
+    P: rules::Policy = rules::RetainRaw,
+    A: rules::Push = rules::RejectPush,
+> {
+    recv: &'a mut R,
+    conn: &'a mut conn::Connection<'d, P, A>,
+}
+
+impl<'a, 'd, R, P, A> Pump<'a, 'd, R, P, A>
+where
+    R: Recv<'d>,
+    P: rules::Policy,
+    A: rules::Push,
+{
+    pub const fn new(recv: &'a mut R, conn: &'a mut conn::Connection<'d, P, A>) -> Self {
+        Self { recv, conn }
+    }
+
+    pub fn event(mut self, id: Id) -> Result<(), R::Error> {
+        let token = event::Token::from(id);
+        self.pump(id, Some(token), Drain::Yes)
+    }
+
+    pub fn token(mut self, id: Id, token: u64) -> Result<(), R::Error> {
+        let token = event::Token::new(token).ok_or(conn::Error::Identity { raw: token })?;
+        self.pump(id, Some(token), Drain::Yes)
+    }
+
+    pub fn credit(&mut self) -> Result<(), R::Error> {
+        for _ in 0..CREDIT_QUANTUM {
+            let Some((id, bytes, resume)) = self.conn.events().poll_credit()? else {
+                return Ok(());
+            };
+            if let Some(bytes) = NonZero::<usize>::new(bytes) {
+                self.recv.release(id, bytes)?;
+            }
+            if matches!(resume, io::Resume::Ready) {
+                self.pump(id, None, Drain::No)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn pump(&mut self, id: Id, token: Option<event::Token>, drain: Drain) -> Result<(), R::Error> {
+        if io::Receive::new(self.conn).is_blocked(id) {
+            return Ok(());
+        }
+        for _ in 0..RECEIVE_QUANTUM {
+            let (bytes, boundary, credit) = match self.recv.recv_stream(id)? {
+                Receive::Pending => return Ok(()),
+                Receive::Finished => {
+                    io::Receive::new(self.conn).finish(id, token)?;
+                    if matches!(drain, Drain::Yes) {
+                        self.credit()?;
+                    }
+                    return Ok(());
+                }
+                Receive::Segment {
+                    bytes,
+                    boundary,
+                    credit,
+                } => (bytes, boundary, credit),
+            };
+            let state = match io::Receive::new(self.conn).hold_with(id, token, bytes, boundary) {
+                Handoff::Rejected(error) => {
+                    self.recv.reject(credit);
+                    return Err(error.into());
+                }
+                Handoff::Accepted(state) => {
+                    self.recv.accept(credit)?;
+                    state?
+                }
+            };
+            if matches!(drain, Drain::Yes) {
+                self.credit()?;
+            }
+            if state == Status::Suspended {
+                return Ok(());
+            }
+            if matches!(boundary, Boundary::End) {
+                return Ok(());
+            }
+        }
+        Ok(io::Receive::new(self.conn).defer(id)?)
+    }
+}

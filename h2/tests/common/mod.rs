@@ -1,21 +1,32 @@
-#![allow(dead_code)]
+pub const INITIAL_SETTINGS: &[u8; 9] = &[0, 0, 0, 4, 0, 0, 0, 0, 0];
 
-use sark_h2::{FrameLength, StreamId, WindowIncrement};
+pub mod body;
+pub mod bounded;
 
-pub fn sid(raw: u32) -> StreamId {
-    assert!(raw <= StreamId::MAX, "invalid test stream ID");
-    StreamId::new(raw).expect("range checked above")
-}
+pub mod capacity;
 
-pub fn flen(raw: u32) -> FrameLength {
-    assert!(raw <= FrameLength::MAX, "invalid test frame length");
-    FrameLength::new(raw).expect("range checked above")
-}
+pub mod headers;
 
-pub fn win(raw: u32) -> WindowIncrement {
-    assert!(
-        (1..=WindowIncrement::MAX).contains(&raw),
-        "invalid test window increment"
-    );
-    WindowIncrement::new(raw).expect("range checked above")
+pub mod hpack;
+
+pub mod protocol;
+
+pub mod recipe;
+
+pub mod response;
+
+pub mod retain;
+
+pub mod session;
+pub mod trailers;
+
+mod repeater;
+pub use repeater::Repeater;
+
+pub mod tls;
+
+pub fn recover(
+    failure: dope::core::driver::life::recovery::Recovery<'_, '_>,
+) -> std::convert::Infallible {
+    panic!("native H2 recovery: {:?}", failure.cause())
 }

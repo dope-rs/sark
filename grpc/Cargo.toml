@@ -2,22 +2,23 @@
 name = "sark-grpc"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 description = "gRPC protocol layer for the sark/dope stack"
 authors.workspace = true
 repository.workspace = true
+readme.workspace = true
 license.workspace = true
 
 [dependencies]
 o3.workspace = true
-shin.workspace = true
-sark-core.workspace = true
+sark-http.workspace = true
 sark-h2.workspace = true
+sark-core.workspace = true
 dope.workspace = true
-dope-net.workspace = true
-dope-gen.workspace = true
-dope-tls.workspace = true
+dope-fiber.workspace = true
 prost.workspace = true
 pin-project.workspace = true
 
 [dev-dependencies]
 dope-test.workspace = true
+sark-gen.workspace = true

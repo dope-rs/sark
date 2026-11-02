@@ -1,0 +1,53 @@
+//! Typed HTTP/2 listener topology.
+
+use dope::{
+    manifold::network::listener::conn::{Ctx, Id},
+    net::link::egress::data,
+};
+use o3::buffer::resident;
+use sark_core::manifold::server::app::Spec;
+use sark_http::field::metadata::section::rules;
+
+use crate::conn::{self, event, machine};
+
+#[doc(hidden)]
+pub mod app;
+pub(in crate::server) mod input;
+mod local;
+#[doc(hidden)]
+pub mod modes;
+pub mod output;
+mod plan;
+mod recipe;
+pub mod startup;
+
+pub use local::Local;
+pub use plan::{Plan, tasks::Tasks};
+pub use recipe::Recipe;
+
+type Connection<'d, A> = machine::Connection<
+    crate::ServerRole,
+    <A as Spec>::Fields,
+    resident::Shared<'d>,
+    rules::RejectPush,
+    event::Ignore,
+>;
+
+type Context<'e, 'a, 'p, 's, 'w, 'd, ID, A, W> = Ctx<
+    'e,
+    'a,
+    'p,
+    's,
+    'w,
+    'd,
+    ID,
+    W,
+    app::State<'d, A, Id<'d, ID>>,
+    data::Bound<resident::Shared<'d>, <A as Spec>::Egress<'d>>,
+>;
+
+#[derive(Debug, Eq, PartialEq)]
+pub enum Build<E> {
+    Connection(conn::Build),
+    App(E),
+}

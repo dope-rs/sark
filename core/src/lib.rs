@@ -1,8 +1,12 @@
-pub mod error;
-pub mod http;
-pub mod pool;
-pub mod utils;
+//! Fiber-free request projection, route contracts, and synchronous dispatch.
 
-pub fn identity_mut<T>(x: &mut T) -> &mut T {
-    x
-}
+pub use o3;
+
+pub mod body;
+pub mod deadline;
+pub mod decode;
+pub mod duplex;
+pub mod life;
+pub mod manifold;
+pub mod request;
+pub mod route;

@@ -1,0 +1,35 @@
+[package]
+name = "sark-fiber"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+description = "Fiber execution extension for the Sark facade"
+authors.workspace = true
+repository.workspace = true
+readme.workspace = true
+license.workspace = true
+
+[dependencies]
+sark-client.workspace = true
+sark-core.workspace = true
+sark-gen.workspace = true
+sark-grpc.workspace = true
+sark-h1.workspace = true
+sark-http.workspace = true
+dope.workspace = true
+dope-fiber.workspace = true
+dope-gen.workspace = true
+o3.workspace = true
+pin-project.workspace = true
+
+[dev-dependencies]
+clap.workspace = true
+sark-h2.workspace = true
+sark-h3.workspace = true
+dope-quic.workspace = true
+dope-test.workspace = true
+sark.workspace = true
+sark-json.workspace = true
+dope-tls.workspace = true
+cartel-redis.workspace = true
+cartel-pg.workspace = true

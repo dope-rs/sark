@@ -2,29 +2,18 @@
 name = "sark-core"
 version.workspace = true
 edition.workspace = true
-description.workspace = true
-repository.workspace = true
-license.workspace = true
+rust-version.workspace = true
+description = "Fiber-free request, route, dispatch, and lifecycle core for Sark"
 authors.workspace = true
-
-[lib]
-path = "src/lib.rs"
+repository.workspace = true
+readme.workspace = true
+license.workspace = true
 
 [dependencies]
-dope-fiber.workspace = true
+dope-core.workspace = true
+dope-net.workspace = true
+sark-http.workspace = true
 o3.workspace = true
-sark-protocol.workspace = true
-http = "1.5.0"
-httparse = "1.10.1"
-libdeflater = "1.25"
-memchr = "2.8"
-serde = { version = "1.0.229", features = ["derive"] }
-serde_json = "1.0.151"
-thiserror = "2.0.19"
 
 [dev-dependencies]
-criterion = { version = "0.8", default-features = false, features = ["cargo_bench_support"] }
-
-[[bench]]
-name = "hpack_huffman"
-harness = false
+dope-test.workspace = true

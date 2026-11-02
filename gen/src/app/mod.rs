@@ -1,140 +1,72 @@
-mod emit;
-pub(super) mod plan;
+use crate::runtime::paths::Paths;
+
+pub(super) mod inputs;
+pub(crate) mod route;
+mod scope;
+mod serve;
 mod spec;
 
-use proc_macro2::TokenStream;
-use syn::{LitStr, Result};
+pub(super) struct App {
+    spec: spec::Spec,
+}
 
-use crate::define_route_input::{DefineRouteEntry, DefineRouteInput};
-use crate::model::{AppDispatchInput, AppRouteInput};
-
-pub(super) fn define_route(input: DefineRouteInput) -> Result<TokenStream> {
-    let DefineRouteInput {
-        vis,
-        name,
-        state_ty,
-        entries,
-    } = input;
-    let mut routes = Vec::new();
-    flatten_entries("", &[], entries, &mut routes)?;
-    let mut seen = std::collections::HashSet::new();
-    for r in &routes {
-        if !seen.insert((r.method.to_string(), r.path.value())) {
+impl App {
+    pub(super) fn new(paths: &Paths, input: inputs::Input) -> syn::Result<Self> {
+        if input.state_ty.is_none() {
             return Err(syn::Error::new_spanned(
-                &r.path,
-                format!(
-                    "duplicate route: `{} {}` is already defined",
-                    r.method,
-                    r.path.value()
-                ),
+                &input.name,
+                "fiber applications require an explicit state type",
             ));
         }
-    }
-    let dispatch = spec::Gen::new(AppDispatchInput {
-        vis,
-        name,
-        state_ty,
-        routes,
-    })?;
-    Ok(emit::render(&dispatch))
-}
-
-fn flatten_entries(
-    prefix: &str,
-    inherited_wraps: &[syn::TypePath],
-    entries: Vec<DefineRouteEntry>,
-    out: &mut Vec<AppRouteInput>,
-) -> Result<()> {
-    for entry in entries {
-        match entry {
-            DefineRouteEntry::Service { method, path, ty } => {
-                let full = format!("{prefix}{}", path.value());
-                out.push(AppRouteInput {
-                    route: ty,
-                    method,
-                    path: LitStr::new(&full, path.span()),
-                    wraps: inherited_wraps.to_vec(),
-                });
-            }
-            DefineRouteEntry::Scope {
-                prefix: scope_prefix,
-                wraps: scope_wraps,
-                children,
-            } => {
-                let new_prefix = format!("{prefix}{}", scope_prefix.value());
-                let mut new_wraps = inherited_wraps.to_vec();
-                new_wraps.extend(scope_wraps);
-                flatten_entries(&new_prefix, &new_wraps, children, out)?;
-            }
-        }
-    }
-    Ok(())
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn generated_task_storage_uses_safe_structural_projection() {
-        let input: DefineRouteInput = syn::parse_quote! {
-            ProjectionApp: () => {
-                GET "/sync" => SyncRoute,
-                GET "/async" => async(capacity = 2) AsyncRoute,
-                GET "/stream" => stream(capacity = 3) StreamRoute,
-            }
-        };
-        let generated = define_route(input).expect("route generation").to_string();
-
-        assert!(generated.contains("__pin_project"));
-        assert!(generated.contains("__task_slot_0000"));
-        assert!(generated.contains("__task_slot_0001"));
-        assert!(generated.contains("invoke_task"));
-        assert!(generated.contains("FiberRoute"));
-        assert!(generated.contains("StreamRoute"));
-        assert!(generated.contains("state : & 'env"));
-        assert!(!generated.contains("__F0001"));
-        assert!(!generated.contains("__MK0001"));
-        for forbidden in [
-            "async move",
-            "unsafe",
-            "dispatch :: Dispatch",
-            "manifold :: Kind",
-            "manifold :: ready",
-            "OwnerFiber",
-            "FiberScope",
-            "RequestTask",
-            "try_into_task",
-            "routes :",
-            "get_unchecked_mut",
-            "into_inner_unchecked",
-            "map_unchecked",
-            "new_unchecked",
-            "unreachable_unchecked",
-        ] {
-            assert!(
-                !generated.contains(forbidden),
-                "generated app contains manual projection `{forbidden}`",
-            );
-        }
+        Self::build(paths, input, spec::StateScope::Driver)
     }
 
-    #[test]
-    fn generated_stream_storage_has_no_task_producer() {
-        let input: DefineRouteInput = syn::parse_quote! {
-            StreamApp: () => {
-                GET "/stream" => stream(capacity = 3) StreamRoute,
-            }
-        };
-        let generated = define_route(input).expect("route generation").to_string();
+    pub(super) fn new_router(paths: &Paths, input: inputs::Input) -> syn::Result<Self> {
+        Self::build(paths, input, spec::StateScope::Router)
+    }
 
-        assert!(generated.contains("__task_slot_0000"));
-        assert!(generated.contains("StreamRoute"));
-        for forbidden in ["__F0000", "__MK0000", "task_producers", "try_into_task"] {
-            assert!(
-                !generated.contains(forbidden),
-                "stream app contains fiber-only storage `{forbidden}`",
-            );
-        }
+    fn build(paths: &Paths, input: inputs::Input, scope: spec::StateScope) -> syn::Result<Self> {
+        Ok(Self {
+            spec: spec::Spec::new(paths, input, scope)?,
+        })
+    }
+
+    fn prepare(&mut self, paths: &Paths) -> (scope::Scope, proc_macro2::TokenStream) {
+        let scope = scope::Scope::new(paths, &mut self.spec);
+        let schema = self
+            .spec
+            .route_plan
+            .check_schema(paths, &self.spec.route_specs);
+        (scope, schema)
+    }
+
+    pub(super) fn expand(
+        mut self,
+        paths: &Paths,
+        h1: crate::runtime::H1,
+    ) -> proc_macro2::TokenStream {
+        use quote::quote;
+
+        let (scope, schema) = self.prepare(paths);
+        let tokens = serve::build(paths, &self.spec, h1);
+        scope.finish(quote! {
+            #schema
+            #tokens
+        })
+    }
+
+    pub(super) fn router(
+        mut self,
+        paths: &Paths,
+        h1: crate::runtime::H1,
+    ) -> proc_macro2::TokenStream {
+        use self::serve::handle::router;
+
+        let (scope, schema) = self.prepare(paths);
+        let handle = router::build(paths, &self.spec, h1);
+        scope.finish(quote::quote! {
+            #schema
+            #handle
+        })
     }
 }

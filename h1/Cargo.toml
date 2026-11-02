@@ -1,0 +1,20 @@
+[package]
+name = "sark-h1"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+description = "Fiber-free HTTP/1 ingress, batching, and response protocol engine for sark"
+authors.workspace = true
+repository.workspace = true
+readme.workspace = true
+license.workspace = true
+
+[dependencies]
+dope.workspace = true
+sark-http.workspace = true
+sark-core.workspace = true
+o3.workspace = true
+pin-project.workspace = true
+
+[dev-dependencies]
+dope-test.workspace = true

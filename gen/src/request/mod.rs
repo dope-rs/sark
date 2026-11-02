@@ -1,552 +1,508 @@
-mod hidden;
+use crate::{macros::tokens::local, runtime::paths::Paths};
+
+mod binding;
+mod bodies;
+mod fields;
+mod header;
+pub(super) mod mode;
 mod params;
 mod query;
-mod raw_body;
+mod values;
 
-use hidden::Hidden;
-use params::Params;
-use proc_macro2::{Span, TokenStream};
-use query::Query;
-use quote::{format_ident, quote};
-use raw_body::BodyPlan;
-use syn::parse::{Parse, ParseStream};
-use syn::{Error, Fields, Ident, ItemStruct, Result, Token};
+use crate::types;
 
-use crate::codegen::header::HeaderEmitter;
-use crate::codegen::value::FieldPlan;
-use crate::model::{HeaderAttrField, PathAttrField, QueryAttrField};
-use crate::util::{AttributeSliceExt, FieldAttr, TypeExt};
+pub(super) fn build(
+    paths: &Paths,
+    mode: mode::Mode,
+    mut st: syn::ItemStruct,
+) -> syn::Result<proc_macro2::TokenStream> {
+    let ns_core = &paths.core;
+    let ns_http = &paths.http;
+    use quote::{format_ident, quote};
+    use syn::{Fields, ext::IdentExt, visit::Visit};
 
-pub(super) struct Mode {
-    ordered: bool,
-    full: bool,
-}
+    use self::{
+        bodies::{Plan, task},
+        header::{prefixes, scan},
+        values::FieldPlan,
+    };
+    let [
+        v_auth,
+        v_req,
+        v_rqst,
+        v_parts,
+        v_heads,
+        v_input,
+        v_range,
+        v_id,
+        v_params,
+        v_err,
+    ] = [
+        "__sark_authority",
+        "req",
+        "request",
+        "parts",
+        "headers",
+        "input",
+        "range",
+        "id",
+        "params",
+        "error",
+    ]
+    .map(local);
+    let mode::Mode { ordered, full } = mode;
+    let name = st.ident.clone();
+    let vis = st.vis.clone();
+    let slot = format_ident!("{}HeaderSlot", name);
+    let raw_path = format_ident!("{}ParamsRaw", name);
+    let headers = format_ident!("{}Headers", name);
+    let params = format_ident!("{}Params", name);
+    let builder = format_ident!("{}TaskBuilder", name);
+    let storage = format_ident!("__{}Mode", name);
+    let mode_ty = format_ident!("__{}Storage", name);
+    let mut body = Plan::from_attrs(&st.attrs)?;
+    let json = body.scope(&name);
+    let module = format_ident!(
+        "{}",
+        crate::handler::names::encoded("__SarkRequest", &name)
+            .to_string()
+            .to_lowercase()
+    );
+    let mut imports = vec![name.clone(), headers.clone(), builder.clone()];
+    let json_decl = json.as_ref().map(|(name, declaration)| {
+        imports.push(name.clone());
+        declaration
+    });
+    let mut symbols = types::Generics::new(st.generics.clone());
+    symbols.reserve().visit_item_struct(&st);
+    let marker = symbols.ident("__sark_mode");
+    let Fields::Named(named) = &mut st.fields else {
+        use proc_macro2::Span;
 
-impl Parse for Mode {
-    fn parse(input: ParseStream<'_>) -> Result<Self> {
-        if input.is_empty() {
-            return Ok(Self {
-                ordered: false,
-                full: false,
-            });
+        return Err(syn::Error::new(
+            Span::call_site(),
+            "#[sark_gen::request] requires a named-field struct",
+        ));
+    };
+
+    let fields = fields::Fields::collect(paths, named, body)?;
+
+    let has_peer = fields.peer.is_some();
+    let frame = match has_peer {
+        true => quote!(#ns_core::request::frame::proof::Peer),
+        false => quote!(#ns_core::request::frame::proof::Maybe),
+    };
+    let ref_peer = if has_peer {
+        Some(quote! {
+            use #ns_core::request::frame::raw::Bound;
+            let #v_auth = Bound::<#ns_core::request::raw::Parsed<
+                #ns_core::request::Head<&'req [::core::primitive::u8], #frame>, Self,
+            >>::required(#v_req).get();
+        })
+    } else {
+        None
+    };
+    let own_peer = if has_peer {
+        Some(quote! {
+            use #ns_core::request::frame::raw::Bound;
+            let #v_auth = Bound::<#ns_core::request::raw::Parsed<
+                #ns_core::request::Parts<'d, #frame>, Self,
+            >>::required(&#v_rqst).try_get()
+                .map_err(#ns_core::route::Input::Retain)?;
+        })
+    } else {
+        None
+    };
+    let peer_ty = fields.peer.as_ref().map(|ty| {
+        let mut ty = ty.clone();
+        types::Edit::new(&mut ty).retained(paths, types::RetainedAs::Request);
+        ty
+    });
+    let (headdecl, headcode, kinds, raw_head) =
+        binding::build(paths, &vis, &name, &headers, &fields, ordered, &symbols)?;
+    imports.push(raw_head.clone());
+    let fields::Fields {
+        headers: head,
+        queries,
+        paths: captures,
+        init: mut ref_init,
+        body,
+        ..
+    } = fields;
+
+    let (hkinds, qkinds) = kinds.split_at(head.len());
+    let headplan = FieldPlan::collect(
+        head.iter()
+            .zip(hkinds)
+            .map(|(field, kind)| (&field.ident, &field.name, *kind)),
+    )?;
+    let admitted = head.iter().map(|field| {
+        let name = syn::LitByteStr::new(field.name.value().as_bytes(), field.name.span());
+        quote::quote_spanned! {name.span()=>
+            const _: #ns_http::field::Name<&'static [::core::primitive::u8]> =
+                #ns_http::field::literal!(#ns_http::field::Name::try_bytes(#name));
         }
-        let mut ordered = false;
-        let mut full = false;
-        while !input.is_empty() {
-            let ident = input.parse::<Ident>()?;
-            if ident == "ordered" {
-                ordered = true;
-            } else if ident == "full" {
-                full = true;
-            } else {
-                return Err(Error::new_spanned(
-                    ident,
-                    "#[sark_gen::request] supports only `ordered` and `full`",
-                ));
-            }
-            if input.is_empty() {
-                break;
-            }
-            input.parse::<Token![,]>()?;
-        }
-        Ok(Self { ordered, full })
-    }
-}
-
-impl Mode {
-    pub(super) fn empty() -> Self {
-        Self {
-            ordered: false,
-            full: false,
-        }
-    }
-
-    pub(super) fn expand(self, mut st: ItemStruct) -> Result<TokenStream> {
-        let ordered = self.ordered;
-        let full = self.full;
-        let name = st.ident.clone();
-        let vis = st.vis.clone();
-        let inner_name = format_ident!("{}View", name);
-        let raw_headers_ident = format_ident!("{}HeadersRaw", name);
-        let header_slot_ident = format_ident!("{}HeaderSlot", name);
-        let raw_params_ident = format_ident!("{}ParamsRaw", name);
-        let headers_inner_ident = format_ident!("{}Headers", name);
-        let params_inner_ident = format_ident!("{}Params", name);
-        let mut body_plan = BodyPlan::from_attrs(&mut st.attrs)?;
-        let Fields::Named(named) = &mut st.fields else {
-            return Err(Error::new(
-                Span::call_site(),
-                "#[sark_gen::request] requires a named-field struct",
-            ));
-        };
-
-        let mut header_fields = Vec::<HeaderAttrField>::new();
-        let mut query_fields = Vec::<QueryAttrField>::new();
-        let mut path_fields = Vec::<PathAttrField>::new();
-        let mut ctor_init_ref = Vec::new();
-
-        for field in &mut named.named {
-            let ident = field
-                .ident
-                .clone()
-                .ok_or_else(|| Error::new(Span::call_site(), "named field required"))?;
-            if ident == "body" {
-                return Err(Error::new_spanned(
-                    &field.ident,
-                    "#[sark_gen::request] reserves field name `body`",
-                ));
-            }
-            let header = field.attrs.field_attr("header");
-            let query = field.attrs.field_attr("query");
-            let path = field.attrs.field_attr("path");
-            let is_raw_body = field
-                .attrs
-                .iter()
-                .any(|attr| attr.path().is_ident("raw_body"));
-            let is_body_len = field
-                .attrs
-                .iter()
-                .any(|attr| attr.path().is_ident("body_len"));
-            let kinds = [
-                header.is_some(),
-                query.is_some(),
-                path.is_some(),
-                is_raw_body,
-                is_body_len,
-            ]
-            .into_iter()
-            .filter(|v| *v)
-            .count();
-            if kinds > 1 {
-                return Err(Error::new_spanned(
-                    field,
-                    "request field must have exactly one of #[header(...)], #[query(...)], #[path(...)], #[raw_body], or #[body_len]",
-                ));
-            }
-            if let Some(FieldAttr {
-                name: header,
-                default,
-            }) = header
-            {
-                header_fields.push(HeaderAttrField {
-                    ident: ident.clone(),
-                    header,
-                    default,
-                    ty: field.ty.clone(),
-                });
-                ctor_init_ref.push(quote!(#ident: headers.#ident));
-            } else if let Some(FieldAttr {
-                name: query,
-                default,
-            }) = query
-            {
-                query_fields.push(QueryAttrField {
-                    ident: ident.clone(),
-                    query,
-                    default,
-                    ty: field.ty.clone(),
-                });
-                ctor_init_ref.push(quote!(#ident: headers.#ident));
-            } else if let Some(FieldAttr {
-                name: path,
-                default,
-            }) = path
-            {
-                path_fields.push(PathAttrField {
-                    ident: ident.clone(),
-                    path,
-                    default,
-                    ty: field.ty.clone(),
-                });
-                ctor_init_ref.push(quote!(#ident: params.#ident));
-            } else if is_raw_body {
-                body_plan.register_raw(ident.clone(), &field.ty)?;
-            } else if is_body_len {
-                body_plan.register_length(ident.clone(), &field.ty)?;
-            } else {
-                return Err(Error::new_spanned(
-                    field,
-                    "#[sark_gen::request] fields require #[header(...)], #[query(...)], #[path(...)], #[raw_body], or #[body_len]",
-                ));
-            }
-            field.attrs.retain(|attr| {
-                !attr.path().is_ident("header")
-                    && !attr.path().is_ident("query")
-                    && !attr.path().is_ident("path")
-                    && !attr.path().is_ident("raw_body")
-                    && !attr.path().is_ident("body_len")
-            });
-        }
-
-        body_plan.append_json_field(named, &vis);
-        ctor_init_ref.extend(body_plan.constructor_fields());
-
-        let borrowed_byte_fields: Vec<Ident> = header_fields
+    });
+    let qplan = FieldPlan::collect(
+        queries
             .iter()
-            .filter(|field| field.ty.has_retained_bytes())
-            .map(|field| field.ident.clone())
-            .chain(
-                query_fields
-                    .iter()
-                    .filter(|field| field.ty.has_retained_bytes())
-                    .map(|field| field.ident.clone()),
-            )
-            .chain(
-                path_fields
-                    .iter()
-                    .filter(|field| field.ty.has_retained_bytes())
-                    .map(|field| field.ident.clone()),
-            )
-            .collect();
-        let mut borrowed_st = st.clone();
-        let Fields::Named(borrowed_named) = &mut borrowed_st.fields else {
-            unreachable!("named fields validated above")
-        };
-        for field in &mut borrowed_named.named {
-            body_plan.rewrite_raw_field(field);
-            body_plan.rewrite_json_field(field);
-            if field
-                .ident
-                .as_ref()
-                .is_some_and(|ident| borrowed_byte_fields.contains(ident))
-            {
-                field.ty.rewrite_retained_to_borrowed();
+            .zip(qkinds)
+            .map(|(field, kind)| (&field.ident, &field.name, *kind)),
+    )?;
+    let captures = captures
+        .iter()
+        .map(|field| Ok((field, types::View::new(&field.ty).kind()?)))
+        .collect::<syn::Result<Vec<_>>>()?;
+    let identity = format_ident!("{}Identity", name);
+    let mut ids: Vec<proc_macro2::Ident> = (0..head.len())
+        .map(|idx| format_ident!("Header{idx}"))
+        .chain((0..queries.len()).map(|idx| format_ident!("Query{idx}")))
+        .collect();
+    for (idx, (_, kind)) in captures.iter().enumerate() {
+        match kind {
+            types::ValueKind::Bytes => {}
+            types::ValueKind::Usize | types::ValueKind::U64 | types::ValueKind::Bool => {
+                ids.push(format_ident!("Path{idx}"))
             }
         }
-        borrowed_named.named.push(syn::parse_quote! {
-            #[doc(hidden)]
-            pub __sark_req_marker: ::core::marker::PhantomData<&'req ()>
-        });
-        ctor_init_ref.push(quote!(__sark_req_marker: ::core::marker::PhantomData));
-        borrowed_st.ident = inner_name.clone();
-        if !borrowed_st
-            .generics
-            .params
-            .iter()
-            .any(|p| matches!(p, syn::GenericParam::Lifetime(lt) if lt.lifetime.ident == "req"))
-        {
-            borrowed_st
-                .generics
-                .params
-                .insert(0, syn::parse_quote!('req));
-        }
-        st.attrs.push(syn::parse_quote!(#[allow(dead_code)]));
-        borrowed_st
-            .attrs
-            .push(syn::parse_quote!(#[allow(dead_code)]));
-
-        let parsed_body_impl = body_plan.parsed_body_impl();
-
-        let header_tokens = if header_fields.is_empty() && query_fields.is_empty() {
+    }
+    let (id_def, proof, error) = if ids.is_empty() {
+        (
+            proc_macro2::TokenStream::new(),
+            proc_macro2::TokenStream::new(),
+            quote!(::core::convert::Infallible),
+        )
+    } else {
+        imports.push(identity.clone());
+        (
             quote! {
-                #[allow(non_camel_case_types, dead_code)]
-                #[derive(Default)]
-                struct #raw_headers_ident;
-
-                #[allow(non_camel_case_types, dead_code)]
-                struct #headers_inner_ident<'req> {
-                    marker: ::core::marker::PhantomData<&'req ()>,
-                }
-            }
-        } else {
-            Hidden {
-                inner_name: &headers_inner_ident,
-                raw_name: &raw_headers_ident,
-                headers: &header_fields,
-                queries: &query_fields,
-                ordered_query_state: ordered && !query_fields.is_empty(),
-            }
-            .build()?
-        };
-
-        let header_plan = FieldPlan::collect(
-            header_fields
-                .iter()
-                .map(|f| (&f.ident, f.header.value().into_bytes(), &f.ty)),
-        )?;
-        let query_plan = FieldPlan::collect(
-            query_fields
-                .iter()
-                .map(|f| (&f.ident, f.query.value().into_bytes(), &f.ty)),
-        )?;
-
-        let (header_slot_ty, header_slot_enum, header_slot_probe_fn, header_set_fn) =
-            if header_fields.is_empty() {
-                (
-                    quote! { #header_slot_ident },
-                    quote! {
-                        #[derive(Clone, Copy)]
-                        struct #header_slot_ident;
-
-                        impl sark::service::HeaderSlot for #header_slot_ident {
-                            fn into_tag(self) -> u16 {
-                                0
-                            }
-
-                            fn from_tag(_tag: u16) -> Option<Self> {
-                                None
-                            }
-                        }
-                    },
-                    quote! { None },
-                    quote! { Ok(()) },
-                )
-            } else {
-                let (slot_enum, slot_probe_fn, set_fn) =
-                    header_plan.slots(&header_slot_ident, true);
-                (
-                    quote! { #header_slot_ident },
-                    slot_enum,
-                    slot_probe_fn,
-                    set_fn,
-                )
-            };
-        let header_emitter = HeaderEmitter::new(&header_plan, full);
-        let header_contig = header_emitter.contiguous()?;
-        let header_contig_fast = header_contig.fast;
-        let header_contig_ignored = header_contig.ignored;
-        let header_contig_unknown = header_contig.unknown;
-        let header_contig_short = header_contig.short;
-        let query = Query::new(&query_fields);
-        let query_set_name_fn = if query_fields.is_empty() {
-            quote! { Ok(()) }
-        } else if ordered {
-            query.set_name_direct()?
-        } else {
-            query_plan.set_name(false)
-        };
-        let query_parse_fn = if query_fields.is_empty() {
-            quote! { Ok(()) }
-        } else if ordered {
-            Query::parse_direct()
-        } else {
-            query_plan.parse_query()
-        };
-        let query_set_slice_fn = if query_fields.is_empty() {
-            quote! { Ok(()) }
-        } else if ordered {
-            query.set_slice_direct()?
-        } else {
-            query_plan.set_slice()
-        };
-        let build_headers = if header_fields.is_empty() && query_fields.is_empty() {
+                #[derive(::core::clone::Clone, ::core::marker::Copy, ::core::fmt::Debug, ::core::cmp::PartialEq, ::core::cmp::Eq)]
+                #vis enum #identity { #( #ids, )* }
+            },
             quote! {
-                let _ = headers;
-                Ok(#headers_inner_ident {
-                    marker: ::core::marker::PhantomData,
-                })
-            }
-        } else {
-            quote!(#headers_inner_ident::<'req>::from_raw(req, headers))
-        };
-        let params_tokens = Params {
-            vis: &vis,
-            inner_ident: &params_inner_ident,
-            raw_ident: &raw_params_ident,
-            fields: &path_fields,
-        }
-        .build()?;
-        let body_mode = body_plan.mode();
+                impl #ns_core::route::Fields for #name<'static> {
+                    type Identity = #identity;
+                }
+            },
+            quote!(#ns_core::route::Error<#identity>),
+        )
+    };
 
-        let header_slot_methods = if header_fields.is_empty() {
-            TokenStream::new()
-        } else {
+    let (hkind, slot_decl, slot_def, himpl) = if head.is_empty() {
+        (
+            quote!(#ns_core::route::field::header::Discard),
+            proc_macro2::TokenStream::new(),
+            proc_macro2::TokenStream::new(),
+            proc_macro2::TokenStream::new(),
+        )
+    } else {
+        imports.push(slot.clone());
+        let (decl, def, get, spans, set) = headplan.slots(paths, &vis, &slot, &identity);
+        let policy = prefixes::build(paths, &headplan, &name, &slot)?;
+        let methods = scan::build(paths, &raw_head, &error, &get, &spans, &set);
+        (
+            quote!(#slot),
+            decl,
+            def,
             quote! {
-                fn header_slot_bytes(name: &[u8]) -> Option<Self::HeaderSlot> {
-                    #header_slot_probe_fn
+                #policy
+                impl #ns_core::route::field::header::Fields<#name<'static>> for #slot {
+                    #methods
                 }
-
-                fn set_header_raw<V: sark::service::HeaderValue>(
-                    headers: &mut Self::RawHeaders,
-                    slot: Self::HeaderSlot,
-                    value: &V,
-                ) -> sark::error::Result<()> {
-                    #header_set_fn
-                }
-
-            }
+            },
+        )
+    };
+    let (qkind, qimpl) = if queries.is_empty() {
+        (
+            quote!(#ns_core::route::field::query::Discard),
+            proc_macro2::TokenStream::new(),
+        )
+    } else {
+        let parse = if ordered {
+            use query::try_ordered;
+            try_ordered(paths, &qplan, &identity, &symbols)?
+        } else {
+            qplan.parse_query(paths, &identity)
         };
-        let header_methods = quote! {
-                #header_slot_methods
-
-                fn parse_headers<const PARSE_ACCEPT_ENCODING: bool>(
-                    req_bytes: &[u8],
-                    headers_start: usize,
-                    max_header_count: usize,
-                ) -> sark::service::HeaderParse<Self::RawHeaders> {
-                    let mut raw_headers = #raw_headers_ident::default();
-                    let mut scan = sark::sark_core::http::codec::HeaderScan::default();
-                    let mut flags = sark::sark_core::http::head::Flags::default();
-                    let mut header_count = 0usize;
-                    let mut pos = headers_start;
-                    let head_len = loop {
-                        let Some(rest) = req_bytes.get(pos..) else {
-                            return sark::service::HeaderParse::NeedMore;
-                        };
-                        match Self::__sark_scan_header_line::<PARSE_ACCEPT_ENCODING>(
-                            &mut raw_headers,
-                            req_bytes,
-                            rest,
-                            pos,
-                            &mut scan,
-                            &mut flags,
-                        ) {
-                            sark::service::HeaderLineOutcome::Complete(0) => break pos + 2,
-                            sark::service::HeaderLineOutcome::Complete(relative) => {
-                                if header_count >= max_header_count {
-                                    return sark::service::HeaderParse::Bad;
-                                }
-                                header_count += 1;
-                                pos += relative + 2;
-                            }
-                            sark::service::HeaderLineOutcome::NeedMore => {
-                                return sark::service::HeaderParse::NeedMore;
-                            }
-                            sark::service::HeaderLineOutcome::Bad => {
-                                return sark::service::HeaderParse::Bad;
-                            }
-                        }
-                    };
-                    let body_framing = match scan.validate_for_request() {
-                        Ok(framing) => framing,
-                        Err(_) => return sark::service::HeaderParse::Bad,
-                    };
-                    sark::service::HeaderParse::Ready {
-                        headers: raw_headers,
-                        head_len,
-                        body_framing,
-                        flags,
-                        accept_gzip: scan.accept_encoding_gzip,
+        (
+            quote!(#raw_head),
+            quote! {
+                impl #ns_core::route::field::query::Fields<#name<'static>> for #raw_head {
+                    fn parse(
+                        #v_parts: #ns_core::route::field::query::Input<'_, #name<'static>>,
+                    ) -> ::core::result::Result<(), #error> {
+                        let (#v_heads, #v_input, #v_range) = #v_parts.into_parts();
+                        #parse
                     }
                 }
-        };
-        let header_parser = quote! {
-            impl #name {
-                #[doc(hidden)]
-                fn __sark_scan_header_line<const __PARSE_ACCEPT_ENCODING: bool>(
-                    headers: &mut #raw_headers_ident,
-                    input: &[u8],
-                    rest: &[u8],
-                    line_start: usize,
-                    scan: &mut sark::sark_core::http::codec::HeaderScan,
-                    flags: &mut sark::sark_core::http::head::Flags,
-                ) -> sark::service::HeaderLineOutcome {
-                    #header_contig_fast
-                }
-
-                #[doc(hidden)]
-                #[inline(never)]
-                fn __sark_scan_header_line_unknown<const __START: usize>(
-                    rest: &[u8],
-                ) -> sark::service::HeaderLineOutcome {
-                    #header_contig_unknown
-                }
-
-                #[doc(hidden)]
-                #[inline(never)]
-                fn __sark_scan_header_value_ignored<const __COLON_IDX: usize>(
-                    rest: &[u8],
-                ) -> sark::service::HeaderLineOutcome {
-                    #header_contig_ignored
-                }
-
-                #[doc(hidden)]
-                #[cold]
-                fn __sark_scan_header_line_short<const __PARSE_ACCEPT_ENCODING: bool>(
-                    headers: &mut #raw_headers_ident,
-                    input: &[u8],
-                    rest: &[u8],
-                    line_start: usize,
-                    scan: &mut sark::sark_core::http::codec::HeaderScan,
-                    flags: &mut sark::sark_core::http::head::Flags,
-                ) -> sark::service::HeaderLineOutcome {
-                    #header_contig_short
-                }
-            }
-        };
-
-        let query_methods = if query_fields.is_empty() {
-            TokenStream::new()
-        } else {
-            quote! {
-                fn set_query_name_raw<V: sark::service::HeaderValue>(
-                    headers: &mut Self::RawHeaders,
-                    name: &[u8],
-                    value: &V,
-                ) -> sark::error::Result<()> {
-                    #query_set_name_fn
-                }
-
-                fn set_query_slice_raw(
-                    headers: &mut Self::RawHeaders,
-                    name: &[u8],
-                    input: &[u8],
-                    range: std::ops::Range<usize>,
-                ) -> sark::error::Result<()> {
-                    #query_set_slice_fn
-                }
-
-                fn parse_query_raw(
-                    headers: &mut Self::RawHeaders,
-                    input: &[u8],
-                    range: std::ops::Range<usize>,
-                ) -> sark::error::Result<()> {
-                    #query_parse_fn
-                }
-            }
-        };
-
-        let parsed_body_param_ty = body_plan.parsed_body_param_ty();
-        let body_bind = body_plan.parsed_body_bind();
-        let from_parts_impl = quote! {
-            impl<'req> #inner_name<'req> {
-                #[allow(unused_variables, dead_code)]
-                #vis fn from_parts(
-                    params: #params_inner_ident<'req>,
-                    headers: #headers_inner_ident<'req>,
-                    parsed_body: #parsed_body_param_ty,
-                    req: &sark::request::Ref<'req>,
-                ) -> Self {
-                    let _ = &params;
-                    let _ = &headers;
-                    let _ = req;
-                    #body_bind
-                    Self { #(#ctor_init_ref,)* }
-                }
-            }
-        };
-
-        Ok(quote! {
-            #st
-            #borrowed_st
-            #header_tokens
-            #params_tokens
-            #from_parts_impl
-            #header_slot_enum
-            #header_parser
-
-            impl sark::service::RouteRequestImpl for #name {
-                type HeaderSlot = #header_slot_ty;
-                type RawHeaders = #raw_headers_ident;
-                type RawParams = #raw_params_ident;
-                type Params<'req> = #params_inner_ident<'req>;
-                type Headers<'req> = #headers_inner_ident<'req>;
-                #parsed_body_impl
-                type BodyMode = #body_mode;
-
-                const FULL: bool = #full;
-
-                #header_methods
-                #query_methods
-
-                fn build_headers<'req>(
-                    req: &sark::request::Ref<'req>,
-                    headers: Self::RawHeaders,
-                ) -> sark::error::Result<Self::Headers<'req>> {
-                    #build_headers
-                }
-
-            }
-        })
+            },
+        )
+    };
+    let build = quote! {
+        #headers::<
+            'req,
+            #ns_core::request::mode::Ref<'req>,
+        >::from_head(#v_req)
+    };
+    let expand =
+        params::Expansion::try_new(paths, &captures, &vis, &name, &params, &raw_path, &symbols)?;
+    if !captures.is_empty() {
+        imports.extend([params.clone(), raw_path.clone()]);
     }
+    let paramdecl = &expand.declaration;
+    let paramsrc = &expand.code;
+    let path_err = &expand.error;
+    let p_reject = &expand.reject;
+    let ref_p = &expand.view;
+    fields::Fields::commit(&mut st.attrs, named);
+    body.append_json(named, &vis);
+    let empty = named.named.is_empty().then(|| {
+        quote! {
+            fn empty_task<'d>(
+                #v_id: #ns_http::request::Id<'d>,
+            ) -> ::core::option::Option<#ns_core::route::Built<'d, Self::Task<'d>>> {
+                if ::core::mem::needs_drop::<Self::Task<'d>>()
+                    || ::core::mem::needs_drop::<Self::TaskBuilder<'d>>()
+                {
+                    return ::core::option::Option::None;
+                }
+                ::core::option::Option::Some(#ns_core::route::Built::new(
+                    #v_id,
+                    #name::<'d> {
+                        #marker: ::core::marker::PhantomData,
+                    },
+                ))
+            }
+        }
+    });
+    let mut own_init = ref_init.clone();
+    let body_len = local("__sark_body_len");
+    ref_init.extend(body.fields(paths, local("parsed_body"), quote!(#v_req.body_len())));
+    own_init.extend(body.fields(paths, local("__sark_task_body"), quote!(#body_len)));
+    if !st
+        .generics
+        .lifetimes()
+        .any(|lifetime| lifetime.lifetime.ident.unraw() == "d")
+    {
+        st.generics.params.insert(0, syn::parse_quote!('d));
+    }
+    st.generics.params.push(syn::parse_quote!(
+        #mode_ty: #storage<'d> = #ns_core::request::mode::Own
+    ));
+    for field in &mut named.named {
+        body.rewrite(field, &storage, &mode_ty);
+        types::Edit::new(&mut field.ty).retained(paths, types::RetainedAs::Mode(&mode_ty));
+    }
+    named.named.push(syn::parse_quote! {
+        #[doc(hidden)]
+        pub #marker: ::core::marker::PhantomData<
+            fn(&'d (), #mode_ty) -> (&'d (), #mode_ty)
+        >
+    });
+    ref_init.push(quote!(#marker: ::core::marker::PhantomData));
+    own_init.push(quote!(#marker: ::core::marker::PhantomData));
+    let modes = body.mode_impls(paths, &vis, &storage);
+    let (in_err, parsed, body_arg) = body.parsing(paths, path_err);
+    let (body_ty, plan) = body.task(paths);
+
+    let (raw_ty, path_ty, own_path, path_api) = if captures.is_empty() {
+        (
+            quote!(()),
+            quote!(()),
+            quote!(()),
+            quote! {
+                type Params<'req> = ();
+
+                fn from_params<'req, 'body>(
+                    _: &#ns_core::request::raw::Parsed<
+                        #ns_core::request::Head<&'req [::core::primitive::u8], #frame>, Self,
+                    >,
+                ) -> ::core::result::Result<
+                    Self::Params<'req>,
+                    <Self as #ns_core::route::Project>::Error<'body>,
+                > {
+                    ::core::result::Result::Ok(())
+                }
+            },
+        )
+    } else {
+        (
+            quote!(#raw_path),
+            quote! {
+                #params<'req, #ns_core::request::mode::Ref<'req>>
+            },
+            quote! {
+                #params<'d, #ns_core::request::mode::Own>
+            },
+            quote! {
+                type Params<'req> = #params<
+                    'req,
+                    #ns_core::request::mode::Ref<'req>,
+                >;
+
+                fn from_params<'req, 'body>(
+                    #v_req: &#ns_core::request::raw::Parsed<
+                        #ns_core::request::Head<&'req [::core::primitive::u8], #frame>, Self,
+                    >,
+                ) -> ::core::result::Result<
+                    Self::Params<'req>,
+                    <Self as #ns_core::route::Project>::Error<'body>,
+                > {
+                    #ref_p
+                }
+            },
+        )
+    };
+    let own_head = quote! {
+        #headers<'d, #ns_core::request::mode::Own>
+    };
+    let pstart = &expand.start;
+    let owned = quote! {
+        #pstart
+        let #v_heads = #headers::<'d, #ns_core::request::mode::Own>
+            ::try_from_task(&#v_rqst).map_err(#ns_core::route::Input::Retain)?;
+        #own_peer
+    };
+    let task = task::Task {
+        names: task::Names {
+            request: &name,
+            builder: &builder,
+            params: &own_path,
+            headers: &own_head,
+        },
+        authority: peer_ty.as_ref(),
+        params: &expand,
+        head: &owned,
+        fields: &own_init,
+        vis: &vis,
+    };
+    let task::Output {
+        declaration: task_decl,
+        definition: task_def,
+        reject,
+        ty: task_ty,
+        start,
+    } = task.build(paths, plan);
+    let path_in = if captures.is_empty() {
+        quote!(())
+    } else {
+        quote!(#v_params)
+    };
+    let hbind = if head.is_empty() && queries.is_empty() {
+        quote!(_)
+    } else {
+        quote!(#v_heads)
+    };
+    let head_in = match has_peer {
+        true => quote!((#hbind, #v_auth)),
+        false => hbind,
+    };
+    let hbase = quote! {
+        #headers<'req, #ns_core::request::mode::Ref<'req>>
+    };
+    let head_ty = match has_peer {
+        true => quote! {
+            (#hbase, &'req [::core::primitive::u8],)
+        },
+        false => hbase,
+    };
+    let head_out = match has_peer {
+        true => quote! {
+            let #v_heads = #build;
+            #ref_peer
+            ::core::result::Result::Ok((#v_heads, #v_auth))
+        },
+        false => quote!(::core::result::Result::Ok(#build)),
+    };
+    let body_in = body.input();
+    let req_in = body.request();
+    let project = quote! {
+            type View<'req, 'd> =
+                #name<'d, #ns_core::request::mode::Ref<'req>>
+            where
+                'd: 'req;
+
+            fn from_parts<'req, 'd>(
+                #path_in: #path_ty,
+                #head_in: #head_ty,
+                #body_in: #body_arg,
+                #req_in: &#ns_core::request::View<'req, 'd, #frame>,
+            ) -> Self::View<'req, 'd>
+            where
+                'd: 'req,
+            {
+                #name::<'d, #ns_core::request::mode::Ref<'req>> {
+                    #(#ref_init,)*
+                }
+            }
+    };
+    Ok(quote! {
+        #( #admitted )*
+        #json_decl
+        #modes
+        #st
+        #headdecl
+        #paramdecl
+        #task_decl
+        #slot_decl
+        #id_def
+
+        mod #module {
+        use super::{ #( #imports, )* };
+
+        #headcode
+        #paramsrc
+        #task_def
+        #slot_def
+        #himpl
+        #qimpl
+
+        impl #ns_core::route::Schema for #name<'static> {
+            type Header = #hkind;
+            type Query = #qkind;
+            type RawHeaders = #raw_head;
+            type RawParams = #raw_ty;
+            type Body = #body_ty;
+            type Error = #error;
+            type Frame = #frame;
+
+            const FULL: ::core::primitive::bool = #full;
+            const AUTHORITY: ::core::primitive::bool = #has_peer;
+        }
+        #proof
+        impl #ns_core::route::Project for #name<'static> {
+            #path_api
+            type Headers<'req> = #head_ty;
+            type Error<'req> = #in_err;
+            fn reject<'req>(
+                #v_err: <Self as #ns_core::route::Project>::Error<'req>,
+            ) -> #ns_core::route::Reject {
+                match #v_err {
+                    #ns_core::route::Input::Params(#v_err) => #p_reject,
+                    #ns_core::route::Input::Body(#v_err) => #reject,
+                    #ns_core::route::Input::Retain(#v_err) => match #v_err {},
+                }
+            }
+            #project
+            #parsed
+            fn from_headers<'req, 'body>(
+                #v_req: &#ns_core::request::raw::Parsed<
+                    #ns_core::request::Head<&'req [::core::primitive::u8], #frame>, Self,
+                >,
+            ) -> ::core::result::Result<
+                Self::Headers<'req>,
+                <Self as #ns_core::route::Project>::Error<'body>,
+            > {
+                #head_out
+            }
+        }
+        impl #ns_core::route::Own for #name<'static> {
+            type Task<'d> = #name<'d>;
+            type TaskBuilder<'d> = #task_ty;
+            type Mode = #ns_core::route::Streaming;
+            #empty
+            #start
+        }
+        }
+    })
 }

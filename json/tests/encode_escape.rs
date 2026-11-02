@@ -1,68 +1,50 @@
-use sark_core::http::EncodedBody;
-use sark_json::{Encode, JsonBody, JsonEncode, Write, Writer};
+use crate::common::nested::Empty;
+pub mod common;
+use o3::buffer::storage;
+use sark_http::payload::response::exact;
+use sark_json::{
+    parsing,
+    writing::{Body, TrySize, Writer},
+};
 
-struct LengthMismatch;
+use crate::common::encode::*;
 
-impl JsonEncode for LengthMismatch {
-    fn json_len(&self) -> usize {
-        0
-    }
-
-    fn write_into<W: Write>(&self, writer: &mut W) -> Result<(), W::Error> {
-        writer.put(b"x")
-    }
-}
-
-struct ShortWrite;
-
-impl JsonEncode for ShortWrite {
-    fn json_len(&self) -> usize {
-        2
-    }
-
-    fn write_into<W: Write>(&self, writer: &mut W) -> Result<(), W::Error> {
-        writer.put(b"x")
-    }
-}
-
-fn check(value: &[u8]) {
+#[test]
+fn escapes_adjacent() {
+    let (value, expected) = ADJACENT;
     let mut out = Vec::new();
-    let mut w = Writer::new(&mut out, 0);
-    w.put_str(value).unwrap();
-    w.finish();
-    assert_eq!(
-        Encode::str_len(value),
-        out.len(),
-        "str_len must match put_str output for {value:?}"
+    assert!(Writer::new(&mut out).put_str(value).is_continue());
+    assert_eq!(out, expected);
+    assert_eq!(value.try_size().expect("size"), out.len());
+}
+
+#[test]
+fn rejects_overflow() {
+    let plan = exact::Plan::try_new(Body::new(Length::<0>))
+        .map_err(|rejected| rejected.discard())
+        .expect("size");
+    let error = plan
+        .encode(&mut [])
+        .expect_err("overflow must report the exact sink failure");
+    assert!(
+        matches!(error, storage::BuildError::Build(_)),
+        "unexpected overflow failure: {error:?}"
     );
+    if let storage::BuildError::Build(error) = error {
+        let (required, room) = error.into_parts();
+        assert_eq!((required.get(), room), (1, 0));
+    }
 }
 
 #[test]
-fn backspace_and_formfeed_are_two_bytes() {
-    check(&[0x08]);
-    check(&[0x0c]);
-    check(b"a\x08b\x0cc");
-}
-
-#[test]
-fn other_control_chars_are_six_bytes() {
-    check(&[0x00]);
-    check(&[0x1f]);
-    check(&[0x07]);
-}
-
-#[test]
-fn common_escapes_and_plain() {
-    check(b"\"\\\n\r\t");
-    check(b"hello world");
-}
-
-#[test]
-fn long_write_returns_capacity_error() {
-    assert!(JsonBody::new(LengthMismatch).encode_into(&mut []).is_err());
-}
-
-#[test]
-fn short_write_returns_length_error() {
-    assert!(JsonBody::new(ShortWrite).into_shared(2).is_err());
+fn empty_view_exact() {
+    let value = <Empty as parsing::Request>::decode(b"{}").expect("decode empty JSON object");
+    let plan = exact::Plan::try_new(Body::new(value))
+        .map_err(|rejected| rejected.discard())
+        .expect("size");
+    assert_eq!(plan.len(), 2);
+    let mut bytes = [0; 2];
+    plan.encode(&mut bytes)
+        .expect("write exact empty JSON object");
+    assert_eq!(&bytes, b"{}");
 }

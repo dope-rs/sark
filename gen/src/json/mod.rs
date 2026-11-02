@@ -1,801 +1,380 @@
-mod decode;
-mod encode;
+use crate::{macros::tokens, runtime::paths::Paths};
+
 mod field;
+pub(super) mod mode;
+mod plan;
 mod scalar;
-mod scan;
+mod segment;
+mod sources;
 
-use decode::Decoder;
-use encode::ValuePlan;
-use field::FieldMode;
-use proc_macro2::{Span, TokenStream};
-use quote::{format_ident, quote};
-use scan::FieldScanner;
-use syn::parse::{Parse, ParseStream};
-use syn::{Fields, Ident, ItemStruct, Result, Type, Visibility};
+use plan::{Scope, encoding};
+use segment::task;
 
-use crate::codegen::value::LengthArms;
-use crate::util::TypeExt;
+pub(super) fn build(
+    paths: &Paths,
+    mode: mode::Mode,
+    mut st: syn::ItemStruct,
+) -> syn::Result<proc_macro2::TokenStream> {
+    let ns_json = &paths.json;
+    let ns_http = &paths.http;
+    let [v_raw, v_idx, v_depth] = ["__raw", "__idx", "__depth"].map(tokens::local);
+    let [v_bytes, v_decode, v_done, v_error] =
+        ["__bytes", "__decoder", "__decoded", "__error"].map(tokens::local);
+    use std::collections::BTreeMap;
 
-#[derive(Clone, Copy)]
-pub(super) enum JsonKind {
-    Unordered,
-    Ordered,
-}
-
-pub(super) struct JsonMode {
-    pub(super) kind: JsonKind,
-    pub(super) preserve: bool,
-    pub(super) exact: bool,
-    pub(super) plain: bool,
-    pub(super) encode_only: bool,
-}
-
-impl Parse for JsonMode {
-    fn parse(input: ParseStream<'_>) -> Result<Self> {
-        if input.is_empty() {
-            return Ok(Self {
-                kind: JsonKind::Unordered,
-                preserve: false,
-                exact: false,
-                plain: false,
-                encode_only: false,
-            });
-        }
-        let mut kind = JsonKind::Unordered;
-        let mut preserve = false;
-        let mut exact = false;
-        let mut plain = false;
-        let mut encode_only = false;
-        while !input.is_empty() {
-            let ident = input.parse::<Ident>()?;
-            if ident == "ordered" {
-                kind = JsonKind::Ordered;
-            } else if ident == "unordered" {
-                kind = JsonKind::Unordered;
-            } else if ident == "preserve" {
-                preserve = true;
-            } else if ident == "exact" {
-                exact = true;
-            } else if ident == "plain" {
-                plain = true;
-            } else if ident == "encode" {
-                encode_only = true;
-            } else {
-                return Err(syn::Error::new_spanned(
-                    ident,
-                    "#[sark_gen::json] supports only `ordered`, `unordered`, `preserve`, `exact`, `plain`, or `encode`",
-                ));
+    use proc_macro2::TokenStream;
+    use syn::{Fields, ext::IdentExt, visit::Visit};
+    if matches!(mode.purpose, mode::Purpose::Decode) && !st.generics.params.is_empty() {
+        return Err(syn::Error::new_spanned(
+            &st.generics,
+            "generic JSON declarations require `encode` or `try_encode`",
+        ));
+    }
+    let mut symbols = crate::types::Generics::new(st.generics.clone());
+    symbols.reserve().visit_item_struct(&st);
+    let marker = symbols.ident("__sark_json_marker");
+    let name = st.ident.clone();
+    let vis = st.vis.clone();
+    let fields = match &mut st.fields {
+        Fields::Named(named) => {
+            use crate::json::field::FieldMode;
+            let parsed = named
+                .named
+                .iter()
+                .map(|field| FieldMode::from_field(field, mode.plain))
+                .collect::<syn::Result<Vec<_>>>()?;
+            for field in &mut named.named {
+                field.attrs.retain(|attr| {
+                    !attr.path().is_ident("raw")
+                        && !attr.path().is_ident("plain")
+                        && !attr.path().is_ident("field")
+                });
             }
-            if input.is_empty() {
-                break;
-            }
-            input.parse::<syn::Token![,]>()?;
+
+            named
+                .named
+                .iter()
+                .zip(parsed)
+                .enumerate()
+                .map(|(idx, (field, (kind, rename)))| {
+                    let ident = field.ident.clone().ok_or_else(|| {
+                        syn::Error::new(proc_macro2::Span::call_site(), "named field required")
+                    })?;
+                    let label = match rename {
+                        Some(name) => name,
+                        None => ident.unraw().to_string(),
+                    };
+                    Ok(plan::JsonField {
+                        bind: tokens::local(&format!("__f{idx}")),
+                        ident,
+                        ty: field.ty.clone(),
+                        vis: field.vis.clone(),
+                        name: label,
+                        mode: kind,
+                    })
+                })
+                .collect::<syn::Result<Vec<_>>>()?
         }
-        if exact && !matches!(kind, JsonKind::Ordered) {
-            return Err(syn::Error::new(
-                Span::call_site(),
-                "`exact` requires `ordered`",
+        Fields::Unnamed(unnamed) => {
+            return Err(syn::Error::new_spanned(
+                unnamed,
+                "#[sark_gen::json] requires a named-field struct",
             ));
         }
-        if encode_only && (preserve || exact) {
-            return Err(syn::Error::new(
-                Span::call_site(),
-                "`encode` cannot be combined with `preserve` or `exact`",
+        Fields::Unit => {
+            return Err(syn::Error::new_spanned(
+                &name,
+                "#[sark_gen::json] requires a named-field struct",
             ));
         }
-        Ok(Self {
-            kind,
-            preserve,
-            exact,
-            plain,
-            encode_only,
-        })
-    }
-}
+    };
 
-struct Plan<'a> {
-    mode: &'a JsonMode,
-    fields: Vec<JsonField>,
-    request_view: bool,
-}
-
-struct JsonField {
-    ident: Ident,
-    bind: Ident,
-    ty: Type,
-    vis: Visibility,
-    name: Vec<u8>,
-    mode: FieldMode,
-}
-
-struct ObjectEmission {
-    lengths: Vec<TokenStream>,
-    writes: Vec<TokenStream>,
-}
-
-fn json_encode_impl(
-    impl_generics: TokenStream,
-    target: TokenStream,
-    object_base_len: usize,
-    object_open: &TokenStream,
-    lengths: &[TokenStream],
-    writes: &[TokenStream],
-) -> TokenStream {
-    quote! {
-        impl #impl_generics sark::json::JsonEncode for #target {
-            fn json_len(&self) -> usize {
-                #object_base_len #( + #lengths )*
-            }
-
-            fn write_into<__W: sark::json::Write>(
-                &self,
-                __w: &mut __W,
-            ) -> ::core::result::Result<(), __W::Error> {
-                #object_open
-                #( #writes )*
-                __w.put(b"}")?;
-                Ok(())
-            }
-        }
-    }
-}
-
-impl<'a> Plan<'a> {
-    fn decoder<'field>(&self, field: &'field JsonField) -> Decoder<'field> {
-        if self.request_view {
-            Decoder::request_view(&field.ty, field.mode)
-        } else {
-            Decoder::new(&field.ty, field.mode)
+    let mut names = BTreeMap::new();
+    for field in fields.iter().filter(|field| !field.mode.flatten) {
+        if let Some(first) = names.insert(field.name.as_str(), &field.ident) {
+            let mut error = syn::Error::new_spanned(&field.ident, "duplicate JSON wire field name");
+            error.combine(syn::Error::new_spanned(
+                first,
+                "first field with this wire name",
+            ));
+            return Err(error);
         }
     }
 
-    fn locals(&self) -> Vec<TokenStream> {
-        self.fields
+    let plan = plan::Plan {
+        mode: &mode,
+        fields,
+    };
+
+    if !matches!(mode.purpose, mode::Purpose::Encode)
+        && let Some(field) = plan.fields.iter().find(|field| field.mode.flatten)
+    {
+        return Err(syn::Error::new_spanned(
+            &field.ident,
+            "`flatten` requires encoding-only `#[json(encode)]`",
+        ));
+    }
+
+    if mode.exact
+        && plan
+            .fields
             .iter()
-            .map(|field| {
-                let bind = &field.bind;
-                let ty = &field.ty;
-                if field.mode.unused && self.mode.preserve {
-                    quote!()
-                } else if ty.option_inner().is_some() {
-                    quote!(let mut #bind = None;)
-                } else {
-                    quote!(let mut #bind: Option<#ty> = None;)
-                }
-            })
-            .collect()
+            .any(|field| field.mode.nested || field.mode.seq)
+    {
+        return Err(syn::Error::new(
+            proc_macro2::Span::call_site(),
+            "#[field(nested)] and #[field(seq)] are not supported with `exact`",
+        ));
     }
 
-    fn match_arms(&self) -> Result<Vec<TokenStream>> {
-        let entries = self
+    let names = encoding::Names::new(&st.generics);
+    let plan::Emission { lengths, writes } = plan.encoding(paths, Scope::Object, &names)?;
+    let (_, enc_ty, _) = st.generics.split_for_impl();
+    let encoder = encoding::emit(
+        paths,
+        &st.generics,
+        quote::quote!(#name #enc_ty),
+        &names,
+        &lengths,
+        &writes,
+    );
+    if let syn::Fields::Named(named) = &mut st.fields {
+        for (decl, field) in named.named.iter_mut().zip(&plan.fields) {
+            decl.ty = field::proof_type(paths, &field.ty, field.mode)?;
+        }
+    }
+
+    if !matches!(mode.purpose, mode::Purpose::Decode) {
+        let members = if matches!(mode.purpose, mode::Purpose::Encode) {
+            plan.members(paths, &st)?
+        } else {
+            TokenStream::new()
+        };
+        st.attrs.retain(|attr| !attr.path().is_ident("json"));
+        return scope(
+            &st,
+            quote::quote! {
+                #st
+
+                #encoder
+                #members
+            },
+        );
+    }
+    let scoped = task::expand(
+        paths,
+        &name,
+        &vis,
+        &st.generics,
+        &plan.fields,
+        &mode,
+        &marker,
+    )?;
+
+    let borrow = plan.borrowed(paths);
+
+    let stream = {
+        let order = match mode.kind {
+            mode::JsonKind::Ordered => quote::quote!(#ns_json::segment::Order::Ordered),
+            mode::JsonKind::Unordered => quote::quote!(#ns_json::segment::Order::Unordered),
+        };
+        let schema = plan
             .fields
             .iter()
             .map(|field| {
-                let bind = &field.bind;
-                let lit = syn::LitByteStr::new(&field.name, Span::call_site());
-                Ok(if field.mode.unused && self.mode.preserve {
-                    let skip = Plan::skip(field.mode.plain);
-                    (
-                        field.name.len(),
-                        quote! {
-                            if __name == #lit {
-                                #skip
-                                __handled = true;
-                            }
-                        },
-                    )
+                let name =
+                    syn::LitByteStr::new(field.name.as_bytes(), proc_macro2::Span::call_site());
+                let view = if field.mode.nested || field.mode.seq {
+                    quote::quote!(#ns_json::segment::Projection::Segments)
                 } else {
-                    let decode = self.decoder(field).expr()?;
-                    (
-                        field.name.len(),
-                        quote! {
-                            if __name == #lit {
-                                if #bind.is_none() {
-                                    #bind = Some(#decode);
-                                } else {
-                                    sark::json::Scan::skip_value(__raw, &mut __idx)?;
-                                }
-                                __handled = true;
-                            }
-                        },
-                    )
-                })
-            })
-            .collect::<Result<Vec<_>>>()?;
-        Ok(LengthArms::collect(entries).emit())
-    }
-
-    fn finals(&self) -> Result<Vec<TokenStream>> {
-        self.fields
-            .iter()
-            .map(|field| {
-                let ident = &field.ident;
-                let bind = &field.bind;
-                if field.mode.unused && self.mode.preserve {
-                    self.decoder(field)
-                        .empty()
-                        .map(|empty| quote!(#ident: #empty))
-                } else if field.ty.option_inner().is_some() {
-                    Ok(quote!(#ident: #bind))
-                } else {
-                    Ok(quote! {
-                        #ident: #bind.ok_or_else(|| {
-                            sark::json::Json::bad_request(
-                                concat!("Missing JSON field: ", stringify!(#ident)),
-                            )
-                        })?
-                    })
-                }
-            })
-            .collect()
-    }
-
-    fn ordered_steps(&self) -> Result<Vec<TokenStream>> {
-        self.fields
-            .iter()
-            .enumerate()
-            .map(|(idx, field)| {
-                let bind = &field.bind;
-                let name = syn::LitByteStr::new(&field.name, Span::call_site());
-                let first = idx == 0;
-                Ok(if field.mode.unused && self.mode.preserve {
-                    let skip = Plan::skip(field.mode.plain);
-                    quote! {
-                        sark::json::Scan::expect_prop(__raw, &mut __idx, #first, #name)?;
-                        #skip
+                    let class = scalar::Classified::of(&field.ty)?;
+                    match class.scalar {
+                        scalar::Scalar::Shared if !field.mode.raw && !field.mode.plain => {
+                            quote::quote!(#ns_json::segment::Projection::Frame)
+                        }
+                        scalar::Scalar::Shared | scalar::Scalar::Token => {
+                            quote::quote!(#ns_json::segment::Projection::Bytes)
+                        }
+                        scalar::Scalar::U64 | scalar::Scalar::Bool => {
+                            quote::quote!(#ns_json::segment::Projection::Scalar)
+                        }
+                        scalar::Scalar::I64
+                        | scalar::Scalar::F64
+                        | scalar::Scalar::String
+                        | scalar::Scalar::Borrowed
+                        | scalar::Scalar::Bytes => {
+                            quote::quote!(#ns_json::segment::Projection::None)
+                        }
                     }
-                } else {
-                    let decode = self.decoder(field).expr()?;
-                    quote! {
-                        sark::json::Scan::expect_prop(__raw, &mut __idx, #first, #name)?;
-                        #bind = Some(#decode);
-                    }
-                })
-            })
-            .collect()
-    }
-
-    fn exact_steps(&self) -> Result<Vec<TokenStream>> {
-        self.fields
-            .iter()
-            .map(|field| {
-                let bind = &field.bind;
-                let lit = syn::LitByteStr::new(&field.name, Span::call_site());
-                Ok(if field.mode.unused && self.mode.preserve {
-                    quote! {
-                        sark::json::Scan::seek_name(__raw, &mut __idx, #lit)?;
-                    }
-                } else {
-                    let decode = self.decoder(field).expr()?;
-                    quote! {
-                        sark::json::Scan::seek_name(__raw, &mut __idx, #lit)?;
-                        #bind = Some(#decode);
-                    }
-                })
-            })
-            .collect()
-    }
-
-    fn field_heads(&self) -> Vec<Vec<u8>> {
-        self.fields
-            .iter()
-            .enumerate()
-            .map(|(idx, field)| {
-                let mut head = Vec::with_capacity(field.name.len() + 4);
-                if idx == 0 {
-                    head.extend_from_slice(b"{\"");
-                } else {
-                    head.extend_from_slice(b",\"");
-                }
-                head.extend_from_slice(&field.name);
-                head.extend_from_slice(b"\":");
-                head
-            })
-            .collect()
-    }
-
-    fn encoding(&self) -> Result<ObjectEmission> {
-        let heads = self.field_heads();
-        let mut lengths = Vec::with_capacity(self.fields.len());
-        let mut writes = Vec::with_capacity(self.fields.len());
-        for (field, head) in self.fields.iter().zip(heads.iter()) {
-            let ident = &field.ident;
-            let head_lit = syn::LitByteStr::new(head, Span::call_site());
-            let emission = ValuePlan::new(&field.ty, field.mode, quote!(self.#ident))?.emit();
-            let write = emission.write;
-            writes.push(quote! {
-                __w.put(#head_lit)?;
-                #write
-            });
-            let len = emission.len;
-            let head_len = head.len();
-            lengths.push(quote!(#head_len + (#len)));
-        }
-        Ok(ObjectEmission { lengths, writes })
-    }
-
-    fn scan_fields(&self) -> Result<Vec<TokenStream>> {
-        if !self.mode.exact {
-            return Ok(Vec::new());
-        }
-        self.fields
-            .iter()
-            .map(|field| {
-                let ident = &field.ident;
-                let scan =
-                    FieldScanner::new(&field.name, &field.ty, quote!(__chunks.iter().copied()))
-                        .emit()?;
-                Ok(quote!(#ident: { #scan }))
-            })
-            .collect()
-    }
-
-    fn scan_one(&self) -> Result<Option<TokenStream>> {
-        if !self.mode.exact || self.fields.len() != 1 {
-            return Ok(None);
-        }
-        let Some(field) = self.fields.first() else {
-            return Ok(None);
-        };
-        Ok(Some(
-            FieldScanner::new(&field.name, &field.ty, quote!(chunks)).emit()?,
-        ))
-    }
-
-    fn has_owned(&self) -> bool {
-        self.mode.preserve
-            || self
-                .fields
-                .iter()
-                .any(|field| field.mode.nested || field.mode.seq)
-            || self.fields.iter().any(|field| {
-                let ty = &field.ty;
-                let base = match ty.option_inner() {
-                    Some(inner) => inner,
-                    None => ty,
                 };
-                base.is_bytes_with_storage("Retained")
+                Ok(quote::quote!(#ns_json::segment::Field::new(
+                    #name,
+                    #view,
+                )))
             })
-    }
+            .collect::<syn::Result<Vec<_>>>()?;
+        segment::decode(paths, &name, &vis, &plan.fields, order, schema, &marker)?
+    };
 
-    fn skip(plain: bool) -> TokenStream {
-        if plain {
-            quote!(sark::json::Scan::skip_plain_string(__raw, &mut __idx)?;)
-        } else {
-            quote!(sark::json::Scan::skip_value(__raw, &mut __idx)?;)
+    let decode = quote::quote! {
+        let mut #v_decode = #ns_json::segment::Decoder::<Self>::one(#v_bytes)?;
+        loop {
+            match #v_decode.poll(::core::num::NonZero::<::core::primitive::usize>::MAX) {
+                #ns_json::segment::Progress::Ready(#v_done) => return ::core::result::Result::Ok(#v_done),
+                #ns_json::segment::Progress::Failed(#v_error) => return ::core::result::Result::Err(#v_error),
+                #ns_json::segment::Progress::NeedInput => {
+                    return ::core::result::Result::Err(#ns_json::Error::Invalid.into());
+                }
+                #ns_json::segment::Progress::Pending => {}
+            }
         }
-    }
+    };
 
-    fn decode_body(&self) -> Result<TokenStream> {
-        Ok(match (self.mode.kind, self.mode.exact) {
-            (JsonKind::Ordered, true) => {
-                let exact_steps = self.exact_steps()?;
-                quote! {
-                    #(
-                        #exact_steps
-                    )*
-                }
-            }
-            (JsonKind::Unordered, _) => {
-                let match_arms = self.match_arms()?;
-                quote! {
-                    loop {
-                        sark::json::Scan::ws(__raw, &mut __idx);
-                        if sark::json::Scan::eat_byte(__raw, &mut __idx, b'}') {
-                            break;
-                        }
-                        let __name = sark::json::Scan::str_slice(__raw, &mut __idx)?;
-                        sark::json::Scan::ws(__raw, &mut __idx);
-                        sark::json::Scan::expect_byte(__raw, &mut __idx, b':')?;
-                        sark::json::Scan::ws(__raw, &mut __idx);
-                        let mut __handled = false;
-                        match __name.len() {
-                            #( #match_arms )*
-                            _ => {}
-                        }
-                        if !__handled {
-                            sark::json::Scan::skip_value(__raw, &mut __idx)?;
-                        }
-                        sark::json::Scan::ws(__raw, &mut __idx);
-                        if sark::json::Scan::eat_byte(__raw, &mut __idx, b',') {
-                            continue;
-                        }
-                        sark::json::Scan::expect_byte(__raw, &mut __idx, b'}')?;
-                        break;
-                    }
-                }
-            }
-            (JsonKind::Ordered, false) => {
-                let ordered_steps = self.ordered_steps()?;
-                quote! {
-                    #(
-                        #ordered_steps
-                    )*
-                    sark::json::Scan::ws(__raw, &mut __idx);
-                    sark::json::Scan::expect_byte(__raw, &mut __idx, b'}')?;
-                }
-            }
-        })
-    }
-}
-
-fn request_view_scalar_type(ty: &Type, mode: FieldMode) -> Type {
-    if ty.is_bytes_with_storage("Retained") {
-        if mode.raw || mode.plain {
-            return syn::parse_quote!(
-                ::sark::sark_core::http::Bytes<::sark::sark_core::http::Borrowed<'req>>
-            );
-        }
-        return syn::parse_quote!(::sark::json::JsonBytes<'req>);
-    }
-    ty.clone()
-}
-
-fn request_view_type(ty: &Type, mode: FieldMode) -> Result<Type> {
-    if mode.seq || mode.nested {
-        return Err(syn::Error::new_spanned(
-            ty,
-            "request JSON views support only flat fields",
-        ));
-    }
-    if let Some(inner) = ty.option_inner() {
-        let inner = request_view_scalar_type(inner, mode);
-        return Ok(syn::parse_quote!(Option<#inner>));
-    }
-    Ok(request_view_scalar_type(ty, mode))
-}
-
-impl JsonMode {
-    pub(super) fn expand(self, mut st: ItemStruct) -> Result<TokenStream> {
-        let mode = self;
-        let name = st.ident.clone();
-        let vis = st.vis.clone();
-        let raw_field = Ident::new("__json_raw", Span::call_site());
-        let fields = match &mut st.fields {
-            Fields::Named(named) => {
-                let parsed = named
-                    .named
-                    .iter()
-                    .map(|field| FieldMode::from_field(field, mode.plain))
-                    .collect::<Result<Vec<_>>>()?;
-                for field in &mut named.named {
-                    field.attrs.retain(|attr| {
-                        !attr.path().is_ident("raw")
-                            && !attr.path().is_ident("unused")
-                            && !attr.path().is_ident("plain")
-                            && !attr.path().is_ident("field")
-                    });
-                }
-                for (field, (field_mode, _)) in named.named.iter_mut().zip(parsed.iter()) {
-                    if field_mode.unused {
-                        field.attrs.push(syn::parse_quote!(#[allow(dead_code)]));
-                    }
-                }
-                let fields = named
-                    .named
-                    .iter()
-                    .zip(parsed)
-                    .enumerate()
-                    .map(|(idx, (field, (field_mode, name_override)))| {
-                        let ident = field.ident.clone().ok_or_else(|| {
-                            syn::Error::new(Span::call_site(), "named field required")
-                        })?;
-                        let field_name = match name_override {
-                            Some(name) => name,
-                            None => ident.to_string(),
-                        };
-                        Ok(JsonField {
-                            bind: Ident::new(&format!("__f{idx}"), Span::call_site()),
-                            ident,
-                            ty: field.ty.clone(),
-                            vis: field.vis.clone(),
-                            name: field_name.into_bytes(),
-                            mode: field_mode,
-                        })
-                    })
-                    .collect::<Result<Vec<_>>>()?;
-                if mode.preserve && !mode.encode_only {
-                    named.named.push(syn::parse_quote!(
-                        #[doc(hidden)]
-                        #[allow(dead_code)]
-                        pub __json_raw: o3::buffer::Shared
-                    ));
-                }
-                fields
-            }
-            _ => {
-                return Err(syn::Error::new(
-                    Span::call_site(),
-                    "#[sark_gen::json] requires a named-field struct",
-                ));
-            }
-        };
-
-        let plan = Plan {
+    let request = {
+        let view = quote::format_ident!("{}JsonView", name);
+        let items = plan
+            .fields
+            .iter()
+            .map(|field| {
+                Ok(plan::JsonField {
+                    ident: field.ident.clone(),
+                    bind: field.bind.clone(),
+                    ty: field::request_type(paths, &field.ty, field.mode)?,
+                    vis: field.vis.clone(),
+                    name: field.name.clone(),
+                    mode: field.mode,
+                })
+            })
+            .collect::<syn::Result<Vec<_>>>()?;
+        let shape = plan::Plan {
             mode: &mode,
-            fields,
-            request_view: false,
+            fields: items,
         };
-
-        if mode.exact
-            && plan
-                .fields
-                .iter()
-                .any(|field| field.mode.nested || field.mode.seq)
-        {
-            return Err(syn::Error::new(
-                Span::call_site(),
-                "#[field(nested)] and #[field(seq)] are not supported with `exact`",
-            ));
-        }
-
-        let ObjectEmission { lengths, writes } = plan.encoding()?;
-        let object_base_len = if plan.fields.is_empty() {
-            2usize
-        } else {
-            1usize
-        };
-        let object_open = if plan.fields.is_empty() {
-            quote!(__w.put(b"{")?;)
-        } else {
-            TokenStream::new()
-        };
-        let encode_impl = json_encode_impl(
-            TokenStream::new(),
-            quote!(#name),
-            object_base_len,
-            &object_open,
+        let decls = shape
+            .fields
+            .iter()
+            .map(|field| {
+                let ident = &field.ident;
+                let ty = field::proof_type(paths, &field.ty, field.mode)?;
+                let vis = &field.vis;
+                Ok(quote::quote!(#vis #ident: #ty))
+            })
+            .collect::<syn::Result<Vec<_>>>()?;
+        let locals = shape.locals(paths)?;
+        let finals = shape.finals(paths);
+        let body = shape.decode_body(paths)?;
+        let generics = syn::parse_quote!(<'req>);
+        let names = encoding::Names::new(&generics);
+        let plan::Emission { lengths, writes } = shape.encoding(paths, Scope::Object, &names)?;
+        let encode = encoding::emit(
+            paths,
+            &generics,
+            quote::quote!(#view<'req>),
+            &names,
             &lengths,
             &writes,
         );
-        if mode.encode_only {
-            st.attrs.retain(|attr| !attr.path().is_ident("json"));
-            return Ok(quote! {
-                #st
+        quote::quote! {
+            #vis struct #view<'req> {
+                #( #decls, )*
+                #[doc(hidden)]
+                #marker: ::core::marker::PhantomData<&'req ()>,
+            }
 
-                #encode_impl
-            });
+        impl #ns_json::parsing::Request for #name {
+                type View<'req> = #view<'req>;
+
+                fn prefix<'req>(
+                    #v_raw: &'req [::core::primitive::u8],
+                    mut #v_idx: ::core::primitive::usize,
+                    #v_depth: #ns_json::parsing::Depth,
+                ) -> ::core::result::Result<
+                    (Self::View<'req>, ::core::primitive::usize),
+                    #ns_json::parsing::Error<'req>,
+                > {
+                    #ns_json::input::Input::ws(#v_raw, &mut #v_idx);
+                    #ns_json::input::Input::expect_byte(#v_raw, &mut #v_idx, b'{')?;
+                    #(#locals)*
+                    #body
+                    ::core::result::Result::Ok((#view {
+                        #(#finals,)*
+                        #marker: ::core::marker::PhantomData,
+                    }, #v_idx))
+                }
+            }
+
+            impl<'view> #ns_json::parsing::Request for #view<'view> {
+                type View<'req> = #view<'req>;
+
+                fn prefix<'req>(
+                    #v_raw: &'req [::core::primitive::u8],
+                    #v_idx: ::core::primitive::usize,
+                    #v_depth: #ns_json::parsing::Depth,
+                ) -> ::core::result::Result<
+                    (Self::View<'req>, ::core::primitive::usize),
+                    #ns_json::parsing::Error<'req>,
+                > {
+                    <#name as #ns_json::parsing::Request>::prefix(#v_raw, #v_idx, #v_depth)
+                }
+            }
+
+            #encode
         }
+    };
 
-        let locals = plan.locals();
-        let finals = plan.finals()?;
-        let scan_one = if mode.exact && !mode.preserve && plan.fields.len() == 1 {
-            plan.scan_one()?
-        } else {
-            None
-        };
-        let scan_fields = if mode.exact && scan_one.is_none() {
-            plan.scan_fields()?
-        } else {
-            Vec::new()
-        };
-        let has_owned = plan.has_owned();
-
-        let scan_prelude = if mode.preserve {
-            quote! {
-                let mut __raw_acc = Vec::new();
-                for __chunk in __chunks.iter().copied() {
-                    __raw_acc.extend_from_slice(__chunk);
-                }
-            }
-        } else {
-            quote! {}
-        };
-        let scan_tail = if mode.preserve {
-            quote!(#raw_field: o3::buffer::Shared::from(__raw_acc),)
-        } else {
-            quote! {}
-        };
-        let single_scan = scan_one.as_ref().zip(plan.fields.first());
-        let scan_impl = if let Some((scan_one, field)) = single_scan {
-            let ident = &field.ident;
-            quote! {
-                impl sark::json::JsonScan for #name {
-                    fn scan_json<'a, I>(chunks: I) -> sark::json::Result<Self>
-                    where
-                        I: IntoIterator<Item = &'a [u8]>,
-                    {
-                        Ok(Self {
-                            #ident: { #scan_one }
-                        })
-                    }
-                }
-            }
-        } else if mode.exact {
-            quote! {
-                impl sark::json::JsonScan for #name {
-                    fn scan_json<'a, I>(chunks: I) -> sark::json::Result<Self>
-                    where
-                        I: IntoIterator<Item = &'a [u8]>,
-                    {
-                        let __chunks: Vec<&'a [u8]> = chunks.into_iter().collect();
-                        #scan_prelude
-                        Ok(Self {
-                            #(#scan_fields,)*
-                            #scan_tail
-                        })
-                    }
-                }
-            }
-        } else {
-            quote! {
-                impl sark::json::JsonScan for #name {
-                    fn scan_json<'a, I>(chunks: I) -> sark::json::Result<Self>
-                    where
-                        I: IntoIterator<Item = &'a [u8]>,
-                    {
-                        let mut __out = Vec::new();
-                        for __chunk in chunks {
-                            __out.extend_from_slice(__chunk);
-                        }
-                        <Self as sark::json::JsonDecode>::decode_json(
-                            o3::buffer::Shared::from(__out)
-                        )
-                    }
-                }
-            }
-        };
-
-        let decode_body = plan.decode_body()?;
-
-        let ctor = if mode.preserve {
-            let ctor_args = plan.fields.iter().map(|field| {
-                let ident = &field.ident;
-                let ty = &field.ty;
-                quote!(#ident: #ty)
-            });
-            let ctor_fields = plan.fields.iter().map(|field| &field.ident);
-            Some(quote! {
-                impl #name {
-                    pub fn new(#(#ctor_args),*) -> Self {
-                        Self {
-                            #(#ctor_fields),*,
-                            #raw_field: o3::buffer::Shared::new(),
-                        }
-                    }
-                }
-            })
-        } else {
-            None
-        };
-        let preserve_impl = if mode.preserve {
-            Some(quote! {
-                impl sark::json::JsonPreserve for #name {
-                    fn raw_json(&self) -> Option<&o3::buffer::Shared> {
-                        if self.#raw_field.is_empty() {
-                            None
-                        } else {
-                            Some(&self.#raw_field)
-                        }
-                    }
-                }
-            })
-        } else {
-            None
-        };
-        let init_fields = if mode.preserve {
-            quote!(#(#finals,)* #raw_field: __bytes)
-        } else {
-            quote!(#(#finals,)*)
-        };
-
-        let decode_borrowed = if has_owned {
-            quote! {}
-        } else {
-            quote! {
-                fn decode_json_borrowed(__raw: &[u8]) -> sark::json::Result<Self> {
-                    let mut __idx = 0usize;
-                    sark::json::Scan::ws(__raw, &mut __idx);
-                    sark::json::Scan::expect_byte(__raw, &mut __idx, b'{')?;
-                    #(#locals)*
-                    #decode_body
-                    Ok(Self { #init_fields })
-                }
-            }
-        };
-
-        let request_view_impl = if mode.preserve
-            || plan
-                .fields
-                .iter()
-                .any(|field| field.mode.nested || field.mode.seq)
-        {
-            TokenStream::new()
-        } else {
-            let view_name = format_ident!("{}JsonView", name);
-            let view_fields = plan
-                .fields
-                .iter()
-                .map(|field| {
-                    Ok(JsonField {
-                        ident: field.ident.clone(),
-                        bind: field.bind.clone(),
-                        ty: request_view_type(&field.ty, field.mode)?,
-                        vis: field.vis.clone(),
-                        name: field.name.clone(),
-                        mode: field.mode,
-                    })
-                })
-                .collect::<Result<Vec<_>>>()?;
-            let view_plan = Plan {
-                mode: &mode,
-                fields: view_fields,
-                request_view: true,
-            };
-            let view_field_decls = view_plan.fields.iter().map(|field| {
-                let ident = &field.ident;
-                let ty = &field.ty;
-                let vis = &field.vis;
-                quote!(#vis #ident: #ty)
-            });
-            let view_locals = view_plan.locals();
-            let view_finals = view_plan.finals()?;
-            let view_decode_body = view_plan.decode_body()?;
-            let ObjectEmission {
-                lengths: view_lengths,
-                writes: view_writes,
-            } = view_plan.encoding()?;
-            let view_encode_impl = json_encode_impl(
-                quote!(<'req>),
-                quote!(#view_name<'req>),
-                object_base_len,
-                &object_open,
-                &view_lengths,
-                &view_writes,
-            );
-            quote! {
-                #[allow(dead_code)]
-                #vis struct #view_name<'req> {
-                    #( #view_field_decls, )*
-                    #[doc(hidden)]
-                    __sark_json_marker: ::core::marker::PhantomData<&'req ()>,
-                }
-
-                impl sark::json::JsonRequestDecode for #name {
-                    type View<'req> = #view_name<'req>;
-
-                    fn decode_request<'req>(
-                        __raw: &'req [u8],
-                    ) -> sark::json::Result<Self::View<'req>> {
-                        let mut __idx = 0usize;
-                        sark::json::Scan::ws(__raw, &mut __idx);
-                        sark::json::Scan::expect_byte(__raw, &mut __idx, b'{')?;
-                        #(#view_locals)*
-                        #view_decode_body
-                        Ok(#view_name {
-                            #(#view_finals,)*
-                            __sark_json_marker: ::core::marker::PhantomData,
-                        })
-                    }
-                }
-
-                #view_encode_impl
-            }
-        };
-
-        st.attrs.retain(|attr| !attr.path().is_ident("json"));
-        Ok(quote! {
+    st.attrs.retain(|attr| !attr.path().is_ident("json"));
+    scope(
+        &st,
+        quote::quote! {
             #st
-            #ctor
-            #request_view_impl
+            #request
+            #scoped
 
-            impl sark::json::JsonDecode for #name {
-                fn decode_json(__bytes: o3::buffer::Shared) -> sark::json::Result<Self> {
-                    let __raw = __bytes.as_ref();
-                    let mut __idx = 0usize;
-                    sark::json::Scan::ws(__raw, &mut __idx);
-                    sark::json::Scan::expect_byte(__raw, &mut __idx, b'{')?;
-                    #(#locals)*
-                    #decode_body
-                    Ok(Self { #init_fields })
+            impl #ns_json::parsing::Decode for #name {
+                fn decode<'__e>(#v_bytes: #ns_http::o3::buffer::storage::Shared) ->
+                    ::core::result::Result<Self, #ns_json::parsing::Error<'__e>> {
+                    #decode
                 }
-                #decode_borrowed
+                #borrow
             }
 
-            #encode_impl
+            #stream
 
-            #scan_impl
-            #preserve_impl
-        })
+            #encoder
+        },
+    )
+}
+
+fn scope(
+    source: &syn::ItemStruct,
+    output: proc_macro2::TokenStream,
+) -> syn::Result<proc_macro2::TokenStream> {
+    use quote::ToTokens;
+    use syn::{visit::Visit, visit_mut::VisitMut};
+
+    let mut names = crate::types::Generics::new(source.generics.clone());
+    names.reserve().visit_item_struct(source);
+    let prefix = crate::handler::names::encoded("__SarkJson", &source.ident).to_string();
+    let module = quote::format_ident!("{}", prefix.to_lowercase());
+    let mut imports = crate::types::Imports::new(names, prefix);
+    let mut declarations = proc_macro2::TokenStream::new();
+    let mut implementations = proc_macro2::TokenStream::new();
+    for item in syn::parse2::<syn::File>(output)?.items {
+        if let syn::Item::Impl(mut item) = item {
+            imports.bind(&item.generics);
+            imports.visit_item_impl_mut(&mut item);
+            item.to_tokens(&mut implementations);
+        } else {
+            item.to_tokens(&mut declarations);
+        }
     }
+    let (outer, inner) = imports.finish()?;
+    Ok(quote::quote! {
+        #declarations
+        #outer
+        mod #module {
+            #inner
+            #implementations
+        }
+    })
 }

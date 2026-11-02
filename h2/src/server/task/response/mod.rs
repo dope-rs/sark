@@ -1,0 +1,191 @@
+use core::convert::Infallible;
+use sark_core::{
+    decode::Decode,
+    manifold::{schedule::typed, task::app::Runtime},
+};
+use sark_http::payload::response::status::Code;
+
+use crate::{conn, frame::numbers};
+
+pub(super) type Stored<'d, P, C, D> =
+    o3::depot::queue::indexed::lanes::typed::Value<Response<'d, P, C, D>, Data<'d, D>, Infallible>;
+
+type Progress<'d, R> = Result<
+    typed::Control<
+        Response<
+            'd,
+            <R as Decode>::Prepared,
+            <R as Runtime<'d>>::Completion,
+            <R as duplex::Application<'d>>::Duplex,
+        >,
+        Data<'d, <R as duplex::Application<'d>>::Duplex>,
+        Infallible,
+        conn::DataBlock,
+        numbers::ErrorCode,
+    >,
+    numbers::ErrorCode,
+>;
+
+pub(super) mod deadline;
+mod driver;
+mod emission;
+pub(in crate::server) mod expiry;
+pub(super) mod input;
+mod opening;
+pub(super) mod raw;
+pub(super) use driver::Driver;
+
+pub(super) enum Count {
+    Pending,
+    Settled,
+}
+
+pub(super) enum Duplex<I, E = PushError<I, payload::Error>> {
+    Other(I),
+    Closed(payload::Error, I),
+    Applied(Result<(), E>),
+}
+
+use o3::buffer::resident;
+use sark_core::{
+    body,
+    decode::{exec, request},
+    duplex::{
+        self,
+        input::{PushError, Status},
+    },
+    life,
+    manifold::stream::Boundary,
+};
+use sark_http::payload::owned;
+
+use crate::{
+    conn::event,
+    server::{
+        payload,
+        response::{Head, Pending, Receipt},
+    },
+};
+
+pub(super) enum Response<'d, P, C, D: duplex::Session<'d>> {
+    Status(Code),
+    Sync(request::Ready<exec::Sync, P, owned::Segments<'d>>),
+    Completion(C),
+    Head {
+        head: Head<'d>,
+        outcome: life::Outcome,
+        count: Count,
+    },
+    Encoded(Receipt<'d>),
+    DuplexOpen {
+        request: input::Request<'d, P>,
+    },
+    DuplexHead {
+        head: Head<'d>,
+        input: input::Input<'d, D>,
+    },
+}
+
+pub(super) enum Data<'d, D: duplex::Session<'d>> {
+    Body {
+        pending: Pending<'d>,
+        outcome: life::Outcome,
+    },
+    Duplex {
+        input: input::Input<'d, D>,
+    },
+}
+
+impl<'d, P, C, D> Response<'d, P, C, D>
+where
+    D: duplex::Session<'d>,
+{
+    pub(in crate::server::task) fn push(
+        self,
+        data: event::DataPayload<resident::Shared<'d>>,
+        boundary: Boundary,
+    ) -> (Self, Duplex<event::DataPayload<resident::Shared<'d>>>) {
+        match self {
+            Self::DuplexOpen { mut request } => match boundary {
+                Boundary::More => {
+                    let result = request.append(data).map_err(PushError::Buffer);
+                    (Self::DuplexOpen { request }, Duplex::Applied(result))
+                }
+                Boundary::End => {
+                    let (request, result) = match request.try_end(data) {
+                        Ok(request) => (request, Ok(())),
+                        Err((rejected, request)) => (request, Err(PushError::Buffer(rejected))),
+                    };
+                    (Self::DuplexOpen { request }, Duplex::Applied(result))
+                }
+            },
+            Self::DuplexHead { head, mut input } if matches!(input.status(), Status::Open) => {
+                let result = input.push(data, boundary);
+                (Self::DuplexHead { head, input }, Duplex::Applied(result))
+            }
+            other @ Self::DuplexHead { .. } => (
+                other,
+                Duplex::Closed(payload::Error::Body(body::Error::InputFinished), data),
+            ),
+            other => (other, Duplex::Other(data)),
+        }
+    }
+
+    pub(in crate::server::task) fn finish(self) -> (Self, Duplex<(), input::Error>) {
+        match self {
+            Self::DuplexOpen { request } => {
+                let (request, result) = match request.try_finish() {
+                    Ok(request) => (request, Ok(())),
+                    Err(rejected) => {
+                        let (request, error) = rejected.into_parts();
+                        (request, Err(input::Error::Input(error)))
+                    }
+                };
+                (Self::DuplexOpen { request }, Duplex::Applied(result))
+            }
+            Self::DuplexHead { head, mut input } if matches!(input.status(), Status::Open) => {
+                let result = input.finish().map_err(input::Error::Machine);
+                (Self::DuplexHead { head, input }, Duplex::Applied(result))
+            }
+            other @ Self::DuplexHead { .. } => (
+                other,
+                Duplex::Closed(payload::Error::Body(body::Error::InputFinished), ()),
+            ),
+            other => (other, Duplex::Other(())),
+        }
+    }
+}
+
+impl<'d, D: duplex::Session<'d>> Data<'d, D> {
+    pub(in crate::server::task) fn push(
+        self,
+        data: event::DataPayload<resident::Shared<'d>>,
+        boundary: Boundary,
+    ) -> (Self, Duplex<event::DataPayload<resident::Shared<'d>>>) {
+        match self {
+            Self::Duplex { mut input } if matches!(input.status(), Status::Open) => {
+                let result = input.push(data, boundary);
+                (Self::Duplex { input }, Duplex::Applied(result))
+            }
+            other @ Self::Duplex { .. } => (
+                other,
+                Duplex::Closed(payload::Error::Body(body::Error::InputFinished), data),
+            ),
+            other @ Self::Body { .. } => (other, Duplex::Other(data)),
+        }
+    }
+
+    pub(in crate::server::task) fn finish(self) -> (Self, Duplex<(), input::Error>) {
+        match self {
+            Self::Duplex { mut input } if matches!(input.status(), Status::Open) => {
+                let result = input.finish().map_err(input::Error::Machine);
+                (Self::Duplex { input }, Duplex::Applied(result))
+            }
+            other @ Self::Duplex { .. } => (
+                other,
+                Duplex::Closed(payload::Error::Body(body::Error::InputFinished), ()),
+            ),
+            other @ Self::Body { .. } => (other, Duplex::Other(())),
+        }
+    }
+}

@@ -1,8 +1,8 @@
-pub mod crypto;
+pub mod client;
 pub mod fragment;
 pub mod frame;
+pub mod inbound;
 pub mod mask;
+pub mod upgrade;
 
-pub mod client;
-pub use client::WsHandle;
 pub mod server;

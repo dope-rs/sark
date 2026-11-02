@@ -1,54 +1,58 @@
 [workspace]
 resolver = "2"
-exclude = [
-    "fuzz",
-]
 members = [
     "client",
     "core",
+    "fiber",
     "gen",
     "grpc",
     "grpc-build",
+    "h1",
     "h2",
     "h3",
+    "http",
     "json",
-    "protocol",
     "sark",
     "ws",
 ]
 
 [workspace.package]
 edition = "2024"
-version = "0.13.2"
+rust-version = "1.98"
+version = "0.21.0"
 description = "the L7 layer for dope"
 repository = "https://github.com/dope-rs/sark"
+readme = "README.md"
 license = "MIT"
 authors = ["inq <gofiri@gmail.com>"]
 
 [workspace.dependencies]
-cartel-core = "0.10"
-cartel-gen = "0.10"
-cartel-pg = "0.10"
-cartel-redis = "0.10"
-dope = "0.14"
-dope-net = "0.14"
-dope-fiber = "0.14"
-dope-gen = "0.14"
-dope-test = "0.14"
-dope-tls = "0.18"
-o3 = "0.9.2"
-shin = "0.14"
+clap = { version = "4.6.6", default-features = false, features = ["std", "help", "usage", "error-context"] }
+cartel-pg = "0.21"
+cartel-redis = "0.21"
+dope = "0.21"
+dope-core = "0.21"
+dope-fiber = "0.21"
+dope-gen = "0.21"
+dope-net = "0.21"
+dope-runtime = "0.21"
+dope-tls = "0.21"
+dope-quic = "0.21"
+o3 = "0.20"
+dope-test = "0.21"
 pin-project = "1"
-pin-project-lite = "0.2"
-prost = "0.14.4"
+prost = "=0.14.4"
 prost-build = "0.14.4"
-sark-core = { path = "core", version = "0.13" }
-sark-gen = { path = "gen", version = "0.13" }
-sark-h2 = { path = "h2", version = "0.13" }
-sark-json = { path = "json", version = "0.13" }
-sark-protocol = { path = "protocol", version = "0.13" }
-sark-ws = { path = "ws", version = "0.13" }
-sark = { path = "sark", version = "0.13" }
+sark-core = { path = "core", version = "0.21.0" }
+sark-gen = { path = "gen", version = "0.21.0" }
+sark-h1 = { path = "h1", version = "0.21.0" }
+sark-h2 = { path = "h2", version = "0.21.0" }
+sark-h3 = { path = "h3", version = "0.21.0" }
+sark-http = { path = "http", version = "0.21.0" }
+sark-grpc = { path = "grpc", version = "0.21.0" }
+sark-json = { path = "json", version = "0.21.0" }
+sark = { path = "sark", version = "0.21.0" }
+sark-client = { path = "client", version = "0.21.0" }
 
 [profile.release]
 lto = "fat"
