@@ -12,7 +12,6 @@ use sark_core::{
         client::{domain, event},
         schedule,
         stream::Section,
-        task::schedule::start,
     },
 };
 use sark_h2::{conn, stream};
@@ -30,7 +29,7 @@ use crate::{
     details::{self, RequestError},
     message, metadata,
     protocol::section::{self, Owner, Terminal, Trailers, seal},
-    server::calls,
+    server::{calls, runtime::schedule::start},
 };
 
 pub(crate) mod repr;

@@ -5,13 +5,11 @@ use dope_fiber::{abi, context};
 use sark_grpc::{
     Code, Status,
     encode::Prost,
-    protocol::request,
     server::service::{
         handler::modes,
         task::{stream, unary},
     },
 };
-use sark_http::field::{self, Lower, Value};
 
 #[derive(Default)]
 pub struct Facts {
@@ -48,14 +46,6 @@ impl unary::Handler for Handler<'_> {
             yielded: false,
         }
     }
-}
-
-impl unary::Fiber for Handler<'_> {
-    type Fiber<'life, 'd>
-        = Task<'life>
-    where
-        'd: 'life,
-        Self: 'life;
 }
 
 impl<'d> abi::Fiber<'d> for Task<'_> {
@@ -148,21 +138,6 @@ pub struct DueFacts {
 
 pub struct DueHandler<'a>(pub &'a DueFacts);
 
-pub struct DueFields<'a> {
-    pub fields: request::Fields<'a>,
-    pub timeout: Value<&'a [u8]>,
-}
-
-impl field::Source for DueFields<'_> {
-    fn emit<'field>(&'field self, sink: &mut impl field::Sink<'field>) {
-        self.fields.emit(sink);
-        sink.field(
-            field::literal!(Lower::try_bytes(b"grpc-timeout")),
-            self.timeout,
-        );
-    }
-}
-
 pub struct DueTask<'a> {
     facts: &'a DueFacts,
     index: usize,
@@ -191,14 +166,6 @@ impl unary::Handler for DueHandler<'_> {
             index: usize::from(request.head.path() == b"/deadline/live"),
         }
     }
-}
-
-impl unary::Fiber for DueHandler<'_> {
-    type Fiber<'life, 'd>
-        = DueTask<'life>
-    where
-        'd: 'life,
-        Self: 'life;
 }
 
 impl<'d> abi::Fiber<'d> for DueTask<'_> {

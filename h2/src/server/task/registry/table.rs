@@ -102,6 +102,9 @@ impl<'d, ID: Identity + 'd, T> Table<'d, ID, T> {
         conn: conn::Id<'d, ID>,
         mut take: impl FnMut(Taken<'d, ID, T>),
     ) {
+        if index.is_empty() {
+            return;
+        }
         for at in 0..index.capacity() {
             let Some(stream) = index.key_at(at) else {
                 continue;

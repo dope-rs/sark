@@ -6,7 +6,6 @@ pub mod app;
 mod error;
 pub mod request;
 pub mod response;
-pub mod schedule;
 
 pub use error::Error;
 

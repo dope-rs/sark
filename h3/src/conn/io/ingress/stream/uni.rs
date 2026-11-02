@@ -5,7 +5,6 @@ use sark_core::manifold::stream::Boundary;
 use sark_http::{self, field::metadata::section::rules};
 
 use crate::{
-    conn,
     conn::io::{
         Resume,
         ingress::{
@@ -14,8 +13,9 @@ use crate::{
         },
         write::feedback::{Feedback, FeedbackMut},
     },
+    conn::{self, event},
     frame, link,
-    qpack::decoder::state::Status,
+    qpack::{self, decoder::state::Status},
     stream,
 };
 
@@ -135,14 +135,36 @@ pub(super) fn resume<'d, P: rules::Policy, A: rules::Push>(
                     let mut bytes = [0u8; MAX_INSTRUCTION];
                     let target = bytes.split_at_mut(len).0;
                     recv.buf.copy(target)?;
-                    let tail = parts
-                        .qpack
-                        .qpack_encoder
-                        .ingest_tail(target)
-                        .map_err(conn::Error::QpackDecoderStream)?;
-                    let consumed = target.len() - tail.len();
-                    if consumed > 0 {
+                    let mut tail = &*target;
+                    while let Some((instruction, consumed)) =
+                        qpack::stream::Instruction::decode(tail)
+                            .map_err(conn::Error::QpackDecoderStream)?
+                    {
+                        let cancellation = match instruction {
+                            qpack::stream::Instruction::StreamCancellation { stream_id } => {
+                                let stream_id = Id::try_from(stream_id)
+                                    .map_err(qpack::stream::Error::StreamId)
+                                    .map_err(conn::Error::QpackDecoderStream)?;
+                                let Some(vacancy) = parts.queues.events.vacant() else {
+                                    parts.park(id, recv)?;
+                                    break;
+                                };
+                                Some((stream_id, vacancy))
+                            }
+                            _ => None,
+                        };
+                        parts
+                            .qpack
+                            .qpack_encoder
+                            .apply(instruction)
+                            .map_err(conn::Error::QpackDecoderStream)?;
                         recv.consume(consumed, &mut released, &mut parts.ingress.budget)?;
+                        if let Some((stream_id, vacancy)) = cancellation {
+                            vacancy.push_front(event::Event::QpackCancelled { stream_id });
+                            // The vacancy proves this increment fits the admitted event capacity.
+                            parts.queues.cancellations += 1;
+                        }
+                        tail = &tail[consumed..];
                         requeue = true;
                     }
                 }

@@ -2,14 +2,48 @@ use prost_build::{Comments, Method, Service};
 
 use super::method;
 
-pub fn generate(services: impl IntoIterator<Item = Service>) -> syn::File {
+pub fn generate(services: impl IntoIterator<Item = Service>) -> syn::Result<syn::File> {
     use prost_build::ServiceGenerator as _;
 
     let mut code = String::new();
+    let mut generator = sark_grpc_build::Routes::default();
     for service in services {
-        sark_grpc_build::Routes.generate(service, &mut code);
+        generator.generate(service, &mut code);
     }
-    syn::parse_file(&code).expect("generated service")
+    generator.finalize_package("sark.test", &mut code);
+    syn::parse_file(&code)
+}
+
+pub fn collisions() -> syn::Result<syn::File> {
+    use prost_build::ServiceGenerator as _;
+
+    let mut generator = sark_grpc_build::Routes::default();
+    let mut code = quote::quote!(
+        pub struct CollisionService;
+    )
+    .to_string();
+    let mut first = new("Collision", vec![method::new("echo", "Echo", false, false)]);
+    first.package = "sark.Test".into();
+    generator.generate(first, &mut code);
+    generator.finalize(&mut code);
+    // Another raw package spelling emits into the same Prost module.
+    code.push_str(
+        &quote::quote! {
+            pub struct CollisionRoutes;
+            pub struct CollisionRoutes_;
+            pub struct __SarkGrpcCollisionCall;
+            pub struct __SarkGrpcCollisionMethod0;
+            pub type __SarkGrpcCollisionMethod0_Input = ();
+            pub mod __sark_grpc_collision_routes {}
+        }
+        .to_string(),
+    );
+    let mut later = new("Later", vec![method::new("echo", "Echo", false, false)]);
+    later.methods[0].input_type = "__SarkGrpcCollisionMethod0_Output".into();
+    generator.generate(later, &mut code);
+    generator.finalize(&mut code);
+    generator.finalize_package("sark.test", &mut code);
+    syn::parse_file(&code)
 }
 
 pub fn duplicate_paths() -> Service {

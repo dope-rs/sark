@@ -8,7 +8,6 @@ use crate::common::{atomic::Setup, field::entry};
 pub mod common;
 
 use dope_quic::wire::stream::Id;
-use dope_test::alloc::Tracker;
 use o3::buffer::{resident, storage};
 use sark_core::manifold::stream::Boundary;
 use sark_h3::{
@@ -20,9 +19,6 @@ use sark_h3::{
     stream::Target,
 };
 use sark_http::payload::owned;
-
-#[global_allocator]
-static ALLOCATOR: Tracker = Tracker::new();
 
 #[test]
 fn rejects_partial_batch() {

@@ -148,7 +148,6 @@ pub enum Reason {
     EarlyStatus,
     FieldSection,
     Path,
-    RequestBuffered,
     CallState,
     StatusMissing,
     PendingResponseCapacity,

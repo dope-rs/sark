@@ -1,5 +1,3 @@
-use std::mem;
-
 use dope::core::driver::schedule::clock;
 use o3::{
     alloc,
@@ -72,7 +70,9 @@ where
         if released.prepared {
             self.calls.records.wake_egress();
         }
-        self.work.released |= released.output;
+        if released.output {
+            self.work.retries = self.calls.records.capacity();
+        }
     }
 
     fn remove_call(&mut self, conn: &mut S, stream: S::Key) {
@@ -190,10 +190,23 @@ where
         &mut self,
         active: &'a active::Signals,
     ) -> Option<active::Entry<'r>> {
-        let entry = match active.pop::<1>(self.work.output) {
-            Some(entry) => entry,
+        let blocked = active.blocked(self.work.waiting, self.work.retries);
+        let ready = if self.work.retry_next && blocked.is_some() {
+            None
+        } else {
+            active.pop::<1>(self.work.output)
+        };
+        let index = match ready {
+            Some(entry) => {
+                self.work.retry_next = true;
+                let index = entry.index().raw();
+                let next = index + 1;
+                self.work.output = if next == active.capacity() { 0 } else { next };
+                index
+            }
             None => {
-                let entry = active.blocked(self.work.waiting, self.work.retries)?;
+                let entry = blocked?;
+                self.work.retry_next = false;
                 let index = entry.index().raw();
                 let rows = if index >= self.work.waiting {
                     index - self.work.waiting + 1
@@ -204,14 +217,8 @@ where
                 entry.clear(set::Id::at::<2>());
                 let next = index + 1;
                 self.work.waiting = if next == active.capacity() { 0 } else { next };
-                entry
+                index
             }
-        };
-        let index = entry.index().raw();
-        self.work.output = if index + 1 == active.capacity() {
-            0
-        } else {
-            index + 1
         };
         self.calls.records.entry_at(index)
     }
@@ -262,8 +269,10 @@ where
                 }
             });
         self.release(released);
-        let edge = if mem::take(&mut self.work.released) && active.has_blocked() {
-            self.work.retries = active.capacity();
+        let edge = if active
+            .blocked(self.work.waiting, self.work.retries)
+            .is_some()
+        {
             active::Edge::Wake
         } else {
             active::Edge::None

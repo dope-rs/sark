@@ -1,8 +1,7 @@
-//! Fixed-capacity task scheduling independent of a concrete fiber runtime.
+//! Context and exact errors for scoped native task scheduling.
 
 mod context;
 mod error;
-pub mod raw;
 pub mod start;
 pub mod wake;
 

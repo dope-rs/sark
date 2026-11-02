@@ -19,7 +19,7 @@ use dope_test::{harness::observe::VecCellExt as _, reclaim::Reports};
 use sark_h1::server::{listener, run};
 
 pub fn recover(failure: Recovery<'_, '_>) -> std::convert::Infallible {
-    panic!("native recovery: {:?}", failure.cause())
+    failure.abort()
 }
 
 /// Maximum connection count shared by deterministic server scenarios.
@@ -90,7 +90,6 @@ fn listener(bind: net::SocketAddr) -> config::Prepared<sark_fiber::Tcp> {
     }
 }
 
-pub mod grpc;
 pub mod h3;
 
 use std::cell::Cell;

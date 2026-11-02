@@ -54,9 +54,10 @@ impl Method {
         })
     }
 
-    pub(super) fn scope(&mut self, names: &crate::names::Names) -> proc_macro2::TokenStream {
-        let request = names.ident(&format!("{}Input", self.wrapper));
-        let response = names.ident(&format!("{}Output", self.wrapper));
+    pub(super) fn scope(&mut self, names: &mut crate::names::Names) -> proc_macro2::TokenStream {
+        self.wrapper = names.ident(&self.wrapper);
+        let request = names.ident(&quote::format_ident!("{}Input", self.wrapper));
+        let response = names.ident(&quote::format_ident!("{}Output", self.wrapper));
         let input = mem::replace(&mut self.request, syn::parse_quote!(super::#request));
         let output = mem::replace(&mut self.response, syn::parse_quote!(super::#response));
         quote::quote! {

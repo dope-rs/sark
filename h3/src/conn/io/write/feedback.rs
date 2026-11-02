@@ -32,13 +32,11 @@ impl<'a, 'd, S, B> Feedback<'a, 'd, S, B> {
     }
 
     pub(in crate::conn) fn limit(&self) -> usize {
-        let inline = if self.session.qpack_decoder.is_some() {
-            qpack::FEEDBACK_CAPACITY
-        } else {
-            qpack::FEEDBACK_CAPACITY - 1
-        };
+        let prefix = usize::from(self.session.qpack_decoder.is_none());
+        let inline = qpack::FEEDBACK_CAPACITY - prefix;
         let used = self.wire.len().min(inline);
-        used + self.queues.write_budget.wire_left().min(inline - used)
+        let available = self.queues.write_budget.wire_left().saturating_sub(prefix);
+        used + available.min(inline - used)
     }
 
     pub(in crate::conn) fn can_prepare(&self, inst: stream::Instruction) -> bool {

@@ -13,7 +13,10 @@ pub mod common;
 
 use std::time::{Duration, Instant};
 
-use dope_quic::{conn::stream::access::bindings, wire::stream::Id};
+use dope_quic::{
+    conn::stream::{self, access::bindings},
+    wire::stream::Id,
+};
 use dope_test::alloc::Tracker;
 use sark_core::manifold::stream::Boundary;
 use sark_h3::{
@@ -25,7 +28,10 @@ use sark_h3::{
     manifold,
     manifold::Session,
 };
-use sark_http::payload::response::Body as _;
+use sark_http::{
+    owner::{Change, cause},
+    payload::response::Body as _,
+};
 
 #[global_allocator]
 static ALLOCATOR: Tracker = Tracker::new();
@@ -346,6 +352,42 @@ fn foreign_flush_is_atomic() {
             .retained(stream)
             .is_ok_and(|charge| charge.is_empty())
     );
+}
+
+#[test]
+fn failed_flush_keeps_owner() {
+    let Pair {
+        client: mut quic, ..
+    } = Pair::try_new(certificate).expect("QUIC bridge fixture");
+    let mut h3 = Session::with_role(Role::Client).expect("client session");
+    let id = Id::new(3).expect("remote unidirectional stream");
+    h3.send()
+        .owned(id, vec![1, 2, 3], Boundary::End)
+        .expect("staged body");
+    let charge = h3.h3().retained(id).expect("staged charge");
+    let wire = h3.h3().wire_len();
+    for _ in 0..2 {
+        assert!(matches!(
+            h3.egress().flush(&mut quic),
+            Err(manifold::Error::Resident(stream::resident::Error::Stream(
+                stream::Error::InvalidDirection
+            )))
+        ));
+        assert_eq!(h3.h3().wire_len(), wire);
+        assert_eq!(h3.h3().resident_len(), charge.resident_bytes);
+        assert_eq!(h3.h3().retained(id).expect("restored charge"), charge);
+    }
+    let mut released = 0;
+    h3.close(|effect| {
+        assert_eq!(*effect.key(), id);
+        assert_eq!(effect.charge(), charge);
+        assert!(matches!(
+            effect.change(),
+            Change::StagingReleased(cause::Staging::Closed)
+        ));
+        released += 1;
+    });
+    assert_eq!(released, 1);
 }
 
 #[test]

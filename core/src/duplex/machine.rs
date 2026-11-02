@@ -8,6 +8,7 @@ use crate::duplex::{self, admit};
 
 const INPUT_FINISH_PENDING: u8 = 1;
 const INPUT_FINISH_HELD: u8 = 1 << 1;
+const INITIAL_ACTIVATION: u8 = 1 << 2;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
@@ -225,14 +226,14 @@ impl<'d, D: duplex::Session<'d>> Machine<'d, D> {
             session: inner,
             pending: None,
             phase: Phase::Turn,
-            flags: 0,
+            flags: INITIAL_ACTIVATION,
             output: Output::Open,
         }
     }
 
     pub(super) fn with_finish(inner: D) -> Self {
         Self {
-            flags: INPUT_FINISH_PENDING | INPUT_FINISH_HELD,
+            flags: INPUT_FINISH_PENDING | INPUT_FINISH_HELD | INITIAL_ACTIVATION,
             ..Self::new(inner)
         }
     }
@@ -384,15 +385,17 @@ impl<'d, D: duplex::Session<'d>> Machine<'d, D> {
         if !pending && !turn && !finish {
             return None;
         }
-        let resume = if turn && pending {
+        // Only initial activation precedes FIN; later activation remains queued.
+        let activate = turn && (!finish || self.flags & INITIAL_ACTIVATION != 0);
+        let resume = if turn && (pending || !activate) {
             Resume::Turn
         } else {
             Resume::Idle
         };
         let action = if let Some(input) = self.pending.take() {
             self.session.receive(owned::Segments::from(input))
-        } else if turn {
-            self.phase = Phase::Idle;
+        } else if activate {
+            self.flags &= !INITIAL_ACTIVATION;
             self.session.activate()
         } else {
             self.flags &= !INPUT_FINISH_PENDING;

@@ -126,6 +126,28 @@ impl<A: Spec, W: wire::Spec, F> App<A, W, F> {
         .resume::<<A as Spec>::Fields, event::Ignore>()
     }
 
+    pub(super) fn fail<'d, ID: Identity>(
+        &mut self,
+        conn: &mut Context<'_, '_, '_, '_, '_, 'd, ID, A, W>,
+        driver: &mut retained::Context<'_, '_, 'd>,
+        error: app::Error<Error, A::Failure>,
+    ) where
+        A: app::Application<'d, Connection<'d, A>, conn::Id<'d, ID>>,
+        F: Fault<'d, W, A::Failure, ID, runtime::Build<A::Build>>,
+    {
+        let code = <F as Fault<'d, W, A::Failure, ID, runtime::Build<A::Build>>>::failed(
+            &mut self.fault,
+            conn.id(),
+            error,
+        );
+        let output = Flush::new(conn).finish(driver, Some(code), &mut mode::Disabled);
+        <F as Fault<'d, W, A::Failure, ID, runtime::Build<A::Build>>>::output(
+            &mut self.fault,
+            conn.id(),
+            output,
+        );
+    }
+
     pub(super) fn activate<'d, ID: Identity, T>(
         &mut self,
         conn: &mut Context<'_, '_, '_, '_, '_, 'd, ID, A, W>,
@@ -147,17 +169,7 @@ impl<A: Spec, W: wire::Spec, F> App<A, W, F> {
                 wake.wake();
                 return;
             }
-            let code = <F as Fault<'d, W, A::Failure, ID, runtime::Build<A::Build>>>::failed(
-                &mut self.fault,
-                conn.id(),
-                error,
-            );
-            let output = Flush::new(conn).finish(driver, Some(code), &mut mode::Disabled);
-            <F as Fault<'d, W, A::Failure, ID, runtime::Build<A::Build>>>::output(
-                &mut self.fault,
-                conn.id(),
-                output,
-            );
+            self.fail(conn, driver, error);
             return;
         }
         T::flush(self, conn, driver);
@@ -211,17 +223,7 @@ impl<A: Spec, W: wire::Spec, F> App<A, W, F> {
                 return receive::Outcome::Continue;
             }
             source.discard();
-            let code = <F as Fault<'d, W, A::Failure, ID, runtime::Build<A::Build>>>::failed(
-                &mut self.fault,
-                conn.id(),
-                error,
-            );
-            let output = Flush::new(conn).finish(driver, Some(code), &mut mode::Disabled);
-            <F as Fault<'d, W, A::Failure, ID, runtime::Build<A::Build>>>::output(
-                &mut self.fault,
-                conn.id(),
-                output,
-            );
+            self.fail(conn, driver, error);
             return receive::Outcome::Continue;
         }
         <A::Timing as Deadline<'d, ID, A, W, F>>::flush(self, conn, driver);

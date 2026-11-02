@@ -1,6 +1,5 @@
 use std::{
-    io,
-    io::{Read, Write},
+    io::{self, Read},
     net::{SocketAddr, TcpStream},
     time::Duration,
 };
@@ -19,7 +18,10 @@ use sark_h2::{
 };
 use sark_http::field::{self, Entry, Lower, Pseudo, Value};
 
-use crate::common::grpc::wire::{Failure, Transfer};
+use crate::common::grpc::{
+    session::fairness::Client as _,
+    wire::{Failure, Transfer},
+};
 
 pub struct Peer {
     pub socket: TcpStream,
@@ -121,11 +123,7 @@ impl Peer {
     }
 
     pub fn try_flush(&mut self) -> Result<(), Failure> {
-        self.socket
-            .write_all(self.client.output().first())
-            .map_err(Failure::Io)?;
-        self.client.transfer().drain(usize::MAX);
-        Ok(())
+        self.client.try_flush(&self.socket).map_err(Failure::Io)
     }
 
     pub fn try_read(&mut self) -> Result<(), Failure> {

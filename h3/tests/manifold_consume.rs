@@ -20,11 +20,156 @@ use sark_h3::{
         io::Step,
     },
     frame,
+    link::Flush,
     manifold::{self, Session},
+    qpack::stream::Instruction,
 };
 use sark_http::field::{literal, metadata::block::ContentError};
 
 use crate::common::{field::entry, message::promise::Authority};
+
+#[test]
+fn qpack_cancellation_stops_response_owner() {
+    for request_arrived in [false, true] {
+        let options = Pair::try_config()
+            .expect("server options")
+            .into_builder()
+            .streams(|streams| streams.send_bytes(1027))
+            .try_build()
+            .expect("bounded output");
+        let Pair {
+            mut server,
+            mut client,
+            mut space,
+        } = Pair::try_with(
+            options,
+            Pair::try_config().expect("client options"),
+            certificate,
+        )
+        .expect("QUIC pair");
+        let mut h3 = Session::with_role(Role::Server).expect("server H3");
+        let control = h3.egress().start(&mut server).expect("control stream");
+        let id = client.with_scope(|mut scope| {
+            scope
+                .streams()
+                .send()
+                .open_bidi()
+                .expect("request stream")
+                .id()
+        });
+        let mut now = Instant::now();
+        if request_arrived {
+            let request = Authority.try_headers().expect("request HEADERS");
+            client.with_scope(|mut scope| {
+                let mut streams = scope.streams();
+                let send = streams.view().resolve_send(id).expect("request sender");
+                streams.send().send(send, &request).expect("request bytes");
+                streams.send().finish(send).expect("request FIN");
+            });
+            now = client.view().recovery().send_at(now);
+            Peer::new(&mut space, &mut client)
+                .try_send(&mut server, now, certificate)
+                .expect("request transfer");
+            Ingress::new(&mut h3)
+                .try_receive(&mut server)
+                .expect("request ingress");
+            server.with_scope(|mut scope| {
+                while !matches!(
+                    h3.ingress()
+                        .consume(&mut scope, |_| ())
+                        .expect("completed request"),
+                    Step::Idle
+                ) {}
+            });
+            h3.send()
+                .headers(id, [literal!(entry(b":status", b"200"))], Boundary::More)
+                .expect("response headers");
+            for len in [64, 1024] {
+                h3.send()
+                    .owned(id, vec![7; len], Boundary::More)
+                    .expect("response owner");
+            }
+            assert!(matches!(
+                h3.egress()
+                    .settle(&mut server)
+                    .expect("each complete DATA write fits the native limit"),
+                Flush::Blocked
+            ));
+            assert_eq!(
+                h3.h3().retained(id).expect("staged owner").resident_bytes,
+                1024
+            );
+            server.with_scope(|mut scope| {
+                let streams = scope.streams();
+                let send = streams.view().resolve_send(id).expect("response sender");
+                assert!(streams.view().buffered(send) > 0);
+            });
+        }
+
+        let mut feedback = vec![frame::STREAM_TYPE_QPACK_DECODER.get() as u8];
+        for cancelled in [control, id] {
+            Instruction::StreamCancellation {
+                stream_id: cancelled.get(),
+            }
+            .encode(&mut feedback);
+        }
+        client.with_scope(|mut scope| {
+            let mut streams = scope.streams();
+            let decoder = streams.send().open_uni().expect("decoder stream");
+            streams
+                .send()
+                .send(decoder, &feedback)
+                .expect("QPACK cancellation");
+        });
+        now = client
+            .view()
+            .recovery()
+            .send_at(now + Duration::from_millis(1));
+        Peer::new(&mut space, &mut client)
+            .try_send(&mut server, now, certificate)
+            .expect("cancellation precedes STOP_SENDING");
+        Ingress::new(&mut h3)
+            .try_receive(&mut server)
+            .expect("cancellation ingress");
+        server.with_scope(|mut scope| {
+            let mut stopped = 0;
+            loop {
+                match h3.ingress().consume(&mut scope, |event| {
+                    matches!(event, Event::Stopped { stream_id, error_code, .. }
+                        if *stream_id == id
+                            && *error_code == Code::from_u16(frame::ErrorCode::RequestCancelled.wire_code()))
+                }).expect("response cancellation") {
+                    Step::Item(cancelled) => {
+                        assert!(cancelled);
+                        stopped += 1;
+                    }
+                    Step::More => {}
+                    Step::Idle => break,
+                }
+            }
+            assert_eq!(stopped, 1);
+            let streams = scope.streams();
+            let send = streams.view().resolve_send(id).expect("cancelled request");
+            assert!(!streams.view().is_send_open(send));
+            assert_eq!(streams.view().buffered(send), 0);
+            let critical = streams.view().resolve_send(control).expect("control sender");
+            assert!(streams.view().is_send_open(critical));
+        });
+        Ingress::new(&mut h3)
+            .try_receive(&mut server)
+            .expect("native Stopped preserves the original resident generation");
+        server.with_scope(|mut scope| {
+            while !matches!(
+                h3.ingress()
+                    .consume(&mut scope, |_| ())
+                    .expect("native terminal callback after immediate cancellation"),
+                Step::Idle
+            ) {}
+        });
+        assert!(h3.h3().retained(id).expect("released output").is_empty());
+        assert_eq!(h3.h3().wire_len(), 0);
+    }
+}
 
 #[test]
 fn goaway_preserves_ids() {

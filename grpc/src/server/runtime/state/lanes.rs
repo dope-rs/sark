@@ -28,8 +28,8 @@ pub(in crate::server::runtime) struct Schedule {
     pub(in crate::server::runtime) waiting: usize,
     /// Remaining rows in the circular sweep admitted by the last capacity release.
     pub(in crate::server::runtime) retries: usize,
-    /// A committed message or byte release awaiting the next producer sweep.
-    pub(super) released: bool,
+    /// Alternate ready producers and admitted blocked retries.
+    pub(super) retry_next: bool,
     plane: Kind,
 }
 

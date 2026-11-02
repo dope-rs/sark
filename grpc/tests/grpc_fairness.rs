@@ -13,19 +13,29 @@ use sark_core::manifold::stream::Boundary;
 use sark_grpc::{
     Code, Status,
     message::Compression,
-    server::{Bank, Plan, config::Limits, mode},
+    server::{
+        Bank, Plan,
+        config::{Limits, Output},
+        mode,
+    },
 };
 use sark_h2::{
     ClientRole,
-    conn::{event, machine::Connection},
+    conn::{DataOutcome, config, event, machine::Connection},
+    frame::numbers::ErrorCode,
     server::runtime::modes,
 };
 
 use crate::common::{
     codec::Bytes,
     grpc::{
-        session::fairness::{BURST, CHECK, Client as _, Event, FLOOD, Fairness, PROBE, Trace},
+        call::egress::capacity::try_window,
+        session::fairness::{
+            BURST, CHECK, Client as _, Event, FLOOD, Fairness, HELD, OTHER_FLOOD, OUTPUT_BYTES,
+            OutputFairness, OutputTrace, PROBE, Trace,
+        },
         settings::Settings,
+        wire::Peer,
     },
 };
 
@@ -203,6 +213,185 @@ fn event_budget() {
             },
         )
         .expect("gRPC admitted semantic E2E");
+}
+
+#[test]
+fn output_retries() {
+    for competing in [false, true] {
+        let pair = Pair::bind().expect("output fairness server");
+        let limits = Limits::default().with_output(
+            Output::try_new(2 * BURST + 3, OUTPUT_BYTES)
+                .expect("finite floods and probes capacity"),
+        );
+        let settings = Settings::new(pair.addr(), limits);
+        let (signal, observed) = mpsc::sync_channel(1);
+        let (queued, ready) = mpsc::sync_channel(0);
+        pair.run(
+        move |context, listener| {
+            let trace = OutputTrace::new(competing);
+            let bank = Bank::try_new(settings.connections.count(), limits).expect("gRPC bank");
+            let prepared = settings
+                .h2::<KeyTag<0>>()
+                .expect("H2 plan")
+                .with_bound(listener)
+                .with_plain::<_, modes::Serve<Infallible>>(Plan::new(
+                    OutputFairness(&trace),
+                    &bank,
+                    mode::Direct,
+                ))
+                .for_install::<timing::Throughput>()
+                .expect("server resources");
+            let mut reports =
+                Reports::new(prepared.layout(), [<FrameworkTag<kind::Any> as Tag>::ROUTE]);
+            let mut finish = session::Completion::new();
+            prepared.enter_with(
+                context,
+                |worker| {
+                    worker.lend(|plan, stage| {
+                        plan.install(stage, |host, stage| {
+                            stage.with_app(&mut finish, host, |mut app| {
+                                assert_eq!(
+                                    fibers::TEST
+                                        .try_wait(&mut app, &trace, 1)
+                                        .expect("blocked probe"),
+                                    fibers::Wait::Reached
+                                );
+                                assert_eq!(trace.blocked.get(), if competing { 2 } else { 1 });
+                                assert!(!trace.failed.get());
+                                trace.armed.set(true);
+                                signal.send(()).expect("blocked observer");
+                                ready
+                                    .recv_timeout(Duration::from_secs(2))
+                                    .expect("flood and cancellation queued");
+                                assert_eq!(
+                                    fibers::TEST
+                                        .try_wait(&mut app, &trace, 2)
+                                        .expect("finite output drive"),
+                                    fibers::Wait::Reached
+                                );
+                                assert!(
+                                    !trace.failed.get(),
+                                    "the finite flood must fit alongside the probe"
+                                );
+                                assert!(
+                                    !trace.unfair.get(),
+                                    "blocked retry displaced the ready cursor: {:?}",
+                                    trace.produced.each_ref().map(|count| count.get())
+                                );
+                                let seen = trace.resumed.get().expect("released probe resumed");
+                                assert!(
+                                    seen < BURST,
+                                    "released probe waited for all {seen} of {BURST} ready outputs"
+                                );
+                                signal.send(()).expect("fairness observer");
+                                app.run()
+                            })
+                        })
+                        .map_err(topology::Failure::Install)?
+                        .map_err(topology::Failure::Run)?
+                        .map_err(|cause| topology::Failure::Run(session::Error::Drive(cause)))
+                    })
+                },
+                recovery::Policy::new(|event| reports.push(event), common::recover),
+                |result| {
+                    (match result {
+                        Ok(result) => result.map_err(topology::RunError::Failure),
+                        Err(error) => Err(topology::RunError::from(error)),
+                    })
+                    .as_ref()
+                    .map(|_| ())
+                    .map_err(topology::RunError::cause)
+                    .expect("gRPC runtime");
+                },
+            );
+            assert!(
+                reports.events().expect("retirement owners").is_empty(),
+                "retirement: {reports:?}"
+            );
+            Ok::<(), Infallible>(())
+        },
+        move |address| {
+            let mut peer = Peer::try_config(
+                address,
+                config::Config {
+                    local_settings: config::Settings {
+                        initial_window_size: 0,
+                        ..config::Settings::DEFAULT
+                    },
+                    ..config::Config::default()
+                },
+            )
+            .expect("zero-window peer");
+            let mut floods = Vec::new();
+            if competing {
+                for path in [FLOOD, OTHER_FLOOD] {
+                    floods.push(peer.client.streams().headers().request(
+                        Fairness::try_headers(path).expect("parked producer headers"),
+                        Boundary::More,
+                    ).expect("parked producer"));
+                }
+            }
+            let held = peer
+                .client
+                .streams()
+                .headers()
+                .request(
+                    Fairness::try_headers(HELD).expect("held headers"),
+                    Boundary::More,
+                )
+                .expect("held response");
+            for _ in 0..if competing { 2 } else { 1 } {
+                peer.client
+                .streams()
+                .headers()
+                .request(
+                    Fairness::try_headers(CHECK).expect("probe headers"),
+                    Boundary::More,
+                )
+                .expect("blocked response");
+            }
+            peer.try_flush().expect("held and blocked requests");
+            observed
+                .recv_timeout(Duration::from_secs(2))
+                .expect("probe blocked on real output capacity");
+
+            if competing {
+                let body = Bytes::try_frames(1, 0, Compression::Plain, 0).expect("producer wake");
+                for id in floods {
+                    assert!(matches!(
+                        peer.client.streams().try_send(id, &body, Boundary::More).expect("wake producer"),
+                        DataOutcome::Sent(bytes) if bytes.get() == body.len()
+                    ));
+                }
+            } else {
+                peer.client
+                .streams()
+                .headers()
+                .request(
+                    Fairness::try_headers(FLOOD).expect("flood headers"),
+                    Boundary::More,
+                )
+                .expect("finite ready output");
+            }
+            let held = peer
+                .client
+                .status()
+                .stream_key(held)
+                .expect("held stream key");
+            peer.client
+                .streams()
+                .try_cancel(held, ErrorCode::Cancel)
+                .expect("release held response");
+            peer.try_flush().expect("ready output and capacity release");
+            try_window(&mut peer.socket, 0).expect("egress release acknowledgement");
+            queued.send(()).expect("queued output race");
+            observed
+                .recv_timeout(Duration::from_secs(2))
+                .expect("finite output completed");
+        },
+    )
+    .expect("released output fairness");
+    }
 }
 
 #[test]

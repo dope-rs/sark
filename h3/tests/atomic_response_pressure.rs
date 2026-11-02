@@ -2,22 +2,18 @@ use std::ptr;
 
 use crate::common::atomic::{
     Setup,
-    pressure::{AcceptAll, BlockData, BlockOnce},
+    pressure::{BlockData, BlockOnce},
 };
 
 pub mod common;
 
 use dope_quic::wire::stream::Id;
-use dope_test::alloc::Tracker;
 use o3::buffer::hold;
 use sark_core::manifold::stream::Boundary;
 use sark_h3::{
     conn::{Error, io::Send},
     link::{Flush, Transport},
 };
-
-#[global_allocator]
-static ALLOCATOR: Tracker = Tracker::new();
 
 #[test]
 fn reserves_critical_slot() {
@@ -82,22 +78,6 @@ fn critical_bypasses_block() {
     assert!((link.accepted) == ([Id::new(3).expect("stream id")]));
     assert_eq!(conn.wire_len(), 3);
     assert_eq!(conn.resident_len(), 1);
-}
-
-#[test]
-fn reports_write_quantum() {
-    let mut conn = Setup::new(64, 4096, 4096)
-        .try_build()
-        .expect("egress configuration");
-    for _ in 0..33 {
-        Send::new(&mut conn)
-            .owned(Id::new(0).expect("stream id"), vec![0x41], Boundary::More)
-            .expect("quantum write fits queue");
-    }
-    let mut link = AcceptAll;
-
-    assert!((link.pump_writes(&mut conn).expect("infallible transport")) == (Flush::Pending));
-    assert!((link.pump_writes(&mut conn).expect("infallible transport")) == (Flush::Drained));
 }
 
 #[test]

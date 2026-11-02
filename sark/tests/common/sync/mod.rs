@@ -2,7 +2,7 @@ use std::{cell::Cell, ops::ControlFlow};
 
 use dope::core::driver::settings;
 use o3::{
-    buffer::{resident, storage},
+    buffer::{raw::Slices, resident, storage},
     mem::rc,
 };
 use resident::bound;
@@ -377,9 +377,19 @@ impl<'a> Client<'a> {
     }
 
     pub fn try_take(self) -> Result<storage::Shared, Build> {
-        let wire =
-            storage::Shared::try_copy(self.connection.output().first()).map_err(Build::Storage)?;
-        self.connection.transfer().drain(usize::MAX);
+        let (first, second) = self.connection.output().slices();
+        let Some(slices) = Slices::try_new([first, second])
+            .map_err(storage::AllocError::Capacity)
+            .map_err(Build::Storage)?
+        else {
+            return Ok(storage::Shared::new());
+        };
+        let wire = slices
+            .try_owned()
+            .map_err(storage::AllocError::Exhausted)
+            .map_err(Build::Storage)?
+            .into_shared();
+        self.connection.transfer().drain(wire.len());
         Ok(wire)
     }
 }

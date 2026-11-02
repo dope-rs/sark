@@ -62,19 +62,20 @@ pub enum Error<E = Infallible, M = Infallible> {
     Detach(detach::Error),
 }
 
-impl<M> Error<Infallible, M> {
-    /// Lifts a cause that cannot contain wire detail into a caller's exact
-    /// wire error type without allocation or formatting.
-    #[doc(hidden)]
-    pub fn generalize<E>(self) -> Error<E, M> {
+impl<E, M> Error<E, M> {
+    fn map<T, C>(
+        self,
+        transport: impl FnOnce(conn::Error<E>) -> conn::Error<T>,
+        connect: impl FnOnce(connect::Error<M>) -> connect::Error<C>,
+    ) -> Error<T, C> {
         match self {
             Self::NotConnected => Error::NotConnected,
-            Self::Transport(error) => Error::Transport(error.generalize()),
+            Self::Transport(error) => Error::Transport(transport(error)),
             Self::Capacity(error) => Error::Capacity(error),
             Self::Timeout(error) => Error::Timeout(error),
             Self::Timer(error) => Error::Timer(error),
             Self::Origin(error) => Error::Origin(error),
-            Self::Connect(error) => Error::Connect(error),
+            Self::Connect(error) => Error::Connect(connect(error)),
             Self::Protocol(error) => Error::Protocol(error),
             Self::Redirect(error) => Error::Redirect(error),
             Self::Request(error) => Error::Request(error),
@@ -85,22 +86,17 @@ impl<M> Error<Infallible, M> {
     }
 }
 
+impl<M> Error<Infallible, M> {
+    /// Lifts a cause that cannot contain wire detail into a caller's exact
+    /// wire error type without allocation or formatting.
+    #[doc(hidden)]
+    pub fn generalize<E>(self) -> Error<E, M> {
+        self.map(conn::Error::generalize, std::convert::identity)
+    }
+}
+
 impl<E> Error<E> {
     pub fn widen<M>(self) -> Error<E, M> {
-        match self {
-            Self::NotConnected => Error::NotConnected,
-            Self::Transport(error) => Error::Transport(error),
-            Self::Capacity(error) => Error::Capacity(error),
-            Self::Timeout(error) => Error::Timeout(error),
-            Self::Timer(error) => Error::Timer(error),
-            Self::Origin(error) => Error::Origin(error),
-            Self::Connect(error) => Error::Connect(error.generalize()),
-            Self::Protocol(error) => Error::Protocol(error),
-            Self::Redirect(error) => Error::Redirect(error),
-            Self::Request(error) => Error::Request(error),
-            Self::Decompression(error) => Error::Decompression(error),
-            Self::Reply(error) => Error::Reply(error),
-            Self::Detach(error) => Error::Detach(error),
-        }
+        self.map(std::convert::identity, connect::Error::generalize)
     }
 }

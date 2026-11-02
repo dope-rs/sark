@@ -194,6 +194,15 @@ impl<'a, 'd, P: rules::Policy, A: rules::Push> Status<'a, 'd, P, A> {
 }
 
 impl<P: rules::Policy, A: rules::Push> Status<'_, '_, P, A> {
+    pub(crate) fn cancelled(&self, id: Option<Id>) -> bool {
+        self.conn.queues.cancellations != 0
+            && id.is_none_or(|id| {
+                (&self.conn.queues.events).into_iter().any(|event| {
+                    matches!(event, event::Event::QpackCancelled { stream_id } if id == *stream_id)
+                })
+            })
+    }
+
     /// Whether this stream still owns an outstanding DATA delivery.
     pub(crate) fn data_held(&self, id: Id) -> bool {
         self.conn.streams.data_held(id)

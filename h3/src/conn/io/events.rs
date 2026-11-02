@@ -60,7 +60,12 @@ where
             };
             conn.ingress.budget.release(bytes)?;
         }
-        Ok(Some(front.remove()))
+        let event = front.remove();
+        if matches!(event, event::Event::QpackCancelled { .. }) {
+            // Every queued cancellation contributes one count until this removal.
+            conn.queues.cancellations -= 1;
+        }
+        Ok(Some(event))
     }
 
     pub fn poll_write(self) -> Result<Option<output::Write<'d>>, conn::Error> {

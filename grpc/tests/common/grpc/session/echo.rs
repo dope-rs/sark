@@ -23,13 +23,6 @@ impl Handler for Echo<'_> {
         response: &mut Response<'_, W>,
     ) -> RequestState {
         for (index, message) in request.messages.iter().enumerate() {
-            let message = match message {
-                Ok(message) => message,
-                Err(status) => {
-                    response.finish_with(status);
-                    return RequestState::Complete;
-                }
-            };
             let mut payload = Vec::with_capacity(message.len());
             for segment in message.payload.segments() {
                 payload.extend_from_slice(segment.as_ref());

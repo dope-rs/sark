@@ -45,35 +45,25 @@ impl<E, M> Failure<E, M> {
     pub fn into_parts(self) -> (Error<E, M>, Safety) {
         (self.cause, self.safety)
     }
+
+    fn map<T, C>(self, cause: impl FnOnce(Error<E, M>) -> Error<T, C>) -> Failure<T, C> {
+        Failure {
+            cause: cause(self.cause),
+            safety: self.safety,
+            attempt: self.attempt,
+        }
+    }
 }
 
 impl<M> Failure<Infallible, M> {
     #[doc(hidden)]
     pub fn generalize<E>(self) -> Failure<E, M> {
-        let Self {
-            cause,
-            safety,
-            attempt,
-        } = self;
-        Failure {
-            cause: cause.generalize(),
-            safety,
-            attempt,
-        }
+        self.map(Error::generalize)
     }
 }
 
 impl<E> Failure<E> {
     pub fn widen<M>(self) -> Failure<E, M> {
-        let Self {
-            cause,
-            safety,
-            attempt,
-        } = self;
-        Failure {
-            cause: cause.widen(),
-            safety,
-            attempt,
-        }
+        self.map(Error::widen)
     }
 }

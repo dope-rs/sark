@@ -1,7 +1,7 @@
 use dope::core::driver::life::recovery::Recovery;
 
 pub fn recover(failure: Recovery<'_, '_>) -> std::convert::Infallible {
-    panic!("native client failure: {:?}", failure.cause())
+    failure.abort()
 }
 
 pub mod config;

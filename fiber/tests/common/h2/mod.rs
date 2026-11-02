@@ -7,7 +7,7 @@ use sark::{Guard, Head};
 use sark_http::field::{Entry, Pseudo};
 
 pub fn recover(failure: Recovery<'_, '_>) -> std::convert::Infallible {
-    panic!("native H2 failure: {:?}", failure.cause())
+    failure.abort()
 }
 
 pub mod apps;

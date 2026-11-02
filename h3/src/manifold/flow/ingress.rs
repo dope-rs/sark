@@ -153,7 +153,7 @@ impl<'session, 'd, P: rules::Policy> Ingress<'session, 'd, P> {
     where
         B: stream::Retain<'d>,
     {
-        let delivery = match self.poll(quic)? {
+        let delivery = match self.poll(quic, &mut mode::Disabled, ())? {
             io::Step::Item(delivery) => delivery,
             io::Step::More => return Ok(io::Step::More),
             io::Step::Idle => return Ok(io::Step::Idle),
@@ -220,12 +220,22 @@ impl<'session, 'd, P: rules::Policy> Ingress<'session, 'd, P> {
         Ok(io::Step::Item(output))
     }
 
-    pub(in crate::manifold) fn poll<'scope, const ID: u8, B, const RECONCILE: bool>(
+    pub(in crate::manifold) fn poll<
+        'scope,
+        const ID: u8,
+        B,
+        C: Copy,
+        O: life::Mode<C, Id>,
+        const RECONCILE: bool,
+    >(
         &mut self,
         quic: &mut scope::Access<'scope, ID, B, RECONCILE, resident::Shared<'d>>,
+        life: &mut O,
+        connection: C,
     ) -> Result<io::Step<manifold::Delivery<'scope, 'd, P>>, manifold::Error>
     where
         B: stream::Retain<'d>,
+        O::Retention: owners::Handoff,
     {
         let owner = self.session.bind_scope(quic)?.owner();
         let mut net = super::Transport::new(quic, &mut self.session.receive_credits, owner, None);
@@ -236,30 +246,47 @@ impl<'session, 'd, P: rules::Policy> Ingress<'session, 'd, P> {
             io::Step::More => return Ok(io::Step::More),
             io::Step::Idle => return Ok(io::Step::Idle),
         };
-        let detached = event.is_detached();
         let mut handle = None;
-        let event = event.map_identity(|token| -> Result<_, manifold::Error> {
-            if detached {
-                let raw = token.raw();
-                return Id::new(raw).ok_or_else(|| crate::conn::Error::Identity { raw }.into());
+        let event = match event {
+            event::Event::QpackCancelled { stream_id } => {
+                let Some(bound) = self.cancel(quic, stream_id, life, connection)? else {
+                    return Ok(io::Step::More);
+                };
+                handle = Some(bound);
+                event::Event::Stopped {
+                    stream_id,
+                    error_code: dope_quic::errors::Code::from_u16(
+                        crate::frame::ErrorCode::RequestCancelled.wire_code(),
+                    ),
+                    origin: event::Origin::Transport,
+                }
             }
-            let key = manifold::resident_key(token)?;
-            let bound = net
-                .scope
-                .streams()
-                .resident()
-                .handle_key(key)
-                .ok_or(Error::InvalidStream)?;
-            handle = Some(bound);
-            Ok(bound.id())
-        })?;
+            event => {
+                let detached = event.is_detached();
+                event.map_identity(|token| -> Result<_, manifold::Error> {
+                    if detached {
+                        let raw = token.raw();
+                        return Id::new(raw)
+                            .ok_or_else(|| crate::conn::Error::Identity { raw }.into());
+                    }
+                    let key = manifold::resident_key(token)?;
+                    let bound = quic
+                        .streams()
+                        .resident()
+                        .handle_key(key)
+                        .ok_or(Error::InvalidStream)?;
+                    handle = Some(bound);
+                    Ok(bound.id())
+                })?
+            }
+        };
         let done = event.completion();
         let resident = match (handle, done) {
             (Some(handle), event::Completion::End(_) | event::Completion::Reset { .. }) => {
                 manifold::Resident::Ending(handle)
             }
             (Some(handle), event::Completion::More | event::Completion::Stopped { .. }) => {
-                match net.scope.streams().binding().try_slot(handle)? {
+                match quic.streams().binding().try_slot(handle)? {
                     Some(slot) => manifold::Resident::Active { handle, slot },
                     None => manifold::Resident::Unbound(handle),
                 }
@@ -272,6 +299,76 @@ impl<'session, 'd, P: rules::Policy> Ingress<'session, 'd, P> {
             self.reconcile(quic, handle.id(), *released, 0)?;
         }
         Ok(io::Step::Item(manifold::Delivery { event, resident }))
+    }
+
+    pub(in crate::manifold) fn cancelled<
+        const ID: u8,
+        B: stream::Recv,
+        C: Copy,
+        O: life::Mode<C, Id>,
+        const RECONCILE: bool,
+    >(
+        &mut self,
+        quic: &mut scope::Access<'_, ID, B, RECONCILE, resident::Shared<'d>>,
+        id: Id,
+        life: &mut O,
+        handle: C,
+    ) -> Result<bool, manifold::Error>
+    where
+        O::Retention: owners::Handoff,
+    {
+        if !io::ingress::schedule::Status::new(&self.session.h3).cancelled(Some(id)) {
+            return Ok(false);
+        }
+        self.session.validate(quic)?;
+        self.cancel(quic, id, life, handle)?;
+        Ok(true)
+    }
+
+    fn cancel<'scope, const ID: u8, B, C: Copy, O, const RECONCILE: bool>(
+        &mut self,
+        quic: &mut scope::Access<'scope, ID, B, RECONCILE, resident::Shared<'d>>,
+        id: Id,
+        life: &mut O,
+        handle: C,
+    ) -> Result<Option<conn::stream::resident::Handle<'scope>>, manifold::Error>
+    where
+        B: stream::Recv,
+        O: life::Mode<C, Id>,
+        O::Retention: owners::Handoff,
+    {
+        // Native H3 admits requests; unidirectional output has no push-carrier proof.
+        if id.kind() != Kind::ClientBidi
+            || self.session.h3.settings.role == event::Role::Client
+                && quic.streams().resident().handle(id).is_none()
+        {
+            return Ok(None);
+        }
+        let send = quic.streams().view().resolve_send(id)?;
+        let code = dope_quic::errors::Code::from_u16(
+            crate::frame::ErrorCode::RequestCancelled.wire_code(),
+        );
+        quic.streams().send().abandon_with(
+            send,
+            code,
+            &mut owners::Projection::new(life, handle),
+        )?;
+        let cause = cause::Staging::PeerRetired;
+        let charge = self
+            .session
+            .h3
+            .queues
+            .discard(id)
+            .map_err(|(error, retired)| {
+                Self::unstage(life, handle, id, retired, cause);
+                error
+            })?;
+        Self::unstage(life, handle, id, charge, cause);
+        let bound = quic.streams().resident().handle(id);
+        if let Some(bound) = bound {
+            quic.streams().binding().try_attach(bound)?;
+        }
+        Ok(bound)
     }
 
     pub(in crate::manifold) fn consumed<

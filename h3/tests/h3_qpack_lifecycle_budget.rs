@@ -5,6 +5,7 @@ use sark_h3::conn::Error;
 use sark_http::field::literal;
 
 use crate::common::{
+    conn::payload::Write as _,
     field::entry,
     ledger::Section as _,
     message::{
@@ -30,6 +31,62 @@ use sark_h3::{
     link::{Handoff, Status},
     qpack::{decoder, encoder::Encoder},
 };
+
+#[test]
+fn decoder_prefix_retains_wire_budget() {
+    let id = Id::new(64).expect("request id");
+    let code = Code::from_u16(42);
+    let mut receiver = Connection::with_config(
+        Role::Server,
+        Config {
+            egress: Egress {
+                wire_bytes: 2,
+                ..Egress::default()
+            },
+            ..Config::qpack()
+        },
+    )
+    .expect("connection");
+    assert!(matches!(
+        Receive::new(&mut receiver).reset(id, None, code),
+        Err((
+            Error::Feedback(sark_h3::qpack::stream::Capacity {
+                len: 0,
+                additional: 2,
+                limit: 1,
+            }),
+            _
+        ))
+    ));
+    assert_eq!(receiver.wire_len(), 0);
+    assert!(matches!(
+        receiver.events().poll_token().expect("unchanged events"),
+        Step::Idle
+    ));
+    receiver
+        .control()
+        .open_decoder(Id::new(3).expect("decoder id"))
+        .expect("decoder stream");
+    assert_eq!(
+        receiver
+            .events()
+            .poll_write()
+            .expect("decoder write")
+            .expect("decoder prefix")
+            .into_bytes(),
+        [3]
+    );
+    assert!(Receive::new(&mut receiver).reset(id, None, code).is_ok());
+    assert_eq!(
+        receiver
+            .events()
+            .poll_write()
+            .expect("decoder write")
+            .expect("stream cancellation")
+            .into_bytes(),
+        [0x7f, 0x01]
+    );
+}
 
 #[test]
 fn feedback_exceeding_budget_is_rejected() {

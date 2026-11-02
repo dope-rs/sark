@@ -401,6 +401,7 @@ impl Config {
                 waiters: wait::Table::try_new(streams.wait)?,
                 receive_credits: ring::Fifo::try_new(qpack.receive_credit_capacity)?,
                 events: ring::Fifo::try_new(ingress.event_capacity)?,
+                cancellations: 0,
                 writes: group::Ledger::try_new(egress.write_capacity)
                     .map_err(options::Error::Queue)?,
                 regular_write_limit: write::regular_limit(egress.write_capacity.get(), 64),

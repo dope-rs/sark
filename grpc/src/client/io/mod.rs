@@ -1,5 +1,5 @@
 use dope::net::link::egress::reserve::exact;
-use receive::policies::{Direct, Policy as _};
+use receive::policies::Direct;
 use sark_core::{
     life::session::Storage,
     manifold::{
@@ -19,14 +19,6 @@ use crate::{
 };
 
 pub mod ingress;
-
-pub(super) fn release(before: usize, after: usize) -> schedule::Egress {
-    if after < before {
-        schedule::Egress::Released
-    } else {
-        schedule::Egress::Unchanged
-    }
-}
 
 pub enum Flush {
     Written,
@@ -77,26 +69,13 @@ where
     fn drain(&mut self, n: usize) -> Drive {
         let before = self.state.connection.outbound_len();
         self.state.connection.drain(n);
-        let egress = release(before, self.state.connection.outbound_len());
-        let mut policy = Direct;
-        self.state
-            .calls
-            .drive(&mut self.state.connection, egress, &mut |record| {
-                let _ = policy.cancel(&mut self.state.ingress, record.response);
-            })
+        self.state.drive(before, &mut Direct)
     }
 
     fn take_write(&mut self, prefix: &mut [u8]) -> Result<(io::Output<C>, Drive), io::Error> {
         let before = self.state.connection.outbound_len();
         let write = self.state.connection.take(prefix)?;
-        let egress = release(before, self.state.connection.outbound_len());
-        let mut policy = Direct;
-        let driven = self
-            .state
-            .calls
-            .drive(&mut self.state.connection, egress, &mut |record| {
-                let _ = policy.cancel(&mut self.state.ingress, record.response);
-            });
+        let driven = self.state.drive(before, &mut Direct);
         Ok((write, driven))
     }
 

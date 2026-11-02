@@ -295,6 +295,7 @@ fn cancels_all() {
         let name = match action {
             CancelAction::RequestCancelled => "reset-cancellation",
             CancelAction::StopSending => "stop-sending-cancellation",
+            CancelAction::Qpack => "qpack-cancellation",
             CancelAction::KeyClose => "connection-close-cancellation",
         };
         let proof = run(Scenario {
@@ -423,7 +424,11 @@ fn reset_then_followup() {
 
 #[test]
 fn task_then_followup() {
-    for action in [CancelAction::RequestCancelled, CancelAction::StopSending] {
+    for action in [
+        CancelAction::RequestCancelled,
+        CancelAction::StopSending,
+        CancelAction::Qpack,
+    ] {
         let mut quick = Spec::new(b"/async/quick", b"");
         quick.dispatch = Dispatch::AfterCancellation;
         let proof = run(Scenario {

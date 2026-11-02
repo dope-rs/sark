@@ -21,4 +21,5 @@ pin-project.workspace = true
 
 [dev-dependencies]
 dope-test.workspace = true
+prost = { workspace = true, features = ["derive"] }
 sark-gen.workspace = true

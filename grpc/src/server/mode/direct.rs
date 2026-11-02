@@ -1,21 +1,11 @@
-use std::convert;
-
+use crate::server::{
+    Bank,
+    runtime::{direct, run, state::active},
+    service::handler::Handler,
+};
 use dope::core::driver::{
     settings,
     settings::{claim, errors},
-};
-use o3::buffer::{resident, resident::bound::Unbounded, storage};
-use sark_core::manifold::server::{Connection, app};
-use sark_h2::stream::Key;
-
-use crate::{
-    protocol::section,
-    server::{
-        Bank,
-        mode::Build,
-        runtime::{direct, run, state::active},
-        service::handler::Handler,
-    },
 };
 
 /// Zero-sized direct mode for synchronous handlers.
@@ -28,30 +18,13 @@ impl settings::Resource for Direct {
     }
 }
 
-impl<'a, 'd, H, C, O> Build<'a, 'd, H, C, O> for Direct
-where
-    H: Handler,
-    C: Connection<
-            Key = Key,
-            Owner = resident::Shared<'d>,
-            Fields = section::Owner,
-            Output = storage::Shared,
-        >,
-    O: Copy + Eq + 'd,
-    run::Service<'a, direct::Policy<H, active::Entry<'a>>>: app::Application<
-            'd,
-            C,
-            O,
-            Fields = section::Plan,
-            Failure = run::Failure,
-            Egress<'d> = Unbounded,
-        >,
-{
-    type Application = run::Service<'a, direct::Policy<H, active::Entry<'a>>>;
-    type Error = convert::Infallible;
-
-    fn build(self, app: H, bank: &'a Bank) -> Result<Self::Application, convert::Infallible> {
-        Ok(run::Service::new(direct::Policy::new(app), bank))
+impl Direct {
+    pub fn build<'a, H: Handler>(
+        self,
+        app: H,
+        bank: &'a Bank,
+    ) -> run::Service<'a, direct::Policy<H, active::Entry<'a>>> {
+        run::Service::new(direct::Policy::new(app), bank)
     }
 }
 

@@ -78,6 +78,7 @@ pub(crate) struct Connect {
 pub enum CancelAction {
     RequestCancelled,
     StopSending,
+    Qpack,
     KeyClose,
 }
 

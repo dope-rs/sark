@@ -33,6 +33,8 @@ pub(crate) struct Queues<'d, S, B> {
     pub(in crate::conn) waiters: wait::Table,
     pub(in crate::conn) receive_credits: ring::Fifo<(Credit, usize)>,
     pub(in crate::conn) events: Events<'d, S, B>,
+    // Exact queued cancellation count; token-based discard preserves these events.
+    pub(in crate::conn) cancellations: usize,
     pub(in crate::conn) writes: group::Ledger<plan::Record<'d>, 2>,
     pub(in crate::conn) regular_write_limit: usize,
     pub(in crate::conn) write_budget: budget::WriteBudget,

@@ -13,6 +13,7 @@ use crate::{conn, frame, manifold::Credit};
 #[derive(Debug)]
 pub enum Error {
     QuicStream(stream::Error),
+    Abandon(stream::abandon::Error),
     Resident(resident::Error),
     Binding(bindings::Fault),
     Stale(resident::Stale),
@@ -37,6 +38,7 @@ impl Error {
         match self {
             Self::H3(error) | Self::Budget { error, .. } => error.error_code(),
             Self::QuicStream(_)
+            | Self::Abandon(_)
             | Self::Resident(_)
             | Self::Binding(_)
             | Self::Stale(_)
@@ -53,6 +55,12 @@ impl Error {
 impl From<stream::Error> for Error {
     fn from(error: stream::Error) -> Self {
         Self::QuicStream(error)
+    }
+}
+
+impl From<stream::abandon::Error> for Error {
+    fn from(error: stream::abandon::Error) -> Self {
+        Self::Abandon(error)
     }
 }
 

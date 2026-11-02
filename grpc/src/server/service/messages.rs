@@ -8,7 +8,7 @@ use o3::{
     depot::{arena::linked, queue::pool},
 };
 
-use crate::{Status, details, message};
+use crate::{details, message};
 
 pub struct Messages<'a, C: buffer::raw::Segment = storage::Shared> {
     lane: pool::Lane<'a, message::Frame<C>>,
@@ -56,7 +56,7 @@ impl<'a, C: buffer::raw::Segment> Messages<'a, C> {
 }
 
 impl<'a, C: buffer::raw::Segment> IntoIterator for &'a Messages<'_, C> {
-    type Item = Result<&'a message::Frame<C>, Status>;
+    type Item = &'a message::Frame<C>;
     type IntoIter = Iter<'a, C>;
 
     fn into_iter(self) -> Self::IntoIter {
@@ -65,7 +65,7 @@ impl<'a, C: buffer::raw::Segment> IntoIterator for &'a Messages<'_, C> {
 }
 
 impl<'a, C: buffer::raw::Segment> IntoIterator for Messages<'a, C> {
-    type Item = Result<&'a message::Frame<C>, Status>;
+    type Item = &'a message::Frame<C>;
     type IntoIter = Iter<'a, C>;
 
     fn into_iter(self) -> Self::IntoIter {
@@ -88,12 +88,12 @@ impl<'a, C: buffer::raw::Segment> Iter<'a, C> {
 }
 
 impl<'a, C: buffer::raw::Segment> Iterator for Iter<'a, C> {
-    type Item = Result<&'a message::Frame<C>, Status>;
+    type Item = &'a message::Frame<C>;
 
     fn next(&mut self) -> Option<Self::Item> {
         let message = self.cursor.next()?;
         self.remaining -= 1;
-        Some(Ok(message))
+        Some(message)
     }
 
     fn size_hint(&self) -> (usize, Option<usize>) {

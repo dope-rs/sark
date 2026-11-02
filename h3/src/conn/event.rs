@@ -55,6 +55,11 @@ pub enum Event<'d, S = Selected<rules::RetainRaw>, B = packed::Decoded, I: Ident
         error_code: errors::Code,
         origin: Origin,
     },
+    /// Decoder feedback naming an abandoned field-section carrier. Resolve its
+    /// application lifetime before further output; this is a wire identity.
+    QpackCancelled {
+        stream_id: Id,
+    },
     PushHeaders {
         message: Message<I>,
         push_id: u64,
@@ -128,7 +133,10 @@ impl<S, B, I: Identity> Event<'_, S, B, I> {
                 stream: *stream,
                 code: *code,
             },
-            Self::Settings(_) | Self::CancelPush { .. } | Self::GoAway { .. } => Completion::More,
+            Self::Settings(_)
+            | Self::CancelPush { .. }
+            | Self::QpackCancelled { .. }
+            | Self::GoAway { .. } => Completion::More,
         }
     }
 
@@ -150,7 +158,10 @@ impl<S, B, I: Identity> Event<'_, S, B, I> {
             | Self::Stopped {
                 stream_id: stream, ..
             } => Some(*stream),
-            Self::Settings(_) | Self::CancelPush { .. } | Self::GoAway { .. } => None,
+            Self::Settings(_)
+            | Self::CancelPush { .. }
+            | Self::QpackCancelled { .. }
+            | Self::GoAway { .. } => None,
         }
     }
 }
@@ -216,6 +227,7 @@ impl<'d, S, B, I: Identity> Event<'d, S, B, I> {
                 error_code: code,
                 origin,
             },
+            Self::QpackCancelled { stream_id } => Event::QpackCancelled { stream_id },
             Self::PushHeaders {
                 message,
                 push_id,

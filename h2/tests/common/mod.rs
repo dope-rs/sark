@@ -28,5 +28,5 @@ pub mod tls;
 pub fn recover(
     failure: dope::core::driver::life::recovery::Recovery<'_, '_>,
 ) -> std::convert::Infallible {
-    panic!("native H2 recovery: {:?}", failure.cause())
+    failure.abort()
 }

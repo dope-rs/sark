@@ -156,15 +156,18 @@ impl Encoder {
         self.buffer.take_pending()
     }
 
+    /// Applies decoder feedback. Cancellation releases current references;
+    /// the caller owns application stream closure.
     pub fn ingest(&mut self, buf: &[u8]) -> Result<usize, stream::Error> {
-        Ok(buf.len() - self.ingest_tail(buf)?.len())
+        let mut tail = buf;
+        while let Some(instruction) = stream::Instruction::take(&mut tail)? {
+            self.apply(instruction)?;
+        }
+        Ok(buf.len() - tail.len())
     }
 
-    pub(crate) fn ingest_tail<'input>(
-        &mut self,
-        buf: &'input [u8],
-    ) -> Result<&'input [u8], stream::Error> {
-        self.state.ingest(buf)
+    pub(crate) fn apply(&mut self, instruction: stream::Instruction) -> Result<(), stream::Error> {
+        self.state.apply(instruction)
     }
 
     /// Writes a field section under its HTTP/3 stream identity.

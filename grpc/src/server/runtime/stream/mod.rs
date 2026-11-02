@@ -1,12 +1,17 @@
 //! Streaming tasks over one exact driver-domain scheduler.
 use core::convert::Infallible;
-use std::marker;
-
-use dope::core::driver::{retained, schedule::app::Work};
-use manifold::task::schedule::{self, start, wake};
+use dope::{
+    core::driver::{retained, route::KeyTag, schedule::app::Work},
+    manifold::network::listener::conn::Id,
+};
+use dope_fiber::task::storage::set::group;
 use o3::buffer::resident;
-use runtime::{Call, policy, state::active};
-use sark_core::{manifold, manifold::server::app};
+use runtime::{
+    Call, executor, policy,
+    schedule::{self, start, wake},
+    state::active,
+};
+use sark_core::manifold::server::app;
 use stream::Route as _;
 
 use crate::{
@@ -29,38 +34,34 @@ mod domain;
 /// Route domain for streaming server tasks.
 pub use domain::Domain;
 
-type Target<'r, 'd, O> = marker::PhantomData<fn() -> *mut (O, active::Entry<'r>, &'d ())>;
+type Fiber<'life, 'd, H> = stream::Fiber<
+    'd,
+    <H as stream::Handler>::Task<'life, 'd>,
+    <H as stream::Handler>::Request<'d>,
+    <H as stream::Handler>::Response,
+    <H as stream::Handler>::Codec,
+>;
 
 /// Fixed-capacity streaming execution over one exact driver-domain scheduler.
-pub struct Policy<'r, 'life, 'd: 'life, H, S, O> {
-    tasks: S,
-    user: &'life H,
-    target: Target<'r, 'd, O>,
-}
-
-impl<'r, 'life, 'd: 'life, H, S, O> Policy<'r, 'life, 'd, H, S, O> {
-    pub(in crate::server) const fn new(user: &'life H, tasks: S) -> Self {
-        Self {
-            tasks,
-            user,
-            target: marker::PhantomData,
-        }
-    }
-}
-
-impl<'r, 'life, 'd: 'life, H, S, O> Policy<'r, 'life, 'd, H, S, O>
+pub struct Policy<'s, 'r, 'life, 'd: 'life, H>
 where
     H: stream::Handler + 'life,
-    S: schedule::raw::Scheduler<
-            'd,
-            Domain,
-            O,
-            active::Entry<'r>,
-            stream::Fiber<'d, H::Task<'life, 'd>, H::Request<'d>, H::Response, H::Codec>,
-            Infallible,
-        >,
-    O: Copy + Eq + 'd,
 {
+    tasks: executor::Scheduler<'s, 'd, Domain, Fiber<'life, 'd, H>, active::Entry<'r>>,
+    user: &'life H,
+}
+
+impl<'s, 'r, 'life, 'd: 'life, H> Policy<'s, 'r, 'life, 'd, H>
+where
+    H: stream::Handler + 'life,
+{
+    pub(in crate::server) const fn new(
+        user: &'life H,
+        tasks: executor::Scheduler<'s, 'd, Domain, Fiber<'life, 'd, H>, active::Entry<'r>>,
+    ) -> Self {
+        Self { tasks, user }
+    }
+
     fn signal(entry: active::Entry<'r>, events: exchange::Events) {
         match events {
             exchange::Events::None => {}
@@ -73,7 +74,7 @@ where
         }
     }
 
-    fn task_state(&self, owner: O) -> policy::TaskState {
+    fn task_state(&self, owner: Id<'d, KeyTag<0>>) -> policy::TaskState {
         if self.tasks.has_work_for(owner) {
             policy::TaskState::Ready
         } else {
@@ -82,22 +83,14 @@ where
     }
 }
 
-impl<'r, 'life, 'd: 'life, H, S, O> policy::Dispatch<'d, O> for Policy<'r, 'life, 'd, H, S, O>
+impl<'s, 'r, 'life, 'd: 'life, H> policy::Dispatch<'d, Id<'d, KeyTag<0>>>
+    for Policy<'s, 'r, 'life, 'd, H>
 where
     H: stream::Handler + 'life,
-    S: schedule::raw::Scheduler<
-            'd,
-            Domain,
-            O,
-            active::Entry<'r>,
-            stream::Fiber<'d, H::Task<'life, 'd>, H::Request<'d>, H::Response, H::Codec>,
-            Infallible,
-        >,
-    O: Copy + Eq + 'd,
 {
     type Call = ();
     type Completion = Infallible;
-    type State = Call<S::Pending>;
+    type State = Call<group::Id<'s, 'd, Domain>>;
     type Target = active::Entry<'r>;
     type Timer = timers::Off;
 
@@ -105,12 +98,12 @@ where
 
     fn start<W: Write>(
         &mut self,
-        turn: &mut app::Turn<'_, '_, '_, '_, 'd, O>,
+        turn: &mut app::Turn<'_, '_, '_, '_, 'd, Id<'d, KeyTag<0>>>,
         target: active::Entry<'r>,
         stream: &mut service::Stream,
         head: request::Head,
         reply: &mut Reply<'_, W>,
-    ) -> Opened<Handler<(), Call<S::Pending>>> {
+    ) -> Opened<Handler<(), Self::State>> {
         let owner = turn.owner();
         let parent = turn.wake();
         let work = turn.work();
@@ -154,9 +147,9 @@ where
 
     fn message<W: Write>(
         &mut self,
-        _: O,
+        _: Id<'d, KeyTag<0>>,
         _: active::Entry<'r>,
-        state: &mut Handler<(), Call<S::Pending>>,
+        state: &mut Handler<(), Self::State>,
         _: &mut service::Stream,
         frame: message::Frame<resident::Shared<'d>>,
         reply: &mut Reply<'_, W>,
@@ -196,9 +189,9 @@ where
 
     fn trailers<W: Write>(
         &mut self,
-        _: O,
+        _: Id<'d, KeyTag<0>>,
         _: active::Entry<'r>,
-        state: &mut Handler<(), Call<S::Pending>>,
+        state: &mut Handler<(), Self::State>,
         _: &mut service::Stream,
         tail: metadata::Decoded,
         reply: &mut Reply<'_, W>,
@@ -227,9 +220,9 @@ where
 
     fn output<W: Write>(
         &mut self,
-        _: O,
+        _: Id<'d, KeyTag<0>>,
         _: active::Entry<'r>,
-        state: &mut Handler<(), Call<S::Pending>>,
+        state: &mut Handler<(), Self::State>,
         _: &mut timers::Output<'_, '_, '_, timers::Off>,
         reply: &mut Reply<'_, W>,
     ) -> policy::Output {
@@ -277,9 +270,9 @@ where
 
     fn request<W: Write>(
         &mut self,
-        _: &mut app::Turn<'_, '_, '_, '_, 'd, O>,
+        _: &mut app::Turn<'_, '_, '_, '_, 'd, Id<'d, KeyTag<0>>>,
         _: active::Entry<'r>,
-        _: &mut Handler<(), Call<S::Pending>>,
+        _: &mut Handler<(), Self::State>,
         _: service::Request<'_, resident::Shared<'d>>,
         output: &mut service::Response<'_, W>,
     ) -> policy::RequestState {
@@ -287,17 +280,17 @@ where
         policy::RequestState::Complete
     }
 
-    fn has_tasks(&self, owner: O) -> bool {
+    fn has_tasks(&self, owner: Id<'d, KeyTag<0>>) -> bool {
         self.tasks.has_work_for(owner)
     }
 
-    fn has_done(&self, _: O) -> bool {
+    fn has_done(&self, _: Id<'d, KeyTag<0>>) -> bool {
         false
     }
 
     fn drive_tasks(
         &mut self,
-        owner: O,
+        owner: Id<'d, KeyTag<0>>,
         work: Work<'_, 'd>,
         driver: &mut retained::Context<'_, '_, 'd>,
     ) -> policy::TaskState {
@@ -307,27 +300,32 @@ where
         self.task_state(owner)
     }
 
-    fn wake_tasks(&mut self, owner: O) -> policy::TaskState {
+    fn wake_tasks(&mut self, owner: Id<'d, KeyTag<0>>) -> policy::TaskState {
         self.tasks.wake_next();
         self.task_state(owner)
     }
 
-    fn pop_done(&mut self, _: O) -> Option<(active::Entry<'r>, Self::Completion)> {
+    fn pop_done(&mut self, _: Id<'d, KeyTag<0>>) -> Option<(active::Entry<'r>, Self::Completion)> {
         None
     }
 
     fn publish<W: Write>(
         &mut self,
-        _: O,
+        _: Id<'d, KeyTag<0>>,
         _: active::Entry<'r>,
-        _: &mut Handler<(), Call<S::Pending>>,
+        _: &mut Handler<(), Self::State>,
         done: Self::Completion,
         _: &mut service::Response<'_, W>,
     ) -> handler::RequestState {
         match done {}
     }
 
-    fn cancel(&mut self, _: O, _: active::Entry<'r>, state: &mut Handler<(), Call<S::Pending>>) {
+    fn cancel(
+        &mut self,
+        _: Id<'d, KeyTag<0>>,
+        _: active::Entry<'r>,
+        state: &mut Handler<(), Self::State>,
+    ) {
         state.split().1.cancel(|task| self.tasks.cancel(task))
     }
 }

@@ -9,7 +9,6 @@ use sark_core::{
     manifold::{
         client::{domain, event},
         schedule,
-        task::schedule::start,
     },
 };
 use sark_h2::{conn, stream};
@@ -24,7 +23,7 @@ use sark_http::{
 use crate::{
     Reason, client, details, message, metadata,
     protocol::section::{Trailers, seal},
-    server::calls,
+    server::{calls, runtime::schedule::start},
 };
 
 #[derive(Debug)]

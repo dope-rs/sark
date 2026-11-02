@@ -154,7 +154,7 @@ fn rejects_late_input() {
 }
 
 #[test]
-fn fin_waits_for_admission() {
+fn fin_preempts_reactivation_and_waits_for_admission() {
     let events = Cell::new(Vec::new());
     let mut machine = machine::Machine::new(Ending(&events));
     assert!(matches!(

@@ -27,7 +27,10 @@ use sark_h2::{
 };
 use sark_http::field;
 
-use crate::common::{codec::Bytes, grpc::wire::Peer};
+use crate::common::{
+    codec::Bytes,
+    grpc::{session::fairness::Client as _, wire::Peer},
+};
 
 pub struct Failed<'a>(pub LocalGateRef<'a>);
 
@@ -219,7 +222,7 @@ impl Waiters<2> {
 
     pub fn try_cancel(self) -> Result<Waiters<1>> {
         let Self {
-            mut socket,
+            socket,
             mut client,
             ids: [held, ready],
         } = self;
@@ -232,10 +235,7 @@ impl Waiters<2> {
             .try_cancel(key, ErrorCode::Cancel)
             .map_err(conn::Error::InactiveStream)
             .map_err(Error::Protocol)?;
-        socket
-            .write_all(client.output().first())
-            .map_err(Error::Io)?;
-        client.transfer().drain(usize::MAX);
+        client.try_flush(&socket).map_err(Error::Io)?;
         Ok(Waiters {
             socket,
             client,
@@ -255,10 +255,7 @@ impl<const N: usize> Waiters<N> {
             .set_read_timeout(Some(Duration::from_secs(2)))
             .map_err(Error::Io)?;
         let mut client = Connection::<ClientRole>::try_new().map_err(Error::Config)?;
-        socket
-            .write_all(client.output().first())
-            .map_err(Error::Io)?;
-        client.transfer().drain(usize::MAX);
+        client.try_flush(&socket).map_err(Error::Io)?;
         try_window(&mut socket, 0)?;
         let mut ids = [Id::CONNECTION; N];
         for (id, path) in ids.iter_mut().zip(paths) {
@@ -271,10 +268,7 @@ impl<const N: usize> Waiters<N> {
                 )
                 .map_err(Error::Protocol)?;
         }
-        socket
-            .write_all(client.output().first())
-            .map_err(Error::Io)?;
-        client.transfer().drain(usize::MAX);
+        client.try_flush(&socket).map_err(Error::Io)?;
         Ok(Self {
             socket,
             client,

@@ -1,6 +1,7 @@
 //! QPACK decoder-stream wire grammar.
 use core::num::NonZero;
 
+use dope_quic::wire::varint;
 use sark_http::field::metadata::integer;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -20,6 +21,7 @@ pub enum Error {
         cause: integer::Overflow,
     },
     ZeroIncrement,
+    StreamId(varint::Error),
     UnknownSection {
         stream_id: u64,
     },

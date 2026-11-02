@@ -30,59 +30,53 @@ impl State {
         }
     }
 
-    pub(super) fn ingest<'input>(
-        &mut self,
-        buf: &'input [u8],
-    ) -> Result<&'input [u8], stream::Error> {
-        let mut tail = buf;
-        while let Some(inst) = stream::Instruction::take(&mut tail)? {
-            match inst {
-                stream::Instruction::SectionAcknowledgment { stream_id: stream } => {
-                    let received = self.known_received_count;
-                    let ledger = match &mut self.outstanding {
-                        Tracking::Disabled => {
-                            return Err(stream::Error::UnknownSection { stream_id: stream });
-                        }
-                        Tracking::Active { ledger, .. } => ledger,
-                    };
-                    let required = ledger.acknowledge(stream, received)?;
-                    if required > self.known_received_count {
-                        self.known_received_count = required;
+    pub(super) fn apply(&mut self, instruction: stream::Instruction) -> Result<(), stream::Error> {
+        match instruction {
+            stream::Instruction::SectionAcknowledgment { stream_id: stream } => {
+                let received = self.known_received_count;
+                let ledger = match &mut self.outstanding {
+                    Tracking::Disabled => {
+                        return Err(stream::Error::UnknownSection { stream_id: stream });
                     }
-                }
-                stream::Instruction::StreamCancellation { stream_id: stream } => {
-                    if let Tracking::Active { ledger, .. } = &mut self.outstanding {
-                        ledger.cancel(stream);
-                    }
-                }
-                stream::Instruction::InsertCountIncrement { increment: delta } => {
-                    let known = self.known_received_count;
-                    let Some(advance) = ledger::Advance::from_step(known, delta.get()) else {
-                        return Err(stream::Error::IncrementOverflow {
-                            known,
-                            increment: delta.get(),
-                        });
-                    };
-                    let received = advance.received();
-                    let inserted = match &self.outstanding {
-                        Tracking::Disabled => 0,
-                        Tracking::Active { table, .. } => table.view().insert_count(),
-                    };
-                    if received > inserted {
-                        return Err(stream::Error::IncrementBeyondTable {
-                            known,
-                            increment: delta.get(),
-                            inserted,
-                        });
-                    }
-                    if let Tracking::Active { ledger, .. } = &mut self.outstanding {
-                        ledger.advance(advance);
-                    }
-                    self.known_received_count = received;
+                    Tracking::Active { ledger, .. } => ledger,
+                };
+                let required = ledger.acknowledge(stream, received)?;
+                if required > self.known_received_count {
+                    self.known_received_count = required;
                 }
             }
+            stream::Instruction::StreamCancellation { stream_id: stream } => {
+                if let Tracking::Active { ledger, .. } = &mut self.outstanding {
+                    ledger.cancel(stream);
+                }
+            }
+            stream::Instruction::InsertCountIncrement { increment: delta } => {
+                let known = self.known_received_count;
+                let Some(advance) = ledger::Advance::from_step(known, delta.get()) else {
+                    return Err(stream::Error::IncrementOverflow {
+                        known,
+                        increment: delta.get(),
+                    });
+                };
+                let received = advance.received();
+                let inserted = match &self.outstanding {
+                    Tracking::Disabled => 0,
+                    Tracking::Active { table, .. } => table.view().insert_count(),
+                };
+                if received > inserted {
+                    return Err(stream::Error::IncrementBeyondTable {
+                        known,
+                        increment: delta.get(),
+                        inserted,
+                    });
+                }
+                if let Tracking::Active { ledger, .. } = &mut self.outstanding {
+                    ledger.advance(advance);
+                }
+                self.known_received_count = received;
+            }
         }
-        Ok(tail)
+        Ok(())
     }
 
     /// Unacknowledged insertions and outstanding references both protect this

@@ -11,7 +11,7 @@ pub trait Handler {
             Encode = Self::Response,
             Owned<resident::Shared<'d>> = Self::Request<'d>,
         > + Default;
-    type Task<'life, 'd>: 'life
+    type Task<'life, 'd>: abi::Fiber<'d, Output = modes::Response<Self::Response>> + 'life
     where
         'd: 'life,
         Self: 'life;
@@ -23,14 +23,4 @@ pub trait Handler {
     ) -> Self::Task<'life, 'd>
     where
         'd: 'life;
-}
-
-/// Converts one exact-lifetime unary task into the selected native fiber ABI.
-pub trait Fiber: Handler {
-    type Fiber<'life, 'd>: abi::Fiber<'d, Output = modes::Response<Self::Response>>
-        + From<Self::Task<'life, 'd>>
-        + 'life
-    where
-        'd: 'life,
-        Self: 'life;
 }

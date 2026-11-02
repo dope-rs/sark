@@ -209,17 +209,7 @@ where
             }
         };
         if let Err(error) = result {
-            let code = <F as Fault<'d, W, A::Failure, ID, runtime::Build<A::Build>>>::failed(
-                &mut run.fault,
-                conn.id(),
-                error,
-            );
-            let output = Flush::new(conn).finish(driver, Some(code), &mut mode::Disabled);
-            <F as Fault<'d, W, A::Failure, ID, runtime::Build<A::Build>>>::output(
-                &mut run.fault,
-                conn.id(),
-                output,
-            );
+            run.fail(conn, driver, error);
         }
     }
 

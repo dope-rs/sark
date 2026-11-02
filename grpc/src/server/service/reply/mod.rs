@@ -1,7 +1,7 @@
 //! Compile-time selected response writers.
 use core::{marker, task::Poll};
 
-use crate::{Reason, metadata, server::service::handler::modes};
+use crate::{Reason, metadata};
 
 pub(super) mod parts;
 pub(in crate::server) mod proof;
@@ -96,25 +96,6 @@ impl<W: Write> Reply<'_, W> {
                 crate::Code::Internal,
                 Reason::ReplyFailed,
             )),
-        }
-    }
-
-    pub fn apply_live<C: crate::Codec>(
-        &mut self,
-        response: modes::LiveResponse<C::Encode>,
-        codec: &mut C,
-    ) {
-        match self.parts.state {
-            parts::State::Ready => {}
-            parts::State::Failed => return,
-        }
-        self.parts.metadata = response.metadata;
-        self.parts.trailers = response.trailers;
-        self.parts.status = response.status;
-        if let Some(message) = response.message
-            && let Err(status) = self.parts.writer.encode(codec, &message)
-        {
-            self.parts.fail(Some(status));
         }
     }
 }

@@ -13,15 +13,11 @@ use crate::common::{atomic::Setup, field::entry};
 pub mod common;
 
 use dope_quic::wire::varint::VarInt;
-use dope_test::alloc::Tracker;
 use sark_core::manifold::stream::Boundary;
 use sark_h3::{
     conn::Connection,
     frame::{TYPE_DATA, TYPE_HEADERS},
 };
-
-#[global_allocator]
-static ALLOCATOR: Tracker = Tracker::new();
 
 #[test]
 fn empty_finishes_headers() {

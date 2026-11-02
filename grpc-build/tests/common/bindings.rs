@@ -59,6 +59,14 @@ pub struct Empty;
 
 impl EmptyService for Empty {}
 
+pub type __SarkGrpcCollisionMethod0_Output = ();
+
+impl CollisionService_ for Empty {
+    fn echo(&mut self, request: modes::Request<()>) -> modes::Response<()> {
+        modes::Response::new(request.body)
+    }
+}
+
 pub struct Shapes<'a> {
     pub calls: &'a Cell<usize>,
     pub paths: &'a Cell<Vec<Vec<u8>>>,

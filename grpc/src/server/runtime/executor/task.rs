@@ -2,9 +2,9 @@ use dope::{core::driver::route::KeyTag, manifold::network::listener::conn};
 use dope_fiber::{context::wake, task::storage::set::group};
 use o3::depot::map;
 
-pub(in crate::manifold) struct Group;
+pub(super) struct Group;
 
-pub(in crate::manifold) struct Task<'d, Target> {
+pub(super) struct Task<'d, Target> {
     pub(super) owner: conn::Id<'d, KeyTag<0>>,
     pub(super) target: Target,
     pub(super) parent: wake::RootWaker<'d>,

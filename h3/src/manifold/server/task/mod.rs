@@ -164,6 +164,31 @@ impl<'a, 'd, A: app::Runtime<'d>, L: rotation::Policy<'d>, E: State<'d>> Ready<'
                 return;
             }
         };
+        match self
+            .state
+            .h3
+            .ingress()
+            .cancelled(quic, stream, life, handle)
+        {
+            Ok(false) => {}
+            cancelled => {
+                let retired = self.state.finish(
+                    quic,
+                    id,
+                    life,
+                    exchange::Id::new(handle, stream),
+                    life::Outcome::Cancelled,
+                    now,
+                );
+                if let Err(error) = cancelled {
+                    manifold::close_connection_scoped(quic, error.code());
+                }
+                if let Err(error) = retired {
+                    manifold::close_connection_scoped(quic, error.code());
+                }
+                return;
+            }
+        }
         if let Err(error) = E::transition(
             &mut self.state.deadline,
             id,

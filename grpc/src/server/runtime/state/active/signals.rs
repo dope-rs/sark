@@ -58,20 +58,16 @@ impl Signals {
         !self.sets.get::<0>().is_empty()
     }
 
-    pub(in crate::server) fn has_blocked(&self) -> bool {
-        !self.sets.get::<2>().is_empty()
-    }
-
     pub(in crate::server::runtime) fn blocked(
         &self,
         cursor: usize,
         rows: usize,
     ) -> Option<set::Entry<&set::State<config::Call, usize, 3>, config::Call, usize, 3>> {
-        if rows == 0 {
+        let plane = self.sets.get::<2>();
+        if rows == 0 || plane.is_empty() {
             return None;
         }
         let tail = self.capacity() - cursor;
-        let plane = self.sets.get::<2>();
         if let Some(entry) = plane.find(index::Ordinal::new(cursor))
             && entry.index().raw() - cursor < rows.min(tail)
         {

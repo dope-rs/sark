@@ -322,9 +322,9 @@ dependencies = [
 
 [[package]]
 name = "dope-quic"
-version = "0.21.0"
+version = "0.21.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c5ab223f668888788a41a2229a9199e2cd2fca3908d9bb36d997da1a3cf536b5"
+checksum = "ec20fae99d7134a065974b8bc1380a2f9b8b0a457f16586f90beefcb895d585a"
 dependencies = [
  "aws-lc-rs",
  "dope",
@@ -824,7 +824,7 @@ checksum = "9774ba4a74de5f7b1c1451ed6cd5285a32eddb5cccb8cc655a4e50009e06477f"
 
 [[package]]
 name = "sark"
-version = "0.21.0"
+version = "0.22.0"
 dependencies = [
  "dope",
  "dope-quic",
@@ -842,7 +842,7 @@ dependencies = [
 
 [[package]]
 name = "sark-client"
-version = "0.21.0"
+version = "0.22.0"
 dependencies = [
  "dope",
  "dope-fiber",
@@ -853,7 +853,7 @@ dependencies = [
 
 [[package]]
 name = "sark-core"
-version = "0.21.0"
+version = "0.22.0"
 dependencies = [
  "dope-core",
  "dope-net",
@@ -864,7 +864,7 @@ dependencies = [
 
 [[package]]
 name = "sark-fiber"
-version = "0.21.0"
+version = "0.22.0"
 dependencies = [
  "cartel-pg",
  "cartel-redis",
@@ -881,7 +881,6 @@ dependencies = [
  "sark-client",
  "sark-core",
  "sark-gen",
- "sark-grpc",
  "sark-h1",
  "sark-h2",
  "sark-h3",
@@ -891,7 +890,7 @@ dependencies = [
 
 [[package]]
 name = "sark-gen"
-version = "0.21.0"
+version = "0.22.0"
 dependencies = [
  "dope-test",
  "proc-macro-crate",
@@ -902,7 +901,7 @@ dependencies = [
 
 [[package]]
 name = "sark-grpc"
-version = "0.21.0"
+version = "0.22.0"
 dependencies = [
  "dope",
  "dope-fiber",
@@ -918,7 +917,7 @@ dependencies = [
 
 [[package]]
 name = "sark-grpc-build"
-version = "0.21.0"
+version = "0.22.0"
 dependencies = [
  "dope",
  "dope-test",
@@ -937,7 +936,7 @@ dependencies = [
 
 [[package]]
 name = "sark-h1"
-version = "0.21.0"
+version = "0.22.0"
 dependencies = [
  "dope",
  "dope-test",
@@ -949,7 +948,7 @@ dependencies = [
 
 [[package]]
 name = "sark-h2"
-version = "0.21.0"
+version = "0.22.0"
 dependencies = [
  "clap",
  "dope",
@@ -963,7 +962,7 @@ dependencies = [
 
 [[package]]
 name = "sark-h3"
-version = "0.21.0"
+version = "0.22.0"
 dependencies = [
  "dope",
  "dope-quic",
@@ -976,7 +975,7 @@ dependencies = [
 
 [[package]]
 name = "sark-http"
-version = "0.21.0"
+version = "0.22.0"
 dependencies = [
  "dope-core",
  "dope-runtime",
@@ -988,7 +987,7 @@ dependencies = [
 
 [[package]]
 name = "sark-json"
-version = "0.21.0"
+version = "0.22.0"
 dependencies = [
  "dope-core",
  "dope-test",
@@ -1000,7 +999,7 @@ dependencies = [
 
 [[package]]
 name = "sark-ws"
-version = "0.21.0"
+version = "0.22.0"
 dependencies = [
  "dope",
  "dope-fiber",

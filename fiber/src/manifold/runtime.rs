@@ -1,9 +1,6 @@
-use std::{marker, num::NonZero};
+use std::marker;
 
-use dope::core::driver::{
-    route::KeyTag,
-    schedule::{clock::timer, ready::task::owner},
-};
+use dope::core::driver::schedule::clock::timer;
 use dope_fiber::{
     abi,
     task::storage::{fixed, scope},
@@ -15,14 +12,6 @@ use fixed::{
 };
 use manifold::task::{self, request::Input, response::Output};
 use sark_core::{manifold, route};
-use sark_grpc::server::{
-    mode::schedule::{Streaming, Unary},
-    runtime::{state::active, stream::Domain, unary},
-    service::task::{stream, unary::Fiber},
-};
-use task::schedule;
-
-use crate::manifold::executor;
 
 /// Marks routes executed by the fiber runtime.
 pub struct NativeFiber;
@@ -248,72 +237,6 @@ pub trait TaskRoute<'d, State>: route::Task<'d, State, Request: route::Own> + Si
     ) -> impl abi::Fiber<'d, Output = Output<'d, Self, State>> + 'req
     where
         'd: 'req;
-}
-
-impl<H> Unary<H, KeyTag<0>> for NativeFiber
-where
-    H: Fiber,
-{
-    type Task<'life, 'd>
-        = H::Fiber<'life, 'd>
-    where
-        'd: 'life,
-        Self: 'life,
-        H: 'life;
-    type Scheduler<'s, 'r, 'life, 'd>
-        = executor::Scheduler<'s, 'd, unary::Domain, H::Fiber<'life, 'd>, active::Entry<'r>>
-    where
-        'r: 'life,
-        'd: 'life,
-        Self: 'life,
-        H: 'life;
-
-    fn with<'r, 'life, 'd, O>(
-        capacity: NonZero<u32>,
-        owners: owner::Capacity,
-        run: impl for<'s> FnOnce(Self::Scheduler<'s, 'r, 'life, 'd>) -> O,
-    ) -> Result<O, schedule::Error>
-    where
-        'r: 'life,
-        'd: 'life,
-        Self: 'life,
-        H: 'life,
-    {
-        executor::with(capacity, owners, |tasks| run(executor::Scheduler { tasks }))
-    }
-}
-
-impl<H> Streaming<H, KeyTag<0>> for NativeFiber
-where
-    H: stream::Handler,
-{
-    type Scheduler<'s, 'r, 'life, 'd>
-        = executor::Scheduler<
-        's,
-        'd,
-        Domain,
-        stream::Fiber<'d, H::Task<'life, 'd>, H::Request<'d>, H::Response, H::Codec>,
-        active::Entry<'r>,
-    >
-    where
-        'r: 'life,
-        'd: 'life,
-        Self: 'life,
-        H: 'life;
-
-    fn with<'r, 'life, 'd, O>(
-        capacity: NonZero<u32>,
-        owners: owner::Capacity,
-        run: impl for<'s> FnOnce(Self::Scheduler<'s, 'r, 'life, 'd>) -> O,
-    ) -> Result<O, schedule::Error>
-    where
-        'r: 'life,
-        'd: 'life,
-        Self: 'life,
-        H: 'life,
-    {
-        executor::with(capacity, owners, |tasks| run(executor::Scheduler { tasks }))
-    }
 }
 
 const _: () = assert!(std::mem::size_of::<Empty>() == 0);

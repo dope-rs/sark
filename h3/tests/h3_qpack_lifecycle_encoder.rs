@@ -4,8 +4,10 @@ use sark_h3::conn::Error;
 use sark_http::field::literal;
 
 use crate::common::{
+    conn::{Events, build::Fields as _},
     field::entry,
     ledger::{Encoder as _, Section as _},
+    message::promise::Authority,
     qpack,
 };
 pub mod common;
@@ -15,11 +17,11 @@ use sark_core::manifold::stream::Boundary;
 use sark_h3::{
     conn::{
         Connection,
-        event::Role,
+        event::{Event, Role},
         io::Receive,
         options::{Config, Decode, Qpack},
     },
-    frame::STREAM_TYPE_QPACK_ENCODER,
+    frame::{STREAM_TYPE_QPACK_DECODER, STREAM_TYPE_QPACK_ENCODER},
     qpack::{decoder, encoder::Encoder, stream::Instruction},
 };
 use sark_http::payload::compress::dynamic::insert;
@@ -184,6 +186,34 @@ fn cancel_reuses_slot() {
         Ok(stale.len()),
         "a stale stream id cannot release a recycled generational slot"
     );
+}
+
+#[test]
+fn cancel_after_request_fin_is_delivered() {
+    let mut conn = Connection::with_role(Role::Server).expect("connection");
+    let request = Authority.try_headers().expect("request HEADERS");
+    Receive::new(&mut conn)
+        .borrowed(Id::ZERO, &request, Boundary::End)
+        .expect("completed request");
+    while Events::new(&mut conn)
+        .poll_token()
+        .expect("request")
+        .is_some()
+    {}
+
+    let mut feedback = vec![STREAM_TYPE_QPACK_DECODER.get() as u8];
+    Instruction::StreamCancellation { stream_id: 0 }.encode(&mut feedback);
+    Receive::new(&mut conn)
+        .borrowed(
+            Id::new(2).expect("decoder stream"),
+            &feedback,
+            Boundary::More,
+        )
+        .expect("cancellation after request FIN");
+    assert!(matches!(
+        Events::new(&mut conn).poll_token().expect("typed cancellation"),
+        Some(Event::QpackCancelled { stream_id }) if stream_id == Id::ZERO
+    ));
 }
 
 /// A zero required insert count cannot expose an existing post-base entry.

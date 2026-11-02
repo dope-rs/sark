@@ -2,6 +2,7 @@ use std::{
     cell::Cell,
     io::{self, Write},
     net::TcpStream,
+    task::Poll,
 };
 
 use dope_test::harness::{observe::VecCellExt as _, signals::Progress};
@@ -14,7 +15,7 @@ use sark_grpc::{
     protocol::request,
     server::service::{
         self, Stream,
-        handler::{Handler, RequestState, Start},
+        handler::{Handler, OutputState, RequestState, Start},
         reply::{self, Reply},
         timers,
     },
@@ -26,10 +27,166 @@ use sark_h2::{
 };
 use sark_http::field::{self, Entry, Lower, Pseudo, Value};
 
+use crate::common::codec::Bytes;
+
 pub const BURST: usize = 1_024;
 pub const FLOOD: &[u8] = b"/fair/Flood";
+pub const OTHER_FLOOD: &[u8] = b"/fair/Other";
 pub const CHECK: &[u8] = b"/fair/Probe";
 pub const PROBE: &[u8] = b"probe";
+pub const HELD: &[u8] = b"/fair/Held";
+pub const OUTPUT_BYTES: usize = 32_768;
+
+#[derive(Default)]
+pub struct OutputTrace {
+    pub produced: [Cell<usize>; 2],
+    pub blocked: Cell<usize>,
+    pub resumed: Cell<Option<usize>>,
+    pub failed: Cell<bool>,
+    pub armed: Cell<bool>,
+    pub unfair: Cell<bool>,
+    competing: bool,
+    last: Cell<Option<usize>>,
+}
+
+impl OutputTrace {
+    pub fn new(competing: bool) -> Self {
+        Self {
+            competing,
+            ..Self::default()
+        }
+    }
+}
+
+impl Progress for OutputTrace {
+    fn hits(&self) -> u32 {
+        if self.failed.get() || self.unfair.get() {
+            2
+        } else {
+            u32::from(self.blocked.get() == if self.competing { 2 } else { 1 })
+                + u32::from(if self.competing {
+                    self.produced.iter().all(|count| count.get() == BURST)
+                } else {
+                    self.resumed.get().is_some() && self.produced[0].get() == BURST
+                })
+        }
+    }
+}
+
+pub struct OutputFairness<'a>(pub &'a OutputTrace);
+
+#[derive(Default)]
+pub struct OutputCall {
+    remaining: usize,
+    payload: Option<Vec<u8>>,
+    index: usize,
+    blocked: bool,
+}
+
+impl Handler for OutputFairness<'_> {
+    type Call = OutputCall;
+    type Timer = timers::Off;
+
+    fn start<W: reply::Write>(
+        &mut self,
+        _: &mut (),
+        _: &mut Stream,
+        head: &request::Head,
+        reply: &mut Reply<'_, W>,
+    ) -> Start<Self::Call> {
+        if head.path() == HELD {
+            reply.push_message(vec![0; OUTPUT_BYTES / 2]);
+            return Start::live(OutputCall::default());
+        }
+        Start::live(OutputCall {
+            remaining: if head.path() == FLOOD || head.path() == OTHER_FLOOD {
+                BURST
+            } else {
+                0
+            },
+            payload: (head.path() == CHECK).then(|| vec![1; OUTPUT_BYTES / 2]),
+            index: usize::from(head.path() == OTHER_FLOOD),
+            blocked: false,
+        })
+        .producing()
+    }
+
+    fn message<P: buffer::raw::Segment, W: reply::Write>(
+        &mut self,
+        _: &mut (),
+        _: &mut Self::Call,
+        _: &mut Stream,
+        _: Frame<P>,
+        _: &mut Reply<'_, W>,
+    ) {
+    }
+
+    fn request<P: buffer::raw::Segment, W: reply::Write>(
+        &mut self,
+        _: &mut (),
+        _: &mut Self::Call,
+        _: service::Request<'_, P>,
+        _: &mut service::Response<'_, W>,
+    ) -> RequestState {
+        RequestState::Complete
+    }
+
+    fn output<W: reply::Write>(
+        &mut self,
+        _: &mut (),
+        call: &mut Self::Call,
+        _: &mut timers::Output<'_, '_, '_, timers::Off>,
+        reply: &mut Reply<'_, W>,
+    ) -> OutputState {
+        let probe = call.payload.is_some();
+        if !probe && call.remaining != 0 && self.0.competing && !self.0.armed.get() {
+            return OutputState::Pending;
+        }
+        if probe || call.remaining != 0 {
+            match reply.try_encode(&mut Bytes, call.payload.as_ref().unwrap_or(&Vec::new())) {
+                Ok(Poll::Ready(())) => {
+                    if probe {
+                        call.payload.take();
+                        self.0.resumed.set(Some(self.0.produced[0].get()));
+                    } else {
+                        if self.0.last.replace(Some(call.index)) == Some(call.index)
+                            && self.0.competing
+                            && self
+                                .0
+                                .produced
+                                .iter()
+                                .all(|count| (1..BURST).contains(&count.get()))
+                        {
+                            self.0.unfair.set(true);
+                        }
+                        call.remaining -= 1;
+                        let count = &self.0.produced[call.index];
+                        count.set(count.get() + 1);
+                    }
+                    return OutputState::Produced;
+                }
+                Ok(Poll::Pending) => {
+                    if probe {
+                        if !call.blocked {
+                            self.0.blocked.set(self.0.blocked.get() + 1);
+                            call.blocked = true;
+                        }
+                    } else {
+                        self.0.failed.set(true);
+                    }
+                    return OutputState::Blocked;
+                }
+                Err(status) => {
+                    self.0.failed.set(true);
+                    reply.finish_with(status);
+                    return OutputState::Complete;
+                }
+            }
+        }
+        reply.finish_with(Status::ok());
+        OutputState::Complete
+    }
+}
 
 #[derive(Clone, Debug)]
 pub enum Event {
@@ -163,10 +320,14 @@ impl Client for Connection<ClientRole> {
     }
 
     fn try_flush(&mut self, mut socket: &TcpStream) -> Result<(), io::Error> {
-        let bytes = self.output().first();
-        let len = bytes.len();
-        socket.write_all(bytes)?;
-        self.transfer().drain(len);
-        Ok(())
+        loop {
+            let bytes = self.output().first();
+            if bytes.is_empty() {
+                return Ok(());
+            }
+            let len = bytes.len();
+            socket.write_all(bytes)?;
+            self.transfer().drain(len);
+        }
     }
 }

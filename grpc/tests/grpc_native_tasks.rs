@@ -1,32 +1,28 @@
 pub mod common;
 
-use std::{convert::Infallible, time::Duration};
+use std::convert::Infallible;
 
-use common::server::recover;
-use common::{
-    h2::{
-        facts::State,
-        peer::{Peer, Sender},
-        server::{CONFIG, Server},
-    },
-    server::{
-        self,
-        grpc::{DueFacts, DueFields, DueHandler, Facts, Handler},
-    },
+use common::grpc::{
+    native::{DueFacts, DueHandler, Facts, Handler},
+    settings::Settings,
+    wire::{Peer, deadline},
 };
 use dope::{
-    core::driver::{life::recovery, storage},
+    core::driver::{
+        life::recovery,
+        route::{FrameworkTag, KeyTag, Tag, kind},
+        storage,
+    },
     manifold::timing,
     runtime::{
         executor::session::Completion,
         topology::{lending, recipe},
     },
 };
-use dope_test::harness::server::Pair;
+use dope_test::{harness::server::Pair, reclaim::Reports};
 use sark_core::manifold::stream::Boundary;
-use sark_fiber::manifold::runtime::NativeFiber;
 use sark_grpc::{
-    Code, Status,
+    Code,
     metadata::Metadata,
     protocol::request::Fields,
     server::{
@@ -35,6 +31,7 @@ use sark_grpc::{
         mode::{Demand, StreamTag, UnaryTag},
     },
 };
+use sark_h2::conn::{DataOutcome, config};
 
 #[test]
 fn unary_yields_to_complete() {
@@ -43,12 +40,11 @@ fn unary_yields_to_complete() {
         .run(
             |source, listener| {
                 let facts = Facts::default();
-                let plan = Server::new(CONFIG, 1, State::default())
-                    .try_plan(listener.local_addr())
-                    .expect("H2 plan");
                 let limits = Limits::default().try_calls(1).expect("one call");
+                let plan = Settings::new(listener.local_addr(), limits)
+                    .h2::<KeyTag<0>>()
+                    .expect("H2 plan");
                 let bank = Bank::try_new(plan.connections().count(), limits).expect("gRPC bank");
-                let mut reports = server::Plan::try_reports(&plan).expect("driver claims");
                 let prepared = plan
                     .with_bound(listener)
                     .with_server(
@@ -56,11 +52,13 @@ fn unary_yields_to_complete() {
                         Plan::new(
                             recipe::Borrow,
                             &bank,
-                            Demand::<NativeFiber, UnaryTag>::try_new(1).expect("one unary task"),
+                            Demand::<UnaryTag>::try_new(1).expect("one unary task"),
                         ),
                     )
                     .for_install::<timing::Throughput>()
                     .expect("gRPC topology");
+                let mut reports =
+                    Reports::new(prepared.layout(), [<FrameworkTag<kind::Any> as Tag>::ROUTE]);
                 let mut finish = Completion::new();
                 prepared.enter_with(
                     source,
@@ -70,7 +68,7 @@ fn unary_yields_to_complete() {
                             .expect("unary installation")
                             .expect("unary execution");
                     },
-                    recovery::Policy::new(|event| reports.push(event), recover),
+                    recovery::Policy::new(|event| reports.push(event), common::recover),
                     |result| {
                         result
                             .as_ref()
@@ -85,30 +83,26 @@ fn unary_yields_to_complete() {
                 Ok::<(), Infallible>(())
             },
             |address| {
-                let (mut socket, mut client) =
-                    Peer::try_connect(address, Duration::from_secs(3)).expect("gRPC peer");
+                let mut peer =
+                    Peer::try_config(address, config::Config::default()).expect("gRPC peer");
                 let metadata = Metadata::new();
                 let fields = Fields::new(b"/test/Echo", Some(b"localhost"), &metadata)
                     .expect("gRPC request");
-                let stream = client
+                let stream = peer
+                    .client
                     .streams()
                     .headers()
                     .request(fields, Boundary::More)
                     .expect("request headers");
-                Sender::new(&mut client)
+                let sent = peer
+                    .client
+                    .streams()
                     .try_send(stream, &[0; 5], Boundary::End)
                     .expect("empty protobuf request");
-                Peer::new(&mut socket, &mut client)
-                    .try_flush()
-                    .expect("request flush");
-                let (trailers, body) = Peer::new(&mut socket, &mut client)
-                    .try_response(stream)
-                    .expect("unary response");
-                assert_eq!(body, [0; 5]);
-                assert_eq!(
-                    Status::from_fields(&trailers).expect("gRPC status").code(),
-                    Code::Ok
-                );
+                assert!(matches!(sent, DataOutcome::Sent(count) if count.get() == 5));
+                let replies = deadline::try_replies(&mut peer, &[stream]).expect("unary response");
+                assert_eq!(replies[0].body, [0; 5]);
+                assert_eq!(replies[0].code, Some(Code::Ok));
             },
         )
         .expect("unary runtime");
@@ -121,12 +115,11 @@ fn streaming_finishes() {
         .run(
             |source, listener| {
                 let facts = Facts::default();
-                let plan = Server::new(CONFIG, 1, State::default())
-                    .try_plan(listener.local_addr())
-                    .expect("H2 plan");
                 let limits = Limits::default().try_calls(1).expect("one call");
+                let plan = Settings::new(listener.local_addr(), limits)
+                    .h2::<KeyTag<0>>()
+                    .expect("H2 plan");
                 let bank = Bank::try_new(plan.connections().count(), limits).expect("gRPC bank");
-                let mut reports = server::Plan::try_reports(&plan).expect("driver claims");
                 let prepared = plan
                     .with_bound(listener)
                     .with_server(
@@ -134,11 +127,13 @@ fn streaming_finishes() {
                         Plan::new(
                             recipe::Borrow,
                             &bank,
-                            Demand::<NativeFiber, StreamTag>::try_new(1).expect("one stream task"),
+                            Demand::<StreamTag>::try_new(1).expect("one stream task"),
                         ),
                     )
                     .for_install::<timing::Throughput>()
                     .expect("gRPC topology");
+                let mut reports =
+                    Reports::new(prepared.layout(), [<FrameworkTag<kind::Any> as Tag>::ROUTE]);
                 let mut finish = Completion::new();
                 prepared.enter_with(
                     source,
@@ -148,7 +143,7 @@ fn streaming_finishes() {
                             .expect("stream installation")
                             .expect("stream execution");
                     },
-                    recovery::Policy::new(|event| reports.push(event), recover),
+                    recovery::Policy::new(|event| reports.push(event), common::recover),
                     |result| {
                         result
                             .as_ref()
@@ -164,30 +159,26 @@ fn streaming_finishes() {
                 Ok::<(), Infallible>(())
             },
             |address| {
-                let (mut socket, mut client) =
-                    Peer::try_connect(address, Duration::from_secs(3)).expect("gRPC peer");
+                let mut peer =
+                    Peer::try_config(address, config::Config::default()).expect("gRPC peer");
                 let metadata = Metadata::new();
                 let fields = Fields::new(b"/test/Echo", Some(b"localhost"), &metadata)
                     .expect("gRPC request");
-                let stream = client
+                let stream = peer
+                    .client
                     .streams()
                     .headers()
                     .request(fields, Boundary::More)
                     .expect("request headers");
-                Sender::new(&mut client)
+                let sent = peer
+                    .client
+                    .streams()
                     .try_send(stream, &[0; 5], Boundary::End)
                     .expect("empty protobuf request");
-                Peer::new(&mut socket, &mut client)
-                    .try_flush()
-                    .expect("request flush");
-                let (trailers, body) = Peer::new(&mut socket, &mut client)
-                    .try_response(stream)
-                    .expect("stream response");
-                assert_eq!(body, [0; 5]);
-                assert_eq!(
-                    Status::from_fields(&trailers).expect("gRPC status").code(),
-                    Code::Ok
-                );
+                assert!(matches!(sent, DataOutcome::Sent(count) if count.get() == 5));
+                let replies = deadline::try_replies(&mut peer, &[stream]).expect("stream response");
+                assert_eq!(replies[0].body, [0; 5]);
+                assert_eq!(replies[0].code, Some(Code::Ok));
             },
         )
         .expect("stream runtime");
@@ -195,24 +186,18 @@ fn streaming_finishes() {
 
 #[test]
 fn unary_expiry() {
-    use sark_http::field::{self, Value};
-
     Pair::bind()
         .expect("deadline listener")
         .run(
             |source, listener| {
                 let facts = DueFacts::default();
-                let plan = Server::new(CONFIG, 2, State::default())
-                    .try_plan(listener.local_addr())
+                let limits = Limits::default()
+                    .try_calls(1)
+                    .expect("one call per connection");
+                let plan = Settings::new(listener.local_addr(), limits)
+                    .h2::<KeyTag<0>>()
                     .expect("H2 plan");
-                let bank = Bank::try_new(
-                    plan.connections().count(),
-                    Limits::default()
-                        .try_calls(1)
-                        .expect("one call per connection"),
-                )
-                .expect("gRPC bank");
-                let mut reports = server::Plan::try_reports(&plan).expect("driver claims");
+                let bank = Bank::try_new(plan.connections().count(), limits).expect("gRPC bank");
                 let prepared = plan
                     .with_bound(listener)
                     .with_server(
@@ -220,11 +205,13 @@ fn unary_expiry() {
                         Plan::new(
                             recipe::Borrow,
                             &bank,
-                            Demand::<NativeFiber, UnaryTag>::try_new(2).expect("two tasks"),
+                            Demand::<UnaryTag>::try_new(2).expect("two tasks"),
                         ),
                     )
                     .for_install::<timing::Throughput>()
                     .expect("deadline topology");
+                let mut reports =
+                    Reports::new(prepared.layout(), [<FrameworkTag<kind::Any> as Tag>::ROUTE]);
                 let mut finish = Completion::new();
                 prepared.enter_with(
                     source,
@@ -234,7 +221,7 @@ fn unary_expiry() {
                             .expect("deadline installation")
                             .expect("deadline execution");
                     },
-                    recovery::Policy::new(|event| reports.push(event), recover),
+                    recovery::Policy::new(|event| reports.push(event), common::recover),
                     |result| {
                         result
                             .as_ref()
@@ -252,26 +239,27 @@ fn unary_expiry() {
                 Ok::<(), Infallible>(())
             },
             |address| {
-                let (mut timed_io, mut expired) =
-                    Peer::try_connect(address, Duration::from_secs(3)).expect("timed peer");
-                let (mut live_io, mut live) =
-                    Peer::try_connect(address, Duration::from_secs(3)).expect("untimed peer");
+                let mut expired =
+                    Peer::try_config(address, config::Config::default()).expect("timed peer");
+                let mut live =
+                    Peer::try_config(address, config::Config::default()).expect("untimed peer");
                 let metadata = Metadata::new();
-                let fields =
-                    Fields::new(b"/deadline/expired", None, &metadata).expect("timed fields");
-                let timed = DueFields {
-                    fields,
-                    timeout: field::literal!(Value::try_bytes(b"500m")),
-                };
+                let timed = deadline::try_fields(b"/deadline/expired", Some(b"500m"))
+                    .expect("timed fields");
                 let timed_id = expired
+                    .client
                     .streams()
                     .headers()
                     .request(&timed, Boundary::More)
                     .expect("timed request");
-                Sender::new(&mut expired)
+                let sent = expired
+                    .client
+                    .streams()
                     .try_send(timed_id, &[0; 5], Boundary::End)
                     .expect("timed unary message");
+                assert!(matches!(sent, DataOutcome::Sent(count) if count.get() == 5));
                 let live_id = live
+                    .client
                     .streams()
                     .headers()
                     .request(
@@ -279,35 +267,22 @@ fn unary_expiry() {
                         Boundary::More,
                     )
                     .expect("untimed request");
-                Sender::new(&mut live)
+                let sent = live
+                    .client
+                    .streams()
                     .try_send(live_id, &[0; 5], Boundary::End)
                     .expect("untimed unary message");
-                Peer::new(&mut timed_io, &mut expired)
-                    .try_flush()
-                    .expect("timed request flush");
-                Peer::new(&mut live_io, &mut live)
-                    .try_flush()
-                    .expect("untimed request flush");
-                let (trailers, body) = Peer::new(&mut timed_io, &mut expired)
-                    .try_response(timed_id)
-                    .expect("deadline response");
-                assert_eq!(
-                    Status::from_fields(&trailers)
-                        .expect("deadline status")
-                        .code(),
-                    Code::DeadlineExceeded
-                );
-                assert!(body.is_empty());
-                let (trailers, body) = Peer::new(&mut live_io, &mut live)
-                    .try_response(live_id)
-                    .expect("sibling response");
-                assert_eq!(
-                    Status::from_fields(&trailers)
-                        .expect("sibling status")
-                        .code(),
-                    Code::Ok
-                );
-                assert_eq!(body, [0; 5]);
+                assert!(matches!(sent, DataOutcome::Sent(count) if count.get() == 5));
+                expired.try_flush().expect("timed request flush");
+                live.try_flush().expect("untimed request flush");
+                let replies =
+                    deadline::try_replies(&mut expired, &[timed_id]).expect("deadline response");
+                assert_eq!(replies[0].code, Some(Code::DeadlineExceeded));
+                assert!(replies[0].body.is_empty());
+                let replies =
+                    deadline::try_replies(&mut live, &[live_id]).expect("sibling response");
+                assert_eq!(replies[0].code, Some(Code::Ok));
+                assert_eq!(replies[0].body, [0; 5]);
             },
         )
         .expect("isolated unary cancellation");

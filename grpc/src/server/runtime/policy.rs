@@ -1,6 +1,8 @@
 use dope::core::driver::{retained, schedule::app::Work};
 use o3::buffer::resident;
-use sark_core::manifold::{server::app, task::schedule::wake};
+use sark_core::manifold::server::app;
+
+use crate::server::runtime::schedule::wake;
 
 use crate::{
     Reason, message, metadata,

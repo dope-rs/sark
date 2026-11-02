@@ -13,5 +13,5 @@ pub mod server;
 pub fn recover(
     failure: dope::core::driver::life::recovery::Recovery<'_, '_>,
 ) -> std::convert::Infallible {
-    panic!("native recovery: {:?}", failure.cause())
+    failure.abort()
 }

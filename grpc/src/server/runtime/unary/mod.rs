@@ -1,11 +1,16 @@
 //! Unary tasks over one exact driver-domain scheduler.
-use std::marker;
-
-use dope::core::driver::{retained, schedule::app::Work};
-use manifold::task::schedule::{self, start};
+use dope::{
+    core::driver::{retained, route::KeyTag, schedule::app::Work},
+    manifold::network::listener::conn::Id,
+};
+use dope_fiber::task::storage::set::group;
 use o3::buffer::resident;
-use runtime::{Call, policy};
-use sark_core::{manifold, manifold::server::app};
+use runtime::{
+    Call, executor, policy,
+    schedule::{self, start},
+    state::active,
+};
+use sark_core::manifold::server::app;
 
 use crate::server::{
     call, runtime,
@@ -23,41 +28,32 @@ mod domain;
 /// Route domain for unary server tasks.
 pub use domain::Domain;
 
-type Target<'d, F, O, T> = marker::PhantomData<fn() -> *mut (F, O, T, &'d ())>;
-
 /// Fixed-capacity unary execution over one exact driver-domain scheduler.
-pub struct Policy<'life, 'd: 'life, H, S, F, O, T>
+pub struct Policy<'s, 'r, 'life, 'd: 'life, H>
 where
     H: Handler + 'life,
-    F: From<H::Task<'life, 'd>> + 'life,
-    S: schedule::raw::Scheduler<'d, Domain, O, T, F, modes::Response<H::Response>>,
-    O: Copy + Eq + 'd,
-    T: Copy,
 {
     user: &'life H,
     codec: H::Codec,
-    tasks: S,
-    target: Target<'d, F, O, T>,
+    tasks: executor::Scheduler<'s, 'd, Domain, H::Task<'life, 'd>, active::Entry<'r>>,
 }
 
-impl<'life, 'd: 'life, H, S, F, O, T> Policy<'life, 'd, H, S, F, O, T>
+impl<'s, 'r, 'life, 'd: 'life, H> Policy<'s, 'r, 'life, 'd, H>
 where
     H: Handler + 'life,
-    F: From<H::Task<'life, 'd>> + 'life,
-    S: schedule::raw::Scheduler<'d, Domain, O, T, F, modes::Response<H::Response>>,
-    O: Copy + Eq + 'd,
-    T: Copy,
 {
-    pub(in crate::server) fn new(user: &'life H, tasks: S) -> Self {
+    pub(in crate::server) fn new(
+        user: &'life H,
+        tasks: executor::Scheduler<'s, 'd, Domain, H::Task<'life, 'd>, active::Entry<'r>>,
+    ) -> Self {
         Self {
             user,
             codec: H::Codec::default(),
             tasks,
-            target: marker::PhantomData,
         }
     }
 
-    fn task_state(&self, owner: O) -> policy::TaskState {
+    fn task_state(&self, owner: Id<'d, KeyTag<0>>) -> policy::TaskState {
         if self.tasks.has_work_for(owner) {
             policy::TaskState::Ready
         } else {
@@ -66,27 +62,24 @@ where
     }
 }
 
-impl<'life, 'd: 'life, H, S, F, O, T> policy::Dispatch<'d, O> for Policy<'life, 'd, H, S, F, O, T>
+impl<'s, 'r, 'life, 'd: 'life, H> policy::Dispatch<'d, Id<'d, KeyTag<0>>>
+    for Policy<'s, 'r, 'life, 'd, H>
 where
     H: Handler + 'life,
-    F: From<H::Task<'life, 'd>> + 'life,
-    S: schedule::raw::Scheduler<'d, Domain, O, T, F, modes::Response<H::Response>>,
-    O: Copy + Eq + 'd,
-    T: Copy,
 {
     type Call = ();
     type Completion = modes::Response<H::Response>;
-    type State = Call<S::Pending>;
-    type Target = T;
+    type State = Call<group::Id<'s, 'd, Domain>>;
+    type Target = active::Entry<'r>;
     type Timer = timers::Off;
 
     const TASKS: bool = true;
 
     fn request<W: Write>(
         &mut self,
-        turn: &mut app::Turn<'_, '_, '_, '_, 'd, O>,
-        target: T,
-        state: &mut call::Handler<(), Call<S::Pending>>,
+        turn: &mut app::Turn<'_, '_, '_, '_, 'd, Id<'d, KeyTag<0>>>,
+        target: active::Entry<'r>,
+        state: &mut call::Handler<(), Self::State>,
         input: service::Request<'_, resident::Shared<'d>>,
         output: &mut service::Response<'_, W>,
     ) -> policy::RequestState {
@@ -107,7 +100,7 @@ where
             return policy::RequestState::Complete;
         };
         match self.tasks.start_with(
-            F::from(self.user.unary(driver.driver_ref().timer(), input)),
+            self.user.unary(driver.driver_ref().timer(), input),
             owner,
             target,
             schedule::Context {
@@ -132,17 +125,17 @@ where
         }
     }
 
-    fn has_tasks(&self, owner: O) -> bool {
+    fn has_tasks(&self, owner: Id<'d, KeyTag<0>>) -> bool {
         self.tasks.has_work_for(owner)
     }
 
-    fn has_done(&self, owner: O) -> bool {
+    fn has_done(&self, owner: Id<'d, KeyTag<0>>) -> bool {
         self.tasks.has_done(owner)
     }
 
     fn drive_tasks(
         &mut self,
-        owner: O,
+        owner: Id<'d, KeyTag<0>>,
         work: Work<'_, 'd>,
         driver: &mut retained::Context<'_, '_, 'd>,
     ) -> policy::TaskState {
@@ -150,20 +143,23 @@ where
         self.task_state(owner)
     }
 
-    fn wake_tasks(&mut self, owner: O) -> policy::TaskState {
+    fn wake_tasks(&mut self, owner: Id<'d, KeyTag<0>>) -> policy::TaskState {
         self.tasks.wake_next();
         self.task_state(owner)
     }
 
-    fn pop_done(&mut self, owner: O) -> Option<(T, Self::Completion)> {
+    fn pop_done(
+        &mut self,
+        owner: Id<'d, KeyTag<0>>,
+    ) -> Option<(active::Entry<'r>, Self::Completion)> {
         self.tasks.pop_done(owner)
     }
 
     fn publish<W: Write>(
         &mut self,
-        _: O,
-        _: T,
-        state: &mut call::Handler<(), Call<S::Pending>>,
+        _: Id<'d, KeyTag<0>>,
+        _: active::Entry<'r>,
+        state: &mut call::Handler<(), Self::State>,
         done: Self::Completion,
         output: &mut service::Response<'_, W>,
     ) -> handler::RequestState {
@@ -176,7 +172,12 @@ where
         handler::RequestState::Complete
     }
 
-    fn cancel(&mut self, _: O, _: T, state: &mut call::Handler<(), Call<S::Pending>>) {
+    fn cancel(
+        &mut self,
+        _: Id<'d, KeyTag<0>>,
+        _: active::Entry<'r>,
+        state: &mut call::Handler<(), Self::State>,
+    ) {
         state.split().1.cancel(|task| self.tasks.cancel(task))
     }
 }

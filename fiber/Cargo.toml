@@ -13,7 +13,6 @@ license.workspace = true
 sark-client.workspace = true
 sark-core.workspace = true
 sark-gen.workspace = true
-sark-grpc.workspace = true
 sark-h1.workspace = true
 sark-http.workspace = true
 dope.workspace = true

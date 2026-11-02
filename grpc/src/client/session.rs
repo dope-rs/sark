@@ -10,7 +10,7 @@ use o3::{
     alloc,
     buffer::{pool, resident, storage},
 };
-use receive::policies::{Notify, Policy as _};
+use receive::policies::Notify;
 use sark_core::{
     life::session::Storage,
     manifold::client::{
@@ -141,13 +141,7 @@ where
                 },
             }
         }
-        let egress = io::release(before, self.state.connection.outbound_len());
-        self.state
-            .calls
-            .drive(&mut self.state.connection, egress, &mut |record| {
-                let _ = done.cancel(&mut self.state.ingress, record.response);
-            })
-            .map_err(Failure::Drive)?;
+        self.state.drive(before, done).map_err(Failure::Drive)?;
         Ok(Flush::Written)
     }
 

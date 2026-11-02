@@ -1,6 +1,5 @@
 use std::{
-    io,
-    io::{Read, Write},
+    io::{self, Read},
     net::{SocketAddr, TcpStream},
     time::Duration,
 };
@@ -19,6 +18,7 @@ use crate::common::{
     codec::{Bytes, Parse},
     grpc::{
         call::egress::capacity,
+        session::fairness::Client as _,
         wire::{Failure, Peer},
     },
 };
@@ -123,10 +123,7 @@ impl Reply {
         window: Option<u8>,
     ) -> Result<Self, Error> {
         if let Some(window) = window {
-            socket
-                .write_all(client.output().first())
-                .map_err(Error::Io)?;
-            client.transfer().drain(usize::MAX);
+            client.try_flush(socket).map_err(Error::Io)?;
             capacity::try_window(socket, window).map_err(Error::Window)?;
         }
         let stream = client
@@ -141,10 +138,7 @@ impl Reply {
             .control()
             .ping(*b"reserved")
             .map_err(Error::Protocol)?;
-        socket
-            .write_all(client.output().first())
-            .map_err(Error::Io)?;
-        client.transfer().drain(usize::MAX);
+        client.try_flush(socket).map_err(Error::Io)?;
 
         let mut wire = Vec::new();
         let mut heads = Vec::new();
@@ -234,10 +228,7 @@ impl Reply {
                         });
                     }
                 }
-                socket
-                    .write_all(client.output().first())
-                    .map_err(Error::Io)?;
-                client.transfer().drain(usize::MAX);
+                client.try_flush(socket).map_err(Error::Io)?;
                 sent = true;
             }
         }

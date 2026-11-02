@@ -79,13 +79,7 @@ pub fn execute<H: Handler<Timer = timers::Off>>(handler: H, cases: &[(&[u8], Cod
                     .expect("application readiness");
                 let owner = retained::raw::Owner::from_driver(driver);
                 let mut context = retained::Context::new(context, owner);
-                let mut application =
-                    <mode::Direct as mode::Build<'_, '_, H, Server<'_>, ()>>::build(
-                        mode::Direct,
-                        handler,
-                        &bank,
-                    )
-                    .expect("direct application");
+                let mut application = mode::Direct.build(handler, &bank);
                 for &(path, expected) in cases {
                     let mut server = Server::from_plan(plan).expect("server");
                     server.ingress().try_bind(budget).expect("bind input owner");

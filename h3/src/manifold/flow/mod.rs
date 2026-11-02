@@ -4,7 +4,7 @@ mod egress;
 mod ingress;
 pub(in crate::manifold) mod report;
 
-use std::{num::NonZero, ops::ControlFlow};
+use std::num::NonZero;
 
 use conn::{
     scope,
@@ -74,64 +74,38 @@ impl<'d, 'a, 'scope, const ID: u8, B: stream::Recv, const RECONCILE: bool>
         O: life::Mode<C, Id>,
         B: stream::Retain<'d>,
     {
-        let mut done = false;
-        for _ in 0..link::WRITE_QUANTUM {
-            let feedback = h3.session.qpack_decoder;
-            let Some(taken) = h3.queues.take(&mut h3.qpack.feedback, feedback) else {
-                return Self::finish::<P>(h3, Flush::Drained, done);
+        let (flush, done) = link::pump(h3, |write, prepared| -> Result<_, manifold::Error> {
+            let charge = if O::ENABLED {
+                write.retained()
+            } else {
+                Default::default()
             };
-            let sent = taken.with(|write, prepared| -> Result<_, manifold::Error> {
-                let charge = if O::ENABLED {
-                    write.retained()
-                } else {
-                    Default::default()
-                };
-                let commit = commit::Commit::new(prepared, &mut *life, handle, charge);
-                match self.send(write, commit) {
-                    admit::Outcome::Retained(done) | admit::Outcome::Discarded(done) => {
-                        Ok(ControlFlow::Continue(done))
-                    }
-                    admit::Outcome::Blocked { owner, commit } => {
-                        commit.restore(owner);
-                        Ok(ControlFlow::Break(()))
-                    }
-                    admit::Outcome::Failed {
-                        owner,
-                        commit,
-                        error,
-                    } => {
-                        commit.restore(owner);
-                        Err(error.into())
-                    }
+            let commit = commit::Commit::new(prepared, &mut *life, handle, charge);
+            match self.send(write, commit) {
+                admit::Outcome::Retained(done) | admit::Outcome::Discarded(done) => Ok(Some(done)),
+                admit::Outcome::Blocked { owner, commit } => {
+                    commit.restore(owner);
+                    Ok(None)
                 }
-            })??;
-            let complete = match sent {
-                ControlFlow::Continue(done) => done,
-                ControlFlow::Break(()) => return Self::finish::<P>(h3, Flush::Blocked, done),
-            };
-            match complete {
-                write::Completion::Queued => done = true,
-                write::Completion::Feedback => h3.events().resume()?,
+                admit::Outcome::Failed {
+                    owner,
+                    commit,
+                    error,
+                } => {
+                    commit.restore(owner);
+                    Err(error.into())
+                }
             }
+        })?;
+        if flush != Flush::Blocked
+            || !crate::conn::io::ingress::schedule::Status::new(h3).cancelled(None)
+        {
+            let gate = match flush {
+                Flush::Blocked => Gate::Held,
+                Flush::Drained | Flush::Pending => Gate::Open,
+            };
+            h3.session.set_gate(gate)?;
         }
-        let flush = if h3.queues.has_write(&h3.qpack.feedback) {
-            Flush::Pending
-        } else {
-            Flush::Drained
-        };
-        Self::finish::<P>(h3, flush, done)
-    }
-
-    fn finish<P: rules::Policy>(
-        h3: &mut crate::conn::Connection<'d, P>,
-        flush: Flush,
-        done: bool,
-    ) -> Result<report::Report, manifold::Error> {
-        let gate = match flush {
-            Flush::Blocked => Gate::Held,
-            Flush::Drained | Flush::Pending => Gate::Open,
-        };
-        h3.session.set_gate(gate)?;
         Ok(report::Report::new(flush, done))
     }
 

@@ -125,6 +125,16 @@ where
                     CancelAction::StopSending => {
                         stop_stream(&mut conn, stream, frame::ErrorCode::RequestCancelled)
                     }
+                    CancelAction::Qpack => {
+                        let mut wire = vec![frame::STREAM_TYPE_QPACK_DECODER.get() as u8];
+                        sark_h3::qpack::stream::Instruction::StreamCancellation {
+                            stream_id: stream.get(),
+                        }
+                        .encode(&mut wire);
+                        let mut streams = conn.streams();
+                        let decoder = streams.send().open_uni()?;
+                        streams.send().send(decoder, &wire)
+                    }
                     CancelAction::KeyClose => {
                         conn.lifecycle()
                             .close(Code::ZERO, b"public H3 cancellation proof".to_vec());

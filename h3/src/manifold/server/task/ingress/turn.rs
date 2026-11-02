@@ -101,6 +101,10 @@ pub(in crate::manifold::server) fn drive<
             return;
         }
     }
+    if schedule::Status::new(ready.state.h3.h3()).cancelled(None) {
+        Item::new(ready.state, router.as_mut(), life, conn, handle, now).step();
+        return;
+    }
     match ready.state.egress_work() {
         Some(Work::Flush) => {
             if let Err(error) = ready.state.flush_h3(life, conn, handle) {

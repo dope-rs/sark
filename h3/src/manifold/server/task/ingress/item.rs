@@ -159,7 +159,12 @@ where
         if self.conn.view().lifecycle().is_closing() {
             return;
         }
-        let step = match self.state.h3.ingress().poll(self.conn) {
+        let step = match self
+            .state
+            .h3
+            .ingress()
+            .poll(self.conn, self.life, self.handle)
+        {
             Ok(step) => step,
             Err(error) => {
                 self.life.diagnostic(&error);
@@ -284,6 +289,7 @@ where
                 event::Event::PushData { .. }
                 | event::Event::PushPromise { .. }
                 | event::Event::PushHeaders { .. } => frame::ErrorCode::FrameUnexpected,
+                event::Event::QpackCancelled { .. } => unreachable!("cancel"),
                 event::Event::Settings(_) | event::Event::GoAway { .. } => return,
             }
         };

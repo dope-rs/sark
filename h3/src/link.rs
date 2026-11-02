@@ -15,7 +15,7 @@ use crate::conn::{
 
 const RECEIVE_QUANTUM: usize = 32;
 const CREDIT_QUANTUM: usize = 32;
-pub(crate) const WRITE_QUANTUM: u8 = 32;
+const WRITE_QUANTUM: u8 = 32;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum Flush {
@@ -100,6 +100,44 @@ pub enum Outcome<'id, 'd> {
     Blocked(Write<'id, 'd>),
 }
 
+/// Drains one bounded turn while preserving each admitted write's exact brand.
+pub(crate) fn pump<'d, P: rules::Policy, A: rules::Push, E: From<conn::Error>>(
+    conn: &mut conn::Connection<'d, P, A>,
+    mut send: impl for<'id, 'q> FnMut(
+        write::Flight<'id, 'd>,
+        write::Prepared<'id, 'q, 'd>,
+    ) -> Result<Option<write::Completion>, E>,
+) -> Result<(Flush, bool), E> {
+    if io::ingress::schedule::Status::new(conn).cancelled(None) {
+        return Ok((Flush::Blocked, false));
+    }
+    let mut released = false;
+    for _ in 0..WRITE_QUANTUM {
+        let feedback = conn.session.qpack_decoder;
+        let Some(taken) = conn.queues.take(&mut conn.qpack.feedback, feedback) else {
+            return Ok((Flush::Drained, released));
+        };
+        let Some(done) = taken.with(&mut send)?? else {
+            return Ok((Flush::Blocked, released));
+        };
+        match done {
+            write::Completion::Queued => released = true,
+            write::Completion::Feedback => {
+                conn.events().resume()?;
+                if io::ingress::schedule::Status::new(conn).cancelled(None) {
+                    return Ok((Flush::Blocked, released));
+                }
+            }
+        }
+    }
+    let flush = if conn.queues.has_write(&conn.qpack.feedback) {
+        Flush::Pending
+    } else {
+        Flush::Drained
+    };
+    Ok((flush, released))
+}
+
 pub trait Transport<'d> {
     /// Attempts one indivisible owner handoff.
     fn send_write<'id>(&mut self, write: Write<'id, 'd>) -> Outcome<'id, 'd>;
@@ -108,30 +146,16 @@ pub trait Transport<'d> {
         &mut self,
         conn: &mut conn::Connection<'d, P, A>,
     ) -> Result<Flush, conn::Error> {
-        for _ in 0..WRITE_QUANTUM {
-            let feedback = conn.session.qpack_decoder;
-            let Some(taken) = conn.queues.take(&mut conn.qpack.feedback, feedback) else {
-                return Ok(Flush::Drained);
-            };
-            let done = taken.with(|write, prepared| match self.send_write(Write::new(write)) {
+        pump(conn, |write, prepared| {
+            Ok(match self.send_write(Write::new(write)) {
                 Outcome::Accepted => Some(prepared.commit()),
                 Outcome::Blocked(owner) => {
                     prepared.restore(owner.into_flight());
                     None
                 }
-            })?;
-            let Some(done) = done else {
-                return Ok(Flush::Blocked);
-            };
-            if done.is_feedback() {
-                conn.events().resume()?;
-            }
-        }
-        Ok(if conn.queues.has_write(&conn.qpack.feedback) {
-            Flush::Pending
-        } else {
-            Flush::Drained
+            })
         })
+        .map(|(flush, _)| flush)
     }
 }
 

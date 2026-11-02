@@ -17,8 +17,6 @@ pub struct BlockData {
     pub accepted: Vec<Id>,
 }
 
-pub struct AcceptAll;
-
 impl<'d> Transport<'d> for BlockOnce {
     fn send_write<'id>(&mut self, write: link::Write<'id, 'd>) -> Outcome<'id, 'd> {
         let pointer = write.payload().map_or(ptr::null(), first_segment_ptr);
@@ -42,13 +40,6 @@ impl<'d> Transport<'d> for BlockData {
             self.accepted.push(write.stream_id());
             Outcome::Accepted
         }
-    }
-}
-
-impl<'d> Transport<'d> for AcceptAll {
-    fn send_write<'id>(&mut self, write: link::Write<'id, 'd>) -> Outcome<'id, 'd> {
-        drop(write);
-        Outcome::Accepted
     }
 }
 

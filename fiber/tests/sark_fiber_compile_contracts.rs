@@ -551,7 +551,6 @@ fn dependent_state() -> Result<(), Error> {
             "sark-client",
             "sark-core",
             "sark-fiber",
-            "sark-grpc",
             "sark-h1",
             "sark-h2",
             "sark-h3",

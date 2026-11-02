@@ -34,13 +34,7 @@ impl Handler for Join {
         } else {
             let mut messages = request.messages.into_iter();
             for message in messages.by_ref() {
-                match message {
-                    Ok(message) => append(message, &mut payload),
-                    Err(status) => {
-                        response.finish_with(status);
-                        return RequestState::Complete;
-                    }
-                }
+                append(message, &mut payload);
             }
             assert_eq!(
                 (messages.size_hint(), messages.next().is_none()),

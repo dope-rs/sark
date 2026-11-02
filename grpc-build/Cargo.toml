@@ -19,7 +19,7 @@ syn = { version = "3.0.3", features = ["full"] }
 [dev-dependencies]
 dope.workspace = true
 dope-test.workspace = true
-prost.workspace = true
+prost = { workspace = true, features = ["derive"] }
 sark-core.workspace = true
 sark-gen.workspace = true
 sark-grpc.workspace = true

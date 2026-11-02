@@ -78,7 +78,7 @@ impl<'d> duplex::Session<'d> for Ending<'_> {
     }
 
     fn activate(&mut self) -> duplex::Action<'d> {
-        duplex::Action::idle()
+        duplex::Action::idle().activate()
     }
 
     fn finish(&mut self) -> duplex::Action<'d> {
@@ -99,7 +99,7 @@ impl<'d> duplex::Session<'d> for Session<'_> {
     }
     fn activate(&mut self) -> duplex::Action<'d> {
         self.0.push(Event::Activate);
-        duplex::Action::idle()
+        duplex::Action::idle().activate()
     }
     fn finish(&mut self) -> duplex::Action<'d> {
         self.0.push(Event::Finished);

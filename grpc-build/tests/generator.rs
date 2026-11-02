@@ -1,18 +1,14 @@
 pub mod common;
 
 use common::service;
-use prost_build::ServiceGenerator;
 use quote::ToTokens;
-use sark_grpc_build::Routes;
 
 #[test]
 fn preserves_type_scope() {
     let source = "__SarkGrpcProofMethod0Input";
     let mut schema = service::streaming();
     schema.methods[0].input_type = source.into();
-    let mut code = String::new();
-    Routes.generate(schema, &mut code);
-    let file = syn::parse_file(&code).expect("generated service");
+    let file = service::generate([schema]).expect("generated service");
     let alias = file
         .items
         .iter()
@@ -28,9 +24,7 @@ fn preserves_type_scope() {
 
 #[test]
 fn rejects_duplicate_paths() {
-    let mut code = String::new();
-    Routes.generate(service::duplicate_paths(), &mut code);
-    let file = (syn::parse_file(&code)).expect("duplicate routes must emit a Rust diagnostic");
+    let file = service::generate([service::duplicate_paths()]).expect("generated diagnostic");
     let [syn::Item::Macro(error)] = file.items.as_slice() else {
         panic!("expected a single diagnostic");
     };
@@ -52,9 +46,7 @@ fn rejects_duplicate_paths() {
 
 #[test]
 fn rejects_factory_name() {
-    let mut code = String::new();
-    Routes.generate(service::empty("1Proof"), &mut code);
-    let file = syn::parse_file(&code).expect("generated diagnostic");
+    let file = service::generate([service::empty("1Proof")]).expect("generated diagnostic");
     assert!(matches!(file.items.as_slice(), [syn::Item::Macro(error)]
         if error.mac.path.segments.last().is_some_and(|segment| segment.ident == "compile_error")));
 }
@@ -68,8 +60,9 @@ fn runs_generated_services() -> Result<(), dope_test::checks::Error> {
         harness::support::file::Directory,
     };
 
-    let routes = service::generate(service::routes());
-    let messages = service::generate(service::messages());
+    let routes = service::generate(service::routes()).expect("generated routes");
+    let messages = service::generate(service::messages()).expect("generated messages");
+    let collisions = service::collisions().expect("generated colliding service");
     let bindings = syn::parse_file(include_str!("common/bindings.rs")).expect("service fixtures");
     let schema = syn::parse_file(include_str!("common/schema.rs")).expect("message fixtures");
     let source = quote::quote! {
@@ -82,6 +75,7 @@ fn runs_generated_services() -> Result<(), dope_test::checks::Error> {
         }
         pub mod bindings {
             #routes
+            #collisions
             #bindings
         }
 
@@ -121,6 +115,11 @@ fn runs_generated_services() -> Result<(), dope_test::checks::Error> {
             assert_eq!(paths.get_mut().as_slice(), &[b"/sark.test._123/_4".to_vec()]);
             execute(empty_routes(Empty), &[
                 (b"/sark.test.Empty/Missing", Code::Unimplemented),
+            ]);
+            let routes: CollisionRoutes__<Empty> = collision_routes(Empty);
+            execute(routes, &[
+                (b"/sark.Test.Collision/Echo", Code::Ok),
+                (b"/sark.test.Collision/Echo", Code::Unimplemented),
             ]);
         }
     };

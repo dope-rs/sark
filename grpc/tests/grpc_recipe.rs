@@ -72,20 +72,7 @@ fn reserves_once() {
         Limits::default().try_calls(1).expect("one call"),
     )
     .expect("one readiness resident");
-    let app = <mode::Direct as mode::Build<
-        '_,
-        '_,
-        Borrowed<'_>,
-        machine::Connection<
-            ServerRole,
-            section::Plan,
-            resident::Shared<'_>,
-            rules::RejectPush,
-            event::Ignore,
-        >,
-        (),
-    >>::build(mode::Direct, Borrowed(&calls), &bank)
-    .expect("direct application");
+    let app = mode::Direct.build(Borrowed(&calls), &bank);
     check_reservations(app);
 }
 

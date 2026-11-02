@@ -19,7 +19,6 @@ pub struct Adjust {
 #[derive(Copy, Clone, PartialEq, Eq, Debug)]
 pub enum Receive {
     Stalled { available: i32, amount: u32 },
-    Pending { pending: u32, amount: u32 },
     Refill { spent: i32, held: u32 },
 }
 

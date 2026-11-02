@@ -1,8 +1,6 @@
 use core::num::NonZero;
 
-use sark_core::manifold::task::schedule;
-
-use crate::server::mode::Limit;
+use crate::server::{mode::Limit, runtime::schedule};
 
 /// Failure to construct a bounded server mode.
 

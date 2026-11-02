@@ -1,7 +1,8 @@
 use sark_core::{
     life::session,
     manifold::{
-        client::{Connection, domain::Plan, event::Reset},
+        client::{Connection, domain::Plan, event::Reset, io::Write as _},
+        schedule,
         stream::Boundary,
     },
 };
@@ -171,6 +172,22 @@ where
             self.ingress.cancel_feed(key);
         }
         self.refill(policy);
+    }
+
+    pub(super) fn drive<R: policies::Policy<P, C>>(
+        &mut self,
+        before: usize,
+        policy: &mut R,
+    ) -> Result<schedule::Report, crate::Status> {
+        let egress = if self.connection.outbound_len() < before {
+            schedule::Egress::Released
+        } else {
+            schedule::Egress::Unchanged
+        };
+        self.calls
+            .drive(&mut self.connection, egress, &mut |record| {
+                let _ = policy.cancel(&mut self.ingress, record.response);
+            })
     }
 
     pub(super) fn refill<R: policies::Policy<P, C>>(&mut self, policy: &mut R) {
