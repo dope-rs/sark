@@ -138,7 +138,7 @@ fn accept_failure_finishes_generated_server() {
             stop.fire().expect("external shutdown after failure");
         })
         .expect("server worker");
-        served.expect("server joined").expect("server preparation");
+        served.expect("server preparation");
         drop(guard);
     })
     .expect("terminal server deadline");

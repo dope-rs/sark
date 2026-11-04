@@ -155,6 +155,7 @@ impl<'a> Scenario<'a> {
         let endpoint = Config {
             max_conns: 1,
             cid_rotation: cid::Rotation::disabled(),
+            opening_lifetime: None,
             outgoing_capacity: slots,
             outgoing_bytes_capacity: slots
                 .checked_mul(4096)

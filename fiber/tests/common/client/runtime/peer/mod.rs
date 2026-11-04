@@ -144,9 +144,7 @@ impl Socket for &net::TcpStream {
 
 fn next(input: &mut input::Input, mut stream: &Stream<'_>) -> Result<Option<input::Frame>, Error> {
     match input.next(&mut stream) {
-        Err(Error::Io(peer::Error::Cancelled)) if stream.is_stopped() && input.is_empty() => {
-            Ok(None)
-        }
+        Err(Error::Io(peer::Error::Cancelled)) if input.is_empty() => Ok(None),
         result => result,
     }
 }

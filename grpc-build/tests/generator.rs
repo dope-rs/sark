@@ -156,6 +156,7 @@ fn runs_generated_services() -> Result<(), dope_test::checks::Error> {
         compiler.args(["-Clto=fat", "-Copt-level=3", "-Ccodegen-units=1"]);
     }
     compiler
+        .arg(format!("-Cmetadata={}", binary.display()))
         .arg("-Dunused_variables")
         .arg(format!("--emit=link={}", binary.display()));
     let compiled = compile(&mut compiler, &source.to_string());

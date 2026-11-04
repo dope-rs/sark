@@ -251,7 +251,7 @@ fn dispatch_survives_cancel() {
         .expect("client shutdown")
         })
         .expect("peer worker");
-    assert_eq!(wire.expect("peer join"), path);
+    assert_eq!(wire, path);
 }
 
 #[test]

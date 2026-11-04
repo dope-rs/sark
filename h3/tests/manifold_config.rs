@@ -8,10 +8,6 @@ fn rejects_fixed_layout() {
     let Ok(overflow) = usize::try_from(u64::from(u32::MAX) + 1) else {
         return;
     };
-    let config = server::Config {
-        max_connection_body_chunks: overflow,
-        ..server::Config::default()
-    };
     let result = startup::Plan::<0>::try_new(
         "127.0.0.1:0".parse().expect("loopback bind address"),
         config::raw::Identity::from_seed(&[0x6a; 32])
@@ -26,8 +22,12 @@ fn rejects_fixed_layout() {
             packet_buffer_slots: 1,
             packet_buffer_bytes: 1200,
             cid_rotation: cid::Rotation::disabled(),
+            opening_lifetime: None,
         },
-        config,
+        server::Config {
+            max_connection_body_chunks: overflow,
+            ..server::Config::default()
+        },
     );
 
     assert!(
