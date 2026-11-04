@@ -1,7 +1,10 @@
 pub mod common;
 
-use common::members::{Envelope, Generic, Item, Offer, Price, Rating};
+use common::members::{
+    Envelope, Generic, ITEM_VIEW, Item, ItemView, OWNED_ITEM, Offer, OwnedItem, Price, Rating,
+};
 use dope_test::alloc::Tracker;
+use sark_json::parsing::Decode as _;
 use sark_json::writing::{Members as _, TryEncode as _, TrySize as _, Writer};
 
 #[global_allocator]
@@ -54,6 +57,20 @@ fn writes_borrowed_buffer() {
     assert_eq!(&wire[..3], b"pre");
     assert_eq!(&wire[3..], expected);
     assert!(std::ptr::eq(item.name.as_ptr(), name.as_ptr()));
+}
+
+#[test]
+fn flattens_borrowed_decodable_object() {
+    let item = OwnedItem::decode_ref(OWNED_ITEM).expect("item");
+    let value = ItemView {
+        item: &item,
+        total: 12,
+    };
+    assert_eq!(value.try_size().expect("size"), ITEM_VIEW.len());
+    let mut wire = Vec::with_capacity(ITEM_VIEW.len());
+    let (_, usage) = Tracker::usage(|| value.try_append(&mut wire).expect("encode"));
+    assert_eq!(wire, ITEM_VIEW);
+    assert_eq!(usage, (0, 0));
 }
 
 #[test]

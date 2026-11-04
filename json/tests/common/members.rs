@@ -65,3 +65,20 @@ pub struct Generic<const r#__FIRST: usize, const __W: usize = 0, const __SIZE: u
     pub price: Price,
     pub token: sark_json::Token<r#__FIRST>,
 }
+
+#[sark_json::json]
+pub struct OwnedItem {
+    pub name: o3::buffer::storage::Shared,
+    #[field(seq)]
+    pub tags: Vec<o3::buffer::storage::Shared>,
+}
+
+#[sark_json::json(encode)]
+pub struct ItemView<'a> {
+    #[field(flatten)]
+    pub item: &'a OwnedItem,
+    pub total: u64,
+}
+
+pub const OWNED_ITEM: &[u8] = br#"{"name":"A\"B","tags":["x","y"]}"#;
+pub const ITEM_VIEW: &[u8] = br#"{"name":"A\"B","tags":["x","y"],"total":12}"#;

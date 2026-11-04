@@ -144,12 +144,12 @@ pub(super) fn build(
         }
     }
 
+    let members = if matches!(mode.purpose, mode::Purpose::TryEncode) {
+        TokenStream::new()
+    } else {
+        plan.members(paths, &st)?
+    };
     if !matches!(mode.purpose, mode::Purpose::Decode) {
-        let members = if matches!(mode.purpose, mode::Purpose::Encode) {
-            plan.members(paths, &st)?
-        } else {
-            TokenStream::new()
-        };
         st.attrs.retain(|attr| !attr.path().is_ident("json"));
         return scope(
             &st,
@@ -341,6 +341,7 @@ pub(super) fn build(
             #stream
 
             #encoder
+            #members
         },
     )
 }

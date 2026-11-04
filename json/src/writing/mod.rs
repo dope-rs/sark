@@ -255,8 +255,8 @@ pub enum EncodeError {
 }
 
 /// One nonempty sequence of object members, without enclosing braces.
-/// Generated encoding-only objects implement this contract. `FIRST` omits the
-/// leading comma; the size always excludes that comma and both braces.
+/// Nonempty generated objects using decoding or `encode` implement this contract.
+/// `FIRST` omits the leading comma; the size always excludes that comma and both braces.
 pub trait Members {
     fn try_fields(&self) -> Result<usize, Overflow>;
 
@@ -264,6 +264,19 @@ pub trait Members {
         &self,
         writer: Writer<'a, W>,
     ) -> ControlFlow<Failure<'a, W>, Writer<'a, W>>;
+}
+
+impl<T: Members + ?Sized> Members for &T {
+    fn try_fields(&self) -> Result<usize, Overflow> {
+        T::try_fields(*self)
+    }
+
+    fn try_members<'a, W: write::Sink, const FIRST: bool>(
+        &self,
+        writer: Writer<'a, W>,
+    ) -> ControlFlow<Failure<'a, W>, Writer<'a, W>> {
+        T::try_members::<W, FIRST>(*self, writer)
+    }
 }
 
 impl Size for u64 {
