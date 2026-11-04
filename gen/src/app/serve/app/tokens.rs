@@ -92,7 +92,6 @@ pub(super) struct Prelude<'a> {
 
 pub(super) struct Names<'a> {
     pub generics: &'a crate::types::Generics,
-    pub constructor_identity: &'a syn::Ident,
     pub core: &'a syn::Ident,
     pub name: &'a syn::Ident,
     pub public_name: &'a syn::Ident,
@@ -158,7 +157,6 @@ pub(super) fn build<'a>(
     } = prelude;
     let Names {
         generics: _,
-        constructor_identity: id,
         core,
         name,
         public_name: api,
@@ -198,10 +196,6 @@ pub(super) fn build<'a>(
             #tags
             #done
             #factory
-
-            struct #id<#g_id: #ns_fiber::Identity>(
-                ::core::marker::PhantomData<fn() -> #g_id>,
-            );
 
             #[#ns_fiber::pin_project::pin_project(!Unpin)]
             struct #core #app
@@ -282,7 +276,7 @@ pub(super) fn build<'a>(
                         #claim
                         #v_state,
                         ::core::marker::PhantomData::<(
-                            #id<#g_id>,
+                            fn() -> #g_id,
                             #g_wire,
                             #ns_fiber::manifold::runtime::Multi<#g_target>,
                         )>,
@@ -311,7 +305,7 @@ pub(super) fn build<'a>(
                 >(
                     #brand
                     #v_state: &#l_env #state,
-                    #v_types: ::core::marker::PhantomData<(#id<#g_id>, #g_wire, #g_store)>,
+                    #v_types: ::core::marker::PhantomData<(fn() -> #g_id, #g_wire, #g_store)>,
                     #v_config: #ns_fiber::Config,
                     #v_life: #g_mode,
                     #v_stamp: #g_stamp,

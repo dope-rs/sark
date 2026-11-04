@@ -11,7 +11,7 @@ use dope::{
             life::recovery,
             route::{FrameworkTag, Tag, kind},
         },
-        io::socket::{Backlog, Listener},
+        io::socket::Backlog,
     },
     manifold::app::env::quota,
     runtime::{executor::session::Completion, topology::ops::Run},
@@ -26,7 +26,7 @@ use sark_ws::{
     server::{Config, Error, Message, Response, app::Sink},
 };
 
-use crate::common::server::{self, Build, Prepared};
+use crate::common::server::{self, Build};
 
 pub struct Echo<'a> {
     pub calls: &'a Cell<usize>,
@@ -36,10 +36,6 @@ pub struct Echo<'a> {
 }
 
 impl<'a> Echo<'a> {
-    pub fn try_serve(self, bound: Listener) -> Result<Prepared<Self>, Build> {
-        server::try_new(Self::config(bound.local_addr()), self, bound)
-    }
-
     pub fn config(bind: SocketAddr) -> Config {
         Config {
             bind,

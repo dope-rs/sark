@@ -185,11 +185,11 @@ fn run<'a, const PREFIX: bool>(
         match byte {
             b' ' if PREFIX => return Ok(Stage::Found(state.finish(at))),
             b'?' if matches!(context, Context::Path) => {
-                let next = at + 1;
-                state = state.with_query(at, next);
+                state.at = at + 1;
+                state.query = At::Query(at);
             }
             b'%' => match escape(source, at) {
-                Ok(next) => state = state.with_at(next),
+                Ok(next) => state.at = next,
                 Err(Error::Escape { first, second, .. })
                     if PREFIX
                         && second.is_none()
@@ -257,16 +257,6 @@ impl Cursor {
             At::Path => Context::Path,
             At::Query(_) => Context::Query,
         }
-    }
-
-    fn with_at(self, at: usize) -> Self {
-        Self { at, ..self }
-    }
-
-    fn with_query(mut self, query: usize, next: usize) -> Self {
-        self.at = next;
-        self.query = At::Query(query);
-        self
     }
 
     fn finish(self, end: usize) -> Plan {

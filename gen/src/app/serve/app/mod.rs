@@ -76,7 +76,6 @@ pub(super) fn build<'source, 'spec>(
             .to_string()
             .to_lowercase()
     );
-    let ctor_id = format_ident!("{}Identity", ctor);
     let app_def = &shape.generic_def;
     let app_use = &shape.generic_use;
     let output = quote! { #name #app_use };
@@ -256,7 +255,6 @@ pub(super) fn build<'source, 'spec>(
     let bounds = &shape.base_bounds;
     let names = tokens::Names {
         generics,
-        constructor_identity: &ctor_id,
         core: &core_id,
         name: &name,
         public_name: api,

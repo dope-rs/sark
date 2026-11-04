@@ -4,7 +4,6 @@ pub(super) mod schedule;
 
 use std::pin;
 
-use app::step;
 use dope::{
     core::driver::{
         retained,
@@ -117,34 +116,31 @@ where
         if matches!(self.ready.build, Availability::Idle) {
             return Admission::Empty;
         }
-        let book = &mut self.state;
-        let gate = step::Checkpoint::new(
-            || {
-                let built = book
-                    .data()
-                    .build()
-                    .drive(body::DEFAULT_BUILD_STEP_BUDGET, |stream| {
-                        self.mode.body(identify(self.scope.conn, stream))
-                    });
-                drive::Drive {
-                    router: self.scope.router.as_mut(),
-                    tasks: self.scope.tasks,
-                    conn: self.scope.conn,
-                    parent: self.scope.parent,
-                    index: self.scope.index,
-                    state: book,
-                    limits: self.limits,
-                    mode: self.mode,
-                }
-                .build(built);
-                Ok(Outcome::Wake)
-            },
-            || self.scope.parent.wake(),
-        );
-        match step::Step::new(self.work).batch(gate) {
-            Some(result) => Admission::Item(result),
-            None => Admission::Exhausted,
-        }
+        let Some(permit) = self.work.permit() else {
+            self.scope.parent.wake();
+            return Admission::Exhausted;
+        };
+        Admission::Item(permit.run(|| {
+            let built = self
+                .state
+                .data()
+                .build()
+                .drive(body::DEFAULT_BUILD_STEP_BUDGET, |stream| {
+                    self.mode.body(identify(self.scope.conn, stream))
+                });
+            drive::Drive {
+                router: self.scope.router.as_mut(),
+                tasks: self.scope.tasks,
+                conn: self.scope.conn,
+                parent: self.scope.parent,
+                index: self.scope.index,
+                state: self.state,
+                limits: self.limits,
+                mode: self.mode,
+            }
+            .build(built);
+            Ok(Outcome::Wake)
+        }))
     }
 
     fn task(&mut self) -> Admission<Result<Outcome, Error>> {

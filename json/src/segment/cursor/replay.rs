@@ -28,7 +28,7 @@ impl Replay {
             cursor,
             end,
             output,
-            string: decoded.then(String::admitted),
+            string: decoded.then(String::new),
         }
     }
 

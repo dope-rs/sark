@@ -24,7 +24,6 @@ pub(super) fn extras<'emit, 'source, 'spec>(
     binding: surfaces::Binding<'emit>,
     producer: &'emit proc_macro2::TokenStream,
 ) -> surfaces::Extras {
-    let ctor = names.constructor_identity;
     let make = names.constructor_module;
     let [f_cache, f_gzip, f_time] = ["response_cache", "gzip", "timer"].map(local);
     let [f_life, f_state, f_mark] = ["lifecycle", "state", "marker"].map(local);
@@ -260,7 +259,7 @@ pub(super) fn extras<'emit, 'source, 'spec>(
             #claim
             #v_state,
             ::core::marker::PhantomData::<(
-                #ctor<#g_id>, #g_wire, #ns_fiber::manifold::runtime::Cold,
+                fn() -> #g_id, #g_wire, #ns_fiber::manifold::runtime::Cold,
             )>,
             #v_config,
             #ns_core::life::mode::Disabled,
@@ -329,7 +328,7 @@ pub(super) fn extras<'emit, 'source, 'spec>(
                 #claim
                 #v_state,
                 ::core::marker::PhantomData::<(
-                    #ctor<#g_id>, #g_wire, #ns_fiber::manifold::runtime::Cold,
+                    fn() -> #g_id, #g_wire, #ns_fiber::manifold::runtime::Cold,
                 )>,
                 #v_config,
                 #ns_core::life::mode::Observed::new(#v_obs),

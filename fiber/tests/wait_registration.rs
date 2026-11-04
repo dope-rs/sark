@@ -86,12 +86,9 @@ fn rearms_reserved() {
                             .app
                             .block_on(Race::new(deadline, requests))
                             .expect("drive request tasks");
-                        assert!(matches!(&result, Either::Right(_)), "admission wake lost");
-                        let replies = match result {
-                            Either::Right(replies) => Some(replies),
-                            Either::Left(()) => None,
-                        }
-                        .expect("request tasks finished");
+                        let Either::Right(replies) = result else {
+                            panic!("admission wake lost");
+                        };
                         for result in replies.expect("join request tasks") {
                             result.expect("queued client response");
                         }
@@ -153,12 +150,9 @@ fn ready_survives_cancel() {
                 .app
                 .block_on(Race::new(deadline, waits))
                 .expect("drive wait tasks");
-            assert!(matches!(&result, Either::Right(_)), "readiness wake lost");
-            let replies = match result {
-                Either::Right(replies) => Some(replies),
-                Either::Left(()) => None,
-            }
-            .expect("wait tasks finished");
+            let Either::Right(replies) = result else {
+                panic!("readiness wake lost");
+            };
             let mut ready = replies.expect("join wait tasks").flatten();
             ready
                 .next()
@@ -238,11 +232,9 @@ fn dispatch_survives_cancel() {
                 });
                 let result = scope.app.block_on(Race::new(deadline, requests))
                     .expect("drive request tasks");
-                assert!(matches!(&result, Either::Right(_)), "dispatch wake lost");
-                let replies = match result {
-                    Either::Right(replies) => Some(replies),
-                    Either::Left(()) => None,
-                }.expect("request tasks finished");
+                let Either::Right(replies) = result else {
+                    panic!("dispatch wake lost");
+                };
                 let mut ready = replies.expect("join request tasks").enumerate()
                     .filter_map(|(index, reply)| reply.map(|reply| (index, reply)));
                 let (index, reply) = ready.next().expect("surviving request");
@@ -354,11 +346,9 @@ fn dynamic_dispatch_survives_cancel() {
                                 .app
                                 .block_on(Race::new(deadline, requests))
                                 .expect("drive request tasks");
-                            let replies = match result {
-                                Either::Right(((), replies)) => Some(replies),
-                                Either::Left(()) => None,
-                            }
-                            .expect("dynamic dispatch wake lost");
+                            let Either::Right(((), replies)) = result else {
+                                panic!("dynamic dispatch wake lost");
+                            };
                             assert!(canceled.get(), "notified request cancellation reached");
                             let mut ready = replies
                                 .expect("join request tasks")

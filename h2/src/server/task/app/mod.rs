@@ -33,7 +33,6 @@ pub(in crate::server::task) use drive::Drive;
 use handler::{failures, send};
 use o3::{buffer::hold::limits, depot::capacity};
 use sark_core::{
-    deadline::config,
     decode::request,
     duplex,
     life::{mode, owners},
@@ -89,7 +88,7 @@ pub struct App<
     wire: marker::PhantomData<fn() -> W>,
 }
 
-impl<'d, ID: Identity + 'd, R, W, M, P> App<'d, ID, R, W, M, timers::Disabled, P>
+impl<'d, ID: Identity + 'd, R, W, M, D, P> App<'d, ID, R, W, M, D, P>
 where
     R: Runtime<'d, Target = Target<'d, ID>>,
     W: wire::Spec,
@@ -99,6 +98,7 @@ where
         router: F,
         config: Config,
         mode: M,
+        deadlines: D,
         fault: P,
         binding: driver::Binding<'d>,
     ) -> Result<Self, Failure<F::Error>>
@@ -126,43 +126,10 @@ where
             },
             execution: works::State::new(),
             mode,
-            deadlines: timers::Disabled,
+            deadlines,
             fault,
             wire: marker::PhantomData,
         })
-    }
-}
-
-impl<'d, ID: Identity, R, W, M, P> App<'d, ID, R, W, M, timers::Disabled, P>
-where
-    R: Runtime<'d>,
-    W: wire::Spec,
-    <R::Head as request::Head>::Start: works::Family,
-{
-    pub(in crate::server) fn with_timer(
-        self,
-        config: config::Config,
-    ) -> App<'d, ID, R, W, M, config::Config, P> {
-        let Self {
-            router,
-            tasks,
-            protocol,
-            execution: exec,
-            mode,
-            deadlines: _,
-            fault,
-            wire,
-        } = self;
-        App {
-            router,
-            tasks,
-            protocol,
-            execution: exec,
-            mode,
-            deadlines: config,
-            fault,
-            wire,
-        }
     }
 }
 

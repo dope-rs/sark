@@ -37,15 +37,12 @@ pub struct Parts {
 }
 
 #[derive(Clone, Copy)]
-pub(super) struct Start {
+pub(in crate::h1::head) struct Start {
     content: Content,
     version: line::Version,
     status: Code,
     fields: u32,
 }
-
-#[derive(Clone, Copy)]
-pub(super) struct Kind(pub(super) Method);
 
 impl Start {
     pub(super) fn from(line: line::Response<'_>, request: Method) -> Result<Self, Boundary> {
@@ -72,7 +69,7 @@ impl Parts {
         limit: Limit,
         sink: impl FnMut(field::Entry<'owner>) -> Result<(), E>,
     ) -> Result<Option<Self>, ParseError<E>> {
-        let (_, parts) = state::State::new(Kind(request), limit).parse(bytes, sink)?;
+        let (_, parts) = state::State::new(request, limit).parse(bytes, sink)?;
         Ok(parts)
     }
 
@@ -81,7 +78,7 @@ impl Parts {
         request: Method,
         limit: Limit,
     ) -> Result<Option<Self>, ParseError<Infallible>> {
-        let (_, parts) = state::State::new(Kind(request), limit).scan(bytes)?;
+        let (_, parts) = state::State::new(request, limit).scan(bytes)?;
         Ok(parts)
     }
 
@@ -127,7 +124,7 @@ impl Parts {
     }
 }
 
-impl state::Kind for Kind {
+impl state::Kind for Method {
     type Start = Start;
     type Fields = Fields;
     type Parts = Parts;
@@ -141,7 +138,7 @@ impl state::Kind for Kind {
             }
         };
         match progress {
-            line::Progress::Complete(line) => match Start::from(line, self.0) {
+            line::Progress::Complete(line) => match Start::from(line, self) {
                 Ok(start) => Ok(line::Progress::Complete(start)),
                 Err(cause) => Err(ParseError::Boundary(cause)),
             },

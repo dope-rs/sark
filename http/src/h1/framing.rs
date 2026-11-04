@@ -375,17 +375,11 @@ impl Message {
             }
             Content::Allowed => {}
         }
-        if !matches!(self.transfer, Transfer::None) {
-            return Ok(match self.transfer {
-                Transfer::Chunked => ResponseBody::Chunked,
-                Transfer::Other => ResponseBody::UntilEof,
-                Transfer::None => ResponseBody::UntilEof,
-            });
-        }
-        match self.content_length {
-            Some(length) => Ok(ResponseBody::Fixed(length)),
-            None => Ok(ResponseBody::UntilEof),
-        }
+        Ok(match (self.transfer, self.content_length) {
+            (Transfer::Chunked, _) => ResponseBody::Chunked,
+            (Transfer::Other, _) | (Transfer::None, None) => ResponseBody::UntilEof,
+            (Transfer::None, Some(length)) => ResponseBody::Fixed(length),
+        })
     }
 }
 

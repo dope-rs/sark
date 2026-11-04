@@ -72,7 +72,14 @@ impl<'a, 'd> Body<'a, 'd> {
     /// Finishes without rechecking the head already owned by this body phase.
     pub fn finish(self) -> reply::Scoped<'a, 'd> {
         let (status, coding, headers) = self.head.into_parts();
-        reply::Scoped::from_parts(status, coding, headers, self.trailers, self.body)
+        reply::Scoped {
+            status,
+            coding,
+            headers,
+            trailers: self.trailers,
+            body: self.body,
+            omitted: false,
+        }
     }
 
     fn sequence(&self, event: sequence::Event) -> Error {

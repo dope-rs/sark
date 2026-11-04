@@ -46,12 +46,10 @@ impl<'app, 'life, 'e, 'd: 'app, P: ?Sized + 'app, ID: Identity> Unary<'app, 'lif
     > {
         let call = self.call.as_ref().ok_or_else(Self::consumed)?;
         let result = Completion::new(token, self.scope).unary(call, None)?;
-        if let Some(result) = result {
+        if result.is_some() {
             self.call = None;
-            Ok(Some(result))
-        } else {
-            Ok(None)
         }
+        Ok(result)
     }
 
     pub fn recv<'a>(

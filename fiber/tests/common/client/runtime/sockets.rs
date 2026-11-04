@@ -1,7 +1,6 @@
 use std::{
     convert::Infallible,
     io::{self, Read as _, Write as _},
-    mem,
     net::{Shutdown, SocketAddr, TcpStream},
     str,
     sync::Arc,
@@ -125,15 +124,6 @@ impl Tls {
 
     pub fn write(&mut self, bytes: &[u8]) -> Result<(), Error> {
         self.0.write(bytes)
-    }
-
-    pub fn read_plain(&mut self) -> Result<Vec<u8>, Error> {
-        while self.0.plain.is_empty() {
-            if self.0.read()? == 0 {
-                return Err(Error::Closed { buffered: 0 });
-            }
-        }
-        Ok(mem::take(&mut self.0.plain))
     }
 
     pub fn close(mut self) -> Result<Vec<u8>, Error> {

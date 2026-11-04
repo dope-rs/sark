@@ -132,7 +132,6 @@ impl Default for Policy {
 /// One admitted backoff, retaining the last attempt until the next begins.
 pub struct Backoff {
     state: State,
-    next: NonZero<u8>,
 }
 
 impl State {
@@ -174,7 +173,6 @@ impl State {
         if self.attempts >= self.limit {
             return Err(self);
         }
-        let next = self.attempts.saturating_add(1);
         let allowed = match self.mode {
             Mode::IdempotentBefore | Mode::IdempotentCommitted => {
                 !matches!(Class::of(failure.cause()), Class::Never)
@@ -189,7 +187,7 @@ impl State {
         if !allowed {
             return Err(self);
         }
-        Ok(Backoff { state: self, next })
+        Ok(Backoff { state: self })
     }
 }
 
@@ -201,7 +199,7 @@ impl Backoff {
     /// Enters the admitted dispatch attempt after its backoff completed.
     pub fn start(self) -> State {
         State {
-            attempts: self.next,
+            attempts: self.state.attempts.saturating_add(1),
             ..self.state
         }
     }

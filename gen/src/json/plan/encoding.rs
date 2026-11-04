@@ -129,7 +129,6 @@ enum Value {
     Bool,
     Bytes { encoding: ByteEncoding },
     Nested { borrow: bool },
-    Sequence(Box<Self>),
 }
 
 #[derive(Clone, Copy)]
@@ -146,19 +145,14 @@ enum ByteEncoding {
 }
 
 impl Value {
-    fn scalar(
-        scalar: scalar::Scalar,
-        mode: field::FieldMode,
-        sequence: bool,
-        ty: &syn::Type,
-    ) -> syn::Result<Self> {
+    fn scalar(scalar: scalar::Scalar, mode: field::FieldMode, ty: &syn::Type) -> syn::Result<Self> {
         use crate::json::scalar::Scalar;
         let encoding = ByteEncoding::from(mode);
         Ok(match scalar {
-            Scalar::U64 if !sequence => Self::U64,
-            Scalar::I64 if !sequence => Self::I64,
-            Scalar::F64 if !sequence => Self::F64,
-            Scalar::Bool if !sequence => Self::Bool,
+            Scalar::U64 if !mode.seq => Self::U64,
+            Scalar::I64 if !mode.seq => Self::I64,
+            Scalar::F64 if !mode.seq => Self::F64,
+            Scalar::Bool if !mode.seq => Self::Bool,
             Scalar::String | Scalar::Shared | Scalar::Bytes | Scalar::Borrowed | Scalar::Token => {
                 Self::Bytes { encoding }
             }
@@ -180,7 +174,6 @@ impl Value {
     ) -> Emission {
         let ns_json = &paths.json;
         let writer = &names.writer;
-        let item = &names.item;
         match self {
             Self::U64 => Emission::new(
                 quote::quote!(#ns_json::writing::Size::json_size(&#access)),
@@ -219,18 +212,6 @@ impl Value {
                     quote::quote!(#ns_json::writing::TrySize::try_size(#access)?),
                     quote::quote!(#writer = #ns_json::writing::TryEncode::try_write(#access, #writer)?;),
                 )
-            }
-            Self::Sequence(element) => {
-                let project = matches!(element.as_ref(), Self::Nested { .. }).then(|| {
-                    quote::quote! {
-                        use #ns_json::writing::Nested as _;
-                        let #item = #ns_json::writing::Item(#item);
-                        let #item = #item.into_ref();
-                    }
-                });
-                element
-                    .emit(paths, quote::quote!(#item), true, names)
-                    .sequence(paths, &access, project, names)
             }
         }
     }
@@ -296,15 +277,26 @@ impl Emission {
                         "sequence field elements cannot be Option<T>",
                     ));
                 }
-                Value::scalar(class.scalar, mode, true, elem)?
+                Value::scalar(class.scalar, mode, elem)?
             };
-            (Value::Sequence(Box::new(value)), None)
+            let ns_json = &paths.json;
+            let item = &names.item;
+            let project = mode.nested.then(|| {
+                quote::quote! {
+                    use #ns_json::writing::Nested as _;
+                    let #item = #ns_json::writing::Item(#item);
+                    let #item = #item.into_ref();
+                }
+            });
+            return Ok(value
+                .emit(paths, quote::quote!(#item), true, names)
+                .sequence(paths, &access, project, names));
         } else if mode.nested {
             (Value::Nested { borrow: true }, None)
         } else {
             let class = Classified::of(ty)?;
             (
-                Value::scalar(class.scalar, mode, false, ty)?,
+                Value::scalar(class.scalar, mode, ty)?,
                 class.optional.then(|| OptionAccess::from(class.scalar)),
             )
         };

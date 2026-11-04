@@ -50,7 +50,7 @@ pub(crate) enum Scan {
 impl Scan {
     pub(crate) fn new(admitted: bool) -> Self {
         if admitted {
-            Self::Admitted(String::admitted())
+            Self::Admitted(String::new())
         } else {
             Self::Checked(String::new())
         }
@@ -168,19 +168,6 @@ impl Decoded {
 }
 
 impl String {
-    pub(crate) const fn new() -> Self {
-        Self {
-            escape: Escape::Plain,
-            utf8: Utf8 {
-                left: 0,
-                min: 0x80,
-                max: 0xbf,
-            },
-            removed: 0,
-            mode: PhantomData,
-        }
-    }
-
     pub(crate) const fn removed(&self) -> usize {
         self.removed
     }
@@ -194,16 +181,6 @@ impl String {
 }
 
 impl String<Admitted> {
-    pub(crate) const fn admitted() -> Self {
-        let checked = String::new();
-        Self {
-            escape: checked.escape,
-            utf8: checked.utf8,
-            removed: checked.removed,
-            mode: PhantomData,
-        }
-    }
-
     pub(crate) fn decode(&mut self, byte: u8) -> Decoded {
         match self.content(byte) {
             Ok(decoded) => decoded,
@@ -213,6 +190,19 @@ impl String<Admitted> {
 }
 
 impl<M: Validation> String<M> {
+    pub(crate) const fn new() -> Self {
+        Self {
+            escape: Escape::Plain,
+            utf8: Utf8 {
+                left: 0,
+                min: 0x80,
+                max: 0xbf,
+            },
+            removed: 0,
+            mode: PhantomData,
+        }
+    }
+
     /// Returns an admitted ASCII run that leaves every state field unchanged.
     pub(crate) fn skip<'a>(&self, chunk: &'a [u8]) -> &'a [u8] {
         if !matches!(self.escape, Escape::Plain) || self.utf8.left != 0 {

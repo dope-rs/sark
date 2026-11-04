@@ -103,21 +103,14 @@ impl<'call, B> Call<'call, B> {
         T: 'call,
         E: 'call,
     {
-        self.collected::<true, true, _, _, _>(
-            observe,
-            move |response, bound, attempt| match process(response, bound, attempt) {
-                Ok(value) => {
-                    bound
-                        .check()
-                        .map_err(|elapsed| decode::expired(elapsed).attempted(attempt).widen())?;
-                    Ok(Ok(value))
-                }
+        self.collected::<true, true, _, _, _>(observe, move |response, bound, attempt| {
+            match process(response, bound, attempt) {
+                Ok(value) => bound.check().map(|()| Ok(value)),
                 Err(process::Error::Work(error)) => Ok(Err(error)),
-                Err(process::Error::Elapsed(elapsed)) => {
-                    Err(decode::expired(elapsed).attempted(attempt).widen())
-                }
-            },
-        )
+                Err(process::Error::Elapsed(elapsed)) => Err(elapsed),
+            }
+            .map_err(|elapsed| decode::expired(elapsed).attempted(attempt).widen())
+        })
     }
 
     fn collected<'app, 'd, const FOLLOW: bool, const PROCESS: bool, T, F, O>(

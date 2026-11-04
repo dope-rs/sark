@@ -14,7 +14,7 @@ impl<'a> Decoder<'a> {
     pub(crate) fn new(content: Content<'a>) -> Self {
         Self {
             raw: content.bytes(),
-            string: String::admitted(),
+            string: String::new(),
             pending: 0,
             remaining: 0,
         }

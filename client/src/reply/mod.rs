@@ -51,23 +51,6 @@ pub struct Scoped<'a, 'd> {
 }
 
 impl<'a, 'd> Scoped<'a, 'd> {
-    const fn from_parts(
-        status: status::Code,
-        coding: Coding,
-        headers: response::Fields<resident::Shared<'d>>,
-        trailers: Option<response::Fields<resident::Shared<'d>>>,
-        body: body::Scoped<'a, 'd>,
-    ) -> Self {
-        Self {
-            status,
-            coding,
-            headers,
-            trailers,
-            body,
-            omitted: false,
-        }
-    }
-
     pub const fn status(&self) -> status::Code {
         self.status
     }

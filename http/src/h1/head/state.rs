@@ -72,28 +72,18 @@ impl<K: Kind> State<K> {
         })
     }
 
-    pub(super) fn advance_line(self, owner: &[u8]) -> Result<(Self, bool), ParseError<Infallible>> {
-        let Phase::Line {
-            kind,
-            cursor,
-            limit,
-        } = self.phase
-        else {
+    pub(super) fn advance_line(
+        mut self,
+        owner: &[u8],
+    ) -> Result<(Self, bool), ParseError<Infallible>> {
+        let Phase::Line { cursor, limit, .. } = &mut self.phase else {
             return Err(ParseError::invalid());
         };
-        let (cursor, end) = cursor
+        let (next, end) = cursor
             .scan(owner, limit.bytes())
             .map_err(ParseError::Boundary)?;
-        Ok((
-            Self {
-                phase: Phase::Line {
-                    kind,
-                    cursor,
-                    limit,
-                },
-            },
-            end.is_some(),
-        ))
+        *cursor = next;
+        Ok((self, end.is_some()))
     }
 
     pub(super) const fn new(kind: K, limit: Limit) -> Self {

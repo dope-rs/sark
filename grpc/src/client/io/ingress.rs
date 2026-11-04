@@ -70,16 +70,7 @@ where
     }
 
     fn resume(&mut self) -> Result<(), crate::Status> {
-        self.state.ingress.take_error()?;
-        let result = self.state.connection.resume();
-        let mut policy = policies::Direct;
-        self.state.ingress.drive(
-            &mut self.state.connection,
-            &mut self.state.calls,
-            &mut self.state.egress,
-            result,
-            &mut policy,
-        )
+        self.resume_on(&mut policies::Direct)
     }
 
     fn is_blocked(&self) -> bool {
@@ -109,9 +100,9 @@ where
         run(self, source, done)
     }
 
-    pub(in crate::client) fn resume_on<'notify>(
+    pub(in crate::client) fn resume_on<R: policies::Policy<P, C>>(
         &mut self,
-        done: &mut policies::Notify<'notify, '_, '_>,
+        done: &mut R,
     ) -> Result<(), crate::Status> {
         self.state.ingress.take_error()?;
         let result = self.state.connection.resume();

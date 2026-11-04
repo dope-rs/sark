@@ -22,6 +22,8 @@ where
             Connection: Connection<Error = conn::Error>,
         >,
 {
+    fn complete(&self, _: receive::Index) {}
+
     fn cancel(
         &mut self,
         asm: &mut receive::Assembler<P, C>,
@@ -29,7 +31,9 @@ where
     ) -> Option<calls::Target> {
         let response = response?;
         let target = response.target;
-        asm.cancel_reply(response);
+        if let receive::Cancel::Complete(slot) = asm.cancel_reply(response) {
+            self.complete(slot);
+        }
         Some(target)
     }
 
@@ -40,9 +44,12 @@ where
         value: Result<receive::UnaryResult<C>, crate::Status>,
         charge: Option<budget::Charge>,
     ) -> Result<(), crate::Status> {
+        let slot = key.slot();
         asm.claims
             .push_unary(key, value, charge)
-            .map_err(|error| error.status(&mut asm.fault, &mut asm.budget))
+            .map_err(|error| error.status(&mut asm.fault, &mut asm.budget))?;
+        self.complete(slot);
+        Ok(())
     }
 
     fn push_event(
@@ -52,9 +59,12 @@ where
         value: Result<receive::Response<C>, crate::Status>,
         charge: Option<budget::Charge>,
     ) -> Result<(), crate::Status> {
+        let slot = key.slot(asm.claims.offset);
         asm.claims
             .push_event(key, value, charge)
-            .map_err(|error| error.status(&mut asm.fault, &mut asm.budget))
+            .map_err(|error| error.status(&mut asm.fault, &mut asm.budget))?;
+        self.complete(slot);
+        Ok(())
     }
 }
 
@@ -71,12 +81,6 @@ impl<'scope, 'life, 'd> Notify<'scope, 'life, 'd> {
         done: table::Sink<'scope, 'life, 'd>,
     ) -> Self {
         Self { scope, done }
-    }
-
-    fn complete(&self, index: receive::Index) {
-        use table::raw::Index as _;
-
-        self.scope.slot(index).wake(&self.done);
     }
 
     pub(in crate::client) fn try_register<'target>(
@@ -118,42 +122,9 @@ where
             Connection: Connection<Error = conn::Error>,
         >,
 {
-    fn cancel(
-        &mut self,
-        asm: &mut receive::Assembler<P, C>,
-        response: Option<calls::Response<C>>,
-    ) -> Option<calls::Target> {
-        let response = response?;
-        let target = response.target;
-        if let receive::Cancel::Complete(slot) = asm.cancel_reply(response) {
-            self.complete(slot);
-        }
-        Some(target)
-    }
+    fn complete(&self, index: receive::Index) {
+        use table::raw::Index as _;
 
-    fn push_unary(
-        &mut self,
-        asm: &mut receive::Assembler<P, C>,
-        key: receive::UnaryKey,
-        value: Result<receive::UnaryResult<C>, crate::Status>,
-        charge: Option<budget::Charge>,
-    ) -> Result<(), crate::Status> {
-        let slot = key.slot();
-        Direct.push_unary(asm, key, value, charge)?;
-        self.complete(slot);
-        Ok(())
-    }
-
-    fn push_event(
-        &mut self,
-        asm: &mut receive::Assembler<P, C>,
-        key: receive::StreamKey,
-        value: Result<receive::Response<C>, crate::Status>,
-        charge: Option<budget::Charge>,
-    ) -> Result<(), crate::Status> {
-        let slot = key.slot(asm.claims.offset);
-        Direct.push_event(asm, key, value, charge)?;
-        self.complete(slot);
-        Ok(())
+        self.scope.slot(index).wake(&self.done);
     }
 }

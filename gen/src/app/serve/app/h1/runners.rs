@@ -134,22 +134,6 @@ fn definitions(
                     marker: ::core::marker::PhantomData<fn() -> #ty>,
                 }
 
-                impl<#l_finish, #( #lives, )* #( #decls, )* #params>
-                    #runner<#l_finish, #( #lives, )* #( #values, )* #params>
-                where
-                    #( #clauses, )*
-                {
-                    fn new(#v_finish: &#l_finish mut #ns_fiber::dope::runtime::executor::session::Completion, #v_state: #state, #v_config: #config, #v_wire: #binding) -> Self {
-                        Self {
-                            finish: #v_finish,
-                            state: #v_state,
-                            config: #v_config,
-                            wire: #v_wire,
-                            marker: ::core::marker::PhantomData,
-                        }
-                    }
-                }
-
                 impl<#l_finish, #l_work, #l_own, #l_store, #l_driver,
 
                     #( #lives, )*
@@ -265,13 +249,9 @@ fn method(
             let #v_store = #ns_fiber::dope::core::driver::storage::Value::new(#v_owner);
         },
     };
-    let create = match wire {
-        Wire::Identity => {
-            quote::quote! { #runner::new(&mut #v_wait, #v_state, #v_config, #v_wire) }
-        }
-        Wire::Generic => {
-            quote::quote! { #runner::<#( #values, )* #ty, _>::new(&mut #v_wait, #v_state, #v_config, #v_wire) }
-        }
+    let constructor = match wire {
+        Wire::Identity => quote::quote! { #runner },
+        Wire::Generic => quote::quote! { #runner::<#( #values, )* #ty, _> },
     };
 
     quote::quote! {
@@ -316,7 +296,13 @@ fn method(
             #storage
             let #v_prep = #v_plan.prepare(#v_store)?;
             let mut #v_wait = #ns_fiber::dope::runtime::executor::session::Completion::new();
-            let #v_op = #create;
+            let #v_op = #constructor {
+                finish: &mut #v_wait,
+                state: #v_state,
+                config: #v_config,
+                wire: #v_wire,
+                marker: ::core::marker::PhantomData,
+            };
             ::core::result::Result::Ok(#v_prep.enter(#v_ctx, #v_op, #v_report, |#v_result| {
                 match #v_result {
                     ::core::result::Result::Ok(#v_result) => #v_finish(#v_result.map_err(#ns_h1::server::run::RunError::Failure)),

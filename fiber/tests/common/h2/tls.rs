@@ -1,6 +1,5 @@
-use std::{cell::Cell, io, io::Write, marker::PhantomData, sync::Arc};
+use std::{cell::Cell, io, io::Write, sync::Arc};
 
-use dope::{core::driver, manifold::app::Host};
 use dope_test::fibers::Yield;
 use dope_tls::{config::raw::Identity, rustls};
 use sark_h2::{ClientRole, conn::machine::Connection};
@@ -43,30 +42,6 @@ async fn shared(state: &State) -> Reply<'d> {
 sark_fiber::define_route! {
     pub Shared: State => {
         GET "/shared" => async(capacity = 1, body = discarded) shared,
-    }
-}
-
-#[pin_project::pin_project]
-#[derive(dope_gen::Application)]
-#[dispatcher(driver = 'd)]
-pub struct Protocols<'d, H1, H2> {
-    #[pin]
-    #[app]
-    h1: H1,
-    #[pin]
-    #[app]
-    h2: Host<H2>,
-    #[dispatcher(state)]
-    driver: PhantomData<driver::Reference<'d>>,
-}
-
-impl<'d, H1, H2> Protocols<'d, H1, H2> {
-    pub fn new(h1: H1, h2: H2) -> Self {
-        Self {
-            h1,
-            h2: Host::new(h2),
-            driver: PhantomData,
-        }
     }
 }
 

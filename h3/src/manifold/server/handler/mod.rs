@@ -1,6 +1,6 @@
 //! QUIC mux handler that drives generated HTTP/3 tasks.
 use dope::core::{
-    driver::{result::SubmitCause, schedule},
+    driver::{self, result::SubmitCause, schedule},
     io::datagram::{ReceiveError, Residency},
 };
 
@@ -33,7 +33,7 @@ use sark_core::{
         mode::Observed,
         session,
     },
-    manifold::task::app::Runtime,
+    manifold::task::app::{Bind, Runtime},
 };
 use sark_http::{field::metadata::block, payload::compress::dynamic::hash};
 use schedule::ready::task::owner;
@@ -70,19 +70,26 @@ impl<'d, R, M, L, E, Q> Handler<'d, R, M, L, E, Q>
 where
     R: Runtime<'d>,
 {
-    pub(super) fn from_parts(
-        router: R,
+    pub(super) fn try_bind<const ID: u8, T>(
+        binding: driver::Binding<'d>,
+        router: T,
         mut config: server::Setup,
         observer: M,
         lifetime: L,
         deadline: E,
         seed: hash::Seed,
-    ) -> Self {
+    ) -> Result<Self, T::Error>
+    where
+        T: Bind<'d, Runtime = R, Target = server::Handle<'d, ID>>,
+        M: life::Mode<id::Handle<id::Driver<'d>, ID>, Id>
+            + Mode<id::Domain<id::Driver<'d>, ID>, net::Owner<id::Driver<'d>, ID>>,
+    {
+        let router = Bind::try_bind(router, binding)?;
         match <R as duplex::Application<'d>>::CONNECT {
             block::Connect::Disabled => {}
             block::Connect::Enabled => config.protocol.set_connect(),
         }
-        Self {
+        Ok(Self {
             router,
             observer,
             config,
@@ -91,7 +98,7 @@ where
             deadline,
             driver: marker::PhantomData,
             packet: marker::PhantomData,
-        }
+        })
     }
     fn accept<const ID: u8, const FLUSH: bool, B>(
         event: stream::Event<'_, Self, ID, B, resident::Shared<'d>, id::Driver<'d>>,

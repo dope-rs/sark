@@ -7,22 +7,18 @@ use dope::core::driver::{
     settings::{claim, errors},
 };
 use dope_quic::{
-    conn::{id, life::options},
+    conn::life::options,
     proto::datagram,
     runtime::{
         endpoint::{Endpoint, Run, config, owner::Owned, server},
-        mux::{app, handler::net},
+        mux::app,
         receive,
     },
     rustls::ServerConfig,
     stream::Retain,
-    wire::stream::Id,
 };
 use o3::buffer::resident;
-use sark_core::{
-    life::{self, endpoint},
-    manifold::task::app::{Bind, Runtime},
-};
+use sark_core::manifold::task::app::Bind;
 use sark_http::payload::compress::dynamic::hash;
 
 use crate::manifold::server::{
@@ -41,28 +37,6 @@ type Bound<'pool, 'd, const ID: u8, R, T, O, L, E, A, C> = Result<
     >,
     startup::BindError<<T as Bind<'d>>::Error>,
 >;
-
-impl<'d, R: Runtime<'d>, O, L, E, Q> Handler<'d, R, O, L, E, Q> {
-    pub(super) fn try_bind<const ID: u8, T>(
-        binding: driver::Binding<'d>,
-        router: T,
-        config: Setup,
-        observer: O,
-        lifetime: L,
-        deadline: E,
-        seed: hash::Seed,
-    ) -> Result<Self, T::Error>
-    where
-        T: Bind<'d, Runtime = R, Target = Handle<'d, ID>>,
-        O: life::Mode<id::Handle<id::Driver<'d>, ID>, Id>
-            + endpoint::Mode<id::Domain<id::Driver<'d>, ID>, net::Owner<id::Driver<'d>, ID>>,
-    {
-        let router = Bind::try_bind(router, binding)?;
-        Ok(Self::from_parts(
-            router, config, observer, lifetime, deadline, seed,
-        ))
-    }
-}
 
 /// Validated H3 and QUIC startup authority for one driver route.
 #[must_use = "an H3 plan must be bound to its generated application"]

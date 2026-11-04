@@ -123,16 +123,9 @@ impl<'d> session::Stored<'d> for Session<'_> {
                 }
             }
             Admission::Ready(
-                move |parsed: Result<Parsed<'d>, Error>, state: &mut State<'d>| {
-                    let parsed = match parsed {
-                        Ok(parsed) => parsed,
-                        Err(error) => {
-                            audit.fail(Failure::Protocol(error));
-                            return;
-                        }
-                    };
-                    let output = codec.admit(state, parsed);
-                    audit.record(index, output);
+                move |parsed: Result<Parsed<'d>, Error>, state: &mut State<'d>| match parsed {
+                    Ok(parsed) => audit.record(index, codec.admit(state, parsed)),
+                    Err(error) => audit.fail(Failure::Protocol(error)),
                 },
             )
         });

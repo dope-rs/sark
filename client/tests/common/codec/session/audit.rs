@@ -27,10 +27,6 @@ impl Audit {
         }
     }
 
-    fn has_failed(&self) -> bool {
-        self.failure.borrow().is_some()
-    }
-
     pub(super) fn fail(&self, error: Failure) {
         self.failure.borrow_mut().get_or_insert(error);
     }
@@ -68,6 +64,6 @@ impl Audit {
 
 impl Progress for Audit {
     fn hits(&self) -> u32 {
-        u32::from(self.accepted[2].get() != 0 || self.has_failed())
+        u32::from(self.accepted[2].get() != 0 || self.failure.borrow().is_some())
     }
 }

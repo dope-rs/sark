@@ -20,14 +20,10 @@ impl<'d> Close<'d> {
         self.code
     }
 
-    pub(in crate::client) fn payload(&self) -> &[u8] {
-        self.payload.as_ref()
-    }
-
     pub(in crate::client) fn reason(&self) -> &str {
         let start = usize::from(self.code.is_some()) * 2;
         // SAFETY: admission retains the exact immutable payload and proves
         // its reason starts after the code, or at zero for an empty close.
-        unsafe { str::from_utf8_unchecked(self.payload().get_unchecked(start..)) }
+        unsafe { str::from_utf8_unchecked(self.payload.as_ref().get_unchecked(start..)) }
     }
 }

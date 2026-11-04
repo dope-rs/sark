@@ -9,7 +9,7 @@ use std::{
 };
 
 use common::{
-    h2::tls::{self, HEADERS, Protocols, RESPONSE, Shared, State},
+    h2::tls::{self, HEADERS, RESPONSE, Shared, State},
     server::{self, recover},
 };
 use dope::{
@@ -21,7 +21,7 @@ use dope::{
         },
         io::socket::{self, Listener},
     },
-    manifold::network::listener::config,
+    manifold::{app::Host, network::listener::config},
     net::{tcp, wire},
     runtime::{executor::session, topology},
 };
@@ -152,7 +152,7 @@ fn shares_driver_storage_with_h1() {
                                                             run::Failure::<Infallible, _>::session(
                                                                 stage.with_app(
                                                                     &mut finish,
-                                                                    Protocols::new(root, listener),
+                                                                    server::accept::Listeners::new(root, Host::new(listener)),
                                                                     |app| wait.run(app),
                                                                 ),
                                                             )
@@ -168,7 +168,7 @@ fn shares_driver_storage_with_h1() {
                                                         run::Failure::<Infallible, _>::session(
                                                             stage.with_app(
                                                                 &mut finish,
-                                                                Protocols::new(root, listener),
+                                                                server::accept::Listeners::new(root, Host::new(listener)),
                                                                 |app| wait.run(app),
                                                             ),
                                                         )

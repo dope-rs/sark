@@ -83,12 +83,12 @@ impl<'borrow, 'request, B> Retry<'borrow, 'request, B> {
                             Ok(backoff) => backoff,
                             Err(retries) => return Err(retries.finish(failure)),
                         };
+                        drop(failure);
                         if let Err(elapsed) = budget.sleep(backoff.delay()).await {
-                            let expired = Failure::new(
+                            return Err(backoff.finish(Failure::new(
                                 Error::Timeout(timeout::Phase::Backoff.expire(elapsed)),
-                                failure.safety(),
-                            );
-                            return Err(backoff.finish(expired));
+                                Safety::BeforeSubmit,
+                            )));
                         }
                         retries = backoff.start();
                     }
@@ -173,12 +173,12 @@ impl<'borrow, 'request, B> Retry<'borrow, 'request, B> {
                     Err(_) => return Err(failure),
                 };
                 observe(&failure);
+                drop(failure);
                 if let Err(elapsed) = budget.sleep(backoff.delay()).await {
-                    let expired = Failure::new(
+                    return Err(backoff.finish(Failure::new(
                         Error::Timeout(timeout::Phase::Backoff.expire(elapsed)),
-                        failure.safety(),
-                    );
-                    return Err(backoff.finish(expired));
+                        Safety::BeforeSubmit,
+                    )));
                 }
                 retries = backoff.start();
             }

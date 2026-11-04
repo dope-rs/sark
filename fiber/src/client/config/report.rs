@@ -252,10 +252,9 @@ impl<E: Impossible> Policy<E> for Never {
         let (receive, transmit) = mem::take(token.borrow_mut(state));
         let cause = native(receive, transmit);
         let progress = run(cause.as_ref(), reply::Retirement::new(token));
-        *token.borrow_mut(state) = match progress {
-            reply::Progress::Complete(_) => (None, None),
-            reply::Progress::Pending(_) => (receive, transmit),
-        };
+        if matches!(progress, reply::Progress::Pending(_)) {
+            *token.borrow_mut(state) = (receive, transmit);
+        }
         progress
     }
 }
@@ -451,11 +450,9 @@ impl<E> Policy<E> for Retain {
             } => run(native(*receive, *transmit).as_ref(), retiring),
             Record::Vacant => run(None, retiring),
         };
-        let next = match progress {
-            reply::Progress::Complete(_) => Record::Vacant,
-            reply::Progress::Pending(_) => record,
-        };
-        *token.borrow_mut(&state.0) = next;
+        if matches!(progress, reply::Progress::Pending(_)) {
+            *token.borrow_mut(&state.0) = record;
+        }
         progress
     }
 }

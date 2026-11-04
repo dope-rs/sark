@@ -128,11 +128,8 @@ impl<D> Error<D> {
     /// Adds a receive failure without replacing an earlier failure.
     #[doc(hidden)]
     pub fn with_receive(mut self, errno: Errno) -> Self {
-        match &mut self {
-            Self::Wire { receive, .. } | Self::Transmit { receive, .. } => {
-                receive.get_or_insert(errno);
-            }
-            _ => {}
+        if let Self::Wire { receive, .. } | Self::Transmit { receive, .. } = &mut self {
+            receive.get_or_insert(errno);
         }
         self
     }
@@ -162,10 +159,8 @@ impl<D> Error<D> {
             Self::Ready(_) | Self::Retain(_) | Self::Ingress(_) | Self::Egress(_) => {
                 Kind::Local(close::LocalOrigin::ResourceFailure)
             }
-            Self::Receive { .. } => Kind::Transport,
-            Self::Wire { .. } => Kind::Wire,
-            Self::Transmit { wire: Some(_), .. } => Kind::Wire,
-            Self::Transmit { wire: None, .. } => Kind::Transport,
+            Self::Receive { .. } | Self::Transmit { wire: None, .. } => Kind::Transport,
+            Self::Wire { .. } | Self::Transmit { wire: Some(_), .. } => Kind::Wire,
         }
     }
 
@@ -200,13 +195,10 @@ impl Error<Infallible> {
                 error,
                 receive,
                 wire,
-            } => match wire {
-                Some(detail) => match detail {},
-                None => Error::Transmit {
-                    error,
-                    receive,
-                    wire: None,
-                },
+            } => Error::Transmit {
+                error,
+                receive,
+                wire: wire.map(|detail| match detail {}),
             },
         }
     }

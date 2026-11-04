@@ -22,7 +22,7 @@ impl Name {
             cursor,
             field,
             matched: 0,
-            string: escaped.then(String::admitted),
+            string: escaped.then(String::new),
         }
     }
 
@@ -98,7 +98,7 @@ impl Name {
                 self.matched = 0;
                 self.cursor = Cursor::at(input, self.range.start).ok_or(Error::Invalid)?;
                 if let Some(string) = &mut self.string {
-                    *string = String::admitted();
+                    *string = String::new();
                 }
             }
         }

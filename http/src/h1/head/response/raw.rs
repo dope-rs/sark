@@ -3,20 +3,16 @@
 use crate::payload::response::Method;
 use core::convert::Infallible;
 
-use crate::h1::head::{
-    Limit, ParseError, field,
-    response::{Parts, parts},
-    state,
-};
+use crate::h1::head::{Limit, ParseError, field, response::Parts, state};
 
 /// Response progress whose exact source prefix the caller preserves.
 /// A failure consumes progress, preventing the failed fields from being replayed.
 #[repr(transparent)]
-pub struct State(state::State<parts::Kind>);
+pub struct State(state::State<Method>);
 
 impl State {
     pub const fn new(request: Method, limit: Limit) -> Self {
-        Self(state::State::new(parts::Kind(request), limit))
+        Self(state::State::new(request, limit))
     }
 
     /// Parses appended bytes and emits newly completed fields.

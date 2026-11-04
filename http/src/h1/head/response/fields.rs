@@ -20,7 +20,7 @@ impl Flags {
 }
 
 #[derive(Clone, Copy, Default)]
-pub(super) struct Fields {
+pub(in crate::h1::head) struct Fields {
     pub(super) coding: super::Coding,
     pub(super) framing: framing::Fields,
     pub(super) connection: Connection,
