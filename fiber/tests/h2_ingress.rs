@@ -60,11 +60,13 @@ fn ingress_yields() {
                         sark_fiber::Config::new(8),
                     );
                     server.state.layout.set(Some(router.layout()));
+                    let wire =
+                        wire::domain::Local::<wire::Identity, KeyTag<ROUTE>>::new(wire::Identity);
                     plan.tasks(router, 8)
                         .observe(Log(&facts, |cause: &dyn fmt::Debug| {
                             eprintln!("lifecycle diagnostic: {cause:?}");
                         }))
-                        .try_install(stage, |listener, stage| {
+                        .try_install(stage, wire, |listener, stage| {
                             stage
                                 .with_quiesce(
                                     &mut done,

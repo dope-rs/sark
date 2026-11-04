@@ -195,7 +195,10 @@ impl Open {
     fn new() -> Self {
         use sark_http::h1::head::Limit;
         Self {
-            head: response::raw::State::new(Limit::RESPONSE.with_bytes(headers::MAX_BYTES)),
+            head: response::raw::State::new(
+                Method::Other,
+                Limit::RESPONSE.with_bytes(headers::MAX_BYTES),
+            ),
             fields: Ok(Admission::default()),
             offset: 0,
         }
@@ -369,7 +372,7 @@ impl codec::Stateful for Codec {
                         storage.progress = Progress::Connecting(open);
                         return codec::Input::wait(&storage.source, budget, limit, None);
                     };
-                    let head = match head.admit(Method::Other) {
+                    let head = match head.admit() {
                         Ok(head) => head,
                         Err(error) => break Err(Fault::Open(Error::Framing(error))),
                     };
@@ -379,6 +382,7 @@ impl codec::Stateful for Codec {
                     if head.status().is_info() && head.status() != Code::SWITCHING_PROTOCOLS {
                         open.offset = wire.get();
                         open.head = response::raw::State::new(
+                            Method::Other,
                             Limit::RESPONSE.with_bytes(headers::MAX_BYTES - open.offset),
                         );
                         continue;

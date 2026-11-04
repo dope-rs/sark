@@ -8,13 +8,13 @@
 //!     core::{BranchError, driver::{route::KeyTag, storage::With}},
 //!     manifold::{BuildError, app::env::Bundle},
 //!     net::{tcp::Tcp, wire::{Identity, domain}},
-//!     runtime::{executor::session, process, topology::{self, lending, ops}},
+//!     runtime::{executor::session, process, topology::{self, ops}},
 //! };
 //! use dope::core::driver::life::recovery::{Policy, Recovery};
 //! use std::convert::Infallible;
 //! use dope_fiber::task::storage::scope::Brand;
 //! use sark_fiber::{Config, Throughput, server::PrepareError};
-//! use sark_h1::server::date::Clock;
+//! use sark_h1::server::{date::Clock, run};
 //!
 //! sark::define_route! {
 //!     pub r#App<__W, const r#producer: usize>: State<__W, r#producer>
@@ -37,7 +37,7 @@
 //!         Policy::new(drop, |error: Recovery<'_, '_>| -> Infallible {
 //!             panic!("native recovery: {:?}", error.cause())
 //!         }),
-//!         |result: Result<_, topology::RunError<'_, _, _, _, _, _>>| {
+//!         |result: Result<_, run::RunError<'_, _, _, _, _, _>>| {
 //!             calls += 1;
 //!             result.as_ref().map(|_| ()).map_err(|error| error.cause()).expect("server");
 //!         },
@@ -50,23 +50,18 @@
 //!     let plan = provider.compose(owner, plan, move |plan, owner, stage| {
 //!         stage.hold(owner, |held, stage| {
 //!             Brand::with(|brand| {
-//!                 let result = plan.prepare_in(stage, domain::Local::new(Identity), |prepared, stage| {
-//!                     held.lend_scope(stage, report, |issued| {
+//!                 plan.prepare_in(stage, domain::Local::new(Identity), |prepared, wait, stage| {
+//!                     let result = held.lend_scope(stage, report, |issued| {
 //!                         let (client, permit) = issued.into_parts();
 //!                         let state = std::pin::pin!(State::<_, 2> {
 //!                             source: (client, task::State { first, second: b"", encoded }),
 //!                         });
 //!                         App::run_prepared(
-//!                             brand, state.as_ref(), config, prepared, permit,
+//!                             brand, state.as_ref(), config, prepared, wait, permit,
 //!                         )
-//!                     })
-//!                 }).map_err(|error| topology::Failure::Install(BuildError::Create(error)))?;
-//!                 match result {
-//!                     Ok(Ok(request)) => Ok(request),
-//!                     Ok(Err(error)) => Err(topology::Failure::Run(session::Error::Drive(error))),
-//!                     Err(lending::Error::Build(error)) => Err(topology::Failure::Install(error)),
-//!                     Err(lending::Error::Run(error)) => Err(topology::Failure::Run(error)),
-//!                 }
+//!                     });
+//!                     run::Failure::lending(result)
+//!                 }).map_err(|error| run::Failure::Install(BuildError::Create(error)))?
 //!             })
 //!         })
 //!     });
@@ -75,15 +70,13 @@
 //!         context,
 //!         ops::Map(ops::Compose, |result| match result {
 //!             Ok(Ok(request)) => Ok(request),
-//!             Ok(Err(topology::Failure::Run(error))) => Err(topology::Failure::Run(error)),
-//!             Ok(Err(topology::Failure::Install(error))) =>
-//!                 Err(topology::Failure::Install(BranchError::Second(error))),
-//!             Err(error) => Err(topology::Failure::Install(BranchError::First(error))),
+//!             Ok(Err(error)) => Err(run::Failure::map_install(error, BranchError::Second)),
+//!             Err(error) => Err(run::Failure::Install(BranchError::First(error))),
 //!         }),
 //!         recovery,
 //!         |outcome| finish(match outcome {
-//!             Ok(result) => result.map_err(topology::RunError::Failure),
-//!             Err(error) => Err(topology::RunError::from(error)),
+//!             Ok(result) => result.map_err(run::RunError::Failure),
+//!             Err(error) => Err(run::RunError::from(error)),
 //!         }),
 //!     );
 //!     Ok(())
@@ -100,13 +93,13 @@
 //!     core::{BranchError, driver::{route::KeyTag, storage::With}},
 //!     manifold::{BuildError, app::env::Bundle},
 //!     net::{tcp::Tcp, wire::{Identity, domain}},
-//!     runtime::{executor::session, process, topology::{self, lending, ops}},
+//!     runtime::{executor::session, process, topology::{self, ops}},
 //! };
 //! use dope::core::driver::life::recovery::{Policy, Recovery};
 //! use std::convert::Infallible;
 //! use dope_fiber::task::storage::scope::Brand;
 //! use sark_fiber::{Config, Throughput, server::PrepareError};
-//! use sark_h1::server::date::Clock;
+//! use sark_h1::server::{date::Clock, run};
 //!
 //! fn escape(
 //!     context: process::Context<'static>,
@@ -122,7 +115,7 @@
 //!         Policy::new(drop, |error: Recovery<'_, '_>| -> Infallible {
 //!             panic!("native recovery: {:?}", error.cause())
 //!         }),
-//!         |result: Result<_, topology::RunError<'_, _, _, _, _, _>>| {
+//!         |result: Result<_, run::RunError<'_, _, _, _, _, _>>| {
 //!             result.as_ref().map(|_| ()).map_err(|error| error.cause()).expect("server");
 //!         },
 //!     );
@@ -134,24 +127,19 @@
 //!     let plan = provider.compose(owner, plan, move |plan, owner, stage| {
 //!         stage.hold(owner, |held, stage| {
 //!             Brand::with(|brand| {
-//!                 let result = plan.prepare_in(stage, domain::Local::new(Identity), |prepared, stage| {
-//!                     held.lend_scope(stage, report, |issued| {
+//!                 plan.prepare_in(stage, domain::Local::new(Identity), |prepared, wait, stage| {
+//!                     let result = held.lend_scope(stage, report, |issued| {
 //!                         let (client, permit) = issued.into_parts();
 //!                         *slot = Some(client);
 //!                         let state = std::pin::pin!(State::<_, 2> {
 //!                             source: (client, task::State { first, second: b"", encoded }),
 //!                         });
 //!                         App::run_prepared(
-//!                             brand, state.as_ref(), config, prepared, permit,
+//!                             brand, state.as_ref(), config, prepared, wait, permit,
 //!                         )
-//!                     })
-//!                 }).map_err(|error| topology::Failure::Install(BuildError::Create(error)))?;
-//!                 match result {
-//!                     Ok(Ok(request)) => Ok(request),
-//!                     Ok(Err(error)) => Err(topology::Failure::Run(session::Error::Drive(error))),
-//!                     Err(lending::Error::Build(error)) => Err(topology::Failure::Install(error)),
-//!                     Err(lending::Error::Run(error)) => Err(topology::Failure::Run(error)),
-//!                 }
+//!                     });
+//!                     run::Failure::lending(result)
+//!                 }).map_err(|error| run::Failure::Install(BuildError::Create(error)))?
 //!             })
 //!         })
 //!     });
@@ -160,15 +148,13 @@
 //!         context,
 //!         ops::Map(ops::Compose, |result| match result {
 //!             Ok(Ok(request)) => Ok(request),
-//!             Ok(Err(topology::Failure::Run(error))) => Err(topology::Failure::Run(error)),
-//!             Ok(Err(topology::Failure::Install(error))) =>
-//!                 Err(topology::Failure::Install(BranchError::Second(error))),
-//!             Err(error) => Err(topology::Failure::Install(BranchError::First(error))),
+//!             Ok(Err(error)) => Err(run::Failure::map_install(error, BranchError::Second)),
+//!             Err(error) => Err(run::Failure::Install(BranchError::First(error))),
 //!         }),
 //!         recovery,
 //!         |outcome| finish(match outcome {
-//!             Ok(result) => result.map_err(topology::RunError::Failure),
-//!             Err(error) => Err(topology::RunError::from(error)),
+//!             Ok(result) => result.map_err(run::RunError::Failure),
+//!             Err(error) => Err(run::RunError::from(error)),
 //!         }),
 //!     );
 //!     drop(escaped);
@@ -528,6 +514,19 @@
 //! }
 //! ```
 
+//! A listener's sole terminal waiter cannot be copied into competing observers.
+//!
+//! ```compile_fail,E0382
+//! use sark_h1::server::run::Wait;
+//!
+//! fn duplicate<'a, 'd>(wait: Wait<'a, 'd>) {
+//!     let first = wait;
+//!     let second = wait;
+//!     drop((first, second));
+//! }
+//! # fn main() {}
+//! ```
+
 use std::env;
 
 use dope_test::checks::{Error, Suite};
@@ -558,14 +557,20 @@ fn dependent_state() -> Result<(), Error> {
             "sark-json",
         ],
     );
-    let exe = env::current_exe()?;
-    let output = suite.try_build(&exe, env!("CARGO_PKG_NAME"))?.output()?;
+    let exe = env::current_exe().expect("current test executable");
+    let output = suite
+        .try_build(&exe, env!("CARGO_PKG_NAME"))?
+        .output()
+        .expect("run cargo");
     let suite = suite.try_collect(&exe, output)?;
     assert_eq!(
-        suite.try_errors(include_str!("sark_fiber_compile_contracts.rs"))?,
-        6
+        suite.try_errors(include_str!("sark_fiber_compile_contracts.rs"), compile)?,
+        7
     );
-    let output = suite.try_compile(include_str!("common/sark_fiber_hrtb.rs"))?;
+    let output = compile(
+        &mut suite.compiler(),
+        include_str!("common/sark_fiber_hrtb.rs"),
+    );
     assert!(!output.status.success());
     let errors = String::from_utf8(output.stderr).expect("UTF-8 diagnostics");
     assert_eq!(
@@ -578,10 +583,23 @@ fn dependent_state() -> Result<(), Error> {
         2,
         "{errors}",
     );
-    let status = suite.try_rustdoc()?.status()?;
+    let status = suite.try_rustdoc()?.status().expect("run rustdoc");
     assert!(
         status.success(),
         "dependent state entry contracts: {status}"
     );
     Ok(())
+}
+
+fn compile(command: &mut std::process::Command, source: &str) -> std::process::Output {
+    let mut child = command.spawn().expect("start compiler");
+    let written = child
+        .stdin
+        .take()
+        .map(|mut input| std::io::Write::write_all(&mut input, source.as_bytes()));
+    let output = child.wait_with_output().expect("reap compiler");
+    written
+        .expect("compiler stdin")
+        .expect("write compiler source");
+    output
 }

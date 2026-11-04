@@ -4,6 +4,7 @@ use std::{convert::Infallible, mem};
 
 use dope::{
     core::Errno,
+    manifold::client::conn::Transmit,
     net::{
         wire,
         wire::{failure, terminal},
@@ -73,6 +74,18 @@ pub enum Disarm {
 pub enum Failure<E> {
     Wire(E),
     Receive(Errno),
+    Transmit(Transmit),
+}
+
+fn native<D>(receive: Option<Errno>, transmit: Option<Transmit>) -> Option<Error<D>> {
+    match transmit {
+        Some(error) => Some(Error::Transmit {
+            error,
+            receive,
+            wire: None,
+        }),
+        None => receive.map(Error::receive),
+    }
 }
 
 #[doc(hidden)]
@@ -159,7 +172,7 @@ impl<E: Impossible> Policy<E> for Never {
     where
         E: 'f;
     type State<'f, 'd>
-        = region::Value<region::Identity<'d>, Option<Errno>>
+        = region::Value<region::Identity<'d>, (Option<Errno>, Option<Transmit>)>
     where
         E: 'f;
 
@@ -178,7 +191,7 @@ impl<E: Impossible> Policy<E> for Never {
     where
         E: 'f,
     {
-        token.bind(None)
+        token.bind((None, None))
     }
 
     fn arm<'f, 'd>(
@@ -189,9 +202,10 @@ impl<E: Impossible> Policy<E> for Never {
     where
         E: 'f,
     {
-        match *token.borrow_mut(state) {
+        let (receive, transmit) = *token.borrow(state);
+        match native(receive, transmit) {
             None => Arm::Ready,
-            Some(errno) => Arm::Failed(Error::receive(errno)),
+            Some(error) => Arm::Failed(error),
         }
     }
 
@@ -202,9 +216,9 @@ impl<E: Impossible> Policy<E> for Never {
     where
         E: 'f,
     {
-        match token.borrow_mut(state) {
-            Some(_) => Disarm::Detailed,
-            None => Disarm::Vacant,
+        match token.borrow(state) {
+            (None, None) => Disarm::Vacant,
+            _ => Disarm::Detailed,
         }
     }
 
@@ -215,13 +229,14 @@ impl<E: Impossible> Policy<E> for Never {
     ) where
         E: 'f,
     {
+        let (receive, transmit) = token.borrow_mut(state);
         match cause {
             Failure::Wire(cause) => cause.eliminate(),
             Failure::Receive(errno) => {
-                let stored = token.borrow_mut(state);
-                if stored.is_none() {
-                    *stored = Some(errno);
-                }
+                receive.get_or_insert(errno);
+            }
+            Failure::Transmit(failure) => {
+                transmit.get_or_insert(failure);
             }
         }
     }
@@ -234,12 +249,13 @@ impl<E: Impossible> Policy<E> for Never {
     where
         E: 'f,
     {
-        let cause = (*token.borrow(state)).map(Error::receive);
+        let (receive, transmit) = mem::take(token.borrow_mut(state));
+        let cause = native(receive, transmit);
         let progress = run(cause.as_ref(), reply::Retirement::new(token));
-        match progress {
-            reply::Progress::Complete(_) => *token.borrow_mut(state) = None,
-            reply::Progress::Pending(_) => {}
-        }
+        *token.borrow_mut(state) = match progress {
+            reply::Progress::Complete(_) => (None, None),
+            reply::Progress::Pending(_) => (receive, transmit),
+        };
         progress
     }
 }
@@ -249,6 +265,7 @@ enum Record<'f, E> {
     Armed {
         slot: Unique<'f, shared::Resident<E>, shared::Header<E>>,
         receive: Option<Errno>,
+        transmit: Option<Transmit>,
     },
     Detailed(Error<Cause<'f, E>>),
 }
@@ -306,6 +323,7 @@ impl<E> Policy<E> for Retain {
                     *report = Record::Armed {
                         slot: vacancy.reserve(),
                         receive: None,
+                        transmit: None,
                     };
                     Arm::Ready
                 }
@@ -323,15 +341,22 @@ impl<E> Policy<E> for Retain {
     {
         let report = token.borrow_mut(&state.0);
         match report {
-            Record::Vacant | Record::Armed { receive: None, .. } => {
+            Record::Vacant
+            | Record::Armed {
+                receive: None,
+                transmit: None,
+                ..
+            } => {
                 *report = Record::Vacant;
                 Disarm::Vacant
             }
             Record::Armed {
-                receive: Some(errno),
-                ..
+                receive, transmit, ..
             } => {
-                *report = Record::Detailed(Error::receive(*errno));
+                match native(*receive, *transmit) {
+                    Some(error) => *report = Record::Detailed(error),
+                    None => unreachable!("report"),
+                }
                 Disarm::Detailed
             }
             Record::Detailed(_) => Disarm::Detailed,
@@ -349,38 +374,63 @@ impl<E> Policy<E> for Retain {
         *report = match (mem::replace(report, Record::Vacant), cause) {
             (Record::Vacant, Failure::Wire(_)) => Record::Vacant,
             (Record::Vacant, Failure::Receive(errno)) => Record::Detailed(Error::receive(errno)),
+            (Record::Vacant, Failure::Transmit(error)) => Record::Detailed(Error::transmit(error)),
             (
                 Record::Armed {
                     slot,
-                    receive: None,
+                    mut receive,
+                    transmit,
                 },
                 Failure::Receive(errno),
-            ) => Record::Armed {
-                slot,
-                receive: Some(errno),
-            },
+            ) => {
+                receive.get_or_insert(errno);
+                Record::Armed {
+                    slot,
+                    receive,
+                    transmit,
+                }
+            }
             (
-                armed @ Record::Armed {
-                    receive: Some(_), ..
+                Record::Armed {
+                    slot,
+                    receive,
+                    mut transmit,
                 },
-                Failure::Receive(_),
-            ) => armed,
-            (Record::Armed { slot, receive }, Failure::Wire(cause)) => {
+                Failure::Transmit(error),
+            ) => {
+                transmit.get_or_insert(error);
+                Record::Armed {
+                    slot,
+                    receive,
+                    transmit,
+                }
+            }
+            (
+                Record::Armed {
+                    slot,
+                    receive,
+                    transmit,
+                },
+                Failure::Wire(cause),
+            ) => {
                 let cause = Cause::new(slot.commit(cause));
                 let error = match receive {
                     Some(errno) => Error::wire_receive(cause, errno),
                     None => Error::wire(cause),
                 };
+                let error = match transmit {
+                    Some(transmit) => error.with_transmit(transmit),
+                    None => error,
+                };
                 Record::Detailed(error)
             }
-            (
-                Record::Detailed(Error::Wire {
-                    detail,
-                    receive: None,
-                }),
-                Failure::Receive(errno),
-            ) => Record::Detailed(Error::wire_receive(detail, errno)),
-            (detailed @ Record::Detailed(_), Failure::Receive(_) | Failure::Wire(_)) => detailed,
+            (Record::Detailed(error), Failure::Receive(errno)) => {
+                Record::Detailed(error.with_receive(errno))
+            }
+            (Record::Detailed(error), Failure::Transmit(transmit)) => {
+                Record::Detailed(error.with_transmit(transmit))
+            }
+            (detailed @ Record::Detailed(_), Failure::Wire(_)) => detailed,
         };
     }
 
@@ -397,10 +447,9 @@ impl<E> Policy<E> for Retain {
         let progress = match &record {
             Record::Detailed(error) => run(Some(error), retiring),
             Record::Armed {
-                receive: Some(errno),
-                ..
-            } => run(Some(&Error::receive(*errno)), retiring),
-            Record::Vacant | Record::Armed { receive: None, .. } => run(None, retiring),
+                receive, transmit, ..
+            } => run(native(*receive, *transmit).as_ref(), retiring),
+            Record::Vacant => run(None, retiring),
         };
         let next = match progress {
             reply::Progress::Complete(_) => Record::Vacant,
@@ -413,7 +462,7 @@ impl<E> Policy<E> for Retain {
 
 const _: () = assert!(
     mem::size_of::<<Never as Policy<Infallible>>::State<'static, 'static>>()
-        == mem::size_of::<Option<Errno>>()
+        == mem::size_of::<(Option<Errno>, Option<Transmit>)>()
 );
 const _: () = assert!(mem::size_of::<<Never as Policy<Infallible>>::Pool>() == 0);
 const _: () = assert!(mem::size_of::<<Never as Policy<Infallible>>::Source<'static>>() == 0);

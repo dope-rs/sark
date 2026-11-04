@@ -4,7 +4,7 @@ use dope::{
     core::Errno,
     manifold::{
         app::receive,
-        client::{close, deadline},
+        client::{close, conn, deadline},
     },
     net::link::{egress::reserve::exact, event},
 };
@@ -80,8 +80,18 @@ pub enum Error<D = Infallible> {
     Retain(rc::Error),
     Ingress(receive::Failure),
     Egress(exact::Failure),
-    Receive { errno: Errno },
-    Wire { detail: D, receive: Option<Errno> },
+    Receive {
+        errno: Errno,
+    },
+    Wire {
+        detail: D,
+        receive: Option<Errno>,
+    },
+    Transmit {
+        error: conn::Transmit,
+        receive: Option<Errno>,
+        wire: Option<D>,
+    },
 }
 
 impl<D> Error<D> {
@@ -106,6 +116,45 @@ impl<D> Error<D> {
         Self::Receive { errno }
     }
 
+    #[doc(hidden)]
+    pub const fn transmit(error: conn::Transmit) -> Self {
+        Self::Transmit {
+            error,
+            receive: None,
+            wire: None,
+        }
+    }
+
+    /// Adds a receive failure without replacing an earlier failure.
+    #[doc(hidden)]
+    pub fn with_receive(mut self, errno: Errno) -> Self {
+        match &mut self {
+            Self::Wire { receive, .. } | Self::Transmit { receive, .. } => {
+                receive.get_or_insert(errno);
+            }
+            _ => {}
+        }
+        self
+    }
+
+    /// Adds a send failure while retaining an earlier wire or receive cause.
+    #[doc(hidden)]
+    pub fn with_transmit(self, error: conn::Transmit) -> Self {
+        match self {
+            Self::Wire { detail, receive } => Self::Transmit {
+                error,
+                receive,
+                wire: Some(detail),
+            },
+            Self::Receive { errno } => Self::Transmit {
+                error,
+                receive: Some(errno),
+                wire: None,
+            },
+            _ => self,
+        }
+    }
+
     pub const fn kind(&self) -> Kind {
         match self {
             Self::Classified(kind) => *kind,
@@ -115,12 +164,15 @@ impl<D> Error<D> {
             }
             Self::Receive { .. } => Kind::Transport,
             Self::Wire { .. } => Kind::Wire,
+            Self::Transmit { wire: Some(_), .. } => Kind::Wire,
+            Self::Transmit { wire: None, .. } => Kind::Transport,
         }
     }
 
     pub const fn detail(&self) -> Option<&D> {
         match self {
             Self::Wire { detail, .. } => Some(detail),
+            Self::Transmit { wire, .. } => wire.as_ref(),
             Self::Classified(_)
             | Self::Park(_)
             | Self::Ready(_)
@@ -144,6 +196,18 @@ impl Error<Infallible> {
             Self::Egress(error) => Error::Egress(error),
             Self::Receive { errno } => Error::Receive { errno },
             Self::Wire { detail, .. } => match detail {},
+            Self::Transmit {
+                error,
+                receive,
+                wire,
+            } => match wire {
+                Some(detail) => match detail {},
+                None => Error::Transmit {
+                    error,
+                    receive,
+                    wire: None,
+                },
+            },
         }
     }
 }
@@ -162,11 +226,23 @@ impl<D: Detail> Error<D> {
                 detail: detail.try_clone()?,
                 receive: *receive,
             },
+            Self::Transmit {
+                error,
+                receive,
+                wire,
+            } => Self::Transmit {
+                error: *error,
+                receive: *receive,
+                wire: wire.as_ref().map(Detail::try_clone).transpose()?,
+            },
         })
     }
 }
 
 const _: () = {
     assert!(mem::size_of::<Cause<'static, ()>>() == mem::size_of::<usize>());
-    assert!(mem::size_of::<Error<usize>>() == mem::size_of::<receive::Failure>());
+    assert!(
+        mem::size_of::<Error<usize>>()
+            <= mem::size_of::<(conn::Transmit, Option<Errno>, Option<usize>, usize)>()
+    );
 };

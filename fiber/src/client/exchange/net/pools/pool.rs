@@ -2,7 +2,12 @@ use std::{convert::Infallible, marker, marker::PhantomData};
 
 use dope::{
     core::driver::{self, route::Identity, schedule::app},
-    manifold::client::{close, conn::Id, deadline, port, session::turns},
+    manifold::client::{
+        close,
+        conn::Id,
+        deadline, port,
+        session::{Input, turns},
+    },
     net::link::egress,
 };
 use dope_fiber::reply::{self, Registration, order::Depth, recv::attach};
@@ -169,6 +174,30 @@ where
         self.directory.schedule(token, bound)
     }
 
+    /// Partial HTTP heads already retain the request bound by the codec.
+    /// Unprocessed input must settle before another reply can be registered.
+    pub(in crate::client) fn input(
+        &self,
+        token: &mut region::Token<region::Identity<'d>>,
+        id: Id<'d, ID>,
+        input: Input,
+    ) -> Option<Tag> {
+        let bound = self.directory.entry(id)?;
+        let entry = bound.entry;
+        match (entry.state.get(), input) {
+            (State::Ready(position, tag), Input::Yield | Input::Blocked) => {
+                entry.state.set(State::Receiving(position, tag));
+                self.directory.ready.remove(token, &bound);
+                None
+            }
+            (State::Receiving(position, tag), Input::Empty | Input::Partial) => {
+                entry.state.set(State::Ready(position, tag));
+                self.schedule(token, &bound)
+            }
+            _ => None,
+        }
+    }
+
     pub(in crate::client::exchange::net) fn seal(
         &self,
         token: &mut region::Token<region::Identity<'d>>,
@@ -197,7 +226,7 @@ where
     ) -> Id<'d, ID> {
         let id = bound.connection();
         let entry = bound.entry;
-        if matches!(entry.state.get(), State::Ready(..)) {
+        if matches!(entry.state.get(), State::Ready(..) | State::Receiving(..)) {
             entry.state.set(State::Closing(bound.position(), bound.tag));
             self.responses
                 .lane(bound.position())
@@ -374,6 +403,9 @@ where
         let Some(bound) = self.directory.entry(id) else {
             return net::Arm::Missing;
         };
+        if !matches!(bound.entry.state.get(), State::Ready(..)) {
+            return net::Arm::Missing;
+        }
         match F::arm(&self.reports, &bound.entry.report, token) {
             report::Arm::Ready => net::Arm::Ready(bound),
             report::Arm::Exhausted => net::Arm::FailureReport(bound),

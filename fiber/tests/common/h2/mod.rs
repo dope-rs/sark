@@ -18,5 +18,6 @@ pub mod server;
 
 pub mod events;
 pub mod peer;
+pub mod tls;
 
 mod session;

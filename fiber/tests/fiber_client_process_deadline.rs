@@ -1,9 +1,9 @@
-use std::{convert::Infallible, io::Write as _, thread, time::Duration};
+use std::{convert::Infallible, thread, time::Duration};
 
 use common::client::recover;
 use common::client::{
-    gzip,
-    runtime::{origins, peer},
+    gzip, retry,
+    runtime::{origins, peer, pools},
 };
 use dope::core::{driver::life::recovery, io::Reclaimed};
 use dope_fiber::{
@@ -62,7 +62,8 @@ fn processing_bound() {
                                     "/",
                                     &[],
                                     &[],
-                                    |response, check| {
+                                    |response, check, attempt| {
+                                        assert_eq!(attempt.get(), 1);
                                         assert_eq!(
                                             response.body().contiguous(),
                                             Some(b"decoded".as_slice())
@@ -124,6 +125,121 @@ fn processing_bound() {
 }
 
 #[test]
+fn recovered_process_attempt() {
+    for (fixed, elapsed) in [(true, false), (false, false), (false, true)] {
+        let mut failures = 2;
+        AcceptScript::with(
+            move |acceptor| {
+                peer::serve_each(acceptor, move |stream, request| {
+                    assert_eq!(request.method(), "GET");
+                    assert_eq!(request.target(), "/retry");
+                    if failures != 0 {
+                        failures -= 1;
+                        return peer::try_shutdown(stream);
+                    }
+                    stream.write_all(
+                        b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok",
+                    )
+                })
+            },
+            |server| {
+                let config = Config::new(server.addr().to_string()).timeout(Duration::from_secs(3));
+                let mut attempts = [(0, Safety::BeforeSubmit, false); 2];
+                if fixed {
+                    pools::Plan::new(server.addr(), config, 1, 1)
+                        .expect("fixed client plan")
+                        .enter(
+                            |mut app| {
+                                let handle = app.handle;
+                                app.wait().expect("fixed client readiness");
+                                let (response, attempt) = app
+                                    .app
+                                    .block_on(handle.process_observed(
+                                        Method::GET,
+                                        "/retry",
+                                        &[],
+                                        &[],
+                                        retry::observe(&mut attempts),
+                                        |response, _, attempt| {
+                                            Ok::<_, process::Error<Infallible>>((response, attempt))
+                                        },
+                                    ))
+                                    .expect("drive retry")
+                                    .expect("recovered request")
+                                    .expect("processed response");
+                                assert_eq!(attempt.get(), 3);
+                                assert_eq!(response.body().contiguous(), Some(b"ok".as_slice()));
+                            },
+                            recovery::Policy::new(
+                                |event| std::assert_matches!(event, Reclaimed::Shutdown),
+                                recover,
+                            ),
+                            |result| result.expect("client execution"),
+                        )
+                        .expect("fixed client shutdown");
+                } else {
+                    origins::Plan::new(config, 1, 1, 1)
+                        .expect("client plan")
+                        .enter(
+                            |mut app| {
+                                let handle = app.handle;
+                                let result = app
+                                    .app
+                                    .block_on(handle.process_observed(
+                                        Method::GET,
+                                        "/retry",
+                                        &[],
+                                        &[],
+                                        retry::observe(&mut attempts),
+                                        |response, _, attempt| {
+                                            assert_eq!(attempt.get(), 3);
+                                            if elapsed {
+                                                return Err(process::Error::Elapsed(Elapsed::Limit));
+                                            }
+                                            Ok::<_, process::Error<Infallible>>((response, attempt))
+                                        },
+                                    ))
+                                    .expect("drive retry");
+                                if elapsed {
+                                    let failure = result.err().expect("expired recovered processing");
+                                    assert_eq!(failure.attempt(), 3);
+                                    assert_eq!(failure.safety(), Safety::PossiblyCommitted);
+                                    assert!(matches!(failure.cause(), Error::Timeout(cause)
+                                        if cause.phase() == Phase::Decode && cause.elapsed() == Elapsed::Limit));
+                                } else {
+                                    let (response, attempt) = result
+                                        .expect("recovered request")
+                                        .expect("processed response");
+                                    assert_eq!(attempt.get(), 3);
+                                    assert_eq!(response.body().contiguous(), Some(b"ok".as_slice()));
+                                }
+                            },
+                            recovery::Policy::new(
+                                |event| std::assert_matches!(event, Reclaimed::Shutdown),
+                                recover,
+                            ),
+                            |result| result.expect("client execution"),
+                        )
+                        .expect("client shutdown");
+                }
+                assert_eq!(
+                    attempts,
+                    [
+                        (1, Safety::PossiblyCommitted, true),
+                        (2, Safety::PossiblyCommitted, true),
+                    ]
+                );
+                server
+                    .stop()
+                    .expect("peer thread")
+                    .expect("stop retry peer");
+            },
+        )
+        .expect("spawn retry peer");
+    }
+}
+
+#[test]
 fn pending_process_cancels() {
     let short = Duration::from_millis(200);
     let long = Duration::from_secs(2);
@@ -151,7 +267,6 @@ fn pending_process_cancels() {
                 assert_eq!(request.method(), "POST");
                 assert_eq!(request.target(), "/cancel");
                 first.write_all(prefix)?;
-                first.flush()?;
                 peer::closed(&mut first)?;
                 let socket = acceptor.accept()?;
                 let mut next = peer::Conn::new(&socket);
@@ -174,14 +289,16 @@ fn pending_process_cancels() {
                         |mut app| {
                             let handle = app.handle;
                             let mut called = false;
+                            let mut retries = 0;
                             let failure = app
                                 .app
-                                .block_on(handle.process(
+                                .block_on(handle.process_observed(
                                     Method::POST,
                                     "/cancel",
                                     &[],
                                     &[],
-                                    |_, _| {
+                                    |_| retries += 1,
+                                    |_, _, _| {
                                         called = true;
                                         Ok::<_, process::Error<Infallible>>(())
                                     },
@@ -189,6 +306,7 @@ fn pending_process_cancels() {
                                 .expect("drive pending process")
                                 .expect_err("pending timeout");
                             assert!(!called);
+                            assert_eq!(retries, 0);
                             assert_eq!(failure.attempt(), 1);
                             assert_eq!(failure.safety(), Safety::PossiblyCommitted);
                             assert!(matches!(failure.cause(), Error::Timeout(cause)

@@ -24,7 +24,7 @@ impl<S> State<S> {
     pub const fn new(source: S, limit: Limit) -> Self {
         Self {
             source,
-            inner: state::State::new(limit),
+            inner: state::State::new(Kind, limit),
         }
     }
 }
@@ -72,7 +72,7 @@ impl<S: buffer::raw::Source> State<S> {
 
     /// Retains the exact incomplete line after the request-line parser needs input.
     pub fn pending_line(source: S, limit: Limit) -> Result<Self, (S, ParseError<Infallible>)> {
-        match state::State::pending_line(source.as_ref(), limit) {
+        match state::State::pending_line(Kind, source.as_ref(), limit) {
             Ok(inner) => Ok(Self { source, inner }),
             Err(error) => Err((source, error)),
         }

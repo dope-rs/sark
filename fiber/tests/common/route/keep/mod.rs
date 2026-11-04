@@ -135,7 +135,7 @@ impl<O> Server<O> {
                         stage,
                         domain::Local::<wire::Identity, _>::new(wire::Identity),
                         app,
-                        |root, stage| {
+                        |root, _wait, stage| {
                             let result = stage
                                 .run_quiesce(complete, root, Duration::from_secs(2))
                                 .map_err(topology::Failure::Run)?;

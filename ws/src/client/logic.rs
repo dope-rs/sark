@@ -381,9 +381,10 @@ impl<'life, 'e: 'life, 'd: 'e, ID: Identity, H, M: Event<'d, H, ID>>
 
     fn disconnect(
         owner: &mut Owner<'life, 'e, 'd, H, M, ID>,
-        ctx: turns::Retired<'_, 'd, Self::ConnState, ID, Owner<'life, 'e, 'd, H, M, ID>>,
+        mut ctx: turns::Retired<'_, 'd, Self::ConnState, ID, Owner<'life, 'e, 'd, H, M, ID>>,
     ) {
         let reason = ctx.reason();
+        let transmit = ctx.take_transmit();
         let (link, state, region) = ctx.into_parts();
         let conn = link.connection();
         let port = owner.root();
@@ -391,21 +392,29 @@ impl<'life, 'e: 'life, 'd: 'e, ID: Identity, H, M: Event<'d, H, ID>>
         port.shared.conn_id.clear(conn);
         port.shared.wake_waiter();
         port.shared.wake();
-        let reason = state.take_reason(reason);
-        M::close(&mut logic.handler, reason, region);
+        let closed = client::Closed {
+            reason: state.take_reason(reason),
+            transmit,
+        };
+        M::close(&mut logic.handler, closed, region);
     }
 }
 
 impl<'life, 'e: 'life, 'd: 'e, ID: Identity + 'life, H, M>
     policy::Output<'life, 'd, Port<'e, 'd, ID>, ID, MAX_CONNECTIONS> for Logic<H, M, ID>
 {
-    fn flush() -> impl for<'a, 'x, 'y, 'z> Call<(
-        &'a mut Owner<'life, 'e, 'd, H, M, ID>,
-        &'x mut turns::Context<'y, 'z, 'd, Self::ConnState, Self::Send, ID>,
-    )> {
-        output::Flush::<_>::Ready(|owner: &mut Owner<'life, 'e, 'd, H, M, ID>| {
-            owner.root().shared.wake_waiter();
-        })
+    fn flush() -> Option<
+        impl for<'a, 'x, 'y, 'z> Call<(
+            &'a mut Owner<'life, 'e, 'd, H, M, ID>,
+            &'x mut turns::Context<'y, 'z, 'd, Self::ConnState, Self::Send, ID>,
+            session::Input,
+        )>,
+    > {
+        Some(output::Flush::<_>::Ready(
+            |owner: &mut Owner<'life, 'e, 'd, H, M, ID>| {
+                owner.root().shared.wake_waiter();
+            },
+        ))
     }
 
     fn sent() -> impl for<'a, 'x> Call<(

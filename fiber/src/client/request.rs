@@ -1,4 +1,4 @@
-use std::time;
+use std::{num::NonZero, time};
 
 use dope::{
     core::driver::{
@@ -148,20 +148,28 @@ impl<'app, 'f, 'w: 'app + 'f, 'd: 'app + 'f, B: ?Sized, ID: Identity, W: wire::S
 where
     F: report::Policy<terminal::Error<'w, W>>,
 {
-    fn process<'r, T, E, P>(
+    fn process_observed<'r, T, E, P, O>(
         &'r self,
         method: Method,
         path: &'r str,
         headers: &'r [(&'r str, &'r str)],
         body: &'r [u8],
+        observe: O,
         process: P,
     ) -> impl abi::Fiber<'d, Output = Result<Result<T, E>, Self::Error>> + 'r
     where
-        P: FnOnce(reply::Scoped<'app, 'd>, budget::Check<'d>) -> Result<T, process::Error<E>> + 'r,
+        O: FnMut(&Self::Error) + 'r,
+        P: FnOnce(
+                reply::Scoped<'app, 'd>,
+                budget::Check<'d>,
+                NonZero<u8>,
+            ) -> Result<T, process::Error<E>>
+            + 'r,
         T: 'r,
         E: 'r,
     {
-        self.call(method, path, headers, body).process(process)
+        self.call(method, path, headers, body)
+            .process(observe, process)
     }
 }
 

@@ -81,6 +81,7 @@ impl<'a> Decoder<'a> {
         budget: &resident::Budget<'d>,
         method: impl FnOnce() -> Option<Method>,
     ) -> Result<Option<(output::Output<'d>, NonZero<usize>)>, Error> {
+        self.codec.bind(storage, state, method);
         let before = storage.source().as_ref().len();
         let mut output = None;
         let target = &mut output;
@@ -91,7 +92,7 @@ impl<'a> Decoder<'a> {
                           state: &mut State<'d>| {
                         *target = Some(
                             parsed
-                                .map(|head| self.codec.admit(state, head, method))
+                                .map(|head| self.codec.admit(state, head))
                                 .map_err(Error::Protocol),
                         );
                     },
@@ -129,7 +130,7 @@ impl<'a> Decoder<'a> {
                               state: &mut State<'d>| {
                             *target = Some(
                                 parsed
-                                    .map(|head| self.codec.admit(state, head, || None))
+                                    .map(|head| self.codec.admit(state, head))
                                     .map_err(Error::Protocol),
                             );
                         },

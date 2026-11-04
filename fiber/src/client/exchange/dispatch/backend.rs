@@ -80,6 +80,8 @@ pub(in crate::client) trait Backend<'app, 'd>: Copy + Unpin {
         context: pin::Pin<&context::Context<'_, 'd>>,
     ) -> Result<(), capacity::Error>;
 
+    fn cancel(self, entry: &mut queue::Registration<'app, 'd, Self::Lanes>);
+
     fn submit<'turn>(
         self,
         ready: Self::Connected,
@@ -194,6 +196,10 @@ where
         _: driver::Context<'turn, 'd>,
     ) -> Result<Self::Stream, Error<Self::Cause, Self::Mailbox>> {
         match ready {}
+    }
+
+    fn cancel(self, entry: &mut queue::Registration<'app, 'd, Self::Lanes>) {
+        self.port.protocol.transport.waiters.cancel(entry);
     }
 }
 
@@ -329,5 +335,9 @@ impl<'app, 'o, 'q, 'e, 'b, 'c, 'd: 'app, B: ?Sized, ID: Identity + 'd> Backend<'
                 Err(error.widen())
             }
         }
+    }
+
+    fn cancel(self, entry: &mut queue::Registration<'app, 'd, Self::Lanes>) {
+        self.port.protocol.transport.waiters.cancel(entry);
     }
 }

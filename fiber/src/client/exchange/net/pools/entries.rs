@@ -27,6 +27,7 @@ pub(super) enum State<P, T> {
     Admitted(P),
     Connecting(P),
     Ready(P, T),
+    Receiving(P, T),
     Closing(P, T),
     Drained(P, T),
 }
@@ -35,6 +36,7 @@ impl<P: Copy, T: Copy> State<P, T> {
     pub(super) fn current(self) -> Option<(P, T)> {
         match self {
             Self::Ready(position, tag)
+            | Self::Receiving(position, tag)
             | Self::Closing(position, tag)
             | Self::Drained(position, tag) => Some((position, tag)),
             Self::Vacant | Self::Admitting | Self::Admitted(_) | Self::Connecting(_) => None,
@@ -114,7 +116,7 @@ impl<'b, 'd, ID: Identity, Tag: Copy, S> Positioned<'_, 'b, 'd, ID, Tag, S> {
         self.position.connection()
     }
 
-    pub(in crate::client::exchange::net) const fn position(&self) -> layout::Position<'b, 'd, ID> {
+    pub(in crate::client) const fn position(&self) -> layout::Position<'b, 'd, ID> {
         self.position
     }
 }
@@ -202,7 +204,7 @@ impl<'b, 'd, ID: Identity, Tag: net::PoolTag<'d, ID>, S> Directory<'b, 'd, ID, T
         })
     }
 
-    pub(in crate::client::exchange::net) fn try_current(
+    pub(in crate::client) fn try_current(
         &self,
         id: conn::Id<'d, ID>,
     ) -> Result<Positioned<'_, 'b, 'd, ID, Tag, S>, net::Open> {

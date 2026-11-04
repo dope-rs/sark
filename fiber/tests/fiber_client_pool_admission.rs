@@ -14,7 +14,6 @@ use dope_test::{fibers, harness::peer::AcceptScript};
 pub mod common;
 
 use std::{
-    io::{ErrorKind, Read as _, Write as _},
     num::NonZero,
     thread,
     time::{Duration, Instant},
@@ -116,9 +115,8 @@ fn close_head_revokes_pool() {
             assert_eq!(request.target(), "/second");
             let mut byte = [0];
             match first.try_read(&mut byte) {
-                Err(error) if error.kind() == ErrorKind::WouldBlock => {}
-                Ok(0) => {}
-                Ok(read) => {
+                Ok(None | Some(0)) => {}
+                Ok(Some(read)) => {
                     assert_eq!(read, 0, "second request leaked onto the closing connection")
                 }
                 Err(error) => return Err(error.into()),
@@ -175,9 +173,8 @@ fn drop_seals_same_poll() {
         AcceptScript::with(
             |acceptor| -> Result<_, peer::Error> {
                 let first_io = acceptor.accept()?;
-                let mut first = Conn::new(&first_io);
                 let mut wire = Vec::new();
-                first.read_to_end(&mut wire)?;
+                first_io.read_to_end(&mut wire)?;
                 assert!(
                     !wire
                         .windows(b"POST /replacement ".len())

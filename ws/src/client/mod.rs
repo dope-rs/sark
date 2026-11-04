@@ -7,7 +7,7 @@ use dope::{
     },
     manifold::{
         app::receive,
-        client::{close, deadline},
+        client::{close, conn, deadline},
     },
     net::link::{
         egress::{
@@ -160,6 +160,12 @@ pub enum CloseReason {
     Send(Error),
 }
 
+/// A connection's terminal reason and any exact native send failure.
+pub struct Closed {
+    pub reason: CloseReason,
+    pub transmit: Option<conn::Transmit>,
+}
+
 impl CloseReason {
     fn lifecycle(&self) -> close::Reason {
         match self {
@@ -217,13 +223,13 @@ pub trait Handshake {
 pub trait Observer: Handshake {
     fn open(&mut self);
     fn message(&mut self, msg: Message<'_>);
-    fn close(&mut self, reason: CloseReason);
+    fn close(&mut self, closed: Closed);
 }
 
 pub trait Egress<'d, ID: Identity = KeyTag<0>> {
     fn open(&mut self, send: &mut send::Sender<'_, '_, '_, 'd, ID>);
     fn message(&mut self, msg: Message<'_>);
-    fn close(&mut self, reason: CloseReason);
+    fn close(&mut self, closed: Closed);
 }
 
 pub trait Handler<'d> {
@@ -234,7 +240,7 @@ pub trait Handler<'d> {
     ) -> Result<headers::Encoded, Error>;
     fn open(&mut self, local: local::Access<'_, region::Identity<'d>>);
     fn message(&mut self, msg: Message<'_>, local: local::Access<'_, region::Identity<'d>>);
-    fn close(&mut self, reason: CloseReason, local: local::Access<'_, region::Identity<'d>>);
+    fn close(&mut self, closed: Closed, local: local::Access<'_, region::Identity<'d>>);
 }
 
 /// Activation failure retaining the caller's exact registration error.

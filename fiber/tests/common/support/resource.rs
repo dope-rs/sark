@@ -201,7 +201,7 @@ where
                 stage,
                 domain::Local::<wire::Identity, KeyTag<0>>::new(wire::Identity),
                 app,
-                |root, stage| {
+                |root, _wait, stage| {
                     let build = Serve { app: root, target };
                     (self.finish)(stage.lend_for(
                         &mut finish,
@@ -272,7 +272,7 @@ where
             .bind(self.wire)
             .map_err(BranchError::First)?;
         self.plan
-            .install(stage, wire, app, |root, stage| {
+            .install(stage, wire, app, |root, _wait, stage| {
                 let build = Serve { app: root, target };
                 (self.finish)(stage.lend_for(&mut finish, owner, build, Duration::from_secs(2)));
             })

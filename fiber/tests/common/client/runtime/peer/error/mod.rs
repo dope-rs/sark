@@ -1,4 +1,4 @@
-use std::{convert::Infallible, io, str};
+use std::{convert::Infallible, str};
 
 use sark_http::h1::head::ParseError;
 
@@ -6,7 +6,7 @@ mod from;
 
 /// Exact request parsing, framing, or peer I/O failure.
 #[derive(Debug)]
-pub enum Error {
+pub enum Error<E = dope_test::harness::peer::Error> {
     Line {
         actual: String,
         expected: String,
@@ -41,5 +41,6 @@ pub enum Error {
         incoming: usize,
         max: usize,
     },
-    Io(io::Error),
+    UnexpectedEof,
+    Io(E),
 }

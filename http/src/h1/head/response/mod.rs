@@ -23,6 +23,7 @@ use o3::buffer::{
 };
 
 use crate::h1::head::{Limit, ParseError, field, response};
+use crate::payload::response::Method;
 
 /// Append-only input retaining the identity of one response parser.
 pub struct State<'id, S> {
@@ -39,6 +40,7 @@ pub struct Progress<'id> {
 impl<S> State<'_, S> {
     pub fn with<R>(
         source: S,
+        request: Method,
         limit: Limit,
         run: impl for<'id> FnOnce(State<'id, S>, Progress<'id>) -> R,
     ) -> R {
@@ -46,7 +48,7 @@ impl<S> State<'_, S> {
         run(
             State { source, brand },
             Progress {
-                inner: response::raw::State::new(limit),
+                inner: response::raw::State::new(request, limit),
                 brand,
             },
         )

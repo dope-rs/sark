@@ -28,7 +28,7 @@ use dope::{
 use dope_fiber::task::storage::scope::Brand;
 use dope_test::{
     fibers,
-    harness::{server::Pair, signals::LocalGate},
+    harness::{peer::Peer as TcpPeer, server::Pair, signals::LocalGate},
 };
 use o3::base::time::Positive;
 use sark_core::{
@@ -67,7 +67,7 @@ fn retires_body() {
                     stage,
                     domain::Local::<wire::Identity, _>::new(wire::Identity),
                     router,
-                    |root, stage| {
+                    |root, _wait, stage| {
                         stage
                             .with_quiesce(&mut done, root, Duration::from_secs(3), |mut app| {
                                 let mut socket = TcpStream::connect(address).expect("connect");
@@ -173,9 +173,11 @@ fn retires_idle_generation() {
                 result
             },
             |bind| {
-                let mut first = TcpStream::connect(bind).expect("connect first H1 generation");
+                let mut first = TcpPeer::at(bind)
+                    .try_connect()
+                    .expect("connect first H1 generation");
                 first
-                    .set_read_timeout(Some(Duration::from_secs(2)))
+                    .read_wait(Some(Duration::from_secs(2)))
                     .expect("bound first-generation read timeout");
                 first
                     .write_all(b"GET /ping HTTP/1.1\r\nHost: lifetime\r\n\r\n")
@@ -189,9 +191,11 @@ fn retires_idle_generation() {
                 let mut eof = [0_u8; 1];
                 assert_eq!(first.read(&mut eof).expect("read server-driven EOF"), 0);
 
-                let mut second = TcpStream::connect(bind).expect("connect second H1 generation");
+                let mut second = TcpPeer::at(bind)
+                    .try_connect()
+                    .expect("connect second H1 generation");
                 second
-                    .set_read_timeout(Some(Duration::from_secs(2)))
+                    .read_wait(Some(Duration::from_secs(2)))
                     .expect("bound second-generation read timeout");
                 second
                     .write_all(b"GET /ping HTTP/1.1\r\nHost: lifetime\r\n\r\n")
@@ -300,7 +304,7 @@ fn deadline_after_eof() {
                 brand, &state, sark_fiber::Config::new(server::MAX_CONNECTIONS), Probe(&events, &audits, diagnose_h1),
             );
             plan.install(stage, domain::Local::<wire::Identity, _>::new(wire::Identity), router,
-                |root, stage| {
+                |root, _wait, stage| {
                     stage.with_quiesce(&mut done, root, Duration::from_secs(3), |mut app| {
                         let mut socket = TcpStream::connect(address).expect("connect");
                         socket.write_all(b"GET /cancel HTTP/1.1\r\nHost: proof\r\nX-Proof-Challenge: cancellation\r\n\r\n").expect("request");

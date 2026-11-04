@@ -4,7 +4,7 @@ use dope::core::{driver::life::recovery, io::Reclaimed};
 use dope_test::harness::peer::{AcceptScript, Stream};
 pub mod common;
 
-use std::{io::Write as _, num::NonZero, time::Duration};
+use std::{num::NonZero, time::Duration};
 
 use common::client::{
     config::{Config as _, FLAVORS},
@@ -155,6 +155,61 @@ fn reuses_one_slot() {
         )
         .expect("connection-counting peer")
     }
+}
+
+#[test]
+fn rejects_excess_response_before_reusing_one_slot() {
+    use common::client::runtime::pools;
+    use dope_fiber::BlockOn as _;
+
+    AcceptScript::with(
+        |acceptor| {
+            peer::counted(
+                acceptor,
+                NonZero::new(2).expect("request count"),
+                |conn, request| conn.try_excess_response(request),
+            )
+        },
+        |server| {
+            let addr = server.addr();
+            let codes = pools::Plan::new(
+                addr,
+                Config::try_new("127.0.0.1")
+                    .expect("HTTP host allocation")
+                    .timeout(Duration::from_secs(2))
+                    .inflight(2)
+                    .request_pool(2, 1024),
+                1,
+                1,
+            )
+            .expect("client plan")
+            .enter(
+                |mut app| {
+                    app.wait().expect("active endpoint");
+                    let client = app.handle;
+                    app.app
+                        .block_on(dope_fiber::fiber!('_ => async move {
+                            let first = client.get("/first").await.expect("first response");
+                            let second = client.get("/second").await.expect("second response");
+                            [first.status().as_u16(), second.status().as_u16()]
+                        }))
+                        .expect("sequential requests")
+                },
+                recovery::Policy::new(
+                    |event| std::assert_matches!(event, Reclaimed::Shutdown),
+                    recover,
+                ),
+                |result| result.expect("client execution"),
+            )
+            .expect("client scenario");
+            assert_eq!(codes, [200, 201]);
+            server
+                .finish()
+                .expect("peer thread")
+                .expect("excess-response peer");
+        },
+    )
+    .expect("connection-counting peer");
 }
 
 #[test]

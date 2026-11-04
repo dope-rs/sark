@@ -4,7 +4,7 @@ use dope::core::driver::life::recovery;
 use dope_test::harness::{GUARD, peer::AcceptScript};
 pub mod common;
 
-use std::{io::Write as _, net::TcpListener, time::Duration};
+use std::{convert::Infallible, net::TcpListener, time::Duration};
 
 use common::client::{
     config::FLAVORS,
@@ -15,14 +15,92 @@ use common::client::{
     },
 };
 use dope::core::{io::Reclaimed, platform::wake};
+use dope::net::link::event;
 use dope_fiber::{BlockOn as _, task::time::budget};
 use sark::client::protocol::retry::Policy;
-use sark_client::{Error, RequestError, Safety, conn, protocol, timeout};
-use sark_fiber::client::config::Config;
+use sark_client::{Error, RequestError, Safety, conn, connect, protocol, timeout};
+use sark_fiber::client::{
+    config::Config,
+    process::{self, Process as _},
+};
 use sark_http::{
     h1::{field::syntax, head},
     method::Method,
 };
+
+#[test]
+fn observed_reconnect_keeps_commitment() {
+    AcceptScript::with(
+        |acceptor| -> Result<(), peer::Error> {
+            let accepted = acceptor.accept()?;
+            let mut conn = peer::Conn::new(&accepted);
+            let request = conn.try_request()?.expect("committed request");
+            assert_eq!(request.method(), "GET");
+            assert_eq!(request.target(), "/retry");
+            peer::try_shutdown(&accepted)?;
+            Ok(())
+        },
+        |server| {
+            let config = Config::new(server.addr().to_string()).timeout(Duration::from_secs(3));
+            let mut server = Some(server);
+            origins::Plan::new(config, 1, 1, 1)
+                .expect("reconnect plan")
+                .enter(
+                    |mut app| {
+                        let handle = app.handle;
+                        let mut observed = 0;
+                        let failure = app
+                            .app
+                            .block_on(handle.process_observed(
+                                Method::GET,
+                                "/retry",
+                                &[],
+                                &[],
+                                |failure| {
+                                    observed += 1;
+                                    assert_eq!(failure.attempt(), observed);
+                                    assert_eq!(failure.safety(), Safety::PossiblyCommitted);
+                                    if let Some(server) = server.take() {
+                                        assert!(matches!(
+                                            failure.cause(),
+                                            Error::Transport(conn::Error::Classified(
+                                                conn::Kind::RemoteEof
+                                            ))
+                                        ));
+                                        // Join before backoff so every later dial sees a closed listener.
+                                        server.finish().expect("peer thread").expect("first GET");
+                                    } else {
+                                        assert!(matches!(failure.cause(), Error::Connect(
+                                            connect::Error::Attempt(event::ConnectFault::Transport(
+                                                event::ConnectError::Connect(errno)
+                                            ))
+                                        ) if errno.is_refused()));
+                                    }
+                                },
+                                |_, _, _| Ok::<_, process::Error<Infallible>>(()),
+                            ))
+                            .expect("drive reconnect")
+                            .expect_err("closed listener");
+                        assert_eq!(observed, 2);
+                        assert_eq!(failure.attempt(), 3);
+                        assert_eq!(failure.safety(), Safety::PossiblyCommitted);
+                        assert!(matches!(failure.cause(), Error::Connect(
+                            connect::Error::Attempt(event::ConnectFault::Transport(
+                                event::ConnectError::Connect(errno)
+                            ))
+                        ) if errno.is_refused()));
+                    },
+                    recovery::Policy::new(
+                        |event| std::assert_matches!(event, Reclaimed::Shutdown),
+                        recover,
+                    ),
+                    |result| result.expect("client execution"),
+                )
+                .expect("client shutdown");
+        },
+    )
+    .expect("spawn committed peer");
+}
 
 #[test]
 fn post_is_not_replayed() {

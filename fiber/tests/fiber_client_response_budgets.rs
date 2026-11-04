@@ -4,13 +4,7 @@ use dope::core::{driver::life::recovery, io::Reclaimed};
 use dope_test::harness::peer::{AcceptScript, Stream};
 pub mod common;
 
-use std::{
-    io,
-    io::{Read as _, Write},
-    str,
-    sync::mpsc,
-    time::Duration,
-};
+use std::{str, sync::mpsc, time::Duration};
 
 use common::client::{config::FLAVORS, retry::AGGRESSIVE, runtime::cases::request::Request};
 use dope_fiber::{
@@ -35,7 +29,7 @@ fn response_at_cap_succeeds() {
                         body.len(),
                         body
                     );
-                    Write::write_all(stream, resp.as_bytes())
+                    stream.write_all(resp.as_bytes())
                 },
             )
         },
@@ -90,7 +84,7 @@ fn response_over_cap_errors() {
                     )
                     .into_bytes();
                     resp.extend_from_slice(&body);
-                    Write::write_all(stream, &resp)
+                    stream.write_all(&resp)
                 },
             )
         },
@@ -146,7 +140,7 @@ fn queue_limit_at_delivery() {
                     )
                     .into_bytes();
                     response.extend_from_slice(&body);
-                    Write::write_all(stream, &response)
+                    stream.write_all(&response)
                 },
             )
         },
@@ -212,7 +206,7 @@ fn wire_memory_at_ingress() {
                     )
                     .into_bytes();
                     response.extend_from_slice(&body);
-                    Write::write_all(stream, &response)
+                    stream.write_all(&response)
                 },
             )
         },
@@ -284,7 +278,6 @@ fn staging_ceiling_closes() {
                     let mut prefix = b"HTTP/1.1 200 OK\r\nX-Fill: ".to_vec();
                     prefix.resize(HEAD_LIMIT, b'x');
                     conn.write_all(&prefix).map_err(Error::Io)?;
-                    conn.flush().map_err(Error::Io)?;
                     open_rx
                         .recv_timeout(WATCHDOG)
                         .expect("client must fail at the exact staging ceiling");
@@ -295,11 +288,8 @@ fn staging_ceiling_closes() {
                             assert_eq!(read, 0, "client wrote after its complete request");
                             Ok(())
                         }
-                        Err(error)
-                            if matches!(
-                                error.kind(),
-                                io::ErrorKind::ConnectionAborted | io::ErrorKind::ConnectionReset
-                            ) =>
+                        Err(dope_test::harness::peer::Error::Syscall(error))
+                            if error.is_aborted() || error.is_reset() =>
                         {
                             Ok(())
                         }

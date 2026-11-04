@@ -10,7 +10,7 @@ pub(super) trait Kind: Clone + Copy {
     type Fields: Clone + Copy + Default;
     type Parts: Clone + Copy;
 
-    fn start<E>(bytes: &[u8]) -> Result<line::Progress<Self::Start>, ParseError<E>>;
+    fn start<E>(self, bytes: &[u8]) -> Result<line::Progress<Self::Start>, ParseError<E>>;
 
     fn fields(start: Self::Start) -> u32;
 
@@ -36,9 +36,11 @@ pub(super) struct State<K: Kind> {
 #[derive(Clone, Copy)]
 enum Phase<K: Kind> {
     Start {
+        kind: K,
         limit: Limit,
     },
     Line {
+        kind: K,
         cursor: line::Cursor,
         limit: Limit,
     },
@@ -52,18 +54,31 @@ enum Phase<K: Kind> {
 }
 
 impl<K: Kind> State<K> {
-    pub(super) fn pending_line(owner: &[u8], limit: Limit) -> Result<Self, ParseError<Infallible>> {
+    pub(super) fn pending_line(
+        kind: K,
+        owner: &[u8],
+        limit: Limit,
+    ) -> Result<Self, ParseError<Infallible>> {
         if owner.len() > limit.bytes() {
             return Err(ParseError::too_large(owner.len(), limit.bytes()));
         }
         let cursor = line::Cursor::pending(owner).map_err(|_| ParseError::invalid())?;
         Ok(Self {
-            phase: Phase::Line { cursor, limit },
+            phase: Phase::Line {
+                kind,
+                cursor,
+                limit,
+            },
         })
     }
 
     pub(super) fn advance_line(self, owner: &[u8]) -> Result<(Self, bool), ParseError<Infallible>> {
-        let Phase::Line { cursor, limit } = self.phase else {
+        let Phase::Line {
+            kind,
+            cursor,
+            limit,
+        } = self.phase
+        else {
             return Err(ParseError::invalid());
         };
         let (cursor, end) = cursor
@@ -71,15 +86,19 @@ impl<K: Kind> State<K> {
             .map_err(ParseError::Boundary)?;
         Ok((
             Self {
-                phase: Phase::Line { cursor, limit },
+                phase: Phase::Line {
+                    kind,
+                    cursor,
+                    limit,
+                },
             },
             end.is_some(),
         ))
     }
 
-    pub(super) const fn new(limit: Limit) -> Self {
+    pub(super) const fn new(kind: K, limit: Limit) -> Self {
         Self {
-            phase: Phase::Start { limit },
+            phase: Phase::Start { kind, limit },
         }
     }
 
@@ -118,15 +137,19 @@ impl<K: Kind> State<K> {
     ) -> Result<Phase<K>, ParseError<E>> {
         loop {
             match phase {
-                Phase::Start { limit } => {
+                Phase::Start { kind, limit } => {
                     let bounded = owner.len().min(limit.bytes());
-                    let progress = K::start(&owner[..bounded])?;
+                    let progress = kind.start(&owner[..bounded])?;
                     match progress {
                         line::Progress::Complete(start) => {
                             phase = Self::fields(start, limit).phase;
                         }
                         line::Progress::Partial(cursor) => {
-                            let next = Phase::Line { cursor, limit };
+                            let next = Phase::Line {
+                                kind,
+                                cursor,
+                                limit,
+                            };
                             if owner.len() == bounded {
                                 return Ok(next);
                             }
@@ -134,14 +157,22 @@ impl<K: Kind> State<K> {
                         }
                     }
                 }
-                Phase::Line { cursor, limit } => {
+                Phase::Line {
+                    kind,
+                    cursor,
+                    limit,
+                } => {
                     let (cursor, end) = cursor
                         .scan(owner, limit.bytes())
                         .map_err(ParseError::Boundary)?;
                     let Some(prefix) = end else {
-                        return Ok(Phase::Line { cursor, limit });
+                        return Ok(Phase::Line {
+                            kind,
+                            cursor,
+                            limit,
+                        });
                     };
-                    let progress = K::start(prefix)?;
+                    let progress = kind.start(prefix)?;
                     let line::Progress::Complete(start) = progress else {
                         return Err(ParseError::invalid());
                     };

@@ -4,7 +4,7 @@ use dope::core::{driver::life::recovery, io::Reclaimed};
 use dope_test::harness::{GUARD, peer::AcceptScript};
 pub mod common;
 
-use std::{io::Write, mem, net::Shutdown, sync::mpsc, time::Duration};
+use std::{mem, net::Shutdown, sync::mpsc, time::Duration};
 
 use common::client::{
     config::{Config as _, FLAVORS},

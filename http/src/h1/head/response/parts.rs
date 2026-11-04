@@ -19,12 +19,13 @@ use crate::{
         },
         switch,
     },
-    payload::response::{Method, status::Code},
+    payload::response::{Content, Method, status::Code},
     request::span,
 };
 
 #[derive(Clone, Copy)]
 pub struct Parts {
+    content: Content,
     coding: super::Coding,
     pub framing: framing::Message,
     pub connection: Connection,
@@ -37,16 +38,17 @@ pub struct Parts {
 
 #[derive(Clone, Copy)]
 pub(super) struct Start {
+    content: Content,
     version: line::Version,
     status: Code,
     fields: u32,
 }
 
 #[derive(Clone, Copy)]
-pub(super) enum Kind {}
+pub(super) struct Kind(pub(super) Method);
 
 impl Start {
-    pub(super) fn from(line: line::Response<'_>) -> Result<Self, Boundary> {
+    pub(super) fn from(line: line::Response<'_>, request: Method) -> Result<Self, Boundary> {
         let end = line.end();
         if end > u32::MAX as usize {
             return Err(Boundary::TooLarge {
@@ -55,6 +57,7 @@ impl Start {
             });
         }
         Ok(Self {
+            content: Content::new(request, line.status().as_u16()),
             version: line.version(),
             status: line.status(),
             fields: end as u32,
@@ -65,15 +68,20 @@ impl Start {
 impl Parts {
     pub fn parse<'owner, E>(
         bytes: &'owner [u8],
+        request: Method,
         limit: Limit,
         sink: impl FnMut(field::Entry<'owner>) -> Result<(), E>,
     ) -> Result<Option<Self>, ParseError<E>> {
-        let (_, parts) = state::State::<Kind>::new(limit).parse(bytes, sink)?;
+        let (_, parts) = state::State::new(Kind(request), limit).parse(bytes, sink)?;
         Ok(parts)
     }
 
-    pub fn scan(bytes: &[u8], limit: Limit) -> Result<Option<Self>, ParseError<Infallible>> {
-        let (_, parts) = state::State::<Kind>::new(limit).scan(bytes)?;
+    pub fn scan(
+        bytes: &[u8],
+        request: Method,
+        limit: Limit,
+    ) -> Result<Option<Self>, ParseError<Infallible>> {
+        let (_, parts) = state::State::new(Kind(request), limit).scan(bytes)?;
         Ok(parts)
     }
 
@@ -95,12 +103,12 @@ impl Parts {
 
     /// Finishes response framing and connection reuse without retaining the
     /// wire owner or materializing fields.
-    pub fn admit(self, request: Method) -> Result<Admitted, framing::Error> {
+    pub fn admit(self) -> Result<Admitted, framing::Error> {
         let version = match self.version {
             line::Version::Ten => 0,
             line::Version::Eleven => 1,
         };
-        let body = self.framing.response(request, self.status.as_u16())?;
+        let body = self.framing.for_content(self.content)?;
         Ok(Admitted {
             coding: self.coding,
             fields: self.fields(),
@@ -124,7 +132,7 @@ impl state::Kind for Kind {
     type Fields = Fields;
     type Parts = Parts;
 
-    fn start<E>(bytes: &[u8]) -> Result<line::Progress<Start>, ParseError<E>> {
+    fn start<E>(self, bytes: &[u8]) -> Result<line::Progress<Start>, ParseError<E>> {
         let progress = match line::Response::progress(bytes) {
             Ok(progress) => progress,
             Err(error::Response::Syntax) => return Err(ParseError::invalid()),
@@ -133,7 +141,7 @@ impl state::Kind for Kind {
             }
         };
         match progress {
-            line::Progress::Complete(line) => match Start::from(line) {
+            line::Progress::Complete(line) => match Start::from(line, self.0) {
                 Ok(start) => Ok(line::Progress::Complete(start)),
                 Err(cause) => Err(ParseError::Boundary(cause)),
             },
@@ -146,7 +154,7 @@ impl state::Kind for Kind {
     }
 
     fn observe(
-        _: &Start,
+        start: &Start,
         mut fields: Fields,
         field: &field::Entry<'_>,
     ) -> Result<Fields, Semantic> {
@@ -154,13 +162,13 @@ impl state::Kind for Kind {
             Name::Regular if field.name().eq_ignore_ascii_case(b"content-encoding") => {
                 fields.coding = fields.coding.observe(field.value());
             }
-            Name::ContentLength => {
+            Name::ContentLength if start.content != Content::Tunnel => {
                 fields.framing = fields
                     .framing
                     .try_length(field.value())
                     .map_err(Semantic::Field)?;
             }
-            Name::TransferEncoding => {
+            Name::TransferEncoding if start.content != Content::Tunnel => {
                 fields.framing = fields
                     .framing
                     .try_coding(field.value())
@@ -190,6 +198,8 @@ impl state::Kind for Kind {
                 }
             }
             Name::Invalid
+            | Name::ContentLength
+            | Name::TransferEncoding
             | Name::Method
             | Name::Scheme
             | Name::Path
@@ -218,6 +228,7 @@ impl state::Kind for Kind {
             .try_version(start.version.as_bytes())
             .map_err(|cause| ParseError::Semantic(Semantic::Framing(cause)))?;
         Ok(Parts {
+            content: start.content,
             coding,
             framing,
             connection: fields.connection,

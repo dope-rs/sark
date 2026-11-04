@@ -17,11 +17,11 @@ use dope::{
     },
 };
 
-use super::{Result, Root, root::Bound};
+use super::{Result, Root, Watch, root::Bound};
 use crate::server::{date, deadline::policies, listener::bind};
 
 /// Owns prepared server storage before a dependent application is constructed.
-pub struct Prepared<'n, 'p, 's, 'w, 'd: 'w, ListenerId, DateId, E, R, B, I, D>
+pub struct Prepared<'f, 'n, 'p, 's, 'w, 'd: 'w + 'f, ListenerId, DateId, E, R, B, I, D>
 where
     ListenerId: Identity,
     DateId: Identity,
@@ -34,10 +34,11 @@ where
     pub(super) date: interval::Interval<'d, DateId>,
     pub(super) deadline: D,
     pub(super) input: marker::PhantomData<fn() -> I>,
+    pub(super) watch: &'f Watch<'d>,
 }
 
-impl<'n, 'p, 's, 'w, 'd: 'w, ListenerId, DateId, E, R, B, I, D>
-    Prepared<'n, 'p, 's, 'w, 'd, ListenerId, DateId, E, R, B, I, D>
+impl<'f, 'n, 'p, 's, 'w, 'd: 'w + 'f, ListenerId, DateId, E, R, B, I, D>
+    Prepared<'f, 'n, 'p, 's, 'w, 'd, ListenerId, DateId, E, R, B, I, D>
 where
     ListenerId: Identity + 'd,
     DateId: Identity,
@@ -49,11 +50,15 @@ where
     D: policies::Policy<'d, ListenerId>,
     I: input::Mode<E::Wire> + receive::Resources,
 {
+    pub fn watch(&self) -> &'f Watch<'d> {
+        self.watch
+    }
+
     pub fn build<F>(
         self,
         app: F,
         driver: &mut driver::Context<'_, 'd>,
-    ) -> Result<Bound<'n, 'p, 's, 'w, 'd, ListenerId, DateId, F, D, E>, F::Error>
+    ) -> Result<Bound<'f, 'n, 'p, 's, 'w, 'd, ListenerId, DateId, F, D, E>, F::Error>
     where
         F: bind::Bind<'w, 'd, ListenerId, Wire = E::Wire, Input = I>,
         F::Application<'w, D>: handler::Application<'d, ListenerId, Egress = B>,
@@ -69,6 +74,7 @@ where
         Ok(Root {
             listener,
             date: date::Root::new(self.clock, self.date),
+            watch: self.watch,
         })
     }
 }

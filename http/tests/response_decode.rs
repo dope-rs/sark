@@ -15,6 +15,22 @@ use sark_http::{
 static ALLOCATOR: Tracker = Tracker::new();
 
 #[test]
+fn connect_transition_stays_typed() {
+    use sark_http::h1::{
+        codec::decode::response::{Decoder, Error},
+        framing,
+    };
+
+    let wire = common::head::CONNECT_RESPONSES[1];
+    assert!(matches!(
+        Decoder::new(Method::Connect).scan(wire, wire.len()),
+        Err(Error::Framing(
+            framing::Error::SuccessfulConnectIsTransition
+        ))
+    ));
+}
+
+#[test]
 fn body_allocation_failures() {
     use sark_http::h1::codec::decode::response::{Decoder, Error};
 
@@ -149,19 +165,24 @@ fn decoded_headers_own_data() {
 #[test]
 fn coding_fragments() {
     for (wire, expected) in coding::CASES {
-        State::with(Vec::new(), Limit::RESPONSE, |mut source, mut progress| {
-            for end in 0..wire.len() {
-                let (next, head) = progress.scan(&source).expect("partial head");
-                progress = next;
-                assert!(head.is_none());
-                source.try_extend(&wire[end..=end]).expect("append byte");
-            }
-            let (_, head) = progress.scan(&source).expect("response head");
-            let admitted = head
-                .expect("complete head")
-                .admit(Method::Other)
-                .expect("response framing");
-            assert_eq!(admitted.coding(), expected);
-        });
+        State::with(
+            Vec::new(),
+            Method::Other,
+            Limit::RESPONSE,
+            |mut source, mut progress| {
+                for end in 0..wire.len() {
+                    let (next, head) = progress.scan(&source).expect("partial head");
+                    progress = next;
+                    assert!(head.is_none());
+                    source.try_extend(&wire[end..=end]).expect("append byte");
+                }
+                let (_, head) = progress.scan(&source).expect("response head");
+                let admitted = head
+                    .expect("complete head")
+                    .admit()
+                    .expect("response framing");
+                assert_eq!(admitted.coding(), expected);
+            },
+        );
     }
 }

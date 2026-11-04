@@ -1,4 +1,5 @@
 use core::mem;
+use sark_http::payload::response::Method;
 
 use dope_test::alloc::Tracker;
 use o3::buffer::write::CopyError;
@@ -79,6 +80,7 @@ fn response_splits() {
     for split in 0..=head_len {
         response::State::with(
             wire[..split].to_vec(),
+            Method::Other,
             Limit::DEFAULT,
             |mut source, progress| {
                 let mut seen = 0usize;
@@ -217,7 +219,7 @@ fn response_sink_stops() {
     let wire = b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n";
     let source = wire.to_vec();
     let pointer = source[wire.len() - 5..].as_ptr();
-    response::State::with(source, Limit::DEFAULT, |source, progress| {
+    response::State::with(source, Method::Other, Limit::DEFAULT, |source, progress| {
         let mut seen = 0;
         let error = progress
             .advance(&source, |field| {

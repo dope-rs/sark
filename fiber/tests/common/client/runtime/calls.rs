@@ -152,11 +152,15 @@ impl<'d, F: abi::Fiber<'d>, C: Fn() -> bool, S: FnOnce()> abi::Fiber<'d> for Can
             this.wait.set(None);
             return Poll::Ready(None);
         }
-        let (poll, _) = admit.poll(wait);
+        let (poll, context) = admit.poll(wait);
         match poll {
             Poll::Ready(output) => Poll::Ready(Some(output)),
             Poll::Pending => {
-                if let Some(start) = this.start.take() {
+                // A budget yield does not prove that the inner waiter parked.
+                if this.start.is_some()
+                    && let context::Continue::Permit(_) = context.as_ref().try_continue()
+                    && let Some(start) = this.start.take()
+                {
                     start();
                 }
                 Poll::Pending

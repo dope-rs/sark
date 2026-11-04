@@ -1,9 +1,7 @@
 use std::{cell::Cell, convert::Infallible, fmt, io};
 
-use dope::{
-    core::{BranchError, driver::life::recovery, io::Reclaimed},
-    runtime::topology,
-};
+use dope::core::{BranchError, driver::life::recovery, io::Reclaimed};
+use sark_h1::server::run;
 
 use crate::error;
 
@@ -11,7 +9,7 @@ use crate::error;
 pub(super) type Error = BranchError<Option<io::Error>, io::Error>;
 
 pub(super) fn finish_run<S: fmt::Debug, I: fmt::Debug, O, T, Q>(
-    result: Result<T, topology::RunError<'_, S, I, O, T, Q>>,
+    result: Result<T, run::RunError<'_, S, I, O, T, Q>>,
     output: &Cell<Option<io::Error>>,
 ) -> Result<T, Error> {
     match result {

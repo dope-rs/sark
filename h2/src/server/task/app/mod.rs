@@ -74,6 +74,7 @@ pub struct App<
     W: wire::Spec = wire::Identity,
     M = mode::Disabled,
     D = timers::Disabled,
+    P = failures::Close,
 > where
     <R::Head as request::Head>::Start: works::Family,
 {
@@ -84,10 +85,11 @@ pub struct App<
     execution: works::State<<R::Head as request::Head>::Start>,
     mode: M,
     deadlines: D,
+    pub(in crate::server) fault: P,
     wire: marker::PhantomData<fn() -> W>,
 }
 
-impl<'d, ID: Identity + 'd, R, W, M> App<'d, ID, R, W, M, timers::Disabled>
+impl<'d, ID: Identity + 'd, R, W, M, P> App<'d, ID, R, W, M, timers::Disabled, P>
 where
     R: Runtime<'d, Target = Target<'d, ID>>,
     W: wire::Spec,
@@ -97,6 +99,7 @@ where
         router: F,
         config: Config,
         mode: M,
+        fault: P,
         binding: driver::Binding<'d>,
     ) -> Result<Self, Failure<F::Error>>
     where
@@ -124,12 +127,13 @@ where
             execution: works::State::new(),
             mode,
             deadlines: timers::Disabled,
+            fault,
             wire: marker::PhantomData,
         })
     }
 }
 
-impl<'d, ID: Identity, R, W, M> App<'d, ID, R, W, M, timers::Disabled>
+impl<'d, ID: Identity, R, W, M, P> App<'d, ID, R, W, M, timers::Disabled, P>
 where
     R: Runtime<'d>,
     W: wire::Spec,
@@ -138,7 +142,7 @@ where
     pub(in crate::server) fn with_timer(
         self,
         config: config::Config,
-    ) -> App<'d, ID, R, W, M, config::Config> {
+    ) -> App<'d, ID, R, W, M, config::Config, P> {
         let Self {
             router,
             tasks,
@@ -146,6 +150,7 @@ where
             execution: exec,
             mode,
             deadlines: _,
+            fault,
             wire,
         } = self;
         App {
@@ -155,13 +160,14 @@ where
             execution: exec,
             mode,
             deadlines: config,
+            fault,
             wire,
         }
     }
 }
 
-impl<'w, 'd: 'w, ID: Identity + 'd, R, W, M, D, S> handler::Scoped<'w, 'd, ID>
-    for App<'d, ID, R, W, M, D>
+impl<'w, 'd: 'w, ID: Identity + 'd, R, W, M, D, P, S> handler::Scoped<'w, 'd, ID>
+    for App<'d, ID, R, W, M, D, P>
 where
     R: Runtime<'d, Target = Target<'d, ID>>,
     R::Head: request::Head<Start = S>,
@@ -302,7 +308,8 @@ where
     }
 }
 
-impl<'d, ID: Identity + 'd, R, W, M, D> handler::Application<'d, ID> for App<'d, ID, R, W, M, D>
+impl<'d, ID: Identity + 'd, R, W, M, D, P> handler::Application<'d, ID>
+    for App<'d, ID, R, W, M, D, P>
 where
     R: Runtime<'d, Target = Target<'d, ID>>,
     W: Execution + 'd,
@@ -316,7 +323,7 @@ where
     type Conn = Carrier<'d, R, D>;
     type Build = task::Build;
     type Wire = W;
-    type WireFailure = failures::Close;
+    type WireFailure = P;
     type Retirement = task::Retire;
     type Egress = data::Bound<M::Output, R::Egress<'d>>;
     type Input = receive::Scoped;
@@ -418,7 +425,7 @@ where
     }
 }
 
-impl<'d, ID: Identity + 'd, R, W, M, D> send::Report<'d, ID> for App<'d, ID, R, W, M, D>
+impl<'d, ID: Identity + 'd, R, W, M, D, P> send::Report<'d, ID> for App<'d, ID, R, W, M, D, P>
 where
     R: Runtime<'d, Target = Target<'d, ID>>,
     W: Execution + 'd,
@@ -441,7 +448,7 @@ where
     }
 }
 
-impl<'d, ID: Identity + 'd, R, W, M, D> send::Drive<'d, ID> for App<'d, ID, R, W, M, D>
+impl<'d, ID: Identity + 'd, R, W, M, D, P> send::Drive<'d, ID> for App<'d, ID, R, W, M, D, P>
 where
     R: Runtime<'d, Target = Target<'d, ID>>,
     W: Execution + 'd,

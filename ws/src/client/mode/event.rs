@@ -27,7 +27,7 @@ pub(in crate::client) trait Event<'d, H, ID: Identity> {
 
     fn close(
         handler: &mut H,
-        reason: client::CloseReason,
+        closed: client::Closed,
         region: &mut region::Token<region::Identity<'d>>,
     );
 }
@@ -59,10 +59,10 @@ impl<'d, H: client::Handler<'d>, ID: Identity> Event<'d, H, ID> for mode::Local 
 
     fn close(
         handler: &mut H,
-        reason: client::CloseReason,
+        closed: client::Closed,
         region: &mut region::Token<region::Identity<'d>>,
     ) {
-        handler.close(reason, Access::new(region));
+        handler.close(closed, Access::new(region));
     }
 }
 
@@ -91,12 +91,8 @@ impl<'d, H: client::Observer, ID: Identity> Event<'d, H, ID> for mode::Observe {
         handler.message(msg);
     }
 
-    fn close(
-        handler: &mut H,
-        reason: client::CloseReason,
-        _: &mut region::Token<region::Identity<'d>>,
-    ) {
-        handler.close(reason);
+    fn close(handler: &mut H, closed: client::Closed, _: &mut region::Token<region::Identity<'d>>) {
+        handler.close(closed);
     }
 }
 
@@ -131,11 +127,7 @@ impl<'d, H: client::Egress<'d, ID>, ID: Identity> Event<'d, H, ID> for mode::Egr
         handler.message(msg);
     }
 
-    fn close(
-        handler: &mut H,
-        reason: client::CloseReason,
-        _: &mut region::Token<region::Identity<'d>>,
-    ) {
-        handler.close(reason);
+    fn close(handler: &mut H, closed: client::Closed, _: &mut region::Token<region::Identity<'d>>) {
+        handler.close(closed);
     }
 }

@@ -1,8 +1,7 @@
 pub mod common;
 
 use std::{
-    io::Write,
-    net::{Shutdown, SocketAddr, TcpStream},
+    net::{Shutdown, SocketAddr},
     thread,
     time::Duration,
 };
@@ -10,7 +9,7 @@ use std::{
 use common::route::{body::discard::*, chunked::peer::Peer};
 use common::server::recover;
 
-use dope_test::harness::server::Pair;
+use dope_test::harness::{peer::Peer as TcpPeer, server::Pair};
 use sark_core::{body::admit::Retention, route::Schema};
 
 #[test]
@@ -47,8 +46,8 @@ fn serve(client: impl FnOnce(SocketAddr)) {
 fn large_body_reuses_conn() {
     serve(|bind| {
         let total: usize = 8 * 1024 * 1024;
-        let mut sock = TcpStream::connect(bind).expect("connect");
-        sock.set_read_timeout(Some(Duration::from_secs(5)))
+        let mut sock = TcpPeer::at(bind).try_connect().expect("connect");
+        sock.read_wait(Some(Duration::from_secs(5)))
             .expect("set response deadline");
         let mut buffered = Vec::new();
         let wire = UpReq::wire(total);
@@ -76,8 +75,8 @@ fn large_body_reuses_conn() {
 fn body_tail_pipelines() {
     serve(|bind| {
         let total: usize = 256 * 1024;
-        let mut sock = TcpStream::connect(bind).expect("connect");
-        sock.set_read_timeout(Some(Duration::from_secs(5)))
+        let mut sock = TcpPeer::at(bind).try_connect().expect("connect");
+        sock.read_wait(Some(Duration::from_secs(5)))
             .expect("set response deadline");
         let mut buffered = Vec::new();
         let prefix = vec![0x11u8; 1000];
@@ -107,8 +106,8 @@ fn body_tail_pipelines() {
 #[test]
 fn small_body_is_inline() {
     serve(|bind| {
-        let mut sock = TcpStream::connect(bind).expect("connect");
-        sock.set_read_timeout(Some(Duration::from_secs(5)))
+        let mut sock = TcpPeer::at(bind).try_connect().expect("connect");
+        sock.read_wait(Some(Duration::from_secs(5)))
             .expect("set response deadline");
         let mut buffered = Vec::new();
         let body = b"tiny";
@@ -137,8 +136,8 @@ fn deep_pipeline_drains() {
         const DEPTH: usize = 8;
         const BODY_LEN: usize = 1024 * 1024;
 
-        let mut sock = TcpStream::connect(bind).expect("connect");
-        sock.set_write_timeout(Some(Duration::from_secs(5)))
+        let mut sock = TcpPeer::at(bind).try_connect().expect("connect");
+        sock.write_wait(Some(Duration::from_secs(5)))
             .expect("set pipeline write deadline");
         let body = [0xa5; 64 * 1024];
         let head = UpReq::head(BODY_LEN);
@@ -150,7 +149,7 @@ fn deep_pipeline_drains() {
             }
         }
 
-        sock.set_read_timeout(Some(Duration::from_secs(5)))
+        sock.read_wait(Some(Duration::from_secs(5)))
             .expect("set pipeline read deadline");
         let mut buffered = Vec::new();
         let digits = BODY_LEN.to_string();
@@ -168,8 +167,8 @@ fn deep_pipeline_drains() {
 fn peer_close_stays_live() {
     serve(|bind| {
         let total: usize = 4 * 1024 * 1024;
-        let mut sock = TcpStream::connect(bind).expect("connect");
-        sock.set_read_timeout(Some(Duration::from_secs(5)))
+        let mut sock = TcpPeer::at(bind).try_connect().expect("connect");
+        sock.read_wait(Some(Duration::from_secs(5)))
             .expect("set response deadline");
         let (_, resp) = Peer::new(&mut sock, &mut Vec::new())
             .try_exchange(UpReq::head(total).as_bytes())
@@ -179,10 +178,9 @@ fn peer_close_stays_live() {
             .expect("write partial upload body");
         sock.shutdown(Shutdown::Both)
             .expect("close partial upload peer");
-        let mut fresh =
-            TcpStream::connect_timeout(&bind, Duration::from_secs(5)).expect("connect fresh peer");
+        let mut fresh = TcpPeer::at(bind).try_connect().expect("connect fresh peer");
         fresh
-            .set_read_timeout(Some(Duration::from_secs(5)))
+            .read_wait(Some(Duration::from_secs(5)))
             .expect("set response deadline");
         let (_, pong) = Peer::new(&mut fresh, &mut Vec::new())
             .try_exchange(PING)

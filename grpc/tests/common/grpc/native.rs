@@ -191,3 +191,72 @@ impl Drop for DueTask<'_> {
         self.facts.drops[self.index].set(self.facts.drops[self.index].get() + 1);
     }
 }
+
+#[derive(Clone, Copy, Debug)]
+pub enum Sender {
+    Unary,
+    Stream,
+    Borrowed,
+}
+
+/// Cancels the first notified sender before polling its admission again.
+#[pin_project::pin_project]
+pub struct CancelSender<'a, F, S> {
+    #[pin]
+    wait: Option<abi::Task<F>>,
+    cancel: bool,
+    cancelled: &'a Cell<bool>,
+    start: Option<S>,
+}
+
+impl<'a, F, S> CancelSender<'a, F, S> {
+    pub fn new(wait: F, cancel: bool, cancelled: &'a Cell<bool>, start: S) -> Self {
+        Self {
+            wait: Some(abi::Task::new(wait)),
+            cancel,
+            cancelled,
+            start: Some(start),
+        }
+    }
+}
+
+impl<'d, F, S: FnOnce(), T> abi::Fiber<'d> for CancelSender<'_, F, S>
+where
+    F: abi::Fiber<'d, Output = Result<T, sark_grpc::client::manifold::Error>>,
+{
+    type Output = Option<F::Output>;
+
+    fn poll(call: context::PollCall<'_, '_, 'd, Self>) -> Poll<Self::Output> {
+        let (this, admit) = call.into_admit();
+        let mut this = this.project();
+        if this.start.is_none() && *this.cancel {
+            this.wait.set(None);
+            this.cancelled.set(true);
+            return Poll::Ready(None);
+        }
+        let Some(wait) = this.wait.as_mut().as_pin_mut() else {
+            return Poll::Pending;
+        };
+        let (poll, context) = admit.poll(wait);
+        match poll {
+            Poll::Ready(output) => {
+                assert!(
+                    this.start.is_none(),
+                    "sender must first wait for an output owner: {:?}",
+                    output.as_ref().err(),
+                );
+                Poll::Ready(Some(output))
+            }
+            Poll::Pending => {
+                // A budget yield does not prove that the inner sender registered.
+                if this.start.is_some()
+                    && let context::Continue::Permit(_) = context.as_ref().try_continue()
+                    && let Some(start) = this.start.take()
+                {
+                    start();
+                }
+                Poll::Pending
+            }
+        }
+    }
+}

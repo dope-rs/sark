@@ -129,8 +129,9 @@ impl RunMode for mode::Disabled {
             let router =
                 H2TaskApp::multiplexed::<wire::Identity, KeyTag<ROUTE>, _>(brand, state, fiber);
             state.layout.set(Some(router.layout()));
+            let wire = wire::domain::Local::<wire::Identity, KeyTag<ROUTE>>::new(wire::Identity);
             plan.tasks(router, task_cap)
-                .try_install(stage, |listener, stage| {
+                .try_install(stage, wire, |listener, stage| {
                     let result = stage
                         .run_quiesce(finish, Host::new(listener), Duration::from_secs(2))
                         .map_err(topology::Failure::Run)?;
@@ -155,8 +156,9 @@ impl RunMode for Config {
             let router =
                 H2TaskApp::multiplexed::<wire::Identity, KeyTag<ROUTE>, _>(brand, state, fiber);
             state.layout.set(Some(router.layout()));
+            let wire = wire::domain::Local::<wire::Identity, KeyTag<ROUTE>>::new(wire::Identity);
             plan.tasks(router, task_cap)
-                .try_due(stage, self, |listener, stage| {
+                .try_due(stage, wire, self, |listener, stage| {
                     let result = stage
                         .run_quiesce(finish, Host::new(listener), Duration::from_secs(2))
                         .map_err(topology::Failure::Run)?;
@@ -184,9 +186,10 @@ where
             let router =
                 H2TaskApp::multiplexed::<wire::Identity, KeyTag<ROUTE>, _>(brand, state, fiber);
             state.layout.set(Some(router.layout()));
+            let wire = wire::domain::Local::<wire::Identity, KeyTag<ROUTE>>::new(wire::Identity);
             plan.tasks(router, task_cap)
                 .observe(self.into_inner())
-                .try_install(stage, |listener, stage| {
+                .try_install(stage, wire, |listener, stage| {
                     let result = stage
                         .run_quiesce(finish, Host::new(listener), Duration::from_secs(2))
                         .map_err(topology::Failure::Run)?;

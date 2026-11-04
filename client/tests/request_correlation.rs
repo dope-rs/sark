@@ -156,17 +156,26 @@ fn rejects_unsolicited_head() {
         let codec = Codec::default();
         let decoder = Decoder::try_new(&codec).expect("HTTP codec staging");
         let mut state = codec::Stateful::state(&codec, budget);
+        let empty = Shared::try_copy(b"").expect("empty input");
+        let mut queries = 0;
+        assert!(
+            decoder
+                .try_item(&mut state, &empty, &budget, || {
+                    queries += 1;
+                    None
+                })
+                .expect("no response bytes")
+                .is_none()
+        );
+        assert_eq!(queries, 0);
         let wire = (Shared::try_copy(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n"))
             .expect("response fixture storage");
-        let (output, _) = decoder
-            .try_item(&mut state, &wire, &budget, || None)
-            .expect("complete response item must parse")
-            .expect("complete response item");
-        let error = (Output::new(output)
-            .only()
-            .expect("unregistered response must emit an error"))
-        .expect_err("unregistered response must fail");
-        assert!(matches!(error, protocol::Error::UnsolicitedResponse));
+        assert!(matches!(
+            decoder.try_item(&mut state, &wire, &budget, || None),
+            Err(decoder::Error::Protocol(
+                protocol::Error::UnsolicitedResponse
+            ))
+        ));
     })
     .expect("resident test domain must admit its budget");
 }

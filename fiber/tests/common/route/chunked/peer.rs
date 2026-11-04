@@ -1,15 +1,10 @@
-use std::{
-    io::{self, Read as _, Write as _},
-    net::{SocketAddr, TcpStream},
-    num,
-    os::fd::AsFd as _,
-    str, string,
-    time::Duration,
-};
+use std::{net::SocketAddr, num, os::fd::AsFd as _, str, string, time::Duration};
+
+use dope_test::harness::peer::{self, Stream};
 
 #[derive(Debug)]
 pub enum Error {
-    Io(io::Error),
+    Io(peer::Error),
     Utf8(str::Utf8Error),
     Body(string::FromUtf8Error),
     Status(num::ParseIntError),
@@ -19,30 +14,30 @@ pub enum Error {
     Closed { buffered: usize },
 }
 
-impl From<io::Error> for Error {
-    fn from(error: io::Error) -> Self {
+impl From<peer::Error> for Error {
+    fn from(error: peer::Error) -> Self {
         Self::Io(error)
     }
 }
 
 pub struct Peer<'a> {
-    socket: &'a mut TcpStream,
+    socket: &'a mut Stream<'static>,
     buffered: &'a mut Vec<u8>,
 }
 
 impl<'a> Peer<'a> {
-    pub fn new(socket: &'a mut TcpStream, buffered: &'a mut Vec<u8>) -> Self {
+    pub fn new(socket: &'a mut Stream<'static>, buffered: &'a mut Vec<u8>) -> Self {
         Self { socket, buffered }
     }
 
-    pub fn try_connect(bind: SocketAddr) -> io::Result<TcpStream> {
-        let socket = TcpStream::connect(bind)?;
+    pub fn try_connect(bind: SocketAddr) -> Result<Stream<'static>, peer::Error> {
+        let socket = peer::Peer::at(bind).try_connect()?;
         socket.set_nodelay(true)?;
-        socket.set_read_timeout(Some(Duration::from_secs(5)))?;
+        socket.read_wait(Some(Duration::from_secs(5)))?;
         Ok(socket)
     }
 
-    pub fn try_bounded(bind: SocketAddr) -> io::Result<TcpStream> {
+    pub fn try_bounded(bind: SocketAddr) -> Result<Stream<'static>, peer::Error> {
         use dope::core::{Backend, dope_sys::io::socket::option};
         let socket = Self::try_connect(bind)?;
         for kind in [option::Kind::RecvBuffer, option::Kind::SendBuffer] {

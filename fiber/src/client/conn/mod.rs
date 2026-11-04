@@ -120,19 +120,34 @@ where
 
 impl<'d, ID: Identity, P, O> session::Output<'d, ID> for Connector<'_, ID, P, O>
 where
-    Self: session::Session<'d, ID>,
+    P: Kind<'d, ID>,
 {
-    fn flush() -> impl for<'a, 'c, 't, 'e> Call<(
-        &'a mut Self,
-        &'c mut turns::Context<'t, 'e, 'd, Self::ConnState, Self::Send, ID>,
-    )> {
-        output::Flush::<Infallible>::None
+    fn flush() -> Option<
+        impl for<'a, 'x, 't, 'io> Call<(
+            &'a mut Self,
+            &'x mut turns::Context<'t, 'io, 'd, Self::ConnState, Self::Send, ID>,
+            session::Input,
+        )>,
+    > {
+        Some(output::Flush::<Infallible, _>::Context(
+            |(owner, ctx, input): (
+                &mut Self,
+                &mut turns::Context<'_, '_, 'd, Self::ConnState, Self::Send, ID>,
+                session::Input,
+            )| {
+                let id = ctx.conn_id;
+                owner
+                    .root
+                    .input(id, input, ctx.close_status(), ctx.region());
+            },
+        ))
     }
 }
 
 impl<'d, ID: Identity, P, O> session::Target<'d, ID, { u32::MAX as usize }>
     for Connector<'_, ID, P, O>
 where
+    P: Kind<'d, ID>,
     Self: session::Parser<'d, ID> + session::Retirement<'d, ID> + session::Scheduling<'d, ID>,
 {
 }
@@ -165,18 +180,29 @@ where
         S: buffer::Cursor + hold::raw::Retain<'d> + buffer::raw::Consume,
     {
         let root = self.root;
-        codec::Stateful::decode(
-            &root.protocol().codec,
-            storage,
-            parser,
-            budget,
-            limit,
-            move |_| {
-                codec::Admission::Ready(move |parsed, parser: &mut State<'d>| {
-                    net::Output::prepare(root, parsed, parser, ctx)
+        let protocol = root.protocol();
+        let pool = &protocol.transport.pool;
+        let mut current = None;
+        protocol.codec.bind(storage, parser, || {
+            current
+                .insert(pool.directory.try_current(ctx.conn_id))
+                .as_ref()
+                .ok()
+                .and_then(|current| {
+                    pool.responses
+                        .lane(current.position())
+                        .control()
+                        .front_tag(ctx.region())
+                        .copied()
+                        .map(crate::client::exchange::request::Kind::transition)
                 })
-            },
-        )
+        });
+        codec::Stateful::decode(&protocol.codec, storage, parser, budget, limit, move |_| {
+            codec::Admission::Ready(move |parsed, parser: &mut State<'d>| {
+                let current = current.unwrap_or_else(|| pool.directory.try_current(ctx.conn_id));
+                net::Output::prepare(root, current, parsed, parser, ctx)
+            })
+        })
     }
 
     fn finish<'slot, 'id, S>(
@@ -195,7 +221,13 @@ where
         let root = self.root;
         codec::Stateful::finish(&root.protocol().codec, input, budget, limit, move |_| {
             codec::Admission::Ready(move |parsed, parser: &mut State<'d>| {
-                net::Output::prepare(root, parsed, parser, ctx)
+                let current = root
+                    .protocol()
+                    .transport
+                    .pool
+                    .directory
+                    .try_current(ctx.conn_id);
+                net::Output::prepare(root, current, parsed, parser, ctx)
             })
         })
     }
@@ -307,6 +339,20 @@ where
     P: Route<'f, 'e, 'b, 'c, 'd, ID>,
 {
     type Drain = Ready;
+
+    fn transmit_failed(
+        &self,
+        id: conn::Id<'d, ID>,
+        failure: conn::Transmit,
+        region: &mut region::Token<region::Identity<'d>>,
+    ) -> Option<conn::Transmit> {
+        self.root
+            .protocol()
+            .transport
+            .pool
+            .failed(region, id, report::Failure::Transmit(failure));
+        None
+    }
 
     fn io_fail(
         &mut self,

@@ -11,6 +11,16 @@ pub(super) struct Write<'app, 'life, 'e, 'd: 'app, P: ?Sized + 'app, ID: Identit
     slot: queue::Registration<'life, 'd, Fixed<1>>,
 }
 
+impl<'app, 'life, 'e, 'd: 'app, P: ?Sized + 'app, ID: Identity> Drop
+    for Write<'app, 'life, 'e, 'd, P, ID>
+{
+    fn drop(&mut self) {
+        if let Some(scope) = self.scope {
+            scope.port.shared.sender_waiters.cancel(&mut self.slot);
+        }
+    }
+}
+
 impl<'app, 'life, 'e, 'd: 'app, P: ?Sized + 'app, ID: Identity> Write<'app, 'life, 'e, 'd, P, ID> {
     pub(super) fn send<'a, S: 'a>(
         scope: handle::Scope<'app, 'life, 'e, 'd, P, ID>,
@@ -33,6 +43,7 @@ impl<'app, 'life, 'e, 'd: 'app, P: ?Sized + 'app, ID: Identity> Write<'app, 'lif
         };
         abi::poll_fn(
             move |mut context: pin::Pin<&mut context::Context<'_, 'd>>| {
+                let sender = &mut sender;
                 let Some(owner) = sender.scope else {
                     return task::Poll::Pending;
                 };

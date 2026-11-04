@@ -51,12 +51,12 @@ impl Decoder {
     }
 
     pub fn scan(&self, buf: &[u8], max: usize) -> Parsed<Head<()>, Infallible> {
-        let Some(plan) =
-            response::Parts::scan(buf, Limit::RESPONSE.with_bytes(max)).map_err(Error::Head)?
+        let Some(plan) = response::Parts::scan(buf, self.request, Limit::RESPONSE.with_bytes(max))
+            .map_err(Error::Head)?
         else {
             return Ok(None);
         };
-        let head = plan.admit(self.request).map_err(Error::Framing)?;
+        let head = plan.admit().map_err(Error::Framing)?;
         let head = Head::from(head, ());
         Ok(Some(head))
     }
@@ -67,14 +67,17 @@ impl Decoder {
         max: usize,
         mut fields: F,
     ) -> Parsed<Head<F>, F::Error> {
-        let Some(plan) = response::Parts::parse(buf, Limit::RESPONSE.with_bytes(max), |field| {
-            fields.entry(field)
-        })
+        let Some(plan) = response::Parts::parse(
+            buf,
+            self.request,
+            Limit::RESPONSE.with_bytes(max),
+            |field| fields.entry(field),
+        )
         .map_err(Error::Head)?
         else {
             return Ok(None);
         };
-        let head = plan.admit(self.request).map_err(Error::Framing)?;
+        let head = plan.admit().map_err(Error::Framing)?;
         let head = Head::from(head, fields);
         Ok(Some(head))
     }

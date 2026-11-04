@@ -1,5 +1,3 @@
-use std::convert::Infallible;
-
 use dope::{
     core::{Errno, driver, driver::route::KeyTag, io::socket},
     manifold::client::{
@@ -11,19 +9,19 @@ use dope::{
             self, Blocking,
             app::drain::Ready,
             codec::{self, Admission, Stateful as _, mode, staging::Limit, storage::Owner},
-            policy::{self, output},
+            policy,
             response::{Direct, Immediate},
             turns,
         },
     },
     net::{
-        link::{egress, event, pool::change::opening},
+        link::{egress, egress::data::Inline, event, pool::change::opening},
         wire::Identity,
     },
 };
 use o3::{
-    base::{Call, cell::region},
-    buffer::{self, hold, resident, storage::Shared},
+    base::cell::region,
+    buffer::{self, hold, resident},
 };
 use sark_client::protocol::{
     Error,
@@ -39,6 +37,10 @@ pub use audit::Audit;
 mod failure;
 pub use failure::Failure;
 
+pub const PREFIX: &[u8] = b"HTTP/1.1 200 OK\r\nContent-Length: ";
+pub const SUFFIX: &[u8] = b"1\r\n\r\nHTTP/1.1 201 Created\r\nContent-Length: 1\r\n\r\nx";
+pub const CONTINUE: [u8; 1] = *b"+";
+
 pub struct Session<'a> {
     pub codec: Codec,
     pub audit: &'a Audit,
@@ -50,7 +52,7 @@ impl<'d> session::Session<'d> for Session<'_> {
     type ConnState = ();
     type Failure = Observed;
     type Requests = request::Disabled;
-    type Send = Shared;
+    type Send = Inline<1>;
 
     fn codec(&self) -> &Codec {
         &self.codec
@@ -77,26 +79,38 @@ impl<'d> session::Stored<'d> for Session<'_> {
         state: &mut State<'d>,
         budget: &resident::Budget<'d>,
         limit: Limit,
-        ctx: &mut turns::Context<'_, '_, 'd, (), Shared>,
+        ctx: &mut turns::Context<'_, '_, 'd, (), Inline<1>>,
     ) -> codec::Step<Direct>
     where
         S: buffer::Cursor + hold::raw::Retain<'d> + buffer::raw::Consume,
     {
         let codec = &self.codec;
         let audit = self.audit;
-        codec.decode(storage, state, budget, limit, |preview| {
+        let initial = audit.queries.get() == 0;
+        codec.bind(storage, state, || {
+            let query = audit.queries.get();
+            audit.queries.set(query + 1);
+            Some(if query == 0 {
+                Method::Head
+            } else {
+                Method::Other
+            })
+        });
+        let step = codec.decode(storage, state, budget, limit, |preview| {
             let index = match preview {
-                Ok(Preview::Head { parts, .. }) => {
-                    if parts.status().as_u16() != 200 {
+                Ok(Preview::Head { parts, .. }) => match parts.status().as_u16() {
+                    200 => Some(0),
+                    201 => Some(1),
+                    _ => {
                         audit.fail(Failure::UnexpectedEvent);
+                        None
                     }
-                    Some(0)
-                }
+                },
                 Ok(Preview::Body { data, .. }) => {
                     if data != b"x" {
                         audit.fail(Failure::UnexpectedEvent);
                     }
-                    Some(1)
+                    Some(2)
                 }
                 Err(_) => None,
             };
@@ -117,11 +131,21 @@ impl<'d> session::Stored<'d> for Session<'_> {
                             return;
                         }
                     };
-                    let output = codec.admit(state, parsed, || Some(Method::Other));
+                    let output = codec.admit(state, parsed);
                     audit.record(index, output);
                 },
             )
-        })
+        });
+        if initial && audit.queries.get() != 0 {
+            let mut parts = ctx.parts();
+            if let egress::Enqueue::Rejected(error) = parts
+                .sink
+                .try_enqueue(parts.driver.region_token(), Inline::from(CONTINUE))
+            {
+                audit.fail(Failure::Egress(*error.error()));
+            }
+        }
+        step
     }
 
     fn finish<'slot, 'id, S>(
@@ -129,7 +153,7 @@ impl<'d> session::Stored<'d> for Session<'_> {
         input: Owner<'slot, 'id, Storage<S>, State<'d>>,
         budget: &resident::Budget<'d>,
         limit: Limit,
-        _: &mut turns::Context<'_, '_, 'd, (), Shared>,
+        _: &mut turns::Context<'_, '_, 'd, (), Inline<1>>,
     ) -> (
         Owner<'slot, 'id, Storage<S>, State<'d>>,
         Result<codec::Finish<Direct>, Direct>,
@@ -149,13 +173,7 @@ impl<'d> session::Stored<'d> for Session<'_> {
     }
 }
 
-impl<'d> session::Output<'d> for Session<'_> {
-    fn flush()
-    -> impl for<'a, 'c, 't, 'e> Call<(&'a mut Self, &'c mut turns::Context<'t, 'e, 'd, (), Shared>)>
-    {
-        output::Flush::<Infallible>::None
-    }
-}
+impl<'d> session::Output<'d> for Session<'_> {}
 
 impl<'d> policy::Compatible<'d, 'd, Identity, KeyTag<0>> for Session<'_> {
     type Open = Self;
@@ -177,7 +195,7 @@ impl<'d> session::Connected<'d> for Session<'_> {
         &mut self,
         _: attempt::Completion<'_, 'd, KeyTag<0>>,
         _: socket::Addr,
-        _: turns::Startup<'_, '_, 'd, (), Shared>,
+        _: turns::Startup<'_, '_, 'd, (), Inline<1>>,
     ) {
         self.audit.connected.set(self.audit.connected.get() + 1);
     }
@@ -208,7 +226,7 @@ impl<'d> session::Exhausted<'d> for Session<'_> {
 impl<'d> session::Retirement<'d> for Session<'_> {
     type Drain = Ready;
 
-    fn io_fail(&mut self, cause: Errno, _: &mut turns::Context<'_, '_, 'd, (), Shared>) {
+    fn io_fail(&mut self, cause: Errno, _: &mut turns::Context<'_, '_, 'd, (), Inline<1>>) {
         self.audit.fail(Failure::Io(cause));
     }
 
@@ -222,7 +240,7 @@ impl<'d> session::Retirement<'d> for Session<'_> {
             region::Token<region::Identity<'d, 1>>,
         ),
     ) {
-        if self.audit.accepted[1].get() == 0 {
+        if self.audit.accepted[2].get() == 0 {
             self.audit.fail(Failure::Closed(reason));
         }
     }

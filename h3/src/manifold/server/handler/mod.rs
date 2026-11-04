@@ -243,7 +243,7 @@ where
     E::State: State<'d>,
     B: Retain<'d>,
 {
-    /// QUIC has consumed the transport connection before issuing this event.
+    /// QUIC has ended application access and released stream owners; terminal transport may remain.
     fn close(event: close::Event<'_, Self, ID, B, resident::Shared<'d>, id::Driver<'d>>) {
         let (this, _, state, handle) = event.into_parts();
         let mut this = this.project();

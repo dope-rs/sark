@@ -2,7 +2,6 @@ pub mod common;
 
 use std::{
     cell::Cell,
-    io::{Read as _, Write as _},
     pin::Pin,
     sync::mpsc,
     task::Poll,

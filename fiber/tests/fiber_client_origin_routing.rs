@@ -1,10 +1,6 @@
 pub mod common;
 
-use std::{
-    io::{self, Write},
-    net::TcpListener,
-    time::Duration,
-};
+use std::{io, net::TcpListener, time::Duration};
 
 use common::client::recover;
 use common::client::{
@@ -35,8 +31,7 @@ fn redirect_cannot_replay_secrets() {
                     assert_eq!(request.target(), "/start");
                     assert_eq!(request.body(), SECRET_BODY);
                     assert!(String::from_utf8_lossy(request.wire()).contains("X-Api-Key: secret"));
-                    Write::write_all(
-                        stream,
+                    stream.write_all(
                         &"HTTP/1.1 307 Temporary Redirect".response(
                             &[("Location", &location), ("Content-Length", "0")],
                             &[],
@@ -174,7 +169,7 @@ fn routes_each_origin() {
                 acceptor,
                 |stream: &mut &Stream<'_>, request: peer::Request<'_>| {
                     std::assert_matches!(request.target(), "/first" | "/again");
-                    Write::write_all(stream, FIRST)
+                    stream.write_all(FIRST)
                 },
             )
         },
@@ -185,7 +180,7 @@ fn routes_each_origin() {
                         acceptor,
                         |stream: &mut &Stream<'_>, request: peer::Request<'_>| {
                             assert_eq!(request.target(), "/second");
-                            Write::write_all(stream, SECOND)
+                            stream.write_all(SECOND)
                         },
                     )
                 },

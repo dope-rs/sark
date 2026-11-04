@@ -41,7 +41,7 @@ pub(in crate::h1::head::request) struct Start {
 }
 
 #[derive(Clone, Copy)]
-pub(in crate::h1::head::request) enum Kind {}
+pub(in crate::h1::head::request) struct Kind;
 
 impl Start {
     pub(super) fn try_new(
@@ -110,7 +110,7 @@ impl state::Kind for Kind {
     type Fields = Fields;
     type Parts = Plan;
 
-    fn start<E>(bytes: &[u8]) -> Result<line::Progress<Start>, ParseError<E>> {
+    fn start<E>(self, bytes: &[u8]) -> Result<line::Progress<Start>, ParseError<E>> {
         let progress = match line::Request::progress(bytes) {
             Ok(progress) => progress,
             Err(error::Request::Syntax) => return Err(ParseError::invalid()),

@@ -1,6 +1,6 @@
-use std::{io, io::Write as _, net, num::NonZero};
+use std::{io, net, num::NonZero};
 
-use dope_test::harness::peer::{Stream, TcpAcceptor};
+use dope_test::harness::peer::{self, Stream, TcpAcceptor};
 
 mod conn;
 mod error;
@@ -18,7 +18,7 @@ pub fn serve(
     mut reply: impl for<'a> FnMut(Request<'a>) -> Vec<u8>,
 ) -> Result<(), Error> {
     while let Some(accepted) = accept(acceptor)? {
-        let mut stream = &accepted;
+        let stream = &accepted;
         let mut input = input::Input::new();
         while let Some(frame) = next(&mut input, stream)? {
             let output = reply(input.request(frame)?);
@@ -32,7 +32,7 @@ pub fn serve(
 /// Serves one framed exchange on each accepted connection.
 pub fn serve_each(
     acceptor: &mut TcpAcceptor<'_>,
-    mut run: impl for<'a> FnMut(&mut &Stream<'_>, Request<'a>) -> io::Result<()>,
+    mut run: impl for<'a> FnMut(&mut &Stream<'_>, Request<'a>) -> Result<(), peer::Error>,
 ) -> Result<(), Error> {
     while let Some(accepted) = accept(acceptor)? {
         let mut stream = &accepted;
@@ -67,13 +67,13 @@ pub fn counted(
 /// After client teardown, checks every queued connection for submitted bytes.
 pub fn empty(acceptor: &mut TcpAcceptor<'_>) -> Result<(), Error> {
     while let Some(accepted) = acceptor.try_accept().map_err(Error::Io)? {
-        closed(&accepted)?;
+        closed(&mut Conn::new(&accepted))?;
     }
     Ok(())
 }
 
 /// Checks an accepted connection, including any retained framing bytes, for EOF.
-pub fn closed(mut stream: impl io::Read) -> Result<(), Error> {
+pub fn closed<S: Socket>(stream: &mut Conn<S>) -> Result<(), Error<S::Error>> {
     let mut byte = [0];
     if stream.read(&mut byte).map_err(Error::Io)? != 0 {
         return Err(Error::Submitted(byte[0]));
@@ -82,43 +82,69 @@ pub fn closed(mut stream: impl io::Read) -> Result<(), Error> {
 }
 
 /// Closes a peer socket, accepting an already retired connection.
-pub fn try_shutdown(stream: &Stream<'_>) -> io::Result<()> {
+pub fn try_shutdown(stream: &Stream<'_>) -> Result<(), peer::Error> {
     match stream.shutdown(net::Shutdown::Both) {
         Ok(()) => Ok(()),
-        Err(error) if error.kind() == io::ErrorKind::NotConnected => Ok(()),
+        Err(peer::Error::Syscall(error)) if error.is_not_connected() => Ok(()),
         Err(error) => Err(error),
     }
 }
 
-pub trait Ready {
-    fn try_read(&mut self, output: &mut [u8]) -> io::Result<usize>;
+pub trait Socket {
+    type Error;
+
+    fn read(&mut self, output: &mut [u8]) -> Result<usize, Self::Error>;
+    fn write_all(&mut self, input: &[u8]) -> Result<(), Self::Error>;
+    fn try_read(&mut self, output: &mut [u8]) -> Result<Option<usize>, Self::Error>;
 }
 
-impl Ready for &net::TcpStream {
-    fn try_read(&mut self, output: &mut [u8]) -> io::Result<usize> {
-        self.set_nonblocking(true)?;
-        let outcome = io::Read::read(self, output);
-        self.set_nonblocking(false)?;
-        outcome
+impl Socket for &Stream<'_> {
+    type Error = peer::Error;
+
+    fn read(&mut self, output: &mut [u8]) -> Result<usize, Self::Error> {
+        Stream::read(self, output)
+    }
+
+    fn write_all(&mut self, input: &[u8]) -> Result<(), Self::Error> {
+        Stream::write_all(self, input)
+    }
+
+    fn try_read(&mut self, output: &mut [u8]) -> Result<Option<usize>, Self::Error> {
+        self.nonblock(true);
+        let outcome = Stream::read(self, output);
+        self.nonblock(false);
+        match outcome {
+            Err(peer::Error::Syscall(error)) if error.is_block() => Ok(None),
+            result => result.map(Some),
+        }
     }
 }
 
-impl Ready for &Stream<'_> {
-    fn try_read(&mut self, output: &mut [u8]) -> io::Result<usize> {
-        self.nonblock(true);
-        let outcome = io::Read::read(self, output);
-        self.nonblock(false);
-        outcome
+impl Socket for &net::TcpStream {
+    type Error = io::Error;
+
+    fn read(&mut self, output: &mut [u8]) -> io::Result<usize> {
+        io::Read::read(self, output)
+    }
+
+    fn write_all(&mut self, input: &[u8]) -> io::Result<()> {
+        io::Write::write_all(self, input)
+    }
+
+    fn try_read(&mut self, output: &mut [u8]) -> io::Result<Option<usize>> {
+        self.set_nonblocking(true)?;
+        let result = io::Read::read(self, output);
+        self.set_nonblocking(false)?;
+        match result {
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => Ok(None),
+            result => result.map(Some),
+        }
     }
 }
 
 fn next(input: &mut input::Input, mut stream: &Stream<'_>) -> Result<Option<input::Frame>, Error> {
     match input.next(&mut stream) {
-        Err(Error::Io(error))
-            if error.kind() == io::ErrorKind::ConnectionAborted
-                && stream.is_stopped()
-                && input.is_empty() =>
-        {
+        Err(Error::Io(peer::Error::Cancelled)) if stream.is_stopped() && input.is_empty() => {
             Ok(None)
         }
         result => result,
@@ -129,7 +155,7 @@ fn next(input: &mut input::Input, mut stream: &Stream<'_>) -> Result<Option<inpu
 fn accept<'a>(acceptor: &mut TcpAcceptor<'a>) -> Result<Option<Stream<'a>>, Error> {
     match acceptor.accept() {
         Ok(value) => Ok(Some(value)),
-        Err(error) if error.kind() == io::ErrorKind::Interrupted => Ok(None),
+        Err(peer::Error::Cancelled) => Ok(None),
         Err(error) => Err(Error::Io(error)),
     }
 }

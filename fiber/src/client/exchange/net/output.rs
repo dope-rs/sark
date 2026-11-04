@@ -21,7 +21,7 @@ use crate::client::{
     exchange::{
         Reuse,
         net::{self, pools::entries},
-        request, reuse,
+        reuse,
     },
 };
 
@@ -43,6 +43,7 @@ where
 {
     pub(in crate::client) fn prepare<'f: 's, 'e: 's, 'b: 'e, 'c: 'b>(
         root: &'s P,
+        current: Result<entries::Bound<'s, 'd, ID, P::Tag, P::State, P::Position>, net::Open>,
         parsed: Result<output::Parsed<'d>, protocol::Error>,
         parser: &mut codec::State<'d>,
         ctx: &mut turns::Context<'_, '_, 'd, Reuse, pool::Cursor, ID>,
@@ -52,18 +53,9 @@ where
         P: Route<'f, 'e, 'b, 'c, 'd, ID>,
     {
         let protocol = root.protocol();
-        let pool = &protocol.transport.pool;
-        let current = pool.directory.try_current(ctx.conn_id);
         let (current, output) = match (parsed, current) {
             (Ok(parsed), Ok(current)) => {
-                let output = protocol.codec.admit(parser, parsed, || {
-                    pool.responses
-                        .lane(current.position())
-                        .control()
-                        .front_tag(ctx.region())
-                        .copied()
-                        .map(request::Kind::transition)
-                });
+                let output = protocol.codec.admit(parser, parsed);
                 (current, output)
             }
             (Err(error), Ok(current)) => {

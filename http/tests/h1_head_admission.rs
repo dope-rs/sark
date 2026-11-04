@@ -268,6 +268,7 @@ fn response_bounds() {
     for split in 0..=LIMIT {
         response::State::with(
             RESPONSE[..split].to_vec(),
+            Method::Other,
             Limit::RESPONSE.with_bytes(LIMIT),
             |mut source, progress| {
                 let mut emitted = 0;
@@ -289,19 +290,64 @@ fn response_bounds() {
 
 #[test]
 fn ends_head_205() {
-    let response = response::Parts::scan(version::HEAD_205, Limit::RESPONSE)
+    let response = response::Parts::scan(version::HEAD_205, Method::Head, Limit::RESPONSE)
         .expect("valid response head")
         .expect("complete response head")
-        .admit(Method::Head)
+        .admit()
         .expect("bodyless HEAD response");
     assert!(response.body() == framing::ResponseBody::None);
     assert!(response.control().is_reusable());
 }
 
 #[test]
+fn connect_ignores_framing_before_admission() {
+    for wire in common::head::CONNECT_RESPONSES {
+        for split in [10, wire.len() - 6] {
+            response::State::with(
+                wire[..split].to_vec(),
+                Method::Connect,
+                Limit::RESPONSE,
+                |mut source, progress| {
+                    let (progress, parts) = progress.scan(&source).expect("partial CONNECT head");
+                    assert!(parts.is_none());
+                    source
+                        .try_extend(&wire[split..])
+                        .expect("append exact suffix");
+                    let (_, parts) = progress.scan(&source).expect("ignored CONNECT framing");
+                    let parts = parts.expect("complete head");
+                    assert_eq!(parts.wire_len().get() as usize, wire.len() - 3);
+                    assert!(matches!(
+                        parts.admit(),
+                        Err(framing::Error::SuccessfulConnectIsTransition)
+                    ));
+                    assert!(
+                        framing::Outcome::admit(
+                            Method::Connect,
+                            h1::switch::Intent::Connect,
+                            parts.status().as_u16(),
+                            parts.framing,
+                            parts.connection,
+                            None,
+                        ) == Ok(framing::Outcome::Switch(h1::switch::Kind::Connect))
+                    );
+                },
+            );
+        }
+    }
+    assert!(
+        response::Parts::scan(
+            common::head::CONNECT_RESPONSES[1],
+            Method::Other,
+            Limit::RESPONSE
+        )
+        .is_err()
+    );
+}
+
+#[test]
 fn rejects_http10_transfer() {
     assert!(matches!(
-        response::Parts::scan(version::RESPONSE_TE_10, Limit::RESPONSE),
+        response::Parts::scan(version::RESPONSE_TE_10, Method::Other, Limit::RESPONSE),
         Err(ParseError::Semantic(Semantic::Framing(
             framing::Error::Http10TransferEncoding
         )))

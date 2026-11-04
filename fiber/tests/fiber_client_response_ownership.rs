@@ -154,7 +154,7 @@ fn retained_keeps_backing() {
                                 "/retained",
                                 &[],
                                 &[],
-                                |response, _| {
+                                |response, _, _| {
                                     if work {
                                         Err(process::Error::Work(response))
                                     } else {

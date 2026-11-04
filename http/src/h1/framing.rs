@@ -339,12 +339,20 @@ impl Message {
         }
     }
 
+    #[inline]
     pub const fn response(self, request: Method, status: u16) -> Result<ResponseBody, Error> {
+        self.for_content(crate::payload::response::Content::new(request, status))
+    }
+
+    pub(in crate::h1) const fn for_content(
+        self,
+        content: crate::payload::response::Content,
+    ) -> Result<ResponseBody, Error> {
         if self.content_length.is_some() && !matches!(self.transfer, Transfer::None) {
             return Err(Error::ContentLengthWithTransferEncoding);
         }
         use crate::payload::response::Content;
-        match Content::new(request, status) {
+        match content {
             Content::Forbidden => {
                 if !self.is_unframed() {
                     return Err(Error::ForbiddenResponseFraming);
@@ -422,9 +430,6 @@ impl Outcome {
         }
 
         if matches!(intent, switch::Intent::Connect) && status < 300 {
-            if !framing.is_unframed() {
-                return Err(Response::Framing(Error::ForbiddenResponseFraming));
-            }
             return Ok(Self::Switch(switch::Kind::Connect));
         }
 

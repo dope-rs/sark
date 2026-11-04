@@ -1,7 +1,5 @@
 pub mod common;
 
-use std::io::Write as _;
-
 use common::client::recover;
 use common::client::{
     config::FLAVORS,

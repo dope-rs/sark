@@ -55,7 +55,7 @@ fn retains_generic_body() {
                                         domain::Local::<wire::Identity, _>::new(wire::Identity);
                                     Brand::with(|brand| {
                                         let app = generics::App::__scoped_new(brand, state, config);
-                                        plan.install(stage, wire, app, |root, stage| {
+                                        plan.install(stage, wire, app, |root, _wait, stage| {
                                             let result = stage.request(report, root);
                                             result
                                                 .as_ref()
@@ -151,7 +151,7 @@ fn retains_scoped_body() {
                                 Brand::with(|brand| {
                                     let app =
                                         generics::ScopedApp::__scoped_new(brand, state, config);
-                                    plan.install(stage, wire, app, |root, stage| {
+                                    plan.install(stage, wire, app, |root, _wait, stage| {
                                         let result = stage.request(report, root);
                                         result
                                             .as_ref()

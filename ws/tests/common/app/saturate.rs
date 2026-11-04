@@ -9,7 +9,7 @@ pub const FRAGMENTS: [u8; 377] = [0x5a; 377];
 pub struct Saturating<'a> {
     pub ping: signals::Gate,
     pub close: signals::Gate,
-    pub reason: Rc<Trace<client::CloseReason, 1>>,
+    pub reason: Rc<Trace<client::Closed, 1>>,
     pub open: &'a dyn Fn(&mut Sender<'_, '_, '_, '_>),
     pub message: &'a dyn Fn(Message<'_>),
 }
@@ -26,8 +26,8 @@ impl<'d> client::Egress<'d> for Saturating<'_> {
         }
     }
 
-    fn close(&mut self, reason: client::CloseReason) {
-        self.reason.record(reason);
+    fn close(&mut self, closed: client::Closed) {
+        self.reason.record(closed);
         self.close.hit();
     }
 }

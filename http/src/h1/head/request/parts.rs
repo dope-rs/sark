@@ -32,12 +32,12 @@ impl<'owner> Parts<&'owner [u8]> {
         limit: Limit,
         sink: impl FnMut(field::Entry<'owner>) -> Result<(), E>,
     ) -> Result<Option<Self>, ParseError<E>> {
-        let (_, output) = state::State::<Kind>::new(limit).parse(bytes, sink)?;
+        let (_, output) = state::State::new(Kind, limit).parse(bytes, sink)?;
         Ok(output.map(|head| Self::new(bytes, head)))
     }
 
     pub fn scan(bytes: &'owner [u8], limit: Limit) -> Result<Option<Self>, ParseError<Infallible>> {
-        let (_, output) = state::State::<Kind>::new(limit).scan(bytes)?;
+        let (_, output) = state::State::new(Kind, limit).scan(bytes)?;
         Ok(output.map(|head| Self::new(bytes, head)))
     }
 
@@ -90,8 +90,8 @@ impl Parts<storage::Owned, trace::Fields> {
         limit: Limit,
     ) -> Result<Option<Self>, ParseError<trace::Error>> {
         let mut fields = trace::Fields::default();
-        let (_, output) = state::State::<Kind>::new(limit)
-            .parse(source.as_ref(), |field| fields.observe(field))?;
+        let (_, output) =
+            state::State::new(Kind, limit).parse(source.as_ref(), |field| fields.observe(field))?;
         Ok(output.map(|head| Self {
             source,
             head,

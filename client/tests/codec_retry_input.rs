@@ -46,7 +46,7 @@ fn sized_retry_keeps_head() {
                         codec::Admission::RetryInput
                     } else {
                         codec::Admission::Ready(move |parsed: Result<_, Error>, state: &mut _| {
-                            *target = Some(codec.admit(state, parsed.expect("body"), || None));
+                            *target = Some(codec.admit(state, parsed.expect("body")));
                         })
                     }
                 },
@@ -77,7 +77,12 @@ fn retry_keeps_info_count() {
         let mut state = codec.state(budget);
         let wire = Shared::try_copy(b"HTTP/1.1 103 Early Hints\r\nLink: </x>\r\n\r\n").expect("wire");
         let mut stored = decoder.storage(&wire, &state);
+        let mut queries = 0;
         for attempt in 0..=output::INFORMATIONAL_LIMIT + 1 {
+            codec.bind(&mut stored, &state, || {
+                queries += 1;
+                Some(Method::Other)
+            });
             let step = codec.decode::<_, Direct, _>(
                 &mut stored, &mut state, &budget, decoder.limit(), |preview| {
                     assert!(matches!(preview, Ok(Preview::Head { parts, .. }) if parts.status().as_u16() == 103));
@@ -85,7 +90,7 @@ fn retry_keeps_info_count() {
                         codec::Admission::RetryInput
                     } else {
                         codec::Admission::Ready(move |parsed: Result<_, Error>, state: &mut _| {
-                            let head = codec.admit(state, parsed.expect("head"), || Some(Method::Other));
+                            let head = codec.admit(state, parsed.expect("head"));
                             assert!(matches!(head.into_events().next(), Some(Ok(Event::Informational(_)))));
                         })
                     }
@@ -93,6 +98,7 @@ fn retry_keeps_info_count() {
             );
             assert_eq!(step.has_consumed(), attempt > output::INFORMATIONAL_LIMIT);
         }
+        assert_eq!(queries, 1);
         for _ in 1..output::INFORMATIONAL_LIMIT {
             let (head, _) = decoder.try_parse(&mut state, &wire, &budget)
                 .expect("admission").expect("informational response");
@@ -128,7 +134,7 @@ fn chunks_keep_pending() {
                             codec::Admission::RetryInput
                         } else {
                             codec::Admission::Ready(move |parsed: Result<_, Error>, state: &mut _| {
-                                let output = codec.admit(state, parsed.expect("body"), || None);
+                                let output = codec.admit(state, parsed.expect("body"));
                                 assert!(output.into_events().next().is_none());
                             })
                         }
@@ -190,7 +196,7 @@ fn chunks_keep_pending() {
                             codec::Admission::RetryInput
                         } else {
                             codec::Admission::Ready(move |parsed: Result<_, Error>, state: &mut _| {
-                                *target = Some(codec.admit(state, parsed.expect("completion"), || None));
+                                *target = Some(codec.admit(state, parsed.expect("completion")));
                             })
                         }
                     },
@@ -255,7 +261,7 @@ fn full_chunk_keeps_owner() {
                         codec::Admission::RetryInput
                     } else {
                         codec::Admission::Ready(move |parsed: Result<_, Error>, state: &mut _| {
-                            *target = Some(codec.admit(state, parsed.expect("chunk"), || None));
+                            *target = Some(codec.admit(state, parsed.expect("chunk")));
                         })
                     }
                 },
@@ -315,8 +321,7 @@ fn eof_retry_keeps_framing() {
                         } else {
                             codec::Admission::Ready(
                                 move |parsed: Result<_, Error>, state: &mut _| {
-                                    *target =
-                                        Some(codec.admit(state, parsed.expect("EOF"), || None));
+                                    *target = Some(codec.admit(state, parsed.expect("EOF")));
                                 },
                             )
                         }
@@ -355,6 +360,7 @@ fn head_error_survives_eof() {
         let mut state = codec.state(budget);
         let wire = Shared::try_copy(b"HTTP/1.1 200 OK\r\nX: y\r\n\r\n").expect("wire");
         let mut stored = decoder.storage(&wire, &state);
+        codec.bind(&mut stored, &state, || Some(Method::Other));
         let step = codec.decode::<_, Direct, _>(
             &mut stored,
             &mut state,
@@ -389,6 +395,56 @@ fn head_error_survives_eof() {
         assert!(matches!(
             finish,
             Err(decoder::Error::Protocol(Error::HeadLimit(_)))
+        ));
+    })
+    .expect("domain");
+}
+
+#[test]
+fn unsolicited_error_survives_rebind_and_eof() {
+    resident::Domain::try_scope(256, |budget| {
+        let codec = Codec::default();
+        let decoder = Decoder::try_new(&codec).expect("staging");
+        let mut state = codec.state(budget);
+        let wire = Shared::try_copy(common::reply::HEAD).expect("wire");
+        let mut stored = decoder.storage(&wire, &state);
+        for request in [None, Some(Method::Other)] {
+            codec.bind(&mut stored, &state, || request);
+            let step = codec.decode::<_, Direct, _>(
+                &mut stored,
+                &mut state,
+                &budget,
+                decoder.limit(),
+                |preview| match preview {
+                    Err(error) => {
+                        assert!(matches!(error, Error::UnsolicitedResponse));
+                        codec::Admission::RetryInput
+                    }
+                    Ok(_) => codec::Admission::Ready(|parsed: Result<_, Error>, _: &mut _| {
+                        assert!(parsed.is_ok())
+                    }),
+                },
+            );
+            assert!(!step.has_consumed());
+        }
+        let (owners, finish) = Slot::new((stored, state)).run(|input| {
+            codec.finish::<_, Direct, _>(input, &budget, decoder.limit(), |preview| match preview {
+                Err(error) => {
+                    assert!(matches!(error, Error::UnsolicitedResponse));
+                    codec::Admission::RetryInput
+                }
+                Ok(_) => codec::Admission::Ready(|parsed: Result<_, Error>, _: &mut _| {
+                    assert!(parsed.is_ok())
+                }),
+            })
+        });
+        let (stored, state) = owners.into_parts();
+        assert!(matches!(finish, Err(Direct::RetryInput)));
+        assert_eq!(stored.source().as_ref(), wire.as_slice());
+        let (_owners, finish) = decoder.try_finish(state, stored, &budget);
+        assert!(matches!(
+            finish,
+            Err(decoder::Error::Protocol(Error::UnsolicitedResponse))
         ));
     })
     .expect("domain");

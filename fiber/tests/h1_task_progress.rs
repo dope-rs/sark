@@ -3,7 +3,7 @@ pub mod common;
 use std::{
     cell::Cell,
     convert,
-    io::{ErrorKind, Read, Write},
+    io::{Read, Write},
     net::{Shutdown, TcpStream},
     thread,
     time::{Duration, Instant},
@@ -31,7 +31,10 @@ use dope::{
     net::wire::{self, domain},
     runtime::{executor::session, topology},
 };
-use dope_test::{harness::server::Pair, reclaim};
+use dope_test::{
+    harness::{peer::Error as PeerError, server::Pair},
+    reclaim,
+};
 use sark_fiber::{
     Throughput,
     driver::{self, settings::Config},
@@ -142,9 +145,9 @@ fn input_deadline_spans_body() {
                     &b"x"[..],
                 ),
             ] {
-                let mut socket = Peer::try_connect(address).expect("body peer");
+                let socket = Peer::try_connect(address).expect("body peer");
                 socket
-                    .set_read_timeout(Some(Duration::from_millis(50)))
+                    .read_wait(Some(Duration::from_millis(50)))
                     .expect("dribble interval");
                 socket.write_all(head).expect("admit body");
                 let started = Instant::now();
@@ -156,29 +159,21 @@ fn input_deadline_spans_body() {
                     match socket.read(&mut [0; 512]) {
                         Ok(0) => break,
                         Ok(_) => {}
-                        Err(error) if error.kind() == ErrorKind::ConnectionReset => break,
-                        Err(error)
-                            if matches!(
-                                error.kind(),
-                                ErrorKind::WouldBlock | ErrorKind::TimedOut
-                            ) =>
-                        {
+                        Err(PeerError::Syscall(error)) if error.is_reset() => break,
+                        Err(PeerError::TimedOut) => {
                             if !dribble.is_empty() {
                                 match socket.write_all(dribble) {
                                     Ok(()) => {}
-                                    Err(error)
-                                        if matches!(
-                                            error.kind(),
-                                            ErrorKind::BrokenPipe | ErrorKind::ConnectionReset
-                                        ) =>
+                                    Err(PeerError::Syscall(error))
+                                        if error.is_pipe() || error.is_reset() =>
                                     {
                                         break;
                                     }
-                                    Err(error) => panic!("body dribble: {error}"),
+                                    Err(error) => panic!("body dribble: {error:?}"),
                                 }
                             }
                         }
-                        Err(error) => panic!("body deadline: {error}"),
+                        Err(error) => panic!("body deadline: {error:?}"),
                     }
                 }
                 assert!(
@@ -440,7 +435,7 @@ fn timer_floor_covers_all() {
                                     stage,
                                     domain::Local::<wire::Identity, _>::new(wire::Identity),
                                     app,
-                                    |root, stage| {
+                                    |root, _wait, stage| {
                                         let result = stage
                                             .run_quiesce(&mut finish, root, Duration::from_secs(2))
                                             .map_err(topology::Failure::Run)?;

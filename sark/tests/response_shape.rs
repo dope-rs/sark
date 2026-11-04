@@ -107,10 +107,13 @@ fn generic_names() -> Result<(), dope_test::checks::Error> {
             "sark-json",
         ],
     );
-    let exe = std::env::current_exe()?;
-    let output = suite.try_build(&exe, env!("CARGO_PKG_NAME"))?.output()?;
+    let exe = std::env::current_exe().expect("current test executable");
+    let output = suite
+        .try_build(&exe, env!("CARGO_PKG_NAME"))?
+        .output()
+        .expect("run cargo");
     let suite = suite.try_collect(&exe, output)?;
-    let status = suite.try_rustdoc()?.status()?;
+    let status = suite.try_rustdoc()?.status().expect("run rustdoc");
     assert!(status.success(), "generic name contracts: {status}");
     Ok(())
 }

@@ -37,7 +37,7 @@ use crate::server::{
     date,
     deadline::policies,
     listener::{Config, bind},
-    run::{Prepared, Root, prepare, root::Bound},
+    run::{Prepared, Root, Wait, Watch, prepare, root::Bound},
 };
 
 /// Complete HTTP/1 server topology for one listener and Date clock.
@@ -132,12 +132,14 @@ where
     }
 
     /// Prepares borrowed storage before the executor issues a dependent client.
+    /// The callback owns this listener's sole terminal-failure waiter.
     pub fn prepare_in<'stage, 'scope, 'life, 'e, 'd, W, R, B, S, Q, O>(
         self,
         stage: &mut lending::Stage<'stage, 'scope, 'life, 'e, 'd, storage::With<S, date::Clock>, Q>,
         wire: R,
-        next: impl for<'n, 'p, 's> FnOnce(
+        next: impl for<'f, 'n, 'p, 's> FnOnce(
             Prepared<
+                'f,
                 'n,
                 'p,
                 's,
@@ -151,6 +153,7 @@ where
                 I,
                 D,
             >,
+            Wait<'f, 'd>,
             &mut lending::Stage<'stage, 'scope, 'life, 'e, 'd, storage::With<S, date::Clock>, Q>,
         ) -> O,
     ) -> Result<O, creation::Error>
@@ -178,6 +181,7 @@ where
         let hash = stage.hash_state(listener::Domain::for_listener(ListenerId::ID.raw()));
         install.prepare(hash, stage, lending::Stage::driver, |listener, stage| {
             let date = interval::Interval::<DateId>::every_second(&mut stage.driver())?;
+            let watch = Watch::new();
             Ok(next(
                 Prepared {
                     listener,
@@ -185,20 +189,24 @@ where
                     date,
                     deadline,
                     input: marker::PhantomData,
+                    watch: &watch,
                 },
+                Wait::new(&watch),
                 stage,
             ))
         })?
     }
 
     /// Installs the listener and Date tick against their exact driver storage.
+    /// The callback owns this listener's sole terminal-failure waiter.
     pub fn install<'stage, 'scope, 'life, 'e, 'd, W, B, F, S, Q, R>(
         self,
         stage: &mut lending::Stage<'stage, 'scope, 'life, 'e, 'd, storage::With<S, date::Clock>, Q>,
         wire: B,
         app: F,
-        next: impl for<'n, 'p, 's> FnOnce(
-            Bound<'n, 'p, 's, 'life, 'd, ListenerId, DateId, F, D, env::Bundle<tcp::Tcp, W, P>>,
+        next: impl for<'f, 'n, 'p, 's> FnOnce(
+            Bound<'f, 'n, 'p, 's, 'life, 'd, ListenerId, DateId, F, D, env::Bundle<tcp::Tcp, W, P>>,
+            Wait<'f, 'd>,
             &mut lending::Stage<'stage, 'scope, 'life, 'e, 'd, storage::With<S, date::Clock>, Q>,
         ) -> R,
     ) -> super::Result<R, F::Error>
@@ -230,7 +238,16 @@ where
                 |listener, stage| {
                     let interval = interval::Interval::<DateId>::every_second(&mut stage.driver())?;
                     let date = date::Root::new(clock, interval);
-                    Ok(next(Root { listener, date }, stage))
+                    let watch = Watch::new();
+                    Ok(next(
+                        Root {
+                            listener,
+                            date,
+                            watch: &watch,
+                        },
+                        Wait::new(&watch),
+                        stage,
+                    ))
                 },
             )?
             .map_err(manifold::BuildError::Create)

@@ -1,8 +1,6 @@
-use std::io;
-
 use sark_http::h1::{codec::decode::request::Head, framing::RequestBody};
 
-use crate::common::client::runtime::peer::{Error, Request};
+use crate::common::client::runtime::peer::{Error, Request, Socket};
 
 const MAX_HEAD: usize = 64 * 1024;
 
@@ -33,7 +31,10 @@ impl Input {
         self.bytes.len() == self.start
     }
 
-    pub(super) fn next(&mut self, stream: &mut impl io::Read) -> Result<Option<Frame>, Error> {
+    pub(super) fn next<S: Socket>(
+        &mut self,
+        stream: &mut S,
+    ) -> Result<Option<Frame>, Error<S::Error>> {
         let Some(head_end) = self.read_head(stream)? else {
             return Ok(None);
         };
@@ -73,7 +74,7 @@ impl Input {
         }))
     }
 
-    pub(super) fn request(&self, frame: Frame) -> Result<Request<'_>, Error> {
+    pub(super) fn request<E>(&self, frame: Frame) -> Result<Request<'_>, Error<E>> {
         Request::parse(
             &self.bytes[self.start..self.start + frame.request_end],
             frame.head_end,
@@ -101,7 +102,7 @@ impl Input {
         len
     }
 
-    fn read_head(&mut self, stream: &mut impl io::Read) -> Result<Option<usize>, Error> {
+    fn read_head<S: Socket>(&mut self, stream: &mut S) -> Result<Option<usize>, Error<S::Error>> {
         loop {
             if let Some(end) = head_end(&self.bytes[self.start..]) {
                 if end > MAX_HEAD {
@@ -130,7 +131,7 @@ impl Input {
         }
     }
 
-    fn read(&mut self, stream: &mut impl io::Read) -> Result<bool, Error> {
+    fn read<S: Socket>(&mut self, stream: &mut S) -> Result<bool, Error<S::Error>> {
         let mut chunk = [0; 4096];
         let read = stream.read(&mut chunk).map_err(Error::Io)?;
         if read == 0 {

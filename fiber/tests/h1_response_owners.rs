@@ -1,3 +1,5 @@
+use dope_test::harness::peer::Peer as TcpPeer;
+
 pub mod common;
 
 use core::mem;
@@ -125,8 +127,8 @@ fn keeps_connection_open() {
                     })
             },
             |bind| {
-                let mut sock = TcpStream::connect(bind).expect("connect");
-                sock.set_read_timeout(Some(Duration::from_secs(2)))
+                let mut sock = TcpPeer::at(bind).try_connect().expect("connect");
+                sock.read_wait(Some(Duration::from_secs(2)))
                     .expect("set keep-alive deadline");
 
                 sock.write_all(b"GET /ping HTTP/1.1\r\nHost: x\r\n\r\n")
@@ -148,9 +150,9 @@ fn keeps_connection_open() {
 
                 sock.write_all(b"GET /ping HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n")
                     .expect("write closing request");
-                let mut last = String::new();
-                sock.read_to_string(&mut last)
-                    .expect("read closing response");
+                let mut last = Vec::new();
+                sock.read_to_end(&mut last).expect("read closing response");
+                let last = String::from_utf8(last).expect("closing response text");
                 assert!(last.contains("200 OK"), "last: {}", last);
             },
             |result| events = result.expect("keeps_connection_open server shutdown"),

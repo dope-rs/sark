@@ -2,7 +2,7 @@ use std::{num::NonZero, time};
 
 use dope::{
     core::driver::result::SubmitCause,
-    manifold::client::{close::LocalOrigin, port::error::Open},
+    manifold::client::{close::LocalOrigin, conn::Transmit, port::error::Open},
     net::link::event,
 };
 use dope_fiber::task::time::budget;
@@ -25,6 +25,10 @@ impl Class {
             | Error::Connect(connect::Error::Attempt(event::ConnectFault::Transport(
                 event::ConnectError::Admission(error),
             ))) if error.cause() == SubmitCause::IdentityExhausted => Self::Never,
+            Error::Transport(crate::conn::Error::Transmit {
+                error: Transmit::Rejected(failure),
+                ..
+            }) if failure.into_error().cause() == SubmitCause::IdentityExhausted => Self::Never,
             Error::Transport(error) => match error.kind() {
                 crate::conn::Kind::RemoteEof
                 | crate::conn::Kind::Receive

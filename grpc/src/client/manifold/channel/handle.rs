@@ -27,6 +27,35 @@ pub struct Handle<'app, 'life, 'e, 'd: 'app, P: ?Sized + 'app, ID: Identity = Ke
     pub(super) bound: client::Bound<'app, 'd, P>,
 }
 
+struct Waiter<'app, 'life, 'e, 'd: 'app, P: ?Sized + 'app, ID: Identity> {
+    handle: Option<Handle<'app, 'life, 'e, 'd, P, ID>>,
+    slot: queue::Registration<'life, 'd, Fixed<1>>,
+}
+
+impl<'app, 'life, 'e, 'd: 'app, P: ?Sized + 'app, ID: Identity> Waiter<'app, 'life, 'e, 'd, P, ID> {
+    fn new(handle: Handle<'app, 'life, 'e, 'd, P, ID>) -> Self {
+        Self {
+            handle: Some(handle),
+            slot: queue::Registration::new(),
+        }
+    }
+
+    fn clear(&mut self) {
+        self.slot.clear();
+        self.handle = None;
+    }
+}
+
+impl<'app, 'life, 'e, 'd: 'app, P: ?Sized + 'app, ID: Identity> Drop
+    for Waiter<'app, 'life, 'e, 'd, P, ID>
+{
+    fn drop(&mut self) {
+        if let Some(handle) = self.handle {
+            handle.port.shared.sender_waiters.cancel(&mut self.slot);
+        }
+    }
+}
+
 impl<'app, 'life, 'e, 'd: 'app, P: ?Sized + 'app, ID: Identity> Copy
     for Handle<'app, 'life, 'e, 'd, P, ID>
 {
@@ -108,17 +137,17 @@ impl<'app, 'life, 'e, 'd: 'app, P: ?Sized + 'app, ID: Identity> Handle<'app, 'li
         message: &'a C::Encode,
     ) -> impl abi::Fiber<'d, Output = Result<handle::Unary<'app, 'life, 'e, 'd, P, ID>, error::Error>> + 'a
     {
-        let mut cap = Some(*self);
-        let mut slot: queue::Registration<'life, 'd, Fixed<1>> = queue::Registration::new();
+        let mut waiter = Waiter::new(*self);
         abi::poll_fn(
             move |mut context: pin::Pin<&mut context::Context<'_, 'd>>| {
+                let waiter = &mut waiter;
                 let wake = context.as_ref().completion();
                 let mut driver = context.as_mut().driver();
                 let token = driver.state_token();
-                let Some(handle) = cap else {
+                let Some(handle) = waiter.handle else {
                     return task::Poll::Pending;
                 };
-                let result = handle::poll_sender(handle.port, &wake, &mut slot, || {
+                let result = handle::poll_sender(handle.port, &wake, &mut waiter.slot, || {
                     let mut sender = send::Sender::new(token, handle.port)?;
                     match sender.try_unary(path, target, metadata, codec, message)? {
                         Some(call) => {
@@ -130,8 +159,7 @@ impl<'app, 'life, 'e, 'd: 'app, P: ?Sized + 'app, ID: Identity> Handle<'app, 'li
                     }
                 });
                 if result.is_ready() {
-                    slot.clear();
-                    cap = None;
+                    waiter.clear();
                 }
                 result
             },
@@ -201,17 +229,17 @@ impl<'app, 'life, 'e, 'd: 'app, P: ?Sized + 'app, ID: Identity> api::Session<'ap
     where
         'd: 'a,
     {
-        let mut cap = Some(*self);
-        let mut slot: queue::Registration<'life, 'd, Fixed<1>> = queue::Registration::new();
+        let mut waiter = Waiter::new(*self);
         abi::poll_fn(
             move |mut context: pin::Pin<&mut context::Context<'_, 'd>>| {
+                let waiter = &mut waiter;
                 let wake = context.as_ref().completion();
                 let mut driver = context.as_mut().driver();
                 let token = driver.state_token();
-                let Some(handle) = cap else {
+                let Some(handle) = waiter.handle else {
                     return task::Poll::Pending;
                 };
-                let result = handle::poll_sender(handle.port, &wake, &mut slot, || {
+                let result = handle::poll_sender(handle.port, &wake, &mut waiter.slot, || {
                     let mut sender = send::Sender::new(token, handle.port)?;
                     match sender.try_server(path, target, metadata, &mut codec, message)? {
                         Some(stream) => {
@@ -223,8 +251,7 @@ impl<'app, 'life, 'e, 'd: 'app, P: ?Sized + 'app, ID: Identity> api::Session<'ap
                     }
                 });
                 if result.is_ready() {
-                    slot.clear();
-                    cap = None;
+                    waiter.clear();
                 }
                 result
             },

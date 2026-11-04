@@ -194,9 +194,11 @@ fn close_cancels_once() {
                         sark_fiber::Config::new(2),
                     );
                     server.state.layout.set(Some(router.layout()));
+                    let wire =
+                        wire::domain::Local::<wire::Identity, KeyTag<ROUTE>>::new(wire::Identity);
                     plan.tasks(router, 2)
                         .observe(Log(&facts, diagnose))
-                        .try_install(stage, |listener, stage| {
+                        .try_install(stage, wire, |listener, stage| {
                             stage
                                 .with_quiesce(
                                     &mut done,
@@ -329,9 +331,11 @@ fn burst_wakes_siblings() {
                         sark_fiber::Config::new(TASKS),
                     );
                     server.state.layout.set(Some(router.layout()));
+                    let wire =
+                        wire::domain::Local::<wire::Identity, KeyTag<ROUTE>>::new(wire::Identity);
                     plan.tasks(router, TASKS)
                         .observe(Log(&facts, diagnose))
-                        .try_install(stage, |listener, stage| {
+                        .try_install(stage, wire, |listener, stage| {
                             let start = stage.driver().driver_ref().clock().now().into();
                             stage
                                 .with_at_for(
@@ -478,9 +482,11 @@ fn renewals_precede_ready_tasks() {
                     .expect("body deadline")
                     .try_with(deadline::Phase::Handler, Duration::from_secs(1))
                     .expect("handler deadline");
+                    let wire =
+                        wire::domain::Local::<wire::Identity, KeyTag<ROUTE>>::new(wire::Identity);
                     plan.tasks(router, 1)
                         .observe(Log(&facts, diagnose))
-                        .try_due(stage, timer, |listener, stage| {
+                        .try_due(stage, wire, timer, |listener, stage| {
                             let start = stage.driver().driver_ref().clock().now().into();
                             stage
                                 .with_at_for(

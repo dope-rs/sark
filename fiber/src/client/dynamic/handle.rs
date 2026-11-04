@@ -1,4 +1,4 @@
-use std::{convert::Infallible, time};
+use std::{convert::Infallible, num::NonZero, time};
 
 use dope::{
     core::driver::route::{Identity, KeyTag},
@@ -56,20 +56,28 @@ impl<'app, 'o, 'q, 'e, 'b, 'c, 'd: 'app, B: ?Sized, ID: Identity + 'd>
 impl<'app, 'o, 'q, 'e, 'b, 'c, 'd: 'app, B: ?Sized, ID: Identity + 'd>
     process::Process<'app, 'd, ID> for Handle<'app, 'o, 'q, 'e, 'b, 'c, 'd, B, ID>
 {
-    fn process<'r, T, E, F>(
+    fn process_observed<'r, T, E, F, O>(
         &'r self,
         method: Method,
         path: &'r str,
         headers: &'r [(&'r str, &'r str)],
         body: &'r [u8],
+        observe: O,
         process: F,
     ) -> impl abi::Fiber<'d, Output = Result<Result<T, E>, Self::Error>> + 'r
     where
-        F: FnOnce(reply::Scoped<'app, 'd>, budget::Check<'d>) -> Result<T, process::Error<E>> + 'r,
+        O: FnMut(&Self::Error) + 'r,
+        F: FnOnce(
+                reply::Scoped<'app, 'd>,
+                budget::Check<'d>,
+                NonZero<u8>,
+            ) -> Result<T, process::Error<E>>
+            + 'r,
         T: 'r,
         E: 'r,
     {
-        self.call(method, path, headers, body).process(process)
+        self.call(method, path, headers, body)
+            .process(observe, process)
     }
 }
 

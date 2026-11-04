@@ -16,13 +16,22 @@ use dope::{
     },
 };
 use o3::base::Call;
-use sark_core::manifold::server::app::{self, Spec};
+use sark_core::{
+    decode::request,
+    manifold::{
+        server::app::{self, Spec},
+        task::app::Runtime,
+    },
+};
 
 use crate::{
     frame::numbers,
-    server::runtime::{
-        app::{App, Failure},
-        output::{self, track::Progress},
+    server::{
+        runtime::{
+            app::{App, Failure},
+            output::{self, track::Progress},
+        },
+        task,
     },
 };
 
@@ -72,6 +81,54 @@ where
         cause: terminal::Error<'w, W>,
     ) {
         (app.get_mut().fault.0)(Failure::Wire {
+            id: conn.id(),
+            cause,
+        });
+    }
+}
+
+impl<'w, 'd: 'w, R, W, M, D, F, ID: Identity + 'd>
+    failures::Policy<'w, 'd, task::App<'d, ID, R, W, M, D, Self>, ID> for Report<F>
+where
+    R: Runtime<'d>,
+    <R::Head as request::Head>::Start: task::works::Family,
+    W: Execution + 'd,
+    task::App<'d, ID, R, W, M, D, Self>: Application<'d, ID, Wire = W>,
+    F: FnMut(Failure<'w, 'd, W, ID>),
+{
+    fn open_failed(
+        app: pin::Pin<&mut task::App<'d, ID, R, W, M, D, Self>>,
+        cause: open::Error<'w, W>,
+    ) {
+        (app.project().fault.0)(Failure::Open(cause));
+    }
+
+    fn peer() -> Option<
+        impl for<'a> Call<(
+            pin::Pin<&'a mut task::App<'d, ID, R, W, M, D, Self>>,
+            socket::Error,
+        )>,
+    > {
+        None::<Infallible>
+    }
+
+    fn wire_failed<'e>(
+        app: pin::Pin<&mut task::App<'d, ID, R, W, M, D, Self>>,
+        conn: conn::Ctx<
+            'e,
+            '_,
+            '_,
+            '_,
+            'w,
+            'd,
+            ID,
+            W,
+            <task::App<'d, ID, R, W, M, D, Self> as Application<'d, ID>>::Conn,
+            <task::App<'d, ID, R, W, M, D, Self> as Application<'d, ID>>::Egress,
+        >,
+        cause: terminal::Error<'w, W>,
+    ) {
+        (app.project().fault.0)(Failure::Wire {
             id: conn.id(),
             cause,
         });

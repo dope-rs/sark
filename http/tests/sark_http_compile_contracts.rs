@@ -1,7 +1,8 @@
 //! Types enforce admission, policy identity, and owner lifetimes; consumed response progress cannot be retried and remains tied to its source owner.
 //! ```compile_fail,E0382
 //! use sark_http::h1::head::{Limit, response::State};
-//! State::with(Vec::<u8>::new(), Limit::RESPONSE, |source, progress| {
+//! use sark_http::payload::response::Method;
+//! State::with(Vec::<u8>::new(), Method::Other, Limit::RESPONSE, |source, progress| {
 //!     let _ = progress.scan(&source);
 //!     let _ = progress.scan(&source);
 //! });
@@ -9,8 +10,9 @@
 //!
 //! ```compile_fail,E0521
 //! use sark_http::h1::head::{Limit, response::State};
-//! State::with(Vec::<u8>::new(), Limit::RESPONSE, |_source, progress| {
-//!     State::with(Vec::<u8>::new(), Limit::RESPONSE, |other, _progress| {
+//! use sark_http::payload::response::Method;
+//! State::with(Vec::<u8>::new(), Method::Other, Limit::RESPONSE, |_source, progress| {
+//!     State::with(Vec::<u8>::new(), Method::Other, Limit::RESPONSE, |other, _progress| {
 //!         let _ = progress.scan(&other);
 //!     });
 //! });
@@ -188,14 +190,30 @@ fn contracts() -> Result<(), Error> {
         toolchain: "stable",
         ..Suite::new(env!("CARGO_MANIFEST_DIR"), file!(), &["sark-http"])
     };
-    let exe = env::current_exe()?;
-    let output = suite.try_build(&exe, env!("CARGO_PKG_NAME"))?.output()?;
+    let exe = env::current_exe().expect("current test executable");
+    let output = suite
+        .try_build(&exe, env!("CARGO_PKG_NAME"))?
+        .output()
+        .expect("run cargo");
     let artifacts = suite.try_collect(&exe, output)?;
     assert_eq!(
-        artifacts.try_errors(include_str!("sark_http_compile_contracts.rs"))?,
+        artifacts.try_errors(include_str!("sark_http_compile_contracts.rs"), compile)?,
         23
     );
-    let status = artifacts.try_rustdoc()?.status()?;
+    let status = artifacts.try_rustdoc()?.status().expect("run rustdoc");
     assert!(status.success(), "compiler contracts: {status}");
     Ok(())
+}
+
+fn compile(command: &mut std::process::Command, source: &str) -> std::process::Output {
+    let mut child = command.spawn().expect("start compiler");
+    let written = child
+        .stdin
+        .take()
+        .map(|mut input| std::io::Write::write_all(&mut input, source.as_bytes()));
+    let output = child.wait_with_output().expect("reap compiler");
+    written
+        .expect("compiler stdin")
+        .expect("write compiler source");
+    output
 }

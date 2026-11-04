@@ -1,12 +1,8 @@
 pub mod common;
 
-use std::{
-    convert::Infallible,
-    io::{Read as _, Write as _},
-    time::Duration,
-};
+use std::{convert::Infallible, time::Duration};
 
-use codec::session::{Audit, Session};
+use codec::session::{Audit, CONTINUE, PREFIX, SUFFIX, Session};
 use common::codec;
 use dope::{
     core::driver::{life::recovery, route::KeyTag},
@@ -34,12 +30,18 @@ use o3::depot::capacity::Count;
 use sark_client::protocol::codec::Codec;
 
 #[test]
-fn refusal_resumes_stored() {
+fn split_head_keeps_binding_through_stored_retries() {
     TcpScript::with(
         |stream| {
+            stream.write_all(PREFIX).expect("partial HEAD response");
+            let mut resume = [0];
             stream
-                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 1\r\n\r\nx")
-                .expect("HTTP response");
+                .read_exact(&mut resume)
+                .expect("partial head admitted");
+            assert_eq!(resume, CONTINUE);
+            stream
+                .write_all(SUFFIX)
+                .expect("HEAD suffix and GET response");
             assert_eq!(stream.read(&mut [0]).expect("client close"), 0);
         },
         |peer| {
@@ -116,8 +118,15 @@ fn refusal_resumes_stored() {
             assert!(reports.is_empty(), "native retirement: {reports:?}");
             let audit = audit.into_result().expect("HTTP session outcome");
             assert_eq!(audit.blocked.get(), 0);
-            assert_eq!(audit.attempts.each_ref().map(|count| count.get()), [2, 2]);
-            assert_eq!(audit.accepted.each_ref().map(|count| count.get()), [1, 1]);
+            assert_eq!(
+                audit.attempts.each_ref().map(|count| count.get()),
+                [2, 2, 2]
+            );
+            assert_eq!(
+                audit.accepted.each_ref().map(|count| count.get()),
+                [1, 1, 1]
+            );
+            assert_eq!(audit.queries.get(), 2);
             assert_eq!(audit.connected.get(), 1);
             assert_eq!(audit.retired.get(), 1);
             peer.finish().expect("peer exit");

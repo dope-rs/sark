@@ -1,4 +1,4 @@
-use std::{iter, mem, net::Shutdown};
+use std::{io, iter, mem, net::Shutdown};
 
 use dope::core::driver::life::recovery;
 pub mod common;
@@ -32,7 +32,7 @@ fn saturates_each_lane() {
         let (full_tx, full_rx) = mpsc::channel();
         let (probe_tx, probe_rx) = mpsc::channel();
         let (free_tx, free_rx) = mpsc::channel();
-        let server = thread::spawn(move || -> Result<Vec<usize>, Error> {
+        let server = thread::spawn(move || -> Result<Vec<usize>, Error<io::Error>> {
             let mut streams = Vec::with_capacity(lanes);
             let mut controls = Vec::with_capacity(lanes);
             for _ in 0..lanes {
@@ -52,7 +52,7 @@ fn saturates_each_lane() {
                 let events = event_tx.clone();
                 commands.push(tx);
                 workers.push(thread::spawn(move || {
-                    let result = (|| -> Result<usize, Error> {
+                    let result = (|| -> Result<usize, Error<io::Error>> {
                         let mut conn = Conn::new(&stream);
                         let mut count = 0;
                         for _ in 0..SATURATION_WAVES {
@@ -82,9 +82,21 @@ fn saturates_each_lane() {
                                 .send(Event::Released(id))
                                 .expect("released lane event");
                         }
-                        if conn.try_tail()? {
-                            count += 1;
-                            events.send(Event::Tail(id)).expect("tail lane event");
+                        match conn.try_request() {
+                            Ok(Some(request)) => {
+                                request.try_line()?;
+                                conn.write_all(SATURATION_LAST_RESPONSE)?;
+                                count += 1;
+                                events.send(Event::Tail(id)).expect("tail lane event");
+                            }
+                            Ok(None) => {}
+                            Err(Error::Io(error))
+                                if matches!(
+                                    error.kind(),
+                                    io::ErrorKind::ConnectionAborted
+                                        | io::ErrorKind::ConnectionReset
+                                ) => {}
+                            Err(error) => return Err(error),
                         }
                         Ok(count)
                     })();

@@ -81,24 +81,31 @@ impl<'call, B> Call<'call, B> {
         'app: 'call,
         B: Backend<'app, 'd> + 'call,
     {
-        self.collected::<FOLLOW, false, _, _>(|response, _, _| Ok(response))
+        self.collected::<FOLLOW, false, _, _, _>(|_| {}, |response, _, _| Ok(response))
     }
 
-    pub(in crate::client) fn process<'app, 'd, T, E, F>(
+    pub(in crate::client) fn process<'app, 'd, T, E, F, O>(
         self,
+        observe: O,
         process: F,
     ) -> impl abi::Fiber<'d, Output = super::Result<Result<T, E>, B::Cause, B::Mailbox>> + 'call
     where
         'd: 'app + 'call,
         'app: 'call,
         B: Backend<'app, 'd> + 'call,
-        F: FnOnce(reply::Scoped<'app, 'd>, budget::Check<'d>) -> Result<T, process::Error<E>>
+        O: FnMut(&Failure<B::Cause, B::Mailbox>) + 'call,
+        F: FnOnce(
+                reply::Scoped<'app, 'd>,
+                budget::Check<'d>,
+                NonZero<u8>,
+            ) -> Result<T, process::Error<E>>
             + 'call,
         T: 'call,
         E: 'call,
     {
-        self.collected::<true, true, _, _>(move |response, bound, attempt| {
-            match process(response, bound) {
+        self.collected::<true, true, _, _, _>(
+            observe,
+            move |response, bound, attempt| match process(response, bound, attempt) {
                 Ok(value) => {
                     bound
                         .check()
@@ -109,18 +116,20 @@ impl<'call, B> Call<'call, B> {
                 Err(process::Error::Elapsed(elapsed)) => {
                     Err(decode::expired(elapsed).attempted(attempt).widen())
                 }
-            }
-        })
+            },
+        )
     }
 
-    fn collected<'app, 'd, const FOLLOW: bool, const PROCESS: bool, T, F>(
+    fn collected<'app, 'd, const FOLLOW: bool, const PROCESS: bool, T, F, O>(
         self,
+        mut observe: O,
         complete: F,
     ) -> impl abi::Fiber<'d, Output = super::Result<T, B::Cause, B::Mailbox>> + 'call
     where
         'd: 'app + 'call,
         'app: 'call,
         B: Backend<'app, 'd> + 'call,
+        O: FnMut(&Failure<B::Cause, B::Mailbox>) + 'call,
         F: FnOnce(
                 reply::Scoped<'app, 'd>,
                 budget::Check<'d>,
@@ -135,7 +144,7 @@ impl<'call, B> Call<'call, B> {
                 self.prepare(clock::Clock::now().await, follows)?;
             loop {
                 let (response, attempt) = Retry::new(backend, &request, headers)
-                    .response(&mut budget)
+                    .response(&mut budget, &mut observe)
                     .await?;
                 if FOLLOW
                     && let Some(next) = request
@@ -172,11 +181,14 @@ impl<'call, B> Call<'call, B> {
         'app: 'call,
         B: Backend<'app, 'd> + 'call,
     {
-        self.collected::<true, false, _, _>(|response, _, attempt| {
-            response.try_retain().map_err(|cause| {
-                Failure::new(Error::Detach(cause), Safety::PossiblyCommitted).attempted(attempt)
-            })
-        })
+        self.collected::<true, false, _, _, _>(
+            |_| {},
+            |response, _, attempt| {
+                response.try_retain().map_err(|cause| {
+                    Failure::new(Error::Detach(cause), Safety::PossiblyCommitted).attempted(attempt)
+                })
+            },
+        )
     }
 
     pub(in crate::client) fn contiguous<'app, 'd>(
@@ -187,11 +199,14 @@ impl<'call, B> Call<'call, B> {
         'app: 'call,
         B: Backend<'app, 'd> + 'call,
     {
-        self.collected::<true, false, _, _>(|response, _, attempt| {
-            response.try_flatten().map_err(|cause| {
-                Failure::new(Error::Detach(cause), Safety::PossiblyCommitted).attempted(attempt)
-            })
-        })
+        self.collected::<true, false, _, _, _>(
+            |_| {},
+            |response, _, attempt| {
+                response.try_flatten().map_err(|cause| {
+                    Failure::new(Error::Detach(cause), Safety::PossiblyCommitted).attempted(attempt)
+                })
+            },
+        )
     }
 
     pub(in crate::client) fn stream<'app, 'd>(

@@ -8,7 +8,7 @@ pub struct Usage {
     pub len: usize,
     pub opened: bool,
     pub messages: [usize; 4],
-    pub close: Option<client::CloseReason>,
+    pub close: Option<client::Closed>,
 }
 
 pub struct Meter<'a> {
@@ -53,9 +53,9 @@ impl client::Observer for Meter<'_> {
         }
     }
 
-    fn close(&mut self, reason: client::CloseReason) {
+    fn close(&mut self, closed: client::Closed) {
         if let Some(mut proof) = self.proof.take() {
-            proof.close = Some(reason);
+            proof.close = Some(closed);
             self.proof.set(Some(proof));
         }
     }

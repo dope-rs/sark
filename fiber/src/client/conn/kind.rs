@@ -2,9 +2,11 @@ use std::convert::Infallible;
 
 use dope::{
     core::driver::route::Identity,
+    manifold::client::{conn, session::Input},
     net::wire::{self, terminal},
 };
 use dope_fiber::reply::layout;
+use o3::base::cell::region;
 use sark_client::protocol::codec::Codec;
 
 use crate::client::{
@@ -22,6 +24,14 @@ pub trait Kind<'d, ID: Identity> {
     type Tag;
 
     fn codec(&self) -> &Codec;
+
+    fn input(
+        &self,
+        id: conn::Id<'d, ID>,
+        input: Input,
+        close: conn::CloseStatus,
+        region: &mut region::Token<region::Identity<'d>>,
+    );
 }
 
 impl<'f, 'e, 'b, 'c, 'w: 'f, 'd: 'f, ID: Identity, W: wire::Spec + 'w, F: 'w> Kind<'d, ID>
@@ -38,6 +48,16 @@ where
     fn codec(&self) -> &Codec {
         &self.protocol.codec
     }
+
+    fn input(
+        &self,
+        id: conn::Id<'d, ID>,
+        input: Input,
+        close: conn::CloseStatus,
+        region: &mut region::Token<region::Identity<'d>>,
+    ) {
+        self.protocol.transport.input(id, input, close, region);
+    }
 }
 
 impl<'o, 'q, 'e, 'b, 'c, 'd, ID: Identity> Kind<'d, ID>
@@ -51,5 +71,15 @@ impl<'o, 'q, 'e, 'b, 'c, 'd, ID: Identity> Kind<'d, ID>
 
     fn codec(&self) -> &Codec {
         &self.protocol.codec
+    }
+
+    fn input(
+        &self,
+        id: conn::Id<'d, ID>,
+        input: Input,
+        close: conn::CloseStatus,
+        region: &mut region::Token<region::Identity<'d>>,
+    ) {
+        self.protocol.transport.input(id, input, close, region);
     }
 }

@@ -12,12 +12,12 @@ pub struct Request<'a> {
 }
 
 impl<'a> Request<'a> {
-    pub(super) fn parse(
+    pub(super) fn parse<E>(
         wire: &'a [u8],
         head_end: usize,
         method: u32,
         target: u32,
-    ) -> Result<Self, Error> {
+    ) -> Result<Self, Error<E>> {
         let head = wire.get(..head_end).ok_or(Error::Boundary {
             wire: wire.len(),
             head: head_end,
@@ -59,7 +59,7 @@ impl<'a> Request<'a> {
         self.method() == "POST" && self.target() == "/effect" && self.body() == b"effect"
     }
 
-    pub(super) fn try_line(self) -> Result<(), Error> {
+    pub fn try_line<E>(self) -> Result<(), Error<E>> {
         let expected = format!("GET {} HTTP/1.1\r\n", pool::SATURATION_PATH);
         if self.wire().starts_with(expected.as_bytes()) {
             Ok(())

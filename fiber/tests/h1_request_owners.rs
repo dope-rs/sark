@@ -1,6 +1,6 @@
 pub mod common;
 
-use std::{cell::Cell, io::Write, net::TcpStream, thread, time::Duration};
+use std::{cell::Cell, thread, time::Duration};
 
 use common::server::recover;
 use common::{
@@ -9,7 +9,7 @@ use common::{
     server::{self, Plan},
 };
 use dope::core::driver::life::recovery::Policy;
-use dope_test::harness::server::Pair;
+use dope_test::harness::{peer::Peer as TcpPeer, server::Pair};
 use sark_fiber::Config;
 
 #[test]
@@ -34,8 +34,8 @@ fn pipeline_keeps_bytes() {
             result
         },
         |bind| {
-            let mut sock = TcpStream::connect(bind).expect("connect");
-            sock.set_read_timeout(Some(Duration::from_secs(3)))
+            let mut sock = TcpPeer::at(bind).try_connect().expect("connect");
+            sock.read_wait(Some(Duration::from_secs(3)))
                 .expect("test socket accepts a read timeout");
             sock.set_nodelay(true)
                 .expect("test socket accepts TCP_NODELAY");
@@ -103,8 +103,8 @@ fn accum_retain() {
                 result
             },
             |bind| {
-                let mut sock = TcpStream::connect(bind).expect("connect");
-                sock.set_read_timeout(Some(Duration::from_secs(3)))
+                let mut sock = TcpPeer::at(bind).try_connect().expect("connect");
+                sock.read_wait(Some(Duration::from_secs(3)))
                     .expect("set bounded response timeout");
                 sock.set_nodelay(true)
                     .expect("disable Nagle for request split");
@@ -189,8 +189,8 @@ fn socket_retain() {
                 result
             },
             |bind| {
-                let mut sock = TcpStream::connect(bind).expect("connect");
-                sock.set_read_timeout(Some(Duration::from_secs(3)))
+                let mut sock = TcpPeer::at(bind).try_connect().expect("connect");
+                sock.read_wait(Some(Duration::from_secs(3)))
                     .expect("set bounded response timeout");
                 sock.set_nodelay(true)
                     .expect("disable Nagle for pipelining");
@@ -267,8 +267,8 @@ fn body_transfer() {
             },
             |bind| {
                 let payload = vec![b'x'; 16 * 1024];
-                let mut sock = TcpStream::connect(bind).expect("connect");
-                sock.set_read_timeout(Some(Duration::from_secs(3)))
+                let mut sock = TcpPeer::at(bind).try_connect().expect("connect");
+                sock.read_wait(Some(Duration::from_secs(3)))
                     .expect("set bounded response timeout");
                 sock.set_nodelay(true).expect("disable Nagle for request");
                 sock.write_all(&wire(&payload))
@@ -319,9 +319,9 @@ fn listener_admission() {
                 let head = b"POST /retained/id?q=query HTTP/1.1\r\nHost: x\r\nx-echo-marker: marker\r\nContent-Length: 2\r\nExpect: 100-continue\r\nConnection: close\r\n\r\n";
                 let mut sockets = Vec::with_capacity(server::MAX_CONNECTIONS);
                 for _ in 0..server::MAX_CONNECTIONS {
-                    let mut socket = TcpStream::connect(bind).expect("connect");
+                    let mut socket = TcpPeer::at(bind).try_connect().expect("connect");
                     socket
-                        .set_read_timeout(Some(Duration::from_secs(3)))
+                        .read_wait(Some(Duration::from_secs(3)))
                         .expect("set bounded continuation timeout");
                     socket
                         .set_nodelay(true)
@@ -382,8 +382,8 @@ fn json_transfer() {
                 result
             },
             |bind| {
-                let mut sock = TcpStream::connect(bind).expect("connect");
-                sock.set_read_timeout(Some(Duration::from_secs(3)))
+                let mut sock = TcpPeer::at(bind).try_connect().expect("connect");
+                sock.read_wait(Some(Duration::from_secs(3)))
                     .expect("set bounded response timeout");
                 sock.set_nodelay(true).expect("disable Nagle for requests");
                 sock.write_all(

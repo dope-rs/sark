@@ -168,13 +168,6 @@ impl<'life, 'e: 'life, 'd: 'life, ID: Identity + 'life>
         )
     }
 
-    fn flush() -> impl for<'a, 'x, 'y, 'z> Call<(
-        &'a mut Owner<'life, 'e, 'd, ID>,
-        &'x mut turns::Context<'y, 'z, 'd, Self::ConnState, Self::Send, ID>,
-    )> {
-        output::Flush::<Infallible>::None
-    }
-
     fn cancel() -> impl for<'a, 'x> Call<(
         &'a Owner<'life, 'e, 'd, ID>,
         Self::Send,

@@ -4,7 +4,7 @@ use sark_ws::client::{self, Message, send::Sender};
 pub enum Event {
     Opened,
     Message,
-    Closed(client::CloseReason),
+    Closed(client::Closed),
     Dropped,
 }
 
@@ -24,8 +24,8 @@ impl<'d> client::Egress<'d> for Borrowed<'_> {
         self.events.record(Event::Message);
     }
 
-    fn close(&mut self, reason: client::CloseReason) {
-        self.events.record(Event::Closed(reason));
+    fn close(&mut self, closed: client::Closed) {
+        self.events.record(Event::Closed(closed));
         self.closed.hit();
     }
 }

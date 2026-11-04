@@ -18,10 +18,7 @@ use dope::{
     },
     manifold::{app::creation, timing::Balanced},
     net::link::egress,
-    runtime::{
-        executor::{Executor, session},
-        topology,
-    },
+    runtime::executor::{Executor, session},
 };
 use dope_test::alloc::Tracker;
 use driver::settings::claim::Needs;
@@ -64,12 +61,12 @@ fn retains_provider_state() {
             tcp::Tcp,
             wire::{Identity, domain},
         },
-        runtime::topology::{lending, ops},
+        runtime::topology::ops,
     };
     use dope_fiber::task::storage::scope::Brand;
     use dope_test::harness::server::Pair;
     use sark_fiber::{Config, Throughput, server::PrepareError};
-    use sark_h1::server::date::Clock;
+    use sark_h1::server::{date::Clock, run};
 
     let harness = Pair::bind().expect("bind dependent listener");
     let plan = server::Plan::new(harness.addr(), time::Duration::from_secs(5)).build();
@@ -99,7 +96,7 @@ fn retains_provider_state() {
                             panic!("native server failure: {:?}", failure.cause())
                         },
                     ),
-                    |result: Result<_, topology::RunError<'_, _, _, _, _, _>>| {
+                    |result: Result<_, run::RunError<'_, _, _, _, _, _>>| {
                         result
                             .as_ref()
                             .map(|_| ())
@@ -116,48 +113,35 @@ fn retains_provider_state() {
                 let plan = provider.compose(storage, plan, move |plan, owner, stage| {
                     stage.hold(owner, |held, stage| {
                         Brand::with(|brand| {
-                            let result = plan
-                                .prepare_in(
-                                    stage,
-                                    domain::Local::new(Identity),
-                                    |prepared, stage| {
-                                        held.lend_scope(stage, report, |issued| {
-                                            let (client, permit) = issued.into_parts();
-                                            let state = std::pin::pin!(State::<_, 2> {
-                                                source: (
-                                                    client,
-                                                    task::State {
-                                                        first: bytes,
-                                                        second: b"",
-                                                        encoded: observed,
-                                                    }
-                                                ),
-                                            });
-                                            App::run_prepared(
-                                                brand,
-                                                state.as_ref(),
-                                                config,
-                                                prepared,
-                                                permit,
-                                            )
-                                        })
-                                    },
-                                )
-                                .map_err(|error| {
-                                    topology::Failure::Install(BuildError::Create(error))
-                                })?;
-                            match result {
-                                Ok(Ok(request)) => Ok(request),
-                                Ok(Err(error)) => {
-                                    Err(topology::Failure::Run(session::Error::Drive(error)))
-                                }
-                                Err(lending::Error::Build(error)) => {
-                                    Err(topology::Failure::Install(error))
-                                }
-                                Err(lending::Error::Run(error)) => {
-                                    Err(topology::Failure::Run(error))
-                                }
-                            }
+                            plan.prepare_in(
+                                stage,
+                                domain::Local::new(Identity),
+                                |prepared, wait, stage| {
+                                    let result = held.lend_scope(stage, report, |issued| {
+                                        let (client, permit) = issued.into_parts();
+                                        let state = std::pin::pin!(State::<_, 2> {
+                                            source: (
+                                                client,
+                                                task::State {
+                                                    first: bytes,
+                                                    second: b"",
+                                                    encoded: observed,
+                                                }
+                                            ),
+                                        });
+                                        App::run_prepared(
+                                            brand,
+                                            state.as_ref(),
+                                            config,
+                                            prepared,
+                                            wait,
+                                            permit,
+                                        )
+                                    });
+                                    run::Failure::lending(result)
+                                },
+                            )
+                            .map_err(|error| run::Failure::Install(BuildError::Create(error)))?
                         })
                     })
                 });
@@ -166,19 +150,16 @@ fn retains_provider_state() {
                     context,
                     ops::Map(ops::Compose, |result| match result {
                         Ok(Ok(request)) => Ok(request),
-                        Ok(Err(topology::Failure::Run(error))) => {
-                            Err(topology::Failure::Run(error))
+                        Ok(Err(error)) => {
+                            Err(run::Failure::map_install(error, BranchError::Second))
                         }
-                        Ok(Err(topology::Failure::Install(error))) => {
-                            Err(topology::Failure::Install(BranchError::Second(error)))
-                        }
-                        Err(error) => Err(topology::Failure::Install(BranchError::First(error))),
+                        Err(error) => Err(run::Failure::Install(BranchError::First(error))),
                     }),
                     recovery,
                     |outcome| {
                         let result = match outcome {
-                            Ok(result) => result.map_err(topology::RunError::Failure),
-                            Err(error) => Err(topology::RunError::from(error)),
+                            Ok(result) => result.map_err(run::RunError::Failure),
+                            Err(error) => Err(run::RunError::from(error)),
                         };
                         finish(result)
                     },

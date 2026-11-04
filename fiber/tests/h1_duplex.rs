@@ -33,7 +33,7 @@ use dope_fiber::task::storage::scope::Brand;
 use dope_test::{
     fibers,
     harness::{
-        peer::{Peer, Stream},
+        peer::{self, Peer, Stream},
         server::Pair,
     },
 };
@@ -41,7 +41,10 @@ use dope_tls::tls::endpoint;
 use o3::buffer::hold::limits::Bound;
 use sark_fiber::Config;
 
-fn serve(end: bool, client: impl FnOnce(&mut &Stream<'_>) -> io::Result<()> + Send) -> Snapshot {
+fn serve(
+    end: bool,
+    client: impl FnOnce(&mut &Stream<'_>) -> Result<(), peer::Error> + Send,
+) -> Snapshot {
     let listener = Listener::bind(SocketAddr::from(([127, 0, 0, 1], 0))).expect("listener");
     let address = listener.local_addr();
     let plan = Plan::new(address, Duration::from_secs(10))
@@ -71,7 +74,7 @@ fn serve(end: bool, client: impl FnOnce(&mut &Stream<'_>) -> io::Result<()> + Se
                         stage,
                         domain::Local::<wire::Identity, _>::new(wire::Identity),
                         router,
-                        |root, stage| {
+                        |root, _wait, stage| {
                             stage
                                 .with_quiesce(&mut done, root, Duration::from_secs(5), |mut app| {
                                     Peer::at(address)
@@ -359,7 +362,7 @@ fn runs_scoped_duplex() {
                                         let (state, config, report) = (&state, config, &mut finish);
                                         Brand::with(|brand| {
                                             let app = MultiDuplexApplication::__scoped_new(brand, state, config);
-                                            plan.install(stage, wire, app, |root, stage| {
+                                            plan.install(stage, wire, app, |root, _wait, stage| {
                                                 let result = stage.request(report, root);
                                                 result.as_ref().map_err(|error| error.cause()).expect("session");
                                                 result.ok().expect("checked session").expect("drive")
@@ -370,7 +373,7 @@ fn runs_scoped_duplex() {
                                         let (state, config, report) = (&state, config, &mut finish);
                                         Brand::with(|brand| {
                                             let app = SingleDuplexApplication::__scoped_new(brand, state, config);
-                                            plan.install(stage, wire, app, |root, stage| {
+                                            plan.install(stage, wire, app, |root, _wait, stage| {
                                                 let result = stage.request(report, root);
                                                 result.as_ref().map_err(|error| error.cause()).expect("session");
                                                 result.ok().expect("checked session").expect("drive")
@@ -390,7 +393,7 @@ fn runs_scoped_duplex() {
                                         let (state, config, report) = (&state, config, &mut finish);
                                         let result = Brand::with(|brand| {
                                             let app = branches::App::__scoped_new(brand, state, config);
-                                            plan.install(stage, wire, app, |root, stage| {
+                                            plan.install(stage, wire, app, |root, _wait, stage| {
                                                 let result = stage.request(report, root);
                                                 result.as_ref().map_err(|error| error.cause()).expect("session");
                                                 result.ok().expect("checked session").expect("drive")

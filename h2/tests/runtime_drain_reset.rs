@@ -1,11 +1,6 @@
 pub mod common;
 
-use std::{
-    cell::Cell,
-    convert::Infallible,
-    io::{Read, Write},
-    time::Duration,
-};
+use std::{cell::Cell, convert::Infallible, time::Duration};
 
 use common::{headers::Generated, recipe::Lexical};
 use dope::{
@@ -68,7 +63,7 @@ fn reset_completes_drain() {
                 Ok::<_, Infallible>(())
             },
             |address| {
-                let mut socket = Peer::at(address)
+                let socket = Peer::at(address)
                     .try_read(Duration::from_secs(2))
                     .expect("connect H2 peer");
                 let mut client = Connection::<ClientRole>::try_new().expect("H2 client");

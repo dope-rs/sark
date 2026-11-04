@@ -2,7 +2,6 @@ pub mod common;
 
 use std::{
     cell::Cell,
-    io::{ErrorKind, Read as _, Write as _},
     net::{Shutdown, SocketAddr},
     time::Duration,
 };
@@ -18,7 +17,7 @@ use common::{
     server::{self, Plan},
 };
 use dope::core::{driver::life::recovery::Policy, io::socket::option::Buffer};
-use dope_test::harness::server::Pair;
+use dope_test::harness::{peer::Error as PeerError, server::Pair};
 use sark_fiber::Config;
 
 fn serve<R>(buffers: Option<Buffer>, client: impl FnOnce(SocketAddr) -> R) -> R {
@@ -127,22 +126,19 @@ fn closing_discard_drains() -> Result<(), Error> {
     serve(None, |bind| {
         for complete in [true, false] {
             let mut socket = Peer::try_connect(bind)?;
-            socket.set_write_timeout(Some(Duration::from_secs(5)))?;
+            socket.write_wait(Some(Duration::from_secs(5)))?;
             socket.write_all(&Request::new("/discard").close_head(UPLOAD.len()))?;
             let mut buffered = Vec::new();
             assert_eq!(
                 Peer::new(&mut socket, &mut buffered).try_response()?,
                 (200, UPLOAD.len().to_string().into_bytes())
             );
-            socket.set_read_timeout(Some(Duration::from_millis(25)))?;
+            socket.read_wait(Some(Duration::from_millis(25)))?;
             let waiting = socket
                 .read(&mut [0; 1])
                 .expect_err("close must wait for the body");
-            assert!(matches!(
-                waiting.kind(),
-                ErrorKind::WouldBlock | ErrorKind::TimedOut
-            ));
-            socket.set_read_timeout(Some(Duration::from_secs(5)))?;
+            assert_eq!(waiting, PeerError::TimedOut);
+            socket.read_wait(Some(Duration::from_secs(5)))?;
             if complete {
                 socket.write_all(UPLOAD)?;
             } else {
@@ -161,7 +157,7 @@ fn drains_during_response() -> Result<(), Error> {
     let buffers = Buffer::try_from(16 * 1024_usize).expect("bounded socket buffers");
     serve(Some(buffers), |bind| {
         let mut socket = Peer::try_bounded(bind)?;
-        socket.set_write_timeout(Some(Duration::from_secs(5)))?;
+        socket.write_wait(Some(Duration::from_secs(5)))?;
         socket.write_all(&Request::new("/discard/large").close_head(LARGE_BODY_LEN))?;
         for chunk in UPLOAD[..LARGE_BODY_LEN].chunks(16 * 1024) {
             socket.write_all(chunk)?;
@@ -314,7 +310,7 @@ fn async_discard_pipeline() -> Result<(), Error> {
 fn closing_fixed_discard() -> Result<(), Error> {
     serve(None, |bind| {
         let mut socket = Peer::try_connect(bind)?;
-        socket.set_write_timeout(Some(Duration::from_secs(5)))?;
+        socket.write_wait(Some(Duration::from_secs(5)))?;
         socket.write_all(&Request::new("/async/discard").close_head(UPLOAD.len()))?;
         socket.write_all(UPLOAD)?;
         let mut buffered = Vec::new();
@@ -419,13 +415,10 @@ fn open_json_waits_for_input() -> Result<(), Error> {
             let split = request.len() - tail;
             let mut socket = Peer::try_connect(bind)?;
             socket.write_all(&request[..split])?;
-            socket.set_read_timeout(Some(Duration::from_millis(25)))?;
+            socket.read_wait(Some(Duration::from_millis(25)))?;
             let waiting = socket.read(&mut [0; 1]).expect_err("incomplete JSON");
-            assert!(matches!(
-                waiting.kind(),
-                ErrorKind::WouldBlock | ErrorKind::TimedOut
-            ));
-            socket.set_read_timeout(Some(Duration::from_secs(5)))?;
+            assert_eq!(waiting, PeerError::TimedOut);
+            socket.read_wait(Some(Duration::from_secs(5)))?;
             socket.write_all(&request[split..])?;
             let mut buffered = Vec::new();
             let (status, body) = Peer::new(&mut socket, &mut buffered).try_response()?;

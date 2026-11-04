@@ -119,6 +119,7 @@ fn splits_keep_admission() {
     let head = b"HTTP/1.1 101 Switching Protocols\r\nUpgrade: h2c/1, websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo=\r\n\r\n";
     State::with(
         Vec::new(),
+        Method::Other,
         Limit::RESPONSE.with_bytes(16 * 1024),
         |mut source, mut progress| {
             let mut fields = Admission::default();
@@ -137,7 +138,7 @@ fn splits_keep_admission() {
                 .expect("complete response");
             let head = head
                 .expect("complete response")
-                .admit(Method::Other)
+                .admit()
                 .expect("response framing");
             assert!(
                 matches!(fields.finish(head.version(), head.status(), head.control().connection()),

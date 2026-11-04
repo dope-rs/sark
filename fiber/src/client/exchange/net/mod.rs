@@ -6,13 +6,15 @@ use dope::{
         app::{creation, receive},
         client::{
             close,
-            conn::{Activation, Id},
+            conn::{Activation, CloseStatus, Id},
             port::{self, error},
+            session::Input,
         },
     },
 };
 use dope_fiber::reply::{self, layout};
 use o3::{
+    base::cell::region,
     buffer::pool,
     depot::{
         capacity::Count,
@@ -163,6 +165,20 @@ where
     F: report::Policy<E>,
     E: 'f,
 {
+    pub(in crate::client) fn input(
+        &self,
+        id: Id<'d, ID>,
+        input: Input,
+        close: CloseStatus,
+        region: &mut region::Token<region::Identity<'d>>,
+    ) {
+        if !matches!(close, CloseStatus::Open) {
+            self.pool.begin_close(region, id);
+        } else if let Some(tag) = self.pool.input(region, id, input) {
+            self.waiters.wake(tag);
+        }
+    }
+
     pub(in crate::client) fn try_activate(
         &self,
         io: &port::Port<'_, 'd, pool::Cursor, ID>,

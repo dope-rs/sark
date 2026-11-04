@@ -102,10 +102,13 @@ fn close_seals_generation() {
                                     ));
                                 }
                             },
-                            close: &|reason| {
+                            close: &|closed| {
                                 assert!(matches!(
-                                    reason,
-                                    client::CloseReason::RemoteClose { code: None, .. }
+                                    closed,
+                                    client::Closed {
+                                        reason: client::CloseReason::RemoteClose { code: None, .. },
+                                        transmit: None,
+                                    }
                                 ))
                             },
                             opened: &opened,

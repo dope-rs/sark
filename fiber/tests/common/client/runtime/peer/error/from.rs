@@ -1,9 +1,7 @@
-use std::io;
-
 use crate::common::client::runtime::peer::Error;
 
-impl From<io::Error> for Error {
-    fn from(error: io::Error) -> Self {
+impl<E> From<E> for Error<E> {
+    fn from(error: E) -> Self {
         Self::Io(error)
     }
 }

@@ -9,6 +9,11 @@ pub const CONNECT_ORIGIN: &[u8] = b"CONNECT / HTTP/1.1\r\n";
 pub const INVALID_ESCAPE_PREFIX: &[u8] = b"GET /%z";
 pub const RESPONSE_PREFIX: &[u8] = b"HTTP/1.1 200 OK\r\nX-Proof: a";
 pub const RESPONSE_SUFFIX: &[u8] = b"b\r\n\r\n";
+pub const CONNECT_RESPONSES: &[&[u8]] = &[
+    b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\nraw",
+    b"HTTP/1.1 204 No Content\r\nContent-Length: x\r\nContent-Length: 7\r\nTransfer-Encoding: chunked, gzip\r\n\r\nraw",
+    b"HTTP/1.0 299 Tunnel\r\nTransfer-Encoding: chunked\r\n\r\nraw",
+];
 
 use std::convert::Infallible;
 

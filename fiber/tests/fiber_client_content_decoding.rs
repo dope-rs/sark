@@ -4,7 +4,7 @@ use dope::core::{driver::life::recovery, io::Reclaimed};
 use dope_test::harness::peer::{AcceptScript, Stream};
 pub mod common;
 
-use std::{io::Write as _, str};
+use std::str;
 
 use common::client::{config::FLAVORS, gzip, runtime::cases::request::Request};
 use sark_client::{Error, Safety, reply::decode::Policy};

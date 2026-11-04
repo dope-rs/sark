@@ -43,6 +43,10 @@ impl<'d, ID: Identity, Tag: net::PoolTag<'d, ID>> Waiters<'d, ID, Tag> {
             .map_err(capacity::Error::Waiter)
     }
 
+    pub(in crate::client) fn cancel(&self, entry: &mut queue::Registration<'_, 'd, Tag::Lanes>) {
+        self.active.cancel(entry);
+    }
+
     pub(in crate::client) fn wake_io(&self) {
         for conn in self.connection.as_ref() {
             conn.wake_one::<0>();

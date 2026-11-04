@@ -1,5 +1,6 @@
 //! Response progress for a separately retained, append-only source.
 
+use crate::payload::response::Method;
 use core::convert::Infallible;
 
 use crate::h1::head::{
@@ -14,8 +15,8 @@ use crate::h1::head::{
 pub struct State(state::State<parts::Kind>);
 
 impl State {
-    pub const fn new(limit: Limit) -> Self {
-        Self(state::State::new(limit))
+    pub const fn new(request: Method, limit: Limit) -> Self {
+        Self(state::State::new(parts::Kind(request), limit))
     }
 
     /// Parses appended bytes and emits newly completed fields.

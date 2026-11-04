@@ -65,6 +65,10 @@ impl Plan {
     pub fn build(
         self,
     ) -> run::Plan<KeyTag<HTTP_LISTENER_ID>, KeyTag<DATE_UPDATER_ID>, sark_fiber::Throughput> {
+        self.build_for()
+    }
+
+    pub fn build_for<L: Identity, D: Identity>(self) -> run::Plan<L, D, sark_fiber::Throughput> {
         let mut config = listener(self.bind);
         if let Some(buffers) = self.buffers {
             config.stream.recv_buffer_size = Some(buffers);
@@ -90,6 +94,7 @@ fn listener(bind: net::SocketAddr) -> config::Prepared<sark_fiber::Tcp> {
     }
 }
 
+pub mod accept;
 pub mod h3;
 
 use std::cell::Cell;

@@ -1,4 +1,4 @@
-use crate::{macros::call, runtime::paths::Paths, types};
+use crate::{runtime::paths::Paths, types};
 
 #[derive(Clone, Copy)]
 enum Wire {
@@ -41,6 +41,7 @@ fn definitions(
     let [n_brand, v_app, v_config] = generics.locals(["__brand", "app", "config"]);
     let [v_error, v_finish, v_plan] = generics.locals(["error", "finish", "plan"]);
     let [v_root, v_stage, v_state] = generics.locals(["root", "stage", "state"]);
+    let [v_wait] = generics.locals(["wait"]);
     let [v_wire, v_worker] = generics.locals(["wire", "worker"]);
     let [l_driver, l_store, l_own, l_work, l_finish] =
         generics.lives(["driver", "storage", "owner", "worker", "__finish"]);
@@ -84,7 +85,7 @@ fn definitions(
         },
         Wire::Generic => quote::quote! {
             let #v_wire = #v_stage.storage().0.bind(#v_wire).map_err(|#v_error| {
-                #ns_fiber::dope::runtime::topology::Failure::Install(
+                #ns_h1::server::run::Failure::Install(
                     #ns_fiber::dope::core::BranchError::First(#v_error),
                 )
             })?;
@@ -92,15 +93,15 @@ fn definitions(
     };
     let config = duplex.config(paths);
     let input = duplex.input_type(paths);
-    let run = call::installed(
-        paths,
-        quote::quote! {
-            #v_plan.install(#v_stage, #v_wire, #v_app, |#v_root, #v_stage| {
-                #v_stage.request(#v_finish, #v_root)
-            })
-            .map_err(#ns_fiber::dope::core::BranchError::Second)
-        },
-    );
+    let run = quote::quote! {
+        #v_plan.install(#v_stage, #v_wire, #v_app, |#v_root, #v_wait, #v_stage| {
+            #ns_h1::server::run::Failure::session(
+                #v_stage.with_app(#v_finish, #v_root, |#v_app| #v_wait.run(#v_app)),
+            )
+        }).map_err(|#v_error| #ns_h1::server::run::Failure::Install(
+            #ns_fiber::dope::core::BranchError::Second(#v_error),
+        ))?
+    };
     let worker = quote::quote! {
         #ns_fiber::dope::runtime::topology::Worker<
             #l_work,
@@ -169,7 +170,7 @@ fn definitions(
     {
                     type Output = ::core::result::Result<
                         #ns_fiber::dope::runtime::shutdown::Requested<#g_q>,
-                        #ns_fiber::dope::runtime::topology::Failure<
+                        #ns_h1::server::run::Failure<
                             #l_finish,
                             #ns_fiber::dope::core::BranchError<
                                 #failure,
@@ -318,8 +319,8 @@ fn method(
             let #v_op = #create;
             ::core::result::Result::Ok(#v_prep.enter(#v_ctx, #v_op, #v_report, |#v_result| {
                 match #v_result {
-                    ::core::result::Result::Ok(#v_result) => #v_finish(#v_result.map_err(#ns_fiber::dope::runtime::topology::RunError::Failure)),
-                    ::core::result::Result::Err(#v_error) => #v_finish(::core::result::Result::Err(#ns_fiber::dope::runtime::topology::RunError::from(#v_error))),
+                    ::core::result::Result::Ok(#v_result) => #v_finish(#v_result.map_err(#ns_h1::server::run::RunError::Failure)),
+                    ::core::result::Result::Err(#v_error) => #v_finish(::core::result::Result::Err(#ns_h1::server::run::RunError::from(#v_error))),
                 }
             }))
         }
@@ -416,7 +417,7 @@ fn error(
     let input = duplex.input_type(paths);
     let wire = wire_error(wire, generics);
     quote::quote! {
-        #ns_fiber::dope::runtime::topology::RunError<
+        #ns_h1::server::run::RunError<
             #l_owner,
             ::core::convert::Infallible,
             #ns_fiber::dope::core::BranchError<

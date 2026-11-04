@@ -1,7 +1,7 @@
 use dope::core::{driver::life::recovery, io::Reclaimed};
 pub mod common;
 
-use std::{io::Write, str};
+use std::str;
 
 use common::client::recover;
 use common::client::{

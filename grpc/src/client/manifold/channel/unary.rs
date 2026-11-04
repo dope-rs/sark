@@ -1,4 +1,4 @@
-use core::task;
+use core::{pin, task};
 
 use dope::core::driver::{
     route::Identity,
@@ -24,7 +24,7 @@ enum Phase<'app, 'life, 'e, 'd: 'app, P: ?Sized + 'app, ID: Identity> {
 }
 
 #[doc(hidden)]
-#[pin_project::pin_project]
+#[pin_project::pin_project(PinnedDrop)]
 pub struct Unary<'target, 'app, 'life, 'e, 'd, P: ?Sized + 'app, D: crate::Codec, ID: Identity>
 where
     'd: 'app + 'target,
@@ -36,6 +36,20 @@ where
     codec: D,
     message: &'target D::Encode,
     phase: Phase<'app, 'life, 'e, 'd, P, ID>,
+}
+
+#[pin_project::pinned_drop]
+impl<'target, 'app, 'life, 'e, 'd, P: ?Sized + 'app, D: crate::Codec, ID: Identity> PinnedDrop
+    for Unary<'target, 'app, 'life, 'e, 'd, P, D, ID>
+where
+    'd: 'app + 'target,
+{
+    fn drop(self: pin::Pin<&mut Self>) {
+        let this = self.project();
+        if let Phase::Starting(lease) = this.phase {
+            this.handle.port.shared.sender_waiters.cancel(lease);
+        }
+    }
 }
 
 impl<'target, 'app, 'life, 'e, 'd, P: ?Sized + 'app, D: crate::Codec, ID: Identity>

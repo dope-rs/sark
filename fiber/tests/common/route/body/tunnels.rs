@@ -85,13 +85,12 @@ sark_fiber::define_route! {
     }
 }
 
-use std::{
-    cell::Cell,
-    io::{self, Read},
-    time::Duration,
-};
+use std::{cell::Cell, time::Duration};
 
-use dope_test::harness::{peer::Stream, signals::LocalGate};
+use dope_test::harness::{
+    peer::{Error, Stream},
+    signals::LocalGate,
+};
 
 #[derive(Default)]
 pub struct Duplex {
@@ -156,20 +155,19 @@ impl Policy<Tls> for State<'_> {
 }
 
 pub trait Receive {
-    fn read_until(&self, buffered: &mut Vec<u8>, expected: &[u8]) -> io::Result<()>;
+    fn read_until(&self, buffered: &mut Vec<u8>, expected: &[u8]) -> Result<(), Error>;
 }
 
 impl Receive for Stream<'_> {
-    fn read_until(&self, buffered: &mut Vec<u8>, expected: &[u8]) -> io::Result<()> {
-        let mut socket = self;
+    fn read_until(&self, buffered: &mut Vec<u8>, expected: &[u8]) -> Result<(), Error> {
         let mut incoming = [0_u8; 4096];
         while !buffered
             .windows(expected.len())
             .any(|window| window == expected)
         {
-            let received = socket.read(&mut incoming)?;
+            let received = self.read(&mut incoming)?;
             if received == 0 {
-                return Err(io::ErrorKind::UnexpectedEof.into());
+                return Err(Error::UnexpectedEof);
             }
             buffered.extend_from_slice(&incoming[..received]);
         }

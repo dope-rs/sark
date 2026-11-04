@@ -122,16 +122,22 @@ fn response_outcome() {
     let none = framing::Message::new(None, framing::Transfer::None);
     let fixed = framing::Message::new(Some(7), framing::Transfer::None);
 
-    assert!(
-        framing::Outcome::admit(
-            Method::Connect,
-            switch::Intent::Connect,
-            200,
-            none,
-            field::Connection::default(),
-            None,
-        ) == Ok(framing::Outcome::Switch(switch::Kind::Connect))
-    );
+    for framing in [
+        none,
+        fixed,
+        framing::Message::new(Some(0), framing::Transfer::Chunked),
+    ] {
+        assert!(
+            framing::Outcome::admit(
+                Method::Connect,
+                switch::Intent::Connect,
+                200,
+                framing,
+                field::Connection::default(),
+                None,
+            ) == Ok(framing::Outcome::Switch(switch::Kind::Connect))
+        );
+    }
     assert!(
         framing::Outcome::admit(
             Method::Connect,

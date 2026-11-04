@@ -128,11 +128,30 @@ fn origin_contracts() -> Result<(), Error> {
         file!(),
         &["sark-core", "sark-http", "o3", "dope-core", "dope-test"],
     );
-    let exe = env::current_exe()?;
-    let output = suite.try_build(&exe, env!("CARGO_PKG_NAME"))?.output()?;
+    let exe = env::current_exe().expect("current test executable");
+    let output = suite
+        .try_build(&exe, env!("CARGO_PKG_NAME"))?
+        .output()
+        .expect("run cargo");
     let artifacts = suite.try_collect(&exe, output)?;
-    assert_eq!(artifacts.try_errors(include_str!("body_origin.rs"))?, 5);
-    let status = artifacts.try_rustdoc()?.status()?;
+    assert_eq!(
+        artifacts.try_errors(include_str!("body_origin.rs"), compile)?,
+        5
+    );
+    let status = artifacts.try_rustdoc()?.status().expect("run rustdoc");
     assert!(status.success(), "body account identity: {status}");
     Ok(())
+}
+
+fn compile(command: &mut std::process::Command, source: &str) -> std::process::Output {
+    let mut child = command.spawn().expect("start compiler");
+    let written = child
+        .stdin
+        .take()
+        .map(|mut input| std::io::Write::write_all(&mut input, source.as_bytes()));
+    let output = child.wait_with_output().expect("reap compiler");
+    written
+        .expect("compiler stdin")
+        .expect("write compiler source");
+    output
 }

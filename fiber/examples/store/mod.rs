@@ -21,15 +21,11 @@ use dope::{
         tcp::Tcp,
         wire::{Identity, domain},
     },
-    runtime::{
-        executor::session,
-        process, shutdown,
-        topology::{self, lending, ops},
-    },
+    runtime::{executor::session, process, shutdown, topology::ops},
 };
 use dope_fiber::task::storage::scope::Brand;
 use sark_fiber::{Throughput, server::PrepareError};
-use sark_h1::server::{date::Clock, listener};
+use sark_h1::server::{date::Clock, listener, run};
 use sark_http::payload::response::status;
 use sark_json::{
     o3::buffer::write::Sink,
@@ -124,9 +120,11 @@ impl Server {
         let plan = provider.compose(storage, plan, move |plan, owner, stage| {
             stage.hold(owner, |held, stage| {
                 Brand::with(|brand| {
-                    let result = plan
-                        .prepare_in(stage, domain::Local::new(Identity), |prepared, stage| {
-                            held.lend_scope(stage, report, |issued| {
+                    plan.prepare_in(
+                        stage,
+                        domain::Local::new(Identity),
+                        |prepared, wait, stage| {
+                            let result = held.lend_scope(stage, report, |issued| {
                                 let (client, permit) = issued.into_parts();
                                 let state = std::pin::pin!(client);
                                 crate::App::run_prepared(
@@ -134,17 +132,14 @@ impl Server {
                                     state.as_ref(),
                                     config,
                                     prepared,
+                                    wait,
                                     permit,
                                 )
-                            })
-                        })
-                        .map_err(|error| topology::Failure::Install(BuildError::Create(error)))?;
-                    match result {
-                        Ok(Ok(request)) => Ok(request),
-                        Ok(Err(error)) => Err(topology::Failure::Run(session::Error::Drive(error))),
-                        Err(lending::Error::Build(error)) => Err(topology::Failure::Install(error)),
-                        Err(lending::Error::Run(error)) => Err(topology::Failure::Run(error)),
-                    }
+                            });
+                            run::Failure::lending(result)
+                        },
+                    )
+                    .map_err(|error| run::Failure::Install(BuildError::Create(error)))?
                 })
             })
         });
@@ -158,17 +153,14 @@ impl Server {
                 context,
                 ops::Map(ops::Compose, |result| match result {
                     Ok(Ok(request)) => Ok(request),
-                    Ok(Err(topology::Failure::Run(error))) => Err(topology::Failure::Run(error)),
-                    Ok(Err(topology::Failure::Install(error))) => {
-                        Err(topology::Failure::Install(BranchError::Second(error)))
-                    }
-                    Err(error) => Err(topology::Failure::Install(BranchError::First(error))),
+                    Ok(Err(error)) => Err(run::Failure::map_install(error, BranchError::Second)),
+                    Err(error) => Err(run::Failure::Install(BranchError::First(error))),
                 }),
                 recovery,
                 |outcome| {
                     let result = match outcome {
-                        Ok(result) => result.map_err(topology::RunError::Failure),
-                        Err(error) => Err(topology::RunError::from(error)),
+                        Ok(result) => result.map_err(run::RunError::Failure),
+                        Err(error) => Err(run::RunError::from(error)),
                     };
                     worker::finish_run(result, &output)
                 },

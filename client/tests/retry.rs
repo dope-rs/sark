@@ -263,6 +263,7 @@ fn connect_ids_are_final() {
 #[test]
 fn submit_cause_is_kept() {
     use dope::core::driver::result::{SubmitCause, SubmitError};
+    use dope::manifold::client::conn::Transmit;
     use o3::depot::arena::slab::Vacancy;
 
     for vacancy in [Vacancy::Full, Vacancy::IdentityExhausted] {
@@ -270,6 +271,9 @@ fn submit_cause_is_kept() {
         let cause = error.cause();
         for error in [
             Error::Transport(conn::Error::Park(event::ParkError::Submit(error))),
+            Error::Transport(conn::Error::transmit(Transmit::Rejected(
+                event::SendFailure::Queued(error),
+            ))),
             Error::Connect(Exhaustion::Submission(error).into()),
         ] {
             let failure: Failure = Failure::new(error, Safety::BeforeSubmit);
@@ -283,6 +287,10 @@ fn submit_cause_is_kept() {
             .generalize::<Errno>();
             let actual = match failure.cause() {
                 Error::Transport(conn::Error::Park(event::ParkError::Submit(error)))
+                | Error::Transport(conn::Error::Transmit {
+                    error: Transmit::Rejected(event::SendFailure::Queued(error)),
+                    ..
+                })
                 | Error::Connect(connect::Error::Attempt(event::ConnectFault::Transport(
                     event::ConnectError::Admission(error),
                 ))) => Some(error.cause()),

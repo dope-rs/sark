@@ -45,7 +45,7 @@ impl Failure {
 pub struct Observation {
     opened: bool,
     reply: Option<String>,
-    close: Option<client::CloseReason>,
+    close: Option<client::Closed>,
 }
 
 impl Observation {
@@ -64,7 +64,7 @@ impl Observation {
     /// Terminal reason observed by the client.
     #[must_use]
     pub fn close(&self) -> Option<&client::CloseReason> {
-        self.close.as_ref()
+        self.close.as_ref().map(|closed| &closed.reason)
     }
 }
 
@@ -239,9 +239,9 @@ impl client::Observer for Capture {
         }
     }
 
-    fn close(&mut self, reason: client::CloseReason) {
+    fn close(&mut self, closed: client::Closed) {
         let mut observed = self.state.take();
-        observed.close = Some(reason);
+        observed.close = Some(closed);
         self.state.set(observed);
     }
 }

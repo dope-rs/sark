@@ -3,8 +3,7 @@ use dope::core::io::socket::Backlog;
 pub mod common;
 
 use std::{
-    convert, io,
-    io::Read,
+    convert,
     time::{Duration, Instant},
 };
 
@@ -123,11 +122,11 @@ fn accept_capacity() {
                 Ok::<(), convert::Infallible>(())
             },
             |bind| {
-                let mut socket = peer::Peer::at(bind)
+                let socket = peer::Peer::at(bind)
                     .try_connect()
                     .expect("connect listening peer");
                 socket
-                    .set_read_timeout(Some(Duration::from_secs(2)))
+                    .read_wait(Some(Duration::from_secs(2)))
                     .expect("capacity-test read deadline");
                 let mut client =
                     Connection::<ClientRole>::try_new().expect("construct capacity-test H2 client");
@@ -149,7 +148,8 @@ fn accept_capacity() {
                         .expect("open second local H2 stream"),
                     Id::new(3).expect("stream ID")
                 );
-                io::Write::write_all(&mut socket, client.output().first())
+                socket
+                    .write_all(client.output().first())
                     .expect("write capacity-test requests");
                 client.transfer().drain(usize::MAX);
 
@@ -161,9 +161,7 @@ fn accept_capacity() {
                     let left = deadline
                         .checked_duration_since(Instant::now())
                         .expect("capacity response deadline");
-                    socket
-                        .set_read_timeout(Some(left))
-                        .expect("response deadline");
+                    socket.read_wait(Some(left)).expect("response deadline");
                     let read = socket
                         .read(&mut bytes)
                         .expect("read capacity-test response");

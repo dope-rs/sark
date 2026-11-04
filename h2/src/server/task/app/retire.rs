@@ -20,7 +20,8 @@ use crate::server::{
 
 pub struct Retire;
 
-impl<'d, ID: Identity + 'd, R, W, M, D> retire::Policy<'d, App<'d, ID, R, W, M, D>, ID> for Retire
+impl<'d, ID: Identity + 'd, R, W, M, D, P> retire::Policy<'d, App<'d, ID, R, W, M, D, P>, ID>
+    for Retire
 where
     R: Runtime<'d, Target = Target<'d, ID>>,
     W: Execution + 'd,
@@ -37,7 +38,7 @@ where
 
     fn retire(
         self,
-        app: pin::Pin<&mut App<'d, ID, R, W, M, D>>,
+        app: pin::Pin<&mut App<'d, ID, R, W, M, D, P>>,
         mut conn: Retired<'_, '_, 'd, ID, R, W, M, D>,
     ) {
         let this = app.project();

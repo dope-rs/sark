@@ -43,6 +43,17 @@ pub(in crate::client) struct Dispatch<'scope, 'request, 'app, 'd, B: Backend<'ap
     state: machine::Machine<State<'scope, 'request, 'app, 'd, B::Route, B::Dial, B::Lanes>>,
 }
 
+impl<'app, 'd, B: Backend<'app, 'd>> Drop for Dispatch<'_, '_, 'app, 'd, B> {
+    fn drop(&mut self) {
+        if let Some(State::Wait {
+            mut registration, ..
+        }) = self.state.take()
+        {
+            self.backend.cancel(&mut registration);
+        }
+    }
+}
+
 impl<'scope, 'request, 'app, 'd, B: Backend<'app, 'd>> Dispatch<'scope, 'request, 'app, 'd, B> {
     pub(in crate::client) const fn new(
         backend: B,
@@ -103,6 +114,7 @@ impl<'app, 'd, B: Backend<'app, 'd>> abi::Fiber<'d> for Dispatch<'_, '_, 'app, '
                                     &mut reg,
                                     admit.context().as_ref(),
                                 ) {
+                                    backend.cancel(&mut reg);
                                     return machine::Step::Complete(task::Poll::Ready(Err(
                                         Rejected::new(Error::Capacity(error)),
                                     )));
@@ -116,6 +128,7 @@ impl<'app, 'd, B: Backend<'app, 'd>> abi::Fiber<'d> for Dispatch<'_, '_, 'app, '
                                 );
                             }
                             Err(error) => {
+                                backend.cancel(&mut reg);
                                 return machine::Step::Complete(task::Poll::Ready(Err(
                                     Rejected::new(error),
                                 )));

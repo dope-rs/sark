@@ -55,10 +55,7 @@ fn rejects_factory_name() {
 fn runs_generated_services() -> Result<(), dope_test::checks::Error> {
     use std::{env, path::Path, process::Command};
 
-    use dope_test::{
-        checks::{Suite, try_compile},
-        harness::support::file::Directory,
-    };
+    use dope_test::{checks::Suite, harness::support::file::Directory};
 
     let routes = service::generate(service::routes()).expect("generated routes");
     let messages = service::generate(service::messages()).expect("generated messages");
@@ -137,8 +134,11 @@ fn runs_generated_services() -> Result<(), dope_test::checks::Error> {
             "sark-gen",
         ],
     );
-    let exe = env::current_exe()?;
-    let output = suite.try_build(&exe, env!("CARGO_PKG_NAME"))?.output()?;
+    let exe = env::current_exe().expect("current test executable");
+    let output = suite
+        .try_build(&exe, env!("CARGO_PKG_NAME"))?
+        .output()
+        .expect("run cargo");
     let artifacts = suite.try_collect(&exe, output)?;
     let directory = Directory::try_with(
         exe.parent().expect("test executable directory"),
@@ -158,14 +158,29 @@ fn runs_generated_services() -> Result<(), dope_test::checks::Error> {
     compiler
         .arg("-Dunused_variables")
         .arg(format!("--emit=link={}", binary.display()));
-    let compiled = try_compile(&mut compiler, &source.to_string())?;
+    let compiled = compile(&mut compiler, &source.to_string());
     assert!(
         compiled.status.success(),
         "{}",
         String::from_utf8_lossy(&compiled.stderr)
     );
-    let status = Command::new(&binary).status()?;
+    let status = Command::new(&binary)
+        .status()
+        .expect("run generated services");
     assert!(status.success(), "generated services: {status}");
     directory.try_close().expect("remove generated executable");
     Ok(())
+}
+
+fn compile(command: &mut std::process::Command, source: &str) -> std::process::Output {
+    let mut child = command.spawn().expect("start compiler");
+    let written = child
+        .stdin
+        .take()
+        .map(|mut input| std::io::Write::write_all(&mut input, source.as_bytes()));
+    let output = child.wait_with_output().expect("reap compiler");
+    written
+        .expect("compiler stdin")
+        .expect("write compiler source");
+    output
 }

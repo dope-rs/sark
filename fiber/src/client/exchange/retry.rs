@@ -97,9 +97,10 @@ impl<'borrow, 'request, B> Retry<'borrow, 'request, B> {
         })
     }
 
-    pub(in crate::client) fn response<'scope, 'app, 'd: 'app>(
+    pub(in crate::client) fn response<'scope, 'app, 'd: 'app, O>(
         self,
         budget: &'scope mut budget::Budget<'d>,
+        observe: &'scope mut O,
     ) -> impl abi::Fiber<
         'd,
         Output = super::Result<(reply::Scoped<'app, 'd>, NonZero<u8>), B::Cause, B::Mailbox>,
@@ -109,6 +110,7 @@ impl<'borrow, 'request, B> Retry<'borrow, 'request, B> {
         'request: 'scope,
         'app: 'scope,
         B: Backend<'app, 'd> + 'scope,
+        O: FnMut(&Failure<B::Cause, B::Mailbox>) + 'scope,
     {
         let Self {
             backend,
@@ -165,10 +167,12 @@ impl<'borrow, 'request, B> Retry<'borrow, 'request, B> {
                         }
                     }
                 };
+                let failure = retries.finish(failure);
                 let backoff = match retries.retry_after(&failure) {
                     Ok(backoff) => backoff,
-                    Err(retries) => return Err(retries.finish(failure)),
+                    Err(_) => return Err(failure),
                 };
+                observe(&failure);
                 if let Err(elapsed) = budget.sleep(backoff.delay()).await {
                     let expired = Failure::new(
                         Error::Timeout(timeout::Phase::Backoff.expire(elapsed)),

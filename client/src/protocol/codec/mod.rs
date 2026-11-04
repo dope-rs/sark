@@ -40,8 +40,8 @@ pub use limits::Limits;
 use output::{Completion, Output, Parsed, Pending, Preview};
 pub use state::State;
 use state::{Content, Framing};
-use storage::Phase;
 pub use storage::Storage;
+use storage::{Phase, Rejection};
 
 #[derive(Clone, Copy)]
 pub struct Codec {
@@ -72,28 +72,39 @@ impl Codec {
         Output::error(error)
     }
 
-    /// Framing admits the representation; metadata-only coding never starts a decoder.
-    pub fn admit<'d>(
+    /// Binds a new response to its original request before inspecting any header.
+    /// Pending heads retain that admission across input growth and retries.
+    pub fn bind<S: buffer::raw::Source>(
         &self,
-        state: &mut State<'d>,
-        parsed: Parsed<'d>,
+        storage: &mut Storage<S>,
+        state: &State<'_>,
         request: impl FnOnce() -> Option<Method>,
-    ) -> Output<'d> {
+    ) {
+        if matches!(storage.phase, Phase::Body) && matches!(state.framing, Framing::Head) {
+            storage.phase = Phase::Unbound;
+        }
+        if matches!(storage.phase, Phase::Unbound)
+            && !storage.source.as_ref().is_empty()
+            && let Some(request) = request()
+        {
+            storage.phase = Phase::Head(response::raw::State::new(request, self.limits.head()));
+        }
+    }
+
+    /// Framing admits the representation; metadata-only coding never starts a decoder.
+    pub fn admit<'d>(&self, state: &mut State<'d>, parsed: Parsed<'d>) -> Output<'d> {
         use sark_http::payload::response::status;
 
         let pending = match parsed {
             Parsed::Ready(output) => return output,
             Parsed::Pending(pending) => pending,
         };
-        let Some(request) = request() else {
-            return Self::reject(state, Error::UnsolicitedResponse);
-        };
         let Pending { parts, fields } = pending;
         let status = parts.status();
         if status == status::Code::SWITCHING_PROTOCOLS {
             return Self::reject(state, Error::Transition(switch::Error::UnexpectedSwitch));
         }
-        let admitted = match parts.admit(request) {
+        let admitted = match parts.admit() {
             Ok(admitted) => admitted,
             Err(error) => return Self::reject(state, Error::Framing(error)),
         };
@@ -333,12 +344,12 @@ impl codec::Stateful for Codec {
     fn storage<'d, S>(&self, source: S, state: &State<'d>) -> Storage<S> {
         Storage {
             source,
-            phase: Phase::new(state, self.limits.head()),
+            phase: Phase::new(state),
         }
     }
 
     fn restart<'a, 'd, S>(&self, storage: &'a mut Storage<S>, state: &State<'d>) -> Edit<'a, S> {
-        storage.phase = Phase::new(state, self.limits.head());
+        storage.phase = Phase::new(state);
         Self::edit(storage)
     }
 
@@ -362,15 +373,21 @@ impl codec::Stateful for Codec {
         S: buffer::Cursor + hold::raw::Retain<'d> + buffer::raw::Consume,
         F: FnOnce(Result<Parsed<'d>, Error>, &mut State<'d>) -> T::Accepted,
     {
-        use response::raw;
-
         if matches!(state.framing, Framing::Failed) {
             return codec::Input::wait(&storage.source, budget, limit, None);
         }
-        if matches!(storage.phase, Phase::Body) && matches!(state.framing, Framing::Head) {
-            storage.phase = Phase::Head(raw::State::new(self.limits.head()));
-        }
         let parts = match mem::replace(&mut storage.phase, Phase::Body) {
+            Phase::Unbound => {
+                storage.phase = Phase::Unbound;
+                if storage.source.as_ref().is_empty() {
+                    return codec::Input::wait(&storage.source, budget, limit, None);
+                }
+                return codec::Step::rejected(storage.rejected(
+                    Rejection::Unsolicited,
+                    state,
+                    admit,
+                ));
+            }
             Phase::Head(head) => {
                 // SAFETY: this codec exclusively owns the stable source. Head
                 // progress permits only append, growth, or exact-prefix transfer;
@@ -382,7 +399,11 @@ impl codec::Stateful for Codec {
                         return codec::Input::wait(&storage.source, budget, limit, None);
                     }
                     Err(error) => {
-                        return codec::Step::rejected(storage.rejected(error, state, admit));
+                        return codec::Step::rejected(storage.rejected(
+                            Rejection::Head(error),
+                            state,
+                            admit,
+                        ));
                     }
                 }
             }
@@ -394,7 +415,7 @@ impl codec::Stateful for Codec {
                 let step = codec::Input::commit(&mut storage.source, budget, limit, |input| {
                     self.progress(state, &input, admit)
                 });
-                storage.phase = Phase::new(state, self.limits.head());
+                storage.phase = Phase::new(state);
                 return step;
             }
         };
@@ -431,7 +452,7 @@ impl codec::Stateful for Codec {
             })
         });
         storage.phase = if step.has_consumed() {
-            Phase::new(state, self.limits.head())
+            Phase::new(state)
         } else {
             Phase::Ready(parts)
         };

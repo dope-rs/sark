@@ -198,7 +198,6 @@ fn tiny_input_preserves_control_progress() {
 #[test]
 fn rejected_calls_reset() {
     use std::{
-        io::{ErrorKind, Read as _, Write as _},
         sync::mpsc,
         time::{Duration, Instant},
     };
@@ -233,9 +232,7 @@ fn rejected_calls_reset() {
             let reset = loop {
                 let mut bytes = [0; 9];
                 let received = stream.read_exact(&mut bytes);
-                if let Err(error) = &received
-                    && error.kind() == ErrorKind::TimedOut
-                {
+                if matches!(received, Err(dope_test::harness::peer::Error::TimedOut)) {
                     break false;
                 }
                 received.expect("client frame");
@@ -349,5 +346,173 @@ fn rejected_calls_reset() {
             assert!(reset, "rejected {method:?} must flush its reset without another gRPC operation");
         },
     ).expect("scripted H2 server");
+    }
+}
+
+#[test]
+fn sender_notification_survives_cancel() {
+    use std::{
+        cell::Cell,
+        time::{Duration, Instant},
+    };
+
+    use common::grpc::native::{CancelSender, Sender};
+    use dope::core::platform::wake;
+    use dope_fiber::task::batch;
+    use dope_test::harness::{GUARD, peer::TcpScript};
+    use sark_h2::frame::{
+        layout::Header,
+        numbers::{Flags, Type},
+    };
+
+    for sender in [Sender::Unary, Sender::Stream, Sender::Borrowed] {
+        let opening = !matches!(sender, Sender::Borrowed);
+        let (settled, handshake) = wake::Ends::blocking().expect("handshake signal").split();
+        let (release, queued) = wake::Ends::blocking()
+            .expect("sender admission signal")
+            .split();
+        let (finished, finish) = wake::Ends::blocking()
+            .expect("peer lifetime signal")
+            .split();
+        TcpScript::with(
+            move |stream| {
+                let mut preface = [0; 24];
+                stream.read_exact(&mut preface).expect("client preface");
+                assert_eq!(&preface, b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n");
+                // Keep every request owner resident until both senders are queued.
+                stream.write_all(&[
+                    0, 0, 6, 4, 0, 0, 0, 0, 0, 0, 4, 0, 0, 0, 0,
+                    0, 0, 0, 4, 1, 0, 0, 0, 0,
+                ]).expect("zero stream window and SETTINGS acknowledgment");
+                let mut opened = 0;
+                while opened != if opening { 1 } else { 3 } {
+                    let mut bytes = [0; 9];
+                    stream.read_exact(&mut bytes).expect("initial frame");
+                    let header = Header::parse(&bytes).expect("initial frame header");
+                    let mut payload = vec![0; header.length.into_usize()];
+                    stream.read_exact(&mut payload).expect("initial frame payload");
+                    if header.kind == Type::Settings && header.flags.contains(Flags::ACK) {
+                        handshake.notify().expect("zero window installed");
+                    }
+                    if header.kind == Type::Headers {
+                        opened += 1;
+                    }
+                    assert_ne!(header.kind, Type::Data, "zero window retains the output owner");
+                }
+                release.wait_timeout(GUARD).expect("both senders registered");
+                // Only stream 1 becomes writable; this frame requires no reply.
+                stream.write_all(&[0, 0, 4, 8, 0, 0, 0, 0, 1, 0, 0, 0, 6])
+                    .expect("release exactly one six-byte request owner");
+                if opening {
+                    loop {
+                        let mut bytes = [0; 9];
+                        stream.read_exact(&mut bytes).expect("surviving call frame");
+                        let header = Header::parse(&bytes).expect("surviving call header");
+                        let mut payload = vec![0; header.length.into_usize()];
+                        stream.read_exact(&mut payload).expect("surviving call payload");
+                        if header.kind == Type::Headers {
+                            assert_eq!(header.stream_id.into_u32(), 3, "canceled waiter never opened a call");
+                            stream.write_all(&[0, 0, 4, 3, 0, 0, 0, 0, 3, 0, 0, 0, 8])
+                                .expect("complete the admitted survivor with CANCEL");
+                            break;
+                        }
+                    }
+                }
+                finished.wait_timeout(GUARD).expect("client runtime retired");
+            },
+            |peer| {
+                let limits = calls::Settings::new(Some(if opening { 2 } else { 3 }), Some(3), Some(8), Some(1))
+                    .try_build().expect("one output owner and distinct call slots");
+                clients::Plan::with_waiters(peer.addr(), limits, limits.calls(), 2).expect("two sender registrations")
+                    .enter(|mut scope| {
+                        let client = scope.handle;
+                        fibers::TEST.try_run(&mut scope.app, client.wait_active())
+                            .expect("client drive").expect("active connection");
+                        let started = Instant::now();
+                        loop {
+                            match settled.wait_timeout(Duration::ZERO) {
+                                Ok(()) => break,
+                                Err(wake::WaitError::Timeout { .. }) => {
+                                    assert!(started.elapsed() < GUARD, "zero-window handshake deadline");
+                                    fibers::TEST.try_pause(&mut scope.app, Duration::from_millis(10))
+                                        .expect("drive zero-window handshake");
+                                }
+                                Err(error) => panic!("handshake signal: {error:?}"),
+                            }
+                        }
+                        let cancelled = Cell::new(false);
+                        let observed = &cancelled;
+                        let queued = &queued;
+                        let result = fibers::TEST.try_run(&mut scope.app, dope_fiber::fiber!('_ => async move {
+                            let metadata = Metadata::new();
+                            let message = vec![b'x'];
+                            let mut held = client.open_request(b"/proof/Held", None, &metadata)
+                                .await.expect("retained request");
+                            let waiting = Cell::new(0);
+                            let register = || {
+                                let count = waiting.get() + 1;
+                                waiting.set(count);
+                                if count == 2 {
+                                    queued.notify().expect("release after both registrations");
+                                }
+                            };
+                            let mut pool = batch::Pool::<2>::acquire().await.expect("separate sender tasks");
+                            if matches!(sender, Sender::Unary) {
+                                held.send(Bytes, &message).await.expect("occupy sole output owner");
+                                let mut results = batch::Join::from_fn(&mut pool, |index| {
+                                    CancelSender::new(
+                                        client.unary(b"/proof/Unary", None, &metadata, Bytes, &message),
+                                        index.get() == 0,
+                                        observed,
+                                        register,
+                                    )
+                                }).await.expect("notified unary senders");
+                                assert!(results.next().expect("first sender").is_none());
+                                let error = results.next().expect("second sender").expect("surviving notification")
+                                    .err().expect("peer canceled the admitted unary");
+                                assert!(matches!(error, Error::Protocol(status) if status.code() == Code::Cancelled));
+                            } else if matches!(sender, Sender::Stream) {
+                                held.send(Bytes, &message).await.expect("occupy sole output owner");
+                                let mut results = batch::Join::from_fn(&mut pool, |index| {
+                                    CancelSender::new(
+                                        client.stream(b"/proof/Stream", None, &metadata, Bytes, &message),
+                                        index.get() == 0,
+                                        observed,
+                                        register,
+                                    )
+                                }).await.expect("notified stream senders");
+                                assert!(results.next().expect("first sender").is_none());
+                                let mut response = results.next().expect("second sender").expect("surviving notification")
+                                    .expect("second stream admitted after waiter cancellation");
+                                let error = response.recv(Bytes).await.err()
+                                    .expect("peer canceled the admitted stream");
+                                assert!(matches!(error, Error::Protocol(status) if status.code() == Code::Cancelled));
+                            } else {
+                                let mut first = client.open_request(b"/proof/First", None, &metadata)
+                                    .await.expect("first retained stream");
+                                let mut second = client.open_request(b"/proof/Second", None, &metadata)
+                                    .await.expect("second retained stream");
+                                held.send(Bytes, &message).await.expect("occupy sole output owner");
+                                let mut results = batch::Join::from_map(&mut pool, [(true, &mut first), (false, &mut second)], |(cancel, stream)| {
+                                    CancelSender::new(stream.send(Bytes, &message), cancel, observed, register)
+                                }).await.expect("notified borrowed senders");
+                                assert!(results.next().expect("first sender").is_none());
+                                results.next().expect("second sender").expect("surviving notification")
+                                    .expect("second send admitted while both streams remain owned");
+                            }
+                            assert_eq!(waiting.get(), 2);
+                            drop(held);
+                        }));
+                        assert!(cancelled.get(), "first sender was notified and canceled before admission");
+                        result.expect("canceled notification must wake the surviving sender");
+                    }, recovery::Policy::new(
+                        |event| assert!(matches!(event, Reclaimed::Shutdown), "unexpected client retirement: {event:?}"),
+                        common::recover,
+                    ), |result| result.expect("gRPC client completion"))
+                    .expect("gRPC client runtime");
+                finish.notify().expect("release peer after client retirement");
+                peer.finish().expect("scripted H2 peer");
+            },
+        ).expect("scripted H2 server");
     }
 }

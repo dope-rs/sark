@@ -70,10 +70,16 @@ fn contracts() -> Result<(), Error> {
         file!(),
         &["o3", "sark-http", "sark-json"],
     );
-    let exe = env::current_exe()?;
-    let output = suite.try_build(&exe, "sark-json")?.output()?;
+    let exe = env::current_exe().expect("current test executable");
+    let output = suite
+        .try_build(&exe, "sark-json")?
+        .output()
+        .expect("run cargo");
     let suite = suite.try_collect(&exe, output)?;
-    let output = suite.try_compile(include_str!("common/compile_generic.rs"))?;
+    let output = compile(
+        &mut suite.compiler(),
+        include_str!("common/compile_generic.rs"),
+    );
     assert!(!output.status.success());
     let errors = String::from_utf8(output.stderr).expect("UTF-8 diagnostics");
     assert!(
@@ -82,7 +88,20 @@ fn contracts() -> Result<(), Error> {
         }),
         "{errors}"
     );
-    let status = suite.try_rustdoc()?.status()?;
+    let status = suite.try_rustdoc()?.status().expect("run rustdoc");
     assert!(status.success(), "JSON wire names: {status}");
     Ok(())
+}
+
+fn compile(command: &mut std::process::Command, source: &str) -> std::process::Output {
+    let mut child = command.spawn().expect("start compiler");
+    let written = child
+        .stdin
+        .take()
+        .map(|mut input| std::io::Write::write_all(&mut input, source.as_bytes()));
+    let output = child.wait_with_output().expect("reap compiler");
+    written
+        .expect("compiler stdin")
+        .expect("write compiler source");
+    output
 }

@@ -7,11 +7,14 @@ use dope::{
         io::socket::Listener,
     },
     manifold::BuildError,
-    runtime::{shutdown, topology::error},
+    runtime::shutdown,
 };
 use dope_test::reclaim;
 use sark_fiber::{Config, request::BodyLen};
-use sark_h1::server::{listener::bind, run::prepare};
+use sark_h1::server::{
+    listener::bind,
+    run::{self, prepare},
+};
 use sark_http::payload::response::status;
 
 use crate::common::server;
@@ -27,7 +30,7 @@ pub fn try_serve(
     listener: Listener,
     recover: impl recovery::Recover,
     finish: impl for<'a> FnOnce(
-        Result<(), error::Run<'a, Infallible, BranchError<Infallible, BuildError<bind::Error>>>>,
+        Result<(), run::RunCause<'a, Infallible, BranchError<Infallible, BuildError<bind::Error>>>>,
     ),
 ) -> Result<reclaim::Reports<1>, Error> {
     let server = server::Plan::new(listener.local_addr(), Duration::from_secs(10)).build();

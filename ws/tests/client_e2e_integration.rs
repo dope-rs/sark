@@ -106,10 +106,13 @@ fn outbound_retains_layout() {
                 domain.run(
                     channel::App::<_, mode::Egress>::new(Closing {
                         open: &|_| {},
-                        close: &|reason| {
+                        close: &|closed| {
                             assert!(matches!(
-                                reason,
-                                client::CloseReason::RemoteClose { code: None, .. }
+                                closed,
+                                client::Closed {
+                                    reason: client::CloseReason::RemoteClose { code: None, .. },
+                                    transmit: None,
+                                }
                             ))
                         },
                         opened: &opened,
@@ -274,9 +277,12 @@ fn controls_wait_capacity() {
 
         assert!(matches!(
             reason.values().expect("close observations").as_ref(),
-            [client::CloseReason::RemoteClose {
-                code: Some(1000),
-                reason,
+            [client::Closed {
+                reason: client::CloseReason::RemoteClose {
+                    code: Some(1000),
+                    reason,
+                },
+                transmit: None,
             }] if reason == "bye"
         ));
 
@@ -366,7 +372,7 @@ fn borrowed_handler_retires() {
 
     assert!(matches!(
         events.values().expect("borrowed observations").as_ref(),
-        [Event::Opened, Event::Message, Event::Closed(client::CloseReason::RemoteClose { code: Some(1000), reason }), Event::Dropped] if reason.is_empty()
+        [Event::Opened, Event::Message, Event::Closed(client::Closed { reason: client::CloseReason::RemoteClose { code: Some(1000), reason }, transmit: None }), Event::Dropped] if reason.is_empty()
     ));
     assert!(
         retired

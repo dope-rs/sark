@@ -72,9 +72,18 @@ pub struct Plan {
 
 impl Plan {
     pub fn new(address: net::SocketAddr, limits: Limits, capacity: usize) -> Result<Self, Failure> {
+        Self::with_waiters(address, limits, capacity, 1)
+    }
+
+    pub fn with_waiters(
+        address: net::SocketAddr,
+        limits: Limits,
+        capacity: usize,
+        waiters: usize,
+    ) -> Result<Self, Failure> {
         let carrier = client::Plan::<section::Plan>::new(capacity).map_err(Failure::Carrier)?;
         let settings =
-            settings::Settings::try_new(carrier, limits, 1).map_err(Failure::Settings)?;
+            settings::Settings::try_new(carrier, limits, waiters).map_err(Failure::Settings)?;
         Ok(Self { settings, address })
     }
 

@@ -20,19 +20,26 @@ pub struct Storage<S> {
 }
 
 pub(super) enum Phase {
+    Unbound,
     Head(response::raw::State),
     Ready(response::Parts),
-    Rejected(head::ParseError<Infallible>),
+    Rejected(Rejection),
     Body,
+}
+
+#[derive(Clone, Copy)]
+pub(super) enum Rejection {
+    Head(head::ParseError<Infallible>),
+    Unsolicited,
 }
 
 const _: () =
     assert!(size_of::<Storage<()>>() <= size_of::<response::raw::State>() + size_of::<usize>());
 
 impl Phase {
-    pub(super) fn new(state: &State<'_>, limit: head::Limit) -> Self {
+    pub(super) fn new(state: &State<'_>) -> Self {
         if matches!(state.framing, Framing::Head) {
-            Self::Head(response::raw::State::new(limit))
+            Self::Unbound
         } else {
             Self::Body
         }
@@ -48,7 +55,7 @@ impl<S: buffer::raw::Source> Storage<S> {
 impl<S> Storage<S> {
     pub(super) fn rejected<'d, T: Outcome, A, F>(
         &mut self,
-        error: head::ParseError<Infallible>,
+        error: Rejection,
         state: &mut State<'d>,
         admit: A,
     ) -> T
@@ -57,8 +64,9 @@ impl<S> Storage<S> {
         F: FnOnce(Result<Parsed<'d>, Error>, &mut State<'d>) -> T::Accepted,
     {
         let cause = match error {
-            head::ParseError::Boundary(error) => Error::HeadLimit(error),
-            error => Error::Head(error),
+            Rejection::Head(head::ParseError::Boundary(error)) => Error::HeadLimit(error),
+            Rejection::Head(error) => Error::Head(error),
+            Rejection::Unsolicited => Error::UnsolicitedResponse,
         };
         match admit(Err(&cause)) {
             codec::Admission::RetryInput => {
