@@ -1,4 +1,4 @@
-use std::ops;
+use std::{mem, ops};
 
 use dope::core::{Errno, random};
 use o3::{
@@ -29,7 +29,6 @@ mod output;
 mod section;
 mod state;
 
-pub(crate) use buffer::Buffer;
 pub(crate) use capacity::Capacity;
 pub(crate) use delta::{Delta, Journal};
 pub use error::Error;
@@ -39,9 +38,8 @@ pub(crate) use state::State;
 pub(super) use state::Tracking;
 
 pub struct Encoder {
-    encoding: strings::Encoding,
     state: State,
-    buffer: Buffer,
+    pending: Wire,
 }
 
 /// An encoded field section and the exact QPACK state delta it depends on.
@@ -59,7 +57,6 @@ struct Encoding<'a> {
 
 pub(crate) struct Commit<'a> {
     pub(in crate::qpack::encoder) tracking: Option<ledger::Tracked<'a>>,
-    pub(in crate::qpack::encoder) pending: &'a mut Wire,
     pub(in crate::qpack::encoder) section: buffer::Cache<'a>,
     pub(in crate::qpack::encoder) delta: Option<Journal<'a>>,
 }
@@ -70,9 +67,8 @@ impl Encoder {
     /// Creates a static-only encoder without allocating or acquiring entropy.
     pub fn new() -> Self {
         Self {
-            encoding: strings::Encoding::Plain,
             state: State::new(Tracking::Disabled),
-            buffer: Buffer::new(),
+            pending: Wire::new(),
         }
     }
 
@@ -88,86 +84,36 @@ impl Encoder {
         let seed = random::Seed::acquire().map_err(BuildError::Entropy)?;
         let capacity = Capacity::new(table);
         Ok(Self {
-            encoding: strings::Encoding::Plain,
             state: State::new(Tracking::Active {
                 table: dynamics::Table::try_new(plan, table, hash::Seed::new(&seed))
                     .map_err(BuildError::Allocation)?,
                 ledger: ledger::Ledger::try_new(sections).map_err(BuildError::Allocation)?,
             }),
-            buffer: Buffer::from(&capacity),
-        })
-    }
-
-    pub(crate) fn try_plan(
-        table: plan::Plan<mode::Direct>,
-        sections: ledger::Plan,
-        seed: hash::Seed,
-    ) -> Result<Self, alloc::Error> {
-        let table = dynamics::Table::try_new(table, 0, seed)?;
-        Ok(Self {
-            encoding: strings::Encoding::Plain,
-            state: State::new(Tracking::Active {
-                table,
-                ledger: ledger::Ledger::try_new(sections)?,
-            }),
-            buffer: Buffer::new(),
+            pending: Wire::from(&capacity),
         })
     }
 
     pub fn set_encoding(&mut self, encoding: strings::Encoding) {
-        self.encoding = encoding;
-    }
-
-    pub(crate) fn allow(&mut self, maximum: u64) {
-        if let Tracking::Active { table, .. } = &mut self.state.outstanding {
-            table.allow(maximum);
-        }
-    }
-
-    pub(crate) fn maximum(&self) -> usize {
-        match &self.state.outstanding {
-            Tracking::Active { table, .. } => table.maximum(),
-            Tracking::Disabled => 0,
-        }
-    }
-
-    pub(crate) fn plan_limit(&mut self, capacity: usize) -> Result<Capacity<&mut State>, Error> {
-        let limit = Capacity::new(capacity);
-        let floor = self.state.floor();
-        match &self.state.outstanding {
-            Tracking::Active { table, .. } => table.check_floor(capacity, floor)?,
-            Tracking::Disabled if capacity != 0 => {
-                return Err(dynamics::Capacity::Maximum {
-                    requested: capacity,
-                    maximum: 0,
-                }
-                .into());
-            }
-            Tracking::Disabled => {}
-        }
-        Ok(limit.bind(&mut self.state))
+        self.state.encoding = encoding;
     }
 
     pub fn set_blocked(&mut self, blocked: u64) {
-        self.state.max_blocked_streams = blocked;
+        self.state.set_blocked(blocked);
     }
 
     pub fn take_wire(&mut self) -> Wire {
-        self.buffer.take_pending()
+        mem::replace(&mut self.pending, Wire::new())
     }
 
     /// Applies decoder feedback. Cancellation releases current references;
     /// the caller owns application stream closure.
     pub fn ingest(&mut self, buf: &[u8]) -> Result<usize, stream::Error> {
+        let published = self.state.insert_count();
         let mut tail = buf;
         while let Some(instruction) = stream::Instruction::take(&mut tail)? {
-            self.apply(instruction)?;
+            self.state.apply(instruction, published)?;
         }
         Ok(buf.len() - tail.len())
-    }
-
-    pub(crate) fn apply(&mut self, instruction: stream::Instruction) -> Result<(), stream::Error> {
-        self.state.apply(instruction)
     }
 
     /// Writes a field section under its HTTP/3 stream identity.
@@ -177,7 +123,7 @@ impl Encoder {
         fields: S,
         out: &mut Vec<u8>,
     ) -> Result<(), Error> {
-        let prepared = Prepared::prepare(self, stream, fields, ())?;
+        let prepared = Prepared::prepare(&mut self.state, stream, fields, ())?;
         let len = prepared.section.encoded_len();
         let out = match Reserved::try_grow(out, len) {
             Ok(out) => out,
@@ -186,7 +132,7 @@ impl Encoder {
                 return Err(error.into());
             }
         };
-        prepared.commit()?.write(out)
+        prepared.commit(&mut self.pending)?.write(out)
     }
 
     /// Encodes a field section under its HTTP/3 stream identity so QPACK
@@ -196,8 +142,8 @@ impl Encoder {
         stream: u64,
         fields: S,
     ) -> Result<qpack::Section, Error> {
-        let prepared = Prepared::prepare(self, stream, fields, ())?;
-        Ok(prepared.commit()?.into_section())
+        let prepared = Prepared::prepare(&mut self.state, stream, fields, ())?;
+        Ok(prepared.commit(&mut self.pending)?.into_section())
     }
 }
 
@@ -251,7 +197,7 @@ impl From<ledger::Error> for BuildError {
 
 impl<'a, C> Prepared<'a, C> {
     pub(crate) fn prepare<S: field::Source>(
-        encoder: &'a mut Encoder,
+        encoder: &'a mut State,
         stream: u64,
         source: S,
         identity: C,
@@ -270,15 +216,13 @@ impl<'a, C> Prepared<'a, C> {
 }
 
 impl<'a> Prepared<'a> {
-    fn commit(self) -> Result<Encoding<'a>, Error> {
+    fn commit(self, pending: &mut Wire) -> Result<Encoding<'a>, Error> {
         let Self {
-            section,
-            mut commit,
-            ..
+            section, commit, ..
         } = self;
-        match commit.try_keep() {
+        match commit.try_keep(pending) {
             Ok(()) => {
-                let (_, cache) = commit.apply();
+                let cache = commit.apply(true);
                 Ok(Encoding { section, cache })
             }
             Err(error) => {
@@ -329,16 +273,15 @@ impl Encoding<'_> {
 }
 
 impl<'a> Commit<'a> {
-    pub(crate) fn pending_len(&self) -> usize {
-        self.pending.len()
-    }
-
     pub(crate) fn wire_len(&self) -> usize {
         self.delta.as_ref().map_or(0, Journal::wire_len)
     }
 
+    pub(crate) fn base(&self) -> u64 {
+        self.delta.as_ref().map_or(0, Journal::base)
+    }
+
     pub(crate) fn encode_wire(&self, out: &mut frame::Writer<'_>) {
-        out.extend([&self.pending[..]]);
         if let Some(delta) = &self.delta {
             delta.encode(out);
         }
@@ -349,28 +292,33 @@ impl<'a> Commit<'a> {
     }
 
     pub(crate) fn clear(self) {
-        let (pending, _) = self.apply();
-        pending.clear();
+        self.apply(true);
     }
 
-    fn try_keep(&mut self) -> Result<(), Error> {
+    /// The native caller owns the encoded instructions while initial section
+    /// references await publication.
+    pub(crate) fn defer(self) {
+        self.apply(false);
+    }
+
+    fn try_keep(&self, pending: &mut Wire) -> Result<(), Error> {
         let Some(delta) = &self.delta else {
             return Ok(());
         };
-        self.pending
+        pending
             .try_reserve(delta.wire_len())?
             .try_write(|writer| delta.encode(writer))
             .map_err(Error::from)
     }
 
-    fn apply(mut self) -> (&'a mut Wire, buffer::Cache<'a>) {
+    fn apply(mut self, published: bool) -> buffer::Cache<'a> {
         if let Some(tracking) = self.tracking.take() {
-            tracking.apply();
+            tracking.apply(published);
         }
         if let Some(delta) = self.delta {
             delta.apply();
         }
-        (self.pending, self.section)
+        self.section
     }
 
     pub(crate) fn discard(self) {
@@ -424,13 +372,6 @@ impl Wire {
         match &mut self.storage {
             Storage::Inline(bytes) => Ok(frame::Output::Inline(bytes.fit(extra))),
             Storage::Owned(bytes) => Ok(frame::Output::Owned(Reserved::try_grow(bytes, extra)?)),
-        }
-    }
-
-    pub(crate) fn clear(&mut self) {
-        match &mut self.storage {
-            Storage::Inline(bytes) => bytes.clear(),
-            Storage::Owned(bytes) => bytes.clear(),
         }
     }
 }

@@ -5,7 +5,7 @@ use core::{num::NonZero, pin};
 use crate::server::runtime::schedule::{self, start, wake};
 use dope::{
     core::driver::{
-        retained,
+        self,
         route::KeyTag,
         schedule::{app::Work, ready::task::owner},
     },
@@ -66,7 +66,7 @@ where
         task: F,
         owner: Id<'d, KeyTag<0>>,
         target: T,
-        ctx: schedule::Context<'_, '_, '_, '_, 'd>,
+        ctx: schedule::Context<'_, '_, '_, 'd>,
         observe: Observe,
     ) -> Result<start::Start<group::Id<'s, 'd, D>, F::Output>, start::Error>
     where
@@ -105,7 +105,7 @@ where
         &mut self,
         active: Id<'d, KeyTag<0>>,
         work: Work<'_, 'd>,
-        driver: &mut retained::Context<'_, '_, 'd>,
+        driver: &mut driver::Context<'_, 'd>,
         mut observe: Observe,
     ) where
         Observe: FnMut(T, pin::Pin<&mut F>),

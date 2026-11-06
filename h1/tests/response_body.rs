@@ -63,17 +63,12 @@ fn preencoded_inline() {
             ),
         )
     });
-    let output::Outcome::SendCopied {
-        written,
-        body_bytes: len,
-        ..
-    } = outcome
-    else {
+    let output::Outcome::SendCopied { written, copy, .. } = outcome else {
         panic!("preencoded response must keep its inline body");
     };
     assert_eq!(allocs, 0);
     assert_eq!(encodes.get(), 1);
-    assert_eq!(&bytes[written - len..written], b"encoded");
+    assert_eq!(&bytes[written - copy.written..written], b"encoded");
 }
 
 #[test]
@@ -104,17 +99,12 @@ fn plain_compressor() {
             ),
         )
     });
-    let output::Outcome::SendCopied {
-        written,
-        body_bytes: len,
-        ..
-    } = outcome
-    else {
+    let output::Outcome::SendCopied { written, copy, .. } = outcome else {
         panic!("plain compression must keep its inline body");
     };
     assert_eq!(allocs, 0);
     assert_eq!(encodes.get(), 1);
-    assert_eq!(&bytes[written - len..written], b"plain");
+    assert_eq!(&bytes[written - copy.written..written], b"plain");
 }
 
 #[test]
@@ -146,17 +136,12 @@ fn reuses_inline_on_limit() {
             Server::Include,
         ),
     );
-    let output::Outcome::SendCopied {
-        written,
-        body_bytes: body_len,
-        ..
-    } = outcome
-    else {
+    let output::Outcome::SendCopied { written, copy, .. } = outcome else {
         panic!("unavailable gzip must keep the encoded inline body");
     };
     assert_eq!(encodes.get(), 1);
-    assert_eq!(body_len, body.len());
-    assert_eq!(&bytes[written - body_len..written], body.as_slice());
+    assert_eq!(copy.written, body.len());
+    assert_eq!(&bytes[written - copy.written..written], body.as_slice());
 }
 
 #[test]
@@ -212,11 +197,7 @@ fn bounded_reuses_inline() {
         ),
     );
     let (written, len) = match outcome {
-        output::Outcome::SendCopied {
-            written,
-            body_bytes: len,
-            ..
-        } => Some((written, len)),
+        output::Outcome::SendCopied { written, copy, .. } => Some((written, copy.written)),
         _ => None,
     }
     .expect("bounded fallback keeps the inline body");

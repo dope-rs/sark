@@ -420,7 +420,10 @@ where
         io: &port::Port<'_, 'd, pool::Cursor, ID>,
     ) {
         let id = self.close_claim(token, bound);
-        io.close(id, close::Reason::Timeout(deadline::Kind::Lifetime));
+        io.close(
+            id,
+            close::Directive::reconnect(close::Reason::Timeout(deadline::Kind::Lifetime)),
+        );
     }
 }
 

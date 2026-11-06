@@ -23,6 +23,7 @@ mod output;
 mod response;
 mod sources;
 
+pub use app::session::{Session, Upgrade};
 pub use error::Error;
 pub use response::Response;
 
@@ -37,21 +38,22 @@ type Acc = Snapshot<WS_MAX_ACC>;
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Phase {
     Handshake,
+    /// The complete opening prefix is retained until output can be reserved.
+    Opening,
     /// The opening failure was reported; its HTTP rejection still needs output.
     OpeningRejected,
     Active,
     MessageTooBig,
-    /// The fault is final; its close frame still needs output capacity.
-    Rejected(inbound::Fault),
+    /// The fault was reported; its close frame still needs output capacity.
+    Rejected(inbound::Code),
     Closed,
 }
 
-pub struct ConnState {
+pub struct ConnState<P = Option<egress::NonEmpty<storage::Shared>>> {
     phase: Phase,
     eof: bool,
-    pending: Option<egress::NonEmpty<storage::Shared>>,
+    pending: P,
     pub(super) acc: Acc,
-    pub(super) handshake_complete: bool,
     pub(super) inbound: inbound::Inbound<inbound::ClientPeer>,
 }
 
@@ -61,14 +63,13 @@ impl Default for ConnState {
     }
 }
 
-impl ConnState {
+impl<P: Default> ConnState<P> {
     fn new(max_message_size: usize) -> Self {
         Self {
             phase: Phase::Handshake,
             eof: false,
-            pending: None,
+            pending: P::default(),
             acc: Acc::new(),
-            handshake_complete: false,
             inbound: inbound::Inbound::new(max_message_size),
         }
     }

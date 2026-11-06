@@ -37,7 +37,7 @@ use sark_core::{
 };
 use sark_http::{field::metadata::block, payload::compress::dynamic::hash};
 use schedule::ready::task::owner;
-use task::{Ready, receive};
+use task::receive;
 
 use crate::{
     frame, manifold,
@@ -108,7 +108,8 @@ where
         E: deadline::Policy<'d>,
         E::State: State<'d>,
         R: Runtime<'d, Target = server::Handle<'d, ID>>,
-        M: life::Mode<id::Handle<id::Driver<'d>, ID>, Id>,
+        M: life::Mode<id::Handle<id::Driver<'d>, ID>, Id>
+            + failure::Sink<id::Handle<id::Driver<'d>, ID>>,
         M::Retention: owners::Handoff,
         B: Retain<'d>,
         Self: handler::Handler<
@@ -116,16 +117,15 @@ where
                 B,
                 resident::Shared<'d>,
                 id::Driver<'d>,
-                Connection = server::Session<'d, R, L, E::State>,
+                Connection = server::Session<'d, R, L, E::State, M::Retention>,
             >,
     {
         let (this, mut slot, handle, event, now) = event.into();
         let (ready, result) = {
             let (state, conn) = slot.split();
-            let mut session = Ready { state };
             let this = this.project();
             let result = receive::accept::<FLUSH, R, M, L, E::State, ID, B, true>(
-                &mut session,
+                state,
                 this.router,
                 this.observer,
                 conn,
@@ -133,8 +133,8 @@ where
                 manifold::Notification::resident(event),
                 now,
             );
-            conn.application().sync(session.deadline());
-            (session.state.has_work(), result)
+            conn.application().sync(state.deadline());
+            (state.has_work(), result)
         };
         slot.set_ready(ready);
         result
@@ -150,7 +150,7 @@ where
     E: deadline::Policy<'d>,
     B: Retain<'d>,
 {
-    type Connection = server::Session<'d, R, L, E::State>;
+    type Connection = server::Session<'d, R, L, E::State, O::Retention>;
     type Create = Self;
     type Events = O::Events<R, L, E, Q, B>;
 }
@@ -225,6 +225,7 @@ where
     B: Retain<'d>,
     Self: handler::Handler<ID, B, resident::Shared<'d>, id::Driver<'d>>,
     O: life::Mode<id::Handle<id::Driver<'d>, ID>, Id>,
+    O::Retention: owners::Handoff,
 {
     fn closing(event: closing::Event<'_, Self, ID, B, resident::Shared<'d>, id::Driver<'d>>) {
         let (this, _, handle) = event.into();
@@ -237,12 +238,13 @@ impl<'d, R, O, L, E, Q, const ID: u8, B> close::Sink<ID, B, resident::Shared<'d>
 where
     R: Runtime<'d, Target = server::Handle<'d, ID>>,
     O: life::Mode<id::Handle<id::Driver<'d>, ID>, Id>,
+    O::Retention: owners::Handoff,
     Self: handler::Handler<
             ID,
             B,
             resident::Shared<'d>,
             id::Driver<'d>,
-            Connection = server::Session<'d, R, L, E::State>,
+            Connection = server::Session<'d, R, L, E::State, O::Retention>,
             Create = Self,
         >,
     L: rotation::Policy<'d>,
@@ -302,6 +304,7 @@ where
     B: Retain<'d>,
     Self: handler::Handler<ID, B, resident::Shared<'d>, id::Driver<'d>>,
     O: life::Mode<id::Handle<id::Driver<'d>, ID>, Id>,
+    O::Retention: owners::Handoff,
 {
     fn release(event: release::Event<'_, Self, ID, id::Driver<'d>>) -> app::Readiness {
         let (this, handle, release) = event.into_parts();
@@ -315,13 +318,15 @@ impl<'d, R, O, L, E, Q, const ID: u8, B> ready::Sink<ID, B, resident::Shared<'d>
     for Handler<'d, R, O, L, E, Q>
 where
     R: Runtime<'d, Target = server::Handle<'d, ID>>,
-    O: life::Mode<id::Handle<id::Driver<'d>, ID>, Id>,
+    O: life::Mode<id::Handle<id::Driver<'d>, ID>, Id>
+        + failure::Sink<id::Handle<id::Driver<'d>, ID>>,
+    O::Retention: owners::Handoff,
     Self: handler::Handler<
             ID,
             B,
             resident::Shared<'d>,
             id::Driver<'d>,
-            Connection = server::Session<'d, R, L, E::State>,
+            Connection = server::Session<'d, R, L, E::State, O::Retention>,
             Create = Self,
         >,
     L: rotation::Policy<'d>,
@@ -333,50 +338,37 @@ where
         let (this, mut slot, handle, now) = event.into();
         let ready = {
             let (state, conn) = slot.split();
-            let mut session = Ready { state };
             let this = this.project();
-            let prepared = (|| -> Result<(), manifold::Error> {
-                let owner = session.state.h3.bind_scope(conn)?.owner();
-                for identity in session.state.requests.reserved() {
+            let report = match (|| {
+                let owner = state.h3.bind_scope(conn)?.owner();
+                for identity in state.requests.reserved() {
                     let bound = conn.streams().resident().bind(owner, identity.local())?;
                     conn.streams().binding().try_prepare(bound)?;
                 }
-                Ok(())
-            })();
-            if let Err(error) = prepared {
-                manifold::close_connection_scoped(conn, error.code());
-                return;
-            }
-            let report = match session
-                .state
-                .h3
-                .egress()
-                .start_with(conn, this.observer, handle)
-            {
+                state.h3.egress().start_with(conn, this.observer, handle)
+            })() {
                 Ok(report) => report,
                 Err(error) => {
+                    this.observer.failure(failure::Event::Connection {
+                        conn: handle,
+                        error: &error,
+                    });
                     manifold::close_connection_scoped(conn, error.code());
                     return;
                 }
             };
-            if let Err(error) = session.state.account(report) {
-                manifold::close_connection_scoped(conn, server::request_error_code(error));
+            state.account(report);
+            if let Err(error) = rotation::State::try_open(&mut state.rotation, this.lifetime, now) {
+                this.observer.failure(failure::Event::Connection {
+                    conn: handle,
+                    error: &error,
+                });
+                manifold::close_connection_scoped(conn, frame::ErrorCode::Internal);
                 return;
             }
-            if let Err(error) =
-                rotation::State::try_open(&mut session.state.rotation, this.lifetime, now)
-            {
-                let code = match error {
-                    rotation::Error::Age { .. }
-                    | rotation::Error::Open { .. }
-                    | rotation::Error::Draining { .. } => frame::ErrorCode::Internal,
-                };
-                manifold::close_connection_scoped(conn, code);
-                return;
-            }
-            conn.application().sync(session.deadline());
+            conn.application().sync(state.deadline());
             life::Mode::observe(this.observer, life::Event::SessionEstablished(handle));
-            session.state.has_work()
+            state.has_work()
         };
         slot.set_ready(ready);
     }
@@ -388,12 +380,13 @@ where
     R: Runtime<'d, Target = server::Handle<'d, ID>>,
     O: life::Mode<id::Handle<id::Driver<'d>, ID>, Id>
         + failure::Sink<id::Handle<id::Driver<'d>, ID>>,
+    O::Retention: owners::Handoff,
     Self: handler::Handler<
             ID,
             B,
             resident::Shared<'d>,
             id::Driver<'d>,
-            Connection = server::Session<'d, R, L, E::State>,
+            Connection = server::Session<'d, R, L, E::State, O::Retention>,
             Create = Self,
         >,
     L: rotation::Policy<'d>,
@@ -403,7 +396,7 @@ where
 {
     fn create(
         event: create::Event<'_, Self, ID, B, resident::Shared<'d>, id::Driver<'d>>,
-    ) -> create::Decision<server::Session<'d, R, L, E::State>> {
+    ) -> create::Decision<server::Session<'d, R, L, E::State, O::Retention>> {
         let (this, mut conn, handle) = event.into_parts();
         let view = this.as_ref().project_ref();
         let session = match server::Session::try_new(view.config, view.deadline, view.seed.clone())
@@ -439,13 +432,14 @@ impl<'d, R, O, L, E, Q, const ID: u8, B> stream::Sink<ID, B, resident::Shared<'d
 where
     R: Runtime<'d, Target = server::Handle<'d, ID>>,
     O: life::Mode<id::Handle<id::Driver<'d>, ID>, Id>
-        + Mode<id::Domain<id::Driver<'d>, ID>, net::Owner<id::Driver<'d>, ID>>,
+        + Mode<id::Domain<id::Driver<'d>, ID>, net::Owner<id::Driver<'d>, ID>>
+        + failure::Sink<id::Handle<id::Driver<'d>, ID>>,
     Self: handler::Handler<
             ID,
             B,
             resident::Shared<'d>,
             id::Driver<'d>,
-            Connection = server::Session<'d, R, L, E::State>,
+            Connection = server::Session<'d, R, L, E::State, O::Retention>,
             Create = Self,
         >,
     O::Retention: owners::Handoff,

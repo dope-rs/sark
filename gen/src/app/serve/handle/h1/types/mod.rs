@@ -72,9 +72,11 @@ impl Generics {
                 #( #makers, )*
         };
         let duplex = plan.duplex.state();
+        let upgrade = context.plan.entries.iter().any(|route| route.entry.upgrade);
         let stamp = duplex.stamp(
             quote!(&#g_clock #ns_h1::server::date::Clock),
             duplex.retention(paths),
+            upgrade.then(|| quote!(::std::vec::Vec<::core::primitive::u8>)),
         );
         let (futures, makers) = context.exec.producers();
         let app_use = quote! {
@@ -136,15 +138,15 @@ impl<'a> Routing<'a> {
 
         let spec = ctx.plan.spec;
         let routes = &spec.route_specs;
-        let core = &ctx.core_ident;
+        let name = &ctx.name;
         let args = &generics.application_generic_use;
         let bound = match plan.duplex.state() {
             duplex::State::Enabled => quote!(#ns_http::o3::buffer::resident::bound::Unbounded),
             duplex::State::Disabled => {
-                quote!(<#core #args as #ns_core::decode::Decode>::Egress<'d>)
+                quote!(<#name #args as #ns_core::decode::Decode>::Egress<'d>)
             }
         };
-        let task = &ctx.exec.task.identity;
+        let task = &ctx.exec.identity;
         let runtime = quote! {
             #ns_h1::server::task::runtime::Runtime<
                 'd,
@@ -160,7 +162,6 @@ impl<'a> Routing<'a> {
         };
         let rejected = terminal::rejected(paths, &ctx.plan.spec.state_generics);
         let build = |owned: bool| {
-            let project = owned.then(|| quote!(let mut #v_this = self.as_mut().project();));
             let (source, start, input, target) = match owned {
                 false => (
                     route::Source::Borrowed,
@@ -179,7 +180,7 @@ impl<'a> Routing<'a> {
                 |index, params| route::emit(paths, ctx, plan, index, params, &runtime, source);
             let reject = quote! {{
                 let #v_result = #start(#input, #v_permit, #ns_http::h1::codec::canned::NOT_FOUND);
-                #project
+                let mut #v_this = self.as_mut().project();
                 #rejected
                 #v_result.into()
             }};
@@ -261,6 +262,7 @@ pub(super) struct Connections {
 
 pub(super) struct Protocol {
     pub(super) duplex: duplex::State,
+    pub(super) upgrade: bool,
     pub(super) duplex_ty: proc_macro2::TokenStream,
     pub(super) connections: Connections,
     pub(super) transition_policy: proc_macro2::TokenStream,
@@ -331,7 +333,7 @@ impl<'a> Types<'a> {
         let duplex = plan.duplex.state();
         let http = quote!((#v_link.state()));
         let edit = quote!((#v_link.state_mut()));
-        let kind = plan.duplex.ty(paths);
+        let kind = plan.duplex.ty(paths, false);
         let pending = plan.continuations.ty();
         let ready = plan.continuations.ready_ty();
         let partial = plan.continuations.head();
@@ -389,14 +391,14 @@ impl<'a> Types<'a> {
             >
         };
         let owner = plan.continuations.route();
-        let heads = context.plan.entries.iter().map(|route| {
+        let heads = plan.continuations.bodies().map(|route| {
             let variant = &route.pending_variant;
             match route.mode {
                 serve::Mode::Fiber { .. } => quote!(#owner::#variant(_) => 0,),
                 serve::Mode::Sync { .. }
                 | serve::Mode::Stream { .. }
                 | serve::Mode::Duplex { .. } => {
-                    quote!(#owner::#variant(#v_wait) => #v_wait.head_len(),)
+                    quote!(#owner::#variant(ref #v_wait) => #v_wait.head_len(),)
                 }
             }
         });
@@ -409,7 +411,7 @@ impl<'a> Types<'a> {
                 let #n_run = &#n_http.async_state;
                 let #n_owners = #n_run.owners();
                 let mut #n_snap = #n_http.ingress
-                    .audit(|#v_wait| match &#v_wait.route { #( #heads )* }, |_| 0,
+                    .audit(|#v_wait| match #v_wait.route { #( #heads )* }, |_| 0,
                         |#v_wait| match #v_wait { #( #lengths )* })
                     .task(#n_owners, #n_owners, 0)
                     .owners(#n_run.owners())
@@ -443,6 +445,7 @@ impl<'a> Types<'a> {
             routing,
             protocol: Protocol {
                 duplex,
+                upgrade: context.plan.entries.iter().any(|route| route.entry.upgrade),
                 duplex_ty: kind,
                 connections: Connections {
                     pending,

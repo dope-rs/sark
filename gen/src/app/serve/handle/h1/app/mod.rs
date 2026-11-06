@@ -13,7 +13,7 @@ pub(super) fn build(
     types: &types::Types<'_>,
     routes: &routes::Routes,
 ) -> proc_macro2::TokenStream {
-    let [f_life, f_state] = ["lifecycle", "state"].map(local);
+    let [f_core, f_life, f_state] = ["core", "lifecycle", "state"].map(local);
     let symbols = &types.names.generics;
     let [n_link] = symbols.locals(["__connection"]);
     let [n_dprog, n_due] = symbols.locals(["__deadline_progress", "__due"]);
@@ -66,7 +66,11 @@ pub(super) fn build(
     let stop = &calls.close;
     let input = &calls.input;
     let gated = &calls.gated;
+    let scratch = &calls.scratch;
+    let mutable = proto.upgrade.then(|| quote!(mut));
     let cancel = &routes.cancel_arms;
+    let retire_pending =
+        (!cancel.is_empty()).then(|| quote::quote!(#v_exch.retire(#v_this.#f_life, #v_result);));
     let cancelrd = &routes.ready_cancel;
     let conn_ref = quote! {
         #ns_fiber::dope::manifold::network::listener::conn::Ref<
@@ -80,8 +84,7 @@ pub(super) fn build(
     let begin = quote! {
         let #n_link = #v_link.id();
         let #n_now = {
-            let (mut #v_core, _) = self.as_mut().__project();
-            let #v_this = #v_core.as_mut().project();
+            let #v_this = self.as_mut().project().#f_core.project();
             #ns_h1::server::deadline::Mode::begin(
                 #v_this.#f_life,
                 #v_driver.driver_ref().clock().now(),
@@ -92,8 +95,7 @@ pub(super) fn build(
     };
     let finish = quote! {
         let #n_root = {
-            let (mut #v_core, _) = self.as_mut().__project();
-            let #v_this = #v_core.as_mut().project();
+            let #v_this = self.as_mut().project().#f_core.project();
             #ns_h1::server::deadline::Mode::finish(
                 #v_this.#f_life,
                 #n_link,
@@ -102,13 +104,8 @@ pub(super) fn build(
                 #n_dprog.body(),
             )
         };
-        use #ns_fiber::dope::manifold::network::listener::conn::deadline::Arm;
-        use #ns_h1::server::deadline::Apply;
-        match #n_root.try_apply(&mut #v_link, #n_now) {
-            Apply::Applied | Apply::Deadline(Arm::Armed) => {}
-            Apply::Deadline(Arm::Disabled | Arm::Sealed | Arm::Overflow(_)) => {
-                #v_link.close_after();
-            }
+        if #n_root.try_apply(&mut #v_link, #n_now).is_err() {
+            #v_link.close_after();
         }
     };
     quote! {
@@ -123,7 +120,7 @@ pub(super) fn build(
                 mut self: ::core::pin::Pin<&mut Self>,
                 #v_date: &#ns_h1::server::date::Clock,
                 #v_link: &mut #slot,
-                #v_driver: &mut #ns_fiber::dope::core::driver::retained::Context<'_, '_, 'd>,
+                #v_driver: &mut #ns_fiber::dope::core::driver::Context<'_, 'd>,
             ) -> #ns_h1::server::deadline::Progress {
                 #body
             }
@@ -132,7 +129,7 @@ pub(super) fn build(
                 mut self: ::core::pin::Pin<&mut Self>,
                 #v_date: &#ns_h1::server::date::Clock,
                 #v_link: &mut #slot,
-                #v_driver: &mut #ns_fiber::dope::core::driver::retained::Context<'_, '_, 'd>,
+                #v_driver: &mut #ns_fiber::dope::core::driver::Context<'_, 'd>,
             ) {
                 #wake
             }
@@ -143,7 +140,7 @@ pub(super) fn build(
                 let #v_result = match #v_wait.route {
                     #( #cancel, )*
                 };
-                #v_exch.retire(#v_this.#f_life, #v_result);
+                #retire_pending
             }
 
             fn close<#g_event>(
@@ -208,7 +205,7 @@ pub(super) fn build(
             fn discarded<#g_event>(
                 mut self: ::core::pin::Pin<&mut Self>,
                 mut #v_link: #slot,
-                #v_driver: &mut #ns_fiber::dope::core::driver::retained::Context<'_, '_, 'd>,
+                #v_driver: &mut #ns_fiber::dope::core::driver::Context<'_, 'd>,
             ) {
                 #begin
                 #n_dprog.merge(#ns_h1::server::deadline::Progress::new(
@@ -221,13 +218,12 @@ pub(super) fn build(
             fn timeout<#g_event>(
                 mut self: ::core::pin::Pin<&mut Self>,
                 #v_link: #slot,
-                #v_driver: &mut #ns_fiber::dope::core::driver::retained::Context<'_, '_, 'd>,
+                #v_driver: &mut #ns_fiber::dope::core::driver::Context<'_, 'd>,
             ) -> #ns_fiber::dope::manifold::network::listener::handler::Timeout<'d> {
                 let #n_link = #v_link.id();
                 let #n_now = #v_driver.driver_ref().clock().now();
                 let #n_due = {
-                    let (mut #v_core, _) = self.as_mut().__project();
-                    let #v_this = #v_core.as_mut().project();
+                    let #v_this = self.as_mut().project().#f_core.project();
                     #ns_h1::server::deadline::Mode::timeout(
                         #v_this.#f_life,
                         #n_link,
@@ -250,8 +246,7 @@ pub(super) fn build(
                         exchange: #n_exch,
                         phase: #n_phase,
                     } => {
-                        let (mut #v_core, _) = self.as_mut().__project();
-                        let #v_this = #v_core.as_mut().project();
+                        let #v_this = self.as_mut().project().#f_core.project();
                         if let ::core::option::Option::Some(#n_out) =
                             #ns_core::life::Mode::observer(#v_this.#f_life)
                         {
@@ -269,9 +264,9 @@ pub(super) fn build(
             }
 
             fn drain<#g_event>(
-                self: ::core::pin::Pin<&mut Self>,
+                #mutable self: ::core::pin::Pin<&mut Self>,
                 #v_link: #slot,
-                #v_driver: &mut #ns_fiber::dope::core::driver::retained::Context<'_, '_, 'd>,
+                #v_driver: &mut #ns_fiber::dope::core::driver::Context<'_, 'd>,
             ) -> #ns_fiber::dope::manifold::network::listener::handler::Drain {
                 <#conn as
                     #ns_h1::server::conn::lifetime::Drain<
@@ -282,15 +277,14 @@ pub(super) fn build(
                             #ns_fiber::dope::manifold::network::listener::conn::Id<'d, #g_id>,
                         >>::TransportTag,
                     >
-                >::begin(#v_link, #v_driver)
+                >::begin(#v_link, #v_driver, #scratch)
             }
 
             fn accept<#g_event>(
                 self: ::core::pin::Pin<&mut Self>,
                 #v_link: #slot,
             ) -> #ns_fiber::dope::manifold::app::receive::Outcome {
-                let (#v_core, _) = self.__project();
-                let #v_this = #v_core.project();
+                let #v_this = self.project().#f_core.project();
                 let #v_link = #v_link.id();
                 #ns_core::life::Mode::observe(
                     #v_this.#f_life,
@@ -306,7 +300,7 @@ pub(super) fn build(
             fn activate<#g_event, #l_a, #l_p, #l_s, #l_wire>(
                 mut self: ::core::pin::Pin<&mut Self>,
                 mut #v_link: #ns_fiber::dope::manifold::network::listener::conn::Ctx<#g_event, #l_a, #l_p, #l_s, #l_wire, 'd, #g_id, #g_wire, #conn, Self::Egress>,
-                #v_driver: &mut #ns_fiber::dope::core::driver::retained::Context<'_, '_, 'd>,
+                #v_driver: &mut #ns_fiber::dope::core::driver::Context<'_, 'd>,
             ) -> #ns_fiber::dope::manifold::network::listener::conn::Ctx<#g_event, #l_a, #l_p, #l_s, #l_wire, 'd, #g_id, #g_wire, #conn, Self::Egress>
             where
                 'd: #l_wire,
@@ -318,11 +312,11 @@ pub(super) fn build(
             }
 
             fn eof<#g_event>(
-                self: ::core::pin::Pin<&mut Self>,
+                #mutable self: ::core::pin::Pin<&mut Self>,
                 mut #v_link: #slot,
                 _: #ns_fiber::dope::manifold::app::receive::End,
-                #ed: &mut #ns_fiber::dope::core::driver::retained::Context<'_, '_, 'd>,
-            ) -> #ns_fiber::dope::manifold::network::listener::handler::Eof {
+                #ed: &mut #ns_fiber::dope::core::driver::Context<'_, 'd>,
+            ) {
                 #eof
             }
 
@@ -348,7 +342,7 @@ pub(super) fn build(
                 'd: #l_wire,
             {
                 let #v_linkid = #v_link.id();
-                let (mut #v_core, _) = self.__project();
+                let mut #v_core = self.project().#f_core;
                 {
                     let #v_this = #v_core.as_mut().project();
                     #ns_core::life::Mode::observe(
@@ -379,8 +373,7 @@ pub(super) fn build(
                 #v_app: ::core::pin::Pin<&mut Self>,
                 #v_cause: #ns_fiber::dope::net::wire::open::Error<#l_w, #g_wire>,
             ) {
-                let (#v_core, _) = #v_app.__project();
-                let #v_this = #v_core.project();
+                let #v_this = #v_app.project().#f_core.project();
                 #ns_h1::server::listener::failure::Policy::open_failed(*#v_this.#f_state, #v_cause);
             }
 
@@ -412,8 +405,7 @@ pub(super) fn build(
                 >,
                 #v_cause: #ns_fiber::dope::net::wire::terminal::Error<#l_w, #g_wire>,
             ) {
-                let (#v_core, _) = #v_app.__project();
-                let #v_this = #v_core.project();
+                let #v_this = #v_app.project().#f_core.project();
                 #ns_h1::server::listener::failure::Policy::wire_failed(
                     *#v_this.#f_state,
                     #v_link.id(),
@@ -452,8 +444,7 @@ pub(super) fn build(
                 >,
             ) {
                 let #v_linkid = #v_link.id();
-                let (#v_core, _) = #v_app.__project();
-                let #v_this = #v_core.project();
+                let #v_this = #v_app.project().#f_core.project();
                 #ns_core::life::sequence::Mode::close(
                     #v_this.#f_life,
                     #v_link.state_mut().async_state.session_mut(),
@@ -479,7 +470,7 @@ pub(super) fn build(
             fn send<#g_event>(
                 mut self: ::core::pin::Pin<&mut Self>,
                 mut #v_link: #slot,
-                #v_driver: &mut #ns_fiber::dope::core::driver::retained::Context<'_, '_, 'd>,
+                #v_driver: &mut #ns_fiber::dope::core::driver::Context<'_, 'd>,
             ) {
                 #begin
                 #send

@@ -275,6 +275,6 @@ unsafe impl<'scope> table::raw::Index<'scope> for Slot<'scope> {
     fn index(self) -> bounded::U32<0, { u32::MAX - 1 }> {
         // SAFETY: the table constructor admitted the common extent as a compact
         // capacity, and the scoped receive index lies strictly below it.
-        unsafe { bounded::raw::Proof::assume(self.index.index() as u32) }.retain()
+        unsafe { bounded::raw::u32(self.index.index() as u32) }
     }
 }

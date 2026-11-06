@@ -13,19 +13,21 @@ pub(super) struct Callbacks {
     pub(super) close: proc_macro2::TokenStream,
     pub(super) input: proc_macro2::TokenStream,
     pub(super) gated: proc_macro2::TokenStream,
+    pub(super) scratch: proc_macro2::TokenStream,
 }
 
 impl Callbacks {
     pub(super) fn new(paths: &Paths, types: &types::Types<'_>) -> Self {
-        let f_stamp = local("stamp");
+        let [f_core, f_stamp] = ["core", "stamp"].map(local);
         let symbols = &types.names.generics;
         let [v_reason, v_slot, v_staged] = symbols.locals(["reason", "slot", "staged"]);
         let [n_dprog] = symbols.locals(["__deadline_progress"]);
-        let [n_drain, n_drive] = symbols.locals(["__drain", "__drive"]);
+        let [n_drive] = symbols.locals(["__drive"]);
         let [n_prog, v_action] = symbols.locals(["__progress", "action"]);
         let [v_budget, v_bytes, v_chunk] = symbols.locals(["budget", "bytes", "chunk"]);
         let [v_link, v_core, v_date] = symbols.locals(["connection", "core", "date"]);
-        let [v_driver, v_raw, v_read, v_tail] = symbols.locals(["driver", "raw", "read", "tail"]);
+        let [v_driver, v_raw, v_tail, v_scratch] =
+            symbols.locals(["driver", "raw", "tail", "scratch"]);
         let l_wire = types.names.generics.lifetime("__w");
         let g_r = types.names.generics.ident("__R");
         let g_event = types.names.generics.lifetime("e");
@@ -44,6 +46,19 @@ impl Callbacks {
         let bounds = &params.bounds;
         let proto = &types.protocol;
         let clock = proto.duplex.clock(types.names.generics);
+        let scratch = if proto.upgrade {
+            quote!(&mut self.as_mut().project().#f_stamp.get_mut().2)
+        } else {
+            quote!(&mut ::std::vec::Vec::new())
+        };
+        let split_scratch = proto
+            .upgrade
+            .then(|| quote!(let (#v_date, _, #v_scratch) = #v_date.get_mut();));
+        let (input_scratch, input_clock) = if proto.upgrade {
+            (quote!(#v_scratch), quote!(*#v_date))
+        } else {
+            (scratch.clone(), clock.clone())
+        };
         let duplex = proto.duplex;
         let slot = &proto.h1_slot;
         let conn = &proto.connections.http_connection;
@@ -58,7 +73,8 @@ impl Callbacks {
                 match #v_link.state().mode() {
                     #ns_h1::switch::Mode::Http
                     | #ns_h1::switch::Mode::Switching(_) => {
-                        let (mut #v_core, #v_date) = self.as_mut().__project();
+                        let #v_date = self.as_mut().project();
+                        let (mut #v_core, #v_date) = (#v_date.#f_core, #v_date.#f_stamp);
                         #n_dprog.merge(#v_core.as_mut().send(
                             #clock,
                             &mut #v_link,
@@ -69,7 +85,8 @@ impl Callbacks {
                 }
             },
             duplex::State::Disabled => quote! {
-                let (mut #v_core, #v_date) = self.as_mut().__project();
+                let #v_date = self.as_mut().project();
+                let (mut #v_core, #v_date) = (#v_date.#f_core, #v_date.#f_stamp);
                 #n_dprog.merge(#v_core.as_mut().send(
                     #clock,
                     &mut #v_link,
@@ -81,13 +98,14 @@ impl Callbacks {
             duplex::State::Enabled => quote! {
                 match #v_link.state().mode() {
                     #ns_h1::switch::Mode::Raw(_) => {
-                        #ns_h1::server::duplex::Runtime::<_, #tag>::new(&mut #v_link)
+                        #ns_h1::server::duplex::Runtime::<_, #tag>::new(&mut #v_link, #scratch)
                             .activate(#v_driver);
                     }
                     #ns_h1::switch::Mode::Http
                     | #ns_h1::switch::Mode::Switching(_) => {
                     let #v_action = #v_link.state().action();
-                    let (mut #v_core, #v_date) = self.as_mut().__project();
+                    let #v_date = self.as_mut().project();
+                    let (mut #v_core, #v_date) = (#v_date.#f_core, #v_date.#f_stamp);
                     match #v_action {
                         ::core::option::Option::Some(_) => #n_dprog.merge(#v_core.as_mut().send(
                                 #clock,
@@ -111,7 +129,8 @@ impl Callbacks {
                 }
             },
             duplex::State::Disabled => quote! {
-                let (mut #v_core, #v_date) = self.as_mut().__project();
+                let #v_date = self.as_mut().project();
+                let (mut #v_core, #v_date) = (#v_date.#f_core, #v_date.#f_stamp);
                 if #v_link.state().action().is_some()
                     || #v_link.state().can_resume()
                 {
@@ -129,34 +148,6 @@ impl Callbacks {
                 }
             },
         };
-        let eof = match duplex {
-            duplex::State::Enabled => quote! {
-                let #n_drain = match #v_link.state().mode() {
-                    #ns_h1::switch::Mode::Raw(_) => {
-                        #ns_h1::server::duplex::Runtime::<_, #tag>::new(&mut #v_link)
-                        .finish_input(#v_driver)
-                    }
-                    #ns_h1::switch::Mode::Http => {
-                        #ns_fiber::dope::manifold::network::listener::handler::Drain::Complete
-                    }
-                    #ns_h1::switch::Mode::Switching(_) => {
-                        #ns_fiber::dope::manifold::network::listener::handler::Drain::Pending
-                    }
-                };
-                match #n_drain {
-                    #ns_fiber::dope::manifold::network::listener::handler::Drain::Pending => {
-                        #ns_fiber::dope::manifold::network::listener::handler::Eof::Hold
-                    }
-                    #ns_fiber::dope::manifold::network::listener::handler::Drain::Discard
-                    | #ns_fiber::dope::manifold::network::listener::handler::Drain::Complete => {
-                        #ns_fiber::dope::manifold::network::listener::handler::Eof::Close
-                    }
-                }
-            },
-            duplex::State::Disabled => {
-                quote!(#ns_fiber::dope::manifold::network::listener::handler::Eof::Close)
-            }
-        };
         let pending = quote! {
             #v_link.state().can_resume()
                 || #v_link.state().action().is_some()
@@ -165,13 +156,21 @@ impl Callbacks {
                     #ns_h1::pump::Activity::Task | #ns_h1::pump::Activity::Stream
                 )
         };
+        let eof = match duplex {
+            duplex::State::Enabled => quote! {
+                if !(#pending) && ::core::matches!(
+                    #v_link.state().mode(),
+                    #ns_h1::switch::Mode::Raw(_)
+                ) {
+                    #ns_h1::server::duplex::Runtime::<_, #tag>::new(&mut #v_link, #scratch)
+                        .finish_input(#v_driver);
+                }
+            },
+            duplex::State::Disabled => proc_macro2::TokenStream::new(),
+        };
         let eof = quote! {
             #v_link.state_mut().ingress.end_discard();
-            if #pending {
-                #ns_fiber::dope::manifold::network::listener::handler::Eof::Hold
-            } else {
-                #eof
-            }
+            #eof
         };
         let gate = match duplex {
             duplex::State::Enabled => quote! {
@@ -280,20 +279,22 @@ impl Callbacks {
                             #egress,
                         >,
                         #v_chunk: #ns_fiber::dope::net::wire::receive::scoped::Input<'_, #l_wire, 'd, #g_wire>,
-                        #v_driver: &mut #ns_fiber::dope::core::driver::retained::Context<'_, '_, 'd>,
+                        #v_driver: &mut #ns_fiber::dope::core::driver::Context<'_, 'd>,
                     ) -> #ns_fiber::dope::manifold::app::receive::Outcome {
                         use #ns_fiber::dope::manifold::app::receive::Outcome;
                         let (#v_chunk, #v_budget) = #v_chunk.into_parts();
-                        let mut #v_read = #ns_h1::server::duplex::Read::new(
+                        let #v_date = self.as_mut().project();
+                        let (mut #v_core, #v_date) = (#v_date.#f_core, #v_date.#f_stamp);
+                        #split_scratch
+                        #v_chunk.drive(Outcome::Continue, &mut #ns_h1::server::duplex::Read::new(
                             &mut #v_link,
                             #v_driver,
                             #v_budget,
+                            #input_scratch,
                             |#v_link, #v_bytes, #v_driver| {
-                                let (mut #v_core, #v_date) = self.as_mut().__project();
-                                #v_core.as_mut().chunk(#clock, #v_link, #v_bytes, #v_driver)
+                                #v_core.as_mut().chunk(#input_clock, #v_link, #v_bytes, #v_driver)
                             },
-                        );
-                        #v_chunk.drive(Outcome::Continue, &mut #v_read)
+                        ))
                     }
                 }
             },
@@ -312,9 +313,10 @@ impl Callbacks {
                         self: ::core::pin::Pin<&mut Self>,
                         mut #v_link: #slot,
                         #v_chunk: #g_r,
-                        #v_driver: &mut #ns_fiber::dope::core::driver::retained::Context<'_, '_, 'd>,
+                        #v_driver: &mut #ns_fiber::dope::core::driver::Context<'_, 'd>,
                     ) -> #ns_fiber::dope::manifold::app::receive::Outcome {
-                    let (mut #v_core, #v_date) = self.__project();
+                    let #v_date = self.project();
+                    let (mut #v_core, #v_date) = (#v_date.#f_core, #v_date.#f_stamp);
                     use #ns_h1::server::conn::driver::Ingress;
                     match #v_core.as_mut().chunk(
                             #clock,
@@ -422,6 +424,7 @@ impl Callbacks {
             close,
             input,
             gated,
+            scratch,
         }
     }
 }

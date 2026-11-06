@@ -259,6 +259,18 @@ fn orders_owner_release() {
         _ => None,
     });
     assert_eq!(opened, [1, 2], "pipelined exchanges");
+    assert_eq!(
+        Identity::select(&events, |event| match event {
+            Identity::Committed(ordinal) => Some(ordinal),
+            _ => None,
+        }),
+        [1, 2]
+    );
+    assert!(
+        !events
+            .iter()
+            .any(|event| matches!(event, Identity::StagingReleased(_)))
+    );
     assert_eq!(handoffs, [1, 2], "pipelined handoffs");
     assert_eq!(released, [1, 2], "pipelined final owners");
     assert_eq!(retired, [1, 2], "pipelined retirements");

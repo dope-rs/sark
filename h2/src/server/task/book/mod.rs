@@ -1,4 +1,4 @@
-use std::{convert::Infallible, marker, mem, ops, pin};
+use std::{convert::Infallible, mem, ops, pin};
 
 use dope::{
     core::driver::{route::Identity, schedule::app},
@@ -8,7 +8,6 @@ use o3::{
     alloc,
     buffer::resident,
     depot::{capacity, map::direct, queue::indexed::keyed},
-    mem::Rejected,
 };
 use sark_core::{
     body::{self, credit},
@@ -40,18 +39,17 @@ use crate::{
     stream,
 };
 
-pub(super) struct Book<'d, P, G, F, B, X, D>
+pub(super) struct Book<'d, P, G, B, D, X>
 where
     P: request::Prepared,
     G: state::Family<P>,
-    F: rules::Policy,
     B: body::Build<'d>,
     D: duplex::Session<'d>,
 {
     pub(super) incoming: direct::Table<stream::Key, entry::Entry<'d, P, G, B>>,
     pub(super) responses: typed::Runtime<
         stream::Key,
-        response::Response<'d, P, X, D>,
+        response::Response<'d, P, D, X>,
         response::Data<'d, D>,
         Infallible,
         conn::DataBlock,
@@ -59,12 +57,10 @@ where
     pub(super) build_ready: keyed::Fifo<stream::Key, entry::Build>,
     pub(super) admission_ready: keyed::Fifo<stream::Key, entry::Admission>,
     pub(super) body_credit: credit::raw::Account,
-    policy: marker::PhantomData<fn() -> F>,
 }
-impl<'d, P: request::Prepared, G, F, B, X, D> Book<'d, P, G, F, B, X, D>
+impl<'d, P: request::Prepared, G, B, D, X> Book<'d, P, G, B, D, X>
 where
     G: state::Family<P>,
-    F: rules::Policy,
     B: body::Build<'d>,
     D: duplex::Session<'d>,
 {
@@ -75,12 +71,11 @@ where
             build_ready: keyed::Fifo::new(),
             admission_ready: keyed::Fifo::new(),
             body_credit: credit::raw::Account::new(),
-            policy: marker::PhantomData,
         })
     }
 }
 
-pub(super) struct Turn<'a, 'd, P, G, F, B, X, D>
+pub(super) struct Turn<'a, 'd, P, G, F, B, D, X>
 where
     P: request::Prepared,
     G: state::Family<P>,
@@ -89,10 +84,10 @@ where
     D: duplex::Session<'d>,
 {
     pub(super) connection: &'a mut machine::Connection<crate::ServerRole, F, resident::Shared<'d>>,
-    book: &'a mut Book<'d, P, G, F, B, X, D>,
+    pub(super) book: &'a mut Book<'d, P, G, B, D, X>,
 }
 
-impl<'a, 'd, P, G, F, B, X, D> Turn<'a, 'd, P, G, F, B, X, D>
+impl<'a, 'd, P, G, F, B, D, X> Turn<'a, 'd, P, G, F, B, D, X>
 where
     P: request::Prepared,
     G: state::Family<P>,
@@ -102,7 +97,7 @@ where
 {
     pub(super) fn new(
         conn: &'a mut machine::Connection<crate::ServerRole, F, resident::Shared<'d>>,
-        book: &'a mut Book<'d, P, G, F, B, X, D>,
+        book: &'a mut Book<'d, P, G, B, D, X>,
     ) -> Self {
         const { assert!(mem::size_of::<Self>() == 2 * mem::size_of::<usize>()) };
         Self {
@@ -112,7 +107,7 @@ where
     }
 }
 
-impl<'d, P, G, F, B, X, D> ops::Deref for Turn<'_, 'd, P, G, F, B, X, D>
+impl<'d, P, G, F, B, D, X> ops::Deref for Turn<'_, 'd, P, G, F, B, D, X>
 where
     P: request::Prepared,
     G: state::Family<P>,
@@ -120,14 +115,14 @@ where
     B: body::Build<'d>,
     D: duplex::Session<'d>,
 {
-    type Target = Book<'d, P, G, F, B, X, D>;
+    type Target = Book<'d, P, G, B, D, X>;
 
     fn deref(&self) -> &Self::Target {
         self.book
     }
 }
 
-impl<'d, P, G, F, B, X, D> ops::DerefMut for Turn<'_, 'd, P, G, F, B, X, D>
+impl<'d, P, G, F, B, D, X> ops::DerefMut for Turn<'_, 'd, P, G, F, B, D, X>
 where
     P: request::Prepared,
     G: state::Family<P>,
@@ -140,7 +135,7 @@ where
     }
 }
 
-impl<'d, P: request::Prepared, G, F, B, X, D> Turn<'_, 'd, P, G, F, B, X, D>
+impl<'d, P: request::Prepared, G, F, B, D, X> Turn<'_, 'd, P, G, F, B, D, X>
 where
     G: state::Family<P>,
     F: rules::Policy,
@@ -180,7 +175,7 @@ where
         self.has_events() || self.connection.ingress().is_blocked()
     }
 
-    pub(super) fn vacant(&mut self, stream: stream::Key) -> Option<slot::Slot<'_, 'd, P, F, X, D>> {
+    pub(super) fn vacant(&mut self, stream: stream::Key) -> Option<slot::Slot<'_, 'd, P, F, D, X>> {
         let vacant = self.book.responses.vacant(stream)?;
         Some(slot::Slot {
             connection: self.connection,
@@ -189,13 +184,14 @@ where
         })
     }
 
-    /// Transfers one DATA event into its exact duplex owner. A non-duplex or
-    /// absent stream returns the original event for the regular ingress path.
+    /// Admits an exact response owner before transferring or discarding its tail.
+    /// Only an absent response returns the event for the regular ingress path.
     pub(super) fn try_push(
         &mut self,
         stream: stream::Key,
         data: event::DataPayload<resident::Shared<'d>>,
         boundary: Boundary,
+        admitted: impl FnOnce(),
     ) -> Result<
         ops::ControlFlow<(), event::DataPayload<resident::Shared<'d>>>,
         input::PushError<event::DataPayload<resident::Shared<'d>>, payload::Error>,
@@ -203,11 +199,12 @@ where
         let Some(entry) = self.responses.entry(stream) else {
             return Ok(ops::ControlFlow::Continue(data));
         };
+        admitted();
         let result = match entry {
             typed::Entry::Control(entry) => entry.change(|value| value.push(data, boundary)).1,
             typed::Entry::Data(entry) => {
                 let (entry, result) = entry.change(|value| value.push(data, boundary));
-                if matches!(result, response::Duplex::Applied(_)) {
+                if matches!(result, response::Duplex::Applied(Ok(()))) {
                     entry.activate(None);
                 }
                 result
@@ -216,19 +213,26 @@ where
         };
         match result {
             response::Duplex::Applied(result) => result.map(|()| ops::ControlFlow::Break(())),
-            response::Duplex::Other(input) => Ok(ops::ControlFlow::Continue(input)),
-            response::Duplex::Closed(error, input) => {
-                Err(input::PushError::Buffer(Rejected::new(input, error)))
+            response::Duplex::Other(input) => {
+                // Inserting a response consumes this stream's incoming owner.
+                input.discard();
+                Ok(ops::ControlFlow::Break(()))
             }
         }
     }
 
-    pub(super) fn try_finish(&mut self, stream: stream::Key) -> Option<Result<(), Error>> {
-        let result = match self.responses.entry(stream)? {
-            typed::Entry::Control(entry) => entry.change(response::Response::finish).1,
+    pub(super) fn try_finish(
+        &mut self,
+        stream: stream::Key,
+        admitted: impl FnOnce(),
+    ) -> Option<Result<(), Error>> {
+        let entry = self.responses.entry(stream)?;
+        admitted();
+        let result = match entry {
+            typed::Entry::Control(entry) => entry.change(|value| value.finish()).1,
             typed::Entry::Data(entry) => {
-                let (entry, result) = entry.change(response::Data::finish);
-                if matches!(result, response::Duplex::Applied(_)) {
+                let (entry, result) = entry.change(|value| value.finish());
+                if matches!(result, response::Duplex::Applied(Ok(()))) {
                     entry.activate(None);
                 }
                 result
@@ -237,8 +241,7 @@ where
         };
         match result {
             response::Duplex::Applied(result) => Some(result),
-            response::Duplex::Other(()) => None,
-            response::Duplex::Closed(error, ()) => Some(Err(Error::Input(error))),
+            response::Duplex::Other(()) => Some(Ok(())),
         }
     }
 
@@ -252,10 +255,10 @@ where
         error: numbers::ErrorCode,
         proof: E,
     ) -> (
-        Option<response::Stored<'d, P, X, D>>,
+        Option<response::Stored<'d, P, D, X>>,
         Option<event::Retirement>,
     ) {
-        let (exchange, error) = match self.data().discard(exchange, proof) {
+        let (exchange, error) = match self.data().discard(exchange, || proof) {
             ingress::Discard::Missing(exchange) | ingress::Discard::Removed(exchange) => {
                 (exchange, error)
             }
@@ -270,39 +273,54 @@ where
         (value, write)
     }
 
-    pub(super) fn pump<const ROUND: bool, ID: Identity + 'd, R, M>(
+    pub(super) fn pump<const ROUND: bool, ID: Identity + 'd, R, M, A>(
         &mut self,
         router: pin::Pin<&mut R>,
+        tasks: &mut registry::Table<'d, ID, R::Task>,
+        index: &mut registry::Index,
         id: Id<'d, ID>,
         limits: server::Config,
         egress: schedule::Egress,
         work: app::Work<'_, 'd>,
         mode: &mut M,
+        report: &mut impl FnMut(Id<'d, ID>, stream::Key, &dyn std::fmt::Debug),
     ) -> schedule::Report
     where
         R: Runtime<
                 'd,
                 Prepared = P,
                 Routes = G,
-                Plan = F,
                 Build = B,
-                Completion = X,
                 Duplex = D,
+                Fixed = X,
                 Target = Target<'d, ID>,
             >,
         M: Transitions<Id<'d, ID>>,
         M::Retention: Handoff,
+        A: service::Select<R, Fields = F>,
     {
         let conn = &mut *self.connection;
         let store = &mut self.book.responses;
-        store.resume(|| conn.flow().poll_wake(), egress);
+        store.resume(
+            || {
+                if A::ENABLED {
+                    None
+                } else {
+                    conn.flow().poll_wake()
+                }
+            },
+            egress,
+        );
         let mut driver = response::Driver {
             router,
+            tasks,
+            index,
             connection_id: id,
             connection: conn,
             limits,
             work,
             mode,
+            report,
         };
         match ROUND {
             true => store.drive_round(&mut driver),
@@ -338,7 +356,7 @@ where
                 };
                 let exchange = identify(conn, stream);
                 if let ingress::Discard::Failed { error, .. } =
-                    self.data().discard(exchange, mode.body(exchange))
+                    self.data().discard(exchange, || mode.body(exchange))
                 {
                     life::Mode::diagnostic(mode, &error);
                 }
@@ -354,34 +372,9 @@ where
                 let Some(value) = self.book.responses.remove(stream) else {
                     continue;
                 };
-                match value {
-                    Value::Data(response::Data::Body { pending, .. }) => {
-                        let exchange = identify(conn, stream);
-                        release_pending(mode, exchange, pending, cause::Staging::Closed);
-                        exchange.retire(mode, life::Outcome::Cancelled);
-                    }
-                    Value::Control(response::Response::Encoded(wire)) => {
-                        identify(conn, stream).retire(mode, life::Outcome::Cancelled);
-                        drop(wire);
-                    }
-                    Value::Control(
-                        response::Response::Head { head, .. }
-                        | response::Response::DuplexHead { head, .. },
-                    ) => {
-                        head.discard(state);
-                        identify(conn, stream).retire(mode, life::Outcome::Cancelled);
-                    }
-                    Value::Data(response::Data::Duplex { .. })
-                    | Value::Control(
-                        response::Response::Status(_)
-                        | response::Response::Sync(_)
-                        | response::Response::Completion(_)
-                        | response::Response::DuplexOpen { .. },
-                    ) => {
-                        identify(conn, stream).retire(mode, life::Outcome::Cancelled);
-                    }
-                    Value::Idle(never) => match never {},
-                }
+                let exchange = identify(conn, stream);
+                response::discard(value, state, exchange, mode, cause::Staging::Closed);
+                exchange.retire(mode, life::Outcome::Cancelled);
             }
         }
         state.transfer().discard(|write| {

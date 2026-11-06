@@ -11,7 +11,7 @@ use sark_http::{
     self,
     field::metadata::{
         block,
-        section::{rules, state::Selected},
+        section::{rules, state::Selected, storage},
     },
     payload::compress::dynamic::{mode, plan},
 };
@@ -108,6 +108,8 @@ impl<P: rules::Policy> Blocks<P> {
         cap: usize,
         connect: block::Connect,
     ) -> Result<Self, build::Ingress> {
+        let plan = storage::try_layout::<P::Block>(plan, cap)
+            .map_err(|(_, error)| build::Ingress::HeaderLayout(error))?;
         let mut dec = decode::Decoder::try_from(table).map_err(build::Ingress::Decoder)?;
         dec.set_max_list(Some(cap));
         Ok(Self {

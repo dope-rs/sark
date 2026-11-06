@@ -76,9 +76,11 @@ impl<'a, 'req, 'd: 'req, 'id, F: rules::Policy, E: event::Evidence, B: stage::Bo
     fn resolve_head<O: Into<scope::Owner<'id, Shared>>, P: proof::Proof>(
         self,
         head: request::Head<O, P>,
-    ) -> (Self::Output, handoff::Head<request::Head<O, P>>) {
+    ) -> Self::Output {
         let Self { staged, body } = self;
-        let (body, head) = body.resolve_head(head, |head| head.into_owner().into());
-        (Prepared { staged, body }, head)
+        Prepared {
+            staged,
+            body: body.resolve_head(head.into_owner()),
+        }
     }
 }

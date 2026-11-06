@@ -9,7 +9,7 @@ mod report;
 use std::{marker, mem, pin};
 
 use dope::{
-    core::driver::{retained, schedule::clock},
+    core::driver::{self, schedule::clock},
     manifold::{
         app::receive::{self, limits::Budget},
         network::listener::{conn, handler},
@@ -22,7 +22,7 @@ use dope::{
 pub use failure::Failure;
 use handler::{failures, retire, send};
 use o3::buffer::resident;
-pub(in crate::server::runtime) use report::Fault;
+pub(in crate::server) use report::{Fault, response};
 pub use report::Report;
 use sark_core::{
     life::mode,
@@ -36,7 +36,7 @@ use sark_core::{
 };
 
 use crate::{
-    conn::{Error, config, event},
+    conn::{Error, config},
     server::{
         self,
         runtime::{
@@ -92,7 +92,7 @@ impl<A: Spec, W: wire::Spec, F> App<A, W, F> {
     fn resume<'d, ID: Identity>(
         &mut self,
         conn: &mut Context<'_, '_, '_, '_, '_, 'd, ID, A, W>,
-        driver: &mut retained::Context<'_, '_, 'd>,
+        driver: &mut driver::Context<'_, 'd>,
         mut egress: schedule::Egress,
     ) -> Result<drain::Progress, app::Error<Error, A::Failure>>
     where
@@ -115,7 +115,11 @@ impl<A: Spec, W: wire::Spec, F> App<A, W, F> {
                     &mut state.carrier,
                     &mut turn,
                     mem::replace(&mut egress, schedule::Egress::Unchanged),
-                    |cause| {
+                    &mut *fault,
+                    |_, conn, drain, _| Ok(drain.next(conn)),
+                    |_, _| {},
+                    |_, _| {},
+                    |fault, cause| {
                         <F as Fault<'d, W, A::Failure, ID, runtime::Build<A::Build>>>::diagnostic(
                             fault, owner, cause,
                         );
@@ -123,13 +127,13 @@ impl<A: Spec, W: wire::Spec, F> App<A, W, F> {
                 )
             },
         )
-        .resume::<<A as Spec>::Fields, event::Ignore>()
+        .resume()
     }
 
     pub(super) fn fail<'d, ID: Identity>(
         &mut self,
         conn: &mut Context<'_, '_, '_, '_, '_, 'd, ID, A, W>,
-        driver: &mut retained::Context<'_, '_, 'd>,
+        driver: &mut driver::Context<'_, 'd>,
         error: app::Error<Error, A::Failure>,
     ) where
         A: app::Application<'d, Connection<'d, A>, conn::Id<'d, ID>>,
@@ -140,18 +144,19 @@ impl<A: Spec, W: wire::Spec, F> App<A, W, F> {
             conn.id(),
             error,
         );
-        let output = Flush::new(conn).finish(driver, Some(code), &mut mode::Disabled);
-        <F as Fault<'d, W, A::Failure, ID, runtime::Build<A::Build>>>::output(
-            &mut self.fault,
-            conn.id(),
-            output,
-        );
+        if let Err((cause, _)) = Flush::new(conn).finish(driver, Some(code), &mut mode::Disabled) {
+            <F as Fault<'d, W, A::Failure, ID, runtime::Build<A::Build>>>::output(
+                &mut self.fault,
+                conn.id(),
+                cause,
+            );
+        }
     }
 
     pub(super) fn activate<'d, ID: Identity, T>(
         &mut self,
         conn: &mut Context<'_, '_, '_, '_, '_, 'd, ID, A, W>,
-        driver: &mut retained::Context<'_, '_, 'd>,
+        driver: &mut driver::Context<'_, 'd>,
         egress: schedule::Egress,
     ) where
         A: app::Application<'d, Connection<'d, A>, conn::Id<'d, ID>>,
@@ -179,7 +184,7 @@ impl<A: Spec, W: wire::Spec, F> App<A, W, F> {
         &mut self,
         conn: &mut Context<'_, '_, '_, '_, 'w, 'd, ID, A, W>,
         chunk: scoped::Input<'_, 'w, 'd, W>,
-        driver: &mut retained::Context<'_, '_, 'd>,
+        driver: &mut driver::Context<'_, 'd>,
     ) -> receive::Outcome
     where
         A: app::Application<'d, Connection<'d, A>, conn::Id<'d, ID>>,
@@ -203,7 +208,11 @@ impl<A: Spec, W: wire::Spec, F> App<A, W, F> {
                     &mut state.carrier,
                     &mut turn,
                     schedule::Egress::Unchanged,
-                    |cause| {
+                    &mut *fault,
+                    |_, conn, drain, _| Ok(drain.next(conn)),
+                    |_, _| {},
+                    |_, _| {},
+                    |fault, cause| {
                         <F as Fault<'d, W, A::Failure, ID, runtime::Build<A::Build>>>::diagnostic(
                             fault, owner, cause,
                         );
@@ -211,7 +220,7 @@ impl<A: Spec, W: wire::Spec, F> App<A, W, F> {
                 )
             },
         )
-        .read::<<A as Spec>::Fields, event::Ignore, W>(&mut source);
+        .read(&mut source);
         let error = drain::Progress::error(result, wake);
         if let Some(error) = error {
             if error.connection().is_some_and(Error::is_pressure)
@@ -275,7 +284,7 @@ where
     fn timeout<'e>(
         self: pin::Pin<&mut Self>,
         mut conn: conn::Ctx<'e, '_, '_, '_, '_, 'd, ID, W, Self::Conn, Self::Egress>,
-        driver: &mut retained::Context<'_, '_, 'd>,
+        driver: &mut driver::Context<'_, 'd>,
     ) -> handler::Timeout<'d> {
         <A::Timing as Deadline<'d, ID, A, W, F>>::timeout(self.get_mut(), &mut conn, driver)
     }
@@ -283,15 +292,16 @@ where
     fn drain<'e>(
         self: pin::Pin<&mut Self>,
         mut conn: conn::Ctx<'e, '_, '_, '_, '_, 'd, ID, W, Self::Conn, Self::Egress>,
-        driver: &mut retained::Context<'_, '_, 'd>,
+        driver: &mut driver::Context<'_, 'd>,
     ) -> handler::Drain {
         conn.state_mut().begin_drain();
-        let output = Flush::new(&mut conn).finish(driver, None, &mut mode::Disabled);
-        <F as Fault<'d, W, A::Failure, ID, runtime::Build<A::Build>>>::output(
-            &mut self.get_mut().fault,
-            conn.id(),
-            output,
-        );
+        if let Err((cause, _)) = Flush::new(&mut conn).finish(driver, None, &mut mode::Disabled) {
+            <F as Fault<'d, W, A::Failure, ID, runtime::Build<A::Build>>>::output(
+                &mut self.get_mut().fault,
+                conn.id(),
+                cause,
+            );
+        }
         match output::State::settle(conn.state_mut()) {
             End::Close => handler::Drain::Complete,
             End::Keep => handler::Drain::Pending,
@@ -328,7 +338,7 @@ where
     fn activate<'e, 'a, 'p, 's, 'w>(
         self: pin::Pin<&mut Self>,
         mut conn: conn::Ctx<'e, 'a, 'p, 's, 'w, 'd, ID, W, Self::Conn, Self::Egress>,
-        driver: &mut retained::Context<'_, '_, 'd>,
+        driver: &mut driver::Context<'_, 'd>,
     ) -> conn::Ctx<'e, 'a, 'p, 's, 'w, 'd, ID, W, Self::Conn, Self::Egress>
     where
         'd: 'w,
@@ -364,7 +374,7 @@ where
     fn send<'e>(
         self: pin::Pin<&mut Self>,
         mut conn: conn::Ctx<'e, '_, '_, '_, '_, 'd, ID, W, Self::Conn, Self::Egress>,
-        driver: &mut retained::Context<'_, '_, 'd>,
+        driver: &mut driver::Context<'_, 'd>,
     ) {
         self.get_mut()
             .activate::<ID, A::Timing>(&mut conn, driver, schedule::Egress::Released);
@@ -387,7 +397,7 @@ where
         self: pin::Pin<&mut Self>,
         mut conn: conn::Ctx<'e, '_, '_, '_, 'w, 'd, ID, W, Self::Conn, Self::Egress>,
         chunk: scoped::Input<'_, 'w, 'd, W>,
-        driver: &mut retained::Context<'_, '_, 'd>,
+        driver: &mut driver::Context<'_, 'd>,
     ) -> receive::Outcome {
         self.get_mut().read(&mut conn, chunk, driver)
     }

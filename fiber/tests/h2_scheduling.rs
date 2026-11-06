@@ -33,6 +33,7 @@ use dope_test::{
 };
 use sark_core::{deadline, life::mode, manifold::stream::Boundary};
 use sark_h2::conn::config::{self, capacity};
+use sark_h2::server::task::timers;
 
 #[test]
 fn pre_fin_yields() {
@@ -173,138 +174,186 @@ fn completion_yields_build() {
 
 #[test]
 fn close_cancels_once() {
-    let listener = Listener::bind(SocketAddr::from(([127, 0, 0, 1], 0))).expect("listener");
-    let address = listener.local_addr();
-    let server = Server::new(CONFIG, 2, State::default());
-    let plan = server.try_plan(address).expect("plan");
-    let mut reports = Plan::try_reports(&plan).expect("claims");
-    let prepared = topology::Plan::new((), plan.with_bound(listener))
-        .for_receive::<timing::Throughput>()
-        .expect("resources");
-    let facts = Cell::new(Vec::new());
-    let mut done = session::Completion::new();
-    prepared.enter_with(
-        (),
-        |worker| {
-            worker.lend(|plan, stage| {
-                Brand::with(|brand| {
-                    let router = H2TaskApp::multiplexed::<wire::Identity, KeyTag<ROUTE>, _>(
-                        brand,
-                        &server.state,
-                        sark_fiber::Config::new(2),
-                    );
-                    server.state.layout.set(Some(router.layout()));
-                    let wire =
-                        wire::domain::Local::<wire::Identity, KeyTag<ROUTE>>::new(wire::Identity);
-                    plan.tasks(router, 2)
-                        .observe(Log(&facts, diagnose))
-                        .try_install(stage, wire, |listener, stage| {
-                            stage
-                                .with_quiesce(
-                                    &mut done,
-                                    Host::new(listener),
-                                    Duration::from_secs(3),
-                                    |mut app| {
-                                        let (mut socket, mut client) =
-                                            Peer::try_connect(address, Duration::from_secs(3))
-                                                .expect("H2 peer connection");
-                                        let first = client
-                                            .streams()
-                                            .headers()
-                                            .request(
-                                                Request::new(b"/blocked")
+    for streaming in [false, true] {
+        let listener = Listener::bind(SocketAddr::from(([127, 0, 0, 1], 0))).expect("listener");
+        let address = listener.local_addr();
+        let server = Server::new(CONFIG, 2, State::default());
+        let plan = server.try_plan(address).expect("plan");
+        let mut reports = Plan::try_reports(&plan).expect("claims");
+        let prepared = topology::Plan::new((), plan.with_bound(listener))
+            .for_receive::<timing::Throughput>()
+            .expect("resources");
+        let facts = Cell::new(Vec::new());
+        let mut done = session::Completion::new();
+        prepared.enter_with(
+            (),
+            |worker| {
+                worker.lend(|plan, stage| {
+                    Brand::with(|brand| {
+                        let wire = wire::domain::Local::<wire::Identity, KeyTag<ROUTE>>::new(
+                            wire::Identity,
+                        );
+                        plan.tasks((), 2)
+                            .observe(Log(&facts, diagnose))
+                            .prepare_in(stage, wire, |prepared, _wait, stage| {
+                                let router =
+                                    H2TaskApp::multiplexed::<wire::Identity, KeyTag<ROUTE>, _>(
+                                        brand,
+                                        &server.state,
+                                        sark_fiber::Config::new(2),
+                                    );
+                                server.state.layout.set(Some(router.layout()));
+                                let listener = prepared
+                                    .build(router, timers::Disabled, &mut stage.driver())
+                                    .expect("observed H2 listener");
+                                stage
+                                    .with_quiesce(
+                                        &mut done,
+                                        Host::new(listener),
+                                        Duration::from_secs(3),
+                                        |mut app| {
+                                            let (mut socket, mut client) =
+                                                Peer::try_connect(address, Duration::from_secs(3))
+                                                    .expect("H2 peer connection");
+                                            let first = client
+                                                .streams()
+                                                .headers()
+                                                .request(
+                                                    Request::new(if streaming {
+                                                        b"/stream"
+                                                    } else {
+                                                        b"/blocked"
+                                                    })
                                                     .try_headers()
                                                     .expect("fields"),
-                                                Boundary::End,
-                                            )
-                                            .expect("first task");
-                                        let second = client
-                                            .streams()
-                                            .headers()
-                                            .request(
-                                                Request::new(b"/blocked")
-                                                    .try_headers()
-                                                    .expect("fields"),
-                                                Boundary::End,
-                                            )
-                                            .expect("second task");
-                                        assert_ne!(first, second);
-                                        Peer::new(&mut socket, &mut client)
-                                            .try_flush()
-                                            .expect("H2 peer flush");
-                                        assert_eq!(
-                                            fibers::TEST
-                                                .try_wait(
-                                                    &mut app,
-                                                    &Count {
-                                                        facts: &facts,
-                                                        event: "task-admitted",
-                                                    },
-                                                    2,
+                                                    Boundary::End,
                                                 )
-                                                .expect("H2 progress"),
-                                            fibers::Wait::Reached
-                                        );
-                                        assert_eq!(
-                                            Count {
-                                                facts: &facts,
-                                                event: "task-admitted"
+                                                .expect("first task");
+                                            let second = client
+                                                .streams()
+                                                .headers()
+                                                .request(
+                                                    Request::new(if streaming {
+                                                        b"/stream"
+                                                    } else {
+                                                        b"/blocked"
+                                                    })
+                                                    .try_headers()
+                                                    .expect("fields"),
+                                                    Boundary::End,
+                                                )
+                                                .expect("second task");
+                                            assert_ne!(first, second);
+                                            Peer::new(&mut socket, &mut client)
+                                                .try_flush()
+                                                .expect("H2 peer flush");
+                                            assert_eq!(
+                                                fibers::TEST
+                                                    .try_wait(
+                                                        &mut app,
+                                                        &Count {
+                                                            facts: &facts,
+                                                            event: if streaming {
+                                                                "response-committed"
+                                                            } else {
+                                                                "task-admitted"
+                                                            },
+                                                        },
+                                                        2,
+                                                    )
+                                                    .expect("H2 progress"),
+                                                fibers::Wait::Reached
+                                            );
+                                            assert_eq!(
+                                                Count {
+                                                    facts: &facts,
+                                                    event: "task-admitted"
+                                                }
+                                                .hits(),
+                                                2
+                                            );
+                                            drop(socket);
+                                            drop(client);
+                                            assert_eq!(
+                                                fibers::TEST
+                                                    .try_wait(
+                                                        &mut app,
+                                                        &Count {
+                                                            facts: &facts,
+                                                            event: if streaming {
+                                                                "exchange-retired"
+                                                            } else {
+                                                                "task-cancelled"
+                                                            },
+                                                        },
+                                                        2,
+                                                    )
+                                                    .expect("H2 progress"),
+                                                fibers::Wait::Reached
+                                            );
+                                            let observed = facts.take();
+                                            let mut cancels = observed
+                                                .iter()
+                                                .filter_map(|&(kind, stream)| {
+                                                    (kind == "task-cancelled")
+                                                        .then_some(Identity::from(stream).wire())
+                                                })
+                                                .collect::<Vec<_>>();
+                                            facts.set(observed);
+                                            cancels.sort_unstable();
+                                            let mut expected = [
+                                                u64::from(first.into_u32()),
+                                                u64::from(second.into_u32()),
+                                            ];
+                                            expected.sort_unstable();
+                                            if streaming {
+                                                assert!(
+                                                    cancels.is_empty(),
+                                                    "ready tasks are not cancelled twice"
+                                                );
+                                                assert_eq!(
+                                                    Count {
+                                                        facts: &facts,
+                                                        event: "task-poll-ready"
+                                                    }
+                                                    .hits(),
+                                                    2
+                                                );
+                                                assert_eq!(
+                                                    Count {
+                                                        facts: &facts,
+                                                        event: "exchange-retired"
+                                                    }
+                                                    .hits(),
+                                                    2
+                                                );
+                                                assert_eq!(server.state.stream.drops.get(), 2);
+                                                assert!(!server.state.stream.moved.get());
+                                            } else {
+                                                assert_eq!(cancels, expected);
                                             }
-                                            .hits(),
-                                            2
-                                        );
-                                        drop(socket);
-                                        drop(client);
-                                        assert_eq!(
-                                            fibers::TEST
-                                                .try_wait(
-                                                    &mut app,
-                                                    &Count {
-                                                        facts: &facts,
-                                                        event: "task-cancelled",
-                                                    },
-                                                    2,
-                                                )
-                                                .expect("H2 progress"),
-                                            fibers::Wait::Reached
-                                        );
-                                        let observed = facts.take();
-                                        let mut cancels = observed
-                                            .iter()
-                                            .filter_map(|&(kind, stream)| {
-                                                (kind == "task-cancelled")
-                                                    .then_some(Identity::from(stream).wire())
-                                            })
-                                            .collect::<Vec<_>>();
-                                        facts.set(observed);
-                                        cancels.sort_unstable();
-                                        let mut expected = [
-                                            u64::from(first.into_u32()),
-                                            u64::from(second.into_u32()),
-                                        ];
-                                        expected.sort_unstable();
-                                        assert_eq!(cancels, expected);
-                                    },
-                                )
-                                .expect("runtime");
-                        })
-                        .expect("install");
+                                        },
+                                    )
+                                    .expect("runtime");
+                            })
+                            .expect("install");
+                    })
                 })
-            })
-        },
-        recovery::Policy::new(|event| reports.push(event), recover),
-        |result| {
-            result
-                .as_ref()
-                .map_err(|error| error.cause())
-                .expect("H2 topology");
-        },
-    );
-    assert_eq!(server.state.observed(), (false, None, Some(DUPLEX_LAYOUT)));
-    assert!(
-        reports.events().expect("H2 reclaim ownership").is_empty(),
-        "retirement: {reports:?}"
-    );
+            },
+            recovery::Policy::new(|event| reports.push(event), recover),
+            |result| {
+                result
+                    .as_ref()
+                    .map_err(|error| error.cause())
+                    .expect("H2 topology");
+            },
+        );
+        assert_eq!(server.state.observed(), (false, None, Some(DUPLEX_LAYOUT)));
+        assert!(
+            reports.events().expect("H2 reclaim ownership").is_empty(),
+            "retirement: {reports:?}"
+        );
+    }
 }
 
 #[test]
@@ -335,7 +384,7 @@ fn burst_wakes_siblings() {
                         wire::domain::Local::<wire::Identity, KeyTag<ROUTE>>::new(wire::Identity);
                     plan.tasks(router, TASKS)
                         .observe(Log(&facts, diagnose))
-                        .try_install(stage, wire, |listener, stage| {
+                        .try_install(stage, wire, timers::Disabled, |listener, _wait, stage| {
                             let start = stage.driver().driver_ref().clock().now().into();
                             stage
                                 .with_at_for(
@@ -451,12 +500,13 @@ fn renewals_precede_ready_tasks() {
     let listener = Listener::bind(SocketAddr::from(([127, 0, 0, 1], 0))).expect("listener");
     let address = listener.local_addr();
     let protocol = config::Config {
-        stream_capacity: STREAMS + 1,
+        stream_capacity: STREAMS + 2,
         payload_capacity: capacity::Payload::new(STREAMS, STREAMS + 1)
             .expect("retained body owners"),
         ..Default::default()
     };
-    let server = Server::new(CONFIG, 1, State::default()).with_config(protocol);
+    let server =
+        Server::new(CONFIG, 1, State::with_guard(GuardProbe::default())).with_config(protocol);
     let plan = server.try_plan(address).expect("plan");
     let mut reports = Plan::try_reports(&plan).expect("claims");
     let prepared = topology::Plan::new((), plan.with_bound(listener))
@@ -486,7 +536,7 @@ fn renewals_precede_ready_tasks() {
                         wire::domain::Local::<wire::Identity, KeyTag<ROUTE>>::new(wire::Identity);
                     plan.tasks(router, 1)
                         .observe(Log(&facts, diagnose))
-                        .try_due(stage, wire, timer, |listener, stage| {
+                        .try_install(stage, wire, timer, |listener, _wait, stage| {
                             let start = stage.driver().driver_ref().clock().now().into();
                             stage
                                 .with_at_for(
@@ -498,10 +548,12 @@ fn renewals_precede_ready_tasks() {
                                         let mut socket =
                                             Peer::try_open(address, Duration::from_secs(3))
                                                 .expect("H2 peer connection");
+                                        let mut client_protocol = protocol;
+                                        client_protocol.local_settings.initial_window_size = 0;
                                         let mut client = sark_h2::conn::machine::Connection::<
                                             sark_h2::ClientRole,
                                         >::with_config(
-                                            protocol
+                                            client_protocol
                                         )
                                         .expect("H2 peer capacity");
                                         let streams = array::from_fn::<_, STREAMS, _>(|_| {
@@ -516,6 +568,16 @@ fn renewals_precede_ready_tasks() {
                                                 )
                                                 .expect("body stream")
                                         });
+                                        let guarded = client
+                                            .streams()
+                                            .headers()
+                                            .request(
+                                                Request::new(b"/guarded/body")
+                                                    .try_headers()
+                                                    .expect("fields"),
+                                                Boundary::More,
+                                            )
+                                            .expect("guarded request");
                                         Peer::new(&mut socket, &mut client)
                                             .try_flush()
                                             .expect("body heads");
@@ -523,11 +585,17 @@ fn renewals_precede_ready_tasks() {
                                             facts: &facts,
                                             event: "head-admitted",
                                         };
+                                        let committed = Count {
+                                            facts: &facts,
+                                            event: "response-committed",
+                                        };
                                         app.drive_for(
                                             start,
                                             Duration::from_secs(3),
                                             Once::new(poll_fn(|context| {
-                                                if heads.hits() < STREAMS as u32 {
+                                                if heads.hits() < STREAMS as u32 + 1
+                                                    || committed.hits() == 0
+                                                {
                                                     context.wake();
                                                     return Poll::Pending;
                                                 }
@@ -571,6 +639,9 @@ fn renewals_precede_ready_tasks() {
                                         .expect("registered task timer")
                                         .into_output();
 
+                                        Sender::new(&mut client)
+                                            .try_send(guarded, b"discarded", Boundary::End)
+                                            .expect("guard input completion");
                                         for stream in streams {
                                             Sender::new(&mut client)
                                                 .try_send(stream, b"first-", Boundary::More)
@@ -604,6 +675,20 @@ fn renewals_precede_ready_tasks() {
                                         )
                                         .expect("lazy body renewal")
                                         .into_output();
+                                        // Later DATA admission proves the earlier guard tail was consumed.
+                                        let observed = facts.take();
+                                        assert_eq!(
+                                            observed
+                                                .iter()
+                                                .filter(|&&(kind, identity)| {
+                                                    kind == "input-finished"
+                                                        && Identity::from(identity).wire()
+                                                            == u64::from(guarded.into_u32())
+                                                })
+                                                .count(),
+                                            1,
+                                        );
+                                        facts.set(observed);
 
                                         let due = handler
                                             .try_add(Duration::from_secs(1))

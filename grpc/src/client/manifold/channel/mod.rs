@@ -4,7 +4,7 @@ use dope::{
     core::driver::{
         self,
         route::{Identity, KeyTag},
-        schedule::{app, ready::wake},
+        schedule::{Progress, app, ready::wake},
     },
     manifold::{
         client::{conn, port, session::ingress},
@@ -68,17 +68,25 @@ impl<'a, 'life: 'a, 'd, ID: Identity> Access<'a, 'life, 'd, ID> {
     fn drain(&mut self) -> cancels::Empty<'life, 'd, ID> {
         let shared = self.shared;
         self.with(|state, done| {
-            loop {
+            let mut changed = None;
+            let idle = loop {
                 let (conn, call) = match shared.cancels.pop() {
                     Ok(call) => call,
-                    Err(idle) => return idle,
+                    Err(idle) => break idle,
                 };
                 if let Some(session) = state.get_mut(conn) {
                     call.cancel(session, done);
-                    shared.wake_space(state);
-                    state.signal(conn);
+                    changed = Some(conn);
                 }
+            };
+            if let Some(conn) = changed {
+                if let Some(session) = state.get_mut(conn) {
+                    session.state.refill(done);
+                }
+                shared.wake_space(state);
+                state.signal(conn);
             }
+            idle
         })
     }
 
@@ -121,11 +129,24 @@ enum SenderWake {
 }
 
 impl<'d, ID: Identity> Shared<'d, ID> {
+    pub(in crate::client::manifold) fn progress(&self) -> Progress<'d> {
+        if self.change_waiters.has_pending()
+            || self.sender_wake.get() != SenderWake::None
+            || self.completion_waiters.is_draining()
+        {
+            Progress::Runnable
+        } else {
+            Progress::Quiescent
+        }
+    }
+
     pub(in crate::client::manifold) fn wake(&self) {
         self.change_waiters.publish();
     }
 
-    pub(in crate::client::manifold) fn complete_all(&self) {
+    pub(in crate::client::manifold) fn wake_all(&self) {
+        self.wake();
+        self.wake_senders();
         if self.completion_waiters.has_waiters() && !self.completion_waiters.is_draining() {
             self.completion_waiters.begin_drain();
         }

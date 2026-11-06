@@ -1,30 +1,19 @@
+use super::OwnedReply;
 use sark_http::payload::response::status;
 
-#[sark_fiber::response(raw)]
-pub struct PingReply {
-    pub status: status::Code,
-    pub body: Vec<u8>,
-}
-
 #[sark_fiber::handler(pub)]
-fn ping() -> PingReply {
+fn ping() -> OwnedReply {
     let mut body = Vec::new();
     body.extend_from_slice(b"pong");
-    PingReply {
+    OwnedReply {
         status: status::Code::OK,
         body,
     }
 }
 
-#[sark_fiber::response(raw)]
-pub struct EchoReply {
-    pub status: status::Code,
-    pub body: Vec<u8>,
-}
-
 #[sark_fiber::handler(pub)]
-fn echo() -> EchoReply {
-    EchoReply {
+fn echo() -> OwnedReply {
+    OwnedReply {
         status: status::Code::OK,
         body: Vec::from(&b"echoed"[..]),
     }

@@ -142,7 +142,6 @@ where
         if self.cancel(stream, policy).is_none() {
             self.ingress.cancel_unary(key);
         }
-        self.refill(policy);
     }
 
     pub(super) fn poll_stream<R: policies::Policy<P, C>>(
@@ -171,7 +170,6 @@ where
         if self.cancel(stream, policy).is_none() {
             self.ingress.cancel_feed(key);
         }
-        self.refill(policy);
     }
 
     pub(super) fn drive<R: policies::Policy<P, C>>(

@@ -20,7 +20,7 @@ use sark_fiber::{
 use sark_h1::server::{listener::bind, run, run::prepare};
 use sark_http::payload::{fixed, response::status};
 
-use crate::common::server;
+use crate::common::{route::body::OwnedReply, server};
 
 pub static LARGE_STATIC_BODY: [u8; 32 * 1024] = [b's'; 32 * 1024];
 
@@ -31,36 +31,30 @@ pub struct BodyReq {
 }
 
 #[sark_fiber::response(raw)]
-pub struct Reply {
-    pub status: status::Code,
-    pub body: Vec<u8>,
-}
-
-#[sark_fiber::response(raw)]
 pub struct StaticReply<'d> {
     pub status: status::Code,
     pub body: fixed::Body<'d>,
 }
 
 #[sark_fiber::handler(pub)]
-fn ping() -> Reply {
-    Reply {
+fn ping() -> OwnedReply {
+    OwnedReply {
         status: status::Code::OK,
         body: b"pong".to_vec(),
     }
 }
 
 #[sark_fiber::handler(pub)]
-fn body(req: BodyReq) -> Reply {
-    Reply {
+fn body(req: BodyReq) -> OwnedReply {
+    OwnedReply {
         status: status::Code::OK,
         body: format!("body:{}", req.payload.len()).into_bytes(),
     }
 }
 
 #[sark_fiber::handler(pub)]
-fn large() -> Reply {
-    Reply {
+fn large() -> OwnedReply {
+    OwnedReply {
         status: status::Code::OK,
         body: vec![b'x'; 32 * 1024],
     }

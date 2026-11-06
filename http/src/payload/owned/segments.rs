@@ -88,6 +88,7 @@ impl<'d> Segments<'d> {
             })
     }
 
+    #[inline]
     pub fn charge(&self) -> hold::Charge {
         match &self.storage {
             Shape::Empty => hold::Charge::default(),

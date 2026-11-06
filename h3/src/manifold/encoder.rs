@@ -1,7 +1,8 @@
 //! Fiber-free HTTP/3 response encoding over the shared request body model.
 
-use std::convert::Infallible;
+use std::{convert::Infallible, ops::ControlFlow};
 
+use dope_quic::wire::stream::Id as StreamId;
 use o3::buffer::{
     bytes::scope,
     hold,
@@ -9,10 +10,10 @@ use o3::buffer::{
     resident,
     storage::Shared,
 };
-use sark_core::{decode, request, request::frame::proof};
+use sark_core::{decode, life, manifold::task::response, request, request::frame::proof};
 use sark_http::{
     field::{Response, metadata::section::rules},
-    owner::{evidence, handoff, handoff::stage},
+    owner::{evidence, evidence::Sink as _, handoff, handoff::stage},
     payload::{
         fixed,
         response::{Body, Content, Method, bounded, dispatch, exact, headers, status::Code},
@@ -23,6 +24,7 @@ use sark_http::{
 use crate::{
     conn,
     conn::{io::replies, output},
+    manifold::{owners, requests},
     stream,
 };
 
@@ -58,6 +60,16 @@ impl<'a, 'd, P: rules::Policy> Head<'a, 'd, P> {
         self.prepared.discard();
     }
 
+    fn with_body<T>(self, body: Result<T, handoff::Error>) -> Result<(T, Self), conn::Error> {
+        match body {
+            Ok(body) => Ok((body, self)),
+            Err(error) => {
+                self.discard();
+                Err(conn::Error::Handoff(error))
+            }
+        }
+    }
+
     fn complete(self, body: handoff::Ready<'d>) -> Result<replies::Batch<'a, 'd, P>, conn::Error> {
         let actual = body.body_len();
         if actual != self.bytes {
@@ -76,22 +88,28 @@ impl<'a, 'd, P: rules::Policy> Head<'a, 'd, P> {
             None => Ok(self.prepared.finish()),
         }
     }
-}
 
-fn commit<'a, 'd, P: rules::Policy>(
-    prepared: Head<'a, 'd, P>,
-    body: handoff::Ready<'d>,
-) -> Result<hold::Charge, conn::Error> {
-    prepared.complete(body)?.commit()
-}
-
-fn commit_with<'a, 'd, P: rules::Policy>(
-    prepared: Head<'a, 'd, P>,
-    body: handoff::Ready<'d>,
-) -> Result<(hold::Charge, Option<evidence::Copy>), conn::Error> {
-    let (body, copied) = body.into_copy();
-    let charge = commit(prepared, body)?;
-    Ok((charge, copied))
+    fn defer<M: owners::Handoff>(
+        self,
+        body: handoff::Ready<'d>,
+        linked: M::Projection,
+        copied: bool,
+        state: response::State,
+    ) -> Result<Pending<'d, M>, conn::Error> {
+        let body_bytes = self.bytes;
+        let reply = match state {
+            response::State::Streaming => self.prepared.open(),
+            response::State::Complete(_) => self.complete(body)?,
+        }
+        .defer()?;
+        Ok(Pending {
+            reply,
+            body_bytes,
+            linked,
+            copied,
+            state,
+        })
+    }
 }
 
 #[must_use = "an H3 response encoder must prepare exactly one response"]
@@ -128,6 +146,67 @@ pub struct Prepared<
 pub struct Detached<'a, 'd, P: rules::Policy = rules::RetainRaw, M: Mode = Off, D = Infallible> {
     body: handoff::Pending<'d, M, D>,
     head: Head<'a, 'd, P>,
+}
+
+#[repr(transparent)]
+pub struct Initial<T>(pub(in crate::manifold) T);
+
+/// One resolved response whose unchanged wire owners await queue admission.
+#[must_use = "send or discard the pending response"]
+pub struct Pending<'d, M: owners::Handoff = Off> {
+    reply: replies::Pending<'d>,
+    body_bytes: usize,
+    linked: M::Projection,
+    copied: bool,
+    state: response::State,
+}
+
+impl<'d, M: owners::Handoff> Pending<'d, M> {
+    pub(in crate::manifold) fn send<P: rules::Policy, C: Copy, O>(
+        mut self,
+        conn: &mut conn::Connection<'d, P>,
+        id: requests::Id,
+        life: &mut O,
+        flow: life::exchange::Id<C, StreamId>,
+    ) -> Result<ControlFlow<Self, response::State>, conn::Error>
+    where
+        O: life::Mode<C, StreamId, Retention = M>,
+    {
+        let sent = if O::RESPONSE_CHARGE {
+            self.reply.send::<On, _, _>(conn.reply(), id.target())
+        } else {
+            self.reply
+                .send::<Off, _, _>(conn.reply(), id.target())
+                .map(|sent| sent.map_continue(|_| hold::Charge::default()))
+        }?;
+        match sent {
+            ControlFlow::Break(reply) => {
+                self.reply = reply;
+                Ok(ControlFlow::Break(self))
+            }
+            ControlFlow::Continue(charge) => {
+                let linked = M::charge(self.linked);
+                if let Some(copy) = M::copied(self.copied, self.body_bytes) {
+                    life::response::Sink::new(life, flow).copied(copy);
+                }
+                life.observe(life::Event::ResponseCommitted {
+                    exchange: flow,
+                    body_bytes: self.body_bytes,
+                    charge,
+                    linked,
+                });
+                Ok(ControlFlow::Continue(self.state))
+            }
+        }
+    }
+
+    pub(in crate::manifold) fn discard<P: rules::Policy>(
+        self,
+        conn: &mut conn::Connection<'d, P>,
+        id: requests::Id,
+    ) {
+        self.reply.discard(conn.reply(), id.target());
+    }
 }
 
 impl<'a, 'd, P: rules::Policy> Encoder<'a, 'd, 'd, P> {
@@ -230,23 +309,21 @@ impl<'a, 'req, 'd: 'req, P: rules::Policy, Q: scope::Source, I: stage::Body<'req
 impl<'a, 'req, 'd: 'req, P: rules::Policy, I: stage::Body<'req, 'd>>
     Prepared<'a, 'req, 'd, P, Infallible, I>
 {
-    pub(crate) const fn body_bytes(&self) -> usize {
-        self.head.bytes
+    pub(in crate::manifold) fn defer(
+        self,
+        state: response::State,
+    ) -> Result<Pending<'d, Off>, conn::Error> {
+        let (body, head) = self.head.with_body(self.body.finish())?;
+        head.defer::<Off>(body, Off, false, state)
     }
 
-    pub(crate) fn try_finish(
+    pub(in crate::manifold) fn try_defer(
         self,
-    ) -> Result<(hold::Charge, hold::Charge, Option<evidence::Copy>), conn::Error> {
-        let Self { body, head } = self;
-        let (body, linked) = match body.try_finish() {
-            Ok(body) => body,
-            Err(error) => {
-                head.discard();
-                return Err(conn::Error::Handoff(error));
-            }
-        };
-        let (charge, copied) = commit_with(head, body)?;
-        Ok((charge, linked, copied))
+        state: response::State,
+    ) -> Result<Pending<'d, On>, conn::Error> {
+        let ((body, linked), head) = self.head.with_body(self.body.try_finish())?;
+        let copied = matches!(&body, handoff::Ready::Copied(_));
+        head.defer::<On>(body, linked, copied, state)
     }
 
     /// Ends the request borrow before an owning request body can be moved into
@@ -267,34 +344,14 @@ impl<'a, 'req, 'd: 'req, P: rules::Policy, I: stage::Body<'req, 'd>>
     where
         I::Deferred: stage::Deferred<'d>,
     {
-        let Self { body, head } = self;
-        let body = match body.try_detach() {
-            Ok(body) => body,
-            Err(error) => {
-                head.discard();
-                return Err(conn::Error::Handoff(error));
-            }
-        };
+        let (body, head) = self.head.with_body(self.body.try_detach())?;
         Ok(Detached { body, head })
     }
 
     /// Commits the complete response in one bounded-queue transaction.
     pub fn finish(self) -> Result<hold::Charge, conn::Error> {
-        let Self { body, head } = self;
-        let body = match body.finish() {
-            Ok(body) => body,
-            Err(error) => {
-                head.discard();
-                return Err(conn::Error::Handoff(error));
-            }
-        };
-        commit(head, body)
-    }
-}
-
-impl<'a, 'd, P: rules::Policy, M: Mode, D> Detached<'a, 'd, P, M, D> {
-    pub(crate) const fn body_bytes(&self) -> usize {
-        self.head.bytes
+        let (body, head) = self.head.with_body(self.body.finish())?;
+        head.complete(body)?.commit()
     }
 }
 
@@ -302,7 +359,21 @@ impl<'a, 'd, P: rules::Policy, D: stage::Deferred<'d>> Detached<'a, 'd, P, Off, 
     pub fn finish_with(self, request: D::Owner) -> Result<hold::Charge, conn::Error> {
         let Self { body, head } = self;
         let body = body.finish(request);
-        commit(head, body)
+        head.complete(body)?.commit()
+    }
+
+    pub(in crate::manifold) fn defer_with(
+        self,
+        request: D::Owner,
+        outcome: life::Outcome,
+    ) -> Result<Pending<'d, Off>, conn::Error> {
+        let Self { body, head } = self;
+        head.defer::<Off>(
+            body.finish(request),
+            Off,
+            false,
+            response::State::Complete(outcome),
+        )
     }
 }
 
@@ -313,8 +384,20 @@ impl<'a, 'd, P: rules::Policy, D: stage::Deferred<'d>> Detached<'a, 'd, P, On, D
     ) -> Result<(hold::Charge, hold::Charge, Option<evidence::Copy>), conn::Error> {
         let Self { body, head } = self;
         let (body, linked) = body.finish(request);
-        let (charge, copied) = commit_with(head, body)?;
+        let (body, copied) = body.into_copy();
+        let charge = head.complete(body)?.commit()?;
         Ok((charge, linked, copied))
+    }
+
+    pub(in crate::manifold) fn defer_with(
+        self,
+        request: D::Owner,
+        outcome: life::Outcome,
+    ) -> Result<Pending<'d, On>, conn::Error> {
+        let Self { body, head } = self;
+        let (body, linked) = body.finish(request);
+        let copied = matches!(&body, handoff::Ready::Copied(_));
+        head.defer::<On>(body, linked, copied, response::State::Complete(outcome))
     }
 }
 
@@ -397,6 +480,34 @@ impl<'a, 'req, 'd: 'req, P: rules::Policy, I: stage::Body<'req, 'd>> decode::Enc
     }
 }
 
+impl<'a, 'req, 'd: 'req, P: rules::Policy, I: stage::Body<'req, 'd>> decode::Streaming<'req, 'd>
+    for Encoder<'a, 'req, 'd, P, (), I>
+{
+    fn split_stream<S>(output: Self::Stream<S>) -> (Self::Prepared, Option<S>) {
+        output
+    }
+}
+
+impl<'a, 'req, 'd: 'req, P: rules::Policy, Q: scope::Source, I: stage::Body<'req, 'd>>
+    dispatch::Sink<'d> for Encoder<'a, 'req, 'd, P, Q, I>
+{
+    type Stream<S> = (Self::Output, Option<S>);
+
+    fn stream<H, S>(
+        self,
+        status: Code,
+        headers: H,
+        stream: S,
+    ) -> Result<Self::Stream<S>, Self::Error>
+    where
+        H: headers::Source,
+    {
+        let omit = self.omit(status)?;
+        let prepared = self.empty(status, headers)?;
+        Ok((prepared, if omit { None } else { Some(stream) }))
+    }
+}
+
 impl<'a, 'req, 'd, P: rules::Policy, Q: scope::Source, I> decode::Cancel
     for Encoder<'a, 'req, 'd, P, Q, I>
 {
@@ -415,16 +526,10 @@ impl<'a, 'req, 'd: 'req, 'id, P: rules::Policy, I: stage::Body<'req, 'd>> decode
     fn resolve_head<O: Into<scope::Owner<'id, Shared>>, Q: proof::Proof>(
         self,
         head: request::Head<O, Q>,
-    ) -> (Self::Output, handoff::Head<request::Head<O, Q>>) {
-        let (body, head) = self
-            .body
-            .resolve_head(head, |head| head.into_owner().into());
-        (
-            Prepared {
-                body,
-                head: self.head,
-            },
-            head,
-        )
+    ) -> Self::Output {
+        Prepared {
+            body: self.body.resolve_head(head.into_owner()),
+            head: self.head,
+        }
     }
 }

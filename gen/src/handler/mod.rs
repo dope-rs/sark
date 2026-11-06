@@ -209,7 +209,8 @@ impl Handler {
         generics
             .lifetimes
             .retain(|lifetime| lifetime.ident.unraw() != "req" && lifetime.ident.unraw() != "d");
-        generics.include(Lifetimes::new(&state).named());
+        let state_lives = Lifetimes::new(&state).named();
+        generics.include(state_lives.iter().cloned());
         generics.reserve().visit_signature(&fun.sig);
         generics.reserve().visit_type(&output);
         generics.reserve().visit_type(req);
@@ -337,21 +338,15 @@ impl Handler {
             },
         };
         let spec = response.build(paths, &name, req, max.as_ref(), skips, h1);
-        let view = quote::quote!(
-            <<#name as #ns_core::route::Spec>::Request as #ns_core::route::Project>::View
-        );
         let (outer, inner) = match mode {
             Mode::Native => {
-                let req_out = life.response(&out_req.ident.to_string(), &out_d.ident.to_string());
-                let req_ty = request.then(|| quote::quote!(#view<#inv_req, #inv_d>,));
-                let st_ty = state_at.map(|_| quote::quote!(&#borrow #state,));
-                let args = quote::quote!((#req_ty #st_ty));
-                let output = life.response(&inv_req.ident.to_string(), &inv_d.ident.to_string());
-                let request_arg = request.then(|| quote::quote!(#call.0,));
-                let state_arg = state_at.map(|_| quote::quote!(#call.1,));
+                let req_out = life.response(&out_req, Some(&out_d), &state_lives);
+                let output = life.response(&inv_req, Some(&inv_d), &state_lives);
+                let request_arg = request.then(|| quote::quote!(#v_input.0,));
+                let state_arg = state_at.map(|_| quote::quote!(#v_input.1,));
                 let projected = quote::quote!(
                     <Self::Request as #ns_core::route::Project>::from_parts(
-                        #call.0, #call.2, #call.3, #call.1,
+                        #v_input.0, #v_input.2, #v_input.3, #v_input.1,
                     )
                 );
                 let projected = if request {
@@ -360,14 +355,6 @@ impl Handler {
                     quote::quote!({ #projected; })
                 };
                 let outer = quote::quote! {
-                    impl<#inv_req, #inv_d, #borrow, #( #lts, )* #( #params, )* #state_ty>
-                        #call::Invoke<#inv_req, #inv_d, #borrow, #state> for #args
-                    where #( #bounds, )* #inv_d: #inv_req, #inv_req: #borrow, #state: #borrow
-                    {
-                        type Output = #output;
-                        #[inline(always)]
-                        fn invoke(self) -> Self::Output { #call(self) }
-                    }
                     impl #impl_lts #ns_core::manifold::Route<#state> for #name
                     where #( #bounds, )*
                     {
@@ -376,41 +363,25 @@ impl Handler {
                         where #out_d: #out_req;
                         #[inline(always)]
                         fn invoke<#inv_req, #inv_d, #borrow>(
-                            #call: #ns_core::manifold::Args<
+                            #v_input: #ns_core::manifold::Args<
                                 '_, #inv_req, #inv_d, #borrow, Self::Request, #state,
                             >,
                         ) -> Self::Response<#inv_req, #inv_d>
                         where #inv_req: #borrow, #inv_d: #inv_req
                         {
-                            let #call = (#projected, #call.4);
-                            #ns_http::payload::response::dispatch::IntoOutput::into_output(
-                                #call::Invoke::<#inv_req, #inv_d, #borrow, #state>::invoke((#request_arg #state_arg)),
+                            let #v_input = (#projected, #v_input.4);
+                            <#output as #ns_http::payload::response::dispatch::IntoOutput<#inv_req, #inv_d>>::into_output(
+                                #call((#request_arg #state_arg)),
                             )
                         }
                     }
                 };
-                let inner = quote::quote! {
-                    pub(super) trait Invoke<'req, 'd, 'state, State>: Sized {
-                        type Output;
-                        fn invoke(self) -> Self::Output;
-                    }
-                };
-                (outer, inner)
+                (outer, TokenStream::new())
             }
             Mode::Task => {
-                let req_ty = quote::quote!(
-                    #ns_core::manifold::task::request::Input<'d, #name>,
-                );
-                let st_ty = state_at.map(|_| quote::quote!(&#inv_req #state,));
-                let tm_ty = matches!(input.timer, Timer::Present).then(|| {
-                    quote::quote!(
-                        #ns_fiber::driver::schedule::clock::timer::Timer<'d>,
-                    )
-                });
-                let args = quote::quote!((#req_ty #st_ty #tm_ty));
-                let state_arg = state_at.map(|_| quote::quote!(#call.1,));
+                let state_arg = state_at.map(|_| quote::quote!(#v_input.1,));
                 let timer_arg =
-                    matches!(input.timer, Timer::Present).then(|| quote::quote!(#call.2,));
+                    matches!(input.timer, Timer::Present).then(|| quote::quote!(#v_input.2,));
                 let outer = quote::quote! {
                     impl<#( #task_lts, )* 'd, #( #params, )* #state_ty>
                         #ns_core::route::Task<'d, #state> for #name
@@ -424,7 +395,7 @@ impl Handler {
                     {
                         #[inline(always)]
                         fn invoke_task<#inv_req>(
-                            #call: (
+                            #v_input: (
                                 #ns_core::manifold::task::request::Input<'d, Self>,
                                 &#inv_req #state,
                                 #ns_fiber::driver::schedule::clock::timer::Timer<'d>,
@@ -434,23 +405,14 @@ impl Handler {
                         > + #inv_req
                         where 'd: #inv_req
                         {
-                            #call::Invoke::<#inv_req, 'd, #state>::invoke((#call.0, #state_arg #timer_arg))
-                        }
-                    }
-                    impl<#inv_req, #( #task_lts, )* 'd, #( #params, )* #state_ty>
-                        #call::Invoke<#inv_req, 'd, #state> for #args
-                    where #( #bounds, )* 'd: #inv_req, #state: #inv_req
-                    {
-                        #[inline(always)]
-                        fn invoke(self) -> impl #ns_fiber::Fiber<
-                            'd, Output = #ns_core::manifold::task::response::Output<'d, #name, #state>,
-                        > + #inv_req {
-                            #call(self)
+                            #call((#v_input.0, #state_arg #timer_arg))
                         }
                     }
                 };
                 let extra_types = &types[usize::from(request)..];
-                fun.sig.inputs = syn::parse_quote!(#call: (#req_ty #( #extra_types, )*));
+                fun.sig.inputs = syn::parse_quote!(
+                    #call: (#ns_core::manifold::task::request::Input<'d, #name>, #( #extra_types, )*)
+                );
                 if matches!(input.state, State::Generic(_)) {
                     fun.sig.generics.params.push(syn::parse_quote!(__SarkState));
                 }
@@ -520,13 +482,6 @@ impl Handler {
                     #ns_core::manifold::task::response::Output<'d, #name, State>,
                 >);
                 let inner = quote::quote! {
-                    pub(super) trait Invoke<'req, 'd, State>: Sized + 'req
-                    where #name: #ns_core::route::Task<'d, State>
-                    {
-                        fn invoke(self) -> impl #ns_fiber::Fiber<
-                            'd, Output = #ns_core::manifold::task::response::Output<'d, #name, State>,
-                        > + 'req where 'd: 'req;
-                    }
                     #[inline(always)]
                     pub(super) fn start<'d, State>(
                         #v_input: #ns_core::manifold::task::request::Input<'d, #name>,
@@ -591,62 +546,30 @@ impl Handler {
             }
             Mode::Duplex => {
                 let session = life.session(state_lt, &env.ident.to_string());
-                let args = quote::quote!((#view<#inv_req, #inv_d>, &#env #state));
                 let outer = quote::quote! {
                     impl<#env, #( #lts: #env, )* #( #params, )*>
-                        #call::Environment<#env, #state> for ()
+                        #ns_core::duplex::Route<#env, #state> for #name
                     where #( #bounds, )* #state: #env, #session: #env
                     {
                         type Session = #session;
-                        type Arguments<#inv_req, #inv_d> = #args
-                        where #inv_d: #inv_req + #env, Self::Session: #ns_core::duplex::Session<#inv_d>;
-                    }
-                    impl<#inv_req, #inv_d, #env, #( #lts: #env, )* #( #params, )*>
-                        #call::Invoke<#inv_req, #inv_d, #env, #state> for #args
-                    where #( #bounds, )* #state: #env, #session: #env,
-                        #inv_d: #inv_req + #env, #session: #ns_core::duplex::Session<#inv_d>
-                    {
-                        type Output = #session;
                         #[inline(always)]
-                        fn invoke(self) -> Self::Output { #call(self) }
-                    }
-                };
-                let inner = quote::quote! {
-                    #inner_vis trait Invoke<'req, 'd, 'state, State>: Sized {
-                        type Output;
-                        fn invoke(self) -> Self::Output;
-                    }
-                    #inner_vis trait Environment<'state, State: 'state> {
-                        type Session: 'state;
-                        type Arguments<'req, 'd>:
-                            Invoke<'req, 'd, 'state, State, Output = Self::Session>
-                            + ::core::convert::From<(#view<'req, 'd>, &'state State)>
-                        where 'd: 'req + 'state, Self::Session: #ns_core::duplex::Session<'d>;
-                    }
-                    impl<'state, State: 'state> #ns_core::duplex::Route<'state, State> for #name
-                    where (): Environment<'state, State>
-                    {
-                        type Session = <() as Environment<'state, State>>::Session;
-                        #[inline(always)]
-                        fn open<'req, 'd>(
-                            #v_params: <Self::Request as #ns_core::route::Project>::Params<'req>,
-                            #v_req: &#ns_core::request::View<'req, 'd, <Self::Request as #ns_core::route::Schema>::Frame>,
-                            #v_heads: <Self::Request as #ns_core::route::Project>::Headers<'req>,
-                            #v_body: <Self::Request as #ns_core::route::Project>::ParsedBody<'req, 'd>,
-                            #v_state: &'state State,
+                        fn open<#inv_req, #inv_d>(
+                            #v_params: <Self::Request as #ns_core::route::Project>::Params<#inv_req>,
+                            #v_req: &#ns_core::request::View<#inv_req, #inv_d, <Self::Request as #ns_core::route::Schema>::Frame>,
+                            #v_heads: <Self::Request as #ns_core::route::Project>::Headers<#inv_req>,
+                            #v_body: <Self::Request as #ns_core::route::Project>::ParsedBody<#inv_req, #inv_d>,
+                            #v_state: &#env #state,
                         ) -> Self::Session
-                        where 'd: 'req + 'state, Self::Session: #ns_core::duplex::Session<'d>
+                        where #inv_d: #inv_req + #env, Self::Session: #ns_core::duplex::Session<#inv_d>
                         {
                             let #v_rqst = <Self::Request as #ns_core::route::Project>::from_parts(
                                 #v_params, #v_heads, #v_body, #v_req,
                             );
-                            Invoke::invoke(
-                                <() as Environment<'state, State>>::Arguments::from((#v_rqst, #v_state)),
-                            )
+                            #call((#v_rqst, #v_state))
                         }
                     }
                 };
-                (outer, inner)
+                (outer, TokenStream::new())
             }
         };
         let schema_import = schema_import.into_iter();

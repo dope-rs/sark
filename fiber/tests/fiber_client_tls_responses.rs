@@ -1,9 +1,7 @@
 use dope::core::driver::life::recovery;
 pub mod common;
 
-use std::{
-    cell::Cell, convert, net::TcpListener, num::NonZero, sync::mpsc, thread, time::Duration,
-};
+use std::{cell::Cell, convert, net::TcpListener, time::Duration};
 
 use common::client::recover;
 use common::{
@@ -21,7 +19,10 @@ use common::{
 };
 use dope::core::io::Reclaimed;
 use dope_fiber::BlockOn as _;
-use dope_test::harness::server::Pair;
+use dope_test::harness::{
+    scenario::run::{Entry, Task as _},
+    server::Pair,
+};
 use dope_tls::tls::endpoint;
 use sark_client::protocol::response::Event;
 use sark_fiber::{
@@ -223,26 +224,23 @@ fn reuses_connection() {
     for lanes in 3..=5 {
         let listener = (TcpListener::bind("127.0.0.1:0")).expect("bind raw TLS server");
         let addr = (listener.local_addr()).expect("raw TLS server address");
-        let (release, hold) = mpsc::channel();
-        let server = thread::spawn(move || {
+        let server = Entry(move || {
             Server { listener }.try_run(
                 tls::Keys::new(&tls::SEED)
                     .server()
                     .expect("TLS server config"),
-                [hold],
-                |mut peer, hold| {
+                [()],
+                |mut peer, ()| {
                     peer.try_ready()?;
                     for path in MARKETS_PATHS {
                         peer.try_request("GET", path)?;
-                        for chunk in NonZero::new(BODY_LEN).expect("large body").response() {
-                            peer.try_write(&chunk)?;
-                        }
+                        try_response(&mut peer)?;
                     }
-                    hold.recv().expect("release persistent TLS peer");
-                    Ok(())
+                    peer.try_closed()
                 },
             )
         });
+        let ((), served) = server.with(|| {
         Plan::new(
             addr,
             config::Config::try_new("test.local").expect("HTTP host allocation").timeout(Duration::from_secs(5)).inflight(1),
@@ -272,12 +270,8 @@ recovery::Policy::new(|event| assert!(matches!(event, Reclaimed::Shutdown), "une
 |result| result.expect("client execution"),
 )
         .expect("run multi-lane TLS client topology");
-        (release.send(()))
-            .as_ref()
-            .expect("release persistent TLS peer");
-        (server.join())
-            .expect("raw TLS server thread")
-            .expect("TLS server execution");
+        }).expect("raw TLS server thread");
+        served.expect("TLS server execution");
     }
 }
 
@@ -285,23 +279,22 @@ recovery::Policy::new(|event| assert!(matches!(event, Reclaimed::Shutdown), "une
 fn keeps_pipeline_order() {
     let listener = (TcpListener::bind("127.0.0.1:0")).expect("bind raw TLS server");
     let addr = (listener.local_addr()).expect("raw TLS server address");
-    let (release, hold) = mpsc::channel();
-    let server = thread::spawn(move || {
+    let server = Entry(move || {
         Server { listener }.try_run(
             tls::Keys::new(&tls::SEED)
                 .server()
                 .expect("TLS server config"),
-            [hold],
-            |mut peer, hold| {
+            [()],
+            |mut peer, ()| {
                 peer.try_ready()?;
                 peer.try_request("HEAD", "/head")?;
                 peer.try_request("GET", "/get")?;
                 peer.try_write(PIPELINED_RESPONSES)?;
-                hold.recv().expect("release persistent TLS peer");
-                Ok(())
+                peer.try_closed()
             },
         )
     });
+    let ((), served) = server.with(|| {
     Plan::new(
         addr,
         config::Config::try_new("test.local").expect("HTTP host allocation").timeout(Duration::from_secs(5))
@@ -353,10 +346,6 @@ recovery::Policy::new(|event| assert!(matches!(event, Reclaimed::Shutdown), "une
 |result| result.expect("client execution"),
 )
     .expect("run pipelined TLS client topology");
-    (release.send(()))
-        .as_ref()
-        .expect("release persistent TLS peer");
-    (server.join())
-        .expect("raw TLS server thread")
-        .expect("TLS server execution");
+    }).expect("raw TLS server thread");
+    served.expect("TLS server execution");
 }

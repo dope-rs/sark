@@ -172,16 +172,19 @@ pub(super) fn build<'source, 'spec>(
         &context.plan.entries,
         context.plan.duplex.connect(),
     );
+    let core = crate::macros::tokens::local("core");
     let decode = decode::Decode::build(
         paths,
         context.plan.spec,
         &dispatch.methods,
         &head,
         &context.plan.entries,
+        quote::quote!(self.#core),
     );
     let tasks = tasks::Tasks::build(paths, &context);
     let neutral = task::Task::new(paths, &context, &decode.prepared.state)
         .build(paths, &context, &dispatch, &head, &decode, &tasks);
+    let duplex = plan.duplex.definitions(paths, h1.is_some());
     match h1 {
         Some(h1) => {
             use h1::types::Types;
@@ -189,6 +192,7 @@ pub(super) fn build<'source, 'spec>(
             let h1 = Types::build(paths, &context, h1, &dispatch);
             (
                 quote::quote! {
+                    #duplex
                     #neutral
                     #h1
                 },
@@ -196,6 +200,10 @@ pub(super) fn build<'source, 'spec>(
                 dispatch.shape,
             )
         }
-        None => (neutral, decode.contract, dispatch.shape),
+        None => (
+            quote::quote!(#duplex #neutral),
+            decode.contract,
+            dispatch.shape,
+        ),
     }
 }

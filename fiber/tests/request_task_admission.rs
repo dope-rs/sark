@@ -11,16 +11,18 @@ use dope::core::{
     BranchError,
     driver::{
         life::recovery::Policy,
-        retained,
         route::{Epoch, indices::SlotIndex},
-        schedule,
     },
 };
 use dope_fiber::{
     abi::Task,
     context::Context,
     task::storage::{
-        fixed::{self, quota, schedule::Pool, staged, tree},
+        fixed::{
+            self, quota,
+            schedule::{self, Pool},
+            tree,
+        },
         scope,
     },
 };
@@ -180,29 +182,32 @@ fn discard_keeps_pipeline() {
 
 #[test]
 fn first_poll_drops_request() {
+    type Tasks<'d, F> = tree::Leaf<Pool<'d, F, 1, Domain, ()>>;
     let mut reports = Vec::new();
     Driver::new(settings::Config::default()).with_scope(
         |scope| {
-            scope.with_driver(|context, mut control| {
-                let core = context.driver_ref();
-                let timer = core.timer();
-                let binding = Binding::new(timer, owner::Capacity::new(NonZero::<u32>::MIN));
-                let ids = Seq::new(binding.sequence());
-                let calls = Cell::new(0);
-                DROPS.set(0);
-                assert!(Head::empty_task(ids.try_next().expect("header drop identity")).is_none());
-                assert_eq!(DROPS.get(), 0);
-                let target = core
-                    .ready()
-                    .make_slot(
-                        core.targets::<KeyTag<0>>()
-                            .bind(SlotIndex::ZERO, Epoch::INITIAL)
-                            .dispatch(),
-                    )
-                    .expect("ready slot");
-                let owner = retained::raw::Owner::from_driver(core);
-                let mut driver = retained::Context::new(context, owner);
-                for wire in [empty::HEAD, empty::BODY, empty::CHUNKED] {
+            let (_, mut driver, mut control) = scope.split();
+            let core = driver.driver_ref();
+            let timer = core.timer();
+            let binding = Binding::new(timer, owner::Capacity::new(NonZero::<u32>::MIN));
+            let ids = Seq::new(binding.sequence());
+            let calls = Cell::new(0);
+            DROPS.set(0);
+            assert!(Head::empty_task(ids.try_next().expect("header drop identity")).is_none());
+            assert_eq!(DROPS.get(), 0);
+            let target = core
+                .ready()
+                .make_slot(
+                    core.targets::<KeyTag<0>>()
+                        .bind(SlotIndex::ZERO, Epoch::INITIAL)
+                        .dispatch(),
+                )
+                .expect("ready slot");
+            let routes: Tasks<'_, _> = tree::Build::try_build().expect("fixed route storage");
+            let mut tasks = pin!(schedule::Plane::bounded(routes, quota::Limit::new(1)));
+            // Retain earlier outputs while the next request reuses the only task slot.
+            let completed = scope::Scope::with(tasks.as_mut(), |mut tasks| {
+                [empty::HEAD, empty::BODY, empty::CHUNKED].map(|wire| {
                     calls.set(0);
                     DROPS.set(0);
                     for accept in [false, true] {
@@ -237,68 +242,76 @@ fn first_poll_drops_request() {
                         true,
                     )
                     .expect("tracked request");
-                    let mut task = pin!(Task::new(Tracked::invoke_task((
-                        input.expect("admitted input"),
-                        &calls,
-                        timer,
-                    ))));
+                    let _ = tasks
+                        .as_mut()
+                        .route::<tree::Here>()
+                        .try_admit((), target.target().into())
+                        .expect("fixed quota released before output")((
+                        Tracked::invoke_task((input.expect("admitted input"), &calls, timer)),
+                        (),
+                    ));
                     assert_eq!(calls.get(), 0);
                     assert_eq!(DROPS.get(), 0);
                     let turn = control.begin();
-                    let output = turn.turn().app().share::<{ schedule::LIMIT }, _>(|share| {
-                        Context::with_target(
-                            target.target(),
-                            share.work(),
-                            driver.reborrow(),
-                            |context| context.poll(task.as_mut()),
-                        )
-                    });
+                    let schedule::result::Selection::Ready(selected) =
+                        tasks.as_mut().select(turn.turn().app())
+                    else {
+                        panic!("fixed task ready");
+                    };
+                    let schedule::result::Outcome::Complete { output, .. } =
+                        selected.only().drive(&mut driver)
+                    else {
+                        panic!("fixed task complete");
+                    };
+                    assert_eq!(calls.get(), 1);
+                    assert_eq!(DROPS.get(), 1);
+                    output
+                })
+            });
+            for output in completed {
+                assert!(matches!(
+                    output.into_parts().1,
+                    Outcome::Response(reply) if reply.status == Code::OK
+                ));
+            }
+            let mut body = vec![b' '; body::DEFAULT_BUILD_STEP_BUDGET.get()];
+            body.extend_from_slice(br#"{"value":"ok"}"#);
+            let mut wire = format!(
+                "POST / HTTP/1.1\r\nHost: empty\r\nContent-Length: {}\r\n\r\n",
+                body.len(),
+            )
+            .into_bytes();
+            wire.extend_from_slice(&body);
+            let (input, _, _) = Carrier::<Built>::try_dispatch(
+                ids.try_next().expect("yielding request identity"),
+                &wire,
+                true,
+            )
+            .expect("yielding request");
+            let input = input.expect("admitted buffered request");
+            assert!(matches!(input, Input::Buffered(_)));
+            calls.set(0);
+            let mut task = pin!(Task::new(Built::invoke_task((input, &calls, timer))));
+            for ready in [false, true] {
+                let turn = control.begin();
+                let output = turn.turn().app().share::<1, _>(|share| {
+                    Context::with_target(
+                        target.target(),
+                        share.work(),
+                        driver.reborrow(),
+                        |context| context.poll(task.as_mut()),
+                    )
+                });
+                if ready {
                     assert!(matches!(
                         output.map(|output| output.into_parts().1),
                         Poll::Ready(Outcome::Response(reply)) if reply.status == Code::OK
                     ));
-                    assert_eq!(calls.get(), 1);
-                    assert_eq!(DROPS.get(), 1);
+                } else {
+                    assert!(output.is_pending());
                 }
-                let mut body = vec![b' '; body::DEFAULT_BUILD_STEP_BUDGET.get()];
-                body.extend_from_slice(br#"{"value":"ok"}"#);
-                let mut wire = format!(
-                    "POST / HTTP/1.1\r\nHost: empty\r\nContent-Length: {}\r\n\r\n",
-                    body.len(),
-                )
-                .into_bytes();
-                wire.extend_from_slice(&body);
-                let (input, _, _) = Carrier::<Built>::try_dispatch(
-                    ids.try_next().expect("yielding request identity"),
-                    &wire,
-                    true,
-                )
-                .expect("yielding request");
-                let input = input.expect("admitted buffered request");
-                assert!(matches!(input, Input::Buffered(_)));
-                calls.set(0);
-                let mut task = pin!(Task::new(Built::invoke_task((input, &calls, timer))));
-                for ready in [false, true] {
-                    let turn = control.begin();
-                    let output = turn.turn().app().share::<1, _>(|share| {
-                        Context::with_target(
-                            target.target(),
-                            share.work(),
-                            driver.reborrow(),
-                            |context| context.poll(task.as_mut()),
-                        )
-                    });
-                    if ready {
-                        assert!(matches!(
-                            output.map(|output| output.into_parts().1),
-                            Poll::Ready(Outcome::Response(reply)) if reply.status == Code::OK
-                        ));
-                    } else {
-                        assert!(output.is_pending());
-                    }
-                    assert_eq!(calls.get(), usize::from(ready));
-                }
-            });
+                assert_eq!(calls.get(), usize::from(ready));
+            }
         },
         Policy::new(|event| reports.push(event), recover),
         |result| {
@@ -319,8 +332,8 @@ fn routes_share_quota() {
     scope::Brand::with(|brand| {
         let (brand, plan) = <Cold as Initial>::tasks::<
             tree::Branch<
-                tree::Leaf<staged::Slab<'_, Yield, 1, Domain, Heap>>,
-                tree::Leaf<staged::Slab<'_, Yield, 1, Domain, Heap>>,
+                tree::Leaf<fixed::Slab<'_, Yield, 1, Domain, Heap>>,
+                tree::Leaf<fixed::Slab<'_, Yield, 1, Domain, Heap>>,
             >,
             tree::Leaf<Pool<'_, Yield, 1, Domain, ()>>,
         >(quota::Limit::new(1), brand);

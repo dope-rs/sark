@@ -23,13 +23,8 @@ impl<'d> Record<'d> {
         boundary: Boundary,
     ) -> Self {
         Self {
-            write: output::Write::single(target, prefix, boundary),
+            write: output::Write::new(target, prefix, None, boundary),
         }
-    }
-
-    pub(in crate::conn::io::write) fn finish(mut self) -> Self {
-        self.write = self.write.finish();
-        self
     }
 
     pub(in crate::conn::io::write) const fn get(&self) -> &output::Write<'d> {
@@ -53,17 +48,7 @@ impl<'d> Record<'d> {
     }
 
     pub(in crate::conn) fn retained(&self) -> hold::Charge {
-        let prefix = self.write.prefix.retention();
-        let body = self
-            .write
-            .payload
-            .as_ref()
-            .map_or(hold::Charge::default(), output::WritePayload::retention);
-        hold::Charge {
-            logical_bytes: prefix.logical_bytes + body.logical_bytes,
-            resident_bytes: prefix.resident_bytes + body.resident_bytes,
-            owners: prefix.owners + body.owners,
-        }
+        output::retention(&self.write.prefix, self.write.payload.as_ref())
     }
 
     pub(in crate::conn::io::write) fn demand(&self) -> Result<send::Demand, send::Overflow> {

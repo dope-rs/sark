@@ -18,6 +18,8 @@ use sark_http::{
     request::{self, span},
 };
 
+use super::Admission;
+
 pub enum Error<R: route::Schema> {
     Name {
         offset: usize,
@@ -46,6 +48,7 @@ pub enum Error<R: route::Schema> {
         cause: head::Error,
     },
     Header(R::Error),
+    Admission(crate::wire::Failure),
     Frame {
         slot: R::Header,
         cause: field::Error,
@@ -66,8 +69,9 @@ pub(super) enum Step<R: route::Schema> {
 }
 
 /// Applies one field whose syntax and absolute spans the native cursor admitted.
-pub(super) fn apply<R: route::Schema>(
+pub(super) fn apply<R: route::Schema, A: Admission>(
     headers: &mut R::RawHeaders,
+    admission: &mut A,
     fields: &mut Fields,
     flags: &mut head::Flags,
     coding: Coding,
@@ -104,6 +108,11 @@ pub(super) fn apply<R: route::Schema>(
     if let Some(slot) = slot {
         R::Header::set(headers, slot, &SliceValue::from(entry)).map_err(Error::Header)?;
     }
+    if A::FIELDS {
+        admission
+            .field(entry.name(), entry.value(), entry.value_span())
+            .map_err(Error::Admission)?;
+    }
     Ok(())
 }
 
@@ -113,8 +122,21 @@ struct Bounds {
     end: usize,
 }
 
-pub(super) struct Scan<'a, R: route::Schema> {
+impl Bounds {
+    fn trimmed(mut self, input: &[u8]) -> Self {
+        while self.start < self.end && matches!(input.get(self.start), Some(b' ' | b'\t')) {
+            self.start += 1;
+        }
+        while self.end > self.start && matches!(input.get(self.end - 1), Some(b' ' | b'\t')) {
+            self.end -= 1;
+        }
+        self
+    }
+}
+
+pub(super) struct Scan<'a, R: route::Schema, A = ()> {
     pub(super) headers: &'a mut R::RawHeaders,
+    pub(super) admission: &'a mut A,
     pub(super) input: &'a [u8],
     pub(super) rest: &'a [u8],
     pub(super) start: usize,
@@ -124,7 +146,28 @@ pub(super) struct Scan<'a, R: route::Schema> {
     pub(super) version: Version,
 }
 
-impl<'a, R: route::Schema> Scan<'a, R> {
+impl<'a, R: route::Schema, A: Admission> Scan<'a, R, A> {
+    fn observe(&mut self, colon: usize, bounds: Bounds) -> Result<(), Step<R>> {
+        if A::FIELDS {
+            let bounds = bounds.trimmed(self.rest);
+            let name = self.try_prefix(colon)?;
+            let span = self
+                .try_span(&bounds)
+                .map_err(|cause| Step::Bad(Error::Span(request::Error::Span(cause))))?;
+            let value = span.get(self.input).ok_or_else(|| {
+                Step::Bad(Error::Point {
+                    base: span.start(),
+                    relative: span.len(),
+                    available: self.input.len(),
+                })
+            })?;
+            self.admission
+                .field(name, value, span)
+                .map_err(|error| Step::Bad(Error::Admission(error)))?;
+        }
+        Ok(())
+    }
+
     fn value(&self, colon: usize) -> Result<Bounds, Step<R>> {
         let limit = head::MAX_HEADER_LINE_BYTES;
         let capped = self.capped();
@@ -245,7 +288,13 @@ impl<'a, R: route::Schema> Scan<'a, R> {
             None => self.value(name_end),
         };
         match bounds {
-            Ok(bounds) => Step::Complete(bounds.tail),
+            Ok(bounds) => {
+                let tail = bounds.tail;
+                match self.observe(name_end, bounds) {
+                    Ok(()) => Step::Complete(tail),
+                    Err(step) => step,
+                }
+            }
             Err(step) => step,
         }
     }
@@ -253,20 +302,7 @@ impl<'a, R: route::Schema> Scan<'a, R> {
     fn user_bounds(&mut self, colon: usize) -> Result<Bounds, Step<R>> {
         match headers::Known::from_name(self.try_prefix(colon)?) {
             Some(known) => self.scan_known(known, colon),
-            None => {
-                let Bounds {
-                    tail,
-                    mut start,
-                    mut end,
-                } = self.value(colon)?;
-                while start < tail && matches!(self.rest.get(start), Some(b' ' | b'\t')) {
-                    start += 1;
-                }
-                while end > start && matches!(self.rest.get(end - 1), Some(b' ' | b'\t')) {
-                    end -= 1;
-                }
-                Ok(Bounds { tail, start, end })
-            }
+            None => Ok(self.value(colon)?.trimmed(self.rest)),
         }
     }
 
@@ -326,7 +362,7 @@ impl<'a, R: route::Schema> Scan<'a, R> {
     }
 }
 
-impl<R> Prefix<R::Header> for Scan<'_, R>
+impl<R, A: Admission> Prefix<R::Header> for Scan<'_, R, A>
 where
     R: route::Schema,
 {
@@ -341,8 +377,12 @@ where
             Ok(bounds) => bounds,
             Err(step) => return step,
         };
-        match self.set(slot, &bounds) {
-            Ok(()) => Step::Complete(bounds.tail),
+        let tail = bounds.tail;
+        match self
+            .set(slot, &bounds)
+            .and_then(|()| self.observe(colon, bounds))
+        {
+            Ok(()) => Step::Complete(tail),
             Err(step) => step,
         }
     }

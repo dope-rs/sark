@@ -187,6 +187,7 @@ where
             let state::State {
                 active_streams: active,
                 stream_history: past,
+                lifecycle: life,
                 ..
             } = &mut *state;
             let ingress::Ingress {
@@ -209,6 +210,7 @@ where
                             blocks.finish_drop::<C, A>(input, range.clone(), total)?;
                             Ok(store::Action::Reset(
                                 error,
+                                life.keeps_events(),
                                 (key, events::Reset::new(slot, None)),
                             ))
                         },
@@ -227,7 +229,14 @@ where
                 } => {
                     let ready = blocks.resume::<C, A, E>(input, events, range, total)?;
                     let result = active.visit(past, stream, ready, |key, record, ready| {
-                        complete::<R, _, _, _>(key, record, ready, boundary, section)
+                        complete::<R, _, _, _>(
+                            key,
+                            record,
+                            ready,
+                            boundary,
+                            section,
+                            life.keeps_events(),
+                        )
                     })?;
                     match result {
                         Ok(Outcome::Done) => Ok(()),

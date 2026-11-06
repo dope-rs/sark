@@ -1,10 +1,7 @@
 use o3::buffer::bytes::scope;
 use sark_http::{
     field,
-    owner::{
-        evidence,
-        handoff::{self, stage},
-    },
+    owner::handoff::{self, stage},
     payload::{
         compress::{self, Compression},
         response::{bounded, exact, status::Code},
@@ -21,17 +18,25 @@ use crate::wire::output::sink::{
 
 pub(super) struct Gzip<'a, H>(pub(super) &'a H);
 
+const ENTRIES: [field::Entry<'_>; 2] = [
+    field::Entry::new(
+        field::literal!(field::Lower::try_bytes(b"content-encoding")),
+        field::literal!(field::Value::try_bytes(b"gzip")),
+    ),
+    field::Entry::new(
+        field::literal!(field::Lower::try_bytes(b"vary")),
+        field::literal!(field::Value::try_bytes(b"Accept-Encoding")),
+    ),
+];
+pub(super) const FIELDS: field::Group<'_> = field::literal!(field::Group::try_new(
+    &ENTRIES,
+    b"content-encoding: gzip\r\nvary: Accept-Encoding\r\n",
+));
+
 impl<H: field::Source> field::Source for Gzip<'_, H> {
     fn emit<'field>(&'field self, sink: &mut impl field::Sink<'field>) {
         self.0.emit(sink);
-        sink.field(
-            field::literal!(field::Lower::try_bytes(b"content-encoding")),
-            field::literal!(field::Value::try_bytes(b"gzip")),
-        );
-        sink.field(
-            field::literal!(field::Lower::try_bytes(b"vary")),
-            field::literal!(field::Value::try_bytes(b"Accept-Encoding")),
-        );
+        sink.group(&FIELDS);
     }
 }
 
@@ -65,11 +70,7 @@ pub(super) fn compress_exact<
         plan.encode(body)?;
         let zipped = match gzip.encode(body) {
             compress::Output::Plain => {
-                return Ok(Written::Inline {
-                    written: end,
-                    body_bytes: len,
-                    cause: evidence::Cause::Inline,
-                });
+                return Ok(Written::inline(end, len));
             }
             compress::Output::Compressed(zipped) => zipped,
         };
@@ -125,11 +126,7 @@ pub(super) fn compress_bounded<
             });
         }
         let (written, _) = encoded.finish()?;
-        return Ok(Written::Inline {
-            written,
-            body_bytes: len,
-            cause: evidence::Cause::Inline,
-        });
+        return Ok(Written::inline(written, len));
     }
     let body = plan.into_shared()?;
     let len = body.len();

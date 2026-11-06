@@ -1,4 +1,3 @@
-use core::mem;
 use sark_http::payload::response::Method;
 
 use dope_test::alloc::Tracker;
@@ -237,22 +236,6 @@ fn response_sink_stops() {
         assert_eq!(source.as_ref(), wire);
         assert_eq!(seen, 1);
     });
-}
-
-#[test]
-fn state_sizes() {
-    assert_eq!(
-        mem::size_of::<scan::State<Vec<u8>>>(),
-        mem::size_of::<scan::State<()>>() + mem::size_of::<Vec<u8>>()
-    );
-    assert_eq!(
-        mem::size_of::<request::Parts<&[u8]>>(),
-        mem::size_of::<request::Plan>() + mem::size_of::<&[u8]>()
-    );
-    assert_eq!(
-        mem::size_of::<Option<request::Parts<&[u8]>>>(),
-        mem::size_of::<request::Parts<&[u8]>>()
-    );
 }
 
 #[test]

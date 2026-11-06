@@ -1,4 +1,4 @@
-use std::{cell::Cell, time::Duration};
+use std::{cell::Cell, rc::Rc, time::Duration};
 
 use dope::core::driver::schedule::clock::timer::Timer;
 use dope_fiber::{
@@ -18,6 +18,7 @@ pub struct State {
     pub invalid: Cell<bool>,
     pub sleep: Cell<Option<sleep::Error>>,
     pub layout: Cell<Option<(usize, usize)>>,
+    pub stream: Rc<crate::common::route::body::Trace>,
 }
 
 impl State {

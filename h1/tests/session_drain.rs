@@ -26,7 +26,7 @@ fn http_stays_closed() {
     assert!(matches!(cycle.connection, head::Connection::Close));
     assert!(matches!(
         cycle.state,
-        Ok(pump::Egress::Write { prefix: 0, body: pump::Body::Static(reason) })
+        Ok(pump::Egress::Static { prefix: 0, body: reason })
             if reason.as_slice() == canned::BAD_REQUEST.as_slice()
     ));
     assert_eq!(calls.get(), 1);
@@ -45,7 +45,7 @@ fn switching_stays_closed() {
     assert!(matches!(cycle.connection, head::Connection::Close));
     assert!(matches!(
         cycle.state,
-        Ok(pump::Egress::Write { prefix: 0, body: pump::Body::Static(reason) })
+        Ok(pump::Egress::Static { prefix: 0, body: reason })
             if reason.as_slice() == canned::BAD_REQUEST.as_slice()
     ));
     assert_eq!(calls.get(), 1);
@@ -73,7 +73,7 @@ fn preserves_cause_once() {
     );
     assert_eq!(handler.reported, [Some(error)]);
     assert!(matches!(cycle.state,
-        Ok(pump::Egress::Write { prefix: 0, body: pump::Body::Static(body) })
+        Ok(pump::Egress::Static { prefix: 0, body })
             if body.as_slice() == canned::BAD_REQUEST.as_slice()
     ));
 }
@@ -105,10 +105,7 @@ fn pump_ingress_allocations() {
         assert_eq!(alloc, 0);
         assert!(matches!(
             cycle.state,
-            Ok(pump::Egress::Write {
-                prefix: 2,
-                body: pump::Body::None
-            })
+            Ok(pump::Egress::Inline { prefix: 2 })
         ));
         assert!(matches!(cycle.connection, head::Connection::KeepAlive));
         assert!(matches!(cycle.tail, pump::Tail::Empty));
@@ -156,10 +153,7 @@ fn rejects_terminal_cursor() {
         assert!(matches!(cycle.connection, head::Connection::KeepAlive));
         assert!(matches!(
             cycle.state,
-            Ok(pump::Egress::Write {
-                prefix: 1,
-                body: pump::Body::None
-            })
+            Ok(pump::Egress::Inline { prefix: 1 })
         ));
         assert!(
             matches!(pump::Drain::progress(&mut conn), pump::Next::Close(body)

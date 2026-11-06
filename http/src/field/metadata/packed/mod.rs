@@ -26,10 +26,10 @@ impl<'a> Iter<'a> {
 }
 
 impl<'a> RangeIter<'a> {
-    pub(in crate::field::metadata) const fn new(current: &'a [u8]) -> Self {
+    pub(in crate::field::metadata) fn new(current: &'a [u8], prefix: usize) -> Self {
         Self {
-            current: Iter::new(current),
-            offset: 0,
+            current: Iter::new(&current[prefix..]),
+            offset: prefix,
         }
     }
 }

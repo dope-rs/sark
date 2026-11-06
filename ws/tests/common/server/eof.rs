@@ -3,7 +3,7 @@ use std::{convert::Infallible, net::SocketAddr, pin::Pin};
 use dope::{
     core::{
         driver::{
-            retained,
+            self,
             route::KeyTag,
             schedule::clock,
             settings::{self, claim, errors},
@@ -125,7 +125,7 @@ impl<'d> handler::Application<'d, KeyTag<0>> for Observed<'_> {
     fn timeout<'e>(
         self: Pin<&mut Self>,
         conn: conn::Ctx<'e, '_, '_, '_, '_, 'd, KeyTag<0>, Self::Wire, Self::Conn, Self::Egress>,
-        driver: &mut retained::Context<'_, '_, 'd>,
+        driver: &mut driver::Context<'_, 'd>,
     ) -> handler::Timeout<'d> {
         handler::Application::timeout(Pin::new(&mut self.get_mut().inner), conn, driver)
     }
@@ -144,7 +144,7 @@ impl<'d> handler::Application<'d, KeyTag<0>> for Observed<'_> {
     fn activate<'e, 'a, 'p, 's, 'w>(
         self: Pin<&mut Self>,
         conn: conn::Ctx<'e, 'a, 'p, 's, 'w, 'd, KeyTag<0>, Self::Wire, Self::Conn, Self::Egress>,
-        driver: &mut retained::Context<'_, '_, 'd>,
+        driver: &mut driver::Context<'_, 'd>,
     ) -> conn::Ctx<'e, 'a, 'p, 's, 'w, 'd, KeyTag<0>, Self::Wire, Self::Conn, Self::Egress>
     where
         'd: 'w,
@@ -156,14 +156,13 @@ impl<'d> handler::Application<'d, KeyTag<0>> for Observed<'_> {
         self: Pin<&mut Self>,
         conn: conn::Ctx<'e, '_, '_, '_, '_, 'd, KeyTag<0>, Self::Wire, Self::Conn, Self::Egress>,
         end: receive::End,
-        driver: &mut retained::Context<'_, '_, 'd>,
-    ) -> handler::Eof {
+        driver: &mut driver::Context<'_, 'd>,
+    ) {
         let this = self.get_mut();
-        let outcome = handler::Application::eof(Pin::new(&mut this.inner), conn, end, driver);
+        handler::Application::eof(Pin::new(&mut this.inner), conn, end, driver);
         if let Some(ended) = this.ended.take() {
             ended();
         }
-        outcome
     }
 }
 
@@ -172,7 +171,7 @@ impl<'d> handler::Borrowed<'d, KeyTag<0>> for Observed<'_> {
         self: Pin<&mut Self>,
         conn: conn::Ctx<'_, '_, '_, '_, '_, 'd, KeyTag<0>, Self::Wire, Self::Conn, Self::Egress>,
         chunk: R,
-        driver: &mut retained::Context<'_, '_, 'd>,
+        driver: &mut driver::Context<'_, 'd>,
     ) -> receive::Outcome {
         let this = self.get_mut();
         let Some(received) = this.received else {
@@ -191,7 +190,7 @@ impl<'d> send::Drive<'d, KeyTag<0>> for Observed<'_> {
     fn send(
         self: Pin<&mut Self>,
         conn: conn::Ctx<'_, '_, '_, '_, '_, 'd, KeyTag<0>, Self::Wire, Self::Conn, Self::Egress>,
-        driver: &mut retained::Context<'_, '_, 'd>,
+        driver: &mut driver::Context<'_, 'd>,
     ) {
         send::Drive::send(Pin::new(&mut self.get_mut().inner), conn, driver);
     }

@@ -4,7 +4,6 @@ pub mod common;
 use std::{
     convert::Infallible,
     net::{SocketAddr, TcpListener},
-    thread,
     time::{Duration, Instant},
 };
 
@@ -22,7 +21,13 @@ use dope_fiber::{
     BlockOn as _,
     reply::{Progress, order::Depth},
 };
-use dope_test::{fibers, harness::GUARD};
+use dope_test::{
+    fibers,
+    harness::{
+        GUARD,
+        scenario::run::{Entry, Task as _},
+    },
+};
 use dope_tls::tls::endpoint;
 use o3::{base::cell::region, depot::capacity};
 use sark_client::{
@@ -43,7 +48,7 @@ fn recycles_failures() {
 
     let listener = (TcpListener::bind("127.0.0.1:0")).expect("bind raw TLS server");
     let addr = (listener.local_addr()).expect("raw TLS server address");
-    let server = thread::spawn(move || {
+    let server = Entry(move || {
         Server { listener }.try_truncate(
             tls::Keys::new(&tls::SEED)
                 .server()
@@ -51,202 +56,206 @@ fn recycles_failures() {
             &PATHS,
         )
     });
-    let plan = (Plan::new(
-        addr,
-        config::Config::try_new("test.local")
-            .expect("HTTP host allocation")
-            .timeout(Duration::from_secs(2)),
-        endpoint::Config::from(
-            tls::Keys::new(&tls::SEED)
-                .client_plan()
-                .expect("TLS client setup"),
-        ),
-        4,
-        4,
-        1,
-    ))
-    .expect("TLS client plan");
-    let result = plan.enter(
-        |mut app| {
-            let client = app.handle;
-            let second = {
-                (app.wait()).as_ref().expect("first TLS connection");
-                let first = (app
-                    .app
-                    .block_on(client.send(Method::POST, PATHS[0], &[]))
-                    .expect("drive first truncated request"))
-                .err()
-                .expect("first truncated request must fail");
-                (app.wait()).as_ref().expect("second TLS connection");
-                let second = (app
-                    .app
-                    .block_on(client.send(Method::POST, PATHS[1], &[]))
-                    .expect("drive second truncated request"))
-                .err()
-                .expect("second truncated request must fail");
-                (app.wait()).as_ref().expect("third TLS connection");
+    let ((), served) = server
+        .with(|| {
+            let plan = (Plan::new(
+                addr,
+                config::Config::try_new("test.local")
+                    .expect("HTTP host allocation")
+                    .timeout(Duration::from_secs(2)),
+                endpoint::Config::from(
+                    tls::Keys::new(&tls::SEED)
+                        .client_plan()
+                        .expect("TLS client setup"),
+                ),
+                4,
+                4,
+                1,
+            ))
+            .expect("TLS client plan");
+            let result = plan.enter(
+                |mut app| {
+                    let client = app.handle;
+                    let second = {
+                        (app.wait()).as_ref().expect("first TLS connection");
+                        let first = (app
+                            .app
+                            .block_on(client.send(Method::POST, PATHS[0], &[]))
+                            .expect("drive first truncated request"))
+                        .err()
+                        .expect("first truncated request must fail");
+                        (app.wait()).as_ref().expect("second TLS connection");
+                        let second = (app
+                            .app
+                            .block_on(client.send(Method::POST, PATHS[1], &[]))
+                            .expect("drive second truncated request"))
+                        .err()
+                        .expect("second truncated request must fail");
+                        (app.wait()).as_ref().expect("third TLS connection");
 
-                let denied = (app
-                    .app
-                    .block_on(client.send(Method::POST, "/must-not-submit", &[]))
-                    .expect("drive request with exhausted report capacity"))
-                .err()
-                .expect("report-capacity rejection must fail");
-                assert!((denied.safety()) == (Safety::BeforeSubmit));
-                assert!(matches!(
-                    denied.cause(),
-                    Error::Capacity(capacity::Error::FailureReport)
-                ));
-                assert!(
-                    matches!(first.cause(), sark_client::Error::Transport(error)
+                        let denied = (app
+                            .app
+                            .block_on(client.send(Method::POST, "/must-not-submit", &[]))
+                            .expect("drive request with exhausted report capacity"))
+                        .err()
+                        .expect("report-capacity rejection must fail");
+                        assert!((denied.safety()) == (Safety::BeforeSubmit));
+                        assert!(matches!(
+                            denied.cause(),
+                            Error::Capacity(capacity::Error::FailureReport)
+                        ));
+                        assert!(
+                            matches!(first.cause(), sark_client::Error::Transport(error)
         if first.safety() == Safety::PossiblyCommitted
             && error.kind() == Kind::Wire
             && matches!(error.detail(),
                 Some(cause) if matches!(cause.causes(), (dope_tls::Error::Io(error), None)
                     if error.kind() == std::io::ErrorKind::UnexpectedEof))),
-                    "unexpected TLS failure"
-                );
-                second
-            };
-            let recycled = (app
-                .app
-                .block_on(client.send(Method::POST, PATHS[2], &[]))
-                .expect("drive request after report release"))
-            .err()
-            .expect("request after report release must fail");
-            for failure in [&second, &recycled] {
-                assert!(
-                    matches!(failure.cause(), sark_client::Error::Transport(error)
+                            "unexpected TLS failure"
+                        );
+                        second
+                    };
+                    let recycled = (app
+                        .app
+                        .block_on(client.send(Method::POST, PATHS[2], &[]))
+                        .expect("drive request after report release"))
+                    .err()
+                    .expect("request after report release must fail");
+                    for failure in [&second, &recycled] {
+                        assert!(
+                            matches!(failure.cause(), sark_client::Error::Transport(error)
         if failure.safety() == Safety::PossiblyCommitted
             && error.kind() == Kind::Wire
             && matches!(error.detail(),
                 Some(cause) if matches!(cause.causes(), (dope_tls::Error::Io(error), None)
                     if error.kind() == std::io::ErrorKind::UnexpectedEof))),
-                    "unexpected TLS failure"
-                );
-            }
-        },
-        recovery::Policy::new(
-            |event| std::assert_matches!(event, Reclaimed::Shutdown),
-            recover,
-        ),
-        |result| result.expect("client execution"),
-    );
-    result.expect("run retained-failure client");
-    (server.join())
-        .expect("raw TLS server thread")
-        .expect("TLS server execution");
+                            "unexpected TLS failure"
+                        );
+                    }
+                },
+                recovery::Policy::new(
+                    |event| std::assert_matches!(event, Reclaimed::Shutdown),
+                    recover,
+                ),
+                |result| result.expect("client execution"),
+            );
+            result.expect("run retained-failure client");
+        })
+        .expect("raw TLS server thread");
+    served.expect("TLS server execution");
 }
 
 #[test]
 fn skips_blocked_report() {
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind TLS server");
     let addr = listener.local_addr().expect("TLS server address");
-    let server = thread::spawn(move || {
+    let server = Entry(move || {
         Server { listener }.try_retained(
             tls::Keys::new(&tls::SEED)
                 .server()
                 .expect("TLS server config"),
         )
     });
-    let plan = Plan::new(
-        addr,
-        config::Config::try_new("test.local")
-            .expect("HTTP host allocation")
-            .timeout(Duration::from_secs(2))
-            .inflight(3)
-            .failures(0),
-        endpoint::Config::from(
-            tls::Keys::new(&tls::SEED)
-                .client_plan()
-                .expect("TLS client setup"),
-        ),
-        4,
-        8,
-        2,
-    )
-    .expect("TLS client plan");
-    plan.enter(
-        |mut app| {
-            let client = app.handle;
-            let [first, failed, second, third, finish] = RETAINED_PATHS;
-            let started = Instant::now();
-            while client.connections() != 2 {
-                assert!(started.elapsed() < GUARD, "two TLS connections");
-                app.app
-                    .block_on(fibers::Yield::new())
-                    .expect("TLS readiness");
-            }
-            let retained = app
-                .app
-                .block_on(client.send(Method::POST, failed, &[]))
-                .expect("failure driver")
-                .err()
-                .expect("retained TLS failure");
-            assert!(matches!(retained.cause(), sark_client::Error::Transport(_)));
-            let started = Instant::now();
-            while client.connections() != 1 {
-                assert!(started.elapsed() < GUARD, "failed connection retired");
-                app.app
-                    .block_on(fibers::Yield::new())
-                    .expect("TLS retirement");
-            }
-            let first = app
-                .app
-                .block_on(client.stream_get(first))
-                .expect("first admission driver")
-                .ok()
-                .expect("first stream");
-            let started = Instant::now();
-            while client.connections() != 2 {
-                assert!(started.elapsed() < GUARD, "replacement TLS connection");
-                app.app
-                    .block_on(fibers::Yield::new())
-                    .expect("TLS replacement");
-            }
-            let second = app
-                .app
-                .block_on(client.stream_get(second))
-                .expect("second admission driver")
-                .ok()
-                .expect("armed lane reused");
-            let third = app
-                .app
-                .block_on(client.stream_get(third))
-                .expect("third admission driver")
-                .ok()
-                .expect("blocked lane skipped");
-            for mut stream in [first, second, third] {
-                let mut status = None;
-                while let Some(event) = app
-                    .app
-                    .block_on(stream.next_event())
-                    .expect("response driver")
-                {
-                    if let response::Event::Head(head) = event.ok().expect("response on armed lane")
-                    {
-                        status = Some(head.status().as_u16());
+    let ((), served) = server
+        .with(|| {
+            let plan = Plan::new(
+                addr,
+                config::Config::try_new("test.local")
+                    .expect("HTTP host allocation")
+                    .timeout(Duration::from_secs(2))
+                    .inflight(3)
+                    .failures(0),
+                endpoint::Config::from(
+                    tls::Keys::new(&tls::SEED)
+                        .client_plan()
+                        .expect("TLS client setup"),
+                ),
+                4,
+                8,
+                2,
+            )
+            .expect("TLS client plan");
+            plan.enter(
+                |mut app| {
+                    let client = app.handle;
+                    let [first, failed, second, third, finish] = RETAINED_PATHS;
+                    let started = Instant::now();
+                    while client.connections() != 2 {
+                        assert!(started.elapsed() < GUARD, "two TLS connections");
+                        app.app
+                            .block_on(fibers::Yield::new())
+                            .expect("TLS readiness");
                     }
-                }
-                assert_eq!(status, Some(200));
-            }
-            app.app
-                .block_on(client.get(finish))
-                .expect("final request driver")
-                .ok()
-                .expect("released report reused");
-        },
-        recovery::Policy::new(
-            |event| std::assert_matches!(event, Reclaimed::Shutdown),
-            recover,
-        ),
-        |result| result.expect("client execution"),
-    )
-    .expect("TLS client execution");
-    server
-        .join()
-        .expect("TLS server thread")
-        .expect("TLS server execution");
+                    let retained = app
+                        .app
+                        .block_on(client.send(Method::POST, failed, &[]))
+                        .expect("failure driver")
+                        .err()
+                        .expect("retained TLS failure");
+                    assert!(matches!(retained.cause(), sark_client::Error::Transport(_)));
+                    let started = Instant::now();
+                    while client.connections() != 1 {
+                        assert!(started.elapsed() < GUARD, "failed connection retired");
+                        app.app
+                            .block_on(fibers::Yield::new())
+                            .expect("TLS retirement");
+                    }
+                    let first = app
+                        .app
+                        .block_on(client.stream_get(first))
+                        .expect("first admission driver")
+                        .ok()
+                        .expect("first stream");
+                    let started = Instant::now();
+                    while client.connections() != 2 {
+                        assert!(started.elapsed() < GUARD, "replacement TLS connection");
+                        app.app
+                            .block_on(fibers::Yield::new())
+                            .expect("TLS replacement");
+                    }
+                    let second = app
+                        .app
+                        .block_on(client.stream_get(second))
+                        .expect("second admission driver")
+                        .ok()
+                        .expect("armed lane reused");
+                    let third = app
+                        .app
+                        .block_on(client.stream_get(third))
+                        .expect("third admission driver")
+                        .ok()
+                        .expect("blocked lane skipped");
+                    for mut stream in [first, second, third] {
+                        let mut status = None;
+                        while let Some(event) = app
+                            .app
+                            .block_on(stream.next_event())
+                            .expect("response driver")
+                        {
+                            if let response::Event::Head(head) =
+                                event.ok().expect("response on armed lane")
+                            {
+                                status = Some(head.status().as_u16());
+                            }
+                        }
+                        assert_eq!(status, Some(200));
+                    }
+                    app.app
+                        .block_on(client.get(finish))
+                        .expect("final request driver")
+                        .ok()
+                        .expect("released report reused");
+                },
+                recovery::Policy::new(
+                    |event| std::assert_matches!(event, Reclaimed::Shutdown),
+                    recover,
+                ),
+                |result| result.expect("client execution"),
+            )
+            .expect("TLS client execution");
+        })
+        .expect("TLS server thread");
+    served.expect("TLS server execution");
 }
 
 #[test]

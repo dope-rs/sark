@@ -2,10 +2,6 @@ use o3::depot::array::Index;
 
 use crate::{conn, conn::output, qpack};
 
-mod batch;
-
-pub(super) use batch::Batch;
-
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) enum WriteClass {
     Regular,
@@ -13,11 +9,32 @@ pub(crate) enum WriteClass {
 }
 
 impl WriteClass {
-    pub(super) const fn lane(self) -> Index<2> {
+    pub(in crate::conn) const fn lane(self) -> Index<2> {
         match self {
             Self::Regular => Index::at::<0>(),
             Self::Critical => Index::at::<1>(),
         }
+    }
+
+    pub(in crate::conn) fn try_add(
+        self,
+        left: output::WriteCharge,
+        right: output::WriteCharge,
+    ) -> Result<output::WriteCharge, conn::Error> {
+        left.try_add(right).map_err(|error| match (self, error) {
+            (Self::Regular, output::Overflow::Wire { left, right }) => {
+                conn::Error::BatchRegularWire { left, right }
+            }
+            (Self::Regular, output::Overflow::Resident { left, right }) => {
+                conn::Error::BatchRegularResident { left, right }
+            }
+            (Self::Critical, output::Overflow::Wire { left, right }) => {
+                conn::Error::BatchCriticalWire { left, right }
+            }
+            (Self::Critical, output::Overflow::Resident { left, right }) => {
+                conn::Error::BatchCriticalResident { left, right }
+            }
+        })
     }
 }
 
@@ -59,8 +76,7 @@ impl<'a> Allowance<'a> {
     }
 
     pub(super) fn commit(mut self, growth: qpack::Growth) {
-        let unused = self.room.saturating_sub(growth.bytes());
-        self.change.retained.wire_bytes = self.change.retained.wire_bytes.saturating_sub(unused);
+        self.change.retained.wire_bytes -= self.room - growth.bytes();
         self.change.commit();
     }
 }
@@ -99,6 +115,48 @@ impl WriteBudget {
                 super::regular_limit(resident, Self::MAX_CRITICAL_RESERVE),
             ),
         }
+    }
+
+    /// Refused owners remain outside the queued-write budget. Both dimensions
+    /// must fit independently before a later admission can make progress.
+    pub(in crate::conn) fn check_pending(
+        &self,
+        charge: output::WriteCharge,
+        class: WriteClass,
+    ) -> Result<(), conn::Error> {
+        let limit = match class {
+            WriteClass::Regular => self.regular_limit,
+            WriteClass::Critical => self.limit,
+        };
+        if charge.wire_bytes > limit.wire_bytes {
+            return Err(match class {
+                WriteClass::Regular => conn::Error::BudgetRegularWire {
+                    retained: 0,
+                    additional: charge.wire_bytes,
+                    limit: limit.wire_bytes,
+                },
+                WriteClass::Critical => conn::Error::BudgetWire {
+                    retained: 0,
+                    additional: charge.wire_bytes,
+                    limit: limit.wire_bytes,
+                },
+            });
+        }
+        if charge.resident_bytes > limit.resident_bytes {
+            return Err(match class {
+                WriteClass::Regular => conn::Error::BudgetRegularResident {
+                    retained: 0,
+                    additional: charge.resident_bytes,
+                    limit: limit.resident_bytes,
+                },
+                WriteClass::Critical => conn::Error::BudgetResident {
+                    retained: 0,
+                    additional: charge.resident_bytes,
+                    limit: limit.resident_bytes,
+                },
+            });
+        }
+        Ok(())
     }
 
     pub(super) fn try_reserve(
@@ -260,9 +318,7 @@ impl WriteBudget {
     }
 
     pub(super) fn wire_left(&self) -> usize {
-        self.limit
-            .wire_bytes
-            .saturating_sub(self.retained.wire_bytes)
+        self.limit.wire_bytes - self.retained.wire_bytes
     }
 }
 

@@ -19,7 +19,7 @@ use crate::{
     frame, manifold,
     manifold::{
         owners, requests,
-        server::{self, deadline::state::State, rotation},
+        server::{self, deadline::state::State, failure, rotation, session::finish},
     },
 };
 
@@ -41,7 +41,7 @@ enum Done {
 }
 
 pub(in crate::manifold::server) fn drive<'d, A, L, E, const ID: u8, O, R, const RECONCILE: bool>(
-    state: &mut server::Session<'d, A, L, E>,
+    state: &mut server::Session<'d, A, L, E, O::Retention>,
     sink: &mut O,
     quic: &mut scope::Access<'_, ID, R, RECONCILE, resident::Shared<'d>>,
     handle: id::Handle<id::Driver<'d>, ID>,
@@ -51,7 +51,8 @@ where
     A: app::Runtime<'d>,
     L: rotation::Policy<'d>,
     E: State<'d>,
-    O: life::Mode<id::Handle<id::Driver<'d>, ID>, Id>,
+    O: life::Mode<id::Handle<id::Driver<'d>, ID>, Id>
+        + failure::Sink<id::Handle<id::Driver<'d>, ID>>,
     O::Retention: owners::Handoff,
     R: stream::Retain<'d>,
 {
@@ -72,7 +73,12 @@ where
                 match commit {
                     Ok(charge) => {
                         *work.response = duplex::Response::Sent;
-                        owners::Commit::new(0, charge, Default::default()).observe(sink, flow);
+                        sink.observe(life::Event::ResponseCommitted {
+                            exchange: flow,
+                            body_bytes: 0,
+                            charge,
+                            linked: Default::default(),
+                        });
                     }
                     Err(error) if h3.h3().queues.is_pressure(&error) => {
                         return duplex::Next::Blocked(Done::Flush);
@@ -83,39 +89,20 @@ where
                 }
             }
 
-            let (step, feed) = work.input.transact(|emit| {
-                let (payload, end, _) = emit.into_parts();
-                match payload {
-                    admit::Payload::Present { output, permit } => {
-                        let boundary = match end {
-                            machine::End::Open => Boundary::More,
-                            machine::End::FinishOutput | machine::End::FinishSession => {
-                                Boundary::End
-                            }
-                        };
-                        let write = h3.h3_mut().reply().send(target, output, boundary);
-                        match write {
-                            Ok(charge) => {
-                                Projection::new(sink).apply(owner::Effect::new(
-                                    flow,
-                                    charge,
-                                    owner::Change::StagingAcquired(cause::Acquire::StreamChunk),
-                                ));
-                                permit.commit(())
-                            }
-                            Err((error, rest)) => {
-                                if h3.h3().queues.is_pressure(&error) {
-                                    permit.pending(rest, ())
-                                } else {
-                                    permit.returned(error, rest)
+            let (step, feed) = work
+                .input
+                .transact(|emit| {
+                    let (payload, end, _) = emit.into_parts();
+                    match payload {
+                        admit::Payload::Present { output, permit } => {
+                            let boundary = match end {
+                                machine::End::Open => Boundary::More,
+                                machine::End::FinishOutput | machine::End::FinishSession => {
+                                    Boundary::End
                                 }
-                            }
-                        }
-                    }
-                    admit::Payload::Vacant(permit) => match end {
-                        machine::End::Open => permit.commit(()),
-                        machine::End::FinishOutput | machine::End::FinishSession => {
-                            match h3.h3_mut().reply().finish(target) {
+                            };
+                            let write = h3.h3_mut().reply().send(target, output, boundary);
+                            match write {
                                 Ok(charge) => {
                                     Projection::new(sink).apply(owner::Effect::new(
                                         flow,
@@ -124,15 +111,39 @@ where
                                     ));
                                     permit.commit(())
                                 }
-                                Err(error) if h3.h3().queues.is_pressure(&error) => {
-                                    permit.blocked(())
+                                Err((error, rest)) => {
+                                    if h3.h3().queues.is_pressure(&error) {
+                                        permit.pending(rest, ())
+                                    } else {
+                                        permit.returned(error, rest)
+                                    }
                                 }
-                                Err(error) => permit.reject(error),
                             }
                         }
-                    },
-                }
-            });
+                        admit::Payload::Vacant(permit) => match end {
+                            machine::End::Open => permit.commit(()),
+                            machine::End::FinishOutput | machine::End::FinishSession => {
+                                match h3.h3_mut().reply().finish(target) {
+                                    Ok(charge) => {
+                                        Projection::new(sink).apply(owner::Effect::new(
+                                            flow,
+                                            charge,
+                                            owner::Change::StagingAcquired(
+                                                cause::Acquire::StreamChunk,
+                                            ),
+                                        ));
+                                        permit.commit(())
+                                    }
+                                    Err(error) if h3.h3().queues.is_pressure(&error) => {
+                                        permit.blocked(())
+                                    }
+                                    Err(error) => permit.reject(error),
+                                }
+                            }
+                        },
+                    }
+                })
+                .into_parts();
             let resume = match (&step, &feed) {
                 (
                     machine::Transaction::Pending { .. }
@@ -146,7 +157,7 @@ where
                     machine::Transaction::Idle
                     | machine::Transaction::Committed { .. }
                     | machine::Transaction::Rejected(_)
-                    | machine::Transaction::Violation(machine::Violation::OutputAfterFinish)
+                    | machine::Transaction::Violation(_)
                     | machine::Transaction::Pending { .. },
                     input::Feed::Idle | input::Feed::Consumed(_),
                 ) => Resume::Idle,
@@ -205,15 +216,22 @@ where
     let (id, finish) = match done {
         Done::Idle | Done::Closed => return super::Drive::Progress,
         Done::Flush => {
-            if let Err(error) = state.flush_h3(sink, quic, handle) {
-                manifold::close_connection_scoped(quic, error.code());
-            }
+            state.flush_h3(sink, quic, handle);
             return super::Drive::Progress;
         }
-        Done::Reject { id, error } => (id, Err(error.error_code())),
+        Done::Reject { id, error } => {
+            sink.failure(failure::Event::Response {
+                conn: handle,
+                stream: id.stream_id(),
+                error: &error,
+            });
+            (id, Err(error.error_code()))
+        }
         Done::Violation { id, error } => {
             let code = match error {
-                machine::Violation::OutputAfterFinish => frame::ErrorCode::Internal,
+                machine::Violation::OutputAfterFinish
+                | machine::Violation::PrefixCapacity { .. }
+                | machine::Violation::PrefixPending => frame::ErrorCode::Internal,
             };
             (id, Err(code))
         }
@@ -222,7 +240,7 @@ where
     let stream = id.stream_id();
     let closed = (|| -> Result<(), manifold::Error> {
         state.h3.ingress().reject(quic, stream)?;
-        let resident = state.bind(quic, id.local())?;
+        let resident = state.h3.bind(quic, id.local())?;
         if finish.is_ok() && quic.streams().try_recv_eof(resident)? {
             return Ok(());
         }
@@ -242,25 +260,16 @@ where
     } else {
         life::Outcome::Rejected
     };
-    let retired = state.finish(
-        quic,
-        id,
-        sink,
-        exchange::Id::new(handle, stream),
-        outcome,
-        now,
-    );
+    let retired = finish::removed(&mut state.h3, now.at(&mut state.deadline), quic, id, false);
+    exchange::Id::new(handle, stream).retire(sink, outcome);
     if let Err(error) = closed {
         manifold::close_connection_scoped(quic, error.code());
     }
     if let Err(error) = retired {
         manifold::close_connection_scoped(quic, error.code());
     }
-    if finish.is_ok()
-        && !quic.view().lifecycle().is_closing()
-        && let Err(error) = state.flush_h3(sink, quic, handle)
-    {
-        manifold::close_connection_scoped(quic, error.code());
+    if finish.is_ok() && !quic.view().lifecycle().is_closing() {
+        state.flush_h3(sink, quic, handle);
     }
     super::Drive::Progress
 }

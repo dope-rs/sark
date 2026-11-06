@@ -8,14 +8,10 @@ use dope::{
         },
         random,
     },
-    manifold::client::{app::request, conn, session::response},
-    net::link::egress::data::{compose, pair},
+    manifold::client::{conn, session::response},
 };
 use io::{Session as _, ingress};
-use o3::{
-    alloc,
-    buffer::{pool, resident},
-};
+use o3::{alloc, buffer::resident};
 use sark_core::manifold::client::domain::Plan as _;
 use sark_h2::{client, conn::Build};
 
@@ -62,22 +58,6 @@ impl<'d, ID: Identity> Active<'d, ID> {
 
     pub(super) fn wake(&self) {
         self.ready.wake();
-    }
-
-    pub(super) fn flush<'scope>(
-        &mut self,
-        prefix: pool::Cursor,
-        requests: &mut request::Requests<
-            '_,
-            '_,
-            '_,
-            'd,
-            compose::Either<pool::Cursor, pair::Source<resident::Shared<'d>>>,
-            ID,
-        >,
-        done: &mut Notify<'scope, '_, '_>,
-    ) -> Result<io::Flush, io::Failure> {
-        self.session.flush(prefix, requests, done)
     }
 
     pub(super) fn has_output(&self) -> bool {

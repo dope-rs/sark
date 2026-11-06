@@ -86,7 +86,7 @@ impl<'d, ID: Identity> Phase<'d, ID> {
         }
     }
 
-    pub(super) fn has_output(&self, conn: conn::Id<'d, ID>) -> bool {
+    pub(in crate::client::manifold) fn has_output(&self, conn: conn::Id<'d, ID>) -> bool {
         if let Self::Active { active, .. } | Self::Retired { active, .. } = self
             && active.connection() == conn
         {
@@ -95,7 +95,7 @@ impl<'d, ID: Identity> Phase<'d, ID> {
         false
     }
 
-    pub(super) fn owner_cap(&self) -> usize {
+    pub(in crate::client::manifold) fn owner_cap(&self) -> usize {
         if let Self::Active { active, .. } = self {
             return active.owner_cap();
         }
@@ -188,7 +188,7 @@ impl<'d, ID: Identity> Phase<'d, ID> {
         }
     }
 
-    pub(super) fn wake(&self, conn: conn::Id<'d, ID>) {
+    pub(in crate::client::manifold) fn signal(&self, conn: conn::Id<'d, ID>) {
         if let Self::Active { active, .. } | Self::Retired { active, .. } = self
             && active.connection() == conn
         {

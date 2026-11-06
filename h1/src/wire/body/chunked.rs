@@ -93,7 +93,18 @@ impl Chunked {
         let Some(suffix) = input.as_slice().get(head..) else {
             return Err(Decode::Framing);
         };
-        self.begin(max, keep, store)?;
+        self.limits = chunk::Limit::with_body(max);
+        self.ranges.clear();
+        let cap = max.min(crate::MAX_CHUNK_PAYLOAD_RANGES);
+        if let Retention::Retained = keep
+            && self.ranges.capacity() < cap
+        {
+            self.ranges
+                .try_reserve_exact(cap)
+                .map_err(Decode::Reserve)?;
+        }
+        store.start(keep, Shape::Segmented);
+        self.progress = Progress::Borrowed;
         self.drive(input, suffix, keep, Flow::Borrowed, store)
     }
 
@@ -113,7 +124,7 @@ impl Chunked {
                 .decoder
                 .scan(suffix, &self.limits)
                 .map_err(Decode::Wire)?;
-            if !scanned.resolve(|| false, || true) {
+            if !scanned.is_complete() {
                 self.progress = Progress::Streamed(keep);
                 return Ok(None);
             }
@@ -214,29 +225,6 @@ impl Chunked {
         }))
     }
 
-    fn begin(
-        &mut self,
-        max: usize,
-        keep: Retention,
-        store: &mut ingress::Ingress<'_>,
-    ) -> Result<(), Decode> {
-        self.decoder.reset();
-        self.limits = chunk::Limit::with_body(max);
-        self.ranges.clear();
-        self.boundary = Boundary::End;
-        let cap = max.min(crate::MAX_CHUNK_PAYLOAD_RANGES);
-        if let Retention::Retained = keep
-            && self.ranges.capacity() < cap
-        {
-            self.ranges
-                .try_reserve_exact(cap)
-                .map_err(Decode::Reserve)?;
-        }
-        store.start(keep, Shape::Segmented);
-        self.progress = Progress::Borrowed;
-        Ok(())
-    }
-
     fn promote(
         &mut self,
         input: crate::Input<'_>,
@@ -247,7 +235,7 @@ impl Chunked {
             let req = input.as_slice();
             let count = self.ranges.len();
             for (index, &(start, end)) in self.ranges.iter().enumerate() {
-                // SAFETY: begin clears ranges before Borrowed drive records
+                // SAFETY: decode clears ranges before Borrowed drive records
                 // Framer fragments from this same immutable input. Only that
                 // drive calls promote before returning; Streamed resume cannot.
                 let part = unsafe { req.get_unchecked(start as usize..end as usize) };

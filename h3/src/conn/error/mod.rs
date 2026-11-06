@@ -39,10 +39,6 @@ pub enum Error {
         pending: u64,
         additional: u64,
     },
-    FeedbackGrowth {
-        before: usize,
-        after: usize,
-    },
     Encode(encoder::Error),
     Request(owned::Error),
     Response(owned::Error),
@@ -123,7 +119,7 @@ pub enum Error {
         expected: usize,
         actual: usize,
     },
-    Output(output::Error),
+    Output(output::Overflow),
     Length(varint::Overflow),
     Reply(replies::Error),
     BatchRegularWire {
@@ -201,10 +197,6 @@ pub enum Error {
         stream_id: u64,
         active: usize,
         capacity: usize,
-    },
-    QpackLength {
-        pending: usize,
-        wire: usize,
     },
     CreditOverflow {
         accumulated: usize,
@@ -412,11 +404,7 @@ impl Error {
             Self::Request(_) | Self::Response(_) => ErrorCode::ExcessiveLoad,
             Self::Handoff(handoff::Error::Retain(_)) | Self::Retain(_) => ErrorCode::ExcessiveLoad,
             Self::Handoff(handoff::Error::Overflow(error)) => Self::overflow(error),
-            Self::Retention(error)
-            | Self::Output(output::Error::Retention(error))
-            | Self::Reply(replies::Error::Output(output::Error::Retention(error))) => {
-                Self::overflow(error)
-            }
+            Self::Retention(error) => Self::overflow(error),
             Self::Size(_)
             | Self::Build(storage::BuildError::Capacity(_) | storage::BuildError::Exhausted(_)) => {
                 ErrorCode::ExcessiveLoad
@@ -441,7 +429,6 @@ impl Error {
             Self::Build(storage::BuildError::Build(_) | storage::BuildError::Length(_))
             | Self::ReceiveRelease { .. }
             | Self::ReceiveCopy { .. }
-            | Self::FeedbackGrowth { .. }
             | Self::BudgetReleaseWire { .. }
             | Self::BudgetReleaseResident { .. }
             | Self::BudgetRegularReleaseWire { .. }
@@ -477,8 +464,8 @@ impl Error {
             ) => ErrorCode::Internal,
             Self::Prefix { .. }
             | Self::PrefixOverflow { .. }
-            | Self::Output(output::Error::Charge(_))
-            | Self::Reply(replies::Error::Output(output::Error::Charge(_)))
+            | Self::Output(_)
+            | Self::Reply(replies::Error::Output(_))
             | Self::BatchRegularWire { .. }
             | Self::BatchRegularResident { .. }
             | Self::BatchCriticalWire { .. }
@@ -492,7 +479,6 @@ impl Error {
             | Self::CreditCapacity { .. }
             | Self::StreamCapacity { .. }
             | Self::StreamAdmission { .. }
-            | Self::QpackLength { .. }
             | Self::CreditOverflow { .. }
             | Self::SectionLength { .. }
             | Self::SectionPrefix { .. } => ErrorCode::ExcessiveLoad,
@@ -517,7 +503,6 @@ impl From<state::Error> for Error {
                 pending,
                 additional: added,
             },
-            state::Error::Growth { before, after } => Self::FeedbackGrowth { before, after },
         }
     }
 }

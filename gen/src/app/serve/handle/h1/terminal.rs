@@ -10,7 +10,7 @@ pub(super) fn routes(
 ) -> TokenStream {
     let f_life = local("lifecycle");
     let [v_cause, v_conn, v_error] = generics.locals(["cause", "conn", "error"]);
-    let [v_obs, v_wait, v_this] = generics.locals(["observer", "pending", "this"]);
+    let [v_wait, v_this] = generics.locals(["pending", "this"]);
     let [v_link, v_exch] = generics.locals(["connection", "exchange"]);
     let g_id = generics.ident("__ID");
     let ns_core = &paths.core;
@@ -24,11 +24,7 @@ pub(super) fn routes(
             #v_cause: &#ns_h1::wire::Failure,
         ) -> #ns_http::payload::fixed::Body<'d> {
             let #v_this = self.project();
-            if let ::core::option::Option::Some(#v_obs) =
-                #ns_core::life::Mode::observer(#v_this.#f_life)
-            {
-                #ns_core::life::Observer::diagnostic(#v_obs, #v_cause);
-            }
+            #ns_core::life::Mode::diagnostic(#v_this.#f_life, #v_cause);
             #v_cause.body()
         }
 

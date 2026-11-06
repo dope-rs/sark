@@ -2,9 +2,13 @@ use std::pin;
 
 use dope::{
     core::driver::{route::Identity, schedule::ready::task::owner},
+    manifold::network::listener::conn::Id,
     net::wire,
 };
-use sark_core::{life, manifold::task::app::Runtime};
+use sark_core::{
+    life,
+    manifold::{server::app as semantic, task::app::Runtime},
+};
 
 use crate::server::{
     runtime::output::flush,
@@ -36,14 +40,15 @@ where
         }
     }
 
-    pub(in crate::server::task::app) fn apply<W, D>(
+    pub(in crate::server::task::app) fn apply<W, D, A>(
         self,
-        conn: &mut Context<'_, '_, '_, '_, '_, 'd, ID, R, W, M, D>,
+        conn: &mut Context<'_, '_, '_, '_, '_, 'd, ID, R, W, M, D, A>,
     ) where
         W: wire::Spec,
         M: Transport<'d, ID>,
         M::Output: flush::Evidence<'d>,
         D: timers::Policy<'d>,
+        A: service::Select<R> + semantic::Application<'d, service::Connection<'d, A>, Id<'d, ID>>,
     {
         let Self {
             mut router,
@@ -53,26 +58,41 @@ where
         let id = conn.id();
         mode.observe(life::Event::SessionClosing(id));
         let state = conn.state_mut();
-        tasks.drain(&mut state.task_index, id, |taken| {
-            let (_, stream, task) = taken.into_parts();
-            Runtime::cancel(router.as_mut(), task);
-            mode.observe(life::Event::TaskCancelled(identify(id, stream)));
-            identify(id, stream).retire(mode, life::Outcome::Cancelled);
-        });
+        let index = &mut state.task_index;
+        if !index.is_empty() {
+            for at in 0..index.capacity() {
+                let Some(stream) = index.key_at(at) else {
+                    continue;
+                };
+                let Some(taken) = tasks.take_stream(index, stream) else {
+                    continue;
+                };
+                let (_, stream, task, unreported) = taken.into_parts();
+                Runtime::cancel(router.as_mut(), task);
+                if unreported {
+                    mode.observe(life::Event::TaskCancelled(identify(id, stream)));
+                }
+                if state.book.responses.entry(stream).is_none() {
+                    identify(id, stream).retire(mode, life::Outcome::Cancelled);
+                }
+            }
+            index.clear();
+        }
         if let Err(cause) = Runtime::try_retire(router.as_ref(), owner::Owner::from(id)) {
             life::Mode::diagnostic(mode, &cause);
         }
         state.turn().close(id, mode);
     }
 
-    pub(in crate::server::task::app) fn audit<W, D>(
+    pub(in crate::server::task::app) fn audit<W, D, A>(
         self,
-        conn: &mut Retired<'_, '_, 'd, ID, R, W, M, D>,
+        conn: &mut Retired<'_, '_, 'd, ID, R, W, M, D, A>,
     ) where
         W: wire::Spec,
         M: Transport<'d, ID>,
         M::Output: flush::Evidence<'d>,
         D: timers::Policy<'d>,
+        A: service::Select<R> + semantic::Application<'d, service::Connection<'d, A>, Id<'d, ID>>,
     {
         let id = conn.id();
         let bytes = conn.response_len();

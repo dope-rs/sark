@@ -261,13 +261,15 @@ fn close_pending_in_order() {
 }
 
 #[test]
-fn reset_uncommitted_owner() {
+fn reset_pending_owner() {
     let mut facts = Vec::new();
+    let mut credit = Credit::default();
     Pair::bind()
         .expect("H2 harness")
         .check(
             |context, listener| {
                 let log = Cell::new(Vec::new());
+                let observed = Cell::new(Credit::default());
                 let mut state = State::try_body().expect("owned guard body");
                 state.guard = Some(GuardProbe::default());
                 let mut limits = CONFIG;
@@ -280,13 +282,16 @@ fn reset_uncommitted_owner() {
                     .try_run(
                         context,
                         listener,
-                        Observed::new(Log(&log, diagnose)),
+                        Observed::new(CreditLog {
+                            log: Log(&log, diagnose),
+                            state: &observed,
+                        }),
                         recover,
                         |result| result.expect("H2 execution"),
                     )
                     .map(|()| {
                         assert!(server.state.body.take().is_none(), "guard consumed owner");
-                        log.into_inner()
+                        (log.into_inner(), observed.into_inner())
                     })
             },
             |address| {
@@ -329,7 +334,7 @@ fn reset_uncommitted_owner() {
                     .expect("fence response");
                 assert_eq!(reply, b"quick");
             },
-            |result| facts = result.expect("H2 setup"),
+            |result| (facts, credit) = result.expect("H2 setup"),
         )
         .expect("observed H2 runtime");
 
@@ -337,18 +342,24 @@ fn reset_uncommitted_owner() {
         .iter()
         .find_map(|&(kind, stream)| (kind == "exchange-opened").then_some(stream))
         .expect("guard exchange");
-    assert!(
-        facts.contains(&("exchange-cancelled", stream)),
-        "the peer reset must remove the prepared response: {facts:?}",
-    );
-    assert!(
-        !facts.contains(&("response-committed", stream)),
-        "reset must precede response admission: {facts:?}",
-    );
-    assert!(
-        !facts.contains(&("response-staging-released", stream)),
-        "an uncommitted response has no acquired staging charge: {facts:?}",
-    );
+    let expected = [
+        "response-committed",
+        "response-staging-released",
+        "exchange-cancelled",
+        "terminal",
+        "exchange-retired",
+    ];
+    let actual = facts
+        .iter()
+        .filter_map(|&(kind, id)| {
+            (id == stream && expected.contains(&kind)).then_some(kind)
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(actual, expected);
+    assert!(credit.audit.expect("final H2 audit").is_zero(
+        audit::Capability::RESPONSE_STAGING_OWNER_BYTES
+            .union(audit::Capability::TRANSPORT_RESPONSE_OWNER_BYTES)
+    ));
 }
 
 #[test]

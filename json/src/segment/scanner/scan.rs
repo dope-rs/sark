@@ -10,7 +10,8 @@ use crate::{
     Error, Nesting,
     input::Taken,
     segment::{
-        Admitted, Atom, Capture, Create, Cursor, Field, Order, State, Transfer, ValueKind,
+        Admitted, Atom, Capture, Create, Cursor, Field, Order, Projection, State, Transfer,
+        ValueKind,
         input::{self, Input},
         is_delimiter, state,
         state::Name,
@@ -153,19 +154,13 @@ impl<'d> Scan<'d> {
         }
         self.state = match state {
             State::Leading => {
-                if self.cursor.take_ws(&self.input) == Taken::Yes {
-                    State::Leading
-                } else {
-                    if self.cursor.take(&self.input, b'{') == Taken::No {
-                        return Err(Error::Invalid);
-                    }
-                    State::NameOrEnd
+                if self.cursor.take(&self.input, b'{') == Taken::No {
+                    return Err(Error::Invalid);
                 }
+                State::NameOrEnd
             }
             State::NameOrEnd => {
-                if self.cursor.take_ws(&self.input) == Taken::Yes {
-                    State::NameOrEnd
-                } else if self.cursor.take(&self.input, b'}') == Taken::Yes {
+                if self.cursor.take(&self.input, b'}') == Taken::Yes {
                     if matches!(self.selection.order, Order::Ordered)
                         && self.selection.next != self.selection.fields.len()
                     {
@@ -188,16 +183,12 @@ impl<'d> Scan<'d> {
                 }
             }
             State::NameStart => {
-                if self.cursor.take_ws(&self.input) == Taken::Yes {
-                    State::NameStart
-                } else {
-                    if self.cursor.take(&self.input, b'"') == Taken::No {
-                        return Err(Error::Invalid);
-                    }
-                    State::Name {
-                        start: self.cursor.absolute,
-                        string: string::Scan::new(self.input.is_admitted()),
-                    }
+                if self.cursor.take(&self.input, b'"') == Taken::No {
+                    return Err(Error::Invalid);
+                }
+                State::Name {
+                    start: self.cursor.absolute,
+                    string: string::Scan::new(self.input.is_admitted()),
                 }
             }
             State::Name { start, mut string } => {
@@ -213,61 +204,55 @@ impl<'d> Scan<'d> {
                 }
             }
             State::Colon { name, escaped } => {
-                if self.cursor.take_ws(&self.input) == Taken::Yes {
-                    State::Colon { name, escaped }
-                } else {
-                    if self.cursor.take(&self.input, b':') == Taken::No {
-                        return Err(Error::Invalid);
-                    }
-                    let field = match self.selection.order {
-                        Order::Unordered => 0,
-                        Order::Ordered => self.selection.next,
-                    };
-                    let cursor = Cursor::at(&self.input, name.start).ok_or(Error::Invalid)?;
-                    State::Select(Name::new(cursor, name.end, escaped, field))
+                if self.cursor.take(&self.input, b':') == Taken::No {
+                    return Err(Error::Invalid);
                 }
+                let field = match self.selection.order {
+                    Order::Unordered => 0,
+                    Order::Ordered => self.selection.next,
+                };
+                let cursor = Cursor::at(&self.input, name.start).ok_or(Error::Invalid)?;
+                State::Select(Name::new(cursor, name.end, escaped, field))
             }
             State::ValueStart {
                 field,
                 projection: mode,
             } => {
-                if self.cursor.take_ws(&self.input) == Taken::Yes {
-                    State::ValueStart {
-                        field,
-                        projection: mode,
-                    }
+                let (byte, advance) = self.cursor.read(&self.input).ok_or(Error::Invalid)?;
+                let field = field.filter(|&index| {
+                    !self
+                        .selection
+                        .values
+                        .get(index)
+                        .is_some_and(Option::is_some)
+                });
+                let mode = if mode == Projection::Frame && byte != b'"' {
+                    Projection::Scalar
                 } else {
-                    let (byte, advance) = self.cursor.read(&self.input).ok_or(Error::Invalid)?;
-                    let field = field.filter(|&index| {
-                        !self
-                            .selection
-                            .values
-                            .get(index)
-                            .is_some_and(Option::is_some)
-                    });
-                    let capture = Capture::new(field, mode, &self.cursor);
-                    match byte {
-                        b'"' => {
-                            self.cursor.advance(advance);
-                            State::String {
-                                capture,
-                                string: string::Scan::new(self.input.is_admitted()),
-                            }
-                        }
-                        b'{' | b'[' => {
-                            self.cursor.advance(advance);
-                            let nesting = if self.input.is_admitted() {
-                                Nesting::admitted()
-                            } else {
-                                Nesting::start(byte)?
-                            };
-                            State::Compound { capture, nesting }
-                        }
-                        _ => State::Atom {
+                    mode
+                };
+                let capture = Capture::new(field, mode, &self.cursor);
+                match byte {
+                    b'"' => {
+                        self.cursor.advance(advance);
+                        State::String {
                             capture,
-                            atom: Atom::new(byte, field.is_some())?,
-                        },
+                            string: string::Scan::new(self.input.is_admitted()),
+                        }
                     }
+                    b'{' | b'[' => {
+                        self.cursor.advance(advance);
+                        let nesting = if self.input.is_admitted() {
+                            Nesting::admitted()
+                        } else {
+                            Nesting::start(byte)?
+                        };
+                        State::Compound { capture, nesting }
+                    }
+                    _ => State::Atom {
+                        capture,
+                        atom: Atom::new(byte, field.is_some())?,
+                    },
                 }
             }
             State::String {
@@ -321,9 +306,7 @@ impl<'d> Scan<'d> {
                 }
             },
             State::Trailing => {
-                if self.cursor.take_ws(&self.input) == Taken::Yes {
-                    State::Trailing
-                } else if self.cursor.absolute == self.input.len() {
+                if self.cursor.absolute == self.input.len() {
                     State::Done
                 } else {
                     return Err(Error::Invalid);

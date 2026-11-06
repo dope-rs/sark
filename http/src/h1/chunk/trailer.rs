@@ -1,6 +1,6 @@
-use core::num::NonZero;
+use core::{num::NonZero, ops::ControlFlow};
 
-use crate::h1::chunk::{Error, Framer, Limit, Run, scan::state, size};
+use crate::h1::chunk::{Error, Framer, Limit, Run, scan::state};
 
 /// The exact trailer phase, with no body or size-line alternatives.
 #[derive(Clone, Copy)]
@@ -24,6 +24,7 @@ pub(in crate::h1) enum Progress {
     Complete {
         wire: usize,
         consumed: NonZero<usize>,
+        trailers: NonZero<u32>,
     },
 }
 
@@ -50,23 +51,24 @@ impl Trailer {
         let mut consumed = None;
         for (offset, &byte) in input.iter().enumerate() {
             let wire = Framer::wire(self.cursor.wire, 1, &self.limits)?;
-            let (state, progress) = self
+            let progress = self
                 .cursor
                 .state
                 .scan(byte, self.cursor.wire, &self.limits)?;
             self.cursor.wire = wire;
-            self.cursor.state = state;
             let next = NonZero::<usize>::MIN.saturating_add(offset);
-            if progress == size::Progress::Complete {
-                return Ok(Run::complete(input, next.get()).consume(|bytes| {
-                    (
+            match progress {
+                ControlFlow::Continue(state) => self.cursor.state = state,
+                ControlFlow::Break(trailers) => {
+                    return Ok((
                         Progress::Complete {
                             wire,
                             consumed: next,
+                            trailers,
                         },
-                        bytes,
-                    )
-                }));
+                        Run::complete(input, next.get()).into_slice(),
+                    ));
+                }
             }
             consumed = Some(next);
         }

@@ -12,35 +12,34 @@ fn retained_event_waits() {
     let mut reports1 = Vec::new();
     Driver::new(settings::Config::default()).with_scope(
         |scope| {
-            scope.with_turn(|_, _, mut sched| {
-                let active = sched.begin();
-                let work = active.turn().app();
-                let calls = Cell::new(0);
-                drain::Events::fair(work, |mut drain| {
-                    assert!(matches!(drain.next_ready::<()>(|| None), Err(drain::Empty)));
-                    assert_eq!(work.remaining(), schedule::LIMIT / 2 - 1);
-                    for expected in 1..schedule::LIMIT / 2 {
-                        let permit = drain.permit().expect("an event turn remains available");
-                        let item = permit.run(|| {
-                            calls.set(calls.get() + 1);
-                            expected
-                        });
-                        assert_eq!(item, expected);
-                    }
-
-                    let deferred = drain.next_ready(|| {
+            let (_, _, mut sched) = scope.split();
+            let active = sched.begin();
+            let work = active.turn().app();
+            let calls = Cell::new(0);
+            drain::Events::fair(work, |mut drain| {
+                assert!(matches!(drain.next_ready::<()>(|| None), Err(drain::Empty)));
+                assert_eq!(work.remaining(), schedule::LIMIT / 2 - 1);
+                for expected in 1..schedule::LIMIT / 2 {
+                    let permit = drain.permit().expect("an event turn remains available");
+                    let item = permit.run(|| {
                         calls.set(calls.get() + 1);
-                        Some(11)
+                        expected
                     });
-                    assert!(matches!(deferred, Ok(None)));
-                    assert_eq!(calls.get(), schedule::LIMIT / 2 - 1);
+                    assert_eq!(item, expected);
+                }
 
-                    let report = drain.finish();
-                    assert!(report.has_drained());
-                    assert!(report.is_exhausted());
+                let deferred = drain.next_ready(|| {
+                    calls.set(calls.get() + 1);
+                    Some(11)
                 });
-                assert_eq!(work.remaining(), schedule::LIMIT / 2);
+                assert!(matches!(deferred, Ok(None)));
+                assert_eq!(calls.get(), schedule::LIMIT / 2 - 1);
+
+                let report = drain.finish();
+                assert!(report.has_drained());
+                assert!(report.is_exhausted());
             });
+            assert_eq!(work.remaining(), schedule::LIMIT / 2);
         },
         recovery::Policy::new(
             |event| reports1.push(event),

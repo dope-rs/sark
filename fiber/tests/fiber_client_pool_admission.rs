@@ -271,6 +271,7 @@ fn burst_socket_per_request() {
             .expect("burst plan");
             let codes = plan
                 .enter(
+                    (),
                     |mut app| {
                         let client = app.handle;
                         app.wait().expect("connector admits its endpoint");
@@ -311,6 +312,7 @@ fn queued_body_yields() {
             pools::Plan::new(server.addr(), Config::new(server.addr().to_string()), 1, 2)
                 .expect("fixed plan")
                 .enter(
+                    (),
                     |mut app| {
                         app.wait().expect("connection");
                         let client = app.handle;

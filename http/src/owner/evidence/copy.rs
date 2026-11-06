@@ -6,3 +6,13 @@ pub struct Copy {
     pub written: usize,
     pub cause: Cause,
 }
+
+impl Copy {
+    pub const fn borrowed(bytes: usize) -> Self {
+        Self {
+            read: bytes,
+            written: bytes,
+            cause: Cause::Borrowed,
+        }
+    }
+}

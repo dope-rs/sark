@@ -2,7 +2,7 @@ use std::{num::NonZero, time};
 
 use dope::{
     core::driver::result::SubmitCause,
-    manifold::client::{close::LocalOrigin, conn::Transmit, port::error::Open},
+    manifold::client::{attempt, close::LocalOrigin, conn::Transmit, port::error::Open},
     net::link::event,
 };
 use dope_fiber::task::time::budget;
@@ -22,7 +22,7 @@ impl Class {
         match error {
             Error::NotConnected => Self::Stale,
             Error::Transport(crate::conn::Error::Park(event::ParkError::Submit(error)))
-            | Error::Connect(connect::Error::Attempt(event::ConnectFault::Transport(
+            | Error::Connect(connect::Error::Attempt(attempt::ConnectFault::Transport(
                 event::ConnectError::Admission(error),
             ))) if error.cause() == SubmitCause::IdentityExhausted => Self::Never,
             Error::Transport(crate::conn::Error::Transmit {
@@ -56,7 +56,9 @@ impl Class {
                 | connect::Error::Mailbox(_)
                 | connect::Error::Reply(_)
                 | connect::Error::Attempt(
-                    event::ConnectFault::Attempt(_) | event::ConnectFault::Cleanup { .. },
+                    attempt::ConnectFault::Attempt(_)
+                    | attempt::ConnectFault::Cleanup { .. }
+                    | attempt::ConnectFault::RuntimeShutdown,
                 ),
             ) => Self::Never,
             Error::Timeout(error) if error.phase() == timeout::Phase::Dispatch => Self::Never,

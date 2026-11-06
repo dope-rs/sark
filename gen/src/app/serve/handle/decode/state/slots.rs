@@ -28,7 +28,6 @@ pub(super) fn define<M>(
                     >,
                     <#route as #ns_core::route::Spec>::Request,
                 >,
-                method: #ns_http::method::Method,
                 content_length: ::core::option::Option<::core::primitive::usize>,
             }
         }

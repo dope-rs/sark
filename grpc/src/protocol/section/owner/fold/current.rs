@@ -13,7 +13,7 @@ use crate::{
     protocol::section::{
         JOINED, Seal,
         owner::{
-            check::{Check, Field},
+            check::Field,
             fold::{Capacity, Failure, Fold, NameLen},
         },
         part::{End, Part},
@@ -49,7 +49,7 @@ struct Current<'a, 'lease> {
     name_len: NameLen,
 }
 
-pub(super) fn field(fold: &mut Fold<'_>, check: &mut Check, limit: usize) -> Result<(), Failure> {
+pub(super) fn field(fold: &mut Fold<'_>, seal: &mut Seal, limit: usize) -> Result<(), Failure> {
     let bytes = fold.lease.as_slice();
     // SAFETY: the sole caller's fields loop admits read < limit == lease.len().
     // Field dispatch preserves that extent until finish truncates the lease.
@@ -70,14 +70,13 @@ pub(super) fn field(fold: &mut Fold<'_>, check: &mut Check, limit: usize) -> Res
         value: start..next,
         name_len,
     };
-    let kind = check
+    let kind = seal
         .field(
             record::Span::from_slice(field.name()),
             record::Span::from_slice(field.value()),
             prefix.indexing(),
         )
         .map_err(Failure::Timeout)?;
-    let seal = &mut check.seal;
     if seal.has_fault() {
         field.fold.read = next;
         return Ok(());

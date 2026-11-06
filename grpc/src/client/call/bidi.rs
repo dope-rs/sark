@@ -150,6 +150,7 @@ where
             stream.response.completion,
             &mut policy,
         );
+        self.state.refill(&mut policy);
     }
 
     fn send_raw(
@@ -220,23 +221,5 @@ where
         done: &mut policies::Notify<'notify, '_, '_>,
     ) -> Result<(), crate::Status> {
         self.state.finish(send.stream, done)
-    }
-
-    pub(in crate::client) fn cancel_send<'notify>(
-        &mut self,
-        send: Send<'scope, P::Key>,
-        done: &mut policies::Notify<'notify, '_, '_>,
-    ) {
-        let _ = self.state.cancel(send.stream, done);
-        self.state.refill(done);
-    }
-
-    pub(in crate::client) fn cancel_bidi<'notify>(
-        &mut self,
-        stream: Stream<'scope, P::Key>,
-        done: &mut policies::Notify<'notify, '_, '_>,
-    ) {
-        self.state
-            .cancel_feed(stream.response.stream, stream.response.completion, done);
     }
 }

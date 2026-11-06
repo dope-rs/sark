@@ -12,11 +12,12 @@ mod frames;
 use frames::Frames;
 mod opening;
 mod reader;
+pub(super) mod session;
 mod sink;
 
 use conn::write;
 use dope::{
-    core::driver::{retained, schedule::clock, settings},
+    core::driver::{self, schedule::clock, settings},
     manifold::{
         app::{env, receive},
         network::listener::{conn, handler, topology::factory},
@@ -28,10 +29,7 @@ use dope::{
     },
 };
 use handler::{failures, retire, send};
-use o3::buffer::{
-    bytes, storage,
-    write::{Sink as _, consume},
-};
+use o3::buffer::{bytes, storage, write::Sink as _};
 pub use reader::Reader;
 pub use sink::Sink;
 use wire::domain;
@@ -117,16 +115,16 @@ impl<'d, ID: Identity, H: Sink> handler::Application<'d, ID> for App<H> {
         self: pin::Pin<&mut Self>,
         mut conn: Ctx<'e, '_, '_, '_, '_, 'd, ID>,
     ) -> receive::Outcome {
-        use conn::deadline::Arm;
+        use conn::deadline::Error;
 
         let now = conn.work().clock().now();
         let error = match conn.deadline().try_ensure(now) {
-            Arm::Armed => return receive::Outcome::Continue,
-            Arm::Disabled => server::Error::OpenTimerDisabled,
-            Arm::Sealed => server::Error::OpenTimerSealed,
-            Arm::Overflow(error) => server::Error::OpenTimerRange {
-                now: error.now.into_raw(),
-                window: error.window,
+            Ok(()) => return receive::Outcome::Continue,
+            Err(Error::Disabled) => server::Error::OpenTimerDisabled,
+            Err(Error::Sealed) => server::Error::OpenTimerSealed,
+            Err(Error::Overflow(error)) => server::Error::OpenTimerRange {
+                now: error.origin(),
+                window: error.duration(),
             },
         };
         self.user.failed(error);
@@ -137,9 +135,9 @@ impl<'d, ID: Identity, H: Sink> handler::Application<'d, ID> for App<H> {
     fn timeout<'e>(
         self: pin::Pin<&mut Self>,
         mut conn: Ctx<'e, '_, '_, '_, '_, 'd, ID>,
-        _: &mut retained::Context<'_, '_, 'd>,
+        _: &mut driver::Context<'_, 'd>,
     ) -> handler::Timeout<'d> {
-        if conn.state().phase == Phase::Handshake {
+        if matches!(conn.state().phase, Phase::Handshake | Phase::Opening) {
             self.user.failed(server::Error::OpenTimeout);
         }
         conn.state_mut().acc.clear();
@@ -158,7 +156,10 @@ impl<'d, ID: Identity, H: Sink> handler::Application<'d, ID> for App<H> {
                 Phase::OpeningRejected | Phase::MessageTooBig | Phase::Rejected(_)
             )
             || (state.eof
-                && matches!(state.phase, Phase::Handshake | Phase::Active)
+                && matches!(
+                    state.phase,
+                    Phase::Handshake | Phase::Opening | Phase::Active
+                )
                 && !state.acc.is_empty())
         {
             CloseGate::Deferred
@@ -171,11 +172,10 @@ impl<'d, ID: Identity, H: Sink> handler::Application<'d, ID> for App<H> {
         self: pin::Pin<&mut Self>,
         mut conn: conn::Ctx<'e, '_, '_, '_, '_, 'd, ID, Self::Wire, Self::Conn, Self::Egress>,
         _: receive::End,
-        driver: &mut retained::Context<'_, '_, 'd>,
-    ) -> handler::Eof {
+        driver: &mut driver::Context<'_, 'd>,
+    ) {
         conn.state_mut().eof = true;
         self.get_mut().pump(&mut conn, driver);
-        handler::Eof::Close
     }
 
     fn deadline(self: pin::Pin<&Self>, _: clock::Clock<'_, 'd>) -> Option<clock::Deadline<'d>> {
@@ -185,7 +185,7 @@ impl<'d, ID: Identity, H: Sink> handler::Application<'d, ID> for App<H> {
     fn activate<'e, 'a, 'p, 's, 'w>(
         self: pin::Pin<&mut Self>,
         mut conn: conn::Ctx<'e, 'a, 'p, 's, 'w, 'd, ID, Self::Wire, Self::Conn, Self::Egress>,
-        driver: &mut retained::Context<'_, '_, 'd>,
+        driver: &mut driver::Context<'_, 'd>,
     ) -> conn::Ctx<'e, 'a, 'p, 's, 'w, 'd, ID, Self::Wire, Self::Conn, Self::Egress>
     where
         'd: 'w,
@@ -200,7 +200,7 @@ impl<'d, ID: Identity, H: Sink> handler::Borrowed<'d, ID> for App<H> {
         self: pin::Pin<&mut Self>,
         conn: conn::Ctx<'_, '_, '_, '_, '_, 'd, ID, Self::Wire, Self::Conn, Self::Egress>,
         chunk: R,
-        driver: &mut retained::Context<'_, '_, 'd>,
+        driver: &mut driver::Context<'_, 'd>,
     ) -> receive::Outcome {
         self.get_mut().chunk(conn, chunk, driver)
     }
@@ -210,7 +210,7 @@ impl<'d, ID: Identity, H: Sink> send::Drive<'d, ID> for App<H> {
     fn send(
         self: pin::Pin<&mut Self>,
         mut conn: conn::Ctx<'_, '_, '_, '_, '_, 'd, ID, Self::Wire, Self::Conn, Self::Egress>,
-        driver: &mut retained::Context<'_, '_, 'd>,
+        driver: &mut driver::Context<'_, 'd>,
     ) {
         self.get_mut().pump(&mut conn, driver);
     }
@@ -231,7 +231,7 @@ impl<H: Sink> App<H> {
         &mut self,
         mut conn: Ctx<'_, '_, '_, '_, '_, 'd, ID>,
         chunk: R,
-        driver: &mut retained::Context<'_, '_, 'd>,
+        driver: &mut driver::Context<'_, 'd>,
     ) -> receive::Outcome {
         use receive::Outcome;
         match conn.state().phase {
@@ -240,7 +240,7 @@ impl<H: Sink> App<H> {
                 self.pump(&mut conn, driver);
                 return Outcome::Continue;
             }
-            Phase::Handshake | Phase::Active => {}
+            Phase::Handshake | Phase::Opening | Phase::Active => {}
         }
         let chunk = chunk.as_ref();
         if conn.state().phase == Phase::Handshake
@@ -250,7 +250,7 @@ impl<H: Sink> App<H> {
             match conn.write().pending() {
                 egress::Pending::Present => {}
                 egress::Pending::Absent => match opening::admit(&self.path, chunk) {
-                    opening::Outcome::NeedMore => {
+                    Ok(None) => {
                         let state = conn.state_mut();
                         if let Err(error) = state.acc.write_slice(chunk) {
                             self.user.failed(server::Error::Allocate(error));
@@ -259,7 +259,7 @@ impl<H: Sink> App<H> {
                         }
                         return Outcome::Continue;
                     }
-                    opening::Outcome::Reject(error) => {
+                    Err(error) => {
                         self.user.failed(error);
                         conn.state_mut().phase = Phase::OpeningRejected;
                         conn.state_mut().acc.clear();
@@ -268,12 +268,8 @@ impl<H: Sink> App<H> {
                             Commit::Deferred => Outcome::Continue,
                         };
                     }
-                    opening::Outcome::Accept {
-                        tail,
-                        accept,
-                        opening,
-                    } => {
-                        conn.state_mut().handshake_complete = true;
+                    Ok(Some((tail, accept, opening))) => {
+                        conn.state_mut().phase = Phase::Opening;
                         match self.try_direct(&mut conn, tail, Some((opening, &accept)), driver) {
                             Commit::Committed => {
                                 conn.deadline().cancel();
@@ -310,22 +306,9 @@ impl<H: Sink> App<H> {
             return Outcome::CloseAfter;
         }
 
-        let buffered = conn.state().acc.len();
-        if let Err(error) = consume::Error::check(chunk.len(), WS_MAX_ACC - buffered) {
-            let state = conn.state_mut();
-            if state.phase == Phase::Handshake {
-                self.user.failed(opening::too_large(buffered + chunk.len()));
-                Self::close(&mut conn);
-                return Outcome::CloseAfter;
-            }
-            state.phase = Phase::MessageTooBig;
-            state.acc.clear();
-            self.user.failed(server::Error::Capacity(error));
-            self.pump(&mut conn, driver);
-            return Outcome::Continue;
-        }
-        if let Err(error) = conn.state_mut().acc.write_slice(chunk) {
-            self.user.failed(server::Error::Allocate(error));
+        if !Frames::new(&self.user, self.limit).append(conn.state_mut(), chunk)
+            && conn.state().phase == Phase::Closed
+        {
             Self::close(&mut conn);
             return Outcome::CloseAfter;
         }
@@ -339,7 +322,7 @@ impl<H: Sink> App<H> {
         conn: &mut Ctx<'_, '_, '_, '_, '_, 'd, ID>,
         chunk: &[u8],
         accept: Option<(server::Opening<'_>, &[u8; 28])>,
-        driver: &mut retained::Context<'_, '_, 'd>,
+        driver: &mut driver::Context<'_, 'd>,
     ) -> Commit {
         let limit = self.limit;
         let user = &self.user;
@@ -372,11 +355,11 @@ impl<H: Sink> App<H> {
     fn try_reject<'d, ID: Identity>(
         &self,
         conn: &mut Ctx<'_, '_, '_, '_, '_, 'd, ID>,
-        driver: &mut retained::Context<'_, '_, 'd>,
+        driver: &mut driver::Context<'_, 'd>,
     ) -> Commit {
         let result = conn.write().try_prefix(driver, |state, buffer| {
             let mut out = server::Response::new(buffer);
-            if let Err(error) = out.put_raw(opening::REJECTION) {
+            if let Err(error) = out.put_raw(server::Response::REJECTION) {
                 self.user.failed(server::Error::Capacity(error));
             }
             state.phase = Phase::Closed;
@@ -388,7 +371,7 @@ impl<H: Sink> App<H> {
     fn pump<'d, ID: Identity>(
         &self,
         conn: &mut Ctx<'_, '_, '_, '_, '_, 'd, ID>,
-        driver: &mut retained::Context<'_, '_, 'd>,
+        driver: &mut driver::Context<'_, 'd>,
     ) {
         if Self::send_pending(conn, driver) != Commit::Committed {
             return;
@@ -397,13 +380,20 @@ impl<H: Sink> App<H> {
             self.try_reject(conn, driver);
             return;
         }
-        let opening = conn.state().phase == Phase::Handshake;
+        let opening = matches!(conn.state().phase, Phase::Handshake | Phase::Opening);
         let result = conn.write().try_prefix(driver, |state, buffer| {
-            let out = Frames::new(&self.user, self.limit).pump(&self.path, state, buffer);
+            let mut out = Output::new(buffer);
+            if state.phase == Phase::Opening
+                && let Err(error) = opening::drive(&self.path, state, &mut out.response, &self.user)
+            {
+                self.user.failed(server::Error::Capacity(error));
+                state.phase = Phase::Closed;
+            }
+            Frames::new(&self.user, self.limit).pump(state, &mut out);
             out.finish(state, &self.user)
         });
         let result = Self::finish(conn, result);
-        if opening && conn.state().phase != Phase::Handshake {
+        if opening && !matches!(conn.state().phase, Phase::Handshake | Phase::Opening) {
             conn.deadline().cancel();
         }
         if result == Commit::Committed {
@@ -442,7 +432,7 @@ impl<H: Sink> App<H> {
 
     fn send_pending<'d, ID: Identity>(
         conn: &mut Ctx<'_, '_, '_, '_, '_, 'd, ID>,
-        driver: &mut retained::Context<'_, '_, 'd>,
+        driver: &mut driver::Context<'_, 'd>,
     ) -> Commit {
         if let Some(load) = conn.state_mut().pending.take() {
             match conn.write().admit(load, driver) {

@@ -195,15 +195,8 @@ pub(super) fn build(
                         scalar::Scalar::Shared | scalar::Scalar::Token => {
                             quote::quote!(#ns_json::segment::Projection::Bytes)
                         }
-                        scalar::Scalar::U64 | scalar::Scalar::Bool => {
+                        _ => {
                             quote::quote!(#ns_json::segment::Projection::Scalar)
-                        }
-                        scalar::Scalar::I64
-                        | scalar::Scalar::F64
-                        | scalar::Scalar::String
-                        | scalar::Scalar::Borrowed
-                        | scalar::Scalar::Bytes => {
-                            quote::quote!(#ns_json::segment::Projection::None)
                         }
                     }
                 };

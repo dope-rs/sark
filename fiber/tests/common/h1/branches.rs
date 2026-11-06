@@ -39,17 +39,22 @@ pub struct Session<'a> {
 }
 
 impl<'d> duplex::Session<'d> for Session<'_> {
-    fn receive(&mut self, _: owned::Segments<'d>) -> duplex::Action<'d> {
-        duplex::Action::close()
+    fn receive(
+        &mut self,
+        _: owned::Segments<'d>,
+        _: &mut [u8],
+        _: &mut Vec<u8>,
+    ) -> (usize, duplex::Action<'d>) {
+        (0, duplex::Action::close())
     }
 
-    fn finish(&mut self) -> duplex::Action<'d> {
-        duplex::Action::end()
+    fn finish(&mut self, _: &mut [u8], _: &mut Vec<u8>) -> (usize, duplex::Action<'d>) {
+        (0, duplex::Action::end())
     }
 
-    fn activate(&mut self) -> duplex::Action<'d> {
+    fn activate(&mut self, _: &mut [u8], _: &mut Vec<u8>) -> (usize, duplex::Action<'d>) {
         self.seen.set(self.bytes.len());
-        duplex::Action::idle()
+        (0, duplex::Action::idle())
     }
 }
 

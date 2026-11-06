@@ -187,10 +187,12 @@ impl<'d, B: ?Sized, ID: Identity, E> phases::Events<'d> for Stream<'_, '_, '_, '
 impl<B: ?Sized, ID: Identity, E> Drop for Stream<'_, '_, '_, '_, '_, B, ID, E> {
     fn drop(&mut self) {
         if matches!(*self.state, State::Active(_)) {
-            use close::{LocalOrigin, Reason};
+            use close::{Directive, LocalOrigin, Reason};
 
-            self.io
-                .close(self.conn, Reason::Local(LocalOrigin::OperationCancelled));
+            self.io.close(
+                self.conn,
+                Directive::reconnect(Reason::Local(LocalOrigin::OperationCancelled)),
+            );
         }
     }
 }

@@ -4,10 +4,7 @@ use conn::scope;
 use dope::core::driver::schedule::clock;
 use dope_quic::{conn, conn::id, stream, wire::stream::Id};
 use o3::buffer::resident;
-use requests::{
-    book::claim,
-    entries::{self, Completion},
-};
+use requests::{book::claim, entries};
 use sark_core::{
     body::{admit, buffered},
     deadline::timeline,
@@ -17,8 +14,11 @@ use sark_core::{
         state,
     },
     duplex,
-    life::{self, Observer as _, exchange},
-    manifold::{stream::Boundary, task::app::Runtime},
+    life::{self, Observer as _},
+    manifold::{
+        stream::Boundary,
+        task::{app::Runtime, response},
+    },
 };
 use sark_http::payload::{
     owned,
@@ -29,7 +29,7 @@ use crate::{
     frame,
     manifold::{
         self, encoder, owners, requests,
-        server::{self, deadline, deadline::state::State, rotation, session::finish},
+        server::{self, deadline, deadline::state::State, failure, rotation, session::finish},
     },
 };
 
@@ -38,38 +38,26 @@ pub(in crate::manifold::server) enum Outcome {
     Done,
     Reject(frame::ErrorCode),
     Close(frame::ErrorCode),
-    Stopped,
-    Removed,
 }
 
-pub(in crate::manifold::server) struct Head<
-    'a,
-    'scope,
-    'd,
-    R,
-    O,
-    E,
-    B,
-    const ID: u8,
-    const RECONCILE: bool,
-> where
+pub(in crate::manifold::server) struct Head<'a, 'd, R, O, E, const ID: u8>
+where
     R: Runtime<'d, Target = server::Handle<'d, ID>>,
     O: life::Mode<id::Handle<id::Driver<'d>, ID>, Id>,
+    O::Retention: owners::Handoff,
     E: State<'d>,
-    B: stream::Recv,
 {
     pub(super) h3: &'a mut manifold::Session<'d, R::Plan>,
     pub(super) deadline: &'a mut E,
     pub(super) app: &'a R,
-    pub(super) effects: owners::Projection<'a, O, id::Handle<id::Driver<'d>, ID>>,
-    pub(super) conn: &'a mut scope::Access<'scope, ID, B, RECONCILE, resident::Shared<'d>>,
-    pub(super) claim: claim::Claim<'a, 'd, R::Prepared, R::Build, R::Task, R::Duplex, Method>,
-    pub(super) boundary: Boundary,
+    pub(super) life: &'a mut O,
+    pub(super) handle: id::Handle<id::Driver<'d>, ID>,
+    pub(super) claim: claim::Claim<'a, 'd, R, O::Retention, Method>,
     pub(super) now: clock::Moment<'d>,
 }
 
 pub(super) fn finish<'d, R, O, L, E, B, const ID: u8, const RECONCILE: bool>(
-    state: &mut server::Session<'d, R, L, E>,
+    state: &mut server::Session<'d, R, L, E, O::Retention>,
     app: &R,
     life: &mut O,
     conn: &mut scope::Access<'_, ID, B, RECONCILE, resident::Shared<'d>>,
@@ -78,7 +66,8 @@ pub(super) fn finish<'d, R, O, L, E, B, const ID: u8, const RECONCILE: bool>(
     now: clock::Moment<'d>,
 ) where
     R: Runtime<'d, Target = server::Handle<'d, ID>>,
-    O: life::Mode<id::Handle<id::Driver<'d>, ID>, Id>,
+    O: life::Mode<id::Handle<id::Driver<'d>, ID>, Id>
+        + failure::Sink<id::Handle<id::Driver<'d>, ID>>,
     O::Retention: owners::Handoff,
     L: rotation::Policy<'d>,
     E: State<'d>,
@@ -96,29 +85,33 @@ pub(super) fn finish<'d, R, O, L, E, B, const ID: u8, const RECONCILE: bool>(
     state.finish_input(app, life, conn, handle, id, now);
 }
 
-impl<'a, 'scope, 'd, R, O, E, B, const ID: u8, const RECONCILE: bool>
-    Head<'a, 'scope, 'd, R, O, E, B, ID, RECONCILE>
+impl<'a, 'd, R, O, E, const ID: u8> Head<'a, 'd, R, O, E, ID>
 where
     R: Runtime<'d, Target = server::Handle<'d, ID>>,
-    O: life::Mode<id::Handle<id::Driver<'d>, ID>, Id>,
+    O: life::Mode<id::Handle<id::Driver<'d>, ID>, Id>
+        + failure::Sink<id::Handle<id::Driver<'d>, ID>>,
     O::Retention: owners::Handoff,
     E: State<'d>,
-    B: stream::Recv,
 {
-    fn guard(self, result: Result<owners::Commit, frame::ErrorCode>) -> Outcome {
-        let id = self.claim.id();
-        let (life, handle) = self.effects.into_parts();
-        let span = exchange::Id::new(handle, id.stream_id());
-        let commit = match result {
-            Ok(commit) => commit,
+    fn guard(
+        self,
+        result: Result<encoder::Pending<'d, O::Retention>, frame::ErrorCode>,
+    ) -> Outcome {
+        let response = match result {
+            Ok(response) => response,
             Err(code) => return Outcome::Reject(code),
         };
-        commit.observe(life, span);
-        self.claim.discard();
-        match self.boundary {
-            Boundary::End => Outcome::Removed,
-            Boundary::More => Outcome::Stopped,
+        if let Err(error) = E::transition(
+            self.deadline,
+            self.claim.id(),
+            timeline::Transition::ResponseReady,
+            self.now,
+        ) {
+            response.discard(self.h3.h3_mut(), self.claim.id());
+            return Outcome::Close(deadline::code(error));
         }
+        self.claim.into_entry().close(response);
+        Outcome::Done
     }
 
     pub(super) fn begin(self, request: <R::Head as request::Head>::Start) -> Outcome {
@@ -128,9 +121,15 @@ where
             self.app,
             || encoder::Encoder::new(self.h3.h3_mut(), id.target(), method),
             |stop| match stop {
-                Ok(wire) => <O::Retention as owners::Handoff>::resolve(wire),
+                Ok(wire) => <O::Retention as owners::Handoff>::defer(
+                    encoder::Initial(wire),
+                    response::State::Complete(life::Outcome::Rejected),
+                )
+                .map_err(|cause| failure::response(self.life, self.handle, id, cause)),
                 Err((error, _)) => Err(match error {
-                    dispatch::Error::Encode(error) => owners::Commit::code(error),
+                    dispatch::Error::Encode(error) => {
+                        failure::response(self.life, self.handle, id, error)
+                    }
                     dispatch::Error::Busy | dispatch::Error::Sequence(_) => {
                         frame::ErrorCode::ExcessiveLoad
                     }
@@ -167,8 +166,7 @@ where
     }
 
     fn reject(self, error: requests::Error) -> Outcome {
-        let (life, _) = self.effects.into_parts();
-        if let Some(observer) = life.observer() {
+        if let Some(observer) = self.life.observer() {
             observer.diagnostic(&error);
         }
         Outcome::Reject(server::request_error_code(error))
@@ -210,20 +208,26 @@ where
         request: request::Admitted<exec::Sync, R::Prepared, admit::Track<admit::Finished>>,
     ) -> Outcome {
         let id = self.claim.id();
-        match self.claim.into_entry().sync(request) {
-            Ok(done) => {
-                finish::accept(
-                    self.h3,
-                    self.now.at(self.deadline),
-                    self.app,
-                    self.effects,
-                    self.conn,
-                    id,
-                    done,
-                );
+        let (entry, done) = match self.claim.into_entry().sync(request) {
+            Ok(done) => done,
+            Err(error) => return Outcome::Reject(server::body_error_code(error.error().error())),
+        };
+        if let Err(error) = E::transition(
+            self.deadline,
+            id,
+            timeline::Transition::ResponseReady,
+            self.now,
+        ) {
+            return Outcome::Close(deadline::code(error));
+        }
+        match finish::accept::<R, O::Retention>(self.h3, self.app, id, done) {
+            Ok(response) => {
+                entry.response(response);
                 Outcome::Done
             }
-            Err(error) => Outcome::Reject(server::body_error_code(error.error().error())),
+            Err(error) => Outcome::Reject(
+                error.unwrap_or_else(|cause| failure::response(self.life, self.handle, id, cause)),
+            ),
         }
     }
 
@@ -237,7 +241,7 @@ where
         }
     }
 
-    fn duplex<K>(self, slot: K, done: Completion) -> Outcome
+    fn duplex<K>(self, slot: K, done: Boundary) -> Outcome
     where
         K: state::Slot<R::Prepared>,
     {
@@ -246,8 +250,7 @@ where
             Ok((peer, ())) => match self.claim.connect(peer, done) {
                 Ok(()) => Outcome::Done,
                 Err(error) => {
-                    let (life, _) = self.effects.into_parts();
-                    if let Some(observer) = life.observer() {
+                    if let Some(observer) = self.life.observer() {
                         observer.diagnostic(&error);
                     }
                     Outcome::Reject(server::request_error_code(error))
@@ -265,15 +268,14 @@ where
     }
 }
 
-impl<'scope, 'd, R, O, E, B, const ID: u8, const RECONCILE: bool>
-    state::Map<R::Prepared, state::Admitted, entries::Receiving<'d>>
-    for Head<'_, 'scope, 'd, R, O, E, B, ID, RECONCILE>
+impl<'d, R, O, E, const ID: u8> state::Map<R::Prepared, state::Admitted, entries::Receiving<'d>>
+    for Head<'_, 'd, R, O, E, ID>
 where
     R: Runtime<'d, Target = server::Handle<'d, ID>>,
-    O: life::Mode<id::Handle<id::Driver<'d>, ID>, Id>,
+    O: life::Mode<id::Handle<id::Driver<'d>, ID>, Id>
+        + failure::Sink<id::Handle<id::Driver<'d>, ID>>,
     O::Retention: owners::Handoff,
     E: State<'d>,
-    B: stream::Recv,
 {
     type Break = Outcome;
     type Retained = Self;
@@ -323,7 +325,7 @@ where
         slot: S,
         _: (),
     ) -> ControlFlow<Self::Break, (Self, S, Infallible)> {
-        ControlFlow::Break(self.duplex(slot, Completion::Open))
+        ControlFlow::Break(self.duplex(slot, Boundary::More))
     }
 
     fn duplex_done<S: state::Slot<R::Prepared>>(
@@ -331,7 +333,7 @@ where
         slot: S,
         _: (),
     ) -> ControlFlow<Self::Break, (Self, S, Infallible)> {
-        ControlFlow::Break(self.duplex(slot, Completion::Finished))
+        ControlFlow::Break(self.duplex(slot, Boundary::End))
     }
 
     fn reject_open<S: state::Slot<R::Prepared>>(

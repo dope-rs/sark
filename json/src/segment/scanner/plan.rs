@@ -4,7 +4,7 @@ use o3::alloc::VecExt as _;
 
 use crate::{
     Error,
-    segment::{Cursor, Document, Projection, Stored, ValueKind, cursor::Replay},
+    segment::{Cursor, Document, Stored, ValueKind, cursor::Replay},
 };
 
 /// Decode plans originate from validated string fields of the same document.
@@ -44,11 +44,11 @@ impl Plan {
                     .and_then(Option::as_mut)
                     .ok_or(Error::Invalid)?;
                 let output = replay.try_finish()?;
-                if replay.is_decoded() {
-                    value.decoded = Some(output);
+                value.stored = if replay.is_decoded() {
+                    Stored::Decoded(output)
                 } else {
-                    value.stored = Stored::Copied(output);
-                }
+                    Stored::Copied(output)
+                };
                 *self = Self::Fields { index: *field + 1 };
                 Ok(Prepare::Pending(NonZero::<usize>::MIN))
             }
@@ -60,13 +60,10 @@ impl Plan {
                         *index += 1;
                         return Ok(Prepare::Pending(NonZero::<usize>::MIN));
                     };
-                    if value.projection == Projection::Frame
+                    if let Stored::Frame(range) = &value.stored
                         && let ValueKind::String { escapes } = value.kind
                         && escapes != 0
                     {
-                        let Stored::Original(range) = &value.stored else {
-                            return Err(Error::Invalid);
-                        };
                         // The captured string includes both quotes and its admitted escape count.
                         let start = range.start + 1;
                         let end = range.end - 1;
@@ -76,8 +73,7 @@ impl Plan {
                         *self = Self::copy(field, cursor, end, output, true);
                         return Ok(Prepare::Pending(NonZero::<usize>::MIN));
                     }
-                    if matches!(value.projection, Projection::Bytes | Projection::Frame)
-                        && let Stored::Original(range) = &value.stored
+                    if let Stored::Bytes(range) | Stored::Frame(range) = &value.stored
                         && scan.input.needs_copy(range)?
                     {
                         let len = range.len();

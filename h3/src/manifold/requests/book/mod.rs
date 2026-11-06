@@ -1,16 +1,16 @@
+use crate::manifold::owners;
 use o3::{
     alloc,
     base::cell::region,
     buffer::{resident, segments},
 };
-use sark_core::{
-    body::{self, credit},
-    decode::request,
-    duplex,
-    life::audit,
-};
+use sark_core::manifold::task::app;
+use sark_core::{body::credit, life::audit};
 
-use crate::manifold::requests::{self, entries, exchange};
+use crate::manifold::{
+    encoder,
+    requests::{self, entries, exchange, task},
+};
 
 mod build;
 pub(in crate::manifold) mod claim;
@@ -20,20 +20,14 @@ mod registry;
 pub(in crate::manifold) mod settings;
 pub(in crate::manifold) mod timers;
 
-pub(in crate::manifold) struct Book<
-    'd,
-    P: request::Prepared,
-    B: body::Build<'d>,
-    T,
-    D: duplex::Session<'d>,
-> {
-    entries: entries::Entries<'d, P, B, T, D>,
+pub(in crate::manifold) struct Book<'d, A: app::Runtime<'d>, M: owners::Handoff> {
+    entries: entries::Entries<'d, A, M>,
     body_credit: credit::raw::Account,
     limits: settings::Limits,
     segments: segments::Pool<resident::Shared<'d>>,
 }
 
-impl<'d, P: request::Prepared, B: body::Build<'d>, T, D: duplex::Session<'d>> Book<'d, P, B, T, D> {
+impl<'d, A: app::Runtime<'d>, M: owners::Handoff> Book<'d, A, M> {
     pub(in crate::manifold) fn try_new(plan: settings::Plan) -> Result<Self, alloc::Error> {
         let (slots, cap, limits) = plan.into_parts();
         let cap = cap.get();
@@ -59,7 +53,7 @@ impl<'d, P: request::Prepared, B: body::Build<'d>, T, D: duplex::Session<'d>> Bo
     pub(in crate::manifold) fn head(
         &mut self,
         id: requests::Id,
-    ) -> Option<claim::Head<claim::Claim<'_, 'd, P, B, T, D>>> {
+    ) -> Option<claim::Head<claim::Claim<'_, 'd, A, M>>> {
         match self.entries.entry(id).ok()?.reserve() {
             Ok(reserved) => Some(claim::Head::Reserved(claim::Claim::new(
                 reserved,
@@ -75,12 +69,8 @@ impl<'d, P: request::Prepared, B: body::Build<'d>, T, D: duplex::Session<'d>> Bo
         self.limits
     }
 
-    pub(in crate::manifold) fn resume(&mut self) -> Result<(), requests::Error> {
-        let Some(blocked) = self.entries.blocked() else {
-            return Ok(());
-        };
-        blocked.resume()?;
-        Ok(())
+    pub(in crate::manifold) fn resume(&mut self) {
+        self.entries.resume();
     }
 
     pub(in crate::manifold) fn has_ready(&self) -> bool {
@@ -104,11 +94,12 @@ impl<'d, P: request::Prepared, B: body::Build<'d>, T, D: duplex::Session<'d>> Bo
         })
     }
 
-    pub(in crate::manifold) fn try_finish<E: credit::Evidence>(
+    pub(in crate::manifold) fn try_finish<E: credit::Evidence, F>(
         &mut self,
         id: requests::Id,
         proof: impl FnOnce(crate::manifold::Phase) -> E,
-    ) -> Result<exchange::Termination<'d, P>, exchange::Error> {
+        response: impl FnOnce(task::Buffered<'d, A::Prepared>) -> Result<encoder::Pending<'d, M>, F>,
+    ) -> Result<exchange::Termination<F>, exchange::Error> {
         let live = self
             .entries
             .identify(id)
@@ -116,7 +107,7 @@ impl<'d, P: request::Prepared, B: body::Build<'d>, T, D: duplex::Session<'d>> Bo
         let proof = proof(live.phase());
         self.body_credit.scope(|mut ledger| {
             // SAFETY: the selected live slot and account belong to this book.
-            unsafe { ledger.bind(live) }.try_finish(&mut ledger, proof)
+            unsafe { ledger.bind(live) }.try_finish(&mut ledger, proof, response)
         })
     }
 
@@ -124,7 +115,7 @@ impl<'d, P: request::Prepared, B: body::Build<'d>, T, D: duplex::Session<'d>> Bo
         &mut self,
         id: requests::Id,
         proof: E,
-    ) -> Result<exchange::Stop<T>, requests::Error> {
+    ) -> Result<exchange::Stop<task::Owned<'d, A::Task, M>>, requests::Error> {
         let live = self.entries.identify(id)?;
         self.body_credit.scope(|mut ledger| {
             // SAFETY: the selected live slot and account belong to this book.
@@ -137,7 +128,7 @@ impl<'d, P: request::Prepared, B: body::Build<'d>, T, D: duplex::Session<'d>> Bo
         self,
         mut drain: impl for<'id, 'account> FnMut(
             requests::Id,
-            exchange::Drained<T, region::Proof<region::Identity<'id>>>,
+            exchange::Drained<task::Owned<'d, A::Task, M>, region::Proof<region::Identity<'id>>>,
             &mut credit::raw::Ledger<'account, region::Proof<region::Identity<'id>>>,
         ),
     ) -> audit::Snapshot {

@@ -54,7 +54,7 @@ fn retains_generic_body() {
                                     let wire =
                                         domain::Local::<wire::Identity, _>::new(wire::Identity);
                                     Brand::with(|brand| {
-                                        let app = generics::App::__scoped_new(brand, state, config);
+                                        let app = generics::App::new(brand, state, config);
                                         plan.install(stage, wire, app, |root, _wait, stage| {
                                             let result = stage.request(report, root);
                                             result
@@ -73,7 +73,7 @@ fn retains_generic_body() {
                                 .as_ref()
                                 .map_err(|error| error.cause())
                                 .expect("topology");
-                            result.ok().expect("checked topology").expect("install")
+                            drop(result.ok().expect("checked topology").expect("install"));
                         },
                     )
                 });
@@ -149,8 +149,7 @@ fn retains_scoped_body() {
                                     &mut *report,
                                 );
                                 Brand::with(|brand| {
-                                    let app =
-                                        generics::ScopedApp::__scoped_new(brand, state, config);
+                                    let app = generics::ScopedApp::new(brand, state, config);
                                     plan.install(stage, wire, app, |root, _wait, stage| {
                                         let result = stage.request(report, root);
                                         result
@@ -162,7 +161,6 @@ fn retains_scoped_body() {
                                 })
                             }
                             .map_err(topology::Failure::Install);
-                            let _ = (&mut *stage, &mut *report);
                             assert_eq!(encoded.get(), 1);
                             assert_eq!(state.observed.get(), Some("independent"));
                             result

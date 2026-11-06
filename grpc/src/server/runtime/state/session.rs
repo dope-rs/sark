@@ -27,8 +27,8 @@ where
     S: server::Connection<Key = Key, Owner = resident::Shared<'d>, Output = storage::Shared>,
 {
     pub(in crate::server::runtime) calls:
-        calls::Store<'r, S::Key, T, resident::Shared<'d>, S::Permit, S::Block>,
-    pub(in crate::server::runtime) egress: egress::Store<S::Key>,
+        calls::Store<'r, T, resident::Shared<'d>, S::Permit, S::Block>,
+    pub(in crate::server::runtime) egress: egress::Store<Key>,
     pub(in crate::server::runtime) segments: segments::Pool<resident::Shared<'d>>,
     pub(in crate::server::runtime) output_deadlines: P::State<'r, 'd>,
     pub(in crate::server::runtime) work: lanes::Schedule,
@@ -43,8 +43,8 @@ where
     S: server::Connection<Key = Key, Owner = resident::Shared<'d>, Output = storage::Shared>,
 {
     pub(in crate::server::runtime) fn retire(&mut self, conn: &mut S) {
-        for index in 0..self.calls.records.capacity() {
-            let Some(stream) = self.calls.records.key_at(index) else {
+        for index in 0..self.calls.capacity() {
+            let Some(stream) = self.calls.key_at(index) else {
                 continue;
             };
             self.remove(conn, stream);
@@ -52,7 +52,7 @@ where
         self.egress_released = false;
     }
 
-    fn remove(&mut self, conn: &mut S, stream: S::Key) {
+    fn remove(&mut self, conn: &mut S, stream: Key) {
         match self.egress.remove(stream, conn) {
             Ok(released) => self.release(released),
             Err(
@@ -68,14 +68,14 @@ where
 
     fn release(&mut self, released: egress::Release) {
         if released.prepared {
-            self.calls.records.wake_egress();
+            self.calls.wake_egress();
         }
         if released.output {
-            self.work.retries = self.calls.records.capacity();
+            self.work.retries = self.calls.capacity();
         }
     }
 
-    fn remove_call(&mut self, conn: &mut S, stream: S::Key) {
+    fn remove_call(&mut self, conn: &mut S, stream: Key) {
         self.cancel_time(stream);
         match self.calls.try_remove(stream) {
             Ok(()) => {}
@@ -88,13 +88,7 @@ where
             ) => conn.fail(),
         }
     }
-}
 
-impl<'r, 'd, T, P, S> Session<'r, 'd, T, P, S>
-where
-    P: state::Timing<'d>,
-    S: server::Connection<Key = Key, Owner = resident::Shared<'d>, Output = storage::Shared>,
-{
     pub(in crate::server::runtime::state) fn try_new(
         limits: &Limits,
         cap: Capacity,
@@ -122,13 +116,7 @@ where
             call_deadlines: None,
         })
     }
-}
 
-impl<'r, 'd, T, P, S> Session<'r, 'd, T, P, S>
-where
-    P: state::Timing<'d>,
-    S: server::Connection<Key = Key, Owner = resident::Shared<'d>, Output = storage::Shared>,
-{
     pub(in crate::server::runtime) fn try_deadline(
         &mut self,
         stream: Key,
@@ -220,7 +208,7 @@ where
                 index
             }
         };
-        self.calls.records.entry_at(index)
+        self.calls.entry_at(index)
     }
 
     pub(in crate::server::runtime) fn poll_app<'a>(
@@ -234,31 +222,38 @@ where
         } else {
             index + 1
         };
-        self.calls.records.entry_at(index)
+        self.calls.entry_at(index)
     }
 
     pub(in crate::server::runtime) fn discard(&mut self, entry: active::Entry<'r>, conn: &mut S) {
         let stream = entry.key();
-        if self.calls.records.key_at(manifold::raw::Key::slot(stream)) != Some(stream) {
+        if self.calls.key_at(manifold::raw::Key::slot(stream)) != Some(stream) {
             return;
         }
         P::cancel(&mut self.output_deadlines, entry);
         self.remove(conn, stream);
     }
 
-    pub(in crate::server::runtime) fn drive(
+    pub(in crate::server::runtime) fn drive<H>(
         &mut self,
         conn: &mut S,
         egress: schedule::Egress,
+        context: &mut H,
+        notify: impl FnMut(&mut H, schedule::Wake<Key>),
         active: &active::Signals,
-        sink: &mut impl FnMut(Key, egress::Error<S::Error>),
+        sink: &mut impl FnMut(&mut H, Key, egress::Error<S::Error>),
         mut cancel: impl FnMut(active::Entry<'r>, &mut T),
     ) -> (schedule::Report, active::Edge) {
         let times = &mut self.output_deadlines;
         let book = &mut self.call_deadlines;
-        let (report, released) = self
-            .calls
-            .drive(&mut self.egress, conn, egress, sink, |record| {
+        let (report, released) = self.calls.drive(
+            &mut self.egress,
+            conn,
+            egress,
+            context,
+            notify,
+            sink,
+            |record| {
                 let entry = record.entry;
                 if let Some(book) = book {
                     book.cancel(entry.key());
@@ -267,7 +262,8 @@ where
                 if let Some(call) = record.handler_mut() {
                     cancel(entry, call);
                 }
-            });
+            },
+        );
         self.release(released);
         let edge = if active
             .blocked(self.work.waiting, self.work.retries)
@@ -288,13 +284,13 @@ where
         sink: &mut impl FnMut(Key, egress::Error<S::Error>),
     ) {
         let stream = entry.key();
-        match self.calls.records.key_at(manifold::raw::Key::slot(stream)) {
+        match self.calls.key_at(manifold::raw::Key::slot(stream)) {
             Some(current) if current != stream => {
                 return conn.reset(stream, Reset::Internal);
             }
             Some(_) => {}
             None => {
-                if let Err(error) = self.calls.records.try_reserve(entry) {
+                if let Err(error) = self.calls.try_reserve(entry) {
                     conn.reset(stream, Reset::Internal);
                     return sink(stream, egress::Error::Fault(Fault::Response(error.into())));
                 }

@@ -103,6 +103,9 @@ impl<C: Copy, S: Copy> Observer<C, S> for Infallible {
 pub trait Mode<C: Copy, S: Copy> {
     const ENABLED: bool;
 
+    /// Whether response commits need exact retained-owner charges.
+    const RESPONSE_CHARGE: bool = true;
+
     type Retention: evidence::Mode;
     type Observer: Observer<C, S>;
 

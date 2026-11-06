@@ -220,5 +220,5 @@ pub trait Spec {
 
 /// A route whose task retains its response until driver-local completion.
 pub trait Task<'d, S>: Spec {
-    type Output: dispatch::IntoOutput<'d, 'd, Output: dispatch::Complete<'d, 'd>>;
+    type Output: dispatch::IntoOutput<'d, 'd>;
 }

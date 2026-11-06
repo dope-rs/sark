@@ -2,7 +2,7 @@ use std::{num, ops::ControlFlow};
 
 use dope::{
     core::{
-        driver::{retained, route::Identity},
+        driver::{self, route::Identity},
         io::transfer,
     },
     manifold::{app::receive, network::listener::conn},
@@ -24,38 +24,40 @@ use crate::{
 };
 
 /// One listener turn borrowing its exact receive budget, connection, and driver.
-pub struct Read<'a, 'r, 's, 'd, C, F> {
+pub struct Read<'a, 'r, 'd, C, F> {
     conn: &'a mut C,
-    driver: &'a mut retained::Context<'r, 's, 'd>,
+    driver: &'a mut driver::Context<'r, 'd>,
     budget: &'a resident::Budget<'d>,
+    scratch: &'a mut Vec<u8>,
     http: F,
 }
 
-impl<'a, 'r, 's, 'd, C, F> Read<'a, 'r, 's, 'd, C, F>
+impl<'a, 'r, 'd, C, F> Read<'a, 'r, 'd, C, F>
 where
-    F: FnMut(&mut C, &[u8], &mut retained::Context<'r, 's, 'd>) -> Ingress,
+    F: FnMut(&mut C, &[u8], &mut driver::Context<'r, 'd>) -> Ingress,
 {
     pub fn new(
         conn: &'a mut C,
-        driver: &'a mut retained::Context<'r, 's, 'd>,
+        driver: &'a mut driver::Context<'r, 'd>,
         budget: &'a resident::Budget<'d>,
+        scratch: &'a mut Vec<u8>,
         http: F,
     ) -> Self {
         Self {
             conn,
             driver,
             budget,
+            scratch,
             http,
         }
     }
 }
 
-impl<'e, 'c, 'p, 's, 'r, 'o, 'w, 'd: 'w, ID: Identity, W, S, P, Ready, Heads, D, K, F>
+impl<'e, 'c, 'p, 's, 'r, 'w, 'd: 'w, ID: Identity, W, S, P, Ready, Heads, D, K, F>
     access::Use<'d, receive::Outcome>
     for Read<
         '_,
         'r,
-        'o,
         'd,
         conn::Ctx<
             'e,
@@ -95,7 +97,7 @@ where
             >,
         >,
         &[u8],
-        &mut retained::Context<'r, 'o, 'd>,
+        &mut driver::Context<'r, 'd>,
     ) -> Ingress,
 {
     fn apply<R>(&mut self, head: &mut R) -> ControlFlow<receive::Outcome, receive::Outcome>
@@ -120,7 +122,9 @@ where
                 }
             };
             let outcome = match self.conn.state().mode() {
-                switch::Mode::Raw(_) => Runtime::new(self.conn).chunk(whole, self.driver),
+                switch::Mode::Raw(_) => {
+                    Runtime::new(self.conn, self.scratch).chunk(whole, self.driver)
+                }
                 switch::Mode::Switching(_) => {
                     return (None, ControlFlow::Break(receive::Outcome::Continue));
                 }
@@ -139,7 +143,7 @@ where
                                 );
                             }
                         };
-                        Runtime::new(self.conn).handoff(tail)
+                        Runtime::new(self.conn, self.scratch).handoff(tail)
                     }
                 },
             };

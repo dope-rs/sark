@@ -24,7 +24,7 @@ pub struct Pending<'input> {
 
 /// Append-only ownership of the trailer prefix and its admitted syntax state.
 pub struct State<'d> {
-    source: Owned<resident::Lease<'d>>,
+    source: Owned<resident::Budget<'d>>,
     parser: trailer::Trailer,
 }
 
@@ -55,7 +55,7 @@ pub struct Ready<T>(T);
 
 /// The exact completed trailer owner, excluding the terminating empty line.
 pub struct Complete<'d> {
-    source: Owned<resident::Lease<'d>>,
+    source: Owned<resident::Budget<'d>>,
 }
 
 #[derive(Debug)]
@@ -105,8 +105,8 @@ impl<'input> Pending<'input> {
     /// Copies the exact borrowed prefix before transferring its parsing proof.
     pub fn try_store<'d>(
         self,
-        mut target: Owned<resident::Lease<'d>>,
-    ) -> Result<State<'d>, Rejected<(Self, Owned<resident::Lease<'d>>), StoreError>> {
+        mut target: Owned<resident::Budget<'d>>,
+    ) -> Result<State<'d>, Rejected<(Self, Owned<resident::Budget<'d>>), StoreError>> {
         if let Err(error) = StoreError::copy(&mut target, self.bytes) {
             return Err(Rejected::new((self, target), error));
         }
@@ -209,8 +209,8 @@ impl<'d, P> Plan<'_, 'd, P> {
     /// Copies only the retained prefix; the new input's admission remains intact.
     pub fn try_grow(
         &mut self,
-        mut target: Owned<resident::Lease<'d>>,
-    ) -> Result<(), Rejected<Owned<resident::Lease<'d>>, StoreError>> {
+        mut target: Owned<resident::Budget<'d>>,
+    ) -> Result<(), Rejected<Owned<resident::Budget<'d>>, StoreError>> {
         if let Err(error) = StoreError::copy(&mut target, self.state.source.as_slice()) {
             return Err(Rejected::new(target, error));
         }
@@ -274,13 +274,13 @@ impl<'d> Complete<'d> {
         Fields::new(self.source.as_slice())
     }
 
-    pub fn into_owner(self) -> Owned<resident::Lease<'d>> {
+    pub fn into_owner(self) -> Owned<resident::Budget<'d>> {
         self.source
     }
 }
 
 impl StoreError {
-    fn copy(target: &mut Owned<resident::Lease<'_>>, bytes: &[u8]) -> Result<(), Self> {
+    fn copy(target: &mut Owned<resident::Budget<'_>>, bytes: &[u8]) -> Result<(), Self> {
         if let Some(len) = NonZero::new(target.len()) {
             return Err(Self::Prefix(len));
         }

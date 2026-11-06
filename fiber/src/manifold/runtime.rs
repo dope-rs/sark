@@ -20,7 +20,6 @@ pub struct NativeFiber;
 #[doc(hidden)]
 pub trait Storage {
     type Target: Copy;
-    type Clock<'d>;
     type Protocol<Cold, Bound>;
     type Resource<Bound>;
 
@@ -41,8 +40,6 @@ pub trait Initial: Storage {
 
     fn resource<Bound>() -> Self::Resource<Bound>;
 
-    fn clock<'d>() -> Self::Clock<'d>;
-
     fn tasks<'s, 'd, D, S>(
         limit: quota::Limit,
         brand: scope::Brand<'s>,
@@ -62,7 +59,7 @@ pub trait Initial: Storage {
 /// Marks storage whose scheduler identity is executable.
 #[doc(hidden)]
 pub trait Runnable: Storage {
-    fn handle<'d>(clock: &Self::Clock<'d>) -> timer::Timer<'d>;
+    fn handle<'d>(clock: &Self::Resource<timer::Timer<'d>>) -> timer::Timer<'d>;
 }
 
 #[doc(hidden)]
@@ -71,12 +68,8 @@ pub struct Direct;
 #[doc(hidden)]
 pub struct Cold;
 
-#[doc(hidden)]
-pub struct Empty;
-
 impl Storage for Direct {
     type Target = ();
-    type Clock<'d> = timer::Timer<'d>;
     type Protocol<Cold, Bound> = Bound;
     type Resource<Bound> = Bound;
 
@@ -94,9 +87,8 @@ impl Storage for Direct {
 
 impl Storage for Cold {
     type Target = ();
-    type Clock<'d> = Empty;
     type Protocol<Cold, Bound> = Cold;
-    type Resource<Bound> = Empty;
+    type Resource<Bound> = ();
 
     type Tasks<'s, 'd, D, S>
         = (scope::Brand<'s>, direct::Plan<'d, D>)
@@ -115,13 +107,7 @@ impl Initial for Cold {
         cold
     }
 
-    fn resource<Bound>() -> Self::Resource<Bound> {
-        Empty
-    }
-
-    fn clock<'d>() -> Self::Clock<'d> {
-        Empty
-    }
+    fn resource<Bound>() -> Self::Resource<Bound> {}
 
     fn tasks<'s, 'd, D, S>(
         limit: quota::Limit,
@@ -146,7 +132,7 @@ impl Initial for Cold {
 }
 
 impl Runnable for Direct {
-    fn handle<'d>(clock: &Self::Clock<'d>) -> timer::Timer<'d> {
+    fn handle<'d>(clock: &Self::Resource<timer::Timer<'d>>) -> timer::Timer<'d> {
         *clock
     }
 }
@@ -159,9 +145,8 @@ pub struct Prepared<T: task::Target>(marker::PhantomData<fn() -> T>);
 
 impl<T: task::Target> Storage for Multi<T> {
     type Target = T;
-    type Clock<'d> = Empty;
-    type Protocol<Cold, Bound> = Empty;
-    type Resource<Bound> = Empty;
+    type Protocol<Cold, Bound> = ();
+    type Resource<Bound> = ();
 
     type Tasks<'s, 'd, D, S>
         = (scope::Brand<'s>, Plan<'d, S>)
@@ -170,23 +155,15 @@ impl<T: task::Target> Storage for Multi<T> {
         S: tree::Tree<'d>;
 
     type DirectOnly<'s, 'd, D>
-        = Empty
+        = ()
     where
         D: tree::Tree<'d>;
 }
 
 impl<T: task::Target> Initial for Multi<T> {
-    fn protocol<Cold, Bound>(_: Cold) -> Self::Protocol<Cold, Bound> {
-        Empty
-    }
+    fn protocol<Cold, Bound>(_: Cold) -> Self::Protocol<Cold, Bound> {}
 
-    fn resource<Bound>() -> Self::Resource<Bound> {
-        Empty
-    }
-
-    fn clock<'d>() -> Self::Clock<'d> {
-        Empty
-    }
+    fn resource<Bound>() -> Self::Resource<Bound> {}
 
     fn tasks<'s, 'd, D, S>(
         limit: quota::Limit,
@@ -202,14 +179,11 @@ impl<T: task::Target> Initial for Multi<T> {
     fn direct_only<'s, 'd, D>(_: quota::Limit, _: scope::Brand<'s>) -> Self::DirectOnly<'s, 'd, D>
     where
         D: tree::Tree<'d>,
-    {
-        Empty
-    }
+    {}
 }
 
 impl<T: task::Target> Storage for Prepared<T> {
     type Target = T;
-    type Clock<'d> = timer::Timer<'d>;
     type Protocol<Cold, Bound> = ();
     type Resource<Bound> = Bound;
 
@@ -220,13 +194,13 @@ impl<T: task::Target> Storage for Prepared<T> {
         S: tree::Tree<'d>;
 
     type DirectOnly<'s, 'd, D>
-        = Empty
+        = ()
     where
         D: tree::Tree<'d>;
 }
 
 impl<T: task::Target> Runnable for Prepared<T> {
-    fn handle<'d>(clock: &Self::Clock<'d>) -> timer::Timer<'d> {
+    fn handle<'d>(clock: &Self::Resource<timer::Timer<'d>>) -> timer::Timer<'d> {
         *clock
     }
 }
@@ -238,5 +212,3 @@ pub trait TaskRoute<'d, State>: route::Task<'d, State, Request: route::Own> + Si
     where
         'd: 'req;
 }
-
-const _: () = assert!(std::mem::size_of::<Empty>() == 0);

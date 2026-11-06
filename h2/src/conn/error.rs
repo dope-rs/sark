@@ -263,7 +263,7 @@ impl Class {
 }
 
 impl Error {
-    pub(crate) const fn code(self) -> numbers::ErrorCode {
+    pub(crate) const fn code(&self) -> numbers::ErrorCode {
         self.class().code()
     }
 
@@ -489,7 +489,7 @@ impl From<outputs::Full> for Error {
 
 impl From<&Error> for numbers::ErrorCode {
     fn from(error: &Error) -> Self {
-        error.class().code()
+        error.code()
     }
 }
 

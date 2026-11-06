@@ -153,10 +153,11 @@ pub(super) fn resume<'d, P: rules::Policy, A: rules::Push>(
                             }
                             _ => None,
                         };
+                        let published = parts.qpack.published();
                         parts
                             .qpack
                             .qpack_encoder
-                            .apply(instruction)
+                            .apply(instruction, published)
                             .map_err(conn::Error::QpackDecoderStream)?;
                         recv.consume(consumed, &mut released, &mut parts.ingress.budget)?;
                         if let Some((stream_id, vacancy)) = cancellation {

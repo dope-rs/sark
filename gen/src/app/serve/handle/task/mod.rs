@@ -10,7 +10,6 @@ use crate::{
 };
 
 mod body;
-mod forward;
 mod open;
 mod route;
 
@@ -52,7 +51,7 @@ impl Task {
         decode: &decode::Decode,
         tasks: &tasks::Tasks,
     ) -> proc_macro2::TokenStream {
-        let [f_core, f_tasks, f_time] = ["core", "tasks", "timer"].map(local);
+        let [f_core, f_tasks] = ["core", "tasks"].map(local);
         let symbols = &ctx.plan.spec.state_generics;
         let [n_body, n_build] = symbols.locals(["__body", "__build"]);
         let [n_driver, n_error] = symbols.locals(["__driver", "__error"]);
@@ -61,8 +60,9 @@ impl Task {
         let [n_req, n_scope] = symbols.locals(["__request", "__scope"]);
         let [n_target, n_task] = symbols.locals(["__target", "__task"]);
         let [n_work, v_error] = symbols.locals(["__work", "error"]);
+        let [n_make] = symbols.locals(["__emit"]);
         let l_turn = ctx.plan.spec.state_generics.lifetime("__turn");
-        let [g_b, g_h] = ctx.plan.spec.state_generics.idents(["__B", "__H"]);
+        let [g_b, g_h, g_e] = ctx.plan.spec.state_generics.idents(["__B", "__H", "__E"]);
         let g_brand = ctx.plan.spec.state_generics.lifetime("brand");
         let [g_target, g_id, g_store] = ctx.plan.spec.state_generics.idents(["__C", "__ID", "__P"]);
         use quote::quote;
@@ -73,17 +73,8 @@ impl Task {
 
         let spec = ctx.plan.spec;
         let vis = &spec.vis;
-        let owner = &spec.name;
-        let task = &ctx.exec.task.fiber;
-        let done = quote::format_ident!("__{}Completion", owner);
-        let state = spec.state.ty();
-        let complete = if ctx.exec.fibers().is_empty() {
-            quote!(::core::convert::Infallible)
-        } else {
-            quote!(#done<'d, #state>)
-        };
+        let task = &ctx.exec.fiber;
         let name = &ctx.name;
-        let core = &ctx.core_ident;
         let base = &disp.shape.base_bounds;
         let def = &disp.shape.generic_def;
         let pdef = &disp.shape.protocol_generic_def;
@@ -106,22 +97,40 @@ impl Task {
             built_body: choose,
         } = self;
         let duplex = &ctx.plan.duplex;
-        let defs = duplex.definitions(paths);
-        let raw = duplex.ty(paths);
+        let raw = duplex.ty(paths, true);
         let ext = match duplex.connect() {
             Connect::Enabled => quote!(#ns_http::field::metadata::block::Connect::Enabled),
             Connect::Disabled => quote!(#ns_http::field::metadata::block::Connect::Disabled),
         };
         let error = &decode.prepared.type_defs;
         let method = &decode.method;
-        let forward = forward::build(paths, ctx, disp, decode);
+        let full = &decode.full;
         let never = quote!(::core::convert::Infallible);
         let drive = &tasks.drive_body;
+        let emit = &tasks.emit_body;
+        let resume = &tasks.resume_body;
         let work = &tasks.task_work_body;
         let wake = &tasks.wake_body;
         let probe = &tasks.try_wake_body;
         let cancel = &tasks.cancel_one_body;
         let fibers = !ctx.exec.fibers().is_empty();
+        let fixed_fibers: Vec<_> = ctx
+            .exec
+            .fibers()
+            .iter()
+            .filter(|(_, fiber)| !fiber.stream)
+            .collect();
+        let fixed = if !fixed_fibers.is_empty() {
+            let ident = quote::format_ident!("__{}Fixed", spec.name);
+            let state = spec.state.ty();
+            let payloads = fixed_fibers
+                .iter()
+                .map(|(task, _)| task.fiber_output(paths, state));
+            quote!(#ident<#( #payloads ),*>)
+        } else {
+            never.clone()
+        };
+        let make = if fibers { quote!(#n_make) } else { quote!(_) };
         let failure = if fibers {
             quote!(#ns_fiber::dope_fiber::task::storage::fixed::schedule::queue::Error<#g_target>)
         } else {
@@ -153,7 +162,7 @@ impl Task {
         });
         let guarded = decode.guard.as_ref().map(|guard| {
             quote! {
-                impl #def #ns_core::decode::Guarded for #core #args
+                impl #def #ns_core::decode::Guarded for #name #args
                 where
                     #policy
                     #base
@@ -200,26 +209,7 @@ impl Task {
         } else {
             (quote!(_), quote!(_), quote!(_), quote!(_), quote!(_))
         };
-        let timers = [
-            (name, quote!(self.#f_core.#f_time)),
-            (core, quote!(self.#f_time)),
-        ]
-        .into_iter()
-        .map(|(target, timer)| {
-            quote! {
-                impl #def #ns_core::manifold::timer::Source<'d> for #target #args
-                where
-                    #g_store: #ns_fiber::manifold::runtime::Runnable,
-                    #base
-                {
-                    fn timer(&self) -> #ns_fiber::driver::schedule::clock::timer::Timer<'d> {
-                        <#g_store as #ns_fiber::manifold::runtime::Runnable>::handle(&#timer)
-                    }
-                }
-            }
-        });
         quote! {
-            #defs
             #plan
 
             #( #slots )*
@@ -235,7 +225,7 @@ impl Task {
             #reqdef
             #error
 
-            impl #def #ns_core::decode::Decode for #core #args
+            impl #def #ns_core::decode::Decode for #name #args
             where
                 #policy
                 #base
@@ -243,11 +233,17 @@ impl Task {
                 #method
             }
 
+            impl #def #ns_core::decode::Full for #name #args
+            where
+                #policy
+                #base
+            {
+                #full
+            }
+
             #guarded
 
-            #forward
-
-            impl #def #ns_core::duplex::Application<'d> for #core #args
+            impl #def #ns_core::duplex::Application<'d> for #name #args
             where
                 #policy
                 #base
@@ -276,46 +272,15 @@ impl Task {
                 }
             }
 
-            impl #def #ns_core::duplex::Application<'d> for #name #args
-            where
-                #policy
-                #base
-            {
-                type Duplex = #raw;
-                const CONNECT: #ns_http::field::metadata::block::Connect =
-                    <#core #args as #ns_core::duplex::Application<'d>>::CONNECT;
-
-                #[inline(always)]
-                fn try_open<#g_b>(
-                    &self,
-                    #n_req: #ns_core::decode::request::Admitted<
-                        #ns_core::decode::exec::Duplex,
-                        Self::Prepared,
-                        #g_b,
-                    >,
-                ) -> ::core::result::Result<
-                    (Self::Duplex, #g_b),
-                    (
-                        #ns_core::duplex::OpenError<Self::Error<'d>>,
-                        #g_b,
-                    ),
-                > {
-                    #ns_core::duplex::Application::try_open(
-                        &self.#f_core,
-                        #n_req,
-                    )
-                }
-            }
-
             impl #pdef #ns_core::manifold::task::app::Runtime<'d>
                 for #name #mux
             where
                 #base
             {
                 type Task = #task<#g_brand, 'd, #g_id>;
+                type Fixed = #fixed;
                 type Build = #build<'d>;
                 type Target = #g_target;
-                type Completion = #complete;
                 type Admission = #failure;
                 type OwnerCause = #own;
                 type RetireCause = #ret;
@@ -420,7 +385,7 @@ impl Task {
                     #g_h: #ns_core::manifold::task::app::Handoff<
                         'd,
                         Self::Target,
-                        Self::Completion,
+                        Self::Fixed,
                     >
                 >(
                     self: ::core::pin::Pin<&mut Self>,
@@ -428,10 +393,27 @@ impl Task {
                         Self::Target,
                     >,
                     #warg: #ns_fiber::dope::core::driver::schedule::app::Work<#l_turn, 'd>,
-                    #darg: &mut #ns_fiber::dope::core::driver::retained::Context<'_, '_, 'd>,
+                    #darg: &mut #ns_fiber::dope::core::driver::Context<'_, 'd>,
                     #harg: #g_h,
-                ) -> #ns_core::manifold::task::app::Turn<#l_turn, 'd, #g_h::Complete> {
+                ) -> #ns_core::manifold::task::app::Turn<#l_turn, 'd, #g_h::Ready> {
                     #drive
+                }
+
+                fn emit<#g_e: #ns_core::decode::Streaming<'d, 'd>>(
+                    self: ::core::pin::Pin<&mut Self>,
+                    #n_task: &Self::Task,
+                    #make: impl ::core::ops::FnOnce(#ns_http::request::Id<'d>) -> #g_e,
+                ) -> #ns_core::manifold::task::response::Access<
+                    #ns_core::manifold::task::response::Prepared<'d, #g_e>,
+                > {
+                    #emit
+                }
+
+                fn resume(
+                    self: ::core::pin::Pin<&mut Self>,
+                    #n_task: &Self::Task,
+                ) -> #ns_core::manifold::task::response::Access<()> {
+                    #resume
                 }
 
                 fn has_work(
@@ -468,8 +450,6 @@ impl Task {
                     #cancel
                 }
             }
-
-            #(#timers)*
         }
     }
 }

@@ -2,6 +2,7 @@ pub mod common;
 
 use common::client::Probe;
 use dope::core::driver::life::recovery;
+use dope_test::harness::scenario::run::{Entry, Task as _};
 use sark_http::h1::codec::decode::fields::Sink as _;
 use sark_ws::{
     client::{self, headers},
@@ -27,39 +28,41 @@ fn reject_negotiation() {
 
 #[test]
 fn handshake_error_survives() {
-    use std::{io::Read as _, net::TcpListener, thread, time::Duration};
+    use std::{io::Read as _, net::TcpListener, time::Duration};
 
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind peer");
     let address = listener.local_addr().expect("peer address");
-    let peer = thread::spawn(move || {
+    let peer = Entry(move || {
         let (mut stream, _) = listener.accept().expect("accept client");
         stream
             .set_read_timeout(Some(Duration::from_secs(3)))
             .expect("read timeout");
         assert_eq!(stream.read(&mut [0; 1]).expect("closed handshake"), 0);
     });
-    let config = client::Config::new("localhost", "/");
-    let config = config.expect("endpoint");
-    let probe =
-        Probe::new(address, config).with_headers(vec![("X-Large".into(), "x".repeat(16 * 1024))]);
-    let probe = probe.expect("headers");
-    let result = probe.close(recovery::Policy::new(|_| {}, common::recover), |result| {
-        result.expect("WebSocket probe")
-    });
-    result
-        .as_ref()
-        .map_err(|cause| cause.kind())
-        .expect("topology");
-    let seen = result.ok().expect("checked topology");
-    assert!(matches!(
-        seen.close(),
-        Some(client::CloseReason::Handshake(client::Error::Header(
-            headers::Error::Length {
-                additional: 16384,
-                maximum: 16384,
-                ..
-            }
-        )))
-    ));
-    peer.join().expect("peer");
+    peer.with(|| {
+        let config = client::Config::new("localhost", "/");
+        let config = config.expect("endpoint");
+        let probe = Probe::new(address, config)
+            .with_headers(vec![("X-Large".into(), "x".repeat(16 * 1024))]);
+        let probe = probe.expect("headers");
+        let result = probe.close(recovery::Policy::new(|_| {}, common::recover), |result| {
+            result.expect("WebSocket probe")
+        });
+        result
+            .as_ref()
+            .map_err(|cause| cause.kind())
+            .expect("topology");
+        let seen = result.ok().expect("checked topology");
+        assert!(matches!(
+            seen.close(),
+            Some(client::CloseReason::Handshake(client::Error::Header(
+                headers::Error::Length {
+                    additional: 16384,
+                    maximum: 16384,
+                    ..
+                }
+            )))
+        ));
+    })
+    .expect("peer");
 }

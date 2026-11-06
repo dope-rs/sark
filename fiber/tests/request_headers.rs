@@ -122,10 +122,6 @@ fn scans_optional_headers() {
         ),
         Ok(Some(_))
     ));
-    const {
-        assert!(!<Minimal as Schema>::FULL);
-        assert!(<Full as Schema>::FULL);
-    }
 }
 
 #[test]

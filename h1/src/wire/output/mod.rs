@@ -1,10 +1,10 @@
 use core::{convert::Infallible, mem};
 
-use o3::buffer::{pool, pool::owners, storage};
+use o3::buffer::storage;
 use sark_http::{
     owner::evidence,
     payload::{
-        compress::{Compression, Gzip},
+        compress::{self, Compression, Gzip},
         fixed, owned,
         response::Body as _,
     },
@@ -19,14 +19,12 @@ mod admit;
 mod egress;
 mod owner;
 mod pending;
-mod plan;
 mod sink;
 
 pub(crate) use admit::Admit;
 pub use egress::Egress;
 pub use owner::Owner;
 pub use pending::Pending;
-pub use plan::Plan;
 pub use sink::error::Error;
 
 /// Selects connection compression storage from the route policies.
@@ -74,8 +72,7 @@ pub enum Outcome<'d, P = Infallible> {
     },
     SendCopied {
         written: usize,
-        body_bytes: usize,
-        cause: evidence::Cause,
+        copy: evidence::Copy,
         connection: head::Connection,
     },
     SendStatic {
@@ -90,11 +87,7 @@ pub enum Outcome<'d, P = Infallible> {
     },
     SendCompressed {
         hdr_written: usize,
-        body: pool::Span<
-            owners::Plain<pool::Fixed<{ Gzip::SLOTS.get() }, { Gzip::CAPACITY.get() }>>,
-            pool::Owned,
-            pool::Frozen,
-        >,
+        body: compress::Frozen,
         read: usize,
         connection: head::Connection,
     },
@@ -126,8 +119,7 @@ pub enum Complete<'d> {
     },
     Copy {
         written: usize,
-        body_bytes: usize,
-        cause: evidence::Cause,
+        copy: evidence::Copy,
     },
     Static {
         hdr_written: usize,
@@ -139,11 +131,7 @@ pub enum Complete<'d> {
     },
     Compressed {
         hdr_written: usize,
-        body: pool::Span<
-            owners::Plain<pool::Fixed<{ Gzip::SLOTS.get() }, { Gzip::CAPACITY.get() }>>,
-            pool::Owned,
-            pool::Frozen,
-        >,
+        body: compress::Frozen,
         read: usize,
     },
     Segments {
@@ -166,9 +154,7 @@ impl Complete<'_> {
     pub fn retention(&self) -> Origin {
         match self {
             Self::Inline { .. } => Origin::Response(Owner::default()),
-            Self::Copy {
-                body_bytes: len, ..
-            } => Origin::Response(Owner::inline(*len)),
+            Self::Copy { copy, .. } => Origin::Response(Owner::inline(copy.written)),
             Self::Static { body, .. } => Origin::Response(Owner::inline(body.len())),
             Self::Shared { body, .. } => Origin::Response(Owner::shared(body)),
             Self::Compressed { body, .. } => Origin::Response(Owner::shared(body)),
@@ -180,15 +166,7 @@ impl Complete<'_> {
 
     pub fn copy(&self) -> Copy {
         match self {
-            Self::Copy {
-                body_bytes: len,
-                cause,
-                ..
-            } => Copy::Copied(evidence::Copy {
-                read: *len,
-                written: *len,
-                cause: *cause,
-            }),
+            Self::Copy { copy, .. } => Copy::Copied(*copy),
             Self::Compressed { body, read, .. } => Copy::Copied(evidence::Copy {
                 read: *read,
                 written: body.len(),
@@ -219,9 +197,7 @@ impl<'d, P> Outcome<'d, P> {
     pub fn retention(&self) -> Retention {
         match self {
             Self::Send { .. } => Retention::Response(Owner::default()),
-            Self::SendCopied {
-                body_bytes: len, ..
-            } => Retention::Response(Owner::inline(*len)),
+            Self::SendCopied { copy, .. } => Retention::Response(Owner::inline(copy.written)),
             Self::SendStatic { body, .. } => Retention::Response(Owner::inline(body.len())),
             Self::SendShared { body, .. } => Retention::Response(Owner::shared(body)),
             Self::SendCompressed { body, .. } => Retention::Response(Owner::shared(body)),
@@ -234,15 +210,7 @@ impl<'d, P> Outcome<'d, P> {
 
     pub fn copy(&self) -> Copy {
         match self {
-            Self::SendCopied {
-                body_bytes: len,
-                cause,
-                ..
-            } => Copy::Copied(evidence::Copy {
-                read: *len,
-                written: *len,
-                cause: *cause,
-            }),
+            Self::SendCopied { copy, .. } => Copy::Copied(*copy),
             Self::SendCompressed { body, read, .. } => Copy::Copied(evidence::Copy {
                 read: *read,
                 written: body.len(),
@@ -277,13 +245,11 @@ impl<'d> Outcome<'d, usize> {
             },
             Self::SendCopied {
                 written,
-                body_bytes: bytes,
-                cause,
+                copy,
                 connection: conn,
             } => Outcome::SendCopied {
                 written,
-                body_bytes: bytes,
-                cause,
+                copy,
                 connection: conn,
             },
             Self::SendStatic {
@@ -368,14 +334,12 @@ impl<'d> Outcome<'d> {
             } => (Complete::Inline { written: sent }, conn),
             Self::SendCopied {
                 written: sent,
-                body_bytes: len,
-                cause,
+                copy,
                 connection: conn,
             } => (
                 Complete::Copy {
                     written: sent,
-                    body_bytes: len,
-                    cause,
+                    copy,
                 },
                 conn,
             ),

@@ -4,10 +4,7 @@ use core::mem;
 
 use dope::{
     core::driver::{route::Identity, schedule::clock},
-    manifold::network::listener::{
-        conn::{self, deadline::Arm},
-        handler,
-    },
+    manifold::network::listener::{conn, handler},
     net::{link::egress::data, wire},
 };
 use o3::alloc;
@@ -32,12 +29,6 @@ pub enum Root<P> {
     Ensure,
     Arm(P),
     Cancel,
-}
-
-#[derive(Clone, Copy, Eq, PartialEq)]
-pub enum Apply<'d> {
-    Applied,
-    Deadline(Arm<'d>),
 }
 
 /// Exact input evidence accumulated across one listener callback.
@@ -108,18 +99,18 @@ impl<'d> Root<clock::Deadline<'d>> {
         self,
         conn: &mut conn::Ctx<'_, '_, '_, '_, '_, 'd, ID, W, C, B>,
         now: clock::Moment<'d>,
-    ) -> Apply<'d>
+    ) -> Result<(), conn::deadline::Error>
     where
         W: wire::Spec,
         B: data::raw::Payload<'d>,
     {
         match self {
-            Self::Unchanged => Apply::Applied,
-            Self::Ensure => Apply::Deadline(conn.deadline().try_ensure(now)),
-            Self::Arm(deadline) => Apply::Deadline(conn.deadline().try_arm(deadline)),
+            Self::Unchanged => Ok(()),
+            Self::Ensure => conn.deadline().try_ensure(now),
+            Self::Arm(deadline) => conn.deadline().try_arm(deadline),
             Self::Cancel => {
                 conn.deadline().cancel();
-                Apply::Applied
+                Ok(())
             }
         }
     }

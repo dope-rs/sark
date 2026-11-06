@@ -36,7 +36,7 @@ impl State {
         let ns_core = &paths.core;
         let [v_body, v_slot, v_map, v_ret] = ["body", "slot", "map", "retained"].map(local);
         let [v_output, v_each, v_fold, v_visit] = ["output", "each", "fold", "visit"].map(local);
-        let [v_head, v_len, v_method] = ["head", "content_length", "method"].map(local);
+        let [v_head, v_len] = ["head", "content_length"].map(local);
         let [v_bound, v_limit, v_error, v_state] =
             ["boundary", "limit", "error", "state"].map(local);
 
@@ -238,6 +238,7 @@ impl State {
                 }
             };
             let started = |phase: &syn::Ident, body: proc_macro2::TokenStream| {
+                let method = entry.method.http_token(paths);
                 let state = if entry.guards.is_empty() {
                     quote! { #plain::#phase(#req_slot, #body) }
                 } else {
@@ -246,16 +247,16 @@ impl State {
                 if all_p {
                     quote! { #ns_core::decode::request::Plain::new(#state) }
                 } else if all_g {
-                    quote! { #ns_core::decode::request::Guarded::new(#state, #v_method) }
+                    quote! { #ns_core::decode::request::Guarded::new(#state, #method) }
                 } else if entry.guards.is_empty() {
                     quote! { #ns_core::decode::request::Start::plain(#state) }
                 } else {
-                    quote! { #ns_core::decode::request::Start::guarded(#state, #v_method) }
+                    quote! { #ns_core::decode::request::Start::guarded(#state, #method) }
                 }
             };
             let restore = quote! {
                 #selected::#variant(#head {
-                    head: #v_head, method: #v_method, content_length: #v_len,
+                    head: #v_head, content_length: #v_len,
                 })
             };
             match item.kind {
@@ -264,7 +265,7 @@ impl State {
                     let done_v = started(&finished, quote!(()));
                     start.push(quote! {
                         Self::#variant(#head {
-                            head: #v_head, method: #v_method, content_length: #v_len,
+                            head: #v_head, content_length: #v_len,
                         }) => ::core::result::Result::Ok(match #v_bound {
                             #ns_core::manifold::stream::Boundary::End => #done_v,
                             #ns_core::manifold::stream::Boundary::More => #open_v,
@@ -276,7 +277,7 @@ impl State {
                     let done_v = started(&finished, quote!(#v_body));
                     start.push(quote! {
                         Self::#variant(#head {
-                            head: #v_head, method: #v_method, content_length: #v_len,
+                            head: #v_head, content_length: #v_len,
                         }) => match #body.try_start(#v_limit, #v_bound) {
                             ::core::result::Result::Ok(
                                 #ns_core::body::admit::Start::Open(#v_body),

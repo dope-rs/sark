@@ -15,6 +15,7 @@ pub struct Disabled;
 
 impl<C: Copy, S: Copy> life::Mode<C, S> for Disabled {
     const ENABLED: bool = false;
+    const RESPONSE_CHARGE: bool = false;
 
     type Retention = evidence::Off;
     type Observer = Infallible;
@@ -52,13 +53,4 @@ impl<E, O> endpoint::Mode<E, O> for Disabled {
 impl<C: Copy> sequence::Mode<C> for Disabled {
     type Session = ();
     type TransportTag = ();
-    type Trace = Infallible;
-
-    fn trace(&self) -> Option<&Self::Trace> {
-        None
-    }
-
-    fn trace_mut(&mut self) -> Option<&mut Self::Trace> {
-        None
-    }
 }

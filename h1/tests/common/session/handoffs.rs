@@ -4,7 +4,7 @@ use conn::write::{self, error};
 use dope::{
     core::{
         driver::{
-            retained,
+            self,
             route::{self, KeyTag},
             schedule::clock,
             settings,
@@ -35,10 +35,7 @@ use o3::buffer::{Complete as _, bytes::TryRetain, resident::bound, storage, stor
 use sark_h1::{
     Input, pump,
     pump::Completion,
-    server::{
-        payload,
-        payload::write::{CycleCommit, Response},
-    },
+    server::{payload, payload::write::CycleCommit},
     session,
     session::{Dispatch, RouteOutcome},
     switch,
@@ -262,7 +259,7 @@ impl<'observe: 'd, 'd, ID: route::Identity> handler::Borrowed<'d, ID> for App<'o
         self: Pin<&mut Self>,
         mut conn: conn::Ctx<'e, '_, '_, '_, '_, 'd, ID, Identity, Self::Conn, Self::Egress>,
         chunk: R,
-        driver: &mut retained::Context<'_, '_, 'd>,
+        driver: &mut driver::Context<'_, 'd>,
     ) -> receive::Outcome {
         let this = self.get_mut();
         if let Ok(raw) = conn.state().raw() {
@@ -295,7 +292,7 @@ impl<'observe: 'd, 'd, ID: route::Identity> handler::Borrowed<'d, ID> for App<'o
                 head::Connection::KeepAlive,
             );
             (this.observe)(Event::Cycle(&cycle));
-            Response::<()>::try_cycle(cycle, |_| ())
+            payload::write::try_cycle(cycle, |_| ())
         });
         (this.observe)(Event::Commit(&commit));
         if let Ok(write::Outcome::Committed(receipt)) = commit {

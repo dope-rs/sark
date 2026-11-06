@@ -3,7 +3,7 @@ use std::{marker, ops, pin};
 use conn::write::{self, body};
 use data::compose;
 use dope::{
-    core::driver::{retained, route::Identity},
+    core::driver::{self, route::Identity},
     manifold::network::listener::conn,
     net::{link::egress::data, wire},
 };
@@ -16,7 +16,7 @@ use crate::{
         date, deadline,
         payload::{
             self,
-            write::{CycleCommit, Failure, Response, Wake},
+            write::{CycleCommit, Failure, Wake},
         },
     },
     session, switch,
@@ -79,16 +79,14 @@ pub enum Flow {
 }
 
 impl Flow {
-    /// Applies one task-activity observation to this flow.
-    fn woken(self, activity: pump::Activity, wake: impl FnOnce()) -> Self {
-        match (self, activity) {
-            (Self::Continue, pump::Activity::Idle) => Self::Continue,
-            (Self::Continue, pump::Activity::Task | pump::Activity::Stream) => {
-                wake();
-                Self::Continue
-            }
-            (Self::Closed, _) => Self::Closed,
-        }
+    pub const fn is_runnable(&self, activity: pump::Activity) -> bool {
+        matches!(
+            (self, activity),
+            (
+                Self::Continue,
+                pump::Activity::Task | pump::Activity::Stream
+            )
+        )
     }
 }
 
@@ -118,19 +116,6 @@ impl<H> Drive<H> {
         self
     }
 
-    pub fn settle(
-        self,
-        activity: pump::Activity,
-        wake: impl FnOnce(),
-    ) -> (Flow, pump::Tail<H>, deadline::Progress) {
-        let Self {
-            flow,
-            tail,
-            progress,
-        } = self;
-        (flow.woken(activity, wake), tail, progress)
-    }
-
     pub fn into_parts(self) -> (Flow, pump::Tail<H>, deadline::Progress) {
         let Self {
             flow,
@@ -147,16 +132,6 @@ impl Settled {
             flow,
             progress: deadline::Progress::new(deadline::Head::Unchanged, deadline::Body::None),
         }
-    }
-
-    /// Applies one task-activity observation to this settled drive.
-    pub fn settle(
-        self,
-        activity: pump::Activity,
-        wake: impl FnOnce(),
-    ) -> (Flow, deadline::Progress) {
-        let Self { flow, progress } = self;
-        (flow.woken(activity, wake), progress)
     }
 
     pub fn into_parts(self) -> (Flow, deadline::Progress) {
@@ -177,7 +152,7 @@ impl<'a, 'd, H> Driver<'a, 'd, H> {
     pub fn resume<Runtime, Transitions, ID: Identity, W>(
         &mut self,
         conn: &mut Context<'_, '_, '_, '_, '_, 'd, ID, W, Runtime, H, Transitions>,
-        driver: &mut retained::Context<'_, '_, 'd>,
+        driver: &mut driver::Context<'_, 'd>,
     ) -> Settled
     where
         H: router::Routes<'d, Runtime, ID, Transitions>,
@@ -196,7 +171,7 @@ impl<'a, 'd, H> Driver<'a, 'd, H> {
         &mut self,
         bytes: &[u8],
         conn: &mut Context<'_, '_, '_, '_, '_, 'd, ID, W, Runtime, H, Transitions>,
-        driver: &mut retained::Context<'_, '_, 'd>,
+        driver: &mut driver::Context<'_, 'd>,
     ) -> Drive<Transitions::Staged>
     where
         H: router::Routes<'d, Runtime, ID, Transitions>,
@@ -232,7 +207,7 @@ impl<'a, 'd, H> Driver<'a, 'd, H> {
                 date: self.date,
             };
             let cycle = pump::Ingress::drive(state, pin::Pin::new(&mut disp), bytes, write, prior);
-            Response::<H::TransportTag>::try_cycle(cycle, |charge| {
+            payload::write::try_cycle(cycle, |charge| {
                 router::Routes::response_tag(
                     disp.app.as_mut(),
                     disp.id,
@@ -267,7 +242,7 @@ impl<'a, 'd, H> Driver<'a, 'd, H> {
             }
             Ok(write::Outcome::Closed) => return Drive::new(Flow::Closed),
             Err(cause) => {
-                let (receipt, failure) = match Response::<H::TransportTag>::reject(cause) {
+                let (receipt, failure) = match payload::write::reject(cause) {
                     Failure::Capacity(cause) => (None, body::Failure::Capacity(cause)),
                     Failure::Rejected { cause, receipt } => (Some(receipt), cause),
                 };
@@ -324,7 +299,7 @@ impl<'a, 'd, H> Driver<'a, 'd, H> {
     pub fn progress<Runtime, Transitions, ID: Identity, W>(
         &mut self,
         conn: &mut Context<'_, '_, '_, '_, '_, 'd, ID, W, Runtime, H, Transitions>,
-        driver: &mut retained::Context<'_, '_, 'd>,
+        driver: &mut driver::Context<'_, 'd>,
     ) -> Settled
     where
         H: router::Routes<'d, Runtime, ID, Transitions>,
@@ -336,8 +311,7 @@ impl<'a, 'd, H> Driver<'a, 'd, H> {
             pump::Next::None => Settled::new(Flow::Continue),
             pump::Next::Close(reason) => {
                 if !reason.is_empty()
-                    && let Some(reason) =
-                        Response::<H::TransportTag>::send_static(conn, reason, driver)
+                    && let Some(reason) = payload::write::send_static(conn, reason, driver)
                 {
                     conn.state_mut().defer(reason);
                     return Settled::new(Flow::Continue);

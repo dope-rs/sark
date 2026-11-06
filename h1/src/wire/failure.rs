@@ -33,6 +33,7 @@ pub enum Failure {
     Projection(Error),
     Bind(request::BindError),
     Route(route::Reject),
+    Upgrade(sark_ws::upgrade::Error),
     Fixed(fixed::Error),
     Chunk(chunked::Decode),
     View(retain::Error),
@@ -57,6 +58,7 @@ impl Failure {
             Self::Route(route::Reject::BadRequest) => canned::BAD_REQUEST,
             Self::Route(route::Reject::Internal) => canned::INTERNAL_SERVER_ERROR,
             Self::Route(route::Reject::Unavailable) => canned::SERVICE_UNAVAILABLE,
+            Self::Upgrade(_) => Body::new(sark_ws::server::Response::REJECTION),
             Self::PayloadTooLarge => canned::PAYLOAD_TOO_LARGE,
             Self::Projection(error) => match error {
                 Error::Borrowed { .. } | Error::Retention { .. } => canned::INTERNAL_SERVER_ERROR,

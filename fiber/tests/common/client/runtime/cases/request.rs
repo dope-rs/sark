@@ -88,6 +88,7 @@ impl<'a> Request<'a> {
             Flavor::Fixed => pools::Plan::new(addr.parse().map_err(Error::Address)?, config, 1, 1)
                 .map_err(Error::FixedPlan)?
                 .enter(
+                    (),
                     move |mut app| -> Result<_, Step> {
                         let client = app.handle;
                         app.wait().map_err(Step::Wait)?;
@@ -106,6 +107,7 @@ impl<'a> Request<'a> {
             Flavor::OnDemand => origins::Plan::new(config, 1, 1, 1)
                 .map_err(Error::DynamicPlan)?
                 .enter(
+                    (),
                     move |mut app| -> Result<_, Step> {
                         let client = app.handle;
                         let outcome = app
@@ -146,6 +148,7 @@ impl<'a> Request<'a> {
             Flavor::Fixed => pools::Plan::new(addr.parse().map_err(Error::Address)?, config, 1, 1)
                 .map_err(Error::FixedPlan)?
                 .enter(
+                    (),
                     move |mut app| -> Result<_, Step> {
                         let client = app.handle;
                         app.wait().map_err(Step::Wait)?;
@@ -166,6 +169,7 @@ impl<'a> Request<'a> {
             Flavor::OnDemand => origins::Plan::new(config, 1, 1, 1)
                 .map_err(Error::DynamicPlan)?
                 .enter(
+                    (),
                     move |mut app| -> Result<_, Step> {
                         let client = app.handle;
                         let outcome = app

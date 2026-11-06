@@ -44,6 +44,7 @@ fn redirect_cannot_replay_secrets() {
             origins::Plan::new(Config::new(redirect.addr().to_string()), 2, 1, 2)
                 .expect("dynamic client plan")
                 .enter(
+                    (),
                     |mut app| {
                         let failure = app.app
                             .block_on(app.handle.collect_with(Method::POST, "/start", &SECRETS, SECRET_BODY))
@@ -84,6 +85,7 @@ fn absolute_rejects_headers_and_body_before_dial() {
     )
     .expect("dynamic client plan")
     .enter(
+        (),
         |mut app| {
             for (headers, body) in [(&SECRETS[2..], &[][..]), (&[][..], SECRET_BODY)] {
                 let failure = app
@@ -141,6 +143,7 @@ fn redirect_alias_reuses_origin() {
             )
             .expect("one dynamic origin")
             .enter(
+                (),
                 |mut app| {
                     app.app
                         .block_on(app.handle.collect(Method::GET, &path, &[]))
@@ -194,6 +197,7 @@ fn routes_each_origin() {
                         origins::Plan::new(Config::new(first.addr().to_string()), 2, 1, 2)
                             .expect("dynamic client plan")
                             .enter(
+                                (),
                                 |mut app| {
                                     paths
                                         .iter()

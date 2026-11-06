@@ -464,9 +464,6 @@ impl State {
                 pending,
                 additional: added,
             }),
-            Err(state::Error::Growth { before, after }) => {
-                Err(Error::FeedbackGrowth { before, after })
-            }
         }
     }
 

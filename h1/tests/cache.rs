@@ -151,11 +151,9 @@ fn bounded_cache_prefix() {
             ),
         );
         let written = match outcome {
-            output::Outcome::SendCopied {
-                written,
-                body_bytes: payload,
-                ..
-            } if payload == source.len() => Some(written),
+            output::Outcome::SendCopied { written, copy, .. } if copy.written == source.len() => {
+                Some(written)
+            }
             _ => None,
         }
         .expect("bounded cache output");
@@ -234,10 +232,9 @@ fn retains_large() {
     assert_eq!(owner.len, first.len());
     assert_eq!(owner.charge.resident_bytes, resident);
     assert_eq!(owner.charge.owners, 1);
-    let (plan, copied) = output::Plan::split(outcome);
-    assert!(matches!(copied, output::Copy::Uncopied));
-    let (len, body) = match plan {
-        output::Plan::Shared {
+    assert!(matches!(outcome.copy(), output::Copy::Uncopied));
+    let (len, body) = match outcome {
+        output::Outcome::SendShared {
             hdr_written: len,
             body,
             ..
@@ -262,8 +259,11 @@ fn retains_large() {
         outcome,
         output::Outcome::SendCopied {
             written,
-            body_bytes: 512,
-            cause: evidence::Cause::Cached,
+            copy: evidence::Copy {
+                written: 512,
+                cause: evidence::Cause::Cached,
+                ..
+            },
             ..
         } if written == head + 512
     ));

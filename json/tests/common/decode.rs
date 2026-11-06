@@ -40,6 +40,10 @@ pub struct Strings {
 }
 
 pub const RAW: &[(&[u8], &[u8])] = &[
+    (
+        b" \t{\r\n \"text\" \t:\n \"x\" \r,\n \"number\"\t: -9223372036854775809 \t}\r\n",
+        b"-9223372036854775809",
+    ),
     (br#"{"text":"x","number":"a,b]}"}"#, br#""a,b]}""#),
     (
         br#"{"text":"x","number":[1,{"a":true}]}"#,

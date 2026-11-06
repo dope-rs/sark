@@ -1,7 +1,7 @@
 use dope::{
     core::Errno,
-    manifold::client::close::Reason,
-    net::link::{egress, event::ConnectFault, pool::change::opening::Exhaustion},
+    manifold::client::{attempt::ConnectFault, close::Reason},
+    net::link::{egress, pool::change::opening::Exhaustion},
 };
 use sark_client::protocol::Error;
 

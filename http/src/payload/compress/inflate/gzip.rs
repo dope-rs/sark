@@ -234,7 +234,7 @@ impl Gzip {
         plan: Plan<'a, I>,
         limit: usize,
         budget: &resident::Budget<'d>,
-    ) -> Result<Owned<resident::Lease<'d>>, DecodeError> {
+    ) -> Result<Owned<resident::Budget<'d>>, DecodeError> {
         let plan = plan.try_limit(limit)?;
         self.owned::<false, _, Infallible>(plan, limit, budget, &mut || Ok(()))
             .map_err(Checked::into_work)
@@ -249,7 +249,7 @@ impl Gzip {
         limit: usize,
         budget: &resident::Budget<'d>,
         mut check: impl FnMut() -> Result<(), E>,
-    ) -> Result<Owned<resident::Lease<'d>>, Checked<DecodeError, E>> {
+    ) -> Result<Owned<resident::Budget<'d>>, Checked<DecodeError, E>> {
         let plan = plan.try_limit(limit).map_err(Checked::Work)?;
         check().map_err(Checked::Check)?;
         self.owned::<true, _, E>(plan, limit, budget, &mut check)
@@ -261,7 +261,7 @@ impl Gzip {
         limit: usize,
         budget: &resident::Budget<'d>,
         check: &mut impl FnMut() -> Result<(), E>,
-    ) -> Result<Owned<resident::Lease<'d>>, Checked<DecodeError, E>> {
+    ) -> Result<Owned<resident::Budget<'d>>, Checked<DecodeError, E>> {
         let free = budget.available();
         let seed = plan.size_hint.min(STEP);
         let mut output = Owned::try_allocate(budget, seed).map_err(|cause| {
@@ -314,7 +314,7 @@ impl Gzip {
 }
 
 fn fill<const CHECK: bool, E>(
-    output: &mut Owned<resident::Lease<'_>>,
+    output: &mut Owned<resident::Budget<'_>>,
     check: &mut impl FnMut() -> Result<(), E>,
 ) -> Result<(), E> {
     static ZERO: [u8; STEP] = [0; STEP];

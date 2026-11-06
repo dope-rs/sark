@@ -36,11 +36,9 @@ pub(super) fn expr(
                 ));
             }
             match class.scalar {
-                scalar::Scalar::Bytes => quote::quote!(#ns_json::Source::frame_depth(
-                    #v_raw,
-                    &mut #v_idx,
-                    #v_depth,
-                )?),
+                scalar::Scalar::Bytes => {
+                    quote::quote!(#ns_json::Source::frame(#v_raw, &mut #v_idx)?)
+                }
                 scalar::Scalar::Borrowed => {
                     if mode.raw {
                         quote::quote!(#ns_json::Source::raw_depth(
@@ -139,9 +137,7 @@ pub(super) fn expr(
                 "retained JSON bytes must be rewritten for request views",
             ));
         }
-        scalar::Scalar::Bytes => quote::quote!(#ns_json::Source::frame_depth(
-            #v_raw, &mut #v_idx, #v_depth,
-        )?),
+        scalar::Scalar::Bytes => quote::quote!(#ns_json::Source::frame(#v_raw, &mut #v_idx)?),
         scalar::Scalar::Token => {
             if mode.plain && !mode.raw {
                 quote::quote!(#ns_json::Source::inline_plain(#v_raw, &mut #v_idx)?)

@@ -224,7 +224,7 @@ impl<
         status: Code,
         headers: H,
     ) -> Result<<Self as dispatch::Accept<'d>>::Output, <Self as dispatch::Accept<'d>>::Error> {
-        self.prepare(status, headers, fixed::Body::new(&[]))
+        self.prepare(status, headers, fixed::Body::new(&[]), Boundary::End)
     }
 
     fn prepare<H, B>(
@@ -232,13 +232,14 @@ impl<
         status: Code,
         headers: H,
         value: B,
+        end: Boundary,
     ) -> Result<<Self as dispatch::Accept<'d>>::Output, <Self as dispatch::Accept<'d>>::Error>
     where
         H: headers::Source,
         B: Body<'d>,
     {
         let boundary = if value.is_empty() {
-            Boundary::End
+            end
         } else {
             Boundary::More
         };
@@ -283,7 +284,7 @@ impl<
         if self.omit(status)? {
             return self.empty(status, headers);
         }
-        self.prepare(status, headers, body)
+        self.prepare(status, headers, body, Boundary::End)
     }
 
     fn exact<H, B>(mut self, status: Code, headers: H, body: B) -> Result<Self::Output, Self::Error>
@@ -299,7 +300,7 @@ impl<
         let body = plan
             .into_shared()
             .map_err(|error| (conn::Error::Build(error), self.stream))?;
-        self.prepare(status, headers, body)
+        self.prepare(status, headers, body, Boundary::End)
     }
 
     fn bounded<H, B>(
@@ -318,7 +319,33 @@ impl<
         let body = bounded::Plan::new(body)
             .into_shared()
             .map_err(|error| (conn::Error::Build(error), self.stream))?;
-        self.prepare(status, headers, body)
+        self.prepare(status, headers, body, Boundary::End)
+    }
+}
+
+impl<
+    'a,
+    'req,
+    'd: 'req,
+    F: rules::Policy,
+    E: event::Evidence,
+    Q: scope::Source,
+    O: stage::Body<'req, 'd>,
+> dispatch::Sink<'d> for Encoder<'a, 'req, 'd, F, E, Q, O>
+{
+    type Stream<S> = (<Self as dispatch::Accept<'d>>::Output, Option<S>);
+
+    fn stream<H: headers::Source, S>(
+        mut self,
+        status: Code,
+        headers: H,
+        stream: S,
+    ) -> Result<Self::Stream<S>, Self::Error> {
+        if self.omit(status)? {
+            return self.empty(status, headers).map(|head| (head, None));
+        }
+        self.prepare(status, headers, fixed::Body::new(&[]), Boundary::More)
+            .map(|head| (head, Some(stream)))
     }
 }
 
@@ -336,6 +363,14 @@ impl<'a, 'req, 'd: 'req, F: rules::Policy, E: event::Evidence, O: stage::Body<'r
             stream: self.stream,
             body: self.body.with_head(head),
         }
+    }
+}
+
+impl<'a, 'req, 'd: 'req, F: rules::Policy, E: event::Evidence, O: stage::Body<'req, 'd>>
+    decode::Streaming<'req, 'd> for Encoder<'a, 'req, 'd, F, E, (), O>
+{
+    fn split_stream<S>(output: Self::Stream<S>) -> (Self::Prepared, Option<S>) {
+        output
     }
 }
 

@@ -3,7 +3,7 @@ use crate::{
     inbound::{Fault, valid},
 };
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 #[repr(u16)]
 pub(crate) enum Code {
     Protocol = 1002,

@@ -2,7 +2,7 @@
 
 use data::compose;
 use dope::{
-    core::driver::{retained, route::Identity},
+    core::driver::{self, route::Identity},
     manifold::network::listener::{conn, handler},
     net::{link::egress::data, wire},
 };
@@ -22,7 +22,8 @@ where
 {
     fn begin<W: wire::Spec>(
         conn: conn::Ctx<'_, '_, '_, '_, '_, 'd, ID, W, Self, B>,
-        driver: &mut retained::Context<'_, '_, 'd>,
+        driver: &mut driver::Context<'_, 'd>,
+        scratch: &mut Vec<u8>,
     ) -> handler::Drain;
 }
 
@@ -34,7 +35,8 @@ where
 {
     fn begin<W: wire::Spec>(
         mut conn: conn::Ctx<'_, '_, '_, '_, '_, 'd, ID, W, Self, B>,
-        _: &mut retained::Context<'_, '_, 'd>,
+        _: &mut driver::Context<'_, 'd>,
+        _: &mut Vec<u8>,
     ) -> handler::Drain {
         let state = conn.state();
         if state.can_resume() {
@@ -82,12 +84,13 @@ where
                 bound::Unbounded,
             >,
         >,
-        driver: &mut retained::Context<'_, '_, 'd>,
+        driver: &mut driver::Context<'_, 'd>,
+        scratch: &mut Vec<u8>,
     ) -> handler::Drain {
         conn.close_after();
         let mode = conn.state().mode();
         if matches!(mode, switch::Mode::Raw(_)) {
-            return Runtime::<_, K>::new(&mut conn).finish_input(driver);
+            return Runtime::<_, K>::new(&mut conn, scratch).finish_input(driver);
         }
         let state = conn.state_mut();
         if state.can_resume() {

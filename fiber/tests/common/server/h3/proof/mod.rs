@@ -11,7 +11,6 @@ use std::{cell, cell::Cell, net, rc, rc::Rc, time::Instant};
 use dope::{
     core::{driver::result::SubmitError, io::datagram::ReceiveError},
     manifold::network::datagram::RejectCause,
-    runtime::shutdown,
 };
 use dope_quic::{
     conn::{id, life::tls::clients::Authority, output::transmit, stream},
@@ -19,7 +18,10 @@ use dope_quic::{
     proto::param,
     wire::stream::Id,
 };
-use dope_test::harness::observe::VecCellExt as _;
+use dope_test::{
+    fibers,
+    harness::{observe::VecCellExt as _, signals::Progress},
+};
 use ledger::Trace;
 use sark_core::manifold::stream::Boundary;
 
@@ -60,6 +62,7 @@ const fn large_json_input() -> [u8; LARGE_JSON_LEN] {
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum Dispatch {
+    Established,
     Initial,
     AfterCancellation,
     AfterFailure,
@@ -74,11 +77,13 @@ pub(crate) struct Connect {
     pub(crate) initial_dcid: Vec<u8>,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CancelAction {
     RequestCancelled,
     StopSending,
     Qpack,
+    QpackAcknowledgment,
+    QpackIncrement,
     KeyClose,
 }
 
@@ -87,13 +92,14 @@ pub enum Readiness {
     ExchangeOpened,
     HeadAdmitted,
     TaskPollPending,
+    TaskPollReady(usize),
+    StreamPending,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub struct Cancellation {
     pub action: CancelAction,
     pub readiness: Readiness,
-    pub expected_task_drops: usize,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
@@ -115,6 +121,7 @@ pub struct Proof<'a> {
     pub trace: Trace,
     pub cancel: Cancel,
     pub network: Network,
+    pub stream: Rc<crate::common::route::body::Trace>,
 }
 
 /// Keeps the coupled proof borrowed while failure reporting stays independent.
@@ -155,41 +162,36 @@ impl<'a> Shared<'a> {
     }
 }
 
+#[derive(Default)]
 pub(crate) struct Failures {
     pub(crate) values: cell::Cell<Vec<Failure>>,
-    stop: cell::Cell<Option<shutdown::Trigger>>,
+    pub(crate) done: Cell<bool>,
 }
 
 impl Failures {
-    fn new(stop: shutdown::Trigger) -> Self {
-        Self {
-            values: Cell::new(Vec::new()),
-            stop: Cell::new(Some(stop)),
-        }
-    }
-
     pub(crate) fn record(&self, error: Failure) {
         self.values.push(error);
     }
 
     fn fail(&self, error: Failure) {
         self.record(error);
-        self.stop();
+        self.done.set(true);
     }
 
-    fn stop(&self) {
-        if let Some(stop) = self.stop.take()
-            && let Err(error) = stop.fire()
-        {
-            self.record(Failure::Shutdown(error));
+    pub(crate) fn try_wait<'d>(
+        &self,
+        app: &mut impl dope_fiber::BlockOn<'d>,
+    ) -> std::result::Result<(), fibers::Run> {
+        match fibers::TEST.try_wait(app, self, 1)? {
+            fibers::Wait::Reached => Ok(()),
+            fibers::Wait::Deadline => Err(fibers::Run::Deadline),
         }
     }
+}
 
-    pub(crate) fn is_pending(&self) -> bool {
-        let stop = self.stop.take();
-        let pending = stop.is_some();
-        self.stop.set(stop);
-        pending
+impl Progress for Failures {
+    fn hits(&self) -> u32 {
+        u32::from(self.done.get())
     }
 }
 
@@ -214,6 +216,7 @@ pub struct Cancel {
 
 pub struct Network {
     pub goaway: Option<u64>,
+    pub(crate) protocol: options::Config,
     pub(crate) connect: Vec<Connect>,
     pub(crate) endpoint: Endpoint,
     pub(crate) failures: Rc<Failures>,
@@ -235,12 +238,12 @@ impl<'a> Proof<'a> {
     pub(crate) fn new(
         requests: Vec<Spec<'a>>,
         deadline: Instant,
-        stop: shutdown::Trigger,
         cancel: Option<Cancellation>,
     ) -> Self {
         let count = requests.len();
         Self {
             requests,
+            stream: Rc::new(crate::common::route::body::Trace::default()),
             replies: Replies {
                 streams: vec![None; count],
                 bodies: iter::repeat_with(Vec::new).take(count).collect(),
@@ -264,9 +267,16 @@ impl<'a> Proof<'a> {
             },
             network: Network {
                 goaway: None,
+                protocol: options::Config {
+                    protocol: options::Protocol {
+                        extended_connect: field::metadata::block::Connect::Enabled,
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                },
                 connect: Vec::new(),
                 endpoint: Endpoint::default(),
-                failures: Rc::new(Failures::new(stop)),
+                failures: Rc::new(Failures::default()),
                 rejected: 0,
                 deadline,
             },
@@ -298,7 +308,7 @@ impl<'a> Proof<'a> {
 
     pub(crate) fn stop_done(&mut self) {
         if self.replies.finished.iter().all(|finished| *finished) {
-            self.network.failures.stop();
+            self.network.failures.done.set(true);
         }
     }
 
@@ -307,11 +317,7 @@ impl<'a> Proof<'a> {
     }
 
     pub(crate) fn is_cancelled(&self) -> bool {
-        self.cancel.request.is_some_and(|cancel| {
-            self.cancel.issued
-                && self.cancel.retired
-                && self.cancel.dropped.get() == cancel.expected_task_drops
-        })
+        self.cancel.issued && self.cancel.retired
     }
 
     pub(crate) fn has_failed(&self) -> bool {
@@ -320,8 +326,9 @@ impl<'a> Proof<'a> {
             .iter()
             .enumerate()
             .filter_map(|(slot, request)| {
-                (request.dispatch == Dispatch::Initial && request.expect.error.is_some())
-                    .then_some(slot)
+                (matches!(request.dispatch, Dispatch::Established | Dispatch::Initial)
+                    && request.expect.error.is_some())
+                .then_some(slot)
             });
         let mut found = false;
         for slot in failures {
@@ -381,6 +388,7 @@ pub enum Failure {
     Borrow(cell::BorrowError),
     BorrowMut(cell::BorrowMutError),
     Field(field::Error),
+    Range(o3::buffer::storage::range::Error),
     Scenario(String),
     Receive(manifold::Error),
     Socket(ReceiveError),
@@ -394,7 +402,6 @@ pub enum Failure {
     Access(errors::Access),
     Stream(stream::Error),
     Index(num::TryFromIntError),
-    Shutdown(shutdown::FireError),
     Counter(Metric, usize, usize),
     Sleep(sleep::Error),
     Guard {

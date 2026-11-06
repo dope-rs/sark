@@ -130,8 +130,6 @@ fn request_error_code(error: requests::Error) -> frame::ErrorCode {
         )
         | requests::Error::Lookup(_)
         | requests::Error::Identity
-        | requests::Error::ReadyStatus
-        | requests::Error::Resume
         | requests::Error::Build
         | requests::Error::Dispatch => frame::ErrorCode::Internal,
     }

@@ -74,10 +74,11 @@ impl Plan {
         Ok(Self { http, address })
     }
 
-    pub fn enter<R, Out>(
+    pub fn enter<C: executor::Build, R, Out>(
         self,
+        context: C,
         run: impl for<'app, 'life, 's, 'm, 'h, 'n, 'f, 'e, 'b, 'c, 'd> FnOnce(
-            Scope<'app, 'life, 's, 'm, 'h, 'n, 'f, 'e, 'b, 'c, 'd>,
+            Scope<'app, 'life, 's, 'm, 'h, 'n, 'f, 'e, 'b, 'c, 'd, C::Shutdown>,
         ) -> R,
         policy: impl recovery::Observe,
         done: impl for<'a> FnOnce(Result<R, Error<'a>>) -> Out,
@@ -89,7 +90,8 @@ impl Plan {
         let prepared = topology::Plan::new((), (http, plan))
             .for_install::<timing::Balanced>()
             .map_err(Failure::Claim)?;
-        Ok(prepared.with_local(
+        Ok(prepared.enter_with(
+            context,
             move |worker| {
                 worker.lend(|(http, plan), stage| {
                     http.try_with(stage, lending::Stage::driver, |port, stage| {
@@ -193,15 +195,16 @@ impl Plan {
 }
 
 /// Live fixed-endpoint HTTP client bound to one application lifetime.
-pub struct Scope<'app, 'life: 'app, 's, 'm, 'h, 'n, 'f, 'e, 'b, 'c, 'd: 'life + 'f> {
-    pub app: session::App<'app, 'life, 'd, Owner<'s, 'm, 'h, 'n, 'f, 'e, 'b, 'c, 'd>>,
+pub struct Scope<'app, 'life: 'app, 's, 'm, 'h, 'n, 'f, 'e, 'b, 'c, 'd: 'life + 'f, Q = ()> {
+    pub app: session::App<'app, 'life, 'd, Owner<'s, 'm, 'h, 'n, 'f, 'e, 'b, 'c, 'd>, Q>,
     pub handle: Handle<'app, 's, 'f, 'e, 'b, 'c, 'd>,
 }
 
-impl<'app, 'life: 'app, 's, 'm, 'h, 'n, 'f, 'e, 'b, 'c, 'd: 'life + 'f>
-    Scope<'app, 'life, 's, 'm, 'h, 'n, 'f, 'e, 'b, 'c, 'd>
+impl<'app, 'life: 'app, 's, 'm, 'h, 'n, 'f, 'e, 'b, 'c, 'd: 'life + 'f, Q>
+    Scope<'app, 'life, 's, 'm, 'h, 'n, 'f, 'e, 'b, 'c, 'd, Q>
 where
     Owner<'s, 'm, 'h, 'n, 'f, 'e, 'b, 'c, 'd>: executor::raw::App<'d>,
+    Q: executor::Startup,
 {
     /// Waits until the fixed connector admits its endpoint.
     pub fn wait(&mut self) -> Result<(), WaitError> {

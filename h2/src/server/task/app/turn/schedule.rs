@@ -1,22 +1,24 @@
-use dope::{core::driver::route::Identity, manifold::network::listener::conn};
+use dope::{core::driver::route::Identity, manifold::network::listener::conn, net::wire};
 use o3::mem::quota;
 use sark_core::{
     decode::{self, request},
-    manifold::task::app::Runtime,
+    manifold::{server::app as semantic, task::app::Runtime},
 };
+use sark_http::field::metadata::section::rules;
 
 use crate::{
     conn::Error,
     server::{
         response::Handoff,
+        runtime::app::Fault,
         state::Transitions,
         task::{
-            Borrowed, Target,
+            Borrowed, Build, Target,
             app::{
                 header::admit::Begin,
                 turn::{Availability, Outcome, Turn, guard::Guard},
             },
-            works,
+            service, works,
         },
     },
 };
@@ -26,24 +28,28 @@ pub(in crate::server::task::app) trait Schedule<'d, R>:
 where
     R: Runtime<'d>,
 {
-    fn admit<ID: Identity + 'd, Q>(
+    fn admit<ID: Identity + 'd, Q, W, A, P>(
         graph: &mut Self::Graph,
-        turn: &mut Turn<'_, '_, '_, '_, 'd, ID, R, Q>,
-    ) -> quota::Admission<Result<Outcome, Error>>
+        turn: &mut Turn<'_, '_, '_, 'd, ID, R, Q, W, A, P>,
+    ) -> quota::Admission<Result<Outcome, semantic::Error<Error, A::Failure>>>
     where
         R: Runtime<'d, Target = Target<'d, ID>>,
         Q: Transitions<conn::Id<'d, ID>>,
-        Q::Retention: Handoff;
+        Q::Retention: Handoff,
+        W: wire::Spec,
+        A: service::Select<R>
+            + semantic::Application<'d, service::Connection<'d, A>, conn::Id<'d, ID>>,
+        P: Fault<'d, W, A::Failure, ID, Build<A::Build>>;
 
     fn account(graph: &mut Self::Graph);
 
-    fn has_pending(state: &mut Borrowed<'_, 'd, R>) -> Availability;
+    fn has_pending<F: rules::Policy>(state: &mut Borrowed<'_, 'd, R, F>) -> Availability;
 
-    fn has_local(state: &mut Borrowed<'_, 'd, R>) -> Availability {
+    fn has_local<F: rules::Policy>(state: &mut Borrowed<'_, 'd, R, F>) -> Availability {
         Self::has_pending(state)
     }
 
-    fn is_ready(state: &mut Borrowed<'_, 'd, R>) -> Availability {
+    fn is_ready<F: rules::Policy>(state: &mut Borrowed<'_, 'd, R, F>) -> Availability {
         match Self::has_local(state) {
             Availability::Ready => Availability::Ready,
             Availability::Idle if state.has_events() || state.responses.has_runnable() => {
@@ -60,14 +66,18 @@ where
     R::Head: request::Head<Start = request::Plain<U>>,
     request::Plain<U>: Begin<'d, R>,
 {
-    fn admit<ID: Identity + 'd, Q>(
+    fn admit<ID: Identity + 'd, Q, W, A, P>(
         graph: &mut Self::Graph,
-        turn: &mut Turn<'_, '_, '_, '_, 'd, ID, R, Q>,
-    ) -> quota::Admission<Result<Outcome, Error>>
+        turn: &mut Turn<'_, '_, '_, 'd, ID, R, Q, W, A, P>,
+    ) -> quota::Admission<Result<Outcome, semantic::Error<Error, A::Failure>>>
     where
         R: Runtime<'d, Target = Target<'d, ID>>,
         Q: Transitions<conn::Id<'d, ID>>,
         Q::Retention: Handoff,
+        W: wire::Spec,
+        A: service::Select<R>
+            + semantic::Application<'d, service::Connection<'d, A>, conn::Id<'d, ID>>,
+        P: Fault<'d, W, A::Failure, ID, Build<A::Build>>,
     {
         graph.admit(|source| match source {
             works::Plain::Build => turn.build(),
@@ -84,7 +94,7 @@ where
         graph.account(works::Plain::Egress);
     }
 
-    fn has_pending(state: &mut Borrowed<'_, 'd, R>) -> Availability {
+    fn has_pending<F: rules::Policy>(state: &mut Borrowed<'_, 'd, R, F>) -> Availability {
         if state.build_ready.is_empty() {
             Availability::Idle
         } else {
@@ -99,14 +109,18 @@ where
     R::Head: request::Head<Start = S>,
     S: Guard + works::Family<Graph = works::GuardedGraph> + Begin<'d, R>,
 {
-    fn admit<ID: Identity + 'd, Q>(
+    fn admit<ID: Identity + 'd, Q, W, A, P>(
         graph: &mut Self::Graph,
-        turn: &mut Turn<'_, '_, '_, '_, 'd, ID, R, Q>,
-    ) -> quota::Admission<Result<Outcome, Error>>
+        turn: &mut Turn<'_, '_, '_, 'd, ID, R, Q, W, A, P>,
+    ) -> quota::Admission<Result<Outcome, semantic::Error<Error, A::Failure>>>
     where
         R: Runtime<'d, Target = Target<'d, ID>>,
         Q: Transitions<conn::Id<'d, ID>>,
         Q::Retention: Handoff,
+        W: wire::Spec,
+        A: service::Select<R>
+            + semantic::Application<'d, service::Connection<'d, A>, conn::Id<'d, ID>>,
+        P: Fault<'d, W, A::Failure, ID, Build<A::Build>>,
     {
         graph.admit(|source| match source {
             works::Guarded::Admission => turn.admission(),
@@ -124,7 +138,7 @@ where
         graph.account(works::Guarded::Egress);
     }
 
-    fn has_pending(state: &mut Borrowed<'_, 'd, R>) -> Availability {
+    fn has_pending<F: rules::Policy>(state: &mut Borrowed<'_, 'd, R, F>) -> Availability {
         if state.admission_ready.is_empty() && state.build_ready.is_empty() {
             Availability::Idle
         } else {
@@ -132,7 +146,7 @@ where
         }
     }
 
-    fn has_local(state: &mut Borrowed<'_, 'd, R>) -> Availability {
+    fn has_local<F: rules::Policy>(state: &mut Borrowed<'_, 'd, R, F>) -> Availability {
         if state.can_admit() || !state.build_ready.is_empty() {
             Availability::Ready
         } else {

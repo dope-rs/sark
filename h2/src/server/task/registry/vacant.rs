@@ -22,7 +22,6 @@ pub(in crate::server::task) struct Vacant<'a, 'd, ID: Identity, T> {
     task: Slot<'a, 'd, ID, T>,
     index: direct::Vacant<'a, stream::Key, slab::Handle<Tag>>,
     connection: conn::Id<'d, ID>,
-    stream: stream::Key,
 }
 
 impl<'a, 'd, ID: Identity + 'd, T> Vacant<'a, 'd, ID, T> {
@@ -30,7 +29,6 @@ impl<'a, 'd, ID: Identity + 'd, T> Vacant<'a, 'd, ID, T> {
         task: Slot<'a, 'd, ID, T>,
         index: direct::Vacant<'a, stream::Key, slab::Handle<Tag>>,
         id: conn::Id<'d, ID>,
-        stream: stream::Key,
     ) -> Self {
         const {
             assert!(
@@ -42,7 +40,6 @@ impl<'a, 'd, ID: Identity + 'd, T> Vacant<'a, 'd, ID, T> {
             task,
             index,
             connection: id,
-            stream,
         }
     }
 
@@ -54,14 +51,14 @@ impl<'a, 'd, ID: Identity + 'd, T> Vacant<'a, 'd, ID, T> {
             task,
             index,
             connection: id,
-            stream,
         } = self;
         let occupied = task.try_insert(|key| {
             let target = Target::new(key);
             build(target).map(|task| Record {
                 connection: id,
-                stream,
+                stream: index.key(),
                 task,
+                unreported: true,
             })
         })?;
         index.insert(occupied.key());

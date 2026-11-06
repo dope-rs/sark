@@ -85,6 +85,7 @@ where
         let mut policy = policies::Direct;
         self.state
             .cancel_feed(stream.stream, stream.completion, &mut policy);
+        self.state.refill(&mut policy);
     }
 }
 
@@ -123,14 +124,5 @@ where
         done: &mut policies::Notify<'notify, '_, '_>,
     ) -> Result<receive::Progress<receive::Response<C>>, crate::Status> {
         self.state.poll_stream(stream.completion, done)
-    }
-
-    pub(in crate::client) fn cancel_response<'notify>(
-        &mut self,
-        stream: Stream<'scope, P::Key>,
-        done: &mut policies::Notify<'notify, '_, '_>,
-    ) {
-        self.state
-            .cancel_feed(stream.stream, stream.completion, done);
     }
 }

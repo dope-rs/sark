@@ -1,4 +1,7 @@
-use o3::{alloc, buffer::write::consume};
+use o3::{
+    alloc,
+    buffer::{pool, write::consume},
+};
 
 use crate::hpack::encode;
 
@@ -13,6 +16,7 @@ pub enum Ingress {
     Input(alloc::Error),
     Events(alloc::Error),
     Decoder(alloc::Error),
+    HeaderLayout(pool::LayoutError),
     Pool(alloc::Exhausted),
 }
 

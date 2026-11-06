@@ -1,6 +1,8 @@
-use o3::buffer::{hold::evidence::On, storage};
+use dope::net::link::egress::data::compose;
+use o3::buffer::{hold::evidence::On, resident::bound, storage};
+use sark_core::life;
 use sark_h1::{
-    server::task::turn,
+    server::{payload, task::turn},
     wire::{head, output},
 };
 use sark_http::{owner::evidence, payload::owned::Segments};
@@ -9,8 +11,11 @@ use sark_http::{owner::evidence, payload::owned::Segments};
 fn inline_copy_tracks_body() {
     let action: output::Outcome<'static> = output::Outcome::SendCopied {
         written: 128,
-        body_bytes: 17,
-        cause: evidence::Cause::Inline,
+        copy: evidence::Copy {
+            read: 23,
+            written: 17,
+            cause: evidence::Cause::Compressed,
+        },
         connection: head::Connection::KeepAlive,
     };
     assert!(matches!(
@@ -20,9 +25,9 @@ fn inline_copy_tracks_body() {
     assert!(matches!(
         action.copy(),
         output::Copy::Copied(evidence::Copy {
-            read: 17,
+            read: 23,
             written: 17,
-            cause: evidence::Cause::Inline,
+            cause: evidence::Cause::Compressed,
         })
     ));
     let done = <On as turn::Mode>::complete(action.retention());
@@ -67,13 +72,18 @@ fn linked_uses_enum_state() {
         action.retention(),
         output::Retention::Linked(owner) if owner.len == 8
     ));
+    assert!(matches!(action.copy(), output::Copy::Uncopied));
+    let response = payload::write::try_outcome::<bound::Unbounded, _, _, _>(
+        action,
+        &mut life::mode::Disabled,
+        life::exchange::Id::new((), 0),
+        |conn, _| conn,
+    )
+    .unwrap_or_else(|_| panic!("linked response"));
+    let (written, body, connection, _) = response.into_parts();
     assert!(matches!(
-        output::Plan::split(action),
-        (output::Plan::Segments {
-            hdr_written: 64,
-            body,
-            connection: head::Connection::KeepAlive,
-        }, output::Copy::Uncopied)
-            if body.segment(0).is_some_and(|bytes| bytes.as_ptr() == original)
+        (written, body.map(|body| body.into_inner().into_inner()), connection),
+        (64, Some(compose::Either::Left(payload::Body::Shared { owner, .. })), head::Connection::KeepAlive)
+            if owner.as_ref().as_ptr() == original
     ));
 }

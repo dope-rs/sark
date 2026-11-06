@@ -16,6 +16,9 @@ pub(in crate::qpack::ledger) use row::Row;
 pub(in crate::qpack::ledger) use table::Table;
 
 pub(super) const NONE: u32 = u32::MAX;
+// The u32-bounded allocation contains multiple planes per section, so both
+// terminal links lie above every admitted section index.
+pub(super) const UNPUBLISHED: u32 = NONE - 1;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(super) struct Section(pub(in crate::qpack::ledger::store) capacity::Count);
@@ -44,7 +47,7 @@ pub(super) struct Resident<'a> {
     pub(super) position: Position,
 }
 
-pub(super) struct Occupied<'a> {
+pub(crate) struct Occupied<'a> {
     pub(super) owner: &'a mut Store,
     pub(super) section: Section,
 }
@@ -95,6 +98,15 @@ impl<'a> Occupied<'a> {
             required: self.row().count(Count::Required),
             minimum: self.row().count(Count::Minimum),
         }
+    }
+
+    pub(crate) fn is_ready(&self, published: u64) -> bool {
+        self.counts().required() <= published
+    }
+
+    /// Consumes the native response's live unpublished head after queue admission.
+    pub(crate) fn publish_initial(mut self) {
+        self.row_mut().node(Node::Next, NONE);
     }
 
     pub(super) fn resident(self) -> Resident<'a> {
@@ -234,13 +246,19 @@ impl Store {
         })
     }
 
-    fn acquire(&mut self, free: &Free, counts: Counts, stream: Stream) -> Allocated {
+    fn acquire(
+        &mut self,
+        free: &Free,
+        counts: Counts,
+        stream: Stream,
+        published: bool,
+    ) -> Allocated {
         let section = free.section;
         // SAFETY: only Table<Free> calls this leaf, while retaining the exact
         // admission owner; its vacant section has not been published or reused.
         let mut row = Row::new(unsafe { depot::raw::Proof::new((&mut *self, section.raw())) });
         let next = row.view().node(Node::Next);
-        row.node(Node::Next, NONE);
+        row.node(Node::Next, if published { NONE } else { UNPUBLISHED });
         row.node(Node::Owner, stream.raw());
         row.node(Node::HeapPosition, NONE);
         row.node(Node::BlockPrevious, NONE);

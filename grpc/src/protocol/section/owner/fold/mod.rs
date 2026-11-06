@@ -5,7 +5,7 @@ use crate::{
     details::Binary,
     protocol::{
         request::timeout,
-        section::{JOINED, owner::check::Check, seal},
+        section::{JOINED, Seal, seal},
     },
 };
 
@@ -54,16 +54,16 @@ impl<'a> Fold<'a> {
         }
     }
 
-    pub(super) fn finish(mut self, check: &mut Check) -> Result<(), Failure> {
+    pub(super) fn finish(mut self, seal: &mut Seal) -> Result<(), Failure> {
         let end = self.lease.len();
-        let result = self.fields(check, end);
+        let result = self.fields(seal, end);
         self.lease.truncate(self.written);
         result
     }
 
-    fn fields(&mut self, check: &mut Check, end: usize) -> Result<(), Failure> {
+    fn fields(&mut self, seal: &mut Seal, end: usize) -> Result<(), Failure> {
         while self.read < end {
-            current::field(self, check, end)?;
+            current::field(self, seal, end)?;
         }
         Ok(())
     }

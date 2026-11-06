@@ -5,18 +5,16 @@ use std::{mem, ops};
 
 use o3::{
     alloc,
-    buffer::{pool, pool::owners, storage, write::consume},
+    buffer::{storage, write::consume},
     mem::rc,
 };
 use sark_http::{
     h1::switch::Kind,
-    payload::{compress::Gzip, fixed, owned},
+    payload::{compress, fixed, owned},
 };
-use session::batch;
 
 use crate::{
     server::deadline,
-    session,
     wire::{head, output},
 };
 
@@ -96,138 +94,93 @@ impl Tasks for () {
 
 const _: () = assert!(mem::size_of::<Activity>() == 1);
 
-/// Body ownership carried across the transport submission boundary.
-pub enum Body<'d> {
-    None,
-    Static(fixed::Body<'d>),
-    Shared(storage::Shared),
-    Frozen(
-        pool::Span<
-            owners::Plain<pool::Fixed<{ Gzip::SLOTS.get() }, { Gzip::CAPACITY.get() }>>,
-            pool::Owned,
-            pool::Frozen,
-        >,
-    ),
-    Segmented(owned::Segments<'d>),
-}
-
-impl<'d> Body<'d> {
-    /// Exact owner charge submitted to the transport.
-    fn retention(&self) -> output::Owner {
-        match self {
-            Self::None | Self::Static(_) => output::Owner::default(),
-            Self::Shared(body) => output::Owner::shared(body),
-            Self::Frozen(body) => output::Owner::shared(body),
-            Self::Segmented(body) => output::Owner::segmented(body),
-        }
-    }
-
-    fn from_split(body: batch::SplitBody<'d>) -> Self {
-        match body {
-            batch::SplitBody::Static(body) => Self::Static(body),
-            batch::SplitBody::Shared(body) => Self::Shared(body),
-            batch::SplitBody::Frozen(body) => Self::Frozen(body),
-            batch::SplitBody::Segmented(body) => Self::Segmented(body),
-        }
-    }
-}
-
 /// Transport-independent command produced by one pump cycle.
 pub enum Egress<'d> {
     None,
     /// The runtime parked work and needs its target scheduled.
     Wake,
-    /// Initialized prefix followed by its unchanged body owner.
-    Write {
+    Inline {
         prefix: usize,
-        body: Body<'d>,
+    },
+    Static {
+        prefix: usize,
+        body: fixed::Body<'d>,
+    },
+    Shared {
+        prefix: usize,
+        body: storage::Shared,
+    },
+    Frozen {
+        prefix: usize,
+        body: compress::Frozen,
+    },
+    Segmented {
+        prefix: usize,
+        body: owned::Segments<'d>,
     },
 }
 
 impl<'d> Egress<'d> {
-    pub(crate) fn output(action: output::Plan<'d>) -> (Self, head::Connection) {
-        let (prefix, body, connection) = match action {
-            output::Plan::Inline {
-                written,
+    pub(crate) fn output(action: output::Outcome<'d>) -> (Self, head::Connection) {
+        match action {
+            output::Outcome::Send {
+                written: prefix,
                 connection,
-            } => (written, Body::None, connection),
-            output::Plan::Static {
-                hdr_written,
-                body,
-                connection,
-            } => (hdr_written, Body::Static(body), connection),
-            output::Plan::Shared {
-                hdr_written,
-                body,
-                connection,
-            } => (hdr_written, Body::Shared(body), connection),
-            output::Plan::Frozen {
-                hdr_written,
-                body,
-                connection,
-            } => (hdr_written, Body::Frozen(body), connection),
-            output::Plan::Segments {
-                hdr_written,
-                body,
-                connection,
-            } => (hdr_written, Body::Segmented(body), connection),
-            output::Plan::Close(reason) if reason.is_empty() => {
-                return (Self::None, head::Connection::Close);
             }
-            output::Plan::Close(reason) => (0, Body::Static(reason), head::Connection::Close),
+            | output::Outcome::SendCopied {
+                written: prefix,
+                connection,
+                ..
+            } => (Self::Inline { prefix }, connection),
+            output::Outcome::SendStatic {
+                hdr_written: prefix,
+                body,
+                connection,
+            } => (Self::Static { prefix, body }, connection),
+            output::Outcome::SendShared {
+                hdr_written: prefix,
+                body,
+                connection,
+            }
+            | output::Outcome::SendOwnedCopy {
+                hdr_written: prefix,
+                body,
+                connection,
+                ..
+            } => (Self::Shared { prefix, body }, connection),
+            output::Outcome::SendCompressed {
+                hdr_written: prefix,
+                body,
+                connection,
+                ..
+            } => (Self::Frozen { prefix, body }, connection),
+            output::Outcome::SendSegmented {
+                hdr_written: prefix,
+                body,
+                connection,
+            }
+            | output::Outcome::SendLinked {
+                hdr_written: prefix,
+                body,
+                connection,
+            } => (Self::Segmented { prefix, body }, connection),
+            output::Outcome::SendRequestBody(pending) => match pending.body {},
+            output::Outcome::Close(reason) => Self::close(reason),
+            output::Outcome::Failed(error) => Self::close(error.body()),
+        }
+    }
+
+    pub(crate) fn close(reason: fixed::Body<'d>) -> (Self, head::Connection) {
+        let action = if reason.is_empty() {
+            Self::None
+        } else {
+            Self::Static {
+                prefix: 0,
+                body: reason,
+            }
         };
-        (Self::Write { prefix, body }, connection)
+        (action, head::Connection::Close)
     }
-
-    pub(crate) fn retention(&self) -> output::Owner {
-        match self {
-            Self::Write { body, .. } => body.retention(),
-            Self::None | Self::Wake => output::Owner::default(),
-        }
-    }
-
-    pub(crate) fn commit<S: Sink<'d>>(self, conn: head::Connection, mut sink: S) {
-        match conn {
-            head::Connection::KeepAlive => {}
-            head::Connection::Close => sink.close(),
-        }
-        match self {
-            Self::None => {}
-            Self::Wake => sink.wake(),
-            Self::Write { prefix, body } => match body {
-                Body::None => sink.inline(prefix),
-                Body::Static(body) => sink.static_body(prefix, body),
-                Body::Shared(body) => sink.shared(prefix, body),
-                Body::Frozen(body) => sink.frozen(prefix, body),
-                Body::Segmented(body) => sink.segments(prefix, body),
-            },
-        }
-    }
-}
-
-/// Consuming, statically selected transport submission capability.
-pub trait Sink<'d>: Sized {
-    fn close(&mut self);
-
-    fn wake(&mut self);
-
-    fn inline(self, prefix: usize);
-
-    fn static_body(self, prefix: usize, body: fixed::Body<'d>);
-
-    fn shared(self, prefix: usize, body: storage::Shared);
-
-    fn frozen(
-        self,
-        prefix: usize,
-        body: pool::Span<
-            owners::Plain<pool::Fixed<{ Gzip::SLOTS.get() }, { Gzip::CAPACITY.get() }>>,
-            pool::Owned,
-            pool::Frozen,
-        >,
-    );
-
-    fn segments(self, prefix: usize, body: owned::Segments<'d>);
 }
 
 /// Exact bounded-retention result before any transport output is constructed.
@@ -320,31 +273,6 @@ impl<'d, H> Cycle<'d, H> {
             discard_remaining: left,
             tail: Tail::Empty,
         }
-    }
-
-    /// Projects the owner charge before transport submission.
-    pub(crate) fn retention(&self) -> output::Retention {
-        match self.state.as_ref() {
-            Ok(egress) => output::Retention::Response(egress.retention()),
-            Err(_) => output::Retention::Rejected,
-        }
-    }
-
-    pub(crate) fn commit<S: Sink<'d>>(self, mut sink: S) -> (Result<(), Reject>, Tail<H>) {
-        let state = match self.state {
-            Ok(egress) => {
-                egress.commit(self.connection, sink);
-                Ok(())
-            }
-            Err(error) => {
-                match self.connection {
-                    head::Connection::KeepAlive => {}
-                    head::Connection::Close => sink.close(),
-                }
-                Err(error)
-            }
-        };
-        (state, self.tail)
     }
 }
 

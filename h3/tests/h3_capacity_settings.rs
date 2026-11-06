@@ -54,6 +54,43 @@ fn reuses_config() {
 }
 
 #[test]
+fn prefixed_response_fits_field_limit() {
+    use common::{conn::build::Fields as _, field::entry, message::promise::Authority};
+    use dope_quic::wire::stream::Id;
+    use sark_core::manifold::stream::Boundary;
+    use sark_h3::conn::{
+        event::Event,
+        io::{Receive, Send, Step},
+    };
+    use sark_http::field::literal;
+
+    let mut conn = plan::Config::new(Config {
+        ingress: Ingress {
+            field_section_bytes: 42,
+            ..Ingress::default()
+        },
+        ..Config::default()
+    })
+    .expect("field limit")
+    .build::<RetainRaw<26>, Authority>(Role::Client)
+    .expect("prefixed storage");
+    Send::new(&mut conn)
+        .headers(Id::ZERO, Authority, Boundary::End)
+        .expect("request");
+    let fields = [literal!(entry(b":status", b"200"))]
+        .try_headers()
+        .expect("response");
+    Receive::new(&mut conn)
+        .owned(Id::ZERO, fields, Boundary::End)
+        .expect("response admission");
+    assert!(matches!(
+        conn.events().poll_token().expect("response head"),
+        Step::Item(Event::Headers { head, .. })
+            if head.fields().get(b":status") == Some(b"200".as_slice())
+    ));
+}
+
+#[test]
 fn reports_qpack_footprint() {
     let layout = plan::Config::new(Default::default())
         .expect("default H3 options")

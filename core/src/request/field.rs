@@ -89,7 +89,7 @@ impl<'a> From<Entry<'a>> for SliceValue<'a> {
 }
 
 impl<'a> SliceValue<'a> {
-    pub(crate) fn try_slice(value: &'a [u8], start: usize) -> Result<Self, Error> {
+    pub fn try_slice(value: &'a [u8], start: usize) -> Result<Self, Error> {
         let span = span::Span::checked(start, value.len()).map_err(Error::Span)?;
         Ok(Self { value, span })
     }

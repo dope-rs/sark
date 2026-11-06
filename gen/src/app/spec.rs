@@ -38,6 +38,7 @@ pub(super) enum Mode {
     Fiber {
         capacity: syn::Expr,
         body: inputs::Body,
+        stream: bool,
     },
     Stream {
         capacity: syn::Expr,
@@ -49,6 +50,7 @@ pub(super) struct Entry {
     pub(super) route: syn::TypePath,
     pub(super) path: syn::LitStr,
     pub(super) method: route::Method,
+    pub(super) upgrade: bool,
     pub(super) protocol: Option<syn::LitStr>,
     pub(super) guards: Vec<syn::TypePath>,
     pub(super) request: inputs::Request,
@@ -300,6 +302,7 @@ fn build_route_bound(
     let ns_core = &paths.core;
     let ns_http = &paths.http;
     let ns_fiber = &paths.fiber;
+    let ns_h1 = &paths.h1;
     use quote::quote;
     let route = &entry.route;
     let guards = &entry.guards;
@@ -341,16 +344,22 @@ fn build_route_bound(
                 >,
         }
     };
+    let upgrade = entry.upgrade.then(|| {
+        quote! {
+            <#route as #ns_core::duplex::Route<#l_env, #state_ty>>::Session:
+                #ns_h1::route::duplex::WebSocket,
+        }
+    });
     let (kind, invoke, extra) = match &entry.mode {
         Mode::Sync => (
             quote!(#ns_http::payload::response::dispatch::Sync),
             quote!(),
             quote!(),
         ),
-        Mode::Fiber { .. } => (
+        Mode::Fiber { stream, .. } => (
             quote!(#ns_fiber::manifold::runtime::NativeFiber),
             quote!(+ #ns_fiber::manifold::runtime::TaskRoute<'d, #state_ty>),
-            quote!(),
+            fiber_bound(paths, route, state_ty, *stream),
         ),
         Mode::Stream { .. } => (
             quote!(#ns_http::payload::response::dispatch::Polled),
@@ -373,7 +382,38 @@ fn build_route_bound(
         #header
         #query
         #( #guards: #ns_core::route::guard::Guard<#state_ty>, )*
+        #upgrade
         #extra
+    }
+}
+
+pub(super) fn fiber_bound(
+    paths: &Paths,
+    route: &syn::TypePath,
+    state: &syn::Type,
+    stream: bool,
+) -> proc_macro2::TokenStream {
+    let ns_core = &paths.core;
+    let ns_fiber = &paths.fiber;
+    let ns_http = &paths.http;
+    let output = quote::quote!(
+        <<#route as #ns_core::route::Task<'d, #state>>::Output
+            as #ns_http::payload::response::dispatch::IntoOutput<'d, 'd>>::Output
+    );
+    if stream {
+        quote::quote! {
+            #route: #ns_core::route::Task<'d, #state>,
+            #ns_core::manifold::task::response::Stream<'d, #route, #state>:
+                #ns_fiber::dope_fiber::abi::Stream<
+                    'd,
+                    Item: ::core::convert::TryInto<
+                        #ns_http::payload::response::dispatch::chunk::Chunk<'d>,
+                        Error: ::core::fmt::Debug,
+                    >,
+                >,
+        }
+    } else {
+        quote::quote!(#output: #ns_http::payload::response::dispatch::Complete<'d, 'd>,)
     }
 }
 
@@ -416,6 +456,7 @@ fn build_route_entry(entry: Route, scope: StateScope) -> syn::Result<(Entry, Kin
     use crate::app::route::Method;
     let path = entry.path;
     let method = Method::parse(&entry.method)?;
+    let upgrade = entry.method == "WS";
     if entry.protocol.is_some() && method != Method::Connect {
         return Err(syn::Error::new_spanned(
             entry.protocol,
@@ -437,7 +478,7 @@ fn build_route_entry(entry: Route, scope: StateScope) -> syn::Result<(Entry, Kin
             ));
         }
     }
-    let (mode, kind) = if method == Method::Connect {
+    let (mode, kind) = if method == Method::Connect || upgrade {
         match (scope, entry.kind) {
             (StateScope::Driver, inputs::Kind::Sync) => (Mode::Duplex, Kind::Duplex),
             (StateScope::Router, inputs::Kind::Sync) => {
@@ -446,7 +487,10 @@ fn build_route_entry(entry: Route, scope: StateScope) -> syn::Result<(Entry, Kin
                     "fiber-free routers support synchronous routes only",
                 ));
             }
-            (StateScope::Driver | StateScope::Router, inputs::Kind::Async { capacity, body }) => {
+            (
+                StateScope::Driver | StateScope::Router,
+                inputs::Kind::Async { capacity, body, .. },
+            ) => {
                 return Err(syn::Error::new_spanned(
                     capacity,
                     format!(
@@ -465,14 +509,26 @@ fn build_route_entry(entry: Route, scope: StateScope) -> syn::Result<(Entry, Kin
     } else {
         match (scope, entry.kind) {
             (StateScope::Driver, inputs::Kind::Sync) => (Mode::Sync, Kind::Sync),
-            (StateScope::Driver, inputs::Kind::Async { capacity, body }) => {
-                (Mode::Fiber { capacity, body }, Kind::Fiber)
-            }
+            (
+                StateScope::Driver,
+                inputs::Kind::Async {
+                    capacity,
+                    body,
+                    stream,
+                },
+            ) => (
+                Mode::Fiber {
+                    capacity,
+                    body,
+                    stream,
+                },
+                Kind::Fiber,
+            ),
             (StateScope::Driver, inputs::Kind::Stream { capacity }) => {
                 (Mode::Stream { capacity }, Kind::Stream)
             }
             (StateScope::Router, inputs::Kind::Sync) => (Mode::Sync, Kind::Sync),
-            (StateScope::Router, inputs::Kind::Async { capacity, body }) => {
+            (StateScope::Router, inputs::Kind::Async { capacity, body, .. }) => {
                 return Err(syn::Error::new_spanned(
                     capacity,
                     format!(
@@ -494,6 +550,7 @@ fn build_route_entry(entry: Route, scope: StateScope) -> syn::Result<(Entry, Kin
             route,
             path,
             method,
+            upgrade,
             protocol: entry.protocol,
             guards: entry.guards,
             request: entry.request,

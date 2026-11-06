@@ -1,5 +1,6 @@
 use core::{mem, ops};
 
+use dope::core::BranchError;
 use o3::buffer::resident;
 use sark_core::{
     body, decode,
@@ -29,12 +30,12 @@ impl<'d, P> Call<'d, P> {
         Self { ready }
     }
 
-    pub(in crate::server) fn try_dispatch<R, M, E>(
+    pub(in crate::server) fn try_dispatch<R, M, E, F>(
         self,
         router: &R,
         conn: &mut machine::Connection<
             crate::ServerRole,
-            R::Plan,
+            F,
             resident::Shared<'d>,
             rules::RejectPush,
             E,
@@ -42,12 +43,16 @@ impl<'d, P> Call<'d, P> {
         stream: stream::Key,
     ) -> Result<
         ops::ControlFlow<response::Head<'d>, response::Receipt<'d>>,
-        (numbers::ErrorCode, stream::Key),
+        (
+            BranchError<crate::conn::Error, numbers::ErrorCode>,
+            stream::Key,
+        ),
     >
     where
         R: decode::Decode<Prepared = P>,
         M: Handoff,
         E: event::Evidence,
+        F: rules::Policy,
     {
         let Self { ready } = self;
         ready.with_input(|prepared, input| {
@@ -60,24 +65,26 @@ impl<'d, P> Call<'d, P> {
                         Err((error, failed)) => {
                             use decode::dispatch::Error;
 
-                            let code = match error {
+                            let error = match error {
                                 Error::Busy | Error::Sequence(_) => {
-                                    numbers::ErrorCode::RefusedStream
+                                    BranchError::Second(numbers::ErrorCode::RefusedStream)
                                 }
-                                Error::Encode(error) => error.code(),
+                                Error::Encode(error) => BranchError::First(error),
                                 Error::Pending
                                 | Error::Moved
                                 | Error::Unsupported
-                                | Error::Invalid(_) => numbers::ErrorCode::InternalError,
+                                | Error::Invalid(_) => {
+                                    BranchError::Second(numbers::ErrorCode::InternalError)
+                                }
                                 Error::Body(never) => match never {},
                             };
-                            return Err((code, failed));
+                            return Err((error, failed));
                         }
                     };
                     let failed = prepared.stream();
                     let detached = prepared
                         .detach::<M>()
-                        .map_err(|error| (error.code(), failed))?;
+                        .map_err(|error| (BranchError::First(error), failed))?;
                     Ok((detached, failed))
                 })
                 .map_err(|failure| {
@@ -86,12 +93,12 @@ impl<'d, P> Call<'d, P> {
                             numbers::ErrorCode::InternalError
                         }
                     };
-                    (code, stream)
+                    (BranchError::Second(code), stream)
                 })?;
             let (detached, failed) = outcome?;
             detached
                 .defer(owner)
-                .map_err(|error| (error.code(), failed))
+                .map_err(|error| (BranchError::First(error), failed))
         })
     }
 }

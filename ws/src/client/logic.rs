@@ -30,7 +30,7 @@ use dope::{
         },
         service::bindings,
     },
-    net::link::{egress, event, pool::change::opening},
+    net::link::{egress, pool::change::opening},
 };
 use o3::{
     alloc::StrExt as _,
@@ -410,11 +410,11 @@ impl<'life, 'e: 'life, 'd: 'e, ID: Identity + 'life, H, M>
             session::Input,
         )>,
     > {
-        Some(output::Flush::<_>::Ready(
-            |owner: &mut Owner<'life, 'e, 'd, H, M, ID>| {
-                owner.root().shared.wake_waiter();
-            },
-        ))
+        Some(
+            |(owner, _, _): output::BoundArgs<
+                '_, '_, '_, '_, 'life, 'd, Port<'e, 'd, ID>, Self, ID, MAX_CONNECTIONS,
+            >| owner.root().shared.wake_waiter(),
+        )
     }
 
     fn sent() -> impl for<'a, 'x> Call<(
@@ -486,7 +486,7 @@ impl<'life, 'e: 'life, 'd: 'e, ID: Identity, H, M>
     fn failed(
         owner: &mut Owner<'life, 'e, 'd, H, M, ID>,
         _: attempt::Completion<'_, 'd, ID>,
-        _: event::ConnectFault,
+        _: attempt::ConnectFault,
         _: &mut driver::Context<'_, 'd>,
     ) {
         owner.root().shared.wake();

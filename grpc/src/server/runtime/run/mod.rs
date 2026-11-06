@@ -1,23 +1,28 @@
 //! gRPC server runtime over H2 stream identities.
-use std::convert;
-
 use dope::core::driver::schedule::clock;
 use o3::{
     buffer::{resident, storage},
     depot::queue::pool,
 };
 use resident::bound;
-use sark_core::manifold::{
-    schedule,
-    server::{Connection, app, drain, timing},
+use sark_core::{
+    decode,
+    manifold::{
+        schedule,
+        server::{self, Connection, app, drain, timing},
+        stream::{Message as _, Section},
+    },
 };
-use sark_h2::stream::Key;
+use sark_h2::{server::task::service::Select, stream::Key};
+use sark_http::field::metadata::section::state::{RetainedHead, Selected};
 
 use crate::{
     details,
     protocol::section,
     server::{
-        Bank, call, egress,
+        Bank,
+        call::Handler,
+        egress,
         runtime::{
             policy,
             state::{self, active},
@@ -68,6 +73,27 @@ impl<'a, X> app::Spec for Service<'a, X> {
     }
 }
 
+impl<R: decode::Full, X> Select<R> for Service<'_, X> {
+    type Retention = o3::buffer::hold::limits::Bound;
+
+    const ENABLED: bool = true;
+
+    fn try_retention(&self) -> Result<Self::Retention, o3::buffer::hold::limits::Error> {
+        sark_h2::INGRESS_RETENTION.try_limit(self.bank.limits.layout().bytes())
+    }
+
+    fn retention(admitted: &Self::Retention) -> o3::buffer::hold::limits::Bound {
+        *admitted
+    }
+
+    fn try_head(
+        router: &R,
+        head: RetainedHead<section::Owner, Selected<section::Plan>>,
+    ) -> Result<R::Head, decode::HeadError<R::Cause>> {
+        decode::Full::try_prefixed(router, head)
+    }
+}
+
 impl<'a, 'd, C, O, X> app::Application<'d, C, O> for Service<'a, X>
 where
     C: Connection<
@@ -75,13 +101,12 @@ where
             Owner = resident::Shared<'d>,
             Fields = section::Owner,
             Output = storage::Shared,
-            Retired = convert::Infallible,
         >,
     O: Copy + Eq + 'd,
     X: policy::Dispatch<'d, O, Target = active::Entry<'a>>,
     X::Timer: drive::Mode<'d>,
 {
-    type State = state::Store<'a, 'd, call::Handler<X::Call, X::State>, X::Timer, C>;
+    type State = state::Store<'a, 'd, Handler<X::Call, X::State>, X::Timer, C>;
     type Timing = timing::On;
     type Build = state::Error;
 
@@ -89,27 +114,45 @@ where
         state::Store::try_new(self.bank, cap)
     }
 
-    fn drive(
+    fn drive<H>(
         &mut self,
         state: &mut Self::State,
         conn: &mut C,
-        turn: &mut app::Turn<'_, '_, '_, '_, 'd, O>,
+        turn: &mut app::Turn<'_, '_, '_, 'd, O>,
         egress: schedule::Egress,
-        mut report: impl FnMut(app::Error<C::Error, Self::Failure>),
+        context: &mut H,
+        protocol: impl FnMut(
+            &mut H,
+            &mut C,
+            &mut drain::Events<'_, 'd>,
+            &Self::State,
+        ) -> Result<Option<server::Event<C>>, C::Error>,
+        notify: impl FnMut(&mut H, schedule::Wake<Key>),
+        finish: impl FnOnce(&mut H, &mut C),
+        mut report: impl FnMut(&mut H, app::Error<C::Error, Self::Failure>),
     ) -> Result<drain::Progress, app::Error<C::Error, Self::Failure>> {
-        let mut sink = |stream, error| report(Failure::from_output(stream, error));
-        let mut run = drive::Driver::new(&mut self.exec, &self.bank.limits, &mut sink);
-        run.drain(state, conn, turn, egress)
-            .map_err(|error| app::Error::Application(Failure::Readiness(error)))
+        if matches!(egress, schedule::Egress::Released) {
+            Self::released(state);
+        }
+        drive::Driver {
+            exec: &mut self.exec,
+            owner: turn.owner(),
+            context,
+            sink: move |context: &mut H, stream, error| {
+                report(context, Failure::from_output(stream, error))
+            },
+            limits: &self.bank.limits,
+        }
+        .drain(state, conn, turn, protocol, notify, finish)
     }
 
     /// Cancels every task before releasing any retained call payload.
     fn close(&mut self, state: &mut Self::State, conn: &mut C, owner: O) {
-        for index in 0..state.state.calls.records.capacity() {
-            let Some(stream) = state.state.calls.records.key_at(index) else {
+        for index in 0..state.state.calls.capacity() {
+            let Some(stream) = state.state.calls.key_at(index) else {
                 continue;
             };
-            let Some(record) = state.state.calls.records.get_mut(stream) else {
+            let Some(record) = state.state.calls.get_mut(stream) else {
                 continue;
             };
             let entry = record.entry;
@@ -130,6 +173,35 @@ where
         }
     }
 
+    fn selected(state: &Self::State, event: &server::Event<C>) -> bool {
+        match event {
+            server::Event::Head {
+                head,
+                section: Section::Initial,
+                ..
+            } => head.fields().iter().any(|field| {
+                field.name == b"content-type"
+                    && (field.value == b"application/grpc"
+                        || field.value.starts_with(b"application/grpc+"))
+            }),
+            server::Event::Head { message, .. } | server::Event::Data { message, .. } => {
+                state.state.calls.entry(message.key()).is_some()
+            }
+            server::Event::Reset { stream, .. } => state.state.calls.entry(*stream).is_some(),
+            server::Event::Control | server::Event::Established | server::Event::Retired(_) => {
+                false
+            }
+        }
+    }
+
+    fn wake(state: &mut Self::State, wake: schedule::Wake<Key>) -> bool {
+        state.state.calls.wake(wake) != 0
+    }
+
+    fn released(state: &mut Self::State) {
+        state.state.egress_released = true;
+    }
+
     fn activity(state: &Self::State) -> schedule::Quiescence {
         <X::Timer as state::Timing<'d>>::activity(state)
     }
@@ -142,7 +214,6 @@ where
             Owner = resident::Shared<'d>,
             Fields = section::Owner,
             Output = storage::Shared,
-            Retired = convert::Infallible,
         >,
     O: Copy + Eq + 'd,
     X: policy::Dispatch<'d, O, Target = active::Entry<'a>>,

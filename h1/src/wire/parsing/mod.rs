@@ -5,6 +5,7 @@ use std::num::NonZero;
 use o3::buffer::{bytes::window::Snapshot, storage};
 use sark_core::{request, route, route::field::query};
 use sark_http::{
+    field::scan::Match,
     h1::{
         codec::canned,
         field::syntax,
@@ -68,7 +69,10 @@ impl<R: route::Schema> Request<R> {
 
     pub fn into_consume<'d, D>(self) -> crate::session::Outcome<'d, D> {
         match self {
-            Self::Wire(error) => crate::session::Outcome::Failed(error),
+            Self::Wire(error)
+            | Self::Head(head::Error::Line(head::line::Error::Admission(error))) => {
+                crate::session::Outcome::Failed(error)
+            }
             Self::Head(head::Error::Storage(error)) => {
                 crate::session::Outcome::Failed(Failure::Input(InputError::Storage(error)))
             }
@@ -239,7 +243,9 @@ impl<'d> Rejected<'d> {
         input: Input<'_>,
         permit: session::Permit,
     ) -> session::RouteOutcome<'d, P, D, H, Self> {
-        if let Err(error) = self.source.try_extend(input.as_slice()) {
+        let input = input.as_slice();
+        let limit = recv::HEAD_CAPACITY + 1 - self.len();
+        if let Err(error) = self.source.try_extend(&input[..input.len().min(limit)]) {
             return failed(error).into();
         }
         self.advance(permit)
@@ -308,7 +314,11 @@ impl<'d> LineError<'d> {
 
 pub(crate) enum LineProgress {
     Pending(Line),
-    Complete { source: Source, prior: usize },
+    Complete {
+        source: Source,
+        prior: usize,
+        used: usize,
+    },
 }
 
 impl Line {
@@ -329,8 +339,23 @@ impl Line {
 
     pub(crate) fn advance<'d>(mut self, input: Input<'_>) -> Result<LineProgress, LineError<'d>> {
         let prior = self.len();
+        let input = input.as_slice();
+        let end = if self.source.as_ref().last() == Some(&b'\r') {
+            1
+        } else {
+            let bounded = &input[..input.len().min(recv::HEAD_CAPACITY.saturating_sub(prior))];
+            Match::find(b'\r', bounded).map_or(input.len(), |found| found.start() + 2)
+        };
+        let actual = prior.saturating_add(end);
+        if actual > recv::HEAD_CAPACITY {
+            return Err(LineError::Close(rejection(ParseError::too_large(
+                actual,
+                recv::HEAD_CAPACITY,
+            ))));
+        }
+        let used = end.min(input.len());
         self.source
-            .try_extend(input.as_slice())
+            .try_extend(&input[..used])
             .map_err(line_failure)?;
         match self
             .source
@@ -338,7 +363,11 @@ impl Line {
             .map_err(|(_, error)| LineError::Close(rejection(error)))?
         {
             Progress::More(source) => Ok(LineProgress::Pending(Self { source })),
-            Progress::Complete(source) => Ok(LineProgress::Complete { source, prior }),
+            Progress::Complete(source) => Ok(LineProgress::Complete {
+                source,
+                prior,
+                used,
+            }),
         }
     }
 }

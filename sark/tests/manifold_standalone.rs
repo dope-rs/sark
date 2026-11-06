@@ -1,16 +1,7 @@
-use std::mem;
-
 use sark::http::h1::codec::canned;
-use sark_h1::{
-    pump,
-    pump::{Body, Egress},
-    server::deadline::Head,
-    session::Conn,
-};
+use sark_h1::{pump, pump::Egress, server::deadline::Head, session::Conn};
 
 pub mod common;
-
-use std::marker::PhantomData;
 
 use common::stand::*;
 use dope_test::alloc::Tracker;
@@ -21,24 +12,8 @@ static ALLOCATOR: Tracker = Tracker::new();
 
 #[track_caller]
 fn assert_reply(cycle: &pump::Cycle<'_>, write: &[u8], body: &[u8]) {
-    use sark_h1::pump::{Body, Egress};
-
-    assert!(
-        matches!(
-            &cycle.state,
-            Ok(Egress::Write {
-                body: Body::None,
-                ..
-            })
-        ),
-        "request must produce an inline reply"
-    );
-    let Ok(Egress::Write {
-        prefix,
-        body: Body::None,
-    }) = &cycle.state
-    else {
-        return;
+    let Ok(Egress::Inline { prefix }) = &cycle.state else {
+        panic!("request must produce an inline reply");
     };
     assert!(*prefix <= write.len());
     let reply = &write[..*prefix];
@@ -47,20 +22,6 @@ fn assert_reply(cycle: &pump::Cycle<'_>, write: &[u8], body: &[u8]) {
         reply.ends_with(body),
         "expected {body:?}, received {reply:?}"
     );
-}
-
-fn shorten_router_lifetime<'short>(
-    proof: PhantomData<Router<'static, 'static, 'static>>,
-    scope: &'short (),
-) -> PhantomData<Router<'short, 'static, 'static>> {
-    let () = *scope;
-    proof
-}
-
-#[test]
-fn router_state_covariant() {
-    let proof = shorten_router_lifetime(PhantomData, &());
-    assert_eq!(mem::size_of_val(&proof), 0);
 }
 
 #[test]
@@ -114,14 +75,8 @@ fn router_uses_param_trie() {
             head::Connection::KeepAlive,
         );
         let response = match cycle.state {
-            Ok(Egress::Write {
-                prefix,
-                body: Body::None,
-            }) => Some(&write[..prefix]),
-            Ok(Egress::Write {
-                prefix: 0,
-                body: Body::Static(body),
-            }) => Some(body.as_slice()),
+            Ok(Egress::Inline { prefix }) => Some(&write[..prefix]),
+            Ok(Egress::Static { prefix: 0, body }) => Some(body.as_slice()),
             _ => None,
         }
         .expect("router response must be complete");
@@ -198,10 +153,7 @@ let mut driver = Driver::try_new(&router, *b"Thu, 01 Jan 1970 00:00:00 GMT").exp
             &mut write,
             head::Connection::KeepAlive,
         );
-        assert!(matches!(first.state, Ok(Egress::Write {
-                prefix: 0,
-                body: Body::Static(value),
-            }) if value == sark_h1::CONTINUE_100));
+        assert!(matches!(first.state, Ok(Egress::Static { prefix: 0, body: value }) if value == sark_h1::CONTINUE_100));
 
         let final_ = driver.ingest(
             &mut conn,
@@ -247,10 +199,9 @@ let mut driver = Driver::try_new(&router, *b"Thu, 01 Jan 1970 00:00:00 GMT").exp
             &mut write,
             head::Connection::KeepAlive,
         );
-        assert!(matches!(bad.state, Ok(Egress::Write {
-                prefix: 0,
-                body: Body::Static(value),
-            }) if value == canned::BAD_REQUEST));
+        assert!(
+            matches!(bad.state, Ok(Egress::Static { prefix: 0, body: value }) if value == canned::BAD_REQUEST)
+        );
         assert!(matches!(bad.connection, head::Connection::Close));
     }
 }

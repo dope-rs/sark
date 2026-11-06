@@ -30,9 +30,6 @@ pub enum Error {
     Allocate(storage::AllocError),
     Reserve(alloc::Error),
     Egress(load::Error),
-    /// A body from an earlier draft is still pending egress, so this close step
-    /// cannot adopt a second one.
-    Pending,
 }
 
 impl From<consume::Error> for Error {

@@ -1,17 +1,24 @@
+use std::fmt;
+
 use dope::{core::driver::route::Identity, manifold::network::listener::conn};
+use o3::buffer::hold;
 use sark_core::{
-    life,
+    life::{self, owners},
     manifold::{
-        schedule::{self, typed},
+        schedule::typed,
         task::{
             app::{Handoff, Runtime},
-            response::{Outcome, Output, Pack},
+            response::{Event, State},
         },
     },
-    route,
+};
+use sark_http::{
+    field::metadata::section::rules,
+    owner::{self, cause},
 };
 
 use crate::{
+    frame::numbers,
     server::{
         self, state,
         task::{response, *},
@@ -19,69 +26,133 @@ use crate::{
     stream,
 };
 
-pub(super) struct Completion<'a, 'state, 'd, ID: Identity + 'd, A, M>
+pub(super) struct Completion<'a, 'state, 'd, ID: Identity + 'd, A, M, P, F>
 where
     A: Runtime<'d, Target = Target<'d, ID>>,
+    F: rules::Policy,
 {
     pub(super) tasks: &'a mut registry::Table<'d, ID, A::Task>,
     pub(super) connection: conn::Id<'d, ID>,
     pub(super) task_index: &'a mut registry::Index,
-    pub(super) state: &'a mut Borrowed<'state, 'd, A>,
+    pub(super) state: &'a mut Borrowed<'state, 'd, A, F>,
     pub(super) limits: server::Config,
     pub(super) mode: &'a mut M,
+    pub(super) report: P,
 }
 
-impl<'a, 'state, 'd, ID: Identity + 'd, A, M> Handoff<'d, Target<'d, ID>, A::Completion>
-    for Completion<'a, 'state, 'd, ID, A, M>
+impl<'d, ID: Identity + 'd, A, M, P, F> Handoff<'d, Target<'d, ID>, A::Fixed>
+    for Completion<'_, '_, 'd, ID, A, M, P, F>
 where
     A: Runtime<'d, Target = Target<'d, ID>>,
     M: state::Transitions<conn::Id<'d, ID>>,
+    P: FnMut(conn::Id<'d, ID>, stream::Key, &dyn fmt::Debug),
+    F: rules::Policy,
 {
-    type Complete = schedule::InsertResult<stream::Key, Next<'d, A>>;
+    type Ready = Result<(), (stream::Key, numbers::ErrorCode)>;
 
     fn pending(self, target: Target<'d, ID>) {
         if !M::ENABLED {
             return;
         }
-        let Some((conn, stream)) = self.tasks.owner(target) else {
+        let Some(entry) = self.tasks.owner(target, self.connection) else {
             return;
         };
-        if conn != self.connection {
-            return;
-        }
-        self.mode
-            .observe(life::Event::TaskPollPending(identify(conn, stream)));
+        self.mode.observe(life::Event::TaskPollPending(identify(
+            self.connection,
+            entry.as_ref().stream,
+        )));
     }
 
-    fn complete<R, S, P>(self, target: Target<'d, ID>, output: Output<'d, R, S>) -> Self::Complete
-    where
-        R: route::Task<'d, S>,
-        P: Pack<'d, R, S, A::Completion>,
-    {
-        let conn = self.connection;
-        let Some(taken) = self.tasks.take_target(self.task_index, target, conn) else {
+    fn complete(self, target: Target<'d, ID>, output: A::Fixed) -> Self::Ready {
+        let Some(taken) = self
+            .tasks
+            .owner(target, self.connection)
+            .and_then(|entry| registry::Table::take_target(self.task_index, entry))
+        else {
             return Ok(());
         };
-        let registry::Taken { stream, .. } = taken;
-        let call = identify(conn, stream);
+        if !taken.unreported {
+            return Err((taken.stream, numbers::ErrorCode::InternalError));
+        }
+        let stream = taken.stream;
+        drop(taken);
+        let call = identify(self.connection, stream);
         self.mode.observe(life::Event::TaskPollReady(call));
-        let value = match output.into_parts() {
-            (.., Outcome::Rejected(reject)) => response::Response::Status(reject.status()),
-            (input, Outcome::Response(output)) => {
-                response::Response::Completion(P::pack(Output::response(input, output)))
+        let next = self.state.activation(self.limits);
+        self.state
+            .responses
+            .try_insert(
+                stream,
+                typed::Next::Control(response::Response::Fixed(output), next),
+            )
+            .map_err(rejected::<A>)?;
+        state::Transitions::ready(self.mode, call);
+        Ok(())
+    }
+
+    fn ready<E: fmt::Debug>(mut self, target: Target<'d, ID>, event: Event<'d, E>) -> Self::Ready {
+        let Some(mut entry) = self.tasks.owner(target, self.connection) else {
+            return Ok(());
+        };
+        let record = entry.as_mut();
+        let stream = record.stream;
+        let call = identify(self.connection, stream);
+        let next = self.state.activation(self.limits);
+        let mut acquired = hold::Charge::default();
+        let head = matches!(&event, Event::Head);
+        let value = match event {
+            Event::Head => {
+                if !record.unreported {
+                    return Err((stream, numbers::ErrorCode::InternalError));
+                }
+                typed::Next::Control(response::Response::Task, next)
+            }
+            Event::Chunk(chunk) => {
+                let Some(pending) = Pending::single(chunk.into_owner()) else {
+                    unreachable!("chunk")
+                };
+                if M::ENABLED {
+                    acquired = pending.retention();
+                }
+                typed::Next::Data(
+                    response::Data::Body {
+                        pending,
+                        state: State::Streaming,
+                    },
+                    next,
+                )
+            }
+            Event::End => {
+                let Some(taken) = registry::Table::take_target(self.task_index, entry) else {
+                    return Ok(());
+                };
+                drop(taken);
+                return self
+                    .state
+                    .responses
+                    .try_insert(stream, typed::Next::Control(response::Response::End, next))
+                    .map_err(rejected::<A>);
+            }
+            Event::Failed(cause) => {
+                crate::server::runtime::app::response(self.mode, call, &cause, &mut self.report);
+                return Err((stream, numbers::ErrorCode::InternalError));
             }
         };
-        let next = self.state.activation(self.limits);
-        match self
-            .state
+        self.state
             .responses
-            .try_insert(stream, typed::Next::Control(value, next))
-        {
-            Ok(()) => {
-                state::Transitions::ready(self.mode, call);
-                Ok(())
-            }
-            Err(failure) => Err(failure),
+            .try_insert(stream, value)
+            .map_err(rejected::<A>)?;
+        if head {
+            record.unreported = false;
+            self.mode.observe(life::Event::TaskPollReady(call));
+            state::Transitions::ready(self.mode, call);
+        } else if !acquired.is_empty() {
+            owners::Projection::new(self.mode).apply(owner::Effect::new(
+                call,
+                acquired,
+                owner::Change::StagingAcquired(cause::Acquire::StreamChunk),
+            ));
         }
+        Ok(())
     }
 }

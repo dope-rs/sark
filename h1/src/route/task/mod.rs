@@ -60,7 +60,7 @@ impl<'turn> Egress<'turn> {
     pub fn finish<'d, R: route::Task<'d, A> + crate::route::PolicyOf, A>(
         self,
         output: response::Output<'d, R, A>,
-    ) -> output::Outcome<'d> {
+    ) -> (output::Outcome<'d>, Option<response::Stream<'d, R, A>>) {
         let (id, outcome) = output.into_parts();
         match outcome {
             response::Outcome::Response(reply) => {
@@ -74,7 +74,7 @@ impl<'turn> Egress<'turn> {
                 )
             }
             response::Outcome::Rejected(error) => {
-                output::Outcome::Close(Failure::Route(error).body())
+                (output::Outcome::Close(Failure::Route(error).body()), None)
             }
         }
     }

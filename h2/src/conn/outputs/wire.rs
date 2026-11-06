@@ -36,6 +36,21 @@ impl Wire {
         })
     }
 
+    fn advance(&mut self) -> bool {
+        if self.frame_len == self.max_frame.into_usize() {
+            if let Err(error) = self
+                .bytes
+                .try_append(&[0; frame::HEADER_LEN])
+                .map(|append| append.commit())
+            {
+                self.error = Some(error);
+                return false;
+            }
+            self.frame_len = 0;
+        }
+        true
+    }
+
     pub(super) fn finish(self) -> Result<Block, consume::Error> {
         match self.error {
             Some(error) => Err(error),
@@ -61,19 +76,8 @@ impl Extend<u8> for Wire {
 
 impl field::Writer for Wire {
     fn write_byte(&mut self, byte: u8) {
-        if self.error.is_some() {
+        if self.error.is_some() || !self.advance() {
             return;
-        }
-        if self.frame_len == self.max_frame.into_usize() {
-            if let Err(error) = self
-                .bytes
-                .try_append(&[0; frame::HEADER_LEN])
-                .map(|append| append.commit())
-            {
-                self.error = Some(error);
-                return;
-            }
-            self.frame_len = 0;
         }
         if let Err(error) = self.bytes.try_append(&[byte]).map(|append| append.commit()) {
             self.error = Some(error);
@@ -90,16 +94,8 @@ impl field::Writer for Wire {
         let max = self.max_frame.into_usize();
         let mut rest = bytes;
         while !rest.is_empty() {
-            if self.frame_len == max {
-                if let Err(error) = self
-                    .bytes
-                    .try_append(&[0; frame::HEADER_LEN])
-                    .map(|append| append.commit())
-                {
-                    self.error = Some(error);
-                    return;
-                }
-                self.frame_len = 0;
+            if !self.advance() {
+                return;
             }
             let take = rest.len().min(max - self.frame_len);
             if let Err(error) = self

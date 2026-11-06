@@ -1,7 +1,7 @@
 use dope::core::driver::life::recovery;
 pub mod common;
 
-use std::{convert::Infallible, sync::mpsc, time::Duration};
+use std::{cell::Cell, convert::Infallible, net::TcpStream, time::Duration};
 
 use common::session::Connect;
 use dope::{
@@ -29,22 +29,32 @@ use crate::common::body::{
 fn yields_and_retains_owner() {
     let pair = Pair::bind().expect("H2 fairness harness");
     let bind = pair.addr();
-    let (first, started) = mpsc::sync_channel(0);
-    let (queued, ready) = mpsc::sync_channel(0);
     pair.check(
         move |context, listener| {
             let trace = Trace::default();
+            let socket = TcpStream::connect_timeout(&bind, Duration::from_secs(3))
+                .expect("H2 probe connection");
+            socket.set_nodelay(true).expect("probe TCP_NODELAY");
+            socket.set_read_timeout(Some(Duration::from_secs(5))).expect("probe read deadline");
+            socket.set_write_timeout(Some(Duration::from_secs(3))).expect("probe write deadline");
+            let mut peer = Connection::<ClientRole>::try_new().expect("default H2 client plan is valid");
+            let id = peer.streams().headers().request(
+                headers(b"/ingress-probe", b"5").expect("request fields"),
+                Boundary::More,
+            ).expect("start ingress probe request");
+            peer.try_send_all(id, b"probe", true).expect("H2 request DATA");
+            let probe = Cell::new(Some((socket, peer, id)));
             let handler = Fairness {
                 trace: &trace,
                 first: || {
                     assert_eq!(
                         trace.flood.get(),
                         1,
-                        "the first flood handler must own the deterministic start barrier",
+                        "the first flood handler queues the probe",
                     );
-                    first.send(()).expect("first flood handler");
-                    ready.recv_timeout(Duration::from_secs(3))
-                        .expect("probe queued before flood resume");
+                    let (mut socket, mut peer, id) = probe.take().expect("probe queued");
+                    peer.try_flush(&mut socket).expect("H2 peer flush");
+                    probe.set(Some((socket, peer, id)));
                 },
             };
             let prepared = Server::from_handler(handler, LIMITS.try_plan(bind).expect("H2 server plan"))
@@ -85,16 +95,15 @@ fn yields_and_retains_owner() {
                         .expect("H2 server shutdown")
                 },
             );
+            let (mut socket, mut peer, id) = probe.take().expect("probe queued");
+            assert_eq!(peer.try_read(&mut socket, id).expect("H2 response body"), b"probe");
             assert!(reports.events().expect("H2 retirement").is_empty(), "retirement: {reports:?}");
             assert_eq!(trace.mismatch.get(), None, "request and response DATA owner");
             Ok::<(), Infallible>(())
         },
         move |address| {
             let mut bulk_io = address.try_connect(Duration::from_secs(5)).expect("H2 peer connection");
-            let mut probe_io = address.try_connect(Duration::from_secs(5)).expect("H2 peer connection");
             let mut bulk =
-                Connection::<ClientRole>::try_new().expect("default H2 client plan is valid");
-            let mut peer =
                 Connection::<ClientRole>::try_new().expect("default H2 client plan is valid");
             let mut streams = Vec::with_capacity(BURST);
             for _ in 0..BURST {
@@ -107,20 +116,7 @@ fn yields_and_retains_owner() {
                 bulk.try_send_all(stream, b"flood", true).expect("H2 request DATA");
                 streams.push(stream);
             }
-            let probe = peer.streams().headers()
-                .request(
-                    headers(b"/ingress-probe", b"5").expect("request fields"),
-                    Boundary::More,
-                )
-                .expect("start ingress probe request");
-            peer.try_send_all(probe, b"probe", true).expect("H2 request DATA");
-
             bulk.try_flush(&mut bulk_io).expect("H2 peer flush");
-            started.recv_timeout(Duration::from_secs(3)).expect("first flood handler");
-            peer.try_flush(&mut probe_io).expect("H2 peer flush");
-            queued.send(()).expect("probe wire queued");
-
-            assert_eq!(peer.try_read(&mut probe_io, probe).expect("H2 response body"), b"probe");
             let mut bodies = vec![Vec::new(); BURST];
             let mut ended = vec![false; BURST];
             bulk.try_events(&mut bulk_io, |event| {

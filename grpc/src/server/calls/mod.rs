@@ -15,13 +15,13 @@ use crate::{
     Reason, details, message, metadata,
     server::{
         call::{self, chunks, input, messages},
-        egress::{self, commit::Commit, driver::Driver},
+        egress::{self, driver::Driver},
+        runtime::state::active,
         service::{self, handler::Production, messages::Messages},
     },
 };
 
 pub(crate) mod capacity;
-mod records;
 
 #[derive(Debug)]
 pub(crate) enum Reserve {
@@ -62,47 +62,115 @@ impl Error {
     }
 }
 
-pub(super) struct Store<'r, K, T, C, P, B>
+pub(super) struct Store<'r, T, C, P, B>
 where
-    K: manifold::raw::Key,
     C: session::Storage,
     B: schedule::Block,
 {
-    pub(super) records: records::Records<'r, K, T, C, B>,
+    records: schedule::Runtime<Key, call::State<'r, T, C>, B>,
     data: chunks::Pool<C, P>,
     messages: messages::Pool<C>,
 }
 
-impl<'r, K, T, C, P, B> Store<'r, K, T, C, P, B>
+impl<'r, T, C, P, B> Store<'r, T, C, P, B>
 where
-    K: manifold::raw::Key,
     C: session::Storage,
     B: schedule::Block,
 {
     pub(super) fn try_new(cap: Count, data: Count, msgs: Count) -> Result<Self, alloc::Error> {
         Ok(Self {
-            records: records::Records::try_new(cap)?,
+            records: schedule::Runtime::try_bounded(cap, cap)?,
             data: chunks::Pool::try_new(data, cap)?,
             messages: messages::Pool::try_new(msgs, cap)?,
         })
     }
 
-    pub(super) fn commit(&mut self) -> Commit<'_, 'r, K, T, C, P, B> {
-        Commit::new(self)
+    pub(in crate::server) fn get_mut(&mut self, key: Key) -> Option<&mut call::State<'r, T, C>> {
+        self.records.get_mut(key)
     }
 
-    pub(super) fn drive<S>(
+    pub(in crate::server) fn initialize(
         &mut self,
-        output: &mut egress::Store<K>,
+        key: Key,
+        stream: input::Input<C>,
+        app: T,
+        output: Production,
+    ) -> Result<(), Error> {
+        let record = self.get_mut(key).ok_or(Error::State)?;
+        record.initialize(stream, app, output).map_err(Error::Call)
+    }
+
+    pub(in crate::server) fn capacity(&self) -> usize {
+        self.records.capacity()
+    }
+
+    pub(in crate::server) fn has_runnable(&self) -> bool {
+        self.records.has_runnable()
+    }
+
+    pub(in crate::server) fn wake_egress(&mut self) {
+        self.records.wake_egress();
+    }
+
+    pub(in crate::server) fn key_at(&self, index: usize) -> Option<Key> {
+        self.records.key_at(index)
+    }
+
+    pub(in crate::server) fn entry(&self, key: Key) -> Option<active::Entry<'r>> {
+        Some(self.records.get(key)?.entry)
+    }
+
+    pub(in crate::server) fn entry_at(&self, index: usize) -> Option<active::Entry<'r>> {
+        Some(self.records.entry_at(index)?.1.entry)
+    }
+
+    pub(in crate::server) fn production(&self, key: Key) -> Option<Production> {
+        self.records.get(key)?.production()
+    }
+
+    pub(in crate::server) fn update<R, E>(
+        &mut self,
+        key: Key,
+        run: impl FnOnce(&mut call::State<'r, T, C>) -> Result<(Option<schedule::WorkClass>, R), E>,
+    ) -> Result<R, schedule::Error<E>> {
+        self.records.transaction(key, |record| {
+            let (class, result) = run(record)?;
+            let next = match class {
+                Some(schedule::WorkClass::Control) => schedule::Activation::control(None),
+                Some(schedule::WorkClass::Data) => schedule::Activation::data(None),
+                None => schedule::Activation::Keep,
+            };
+            Ok((next, result))
+        })
+    }
+
+    pub(in crate::server) fn wake(&mut self, wake: schedule::Wake<Key>) -> usize {
+        self.records.wake(wake)
+    }
+
+    pub(super) fn drive<S, H>(
+        &mut self,
+        output: &mut egress::Store<Key>,
         conn: &mut S,
         egress: schedule::Egress,
-        sink: &mut impl FnMut(K, egress::Error<S::Error>),
+        context: &mut H,
+        mut notify: impl FnMut(&mut H, schedule::Wake<Key>),
+        sink: &mut impl FnMut(&mut H, Key, egress::Error<S::Error>),
         mut cancel: impl FnMut(&mut call::State<'r, T, C>),
     ) -> (schedule::Report, egress::Release)
     where
-        S: server::Connection<Owner = C, Key = K, Output = storage::Shared, Permit = P, Block = B>,
+        S: server::Connection<
+                Owner = C,
+                Key = Key,
+                Output = storage::Shared,
+                Permit = P,
+                Block = B,
+            >,
     {
-        self.records.resume(|| conn.poll_wake(), egress);
+        self.records.resume(
+            || conn.poll_wake().inspect(|wake| notify(context, *wake)),
+            egress,
+        );
         let Self {
             records,
             data,
@@ -112,33 +180,37 @@ where
             cancel(record);
             Self::release(record, data, messages)
         };
-        let mut driver = Driver::new(conn, output, sink, &mut retire);
+        let mut sink = |stream, error| sink(context, stream, error);
+        let mut driver = Driver::new(conn, output, &mut sink, &mut retire);
         let report = records.drive(&mut driver);
         (report, driver.released)
     }
 
-    pub(super) fn stream_mut(&mut self, key: K) -> Option<&mut input::Input<C>> {
+    pub(super) fn stream_mut(&mut self, key: Key) -> Option<&mut input::Input<C>> {
         self.records.get_mut(key)?.input_mut()
     }
 
-    pub(super) fn has_input(&mut self, key: K) -> bool {
+    pub(super) fn has_input(&mut self, key: Key) -> bool {
         self.records
             .get_mut(key)
             .and_then(call::State::input_mut)
-            .is_some_and(|stream| self.data.is_pending(key.slot(), &stream.data))
+            .is_some_and(|stream| {
+                self.data
+                    .is_pending(manifold::raw::Key::slot(key), &stream.data)
+            })
     }
 
-    pub(super) fn handler_mut(&mut self, key: K) -> Option<&mut T> {
+    pub(super) fn handler_mut(&mut self, key: Key) -> Option<&mut T> {
         self.records.get_mut(key)?.handler_mut()
     }
 
-    pub(super) fn output(&mut self, key: K) -> Option<(&mut T, Production)> {
+    pub(super) fn output(&mut self, key: Key) -> Option<(&mut T, Production)> {
         self.records.get_mut(key)?.output()
     }
 
     pub(super) fn stage_data(
         &mut self,
-        key: K,
+        key: Key,
         chunk: message::DataChunk<C, P>,
         boundary: Boundary,
         local: usize,
@@ -148,7 +220,7 @@ where
             return Err(Stage::Unknown);
         };
         self.data
-            .try_bind(key.slot())
+            .try_bind(manifold::raw::Key::slot(key))
             .map_err(|error| Stage::Failed(error.into()))?
             .try_stage(stream, chunk, boundary, local, total)
             .map_err(|error| Stage::Failed(error.into()))?;
@@ -157,20 +229,24 @@ where
 
     pub(super) fn deframe_turn(
         &mut self,
-        key: K,
+        key: Key,
         source: &segments::Pool<C>,
         limit: usize,
     ) -> Result<input::Turn<C>, crate::Status> {
         let Some(stream) = self.records.get_mut(key).and_then(call::State::input_mut) else {
             return Err(Error::State.status());
         };
-        let mut data = self.data.try_bind(key.slot())?;
+        let mut data = self.data.try_bind(manifold::raw::Key::slot(key))?;
         let turn = data.try_deframe(stream, source)?;
         let input::Turn::Frame(frame) = turn else {
             return Ok(turn);
         };
         if matches!(stream.request, input::Request::Buffered(_)) {
-            messages::try_push(self.messages.try_bind(key.slot())?, frame, limit)?;
+            messages::try_push(
+                self.messages.try_bind(manifold::raw::Key::slot(key))?,
+                frame,
+                limit,
+            )?;
             return Ok(if data.is_pending(&stream.data) {
                 input::Turn::Pending
             } else {
@@ -180,7 +256,7 @@ where
         Ok(input::Turn::Frame(frame))
     }
 
-    pub(super) fn release_live(&mut self, key: K, bytes: usize) -> Result<(), Error> {
+    pub(super) fn release_live(&mut self, key: Key, bytes: usize) -> Result<(), Error> {
         let stream = self
             .records
             .get_mut(key)
@@ -189,9 +265,8 @@ where
         self.data.release_live(stream, bytes).map_err(Error::Credit)
     }
 
-    pub(super) fn try_remove(&mut self, key: K) -> Result<(), Error> {
+    pub(super) fn try_remove(&mut self, key: Key) -> Result<(), Error> {
         self.records
-            .inner
             .try_remove(key, |record| -> Result<(), Error> {
                 Self::release(record, &mut self.data, &mut self.messages)
             })?
@@ -200,16 +275,15 @@ where
     }
 
     /// Ends the application half while preserving the committed response owner.
-    pub(super) fn complete(&mut self, key: K) -> Result<(), Error> {
+    pub(super) fn complete(&mut self, key: Key) -> Result<(), Error> {
         let record = self.records.get_mut(key).ok_or(Error::State)?;
         Self::release(record, &mut self.data, &mut self.messages)?;
         record.complete().map_err(Error::Call)
     }
 
     /// Keeps the exact call row until its scheduled error response is released.
-    pub(super) fn reject(&mut self, key: K) -> Result<(), Error> {
+    pub(super) fn reject(&mut self, key: Key) -> Result<(), Error> {
         self.records
-            .inner
             .transaction(key, |record| {
                 Self::release(record, &mut self.data, &mut self.messages)?;
                 record.reject();
@@ -240,13 +314,21 @@ where
     pub(super) fn is_quiescent(&self) -> bool {
         self.records.is_empty() && self.data.is_empty() && self.messages.is_empty()
     }
-}
 
-impl<'r, T, C, P, B> Store<'r, Key, T, C, P, B>
-where
-    C: session::Storage,
-    B: schedule::Block,
-{
+    pub(in crate::server) fn try_reserve(
+        &mut self,
+        entry: active::Entry<'r>,
+    ) -> Result<(), Reserve> {
+        let active = self.records.len();
+        let limit = self.records.capacity();
+        if active >= limit {
+            return Err(Reserve::Capacity(capacity::Error::new(active, limit)));
+        }
+        let vacant = self.records.vacant(entry.key()).ok_or(Reserve::Occupied)?;
+        vacant.store(call::State::reserved(entry));
+        Ok(())
+    }
+
     pub(super) fn try_finish<R>(
         &mut self,
         key: Key,

@@ -329,7 +329,9 @@ impl<'app, 'o, 'q, 'e, 'b, 'c, 'd: 'app, B: ?Sized, ID: Identity + 'd> Backend<'
             Err(error) => {
                 protocol.io.close(
                     conn,
-                    close::Reason::Local(close::LocalOrigin::ResourceFailure),
+                    close::Directive::reconnect(close::Reason::Local(
+                        close::LocalOrigin::ResourceFailure,
+                    )),
                 );
                 attempt.cancel();
                 Err(error.widen())

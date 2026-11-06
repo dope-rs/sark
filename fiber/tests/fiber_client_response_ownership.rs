@@ -50,6 +50,7 @@ fn shape_and_ceiling() {
             )
             .expect("fixed topology")
             .enter(
+                (),
                 |mut app| {
                     let client = app.handle;
                     app.wait().expect("fixed client readiness");
@@ -73,6 +74,7 @@ fn shape_and_ceiling() {
             let dynamic = origins::Plan::new(Config::new(server.addr().to_string()), 1, 1, 1)
                 .expect("on-demand topology")
                 .enter(
+                    (),
                     |mut app| {
                         let client = app.handle;
                         owners::try_measure(
@@ -144,6 +146,7 @@ fn retained_keeps_backing() {
                 )
                 .expect("fixed topology")
                 .enter(
+                    (),
                     |mut app| {
                         let client = app.handle;
                         app.wait().expect("fixed client readiness");
@@ -233,6 +236,7 @@ fn failures_keep_provenance() {
             )
             .expect("fixed topology")
             .enter(
+                (),
                 |mut app| {
                     let client = app.handle;
                     app.wait().expect("fixed client readiness");

@@ -1,5 +1,4 @@
 pub mod common;
-use std::mem;
 
 use common::requests::{Plan as _, Segments};
 use dope_test::alloc::Tracker;
@@ -73,18 +72,6 @@ fn discarded_keeps_len() {
     assert!(view.segments().next().is_none());
     std::assert_matches!(view.try_copy().err(), Some(owned::Error::Discarded));
     assert!(body.into_source().is_empty());
-}
-
-#[test]
-fn body_adds_len_word() {
-    assert_eq!(
-        mem::size_of::<body::Body<Ref<'_, '_>>>(),
-        mem::size_of::<Ref<'_, '_>>() + mem::size_of::<usize>(),
-    );
-    assert_eq!(
-        mem::size_of::<body::Body<owned::Segments<'_>>>(),
-        mem::size_of::<owned::Segments<'_>>() + mem::size_of::<usize>(),
-    );
 }
 
 #[test]

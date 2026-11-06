@@ -15,20 +15,12 @@ use crate::{
 };
 
 pub(in crate::conn) struct Section<'q, 'd> {
+    pub(super) target: stream::Target,
     pub(super) entry: Entry<'d>,
     pub(super) qpack: encoder::Commit<'q>,
 }
 
 impl<'q, 'd> Section<'q, 'd> {
-    pub(in crate::conn) fn target(&self) -> stream::Target {
-        self.entry.target()
-    }
-
-    pub(in crate::conn) fn finish(mut self) -> Self {
-        self.entry = self.entry.finish();
-        self
-    }
-
     pub(in crate::conn) fn discard(self) {
         self.qpack.discard();
     }
@@ -37,7 +29,7 @@ impl<'q, 'd> Section<'q, 'd> {
         target: stream::Target,
         kind: varint::VarInt,
         lead: Option<varint::VarInt>,
-        encoder: &'q mut encoder::Encoder,
+        encoder: &'q mut encoder::State,
         peer: Option<&frame::Settings>,
         source: S,
         boundary: Boundary,
@@ -110,17 +102,17 @@ impl<'q, 'd> Section<'q, 'd> {
             && bytes.write_slice(&lines).is_ok()
         {
             qpack.recycle(lines);
-            Entry::single(budget::WriteClass::Regular, target, prefix, boundary)
+            Entry::single(budget::WriteClass::Regular, prefix, boundary)
         } else {
-            match Entry::try_frame(budget::WriteClass::Regular, target, prefix, lines, boundary) {
-                Ok(entry) => entry,
-                Err(rejected) => {
-                    let (lines, error) = rejected.into_parts();
-                    qpack.discard_vec(lines);
-                    return Err(conn::Error::Output(error));
-                }
-            }
+            Entry::frame(budget::WriteClass::Regular, prefix, lines, boundary)
         };
-        Ok((Self { entry, qpack }, identity))
+        Ok((
+            Self {
+                target,
+                entry,
+                qpack,
+            },
+            identity,
+        ))
     }
 }

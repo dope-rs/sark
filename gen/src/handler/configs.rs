@@ -96,8 +96,8 @@ impl<'a> Response<'a> {
         let (kind, stream, coding, mode) = match self {
             Response::Native { output, cache } => {
                 let life = Lifetimes::new(output);
-                let drive = life.response("__d", "__d");
-                let owned = life.rebind("static");
+                let drive = life.response(&syn::parse_quote!('__d), None, &[]);
+                let owned = life.response(&syn::parse_quote!('static), None, &[]);
                 let kind = quote! {
                     <#owned as #ns_core::manifold::Response<'static, 'static>>::Kind
                 };

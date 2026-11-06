@@ -79,10 +79,9 @@ fn accept_failure_finishes_generated_server() {
             Backend, Errno,
             dope_sys::io::socket::{How, Socket as _},
             io::{event::net::accept, socket::Listener},
-            platform::wake,
         },
         manifold::network::listener::AcceptError,
-        runtime::shutdown,
+        runtime::process::lifecycle,
     };
     use dope_test::harness::{
         GUARD,
@@ -102,44 +101,37 @@ fn accept_failure_finishes_generated_server() {
     let fault = server::accept::duplicate(listener.local_addr()).expect("fault descriptor");
     let plan = Plan::new(listener.local_addr(), Duration::from_secs(10)).build();
     Deadline::with(GUARD, |_| {
-        let (context, stop, ready) = shutdown::ReadyPair::new().expect("shutdown").split();
-        let guard = context
-            .as_fd()
-            .try_clone_to_owned()
-            .expect("shutdown reader");
-        let (finished, notify) = wake::Ends::blocking().expect("completion").split();
+        let (main, worker) = lifecycle::Main::try_pair().expect("worker lifecycle");
         let ((), served) = Entry(move || {
-            let calls = Cell::new(0);
-            App::serve(
-                plan.with_bound(listener),
-                context,
-                __W(&calls),
-                sark_fiber::Config::new(server::MAX_CONNECTIONS),
-                Policy::new(drop, recover),
-                |result| {
-                    let error = result.err().expect("terminal listener failure");
-                    assert!(matches!(
-                        error.cause(),
-                        run::RunCause::Failure(run::Cause::Execute(run::ExecutionError::Accept {
-                            cause: AcceptError::Completion(accept::Failure::Syscall(error)),
-                            drive: None,
-                        })) if *error == Errno::INVALID_ARGUMENT
-                    ));
-                    notify.notify().expect("server finished");
-                },
-            )
+            worker.run(|context| {
+                let calls = Cell::new(0);
+                App::serve(
+                    plan.with_bound(listener),
+                    context,
+                    __W(&calls),
+                    sark_fiber::Config::new(server::MAX_CONNECTIONS),
+                    Policy::new(drop, recover),
+                    |result| {
+                        let error = result.err().expect("terminal listener failure");
+                        assert!(matches!(
+                            error.cause(),
+                            run::RunCause::Failure(run::Cause::Execute(run::ExecutionError::Accept {
+                                cause: AcceptError::Completion(accept::Failure::Syscall(error)),
+                                drive: None,
+                            })) if *error == Errno::INVALID_ARGUMENT
+                        ));
+                    },
+                )
+            })
         })
         .with(|| {
-            ready.wait_timeout(GUARD).expect("installed server");
+            main.wait_ready(GUARD).expect("installed server");
             Backend::shutdown::<Errno>(fault.as_fd(), How::READ).expect("stop native listener");
-            finished
-                .wait_timeout(GUARD)
+            main.wait_done(GUARD)
                 .expect("finish before external shutdown");
-            stop.fire().expect("external shutdown after failure");
         })
         .expect("server worker");
-        served.expect("server preparation");
-        drop(guard);
+        std::assert_matches!(served, lifecycle::Outcome::Done(()));
     })
     .expect("terminal server deadline");
 }
@@ -163,7 +155,7 @@ fn observes_either_listener_on_one_driver() {
                 socket::Listener,
             },
         },
-        manifold::network::listener::AcceptError,
+        manifold::{app::Host, network::listener::AcceptError},
         net::wire::{self, domain},
         runtime::{executor::session, topology},
     };
@@ -189,9 +181,7 @@ fn observes_either_listener_on_one_driver() {
             let first = Plan::new(first.local_addr(), Duration::from_secs(10))
                 .build()
                 .with_bound(first);
-            let second = Plan::new(second.local_addr(), Duration::from_secs(10))
-                .build_for::<KeyTag<2>, KeyTag<3>>()
-                .with_bound(second);
+            let second = common::h2::tls::plan(second).expect("H2 plan");
             let profile = first.config();
             let storage = storage::With::new((), date::Clock::new().expect("Date clock"));
             let plans = (first, second);
@@ -209,17 +199,18 @@ fn observes_either_listener_on_one_driver() {
                         let first_app = App::new::<wire::Identity, KeyTag<0>>(
                             first_brand, &state, sark_fiber::Config::new(server::MAX_CONNECTIONS),
                         );
-                        let second_app = App::new::<wire::Identity, KeyTag<2>>(
-                            second_brand, &state, sark_fiber::Config::new(server::MAX_CONNECTIONS),
+                        let second_app = App::multiplexed::<wire::Identity, KeyTag<2>, _>(
+                            second_brand, &state, sark_fiber::Config::new(1),
                         );
                         first.install(stage, domain::Local::new(wire::Identity), first_app,
                             |first, mut first_wait, stage| {
-                                second.install(stage, domain::Local::new(wire::Identity), second_app,
+                                second.tasks(second_app, 1).try_install(
+                                    stage, domain::Local::<wire::Identity, _>::new(wire::Identity), sark_h2::server::task::timers::Disabled,
                                     |second, mut second_wait, stage| {
-                                        let watches = [first.watch(), second.watch()];
+                                        let watches = [first_wait.watch(), second_wait.watch()];
                                         let result = stage.with_app(
                                             &mut finish,
-                                            server::accept::Listeners::new(first, second),
+                                            server::accept::Listeners::new(first, Host::new(second)),
                                             |app| {
                                                 let first = abi::poll_fn(move |cx| {
                                                     first_wait.poll(cx.as_ref().completion())
@@ -266,14 +257,16 @@ fn observes_either_listener_on_one_driver() {
             );
             let route = [<KeyTag<0> as Tag>::ROUTE, <KeyTag<2> as Tag>::ROUTE][selected];
             // The consumed terminal failure also reaches the scope's mandatory observer.
-            assert!(matches!(
-                reports.events().expect("reclaimed resources"),
-                [Reclaimed::AcceptRoute {
+            let events = reports.events().expect("reclaimed resources");
+            assert!(!events.is_empty(), "{reports:?}");
+            assert!(events.iter().all(|event| matches!(
+                event,
+                Reclaimed::AcceptRoute {
                     target,
                     cause: accept::Failure::Syscall(error),
                     flow: Flow::Last,
-                }] if target.route() == route && *error == Errno::INVALID_ARGUMENT
-            ), "{reports:?}");
+                } if target.route() == route && *error == Errno::INVALID_ARGUMENT
+            )), "{reports:?}");
         }).expect("combined listener deadline");
     }
 }

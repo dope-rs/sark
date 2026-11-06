@@ -31,7 +31,7 @@ impl Routes {
         let symbols = &context.plan.spec.state_generics;
         let [n_tasks, v_body, v_date] = symbols.locals(["__tasks", "body", "date"]);
         let [v_error, v_exch, v_exec] = symbols.locals(["error", "exchange", "execution"]);
-        let [v_finish, v_obs, v_result] = symbols.locals(["finish", "observer", "outcome"]);
+        let [v_finish, v_result] = symbols.locals(["finish", "outcome"]);
         let [v_output, v_wait, v_permit] = symbols.locals(["output", "pending", "permit"]);
         let [v_ready, v_run, v_sess] = symbols.locals(["ready", "runtime", "session"]);
         let [v_this, v_write] = symbols.locals(["this", "write"]);
@@ -41,31 +41,27 @@ impl Routes {
         use quote::quote;
 
         let state_ty = types.names.state_ty;
-        let task_id = &context.exec.task.identity;
+        let task_id = &context.exec.identity;
         let runtime = &types.routing.runtime;
         let duplex = &types.protocol.duplex_ty;
         let cont = &h1.continuations;
         let owner = cont.route();
         let ready = cont.ready();
         let built = cont.ready_route();
-        let work: Vec<_> = context
-            .plan
-            .entries
-            .iter()
+        let work: Vec<_> = cont
+            .bodies()
             .map(|route| {
                 let variant = &route.pending_variant;
                 match &route.mode {
                     serve::Mode::Fiber { .. } => quote! {
-                        #owner::#variant(#v_wait) => #v_wait.has_work()
+                        #owner::#variant(ref #v_wait) => #v_wait.has_work()
                     },
                     _ => quote! { #owner::#variant(_) => false },
                 }
             })
             .collect();
-        let pending: Vec<_> = context
-            .plan
-            .entries
-            .iter()
+        let pending: Vec<_> = cont
+            .bodies()
             .map(|route| {
                 let variant = &route.pending_variant;
                 match &route.mode {
@@ -81,10 +77,8 @@ impl Routes {
                 }
             })
             .collect();
-        let body: Vec<_> = context
-            .plan
-            .entries
-            .iter()
+        let body: Vec<_> = cont
+            .bodies()
             .map(|route| {
                 let variant = &route.pending_variant;
                 match &route.pending_flow {
@@ -126,11 +120,7 @@ impl Routes {
                                             #v_exch,
                                         ));
                                         let #v_error = #ns_h1::wire::Failure::Assembly(#v_error);
-                                        if let ::core::option::Option::Some(#v_obs) =
-                                            #ns_core::life::Mode::observer(#v_this.#f_life)
-                                        {
-                                            #ns_core::life::Observer::diagnostic(#v_obs, &#v_error);
-                                        }
+                                        #ns_core::life::Mode::diagnostic(#v_this.#f_life, &#v_error);
                                         ::core::result::Result::Err(#v_error.body())
                                     }
                                 }
@@ -141,10 +131,8 @@ impl Routes {
             })
             .collect();
         let mut resume = Vec::new();
-        let finish: Vec<_> = context
-            .plan
-            .entries
-            .iter()
+        let finish: Vec<_> = cont
+            .bodies()
             .map(|route| {
                 let pending = &route.pending_variant;
                 match &route.mode {
@@ -274,7 +262,7 @@ impl Routes {
                         }
                     }
                     serve::Mode::Duplex { family } => {
-                        let wrapped = h1.duplex.wrap(*family, quote!(#v_sess));
+                        let wrapped = h1.duplex.wrap(*family, false, quote!(#v_sess));
                         quote! {
                             #owner::#pending(#v_wait) => {
                                 let #v_finish = (
@@ -296,10 +284,8 @@ impl Routes {
                 }
             })
             .collect();
-        let cancel: Vec<_> = context
-            .plan
-            .entries
-            .iter()
+        let cancel: Vec<_> = cont
+            .bodies()
             .map(|route| {
                 let pending = &route.pending_variant;
                 quote! {

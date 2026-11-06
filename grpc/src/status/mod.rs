@@ -209,7 +209,7 @@ impl Status {
     }
 
     pub fn from_fields<S: Metadata + ?Sized>(fields: &S) -> Result<Self, Self> {
-        let owner = section::Plan::build(fields, rules::Kind::ResponseTrailers)?;
+        let owner = section::build(fields, rules::Kind::ResponseTrailers)?;
         Self::from_owner(owner, Section::Trailing, None)
     }
 

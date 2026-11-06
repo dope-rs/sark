@@ -1,4 +1,4 @@
-use std::{convert::Infallible, marker::PhantomData, mem};
+use std::{marker::PhantomData, mem};
 
 use app::{
     admit::Registered,
@@ -35,7 +35,7 @@ use o3::{
     buffer,
     buffer::{hold, pool, resident},
 };
-use policy::{end, output, start};
+use policy::{end, start};
 use sark_client::protocol::codec::{Codec, State, Storage};
 
 use crate::client::{
@@ -129,7 +129,7 @@ where
             session::Input,
         )>,
     > {
-        Some(output::Flush::<Infallible, _>::Context(
+        Some(
             |(owner, ctx, input): (
                 &mut Self,
                 &mut turns::Context<'_, '_, 'd, Self::ConnState, Self::Send, ID>,
@@ -140,7 +140,7 @@ where
                     .root
                     .input(id, input, ctx.close_status(), ctx.region());
             },
-        ))
+        )
     }
 }
 
@@ -304,7 +304,7 @@ where
     fn failed(
         &mut self,
         _: attempt::Completion<'_, 'd, ID>,
-        _: event::ConnectFault,
+        _: attempt::ConnectFault,
         _: &mut driver::Context<'_, 'd>,
     ) {
         self.root.protocol.transport.waiters.wake_io();
@@ -339,6 +339,10 @@ where
     P: Route<'f, 'e, 'b, 'c, 'd, ID>,
 {
     type Drain = Ready;
+
+    fn take_close(&self, id: conn::Id<'d, ID>) -> Option<close::Directive> {
+        self.root.protocol().io.take_close(id)
+    }
 
     fn transmit_failed(
         &self,
@@ -420,7 +424,7 @@ impl<'s, 'o, 'q, 'e, 'b, 'c, 'd, ID: Identity, O> session::Failed<'d, ID>
     fn failed(
         &mut self,
         attempt: attempt::Completion<'_, 'd, ID>,
-        cause: event::ConnectFault,
+        cause: attempt::ConnectFault,
         _: &mut driver::Context<'_, 'd>,
     ) {
         self.root.fail(&attempt, Failure::Attempt(cause));
@@ -439,7 +443,7 @@ impl<'s, 'o, 'q, 'e, 'b, 'c, 'd, ID: Identity, O> session::Exhausted<'d, ID>
         let cause = match cause {
             opening::Exhaustion::Identity => Failure::IdentityExhausted,
             opening::Exhaustion::Submission(error) => Failure::Attempt(
-                event::ConnectFault::Transport(event::ConnectError::Admission(error)),
+                attempt::ConnectFault::Transport(event::ConnectError::Admission(error)),
             ),
         };
         self.root.fail(&attempt, cause);

@@ -275,14 +275,19 @@ impl<'state> duplex::Route<'state, ()> for Connect {
 pub struct Session;
 
 impl<'d> duplex::Session<'d> for Session {
-    fn receive(&mut self, _: owned::Segments<'d>) -> duplex::Action<'d> {
-        duplex::Action::idle()
+    fn receive(
+        &mut self,
+        _: owned::Segments<'d>,
+        _: &mut [u8],
+        _: &mut Vec<u8>,
+    ) -> (usize, duplex::Action<'d>) {
+        (0, duplex::Action::idle())
     }
-    fn finish(&mut self) -> duplex::Action<'d> {
-        duplex::Action::idle()
+    fn finish(&mut self, _: &mut [u8], _: &mut Vec<u8>) -> (usize, duplex::Action<'d>) {
+        (0, duplex::Action::idle())
     }
-    fn activate(&mut self) -> duplex::Action<'d> {
-        duplex::Action::idle()
+    fn activate(&mut self, _: &mut [u8], _: &mut Vec<u8>) -> (usize, duplex::Action<'d>) {
+        (0, duplex::Action::idle())
     }
 }
 

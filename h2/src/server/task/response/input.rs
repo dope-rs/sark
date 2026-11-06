@@ -5,8 +5,7 @@ use o3::{
 use sark_core::{
     body,
     decode::{exec, request},
-    duplex::{self, admit, input, machine},
-    manifold::stream::Boundary,
+    duplex::{self, input, machine},
 };
 use sark_http::payload::owned;
 
@@ -106,12 +105,12 @@ impl<'d, P> Request<'d, P> {
     }
 }
 
-struct Buf<'d> {
+pub(in crate::server::task) struct Buf<'d> {
     input: Option<segments::Chain<resident::Shared<'d>>>,
 }
 
 impl<'d> Buf<'d> {
-    const fn new(input: Option<segments::Chain<resident::Shared<'d>>>) -> Self {
+    pub(super) const fn new(input: Option<segments::Chain<resident::Shared<'d>>>) -> Self {
         Self { input }
     }
 }
@@ -150,57 +149,8 @@ impl<'d> input::Buf<'d> for Buf<'d> {
     }
 }
 
-/// H2 carrier storage around the protocol-neutral input reducer.
-#[repr(transparent)]
-pub(in crate::server::task) struct Input<'d, D>(input::State<'d, D, Buf<'d>>)
-where
-    D: duplex::Session<'d>;
-
-impl<'d, D> Input<'d, D>
-where
-    D: duplex::Session<'d>,
-{
-    pub(super) fn open(session: D, input: Option<segments::Chain<resident::Shared<'d>>>) -> Self {
-        Self(input::State::open(session, Buf::new(input)))
-    }
-
-    pub(super) fn finished(
-        session: D,
-        input: Option<segments::Chain<resident::Shared<'d>>>,
-    ) -> Self {
-        Self(input::State::finished(session, Buf::new(input)))
-    }
-
-    pub(super) const fn status(&self) -> input::Status {
-        self.0.status()
-    }
-
-    pub(super) fn push(
-        &mut self,
-        data: event::DataPayload<resident::Shared<'d>>,
-        boundary: Boundary,
-    ) -> Result<(), input::PushError<event::DataPayload<resident::Shared<'d>>, payload::Error>>
-    {
-        self.0.push(data, boundary)
-    }
-
-    pub(super) fn finish(&mut self) -> Result<(), machine::FinishError> {
-        self.0.finish()
-    }
-
-    pub(super) fn work(&self) -> input::Work {
-        self.0.work()
-    }
-
-    pub(super) fn transact<R, E>(
-        &mut self,
-        admit: impl for<'turn> FnOnce(
-            admit::Emission<'turn, 'd, D>,
-        ) -> admit::Admission<'turn, 'd, D, R, E>,
-    ) -> input::Turn<machine::Transaction<R, E>, ()> {
-        self.0.transact(admit)
-    }
-}
+/// H2 carrier storage using the protocol-neutral input reducer.
+pub(in crate::server::task) type Input<'d, D> = input::State<'d, D, Buf<'d>>;
 
 const _: () = {
     assert!(size_of::<Request<'static, ()>>() == size_of::<Body<'static, ()>>());

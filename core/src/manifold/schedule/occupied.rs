@@ -4,9 +4,7 @@ use o3::{base::cell::region, depot::queue::indexed::lanes::entry};
 
 use crate::manifold::{
     self,
-    schedule::{
-        Activity, Block, Control, ControlTurn, Decision, Driver, LANES, Terminal, WorkClass, drive,
-    },
+    schedule::{Block, Control, ControlTurn, Decision, Driver, LANES, Terminal, WorkClass, drive},
 };
 
 /// One admitted resident owner and its control scheduling authority.
@@ -100,7 +98,7 @@ impl<'a, 'id, K: manifold::raw::Key, T, B: Block>
                         self.slot,
                         stream,
                         Terminal::Failed(error),
-                        Activity::Control,
+                        WorkClass::Control,
                     ),
                     self.scope,
                 );

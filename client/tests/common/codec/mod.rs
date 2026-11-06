@@ -110,14 +110,12 @@ unsafe impl<'d> hold::raw::Retain<'d> for Gate {
     }
 }
 
-mod block;
 pub mod decoder;
 mod output;
 mod retain;
 pub mod session;
 mod source;
-pub use block::Block;
-pub use output::Output;
+pub use output::only;
 pub use retain::Retain;
 pub(in crate::common::codec) use source::Source;
 

@@ -74,15 +74,15 @@ const _: () = assert!(core::mem::size_of::<Allowance>() == 1);
 
 const MAX_HEADER_COUNT: usize = 128;
 
-pub enum HeadProgress<'a, 'req, R: route::Spec, C = Plain> {
-    Complete(Head<'a, 'req, R, C>),
-    Pending(PendingHead<R, C>),
+pub enum HeadProgress<'a, 'req, R: route::Spec, C = Plain, A: head::Admission = ()> {
+    Complete(Head<'a, 'req, R, C, A>),
+    Pending(PendingHead<R, C, A>),
 }
 
 /// Complete typed request headers tied to their admitted input window.
 /// Body admission rejects GET/HEAD with a nonempty fixed body or any chunked body.
 /// A fixed length above the route limit is rejected first as too large.
-pub struct Head<'a, 'req, R: route::Spec, C = Plain> {
+pub struct Head<'a, 'req, R: route::Spec, C = Plain, A: head::Admission = ()> {
     pub(in crate::wire::parsing::framing) fields: Fields<'a, 'req, R>,
     pub(in crate::wire::parsing::framing) connection: head::Connection,
     pub(in crate::wire::parsing::framing) response: response::Context,
@@ -90,9 +90,10 @@ pub struct Head<'a, 'req, R: route::Spec, C = Plain> {
     pub(in crate::wire::parsing::framing) body_framing: RequestBody,
     pub(in crate::wire::parsing::framing) expectation: expect::Decision,
     pub(in crate::wire::parsing::framing) allowance: Allowance,
+    admission: A::Admitted,
 }
 
-impl<'a, 'req, R: route::Spec, C> Head<'a, 'req, R, C> {
+impl<'a, 'req, R: route::Spec, C, A: head::Admission> Head<'a, 'req, R, C, A> {
     pub const fn source(&self) -> &'a parsing::Head<'req> {
         self.fields.source.head
     }
@@ -101,19 +102,37 @@ impl<'a, 'req, R: route::Spec, C> Head<'a, 'req, R, C> {
         self.response
     }
 
+    /// Removes route-local header admission without changing its frame proof.
+    pub fn into_admission(self) -> (Head<'a, 'req, R, C>, A::Admitted) {
+        (
+            Head {
+                fields: self.fields,
+                connection: self.connection,
+                response: self.response,
+                coding: self.coding,
+                body_framing: self.body_framing,
+                expectation: self.expectation,
+                allowance: self.allowance,
+                admission: (),
+            },
+            self.admission,
+        )
+    }
+
     fn start_with(
         source: parsing::raw::Bound<&'a parsing::Head<'req>, R>,
         coding: Coding,
         select: impl FnOnce(Coding) -> C,
-    ) -> Result<HeadProgress<'a, 'req, R, C>, parsing::Request<R::Request>> {
-        let parsed = head::Block::<<R::Request as route::Schema>::RawHeaders>::scan::<R::Request>(
-            source.head.input().as_slice(),
-            source.head.request().end(),
-            MAX_HEADER_COUNT,
-            coding,
-            source.head.request().version(),
-        )
-        .map_err(parsing::Request::Head)?;
+    ) -> Result<HeadProgress<'a, 'req, R, C, A>, parsing::Request<R::Request>> {
+        let parsed =
+            head::Block::<<R::Request as route::Schema>::RawHeaders, A>::scan::<R::Request>(
+                source.head.input().as_slice(),
+                source.head.request().end(),
+                MAX_HEADER_COUNT,
+                coding,
+                source.head.request().version(),
+            )
+            .map_err(parsing::Request::Head)?;
         Ok(match parsed {
             head::Scanned::Complete(block) => {
                 let coding = select(block.coding());
@@ -140,22 +159,30 @@ impl<'a, 'req, R: route::Spec, C> Head<'a, 'req, R, C> {
 
     pub(in crate::wire::parsing::framing) fn new(
         source: parsing::raw::Bound<&'a parsing::Head<'req>, R>,
-        parsed: head::Parsed<<R::Request as route::Schema>::RawHeaders>,
+        parsed: head::Parsed<<R::Request as route::Schema>::RawHeaders, A>,
         coding: C,
     ) -> Self {
+        let connection = parsed.connection();
+        let response = parsed.response();
+        let body_framing = parsed.body();
+        let expectation = parsed.expectation();
+        let len = parsed.len();
+        let layout = parsed.layout();
+        let (headers, admission) = parsed.into_fields();
         Self {
-            connection: parsed.connection(),
-            response: parsed.response(),
+            connection,
+            response,
             coding,
-            body_framing: parsed.body(),
-            expectation: parsed.expectation(),
+            body_framing,
+            expectation,
             allowance: Allowance::from(source.head.request()),
             fields: Fields {
-                len: parsed.len(),
-                layout: parsed.layout(),
-                headers: parsed.into_headers(),
+                len,
+                layout,
+                headers,
                 source,
             },
+            admission,
         }
     }
 
@@ -170,17 +197,17 @@ impl<'a, 'req, R: route::Spec, C> Head<'a, 'req, R, C> {
     }
 }
 
-impl<'a, 'req, R: route::Spec> Head<'a, 'req, R, Plain> {
+impl<'a, 'req, R: route::Spec, A: head::Admission> Head<'a, 'req, R, Plain, A> {
     pub fn start(
         source: parsing::raw::Bound<&'a parsing::Head<'req>, R>,
-    ) -> Result<HeadProgress<'a, 'req, R>, parsing::Request<R::Request>> {
+    ) -> Result<HeadProgress<'a, 'req, R, Plain, A>, parsing::Request<R::Request>> {
         Self::start_with(source, Coding::Plain, |_| Plain)
     }
 
     pub fn parse(
         source: parsing::raw::Bound<&'a parsing::Head<'req>, R>,
     ) -> Result<Option<Self>, parsing::Request<R::Request>> {
-        let Some(parsed) = head::Parsed::<<R::Request as route::Schema>::RawHeaders>::parse::<
+        let Some(parsed) = head::Parsed::<<R::Request as route::Schema>::RawHeaders, A>::parse::<
             R::Request,
         >(source.head, MAX_HEADER_COUNT)
         .map_err(parsing::Request::Head)?
@@ -191,11 +218,11 @@ impl<'a, 'req, R: route::Spec> Head<'a, 'req, R, Plain> {
     }
 }
 
-impl<'a, 'req, R: route::Spec> Head<'a, 'req, R, Coding> {
+impl<'a, 'req, R: route::Spec, A: head::Admission> Head<'a, 'req, R, Coding, A> {
     pub fn start(
         source: parsing::raw::Bound<&'a parsing::Head<'req>, R>,
         coding: Coding,
-    ) -> Result<HeadProgress<'a, 'req, R, Coding>, parsing::Request<R::Request>> {
+    ) -> Result<HeadProgress<'a, 'req, R, Coding, A>, parsing::Request<R::Request>> {
         Self::start_with(source, coding, convert::identity)
     }
 
@@ -203,7 +230,7 @@ impl<'a, 'req, R: route::Spec> Head<'a, 'req, R, Coding> {
         source: parsing::raw::Bound<&'a parsing::Head<'req>, R>,
         coding: Coding,
     ) -> Result<Option<Self>, parsing::Request<R::Request>> {
-        let Some(parsed) = head::Gzip::<<R::Request as route::Schema>::RawHeaders>::parse::<
+        let Some(parsed) = head::Gzip::<<R::Request as route::Schema>::RawHeaders, A>::parse::<
             R::Request,
         >(source.head, MAX_HEADER_COUNT, coding)
         .map_err(parsing::Request::Head)?
@@ -217,14 +244,14 @@ impl<'a, 'req, R: route::Spec> Head<'a, 'req, R, Coding> {
 
 /// Completed route fields bound to the sole append-only owner of a split head.
 /// Resumed body admission follows [`Head`]'s method and length checks.
-pub struct PendingHead<R: route::Spec, C = Plain> {
+pub struct PendingHead<R: route::Spec, C = Plain, A = ()> {
     pub(in crate::wire::parsing::framing) fields:
-        head::Pending<<R::Request as route::Schema>::RawHeaders>,
+        head::Pending<<R::Request as route::Schema>::RawHeaders, A>,
     pub(in crate::wire::parsing::framing) params: <R::Request as route::Schema>::RawParams,
     pub(in crate::wire::parsing::framing) coding: PhantomData<C>,
 }
 
-impl<R: route::Spec, C> PendingHead<R, C> {
+impl<R: route::Spec, C, A: head::Admission> PendingHead<R, C, A> {
     /// Pending fields retain the head admitted within HEAD_CAPACITY.
     pub fn len(&self) -> u32 {
         self.fields.len() as u32
@@ -241,7 +268,7 @@ impl<R: route::Spec, C> PendingHead<R, C> {
         select: impl FnOnce(Coding) -> C,
         pending: impl FnOnce(Self) -> H,
         complete: impl for<'a, 'req> FnOnce(
-            Head<'a, 'req, R, C>,
+            Head<'a, 'req, R, C, A>,
             session::Permit,
         )
             -> session::RouteOutcome<'d, P, D, H, parsing::Rejected<'d>>,
@@ -255,7 +282,7 @@ impl<R: route::Spec, C> PendingHead<R, C> {
         } = source;
         let progress = head::Pending::try_start::<R::Request>(owner, coding, MAX_HEADER_COUNT)
             .map_err(parsing::Request::Head)?;
-        Self::settle(
+        Ok(Self::settle(
             progress,
             params,
             permit,
@@ -265,7 +292,7 @@ impl<R: route::Spec, C> PendingHead<R, C> {
                 pending: pending(head),
             },
             complete,
-        )
+        ))
     }
 
     fn advance<'d, P, D, H>(
@@ -275,7 +302,7 @@ impl<R: route::Spec, C> PendingHead<R, C> {
         select: impl FnOnce(Coding) -> C,
         pending: impl FnOnce(Self) -> H,
         complete: impl for<'a, 'req> FnOnce(
-            Head<'a, 'req, R, C>,
+            Head<'a, 'req, R, C, A>,
             session::Permit,
         )
             -> session::RouteOutcome<'d, P, D, H, parsing::Rejected<'d>>,
@@ -292,7 +319,7 @@ impl<R: route::Spec, C> PendingHead<R, C> {
         let progress = fields
             .advance::<R::Request>(input.as_slice())
             .map_err(parsing::Request::Head)?;
-        Self::settle(
+        Ok(Self::settle(
             progress,
             params,
             permit,
@@ -302,49 +329,47 @@ impl<R: route::Spec, C> PendingHead<R, C> {
                 pending: pending(head),
             },
             |head, permit| complete(head, permit).after_head(prior),
-        )
+        ))
     }
 
     fn settle<T>(
-        progress: head::Progress<<R::Request as route::Schema>::RawHeaders>,
+        progress: head::Progress<<R::Request as route::Schema>::RawHeaders, A>,
         params: <R::Request as route::Schema>::RawParams,
         permit: session::Permit,
         select: impl FnOnce(Coding) -> C,
         pending: impl FnOnce(Self, session::Permit) -> T,
-        complete: impl for<'a, 'req> FnOnce(Head<'a, 'req, R, C>, session::Permit) -> T,
-    ) -> Result<T, parsing::Request<R::Request>> {
+        complete: impl for<'a, 'req> FnOnce(Head<'a, 'req, R, C, A>, session::Permit) -> T,
+    ) -> T {
         match progress {
-            head::Progress::Pending(fields) => Ok(pending(
+            head::Progress::Pending(fields) => pending(
                 Self {
                     fields,
                     params,
                     coding: PhantomData,
                 },
                 permit,
-            )),
-            head::Progress::Complete(owner, block) => owner.with_shared(|view, request| {
+            ),
+            head::Progress::Complete(owner, parsed) => owner.with_shared(|view, request| {
                 let source = parsing::Head {
                     input: crate::Input::Buffered(view),
                     request,
                 };
-                let coding = select(block.coding());
-                let parsed = head::Parsed::from_block::<R::Request>(block, source.request())
-                    .map_err(parsing::Request::Head)?;
+                let (parsed, coding) = parsed.into_parts();
                 let matched = parsing::raw::Bound::retained(&source, params);
-                let head = Head::new(matched, parsed, coding);
-                Ok(complete(head, permit))
+                let head = Head::new(matched, parsed, select(coding));
+                complete(head, permit)
             }),
         }
     }
 }
 
-impl<R: route::Spec> PendingHead<R, Plain> {
+impl<R: route::Spec, A: head::Admission> PendingHead<R, Plain, A> {
     pub fn try_start<'d, P, D, H>(
         source: parsing::raw::Bound<parsing::Owned, R>,
         permit: session::Permit,
         pending: impl FnOnce(Self) -> H,
         complete: impl for<'a, 'req> FnOnce(
-            Head<'a, 'req, R>,
+            Head<'a, 'req, R, Plain, A>,
             session::Permit,
         )
             -> session::RouteOutcome<'d, P, D, H, parsing::Rejected<'d>>,
@@ -361,7 +386,7 @@ impl<R: route::Spec> PendingHead<R, Plain> {
         permit: session::Permit,
         pending: impl FnOnce(Self) -> H,
         complete: impl for<'a, 'req> FnOnce(
-            Head<'a, 'req, R>,
+            Head<'a, 'req, R, Plain, A>,
             session::Permit,
         )
             -> session::RouteOutcome<'d, P, D, H, parsing::Rejected<'d>>,
@@ -373,14 +398,14 @@ impl<R: route::Spec> PendingHead<R, Plain> {
     }
 }
 
-impl<R: route::Spec> PendingHead<R, Coding> {
+impl<R: route::Spec, A: head::Admission> PendingHead<R, Coding, A> {
     pub fn try_start<'d, P, D, H>(
         source: parsing::raw::Bound<parsing::Owned, R>,
         coding: Coding,
         permit: session::Permit,
         pending: impl FnOnce(Self) -> H,
         complete: impl for<'a, 'req> FnOnce(
-            Head<'a, 'req, R, Coding>,
+            Head<'a, 'req, R, Coding, A>,
             session::Permit,
         )
             -> session::RouteOutcome<'d, P, D, H, parsing::Rejected<'d>>,
@@ -397,7 +422,7 @@ impl<R: route::Spec> PendingHead<R, Coding> {
         permit: session::Permit,
         pending: impl FnOnce(Self) -> H,
         complete: impl for<'a, 'req> FnOnce(
-            Head<'a, 'req, R, Coding>,
+            Head<'a, 'req, R, Coding, A>,
             session::Permit,
         )
             -> session::RouteOutcome<'d, P, D, H, parsing::Rejected<'d>>,

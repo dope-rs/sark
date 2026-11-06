@@ -11,8 +11,9 @@ use sark_core::{
 };
 use sark_http::{
     field::metadata::{map::record, section::storage},
+    h1::{framing::RequestBody, head::line},
     payload::response::dispatch,
-    request::body::Ref,
+    request::{body::Ref, span::Span},
 };
 
 thread_local! {
@@ -21,6 +22,36 @@ thread_local! {
 
 pub struct Request<const START: usize = 0>;
 
+#[derive(Clone, Copy, Default)]
+pub struct Admission {
+    pub fields: usize,
+    pub finishes: usize,
+    pub other: Option<Span>,
+}
+
+impl sark_h1::wire::head::Admission for Admission {
+    type Admitted = Self;
+    const MAX_BYTES: usize = 16 * 1024;
+
+    fn field(&mut self, name: &[u8], _: &[u8], span: Span) -> Result<(), sark_h1::wire::Failure> {
+        self.fields += 1;
+        if name.eq_ignore_ascii_case(b"x-other") {
+            self.other = Some(span);
+        }
+        Ok(())
+    }
+
+    fn finish(
+        mut self,
+        _: &line::Request<'_>,
+        _: &sark_http::h1::head::request::Fields,
+        _: RequestBody,
+    ) -> Result<Self::Admitted, sark_h1::wire::Failure> {
+        self.finishes += 1;
+        Ok(self)
+    }
+}
+
 pub const PREFIX_HOST: &[u8] = b"HoSt: local\r\n\r\n";
 pub const PREFIX_LENGTH: &[u8] = b"Content-Length: invalid\r\n\r\n";
 pub const OWNED_PREFIX: &[u8] = b"GET / HTTP/1.1\r\nHost: local\r\nX-Next: value\r\nX-Count: on";
@@ -28,6 +59,17 @@ pub const OWNED_SUFFIX: &[u8] = b"ce\r\n\r\nTAIL";
 pub const OWNED_TAIL: &[u8] = b"TAIL";
 pub const CSV_FIELD: &[u8] =
     b"GET / HTTP/1.1\r\nHost: local\r\nAccept-Encoding: \t,gzip, \t\r\n\r\n";
+pub const INVALID_UPGRADES: [(&[u8], sark_ws::upgrade::Error); 3] = [
+    (
+        b"GET / HTTP/1.1\r\nHost: local\r\nSec-WebSocket-Key: invalid\r\n",
+        sark_ws::upgrade::Error::Key(sark_ws::upgrade::KeyError::Length { actual: 7 }),
+    ),
+    (
+        b"GET / HTTP/1.1\r\nHost: local\r\nSec-WebSocket-Key: invalid\r\nBroken header\r\n\r\n",
+        sark_ws::upgrade::Error::Key(sark_ws::upgrade::KeyError::Length { actual: 7 }),
+    ),
+    (CSV_FIELD, sark_ws::upgrade::Error::Connection),
+];
 pub const TRANSFER_CODINGS: &[(&[u8], bool)] = &[
     (b"chunked", true),
     (b"\tChUnKeD \t", true),
@@ -54,6 +96,25 @@ impl Request {
         input.extend_from_slice(field);
         input.resize(input.len() + width - field.len(), b'a');
         input.extend_from_slice(b"\r\n\r\n");
+        input
+    }
+
+    pub fn bounded(limit: usize, extra: usize) -> Vec<u8> {
+        let mut input = b"GET / HTTP/1.1\r\n".to_vec();
+        input.extend(super::Request::field_block(limit + extra - input.len()));
+        input.resize(input.len() + 128 * 1024, 0xa5);
+        input
+    }
+
+    pub fn upgrade_limit(extra: bool) -> Vec<u8> {
+        let mut input = Self::PREFIX.to_vec();
+        for _ in 1..128 {
+            input.extend_from_slice(b"X-Other: valid\r\n");
+        }
+        if extra {
+            input.extend_from_slice(b"Sec-WebSocket-Key: invalid\r\n");
+        }
+        input.extend_from_slice(b"\r\n");
         input
     }
 }

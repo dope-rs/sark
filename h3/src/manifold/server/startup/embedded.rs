@@ -24,6 +24,7 @@ use o3::buffer::resident;
 use sark_core::{life, life::session, manifold::task::app};
 use sark_http::payload::compress::dynamic::hash;
 
+use crate::manifold::owners;
 use crate::manifold::server::{
     Config, ConfigError, Handle, Session, Setup, Tasks, deadline, startup::Local,
 };
@@ -88,6 +89,7 @@ impl<const ID: u8, R: receive::Policy> Embedded<ID, R> {
         T: app::Bind<'d, Target = Handle<'d, ID>>,
         O: life::Mode<id::Handle<id::Driver<'d>, ID>, Id>
             + Mode<id::Domain<id::Driver<'d>, ID>, net::Owner<id::Driver<'d>, ID>>,
+        O::Retention: owners::Handoff,
         Tasks: Driver<
                 'd,
                 Local<'d, T::Runtime, O, packet::Off>,
@@ -101,7 +103,13 @@ impl<const ID: u8, R: receive::Policy> Embedded<ID, R> {
                 R::Buffer<'d>,
                 resident::Shared<'d>,
                 id::Driver<'d>,
-                Connection = Session<'d, T::Runtime>,
+                Connection = Session<
+                    'd,
+                    T::Runtime,
+                    session::Disabled,
+                    deadline::Disabled,
+                    O::Retention,
+                >,
             >,
     {
         let quic = self.quic;

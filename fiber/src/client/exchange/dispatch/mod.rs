@@ -97,7 +97,7 @@ impl<'app, 'd, B: Backend<'app, 'd>> abi::Fiber<'d> for Dispatch<'_, '_, 'app, '
                         prepared,
                         registration: mut reg,
                     } => {
-                        match backend.admit(prepared, check, admit.context().driver().into_driver())
+                        match backend.admit(prepared, check, admit.context().driver())
                         {
                             Ok(Admit::Stream(stream)) => {
                                 return machine::Step::Complete(task::Poll::Ready(Ok(
@@ -143,7 +143,7 @@ impl<'app, 'd, B: Backend<'app, 'd>> abi::Fiber<'d> for Dispatch<'_, '_, 'app, '
                                     conn,
                                     encoded,
                                     check,
-                                    context.as_mut().driver().into_driver(),
+                                    context.as_mut().driver(),
                                 );
                                 machine::Step::Complete(task::Poll::Ready(
                                     result.map(Submitted::new).map_err(Rejected::new),

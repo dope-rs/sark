@@ -2,15 +2,11 @@ use std::convert;
 
 use o3::{
     buffer::{self, hold, pool, pool::owners, segments, storage},
-    depot::queue::ring,
     mem,
 };
 use sark_core::{
     life::session,
-    manifold::{
-        server::drain,
-        stream::{Boundary, Payload, Section},
-    },
+    manifold::stream::{Boundary, Payload, Section},
 };
 use sark_http::field::metadata::{
     block, packed,
@@ -27,30 +23,7 @@ use crate::{conn::outputs::payloads, flow, frame, frame::numbers, hpack::decode:
 #[doc(hidden)]
 pub const MIN_RETAINED_WRITE_PREFIX_CAPACITY: usize = frame::HEADER_LEN + payloads::INLINE_PREFIX;
 
-/// One queued event tied to the queue that proves it is still resident.
-#[must_use]
-#[repr(transparent)]
-pub struct Ready<'a, T>(ring::Front<'a, ring::Fifo<T>>);
-
-impl<'a, T> Ready<'a, T> {
-    pub(in crate::conn) const fn new(front: ring::Front<'a, ring::Fifo<T>>) -> Self {
-        Self(front)
-    }
-}
-
-impl<T> AsRef<T> for Ready<'_, T> {
-    fn as_ref(&self) -> &T {
-        self.0.get()
-    }
-}
-
-impl<T> drain::Ready for Ready<'_, T> {
-    type Item = T;
-
-    fn take(self) -> Self::Item {
-        self.0.remove()
-    }
-}
+pub use crate::conn::machine::ready::Incoming as Ready;
 
 /// Exact header admission and semantic validation that rejected a stream.
 #[derive(Clone, Copy, Debug)]

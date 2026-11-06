@@ -3,7 +3,7 @@ use core::mem;
 use conn::write;
 use data::compose;
 use dope::{
-    core::driver::{retained, route::Identity},
+    core::driver::{self, route::Identity},
     manifold::network::listener,
     net::{
         link::egress::{self, data},
@@ -162,7 +162,7 @@ impl<'d> Evidence<'d> for compose::Tagged<resident::Shared<'d>, stream::Key> {
 
 fn flush_into<'d, ID: Identity, W, C, E, G, S>(
     conn: &mut conn::Ctx<'_, '_, '_, '_, '_, 'd, ID, W, C, data::Bound<E, G>>,
-    driver: &mut retained::Context<'_, '_, 'd>,
+    driver: &mut driver::Context<'_, 'd>,
     end: End,
     accepted: &mut S,
 ) -> Result<(), Failure>
@@ -298,20 +298,9 @@ where
     E: Evidence<'d>,
     G: bound::Bound,
 {
-    pub(in crate::server) fn observe<M: life::Mode<conn::Id<'d, ID>, stream::Key>>(
-        self,
-        driver: &mut retained::Context<'_, '_, 'd>,
-        error: Option<numbers::ErrorCode>,
-        mode: &mut M,
-    ) {
-        if let Err((cause, _)) = self.finish(driver, error, mode) {
-            mode.diagnostic(&cause);
-        }
-    }
-
     pub(in crate::server) fn finish<M: life::Mode<conn::Id<'d, ID>, stream::Key>>(
         self,
-        driver: &mut retained::Context<'_, '_, 'd>,
+        driver: &mut driver::Context<'_, 'd>,
         error: Option<numbers::ErrorCode>,
         mode: &mut M,
     ) -> Result<Progress, (Failure, Progress)> {

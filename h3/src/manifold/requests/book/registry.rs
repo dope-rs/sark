@@ -1,7 +1,9 @@
 //! Canonical generational identity registry for one connection-local book.
 
+use crate::manifold::owners;
+use sark_core::manifold::task::app;
+
 use o3::depot::arena::hash::errors;
-use sark_core::{body, decode::request, duplex};
 
 use crate::manifold::{
     Phase,
@@ -12,7 +14,7 @@ use crate::manifold::{
     },
 };
 
-impl<'d, P: request::Prepared, B: body::Build<'d>, T, D: duplex::Session<'d>> Book<'d, P, B, T, D> {
+impl<'d, A: app::Runtime<'d>, M: owners::Handoff> Book<'d, A, M> {
     pub(in crate::manifold) fn resolve(
         &mut self,
         ident: requests::Identity,
@@ -20,16 +22,6 @@ impl<'d, P: request::Prepared, B: body::Build<'d>, T, D: duplex::Session<'d>> Bo
         finished: bool,
     ) -> Option<requests::Id> {
         self.entries.resolve(ident, slot, finished)
-    }
-
-    pub(in crate::manifold) fn resume_head(
-        &mut self,
-        id: requests::Id,
-    ) -> Option<claim::Claim<'_, 'd, P, B, T, D>> {
-        match self.head(id) {
-            Some(claim::Head::Reserved(claim)) => Some(claim),
-            Some(claim::Head::Stopped) | None => None,
-        }
     }
 
     pub(in crate::manifold) fn reserved(&self) -> impl Iterator<Item = requests::Identity> + '_ {
@@ -58,7 +50,7 @@ impl<'d, P: request::Prepared, B: body::Build<'d>, T, D: duplex::Session<'d>> Bo
     pub(in crate::manifold) fn reserve_head(
         &mut self,
         ident: requests::Identity,
-    ) -> Result<claim::Claim<'_, 'd, P, B, T, D>, errors::Create<entries::Tag>> {
+    ) -> Result<claim::Claim<'_, 'd, A, M>, errors::Create<entries::Tag>> {
         let reserved = self.entries.reserve(ident)?;
         Ok(claim::Claim::new(reserved, &mut self.segments))
     }

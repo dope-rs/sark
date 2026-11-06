@@ -24,7 +24,7 @@ use crate::{
     manifold::{
         self, owners, requests,
         server::{
-            self, deadline, deadline::state::State, rotation, session::finish,
+            self, deadline, deadline::state::State, failure, rotation, session::finish,
             task::ingress::item::Item,
         },
     },
@@ -42,7 +42,7 @@ pub(in crate::manifold::server) fn accept<
     B,
     const RECONCILE: bool,
 >(
-    state: &mut super::Ready<'_, 'd, R, L, E>,
+    state: &mut server::Session<'d, R, L, E, O::Retention>,
     mut app: pin::Pin<&mut R>,
     life: &mut O,
     conn: &mut scope::Access<'scope, ID, B, RECONCILE, resident::Shared<'d>>,
@@ -54,11 +54,11 @@ where
     L: rotation::Policy<'d>,
     E: State<'d>,
     R: Runtime<'d, Target = server::Handle<'d, ID>>,
-    O: life::Mode<id::Handle<id::Driver<'d>, ID>, Id>,
+    O: life::Mode<id::Handle<id::Driver<'d>, ID>, Id>
+        + failure::Sink<id::Handle<id::Driver<'d>, ID>>,
     O::Retention: owners::Handoff,
     B: stream::Retain<'d>,
 {
-    let state = &mut *state.state;
     if schedule::Status::new(state.h3.h3()).has_work() {
         Item::new(state, app.as_mut(), life, conn, handle, now).step();
         return if conn.view().lifecycle().is_closing() {
@@ -156,25 +156,23 @@ where
     let report = match state.h3.ingress().drive(conn, note, life, handle) {
         Ok(report) => report,
         Err(error) => {
-            life.diagnostic(&error);
+            life.failure(failure::Event::Connection {
+                conn: handle,
+                error: &error,
+            });
             manifold::close_connection_scoped(conn, error.code());
             return mux::Disposition::Accept;
         }
     };
-    if let Some(report) = report
-        && let Err(error) = state.account(report)
-    {
-        life.diagnostic(&error);
-        manifold::close_connection_scoped(conn, server::request_error_code(error));
-        return mux::Disposition::Accept;
+    if let Some(report) = report {
+        state.account(report);
     }
     Item::new(state, app.as_mut(), life, conn, handle, now).step();
     if conn.view().lifecycle().is_closing() {
         return mux::Disposition::Accept;
     }
-    if FLUSH && let Err(error) = state.flush_h3(life, conn, handle) {
-        life.diagnostic(&error);
-        manifold::close_connection_scoped(conn, error.code());
+    if FLUSH {
+        state.flush_h3(life, conn, handle);
     }
     mux::Disposition::Accept
 }

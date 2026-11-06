@@ -1,6 +1,6 @@
 //! Static selection of an input lease or finite exchange deadlines.
 
-use std::time;
+use std::{fmt, time};
 
 use dope::{
     core::driver::{
@@ -9,6 +9,9 @@ use dope::{
     },
     manifold::network::listener::conn,
 };
+use o3::buffer::hold;
+use sark_http::owner::cause;
+
 use sark_core::{
     deadline::config,
     life::{self, exchange, sequence},
@@ -29,12 +32,6 @@ pub struct Input;
 #[doc(hidden)]
 #[repr(transparent)]
 pub struct Head<M, const BODY: bool = false>(M);
-
-impl<M, const BODY: bool> Head<M, BODY> {
-    const fn new(mode: M) -> Self {
-        Self(mode)
-    }
-}
 
 /// Binds one compile-time deadline policy to a listener-capacity state domain.
 #[doc(hidden)]
@@ -67,7 +64,7 @@ impl<'d, ID: Identity> Policy<'d, ID> for HeadOnly {
     where
         M: sequence::Mode<conn::Id<'d, ID>>,
     {
-        Ok(Head::new(mode))
+        Ok(Head(mode))
     }
 }
 
@@ -81,7 +78,7 @@ impl<'d, ID: Identity> Policy<'d, ID> for Input {
     where
         M: sequence::Mode<conn::Id<'d, ID>>,
     {
-        Ok(Head::new(mode))
+        Ok(Head(mode))
     }
 }
 
@@ -158,6 +155,10 @@ where
         self.0.observer()
     }
 
+    fn diagnostic<E: fmt::Debug>(&mut self, cause: &E) {
+        self.0.diagnostic(cause);
+    }
+
     fn body<'a>(&'a mut self, id: exchange::Id<conn::Id<'d, ID>, u64>) -> Self::Body<'a>
     where
         conn::Id<'d, ID>: 'a,
@@ -172,14 +173,97 @@ where
 {
     type Session = M::Session;
     type TransportTag = M::TransportTag;
-    type Trace = M::Trace;
-
-    fn trace(&self) -> Option<&Self::Trace> {
-        self.0.trace()
+    fn tag(
+        &self,
+        id: exchange::Id<conn::Id<'d, ID>, u64>,
+        charge: hold::Charge,
+    ) -> Self::TransportTag {
+        sequence::Mode::tag(&self.0, id, charge)
     }
 
-    fn trace_mut(&mut self) -> Option<&mut Self::Trace> {
-        self.0.trace_mut()
+    fn transport(
+        &self,
+        conn: conn::Id<'d, ID>,
+        tag: Self::TransportTag,
+    ) -> Option<(exchange::Id<conn::Id<'d, ID>, u64>, hold::Charge)> {
+        sequence::Mode::transport(&self.0, conn, tag)
+    }
+
+    fn next(
+        &mut self,
+        session: &mut Self::Session,
+        conn: conn::Id<'d, ID>,
+    ) -> exchange::Id<conn::Id<'d, ID>, u64> {
+        sequence::Mode::next(&mut self.0, session, conn)
+    }
+
+    fn current(
+        &self,
+        session: &Self::Session,
+        conn: conn::Id<'d, ID>,
+    ) -> Option<exchange::Id<conn::Id<'d, ID>, u64>> {
+        sequence::Mode::current(&self.0, session, conn)
+    }
+
+    fn commit(
+        &mut self,
+        session: &mut Self::Session,
+        id: exchange::Id<conn::Id<'d, ID>, u64>,
+        bytes: usize,
+        charge: hold::Charge,
+    ) {
+        sequence::Mode::commit(&mut self.0, session, id, bytes, charge)
+    }
+
+    fn commit_link(
+        &mut self,
+        session: &mut Self::Session,
+        id: exchange::Id<conn::Id<'d, ID>, u64>,
+        bytes: usize,
+        charge: hold::Charge,
+        linked: hold::Charge,
+    ) {
+        sequence::Mode::commit_link(&mut self.0, session, id, bytes, charge, linked)
+    }
+
+    fn stage(
+        &mut self,
+        session: &mut Self::Session,
+        id: exchange::Id<conn::Id<'d, ID>, u64>,
+        charge: hold::Charge,
+    ) {
+        sequence::Mode::stage(&mut self.0, session, id, charge)
+    }
+
+    fn unstage(
+        &mut self,
+        session: &mut Self::Session,
+        id: exchange::Id<conn::Id<'d, ID>, u64>,
+        charge: hold::Charge,
+    ) {
+        sequence::Mode::unstage(&mut self.0, session, id, charge)
+    }
+
+    fn accept(
+        &mut self,
+        session: &mut Self::Session,
+        id: exchange::Id<conn::Id<'d, ID>, u64>,
+        charge: hold::Charge,
+    ) {
+        sequence::Mode::accept(&mut self.0, session, id, charge)
+    }
+
+    fn release(
+        &mut self,
+        id: exchange::Id<conn::Id<'d, ID>, u64>,
+        charge: hold::Charge,
+        cause: cause::Transport,
+    ) {
+        sequence::Mode::release(&mut self.0, id, charge, cause)
+    }
+
+    fn close(&mut self, session: &mut Self::Session, conn: conn::Id<'d, ID>) {
+        sequence::Mode::close(&mut self.0, session, conn)
     }
 }
 

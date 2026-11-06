@@ -52,12 +52,10 @@ impl<'d, P: rules::Policy, A: rules::Push> Parts<'_, 'd, P, A> {
 
         let target = self.session.control.ok_or(conn::Error::ControlMissing)?;
         let prefix = output::WritePrefix::try_encode(&frame::Control::cancel_push(push_id))?;
-        self.queues.enqueue(write::Entry::single(
-            WriteClass::Critical,
+        self.queues.enqueue(
             target,
-            prefix,
-            Boundary::More,
-        ))
+            write::Entry::single(WriteClass::Critical, prefix, Boundary::More),
+        )
     }
 
     pub(super) fn check_goaway(&self, id: u64) -> Result<(), conn::Error> {

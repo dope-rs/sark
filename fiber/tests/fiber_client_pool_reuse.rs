@@ -184,6 +184,7 @@ fn rejects_excess_response_before_reusing_one_slot() {
             )
             .expect("client plan")
             .enter(
+                (),
                 |mut app| {
                     app.wait().expect("active endpoint");
                     let client = app.handle;

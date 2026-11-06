@@ -71,8 +71,7 @@ fn preserves_resource() {
                             prepared.enter_with(
                                 context,
                                 |scope| scope.lend(|(head, tail), stage| {
-                                    let owner = stage
-                                        .with_stage(|stage| topology::Installer::install(head, stage))
+                                    let owner = topology::Installer::install(head, &mut stage.stage())
                                         .map_err(BranchError::First)?;
                                     tail.compose(owner, stage).map_err(BranchError::Second)
                                 }),
@@ -147,8 +146,7 @@ fn preserves_resource() {
                             prepared.enter_with(
                                 context,
                                 |scope| scope.lend(|(head, tail), stage| {
-                                    let owner = stage
-                                        .with_stage(|stage| topology::Installer::install(head, stage))
+                                    let owner = topology::Installer::install(head, &mut stage.stage())
                                         .map_err(BranchError::First)?;
                                     tail.compose(owner, stage).map_err(BranchError::Second)
                                 }),

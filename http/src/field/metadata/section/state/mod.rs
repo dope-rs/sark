@@ -110,7 +110,13 @@ impl<B, S> From<RetainedHead<B, S, ()>> for RetainedHead<B, S, Option<block::Pla
 
 /// The built-in policy admits every field before retaining this immutable owner;
 /// a request plan exists only after both final verdicts are valid.
-impl field::Source for RetainedHead<packed::Decoded, Selected<rules::RetainRaw>, block::Plan> {
+impl<const PREFIX: usize> field::Source
+    for RetainedHead<
+        packed::Decoded<pool::Span, PREFIX>,
+        Selected<rules::RetainRaw<PREFIX>>,
+        block::Plan,
+    >
+{
     fn emit<'field>(&'field self, sink: &mut impl field::Sink<'field>) {
         for field in self.fields.iter() {
             sink.entry(field::Entry(field));

@@ -17,12 +17,14 @@ use sark_h3::{conn::options, manifold::server::deadline};
 fn run<'a>(scenario: Scenario<'a>, protocol: options::Config) {
     scenario.try_run_with(
         protocol,
+        None,
         Disabled,
         deadline::Disabled,
         |error: Recovery<'_, '_>| -> Infallible {
             panic!("connection recovery: {:?}", error.cause())
         },
         |error| panic!("server diagnostic: {error:?}"),
+        sark_core::life::mode::Observed::new,
         |outcome| outcome.unwrap_or_else(|error| panic!("scenario failed: {error:?}")),
     );
 }

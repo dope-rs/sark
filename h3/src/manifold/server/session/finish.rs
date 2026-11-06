@@ -1,5 +1,5 @@
 use conn::scope;
-use dope::core::driver::schedule::{clock, sequence};
+use dope::core::driver::schedule::clock;
 use dope_quic::{
     conn,
     conn::{id, stream::resident::Handle},
@@ -8,24 +8,28 @@ use dope_quic::{
 };
 use o3::{buffer::resident, depot::arena::hash::errors::Create};
 use requests::{entries, task};
-use sark_core::{
-    deadline::timeline,
-    decode::dispatch,
-    life::{self, exchange},
-    manifold::task::app,
-};
+use sark_core::{deadline::timeline, decode::dispatch, life, manifold::task::app};
 use sark_http::field::metadata::section::rules;
 
 use crate::{
     frame, manifold,
     manifold::{
         Phase, encoder, owners, requests,
-        server::{self, deadline, deadline::state::State, rotation, session::retire::Retire},
+        server::{self, deadline::state::State, rotation, session::retire::Retire},
     },
 };
 
-pub(in crate::manifold::server) fn release<'d, A, L, E, const ID: u8, R, const RECONCILE: bool>(
-    state: &mut server::Session<'d, A, L, E>,
+pub(in crate::manifold::server) fn release<
+    'd,
+    A,
+    L,
+    E,
+    M: owners::Handoff,
+    const ID: u8,
+    R,
+    const RECONCILE: bool,
+>(
+    state: &mut server::Session<'d, A, L, E, M>,
     quic: &mut scope::Access<'_, ID, R, RECONCILE, resident::Shared<'d>>,
     id: requests::Id,
     now: clock::Moment<'d>,
@@ -59,7 +63,7 @@ where
     retire_slot(h3, quic, id, discard_input)
 }
 
-fn retained<'d, E: State<'d>>(
+pub(in crate::manifold::server) fn retained<'d, E: State<'d>>(
     deadline: &mut E,
     id: requests::Id,
     now: clock::Moment<'d>,
@@ -105,106 +109,49 @@ where
     result.map_err(|error| Retire::Target(error.into()))
 }
 
-pub(in crate::manifold::server) fn accept<'d, E, const ID: u8, A, O, R, const RECONCILE: bool>(
+pub(in crate::manifold::server) fn accept<'d, A, H>(
     h3: &mut manifold::Session<'d, A::Plan>,
-    mut deadline: clock::At<'d, &mut E>,
     app: &A,
-    effects: owners::Projection<'_, O, id::Handle<id::Driver<'d>, ID>>,
-    quic: &mut scope::Access<'_, ID, R, RECONCILE, resident::Shared<'d>>,
     id: requests::Id,
     done: task::Buffered<'d, A::Prepared>,
-) where
+) -> Result<encoder::Pending<'d, H>, Result<frame::ErrorCode, crate::conn::Error>>
+where
     A: app::Runtime<'d>,
-    E: State<'d>,
-    O: life::Mode<id::Handle<id::Driver<'d>, ID>, Id>,
-    O::Retention: owners::Handoff,
-    R: stream::Recv,
+    H: owners::Handoff,
 {
-    use owners::{Commit, Projection};
-
-    let (life, handle) = effects.into_parts();
-
-    if let Err(error) = deadline.apply_mut(|deadline, now| {
-        E::transition(deadline, id, timeline::Transition::ResponseReady, now)
-    }) {
-        let retired = removed(h3, deadline, quic, id, false);
-        exchange::Id::new(handle, id.stream_id()).retire(life, life::Outcome::Rejected);
-        manifold::close_connection_scoped(quic, deadline::code(error));
-        if let Err(error) = retired {
-            manifold::close_connection_scoped(quic, error.code());
-        }
-        return;
-    }
     let target = id.target();
-    let stream = target.stream_id();
     let task::Buffered {
         request: req,
         method,
     } = done;
-    let flow = exchange::Id::new(handle, stream);
-    let done = req.with_input(|prepared, input| {
+    req.with_input(|prepared, input| {
         let sent = app.try_project(prepared, input, |scoped| {
             let (req, slot) = scoped.into_parts();
             let enc = encoder::Encoder::from_slot(h3.h3_mut(), target, method, slot);
             match app.try_dispatch(req, enc) {
-                Err((error, target)) => {
-                    let code = match error {
-                        dispatch::Error::Busy | dispatch::Error::Sequence(sequence::Exhausted) => {
-                            frame::ErrorCode::ExcessiveLoad
-                        }
-                        dispatch::Error::Encode(cause) => Commit::code(cause),
-                        dispatch::Error::Body(never) => match never {},
-                        dispatch::Error::Pending
-                        | dispatch::Error::Moved
-                        | dispatch::Error::Unsupported
-                        | dispatch::Error::Invalid(_) => frame::ErrorCode::Internal,
-                    };
-                    Err((code, target.into_target()))
-                }
-                Ok(enc) => <O::Retention as owners::Handoff>::try_detach(enc)
-                    .map_err(|code| (code, target)),
+                Err((error, _)) => Err(match error {
+                    dispatch::Error::Busy | dispatch::Error::Sequence(_) => {
+                        Ok(frame::ErrorCode::ExcessiveLoad)
+                    }
+                    dispatch::Error::Encode(cause) => Err(cause),
+                    dispatch::Error::Body(never) => match never {},
+                    dispatch::Error::Pending
+                    | dispatch::Error::Moved
+                    | dispatch::Error::Unsupported
+                    | dispatch::Error::Invalid(_) => Ok(frame::ErrorCode::Internal),
+                }),
+                Ok(enc) => H::try_detach(enc).map_err(Err),
             }
         });
         let (enc, owner) = match sent {
             Ok(ready) => ready,
             Err(fail) => {
                 fail.discard();
-                return Err((frame::ErrorCode::Internal, target));
+                return Err(Ok(frame::ErrorCode::Internal));
             }
         };
-        <O::Retention as owners::Handoff>::finish(enc?, owner).map_err(|code| (code, target))
-    });
-    match done {
-        Ok(commit) => {
-            commit.observe(life, flow);
-            retire(h3, deadline, life, quic, id, flow, life::Outcome::Completed);
-        }
-        Err((code, target)) => {
-            Projection::new(life, handle).reset(quic, target, code);
-            retire(h3, deadline, life, quic, id, flow, life::Outcome::Rejected);
-        }
-    }
-}
-
-fn retire<'d, P, E, const ID: u8, O, R, const RECONCILE: bool>(
-    h3: &mut manifold::Session<'d, P>,
-    deadline: clock::At<'d, &mut E>,
-    life: &mut O,
-    quic: &mut scope::Access<'_, ID, R, RECONCILE, resident::Shared<'d>>,
-    id: requests::Id,
-    flow: exchange::Id<id::Handle<id::Driver<'d>, ID>, Id>,
-    end: life::Outcome,
-) where
-    P: rules::Policy,
-    E: State<'d>,
-    O: life::Mode<id::Handle<id::Driver<'d>, ID>, Id>,
-    R: stream::Recv,
-{
-    let retired = removed(h3, deadline, quic, id, false);
-    flow.retire(life, end);
-    if let Err(error) = retired {
-        manifold::close_connection_scoped(quic, error.code());
-    }
+        H::defer_with(encoder::Initial(enc?), owner, life::Outcome::Completed).map_err(Err)
+    })
 }
 
 pub(in crate::manifold::server) fn reject_new<
@@ -218,7 +165,7 @@ pub(in crate::manifold::server) fn reject_new<
     R,
     const RECONCILE: bool,
 >(
-    state: &mut server::Session<'d, A, L, E>,
+    state: &mut server::Session<'d, A, L, E, O::Retention>,
     life: &mut O,
     quic: &mut scope::Access<'scope, ID, R, RECONCILE, resident::Shared<'d>>,
     handle: id::Handle<id::Driver<'d>, ID>,

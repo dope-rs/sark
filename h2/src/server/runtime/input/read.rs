@@ -14,8 +14,19 @@ pub(in crate::server) struct Read<'a, T, P, D> {
     events: D,
 }
 
-impl<'a, T, P, D, X> Read<'a, T, P, D>
+impl<'a, 'd, T, P, D, X, F, E> Read<'a, T, P, D>
 where
+    F: rules::Policy,
+    E: event::Evidence,
+    P: for<'step> FnMut(
+        &'step mut T,
+    ) -> &'step mut machine::Connection<
+        crate::ServerRole,
+        F,
+        resident::Shared<'d>,
+        rules::RejectPush,
+        E,
+    >,
     D: FnMut(&mut T) -> Result<Progress, X>,
     X: Fault,
 {
@@ -27,23 +38,13 @@ where
         }
     }
 
-    pub(in crate::server) fn read<'w, 'd: 'w, F, E, W>(
+    pub(in crate::server) fn read<'w, W>(
         &mut self,
         source: &mut Turn<'_, 'w, 'd, W>,
     ) -> Result<Progress, X>
     where
-        F: rules::Policy,
-        E: event::Evidence,
+        'd: 'w,
         W: wire::Spec,
-        P: for<'step> FnMut(
-            &'step mut T,
-        ) -> &'step mut machine::Connection<
-            crate::ServerRole,
-            F,
-            resident::Shared<'d>,
-            rules::RejectPush,
-            E,
-        >,
     {
         let work = {
             let conn = (self.protocol)(self.context);
@@ -88,40 +89,14 @@ where
         result
     }
 
-    pub(in crate::server) fn resume<'d, F, E>(&mut self) -> Result<Progress, X>
-    where
-        F: rules::Policy,
-        E: event::Evidence,
-        P: for<'step> FnMut(
-            &'step mut T,
-        ) -> &'step mut machine::Connection<
-            crate::ServerRole,
-            F,
-            resident::Shared<'d>,
-            rules::RejectPush,
-            E,
-        >,
-    {
+    pub(in crate::server) fn resume(&mut self) -> Result<Progress, X> {
         if (self.protocol)(self.context).status().is_closing() {
             return Ok(Progress::default());
         }
         self.resume_inner()
     }
 
-    fn resume_inner<'d, F, E>(&mut self) -> Result<Progress, X>
-    where
-        F: rules::Policy,
-        E: event::Evidence,
-        P: for<'step> FnMut(
-            &'step mut T,
-        ) -> &'step mut machine::Connection<
-            crate::ServerRole,
-            F,
-            resident::Shared<'d>,
-            rules::RejectPush,
-            E,
-        >,
-    {
+    fn resume_inner(&mut self) -> Result<Progress, X> {
         let total = (self.events)(self.context)?;
         if total.is_exhausted() || !(self.protocol)(self.context).ingress().is_blocked() {
             return Ok(total);
@@ -132,24 +107,13 @@ where
         })
     }
 
-    fn drive<'d, F, E, N>(
+    fn drive<N>(
         &mut self,
         mut result: Result<(), conn::Error>,
         mut total: Progress,
         mut next: N,
     ) -> Result<Progress, X>
     where
-        F: rules::Policy,
-        E: event::Evidence,
-        P: for<'step> FnMut(
-            &'step mut T,
-        ) -> &'step mut machine::Connection<
-            crate::ServerRole,
-            F,
-            resident::Shared<'d>,
-            rules::RejectPush,
-            E,
-        >,
         N: FnMut(&mut T, &mut P) -> Result<(), conn::Error>,
     {
         loop {

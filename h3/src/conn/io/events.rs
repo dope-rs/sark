@@ -70,6 +70,11 @@ where
 
     pub fn poll_write(self) -> Result<Option<output::Write<'d>>, conn::Error> {
         let conn = self.conn;
+        if let Err(error) = conn.publish_encoder()
+            && !conn.queues.is_pressure(&error)
+        {
+            return Err(error);
+        }
         let feedback = conn.session.qpack_decoder;
         let Some(taken) = conn.queues.take(&mut conn.qpack.feedback, feedback) else {
             return Ok(None);

@@ -10,7 +10,6 @@ pub mod schedule;
 pub mod server;
 pub mod stream;
 pub mod task;
-pub mod timer;
 
 pub struct EmptyState;
 

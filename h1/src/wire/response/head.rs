@@ -118,6 +118,25 @@ impl Writer<'_> {
         source.emit(&mut fields);
         fields.state
     }
+
+    pub(in crate::wire) fn group<C: Count>(
+        &mut self,
+        group: &field::Group<'_>,
+        count: C,
+    ) -> Result<C, Error> {
+        let mut total = count;
+        if count_group(&mut total, group).is_ok() && self.put(group.wire()).is_ok() {
+            return Ok(total);
+        }
+        let mut fields = Fields {
+            out: self,
+            state: Ok(count),
+        };
+        for entry in group.entries() {
+            field::Sink::entry(&mut fields, *entry);
+        }
+        fields.state
+    }
 }
 
 struct Fields<'a, 'out, C> {
@@ -135,16 +154,10 @@ struct Measure {
 impl<'field, C: Count> field::Sink<'field> for Fields<'_, '_, C> {
     /// Bulk admission commits bytes and count together; failures replay scalar writes.
     fn group(&mut self, group: &field::Group<'field>) {
-        let Ok(mut total) = self.state else {
+        let Ok(total) = self.state else {
             return;
         };
-        if count_group(&mut total, group).is_ok() && self.out.put(group.wire()).is_ok() {
-            self.state = Ok(total);
-            return;
-        }
-        for entry in group.entries() {
-            self.entry(*entry);
-        }
+        self.state = self.out.group(group, total);
     }
 
     fn entry(&mut self, entry: field::Entry<'field>) {

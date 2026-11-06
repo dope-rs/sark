@@ -190,11 +190,11 @@ impl<P: Plan> Policy for P {
 }
 
 #[derive(Clone, Copy, Default)]
-pub struct RetainRaw;
+pub struct RetainRaw<const PREFIX: usize = 0>;
 
-impl section::Policy for RetainRaw {
+impl<const PREFIX: usize> section::Policy for RetainRaw<PREFIX> {
     type Selection = ();
-    type Block = packed::Decoded;
+    type Block = packed::Decoded<o3::buffer::pool::Span, PREFIX>;
 
     fn finish(self) -> Self::Selection {
         match self {
@@ -203,7 +203,7 @@ impl section::Policy for RetainRaw {
     }
 }
 
-impl Policy for RetainRaw {
+impl<const PREFIX: usize> Policy for RetainRaw<PREFIX> {
     type State = fixed::Raw;
 }
 

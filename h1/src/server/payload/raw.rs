@@ -63,7 +63,6 @@ unsafe impl<'a, 'd> buffer::raw::Scatter<'a> for Cursor<'a, 'd> {
     unsafe fn advance<const MAX: usize>(
         &mut self,
         cap: num::NonZero<usize>,
-        _left: num::NonZero<usize>,
     ) -> buffer::raw::Chunk<'a, MAX> {
         let (bytes, state) = match self.0 {
             State::Prefix { parts, bytes } => {

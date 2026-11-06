@@ -3,8 +3,8 @@ use std::alloc;
 use data::{Inline, compose};
 use dispatch::chunk::Chunk;
 use dope::net::link::egress::data;
-use o3::buffer::{Residency, hold, pool, pool::owners, resident, segments};
-use sark_http::payload::{compress::Gzip, owned, response::dispatch};
+use o3::buffer::{Residency, hold, resident, segments};
+use sark_http::payload::{compress, response::dispatch};
 
 mod raw;
 pub mod write;
@@ -21,29 +21,21 @@ pub enum Body<'d, K: 'd = ()> {
         tag: K,
     },
     Frozen {
-        owner: pool::Span<
-            owners::Plain<pool::Fixed<{ Gzip::SLOTS.get() }, { Gzip::CAPACITY.get() }>>,
-            pool::Owned,
-            pool::Frozen,
-        >,
+        owner: compress::Frozen,
         tag: K,
     },
 }
 
 impl<'d, K> Body<'d, K> {
-    /// Lowers a duplex owner sum without copying bytes or segment metadata.
+    /// Lowers admitted owners without copying bytes or segment metadata.
     #[doc(hidden)]
-    pub fn duplex(chunk: owned::Segments<'d>, tag: K) -> Self {
-        match chunk.into_shape() {
-            segments::Shape::Empty => Self::Shared {
-                owner: resident::Shared::new(),
-                tag,
-            },
-            segments::Shape::One(owner) => Self::Shared {
+    pub fn duplex(chunk: segments::Nonempty<resident::Shared<'d>>, tag: K) -> Self {
+        match chunk {
+            segments::Nonempty::One(owner) => Self::Shared {
                 owner: owner.into_inner(),
                 tag,
             },
-            segments::Shape::Many(owners) => Self::Segments { owners, tag },
+            segments::Nonempty::Many(owners) => Self::Segments { owners, tag },
         }
     }
 

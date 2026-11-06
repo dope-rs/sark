@@ -53,6 +53,7 @@ fn processing_bound() {
                 origins::Plan::new(config, 1, 1, 1)
                     .expect("client plan")
                     .enter(
+                        (),
                         |mut app| {
                             let handle = app.handle;
                             let result = app
@@ -149,6 +150,7 @@ fn recovered_process_attempt() {
                     pools::Plan::new(server.addr(), config, 1, 1)
                         .expect("fixed client plan")
                         .enter(
+                            (),
                             |mut app| {
                                 let handle = app.handle;
                                 app.wait().expect("fixed client readiness");
@@ -181,6 +183,7 @@ fn recovered_process_attempt() {
                     origins::Plan::new(config, 1, 1, 1)
                         .expect("client plan")
                         .enter(
+                            (),
                             |mut app| {
                                 let handle = app.handle;
                                 let result = app
@@ -286,6 +289,7 @@ fn pending_process_cancels() {
                 origins::Plan::new(config, 1, 1, 1)
                     .expect("client plan")
                     .enter(
+                        (),
                         |mut app| {
                             let handle = app.handle;
                             let mut called = false;

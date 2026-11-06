@@ -42,14 +42,13 @@ pub(super) fn build<'source, 'spec>(
     let values = &generics.arguments;
     let clauses = &generics.predicates;
     let routes = &spec.route_bounds;
-    let plan = &exec.task;
     let tasks = exec.tasks();
     let fibers = exec.fibers().len();
     let h1 = surface.is_some();
     let (futures, makers) = exec.producers();
     let futures: Vec<_> = futures.collect();
     let makers: Vec<_> = makers.collect();
-    let slabs = &plan.slab_bounds;
+    let slabs = &exec.slab_bounds;
     let makes: Vec<TokenStream> = exec
         .fibers()
         .iter()
@@ -60,16 +59,22 @@ pub(super) fn build<'source, 'spec>(
             }
         })
         .collect();
-    let identity = &plan.identity;
-    let fiber = &plan.fiber;
+    let identity = &exec.identity;
+    let fiber = &exec.fiber;
     let (tags, variants): (Vec<_>, Vec<_>) = tasks
         .iter()
         .map(|task| (task.tag(api), task.variant()))
         .unzip();
-    let done = format_ident!("__{}Completion", api);
-    let finish = finish::define(paths, generics, exec.fibers(), &done);
-    let dtree = layout::Tree::new(&plan.direct).ty(paths);
-    let qtree = layout::Tree::new(&plan.queued).ty(paths);
+    let fixed_id = format_ident!("__{}Fixed", api);
+    let fixed_fibers: Vec<_> = exec
+        .fibers()
+        .iter()
+        .copied()
+        .filter(|(_, fiber)| !fiber.stream)
+        .collect();
+    let fixed = finish::define(paths, generics, &fixed_fibers, &fixed_id);
+    let dtree = layout::Tree::new(&exec.direct).ty(paths);
+    let qtree = layout::Tree::new(&exec.queued).ty(paths);
     let ctor = format_ident!(
         "{}",
         crate::handler::names::encoded("__SarkConstructor", api)
@@ -115,14 +120,20 @@ pub(super) fn build<'source, 'spec>(
         quote! {
             #f_tasks: <#g_store as #ns_fiber::manifold::runtime::Initial>::direct_only::<
                 #dtree,
-            >(#ns_fiber::dope_fiber::task::storage::fixed::quota::Limit::new(#v_cap), #v_brand),
+            >(
+                #ns_fiber::dope_fiber::task::storage::fixed::quota::Limit::new(#v_cap),
+                #v_brand,
+            ),
         }
     } else {
         quote! {
             #f_tasks: <#g_store as #ns_fiber::manifold::runtime::Initial>::tasks::<
                 #dtree,
                 #qtree,
-            >(#ns_fiber::dope_fiber::task::storage::fixed::quota::Limit::new(#v_cap), #v_brand),
+            >(
+                #ns_fiber::dope_fiber::task::storage::fixed::quota::Limit::new(#v_cap),
+                #v_brand,
+            ),
         }
     };
     let ids_f = (fibers != 0).then(|| {
@@ -144,7 +155,7 @@ pub(super) fn build<'source, 'spec>(
         TokenStream::new()
     } else {
         quote! {
-            let #ns_fiber::manifold::runtime::Empty = #v_ids;
+            let () = #v_ids;
             let #v_ids = #ns_http::request::Seq::new(#n_bind.sequence());
         }
     };
@@ -285,7 +296,6 @@ pub(super) fn build<'source, 'spec>(
         core_moves: core_mv,
         public_methods: methods,
         core_initializers: core_i,
-        multiplexed_prepare: multi_p,
     } = extras;
     let proto = &shape.protocol_generic_def;
     let cold = quote! {
@@ -310,15 +320,13 @@ pub(super) fn build<'source, 'spec>(
     } else {
         quote! {
             let (#v_brand, #v_tasks) = #v_tasks;
-            let #v_tasks = #v_tasks.try_prepare(#n_bind.owners())
-                .map_err(#ns_core::manifold::task::app::BindError::Prepare)?;
+            let #v_tasks = #v_tasks.try_prepare(#n_bind.owners())?;
             let #v_tasks = #ns_fiber::dope_fiber::task::storage::scope::Owned::new(#v_tasks, #v_brand);
         }
     };
     let prep = quote! {
         #bind
         #ids_prep
-        #multi_p
     };
     let factory = tokens::Factory {
         name: &name,
@@ -337,7 +345,10 @@ pub(super) fn build<'source, 'spec>(
         #id_def
         #fdef
     };
-    let slab = quote! { #( #clauses, )* #( #slabs )* };
+    let sources = exec.fibers().iter().map(|(task, fiber)| {
+        crate::app::spec::fiber_bound(paths, task.route(), state_ty, fiber.stream)
+    });
+    let slab = quote! { #( #clauses, )* #( #slabs )* #( #sources )* };
     let public = quote! { #( #clauses, )* #( #routes )* };
     let state_b = quote! { #( #lives: #l_env, )* };
     let state_p = quote! { #( #decls, )* };
@@ -348,7 +359,7 @@ pub(super) fn build<'source, 'spec>(
         tokens::Prelude {
             definitions: &defs,
             task_tags: &tags,
-            completion: &finish,
+            fixed: &fixed,
             factory: &factory,
         },
         names,

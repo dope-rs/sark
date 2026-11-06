@@ -44,6 +44,7 @@ impl<'d> State<'d> {
             E,
         >,
         stream: stream::Key,
+        end: Boundary,
         owner: &mut owners::Sink<'_, K, M, G>,
     ) -> Result<Option<conn::DataOutcome>, conn::Error>
     where
@@ -62,7 +63,7 @@ impl<'d> State<'d> {
             hold::Charge::default()
         };
         let boundary = if segments.is_empty() {
-            Boundary::End
+            end
         } else {
             Boundary::More
         };
@@ -186,7 +187,7 @@ impl<'d> Pending<'d> {
         State::next(None, body.into_iter()).map(|state| Self { state: Some(state) })
     }
 
-    pub(super) fn single(body: resident::Shared<'d>) -> Option<Self> {
+    pub(in crate::server) fn single(body: resident::Shared<'d>) -> Option<Self> {
         if body.is_empty() {
             return None;
         }
@@ -229,7 +230,7 @@ impl<'d> Pending<'d> {
     ) -> Result<schedule::Turn<conn::DataBlock>, conn::Error> {
         let mut mode = mode::Disabled;
         let mut owner = owners::Sink::new(&mut mode, (), identity);
-        self.turn_seen(conn, stream, &mut owner)
+        self.turn_seen(conn, stream, Boundary::End, &mut owner)
     }
 
     #[doc(hidden)]
@@ -243,6 +244,7 @@ impl<'d> Pending<'d> {
             E,
         >,
         stream: stream::Key,
+        end: Boundary,
         owner: &mut owners::Sink<'_, K, M, G>,
     ) -> Result<schedule::Turn<conn::DataBlock>, conn::Error>
     where
@@ -252,7 +254,7 @@ impl<'d> Pending<'d> {
         M: life::Mode<K, stream::Key>,
         G: FnMut(stream::Key) -> stream::Key,
     {
-        let Some(outcome) = State::send(&mut self.state, conn, stream, owner)? else {
+        let Some(outcome) = State::send(&mut self.state, conn, stream, end, owner)? else {
             return Ok(schedule::Turn::Idle);
         };
         let more = self.state.is_some();

@@ -3,6 +3,7 @@ use core::{
     ops::{self, ControlFlow},
 };
 
+use dope::core::BranchError;
 use o3::buffer::{hold::evidence::Off, resident};
 use sark_core::{
     body::credit,
@@ -20,12 +21,15 @@ use crate::{
     server::{
         self, response,
         state::exchange::{Call, Deferred, Routed, Sync, admit},
-        sync::book::{self, Control, Receiving, State, phase::Phase},
+        sync::{
+            self,
+            book::{self, Control, Receiving, State, phase::Phase},
+        },
     },
     stream,
 };
 
-pub(in crate::server::sync) struct Driver<'a, 'd: 'a, R: decode::Decode, S, B> {
+pub(in crate::server::sync) struct Driver<'a, 'd: 'a, R: decode::Decode, S, B, D> {
     pub(super) connection: &'a mut machine::Connection<
         crate::ServerRole,
         R::Plan,
@@ -38,10 +42,12 @@ pub(in crate::server::sync) struct Driver<'a, 'd: 'a, R: decode::Decode, S, B> {
     pub(super) credit: &'a mut credit::raw::Account,
     pub(super) mode: PhantomData<S>,
     pub(super) permit: B,
+    pub(super) report: D,
 }
 
-impl<'a, 'd: 'a, R, S, B> Driver<'a, 'd, R, S, B>
+impl<'a, 'd: 'a, R, S, B, D> Driver<'a, 'd, R, S, B, D>
 where
+    D: FnMut(conn::Error),
     R: decode::Decode,
     R::Prepared: request::Synchronous,
     <<R::Head as request::Head>::Start as request::Selection<R::Prepared>>::Deferred<
@@ -63,7 +69,7 @@ where
                 Some(pending) => self.start_body(stream, pending),
                 None => typed::Control::Complete,
             },
-            Err(error) => self.removed(stream, error.code()),
+            Err(error) => self.removed(stream, BranchError::First(error)),
         }
     }
 
@@ -77,7 +83,7 @@ where
                 value: pending,
                 turn,
             },
-            Err(error) => self.removed(stream, error.code()),
+            Err(error) => self.removed(stream, BranchError::First(error)),
         }
     }
 
@@ -89,7 +95,12 @@ where
         typed::Control::Control { value: phase, turn }
     }
 
-    fn removed(&mut self, stream: stream::Key, error: numbers::ErrorCode) -> Control<'d, R> {
+    fn removed(
+        &mut self,
+        stream: stream::Key,
+        error: BranchError<conn::Error, numbers::ErrorCode>,
+    ) -> Control<'d, R> {
+        let error = sync::response(error, &mut self.report);
         self.connection.streams().cancel(stream, error);
         typed::Control::Remove
     }
@@ -103,14 +114,14 @@ where
         R: decode::Guarded,
     {
         let encoder = response::Encoder::new(self.connection, stream, Ref::from_slice(&[]));
-        match admit::run::<R, _, Off, event::Ignore>(self.router, routed.into_state(), encoder) {
+        match admit::run::<R, _, Off, event::Ignore, _>(self.router, routed.into_state(), encoder) {
             Ok(ControlFlow::Continue(prepared)) => match Sync::new(prepared).take() {
                 request::Body::Finished(request) => {
                     // SAFETY: Book::pump lends this account only to its runtime's
                     // driver; admission preserves the selected routed body's owner.
                     let ready = match unsafe { book::raw::try_body::<R>(request, self.credit) } {
                         Ok(ready) => ready,
-                        Err(error) => return self.removed(stream, error),
+                        Err(error) => return self.removed(stream, BranchError::Second(error)),
                     };
                     self.request(stream, ready)
                 }
@@ -122,17 +133,18 @@ where
                     if let ControlFlow::Break(head) = reject {
                         head.discard(self.connection);
                     }
-                    return self.removed(stream, error.code());
+                    return self.removed(stream, BranchError::Second(error.code()));
                 }
                 self.finish_head(stream, Ok(reject))
             }
             Err((error, failed, input)) => {
+                let error = sync::response(error, &mut self.report);
                 // SAFETY: failed admission returns the same selected route's body.
                 let error = match unsafe { book::raw::discard(input, self.credit) } {
                     Ok(()) => error,
                     Err(error) => error.code(),
                 };
-                self.removed(failed, error)
+                self.removed(failed, BranchError::Second(error))
             }
         }
     }
@@ -142,7 +154,7 @@ where
         stream: stream::Key,
         ready: request::Ready<exec::Sync, R::Prepared, owned::Segments<'d>>,
     ) -> Control<'d, R> {
-        let reply = Call::new(ready).try_dispatch::<R, Off, event::Ignore>(
+        let reply = Call::new(ready).try_dispatch::<R, Off, event::Ignore, _>(
             self.router,
             self.connection,
             stream,
@@ -179,7 +191,7 @@ where
                 Err(error) if error.is_pressure() => {
                     Self::retain(Phase::Status(status), Self::blocked())
                 }
-                Err(error) => self.removed(stream, error.code()),
+                Err(error) => self.removed(stream, BranchError::First(error)),
             },
             Phase::Head(head) => {
                 let result = head.drive(self.connection);
@@ -195,13 +207,14 @@ where
     ) -> Result<schedule::Turn<conn::DataBlock>, numbers::ErrorCode> {
         pending
             .turn(self.connection, stream)
-            .map_err(conn::Error::code)
+            .map_err(|error| sync::response(BranchError::First(error), &mut self.report))
     }
 }
 
-impl<'a, 'd: 'a, R, S, B> typed::Settle<Phase<'d, R>, response::Pending<'d>, Receiving<'d, R>>
-    for Driver<'a, 'd, R, S, B>
+impl<'a, 'd: 'a, R, S, B, D> typed::Settle<Phase<'d, R>, response::Pending<'d>, Receiving<'d, R>>
+    for Driver<'a, 'd, R, S, B, D>
 where
+    D: FnMut(conn::Error),
     R: decode::Decode,
     R::Prepared: request::Synchronous,
     <<R::Head as request::Head>::Start as request::Selection<R::Prepared>>::Deferred<
@@ -242,9 +255,10 @@ where
     }
 }
 
-impl<'a, 'd: 'a, R, U, B, P> typed::Driver<Phase<'d, R>, response::Pending<'d>, Receiving<'d, R>>
-    for Driver<'a, 'd, R, request::Plain<U>, B>
+impl<'a, 'd: 'a, R, U, B, P, D> typed::Driver<Phase<'d, R>, response::Pending<'d>, Receiving<'d, R>>
+    for Driver<'a, 'd, R, request::Plain<U>, B, D>
 where
+    D: FnMut(conn::Error),
     B: FnMut() -> Option<P>,
     R: decode::Decode,
     R::Head: request::Head<Start = request::Plain<U>>,
@@ -277,9 +291,10 @@ where
     }
 }
 
-impl<'a, 'd: 'a, R, G, B, P> typed::Driver<Phase<'d, R>, response::Pending<'d>, Receiving<'d, R>>
-    for Driver<'a, 'd, R, request::Guarded<G>, B>
+impl<'a, 'd: 'a, R, G, B, P, D> typed::Driver<Phase<'d, R>, response::Pending<'d>, Receiving<'d, R>>
+    for Driver<'a, 'd, R, request::Guarded<G>, B, D>
 where
+    D: FnMut(conn::Error),
     B: FnMut() -> Option<P>,
     R: decode::Guarded,
     R::Head: request::Head<Start = request::Guarded<G>>,
@@ -312,9 +327,11 @@ where
     }
 }
 
-impl<'a, 'd: 'a, R, U, G, B, P> typed::Driver<Phase<'d, R>, response::Pending<'d>, Receiving<'d, R>>
-    for Driver<'a, 'd, R, request::Start<U, G>, B>
+impl<'a, 'd: 'a, R, U, G, B, P, D>
+    typed::Driver<Phase<'d, R>, response::Pending<'d>, Receiving<'d, R>>
+    for Driver<'a, 'd, R, request::Start<U, G>, B, D>
 where
+    D: FnMut(conn::Error),
     B: FnMut() -> Option<P>,
     R: decode::Guarded,
     R::Head: request::Head<Start = request::Start<U, G>>,

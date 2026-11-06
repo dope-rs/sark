@@ -1,10 +1,16 @@
 use o3::buffer::{hold, resident, storage};
+use sark_core::life::{self, exchange};
+use sark_http::owner::evidence::Sink as _;
 use sark_http::{
     owner::{evidence, handoff},
     payload::owned,
 };
 
-use crate::{conn, server::response::Pending};
+use crate::{
+    conn,
+    server::{response::Pending, state::Transitions},
+    stream,
+};
 
 #[doc(hidden)]
 pub struct Receipt<'d> {
@@ -63,7 +69,29 @@ impl<'d> Receipt<'d> {
         self.pending
     }
 
-    pub(crate) fn into_parts(self) -> (Option<Pending<'d>>, hold::Charge, Option<evidence::Copy>) {
-        (self.pending, self.linked, self.copied)
+    pub(in crate::server) fn observe<C: Copy, M: Transitions<C>>(
+        self,
+        mode: &mut M,
+        exchange: exchange::Id<C, stream::Key>,
+    ) -> Option<Pending<'d>> {
+        if let Some(copied) = self.copied {
+            life::response::Sink::new(mode, exchange).copied(copied);
+        }
+        if M::ENABLED || M::EXCHANGE_DEADLINES {
+            let charge = if M::ENABLED {
+                self.pending
+                    .as_ref()
+                    .map_or(hold::Charge::default(), Pending::retention)
+            } else {
+                hold::Charge::default()
+            };
+            mode.observe(life::Event::ResponseCommitted {
+                exchange,
+                body_bytes: charge.logical_bytes,
+                charge,
+                linked: self.linked,
+            });
+        }
+        self.pending
     }
 }

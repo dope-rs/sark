@@ -42,7 +42,7 @@ impl<B: TryBody> Plan<B> {
     pub fn into_shared(self) -> Result<storage::Shared, storage::BuildError<consume::Error>> {
         let Self { body, max_len } = self;
         storage::Owned::try_build(max_len, |out| body.encode(out))
-            .map(storage::Owned::<(), 0>::freeze)
+            .map(storage::Owned::<()>::freeze)
     }
 
     pub fn encode(self, out: &mut [u8]) -> Result<&mut [u8], storage::BuildError<consume::Error>> {

@@ -1,10 +1,10 @@
 use crate::{app::serve::handle::h1::types, macros::tokens::local, runtime::paths::Paths};
 
 pub(super) fn render(paths: &Paths, types: &types::Types<'_>) -> proc_macro2::TokenStream {
-    let f_life = local("lifecycle");
+    let [f_core, f_life] = ["core", "lifecycle"].map(local);
     let symbols = &types.names.generics;
     let [v_body, v_cause, v_charge] = symbols.locals(["body", "cause", "charge"]);
-    let [v_link, v_core, v_egress] = symbols.locals(["connection", "core", "egress"]);
+    let [v_link, v_egress] = symbols.locals(["connection", "egress"]);
     let [v_exch, v_free, v_tag] = symbols.locals(["exchange", "release", "tag"]);
     let [v_this, v_trans] = symbols.locals(["this", "transport"]);
     let [g_id, g_mode] = types.names.generics.idents(["__ID", "__M"]);
@@ -56,8 +56,7 @@ pub(super) fn render(paths: &Paths, types: &types::Types<'_>) -> proc_macro2::To
                         #ns_http::owner::cause::Transport::Closed
                     }
                 };
-                let (#v_core, _) = self.__project();
-                let #v_this = #v_core.project();
+                let #v_this = self.project().#f_core.project();
                 let #v_trans = #ns_core::life::sequence::Mode::transport(
                     #v_this.#f_life,
                     #v_link,

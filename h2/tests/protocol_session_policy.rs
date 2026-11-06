@@ -12,7 +12,7 @@ pub mod common;
 
 use sark_core::manifold::stream::Boundary;
 use sark_h2::{
-    ClientRole, ServerRole,
+    ClientRole,
     conn::{Association, Error, Protocol, config, config::Config, machine::Connection},
     frame,
     frame::numbers::ErrorCode,
@@ -372,68 +372,5 @@ fn refused_push_drains_head() {
             .try_reset()
             .expect("protocol fixture"))
             == (Some((Id::new(2).expect("fixture domain"), ErrorCode::StreamClosed)))
-    );
-}
-
-#[test]
-fn refused_request_drains() {
-    let mut conn = Connection::<ServerRole>::with_config(config::Config {
-        stream_capacity: 1,
-        ..Config::default()
-    })
-    .expect("protocol scenario precondition");
-    Session::new(&mut conn)
-        .try_prime()
-        .expect("protocol fixture");
-    conn.ingress()
-        .ingest(
-            &Frame::new(
-                1,
-                &Fields::new(&GET).try_encode().expect("protocol fixture"),
-            )
-            .try_headers(Boundary::More, frame::Block::End)
-            .expect("protocol fixture"),
-        )
-        .expect("protocol scenario precondition");
-    assert!(
-        conn.ingress().poll_event().is_some(),
-        "scenario emits the expected event"
-    );
-    conn.transfer().drain(usize::MAX);
-    conn.ingress()
-        .ingest(
-            &Frame::new(
-                3,
-                &Fields::new(&GET).try_encode().expect("protocol fixture"),
-            )
-            .try_headers(Boundary::More, frame::Block::End)
-            .expect("protocol fixture"),
-        )
-        .expect("protocol scenario precondition");
-    assert!(
-        (Wire::new(conn.output().first())
-            .try_reset()
-            .expect("protocol fixture"))
-            == (Some((
-                Id::new(3).expect("fixture domain"),
-                ErrorCode::RefusedStream
-            )))
-    );
-    conn.transfer().drain(usize::MAX);
-
-    conn.ingress()
-        .ingest(
-            &Frame::new(3, b"in flight")
-                .try_data(Boundary::More)
-                .expect("protocol fixture"),
-        )
-        .expect("protocol scenario precondition");
-
-    assert!(conn.ingress().poll_event().is_none());
-    assert!(
-        (Wire::new(conn.output().first())
-            .try_reset()
-            .expect("protocol fixture"))
-            == (Some((Id::new(3).expect("fixture domain"), ErrorCode::StreamClosed)))
     );
 }

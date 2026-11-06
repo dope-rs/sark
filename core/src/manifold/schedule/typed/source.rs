@@ -4,8 +4,8 @@ use typed::{Vacancy, Value};
 use crate::manifold::{
     self,
     schedule::{
-        Activity, Block, CONNECTION_WAIT, DATA_READY, LANES, Outcome, STREAM_WAIT, Settlement,
-        Terminal, Turn, Wait, WorkClass,
+        Block, CONNECTION_WAIT, DATA_READY, LANES, STREAM_WAIT, Settlement, Terminal, Turn, Wait,
+        WorkClass,
         drive::{self, Effect, TurnOutcome},
         typed::{Control, Driver, Next, place},
     },
@@ -41,12 +41,7 @@ where
         self.domain.is_vacant(lane)
     }
 
-    fn turn(
-        &mut self,
-        source: Index<LANES>,
-        _: WorkClass,
-        apply: impl FnOnce(Effect),
-    ) -> drive::Turn<K> {
+    fn turn(&mut self, source: Index<LANES>, _: WorkClass) -> drive::Turn<K> {
         let Some(current) = self.domain.front(source) else {
             return drive::Turn::Empty;
         };
@@ -62,8 +57,7 @@ where
             }
             typed::Front::Data(current) => data(self.driver, current, permit),
         };
-        apply(outcome.1);
-        drive::Turn::Ready(outcome.0)
+        drive::Turn::Ready(outcome)
     }
 }
 
@@ -72,7 +66,7 @@ fn control<K, C, D, I, F>(
     vacant: typed::Withdrawn<'_, K, C, D, I, typed::Control, LANES>,
     stream: K,
     result: Control<C, D, I, F::Block, F::Error>,
-) -> Outcome<K>
+) -> TurnOutcome<K>
 where
     K: manifold::raw::Key,
     F: Driver<C, D, I, Key = K>,
@@ -84,7 +78,7 @@ where
             stream,
             typed::Active::Control(value),
             turn,
-            Activity::Control,
+            WorkClass::Control,
         ),
         Control::Data { value, turn } => next(
             driver,
@@ -92,7 +86,7 @@ where
             stream,
             typed::Active::Data(value),
             turn,
-            Activity::Control,
+            WorkClass::Control,
         ),
         Control::Fused { value, turn } => next(
             driver,
@@ -100,11 +94,11 @@ where
             stream,
             typed::Active::Data(value),
             turn,
-            Activity::Data,
+            WorkClass::Data,
         ),
         Control::Idle(value) => {
             vacant.insert::<typed::Idle>(value);
-            (TurnOutcome::new(stream, Activity::Control), Effect::None)
+            TurnOutcome::new(stream, WorkClass::Control, Effect::None)
         }
         Control::Failed { value, error } => settle(
             driver,
@@ -112,13 +106,10 @@ where
             stream,
             value,
             Terminal::Failed(error),
-            Activity::Control,
+            WorkClass::Control,
         ),
-        Control::Complete => (
-            TurnOutcome::new(stream, Activity::Control),
-            Effect::Complete,
-        ),
-        Control::Remove => (TurnOutcome::new(stream, Activity::Control), Effect::None),
+        Control::Complete => TurnOutcome::new(stream, WorkClass::Control, Effect::Complete),
+        Control::Remove => TurnOutcome::new(stream, WorkClass::Control, Effect::None),
     }
 }
 
@@ -128,8 +119,8 @@ fn next<K, C, D, I, F>(
     stream: K,
     value: typed::Active<C, D>,
     turn: Turn<F::Block>,
-    activity: Activity,
-) -> Outcome<K>
+    activity: WorkClass,
+) -> TurnOutcome<K>
 where
     K: manifold::raw::Key,
     F: Driver<C, D, I, Key = K>,
@@ -154,14 +145,14 @@ where
         typed::Active::Data(value) => Next::Data(value, blocked),
     };
     let effect = place::enqueue(vacant, next);
-    (TurnOutcome::new(stream, activity), effect)
+    TurnOutcome::new(stream, activity, effect)
 }
 
 fn data<K, C, D, I, F>(
     driver: &mut F,
     mut current: typed::Slot<'_, K, C, D, I, typed::Data, LANES>,
     permit: F::Permit,
-) -> Outcome<K>
+) -> TurnOutcome<K>
 where
     K: manifold::raw::Key,
     F: Driver<C, D, I, Key = K>,
@@ -177,7 +168,7 @@ where
                 stream,
                 Value::Data(value),
                 Terminal::Failed(error),
-                Activity::Data,
+                WorkClass::Data,
             );
         }
     };
@@ -209,11 +200,11 @@ where
                 stream,
                 Value::Data(value),
                 terminal,
-                Activity::Data,
+                WorkClass::Data,
             );
         }
     };
-    (TurnOutcome::new(stream, Activity::Data), effect)
+    TurnOutcome::new(stream, WorkClass::Data, effect)
 }
 
 fn settle<'a, K, C, D, I, F>(
@@ -222,8 +213,8 @@ fn settle<'a, K, C, D, I, F>(
     stream: K,
     value: Value<C, D, I>,
     terminal: Terminal<F::Error>,
-    activity: Activity,
-) -> Outcome<K>
+    activity: WorkClass,
+) -> TurnOutcome<K>
 where
     K: manifold::raw::Key + 'a,
     C: 'a,
@@ -238,5 +229,5 @@ where
     if let Settlement::Keep(value) = driver.settle(stream, value, terminal) {
         place::store(vacant, value);
     }
-    (TurnOutcome::new(stream, activity), effect)
+    TurnOutcome::new(stream, activity, effect)
 }

@@ -7,6 +7,8 @@ use o3::{
         queue::{indexed::keyed, links},
     },
 };
+use sark_core::manifold::stream::Section;
+use sark_http::payload::response::Method;
 
 use crate::{Endpoint, conn, flow, frame::numbers, stream};
 
@@ -31,11 +33,38 @@ pub(crate) enum Update {
 pub(crate) struct Association;
 
 pub(crate) struct Active {
-    pub(crate) stream: stream::Lifecycle,
+    pub(crate) state: stream::State,
+    pub(crate) method: Option<Method>,
+    pub(crate) content: stream::Content,
+    peer: store::Live,
     pub(crate) send_window: flow::Window,
     pub(crate) recv_window: flow::Window,
     pub(crate) pending_release: u32,
     pub(crate) remaining: u64,
+}
+
+impl Active {
+    pub(crate) fn section(&self) -> Section {
+        match self.peer {
+            store::Live::Initial => Section::Initial,
+            _ => Section::Trailing,
+        }
+    }
+
+    pub(crate) fn complete_head(&mut self) {
+        if matches!(self.peer, store::Live::Initial) {
+            self.peer = store::Live::Trailing;
+        }
+    }
+
+    #[inline]
+    pub(crate) fn queue_end(&mut self) {
+        self.peer = match self.peer {
+            store::Live::Trailing => store::Live::End,
+            store::Live::Duplex => store::Live::DuplexEnd,
+            _ => unreachable!("stream"),
+        };
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -73,46 +102,6 @@ impl<R: crate::Role> Registry<R> {
         })
     }
 
-    pub(crate) fn admit<'s, 'h, T, E>(
-        &'s mut self,
-        history: &'h mut History<R>,
-        proof: stream::Nonzero,
-        limit: usize,
-        edit: impl FnOnce(stream::Key, &mut Active) -> Result<store::Action<T>, E>,
-    ) -> Result<store::Admission<'s, 'h, R, T>, E> {
-        self.store.admit(
-            history,
-            proof,
-            limit,
-            Changes {
-                wakes: &mut self.send_wakes,
-                head: &mut self.pending_reset,
-                count: &mut self.reset_count,
-            },
-            edit,
-        )
-    }
-
-    pub(crate) fn visit<I, T, E>(
-        &mut self,
-        history: &History<R>,
-        proof: stream::Nonzero,
-        input: I,
-        edit: impl FnOnce(stream::Key, &mut Active, I) -> Result<store::Action<T>, E>,
-    ) -> Result<Result<T, (Past, I)>, E> {
-        self.store.visit(
-            history,
-            proof,
-            Changes {
-                wakes: &mut self.send_wakes,
-                head: &mut self.pending_reset,
-                count: &mut self.reset_count,
-            },
-            input,
-            edit,
-        )
-    }
-
     pub(crate) fn add_send(
         &mut self,
         history: &History<R>,
@@ -122,21 +111,18 @@ impl<R: crate::Role> Registry<R> {
         let Some(wake) = Plane::new(self).find(proof)? else {
             return Ok(Update::Past(history.classify(proof)));
         };
-        match wake.update(|active| {
-            if active.stream.state == stream::State::ReservedRemote {
+        wake.update(|active| {
+            if active.state == stream::State::ReservedRemote {
                 return Err(conn::Error::Protocol(conn::Protocol::WindowUpdate {
                     stream: proof.get(),
-                    state: active.stream.state,
+                    state: active.state,
                 }));
             }
             active
                 .send_window
                 .increase(delta)
                 .map_err(conn::Error::Increase)
-        })? {
-            store::Change::Closed => Ok(Update::Past(Past::Closed)),
-            store::Change::Idle | store::Change::Opened => Ok(Update::Applied),
-        }
+        })
     }
 
     pub(crate) fn adjust_send(&mut self, delta: i32) -> Result<(), flow::Adjust> {
@@ -159,21 +145,14 @@ impl<R: crate::Role> Registry<R> {
         Some(key)
     }
 
-    pub(crate) fn remove(&mut self, id: stream::Id) -> Option<stream::Key> {
-        let entry = self
-            .store
-            .entry(id, |key| key.id() == id, &mut self.send_wakes)?;
-        Some(entry.remove())
-    }
-
-    pub(crate) fn remove_key(&mut self, key: stream::Key) {
+    pub(crate) fn remove_key(&mut self, key: stream::Key, reset: bool) {
         let Self {
             store,
             send_wakes: wakes,
             ..
         } = self;
-        if let Some(entry) = store.entry(key.id(), |entry| *entry == key, wakes) {
-            entry.remove();
+        if let Some(entry) = store.entry(key, wakes) {
+            entry.remove(reset);
         }
     }
 
@@ -184,10 +163,10 @@ impl<R: crate::Role> Registry<R> {
             pending_reset: head,
             reset_count: count,
         } = self;
-        let Some(entry) = store.entry(key.id(), |entry| *entry == key, wakes) else {
+        let Some(entry) = store.entry(key, wakes) else {
             return Begin::Inactive;
         };
-        entry.reset(error, *head);
+        entry.reset(error, *head, false);
         *head = Some(key);
         *count += 1;
         Begin::Started
@@ -227,12 +206,10 @@ impl<R: crate::Role> Registry<R> {
             return Err(conn::Association::Peer(id));
         }
         match self.store.lookup(history, proof) {
-            store::Lookup::Active(_, record)
-                if record.stream.content == stream::Content::Tunnel =>
-            {
+            store::Lookup::Active(_, record) if record.content == stream::Content::Tunnel => {
                 Err(conn::Association::Tunnel(id))
             }
-            store::Lookup::Active(_, record) => match record.stream.state {
+            store::Lookup::Active(_, record) => match record.state {
                 stream::State::Open | stream::State::HalfClosedLocal => Ok(Association),
                 state => Err(conn::Association::State { stream: id, state }),
             },
@@ -269,17 +246,6 @@ pub(super) struct Wake<'a, P = ()> {
         true,
     >,
     fifo: &'a mut keyed::Fifo<stream::Key, store::Send>,
-}
-
-struct Record<'a>(&'a store::Record);
-
-// SAFETY: each retained record permanently pairs its exact bounded key and send link.
-unsafe impl<'a> depot::raw::KeyBorrow<'a, store::Send> for Record<'a> {
-    type Key = stream::Key;
-
-    fn parts(self) -> (stream::Key, &'a keyed::Link<stream::Key, store::Send>) {
-        (self.0.key, &self.0.send)
-    }
 }
 
 impl<'a, R: crate::Role> Plane<'a, R> {
@@ -337,19 +303,6 @@ impl<'a> Wake<'a> {
             Err(vacant) => vacant,
         }
     }
-
-    fn update<E>(
-        mut self,
-        edit: impl FnOnce(&mut Active) -> Result<(), E>,
-    ) -> Result<store::Change, E> {
-        let change = self.entry.get_mut().update(edit)?;
-        if let store::Change::Opened = change
-            && let Ok(vacant) = keyed::Slot::try_vacant(self)
-        {
-            vacant.push::<false>();
-        }
-        Ok(change)
-    }
 }
 
 // SAFETY: the detached capability retains this exact initialized slab slot.
@@ -396,18 +349,18 @@ unsafe impl<P> depot::raw::KeyOwner<store::Send> for Wake<'_, P> {
     type Fifo = keyed::Fifo<stream::Key, store::Send>;
 
     fn parts(&self) -> (stream::Key, &keyed::Link<stream::Key, store::Send>) {
-        depot::raw::KeyBorrow::parts(Record(self.entry.get()))
+        let record = self.entry.get();
+        (record.key, &record.send)
     }
 
     fn fifo(&self) -> &keyed::Fifo<stream::Key, store::Send> {
         self.fifo
     }
 
-    fn entry<'a>(
-        live: depot::raw::Proof<(&'a Self, links::Index), Initialized<store::Send>>,
-    ) -> keyed::Entry<'a, stream::Key, store::Send> {
+    fn link(
+        live: depot::raw::Proof<(&Self, links::Index), Initialized<store::Send>>,
+    ) -> &keyed::Link<stream::Key, store::Send> {
         let live = unsafe { live.map(|(owner, index)| (&owner.entry, index)) };
-        let (_, record) = slab::Occupied::project(live);
-        keyed::Entry::from_source(Record(record))
+        &slab::Occupied::project(live).1.send
     }
 }

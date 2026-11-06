@@ -2,12 +2,12 @@ use dope_quic::wire::{stream::Id, varint};
 use sark_core::manifold::stream::Boundary;
 use sark_h3::{
     conn::{
-        self, Connection,
+        Connection,
         event::{Event, Role},
         io::Receive,
         options::{self, Config},
     },
-    frame::{self, Settings},
+    frame::Settings,
 };
 use sark_http::field::metadata::block::Connect;
 
@@ -51,33 +51,17 @@ impl Setup {
     }
 }
 
-#[derive(Debug)]
-pub enum Dynamic {
-    Config(options::Error),
-    Connection(conn::Error),
-    Stream(varint::Error),
-    Wire(frame::EncodeError),
-    Write,
-    Settings,
-}
-
-pub fn try_dynamic_sender<'d>(writes: usize, bytes: usize) -> Result<Connection<'d>, Dynamic> {
-    let mut conn = Setup {
-        egress: options::Egress {
-            write_capacity: writes,
-            wire_bytes: bytes,
-            ..options::Egress::default()
-        },
-    }
-    .try_build()
-    .map_err(Dynamic::Config)?;
+pub fn dynamic_sender<'d>(writes: usize, bytes: usize) -> Connection<'d> {
+    let mut conn = Setup::new(writes, bytes, options::Egress::default().resident_bytes)
+        .try_build()
+        .expect("dynamic configuration");
     conn.control()
-        .open_encoder(Id::try_from(3_u64).map_err(Dynamic::Stream)?)
-        .map_err(Dynamic::Connection)?;
+        .open_encoder(Id::try_from(3_u64).expect("encoder stream"))
+        .expect("open encoder");
     conn.events()
         .poll_write()
-        .map_err(Dynamic::Connection)?
-        .ok_or(Dynamic::Write)?;
+        .expect("encoder write")
+        .expect("encoder prefix");
     let peer = Settings::new(
         varint::VarInt::from_u16(256),
         None,
@@ -86,24 +70,19 @@ pub fn try_dynamic_sender<'d>(writes: usize, bytes: usize) -> Result<Connection<
     );
     Receive::new(&mut conn)
         .owned(
-            Id::try_from(2_u64).map_err(Dynamic::Stream)?,
-            peer.try_wire().map_err(Dynamic::Wire)?,
+            Id::try_from(2_u64).expect("control stream"),
+            peer.try_wire().expect("SETTINGS wire"),
             Boundary::More,
         )
-        .map_err(Dynamic::Connection)?;
-    match Events::new(&mut conn)
-        .poll_token()
-        .map_err(Dynamic::Connection)?
-    {
-        Some(Event::Settings(settings)) if settings == peer => {}
-        _ => return Err(Dynamic::Settings),
-    }
-    conn.control()
-        .set_capacity(256)
-        .map_err(Dynamic::Connection)?;
+        .expect("peer SETTINGS");
+    assert!(matches!(
+        Events::new(&mut conn).poll_token().expect("SETTINGS event"),
+        Some(Event::Settings(settings)) if settings == peer
+    ));
+    conn.control().set_capacity(256).expect("table capacity");
     conn.events()
         .poll_write()
-        .map_err(Dynamic::Connection)?
-        .ok_or(Dynamic::Write)?;
-    Ok(conn)
+        .expect("capacity write")
+        .expect("capacity instruction");
+    conn
 }

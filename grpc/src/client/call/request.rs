@@ -96,6 +96,7 @@ where
         } = stream.response;
         let mut policy = policies::Direct;
         self.state.cancel_unary(stream, done, &mut policy);
+        self.state.refill(&mut policy);
     }
 }
 

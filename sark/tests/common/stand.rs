@@ -39,14 +39,14 @@ pub struct Reply<'r#req> {
 }
 
 #[sark::handler(pub)]
-pub(crate) fn echo<'r#req, 'r#d, 'r#__sark_state_data0>(
+pub(crate) fn echo<'i, 'r#req: 'i, 'r#d, 'r#__sark_state_data0>(
     req: BodyRequest,
     state: &State<
         '__sark_state_data0,
         '_,
         dyn for<'r#__sark_state_data0_> PartialEq<&'__sark_state_data0_ [u8]>,
     >,
-) -> Reply<'req> {
+) -> Reply<'i> {
     let valid = req.payload == state.expected
         && (!state.exact_pointer || req.payload.as_ref().as_ptr() == state.expected.as_ptr())
         && state.invariant.get() == "capability";

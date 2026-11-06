@@ -114,13 +114,13 @@ where
     }
 
     pub(in crate::client) fn cancel_feed(&mut self, key: StreamKey) -> Cancel {
-        let claims = &mut self.claims;
-        let budget = &mut self.budget;
-        let fault = &mut self.fault;
-        match claims.cancel_feed(key, |charge| fault.release(budget, Some(charge))) {
+        match self
+            .claims
+            .cancel_feed(key, &mut self.fault, &mut self.budget)
+        {
             Ok(cancel) => cancel,
             Err(error) => {
-                fault.store(crate::Status::claim(error));
+                self.fault.store(crate::Status::claim(error));
                 Cancel::Missing
             }
         }

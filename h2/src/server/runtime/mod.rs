@@ -22,10 +22,13 @@ mod recipe;
 pub mod startup;
 
 pub use local::Local;
-pub use plan::{Plan, tasks::Tasks};
+pub use plan::{
+    Plan,
+    tasks::{Prepared, Tasks},
+};
 pub use recipe::Recipe;
 
-type Connection<'d, A> = machine::Connection<
+pub(in crate::server) type Connection<'d, A> = machine::Connection<
     crate::ServerRole,
     <A as Spec>::Fields,
     resident::Shared<'d>,

@@ -23,6 +23,7 @@ fn reports_construction() {
         |failure: app::Failure<
             '_,
             '_,
+            '_,
             wire::Identity,
             KeyTag<0>,
             Infallible,

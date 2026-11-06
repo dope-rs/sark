@@ -1,14 +1,10 @@
 use o3::buffer::{pool, pool::owners};
-use sark_http::field::metadata::section::{rules, storage};
+use sark_http::field::metadata::section::rules;
 
 use crate::{
     details::Fault,
-    protocol::section::{self, seal},
+    protocol::section::{self, Owner, Seal, seal},
 };
-
-pub struct Owner {
-    storage: pool::Span,
-}
 
 /// Response spans retain decoder-established UTF-8 through folding and freezing.
 #[repr(transparent)]
@@ -19,49 +15,31 @@ pub(crate) struct Valid {
 
 mod check;
 pub(super) mod fold;
-use check::Check;
 
-impl Owner {
-    pub(crate) fn validate(mut self, kind: rules::Kind) -> Result<Valid, seal::Error> {
-        let mut check = Check::new(kind);
-        fold::Fold::new(&mut self.storage)
-            .finish(&mut check)
+impl Valid {
+    pub(crate) fn try_from(owner: Owner, kind: rules::Kind) -> Result<Self, seal::Error> {
+        let mut storage = owner.into_lease();
+        let mut seal = Seal::new(kind);
+        fold::Fold::new(&mut storage)
+            .finish(&mut seal)
             .map_err(seal::Error::Fold)?;
-        check.require();
-        if check.seal.write(&mut self.storage) != seal::Write::Complete {
+        seal.require();
+        if seal.write(&mut storage) != seal::Write::Complete {
             return Err(seal::Error::Prefix {
-                actual: self.storage.len(),
+                actual: storage.len(),
                 required: seal::LEN,
             });
         }
-        let fault = check.seal.into_fault();
+        let fault = seal.into_fault();
         if fault != Fault::None {
             return Err(seal::Error::Stored(fault));
         }
-        Ok(Valid {
-            storage: self.storage.freeze(),
+        Ok(Self {
+            storage: storage.freeze(),
         })
     }
-}
-
-impl Valid {
     pub(crate) fn bytes(&self) -> &[u8] {
         self.storage.as_ref()
-    }
-}
-
-impl storage::Block for Owner {
-    type Format = storage::Raw;
-    const PREFIX: &'static [u8] = &[0; seal::LEN];
-
-    fn from(storage: storage::Finished<Self>) -> Self {
-        Self {
-            storage: storage.into_lease(),
-        }
-    }
-
-    fn into_bytes(self) -> storage::Bytes {
-        storage::Bytes::new(self.storage.freeze())
     }
 }
 

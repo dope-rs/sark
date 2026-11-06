@@ -129,6 +129,7 @@ where
         let mut policy = policies::Direct;
         self.state
             .cancel_unary(call.stream, call.completion, &mut policy);
+        self.state.refill(&mut policy);
     }
 }
 
@@ -171,13 +172,5 @@ where
             self.state.ingress.take_error()?;
         }
         Ok(result)
-    }
-
-    pub(in crate::client) fn cancel_unary<'notify>(
-        &mut self,
-        call: Handle<'scope, P::Key>,
-        done: &mut policies::Notify<'notify, '_, '_>,
-    ) {
-        self.state.cancel_unary(call.stream, call.completion, done);
     }
 }

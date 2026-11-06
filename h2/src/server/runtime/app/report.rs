@@ -1,4 +1,4 @@
-use std::{convert::Infallible, pin};
+use std::{convert::Infallible, fmt, pin};
 
 use dope::{
     core::{driver::route::Identity, io::socket},
@@ -18,6 +18,7 @@ use dope::{
 use o3::base::Call;
 use sark_core::{
     decode::request,
+    life,
     manifold::{
         server::app::{self, Spec},
         task::app::Runtime,
@@ -29,11 +30,26 @@ use crate::{
     server::{
         runtime::{
             app::{App, Failure},
-            output::{self, track::Progress},
+            output,
         },
         task,
     },
 };
+
+pub(in crate::server) fn response<C: Copy, M, E: fmt::Debug>(
+    mode: &mut M,
+    exchange: life::exchange::Id<C, crate::stream::Key>,
+    cause: &E,
+    report: &mut impl FnMut(C, crate::stream::Key, &dyn fmt::Debug),
+) where
+    M: life::Mode<C, crate::stream::Key>,
+{
+    if M::ENABLED {
+        mode.diagnostic(cause);
+    } else {
+        report(exchange.connection(), exchange.stream(), cause);
+    }
+}
 
 /// Owns the final consumer of failures from the selected wire.
 #[repr(transparent)]
@@ -51,7 +67,9 @@ where
     App<A, W, Self>: Application<'d, ID, Wire = W>,
     W: Execution + 'd,
     receive::Scoped: receive::Mode<W>,
-    F: FnMut(Failure<'w, 'd, W, ID, A::Failure, <App<A, W, Self> as Application<'d, ID>>::Build>),
+    F: for<'a> FnMut(
+        Failure<'a, 'w, 'd, W, ID, A::Failure, <App<A, W, Self> as Application<'d, ID>>::Build>,
+    ),
 {
     fn open_failed(app: pin::Pin<&mut App<A, W, Self>>, cause: open::Error<'w, W>) {
         (app.get_mut().fault.0)(Failure::Open(cause));
@@ -87,17 +105,19 @@ where
     }
 }
 
-impl<'w, 'd: 'w, R, W, M, D, F, ID: Identity + 'd>
-    failures::Policy<'w, 'd, task::App<'d, ID, R, W, M, D, Self>, ID> for Report<F>
+impl<'w, 'd: 'w, R, W, M, D, F, A, ID: Identity + 'd>
+    failures::Policy<'w, 'd, task::App<'d, ID, R, W, M, D, Self, A>, ID> for Report<F>
 where
     R: Runtime<'d>,
     <R::Head as request::Head>::Start: task::works::Family,
     W: Execution + 'd,
-    task::App<'d, ID, R, W, M, D, Self>: Application<'d, ID, Wire = W>,
-    F: FnMut(Failure<'w, 'd, W, ID>),
+    A: task::service::Select<R>
+        + app::Timed<'d, task::service::Connection<'d, A>, conn::Id<'d, ID>>,
+    task::App<'d, ID, R, W, M, D, Self, A>: Application<'d, ID, Wire = W>,
+    F: for<'a> FnMut(Failure<'a, 'w, 'd, W, ID, A::Failure, task::Build<A::Build>>),
 {
     fn open_failed(
-        app: pin::Pin<&mut task::App<'d, ID, R, W, M, D, Self>>,
+        app: pin::Pin<&mut task::App<'d, ID, R, W, M, D, Self, A>>,
         cause: open::Error<'w, W>,
     ) {
         (app.project().fault.0)(Failure::Open(cause));
@@ -105,7 +125,7 @@ where
 
     fn peer() -> Option<
         impl for<'a> Call<(
-            pin::Pin<&'a mut task::App<'d, ID, R, W, M, D, Self>>,
+            pin::Pin<&'a mut task::App<'d, ID, R, W, M, D, Self, A>>,
             socket::Error,
         )>,
     > {
@@ -113,7 +133,7 @@ where
     }
 
     fn wire_failed<'e>(
-        app: pin::Pin<&mut task::App<'d, ID, R, W, M, D, Self>>,
+        app: pin::Pin<&mut task::App<'d, ID, R, W, M, D, Self, A>>,
         conn: conn::Ctx<
             'e,
             '_,
@@ -123,8 +143,8 @@ where
             'd,
             ID,
             W,
-            <task::App<'d, ID, R, W, M, D, Self> as Application<'d, ID>>::Conn,
-            <task::App<'d, ID, R, W, M, D, Self> as Application<'d, ID>>::Egress,
+            <task::App<'d, ID, R, W, M, D, Self, A> as Application<'d, ID>>::Conn,
+            <task::App<'d, ID, R, W, M, D, Self, A> as Application<'d, ID>>::Egress,
         >,
         cause: terminal::Error<'w, W>,
     ) {
@@ -135,16 +155,14 @@ where
     }
 }
 
-pub(in crate::server::runtime) trait Fault<'d, W: wire::Spec, E, ID: Identity, B> {
+pub(in crate::server) trait Fault<'d, W: wire::Spec, E, ID: Identity, B> {
     fn construction(&mut self, cause: B);
 
-    fn output(
-        &mut self,
-        id: conn::Id<'d, ID>,
-        result: Result<Progress, (output::Failure, Progress)>,
-    ) -> Progress;
+    fn output(&mut self, id: conn::Id<'d, ID>, cause: output::Failure);
 
     fn diagnostic(&mut self, id: conn::Id<'d, ID>, cause: app::Error<crate::conn::Error, E>);
+
+    fn response(&mut self) -> impl FnMut(conn::Id<'d, ID>, crate::stream::Key, &dyn fmt::Debug);
 
     fn failed(
         &mut self,
@@ -158,19 +176,14 @@ impl<'d, W: wire::Spec, E, ID: Identity, B> Fault<'d, W, E, ID, B> for failures:
         drop(cause);
     }
 
-    fn output(
-        &mut self,
-        _: conn::Id<'d, ID>,
-        result: Result<Progress, (output::Failure, Progress)>,
-    ) -> Progress {
-        match result {
-            Ok(progress) => progress,
-            Err((_, progress)) => progress,
-        }
-    }
+    fn output(&mut self, _: conn::Id<'d, ID>, _: output::Failure) {}
 
     fn diagnostic(&mut self, _: conn::Id<'d, ID>, cause: app::Error<crate::conn::Error, E>) {
         drop(cause);
+    }
+
+    fn response(&mut self) -> impl FnMut(conn::Id<'d, ID>, crate::stream::Key, &dyn fmt::Debug) {
+        |_, _, _| {}
     }
 
     fn failed(
@@ -188,28 +201,22 @@ impl<'d, W: wire::Spec, E, ID: Identity, B> Fault<'d, W, E, ID, B> for failures:
 impl<'d, W, E, F, ID: Identity, B> Fault<'d, W, E, ID, B> for Report<F>
 where
     W: wire::Spec + 'd,
-    F: FnMut(Failure<'d, 'd, W, ID, E, B>),
+    F: for<'a> FnMut(Failure<'a, 'd, 'd, W, ID, E, B>),
 {
     fn construction(&mut self, cause: B) {
         (self.0)(Failure::Construction(cause));
     }
 
-    fn output(
-        &mut self,
-        id: conn::Id<'d, ID>,
-        result: Result<Progress, (output::Failure, Progress)>,
-    ) -> Progress {
-        match result {
-            Ok(progress) => progress,
-            Err((cause, progress)) => {
-                (self.0)(Failure::Output { id, cause });
-                progress
-            }
-        }
+    fn output(&mut self, id: conn::Id<'d, ID>, cause: output::Failure) {
+        (self.0)(Failure::Output { id, cause });
     }
 
     fn diagnostic(&mut self, id: conn::Id<'d, ID>, cause: app::Error<crate::conn::Error, E>) {
         (self.0)(Failure::Diagnostic { id, cause });
+    }
+
+    fn response(&mut self) -> impl FnMut(conn::Id<'d, ID>, crate::stream::Key, &dyn fmt::Debug) {
+        move |id, stream, cause| (self.0)(Failure::Response { id, stream, cause })
     }
 
     fn failed(

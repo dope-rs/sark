@@ -3,244 +3,362 @@ use dope_quic::conn::id;
 use crate::manifold::server::deadline::state::State;
 pub(in crate::manifold::server) mod ingress;
 pub(super) mod receive;
-use std::pin;
+use std::{mem, ops::ControlFlow, pin};
 
-use conn::scope;
-use dope::core::driver::schedule::{
-    clock,
-    ready::{self, task::owner},
-};
-use dope_quic::{conn, stream, wire::stream::Id};
-use o3::buffer::resident;
+use dope_quic::{stream, wire::stream::Id};
 use owners::Projection;
-use requests::task::{self, Close};
+use requests::task::{self, Pending};
 use sark_core::{
     deadline::timeline,
     life::{self, exchange},
-    manifold::task::{app, response::Completion},
-    route,
+    manifold::task::{app, response},
 };
+use sark_http::payload::response::{Response, dispatch, status::Code};
 
 use crate::{
+    conn::io::replies,
     frame,
     manifold::{
         self, encoder, owners, requests,
-        server::{self, deadline, rotation},
+        server::{self, deadline, failure, rotation, session::finish},
     },
 };
 
-enum Dispatch {
-    Idle,
-    Progress,
+pub(in crate::manifold::server) enum Output<'d, F> {
+    Fixed(F),
+    Status(Code),
+    Head,
+    Body(Option<sark_http::payload::response::dispatch::chunk::Chunk<'d>>),
+    Failed,
+    Resume,
 }
 
-/// Borrowed session task dispatch and completion.
-#[repr(transparent)]
-pub(in crate::manifold::server) struct Ready<
-    'a,
-    'd,
+pub(in crate::manifold::server) fn cancel<'d, A, C: Copy, O>(
+    owned: task::Owned<'d, A::Task, O::Retention>,
+    app: pin::Pin<&mut A>,
+    life: &mut O,
+    flow: exchange::Id<C, Id>,
+) -> Option<encoder::Pending<'d, O::Retention>>
+where
     A: app::Runtime<'d>,
+    O: life::Mode<C, Id>,
+    O::Retention: owners::Handoff,
+{
+    let active = match owned {
+        task::Owned::Response(response) => return Some(response),
+        task::Owned::Active(active) => active,
+    };
+    let task::Active { task, pending } = active;
+    let unfinished = matches!(pending, Pending::Future);
+    let response = match pending {
+        Pending::End => return None,
+        Pending::Response(response) => Some(response),
+        _ => None,
+    };
+    app::Runtime::cancel(app, task);
+    if unfinished {
+        life.observe(life::Event::TaskCancelled(flow));
+    }
+    response
+}
+
+impl<'a, 'scope, 'd, A, O, L, E, B, const ID: u8, const RECONCILE: bool>
+    ingress::item::Item<'a, 'scope, 'd, A, O, L, E, B, ID, RECONCILE>
+where
+    A: app::Runtime<'d, Target = server::Handle<'d, ID>>,
+    O: life::Mode<id::Handle<id::Driver<'d>, ID>, Id>
+        + failure::Sink<id::Handle<id::Driver<'d>, ID>>,
+    O::Retention: owners::Handoff,
     L: rotation::Policy<'d>,
     E: State<'d>,
-> {
-    pub(super) state: &'a mut server::Session<'d, A, L, E>,
-}
-
-impl<'a, 'd, A: app::Runtime<'d>, L: rotation::Policy<'d>, E: State<'d>> Ready<'a, 'd, A, L, E> {
-    pub(super) fn deadline(&mut self) -> Option<clock::Deadline<'d>> {
-        let drain = rotation::State::deadline(&self.state.rotation);
-        let entry = E::deadline(&self.state.deadline);
-        match (drain, entry) {
-            (Some(drain), Some(entry)) => Some(drain.min(entry)),
-            (Some(drain), None) => Some(drain),
-            (None, Some(entry)) => Some(entry),
-            (None, None) => None,
-        }
-    }
-
-    fn dispatch<
-        const ID: u8,
-        O: life::Mode<id::Handle<id::Driver<'d>, ID>, Id>,
-        B: stream::Recv,
-        const RECONCILE: bool,
-    >(
-        &mut self,
-        mut router: pin::Pin<&mut A>,
-        life: &mut O,
-        quic: &mut scope::Access<'_, ID, B, RECONCILE, resident::Shared<'d>>,
-        handle: id::Handle<id::Driver<'d>, ID>,
-        parent: ready::Target<'d>,
-        now: clock::Moment<'d>,
-    ) -> Dispatch
-    where
-        O::Retention: owners::Handoff,
-        A: app::Runtime<'d, Target = server::Handle<'d, ID>>,
-    {
-        let owner = owner::Owner::from(handle);
-        let done = self.state.requests.dispatch_one(|id, input| {
-            let target = server::Handle::from_request(handle, id);
-            match input {
-                task::Input::Built { output } => {
-                    app::Runtime::try_built(router.as_mut(), output, target, owner, parent)
-                }
-                task::Input::Buffered(req) => {
-                    app::Runtime::try_dispatch(router.as_mut(), req, target, owner, parent)
-                }
-            }
-        });
-        let done = match done {
-            Ok(done) => done,
-            Err(error) => {
-                manifold::close_connection_scoped(quic, server::request_error_code(error));
-                return Dispatch::Progress;
-            }
-        };
-        match done {
-            task::Dispatch::Idle => Dispatch::Idle,
-            task::Dispatch::Active { key: id } => {
-                life.observe(life::Event::TaskAdmitted(exchange::Id::new(
-                    handle,
-                    id.stream_id(),
-                )));
-                if let Err(error) = E::transition(
-                    &mut self.state.deadline,
-                    id,
-                    timeline::Transition::HandlerStarted,
-                    now,
-                ) {
-                    manifold::close_connection_scoped(quic, deadline::code(error));
-                    return Dispatch::Progress;
-                }
-                Dispatch::Progress
-            }
-            task::Dispatch::Rejected { key: id, error } => {
-                let code = match A::rejection(&error) {
-                    route::Reject::Unavailable => frame::ErrorCode::ExcessiveLoad,
-                    route::Reject::BadRequest => frame::ErrorCode::Message,
-                    route::Reject::Internal => frame::ErrorCode::Internal,
-                };
-                let stream = id.stream_id();
-                Projection::new(life, handle).reset(quic, id.target(), code);
-                if let Err(error) = self.state.finish(
-                    quic,
-                    id,
-                    life,
-                    exchange::Id::new(handle, stream),
-                    life::Outcome::Rejected,
-                    now,
-                ) {
-                    manifold::close_connection_scoped(quic, error.code());
-                }
-                Dispatch::Progress
-            }
-        }
-    }
-
-    pub(in crate::manifold) fn finish_task<
-        const ID: u8,
-        R,
-        O: life::Mode<id::Handle<id::Driver<'d>, ID>, Id>,
-        B,
-        const RECONCILE: bool,
-    >(
-        &mut self,
-        quic: &mut scope::Access<'_, ID, B, RECONCILE, resident::Shared<'d>>,
-        handle: id::Handle<id::Driver<'d>, ID>,
+    B: stream::Retain<'d>,
+{
+    pub(in crate::manifold::server) fn respond(
+        mut self,
         id: requests::Id,
-        output: R,
-        life: &mut O,
-        now: clock::Moment<'d>,
-    ) where
-        R: Completion<'d>,
-        B: stream::Retain<'d>,
-        O::Retention: owners::Handoff,
-    {
-        let stream = id.stream_id();
-        let method = match self.state.requests.close_task(id) {
-            Ok(Close::Closed(method)) => method,
-            Ok(Close::Missing) => return,
-            Err(error) => {
-                manifold::close_connection_scoped(quic, server::request_error_code(error));
-                return;
-            }
-        };
-        match self
-            .state
-            .h3
-            .ingress()
-            .cancelled(quic, stream, life, handle)
-        {
-            Ok(false) => {}
-            cancelled => {
-                let retired = self.state.finish(
-                    quic,
-                    id,
+        output: Output<'d, A::Fixed>,
+    ) {
+        self.response(Some(id), output);
+    }
+
+    pub(in crate::manifold::server) fn resume_response(mut self) -> bool {
+        self.response(None, Output::Resume)
+    }
+
+    fn response(&mut self, selected: Option<requests::Id>, output: Output<'d, A::Fixed>) -> bool {
+        use response::Completion as _;
+
+        let state = &mut *self.state;
+        let mut app = self.app.as_mut();
+        let life = &mut *self.life;
+        let conn = &mut *self.conn;
+        let handle = self.handle;
+        let now = self.now;
+        let (requests, h3, deadline) = (&mut state.requests, &mut state.h3, &mut state.deadline);
+        let mut cancellation_error = None;
+        let next = requests.with_response(selected, |id, method, owned| {
+            let flow = exchange::Id::new(handle, id.stream_id());
+            // Only this turn combines the phases; parked entries retain either
+            // a live task or a fixed response whose runtime slot is already free.
+            let (mut task, mut pending, mut output) = match owned {
+                Ok(task::Owned::Active(active)) => (Some(active.task), active.pending, output),
+                Ok(task::Owned::Response(response)) => (None, Pending::Response(response), output),
+                Err(code) => (None, Pending::Future, Output::Status(code)),
+            };
+            let result = (|| {
+                match &output {
+                    Output::Fixed(_) => {
+                        drop(task.take());
+                        if !matches!(pending, Pending::Future) {
+                            drop(mem::replace(&mut output, Output::Resume));
+                            return Err(frame::ErrorCode::Internal);
+                        }
+                        pending = Pending::Body;
+                        life.observe(life::Event::TaskPollReady(flow));
+                    }
+                    Output::Body(body) => {
+                        let next = body.as_ref().map_or(Pending::End, |_| Pending::Body);
+                        let expected = matches!(pending, Pending::Body);
+                        if let Pending::Response(response) = mem::replace(&mut pending, next) {
+                            response.discard(h3.h3_mut(), id);
+                        }
+                        if !expected {
+                            return Err(frame::ErrorCode::Internal);
+                        }
+                    }
+                    _ => {}
+                }
+                match h3.ingress().cancelled(conn, id.stream_id(), life, handle) {
+                    Ok(false) => {}
+                    Ok(true) => return Ok(ControlFlow::Continue(life::Outcome::Cancelled)),
+                    Err(error) => {
+                        cancellation_error = Some((id, error));
+                        return Ok(ControlFlow::Continue(life::Outcome::Cancelled));
+                    }
+                }
+                if matches!(output, Output::Head) {
+                    if task.is_none() || !matches!(pending, Pending::Future) {
+                        return Err(frame::ErrorCode::Internal);
+                    }
+                    pending = Pending::Body;
+                    life.observe(life::Event::TaskPollReady(flow));
+                }
+                if matches!(output, Output::Fixed(_) | Output::Head) {
+                    E::transition(deadline, id, timeline::Transition::ResponseReady, now)
+                        .map_err(deadline::code)?;
+                }
+                let emitted = match mem::replace(&mut output, Output::Resume) {
+                    Output::Status(code) => Some(
+                        dispatch::Immediate::emit(
+                            Response::new(code),
+                            encoder::Encoder::new(h3.h3_mut(), id.target(), method),
+                        )
+                        .map(|enc| (enc, response::State::Complete(life::Outcome::Rejected))),
+                    ),
+                    Output::Fixed(output) => Some(
+                        output
+                            .emit(|request| {
+                                encoder::Encoder::task(h3.h3_mut(), id.target(), method, request)
+                            })
+                            .map(|(enc, outcome)| (enc, response::State::Complete(outcome))),
+                    ),
+                    Output::Head => {
+                        let Some(task) = task.as_ref() else {
+                            unreachable!("task")
+                        };
+                        match app::Runtime::emit(app.as_mut(), task, |request| {
+                            encoder::Encoder::task(h3.h3_mut(), id.target(), method, request)
+                        }) {
+                            response::Access::Ready(emitted) => Some(emitted),
+                            response::Access::Absent | response::Access::Active => {
+                                return Err(frame::ErrorCode::Internal);
+                            }
+                        }
+                    }
+                    Output::Body(Some(body)) => {
+                        let plan = replies::try_data(body)
+                            .map_err(|(cause, _)| failure::response(life, handle, id, cause))?;
+                        pending = Pending::Chunk(plan);
+                        None
+                    }
+                    Output::Resume | Output::Body(None) => None,
+                    Output::Failed => return Err(frame::ErrorCode::Internal),
+                };
+                if let Some(emitted) = emitted {
+                    let response = emitted
+                        .map_err(|(cause, _)| cause)
+                        .and_then(|(enc, state)| {
+                            <O::Retention as owners::Handoff>::defer(encoder::Initial(enc), state)
+                        })
+                        .map_err(|cause| failure::response(life, handle, id, cause))?;
+                    pending = Pending::Response(response);
+                }
+                let end = matches!(pending, Pending::End);
+                let charge = match mem::replace(&mut pending, Pending::Body) {
+                    Pending::Response(response) => {
+                        match response
+                            .send(h3.h3_mut(), id, life, flow)
+                            .map_err(|cause| failure::response(life, handle, id, cause))?
+                        {
+                            ControlFlow::Break(response) => {
+                                pending = Pending::Response(response);
+                                return Ok(ControlFlow::Break(()));
+                            }
+                            ControlFlow::Continue(state) => match state {
+                                response::State::Complete(outcome) => {
+                                    return Ok(ControlFlow::Continue(outcome));
+                                }
+                                response::State::Streaming => {
+                                    E::transition(
+                                        deadline,
+                                        id,
+                                        timeline::Transition::ResponseCommitted,
+                                        now,
+                                    )
+                                    .map_err(deadline::code)?;
+                                    None
+                                }
+                            },
+                        }
+                    }
+                    Pending::Chunk(chunk) => Some(
+                        h3.h3_mut()
+                            .reply()
+                            .send_chunk(id.target(), chunk)
+                            .map_err(|(error, chunk)| (error, Pending::Chunk(chunk))),
+                    ),
+                    Pending::End => {
+                        pending = Pending::End;
+                        Some(
+                            h3.h3_mut()
+                                .reply()
+                                .finish(id.target())
+                                .map_err(|error| (error, Pending::End)),
+                        )
+                    }
+                    Pending::Future | Pending::Body => return Err(frame::ErrorCode::Internal),
+                };
+                if let Some(charge) = charge {
+                    let charge = match charge {
+                        Ok(charge) => charge,
+                        Err((error, held)) if h3.h3().queues.is_pressure(&error) => {
+                            pending = held;
+                            return Ok(ControlFlow::Break(()));
+                        }
+                        Err((error, _)) => {
+                            return Err(failure::response(life, handle, id, error));
+                        }
+                    };
+                    use sark_http::owner::{self, cause};
+                    sark_core::life::owners::Projection::new(life).apply(owner::Effect::new(
+                        flow,
+                        charge,
+                        owner::Change::StagingAcquired(cause::Acquire::StreamChunk),
+                    ));
+                }
+                if end {
+                    return Ok(ControlFlow::Continue(life::Outcome::Completed));
+                }
+                let Some(task) = task.as_ref() else {
+                    return Err(frame::ErrorCode::Internal);
+                };
+                match app::Runtime::resume(app.as_mut(), task) {
+                    response::Access::Ready(()) | response::Access::Active => {
+                        Ok(ControlFlow::Break(()))
+                    }
+                    response::Access::Absent => Err(frame::ErrorCode::Internal),
+                }
+            })();
+            let outcome = match result {
+                Ok(ControlFlow::Break(())) => {
+                    return ControlFlow::Break(match task {
+                        Some(task) => task::Owned::Active(task::Active { task, pending }),
+                        None => match pending {
+                            Pending::Response(response) => task::Owned::Response(response),
+                            _ => unreachable!("response"),
+                        },
+                    });
+                }
+                Ok(ControlFlow::Continue(outcome)) => Ok(outcome),
+                Err(code) => Err(code),
+            };
+            let retained = match task {
+                Some(task) => cancel(
+                    task::Owned::Active(task::Active { task, pending }),
+                    app.as_mut(),
                     life,
-                    exchange::Id::new(handle, stream),
-                    life::Outcome::Cancelled,
-                    now,
-                );
-                if let Err(error) = cancelled {
-                    manifold::close_connection_scoped(quic, error.code());
-                }
-                if let Err(error) = retired {
-                    manifold::close_connection_scoped(quic, error.code());
-                }
-                return;
+                    flow,
+                ),
+                None => match pending {
+                    Pending::Response(response) => Some(response),
+                    _ => None,
+                },
+            };
+            if let Some(response) = retained {
+                response.discard(h3.h3_mut(), id);
             }
-        }
-        if let Err(error) = E::transition(
-            &mut self.state.deadline,
-            id,
-            timeline::Transition::ResponseReady,
-            now,
-        ) {
-            let retired = self.state.finish(
-                quic,
-                id,
-                life,
-                exchange::Id::new(handle, stream),
-                life::Outcome::Rejected,
-                now,
-            );
-            manifold::close_connection_scoped(quic, deadline::code(error));
-            if let Err(error) = retired {
-                manifold::close_connection_scoped(quic, error.code());
+            ControlFlow::Continue((id, outcome))
+        });
+        let progressed = match next {
+            Ok(Some(ControlFlow::Continue(((id, outcome), removed)))) => {
+                self.finish_response(id, outcome, removed);
+                true
             }
-            return;
-        }
-        let target = id.target();
-        let flow = exchange::Id::new(handle, stream);
-        let req_id = output.id();
-        let enc = encoder::Encoder::task(self.state.h3.h3_mut(), target, method, req_id);
-        let sent = output.emit(enc);
-        use owners::Commit;
-        let commit = match sent {
-            Err((cause, target)) => Err((Commit::code(cause), target.into_target())),
-            Ok((enc, outcome)) => <O::Retention as owners::Handoff>::resolve(enc)
-                .map(|done| (done, outcome))
-                .map_err(|code| (code, target)),
+            Ok(Some(ControlFlow::Break(()))) => true,
+            Ok(None) => false,
+            Err(error) => {
+                manifold::close_connection_scoped(self.conn, server::request_error_code(error));
+                true
+            }
         };
-        let (commit, outcome) = match commit {
-            Ok(done) => done,
-            Err((code, target)) => {
-                Projection::new(life, handle).reset(quic, target, code);
+        if let Some((id, error)) = cancellation_error {
+            if let Err(error) = self
+                .state
+                .discard_response(self.life, self.handle, id.stream_id())
+            {
+                manifold::close_connection_scoped(self.conn, error.error_code());
+            }
+            manifold::close_connection_scoped(self.conn, error.code());
+        }
+        if progressed && !self.conn.view().lifecycle().is_closing() {
+            self.state.flush_h3(self.life, self.conn, self.handle);
+        }
+        progressed
+    }
+
+    fn finish_response(
+        &mut self,
+        id: requests::Id,
+        outcome: Result<life::Outcome, frame::ErrorCode>,
+        removed: Option<bool>,
+    ) {
+        let outcome = match outcome {
+            Ok(outcome) => outcome,
+            Err(code) => {
                 if let Err(error) =
                     self.state
-                        .finish(quic, id, life, flow, life::Outcome::Rejected, now)
+                        .discard_response(self.life, self.handle, id.stream_id())
                 {
-                    manifold::close_connection_scoped(quic, error.code());
+                    manifold::close_connection_scoped(self.conn, error.error_code());
                 }
-                return;
+                Projection::new(self.life, self.handle).reset(self.conn, id.target(), code);
+                life::Outcome::Rejected
             }
         };
-        commit.observe(life, flow);
-        if let Err(error) = self.state.finish(quic, id, life, flow, outcome, now) {
-            manifold::close_connection_scoped(quic, error.code());
-            return;
-        }
-        if let Err(error) = self.state.flush_h3(life, quic, handle) {
-            manifold::close_connection_scoped(quic, error.code());
+        let flow = exchange::Id::new(self.handle, id.stream_id());
+        let retired = match removed {
+            Some(finished) => finish::removed(
+                &mut self.state.h3,
+                self.now.at(&mut self.state.deadline),
+                self.conn,
+                id,
+                !finished,
+            ),
+            None => finish::retained(&mut self.state.deadline, id, self.now),
+        };
+        flow.retire(self.life, outcome);
+        if let Err(error) = retired {
+            manifold::close_connection_scoped(self.conn, error.code());
         }
     }
 }

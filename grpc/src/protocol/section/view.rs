@@ -3,8 +3,8 @@ use core::{marker, slice, time::Duration};
 use sark_http::{field::Indexing, payload::response::status};
 
 use crate::protocol::{
-    request::timeout,
-    section::{Request, Trailers, Valid, seal},
+    request::{Head, timeout},
+    section::{Trailers, Valid, seal},
 };
 
 #[repr(transparent)]
@@ -69,8 +69,8 @@ impl<'a> View<'a, Valid> {
     }
 }
 
-impl<'a> View<'a, Request> {
-    pub(in crate::protocol) const fn new(request: &'a Request) -> Self {
+impl<'a> View<'a, Head> {
+    pub(in crate::protocol) const fn new(request: &'a Head) -> Self {
         Self {
             owner: request.owner(),
             kind: marker::PhantomData,
@@ -80,8 +80,12 @@ impl<'a> View<'a, Request> {
     pub(in crate::protocol) fn required(self) -> &'a [u8] {
         let (start, len) = self.span(seal::Field::First);
         let bytes = self.owner.bytes();
-        // SAFETY: `Request` requires the path in First from the validated owner.
+        // SAFETY: `Head` requires the path in First from the validated owner.
         unsafe { slice::from_raw_parts(bytes.as_ptr().add(start), len) }
+    }
+
+    pub(in crate::protocol) fn authority(self) -> Option<&'a [u8]> {
+        self.field(seal::Field::Second)
     }
 }
 
@@ -148,4 +152,4 @@ impl<'a, K> View<'a, K> {
     }
 }
 
-const _: () = assert!(core::mem::size_of::<View<'_, Request>>() == core::mem::size_of::<usize>());
+const _: () = assert!(core::mem::size_of::<View<'_, Head>>() == core::mem::size_of::<usize>());

@@ -32,8 +32,8 @@ where
         machine: config::Validated<crate::ServerRole>,
         seed: hash::Seed,
     ) -> Result<Self, runtime::Build<A::Build>> {
-        let carrier =
-            Connection::<'d, A>::from_seed(machine, seed).map_err(runtime::Build::Connection)?;
+        let carrier = Connection::<'d, A>::from_runtime_seed(machine, seed)
+            .map_err(runtime::Build::Connection)?;
         let capacity = Capacity::new(machine.stream_count(), machine.data_events().raw());
         let app = app.state(capacity).map_err(runtime::Build::App)?;
         Ok(Self {

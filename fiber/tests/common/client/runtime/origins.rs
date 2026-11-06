@@ -3,7 +3,7 @@ use std::time;
 use dope::{
     core::driver::{life::recovery, schedule::clock},
     manifold::{app::Host, timing},
-    runtime::{executor::session, topology, topology::lending},
+    runtime::{executor, executor::session, topology, topology::lending},
 };
 use dope_test::harness::GUARD;
 use dynamic::channel;
@@ -38,17 +38,19 @@ impl Plan {
         Ok(Self { prepared })
     }
 
-    pub fn enter<R, Out>(
+    pub fn enter<C: executor::Build, R, Out>(
         self,
+        context: C,
         run: impl for<'app, 'life, 's, 'p, 'o, 'q, 'e, 'b, 'c, 'd> FnOnce(
-            Scope<'app, 'life, 's, 'p, 'o, 'q, 'e, 'b, 'c, 'd>,
+            Scope<'app, 'life, 's, 'p, 'o, 'q, 'e, 'b, 'c, 'd, C::Shutdown>,
         ) -> R,
         policy: impl recovery::Observe,
         done: impl for<'a> FnOnce(Result<R, Error<'a>>) -> Out,
     ) -> Result<Out, Failure> {
         let mut finish = session::Completion::new();
         let finish = &mut finish;
-        Ok(self.prepared.with_local(
+        Ok(self.prepared.enter_with(
+            context,
             move |worker| {
                 worker.lend(|http, stage| {
                     http.try_with(stage, lending::Stage::driver, |port, stage| {
@@ -119,9 +121,9 @@ impl Plan {
 }
 
 /// Live on-demand HTTP client bound to one application lifetime.
-pub struct Scope<'app, 'life: 'app, 's, 'p, 'o, 'q, 'e, 'b, 'c, 'd: 'life> {
+pub struct Scope<'app, 'life: 'app, 's, 'p, 'o, 'q, 'e, 'b, 'c, 'd: 'life, Q = ()> {
     pub app:
-        session::App<'app, 'life, 'd, Host<dynamic::Connector<'s, 'p, 'o, 'q, 'e, 'b, 'c, 'd>>>,
+        session::App<'app, 'life, 'd, Host<dynamic::Connector<'s, 'p, 'o, 'q, 'e, 'b, 'c, 'd>>, Q>,
     pub handle: Handle<'app, 's, 'p, 'o, 'q, 'e, 'b, 'c, 'd>,
 }
 

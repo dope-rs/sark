@@ -13,12 +13,7 @@ impl Body {
     }
 
     pub(in crate::owner::handoff) fn copy(&self) -> evidence::Copy {
-        let len = self.body.len();
-        evidence::Copy {
-            read: len,
-            written: len,
-            cause: evidence::Cause::Borrowed,
-        }
+        evidence::Copy::borrowed(self.body.len())
     }
 
     pub(in crate::owner::handoff) fn len(&self) -> usize {

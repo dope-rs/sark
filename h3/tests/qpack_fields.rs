@@ -407,7 +407,8 @@ fn field_paths_are_packed() {
         .expect("fixed QPACK test contract must hold");
     let error = limited
         .decode(&method)
-        .expect_err("field capacity must reject");
+        .err()
+        .expect("field capacity must reject");
     assert_eq!(
         error,
         decoder::Error::FieldCapacity {
@@ -435,7 +436,8 @@ fn field_paths_are_packed() {
     let (_, (allocs, _)) = Tracker::usage(|| {
         let error = limited
             .decode(&encoded)
-            .expect_err("literal capacity must reject");
+            .err()
+            .expect("literal capacity must reject");
         assert_eq!(
             error,
             decoder::Error::LiteralCapacity {

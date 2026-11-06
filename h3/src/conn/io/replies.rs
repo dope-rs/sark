@@ -1,12 +1,14 @@
-use std::num::NonZero;
+use std::{num::NonZero, ops::ControlFlow};
 
-use dope_quic::wire::varint;
+use dope_quic::{stream::release, wire::varint};
 use o3::buffer::hold;
 use output::Payload as _;
+pub(crate) use plan::Plan;
 use sark_core::manifold::stream::Boundary;
 use sark_http::{
     self, field,
     field::metadata::section::{rules, state::Selected},
+    payload::response::dispatch::chunk::Chunk,
 };
 
 use crate::{
@@ -25,7 +27,7 @@ use crate::{
 pub enum Error {
     Empty,
     Length(varint::Overflow),
-    Output(output::Error),
+    Output(output::Overflow),
 }
 
 /// A nonempty DATA frame with validated wire and retention charges.
@@ -47,7 +49,7 @@ impl<'d> Data<'d> {
             Err(error) => return Err((Error::Length(error), body)),
         };
         let prefix = conn::frame_prefix(frame::TYPE_DATA, length);
-        let (plan, _) = match plan::Plan::try_measured(prefix, body, charge) {
+        let plan = match plan::Plan::try_measured(prefix, body, charge) {
             Ok(plan) => plan,
             Err(rejected) => {
                 let (body, error) = rejected.into_parts();
@@ -68,6 +70,88 @@ pub struct Batch<'a, 'd, P: rules::Policy = rules::RetainRaw>(
     outbound::Batch<'a, 'd, Selected<P>, P::Block>,
 );
 
+/// Ordinary response owners whose initial QPACK references remain unpublished.
+pub(crate) struct Pending<'d> {
+    fields: Entry<'d>,
+    trailing: Option<Entry<'d>>,
+}
+
+impl<'d> Pending<'d> {
+    pub(in crate::conn) const fn new(fields: Entry<'d>, trailing: Option<Entry<'d>>) -> Self {
+        Self { fields, trailing }
+    }
+
+    pub(crate) fn discard<P: rules::Policy, A: rules::Push>(
+        self,
+        reply: Reply<'_, 'd, P, A>,
+        target: stream::Target,
+    ) {
+        reply
+            .conn
+            .qpack
+            .qpack_encoder
+            .discard_initial(target.stream_id().get());
+    }
+
+    pub(crate) fn send<M: release::Mode, P: rules::Policy, A: rules::Push>(
+        self,
+        reply: Reply<'_, 'd, P, A>,
+        target: stream::Target,
+    ) -> Result<ControlFlow<Self, M::Projection>, conn::Error> {
+        let conn = reply.conn;
+        let stream = target.stream_id().get();
+        let published = conn.qpack.published();
+        let initial = conn.qpack.qpack_encoder.initial(stream);
+        if initial
+            .as_ref()
+            .is_some_and(|head| !head.is_ready(published))
+        {
+            return Ok(ControlFlow::Break(self));
+        }
+        let attempt = match self.trailing {
+            None => match write::Single::new(&mut conn.queues, target, self.fields) {
+                Ok(permit) => Ok(permit.commit::<M>()),
+                Err(rejected) => {
+                    let ([fields], error) = rejected.into_parts();
+                    Err((Self::new(fields, None), error))
+                }
+            },
+            Some(trailing) => {
+                let attempt = match write::Permit::new(
+                    &mut conn.queues,
+                    [(target, self.fields), (target, trailing)],
+                ) {
+                    Ok(permit) => permit
+                        .commit::<M, _>((), |()| ())
+                        .map_err(|(rejected, ())| rejected),
+                    Err(rejected) => Err(rejected),
+                };
+                match attempt {
+                    Ok(retained) => Ok(retained),
+                    Err(rejected) => {
+                        let ([(_, fields), (_, trailing)], error) = rejected.into_parts();
+                        Err((Self::new(fields, Some(trailing)), error))
+                    }
+                }
+            }
+        };
+        match attempt {
+            Ok(retained) => {
+                if let Some(initial) = initial {
+                    initial.publish_initial();
+                }
+                Ok(ControlFlow::Continue(retained))
+            }
+            Err((owner, error)) if conn.queues.is_pressure(&error) => Ok(ControlFlow::Break(owner)),
+            Err((owner, error)) => {
+                drop(initial);
+                owner.discard(Reply::new(conn), target);
+                Err(error)
+            }
+        }
+    }
+}
+
 impl<'a, 'd, P: rules::Policy> Prepared<'a, 'd, P> {
     pub fn open(self) -> Batch<'a, 'd, P> {
         Batch(self.fields.into_batch(None))
@@ -78,13 +162,7 @@ impl<'a, 'd, P: rules::Policy> Prepared<'a, 'd, P> {
     }
 
     pub fn complete(self, body: Data<'d>) -> Batch<'a, 'd, P> {
-        let target = self.fields.target();
-        let entry = Entry::planned(
-            budget::WriteClass::Regular,
-            target,
-            body.plan,
-            Boundary::End,
-        );
+        let entry = Entry::planned(budget::WriteClass::Regular, body.plan, Boundary::End);
         Batch(self.fields.into_batch(Some(entry)))
     }
 
@@ -99,33 +177,36 @@ impl<P: rules::Policy> Batch<'_, '_, P> {
     }
 }
 
-struct Body<T> {
-    target: stream::Target,
-    plan: plan::Plan<T>,
-    boundary: Boundary,
-}
-
-impl<'d, T: output::Payload<'d>> Body<T> {
-    fn into_data(self) -> T {
-        self.plan.into_payload()
+impl<'d, P: rules::Policy> Batch<'_, 'd, P> {
+    pub(crate) fn defer(self) -> Result<Pending<'d>, conn::Error> {
+        self.0.defer()
     }
 }
 
-impl<'d, T: output::Payload<'d>> write::Stage<'d> for Body<T> {
-    fn target(&self) -> stream::Target {
-        self.target
-    }
+pub(crate) fn try_data<'d, T: output::Payload<'d>>(data: T) -> Result<Plan<T>, (conn::Error, T)> {
+    let charge = data.measure();
+    let length = match varint::VarInt::try_from(charge.wire_bytes) {
+        Ok(length) => length,
+        Err(error) => return Err((conn::Error::Length(error), data)),
+    };
+    let prefix = conn::frame_prefix(frame::TYPE_DATA, length);
+    Plan::try_measured(prefix, data, charge).map_err(|rejected| {
+        let (data, error) = rejected.into_parts();
+        (conn::Error::Output(error), data)
+    })
+}
 
+impl<'d, T: output::Payload<'d>> write::Stage<'d> for (Plan<T>, Boundary) {
     fn class(&self) -> budget::WriteClass {
         budget::WriteClass::Regular
     }
 
     fn charge(&self) -> output::WriteCharge {
-        self.plan.charge()
+        self.0.charge()
     }
 
-    fn into_write(self) -> plan::Record<'d> {
-        self.plan.into_write(self.target, self.boundary)
+    fn into_write(self, target: stream::Target) -> plan::Record<'d> {
+        self.0.freeze().into_write(target, self.1)
     }
 }
 
@@ -143,10 +224,10 @@ impl<'a, 'd, P: rules::Policy, A: rules::Push> Reply<'a, 'd, P, A> {
     pub fn finish(self, target: impl Into<stream::Target>) -> Result<hold::Charge, conn::Error> {
         let conn = self.conn;
         let target = target.into();
-        let prefix = conn::frame_prefix(frame::TYPE_DATA, varint::VarInt::ZERO);
+        let prefix = output::WritePrefix::Inline(o3::buffer::storage::inline::Bytes::new());
         let retained = prefix.retention();
-        let entry = Entry::single(budget::WriteClass::Regular, target, prefix, Boundary::End);
-        conn.queues.enqueue(entry)?;
+        let entry = Entry::single(budget::WriteClass::Regular, prefix, Boundary::End);
+        conn.queues.enqueue(target, entry)?;
         Ok(retained)
     }
 
@@ -159,37 +240,40 @@ impl<'a, 'd, P: rules::Policy, A: rules::Push> Reply<'a, 'd, P, A> {
         data: T,
         boundary: Boundary,
     ) -> Result<hold::Charge, (conn::Error, T)> {
+        self.send_with(target.into(), try_data(data)?, boundary)
+            .map_err(|(error, plan)| (error, plan.into_payload()))
+    }
+
+    pub(crate) fn send_chunk(
+        self,
+        target: stream::Target,
+        plan: Plan<Chunk<'d>>,
+    ) -> Result<hold::Charge, (conn::Error, Plan<Chunk<'d>>)> {
+        self.send_with(target, plan, Boundary::More)
+    }
+
+    fn send_with<T: output::Payload<'d>>(
+        self,
+        target: stream::Target,
+        plan: Plan<T>,
+        boundary: Boundary,
+    ) -> Result<hold::Charge, (conn::Error, Plan<T>)> {
         let conn = self.conn;
-        let target = target.into();
-        let charge = data.measure();
-        let length = match varint::VarInt::try_from(charge.wire_bytes) {
-            Ok(length) => length,
-            Err(error) => return Err((conn::Error::Length(error), data)),
-        };
-        let prefix = conn::frame_prefix(frame::TYPE_DATA, length);
-        let (plan, retained) = match plan::Plan::try_measured(prefix, data, charge) {
-            Ok(plan) => plan,
-            Err(rejected) => {
-                let (data, error) = rejected.into_parts();
-                return Err((conn::Error::Output(error), data));
-            }
-        };
-        let body = Body {
-            target,
-            plan,
-            boundary,
-        };
         use write::Single;
-        match Single::new(&mut conn.queues, body) {
-            Ok(permit) => {
-                permit.commit();
-                Ok(retained)
-            }
-            Err(rejected) => {
-                let ([body], error) = rejected.into_parts();
-                Err((error, body.into_data()))
-            }
-        }
+        let ([(plan, _)], error) = match Single::new(&mut conn.queues, target, (plan, boundary)) {
+            Ok(permit) => return Ok(permit.commit::<hold::evidence::On>()),
+            Err(rejected) => rejected.into_parts(),
+        };
+        let error = if conn.queues.is_pressure(&error) {
+            conn.queues
+                .write_budget
+                .check_pending(plan.charge(), budget::WriteClass::Regular)
+                .err()
+                .unwrap_or(error)
+        } else {
+            error
+        };
+        Err((error, plan))
     }
 
     pub fn prepare<S: field::Source>(

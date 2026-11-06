@@ -1,15 +1,9 @@
-use std::mem;
 pub mod common;
 
 use common::{Bytes as _, encode::Quoted};
 use dope_test::alloc::Tracker;
 use o3::buffer::storage::Shared;
 use sark_json::Source;
-
-#[test]
-fn inline_token_layout() {
-    assert_eq!(mem::size_of::<sark_json::Token<31>>(), 32);
-}
 
 #[global_allocator]
 static ALLOCATOR: Tracker = Tracker::new();

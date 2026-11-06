@@ -21,7 +21,7 @@ use sark::{
 };
 use sark_h1::{
     Input, pump,
-    pump::{Body, Egress},
+    pump::Egress,
     route::Driver,
     server::deadline,
     session::{self, Conn, Dispatch as _},
@@ -38,14 +38,9 @@ use sark_h1::wire::{head, output};
 static ALLOCATOR: Tracker = Tracker::new();
 
 fn inline_body(egress: pump::Egress<'_>, want: &[u8], out: &[u8]) -> usize {
-    let prefix = match egress {
-        Egress::Write {
-            prefix,
-            body: Body::None,
-        } => Some(prefix),
-        _ => None,
-    }
-    .expect("inline response expected");
+    let Egress::Inline { prefix } = egress else {
+        panic!("inline response expected");
+    };
     assert!(out[..prefix].ends_with(want));
     prefix
 }
@@ -176,7 +171,7 @@ fn drip_allocations(req: &'static [u8], head: usize) -> usize {
     let mut write = [0_u8; 4096];
 
     let warm = driver.ingest(&mut conn, req, &mut write, head::Connection::KeepAlive);
-    assert!(matches!(warm.state, Ok(Egress::Write { .. })));
+    assert!(matches!(warm.state, Ok(Egress::Inline { .. })));
 
     let (done, allocs) = Tracker::count(|| {
         let prefix = driver.ingest(
@@ -194,7 +189,7 @@ fn drip_allocations(req: &'static [u8], head: usize) -> usize {
                 &mut write,
                 head::Connection::KeepAlive,
             );
-            done = matches!(cycle.state, Ok(Egress::Write { .. }));
+            done = matches!(cycle.state, Ok(Egress::Inline { .. }));
         }
         done
     });
@@ -439,11 +434,7 @@ fn cold_status(wire: &[u8], split: usize) -> u16 {
     let mut status = None;
     for chunk in [&wire[..split], &wire[split..]] {
         let cycle = driver.ingest(&mut conn, chunk, &mut write, head::Connection::KeepAlive);
-        if let Ok(Egress::Write {
-            prefix: 0,
-            body: Body::Static(body),
-        }) = cycle.state
-        {
+        if let Ok(Egress::Static { prefix: 0, body }) = cycle.state {
             let wire = body.as_slice();
             status = Some(
                 if wire.starts_with(b"HTTP/1.1 400") {

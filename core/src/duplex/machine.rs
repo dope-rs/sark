@@ -211,6 +211,8 @@ pub enum Transaction<R, E> {
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum Violation {
     OutputAfterFinish,
+    PrefixCapacity { written: usize, capacity: usize },
+    PrefixPending,
 }
 
 /// Rejection of one orderly peer-input terminal transition.
@@ -296,25 +298,67 @@ impl<'d, D: duplex::Session<'d>> Machine<'d, D> {
     /// Joins at most one session callback to one native admission attempt.
     pub fn transact<R, E>(
         &mut self,
+        output: &mut [u8],
+        scratch: &mut Vec<u8>,
         admit: impl for<'turn> FnOnce(
+            usize,
             admit::Emission<'turn, 'd, D>,
         ) -> admit::Admission<'turn, 'd, D, R, E>,
     ) -> Transaction<R, E> {
-        let staged = match self.phase.action() {
-            Some(staged) => staged,
-            None => match self.stage() {
-                Some(staged) => staged,
-                None => return Transaction::Idle,
-            },
+        let (written, staged) = match self.phase.action() {
+            Some(staged) => (0, staged),
+            None => {
+                let pending = self.pending.is_some();
+                let turn = matches!(self.phase, Phase::Turn);
+                let finish = self.flags & INPUT_FINISH_PENDING != 0;
+                if !pending && !turn && !finish {
+                    return Transaction::Idle;
+                }
+                // Only initial activation precedes FIN; later activation remains queued.
+                let activate = turn && (!finish || self.flags & INITIAL_ACTIVATION != 0);
+                let resume = if turn && (pending || !activate) {
+                    Resume::Turn
+                } else {
+                    Resume::Idle
+                };
+                let (written, action) = if let Some(input) = self.pending.take() {
+                    self.session
+                        .receive(owned::Segments::from(input), output, scratch)
+                } else if activate {
+                    self.flags &= !INITIAL_ACTIVATION;
+                    self.session.activate(output, scratch)
+                } else {
+                    self.flags &= !INPUT_FINISH_PENDING;
+                    self.session.finish(output, scratch)
+                };
+                let (output, dir) = action.into_parts();
+                self.pending = output.and_then(owned::Segments::take);
+                self.phase = Phase::from_action(dir, resume);
+                (
+                    written,
+                    Staged {
+                        directive: dir,
+                        resume,
+                    },
+                )
+            }
         };
-        if matches!(self.output, Output::Finished) && self.pending.is_some() {
+        if written > output.len() {
+            self.terminate();
+            return Transaction::Violation(Violation::PrefixCapacity {
+                written,
+                capacity: output.len(),
+            });
+        }
+        if matches!(self.output, Output::Finished) && (written != 0 || self.pending.is_some()) {
             self.terminate();
             return Transaction::Violation(Violation::OutputAfterFinish);
         }
-        let end = match staged.directive {
-            duplex::Directive::Wait | duplex::Directive::Activate => End::Open,
-            duplex::Directive::FinishOutput => End::FinishOutput,
-            duplex::Directive::FinishSession => End::FinishSession,
+        let end = match (self.output, staged.directive) {
+            (Output::Finished, _)
+            | (Output::Open, duplex::Directive::Wait | duplex::Directive::Activate) => End::Open,
+            (Output::Open, duplex::Directive::FinishOutput) => End::FinishOutput,
+            (Output::Open, duplex::Directive::FinishSession) => End::FinishSession,
         };
         let next = Next::reduce(self.flags, self.output, staged);
         let after = next.after();
@@ -340,8 +384,12 @@ impl<'d, D: duplex::Session<'d>> Machine<'d, D> {
         let admit::Admission {
             decision,
             owner: marker::PhantomData,
-        } = admit(emit);
+        } = admit(written, emit);
         match decision {
+            admit::Decision::Pending { .. } | admit::Decision::Blocked { .. } if written != 0 => {
+                self.terminate();
+                Transaction::Violation(Violation::PrefixPending)
+            }
             admit::Decision::Committed { receipt: proof } => {
                 self.phase = match next.settled {
                     After::Idle => Phase::Idle,
@@ -371,43 +419,11 @@ impl<'d, D: duplex::Session<'d>> Machine<'d, D> {
                 error,
                 remainder: rest,
             } => {
-                self.pending = Some(rest);
+                drop(rest);
                 self.terminate();
                 Transaction::Rejected(error)
             }
         }
-    }
-
-    fn stage(&mut self) -> Option<Staged> {
-        let pending = self.pending.is_some();
-        let turn = matches!(self.phase, Phase::Turn);
-        let finish = self.flags & INPUT_FINISH_PENDING != 0;
-        if !pending && !turn && !finish {
-            return None;
-        }
-        // Only initial activation precedes FIN; later activation remains queued.
-        let activate = turn && (!finish || self.flags & INITIAL_ACTIVATION != 0);
-        let resume = if turn && (pending || !activate) {
-            Resume::Turn
-        } else {
-            Resume::Idle
-        };
-        let action = if let Some(input) = self.pending.take() {
-            self.session.receive(owned::Segments::from(input))
-        } else if activate {
-            self.flags &= !INITIAL_ACTIVATION;
-            self.session.activate()
-        } else {
-            self.flags &= !INPUT_FINISH_PENDING;
-            self.session.finish()
-        };
-        let (output, dir) = action.into_parts();
-        self.pending = output.and_then(owned::Segments::take);
-        self.phase = Phase::from_action(dir, resume);
-        Some(Staged {
-            directive: dir,
-            resume,
-        })
     }
 
     fn terminate(&mut self) {

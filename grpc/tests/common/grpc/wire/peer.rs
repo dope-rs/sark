@@ -69,9 +69,13 @@ impl Peer {
     }
 
     pub fn try_config(addr: SocketAddr, config: config::Config) -> Result<Self, Failure> {
-        let socket = TcpStream::connect(addr).map_err(Failure::Io)?;
+        let socket =
+            TcpStream::connect_timeout(&addr, Duration::from_secs(2)).map_err(Failure::Io)?;
         socket
             .set_read_timeout(Some(Duration::from_secs(2)))
+            .map_err(Failure::Io)?;
+        socket
+            .set_write_timeout(Some(Duration::from_secs(2)))
             .map_err(Failure::Io)?;
         Ok(Self {
             socket,

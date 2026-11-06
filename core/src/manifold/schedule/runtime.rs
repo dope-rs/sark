@@ -23,21 +23,7 @@ pub struct Runtime<K: manifold::raw::Key, T, B: Block> {
     block: marker::PhantomData<cell::Cell<B>>,
 }
 
-#[derive(Clone, Copy)]
-enum Placement {
-    Move(array::Index<LANES>),
-    Block(array::Index<LANES>),
-}
-
-impl Placement {
-    const fn lane(self) -> array::Index<LANES> {
-        match self {
-            Self::Move(lane) | Self::Block(lane) => lane,
-        }
-    }
-}
-
-fn select<B: Block>(next: Activation<B>) -> Option<Placement> {
+fn select<B: Block>(next: Activation<B>) -> Option<(array::Index<LANES>, bool)> {
     match next {
         Activation::Keep => None,
         Activation::Activate {
@@ -45,26 +31,23 @@ fn select<B: Block>(next: Activation<B>) -> Option<Placement> {
             class,
         } => {
             let wait = block.map(Block::wait);
-            let lane = class.blocked_lane(wait);
-            if matches!((class, wait), (WorkClass::Data, Some(Wait::Egress))) {
-                Some(Placement::Block(lane))
-            } else {
-                Some(Placement::Move(lane))
-            }
+            Some((
+                class.blocked_lane(wait),
+                matches!((class, wait), (WorkClass::Data, Some(Wait::Egress))),
+            ))
         }
     }
 }
 
 fn apply<K: manifold::raw::Key, T>(
     entry: entry::Slot<'_, K, T, LANES>,
-    place: Placement,
+    (lane, block_data): (array::Index<LANES>, bool),
     policy: &mut Policy,
 ) {
-    let lane = place.lane();
     if Some(lane) != entry.lane() {
         entry.move_to_back(lane);
     }
-    if matches!(place, Placement::Block(_)) {
+    if block_data {
         policy.block_data();
     }
 }

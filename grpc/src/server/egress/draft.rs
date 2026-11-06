@@ -3,7 +3,7 @@ use core::task::Poll;
 use o3::{
     buffer,
     buffer::storage,
-    depot::{arena::linked::slots, capacity, queue::pool},
+    depot::{arena::linked::slots, capacity},
 };
 use sark_core::{manifold, manifold::schedule};
 
@@ -142,8 +142,8 @@ impl<'a, K: manifold::raw::Key> Draft<'a, K> {
             key,
             position,
             output: match slot {
-                pool::Vacancy::Exhausted => Output::Exhausted,
-                pool::Vacancy::Ready(slot) => Output::Ready {
+                None => Output::Exhausted,
+                Some(slot) => Output::Ready {
                     slot,
                     staged: credits::Staged::new(&mut store.credits, &mut state.charge),
                 },

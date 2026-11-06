@@ -6,12 +6,7 @@ use buffer::Residency as _;
 use common::guard::*;
 use dope_test::alloc::Tracker;
 use sark::http::o3::buffer;
-use sark_h1::{
-    pump::{Body, Egress},
-    route::Driver,
-    session::Conn,
-    wire::head,
-};
+use sark_h1::{pump::Egress, route::Driver, session::Conn, wire::head};
 
 #[global_allocator]
 static ALLOCATOR: Tracker = Tracker::new();
@@ -36,10 +31,7 @@ fn guard_copies_borrowed() {
 
     let (cycle, alloc) =
         Tracker::count(|| driver.ingest(&mut conn, &req, &mut write, head::Connection::KeepAlive));
-    let Egress::Write {
-        body: Body::Shared(body),
-        ..
-    } = cycle
+    let Egress::Shared { body, .. } = cycle
         .state
         .expect("borrowed request head must become one exact shared body")
     else {
@@ -69,10 +61,7 @@ fn guard_moves_buffered() {
 
     let (cycle, alloc) =
         Tracker::count(|| driver.ingest(&mut conn, &[], &mut write, head::Connection::KeepAlive));
-    let Egress::Write {
-        body: Body::Shared(body),
-        ..
-    } = cycle
+    let Egress::Shared { body, .. } = cycle
         .state
         .expect("buffered request head must retain its existing backing")
     else {

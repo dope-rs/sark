@@ -211,11 +211,10 @@ fn run() -> io::Result<ExitCode> {
                     cpu,
                     source,
                     bus,
-                    terminal,
                     handoff,
                 }) => {
                     write(format_args!(
-                        "echo_server: worker {cpu:?}: bus={bus:?}, terminal={terminal:?}, handoff={handoff:?}"
+                        "echo_server: worker {cpu:?}: bus={bus:?}, handoff={handoff:?}"
                     ))?;
                     match source {
                         Setup::Config(error) => write(format_args!("echo_server: configuration: {error:?}")),

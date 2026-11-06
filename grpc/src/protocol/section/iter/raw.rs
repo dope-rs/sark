@@ -8,24 +8,10 @@ use crate::protocol::section::{
     seal,
 };
 
-/// # Safety
-/// Construction and every successor must retain whole fields from the same
-/// immutable admitted owner, including its name and joined-format proofs.
-pub(super) unsafe trait Records<'a>: Sized {
-    fn new(owner: &'a Valid) -> Self;
-    fn next(&mut self) -> Option<(&'a [u8], Value<'a>, Indexing)>;
-}
-
-/// # Safety
-/// Each input and More successor must contain a complete canonical part prefix
-/// and its payload from the same immutable admitted owner.
-pub(super) unsafe trait Joined<'a>: Sized {
-    fn take(self) -> (&'a [u8], Tail<'a>);
-}
-
-// SAFETY: Fields has private storage and only these operations construct it.
-unsafe impl<'a> Records<'a> for Fields<'a> {
-    fn new(owner: &'a Valid) -> Self {
+// Construction and every successor retain whole fields from the same immutable
+// admitted owner, including its name and joined-format proofs.
+impl<'a> Fields<'a> {
+    pub(super) fn new(owner: &'a Valid) -> Self {
         let bytes = owner.bytes();
         // SAFETY: Valid owns the complete immutable seal followed by the field
         // sequence. The borrow prevents its frozen storage from being released.
@@ -34,7 +20,7 @@ unsafe impl<'a> Records<'a> for Fields<'a> {
         })
     }
 
-    fn next(&mut self) -> Option<(&'a [u8], Value<'a>, Indexing)> {
+    pub(super) fn next(&mut self) -> Option<(&'a [u8], Value<'a>, Indexing)> {
         if self.0.is_empty() {
             return None;
         }
@@ -72,9 +58,10 @@ unsafe impl<'a> Records<'a> for Fields<'a> {
     }
 }
 
-// SAFETY: Parts is created only from an admitted joined field or its successor.
-unsafe impl<'a> Joined<'a> for Parts<'a> {
-    fn take(self) -> (&'a [u8], Tail<'a>) {
+// Each input and More successor retain a complete canonical part prefix and its
+// payload from the same immutable admitted owner.
+impl<'a> Parts<'a> {
+    pub(super) fn take(self) -> (&'a [u8], Tail<'a>) {
         let mut value = 0usize;
         let mut shift = 0;
         let mut cursor = self.0.as_ptr();

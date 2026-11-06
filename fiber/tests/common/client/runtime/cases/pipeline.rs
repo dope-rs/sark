@@ -47,6 +47,7 @@ pub fn try_run<R>(
         Flavor::Fixed => pools::Plan::new(addr, config, 1, 2)
             .map_err(Error::FixedPlan)?
             .enter(
+                (),
                 |mut app| {
                     let client = app.handle;
                     app.wait().map_err(Step::Wait)?;
@@ -76,6 +77,7 @@ pub fn try_run<R>(
         Flavor::OnDemand => origins::Plan::new(config, 1, 2, 1)
             .map_err(Error::DynamicPlan)?
             .enter(
+                (),
                 |mut app| {
                     let client = app.handle;
                     let result = (|| {

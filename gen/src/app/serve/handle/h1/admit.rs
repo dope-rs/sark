@@ -13,7 +13,7 @@ pub(in crate::app::serve::handle) fn fiber(
     make: proc_macro2::TokenStream,
 ) -> proc_macro2::TokenStream {
     let generics = &context.plan.spec.state_generics;
-    let identity = &context.exec.task.identity;
+    let identity = &context.exec.identity;
     let variant = task.variant();
     let route = task.route();
     let [n_admit, n_close] = generics.locals(["__admission", "__close"]);
@@ -26,6 +26,11 @@ pub(in crate::app::serve::handle) fn fiber(
     let ns_h1 = &paths.h1;
     use quote::quote;
 
+    let stored = if task.is_stream() {
+        task.make(paths, &n_task)
+    } else {
+        quote!(#ns_fiber::dope_fiber::task::storage::fixed::staged::Task::new(#n_task))
+    };
     quote! {{
         let #n_source = #n_tasks.as_mut();
         move || {
@@ -41,7 +46,7 @@ pub(in crate::app::serve::handle) fn fiber(
                         let #n_task = (#make)((#n_input, #state, #timer));
                         let #n_task = #ns_fiber::dope_fiber::task::storage::fixed::direct::Insert::insert(
                             #n_admit,
-                            #n_task,
+                            #stored,
                         );
                         #n_run.insert(
                             #ns_h1::server::task::runtime::Running::fiber(

@@ -1,5 +1,6 @@
 use std::{cell::Cell, time::Duration};
 
+use crate::common::route::body::OwnedReply as Reply;
 use dope::core::driver::schedule::clock::timer::Timer;
 use dope_fiber::{
     abi::Fiber,
@@ -8,10 +9,6 @@ use dope_fiber::{
 use dope_test::harness::observe::VecCellExt as _;
 use o3::buffer::{segments, storage};
 use sark_http::{payload::response::status, request};
-
-struct Copy;
-struct From;
-const _: (Copy, From) = (Copy, From);
 
 #[derive(Debug)]
 pub enum Failure {
@@ -93,12 +90,6 @@ pub struct Catalog {
 #[sark_fiber::request(ordered)]
 #[json_body(Catalog)]
 pub struct NestedReq {}
-
-#[sark_fiber::response(raw)]
-pub struct Reply {
-    status: status::Code,
-    body: Vec<u8>,
-}
 
 #[sark_fiber::response(raw)]
 pub struct BytesReply<'d> {

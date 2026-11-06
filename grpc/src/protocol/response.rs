@@ -51,14 +51,14 @@ pub struct Head {
 
 impl Head {
     pub fn from_fields<S: Metadata + ?Sized>(fields: &S) -> Result<Self, crate::Status> {
-        let fields = section::Plan::build(fields, rules::Kind::Response)?;
+        let fields = section::build(fields, rules::Kind::Response)?;
         Self::from_owner(fields)
     }
 
     pub(crate) fn from_owner(fields: section::Owner) -> Result<Self, crate::Status> {
         use section::{Valid, View};
 
-        let fields = fields.validate(rules::Kind::Response)?;
+        let fields = Valid::try_from(fields, rules::Kind::Response)?;
         if View::<Valid>::new(&fields).code().is_some()
             || View::<Valid>::new(&fields).is_present(seal::Field::First)
             || View::<Valid>::new(&fields).is_present(seal::Field::Second)

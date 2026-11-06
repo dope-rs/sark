@@ -1,8 +1,4 @@
-use sark_h1::{
-    pump::{Body, Egress},
-    route::Driver,
-    session::Conn,
-};
+use sark_h1::{pump::Egress, route::Driver, session::Conn};
 
 pub mod common;
 
@@ -25,10 +21,7 @@ fn partial_upgrade_rejected() {
             for chunk in [&wire[..split], &wire[split..]] {
                 let cycle =
                     driver.ingest(&mut conn, chunk, &mut write, head::Connection::KeepAlive);
-                if let Ok(Egress::Write {
-                    prefix: 0,
-                    body: Body::Static(body),
-                }) = cycle.state
+                if let Ok(Egress::Static { prefix: 0, body }) = cycle.state
                     && body.as_slice().starts_with(b"HTTP/1.1 400")
                 {
                     continue 'split;

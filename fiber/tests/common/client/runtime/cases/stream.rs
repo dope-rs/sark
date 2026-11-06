@@ -85,7 +85,7 @@ impl<'a> Stream<'a> {
         } = self;
         let output = match flavor {
             Flavor::Fixed => pools::Plan::new(addr, config, capacity.get(), 2).map_err(Error::FixedPlan)?
-                .enter(move |mut app| -> Result<_, Step> {
+                .enter((), move |mut app| -> Result<_, Step> {
                     let client = app.handle;
                     app.wait().map_err(Step::Wait)?;
                     let outcome = (|| match scenario {
@@ -118,7 +118,7 @@ impl<'a> Stream<'a> {
                     Ok::<R, Step>(check(outcome))
                 }, policy, done).map_err(Error::Fixed)?.map_err(Error::Step)?,
             Flavor::OnDemand => origins::Plan::new(config, capacity.get(), 2, 1).map_err(Error::DynamicPlan)?
-                .enter(move |mut app| -> Result<_, Step> {
+                .enter((), move |mut app| -> Result<_, Step> {
                     let client = app.handle;
                     let outcome = (|| match scenario {
                         Scenario::Interleave { first, second, gap } => {

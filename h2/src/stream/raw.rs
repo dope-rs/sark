@@ -10,7 +10,7 @@ const unsafe fn restore(raw: u64) -> Key {
     Key {
         id: Nonzero(Id::from_wire((raw >> 32) as u32)),
         // SAFETY: The retained Key's physical slot excludes the sentinel.
-        slot: unsafe { bounded::raw::Proof::assume(raw as u32) }.retain(),
+        slot: unsafe { bounded::raw::u32(raw as u32) },
     }
 }
 

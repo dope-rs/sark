@@ -210,8 +210,10 @@ impl<O> Head<O, proof::Peer> {
     }
 }
 
-impl<P> From<Head<packed::Decoded, P>> for Head<Bytes, P> {
-    fn from(head: Head<packed::Decoded, P>) -> Self {
+impl<P, const PREFIX: usize> From<Head<packed::Decoded<o3::buffer::pool::Span, PREFIX>, P>>
+    for Head<Bytes, P>
+{
+    fn from(head: Head<packed::Decoded<o3::buffer::pool::Span, PREFIX>, P>) -> Self {
         Self {
             owner: head.owner.into_bytes(),
             target: head.target,

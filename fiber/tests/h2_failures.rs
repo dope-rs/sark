@@ -1,6 +1,6 @@
 pub mod common;
 
-use std::time::Duration;
+use std::{io::Read as _, time::Duration};
 
 use common::h2::recover;
 use common::h2::{
@@ -206,83 +206,121 @@ fn pre_fin_credit() {
 
 #[test]
 fn reset_reuses_slot() {
-    let harness = Pair::bind().expect("H2 harness");
-    let config = CONFIG;
-    harness
-        .check(
-            move |context, listener| {
-                Server::new(config, 1, State::default()).try_run(
-                    context,
-                    listener,
-                    mode::Disabled,
-                    recover,
-                    |result| result.expect("H2 execution"),
-                )
-            },
-            |address| {
-                let (mut socket, mut client) =
-                    Peer::try_connect(address, Duration::from_secs(3)).expect("H2 peer connection");
-                let first = client
-                    .streams()
-                    .headers()
-                    .request(
-                        Request::new(b"/blocked")
-                            .try_headers()
-                            .expect("valid request fields"),
-                        Boundary::End,
-                    )
-                    .expect("start first blocked task");
-                let full = client
-                    .streams()
-                    .headers()
-                    .request(
-                        Request::new(b"/blocked")
-                            .try_headers()
-                            .expect("valid request fields"),
-                        Boundary::End,
-                    )
-                    .expect("start saturated task");
-                Peer::new(&mut socket, &mut client)
-                    .try_flush()
-                    .expect("H2 peer flush");
-                assert_eq!(
+    for streaming in [false, true] {
+        let harness = Pair::bind().expect("H2 harness");
+        let config = CONFIG;
+        harness
+            .check(
+                move |context, listener| {
+                    let server = Server::new(config, 1, State::default());
+                    server
+                        .try_run(context, listener, mode::Disabled, recover, |result| {
+                            result.expect("H2 execution")
+                        })
+                        .map(|output| {
+                            if streaming {
+                                assert!(server.state.stream.polls.get() >= 2);
+                                assert_eq!(server.state.stream.drops.get(), 1);
+                                assert!(!server.state.stream.moved.get());
+                            }
+                            output
+                        })
+                },
+                |address| {
+                    let (mut socket, mut client) =
+                        Peer::try_connect(address, Duration::from_secs(3))
+                            .expect("H2 peer connection");
+                    let first = client
+                        .streams()
+                        .headers()
+                        .request(
+                            Request::new(if streaming { b"/stream" } else { b"/blocked" })
+                                .try_headers()
+                                .expect("valid request fields"),
+                            Boundary::End,
+                        )
+                        .expect("start first blocked task");
+                    if streaming {
+                        use sark_h2::conn::event::Event;
+                        Peer::new(&mut socket, &mut client)
+                            .try_flush()
+                            .expect("stream request");
+                        let mut received = Vec::new();
+                        let mut input = [0; 4096];
+                        while received.is_empty() {
+                            let count = socket.read(&mut input).expect("first stream chunk");
+                            assert_ne!(count, 0);
+                            client.ingress().ingest(&input[..count]).expect("ingress");
+                            while let Some(event) = client.ingress().poll_event() {
+                                if let Event::Data {
+                                    stream_id,
+                                    data,
+                                    boundary,
+                                } = event
+                                {
+                                    assert_eq!(stream_id, first);
+                                    assert_eq!(boundary, Boundary::More);
+                                    data.for_each(|part| received.extend_from_slice(part));
+                                }
+                            }
+                            Peer::new(&mut socket, &mut client)
+                                .try_flush()
+                                .expect("control");
+                        }
+                        assert_eq!(received, b"held");
+                    }
+                    let full = client
+                        .streams()
+                        .headers()
+                        .request(
+                            Request::new(b"/blocked")
+                                .try_headers()
+                                .expect("valid request fields"),
+                            Boundary::End,
+                        )
+                        .expect("start saturated task");
                     Peer::new(&mut socket, &mut client)
-                        .try_reset(full)
-                        .expect("H2 peer reset"),
-                    ErrorCode::RefusedStream,
-                );
+                        .try_flush()
+                        .expect("H2 peer flush");
+                    assert_eq!(
+                        Peer::new(&mut socket, &mut client)
+                            .try_reset(full)
+                            .expect("H2 peer reset"),
+                        ErrorCode::RefusedStream,
+                    );
 
-                let first = client
-                    .status()
-                    .stream_key(first)
-                    .expect("active blocked stream");
-                client
-                    .streams()
-                    .try_cancel(first, ErrorCode::Cancel)
-                    .expect("cancel exact blocked task");
-                let next = client
-                    .streams()
-                    .headers()
-                    .request(
-                        Request::new(b"/quick")
-                            .try_headers()
-                            .expect("valid request fields"),
-                        Boundary::End,
-                    )
-                    .expect("reuse task slot");
-                Peer::new(&mut socket, &mut client)
-                    .try_flush()
-                    .expect("H2 peer flush");
-                let (_, response) = Peer::new(&mut socket, &mut client)
-                    .try_response(next)
-                    .expect("H2 peer response");
-                assert_eq!(response, b"quick");
-            },
-            |result| {
-                result.expect("H2 setup");
-            },
-        )
-        .expect("H2 exact cancellation runtime");
+                    let first = client
+                        .status()
+                        .stream_key(first)
+                        .expect("active blocked stream");
+                    client
+                        .streams()
+                        .try_cancel(first, ErrorCode::Cancel)
+                        .expect("cancel exact blocked task");
+                    let next = client
+                        .streams()
+                        .headers()
+                        .request(
+                            Request::new(b"/quick")
+                                .try_headers()
+                                .expect("valid request fields"),
+                            Boundary::End,
+                        )
+                        .expect("reuse task slot");
+                    Peer::new(&mut socket, &mut client)
+                        .try_flush()
+                        .expect("H2 peer flush");
+                    let (_, response) = Peer::new(&mut socket, &mut client)
+                        .try_response(next)
+                        .expect("H2 peer response");
+                    assert_eq!(response, b"quick");
+                },
+                |result| {
+                    result.expect("H2 setup");
+                },
+            )
+            .expect("H2 exact cancellation runtime");
+    }
 }
 
 #[test]

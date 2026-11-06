@@ -145,20 +145,18 @@ impl Atom {
                 Ordering::Equal => Ok(literal.finish()),
                 Ordering::Less | Ordering::Greater => Err(Error::Invalid),
             },
-            Self::Number { state, value } => match state {
-                NumberState::Zero
-                | NumberState::Integer
-                | NumberState::Fraction
-                | NumberState::ExponentDigits => match value {
-                    Some(value) => Ok(ValueKind::Unsigned(value)),
-                    None => Ok(ValueKind::Number),
-                },
-                NumberState::Start
-                | NumberState::Minus
-                | NumberState::Dot
-                | NumberState::Exponent
-                | NumberState::ExponentSign => Err(Error::Invalid),
+            Self::Number {
+                state:
+                    NumberState::Zero
+                    | NumberState::Integer
+                    | NumberState::Fraction
+                    | NumberState::ExponentDigits,
+                value,
+            } => match value {
+                Some(value) => Ok(ValueKind::Unsigned(value)),
+                None => Ok(ValueKind::Number),
             },
+            Self::Number { .. } => Err(Error::Invalid),
         }
     }
 }

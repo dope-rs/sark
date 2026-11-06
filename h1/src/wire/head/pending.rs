@@ -1,5 +1,6 @@
 use std::num::NonZero;
 
+use o3::buffer::write::Sink as _;
 use sark_core::route;
 use sark_http::{
     field::head,
@@ -13,15 +14,16 @@ use sark_http::{
 };
 
 use crate::wire::{
-    head::{Block, Error, Scanned, line},
+    head::{Admission, Block, Error, Gzip, Parsed, Scanned, line},
     recv,
 };
 
 type Source = Owned<{ recv::BODY_CAPACITY }>;
 
-pub(crate) struct Partial<'input, H> {
+pub(crate) struct Partial<'input, H, A = ()> {
     pub(super) input: &'input [u8],
     pub(super) headers: H,
+    pub(super) admission: A,
     pub(super) fields: Fields,
     pub(super) flags: head::Flags,
     pub(super) count: usize,
@@ -29,38 +31,37 @@ pub(crate) struct Partial<'input, H> {
 }
 
 /// Typed completed fields and append-only ownership of the uncompleted head.
-pub(crate) struct Pending<H> {
+pub(crate) struct Pending<H, A = ()> {
     source: scan::State<Source>,
     headers: H,
+    admission: A,
     fields: Fields,
     flags: head::Flags,
     coding: Coding,
 }
 
-pub(crate) enum Progress<H> {
-    Pending(Pending<H>),
-    Complete(Source, Block<H>),
+pub(crate) enum Progress<H, A: Admission = ()> {
+    Pending(Pending<H, A>),
+    Complete(Source, Gzip<H, A>),
 }
 
-impl<H> Partial<'_, H> {
+impl<H, A: Admission> Partial<'_, H, A> {
     pub(crate) fn retain<R>(
         self,
         request: Request<'_>,
         coding: Coding,
         limit: usize,
-    ) -> Result<Pending<H>, Error<R>>
+    ) -> Result<Pending<H, A>, Error<R>>
     where
         R: route::Schema<RawHeaders = H>,
     {
         let input = self.input;
-        if input.len() > recv::HEAD_CAPACITY {
-            return Err(Error::Length { len: input.len() });
-        }
         let capacity = NonZero::new(input.len()).unwrap_or(NonZero::<usize>::MIN);
         let source = request.try_snapshot(capacity).map_err(Error::Storage)?;
         Pending::try_new(
             source,
             self.headers,
+            self.admission,
             self.fields,
             self.flags,
             coding,
@@ -70,10 +71,11 @@ impl<H> Partial<'_, H> {
     }
 }
 
-impl<H> Pending<H> {
+impl<H, A: Admission> Pending<H, A> {
     fn try_new<R: route::Schema<RawHeaders = H>>(
         source: Source,
         headers: H,
+        admission: A,
         fields: Fields,
         flags: head::Flags,
         coding: Coding,
@@ -85,6 +87,7 @@ impl<H> Pending<H> {
         Ok(Self {
             source,
             headers,
+            admission,
             fields,
             flags,
             coding,
@@ -95,12 +98,12 @@ impl<H> Pending<H> {
         source: Source,
         coding: Coding,
         limit: usize,
-    ) -> Result<Progress<H>, Error<R>>
+    ) -> Result<Progress<H, A>, Error<R>>
     where
         R: route::Schema<RawHeaders = H>,
         H: Default,
     {
-        let parsed = Block::scan::<R>(
+        let parsed = Block::<H, A>::scan::<R>(
             source.as_ref(),
             source.request().end(),
             limit,
@@ -108,23 +111,32 @@ impl<H> Pending<H> {
             source.request().version(),
         )?;
         match parsed {
-            Scanned::Complete(block) => Ok(Progress::Complete(source, block)),
+            Scanned::Complete(block) => {
+                let coding = block.coding();
+                let head = Parsed::from_block::<R>(block, &source.request())?;
+                Ok(Progress::Complete(source, Gzip { head, coding }))
+            }
             Scanned::Pending(partial) => {
-                if partial.input.len() > recv::HEAD_CAPACITY {
-                    return Err(Error::Length {
-                        len: partial.input.len(),
-                    });
-                }
                 let Partial {
                     input: _,
                     headers,
+                    admission,
                     fields,
                     flags,
                     count,
                     pos,
                 } = partial;
-                Self::try_new(source, headers, fields, flags, coding, (pos, count), limit)
-                    .map(Progress::Pending)
+                Self::try_new(
+                    source,
+                    headers,
+                    admission,
+                    fields,
+                    flags,
+                    coding,
+                    (pos, count),
+                    limit,
+                )
+                .map(Progress::Pending)
             }
         }
     }
@@ -133,14 +145,18 @@ impl<H> Pending<H> {
         self.source.as_ref().len()
     }
 
-    pub(crate) fn advance<R>(mut self, incoming: &[u8]) -> Result<Progress<H>, Error<R>>
+    pub(crate) fn advance<R>(mut self, incoming: &[u8]) -> Result<Progress<H, A>, Error<R>>
     where
         R: route::Schema<RawHeaders = H>,
     {
-        self.source.try_extend(incoming).map_err(Error::Storage)?;
+        let prior = self.len();
+        let maximum = A::MAX_BYTES.min(recv::HEAD_CAPACITY);
+        let (prefix, tail) = incoming.split_at(incoming.len().min(maximum.saturating_sub(prior)));
+        self.source.try_extend(prefix).map_err(Error::Storage)?;
         let Self {
             source,
             mut headers,
+            mut admission,
             mut fields,
             mut flags,
             coding,
@@ -148,8 +164,9 @@ impl<H> Pending<H> {
         let version = source.source().request().version();
         let progress = source
             .advance(|entry| {
-                line::apply::<R>(
+                line::apply::<R, A>(
                     &mut headers,
+                    &mut admission,
                     &mut fields,
                     &mut flags,
                     coding,
@@ -163,35 +180,32 @@ impl<H> Pending<H> {
             })?;
         match progress {
             scan::Progress::More(source) => {
-                if source.as_ref().len() > recv::HEAD_CAPACITY {
+                if !tail.is_empty() {
                     return Err(Error::Length {
-                        len: source.as_ref().len(),
+                        len: prior.saturating_add(incoming.len()),
                     });
                 }
                 Ok(Progress::Pending(Self {
                     source,
                     headers,
+                    admission,
                     fields,
                     flags,
                     coding,
                 }))
             }
             scan::Progress::Complete(complete) => {
-                let (source, _, len) = complete.into_parts();
-                if len.get() as usize > recv::HEAD_CAPACITY {
-                    return Err(Error::Length {
-                        len: len.get() as usize,
-                    });
-                }
-                Ok(Progress::Complete(
-                    source,
-                    Block {
-                        headers,
-                        fields,
-                        flags,
-                        len,
-                    },
-                ))
+                let (mut source, _, len) = complete.into_parts();
+                let block = Block {
+                    headers,
+                    admission,
+                    fields,
+                    len,
+                };
+                let coding = block.coding();
+                let head = Parsed::from_block::<R>(block, &source.request())?;
+                source.write_slice(tail).map_err(Error::Storage)?;
+                Ok(Progress::Complete(source, Gzip { head, coding }))
             }
         }
     }

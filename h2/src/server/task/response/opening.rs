@@ -1,18 +1,17 @@
 use std::ops;
 
 use dope::{core::driver::route::Identity, manifold::network::listener::conn::Id};
-use o3::buffer::hold;
 use sark_core::{
     decode::request,
     duplex, life,
     manifold::{schedule, schedule::typed, stream::Boundary, task::app::Runtime},
 };
-use sark_http::payload::response::status::Code;
+use sark_http::{field::metadata::section::rules, payload::response::status::Code};
 
 use crate::{
     conn,
     server::{
-        response::{Head, Receipt, Status},
+        response::{Handoff, Head, Status},
         state,
         task::{
             self, response,
@@ -22,66 +21,68 @@ use crate::{
     stream,
 };
 
-pub(super) struct Opening<'a, 'b, 'd, ID: Identity, R, M>
-where
-    R: Runtime<'d>,
-{
-    pub(super) driver: &'a mut response::Driver<'b, 'd, ID, R, M>,
-}
-
-impl<'d, ID: Identity + 'd, R, M> Opening<'_, '_, 'd, ID, R, M>
+impl<'d, ID: Identity + 'd, R, M, F, P> response::Driver<'_, 'd, ID, R, M, F, P>
 where
     R: Runtime<'d, Target = task::Target<'d, ID>>,
     M: state::Transitions<Id<'d, ID>>,
+    M::Retention: Handoff,
+    F: rules::Policy,
+    P: FnMut(Id<'d, ID>, stream::Key, &dyn std::fmt::Debug),
 {
     pub(super) fn open(
-        self,
+        &mut self,
         stream: stream::Key,
         request: input::Request<'d, R::Prepared>,
     ) -> Progress<'d, R> {
-        let app = self.driver.router.as_ref().get_ref();
+        let app = self.router.as_ref().get_ref();
         let input = match request.into_body() {
             request::Body::Open(request) => match duplex::Application::try_open(app, request) {
-                Ok((session, body)) => input::Input::open(session, body),
-                Err((error, ..)) => return self.reject(stream, error),
+                Ok((session, body)) => input::Input::open(session, input::Buf::new(body)),
+                Err((error, ..)) => return self.reject_open(stream, error),
             },
             request::Body::Finished(request) => match duplex::Application::try_open(app, request) {
-                Ok((session, body)) => input::Input::finished(session, body),
-                Err((error, ..)) => return self.reject(stream, error),
+                Ok((session, body)) => input::Input::finished(session, input::Buf::new(body)),
+                Err((error, ..)) => return self.reject_open(stream, error),
             },
         };
         let head = Status::new(Code::OK)
-            .prepare(self.driver.connection, stream, Boundary::More)
-            .map_err(conn::Error::code)?;
-        self.resume(stream, head, input)
+            .prepare(self.connection, stream, Boundary::More)
+            .map_err(|error| self.error(stream, error))?;
+        self.connection.hold_duplex(stream);
+        self.resume_open(stream, head, input)
     }
 
-    pub(super) fn resume(
-        mut self,
+    pub(super) fn resume_open(
+        &mut self,
         stream: stream::Key,
         head: Head<'d>,
         input: input::Input<'d, R::Duplex>,
     ) -> Progress<'d, R> {
-        match head
-            .drive(self.driver.connection)
-            .map_err(conn::Error::code)?
-        {
+        let progress = match head.drive(self.connection) {
+            Ok(progress) => progress,
+            Err(error) => {
+                drop(input);
+                self.connection.release_duplex(stream);
+                return Err(self.error(stream, error));
+            }
+        };
+        match progress {
             ops::ControlFlow::Break(head) => Ok(typed::Control::Control {
                 value: response::Response::DuplexHead { head, input },
-                turn: Self::blocked(),
+                turn: schedule::Turn::Blocked(conn::DataBlock::Egress),
             }),
             ops::ControlFlow::Continue(receipt) => {
-                self.committed(stream, receipt);
+                drop(receipt.observe(self.mode, task::identify(self.connection_id, stream)));
                 Ok(typed::Control::Data {
                     value: response::Data::Duplex { input },
-                    turn: Self::progress(),
+                    turn: schedule::Turn::Progress,
                 })
             }
         }
     }
 
-    fn reject(
-        mut self,
+    fn reject_open(
+        &mut self,
         stream: stream::Key,
         error: duplex::OpenError<R::Error<'d>>,
     ) -> Progress<'d, R> {
@@ -91,53 +92,28 @@ where
             duplex::OpenError::Unsupported => Code::INTERNAL_SERVER_ERROR,
         };
         let head = Status::new(status)
-            .prepare(self.driver.connection, stream, Boundary::End)
-            .map_err(conn::Error::code)?;
+            .prepare(self.connection, stream, Boundary::End)
+            .map_err(|error| self.error(stream, error))?;
         match head
-            .drive(self.driver.connection)
-            .map_err(conn::Error::code)?
+            .drive(self.connection)
+            .map_err(|error| self.error(stream, error))?
         {
             ops::ControlFlow::Break(head) => Ok(typed::Control::Control {
                 value: response::Response::Head {
                     head,
-                    outcome: life::Outcome::Rejected,
+                    state: sark_core::manifold::task::response::State::Complete(
+                        life::Outcome::Rejected,
+                    ),
                     count: response::Count::Pending,
                 },
-                turn: Self::blocked(),
+                turn: schedule::Turn::Blocked(conn::DataBlock::Egress),
             }),
             ops::ControlFlow::Continue(receipt) => {
-                self.committed(stream, receipt);
-                task::identify(self.driver.connection_id, stream)
-                    .retire(self.driver.mode, life::Outcome::Rejected);
+                let exchange = task::identify(self.connection_id, stream);
+                drop(receipt.observe(self.mode, exchange));
+                exchange.retire(self.mode, life::Outcome::Rejected);
                 Ok(typed::Control::Complete)
             }
         }
-    }
-
-    fn committed(&mut self, stream: stream::Key, receipt: Receipt<'d>) {
-        let (_, linked, copied) = receipt.into_parts();
-        let exchange = task::identify(self.driver.connection_id, stream);
-        if let Some(copied) = copied {
-            self.driver.mode.observe(life::Event::ResponseBodyCopied {
-                exchange,
-                read: copied.read,
-                written: copied.written,
-                cause: copied.cause,
-            });
-        }
-        self.driver.mode.observe(life::Event::ResponseCommitted {
-            exchange,
-            body_bytes: 0,
-            charge: hold::Charge::default(),
-            linked,
-        });
-    }
-
-    fn blocked() -> schedule::Turn<conn::DataBlock> {
-        schedule::Turn::Blocked(conn::DataBlock::Egress)
-    }
-
-    fn progress() -> schedule::Turn<conn::DataBlock> {
-        schedule::Turn::Progress
     }
 }

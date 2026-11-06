@@ -5,7 +5,7 @@ use sark_http::{
 };
 
 use crate::wire::{
-    output::sink::{Error, Gzip, Headers},
+    output::sink::{Error, Headers, gzip::FIELDS},
     response::{
         self, consts,
         framing::{self, Framing as _},
@@ -58,8 +58,7 @@ impl<'out> Emitted<'out> {
     }
 
     pub(super) fn gzip(mut self, date: Headers<'_>, len: usize) -> Result<usize, response::Error> {
-        let fields: [field::Entry<'_>; 0] = [];
-        let _: () = self.out.fields(&Gzip(&fields))?;
+        self.out.group(&FIELDS, ())?;
         framing::Length(len).write(&mut self.out)?;
         self.out
             .end_head(date.response, date.value, date.server, date.dated)?;

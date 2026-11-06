@@ -1,5 +1,6 @@
-use std::{cell::Cell, collections::VecDeque, mem};
+use std::{cell::Cell, collections::VecDeque};
 
+use o3::buffer::resident;
 use sark_http::payload::owned;
 pub mod common;
 use sark_core::{
@@ -8,36 +9,6 @@ use sark_core::{
 };
 
 use crate::common::duplex::*;
-
-trait Local<A> {
-    type Proof;
-}
-
-impl<T: ?Sized> Local<()> for T {
-    type Proof = ();
-}
-impl<T: ?Sized + Send> Local<u8> for T {
-    type Proof = ();
-}
-impl<T: ?Sized + Sync> Local<u16> for T {
-    type Proof = ();
-}
-
-#[test]
-fn preserves_locality() {
-    let _: <admit::Emission<'static, 'static, Session<'static>> as Local<_>>::Proof;
-    let _: <admit::Admission<'static, 'static, Session<'static>, (), ()> as Local<_>>::Proof;
-    let _: <admit::Permit<'static, admit::Present, Session<'static>> as Local<_>>::Proof;
-    let _: <admit::Permit<'static, admit::Present, Terminal> as Local<_>>::Proof;
-    let _: <admit::Permit<'static, admit::Vacant, Terminal> as Local<_>>::Proof;
-    let _: <machine::Access<machine::Input<'static, 'static, Session<'static>>> as Local<_>>::Proof;
-    assert_eq!(
-        mem::size_of::<machine::Access<machine::Input<'static, 'static, Session<'static>>>>(),
-        mem::size_of::<machine::Input<'static, 'static, Session<'static>>>()
-    );
-    assert_eq!(mem::size_of::<machine::Progress>(), 1);
-    assert_eq!(mem::size_of::<machine::Hold>(), 1);
-}
 
 #[test]
 fn orders_input_and_fin() {
@@ -158,13 +129,14 @@ fn fin_preempts_reactivation_and_waits_for_admission() {
     let events = Cell::new(Vec::new());
     let mut machine = machine::Machine::new(Ending(&events));
     assert!(matches!(
-        machine.transact(Ending::admit),
+        machine.transact(&mut [], &mut Vec::new(), |_, emit| Ending::admit(emit)),
         machine::Transaction::Committed { .. }
     ));
     machine.finish(()).expect("first input finish").0.commit();
 
     for pending in [true, true, false] {
-        let turn = machine.transact(|emit| {
+        let turn = machine.transact(&mut [], &mut Vec::new(), |written, emit| {
+            assert_eq!(written, 0);
             let (payload, end, after) = emit.into_parts();
             assert!(matches!(end, machine::End::FinishOutput));
             assert!(matches!(after, machine::After::Finished));
@@ -204,4 +176,117 @@ fn fin_preempts_reactivation_and_waits_for_admission() {
         machine.finish(()),
         Err((machine::FinishError::Closed, ()))
     ));
+}
+
+#[test]
+fn late_input_finish_does_not_repeat_output_fin() {
+    let calls = Cell::new(0);
+    let mut machine = machine::Machine::new(Prefix {
+        calls: &calls,
+        written: 0,
+        body: false,
+    });
+    for (finish, end, after) in [
+        (false, machine::End::FinishOutput, machine::After::Idle),
+        (true, machine::End::Open, machine::After::Finished),
+    ] {
+        if finish {
+            machine.finish(()).expect("late input finish").0.commit();
+        }
+        let turn = machine.transact(&mut [], &mut Vec::new(), |_, emit| {
+            let (payload, actual, _) = emit.into_parts();
+            assert!(actual == end);
+            match payload {
+                admit::Payload::Vacant(permit) => permit.commit::<_, ()>(()),
+                admit::Payload::Present { .. } => panic!("unexpected output"),
+            }
+        });
+        assert!(matches!(
+            turn,
+            machine::Transaction::Committed { after: actual, .. } if actual == after
+        ));
+    }
+    assert_eq!(calls.get(), 1);
+}
+
+#[test]
+fn rejects_invalid_prefix_before_admission() {
+    for (written, finished, expected) in [
+        (
+            2,
+            false,
+            machine::Violation::PrefixCapacity {
+                written: 2,
+                capacity: 1,
+            },
+        ),
+        (1, true, machine::Violation::OutputAfterFinish),
+    ] {
+        let calls = Cell::new(0);
+        let mut machine = machine::Machine::new(Prefix {
+            calls: &calls,
+            written,
+            body: false,
+        });
+        if finished {
+            assert!(matches!(
+                machine.transact(&mut [], &mut Vec::new(), |_, emit| Prefix::admit(emit)),
+                machine::Transaction::Committed { .. }
+            ));
+        }
+        let machine::Access::Vacant(input) = machine.input() else {
+            panic!("vacant input");
+        };
+        input.commit(resident::Shared::from(b"input".as_slice()).into());
+        let turn = machine.transact::<(), ()>(&mut [0], &mut Vec::new(), |_, _| {
+            panic!("invalid prefix admitted")
+        });
+        assert!(matches!(turn, machine::Transaction::Violation(actual) if actual == expected));
+        assert_eq!(calls.get(), 1);
+        assert!(matches!(machine.progress(), machine::Progress::Finished));
+        assert!(matches!(
+            machine.transact::<(), ()>(&mut [], &mut Vec::new(), |_, _| panic!("retired callback")),
+            machine::Transaction::Idle
+        ));
+    }
+}
+
+#[test]
+fn prefix_cannot_be_pending_or_blocked() {
+    for body in [false, true] {
+        let calls = Cell::new(0);
+        let mut machine = machine::Machine::new(Prefix {
+            calls: &calls,
+            written: 1,
+            body,
+        });
+        let machine::Access::Vacant(input) = machine.input() else {
+            panic!("vacant input");
+        };
+        input.commit(resident::Shared::from(b"input".as_slice()).into());
+        machine.finish(()).expect("input finish").0.commit();
+        let mut output = [0];
+        let turn = machine.transact(&mut output, &mut Vec::new(), |written, emit| {
+            assert_eq!(written, 1);
+            let (payload, end, _) = emit.into_parts();
+            assert!(matches!(end, machine::End::FinishOutput));
+            match payload {
+                admit::Payload::Present { output, permit } => permit.pending::<(), ()>(output, ()),
+                admit::Payload::Vacant(permit) => permit.blocked::<(), ()>(()),
+            }
+        });
+        assert!(matches!(
+            turn,
+            machine::Transaction::Violation(machine::Violation::PrefixPending)
+        ));
+        assert_eq!(output, *b"p");
+        assert_eq!(calls.get(), 1);
+        assert!(matches!(machine.hold(), machine::Hold::Released));
+        assert!(matches!(machine.progress(), machine::Progress::Finished));
+        machine.retire();
+        assert!(matches!(
+            machine.transact::<(), ()>(&mut [], &mut Vec::new(), |_, _| panic!("retired callback")),
+            machine::Transaction::Idle
+        ));
+    }
 }

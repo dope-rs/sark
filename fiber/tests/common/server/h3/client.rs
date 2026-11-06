@@ -19,6 +19,7 @@ use sark_h3::{
     conn::{
         event::{Completion, Event, Role},
         io::Step,
+        options::plan,
     },
     manifold::{Notification, Session},
     stream::Owned,
@@ -28,10 +29,7 @@ use sark_http::{
     payload::compress::dynamic::hash,
 };
 
-use crate::common::server::h3::{
-    observer::protocol,
-    proof::{DIALER, Dispatch, Failure, Result, Shared, connection_key},
-};
+use crate::common::server::h3::proof::{DIALER, Dispatch, Failure, Result, Shared, connection_key};
 
 pub(crate) struct Link<'d> {
     pub(crate) h3: Session<'d>,
@@ -276,8 +274,10 @@ impl<Q> Client<'_, Q> {
                                     if proof.requests[slot].dispatch == Dispatch::AfterGoAway
                                         && let Some(pending) =
                                             proof.requests.iter().position(|request| {
-                                                request.dispatch == Dispatch::Initial
-                                                    && request.data.defer_tail
+                                                matches!(
+                                                    request.dispatch,
+                                                    Dispatch::Established | Dispatch::Initial
+                                                ) && request.data.defer_tail
                                             })
                                     {
                                         tail = proof.tail(pending)?;
@@ -296,14 +296,16 @@ impl<Q> Client<'_, Q> {
                                 {
                                     proof.replies.error_ok[slot] = true;
                                 }
-                                None if proof.cancel.request.is_none() => {
-                                    proof.fail(Failure::Scenario(format!(
-                                        "stream {} failed with H3 code {}",
-                                        stream.get(),
-                                        code.get()
-                                    )))
-                                }
-                                None => {}
+                                None if proof.cancel.issued
+                                    && slot == 0
+                                    && code.get()
+                                        == sark_h3::frame::ErrorCode::RequestCancelled
+                                            .wire_value() => {}
+                                None => proof.fail(Failure::Scenario(format!(
+                                    "stream {} failed with H3 code {}",
+                                    stream.get(),
+                                    code.get()
+                                ))),
                             }
                         }
                         _ => {}
@@ -311,6 +313,12 @@ impl<Q> Client<'_, Q> {
                     if let Completion::End(stream) = done {
                         let mut proof = self.proof.write()?;
                         if let Some(slot) = proof.slot(connection_key(link.handle), stream) {
+                            if proof.requests[slot].expect.error.is_some() {
+                                return Err(Failure::Scenario(format!(
+                                    "stream {} ended successfully instead of failing",
+                                    stream.get()
+                                )));
+                            }
                             if !proof.replies.finished[slot] {
                                 proof.replies.finished[slot] = true;
                                 proof.replies.completion_order.push(slot);
@@ -409,7 +417,14 @@ where
         event: create::Event<'_, Self, DIALER, B, resident::Shared<'d>, id::Driver<'d>>,
     ) -> create::Decision<Link<'d>> {
         let (this, _, handle) = event.into_parts();
-        let h3 = protocol()
+        let protocol = match this.proof.read() {
+            Ok(proof) => proof.network.protocol.clone(),
+            Err(error) => {
+                this.proof.fail(error);
+                return create::Decision::Reject;
+            }
+        };
+        let h3 = plan::Config::new(protocol)
             .and_then(|protocol| Session::from_seed(Role::Client, protocol, this.seed.clone()));
         match h3 {
             Ok(h3) => create::Decision::Install(Link {
@@ -434,8 +449,14 @@ where
     fn established(event: ready::Event<'_, Self, DIALER, B, resident::Shared<'d>, id::Driver<'d>>) {
         let (this, mut slot, _, _) = event.into();
         let (link, conn) = slot.split();
-        if let Err(error) = link.h3.egress().start_scope(conn) {
-            this.proof.fail(Failure::Flush(error));
+        if let Err(error) = link
+            .h3
+            .egress()
+            .start_scope(conn)
+            .map_err(Failure::Flush)
+            .and_then(|_| link.try_send(&this.proof, conn, Dispatch::Established))
+        {
+            this.proof.fail(error);
         }
     }
 }
@@ -450,6 +471,22 @@ where
     ) -> mux::Disposition {
         let (this, mut slot, _, event, _) = event.into();
         let (link, conn) = slot.split();
+        if let dope_quic::conn::stream::Event::Readable { id } = event.event() {
+            match this.proof.read() {
+                Ok(proof)
+                    if proof
+                        .slot(connection_key(link.handle), id)
+                        .is_some_and(|slot| !proof.requests[slot].read_response) =>
+                {
+                    return mux::Disposition::Defer;
+                }
+                Err(error) => {
+                    this.proof.fail(error);
+                    return mux::Disposition::Accept;
+                }
+                _ => {}
+            }
+        }
         if let Err(error) = this.try_stream(link, conn, Notification::resident(event)) {
             this.proof.fail(error);
         }

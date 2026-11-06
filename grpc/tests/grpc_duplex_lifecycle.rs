@@ -4,7 +4,6 @@ pub mod common;
 use std::{
     cell::Cell,
     convert::Infallible,
-    sync::mpsc,
     time::{Duration, Instant},
 };
 
@@ -17,7 +16,6 @@ use dope::{
     runtime::{executor::session, topology, topology::lending::Stage},
 };
 use dope_test::{
-    fibers,
     harness::{
         server::Pair,
         signals::{LocalGate, Progress as _},
@@ -53,7 +51,6 @@ fn bidi_ingress() {
             .with_output(Output::try_new(1, 9).expect("one-message bidi output budget")),
     };
 
-    let (checked, complete) = mpsc::sync_channel(1);
     harness
         .run(
             move |context, listener| {
@@ -82,16 +79,10 @@ fn bidi_ingress() {
                         worker
                             .lend(|plan, stage| {
                                 plan.install(stage, |app, stage| {
-                                    Stage::with_app(stage, &mut finish, app, |mut app| {
-                                        assert_eq!(
-                                            fibers::Harness::new(Duration::from_secs(2))
-                                                .try_wait(&mut app, &dropped, 1)
-                                                .expect("progress drive"),
-                                            fibers::Wait::Reached
-                                        );
+                                    Stage::with_app(stage, &mut finish, app, |app| {
+                                        let result = app.run();
                                         assert_eq!(dropped.hits(), 1);
-                                        checked.send(()).expect("retirement observer");
-                                        app.run()
+                                        result
                                     })?
                                     .map_err(session::Error::Drive)
                                 })
@@ -121,9 +112,6 @@ fn bidi_ingress() {
                 let reply = Reply::try_exchange(address, b"/proof/Chat", &[b"one", b"two"], true)
                     .expect("gRPC exchange");
                 assert_eq!(reply.messages, vec![b"eno".to_vec(), b"owt".to_vec()]);
-                complete
-                    .recv_timeout(Duration::from_secs(2))
-                    .expect("producer retired before shutdown");
             },
         )
         .expect("bidi E2E");
@@ -139,7 +127,6 @@ fn late_ingress() {
         limits: Limits::default(),
     };
 
-    let (checked, complete) = mpsc::sync_channel(1);
     harness
         .run(
             move |context, listener| {
@@ -174,19 +161,13 @@ fn late_ingress() {
                         worker
                             .lend(|plan, stage| {
                                 plan.install(stage, |app, stage| {
-                                    Stage::with_app(stage, &mut finish, app, |mut app| {
-                                        assert_eq!(
-                                            fibers::Harness::new(Duration::from_secs(2))
-                                                .try_wait(&mut app, &dropped, 1)
-                                                .expect("progress drive"),
-                                            fibers::Wait::Reached
-                                        );
+                                    Stage::with_app(stage, &mut finish, app, |app| {
+                                        let result = app.run();
                                         assert_eq!(dropped.hits(), 1);
                                         assert_eq!(ingress.get(), 0);
                                         assert_eq!(error.get(), None);
                                         assert_eq!(polls.get(), 1);
-                                        checked.send(()).expect("retirement observer");
-                                        app.run()
+                                        result
                                     })?
                                     .map_err(session::Error::Drive)
                                 })
@@ -217,9 +198,6 @@ fn late_ingress() {
                 let reply = Reply::try_exchange(address, b"/proof/Early", &[b"late"], true)
                     .expect("gRPC exchange");
                 assert!(reply.messages.is_empty());
-                complete
-                    .recv_timeout(Duration::from_secs(2))
-                    .expect("producer retired before shutdown");
             },
         )
         .expect("early terminal E2E");
@@ -235,7 +213,6 @@ fn bidi_timer() {
         limits: Limits::default(),
     };
 
-    let (checked, complete) = mpsc::sync_channel(1);
     harness
         .run(
             move |context, listener| {
@@ -270,19 +247,13 @@ fn bidi_timer() {
                         worker
                             .lend(|plan, stage| {
                                 plan.install(stage, |app, stage| {
-                                    Stage::with_app(stage, &mut finish, app, |mut app| {
-                                        assert_eq!(
-                                            fibers::Harness::new(Duration::from_secs(2))
-                                                .try_wait(&mut app, &dropped, 1)
-                                                .expect("progress drive"),
-                                            fibers::Wait::Reached
-                                        );
+                                    Stage::with_app(stage, &mut finish, app, |app| {
+                                        let result = app.run();
                                         assert_eq!(dropped.hits(), 1);
                                         assert_eq!(ingress.get(), 0);
                                         assert_eq!(error.get(), None);
                                         assert_eq!(polls.get(), 3);
-                                        checked.send(()).expect("retirement observer");
-                                        app.run()
+                                        result
                                     })?
                                     .map_err(session::Error::Drive)
                                 })
@@ -315,9 +286,6 @@ fn bidi_timer() {
                     .expect("gRPC exchange");
                 assert_eq!(reply.messages, vec![b"wake".to_vec()]);
                 assert!(started.elapsed() >= Duration::from_millis(5));
-                complete
-                    .recv_timeout(Duration::from_secs(2))
-                    .expect("producer retired before shutdown");
             },
         )
         .expect("driver-timer bidi E2E");

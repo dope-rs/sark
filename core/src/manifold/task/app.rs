@@ -2,14 +2,10 @@ use std::{convert::Infallible, fmt, mem, pin};
 
 use app::step;
 use dope_core::driver;
-use driver::{
-    retained,
-    schedule::{app, ready},
-};
-use o3::alloc;
+use driver::schedule::{app, ready};
 use ready::task::owner;
 use request::admit;
-use sark_http::payload::owned;
+use sark_http::{payload::owned, request::Id};
 
 use crate::{
     decode,
@@ -18,12 +14,6 @@ use crate::{
     manifold::task::{self, Target, response},
     route,
 };
-
-#[derive(Debug)]
-pub enum BindError<P = Infallible> {
-    Prepare(P),
-    Allocation(alloc::Error),
-}
 
 /// Binds generated task storage to one driver domain.
 pub trait Bind<'d>: Sized
@@ -45,7 +35,7 @@ pub enum Turn<'turn, 'd, C = ()> {
     Deferred,
     Pending(step::Receipt<'turn, 'd>),
     PendingReady(step::Receipt<'turn, 'd>),
-    Complete(C, step::Receipt<'turn, 'd>),
+    Ready(C, step::Receipt<'turn, 'd>),
 }
 
 #[derive(Clone, Copy, Eq, PartialEq)]
@@ -55,15 +45,16 @@ pub enum Wake {
 }
 
 /// Linear monomorphized handoff into one protocol response adapter.
-pub trait Handoff<'d, T: Target, C: response::Completion<'d>>: Sized {
-    type Complete;
+pub trait Handoff<'d, T: Target, F: response::Completion<'d>>: Sized {
+    type Ready;
 
     fn pending(self, target: T);
 
-    fn complete<R, A, P>(self, target: T, output: response::Output<'d, R, A>) -> Self::Complete
-    where
-        R: route::Task<'d, A>,
-        P: response::Pack<'d, R, A, C>;
+    /// Transfers the target's sole fixed response after releasing its runtime slot and quota.
+    /// This is mutually exclusive with `ready(Event::Head)` for the same target.
+    fn complete(self, target: T, output: F) -> Self::Ready;
+
+    fn ready<E: fmt::Debug>(self, target: T, event: response::Event<'d, E>) -> Self::Ready;
 }
 
 /// Allocation-free task execution selected independently of the protocol.
@@ -73,9 +64,9 @@ pub trait Runtime<'d>:
     + Sized
 {
     type Task;
+    type Fixed: response::Completion<'d>;
     type Build: crate::body::Push<'d>;
     type Target: Target + 'd;
-    type Completion: response::Completion<'d>;
     type Admission;
 
     /// Exact unadmitted reason for one owner-lane registration.
@@ -125,13 +116,21 @@ pub trait Runtime<'d>:
         parent: ready::Target<'d>,
     ) -> Result<Self::Task, task::Error<Self::Admission>>;
 
-    fn drive<'turn, H: Handoff<'d, Self::Target, Self::Completion>>(
+    fn drive<'turn, H: Handoff<'d, Self::Target, Self::Fixed>>(
         self: pin::Pin<&mut Self>,
         scope: owner::Scope<Self::Target>,
         work: app::Work<'turn, 'd>,
-        driver: &mut retained::Context<'_, '_, 'd>,
+        driver: &mut driver::Context<'_, 'd>,
         sink: H,
-    ) -> Turn<'turn, 'd, H::Complete>;
+    ) -> Turn<'turn, 'd, H::Ready>;
+
+    fn emit<E: decode::Streaming<'d, 'd>>(
+        self: pin::Pin<&mut Self>,
+        task: &Self::Task,
+        make: impl FnOnce(Id<'d>) -> E,
+    ) -> response::Access<response::Prepared<'d, E>>;
+
+    fn resume(self: pin::Pin<&mut Self>, task: &Self::Task) -> response::Access<()>;
 
     fn has_work(self: pin::Pin<&Self>, scope: owner::Scope<Self::Target>) -> bool;
 

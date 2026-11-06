@@ -1,4 +1,4 @@
-use core::{fmt, num};
+use core::num;
 
 use decoder::state;
 use o3::{
@@ -30,12 +30,6 @@ pub(crate) enum Insertion {
 pub enum DeltaSign {
     Positive,
     Negative,
-}
-
-impl fmt::Display for DeltaSign {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        fmt::Debug::fmt(self, f)
-    }
 }
 
 #[derive(Clone, Copy, Default, PartialEq, Eq)]

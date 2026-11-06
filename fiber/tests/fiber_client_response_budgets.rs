@@ -1,18 +1,24 @@
 use common::client::recover;
-use common::client::runtime::{peer, peer::Conn};
-use dope::core::{driver::life::recovery, io::Reclaimed};
+use common::client::runtime::{cases::Flavor, origins, peer, peer::Conn, pools};
+use dope::{
+    core::{driver::life::recovery, io::Reclaimed},
+    manifold::client::attempt::queue::mailbox,
+    runtime::executor::drive,
+};
 use dope_test::harness::peer::{AcceptScript, Stream};
 pub mod common;
 
-use std::{str, sync::mpsc, time::Duration};
+use std::{convert::Infallible, str, time::Duration};
 
 use common::client::{config::FLAVORS, retry::AGGRESSIVE, runtime::cases::request::Request};
 use dope_fiber::{
+    BlockOn as _,
+    abi::Pending,
     reply::usage::{Capacity, Resource},
     task::time::budget,
 };
 use o3::buffer::{hold, storage::provided::account};
-use sark_client::{Error, Safety, capacity, protocol, timeout};
+use sark_client::{Error, Failure, Safety, capacity, protocol, timeout};
 use sark_fiber::client::config::{Config, Stage};
 use sark_http::method::Method;
 
@@ -262,96 +268,98 @@ fn wire_memory_at_ingress() {
 #[test]
 fn staging_ceiling_closes() {
     const HEAD_LIMIT: usize = 16 * 1024;
-    const WATCHDOG: Duration = Duration::from_secs(10);
 
     for flavor in FLAVORS {
-        let (open_tx, open_rx) = mpsc::channel();
-        let (done_tx, done_rx) = mpsc::channel();
         AcceptScript::with(
             move |acceptor| {
                 use common::client::runtime::peer::Error;
-                let result = (|| {
-                    let conn_io = acceptor.accept().map_err(Error::Io)?;
-                    let mut conn = Conn::new(&conn_io);
-                    conn.try_request()?.expect("client request");
+                let conn_io = acceptor.accept().map_err(Error::Io)?;
+                let mut conn = Conn::new(&conn_io);
+                conn.try_request()?.expect("client request");
 
-                    let mut prefix = b"HTTP/1.1 200 OK\r\nX-Fill: ".to_vec();
-                    prefix.resize(HEAD_LIMIT, b'x');
-                    conn.write_all(&prefix).map_err(Error::Io)?;
-                    open_rx
-                        .recv_timeout(WATCHDOG)
-                        .expect("client must fail at the exact staging ceiling");
-                    let mut byte = [0];
-                    match conn.read(&mut byte) {
-                        Ok(0) => Ok(()),
-                        Ok(read) => {
-                            assert_eq!(read, 0, "client wrote after its complete request");
-                            Ok(())
-                        }
-                        Err(dope_test::harness::peer::Error::Syscall(error))
-                            if error.is_aborted() || error.is_reset() =>
-                        {
-                            Ok(())
-                        }
-                        Err(error) => Err(Error::Io(error)),
+                let mut prefix = b"HTTP/1.1 200 OK\r\nX-Fill: ".to_vec();
+                prefix.resize(HEAD_LIMIT, b'x');
+                conn.write_all(&prefix).map_err(Error::Io)?;
+                match peer::closed(&mut conn) {
+                    Err(Error::Io(dope_test::harness::peer::Error::Syscall(error)))
+                        if error.is_aborted() || error.is_reset() =>
+                    {
+                        Ok(())
                     }
-                })();
-                done_tx.send(()).expect("staging peer completion receiver");
-                result
+                    result => result,
+                }
             },
             |server| {
                 let config = Config::new(server.addr().to_string())
                     .head_limit(HEAD_LIMIT)
                     .wire_memory(HEAD_LIMIT * 2)
                     .queue_bytes(HEAD_LIMIT * 2);
-                let outcome = Request::new(
-                    flavor,
-                    &server.addr().to_string(),
-                    config,
-                    Method::GET,
-                    "/",
-                    &[],
-                    &[],
-                )
-                .try_run(
-                    |outcome| {
-                        let error = (outcome)
-                            .err()
-                            .expect("an incomplete head cannot grow beyond the staging ceiling");
-                        (
-                            matches!(
-                                error.cause(),
-                                Error::Capacity(capacity::Error::ResponseStaging)
-                            ),
-                            error.safety(),
-                            format!("{error:?}"),
-                        )
-                    },
-                    recovery::Policy::new(
-                        |event| std::assert_matches!(event, Reclaimed::Shutdown),
-                        recover,
+                let mut checked = false;
+                let mut check = |outcome: Result<_, Failure<Infallible, mailbox::Error<'_>>>| {
+                    let error = outcome
+                        .err()
+                        .expect("an incomplete head cannot grow beyond the staging ceiling");
+                    assert!(
+                        matches!(
+                            error.cause(),
+                            Error::Capacity(capacity::Error::ResponseStaging)
+                        ) && error.safety() == Safety::PossiblyCommitted,
+                        "{error:?}",
+                    );
+                    checked = true;
+                };
+                let policy = recovery::Policy::new(
+                    |event| std::assert_matches!(
+                        event,
+                        Reclaimed::Shutdown | Reclaimed::Socket {
+                            result: Ok(()),
+                            close: None,
+                            ..
+                        }
                     ),
-                    |result| result.expect("client execution"),
-                )
-                .expect("HTTP request execution");
-                let release = open_tx.send(());
-                let done = done_rx.recv_timeout(WATCHDOG);
-                let server = match done {
-                    Ok(()) => Ok(server),
-                    Err(cause) => Err((cause, server.stop())),
+                    recover,
+                );
+                match flavor {
+                    Flavor::Fixed => pools::Plan::new(server.addr(), config, 1, 1)
+                        .expect("fixed client plan")
+                        .enter(
+                            server.completion(),
+                            |mut app| {
+                                app.wait().expect("active endpoint");
+                                let client = app.handle;
+                                let result = app.app.block_on(dope_fiber::fiber!('_ => async move {
+                                    check(client.collect_with(Method::GET, "/", &[], &[])
+                                        .await.map_err(Failure::widen));
+                                    Pending::<()>::new().await;
+                                }));
+                                std::assert_matches!(result, Err(drive::Error::Shutdown));
+                            },
+                            policy,
+                            |result| result.expect("client execution"),
+                        )
+                        .expect("fixed HTTP request execution"),
+                    Flavor::OnDemand => origins::Plan::new(config, 1, 1, 1)
+                        .expect("on-demand client plan")
+                        .enter(
+                            server.completion(),
+                            |mut app| {
+                                let client = app.handle;
+                                let result = app.app.block_on(dope_fiber::fiber!('_ => async move {
+                                    check(client.collect_with(Method::GET, "/", &[], &[]).await);
+                                    Pending::<()>::new().await;
+                                }));
+                                std::assert_matches!(result, Err(drive::Error::Shutdown));
+                            },
+                            policy,
+                            |result| result.expect("client execution"),
+                        )
+                        .expect("on-demand HTTP request execution"),
                 }
-                .expect("peer must observe client closure after the staging failure");
+                assert!(checked, "the exact staging failure was observed");
                 server
                     .finish()
                     .expect("peer thread")
                     .expect("the exact staging ceiling must close the client connection");
-                release.expect("client must finish before the staging peer watchdog");
-
-                assert!(
-                    (outcome.0, outcome.1) == (true, Safety::PossiblyCommitted),
-                    "{}",
-                    outcome.2
-                );
             },
         )
         .expect("spawn staging-capacity peer");

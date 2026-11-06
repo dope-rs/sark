@@ -195,7 +195,7 @@ where
         };
         let sent = ready.send()?;
         if matches!(sent.state, stream::State::Closed) {
-            self.conn.state.active_streams.remove_key(key);
+            self.conn.state.active_streams.remove_key(key, false);
         }
         Ok(conn::DataOutcome::sent(sent.length.into_usize()))
     }

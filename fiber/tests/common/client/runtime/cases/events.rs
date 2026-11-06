@@ -44,6 +44,7 @@ impl<'a> Reader<'a> {
         let output = pools::Plan::new(addr, config, 1, 1)
             .map_err(Error::FixedPlan)?
             .enter(
+                (),
                 move |mut app| -> Result<_, Step> {
                     let client = app.handle;
                     app.wait().map_err(Step::Wait)?;

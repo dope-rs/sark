@@ -138,25 +138,34 @@ fn sent_completes_drain() {
 
 #[test]
 fn deadline_completes_drain() {
-    for blocked in [false, true] {
+    for (blocked, streaming) in [(false, false), (true, false), (true, true)] {
         let timer =
             config::Config::try_new(Phase::Total, Duration::from_millis(500)).expect("deadline");
         Pair::bind()
             .expect("server")
             .check(
                 move |context, listener| {
-                    let state = if blocked {
+                    let state = if blocked && !streaming {
                         State::try_body().expect("large response owner")
                     } else {
                         State::default()
                     };
-                    Server::new(CONFIG, 8, state)
-                        .with_life(handler::Lifetime::graceful(
+                    let server =
+                        Server::new(CONFIG, 8, state).with_life(handler::Lifetime::graceful(
                             Positive::from_millis::<250>(),
                             Positive::from_secs::<10>(),
-                        ))
+                        ));
+                    server
                         .try_run(context, listener, timer, recover, |result| {
                             result.expect("H2 execution")
+                        })
+                        .map(|output| {
+                            if streaming {
+                                assert_eq!(server.state.stream.polls.get(), 2);
+                                assert_eq!(server.state.stream.drops.get(), 1);
+                                assert!(!server.state.stream.moved.get());
+                            }
+                            output
                         })
                 },
                 |address| {
@@ -175,9 +184,15 @@ fn deadline_completes_drain() {
                         .streams()
                         .headers()
                         .request(
-                            Request::new(if blocked { b"/unbounded" } else { b"/nested" })
-                                .try_headers()
-                                .expect("valid request fields"),
+                            Request::new(if streaming {
+                                b"/stream"
+                            } else if blocked {
+                                b"/unbounded"
+                            } else {
+                                b"/nested"
+                            })
+                            .try_headers()
+                            .expect("valid request fields"),
                             if blocked {
                                 Boundary::End
                             } else {

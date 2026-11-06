@@ -15,7 +15,7 @@ use dope::{
         },
     },
     net::{
-        link::{egress, egress::data::Inline, event, pool::change::opening},
+        link::{egress, egress::data::Inline, pool::change::opening},
         wire::Identity,
     },
 };
@@ -198,7 +198,7 @@ impl<'d> session::Failed<'d> for Session<'_> {
     fn failed(
         &mut self,
         _: attempt::Completion<'_, 'd, KeyTag<0>>,
-        cause: event::ConnectFault,
+        cause: attempt::ConnectFault,
         _: &mut driver::Context<'_, 'd>,
     ) {
         self.audit.fail(Failure::Connect(cause));

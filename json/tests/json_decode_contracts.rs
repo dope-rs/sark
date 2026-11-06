@@ -4,14 +4,18 @@ use std::num::NonZero;
 
 use common::{
     Bytes as _,
+    members::OwnedItem,
     schema::{
-        DepthNode, Escaped, Exact, INVALID_IGNORED_VALUES, Optional, Ordered,
-        PLAIN_SEQUENCE_ESCAPED, RAW_SEQUENCE, RawSequence, SAME_LENGTH_NAMES, SEQUENCE, Scalars,
-        Sequence,
+        DepthNode, Escaped, Exact, INVALID_IGNORED_VALUES, NON_STRING_FIELDS, NULL_TEXT_DUPLICATE,
+        NullableText, Optional, Ordered, PLAIN_SEQUENCE_ESCAPED, RAW_SEQUENCE, RawSequence,
+        SAME_LENGTH_NAMES, SEQUENCE, Scalars, Sequence,
     },
 };
 use dope_test::alloc::Tracker;
-use o3::{alloc, buffer::storage::Shared};
+use o3::{
+    alloc,
+    buffer::{resident, storage::Shared},
+};
 use sark_json::{
     Error,
     parsing::{self, Decode, Request},
@@ -48,6 +52,24 @@ fn ignored_value_grammar() {
             <Scalars as Request>::decode(input),
             Err(parsing::Error::Parse(Error::Invalid)),
         ));
+    }
+}
+
+#[test]
+fn string_rejection_does_not_allocate() {
+    for input in NON_STRING_FIELDS {
+        let mut decoder = Decoder::<OwnedItem>::from_scoped(vec![resident::Shared::from(input)])
+            .expect("decoder");
+        let error = Tracker::fail_after(0, || {
+            loop {
+                match decoder.poll(NonZero::<usize>::MIN) {
+                    Progress::Pending => {}
+                    Progress::Failed(error) => break error,
+                    _ => panic!("invalid text"),
+                }
+            }
+        });
+        std::assert_matches!(error, parsing::Error::Parse(Error::Invalid));
     }
 }
 
@@ -98,6 +120,13 @@ fn optional_presence() {
             Progress::Ready(Optional { value }) if value == expected
         ));
     }
+    let mut decoder =
+        Decoder::<NullableText>::from_scoped(vec![resident::Shared::from(NULL_TEXT_DUPLICATE)])
+            .expect("nullable decoder");
+    assert!(matches!(
+        Tracker::fail_after(0, || decoder.poll(NonZero::<usize>::MAX)),
+        Progress::Ready(NullableText { name: None }),
+    ));
 }
 
 #[test]

@@ -66,7 +66,7 @@ impl<'a, 'd> Scoped<'a, 'd> {
         data: resident::Shared<'d>,
     ) -> Result<(), capacity::Error> {
         match self.segments.try_push(data) {
-            Ok(segments::Push::Loaded | segments::Push::Discarded(_)) => Ok(()),
+            Ok(_) => Ok(()),
             Err(rejected) => Err(capacity::Error::ResponseSegments(rejected.discard())),
         }
     }

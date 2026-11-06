@@ -58,6 +58,10 @@ pub(super) fn methods<'view, 'source, 'spec>(
     let methods = ctx.plan.entries.iter().enumerate().map(|(index, plan)| {
         let method = quote::format_ident!("__complete_head_{index}");
         let route = &plan.entry.route;
+        let admission = plan
+            .entry
+            .upgrade
+            .then(|| quote::quote!(, #ns_h1::route::duplex::Upgrade));
         let coding = match plan.mode {
             serve::Mode::Sync { .. } => quote::quote!(#ns_http::h1::head::request::Coding),
             serve::Mode::Duplex { .. } | serve::Mode::Fiber { .. } | serve::Mode::Stream { .. } => {
@@ -74,12 +78,13 @@ pub(super) fn methods<'view, 'source, 'spec>(
             Source::Resumed,
         );
         quote::quote! {
+            #[inline(always)]
             fn #method<#head_lt, #req_lt>(
                 self: ::core::pin::Pin<&mut Self>,
                 #v_link: #ns_fiber::dope::manifold::network::listener::conn::Id<'d, #g_id>,
                 #v_permit: #ns_h1::session::Permit,
                 #n_shead: #ns_h1::wire::parsing::framing::Head<
-                    #head_lt, #req_lt, #route, #coding,
+                    #head_lt, #req_lt, #route, #coding #admission,
                 >,
                 #v_write: &mut [::core::primitive::u8],
                 #v_date: &[::core::primitive::u8; 29],
@@ -124,7 +129,6 @@ pub(super) fn emit<'view, 'source, 'spec>(
     let [v_result, v_parsed, v_wait] = symbols.locals(["outcome", "parsed", "pending"]);
     let [v_permit, v_resp, v_state] = symbols.locals(["permit", "response", "state"]);
     let [v_this, v_write] = symbols.locals(["this", "write"]);
-    let l_env = ctx.plan.spec.state_generics.lifetime("env");
     let ns_core = &paths.core;
     let ns_fiber = &paths.fiber;
     let ns_h1 = &paths.h1;
@@ -133,7 +137,7 @@ pub(super) fn emit<'view, 'source, 'spec>(
 
     let spec = ctx.plan.spec;
     let state = spec.state.ty();
-    let ident = &ctx.exec.task.identity;
+    let ident = &ctx.exec.identity;
     let cont = &h1.continuations;
     use syn::Index;
     let Some(plan) = ctx.plan.route(index) else {
@@ -144,6 +148,10 @@ pub(super) fn emit<'view, 'source, 'spec>(
         .into_compile_error();
     };
     let route = &plan.entry.route;
+    let admission = plan
+        .entry
+        .upgrade
+        .then(|| quote!(, #ns_h1::wire::parsing::framing::Plain, #ns_h1::route::duplex::Upgrade));
     let slot = &plan.head;
     let heads = cont.head();
     let head = &plan.pending_variant;
@@ -177,7 +185,7 @@ pub(super) fn emit<'view, 'source, 'spec>(
             ),
             serve::Mode::Duplex { .. } | serve::Mode::Fiber { .. } | serve::Mode::Stream { .. } => {
                 (
-                    quote!(#ns_h1::wire::parsing::framing::PendingHead::<#route>::try_start),
+                    quote!(#ns_h1::wire::parsing::framing::PendingHead::<#route #admission>::try_start),
                     quote!(),
                 )
             }
@@ -203,7 +211,7 @@ pub(super) fn emit<'view, 'source, 'spec>(
     }
     let method = plan.entry.method.http_token(paths);
     let guard = terminal::guard(paths, &ctx.plan.spec.state_generics, &method, slot, state);
-    let header = matches!(source, Source::Borrowed).then(|| {
+    if matches!(source, Source::Borrowed) {
         let parse = match &plan.mode {
             serve::Mode::Sync { .. } => quote! {
                 #ns_h1::wire::parsing::framing::Head::<
@@ -213,11 +221,12 @@ pub(super) fn emit<'view, 'source, 'spec>(
             },
             serve::Mode::Duplex { .. } | serve::Mode::Fiber { .. } | serve::Mode::Stream { .. } => {
                 quote! {
-                    #ns_h1::wire::parsing::framing::Head::<#route>::start(#found)
+                    #ns_h1::wire::parsing::framing::Head::<#route #admission>::start(#found)
                 }
             }
         };
-        quote! {
+        let complete = complete(index, &ctx.plan.spec.state_generics, &quote!(self));
+        return quote! {
             let #n_shead = match #parse {
                 ::core::result::Result::Ok(
                     #ns_h1::wire::parsing::framing::HeadProgress::Complete(#v_head),
@@ -231,20 +240,28 @@ pub(super) fn emit<'view, 'source, 'spec>(
                     };
                 }
                 ::core::result::Result::Err(#v_error) => {
+                    let mut #v_this = self.as_mut().project();
                     return { #failed };
                 }
             };
-        }
-    });
+            return #complete;
+        };
+    }
     let (prepare, invoke) = match &plan.mode {
         serve::Mode::Duplex { family } => {
-            let wrap = h1.duplex.wrap(*family, quote!(#v_sess));
+            let wrap = h1.duplex.wrap(*family, false, quote!(#v_sess));
+            let (method, write) = if plan.entry.upgrade {
+                (quote!(upgrade::<#route, _, _>), quote!(#v_write,))
+            } else {
+                (quote!(dispatch::<#route, _, _>), quote!())
+            };
             (
                 quote!(),
                 quote! {
-                    #ns_h1::route::duplex::Endpoint::new(#v_state, #v_conn).dispatch::<#route, _, _>(
+                    #ns_h1::route::duplex::Endpoint::new(#v_state, #v_conn).#method(
                         #v_permit,
                         #n_shead,
+                        #write
                         |#v_sess| #wrap,
                         #ns_core::life::Mode::body(#v_this.#f_life, #v_exch),
                     )
@@ -434,11 +451,29 @@ pub(super) fn emit<'view, 'source, 'spec>(
     };
     let name = cont.name();
     let pending = cont.route();
+    let body = if plan.entry.upgrade {
+        quote! {
+            #ns_h1::session::RouteOutcome::AwaitBody { pending: #v_wait, .. } => match #v_wait {},
+        }
+    } else {
+        quote! {
+            #ns_h1::session::RouteOutcome::AwaitBody {
+                state: #v_state,
+                expectation: #v_expect,
+                pending: #v_wait,
+            } => #ns_h1::session::RouteOutcome::AwaitBody {
+                state: #v_state,
+                expectation: #v_expect,
+                pending: #name {
+                    exchange: #v_exch,
+                    route: #pending::#head(#v_wait),
+                },
+            },
+        }
+    };
     quote! {
-        #header
         let #n_resp = #n_shead.response();
         #prepare
-        let #v_state: &#l_env #state = #v_state;
         #guard
         #open
         let #v_result = #invoke;
@@ -455,18 +490,7 @@ pub(super) fn emit<'view, 'source, 'spec>(
                 }
                 #ns_h1::session::RouteOutcome::Outcome(#v_value)
             }
-            #ns_h1::session::RouteOutcome::AwaitBody {
-                state: #v_state,
-                expectation: #v_expect,
-                pending: #v_wait,
-            } => #ns_h1::session::RouteOutcome::AwaitBody {
-                state: #v_state,
-                expectation: #v_expect,
-                pending: #name {
-                    exchange: #v_exch,
-                    route: #pending::#head(#v_wait),
-                },
-            },
+            #body
         };
     }
 }

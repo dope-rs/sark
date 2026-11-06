@@ -10,7 +10,7 @@ pub(super) fn build<'view, 'source>(
     routes: &'view routes::Routes,
     methods: &proc_macro2::TokenStream,
 ) -> proc_macro2::TokenStream {
-    let [f_life, f_state] = ["lifecycle", "state"].map(local);
+    let f_life = local("lifecycle");
     let symbols = &types.names.generics;
     let [v_route, v_tag, v_trans] = symbols.locals(["route", "tag", "transport"]);
     let [v_body, v_charge, v_conn] = symbols.locals(["body", "charge", "conn"]);
@@ -19,9 +19,8 @@ pub(super) fn build<'view, 'source>(
     let [v_method, v_result, v_parsed] = symbols.locals(["method", "outcome", "parsed"]);
     let [v_wait, v_permit, v_ready] = symbols.locals(["pending", "permit", "ready"]);
     let [v_resp, v_run, v_source] = symbols.locals(["response", "runtime", "source"]);
-    let [v_stamp, v_state, v_this] = symbols.locals(["stamp", "state", "this"]);
+    let [v_stamp, v_this] = symbols.locals(["stamp", "this"]);
     let [v_write, v_routes] = symbols.locals(["write", "routes"]);
-    let l_env = types.names.generics.lifetime("env");
     let [g_id, g_mode] = types.names.generics.idents(["__ID", "__M"]);
     let ns_core = &paths.core;
     let ns_fiber = &paths.fiber;
@@ -29,7 +28,6 @@ pub(super) fn build<'view, 'source>(
     let ns_http = &paths.http;
     use quote::quote;
 
-    let state = types.names.state_ty;
     let core = types.names.core_ident;
     let args = &types.generics;
     let bounds = &args.bounds;
@@ -51,17 +49,21 @@ pub(super) fn build<'view, 'source>(
     let data = &routes.body_data_arms;
     let work = &routes.body_work_arms;
     let pending = &routes.pending_resume_arms;
-    let settle_pending = quote! {
-        #v_wait.route = match #v_route {
-            ::core::result::Result::Ok(#v_route) => #v_route,
-            ::core::result::Result::Err(#v_error) => {
-                #ns_core::life::sequence::Mode::reject(#v_this.#f_life, #v_exch);
-                return ::core::result::Result::Err(#v_error);
-            }
-        };
-        ::core::result::Result::Ok(#v_wait)
-    };
+    let settle_pending = (!data.is_empty()).then(|| {
+        quote! {
+            #v_wait.route = match #v_route {
+                ::core::result::Result::Ok(#v_route) => #v_route,
+                ::core::result::Result::Err(#v_error) => {
+                    #ns_core::life::sequence::Mode::reject(#v_this.#f_life, #v_exch);
+                    return ::core::result::Result::Err(#v_error);
+                }
+            };
+            ::core::result::Result::Ok(#v_wait)
+        }
+    });
     let finish = &routes.finish_arms;
+    let finish_body =
+        (!finish.is_empty()).then(|| quote!(self.__finish_body(#v_exch, #v_result, #v_run)));
     let ready = &proto.connections.ready;
     let head = &proto.connections.head;
     let resume = &routes.resume_arms;
@@ -125,14 +127,6 @@ pub(super) fn build<'view, 'source>(
         }
     };
     let consume = [false, true].map(|owned| {
-        let receiver = if owned {
-            quote!(mut self)
-        } else {
-            quote!(self)
-        };
-        let project = (!owned).then(|| quote!(let mut #v_this = self.project();));
-        let on_error = owned.then(|| quote!(let mut #v_this = self.as_mut().project();));
-        let state = (!owned).then(|| quote!(let #v_state: &#l_env #state = *#v_this.#f_state;));
         let (method, input, parse, complete, pending, error, reject, retained, body) = if owned {
             (
                 quote!(consume_line),
@@ -160,7 +154,7 @@ pub(super) fn build<'view, 'source>(
         };
         quote! {
             fn #method(
-                #receiver: ::core::pin::Pin<&mut Self>,
+                mut self: ::core::pin::Pin<&mut Self>,
                 #v_link: #ns_fiber::dope::manifold::network::listener::conn::Id<'d, #g_id>,
                 #v_stamp: &#ns_h1::server::date::Clock,
                 #v_permit: #ns_h1::session::Permit,
@@ -174,7 +168,6 @@ pub(super) fn build<'view, 'source>(
                 #head,
                 #ns_h1::wire::parsing::Rejected<'d>,
             > {
-                #project
                 let #v_parsed = match #parse {
                     ::core::result::Result::Ok(#complete) => #v_parsed,
                     ::core::result::Result::Ok(#pending) => {
@@ -184,7 +177,7 @@ pub(super) fn build<'view, 'source>(
                         }.into();
                     }
                     ::core::result::Result::Err(#v_error) => {
-                        #on_error
+                        let mut #v_this = self.as_mut().project();
                         let (#request::Syntax | #request::Target(..) | #request::Span(..)) = #error;
                         let #v_exch = #ns_core::life::sequence::Mode::open(
                             #v_this.#f_life,
@@ -206,12 +199,11 @@ pub(super) fn build<'view, 'source>(
                         #v_permit,
                         #ns_http::h1::codec::canned::NOT_FOUND,
                     );
-                    #on_error
+                    let mut #v_this = self.as_mut().project();
                     #rejected
                     return #v_result.into();
                 };
                 let #v_date = #v_stamp.load();
-                #state
                 let #v_head = #v_parsed.request();
                 let #v_date = &#v_date;
                 #body
@@ -367,7 +359,7 @@ pub(super) fn build<'view, 'source>(
             }
 
             fn has_body_work(#v_wait: &Self::Pending) -> ::core::primitive::bool {
-                match &#v_wait.route { #( #work, )* }
+                match #v_wait.route { #( #work, )* }
             }
 
             fn resume_pending(
@@ -400,7 +392,7 @@ pub(super) fn build<'view, 'source>(
                 let #v_result = match #v_wait.route {
                     #( #finish, )*
                 };
-                self.__finish_body(#v_exch, #v_result, #v_run)
+                #finish_body
             }
 
             fn resume_body(

@@ -1,4 +1,4 @@
-use dope::core::driver::{retained, schedule::app::Work};
+use dope::core::driver::{self, schedule::app::Work};
 use o3::buffer::resident;
 use sark_core::manifold::server::app;
 
@@ -117,7 +117,7 @@ where
 
     fn start<W: Write>(
         &mut self,
-        _: &mut app::Turn<'_, '_, '_, '_, 'd, O>,
+        _: &mut app::Turn<'_, '_, '_, 'd, O>,
         _: Self::Target,
         _: &mut service::Stream,
         head: request::Head,
@@ -167,7 +167,7 @@ where
 
     fn request<W: Write>(
         &mut self,
-        turn: &mut app::Turn<'_, '_, '_, '_, 'd, O>,
+        turn: &mut app::Turn<'_, '_, '_, 'd, O>,
         target: Self::Target,
         call: &mut call::Handler<Self::Call, Self::State>,
         input: service::Request<'_, resident::Shared<'d>>,
@@ -182,7 +182,7 @@ where
         &mut self,
         owner: O,
         work: Work<'_, 'd>,
-        driver: &mut retained::Context<'_, '_, 'd>,
+        driver: &mut driver::Context<'_, 'd>,
     ) -> TaskState;
 
     fn wake_tasks(&mut self, owner: O) -> TaskState;

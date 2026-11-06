@@ -35,7 +35,7 @@ impl Head {
         let [n_first] = symbols.locals(["__first_regular"]);
         let [n_head, n_hbytes] = symbols.locals(["__head", "__head_bytes"]);
         let [n_hostrg] = symbols.locals(["__host_range"]);
-        let [n_httpm, n_framing] = symbols.locals(["__http_method", "__framing"]);
+        let [n_framing] = symbols.locals(["__framing"]);
         let [n_name, n_pend] = symbols.locals(["__name", "__path_end"]);
         let [n_ptarg] = symbols.locals(["__planned_target"]);
         let [n_query] = symbols.locals(["__query"]);
@@ -179,20 +179,19 @@ impl Head {
                                 #n_head, #params, #n_rawhdr,
                             )
                         },
-                        method: #n_httpm,
                         content_length: #n_len,
                     }),
                 );
             }
         };
-        let set = |index: usize| {
+        let set = |index: usize, value: proc_macro2::TokenStream| {
             let route = &entries[index].entry.route;
             let schema = schema(index);
             quote! {
                 let #n_value =
-                    #ns_core::request::field::SliceValue::try_new(
-                    #n_hbytes,
-                    #n_range,
+                    #ns_core::request::field::SliceValue::try_slice(
+                    #value,
+                    #n_range.start,
                 ).map_err(|_| #ns_core::decode::HeadError::BadRequest)?;
                 if let ::core::result::Result::Err(#n_error) =
                     <<<#route as #ns_core::route::Spec>::Request
@@ -211,7 +210,7 @@ impl Head {
         };
         let prepare = |index: usize| {
             let route = &entries[index].entry.route;
-            let setter = set(index);
+            let setter = set(index, quote!(#n_field.value));
             quote! {
                 for (#n_field, #n_range) in
                     #n_first.into_iter().chain(#n_iter)
@@ -235,7 +234,7 @@ impl Head {
         };
         let tagged = |index: usize| {
             let route = &entries[index].entry.route;
-            let setter = set(index);
+            let setter = set(index, quote!(#n_value));
             let named = |name: &proc_macro2::TokenStream| {
                 quote! {
                     if let ::core::option::Option::Some(#n_slot) =
@@ -253,7 +252,7 @@ impl Head {
             let set_host = named(&host);
             quote! {
                 for #n_field in #n_iter {
-                    let (#n_tag, #n_range, _) =
+                    let (#n_tag, #n_range, #n_value) =
                         #n_field.map_err(#ns_core::decode::HeadError::Storage)?;
                     if #n_tag == #ns_http::field::metadata::section::storage::Tag::CONTENT_LENGTH {
                         #set_len
@@ -332,7 +331,6 @@ impl Head {
             .map(|(index, item)| {
                 let entry = item.entry;
                 let variant = &item.prepared;
-                let method = entry.method.http_token(paths);
                 let form = match entry.method {
                     Method::Connect if entry.protocol.is_some() => quote! {
                         #ns_http::field::metadata::block::Form::ExtendedConnect
@@ -367,7 +365,6 @@ impl Head {
                         captures: #n_caps,
                     } => {
                         #guard
-                        let #n_httpm = #method;
                         #body
                     }
                 }

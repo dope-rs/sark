@@ -20,14 +20,36 @@ pub enum Never {}
 
 pub trait Dispatch {
     type Output<'d, E: Sink<'d>, S>;
+
+    fn fold<'d, E: Sink<'d>, S, T>(
+        output: Self::Output<'d, E, S>,
+        sync: impl FnOnce(E::Output) -> T,
+        stream: impl FnOnce(E::Stream<S>) -> T,
+    ) -> T;
 }
 
 impl Dispatch for Sync {
     type Output<'d, E: Sink<'d>, S> = E::Output;
+
+    fn fold<'d, E: Sink<'d>, S, T>(
+        output: Self::Output<'d, E, S>,
+        sync: impl FnOnce(E::Output) -> T,
+        _: impl FnOnce(E::Stream<S>) -> T,
+    ) -> T {
+        sync(output)
+    }
 }
 
 impl Dispatch for Polled {
     type Output<'d, E: Sink<'d>, S> = E::Stream<S>;
+
+    fn fold<'d, E: Sink<'d>, S, T>(
+        output: Self::Output<'d, E, S>,
+        _: impl FnOnce(E::Output) -> T,
+        stream: impl FnOnce(E::Stream<S>) -> T,
+    ) -> T {
+        stream(output)
+    }
 }
 
 /// One of two synchronous response shapes without allocation or type erasure.

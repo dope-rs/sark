@@ -15,7 +15,7 @@ use dope::{
     manifold::{
         app::{env, receive},
         network::listener::{
-            config, handler,
+            self, config, handler,
             topology::{Direct, Layout, factory},
         },
         timing,
@@ -113,7 +113,7 @@ impl<ID: Identity> Plan<ID> {
     pub fn with_server<S, F>(self, storage: S, recipe: F) -> topology::Plan<S, Recipe<ID, F>>
     where
         S: storage::Plan,
-        F: modes::Family<S, ID>,
+        F: topology::recipe::Build<S>,
     {
         topology::Plan::new(storage, Recipe::new(self, recipe))
     }
@@ -170,6 +170,23 @@ impl<ID: Identity> Plan<ID> {
         Option<handler::Lifetime>,
     ) {
         (self.listener, self.connection, self.bound, self.lifetime)
+    }
+
+    #[doc(hidden)]
+    pub fn into_install<'w, W: input::Execution, B>(
+        self,
+        wire: B,
+    ) -> (
+        listener::Install<'w, ID, env::Bundle<tcp::Tcp, W, timing::Throughput>, B>,
+        server::Plan,
+    ) {
+        let (listener, protocol, bound, lifetime) = self.into_parts();
+        let install = listener::Install::new(listener, wire).with_bound(bound);
+        let install = match lifetime {
+            Some(lifetime) => install.with_life(lifetime),
+            None => install,
+        };
+        (install, protocol)
     }
 }
 

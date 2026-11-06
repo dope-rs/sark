@@ -2,7 +2,7 @@ use std::{cell::Cell, convert::Infallible, pin::Pin};
 
 use dope::{
     core::{
-        driver::{retained, route, schedule::clock, settings},
+        driver::{self, route, schedule::clock, settings},
         random,
     },
     manifold::{
@@ -85,7 +85,7 @@ impl<'a> App<'a> {
             <Self as handler::Application<'d, ID>>::Conn,
             <Self as handler::Application<'d, ID>>::Egress,
         >,
-        driver: &mut retained::Context<'_, '_, 'd>,
+        driver: &mut driver::Context<'_, 'd>,
     ) where
         'a: 'd,
     {
@@ -138,7 +138,7 @@ impl<'a: 'd, 'd, ID: route::Identity> handler::Application<'d, ID> for App<'a> {
     fn activate<'e, 'b, 'p, 's, 'w>(
         self: Pin<&mut Self>,
         mut conn: conn::Ctx<'e, 'b, 'p, 's, 'w, 'd, ID, Self::Wire, Self::Conn, Self::Egress>,
-        driver: &mut retained::Context<'_, '_, 'd>,
+        driver: &mut driver::Context<'_, 'd>,
     ) -> conn::Ctx<'e, 'b, 'p, 's, 'w, 'd, ID, Self::Wire, Self::Conn, Self::Egress>
     where
         'd: 'w,
@@ -177,7 +177,7 @@ impl<'a: 'd, 'd, ID: route::Identity> handler::Borrowed<'d, ID> for App<'a> {
         self: Pin<&mut Self>,
         mut conn: conn::Ctx<'_, '_, '_, '_, '_, 'd, ID, Self::Wire, Self::Conn, Self::Egress>,
         chunk: R,
-        driver: &mut retained::Context<'_, '_, 'd>,
+        driver: &mut driver::Context<'_, 'd>,
     ) -> receive::Outcome {
         let this = self.get_mut();
         let clock = this.clock;
@@ -206,7 +206,7 @@ impl<'a: 'd, 'd, ID: route::Identity> send::Drive<'d, ID> for App<'a> {
     fn send(
         self: Pin<&mut Self>,
         mut conn: conn::Ctx<'_, '_, '_, '_, '_, 'd, ID, Self::Wire, Self::Conn, Self::Egress>,
-        driver: &mut retained::Context<'_, '_, 'd>,
+        driver: &mut driver::Context<'_, 'd>,
     ) {
         self.get_mut().finish(&mut conn, driver);
     }

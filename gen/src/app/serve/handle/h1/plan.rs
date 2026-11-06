@@ -35,6 +35,12 @@ impl<'source, 'spec> Plan<'source, 'spec> {
         &self.route
     }
 
+    pub(in crate::app::serve::handle) fn bodies(
+        &self,
+    ) -> impl Iterator<Item = &serve::RouteSpec<'spec, serve::Mode<'spec>>> {
+        self.entries.iter().filter(|item| !item.entry.upgrade)
+    }
+
     pub(in crate::app::serve) fn head(&self) -> &syn::Ident {
         &self.head
     }
@@ -72,7 +78,8 @@ impl<'source, 'spec> Plan<'source, 'spec> {
         let ns_fiber = &paths.fiber;
         let ns_h1 = &paths.h1;
         let ns_http = &paths.http;
-        let entries = self.entries.iter().map(|item| {
+        let life = self.bodies().next().map(|_| quote::quote!(<'d>));
+        let entries = self.bodies().map(|item| {
             let variant = &item.pending_variant;
             let route = &item.entry.route;
             let pending = match item.kind {
@@ -99,8 +106,14 @@ impl<'source, 'spec> Plan<'source, 'spec> {
         let headers = self.entries.iter().map(|item| {
             let variant = &item.pending_variant;
             let route = &item.entry.route;
-            let coding = (item.kind == spec::Kind::Sync)
-                .then(|| quote::quote!(, #ns_http::h1::head::request::Coding));
+            let coding = if item.entry.upgrade {
+                quote::quote!(, #ns_h1::wire::parsing::framing::Plain,
+                    #ns_h1::route::duplex::Upgrade)
+            } else if item.kind == spec::Kind::Sync {
+                quote::quote!(, #ns_http::h1::head::request::Coding)
+            } else {
+                quote::quote!()
+            };
             quote::quote!(#variant(#ns_h1::wire::parsing::framing::PendingHead<#route #coding>),)
         });
         let builders: Vec<_> = self
@@ -139,10 +152,10 @@ impl<'source, 'spec> Plan<'source, 'spec> {
                     >,
                     ::core::primitive::u64,
                 >,
-                route: #route<'d>,
+                route: #route #life,
             }
 
-            enum #route<'d> {
+            enum #route #life {
                 #( #entries )*
             }
 

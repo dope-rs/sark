@@ -1,80 +1,86 @@
 use std::pin;
 
 use dope::{core::driver::route::Identity, manifold::network::listener::conn};
-use o3::depot::queue::indexed::lanes::typed::Value;
 use sark_core::{deadline, life, manifold::task::app::Runtime};
-use sark_http::owner::cause;
+use sark_http::{field::metadata::section::rules, owner::cause};
 
 use crate::{
     frame::numbers,
-    server::task::{
-        self, Borrowed, Target, registry,
-        response::{Data, Response, deadline::Deadline},
-        timers::Due,
+    server::{
+        state::Transitions,
+        task::{
+            self, Borrowed, Target, ingress, registry,
+            response::{self, deadline::Deadline},
+            timers::Due,
+        },
     },
-    stream,
 };
 
-pub(in crate::server::task) struct Expiry(deadline::Poll<Due>);
-
-impl Expiry {
-    pub(in crate::server::task) const fn new(due: deadline::Poll<Due>) -> Self {
-        Self(due)
-    }
-
-    pub(in crate::server::task) fn apply<'d, ID: Identity + 'd, R, Q>(
-        self,
-        router: pin::Pin<&mut R>,
-        tasks: &mut registry::Table<'d, ID, R::Task>,
-        conn: conn::Id<'d, ID>,
-        index: &mut registry::Index,
-        state: &mut Borrowed<'_, 'd, R>,
-        mode: &mut Q,
-    ) -> Deadline
-    where
-        R: Runtime<'d, Target = Target<'d, ID>>,
-        Q: life::Mode<conn::Id<'d, ID>, stream::Key>,
-    {
-        let due = match self.0 {
-            deadline::Poll::Idle => return Deadline::Ready,
-            deadline::Poll::Renewed => return Deadline::Wake,
-            deadline::Poll::Expired(due) => due,
-        };
-        match due {
-            Due::Exchange { key, phase } => {
-                let xchg = task::identify(conn, key);
-                let expiry = xchg.begin_expiry(mode, phase);
-                if let Some(registry::Taken { task, .. }) = tasks.take_stream(index, conn, key) {
-                    Runtime::cancel(router, task);
+pub(in crate::server::task) fn apply<'d, ID: Identity + 'd, R, Q, F>(
+    due: deadline::Poll<Due>,
+    router: pin::Pin<&mut R>,
+    tasks: &mut registry::Table<'d, ID, R::Task>,
+    conn: conn::Id<'d, ID>,
+    index: &mut registry::Index,
+    state: &mut Borrowed<'_, 'd, R, F>,
+    mode: &mut Q,
+) -> Deadline
+where
+    R: Runtime<'d, Target = Target<'d, ID>>,
+    Q: Transitions<conn::Id<'d, ID>>,
+    F: rules::Policy,
+{
+    let due = match due {
+        deadline::Poll::Idle => return Deadline::Ready,
+        deadline::Poll::Renewed => return Deadline::Wake,
+        deadline::Poll::Expired(due) => due,
+    };
+    match due {
+        Due::Exchange { key, phase } => {
+            let xchg = task::identify(conn, key);
+            let mut expiry = None;
+            if let Some(taken) = tasks.take_stream(index, key) {
+                expiry = Some(xchg.begin_expiry(mode, phase));
+                Runtime::cancel(router, taken.task);
+                if taken.unreported {
                     mode.observe(life::Event::TaskCancelled(xchg));
                 }
-                let (reply, done) = state.reset(xchg, numbers::ErrorCode::Cancel, mode.body(xchg));
-                if let Some(write) = done {
-                    task::release_retired(mode, conn, write, cause::Staging::Reset);
-                }
-                match reply {
-                    Some(Value::Data(Data::Body { pending, .. })) => {
-                        task::release_pending(mode, xchg, pending, cause::Staging::Reset)
-                    }
-                    Some(Value::Control(Response::Encoded(receipt))) => drop(receipt),
-                    Some(Value::Control(
-                        Response::Head { head, .. } | Response::DuplexHead { head, .. },
-                    )) => head.discard(state.connection),
-                    Some(Value::Data(Data::Duplex { .. }))
-                    | Some(Value::Control(
-                        Response::Status(_)
-                        | Response::Sync(_)
-                        | Response::Completion(_)
-                        | Response::DuplexOpen { .. },
-                    ))
-                    | None => {}
-                    Some(Value::Idle(never)) => match never {},
-                }
-                expiry.finish(mode);
-                Deadline::Expired
             }
-            Due::Wake { .. } => Deadline::Wake,
-            Due::Critical | Due::Header { .. } => Deadline::Critical,
+            let discarded = {
+                let expiry = &mut expiry;
+                let mode = &mut *mode;
+                state.data().discard(xchg, move || {
+                    expiry.get_or_insert_with(|| xchg.begin_expiry(mode, phase));
+                    mode.body(xchg)
+                })
+            };
+            let code = match discarded {
+                ingress::Discard::Missing(_) | ingress::Discard::Removed(_) => {
+                    numbers::ErrorCode::Cancel
+                }
+                ingress::Discard::Failed { error, .. } => error.code(),
+            };
+            let reply = state.responses.remove(key);
+            if reply.is_some() {
+                expiry.get_or_insert_with(|| xchg.begin_expiry(mode, phase));
+            }
+            let done = if expiry.is_some() {
+                state.connection.streams().retire(key, code)
+            } else {
+                mode.cancel(key);
+                state.connection.cancel_ingress(key, code)
+            };
+            if let Some(write) = done {
+                task::release_retired(mode, conn, write, cause::Staging::Reset);
+            }
+            if let Some(reply) = reply {
+                response::discard(reply, state.connection, xchg, mode, cause::Staging::Reset);
+            }
+            if let Some(expiry) = expiry {
+                expiry.finish(mode);
+            }
+            Deadline::Expired
         }
+        Due::Critical => Deadline::Critical,
     }
 }

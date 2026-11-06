@@ -124,9 +124,8 @@ where
                 }
                 return Ok(());
             }
-            Lookup::Active(key, record) => {
+            Lookup::Active(key, _) => {
                 let resets = self.conn.state.lifecycle.peer_reset_count.next()?;
-                record.stream.state = stream::State::Closed;
                 (key, resets)
             }
         };
@@ -134,7 +133,10 @@ where
             .conn
             .state
             .retire_write::<_, E>(&mut self.conn.egress, key.id());
-        self.conn.state.active_streams.remove_key(key);
+        self.conn
+            .state
+            .active_streams
+            .remove_key(key, self.conn.state.lifecycle.keeps_events());
         self.conn.ingress.events.push(event::Event::StreamReset {
             stream_id: key,
             error: r.error(),
@@ -216,6 +218,7 @@ where
             },
         active_streams: active,
         stream_history: history,
+        lifecycle: life,
         ..
     } = &mut *state;
     use registry::store::Lookup;
@@ -246,9 +249,8 @@ where
             return Ok(());
         }
     };
-    let (window, release) = (&mut record.recv_window, &mut record.pending_release);
-    let next = match record.stream.state.recv(stream::Event::Data { boundary }) {
-        Ok(next) if matches!(record.stream.peer_section, Section::Trailing) => Ok(next),
+    let next = match record.state.recv(stream::Event::Data { boundary }) {
+        Ok(next) if matches!(record.section(), Section::Trailing) => Ok(next),
         Ok(_) => Err(numbers::ErrorCode::ProtocolError),
         Err(stream::Error::StreamClosed { .. }) => Err(numbers::ErrorCode::StreamClosed),
         Err(error @ stream::Error::Protocol { .. }) => {
@@ -259,7 +261,6 @@ where
     };
     let next = next.and_then(|next| {
         record
-            .stream
             .content
             .receive(record.remaining, len, matches!(boundary, Boundary::End))
             .map_err(numbers::ErrorCode::from)
@@ -288,13 +289,13 @@ where
     };
     let receive = flow::Pair {
         conn: recv,
-        stream: window,
+        stream: &mut record.recv_window,
     }
     .receive_data(
         flow,
         flow::ReleasePair {
             conn: pending,
-            stream: release,
+            stream: &mut record.pending_release,
             conn_threshold: conn_low,
             stream_threshold: flow_low,
         },
@@ -335,8 +336,11 @@ where
     }
     conn.commit();
     stream.commit();
-    record.stream.state = next;
+    record.state = next;
     record.remaining = remaining;
+    if matches!(boundary, Boundary::End) && life.keeps_events() {
+        record.queue_end();
+    }
     data.frame.commit();
     data.event.push_back(event::Event::Data {
         stream_id: key,
@@ -344,7 +348,7 @@ where
         boundary,
     });
     if next == stream::State::Closed {
-        active.remove_key(key);
+        active.remove_key(key, false);
     }
     Ok(())
 }

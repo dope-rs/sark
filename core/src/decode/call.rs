@@ -2,7 +2,7 @@ use std::mem;
 
 use sark_http::request::body::Ref;
 
-use crate::{body, decode::Projected, duplex, manifold, request, request::frame::proof, route};
+use crate::{body, duplex, manifold, request, request::frame::proof, route};
 
 /// A route call whose body has already passed its request projection.
 #[repr(C)]
@@ -17,27 +17,9 @@ impl<H, B> Call<H, B> {
         Self { request, body }
     }
 
-    pub const fn body(&self) -> &B {
-        &self.body
-    }
-
     #[doc(hidden)]
     pub fn into_parts(self) -> (H, B) {
         (self.request, self.body)
-    }
-}
-
-impl<'req, 'd: 'req, H, P: body::Project> Projected<'req, 'd>
-    for Call<H, body::Scoped<'req, 'd, P>>
-{
-    fn body(&self) -> Ref<'req, 'd> {
-        self.body.body()
-    }
-}
-
-impl<'req, 'd, H> Projected<'req, 'd> for Call<H, Ref<'req, 'd>> {
-    fn body(&self) -> Ref<'req, 'd> {
-        self.body
     }
 }
 

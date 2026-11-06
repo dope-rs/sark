@@ -4,7 +4,7 @@ use crate::{
             self,
             app::{surfaces, tokens},
             duplex,
-            handle::{self, router},
+            handle::{self, decode, router},
         },
         spec::Driver,
     },
@@ -12,7 +12,6 @@ use crate::{
     runtime::paths::Paths,
 };
 
-mod lending;
 mod runners;
 
 pub(super) fn extras<'emit, 'source, 'spec>(
@@ -35,13 +34,16 @@ pub(super) fn extras<'emit, 'source, 'spec>(
     let [v_obs, v_cache] = symbols.locals(["observer", "response_cache"]);
     let [v_retain, v_stamp, v_state] = symbols.locals(["retention", "stamp", "state"]);
     let [v_tasks] = symbols.locals(["tasks"]);
-    let [l_wire, l_env] = source.spec.state_generics.lives(["__w", "env"]);
-    let [g_d, g_o] = source.spec.state_generics.idents(["__D", "__O"]);
-    let [g_brand, g_clock] = source.spec.state_generics.lives(["brand", "clock"]);
-    let [g_id, g_mode, g_store, g_wire] = source
-        .spec
-        .state_generics
-        .idents(["__ID", "__M", "__P", "__W"]);
+    let [v_prep, v_driver, v_app, v_permit, v_wait] =
+        symbols.locals(["prepared", "driver", "app", "permit", "wait"]);
+    let [l_wire, l_env] = symbols.lives(["__w", "env"]);
+    let [l_n, l_p, l_s, l_issued, l_life, l_watch] =
+        symbols.lives(["__n", "__p", "__s", "__issued", "__life", "__watch"]);
+    let [g_date, g_prof, g_recv, g_owner, g_shutdown] =
+        symbols.idents(["__DATE", "__PROFILE", "__RECEIVER", "__OWNER", "__SHUTDOWN"]);
+    let [g_d, g_o] = symbols.idents(["__D", "__O"]);
+    let [g_brand, g_clock] = symbols.lives(["brand", "clock"]);
+    let [g_id, g_mode, g_store, g_wire] = symbols.idents(["__ID", "__M", "__P", "__W"]);
     let ns_core = &paths.core;
     let ns_http = &paths.http;
     let ns_fiber = &paths.fiber;
@@ -55,11 +57,9 @@ pub(super) fn extras<'emit, 'source, 'spec>(
     let spec = source.spec;
     let vis = &spec.vis;
     let state_ty = spec.state.ty();
-    let generics = &spec.state_generics;
-    let lives = &generics.lifetimes;
-    let decls = &generics.parameters;
-    let values = &generics.arguments;
-    let clauses = &generics.predicates;
+    let lives = &symbols.lifetimes;
+    let decls = &symbols.parameters;
+    let clauses = &symbols.predicates;
     let routes = &spec.route_bounds;
     let inner = names.name;
     let core = names.core;
@@ -82,7 +82,38 @@ pub(super) fn extras<'emit, 'source, 'spec>(
     let duplex = plan.duplex.state();
     let input = duplex.input_type(paths);
     let config = duplex.config(paths);
-    let stamp = duplex.stamp(quote!(#n_clock), quote!(#v_stamp));
+    let egress_bound = match duplex {
+        duplex::State::Enabled => quote!(#ns_http::o3::buffer::resident::bound::Unbounded),
+        duplex::State::Disabled => decode::egress(
+            paths,
+            spec,
+            &source.entries,
+            &syn::Lifetime::new("'d", proc_macro2::Span::call_site()),
+        ),
+    };
+    let egress = |tag: proc_macro2::TokenStream| {
+        quote! {
+            #ns_fiber::dope::net::link::egress::data::Bound<
+                #ns_fiber::dope::net::link::egress::data::compose::Either<
+                    #ns_h1::server::payload::Body<'d, #tag>,
+                    #ns_h1::server::payload::Stream<'d, #tag>,
+                >,
+                #egress_bound,
+            >
+        }
+    };
+    let plain_egress = egress(quote!(()));
+    let bind_egress = egress(quote! {
+        <#g_mode as #ns_core::life::sequence::Mode<
+            #ns_fiber::dope::manifold::network::listener::conn::Id<'d, #g_id>,
+        >>::TransportTag
+    });
+    let upgrade = source.entries.iter().any(|route| route.entry.upgrade);
+    let stamp = duplex.stamp(
+        quote!(#n_clock),
+        quote!(#v_stamp),
+        upgrade.then(|| quote!(::std::vec::Vec::new())),
+    );
     let (unpack, initial) = match duplex {
         duplex::State::Disabled => (quote!(), quote!(())),
         duplex::State::Enabled => (
@@ -106,49 +137,39 @@ pub(super) fn extras<'emit, 'source, 'spec>(
         quote! {
             #f_gzip: <#g_store as
                 #ns_fiber::manifold::runtime::Storage
-            >::Resource<#coding>,
+            >::Protocol<(), #coding>,
         }
     });
     let gz_init = (count != 0).then(|| {
         quote! {
             #f_gzip: <#g_store as
                 #ns_fiber::manifold::runtime::Initial
-            >::resource::<#coding>(),
+            >::protocol::<(), #coding>(()),
         }
     });
     let gz_move = (count != 0).then(|| quote!(#f_gzip: #v_gzip,));
-    let make_gz = |error: proc_macro2::TokenStream| {
-        (count != 0).then(|| {
-            quote! {
-                let #ns_fiber::manifold::runtime::Empty = #v_gzip;
-                let #v_gzip = <#coding as #ns_http::payload::compress::Compression>::try_new()
-                    .map_err(#error)?;
-            }
-        })
-    };
+    let cache = quote!([::core::option::Option<#ns_h1::wire::cache::Entry>; #count]);
     let fields = quote! {
-        #f_cache: [
-            ::core::option::Option<#ns_h1::wire::cache::Entry>;
-            #count
-        ],
+        #f_cache: <#g_store as #ns_fiber::manifold::runtime::Storage>::Protocol<#cache, #cache>,
         #gz_field
     };
     let init = quote! {
-        #f_cache: [
-            const { ::core::option::Option::None };
-            #count
-        ],
+        #f_cache: <#g_store as #ns_fiber::manifold::runtime::Initial>::protocol::<#cache, #cache>(
+            [const { ::core::option::Option::None }; #count],
+        ),
         #gz_init
     };
     let owned = quote! {
         #f_cache: #v_cache,
         #gz_move
     };
-    let multi_gz = make_gz(quote!(#ns_core::manifold::task::app::BindError::Allocation));
-    let bind_gz = make_gz(quote!(#ns_h1::server::listener::bind::Error::Allocation));
-    let prepare = quote! {
-        #multi_gz
-    };
+    let bind_gz = (count != 0).then(|| {
+        quote! {
+            let () = #v_gzip;
+            let #v_gzip = <#coding as #ns_http::payload::compress::Compression>::try_new()
+                .map_err(#ns_h1::server::listener::bind::Error::Allocation)?;
+        }
+    });
     let wire = quote! {
         <#input as #ns_fiber::dope::net::link::pool::recv::input::Mode<#g_wire>>::Reserve:
             #ns_fiber::dope::net::link::pool::recv::reserve::Choice<
@@ -168,18 +189,23 @@ pub(super) fn extras<'emit, 'source, 'spec>(
             #g_id: #ns_fiber::Identity + #l_env,
         >
     };
-    let ctor_out = quote! {
-        impl #ns_h1::server::listener::bind::Bind<
-            #l_wire,
-            'd,
-            #g_id,
-            Wire = #g_wire,
-            Input = #input,
-            Error = #ns_h1::server::listener::bind::Error,
-        >
-        #decode
-        + #l_env
+    let ctor = |egress: &proc_macro2::TokenStream| {
+        quote! {
+            impl #ns_h1::server::listener::bind::Bind<
+                #l_wire,
+                'd,
+                #g_id,
+                Wire = #g_wire,
+                Input = #input,
+                Egress = #egress,
+                Error = #ns_h1::server::listener::bind::Error,
+            >
+            #decode
+            + #l_env
+        }
     };
+    let ctor_out = ctor(&plain_egress);
+    let observed_ctor = ctor(&egress(quote!(#ns_core::life::sequence::observed::Tag)));
     let ctor_b = quote! {
         #( #clauses, )*
         #( #routes )*
@@ -205,6 +231,7 @@ pub(super) fn extras<'emit, 'source, 'spec>(
         {
             type Wire = #g_wire;
             type Input = #input;
+            type Egress = #bind_egress;
             type Error = #ns_h1::server::listener::bind::Error;
             type Application<#g_clock, #g_d> = #inner #bound
             where
@@ -225,7 +252,7 @@ pub(super) fn extras<'emit, 'source, 'spec>(
                 let #core {
                     #owned
                     #moves
-                    #f_time: #ns_fiber::manifold::runtime::Empty,
+                    #f_time: (),
                     #f_life: #v_life,
                     #f_state: #v_state,
                     #f_mark: ::core::marker::PhantomData,
@@ -267,14 +294,72 @@ pub(super) fn extras<'emit, 'source, 'spec>(
             #producer
         )
     };
-    let lending = lending::build(paths, source, plan, &create, &ctor_b, branded);
+    let prepared = quote! {
+        #ns_h1::server::run::Prepared<
+            #l_n, #l_p, #l_s, #l_wire, 'd, #g_id, #g_date,
+            #ns_fiber::dope::manifold::app::env::Bundle<
+                #ns_fiber::dope::net::tcp::Tcp, #g_wire, #g_prof,
+            >,
+            #g_recv, #plain_egress, #input, #g_d,
+        >
+    };
     let defs = quote! {
         #pending
         #binding
-        #lending
         #runs
     };
     let methods = quote! {
+        /// Builds and runs this application while consuming its provider permit.
+        #vis fn run_prepared<
+            #l_env, #g_brand: #l_env, #l_wire, #l_n, #l_p, #l_s,
+            #l_issued, #l_life: #l_issued, #l_watch,
+            #( #lives: #l_env, )* 'd: #l_wire + #l_env + #l_life + #l_watch,
+            #( #decls, )*
+            #g_id: #ns_fiber::Identity + 'd,
+            #g_wire: #ns_fiber::dope::net::link::pool::recv::input::Execution + 'd,
+            #g_date: #ns_fiber::Identity,
+            #g_prof, #g_recv, #g_d, #g_owner, #g_shutdown,
+        >(
+            #bind_key: #ns_fiber::dope_fiber::task::storage::scope::Brand<#g_brand>,
+            #v_state: ::core::pin::Pin<&#l_env #state_ty>,
+            #v_config: #config,
+            #v_prep: #prepared,
+            #v_wait: #ns_h1::server::run::Wait<#l_watch, 'd>,
+            #v_permit: #ns_fiber::dope::runtime::topology::lending::Permit<
+                #l_issued, #l_life, 'd, #g_owner, #g_shutdown,
+            >,
+        ) -> #ns_fiber::dope::runtime::topology::lending::Outcome<
+            #l_issued, #l_life, 'd, #g_owner, #g_shutdown,
+            #ns_fiber::dope::manifold::BuildError<#ns_h1::server::listener::bind::Error>,
+            #ns_h1::server::run::Pending<
+                #l_watch, 'd,
+                #ns_fiber::dope::runtime::shutdown::Requested<#g_shutdown>,
+            >,
+        >
+        where
+            #ctor_b
+            #g_prof: #ns_fiber::dope::core::driver::settings::Profile
+                + #ns_fiber::dope::manifold::timing::Policy,
+            #g_recv: #ns_fiber::dope::net::link::pool::change::Prepare<
+                #l_wire, 'd, #g_id, #g_wire,
+            >,
+            #g_d: #ns_h1::server::deadline::policies::Policy<'d, #g_id>,
+            #plain_egress: #ns_fiber::dope::net::link::egress::data::raw::Payload<'d> + 'd,
+            #prepared: #l_env,
+            #g_owner: #ns_fiber::dope::runtime::topology::lending::raw::Resume<'d>,
+            #g_shutdown: #ns_fiber::dope::runtime::executor::Startup,
+        {
+            #v_permit.try_run(
+                |mut #v_driver| {
+                    let #v_state = #v_state.get_ref();
+                    let #v_app = { #create };
+                    #v_prep.build(#v_app, &mut #v_driver)
+                        .map(|#v_app| (#v_app, ()))
+                },
+                |(), #v_app| #ns_h1::server::run::run(#v_wait, #v_app),
+            )
+        }
+
         #vis fn new #ctor_g(
             #brand
             #v_state: &#l_env #state_ty,
@@ -286,20 +371,7 @@ pub(super) fn extras<'emit, 'source, 'spec>(
             #create
         }
 
-        #[doc(hidden)]
-        #vis fn __scoped_new #ctor_g(
-            #bind_key: #ns_fiber::dope_fiber::task::storage::scope::Brand<#g_brand>,
-            #v_state: &#l_env #state_ty,
-            #v_config: #config,
-        ) -> #ctor_out
-        where
-            #ctor_b
-        {
-            Self::new::<#(#values,)* #g_wire, #g_id>(#claim #v_state, #v_config)
-        }
-
         #serve
-
         /// Constructs an observed H1 application with static dispatch.
         #vis fn with_observer<
             #l_wire,
@@ -319,7 +391,7 @@ pub(super) fn extras<'emit, 'source, 'spec>(
             #v_state: &#l_env #state_ty,
             #v_config: #config,
             #v_obs: #g_o,
-        ) -> #ctor_out
+        ) -> #observed_ctor
         where
             #ctor_b
         {
@@ -344,6 +416,5 @@ pub(super) fn extras<'emit, 'source, 'spec>(
         core_moves: owned,
         public_methods: methods,
         core_initializers: init,
-        multiplexed_prepare: prepare,
     }
 }

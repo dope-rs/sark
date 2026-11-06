@@ -1,6 +1,8 @@
+use core::{num::NonZero, ops::ControlFlow};
+
 use crate::{
     field,
-    h1::chunk::{self, ban, size::Progress},
+    h1::chunk::{self, ban},
 };
 
 #[derive(Clone, Copy, Default, PartialEq, Eq)]
@@ -43,15 +45,16 @@ impl State {
         byte: u8,
         offset: usize,
         limits: &chunk::Limit,
-    ) -> Result<(Self, Progress), chunk::Error> {
+    ) -> Result<ControlFlow<NonZero<u32>, Self>, chunk::Error> {
         let mut next = self;
-        let value = next.bytes as usize;
-        let bytes = next.bytes.checked_add(1).ok_or(chunk::Error::Overflow {
-            axis: chunk::Axis::Trailer,
-            value,
-            added: 1,
-        })?;
-        let actual = bytes as usize;
+        let bytes = NonZero::<u32>::MIN
+            .checked_add(next.bytes)
+            .ok_or(chunk::Error::Overflow {
+                axis: chunk::Axis::Trailer,
+                value: next.bytes as usize,
+                added: 1,
+            })?;
+        let actual = bytes.get() as usize;
         if actual > limits.trailer_bytes {
             return Err(chunk::Error::Limit {
                 axis: chunk::Axis::Trailer,
@@ -59,15 +62,24 @@ impl State {
                 maximum: limits.trailer_bytes,
             });
         }
-        next.bytes = bytes;
-        let (next, progress) = match next.stage {
-            Stage::LineStart => (next.start(byte, offset)?, Progress::Pending),
-            Stage::Name => (next.name(byte, offset)?, Progress::Pending),
-            Stage::Value => (next.value(byte, offset)?, Progress::Pending),
-            Stage::LineLf => (next.line_lf(byte, offset, limits)?, Progress::Pending),
-            Stage::FinalLf => next.final_lf(byte, offset)?,
+        next.bytes = bytes.get();
+        let next = match next.stage {
+            Stage::LineStart => next.start(byte, offset)?,
+            Stage::Name => next.name(byte, offset)?,
+            Stage::Value => next.value(byte, offset)?,
+            Stage::LineLf => next.line_lf(byte, offset, limits)?,
+            Stage::FinalLf => {
+                if byte != b'\n' {
+                    return Err(chunk::Error::Syntax {
+                        offset,
+                        syntax: chunk::Syntax::TrailerEnd,
+                        actual: byte,
+                    });
+                }
+                return Ok(ControlFlow::Break(bytes));
+            }
         };
-        Ok((next, progress))
+        Ok(ControlFlow::Continue(next))
     }
 
     fn start(mut self, byte: u8, offset: usize) -> Result<Self, chunk::Error> {
@@ -149,18 +161,6 @@ impl State {
         self.candidates = Self::ALL;
         self.stage = Stage::LineStart;
         Ok(self)
-    }
-
-    fn final_lf(self, byte: u8, offset: usize) -> Result<(Self, Progress), chunk::Error> {
-        if byte == b'\n' {
-            Ok((self, Progress::Complete))
-        } else {
-            Err(chunk::Error::Syntax {
-                offset,
-                syntax: chunk::Syntax::TrailerEnd,
-                actual: byte,
-            })
-        }
     }
 
     fn matching(set: u16, index: usize, byte: u8) -> u16 {

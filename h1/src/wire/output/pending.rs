@@ -6,7 +6,7 @@ use crate::wire::{Failure, head, output::Outcome};
 /// Response head awaiting its affine request-body owner.
 pub struct Pending<P = usize> {
     head: usize,
-    pub(super) body: P,
+    pub(crate) body: P,
     connection: head::Connection,
 }
 

@@ -23,8 +23,10 @@ pin-project.workspace = true
 
 [dev-dependencies]
 clap.workspace = true
+sark-grpc.workspace = true
 sark-h2.workspace = true
 sark-h3.workspace = true
+sark-ws.workspace = true
 dope-quic.workspace = true
 dope-test.workspace = true
 sark.workspace = true

@@ -12,7 +12,6 @@ pub(in crate::app::serve::handle) struct Dispatch {
 
 pub(in crate::app::serve::handle) struct Methods {
     pub(in crate::app::serve::handle) method_mask: proc_macro2::TokenStream,
-    pub(in crate::app::serve::handle) decoded_method_key: proc_macro2::TokenStream,
     pub(in crate::app::serve::handle) head_method_key: proc_macro2::TokenStream,
 }
 
@@ -29,8 +28,6 @@ impl Methods {
     pub(in crate::app::serve::handle) fn build(paths: &Paths, spec: &spec::Spec) -> Self {
         use quote::quote;
         let symbols = &spec.state_generics;
-        let [v_httpm] = symbols.locals(["__http_method"]);
-        let [v_dkey] = symbols.locals(["decoded_method_key"]);
         let [v_mbytes, v_mkey] = symbols.locals(["__method_bytes", "__method_key"]);
 
         let mut enabled = [false; route::Method::ALL.len()];
@@ -45,21 +42,6 @@ impl Methods {
         };
         let bits = methods().map(|method| method.bit_token(paths));
         let mask = quote!(0u8 #( | #bits )*);
-        let dchecks = methods().map(|method| {
-            let http = method.http_token(paths);
-            let key = method.key_token(paths);
-            quote! {
-                if #v_httpm == #http {
-                    ::core::option::Option::Some(#key)
-                }
-            }
-        });
-        let decoded = quote! {
-            let #v_dkey = #( #dchecks else )*
-            {
-                ::core::option::Option::None
-            };
-        };
         let hchecks = methods().map(|method| {
             let bytes = method.bytes_token();
             let key = method.key_token(paths);
@@ -78,7 +60,6 @@ impl Methods {
 
         Self {
             method_mask: mask,
-            decoded_method_key: decoded,
             head_method_key: head,
         }
     }
@@ -102,9 +83,8 @@ impl Shape {
         let values = &spec.state_generics.arguments;
         let clauses = &spec.state_generics.predicates;
         let routes = &spec.route_bounds;
-        let task = &context.exec.task;
-        let slabs = &task.slab_bounds;
-        let make_req = &task.producer_bounds;
+        let slabs = &context.exec.slab_bounds;
+        let make_req = &context.exec.producer_bounds;
         let base = quote! {
         #( #clauses, )*
         #( #routes )*

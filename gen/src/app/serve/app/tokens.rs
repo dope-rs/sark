@@ -37,9 +37,7 @@ impl Factory<'_> {
             prepare,
         } = self;
         let error = quote::quote! {
-            #ns_core::manifold::task::app::BindError<
-                #ns_fiber::dope_fiber::task::storage::fixed::schedule::queue::PrepareError
-            >
+            #ns_fiber::dope_fiber::task::storage::fixed::schedule::queue::PrepareError
         };
         quote::quote! {
             impl #proto
@@ -60,7 +58,7 @@ impl Factory<'_> {
                     let #core {
                         #core_set
                         #task_set
-                        #f_time: #ns_fiber::manifold::runtime::Empty,
+                        #f_time: (),
                         #f_life: #v_life,
                         #f_state: #v_state,
                         #f_mark: ::core::marker::PhantomData,
@@ -86,7 +84,7 @@ impl Factory<'_> {
 pub(super) struct Prelude<'a> {
     pub definitions: &'a proc_macro2::TokenStream,
     pub task_tags: &'a proc_macro2::TokenStream,
-    pub completion: &'a proc_macro2::TokenStream,
+    pub fixed: &'a proc_macro2::TokenStream,
     pub factory: &'a proc_macro2::TokenStream,
 }
 
@@ -142,7 +140,7 @@ pub(super) fn build<'a>(
     let [v_brand, v_config] = names.generics.locals(["brand", "config"]);
     let [v_life, v_stamp] = names.generics.locals(["lifecycle", "stamp"]);
     let [v_state, v_cap] = names.generics.locals(["state", "task_capacity"]);
-    let [v_this, v_types] = names.generics.locals(["this", "types"]);
+    let [v_types] = names.generics.locals(["types"]);
     let [l_env, g_brand] = names.generics.lives(["env", "brand"]);
     let [g_target, g_id, g_mode, g_store, g_stamp, g_wire] = names
         .generics
@@ -152,7 +150,7 @@ pub(super) fn build<'a>(
     let Prelude {
         definitions: defs,
         task_tags: tags,
-        completion: done,
+        fixed,
         factory,
     } = prelude;
     let Names {
@@ -194,7 +192,7 @@ pub(super) fn build<'a>(
     quote::quote! {
             #defs
             #tags
-            #done
+            #fixed
             #factory
 
             #[#ns_fiber::pin_project::pin_project(!Unpin)]
@@ -206,7 +204,7 @@ pub(super) fn build<'a>(
                 #task_set
                 #f_time: <#g_store as
                     #ns_fiber::manifold::runtime::Storage
-                >::Clock<'d>,
+                >::Resource<#ns_fiber::driver::schedule::clock::timer::Timer<'d>>,
                 #f_life: #g_mode,
                 #f_state: &#l_env #state,
                 #f_mark: ::core::marker::PhantomData<
@@ -223,21 +221,6 @@ pub(super) fn build<'a>(
                 #f_core: #core #usage,
                 #[pin]
                 #f_stamp: #g_stamp,
-            }
-
-            impl #app #name #usage
-            where
-                #base
-            {
-                fn __project(
-                    self: ::core::pin::Pin<&mut Self>,
-                ) -> (
-                    ::core::pin::Pin<&mut #core #usage>,
-                    ::core::pin::Pin<&mut #g_stamp>,
-                ) {
-                    let #v_this = self.project();
-                    (#v_this.#f_core, #v_this.#f_stamp)
-                }
             }
 
             #vis struct #api;
@@ -263,9 +246,7 @@ pub(super) fn build<'a>(
                 ) -> impl #ns_core::manifold::task::app::Bind<
                         'd,
                         Target = #g_target,
-                        Error = #ns_core::manifold::task::app::BindError<
-                            #ns_fiber::dope_fiber::task::storage::fixed::schedule::queue::PrepareError
-                        >,
+                        Error = #ns_fiber::dope_fiber::task::storage::fixed::schedule::queue::PrepareError,
                         Runtime: #runtime,
                     >
                     + #l_env
@@ -322,7 +303,7 @@ pub(super) fn build<'a>(
                             #tinit
                             #f_time: <#g_store as
                                 #ns_fiber::manifold::runtime::Initial
-                            >::clock(),
+                            >::resource::<#ns_fiber::driver::schedule::clock::timer::Timer<'d>>(),
                             #f_life: #v_life,
                             #f_state: #v_state,
                             #f_mark: ::core::marker::PhantomData,

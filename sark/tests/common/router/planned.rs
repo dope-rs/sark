@@ -57,7 +57,8 @@ pub fn try_fields<P: rules::Policy>(
     let capacity = fields
         .clone()
         .map(|(name, value)| prefix::Prefix::LEN + name.len() + value.len())
-        .sum();
+        .sum::<usize>()
+        + <P::Block as storage::Block>::PREFIX.len();
     let fields = fields.map(|(name, value)| {
         (
             block::Named::from_slice(name),

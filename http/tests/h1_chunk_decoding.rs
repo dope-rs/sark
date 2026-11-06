@@ -238,41 +238,60 @@ fn zero_keeps_payload() {
 
 #[test]
 fn scan_keeps_prefix() {
-    let wire = b"5\r\nhello\r\n0\r\nX: y\r\n\r\n";
-    let mut pipeline = wire.to_vec();
-    pipeline.extend_from_slice(b"NEXT");
-    let limits = Limit::with_body(5);
-    for split in 0..=wire.len() {
-        let mut framer = chunk::Framer::new();
-        let mut total = 0;
-        for part in [&pipeline[..split], &pipeline[split..]] {
-            let (result, allocs) = Tracker::measure(|| framer.scan(part, &limits));
-            assert_eq!(allocs, [0; 4]);
-            let run = (result).expect("valid framing split {split}");
-            let prefix = run.consume(|prefix| prefix);
-            assert_eq!(prefix.as_ptr(), part.as_ptr());
-            assert_eq!(prefix, &wire[total..total + prefix.len()]);
-            total += prefix.len();
+    for (wire, body, trailers) in [
+        (
+            b"5\r\nhello\r\n0;done=yes\r\nX: y\r\nY: z\r\n\r\n".as_slice(),
+            5,
+            14,
+        ),
+        (b"0\r\n\r\n".as_slice(), 0, 2),
+    ] {
+        let mut pipeline = wire.to_vec();
+        pipeline.extend_from_slice(b"NEXT");
+        let limits = Limit::new(body, wire.len(), 1024, trailers as usize, 128);
+        for split in 0..=wire.len() {
+            let mut framer = chunk::Framer::new();
+            let mut total = 0;
+            for part in [&pipeline[..split], &pipeline[split..]] {
+                let (result, allocs) = Tracker::measure(|| framer.scan(part, &limits));
+                assert_eq!(allocs, [0; 4]);
+                let run = (result).expect("valid framing split {split}");
+                let prefix = run.into_slice();
+                assert_eq!(prefix.as_ptr(), part.as_ptr());
+                assert_eq!(prefix, &wire[total..total + prefix.len()]);
+                total += prefix.len();
+                assert_eq!(
+                    framer.trailer_bytes().map(|count| count.get()),
+                    (total == wire.len()).then_some(trailers)
+                );
+            }
+            assert_eq!(total, wire.len());
+            assert_eq!(framer.body_bytes(), body);
+            let run = (framer.scan(b"", &limits)).expect("completed scan");
+            assert!(run.is_complete(), "wire must be complete");
+            framer.reset();
+            assert!(framer.trailer_bytes().is_none());
         }
-        assert_eq!(total, wire.len());
-        assert_eq!(framer.body_bytes(), 5);
-        let run = (framer.scan(b"", &limits)).expect("completed scan");
-        assert!(run.resolve(|| false, || true), "wire must be complete");
     }
-    let mut framer = chunk::Framer::new();
-    let before = framer;
-    assert!(matches!(
-        framer.scan(b"6\r\n", &limits),
-        Err(chunk::Error::Limit {
-            axis: chunk::Axis::Body,
-            actual: 6,
-            maximum: 5,
-        })
-    ));
-    assert!(
-        (framer) == (before),
-        "rejected scan must not publish progress"
-    );
+    for (limits, axis, actual, maximum) in [
+        (Limit::new(0, 10, 1024, 8, 1), chunk::Axis::Wire, 11, 10),
+        (Limit::new(0, 11, 1024, 7, 1), chunk::Axis::Trailer, 8, 7),
+    ] {
+        let mut framer = chunk::Framer::new();
+        let _ = framer
+            .scan(b"0\r\nX: y\r\n\r", &limits)
+            .expect("trailer prefix");
+        let before = framer;
+        assert!(matches!(
+            framer.scan(b"\n", &limits),
+            Err(chunk::Error::Limit {
+                axis: found,
+                actual: used,
+                maximum: bound,
+            }) if found == axis && used == actual && bound == maximum
+        ));
+        assert!(framer == before, "rejected scan must not publish progress");
+    }
 }
 
 #[test]
@@ -300,6 +319,7 @@ fn split_last_lf() {
         .decode(prefix, &limits, usize::MAX)
         .expect("valid trailer prefix");
     assert!(matches!(event, chunk::Fragment::Trailer(used) if used.get() == prefix.len()));
+    assert!(framer.trailer_bytes().is_none());
 
     let tail = b"\nGET /ping HTTP/1.1\r\nHost: local\r\n\r\n";
     let (result, allocs) = Tracker::measure(|| framer.decode(tail, &limits, usize::MAX));
@@ -312,6 +332,7 @@ fn split_last_lf() {
     ));
     assert_eq!(next.wire_bytes(), prefix.len() + 1);
     assert_eq!(next.body_bytes(), 0);
+    assert_eq!(next.trailer_bytes().map(|count| count.get()), Some(16));
 }
 
 #[test]

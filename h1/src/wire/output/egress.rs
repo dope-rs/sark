@@ -1,4 +1,4 @@
-use std::mem;
+use std::{convert::Infallible, mem};
 
 use o3::buffer::storage;
 use sark_core::route::guard;
@@ -97,10 +97,10 @@ impl<'a> Egress<'a> {
         id: Id<'d>,
         conn: head::Connection,
         policy: route::Policy,
-    ) -> output::Outcome<'d>
+    ) -> (output::Outcome<'d>, Option<S::Stream>)
     where
         'd: 'req,
-        S: dispatch::Complete<'req, 'd>,
+        S: dispatch::Emit<'req, 'd>,
     {
         let sink = Sink::new(
             self.write,
@@ -110,7 +110,26 @@ impl<'a> Egress<'a> {
             handoff::Slot::ready(Some(id)),
         )
         .with_policy(policy);
-        Self::outcome(reply.complete(sink), conn)
+        match reply.emit(sink) {
+            Ok(written) => <S::Kind as dispatch::Dispatch>::fold::<
+                Sink<'_, 'req, 'd, (), Infallible, ()>,
+                S::Stream,
+                _,
+            >(
+                written,
+                |written| (Self::outcome(Ok(written), conn), None),
+                |(written, stream)| {
+                    (
+                        output::Outcome::Send {
+                            written,
+                            connection: conn,
+                        },
+                        stream,
+                    )
+                },
+            ),
+            Err(error) => (output::Outcome::Failed(Failure::Output(error)), None),
+        }
     }
 
     /// Writes and transfers one streaming response without widening its shape.
@@ -147,12 +166,10 @@ impl<'a> Egress<'a> {
         match sent {
             Written::Inline {
                 written: used,
-                body_bytes: bytes,
-                cause,
+                copy,
             } => output::Outcome::SendCopied {
                 written: used,
-                body_bytes: bytes,
-                cause,
+                copy,
                 connection: conn,
             },
             Written::Compressed { head, body, read } => output::Outcome::SendCompressed {
@@ -256,8 +273,11 @@ impl<'a> Egress<'a> {
         match cached {
             cache::Cached::Fixed { len, body } => output::Outcome::SendCopied {
                 written: len,
-                body_bytes: body,
-                cause: evidence::Cause::Cached,
+                copy: evidence::Copy {
+                    read: body,
+                    written: body,
+                    cause: evidence::Cause::Cached,
+                },
                 connection: head::Connection::KeepAlive,
             },
             cache::Cached::Shared { head, body } => output::Outcome::SendShared {

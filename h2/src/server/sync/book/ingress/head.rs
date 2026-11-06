@@ -15,14 +15,17 @@ use sark_http::{
 };
 
 use crate::{
-    conn::event,
+    conn::{self, event},
     frame::numbers,
     server::{
         self, payload,
         payload::Buffer,
         response,
         state::exchange::{Accepted, Deferred, Plain, Rejected, Routed, Sync, admit},
-        sync::book::{self, ingress::Ingress, phase::Phase},
+        sync::{
+            self,
+            book::{self, ingress::Ingress, phase::Phase},
+        },
     },
     stream,
 };
@@ -39,14 +42,11 @@ pub(in crate::server::sync) trait Begin<S> {
         head: Retained<<Self::Router as decode::Decode>::Plan>,
         boundary: Boundary,
         limits: server::Config,
+        report: &mut impl FnMut(conn::Error),
     );
 }
 
-pub(in crate::server::sync) struct Head<'i, 'a, 'd: 'a, R: decode::Decode> {
-    ingress: &'i mut Ingress<'a, 'd, R>,
-}
-
-impl<'i, 'a, 'd: 'a, R> Head<'i, 'a, 'd, R>
+impl<'a, 'd: 'a, R> Ingress<'a, 'd, R>
 where
     R: decode::Decode,
     R::Prepared: request::Synchronous,
@@ -54,10 +54,6 @@ where
         Routed<'d, R::Prepared, R::Routes>,
     >: Deferred<'d, R::Prepared, R::Routes>,
 {
-    pub(super) const fn new(ingress: &'i mut Ingress<'a, 'd, R>) -> Self {
-        Self { ingress }
-    }
-
     fn try_route(
         &mut self,
         stream: stream::Key,
@@ -69,7 +65,7 @@ where
                 Deferred<Routed<'d, R::Prepared, R::Routes>> = Routed<'d, R::Prepared, R::Routes>,
             >,
     {
-        let Some(slot) = self.ingress.book.runtime.vacant(stream) else {
+        let Some(slot) = self.book.runtime.vacant(stream) else {
             return Err(route);
         };
         slot.insert(typed::Next::Control(
@@ -84,30 +80,28 @@ where
         router: &R,
         stream: stream::Key,
         routed: request::Guarded<<R::Routes as state::Family<R::Prepared>>::State<state::Routed>>,
+        report: &mut impl FnMut(conn::Error),
     ) -> Option<request::Body<request::Admitted<exec::Sync, R::Prepared, Buffer<'d>>>>
     where
         R: decode::Guarded,
     {
-        let encoder = response::Encoder::new(self.ingress.connection, stream, Ref::from_slice(&[]));
-        match admit::run::<R, _, Off, event::Ignore>(router, routed, encoder) {
+        let encoder = response::Encoder::new(self.connection, stream, Ref::from_slice(&[]));
+        match admit::run::<R, _, Off, event::Ignore, _>(router, routed, encoder) {
             Ok(ControlFlow::Continue(plan)) => Some(Sync::new(plan).take()),
             Ok(ControlFlow::Break((reject, input))) => {
                 // SAFETY: this newly rejected head has not charged any DATA.
-                if let Err(error) =
-                    unsafe { book::raw::discard(input, &mut self.ingress.book.credit) }
-                {
+                if let Err(error) = unsafe { book::raw::discard(input, &mut self.book.credit) } {
                     if let ControlFlow::Break(head) = reject {
-                        head.discard(self.ingress.connection);
+                        head.discard(self.connection);
                     }
-                    self.ingress.reset(stream, error.code());
+                    self.reset(stream, error.code());
                     return None;
                 }
                 match reject {
                     ControlFlow::Break(head) => {
-                        let Some(slot) = self.ingress.book.runtime.vacant(stream) else {
-                            head.discard(self.ingress.connection);
-                            self.ingress
-                                .reset(stream, numbers::ErrorCode::EnhanceYourCalm);
+                        let Some(slot) = self.book.runtime.vacant(stream) else {
+                            head.discard(self.connection);
+                            self.reset(stream, numbers::ErrorCode::EnhanceYourCalm);
                             return None;
                         };
                         slot.insert(typed::Next::Control(
@@ -118,25 +112,24 @@ where
                     ControlFlow::Continue(receipt) => {
                         if let Some(send) = receipt.into_pending()
                             && let Err(failure) = self
-                                .ingress
                                 .book
                                 .runtime
                                 .try_insert(stream, typed::Next::Data(send, None))
                         {
-                            self.ingress.reject(failure);
+                            self.reject(failure);
                         }
                     }
                 }
                 None
             }
             Err((error, failed, input)) => {
+                let error = sync::response(error, report);
                 // SAFETY: this failed fresh head has not charged any DATA.
-                let error =
-                    match unsafe { book::raw::discard(input, &mut self.ingress.book.credit) } {
-                        Ok(()) => error,
-                        Err(error) => error.code(),
-                    };
-                self.ingress.reset(failed, error);
+                let error = match unsafe { book::raw::discard(input, &mut self.book.credit) } {
+                    Ok(()) => error,
+                    Err(error) => error.code(),
+                };
+                self.reset(failed, error);
                 None
             }
         }
@@ -144,7 +137,7 @@ where
 
     fn status(&mut self, stream: stream::Key, status: Code, limits: server::Config) {
         let phase = Phase::Status(response::Status::new(status));
-        self.ingress.admit(stream, phase, limits);
+        self.admit(stream, phase, limits);
     }
 
     fn select(
@@ -166,8 +159,7 @@ where
             Ok(start) => Some(start),
             Err(error) => {
                 let error = error.discard();
-                self.ingress
-                    .reset(stream, payload::Error::Body(error).code());
+                self.reset(stream, payload::Error::Body(error).code());
                 None
             }
         }
@@ -182,24 +174,21 @@ where
         match body {
             request::Body::Finished(input) => {
                 // SAFETY: this freshly admitted head has not charged any DATA.
-                match unsafe { book::raw::try_body::<R>(input, &mut self.ingress.book.credit) } {
-                    Ok(input) => self.ingress.admit(stream, Phase::Request(input), limits),
-                    Err(error) => self.ingress.reset(stream, error),
+                match unsafe { book::raw::try_body::<R>(input, &mut self.book.credit) } {
+                    Ok(input) => self.admit(stream, Phase::Request(input), limits),
+                    Err(error) => self.reset(stream, error),
                 }
             }
             request::Body::Open(input) => {
-                if let Err(input) = self.ingress.try_receive(stream, input) {
+                if let Err(input) = self.try_receive(stream, input) {
                     // SAFETY: failed initial insertion returns this uncharged body.
                     let error = match unsafe {
-                        book::raw::discard(
-                            Rejected::Body(input.into_body()),
-                            &mut self.ingress.book.credit,
-                        )
+                        book::raw::discard(Rejected::Body(input.into_body()), &mut self.book.credit)
                     } {
                         Ok(()) => numbers::ErrorCode::EnhanceYourCalm,
                         Err(error) => error.code(),
                     };
-                    self.ingress.reset(stream, error);
+                    self.reset(stream, error);
                 }
             }
         }
@@ -227,6 +216,7 @@ where
         stream: stream::Key,
         request: request::Guarded<<R::Routes as state::Family<R::Prepared>>::State<state::Routed>>,
         limits: server::Config,
+        report: &mut impl FnMut(conn::Error),
     ) where
         R: decode::Guarded,
         <R::Head as request::Head>::Start: request::Selection<
@@ -234,22 +224,21 @@ where
                 Deferred<Routed<'d, R::Prepared, R::Routes>> = Routed<'d, R::Prepared, R::Routes>,
             >,
     {
-        if self.ingress.connection.output().len() >= limits.max_outbound_bytes
-            || !self.ingress.connection.streams().headers().is_ready()
+        if self.connection.output().len() >= limits.max_outbound_bytes
+            || !self.connection.streams().headers().is_ready()
         {
             if let Err(input) = self.try_route(stream, Routed::new(request)) {
                 // SAFETY: failed initial insertion returns this uncharged route.
-                let error =
-                    match unsafe { book::raw::discard_route(input, &mut self.ingress.book.credit) }
-                    {
-                        Ok(()) => numbers::ErrorCode::EnhanceYourCalm,
-                        Err(error) => error.code(),
-                    };
-                self.ingress.reset(stream, error);
+                let error = match unsafe { book::raw::discard_route(input, &mut self.book.credit) }
+                {
+                    Ok(()) => numbers::ErrorCode::EnhanceYourCalm,
+                    Err(error) => error.code(),
+                };
+                self.reset(stream, error);
             }
             return;
         }
-        let body = match self.guard(router, stream, request) {
+        let body = match self.guard(router, stream, request, report) {
             Some(body) => body,
             None => return,
         };
@@ -257,7 +246,7 @@ where
     }
 }
 
-impl<'i, 'a, 'd: 'a, R, U> Begin<request::Plain<U>> for Head<'i, 'a, 'd, R>
+impl<'a, 'd: 'a, R, U> Begin<request::Plain<U>> for Ingress<'a, 'd, R>
 where
     R: decode::Decode,
     R::Head: request::Head<Start = request::Plain<U>>,
@@ -279,6 +268,7 @@ where
         head: Retained<R::Plan>,
         boundary: Boundary,
         limits: server::Config,
+        _: &mut impl FnMut(conn::Error),
     ) {
         let Some(request) = self.select(router, stream, head, boundary, limits)
         else {
@@ -288,9 +278,9 @@ where
     }
 }
 
-impl<'i, 'a, 'd: 'a, R>
+impl<'a, 'd: 'a, R>
     Begin<request::Guarded<<R::Routes as state::Family<R::Prepared>>::State<state::Routed>>>
-    for Head<'i, 'a, 'd, R>
+    for Ingress<'a, 'd, R>
 where
     R: decode::Guarded,
     R::Head: request::Head<
@@ -309,17 +299,18 @@ where
         head: Retained<R::Plan>,
         boundary: Boundary,
         limits: server::Config,
+        report: &mut impl FnMut(conn::Error),
     ) {
         let Some(request) = self.select(router, stream, head, boundary, limits) else {
             return;
         };
-        self.checked(router, stream, request, limits);
+        self.checked(router, stream, request, limits, report);
     }
 }
 
-impl<'i, 'a, 'd: 'a, R, U>
+impl<'a, 'd: 'a, R, U>
     Begin<request::Start<U, <R::Routes as state::Family<R::Prepared>>::State<state::Routed>>>
-    for Head<'i, 'a, 'd, R>
+    for Ingress<'a, 'd, R>
 where
     R: decode::Guarded,
     R::Head: request::Head<
@@ -342,6 +333,7 @@ where
         head: Retained<R::Plan>,
         boundary: Boundary,
         limits: server::Config,
+        report: &mut impl FnMut(conn::Error),
     ) {
         let Some(request) = self.select(router, stream, head, boundary, limits)
         else {
@@ -349,7 +341,7 @@ where
         };
         match request {
             request::Start::Plain(request) => self.plain(stream, request, limits),
-            request::Start::Guarded(request) => self.checked(router, stream, request, limits),
+            request::Start::Guarded(request) => self.checked(router, stream, request, limits, report),
         }
     }
 }

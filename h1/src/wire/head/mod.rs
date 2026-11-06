@@ -1,12 +1,12 @@
-use std::{mem, num::NonZero};
+use std::{convert::Infallible, mem, num::NonZero};
 
 use header::Policy as _;
 use o3::buffer::storage;
 use sark_core::route::{self, field::header};
 use sark_http::{
-    field::head::Flags,
+    field::head::{Flags, MAX_HEADER_LINE_BYTES},
     h1::{
-        field::{expect, syntax},
+        field::{expect, scan, syntax},
         framing::RequestBody,
         head::{
             Semantic,
@@ -15,14 +15,41 @@ use sark_http::{
         },
         target,
     },
-    request::Layout,
+    request::{Layout, span::Span},
 };
 
-use crate::wire::{parsing, recv, response};
+use crate::wire::{Failure, parsing, recv, response};
 
 pub mod line;
 mod pending;
 pub(crate) use pending::{Partial, Pending, Progress};
+
+/// Route-local admission over the canonical HTTP/1 field scan.
+pub trait Admission: Default {
+    type Admitted: Copy;
+    const MAX_BYTES: usize = recv::HEAD_CAPACITY;
+    const FIELDS: bool = true;
+
+    fn field(&mut self, _: &[u8], _: &[u8], _: Span) -> Result<(), Failure> {
+        Ok(())
+    }
+
+    fn finish(
+        self,
+        request: &Request<'_>,
+        fields: &Fields,
+        body: RequestBody,
+    ) -> Result<Self::Admitted, Failure>;
+}
+
+impl Admission for () {
+    type Admitted = ();
+    const FIELDS: bool = false;
+
+    fn finish(self, _: &Request<'_>, _: &Fields, _: RequestBody) -> Result<(), Failure> {
+        Ok(())
+    }
+}
 
 pub enum Error<R: route::Schema> {
     Storage(storage::AllocError),
@@ -49,16 +76,16 @@ pub enum Error<R: route::Schema> {
 
 /// One scanned HTTP/1 field block before request-target admission.
 #[doc(hidden)]
-pub struct Block<H> {
+pub struct Block<H, A = ()> {
     headers: H,
+    admission: A,
     fields: Fields,
-    flags: Flags,
     len: NonZero<u32>,
 }
 
-pub(crate) enum Scanned<'input, H> {
-    Complete(Block<H>),
-    Pending(Partial<'input, H>),
+pub(crate) enum Scanned<'input, H, A = ()> {
+    Complete(Block<H, A>),
+    Pending(Partial<'input, H, A>),
 }
 
 /// Persistence selected by one admitted HTTP/1 request head.
@@ -82,8 +109,9 @@ impl Connection {
 
 /// An admitted HTTP/1 request head with route-specific raw fields.
 #[doc(hidden)]
-pub struct Parsed<H> {
+pub struct Parsed<H, A: Admission = ()> {
     headers: H,
+    admission: A::Admitted,
     len: NonZero<u32>,
     body: RequestBody,
     expectation: expect::Decision,
@@ -94,18 +122,18 @@ pub struct Parsed<H> {
 
 /// An admitted request head paired with its permitted response coding.
 #[doc(hidden)]
-pub struct Gzip<H> {
-    head: Parsed<H>,
+pub struct Gzip<H, A: Admission = ()> {
+    head: Parsed<H, A>,
     coding: request::Coding,
 }
 
-impl<H> Parsed<H> {
+impl<H, A: Admission> Parsed<H, A> {
     pub const fn response(&self) -> response::Context {
         self.response
     }
 
-    pub(crate) fn into_headers(self) -> H {
-        self.headers
+    pub(crate) fn into_fields(self) -> (H, A::Admitted) {
+        (self.headers, self.admission)
     }
 
     pub const fn len(&self) -> NonZero<u32> {
@@ -129,7 +157,23 @@ impl<H> Parsed<H> {
     }
 }
 
-impl<H> Block<H> {
+#[cold]
+fn at_limit(
+    input: &[u8],
+    start: usize,
+    limit: usize,
+) -> Result<Option<NonZero<u32>>, syntax::Error> {
+    let suffix = scan::State::try_new(input, start, limit, limit, MAX_HEADER_LINE_BYTES)
+        .map_err(|(_, error)| error)?;
+    match suffix.advance::<Infallible>(|_| unreachable!("fields")) {
+        Ok(scan::Progress::Complete(head)) => Ok(Some(head.into_parts().2)),
+        Ok(scan::Progress::More(_)) => Ok(None),
+        Err((_, scan::Error::Syntax(error))) => Err(error),
+        Err((_, scan::Error::Sink(never))) => match never {},
+    }
+}
+
+impl<H, A: Admission> Block<H, A> {
     pub fn into_headers(self) -> H {
         self.headers
     }
@@ -185,7 +229,7 @@ impl<H> Block<H> {
         limit: usize,
         coding: request::Coding,
         version: Version,
-    ) -> Result<Scanned<'input, H>, Error<R>>
+    ) -> Result<Scanned<'input, H, A>, Error<R>>
     where
         H: Default,
         R: route::Schema<RawHeaders = H>,
@@ -194,7 +238,11 @@ impl<H> Block<H> {
             assert!(mem::size_of::<Result<(), Error<R>>>() == mem::size_of::<Error<R>>());
             assert!(mem::size_of::<line::Step<R>>() == mem::size_of::<line::Error<R>>());
         }
+        let available = input.len();
+        let maximum = A::MAX_BYTES.min(recv::HEAD_CAPACITY);
+        let input = &input[..input.len().min(maximum)];
         let mut headers = H::default();
+        let mut admission = A::default();
         let mut fields = Fields::default();
         let mut flags = Flags::default();
         let mut count = 0usize;
@@ -203,8 +251,21 @@ impl<H> Block<H> {
             let Some(rest) = input.get(pos..) else {
                 break None;
             };
-            let prefix = line::Scan::<R> {
+            if count >= limit {
+                break match at_limit(input, pos, limit) {
+                    Ok(len) => len.map(|len| len.get() as usize),
+                    Err(syntax::Error::TooMany) => {
+                        return Err(Error::Fields {
+                            actual: count.saturating_add(1),
+                            limit,
+                        });
+                    }
+                    Err(error) => return Err(Error::Syntax(error)),
+                };
+            }
+            let prefix = line::Scan::<R, A> {
                 headers: &mut headers,
+                admission: &mut admission,
                 input,
                 rest,
                 start: pos,
@@ -216,12 +277,6 @@ impl<H> Block<H> {
             match R::Header::prefix(prefix) {
                 line::Step::Complete(0) => break Some(Self::advance::<R>(input, pos, 0)?),
                 line::Step::Complete(relative) => {
-                    if count >= limit {
-                        return Err(Error::Fields {
-                            actual: count.saturating_add(1),
-                            limit,
-                        });
-                    }
                     count += 1;
                     pos = Self::advance::<R>(input, pos, relative)?;
                 }
@@ -230,9 +285,13 @@ impl<H> Block<H> {
             }
         };
         let Some(len) = len else {
+            if available > maximum {
+                return Err(Error::Length { len: available });
+            }
             return Ok(Scanned::Pending(Partial {
                 input,
                 headers,
+                admission,
                 fields,
                 flags,
                 count,
@@ -240,20 +299,17 @@ impl<H> Block<H> {
             }));
         };
         const { assert!(recv::HEAD_CAPACITY <= u32::MAX as usize) };
-        if len > recv::HEAD_CAPACITY {
-            return Err(Error::Length { len });
-        }
         let len = NonZero::new(len as u32).ok_or(Error::Length { len })?;
         Ok(Scanned::Complete(Self {
             headers,
+            admission,
             fields,
-            flags,
             len,
         }))
     }
 }
 
-impl<H> Parsed<H> {
+impl<H, A: Admission> Parsed<H, A> {
     /// Parses and admits one route-specific HTTP/1 request head.
     #[doc(hidden)]
     pub fn parse<R>(source: &parsing::Head<'_>, limit: usize) -> Result<Option<Self>, Error<R>>
@@ -263,7 +319,7 @@ impl<H> Parsed<H> {
     {
         let input = source.input().as_slice();
         let request = source.request();
-        let Some(block) = Block::<H>::parse::<R>(
+        let Some(block) = Block::<H, A>::parse::<R>(
             input,
             request.end(),
             limit,
@@ -276,14 +332,14 @@ impl<H> Parsed<H> {
         Self::from_block::<R>(block, request).map(Some)
     }
 
-    pub(crate) fn from_block<R>(block: Block<H>, request: &Request<'_>) -> Result<Self, Error<R>>
+    pub(crate) fn from_block<R>(block: Block<H, A>, request: &Request<'_>) -> Result<Self, Error<R>>
     where
         R: route::Schema<RawHeaders = H>,
     {
         let Block {
             headers,
+            admission,
             fields,
-            flags,
             len,
         } = block;
         let admit = fields
@@ -303,13 +359,19 @@ impl<H> Parsed<H> {
         if fields.message.has_other_transfer_coding() {
             return Err(Error::UnsupportedTransferEncoding);
         }
-        let conn = if flags.is_close(request.version().as_bytes()) {
-            Connection::Close
-        } else {
-            Connection::KeepAlive
-        };
+        let options = fields.routing.connection();
+        let conn =
+            if options.is_close() || (!options.is_keep() && request.version() == Version::Ten) {
+                Connection::Close
+            } else {
+                Connection::KeepAlive
+            };
+        let admission = admission
+            .finish(request, &fields, admit.body())
+            .map_err(|error| Error::Line(line::Error::Admission(error)))?;
         Ok(Self {
             headers,
+            admission,
             len,
             body: admit.body(),
             expectation: admit.expectation(),
@@ -320,7 +382,7 @@ impl<H> Parsed<H> {
     }
 }
 
-impl<H> Gzip<H> {
+impl<H, A: Admission> Gzip<H, A> {
     #[doc(hidden)]
     pub fn parse<R>(
         source: &parsing::Head<'_>,
@@ -334,7 +396,7 @@ impl<H> Gzip<H> {
         let input = source.input().as_slice();
         let request = source.request();
         let Some(block) =
-            Block::<H>::parse::<R>(input, request.end(), limit, coding, request.version())?
+            Block::<H, A>::parse::<R>(input, request.end(), limit, coding, request.version())?
         else {
             return Ok(None);
         };
@@ -342,7 +404,7 @@ impl<H> Gzip<H> {
         Parsed::from_block::<R>(block, request).map(|head| Some(Self { head, coding }))
     }
 
-    pub(crate) fn into_parts(self) -> (Parsed<H>, request::Coding) {
+    pub(crate) fn into_parts(self) -> (Parsed<H, A>, request::Coding) {
         (self.head, self.coding)
     }
 }

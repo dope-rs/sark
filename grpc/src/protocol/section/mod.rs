@@ -1,5 +1,7 @@
 //! One-pass gRPC field-section admission and retained ownership.
 
+use sark_http::field::metadata::{packed, section::rules};
+
 use seal::Seal;
 
 const JOINED: u32 = 1 << 31;
@@ -8,15 +10,14 @@ mod iter;
 mod owner;
 mod part;
 mod plan;
-mod request;
 pub(crate) mod seal;
 mod trailers;
 mod view;
 
 pub(crate) use iter::Iter;
-pub use owner::Owner;
+pub type Owner = packed::Decoded<o3::buffer::pool::Span, { seal::LEN }>;
+pub type Plan = rules::RetainRaw<{ seal::LEN }>;
 pub(crate) use owner::{Valid, fold::Failure};
-pub use plan::Plan;
-pub(crate) use request::Request;
+pub(crate) use plan::build;
 pub(crate) use trailers::{Terminal, Trailers};
 pub(in crate::protocol) use view::View;

@@ -7,7 +7,7 @@ use sark_core::{
     life::session,
     manifold::{server::drain, stream::Boundary},
 };
-use sark_http::field::metadata::section::{self, rules, state::Selected};
+use sark_http::field::metadata::section::{rules, state::Selected};
 
 use crate::{
     conn::{
@@ -26,9 +26,6 @@ impl From<Complete> for frame::Block {
         Self::End
     }
 }
-
-type Ready<'a, F, C, E> =
-    event::Ready<'a, event::Event<Selected<F>, <F as section::Policy>::Block, C, E>>;
 
 #[repr(transparent)]
 pub struct Ingress<
@@ -83,7 +80,7 @@ where
             if !self.conn.ingress.input.is_ready()
                 || !self.conn.ingress.input.bytes.is_empty()
                 || self.conn.ingress.headers.pending().is_some()
-                || self.conn.ingress.decoder_blocked
+                || self.is_blocked()
             {
                 self.resume()?;
             }
@@ -160,8 +157,8 @@ where
         self.ready_event().map(drain::Ready::take)
     }
 
-    pub fn ready_event(&mut self) -> Option<Ready<'_, F, C, E>> {
-        self.conn.ingress.events.ready()
+    pub fn ready_event(&mut self) -> Option<event::Ready<'_, R, F, C, A, E>> {
+        machine::ready::Incoming::new(self.conn)
     }
 
     pub fn has_event(&self) -> bool {

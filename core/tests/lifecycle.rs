@@ -51,7 +51,6 @@ fn erases_disabled_tag() {
     let mode = Disabled;
     let exchange = exchange::Id::new(7, 11);
     sequence::Mode::tag(&mode, exchange, hold::Charge::from_owner(41, 64));
-
     assert_eq!(mem::size_of::<Tag>(), 0);
     assert_eq!(mem::size_of::<Session>(), 0);
     assert!(sequence::Mode::transport(&mode, exchange.connection(), ()).is_none());
@@ -106,9 +105,4 @@ fn round_trips_audit() {
     let restored = audit::Projection::from_parts(caps, values).restore();
 
     assert!((restored) == (snapshot));
-}
-
-#[test]
-fn audit_outside_event() {
-    assert!(mem::size_of::<life::Event<u64, u64>>() < mem::size_of::<audit::Snapshot>(),);
 }

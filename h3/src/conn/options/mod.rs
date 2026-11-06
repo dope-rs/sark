@@ -1,6 +1,6 @@
 //! HTTP/3 connection options and their exact validation failures.
 
-use std::{alloc::LayoutError, fmt, num::TryFromIntError};
+use std::{alloc::LayoutError, num::TryFromIntError};
 
 use o3::depot::{capacity, map};
 use sark_http::field::metadata::block;
@@ -143,22 +143,10 @@ pub enum Resource {
     OutboundResidentByte,
 }
 
-impl fmt::Display for Resource {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        fmt::Debug::fmt(self, f)
-    }
-}
-
 #[derive(Clone, Copy, Debug)]
 pub enum Arithmetic {
     Add,
     Mul,
-}
-
-impl fmt::Display for Arithmetic {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        fmt::Debug::fmt(self, f)
-    }
 }
 
 #[derive(Clone, Debug)]

@@ -7,10 +7,11 @@ pub(in crate::server::task) struct Taken<'d, ID: Identity, T> {
     pub(in crate::server::task) target: Target<'d, ID>,
     pub(in crate::server::task) stream: stream::Key,
     pub(in crate::server::task) task: T,
+    pub(in crate::server::task) unreported: bool,
 }
 
 impl<'d, ID: Identity, T> Taken<'d, ID, T> {
-    pub(in crate::server::task) fn into_parts(self) -> (Target<'d, ID>, stream::Key, T) {
-        (self.target, self.stream, self.task)
+    pub(in crate::server::task) fn into_parts(self) -> (Target<'d, ID>, stream::Key, T, bool) {
+        (self.target, self.stream, self.task, self.unreported)
     }
 }

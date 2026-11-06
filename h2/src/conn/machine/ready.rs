@@ -3,17 +3,43 @@ use sark_core::{
     life::session,
     manifold::server::{self, drain},
 };
-use sark_http::field::metadata::section::{rules, state::Selected};
+use sark_http::field::metadata::section::rules;
 
 use crate::{
     conn,
     conn::{event, machine},
 };
 
+mod raw;
+
+/// One resident event, retaining exclusive access to its connection until consumed.
+#[must_use]
+#[repr(transparent)]
+pub struct Incoming<'a, R, F, C, A, E>(&'a mut machine::Connection<R, F, C, A, E>)
+where
+    R: crate::Role,
+    F: rules::Policy,
+    C: session::Storage,
+    A: rules::Push,
+    E: event::Evidence;
+
+impl<'a, R, F, C, A, E> Incoming<'a, R, F, C, A, E>
+where
+    R: crate::Role,
+    F: rules::Policy,
+    C: session::Storage,
+    A: rules::Push,
+    E: event::Evidence,
+{
+    pub(super) fn new(conn: &'a mut machine::Connection<R, F, C, A, E>) -> Option<Self> {
+        (!conn.ingress.events.is_empty()).then_some(Self(conn))
+    }
+}
+
 /// A server event that remains resident in its owning connection queue.
 #[must_use]
 #[repr(transparent)]
-pub struct Ready<'a, F, C, E>(event::Ready<'a, event::Event<Selected<F>, F::Block, C, E>>)
+pub struct Ready<'a, F, C, E>(Incoming<'a, crate::ServerRole, F, C, rules::RejectPush, E>)
 where
     F: rules::Policy,
     C: session::Storage,
@@ -26,7 +52,7 @@ where
     E: event::Evidence,
 {
     pub(super) const fn new(
-        ready: event::Ready<'a, event::Event<Selected<F>, F::Block, C, E>>,
+        ready: Incoming<'a, crate::ServerRole, F, C, rules::RejectPush, E>,
     ) -> Self {
         Self(ready)
     }

@@ -1,6 +1,6 @@
 pub mod common;
 
-use std::{cell::Cell, net::Shutdown, ptr, rc::Rc};
+use std::{cell::Cell, net::Shutdown, ptr, rc::Rc, time::Instant};
 
 use common::{
     app::{App, Event, Facts, PREFIX},
@@ -13,7 +13,6 @@ use dope::{
             route::{FrameworkTag, KeyTag, Tag, kind, table::conn::Capacity},
         },
         io::socket::{Backlog, option},
-        platform::wake,
     },
     manifold::{
         app::{Host, env::Bundle},
@@ -31,7 +30,7 @@ use dope_test::{
     fibers,
     harness::{
         GUARD,
-        peer::Peer,
+        peer::{self, Peer},
         signals::{Gate, Progress as _},
     },
     reclaim,
@@ -276,13 +275,7 @@ fn switch_moves_tail_once() {
             handoffs::Event::Cycle(cycle) => {
                 assert!(matches!(cycle.connection, head::Connection::KeepAlive));
                 assert!(
-                    matches!(
-                        &cycle.state,
-                        Ok(pump::Egress::Write {
-                            body: pump::Body::Static(_),
-                            ..
-                        })
-                    ),
+                    matches!(&cycle.state, Ok(pump::Egress::Static { .. })),
                     "switch must publish its exact static response owner"
                 );
                 3
@@ -370,60 +363,54 @@ fn switch_moves_tail_once() {
                             let addr = app.inspect(Host::manifold, |server| {
                                 Listener::local_addr(server.get_ref())
                             });
-                            let (wait, release) =
-                                wake::Ends::blocking().expect("handoff peer gate").split();
-                            Peer::at(addr)
-                                .with(
-                                    move |socket| {
-                                        socket.read_wait(Some(GUARD)).expect("read deadline");
-                                        socket.write_wait(Some(GUARD)).expect("write deadline");
-                                        socket.write_all(b"Rtail").expect("listener operation");
-                                        wait.wait_timeout(GUARD).expect("handoff admission");
-                                        socket.write_all(b"later").expect("listener operation");
-                                        socket
-                                            .shutdown(Shutdown::Write)
-                                            .expect("listener operation");
-                                        Peer::try_read_all(socket)
-                                    },
-                                    |peer| {
-                                        assert_eq!(
-                                            fibers::TEST
-                                                .try_wait(&mut app, &sent, 1)
-                                                .expect("listener progress"),
-                                            fibers::Wait::Reached
-                                        );
-                                        assert_eq!(
-                                            moved.hits(),
-                                            0,
-                                            "send progress forged a commit"
-                                        );
-                                        assert_eq!(owner.get(), None);
-                                        release.notify().expect("release handoff peer");
-                                        assert_eq!(
-                                            fibers::TEST
-                                                .try_wait(&mut app, &moved, 1)
-                                                .expect("listener progress"),
-                                            fibers::Wait::Reached
-                                        );
-                                        assert_eq!(
-                                            fibers::TEST
-                                                .try_wait(&mut app, &closed, 1)
-                                                .expect("listener progress"),
-                                            fibers::Wait::Reached
-                                        );
-                                        let reply = peer
-                                            .finish()
-                                            .expect("listener operation")
-                                            .expect("listener operation");
-                                        assert_eq!(
-                                            reply.as_slice(),
-                                            handoffs::SWITCH_BYTES.as_slice()
-                                        );
-                                        assert_eq!(owner.get(), Some(7));
-                                        assert_eq!(raw.take().as_slice(), b"taillater");
-                                    },
-                                )
-                                .expect("handoff peer")
+                            let socket = Peer::at(addr).try_connect().expect("handoff peer");
+                            socket.read_wait(Some(GUARD)).expect("read deadline");
+                            socket.write_wait(Some(GUARD)).expect("write deadline");
+                            socket.write_all(b"Rtail").expect("listener operation");
+                            assert_eq!(
+                                fibers::TEST
+                                    .try_wait(&mut app, &sent, 1)
+                                    .expect("listener progress"),
+                                fibers::Wait::Reached
+                            );
+                            assert_eq!(moved.hits(), 0, "send progress forged a commit");
+                            assert_eq!(owner.get(), None);
+                            socket.write_all(b"later").expect("listener operation");
+                            socket
+                                .shutdown(Shutdown::Write)
+                                .expect("listener operation");
+                            socket.nonblock(true);
+                            let deadline = Instant::now() + GUARD;
+                            let mut reply = Vec::new();
+                            loop {
+                                match socket.read_to_end(&mut reply) {
+                                    Ok(_) => break,
+                                    Err(peer::Error::Syscall(error))
+                                        if error.is_block() || error.is_intr() => {}
+                                    Err(error) => panic!("listener operation: {error:?}"),
+                                }
+                                let remaining = deadline
+                                    .checked_duration_since(Instant::now())
+                                    .expect("listener deadline");
+                                fibers::Harness::new(remaining)
+                                    .try_run(&mut app, fibers::Yield::new())
+                                    .expect("listener progress");
+                            }
+                            assert_eq!(
+                                fibers::TEST
+                                    .try_wait(&mut app, &moved, 1)
+                                    .expect("listener progress"),
+                                fibers::Wait::Reached
+                            );
+                            assert_eq!(
+                                fibers::TEST
+                                    .try_wait(&mut app, &closed, 1)
+                                    .expect("listener progress"),
+                                fibers::Wait::Reached
+                            );
+                            assert_eq!(reply.as_slice(), handoffs::SWITCH_BYTES.as_slice());
+                            assert_eq!(owner.get(), Some(7));
+                            assert_eq!(raw.take().as_slice(), b"taillater");
                         },
                     )
                 })

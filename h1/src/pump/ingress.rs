@@ -9,7 +9,7 @@ use crate::{
     pump,
     server::deadline,
     session, switch,
-    wire::{head, output, recv},
+    wire::{head, recv},
 };
 
 /// Stateless owner of HTTP ingress transitions.
@@ -226,28 +226,29 @@ impl Ingress {
         conn.deferred = batch.connection;
         let (egress, intent) = match (conn.async_state.activity(), batch.output) {
             (pump::Activity::Task | pump::Activity::Stream, batch::Output::Streamed) => (
-                pump::Egress::Write {
+                pump::Egress::Inline {
                     prefix: batch.written,
-                    body: pump::Body::None,
                 },
                 head::Connection::KeepAlive,
             ),
             (pump::Activity::Task | pump::Activity::Stream, batch::Output::Park) => {
                 (pump::Egress::Wake, head::Connection::KeepAlive)
             }
-            (_, batch::Output::Split(body)) => (
-                pump::Egress::Write {
-                    prefix: batch.written,
-                    body: pump::Body::from_split(body),
-                },
-                batch.connection,
-            ),
+            (_, batch::Output::Split(body)) => {
+                let prefix = batch.written;
+                let egress = match body {
+                    batch::SplitBody::Static(body) => pump::Egress::Static { prefix, body },
+                    batch::SplitBody::Shared(body) => pump::Egress::Shared { prefix, body },
+                    batch::SplitBody::Frozen(body) => pump::Egress::Frozen { prefix, body },
+                    batch::SplitBody::Segmented(body) => pump::Egress::Segmented { prefix, body },
+                };
+                (egress, batch.connection)
+            }
             (_, batch::Output::Close(reason)) if batch.written > 0 => {
                 conn.deferred_action = Some(reason);
                 (
-                    pump::Egress::Write {
+                    pump::Egress::Inline {
                         prefix: batch.written,
-                        body: pump::Body::None,
                     },
                     batch.connection,
                 )
@@ -256,24 +257,22 @@ impl Ingress {
                 if batch.written > 0 =>
             {
                 (
-                    pump::Egress::Write {
+                    pump::Egress::Inline {
                         prefix: batch.written,
-                        body: pump::Body::None,
                     },
                     batch.connection,
                 )
             }
             (_, batch::Output::Streamed) => (
-                pump::Egress::Write {
+                pump::Egress::Inline {
                     prefix: batch.written,
-                    body: pump::Body::None,
                 },
                 batch.connection,
             ),
             (_, batch::Output::Yield) => (pump::Egress::Wake, batch.connection),
             (_, batch::Output::Close(reason)) => {
                 conn.deferred = head::Connection::Close;
-                pump::Egress::output(output::Plan::Close(reason))
+                pump::Egress::close(reason)
             }
             (_, batch::Output::None | batch::Output::Park) => {
                 (pump::Egress::None, batch.connection)

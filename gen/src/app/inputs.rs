@@ -70,8 +70,14 @@ pub(super) struct Route {
 
 pub(super) enum Kind {
     Sync,
-    Async { capacity: syn::Expr, body: Body },
-    Stream { capacity: syn::Expr },
+    Async {
+        capacity: syn::Expr,
+        body: Body,
+        stream: bool,
+    },
+    Stream {
+        capacity: syn::Expr,
+    },
 }
 
 pub(super) enum Body {
@@ -241,6 +247,10 @@ impl parse::Parse for Route {
         use syn::token::Paren;
         let (kind, ty) = match Word::Async.try_take(input)? {
             Some(keyword) => keyword.parse_with(input, |input| {
+                let stream = match Word::Stream.try_take(input)? {
+                    Some(word) => word.parse_with(input, |_| Ok(true))?,
+                    None => false,
+                };
                 if !input.peek(Paren) {
                     return Err(
                         input.error("async routes require `(capacity = EXPR, body = KIND)`")
@@ -260,7 +270,14 @@ impl parse::Parse for Route {
                 options.parse::<syn::Token![=]>()?;
                 let body = options.parse()?;
                 finish_options(&options, true)?;
-                Ok((Kind::Async { capacity, body }, input.parse()?))
+                Ok((
+                    Kind::Async {
+                        capacity,
+                        body,
+                        stream,
+                    },
+                    input.parse()?,
+                ))
             })?,
             None => match Word::Stream.try_take(input)? {
                 Some(keyword) => keyword.parse_with(input, |input| {

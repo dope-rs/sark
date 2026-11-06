@@ -1,7 +1,7 @@
 use std::{mem, num::NonZero, ops, task::Poll};
 
 use o3::{
-    alloc::{self, VecExt as _},
+    alloc::{self, BoxUninitExt as _, VecExt as _},
     buffer::{resident, segments, storage},
 };
 use sark_http::payload::{owned, response::Body as _};
@@ -332,18 +332,17 @@ impl<'d> Input<'d> {
         };
         let (segment, local) = self.locate(range.start).ok_or(Error::Invalid)?;
         if len.get() <= self.segments[segment].owner.len() - local {
-            let owner = self.segments[segment]
+            let view = self.segments[segment]
                 .owner
                 .get(local..local + len.get())
-                .ok_or(Error::Invalid)?
-                .try_retain()
-                .map_err(Error::Retain)?;
-            return match owner.try_detach() {
-                Ok(shared) => Ok(shared),
-                Err(owner) => storage::Shared::try_copy(owner.as_slice()).map_err(Error::from),
+                .ok_or(Error::Invalid)?;
+            let bytes = view.as_slice();
+            return match view.try_own().map_err(Error::Retain)? {
+                Some(shared) => Ok(shared),
+                None => storage::Shared::try_copy(bytes).map_err(Error::from),
             };
         }
-        let mut output = alloc::array::Block::try_new(len.get(), ()).map_err(Error::Allocation)?;
+        let mut output = Box::try_uninit(len.get()).map_err(Error::Allocation)?;
         let mut target = &mut output[..];
         let mut index = range.start;
         let mut parts = self.segments[segment..].iter();
@@ -361,7 +360,7 @@ impl<'d> Input<'d> {
             index += take;
         }
         // SAFETY: consuming every exclusive target suffix initialized the exact allocation.
-        let mut output = unsafe { alloc::raw::AssumeInit::assume_init(output) }.into_vec();
+        let mut output = unsafe { output.assume_init() }.into_vec();
         storage::Shared::try_from(&mut output).map_err(Error::Exhausted)
     }
 }

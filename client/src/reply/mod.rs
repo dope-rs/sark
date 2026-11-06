@@ -43,11 +43,10 @@ impl<'a, S: AsRef<[u8]>> Headers<'a, S> {
 ///
 pub struct Scoped<'a, 'd> {
     status: status::Code,
-    coding: Coding,
+    coding: Option<Coding>,
     headers: response::Fields<resident::Shared<'d>>,
     trailers: Option<response::Fields<resident::Shared<'d>>>,
     body: body::Scoped<'a, 'd>,
-    omitted: bool,
 }
 
 impl<'a, 'd> Scoped<'a, 'd> {
@@ -58,7 +57,7 @@ impl<'a, 'd> Scoped<'a, 'd> {
     pub fn headers(&self) -> Headers<'_, resident::Shared<'d>> {
         Headers {
             fields: &self.headers,
-            omitted: self.omitted,
+            omitted: self.coding.is_none(),
         }
     }
 
@@ -73,11 +72,6 @@ impl<'a, 'd> Scoped<'a, 'd> {
     /// Transfers the body owner and releases the unused response fields.
     pub fn into_body(self) -> body::Scoped<'a, 'd> {
         self.body
-    }
-
-    fn omit_coding(&mut self) {
-        self.coding = Coding::None;
-        self.omitted = true;
     }
 
     /// Detaches every owner while preserving body segment boundaries.
@@ -163,7 +157,7 @@ impl<'a, 'd> Scoped<'a, 'd> {
             headers,
             trailers,
             body,
-            omitted: self.omitted,
+            omitted: self.coding.is_none(),
         })
     }
 }

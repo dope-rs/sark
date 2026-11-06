@@ -83,12 +83,11 @@ where
         } = &mut *self.conn;
         let encoder = &mut egress.headers;
         let send = {
-            let stream = &mut active
+            let record = active
                 .store
                 .active_mut(key)
-                .ok_or(conn::Error::InactiveStream(key))?
-                .stream;
-            match stream::Sending::new(stream.state, boundary) {
+                .ok_or(conn::Error::InactiveStream(key))?;
+            match stream::Sending::new(record.state, boundary) {
                 Ok(send) => send,
                 Err(error) => return Err(conn::Error::Transition(key.id(), error)),
             }
@@ -144,11 +143,10 @@ where
                 return Ok(ControlFlow::Break(full));
             }
         };
-        let stream = &mut record.stream;
-        let next = send.apply(stream.state);
-        stream.state = next;
+        let next = send.apply(record.state);
+        record.state = next;
         if next == stream::State::Closed {
-            state.active_streams.remove_key(key);
+            state.active_streams.remove_key(key, false);
         }
         Ok(ControlFlow::Continue(()))
     }
@@ -233,7 +231,6 @@ where
             .next_local()
             .ok_or(conn::Error::StreamIdExhausted)?;
         let proof = next.id();
-        let id = proof.get();
         let send = self.conn.state.settings.peer.initial_window_size;
         let recv = self.conn.state.settings.local.initial_window_size;
         let active = self.conn.state.active_streams.store.local_len();
@@ -247,7 +244,13 @@ where
             .store
             .vacant(proof)
             .map_err(conn::Error::Admission)?;
-        let key = vacant.insert(stream::Lifecycle::open_local(boundary), send, recv, 0);
+        let key = vacant.insert(
+            stream::Lifecycle::open_local(boundary),
+            send,
+            recv,
+            0,
+            false,
+        );
         let outputs::Egress {
             outbound,
             headers: encoder,
@@ -261,7 +264,7 @@ where
         ) {
             Ok(method) => method,
             Err(error) => {
-                self.conn.state.active_streams.remove(id);
+                self.conn.state.active_streams.remove_key(key, false);
                 return Err(error);
             }
         };
@@ -271,7 +274,6 @@ where
             .store
             .active_mut(key)
             .ok_or(conn::Error::InactiveStream(key))?
-            .stream
             .method = Some(method);
         next.commit();
         Ok(key)
@@ -291,7 +293,7 @@ where
             .active_streams
             .store
             .record_at(key)
-            .and_then(|record| record.stream.method)
+            .and_then(|record| record.method)
             .ok_or(conn::Error::InactiveStream(key))
     }
 

@@ -380,6 +380,30 @@ pub trait Block: Sized {
     fn into_bytes(self) -> Bytes;
 }
 
+/// Retained layout for a field-list limit that includes 32 bytes per field.
+#[doc(hidden)]
+pub fn try_layout<B: Block>(
+    base: pool::Layout,
+    limit: usize,
+) -> Result<pool::Layout, (usize, pool::LayoutError)> {
+    let prefix = B::PREFIX.len();
+    if prefix == 0 {
+        return Ok(base);
+    }
+    // Packed fields use nine bytes beyond their name and value; tagged fields
+    // retain no more. One admitted field therefore pays for this much prefix.
+    let capacity = if limit <= crate::payload::compress::dynamic::ENTRY_OVERHEAD {
+        limit.max(prefix).max(1)
+    } else {
+        limit
+            .checked_add(prefix.saturating_sub(
+                crate::payload::compress::dynamic::ENTRY_OVERHEAD - prefix::Prefix::LEN,
+            ))
+            .ok_or((limit, pool::LayoutError::CapacityTooLarge))?
+    };
+    pool::Layout::new(base.slots() as usize, capacity).map_err(|error| (capacity, error))
+}
+
 impl Block for Fields {
     type Format = Tagged;
 

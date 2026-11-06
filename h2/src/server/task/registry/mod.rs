@@ -22,4 +22,6 @@ pub(in crate::server::task) struct Record<'d, ID: Identity, T> {
     pub(in crate::server::task) connection: conn::Id<'d, ID>,
     pub(in crate::server::task) stream: stream::Key,
     pub(in crate::server::task) task: T,
+    /// No TaskPollReady has been reported for this admission.
+    pub(in crate::server::task) unreported: bool,
 }
