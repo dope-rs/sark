@@ -7,7 +7,7 @@ use o3::{
 };
 use task::{
     Target,
-    registry::{Error, Index, Record, Tag, Taken, Vacant},
+    registry::{Error, Index, Record, Tag, Vacant},
 };
 
 use crate::{server::task, stream};
@@ -57,18 +57,11 @@ impl<'d, ID: Identity + 'd, T> Table<'d, ID, T> {
         &mut self,
         index: &mut Index,
         stream: stream::Key,
-    ) -> Option<Taken<'d, ID, T>> {
+    ) -> Option<(stream::Key, T, bool)> {
         let slot = index.entry(stream)?;
-        let target = Target::new(*slot.get());
-        let entry = self.tasks.entry(target.key())?;
+        let entry = self.tasks.entry(*slot.get())?;
         slot.discard();
-        let record = entry.remove();
-        Some(Taken {
-            target,
-            stream: record.stream,
-            task: record.task,
-            unreported: record.unreported,
-        })
+        Some(entry.remove().into_parts())
     }
 
     pub(in crate::server::task) fn get(&self, index: &Index, stream: stream::Key) -> Option<&T> {
@@ -78,20 +71,12 @@ impl<'d, ID: Identity + 'd, T> Table<'d, ID, T> {
     pub(in crate::server::task) fn take_target(
         index: &mut Index,
         entry: Entry<'_, 'd, ID, T>,
-    ) -> Option<Taken<'d, ID, T>> {
-        let target = Target::new(entry.key());
-        let record = entry.as_ref();
-        let slot = index.entry(record.stream)?;
-        if *slot.get() != target.key() {
+    ) -> Option<(stream::Key, T, bool)> {
+        let slot = index.entry(entry.as_ref().stream)?;
+        if *slot.get() != entry.key() {
             return None;
         }
         slot.discard();
-        let record = entry.remove();
-        Some(Taken {
-            target,
-            stream: record.stream,
-            task: record.task,
-            unreported: record.unreported,
-        })
+        Some(entry.remove().into_parts())
     }
 }

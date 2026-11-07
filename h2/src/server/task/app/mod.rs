@@ -774,10 +774,9 @@ where
                 let Some(stream) = index.key_at(at) else {
                     continue;
                 };
-                let Some(taken) = this.tasks.take_stream(index, stream) else {
+                let Some((stream, task, unreported)) = this.tasks.take_stream(index, stream) else {
                     continue;
                 };
-                let (_, stream, task, unreported) = taken.into_parts();
                 Runtime::cancel(this.router.as_mut(), task);
                 if unreported {
                     this.mode

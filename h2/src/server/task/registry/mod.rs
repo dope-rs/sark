@@ -5,12 +5,10 @@ use crate::stream;
 
 mod error;
 mod table;
-mod taken;
 mod vacant;
 
 pub(in crate::server::task) use error::Error;
 pub(in crate::server::task) use table::Table;
-pub(in crate::server::task) use taken::Taken;
 pub(in crate::server::task) use vacant::Vacant;
 
 pub(in crate::server) enum Tag {}
@@ -24,4 +22,10 @@ pub(in crate::server::task) struct Record<'d, ID: Identity, T> {
     pub(in crate::server::task) task: T,
     /// No TaskPollReady has been reported for this admission.
     pub(in crate::server::task) unreported: bool,
+}
+
+impl<ID: Identity, T> Record<'_, ID, T> {
+    fn into_parts(self) -> (stream::Key, T, bool) {
+        (self.stream, self.task, self.unreported)
+    }
 }

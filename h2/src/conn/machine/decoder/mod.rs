@@ -112,16 +112,12 @@ where
     }
 
     pub(super) fn drive(&mut self) -> Result<(), conn::Error> {
-        self.drive_run(&mut iter::empty::<Result<C, conn::Error>>())
+        self.drive_run(&mut iter::empty())
     }
 
-    fn refill<I, X>(&mut self, source: &mut I) -> Result<Refill, conn::Error>
-    where
-        I: Iterator<Item = Result<C, X>>,
-        conn::Error: From<X>,
-    {
+    fn refill(&mut self, source: &mut impl Iterator<Item = C>) -> Result<Refill, conn::Error> {
         let bytes = match source.next() {
-            Some(bytes) => bytes?,
+            Some(bytes) => bytes,
             None => return Ok(Refill::Exhausted),
         };
         match self.conn.ingress.input.push(bytes) {
@@ -131,11 +127,10 @@ where
         Ok(Refill::Added)
     }
 
-    pub(super) fn drive_run<I, X>(&mut self, source: &mut I) -> Result<(), conn::Error>
-    where
-        I: Iterator<Item = Result<C, X>>,
-        conn::Error: From<X>,
-    {
+    pub(super) fn drive_run(
+        &mut self,
+        source: &mut impl Iterator<Item = C>,
+    ) -> Result<(), conn::Error> {
         loop {
             use conn::ingress::{self, input::Preface};
             let max = self.conn.state.settings.local.max_frame_size;

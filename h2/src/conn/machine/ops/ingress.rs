@@ -309,7 +309,7 @@ where
         let result = decoder::Decoder {
             conn: &mut *self.conn,
         }
-        .drive_run(&mut source.map(Ok::<C, conn::Error>));
+        .drive_run(source);
         self.finish_drive(result)
     }
 

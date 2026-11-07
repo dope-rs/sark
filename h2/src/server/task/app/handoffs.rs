@@ -64,18 +64,17 @@ where
     }
 
     fn complete(self, target: Target<'d, ID>, output: A::Fixed) -> Self::Ready {
-        let Some(taken) = self
+        let Some((stream, task, unreported)) = self
             .tasks
             .owner(target, self.connection)
             .and_then(|entry| registry::Table::take_target(self.task_index, entry))
         else {
             return Ok(());
         };
-        if !taken.unreported {
-            return Err((taken.stream, numbers::ErrorCode::InternalError));
+        if !unreported {
+            return Err((stream, numbers::ErrorCode::InternalError));
         }
-        let stream = taken.stream;
-        drop(taken);
+        drop(task);
         let call = identify(self.connection, stream);
         self.mode.observe(life::Event::TaskPollReady(call));
         let next = self.state.activation(self.limits);

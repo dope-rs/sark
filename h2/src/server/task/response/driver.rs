@@ -91,11 +91,11 @@ where
     }
 
     fn release_task(&mut self, stream: stream::Key) -> bool {
-        let Some(taken) = self.tasks.take_stream(self.index, stream) else {
+        let Some((_, task, unreported)) = self.tasks.take_stream(self.index, stream) else {
             return false;
         };
-        Runtime::cancel(self.router.as_mut(), taken.task);
-        taken.unreported
+        Runtime::cancel(self.router.as_mut(), task);
+        unreported
     }
 
     fn finish(&mut self, stream: stream::Key, outcome: life::Outcome) {

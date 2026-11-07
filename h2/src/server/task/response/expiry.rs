@@ -39,10 +39,10 @@ where
         Due::Exchange { key, phase } => {
             let xchg = task::identify(conn, key);
             let mut expiry = None;
-            if let Some(taken) = tasks.take_stream(index, key) {
+            if let Some((_, task, unreported)) = tasks.take_stream(index, key) {
                 expiry = Some(xchg.begin_expiry(mode, phase));
-                Runtime::cancel(router, taken.task);
-                if taken.unreported {
+                Runtime::cancel(router, task);
+                if unreported {
                     mode.observe(life::Event::TaskCancelled(xchg));
                 }
             }

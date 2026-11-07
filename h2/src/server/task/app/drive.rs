@@ -289,9 +289,9 @@ where
                 cause::Staging::Reset,
             );
         }
-        if let Some(taken) = self.tasks.take_stream(self.index, stream) {
-            Runtime::cancel(self.router.as_mut(), taken.task);
-            if taken.unreported {
+        if let Some((_, task, unreported)) = self.tasks.take_stream(self.index, stream) {
+            Runtime::cancel(self.router.as_mut(), task);
+            if unreported {
                 self.mode.observe(life::Event::TaskCancelled(exchange));
             }
         }
@@ -380,10 +380,10 @@ where
                         cause::Staging::Reset,
                     );
                 }
-                if let Some(taken) = self.tasks.take_stream(self.index, stream) {
+                if let Some((_, task, unreported)) = self.tasks.take_stream(self.index, stream) {
                     retire = true;
-                    Runtime::cancel(self.router.as_mut(), taken.task);
-                    if taken.unreported {
+                    Runtime::cancel(self.router.as_mut(), task);
+                    if unreported {
                         self.mode.observe(life::Event::TaskCancelled(exchange));
                     }
                 }
