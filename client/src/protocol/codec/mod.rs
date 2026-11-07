@@ -308,10 +308,7 @@ impl Codec {
             Framing::UntilEof { received, content } => {
                 self.parse_eof(state, input, received, content, admit)
             }
-            Framing::Failed => {
-                state.framing = Framing::Failed;
-                Ok(Self::more(input, None))
-            }
+            Framing::Failed => unreachable!("framing"),
         }
     }
 }

@@ -13,8 +13,7 @@ use sark_core::{
         request::admit::{Start as _, Stop as _},
         state,
     },
-    duplex,
-    life::{self, Observer as _},
+    duplex, life,
     manifold::{
         stream::Boundary,
         task::{app::Runtime, response},
@@ -155,9 +154,7 @@ where
     }
 
     fn reject(self, error: requests::Error) -> Outcome {
-        if let Some(observer) = self.life.observer() {
-            observer.diagnostic(&error);
-        }
+        self.life.diagnostic(&error);
         Outcome::Reject(server::request_error_code(error))
     }
 
@@ -239,9 +236,7 @@ where
             Ok((peer, ())) => match self.claim.connect(peer, done) {
                 Ok(()) => Outcome::Done,
                 Err(error) => {
-                    if let Some(observer) = self.life.observer() {
-                        observer.diagnostic(&error);
-                    }
+                    self.life.diagnostic(&error);
                     Outcome::Reject(server::request_error_code(error))
                 }
             },
