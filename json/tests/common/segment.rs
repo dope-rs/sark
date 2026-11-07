@@ -169,8 +169,8 @@ impl<'d> Materialize<'d, CancelSequence> for CancelSequenceState<'d> {
 pub const COPIED: &[u8] = &[b'x'; 128];
 pub const MESSAGE: [&[u8]; 3] = [b"{\"message\":\"", COPIED, b"\"}"];
 pub const ARRAY: [&[u8]; 3] = [b"[\"", COPIED, b"\"]"];
-pub const ESCAPED_ARRAY: &[u8] = br#"["prefix\n\t\uD83D\uDE00suffix\\\"tail"]"#;
-pub const ESCAPED_VALUE: &[u8] = "prefix\n\t\u{1f600}suffix\\\"tail".as_bytes();
+pub const ESCAPED_ARRAY: &[u8] = r#"["é€🙂prefix\n\t\uD83D\uDE00suffix\\\"tail"]"#.as_bytes();
+pub const ESCAPED_VALUE: &[u8] = "é€🙂prefix\n\t\u{1f600}suffix\\\"tail".as_bytes();
 
 impl Decode for Compound {
     type State<'d> = Ready<'d, Self>;

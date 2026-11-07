@@ -94,7 +94,7 @@ impl<'d, ID: Identity> Active<'d, ID> {
         };
         Ok(match pending {
             Some(pending) => Progress::Blocked(pending),
-            None if !self.session.state.ingress.phase.is_open()
+            None if self.session.state.ingress.closed
                 && self.session.state.calls.responses().next().is_none() =>
             {
                 Progress::Drained

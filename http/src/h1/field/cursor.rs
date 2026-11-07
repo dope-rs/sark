@@ -12,7 +12,6 @@ enum Phase {
     Value { raw: u32 },
     ValueLf { raw: u32 },
     EndLf,
-    Head(End),
 }
 
 /// Owner-free progress through one growing field block.
@@ -107,7 +106,6 @@ impl Cursor {
                 Ok(Progress::Field(field))
             }
             Phase::EndLf => self.ending(bytes),
-            Phase::Head(end) => Ok(Progress::End(end)),
         }
     }
 
@@ -164,13 +162,7 @@ impl Cursor {
             });
         }
         let wire = NonZero::<u32>::MIN.checked_add(lf).ok_or(Error::TooLarge)?;
-        let end = End::new(self.cursor, wire);
-        *self = Self {
-            cursor: end.wire_len().get(),
-            phase: Phase::Head(end),
-            ..*self
-        };
-        Ok(Progress::End(end))
+        Ok(Progress::End(End::new(self.cursor, wire)))
     }
 
     fn admit<'owner>(
@@ -235,7 +227,7 @@ impl Cursor {
 }
 
 const _: () = {
-    assert!(core::mem::size_of::<Cursor>() == 32);
+    assert!(core::mem::size_of::<Cursor>() == 28);
 };
 
 #[derive(Clone, Copy, PartialEq, Eq)]

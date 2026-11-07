@@ -332,7 +332,7 @@ where
         shutdown: Shutdown,
         next: usize,
     ) -> Result<Step<P, C>, crate::Status> {
-        self.assembler.phase.observe(shutdown);
+        self.assembler.closed = true;
         for index in next..self.calls.capacity() {
             let Some(stream) = self.calls.key_at(index) else {
                 continue;

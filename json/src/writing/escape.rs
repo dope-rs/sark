@@ -10,7 +10,7 @@ impl<'a> Split<'a> {
         let input = *value;
         let mut start = 0;
         for chunk in input.as_chunks::<8>().0 {
-            if !crate::bytes::is_plain::<false>(u64::from_ne_bytes(*chunk)) {
+            if !crate::bytes::is_plain(u64::from_ne_bytes(*chunk), false, true) {
                 break;
             }
             start += 8;

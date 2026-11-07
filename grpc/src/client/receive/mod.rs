@@ -6,7 +6,6 @@ use o3::{
     buffer::{self, storage},
     depot::arena::slab::key,
 };
-use sark_core::manifold::client::event::Shutdown;
 
 use crate::{Reason, message, metadata};
 
@@ -200,30 +199,6 @@ impl StreamKey {
 pub(in crate::client) enum Cancel {
     Missing,
     Complete(Index),
-}
-
-#[derive(Clone, Copy, Default, PartialEq, Eq)]
-pub(in crate::client) enum Phase {
-    #[default]
-    Open,
-    Drain,
-    Failed,
-}
-
-impl Phase {
-    fn observe(&mut self, shutdown: Shutdown) {
-        if *self == Self::Failed {
-            return;
-        }
-        *self = match shutdown {
-            Shutdown::Clean => Self::Drain,
-            Shutdown::Failed => Self::Failed,
-        };
-    }
-
-    pub(in crate::client) const fn is_open(self) -> bool {
-        matches!(self, Self::Open)
-    }
 }
 
 struct Fault(Option<crate::Status>);

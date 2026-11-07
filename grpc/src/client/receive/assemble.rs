@@ -12,7 +12,7 @@ use crate::{
     client::{
         config,
         receive::{
-            self, Cancel, Fault, Phase, Response, StreamKey, UnaryKey, UnaryResult, budget, claims,
+            self, Cancel, Fault, Response, StreamKey, UnaryKey, UnaryResult, budget, claims,
             policies, turn,
         },
         state::{calls, output},
@@ -30,7 +30,7 @@ where
     pub(super) budget: budget::Budget,
     pub(super) pending: Option<turn::Pending<P, C>>,
     pub(super) fault: Fault,
-    pub(in crate::client) phase: Phase,
+    pub(in crate::client) closed: bool,
 }
 
 impl<P, C> Assembler<P, C>
@@ -61,7 +61,7 @@ where
             budget: budget::Budget::new(input.bytes(), input.owner_count().get()),
             pending: None,
             fault: Fault::new(),
-            phase: Phase::Open,
+            closed: false,
         })
     }
 

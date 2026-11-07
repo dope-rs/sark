@@ -83,7 +83,7 @@ where
     where
         T: ticket::Ticket<P, C>,
     {
-        if !self.ingress.phase.is_open() {
+        if self.ingress.closed {
             return Err(crate::Status::new(
                 crate::Code::Unavailable,
                 Reason::ConnectionDraining,
