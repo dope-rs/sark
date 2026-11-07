@@ -305,9 +305,9 @@ dependencies = [
 
 [[package]]
 name = "dope-quic"
-version = "0.35.0"
+version = "0.35.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d9ce50c621c8caa419fb1d485580fcc4f98ca71906c684390b40d638ea4ab8bf"
+checksum = "450f28fefbeb1a5f50226865949b48f7a4595be355bc81f9b804997a968e6a18"
 dependencies = [
  "aws-lc-rs",
  "dope",
@@ -357,9 +357,9 @@ dependencies = [
 
 [[package]]
 name = "dope-tls"
-version = "0.34.0"
+version = "0.34.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "317460bdf72c150e775f7448766c0527c99314077d65620d224ccced46fac93f"
+checksum = "c0a69ef2eb4ba5272e0244043c4a700788249824be8497c12b60e56aedd6dd64"
 dependencies = [
  "dope",
  "o3",
@@ -558,9 +558,9 @@ checksum = "1d87ecb2933e8aeadb3e3a02b828fed80a7528047e68b4f424523a0981a3a084"
 
 [[package]]
 name = "o3"
-version = "0.37.0"
+version = "0.37.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8c5afa8677417ff202988911972099d50e5483db40a90dccb72418090e0db2fd"
+checksum = "4e8dd3a6d76a7828c36d171b3ab8b938e992f5c8f280a4310fb63e6ac95c67cf"
 
 [[package]]
 name = "once_cell"
@@ -798,7 +798,7 @@ checksum = "9774ba4a74de5f7b1c1451ed6cd5285a32eddb5cccb8cc655a4e50009e06477f"
 
 [[package]]
 name = "sark"
-version = "0.28.0"
+version = "0.28.1"
 dependencies = [
  "dope",
  "dope-quic",
@@ -816,7 +816,7 @@ dependencies = [
 
 [[package]]
 name = "sark-client"
-version = "0.28.0"
+version = "0.28.1"
 dependencies = [
  "dope",
  "dope-fiber",
@@ -827,7 +827,7 @@ dependencies = [
 
 [[package]]
 name = "sark-core"
-version = "0.28.0"
+version = "0.28.1"
 dependencies = [
  "dope-core",
  "dope-net",
@@ -838,7 +838,7 @@ dependencies = [
 
 [[package]]
 name = "sark-fiber"
-version = "0.28.0"
+version = "0.28.1"
 dependencies = [
  "cartel-pg",
  "cartel-redis",
@@ -866,7 +866,7 @@ dependencies = [
 
 [[package]]
 name = "sark-gen"
-version = "0.28.0"
+version = "0.28.1"
 dependencies = [
  "proc-macro-crate",
  "proc-macro2",
@@ -876,7 +876,7 @@ dependencies = [
 
 [[package]]
 name = "sark-grpc"
-version = "0.28.0"
+version = "0.28.1"
 dependencies = [
  "dope",
  "dope-fiber",
@@ -892,7 +892,7 @@ dependencies = [
 
 [[package]]
 name = "sark-grpc-build"
-version = "0.28.0"
+version = "0.28.1"
 dependencies = [
  "heck",
  "proc-macro2",
@@ -903,7 +903,7 @@ dependencies = [
 
 [[package]]
 name = "sark-h1"
-version = "0.28.0"
+version = "0.28.1"
 dependencies = [
  "dope",
  "dope-test",
@@ -916,7 +916,7 @@ dependencies = [
 
 [[package]]
 name = "sark-h2"
-version = "0.28.0"
+version = "0.28.1"
 dependencies = [
  "clap",
  "dope",
@@ -930,7 +930,7 @@ dependencies = [
 
 [[package]]
 name = "sark-h3"
-version = "0.28.0"
+version = "0.28.1"
 dependencies = [
  "dope",
  "dope-quic",
@@ -943,7 +943,7 @@ dependencies = [
 
 [[package]]
 name = "sark-http"
-version = "0.28.0"
+version = "0.28.1"
 dependencies = [
  "dope-core",
  "dope-runtime",
@@ -955,7 +955,7 @@ dependencies = [
 
 [[package]]
 name = "sark-json"
-version = "0.28.0"
+version = "0.28.1"
 dependencies = [
  "dope-core",
  "dope-test",
@@ -967,7 +967,7 @@ dependencies = [
 
 [[package]]
 name = "sark-ws"
-version = "0.28.0"
+version = "0.28.1"
 dependencies = [
  "dope",
  "dope-fiber",

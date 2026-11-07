@@ -15,7 +15,6 @@ use o3::buffer::{
         evidence::{Mode, Off, On},
     },
     resident::Shared,
-    storage,
 };
 use resident::Local;
 use sark_core::{
@@ -30,122 +29,9 @@ use send::admit;
 use stream::{release, send};
 
 use crate::{
-    conn::{self, io::replies},
-    frame,
+    conn, frame,
     manifold::{self, Diagnostic, encoder},
-    qpack,
 };
-
-pub(in crate::manifold) fn code(error: conn::Error) -> frame::ErrorCode {
-    use conn::Error;
-    use qpack::encoder;
-
-    match error {
-        cause @ Error::Qpack(_) if cause.is_pressure() => frame::ErrorCode::ExcessiveLoad,
-        Error::Feedback(_)
-        | Error::Encode(
-            encoder::Error::Allocation(_)
-            | encoder::Error::Buffer(_)
-            | encoder::Error::Huffman(_)
-            | encoder::Error::FieldCapacity { .. }
-            | encoder::Error::FieldSection { .. }
-            | encoder::Error::Capacity { .. },
-        )
-        | Error::Request(_)
-        | Error::Response(_)
-        | Error::Retain(_)
-        | Error::Size(_)
-        | Error::Build(storage::BuildError::Capacity(_) | storage::BuildError::Exhausted(_))
-        | Error::Prefix { .. }
-        | Error::PrefixOverflow { .. }
-        | Error::Output(_)
-        | Error::Reply(replies::Error::Output(_))
-        | Error::BatchRegularWire { .. }
-        | Error::BatchRegularResident { .. }
-        | Error::BatchCriticalWire { .. }
-        | Error::BatchCriticalResident { .. }
-        | Error::QueueRegular { .. }
-        | Error::BudgetWire { .. }
-        | Error::BudgetResident { .. }
-        | Error::BudgetRegularWire { .. }
-        | Error::BudgetRegularResident { .. }
-        | Error::EventCapacity { .. }
-        | Error::CreditCapacity { .. }
-        | Error::StreamCapacity { .. }
-        | Error::StreamAdmission { .. }
-        | Error::CreditOverflow { .. }
-        | Error::SectionLength { .. }
-        | Error::SectionPrefix { .. } => frame::ErrorCode::ExcessiveLoad,
-        cause @ (Error::Egress(_)
-        | Error::Encode(encoder::Error::ConnectDisabled)
-        | Error::GoAway(_)
-        | Error::Push(_)
-        | Error::Retention(_)
-        | Error::SegmentPush(_)
-        | Error::SegmentTake(_)
-        | Error::Wait(_)) => cause.error_code(),
-        Error::Informational(_)
-        | Error::Parse(_)
-        | Error::Qpack(_)
-        | Error::Encode(_)
-        | Error::FrameUnexpected(_)
-        | Error::MissingSettings(_)
-        | Error::ClosedCriticalStream(_)
-        | Error::Target(_)
-        | Error::GoAwayId(_)
-        | Error::GoAwayOrder { .. }
-        | Error::PushIdOrder { .. }
-        | Error::PushStream { .. }
-        | Error::RequestStream { .. }
-        | Error::CriticalExists { .. }
-        | Error::Identity { .. }
-        | Error::Bound { .. }
-        | Error::UnboundOpen
-        | Error::UnboundHold
-        | Error::FeedbackIncrement { .. }
-        | Error::BudgetReleaseWire { .. }
-        | Error::BudgetReleaseResident { .. }
-        | Error::BudgetRegularReleaseWire { .. }
-        | Error::BudgetRegularReleaseResident { .. }
-        | Error::QpackEncoderStream(_)
-        | Error::QpackDecoderStream(_)
-        | Error::ReceiveCapacity { .. }
-        | Error::ReceiveRelease { .. }
-        | Error::ReceiveCopy { .. }
-        | Error::Handoff(_)
-        | Error::Build(storage::BuildError::Build(_) | storage::BuildError::Length(_))
-        | Error::PrefixWrite { .. }
-        | Error::PrefixLength { .. }
-        | Error::VarInt { .. }
-        | Error::StreamKind { .. }
-        | Error::ControlExists { .. }
-        | Error::EncoderExists { .. }
-        | Error::DecoderExists { .. }
-        | Error::ControlMissing
-        | Error::EncoderMissing
-        | Error::Reply(replies::Error::Empty | replies::Error::Length(_))
-        | Error::Length(_)
-        | Error::ResponseLength { .. }
-        | Error::ReceiveRange { .. }
-        | Error::TokenMismatch { .. }
-        | Error::ReceiveState { .. }
-        | Error::Consume(_)
-        | Error::AppendBlocked { .. }
-        | Error::HandoffBlocked { .. }
-        | Error::FinishBlocked { .. }
-        | Error::DeferBlocked { .. }
-        | Error::CreditMode { .. }
-        | Error::CreditOpen { .. }
-        | Error::StreamMissing { .. }
-        | Error::StreamResidual { .. }
-        | Error::Incomplete { .. }
-        | Error::DuplicateSettings(_)
-        | Error::MessageMissing { .. }
-        | Error::Malformed { .. }
-        | Error::Content { .. }
-        | Error::PushRejected { .. } => frame::ErrorCode::Internal,
-    }
-}
 
 /// Owner-bound capability for projecting one H3 lifecycle effect.
 #[repr(C)]

@@ -13,7 +13,7 @@ use sark_core::life::mode;
 use crate::{
     conn::{self, options},
     frame,
-    manifold::{owners, requests},
+    manifold::requests,
 };
 
 mod quiet;
@@ -74,7 +74,7 @@ pub(super) fn response<C>(
         stream: id.stream_id(),
         error: &cause,
     });
-    owners::code(cause)
+    cause.response_code()
 }
 
 impl<O: Packet> Packet for mode::Observed<O> {
