@@ -188,6 +188,20 @@ where
             })
     }
 
+    pub(super) fn drive_ingress<R: policies::Policy<P, C>>(
+        &mut self,
+        result: Result<(), conn::Error>,
+        policy: &mut R,
+    ) -> Result<(), crate::Status> {
+        self.ingress.drive(
+            &mut self.connection,
+            &mut self.calls,
+            &mut self.egress,
+            result,
+            policy,
+        )
+    }
+
     pub(super) fn refill<R: policies::Policy<P, C>>(&mut self, policy: &mut R) {
         self.ingress.refill(
             &mut self.connection,
