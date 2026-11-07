@@ -156,8 +156,8 @@ where
                 continue;
             };
             let entry = record.entry;
-            if let Some(call) = record.handler_mut() {
-                self.exec.cancel(owner, entry, call);
+            if let Some(call) = record.active() {
+                self.exec.cancel(owner, entry, &mut call.handler);
             }
             if let Some(times) =
                 <X::Timer as state::Timing<'d>>::timers(&mut state.output_deadlines)

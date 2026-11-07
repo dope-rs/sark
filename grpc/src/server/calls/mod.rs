@@ -187,13 +187,13 @@ where
     }
 
     pub(super) fn stream_mut(&mut self, key: Key) -> Option<&mut input::Input<C>> {
-        self.records.get_mut(key)?.input_mut()
+        self.records.get_mut(key)?.active()?.input.as_mut()
     }
 
     pub(super) fn has_input(&mut self, key: Key) -> bool {
         self.records
             .get_mut(key)
-            .and_then(call::State::input_mut)
+            .and_then(|record| record.active()?.input.as_mut())
             .is_some_and(|stream| {
                 self.data
                     .is_pending(manifold::raw::Key::slot(key), &stream.data)
@@ -201,11 +201,12 @@ where
     }
 
     pub(super) fn handler_mut(&mut self, key: Key) -> Option<&mut T> {
-        self.records.get_mut(key)?.handler_mut()
+        Some(&mut self.records.get_mut(key)?.active()?.handler)
     }
 
     pub(super) fn output(&mut self, key: Key) -> Option<(&mut T, Production)> {
-        self.records.get_mut(key)?.output()
+        let call = self.records.get_mut(key)?.active()?;
+        Some((&mut call.handler, call.output))
     }
 
     pub(super) fn stage_data(
@@ -216,7 +217,11 @@ where
         local: usize,
         total: usize,
     ) -> Result<(), Stage> {
-        let Some(stream) = self.records.get_mut(key).and_then(call::State::input_mut) else {
+        let Some(stream) = self
+            .records
+            .get_mut(key)
+            .and_then(|record| record.active()?.input.as_mut())
+        else {
             return Err(Stage::Unknown);
         };
         self.data
@@ -233,7 +238,11 @@ where
         source: &segments::Pool<C>,
         limit: usize,
     ) -> Result<input::Turn<C>, crate::Status> {
-        let Some(stream) = self.records.get_mut(key).and_then(call::State::input_mut) else {
+        let Some(stream) = self
+            .records
+            .get_mut(key)
+            .and_then(|record| record.active()?.input.as_mut())
+        else {
             return Err(Error::State.status());
         };
         let mut data = self.data.try_bind(manifold::raw::Key::slot(key))?;
@@ -260,7 +269,7 @@ where
         let stream = self
             .records
             .get_mut(key)
-            .and_then(call::State::input_mut)
+            .and_then(|record| record.active()?.input.as_mut())
             .ok_or(Error::State)?;
         self.data.release_live(stream, bytes).map_err(Error::Credit)
     }
@@ -301,7 +310,7 @@ where
         messages: &mut pool::Lanes<message::Frame<C>>,
     ) -> Result<(), Error> {
         let index = manifold::raw::Key::slot(record.entry.key());
-        if let Some(stream) = record.input_mut() {
+        if let Some(stream) = record.active().and_then(|call| call.input.as_mut()) {
             data.try_bind(index)
                 .map_err(Error::Lane)?
                 .try_release(stream)
@@ -339,10 +348,11 @@ where
         let Some(record) = self.records.get_mut(key) else {
             return Ok(None);
         };
-        let Some((slot, app, output)) = record.request() else {
+        let Some(call) = record.active() else {
             return Ok(None);
         };
-        let Some(stream) = slot.as_mut() else {
+        let output = call.output;
+        let Some(stream) = call.input.as_mut() else {
             return Ok(None);
         };
         let index = manifold::raw::Key::slot(key);
@@ -365,9 +375,9 @@ where
             }),
             input::Request::Finished => return Ok(None),
         };
-        let result = run(app, request);
+        let result = run(&mut call.handler, request);
         messages.clear();
-        *slot = None;
+        call.input = None;
         Ok(Some(result))
     }
 }

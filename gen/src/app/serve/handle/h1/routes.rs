@@ -2,6 +2,7 @@ use handle::h1::{admit, types};
 
 use crate::{
     app::{
+        inputs,
         serve::{self, handle},
         spec,
     },
@@ -81,12 +82,13 @@ impl Routes {
             .bodies()
             .map(|route| {
                 let variant = &route.pending_variant;
-                match &route.pending_flow {
-                    serve::Flow::Discard | serve::Flow::Retain => {
-                        let method = if matches!(route.pending_flow, serve::Flow::Discard) {
-                            quote!(try_discard)
-                        } else {
-                            quote!(try_retain)
+                match &route.mode {
+                    serve::Mode::Fiber { fiber, .. } => {
+                        let method = match fiber.body {
+                            inputs::Body::Discarded => quote!(try_discard),
+                            inputs::Body::Json
+                            | inputs::Body::Segmented
+                            | inputs::Body::Contiguous => quote!(try_retain),
                         };
                         quote! {
                             #owner::#variant(#v_wait) => {
@@ -102,7 +104,9 @@ impl Routes {
                             }
                         }
                     }
-                    serve::Flow::Push => {
+                    serve::Mode::Sync { .. }
+                    | serve::Mode::Stream { .. }
+                    | serve::Mode::Duplex { .. } => {
                         quote! {
                             #owner::#variant(mut #v_wait) => {
                                 match #v_wait.push_body(

@@ -27,19 +27,21 @@ pub(in crate::server) struct State<'r, T, C: session::Storage = storage::Shared>
 
 enum Phase<T, C: session::Storage> {
     Reserved,
-    Active {
-        input: Option<input::Input<C>>,
-        handler: T,
-        output: Production,
-    },
+    Active(Active<T, C>),
     Done,
+}
+
+pub(in crate::server) struct Active<T, C: session::Storage> {
+    pub(in crate::server) input: Option<input::Input<C>>,
+    pub(in crate::server) handler: T,
+    pub(in crate::server) output: Production,
 }
 
 impl<T, C: session::Storage> Phase<T, C> {
     fn kind(&self) -> Kind {
         match self {
             Self::Reserved => Kind::Reserved,
-            Self::Active { .. } => Kind::Active,
+            Self::Active(_) => Kind::Active,
             Self::Done => Kind::Done,
         }
     }
@@ -65,53 +67,24 @@ impl<'r, T, C: session::Storage> State<'r, T, C> {
                 actual: self.phase.kind(),
             });
         }
-        self.phase = Phase::Active {
+        self.phase = Phase::Active(Active {
             input: Some(input),
             handler,
             output,
-        };
+        });
         Ok(())
     }
 
-    pub(in crate::server) fn input_mut(&mut self) -> Option<&mut input::Input<C>> {
+    pub(in crate::server) fn active(&mut self) -> Option<&mut Active<T, C>> {
         match &mut self.phase {
-            Phase::Active { input, .. } => input.as_mut(),
-            Phase::Reserved | Phase::Done => None,
-        }
-    }
-
-    pub(in crate::server) fn handler_mut(&mut self) -> Option<&mut T> {
-        match &mut self.phase {
-            Phase::Active { handler, .. } => Some(handler),
-            Phase::Reserved | Phase::Done => None,
-        }
-    }
-
-    pub(in crate::server) fn output(&mut self) -> Option<(&mut T, Production)> {
-        match &mut self.phase {
-            Phase::Active {
-                handler, output, ..
-            } => Some((handler, *output)),
-            Phase::Reserved | Phase::Done => None,
-        }
-    }
-
-    pub(in crate::server) fn request(
-        &mut self,
-    ) -> Option<(&mut Option<input::Input<C>>, &mut T, Production)> {
-        match &mut self.phase {
-            Phase::Active {
-                input,
-                handler,
-                output,
-            } => Some((input, handler, *output)),
+            Phase::Active(call) => Some(call),
             Phase::Reserved | Phase::Done => None,
         }
     }
 
     pub(in crate::server) fn complete(&mut self) -> Result<(), Mismatch> {
         let actual = self.phase.kind();
-        let Phase::Active { .. } = &self.phase else {
+        let Phase::Active(_) = &self.phase else {
             return Err(Mismatch {
                 expected: Kind::Active,
                 actual,
@@ -126,16 +99,9 @@ impl<'r, T, C: session::Storage> State<'r, T, C> {
         self.phase = Phase::Done;
     }
 
-    pub(in crate::server) fn output_mut(&mut self) -> Option<&mut Production> {
-        match &mut self.phase {
-            Phase::Active { output, .. } => Some(output),
-            Phase::Reserved | Phase::Done => None,
-        }
-    }
-
     pub(in crate::server) fn production(&self) -> Option<Production> {
-        match self.phase {
-            Phase::Active { output, .. } => Some(output),
+        match &self.phase {
+            Phase::Active(call) => Some(call.output),
             Phase::Reserved | Phase::Done => None,
         }
     }

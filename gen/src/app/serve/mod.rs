@@ -21,7 +21,6 @@ pub(in crate::app::serve) struct RouteSpec<'a, M> {
     pub(in crate::app::serve) mode: M,
     head: syn::Ident,
     pending_variant: syn::Ident,
-    pending_flow: Flow,
     prepared: syn::Ident,
     request: syn::Ident,
 }
@@ -33,7 +32,6 @@ impl<'a, M> RouteSpec<'a, M> {
         entry: &'a spec::Entry,
         kind: spec::Kind,
         mode: M,
-        flow: Flow,
     ) -> Self {
         Self {
             entry,
@@ -41,17 +39,10 @@ impl<'a, M> RouteSpec<'a, M> {
             mode,
             head: quote::format_ident!("__{}Route{index:04}", owner),
             pending_variant: quote::format_ident!("R{index}"),
-            pending_flow: flow,
             prepared: quote::format_ident!("R{index:04}"),
             request: quote::format_ident!("__{}Request{index:04}", owner),
         }
     }
-}
-
-enum Flow {
-    Push,
-    Discard,
-    Retain,
 }
 
 pub(in crate::app::serve) enum Mode<'a> {
@@ -326,11 +317,11 @@ impl<'spec> ProtocolPlan<'spec> {
             .iter()
             .enumerate()
             .map(|(index, entry)| {
-                let (kind, mode, flow) = match &entry.mode {
+                let (kind, mode) = match &entry.mode {
                     spec::Mode::Sync => {
                         let slot = cache;
                         cache += 1;
-                        (spec::Kind::Sync, Mode::Sync { cache: slot }, Flow::Push)
+                        (spec::Kind::Sync, Mode::Sync { cache: slot })
                     }
                     spec::Mode::Fiber {
                         capacity,
@@ -341,12 +332,6 @@ impl<'spec> ProtocolPlan<'spec> {
                         let pslot = producer;
                         task += 1;
                         producer += 1;
-                        let flow = match body {
-                            inputs::Body::Discarded => Flow::Discard,
-                            inputs::Body::Json
-                            | inputs::Body::Segmented
-                            | inputs::Body::Contiguous => Flow::Retain,
-                        };
                         (
                             spec::Kind::Fiber,
                             Mode::Fiber {
@@ -364,7 +349,6 @@ impl<'spec> ProtocolPlan<'spec> {
                                     maker: spec.state_generics.ident(&format!("__MK{pslot:04}")),
                                 },
                             },
-                            flow,
                         )
                     }
                     spec::Mode::Stream { capacity } => {
@@ -379,15 +363,14 @@ impl<'spec> ProtocolPlan<'spec> {
                                     path: layout::Path::new(paths, tasks, slot),
                                 },
                             },
-                            Flow::Push,
                         )
                     }
                     spec::Mode::Duplex => {
                         let family = duplex.register(entry);
-                        (spec::Kind::Duplex, Mode::Duplex { family }, Flow::Push)
+                        (spec::Kind::Duplex, Mode::Duplex { family })
                     }
                 };
-                RouteSpec::new(owner, index, entry, kind, mode, flow)
+                RouteSpec::new(owner, index, entry, kind, mode)
             })
             .collect()
     }

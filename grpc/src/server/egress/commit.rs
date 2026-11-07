@@ -55,10 +55,10 @@ where
         let key = prepared.key();
         let work = prepared.work();
         match self.update(key, move |call| {
-            let output = call
-                .output_mut()
+            let call = call
+                .active()
                 .ok_or_else(|| crate::Status::new(crate::Code::Internal, Reason::ReplyInactive))?;
-            prepared.apply(output);
+            prepared.apply(&mut call.output);
             Ok((work, ()))
         }) {
             Ok(()) => Ok(()),

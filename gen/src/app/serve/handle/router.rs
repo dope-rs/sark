@@ -56,7 +56,7 @@ pub(in crate::app) fn build(
         .iter()
         .enumerate()
         .map(|(index, entry)| {
-            serve::RouteSpec::new(name, index, entry, spec::Kind::Sync, (), serve::Flow::Push)
+            serve::RouteSpec::new(name, index, entry, spec::Kind::Sync, ())
         })
         .collect::<Vec<_>>();
     let entries = &entries;

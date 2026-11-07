@@ -263,8 +263,8 @@ where
                     book.cancel(entry.key());
                 }
                 P::cancel(times, entry);
-                if let Some(call) = record.handler_mut() {
-                    cancel(entry, call);
+                if let Some(call) = record.active() {
+                    cancel(entry, &mut call.handler);
                 }
             },
         );
