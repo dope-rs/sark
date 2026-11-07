@@ -127,7 +127,7 @@ where
             Self::Key,
             call::State<'r, T, C>,
             Self::Block,
-            region::Proof<region::Identity<'id>>,
+            region::Identity<'id>,
         >,
     ) -> schedule::Decision<'id, Self::Key> {
         entry.borrowed(self, |driver, key, _| {

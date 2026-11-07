@@ -80,19 +80,25 @@ pub(super) fn apply<R: route::Schema, A: Admission>(
 ) -> Result<(), Error<R>> {
     let slot = R::Header::slice(entry.name());
     let known = headers::Known::from_name(entry.name());
+    let mut encoding = None;
     if let Some(known) = known {
         let skip = matches!(known, headers::Known::AcceptEncoding)
             && slot.is_none()
             && !R::FULL
             && matches!(coding, Coding::Plain);
         if !skip {
-            known
-                .apply(fields, flags, entry.value(), version)
-                .map_err(|cause| Error::Field {
-                    start: entry.line_span().start(),
-                    available: entry.line_span().len(),
-                    cause,
-                })?;
+            encoding = if R::Header::ENCODING && matches!(known, headers::Known::AcceptEncoding) {
+                head::AcceptEncoding::try_apply(fields, flags, entry.value()).map(Some)
+            } else {
+                known
+                    .apply(fields, flags, entry.value(), version)
+                    .map(|()| None)
+            }
+            .map_err(|cause| Error::Field {
+                start: entry.line_span().start(),
+                available: entry.line_span().len(),
+                cause,
+            })?;
         }
         if matches!(known, headers::Known::Host) {
             fields.routing = fields
@@ -106,7 +112,12 @@ pub(super) fn apply<R: route::Schema, A: Admission>(
         }
     }
     if let Some(slot) = slot {
-        R::Header::set(headers, slot, &SliceValue::from(entry)).map_err(Error::Header)?;
+        let value = SliceValue::from(entry);
+        match encoding {
+            Some(encoding) => R::Header::set_encoding(headers, slot, &value, encoding),
+            None => R::Header::set(headers, slot, &value),
+        }
+        .map_err(Error::Header)?;
     }
     if A::FIELDS {
         admission
@@ -191,13 +202,6 @@ impl<'a, R: route::Schema, A: Admission> Scan<'a, R, A> {
             start,
             end: tail,
         })
-    }
-
-    fn set(&mut self, slot: R::Header, bounds: &Bounds) -> Result<(), Step<R>> {
-        let value = self
-            .try_value(bounds)
-            .map_err(|cause| Step::Bad(Error::Frame { slot, cause }))?;
-        R::Header::set(self.headers, slot, &value).map_err(|cause| Step::Bad(Error::Header(cause)))
     }
 
     fn try_value(&self, bounds: &Bounds) -> Result<SliceValue<'a>, field::Error> {
@@ -299,13 +303,6 @@ impl<'a, R: route::Schema, A: Admission> Scan<'a, R, A> {
         }
     }
 
-    fn user_bounds(&mut self, colon: usize) -> Result<Bounds, Step<R>> {
-        match headers::Known::from_name(self.try_prefix(colon)?) {
-            Some(known) => self.scan_known(known, colon),
-            None => Ok(self.value(colon)?.trimmed(self.rest)),
-        }
-    }
-
     fn incomplete(&self) -> Step<R> {
         let limit = head::MAX_HEADER_LINE_BYTES;
         let observed = self.rest.len();
@@ -373,13 +370,57 @@ where
     }
 
     fn user(mut self, slot: R::Header, colon: usize) -> Self::Output {
-        let bounds = match self.user_bounds(colon) {
+        let known = match self.try_prefix(colon) {
+            Ok(name) => headers::Known::from_name(name),
+            Err(step) => return step,
+        };
+        let mut encoding = None;
+        let bounds = if R::Header::ENCODING && matches!(known, Some(headers::Known::AcceptEncoding))
+        {
+            let capped = self.capped();
+            let start = match self.try_index(colon, 1, capped.len()) {
+                Ok(start) => start,
+                Err(step) => return step,
+            };
+            let (value, admitted) =
+                match head::AcceptEncoding::scan_line(self.fields, self.flags, &capped[start..]) {
+                    Ok(Some(value)) => value,
+                    Ok(None) => return self.incomplete(),
+                    Err(cause) => {
+                        return Step::Bad(Error::Field {
+                            start: self.start,
+                            available: capped.len(),
+                            cause,
+                        });
+                    }
+                };
+            encoding = Some(admitted);
+            Ok(Bounds {
+                tail: start + value.tail(),
+                start: start + value.start(),
+                end: start + value.end(),
+            })
+        } else {
+            match known {
+                Some(known) => self.scan_known(known, colon),
+                None => self.value(colon).map(|bounds| bounds.trimmed(self.rest)),
+            }
+        };
+        let bounds = match bounds {
             Ok(bounds) => bounds,
             Err(step) => return step,
         };
         let tail = bounds.tail;
-        match self
-            .set(slot, &bounds)
+        let value = match self.try_value(&bounds) {
+            Ok(value) => value,
+            Err(cause) => return Step::Bad(Error::Frame { slot, cause }),
+        };
+        let stored = match encoding {
+            Some(encoding) => R::Header::set_encoding(self.headers, slot, &value, encoding),
+            None => R::Header::set(self.headers, slot, &value),
+        };
+        match stored
+            .map_err(|cause| Step::Bad(Error::Header(cause)))
             .and_then(|()| self.observe(colon, bounds))
         {
             Ok(()) => Step::Complete(tail),

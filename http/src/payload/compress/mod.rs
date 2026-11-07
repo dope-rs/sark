@@ -64,10 +64,9 @@ impl Compression for Gzip {
         let Some(mut lease) = self.pool.acquire() else {
             return Output::Plain;
         };
-        let Some(done) = self.encoder.encode(src, lease.output()) else {
+        let Some(()) = self.encoder.encode(src, lease.output()) else {
             return Output::Plain;
         };
-        done.commit();
         Output::Compressed(lease.freeze())
     }
 }

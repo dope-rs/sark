@@ -6,7 +6,7 @@ use o3::{
 };
 use sark_http::payload::{owned, response::Body as _};
 
-use crate::{Error, segment::Transfer};
+use crate::{Error, segment::Push};
 
 const _: () = assert!(usize::BITS >= u32::BITS);
 
@@ -62,7 +62,7 @@ impl<'d> Split<'d> {
                 .try_retain()
                 .map_err(Error::Retain)?;
             // SAFETY: new reserved end - next slots; each successful step consumes one.
-            unsafe { alloc::raw::VecExt::vacancy(&mut self.output.segments) }.insert(Part {
+            (unsafe { alloc::raw::VecExt::vacancy(&mut self.output.segments) })(Part {
                 owner,
                 start: start - self.range.start,
                 end: end - self.range.start,
@@ -94,23 +94,6 @@ impl<'d> Part<'d> {
     pub(super) fn take(&mut self) -> usize {
         mem::take(&mut self.owner).len()
     }
-}
-
-pub(super) enum Failure<'d> {
-    Length {
-        len: usize,
-        add: usize,
-        owner: resident::Shared<'d>,
-    },
-    Segments {
-        current: segments::Count,
-        add: segments::Count,
-        owner: resident::Shared<'d>,
-    },
-    Allocation {
-        error: alloc::Error,
-        owner: resident::Shared<'d>,
-    },
 }
 
 impl<'d> Input<'d> {
@@ -180,8 +163,7 @@ impl<'d> Input<'d> {
             len = len
                 .checked_add(add)
                 .ok_or(Error::InputLength { current: len, add })?;
-            let slot = alloc::Vacant::try_new(&mut segments).map_err(Error::Allocation)?;
-            slot.insert(Part {
+            alloc::try_vacant(&mut segments).map_err(Error::Allocation)?(Part {
                 owner,
                 start,
                 end: len,
@@ -204,11 +186,7 @@ impl<'d> Input<'d> {
             let owner = resident::Shared::from(owner);
             let end = len - owners.byte_len();
             // SAFETY: this sealed owner iterator yields exactly the reserved count.
-            unsafe { alloc::raw::VecExt::vacancy(&mut segments) }.insert(Part {
-                owner,
-                start,
-                end,
-            });
+            (unsafe { alloc::raw::VecExt::vacancy(&mut segments) })(Part { owner, start, end });
             start = end;
         }
         Ok(Self {
@@ -218,42 +196,33 @@ impl<'d> Input<'d> {
         })
     }
 
-    pub(super) fn push(mut self, owner: resident::Shared<'d>) -> Transfer<Self, Failure<'d>> {
+    pub(super) fn push(&mut self, owner: resident::Shared<'d>) -> Result<(), Push<'d>> {
         if owner.is_empty() {
-            return Transfer::Accepted(self);
+            return Ok(());
         }
         let start = self.len;
         let add = owner.len();
         let Some(end) = self.len.checked_add(add) else {
-            return Transfer::Rejected {
-                state: self,
-                error: Failure::Length {
-                    len: start,
-                    add,
-                    owner,
-                },
-            };
+            return Err(Push::Length {
+                len: start,
+                add,
+                owner,
+            });
         };
         if self.segments.len() == u32::MAX as usize {
-            return Transfer::Rejected {
-                state: self,
-                error: Failure::Segments {
-                    current: segments::Count::new(u32::MAX),
-                    add: segments::Count::ONE,
-                    owner,
-                },
-            };
+            return Err(Push::Segments {
+                current: segments::Count::new(u32::MAX),
+                add: segments::Count::ONE,
+                owner,
+            });
         }
-        match alloc::Vacant::try_new(&mut self.segments) {
+        match alloc::try_vacant(&mut self.segments) {
             Ok(slot) => {
                 self.len = end;
-                slot.insert(Part { owner, start, end });
-                Transfer::Accepted(self)
+                slot(Part { owner, start, end });
+                Ok(())
             }
-            Err(error) => Transfer::Rejected {
-                state: self,
-                error: Failure::Allocation { error, owner },
-            },
+            Err(error) => Err(Push::Allocation { error, owner }),
         }
     }
 
@@ -292,7 +261,7 @@ impl<'d> Input<'d> {
     pub(super) fn needs_copy(&self, range: &ops::Range<usize>) -> crate::Result<bool> {
         Ok(match self.parts(range)? {
             [] => false,
-            [part] => matches!(part.owner.scope(), resident::Scope::Bound(_)),
+            [part] => part.owner.scope().is_some(),
             [_, _, ..] => true,
         })
     }

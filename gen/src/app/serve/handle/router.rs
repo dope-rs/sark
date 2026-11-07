@@ -184,7 +184,7 @@ pub(in crate::app) fn build(
         }
     };
     let h1_impl = match h1 {
-        crate::runtime::H1::Available => {
+        crate::runtime::H1::Available(_) => {
             let coding = coding(paths, spec);
             let (variants, slots, routes): (Vec<_>, Vec<_>, Vec<_>) = entries
                 .iter()

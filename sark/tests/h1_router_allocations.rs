@@ -5,10 +5,10 @@ use dope::core::driver::{self, life::recovery, schedule::ready::task::owner};
 use dope_test::scope;
 use sark::{
     core::{
-        body::{self, Step},
+        body::{self, Build, Step},
         request::raw::Parsed,
         route,
-        route::{TaskBuild, raw::PathCapture},
+        route::raw::PathCapture,
     },
     http::{
         h1::target::Target,
@@ -383,7 +383,7 @@ fn retained_metadata() {
                 .with_body(body);
             let build =
                 <ParamReq as route::Own>::start_task(req).expect("retained request builder");
-            let step = TaskBuild::step(build, NonZero::<usize>::MAX);
+            let step = Build::step(build, NonZero::<usize>::MAX);
             let ready = if let Step::Ready { output, released } = step {
                 Some((output, released))
             } else {

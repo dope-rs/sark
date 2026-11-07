@@ -61,29 +61,39 @@ impl<F> Report<F> {
     }
 }
 
-impl<'w, 'd: 'w, A, W, F, ID: Identity> failures::Policy<'w, 'd, App<A, W, Self>, ID> for Report<F>
+impl<'w, 'd: 'w, A, W, F, E, ID: Identity> failures::Policy<'w, 'd, App<'d, A, W, Self, E>, ID>
+    for Report<F>
 where
     A: Spec,
-    App<A, W, Self>: Application<'d, ID, Wire = W>,
+    App<'d, A, W, Self, E>: Application<'d, ID, Wire = W>,
     W: Execution + 'd,
     receive::Scoped: receive::Mode<W>,
     F: for<'a> FnMut(
-        Failure<'a, 'w, 'd, W, ID, A::Failure, <App<A, W, Self> as Application<'d, ID>>::Build>,
+        Failure<
+            'a,
+            'w,
+            'd,
+            W,
+            ID,
+            A::Failure,
+            <App<'d, A, W, Self, E> as Application<'d, ID>>::Build,
+        >,
     ),
 {
-    fn open_failed(app: pin::Pin<&mut App<A, W, Self>>, cause: open::Error<'w, W>) {
+    fn open_failed(app: pin::Pin<&mut App<'d, A, W, Self, E>>, cause: open::Error<'w, W>) {
         (app.get_mut().fault.0)(Failure::Open(cause));
     }
 
     /// A peer address that failed validation is a platform fault raised before
     /// this report's connection classes exist, so the accepted socket closes
     /// without an application-visible cause.
-    fn peer() -> Option<impl for<'a> Call<(pin::Pin<&'a mut App<A, W, Self>>, socket::Error)>> {
+    fn peer() -> Option<impl for<'a> Call<(pin::Pin<&'a mut App<'d, A, W, Self, E>>, socket::Error)>>
+    {
         None::<Infallible>
     }
 
     fn wire_failed<'e>(
-        app: pin::Pin<&mut App<A, W, Self>>,
+        app: pin::Pin<&mut App<'d, A, W, Self, E>>,
         conn: conn::Ctx<
             'e,
             '_,
@@ -93,8 +103,8 @@ where
             'd,
             ID,
             W,
-            <App<A, W, Self> as Application<'d, ID>>::Conn,
-            <App<A, W, Self> as Application<'d, ID>>::Egress,
+            <App<'d, A, W, Self, E> as Application<'d, ID>>::Conn,
+            <App<'d, A, W, Self, E> as Application<'d, ID>>::Egress,
         >,
         cause: terminal::Error<'w, W>,
     ) {

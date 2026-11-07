@@ -297,7 +297,7 @@ impl<'d, P: rules::Policy, A: rules::Push> Connection<'d, P, A> {
         leading: Option<varint::VarInt>,
         source: S,
         boundary: Boundary,
-    ) -> Result<outbound::Pending<'a, 'd, Selected<P>, P::Block>, Error> {
+    ) -> Result<outbound::Prepared<'a, 'd, P>, Error> {
         let qpack = self.session.qpack_encoder;
         // Config already admits the table's byte extent in the u32 domain.
         let encoder_capacity =
@@ -326,7 +326,7 @@ impl<'d, P: rules::Policy, A: rules::Push> Connection<'d, P, A> {
                 return Err(error);
             }
         };
-        Ok(outbound::Pending::new(
+        Ok(outbound::Prepared::new(
             fields,
             &mut self.queues,
             qpack,

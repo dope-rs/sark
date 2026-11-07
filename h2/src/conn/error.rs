@@ -282,7 +282,6 @@ impl Error {
                 | segments::Error::Count(_)
                 | segments::Error::Logical(_)
                 | segments::Error::Resident(_)
-                | segments::Error::Total(_)
                 | segments::Error::Boundary(_) => {
                     Class::Protocol(numbers::ErrorCode::InternalError)
                 }

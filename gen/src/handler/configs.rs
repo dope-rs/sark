@@ -143,7 +143,7 @@ impl<'a> Response<'a> {
             Inclusion::Omit => quote!(#ns_http::h1::head::response::Server::Omit),
         };
         let policy = match h1 {
-            crate::runtime::H1::Available => {
+            crate::runtime::H1::Available(_) => {
                 let cache = match mode {
                     Cache::Bypass => quote!(#ns_h1::route::Cache::Bypass),
                     Cache::Store => quote!(#ns_h1::route::Cache::Store),

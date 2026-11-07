@@ -21,7 +21,7 @@ pub(crate) fn emit_query(
                 })?;
             ::core::option::Option::Some(#span)
         }},
-        types::ValueKind::Usize | types::ValueKind::U64 | types::ValueKind::Bool => {
+        _ => {
             quote::quote! {{
                 ::core::option::Option::Some(#entry.try_value()
                     .and_then(|#value| #ns_core::request::field::Value::parse_value(&#value))
@@ -82,7 +82,9 @@ impl FieldPlan {
         vis: &syn::Visibility,
         kind: &proc_macro2::Ident,
         identity: &proc_macro2::Ident,
+        raw_headers: &proc_macro2::Ident,
     ) -> (
+        proc_macro2::TokenStream,
         proc_macro2::TokenStream,
         proc_macro2::TokenStream,
         proc_macro2::TokenStream,
@@ -161,24 +163,34 @@ impl FieldPlan {
                     types::ValueKind::Bytes => quote::quote! {
                         #ns_core::request::field::HeaderValue::try_span(#v_value)
                     },
+                    types::ValueKind::Encoding => quote::quote! {
+                        #ns_http::field::head::AcceptEncoding::try_parse(#v_value.as_ref())
+                            .map_err(#ns_core::request::field::Error::AcceptEncoding)
+                    },
                     types::ValueKind::Usize | types::ValueKind::U64 | types::ValueKind::Bool => {
                         quote::quote! {
                             #ns_core::request::field::Value::parse_value(#v_value)
                         }
                     }
                 };
-                quote::quote! {
-                    #kind::#slot => {
+                let parsed = quote::quote! {
+                    #parsed.map_err(|#v_cause| #ns_core::route::Error::Header {
+                        field: #identity::#field,
+                        cause: #v_cause,
+                    })?
+                };
+                let assign = if matches!(spec.kind, types::ValueKind::Encoding) {
+                    quote::quote! {
+                        Self::set_encoding(#v_heads, Self::#slot, #v_value, #parsed)?;
+                    }
+                } else {
+                    quote::quote! {
                         if #v_heads.#ident.is_none() {
-                            #v_heads.#ident = ::core::option::Option::Some(#parsed.map_err(|#v_cause| {
-                                #ns_core::route::Error::Header {
-                                    field: #identity::#field,
-                                    cause: #v_cause,
-                                }
-                            })?);
+                            #v_heads.#ident = ::core::option::Option::Some(#parsed);
                         }
                     }
-                }
+                };
+                quote::quote! { #kind::#slot => { #assign } }
             })
             .collect();
         let set = quote::quote! {
@@ -187,7 +199,48 @@ impl FieldPlan {
             }
             ::core::result::Result::Ok(())
         };
-        (declaration, def, raw, span, set)
+        let encoding = self
+            .entries
+            .iter()
+            .find(|spec| matches!(spec.kind, types::ValueKind::Encoding))
+            .map(|spec| {
+                let ident = &spec.ident;
+                let slot = &spec.variant;
+                let v_encoding = local("encoding");
+                let other: Vec<_> = self
+                    .entries
+                    .iter()
+                    .filter(|entry| entry.slot != spec.slot)
+                    .map(|entry| &entry.variant)
+                    .collect();
+                let fallback = (!other.is_empty()).then(|| {
+                    quote::quote! {
+                        #(Self::#other)|* => Self::set(#v_heads, #v_slot, #v_value),
+                    }
+                });
+                quote::quote! {
+                    const ENCODING: ::core::primitive::bool = true;
+
+                    fn set_encoding<__V: #ns_core::request::field::HeaderValue>(
+                        #v_heads: &mut #raw_headers,
+                        #v_slot: Self,
+                        #v_value: &__V,
+                        #v_encoding: #ns_http::field::head::AcceptEncoding,
+                    ) -> ::core::result::Result<(), #ns_core::route::Error<#identity>> {
+                        match #v_slot {
+                            Self::#slot => {
+                                match &mut #v_heads.#ident {
+                                    ::core::option::Option::Some(#v_value) => #v_value.append(#v_encoding),
+                                    ::core::option::Option::None => #v_heads.#ident = ::core::option::Option::Some(#v_encoding),
+                                }
+                                ::core::result::Result::Ok(())
+                            }
+                            #fallback
+                        }
+                    }
+                }
+            });
+        (declaration, def, raw, span, set, quote::quote!(#encoding))
     }
 
     fn header_arms(&self, kind: &proc_macro2::Ident, fold: bool) -> Vec<proc_macro2::TokenStream> {

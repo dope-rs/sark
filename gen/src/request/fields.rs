@@ -186,9 +186,7 @@ impl Fields {
             }
             match view.kind()? {
                 types::ValueKind::Bytes => Ok(()),
-                types::ValueKind::Usize | types::ValueKind::U64 | types::ValueKind::Bool => {
-                    Err(invalid())
-                }
+                _ => Err(invalid()),
             }
         })?;
         let body =
@@ -235,6 +233,19 @@ impl Fields {
             let header = parse(&field.attrs, "header")?;
             let query = parse(&field.attrs, "query")?;
             let path = path(&field.attrs, &ident)?;
+            let view = types::View::new(&field.ty);
+            if types::View::new(view.value()).is_named("AcceptEncoding")
+                && (!view.is_optional()
+                    || header.as_ref().is_none_or(|header| {
+                        !header.name.value().eq_ignore_ascii_case("accept-encoding")
+                            || header.default.is_some()
+                    }))
+            {
+                return Err(syn::Error::new_spanned(
+                    field,
+                    "AcceptEncoding requires Option and an accept-encoding header without default",
+                ));
+            }
             let raw = contains(&field.attrs, "raw_body");
             let len = contains(&field.attrs, "body_len");
             let auth = contains(&field.attrs, "authority");

@@ -121,11 +121,11 @@ fn duplex_layout_is_exact() {
         ws,
     );
     let echo = Brand::with(|brand| {
-        tunnels::ConnectDispatch::multiplexed::<
-            Identity,
-            KeyTag<0>,
-            server::Target<'_, KeyTag<0>>,
-        >(brand, &state, Config::new(1))
+        tunnels::ConnectDispatch::multiplexed::<Identity, KeyTag<0>, server::Target<'_, KeyTag<0>>>(
+            brand,
+            &state,
+            Config::new(1),
+        )
         .layout()
     });
     assert_eq!(
@@ -216,6 +216,37 @@ fn routes_without_alloc() {
             let (prepared, (count, bytes)) = Tracker::usage(|| app.try_head(planned));
             prepared.expect("route head must be valid");
             assert_eq!((count, bytes), (0, 0));
+
+            let fields = [
+                agnostic::FIELDS.as_slice(),
+                agnostic::BAD_ENCODING.as_slice(),
+            ]
+            .concat();
+            let full = fields
+                .try_raw(block::Connect::Disabled)
+                .expect("native field admission")
+                .try_request()
+                .ok()
+                .expect("request");
+            let planned = app
+                .try_select(fields.try_decoded().expect("decoded fields"))
+                .expect("selected fields")
+                .try_request()
+                .ok()
+                .expect("request");
+            for result in [app.try_full(full), app.try_head(planned)] {
+                assert!(matches!(
+                    result,
+                    Err(sark_core::decode::HeadError::Schema(
+                        agnostic::AgnAppHeadCause::R0001(sark_core::route::Error::Header {
+                            field: agnostic::PairReqIdentity::Header0,
+                            cause: sark_core::request::field::Error::AcceptEncoding(
+                                sark_http::field::head::Error::Value
+                            ),
+                        })
+                    ))
+                ));
+            }
         },
         Policy::new(|event| reports3.push(event), recover),
         |result| {

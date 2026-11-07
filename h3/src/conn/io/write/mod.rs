@@ -344,10 +344,10 @@ impl<'d, S, B> Queues<'d, S, B> {
 
 const _: () = {
     assert!(core::mem::size_of::<Completion>() == 1);
-    assert!(core::mem::size_of::<Source<'static, 'static>>() == 9 * core::mem::size_of::<usize>());
+    assert!(core::mem::size_of::<Source<'static, 'static>>() == 7 * core::mem::size_of::<usize>());
     assert!(
         core::mem::size_of::<Prepared<'static, 'static, 'static>>()
-            == 13 * core::mem::size_of::<usize>()
+            == 11 * core::mem::size_of::<usize>()
     );
 };
 

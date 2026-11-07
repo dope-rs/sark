@@ -40,7 +40,7 @@ fn select<B: Block>(next: Activation<B>) -> Option<(array::Index<LANES>, bool)> 
 }
 
 fn apply<K: manifold::raw::Key, T>(
-    entry: entry::Slot<'_, K, T, LANES>,
+    entry: entry::Occupied<'_, K, T, LANES>,
     (lane, block_data): (array::Index<LANES>, bool),
     policy: &mut Policy,
 ) {

@@ -55,23 +55,25 @@ impl Key {
 /// The name and exact-field directories of one bounded arena.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub struct State {
-    planes: compact::Planes<2>,
+    name: compact::Layout,
+    exact: compact::Layout,
 }
 
 impl State {
     pub(super) fn new(entries: usize, start: usize) -> Result<(Self, usize), Error> {
-        let (planes, end) = compact::Planes::try_new([entries; 2], start).map_err(Error)?;
-        Ok((Self { planes }, end))
+        let (name, start) = compact::Layout::try_new(entries, start).map_err(Error)?;
+        let (exact, end) = compact::Layout::try_new(entries, start).map_err(Error)?;
+        Ok((Self { name, exact }, end))
     }
 
     pub(super) const fn layout(self, key: Key) -> compact::Layout {
         match key {
-            Key::Name => self.planes.layout::<0>(),
-            Key::Exact => self.planes.layout::<1>(),
+            Key::Name => self.name,
+            Key::Exact => self.exact,
         }
     }
 
     pub(super) fn byte(self, offset: usize) -> u8 {
-        self.planes.byte(offset)
+        self.name.byte(offset).max(self.exact.byte(offset))
     }
 }

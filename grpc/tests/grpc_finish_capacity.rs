@@ -163,7 +163,6 @@ fn finish_wakes_sender() {
                 },
                 common::recover,
             ),
-            |result| result.expect("client completion"),
         )
         .expect("client runtime");
     assert!(finished, "finish failed after releasing its queued owner");

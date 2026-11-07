@@ -80,6 +80,7 @@ where
     type Connect = Full;
     type ConnState = Reuse;
     type Failure = Observed;
+    type Receipt = ();
     type Requests = request::Enabled;
     type Send = pool::Cursor;
 
@@ -348,13 +349,16 @@ where
         &self,
         id: conn::Id<'d, ID>,
         failure: conn::Transmit,
-        region: &mut region::Token<region::Identity<'d>>,
+        regions: &mut (
+            region::Token<region::Identity<'d>>,
+            region::Token<region::Identity<'d, 1>>,
+        ),
     ) -> Option<conn::Transmit> {
-        self.root
-            .protocol()
-            .transport
-            .pool
-            .failed(region, id, report::Failure::Transmit(failure));
+        self.root.protocol().transport.pool.failed(
+            &mut regions.0,
+            id,
+            report::Failure::Transmit(failure),
+        );
         None
     }
 
@@ -400,10 +404,7 @@ where
         ctx: &mut turns::Retirement<'_, 'turn, 'd>,
     ) -> egress::Cleared {
         let (work, region) = ctx.parts();
-        self.root
-            .protocol()
-            .io
-            .retire(conn, work, region, pool::Cursor::recycle)
+        self.root.protocol().io.retire(conn, work, region, drop)
     }
 
     fn clear_recv<'turn>(

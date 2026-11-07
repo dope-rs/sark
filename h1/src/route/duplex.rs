@@ -195,9 +195,7 @@ where
         if matches!(found.connection(), head::Connection::Close) {
             return session::Outcome::Failed(Failure::BadRequest).into();
         }
-        let frame = match framing::Frame::<R>::drive(found, &mut self.connection.ingress, || {
-            credit::Evidence::head(&mut proof)
-        }) {
+        let frame = match framing::Frame::drive(found, &mut self.connection.ingress, &mut proof) {
             Ok(framing::Progress::Complete(frame)) => frame,
             Ok(framing::Progress::Pending(wait)) => {
                 let mut route = Pending {
@@ -246,9 +244,7 @@ where
         let input = source.input().as_slice();
         let target = source.request().target();
         let (found, (accept, origin, cookie)) = found.into_admission();
-        let frame = match framing::Frame::<R>::drive(found, &mut self.connection.ingress, || {
-            credit::Evidence::head(&mut proof)
-        }) {
+        let frame = match framing::Frame::drive(found, &mut self.connection.ingress, &mut proof) {
             Ok(framing::Progress::Complete(frame)) => frame,
             Ok(framing::Progress::Pending(_)) => {
                 return session::Outcome::Failed(Failure::BadRequest).into();

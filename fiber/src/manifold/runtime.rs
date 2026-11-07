@@ -33,29 +33,6 @@ pub trait Storage {
         D: tree::Tree<'d>;
 }
 
-/// Constructs an application's initial task storage.
-#[doc(hidden)]
-pub trait Initial: Storage {
-    fn protocol<Cold, Bound>(cold: Cold) -> Self::Protocol<Cold, Bound>;
-
-    fn resource<Bound>() -> Self::Resource<Bound>;
-
-    fn tasks<'s, 'd, D, S>(
-        limit: quota::Limit,
-        brand: scope::Brand<'s>,
-    ) -> Self::Tasks<'s, 'd, D, S>
-    where
-        D: tree::Tree<'d>,
-        S: tree::Tree<'d>;
-
-    fn direct_only<'s, 'd, D>(
-        limit: quota::Limit,
-        brand: scope::Brand<'s>,
-    ) -> Self::DirectOnly<'s, 'd, D>
-    where
-        D: tree::Tree<'d>;
-}
-
 /// Marks storage whose scheduler identity is executable.
 #[doc(hidden)]
 pub trait Runnable: Storage {
@@ -102,35 +79,6 @@ impl Storage for Cold {
         D: tree::Tree<'d>;
 }
 
-impl Initial for Cold {
-    fn protocol<Cold, Bound>(cold: Cold) -> Self::Protocol<Cold, Bound> {
-        cold
-    }
-
-    fn resource<Bound>() -> Self::Resource<Bound> {}
-
-    fn tasks<'s, 'd, D, S>(
-        limit: quota::Limit,
-        brand: scope::Brand<'s>,
-    ) -> Self::Tasks<'s, 'd, D, S>
-    where
-        D: tree::Tree<'d>,
-        S: tree::Tree<'d>,
-    {
-        (brand, direct::Plan::new(limit))
-    }
-
-    fn direct_only<'s, 'd, D>(
-        limit: quota::Limit,
-        brand: scope::Brand<'s>,
-    ) -> Self::DirectOnly<'s, 'd, D>
-    where
-        D: tree::Tree<'d>,
-    {
-        (brand, direct::Plan::new(limit))
-    }
-}
-
 impl Runnable for Direct {
     fn handle<'d>(clock: &Self::Resource<timer::Timer<'d>>) -> timer::Timer<'d> {
         *clock
@@ -158,28 +106,6 @@ impl<T: task::Target> Storage for Multi<T> {
         = ()
     where
         D: tree::Tree<'d>;
-}
-
-impl<T: task::Target> Initial for Multi<T> {
-    fn protocol<Cold, Bound>(_: Cold) -> Self::Protocol<Cold, Bound> {}
-
-    fn resource<Bound>() -> Self::Resource<Bound> {}
-
-    fn tasks<'s, 'd, D, S>(
-        limit: quota::Limit,
-        brand: scope::Brand<'s>,
-    ) -> Self::Tasks<'s, 'd, D, S>
-    where
-        D: tree::Tree<'d>,
-        S: tree::Tree<'d>,
-    {
-        (brand, Plan::new(limit))
-    }
-
-    fn direct_only<'s, 'd, D>(_: quota::Limit, _: scope::Brand<'s>) -> Self::DirectOnly<'s, 'd, D>
-    where
-        D: tree::Tree<'d>,
-    {}
 }
 
 impl<T: task::Target> Storage for Prepared<T> {

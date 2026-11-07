@@ -1,7 +1,10 @@
 use core::mem;
 
 use sark_core::{
-    body::admit::{Length, Retention},
+    body::{
+        admit::{Length, Retention},
+        credit,
+    },
     route,
 };
 use sark_http::{
@@ -10,7 +13,7 @@ use sark_http::{
 };
 
 use crate::{
-    session, switch,
+    session,
     wire::{
         head, parsing,
         parsing::{framing, framing::Parsed},
@@ -55,14 +58,11 @@ impl<'a, 'req, R: route::Spec> Discard<'a, 'req, R> {
         ))
     }
 
-    pub(crate) fn drive<'d, Runtime, RouteState, Transitions, Ready, Heads, F: FnOnce()>(
+    pub(crate) fn drive<'d, RouteState, Ready, Heads>(
         base: framing::Head<'a, 'req, R, Coding>,
-        conn: &mut session::Conn<'d, Runtime, RouteState, Transitions, Ready, Heads>,
-        ready: F,
-    ) -> Result<framing::Discarded<'a, 'req, R>, parsing::Request<R::Request>>
-    where
-        Transitions: switch::Engine,
-    {
+        ingress: &mut session::Ingress<'d, RouteState, Ready, Heads>,
+        proof: &mut impl credit::Evidence,
+    ) -> Result<framing::Discarded<'a, 'req, R>, parsing::Request<R::Request>> {
         const {
             assert!(
                 mem::size_of::<Self>()
@@ -83,7 +83,7 @@ impl<'a, 'req, R: route::Spec> Discard<'a, 'req, R> {
         }
         let ctx = base.fields.source.head;
         base.check_body()?;
-        ready();
+        credit::Evidence::head(proof);
         let (total, length, used) = match base.body_framing {
             RequestBody::Empty => (
                 0,
@@ -102,7 +102,7 @@ impl<'a, 'req, R: route::Spec> Discard<'a, 'req, R> {
                 )),
             ),
             RequestBody::Chunked => {
-                match conn.ingress.decode(
+                match ingress.decode(
                     ctx.input(),
                     base.fields.len.get() as usize,
                     R::MAX_BODY,

@@ -172,8 +172,8 @@ fn chunk_retries_budget() {
         );
         let decoder = Decoder::try_new(&codec).expect("codec staging");
         let mut stored = decoder.storage(&fragment, &state);
-        let blocker = storage::Owned::try_allocate(&budget, budget.available())
-            .expect("resident blocker");
+        let blocker =
+            storage::Owned::try_allocate(&budget, budget.available()).expect("resident blocker");
         Retain {
             result: decoder.try_stored(&mut state, &mut stored, &budget),
             budget,
@@ -213,7 +213,7 @@ fn split_trailers_retain() {
         let wire =
             storage::Shared::try_from(&mut b"0\r\nX-Proof: yes\r\nX-Trace: 7\r\n\r\n".to_vec())
                 .expect("trailer backing must retain its owner");
-        for split in [0, 9] {
+        for (first, second) in [(0, 0), (0, 9), (9, 15)] {
             let mut state = codec::Stateful::state(&codec, budget);
             assert!(
                 decoder
@@ -221,7 +221,7 @@ fn split_trailers_retain() {
                     .expect("codec parse")
                     .is_some()
             );
-            for range in [0..split, split..wire.len()] {
+            for range in [0..first, first..second, second..wire.len()] {
                 if range.is_empty() {
                     continue;
                 }

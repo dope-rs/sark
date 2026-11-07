@@ -129,6 +129,7 @@ pub(super) fn emit<'view, 'source, 'spec>(
     let [v_result, v_parsed, v_wait] = symbols.locals(["outcome", "parsed", "pending"]);
     let [v_permit, v_resp, v_state] = symbols.locals(["permit", "response", "state"]);
     let [v_this, v_write] = symbols.locals(["this", "write"]);
+    let v_routes = symbols.local("routes");
     let ns_core = &paths.core;
     let ns_fiber = &paths.fiber;
     let ns_h1 = &paths.h1;
@@ -190,7 +191,7 @@ pub(super) fn emit<'view, 'source, 'spec>(
                 )
             }
         };
-        let complete = complete(index, &ctx.plan.spec.state_generics, &quote!(self));
+        let complete = complete(index, &ctx.plan.spec.state_generics, &quote!(#v_routes));
         return quote! {
             return match #start(
                 #found,
@@ -203,7 +204,7 @@ pub(super) fn emit<'view, 'source, 'spec>(
             ) {
                 ::core::result::Result::Ok(#v_result) => #v_result,
                 ::core::result::Result::Err(#v_error) => {
-                    let mut #v_this = self.as_mut().project();
+                    let mut #v_this = #v_routes.as_mut().project();
                     #failed
                 }
             };
@@ -225,7 +226,7 @@ pub(super) fn emit<'view, 'source, 'spec>(
                 }
             }
         };
-        let complete = complete(index, &ctx.plan.spec.state_generics, &quote!(self));
+        let complete = complete(index, &ctx.plan.spec.state_generics, &quote!(#v_routes));
         return quote! {
             let #n_shead = match #parse {
                 ::core::result::Result::Ok(
@@ -240,7 +241,7 @@ pub(super) fn emit<'view, 'source, 'spec>(
                     };
                 }
                 ::core::result::Result::Err(#v_error) => {
-                    let mut #v_this = self.as_mut().project();
+                    let mut #v_this = #v_routes.as_mut().project();
                     return { #failed };
                 }
             };

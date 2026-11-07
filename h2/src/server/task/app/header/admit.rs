@@ -28,14 +28,6 @@ use crate::{
     stream,
 };
 
-pub(in crate::server::task::app) struct Admit<'a, 'state, 'd, ID: Identity + 'd, R, Q, F>
-where
-    R: Runtime<'d, Target = Target<'d, ID>> + decode::Guarded,
-    F: rules::Policy,
-{
-    head: Drive<'a, 'state, 'd, ID, R, Q, F>,
-}
-
 pub(in crate::server::task::app) trait Begin<'d, R: Runtime<'d>>:
     Sized
 {
@@ -51,27 +43,21 @@ pub(in crate::server::task::app) trait Begin<'d, R: Runtime<'d>>:
         Q::Retention: Handoff;
 }
 
-impl<'a, 'state, 'd, ID: Identity + 'd, R, Q, F> Admit<'a, 'state, 'd, ID, R, Q, F>
+impl<'a, 'state, 'd, ID: Identity + 'd, R, Q, F> Drive<'a, 'state, 'd, ID, R, Q, F>
 where
     R: Runtime<'d, Target = Target<'d, ID>> + decode::Guarded,
     Q: Transitions<Id<'d, ID>>,
     Q::Retention: Handoff,
     F: rules::Policy,
 {
-    pub(in crate::server::task::app) const fn new(
-        head: Drive<'a, 'state, 'd, ID, R, Q, F>,
-    ) -> Self {
-        Self { head }
-    }
-
-    pub(in crate::server::task::app) fn next(
+    pub(in crate::server::task::app) fn admit_next(
         self,
         report: impl FnMut(Id<'d, ID>, stream::Key, &dyn std::fmt::Debug),
     ) -> Result<(), conn::Error> {
-        if !self.head.state.connection.streams().headers().is_ready() {
+        if !self.state.connection.streams().headers().is_ready() {
             return Ok(());
         }
-        let Some((stream, routed)) = self.head.state.data().take_route() else {
+        let Some((stream, routed)) = self.state.data().take_route() else {
             return Ok(());
         };
         self.resume(stream, routed.into_state(), report)?;
@@ -87,7 +73,7 @@ where
     where
         I: Input<'d>,
     {
-        let mut head = self.head;
+        let mut head = self;
         let call = identify(head.conn, stream);
         let slot = match head.state.vacant(stream) {
             Some(slot) => slot,
@@ -210,7 +196,7 @@ where
             head.state.data().try_route(stream, self, evidence)?;
             return Ok(());
         }
-        Admit::new(head).resume(stream, self, report)
+        head.resume(stream, self, report)
     }
 }
 

@@ -134,7 +134,9 @@ pub trait Runtime<'d>:
 
     fn has_work(self: pin::Pin<&Self>, scope: owner::Scope<Self::Target>) -> bool;
 
-    fn wake(self: pin::Pin<&mut Self>, scope: owner::Scope<Self::Target>);
+    fn wake(self: pin::Pin<&mut Self>, scope: owner::Scope<Self::Target>) {
+        let _ = Self::try_wake(self, scope);
+    }
 
     fn try_wake(self: pin::Pin<&mut Self>, scope: owner::Scope<Self::Target>) -> Wake;
 

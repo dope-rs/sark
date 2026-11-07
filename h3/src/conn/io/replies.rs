@@ -2,13 +2,12 @@ use std::{num::NonZero, ops::ControlFlow};
 
 use dope_quic::{stream::release, wire::varint};
 use o3::buffer::hold;
+pub use outbound::{Batch, Prepared};
 use output::Payload as _;
 pub(crate) use plan::Plan;
 use sark_core::manifold::stream::Boundary;
 use sark_http::{
-    self, field,
-    field::metadata::section::{rules, state::Selected},
-    payload::response::dispatch::chunk::Chunk,
+    self, field, field::metadata::section::rules, payload::response::dispatch::chunk::Chunk,
 };
 
 use crate::{
@@ -59,16 +58,6 @@ impl<'d> Data<'d> {
         Ok(Self { plan })
     }
 }
-
-#[must_use = "a prepared response is invisible until committed"]
-pub struct Prepared<'a, 'd, P: rules::Policy = rules::RetainRaw> {
-    fields: outbound::Pending<'a, 'd, Selected<P>, P::Block>,
-}
-
-#[must_use = "a response batch is invisible until committed"]
-pub struct Batch<'a, 'd, P: rules::Policy = rules::RetainRaw>(
-    outbound::Batch<'a, 'd, Selected<P>, P::Block>,
-);
 
 /// Ordinary response owners whose initial QPACK references remain unpublished.
 pub(crate) struct Pending<'d> {
@@ -153,33 +142,12 @@ impl<'d> Pending<'d> {
 }
 
 impl<'a, 'd, P: rules::Policy> Prepared<'a, 'd, P> {
-    pub fn open(self) -> Batch<'a, 'd, P> {
-        Batch(self.fields.into_batch(None))
-    }
-
-    pub fn finish(self) -> Batch<'a, 'd, P> {
-        Batch(self.fields.finish().into_batch(None))
-    }
-
     pub fn complete(self, body: Data<'d>) -> Batch<'a, 'd, P> {
         let entry = Entry::planned(budget::WriteClass::Regular, body.plan, Boundary::End);
-        Batch(self.fields.into_batch(Some(entry)))
-    }
-
-    pub(crate) fn discard(self) {
-        self.fields.discard();
-    }
-}
-
-impl<P: rules::Policy> Batch<'_, '_, P> {
-    pub fn commit(self) -> Result<hold::Charge, conn::Error> {
-        self.0.commit()
-    }
-}
-
-impl<'d, P: rules::Policy> Batch<'_, 'd, P> {
-    pub(crate) fn defer(self) -> Result<Pending<'d>, conn::Error> {
-        self.0.defer()
+        Batch {
+            pending: self,
+            trailing: Some(entry),
+        }
     }
 }
 
@@ -283,8 +251,7 @@ impl<'a, 'd, P: rules::Policy, A: rules::Push> Reply<'a, 'd, P, A> {
     ) -> Result<Prepared<'a, 'd, P>, conn::Error> {
         let conn = self.conn;
         let target = target.into();
-        let fields = conn.stage(target, frame::TYPE_HEADERS, None, fields, Boundary::More)?;
-        Ok(Prepared { fields })
+        conn.stage(target, frame::TYPE_HEADERS, None, fields, Boundary::More)
     }
 }
 

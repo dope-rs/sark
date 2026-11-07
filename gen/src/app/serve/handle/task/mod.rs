@@ -110,7 +110,6 @@ impl Task {
         let emit = &tasks.emit_body;
         let resume = &tasks.resume_body;
         let work = &tasks.task_work_body;
-        let wake = &tasks.wake_body;
         let probe = &tasks.try_wake_body;
         let cancel = &tasks.cancel_one_body;
         let fibers = !ctx.exec.fibers().is_empty();
@@ -423,15 +422,6 @@ impl Task {
                     >,
                 ) -> ::core::primitive::bool {
                     #work
-                }
-
-                fn wake(
-                    self: ::core::pin::Pin<&mut Self>,
-                    #sarg: #ns_fiber::dope::core::driver::schedule::ready::task::owner::Scope<
-                        Self::Target,
-                    >,
-                ) {
-                    #wake
                 }
 
                 fn try_wake(

@@ -51,15 +51,12 @@ impl<'a> View<'a, ()> {
             return None;
         }
         let data = meta.data();
-        let source = match layout.source() {
-            pool::Source::Compact => {
-                Source::Compact(unsafe { data.get_unchecked(layout.target_end()..) })
-            }
-            pool::Source::Head => {
-                let start = layout.target_end() + 11;
-                let end = layout.head_end() - 2;
-                Source::Head(unsafe { data.get_unchecked(start..end) })
-            }
+        let end = layout.head_end();
+        let source = if end == 0 {
+            Source::Compact(unsafe { data.get_unchecked(layout.target_end()..) })
+        } else {
+            let start = layout.target_end() + 11;
+            Source::Head(unsafe { data.get_unchecked(start..end - 2) })
         };
         Some(Self { source, bound: () })
     }

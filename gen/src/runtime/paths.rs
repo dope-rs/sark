@@ -39,10 +39,10 @@ pub(crate) enum Path {
 }
 
 impl Path {
-    fn dependency(package: Library, path: runtime::Path) -> Self {
+    fn dependency(package: Library, path: Option<proc_macro2::TokenStream>) -> Self {
         match path {
-            runtime::Path::Found(path) => Self::Found(path),
-            runtime::Path::Missing => Self::Missing {
+            Some(path) => Self::Found(path),
+            None => Self::Missing {
                 package,
                 used: Cell::new(false),
             },
@@ -82,22 +82,20 @@ impl Paths {
         let json = runtime::optional("sark-json")?;
         let h1 = runtime::optional("sark-h1")?;
         let (core, http) = match &facade {
-            runtime::Path::Found(root) => (
+            Some(root) => (
                 Path::Found(quote::quote!(#root::core)),
                 Path::Found(quote::quote!(#root::http)),
             ),
-            runtime::Path::Missing => match &fiber {
-                runtime::Path::Found(root) => (
+            None => match &fiber {
+                Some(root) => (
                     Path::Found(quote::quote!(#root::sark_core)),
                     Path::Found(quote::quote!(#root::sark_http)),
                 ),
-                runtime::Path::Missing => (
-                    Path::dependency(Library::Protocol, runtime::Path::Missing),
+                None => (
+                    Path::dependency(Library::Protocol, None),
                     match &json {
-                        runtime::Path::Found(root) => Path::Found(quote::quote!(#root::sark_http)),
-                        runtime::Path::Missing => {
-                            Path::dependency(Library::Http, runtime::Path::Missing)
-                        }
+                        Some(root) => Path::Found(quote::quote!(#root::sark_http)),
+                        None => Path::dependency(Library::Http, None),
                     },
                 ),
             },
@@ -134,7 +132,7 @@ impl Paths {
 
     pub(crate) fn h1(&self) -> runtime::H1 {
         match self.h1 {
-            Path::Found(_) => runtime::H1::Available,
+            Path::Found(_) => runtime::H1::Available(None),
             Path::Missing { .. } => runtime::H1::Missing,
         }
     }

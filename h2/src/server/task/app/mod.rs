@@ -8,7 +8,6 @@ use crate::server::{
     },
     task::Carrier,
 };
-mod boundary;
 mod drive;
 mod handoffs;
 mod header;
@@ -57,10 +56,7 @@ use crate::{
         runtime::{app::Fault, input, startup::Failure},
         state, task,
         task::{
-            app::{
-                boundary::{close, open},
-                turn::{Availability, schedule::Schedule},
-            },
+            app::turn::{Availability, schedule::Schedule},
             book,
             response::{deadline::Deadline, expiry},
             timers, *,
@@ -159,7 +155,7 @@ where
         M::Output: flush::Evidence<'d>,
         P: Fault<'d, W, A::Failure, ID, task::Build<A::Build>>,
     {
-        if let Err((cause, _)) = flush::Flush::new(conn).finish(driver, error, mode) {
+        if let Err((cause, _)) = flush::finish(conn, driver, error, mode) {
             if A::ENABLED {
                 fault.output(conn.id(), cause);
             } else {
@@ -205,7 +201,8 @@ where
     {
         match arm {
             Ok(()) => Sync::Armed,
-            Err(_) => {
+            Err(cause) => {
+                conn.deadline().reject(cause);
                 Self::flush_transport(
                     conn,
                     driver,
@@ -523,8 +520,12 @@ where
         let timers =
             timers::Policy::state(&this.deadlines, domain).map_err(task::Build::Deadlines)?;
         let capacity = semantic::Capacity::new(domain, config.data_events().raw());
-        let carrier = conn::machine::Connection::from_runtime_seed(*config, hash::Seed::new(seed))
-            .map_err(task::Build::Connection)?;
+        let carrier = conn::machine::Connection::from_runtime_seed(
+            config,
+            hash::Seed::new(seed),
+            conn::ingress::PrefacePhase::Magic,
+        )
+        .map_err(task::Build::Connection)?;
         let book = book::Book::try_new(domain).map_err(task::Build::Book)?;
         Ok(State {
             carrier,
@@ -570,17 +571,21 @@ where
         conn: Ctx<'e, '_, '_, '_, '_, 'd, ID, W, Self::Conn, Self::Egress>,
     ) -> receive::Outcome {
         let this = self.project();
-        open::apply(this.router, this.mode, conn.id())
+        let id = conn.id();
+        let owner = owner::Owner::from(id);
+        if let Err(cause) = Runtime::register(this.router.as_ref(), owner) {
+            life::Mode::diagnostic(this.mode, &cause);
+            return receive::Outcome::Failed(receive::Failure::Contract);
+        }
+        this.mode.observe(life::Event::SessionOpened(id));
+        receive::Outcome::Continue
     }
 
-    fn activate<'e, 'a, 'p, 's, 'w>(
+    fn activate<'e>(
         self: pin::Pin<&mut Self>,
-        mut conn: Ctx<'e, 'a, 'p, 's, 'w, 'd, ID, W, Self::Conn, Self::Egress>,
+        mut conn: Ctx<'e, '_, '_, '_, '_, 'd, ID, W, Self::Conn, Self::Egress>,
         driver: &mut driver::Context<'_, 'd>,
-    ) -> Ctx<'e, 'a, 'p, 's, 'w, 'd, ID, W, Self::Conn, Self::Egress>
-    where
-        'd: 'w,
-    {
+    ) {
         let this = self.project();
         let mut router = this.router;
         let tasks = this.tasks;
@@ -716,7 +721,7 @@ where
                 Self::arm_transport(&mut conn, driver, arm, mode, fault),
                 Sync::Finished
             ) {
-                return conn;
+                return;
             }
         }
         let result = match timer_fault {
@@ -730,7 +735,7 @@ where
         };
         if let Some(error) = error {
             Self::finish_transport(&mut conn, driver, error, mode, fault);
-            return conn;
+            return;
         }
         if matches!(expiry, Deadline::Wake) {
             parent.wake();
@@ -740,32 +745,54 @@ where
                 Self::flush_transport(&mut conn, driver, None, mode, fault);
             }
             parent.wake();
-            return conn;
+            return;
         }
         let state = conn.state_mut();
         let drain = state.finish_drain(A::activity(&state.service));
         if !conn.state().carrier.output().is_empty() || matches!(drain, handler::Drain::Complete) {
             Self::flush_transport(&mut conn, driver, None, mode, fault);
         }
-        conn
     }
 
-    fn close<'e, 'a, 'p, 's, 'w>(
+    fn close<'e>(
         self: pin::Pin<&mut Self>,
-        mut conn: Ctx<'e, 'a, 'p, 's, 'w, 'd, ID, W, Self::Conn, Self::Egress>,
-    ) -> Ctx<'e, 'a, 'p, 's, 'w, 'd, ID, W, Self::Conn, Self::Egress>
-    where
-        'd: 'w,
-    {
-        let this = self.project();
+        mut conn: Ctx<'e, '_, '_, '_, '_, 'd, ID, W, Self::Conn, Self::Egress>,
+    ) {
+        let mut this = self.project();
         {
             let owner = conn.id();
             let state = conn.state_mut();
             this.service
                 .close(&mut state.service, &mut state.carrier, owner);
         }
-        close::Close::new(this.router, this.tasks, this.mode).apply::<W, D, A>(&mut conn);
-        conn
+        let id = conn.id();
+        this.mode.observe(life::Event::SessionClosing(id));
+        let state = conn.state_mut();
+        let index = &mut state.task_index;
+        if !index.is_empty() {
+            for at in 0..index.capacity() {
+                let Some(stream) = index.key_at(at) else {
+                    continue;
+                };
+                let Some(taken) = this.tasks.take_stream(index, stream) else {
+                    continue;
+                };
+                let (_, stream, task, unreported) = taken.into_parts();
+                Runtime::cancel(this.router.as_mut(), task);
+                if unreported {
+                    this.mode
+                        .observe(life::Event::TaskCancelled(identify(id, stream)));
+                }
+                if state.book.responses.entry(stream).is_none() {
+                    identify(id, stream).retire(this.mode, life::Outcome::Cancelled);
+                }
+            }
+            index.clear();
+        }
+        if let Err(cause) = Runtime::try_retire(this.router.as_ref(), owner::Owner::from(id)) {
+            life::Mode::diagnostic(this.mode, &cause);
+        }
+        state.turn().close(id, this.mode);
     }
 }
 

@@ -13,7 +13,7 @@ impl Drain {
         Runtime: pump::Tasks,
         Transitions: switch::Engine,
     {
-        match conn.commit() {
+        match conn.transitions.commit() {
             switch::Commit::Ordinary => Self::ordinary(conn).into(),
             switch::Commit::Switch => pump::Completion::Switch,
         }

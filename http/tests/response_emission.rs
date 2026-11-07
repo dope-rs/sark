@@ -157,10 +157,14 @@ fn result_keeps_bound() {
 fn stream_keeps_headers() {
     let value = *b"on";
     let stream = &value[..];
-    let fields = Set::from_items([Item::borrow(
-        field::literal!(Name::try_bytes(b"x-stream")),
-        Value::try_bytes(&value).expect("stream field"),
-    )]);
+    let fields = Set::from_optional([
+        None,
+        Some(Item::borrow(
+            field::literal!(Name::try_bytes(b"x-stream")),
+            Value::try_bytes(&value).expect("stream field"),
+        )),
+        None,
+    ]);
     let output = dispatch::Stream::new(stream)
         .with_status(Code::CREATED)
         .headers(fields);

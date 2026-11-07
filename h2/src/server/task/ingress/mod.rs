@@ -122,7 +122,7 @@ impl<'a, 'd, P: request::Prepared, F: state::Family<P>, B: body::Build<'d>>
             unsafe { keyed::Slot::<_, _, false>::from_source(depot::raw::Proof::new(owner)) }
                 .push::<false>();
         }
-        vacant.occupy(Entry::Streaming { body, link })
+        vacant.insert(Entry::Streaming { body, link })
     }
 }
 

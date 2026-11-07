@@ -74,6 +74,7 @@ impl<'life, 'e: 'life, 'd: 'life, ID: Identity>
     type ConnState = ();
     type Failure = Observed;
     type Mode = mode::Plain;
+    type Receipt = ();
     type Requests = request::Enabled;
     type Response = response::Resume<Pending<'d>, Pending<'d>>;
     type Send = compose::Either<pool::Cursor, pair::Source<resident::Shared<'d>>>;
@@ -311,6 +312,22 @@ impl<'life, 'e: 'life, 'd: 'life, ID: Identity>
     policy::Lifecycle<'life, 'd, Port<'e, 'd, ID>, ID, MAX_CONNECTIONS> for Driver
 {
     type Drain = Ready;
+
+    fn transmit_failed(
+        owner: &Owner<'life, 'e, 'd, ID>,
+        conn: conn::Id<'d, ID>,
+        failure: conn::Transmit,
+        regions: &mut (
+            region::Token<region::Identity<'d>>,
+            region::Token<region::Identity<'d, 1>>,
+        ),
+    ) -> Option<conn::Transmit> {
+        let port = owner.root();
+        let state = port.shared.get_mut(&mut regions.1);
+        state.fail(conn, error::Error::Transmit(failure));
+        port.shared.wake_all();
+        Some(failure)
+    }
 
     fn io_fail(
         owner: &mut Owner<'life, 'e, 'd, ID>,

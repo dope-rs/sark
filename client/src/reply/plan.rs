@@ -38,11 +38,8 @@ impl<'source, 'a, 'd> Plan<'source, 'a, 'd> {
                             Ok(owner) => owner.into(),
                             Err(owner) => owner,
                         };
-                        match owner.scope() {
-                            resident::Scope::Independent => {}
-                            resident::Scope::Bound(owner) => {
-                                Self::add(owner.len(), Part::Body, &mut bytes, &mut parts)?;
-                            }
+                        if let Some(owner) = owner.scope() {
+                            Self::add(owner.len(), Part::Body, &mut bytes, &mut parts)?;
                         }
                         front = source.body.segments.try_insert(owner).map_err(|rejected| {
                             Error::MetadataCommit {
@@ -75,9 +72,8 @@ impl<'source, 'a, 'd> Plan<'source, 'a, 'd> {
         bytes: &mut usize,
         parts: &mut Parts,
     ) -> Result<(), Error> {
-        match fields.prepare() {
-            resident::Scope::Independent => {}
-            resident::Scope::Bound(owner) => Self::add(owner.len(), part, bytes, parts)?,
+        if let Some(owner) = fields.prepare() {
+            Self::add(owner.len(), part, bytes, parts)?;
         }
         Ok(())
     }

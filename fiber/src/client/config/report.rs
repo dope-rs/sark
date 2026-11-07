@@ -262,7 +262,7 @@ impl<E: Impossible> Policy<E> for Never {
 enum Record<'f, E> {
     Vacant,
     Armed {
-        slot: Unique<'f, shared::Resident<E>, shared::Header<E>>,
+        slot: Unique<'f, shared::Resident<E>>,
         receive: Option<Errno>,
         transmit: Option<Transmit>,
     },

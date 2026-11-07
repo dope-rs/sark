@@ -23,7 +23,7 @@ impl<'d> Iterator for Segments<'d> {
             }
         };
         self.state.storage = storage;
-        owner.map(Segment::from)
+        owner
     }
 
     fn size_hint(&self) -> (usize, Option<usize>) {

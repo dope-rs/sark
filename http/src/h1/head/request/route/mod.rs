@@ -1,7 +1,7 @@
 use std::{num::NonZero, str};
 
 use o3::{buffer, buffer::write};
-use write::{CopyError, SourceExt as _};
+use write::CopyError;
 
 use crate::{
     h1::{field::expect, head::request::pool, switch},
@@ -72,7 +72,6 @@ impl<'d> Route<pool::Buf<'d>> {
                 target.end() as u16,
                 self.end.get() as u16,
             ],
-            pool::Source::Head,
             route.transition(),
         );
         let mut bytes = self.source.bytes;
@@ -100,7 +99,7 @@ impl<S: buffer::raw::Source> Route<S> {
     where
         D: buffer::raw::Source + write::Sink,
     {
-        let target = target.try_copy(self.source.as_ref())?;
+        let target = write::try_copy(target, self.source.as_ref())?;
         Ok(Route {
             source: target,
             line: self.line,

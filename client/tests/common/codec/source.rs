@@ -53,7 +53,7 @@ unsafe impl<'d, R: buffer::Cursor + hold::raw::Retain<'d>> hold::raw::Retain<'d>
     fn try_retain<'a>(
         plan: &Self::View<'a>,
         budget: &resident::Budget<'d>,
-    ) -> Result<resident::Shared<'d>, hold::Error>
+    ) -> Result<hold::Retained<'d>, hold::Error>
     where
         Self: 'a,
     {

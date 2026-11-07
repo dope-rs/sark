@@ -13,38 +13,31 @@ pub(crate) enum Requirement {
     Fiber,
 }
 
-#[derive(Clone)]
-pub(super) enum Path {
-    Found(proc_macro2::TokenStream),
-    Missing,
-}
-
-#[derive(Clone, Copy)]
 pub(crate) enum H1 {
-    Available,
+    Available(Option<proc_macro2::TokenStream>),
     Missing,
 }
 
-pub(crate) fn grpc() -> syn::Result<proc_macro2::TokenStream> {
-    match optional("sark-grpc")? {
-        Path::Found(path) => Ok(path),
-        Path::Missing => Err(syn::Error::new(
+pub(crate) fn require(package: &str, context: &str) -> syn::Result<proc_macro2::TokenStream> {
+    match optional(package)? {
+        Some(path) => Ok(path),
+        None => Err(syn::Error::new(
             Span::call_site(),
-            "Message requires sark-grpc as a direct dependency",
+            format!("{context} requires {package} as a direct dependency"),
         )),
     }
 }
 
-fn optional(package: &str) -> syn::Result<Path> {
+fn optional(package: &str) -> syn::Result<Option<proc_macro2::TokenStream>> {
     match proc_macro_crate::crate_name(package) {
-        Ok(FoundCrate::Itself) => own_path(package).map(Path::Found),
-        Ok(FoundCrate::Name(name)) => named_path(&name).map(Path::Found),
+        Ok(FoundCrate::Itself) => own_path(package).map(Some),
+        Ok(FoundCrate::Name(name)) => named_path(&name).map(Some),
         Err(Error::CrateNotFound {
             crate_name: reported,
             path,
         }) => {
             if reported == package {
-                Ok(Path::Missing)
+                Ok(None)
             } else {
                 Err(syn::Error::new(
                     Span::call_site(),

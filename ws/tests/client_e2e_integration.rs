@@ -40,22 +40,20 @@ fn terminal_frames_keep_diagnostics() {
             std::io::copy(&mut stream, &mut std::io::sink()).expect("client terminates");
         });
         peer.with(|| {
-            common::client::Probe::new(
+            let seen = common::client::Probe::new(
                 address,
                 client::Config::new("localhost", "/").expect("configuration"),
             )
-            .close(recovery::Policy::new(|_| {}, common::recover), |result| {
-                let seen = result.expect("client execution");
-                assert!(seen.is_open());
-                assert!(matches!(
-                    seen.close(),
-                    Some(client::CloseReason::Decode(client::Fault::Frame(actual)))
-                        if *actual == expected
-                ));
-            })
-            .as_ref()
-            .map_err(|cause| cause.kind())
-            .expect("client topology");
+            .run(
+                common::client::Goal::Close,
+                recovery::Policy::new(|_| {}, common::recover),
+            );
+            assert!(seen.is_open());
+            assert!(matches!(
+                seen.close(),
+                Some(client::CloseReason::Decode(client::Fault::Frame(actual)))
+                    if *actual == expected
+            ));
         })
         .expect("peer");
     }
@@ -121,13 +119,11 @@ fn outbound_retains_layout() {
                             messages: &messages,
                         }),
                         |mut app| {
-                            app.wait(|result| {
-                                result
-                                    .as_ref()
-                                    .map_err(|cause| cause.cause())
-                                    .expect("WebSocket wait");
-                            })
-                            .expect("WebSocket operation");
+                            app.wait()
+                                .expect("WebSocket operation")
+                                .as_ref()
+                                .map_err(|cause| cause.cause())
+                                .expect("WebSocket wait");
                             let handle = app.client();
                             let driver = handle.try_driver().expect("first egress driver");
                             let alias = handle;

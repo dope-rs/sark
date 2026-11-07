@@ -77,7 +77,6 @@ pub(super) fn build(task: Task<'_>, paths: &Paths, json: &syn::Type) -> Output {
         definition: quote::quote! {
             impl<'d> #ns_core::route::TaskBuild<'d> for #builder<'d> {
                 type Task = #request<'d>;
-                type StepError = #ns_json::parsing::Error<'d>;
 
                 fn reject(#v_err: Self::StepError) -> #ns_core::route::Reject {
                     match #v_err {
@@ -112,8 +111,13 @@ pub(super) fn build(task: Task<'_>, paths: &Paths, json: &syn::Type) -> Output {
                         ) => #ns_core::route::Reject::Internal,
                     }
                 }
+            }
 
-                fn finish_body(mut self, #v_len: ::core::primitive::usize) -> Self {
+            impl<'d> #ns_core::body::Build<'d> for #builder<'d> {
+                type Output = #ns_core::route::Built<'d, #request<'d>>;
+                type StepError = #ns_json::parsing::Error<'d>;
+
+                fn finish_input(mut self, #v_len: ::core::primitive::usize) -> Self {
                     self.body_len = #v_len;
                     self.body = self.body.close();
                     self
@@ -124,7 +128,7 @@ pub(super) fn build(task: Task<'_>, paths: &Paths, json: &syn::Type) -> Output {
                     #v_budget: ::core::num::NonZero<::core::primitive::usize>,
                 ) -> #ns_core::body::Step<
                     Self,
-                    #ns_core::route::Built<'d, Self::Task>,
+                    Self::Output,
                     Self::StepError,
                 > {
                     let #v_prog = self.body.poll(#v_budget);
@@ -158,6 +162,24 @@ pub(super) fn build(task: Task<'_>, paths: &Paths, json: &syn::Type) -> Output {
             }
 
             impl<'d> #ns_core::route::Push<'d> for #builder<'d> {
+                fn reject_push(#v_err: Self::Error) -> #ns_core::route::Reject {
+                    match #v_err {
+                        #ns_json::segment::Push::Complete(_)
+                        | #ns_json::segment::Push::Length { .. }
+                        | #ns_json::segment::Push::Segments { .. } => {
+                            #ns_core::route::Reject::BadRequest
+                        }
+                        #ns_json::segment::Push::Allocation {
+                            error: #ns_json::o3::alloc::Error::Exhausted, ..
+                        } => #ns_core::route::Reject::Unavailable,
+                        #ns_json::segment::Push::Allocation {
+                            error: #ns_json::o3::alloc::Error::Overflow, ..
+                        } => #ns_core::route::Reject::Internal,
+                    }
+                }
+            }
+
+            impl<'d> #ns_core::body::Push<'d> for #builder<'d> {
                 type Error = #ns_json::segment::Push<'d>;
 
                 fn observe<C: ::core::marker::Copy, S: ::core::marker::Copy, O: #ns_core::life::Observer<C, S>>(
@@ -180,23 +202,7 @@ pub(super) fn build(task: Task<'_>, paths: &Paths, json: &syn::Type) -> Output {
                     }
                 }
 
-                fn reject_push(#v_err: Self::Error) -> #ns_core::route::Reject {
-                    match #v_err {
-                        #ns_json::segment::Push::Complete(_)
-                        | #ns_json::segment::Push::Length { .. }
-                        | #ns_json::segment::Push::Segments { .. } => {
-                            #ns_core::route::Reject::BadRequest
-                        }
-                        #ns_json::segment::Push::Allocation {
-                            error: #ns_json::o3::alloc::Error::Exhausted, ..
-                        } => #ns_core::route::Reject::Unavailable,
-                        #ns_json::segment::Push::Allocation {
-                            error: #ns_json::o3::alloc::Error::Overflow, ..
-                        } => #ns_core::route::Reject::Internal,
-                    }
-                }
-
-                fn push_body(
+                fn push(
                     mut self,
                     #v_seg: #ns_http::payload::owned::Segment<'d>,
                 ) -> #ns_core::body::Transfer<Self, Self::Error> {

@@ -127,7 +127,7 @@ impl<'d, A: app::Runtime<'d>, L: rotation::Policy<'d>, E: State<'d>, M: owners::
         A: app::Runtime<'d, Target = server::Handle<'d, ID>>,
     {
         let owner = owner::Owner::from(handle);
-        let done = self.requests.dispatch_one(|id, input| {
+        match self.requests.dispatch_one(|id, input| {
             let target = server::Handle::from_request(handle, id);
             match input {
                 task::Input::Built { output } => {
@@ -137,17 +137,9 @@ impl<'d, A: app::Runtime<'d>, L: rotation::Policy<'d>, E: State<'d>, M: owners::
                     app::Runtime::try_dispatch(router.as_mut(), req, target, owner, parent)
                 }
             }
-        });
-        let done = match done {
-            Ok(done) => done,
-            Err(error) => {
-                manifold::close_connection_scoped(quic, server::request_error_code(error));
-                return Drive::Progress;
-            }
-        };
-        match done {
-            task::Dispatch::Idle => Drive::Idle,
-            task::Dispatch::Active { key: id } => {
+        }) {
+            Ok(task::Dispatch::Idle) => return Drive::Idle,
+            Ok(task::Dispatch::Active { key: id }) => {
                 life.observe(life::Event::TaskAdmitted(exchange::Id::new(
                     handle,
                     id.stream_id(),
@@ -159,11 +151,9 @@ impl<'d, A: app::Runtime<'d>, L: rotation::Policy<'d>, E: State<'d>, M: owners::
                     now,
                 ) {
                     manifold::close_connection_scoped(quic, deadline::code(error));
-                    return Drive::Progress;
                 }
-                Drive::Progress
             }
-            task::Dispatch::Rejected { key: id, error } => {
+            Ok(task::Dispatch::Rejected { key: id, error }) => {
                 let code = match A::rejection(&error) {
                     route::Reject::Unavailable => frame::ErrorCode::ExcessiveLoad,
                     route::Reject::BadRequest => frame::ErrorCode::Message,
@@ -181,9 +171,12 @@ impl<'d, A: app::Runtime<'d>, L: rotation::Policy<'d>, E: State<'d>, M: owners::
                 ) {
                     manifold::close_connection_scoped(quic, error.code());
                 }
-                Drive::Progress
+            }
+            Err(error) => {
+                manifold::close_connection_scoped(quic, server::request_error_code(error));
             }
         }
+        Drive::Progress
     }
 
     /// Reads the request phase under its connection's resident identity proof.

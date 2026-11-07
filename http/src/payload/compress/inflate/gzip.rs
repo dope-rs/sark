@@ -11,7 +11,7 @@ use crate::payload::{
     compress::inflate::{
         Checked, DecodeError, Error, Failure, Part, Plan,
         checked::STEP,
-        input::{Chunk, Input, Step},
+        input::{Chunk, Step},
     },
     crc32::Hasher,
 };
@@ -50,7 +50,7 @@ impl Gzip {
         I: Iterator<Item = &'a [u8]>,
     {
         let plan = self.try_plan(segments, 0)?;
-        self.decode_exact(plan.input, output)
+        self.decode_exact(plan, output)
     }
 
     pub fn decode_plan<'a, I: Iterator<Item = &'a [u8]>>(
@@ -67,12 +67,12 @@ impl Gzip {
                 0,
             ));
         }
-        self.decode_exact(plan.input, output)
+        self.decode_exact(plan, output)
     }
 
     fn decode_exact<'a, I>(
         &mut self,
-        input: Input<'a, I>,
+        plan: Plan<'a, I>,
         mut output: write::Spare<'_>,
     ) -> Result<(), Failure>
     where
@@ -80,7 +80,7 @@ impl Gzip {
     {
         let written = self
             .decode_input::<false, _, _, Failure, Infallible, _>(
-                input,
+                plan,
                 &mut output.as_mut_slice(),
                 |output, _| {
                     let capacity = output.len();
@@ -111,7 +111,7 @@ impl Gzip {
 
     fn decode_input<'a, const CHECK: bool, I, B, D, E, F>(
         &mut self,
-        input: Input<'a, I>,
+        plan: Plan<'a, I>,
         output: &mut B,
         mut grow: impl FnMut(&mut B, &mut F) -> Result<(), Checked<D, E>>,
         check: &mut F,
@@ -122,7 +122,8 @@ impl Gzip {
         D: From<Failure>,
         F: FnMut() -> Result<(), E>,
     {
-        let (mut segments, mut input) = input.into_parts();
+        let mut segments = plan.segments;
+        let mut input = plan.input;
         let mut written = 0;
         let mut start = 0;
         loop {
@@ -273,7 +274,7 @@ impl Gzip {
         })?;
         fill::<CHECK, E>(&mut output, check).map_err(Checked::Check)?;
         let written = self.decode_input::<CHECK, _, _, DecodeError, E, _>(
-            plan.input,
+            plan,
             &mut output,
             |output, check| {
                 let current = output.len();

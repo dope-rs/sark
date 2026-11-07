@@ -47,7 +47,6 @@ where
     pub(super) fn activity(&self, service: schedule::Quiescence) -> schedule::Quiescence {
         if self.task_index.is_empty()
             && self.book.incoming.is_empty()
-            && self.book.build_ready.is_empty()
             && self.book.responses.is_empty()
             && self.carrier.status().active_len() == 0
             && matches!(service, schedule::Quiescence::Quiet)

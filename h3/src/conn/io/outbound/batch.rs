@@ -1,21 +1,25 @@
-use o3::{buffer::hold, depot::queue::ring};
+use o3::{buffer::hold, depot::queue::ring, mem::Rejected};
 use sark_core::manifold::stream::Boundary;
+use sark_http::field::metadata::section::rules;
 
 use crate::{
     conn,
     conn::io::{
-        outbound::{Pending, section, writes},
-        write::{self, Entry, Stage as _, budget},
+        outbound::{Prepared, section},
+        write::{self, Entry, Permit, Single, Stage as _, budget},
     },
+    qpack::encoder,
+    stream,
 };
 
-pub(in crate::conn) struct Batch<'q, 'd, S, B> {
-    pub(super) pending: Pending<'q, 'd, S, B>,
-    pub(super) trailing: Option<Entry<'d>>,
+#[must_use = "a response batch is invisible until committed"]
+pub struct Batch<'q, 'd, P: rules::Policy = rules::RetainRaw> {
+    pub(in crate::conn::io) pending: Prepared<'q, 'd, P>,
+    pub(in crate::conn::io) trailing: Option<Entry<'d>>,
 }
 
-impl<'q, 'd, S, B> Batch<'q, 'd, S, B> {
-    pub(in crate::conn) fn commit(self) -> Result<hold::Charge, conn::Error> {
+impl<'q, 'd, P: rules::Policy> Batch<'q, 'd, P> {
+    pub fn commit(self) -> Result<hold::Charge, conn::Error> {
         let qpack = match self.pending.encode_qpack() {
             Ok(qpack) => qpack,
             Err(error) => {
@@ -27,18 +31,56 @@ impl<'q, 'd, S, B> Batch<'q, 'd, S, B> {
             self.pending.discard();
             return Err(error);
         }
-        writes::commit(
-            self,
-            qpack.map(|(target, prefix)| {
-                (
-                    target,
-                    Entry::single(budget::WriteClass::Critical, prefix, Boundary::More),
-                )
-            }),
-        )
+        let qpack = qpack.map(|(target, prefix)| {
+            (
+                target,
+                Entry::single(budget::WriteClass::Critical, prefix, Boundary::More),
+            )
+        });
+        let Self {
+            pending:
+                Prepared {
+                    fields,
+                    queues,
+                    outgoing,
+                    ..
+                },
+            trailing,
+        } = self;
+        let section::Section {
+            target,
+            entry: fields,
+            qpack: commit,
+        } = fields;
+        let retained = match (qpack, trailing) {
+            (None, None) => match Single::new(queues, target, fields) {
+                Ok(permit) => {
+                    commit.clear();
+                    permit.commit::<hold::evidence::On>()
+                }
+                Err(rejected) => {
+                    let error = rejected.discard();
+                    commit.discard();
+                    return Err(error);
+                }
+            },
+            (Some(qpack), None) => publish(Permit::new(queues, [qpack, (target, fields)]), commit)?,
+            (None, Some(trailing)) => publish(
+                Permit::new(queues, [(target, fields), (target, trailing)]),
+                commit,
+            )?,
+            (Some(qpack), Some(trailing)) => publish(
+                Permit::new(queues, [qpack, (target, fields), (target, trailing)]),
+                commit,
+            )?,
+        };
+        if let Some(outgoing) = outgoing {
+            outgoing.commit();
+        }
+        Ok(retained)
     }
 
-    pub(in crate::conn) fn defer(mut self) -> Result<conn::io::replies::Pending<'d>, conn::Error> {
+    pub(crate) fn defer(mut self) -> Result<conn::io::replies::Pending<'d>, conn::Error> {
         if let Err(error) = self.stage() {
             self.pending.discard();
             return Err(error);
@@ -126,4 +168,19 @@ impl<'q, 'd, S, B> Batch<'q, 'd, S, B> {
         }
         Ok(())
     }
+}
+
+fn publish<'a, 'd, const N: usize>(
+    permit: Result<Permit<'a, 'd, N>, Rejected<[(stream::Target, Entry<'d>); N], conn::Error>>,
+    qpack: encoder::Commit<'a>,
+) -> Result<hold::Charge, conn::Error> {
+    let result = match permit {
+        Ok(permit) => permit.commit::<hold::evidence::On, _>(qpack, encoder::Commit::clear),
+        Err(rejected) => Err((rejected, qpack)),
+    };
+    result.map_err(|(rejected, qpack)| {
+        let error = rejected.discard();
+        qpack.discard();
+        error
+    })
 }

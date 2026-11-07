@@ -1,5 +1,5 @@
 //! Statically selected H3 lifecycle and owner projection.
-use std::convert::{Infallible, identity};
+use std::convert::Infallible;
 
 use dope_quic::{
     conn::{
@@ -207,7 +207,7 @@ impl<C: Copy, O: life::Mode<C, Id>> Projection<'_, O, C> {
         if !O::ENABLED || id.kind() != Kind::ClientBidi {
             return;
         }
-        let mut sink = owners::Sink::new(self.observer, self.handle, identity);
+        let mut sink = owners::Sink::new(self.observer, self.handle);
         sink.apply(owner::Effect::new(id, charge, owner::Change::Handoff));
     }
 
@@ -232,7 +232,7 @@ impl<C: Copy, O: life::Mode<C, Id>> Projection<'_, O, C> {
             return;
         }
         if effect.key().kind() == Kind::ClientBidi {
-            let mut sink = owners::Sink::new(self.observer, self.handle, identity);
+            let mut sink = owners::Sink::new(self.observer, self.handle);
             sink.apply(effect);
         }
     }

@@ -7,7 +7,7 @@ use sark_core::manifold::{
 use sark_http::payload::compress::dynamic::hash;
 
 use crate::{
-    conn::{config, event, machine},
+    conn::{config, event, ingress::PrefacePhase, machine},
     server::runtime::{
         self, Connection,
         output::{self, flush::End},
@@ -29,10 +29,11 @@ where
 {
     pub(super) fn try_new(
         app: &A,
-        machine: config::Validated<crate::ServerRole>,
+        machine: &config::Validated<crate::ServerRole>,
         seed: hash::Seed,
+        preface: PrefacePhase,
     ) -> Result<Self, runtime::Build<A::Build>> {
-        let carrier = Connection::<'d, A>::from_runtime_seed(machine, seed)
+        let carrier = Connection::<'d, A>::from_runtime_seed(machine, seed, preface)
             .map_err(runtime::Build::Connection)?;
         let capacity = Capacity::new(machine.stream_count(), machine.data_events().raw());
         let app = app.state(capacity).map_err(runtime::Build::App)?;

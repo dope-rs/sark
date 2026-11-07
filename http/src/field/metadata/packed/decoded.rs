@@ -68,8 +68,7 @@ impl<S: AsRef<[u8]>, const PREFIX: usize> Decoded<S, PREFIX> {
     pub fn try_to_owned(&self) -> Result<Vec<Owned>, alloc::Error> {
         let mut fields = Vec::new();
         for field in self.iter() {
-            let slot = alloc::Vacant::try_new(&mut fields)?;
-            slot.insert(Owned::try_from(field)?);
+            alloc::try_vacant(&mut fields)?(Owned::try_from(field)?);
         }
         Ok(fields)
     }
@@ -175,7 +174,7 @@ impl<const PREFIX: usize> storage::Writer<Decoded<pool::Span, PREFIX>> {
     /// Commits a field after its producer supplies the name boundary.
     pub fn try_write<E>(
         &mut self,
-        write: impl FnOnce(&mut spans::Writer<'_, '_, false>) -> Result<usize, E>,
+        write: impl FnOnce(&mut spans::Writer<'_, '_>) -> Result<usize, E>,
     ) -> Result<(), E>
     where
         E: From<Error>,
@@ -186,7 +185,7 @@ impl<const PREFIX: usize> storage::Writer<Decoded<pool::Span, PREFIX>> {
     pub fn try_write_as<E>(
         &mut self,
         indexing: crate::field::Indexing,
-        write: impl FnOnce(&mut spans::Writer<'_, '_, false>) -> Result<usize, E>,
+        write: impl FnOnce(&mut spans::Writer<'_, '_>) -> Result<usize, E>,
     ) -> Result<(), E>
     where
         E: From<Error>,

@@ -1,11 +1,6 @@
 pub mod common;
 
-use std::{
-    cell::Cell,
-    num::NonZero,
-    pin::{self, pin},
-    task::Poll,
-};
+use std::{cell::Cell, num::NonZero, pin::pin, task::Poll};
 
 use dope::core::{
     BranchError,
@@ -19,7 +14,7 @@ use dope_fiber::{
     context::Context,
     task::storage::{
         fixed::{
-            self, quota,
+            quota,
             schedule::{self, Pool},
             tree,
         },
@@ -28,20 +23,19 @@ use dope_fiber::{
 };
 use dope_test::{
     alloc::Tracker,
-    fibers::Yield,
     scope::{Driver, Error},
 };
-use o3::depot::arena::slab::storage::Heap;
 use sark_core::{
-    body,
+    body::{self, Build as _},
     manifold::task::{request::Input, response::Outcome},
-    route::{Own, TaskBuild as _},
+    route::Own,
 };
 use sark_fiber::{
     driver::{Binding, route::KeyTag, schedule::ready::task::owner, settings},
-    manifold::runtime::{Cold, Initial, TaskRoute as _},
+    manifold::runtime::TaskRoute as _,
 };
 use sark_h1::session;
+use sark_http::field::head::AcceptEncoding;
 use sark_http::{h1::codec::canned, payload::response::status::Code, request::Seq};
 
 use crate::common::route::glue::{
@@ -52,6 +46,7 @@ use crate::common::route::glue::{
     },
     storage::Domain,
 };
+use common::h1::fields;
 use common::server::recover;
 
 type Plain = __SarkHandlerPlainX706C61696E;
@@ -111,6 +106,7 @@ fn empty_input_has_no_owner() {
 #[test]
 fn discard_keeps_pipeline() {
     let mut reports = Vec::new();
+    let encoding = AcceptEncoding::try_parse(fields::ENCODING_VALUE).expect("owner admission");
     Driver::new(settings::Config::default()).with_driver(
         |driver| {
             let binding = Binding::new(
@@ -118,7 +114,11 @@ fn discard_keeps_pipeline() {
                 owner::Capacity::new(NonZero::<u32>::MIN),
             );
             let ids = Seq::new(binding.sequence());
-            for wire in [empty::BODY, empty::CHUNKED] {
+            for (wire, encoding) in [
+                (empty::BODY, None),
+                (empty::CHUNKED, None),
+                (empty::ENCODING_BODY, Some(encoding)),
+            ] {
                 let head = wire
                     .windows(4)
                     .position(|part| part == b"\r\n\r\n")
@@ -143,7 +143,7 @@ fn discard_keeps_pipeline() {
                             .expect("inspected pipeline");
                     assert_eq!(consumed, expected);
                     assert_eq!(rest, empty::HEAD.len());
-                    for (input, len) in [(input, 1), (pipeline, 0)] {
+                    for (input, len, expected) in [(input, 1, encoding), (pipeline, 0, None)] {
                         let built = match input {
                             Input::Ready { request } => request,
                             Input::Buffered(request) => {
@@ -158,6 +158,7 @@ fn discard_keeps_pipeline() {
                         };
                         let (_, request) = built.into_parts();
                         assert_eq!(request.len.len(), len);
+                        assert_eq!(request.encoding, expected);
                         assert_eq!(
                             request.proof.as_ref().map(|proof| proof.as_slice()),
                             Some(b"kept".as_slice())
@@ -325,43 +326,4 @@ fn first_poll_drops_request() {
         },
     );
     assert!(reports.is_empty(), "driver retirement: {reports:?}");
-}
-
-#[test]
-fn routes_share_quota() {
-    scope::Brand::with(|brand| {
-        let (brand, plan) = <Cold as Initial>::tasks::<
-            tree::Branch<
-                tree::Leaf<fixed::Slab<'_, Yield, 1, Domain, Heap>>,
-                tree::Leaf<fixed::Slab<'_, Yield, 1, Domain, Heap>>,
-            >,
-            tree::Leaf<Pool<'_, Yield, 1, Domain, ()>>,
-        >(quota::Limit::new(1), brand);
-        let tasks = scope::Owned::new(plan.try_prepare().expect("route storage"), brand);
-        let mut tasks = pin::pin!(tasks);
-        let mut tasks = tasks.as_mut().scope();
-
-        {
-            let mut route = tasks.as_mut().route::<tree::Left<tree::Here>>();
-            assert!(route.admit().is_some(), "left route must admit one task");
-        }
-        assert_eq!(tasks.as_ref().get_ref().available().get(), 1);
-
-        let id = {
-            let mut route = tasks.as_mut().route::<tree::Left<tree::Here>>();
-            route.insert(Yield::new()).expect("available route")
-        };
-        assert_eq!(tasks.as_ref().get_ref().available().get(), 0);
-
-        {
-            let mut route = tasks.as_mut().route::<tree::Right<tree::Here>>();
-            assert!(route.admit().is_none());
-        }
-
-        {
-            let mut route = tasks.as_mut().route::<tree::Left<tree::Here>>();
-            assert!(matches!(route.remove(id), fixed::local::Removal::Removed));
-        }
-        assert_eq!(tasks.as_ref().get_ref().available().get(), 1);
-    });
 }

@@ -187,7 +187,7 @@ impl Codec {
         R: buffer::Cursor + hold::raw::Retain<'d>,
         F: FnOnce(Result<Parsed<'d>, Error>, &mut State<'d>) -> T::Accepted,
     {
-        let (data, consumed) = match input.try_prefix(take) {
+        let (data, consumed) = match input.try_prefix(0, take) {
             Ok(plan) => plan,
             Err(error) => return Err(output::rejected(Error::Input(error), state, admit)),
         };

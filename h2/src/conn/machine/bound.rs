@@ -22,11 +22,11 @@ where
     pub(crate) fn commit_with<T>(
         self,
         prefix: &mut write::Prefix<'_, '_>,
-        evidence: impl FnOnce(crate::stream::Key, usize, C) -> (C, T),
+        evidence: impl FnOnce(crate::stream::Key, usize) -> T,
     ) -> Result<event::Write<T, C>, bounded::Error> {
         let Self { state, write: head } = self;
         head.commit_to(prefix, |write, tail| {
-            let output = state.finish_write(write, evidence);
+            let output = state.finish_write(write, |stream, bytes, _| evidence(stream, bytes));
             state.flush_resets(tail);
             output
         })

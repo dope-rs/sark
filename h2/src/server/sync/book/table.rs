@@ -1,5 +1,3 @@
-use core::marker::PhantomData;
-
 use o3::buffer::resident;
 use sark_core::{
     decode::{self, request},
@@ -42,7 +40,7 @@ where
         'd: 'a,
         B: FnMut() -> Option<P>,
         D: FnMut(conn::Error),
-        driver::Driver<'a, 'd, R, <R::Head as request::Head>::Start, B, D>: typed::Driver<
+        driver::Driver<'a, 'd, R, B, D>: typed::Driver<
                 Phase<'d, R>,
                 response::Pending<'d>,
                 Receiving<'d, R>,
@@ -58,7 +56,6 @@ where
             credit: &mut self.credit,
             permit,
             report,
-            mode: PhantomData::<<R::Head as request::Head>::Start>,
         };
         match ROUND {
             true => self.runtime.drive_round(driver),

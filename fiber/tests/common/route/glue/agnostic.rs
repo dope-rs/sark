@@ -22,6 +22,8 @@ pub struct PairReq {
     pub __sark_m: storage::Shared,
     #[path]
     pub req: storage::Shared,
+    #[header("accept-encoding")]
+    pub encoding: Option<sark_http::field::head::AcceptEncoding>,
 }
 
 #[sark_fiber::handler(pub)]
@@ -39,7 +41,7 @@ fn pair_h(req: PairReq) -> Reply<'d> {
 sark_fiber::define_route! {
     pub AgnApp: sark_fiber::EmptyState => {
         GET "/json" => plain_h,
-        GET "/users/:req/teams/:__sark_m" => request(path) pair_h,
+        GET "/users/:req/teams/:__sark_m" => request(path, header) pair_h,
         OPTIONS "*" => plain_h,
     }
 }
@@ -50,6 +52,11 @@ pub const FIELDS: [Entry<'static>; 3] = [
     Entry::new(b":method", b"GET"),
     Entry::new(b":scheme", b"https"),
     Entry::new(b":path", b"/users/beta/teams/alpha"),
+];
+
+pub const BAD_ENCODING: [Entry<'static>; 2] = [
+    Entry::new(b"accept-encoding", b"gzip"),
+    Entry::new(b"accept-encoding", b"gzip;q=2"),
 ];
 
 pub const ASTERISK: [Entry<'static>; 4] = [

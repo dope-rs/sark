@@ -1,35 +1,33 @@
 mod batch;
 mod section;
-mod writes;
 
 use o3::depot::{capacity, queue::ring};
+use sark_http::field::metadata::section::{rules, state::Selected};
 
-pub(in crate::conn) use batch::Batch;
+pub use batch::Batch;
 pub(in crate::conn) use section::Section;
 
 use crate::{
     conn,
-    conn::io::{
-        ingress::stream::table::Outgoing,
-        write::{self, Entry},
-    },
+    conn::io::{ingress::stream::table::Outgoing, write},
     conn::output,
     stream,
 };
 
-pub(in crate::conn) struct Pending<'a, 'd, S, B> {
+#[must_use = "a prepared response is invisible until committed"]
+pub struct Prepared<'a, 'd, P: rules::Policy = rules::RetainRaw> {
     fields: Section<'a, 'd>,
-    queues: &'a mut write::Queues<'d, S, B>,
+    queues: &'a mut write::Queues<'d, Selected<P>, P::Block>,
     qpack: Option<stream::Target>,
     outgoing: Option<Outgoing<'a, 'd>>,
     pending_encoder: &'a mut Option<ring::Fifo<(output::WritePrefix, u64)>>,
     encoder_capacity: capacity::Count,
 }
 
-impl<'a, 'd, S, B> Pending<'a, 'd, S, B> {
+impl<'a, 'd, P: rules::Policy> Prepared<'a, 'd, P> {
     pub(in crate::conn) const fn new(
         fields: Section<'a, 'd>,
-        queues: &'a mut write::Queues<'d, S, B>,
+        queues: &'a mut write::Queues<'d, Selected<P>, P::Block>,
         qpack: Option<stream::Target>,
         outgoing: Option<Outgoing<'a, 'd>>,
         pending_encoder: &'a mut Option<ring::Fifo<(output::WritePrefix, u64)>>,
@@ -45,19 +43,19 @@ impl<'a, 'd, S, B> Pending<'a, 'd, S, B> {
         }
     }
 
-    pub(in crate::conn) fn into_batch(self, trailing: Option<Entry<'d>>) -> Batch<'a, 'd, S, B> {
+    pub fn open(self) -> Batch<'a, 'd, P> {
         Batch {
             pending: self,
-            trailing,
+            trailing: None,
         }
     }
 
-    pub(in crate::conn) fn finish(mut self) -> Self {
+    pub fn finish(mut self) -> Batch<'a, 'd, P> {
         self.fields.entry.finish();
-        self
+        self.open()
     }
 
-    pub(in crate::conn) fn discard(self) {
+    pub(crate) fn discard(self) {
         self.fields.discard();
     }
 

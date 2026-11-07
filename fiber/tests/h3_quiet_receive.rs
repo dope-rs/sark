@@ -35,7 +35,11 @@ fn retains_terminal_cause() {
         linked: 0,
     };
     let (prepared, proof) = scenario
-        .try_prepare(Default::default(), None)
+        .try_prepare(
+            Default::default(),
+            None,
+            common::server::h3::sessions::plain,
+        )
         .expect("server plan");
     let mut reports = Vec::new();
     prepared.enter_with(

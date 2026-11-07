@@ -27,6 +27,15 @@ impl<'req, const N: usize> Set<'req, N> {
         }
     }
 
+    pub fn from_optional(items: [Option<value::Item<'req>>; N]) -> Self {
+        let mut set = Self::new();
+        for (slot, item) in set.entries.iter_mut().zip(items.into_iter().flatten()) {
+            *slot = item;
+            set.len += 1;
+        }
+        set
+    }
+
     pub fn is_empty(&self) -> bool {
         self.len == 0
     }
@@ -34,18 +43,12 @@ impl<'req, const N: usize> Set<'req, N> {
     pub fn len(&self) -> usize {
         self.len
     }
-
-    pub(crate) fn fields(&self) -> impl ExactSizeIterator<Item = headers::Entry<'_>> + '_ {
-        self.entries[..self.len.min(N)]
-            .iter()
-            .map(|item| headers::Entry::new(item.name, item.value.borrow()))
-    }
 }
 
 impl<const N: usize> headers::Source for Set<'_, N> {
     fn emit<'field>(&'field self, sink: &mut impl headers::Sink<'field>) {
-        for field in self.fields() {
-            sink.entry(field);
+        for item in &self.entries[..self.len.min(N)] {
+            sink.entry(headers::Entry::new(item.name, item.value.borrow()));
         }
     }
 }

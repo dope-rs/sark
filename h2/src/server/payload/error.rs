@@ -43,7 +43,6 @@ impl Error {
                 | segments::Error::Count(_)
                 | segments::Error::Logical(_)
                 | segments::Error::Resident(_)
-                | segments::Error::Total(_)
                 | segments::Error::Boundary(_),
             ) => numbers::ErrorCode::InternalError,
         }

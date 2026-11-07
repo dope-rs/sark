@@ -22,7 +22,7 @@ use crate::common::route::body::Chunks;
 
 #[sark_json::json(ordered)]
 pub struct Item {
-    pub id: u64,
+    pub id: i64,
     pub value: storage::Shared,
     #[field(seq)]
     pub tags: Vec<storage::Shared>,
@@ -151,8 +151,8 @@ impl Guard<State> for RejectHead {
 
 #[sark_fiber::handler(pub)]
 pub(crate) async fn nested<'d>(request: NestedReq, state: &State, timer: Timer<'_>) -> Reply<'d> {
-    if !matches!(request.body.items.as_slice(), [first, second] if first.id == 1 && second.tags.len() == 2)
-        || request.body.featured.id != 3
+    if !matches!(request.body.items.as_slice(), [first, second] if first.id == i64::MIN && second.tags.len() == 2)
+        || request.body.featured.id != i64::MAX
     {
         state.invalid.set(true);
     }
@@ -423,4 +423,4 @@ pub const LARGE_JSON: &[u8; LARGE_JSON_LEN] = &{
     input
 };
 
-pub const NESTED_JSON: &[u8] = br#"{"items":[{"id":1,"value":"first","tags":["a"]},{"id":2,"value":"second","tags":["b","c"]}],"featured":{"id":3,"value":"retained","tags":[]}}"#;
+pub const NESTED_JSON: &[u8] = br#"{"items":[{"id":-9223372036854775808,"value":"first","tags":["a"]},{"id":2,"value":"second","tags":["b","c"]}],"featured":{"id":9223372036854775807,"value":"retained","tags":[]}}"#;

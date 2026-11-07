@@ -5,7 +5,7 @@ mod backend;
 mod phases;
 mod prepared;
 
-use std::{pin, task};
+use std::{ops::ControlFlow, pin, task};
 
 pub(in crate::client) use admit::Admit;
 pub(in crate::client) use backend::Backend;
@@ -87,75 +87,58 @@ impl<'app, 'd, B: Backend<'app, 'd>> abi::Fiber<'d> for Dispatch<'_, '_, 'app, '
                                 registration: queue::Registration::new(),
                             },
                             Err(error) => {
-                                return machine::Step::Complete(task::Poll::Ready(Err(
-                                    Rejected::new(error),
-                                )));
+                                return ControlFlow::Break(Err(Rejected::new(error)));
                             }
                         }
                     }
                     State::Wait {
                         prepared,
                         registration: mut reg,
-                    } => {
-                        match backend.admit(prepared, check, admit.context().driver())
-                        {
-                            Ok(Admit::Stream(stream)) => {
-                                return machine::Step::Complete(task::Poll::Ready(Ok(
-                                    Submitted::new(stream),
-                                )));
-                            }
-                            Ok(Admit::Dial(dial, encoded)) => State::Dial {
-                                dial: abi::Task::new(dial),
-                                encoded,
-                            },
-                            Ok(Admit::Wait(prepared)) => {
-                                if let Err(error) = backend.try_register(
-                                    prepared.route(),
-                                    &mut reg,
-                                    admit.context().as_ref(),
-                                ) {
-                                    backend.cancel(&mut reg);
-                                    return machine::Step::Complete(task::Poll::Ready(Err(
-                                        Rejected::new(Error::Capacity(error)),
-                                    )));
-                                }
-                                return machine::Step::Suspend(
-                                    State::Wait {
-                                        prepared,
-                                        registration: reg,
-                                    },
-                                    task::Poll::Pending,
-                                );
-                            }
-                            Err(error) => {
-                                backend.cancel(&mut reg);
-                                return machine::Step::Complete(task::Poll::Ready(Err(
-                                    Rejected::new(error),
-                                )));
-                            }
+                    } => match backend.admit(prepared, check, admit.context().driver()) {
+                        Ok(Admit::Stream(stream)) => {
+                            return ControlFlow::Break(Ok(Submitted::new(stream)));
                         }
-                    }
+                        Ok(Admit::Dial(dial, encoded)) => State::Dial {
+                            dial: abi::Task::new(dial),
+                            encoded,
+                        },
+                        Ok(Admit::Wait(prepared)) => {
+                            if let Err(error) = backend.try_register(
+                                prepared.route(),
+                                &mut reg,
+                                admit.context().as_ref(),
+                            ) {
+                                backend.cancel(&mut reg);
+                                return ControlFlow::Break(Err(Rejected::new(Error::Capacity(
+                                    error,
+                                ))));
+                            }
+                            return ControlFlow::Continue(State::Wait {
+                                prepared,
+                                registration: reg,
+                            });
+                        }
+                        Err(error) => {
+                            backend.cancel(&mut reg);
+                            return ControlFlow::Break(Err(Rejected::new(error)));
+                        }
+                    },
                     State::Dial { mut dial, encoded } => {
                         let (poll, mut context) = admit.poll(pin::Pin::new(&mut dial));
                         return match poll {
                             task::Poll::Ready(Ok(conn)) => {
-                                let result = backend.submit(
-                                    conn,
-                                    encoded,
-                                    check,
-                                    context.as_mut().driver(),
-                                );
-                                machine::Step::Complete(task::Poll::Ready(
+                                let result =
+                                    backend.submit(conn, encoded, check, context.as_mut().driver());
+                                ControlFlow::Break(
                                     result.map(Submitted::new).map_err(Rejected::new),
-                                ))
+                                )
                             }
-                            task::Poll::Ready(Err(error)) => machine::Step::Complete(
-                                task::Poll::Ready(Err(Rejected::new(Error::Connect(error)))),
-                            ),
-                            task::Poll::Pending => machine::Step::Suspend(
-                                State::Dial { dial, encoded },
-                                task::Poll::Pending,
-                            ),
+                            task::Poll::Ready(Err(error)) => {
+                                ControlFlow::Break(Err(Rejected::new(Error::Connect(error))))
+                            }
+                            task::Poll::Pending => {
+                                ControlFlow::Continue(State::Dial { dial, encoded })
+                            }
                         };
                     }
                 };

@@ -164,10 +164,7 @@ const _: () = {
     use std::mem;
 
     assert!(mem::size_of::<State>() == 5 * mem::size_of::<usize>());
-    assert!(
-        mem::size_of::<State<region::Proof<region::Identity<'static>>>>()
-            == mem::size_of::<State>()
-    );
+    assert!(mem::size_of::<State<region::Identity<'static>>>() == mem::size_of::<State>());
     assert!(mem::size_of::<Reserve<'_, credit::Disabled>>() == 11 * mem::size_of::<usize>());
     assert!(
         mem::size_of::<Option<Reserve<'_, credit::Disabled>>>()

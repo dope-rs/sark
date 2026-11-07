@@ -1,4 +1,3 @@
-use core::ops;
 use std::num::NonZero;
 
 use crate::{
@@ -49,26 +48,16 @@ impl Cursor {
         }
     }
 
-    pub(in crate::h1) fn advance<'owner, B, E>(
+    #[inline(always)]
+    pub(in crate::h1) fn advance<'owner>(
         &mut self,
-        owner: &'owner [u8],
-        sink: impl FnMut(Entry<'owner>) -> ops::ControlFlow<B, E>,
-    ) -> Result<Progress<B, E>, Error> {
-        let (next, progress) = self.run(owner, sink)?;
-        *self = next;
-        Ok(progress)
-    }
-
-    fn run<'owner, B, E>(
-        self,
         bytes: &'owner [u8],
-        mut sink: impl FnMut(Entry<'owner>) -> ops::ControlFlow<B, E>,
-    ) -> Result<(Self, Progress<B, E>), Error> {
+    ) -> Result<Progress<'owner>, Error> {
         match self.phase {
             Phase::Name => {
                 let cursor = self.cursor as usize;
                 let Some(byte) = bytes.get(cursor) else {
-                    return Ok((self, Progress::More));
+                    return Ok(Progress::More);
                 };
                 if self.cursor == self.line && *byte == b'\r' {
                     return self.ending(bytes);
@@ -84,7 +73,7 @@ impl Cursor {
                         let raw = Self::try_narrow(colon)?
                             .checked_add(1)
                             .ok_or(Error::TooLarge)?;
-                        self.value(bytes, raw, raw, &mut sink)
+                        self.value(bytes, raw, raw)
                     }
                     scan::Outcome::Found((offset, actual)) => Err(Error::Name { offset, actual }),
                     scan::Outcome::Invalid { offset, actual } => {
@@ -93,19 +82,20 @@ impl Cursor {
                     scan::Outcome::Partial => {
                         let next = Self {
                             cursor: Self::try_narrow(bytes.len())?,
-                            ..self
+                            ..*self
                         };
                         let progress = next.incomplete()?;
-                        Ok((next, progress))
+                        *self = next;
+                        Ok(progress)
                     }
                 }
             }
-            Phase::Value { raw } => self.value(bytes, raw, self.cursor, &mut sink),
+            Phase::Value { raw } => self.value(bytes, raw, self.cursor),
             Phase::ValueLf { raw } => {
                 let lf = self.cursor.checked_add(1).ok_or(Error::TooLarge)?;
                 let Some(byte) = bytes.get(lf as usize) else {
                     let progress = self.incomplete()?;
-                    return Ok((self, progress));
+                    return Ok(progress);
                 };
                 if *byte != b'\n' {
                     return Err(Error::Value {
@@ -113,34 +103,25 @@ impl Cursor {
                         actual: *byte,
                     });
                 }
-                let (next, field) = self.admit(bytes, raw, self.cursor)?;
-                let progress = match sink(field) {
-                    ops::ControlFlow::Break(value) => Progress::Break(value),
-                    ops::ControlFlow::Continue(next) => Progress::Emitted(next),
-                };
-                Ok((next, progress))
+                let field = self.admit(bytes, raw, self.cursor)?;
+                Ok(Progress::Field(field))
             }
             Phase::EndLf => self.ending(bytes),
-            Phase::Head(end) => Ok((self, Progress::End(end))),
+            Phase::Head(end) => Ok(Progress::End(end)),
         }
     }
 
-    fn value<'owner, B, E>(
-        self,
+    fn value<'owner>(
+        &mut self,
         owner: &'owner [u8],
         raw: u32,
         cursor: u32,
-        sink: &mut impl FnMut(Entry<'owner>) -> ops::ControlFlow<B, E>,
-    ) -> Result<(Self, Progress<B, E>), Error> {
+    ) -> Result<Progress<'owner>, Error> {
         let bytes = owner;
         match scan::Bytes::new(bytes).value(cursor as usize) {
             scan::Outcome::Found(end) => {
-                let (next, field) = self.admit(owner, raw, Self::try_narrow(end)?)?;
-                let progress = match sink(field) {
-                    ops::ControlFlow::Break(value) => Progress::Break(value),
-                    ops::ControlFlow::Continue(next) => Progress::Emitted(next),
-                };
-                Ok((next, progress))
+                let field = self.admit(owner, raw, Self::try_narrow(end)?)?;
+                Ok(Progress::Field(field))
             }
             scan::Outcome::Invalid { offset, actual } => Err(Error::Value { offset, actual }),
             scan::Outcome::Partial => {
@@ -149,30 +130,32 @@ impl Cursor {
                     Self {
                         cursor: end,
                         phase: Phase::ValueLf { raw },
-                        ..self
+                        ..*self
                     }
                 } else {
                     Self {
                         cursor: Self::try_narrow(bytes.len())?,
                         phase: Phase::Value { raw },
-                        ..self
+                        ..*self
                     }
                 };
                 let progress = next.incomplete()?;
-                Ok((next, progress))
+                *self = next;
+                Ok(progress)
             }
         }
     }
 
-    fn ending<B, E>(self, bytes: &[u8]) -> Result<(Self, Progress<B, E>), Error> {
+    fn ending<'owner>(&mut self, bytes: &'owner [u8]) -> Result<Progress<'owner>, Error> {
         let lf = self.cursor.checked_add(1).ok_or(Error::TooLarge)?;
         let Some(byte) = bytes.get(lf as usize) else {
             let next = Self {
                 phase: Phase::EndLf,
-                ..self
+                ..*self
             };
             let progress = next.incomplete()?;
-            return Ok((next, progress));
+            *self = next;
+            return Ok(progress);
         };
         if *byte != b'\n' {
             return Err(Error::Ending {
@@ -182,20 +165,20 @@ impl Cursor {
         }
         let wire = NonZero::<u32>::MIN.checked_add(lf).ok_or(Error::TooLarge)?;
         let end = End::new(self.cursor, wire);
-        let next = Self {
+        *self = Self {
             cursor: end.wire_len().get(),
             phase: Phase::Head(end),
-            ..self
+            ..*self
         };
-        Ok((next, Progress::End(end)))
+        Ok(Progress::End(end))
     }
 
     fn admit<'owner>(
-        self,
+        &mut self,
         owner: &'owner [u8],
         raw: u32,
         end: u32,
-    ) -> Result<(Self, Entry<'owner>), Error> {
+    ) -> Result<Entry<'owner>, Error> {
         let next = end.checked_add(2).ok_or(Error::TooLarge)?;
         let width = end - self.line;
         if width > self.limit.line_bytes {
@@ -215,14 +198,14 @@ impl Cursor {
             span::Span::from_range(self.line as usize..next as usize)
                 .map_err(|_| Error::Invalid)?,
         );
-        let state = Self {
+        *self = Self {
             line: next,
             cursor: next,
             seen: self.seen + 1,
             limit: self.limit,
             phase: Phase::Name,
         };
-        Ok((state, field))
+        Ok(field)
     }
 
     /// Retains a range this scan measured inside the block it walks.
@@ -234,7 +217,7 @@ impl Cursor {
         span::Retained::try_new(owner, start..end).map_err(|_| Error::Invalid)
     }
 
-    fn incomplete<B, E>(&self) -> Result<Progress<B, E>, Error> {
+    fn incomplete<'owner>(&self) -> Result<Progress<'owner>, Error> {
         let width = self.cursor - self.line;
         if width > self.limit.line_bytes {
             return Err(Error::TooLong);

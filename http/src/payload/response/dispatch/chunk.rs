@@ -22,7 +22,7 @@ impl<'d> Chunk<'d> {
         }
     }
 
-    pub const fn owner(&self) -> &resident::Shared<'d> {
+    pub fn owner(&self) -> &resident::Shared<'d> {
         self.0.as_ref()
     }
 

@@ -53,6 +53,7 @@ pub enum Error {
         end: usize,
         capacity: usize,
     },
+    AcceptEncoding(sark_http::field::head::Error),
 }
 
 impl From<storage::AllocError> for Error {

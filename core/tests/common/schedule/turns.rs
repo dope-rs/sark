@@ -76,13 +76,7 @@ impl schedule::Driver<Stage> for Writer {
     fn control<'id>(
         &mut self,
         permit: NonZero<usize>,
-        entry: schedule::Occupied<
-            '_,
-            Self::Key,
-            Stage,
-            Blocked,
-            region::Proof<region::Identity<'id>>,
-        >,
+        entry: schedule::Occupied<'_, Self::Key, Stage, Blocked, region::Identity<'id>>,
     ) -> schedule::Decision<'id, Self::Key> {
         entry.borrowed(self, |driver, _, value| {
             driver.invalid |= permit.get() != driver.remaining + 1;

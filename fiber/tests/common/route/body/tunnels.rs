@@ -142,7 +142,7 @@ async fn wait<'state>(state: &State<'state>, timer: Timer<'_>) -> super::OwnedRe
     }
 }
 
-sark_fiber::define_route! {
+sark_fiber::define_cleartext_route! {
     pub ConnectDispatch<'state>: State<'state> => {
         CONNECT "*" => echo,
         WS "/ws" => websocket,

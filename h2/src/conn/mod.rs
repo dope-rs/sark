@@ -15,6 +15,7 @@ mod error;
 pub mod event;
 pub(crate) mod ingress;
 pub mod machine;
+pub(crate) use sark_http::preface;
 pub(crate) mod outputs;
 pub(crate) mod registry;
 
@@ -174,7 +175,7 @@ impl DataOutcome {
 pub const MAX_MATERIALIZED_RESPONSE_TAIL: usize =
     payloads::Ledger::<resident::Shared<'_>>::MAX_MATERIALIZED_TAIL;
 
-pub const CLIENT_PREFACE: &[u8] = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
+pub use sark_http::preface::CLIENT_PREFACE;
 /// Connection security bound for peer-initiated stream resets.
 /// Cancellation-heavy callers must rotate before crossing it.
 pub const MAX_PEER_RESETS_PER_CONNECTION: u32 = 100;

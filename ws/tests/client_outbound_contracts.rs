@@ -155,13 +155,11 @@ fn close_seals_generation() {
                                         == dope_test::fibers::Wait::Reached
                                 );
                                 if !direct {
-                                    app.wait(|result| {
-                                        result
-                                            .as_ref()
-                                            .map_err(|cause| cause.cause())
-                                            .expect("WebSocket wait");
-                                    })
-                                    .expect("WebSocket operation");
+                                    app.wait()
+                                        .expect("WebSocket operation")
+                                        .as_ref()
+                                        .map_err(|cause| cause.cause())
+                                        .expect("WebSocket wait");
                                     app.drive(handle.send_text("next"))
                                         .expect("next generation driver")
                                         .expect("WebSocket operation");
@@ -234,13 +232,11 @@ fn close_rejection_open() {
                             messages: &messages,
                         }),
                         |mut app| {
-                            app.wait(|result| {
-                                result
-                                    .as_ref()
-                                    .map_err(|cause| cause.cause())
-                                    .expect("WebSocket wait");
-                            })
-                            .expect("WebSocket operation");
+                            app.wait()
+                                .expect("WebSocket operation")
+                                .as_ref()
+                                .map_err(|cause| cause.cause())
+                                .expect("WebSocket wait");
                         },
                     )
                 },

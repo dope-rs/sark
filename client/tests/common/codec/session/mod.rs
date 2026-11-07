@@ -51,6 +51,7 @@ impl<'d> session::Session<'d> for Session<'_> {
     type Connect = Full;
     type ConnState = ();
     type Failure = Observed;
+    type Receipt = ();
     type Requests = request::Disabled;
     type Send = Inline<1>;
 

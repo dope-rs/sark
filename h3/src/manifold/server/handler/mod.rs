@@ -70,7 +70,7 @@ impl<'d, R, M, L, E, Q> Handler<'d, R, M, L, E, Q>
 where
     R: Runtime<'d>,
 {
-    pub(super) fn try_bind<const ID: u8, T>(
+    pub(super) fn try_bind<T>(
         binding: driver::Binding<'d>,
         router: T,
         mut config: server::Setup,
@@ -80,9 +80,7 @@ where
         seed: hash::Seed,
     ) -> Result<Self, T::Error>
     where
-        T: Bind<'d, Runtime = R, Target = server::Handle<'d, ID>>,
-        M: life::Mode<id::Handle<id::Driver<'d>, ID>, Id>
-            + Mode<id::Domain<id::Driver<'d>, ID>, net::Owner<id::Driver<'d>, ID>>,
+        T: Bind<'d, Runtime = R>,
     {
         let router = Bind::try_bind(router, binding)?;
         match <R as duplex::Application<'d>>::CONNECT {

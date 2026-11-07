@@ -128,8 +128,8 @@ impl<'d, A: app::Runtime<'d>, M: owners::Handoff> Book<'d, A, M> {
         self,
         mut drain: impl for<'id, 'account> FnMut(
             requests::Id,
-            exchange::Drained<task::Owned<'d, A::Task, M>, region::Proof<region::Identity<'id>>>,
-            &mut credit::raw::Ledger<'account, region::Proof<region::Identity<'id>>>,
+            exchange::Drained<task::Owned<'d, A::Task, M>, region::Identity<'id>>,
+            &mut credit::raw::Ledger<'account, region::Identity<'id>>,
         ),
     ) -> audit::Snapshot {
         let Self {

@@ -48,6 +48,8 @@ impl<'s, 'b, 'c, 'd, E> recv::Extract<'s, 'b, 'c, 'd, Outcome<'d, E>> for Outcom
 }
 
 impl<E> usage::Footprint for Outcome<'_, E> {
+    type Amount = usage::Usage;
+
     fn footprint(&self) -> usage::Usage {
         match self {
             Self::Event(event) => {

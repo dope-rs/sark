@@ -168,24 +168,11 @@ fn codec_round_trip() {
                 let mut retired = Vec::new();
                 let config = client::Config::new("127.0.0.1", "/ws");
                 let config = config.expect("WebSocket configuration");
-                Probe::new(addr, config)
-                    .echo(
-                        "ping",
-                        |result| {
-                            result
-                                .as_ref()
-                                .map_err(|cause| cause.cause())
-                                .expect("WebSocket wait");
-                        },
-                        recovery::Policy::new(|event| retired.push(event), common::recover),
-                        |result| {
-                            let seen = result.expect("WebSocket probe");
-                            assert_eq!(seen.reply(), Some("pong"));
-                        },
-                    )
-                    .as_ref()
-                    .map_err(|cause| cause.kind())
-                    .expect("WebSocket operation");
+                let seen = Probe::new(addr, config).run(
+                    common::client::Goal::Echo("ping"),
+                    recovery::Policy::new(|event| retired.push(event), common::recover),
+                );
+                assert_eq!(seen.reply(), Some("pong"));
                 assert!(
                     retired
                         .iter()

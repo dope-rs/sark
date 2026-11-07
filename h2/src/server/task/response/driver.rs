@@ -1,7 +1,4 @@
-use std::{
-    convert::{Infallible, identity},
-    ops, pin,
-};
+use std::{convert::Infallible, ops, pin};
 
 use dope::{
     core::{
@@ -45,7 +42,7 @@ use crate::{
     server::{
         self,
         response::{Encoder, Handoff, Pending, Status},
-        state::{self, exchange::Call},
+        state::{self, exchange::try_dispatch},
         task::{
             response::{Count, Response, input},
             *,
@@ -125,7 +122,7 @@ where
             State::Complete(_) => Boundary::End,
             State::Streaming => Boundary::More,
         };
-        let mut owner = owners::Sink::new(&mut *self.mode, self.connection_id, identity);
+        let mut owner = owners::Sink::new(&mut *self.mode, self.connection_id);
         let turn = pending
             .turn_seen(self.connection, stream, end, &mut owner)
             .map_err(|error| self.error(stream, error))?;
@@ -403,7 +400,8 @@ where
                 }
             }
             Response::Sync(request) => {
-                match Call::new(request).try_dispatch::<R, M::Retention, _, F>(
+                match try_dispatch::<R, M::Retention, _, F>(
+                    request,
                     self.router.as_ref().get_ref(),
                     self.connection,
                     stream,

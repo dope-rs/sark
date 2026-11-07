@@ -1,24 +1,13 @@
 pub mod topology;
-use std::{cell, net, rc, task};
+use std::{cell, net, task};
 
 use dope::{core::driver::life::recovery, runtime::executor::drive};
-use dope_fiber::{abi, wait};
+use dope_fiber::abi;
 use dope_test::fibers;
 use sark_ws::{
     client,
     client::{channel, headers, mode},
 };
-
-/// Exact failure borrowed while its original execution owner remains alive.
-#[derive(Debug)]
-pub enum Error<'a> {
-    Topology(topology::Run<'a>),
-    Runtime(&'a drive::Error),
-    Guard(&'a fibers::Run),
-    Wait(&'a topology::WaitError),
-    Client(&'a client::Error),
-    Deadline,
-}
 
 enum Failure {
     Runtime(drive::Error),
@@ -26,18 +15,6 @@ enum Failure {
     Wait(topology::WaitError),
     Client(client::Error),
     Deadline,
-}
-
-impl Failure {
-    fn kind(&self) -> Error<'_> {
-        match self {
-            Self::Runtime(cause) => Error::Runtime(cause),
-            Self::Guard(cause) => Error::Guard(cause),
-            Self::Wait(cause) => Error::Wait(cause),
-            Self::Client(cause) => Error::Client(cause),
-            Self::Deadline => Error::Deadline,
-        }
-    }
 }
 
 /// Events captured from one installed WebSocket client.
@@ -104,65 +81,23 @@ impl Probe {
         self
     }
 
-    /// Opens the client, sends text, and waits for a text response.
-    pub fn echo<Out>(
-        self,
-        data: &str,
-        check: impl for<'d> FnOnce(Result<(), client::Active<wait::Error<'d>>>),
-        policy: impl recovery::Observe,
-        done: impl for<'a> FnOnce(Result<Observation, Error<'a>>) -> Out,
-    ) -> Result<Out, topology::Error> {
-        self.run(Goal::Echo(data), check, policy, done)
-    }
-
-    /// Waits until the peer's opening response is admitted.
-    pub fn open<Out>(
-        self,
-        check: impl for<'d> FnOnce(Result<(), client::Active<wait::Error<'d>>>),
-        policy: impl recovery::Observe,
-        done: impl for<'a> FnOnce(Result<Observation, Error<'a>>) -> Out,
-    ) -> Result<Out, topology::Error> {
-        self.run(Goal::Open, check, policy, done)
-    }
-
-    /// Waits for the first text message from the peer.
-    pub fn message<Out>(
-        self,
-        check: impl for<'d> FnOnce(Result<(), client::Active<wait::Error<'d>>>),
-        policy: impl recovery::Observe,
-        done: impl for<'a> FnOnce(Result<Observation, Error<'a>>) -> Out,
-    ) -> Result<Out, topology::Error> {
-        self.run(Goal::Message, check, policy, done)
-    }
-
-    /// Waits for the client to terminate the connection.
-    pub fn close<Out>(
-        self,
-        policy: impl recovery::Observe,
-        done: impl for<'a> FnOnce(Result<Observation, Error<'a>>) -> Out,
-    ) -> Result<Out, topology::Error> {
-        self.run(Goal::Close, |_| {}, policy, done)
-    }
-
-    fn run<Out>(
-        self,
-        goal: Goal<'_>,
-        check: impl for<'d> FnOnce(Result<(), client::Active<wait::Error<'d>>>),
-        policy: impl recovery::Observe,
-        done: impl for<'a> FnOnce(Result<Observation, Error<'a>>) -> Out,
-    ) -> Result<Out, topology::Error> {
-        let state = rc::Rc::new(cell::Cell::new(Observation::default()));
+    pub fn run(self, goal: Goal<'_>, policy: impl recovery::Observe) -> Observation {
+        let state = cell::Cell::new(Observation::default());
         let hook = Capture {
-            state: rc::Rc::clone(&state),
+            state: &state,
             added_headers: self.added_headers,
             remove_headers: self.remove_headers,
         };
-        topology::Plan::new(self.address, self.config, 1, 16).enter(
-            move |domain| {
+        let result = topology::Plan::new(self.address, self.config, 1, 16).enter(
+            |domain| {
                 domain.run(channel::App::<_, mode::Observe>::new(hook), |mut app| {
                     let closing = matches!(goal, Goal::Close);
                     if !closing {
-                        app.wait(check).map_err(Failure::Wait)?;
+                        app.wait()
+                            .map_err(Failure::Wait)?
+                            .as_ref()
+                            .map_err(|cause| cause.cause())
+                            .expect("WebSocket opening");
                     }
                     match goal {
                         Goal::Open => return Ok(state.take()),
@@ -194,36 +129,43 @@ impl Probe {
                 })
             },
             policy,
-            |result| match result {
-                Ok(Ok(value)) => done(Ok(value)),
-                Ok(Err(error)) => done(Err(error.kind())),
-                Err(error) => done(Err(Error::Topology(error))),
+            |result| match result.expect("WebSocket execution") {
+                Ok(observed) => observed,
+                Err(Failure::Runtime(cause)) => panic!("WebSocket probe: Runtime({cause:?})"),
+                Err(Failure::Guard(cause)) => panic!("WebSocket probe: Guard({cause:?})"),
+                Err(Failure::Wait(cause)) => panic!("WebSocket probe: Wait({cause:?})"),
+                Err(Failure::Client(cause)) => panic!("WebSocket probe: Client({cause:?})"),
+                Err(Failure::Deadline) => panic!("WebSocket probe: Deadline"),
             },
-        )
+        );
+        match result {
+            Ok(observed) => observed,
+            Err(error) => panic!("WebSocket topology: {:?}", error.kind()),
+        }
     }
 }
 
-enum Goal<'a> {
+pub enum Goal<'a> {
     Echo(&'a str),
     Open,
     Message,
     Close,
 }
 
-struct Capture {
-    state: rc::Rc<cell::Cell<Observation>>,
+struct Capture<'a> {
+    state: &'a cell::Cell<Observation>,
     added_headers: Vec<headers::Field>,
     remove_headers: Vec<String>,
 }
 
-impl client::Handshake for Capture {
+impl client::Handshake for Capture<'_> {
     fn handshake(&mut self, req: headers::Request<'_>) -> Result<headers::Encoded, client::Error> {
         let edits = headers::Changes::new(&self.added_headers, &self.remove_headers);
         req.finish_edits(edits)
     }
 }
 
-impl client::Observer for Capture {
+impl client::Observer for Capture<'_> {
     fn open(&mut self) {
         let mut observed = self.state.take();
         observed.opened = true;

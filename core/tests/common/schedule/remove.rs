@@ -71,13 +71,7 @@ impl<'a> schedule::Driver<Box<usize>> for Reject<'a> {
     fn control<'id>(
         &mut self,
         permit: Self::Permit,
-        entry: schedule::Occupied<
-            '_,
-            Self::Key,
-            Box<usize>,
-            Blocked,
-            region::Proof<region::Identity<'id>>,
-        >,
+        entry: schedule::Occupied<'_, Self::Key, Box<usize>, Blocked, region::Identity<'id>>,
     ) -> schedule::Decision<'id, Self::Key> {
         if self.owned {
             entry.owned(self, |driver, _, value| {

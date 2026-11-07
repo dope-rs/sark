@@ -1,4 +1,4 @@
-use std::{convert::Infallible, net, num::NonZero, time};
+use std::{net, num::NonZero, time};
 
 use dope::{
     core::{
@@ -16,7 +16,7 @@ use dope::{
     net::{tcp, wire},
     runtime::{
         executor::session,
-        topology::{self, error, lending},
+        topology::{self, lending},
     },
 };
 use dope_fiber::net::{read, server};
@@ -93,19 +93,6 @@ pub enum Failure {
     Receive(read::Capacity),
 }
 
-#[derive(Debug)]
-pub enum Error<'a> {
-    Install(&'a manifold::BuildError<Infallible>),
-    Session(session::Cause<'a>),
-    Topology(
-        error::Kind<
-            'a,
-            settings::Error,
-            Result<Result<(), session::Cause<'a>>, &'a manifold::BuildError<Infallible>>,
-        >,
-    ),
-}
-
 pub struct Plan(topology::Plan<settings::Settings, Setup>);
 
 impl Plan {
@@ -136,15 +123,14 @@ impl Plan {
         Ok(Self(topology::Plan::new(settings, install)))
     }
 
-    pub fn enter<R, Out>(
+    pub fn enter<R>(
         self,
         run: impl for<'app, 'life, 'q, 'h, 'p, 'e, 'd> FnOnce(
             session::App<'app, 'life, 'd, Owner<'q, 'h, 'p, 'life, 'e, 'd>>,
             channel::Handle<'app, 'life, 'e, 'd, Provider<'life, 'e, 'd>>,
         ) -> R,
         policy: impl recovery::Observe,
-        done: impl for<'a> FnOnce(Result<R, Error<'a>>) -> Out,
-    ) -> Result<Out, Failure> {
+    ) -> Result<R, Failure> {
         let prepared = self
             .0
             .for_profile::<timing::Balanced>()
@@ -170,19 +156,22 @@ impl Plan {
             },
             policy,
             |result| match result {
-                Ok(Ok(Ok(result))) => done(Ok(result)),
-                Ok(Ok(Err(error))) => done(Err(Error::Session(error.cause()))),
-                Ok(Err(error)) => done(Err(Error::Install(&error))),
-                Err(error) => done(Err(Error::Topology(error.kind().map(|output| {
-                    output
-                        .as_ref()
-                        .map(|session| session.as_ref().map(|_| ()).map_err(session::Error::cause))
-                })))),
+                Ok(Ok(Ok(result))) => result,
+                Ok(Ok(Err(error))) => panic!("gRPC session: {:?}", error.cause()),
+                Ok(Err(error)) => panic!("gRPC install: {error:?}"),
+                Err(error) => {
+                    let cause = error.kind().map(|output| {
+                        output.as_ref().map(|session| {
+                            session.as_ref().map(|_| ()).map_err(session::Error::cause)
+                        })
+                    });
+                    panic!("gRPC topology: {cause:?}")
+                }
             },
         ))
     }
 
-    pub fn enter_peer<R, Out>(
+    pub fn enter_peer<R>(
         self,
         bound: socket::Listener,
         run: impl for<'app, 'life, 'q, 'h, 'p, 'e, 'd, 'n, 'g, 's, 'port, 'w, 'handle> FnOnce(
@@ -194,10 +183,10 @@ impl Plan {
             >,
             channel::Handle<'app, 'life, 'e, 'd, Provider<'life, 'e, 'd>>,
             server::Handle<'handle, 'w, 'd, wire::Identity, KeyTag<1>>,
-        ) -> R,
+        )
+            -> R,
         policy: impl recovery::Observe,
-        done: impl for<'a> FnOnce(Result<R, Error<'a>>) -> Out,
-    ) -> Result<Out, Failure> {
+    ) -> Result<R, Failure> {
         let capacity = driver::route::table::conn::Capacity::fixed::<1>();
         let peer = server::Plan::<wire::Identity, KeyTag<1>>::new(capacity, wire::Identity)
             .with_receive(read::Config {
@@ -268,14 +257,17 @@ impl Plan {
             },
             policy,
             |result| match result {
-                Ok(Ok(Ok(result))) => done(Ok(result)),
-                Ok(Ok(Err(error))) => done(Err(Error::Session(error.cause()))),
-                Ok(Err(error)) => done(Err(Error::Install(&error))),
-                Err(error) => done(Err(Error::Topology(error.kind().map(|output| {
-                    output
-                        .as_ref()
-                        .map(|session| session.as_ref().map(|_| ()).map_err(session::Error::cause))
-                })))),
+                Ok(Ok(Ok(result))) => result,
+                Ok(Ok(Err(error))) => panic!("gRPC session: {:?}", error.cause()),
+                Ok(Err(error)) => panic!("gRPC install: {error:?}"),
+                Err(error) => {
+                    let cause = error.kind().map(|output| {
+                        output.as_ref().map(|session| {
+                            session.as_ref().map(|_| ()).map_err(session::Error::cause)
+                        })
+                    });
+                    panic!("gRPC topology: {cause:?}")
+                }
             },
         ))
     }

@@ -40,7 +40,7 @@ impl<'d> Fields<resident::Shared<'d>> {
     }
 
     /// Transfers unique backing without changing this admitted field extent.
-    pub(crate) fn prepare<'a>(&'a mut self) -> resident::Scope<'a, 'd> {
+    pub(crate) fn prepare(&mut self) -> Option<&resident::Shared<'d>> {
         self.owner = match mem::take(&mut self.owner).try_owned() {
             Ok(owner) => owner.into(),
             Err(owner) => owner,

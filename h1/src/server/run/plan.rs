@@ -269,6 +269,16 @@ impl<ListenerId: Identity, DateId: Identity, P, D> Plan<ListenerId, DateId, P, r
 where
     P: settings::Profile + timing::Policy,
 {
+    pub fn scoped(self) -> Plan<ListenerId, DateId, P, receive::Scoped, D> {
+        Plan {
+            listener: self.listener,
+            bound: self.bound,
+            date: self.date,
+            input: marker::PhantomData,
+            deadline: self.deadline,
+        }
+    }
+
     pub fn gated_scoped(self) -> Plan<ListenerId, DateId, P, receive::GatedScoped, D> {
         Plan {
             listener: self.listener,

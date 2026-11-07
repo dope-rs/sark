@@ -6,6 +6,8 @@ use core::mem;
 
 use known::Known;
 
+pub use parse::AcceptEncoding;
+
 use crate::{
     field::text::IntError,
     h1::{

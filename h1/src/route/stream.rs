@@ -237,9 +237,7 @@ where
         Admit: FnOnce(R::Stream<'d>, &mut Runtime, response::Context),
         E: credit::Evidence,
     {
-        let frame = match framing::Frame::<R>::drive(found, &mut self.connection.ingress, || {
-            credit::Evidence::head(&mut proof)
-        }) {
+        let frame = match framing::Frame::drive(found, &mut self.connection.ingress, &mut proof) {
             Ok(framing::Progress::Complete(frame)) => frame,
             Ok(framing::Progress::Pending(wait)) => {
                 let mut route = Pending::new(

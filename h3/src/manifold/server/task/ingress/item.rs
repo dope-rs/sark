@@ -17,7 +17,6 @@ use requests::{
     exchange::{Reset, Stop},
 };
 use sark_core::{
-    deadline::timeline,
     life::{self, Observer as _, exchange},
     manifold::{stream::Section, task::app::Runtime},
 };
@@ -36,8 +35,10 @@ use crate::{
     manifold::{
         self, Diagnostic, owners, requests,
         server::{
-            self, deadline, deadline::state::State, failure, rotation, session,
-            task::ingress::dispatch,
+            self,
+            deadline::state::State,
+            failure, rotation, session,
+            task::ingress::{dispatch, head},
         },
     },
 };
@@ -219,7 +220,7 @@ where
         self.retire(id, life::Outcome::Rejected);
     }
 
-    fn run(self, item: manifold::Delivery<'scope, 'd, R::Plan>)
+    fn run(mut self, item: manifold::Delivery<'scope, 'd, R::Plan>)
     where
         B: stream::Retain<'d>,
     {
@@ -277,7 +278,10 @@ where
                     return self.data(resident, message, data);
                 }
                 event::Event::Finished { .. } => return self.finish(resident),
-                event::Event::Reset { .. } => return self.reset(resident),
+                event::Event::Reset { .. } => match self.resolve(&resident) {
+                    Ok((_, id)) => return self.retire(id, life::Outcome::Cancelled),
+                    Err(Resolve::NotRequest | Resolve::Unbound(_) | Resolve::Stale(..)) => return,
+                },
                 event::Event::Rejected { error, .. } => return self.rejected(resident, error),
                 event::Event::Stopped {
                     stream_id: stream, ..
@@ -333,16 +337,8 @@ where
                 return;
             }
         };
-        if let Err(error) = E::transition(
-            &mut self.state.deadline,
-            id,
-            timeline::Transition::InputFinished,
-            self.now,
-        ) {
-            manifold::close_connection_scoped(self.conn, deadline::code(error));
-            return;
-        }
-        self.state.finish_input(
+        head::finish(
+            self.state,
             self.app.into_ref().get_ref(),
             self.life,
             self.conn,
@@ -350,14 +346,6 @@ where
             id,
             self.now,
         );
-    }
-
-    fn reset(mut self, resident: Presence<'scope>) {
-        let id = match self.resolve(&resident) {
-            Ok((_, id)) => id,
-            Err(Resolve::NotRequest | Resolve::Unbound(_) | Resolve::Stale(..)) => return,
-        };
-        self.retire(id, life::Outcome::Cancelled);
     }
 
     fn retire(mut self, id: requests::Id, outcome: life::Outcome) {

@@ -1,4 +1,4 @@
-use std::{marker, ops, pin};
+use std::pin;
 
 use conn::write::{self, body};
 use data::compose;
@@ -13,7 +13,7 @@ use crate::{
     pump,
     server::{
         conn::router,
-        date, deadline,
+        deadline,
         payload::{
             self,
             write::{CycleCommit, Failure, Wake},
@@ -34,25 +34,19 @@ type Context<'a, 'b, 'c, 'e, 'f, 'd, ID, W, R, H, T> = conn::Ctx<
     session::Conn<
         'd,
         R,
-        <H as router::Routes<'d, R, ID, T>>::Pending,
+        <H as router::Routes<'d, R, T>>::Pending,
         T,
-        <H as router::Routes<'d, R, ID, T>>::Ready,
-        <H as router::Routes<'d, R, ID, T>>::Head,
+        <H as session::Dispatch<'d, R, <H as router::Routes<'d, R, T>>::Pending, T>>::Ready,
+        <H as session::Dispatch<'d, R, <H as router::Routes<'d, R, T>>::Pending, T>>::Head,
     >,
     data::Bound<
         compose::Either<
-            payload::Body<'d, <H as router::Routes<'d, R, ID, T>>::TransportTag>,
-            payload::Stream<'d, <H as router::Routes<'d, R, ID, T>>::TransportTag>,
+            payload::Body<'d, <H as router::Routes<'d, R, T>>::TransportTag>,
+            payload::Stream<'d, <H as router::Routes<'d, R, T>>::TransportTag>,
         >,
-        <H as router::Routes<'d, R, ID, T>>::Egress,
+        <H as router::Routes<'d, R, T>>::Egress,
     >,
 >;
-
-pub struct Driver<'a, 'd, H> {
-    app: pin::Pin<&'a mut H>,
-    date: &'a date::Clock,
-    driver: marker::PhantomData<fn(&'d ()) -> &'d ()>,
-}
 
 /// One HTTP/1 turn's direct task-plane continuation proof.
 #[must_use = "an HTTP/1 drive must settle its continuation"]
@@ -90,13 +84,6 @@ impl Flow {
     }
 }
 
-/// Exact result of one HTTP/1 input callback and its deadline mutation.
-pub enum Ingress<H = ()> {
-    Continue,
-    Handoff { staged: H, range: ops::Range<usize> },
-    CloseAfter,
-}
-
 impl<H> Drive<H> {
     const fn new(flow: Flow) -> Self {
         Self {
@@ -104,11 +91,6 @@ impl<H> Drive<H> {
             tail: pump::Tail::Empty,
             progress: deadline::Progress::new(deadline::Head::Unchanged, deadline::Body::None),
         }
-    }
-
-    fn with_tail(mut self, tail: pump::Tail<H>) -> Self {
-        self.tail = tail;
-        self
     }
 
     fn with_input(mut self, progress: deadline::Progress) -> Self {
@@ -139,187 +121,152 @@ impl Settled {
     }
 }
 
-impl<'a, 'd, H> Driver<'a, 'd, H> {
-    pub fn new(app: pin::Pin<&'a mut H>, date: &'a date::Clock) -> Self {
-        Self {
-            app,
-            date,
-            driver: marker::PhantomData,
+/// Drives one turn that supplies no input to the pump.
+pub fn resume<'d, H, Runtime, Transitions, ID: Identity, W>(
+    routes: pin::Pin<&mut H>,
+    conn: &mut Context<'_, '_, '_, '_, '_, 'd, ID, W, Runtime, H, Transitions>,
+    driver: &mut driver::Context<'_, 'd>,
+) -> Settled
+where
+    H: router::Routes<'d, Runtime, Transitions>,
+    Transitions: switch::Engine,
+    Runtime: pump::Tasks,
+    W: wire::Spec,
+{
+    // Empty input cannot construct `pump::Tail::Handoff`, so no borrowed suffix is kept.
+    let Drive { flow, progress, .. } = run(routes, &[], conn, driver);
+    Settled { flow, progress }
+}
+
+/// Drives one turn of freshly arrived callback input, handing any
+/// unconsumed borrowed suffix back to the transport.
+pub fn run<'d, H, Runtime, Transitions, ID: Identity, W>(
+    mut routes: pin::Pin<&mut H>,
+    bytes: &[u8],
+    conn: &mut Context<'_, '_, '_, '_, '_, 'd, ID, W, Runtime, H, Transitions>,
+    driver: &mut driver::Context<'_, 'd>,
+) -> Drive<Transitions::Staged>
+where
+    H: router::Routes<'d, Runtime, Transitions>,
+    Transitions: switch::Engine,
+    Runtime: pump::Tasks,
+    W: wire::Spec,
+{
+    let bytes = match pump::Ingress::preflight(conn.state_mut(), bytes) {
+        pump::Preflight::Drive => bytes,
+        pump::Preflight::Resume => &[],
+        pump::Preflight::Finished => {
+            return Drive::new(Flow::Continue).with_input(deadline::Progress::new(
+                deadline::Head::Ready,
+                deadline::Body::None,
+            ));
         }
-    }
+        pump::Preflight::Settled => return Drive::new(Flow::Continue),
+        pump::Preflight::Rejected(error) => {
+            routes.as_mut().failure(&crate::wire::Failure::Pump(error));
+            conn.close_after();
+            return Drive::new(Flow::Closed);
+        }
+    };
 
-    /// Drives one turn that supplies no input to the pump.
-    pub fn resume<Runtime, Transitions, ID: Identity, W>(
-        &mut self,
-        conn: &mut Context<'_, '_, '_, '_, '_, 'd, ID, W, Runtime, H, Transitions>,
-        driver: &mut driver::Context<'_, 'd>,
-    ) -> Settled
-    where
-        H: router::Routes<'d, Runtime, ID, Transitions>,
-        Transitions: switch::Engine,
-        Runtime: pump::Tasks,
-        W: wire::Spec,
-    {
-        // Empty input cannot construct `pump::Tail::Handoff`, so no borrowed suffix is kept.
-        let Drive { flow, progress, .. } = self.run(&[], conn, driver);
-        Settled { flow, progress }
-    }
-
-    /// Drives one turn of freshly arrived callback input, handing any
-    /// unconsumed borrowed suffix back to the transport.
-    pub fn run<Runtime, Transitions, ID: Identity, W>(
-        &mut self,
-        bytes: &[u8],
-        conn: &mut Context<'_, '_, '_, '_, '_, 'd, ID, W, Runtime, H, Transitions>,
-        driver: &mut driver::Context<'_, 'd>,
-    ) -> Drive<Transitions::Staged>
-    where
-        H: router::Routes<'d, Runtime, ID, Transitions>,
-        Transitions: switch::Engine,
-        Runtime: pump::Tasks,
-        W: wire::Spec,
-    {
-        let bytes = match pump::Ingress::preflight(conn.state_mut(), bytes) {
-            pump::Preflight::Drive => bytes,
-            pump::Preflight::Resume => &[],
-            pump::Preflight::Finished => {
-                return Drive::new(Flow::Continue).with_input(deadline::Progress::new(
-                    deadline::Head::Ready,
-                    deadline::Body::None,
-                ));
-            }
-            pump::Preflight::Settled => return Drive::new(Flow::Continue),
-            pump::Preflight::Rejected(error) => {
-                self.app
-                    .as_mut()
-                    .failure(&crate::wire::Failure::Pump(error));
-                conn.close_after();
-                return Drive::new(Flow::Closed);
-            }
-        };
-
-        let id = conn.id();
-        let prior = pump::Ingress::deferred(conn.state());
-        let commit = conn.write().try_draft(driver, |state, write| {
-            let mut disp = router::Dispatch {
-                app: self.app.as_mut(),
-                id,
-                date: self.date,
+    let prior = pump::Ingress::deferred(conn.state());
+    let commit = conn.write().try_draft(driver, |state, write| {
+        let cycle = pump::Ingress::drive(state, routes.as_mut(), bytes, write, prior);
+        payload::write::try_cycle(cycle, |charge| {
+            routes.as_mut().response_tag(&mut state.async_state, charge)
+        })
+    });
+    let CycleCommit {
+        progress,
+        discard_remaining: left,
+        state,
+        transport: sent,
+        wake,
+        tail,
+    } = match commit {
+        Ok(write::Outcome::Committed(done)) => done,
+        Ok(write::Outcome::Deferred(
+            write::Deferred::Turn | write::Deferred::Capacity | write::Deferred::OrderedDrain,
+        )) => {
+            let held = pump::Ingress::retain(conn.state_mut(), bytes);
+            return match held.state {
+                Ok(()) => Drive::new(Flow::Continue).with_input(held.progress),
+                Err(error) => {
+                    routes.as_mut().failure(&crate::wire::Failure::Pump(error));
+                    conn.close_after();
+                    Drive::new(Flow::Closed).with_input(held.progress)
+                }
             };
-            let cycle = pump::Ingress::drive(state, pin::Pin::new(&mut disp), bytes, write, prior);
-            payload::write::try_cycle(cycle, |charge| {
-                router::Routes::response_tag(
-                    disp.app.as_mut(),
-                    disp.id,
-                    &mut state.async_state,
-                    charge,
-                )
-            })
-        });
-        let CycleCommit {
-            progress,
-            discard_remaining: left,
-            state,
-            transport: sent,
-            wake,
-            tail,
-        } = match commit {
-            Ok(write::Outcome::Committed(done)) => done,
-            Ok(write::Outcome::Deferred(
-                write::Deferred::Turn | write::Deferred::Capacity | write::Deferred::OrderedDrain,
-            )) => {
-                let held = pump::Ingress::retain(conn.state_mut(), bytes);
-                return match held.state {
-                    Ok(()) => Drive::new(Flow::Continue).with_input(held.progress),
-                    Err(error) => {
-                        self.app
-                            .as_mut()
-                            .failure(&crate::wire::Failure::Pump(error));
-                        conn.close_after();
-                        Drive::new(Flow::Closed).with_input(held.progress)
-                    }
-                };
-            }
-            Ok(write::Outcome::Closed) => return Drive::new(Flow::Closed),
-            Err(cause) => {
-                let (receipt, failure) = match payload::write::reject(cause) {
-                    Failure::Capacity(cause) => (None, body::Failure::Capacity(cause)),
-                    Failure::Rejected { cause, receipt } => (Some(receipt), cause),
-                };
-                if let Some(receipt) = receipt
-                    && let Some(tag) = receipt.transport
-                {
-                    router::Routes::cancel(
-                        self.app.as_mut(),
-                        id,
-                        &mut conn.state_mut().async_state,
-                        tag,
-                    );
-                }
-                conn.write().reject(failure);
-                return Drive::new(Flow::Closed);
-            }
-        };
-        match wake {
-            Wake::None => {}
-            Wake::Pending => conn.wake_target().wake(),
         }
-        match state {
-            Ok(()) => {
-                if let Some(tag) = sent {
-                    router::Routes::accept(
-                        self.app.as_mut(),
-                        id,
-                        &mut conn.state_mut().async_state,
-                        tag,
-                    );
-                }
-            }
-            Err(error) => {
-                self.app
+        Ok(write::Outcome::Closed) => return Drive::new(Flow::Closed),
+        Err(cause) => {
+            let (receipt, failure) = match payload::write::reject(cause) {
+                Failure::Capacity(cause) => (None, body::Failure::Capacity(cause)),
+                Failure::Rejected { cause, receipt } => (Some(receipt), cause),
+            };
+            if let Some(receipt) = receipt
+                && let Some(tag) = receipt.transport
+            {
+                routes
                     .as_mut()
-                    .failure(&crate::wire::Failure::Pump(error));
-                conn.close_after();
-                return Drive::new(Flow::Closed);
+                    .cancel(&mut conn.state_mut().async_state, tag);
             }
+            conn.write().reject(failure);
+            return Drive::new(Flow::Closed);
         }
-        if let Some(prefix) = discard::Prefix::try_new(left)
-            && matches!(conn.try_discard(prefix), discard::Start::Started)
-        {
-            pump::Ingress::discard(conn.state_mut());
-        }
-        Drive::new(Flow::Continue)
-            .with_tail(tail)
-            .with_input(progress)
+    };
+    match wake {
+        Wake::None => {}
+        Wake::Pending => conn.wake_target().wake(),
     }
-
-    /// Handles prefix write progress for a transition-capable connection.
-    /// A staged switch remains inert until the gated adapter supplies its
-    /// separate final-drain proof.
-    pub fn progress<Runtime, Transitions, ID: Identity, W>(
-        &mut self,
-        conn: &mut Context<'_, '_, '_, '_, '_, 'd, ID, W, Runtime, H, Transitions>,
-        driver: &mut driver::Context<'_, 'd>,
-    ) -> Settled
-    where
-        H: router::Routes<'d, Runtime, ID, Transitions>,
-        Transitions: switch::Engine,
-        Runtime: pump::Tasks,
-        W: wire::Spec,
+    if let Err(error) = state {
+        routes.as_mut().failure(&crate::wire::Failure::Pump(error));
+        conn.close_after();
+        return Drive::new(Flow::Closed);
+    }
+    if let Some(tag) = sent {
+        routes
+            .as_mut()
+            .accept(&mut conn.state_mut().async_state, tag);
+    }
+    if let Some(prefix) = discard::Prefix::try_new(left)
+        && matches!(conn.try_discard(prefix), discard::Start::Started)
     {
-        match pump::Drain::progress(conn.state_mut()) {
-            pump::Next::None => Settled::new(Flow::Continue),
-            pump::Next::Close(reason) => {
-                if !reason.is_empty()
-                    && let Some(reason) = payload::write::send_static(conn, reason, driver)
-                {
-                    conn.state_mut().defer(reason);
-                    return Settled::new(Flow::Continue);
-                }
-                conn.close_after();
-                Settled::new(Flow::Closed)
+        pump::Ingress::discard(conn.state_mut());
+    }
+    Drive {
+        flow: Flow::Continue,
+        tail,
+        progress,
+    }
+}
+
+/// Handles prefix write progress for a transition-capable connection.
+/// A staged switch remains inert until the gated adapter supplies its
+/// separate final-drain proof.
+pub fn progress<'d, H, Runtime, Transitions, ID: Identity, W>(
+    routes: pin::Pin<&mut H>,
+    conn: &mut Context<'_, '_, '_, '_, '_, 'd, ID, W, Runtime, H, Transitions>,
+    driver: &mut driver::Context<'_, 'd>,
+) -> Settled
+where
+    H: router::Routes<'d, Runtime, Transitions>,
+    Transitions: switch::Engine,
+    Runtime: pump::Tasks,
+    W: wire::Spec,
+{
+    match pump::Drain::progress(conn.state_mut()) {
+        pump::Next::None => Settled::new(Flow::Continue),
+        pump::Next::Close(reason) => {
+            if !reason.is_empty()
+                && let Some(reason) = payload::write::send_static(conn, reason, driver)
+            {
+                conn.state_mut().defer(reason);
+                return Settled::new(Flow::Continue);
             }
-            pump::Next::Resume => self.resume(conn, driver),
+            conn.close_after();
+            Settled::new(Flow::Closed)
         }
+        pump::Next::Resume => resume(routes, conn, driver),
     }
 }

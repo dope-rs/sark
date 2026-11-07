@@ -138,8 +138,8 @@ impl Plan {
         let frame = machine.local_settings.max_frame_size;
         let data_gap = frame::HEADER_LEN + frame.into_usize();
         machine.inbound_capacity = buffer.get() as usize + data_gap - 1;
-        let headers = limits::Block::new(machine.hpack_encoder.header_list)?;
-        let head_gap = limits::Capacity::wire(headers)?.bytes();
+        let (_, wire) = limits::Capacity::wire(machine.hpack_encoder.header_list)?;
+        let head_gap = wire.bytes();
         let headroom = data_gap.max(head_gap);
         machine.outbound_capacity = self.config.max_outbound_bytes.checked_add(headroom).ok_or(
             config::Error::OutboundHeadroom {

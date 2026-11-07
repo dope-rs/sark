@@ -9,6 +9,7 @@ use sark_http::field::{Entry, Pseudo};
 pub use super::server::recover;
 
 pub mod apps;
+pub mod cleartext;
 
 pub mod facts;
 

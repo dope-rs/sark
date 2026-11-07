@@ -305,8 +305,7 @@ impl Error {
             | segments::Error::Retain(_)
             | segments::Error::Count(_)
             | segments::Error::Logical(_)
-            | segments::Error::Resident(_)
-            | segments::Error::Total(_) => ErrorCode::ExcessiveLoad,
+            | segments::Error::Resident(_) => ErrorCode::ExcessiveLoad,
             segments::Error::DifferentPool | segments::Error::Boundary(_) => ErrorCode::Internal,
         }
     }

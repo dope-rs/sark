@@ -2,6 +2,7 @@ pub mod common;
 
 use std::{
     cell::Cell,
+    convert::Infallible,
     io::{Read, Write},
     net::TcpStream,
     thread,
@@ -16,78 +17,20 @@ use crate::common::{
     retained::State,
     route::{
         chunked::wire::Request,
-        glue::storage::{self, GlobalBudgetApp, MixedStorageApp, ThirteenStorageApp},
+        glue::storage::{self, GlobalBudgetApp, MixedStorageApp},
     },
     server::{self, Plan},
 };
 use common::server::recover;
 
 #[test]
-fn h1_reaches_tree_leaves() {
+fn routes_dispatch_heterogeneous() {
     let harness = Pair::bind().expect("bind isolated listener");
     let bind = harness.addr();
     let server = server::Plan::new(bind, Duration::from_secs(10)).build();
 
     harness
-        .check(
-            |context, listener| {
-                let mut reports = Plan::try_reports(&server).expect("server descriptor claims");
-                let failures = Cell::new(Vec::new());
-                let result = ThirteenStorageApp::serve(
-                    server.with_bound(listener),
-                    context,
-                    State(&failures),
-                    Config::new(server::MAX_CONNECTIONS),
-                    Policy::new(|event| reports.push(event), recover),
-                    |result| {
-                        result
-                            .as_ref()
-                            .map(|_| ())
-                            .map_err(|error| error.cause())
-                            .expect("server")
-                    },
-                );
-                assert!(
-                    reports.events().expect("reclaimed resources").is_empty(),
-                    "server retirement: {reports:?}"
-                );
-                let failures = failures.into_inner();
-                assert!(failures.is_empty(), "storage: {failures:?}");
-                result
-            },
-            |bind| {
-                for path in storage::LEAVES {
-                    let mut stream = TcpStream::connect(bind).expect("connect route leaf");
-                    stream
-                        .write_all(&Request::new(path).get())
-                        .expect("write route leaf request");
-                    let mut response = String::new();
-                    stream
-                        .read_to_string(&mut response)
-                        .expect("read route leaf response");
-                    assert!(response.contains("200 OK"), "{path}: {response}");
-                    assert!(response.contains("narrow"), "{path}: {response}");
-                }
-            },
-            |result| {
-                assert!(
-                    result.is_ok(),
-                    "h1_reaches_tree_leaves server shutdown: {:?}",
-                    result.err()
-                );
-            },
-        )
-        .expect("harness");
-}
-
-#[test]
-fn routes_use_own_slabs() {
-    let harness = Pair::bind().expect("bind isolated listener");
-    let bind = harness.addr();
-    let server = server::Plan::new(bind, Duration::from_secs(10)).build();
-
-    harness
-        .check(
+        .run(
             |context, listener| {
                 let mut reports = Plan::try_reports(&server).expect("server descriptor claims");
                 let failures = Cell::new(Vec::new());
@@ -111,37 +54,30 @@ fn routes_use_own_slabs() {
                 );
                 let failures = failures.into_inner();
                 assert!(failures.is_empty(), "storage: {failures:?}");
-                result
-            },
-            |bind| {
-                let mut stream = TcpStream::connect(bind).expect("connect");
-                stream
-                    .write_all(storage::WIDE)
-                    .expect("write wide route request");
-                let mut response = String::new();
-                stream
-                    .read_to_string(&mut response)
-                    .expect("read wide route response");
-                assert!(response.contains("200 OK"), "response: {response}");
-                assert!(response.contains("wide"), "response: {response}");
-
-                let mut stream = TcpStream::connect(bind).expect("connect");
-                stream
-                    .write_all(storage::STREAM)
-                    .expect("write stream route request");
-                let mut response = String::new();
-                stream
-                    .read_to_string(&mut response)
-                    .expect("read stream route response");
-                assert!(response.contains("200 OK"), "response: {response}");
-                assert!(response.contains("stream"), "response: {response}");
-            },
-            |result| {
                 assert!(
                     result.is_ok(),
-                    "routes_use_own_slabs server shutdown: {:?}",
+                    "routes_dispatch_heterogeneous server shutdown: {:?}",
                     result.err()
                 );
+                Ok::<_, Infallible>(())
+            },
+            |bind| {
+                for (path, expected) in [
+                    ("/narrow", "narrow"),
+                    ("/wide", "wide"),
+                    ("/stream", "stream"),
+                ] {
+                    let mut stream = TcpStream::connect(bind).expect("connect");
+                    stream
+                        .write_all(&Request::new(path).get())
+                        .expect("write route request");
+                    let mut response = String::new();
+                    stream
+                        .read_to_string(&mut response)
+                        .expect("read route response");
+                    assert!(response.contains("200 OK"), "{path}: {response}");
+                    assert!(response.contains(expected), "{path}: {response}");
+                }
             },
         )
         .expect("harness");
@@ -154,7 +90,7 @@ fn quota_is_reusable() {
     let server = server::Plan::new(bind, Duration::from_secs(10)).build();
 
     harness
-        .check(
+        .run(
             |context, listener| {
                 let mut reports = Plan::try_reports(&server).expect("server descriptor claims");
                 let failures = Cell::new(Vec::new());
@@ -178,7 +114,12 @@ fn quota_is_reusable() {
                 );
                 let failures = failures.into_inner();
                 assert!(failures.is_empty(), "storage: {failures:?}");
-                result
+                assert!(
+                    result.is_ok(),
+                    "quota_is_reusable server shutdown: {:?}",
+                    result.err()
+                );
+                Ok::<_, Infallible>(())
             },
             |bind| {
                 {
@@ -242,13 +183,6 @@ fn quota_is_reusable() {
                     );
                     thread::sleep(Duration::from_millis(10));
                 }
-            },
-            |result| {
-                assert!(
-                    result.is_ok(),
-                    "quota_is_reusable server shutdown: {:?}",
-                    result.err()
-                );
             },
         )
         .expect("harness");

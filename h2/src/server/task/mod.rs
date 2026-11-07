@@ -73,19 +73,6 @@ type Carrier<'d, R, D, F = <R as decode::Decode>::Plan, S = ()> = State<
     S,
 >;
 
-type Context<'a, 'b, 'c, 'e, 'f, 'd, ID, R, W, M, D, A = service::Native<R>> = conn::Ctx<
-    'a,
-    'b,
-    'c,
-    'e,
-    'f,
-    'd,
-    ID,
-    W,
-    Carrier<'d, R, D, <A as semantic::Spec>::Fields, service::State<'d, ID, A>>,
-    data::Bound<<M as Transport<'d, ID>>::Output, <A as semantic::Spec>::Egress<'d>>,
->;
-
 type Retired<'a, 'b, 'd, ID, R, W, M, D, A = service::Native<R>> = conn::Retired<
     'a,
     'b,

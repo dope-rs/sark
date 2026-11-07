@@ -200,7 +200,7 @@ where
         mut next: impl FnMut(&mut Connection<'d, R::Plan>) -> Option<Incoming<'d, R::Plan>>,
         mut report: impl FnMut(conn::Error),
     ) where
-        Self: head::Begin<<R::Head as request::Head>::Start, Router = R>,
+        <R::Head as request::Head>::Start: head::Begin<'d, R>,
     {
         while let Some(event) = next(self.connection) {
             match event {
@@ -224,7 +224,9 @@ where
                             continue;
                         }
                     };
-                    head::Begin::begin(self, router, stream, head, boundary, limits, &mut report);
+                    if let Some(start) = self.select(router, stream, head, boundary, limits) {
+                        head::Begin::begin(start, self, router, stream, limits, &mut report);
+                    }
                 }
                 Event::Data {
                     message: frame,

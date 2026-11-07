@@ -73,7 +73,7 @@ where
     }
 
     /// The admission reservation preserves report vacancy through activation.
-    pub(in crate::client::exchange::net) fn try_connect(
+    pub(in crate::client) fn try_connect(
         &self,
         id: Id<'d, ID>,
     ) -> Result<

@@ -31,6 +31,13 @@ enum Pending<R, D> {
 }
 
 impl<R, D> Pending<R, D> {
+    fn state(&self) -> lower::State {
+        match self {
+            Self::Ready => lower::State::Ready,
+            Self::Buffered(_, _) | Self::Direct(_) => lower::State::Pending,
+        }
+    }
+
     fn try_ready(&self) -> Result<(), lower::Error> {
         match self {
             Self::Ready => Ok(()),
@@ -120,11 +127,7 @@ impl<P: rules::Policy> Session<P> {
         indexing: field::Indexing,
     ) -> Result<(), lower::Error> {
         let Pending::Buffered(rule, expected) = self.pending else {
-            let cause = lower::Error::State(match self.pending {
-                Pending::Ready => lower::State::Ready,
-                Pending::Buffered(_, _) | Pending::Direct(_) => lower::State::Pending,
-            });
-            return Err(cause);
+            return Err(lower::Error::State(self.pending.state()));
         };
         let actual = name.proof();
         if actual != expected {
@@ -151,11 +154,7 @@ impl<P: rules::Policy> Session<P> {
     /// Direct input already owns its class, tag and value; completion never observes a name.
     pub fn direct<A: rules::Push>(&mut self) -> Result<(), lower::Error> {
         let Pending::Direct(done) = self.pending else {
-            let cause = lower::Error::State(match self.pending {
-                Pending::Ready => lower::State::Ready,
-                Pending::Buffered(_, _) | Pending::Direct(_) => lower::State::Pending,
-            });
-            return Err(cause);
+            return Err(lower::Error::State(self.pending.state()));
         };
         done.try_finish::<A>(&mut self.section, &mut self.input, &mut self.scratch)?;
         self.pending = Pending::Ready;

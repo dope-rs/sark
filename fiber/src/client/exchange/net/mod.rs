@@ -189,20 +189,6 @@ where
         response.bind_retire(active.ready());
         Ok(())
     }
-
-    pub(in crate::client) fn try_reserve<'a>(
-        &'a self,
-        driver: &'a mut driver::Context<'_, 'd>,
-        id: Id<'d, ID>,
-    ) -> Result<impl FnOnce(Tag) + 'a, Open> {
-        let commit = self.pool.try_connect(id)?;
-        let token = driver.region_token();
-        Ok(move |tag| {
-            commit(token, tag, reuse::Admission::Reserved);
-            self.waiters.wake(tag);
-            self.waiters.wake_io();
-        })
-    }
 }
 
 impl<'f, 'e, 'b, 'c, 'd, ID: Identity, E, F> Transport<'f, 'e, 'b, 'c, 'd, ID, (), E, F>

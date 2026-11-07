@@ -1,7 +1,7 @@
 use dope::core::driver::schedule::app;
 use o3::buffer::resident;
 use sark_core::{
-    decode::{self, request, state},
+    decode::{self, request},
     manifold::{
         schedule,
         server::{
@@ -16,7 +16,7 @@ use crate::{
     conn::{self, event, machine},
     server::{
         self,
-        state::exchange::Accepted,
+        state::exchange::{Deferred, Routed},
         sync::{Book, book::ingress},
     },
 };
@@ -111,39 +111,14 @@ pub trait Dispatch<'d, S = <<Self as decode::Decode>::Head as request::Head>::St
     fn clear(&self, book: &mut Book<'d, Self>, conn: &mut Connection<'d, Self>);
 }
 
-impl<'d, R, U> Dispatch<'d, request::Plain<U>> for R
+impl<'d, R, S> Dispatch<'d, S> for R
 where
     R: decode::Decode<Egress<'d>: 'd>,
-    R::Head: request::Head<Start = request::Plain<U>>,
+    R::Head: request::Head<Start = S>,
     R::Prepared: request::Synchronous,
-    U: state::Flow<R::Prepared, state::Routed, Family = R::Routes> + state::Admission<
-            R::Prepared,
-            state::Routed,
-            Accepted<'d>,
-            Output = <<R::Prepared as request::Prepared>::Family as state::Family<R::Prepared>>::State<Accepted<'d>>,
-        >,
-{
-    fn ingress(&self, book: &mut Book<'d, Self>, conn: &mut Connection<'d, Self>, limits: server::Config,
-        next: impl FnMut(&mut Connection<'d, Self>) -> Option<Incoming<'d, Self>>, report: impl FnMut(conn::Error)) {
-        ingress::Ingress::new(book, conn).run(self, limits, next, report);
-    }
-
-    fn pump<const ROUND: bool, P>(&self, book: &mut Book<'d, Self>, conn: &mut Connection<'d, Self>, limits: server::Config, egress: schedule::Egress, permit: impl FnMut() -> Option<P>, report: impl FnMut(conn::Error)) -> schedule::Report {
-        book.pump::<ROUND, _, _, _>(conn, self, limits, egress, permit, report)
-    }
-
-    fn clear(&self, book: &mut Book<'d, Self>, conn: &mut Connection<'d, Self>) {
-        book.clear(conn);
-    }
-}
-
-impl<'d, R, G> Dispatch<'d, request::Guarded<G>> for R
-where
-    R: decode::Guarded<Egress<'d>: 'd>,
-    R::Head: request::Head<Start = request::Guarded<G>>,
-    R::Prepared: request::Synchronous,
-    R::Routes: state::Family<R::Prepared, State<state::Routed> = G>,
-    G: state::Flow<R::Prepared, state::Routed, Family = R::Routes>,
+    S: ingress::head::Begin<'d, R>,
+    <S as request::Selection<R::Prepared>>::Deferred<Routed<'d, R::Prepared, R::Routes>>:
+        Deferred<'d, R::Prepared, R::Routes>,
 {
     fn ingress(
         &self,
@@ -165,34 +140,6 @@ where
         permit: impl FnMut() -> Option<P>,
         report: impl FnMut(conn::Error),
     ) -> schedule::Report {
-        book.pump::<ROUND, _, _, _>(conn, self, limits, egress, permit, report)
-    }
-
-    fn clear(&self, book: &mut Book<'d, Self>, conn: &mut Connection<'d, Self>) {
-        book.clear(conn);
-    }
-}
-
-impl<'d, R, U, G> Dispatch<'d, request::Start<U, G>> for R
-where
-    R: decode::Guarded<Egress<'d>: 'd>,
-    R::Head: request::Head<Start = request::Start<U, G>>,
-    R::Prepared: request::Synchronous,
-    R::Routes: state::Family<R::Prepared, State<state::Routed> = G>,
-    U: state::Admission<
-            R::Prepared,
-            state::Routed,
-            Accepted<'d>,
-            Output = <<R::Prepared as request::Prepared>::Family as state::Family<R::Prepared>>::State<Accepted<'d>>,
-        >,
-    G: state::Flow<R::Prepared, state::Routed, Family = R::Routes>,
-{
-    fn ingress(&self, book: &mut Book<'d, Self>, conn: &mut Connection<'d, Self>, limits: server::Config,
-        next: impl FnMut(&mut Connection<'d, Self>) -> Option<Incoming<'d, Self>>, report: impl FnMut(conn::Error)) {
-        ingress::Ingress::new(book, conn).run(self, limits, next, report);
-    }
-
-    fn pump<const ROUND: bool, P>(&self, book: &mut Book<'d, Self>, conn: &mut Connection<'d, Self>, limits: server::Config, egress: schedule::Egress, permit: impl FnMut() -> Option<P>, report: impl FnMut(conn::Error)) -> schedule::Report {
         book.pump::<ROUND, _, _, _>(conn, self, limits, egress, permit, report)
     }
 

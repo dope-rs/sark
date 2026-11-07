@@ -65,7 +65,21 @@ pub fn define_route(input: proc_macro::TokenStream) -> proc_macro::TokenStream {
     emit(
         |paths| {
             paths.h1.require()?;
-            App::new(paths, input).map(|app| app.expand(paths, runtime::H1::Available))
+            App::new(paths, input).map(|app| app.expand(paths, runtime::H1::Available(None)))
+        },
+        runtime::Requirement::Fiber,
+    )
+}
+
+#[proc_macro]
+pub fn define_cleartext_route(input: proc_macro::TokenStream) -> proc_macro::TokenStream {
+    let input = syn::parse_macro_input!(input as app::inputs::Input);
+    emit(
+        |paths| {
+            paths.h1.require()?;
+            let h2 = runtime::require("sark-h2", "define_cleartext_route")?;
+            app::App::new(paths, input)
+                .map(|app| app.expand(paths, runtime::H1::Available(Some(h2))))
         },
         runtime::Requirement::Fiber,
     )

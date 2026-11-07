@@ -130,7 +130,11 @@ impl<'d> Controller<'d> {
         {
             let at = instant(self.config, deadline::Phase::Total, now);
             if let Some(at) = at {
-                schedule_at(&mut self.book, key, deadline::Phase::Total, at)?;
+                deadline::Book::schedule(
+                    &mut self.book,
+                    key,
+                    deadline::Scheduled::expire(at, deadline::Phase::Total),
+                )?;
             }
             at
         } else {
@@ -233,16 +237,6 @@ fn instant<'d>(
         config::Window::Disabled => None,
         config::Window::Finite(window) => Some(now.clamp_add(window)),
     }
-}
-
-fn schedule_at<'d>(
-    book: &mut deadline::Agenda<stream::Key, clock::Deadline<'d>, Infallible>,
-    key: stream::Key,
-    phase: deadline::Phase,
-    at: clock::Deadline<'d>,
-) -> Result<(), deadline::Error<stream::Key>> {
-    let item = deadline::Scheduled::expire(at, phase);
-    deadline::Book::schedule(book, key, item)
 }
 
 const _: () = assert!(mem::size_of::<Disabled>() == 0);

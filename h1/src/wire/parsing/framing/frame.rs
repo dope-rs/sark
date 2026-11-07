@@ -9,6 +9,7 @@ use sark_core::{
     body::{
         self, admit,
         admit::{Length, Retention},
+        credit,
     },
     request, route,
 };
@@ -111,10 +112,10 @@ impl<'a, 'req: 'body, 'body, 'd, R: route::Spec, C> Frame<'a, 'req, 'body, 'd, R
         ))
     }
 
-    pub(crate) fn drive<RouteState, Ready, Heads, F: FnOnce()>(
+    pub(crate) fn drive<RouteState, Ready, Heads>(
         base: framing::Head<'a, 'req, R, C>,
         ingress: &'body mut session::Ingress<'d, RouteState, Ready, Heads>,
-        ready: F,
+        proof: &mut impl credit::Evidence,
     ) -> Result<framing::Progress<'a, 'req, 'body, 'd, R, C>, parsing::Request<R::Request>> {
         const {
             assert!(
@@ -137,7 +138,7 @@ impl<'a, 'req: 'body, 'body, 'd, R: route::Spec, C> Frame<'a, 'req, 'body, 'd, R
         let ctx = base.fields.source.head;
         let head = base.fields.len.get() as usize;
         base.check_body()?;
-        ready();
+        credit::Evidence::head(proof);
         let (total, body) = match base.body_framing {
             RequestBody::Empty => (head, Payload::Inline(0, ())),
             RequestBody::Fixed(length) => {

@@ -47,7 +47,7 @@ pub(super) fn span(
 ) -> Result<Span<'_>, insert::Error> {
     let state = table.storage.state();
     let parts = table.storage.memory().parts();
-    let start = state.insert.checkpoint;
+    let start = state.entries.tail();
     match Ring::new(parts.arena).span(start, len as usize) {
         Some(name) => Ok(name),
         None => Err(insert::Error::Span(insert::Span::new(

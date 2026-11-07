@@ -43,7 +43,7 @@ impl Account {
     /// Lends this exact account under an identity that cannot escape this operation.
     pub fn scope<R>(
         &mut self,
-        run: impl for<'id> FnOnce(Ledger<'_, region::Proof<region::Identity<'id>>>) -> R,
+        run: impl for<'id> FnOnce(Ledger<'_, region::Identity<'id>>) -> R,
     ) -> R {
         region::Token::scope(|token| {
             run(Ledger {
@@ -124,12 +124,9 @@ pub unsafe trait Bind {
 const _: () = {
     assert!(size_of::<Stored>() == 0);
     assert!(size_of::<Account>() == size_of::<Amount>());
+    assert!(size_of::<Ledger<'static, region::Identity<'static>>>() == size_of::<&mut Amount>());
     assert!(
-        size_of::<Ledger<'static, region::Proof<region::Identity<'static>>>>()
-            == size_of::<&mut Amount>()
-    );
-    assert!(
-        size_of::<buffered::Loan<'static, (), region::Proof<region::Identity<'static>>>>()
+        size_of::<buffered::Loan<'static, (), region::Identity<'static>>>()
             == size_of::<&mut buffered::State<()>>()
     );
 };

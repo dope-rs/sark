@@ -1,4 +1,4 @@
-use std::task;
+use std::{ops::ControlFlow, task};
 
 use dope::{
     core::{driver::route::Identity, io::socket::option},
@@ -93,18 +93,16 @@ impl<'app, 'o, 'q, 'e, 'b, 'c, 'd, ID: Identity> abi::Fiber<'d>
         this.state.step(
             |attempt| match attempt.poll(context.as_ref().completion()) {
                 mailbox::Poll::Ready(channel::Outcome::Connected(conn), attempt) => {
-                    machine::Step::Complete(task::Poll::Ready(Ok(Connected {
+                    ControlFlow::Break(Ok(Connected {
                         attempt,
                         connection: conn,
-                    })))
+                    }))
                 }
                 mailbox::Poll::Ready(channel::Outcome::Failed(error), attempt) => {
                     attempt.cancel();
-                    machine::Step::Complete(task::Poll::Ready(Err(error.into())))
+                    ControlFlow::Break(Err(error.into()))
                 }
-                mailbox::Poll::Pending(attempt) => {
-                    machine::Step::Suspend(attempt, task::Poll::Pending)
-                }
+                mailbox::Poll::Pending(attempt) => ControlFlow::Continue(attempt),
             },
         )
     }

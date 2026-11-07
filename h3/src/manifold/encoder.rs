@@ -52,19 +52,11 @@ struct Head<'a, 'd, P: rules::Policy> {
 }
 
 impl<'a, 'd, P: rules::Policy> Head<'a, 'd, P> {
-    const fn new(prepared: replies::Prepared<'a, 'd, P>, bytes: usize) -> Self {
-        Self { prepared, bytes }
-    }
-
-    fn discard(self) {
-        self.prepared.discard();
-    }
-
     fn with_body<T>(self, body: Result<T, handoff::Error>) -> Result<(T, Self), conn::Error> {
         match body {
             Ok(body) => Ok((body, self)),
             Err(error) => {
-                self.discard();
+                self.prepared.discard();
                 Err(conn::Error::Handoff(error))
             }
         }
@@ -74,7 +66,7 @@ impl<'a, 'd, P: rules::Policy> Head<'a, 'd, P> {
         let actual = body.body_len();
         if actual != self.bytes {
             let expected = self.bytes;
-            self.discard();
+            self.prepared.discard();
             return Err(conn::Error::ResponseLength { expected, actual });
         }
         match write_payload(body, actual) {
@@ -301,7 +293,7 @@ impl<'a, 'req, 'd: 'req, P: rules::Policy, Q: scope::Source, I: stage::Body<'req
             .map_err(|error| (error, stream::Cancellation::new(target)))?;
         Ok(Prepared {
             body: plan,
-            head: Head::new(prepared, bytes),
+            head: Head { prepared, bytes },
         })
     }
 }

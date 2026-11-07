@@ -18,7 +18,7 @@ use crate::{
         runtime::{
             policy,
             run::Failure,
-            state::{self, Session, lanes},
+            state::{self, Store, lanes},
         },
         service::{handler::Production, timers},
     },
@@ -47,7 +47,7 @@ pub(super) trait Mode<'d>: state::Timing<'d> {
 
     fn poll<'r, T, C>(
         now: clock::Moment<'d>,
-        state: &mut Session<'r, 'd, T, Self, C>,
+        state: &mut Store<'r, 'd, T, Self, C>,
         active: &'r active::Signals,
     ) -> Option<active::Entry<'r>>
     where
@@ -65,7 +65,7 @@ pub(super) trait Mode<'d>: state::Timing<'d> {
 impl<'d> Mode<'d> for timers::Off {
     fn poll<'r, T, C>(
         _: clock::Moment<'d>,
-        state: &mut Session<'r, 'd, T, Self, C>,
+        state: &mut Store<'r, 'd, T, Self, C>,
         active: &'r active::Signals,
     ) -> Option<active::Entry<'r>>
     where
@@ -89,7 +89,7 @@ impl<'d> Mode<'d> for timers::Off {
 impl<'d> Mode<'d> for timers::On {
     fn poll<'r, T, C>(
         now: clock::Moment<'d>,
-        state: &mut Session<'r, 'd, T, Self, C>,
+        state: &mut Store<'r, 'd, T, Self, C>,
         active: &'r active::Signals,
     ) -> Option<active::Entry<'r>>
     where
@@ -123,7 +123,7 @@ where
 {
     pub(super) fn egress<C>(
         &mut self,
-        state: &mut Session<'r, 'd, Handler<X::Call, X::State>, X::Timer, C>,
+        state: &mut Store<'r, 'd, Handler<X::Call, X::State>, X::Timer, C>,
         conn: &mut C,
         active: &active::Signals,
         egress: schedule::Egress,
@@ -180,7 +180,7 @@ where
         drain::Events::fair(work, |mut drain| {
             let mut again = false;
             'work: {
-                let state = &mut store.state;
+                let state = &mut *store;
                 while state.deadline().is_some_and(|at| at <= now) {
                     let key = match drain.next_ready(|| state.pop_deadline(now)) {
                         Ok(Some(key)) => key,
@@ -200,7 +200,7 @@ where
                     }
                 }
                 loop {
-                    let state = &mut store.state;
+                    let state = &mut *store;
                     if mem::take(&mut state.egress_released) {
                         self.egress(state, conn, active, schedule::Egress::Released, &mut notify);
                     }
@@ -226,7 +226,7 @@ where
                             else {
                                 break;
                             };
-                            self.event(now, &mut store.state, conn, turn, active, event)
+                            self.event(now, store, conn, turn, active, event)
                                 .map_err(Failure::Readiness)
                                 .map_err(app::Error::Application)?;
                         }
@@ -294,7 +294,7 @@ where
                     }
                 }
             }
-            let state = &store.state;
+            let state = &*store;
             let result = drain.finish();
             let done = X::TASKS && self.exec.has_done(owner);
             let task = X::TASKS && active.has_work();
@@ -323,7 +323,7 @@ where
 
     pub(super) fn fail<C>(
         &mut self,
-        state: &mut Session<'r, 'd, Handler<X::Call, X::State>, X::Timer, C>,
+        state: &mut Store<'r, 'd, Handler<X::Call, X::State>, X::Timer, C>,
         conn: &mut C,
         status: crate::Status,
         entry: active::Entry<'r>,
@@ -339,7 +339,7 @@ where
 
     pub(super) fn complete<C>(
         &mut self,
-        state: &mut Session<'r, 'd, Handler<X::Call, X::State>, X::Timer, C>,
+        state: &mut Store<'r, 'd, Handler<X::Call, X::State>, X::Timer, C>,
         conn: &mut C,
         entry: active::Entry<'r>,
     ) where
@@ -352,7 +352,7 @@ where
 
     pub(super) fn cancel<C>(
         &mut self,
-        state: &mut Session<'r, 'd, Handler<X::Call, X::State>, X::Timer, C>,
+        state: &mut Store<'r, 'd, Handler<X::Call, X::State>, X::Timer, C>,
         entry: active::Entry<'r>,
     ) where
         C: Connection<Key = Key, Owner = resident::Shared<'d>, Output = storage::Shared>,

@@ -29,10 +29,13 @@ pub(super) fn build<'view, 'source>(
     use quote::quote;
 
     let core = types.names.core_ident;
+    let dispatch = &types.names.dispatch_ident;
+    let g_turn = symbols.lifetime("__dispatch");
+    let g_h = symbols.ident("__H");
     let args = &types.generics;
     let bounds = &args.bounds;
-    let def = &args.application_params;
-    let uses = &args.application_generic_use;
+    let def = &args.core_params;
+    let uses = &args.core_generic_use;
     let route = &types.routing;
     let mask = route.method_mask;
     let headers = &route.resume_head;
@@ -63,7 +66,7 @@ pub(super) fn build<'view, 'source>(
     });
     let finish = &routes.finish_arms;
     let finish_body =
-        (!finish.is_empty()).then(|| quote!(self.__finish_body(#v_exch, #v_result, #v_run)));
+        (!finish.is_empty()).then(|| quote!(#v_routes.__finish_body(#v_exch, #v_result, #v_run)));
     let ready = &proto.connections.ready;
     let head = &proto.connections.head;
     let resume = &routes.resume_arms;
@@ -120,10 +123,10 @@ pub(super) fn build<'view, 'source>(
         quote!(match #v_ready {})
     } else {
         quote! {
-            let mut #v_this = self.as_mut().project();
+            let mut #v_this = #v_routes.as_mut().project();
             let #v_exch = #v_ready.exchange;
             let #v_result = match #v_ready.route { #( #resume, )* };
-            self.__finish_body(#v_exch, #v_result, #v_run)
+            #v_routes.__finish_body(#v_exch, #v_result, #v_run)
         }
     };
     let consume = [false, true].map(|owned| {
@@ -154,9 +157,7 @@ pub(super) fn build<'view, 'source>(
         };
         quote! {
             fn #method(
-                mut self: ::core::pin::Pin<&mut Self>,
-                #v_link: #ns_fiber::dope::manifold::network::listener::conn::Id<'d, #g_id>,
-                #v_stamp: &#ns_h1::server::date::Clock,
+                self: ::core::pin::Pin<&mut Self>,
                 #v_permit: #ns_h1::session::Permit,
                 #input,
                 #v_write: &mut [::core::primitive::u8],
@@ -168,6 +169,10 @@ pub(super) fn build<'view, 'source>(
                 #head,
                 #ns_h1::wire::parsing::Rejected<'d>,
             > {
+                let #v_routes = self.get_mut();
+                let #v_link = #v_routes.id;
+                let #v_stamp = #v_routes.date;
+                let mut #v_routes = #v_routes.app.as_mut();
                 let #v_parsed = match #parse {
                     ::core::result::Result::Ok(#complete) => #v_parsed,
                     ::core::result::Result::Ok(#pending) => {
@@ -177,7 +182,7 @@ pub(super) fn build<'view, 'source>(
                         }.into();
                     }
                     ::core::result::Result::Err(#v_error) => {
-                        let mut #v_this = self.as_mut().project();
+                        let mut #v_this = #v_routes.as_mut().project();
                         let (#request::Syntax | #request::Target(..) | #request::Span(..)) = #error;
                         let #v_exch = #ns_core::life::sequence::Mode::open(
                             #v_this.#f_life,
@@ -199,7 +204,7 @@ pub(super) fn build<'view, 'source>(
                         #v_permit,
                         #ns_http::h1::codec::canned::NOT_FOUND,
                     );
-                    let mut #v_this = self.as_mut().project();
+                    let mut #v_this = #v_routes.as_mut().project();
                     #rejected
                     return #v_result.into();
                 };
@@ -218,11 +223,12 @@ pub(super) fn build<'view, 'source>(
         quote! {
             fn #name(
                 self: ::core::pin::Pin<&mut Self>,
-                #v_link: #ns_fiber::dope::manifold::network::listener::conn::Id<'d, #g_id>,
                 #v_run: &mut #rt,
                 #v_tag: Self::TransportTag,
             ) {
-                let mut #v_this = self.project();
+                let #v_this = self.get_mut();
+                let #v_link = #v_this.id;
+                let mut #v_this = #v_this.app.as_mut().project();
                 let #v_trans = #ns_core::life::sequence::Mode::transport(
                     #v_this.#f_life,
                     #v_link,
@@ -241,6 +247,12 @@ pub(super) fn build<'view, 'source>(
         }
     });
     quote! {
+        struct #dispatch<#g_turn, 'd, #g_h, #g_id: #ns_fiber::Identity> {
+            app: ::core::pin::Pin<&#g_turn mut #g_h>,
+            id: #ns_fiber::dope::manifold::network::listener::conn::Id<'d, #g_id>,
+            date: &#g_turn #ns_h1::server::date::Clock,
+        }
+
         impl<#def> #core #uses
         where
             #bounds
@@ -262,22 +274,127 @@ pub(super) fn build<'view, 'source>(
             }
         }
 
-        impl<#def> #ns_h1::server::conn::router::Routes<
-            'd,
-            #rt,
-            #g_id,
-            #policy,
-        >
-            for #core #uses
+        impl<#g_turn, #def> #ns_h1::session::Dispatch<'d, #rt, #wait, #policy>
+            for #dispatch<#g_turn, 'd, #core #uses, #g_id>
         where
             #bounds
             #g_mode: #ns_h1::server::deadline::Mode<'d, #g_id>,
         {
-            #terminal
-
-            type Pending = #wait;
             type Ready = #ready;
             type Head = #head;
+
+            #terminal
+
+            #( #consume )*
+
+            fn resume_head(
+                self: ::core::pin::Pin<&mut Self>,
+                #v_wait: #head,
+                #v_permit: #ns_h1::session::Permit,
+                #v_input: #ns_h1::Input<'_>,
+                #v_write: &mut [::core::primitive::u8],
+                #v_conn: &mut #conn,
+            ) -> #ns_h1::session::RouteOutcome<'d, #wait, #raw, #head, #ns_h1::wire::parsing::Rejected<'d>> {
+                let #v_routes = self.get_mut();
+                let #v_link = #v_routes.id;
+                let #v_date = #v_routes.date.load();
+                let #v_date = &#v_date;
+                let mut #v_routes = #v_routes.app.as_mut();
+                #headers
+            }
+
+            fn resume_error(
+                self: ::core::pin::Pin<&mut Self>,
+                #v_wait: #ns_h1::wire::parsing::Rejected<'d>,
+                #v_permit: #ns_h1::session::Permit,
+                #v_input: #ns_h1::Input<'_>,
+                _: &mut [::core::primitive::u8],
+                #v_conn: &mut #conn,
+            ) -> #ns_h1::session::RouteOutcome<'d, #wait, #raw, #head, #ns_h1::wire::parsing::Rejected<'d>> {
+                let #v_this = self.get_mut();
+                let #v_link = #v_this.id;
+                let mut #v_this = #v_this.app.as_mut().project();
+                let #v_result = #v_wait.resume(#v_input, #v_permit);
+                #rejected
+                #v_result
+            }
+
+            fn body_data(
+                self: ::core::pin::Pin<&mut Self>,
+                mut #v_wait: #wait,
+                #v_body: #ns_http::payload::owned::Segments<'d>,
+                _: &mut #rt,
+            ) -> ::core::result::Result<
+                #wait,
+                #ns_http::payload::fixed::Body<'d>,
+            > {
+                let mut #v_this = self.get_mut().app.as_mut().project();
+                let #v_exch = #v_wait.exchange;
+                let #v_route = match #v_wait.route {
+                    #( #data, )*
+                };
+                #settle_pending
+            }
+
+            fn has_body_work(#v_wait: &#wait) -> ::core::primitive::bool {
+                match #v_wait.route { #( #work, )* }
+            }
+
+            fn resume_pending(
+                self: ::core::pin::Pin<&mut Self>,
+                mut #v_wait: #wait,
+                _: &mut #rt,
+            ) -> ::core::result::Result<#wait, #ns_http::payload::fixed::Body<'d>> {
+                let mut #v_this = self.get_mut().app.as_mut().project();
+                let #v_exch = #v_wait.exchange;
+                let #v_route = match #v_wait.route { #( #pending, )* };
+                #settle_pending
+            }
+
+            fn finish_body(
+                self: ::core::pin::Pin<&mut Self>,
+                #v_wait: #wait,
+                #v_body: #ns_h1::session::Complete,
+                #v_permit: #ns_h1::session::Permit,
+                #v_write: &mut [::core::primitive::u8],
+                #v_run: &mut #rt,
+            ) -> #ns_h1::session::BodyOutcome<'d, #ready, #raw> {
+                let #v_routes = self.get_mut();
+                let #v_date = #v_routes.date.load();
+                let #v_date = &#v_date;
+                let mut #v_routes = #v_routes.app.as_mut();
+                let mut #v_this = #v_routes.as_mut().project();
+                let #v_exch = #v_wait.exchange;
+                #ns_core::life::Mode::observe(
+                    #v_this.#f_life,
+                    #ns_core::life::Event::InputFinished(#v_exch),
+                );
+                let #v_result = match #v_wait.route {
+                    #( #finish, )*
+                };
+                #finish_body
+            }
+
+            fn resume_body(
+                self: ::core::pin::Pin<&mut Self>,
+                #v_ready: Self::Ready,
+                #v_permit: #ns_h1::session::Permit,
+                _: &mut [::core::primitive::u8],
+                #v_run: &mut #rt,
+            ) -> #ns_h1::session::BodyOutcome<'d, #ready, #raw> {
+                let mut #v_routes = self.get_mut().app.as_mut();
+                #build
+            }
+
+        }
+
+        impl<#g_turn, #def> #ns_h1::server::conn::router::Routes<'d, #rt, #policy>
+            for #dispatch<#g_turn, 'd, #core #uses, #g_id>
+        where
+            #bounds
+            #g_mode: #ns_h1::server::deadline::Mode<'d, #g_id>,
+        {
+            type Pending = #wait;
             type Egress = #egress;
             type TransportTag = <#g_mode as
                 #ns_core::life::sequence::Mode<
@@ -286,11 +403,12 @@ pub(super) fn build<'view, 'source>(
 
             fn response_tag(
                 self: ::core::pin::Pin<&mut Self>,
-                #v_link: #ns_fiber::dope::manifold::network::listener::conn::Id<'d, #g_id>,
                 #v_run: &mut #rt,
                 #v_charge: #ns_http::o3::buffer::hold::Charge,
             ) -> Self::TransportTag {
-                let #v_this = self.project();
+                let #v_this = self.get_mut();
+                let #v_link = #v_this.id;
+                let #v_this = #v_this.app.as_mut().project();
                 let ::core::option::Option::Some(#v_exch) =
                     #ns_core::life::sequence::Mode::current(
                         #v_this.#f_life,
@@ -308,105 +426,6 @@ pub(super) fn build<'view, 'source>(
             }
 
             #( #handoff )*
-
-            #( #consume )*
-
-            fn resume_head(
-                #v_routes: #ns_h1::server::conn::router::Dispatch<'_, 'd, Self, #g_id>,
-                #v_wait: #head,
-                #v_permit: #ns_h1::session::Permit,
-                #v_input: #ns_h1::Input<'_>,
-                #v_write: &mut [::core::primitive::u8],
-                #v_conn: &mut #conn,
-            ) -> #ns_h1::session::RouteOutcome<'d, #wait, #raw, #head, #ns_h1::wire::parsing::Rejected<'d>> {
-                let #v_link = #v_routes.id;
-                let #v_date = #v_routes.date.load();
-                let #v_date = &#v_date;
-                let mut #v_routes = #v_routes.app;
-                #headers
-            }
-
-            fn resume_error(
-                self: ::core::pin::Pin<&mut Self>,
-                #v_link: #ns_fiber::dope::manifold::network::listener::conn::Id<'d, #g_id>,
-                #v_wait: #ns_h1::wire::parsing::Rejected<'d>,
-                #v_permit: #ns_h1::session::Permit,
-                #v_input: #ns_h1::Input<'_>,
-                #v_conn: &mut #conn,
-            ) -> #ns_h1::session::RouteOutcome<'d, #wait, #raw, #head, #ns_h1::wire::parsing::Rejected<'d>> {
-                let mut #v_this = self.project();
-                let #v_result = #v_wait.resume(#v_input, #v_permit);
-                #rejected
-                #v_result
-            }
-
-            fn body_data(
-                self: ::core::pin::Pin<&mut Self>,
-                _: #ns_fiber::dope::manifold::network::listener::conn::Id<'d, #g_id>,
-                mut #v_wait: #wait,
-                #v_body: #ns_http::payload::owned::Segments<'d>,
-                _: &mut #rt,
-            ) -> ::core::result::Result<
-                #wait,
-                #ns_http::payload::fixed::Body<'d>,
-            > {
-                let mut #v_this = self.project();
-                let #v_exch = #v_wait.exchange;
-                let #v_route = match #v_wait.route {
-                    #( #data, )*
-                };
-                #settle_pending
-            }
-
-            fn has_body_work(#v_wait: &Self::Pending) -> ::core::primitive::bool {
-                match #v_wait.route { #( #work, )* }
-            }
-
-            fn resume_pending(
-                self: ::core::pin::Pin<&mut Self>,
-                _: #ns_fiber::dope::manifold::network::listener::conn::Id<'d, #g_id>,
-                mut #v_wait: Self::Pending,
-                _: &mut #rt,
-            ) -> ::core::result::Result<Self::Pending, #ns_http::payload::fixed::Body<'d>> {
-                let mut #v_this = self.project();
-                let #v_exch = #v_wait.exchange;
-                let #v_route = match #v_wait.route { #( #pending, )* };
-                #settle_pending
-            }
-
-            fn finish_body(
-                mut self: ::core::pin::Pin<&mut Self>,
-                #v_wait: #wait,
-                #v_body: #ns_h1::session::Complete,
-                #v_permit: #ns_h1::session::Permit,
-                #v_write: &mut [::core::primitive::u8],
-                #v_date: &[::core::primitive::u8; 29],
-                #v_run: &mut #rt,
-            ) -> #ns_h1::session::BodyOutcome<'d, #ready, #raw> {
-                let mut #v_this = self.as_mut().project();
-                let #v_exch = #v_wait.exchange;
-                #ns_core::life::Mode::observe(
-                    #v_this.#f_life,
-                    #ns_core::life::Event::InputFinished(#v_exch),
-                );
-                let #v_result = match #v_wait.route {
-                    #( #finish, )*
-                };
-                #finish_body
-            }
-
-            fn resume_body(
-                mut self: ::core::pin::Pin<&mut Self>,
-                _: #ns_fiber::dope::manifold::network::listener::conn::Id<'d, #g_id>,
-                #v_ready: Self::Ready,
-                #v_permit: #ns_h1::session::Permit,
-                _: &mut [::core::primitive::u8],
-                _: &[::core::primitive::u8; 29],
-                #v_run: &mut #rt,
-            ) -> #ns_h1::session::BodyOutcome<'d, #ready, #raw> {
-                #build
-            }
-
         }
 
     }

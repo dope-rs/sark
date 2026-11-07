@@ -27,6 +27,26 @@ pub struct Scalars {
 }
 
 #[sark_json::json]
+pub struct Signed {
+    pub name: Shared,
+    pub price: i64,
+    pub quantity: i64,
+}
+
+pub const SIGNED_VALUES: [(&[primitive::u8], (i64, i64)); 2] = [
+    (
+        br#"{"name":"item","price":-9223372036854775808,"quantity":9223372036854775807}"#,
+        (i64::MIN, i64::MAX),
+    ),
+    (br#"{"name":"item","price":-0,"quantity":-1}"#, (0, -1)),
+];
+pub const SIGNED_INVALID: [&[primitive::u8]; 3] = [
+    br#"{"name":"item","price":9223372036854775808,"quantity":0}"#,
+    br#"{"name":"item","price":-9223372036854775809,"quantity":0}"#,
+    br#"{"name":"item","price":-1.5,"quantity":0}"#,
+];
+
+#[sark_json::json]
 pub struct NullableText {
     pub name: option::Option<Shared>,
 }

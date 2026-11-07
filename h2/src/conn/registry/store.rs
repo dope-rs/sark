@@ -402,7 +402,7 @@ impl<R: crate::Role> Store<R> {
             ..
         } = self;
         let index = by_id.occupied(u64::from(key.id().into_u32()), |entry| *entry == key)?;
-        let slot = slab::Slots::new(&mut *streams).entry_at(key.index() as u32)?;
+        let slot = streams.entry_at(key.index() as u32)?;
         if slot.get().state.active().is_none() {
             return None;
         }
@@ -421,7 +421,7 @@ impl<R: crate::Role> Store<R> {
     pub(super) fn reset(&mut self, key: stream::Key) -> Option<Reset<'_>> {
         let Self { by_id, streams, .. } = self;
         let index = by_id.occupied(u64::from(key.id().into_u32()), |entry| *entry == key)?;
-        let slot = slab::Slots::new(&mut *streams).entry_at(key.index() as u32)?;
+        let slot = streams.entry_at(key.index() as u32)?;
         let ResetState { error, next } = slot.get().state.reset()?;
         Some(Reset {
             index,
@@ -455,7 +455,7 @@ impl<R: crate::Role> Store<R> {
     }
 
     pub(crate) fn release(&mut self, key: stream::Key, notice: Notice) {
-        let Some(mut slot) = slab::Slots::new(&mut self.streams).entry_at(key.slot()) else {
+        let Some(mut slot) = self.streams.entry_at(key.slot()) else {
             return;
         };
         if slot.get().key != key {
@@ -467,14 +467,12 @@ impl<R: crate::Role> Store<R> {
     }
 
     fn slot(&self, key: stream::Key) -> Option<&Record> {
-        let record = slab::Slots::new(&self.streams).value_at(key.slot())?;
+        let record = self.streams.value_at(key.slot())?;
         (record.key == key).then_some(record)
     }
 
     fn slot_mut(&mut self, key: stream::Key) -> Option<&mut Record> {
-        let record = slab::Slots::new(&mut self.streams)
-            .entry_at(key.slot())?
-            .into_mut();
+        let record = self.streams.entry_at(key.slot())?.into_mut();
         (record.key == key).then_some(record)
     }
 }
@@ -500,7 +498,7 @@ impl<R: crate::Role> Registry<R> {
         let index = match by_id.entry(u64::from(id.into_u32()), |key| key.id() == id) {
             Some(Entry::Occupied(entry)) => {
                 let key = *entry.get();
-                let Some(slot) = slab::Slots::new(&mut *streams).entry_at(key.slot()) else {
+                let Some(slot) = streams.entry_at(key.slot()) else {
                     return Ok(Admission::Past(history.classify(proof)));
                 };
                 let count = if History::<R>::is_local(id) {
@@ -574,7 +572,7 @@ impl<R: crate::Role> Registry<R> {
             return Ok(Err((history.classify(proof), input)));
         };
         let key = *index.get();
-        let Some(slot) = slab::Slots::new(&mut self.store.streams).entry_at(key.slot()) else {
+        let Some(slot) = self.store.streams.entry_at(key.slot()) else {
             return Ok(Err((history.classify(proof), input)));
         };
         let count = if History::<R>::is_local(id) {

@@ -12,7 +12,7 @@ use crate::{
         event,
         io::{
             Stream,
-            outbound::{Pending, Section},
+            outbound::{Prepared, Section},
             write::{Entry, budget},
         },
         output, push,
@@ -55,7 +55,7 @@ impl<'a, 'd, P: rules::Policy, A: rules::Push> Send<'a, 'd, P, A> {
         let conn = self.conn;
         let target = target.into();
         let pending = conn.stage(target, TYPE_HEADERS, None, fields, boundary)?;
-        pending.into_batch(None).commit()
+        pending.open().commit()
     }
 
     pub fn data(
@@ -163,7 +163,7 @@ impl<'a, 'd, P: rules::Policy, A: rules::Push> Send<'a, 'd, P, A> {
                     return Err(conn::Error::Push(error));
                 }
             };
-        let pending = Pending::new(
+        let pending = Prepared::new(
             fields,
             &mut conn.queues,
             conn.session.qpack_encoder,
@@ -171,7 +171,7 @@ impl<'a, 'd, P: rules::Policy, A: rules::Push> Send<'a, 'd, P, A> {
             &mut conn.qpack.pending_encoder,
             encoder_capacity,
         );
-        let retained = pending.into_batch(None).commit()?;
+        let retained = pending.open().commit()?;
         promise.commit();
         Ok(retained)
     }

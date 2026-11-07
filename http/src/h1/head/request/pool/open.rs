@@ -6,7 +6,7 @@ use o3::buffer::{
 
 use crate::h1::head::request::{
     Route, offers,
-    pool::{Buf, Layout, Meta, Source},
+    pool::{Buf, Layout, Meta},
 };
 
 pub struct Open<'d> {
@@ -37,7 +37,6 @@ impl<'d> Open<'d> {
                 (method.len() + target.len()) as u16,
                 0,
             ],
-            Source::Compact,
             route.transition(),
         );
         let mut out = self.bytes.spare();

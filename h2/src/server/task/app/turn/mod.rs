@@ -233,7 +233,7 @@ where
         if matches!(self.budget(), Budget::Spent) {
             return Admission::Exhausted;
         }
-        let result = admit::Admit::new(self.drive.reborrow()).next(self.fault.response());
+        let result = self.drive.reborrow().admit_next(self.fault.response());
         Admission::Item(
             result
                 .map(|()| Outcome::Wake)

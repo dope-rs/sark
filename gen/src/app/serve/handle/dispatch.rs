@@ -18,6 +18,7 @@ pub(in crate::app::serve::handle) struct Methods {
 pub(in crate::app::serve) struct Shape {
     pub(in crate::app::serve) base_bounds: proc_macro2::TokenStream,
     pub(in crate::app::serve) generic_def: proc_macro2::TokenStream,
+    pub(in crate::app::serve) core_generic_def: proc_macro2::TokenStream,
     pub(in crate::app::serve) protocol_generic_def: proc_macro2::TokenStream,
     pub(in crate::app::serve) generic_use: proc_macro2::TokenStream,
     pub(in crate::app::serve) multiplexed_generic_use: proc_macro2::TokenStream,
@@ -83,6 +84,7 @@ impl Shape {
         let values = &spec.state_generics.arguments;
         let clauses = &spec.state_generics.predicates;
         let routes = &spec.route_bounds;
+        let core = &context.core_ident;
         let slabs = &context.exec.slab_bounds;
         let make_req = &context.exec.producer_bounds;
         let base = quote! {
@@ -91,8 +93,11 @@ impl Shape {
         #( #make_req )*
         #( #slabs )*
         };
-        let (futures, makers) = context.exec.producers();
-        let generic = quote! {
+        let generic = |stamp: bool| {
+            let (futures, makers) = context.exec.producers();
+            let stamp = stamp.then_some(&g_stamp);
+            let stamp = stamp.as_slice();
+            quote! {
             <
                 #g_brand: #l_env,
                 #l_env,
@@ -103,10 +108,11 @@ impl Shape {
                 #g_wire: #ns_fiber::dope::net::wire::Spec + #l_env,
                 #g_store: #ns_fiber::manifold::runtime::Storage,
                 #g_mode,
-                #g_stamp,
+                #( #stamp, )*
                 #( #futures, )*
                 #( #makers, )*
             >
+            }
         };
         let (futures, makers) = context.exec.producers();
         let proto = quote! {
@@ -125,11 +131,11 @@ impl Shape {
         };
         let (futures, makers) = context.exec.producers();
         let use_ = quote! {
-            <#g_brand, #l_env, #( #lives, )* 'd, #( #values, )* #g_id, #g_wire, #g_store, #g_mode, #g_stamp, #( #futures, )* #( #makers, )*>
+            <#core<#g_brand, #l_env, #( #lives, )* 'd, #( #values, )* #g_id, #g_wire, #g_store, #g_mode, #( #futures, )* #( #makers, )*>, #g_stamp>
         };
         let (futures, makers) = context.exec.producers();
         let multi = quote! {
-            <
+            <#core<
                 #g_brand,
                 #l_env,
                 #( #lives, )*
@@ -139,15 +145,15 @@ impl Shape {
                 #g_wire,
                 #ns_fiber::manifold::runtime::Prepared<#g_target>,
                 #ns_core::life::mode::Disabled,
-                (),
                 #( #futures, )*
                 #( #makers, )*
-            >
+            >, ()>
         };
 
         Self {
             base_bounds: base,
-            generic_def: generic,
+            generic_def: generic(true),
+            core_generic_def: generic(false),
             protocol_generic_def: proto,
             generic_use: use_,
             multiplexed_generic_use: multi,

@@ -7,7 +7,7 @@ mod routed;
 mod sync;
 
 pub(crate) use admit::Plain;
-pub(crate) use call::Call;
+pub(in crate::server) use call::try_dispatch;
 pub(crate) use input::Input;
 pub(crate) use rejected::Rejected;
 pub(crate) use routed::{Accepted, Deferred, Pending, Routed};

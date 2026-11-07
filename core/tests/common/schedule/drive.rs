@@ -44,13 +44,7 @@ impl schedule::Driver<usize> for Driver {
     fn control<'id>(
         &mut self,
         permit: NonZero<usize>,
-        entry: schedule::Occupied<
-            '_,
-            Self::Key,
-            usize,
-            Block,
-            region::Proof<region::Identity<'id>>,
-        >,
+        entry: schedule::Occupied<'_, Self::Key, usize, Block, region::Identity<'id>>,
     ) -> schedule::Decision<'id, Self::Key> {
         entry.borrowed(self, |_, _, value| {
             *value += permit.get();

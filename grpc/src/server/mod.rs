@@ -135,11 +135,11 @@ where
             Failure = run::Failure,
             Egress<'d> = Unbounded,
         >,
-    for<'d> App<run::Service<'a, direct::Policy<H, active::Entry<'a>>>, W, F>:
+    for<'d> App<'d, run::Service<'a, direct::Policy<H, active::Entry<'a>>>, W, F>:
         Runtime<'d, 'd, ID> + Application<'d, ID, Wire = W, Input = receive::Scoped>,
 {
     type Application<'d>
-        = App<run::Service<'a, direct::Policy<H, active::Entry<'a>>>, W, F>
+        = App<'d, run::Service<'a, direct::Policy<H, active::Entry<'a>>>, W, F>
     where
         Self: 'd,
         W: 'd,
@@ -178,7 +178,7 @@ where
                     'd,
                     'd,
                     KeyTag<0>,
-                    App<run::Service<'a, unary::Policy<'s, 'a, 'life, 'd, H>>, wire::Identity>,
+                    App<'d, run::Service<'a, unary::Policy<'s, 'a, 'life, 'd, H>>, wire::Identity>,
                     env::Bundle<tcp::Tcp, wire::Identity, timing::Throughput>,
                 >,
             >,
@@ -246,7 +246,7 @@ where
                     'd,
                     'd,
                     KeyTag<0>,
-                    App<run::Service<'a, Policy<'s, 'a, 'life, 'd, H>>, wire::Identity>,
+                    App<'d, run::Service<'a, Policy<'s, 'a, 'life, 'd, H>>, wire::Identity>,
                     env::Bundle<tcp::Tcp, wire::Identity, timing::Throughput>,
                 >,
             >,

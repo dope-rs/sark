@@ -10,6 +10,7 @@ use dope::{
 };
 use sark_core::{
     decode::request,
+    life,
     manifold::{server::app as semantic, task::app::Runtime},
 };
 
@@ -17,11 +18,7 @@ use crate::server::{
     Target,
     response::Handoff,
     runtime::output::flush,
-    task::{
-        App, Build, Retired, Transport,
-        app::{boundary::close, turn::schedule::Schedule},
-        service, timers,
-    },
+    task::{App, Build, Retired, Transport, app::turn::schedule::Schedule, service, timers},
 };
 
 pub struct Retire;
@@ -50,6 +47,13 @@ where
         mut conn: Retired<'_, '_, 'd, ID, R, W, M, D, A>,
     ) {
         let this = app.project();
-        close::Close::new(this.router, this.tasks, this.mode).audit::<W, D, A>(&mut conn);
+        let id = conn.id();
+        let bytes = conn.response_len();
+        let state = conn.state_mut();
+        let count = state.task_index.len();
+        let empty = state.task_index.is_empty();
+        life::Mode::close(this.mode, id, || {
+            state.turn().audit(count, empty).wire_bytes(bytes)
+        });
     }
 }

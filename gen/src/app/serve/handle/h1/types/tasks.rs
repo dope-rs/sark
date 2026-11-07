@@ -7,9 +7,14 @@ pub(in crate::app::serve::handle::h1) struct Tasks {
 }
 
 impl Tasks {
-    pub(super) fn build(paths: &Paths, ctx: &handle::Context<'_, '_, '_>) -> Self {
+    pub(super) fn build(
+        paths: &Paths,
+        ctx: &handle::Context<'_, '_, '_>,
+        dispatch: &syn::Ident,
+    ) -> Self {
         let f_life = local("lifecycle");
         let symbols = &ctx.plan.spec.state_generics;
+        let v_routes = symbols.local("routes");
         let [v_cancel, n_active] = symbols.locals(["cancellation", "__activity"]);
         let [n_charge, n_drive] = symbols.locals(["__charge", "__drive"]);
         let [n_exch, n_kind] = symbols.locals(["__exchange", "__kind"]);
@@ -89,7 +94,13 @@ impl Tasks {
         };
         let body = if tasks.is_empty() {
             quote! {
-                let #n_drive = #ns_h1::server::conn::driver::Driver::new(self, #v_date).progress(
+                let mut #v_routes = #dispatch {
+                    app: self,
+                    id: #v_link.id(),
+                    date: #v_date,
+                };
+                let #n_drive = #ns_h1::server::conn::driver::progress(
+                    ::core::pin::Pin::new(&mut #v_routes),
                     #v_link,
                     #v_driver,
                 );
@@ -111,9 +122,18 @@ impl Tasks {
                         return #ns_h1::server::deadline::Progress::default();
                     }
                 }
-                let #n_drive =
-                    #ns_h1::server::conn::driver::Driver::new(self.as_mut(), #v_date)
-                        .progress(#v_link, #v_driver);
+                let #n_drive = {
+                    let mut #v_routes = #dispatch {
+                        app: self.as_mut(),
+                        id: #v_link.id(),
+                        date: #v_date,
+                    };
+                    #ns_h1::server::conn::driver::progress(
+                        ::core::pin::Pin::new(&mut #v_routes),
+                        #v_link,
+                        #v_driver,
+                    )
+                };
                 let #n_active = #ns_h1::pump::Tasks::activity(&#view.async_state);
                 let (#n_flow, #n_prog) = #n_drive.into_parts();
                 if #n_flow.is_runnable(#n_active) {

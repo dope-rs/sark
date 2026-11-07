@@ -78,26 +78,6 @@ sark_fiber::define_route! {
     }
 }
 
-sark_fiber::define_route! {
-    pub ThirteenStorageApp<'state>: State<'state> => {
-        GET "/r0" => async(capacity = 1, body = discarded) narrow_handler,
-        GET "/r1" => async(capacity = 1, body = discarded) narrow_handler,
-        GET "/r2" => async(capacity = 1, body = discarded) narrow_handler,
-        GET "/r3" => async(capacity = 1, body = discarded) narrow_handler,
-        GET "/r4" => async(capacity = 1, body = discarded) narrow_handler,
-        GET "/r5" => async(capacity = 1, body = discarded) narrow_handler,
-        GET "/r6" => async(capacity = 1, body = discarded) narrow_handler,
-        GET "/r7" => async(capacity = 1, body = discarded) narrow_handler,
-        GET "/r8" => async(capacity = 1, body = discarded) narrow_handler,
-        GET "/r9" => async(capacity = 1, body = discarded) narrow_handler,
-        GET "/r10" => async(capacity = 1, body = discarded) narrow_handler,
-        GET "/r11" => async(capacity = 1, body = discarded) narrow_handler,
-        GET "/r12" => async(capacity = 1, body = discarded) narrow_handler,
-    }
-}
-
-pub const LEAVES: [&str; 3] = ["/r0", "/r6", "/r12"];
-pub const WIDE: &[u8] = b"GET /wide HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n";
 pub const STREAM: &[u8] = b"GET /stream HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n";
 pub const HELD: &[u8] = b"GET /held HTTP/1.1\r\nHost: x\r\n\r\n";
 pub const QUICK: &[u8] = b"GET /quick HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n";

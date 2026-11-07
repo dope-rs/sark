@@ -371,22 +371,12 @@ where
             .map_err(fibers::Run::Timer)
     }
 
-    pub fn pause(&mut self, duration: time::Duration) -> Result<(), fibers::Run> {
-        fibers::TEST.try_pause(&mut self.run, duration)
-    }
-
     /// Waits until the peer's opening response is admitted.
-    pub fn wait(
-        &mut self,
-        check: impl FnOnce(Result<(), client::Active<wait::Error<'d>>>),
-    ) -> Result<(), WaitError> {
+    pub fn wait(&mut self) -> Result<Result<(), client::Active<wait::Error<'d>>>, WaitError> {
         let handle = self.handle;
-        check(
-            self.drive_within(handle.wait_active())
-                .map_err(WaitError::Drive)?
-                .ok_or(WaitError::Deadline)?,
-        );
-        Ok(())
+        self.drive_within(handle.wait_active())
+            .map_err(WaitError::Drive)?
+            .ok_or(WaitError::Deadline)
     }
 
     /// Drives until a causal test signal reaches the requested count.

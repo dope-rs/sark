@@ -143,25 +143,14 @@ where
             },
         );
         match outcome {
-            ControlFlow::Continue(request) => self.run(request),
+            ControlFlow::Continue(request) => match state::Flow::map_retain(request, self) {
+                ControlFlow::Continue((this, request)) => {
+                    this.claim.into_entry().buffer(request);
+                    Outcome::Done
+                }
+                ControlFlow::Break(outcome) => outcome,
+            },
             ControlFlow::Break(stop) => self.guard(stop.into_result()),
-        }
-    }
-
-    fn run<T>(self, request: T) -> Outcome
-    where
-        T: state::Flow<
-                R::Prepared,
-                state::Admitted,
-                Family = <R::Prepared as request::Prepared>::Family,
-            >,
-    {
-        match request.map_retain(self) {
-            ControlFlow::Continue((this, request)) => {
-                this.claim.into_entry().buffer(request);
-                Outcome::Done
-            }
-            ControlFlow::Break(outcome) => outcome,
         }
     }
 

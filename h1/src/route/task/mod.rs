@@ -21,17 +21,14 @@ use sark_http::{
     h1::codec::canned,
     payload::{fixed, owned, response::dispatch},
 };
-use task::{
-    request::{Build, Input},
-    response,
-};
+use task::{request::Input, response};
 
 use crate::{
     session,
     wire::{Failure, head, output, response::Context},
 };
 
-type Origin<'id> = region::Proof<region::Identity<'id>>;
+type Origin<'id> = region::Identity<'id>;
 
 /// Borrowed HTTP/1 output resources for one completed generated task.
 #[doc(hidden)]
@@ -141,7 +138,7 @@ impl<'d, R: route::Spec<Request: route::Own<Mode = route::Buffered>>> Mode<'d, R
 
 /// Owned pre-admission state for one streamed task request body.
 pub struct Streaming<'d, R: route::Spec<Request: route::Own>> {
-    stream: stream::Stream<'d, Build<'d, R>>,
+    stream: stream::Stream<'d, <R::Request as route::Own>::TaskBuilder<'d>>,
     account: credit::raw::Account,
     connection: head::Connection,
     response: Context,
@@ -165,7 +162,7 @@ impl<'d, R: route::Spec<Request: route::Own>> Streaming<'d, R> {
         response: Context,
     ) -> Self {
         Self {
-            stream: stream::Stream::new(open, Build::new(build)),
+            stream: stream::Stream::new(open, build),
             account: credit::raw::Account::new(),
             connection: close,
             response,
@@ -178,10 +175,13 @@ impl<'d, R: route::Spec<Request: route::Own>> Streaming<'d, R> {
     fn try_with<T>(
         self,
         run: impl for<'id> FnOnce(
-            stream::Stream<'d, Build<'d, R>, Origin<'id>>,
+            stream::Stream<'d, <R::Request as route::Own>::TaskBuilder<'d>, Origin<'id>>,
             &mut credit::raw::Ledger<'_, Origin<'id>>,
             &mut bool,
-        ) -> Result<stream::Stream<'d, Build<'d, R>, Origin<'id>>, T>,
+        ) -> Result<
+            stream::Stream<'d, <R::Request as route::Own>::TaskBuilder<'d>, Origin<'id>>,
+            T,
+        >,
     ) -> Result<Self, T> {
         let Self {
             stream,
@@ -295,11 +295,12 @@ impl<'d, R: route::Spec<Request: route::Own>> Streaming<'d, R> {
     }
 
     fn try_step<E: credit::Evidence, O: credit::Origin>(
-        stream: stream::Stream<'d, Build<'d, R>, O>,
+        stream: stream::Stream<'d, <R::Request as route::Own>::TaskBuilder<'d>, O>,
         ledger: &mut credit::raw::Ledger<'_, O>,
         proof: &mut E,
         work: &mut bool,
-    ) -> Result<stream::Stream<'d, Build<'d, R>, O>, fixed::Body<'d>> {
+    ) -> Result<stream::Stream<'d, <R::Request as route::Own>::TaskBuilder<'d>, O>, fixed::Body<'d>>
+    {
         match stream.try_step(ledger, proof, body::DEFAULT_BUILD_STEP_BUDGET) {
             stream::Drive::NeedInput(stream) => {
                 *work = false;

@@ -32,6 +32,10 @@ impl<'a, 'd> Value<'a, 'd> {
         }
     }
 
+    pub fn i64(&self) -> crate::Result<i64> {
+        self.value.kind.i64()
+    }
+
     pub fn boolean(&self) -> crate::Result<bool> {
         match self.value.kind {
             ValueKind::True => Ok(true),

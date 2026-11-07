@@ -419,8 +419,10 @@ pub(super) fn build(
 
     let plan = ProtocolPlan::new(paths, spec);
     let exec = Execution::new(paths, &plan);
-    let h1 = match h1 {
-        crate::runtime::H1::Available => Some(handle::H1Plan::new(&plan, &exec)),
+    let h1 = match &h1 {
+        crate::runtime::H1::Available(cleartext) => {
+            Some(handle::H1Plan::new(&plan, &exec, cleartext.as_ref()))
+        }
         crate::runtime::H1::Missing => None,
     };
     let (handle, contract, shape) = handle::build(paths, &plan, &exec, h1.as_ref());

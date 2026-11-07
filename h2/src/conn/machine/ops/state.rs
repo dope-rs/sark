@@ -63,7 +63,7 @@ impl<R: crate::Role> State<R> {
     pub(in crate::conn::machine) fn finish_write<C: session::Storage, T>(
         &mut self,
         write: payloads::Write<C>,
-        evidence: impl FnOnce(stream::Key, usize, C) -> (C, T),
+        evidence: impl FnOnce(stream::Key, usize, &C) -> T,
     ) -> event::Write<T, C> {
         use payloads::Write;
 
@@ -79,7 +79,7 @@ impl<R: crate::Role> State<R> {
                 credit,
                 body,
             } => {
-                let (body, proof) = evidence(credit.stream(), credit.amount(), body);
+                let proof = evidence(credit.stream(), credit.amount(), &body);
                 self.accept_write(credit);
                 event::Write::Split {
                     write: proof,

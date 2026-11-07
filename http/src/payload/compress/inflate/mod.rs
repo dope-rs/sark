@@ -10,7 +10,7 @@ mod gzip;
 mod input;
 pub use checked::Checked;
 pub use gzip::Gzip;
-use input::Input;
+use input::Cursor;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Part {
@@ -88,7 +88,8 @@ pub struct Plan<'a, I>
 where
     I: Iterator<Item = &'a [u8]>,
 {
-    input: Input<'a, I>,
+    segments: I,
+    input: Cursor<'a>,
     size_hint: usize,
 }
 
@@ -111,16 +112,17 @@ impl<'a, I: Iterator<Item = &'a [u8]>> Plan<'a, I> {
     }
 
     fn try_header<const CHECK: bool, E>(
-        segments: I,
+        mut segments: I,
         hint: usize,
         checksum: Option<&Hasher>,
         check: &mut impl FnMut() -> Result<(), E>,
     ) -> Result<Self, Checked<Failure, E>> {
-        let mut input = Input::new(segments);
+        let mut input = Cursor::new(segments.next().unwrap_or(&[]));
         input
-            .header::<CHECK, E>(checksum, check)
+            .header::<CHECK, E>(&mut segments, checksum, check)
             .map_err(|error| error.map_work(|cause| Failure::new(cause, 0)))?;
         Ok(Self {
+            segments,
             input,
             size_hint: hint,
         })

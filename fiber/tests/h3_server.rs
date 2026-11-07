@@ -32,6 +32,7 @@ fn run(scenario: Scenario<'_>) -> Proof<'_> {
 fn run_with<'a>(scenario: Scenario<'a>, lifetime: impl for<'d> Policy<'d>) -> Proof<'a> {
     let name = scenario.name;
     scenario.try_run_with(
+        common::server::h3::sessions::plain,
         options::Config::default(),
         None,
         lifetime,
@@ -82,6 +83,7 @@ fn sync_rejection() {
             linked: 0,
         }
         .try_run_with(
+            common::server::h3::sessions::plain,
             Default::default(),
             None,
             Disabled,
@@ -210,6 +212,7 @@ fn duplex_retries_only_temporary_pressure() {
             linked: 0,
         }
         .try_run_with(
+            common::server::h3::sessions::plain,
             options::Config {
                 egress: Egress {
                     write_capacity: capacity,
@@ -361,17 +364,36 @@ fn async_owners() {
 fn cancels_all() {
     for (action, followup, name) in [
         (CancelAction::RequestCancelled, false, "reset-cancellation"),
-        (CancelAction::StopSending, false, "stop-sending-cancellation"),
-        (CancelAction::KeyClose, false, "connection-close-cancellation"),
-        (CancelAction::RequestCancelled, true, "active-task-cancel-then-quick"),
-        (CancelAction::StopSending, true, "active-task-cancel-then-quick"),
+        (
+            CancelAction::StopSending,
+            false,
+            "stop-sending-cancellation",
+        ),
+        (
+            CancelAction::KeyClose,
+            false,
+            "connection-close-cancellation",
+        ),
+        (
+            CancelAction::RequestCancelled,
+            true,
+            "active-task-cancel-then-quick",
+        ),
+        (
+            CancelAction::StopSending,
+            true,
+            "active-task-cancel-then-quick",
+        ),
         (CancelAction::Qpack, true, "active-task-cancel-then-quick"),
     ] {
         let cancelled = Spec::new(b"/async/cancel", b"");
         let (requests, expected_bodies) = if followup {
             let mut quick = Spec::new(b"/async/quick", b"");
             quick.dispatch = Dispatch::AfterCancellation;
-            (vec![cancelled, quick], vec![None, Some(b"quick".as_slice())])
+            (
+                vec![cancelled, quick],
+                vec![None, Some(b"quick".as_slice())],
+            )
         } else {
             (vec![cancelled], vec![None])
         };
@@ -562,6 +584,7 @@ fn json_failure_precedes_next_data() {
         linked: 1,
     }
     .try_run_with(
+        common::server::h3::sessions::plain,
         options::Config::default(),
         None,
         Disabled,
@@ -613,6 +636,7 @@ fn stream_failure_isolated() {
         linked: 0,
     }
     .try_run_with(
+        common::server::h3::sessions::plain,
         Default::default(),
         None,
         Disabled,
@@ -630,6 +654,48 @@ fn stream_failure_isolated() {
 }
 
 #[test]
+fn routed_response_or_unsupported() {
+    use common::server::h3::sessions::Error;
+    use dope::core::io::datagram;
+    use dope_quic::runtime::{endpoint::server::Plan, routing};
+
+    let result = Scenario {
+        name: "routed-response",
+        requests: vec![Spec::new(b"/async/quick", b"")],
+        expected_bodies: vec![Some(b"quick")],
+        task_capacity: 1,
+        cancellation: None,
+        must_finish_before_last: None,
+        linked: 0,
+    }
+    .try_run_with(
+        |(address, reservation), tls, options, endpoint| {
+            drop(reservation);
+            let binding = routing::Group::bind(address, routing::Count::MIN)
+                .map_err(Error::Group)?
+                .split()
+                .next()
+                .expect("one routed binding");
+            let plan = Plan::routed(binding, tls, options, endpoint).map_err(Error::Endpoint)?;
+            Ok((plan, ()))
+        },
+        Default::default(),
+        None,
+        Disabled,
+        deadline::Disabled,
+        recover,
+        |error| panic!("{error:?}"),
+        life::mode::Observed::new,
+        |outcome| match outcome {
+            Ok(_) => Ok(()),
+            Err(Error::Group(error @ datagram::Error::Unsupported { .. })) => Err(error),
+            Err(error) => panic!("{error:?}"),
+        },
+    );
+    eprintln!("routed native outcome: {result:?}");
+}
+
+#[test]
 fn quiet_connection_failures() {
     use std::{num::NonZero, time::Duration};
 
@@ -642,21 +708,47 @@ fn quiet_connection_failures() {
     deferred.push(frame::TYPE_HEADERS.get() as u8);
     for (streams, age, drain, send_bytes, wire, expected) in [
         (0, short, short, None, None, "QuicStream(PeerLimit)"),
-        (1, Duration::from_secs(60), short, None, None, "QuicStream(PeerLimit)"),
-        (3, Duration::MAX, short, None, None, "Age { source: Range {"),
-        (3, short, Duration::MAX, None, None, "Deadline { source: Range {"),
         (
-            3, Duration::from_secs(60), short, NonZero::new(256), None,
+            1,
+            Duration::from_secs(60),
+            short,
+            None,
+            None,
+            "QuicStream(PeerLimit)",
+        ),
+        (3, Duration::MAX, short, None, None, "Age { source: Range {"),
+        (
+            3,
+            short,
+            Duration::MAX,
+            None,
+            None,
+            "Deadline { source: Range {",
+        ),
+        (
+            3,
+            Duration::from_secs(60),
+            short,
+            NonZero::new(256),
+            None,
             "Resident(Stream(ValueOutOfRange))",
         ),
         (
-            3, Duration::from_secs(60), short, None, Some(deferred.as_slice()),
+            3,
+            Duration::from_secs(60),
+            short,
+            None,
+            Some(deferred.as_slice()),
             "H3(Incomplete { stream_id: 0, buffered: 1, cause: VarInt(Underflow { actual: 0, required: 1 }) })",
         ),
     ] {
         let diagnostics = Cell::new(Vec::new());
         let mut request = Spec::new(
-            if send_bytes.is_some() { b"/async/stream/two_park" } else { b"/async/stream/park" },
+            if send_bytes.is_some() {
+                b"/async/stream/two_park"
+            } else {
+                b"/async/stream/park"
+            },
             if wire.is_some() { b"" } else { b"x" },
         );
         request.head.wire = wire;
@@ -671,6 +763,7 @@ fn quiet_connection_failures() {
             linked: 0,
         }
         .try_run_with(
+            common::server::h3::sessions::plain,
             Default::default(),
             send_bytes,
             Config::try_new(age, drain).expect("finite lifetime"),
@@ -811,6 +904,7 @@ fn stream_rejects_intrinsic_pressure() {
             linked: 0,
         }
         .try_run_with(
+            common::server::h3::sessions::plain,
             protocol,
             Some(send_bytes),
             Disabled,

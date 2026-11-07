@@ -3,7 +3,7 @@ use std::{mem, ops};
 use o3::{buffer::storage, mem::slice::Ext as _};
 
 use crate::{
-    Nesting,
+    Error, Nesting,
     segment::{Atom, Cursor, Projection},
     source::string::Scan,
 };
@@ -15,11 +15,22 @@ pub(super) use name::Name;
 pub(crate) enum ValueKind {
     String { escapes: usize },
     Unsigned(u64),
+    Negative(u64),
     Number,
     True,
     False,
     Null,
     Compound,
+}
+
+impl ValueKind {
+    pub(crate) fn i64(self) -> crate::Result<i64> {
+        match self {
+            Self::Unsigned(value) => i64::try_from(value).map_err(|_| Error::Invalid),
+            Self::Negative(value) => 0_i64.checked_sub_unsigned(value).ok_or(Error::Invalid),
+            _ => Err(Error::Invalid),
+        }
+    }
 }
 
 const _: () = assert!(mem::size_of::<ValueKind>() == 2 * mem::size_of::<usize>());

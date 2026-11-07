@@ -1,5 +1,4 @@
 use core::mem;
-use std::convert::identity;
 
 use o3::{
     buffer,
@@ -34,7 +33,7 @@ impl<'d> State<'d> {
         Some(Self { current, segments })
     }
 
-    fn send<F, E, K, M, G>(
+    fn send<F, E, K, M>(
         pending: &mut Option<Self>,
         conn: &mut machine::Connection<
             crate::ServerRole,
@@ -45,14 +44,13 @@ impl<'d> State<'d> {
         >,
         stream: stream::Key,
         end: Boundary,
-        owner: &mut owners::Sink<'_, K, M, G>,
+        owner: &mut owners::Sink<'_, K, M>,
     ) -> Result<Option<conn::DataOutcome>, conn::Error>
     where
         F: rules::Policy,
         E: event::Evidence,
         K: Copy,
         M: life::Mode<K, stream::Key>,
-        G: FnMut(stream::Key) -> stream::Key,
     {
         let Some(Self { current, segments }) = pending.take() else {
             return Ok(None);
@@ -110,8 +108,8 @@ impl<'d> State<'d> {
         Ok(Some(outcome))
     }
 
-    fn buffered<K, M, G>(
-        owner: &mut owners::Sink<'_, K, M, G>,
+    fn buffered<K, M>(
+        owner: &mut owners::Sink<'_, K, M>,
         stream: stream::Key,
         before: hold::Charge,
         body: &Option<resident::Shared<'d>>,
@@ -119,7 +117,6 @@ impl<'d> State<'d> {
     ) where
         K: Copy,
         M: life::Mode<K, stream::Key>,
-        G: FnMut(stream::Key) -> stream::Key,
     {
         let conn::DataOutcome::Sent(written) = outcome else {
             return;
@@ -152,8 +149,8 @@ impl<'d> State<'d> {
         );
     }
 
-    fn retained<K, M, G>(
-        owner: &mut owners::Sink<'_, K, M, G>,
+    fn retained<K, M>(
+        owner: &mut owners::Sink<'_, K, M>,
         stream: stream::Key,
         before: hold::Charge,
         body: &Option<resident::Shared<'d>>,
@@ -161,7 +158,6 @@ impl<'d> State<'d> {
     ) where
         K: Copy,
         M: life::Mode<K, stream::Key>,
-        G: FnMut(stream::Key) -> stream::Key,
     {
         if M::ENABLED
             && matches!(outcome, conn::DataOutcome::Sent(_))
@@ -229,12 +225,12 @@ impl<'d> Pending<'d> {
         stream: stream::Key,
     ) -> Result<schedule::Turn<conn::DataBlock>, conn::Error> {
         let mut mode = mode::Disabled;
-        let mut owner = owners::Sink::new(&mut mode, (), identity);
+        let mut owner = owners::Sink::new(&mut mode, ());
         self.turn_seen(conn, stream, Boundary::End, &mut owner)
     }
 
     #[doc(hidden)]
-    pub fn turn_seen<F, E, K, M, G>(
+    pub fn turn_seen<F, E, K, M>(
         &mut self,
         conn: &mut machine::Connection<
             crate::ServerRole,
@@ -245,14 +241,13 @@ impl<'d> Pending<'d> {
         >,
         stream: stream::Key,
         end: Boundary,
-        owner: &mut owners::Sink<'_, K, M, G>,
+        owner: &mut owners::Sink<'_, K, M>,
     ) -> Result<schedule::Turn<conn::DataBlock>, conn::Error>
     where
         F: rules::Policy,
         E: event::Evidence,
         K: Copy,
         M: life::Mode<K, stream::Key>,
-        G: FnMut(stream::Key) -> stream::Key,
     {
         let Some(outcome) = State::send(&mut self.state, conn, stream, end, owner)? else {
             return Ok(schedule::Turn::Idle);

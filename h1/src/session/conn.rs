@@ -28,8 +28,21 @@ impl<'d, Runtime: Default, Pending, Transitions: Default, Ready, Heads> Default
     for Conn<'d, Runtime, Pending, Transitions, Ready, Heads>
 {
     fn default() -> Self {
+        Self::prefixed(sark_http::preface::Prefix::default())
+    }
+}
+
+impl<'d, Runtime: Default, Pending, Transitions: Default, Ready, Heads>
+    Conn<'d, Runtime, Pending, Transitions, Ready, Heads>
+{
+    pub fn prefixed(prefix: sark_http::preface::Prefix) -> Self {
+        let protocol = if prefix.as_ref().is_empty() {
+            super::ingress::Protocol::Head
+        } else {
+            super::ingress::Protocol::Prefix(prefix)
+        };
         Self {
-            ingress: Ingress::default(),
+            ingress: Ingress::new(protocol),
             async_state: Runtime::default(),
             deferred_action: None,
             deferred: head::Connection::KeepAlive,
@@ -81,10 +94,6 @@ impl<'d, Runtime, Pending, Transitions: switch::Engine, Ready, Heads>
             && matches!(self.deferred, head::Connection::Close)
             && matches!(self.async_state.activity(), pump::Activity::Idle)
             && self.deferred_action.is_none()
-    }
-
-    pub(crate) fn commit(&mut self) -> switch::Commit {
-        self.transitions.commit()
     }
 
     /// Retires request ingress and deferred connection intents.

@@ -69,7 +69,7 @@ where
 {
     records: schedule::Runtime<Key, call::State<'r, T, C>, B>,
     data: chunks::Pool<C, P>,
-    messages: messages::Pool<C>,
+    messages: pool::Lanes<message::Frame<C>>,
 }
 
 impl<'r, T, C, P, B> Store<'r, T, C, P, B>
@@ -81,7 +81,7 @@ where
         Ok(Self {
             records: schedule::Runtime::try_bounded(cap, cap)?,
             data: chunks::Pool::try_new(data, cap)?,
-            messages: messages::Pool::try_new(msgs, cap)?,
+            messages: pool::Lanes::try_new(pool::Plan::from_counts(msgs, cap))?,
         })
     }
 
@@ -243,7 +243,7 @@ where
         };
         if matches!(stream.request, input::Request::Buffered(_)) {
             messages::try_push(
-                self.messages.try_bind(manifold::raw::Key::slot(key))?,
+                self.messages.try_bind_mut(manifold::raw::Key::slot(key))?,
                 frame,
                 limit,
             )?;
@@ -298,7 +298,7 @@ where
     fn release(
         record: &mut call::State<'r, T, C>,
         data: &mut chunks::Pool<C, P>,
-        messages: &mut messages::Pool<C>,
+        messages: &mut pool::Lanes<message::Frame<C>>,
     ) -> Result<(), Error> {
         let index = manifold::raw::Key::slot(record.entry.key());
         if let Some(stream) = record.input_mut() {
@@ -306,13 +306,15 @@ where
                 .map_err(Error::Lane)?
                 .try_release(stream)
                 .map_err(Error::Chunks)?;
-            messages.try_bind(index).map_err(Error::Lane)?.clear();
+            messages.try_bind_mut(index).map_err(Error::Lane)?.clear();
         }
         Ok(())
     }
 
     pub(super) fn is_quiescent(&self) -> bool {
-        self.records.is_empty() && self.data.is_empty() && self.messages.is_empty()
+        self.records.is_empty()
+            && self.data.is_empty()
+            && self.messages.available() == self.messages.capacity()
     }
 
     pub(in crate::server) fn try_reserve(
@@ -349,7 +351,7 @@ where
             .map_err(Error::Lane)?
             .try_release(stream)
             .map_err(Error::Chunks)?;
-        let mut messages = self.messages.try_bind(index).map_err(Error::Lane)?;
+        let mut messages = self.messages.try_bind_mut(index).map_err(Error::Lane)?;
         let request = match mem::replace(&mut stream.request, input::Request::Finished) {
             input::Request::Live => Request::Live {
                 output,

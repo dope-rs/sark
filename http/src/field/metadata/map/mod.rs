@@ -136,15 +136,12 @@ impl Fields {
     }
 
     pub fn push_entry(&mut self, field: Entry<'_>) -> Result<(), Error> {
-        Space::new(
-            &mut self.bytes,
-            field.name.len(),
+        self.push_with(
+            field.name,
             field.value.len(),
             field.indexing,
-        )?
-        .generated(field.name, |writer| writer.write_slice(field.value))?
-        .commit();
-        Ok(())
+            |writer| writer.write_slice(field.value),
+        )
     }
 
     /// Publishes only a successful callback that writes exactly `vlen` bytes.

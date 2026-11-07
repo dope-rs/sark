@@ -141,14 +141,11 @@ impl<'d> handler::Application<'d, KeyTag<0>> for Observed<'_> {
         handler::Application::close_gate(Pin::new(&self.inner), conn)
     }
 
-    fn activate<'e, 'a, 'p, 's, 'w>(
+    fn activate<'e>(
         self: Pin<&mut Self>,
-        conn: conn::Ctx<'e, 'a, 'p, 's, 'w, 'd, KeyTag<0>, Self::Wire, Self::Conn, Self::Egress>,
+        conn: conn::Ctx<'e, '_, '_, '_, '_, 'd, KeyTag<0>, Self::Wire, Self::Conn, Self::Egress>,
         driver: &mut driver::Context<'_, 'd>,
-    ) -> conn::Ctx<'e, 'a, 'p, 's, 'w, 'd, KeyTag<0>, Self::Wire, Self::Conn, Self::Egress>
-    where
-        'd: 'w,
-    {
+    ) {
         handler::Application::activate(Pin::new(&mut self.get_mut().inner), conn, driver)
     }
 

@@ -108,21 +108,10 @@ fn owned_headers_are_unique() {
             let probe =
                 Probe::new(addr, config).with_headers(vec![("X-Dynamic".into(), "handler".into())]);
             let probe = probe.expect("headers");
-            let result = probe.omit(vec!["x-removed".into()]).open(
-                |result| {
-                    result
-                        .as_ref()
-                        .map_err(|cause| cause.cause())
-                        .expect("opening");
-                },
+            drop(probe.omit(vec!["x-removed".into()]).run(
+                common::client::Goal::Open,
                 recovery::Policy::new(|event| retired.push(event), common::recover),
-                |result| result.expect("WebSocket probe"),
-            );
-            result
-                .as_ref()
-                .map_err(|cause| cause.kind())
-                .expect("topology");
-            drop(result);
+            ));
         })
         .expect("handshake probe");
         let req = str::from_utf8(&req).expect("ASCII handshake request");

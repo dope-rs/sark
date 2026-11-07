@@ -307,7 +307,11 @@ impl<'payload, P: Peer> Control<'_, 'payload, P> {
             }
             Self::Pong(pending) => pending,
             Self::Required(need) => {
-                return need.commit_with(send).map(|event| match event {
+                let reply = need.reply();
+                send(Request { reply: &reply })?;
+                let event = need.kind;
+                need.inbound.settle();
+                return Ok(match event {
                     Event::Close(_) => ops::ControlFlow::Break(()),
                     Event::Ping(_) => ops::ControlFlow::Continue(()),
                 });
@@ -426,17 +430,6 @@ impl<'payload, P: Peer> Required<'_, 'payload, P> {
                 payload: data,
             },
         }
-    }
-
-    fn commit_with<E>(
-        self,
-        send: impl for<'reply> FnOnce(Request<'reply, 'payload>) -> Result<Receipt<'reply, 'payload>, E>,
-    ) -> Result<Event<'payload>, E> {
-        let reply = self.reply();
-        send(Request { reply: &reply })?;
-        let event = self.kind;
-        self.inbound.settle();
-        Ok(event)
     }
 
     /// Releases a complete mandatory frame for causal delivery.

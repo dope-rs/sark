@@ -1,9 +1,9 @@
 pub mod common;
 
-use std::{cell::Cell, net::Shutdown, ptr, rc::Rc, time::Instant};
+use std::{cell::Cell, net::Shutdown, rc::Rc, time::Instant};
 
 use common::{
-    app::{App, Event, Facts, PREFIX},
+    app::{App, Facts, PREFIX},
     session::handoffs,
 };
 use dope::{
@@ -16,11 +16,7 @@ use dope::{
     },
     manifold::{
         app::{Host, env::Bundle},
-        network::listener::{
-            Listener, config, conn,
-            conn::write::{self, body},
-            topology::Direct,
-        },
+        network::listener::{Listener, config, topology::Direct},
         timing::Throughput,
     },
     net::{tcp, wire::Identity},
@@ -35,13 +31,6 @@ use dope_test::{
     },
     reclaim,
 };
-use sark_h1::{
-    pump,
-    server::{conn::driver::Flow, date::Clock},
-    switch,
-    wire::head,
-};
-use sark_http::h1::switch::Kind;
 
 #[test]
 fn closes_and_retries() {
@@ -55,69 +44,8 @@ fn closes_and_retries() {
     ] {
         type Env = Bundle<tcp::Tcp, Identity, Throughput>;
         let facts = Facts::default();
-        let clock = Clock::new().expect("clock");
         let reason =
             b"HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_vec();
-        let checks = Cell::new([0; 7]);
-        let observe = |event: Event<'_>| {
-            assert!(
-                !matches!(event, Event::Rejected(_) | Event::Input(_)),
-                "unexpected rejection or input callback"
-            );
-            let index = match event {
-                Event::Progress(Flow::Continue, actual, closing) => {
-                    assert!(ptr::eq(actual.expect("deferred reason"), reason.as_slice()));
-                    assert_eq!(closing, early);
-                    0
-                }
-                Event::Progress(Flow::Closed, actual, closing) => {
-                    assert!(actual.is_none());
-                    assert!(closing);
-                    1
-                }
-                Event::Close(actual) => {
-                    assert!(actual.is_none());
-                    2
-                }
-                Event::Stopped => {
-                    assert!(facts.failure.get().is_some());
-                    3
-                }
-                Event::Charge(charge, previous) => {
-                    assert!(!charge.is_empty());
-                    assert!(previous.is_none());
-                    4
-                }
-                Event::Cancelled => {
-                    assert!(facts.failure.get().is_some());
-                    5
-                }
-                Event::Retired(failure, response) => {
-                    match facts.failure.get() {
-                        None => assert!(failure.is_none()),
-                        Some(expected) => {
-                            let Some(conn::Failure::Write(body::Failure::Bound {
-                                charge,
-                                maximum,
-                            })) = failure
-                            else {
-                                panic!("exact owner bound failure must reach final retirement");
-                            };
-                            assert_eq!(charge.bytes().get(), expected.logical_bytes);
-                            assert_eq!(charge.resident().get(), expected.resident_bytes);
-                            assert_eq!(*maximum, 0);
-                            assert_eq!(facts.rejected.get(), 1);
-                        }
-                    }
-                    assert_eq!(response, 0);
-                    6
-                }
-                Event::Rejected(_) | Event::Input(_) => return,
-            };
-            let mut counts = checks.get();
-            counts[index] += 1;
-            checks.set(counts);
-        };
         let setup = Direct::<KeyTag<0>, Env, _>::new(
             config::Prepared {
                 connections: Capacity::fixed::<2>(),
@@ -133,8 +61,6 @@ fn closes_and_retries() {
                 reason: &reason,
                 facts: &facts,
                 close_early: early,
-                clock: &clock,
-                observe: &observe,
             },
         );
         let prepared = topology::Plan::new((), setup)
@@ -225,7 +151,7 @@ fn closes_and_retries() {
         assert_eq!(facts.released.get(), 1);
         assert_eq!(facts.closed.hits(), 1);
         assert_eq!(
-            checks.get(),
+            facts.checks.each_ref().map(Cell::get),
             [
                 facts.deferred.get(),
                 facts.committed.get(),
@@ -252,70 +178,7 @@ fn switch_moves_tail_once() {
     let closed = Gate::new();
     let raw = Rc::new(Cell::new(Vec::new()));
     let owner = Rc::new(Cell::new(None));
-    let checks = Cell::new([0; 9]);
-    let observe = |event: handoffs::Event<'_, '_>| {
-        assert!(
-            !matches!(event, handoffs::Event::Preflight(_)),
-            "unexpected preflight failure"
-        );
-        let index = match event {
-            handoffs::Event::Switch(mode, input) => {
-                assert_eq!(mode, switch::Mode::Raw(Kind::Connect));
-                assert!(input.is_none(), "affine tail stayed out of HTTP input");
-                0
-            }
-            handoffs::Event::Raw(staged) => {
-                assert!(staged.is_ok(), "drain must commit the raw owner");
-                1
-            }
-            handoffs::Event::Owner(actual) => {
-                assert_eq!(actual, 7);
-                2
-            }
-            handoffs::Event::Cycle(cycle) => {
-                assert!(matches!(cycle.connection, head::Connection::KeepAlive));
-                assert!(
-                    matches!(&cycle.state, Ok(pump::Egress::Static { .. })),
-                    "switch must publish its exact static response owner"
-                );
-                3
-            }
-            handoffs::Event::Commit(commit) => {
-                let Ok(write::Outcome::Committed(receipt)) = commit else {
-                    panic!("switching response must commit exactly once");
-                };
-                assert!(
-                    receipt.state.is_ok(),
-                    "switch response committed its protocol state"
-                );
-                assert!(
-                    matches!(&receipt.tail, pump::Tail::Handoff { .. }),
-                    "switching response must carry its exact suffix"
-                );
-                4
-            }
-            handoffs::Event::Retained(tail) => {
-                assert!(tail.is_ok(), "retain tail: {:?}", tail.as_ref().err());
-                5
-            }
-            handoffs::Event::Restricted(result) => {
-                assert!(result.is_ok(), "restrict tail: {result:?}");
-                6
-            }
-            handoffs::Event::Staged(staged) => {
-                assert!(staged.is_ok(), "raw owner must remain staged until drain");
-                7
-            }
-            handoffs::Event::Replaced(previous) => {
-                assert!(previous.is_none(), "one affine switch tail");
-                8
-            }
-            handoffs::Event::Preflight(_) => return,
-        };
-        let mut counts = checks.get();
-        counts[index] += 1;
-        checks.set(counts);
-    };
+    let checks: [Cell<usize>; 9] = Default::default();
 
     let send_buf = (option::Buffer::try_from(1024)).expect("socket send buffer");
     let config = config::Prepared {
@@ -340,7 +203,7 @@ fn switch_moves_tail_once() {
             closed: closed.clone(),
             raw: raw.clone(),
             owner: owner.clone(),
-            observe: &observe,
+            checks: &checks,
         },
     );
     let prepared = topology::Plan::new((), setup)
@@ -443,7 +306,7 @@ fn switch_moves_tail_once() {
         limited,
         staged,
         replaced,
-    ] = checks.get();
+    ] = checks.each_ref().map(Cell::get);
     assert!(received > 0);
     assert_eq!(
         [

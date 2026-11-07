@@ -90,13 +90,17 @@ impl Retain<'_> {
             definition: quote::quote! {
                 impl<'d> #ns_core::route::TaskBuild<'d> for #builder<'d> {
                     type Task = #request<'d>;
-                    type StepError = #error;
 
                     fn reject(#v_err: Self::StepError) -> #ns_core::route::Reject {
                         #reject
                     }
+                }
 
-                    fn finish_body(mut self, #v_len: ::core::primitive::usize) -> Self {
+                impl<'d> #ns_core::body::Build<'d> for #builder<'d> {
+                    type Output = #ns_core::route::Built<'d, #request<'d>>;
+                    type StepError = #error;
+
+                    fn finish_input(mut self, #v_len: ::core::primitive::usize) -> Self {
                         self.body_len = #v_len;
                         self.input_finished = true;
                         self
@@ -106,18 +110,6 @@ impl Retain<'_> {
                 }
 
                 impl<'d> #ns_core::route::Push<'d> for #builder<'d> {
-                    type Error = (
-                        #ns_http::payload::owned::Segment<'d>,
-                        #ns_http::payload::owned::flatten::Error,
-                    );
-
-                    fn observe<C: ::core::marker::Copy, S: ::core::marker::Copy, O: #ns_core::life::Observer<C, S>>(
-                        #v_err: &Self::Error,
-                        #v_obs: &mut O,
-                    ) {
-                        #v_obs.diagnostic(&#v_err.1);
-                    }
-
                     fn reject_push(#v_err: Self::Error) -> #ns_core::route::Reject {
                         use #ns_core::route::Reject;
                         use #ns_http::o3::{alloc, buffer::segments::assembly};
@@ -146,8 +138,22 @@ impl Retain<'_> {
                             | assembly::Error::Total(_) => Reject::Internal,
                         }
                     }
+                }
 
-                    fn push_body(
+                impl<'d> #ns_core::body::Push<'d> for #builder<'d> {
+                    type Error = (
+                        #ns_http::payload::owned::Segment<'d>,
+                        #ns_http::payload::owned::flatten::Error,
+                    );
+
+                    fn observe<C: ::core::marker::Copy, S: ::core::marker::Copy, O: #ns_core::life::Observer<C, S>>(
+                        #v_err: &Self::Error,
+                        #v_obs: &mut O,
+                    ) {
+                        #v_obs.diagnostic(&#v_err.1);
+                    }
+
+                    fn push(
                         mut self,
                         #v_seg: #ns_http::payload::owned::Segment<'d>,
                     ) -> #ns_core::body::Transfer<Self, Self::Error> {
@@ -229,7 +235,7 @@ impl Retain<'_> {
                 #v_budget: ::core::num::NonZero<::core::primitive::usize>,
             ) -> #ns_core::body::Step<
                 Self,
-                #ns_core::route::Built<'d, Self::Task>,
+                Self::Output,
                 Self::StepError,
             > {
                 let #v_credit = #ns_core::body::credit::Amount::new(

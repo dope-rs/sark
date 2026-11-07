@@ -45,7 +45,7 @@ pub fn duplicate(address: SocketAddr) -> io::Result<OwnedFd> {
     let mut directory =
         Dir::<Backend>::open::<Errno>(c"/proc/self/fd").expect("process descriptors");
     let (_, mut entries) = directory.entries();
-    while let Some(entry) = entries.try_next::<Errno>().expect("descriptor entry") {
+    while let Some(entry) = entries.try_next().expect("descriptor entry") {
         let Some(number) = entry
             .name
             .to_str()

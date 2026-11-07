@@ -18,10 +18,11 @@ where
     E: event::Evidence,
 {
     pub(crate) fn from_runtime_seed(
-        config: config::Validated<crate::ServerRole>,
+        config: &config::Validated<crate::ServerRole>,
         seed: hash::Seed,
+        preface: ingress::PrefacePhase,
     ) -> Result<Self, conn::Build> {
-        let mut connection = Self::from_seed(config, seed)?;
+        let mut connection = Self::from_seed_phase(config, seed, preface)?;
         connection.state.lifecycle.queue_events();
         Ok(connection)
     }
@@ -61,6 +62,14 @@ where
 {
     /// Builds from admitted geometry and an owning hash seed without acquiring entropy.
     pub fn from_seed(config: config::Validated<R>, seed: hash::Seed) -> Result<Self, conn::Build> {
+        Self::from_seed_phase(&config, seed, ingress::PrefacePhase::for_role::<R>())
+    }
+
+    fn from_seed_phase(
+        config: &config::Validated<R>,
+        seed: hash::Seed,
+        preface: ingress::PrefacePhase,
+    ) -> Result<Self, conn::Build> {
         use conn::Build;
 
         let config::Validated {
@@ -71,7 +80,7 @@ where
             hpack,
             buffers,
             marker: _,
-        } = config;
+        } = *config;
         let streams = Registry::try_new(streams).map_err(Build::Streams)?;
         Ok(Self {
             ingress: ingress::Ingress::try_new(Config {
@@ -84,7 +93,7 @@ where
                     cap: buffers.inbound_header_list_cap,
                     connect: local.enable_connect_protocol,
                 },
-                preface: ingress::PrefacePhase::for_role::<R>(),
+                preface,
             })
             .map_err(Build::Ingress)?,
             egress: outputs::Egress::try_new::<R>(

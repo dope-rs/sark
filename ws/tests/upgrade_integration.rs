@@ -37,21 +37,10 @@ fn interim_upgrade() {
         .with(|| {
             let config = client::Config::new("127.0.0.1", "/ws");
             let config = config.expect("endpoint");
-            let result = Probe::new(addr, config).message(
-                |result| {
-                    result
-                        .as_ref()
-                        .map_err(|cause| cause.cause())
-                        .expect("opening");
-                },
+            let seen = Probe::new(addr, config).run(
+                common::client::Goal::Message,
                 recovery::Policy::new(|event| retired.push(event), common::recover),
-                |result| result.expect("WebSocket probe"),
             );
-            result
-                .as_ref()
-                .map_err(|cause| cause.kind())
-                .expect("topology");
-            let seen = result.ok().expect("checked topology");
             assert!(seen.is_open());
             assert_eq!(seen.reply(), Some("pong"));
         })
@@ -82,15 +71,10 @@ fn bad_accept_blocks_frame() {
         .with(|| {
             let config = client::Config::new("127.0.0.1", "/ws");
             let config = config.expect("endpoint");
-            let result = Probe::new(addr, config).close(
+            let seen = Probe::new(addr, config).run(
+                common::client::Goal::Close,
                 recovery::Policy::new(|event| retired.push(event), common::recover),
-                |result| result.expect("WebSocket probe"),
             );
-            result
-                .as_ref()
-                .map_err(|cause| cause.kind())
-                .expect("topology");
-            let seen = result.ok().expect("checked topology");
             assert!(!seen.is_open());
             assert_eq!(seen.reply(), None);
             assert!(matches!(seen.close(), Some(client::CloseReason::Protocol)));
@@ -127,15 +111,10 @@ fn bad_field_blocks_open() {
         .with(|| {
             let config = client::Config::new("127.0.0.1", "/ws");
             let config = config.expect("endpoint");
-            let result = Probe::new(addr, config).close(
+            let seen = Probe::new(addr, config).run(
+                common::client::Goal::Close,
                 recovery::Policy::new(|event| retired.push(event), common::recover),
-                |result| result.expect("WebSocket probe"),
             );
-            result
-                .as_ref()
-                .map_err(|cause| cause.kind())
-                .expect("topology");
-            let seen = result.ok().expect("checked topology");
             assert!(matches!(
                 seen.close(),
                 Some(client::CloseReason::Decode(client::Fault::Open(_)))
@@ -170,24 +149,21 @@ fn interim_cumulative_limit() {
         assert_eq!(stream.read(&mut [0; 1]).expect("rejected opening"), 0);
     })
     .with(|| {
-        let result = Probe::new(
+        let seen = Probe::new(
             addr,
             client::Config::new("localhost", "/").expect("endpoint"),
         )
-        .close(recovery::Policy::new(|_| {}, common::recover), |result| {
-            let seen = result.expect("WebSocket probe");
-            assert!(matches!(
-                seen.close(),
-                Some(client::CloseReason::Decode(client::Fault::Open(
-                    response::Error::Head(ParseError::Boundary(Boundary::TooLarge { .. }))
-                )))
-            ));
-            assert!(!seen.is_open());
-        });
-        result
-            .as_ref()
-            .map_err(|cause| cause.kind())
-            .expect("topology");
+        .run(
+            common::client::Goal::Close,
+            recovery::Policy::new(|_| {}, common::recover),
+        );
+        assert!(matches!(
+            seen.close(),
+            Some(client::CloseReason::Decode(client::Fault::Open(
+                response::Error::Head(ParseError::Boundary(Boundary::TooLarge { .. }))
+            )))
+        ));
+        assert!(!seen.is_open());
     })
     .expect("interim peer");
 }

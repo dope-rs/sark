@@ -4,7 +4,7 @@ use o3::{
         array::Index,
         queue::indexed::lanes::{
             Table,
-            entry::{Slot, Withdrawn},
+            entry::{self, Withdrawn},
         },
     },
 };
@@ -209,7 +209,7 @@ pub(super) enum Effect {
 
 pub(super) fn control<K, T, D>(
     driver: &mut D,
-    current: Slot<'_, K, T, LANES>,
+    current: entry::Occupied<'_, K, T, LANES>,
     run: impl FnOnce(&mut D, K, T) -> Control<T, D::Block, D::Error>,
 ) -> TurnOutcome<K>
 where
@@ -238,7 +238,7 @@ where
 
 fn data<K, T, D>(
     driver: &mut D,
-    mut current: Slot<'_, K, T, LANES>,
+    mut current: entry::Occupied<'_, K, T, LANES>,
     permit: D::Permit,
 ) -> TurnOutcome<K>
 where
@@ -263,7 +263,7 @@ where
 
 pub(super) fn borrowed<K, T, D>(
     driver: &mut D,
-    current: Slot<'_, K, T, LANES>,
+    current: entry::Occupied<'_, K, T, LANES>,
     stream: K,
     step: Step<D::Block>,
     activity: WorkClass,
@@ -328,7 +328,7 @@ where
 
 pub(super) fn finish<K, T, D>(
     driver: &mut D,
-    current: Slot<'_, K, T, LANES>,
+    current: entry::Occupied<'_, K, T, LANES>,
     stream: K,
     terminal: Terminal<D::Error>,
     activity: WorkClass,

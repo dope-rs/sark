@@ -122,6 +122,14 @@ impl Input for [u8] {
     }
 }
 
+pub fn parse_i64(input: &[u8], index: &mut usize) -> crate::Result<i64> {
+    let first = *input.get(*index).ok_or(Error::Invalid)?;
+    let (kind, next) = atom_with::<true>(input, *index, first, None)?;
+    let value = kind.i64()?;
+    *index = next;
+    Ok(value)
+}
+
 #[derive(Clone, Copy)]
 pub(crate) struct Content<'a>(&'a [u8]);
 
@@ -266,6 +274,7 @@ fn value_with(
     }
 }
 
+#[inline(always)]
 fn atom_with<const INTEGER: bool>(
     input: &[u8],
     index: usize,

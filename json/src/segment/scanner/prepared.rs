@@ -18,7 +18,7 @@ pub(in crate::segment) struct Prepared<'d> {
 impl<'d> Prepared<'d> {
     pub(in crate::segment) fn new(scan: Scanning<'d>) -> Self {
         Self {
-            document: Document::new(scan.scan.input, scan.scan.selection.values),
+            document: Document::new(scan.input, scan.selection.values),
             plan: Plan::Fields { index: 0 },
             stream: scan.stream,
             sweep: false,

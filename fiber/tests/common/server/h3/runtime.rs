@@ -1,5 +1,5 @@
 use core::mem;
-use std::{net, rc::Rc};
+use std::rc::Rc;
 
 use dope::{
     core::driver::{
@@ -11,7 +11,7 @@ use dope::{
 };
 use dope_quic::{
     errors::Code,
-    runtime::{endpoint, endpoint::client},
+    runtime::{endpoint, endpoint::client, receive, routing},
 };
 use sark_h3::{frame, manifold::server::startup::Plan};
 
@@ -234,15 +234,15 @@ where
     }
 }
 
-pub(crate) struct RunPlan<'a> {
-    pub(crate) plan: Plan<LISTENER>,
+pub(crate) struct RunPlan<'a, Q: routing::LocalRoute, P> {
+    pub(crate) plan: Plan<LISTENER, receive::Retained, Q>,
     pub(crate) proof: Rc<Shared<'a>>,
     pub(crate) client: client::Plan<DIALER>,
-    pub(crate) reservation: net::UdpSocket,
+    pub(crate) reservation: P,
     pub(crate) task_capacity: slots::Slots,
 }
 
-impl settings::Resource for RunPlan<'_> {
+impl<Q: routing::LocalRoute, P> settings::Resource for RunPlan<'_, Q, P> {
     fn include_in(&self, needs: claim::Needs) -> Result<claim::Needs, errors::Claim> {
         let needs = self.plan.include_in(needs)?;
         let needs = self.client.as_ref().include_in(needs)?;

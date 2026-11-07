@@ -508,7 +508,7 @@ impl Handler {
                     pub(super) fn step<'d, State>((#v_id, #v_task): (#ns_http::request::Id<'d>, #builder))
                         -> #admitted where #name: #ns_core::route::Task<'d, State>
                     {
-                        match #ns_core::route::TaskBuild::step(#v_task, #ns_core::body::DEFAULT_BUILD_STEP_BUDGET) {
+                        match #ns_core::body::Build::step(#v_task, #ns_core::body::DEFAULT_BUILD_STEP_BUDGET) {
                             #ns_core::body::Step::Ready { output: #v_output, released: #v_credit } => {
                                 #released
                                 ::core::result::Result::Ok(::core::ops::ControlFlow::Break(#v_output))

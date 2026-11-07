@@ -5,7 +5,7 @@ use o3::{
     mem::Rejected,
 };
 use scan::{Progress, line};
-use write::{CopyError, SourceExt as _};
+use write::CopyError;
 
 use crate::h1::head::{
     Limit, ParseError, field,
@@ -95,7 +95,7 @@ impl<S: buffer::raw::Source> State<S> {
     where
         D: buffer::raw::Source + write::Sink,
     {
-        let target = target.try_copy(self.source.as_ref())?;
+        let target = write::try_copy(target, self.source.as_ref())?;
         Ok(State {
             source: target,
             inner: self.inner.clone(),

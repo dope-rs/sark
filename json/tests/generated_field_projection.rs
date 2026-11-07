@@ -1,18 +1,52 @@
 pub mod common;
 
+use std::num::NonZero;
+
 use common::{
+    Bytes as _,
     members::OwnedItem,
     nested::Node,
     schema::{
         FIELD_VALUES, MISSING_FIELDS, NON_STRING_FIELDS, NULL_CHILDREN, NULL_FLAG, RenamedSequence,
-        Scalars,
+        SIGNED_INVALID, SIGNED_VALUES, Scalars, Signed,
     },
 };
 use o3::buffer::storage::Shared;
 use sark_json::{
     Error,
     parsing::{self, Decode, Request},
+    segment::{Decoder, Progress},
 };
+
+#[test]
+fn signed_fields() {
+    for (input, expected) in SIGNED_VALUES {
+        let value = <Signed as Request>::decode(input).expect("signed request");
+        assert_eq!((value.price, value.quantity), expected);
+        let mut decoder =
+            Decoder::<Signed>::new(input.try_segments().expect("segments")).expect("decoder");
+        assert!(matches!(
+            decoder.poll(NonZero::<usize>::MAX),
+            Progress::Ready(value) if (value.price, value.quantity) == expected,
+        ));
+    }
+    for input in SIGNED_INVALID {
+        assert!(matches!(
+            <Signed as Request>::decode(input),
+            Err(parsing::Error::Parse(Error::Invalid)),
+        ));
+        let mut decoder =
+            Decoder::<Signed>::new(input.try_segments().expect("segments")).expect("decoder");
+        let error = loop {
+            match decoder.poll(NonZero::<usize>::MAX) {
+                Progress::Pending => {}
+                Progress::Failed(error) => break error,
+                _ => panic!("invalid signed value"),
+            }
+        };
+        assert!(matches!(error, parsing::Error::Parse(Error::Invalid)));
+    }
+}
 
 #[test]
 fn field_null_presence() {

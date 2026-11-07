@@ -13,7 +13,6 @@ pub(super) fn expr(
     let ns_json = &paths.json;
     let [v_raw, v_idx, v_depth] = ["__raw", "__idx", "__depth"].map(tokens::local);
     let [v_value, v_end, v_vec] = ["__value", "__end", "__v"].map(tokens::local);
-    let v_slot = tokens::local("__slot");
     if mode.seq {
         let elem = types::View::new(ty)
             .vector()
@@ -83,9 +82,8 @@ pub(super) fn expr(
             {
                 loop {
                     #ns_json::input::Input::ws(#v_raw, &mut #v_idx);
-                    let #v_slot = #ns_json::o3::alloc::Vacant::try_new(&mut #v_vec)
-                        .map_err(#ns_json::Error::Allocation)?;
-                    #v_slot.insert(#value);
+                    #ns_json::o3::alloc::try_vacant(&mut #v_vec)
+                        .map_err(#ns_json::Error::Allocation)?(#value);
                     #ns_json::input::Input::ws(#v_raw, &mut #v_idx);
                     if #ns_json::input::Input::take_byte(#v_raw, &mut #v_idx, b',')
                         == #ns_json::input::Taken::Yes
@@ -115,7 +113,10 @@ pub(super) fn expr(
         scalar::Scalar::U64 => {
             quote::quote!(#ns_json::input::Input::parse_u64(#v_raw, &mut #v_idx)?)
         }
-        scalar::Scalar::I64 | scalar::Scalar::F64 | scalar::Scalar::String => {
+        scalar::Scalar::I64 => {
+            quote::quote!(#ns_json::input::parse_i64(#v_raw, &mut #v_idx)?)
+        }
+        scalar::Scalar::F64 | scalar::Scalar::String => {
             return Err(syn::Error::new_spanned(
                 ty,
                 "this JSON field type requires an encoding-only mode",

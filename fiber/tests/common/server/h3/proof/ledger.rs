@@ -3,7 +3,7 @@ use std::collections::BTreeMap;
 use dope_quic::wire::stream::Id;
 use o3::buffer::{hold, segments};
 use sark_core::life::{Event, Outcome, audit};
-use sark_http::owner::{Change, cause};
+use sark_http::owner::Change;
 
 use crate::common::server::h3::proof::{ConnKey, Endpoint, Metric, charge};
 
@@ -155,17 +155,13 @@ impl Entry {
                     .map_err(Error::Charge)?;
             }
             Event::ResponseOwnership(effect) => match effect.change() {
-                Change::StagingAcquired(acquired) => match acquired {
-                    cause::Acquire::Committed
-                    | cause::Acquire::Split
-                    | cause::Acquire::StreamChunk => {
-                        ledger.response.staging = ledger
-                            .response
-                            .staging
-                            .try_add(effect.charge())
-                            .map_err(Error::Charge)?
-                    }
-                },
+                Change::StagingAcquired(_) => {
+                    ledger.response.staging = ledger
+                        .response
+                        .staging
+                        .try_add(effect.charge())
+                        .map_err(Error::Charge)?
+                }
                 Change::Handoff => {
                     charge::remove(&mut ledger.response.staging, effect.charge())?;
                     ledger.response.transport = ledger
@@ -179,25 +175,12 @@ impl Entry {
                         .try_add(effect.charge())
                         .map_err(Error::Charge)?;
                 }
-                Change::StagingReleased(released) => match released {
-                    cause::Staging::TransportAccepted
-                    | cause::Staging::Buffered
-                    | cause::Staging::Reset
-                    | cause::Staging::Closed
-                    | cause::Staging::PeerRetired => {
-                        charge::remove(&mut ledger.response.staging, effect.charge())?
-                    }
-                },
-                Change::TransportReleased(released) => match released {
-                    cause::Transport::Sent
-                    | cause::Transport::Acked
-                    | cause::Transport::Stopped
-                    | cause::Transport::Reset
-                    | cause::Transport::Closed
-                    | cause::Transport::PeerRetired => {
-                        charge::remove(&mut ledger.response.transport, effect.charge())?
-                    }
-                },
+                Change::StagingReleased(_) => {
+                    charge::remove(&mut ledger.response.staging, effect.charge())?
+                }
+                Change::TransportReleased(_) => {
+                    charge::remove(&mut ledger.response.transport, effect.charge())?
+                }
             },
             Event::ResponseBodyCopied { written, .. } => {
                 let copied = &mut ledger.response.materialized;

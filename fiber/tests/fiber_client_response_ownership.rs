@@ -184,13 +184,19 @@ fn retained_keeps_backing() {
                         );
                         let retained = scoped.try_retain().expect("retain response");
                         assert_eq!(
-                            retained.body().segment(0).expect("retained first").as_ptr(),
+                            retained
+                                .body()
+                                .segments()
+                                .nth(0)
+                                .expect("retained first")
+                                .as_ptr(),
                             backing[0]
                         );
                         assert_eq!(
                             retained
                                 .body()
-                                .segment(1)
+                                .segments()
+                                .nth(1)
                                 .expect("retained second")
                                 .as_ptr(),
                             backing[1]
@@ -322,7 +328,8 @@ fn check_keep(response: reply::Retained) {
     assert!(
         response
             .body()
-            .segment(0)
+            .segments()
+            .nth(0)
             .expect("first segment")
             .iter()
             .all(|byte| *byte == b'a')
@@ -330,7 +337,8 @@ fn check_keep(response: reply::Retained) {
     assert!(
         response
             .body()
-            .segment(1)
+            .segments()
+            .nth(1)
             .expect("second segment")
             .iter()
             .all(|byte| *byte == b'b')

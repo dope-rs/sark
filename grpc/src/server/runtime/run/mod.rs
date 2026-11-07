@@ -148,11 +148,11 @@ where
 
     /// Cancels every task before releasing any retained call payload.
     fn close(&mut self, state: &mut Self::State, conn: &mut C, owner: O) {
-        for index in 0..state.state.calls.capacity() {
-            let Some(stream) = state.state.calls.key_at(index) else {
+        for index in 0..state.calls.capacity() {
+            let Some(stream) = state.calls.key_at(index) else {
                 continue;
             };
-            let Some(record) = state.state.calls.get_mut(stream) else {
+            let Some(record) = state.calls.get_mut(stream) else {
                 continue;
             };
             let entry = record.entry;
@@ -160,13 +160,13 @@ where
                 self.exec.cancel(owner, entry, call);
             }
             if let Some(times) =
-                <X::Timer as state::Timing<'d>>::timers(&mut state.state.output_deadlines)
+                <X::Timer as state::Timing<'d>>::timers(&mut state.output_deadlines)
             {
                 times.cancel(entry);
             }
         }
         state.active.get().clear();
-        state.state.retire(conn);
+        state.retire(conn);
         match <X::Timer as state::Timing<'d>>::activity(state) {
             schedule::Quiescence::Busy => conn.fail(),
             schedule::Quiescence::Quiet => {}
@@ -185,9 +185,9 @@ where
                         || field.value.starts_with(b"application/grpc+"))
             }),
             server::Event::Head { message, .. } | server::Event::Data { message, .. } => {
-                state.state.calls.entry(message.key()).is_some()
+                state.calls.entry(message.key()).is_some()
             }
-            server::Event::Reset { stream, .. } => state.state.calls.entry(*stream).is_some(),
+            server::Event::Reset { stream, .. } => state.calls.entry(*stream).is_some(),
             server::Event::Control | server::Event::Established | server::Event::Retired(_) => {
                 false
             }
@@ -195,11 +195,11 @@ where
     }
 
     fn wake(state: &mut Self::State, wake: schedule::Wake<Key>) -> bool {
-        state.state.calls.wake(wake) != 0
+        state.calls.wake(wake) != 0
     }
 
     fn released(state: &mut Self::State) {
-        state.state.egress_released = true;
+        state.egress_released = true;
     }
 
     fn activity(state: &Self::State) -> schedule::Quiescence {
@@ -220,8 +220,8 @@ where
     X::Timer: drive::Mode<'d>,
 {
     fn deadline(&self, state: &Self::State) -> Option<clock::Deadline<'d>> {
-        let call = state.state.deadline();
-        let output = <X::Timer as state::Timing<'d>>::deadline(&state.state.output_deadlines);
+        let call = state.deadline();
+        let output = <X::Timer as state::Timing<'d>>::deadline(&state.output_deadlines);
         match (call, output) {
             (Some(left), Some(right)) => Some(left.min(right)),
             (left, right) => left.or(right),

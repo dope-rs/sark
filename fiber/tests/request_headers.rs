@@ -15,7 +15,7 @@ use sark_h1::{
 };
 use sark_http::{
     field::{
-        head::MAX_HEADER_LINE_BYTES,
+        head::{AcceptEncoding, MAX_HEADER_LINE_BYTES},
         metadata::{map::record, section::storage},
     },
     h1::{
@@ -35,30 +35,45 @@ use crate::common::route::glue::{
 
 #[test]
 fn defaults_header() {
-    let wire = fields::EMPTY;
-    let source = parsing::Head::parse(Input::Borrowed(wire), u8::MAX)
-        .expect("request line syntax")
-        .expect("complete request line");
-    let block = head::Block::<HdrReqHeadersRaw>::parse::<HdrReq>(
-        wire,
-        source.request().end(),
-        16,
-        Coding::Plain,
-        source.request().version(),
-    )
-    .ok()
-    .expect("header block syntax")
-    .expect("complete absent-header block");
-    let span = source.request().target_span();
-    let target = Target::from_span(Form::Path, span).expect("request path target");
-    let owner = Head::bind(wire.as_slice(), Layout::new(target, None, Some(span)))
-        .expect("request head layout");
-    // SAFETY: HdrReq parsed these headers from this exact retained input;
-    // its generated parameter schema is the empty tuple.
-    let request = unsafe { raw::Parsed::<_, HdrReq>::new(owner, (), block.into_headers()) };
-    let parsed = <HdrReq as Project>::from_headers(&request)
-        .expect("absent header field falls back to default");
-    assert_eq!(parsed.captured(), fields::DEFAULT);
+    for (wire, value) in fields::ENCODINGS {
+        let expected = value.map(|raw| AcceptEncoding::try_parse(raw).expect("owner admission"));
+        let source = parsing::Head::parse(Input::Borrowed(wire), u8::MAX)
+            .expect("request line syntax")
+            .expect("complete request line");
+        let block = head::Block::<HdrReqHeadersRaw>::parse::<HdrReq>(
+            wire,
+            source.request().end(),
+            16,
+            Coding::Plain,
+            source.request().version(),
+        )
+        .ok()
+        .expect("header block syntax")
+        .expect("complete absent-header block");
+        assert_eq!(
+            block.coding() == Coding::Gzip,
+            expected.is_some_and(|value| value.gzip() != 0),
+        );
+        let span = source.request().target_span();
+        let target = Target::from_span(Form::Path, span).expect("request path target");
+        let owner =
+            Head::bind(wire, Layout::new(target, None, Some(span))).expect("request head layout");
+        // SAFETY: HdrReq parsed these headers from this exact retained input;
+        // its generated parameter schema is the empty tuple.
+        let request = unsafe { raw::Parsed::<_, HdrReq>::new(owner, (), block.into_headers()) };
+        let parsed = <HdrReq as Project>::from_headers(&request)
+            .expect("absent header field falls back to default");
+        let (token, encoding) = parsed.captured();
+        assert_eq!(token, fields::DEFAULT);
+        assert_eq!(encoding, expected);
+    }
+    assert!(matches!(
+        Wire::new(fields::BAD_ENCODING).try_request::<HdrReq>(16),
+        Err(Failure::Head(head::Error::Line(Error::Field {
+            cause: sark_http::field::head::Error::Value,
+            ..
+        })))
+    ));
 }
 
 #[test]

@@ -8,6 +8,7 @@ use crate::{
     client::{
         call::{self, bidi, request, response, unary},
         manifold::{channel, error, ops::cancels},
+        receive,
     },
     metadata,
 };
@@ -80,10 +81,15 @@ impl<'a, 'd, ID: Identity> Sender<'a, 'd, ID> {
     ) -> Result<Option<cancels::Registered<unary::Handle<'d, stream::Key>>>, error::Error> {
         let conn = self.conn;
         let result = self.source.with(|state, done| -> Result<_, error::Error> {
-            Ok(state
-                .active_mut(conn)?
-                .session
-                .try_unary(path, host, metadata, codec, message, done))
+            let session = &mut state.active_mut(conn)?.session;
+            Ok(session
+                .state
+                .start_single::<receive::UnaryKey, _, _>(path, host, metadata, codec, message, done)
+                .map(|started| unary::Handle {
+                    brand: session.brand,
+                    stream: started.stream,
+                    completion: started.completion,
+                }))
         })?;
         let result = self.admit(result)?;
         Ok(result.map(|value| {
@@ -106,10 +112,17 @@ impl<'a, 'd, ID: Identity> Sender<'a, 'd, ID> {
     ) -> Result<Option<cancels::Registered<response::Stream<'d, stream::Key>>>, error::Error> {
         let conn = self.conn;
         let result = self.source.with(|state, done| -> Result<_, error::Error> {
-            Ok(state
-                .active_mut(conn)?
-                .session
-                .try_response(path, host, metadata, codec, message, done))
+            let session = &mut state.active_mut(conn)?.session;
+            Ok(session
+                .state
+                .start_single::<receive::StreamKey, _, _>(
+                    path, host, metadata, codec, message, done,
+                )
+                .map(|started| response::Stream {
+                    brand: session.brand,
+                    stream: started.stream,
+                    completion: started.completion,
+                }))
         })?;
         let result = self.admit(result)?;
         Ok(result.map(|value| {
@@ -174,10 +187,12 @@ impl<'a, 'd, ID: Identity> Sender<'a, 'd, ID> {
     ) -> Result<Outcome, error::Error> {
         let conn = self.conn;
         let result = self.source.with(|state, done| -> Result<_, error::Error> {
-            Ok(state
-                .active_mut(conn)?
-                .session
-                .try_request(stream, codec, message, done))
+            Ok(state.active_mut(conn)?.session.state.send(
+                stream.response.stream,
+                codec,
+                message,
+                done,
+            ))
         })?;
         self.sent(result)
     }
@@ -192,8 +207,9 @@ impl<'a, 'd, ID: Identity> Sender<'a, 'd, ID> {
                 state
                     .active_mut(conn)?
                     .session
-                    .finish_request(stream, done)
-                    .map_err(error::Error::from)
+                    .state
+                    .finish(stream.response.stream, done)?;
+                Ok(stream.response)
             })
         });
         self.wake();
@@ -208,10 +224,12 @@ impl<'a, 'd, ID: Identity> Sender<'a, 'd, ID> {
     ) -> Result<Outcome, error::Error> {
         let conn = self.conn;
         let result = self.source.with(|state, done| -> Result<_, error::Error> {
-            Ok(state
-                .active_mut(conn)?
-                .session
-                .try_bidi(stream, codec, message, done))
+            Ok(state.active_mut(conn)?.session.state.send(
+                stream.response.stream,
+                codec,
+                message,
+                done,
+            ))
         })?;
         self.sent(result)
     }
@@ -226,8 +244,9 @@ impl<'a, 'd, ID: Identity> Sender<'a, 'd, ID> {
                 state
                     .active_mut(conn)?
                     .session
-                    .finish_bidi(stream, done)
-                    .map_err(error::Error::from)
+                    .state
+                    .finish(stream.response.stream, done)?;
+                Ok(stream.response)
             })
         });
         self.wake();
@@ -245,7 +264,8 @@ impl<'a, 'd, ID: Identity> Sender<'a, 'd, ID> {
             Ok(state
                 .active_mut(conn)?
                 .session
-                .try_send_half(send, codec, message, done))
+                .state
+                .send(send.stream, codec, message, done))
         })?;
         self.sent(result)
     }
@@ -260,7 +280,8 @@ impl<'a, 'd, ID: Identity> Sender<'a, 'd, ID> {
                 state
                     .active_mut(conn)?
                     .session
-                    .finish_send(send, done)
+                    .state
+                    .finish(send.stream, done)
                     .map_err(error::Error::from)
             })
         });

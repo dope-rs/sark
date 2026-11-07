@@ -1,7 +1,6 @@
 use std::{cell, marker};
 
-use lanes::entry;
-use o3::depot::{map::direct, queue::indexed::lanes};
+use o3::depot::queue::indexed::lanes::entry;
 
 use crate::manifold::{
     self,
@@ -10,14 +9,12 @@ use crate::manifold::{
 
 #[must_use]
 pub struct Vacant<'a, K: manifold::raw::Key, T, B: Block> {
-    slot: entry::Slot<'a, K, T, LANES, direct::Vacant<'a, K, lanes::Node<T, LANES>>>,
+    slot: entry::Vacancy<'a, K, T, LANES>,
     block: marker::PhantomData<cell::Cell<B>>,
 }
 
 impl<'a, K: manifold::raw::Key, T, B: Block> Vacant<'a, K, T, B> {
-    pub(super) const fn new(
-        slot: entry::Slot<'a, K, T, LANES, direct::Vacant<'a, K, lanes::Node<T, LANES>>>,
-    ) -> Self {
+    pub(super) const fn new(slot: entry::Vacancy<'a, K, T, LANES>) -> Self {
         Self {
             slot,
             block: marker::PhantomData,

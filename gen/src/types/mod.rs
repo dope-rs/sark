@@ -16,6 +16,7 @@ pub(super) enum ValueKind {
     Usize,
     U64,
     Bool,
+    Encoding,
 }
 
 #[derive(Clone, Copy)]
@@ -109,7 +110,7 @@ impl<'a> View<'a> {
             ValueKind::Bytes => {
                 syn::parse_quote! { ::core::option::Option<#ns_http::request::span::Span> }
             }
-            ValueKind::Usize | ValueKind::U64 | ValueKind::Bool => {
+            _ => {
                 if self.is_optional() {
                     self.ty.clone()
                 } else {
@@ -134,9 +135,12 @@ impl<'a> View<'a> {
         if Self::new(inner).is_named("bool") {
             return Ok(ValueKind::Bool);
         }
+        if Self::new(inner).is_named("AcceptEncoding") {
+            return Ok(ValueKind::Encoding);
+        }
         Err(syn::Error::new_spanned(
             self.ty,
-            "request fields require Shared, usize, u64, or bool, optionally wrapped in Option",
+            "request fields require Shared, usize, u64, or bool, optionally Option; accept-encoding also supports Option<AcceptEncoding>",
         ))
     }
 }

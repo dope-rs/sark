@@ -12,6 +12,7 @@ pub(super) struct Binding<'emit> {
 impl<'emit> Binding<'emit> {
     pub(super) fn new(
         paths: &Paths,
+        core: &syn::Ident,
         source: &serve::ProtocolPlan<'_>,
         futures: &[&syn::Ident],
         makers: &[&syn::Ident],
@@ -43,8 +44,8 @@ impl<'emit> Binding<'emit> {
         };
         let usage = |policy, mode, stamp| {
             quote! {
-                <#g_brand, #l_env, #( #states, )* 'd, #( #values, )* #g_id, #g_wire, #policy, #mode, #stamp,
-                    #( #futures, )* #( #makers, )*>
+                <#core<#g_brand, #l_env, #( #states, )* 'd, #( #values, )* #g_id, #g_wire, #policy, #mode,
+                    #( #futures, )* #( #makers, )*>, #stamp>
             }
         };
         Self {

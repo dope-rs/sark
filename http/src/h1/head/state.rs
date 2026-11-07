@@ -1,4 +1,4 @@
-use core::{convert::Infallible, ops};
+use core::convert::Infallible;
 
 use crate::h1::{
     field,
@@ -97,35 +97,8 @@ impl<K: Kind> State<K> {
         owner: &'owner [u8],
         mut sink: impl FnMut(field::Entry<'owner>) -> Result<(), E>,
     ) -> Result<(Self, Option<K::Parts>), ParseError<E>> {
-        let phase = Self::run(self.phase, owner, |start, fields, field| {
-            let fields = K::observe(start, fields, &field).map_err(ParseError::Semantic)?;
-            sink(field).map_err(ParseError::Sink)?;
-            Ok(fields)
-        })?;
-        let parts = match phase {
-            Phase::Done(parts) => Some(parts),
-            _ => None,
-        };
-        Ok((Self { phase }, parts))
-    }
-
-    pub(super) fn scan(
-        self,
-        owner: &[u8],
-    ) -> Result<(Self, Option<K::Parts>), ParseError<Infallible>> {
-        self.parse(owner, |_| Ok(()))
-    }
-
-    fn run<'owner, E>(
-        mut phase: Phase<K>,
-        owner: &'owner [u8],
-        mut drain: impl FnMut(
-            &K::Start,
-            K::Fields,
-            field::Entry<'owner>,
-        ) -> Result<K::Fields, ParseError<E>>,
-    ) -> Result<Phase<K>, ParseError<E>> {
-        loop {
+        let mut phase = self.phase;
+        let phase = loop {
             match phase {
                 Phase::Start { kind, limit } => {
                     let bounded = owner.len().min(limit.bytes());
@@ -141,7 +114,7 @@ impl<K: Kind> State<K> {
                                 limit,
                             };
                             if owner.len() == bounded {
-                                return Ok(next);
+                                break next;
                             }
                             phase = next;
                         }
@@ -156,11 +129,11 @@ impl<K: Kind> State<K> {
                         .scan(owner, limit.bytes())
                         .map_err(ParseError::Boundary)?;
                     let Some(prefix) = end else {
-                        return Ok(Phase::Line {
+                        break Phase::Line {
                             kind,
                             cursor,
                             limit,
-                        });
+                        };
                     };
                     let progress = kind.start(prefix)?;
                     let line::Progress::Complete(start) = progress else {
@@ -175,19 +148,14 @@ impl<K: Kind> State<K> {
                     bytes,
                 } => {
                     let bounded = &owner[..owner.len().min(bytes)];
-                    let parsed =
-                        cursor.advance(bounded, |field| match drain(&start, fields, field) {
-                            Ok(next) => {
-                                fields = next;
-                                ops::ControlFlow::Continue(())
-                            }
-                            Err(error) => ops::ControlFlow::Break(error),
-                        });
-                    let progress = parsed.map_err(ParseError::Field)?;
+                    let progress = cursor.advance(bounded).map_err(ParseError::Field)?;
                     let end = match progress {
-                        field::Progress::Break(error) => return Err(error),
                         field::Progress::End(end) => end,
-                        field::Progress::Emitted(()) => {
+                        field::Progress::Field(field) => {
+                            let next = K::observe(&start, fields, &field)
+                                .map_err(ParseError::Semantic)?;
+                            sink(field).map_err(ParseError::Sink)?;
+                            fields = next;
                             phase = Phase::Fields {
                                 cursor,
                                 start,
@@ -200,21 +168,33 @@ impl<K: Kind> State<K> {
                             return Err(ParseError::too_large(owner.len(), bytes));
                         }
                         field::Progress::More => {
-                            return Ok(Phase::Fields {
+                            break Phase::Fields {
                                 cursor,
                                 start,
                                 fields,
                                 bytes,
-                            });
+                            };
                         }
                     };
                     let tail = Tail::new(K::fields(start), end).map_err(ParseError::Boundary)?;
                     let parts = K::finish(fields, start, tail)?;
-                    return Ok(Phase::Done(parts));
+                    break Phase::Done(parts);
                 }
-                Phase::Done(parts) => return Ok(Phase::Done(parts)),
+                Phase::Done(parts) => break Phase::Done(parts),
             }
-        }
+        };
+        let parts = match phase {
+            Phase::Done(parts) => Some(parts),
+            _ => None,
+        };
+        Ok((Self { phase }, parts))
+    }
+
+    pub(super) fn scan(
+        self,
+        owner: &[u8],
+    ) -> Result<(Self, Option<K::Parts>), ParseError<Infallible>> {
+        self.parse(owner, |_| Ok(()))
     }
 
     pub(super) fn fields(start: K::Start, limit: Limit) -> Self {

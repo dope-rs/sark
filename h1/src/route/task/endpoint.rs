@@ -68,9 +68,7 @@ where
         ) -> Result<Pending<'d, R>, fixed::Body<'d>>,
         E: credit::Evidence,
     {
-        let frame = match framing::Frame::<R>::drive(found, &mut self.connection.ingress, || {
-            credit::Evidence::head(&mut proof)
-        }) {
+        let frame = match framing::Frame::drive(found, &mut self.connection.ingress, &mut proof) {
             Ok(framing::Progress::Complete(frame)) => frame,
             Ok(framing::Progress::Pending(wait)) => {
                 let req = wait.head.with_id(id);

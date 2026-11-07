@@ -264,7 +264,10 @@ impl<'a, R: crate::Role> Plane<'a, R> {
         else {
             return Ok(None);
         };
-        let entry = slab::Slots::new(&mut self.0.store.streams)
+        let entry = self
+            .0
+            .store
+            .streams
             .try_entry_at(key.slot())
             .map_err(|cause| conn::Error::WakeSlot { key, cause })?;
         let actual = entry.get().key;
@@ -281,7 +284,7 @@ impl<'a, R: crate::Role> Plane<'a, R> {
     }
 
     fn at(self, index: u32) -> Option<Wake<'a>> {
-        let entry = slab::Slots::new(&mut self.0.store.streams).entry_at(index)?;
+        let entry = self.0.store.streams.entry_at(index)?;
         Some(Wake {
             entry,
             fifo: &mut self.0.send_wakes,

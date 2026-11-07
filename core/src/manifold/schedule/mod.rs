@@ -277,11 +277,11 @@ pub trait Settle<T> {
 #[repr(transparent)]
 pub struct Decision<'id, K> {
     outcome: TurnOutcome<K>,
-    _scope: marker::PhantomData<region::Proof<region::Identity<'id>>>,
+    _scope: marker::PhantomData<region::Identity<'id>>,
 }
 
 impl<'id, K> Decision<'id, K> {
-    fn bind(outcome: TurnOutcome<K>, _scope: region::Proof<region::Identity<'id>>) -> Self {
+    fn bind(outcome: TurnOutcome<K>, _scope: region::Identity<'id>) -> Self {
         Self {
             outcome,
             _scope: marker::PhantomData,
@@ -307,7 +307,7 @@ pub trait Driver<T>: Settle<T> {
     fn control<'id>(
         &mut self,
         permit: Self::Permit,
-        entry: Occupied<'_, Self::Key, T, Self::Block, region::Proof<region::Identity<'id>>>,
+        entry: Occupied<'_, Self::Key, T, Self::Block, region::Identity<'id>>,
     ) -> Decision<'id, Self::Key>;
 
     fn data(

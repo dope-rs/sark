@@ -182,16 +182,12 @@ impl<'d, ID: Identity, H: Sink> handler::Application<'d, ID> for App<H> {
         None
     }
 
-    fn activate<'e, 'a, 'p, 's, 'w>(
+    fn activate<'e>(
         self: pin::Pin<&mut Self>,
-        mut conn: conn::Ctx<'e, 'a, 'p, 's, 'w, 'd, ID, Self::Wire, Self::Conn, Self::Egress>,
+        mut conn: conn::Ctx<'e, '_, '_, '_, '_, 'd, ID, Self::Wire, Self::Conn, Self::Egress>,
         driver: &mut driver::Context<'_, 'd>,
-    ) -> conn::Ctx<'e, 'a, 'p, 's, 'w, 'd, ID, Self::Wire, Self::Conn, Self::Egress>
-    where
-        'd: 'w,
-    {
+    ) {
         self.get_mut().pump(&mut conn, driver);
-        conn
     }
 }
 

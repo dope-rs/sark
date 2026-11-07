@@ -1,29 +1,23 @@
-use std::{convert::identity, mem};
+use std::mem;
 
-use o3::{
-    alloc::{self, array},
-    buffer::resident,
-};
-use sark_http::payload::owned;
+use o3::alloc::{self, array};
 
 use crate::{
     Error, Nesting,
     input::Taken,
     segment::{
-        Admitted, Atom, Capture, Create, Cursor, Field, Order, Projection, State, Transfer,
-        ValueKind,
-        input::{self, Input},
-        is_delimiter, state,
-        state::Name,
+        Atom, Capture, Cursor, Field, Order, Projection, State, ValueKind, input::Input,
+        is_delimiter, state, state::Name,
     },
     source::string,
 };
 
-pub(super) struct Scan<'d> {
+pub(in crate::segment) struct Scanning<'d> {
     pub(super) input: Input<'d>,
     pub(super) cursor: Cursor,
     pub(super) state: State,
     pub(super) selection: Selection<'d>,
+    pub(in crate::segment) stream: super::Stream,
 }
 
 pub(in crate::segment) struct Selection<'d> {
@@ -60,70 +54,15 @@ impl<'d> Selection<'d> {
     }
 }
 
-impl<'d> Scan<'d> {
-    pub(super) fn admitted(admitted: Admitted<'d>, selection: Selection<'d>) -> Self {
+impl<'d> Scanning<'d> {
+    pub(super) fn new(input: Input<'d>, selection: Selection<'d>) -> Self {
         Self {
-            input: admitted.input,
+            input,
             cursor: Cursor::new(),
             state: State::Leading,
             selection,
+            stream: super::Stream::new(),
         }
-    }
-
-    pub(super) fn try_stream(fields: &'d [Field<'d>], order: Order) -> Result<Self, Create> {
-        Ok(Self {
-            input: Input::empty(),
-            cursor: Cursor::new(),
-            state: State::Leading,
-            selection: Selection::try_new(fields, order).map_err(Create::from)?,
-        })
-    }
-
-    pub(super) fn new<I, O>(owners: I, fields: &'d [Field<'d>], order: Order) -> crate::Result<Self>
-    where
-        I: IntoIterator<Item = O>,
-        I::IntoIter: ExactSizeIterator,
-        resident::Shared<'d>: From<O>,
-    {
-        Ok(Self {
-            input: Input::new(owners)?,
-            cursor: Cursor::new(),
-            state: State::Leading,
-            selection: Selection::try_new(fields, order).map_err(Error::Allocation)?,
-        })
-    }
-
-    pub(super) fn try_new(
-        owners: owned::Segments<'d>,
-        fields: &'d [Field<'d>],
-        order: Order,
-    ) -> Result<Self, Create> {
-        let input = Input::try_new(owners).map_err(Create::from)?;
-        let set = Selection::try_new(fields, order).map_err(Create::from)?;
-        Ok(Self {
-            input,
-            cursor: Cursor::new(),
-            state: State::Leading,
-            selection: set,
-        })
-    }
-
-    pub(super) fn push(self, owner: resident::Shared<'d>) -> Transfer<Self, input::Failure<'d>> {
-        let Self {
-            input,
-            cursor,
-            state,
-            selection: select,
-        } = self;
-        input.push(owner).map(
-            |input| Self {
-                input,
-                cursor,
-                state,
-                selection: select,
-            },
-            identity,
-        )
     }
 
     pub(super) fn skip(&mut self, budget: usize) -> usize {

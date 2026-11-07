@@ -57,6 +57,28 @@ fn retention_length() {
         parts.upgrades().compact_len(),
         b"h2c, websocket\0chat/1".len()
     );
+    let route = parts.into_route();
+    let pool = head::request::pool::Pool::try_new(2, wire.len()).expect("request pool");
+    let compact = pool
+        .open()
+        .expect("compact slot")
+        .seal(route)
+        .expect("compact head");
+    let buffer = pool
+        .open()
+        .expect("buffered slot")
+        .buffer(&[])
+        .expect("prefix");
+    let buffered = route
+        .try_copy(buffer)
+        .map_err(|(_, error)| error)
+        .expect("buffered head")
+        .seal();
+    for meta in [compact, buffered] {
+        assert_eq!((meta.method(), meta.target()), ("GET", "/"));
+        assert!(meta.transition() == switch::Intent::Upgrade);
+        assert!(meta.select(b"chat/1").expect("retained offer").is_some());
+    }
 }
 
 #[test]

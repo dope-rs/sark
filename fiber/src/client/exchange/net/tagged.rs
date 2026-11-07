@@ -52,7 +52,7 @@ impl<'r, 'q, 'd, ID: Identity> net::ReadyQueue<'d, ID, origin::Key<'r, 'q, 'd, I
         bound: &Positioned<'_, '_, 'd, ID, origin::Key<'r, 'q, 'd, ID>, S>,
     ) -> Result<(), entry::Error<num::NonZero<u32>>> {
         let mut lane = bound.tag().lane().borrow(token);
-        if let entry::State::Vacant(vacant) = lane.entry(bound.connection().index().into_usize())? {
+        if let Some(vacant) = lane.entry(bound.connection().index().into_usize())? {
             vacant.insert::<false>(());
         }
         Ok(())

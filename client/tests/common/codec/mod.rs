@@ -97,14 +97,12 @@ unsafe impl<'d> hold::raw::Retain<'d> for Gate {
     fn try_retain<'a>(
         plan: &Self::View<'a>,
         budget: &resident::Budget<'d>,
-    ) -> Result<resident::Shared<'d>, hold::Error>
+    ) -> Result<hold::Retained<'d>, hold::Error>
     where
         Self: 'a,
     {
         if !plan.open.get() {
-            return resident::Exact::try_copy(budget, plan.view.as_slice())
-                .map(resident::Exact::into_shared)
-                .map_err(hold::Error::Resident);
+            return Self::try_copy(plan, budget).map(Into::into);
         }
         <Shared as hold::raw::Retain<'d>>::try_retain(&plan.view, budget)
     }

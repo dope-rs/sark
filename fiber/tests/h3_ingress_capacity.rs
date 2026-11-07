@@ -61,6 +61,7 @@ fn reports_rejected_ingress() {
             linked: 0,
         }
         .try_run_with(
+            common::server::h3::sessions::plain,
             Default::default(),
             None,
             Disabled,
@@ -117,6 +118,7 @@ fn rejected_head_reconciles_pending_parser_credit() {
             linked: 1,
         }
         .try_run_with(
+            common::server::h3::sessions::plain,
             protocol,
             None,
             Disabled,

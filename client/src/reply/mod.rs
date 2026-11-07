@@ -85,7 +85,7 @@ impl<'a, 'd> Scoped<'a, 'd> {
         let copies = plan.allocate()?;
         self.detach(copies, |mut source, copies| {
             Ok(match target {
-                body::Vacant::Empty => body::Retained::empty(),
+                body::Vacant::Empty => body::Retained::Empty,
                 body::Vacant::One => {
                     let Some(owner) = source.pop() else {
                         return Err(Error::BodyCount {
@@ -100,7 +100,7 @@ impl<'a, 'd> Scoped<'a, 'd> {
                             actual: Count::EMPTY,
                         });
                     };
-                    body::Retained::one(owner)
+                    body::Retained::One(owner)
                 }
                 body::Vacant::Many(mut chain) => {
                     while let Some(owner) = source.pop() {
@@ -113,7 +113,7 @@ impl<'a, 'd> Scoped<'a, 'd> {
                             });
                         }
                     }
-                    body::Retained::many(chain)
+                    chain.into_shape()
                 }
             })
         })

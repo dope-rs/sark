@@ -15,7 +15,7 @@ use crate::{
         runtime::{
             policy,
             run::drive,
-            state::{self, Session, active},
+            state::{self, Store, active},
         },
         service::{self, handler, reply::Reply},
     },
@@ -37,7 +37,7 @@ where
 {
     pub(super) fn finish<C>(
         &mut self,
-        state: &mut Session<'r, 'd, Handler<X::Call, X::State>, X::Timer, C>,
+        state: &mut Store<'r, 'd, Handler<X::Call, X::State>, X::Timer, C>,
         conn: &mut C,
         turn: &mut app::Turn<'_, '_, '_, 'd, O>,
         entry: active::Entry<'r>,
@@ -117,7 +117,7 @@ where
 
     pub(super) fn completion<C>(
         &mut self,
-        state: &mut Session<'r, 'd, Handler<X::Call, X::State>, X::Timer, C>,
+        state: &mut Store<'r, 'd, Handler<X::Call, X::State>, X::Timer, C>,
         conn: &mut C,
         done: X::Completion,
         entry: active::Entry<'r>,
@@ -152,7 +152,7 @@ where
     pub(super) fn output<C>(
         &mut self,
         now: clock::Moment<'d>,
-        state: &mut Session<'r, 'd, Handler<X::Call, X::State>, X::Timer, C>,
+        state: &mut Store<'r, 'd, Handler<X::Call, X::State>, X::Timer, C>,
         conn: &mut C,
         entry: active::Entry<'r>,
     ) where

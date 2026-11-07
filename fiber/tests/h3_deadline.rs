@@ -37,6 +37,7 @@ fn handler_deadline() {
             linked: 0,
         }
         .try_run_with(
+            common::server::h3::sessions::plain,
             Default::default(),
             None,
             Disabled,

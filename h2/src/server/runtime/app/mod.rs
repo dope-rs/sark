@@ -22,8 +22,8 @@ use dope::{
 pub use failure::Failure;
 use handler::{failures, retire, send};
 use o3::buffer::resident;
-pub(in crate::server) use report::{Fault, response};
 pub use report::Report;
+pub(in crate::server) use report::{Fault, response};
 use sark_core::{
     life::mode,
     manifold::{
@@ -36,7 +36,7 @@ use sark_core::{
 };
 
 use crate::{
-    conn::{Error, config},
+    conn::{Error, config, ingress::PrefacePhase, preface},
     server::{
         self,
         runtime::{
@@ -45,22 +45,27 @@ use crate::{
             modes::Deadline,
             output::{
                 self,
-                flush::{End, Flush},
+                flush::{self, End, Evidence},
             },
         },
-        sync,
     },
 };
 
-pub struct App<A: Spec, W: wire::Spec = wire::Identity, F = failures::Close> {
+pub struct App<
+    'd,
+    A: Spec,
+    W: wire::Spec = wire::Identity,
+    F = failures::Close,
+    E = resident::Shared<'d>,
+> {
     pub(super) app: A,
     pub(super) fault: F,
     machine: config::Validated<crate::ServerRole>,
     retention: Budget,
-    wire: marker::PhantomData<fn() -> W>,
+    wire: marker::PhantomData<fn() -> (W, E, &'d ())>,
 }
 
-impl<A: Spec, W: wire::Spec, F> App<A, W, F> {
+impl<'d, A: Spec, W: wire::Spec, F, E: data::raw::Payload<'d>> App<'d, A, W, F, E> {
     pub fn new(app: A, plan: server::Plan, fault: F) -> Result<Self, config::Error> {
         let layout = app.layout();
         let minimum = plan.resident_len();
@@ -69,7 +74,7 @@ impl<A: Spec, W: wire::Spec, F> App<A, W, F> {
         Self::from_machine(app, layout, machine, minimum, fault)
     }
 
-    fn from_machine(
+    pub(super) fn from_machine(
         app: A,
         layout: app::Layout,
         machine: config::Validated<crate::ServerRole>,
@@ -89,9 +94,25 @@ impl<A: Spec, W: wire::Spec, F> App<A, W, F> {
         })
     }
 
-    fn resume<'d, ID: Identity>(
+    pub fn connection_after_preface<ID: Identity>(
+        &self,
+        seed: &random::Seed,
+        _: preface::Complete,
+    ) -> Result<State<'d, A, conn::Id<'d, ID>>, runtime::Build<A::Build>>
+    where
+        A: app::Application<'d, Connection<'d, A>, conn::Id<'d, ID>>,
+    {
+        State::try_new(
+            &self.app,
+            &self.machine,
+            hash::Seed::new(seed),
+            PrefacePhase::InitialSettings,
+        )
+    }
+
+    fn resume<ID: Identity>(
         &mut self,
-        conn: &mut Context<'_, '_, '_, '_, '_, 'd, ID, A, W>,
+        conn: &mut Context<'_, '_, '_, '_, '_, 'd, ID, A, W, E>,
         driver: &mut driver::Context<'_, 'd>,
         mut egress: schedule::Egress,
     ) -> Result<drain::Progress, app::Error<Error, A::Failure>>
@@ -130,21 +151,22 @@ impl<A: Spec, W: wire::Spec, F> App<A, W, F> {
         .resume()
     }
 
-    pub(super) fn fail<'d, ID: Identity>(
+    pub(super) fn fail<ID: Identity>(
         &mut self,
-        conn: &mut Context<'_, '_, '_, '_, '_, 'd, ID, A, W>,
+        conn: &mut Context<'_, '_, '_, '_, '_, 'd, ID, A, W, E>,
         driver: &mut driver::Context<'_, 'd>,
         error: app::Error<Error, A::Failure>,
     ) where
         A: app::Application<'d, Connection<'d, A>, conn::Id<'d, ID>>,
         F: Fault<'d, W, A::Failure, ID, runtime::Build<A::Build>>,
+        E: Evidence<'d>,
     {
         let code = <F as Fault<'d, W, A::Failure, ID, runtime::Build<A::Build>>>::failed(
             &mut self.fault,
             conn.id(),
             error,
         );
-        if let Err((cause, _)) = Flush::new(conn).finish(driver, Some(code), &mut mode::Disabled) {
+        if let Err((cause, _)) = flush::finish(conn, driver, Some(code), &mut mode::Disabled) {
             <F as Fault<'d, W, A::Failure, ID, runtime::Build<A::Build>>>::output(
                 &mut self.fault,
                 conn.id(),
@@ -153,15 +175,16 @@ impl<A: Spec, W: wire::Spec, F> App<A, W, F> {
         }
     }
 
-    pub(super) fn activate<'d, ID: Identity, T>(
+    pub(super) fn activate<ID: Identity, T>(
         &mut self,
-        conn: &mut Context<'_, '_, '_, '_, '_, 'd, ID, A, W>,
+        conn: &mut Context<'_, '_, '_, '_, '_, 'd, ID, A, W, E>,
         driver: &mut driver::Context<'_, 'd>,
         egress: schedule::Egress,
     ) where
         A: app::Application<'d, Connection<'d, A>, conn::Id<'d, ID>>,
         F: Fault<'d, W, A::Failure, ID, runtime::Build<A::Build>>,
-        T: Deadline<'d, ID, A, W, F>,
+        E: Evidence<'d>,
+        T: Deadline<'d, ID, A, W, F, E>,
     {
         let wake = conn.wake_target();
         let error = drain::Progress::error(self.resume(conn, driver, egress), wake);
@@ -180,16 +203,18 @@ impl<A: Spec, W: wire::Spec, F> App<A, W, F> {
         T::flush(self, conn, driver);
     }
 
-    fn read<'w, 'd: 'w, ID: Identity>(
+    fn read<'w, ID: Identity>(
         &mut self,
-        conn: &mut Context<'_, '_, '_, '_, 'w, 'd, ID, A, W>,
+        conn: &mut Context<'_, '_, '_, '_, 'w, 'd, ID, A, W, E>,
         chunk: scoped::Input<'_, 'w, 'd, W>,
         driver: &mut driver::Context<'_, 'd>,
     ) -> receive::Outcome
     where
         A: app::Application<'d, Connection<'d, A>, conn::Id<'d, ID>>,
         F: Fault<'d, W, A::Failure, ID, runtime::Build<A::Build>>,
-        A::Timing: Deadline<'d, ID, A, W, F>,
+        E: Evidence<'d>,
+        'd: 'w,
+        A::Timing: Deadline<'d, ID, A, W, F, E>,
     {
         let owner = conn.id();
         let work = conn.work();
@@ -227,7 +252,7 @@ impl<A: Spec, W: wire::Spec, F> App<A, W, F> {
                 && conn.state_mut().carrier.ingress().is_blocked()
                 && !conn.state().carrier.output().is_empty()
             {
-                <A::Timing as Deadline<'d, ID, A, W, F>>::flush(self, conn, driver);
+                <A::Timing as Deadline<'d, ID, A, W, F, E>>::flush(self, conn, driver);
                 wake.wake();
                 return receive::Outcome::Continue;
             }
@@ -235,36 +260,19 @@ impl<A: Spec, W: wire::Spec, F> App<A, W, F> {
             self.fail(conn, driver, error);
             return receive::Outcome::Continue;
         }
-        <A::Timing as Deadline<'d, ID, A, W, F>>::flush(self, conn, driver);
+        <A::Timing as Deadline<'d, ID, A, W, F, E>>::flush(self, conn, driver);
         receive::Outcome::Continue
     }
 }
 
-impl<R, W, F> App<sync::Route<R>, W, F>
-where
-    sync::Route<R>: Spec,
-    W: wire::Spec,
-{
-    pub(in crate::server) fn from_sync(
-        router: R,
-        plan: server::Plan,
-        fault: F,
-    ) -> Result<Self, config::Error> {
-        let machine = config::Validated::new(plan.build()?)?;
-        let minimum = plan.resident_len();
-        let route = sync::Route::new(router, plan.config());
-        let layout = route.layout();
-        Self::from_machine(route, layout, machine, minimum, fault)
-    }
-}
+impl<A: Spec, W: wire::Spec, F, E> Unpin for App<'_, A, W, F, E> {}
 
-impl<A: Spec, W: wire::Spec, F> Unpin for App<A, W, F> {}
-
-impl<'d, ID: Identity, A, W, F> handler::Application<'d, ID> for App<A, W, F>
+impl<'d, ID: Identity, A, W, F, E> handler::Application<'d, ID> for App<'d, A, W, F, E>
 where
     A: app::Application<'d, Connection<'d, A>, conn::Id<'d, ID>>,
     F: Fault<'d, W, A::Failure, ID, runtime::Build<A::Build>>,
-    A::Timing: Deadline<'d, ID, A, W, F>,
+    A::Timing: Deadline<'d, ID, A, W, F, E>,
+    E: Evidence<'d> + 'd,
     W: Execution + 'd,
     receive::Scoped: receive::Mode<W>,
 {
@@ -273,12 +281,12 @@ where
     type Wire = W;
     type WireFailure = F;
     type Retirement = retire::Close;
-    type Egress = data::Bound<resident::Shared<'d>, A::Egress<'d>>;
+    type Egress = data::Bound<E, A::Egress<'d>>;
     type Input = receive::Scoped;
     type Send = send::Run;
 
     fn timing(&self) -> handler::Timing {
-        <A::Timing as Deadline<'d, ID, A, W, F>>::TIMING
+        <A::Timing as Deadline<'d, ID, A, W, F, E>>::TIMING
     }
 
     fn timeout<'e>(
@@ -286,7 +294,7 @@ where
         mut conn: conn::Ctx<'e, '_, '_, '_, '_, 'd, ID, W, Self::Conn, Self::Egress>,
         driver: &mut driver::Context<'_, 'd>,
     ) -> handler::Timeout<'d> {
-        <A::Timing as Deadline<'d, ID, A, W, F>>::timeout(self.get_mut(), &mut conn, driver)
+        <A::Timing as Deadline<'d, ID, A, W, F, E>>::timeout(self.get_mut(), &mut conn, driver)
     }
 
     fn drain<'e>(
@@ -295,7 +303,7 @@ where
         driver: &mut driver::Context<'_, 'd>,
     ) -> handler::Drain {
         conn.state_mut().begin_drain();
-        if let Err((cause, _)) = Flush::new(&mut conn).finish(driver, None, &mut mode::Disabled) {
+        if let Err((cause, _)) = flush::finish(&mut conn, driver, None, &mut mode::Disabled) {
             <F as Fault<'d, W, A::Failure, ID, runtime::Build<A::Build>>>::output(
                 &mut self.get_mut().fault,
                 conn.id(),
@@ -314,7 +322,12 @@ where
 
     fn connection(self: pin::Pin<&Self>, seed: &random::Seed) -> Result<Self::Conn, Self::Build> {
         let this = self.get_ref();
-        State::try_new(&this.app, this.machine, hash::Seed::new(seed))
+        State::try_new(
+            &this.app,
+            &this.machine,
+            hash::Seed::new(seed),
+            PrefacePhase::Magic,
+        )
     }
 
     fn build_failed(self: pin::Pin<&mut Self>, cause: Self::Build) {
@@ -335,39 +348,32 @@ where
         }
     }
 
-    fn activate<'e, 'a, 'p, 's, 'w>(
+    fn activate<'e>(
         self: pin::Pin<&mut Self>,
-        mut conn: conn::Ctx<'e, 'a, 'p, 's, 'w, 'd, ID, W, Self::Conn, Self::Egress>,
+        mut conn: conn::Ctx<'e, '_, '_, '_, '_, 'd, ID, W, Self::Conn, Self::Egress>,
         driver: &mut driver::Context<'_, 'd>,
-    ) -> conn::Ctx<'e, 'a, 'p, 's, 'w, 'd, ID, W, Self::Conn, Self::Egress>
-    where
-        'd: 'w,
-    {
+    ) {
         self.get_mut()
             .activate::<ID, A::Timing>(&mut conn, driver, schedule::Egress::Unchanged);
-        conn
     }
 
-    fn close<'e, 'a, 'p, 's, 'w>(
+    fn close<'e>(
         self: pin::Pin<&mut Self>,
-        mut conn: conn::Ctx<'e, 'a, 'p, 's, 'w, 'd, ID, W, Self::Conn, Self::Egress>,
-    ) -> conn::Ctx<'e, 'a, 'p, 's, 'w, 'd, ID, W, Self::Conn, Self::Egress>
-    where
-        'd: 'w,
-    {
+        mut conn: conn::Ctx<'e, '_, '_, '_, '_, 'd, ID, W, Self::Conn, Self::Egress>,
+    ) {
         let owner = conn.id();
         let this = self.get_mut();
         let state = conn.state_mut();
         this.app.close(&mut state.app, &mut state.carrier, owner);
-        conn
     }
 }
 
-impl<'d, ID: Identity, A, W, F> send::Drive<'d, ID> for App<A, W, F>
+impl<'d, ID: Identity, A, W, F, E> send::Drive<'d, ID> for App<'d, A, W, F, E>
 where
     A: app::Application<'d, Connection<'d, A>, conn::Id<'d, ID>>,
     F: Fault<'d, W, A::Failure, ID, runtime::Build<A::Build>>,
-    A::Timing: Deadline<'d, ID, A, W, F>,
+    A::Timing: Deadline<'d, ID, A, W, F, E>,
+    E: Evidence<'d> + 'd,
     W: Execution + 'd,
     receive::Scoped: receive::Mode<W>,
 {
@@ -381,11 +387,12 @@ where
     }
 }
 
-impl<'w, 'd: 'w, ID: Identity, A, W, F> handler::Scoped<'w, 'd, ID> for App<A, W, F>
+impl<'w, 'd: 'w, ID: Identity, A, W, F, E> handler::Scoped<'w, 'd, ID> for App<'d, A, W, F, E>
 where
     A: app::Application<'d, Connection<'d, A>, conn::Id<'d, ID>>,
     F: Fault<'d, W, A::Failure, ID, runtime::Build<A::Build>>,
-    A::Timing: Deadline<'d, ID, A, W, F>,
+    A::Timing: Deadline<'d, ID, A, W, F, E>,
+    E: Evidence<'d> + 'd,
     W: Execution + 'd,
     receive::Scoped: receive::Mode<W>,
 {

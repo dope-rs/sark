@@ -33,6 +33,7 @@ fn head_response_paths() {
         linked: 0,
     }
     .try_run_with(
+        common::server::h3::sessions::plain,
         Default::default(),
         None,
         Disabled,
@@ -85,28 +86,10 @@ fn pending_response_head_ownership() {
             unlimited,
             unlimited,
         ),
-        (
-            Some(CancelAction::QpackIncrement),
-            false,
-            8,
-            900,
-            unlimited,
-        ),
+        (Some(CancelAction::QpackIncrement), false, 8, 900, unlimited),
         (None, false, 2, unlimited, unlimited),
-        (
-            Some(CancelAction::StopSending),
-            false,
-            8,
-            900,
-            unlimited,
-        ),
-        (
-            Some(CancelAction::StopSending),
-            false,
-            8,
-            unlimited,
-            9000,
-        ),
+        (Some(CancelAction::StopSending), false, 8, 900, unlimited),
+        (Some(CancelAction::StopSending), false, 8, unlimited, 9000),
         (Some(CancelAction::StopSending), true, 8, 900, 10000),
     ] {
         let invalid_feedback = matches!(
@@ -164,6 +147,7 @@ fn pending_response_head_ownership() {
             linked: usize::from(fixed),
         }
         .try_run_with(
+            common::server::h3::sessions::plain,
             options::Config {
                 egress: options::Egress {
                     write_capacity: slots,
@@ -205,11 +189,7 @@ fn pending_response_head_ownership() {
         }
         assert_eq!(
             proof.stream.drops.get(),
-            if followup {
-                3
-            } else {
-                2 - usize::from(fixed)
-            }
+            if followup { 3 } else { 2 - usize::from(fixed) }
         );
         assert!(!proof.stream.moved.get());
         let committed = proof

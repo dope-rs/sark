@@ -35,11 +35,11 @@ impl<'a> Value<'a> {
         };
         if len < end as usize {
             let ring = Ring::new(parts.arena);
-            let cursor = ring.advance(state.insert.checkpoint, start as usize);
+            let cursor = ring.advance(state.entries.tail(), start as usize);
             let value = ring.stored(cursor, len - start as usize);
             state.insert.value = block::Value::from_span(value);
             state.insert.len = next;
-            state.insert.tail = ring.advance(state.insert.checkpoint, len);
+            state.insert.tail = ring.advance(state.entries.tail(), len);
         }
         Ok(())
     }
@@ -64,7 +64,7 @@ impl<'a> Value<'a> {
         let current = self.0.table.storage.state();
         let size = state::Size::from_data(current.insert.len.get());
         let slot = Slot::pack(
-            current.insert.checkpoint,
+            current.entries.tail(),
             current.insert.name_len() as usize,
             Whole::from_value(current.insert.proof(), current.insert.value),
         );
@@ -86,7 +86,7 @@ pub(super) fn project(table: &table::Table<mode::Staged>) -> Result<Span<'_>, in
         )));
     }
     let ring = Ring::new(parts.arena);
-    let start = ring.advance(state.insert.checkpoint, name_len as usize);
+    let start = ring.advance(state.entries.tail(), name_len as usize);
     let len = total - name_len;
     match ring.span(start, len as usize) {
         Some(value) => Ok(value),

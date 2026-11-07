@@ -9,7 +9,6 @@ pub(super) struct Tasks {
     pub(super) emit_body: proc_macro2::TokenStream,
     pub(super) resume_body: proc_macro2::TokenStream,
     pub(super) task_work_body: proc_macro2::TokenStream,
-    pub(super) wake_body: proc_macro2::TokenStream,
     pub(super) try_wake_body: proc_macro2::TokenStream,
     pub(super) cancel_one_body: proc_macro2::TokenStream,
 }
@@ -46,7 +45,6 @@ impl Tasks {
                 emit_body: absent.clone(),
                 resume_body: absent,
                 task_work_body: quote!(false),
-                wake_body: quote!(),
                 try_wake_body: quote!(#ns_core::manifold::task::app::Wake::Idle),
                 cancel_one_body: quote! {
                     match #n_task {
@@ -142,16 +140,6 @@ impl Tasks {
             | #ns_fiber::dope_fiber::task::storage::fixed::schedule::queue::Wake::Pending => true,
             #ns_fiber::dope_fiber::task::storage::fixed::schedule::queue::Wake::Idle => false,
         });
-        let wake = quote! {
-            self.project()
-                .#f_core
-                .project()
-                .#f_tasks
-                .as_mut()
-                .scope()
-                .as_mut()
-                .wake(#n_scope);
-        };
         let probe = quote! {
             match self.project()
                 .#f_core
@@ -257,7 +245,6 @@ impl Tasks {
             emit_body: emission,
             resume_body: resumption,
             task_work_body: work,
-            wake_body: wake,
             try_wake_body: probe,
             cancel_one_body: one,
         }

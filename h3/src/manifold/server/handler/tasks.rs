@@ -147,7 +147,7 @@ where
             Some(source) => source,
             None => return quota::Admission::Empty,
         };
-        let admit = match source {
+        let flow = match source {
             Work::Build => {
                 let Some(selected) = conns.next() else {
                     return quota::Admission::Empty;
@@ -185,7 +185,7 @@ where
                     true => step::Flow::Batch,
                     false => step::Flow::Yield,
                 };
-                quota::Admission::Item(receipt.settle(flow))
+                receipt.settle(flow)
             }
             Work::Task => {
                 use sark_core::manifold::task::app::Turn;
@@ -204,8 +204,8 @@ where
                     parent.wake();
                 }
                 match turn {
-                    Turn::Idle => quota::Admission::Empty,
-                    Turn::Deferred => quota::Admission::Exhausted,
+                    Turn::Idle => return quota::Admission::Empty,
+                    Turn::Deferred => return quota::Admission::Exhausted,
                     Turn::Pending(step) => {
                         let ready = matches!(
                             Runtime::try_wake(router.as_mut(), owner::Scope::Any),
@@ -215,11 +215,9 @@ where
                             true => step::Flow::Batch,
                             false => step::Flow::Yield,
                         };
-                        quota::Admission::Item(step.settle(flow))
+                        step.settle(flow)
                     }
-                    Turn::PendingReady(step) => {
-                        quota::Admission::Item(step.settle(step::Flow::Batch))
-                    }
+                    Turn::PendingReady(step) => step.settle(step::Flow::Batch),
                     Turn::Ready((target, output), step) => {
                         match conns.try_select(target.connection()) {
                             Ok(pick) => pick.run(|mut slot| {
@@ -241,19 +239,13 @@ where
                             true => step::Flow::Batch,
                             false => step::Flow::Yield,
                         };
-                        quota::Admission::Item(step.settle(flow))
+                        step.settle(flow)
                     }
                 }
             }
         };
-        match admit {
-            quota::Admission::Item(flow) => {
-                self.work.account(source);
-                quota::Admission::Item(flow)
-            }
-            quota::Admission::Empty => quota::Admission::Empty,
-            quota::Admission::Exhausted => quota::Admission::Exhausted,
-        }
+        self.work.account(source);
+        quota::Admission::Item(flow)
     }
 }
 

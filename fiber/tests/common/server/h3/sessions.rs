@@ -27,7 +27,7 @@ use dope::{
 };
 use dope_fiber::task::storage::{fixed::schedule::queue, scope::Brand};
 use dope_quic::{
-    conn::life::tls::clients::Authority,
+    conn::life::{options::Options, tls::clients::Authority},
     proto::cid,
     runtime::{
         endpoint::{
@@ -36,7 +36,9 @@ use dope_quic::{
             server::Plan,
         },
         mux::app::Silent,
+        receive, routing,
     },
+    rustls::ServerConfig,
 };
 use dope_test::{
     fibers,
@@ -62,12 +64,24 @@ use crate::common::server::h3::{
 };
 
 type Result<'a, T> = std::result::Result<T, Error<'a>>;
+type Planned<Q, P> = Result<'static, (Plan<LISTENER, receive::Retained, Q>, P)>;
+
+pub fn plain(
+    (address, reservation): (SocketAddr, UdpSocket),
+    tls: ServerConfig,
+    options: Options,
+    endpoint: Config,
+) -> Planned<routing::Plain, UdpSocket> {
+    let plan = Plan::new(address, tls, options, endpoint).map_err(Error::Endpoint)?;
+    Ok((plan, reservation))
+}
 
 #[derive(Debug)]
 pub enum Error<'a> {
     Overflow(Metric, usize, usize),
     Index(num::TryFromIntError),
     Reserve(io::Error),
+    Group(dope::core::io::datagram::Error),
     Config(ConfigError),
     Tls(dope_tls::Error),
     Endpoint(endpoint::PlanError),
@@ -106,11 +120,18 @@ pub struct Scenario<'a> {
 }
 
 impl<'a> Scenario<'a> {
-    pub(crate) fn try_prepare(
+    pub(crate) fn try_prepare<Q: routing::LocalRoute, P>(
         &mut self,
         protocol: options::Config,
         send_bytes: Option<num::NonZero<usize>>,
-    ) -> Result<'_, (topology::Prepared<StoragePlan, RunPlan<'a>>, Rc<Shared<'a>>)> {
+        make: impl FnOnce((SocketAddr, UdpSocket), ServerConfig, Options, Config) -> Planned<Q, P>,
+    ) -> Result<
+        '_,
+        (
+            topology::Prepared<StoragePlan, RunPlan<'a, Q, P>>,
+            Rc<Shared<'a>>,
+        ),
+    > {
         use dope_quic::config;
 
         if self.requests.is_empty() {
@@ -190,8 +211,7 @@ impl<'a> Scenario<'a> {
         }
         let mut tls = identity.server().map_err(Error::Tls)?;
         tls.alpn_protocols = vec![b"h3".to_vec()];
-        let plan =
-            Plan::<LISTENER>::new(address, tls, options, endpoint).map_err(Error::Endpoint)?;
+        let (plan, reservation) = make((address, port), tls, options, endpoint)?;
         let plan = startup::Plan::try_from(plan, config).map_err(Error::Application)?;
         let client = client::Plan::new(bind, endpoint).map_err(Error::Client)?;
         let shared = Rc::clone(&proof);
@@ -199,7 +219,7 @@ impl<'a> Scenario<'a> {
             plan,
             proof: shared,
             client,
-            reservation: port,
+            reservation,
             task_capacity: self.task_capacity.try_into().map_err(Error::Capacity)?,
         };
         let prepared = topology::Plan::new(
@@ -215,8 +235,9 @@ impl<'a> Scenario<'a> {
         Ok((prepared, proof))
     }
 
-    pub fn try_run_with<L, D, O, Out>(
+    pub fn try_run_with<Q: routing::LocalRoute, P, L, D, O, Out>(
         mut self,
+        make: impl FnOnce((SocketAddr, UdpSocket), ServerConfig, Options, Config) -> Planned<Q, P>,
         protocol: options::Config,
         send_bytes: Option<num::NonZero<usize>>,
         lifetime: L,
@@ -235,7 +256,7 @@ impl<'a> Scenario<'a> {
             dope_quic::conn::id::Handle<dope_quic::conn::id::Driver<'static>, LISTENER>,
             dope_quic::wire::stream::Id,
         >>::ENABLED;
-        let (prepared, proof) = match self.try_prepare(protocol, send_bytes) {
+        let (prepared, proof) = match self.try_prepare(protocol, send_bytes, make) {
             Ok(prepared) => prepared,
             Err(error) => return done(Err(error)),
         };
@@ -264,36 +285,34 @@ impl<'a> Scenario<'a> {
                             stage.storage(),
                             sark_fiber::Config::new(capacity.count().get()),
                         );
-                        let runtime = (|| {
-                            let seed =
-                                hash::Seed::new(stage.driver().driver_ref().random_seed());
-                            let deadline = stage
-                                .driver()
-                                .driver_ref()
-                                .clock()
-                                .deadline_at(proof.read().map_err(Error::Proof)?.network.deadline);
-                            let server = plan
-                                .try_with::<Silent, _, _, _, _, _>(
-                                    router,
-                                    observe(Probe(Rc::clone(&proof), diagnose)),
-                                    lifetime,
-                                    policy,
-                                    server::Tasks::new(),
-                                    &mut stage.driver(),
-                                )
-                                .map_err(Error::Bind)?;
-                            let client = client
-                                .bind(
-                                    Client::new(seed, Rc::clone(&proof)),
-                                    &mut stage.driver(),
-                                )
-                                .map_err(Error::Dialer)?;
-                            Ok(AsyncRuntime {
-                                server,
-                                client,
-                                deadline,
-                            })
-                        })()?;
+                        let seed =
+                            hash::Seed::new(stage.driver().driver_ref().random_seed());
+                        let deadline = stage
+                            .driver()
+                            .driver_ref()
+                            .clock()
+                            .deadline_at(proof.read().map_err(Error::Proof)?.network.deadline);
+                        let server = plan
+                            .try_with::<Silent, _, _, _, _, _>(
+                                router,
+                                observe(Probe(Rc::clone(&proof), diagnose)),
+                                lifetime,
+                                policy,
+                                server::Tasks::new(),
+                                &mut stage.driver(),
+                            )
+                            .map_err(Error::Bind)?;
+                        let client = client
+                            .bind(
+                                Client::new(seed, Rc::clone(&proof)),
+                                &mut stage.driver(),
+                            )
+                            .map_err(Error::Dialer)?;
+                        let runtime = AsyncRuntime {
+                            server,
+                            client,
+                            deadline,
+                        };
                         Stage::with_quiesce(stage, &mut finish, runtime, GUARD, |mut app| {
                             proof.failures.try_wait(&mut app)
                         })

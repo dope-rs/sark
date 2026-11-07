@@ -19,7 +19,7 @@ use crate::{
         runtime::{
             policy,
             run::drive,
-            state::{Session, active},
+            state::{Store, active},
         },
         service::{self, handler, reply::Reply},
     },
@@ -34,7 +34,7 @@ where
     pub(super) fn event<C>(
         &mut self,
         now: clock::Moment<'d>,
-        state: &mut Session<'r, 'd, Handler<X::Call, X::State>, X::Timer, C>,
+        state: &mut Store<'r, 'd, Handler<X::Call, X::State>, X::Timer, C>,
         conn: &mut C,
         turn: &mut app::Turn<'_, '_, '_, 'd, O>,
         active: &'r active::Signals,
@@ -105,7 +105,7 @@ where
     fn headers<C>(
         &mut self,
         now: clock::Moment<'d>,
-        state: &mut Session<'r, 'd, Handler<X::Call, X::State>, X::Timer, C>,
+        state: &mut Store<'r, 'd, Handler<X::Call, X::State>, X::Timer, C>,
         conn: &mut C,
         turn: &mut app::Turn<'_, '_, '_, 'd, O>,
         fields: section::Owner,
@@ -171,7 +171,7 @@ where
 
     fn trailers<C>(
         &mut self,
-        state: &mut Session<'r, 'd, Handler<X::Call, X::State>, X::Timer, C>,
+        state: &mut Store<'r, 'd, Handler<X::Call, X::State>, X::Timer, C>,
         conn: &mut C,
         fields: section::Owner,
         entry: active::Entry<'r>,
@@ -192,7 +192,7 @@ where
 
     fn data<C>(
         &mut self,
-        state: &mut Session<'r, 'd, Handler<X::Call, X::State>, X::Timer, C>,
+        state: &mut Store<'r, 'd, Handler<X::Call, X::State>, X::Timer, C>,
         conn: &mut C,
         data: C::Data,
         boundary: Boundary,
@@ -219,7 +219,7 @@ where
     }
 
     fn end<C>(
-        state: &mut Session<'r, 'd, Handler<X::Call, X::State>, X::Timer, C>,
+        state: &mut Store<'r, 'd, Handler<X::Call, X::State>, X::Timer, C>,
         entry: active::Entry<'r>,
     ) where
         C: Connection<Key = Key, Owner = resident::Shared<'d>, Output = storage::Shared>,
@@ -233,7 +233,7 @@ where
     }
 
     fn rearm<C>(
-        state: &mut Session<'r, 'd, Handler<X::Call, X::State>, X::Timer, C>,
+        state: &mut Store<'r, 'd, Handler<X::Call, X::State>, X::Timer, C>,
         entry: active::Entry<'r>,
     ) where
         C: Connection<Key = Key, Owner = resident::Shared<'d>, Output = storage::Shared>,
@@ -246,7 +246,7 @@ where
 
     pub(super) fn semantic<C>(
         &mut self,
-        state: &mut Session<'r, 'd, Handler<X::Call, X::State>, X::Timer, C>,
+        state: &mut Store<'r, 'd, Handler<X::Call, X::State>, X::Timer, C>,
         conn: &mut C,
         turn: &mut app::Turn<'_, '_, '_, 'd, O>,
         entry: active::Entry<'r>,
@@ -288,7 +288,7 @@ where
 
     fn dispatch<C>(
         &mut self,
-        state: &mut Session<'r, 'd, Handler<X::Call, X::State>, X::Timer, C>,
+        state: &mut Store<'r, 'd, Handler<X::Call, X::State>, X::Timer, C>,
         conn: &mut C,
         frame: message::Frame<resident::Shared<'d>>,
         entry: active::Entry<'r>,

@@ -92,7 +92,7 @@ impl<'d, H> Batch<'d, H> {
                 deadline::Head::Ready,
                 deadline::Body::None,
             ));
-            let (result, consumed) = match conn.ingress.protocol.take_frame() {
+            let (result, consumed) = match conn.ingress.protocol.take_frame(rest) {
                 Frame::Head(pending) => {
                     let result = match pending {
                         HeadFrame::Pending(pending) => disp
@@ -102,7 +102,7 @@ impl<'d, H> Batch<'d, H> {
                         HeadFrame::Rejected(pending) => disp
                             .as_mut()
                             .resume_error(pending, permit, rest, write, conn),
-                        HeadFrame::Line(line) => match line.advance(rest) {
+                        HeadFrame::Line(line) => match line {
                             Ok(parsing::LineProgress::Pending(line)) => {
                                 permit.defer();
                                 conn.ingress.protocol = Protocol::Line(line);

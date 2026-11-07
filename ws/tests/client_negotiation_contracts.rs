@@ -45,14 +45,10 @@ fn handshake_error_survives() {
         let probe = Probe::new(address, config)
             .with_headers(vec![("X-Large".into(), "x".repeat(16 * 1024))]);
         let probe = probe.expect("headers");
-        let result = probe.close(recovery::Policy::new(|_| {}, common::recover), |result| {
-            result.expect("WebSocket probe")
-        });
-        result
-            .as_ref()
-            .map_err(|cause| cause.kind())
-            .expect("topology");
-        let seen = result.ok().expect("checked topology");
+        let seen = probe.run(
+            common::client::Goal::Close,
+            recovery::Policy::new(|_| {}, common::recover),
+        );
         assert!(matches!(
             seen.close(),
             Some(client::CloseReason::Handshake(client::Error::Header(

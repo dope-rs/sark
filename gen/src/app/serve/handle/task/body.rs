@@ -52,7 +52,7 @@ pub(super) fn build(
         let var = fiber.1;
         quote! {
             #var(
-                #ns_core::manifold::task::request::Build<'d, #route>,
+                <<#route as #ns_core::route::Spec>::Request as #ns_core::route::Own>::TaskBuilder<'d>,
             ),
         }
     });
@@ -84,7 +84,7 @@ pub(super) fn build(
                         #var(
                             <<<#route as #ns_core::route::Spec>::Request
                                 as #ns_core::route::Own>::TaskBuilder<'d>
-                                as #ns_core::route::Push<'d>>::Error,
+                                as #ns_core::body::Push<'d>>::Error,
                         ),
                     }
                 }
@@ -114,7 +114,7 @@ pub(super) fn build(
                 #var(
                     <<<#route as #ns_core::route::Spec>::Request
                         as #ns_core::route::Own>::TaskBuilder<'d>
-                        as #ns_core::route::TaskBuild<'d>>::StepError,
+                        as #ns_core::body::Build<'d>>::StepError,
                 ),
             }
         })
@@ -172,7 +172,7 @@ pub(super) fn build(
                     #push_id::#var(#v_error) =>
                         <<<#route as #ns_core::route::Spec>::Request
                             as #ns_core::route::Own>::TaskBuilder<'d>
-                            as #ns_core::route::Push<'d>>::observe(#v_error, #v_obs),
+                            as #ns_core::body::Push<'d>>::observe(#v_error, #v_obs),
                 },
             }
         });
@@ -230,9 +230,7 @@ pub(super) fn build(
                                 );
                             }
                         };
-                        ::core::result::Result::Ok(#ident::#var(
-                            #ns_core::manifold::task::request::Build::new(#v_build),
-                        ))
+                        ::core::result::Result::Ok(#ident::#var(#v_build))
                     }
                 },
                 spec::Kind::Sync | spec::Kind::Stream | spec::Kind::Duplex => {

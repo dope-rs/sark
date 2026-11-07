@@ -24,7 +24,7 @@ use crate::{
         state::exchange::{Accepted, Deferred, Plain, Rejected, Routed, Sync, admit},
         sync::{
             self,
-            book::{self, ingress::Ingress, phase::Phase},
+            book::{self, Control, Delayed, driver::Driver, ingress::Ingress, phase::Phase},
         },
     },
     stream,
@@ -32,18 +32,25 @@ use crate::{
 
 type Retained<P> = RetainedHead<<P as section::Policy>::Block, Selected<P>>;
 
-pub(in crate::server::sync) trait Begin<S> {
-    type Router: decode::Decode;
-
+pub(in crate::server::sync) trait Begin<'d, R>:
+    request::Selection<R::Prepared>
+where
+    R: decode::Decode<Prepared: request::Synchronous, Head: request::Head<Start = Self>>,
+{
     fn begin(
-        &mut self,
-        router: &Self::Router,
+        self,
+        ingress: &mut Ingress<'_, 'd, R>,
+        router: &R,
         stream: stream::Key,
-        head: Retained<<Self::Router as decode::Decode>::Plan>,
-        boundary: Boundary,
         limits: server::Config,
         report: &mut impl FnMut(conn::Error),
     );
+
+    fn resume<B, D: FnMut(conn::Error)>(
+        driver: &mut Driver<'_, 'd, R, B, D>,
+        stream: stream::Key,
+        routed: Delayed<'d, R>,
+    ) -> Control<'d, R>;
 }
 
 impl<'a, 'd: 'a, R> Ingress<'a, 'd, R>
@@ -140,7 +147,7 @@ where
         self.admit(stream, phase, limits);
     }
 
-    fn select(
+    pub(super) fn select(
         &mut self,
         router: &R,
         stream: stream::Key,
@@ -246,10 +253,10 @@ where
     }
 }
 
-impl<'a, 'd: 'a, R, U> Begin<request::Plain<U>> for Ingress<'a, 'd, R>
+impl<'d, R, U> Begin<'d, R> for request::Plain<U>
 where
     R: decode::Decode,
-    R::Head: request::Head<Start = request::Plain<U>>,
+    R::Head: request::Head<Start = Self>,
     R::Prepared: request::Synchronous,
     U: state::Flow<R::Prepared, state::Routed, Family = R::Routes>
         + state::Admission<
@@ -259,63 +266,58 @@ where
             Output = <<R::Prepared as request::Prepared>::Family as state::Family<R::Prepared>>::State<Accepted<'d>>,
         >,
 {
-    type Router = R;
-
     fn begin(
-        &mut self,
-        router: &R,
+        self,
+        ingress: &mut Ingress<'_, 'd, R>,
+        _: &R,
         stream: stream::Key,
-        head: Retained<R::Plan>,
-        boundary: Boundary,
         limits: server::Config,
         _: &mut impl FnMut(conn::Error),
     ) {
-        let Some(request) = self.select(router, stream, head, boundary, limits)
-        else {
-            return;
-        };
-        self.plain(stream, request, limits);
+        ingress.plain(stream, self, limits);
+    }
+
+    fn resume<B, D: FnMut(conn::Error)>(
+        _: &mut Driver<'_, 'd, R, B, D>,
+        _: stream::Key,
+        never: Delayed<'d, R>,
+    ) -> Control<'d, R> {
+        match never {}
     }
 }
 
-impl<'a, 'd: 'a, R>
-    Begin<request::Guarded<<R::Routes as state::Family<R::Prepared>>::State<state::Routed>>>
-    for Ingress<'a, 'd, R>
+impl<'d, R> Begin<'d, R>
+    for request::Guarded<<R::Routes as state::Family<R::Prepared>>::State<state::Routed>>
 where
     R: decode::Guarded,
-    R::Head: request::Head<
-            Start = request::Guarded<
-                <R::Routes as state::Family<R::Prepared>>::State<state::Routed>,
-            >,
-        >,
+    R::Head: request::Head<Start = Self>,
     R::Prepared: request::Synchronous,
 {
-    type Router = R;
-
     fn begin(
-        &mut self,
+        self,
+        ingress: &mut Ingress<'_, 'd, R>,
         router: &R,
         stream: stream::Key,
-        head: Retained<R::Plan>,
-        boundary: Boundary,
         limits: server::Config,
         report: &mut impl FnMut(conn::Error),
     ) {
-        let Some(request) = self.select(router, stream, head, boundary, limits) else {
-            return;
-        };
-        self.checked(router, stream, request, limits, report);
+        ingress.checked(router, stream, self, limits, report);
+    }
+
+    fn resume<B, D: FnMut(conn::Error)>(
+        driver: &mut Driver<'_, 'd, R, B, D>,
+        stream: stream::Key,
+        routed: Delayed<'d, R>,
+    ) -> Control<'d, R> {
+        driver.routed(stream, routed)
     }
 }
 
-impl<'a, 'd: 'a, R, U>
-    Begin<request::Start<U, <R::Routes as state::Family<R::Prepared>>::State<state::Routed>>>
-    for Ingress<'a, 'd, R>
+impl<'d, R, U> Begin<'d, R>
+    for request::Start<U, <R::Routes as state::Family<R::Prepared>>::State<state::Routed>>
 where
     R: decode::Guarded,
-    R::Head: request::Head<
-        Start = request::Start<U, <R::Routes as state::Family<R::Prepared>>::State<state::Routed>>,
-    >,
+    R::Head: request::Head<Start = Self>,
     R::Prepared: request::Synchronous,
     U: state::Admission<
             R::Prepared,
@@ -324,24 +326,25 @@ where
             Output = <<R::Prepared as request::Prepared>::Family as state::Family<R::Prepared>>::State<Accepted<'d>>,
         >,
 {
-    type Router = R;
-
     fn begin(
-        &mut self,
+        self,
+        ingress: &mut Ingress<'_, 'd, R>,
         router: &R,
         stream: stream::Key,
-        head: Retained<R::Plan>,
-        boundary: Boundary,
         limits: server::Config,
         report: &mut impl FnMut(conn::Error),
     ) {
-        let Some(request) = self.select(router, stream, head, boundary, limits)
-        else {
-            return;
-        };
-        match request {
-            request::Start::Plain(request) => self.plain(stream, request, limits),
-            request::Start::Guarded(request) => self.checked(router, stream, request, limits, report),
+        match self {
+            request::Start::Plain(request) => ingress.plain(stream, request, limits),
+            request::Start::Guarded(request) => ingress.checked(router, stream, request, limits, report),
         }
+    }
+
+    fn resume<B, D: FnMut(conn::Error)>(
+        driver: &mut Driver<'_, 'd, R, B, D>,
+        stream: stream::Key,
+        routed: Delayed<'d, R>,
+    ) -> Control<'d, R> {
+        driver.routed(stream, routed)
     }
 }

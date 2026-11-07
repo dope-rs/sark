@@ -208,6 +208,7 @@ impl<'life, 'e: 'life, 'd: 'e, ID: Identity, H, M>
     type ConnState = protocol::Connection;
     type Failure = Observed;
     type Mode = mode::Stored;
+    type Receipt = ();
     type Requests = request::Enabled;
     type Response = response::Immediate;
     type Send = Shared;

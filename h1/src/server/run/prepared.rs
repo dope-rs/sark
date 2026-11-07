@@ -5,7 +5,7 @@ use dope::{
     manifold::{
         self,
         app::{env, receive},
-        network::listener,
+        network::listener::{self, handler},
         timing::interval,
     },
     net::{
@@ -57,10 +57,25 @@ where
     where
         F: bind::Bind<'w, 'd, ListenerId, Wire = E::Wire, Input = I, Egress = B>,
     {
+        self.build_with(app, std::convert::identity, driver)
+    }
+
+    pub fn build_with<F, A>(
+        self,
+        app: F,
+        transform: impl FnOnce(F::Application<'w, D>) -> A,
+        driver: &mut driver::Context<'_, 'd>,
+    ) -> Result<Root<'n, 'p, 's, 'w, 'd, ListenerId, DateId, A, E>, F::Error>
+    where
+        F: bind::Bind<'w, 'd, ListenerId, Wire = E::Wire, Egress = B>,
+        A: handler::Application<'d, ListenerId, Wire = E::Wire, Input = I, Egress = B>
+            + handler::Runtime<'w, 'd, ListenerId>,
+    {
         let binding = self.listener.binding(driver.driver_ref());
         let app = app
             .try_bind(binding, self.deadline, self.clock)
             .map_err(manifold::BuildError::Factory)?;
+        let app = transform(app);
         let listener = self
             .listener
             .build(app, driver)

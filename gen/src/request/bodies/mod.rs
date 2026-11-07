@@ -239,31 +239,20 @@ impl Plan {
         fields
     }
 
-    pub(super) fn task(&self, paths: &Paths) -> (proc_macro2::TokenStream, task::Plan<'_>) {
+    pub(super) fn task(&self, paths: &Paths) -> (proc_macro2::TokenStream, &Source) {
         let ns_core = &paths.core;
-        match &self.source {
-            Source::Json(json) => (
-                quote::quote!(#ns_core::body::Contiguous),
-                task::Plan::Json(&json.ty),
-            ),
+        let body = match &self.source {
+            Source::Json(_) => quote::quote!(#ns_core::body::Contiguous),
             Source::Raw(raw) => {
-                let mode = if raw.segmented {
+                if raw.segmented {
                     quote::quote!(#ns_core::body::Segmented)
                 } else {
                     quote::quote!(#ns_core::body::Contiguous)
-                };
-                (
-                    mode,
-                    task::Plan::Raw {
-                        segmented: raw.segmented,
-                    },
-                )
+                }
             }
-            Source::Discarded => (
-                quote::quote!(#ns_core::body::Discarded),
-                task::Plan::Discarded,
-            ),
-        }
+            Source::Discarded => quote::quote!(#ns_core::body::Discarded),
+        };
+        (body, &self.source)
     }
 
     pub(super) fn parsing(

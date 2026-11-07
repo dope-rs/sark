@@ -119,7 +119,7 @@ fn admission_and_retirement() {
                 }, recovery::Policy::new(
                     |event| assert!(matches!(event, Reclaimed::Shutdown), "unexpected client retirement: {event:?}"),
                     common::recover,
-                ), |result| result.expect("gRPC client completion"))
+                ))
                 .expect("gRPC client runtime");
         },
     ).expect("manifold stream roundtrip");
@@ -184,7 +184,6 @@ fn tiny_input_preserves_control_progress() {
                             |event| assert!(matches!(event, Reclaimed::Shutdown), "unexpected client retirement: {event:?}"),
                             common::recover,
                         ),
-                        |result| result.expect("gRPC client completion"),
                     )
                     .expect("gRPC client runtime");
             },
@@ -294,7 +293,7 @@ fn rejected_calls_reset() {
             }, recovery::Policy::new(
                 |event| assert!(matches!(event, Reclaimed::Shutdown), "unexpected client retirement: {event:?}"),
                 common::recover,
-            ), |result| result.expect("gRPC client completion"))
+            ))
             .expect("gRPC client runtime");
     }
 }
@@ -416,7 +415,7 @@ fn sender_notification_survives_cancel() {
             }, recovery::Policy::new(
                 |event| assert!(matches!(event, Reclaimed::Shutdown), "unexpected client retirement: {event:?}"),
                 common::recover,
-            ), |result| result.expect("gRPC client completion"))
+            ))
             .expect("gRPC client runtime");
     }
 }
@@ -477,7 +476,7 @@ fn queued_cancellations_release_before_refill() {
         }, recovery::Policy::new(
             |event| assert!(matches!(event, Reclaimed::Shutdown), "unexpected client retirement: {event:?}"),
             common::recover,
-        ), |result| result.expect("gRPC client completion"))
+        ))
         .expect("gRPC client runtime");
 }
 
@@ -559,7 +558,7 @@ fn split_cancellation_preserves_reused_claim() {
             }, recovery::Policy::new(
                 |event| assert!(matches!(event, Reclaimed::Shutdown), "unexpected client retirement: {event:?}"),
                 common::recover,
-            ), |result| result.expect("gRPC client completion"))
+            ))
             .expect("gRPC client runtime");
     }
 }

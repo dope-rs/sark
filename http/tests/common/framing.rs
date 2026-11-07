@@ -33,6 +33,13 @@ pub const EXPECT_VERSIONS: &[(&[u8], bool)] = &[
     ),
 ];
 pub const ACCEPT_GZIP: &[u8] = b"gzip";
+pub const ENCODING_QUALITY: [(&[u8], (u16, u16, u16)); 5] = [
+    (b"", (0, 0, 1000)),
+    (b"x-gzip;q=0,*;q=0.8", (800, 800, 1000)),
+    (b"br;q=1,gzip;q=0.4,identity;q=0.5", (1000, 400, 500)),
+    (b"br;q=0.6", (600, 400, 500)),
+    (b"gzip;q=0,*;q=0,identity;q=0", (600, 0, 0)),
+];
 pub const INVALID_GZIP_LINE: &[u8] = b"gzip;q=0, br;q=2\r\n";
 pub const INVALID_CONNECTION_LINE: &[u8] = b" \t, bad/name, \t\r\n";
 pub const LENGTH_LINES: &[(&[u8], usize, usize, usize)] = &[

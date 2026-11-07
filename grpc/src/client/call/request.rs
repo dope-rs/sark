@@ -99,35 +99,3 @@ where
         self.state.refill(&mut policy);
     }
 }
-
-impl<'scope, P, C> session::Session<'scope, P, C>
-where
-    C: Storage,
-    P: Plan<
-            C,
-            Key = stream::Key,
-            Fields = section::Owner,
-            Selection = (),
-            Connection: Connection<Error = conn::Error>,
-        >,
-{
-    pub(in crate::client) fn try_request<'notify, D: crate::Codec>(
-        &mut self,
-        stream: &mut Stream<'scope, P::Key>,
-        codec: &mut D,
-        message: &D::Encode,
-        done: &mut policies::Notify<'notify, '_, '_>,
-    ) -> call::Admission<()> {
-        self.state
-            .send(stream.response.stream, codec, message, done)
-    }
-
-    pub(in crate::client) fn finish_request<'notify>(
-        &mut self,
-        stream: Stream<'scope, P::Key>,
-        done: &mut policies::Notify<'notify, '_, '_>,
-    ) -> Result<unary::Handle<'scope, P::Key>, crate::Status> {
-        self.state.finish(stream.response.stream, done)?;
-        Ok(stream.response)
-    }
-}
