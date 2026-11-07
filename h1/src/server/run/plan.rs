@@ -300,8 +300,6 @@ where
         use dope::manifold::network::listener::topology::Layout;
 
         let needs =
-            needs.include(claim::Claim::new(settings::Routes::EMPTY).receive(P::RECEIVE.into()))?;
-        let needs =
             Layout::<ListenerId, I>::new(self.listener.listener.connections()).include_in(needs)?;
         self.date.include_in(needs)
     }
