@@ -12,17 +12,6 @@ pub(crate) enum Code {
     Internal = 1011,
 }
 
-impl Code {
-    pub(crate) const fn close(self, payload: &mut [u8; 2]) -> Close<'_> {
-        *payload = (self as u16).to_be_bytes();
-        Close {
-            payload,
-            code: Some(self as u16),
-            reason: "",
-        }
-    }
-}
-
 /// One peer close frame's admitted payload, code, and reason.
 #[derive(Clone, Copy, Debug)]
 pub struct Close<'payload> {

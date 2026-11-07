@@ -1,12 +1,5 @@
 use crate::manifold::schedule::WorkClass;
 
-#[derive(Clone, Copy)]
-pub(super) enum Round {
-    Single,
-    ControlFirst,
-    DataFirst,
-}
-
 #[derive(Default)]
 pub(super) struct Policy(u8);
 
@@ -30,14 +23,10 @@ impl Policy {
         self.0 &= !Self::DATA_BLOCKED;
     }
 
-    pub(super) fn finish_round(&mut self, round: Round, activity: WorkClass) {
-        match (round, activity) {
-            (Round::DataFirst | Round::Single, WorkClass::Data) => self.0 &= !Self::PREFER_DATA,
-            (Round::ControlFirst | Round::Single, WorkClass::Control) => {
-                self.0 |= Self::PREFER_DATA
-            }
-            (Round::DataFirst, WorkClass::Control) => self.0 &= !Self::PREFER_DATA,
-            (Round::ControlFirst, WorkClass::Data) => self.0 |= Self::PREFER_DATA,
+    pub(super) fn finish_round(&mut self, activity: WorkClass) {
+        match activity {
+            WorkClass::Data => self.0 &= !Self::PREFER_DATA,
+            WorkClass::Control => self.0 |= Self::PREFER_DATA,
         }
     }
 

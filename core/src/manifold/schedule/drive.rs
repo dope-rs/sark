@@ -13,8 +13,7 @@ use crate::manifold::{
     self,
     schedule::{
         Block, CONTROL_READY, Control, DATA_READY, Decision, Driver, LANES, Occupied, Report,
-        Settlement, Step, Terminal, Wait, WorkClass,
-        policy::{Policy, Round},
+        Settlement, Step, Terminal, Wait, WorkClass, policy::Policy,
     },
 };
 
@@ -80,21 +79,22 @@ impl<'a, S: Source> Drive<'a, S> {
                 break;
             }
             let both = has_data && control;
-            let round = if both {
-                if self.policy.is_data_next() {
-                    Round::DataFirst
+            let first = if both {
+                Some(if self.policy.is_data_next() {
+                    WorkClass::Data
                 } else {
-                    Round::ControlFirst
-                }
+                    WorkClass::Control
+                })
             } else {
-                Round::Single
+                None
             };
-            let first = matches!(round, Round::DataFirst);
             let mut activity = None;
             let mut done = false;
 
             let stop = 'round: {
-                if first && let Some(last) = tail {
+                if matches!(first, Some(WorkClass::Data))
+                    && let Some(last) = tail
+                {
                     let outcome = match self.one(DATA_READY, WorkClass::Data) {
                         Turn::Ready(outcome) => outcome,
                         Turn::Empty | Turn::Blocked => break 'round true,
@@ -128,7 +128,7 @@ impl<'a, S: Source> Drive<'a, S> {
             };
 
             if let Some(activity) = activity {
-                self.policy.finish_round(round, activity);
+                self.policy.finish_round(first.unwrap_or(activity));
             }
             if stop || ONE_ROUND {
                 break;

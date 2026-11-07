@@ -160,11 +160,12 @@ impl<H, M, ID: Identity> Logic<H, M, ID> {
         active: bool,
         ctx: &mut turns::Context<'_, '_, 'd, protocol::Connection, Shared, ID>,
     ) -> Result<(), client::Error> {
-        let mut bytes = [0; 2];
+        let bytes;
         let reply = match preview {
             Ok(Some(reply)) => reply,
             Err(error) if active => {
-                inbound::Reply::owed(0x8, error.close_code().close(&mut bytes).payload())
+                bytes = (error.close_code() as u16).to_be_bytes();
+                inbound::Reply::owed(0x8, &bytes)
             }
             Ok(None) | Err(_) => return Ok(()),
         };
