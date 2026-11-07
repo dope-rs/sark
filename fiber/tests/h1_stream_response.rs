@@ -3,13 +3,13 @@ pub mod common;
 use std::{
     cell::Cell,
     convert::Infallible,
-    io::{ErrorKind, Read, Write},
+    io::{Read, Write},
     net::TcpStream,
     rc::Rc,
     time::Duration,
 };
 
-use common::server::recover;
+use common::server::{peer::Endpoint as _, recover};
 use common::{
     route::body::stream::*,
     server::{self, Plan},
@@ -59,32 +59,7 @@ fn pending_chunks_complete() {
                 result
             },
             |bind| {
-                let mut sock = TcpStream::connect(bind).expect("connect");
-                sock.set_read_timeout(Some(Duration::from_secs(3)))
-                    .expect("set bounded response wait");
-
-                sock.write_all(b"GET /stream HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n")
-                    .expect("send complete stream request");
-                let mut resp = Vec::new();
-                let mut chunk = [0u8; 4096];
-                loop {
-                    let n = match sock.read(&mut chunk) {
-                        Err(error)
-                            if error.kind() == ErrorKind::WouldBlock
-                                || error.kind() == ErrorKind::TimedOut =>
-                        {
-                            break;
-                        }
-                        result => result.expect("read pending stream response"),
-                    };
-                    if n == 0 {
-                        break;
-                    }
-                    resp.extend_from_slice(&chunk[..n]);
-                    if resp.ends_with(b"0\r\n\r\n") {
-                        break;
-                    }
-                }
+                let resp = bind.try_get("/stream").expect("complete pending stream");
                 let resp_str = String::from_utf8_lossy(&resp);
 
                 assert!(resp_str.contains("200 OK"), "resp: {resp_str}");
@@ -94,11 +69,6 @@ fn pending_chunks_complete() {
                         .contains("transfer-encoding: chunked"),
                     "resp: {resp_str}"
                 );
-                assert!(
-                    resp.ends_with(b"0\r\n\r\n"),
-                    "stream never completed (wedged?): {resp_str}"
-                );
-
                 assert!(resp.ends_with(b"5\r\nalpha\r\n5\r\n-beta\r\n6\r\n-gamma\r\n0\r\n\r\n"));
             },
             |result| {
@@ -137,58 +107,12 @@ fn streams_response() {
                 result
             },
             |bind| {
-                {
-                    let mut sock = TcpStream::connect(bind).expect("connect");
-                    sock.set_read_timeout(Some(Duration::from_millis(500)))
-                        .expect("connected socket must accept a read timeout");
-
-                sock.write_all(b"GET /stream HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n")
-                    .expect("connected socket must accept the stream request");
-                let mut resp = Vec::new();
-                let mut chunk = [0u8; 4096];
-                loop {
-                    let n = match sock.read(&mut chunk) {
-                        Err(error) if error.kind() == ErrorKind::WouldBlock => break,
-                        result => result.expect("read streamed response"),
-                    };
-                    if n == 0 {
-                        break;
-                    }
-                    resp.extend_from_slice(&chunk[..n]);
-                    if resp.windows(5).any(|w| w == b"0\r\n\r\n")
-                        && resp.ends_with(b"0\r\n\r\n")
-                    {
-                        break;
-                    }
-                }
-                let resp_str = String::from_utf8_lossy(&resp);
-
-                assert!(resp_str.contains("200 OK"), "resp: {}", resp_str);
-                assert!(
-                    resp_str
-                        .to_lowercase()
-                        .contains("transfer-encoding: chunked"),
-                    "resp: {}",
-                    resp_str
-                );
-
-                assert!(resp.ends_with(b"5\r\nhello\r\n6\r\n world\r\n0\r\n\r\n"));
-
-                }
-                {
-                    let mut socket = TcpStream::connect(bind).expect("connect array stream");
-                    socket
-                        .set_read_timeout(Some(Duration::from_secs(3)))
-                        .expect("set array response deadline");
-                    socket
-                        .write_all(b"GET /arrays HTTP/1.1\r\nHost: task\r\nConnection: close\r\n\r\n")
-                        .expect("write array stream request");
-                    let mut response = Vec::new();
-                    socket
-                        .read_to_end(&mut response)
-                        .expect("read array stream response");
-                    assert!(response.ends_with(b"6\r\nhello \r\n6\r\nworld!\r\n0\r\n\r\n"));
-                }
+                let response = bind.try_get("/stream").expect("complete stream");
+                assert!(response.starts_with(b"HTTP/1.1 200 OK\r\n"));
+                assert!(String::from_utf8_lossy(&response).to_lowercase().contains("transfer-encoding: chunked"));
+                assert!(response.ends_with(b"5\r\nhello\r\n6\r\n world\r\n0\r\n\r\n"));
+                let response = bind.try_get("/arrays").expect("complete array stream");
+                assert!(response.ends_with(b"6\r\nhello \r\n6\r\nworld!\r\n0\r\n\r\n"));
                 let mut sock = TcpStream::connect(bind).expect("connect body stream");
                 sock.set_read_timeout(Some(Duration::from_secs(3)))
                     .expect("connected socket must accept a read timeout");

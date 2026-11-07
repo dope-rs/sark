@@ -73,6 +73,14 @@ fn selects_existing_protocol_owners() {
                 assert_eq!(status, Some(Code::Ok));
                 assert_eq!(body, [0, 0, 0, 0, 2, 8, 1]);
                 if round == 0 {
+                    for (path, suffix) in [
+                        ("/stream", b"5\r\nalpha\r\n5\r\n-beta\r\n6\r\n-gamma\r\n0\r\n\r\n".as_slice()),
+                        ("/empty", b"\r\n\r\n0\r\n\r\n".as_slice()),
+                    ] {
+                        let response = address.try_get(path).expect("gated stream completes");
+                        assert_eq!(response.status_line(), b"HTTP/1.1 200 OK");
+                        assert!(response.ends_with(suffix));
+                    }
                     let response = address.try_get("/wait").expect("H1 while H2 bank is full");
                     assert_eq!(response.status_line(), b"HTTP/1.1 200 OK");
                     assert!(response.ends_with(b"waited"));

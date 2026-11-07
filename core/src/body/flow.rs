@@ -8,6 +8,8 @@ use crate::body::{
     stream::{Admission, Drive, Stream},
 };
 
+mod raw;
+
 enum State<B, O> {
     Building(B),
     Ready(O),
@@ -36,18 +38,42 @@ pub struct Flow<'d, B: body::Build<'d>> {
 /// Completed output retaining its exact finished ingress and unsettled credit.
 #[must_use = "admit the output or discard its retained owner"]
 pub struct Ready<'d, B: body::Build<'d>, O: credit::Origin = credit::raw::Stored> {
-    pub(in crate::body) state: ingress::Finished<O>,
-    pub(in crate::body) output: B::Output,
-    pub(in crate::body) lifetime: marker::PhantomData<&'d ()>,
+    state: ingress::State<O>,
+    output: B::Output,
+    lifetime: marker::PhantomData<&'d ()>,
 }
 
 impl<'d, B: body::Build<'d>, O: credit::Origin> Ready<'d, B, O> {
+    fn try_new<E: credit::Evidence>(
+        state: ingress::State<O>,
+        output: B::Output,
+        event: &mut E,
+    ) -> Drive<'d, B, O> {
+        let state = match state.try_ready() {
+            Ok(state) => state,
+            Err(state) => {
+                return Drive::Rejected {
+                    stream: Stream::from_parts(state, Flow::from_output(output)),
+                    error: body::Error::InputIncomplete,
+                };
+            }
+        };
+        event.build_ready();
+        Drive::Ready(Self {
+            state,
+            output,
+            lifetime: marker::PhantomData,
+        })
+    }
+
     pub fn try_admit<E: credit::Evidence>(
         mut self,
         ledger: &mut credit::raw::Ledger<'_, O>,
         mut event: E,
     ) -> Admission<'d, B, E, O> {
-        match self.state.try_drain(ledger, &mut event) {
+        match ingress::Turn::new(&mut self.state, ledger, &mut event)
+            .try_drain(credit::Disposition::Admitted)
+        {
             Ok(()) => Admission::Accepted(self.output),
             Err(error) => Admission::Rejected {
                 ready: self,
@@ -68,7 +94,7 @@ impl<'d, B: body::Build<'d>, O: credit::Origin> Ready<'d, B, O> {
     pub fn into_release(self) -> credit::Release<O> {
         let Self { state, output, .. } = self;
         drop(output);
-        state.into_state().abandon()
+        state.abandon()
     }
 }
 
@@ -268,19 +294,7 @@ impl<'d, B: body::Build<'d>> Flow<'d, B> {
     ) -> Drive<'d, B, O> {
         let build = match self.state {
             State::Building(build) => build,
-            State::Ready(output) => {
-                return match state.try_ready() {
-                    Ok(state) => Drive::Ready(Ready::<B, O> {
-                        state,
-                        output,
-                        lifetime: self.lifetime,
-                    }),
-                    Err(state) => Drive::Rejected {
-                        stream: Stream::from_parts(state, Self::from_output(output)),
-                        error: body::Error::InputIncomplete,
-                    },
-                };
-            }
+            State::Ready(output) => return Ready::<B, O>::try_new(state, output, event),
         };
         match build.step(budget) {
             body::Step::NeedInput { build, released } => {
@@ -318,21 +332,7 @@ impl<'d, B: body::Build<'d>> Flow<'d, B> {
                         error: Error::Credit(error),
                     };
                 }
-                let state = match state.try_ready() {
-                    Ok(state) => state,
-                    Err(state) => {
-                        return Drive::Rejected {
-                            stream: Stream::from_parts(state, Self::from_output(output)),
-                            error: body::Error::InputIncomplete,
-                        };
-                    }
-                };
-                event.build_ready();
-                Drive::Ready(Ready::<B, O> {
-                    state,
-                    output,
-                    lifetime: self.lifetime,
-                })
+                Ready::<B, O>::try_new(state, output, event)
             }
             body::Step::Failed {
                 build,

@@ -43,6 +43,12 @@ fn array_handler() -> Stream<'req, IterStream<array::IntoIter<Chunk<'d>, 2>>> {
 }
 
 #[sark_fiber::handler(pub)]
+async fn empty() -> Stream<'static, IterStream<array::IntoIter<Chunk<'d>, 0>>> {
+    Yield::new().await;
+    [].into_stream()
+}
+
+#[sark_fiber::handler(pub)]
 fn echo_handler<F>(request: EchoReq, state: &State<F>) -> Output<'req, 'd>
 where
     F: for<'r, 's> Fn(Result<Output<'r, 's>, Error<'s>>) -> Output<'r, 's>,

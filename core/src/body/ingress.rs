@@ -12,25 +12,6 @@ pub struct State<O: credit::Origin = credit::raw::Stored> {
     pub(super) origin: O,
 }
 
-/// The exact ingress owner after its transport boundary has finished.
-pub(super) struct Finished<O: credit::Origin> {
-    pub(in crate::body) state: State<O>,
-}
-
-impl<O: credit::Origin> Finished<O> {
-    pub(super) fn into_state(self) -> State<O> {
-        self.state
-    }
-
-    pub(super) fn try_drain<E: credit::Evidence>(
-        &mut self,
-        ledger: &mut credit::raw::Ledger<'_, O>,
-        event: E,
-    ) -> Result<(), body::Error> {
-        Turn::new(&mut self.state, ledger, event).try_drain(credit::Disposition::Admitted)
-    }
-}
-
 impl<O: credit::Origin> State<O> {
     pub(super) fn new(start: admit::Start, origin: O) -> Self {
         let track = match start {
@@ -68,9 +49,9 @@ impl<O: credit::Origin> State<O> {
         self.credit
     }
 
-    pub(super) fn try_ready(self) -> Result<Finished<O>, Self> {
+    pub(super) fn try_ready(self) -> Result<Self, Self> {
         match self.track.boundary() {
-            Boundary::End => Ok(Finished { state: self }),
+            Boundary::End => Ok(self),
             Boundary::More => Err(self),
         }
     }

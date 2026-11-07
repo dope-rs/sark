@@ -14,7 +14,7 @@ impl Drain {
         Transitions: switch::Engine,
     {
         match conn.transitions.commit() {
-            switch::Commit::Ordinary => Self::ordinary(conn).into(),
+            switch::Commit::Ordinary => Self::ordinary(conn, pump::Next::Resume).into(),
             switch::Commit::Switch => pump::Completion::Switch,
         }
     }
@@ -30,18 +30,19 @@ impl Drain {
         if matches!(conn.mode(), switch::Mode::Switching(_)) {
             return pump::Next::None;
         }
-        Self::ordinary(conn)
+        Self::ordinary(conn, pump::Next::None)
     }
 
     fn ordinary<'d, Runtime, Pending, Transitions, Ready, Heads>(
         conn: &mut session::Conn<'d, Runtime, Pending, Transitions, Ready, Heads>,
+        stream: pump::Next<'d>,
     ) -> pump::Next<'d>
     where
         Runtime: pump::Tasks,
         Transitions: switch::Engine,
     {
         match conn.async_state.activity() {
-            pump::Activity::Stream => return pump::Next::None,
+            pump::Activity::Stream => return stream,
             pump::Activity::Idle | pump::Activity::Task => {}
         }
         if let Some(reason) = conn.deferred_action.take() {

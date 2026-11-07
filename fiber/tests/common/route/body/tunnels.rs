@@ -147,6 +147,8 @@ sark_fiber::define_cleartext_route! {
         CONNECT "*" => echo,
         WS "/ws" => websocket,
         GET "/wait" => async(capacity = 1, body = discarded) wait,
+        GET "/stream" => stream(capacity = 1) super::stream::pending,
+        GET "/empty" => async stream(capacity = 1, body = discarded) super::stream::empty,
     }
 }
 
