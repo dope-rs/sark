@@ -210,28 +210,8 @@ where
         let Credit { id, inner } = credit;
         let mut table = self.scope.streams();
         let mut recv = table.receive();
-        match self.credits.try_hold(id, inner, &mut recv) {
-            Ok(hold) => {
-                hold.commit(&mut recv);
-                Ok(())
-            }
-            Err(rejected) => {
-                let (credit, cause) = rejected.into_parts();
-                let credit = credit.release_conn(&mut recv).detach(&mut recv);
-                Err(match cause {
-                    credits::Rejection::Capacity => manifold::Credit::Capacity {
-                        stream_id: id,
-                        credit,
-                    },
-                    credits::Rejection::Mismatch { held } => manifold::Credit::Mismatch {
-                        stream_id: id,
-                        held,
-                        credit,
-                    },
-                }
-                .into())
-            }
-        }
+        self.credits.try_hold(id, inner, &mut recv)?;
+        Ok(())
     }
 
     fn reject(&mut self, credit: Self::Credit) {
