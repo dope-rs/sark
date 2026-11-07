@@ -159,9 +159,9 @@ impl State {
             if !tail.is_empty()
                 && let Some(progress) = self.partial(tail)
             {
-                let progress = progress?;
-                position = Self::advance(position, progress.consumed(), input.len())?;
-                continue;
+                progress?;
+                position = input.len();
+                break;
             }
             let core = &mut self.core;
             let step = match self.phase.view() {
@@ -266,19 +266,13 @@ impl State {
                 Borrowed::Name(mut string, mut table) => {
                     let progress =
                         Self::feed(&mut string, tail, table.writer(), Error::NameEncoding)?;
-                    match string.completion() {
-                        strings::Completion::Complete => Self::finish_name(table, string)?,
-                        strings::Completion::Pending => table.pending(string),
-                    }
+                    Self::finish_name(table, string)?;
                     Ok(Step::Consumed(progress.consumed()))
                 }
                 Borrowed::Value(Value::Literal(mut string), mut table) => {
                     let progress =
                         Self::feed(&mut string, tail, table.writer(), Error::ValueEncoding)?;
-                    match string.completion() {
-                        strings::Completion::Complete => Self::finish_value(table, string)?,
-                        strings::Completion::Pending => table.pending(Value::Literal(string)),
-                    }
+                    Self::finish_value(table, string)?;
                     Ok(Step::Consumed(progress.consumed()))
                 }
             }?;

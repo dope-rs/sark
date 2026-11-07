@@ -139,22 +139,12 @@ struct Decoder {
 }
 
 #[derive(Clone, Copy)]
+#[repr(u8)]
 enum Setting {
-    Table,
-    Fields,
-    Blocked,
-    Connect,
-}
-
-impl Setting {
-    const fn mask(self) -> u8 {
-        match self {
-            Self::Table => 1,
-            Self::Fields => 2,
-            Self::Blocked => 4,
-            Self::Connect => 8,
-        }
-    }
+    Table = 1,
+    Fields = 2,
+    Blocked = 4,
+    Connect = 8,
 }
 
 impl Decoder {
@@ -179,7 +169,7 @@ impl Decoder {
         let Some(setting) = setting else {
             return Ok(());
         };
-        let mask = setting.mask();
+        let mask = setting as u8;
         if self.seen & mask != 0 {
             return Err(ParseError::DuplicateSetting);
         }

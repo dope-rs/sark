@@ -342,10 +342,10 @@ impl Plan {
                             break '__sark_route_match;
                         };
                         #v_rstate = #v_nstate;
-                        #v_pend = #v_target.len() - #v_rtail.len();
                         let ::core::option::Option::Some((&b'/', #v_tail)) =
                             #v_rtail.split_first()
                         else {
+                            #v_pend = #v_target.len() - #v_rtail.len();
                             break;
                         };
                         #v_rtail = #v_tail;

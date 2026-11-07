@@ -108,9 +108,7 @@ impl<'a, S: Source> Drive<'a, S> {
                         Turn::Ready(outcome) => outcome,
                         Turn::Empty | Turn::Blocked => break 'round true,
                     };
-                    if activity.is_none() {
-                        activity = Some(outcome.activity);
-                    }
+                    activity = Some(outcome.activity);
                 }
 
                 while tail.is_some() && !done && self.remaining != 0 && !self.policy.is_blocked() {
@@ -120,9 +118,7 @@ impl<'a, S: Source> Drive<'a, S> {
                         Turn::Blocked => break 'round true,
                     };
                     done = Some(outcome.stream) == tail;
-                    if activity.is_none() {
-                        activity = Some(outcome.activity);
-                    }
+                    activity = Some(outcome.activity);
                 }
                 false
             };

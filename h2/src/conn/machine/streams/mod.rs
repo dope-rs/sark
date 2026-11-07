@@ -105,12 +105,7 @@ where
     }
 
     pub fn cancel(&mut self, key: stream::Key, error: numbers::ErrorCode) {
-        if matches!(
-            self.conn.state.active_streams.begin_reset(key, error),
-            registry::Begin::Started
-        ) {
-            self.finish_off(key);
-        }
+        let _ = self.try_cancel(key, error);
     }
 
     pub(crate) fn retire(
