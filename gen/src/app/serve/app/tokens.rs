@@ -3,7 +3,6 @@ use crate::{macros::tokens::local, runtime::paths::Paths};
 pub(super) struct Prelude<'a> {
     pub definitions: &'a proc_macro2::TokenStream,
     pub task_tags: &'a proc_macro2::TokenStream,
-    pub fixed: &'a proc_macro2::TokenStream,
     pub factory: &'a proc_macro2::TokenStream,
 }
 
@@ -60,7 +59,6 @@ pub(super) fn build<'a>(
     let Prelude {
         definitions: defs,
         task_tags: tags,
-        fixed,
         factory,
     } = prelude;
     let Names {
@@ -93,7 +91,6 @@ pub(super) fn build<'a>(
     quote::quote! {
             #defs
             #tags
-            #fixed
             #factory
 
             #[#ns_fiber::pin_project::pin_project(!Unpin)]

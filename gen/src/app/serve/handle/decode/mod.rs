@@ -10,7 +10,6 @@ use crate::{
 };
 
 mod arms;
-mod body;
 mod prepared;
 pub(super) mod state;
 

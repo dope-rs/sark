@@ -3,7 +3,6 @@ use crate::{
     macros::tokens::local,
     runtime::paths::Paths,
 };
-mod finish;
 mod h1;
 mod surfaces;
 mod tokens;
@@ -65,14 +64,6 @@ pub(super) fn build<'source, 'spec>(
         .iter()
         .map(|task| (task.tag(api), task.variant()))
         .unzip();
-    let fixed_id = format_ident!("__{}Fixed", api);
-    let fixed_fibers: Vec<_> = exec
-        .fibers()
-        .iter()
-        .copied()
-        .filter(|(_, fiber)| !fiber.stream)
-        .collect();
-    let fixed = finish::define(paths, generics, &fixed_fibers, &fixed_id);
     let dtree = layout::Tree::new(&exec.direct).ty(paths);
     let qtree = layout::Tree::new(&exec.queued).ty(paths);
     let core_def = &shape.core_generic_def;
@@ -364,7 +355,6 @@ pub(super) fn build<'source, 'spec>(
         tokens::Prelude {
             definitions: &defs,
             task_tags: &tags,
-            fixed: &fixed,
             factory: &factory,
         },
         names,

@@ -7,6 +7,7 @@ pub(super) struct Flow<'a> {
     pub(super) maps: &'a [proc_macro2::TokenStream],
     pub(super) each: &'a [proc_macro2::TokenStream],
     pub(super) folds: &'a [proc_macro2::TokenStream],
+    pub(super) bodies: &'a [proc_macro2::TokenStream],
     pub(super) finish: &'a [proc_macro2::TokenStream],
     pub(super) open: &'a arms::Arms,
 }
@@ -16,7 +17,7 @@ impl Flow<'_> {
         use quote::quote;
 
         let ns_core = &paths.core;
-        let [v_each, v_map, v_fold] = ["each", "map", "fold"].map(local);
+        let [v_each, v_map, v_fold, v_visit] = ["each", "map", "fold", "visit"].map(local);
 
         let Self {
             prepared,
@@ -25,6 +26,7 @@ impl Flow<'_> {
             maps,
             each,
             folds,
+            bodies,
             finish,
             open,
         } = self;
@@ -57,6 +59,15 @@ impl Flow<'_> {
                 { match self { #( #finish )* } }
 
                 #open
+            }
+
+            impl<F: #ns_core::decode::state::Set>
+                #ns_core::decode::state::body::Flow<F> for #state<F>
+            {
+                fn fold<V: #ns_core::decode::state::body::Fold<F>>(
+                    self,
+                    #v_visit: V,
+                ) -> V::Output { match self { #( #bodies )* } }
             }
         }
     }

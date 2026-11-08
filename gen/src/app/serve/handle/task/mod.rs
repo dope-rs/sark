@@ -10,6 +10,7 @@ use crate::{
 };
 
 mod body;
+mod finish;
 mod open;
 mod route;
 
@@ -117,10 +118,12 @@ impl Task {
             .exec
             .fibers()
             .iter()
+            .copied()
             .filter(|(_, fiber)| !fiber.stream)
             .collect();
+        let ident = quote::format_ident!("__{}Fixed", spec.name);
+        let fixed_def = finish::define(paths, symbols, &fixed_fibers, &ident);
         let fixed = if !fixed_fibers.is_empty() {
-            let ident = quote::format_ident!("__{}Fixed", spec.name);
             let state = spec.state.ty();
             let payloads = fixed_fibers
                 .iter()
@@ -209,6 +212,7 @@ impl Task {
             (quote!(_), quote!(_), quote!(_), quote!(_), quote!(_))
         };
         quote! {
+            #fixed_def
             #plan
 
             #( #slots )*
