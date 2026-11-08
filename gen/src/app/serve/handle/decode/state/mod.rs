@@ -101,28 +101,28 @@ impl State {
                     quote!(SyncFinished),
                     quote!(sync_open),
                     quote!(sync_done),
-                    quote!(sync),
+                    syn::Ident::new("sync", proc_macro2::Span::call_site()),
                 ),
                 spec::Kind::Fiber => (
                     quote!(TaskOpen),
                     quote!(TaskFinished),
                     quote!(task_open),
                     quote!(task_done),
-                    quote!(task),
+                    syn::Ident::new("task", proc_macro2::Span::call_site()),
                 ),
                 spec::Kind::Stream => (
                     quote!(UnsupportedOpen),
                     quote!(UnsupportedFinished),
                     quote!(reject_open),
                     quote!(reject_done),
-                    quote!(reject),
+                    syn::Ident::new("reject", proc_macro2::Span::call_site()),
                 ),
                 spec::Kind::Duplex => (
                     quote!(DuplexOpen),
                     quote!(DuplexFinished),
                     quote!(duplex_open),
                     quote!(duplex_done),
-                    quote!(duplex),
+                    syn::Ident::new("duplex", proc_macro2::Span::call_site()),
                 ),
             };
             let variants = quote! {
@@ -182,15 +182,9 @@ impl State {
             let gated = !entry.guards.is_empty();
             let branch = if gated { &mut g_open } else { &mut p_open };
             match item.kind {
-                spec::Kind::Sync => {
-                    let action = format_ident!("sync");
-                    c_open.push_active(&action, &open, &finished);
-                    branch.push_active(&action, &open, &finished);
-                }
-                spec::Kind::Fiber => {
-                    let action = format_ident!("task");
-                    c_open.push_active(&action, &open, &finished);
-                    branch.push_active(&action, &open, &finished);
+                spec::Kind::Sync | spec::Kind::Fiber => {
+                    c_open.push_active(&end_fn, &open, &finished);
+                    branch.push_active(&end_fn, &open, &finished);
                 }
                 spec::Kind::Stream | spec::Kind::Duplex => {
                     c_open.push_never(&open, &finished);
@@ -246,13 +240,9 @@ impl State {
                     quote! { #slot { head: #v_head } }
                 }
             };
+            let method = entry.method.http_token(paths);
             let started = |phase: &syn::Ident, body: proc_macro2::TokenStream| {
-                let method = entry.method.http_token(paths);
-                let state = if entry.guards.is_empty() {
-                    quote! { #plain::#phase(#req_slot, #body) }
-                } else {
-                    quote! { #guarded::#phase(#req_slot, #body) }
-                };
+                let state = quote! { #subset::#phase(#req_slot, #body) };
                 if all_p {
                     quote! { #ns_core::decode::request::Plain::new(#state) }
                 } else if all_g {
