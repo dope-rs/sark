@@ -36,10 +36,7 @@ impl Key {
     }
 
     pub fn accept(&self) -> [u8; 28] {
-        let mut input = [0; 60];
-        input[..24].copy_from_slice(&self.0);
-        input[24..].copy_from_slice(GUID);
-        let digest = sha1_accept(&input);
+        let digest = sha1_accept(&self.0);
         let mut accept = [0; 28];
         let mut offset = 0;
         Encoder::padded(&digest).write(|block| {
@@ -50,7 +47,7 @@ impl Key {
     }
 }
 
-fn sha1_accept(input: &[u8; 60]) -> [u8; 20] {
+fn sha1_accept(key: &[u8; 24]) -> [u8; 20] {
     let mut state = [
         0x6745_2301,
         0xEFCD_AB89,
@@ -59,7 +56,8 @@ fn sha1_accept(input: &[u8; 60]) -> [u8; 20] {
         0xC3D2_E1F0,
     ];
     let mut first = [0; 64];
-    first[..60].copy_from_slice(input);
+    first[..24].copy_from_slice(key);
+    first[24..60].copy_from_slice(GUID);
     first[60] = 0x80;
     sha1_compress(&mut state, &first);
 

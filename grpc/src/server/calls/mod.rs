@@ -275,11 +275,9 @@ where
     }
 
     pub(super) fn try_remove(&mut self, key: Key) -> Result<(), Error> {
-        self.records
-            .try_remove(key, |record| -> Result<(), Error> {
-                Self::release(record, &mut self.data, &mut self.messages)
-            })?
-            .ok_or(Error::State)?;
+        let mut entry = self.records.entry(key).ok_or(Error::State)?;
+        Self::release(entry.get_mut(), &mut self.data, &mut self.messages)?;
+        entry.discard();
         Ok(())
     }
 
