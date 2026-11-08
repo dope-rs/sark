@@ -659,6 +659,7 @@ fn routed_response_or_unsupported() {
     use dope::core::io::datagram;
     use dope_quic::runtime::{endpoint::server::Plan, routing};
 
+    let mut group = None;
     let result = Scenario {
         name: "routed-response",
         requests: vec![Spec::new(b"/async/quick", b"")],
@@ -671,8 +672,8 @@ fn routed_response_or_unsupported() {
     .try_run_with(
         |(address, reservation), tls, options, endpoint| {
             drop(reservation);
-            let binding = routing::Group::bind(address, routing::Count::MIN)
-                .map_err(Error::Group)?
+            let binding = group
+                .insert(routing::Group::bind(address, routing::Count::MIN).map_err(Error::Group)?)
                 .split()
                 .next()
                 .expect("one routed binding");

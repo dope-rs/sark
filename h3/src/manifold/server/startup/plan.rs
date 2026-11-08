@@ -25,31 +25,19 @@ use crate::manifold::server::{
     Config, ConfigError, Handle, Handler, Mode, Setup, deadline, failure, rotation, startup,
 };
 
-type Bound<'pool, 'd, const ID: u8, R, T, O, L, E, A, C, Q> = Result<
-    Endpoint<
-        'd,
-        ID,
-        Handler<'d, <T as Bind<'d>>::Runtime, O, L, E>,
-        <R as receive::Policy>::Buffer<'d>,
-        Run<A, C>,
-        Owned<Q>,
-        datagram::Sealed<'pool>,
-    >,
-    startup::BindError<<T as Bind<'d>>::Error>,
->;
-
 /// Validated H3 and QUIC startup authority for one driver route.
 #[must_use = "an H3 plan must be bound to its generated application"]
 pub struct Plan<
+    'g,
     const ID: u8,
     R: receive::Policy = receive::Retained,
     Q: routing::LocalRoute = routing::Plain,
 > {
-    endpoint: server::Plan<ID, R, Q>,
+    endpoint: server::Plan<'g, ID, R, Q>,
     config: Setup,
 }
 
-impl<const ID: u8> Plan<ID> {
+impl<const ID: u8> Plan<'static, ID> {
     pub fn try_new(
         bind: SocketAddr,
         tls: ServerConfig,
@@ -64,9 +52,12 @@ impl<const ID: u8> Plan<ID> {
     }
 }
 
-impl<const ID: u8, R: receive::Policy, Q: routing::LocalRoute> Plan<ID, R, Q> {
+impl<'g, const ID: u8, R: receive::Policy, Q: routing::LocalRoute> Plan<'g, ID, R, Q> {
     /// Adds validated H3 limits to an existing QUIC plan without rebuilding its authority.
-    pub fn try_from(endpoint: server::Plan<ID, R, Q>, app: Config) -> Result<Self, ConfigError> {
+    pub fn try_from(
+        endpoint: server::Plan<'g, ID, R, Q>,
+        app: Config,
+    ) -> Result<Self, ConfigError> {
         Ok(Self {
             endpoint,
             config: Setup::try_new(app)?,
@@ -82,8 +73,20 @@ impl<const ID: u8, R: receive::Policy, Q: routing::LocalRoute> Plan<ID, R, Q> {
         deadline: E,
         tasks: A,
         driver: &mut driver::Context<'_, 'd>,
-    ) -> Bound<'pool, 'd, ID, R, T, O, L, E, A, C, Q>
+    ) -> Result<
+        Endpoint<
+            'd,
+            ID,
+            Handler<'d, T::Runtime, O, L, E>,
+            R::Buffer<'d>,
+            Run<A, C>,
+            Owned<Q>,
+            datagram::Sealed<'pool>,
+        >,
+        startup::BindError<T::Error>,
+    >
     where
+        'g: 'd,
         T: Bind<'d, Target = Handle<'d, ID>>,
         O: Mode<'d, ID> + failure::Packet,
         L: rotation::Policy<'d>,
@@ -107,26 +110,23 @@ impl<const ID: u8, R: receive::Policy, Q: routing::LocalRoute> Plan<ID, R, Q> {
     {
         let Self { endpoint, config } = self;
         let seed = hash::Seed::new(driver.driver_ref().random_seed());
-        endpoint
-            .bind_with::<C, _, _, _, _>(driver, |binding| {
-                Handler::try_bind(binding, router, config, observer, lifetime, deadline, seed)
-                    .map(|handler| (handler, tasks))
-                    .map_err(startup::BindError::Application)
-            })
-            .map_err(Into::into)
+        endpoint.bind_with::<C, _, _, _, _>(driver, |binding| {
+            Handler::try_bind(binding, router, config, observer, lifetime, deadline, seed)
+                .map(|handler| (handler, tasks))
+        })
     }
 }
 
-impl<const ID: u8, R: receive::Policy, Q: routing::LocalRoute> AsRef<server::Plan<ID, R, Q>>
-    for Plan<ID, R, Q>
+impl<'g, const ID: u8, R: receive::Policy, Q: routing::LocalRoute> AsRef<server::Plan<'g, ID, R, Q>>
+    for Plan<'g, ID, R, Q>
 {
-    fn as_ref(&self) -> &server::Plan<ID, R, Q> {
+    fn as_ref(&self) -> &server::Plan<'g, ID, R, Q> {
         &self.endpoint
     }
 }
 
 impl<const ID: u8, R: receive::Policy, Q: routing::LocalRoute> settings::Resource
-    for Plan<ID, R, Q>
+    for Plan<'_, ID, R, Q>
 {
     fn include_in(&self, needs: claim::Needs) -> Result<claim::Needs, errors::Claim> {
         settings::Resource::include_in(self.endpoint.as_ref(), needs)

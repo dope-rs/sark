@@ -234,15 +234,15 @@ where
     }
 }
 
-pub(crate) struct RunPlan<'a, Q: routing::LocalRoute, P> {
-    pub(crate) plan: Plan<LISTENER, receive::Retained, Q>,
+pub(crate) struct RunPlan<'g, 'a, Q: routing::LocalRoute, P> {
+    pub(crate) plan: Plan<'g, LISTENER, receive::Retained, Q>,
     pub(crate) proof: Rc<Shared<'a>>,
     pub(crate) client: client::Plan<DIALER>,
     pub(crate) reservation: P,
     pub(crate) task_capacity: slots::Slots,
 }
 
-impl<Q: routing::LocalRoute, P> settings::Resource for RunPlan<'_, Q, P> {
+impl<Q: routing::LocalRoute, P> settings::Resource for RunPlan<'_, '_, Q, P> {
     fn include_in(&self, needs: claim::Needs) -> Result<claim::Needs, errors::Claim> {
         let needs = self.plan.include_in(needs)?;
         let needs = self.client.as_ref().include_in(needs)?;
