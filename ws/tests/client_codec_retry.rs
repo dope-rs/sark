@@ -205,7 +205,5 @@ fn retry_keeps_progress() {
             ),
             |result| result.expect("client execution"),
         )
-        .as_ref()
-        .map_err(|error| error.kind())
         .expect("client setup");
 }

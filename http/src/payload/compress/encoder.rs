@@ -79,7 +79,8 @@ impl Encoder {
             .copy_from_slice(&(src.len() as u32).to_le_bytes());
         // SAFETY: deflate reported a complete stream and the exact nonzero extent
         // was bounded above while this output stayed borrowed by its owner.
-        Some(unsafe { output.complete(written) })
+        unsafe { output.complete(written) };
+        Some(())
     }
 }
 

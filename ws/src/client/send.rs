@@ -64,10 +64,11 @@ impl<'d, B: ?Sized, ID: Identity> Driver<'_, '_, '_, 'd, B, ID> {
                 return task::Poll::Ready(Err(error));
             }
         };
-        port.shared.set_waiter(plan.batch(), wake);
-        let result = local.with_region(|region| port.try_commit(region, plan));
-        match result {
-            Err(client::Error::Admission(_)) => task::Poll::Pending,
+        match local.with_region(|region| port.try_commit(region, plan)) {
+            Err(client::Error::Admission(_)) => {
+                port.shared.set_waiter(plan.batch(), wake);
+                task::Poll::Pending
+            }
             result => {
                 self.clear_waiter();
                 task::Poll::Ready(result)

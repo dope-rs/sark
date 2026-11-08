@@ -174,8 +174,6 @@ fn close_seals_generation() {
                     recovery::Policy::new(|_| {}, common::recover),
                     |result| result.expect("WebSocket execution"),
                 )
-                .as_ref()
-                .map_err(|cause| cause.kind())
                 .expect("WebSocket operation");
             assert_eq!(messages.hits(), 1);
         })
@@ -243,8 +241,6 @@ fn close_rejection_open() {
                 recovery::Policy::new(|_| {}, common::recover),
                 |result| result.expect("WebSocket execution"),
             )
-            .as_ref()
-            .map_err(|cause| cause.kind())
             .expect("WebSocket operation");
         assert_eq!(closed.hits(), 1);
         assert_eq!(opened.hits(), 1);

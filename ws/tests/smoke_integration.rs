@@ -66,12 +66,11 @@ fn opening_has_one_owner() {
                     domain.run(
                         channel::App::<_, mode::Observe>::new(Meter { proof: sink, auth }),
                         |mut app| {
-                            app.wait(|result| {
-                                result
-                                    .as_ref()
-                                    .map_err(|cause| cause.cause())
-                                    .expect("WebSocket wait");
-                            })
+                            app.wait()?
+                                .as_ref()
+                                .map_err(|cause| cause.cause())
+                                .expect("WebSocket wait");
+                            Ok::<_, topology::WaitError>(())
                         },
                     )
                 },
@@ -80,7 +79,6 @@ fn opening_has_one_owner() {
             );
             opened
                 .as_ref()
-                .map_err(|cause| cause.kind())
                 .expect("WebSocket operation")
                 .as_ref()
                 .expect("WebSocket operation");

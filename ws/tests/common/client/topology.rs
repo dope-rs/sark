@@ -93,24 +93,10 @@ impl storage::Build for Layout {
 }
 
 /// Failure while constructing or running one WebSocket client.
+#[derive(Debug)]
 pub enum Error {
     Config(client::Error),
     Claim(errors::Claim),
-}
-
-#[derive(Debug)]
-pub enum Kind<'a> {
-    Config(&'a client::Error),
-    Claim(&'a errors::Claim),
-}
-
-impl Error {
-    pub fn kind(&self) -> Kind<'_> {
-        match self {
-            Self::Config(cause) => Kind::Config(cause),
-            Self::Claim(cause) => Kind::Claim(cause),
-        }
-    }
 }
 
 #[derive(Debug)]
