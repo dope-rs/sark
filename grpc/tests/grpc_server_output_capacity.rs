@@ -1,7 +1,7 @@
 use dope::core::driver::life::recovery;
 pub mod common;
 
-use std::{convert::Infallible, sync::mpsc, time::Duration};
+use std::{convert::Infallible, time::Duration};
 
 use common::{
     codec::Bytes,
@@ -14,13 +14,18 @@ use common::{
     },
 };
 use dope::{
-    core::driver::route::{FrameworkTag, KeyTag, Tag, kind},
+    core::{
+        driver::route::{FrameworkTag, KeyTag, Tag, kind},
+        io::socket::Listener,
+    },
     manifold::timing,
-    runtime::{executor::session, topology, topology::lending::Stage},
+    runtime::{executor::session, topology::lending::Stage},
 };
+use dope_fiber::abi::race::Either;
 use dope_test::{
     fibers,
     harness::{
+        scenario::process::Deadline,
         server::Pair,
         signals::{LocalGate, Progress as _},
     },
@@ -101,10 +106,10 @@ fn failed_response_stops() {
             },
             |address| {
                 if live {
-                    let [(failed_body, failed), (ready_body, ready)] = Waiters::try_pair(address)
-                        .expect("paired capacity requests")
-                        .try_release()
-                        .expect("paired capacity responses");
+                    let mut waiters = Waiters::try_pair(address).expect("paired capacity requests");
+                    waiters.try_window(64).expect("response credit");
+                    let [(failed_body, failed), (ready_body, ready)] =
+                        waiters.try_read().expect("paired capacity responses");
                     assert!(failed_body.is_empty() && ready_body.is_empty());
                     assert_eq!(
                         failed.expect("failed output").code(),
@@ -128,150 +133,151 @@ fn failed_response_stops() {
 #[test]
 fn released_waiters() {
     for cancel in [false, true] {
-        let pair = Pair::bind().expect("waiter server");
-        let limits =
-            Limits::default().with_output(Output::try_new(1, 9).expect("one response capacity"));
-        let settings = Settings::new(pair.addr(), limits);
-        let (release, ready) = mpsc::sync_channel(1);
-        pair.run(
-            move |context, listener| {
-                let counts = LocalGate::new();
-                let blocked = counts.handle();
-                let resumed = LocalGate::new();
-                let resumed = resumed.handle();
-                let attempts = LocalGate::new();
-                let attempts = attempts.handle();
-                let handler = Capacity {
-                    blocked: Some(blocked),
-                    resumed: Some(resumed),
-                    attempts: Some(attempts),
-                };
-                let bank = Bank::try_new(settings.connections.count(), settings.limits)
-                    .expect("server bank");
-                let prepared = settings
-                    .h2::<KeyTag<0>>()
-                    .expect("H2 plan")
-                    .with_bound(listener)
-                    .with_plain::<_, modes::Serve<Infallible>>(Plan::new(
-                        handler,
-                        &bank,
-                        mode::Direct,
-                    ))
-                    .for_install::<timing::Throughput>()
-                    .expect("server resources");
-                let mut reports =
-                    Reports::new(prepared.layout(), [<FrameworkTag<kind::Any> as Tag>::ROUTE]);
-                let mut finish = session::Completion::new();
-                prepared.enter_with(
-                    context,
-                    |worker| {
-                        worker
-                            .lend(|plan, stage| {
-                                plan.install(stage, |app, stage| {
-                                    Stage::with_app(stage, &mut finish, app, |mut app| {
-                                        let waiters = if cancel { 2 } else { 3 };
+        Deadline::with(Duration::from_secs(30), |_| {
+            let listener = Listener::bind(([127, 0, 0, 1], 0).into()).expect("waiter server");
+            let address = listener.local_addr();
+            let limits = Limits::default()
+                .with_output(Output::try_new(1, 9).expect("one response capacity"));
+            let settings = Settings::new(address, limits);
+            let counts = LocalGate::new();
+            let blocked = counts.handle();
+            let resumed = LocalGate::new();
+            let resumed = resumed.handle();
+            let attempts = LocalGate::new();
+            let attempts = attempts.handle();
+            let completed = LocalGate::new();
+            let completed = completed.handle();
+            let handler = Capacity {
+                blocked: Some(blocked),
+                resumed: Some(resumed),
+                attempts: Some(attempts),
+                completed: Some(completed),
+            };
+            let bank =
+                Bank::try_new(settings.connections.count(), settings.limits).expect("server bank");
+            let prepared = settings
+                .h2::<KeyTag<0>>()
+                .expect("H2 plan")
+                .with_bound(listener)
+                .with_plain::<_, modes::Serve<Infallible>>(Plan::new(handler, &bank, mode::Direct))
+                .for_install::<timing::Throughput>()
+                .expect("server resources");
+            let mut reports =
+                Reports::new(prepared.layout(), [<FrameworkTag<kind::Any> as Tag>::ROUTE]);
+            let mut finish = session::Completion::new();
+            let waiters = prepared.with_local(
+                |worker| {
+                    worker.lend(|plan, stage| {
+                        plan.install(stage, |app, stage| {
+                            Stage::with_app(stage, &mut finish, app, |mut app| {
+                                let waiters = if cancel {
+                                    Either::Left(
+                                        Waiters::try_pair(address).expect("zero-window requests"),
+                                    )
+                                } else {
+                                    Either::Right(
+                                        Waiters::try_new(address).expect("zero-window requests"),
+                                    )
+                                };
+                                let want = if cancel { 2 } else { 3 };
+                                assert_eq!(
+                                    fibers::Harness::new(Duration::from_secs(2))
+                                        .try_wait(&mut app, &blocked, want)
+                                        .expect("progress drive"),
+                                    fibers::Wait::Reached
+                                );
+                                assert_eq!(blocked.hits(), want);
+                                let waiters = match waiters {
+                                    Either::Left(waiters) => {
+                                        let mut waiter =
+                                            waiters.try_cancel().expect("cancel held response");
                                         assert_eq!(
                                             fibers::Harness::new(Duration::from_secs(2))
-                                                .try_wait(&mut app, &blocked, waiters)
-                                                .expect("progress drive"),
+                                                .try_wait(&mut app, &resumed, 1)
+                                                .expect("cancelled capacity drive"),
                                             fibers::Wait::Reached
                                         );
-                                        assert_eq!(blocked.hits(), waiters);
-                                        release.send(()).expect("flow release observer");
-                                        if cancel {
-                                            assert_eq!(
-                                                fibers::Harness::new(Duration::from_secs(2))
-                                                    .try_wait(&mut app, &resumed, 1)
-                                                    .expect("cancelled capacity drive"),
-                                                fibers::Wait::Reached
-                                            );
-                                            assert_eq!(attempts.hits(), 2);
-                                            release
-                                                .send(())
-                                                .expect("cancellation release observer");
-                                        } else {
-                                            assert_eq!(
-                                                fibers::Harness::new(Duration::from_secs(2))
-                                                    .try_wait(&mut app, &attempts, 2)
-                                                    .expect("partial credit drive"),
-                                                fibers::Wait::Reached
-                                            );
-                                            fibers::TEST
-                                                .try_pause(&mut app, Duration::from_millis(10))
-                                                .expect("exhausted sweep is quiescent");
-                                            assert_eq!(attempts.hits(), 2);
-                                            release.send(()).expect("partial credit observer");
-                                        }
-                                        app.run()
-                                    })?
-                                    .map_err(session::Error::Drive)
-                                })
+                                        assert_eq!(attempts.hits(), 2);
+                                        waiter.try_window(64).expect("response credit");
+                                        Either::Left(waiter)
+                                    }
+                                    Either::Right(mut waiters) => {
+                                        waiters.try_window(1).expect("one byte of real credit");
+                                        assert_eq!(
+                                            fibers::Harness::new(Duration::from_secs(2))
+                                                .try_wait(&mut app, &attempts, 2)
+                                                .expect("partial credit drive"),
+                                            fibers::Wait::Reached
+                                        );
+                                        fibers::TEST
+                                            .try_pause(&mut app, Duration::from_millis(10))
+                                            .expect("exhausted sweep is quiescent");
+                                        assert_eq!(attempts.hits(), 2);
+                                        waiters.try_window(64).expect("response credit");
+                                        Either::Right(waiters)
+                                    }
+                                };
+                                let want = if cancel { 1 } else { 3 };
+                                assert_eq!(
+                                    fibers::Harness::new(Duration::from_secs(2))
+                                        .try_wait(&mut app, &completed, want)
+                                        .expect("responses complete before cleanup"),
+                                    fibers::Wait::Reached
+                                );
+                                assert_eq!(completed.hits(), want);
+                                waiters
                             })
-                            .map_err(topology::Failure::Install)?
-                            .map_err(topology::Failure::Run)
-                    },
-                    recovery::Policy::new(|report| reports.push(report), common::recover),
-                    |result| {
-                        (match result {
-                            Ok(result) => result.map_err(topology::RunError::Failure),
-                            Err(error) => Err(topology::RunError::from(error)),
                         })
-                        .as_ref()
-                        .map(|_| ())
-                        .map_err(topology::RunError::cause)
-                        .expect("gRPC runtime");
-                    },
-                );
-                assert!(
-                    reports.events().expect("retirement owners").is_empty(),
-                    "unexpected server retirement: {reports:?}"
-                );
-                Ok::<_, Infallible>(())
-            },
-            move |address| {
-                if cancel {
-                    let waiters = Waiters::try_pair(address).expect("zero-window requests");
-                    ready
-                        .recv_timeout(Duration::from_secs(2))
-                        .expect("two blocked producers");
-                    let waiter = waiters.try_cancel().expect("cancel held response");
-                    ready
-                        .recv_timeout(Duration::from_secs(2))
-                        .expect("waiter resumed before window release");
-                    let [(body, status)] = waiter.try_release().expect("resumed response");
+                    })
+                },
+                recovery::Policy::new(|report| reports.push(report), common::recover),
+                |result| match result {
+                    Ok(Ok(Ok(waiters))) => waiters,
+                    Ok(Ok(Err(error))) => panic!("gRPC session: {:?}", error.cause()),
+                    Ok(Err(error)) => panic!("gRPC install: {error:?}"),
+                    Err(error) => panic!(
+                        "gRPC runtime: {:?}",
+                        error.kind().map(|output| {
+                            output.as_ref().map(|session| {
+                                session.as_ref().map(|_| ()).map_err(session::Error::cause)
+                            })
+                        })
+                    ),
+                },
+            );
+            assert!(
+                reports.events().expect("retirement owners").is_empty(),
+                "unexpected server retirement: {reports:?}"
+            );
+            match waiters {
+                Either::Left(waiter) => {
+                    let [(body, status)] = waiter.try_read().expect("resumed response");
                     assert_eq!(status.expect("complete response").code(), Code::Ok);
                     assert_eq!(
                         Bytes::try_messages(&body).expect("ready message"),
                         [vec![1; 4]]
                     );
-                    return;
                 }
-                let mut waiters = Waiters::try_new(address).expect("zero-window requests");
-                ready
-                    .recv_timeout(Duration::from_secs(2))
-                    .expect("three blocked producers");
-                waiters.try_partial().expect("one byte of real credit");
-                ready
-                    .recv_timeout(Duration::from_secs(2))
-                    .expect("one retry per blocked producer");
-                let [(held, first), (empty, second), (ready, third)] =
-                    waiters.try_release().expect("waiter responses");
-                assert!(
-                    [first, second, third]
-                        .into_iter()
-                        .all(|status| status.expect("complete response").code() == Code::Ok)
-                );
-                assert_eq!(
-                    Bytes::try_messages(&held).expect("held message"),
-                    [vec![0; 4]]
-                );
-                assert!(empty.is_empty());
-                assert_eq!(
-                    Bytes::try_messages(&ready).expect("ready message"),
-                    [vec![1; 4]]
-                );
-            },
-        )
-        .expect("waiter progress");
+                Either::Right(waiters) => {
+                    let [(held, first), (empty, second), (ready, third)] =
+                        waiters.try_read().expect("waiter responses");
+                    assert!(
+                        [first, second, third]
+                            .into_iter()
+                            .all(|status| status.expect("complete response").code() == Code::Ok)
+                    );
+                    assert_eq!(
+                        Bytes::try_messages(&held).expect("held message"),
+                        [vec![0; 4]]
+                    );
+                    assert!(empty.is_empty());
+                    assert_eq!(
+                        Bytes::try_messages(&ready).expect("ready message"),
+                        [vec![1; 4]]
+                    );
+                }
+            }
+        })
+        .expect("waiter deadline");
     }
 }

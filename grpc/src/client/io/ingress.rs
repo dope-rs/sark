@@ -38,35 +38,20 @@ where
     fn ingest(&mut self, bytes: &[u8]) -> Result<(), crate::Status> {
         self.state.ingress.take_error()?;
         let result = self.state.connection.ingest(bytes);
-        let mut policy = policies::Direct;
-        self.state.ingress.drive(
-            &mut self.state.connection,
-            &mut self.state.calls,
-            &mut self.state.egress,
-            result,
-            &mut policy,
-        )
+        self.state.drive_ingress(result, &mut policies::Direct)
     }
 
     fn ingest_owned(&mut self, bytes: C) -> Result<(), crate::Status> {
         self.state.ingress.take_error()?;
         let result = self.state.connection.ingest_owned(bytes);
-        let mut policy = policies::Direct;
-        self.state.ingress.drive(
-            &mut self.state.connection,
-            &mut self.state.calls,
-            &mut self.state.egress,
-            result,
-            &mut policy,
-        )
+        self.state.drive_ingress(result, &mut policies::Direct)
     }
 
     fn ingest_many<I>(&mut self, source: &mut I) -> Result<(), crate::Status>
     where
         I: Iterator<Item = C>,
     {
-        let mut policy = policies::Direct;
-        run(self, source, &mut policy)
+        self.ingest_many_on(source, &mut policies::Direct)
     }
 
     fn resume(&mut self) -> Result<(), crate::Status> {
@@ -89,15 +74,24 @@ where
             Connection: Connection<Error = conn::Error>,
         >,
 {
-    pub(in crate::client) fn ingest_many_on<'notify, I>(
+    pub(in crate::client) fn ingest_many_on<I, R>(
         &mut self,
         source: &mut I,
-        done: &mut policies::Notify<'notify, '_, '_>,
+        policy: &mut R,
     ) -> Result<(), crate::Status>
     where
         I: Iterator<Item = C>,
+        R: policies::Policy<P, C>,
     {
-        run(self, source, done)
+        self.state.ingress.take_error()?;
+        if self.state.ingress.is_blocked() {
+            self.state.drive_ingress(Ok(()), policy)?;
+            if self.state.ingress.is_blocked() {
+                return Ok(());
+            }
+        }
+        let result = self.state.connection.ingest_from(source);
+        self.state.drive_ingress(result, policy)
     }
 
     pub(in crate::client) fn resume_on<R: policies::Policy<P, C>>(
@@ -106,52 +100,6 @@ where
     ) -> Result<(), crate::Status> {
         self.state.ingress.take_error()?;
         let result = self.state.connection.resume();
-        self.state.ingress.drive(
-            &mut self.state.connection,
-            &mut self.state.calls,
-            &mut self.state.egress,
-            result,
-            done,
-        )
+        self.state.drive_ingress(result, done)
     }
-}
-
-fn run<P, C, I, R>(
-    client: &mut session::Session<'_, P, C>,
-    source: &mut I,
-    policy: &mut R,
-) -> Result<(), crate::Status>
-where
-    C: Storage,
-    I: Iterator<Item = C>,
-    P: Plan<
-            C,
-            Key = stream::Key,
-            Fields = section::Owner,
-            Selection = (),
-            Connection: Connection<Error = conn::Error>,
-        >,
-    R: policies::Policy<P, C>,
-{
-    client.state.ingress.take_error()?;
-    if client.state.ingress.is_blocked() {
-        client.state.ingress.drive(
-            &mut client.state.connection,
-            &mut client.state.calls,
-            &mut client.state.egress,
-            Ok(()),
-            policy,
-        )?;
-        if client.state.ingress.is_blocked() {
-            return Ok(());
-        }
-    }
-    let result = client.state.connection.ingest_from(source);
-    client.state.ingress.drive(
-        &mut client.state.connection,
-        &mut client.state.calls,
-        &mut client.state.egress,
-        result,
-        policy,
-    )
 }

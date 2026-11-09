@@ -30,6 +30,10 @@ impl<'a> Journal<'a> {
         self.wire_len
     }
 
+    pub(crate) const fn base(&self) -> u64 {
+        *self.count
+    }
+
     pub(crate) fn encode(&self, out: &mut impl for<'b> Extend<&'b [u8]>) {
         for field in self.inner.fields() {
             literal::<5>(field.name().span(), 0x40, out);

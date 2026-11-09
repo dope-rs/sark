@@ -1,6 +1,6 @@
 pub mod common;
 
-use std::{cell::Cell, convert::Infallible, time::Duration};
+use std::{cell::Cell, convert::Infallible, num::NonZero, time::Duration};
 
 use common::{headers::Generated, recipe::Lexical};
 use dope::{
@@ -31,6 +31,7 @@ fn reset_completes_drain() {
                 let mut reports = Vec::new();
                 let prepared = Lexical::try_plan()
                     .expect("H2 plan")
+                    .with_streams(NonZero::new(1).expect("one physical stream"))
                     .with_bound(listener)
                     .with_life(handler::Lifetime::graceful(
                         Positive::from_millis::<250>(),

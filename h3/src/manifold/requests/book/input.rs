@@ -1,17 +1,13 @@
+use crate::manifold::owners;
+use sark_core::manifold::task::app;
 use sark_core::{
     body::{self, credit},
-    decode::request,
-    duplex,
     manifold::stream::Boundary,
 };
 
 use crate::manifold::{
     Phase,
-    requests::{
-        self,
-        book::Book,
-        entries::{self, Completion},
-    },
+    requests::{self, book::Book, entries},
 };
 
 pub(in crate::manifold) enum Error<E> {
@@ -20,21 +16,21 @@ pub(in crate::manifold) enum Error<E> {
 }
 
 pub(in crate::manifold) enum Push<E> {
-    Accepted { completion: Completion },
+    Accepted { completion: Boundary },
     Queued,
     Rejected(requests::Error),
     Inactive { phase: Phase },
     Failed(Error<E>),
 }
 
-impl<'d, P: request::Prepared, B: body::Push<'d>, T, D: duplex::Session<'d>> Book<'d, P, B, T, D> {
+impl<'d, A: app::Runtime<'d>, M: owners::Handoff> Book<'d, A, M> {
     pub(in crate::manifold) fn push<E: credit::Evidence>(
         &mut self,
         id: requests::Id,
         data: crate::Payload<'d>,
         boundary: Boundary,
         proof: E,
-    ) -> Push<B::Error> {
+    ) -> Push<<A::Build as body::Push<'d>>::Error> {
         let request = self.limits.request();
         let conn = self.limits.connection();
         let pushed = {

@@ -1,12 +1,7 @@
 use std::{cell, mem, ptr};
 
 use dope::{core::driver::route::Identity, manifold::client::conn};
-use sark_h2::stream;
-
-use crate::client::{
-    call::bidi,
-    manifold::ops::cancels::{Call, Key, Phase},
-};
+use crate::client::manifold::ops::cancels::{Call, Key, Phase, Queue};
 
 /// Stable native cancellation storage; queued links retain both initialized fields.
 pub(super) struct Entry<'d, ID: Identity> {
@@ -48,12 +43,6 @@ impl<'d, ID: Identity> Entry<'d, ID> {
     }
 
     /// # Safety
-    /// This is the same stream's initialized queued reset, retained by the other split token.
-    pub(super) unsafe fn pair(&self, send: bidi::Send<'d, stream::Key>) {
-        unsafe { (*self.call.get()).write(Call::ResetPair(send)) };
-    }
-
-    /// # Safety
     /// This exact node is the initialized head of its unchanged owner queue.
     pub(super) unsafe fn take(&self) -> (conn::Id<'d, ID>, Call<'d>) {
         let (conn, _) = unsafe { (*self.owner.get()).assume_init_read() };
@@ -63,11 +52,18 @@ impl<'d, ID: Identity> Entry<'d, ID> {
     }
 }
 
-/// The native call keys retain this exact fixed allocation's full usize extent.
-/// # Safety
-/// Every admitted native key resolves to its original initialized resident node.
-pub(super) unsafe trait Source<'d, ID: Identity> {
+impl<'d, ID: Identity> Queue<'d, ID> {
+    /// The native call keys retain this exact fixed allocation's full usize extent.
+    ///
     /// # Safety
     /// The key comes from this queue's State or its affine Registered token.
-    unsafe fn entry(&self, key: Key) -> &Entry<'d, ID>;
+    pub(super) unsafe fn entry(&self, key: Key) -> &Entry<'d, ID> {
+        // SAFETY: native registrations and affine Registered transitions retain keys
+        // from this channel's State. Shared sizes this fixed Box from that same State's
+        // immutable limits; no callback runs during a queue mutation.
+        unsafe {
+            self.entries
+                .get_unchecked(key.index(self.offset, self.claims))
+        }
+    }
 }

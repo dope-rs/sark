@@ -2,15 +2,14 @@
 
 use std::{net::SocketAddr, ops::ControlFlow, time::Duration};
 
-use dope::{core::driver::life::recovery::Recovery, manifold::app::Host};
+use dope::manifold::app::Host;
 use sark::{Guard, Head};
 use sark_http::field::{Entry, Pseudo};
 
-pub fn recover(failure: Recovery<'_, '_>) -> std::convert::Infallible {
-    failure.abort()
-}
+pub use super::server::recover;
 
 pub mod apps;
+pub mod cleartext;
 
 pub mod facts;
 

@@ -283,9 +283,8 @@ fn rejects_decode_bomb() {
 
 #[test]
 fn honors_decode_memory() {
-    let payload = vec![b'x'; 4096];
-    let encoded = gzip::REPEATED.to_vec();
-    let retained = encoded.clone();
+    let plain_len = 4096;
+    let encoded = gzip::REPEATED;
     AcceptScript::with(
         move |acceptor| {
             peer::serve_each(acceptor, move |stream: &mut &Stream<'_>, _: peer::Request<'_>| {
@@ -294,7 +293,7 @@ fn honors_decode_memory() {
                     encoded.len()
                 )
                 .into_bytes();
-                resp.extend_from_slice(&encoded);
+                resp.extend_from_slice(encoded);
                 stream.write_all(&resp)
             })
         },
@@ -302,7 +301,7 @@ fn honors_decode_memory() {
             for flavor in FLAVORS {
                 let strict = Config::new(server.addr().to_string())
                     .decode(Policy::Strict)
-                    .plain_limit(payload.len())
+                    .plain_limit(plain_len)
                     .plain_memory(1024);
                 Request::new(
                     flavor,
@@ -321,7 +320,7 @@ fn honors_decode_memory() {
                             requested,
                             available,
                             cause: o3::buffer::resident::AllocError::Budget(cause),
-                        }) if *requested == payload.len() && *available == 1024
+                        }) if *requested == plain_len && *available == 1024
                             && cause.into_parts().0.get() == *requested
                             && cause.into_parts().1 == *available
                     ));
@@ -333,7 +332,7 @@ fn honors_decode_memory() {
 
                 let lenient = Config::new(server.addr().to_string())
                     .decode(Policy::Lenient)
-                    .plain_limit(payload.len())
+                    .plain_limit(plain_len)
                     .plain_memory(1024);
                 let response = Request::new(
                     flavor,
@@ -349,7 +348,7 @@ fn honors_decode_memory() {
                     recover,
                 ), |result| result.expect("client execution"))
                 .expect("HTTP request execution");
-                assert_eq!(response.body().as_slice(), retained);
+                assert_eq!(response.body().as_slice(), encoded);
                 assert_eq!(
                     response.headers().get("content-encoding"),
                     Some(b"gzip".as_slice())

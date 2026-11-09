@@ -97,27 +97,37 @@ impl<'d> Action<'d> {
 
 /// Established byte-stream owner retained without type erasure.
 pub trait Session<'d> {
-    fn receive(&mut self, input: owned::Segments<'d>) -> Action<'d>;
+    fn receive(
+        &mut self,
+        input: owned::Segments<'d>,
+        output: &mut [u8],
+        scratch: &mut Vec<u8>,
+    ) -> (usize, Action<'d>);
 
     /// Observes the peer's orderly end of the input direction exactly once.
-    fn finish(&mut self) -> Action<'d>;
+    fn finish(&mut self, output: &mut [u8], scratch: &mut Vec<u8>) -> (usize, Action<'d>);
 
-    fn activate(&mut self) -> Action<'d>;
+    fn activate(&mut self, output: &mut [u8], scratch: &mut Vec<u8>) -> (usize, Action<'d>);
 }
 
 /// Uninhabited session used by generated applications with no duplex routes.
 pub enum Never {}
 
 impl<'d> Session<'d> for Never {
-    fn receive(&mut self, _: owned::Segments<'d>) -> Action<'d> {
+    fn receive(
+        &mut self,
+        _: owned::Segments<'d>,
+        _: &mut [u8],
+        _: &mut Vec<u8>,
+    ) -> (usize, Action<'d>) {
         match *self {}
     }
 
-    fn finish(&mut self) -> Action<'d> {
+    fn finish(&mut self, _: &mut [u8], _: &mut Vec<u8>) -> (usize, Action<'d>) {
         match *self {}
     }
 
-    fn activate(&mut self) -> Action<'d> {
+    fn activate(&mut self, _: &mut [u8], _: &mut Vec<u8>) -> (usize, Action<'d>) {
         match *self {}
     }
 }

@@ -17,6 +17,24 @@ use sark_http::h1::codec::canned;
 static ALLOCATOR: Tracker = Tracker::new();
 
 #[test]
+fn resumes_stream_after_final_drain() {
+    use sark_h1::{server::task::runtime, wire::response::Context};
+    use sark_http::{h1::head::line::Version, payload::response::Method};
+
+    let mut conn: Conn<'_, runtime::Runtime<'_, ()>, Infallible> = Conn::default();
+    conn.async_state.insert(runtime::Running::stream(
+        (),
+        Context::new(Method::Other, Version::Eleven),
+    ));
+    conn.settle(head::Connection::Close);
+    assert!(matches!(pump::Drain::progress(&mut conn), pump::Next::None));
+    assert!(matches!(
+        pump::Drain::complete(&mut conn),
+        pump::Completion::Resume
+    ));
+}
+
+#[test]
 fn http_stays_closed() {
     let mut conn: session::Conn<'_, (), Infallible, switch::Disabled> = session::Conn::default();
     let calls = Cell::new(0);
@@ -26,7 +44,7 @@ fn http_stays_closed() {
     assert!(matches!(cycle.connection, head::Connection::Close));
     assert!(matches!(
         cycle.state,
-        Ok(pump::Egress::Write { prefix: 0, body: pump::Body::Static(reason) })
+        Ok(pump::Egress::Static { prefix: 0, body: reason })
             if reason.as_slice() == canned::BAD_REQUEST.as_slice()
     ));
     assert_eq!(calls.get(), 1);
@@ -45,7 +63,7 @@ fn switching_stays_closed() {
     assert!(matches!(cycle.connection, head::Connection::Close));
     assert!(matches!(
         cycle.state,
-        Ok(pump::Egress::Write { prefix: 0, body: pump::Body::Static(reason) })
+        Ok(pump::Egress::Static { prefix: 0, body: reason })
             if reason.as_slice() == canned::BAD_REQUEST.as_slice()
     ));
     assert_eq!(calls.get(), 1);
@@ -73,7 +91,7 @@ fn preserves_cause_once() {
     );
     assert_eq!(handler.reported, [Some(error)]);
     assert!(matches!(cycle.state,
-        Ok(pump::Egress::Write { prefix: 0, body: pump::Body::Static(body) })
+        Ok(pump::Egress::Static { prefix: 0, body })
             if body.as_slice() == canned::BAD_REQUEST.as_slice()
     ));
 }
@@ -105,10 +123,7 @@ fn pump_ingress_allocations() {
         assert_eq!(alloc, 0);
         assert!(matches!(
             cycle.state,
-            Ok(pump::Egress::Write {
-                prefix: 2,
-                body: pump::Body::None
-            })
+            Ok(pump::Egress::Inline { prefix: 2 })
         ));
         assert!(matches!(cycle.connection, head::Connection::KeepAlive));
         assert!(matches!(cycle.tail, pump::Tail::Empty));
@@ -156,10 +171,7 @@ fn rejects_terminal_cursor() {
         assert!(matches!(cycle.connection, head::Connection::KeepAlive));
         assert!(matches!(
             cycle.state,
-            Ok(pump::Egress::Write {
-                prefix: 1,
-                body: pump::Body::None
-            })
+            Ok(pump::Egress::Inline { prefix: 1 })
         ));
         assert!(
             matches!(pump::Drain::progress(&mut conn), pump::Next::Close(body)

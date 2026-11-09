@@ -1,11 +1,10 @@
 //! HTTP/3 drain mechanics for the shared session lifetime policy.
+use crate::{conn, manifold};
 use dope::core::driver::schedule::clock;
 use dope_quic::wire::stream::Id;
 use o3::base::time::Positive;
 use sark_core::life::session;
 use sark_http::field::metadata::section::rules;
-
-use crate::{conn, conn::io};
 
 /// Exact failure to arm a connection's finite lifetime.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -49,7 +48,7 @@ pub trait State<'d> {
     fn expire<P: rules::Policy>(
         &mut self,
         policy: &Self::Policy,
-        h3: &mut crate::manifold::Session<'_, P>,
+        h3: &mut manifold::Session<'_, P>,
         now: clock::Moment<'d>,
     ) -> Result<Option<Expired>, Failure>;
 }
@@ -79,7 +78,7 @@ impl<'d> State<'d> for Inactive {
     fn expire<P: rules::Policy>(
         &mut self,
         _: &Self::Policy,
-        _: &mut crate::manifold::Session<'_, P>,
+        _: &mut manifold::Session<'_, P>,
         _: clock::Moment<'d>,
     ) -> Result<Option<Expired>, Failure> {
         Ok(None)
@@ -162,7 +161,7 @@ impl<'d> State<'d> for Drain<'d> {
     fn expire<P: rules::Policy>(
         &mut self,
         policy: &Self::Policy,
-        h3: &mut crate::manifold::Session<'_, P>,
+        h3: &mut manifold::Session<'_, P>,
         now: clock::Moment<'d>,
     ) -> Result<Option<Expired>, Failure> {
         match self.phase {
@@ -173,7 +172,7 @@ impl<'d> State<'d> for Drain<'d> {
                     .try_add(policy.drain())
                     .map_err(|source| Failure::Deadline { source })?;
                 if self.admission_limit < 1 << 62 {
-                    io::Send::new(h3.h3_mut())
+                    h3.send()
                         .goaway(self.admission_limit)
                         .map_err(Failure::GoAway)?;
                 }

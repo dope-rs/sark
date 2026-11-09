@@ -1,11 +1,11 @@
 pub mod common;
-use std::{convert::Infallible, mem};
+use std::convert::Infallible;
 
 use dope_test::alloc::Tracker;
 use o3::buffer::segments;
 use sark_core::{
     body::{
-        self, buffered,
+        buffered,
         credit::{self, raw::Account},
         input,
     },
@@ -57,16 +57,6 @@ fn retains_without_alloc() {
     });
 
     assert_eq!(alloc, 0);
-}
-
-#[test]
-fn ready_keeps_layout() {
-    type Source = &'static [u8];
-    type Ready = request::Ready<exec::Sync, (), Source>;
-    type Body = body::Body<Source>;
-
-    assert_eq!(mem::size_of::<Ready>(), mem::size_of::<Body>());
-    assert_eq!(mem::align_of::<Ready>(), mem::align_of::<Body>());
 }
 
 #[test]

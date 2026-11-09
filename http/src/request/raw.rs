@@ -28,8 +28,13 @@ pub trait Bind: Sized {
     ) -> Result<Bound<Self::Owner>, Error>;
 }
 
-impl Bind for RetainedHead<packed::Decoded, Selected<rules::RetainRaw>> {
-    type Owner = packed::Decoded;
+impl<const PREFIX: usize> Bind
+    for RetainedHead<
+        packed::Decoded<o3::buffer::pool::Span, PREFIX>,
+        Selected<rules::RetainRaw<PREFIX>>,
+    >
+{
+    type Owner = packed::Decoded<o3::buffer::pool::Span, PREFIX>;
 
     unsafe fn try_bind(
         self,

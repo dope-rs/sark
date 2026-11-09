@@ -1,28 +1,23 @@
-use std::{convert::identity, mem};
+use std::mem;
 
-use o3::{
-    alloc::{self, array},
-    buffer::resident,
-};
-use sark_http::payload::owned;
+use o3::alloc::{self, array};
 
 use crate::{
     Error, Nesting,
     input::Taken,
     segment::{
-        Admitted, Atom, Capture, Create, Cursor, Field, Order, State, Transfer, ValueKind,
-        input::{self, Input},
-        is_delimiter, state,
-        state::Name,
+        Atom, Capture, Cursor, Field, Order, Projection, State, ValueKind, input::Input,
+        is_delimiter, state, state::Name,
     },
     source::string,
 };
 
-pub(super) struct Scan<'d> {
+pub(in crate::segment) struct Scanning<'d> {
     pub(super) input: Input<'d>,
     pub(super) cursor: Cursor,
     pub(super) state: State,
     pub(super) selection: Selection<'d>,
+    pub(in crate::segment) stream: super::Stream,
 }
 
 pub(in crate::segment) struct Selection<'d> {
@@ -59,70 +54,15 @@ impl<'d> Selection<'d> {
     }
 }
 
-impl<'d> Scan<'d> {
-    pub(super) fn admitted(admitted: Admitted<'d>, selection: Selection<'d>) -> Self {
+impl<'d> Scanning<'d> {
+    pub(super) fn new(input: Input<'d>, selection: Selection<'d>) -> Self {
         Self {
-            input: admitted.input,
+            input,
             cursor: Cursor::new(),
             state: State::Leading,
             selection,
+            stream: super::Stream::new(),
         }
-    }
-
-    pub(super) fn try_stream(fields: &'d [Field<'d>], order: Order) -> Result<Self, Create> {
-        Ok(Self {
-            input: Input::empty(),
-            cursor: Cursor::new(),
-            state: State::Leading,
-            selection: Selection::try_new(fields, order).map_err(Create::from)?,
-        })
-    }
-
-    pub(super) fn new<I, O>(owners: I, fields: &'d [Field<'d>], order: Order) -> crate::Result<Self>
-    where
-        I: IntoIterator<Item = O>,
-        I::IntoIter: ExactSizeIterator,
-        resident::Shared<'d>: From<O>,
-    {
-        Ok(Self {
-            input: Input::new(owners)?,
-            cursor: Cursor::new(),
-            state: State::Leading,
-            selection: Selection::try_new(fields, order).map_err(Error::Allocation)?,
-        })
-    }
-
-    pub(super) fn try_new(
-        owners: owned::Segments<'d>,
-        fields: &'d [Field<'d>],
-        order: Order,
-    ) -> Result<Self, Create> {
-        let input = Input::try_new(owners).map_err(Create::from)?;
-        let set = Selection::try_new(fields, order).map_err(Create::from)?;
-        Ok(Self {
-            input,
-            cursor: Cursor::new(),
-            state: State::Leading,
-            selection: set,
-        })
-    }
-
-    pub(super) fn push(self, owner: resident::Shared<'d>) -> Transfer<Self, input::Failure<'d>> {
-        let Self {
-            input,
-            cursor,
-            state,
-            selection: select,
-        } = self;
-        input.push(owner).map(
-            |input| Self {
-                input,
-                cursor,
-                state,
-                selection: select,
-            },
-            identity,
-        )
     }
 
     pub(super) fn skip(&mut self, budget: usize) -> usize {
@@ -153,19 +93,13 @@ impl<'d> Scan<'d> {
         }
         self.state = match state {
             State::Leading => {
-                if self.cursor.take_ws(&self.input) == Taken::Yes {
-                    State::Leading
-                } else {
-                    if self.cursor.take(&self.input, b'{') == Taken::No {
-                        return Err(Error::Invalid);
-                    }
-                    State::NameOrEnd
+                if self.cursor.take(&self.input, b'{') == Taken::No {
+                    return Err(Error::Invalid);
                 }
+                State::NameOrEnd
             }
             State::NameOrEnd => {
-                if self.cursor.take_ws(&self.input) == Taken::Yes {
-                    State::NameOrEnd
-                } else if self.cursor.take(&self.input, b'}') == Taken::Yes {
+                if self.cursor.take(&self.input, b'}') == Taken::Yes {
                     if matches!(self.selection.order, Order::Ordered)
                         && self.selection.next != self.selection.fields.len()
                     {
@@ -188,16 +122,12 @@ impl<'d> Scan<'d> {
                 }
             }
             State::NameStart => {
-                if self.cursor.take_ws(&self.input) == Taken::Yes {
-                    State::NameStart
-                } else {
-                    if self.cursor.take(&self.input, b'"') == Taken::No {
-                        return Err(Error::Invalid);
-                    }
-                    State::Name {
-                        start: self.cursor.absolute,
-                        string: string::Scan::new(self.input.is_admitted()),
-                    }
+                if self.cursor.take(&self.input, b'"') == Taken::No {
+                    return Err(Error::Invalid);
+                }
+                State::Name {
+                    start: self.cursor.absolute,
+                    string: string::Scan::new(self.input.is_admitted()),
                 }
             }
             State::Name { start, mut string } => {
@@ -213,61 +143,55 @@ impl<'d> Scan<'d> {
                 }
             }
             State::Colon { name, escaped } => {
-                if self.cursor.take_ws(&self.input) == Taken::Yes {
-                    State::Colon { name, escaped }
-                } else {
-                    if self.cursor.take(&self.input, b':') == Taken::No {
-                        return Err(Error::Invalid);
-                    }
-                    let field = match self.selection.order {
-                        Order::Unordered => 0,
-                        Order::Ordered => self.selection.next,
-                    };
-                    let cursor = Cursor::at(&self.input, name.start).ok_or(Error::Invalid)?;
-                    State::Select(Name::new(cursor, name.end, escaped, field))
+                if self.cursor.take(&self.input, b':') == Taken::No {
+                    return Err(Error::Invalid);
                 }
+                let field = match self.selection.order {
+                    Order::Unordered => 0,
+                    Order::Ordered => self.selection.next,
+                };
+                let cursor = Cursor::at(&self.input, name.start).ok_or(Error::Invalid)?;
+                State::Select(Name::new(cursor, name.end, escaped, field))
             }
             State::ValueStart {
                 field,
                 projection: mode,
             } => {
-                if self.cursor.take_ws(&self.input) == Taken::Yes {
-                    State::ValueStart {
-                        field,
-                        projection: mode,
-                    }
+                let (byte, advance) = self.cursor.read(&self.input).ok_or(Error::Invalid)?;
+                let field = field.filter(|&index| {
+                    !self
+                        .selection
+                        .values
+                        .get(index)
+                        .is_some_and(Option::is_some)
+                });
+                let mode = if mode == Projection::Frame && byte != b'"' {
+                    Projection::Scalar
                 } else {
-                    let (byte, advance) = self.cursor.read(&self.input).ok_or(Error::Invalid)?;
-                    let field = field.filter(|&index| {
-                        !self
-                            .selection
-                            .values
-                            .get(index)
-                            .is_some_and(Option::is_some)
-                    });
-                    let capture = Capture::new(field, mode, &self.cursor);
-                    match byte {
-                        b'"' => {
-                            self.cursor.advance(advance);
-                            State::String {
-                                capture,
-                                string: string::Scan::new(self.input.is_admitted()),
-                            }
-                        }
-                        b'{' | b'[' => {
-                            self.cursor.advance(advance);
-                            let nesting = if self.input.is_admitted() {
-                                Nesting::admitted()
-                            } else {
-                                Nesting::start(byte)?
-                            };
-                            State::Compound { capture, nesting }
-                        }
-                        _ => State::Atom {
+                    mode
+                };
+                let capture = Capture::new(field, mode, &self.cursor);
+                match byte {
+                    b'"' => {
+                        self.cursor.advance(advance);
+                        State::String {
                             capture,
-                            atom: Atom::new(byte, field.is_some())?,
-                        },
+                            string: string::Scan::new(self.input.is_admitted()),
+                        }
                     }
+                    b'{' | b'[' => {
+                        self.cursor.advance(advance);
+                        let nesting = if self.input.is_admitted() {
+                            Nesting::admitted()
+                        } else {
+                            Nesting::start(byte)?
+                        };
+                        State::Compound { capture, nesting }
+                    }
+                    _ => State::Atom {
+                        capture,
+                        atom: Atom::new(byte, field.is_some())?,
+                    },
                 }
             }
             State::String {
@@ -321,9 +245,7 @@ impl<'d> Scan<'d> {
                 }
             },
             State::Trailing => {
-                if self.cursor.take_ws(&self.input) == Taken::Yes {
-                    State::Trailing
-                } else if self.cursor.absolute == self.input.len() {
+                if self.cursor.absolute == self.input.len() {
                     State::Done
                 } else {
                     return Err(Error::Invalid);

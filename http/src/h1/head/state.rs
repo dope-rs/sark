@@ -1,4 +1,4 @@
-use core::{convert::Infallible, ops};
+use core::convert::Infallible;
 
 use crate::h1::{
     field,
@@ -97,11 +97,75 @@ impl<K: Kind> State<K> {
         owner: &'owner [u8],
         mut sink: impl FnMut(field::Entry<'owner>) -> Result<(), E>,
     ) -> Result<(Self, Option<K::Parts>), ParseError<E>> {
-        let phase = Self::run(self.phase, owner, |start, fields, field| {
-            let fields = K::observe(start, fields, &field).map_err(ParseError::Semantic)?;
-            sink(field).map_err(ParseError::Sink)?;
-            Ok(fields)
-        })?;
+        let mut phase = self.phase;
+        loop {
+            match &mut phase {
+                Phase::Start { kind, limit } => {
+                    let bounded = owner.len().min(limit.bytes());
+                    let progress = kind.start(&owner[..bounded])?;
+                    match progress {
+                        line::Progress::Complete(start) => {
+                            phase = Self::fields(start, *limit).phase;
+                        }
+                        line::Progress::Partial(cursor) => {
+                            phase = Phase::Line {
+                                kind: *kind,
+                                cursor,
+                                limit: *limit,
+                            };
+                            if owner.len() == bounded {
+                                break;
+                            }
+                        }
+                    }
+                }
+                Phase::Line {
+                    kind,
+                    cursor,
+                    limit,
+                } => {
+                    let (next, end) = cursor
+                        .scan(owner, limit.bytes())
+                        .map_err(ParseError::Boundary)?;
+                    *cursor = next;
+                    let Some(prefix) = end else {
+                        break;
+                    };
+                    let progress = kind.start(prefix)?;
+                    let line::Progress::Complete(start) = progress else {
+                        return Err(ParseError::invalid());
+                    };
+                    phase = Self::fields(start, *limit).phase;
+                }
+                Phase::Fields {
+                    cursor,
+                    start,
+                    fields,
+                    bytes,
+                } => {
+                    let bounded = &owner[..owner.len().min(*bytes)];
+                    let progress = cursor.advance(bounded).map_err(ParseError::Field)?;
+                    let end = match progress {
+                        field::Progress::End(end) => end,
+                        field::Progress::Field(field) => {
+                            let next =
+                                K::observe(start, *fields, &field).map_err(ParseError::Semantic)?;
+                            sink(field).map_err(ParseError::Sink)?;
+                            *fields = next;
+                            continue;
+                        }
+                        field::Progress::More if owner.len() > *bytes => {
+                            return Err(ParseError::too_large(owner.len(), *bytes));
+                        }
+                        field::Progress::More => break,
+                    };
+                    let tail = Tail::new(K::fields(*start), end).map_err(ParseError::Boundary)?;
+                    phase = Phase::Done(K::finish(*fields, *start, tail)?);
+                    break;
+                }
+                Phase::Done(_) => break,
+            }
+        }
         let parts = match phase {
             Phase::Done(parts) => Some(parts),
             _ => None,
@@ -114,107 +178,6 @@ impl<K: Kind> State<K> {
         owner: &[u8],
     ) -> Result<(Self, Option<K::Parts>), ParseError<Infallible>> {
         self.parse(owner, |_| Ok(()))
-    }
-
-    fn run<'owner, E>(
-        mut phase: Phase<K>,
-        owner: &'owner [u8],
-        mut drain: impl FnMut(
-            &K::Start,
-            K::Fields,
-            field::Entry<'owner>,
-        ) -> Result<K::Fields, ParseError<E>>,
-    ) -> Result<Phase<K>, ParseError<E>> {
-        loop {
-            match phase {
-                Phase::Start { kind, limit } => {
-                    let bounded = owner.len().min(limit.bytes());
-                    let progress = kind.start(&owner[..bounded])?;
-                    match progress {
-                        line::Progress::Complete(start) => {
-                            phase = Self::fields(start, limit).phase;
-                        }
-                        line::Progress::Partial(cursor) => {
-                            let next = Phase::Line {
-                                kind,
-                                cursor,
-                                limit,
-                            };
-                            if owner.len() == bounded {
-                                return Ok(next);
-                            }
-                            phase = next;
-                        }
-                    }
-                }
-                Phase::Line {
-                    kind,
-                    cursor,
-                    limit,
-                } => {
-                    let (cursor, end) = cursor
-                        .scan(owner, limit.bytes())
-                        .map_err(ParseError::Boundary)?;
-                    let Some(prefix) = end else {
-                        return Ok(Phase::Line {
-                            kind,
-                            cursor,
-                            limit,
-                        });
-                    };
-                    let progress = kind.start(prefix)?;
-                    let line::Progress::Complete(start) = progress else {
-                        return Err(ParseError::invalid());
-                    };
-                    phase = Self::fields(start, limit).phase;
-                }
-                Phase::Fields {
-                    mut cursor,
-                    start,
-                    mut fields,
-                    bytes,
-                } => {
-                    let bounded = &owner[..owner.len().min(bytes)];
-                    let parsed =
-                        cursor.advance(bounded, |field| match drain(&start, fields, field) {
-                            Ok(next) => {
-                                fields = next;
-                                ops::ControlFlow::Continue(())
-                            }
-                            Err(error) => ops::ControlFlow::Break(error),
-                        });
-                    let progress = parsed.map_err(ParseError::Field)?;
-                    let end = match progress {
-                        field::Progress::Break(error) => return Err(error),
-                        field::Progress::End(end) => end,
-                        field::Progress::Emitted(()) => {
-                            phase = Phase::Fields {
-                                cursor,
-                                start,
-                                fields,
-                                bytes,
-                            };
-                            continue;
-                        }
-                        field::Progress::More if owner.len() > bytes => {
-                            return Err(ParseError::too_large(owner.len(), bytes));
-                        }
-                        field::Progress::More => {
-                            return Ok(Phase::Fields {
-                                cursor,
-                                start,
-                                fields,
-                                bytes,
-                            });
-                        }
-                    };
-                    let tail = Tail::new(K::fields(start), end).map_err(ParseError::Boundary)?;
-                    let parts = K::finish(fields, start, tail)?;
-                    return Ok(Phase::Done(parts));
-                }
-                Phase::Done(parts) => return Ok(Phase::Done(parts)),
-            }
-        }
     }
 
     pub(super) fn fields(start: K::Start, limit: Limit) -> Self {

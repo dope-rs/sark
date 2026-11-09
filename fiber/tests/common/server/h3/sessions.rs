@@ -17,19 +17,17 @@ use dope::{
             settings::{demands, errors},
         },
         io::{Reclaimed, event::batch::Flow},
-        platform::wake,
     },
     manifold::timing,
     net::wire,
     runtime::{
-        executor::{drive, session, session::Completion},
-        shutdown,
+        executor::{session, session::Completion},
         topology::{self, error, lending::Stage},
     },
 };
 use dope_fiber::task::storage::{fixed::schedule::queue, scope::Brand};
 use dope_quic::{
-    conn::life::tls::clients::Authority,
+    conn::life::{options::Options, tls::clients::Authority},
     proto::cid,
     runtime::{
         endpoint::{
@@ -38,16 +36,19 @@ use dope_quic::{
             server::Plan,
         },
         mux::app::Silent,
+        receive, routing,
     },
+    rustls::ServerConfig,
 };
 use dope_test::{
+    fibers,
     harness::{GUARD, observe::VecCellExt as _},
     reclaim,
 };
-use sark_core::{life::mode::Observed, manifold::task::app};
+use sark_core::life;
 use sark_h3::{
     conn::options,
-    manifold::server::{self, deadline, rotation, startup},
+    manifold::server::{self, deadline, failure, rotation, startup},
 };
 use sark_http::payload::compress::dynamic::hash;
 
@@ -63,24 +64,35 @@ use crate::common::server::h3::{
 };
 
 type Result<'a, T> = std::result::Result<T, Error<'a>>;
+type Planned<Q, P> = Result<'static, (Plan<LISTENER, receive::Retained, Q>, P)>;
+
+pub fn plain(
+    (address, reservation): (SocketAddr, UdpSocket),
+    tls: ServerConfig,
+    options: Options,
+    endpoint: Config,
+) -> Planned<routing::Plain, UdpSocket> {
+    let plan = Plan::new(address, tls, options, endpoint).map_err(Error::Endpoint)?;
+    Ok((plan, reservation))
+}
 
 #[derive(Debug)]
 pub enum Error<'a> {
     Overflow(Metric, usize, usize),
     Index(num::TryFromIntError),
     Reserve(io::Error),
+    Group(dope::core::io::datagram::Error),
     Config(ConfigError),
     Tls(dope_tls::Error),
-    Shutdown(wake::CreateError),
     Endpoint(endpoint::PlanError),
     Application(server::ConfigError),
     Client(config::Error),
     Capacity(demands::Overflow),
     Claims(errors::Claim),
-    Bind(startup::BindError<app::BindError<queue::PrepareError>>),
+    Bind(startup::BindError<queue::PrepareError>),
     Dialer(endpoint::BindError),
-    Session(session::Error<'a, std::result::Result<(), drive::Error>>),
-    Drive(drive::Error),
+    Session(session::Error<'a, std::result::Result<(), fibers::Run>>),
+    Run(fibers::Run),
     Enter {
         cause: error::Cause<'a, Infallible>,
         output: Option<&'a Result<'a, ()>>,
@@ -108,15 +120,16 @@ pub struct Scenario<'a> {
 }
 
 impl<'a> Scenario<'a> {
-    pub(crate) fn try_prepare(
+    pub(crate) fn try_prepare<Q: routing::LocalRoute, P>(
         &mut self,
         protocol: options::Config,
+        send_bytes: Option<num::NonZero<usize>>,
+        make: impl FnOnce((SocketAddr, UdpSocket), ServerConfig, Options, Config) -> Planned<Q, P>,
     ) -> Result<
         '_,
         (
-            topology::Prepared<StoragePlan, RunPlan<'a>>,
+            topology::Prepared<StoragePlan, RunPlan<'a, Q, P>>,
             Rc<Shared<'a>>,
-            shutdown::Source,
         ),
     > {
         use dope_quic::config;
@@ -134,12 +147,9 @@ impl<'a> Scenario<'a> {
         let limit = self
             .requests
             .iter()
-            .filter(|request| request.dispatch == Dispatch::Initial)
+            .filter(|request| matches!(request.dispatch, Dispatch::Established | Dispatch::Initial))
             .find_map(|request| {
-                request
-                    .expect
-                    .error
-                    .is_some()
+                (request.expect.error == Some(sark_h3::frame::ErrorCode::ExcessiveLoad))
                     .then_some(request.data.bytes.len())
             });
         let slots = self
@@ -174,13 +184,11 @@ impl<'a> Scenario<'a> {
         let policy = Authority::try_new(client, address.ip().into())
             .map_err(|error| Error::Tls(error.into()))?;
         let streams = u64::try_from(self.requests.len()).map_err(Error::Index)?;
-        let options = config_with_streams(streams).map_err(Error::Config)?;
+        let options = config_with_streams(streams, send_bytes).map_err(Error::Config)?;
         let params = options.params().clone();
-        let (source, stop) = shutdown::Pair::new().map_err(Error::Shutdown)?.split();
         let mut proof = Proof::new(
             mem::take(&mut self.requests),
             Instant::now() + Duration::from_secs(10),
-            stop,
             self.cancellation,
         );
         proof.network.connect.push(Connect {
@@ -192,6 +200,7 @@ impl<'a> Scenario<'a> {
         });
         let drops = Rc::clone(&proof.cancel.dropped);
         let errors = Rc::clone(&proof.network.failures);
+        let stream = Rc::clone(&proof.stream);
         let proof = Rc::new(Shared::new(proof));
         let mut config = server::Config {
             protocol,
@@ -202,8 +211,7 @@ impl<'a> Scenario<'a> {
         }
         let mut tls = identity.server().map_err(Error::Tls)?;
         tls.alpn_protocols = vec![b"h3".to_vec()];
-        let plan =
-            Plan::<LISTENER>::new(address, tls, options, endpoint).map_err(Error::Endpoint)?;
+        let (plan, reservation) = make((address, port), tls, options, endpoint)?;
         let plan = startup::Plan::try_from(plan, config).map_err(Error::Application)?;
         let client = client::Plan::new(bind, endpoint).map_err(Error::Client)?;
         let shared = Rc::clone(&proof);
@@ -211,31 +219,44 @@ impl<'a> Scenario<'a> {
             plan,
             proof: shared,
             client,
-            reservation: port,
+            reservation,
             task_capacity: self.task_capacity.try_into().map_err(Error::Capacity)?,
         };
         let prepared = topology::Plan::new(
             StoragePlan {
                 cancel_dropped: drops,
                 errors,
+                stream,
             },
             topology,
         )
         .for_install::<timing::Balanced>()
         .map_err(Error::Claims)?;
-        Ok((prepared, proof, source))
+        Ok((prepared, proof))
     }
 
-    pub fn try_run_with<L: for<'d> rotation::Policy<'d>, Out>(
+    pub fn try_run_with<Q: routing::LocalRoute, P, L, D, O, Out>(
         mut self,
+        make: impl FnOnce((SocketAddr, UdpSocket), ServerConfig, Options, Config) -> Planned<Q, P>,
         protocol: options::Config,
+        send_bytes: Option<num::NonZero<usize>>,
         lifetime: L,
         policy: impl for<'d> deadline::Policy<'d>,
         recover: impl recovery::Recover,
-        diagnose: impl Fn(&dyn fmt::Debug),
+        diagnose: D,
+        observe: impl FnOnce(Probe<'a, D>) -> O,
         done: impl for<'error> FnOnce(Result<'error, Proof<'a>>) -> Out,
-    ) -> Out {
-        let (prepared, proof, source) = match self.try_prepare(protocol) {
+    ) -> Out
+    where
+        L: for<'d> rotation::Policy<'d>,
+        D: Fn(&dyn fmt::Debug),
+        O: for<'d> server::Mode<'d, LISTENER> + failure::Packet,
+    {
+        let observed = <O as life::Mode<
+            dope_quic::conn::id::Handle<dope_quic::conn::id::Driver<'static>, LISTENER>,
+            dope_quic::wire::stream::Id,
+        >>::ENABLED;
+        let (prepared, proof) = match self.try_prepare(protocol, send_bytes, make) {
             Ok(prepared) => prepared,
             Err(error) => return done(Err(error)),
         };
@@ -247,7 +268,7 @@ impl<'a> Scenario<'a> {
         let mut reclaim = reclaim::Reports::<_>::new(prepared.layout(), routes);
         let mut finish = Completion::new();
         prepared.enter_with(
-            source,
+            (),
             |scope| {
                 scope.lend(|topology, stage| {
                     Brand::with(|brand| {
@@ -261,42 +282,42 @@ impl<'a> Scenario<'a> {
                         drop(port);
                         let router = SrvApp::multiplexed::<wire::Identity, KeyTag<LISTENER>, _>(
                             brand,
-                            &stage.storage().state,
+                            stage.storage(),
                             sark_fiber::Config::new(capacity.count().get()),
                         );
-                        let runtime = stage.with_stage(|stage| {
-                            let seed =
-                                hash::Seed::new(stage.driver().driver_ref().random_seed());
-                            let deadline = stage
-                                .driver()
-                                .driver_ref()
-                                .clock()
-                                .deadline_at(proof.read().map_err(Error::Proof)?.network.deadline);
-                            let server = plan
-                                .try_with::<Silent, _, _, _, _, _>(
-                                    router,
-                                    Observed::new(Probe(Rc::clone(&proof), diagnose)),
-                                    lifetime,
-                                    policy,
-                                    server::Tasks::new(),
-                                    &mut stage.driver(),
-                                )
-                                .map_err(Error::Bind)?;
-                            let client = client
-                                .bind(
-                                    Client::new(seed, Rc::clone(&proof)),
-                                    &mut stage.driver(),
-                                )
-                                .map_err(Error::Dialer)?;
-                            Ok(AsyncRuntime {
-                                server,
-                                client,
-                                deadline,
-                            })
-                        })?;
-                        Stage::run_quiesce(stage, &mut finish, runtime, GUARD)
-                            .map_err(Error::Session)?
-                            .map_err(Error::Drive)
+                        let seed =
+                            hash::Seed::new(stage.driver().driver_ref().random_seed());
+                        let deadline = stage
+                            .driver()
+                            .driver_ref()
+                            .clock()
+                            .deadline_at(proof.read().map_err(Error::Proof)?.network.deadline);
+                        let server = plan
+                            .try_with::<Silent, _, _, _, _, _>(
+                                router,
+                                observe(Probe(Rc::clone(&proof), diagnose)),
+                                lifetime,
+                                policy,
+                                server::Tasks::new(),
+                                &mut stage.driver(),
+                            )
+                            .map_err(Error::Bind)?;
+                        let client = client
+                            .bind(
+                                Client::new(seed, Rc::clone(&proof)),
+                                &mut stage.driver(),
+                            )
+                            .map_err(Error::Dialer)?;
+                        let runtime = AsyncRuntime {
+                            server,
+                            client,
+                            deadline,
+                        };
+                        Stage::with_quiesce(stage, &mut finish, runtime, GUARD, |mut app| {
+                            proof.failures.try_wait(&mut app)
+                        })
+                        .map_err(Error::Session)?
+                        .map_err(Error::Run)
                     })
                 })
             },
@@ -316,7 +337,10 @@ impl<'a> Scenario<'a> {
                     Ok(events) => events,
                     Err(error) => return done(Err(Error::Reclaim(error))),
                 };
-                if events.len() != routes.len() || routes.iter().any(|route| {
+                if events.iter().filter(|event| !matches!(event,
+                    Reclaimed::RecvRoute { target, result: Ok(_), flow: Flow::More }
+                    if routes.contains(&target.route())
+                )).count() != routes.len() || routes.iter().any(|route| {
                     events.iter().filter(|event| matches!(event,
                         Reclaimed::RecvRoute { target, result: Err(Errno::CANCELED), flow: Flow::Last }
                         if target.route() == *route)).count() != 1
@@ -327,7 +351,7 @@ impl<'a> Scenario<'a> {
                     return done(Err(Error::Verification(Verification::RetainedScenario)));
                 };
                 let proof = proof.into_inner();
-                match self.verify(&proof) {
+                match self.verify(&proof, observed) {
                     Ok(()) => done(Ok(proof)),
                     Err(error) => done(Err(error)),
                 }
@@ -335,7 +359,7 @@ impl<'a> Scenario<'a> {
         )
     }
 
-    fn verify<'e>(&'e self, proof: &'e Proof<'a>) -> Result<'e, ()> {
+    fn verify<'e>(&'e self, proof: &'e Proof<'a>, observed: bool) -> Result<'e, ()> {
         let errors = proof.network.failures.values.take();
         if !errors.is_empty() {
             return Err(Error::Fixture(errors));
@@ -383,6 +407,15 @@ impl<'a> Scenario<'a> {
             {
                 return Err(Error::Verification(Verification::Fairness));
             }
+        }
+        if !observed {
+            return if proof.trace.events.is_empty() && proof.trace.audits.is_empty() {
+                Ok(())
+            } else {
+                Err(Error::Proof(Failure::Scenario(
+                    "quiet lifecycle events".to_owned(),
+                )))
+            };
         }
         proof
             .trace

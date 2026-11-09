@@ -72,15 +72,11 @@ where
         Ok(Feed::Consumed)
     }
 
-    pub(in crate::conn::machine::decoder) fn run<I, X>(
+    pub(in crate::conn::machine::decoder) fn run(
         &mut self,
         max: numbers::Limit,
-        source: &mut I,
-    ) -> Result<(), conn::Error>
-    where
-        I: Iterator<Item = Result<C, X>>,
-        conn::Error: From<X>,
-    {
+        source: &mut impl Iterator<Item = C>,
+    ) -> Result<(), conn::Error> {
         let head = self.conn.ingress.headers.try_pending()?;
         let stream = head.stream_id;
         let id = stream.get();
@@ -88,7 +84,7 @@ where
         'input: loop {
             if self.conn.ingress.input.bytes.is_empty() {
                 let owner = match source.next() {
-                    Some(owner) => owner?,
+                    Some(owner) => owner,
                     None => return Ok(()),
                 };
                 let owner = match self.try_feed(max, owner)? {
@@ -187,6 +183,7 @@ where
             let state::State {
                 active_streams: active,
                 stream_history: past,
+                lifecycle: life,
                 ..
             } = &mut *state;
             let ingress::Ingress {
@@ -209,6 +206,7 @@ where
                             blocks.finish_drop::<C, A>(input, range.clone(), total)?;
                             Ok(store::Action::Reset(
                                 error,
+                                life.keeps_events(),
                                 (key, events::Reset::new(slot, None)),
                             ))
                         },
@@ -227,7 +225,14 @@ where
                 } => {
                     let ready = blocks.resume::<C, A, E>(input, events, range, total)?;
                     let result = active.visit(past, stream, ready, |key, record, ready| {
-                        complete::<R, _, _, _>(key, record, ready, boundary, section)
+                        complete::<R, _, _, _>(
+                            key,
+                            record,
+                            ready,
+                            boundary,
+                            section,
+                            life.keeps_events(),
+                        )
                     })?;
                     match result {
                         Ok(Outcome::Done) => Ok(()),
@@ -269,7 +274,7 @@ where
         if self.conn.ingress.headers.pending().is_none() {
             return Err(full);
         }
-        self.run(max, &mut iter::empty::<Result<C, conn::Error>>())
+        self.run(max, &mut iter::empty())
     }
 }
 

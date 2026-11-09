@@ -25,27 +25,13 @@ pub trait Source: Copy + seals::Source {
     fn decode_frame(span: input::StringSpan<'_>) -> crate::Result<Self::Frame>;
 
     fn frame(self, idx: &mut usize) -> crate::Result<Text<Self::Frame>> {
-        self.frame_depth(idx, Depth::ROOT)
-    }
-
-    #[doc(hidden)]
-    fn frame_depth(self, idx: &mut usize, depth: Depth) -> crate::Result<Text<Self::Frame>> {
-        let input = self.input();
-        let start = *idx;
-        if start >= input.len() {
-            return Err(Error::Invalid);
-        }
-        if input[start] == b'"' {
-            let span = input::Input::string_span(input, idx)?;
-            if span.escaped {
-                Self::decode_frame(span).map(Text::admitted)
-            } else {
-                self.get_frame(span.start..span.end).map(Text::admitted)
-            }
+        let span = input::Input::string_span(self.input(), idx)?;
+        let frame = if span.escaped {
+            Self::decode_frame(span)
         } else {
-            input::Input::skip_depth(input, idx, depth)?;
-            self.get_frame(start..*idx).map(Text::admitted)
-        }
+            self.get_frame(span.start..span.end)
+        };
+        frame.map(Text::admitted)
     }
 
     fn frame_plain(self, idx: &mut usize) -> crate::Result<Plain<Self::Slice>> {

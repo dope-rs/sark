@@ -65,16 +65,6 @@ fn parse_connection(raw: &[u8]) -> Result<field::Connection, Error> {
         .map_err(Error::Connection)
 }
 
-fn apply_connection(scan: &mut request::Fields, flags: &mut Flags, value: field::Connection) {
-    scan.routing.connection.append(value);
-    if value.is_close() {
-        flags.set(Flags::CONNECTION_CLOSE);
-    }
-    if value.is_keep() {
-        flags.set(Flags::CONNECTION_KEEP_ALIVE);
-    }
-}
-
 impl Known {
     const PREFIX_INITIALS: u32 = {
         let mut initials = 0;
@@ -172,7 +162,7 @@ impl Known {
             }
             Self::Connection => {
                 let value = parse_connection(value)?;
-                apply_connection(scan, flags, value);
+                scan.routing.connection.append(value);
                 Ok(())
             }
             Self::Upgrade => {
@@ -198,7 +188,7 @@ impl Known {
             Self::TransferEncoding => parse::te_line(scan, raw),
             Self::Expect => expect_line(scan, raw),
             Self::Host => host_line(scan, raw),
-            Self::Connection => conn_line(scan, flags, raw),
+            Self::Connection => conn_line(scan, raw),
             Self::Upgrade => upgrade_line(scan, raw, version),
         }
     }
@@ -245,11 +235,7 @@ fn expect_line(scan: &mut request::Fields, raw: &[u8]) -> Result<Option<Bounds>,
     Ok(Some(bounds))
 }
 
-fn conn_line(
-    scan: &mut request::Fields,
-    flags: &mut Flags,
-    raw: &[u8],
-) -> Result<Option<Bounds>, Error> {
+fn conn_line(scan: &mut request::Fields, raw: &[u8]) -> Result<Option<Bounds>, Error> {
     let (value, bounds) = if let Some(bounds) = parse::try_token_line_lit(raw, b"keep-alive") {
         (field::Connection::KEEP_ALIVE, bounds)
     } else if let Some(bounds) = parse::try_token_line_lit(raw, b"close") {
@@ -261,6 +247,6 @@ fn conn_line(
         let value = parse_connection(bounds.value(raw))?;
         (value, bounds)
     };
-    apply_connection(scan, flags, value);
+    scan.routing.connection.append(value);
     Ok(Some(bounds))
 }

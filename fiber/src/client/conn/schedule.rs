@@ -30,16 +30,11 @@ where
             net.waiters.begin_drain();
         }
         net.waiters.drain(work);
-        if net.pool.directory.len() != 0
-            && net.waiters.has_io()
-            && let Some(permit) = work.permit()
-        {
-            permit.run(|| net.waiters.wake_io());
+        if net.pool.directory.len() != 0 && net.waiters.has_io() && work.permit().is_some() {
+            net.waiters.wake_io();
         }
-        if self.can_wake(region)
-            && let Some(permit) = work.permit()
-        {
-            permit.run(|| net.waiters.wake_next());
+        if self.can_wake(region) && work.permit().is_some() {
+            net.waiters.wake_next();
         }
     }
 

@@ -21,11 +21,11 @@ pub trait Timing<'d>: timers::Policy {
     where
         S: server::Connection<Key = Key, Owner = resident::Shared<'d>, Output = storage::Shared>,
     {
-        state.state.calls.is_quiescent()
-            && state.state.egress.is_quiescent()
+        state.calls.is_quiescent()
+            && state.egress.is_quiescent()
             && state.active.get().is_quiescent()
-            && state.state.segments.is_idle()
-            && state.state.deadline().is_none()
+            && state.segments.is_idle()
+            && state.deadline().is_none()
     }
 
     fn activity<T, S>(state: &state::Store<'_, 'd, T, Self, S>) -> Quiescence
@@ -84,7 +84,7 @@ impl<'d> Timing<'d> for timers::On {
     where
         S: server::Connection<Key = Key, Owner = resident::Shared<'d>, Output = storage::Shared>,
     {
-        if Self::is_quiescent(state) && state.state.output_deadlines.is_empty() {
+        if Self::is_quiescent(state) && state.output_deadlines.is_empty() {
             Quiescence::Quiet
         } else {
             Quiescence::Busy

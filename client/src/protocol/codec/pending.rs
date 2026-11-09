@@ -6,7 +6,7 @@ use o3::{
 use crate::protocol::{Error, codec::output};
 
 pub(super) struct Pending<'d> {
-    owner: Option<Owned<resident::Lease<'d>>>,
+    owner: Option<Owned<resident::Budget<'d>>>,
 }
 
 impl<'d> Pending<'d> {
@@ -49,7 +49,7 @@ impl<'d> Pending<'d> {
     pub(super) fn take_full(&mut self) -> Option<resident::Shared<'d>> {
         self.owner
             .take_if(|owner| owner.len() == output::DATA_LIMIT)
-            .map(<Owned<resident::Lease<'d>>>::freeze)
+            .map(<Owned<resident::Budget<'d>>>::freeze)
     }
 
     pub(super) fn finish(&mut self) -> Result<Option<resident::Shared<'d>>, Error> {
@@ -58,11 +58,11 @@ impl<'d> Pending<'d> {
         {
             return Err(Error::Compact(alloc::Error::from(error)));
         }
-        Ok(self.owner.take().map(<Owned<resident::Lease<'d>>>::freeze))
+        Ok(self.owner.take().map(<Owned<resident::Budget<'d>>>::freeze))
     }
 }
 
 const _: () = assert!(
     core::mem::size_of::<Pending<'static>>()
-        == core::mem::size_of::<Option<Owned<resident::Lease<'static>>>>()
+        == core::mem::size_of::<Option<Owned<resident::Budget<'static>>>>()
 );

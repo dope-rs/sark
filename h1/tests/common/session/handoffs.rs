@@ -1,10 +1,10 @@
 use std::{cell::Cell, convert, pin::Pin, rc::Rc};
 
-use conn::write::{self, error};
+use conn::write;
 use dope::{
     core::{
         driver::{
-            retained,
+            self,
             route::{self, KeyTag},
             schedule::clock,
             settings,
@@ -22,23 +22,17 @@ use dope::{
         timing::Throughput,
     },
     net::{
-        link::egress::{
-            self,
-            data::{self, compose},
-        },
+        link::egress::data::{self, compose},
         tcp,
         wire::{Identity, domain, domain::Local},
     },
 };
 use dope_test::harness::signals::Gate;
-use o3::buffer::{Complete as _, bytes::TryRetain, resident::bound, storage, storage::range};
+use o3::buffer::{Complete as _, bytes::TryRetain, resident::bound, storage};
 use sark_h1::{
     Input, pump,
     pump::Completion,
-    server::{
-        payload,
-        payload::write::{CycleCommit, Response},
-    },
+    server::payload,
     session,
     session::{Dispatch, RouteOutcome},
     switch,
@@ -151,36 +145,13 @@ impl<'d> Dispatch<'d, (), convert::Infallible, switch::Enabled<Staged>> for Swit
 }
 
 type Owner<'d> = compose::Either<payload::Body<'d, ()>, payload::Stream<'d, ()>>;
-type Receipt = CycleCommit<(), ()>;
-type Commit<'d> = Result<
-    write::Outcome<Receipt>,
-    error::Error<
-        data::Bound<Owner<'d>, bound::Unbounded>,
-        Receipt,
-        (egress::Excess<payload::Body<'d, ()>>, Receipt),
-    >,
->;
-
-pub enum Event<'a, 'd> {
-    Switch(switch::Mode, Option<storage::Shared>),
-    Raw(&'a Result<&'a mut Staged, switch::Mode<convert::Infallible>>),
-    Owner(u8),
-    Preflight(&'a pump::Reject),
-    Cycle(&'a pump::Cycle<'d, ()>),
-    Commit(&'a Commit<'d>),
-    Retained(&'a Result<storage::Shared, storage::AllocError>),
-    Restricted(&'a Result<(), range::Error>),
-    Staged(&'a Result<&'a mut Staged, switch::Mode<Kind, convert::Infallible>>),
-    Replaced(Option<storage::Shared>),
-}
-
 pub struct App<'a> {
     pub sent: Gate,
     pub moved: Gate,
     pub closed: Gate,
     pub raw: Rc<Cell<Vec<u8>>>,
     pub owner: Rc<Cell<Option<u8>>>,
-    pub observe: &'a dyn Fn(Event<'_, '_>),
+    pub checks: &'a [Cell<usize>; 9],
 }
 
 impl App<'_> {
@@ -222,15 +193,11 @@ impl<'observe: 'd, 'd, ID: route::Identity> Application<'d, ID> for App<'observe
         matches!(conn.state().mode(), switch::Mode::Switching(_))
     }
 
-    fn close<'e, 'a, 'p, 's, 'w>(
+    fn close<'e>(
         self: Pin<&mut Self>,
-        conn: conn::Ctx<'e, 'a, 'p, 's, 'w, 'd, ID, Identity, Self::Conn, Self::Egress>,
-    ) -> conn::Ctx<'e, 'a, 'p, 's, 'w, 'd, ID, Identity, Self::Conn, Self::Egress>
-    where
-        'd: 'w,
-    {
+        _: conn::Ctx<'e, '_, '_, '_, '_, 'd, ID, Identity, Self::Conn, Self::Egress>,
+    ) {
         self.get_mut().closed.hit();
-        conn
     }
 }
 
@@ -242,9 +209,14 @@ impl<'observe: 'd, 'd, ID: route::Identity> handler::Gated<'d, ID> for App<'obse
         let this = self.get_mut();
         let http = conn.state_mut();
         if matches!(pump::Drain::complete(http), Completion::Switch) {
-            (this.observe)(Event::Switch(http.mode(), http.take_input()));
+            let mode = http.mode();
+            let input = http.take_input();
+            assert_eq!(mode, switch::Mode::Raw(Kind::Connect));
+            assert!(input.is_none(), "affine tail stayed out of HTTP input");
+            this.checks[0].set(this.checks[0].get() + 1);
             let staged = http.raw_mut();
-            (this.observe)(Event::Raw(&staged));
+            assert!(staged.is_ok(), "drain must commit the raw owner");
+            this.checks[1].set(this.checks[1].get() + 1);
             if let Ok(staged) = staged {
                 if let Some(tail) = staged.tail.take() {
                     this.absorb_raw(tail.as_slice());
@@ -262,11 +234,12 @@ impl<'observe: 'd, 'd, ID: route::Identity> handler::Borrowed<'d, ID> for App<'o
         self: Pin<&mut Self>,
         mut conn: conn::Ctx<'e, '_, '_, '_, '_, 'd, ID, Identity, Self::Conn, Self::Egress>,
         chunk: R,
-        driver: &mut retained::Context<'_, '_, 'd>,
+        driver: &mut driver::Context<'_, 'd>,
     ) -> receive::Outcome {
         let this = self.get_mut();
         if let Ok(raw) = conn.state().raw() {
-            (this.observe)(Event::Owner(raw.owner));
+            assert_eq!(raw.owner, 7);
+            this.checks[2].set(this.checks[2].get() + 1);
             this.absorb_raw(chunk.as_ref());
             conn.close_after();
             return receive::Outcome::Continue;
@@ -278,9 +251,8 @@ impl<'observe: 'd, 'd, ID: route::Identity> handler::Borrowed<'d, ID> for App<'o
             pump::Preflight::Settled | pump::Preflight::Finished => {
                 return receive::Outcome::Continue;
             }
-            pump::Preflight::Rejected(error) => {
-                (this.observe)(Event::Preflight(&error));
-                return receive::Outcome::CloseAfter;
+            pump::Preflight::Rejected(_) => {
+                panic!("unexpected preflight failure");
             }
         };
 
@@ -294,27 +266,48 @@ impl<'observe: 'd, 'd, ID: route::Identity> handler::Borrowed<'d, ID> for App<'o
                 prefix,
                 head::Connection::KeepAlive,
             );
-            (this.observe)(Event::Cycle(&cycle));
-            Response::<()>::try_cycle(cycle, |_| ())
+            assert!(matches!(cycle.connection, head::Connection::KeepAlive));
+            assert!(
+                matches!(&cycle.state, Ok(pump::Egress::Static { .. })),
+                "switch must publish its exact static response owner"
+            );
+            this.checks[3].set(this.checks[3].get() + 1);
+            payload::write::try_cycle(cycle, |_| ())
         });
-        (this.observe)(Event::Commit(&commit));
+        let Ok(write::Outcome::Committed(receipt)) = &commit else {
+            panic!("switching response must commit exactly once");
+        };
+        assert!(
+            receipt.state.is_ok(),
+            "switch response committed its protocol state"
+        );
+        assert!(
+            matches!(&receipt.tail, pump::Tail::Handoff { .. }),
+            "switching response must carry its exact suffix"
+        );
+        this.checks[4].set(this.checks[4].get() + 1);
         if let Ok(write::Outcome::Committed(receipt)) = commit {
             let tail = receipt.tail;
             if let pump::Tail::Handoff { staged: (), range } = tail {
                 let tail = chunk.try_retain();
-                (this.observe)(Event::Retained(&tail));
+                assert!(tail.is_ok(), "retain tail: {:?}", tail.as_ref().err());
+                this.checks[5].set(this.checks[5].get() + 1);
                 let Ok(mut tail) = tail else {
                     return receive::Outcome::CloseAfter;
                 };
                 let restrict = tail.try_restrict(range);
-                (this.observe)(Event::Restricted(&restrict));
+                assert!(restrict.is_ok(), "restrict tail: {restrict:?}");
+                this.checks[6].set(this.checks[6].get() + 1);
                 if restrict.is_err() {
                     return receive::Outcome::CloseAfter;
                 }
                 let staged = conn.state_mut().staged_mut();
-                (this.observe)(Event::Staged(&staged));
+                assert!(staged.is_ok(), "raw owner must remain staged until drain");
+                this.checks[7].set(this.checks[7].get() + 1);
                 if let Ok(staged) = staged {
-                    (this.observe)(Event::Replaced(staged.tail.replace(tail)));
+                    let previous = staged.tail.replace(tail);
+                    assert!(previous.is_none(), "one affine switch tail");
+                    this.checks[8].set(this.checks[8].get() + 1);
                     this.sent.hit();
                 }
             }

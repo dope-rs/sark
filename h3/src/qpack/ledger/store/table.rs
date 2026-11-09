@@ -62,10 +62,13 @@ impl<'a> Table<'a, store::Free> {
         blocking: u32,
         received: u64,
         active: Option<u32>,
+        published: bool,
     ) {
         let table = match slot {
-            compact::Entry::Occupied(occupied) => Self::append(occupied, counts, blocking),
-            compact::Entry::Vacant(owner) => owner.insert(counts, blocking),
+            compact::Entry::Occupied(occupied) => {
+                Self::append(occupied, counts, blocking, published)
+            }
+            compact::Entry::Vacant(owner) => owner.insert(counts, blocking, published),
         };
         table.commit(received, active);
     }
@@ -74,13 +77,19 @@ impl<'a> Table<'a, store::Free> {
         mut occupied: compact::Found<Self>,
         counts: store::Counts,
         blocking: u32,
+        published: bool,
     ) -> Table<'a, store::Allocated> {
         let value = occupied.value();
         let stream = value.index() as u32;
         let tail = Self::row(&value).queue(Queue::Tail);
         let owner = unsafe { compact::raw::Write::owner_mut(&mut occupied) };
         let store = &mut owner.ledger.store;
-        let input = store.acquire(&owner.input, counts, store::Stream::from_index(stream));
+        let input = store.acquire(
+            &owner.input,
+            counts,
+            store::Stream::from_index(stream),
+            published,
+        );
         // SAFETY: the occupied stream retains its live tail and exact owner;
         // admission has initialized the new section before this link publishes it.
         Row::new(unsafe { depot::raw::Proof::new((&mut *store, tail)) })
@@ -95,11 +104,16 @@ impl<'a> Table<'a, store::Free> {
         }
     }
 
-    fn insert(self, counts: store::Counts, blocking: u32) -> Table<'a, store::Allocated> {
+    fn insert(
+        self,
+        counts: store::Counts,
+        blocking: u32,
+        published: bool,
+    ) -> Table<'a, store::Allocated> {
         use compact::Insert as _;
         let store = &mut self.ledger.store;
         let stream = self.input.stream;
-        let input = store.acquire(&self.input, counts, stream);
+        let input = store.acquire(&self.input, counts, stream, published);
         // SAFETY: this Table retains its admitted free stream row and owner.
         let mut row = Row::new(unsafe { depot::raw::Proof::new((&mut *store, stream.raw())) });
         let next = row.view().queue(Queue::Head);
@@ -130,31 +144,41 @@ impl Table<'_, store::Allocated> {
 }
 
 impl Table<'_, ()> {
+    pub(in crate::qpack::ledger) fn head<'a>(
+        occupied: &'a mut compact::Found<Self>,
+    ) -> store::Occupied<'a> {
+        let section = store::Section(capacity::Count::new(
+            Self::row(&occupied.value()).queue(Queue::Head),
+        ));
+        // SAFETY: Found retains the same live stream and its initialized head;
+        // the returned projection cannot outlive that exclusive owner loan.
+        let owner = unsafe { compact::raw::Write::owner_mut(occupied) };
+        store::Occupied {
+            owner: &mut owner.ledger.store,
+            section,
+        }
+    }
+
     /// Retire one head under the original Found loan. No section identity or
     /// owner-free resident escapes between queue, frontier, heap and free list.
     pub(in crate::qpack::ledger) fn release_head(
         occupied: &mut compact::Found<Self>,
     ) -> (u64, bool) {
-        let value = occupied.value();
-        let stream = value.index() as u32;
-        let section = store::Section(capacity::Count::new(Self::row(&value).queue(Queue::Head)));
-        let owner = unsafe { compact::raw::Write::owner_mut(occupied) };
-        let store = &mut owner.ledger.store;
-        let head = store::Occupied {
-            owner: store,
-            section,
-        };
+        let stream = occupied.value().index() as u32;
+        let head = Self::head(occupied);
         let required = head.counts().required();
         let next = head.row().node(Node::Next);
         let head = frontier::Frontier::remove(head);
         ledger::raw::Heap::remove(head.resident()).release();
-        if next != store::NONE {
+        let has_next = next < store::UNPUBLISHED;
+        if has_next {
             // SAFETY: Found still retains the same stream row. The successor
             // came from its live queue before the head was retired.
-            Row::new(unsafe { depot::raw::Proof::new((&mut *store, stream)) })
+            let owner = unsafe { compact::raw::Write::owner_mut(occupied) };
+            Row::new(unsafe { depot::raw::Proof::new((&mut owner.ledger.store, stream)) })
                 .queue(Queue::Head, next);
         }
-        (required, next != store::NONE)
+        (required, has_next)
     }
 
     pub(in crate::qpack::ledger) fn advance(

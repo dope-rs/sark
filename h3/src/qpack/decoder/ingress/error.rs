@@ -50,10 +50,6 @@ pub enum Error {
         pending: u64,
         additional: u64,
     },
-    FeedbackGrowth {
-        before: usize,
-        after: usize,
-    },
 }
 
 impl From<dynamics::Capacity> for Error {

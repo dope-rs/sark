@@ -107,15 +107,20 @@ impl<'d, ID: Identity> Session<ID> {
 }
 
 impl<'d, ID: Identity> duplex::Session<'d> for Session<ID> {
-    fn receive(&mut self, _: owned::Segments<'d>) -> duplex::Action<'d> {
-        duplex::Action::close()
+    fn receive(
+        &mut self,
+        _: owned::Segments<'d>,
+        _: &mut [u8],
+        _: &mut Vec<u8>,
+    ) -> (usize, duplex::Action<'d>) {
+        (0, duplex::Action::close())
     }
 
-    fn finish(&mut self) -> duplex::Action<'d> {
-        Self::END
+    fn finish(&mut self, _: &mut [u8], _: &mut Vec<u8>) -> (usize, duplex::Action<'d>) {
+        (0, Self::END)
     }
 
-    fn activate(&mut self) -> duplex::Action<'d> {
-        Self::IDLE
+    fn activate(&mut self, _: &mut [u8], _: &mut Vec<u8>) -> (usize, duplex::Action<'d>) {
+        (0, Self::IDLE)
     }
 }

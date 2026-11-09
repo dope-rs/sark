@@ -193,67 +193,54 @@ where
         }
     }
 
-    fn apply(&mut self, router: &R, limits: server::Config, event: Incoming<'d, R::Plan>)
-    where
-        for<'i> head::Head<'i, 'a, 'd, R>:
-            head::Begin<<R::Head as request::Head>::Start, Router = R>,
-    {
-        match event {
-            Event::Head {
-                message: frame,
-                head,
-                section: part,
-            } => {
-                let stream = frame.key();
-                let boundary = frame.boundary();
-                if matches!(part, Section::Trailing) {
-                    if matches!(boundary, Boundary::End) {
-                        self.finish(stream, limits);
-                    }
-                    return;
-                }
-                let head = match head.try_request() {
-                    Ok(head) => head,
-                    Err(_) => {
-                        self.reset(stream, numbers::ErrorCode::ProtocolError);
-                        return;
-                    }
-                };
-                head::Begin::begin(
-                    &mut head::Head::new(self),
-                    router,
-                    stream,
-                    head,
-                    boundary,
-                    limits,
-                );
-            }
-            Event::Data {
-                message: frame,
-                data,
-            } => self.data(frame.key(), data, frame.boundary(), limits),
-            Event::Reset { stream, .. } => {
-                let result = self.discard(stream);
-                if let Err(error) = result {
-                    self.connection.streams().cancel(stream, error.code());
-                }
-            }
-            Event::Retired(retired) => match retired {},
-            Event::Control | Event::Established => {}
-        }
-    }
-
     pub(in crate::server::sync) fn run(
         &mut self,
         router: &R,
         limits: server::Config,
         mut next: impl FnMut(&mut Connection<'d, R::Plan>) -> Option<Incoming<'d, R::Plan>>,
+        mut report: impl FnMut(conn::Error),
     ) where
-        for<'i> head::Head<'i, 'a, 'd, R>:
-            head::Begin<<R::Head as request::Head>::Start, Router = R>,
+        <R::Head as request::Head>::Start: head::Begin<'d, R>,
     {
         while let Some(event) = next(self.connection) {
-            self.apply(router, limits, event);
+            match event {
+                Event::Head {
+                    message: frame,
+                    head,
+                    section: part,
+                } => {
+                    let stream = frame.key();
+                    let boundary = frame.boundary();
+                    if matches!(part, Section::Trailing) {
+                        if matches!(boundary, Boundary::End) {
+                            self.finish(stream, limits);
+                        }
+                        continue;
+                    }
+                    let head = match head.try_request() {
+                        Ok(head) => head,
+                        Err(_) => {
+                            self.reset(stream, numbers::ErrorCode::ProtocolError);
+                            continue;
+                        }
+                    };
+                    if let Some(start) = self.select(router, stream, head, boundary, limits) {
+                        head::Begin::begin(start, self, router, stream, limits, &mut report);
+                    }
+                }
+                Event::Data {
+                    message: frame,
+                    data,
+                } => self.data(frame.key(), data, frame.boundary(), limits),
+                Event::Reset { stream, .. } => {
+                    let result = self.discard(stream);
+                    if let Err(error) = result {
+                        self.connection.streams().cancel(stream, error.code());
+                    }
+                }
+                Event::Retired(retired) => match retired {},
+                Event::Control | Event::Established => {}
+            }
         }
     }
 }

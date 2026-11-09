@@ -85,52 +85,6 @@ where
         let mut policy = policies::Direct;
         self.state
             .cancel_feed(stream.stream, stream.completion, &mut policy);
-    }
-}
-
-impl<'scope, P, C> session::Session<'scope, P, C>
-where
-    C: Storage,
-    P: Plan<
-            C,
-            Key = stream::Key,
-            Fields = section::Owner,
-            Selection = (),
-            Connection: Connection<Error = conn::Error>,
-        >,
-{
-    pub(in crate::client) fn try_response<'notify, D: crate::Codec>(
-        &mut self,
-        path: &[u8],
-        target: Option<&[u8]>,
-        metadata: &metadata::Metadata,
-        codec: &mut D,
-        message: &D::Encode,
-        done: &mut policies::Notify<'notify, '_, '_>,
-    ) -> call::Admission<Stream<'scope, P::Key>> {
-        self.state
-            .start_single::<receive::StreamKey, _, _>(path, target, metadata, codec, message, done)
-            .map(|started| Stream {
-                brand: self.brand,
-                stream: started.stream,
-                completion: started.completion,
-            })
-    }
-
-    pub(in crate::client) fn poll_response<'notify>(
-        &mut self,
-        stream: &Stream<'scope, P::Key>,
-        done: &mut policies::Notify<'notify, '_, '_>,
-    ) -> Result<receive::Progress<receive::Response<C>>, crate::Status> {
-        self.state.poll_stream(stream.completion, done)
-    }
-
-    pub(in crate::client) fn cancel_response<'notify>(
-        &mut self,
-        stream: Stream<'scope, P::Key>,
-        done: &mut policies::Notify<'notify, '_, '_>,
-    ) {
-        self.state
-            .cancel_feed(stream.stream, stream.completion, done);
+        self.state.refill(&mut policy);
     }
 }

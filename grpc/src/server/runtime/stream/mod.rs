@@ -1,7 +1,7 @@
 //! Streaming tasks over one exact driver-domain scheduler.
 use core::convert::Infallible;
 use dope::{
-    core::driver::{retained, route::KeyTag, schedule::app::Work},
+    core::driver::{self, route::KeyTag, schedule::app::Work},
     manifold::network::listener::conn::Id,
 };
 use dope_fiber::task::storage::set::group;
@@ -98,7 +98,7 @@ where
 
     fn start<W: Write>(
         &mut self,
-        turn: &mut app::Turn<'_, '_, '_, '_, 'd, Id<'d, KeyTag<0>>>,
+        turn: &mut app::Turn<'_, '_, '_, 'd, Id<'d, KeyTag<0>>>,
         target: active::Entry<'r>,
         stream: &mut service::Stream,
         head: request::Head,
@@ -270,7 +270,7 @@ where
 
     fn request<W: Write>(
         &mut self,
-        _: &mut app::Turn<'_, '_, '_, '_, 'd, Id<'d, KeyTag<0>>>,
+        _: &mut app::Turn<'_, '_, '_, 'd, Id<'d, KeyTag<0>>>,
         _: active::Entry<'r>,
         _: &mut Handler<(), Self::State>,
         _: service::Request<'_, resident::Shared<'d>>,
@@ -292,7 +292,7 @@ where
         &mut self,
         owner: Id<'d, KeyTag<0>>,
         work: Work<'_, 'd>,
-        driver: &mut retained::Context<'_, '_, 'd>,
+        driver: &mut driver::Context<'_, 'd>,
     ) -> policy::TaskState {
         self.tasks.drive_with(owner, work, driver, |entry, fiber| {
             Self::signal(entry, fiber.take_events());

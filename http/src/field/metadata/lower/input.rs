@@ -168,6 +168,6 @@ impl<B: storage::Block> Input<B> {
 
     pub fn recycle(mut self, scratch: &mut storage::Scratch) {
         self.rollback(scratch);
-        self.lease.recycle();
+        drop(self.lease);
     }
 }

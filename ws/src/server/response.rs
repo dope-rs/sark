@@ -20,6 +20,10 @@ pub struct Response<'a> {
 }
 
 impl<'a> Response<'a> {
+    pub const REJECTION: &'static [u8] = b"HTTP/1.1 400 Bad Request\r\nConnection: close\r\nSec-WebSocket-Version: 13\r\nContent-Length: 0\r\n\r\n";
+    pub const FORBIDDEN: &'static [u8] =
+        b"HTTP/1.1 403 Forbidden\r\nConnection: close\r\nContent-Length: 0\r\n\r\n";
+
     pub(super) fn new(write: &'a mut [u8]) -> Self {
         let user = write.len();
         Self {
@@ -44,6 +48,13 @@ impl<'a> Response<'a> {
 
     pub fn try_binary(&mut self, data: &[u8]) -> Result<(), consume::Error> {
         self.put(0x2, data, self.user)
+    }
+
+    /// Writes the complete opening response into already reserved output.
+    pub fn upgrade_into(write: &'a mut [u8], accept: &[u8; 28]) -> Result<usize, consume::Error> {
+        let mut out = Self::new(write);
+        out.upgrade(accept)?;
+        Ok(out.written)
     }
 
     pub(super) fn put_raw(&mut self, src: &[u8]) -> Result<(), consume::Error> {

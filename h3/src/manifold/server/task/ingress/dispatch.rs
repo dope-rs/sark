@@ -25,8 +25,7 @@ use crate::{
         server::{
             self, deadline,
             deadline::state::State,
-            rotation,
-            session::finish,
+            failure, rotation,
             task::ingress::{
                 head::{self, Head, Outcome},
                 item::Item,
@@ -43,7 +42,8 @@ pub(super) fn accept<'a, 'scope, 'd, R, O, L, E, B, const ID: u8, const RECONCIL
     section: Section,
 ) where
     R: Runtime<'d, Target = server::Handle<'d, ID>>,
-    O: life::Mode<id::Handle<id::Driver<'d>, ID>, Id>,
+    O: life::Mode<id::Handle<id::Driver<'d>, ID>, Id>
+        + failure::Sink<id::Handle<id::Driver<'d>, ID>>,
     O::Retention: owners::Handoff,
     L: rotation::Policy<'d>,
     E: State<'d>,
@@ -159,10 +159,9 @@ pub(super) fn accept<'a, 'scope, 'd, R, O, L, E, B, const ID: u8, const RECONCIL
         h3: &mut state.h3,
         deadline: &mut state.deadline,
         app,
-        effects: owners::Projection::new(life, handle),
-        conn,
+        life,
+        handle,
         claim,
-        boundary,
         now,
     }
     .begin(request);
@@ -170,18 +169,5 @@ pub(super) fn accept<'a, 'scope, 'd, R, O, L, E, B, const ID: u8, const RECONCIL
         Outcome::Done => {}
         Outcome::Reject(code) => state.reject(life, conn, handle, id, code, now),
         Outcome::Close(code) => manifold::close_connection_scoped(conn, code),
-        Outcome::Stopped | Outcome::Removed => {
-            let retired = finish::removed(
-                &mut state.h3,
-                now.at(&mut state.deadline),
-                conn,
-                id,
-                matches!(outcome, Outcome::Stopped),
-            );
-            span.retire(life, life::Outcome::Rejected);
-            if let Err(error) = retired {
-                manifold::close_connection_scoped(conn, error.code());
-            }
-        }
     }
 }

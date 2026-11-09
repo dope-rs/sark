@@ -16,7 +16,6 @@ pub(crate) enum Status {
 pub(crate) enum Error {
     Capacity(stream::Capacity),
     Increment { pending: u64, additional: u64 },
-    Growth { before: usize, after: usize },
 }
 
 pub(crate) struct State {
@@ -100,10 +99,7 @@ impl State {
             tail_increment: self.tail_increment,
         };
         update(&mut next)?;
-        let after = next.len();
-        let growth = after
-            .checked_sub(before)
-            .ok_or(Error::Growth { before, after })?;
+        let growth = next.len() - before;
         Ok(Candidate {
             owner: self,
             next,

@@ -22,10 +22,13 @@ mod recipe;
 pub mod startup;
 
 pub use local::Local;
-pub use plan::{Plan, tasks::Tasks};
+pub use plan::{
+    Plan,
+    tasks::{Prepared, Tasks},
+};
 pub use recipe::Recipe;
 
-type Connection<'d, A> = machine::Connection<
+pub type Connection<'d, A> = machine::Connection<
     crate::ServerRole,
     <A as Spec>::Fields,
     resident::Shared<'d>,
@@ -33,7 +36,7 @@ type Connection<'d, A> = machine::Connection<
     event::Ignore,
 >;
 
-type Context<'e, 'a, 'p, 's, 'w, 'd, ID, A, W> = Ctx<
+type Context<'e, 'a, 'p, 's, 'w, 'd, ID, A, W, E> = Ctx<
     'e,
     'a,
     'p,
@@ -43,7 +46,7 @@ type Context<'e, 'a, 'p, 's, 'w, 'd, ID, A, W> = Ctx<
     ID,
     W,
     app::State<'d, A, Id<'d, ID>>,
-    data::Bound<resident::Shared<'d>, <A as Spec>::Egress<'d>>,
+    data::Bound<E, <A as Spec>::Egress<'d>>,
 >;
 
 #[derive(Debug, Eq, PartialEq)]

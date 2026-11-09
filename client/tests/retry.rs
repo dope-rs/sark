@@ -11,7 +11,7 @@ use std::time::Duration;
 use common::retry::aggressive;
 use dope::{
     core::Errno,
-    manifold::client::close::LocalOrigin,
+    manifold::client::{attempt, close::LocalOrigin},
     net::link::{event, pool::change::opening::Exhaustion},
 };
 use dope_fiber::task::time::budget;
@@ -33,10 +33,11 @@ fn attempt_failures_final() {
         actual: key::Generation::MIN,
     };
     for cause in [
-        event::ConnectFault::Attempt(event::AttemptError::Lookup(observed)),
-        event::ConnectFault::Cleanup {
+        attempt::ConnectFault::RuntimeShutdown,
+        attempt::ConnectFault::Attempt(attempt::AttemptError::Lookup(observed)),
+        attempt::ConnectFault::Cleanup {
             cause: event::ConnectError::Connect(Errno::NO_BUFFER_SPACE),
-            error: event::AttemptError::Lookup(observed),
+            error: attempt::AttemptError::Lookup(observed),
         },
     ] {
         let (failure, counts) = Tracker::measure(|| {
@@ -50,12 +51,13 @@ fn attempt_failures_final() {
         });
         assert_eq!(counts, [0; 4]);
         match failure.cause() {
-            Error::Connect(connect::Error::Attempt(event::ConnectFault::Attempt(
-                event::AttemptError::Lookup(actual),
+            Error::Connect(connect::Error::Attempt(attempt::ConnectFault::RuntimeShutdown)) => {}
+            Error::Connect(connect::Error::Attempt(attempt::ConnectFault::Attempt(
+                attempt::AttemptError::Lookup(actual),
             ))) => assert!((*actual) == (observed)),
-            Error::Connect(connect::Error::Attempt(event::ConnectFault::Cleanup {
+            Error::Connect(connect::Error::Attempt(attempt::ConnectFault::Cleanup {
                 cause: event::ConnectError::Connect(errno),
-                error: event::AttemptError::Lookup(actual),
+                error: attempt::AttemptError::Lookup(actual),
             })) => {
                 assert_eq!(*errno, Errno::NO_BUFFER_SPACE);
                 assert!((*actual) == (observed));
@@ -114,32 +116,29 @@ fn pre_submit_can_retry() {
 
 #[test]
 fn connect_before_only() {
-    let connect = || -> Failure {
-        Failure::new(
-            Error::Connect(connect::Error::Attempt(event::ConnectFault::Transport(
-                event::ConnectError::Connect(Errno::NO_BUFFER_SPACE),
-            ))),
+    for cause in [
+        attempt::ConnectFault::Transport(event::ConnectError::Connect(Errno::NO_BUFFER_SPACE)),
+        attempt::ConnectFault::ConnectTimeout,
+    ] {
+        let failure: Failure = Failure::new(
+            Error::Connect(connect::Error::Attempt(cause)),
             Safety::BeforeSubmit,
-        )
-    };
-
-    for method in [Method::GET, Method::POST] {
-        let retry = State::new(Policy::default(), &method);
-        let backoff = retry.retry_after(&connect()).ok().expect("retry admitted");
-        assert_eq!(backoff.delay(), Duration::from_millis(25));
+        );
+        for method in [Method::GET, Method::POST] {
+            let retry = State::new(Policy::default(), &method);
+            let backoff = retry.retry_after(&failure).ok().expect("retry admitted");
+            assert_eq!(backoff.delay(), Duration::from_millis(25));
+        }
+        let after: Failure = Failure::new(
+            Error::Connect(connect::Error::Attempt(cause)),
+            Safety::PossiblyCommitted,
+        );
+        let retry = State::new(aggressive(), &Method::POST);
+        let retry = retry.retry_after(&after).err().expect("terminal failure");
+        let terminal = retry.finish(after);
+        assert!(terminal.safety() == Safety::PossiblyCommitted);
+        assert!(matches!(terminal.cause(), Error::Connect(_)));
     }
-
-    let after: Failure = Failure::new(
-        Error::Connect(connect::Error::Attempt(event::ConnectFault::Transport(
-            event::ConnectError::Connect(Errno::NO_BUFFER_SPACE),
-        ))),
-        Safety::PossiblyCommitted,
-    );
-    let retry = State::new(aggressive(), &Method::POST);
-    let retry = retry.retry_after(&after).err().expect("terminal failure");
-    let terminal = retry.finish(after);
-    assert!(terminal.safety() == Safety::PossiblyCommitted);
-    assert!(matches!(terminal.cause(), Error::Connect(_)));
 }
 
 #[test]
@@ -291,7 +290,7 @@ fn submit_cause_is_kept() {
                     error: Transmit::Rejected(event::SendFailure::Queued(error)),
                     ..
                 })
-                | Error::Connect(connect::Error::Attempt(event::ConnectFault::Transport(
+                | Error::Connect(connect::Error::Attempt(attempt::ConnectFault::Transport(
                     event::ConnectError::Admission(error),
                 ))) => Some(error.cause()),
                 _ => None,

@@ -5,17 +5,22 @@ pub(crate) mod seals;
 
 use o3::{buffer::storage, mem::Rejected};
 
-/// Admits words without escapes, optionally requiring ASCII bytes.
+/// Admits words without escapes, optionally checking ASCII and control bytes.
 /// Cross-byte borrows only mark lanes after a matching byte.
-pub(crate) fn is_plain<const ASCII: bool>(word: u64) -> bool {
+#[inline]
+pub(crate) fn is_plain(word: u64, ascii: bool, control: bool) -> bool {
     const HIGH: u64 = 0x8080_8080_8080_8080;
     const ONES: u64 = 0x0101_0101_0101_0101;
     let quote = word ^ u64::from_ne_bytes([b'"'; 8]);
     let slash = word ^ u64::from_ne_bytes([b'\\'; 8]);
-    let control = word.wrapping_sub(u64::from_ne_bytes([0x20; 8])) & !word;
+    let control = if control {
+        word.wrapping_sub(u64::from_ne_bytes([0x20; 8])) & !word
+    } else {
+        0
+    };
     let quote = quote.wrapping_sub(ONES) & !quote;
     let slash = slash.wrapping_sub(ONES) & !slash;
-    (control | quote | slash | if ASCII { word } else { 0 }) & HIGH == 0
+    (control | quote | slash | if ascii { word } else { 0 }) & HIGH == 0
 }
 
 /// JSON bytes that borrow the request when possible and own only decoded escapes.

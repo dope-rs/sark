@@ -1,16 +1,16 @@
 use sark_core::body::{self, credit};
 
-use crate::manifold::requests::{self, task};
+use crate::manifold::requests;
 
 pub(in crate::manifold) enum Reset {
     Missing,
     Cancelled,
 }
 
-pub(in crate::manifold) enum Termination<'d, P> {
+pub(in crate::manifold) enum Termination<E> {
     Retained,
     Removed,
-    Completed(task::Buffered<'d, P>),
+    Completed(Result<(), E>),
     InputFinished,
     Deferred,
     Cancelled,

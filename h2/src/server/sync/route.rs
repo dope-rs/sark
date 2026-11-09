@@ -1,19 +1,19 @@
 use std::convert::Infallible;
 
-use o3::{alloc, buffer::resident};
+use o3::alloc;
 use sark_core::{
     decode::{self, request},
     manifold::{
         schedule,
-        server::{app, drain, timing},
+        server::{Event, app, drain, timing},
     },
 };
-use sark_http::field::metadata::section::rules;
 
 use crate::{
-    conn::{config, event, machine},
+    conn::config,
     server::{
         self,
+        runtime::Connection,
         sync::{Book, Dispatch},
     },
 };
@@ -55,18 +55,7 @@ where
     }
 }
 
-impl<'d, R, O>
-    app::Application<
-        'd,
-        machine::Connection<
-            crate::ServerRole,
-            R::Plan,
-            resident::Shared<'d>,
-            rules::RejectPush,
-            event::Ignore,
-        >,
-        O,
-    > for Route<R>
+impl<'d, R, O> app::Application<'d, Connection<'d, Route<R>>, O> for Route<R>
 where
     R: Dispatch<'d>,
     O: Copy,
@@ -80,37 +69,51 @@ where
         Book::try_new(streams)
     }
 
-    fn drive(
+    fn drive<H>(
         &mut self,
         state: &mut Self::State,
-        carrier: &mut machine::Connection<
-            crate::ServerRole,
-            R::Plan,
-            resident::Shared<'d>,
-            rules::RejectPush,
-            event::Ignore,
-        >,
-        turn: &mut app::Turn<'_, '_, '_, '_, 'd, O>,
+        carrier: &mut Connection<'d, Self>,
+        turn: &mut app::Turn<'_, '_, '_, 'd, O>,
         egress: schedule::Egress,
-        _: impl FnMut(app::Error<crate::conn::Error, Self::Failure>),
+        context: &mut H,
+        _: impl FnMut(
+            &mut H,
+            &mut Connection<'d, Self>,
+            &mut drain::Events<'_, 'd>,
+            &Self::State,
+        ) -> Result<Option<Event<Connection<'d, Self>>>, crate::conn::Error>,
+        _: impl FnMut(&mut H, schedule::Wake<crate::stream::Key>),
+        finish: impl FnOnce(&mut H, &mut Connection<'d, Self>),
+        mut report: impl FnMut(&mut H, app::Error<crate::conn::Error, Self::Failure>),
     ) -> Result<drain::Progress, app::Error<crate::conn::Error, Self::Failure>> {
+        let mut report = |error| report(context, app::Error::Connection(error));
         if matches!(egress, schedule::Egress::Released) {
             match Self::State::has_input(carrier) {
                 true => {
-                    self.router
-                        .pump::<true, _>(state, carrier, self.limits, egress, || {
-                            turn.work().permit()
-                        });
+                    self.router.pump::<true, _>(
+                        state,
+                        carrier,
+                        self.limits,
+                        egress,
+                        || turn.work().permit(),
+                        &mut report,
+                    );
                 }
                 false => {
-                    self.router
-                        .pump::<false, _>(state, carrier, self.limits, egress, || {
-                            turn.work().permit()
-                        });
+                    self.router.pump::<false, _>(
+                        state,
+                        carrier,
+                        self.limits,
+                        egress,
+                        || turn.work().permit(),
+                        &mut report,
+                    );
                 }
             }
         }
-        let progress = self.router.drive(state, carrier, self.limits, turn.work());
+        let progress = self
+            .router
+            .drive(state, carrier, self.limits, turn.work(), &mut report);
         if !Self::State::has_events(carrier) {
             self.router.pump::<false, _>(
                 state,
@@ -118,27 +121,30 @@ where
                 self.limits,
                 schedule::Egress::Unchanged,
                 || turn.work().permit(),
+                &mut report,
             );
         }
         if Self::State::has_events(carrier) || state.has_ready() {
             turn.wake().wake();
         }
+        finish(context, carrier);
         Ok(progress)
     }
 
-    fn close(
-        &mut self,
-        state: &mut Self::State,
-        carrier: &mut machine::Connection<
-            crate::ServerRole,
-            R::Plan,
-            resident::Shared<'d>,
-            rules::RejectPush,
-            event::Ignore,
-        >,
-        _: O,
-    ) {
+    fn close(&mut self, state: &mut Self::State, carrier: &mut Connection<'d, Self>, _: O) {
         self.router.clear(state, carrier);
+    }
+
+    fn selected(_: &Self::State, _: &Event<Connection<'d, Self>>) -> bool {
+        true
+    }
+
+    fn wake(state: &mut Self::State, wake: schedule::Wake<crate::stream::Key>) -> bool {
+        state.runtime.wake(wake) != 0
+    }
+
+    fn released(state: &mut Self::State) {
+        state.runtime.wake_egress();
     }
 
     fn activity(state: &Self::State) -> schedule::Quiescence {

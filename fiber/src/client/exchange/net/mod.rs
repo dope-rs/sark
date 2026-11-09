@@ -184,26 +184,10 @@ where
         io: &port::Port<'_, 'd, pool::Cursor, ID>,
         active: &Activation<'_, 'd, ID>,
     ) -> Result<(), Open> {
-        let reserve = self.pool.directory.try_admit(active.connection())?;
-        io.try_activate(active).map_err(Open::Transport)?;
-        let position = reserve.commit();
+        let position = self.pool.directory.try_activate(io, active)?;
         let response = self.pool.responses.lane(position);
         response.bind_retire(active.ready());
         Ok(())
-    }
-
-    pub(in crate::client) fn try_reserve<'a>(
-        &'a self,
-        driver: &'a mut driver::Context<'_, 'd>,
-        id: Id<'d, ID>,
-    ) -> Result<impl FnOnce(Tag) + 'a, Open> {
-        let commit = self.pool.try_connect(id)?;
-        let token = driver.region_token();
-        Ok(move |tag| {
-            commit(token, tag, reuse::Admission::Reserved);
-            self.waiters.wake(tag);
-            self.waiters.wake_io();
-        })
     }
 }
 
@@ -253,7 +237,7 @@ where
         Ok(Self {
             pool: pools::Pool::try_new(ready, reports, context.region(), replies)
                 .map_err(creation::Error::Allocation)?,
-            waiters: waiters::Waiters::try_new(active, conn).map_err(creation::Error::Wake)?,
+            waiters: waiters::Waiters::try_new(active, conn()).map_err(creation::Error::Wake)?,
             idle_policy: plan.idle_policy,
         })
     }

@@ -56,7 +56,7 @@ pub(in crate::app) fn build(
         .iter()
         .enumerate()
         .map(|(index, entry)| {
-            serve::RouteSpec::new(name, index, entry, spec::Kind::Sync, (), serve::Flow::Push)
+            serve::RouteSpec::new(name, index, entry, spec::Kind::Sync, ())
         })
         .collect::<Vec<_>>();
     let entries = &entries;
@@ -67,7 +67,7 @@ pub(in crate::app) fn build(
             connect.register(item.entry)
         });
     let head = head::Head::build(paths, spec, &methods, entries, connect);
-    let decode = decode::Decode::build(paths, spec, &methods, &head, entries);
+    let decode = decode::Decode::build(paths, spec, &methods, &head, entries, quote!(self));
     let vis = &spec.vis;
     let state_ty = spec.state.ty();
     let lives = &spec.state_generics.lifetimes;
@@ -81,6 +81,7 @@ pub(in crate::app) fn build(
     let flow = &decode.prepared.state.definition;
     let error = &decode.prepared.type_defs;
     let method = &decode.method;
+    let full = &decode.full;
     let mask = &methods.method_mask;
     let count = entries.len();
     let table = format_ident!("{}Table", name);
@@ -183,7 +184,7 @@ pub(in crate::app) fn build(
         }
     };
     let h1_impl = match h1 {
-        crate::runtime::H1::Available => {
+        crate::runtime::H1::Available(_) => {
             let coding = coding(paths, spec);
             let (variants, slots, routes): (Vec<_>, Vec<_>, Vec<_>) = entries
                 .iter()
@@ -458,6 +459,13 @@ pub(in crate::app) fn build(
             #bounds
         {
             #method
+        }
+
+        impl #decl #ns_core::decode::Full for #name #args
+        where
+            #bounds
+        {
+            #full
         }
 
         #guarded

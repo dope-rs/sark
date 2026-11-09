@@ -41,8 +41,7 @@ impl<'field, N> List<'field, N> {
     }
 
     fn try_append(&mut self, field: Field<'field, N>) -> Result<(), alloc::Error> {
-        let slot = alloc::Vacant::try_new(&mut self.entries)?;
-        slot.insert(field);
+        alloc::try_vacant(&mut self.entries)?(field);
         Ok(())
     }
 }

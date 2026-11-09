@@ -37,7 +37,7 @@ use crate::server::{
     date,
     deadline::policies,
     listener::{Config, bind},
-    run::{Prepared, Root, Wait, Watch, prepare, root::Bound},
+    run::{Prepared, Root, Wait, prepare, root::Bound},
 };
 
 /// Complete HTTP/1 server topology for one listener and Date clock.
@@ -137,9 +137,8 @@ where
         self,
         stage: &mut lending::Stage<'stage, 'scope, 'life, 'e, 'd, storage::With<S, date::Clock>, Q>,
         wire: R,
-        next: impl for<'f, 'n, 'p, 's> FnOnce(
+        next: impl for<'n, 'p, 's> FnOnce(
             Prepared<
-                'f,
                 'n,
                 'p,
                 's,
@@ -153,7 +152,7 @@ where
                 I,
                 D,
             >,
-            Wait<'f, 'd>,
+            Wait<'p, 'd>,
             &mut lending::Stage<'stage, 'scope, 'life, 'e, 'd, storage::With<S, date::Clock>, Q>,
         ) -> O,
     ) -> Result<O, creation::Error>
@@ -179,9 +178,8 @@ where
                 .with_life(lifetime)
                 .with_timing(timing);
         let hash = stage.hash_state(listener::Domain::for_listener(ListenerId::ID.raw()));
-        install.prepare(hash, stage, lending::Stage::driver, |listener, stage| {
+        install.prepare(hash, stage, lending::Stage::driver, |listener, wait, stage| {
             let date = interval::Interval::<DateId>::every_second(&mut stage.driver())?;
-            let watch = Watch::new();
             Ok(next(
                 Prepared {
                     listener,
@@ -189,9 +187,8 @@ where
                     date,
                     deadline,
                     input: marker::PhantomData,
-                    watch: &watch,
                 },
-                Wait::new(&watch),
+                wait,
                 stage,
             ))
         })?
@@ -204,9 +201,9 @@ where
         stage: &mut lending::Stage<'stage, 'scope, 'life, 'e, 'd, storage::With<S, date::Clock>, Q>,
         wire: B,
         app: F,
-        next: impl for<'f, 'n, 'p, 's> FnOnce(
-            Bound<'f, 'n, 'p, 's, 'life, 'd, ListenerId, DateId, F, D, env::Bundle<tcp::Tcp, W, P>>,
-            Wait<'f, 'd>,
+        next: impl for<'n, 'p, 's> FnOnce(
+            Bound<'n, 'p, 's, 'life, 'd, ListenerId, DateId, F, D, env::Bundle<tcp::Tcp, W, P>>,
+            Wait<'p, 'd>,
             &mut lending::Stage<'stage, 'scope, 'life, 'e, 'd, storage::With<S, date::Clock>, Q>,
         ) -> R,
     ) -> super::Result<R, F::Error>
@@ -235,19 +232,10 @@ where
             .build_in(
                 stage,
                 |binding| bind::Bind::try_bind(app, binding, deadline, clock),
-                |listener, stage| {
+                |listener, wait, stage| {
                     let interval = interval::Interval::<DateId>::every_second(&mut stage.driver())?;
                     let date = date::Root::new(clock, interval);
-                    let watch = Watch::new();
-                    Ok(next(
-                        Root {
-                            listener,
-                            date,
-                            watch: &watch,
-                        },
-                        Wait::new(&watch),
-                        stage,
-                    ))
+                    Ok(next(Root { listener, date }, wait, stage))
                 },
             )?
             .map_err(manifold::BuildError::Create)
@@ -281,6 +269,16 @@ impl<ListenerId: Identity, DateId: Identity, P, D> Plan<ListenerId, DateId, P, r
 where
     P: settings::Profile + timing::Policy,
 {
+    pub fn scoped(self) -> Plan<ListenerId, DateId, P, receive::Scoped, D> {
+        Plan {
+            listener: self.listener,
+            bound: self.bound,
+            date: self.date,
+            input: marker::PhantomData,
+            deadline: self.deadline,
+        }
+    }
+
     pub fn gated_scoped(self) -> Plan<ListenerId, DateId, P, receive::GatedScoped, D> {
         Plan {
             listener: self.listener,
@@ -301,8 +299,6 @@ where
     fn include_in(&self, needs: claim::Needs) -> Result<claim::Needs, errors::Claim> {
         use dope::manifold::network::listener::topology::Layout;
 
-        let needs =
-            needs.include(claim::Claim::new(settings::Routes::EMPTY).receive(P::RECEIVE.into()))?;
         let needs =
             Layout::<ListenerId, I>::new(self.listener.listener.connections()).include_in(needs)?;
         self.date.include_in(needs)

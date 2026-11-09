@@ -73,7 +73,7 @@ where
     }
 
     /// The admission reservation preserves report vacancy through activation.
-    pub(in crate::client::exchange::net) fn try_connect(
+    pub(in crate::client) fn try_connect(
         &self,
         id: Id<'d, ID>,
     ) -> Result<
@@ -420,7 +420,10 @@ where
         io: &port::Port<'_, 'd, pool::Cursor, ID>,
     ) {
         let id = self.close_claim(token, bound);
-        io.close(id, close::Reason::Timeout(deadline::Kind::Lifetime));
+        io.close(
+            id,
+            close::Directive::reconnect(close::Reason::Timeout(deadline::Kind::Lifetime)),
+        );
     }
 }
 

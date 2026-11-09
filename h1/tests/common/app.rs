@@ -1,8 +1,8 @@
-use std::{cell::Cell, convert::Infallible, pin::Pin};
+use std::{cell::Cell, convert::Infallible, pin::Pin, ptr};
 
 use dope::{
     core::{
-        driver::{retained, route, schedule::clock, settings},
+        driver::{self, route, schedule::clock, settings},
         random,
     },
     manifold::{
@@ -26,10 +26,10 @@ use sark_h1::{
     Input,
     server::{
         conn::{
-            driver::{Driver, Flow},
-            router::{self, Routes},
+            driver::{self as h1_driver, Flow},
+            router::Routes,
         },
-        date, payload,
+        payload,
     },
     session,
     wire::{Failure, InputError, head, output, parsing},
@@ -49,25 +49,13 @@ pub struct Facts {
     pub permits: Cell<usize>,
     pub closed: Gate,
     pub failure: Cell<Option<hold::Charge>>,
-}
-
-pub enum Event<'a> {
-    Progress(&'a Flow, Option<&'a [u8]>, bool),
-    Close(Option<&'a [u8]>),
-    Stopped,
-    Charge(hold::Charge, Option<hold::Charge>),
-    Cancelled,
-    Retired(Option<&'a conn::Failure>, usize),
-    Rejected(&'a Failure),
-    Input(&'a [u8]),
+    pub checks: [Cell<usize>; 7],
 }
 
 pub struct App<'a> {
     pub reason: &'a [u8],
     pub facts: &'a Facts,
     pub close_early: bool,
-    pub clock: &'a date::Clock,
-    pub observe: &'a dyn Fn(Event<'_>),
 }
 
 impl<'a> App<'a> {
@@ -85,27 +73,27 @@ impl<'a> App<'a> {
             <Self as handler::Application<'d, ID>>::Conn,
             <Self as handler::Application<'d, ID>>::Egress,
         >,
-        driver: &mut retained::Context<'_, '_, 'd>,
+        driver: &mut driver::Context<'_, 'd>,
     ) where
         'a: 'd,
     {
         if conn.state().action().is_none() {
             return;
         }
-        let clock = self.clock;
-        let (flow, _) = Driver::new(Pin::new(&mut *self), clock)
-            .progress(conn, driver)
-            .into_parts();
-        (self.observe)(Event::Progress(
-            &flow,
-            conn.state().action().map(|reason| reason.as_slice()),
-            conn.is_closing(),
-        ));
+        let (flow, _) = h1_driver::progress(Pin::new(&mut *self), conn, driver).into_parts();
+        let actual = conn.state().action().map(|reason| reason.as_slice());
+        let closing = conn.is_closing();
         match flow {
             Flow::Continue => {
+                assert!(ptr::eq(actual.expect("deferred reason"), self.reason));
+                assert_eq!(closing, self.close_early);
+                self.facts.checks[0].set(self.facts.checks[0].get() + 1);
                 self.facts.deferred.set(self.facts.deferred.get() + 1);
             }
             Flow::Closed => {
+                assert!(actual.is_none());
+                assert!(closing);
+                self.facts.checks[1].set(self.facts.checks[1].get() + 1);
                 self.facts.committed.set(self.facts.committed.get() + 1);
             }
         }
@@ -135,30 +123,21 @@ impl<'a: 'd, 'd, ID: route::Identity> handler::Application<'d, ID> for App<'a> {
         None
     }
 
-    fn activate<'e, 'b, 'p, 's, 'w>(
+    fn activate<'e>(
         self: Pin<&mut Self>,
-        mut conn: conn::Ctx<'e, 'b, 'p, 's, 'w, 'd, ID, Self::Wire, Self::Conn, Self::Egress>,
-        driver: &mut retained::Context<'_, '_, 'd>,
-    ) -> conn::Ctx<'e, 'b, 'p, 's, 'w, 'd, ID, Self::Wire, Self::Conn, Self::Egress>
-    where
-        'd: 'w,
-    {
+        mut conn: conn::Ctx<'e, '_, '_, '_, '_, 'd, ID, Self::Wire, Self::Conn, Self::Egress>,
+        driver: &mut driver::Context<'_, 'd>,
+    ) {
         self.get_mut().finish(&mut conn, driver);
-        conn
     }
 
-    fn close<'e, 'b, 'p, 's, 'w>(
+    fn close<'e>(
         self: Pin<&mut Self>,
-        conn: conn::Ctx<'e, 'b, 'p, 's, 'w, 'd, ID, Self::Wire, Self::Conn, Self::Egress>,
-    ) -> conn::Ctx<'e, 'b, 'p, 's, 'w, 'd, ID, Self::Wire, Self::Conn, Self::Egress>
-    where
-        'd: 'w,
-    {
-        (self.observe)(Event::Close(
-            conn.state().action().map(|reason| reason.as_slice()),
-        ));
+        conn: conn::Ctx<'e, '_, '_, '_, '_, 'd, ID, Self::Wire, Self::Conn, Self::Egress>,
+    ) {
+        assert!(conn.state().action().is_none());
+        self.facts.checks[2].set(self.facts.checks[2].get() + 1);
         self.facts.closed.hit();
-        conn
     }
 
     fn close_gate(
@@ -177,15 +156,14 @@ impl<'a: 'd, 'd, ID: route::Identity> handler::Borrowed<'d, ID> for App<'a> {
         self: Pin<&mut Self>,
         mut conn: conn::Ctx<'_, '_, '_, '_, '_, 'd, ID, Self::Wire, Self::Conn, Self::Egress>,
         chunk: R,
-        driver: &mut retained::Context<'_, '_, 'd>,
+        driver: &mut driver::Context<'_, 'd>,
     ) -> receive::Outcome {
         let this = self.get_mut();
-        let clock = this.clock;
-        let (flow, _, _) = Driver::new(Pin::new(&mut *this), clock)
-            .run(chunk.as_ref(), &mut conn, driver)
-            .into_parts();
+        let (flow, _, _) =
+            h1_driver::run(Pin::new(&mut *this), chunk.as_ref(), &mut conn, driver).into_parts();
         if matches!(flow, Flow::Closed) {
-            (this.observe)(Event::Stopped);
+            assert!(this.facts.failure.get().is_some());
+            this.facts.checks[3].set(this.facts.checks[3].get() + 1);
             return receive::Outcome::CloseAfter;
         }
         if conn.state().action().is_none() {
@@ -206,47 +184,26 @@ impl<'a: 'd, 'd, ID: route::Identity> send::Drive<'d, ID> for App<'a> {
     fn send(
         self: Pin<&mut Self>,
         mut conn: conn::Ctx<'_, '_, '_, '_, '_, 'd, ID, Self::Wire, Self::Conn, Self::Egress>,
-        driver: &mut retained::Context<'_, '_, 'd>,
+        driver: &mut driver::Context<'_, 'd>,
     ) {
         self.get_mut().finish(&mut conn, driver);
     }
 }
 
-impl<'a: 'd, 'd, ID: route::Identity> Routes<'d, (), ID> for App<'a> {
-    type Pending = Infallible;
+impl<'a: 'd, 'd> session::Dispatch<'d, (), Infallible> for App<'a> {
     type Ready = Infallible;
     type Head = Infallible;
-
-    type TransportTag = ();
-    type Egress = bound::AtMost<0>;
 
     fn abort_body(
         self: Pin<&mut Self>,
         _: &mut session::Conn<'d, (), Infallible>,
         error: Failure,
     ) -> fixed::Body<'d> {
-        (self.observe)(Event::Rejected(&error));
-        error.body()
-    }
-
-    fn response_tag(self: Pin<&mut Self>, _: conn::Id<'d, ID>, _: &mut (), charge: hold::Charge) {
-        (self.observe)(Event::Charge(
-            charge,
-            self.facts.failure.replace(Some(charge)),
-        ));
-    }
-
-    fn accept(self: Pin<&mut Self>, _: conn::Id<'d, ID>, _: &mut (), _: ()) {
-        self.facts.released.set(self.facts.released.get() + 1);
-    }
-
-    fn cancel(self: Pin<&mut Self>, _: conn::Id<'d, ID>, _: &mut (), _: ()) {
-        (self.observe)(Event::Cancelled);
-        self.facts.rejected.set(self.facts.rejected.get() + 1);
+        panic!("unexpected rejection: {error:?}")
     }
 
     fn resume_head(
-        _: router::Dispatch<'_, 'd, Self, ID>,
+        self: Pin<&mut Self>,
         pending: Self::Head,
         _: session::Permit,
         _: Input<'_>,
@@ -258,28 +215,17 @@ impl<'a: 'd, 'd, ID: route::Identity> Routes<'d, (), ID> for App<'a> {
 
     fn consume_line(
         self: Pin<&mut Self>,
-        id: conn::Id<'d, ID>,
-        date: &date::Clock,
         permit: session::Permit,
         source: parsing::Source,
         write: &mut [u8],
         conn: &mut session::Conn<'d, (), Infallible>,
     ) -> session::RouteOutcome<'d, Infallible, Infallible, Self::Head, parsing::Rejected<'d>> {
         let source = source.freeze();
-        self.try_consume(
-            id,
-            date,
-            permit,
-            Input::Buffered(source.view()),
-            write,
-            conn,
-        )
+        self.try_consume(permit, Input::Buffered(source.view()), write, conn)
     }
 
     fn try_consume(
         self: Pin<&mut Self>,
-        _: conn::Id<'d, ID>,
-        _: &date::Clock,
         permit: session::Permit,
         input: Input<'_>,
         output: &mut [u8],
@@ -310,8 +256,7 @@ impl<'a: 'd, 'd, ID: route::Identity> Routes<'d, (), ID> for App<'a> {
                     Ok(body) => body,
                     Err(error) => {
                         let error = Failure::Input(InputError::Storage(error));
-                        (self.observe)(Event::Rejected(&error));
-                        return session::Outcome::Close(error.body()).into();
+                        panic!("unexpected rejection: {error:?}");
                     }
                 };
                 session::Outcome::Complete {
@@ -329,16 +274,12 @@ impl<'a: 'd, 'd, ID: route::Identity> Routes<'d, (), ID> for App<'a> {
                 self.facts.rejected.set(self.facts.rejected.get() + 1);
                 session::Outcome::Close(fixed::Body::new(self.reason)).into()
             }
-            _ => {
-                (self.observe)(Event::Input(input.as_slice()));
-                session::Outcome::Close(Failure::BadRequest.body()).into()
-            }
+            _ => panic!("unexpected input: {:?}", input.as_slice()),
         }
     }
 
     fn body_data(
         self: Pin<&mut Self>,
-        _: conn::Id<'d, ID>,
         wait: Infallible,
         _: owned::Segments<'d>,
         _: &mut (),
@@ -352,7 +293,6 @@ impl<'a: 'd, 'd, ID: route::Identity> Routes<'d, (), ID> for App<'a> {
 
     fn resume_pending(
         self: Pin<&mut Self>,
-        _: conn::Id<'d, ID>,
         wait: Infallible,
         _: &mut (),
     ) -> Result<Infallible, fixed::Body<'d>> {
@@ -365,7 +305,6 @@ impl<'a: 'd, 'd, ID: route::Identity> Routes<'d, (), ID> for App<'a> {
         _: session::Complete,
         _: session::Permit,
         _: &mut [u8],
-        _: &[u8; 29],
         _: &mut (),
     ) -> session::BodyOutcome<'d, Self::Ready> {
         match wait {}
@@ -373,14 +312,35 @@ impl<'a: 'd, 'd, ID: route::Identity> Routes<'d, (), ID> for App<'a> {
 
     fn resume_body(
         self: Pin<&mut Self>,
-        _: conn::Id<'d, ID>,
         ready: Self::Ready,
         _: session::Permit,
         _: &mut [u8],
-        _: &[u8; 29],
         _: &mut (),
     ) -> session::BodyOutcome<'d, Self::Ready> {
         match ready {}
+    }
+}
+
+impl<'a: 'd, 'd> Routes<'d, ()> for App<'a> {
+    type Pending = Infallible;
+    type TransportTag = ();
+    type Egress = bound::AtMost<0>;
+
+    fn response_tag(self: Pin<&mut Self>, _: &mut (), charge: hold::Charge) {
+        let previous = self.facts.failure.replace(Some(charge));
+        assert!(!charge.is_empty());
+        assert!(previous.is_none());
+        self.facts.checks[4].set(self.facts.checks[4].get() + 1);
+    }
+
+    fn accept(self: Pin<&mut Self>, _: &mut (), _: ()) {
+        self.facts.released.set(self.facts.released.get() + 1);
+    }
+
+    fn cancel(self: Pin<&mut Self>, _: &mut (), _: ()) {
+        assert!(self.facts.failure.get().is_some());
+        self.facts.checks[5].set(self.facts.checks[5].get() + 1);
+        self.facts.rejected.set(self.facts.rejected.get() + 1);
     }
 }
 
@@ -433,7 +393,24 @@ impl<'a: 'd, 'd, ID: route::Identity> retire::Policy<'d, App<'a>, ID> for Retire
             <App<'a> as handler::Application<'d, ID>>::Egress,
         >,
     ) {
-        (app.observe)(Event::Retired(conn.failure(), conn.response_len()));
+        match app.facts.failure.get() {
+            None => assert!(conn.failure().is_none()),
+            Some(expected) => {
+                let Some(conn::Failure::Write(conn::write::body::Failure::Bound {
+                    charge,
+                    maximum,
+                })) = conn.failure()
+                else {
+                    panic!("exact owner bound failure must reach final retirement");
+                };
+                assert_eq!(charge.bytes().get(), expected.logical_bytes);
+                assert_eq!(charge.resident().get(), expected.resident_bytes);
+                assert_eq!(*maximum, 0);
+                assert_eq!(app.facts.rejected.get(), 1);
+            }
+        }
+        assert_eq!(conn.response_len(), 0);
+        app.facts.checks[6].set(app.facts.checks[6].get() + 1);
         app.facts.released.set(app.facts.released.get() + 1);
     }
 }

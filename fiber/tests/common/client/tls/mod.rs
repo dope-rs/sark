@@ -52,7 +52,7 @@ impl Keys {
     }
 
     pub fn client(&self) -> Result<Arc<rustls::ClientConfig>, dope_tls::Error> {
-        let key = config::raw::Identity::from_seed(&self.0)?.public_key();
+        let key = config::raw::Identity::try_public_key_from_seed(&self.0)?;
         config::raw::Identity::client(key).map(Arc::new)
     }
 

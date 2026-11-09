@@ -87,6 +87,7 @@ pub struct Capacity<'a> {
     pub blocked: Option<LocalGateRef<'a>>,
     pub resumed: Option<LocalGateRef<'a>>,
     pub attempts: Option<LocalGateRef<'a>>,
+    pub completed: Option<LocalGateRef<'a>>,
 }
 
 #[derive(Default)]
@@ -144,6 +145,9 @@ impl Handler for Capacity<'_> {
                 Some(payload) => reply.try_encode(&mut Bytes, payload),
                 None => {
                     reply.finish_with(Status::ok());
+                    if let Some(completed) = self.completed {
+                        completed.hit();
+                    }
                     return handler::OutputState::Complete;
                 }
             },
@@ -245,14 +249,18 @@ impl Waiters<2> {
 }
 
 impl<const N: usize> Waiters<N> {
-    pub fn try_partial(&mut self) -> Result<()> {
-        try_window(&mut self.socket, 1)
+    pub fn try_window(&mut self, value: u8) -> Result<()> {
+        try_window(&mut self.socket, value)
     }
 
     fn try_paths(address: SocketAddr, paths: [&[u8]; N]) -> Result<Self> {
-        let mut socket = TcpStream::connect(address).map_err(Error::Io)?;
+        let mut socket =
+            TcpStream::connect_timeout(&address, Duration::from_secs(2)).map_err(Error::Io)?;
         socket
             .set_read_timeout(Some(Duration::from_secs(2)))
+            .map_err(Error::Io)?;
+        socket
+            .set_write_timeout(Some(Duration::from_secs(2)))
             .map_err(Error::Io)?;
         let mut client = Connection::<ClientRole>::try_new().map_err(Error::Config)?;
         client.try_flush(&socket).map_err(Error::Io)?;
@@ -276,13 +284,12 @@ impl<const N: usize> Waiters<N> {
         })
     }
 
-    pub fn try_release(self) -> Result<[(Vec<u8>, Option<Status>); N]> {
+    pub fn try_read(self) -> Result<[(Vec<u8>, Option<Status>); N]> {
         let Self {
             mut socket,
             mut client,
             ids,
         } = self;
-        try_window(&mut socket, 64)?;
         let mut replies = array::from_fn(|_| (Vec::new(), None));
         let mut input = [0; 4096];
         while replies.iter().any(|(_, status)| status.is_none()) {

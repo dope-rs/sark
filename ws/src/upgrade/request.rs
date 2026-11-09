@@ -1,26 +1,18 @@
 use sark_http::{
     field,
     h1::{codec::decode::fields, field::Connection, framing},
+    request::span::Span,
 };
 
 use crate::upgrade::{Error, Header, Key, Need, state};
 
-#[derive(Clone, Copy, Default, PartialEq, Eq)]
-#[repr(u8)]
-enum Version {
-    #[default]
-    Missing,
-    Thirteen,
-}
-
-const _: () = assert!(core::mem::size_of::<Version>() == core::mem::size_of::<bool>());
-const _: () = assert!(core::mem::align_of::<Version>() == core::mem::align_of::<bool>());
-
-#[derive(Default)]
+#[derive(Clone, Copy, Default)]
 pub struct Admission {
     upgrade: state::State,
-    version: Version,
+    version: bool,
     key: Option<Key>,
+    origin: Option<Span>,
+    cookie: Option<Span>,
 }
 
 impl<'input> fields::Sink<'input> for Admission {
@@ -30,9 +22,8 @@ impl<'input> fields::Sink<'input> for Admission {
         if name.eq_ignore_ascii_case(b"upgrade") {
             self.upgrade.push(value)?;
         } else if name.eq_ignore_ascii_case(b"sec-websocket-version") {
-            match self.version {
-                Version::Missing => {}
-                Version::Thirteen => return Err(Error::Duplicate(Header::Version)),
+            if self.version {
+                return Err(Error::Duplicate(Header::Version));
             }
             let actual = field::Error::trim_ows(value);
             if let Some((offset, actual, want)) = mismatch(actual, b"13") {
@@ -42,7 +33,7 @@ impl<'input> fields::Sink<'input> for Admission {
                     want,
                 });
             }
-            self.version = Version::Thirteen;
+            self.version = true;
         } else if name.eq_ignore_ascii_case(b"sec-websocket-key") {
             if self.key.is_some() {
                 return Err(Error::Duplicate(Header::Key));
@@ -54,6 +45,30 @@ impl<'input> fields::Sink<'input> for Admission {
 }
 
 impl Admission {
+    /// Retains one admitted field's span into its unchanged request owner.
+    pub fn field(&mut self, name: &[u8], value: &[u8], span: Span) -> Result<(), Error> {
+        let (slot, header) = if name.eq_ignore_ascii_case(b"origin") {
+            (&mut self.origin, Header::Origin)
+        } else if name.eq_ignore_ascii_case(b"cookie") {
+            (&mut self.cookie, Header::Cookie)
+        } else {
+            return fields::Sink::push(self, name, value);
+        };
+        if slot.replace(span).is_some() {
+            Err(Error::Duplicate(header))
+        } else {
+            Ok(())
+        }
+    }
+
+    pub const fn origin(&self) -> Option<Span> {
+        self.origin
+    }
+
+    pub const fn cookie(&self) -> Option<Span> {
+        self.cookie
+    }
+
     pub fn finish(
         self,
         method: &[u8],
@@ -92,9 +107,8 @@ impl Admission {
             return Err(Error::Connection);
         }
         self.upgrade.require()?;
-        match self.version {
-            Version::Missing => return Err(Error::Missing(Need::Version)),
-            Version::Thirteen => {}
+        if !self.version {
+            return Err(Error::Missing(Need::Version));
         }
         self.key
             .as_ref()
@@ -117,4 +131,4 @@ fn mismatch(actual: &[u8], want: &[u8]) -> Option<(usize, Option<u8>, Option<u8>
     ))
 }
 
-const _: () = assert!(core::mem::size_of::<Admission>() <= 32);
+const _: () = assert!(core::mem::size_of::<Admission>() <= 48);

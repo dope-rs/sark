@@ -3,39 +3,11 @@
 use std::num;
 
 use o3::{
-    alloc, buffer,
+    buffer,
     depot::{capacity, queue::pool},
 };
 
 use crate::{details, message};
-
-pub(in crate::server) struct Pool<C: buffer::raw::Segment> {
-    lanes: pool::Lanes<message::Frame<C>>,
-    capacity: capacity::Count,
-}
-
-impl<C: buffer::raw::Segment> Pool<C> {
-    pub(in crate::server) fn try_new(
-        cap: capacity::Count,
-        calls: capacity::Count,
-    ) -> Result<Self, alloc::Error> {
-        Ok(Self {
-            lanes: pool::Lanes::try_new(pool::Plan::from_counts(cap, calls))?,
-            capacity: cap,
-        })
-    }
-
-    pub(in crate::server) fn try_bind(
-        &mut self,
-        index: usize,
-    ) -> Result<pool::Lane<'_, message::Frame<C>>, pool::Missing> {
-        self.lanes.try_bind_mut(index)
-    }
-
-    pub(in crate::server) fn is_empty(&self) -> bool {
-        self.lanes.available() == self.capacity.get()
-    }
-}
 
 pub(in crate::server) fn try_push<C: buffer::raw::Segment>(
     mut lane: pool::Lane<'_, message::Frame<C>>,

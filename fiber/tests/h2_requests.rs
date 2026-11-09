@@ -95,6 +95,7 @@ fn rejects_atomically() {
                 "input-finished",
                 "response-committed",
                 "request-owner-scope-closed",
+                "exchange-rejected",
                 "terminal",
                 "exchange-retired",
             ],

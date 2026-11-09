@@ -103,7 +103,14 @@ impl Input for [u8] {
     }
 
     fn parse_u64(&self, index: &mut usize) -> crate::Result<u64> {
-        let (value, next) = u64_at(self, *index)?;
+        let first = *self.get(*index).ok_or(Error::Invalid)?;
+        if first == b'-' {
+            return Err(Error::Invalid);
+        }
+        let (ValueKind::Unsigned(value), next) = atom_with::<true>(self, *index, first, None)?
+        else {
+            return Err(Error::Invalid);
+        };
         *index = next;
         Ok(value)
     }
@@ -113,6 +120,14 @@ impl Input for [u8] {
         *index = next;
         Ok(value)
     }
+}
+
+pub fn parse_i64(input: &[u8], index: &mut usize) -> crate::Result<i64> {
+    let first = *input.get(*index).ok_or(Error::Invalid)?;
+    let (kind, next) = atom_with::<true>(input, *index, first, None)?;
+    let value = kind.i64()?;
+    *index = next;
+    Ok(value)
 }
 
 #[derive(Clone, Copy)]
@@ -252,35 +267,28 @@ fn value_with(
     match input.get(index) {
         Some(b'"') => string_with(input, index, limit).map(|(_, end)| end),
         Some(&open) if matches!(open, b'{' | b'[') => group_at(input, index, open, limit, depth),
-        Some(b't' | b'f' | b'n' | b'-' | b'0'..=b'9') => {
-            atom_with::<false>(input, index, limit).map(|(_, end)| end)
+        Some(&first) if matches!(first, b't' | b'f' | b'n' | b'-' | b'0'..=b'9') => {
+            atom_with::<false>(input, index, first, limit).map(|(_, end)| end)
         }
         _ => Err(Error::Invalid),
     }
 }
 
-fn u64_at(input: &[u8], index: usize) -> crate::Result<(u64, usize)> {
-    let (kind, next) = atom_with::<true>(input, index, None)?;
-    match kind {
-        ValueKind::Unsigned(value) => Ok((value, next)),
-        _ => Err(Error::Invalid),
-    }
-}
-
-fn atom_with<const UNSIGNED: bool>(
+#[inline(always)]
+fn atom_with<const INTEGER: bool>(
     input: &[u8],
     index: usize,
+    first: u8,
     limit: Option<Limit>,
 ) -> crate::Result<(ValueKind, usize)> {
-    let byte = *input.get(index).ok_or(Error::Invalid)?;
-    let mut atom = Atom::new(byte, UNSIGNED)?;
+    let mut atom = Atom::new(first, INTEGER)?;
     let mut next = index;
     while let Some(&byte) = input.get(next) {
         if is_whitespace(byte) || matches!(byte, b',' | b'}' | b']') {
             break;
         }
         atom = atom.step(byte)?;
-        if UNSIGNED && !matches!(atom, Atom::Number { value: Some(_), .. }) {
+        if INTEGER && !matches!(atom, Atom::Number { value: Some(_), .. }) {
             return Err(Error::Invalid);
         }
         next += 1;
@@ -362,10 +370,11 @@ fn group_at(
 }
 
 fn bool_at(input: &[u8], index: usize) -> crate::Result<(bool, usize)> {
-    if !matches!(input.get(index), Some(b't' | b'f')) {
+    let first = *input.get(index).ok_or(Error::Invalid)?;
+    if !matches!(first, b't' | b'f') {
         return Err(Error::Invalid);
     }
-    let (kind, next) = atom_with::<false>(input, index, None)?;
+    let (kind, next) = atom_with::<false>(input, index, first, None)?;
     match kind {
         ValueKind::True => Ok((true, next)),
         ValueKind::False => Ok((false, next)),

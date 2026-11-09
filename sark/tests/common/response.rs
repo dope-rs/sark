@@ -181,6 +181,14 @@ pub struct CountedReply<'a> {
     pub body: Counted<'a>,
 }
 
+#[sark::handler(pub)]
+pub fn borrowed<'a>(state: &Cell<&'a Cell<usize>>) -> CountedReply<'a> {
+    CountedReply {
+        status: Code::OK,
+        body: Counted(state.get()),
+    }
+}
+
 #[sark::response(raw)]
 pub struct StaticReply<'field> {
     pub status: Code,

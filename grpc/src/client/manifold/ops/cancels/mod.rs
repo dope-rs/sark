@@ -1,4 +1,4 @@
-use std::{cell, marker, mem, ops, ptr};
+use std::{cell, mem, ops, ptr};
 
 use dope::core::driver::route::Identity;
 use o3::{depot, depot::arena::linked::fifo::ends};
@@ -45,8 +45,6 @@ pub(in crate::client::manifold) enum Call<'d> {
     Response(response::Stream<'d, stream::Key>),
     Bidi(bidi::Stream<'d, stream::Key>),
     Send(bidi::Send<'d, stream::Key>),
-    /// Two split tokens retain their original FIFO position and both reset/refills.
-    ResetPair(bidi::Send<'d, stream::Key>),
 }
 
 impl<'d> Call<'d> {
@@ -62,7 +60,7 @@ impl<'d> Call<'d> {
                 Key::Stream(stream.response.completion),
                 stream.response.stream,
             ),
-            Self::Send(send) | Self::ResetPair(send) => (Key::Call(send.stream), send.stream),
+            Self::Send(send) => (Key::Call(send.stream), send.stream),
         }
     }
 
@@ -83,19 +81,16 @@ impl<'d> Call<'d> {
         session: &mut session::Session<'d, client::Plan<section::Plan>, resident::Shared<'d>>,
         done: &mut Notify<'scope, '_, '_>,
     ) {
+        let state = &mut session.state;
         match self {
-            Self::Unary(call) => session.cancel_unary(call, done),
-            Self::Request(stream) => session.cancel_unary(stream.response, done),
-            Self::Response(stream) => session.cancel_response(stream, done),
-            Self::Bidi(stream) => session.cancel_bidi(stream, done),
-            Self::Send(send) => session.cancel_send(send, done),
-            Self::ResetPair(send) => {
-                let other = bidi::Send {
-                    brand: send.brand,
-                    stream: send.stream,
-                };
-                session.cancel_send(send, done);
-                session.cancel_send(other, done);
+            Self::Unary(call) | Self::Request(request::Stream { response: call }) => {
+                state.cancel_unary(call.stream, call.completion, done);
+            }
+            Self::Response(stream) | Self::Bidi(bidi::Stream { response: stream }) => {
+                state.cancel_feed(stream.stream, stream.completion, done);
+            }
+            Self::Send(send) => {
+                let _ = state.cancel(send.stream, done);
             }
         }
     }
@@ -161,8 +156,6 @@ impl<'d, ID: Identity> Empty<'_, 'd, ID> {
         stream: stream::Key,
         value: T,
     ) -> Registered<T> {
-        use raw::Source as _;
-
         for key in [key, Key::Call(stream)] {
             // SAFETY: Access supplies this queue's final empty-front result and
             // a native call admitted by the State that sized its fixed region.
@@ -227,8 +220,6 @@ impl<'d, ID: Identity> Queue<'d, ID> {
         conn: conn::Id<'d, ID>,
         record: Registered<Call<'d>>,
     ) {
-        use raw::Source as _;
-
         let call = record.0;
         let (primary, stream) = call.keys();
         // SAFETY: Registered preserves the native keys from this channel's
@@ -251,16 +242,7 @@ impl<'d, ID: Identity> Queue<'d, ID> {
             }
             match phase {
                 Phase::Parked => self.enqueue(entry, call.fallback()),
-                Phase::Queued => {
-                    // SAFETY: actual owner/generation and Queued checks retain
-                    // the other split token in this same stream position.
-                    unsafe {
-                        entry.pair(bidi::Send {
-                            brand: marker::PhantomData,
-                            stream,
-                        })
-                    };
-                }
+                Phase::Queued => return,
             }
         }
         if let Some(ready) = self.ready.get() {
@@ -293,15 +275,3 @@ const _: () = {
     assert!(!mem::needs_drop::<Call<'static>>());
     assert!(mem::size_of::<raw::Entry<'static, dope::core::driver::route::KeyTag<0>>>() <= 80);
 };
-
-// SAFETY: native registrations and affine Registered transitions retain keys
-// from this channel's State. Shared sizes this fixed Box from that same State's
-// immutable limits; no callback runs during a queue mutation.
-unsafe impl<'d, ID: Identity> raw::Source<'d, ID> for Queue<'d, ID> {
-    unsafe fn entry(&self, key: Key) -> &raw::Entry<'d, ID> {
-        unsafe {
-            self.entries
-                .get_unchecked(key.index(self.offset, self.claims))
-        }
-    }
-}

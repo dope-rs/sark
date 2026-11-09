@@ -4,21 +4,19 @@ use o3::{base::cell::region, depot::queue::indexed::lanes::entry};
 
 use crate::manifold::{
     self,
-    schedule::{
-        Activity, Block, Control, ControlTurn, Decision, Driver, LANES, Terminal, WorkClass, drive,
-    },
+    schedule::{Block, Control, ControlTurn, Decision, Driver, LANES, Terminal, WorkClass, drive},
 };
 
 /// One admitted resident owner and its control scheduling authority.
 #[must_use = "an occupied entry retains its exclusive schedule borrow"]
 pub struct Occupied<'a, K: manifold::raw::Key, T, B: Block, Q = ()> {
-    slot: entry::Slot<'a, K, T, LANES>,
+    slot: entry::Occupied<'a, K, T, LANES>,
     block: marker::PhantomData<cell::Cell<B>>,
     scope: Q,
 }
 
 impl<'a, K: manifold::raw::Key, T, B: Block, Q> Occupied<'a, K, T, B, Q> {
-    pub(super) const fn new(slot: entry::Slot<'a, K, T, LANES>, scope: Q) -> Self {
+    pub(super) const fn new(slot: entry::Occupied<'a, K, T, LANES>, scope: Q) -> Self {
         Self {
             slot,
             block: marker::PhantomData,
@@ -78,9 +76,7 @@ impl<'a, K: manifold::raw::Key, T, B: Block, Q> Occupied<'a, K, T, B, Q> {
     }
 }
 
-impl<'a, 'id, K: manifold::raw::Key, T, B: Block>
-    Occupied<'a, K, T, B, region::Proof<region::Identity<'id>>>
-{
+impl<'a, 'id, K: manifold::raw::Key, T, B: Block> Occupied<'a, K, T, B, region::Identity<'id>> {
     /// Runs a control quantum without withdrawing its resident owner.
     pub fn borrowed<D>(
         mut self,
@@ -100,7 +96,7 @@ impl<'a, 'id, K: manifold::raw::Key, T, B: Block>
                         self.slot,
                         stream,
                         Terminal::Failed(error),
-                        Activity::Control,
+                        WorkClass::Control,
                     ),
                     self.scope,
                 );

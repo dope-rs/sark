@@ -84,10 +84,6 @@ impl<'d, ID: Identity> State<'d, ID> {
         self.phase.connect(lifetime, ready, self.protocol, seed)
     }
 
-    pub(in crate::client::manifold) fn signal(&self, conn: conn::Id<'d, ID>) {
-        self.phase.wake(conn);
-    }
-
     pub(in crate::client::manifold) fn flush<'scope>(
         &mut self,
         requests: &mut request::Requests<
@@ -106,15 +102,7 @@ impl<'d, ID: Identity> State<'d, ID> {
         let Some(prefix) = self.prefixes.cursor() else {
             return Ok(io::Flush::Empty);
         };
-        active.flush(prefix, requests, done)
-    }
-
-    pub(in crate::client::manifold) fn has_output(&self, conn: conn::Id<'d, ID>) -> bool {
-        self.phase.has_output(conn)
-    }
-
-    pub(in crate::client::manifold) fn owner_cap(&self) -> usize {
-        self.phase.owner_cap()
+        active.session.flush(prefix, requests, done)
     }
 
     pub(in crate::client::manifold) fn get_mut(

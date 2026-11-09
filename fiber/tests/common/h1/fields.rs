@@ -1,5 +1,19 @@
 pub const EMPTY: &[u8; 18] = b"GET / HTTP/1.1\r\n\r\n";
 pub const DEFAULT: &[u8; 4] = b"none";
+pub const ENCODING_VALUE: &[u8] = b"br, gzip";
+pub const ENCODINGS: [(&[u8], Option<&[u8]>); 3] = [
+    (EMPTY, None),
+    (
+        b"GET / HTTP/1.1\r\nHost: local\r\nAccept-Encoding:\r\n\r\n",
+        Some(b""),
+    ),
+    (
+        b"GET / HTTP/1.1\r\nHost: local\r\nAccept-Encoding: br\r\nAccept-Encoding: gzip\r\n\r\n",
+        Some(ENCODING_VALUE),
+    ),
+];
+pub const BAD_ENCODING: &[u8] =
+    b"GET / HTTP/1.1\r\nHost: local\r\nAccept-Encoding: gzip;q=2\r\n\r\n";
 pub const GZIP: &[u8; 25] = b"Accept-Encoding: gzip\r\n\r\n";
 pub const DUPLICATE_EXPECT: &[u8; 65] =
     b"Content-Length: 4\r\nExpect: 100-continue\r\nExpect: 100-continue\r\n\r\n";

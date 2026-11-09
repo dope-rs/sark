@@ -16,15 +16,15 @@ use common::{
         DUPLEX_STATE, MultiDuplexApplication, SingleDuplexApplication,
         branches::{self, Kind},
     },
-    route::body::tunnels::{ConnectDispatch, Duplex, Receive as _, Snapshot, State},
+    route::body::tunnels::{
+        ConnectDispatch, Duplex, Receive as _, Snapshot, State, WEBSOCKET_FRAMES,
+        WEBSOCKET_OPENING, WEBSOCKET_REPLY,
+    },
     server::{self, Plan},
-    support,
+    stacks, support,
 };
 use dope::{
-    core::{
-        driver::{life::recovery::Policy, route::KeyTag},
-        io::socket::Listener,
-    },
+    core::{driver::life::recovery::Policy, io::socket::Listener},
     manifold::app::receive::limits::Budget,
     net::wire::{self, domain},
     runtime::{executor::session, topology},
@@ -33,6 +33,7 @@ use dope_fiber::task::storage::scope::Brand;
 use dope_test::{
     fibers,
     harness::{
+        observe::VecCellExt as _,
         peer::{self, Peer, Stream},
         server::Pair,
     },
@@ -59,16 +60,21 @@ fn serve(
         hold_output_on_finish: false,
     };
     let mut done = session::Completion::new();
+    let events = Cell::new(Vec::new());
+    let audit = Cell::new(None);
     prepared.enter_with(
         (),
         |worker| {
             worker.lend(|plan, stage| {
                 Brand::with(|brand| {
-                    let router = ConnectDispatch::new(
+                    let router = ConnectDispatch::with_observer(
                         brand,
                         &state,
                         Config::new(server::MAX_CONNECTIONS)
                             .with_budget(Budget::new(Bound::new(4096), 0)),
+                        stacks::Probe(&events, &audit, |cause: &dyn std::fmt::Debug| {
+                            state.counters.diagnostics.push(format!("{cause:?}"));
+                        }),
                     );
                     plan.install(
                         stage,
@@ -83,7 +89,10 @@ fn serve(
                                                 fibers::TEST
                                                     .try_wait(
                                                         &mut app,
-                                                        &state.counters.closed.handle(),
+                                                        &stacks::Count {
+                                                            events: &events,
+                                                            step: stacks::Step::Closed,
+                                                        },
                                                         1,
                                                     )
                                                     .expect("closed session"),
@@ -143,6 +152,83 @@ fn handoff_keeps_ownership() {
     });
     assert_eq!(seen.capability, 1);
     assert_eq!(seen.input_finished, 1);
+}
+
+#[test]
+fn websocket_after_http_keeps_split_head_and_frame_order() {
+    let seen = serve(false, |socket| {
+        socket.write_all(b"GET /wait HTTP/1.1\r\nHost: x\r\n\r\nGET /w")?;
+        let mut received = Vec::new();
+        socket.read_until(&mut received, b"\r\n\r\nwaited")?;
+        assert!(received.starts_with(b"HTTP/1.1 200 OK\r\n"));
+        socket.write_all(&[&WEBSOCKET_OPENING[b"GET /w".len()..], WEBSOCKET_FRAMES].concat())?;
+        received.clear();
+        socket.read_to_end(&mut received)?;
+        assert_eq!(received, WEBSOCKET_REPLY);
+        Ok(())
+    });
+    assert_eq!(seen.capability, 1);
+    assert_eq!(seen.after_finish, 1);
+    assert_eq!(seen.dropped, 1);
+    assert!(seen.diagnostics.is_empty(), "{seen:?}");
+    assert!(seen.websocket_failures.is_empty(), "{seen:?}");
+}
+
+#[test]
+fn websocket_rejects_before_frames_once() {
+    use sark_ws::server as ws;
+
+    for (fields, error) in [
+        (b"Origin: https://other.test\r\n".as_slice(), None),
+        (
+            b"Sec-WebSocket-Key: duplicate\r\n".as_slice(),
+            Some("Upgrade(Duplicate(Key))"),
+        ),
+        (
+            b"Content-Length: 1\r\n".as_slice(),
+            Some("Upgrade(Body(Fixed(1)))"),
+        ),
+        (
+            b"Sec-WebSocket-Key: duplicate\r\nContent-Length: 1\r\n".as_slice(),
+            Some("Upgrade(Duplicate(Key))"),
+        ),
+    ] {
+        let seen = serve(false, move |socket| {
+            socket.write_all(
+                &[
+                    &WEBSOCKET_OPENING[..WEBSOCKET_OPENING.len() - 2],
+                    fields,
+                    b"\r\n",
+                    WEBSOCKET_FRAMES,
+                ]
+                .concat(),
+            )?;
+            let mut received = Vec::new();
+            socket.read_to_end(&mut received)?;
+            assert_eq!(
+                received,
+                if error.is_none() {
+                    ws::Response::FORBIDDEN
+                } else {
+                    ws::Response::REJECTION
+                }
+            );
+            Ok(())
+        });
+        assert_eq!(seen.capability, usize::from(error.is_none()));
+        assert_eq!(seen.after_finish, 0);
+        assert_eq!(seen.dropped, u32::from(error.is_none()));
+        if let Some(error) = error {
+            assert_eq!(seen.diagnostics, [error]);
+            assert!(seen.websocket_failures.is_empty());
+        } else {
+            assert!(seen.diagnostics.is_empty());
+            assert!(matches!(
+                seen.websocket_failures.as_slice(),
+                [ws::Error::Forbidden]
+            ));
+        }
+    }
 }
 
 #[test]
@@ -360,24 +446,20 @@ fn runs_scoped_duplex() {
                                 let result = match kind {
                                     Kind::Multiple => {
                                         let (state, config, report) = (&state, config, &mut finish);
-                                        Brand::with(|brand| {
-                                            let app = MultiDuplexApplication::__scoped_new(brand, state, config);
-                                            plan.install(stage, wire, app, |root, _wait, stage| {
-                                                let result = stage.request(report, root);
-                                                result.as_ref().map_err(|error| error.cause()).expect("session");
-                                                result.ok().expect("checked session").expect("drive")
-                                            })
+                                        let app = MultiDuplexApplication::new(state, config);
+                                        plan.install(stage, wire, app, |root, _wait, stage| {
+                                            let result = stage.request(report, root);
+                                            result.as_ref().map_err(|error| error.cause()).expect("session");
+                                            result.ok().expect("checked session").expect("drive")
                                         })
                                     }
                                     Kind::Single => {
                                         let (state, config, report) = (&state, config, &mut finish);
-                                        Brand::with(|brand| {
-                                            let app = SingleDuplexApplication::__scoped_new(brand, state, config);
-                                            plan.install(stage, wire, app, |root, _wait, stage| {
-                                                let result = stage.request(report, root);
-                                                result.as_ref().map_err(|error| error.cause()).expect("session");
-                                                result.ok().expect("checked session").expect("drive")
-                                            })
+                                        let app = SingleDuplexApplication::new(state, config);
+                                        plan.install(stage, wire, app, |root, _wait, stage| {
+                                            let result = stage.request(report, root);
+                                            result.as_ref().map_err(|error| error.cause()).expect("session");
+                                            result.ok().expect("checked session").expect("drive")
                                         })
                                     }
                                     Kind::Conditional => {
@@ -387,17 +469,12 @@ fn runs_scoped_duplex() {
                                             source: Cell::new(0),
                                             driver: PhantomData,
                                         };
-                                        let _ = branches::App::new::<_, wire::Identity, KeyTag<0>>(
-                                            &state, config,
-                                        );
                                         let (state, config, report) = (&state, config, &mut finish);
-                                        let result = Brand::with(|brand| {
-                                            let app = branches::App::__scoped_new(brand, state, config);
-                                            plan.install(stage, wire, app, |root, _wait, stage| {
-                                                let result = stage.request(report, root);
-                                                result.as_ref().map_err(|error| error.cause()).expect("session");
-                                                result.ok().expect("checked session").expect("drive")
-                                            })
+                                        let app = branches::App::new(state, config);
+                                        let result = plan.install(stage, wire, app, |root, _wait, stage| {
+                                            let result = stage.request(report, root);
+                                            result.as_ref().map_err(|error| error.cause()).expect("session");
+                                            result.ok().expect("checked session").expect("drive")
                                         });
                                         assert_eq!(state.source.get(), bytes.len());
                                         result

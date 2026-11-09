@@ -11,8 +11,6 @@ use sark_grpc::{
     },
 };
 
-pub const H2: u8 = 7;
-
 pub struct Borrowed<'a>(pub &'a Cell<u32>);
 
 impl Handler for Borrowed<'_> {

@@ -43,8 +43,8 @@ impl<'a, 'd, P: rules::Policy, A: rules::Push> Control<'a, 'd, P, A> {
                 .map_err(conn::Error::Parse)?;
             output::WritePrefix::try_encode(&stream)?
         };
-        let entry = Entry::single(budget::WriteClass::Critical, target, prefix, Boundary::More);
-        conn.queues.enqueue(entry)?;
+        let entry = Entry::single(budget::WriteClass::Critical, prefix, Boundary::More);
+        conn.queues.enqueue(target, entry)?;
         conn.session.control = Some(target);
         Ok(())
     }
@@ -101,12 +101,12 @@ impl<'a, 'd, P: rules::Policy, A: rules::Push> Control<'a, 'd, P, A> {
             .plan_limit(capacity)
             .map_err(conn::Error::Encode)?;
         let prefix = output::WritePrefix::from(&limit);
-        let entry = Entry::single(budget::WriteClass::Critical, target, prefix, Boundary::More);
-        let permit = match Single::new(&mut conn.queues, entry) {
+        let entry = Entry::single(budget::WriteClass::Critical, prefix, Boundary::More);
+        let permit = match Single::new(&mut conn.queues, target, entry) {
             Ok(permit) => permit,
             Err(rejected) => return Err(rejected.discard()),
         };
-        permit.commit();
+        permit.commit::<o3::buffer::hold::evidence::Off>();
         limit.commit();
         Ok(())
     }

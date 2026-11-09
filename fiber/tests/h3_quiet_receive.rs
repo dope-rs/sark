@@ -12,7 +12,7 @@ use common::server::recover;
 use dope::{
     core::{
         driver::{life::recovery, result::SubmitError, route::KeyTag},
-        io::{Reclaimed, datagram::ReceiveError},
+        io::datagram::ReceiveError,
     },
     manifold::{app::dispatch::raw::Projection as _, network::datagram::hook::ingress},
     net::wire,
@@ -34,55 +34,57 @@ fn retains_terminal_cause() {
         must_finish_before_last: None,
         linked: 0,
     };
-    let (prepared, proof, source) = scenario
-        .try_prepare(Default::default())
+    let (prepared, proof) = scenario
+        .try_prepare(
+            Default::default(),
+            None,
+            common::server::h3::sessions::plain,
+        )
         .expect("server plan");
     let mut reports = Vec::new();
     prepared.enter_with(
-        source,
+        (),
         |scope| {
             scope.lend(|topology, stage| {
                 drop(topology.reservation);
                 Brand::with(|brand| {
                     let router = SrvApp::multiplexed::<wire::Identity, KeyTag<LISTENER>, _>(
                         brand,
-                        &stage.storage().state,
+                        stage.storage(),
                         sark_fiber::Config::new(1),
                     );
-                    stage.with_stage(|stage| {
-                        let mut driver = stage.driver();
-                        let endpoint = topology
-                            .plan
-                            .try_with::<Silent, _, _, _, _, _>(
-                                router,
-                                Quiet::new(Probe(Rc::clone(&proof), ())),
-                                Disabled,
-                                deadline::Disabled,
-                                server::Tasks::new(),
-                                &mut driver,
-                            )
-                            .expect("quiet server binding");
-                        let mut endpoint = pin::pin!(endpoint);
-                        let now = driver.driver_ref().clock().now();
-                        let full = ReceiveError::Submit(SubmitError::from(Vacancy::Full));
-                        <ingress::Coupled as ingress::Failure<'_, KeyTag<LISTENER>, _>>::failed(
-                            endpoint.as_mut().inner_mut(),
-                            full,
-                            now,
-                            driver.state_token(),
-                        );
-                        assert!(proof.failures.values.take().is_empty());
-                        let terminal =
-                            ReceiveError::Submit(SubmitError::from(Vacancy::IdentityExhausted));
-                        <ingress::Coupled as ingress::Failure<'_, KeyTag<LISTENER>, _>>::failed(
-                            endpoint.as_mut().inner_mut(),
-                            terminal,
-                            now,
-                            driver.state_token(),
-                        );
-                        assert!(matches!(proof.failures.values.take().as_slice(),
-                            [Failure::Socket(error)] if *error == terminal));
-                    });
+                    let mut driver = stage.driver();
+                    let endpoint = topology
+                        .plan
+                        .try_with::<Silent, _, _, _, _, _>(
+                            router,
+                            Quiet::new(Probe(Rc::clone(&proof), |_: &dyn std::fmt::Debug| {})),
+                            Disabled,
+                            deadline::Disabled,
+                            server::Tasks::new(),
+                            &mut driver,
+                        )
+                        .expect("quiet server binding");
+                    let mut endpoint = pin::pin!(endpoint);
+                    let now = driver.driver_ref().clock().now();
+                    let full = ReceiveError::Submit(SubmitError::from(Vacancy::Full));
+                    <ingress::Coupled as ingress::Failure<'_, KeyTag<LISTENER>, _>>::failed(
+                        endpoint.as_mut().inner_mut(),
+                        full,
+                        now,
+                        driver.state_token(),
+                    );
+                    assert!(proof.failures.values.take().is_empty());
+                    let terminal =
+                        ReceiveError::Submit(SubmitError::from(Vacancy::IdentityExhausted));
+                    <ingress::Coupled as ingress::Failure<'_, KeyTag<LISTENER>, _>>::failed(
+                        endpoint.as_mut().inner_mut(),
+                        terminal,
+                        now,
+                        driver.state_token(),
+                    );
+                    assert!(matches!(proof.failures.values.take().as_slice(),
+                        [Failure::Socket(error)] if *error == terminal));
                 });
             });
         },
@@ -95,5 +97,5 @@ fn retains_terminal_cause() {
             );
         },
     );
-    assert!(matches!(reports.as_slice(), [Reclaimed::Shutdown]));
+    assert!(reports.is_empty(), "unexpected retirement: {reports:?}");
 }

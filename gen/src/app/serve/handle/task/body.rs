@@ -37,7 +37,7 @@ pub(super) fn build(
 
     let spec = ctx.plan.spec;
     let vis = &spec.vis;
-    let task = &ctx.exec.task.fiber;
+    let task = &ctx.exec.fiber;
     let prep = &state.prepared;
     let ident = quote::format_ident!("{}TaskBuild", spec.name);
     let ready_id = quote::format_ident!("{}TaskReady", spec.name);
@@ -52,7 +52,7 @@ pub(super) fn build(
         let var = fiber.1;
         quote! {
             #var(
-                #ns_core::manifold::task::request::Build<'d, #route>,
+                <<#route as #ns_core::route::Spec>::Request as #ns_core::route::Own>::TaskBuilder<'d>,
             ),
         }
     });
@@ -84,7 +84,7 @@ pub(super) fn build(
                         #var(
                             <<<#route as #ns_core::route::Spec>::Request
                                 as #ns_core::route::Own>::TaskBuilder<'d>
-                                as #ns_core::route::Push<'d>>::Error,
+                                as #ns_core::body::Push<'d>>::Error,
                         ),
                     }
                 }
@@ -114,7 +114,7 @@ pub(super) fn build(
                 #var(
                     <<<#route as #ns_core::route::Spec>::Request
                         as #ns_core::route::Own>::TaskBuilder<'d>
-                        as #ns_core::route::TaskBuild<'d>>::StepError,
+                        as #ns_core::body::Build<'d>>::StepError,
                 ),
             }
         })
@@ -172,7 +172,7 @@ pub(super) fn build(
                     #push_id::#var(#v_error) =>
                         <<<#route as #ns_core::route::Spec>::Request
                             as #ns_core::route::Own>::TaskBuilder<'d>
-                            as #ns_core::route::Push<'d>>::observe(#v_error, #v_obs),
+                            as #ns_core::body::Push<'d>>::observe(#v_error, #v_obs),
                 },
             }
         });
@@ -230,9 +230,7 @@ pub(super) fn build(
                                 );
                             }
                         };
-                        ::core::result::Result::Ok(#ident::#var(
-                            #ns_core::manifold::task::request::Build::new(#v_build),
-                        ))
+                        ::core::result::Result::Ok(#ident::#var(#v_build))
                     }
                 },
                 spec::Kind::Sync | spec::Kind::Stream | spec::Kind::Duplex => {
@@ -398,6 +396,7 @@ pub(super) fn build(
             let field = syn::Index::from(fiber.slot);
             let route = fiber.path().route(&ctx.plan.spec.state_generics);
             let kind = item.variant();
+            let source = item.make(paths, &n_task);
             quote! {
                 #ready_id::#var(#v_req) => {
                     let mut #n_taker = #route;
@@ -418,7 +417,7 @@ pub(super) fn build(
                             #ns_fiber::manifold::runtime::Runnable
                         >::handle(#v_this.#f_time),
                     ));
-                    let #n_task = #n_insert((#n_task, #n_target));
+                    let #n_task = #n_insert((#source, #n_target));
                     ::core::result::Result::Ok(
                         #task::#kind(#n_task),
                     )

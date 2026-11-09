@@ -14,6 +14,7 @@ use crate::client::{
     exchange::{
         net::{self, PoolTag},
         protocol::Protocol,
+        reuse,
     },
 };
 
@@ -110,7 +111,8 @@ impl<'o, 'q, 'e, 'b, 'c, 'd, ID: Identity> Route<'d, 'e, 'b, 'c, 'd, ID>
         conn: conn::Id<'d, ID>,
         driver: &mut driver::Context<'_, 'd>,
     ) -> Result<(), Connect<'d, ID>> {
-        let reserve = match self.protocol.transport.try_reserve(driver, conn) {
+        let transport = &self.protocol.transport;
+        let commit = match transport.pool.try_connect(conn) {
             Ok(reserve) => reserve,
             Err(error) => {
                 self.fail(&attempt, channel::Failure::Activation(error));
@@ -121,7 +123,9 @@ impl<'o, 'q, 'e, 'b, 'c, 'd, ID: Identity> Route<'d, 'e, 'b, 'c, 'd, ID>
             .pending
             .try_settle(&attempt, channel::Outcome::Connected(conn))
             .map_err(|(cause, outcome)| Connect::Mailbox(cause, outcome))?;
-        reserve(origin);
+        commit(driver.region_token(), origin, reuse::Admission::Reserved);
+        transport.waiters.wake(origin);
+        transport.waiters.wake_io();
         if let Some(waiter) = waiter {
             waiter.wake();
         }

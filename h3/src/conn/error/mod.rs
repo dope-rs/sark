@@ -39,10 +39,6 @@ pub enum Error {
         pending: u64,
         additional: u64,
     },
-    FeedbackGrowth {
-        before: usize,
-        after: usize,
-    },
     Encode(encoder::Error),
     Request(owned::Error),
     Response(owned::Error),
@@ -123,7 +119,7 @@ pub enum Error {
         expected: usize,
         actual: usize,
     },
-    Output(output::Error),
+    Output(output::Overflow),
     Length(varint::Overflow),
     Reply(replies::Error),
     BatchRegularWire {
@@ -201,10 +197,6 @@ pub enum Error {
         stream_id: u64,
         active: usize,
         capacity: usize,
-    },
-    QpackLength {
-        pending: usize,
-        wire: usize,
     },
     CreditOverflow {
         accumulated: usize,
@@ -313,8 +305,7 @@ impl Error {
             | segments::Error::Retain(_)
             | segments::Error::Count(_)
             | segments::Error::Logical(_)
-            | segments::Error::Resident(_)
-            | segments::Error::Total(_) => ErrorCode::ExcessiveLoad,
+            | segments::Error::Resident(_) => ErrorCode::ExcessiveLoad,
             segments::Error::DifferentPool | segments::Error::Boundary(_) => ErrorCode::Internal,
         }
     }
@@ -336,7 +327,7 @@ impl Error {
     /// Overflow errors retain the failed operands and remain terminal.
     pub(crate) const fn is_pressure(&self) -> bool {
         match self {
-            Self::Qpack(error) => failure::Failure::classify(error).is_pressure(),
+            Self::Qpack(error) => failure::is_pressure(error),
             Self::EventCapacity { .. }
             | Self::CreditCapacity { .. }
             | Self::StreamCapacity { .. } => true,
@@ -373,6 +364,18 @@ impl Error {
     }
 
     pub const fn error_code(&self) -> ErrorCode {
+        self.code::<false>()
+    }
+
+    pub(crate) const fn response_code(&self) -> ErrorCode {
+        self.code::<true>()
+    }
+
+    const fn input_code<const RESPONSE: bool>(code: ErrorCode) -> ErrorCode {
+        if RESPONSE { ErrorCode::Internal } else { code }
+    }
+
+    const fn code<const RESPONSE: bool>(&self) -> ErrorCode {
         match self {
             Self::Push(
                 push::Error::Unpermitted { .. }
@@ -391,14 +394,24 @@ impl Error {
             | Self::Parse(frame::ParseError::PayloadInteger(_) | frame::ParseError::BadVarInt)
             | Self::Incomplete { .. }
             | Self::Length(_)
-            | Self::Reply(replies::Error::Length(_)) => ErrorCode::Payload,
-            Self::Parse(frame::ParseError::BadSettings | frame::ParseError::DuplicateSetting) => {
-                ErrorCode::Settings
+            | Self::Reply(replies::Error::Length(_)) => {
+                Self::input_code::<RESPONSE>(ErrorCode::Payload)
             }
-            Self::DuplicateSettings(_) => ErrorCode::FrameUnexpected,
-            Self::Qpack(error) => failure::Failure::classify(error).code(),
+            Self::Parse(frame::ParseError::BadSettings | frame::ParseError::DuplicateSetting) => {
+                Self::input_code::<RESPONSE>(ErrorCode::Settings)
+            }
+            Self::DuplicateSettings(_) => Self::input_code::<RESPONSE>(ErrorCode::FrameUnexpected),
+            Self::Qpack(error) => {
+                if failure::is_pressure(error) {
+                    ErrorCode::ExcessiveLoad
+                } else {
+                    Self::input_code::<RESPONSE>(ErrorCode::QpackDecompressionFailed)
+                }
+            }
             Self::Feedback(_) => ErrorCode::ExcessiveLoad,
-            Self::FeedbackIncrement { .. } => ErrorCode::QpackEncoderStream,
+            Self::FeedbackIncrement { .. } => {
+                Self::input_code::<RESPONSE>(ErrorCode::QpackEncoderStream)
+            }
             Self::Encode(
                 encoder::Error::Allocation(_)
                 | encoder::Error::Huffman(_)
@@ -410,38 +423,44 @@ impl Error {
             Self::Encode(encoder::Error::ConnectDisabled) => ErrorCode::Message,
             Self::Encode(_) => ErrorCode::Internal,
             Self::Request(_) | Self::Response(_) => ErrorCode::ExcessiveLoad,
-            Self::Handoff(handoff::Error::Retain(_)) | Self::Retain(_) => ErrorCode::ExcessiveLoad,
-            Self::Handoff(handoff::Error::Overflow(error)) => Self::overflow(error),
-            Self::Retention(error)
-            | Self::Output(output::Error::Retention(error))
-            | Self::Reply(replies::Error::Output(output::Error::Retention(error))) => {
-                Self::overflow(error)
+            Self::Retain(_) => ErrorCode::ExcessiveLoad,
+            Self::Handoff(handoff::Error::Retain(_)) => {
+                Self::input_code::<RESPONSE>(ErrorCode::ExcessiveLoad)
             }
+            Self::Handoff(handoff::Error::Overflow(error)) => {
+                Self::input_code::<RESPONSE>(Self::overflow(error))
+            }
+            Self::Retention(error) => Self::overflow(error),
             Self::Size(_)
             | Self::Build(storage::BuildError::Capacity(_) | storage::BuildError::Exhausted(_)) => {
                 ErrorCode::ExcessiveLoad
             }
             Self::FrameUnexpected(_) | Self::Parse(frame::ParseError::ReservedFrame { .. }) => {
-                ErrorCode::FrameUnexpected
+                Self::input_code::<RESPONSE>(ErrorCode::FrameUnexpected)
             }
-            Self::MissingSettings(_) => ErrorCode::MissingSettings,
-            Self::ClosedCriticalStream(_) => ErrorCode::ClosedCriticalStream,
+            Self::MissingSettings(_) => Self::input_code::<RESPONSE>(ErrorCode::MissingSettings),
+            Self::ClosedCriticalStream(_) => {
+                Self::input_code::<RESPONSE>(ErrorCode::ClosedCriticalStream)
+            }
             Self::PushStream { .. } | Self::RequestStream { .. } | Self::CriticalExists { .. } => {
-                ErrorCode::StreamCreation
+                Self::input_code::<RESPONSE>(ErrorCode::StreamCreation)
             }
             Self::Target(_) | Self::Informational(_) => ErrorCode::Internal,
             Self::Identity { .. }
             | Self::VarInt { .. }
             | Self::GoAwayId(_)
             | Self::GoAwayOrder { .. }
-            | Self::PushIdOrder { .. } => ErrorCode::Id,
-            Self::QpackEncoderStream(_) => ErrorCode::QpackEncoderStream,
-            Self::QpackDecoderStream(_) => ErrorCode::QpackDecoderStream,
-            Self::ReceiveCapacity { .. } => ErrorCode::ExcessiveLoad,
+            | Self::PushIdOrder { .. } => Self::input_code::<RESPONSE>(ErrorCode::Id),
+            Self::QpackEncoderStream(_) => {
+                Self::input_code::<RESPONSE>(ErrorCode::QpackEncoderStream)
+            }
+            Self::QpackDecoderStream(_) => {
+                Self::input_code::<RESPONSE>(ErrorCode::QpackDecoderStream)
+            }
+            Self::ReceiveCapacity { .. } => Self::input_code::<RESPONSE>(ErrorCode::ExcessiveLoad),
             Self::Build(storage::BuildError::Build(_) | storage::BuildError::Length(_))
             | Self::ReceiveRelease { .. }
             | Self::ReceiveCopy { .. }
-            | Self::FeedbackGrowth { .. }
             | Self::BudgetReleaseWire { .. }
             | Self::BudgetReleaseResident { .. }
             | Self::BudgetRegularReleaseWire { .. }
@@ -477,8 +496,8 @@ impl Error {
             ) => ErrorCode::Internal,
             Self::Prefix { .. }
             | Self::PrefixOverflow { .. }
-            | Self::Output(output::Error::Charge(_))
-            | Self::Reply(replies::Error::Output(output::Error::Charge(_)))
+            | Self::Output(_)
+            | Self::Reply(replies::Error::Output(_))
             | Self::BatchRegularWire { .. }
             | Self::BatchRegularResident { .. }
             | Self::BatchCriticalWire { .. }
@@ -492,7 +511,6 @@ impl Error {
             | Self::CreditCapacity { .. }
             | Self::StreamCapacity { .. }
             | Self::StreamAdmission { .. }
-            | Self::QpackLength { .. }
             | Self::CreditOverflow { .. }
             | Self::SectionLength { .. }
             | Self::SectionPrefix { .. } => ErrorCode::ExcessiveLoad,
@@ -500,8 +518,8 @@ impl Error {
             Self::MessageMissing { .. }
             | Self::Malformed { .. }
             | Self::Content { .. }
-            | Self::PushRejected { .. } => ErrorCode::Message,
-            Self::Parse(_) => ErrorCode::GeneralProtocol,
+            | Self::PushRejected { .. } => Self::input_code::<RESPONSE>(ErrorCode::Message),
+            Self::Parse(_) => Self::input_code::<RESPONSE>(ErrorCode::GeneralProtocol),
         }
     }
 }
@@ -517,7 +535,6 @@ impl From<state::Error> for Error {
                 pending,
                 additional: added,
             },
-            state::Error::Growth { before, after } => Self::FeedbackGrowth { before, after },
         }
     }
 }

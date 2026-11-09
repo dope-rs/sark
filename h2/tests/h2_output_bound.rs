@@ -19,7 +19,7 @@ use common::{
 fn rejects_oversized_owner() {
     let pair = Pair::bind().expect("H2 output-bound harness");
     let bind = pair.addr();
-    pair.check(
+    pair.run(
         move |context, listener| {
             let calls = Cell::new(0);
             let reports = Oversized::<0>(&calls)
@@ -64,7 +64,6 @@ fn rejects_oversized_owner() {
                 assert!(!matches!(event, Event::Data { .. }), "rejected owner data");
             }
         },
-        |result| result.expect("H2 server runtime"),
     )
     .expect("rejected output-bound E2E");
 }
@@ -73,7 +72,7 @@ fn rejects_oversized_owner() {
 fn accepts_bounded_owner() {
     let pair = Pair::bind().expect("H2 output-bound harness");
     let bind = pair.addr();
-    pair.check(
+    pair.run(
         move |context, listener| {
             let calls = Cell::new(0);
             let reports = Oversized::<BODY_LEN>(&calls)
@@ -113,7 +112,6 @@ fn accepts_bounded_owner() {
                 vec![b'x'; BODY_LEN]
             );
         },
-        |result| result.expect("H2 server runtime"),
     )
     .expect("accepted output-bound E2E");
 }

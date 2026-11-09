@@ -21,10 +21,6 @@ impl<'a, 'spec> Task<'a, 'spec> {
         &self.route.entry.route
     }
 
-    pub(in crate::app::serve) fn slot(self) -> usize {
-        self.spec.slot
-    }
-
     pub(in crate::app::serve) fn capacity(self) -> &'spec syn::Expr {
         self.spec.capacity
     }
@@ -55,14 +51,43 @@ impl<'a, 'spec> Task<'a, 'spec> {
         fiber: &serve::Fiber<'_>,
         state: &syn::Type,
     ) -> (proc_macro2::TokenStream, proc_macro2::TokenStream) {
+        let ns_core = &paths.core;
         let ns_fiber = &paths.fiber;
         let future = &fiber.future;
-        let ty = quote::quote!(#future);
+        let route = self.route();
         let output = self.fiber_output(paths, state);
+        let ty = if fiber.stream {
+            quote::quote!(
+                #ns_fiber::manifold::Phase<
+                    #future,
+                    #output,
+                    #ns_core::manifold::task::response::Stream<'d, #route, #state>,
+                >
+            )
+        } else {
+            quote::quote!(#future)
+        };
         let bound = quote::quote! {
-            #ty: #ns_fiber::dope_fiber::abi::Fiber<'d, Output = #output>,
+            #future: #ns_fiber::dope_fiber::abi::Fiber<'d, Output = #output>,
         };
         (ty, bound)
+    }
+
+    pub(in crate::app::serve) fn is_stream(self) -> bool {
+        matches!(&self.route.mode, serve::Mode::Fiber { fiber, .. } if fiber.stream)
+    }
+
+    pub(in crate::app::serve) fn make(
+        self,
+        paths: &Paths,
+        task: &syn::Ident,
+    ) -> proc_macro2::TokenStream {
+        let ns_fiber = &paths.fiber;
+        if self.is_stream() {
+            quote::quote!(#ns_fiber::manifold::Phase::new(#task))
+        } else {
+            quote::quote!(#task)
+        }
     }
 
     pub(in crate::app::serve) fn store_stream(
@@ -77,7 +102,10 @@ impl<'a, 'spec> Task<'a, 'spec> {
         let bound = quote::quote! {
             #ty: #ns_fiber::dope_fiber::abi::Stream<
                 'd,
-                Item = #ns_http::payload::response::dispatch::chunk::Chunk<'d>,
+                Item: ::core::convert::TryInto<
+                    #ns_http::payload::response::dispatch::chunk::Chunk<'d>,
+                    Error: ::core::fmt::Debug,
+                >,
             >,
         };
         (ty, bound)
@@ -94,72 +122,4 @@ impl<'a, 'spec> Task<'a, 'spec> {
             #ns_core::manifold::task::response::Output<'d, #route, #state>
         )
     }
-}
-
-/// Owns the generated task types and bounds.
-pub(in crate::app::serve) struct TaskPlan {
-    pub(in crate::app::serve) identity: syn::Ident,
-    pub(in crate::app::serve) fiber: syn::Ident,
-    pub(in crate::app::serve) direct: Vec<proc_macro2::TokenStream>,
-    pub(in crate::app::serve) queued: Vec<proc_macro2::TokenStream>,
-    pub(in crate::app::serve) producer_bounds: Vec<proc_macro2::TokenStream>,
-    pub(in crate::app::serve) slab_bounds: Vec<proc_macro2::TokenStream>,
-}
-
-impl TaskPlan {
-    pub(in crate::app::serve) fn new(
-        paths: &Paths,
-        spec: &crate::app::spec::Spec,
-        fibers: &[(Task<'_, '_>, &serve::Fiber<'_>)],
-        direct: Vec<proc_macro2::TokenStream>,
-        queued: Vec<proc_macro2::TokenStream>,
-        slabs: Vec<proc_macro2::TokenStream>,
-    ) -> Self {
-        let generics = &spec.state_generics;
-        let owner = &spec.name;
-        let state = spec.state.ty();
-        let make = producer_bounds(paths, generics, fibers, state);
-        Self {
-            identity: quote::format_ident!("__{}Task", owner),
-            fiber: quote::format_ident!("__{}Fiber", owner),
-            direct,
-            queued,
-            producer_bounds: make,
-            slab_bounds: slabs,
-        }
-    }
-}
-
-fn producer_bounds(
-    paths: &Paths,
-    generics: &crate::types::Generics,
-    fibers: &[(Task<'_, '_>, &serve::Fiber<'_>)],
-    state_ty: &syn::Type,
-) -> Vec<proc_macro2::TokenStream> {
-    let l_env = generics.lifetime("env");
-    let ns_core = &paths.core;
-    let ns_fiber = &paths.fiber;
-    let mut bounds = Vec::new();
-    for (task, fiber) in fibers.iter().copied() {
-        let route = task.route();
-        let future = &fiber.future;
-        let maker = &fiber.maker;
-        let output = task.fiber_output(paths, state_ty);
-        let builder = fiber.body_bound(paths, route);
-        bounds.push(quote::quote! {
-            #builder
-            #future: #ns_fiber::Fiber<
-                    'd,
-                    Output = #output,
-                > + #l_env,
-            #maker: ::core::marker::Copy
-                + #l_env
-                + ::core::ops::FnOnce((
-                    #ns_core::manifold::task::request::Input<'d, #route>,
-                    &#l_env #state_ty,
-                    #ns_fiber::driver::schedule::clock::timer::Timer<'d>,
-                )) -> #future,
-        });
-    }
-    bounds
 }

@@ -8,14 +8,15 @@ use dope_quic::{
 };
 use o3::buffer::{Residency, hold, resident, segments, storage, storage::inline, write::Reserved};
 use sark_core::manifold::stream::Boundary;
-use sark_http::{self, payload::owned};
+use sark_http::{
+    self,
+    payload::{owned, response::dispatch::chunk::Chunk},
+};
 
 use crate::{conn, frame, frame::Writer, qpack::encoder, stream};
 
-mod error;
 mod sealed;
 
-pub use error::Error;
 pub(crate) use sealed::Sealed;
 
 pub enum WritePayload<'d> {
@@ -47,27 +48,26 @@ impl WritePayload<'_> {
             Self::Segmented(body) => body.as_chain().resident(),
         }
     }
-}
 
-/// Immutable owners whose measured charges survive conversion into queued output.
-pub trait Payload<'d>: Sealed + Sized {
-    fn measure(&self) -> WriteCharge;
-    fn retention(&self) -> hold::Charge;
-    fn into_payload(self) -> WritePayload<'d>;
-}
-
-impl<'d> Payload<'d> for WritePayload<'d> {
-    fn measure(&self) -> WriteCharge {
-        WriteCharge::new(self.len(), self.resident_len())
-    }
-
-    fn retention(&self) -> hold::Charge {
+    pub(in crate::conn) fn retention(&self) -> hold::Charge {
         match self {
             Self::Owned(bytes) => hold::Charge::from_owner(bytes.len(), bytes.capacity()),
             Self::Shared(bytes) => hold::Charge::from_owner(bytes.len(), bytes.resident()),
             Self::Retained(bytes) => hold::Charge::from_owner(bytes.len(), bytes.resident()),
             Self::Segmented(body) => hold::Charge::from(body.as_chain()),
         }
+    }
+}
+
+/// Immutable owners whose measured charges survive conversion into queued output.
+pub trait Payload<'d>: Sealed + Sized {
+    fn measure(&self) -> WriteCharge;
+    fn into_payload(self) -> WritePayload<'d>;
+}
+
+impl<'d> Payload<'d> for WritePayload<'d> {
+    fn measure(&self) -> WriteCharge {
+        WriteCharge::new(self.len(), self.resident_len())
     }
 
     fn into_payload(self) -> WritePayload<'d> {
@@ -80,12 +80,18 @@ impl<'d> Payload<'d> for Vec<u8> {
         WriteCharge::new(self.len(), self.capacity())
     }
 
-    fn retention(&self) -> hold::Charge {
-        hold::Charge::from_owner(self.len(), self.capacity())
+    fn into_payload(self) -> WritePayload<'d> {
+        WritePayload::Owned(self)
+    }
+}
+
+impl<'d> Payload<'d> for Chunk<'d> {
+    fn measure(&self) -> WriteCharge {
+        WriteCharge::new(self.owner().len(), self.owner().resident())
     }
 
     fn into_payload(self) -> WritePayload<'d> {
-        WritePayload::Owned(self)
+        WritePayload::Retained(self.into_owner())
     }
 }
 
@@ -102,10 +108,6 @@ impl<'d> Payload<'d> for owned::Segments<'d> {
                 WriteCharge::new(chain.len(), chain.resident())
             }
         }
-    }
-
-    fn retention(&self) -> hold::Charge {
-        self.charge()
     }
 
     fn into_payload(self) -> WritePayload<'d> {
@@ -134,16 +136,6 @@ impl<'d> Payload<'d> for segments::Nonempty<resident::Shared<'d>> {
                 let chain = owners.as_chain();
                 WriteCharge::new(chain.len(), chain.resident())
             }
-        }
-    }
-
-    fn retention(&self) -> hold::Charge {
-        match self {
-            Self::One(owner) => {
-                let owner = owner.as_ref();
-                hold::Charge::from_owner(owner.len(), owner.resident())
-            }
-            Self::Many(owners) => hold::Charge::from(owners.as_chain()),
         }
     }
 
@@ -249,6 +241,19 @@ impl From<Vec<u8>> for WritePrefix {
     }
 }
 
+pub(in crate::conn) fn retention(
+    prefix: &WritePrefix,
+    payload: Option<&WritePayload<'_>>,
+) -> hold::Charge {
+    let prefix = prefix.retention();
+    let body = payload.map_or(hold::Charge::default(), WritePayload::retention);
+    hold::Charge {
+        logical_bytes: prefix.logical_bytes + body.logical_bytes,
+        resident_bytes: prefix.resident_bytes + body.resident_bytes,
+        owners: prefix.owners + body.owners,
+    }
+}
+
 pub struct Write<'d> {
     stream_id: Id,
     pub prefix: WritePrefix,
@@ -296,36 +301,18 @@ impl WriteCharge {
 }
 
 impl<'d> Write<'d> {
-    pub(in crate::conn) fn single(
-        target: stream::Target,
-        prefix: impl Into<WritePrefix>,
-        boundary: Boundary,
-    ) -> Self {
-        Self {
-            stream_id: target.stream_id(),
-            prefix: prefix.into(),
-            payload: None,
-            state: Self::state(target, boundary),
-        }
-    }
-
-    pub(in crate::conn) fn segmented(
+    pub(in crate::conn) fn new(
         target: stream::Target,
         prefix: WritePrefix,
-        body: WritePayload<'d>,
+        payload: Option<WritePayload<'d>>,
         boundary: Boundary,
     ) -> Self {
         Self {
             stream_id: target.stream_id(),
             prefix,
-            payload: Some(body),
+            payload,
             state: Self::state(target, boundary),
         }
-    }
-
-    pub(in crate::conn) fn finish(mut self) -> Self {
-        self.state = Tag::new(self.state.key(), Mark::Set);
-        self
     }
 
     const fn state(target: stream::Target, boundary: Boundary) -> Tag {

@@ -1,18 +1,128 @@
 use dope_test::alloc::Tracker;
 pub mod common;
 
+use o3::buffer::storage;
+use sark_core::duplex::{admit, machine};
+use sark_http::payload::{owned, response::Body as _};
 use std::{
+    cell::Cell,
     io::{Read as _, Write as _},
     net::{Shutdown, TcpStream},
-    thread,
-    time::Duration,
 };
 
 use crate::common::{
-    echo::{OPENING, run_echo},
+    echo::{Echo, OPENING, run_echo},
     peer::Peer as _,
     protocol::Payload as _,
 };
+
+#[test]
+fn session_retains_tail_across_owned_output() {
+    assert_eq!(
+        size_of::<sark_ws::server::ConnState>(),
+        size_of::<sark_ws::server::ConnState<()>>()
+            + size_of::<Option<dope::net::link::egress::NonEmpty<storage::Shared>>>()
+    );
+    for eof in [false, true] {
+        let calls = Cell::new(0);
+        let echo = Echo {
+            calls: &calls,
+            repeat: None,
+            activity: &|_| {},
+            failed: &|error| panic!("session failure: {error:?}"),
+        };
+        let mut session = machine::Machine::new(sark_ws::server::Session::new(echo, 1024, 1024));
+        let mut scratch = Vec::new();
+        if eof {
+            assert!(matches!(
+                session.transact(&mut [], &mut scratch, |_, emit| {
+                    match emit.into_parts().0 {
+                        admit::Payload::Vacant(permit) => permit.commit::<_, ()>(()),
+                        admit::Payload::Present { .. } => panic!("initial output"),
+                    }
+                }),
+                machine::Transaction::Committed { .. }
+            ));
+        }
+        let mut first = [b'x'; 256].try_masked(0x2, true).expect("first frame");
+        let mut tail = if eof {
+            [b'y'; 256].try_masked(0x2, true)
+        } else {
+            b"end".try_masked(0x1, true)
+        }
+        .expect("tail frame");
+        if !eof {
+            tail.extend(1000u16.to_be_bytes().try_masked(0x8, true).expect("close"));
+        }
+        first.push(tail[0]);
+        let input = owned::Segments::from(storage::Shared::try_copy(&first).expect("first owner"))
+            .try_extend(
+                storage::Shared::try_copy(&tail[1..])
+                    .expect("tail owner")
+                    .into(),
+            )
+            .expect("segmented input");
+        let machine::Access::Vacant(slot) = session.input() else {
+            panic!("initial input slot");
+        };
+        slot.commit(input);
+        let mut output = Vec::new();
+        let mut deferred = false;
+        let mut owned = 0;
+        for _ in 0..8 {
+            let mut prefix = [0; 160];
+            let turn = session.transact(&mut prefix, &mut scratch, |written, emit| {
+                match emit.into_parts().0 {
+                    admit::Payload::Present { output, permit } if !deferred => {
+                        assert_eq!(calls.get(), 1);
+                        deferred = true;
+                        permit.pending::<_, ()>(output, (written, None))
+                    }
+                    admit::Payload::Present { output, permit } => {
+                        assert_eq!(calls.get(), owned + 1);
+                        permit.commit((written, Some(output)))
+                    }
+                    admit::Payload::Vacant(permit) => permit.commit((written, None)),
+                }
+            });
+            let (written, body) = match turn {
+                machine::Transaction::Committed { receipt, .. } => receipt,
+                machine::Transaction::Pending { receipt } => {
+                    if eof {
+                        session.finish(()).expect("input EOF").0.commit();
+                    }
+                    receipt
+                }
+                _ => panic!("output admission"),
+            };
+            output.extend_from_slice(&prefix[..written]);
+            if let Some(body) = body {
+                owned += 1;
+                for chunk in owned::Segments::from(body).segments() {
+                    output.extend_from_slice(chunk);
+                }
+                if eof && owned == 2 {
+                    assert!(matches!(session.progress(), machine::Progress::Finished));
+                }
+            }
+            if matches!(session.progress(), machine::Progress::Finished) {
+                break;
+            }
+        }
+        let mut expected = b"\x82\x7e\x01\x00".to_vec();
+        expected.extend_from_slice(&[b'x'; 256]);
+        if eof {
+            expected.extend_from_slice(b"\x82\x7e\x01\x00");
+            expected.extend_from_slice(&[b'y'; 256]);
+        } else {
+            expected.extend_from_slice(b"\x81\x03end\x88\x02\x03\xe8");
+        }
+        assert_eq!(output, expected);
+        assert_eq!(calls.get(), 2);
+        assert!(deferred);
+        assert!(matches!(session.progress(), machine::Progress::Finished));
+    }
+}
 
 #[test]
 fn split_writes_echo() {
@@ -23,7 +133,7 @@ fn split_writes_echo() {
                 .expect("opening prefix write");
             sock.write_all(&OPENING[split..])
                 .expect("opening tail write");
-            let (head, _) = sock.try_head().expect("WebSocket test peer");
+            let (head, _) = sock.try_head(&mut Vec::new()).expect("WebSocket test peer");
             assert!(head.starts_with(b"HTTP/1.1 101"), "split {split}");
         }
 
@@ -35,7 +145,7 @@ fn split_writes_echo() {
                 .expect("WebSocket test peer"),
         );
         sock.write_all(&input).expect("coalesced opening write");
-        let (head, mut tail) = sock.try_head().expect("WebSocket test peer");
+        let (head, mut tail) = sock.try_head(&mut Vec::new()).expect("WebSocket test peer");
         assert!(head.starts_with(b"HTTP/1.1 101"));
         assert_eq!(
             sock.try_next(&mut tail).expect("WebSocket test peer"),
@@ -161,7 +271,7 @@ fn invalid_openings_reject() {
         ] {
             let mut sock = TcpStream::try_socket(bind).expect("WebSocket test peer");
             sock.write_all(req).expect("invalid opening write");
-            let (head, _) = sock.try_head().expect("WebSocket test peer");
+            let (head, _) = sock.try_head(&mut Vec::new()).expect("WebSocket test peer");
             assert!(head.starts_with(b"HTTP/1.1 400"));
             let version = b"\r\nSec-WebSocket-Version: 13\r\n";
             assert!(head.windows(version.len()).any(|field| field == version));
@@ -385,7 +495,7 @@ fn preserves_queued_bytes() {
         batch.extend(large[32768..].try_masked(0x0, true).expect("fragment tail"));
         batch.extend([3, 232].try_masked(0x8, true).expect("close after data"));
         sock.write_all(&batch).expect("pipeline write");
-        thread::sleep(Duration::from_millis(30));
+        assert_eq!(sock.peek(&mut [0]).expect("queued responses"), 1);
         for id in 0..16u8 {
             assert_eq!(
                 sock.try_next(&mut buf).expect("ordered 4KiB echo"),
@@ -417,9 +527,9 @@ fn amplifies_once() {
             batch.extend([id].try_masked(0x2, true).expect("small request"));
         }
         sock.write_all(&batch).expect("amplified pipeline");
-        thread::sleep(Duration::from_millis(30));
+        assert_eq!(sock.peek(&mut [0]).expect("queued responses"), 1);
         sock.write_all(&[64].try_masked(0x2, true).expect("later request"))
-            .expect("arrival during deferred output");
+            .expect("arrival after queued output");
         sock.shutdown(Shutdown::Write)
             .expect("peer EOF preserves responses");
         for _ in 0..65 {

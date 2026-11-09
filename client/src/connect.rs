@@ -1,7 +1,7 @@
 use std::convert::Infallible;
 
 use dope::{
-    manifold::client::port::error::Open,
+    manifold::client::{attempt, port::error::Open},
     net::link::{event, pool::change::opening},
 };
 use dope_fiber::reply;
@@ -14,7 +14,7 @@ pub enum Error<M = Infallible> {
     Activation(Open),
     Reply(reply::Error),
     Mailbox(M),
-    Attempt(event::ConnectFault),
+    Attempt(attempt::ConnectFault),
 }
 
 impl<M> From<opening::Exhaustion> for Error<M> {
@@ -22,7 +22,7 @@ impl<M> From<opening::Exhaustion> for Error<M> {
         match cause {
             opening::Exhaustion::Identity => Self::IdentityExhausted,
             opening::Exhaustion::Submission(error) => Self::Attempt(
-                event::ConnectFault::Transport(event::ConnectError::Admission(error)),
+                attempt::ConnectFault::Transport(event::ConnectError::Admission(error)),
             ),
         }
     }

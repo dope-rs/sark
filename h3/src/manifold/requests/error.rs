@@ -21,8 +21,6 @@ pub(in crate::manifold) enum Error {
     Payload(buffered::Error<assembly::Error>),
     Segments(segments::Error),
     Duplex(machine::FinishError),
-    ReadyStatus,
-    Resume,
     Build,
     Dispatch,
 }

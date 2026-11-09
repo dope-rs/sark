@@ -11,7 +11,7 @@ pub(in crate::body::credit) use seal::Seal;
 pub trait Origin: Seal + Copy {}
 
 impl Origin for raw::Stored {}
-impl<'id> Origin for region::Proof<region::Identity<'id>> {}
+impl<'id> Origin for region::Identity<'id> {}
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct Amount {
@@ -424,7 +424,7 @@ const _: () = {
     assert!(core::mem::size_of::<Amount>() == 2 * core::mem::size_of::<usize>());
     assert!(core::mem::size_of::<Release>() == core::mem::size_of::<Amount>());
     assert!(
-        core::mem::size_of::<Release<region::Proof<region::Identity<'static>>>>()
+        core::mem::size_of::<Release<region::Identity<'static>>>()
             == core::mem::size_of::<Amount>()
     );
     assert!(core::mem::size_of::<Disabled>() == 0);

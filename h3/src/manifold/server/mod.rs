@@ -125,13 +125,10 @@ fn request_error_code(error: requests::Error) -> frame::ErrorCode {
             | segments::Error::Count(_)
             | segments::Error::Logical(_)
             | segments::Error::Resident(_)
-            | segments::Error::Total(_)
             | segments::Error::Boundary(_),
         )
         | requests::Error::Lookup(_)
         | requests::Error::Identity
-        | requests::Error::ReadyStatus
-        | requests::Error::Resume
         | requests::Error::Build
         | requests::Error::Dispatch => frame::ErrorCode::Internal,
     }

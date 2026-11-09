@@ -1,5 +1,3 @@
-use std::convert;
-
 use dope::core::driver::schedule::clock;
 use o3::{
     base::time::Positive,
@@ -15,33 +13,30 @@ use crate::{
     Reason, message,
     protocol::{request, section},
     server::{
-        call::{self, input},
+        call::{Handler, input},
         calls,
         egress::{self, draft},
         runtime::{
             policy,
-            run::{drive, write},
-            state::{self, active},
+            run::drive,
+            state::{Store, active},
         },
-        service::{self, handler, reply::Reply, timers},
+        service::{self, handler, reply::Reply},
     },
 };
 
-pub(super) struct Reader<'a, 'run, X, F> {
-    run: &'a mut drive::Driver<'run, X, F>,
-}
-
-impl<'a, 'run, X, F> Reader<'a, 'run, X, F> {
-    pub(super) fn new(run: &'a mut drive::Driver<'run, X, F>) -> Self {
-        Self { run }
-    }
-
-    pub(super) fn event<'r, 'd, C, O>(
+impl<'run, 'r, 'd, X, O, H, F> drive::Driver<'run, X, O, H, F>
+where
+    O: Copy + Eq + 'd,
+    X: policy::Dispatch<'d, O, Target = active::Entry<'r>>,
+    X::Timer: drive::Mode<'d>,
+{
+    pub(super) fn event<C>(
         &mut self,
         now: clock::Moment<'d>,
-        state: &mut state::Session<'r, 'd, call::Handler<X::Call, X::State>, X::Timer, C>,
+        state: &mut Store<'r, 'd, Handler<X::Call, X::State>, X::Timer, C>,
         conn: &mut C,
-        turn: &mut app::Turn<'_, '_, '_, '_, 'd, O>,
+        turn: &mut app::Turn<'_, '_, '_, 'd, O>,
         active: &'r active::Signals,
         event: server::Event<C>,
     ) -> Result<(), active::Error>
@@ -51,11 +46,8 @@ impl<'a, 'run, X, F> Reader<'a, 'run, X, F> {
                 Owner = resident::Shared<'d>,
                 Fields = section::Owner,
                 Output = storage::Shared,
-                Retired = convert::Infallible,
             >,
-        O: Copy + Eq + 'd,
-        F: FnMut(Key, egress::Error<C::Error>),
-        X: policy::Dispatch<'d, O, Target = active::Entry<'r>>,
+        F: FnMut(&mut H, Key, egress::Error<C::Error>),
     {
         use server::Event;
 
@@ -67,10 +59,10 @@ impl<'a, 'run, X, F> Reader<'a, 'run, X, F> {
                 ..
             } => {
                 let stream = frame.key();
-                let Some(entry) = state.calls.records.entry(stream) else {
+                let Some(entry) = state.calls.entry(stream) else {
                     return Ok(());
                 };
-                self.trailers(state, conn, turn.owner(), head.into_parts().0, entry);
+                self.trailers(state, conn, head.into_parts().0, entry);
                 if matches!(frame.boundary(), Boundary::End) {
                     Self::end(state, entry);
                 }
@@ -93,60 +85,47 @@ impl<'a, 'run, X, F> Reader<'a, 'run, X, F> {
                 data,
             } => {
                 let stream = frame.key();
-                let Some(entry) = state.calls.records.entry(stream) else {
+                let Some(entry) = state.calls.entry(stream) else {
                     return Ok(());
                 };
-                self.data(state, conn, turn.owner(), data, frame.boundary(), entry);
+                self.data(state, conn, data, frame.boundary(), entry);
             }
-            Event::Reset {
-                stream,
-                retired: None,
-                ..
-            } => {
-                let Some(entry) = state.calls.records.entry(stream) else {
+            Event::Reset { stream, .. } => {
+                let Some(entry) = state.calls.entry(stream) else {
                     return Ok(());
                 };
-                self.run.cancel(state, turn.owner(), entry);
+                self.cancel(state, entry);
                 state.discard(entry, conn);
             }
-            Event::Reset {
-                retired: Some(retired),
-                ..
-            }
-            | Event::Retired(retired) => match retired {},
-            Event::Control | Event::Established => {}
+            Event::Control | Event::Established | Event::Retired(_) => {}
         }
         Ok(())
     }
 
-    fn headers<'r, 'd, C, O>(
+    fn headers<C>(
         &mut self,
         now: clock::Moment<'d>,
-        state: &mut state::Session<'r, 'd, call::Handler<X::Call, X::State>, X::Timer, C>,
+        state: &mut Store<'r, 'd, Handler<X::Call, X::State>, X::Timer, C>,
         conn: &mut C,
-        turn: &mut app::Turn<'_, '_, '_, '_, 'd, O>,
+        turn: &mut app::Turn<'_, '_, '_, 'd, O>,
         fields: section::Owner,
         entry: active::Entry<'r>,
     ) where
         C: Connection<Key = Key, Owner = resident::Shared<'d>, Output = storage::Shared>,
-        O: Copy + Eq + 'd,
-        F: FnMut(Key, egress::Error<C::Error>),
-        X: policy::Dispatch<'d, O, Target = active::Entry<'r>>,
+        F: FnMut(&mut H, Key, egress::Error<C::Error>),
     {
-        let owner = turn.owner();
         let stream = entry.key();
         let head = match request::Head::from_owner(fields) {
             Ok(head) => head,
             Err(status) => {
-                self.run.fail(state, conn, owner, status, entry);
+                self.fail(state, conn, status, entry);
                 return;
             }
         };
-        match state.calls.records.try_reserve(entry) {
+        match state.calls.try_reserve(entry) {
             Ok(()) => {}
             Err(error) => {
-                self.run
-                    .fail(state, conn, owner, crate::Status::from(error), entry);
+                self.fail(state, conn, crate::Status::from(error), entry);
                 return;
             }
         }
@@ -159,9 +138,9 @@ impl<'a, 'run, X, F> Reader<'a, 'run, X, F> {
             let draft = draft::Draft::try_new(&mut state.egress, stream)?;
             let mut reply = Reply::with_writer(draft);
             let mut cx = service::Stream::new(stream.id());
-            let opened = self.run.exec.start(turn, entry, &mut cx, head, &mut reply);
+            let opened = self.exec.start(turn, entry, &mut cx, head, &mut reply);
             let done = reply.is_finished();
-            let (app, output, input) = opened.into_input(self.run.limits.bytes());
+            let (app, output, input) = opened.into_input(self.limits.bytes());
             let output = match (output, done) {
                 (handler::Production::Ready, false) => handler::Production::Ready,
                 (handler::Production::Idle | handler::Production::Ready, true)
@@ -169,40 +148,36 @@ impl<'a, 'run, X, F> Reader<'a, 'run, X, F> {
             };
             state
                 .calls
-                .records
                 .initialize(stream, input, app, output)
                 .map_err(calls::Error::status)?;
-            state.calls.commit().reply(reply)?;
+            state.calls.reply(reply)?;
             Ok((done, output))
         })();
         let (done, output) = match result {
             Ok(outcome) => outcome,
             Err(status) => {
-                self.run.fail(state, conn, owner, status, entry);
+                self.fail(state, conn, status, entry);
                 return;
             }
         };
         match (done, output) {
             (true, _) => {
-                self.run.complete(state, conn, owner, entry);
+                self.complete(state, conn, entry);
             }
             (false, handler::Production::Ready) => entry.output(),
             (false, handler::Production::Idle) => {}
         }
     }
 
-    fn trailers<'r, 'd, C, O>(
+    fn trailers<C>(
         &mut self,
-        state: &mut state::Session<'r, 'd, call::Handler<X::Call, X::State>, X::Timer, C>,
+        state: &mut Store<'r, 'd, Handler<X::Call, X::State>, X::Timer, C>,
         conn: &mut C,
-        owner: O,
         fields: section::Owner,
         entry: active::Entry<'r>,
     ) where
         C: Connection<Key = Key, Owner = resident::Shared<'d>, Output = storage::Shared>,
-        O: Copy + Eq + 'd,
-        F: FnMut(Key, egress::Error<C::Error>),
-        X: policy::Dispatch<'d, O, Target = active::Entry<'r>>,
+        F: FnMut(&mut H, Key, egress::Error<C::Error>),
     {
         let stream = entry.key();
         match request::Head::trailers(fields) {
@@ -211,27 +186,24 @@ impl<'a, 'run, X, F> Reader<'a, 'run, X, F> {
                     input.trailers = meta;
                 }
             }
-            Err(status) => self.run.fail(state, conn, owner, status, entry),
+            Err(status) => self.fail(state, conn, status, entry),
         }
     }
 
-    fn data<'r, 'd, C, O>(
+    fn data<C>(
         &mut self,
-        state: &mut state::Session<'r, 'd, call::Handler<X::Call, X::State>, X::Timer, C>,
+        state: &mut Store<'r, 'd, Handler<X::Call, X::State>, X::Timer, C>,
         conn: &mut C,
-        owner: O,
         data: C::Data,
         boundary: Boundary,
         entry: active::Entry<'r>,
     ) where
         C: Connection<Key = Key, Owner = resident::Shared<'d>, Output = storage::Shared>,
-        O: Copy + Eq + 'd,
-        F: FnMut(Key, egress::Error<C::Error>),
-        X: policy::Dispatch<'d, O, Target = active::Entry<'r>>,
+        F: FnMut(&mut H, Key, egress::Error<C::Error>),
     {
         let stream = entry.key();
         let data = message::DataChunk::new(data);
-        let input = self.run.limits.input();
+        let input = self.limits.input();
         match state
             .calls
             .stage_data(stream, data, boundary, input.stream_wire(), input.wire())
@@ -239,17 +211,18 @@ impl<'a, 'run, X, F> Reader<'a, 'run, X, F> {
             Ok(()) => {}
             Err(calls::Stage::Unknown) => return,
             Err(calls::Stage::Failed(status)) => {
-                self.run.fail(state, conn, owner, status, entry);
+                self.fail(state, conn, status, entry);
                 return;
             }
         }
         Self::rearm(state, entry);
     }
 
-    fn end<'r, 'd, T, P, C>(state: &mut state::Session<'r, 'd, T, P, C>, entry: active::Entry<'r>)
-    where
+    fn end<C>(
+        state: &mut Store<'r, 'd, Handler<X::Call, X::State>, X::Timer, C>,
+        entry: active::Entry<'r>,
+    ) where
         C: Connection<Key = Key, Owner = resident::Shared<'d>, Output = storage::Shared>,
-        P: timers::Policy,
     {
         let stream = entry.key();
         let Some(call) = state.calls.stream_mut(stream) else {
@@ -259,10 +232,11 @@ impl<'a, 'run, X, F> Reader<'a, 'run, X, F> {
         entry.app();
     }
 
-    fn rearm<'r, 'd, T, P, C>(state: &mut state::Session<'r, 'd, T, P, C>, entry: active::Entry<'r>)
-    where
+    fn rearm<C>(
+        state: &mut Store<'r, 'd, Handler<X::Call, X::State>, X::Timer, C>,
+        entry: active::Entry<'r>,
+    ) where
         C: Connection<Key = Key, Owner = resident::Shared<'d>, Output = storage::Shared>,
-        P: timers::Policy,
     {
         let stream = entry.key();
         if state.calls.has_input(stream) {
@@ -270,44 +244,40 @@ impl<'a, 'run, X, F> Reader<'a, 'run, X, F> {
         }
     }
 
-    pub(super) fn semantic<'r, 'd, C, O>(
+    pub(super) fn semantic<C>(
         &mut self,
-        state: &mut state::Session<'r, 'd, call::Handler<X::Call, X::State>, X::Timer, C>,
+        state: &mut Store<'r, 'd, Handler<X::Call, X::State>, X::Timer, C>,
         conn: &mut C,
-        turn: &mut app::Turn<'_, '_, '_, '_, 'd, O>,
+        turn: &mut app::Turn<'_, '_, '_, 'd, O>,
         entry: active::Entry<'r>,
     ) where
         C: Connection<Key = Key, Owner = resident::Shared<'d>, Output = storage::Shared>,
-        O: Copy + Eq + 'd,
-        F: FnMut(Key, egress::Error<C::Error>),
-        X: policy::Dispatch<'d, O, Target = active::Entry<'r>>,
+        F: FnMut(&mut H, Key, egress::Error<C::Error>),
     {
-        let owner = turn.owner();
         let stream = entry.key();
-        let input = self.run.limits.input();
+        let input = self.limits.input();
         let step = match state
             .calls
             .deframe_turn(stream, &state.segments, input.messages())
         {
             Ok(turn) => turn,
             Err(error) => {
-                self.run.fail(state, conn, owner, error, entry);
+                self.fail(state, conn, error, entry);
                 return;
             }
         };
         match step {
             input::Turn::Frame(frame) => {
-                self.dispatch(state, conn, owner, frame, entry);
+                self.dispatch(state, conn, frame, entry);
             }
             input::Turn::Pending => entry.app(),
             input::Turn::Complete => {
-                write::Writer::new(self.run).finish(state, conn, turn, entry);
+                self.finish(state, conn, turn, entry);
             }
             input::Turn::Incomplete => {
-                self.run.fail(
+                self.fail(
                     state,
                     conn,
-                    owner,
                     crate::Status::from(message::Error::Incomplete),
                     entry,
                 );
@@ -316,18 +286,15 @@ impl<'a, 'run, X, F> Reader<'a, 'run, X, F> {
         }
     }
 
-    fn dispatch<'r, 'd, C, O>(
+    fn dispatch<C>(
         &mut self,
-        state: &mut state::Session<'r, 'd, call::Handler<X::Call, X::State>, X::Timer, C>,
+        state: &mut Store<'r, 'd, Handler<X::Call, X::State>, X::Timer, C>,
         conn: &mut C,
-        owner: O,
         frame: message::Frame<resident::Shared<'d>>,
         entry: active::Entry<'r>,
     ) where
         C: Connection<Key = Key, Owner = resident::Shared<'d>, Output = storage::Shared>,
-        O: Copy + Eq + 'd,
-        F: FnMut(Key, egress::Error<C::Error>),
-        X: policy::Dispatch<'d, O, Target = active::Entry<'r>>,
+        F: FnMut(&mut H, Key, egress::Error<C::Error>),
     {
         let stream = entry.key();
         let bytes = frame.len() + message::HEADER_LEN;
@@ -340,27 +307,26 @@ impl<'a, 'run, X, F> Reader<'a, 'run, X, F> {
             let mut reply = Reply::with_writer(draft);
             let mut cx = service::Stream::new(stream.id());
             let rearm = self
-                .run
                 .exec
-                .message(owner, entry, call, &mut cx, frame, &mut reply);
+                .message(self.owner, entry, call, &mut cx, frame, &mut reply);
             let done = reply.is_finished();
-            state.calls.commit().reply(reply)?;
+            state.calls.reply(reply)?;
             Ok((done, rearm, output))
         })();
         let (done, rearm, output) = match result {
             Ok(outcome) => outcome,
             Err(status) => {
-                self.run.fail(state, conn, owner, status, entry);
+                self.fail(state, conn, status, entry);
                 return;
             }
         };
         if let Err(error) = state.calls.release_live(stream, bytes) {
-            self.run.fail(state, conn, owner, error.status(), entry);
+            self.fail(state, conn, error.status(), entry);
             return;
         }
         match (done, output) {
             (true, _) => {
-                self.run.complete(state, conn, owner, entry);
+                self.complete(state, conn, entry);
             }
             (false, handler::Production::Ready) => entry.output(),
             (false, handler::Production::Idle) => {}

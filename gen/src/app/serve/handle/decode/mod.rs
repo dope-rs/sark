@@ -10,7 +10,6 @@ use crate::{
 };
 
 mod arms;
-mod body;
 mod prepared;
 pub(super) mod state;
 
@@ -60,6 +59,7 @@ pub(super) struct Decode {
     pub(super) contract: proc_macro2::TokenStream,
     pub(super) guard: Option<proc_macro2::TokenStream>,
     pub(super) method: proc_macro2::TokenStream,
+    pub(super) full: proc_macro2::TokenStream,
     pub(super) prepared: prepared::Prepared,
 }
 
@@ -70,6 +70,7 @@ impl Decode {
         methods: &dispatch::Methods,
         head: &head::Head,
         entries: &[serve::RouteSpec<'_, M>],
+        receiver: proc_macro2::TokenStream,
     ) -> Self {
         let f_state = local("state");
         let symbols = &spec.state_generics;
@@ -80,7 +81,8 @@ impl Decode {
         let [n_fields, n_fstart] = symbols.locals(["__fields", "__fields_start"]);
         let [n_first, n_head] = symbols.locals(["__first_regular", "__head"]);
         let [n_hbytes, n_hostrg] = symbols.locals(["__head_bytes", "__host_range"]);
-        let [n_httpm, n_method] = symbols.locals(["__http_method", "__method"]);
+        let [n_method] = symbols.locals(["__method"]);
+        let [n_mbytes, n_mkey] = symbols.locals(["__method_bytes", "__method_key"]);
         let [n_next] = symbols.locals(["__next"]);
         let [n_pmeth] = symbols.locals(["__planned_method"]);
         let [n_pproto] = symbols.locals(["__planned_protocol"]);
@@ -93,7 +95,7 @@ impl Decode {
         let [n_rtarg] = symbols.locals(["__route_target"]);
         let [n_select, n_target] = symbols.locals(["__selection", "__target"]);
         let [n_trange, n_visit] = symbols.locals(["__target_range", "__visit"]);
-        let [v_dkey, v_error] = symbols.locals(["decoded_method_key", "error"]);
+        let [v_error] = symbols.locals(["error"]);
         let [l_driver, l_req, l_out, l_input] =
             spec.state_generics
                 .lives(["__sark_driver", "__sark_request", "o", "req"]);
@@ -109,15 +111,16 @@ impl Decode {
         let path = spec.state_generics.ident("__SARK_PATH");
         let auth = spec.state_generics.ident("__SARK_AUTHORITY");
         let proto = spec.state_generics.ident("__SARK_PROTOCOL");
+        let prefix = spec.state_generics.ident("__SARK_PREFIX");
         let head_ty = &head.names.prepared_ident;
         let plan = &head.names.head_plan_ident;
         let cause = &head.names.cause;
         let route = &head.names.head_route_ident;
         let matcher = &head.full_head_matcher;
         let arms = &head.planned_route_arms;
-        let key = &methods.decoded_method_key;
+        let key = &methods.head_method_key;
         let state = match &spec.state {
-            spec::State::Bound(_) => quote!(self.#f_state),
+            spec::State::Bound(_) => quote!(#receiver.#f_state),
             spec::State::Empty(_) => quote!(#ns_core::manifold::EmptyState::REF),
         };
         let prepared = prepared::Prepared::build(paths, spec, head, entries, &state);
@@ -155,7 +158,7 @@ impl Decode {
             const #path: &[::core::primitive::u8] = #ns_http::field::head::Name::Path.wire();
             const #auth: &[::core::primitive::u8] = #ns_http::field::head::Name::Authority.wire();
             const #proto: &[::core::primitive::u8] = #ns_http::field::head::Name::Protocol.wire();
-            let mut #n_httpm = ::core::option::Option::None;
+            let mut #n_mbytes = ::core::option::Option::None;
             let mut #n_ptarg = ::core::option::Option::None;
             let mut #n_authrg = ::core::option::Option::None;
             let mut #n_hostrg = ::core::option::Option::None;
@@ -172,22 +175,19 @@ impl Decode {
                     break ::core::option::Option::Some((#n_field, #n_range));
                 }
                 match #n_field.name {
-                    #method => {
-                        let #n_method = #ns_http::method::Method::from_bytes(
-                            #n_field.value,
-                        ).map_err(#ns_core::decode::HeadError::Method)?;
-                        #n_httpm = ::core::option::Option::Some(#n_method);
-                    }
+                    #method => #n_mbytes = ::core::option::Option::Some(#n_field.value),
                     #path => #n_ptarg = ::core::option::Option::Some(#n_range),
                     #auth => #n_authrg = ::core::option::Option::Some(#n_range),
                     #proto => #n_pproto = ::core::option::Option::Some(#n_range),
                     _ => {}
                 }
             };
-            let #n_httpm = #n_httpm.ok_or(#ns_core::decode::HeadError::BadRequest)?;
+            let #n_mbytes = #ns_http::field::metadata::map::record::Span::from_slice(
+                #n_mbytes.ok_or(#ns_core::decode::HeadError::BadRequest)?,
+            );
             #target
             #key
-            let #n_method = #v_dkey.ok_or(#ns_core::decode::HeadError::NotFound)?;
+            let #n_method = #n_mkey.ok_or(#ns_core::decode::HeadError::NotFound)?;
             let #n_target = #n_rtarg;
             #matcher
             ::core::result::Result::Err(#ns_core::decode::HeadError::NotFound)
@@ -280,6 +280,23 @@ impl Decode {
                 Egress<#l_out> = #bound,
             >
             #guards
+            + #ns_core::decode::Full
+        };
+        let full = quote! {
+            #[inline(always)]
+            fn try_prefixed<const #prefix: ::core::primitive::usize>(
+                &self,
+                #n_head: #ns_http::field::metadata::section::state::RetainedHead<
+                    #ns_http::field::metadata::packed::Decoded<#ns_http::o3::buffer::pool::Span, #prefix>,
+                    #ns_http::field::metadata::section::state::Selected<
+                        #ns_http::field::metadata::section::rules::RetainRaw<#prefix>,
+                    >,
+                >,
+            ) -> ::core::result::Result<Self::Head, #ns_core::decode::HeadError<Self::Cause>> {
+                let #n_fields = #n_head.fields();
+                let #n_plan = *#n_head.control();
+                #full
+            }
         };
         let tokens = quote! {
             type Head = #head_ty;
@@ -310,9 +327,7 @@ impl Decode {
                 Self::Head,
                 #ns_core::decode::HeadError<Self::Cause>,
             > {
-                let #n_fields = #n_head.fields();
-                let #n_plan = *#n_head.control();
-                #full
+                #ns_core::decode::Full::try_prefixed::<0>(self, #n_head)
             }
 
             #[inline(always)]
@@ -403,6 +418,7 @@ impl Decode {
             contract,
             guard,
             method: tokens,
+            full,
             prepared,
         }
     }

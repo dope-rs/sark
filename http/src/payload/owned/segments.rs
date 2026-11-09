@@ -38,16 +38,15 @@ impl<'d> Segments<'d> {
         self,
         segment: Segment<'d>,
     ) -> Result<Self, mem::Rejected<(Self, Segment<'d>), assembly::Error>> {
-        let ops::ControlFlow::Continue(item) = segments::Item::new(resident::Shared::from(segment))
-        else {
+        let ops::ControlFlow::Continue(item) = segments::Item::new(segment) else {
             return Ok(self);
         };
         match self.storage {
             Shape::Empty => Ok(Self {
                 storage: Shape::One(item),
             }),
-            Shape::One(first) => Self::try_merge((first, item), Segment::from_item),
-            Shape::Many(chain) => Self::try_merge((chain, item), Segment::from_item),
+            Shape::One(first) => Self::try_merge((first, item), segments::Item::into_inner),
+            Shape::Many(chain) => Self::try_merge((chain, item), segments::Item::into_inner),
         }
     }
 
@@ -88,6 +87,7 @@ impl<'d> Segments<'d> {
             })
     }
 
+    #[inline]
     pub fn charge(&self) -> hold::Charge {
         match &self.storage {
             Shape::Empty => hold::Charge::default(),
@@ -257,12 +257,6 @@ impl<'d> From<segments::Item<resident::Shared<'d>>> for Segments<'d> {
 
 impl<'d> From<storage::Shared> for Segments<'d> {
     fn from(data: storage::Shared) -> Self {
-        Self::from(resident::Shared::from(data))
-    }
-}
-
-impl<'d> From<Segment<'d>> for Segments<'d> {
-    fn from(data: Segment<'d>) -> Self {
         Self::from(resident::Shared::from(data))
     }
 }

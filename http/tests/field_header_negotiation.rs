@@ -1,3 +1,5 @@
+pub mod common;
+
 use sark_http::{
     field::head::{self, Flags, headers::Known},
     h1::head::{
@@ -69,6 +71,18 @@ fn retains_line_exclusions() {
                 .expect("field");
         }
         assert!(fields.message.coding() == Coding::Plain);
+    }
+}
+
+#[test]
+fn retains_encoding_quality() {
+    let mut encoding = head::AcceptEncoding::default();
+    for (raw, expected) in common::framing::ENCODING_QUALITY {
+        encoding.append(head::AcceptEncoding::try_parse(raw).expect("encoding"));
+        assert_eq!(
+            (encoding.br(), encoding.gzip(), encoding.identity()),
+            expected
+        );
     }
 }
 

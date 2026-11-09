@@ -187,7 +187,7 @@ impl Codec {
         R: buffer::Cursor + hold::raw::Retain<'d>,
         F: FnOnce(Result<Parsed<'d>, Error>, &mut State<'d>) -> T::Accepted,
     {
-        let (data, consumed) = match input.try_prefix(take) {
+        let (data, consumed) = match input.try_prefix(0, take) {
             Ok(plan) => plan,
             Err(error) => return Err(output::rejected(Error::Input(error), state, admit)),
         };
@@ -308,10 +308,7 @@ impl Codec {
             Framing::UntilEof { received, content } => {
                 self.parse_eof(state, input, received, content, admit)
             }
-            Framing::Failed => {
-                state.framing = Framing::Failed;
-                Ok(Self::more(input, None))
-            }
+            Framing::Failed => unreachable!("framing"),
         }
     }
 }

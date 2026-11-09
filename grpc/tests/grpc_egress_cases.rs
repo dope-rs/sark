@@ -4,7 +4,6 @@ pub mod common;
 use std::{
     cell::Cell,
     convert::Infallible,
-    sync::mpsc,
     time::{Duration, Instant},
 };
 
@@ -17,7 +16,6 @@ use dope::{
     runtime::{executor::session, topology, topology::lending::Stage},
 };
 use dope_test::{
-    fibers,
     harness::{
         server::Pair,
         signals::{LocalGate, Progress as _},
@@ -57,7 +55,6 @@ fn backpressure() {
             .with_output(Output::try_new(1, 13).expect("one-message server-stream output budget")),
     };
 
-    let (checked, complete) = mpsc::sync_channel(1);
     harness
         .run(
             move |context, listener| {
@@ -90,13 +87,8 @@ fn backpressure() {
                         worker
                             .lend(|plan, stage| {
                                 plan.install(stage, |app, stage| {
-                                    Stage::with_app(stage, &mut finish, app, |mut app| {
-                                        assert_eq!(
-                                            fibers::Harness::new(Duration::from_secs(2))
-                                                .try_wait(&mut app, &dropped, 1)
-                                                .expect("progress drive"),
-                                            fibers::Wait::Reached
-                                        );
+                                    Stage::with_app(stage, &mut finish, app, |app| {
+                                        let result = app.run();
                                         assert_eq!(dropped.hits(), 1);
                                         let mut observed = requests.take();
                                         let request = observed.pop();
@@ -110,8 +102,7 @@ fn backpressure() {
                                             metadata.as_deref(),
                                             Some(b"retained-through-response".as_slice())
                                         );
-                                        checked.send(()).expect("retirement observer");
-                                        app.run()
+                                        result
                                     })?
                                     .map_err(session::Error::Drive)
                                 })
@@ -155,9 +146,6 @@ fn backpressure() {
                 assert_eq!(reply.messages, vec![vec![0; 8], vec![1; 8], vec![2; 8]],);
                 assert!(initial, "initial metadata crossed the real H2 connection");
                 assert!(trailing, "trailing metadata crossed the real H2 connection");
-                complete
-                    .recv_timeout(Duration::from_secs(2))
-                    .expect("producer retired before shutdown");
             },
         )
         .expect("server-streaming E2E");
@@ -232,10 +220,10 @@ fn encode_rollback() {
             Ok::<_, Infallible>(())
         },
         |address| {
-            let [(failed, status), (kept, ready)] = Waiters::try_pair(address)
-                .expect("paired codec requests")
-                .try_release()
-                .expect("paired codec responses");
+            let mut waiters = Waiters::try_pair(address).expect("paired codec requests");
+            waiters.try_window(64).expect("response credit");
+            let [(failed, status), (kept, ready)] =
+                waiters.try_read().expect("paired codec responses");
             assert_eq!(status.expect("codec failure").code(), Code::DataLoss);
             assert!(failed.is_empty());
             assert_eq!(ready.expect("healthy sibling").code(), Code::Ok);
@@ -259,7 +247,6 @@ fn stream_timer() {
         limits: Limits::default(),
     };
 
-    let (checked, complete) = mpsc::sync_channel(1);
     harness
         .run(
             move |context, listener| {
@@ -294,18 +281,12 @@ fn stream_timer() {
                         worker
                             .lend(|plan, stage| {
                                 plan.install(stage, |app, stage| {
-                                    Stage::with_app(stage, &mut finish, app, |mut app| {
-                                        assert_eq!(
-                                            fibers::Harness::new(Duration::from_secs(2))
-                                                .try_wait(&mut app, &dropped, 1)
-                                                .expect("progress drive"),
-                                            fibers::Wait::Reached
-                                        );
+                                    Stage::with_app(stage, &mut finish, app, |app| {
+                                        let result = app.run();
                                         assert_eq!(dropped.hits(), 1);
                                         assert_eq!(error.get(), None);
                                         assert_eq!(polls.get(), 3);
-                                        checked.send(()).expect("retirement observer");
-                                        app.run()
+                                        result
                                     })?
                                     .map_err(session::Error::Drive)
                                 })
@@ -339,9 +320,6 @@ fn stream_timer() {
                     .expect("gRPC exchange");
                 assert_eq!(reply.messages, vec![b"wake".to_vec()]);
                 assert!(started.elapsed() >= Duration::from_millis(5));
-                complete
-                    .recv_timeout(Duration::from_secs(2))
-                    .expect("producer retired before shutdown");
             },
         )
         .expect("driver-timer server-stream E2E");

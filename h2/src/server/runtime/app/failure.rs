@@ -1,4 +1,4 @@
-use std::convert::Infallible;
+use std::{convert::Infallible, fmt};
 
 use dope::{
     core::driver::route::Identity,
@@ -9,8 +9,8 @@ use sark_core::manifold::server::app;
 
 use crate::server::runtime::output;
 
-/// A wire failure with its original owner and connection generation.
-pub enum Failure<'w, 'd: 'w, W: wire::Spec + 'w, ID: Identity, E = Infallible, B = Infallible> {
+/// A failure preserving its wire owner or borrowing its response diagnostic.
+pub enum Failure<'a, 'w, 'd: 'w, W: wire::Spec + 'w, ID: Identity, E = Infallible, B = Infallible> {
     Construction(B),
     Drive {
         id: conn::Id<'d, ID>,
@@ -23,6 +23,11 @@ pub enum Failure<'w, 'd: 'w, W: wire::Spec + 'w, ID: Identity, E = Infallible, B
     Output {
         id: conn::Id<'d, ID>,
         cause: output::Failure,
+    },
+    Response {
+        id: conn::Id<'d, ID>,
+        stream: crate::stream::Key,
+        cause: &'a dyn fmt::Debug,
     },
     Open(open::Error<'w, W>),
     Wire {

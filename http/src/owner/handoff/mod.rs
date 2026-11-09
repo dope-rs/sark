@@ -51,12 +51,6 @@ pub enum Error {
     Overflow(hold::Overflow),
 }
 
-#[doc(hidden)]
-pub enum Head<O> {
-    Kept,
-    Passed(O),
-}
-
 pub(crate) use origin::Origin;
 pub use pending::Pending;
 pub use plan::Plan;

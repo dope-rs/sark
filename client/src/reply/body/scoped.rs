@@ -1,6 +1,6 @@
 use std::mem;
 
-use o3::buffer::{resident, segments};
+use o3::buffer::{raw, resident, segments};
 use segments::scatter;
 
 use crate::capacity;
@@ -39,14 +39,12 @@ impl<'a, 'd> Scoped<'a, 'd> {
         self.segments.contiguous()
     }
 
-    pub fn reader(
-        &self,
-    ) -> scatter::Reader<'_, segments::Iter<'_, resident::Shared<'d>>, resident::Shared<'d>> {
+    pub fn reader(&self) -> scatter::Reader<'_, segments::Iter<'_, resident::Shared<'d>>> {
         scatter::Reader::new(self.segments.segments())
     }
 
     pub fn suffix<const N: usize>(&self) -> Option<[u8; N]> {
-        scatter::Source::suffix(&self.segments)
+        raw::Chunks::suffix(&self.segments)
     }
 
     pub(in crate::reply) fn pop(&mut self) -> Option<resident::Shared<'d>> {
@@ -66,7 +64,7 @@ impl<'a, 'd> Scoped<'a, 'd> {
         data: resident::Shared<'d>,
     ) -> Result<(), capacity::Error> {
         match self.segments.try_push(data) {
-            Ok(segments::Push::Loaded | segments::Push::Discarded(_)) => Ok(()),
+            Ok(_) => Ok(()),
             Err(rejected) => Err(capacity::Error::ResponseSegments(rejected.discard())),
         }
     }

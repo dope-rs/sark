@@ -150,6 +150,7 @@ impl<'d, A: executor::raw::App<'d>> lending::Build<'d, Tick<'d>> for Serve<'d, A
 impl<'life, 'd: 'life, A, Q> lending::Execute<'life, 'd, Tick<'d>, Q> for Serve<'d, A>
 where
     A: executor::raw::App<'d>,
+    Q: executor::Startup,
 {
     type Output = Driven;
 

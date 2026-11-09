@@ -1,7 +1,7 @@
 //! Static application binding for HTTP server carriers.
 
 use dope_core::driver::{
-    retained,
+    self,
     schedule::{app, clock, ready},
 };
 use o3::{buffer::resident, depot::capacity};
@@ -59,19 +59,19 @@ impl Capacity {
 }
 
 /// Borrowed resources for one application admission turn.
-pub struct Turn<'a, 'work, 'borrow, 'owner, 'd, O> {
+pub struct Turn<'a, 'work, 'borrow, 'd, O> {
     owner: O,
     work: app::Work<'work, 'd>,
     wake: ready::Target<'d>,
-    driver: &'a mut retained::Context<'borrow, 'owner, 'd>,
+    driver: &'a mut driver::Context<'borrow, 'd>,
 }
 
-impl<'a, 'work, 'borrow, 'owner, 'd, O> Turn<'a, 'work, 'borrow, 'owner, 'd, O> {
+impl<'a, 'work, 'borrow, 'd, O> Turn<'a, 'work, 'borrow, 'd, O> {
     pub fn new(
         owner: O,
         work: app::Work<'work, 'd>,
         wake: ready::Target<'d>,
-        driver: &'a mut retained::Context<'borrow, 'owner, 'd>,
+        driver: &'a mut driver::Context<'borrow, 'd>,
     ) -> Self {
         Self {
             owner,
@@ -96,7 +96,7 @@ impl<'a, 'work, 'borrow, 'owner, 'd, O> Turn<'a, 'work, 'borrow, 'owner, 'd, O> 
         self.wake
     }
 
-    pub fn driver(&mut self) -> &mut retained::Context<'borrow, 'owner, 'd> {
+    pub fn driver(&mut self) -> &mut driver::Context<'borrow, 'd> {
         self.driver
     }
 }
@@ -139,16 +139,32 @@ where
 
     fn state(&self, capacity: Capacity) -> Result<Self::State, Self::Build>;
 
-    fn drive(
+    fn drive<H>(
         &mut self,
         state: &mut Self::State,
         carrier: &mut C,
-        turn: &mut Turn<'_, '_, '_, '_, 'd, O>,
+        turn: &mut Turn<'_, '_, '_, 'd, O>,
         egress: schedule::Egress,
-        report: impl FnMut(Error<C::Error, Self::Failure>),
+        context: &mut H,
+        protocol: impl FnMut(
+            &mut H,
+            &mut C,
+            &mut drain::Events<'_, 'd>,
+            &Self::State,
+        ) -> Result<Option<server::Event<C>>, C::Error>,
+        notify: impl FnMut(&mut H, schedule::Wake<C::Key>),
+        finish: impl FnOnce(&mut H, &mut C),
+        report: impl FnMut(&mut H, Error<C::Error, Self::Failure>),
     ) -> Result<drain::Progress, Error<C::Error, Self::Failure>>;
 
     fn close(&mut self, state: &mut Self::State, carrier: &mut C, owner: O);
+
+    fn selected(state: &Self::State, event: &server::Event<C>) -> bool;
+
+    fn wake(state: &mut Self::State, wake: schedule::Wake<C::Key>) -> bool;
+
+    /// Records released egress capacity without executing application work.
+    fn released(state: &mut Self::State);
 
     fn activity(state: &Self::State) -> schedule::Quiescence;
 }

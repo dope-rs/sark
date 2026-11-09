@@ -11,7 +11,7 @@ use sark_core::{
     life::exchange::Id,
     manifold::stream::{Boundary, Payload as _},
 };
-use sark_http::{field::metadata::section::rules, payload::owned};
+use sark_http::payload::owned;
 
 use crate::{
     conn::{Error, event},
@@ -24,7 +24,6 @@ use crate::{
                 self, Build, Receiving, Routes, Streams, Variant,
                 entry::{self, Entry},
                 errors,
-                variant::BufferedSlot,
             },
         },
     },
@@ -71,11 +70,10 @@ where
     F: state::Family<P>,
     B: body::Build<'d>,
 {
-    pub(in crate::server::task) fn from_book<G, X, D>(
-        book: &'a mut book::Book<'d, P, F, G, B, X, D>,
+    pub(in crate::server::task) fn from_book<D, X>(
+        book: &'a mut book::Book<'d, P, F, B, D, X>,
     ) -> Self
     where
-        G: rules::Policy,
         D: duplex::Session<'d>,
     {
         Self {
@@ -127,6 +125,7 @@ where
     pub(in crate::server::task) fn finish_route(
         &mut self,
         stream: Key,
+        admitted: impl FnOnce(),
     ) -> Result<Route, payload::Error> {
         let occupied = match self.entries.entry(stream) {
             Some(occupied) => occupied,
@@ -135,6 +134,7 @@ where
         let (vacant, entry) = occupied.take();
         let (entry, result) = match entry {
             Entry::Routed { state, link } => {
+                admitted();
                 let (state, result) = match state.try_finish() {
                     Ok(state) => (state, Ok(Route::Finished)),
                     Err((error, state)) => (state, Err(error)),
@@ -158,12 +158,13 @@ where
     pub(in crate::server::task) fn discard<ID: Identity, E: credit::Evidence>(
         &mut self,
         exchange: Id<conn::Id<'d, ID>, Key>,
-        evidence: E,
+        admitted: impl FnOnce() -> E,
     ) -> Discard<'d, ID> {
         let stream = exchange.stream();
         let Some(entry) = self.remove_any(stream) else {
             return Discard::Missing(exchange);
         };
+        let evidence = admitted();
         let result = self.credit.scope(|mut ledger| match entry {
             Entry::Routed { state, .. } => {
                 // SAFETY: this route was removed from this exact Book.
@@ -204,8 +205,8 @@ where
         data: event::DataPayload<resident::Shared<'d>>,
         boundary: Boundary,
         limits: server::Config,
-        evidence: E,
-    ) -> Output<BufferedSlot<'a, 'd, P, F, B>, errors::Push<B::Error>>
+        admitted: impl FnOnce() -> E,
+    ) -> Output<<P::Family as state::Family<P>>::State<Receiving<'d>>, errors::Push<B::Error>>
     where
         B: body::Push<'d>,
     {
@@ -216,6 +217,7 @@ where
                 return Ok(Progress::Idle);
             }
         };
+        let evidence = admitted();
         let (vacant, entry) = occupied.take();
         match entry {
             Entry::Routed { mut state, link } => {
@@ -246,7 +248,7 @@ where
                 });
                 match pushed {
                     payload::Push::Accepted if matches!(boundary, Boundary::End) => {
-                        Ok(Progress::Request(BufferedSlot::insert(vacant, buffered)))
+                        Ok(Progress::Request(buffered.request))
                     }
                     pushed => {
                         vacant.insert(Entry::Buffered(buffered));
@@ -317,12 +319,13 @@ where
     pub(in crate::server::task) fn finish<E: credit::Evidence>(
         self,
         stream: Key,
-        evidence: E,
+        admitted: impl FnOnce() -> E,
     ) -> Output<<P::Family as state::Family<P>>::State<Receiving<'d>>, payload::Error> {
         let occupied = match self.entries.entry(stream) {
             Some(occupied) => occupied,
             None => return Ok(Progress::Idle),
         };
+        let evidence = admitted();
         let (vacant, entry) = occupied.take();
         match entry {
             Entry::Buffered(buffered) => Ok(Progress::Request(buffered.request)),

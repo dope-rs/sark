@@ -280,8 +280,7 @@ impl<R: crate::Role> Validated<R> {
             Some(limit) => limit as usize,
             None => DEFAULT_MAX_HEADER_LIST_SIZE as usize,
         };
-        let block = limits::Block::new(list)?;
-        let wire = limits::Capacity::wire(block)?;
+        let (block, wire) = limits::Capacity::wire(list)?;
         let slots = egress.slots(wire);
         let wire = pool::Layout::new(slots, wire.bytes())?;
         local.max_header_list_size = Some(recv_cap as u32);

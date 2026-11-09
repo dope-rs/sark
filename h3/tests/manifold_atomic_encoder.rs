@@ -235,9 +235,7 @@ fn keeps_head_zero_copy() -> Result<(), Error> {
         let encoder = Encode::begin_head(encoder, head.owner().view());
         let borrowed = head.borrow();
         let prepared = Accept::fixed(encoder, Code::OK, (), *borrowed.owner())?;
-        let (prepared, res) = Lineage::resolve_head(prepared, head);
-        assert!(matches!(res, handoff::Head::Kept));
-        Ok::<_, (Error, Cancellation)>(prepared)
+        Ok::<_, (Error, Cancellation)>(Lineage::resolve_head(prepared, head))
     });
     assert!(result.is_ok(), "the head-backed response must prepare");
     if let Ok(prepared) = result {

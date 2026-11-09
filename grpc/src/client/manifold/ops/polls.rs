@@ -23,31 +23,11 @@ type Wait<'a, 'target, 'd> = Option<(
     &'a wake::Waker<'d>,
 )>;
 
-pub(in crate::client::manifold) struct Completion<
-    'a,
-    'app,
-    'life,
-    'e,
-    'd: 'app,
-    P: ?Sized + 'app,
-    ID: Identity,
-> {
-    token: &'a mut region::Token<region::Identity<'d, 1>>,
-    scope: handle::Scope<'app, 'life, 'e, 'd, P, ID>,
-}
-
-impl<'a, 'app, 'life, 'e, 'd: 'app, P: ?Sized + 'app, ID: Identity>
-    Completion<'a, 'app, 'life, 'e, 'd, P, ID>
+impl<'app, 'life, 'e, 'd: 'app, P: ?Sized + 'app, ID: Identity>
+    handle::Scope<'app, 'life, 'e, 'd, P, ID>
 {
-    pub(in crate::client::manifold) fn new(
-        token: &'a mut region::Token<region::Identity<'d, 1>>,
-        scope: handle::Scope<'app, 'life, 'e, 'd, P, ID>,
-    ) -> Self {
-        Self { token, scope }
-    }
-
     fn finish<'scope, 'target, T>(
-        scope: handle::Scope<'app, 'life, 'e, 'd, P, ID>,
+        self,
         state: &mut State<'d, ID>,
         ready: ready::Target<'d>,
         result: Result<receive::Progress<T>, crate::Status>,
@@ -57,9 +37,9 @@ impl<'a, 'app, 'life, 'e, 'd: 'app, P: ?Sized + 'app, ID: Identity>
     where
         'life: 'target,
     {
-        state.signal(scope.connection);
+        state.signal(self.connection);
         match result? {
-            receive::Progress::Ready(value) => Ok(Some(Delivery::new(value, ready, scope.bound))),
+            receive::Progress::Ready(value) => Ok(Some(Delivery::new(value, ready, self.bound))),
             receive::Progress::Pending(index) => {
                 if let Some(error) = state.terminal() {
                     return Err(error);
@@ -73,8 +53,9 @@ impl<'a, 'app, 'life, 'e, 'd: 'app, P: ?Sized + 'app, ID: Identity>
         }
     }
 
-    pub(in crate::client::manifold) fn unary<'target>(
+    pub(in crate::client::manifold) fn poll_unary<'target>(
         self,
+        token: &mut region::Token<region::Identity<'d, 1>>,
         call: &unary::Handle<'d, stream::Key>,
         wait: Wait<'_, 'target, 'd>,
     ) -> Result<
@@ -84,29 +65,36 @@ impl<'a, 'app, 'life, 'e, 'd: 'app, P: ?Sized + 'app, ID: Identity>
     where
         'life: 'target,
     {
-        let Self { token, scope } = self;
-        scope.port.shared.source(token).with(|state, done| {
-            let active = state.active_mut(scope.connection)?;
+        self.port.shared.source(token).with(|state, done| {
+            let active = state.active_mut(self.connection)?;
             let ready = active.ready;
-            let result = active.session.poll_unary(call, done);
-            Self::finish(scope, state, ready, result, done, wait)
+            let session = &mut active.session.state;
+            let result = session
+                .poll_unary(call.completion, done)
+                .and_then(|result| {
+                    if matches!(result, receive::Progress::Pending(_)) {
+                        session.ingress.take_error()?;
+                    }
+                    Ok(result)
+                });
+            self.finish(state, ready, result, done, wait)
         })
     }
 
-    pub(in crate::client::manifold) fn response<'target>(
+    pub(in crate::client::manifold) fn poll_response<'target>(
         self,
+        token: &mut region::Token<region::Identity<'d, 1>>,
         call: &response::Stream<'d, stream::Key>,
         wait: Wait<'_, 'target, 'd>,
     ) -> Result<Option<Delivery<'app, 'd, P, receive::Response<resident::Shared<'d>>>>, error::Error>
     where
         'life: 'target,
     {
-        let Self { token, scope } = self;
-        scope.port.shared.source(token).with(|state, done| {
-            let active = state.active_mut(scope.connection)?;
+        self.port.shared.source(token).with(|state, done| {
+            let active = state.active_mut(self.connection)?;
             let ready = active.ready;
-            let result = active.session.poll_response(call, done);
-            Self::finish(scope, state, ready, result, done, wait)
+            let result = active.session.state.poll_stream(call.completion, done);
+            self.finish(state, ready, result, done, wait)
         })
     }
 }

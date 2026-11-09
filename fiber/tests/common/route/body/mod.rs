@@ -1,4 +1,4 @@
-pub use chunks::Chunks;
+pub use chunks::{Chunks, Trace};
 use sark_http::payload::response::status;
 
 #[sark_fiber::response(raw)]

@@ -6,16 +6,23 @@ use sark_core::{decode, duplex, manifold::task::app::Bind};
 use sark_http::{
     field::{self, Value},
     method::Method,
-    payload::{fixed, response::status},
+    payload::{
+        fixed,
+        response::{
+            dispatch::{Stream, chunk::Chunk},
+            status,
+        },
+    },
     request,
     request::body,
 };
 
 use crate::common::h2::{facts::*, *};
+use crate::common::route::body::Chunks;
 
 #[sark_json::json(ordered)]
 pub struct Item {
-    pub id: u64,
+    pub id: i64,
     pub value: storage::Shared,
     #[field(seq)]
     pub tags: Vec<storage::Shared>,
@@ -144,8 +151,8 @@ impl Guard<State> for RejectHead {
 
 #[sark_fiber::handler(pub)]
 pub(crate) async fn nested<'d>(request: NestedReq, state: &State, timer: Timer<'_>) -> Reply<'d> {
-    if !matches!(request.body.items.as_slice(), [first, second] if first.id == 1 && second.tags.len() == 2)
-        || request.body.featured.id != 3
+    if !matches!(request.body.items.as_slice(), [first, second] if first.id == i64::MIN && second.tags.len() == 2)
+        || request.body.featured.id != i64::MAX
     {
         state.invalid.set(true);
     }
@@ -192,6 +199,18 @@ pub(crate) async fn quick() -> StaticReply<'d> {
         status: status::Code::OK,
         body: fixed::Body::new(b"quick"),
     }
+}
+
+#[sark_fiber::handler(pub)]
+pub(crate) async fn stream_hold(state: &State) -> Stream<'static, Chunks<Chunk<'d>>> {
+    dope_test::fibers::Yield::new().await;
+    Stream::new(
+        Chunks::new(
+            [Chunk::from(b"held")],
+            Some(std::rc::Rc::clone(&state.stream)),
+        )
+        .park(true),
+    )
 }
 
 #[sark_fiber::handler(pub)]
@@ -319,7 +338,7 @@ pub(crate) async fn retained_header<'d>(
     }
 }
 
-pub struct DuplexEcho;
+pub struct DuplexEcho(pub(super) u8);
 
 pub const DUPLEX_LAYOUT: (usize, usize) =
     (mem::size_of::<DuplexEcho>(), mem::align_of::<DuplexEcho>());
@@ -337,7 +356,7 @@ pub struct DuplexReq {
 #[sark_fiber::duplex(pub)]
 pub(crate) fn duplex_echo(request: DuplexReq, state: &State) -> DuplexEcho {
     state.header.set(request.marker.try_into().ok());
-    DuplexEcho
+    DuplexEcho(0)
 }
 
 sark_fiber::define_task_route! {
@@ -366,6 +385,7 @@ sark_fiber::define_task_route! {
         ],
         CONNECT "*" => request(header) duplex_echo,
         CONNECT("sark-echo") "/duplex" => request(header) duplex_echo,
+        POST "/stream" => async stream(capacity = 2, body = discarded) stream_hold,
     }
 }
 
@@ -403,4 +423,4 @@ pub const LARGE_JSON: &[u8; LARGE_JSON_LEN] = &{
     input
 };
 
-pub const NESTED_JSON: &[u8] = br#"{"items":[{"id":1,"value":"first","tags":["a"]},{"id":2,"value":"second","tags":["b","c"]}],"featured":{"id":3,"value":"retained","tags":[]}}"#;
+pub const NESTED_JSON: &[u8] = br#"{"items":[{"id":-9223372036854775808,"value":"first","tags":["a"]},{"id":2,"value":"second","tags":["b","c"]}],"featured":{"id":9223372036854775807,"value":"retained","tags":[]}}"#;

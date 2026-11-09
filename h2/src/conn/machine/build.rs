@@ -11,6 +11,47 @@ use crate::conn::{
     registry::Registry,
 };
 
+impl<F, C, E> Connection<crate::ServerRole, F, C, rules::RejectPush, E>
+where
+    F: rules::Policy,
+    C: session::Storage,
+    E: event::Evidence,
+{
+    pub(crate) fn from_runtime_seed(
+        config: &config::Validated<crate::ServerRole>,
+        seed: hash::Seed,
+        preface: ingress::PrefacePhase,
+    ) -> Result<Self, conn::Build> {
+        let mut connection = Self::from_seed_phase(config, seed, preface)?;
+        connection.state.lifecycle.queue_events();
+        Ok(connection)
+    }
+
+    pub(crate) fn cancel_ingress(
+        &mut self,
+        key: crate::stream::Key,
+        error: crate::frame::numbers::ErrorCode,
+    ) -> Option<event::Retirement> {
+        self.ingress.events.cancel(key);
+        self.state
+            .active_streams
+            .store
+            .release(key, crate::conn::registry::store::Notice::Cancel);
+        self.streams().retire(key, error)
+    }
+
+    pub(crate) fn hold_duplex(&mut self, key: crate::stream::Key) {
+        self.state.active_streams.store.hold_duplex(key);
+    }
+
+    pub(crate) fn release_duplex(&mut self, key: crate::stream::Key) {
+        self.state
+            .active_streams
+            .store
+            .release(key, crate::conn::registry::store::Notice::Duplex);
+    }
+}
+
 impl<R, F, C, A, E> Connection<R, F, C, A, E>
 where
     R: crate::Role,
@@ -21,6 +62,14 @@ where
 {
     /// Builds from admitted geometry and an owning hash seed without acquiring entropy.
     pub fn from_seed(config: config::Validated<R>, seed: hash::Seed) -> Result<Self, conn::Build> {
+        Self::from_seed_phase(&config, seed, ingress::PrefacePhase::for_role::<R>())
+    }
+
+    fn from_seed_phase(
+        config: &config::Validated<R>,
+        seed: hash::Seed,
+        preface: ingress::PrefacePhase,
+    ) -> Result<Self, conn::Build> {
         use conn::Build;
 
         let config::Validated {
@@ -31,7 +80,7 @@ where
             hpack,
             buffers,
             marker: _,
-        } = config;
+        } = *config;
         let streams = Registry::try_new(streams).map_err(Build::Streams)?;
         Ok(Self {
             ingress: ingress::Ingress::try_new(Config {
@@ -44,7 +93,7 @@ where
                     cap: buffers.inbound_header_list_cap,
                     connect: local.enable_connect_protocol,
                 },
-                preface: ingress::PrefacePhase::for_role::<R>(),
+                preface,
             })
             .map_err(Build::Ingress)?,
             egress: outputs::Egress::try_new::<R>(

@@ -163,12 +163,16 @@ where
             .is_some()
     }
 
+    pub(crate) fn owns_exchange(&self, key: stream::Key) -> bool {
+        self.conn.state.active_streams.store.owns_exchange(key)
+    }
+
     pub fn capacity(&self) -> usize {
         self.conn.state.active_streams.store.capacity()
     }
 
     pub fn stream_state(&self, id: stream::Id) -> Option<stream::State> {
-        self.record(id).map(|record| record.stream.state)
+        self.record(id).map(|record| record.state)
     }
 
     pub fn active_len(&self) -> usize {

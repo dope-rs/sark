@@ -9,7 +9,7 @@ use dope_quic::{
 };
 use o3::{
     buffer::{hold, resident, segments, storage::inline},
-    depot::{array::Index, map},
+    depot::{array::Index, map, queue::ring},
 };
 use sark_core::manifold::stream::Boundary;
 use sark_http::{
@@ -58,10 +58,26 @@ impl Settings {
 }
 
 pub(super) struct QpackState {
-    pub(super) qpack_encoder: encoder::Encoder,
+    pub(super) qpack_encoder: encoder::State,
+    pub(super) pending_encoder: Option<ring::Fifo<(output::WritePrefix, u64)>>,
     pub(super) qpack_decoder: decoder::Decoder,
     pub(super) feedback: State,
     blocked: blocked::Blocked,
+}
+
+impl QpackState {
+    pub(crate) fn published(&self) -> u64 {
+        self.pending_encoder
+            .as_ref()
+            .and_then(ring::Fifo::front)
+            .map_or_else(|| self.qpack_encoder.insert_count(), |(_, base)| *base)
+    }
+
+    pub(crate) fn has_pending_encoder(&self) -> bool {
+        self.pending_encoder
+            .as_ref()
+            .is_some_and(|pending| !pending.is_empty())
+    }
 }
 
 pub(super) struct SessionState {
@@ -281,8 +297,11 @@ impl<'d, P: rules::Policy, A: rules::Push> Connection<'d, P, A> {
         leading: Option<varint::VarInt>,
         source: S,
         boundary: Boundary,
-    ) -> Result<outbound::Pending<'a, 'd, Selected<P>, P::Block>, Error> {
+    ) -> Result<outbound::Prepared<'a, 'd, P>, Error> {
         let qpack = self.session.qpack_encoder;
+        // Config already admits the table's byte extent in the u32 domain.
+        let encoder_capacity =
+            o3::depot::capacity::Count::new((self.qpack.qpack_encoder.maximum() / 32) as u32);
         let (fields, method) = outbound::Section::frame(
             target,
             kind,
@@ -307,11 +326,13 @@ impl<'d, P: rules::Policy, A: rules::Push> Connection<'d, P, A> {
                 return Err(error);
             }
         };
-        Ok(outbound::Pending::new(
+        Ok(outbound::Prepared::new(
             fields,
             &mut self.queues,
             qpack,
             outgoing,
+            &mut self.qpack.pending_encoder,
+            encoder_capacity,
         ))
     }
 
@@ -372,12 +393,10 @@ fn start_uni_stream<P: rules::Policy, A: rules::Push>(
         });
     }
     let prefix = output::WritePrefix::try_encode(&stream)?;
-    state.queues.enqueue(write::Entry::single(
-        WriteClass::Critical,
+    state.queues.enqueue(
         target,
-        prefix,
-        Boundary::More,
-    ))
+        write::Entry::single(WriteClass::Critical, prefix, Boundary::More),
+    )
 }
 
 fn frame_prefix(kind: varint::VarInt, length: varint::VarInt) -> output::WritePrefix {

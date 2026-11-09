@@ -15,7 +15,6 @@ use crate::{
 };
 
 pub(in crate::server) mod flush;
-pub(in crate::server) mod track;
 
 /// Exact output failure after rejected payload owners and receipts are released.
 #[derive(Debug)]

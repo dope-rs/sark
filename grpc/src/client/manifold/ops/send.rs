@@ -1,5 +1,3 @@
-use std::mem;
-
 use dope::{core::driver::route::Identity, manifold::client::conn};
 use o3::base::cell::region;
 use sark_h2::stream;
@@ -8,6 +6,7 @@ use crate::{
     client::{
         call::{self, bidi, request, response, unary},
         manifold::{channel, error, ops::cancels},
+        receive,
     },
     metadata,
 };
@@ -15,12 +14,6 @@ use crate::{
 pub(in crate::client::manifold) struct Sender<'a, 'd, ID: Identity> {
     source: channel::Access<'a, 'a, 'd, ID>,
     conn: conn::Id<'d, ID>,
-}
-
-#[derive(Clone, Copy, Eq, PartialEq)]
-pub(in crate::client::manifold) enum Outcome {
-    Sent,
-    Pending,
 }
 
 impl<'a, 'd, ID: Identity> Sender<'a, 'd, ID> {
@@ -63,13 +56,6 @@ impl<'a, 'd, ID: Identity> Sender<'a, 'd, ID> {
         result
     }
 
-    fn sent(&mut self, result: call::Admission<()>) -> Result<Outcome, error::Error> {
-        Ok(match self.admit(result)? {
-            Some(()) => Outcome::Sent,
-            None => Outcome::Pending,
-        })
-    }
-
     pub(in crate::client::manifold) fn try_unary<C: crate::Codec>(
         &mut self,
         path: &[u8],
@@ -80,10 +66,15 @@ impl<'a, 'd, ID: Identity> Sender<'a, 'd, ID> {
     ) -> Result<Option<cancels::Registered<unary::Handle<'d, stream::Key>>>, error::Error> {
         let conn = self.conn;
         let result = self.source.with(|state, done| -> Result<_, error::Error> {
-            Ok(state
-                .active_mut(conn)?
-                .session
-                .try_unary(path, host, metadata, codec, message, done))
+            let session = &mut state.active_mut(conn)?.session;
+            Ok(session
+                .state
+                .start_single::<receive::UnaryKey, _, _>(path, host, metadata, codec, message, done)
+                .map(|started| unary::Handle {
+                    brand: session.brand,
+                    stream: started.stream,
+                    completion: started.completion,
+                }))
         })?;
         let result = self.admit(result)?;
         Ok(result.map(|value| {
@@ -106,10 +97,17 @@ impl<'a, 'd, ID: Identity> Sender<'a, 'd, ID> {
     ) -> Result<Option<cancels::Registered<response::Stream<'d, stream::Key>>>, error::Error> {
         let conn = self.conn;
         let result = self.source.with(|state, done| -> Result<_, error::Error> {
-            Ok(state
-                .active_mut(conn)?
-                .session
-                .try_response(path, host, metadata, codec, message, done))
+            let session = &mut state.active_mut(conn)?.session;
+            Ok(session
+                .state
+                .start_single::<receive::StreamKey, _, _>(
+                    path, host, metadata, codec, message, done,
+                )
+                .map(|started| response::Stream {
+                    brand: session.brand,
+                    stream: started.stream,
+                    completion: started.completion,
+                }))
         })?;
         let result = self.admit(result)?;
         Ok(result.map(|value| {
@@ -171,15 +169,17 @@ impl<'a, 'd, ID: Identity> Sender<'a, 'd, ID> {
         stream: &mut request::Stream<'d, stream::Key>,
         codec: &mut C,
         message: &C::Encode,
-    ) -> Result<Outcome, error::Error> {
+    ) -> Result<Option<()>, error::Error> {
         let conn = self.conn;
         let result = self.source.with(|state, done| -> Result<_, error::Error> {
-            Ok(state
-                .active_mut(conn)?
-                .session
-                .try_request(stream, codec, message, done))
+            Ok(state.active_mut(conn)?.session.state.send(
+                stream.response.stream,
+                codec,
+                message,
+                done,
+            ))
         })?;
-        self.sent(result)
+        self.admit(result)
     }
 
     pub(in crate::client::manifold) fn end_request(
@@ -192,8 +192,9 @@ impl<'a, 'd, ID: Identity> Sender<'a, 'd, ID> {
                 state
                     .active_mut(conn)?
                     .session
-                    .finish_request(stream, done)
-                    .map_err(error::Error::from)
+                    .state
+                    .finish(stream.response.stream, done)?;
+                Ok(stream.response)
             })
         });
         self.wake();
@@ -205,15 +206,17 @@ impl<'a, 'd, ID: Identity> Sender<'a, 'd, ID> {
         stream: &mut bidi::Stream<'d, stream::Key>,
         codec: &mut C,
         message: &C::Encode,
-    ) -> Result<Outcome, error::Error> {
+    ) -> Result<Option<()>, error::Error> {
         let conn = self.conn;
         let result = self.source.with(|state, done| -> Result<_, error::Error> {
-            Ok(state
-                .active_mut(conn)?
-                .session
-                .try_bidi(stream, codec, message, done))
+            Ok(state.active_mut(conn)?.session.state.send(
+                stream.response.stream,
+                codec,
+                message,
+                done,
+            ))
         })?;
-        self.sent(result)
+        self.admit(result)
     }
 
     pub(in crate::client::manifold) fn finish_bidi(
@@ -226,8 +229,9 @@ impl<'a, 'd, ID: Identity> Sender<'a, 'd, ID> {
                 state
                     .active_mut(conn)?
                     .session
-                    .finish_bidi(stream, done)
-                    .map_err(error::Error::from)
+                    .state
+                    .finish(stream.response.stream, done)?;
+                Ok(stream.response)
             })
         });
         self.wake();
@@ -239,15 +243,16 @@ impl<'a, 'd, ID: Identity> Sender<'a, 'd, ID> {
         send: &mut bidi::Send<'d, stream::Key>,
         codec: &mut C,
         message: &C::Encode,
-    ) -> Result<Outcome, error::Error> {
+    ) -> Result<Option<()>, error::Error> {
         let conn = self.conn;
         let result = self.source.with(|state, done| -> Result<_, error::Error> {
             Ok(state
                 .active_mut(conn)?
                 .session
-                .try_send_half(send, codec, message, done))
+                .state
+                .send(send.stream, codec, message, done))
         })?;
-        self.sent(result)
+        self.admit(result)
     }
 
     pub(in crate::client::manifold) fn finish_half(
@@ -260,7 +265,8 @@ impl<'a, 'd, ID: Identity> Sender<'a, 'd, ID> {
                 state
                     .active_mut(conn)?
                     .session
-                    .finish_send(send, done)
+                    .state
+                    .finish(send.stream, done)
                     .map_err(error::Error::from)
             })
         });
@@ -269,5 +275,3 @@ impl<'a, 'd, ID: Identity> Sender<'a, 'd, ID> {
         Ok(())
     }
 }
-
-const _: () = assert!(mem::size_of::<Outcome>() == mem::size_of::<Option<()>>());

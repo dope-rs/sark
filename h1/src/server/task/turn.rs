@@ -58,22 +58,15 @@ pub enum Completion<R: Mode = evidence::Off> {
     Rejected,
 }
 
-impl<R: Mode> Completion<R> {
-    /// Converts response metadata recovered before publication into its exact
-    /// terminal task state.
-    pub fn reject(self) -> Self {
-        Self::Rejected
-    }
-}
-
 /// Whether this turn first observed a task becoming ready.
+#[derive(Clone, Copy)]
 #[repr(u8)]
 pub enum Readiness {
     Staged,
     NewlyReady,
 }
 
-/// One closed HTTP/1 task transition.
+/// One HTTP/1 task transition.
 #[must_use]
 pub enum Turn<R: Mode = evidence::Off> {
     Idle,
@@ -84,6 +77,9 @@ pub enum Turn<R: Mode = evidence::Off> {
     TransportCancelled,
     ConnectionCancelled,
     StagedCancelled,
+    Streaming {
+        ready: Readiness,
+    },
     Response {
         ready: Readiness,
         owner: output::Owner,
@@ -142,26 +138,37 @@ impl<R: Mode> Turn<R> {
                 Self::audit(mode, id, 0);
                 id.retire(mode, life::Outcome::Cancelled);
             }
+            Self::Streaming { ready } => {
+                Self::ready(mode, id, ready, 1);
+                sequence::Mode::commit(mode, session, id, 0, hold::Charge::default());
+                sequence::Mode::accept(mode, session, id, hold::Charge::default());
+            }
             Self::Response {
                 ready,
                 owner,
                 linked,
             } => {
-                Self::ready(mode, id, ready);
+                Self::ready(mode, id, ready, 0);
                 let charge = owner.charge;
-                if let Some(trace) = sequence::Mode::trace_mut(mode) {
-                    let linked = R::charge(linked);
-                    sequence::Trace::commit_link(trace, session, id, owner.len, charge, linked);
-                    sequence::Trace::accept(trace, session, id, charge);
+                if M::ENABLED {
+                    sequence::Mode::commit_link(
+                        mode,
+                        session,
+                        id,
+                        owner.len,
+                        charge,
+                        R::charge(linked),
+                    );
                 }
+                sequence::Mode::accept(mode, session, id, charge);
                 id.retire(mode, life::Outcome::Completed);
             }
             Self::Completed { ready } => {
-                Self::ready(mode, id, ready);
+                Self::ready(mode, id, ready, 0);
                 id.retire(mode, life::Outcome::Completed);
             }
             Self::Rejected { ready } => {
-                Self::ready(mode, id, ready);
+                Self::ready(mode, id, ready, 0);
                 id.retire(mode, life::Outcome::Rejected);
             }
         }
@@ -171,12 +178,16 @@ impl<R: Mode> Turn<R> {
         mode: &mut M,
         id: exchange::Id<C, u64>,
         ready: Readiness,
+        slots: usize,
     ) {
         match ready {
-            Readiness::Staged => Self::audit(mode, id, 0),
+            Readiness::Staged => Self::audit(mode, id, slots),
             Readiness::NewlyReady => {
                 if let Some(out) = life::Mode::observer(mode) {
                     life::Observer::observe(out, life::Event::TaskPollReady(id));
+                }
+                if slots != 0 {
+                    Self::audit(mode, id, slots);
                 }
             }
         }

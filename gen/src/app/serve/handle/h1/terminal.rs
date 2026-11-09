@@ -10,11 +10,9 @@ pub(super) fn routes(
 ) -> TokenStream {
     let f_life = local("lifecycle");
     let [v_cause, v_conn, v_error] = generics.locals(["cause", "conn", "error"]);
-    let [v_obs, v_wait, v_this] = generics.locals(["observer", "pending", "this"]);
+    let [v_wait, v_this] = generics.locals(["pending", "this"]);
     let [v_link, v_exch] = generics.locals(["connection", "exchange"]);
-    let g_id = generics.ident("__ID");
     let ns_core = &paths.core;
-    let ns_fiber = &paths.fiber;
     let ns_h1 = &paths.h1;
     let ns_http = &paths.http;
     let open = open(paths, generics);
@@ -23,27 +21,24 @@ pub(super) fn routes(
             self: ::core::pin::Pin<&mut Self>,
             #v_cause: &#ns_h1::wire::Failure,
         ) -> #ns_http::payload::fixed::Body<'d> {
-            let #v_this = self.project();
-            if let ::core::option::Option::Some(#v_obs) =
-                #ns_core::life::Mode::observer(#v_this.#f_life)
-            {
-                #ns_core::life::Observer::diagnostic(#v_obs, #v_cause);
-            }
+            let #v_this = self.get_mut().app.as_mut().project();
+            #ns_core::life::Mode::diagnostic(#v_this.#f_life, #v_cause);
             #v_cause.body()
         }
 
         fn reject_line(
             mut self: ::core::pin::Pin<&mut Self>,
-            #v_link: #ns_fiber::dope::manifold::network::listener::conn::Id<'d, #g_id>,
             _: #ns_h1::session::Permit,
             #v_conn: &mut #conn,
             #v_error: #ns_h1::wire::parsing::LineError<'d>,
         ) -> #ns_http::payload::fixed::Body<'d> {
-            let #v_this = self.as_mut().project();
+            let #v_this = self.as_mut().get_mut();
+            let #v_link = #v_this.id;
+            let #v_this = #v_this.app.as_mut().project();
             #open
             #ns_core::life::sequence::Mode::reject(#v_this.#f_life, #v_exch);
             #v_error.response(|#v_cause| {
-                #ns_h1::server::conn::router::Routes::failure(self, #v_cause)
+                #ns_h1::session::Dispatch::failure(self, #v_cause)
             })
         }
 
@@ -53,10 +48,10 @@ pub(super) fn routes(
             #v_error: #ns_h1::wire::Failure,
         ) -> #ns_http::payload::fixed::Body<'d> {
             if let ::core::option::Option::Some(#v_wait) = #v_conn.ingress.take_pending() {
-                self.as_mut().__cancel_pending(#v_wait);
+                self.as_mut().get_mut().app.as_mut().__cancel_pending(#v_wait);
             }
             #v_conn.ingress.finish_frame();
-            #ns_h1::server::conn::router::Routes::failure(self, &#v_error)
+            #ns_h1::session::Dispatch::failure(self, &#v_error)
         }
     }
 }

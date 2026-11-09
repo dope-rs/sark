@@ -37,11 +37,7 @@ fn fixed_connections() {
             let outcome = output::Egress::new(&mut write, DATE, response)
                 .plain(fixed::Direct::new(Code::OK, (), replies::BYTES), connection);
             let (written, len) = match outcome {
-                output::Outcome::SendCopied {
-                    written,
-                    body_bytes: len,
-                    ..
-                } => Some((written, len)),
+                output::Outcome::SendCopied { written, copy, .. } => Some((written, copy.written)),
                 _ => None,
             }
             .expect("fixed response");
@@ -97,11 +93,7 @@ fn cached_connections() {
             policy,
         );
         let (written, len) = match outcome {
-            output::Outcome::SendCopied {
-                written,
-                body_bytes: len,
-                ..
-            } => Some((written, len)),
+            output::Outcome::SendCopied { written, copy, .. } => Some((written, copy.written)),
             _ => None,
         }
         .expect("cached response");

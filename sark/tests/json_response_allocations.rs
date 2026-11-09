@@ -1,7 +1,7 @@
 pub mod common;
 use std::{cell::Cell, mem};
 
-use common::response::*;
+use common::response::{__SarkHandlerBorrowedX626F72726F776564 as Borrowed, *};
 use dope_test::alloc::Tracker;
 use sark::http::{
     field::{self, Value},
@@ -97,7 +97,10 @@ fn writes_unsigned_no_alloc() {
 #[test]
 fn visits_length_once() {
     let visits = Cell::new(0);
-    let response = CountedReply {
+    let response: <Borrowed as sark::core::manifold::Route<Cell<&Cell<usize>>>>::Response<
+        'static,
+        'static,
+    > = CountedReply {
         status: Code::OK,
         body: Counted(&visits),
     }

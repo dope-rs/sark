@@ -1,9 +1,4 @@
-use std::{fmt, num::NonZero};
-
-use sark_http::{
-    payload::{owned, response::dispatch},
-    request::Id,
-};
+use sark_http::{payload::response::dispatch, request::Id};
 
 use crate::{
     body::{
@@ -31,35 +26,15 @@ pub mod table;
 use field::{header, query};
 
 /// Fiber-free, cooperatively stepped construction of an owned request.
-pub trait TaskBuild<'d>: Sized {
+pub trait TaskBuild<'d>: body::Build<'d, Output = Built<'d, Self::Task>> {
     type Task;
-    type StepError: fmt::Debug;
 
     fn reject(error: Self::StepError) -> Reject;
-
-    /// Commits the accepted logical body length and closes the input stream.
-    fn finish_body(self, len: usize) -> Self;
-
-    /// Consumes one construction state and returns its exact successor.
-    fn step(
-        self,
-        budget: NonZero<usize>,
-    ) -> body::Step<Self, Built<'d, Self::Task>, Self::StepError>;
 }
 
 /// Capability to transfer retained body ownership into a task builder.
-pub trait Push<'d>: TaskBuild<'d> {
-    type Error;
-
-    /// Borrows the exact local failure without consuming retained input.
-    fn observe<C: Copy, S: Copy, O: crate::life::Observer<C, S>>(
-        error: &Self::Error,
-        observer: &mut O,
-    );
-
+pub trait Push<'d>: TaskBuild<'d> + body::Push<'d> {
     fn reject_push(error: Self::Error) -> Reject;
-
-    fn push_body(self, segment: owned::Segment<'d>) -> body::Transfer<Self, Self::Error>;
 }
 
 /// A completed owned request paired with its ingress identity.
@@ -220,5 +195,5 @@ pub trait Spec {
 
 /// A route whose task retains its response until driver-local completion.
 pub trait Task<'d, S>: Spec {
-    type Output: dispatch::IntoOutput<'d, 'd, Output: dispatch::Complete<'d, 'd>>;
+    type Output: dispatch::IntoOutput<'d, 'd>;
 }

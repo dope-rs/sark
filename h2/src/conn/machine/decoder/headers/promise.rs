@@ -113,6 +113,7 @@ impl Promise {
             peer.initial_window_size,
             local.initial_window_size,
             0,
+            false,
         );
         opening.commit();
         prepared.promise(id, key);

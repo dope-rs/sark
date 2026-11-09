@@ -11,7 +11,7 @@ use crate::payload::{
     compress::inflate::{
         Checked, DecodeError, Error, Failure, Part, Plan,
         checked::STEP,
-        input::{Chunk, Input, Step},
+        input::{Chunk, Step},
     },
     crc32::Hasher,
 };
@@ -50,7 +50,7 @@ impl Gzip {
         I: Iterator<Item = &'a [u8]>,
     {
         let plan = self.try_plan(segments, 0)?;
-        self.decode_exact(plan.input, output)
+        self.decode_exact(plan, output)
     }
 
     pub fn decode_plan<'a, I: Iterator<Item = &'a [u8]>>(
@@ -67,12 +67,12 @@ impl Gzip {
                 0,
             ));
         }
-        self.decode_exact(plan.input, output)
+        self.decode_exact(plan, output)
     }
 
     fn decode_exact<'a, I>(
         &mut self,
-        input: Input<'a, I>,
+        plan: Plan<'a, I>,
         mut output: write::Spare<'_>,
     ) -> Result<(), Failure>
     where
@@ -80,7 +80,7 @@ impl Gzip {
     {
         let written = self
             .decode_input::<false, _, _, Failure, Infallible, _>(
-                input,
+                plan,
                 &mut output.as_mut_slice(),
                 |output, _| {
                     let capacity = output.len();
@@ -111,7 +111,7 @@ impl Gzip {
 
     fn decode_input<'a, const CHECK: bool, I, B, D, E, F>(
         &mut self,
-        input: Input<'a, I>,
+        plan: Plan<'a, I>,
         output: &mut B,
         mut grow: impl FnMut(&mut B, &mut F) -> Result<(), Checked<D, E>>,
         check: &mut F,
@@ -122,7 +122,8 @@ impl Gzip {
         D: From<Failure>,
         F: FnMut() -> Result<(), E>,
     {
-        let (mut segments, mut input) = input.into_parts();
+        let mut segments = plan.segments;
+        let mut input = plan.input;
         let mut written = 0;
         let mut start = 0;
         loop {
@@ -234,7 +235,7 @@ impl Gzip {
         plan: Plan<'a, I>,
         limit: usize,
         budget: &resident::Budget<'d>,
-    ) -> Result<Owned<resident::Lease<'d>>, DecodeError> {
+    ) -> Result<Owned<resident::Budget<'d>>, DecodeError> {
         let plan = plan.try_limit(limit)?;
         self.owned::<false, _, Infallible>(plan, limit, budget, &mut || Ok(()))
             .map_err(Checked::into_work)
@@ -249,7 +250,7 @@ impl Gzip {
         limit: usize,
         budget: &resident::Budget<'d>,
         mut check: impl FnMut() -> Result<(), E>,
-    ) -> Result<Owned<resident::Lease<'d>>, Checked<DecodeError, E>> {
+    ) -> Result<Owned<resident::Budget<'d>>, Checked<DecodeError, E>> {
         let plan = plan.try_limit(limit).map_err(Checked::Work)?;
         check().map_err(Checked::Check)?;
         self.owned::<true, _, E>(plan, limit, budget, &mut check)
@@ -261,7 +262,7 @@ impl Gzip {
         limit: usize,
         budget: &resident::Budget<'d>,
         check: &mut impl FnMut() -> Result<(), E>,
-    ) -> Result<Owned<resident::Lease<'d>>, Checked<DecodeError, E>> {
+    ) -> Result<Owned<resident::Budget<'d>>, Checked<DecodeError, E>> {
         let free = budget.available();
         let seed = plan.size_hint.min(STEP);
         let mut output = Owned::try_allocate(budget, seed).map_err(|cause| {
@@ -273,7 +274,7 @@ impl Gzip {
         })?;
         fill::<CHECK, E>(&mut output, check).map_err(Checked::Check)?;
         let written = self.decode_input::<CHECK, _, _, DecodeError, E, _>(
-            plan.input,
+            plan,
             &mut output,
             |output, check| {
                 let current = output.len();
@@ -314,7 +315,7 @@ impl Gzip {
 }
 
 fn fill<const CHECK: bool, E>(
-    output: &mut Owned<resident::Lease<'_>>,
+    output: &mut Owned<resident::Budget<'_>>,
     check: &mut impl FnMut() -> Result<(), E>,
 ) -> Result<(), E> {
     static ZERO: [u8; STEP] = [0; STEP];

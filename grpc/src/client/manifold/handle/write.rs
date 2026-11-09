@@ -4,7 +4,7 @@ use dope::core::driver::{route::Identity, schedule::ready::wake::queue};
 use dope_fiber::{abi, context};
 use o3::{base::cell::region, depot::queue::resident::Fixed};
 
-use crate::client::manifold::{error, handle, ops::send::Outcome};
+use crate::client::manifold::{error, handle};
 
 pub(super) struct Write<'app, 'life, 'e, 'd: 'app, P: ?Sized + 'app, ID: Identity> {
     scope: Option<handle::Scope<'app, 'life, 'e, 'd, P, ID>>,
@@ -30,7 +30,7 @@ impl<'app, 'life, 'e, 'd: 'app, P: ?Sized + 'app, ID: Identity> Write<'app, 'lif
             &mut region::Token<region::Identity<'d, 1>>,
             handle::Scope<'app, 'life, 'e, 'd, P, ID>,
             &mut S,
-        ) -> Result<Outcome, error::Error>
+        ) -> Result<Option<()>, error::Error>
         + 'a,
     ) -> impl abi::Fiber<'d, Output = Result<(), error::Error>> + 'a
     where
@@ -53,10 +53,7 @@ impl<'app, 'life, 'e, 'd: 'app, P: ?Sized + 'app, ID: Identity> Write<'app, 'lif
                 let result = match stream.as_mut() {
                     Some(stream) => {
                         handle::poll_sender(owner.port, &wake, &mut sender.slot, || {
-                            Ok(match write(token, owner, stream)? {
-                                Outcome::Sent => Some(()),
-                                Outcome::Pending => None,
-                            })
+                            write(token, owner, stream)
                         })
                     }
                     None => task::Poll::Ready(Err(consumed())),

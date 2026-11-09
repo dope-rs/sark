@@ -1,7 +1,5 @@
 use sark_core::duplex;
 
-use crate::manifold::requests::entries::status;
-
 pub(super) mod input;
 pub(in crate::manifold) mod work;
 
@@ -15,7 +13,6 @@ pub(in crate::manifold) enum Response {
 pub(super) struct State<'d, D: duplex::Session<'d>> {
     pub(super) input: input::Input<'d, D>,
     pub(super) response: Response,
-    pub(super) queue: status::Queue,
 }
 
 #[derive(Clone, Copy)]

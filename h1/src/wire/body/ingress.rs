@@ -33,7 +33,7 @@ pub enum Error {
         error: rc::Error,
     },
     Resident {
-        index: usize,
+        index: u32,
         current: usize,
         added: usize,
     },

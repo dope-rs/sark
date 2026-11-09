@@ -22,8 +22,12 @@ impl<'d> Chunk<'d> {
         }
     }
 
-    pub const fn owner(&self) -> &resident::Shared<'d> {
+    pub fn owner(&self) -> &resident::Shared<'d> {
         self.0.as_ref()
+    }
+
+    pub fn into_owner(self) -> resident::Shared<'d> {
+        self.0.into_inner()
     }
 }
 
@@ -36,6 +40,14 @@ impl<'d> Empty<'d> {
 impl buffer::Residency for Chunk<'_> {
     fn resident(&self) -> usize {
         self.0.resident()
+    }
+}
+
+impl<'d, E> TryFrom<Result<Chunk<'d>, E>> for Chunk<'d> {
+    type Error = E;
+
+    fn try_from(item: Result<Self, E>) -> Result<Self, E> {
+        item
     }
 }
 

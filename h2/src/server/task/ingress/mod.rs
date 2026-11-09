@@ -16,7 +16,7 @@ use sark_core::{
     },
     decode::{request, state},
 };
-use variant::{Borrowed, Projection, Variant};
+use variant::Variant;
 
 use crate::{
     server::{
@@ -42,13 +42,13 @@ pub(in crate::server::task) use states::{Buffered, Receiving};
 
 pub(super) struct Routes<'a, 'd, P: request::Prepared, F: state::Family<P>, B: body::Build<'d>> {
     entries: &'a direct::Table<stream::Key, Entry<'d, P, F, B>>,
-    selected: keyed::Entry<'a, stream::Key, entry::Admission>,
+    selected: (stream::Key, &'a keyed::Link<stream::Key, entry::Admission>),
     queue: &'a mut keyed::Fifo<stream::Key, entry::Admission>,
 }
 
 pub(super) struct Streams<'a, 'd, P: request::Prepared, F: state::Family<P>, B: body::Build<'d>> {
     entries: &'a direct::Table<stream::Key, Entry<'d, P, F, B>>,
-    selected: keyed::Entry<'a, stream::Key, entry::Build>,
+    selected: (stream::Key, &'a keyed::Link<stream::Key, entry::Build>),
     queue: &'a mut keyed::Fifo<stream::Key, entry::Build>,
 }
 
@@ -63,10 +63,7 @@ impl<'d, P: request::Prepared, F: state::Family<P>, B: body::Build<'d>> Routes<'
         let link = keyed::Link::from(Index::from(key));
         let owner = Routes {
             entries: vacant.table(),
-            selected: keyed::Entry::from_source(Borrowed {
-                slot: &vacant,
-                link: &link,
-            }),
+            selected: (key, &link),
             queue,
         };
         // SAFETY: the new link is vacant; this exclusive admission root owns its neighbors.
@@ -82,10 +79,7 @@ impl<'d, P: request::Prepared, F: state::Family<P>, B: body::Build<'d>> Routes<'
     ) {
         let owner = Routes {
             entries: vacant.table(),
-            selected: keyed::Entry::from_source(Borrowed {
-                slot: &vacant,
-                link,
-            }),
+            selected: (vacant.key(), link),
             queue,
         };
         // SAFETY: every routed state is an admission member until this consuming removal.
@@ -103,7 +97,7 @@ impl<'a, 'd, P: request::Prepared, F: state::Family<P>, B: body::Build<'d>>
     ) -> Result<keyed::Slot<Self, entry::Build>, keyed::Slot<Self, entry::Build, false>> {
         let owner = Self {
             entries: vacant.table(),
-            selected: keyed::Entry::from_source(Borrowed { slot: vacant, link }),
+            selected: (vacant.key(), link),
             queue,
         };
         keyed::Slot::try_new(owner)
@@ -121,17 +115,14 @@ impl<'a, 'd, P: request::Prepared, F: state::Family<P>, B: body::Build<'d>>
         if let Schedule::Ready = schedule {
             let owner = Streams {
                 entries: vacant.table(),
-                selected: keyed::Entry::from_source(Borrowed {
-                    slot: &vacant,
-                    link: &link,
-                }),
+                selected: (key, &link),
                 queue,
             };
             // SAFETY: the new stream link is vacant in this original build root.
             unsafe { keyed::Slot::<_, _, false>::from_source(depot::raw::Proof::new(owner)) }
                 .push::<false>();
         }
-        vacant.occupy(Entry::Streaming { body, link })
+        vacant.insert(Entry::Streaming { body, link })
     }
 }
 
@@ -152,16 +143,16 @@ unsafe impl<'d, P: request::Prepared, F: state::Family<P>, B: body::Build<'d>>
     type Key = stream::Key;
     type Fifo = keyed::Fifo<stream::Key, entry::Admission>;
     fn parts(&self) -> (stream::Key, &keyed::Link<stream::Key, entry::Admission>) {
-        depot::raw::KeyBorrow::parts(self.selected)
+        self.selected
     }
     fn fifo(&self) -> &keyed::Fifo<stream::Key, entry::Admission> {
         self.queue
     }
-    fn entry<'a>(
-        live: depot::raw::Proof<(&'a Self, links::Index), Initialized<entry::Admission>>,
-    ) -> keyed::Entry<'a, stream::Key, entry::Admission> {
+    fn link(
+        live: depot::raw::Proof<(&Self, links::Index), Initialized<entry::Admission>>,
+    ) -> &keyed::Link<stream::Key, entry::Admission> {
         let live = unsafe { live.map(|(owner, index)| (owner.entries, index)) };
-        keyed::Entry::from_source(Projection(direct::Table::project(live)))
+        Variant::<exchange::Routed<'d, P, F>, entry::Admission>::link(direct::Table::project(live))
     }
 }
 
@@ -172,16 +163,16 @@ unsafe impl<'d, P: request::Prepared, F: state::Family<P>, B: body::Build<'d>>
     type Key = stream::Key;
     type Fifo = keyed::Fifo<stream::Key, entry::Build>;
     fn parts(&self) -> (stream::Key, &keyed::Link<stream::Key, entry::Build>) {
-        depot::raw::KeyBorrow::parts(self.selected)
+        self.selected
     }
     fn fifo(&self) -> &keyed::Fifo<stream::Key, entry::Build> {
         self.queue
     }
-    fn entry<'a>(
-        live: depot::raw::Proof<(&'a Self, links::Index), Initialized<entry::Build>>,
-    ) -> keyed::Entry<'a, stream::Key, entry::Build> {
+    fn link(
+        live: depot::raw::Proof<(&Self, links::Index), Initialized<entry::Build>>,
+    ) -> &keyed::Link<stream::Key, entry::Build> {
         let live = unsafe { live.map(|(owner, index)| (owner.entries, index)) };
-        keyed::Entry::from_source(Projection(direct::Table::project(live)))
+        Variant::<Stream<'d, B>, entry::Build>::link(direct::Table::project(live))
     }
 }
 
@@ -333,19 +324,16 @@ unsafe impl<'d, P: request::Prepared, F: state::Family<P>, B: body::Build<'d>, Q
     type Key = stream::Key;
     type Fifo = keyed::Fifo<stream::Key, entry::Build>;
     fn parts(&self) -> (stream::Key, &keyed::Link<stream::Key, entry::Build>) {
-        depot::raw::KeyBorrow::parts(Borrowed {
-            slot: &self.vacant,
-            link: &self.link,
-        })
+        (self.vacant.key(), &self.link)
     }
     fn fifo(&self) -> &keyed::Fifo<stream::Key, entry::Build> {
         self.queue
     }
-    fn entry<'a>(
-        live: depot::raw::Proof<(&'a Self, links::Index), Initialized<entry::Build>>,
-    ) -> keyed::Entry<'a, stream::Key, entry::Build> {
+    fn link(
+        live: depot::raw::Proof<(&Self, links::Index), Initialized<entry::Build>>,
+    ) -> &keyed::Link<stream::Key, entry::Build> {
         let live = unsafe { live.map(|(owner, index)| (owner.vacant.table(), index)) };
-        keyed::Entry::from_source(Projection(direct::Table::project(live)))
+        Variant::<Stream<'d, B>, entry::Build>::link(direct::Table::project(live))
     }
 }
 

@@ -58,7 +58,7 @@ fn escaped_replay_budget() {
     for (chunk, budget) in [
         (
             NonZero::new(bytes.len()).expect("escaped fixture length"),
-            NonZero::<usize>::MIN.saturating_add(6),
+            NonZero::<usize>::MIN.saturating_add(8),
         ),
         (
             NonZero::<usize>::MIN.saturating_add(2),

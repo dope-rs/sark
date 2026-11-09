@@ -22,6 +22,7 @@ pub use runtime::Runtime;
 pub use vacant::Vacant;
 
 use crate::manifold;
+use drive::TurnOutcome;
 
 const LANES: usize = 7;
 const CONTROL_READY: Index<LANES> = Index::at::<0>();
@@ -96,7 +97,7 @@ pub enum Turn<B> {
     Idle,
 }
 
-/// The statically selected kind of the next stream quantum.
+/// The statically selected kind of a stream quantum.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum WorkClass {
     Control,
@@ -128,53 +129,53 @@ impl WorkClass {
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub struct ControlTurn<B> {
     step: Step<B>,
-    activity: Activity,
+    activity: WorkClass,
 }
 
 impl<B> ControlTurn<B> {
     pub const fn progress(next: WorkClass) -> Self {
         Self {
             step: Step::Progress(next),
-            activity: Activity::Control,
+            activity: WorkClass::Control,
         }
     }
 
     pub const fn blocked(block: B) -> Self {
         Self {
             step: Step::Blocked(block),
-            activity: Activity::Control,
+            activity: WorkClass::Control,
         }
     }
 
     pub const fn complete() -> Self {
         Self {
             step: Step::Complete,
-            activity: Activity::Control,
+            activity: WorkClass::Control,
         }
     }
 
     pub const fn idle() -> Self {
         Self {
             step: Step::Idle,
-            activity: Activity::Control,
+            activity: WorkClass::Control,
         }
     }
 
-    fn into_parts(self) -> (Step<B>, Activity) {
+    fn into_parts(self) -> (Step<B>, WorkClass) {
         (self.step, self.activity)
     }
 }
 
 impl<B: Copy> ControlTurn<B> {
     pub const fn new(egress: Turn<B>, next: WorkClass) -> Self {
-        Self::from_turn(egress, next, Activity::Control)
+        Self::from_turn(egress, next, WorkClass::Control)
     }
 
     pub const fn fused(egress: Turn<B>, next: WorkClass) -> Self {
-        Self::from_turn(egress, next, Activity::Data)
+        Self::from_turn(egress, next, WorkClass::Data)
     }
 
-    const fn from_turn(egress: Turn<B>, next: WorkClass, activity: Activity) -> Self {
+    const fn from_turn(egress: Turn<B>, next: WorkClass, activity: WorkClass) -> Self {
         Self {
             step: DataTurn::new(egress, next),
             activity,
@@ -198,21 +199,6 @@ impl<B: Copy> DataTurn<B> {
             Turn::Progress => Self::Progress(next),
             Turn::Blocked(block) => Self::Blocked(block),
             Turn::Idle => Self::Idle,
-        }
-    }
-}
-
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum Activity {
-    Control,
-    Data,
-}
-
-impl Activity {
-    const fn class(self) -> WorkClass {
-        match self {
-            Self::Control => WorkClass::Control,
-            Self::Data => WorkClass::Data,
         }
     }
 }
@@ -288,34 +274,26 @@ pub trait Settle<T> {
     ) -> Settlement<T>;
 }
 
-type Outcome<K> = (drive::TurnOutcome<K>, drive::Effect);
-
 #[repr(transparent)]
 pub struct Decision<'id, K> {
-    outcome: Outcome<K>,
-    _scope: marker::PhantomData<region::Proof<region::Identity<'id>>>,
+    outcome: TurnOutcome<K>,
+    _scope: marker::PhantomData<region::Identity<'id>>,
 }
 
 impl<'id, K> Decision<'id, K> {
-    fn bind(outcome: Outcome<K>, _scope: region::Proof<region::Identity<'id>>) -> Self {
+    fn bind(outcome: TurnOutcome<K>, _scope: region::Identity<'id>) -> Self {
         Self {
             outcome,
             _scope: marker::PhantomData,
         }
     }
 
-    const fn running(stream: K, activity: Activity) -> Outcome<K> {
-        (
-            drive::TurnOutcome::new(stream, activity),
-            drive::Effect::None,
-        )
+    const fn running(stream: K, activity: WorkClass) -> TurnOutcome<K> {
+        TurnOutcome::new(stream, activity, drive::Effect::None)
     }
 
-    const fn blocked(stream: K, activity: Activity) -> Outcome<K> {
-        (
-            drive::TurnOutcome::new(stream, activity),
-            drive::Effect::BlockData,
-        )
+    const fn blocked(stream: K, activity: WorkClass) -> TurnOutcome<K> {
+        TurnOutcome::new(stream, activity, drive::Effect::BlockData)
     }
 }
 
@@ -329,7 +307,7 @@ pub trait Driver<T>: Settle<T> {
     fn control<'id>(
         &mut self,
         permit: Self::Permit,
-        entry: Occupied<'_, Self::Key, T, Self::Block, region::Proof<region::Identity<'id>>>,
+        entry: Occupied<'_, Self::Key, T, Self::Block, region::Identity<'id>>,
     ) -> Decision<'id, Self::Key>;
 
     fn data(

@@ -179,10 +179,10 @@ impl Target {
         Ok(Self {
             path: Operation::Path.check(path_at, path_len)?,
             query: match scan.query() {
-                path::At::Query(index) => Part::Present(
-                    Operation::Query.check(path_at + index + 1, scan.end() - index - 1)?,
+                Some(start) => Part::Present(
+                    Operation::Query.check(path_at + start.get(), scan.end() - start.get())?,
                 ),
-                path::At::Path => Part::Missing,
+                None => Part::Missing,
             },
             authority: auth,
             form: Form::Absolute,
@@ -417,10 +417,10 @@ fn origin(scan: path::Plan, base: usize) -> Result<Target, Error> {
     Ok(Target {
         path: Operation::Path.check(base, path_end)?,
         query: match scan.query() {
-            path::At::Query(index) => {
-                Part::Present(Operation::Query.check(base + index + 1, scan.end() - index - 1)?)
+            Some(start) => {
+                Part::Present(Operation::Query.check(base + start.get(), scan.end() - start.get())?)
             }
-            path::At::Path => Part::Missing,
+            None => Part::Missing,
         },
         authority: Part::Missing,
         form: Form::Origin,

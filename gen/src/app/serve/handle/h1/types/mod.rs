@@ -15,12 +15,17 @@ pub(super) struct Names<'a> {
     pub(super) state_ty: &'a syn::Type,
     pub(super) name: &'a syn::Ident,
     pub(super) core_ident: &'a syn::Ident,
+    pub(super) dispatch_ident: syn::Ident,
 }
 
 pub(super) struct Generics {
     pub(super) bounds: proc_macro2::TokenStream,
     pub(super) application_params: proc_macro2::TokenStream,
     pub(super) application_generic_use: proc_macro2::TokenStream,
+    pub(super) core_params: proc_macro2::TokenStream,
+    pub(super) core_generic_use: proc_macro2::TokenStream,
+    pub(super) mixed_application_params: proc_macro2::TokenStream,
+    pub(super) mixed_application_generic_use: proc_macro2::TokenStream,
 }
 
 impl Generics {
@@ -35,11 +40,12 @@ impl Generics {
             .spec
             .state_generics
             .lives(["env", "brand", "clock"]);
-        let [g_id, g_mode, g_wire] = context
+        let [g_id, g_mode, g_wire, g_h2a, g_h2f] = context
             .plan
             .spec
             .state_generics
-            .idents(["__ID", "__M", "__W"]);
+            .idents(["__ID", "__M", "__W", "__H2A", "__H2F"]);
+        let core = &context.core_ident;
         let ns_core = &paths.core;
         let ns_fiber = &paths.fiber;
         let ns_h1 = &paths.h1;
@@ -57,46 +63,78 @@ impl Generics {
                 TransportTag: 'd,
             >,
         };
-        let (futures, makers) = context.exec.producers();
-        let app = quote! {
+        let params = |clock: bool| {
+            let clock = clock.then_some(&g_clock);
+            let clock = clock.as_slice();
+            let (futures, makers) = context.exec.producers();
+            quote! {
                 #g_brand: #l_env,
                 #l_env,
                 #( #lives: #l_env, )*
-                #g_clock,
-                'd: #l_env + #g_clock,
+                #( #clock, )*
+                'd: #l_env #( + #clock )*,
                 #( #decls, )*
                 #g_id: #ns_fiber::Identity,
                 #g_wire: #ns_fiber::dope::net::link::pool::recv::input::Execution + 'd,
                 #g_mode,
                 #( #futures, )*
                 #( #makers, )*
+            }
         };
+        let app = params(true);
         let duplex = plan.duplex.state();
+        let upgrade = context.plan.entries.iter().any(|route| route.entry.upgrade);
         let stamp = duplex.stamp(
             quote!(&#g_clock #ns_h1::server::date::Clock),
             duplex.retention(paths),
+            upgrade.then(|| quote!(::std::vec::Vec<::core::primitive::u8>)),
         );
         let (futures, makers) = context.exec.producers();
-        let app_use = quote! {
-            <
-                #g_brand,
-                #l_env,
-                #( #lives, )*
-                'd,
-                #( #values, )*
-                #g_id,
-                #g_wire,
-                #ns_fiber::manifold::runtime::Direct,
-                #g_mode,
-                #stamp,
-                #( #futures, )*
-                #( #makers, )*
-            >
+        let core_use = quote! {
+                <
+                    #g_brand,
+                    #l_env,
+                    #( #lives, )*
+                    'd,
+                    #( #values, )*
+                    #g_id,
+                    #g_wire,
+                    #ns_fiber::manifold::runtime::Direct,
+                    #g_mode,
+                    #( #futures, )*
+                    #( #makers, )*
+                >
         };
+        let app_use = |stamp| quote!(<#core #core_use, #stamp>);
+        let (mixed_application_params, mixed_application_generic_use) = plan
+            .cleartext
+            .map(|ns_h2| {
+                let stamp = match duplex {
+                    duplex::State::Enabled => stamp.clone(),
+                    duplex::State::Disabled => {
+                        quote!((#stamp, #ns_fiber::dope::manifold::app::receive::limits::Budget))
+                    }
+                };
+                let payload = handle::h1_payload(paths, quote!(()));
+                let h2 = quote! {
+                    #ns_h2::server::runtime::app::App<
+                        'd, #g_h2a, #g_wire, #g_h2f, #payload,
+                    >
+                };
+                (
+                    quote!(#app #g_h2a: #ns_core::manifold::server::app::Spec, #g_h2f,),
+                    app_use(quote!((#stamp, #h2))),
+                )
+            })
+            .unwrap_or_default();
         Self {
             bounds,
             application_params: app,
-            application_generic_use: app_use,
+            application_generic_use: app_use(stamp),
+            core_params: params(false),
+            core_generic_use: core_use,
+            mixed_application_params,
+            mixed_application_generic_use,
         }
     }
 }
@@ -116,7 +154,6 @@ impl<'a> Routing<'a> {
         ctx: &handle::Context<'view, 'source, 'spec>,
         plan: &handle::H1Plan<'source, 'spec>,
         dispatch: &'a dispatch::Dispatch,
-        generics: &Generics,
     ) -> Self {
         let symbols = &ctx.plan.spec.state_generics;
         let [n_method, n_raw] = symbols.locals(["__method", "__raw"]);
@@ -136,15 +173,18 @@ impl<'a> Routing<'a> {
 
         let spec = ctx.plan.spec;
         let routes = &spec.route_specs;
-        let core = &ctx.core_ident;
-        let args = &generics.application_generic_use;
-        let bound = match plan.duplex.state() {
-            duplex::State::Enabled => quote!(#ns_http::o3::buffer::resident::bound::Unbounded),
-            duplex::State::Disabled => {
-                quote!(<#core #args as #ns_core::decode::Decode>::Egress<'d>)
-            }
-        };
-        let task = &ctx.exec.task.identity;
+        let bound =
+            if plan.cleartext.is_some() || matches!(plan.duplex.state(), duplex::State::Enabled) {
+                quote!(#ns_http::o3::buffer::resident::bound::Unbounded)
+            } else {
+                handle::decode::egress(
+                    paths,
+                    spec,
+                    &ctx.plan.entries,
+                    &syn::Lifetime::new("'d", proc_macro2::Span::call_site()),
+                )
+            };
+        let task = &ctx.exec.identity;
         let runtime = quote! {
             #ns_h1::server::task::runtime::Runtime<
                 'd,
@@ -160,7 +200,6 @@ impl<'a> Routing<'a> {
         };
         let rejected = terminal::rejected(paths, &ctx.plan.spec.state_generics);
         let build = |owned: bool| {
-            let project = owned.then(|| quote!(let mut #v_this = self.as_mut().project();));
             let (source, start, input, target) = match owned {
                 false => (
                     route::Source::Borrowed,
@@ -179,7 +218,7 @@ impl<'a> Routing<'a> {
                 |index, params| route::emit(paths, ctx, plan, index, params, &runtime, source);
             let reject = quote! {{
                 let #v_result = #start(#input, #v_permit, #ns_http::h1::codec::canned::NOT_FOUND);
-                #project
+                let mut #v_this = #v_routes.as_mut().project();
                 #rejected
                 #v_result.into()
             }};
@@ -261,6 +300,7 @@ pub(super) struct Connections {
 
 pub(super) struct Protocol {
     pub(super) duplex: duplex::State,
+    pub(super) upgrade: bool,
     pub(super) duplex_ty: proc_macro2::TokenStream,
     pub(super) connections: Connections,
     pub(super) transition_policy: proc_macro2::TokenStream,
@@ -275,7 +315,7 @@ pub(in crate::app::serve::handle) struct Types<'a> {
     pub(super) generics: Generics,
     pub(super) routing: Routing<'a>,
     pub(super) protocol: Protocol,
-    pub(super) http: proc_macro2::TokenStream,
+    pub(super) h2: Option<&'a proc_macro2::TokenStream>,
     pub(super) http_mut: proc_macro2::TokenStream,
     pub(super) audit: proc_macro2::TokenStream,
     pub(super) tasks: tasks::Tasks,
@@ -321,17 +361,17 @@ impl<'a> Types<'a> {
         let ns_h1 = &paths.h1;
         use quote::quote;
 
-        let tasks = tasks::Tasks::build(paths, context);
+        let dispatch_ident = crate::handler::names::encoded("__SarkH1Dispatch", &context.name);
+        let tasks = tasks::Tasks::build(paths, context, &dispatch_ident);
         let generics = Generics::new(paths, context, plan, dispatch);
-        let routing = Routing::new(paths, context, plan, dispatch, &generics);
+        let routing = Routing::new(paths, context, plan, dispatch);
         let spec = context.plan.spec;
         let state = spec.state.ty();
         let name = &context.name;
         let core = &context.core_ident;
         let duplex = plan.duplex.state();
-        let http = quote!((#v_link.state()));
         let edit = quote!((#v_link.state_mut()));
-        let kind = plan.duplex.ty(paths);
+        let kind = plan.duplex.ty(paths, false);
         let pending = plan.continuations.ty();
         let ready = plan.continuations.ready_ty();
         let partial = plan.continuations.head();
@@ -356,22 +396,14 @@ impl<'a> Types<'a> {
                 #head,
             >
         };
-        let payload = quote! {
-            #ns_fiber::dope::net::link::egress::data::compose::Either<
-                #ns_h1::server::payload::Body<
-                    'd,
-                    <#g_mode as #ns_core::life::sequence::Mode<
-                        #ns_fiber::dope::manifold::network::listener::conn::Id<'d, #g_id>,
-                    >>::TransportTag,
-                >,
-                #ns_h1::server::payload::Stream<
-                    'd,
-                    <#g_mode as #ns_core::life::sequence::Mode<
-                        #ns_fiber::dope::manifold::network::listener::conn::Id<'d, #g_id>,
-                    >>::TransportTag,
-                >,
-            >
-        };
+        let payload = handle::h1_payload(
+            paths,
+            quote! {
+                <#g_mode as #ns_core::life::sequence::Mode<
+                    #ns_fiber::dope::manifold::network::listener::conn::Id<'d, #g_id>,
+                >>::TransportTag
+            },
+        );
         let egress = quote!(#ns_fiber::dope::net::link::egress::data::Bound<#payload, #bound>);
         let input = duplex.input_type(paths);
         let view = quote! {
@@ -389,14 +421,14 @@ impl<'a> Types<'a> {
             >
         };
         let owner = plan.continuations.route();
-        let heads = context.plan.entries.iter().map(|route| {
+        let heads = plan.continuations.bodies().map(|route| {
             let variant = &route.pending_variant;
             match route.mode {
                 serve::Mode::Fiber { .. } => quote!(#owner::#variant(_) => 0,),
                 serve::Mode::Sync { .. }
                 | serve::Mode::Stream { .. }
                 | serve::Mode::Duplex { .. } => {
-                    quote!(#owner::#variant(#v_wait) => #v_wait.head_len(),)
+                    quote!(#owner::#variant(ref #v_wait) => #v_wait.head_len(),)
                 }
             }
         });
@@ -409,7 +441,7 @@ impl<'a> Types<'a> {
                 let #n_run = &#n_http.async_state;
                 let #n_owners = #n_run.owners();
                 let mut #n_snap = #n_http.ingress
-                    .audit(|#v_wait| match &#v_wait.route { #( #heads )* }, |_| 0,
+                    .audit(|#v_wait| match #v_wait.route { #( #heads )* }, |_| 0,
                         |#v_wait| match #v_wait { #( #lengths )* })
                     .task(#n_owners, #n_owners, 0)
                     .owners(#n_run.owners())
@@ -438,11 +470,14 @@ impl<'a> Types<'a> {
                 state_ty: state,
                 name,
                 core_ident: core,
+                dispatch_ident,
             },
             generics,
             routing,
+            h2: plan.cleartext,
             protocol: Protocol {
                 duplex,
+                upgrade: context.plan.entries.iter().any(|route| route.entry.upgrade),
                 duplex_ty: kind,
                 connections: Connections {
                     pending,
@@ -455,7 +490,6 @@ impl<'a> Types<'a> {
                 input_type: input,
                 h1_slot: view,
             },
-            http,
             http_mut: edit,
             audit,
             tasks,

@@ -33,8 +33,11 @@ pub enum Error<'a> {
 
 type Output<'report, T> = Result<session::Result<'report, T>, Failure>;
 
-pub fn finish<'report, I, R, Out>(
-    result: Result<Output<'report, R>, topology::EnterError<'_, Infallible, I, Output<'report, R>>>,
+pub fn finish<'report, I, R, Out, Q>(
+    result: Result<
+        Output<'report, R>,
+        topology::EnterError<'_, Infallible, I, Output<'report, R>, Q>,
+    >,
     done: impl for<'a> FnOnce(Result<R, Error<'a>>) -> Out,
 ) -> Out {
     match result {

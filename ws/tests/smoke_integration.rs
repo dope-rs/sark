@@ -1,6 +1,4 @@
-use std::{
-    cell, convert, marker::PhantomPinned, net::TcpListener, rc, sync::mpsc, thread, time::Duration,
-};
+use std::{cell, convert, io::Read, marker::PhantomPinned, net::TcpListener, rc};
 
 use common::{
     app::{self, meter::Meter},
@@ -20,6 +18,7 @@ use dope::{
         topology::{Plan, lending},
     },
 };
+use dope_test::harness::scenario::run::{Entry, Task as _};
 use dope_test::{alloc::Tracker, harness::server::Pair, reclaim};
 use sark_ws::{
     client,
@@ -40,9 +39,8 @@ fn opening_has_one_owner() {
     {
         let sock = TcpListener::bind("127.0.0.1:0").expect("bind allocation probe");
         let addr = sock.local_addr().expect("allocation probe address");
-        let (tx, rx) = mpsc::channel();
-        let server = thread::spawn(move || {
-            let (stream, _) = sock.accept().expect("accept allocation probe");
+        let (proof, request_len) = Entry(move || {
+            let (mut stream, _) = sock.accept().expect("accept allocation probe");
             let req = app::Upgrade::new(&stream)
                 .try_head()
                 .expect("WebSocket operation");
@@ -53,46 +51,45 @@ fn opening_has_one_owner() {
                         .expect("WebSocket operation"),
                 )
                 .expect("WebSocket operation");
-            rx.recv_timeout(Duration::from_secs(3))
-                .expect("client admitted allocation probe");
-            req
-        });
-
-        let proof = rc::Rc::new(cell::Cell::new(None));
-        let sink = rc::Rc::clone(&proof);
-        let auth = headers::Field::new("Authorization", String::from("Bearer token"))
-            .expect("valid borrowed authorization field");
-        let config = client::Config::new("127.0.0.1", "/ws");
-        let config = config.expect("WebSocket configuration");
-        let opened = topology::Plan::new(addr, config, 1, 16).enter(
-            move |domain| {
-                domain.run(
-                    channel::App::<_, mode::Observe>::new(Meter { proof: sink, auth }),
-                    |mut app| {
-                        app.wait(|result| {
-                            result
-                                .as_ref()
-                                .map_err(|cause| cause.cause())
-                                .expect("WebSocket wait");
-                        })
-                    },
-                )
-            },
-            recovery::Policy::new(|event| retired.push(event), common::recover),
-            |result| result.expect("WebSocket execution"),
-        );
-        opened
-            .as_ref()
-            .map_err(|cause| cause.kind())
-            .expect("WebSocket operation")
-            .as_ref()
-            .expect("WebSocket operation");
-        tx.send(()).expect("release allocation probe");
-        let req = server.join().expect("allocation probe server");
-        let proof = proof.take().expect("handshake allocation proof");
+            while stream.read(&mut [0; 64]).expect("client close") != 0 {}
+            req.len()
+        })
+        .with(|| {
+            let proof = rc::Rc::new(cell::Cell::new(None));
+            let sink = rc::Rc::clone(&proof);
+            let auth = headers::Field::new("Authorization", String::from("Bearer token"))
+                .expect("valid borrowed authorization field");
+            let config = client::Config::new("127.0.0.1", "/ws");
+            let config = config.expect("WebSocket configuration");
+            let opened = topology::Plan::new(addr, config, 1, 16).enter(
+                move |domain| {
+                    domain.run(
+                        channel::App::<_, mode::Observe>::new(Meter { proof: sink, auth }),
+                        |mut app| {
+                            app.wait(|result| {
+                                result
+                                    .as_ref()
+                                    .map_err(|cause| cause.cause())
+                                    .expect("WebSocket wait");
+                            })
+                        },
+                    )
+                },
+                recovery::Policy::new(|event| retired.push(event), common::recover),
+                |result| result.expect("WebSocket execution"),
+            );
+            opened
+                .as_ref()
+                .map_err(|cause| cause.kind())
+                .expect("WebSocket operation")
+                .as_ref()
+                .expect("WebSocket operation");
+            proof.take().expect("handshake allocation proof")
+        })
+        .expect("allocation probe server");
 
         assert_eq!(proof.count, 1);
-        assert_eq!(proof.len, req.len());
+        assert_eq!(proof.len, request_len);
         assert!(proof.opened);
         assert_eq!(proof.messages, [0; 4]);
         assert!(proof.close.is_some());
@@ -171,24 +168,11 @@ fn codec_round_trip() {
                 let mut retired = Vec::new();
                 let config = client::Config::new("127.0.0.1", "/ws");
                 let config = config.expect("WebSocket configuration");
-                Probe::new(addr, config)
-                    .echo(
-                        "ping",
-                        |result| {
-                            result
-                                .as_ref()
-                                .map_err(|cause| cause.cause())
-                                .expect("WebSocket wait");
-                        },
-                        recovery::Policy::new(|event| retired.push(event), common::recover),
-                        |result| {
-                            let seen = result.expect("WebSocket probe");
-                            assert_eq!(seen.reply(), Some("pong"));
-                        },
-                    )
-                    .as_ref()
-                    .map_err(|cause| cause.kind())
-                    .expect("WebSocket operation");
+                let seen = Probe::new(addr, config).run(
+                    common::client::Goal::Echo("ping"),
+                    recovery::Policy::new(|event| retired.push(event), common::recover),
+                );
+                assert_eq!(seen.reply(), Some("pong"));
                 assert!(
                     retired
                         .iter()

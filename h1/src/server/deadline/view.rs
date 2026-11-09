@@ -9,7 +9,7 @@ use dope::{
 use o3::buffer::hold;
 use sark_core::{
     body::{credit, credit::Mode as _},
-    life::{self, Observer, audit, exchange, sequence},
+    life::{self, audit, exchange, sequence},
 };
 use sark_http::owner::cause;
 
@@ -83,9 +83,7 @@ where
     M: life::Mode<conn::Id<'d, ID>, u64>,
 {
     fn diagnostic<E: fmt::Debug>(&mut self, cause: &E) {
-        if let Some(observer) = self.mode.observer() {
-            Observer::diagnostic(observer, cause);
-        }
+        life::Mode::diagnostic(&mut self.mode, cause);
     }
 
     fn observe(&mut self, event: life::Event<conn::Id<'d, ID>, u64>) {
@@ -139,33 +137,13 @@ where
 {
     type Session = M::Session;
     type TransportTag = M::TransportTag;
-    type Trace = Self;
-
-    fn trace(&self) -> Option<&Self::Trace> {
-        Some(self)
-    }
-
-    fn trace_mut(&mut self) -> Option<&mut Self::Trace> {
-        Some(self)
-    }
-}
-
-impl<'d, ID: Identity, M> sequence::Trace<conn::Id<'d, ID>> for View<'d, M, ID>
-where
-    M: sequence::Mode<conn::Id<'d, ID>>,
-{
-    type Session = M::Session;
-    type TransportTag = M::TransportTag;
 
     fn tag(
         &self,
         id: exchange::Id<conn::Id<'d, ID>, u64>,
         charge: hold::Charge,
     ) -> Self::TransportTag {
-        match sequence::Mode::trace(&self.mode) {
-            Some(trace) => sequence::Trace::tag(trace, id, charge),
-            None => Self::TransportTag::default(),
-        }
+        sequence::Mode::tag(&self.mode, id, charge)
     }
 
     fn transport(
@@ -173,19 +151,15 @@ where
         conn: conn::Id<'d, ID>,
         tag: Self::TransportTag,
     ) -> Option<(exchange::Id<conn::Id<'d, ID>, u64>, hold::Charge)> {
-        let trace = sequence::Mode::trace(&self.mode)?;
-        sequence::Trace::transport(trace, conn, tag)
+        sequence::Mode::transport(&self.mode, conn, tag)
     }
 
-    fn open(
+    fn next(
         &mut self,
         session: &mut Self::Session,
         conn: conn::Id<'d, ID>,
     ) -> exchange::Id<conn::Id<'d, ID>, u64> {
-        match sequence::Mode::trace_mut(&mut self.mode) {
-            Some(trace) => sequence::Trace::open(trace, session, conn),
-            None => exchange::Id::new(conn, 0),
-        }
+        sequence::Mode::next(&mut self.mode, session, conn)
     }
 
     fn current(
@@ -193,10 +167,7 @@ where
         session: &Self::Session,
         conn: conn::Id<'d, ID>,
     ) -> Option<exchange::Id<conn::Id<'d, ID>, u64>> {
-        match sequence::Mode::trace(&self.mode) {
-            Some(trace) => sequence::Trace::current(trace, session, conn),
-            None => Some(exchange::Id::new(conn, 0)),
-        }
+        sequence::Mode::current(&self.mode, session, conn)
     }
 
     fn commit_link(
@@ -213,9 +184,7 @@ where
             charge,
             linked,
         });
-        if let Some(trace) = sequence::Mode::trace_mut(&mut self.mode) {
-            sequence::Trace::commit_link(trace, session, id, bytes, charge, linked);
-        }
+        sequence::Mode::commit_link(&mut self.mode, session, id, bytes, charge, linked);
     }
 
     fn stage(
@@ -224,9 +193,7 @@ where
         id: exchange::Id<conn::Id<'d, ID>, u64>,
         charge: hold::Charge,
     ) {
-        if let Some(trace) = sequence::Mode::trace_mut(&mut self.mode) {
-            sequence::Trace::stage(trace, session, id, charge);
-        }
+        sequence::Mode::stage(&mut self.mode, session, id, charge)
     }
 
     fn unstage(
@@ -235,9 +202,7 @@ where
         id: exchange::Id<conn::Id<'d, ID>, u64>,
         charge: hold::Charge,
     ) {
-        if let Some(trace) = sequence::Mode::trace_mut(&mut self.mode) {
-            sequence::Trace::unstage(trace, session, id, charge);
-        }
+        sequence::Mode::unstage(&mut self.mode, session, id, charge)
     }
 
     fn accept(
@@ -246,9 +211,7 @@ where
         id: exchange::Id<conn::Id<'d, ID>, u64>,
         charge: hold::Charge,
     ) {
-        if let Some(trace) = sequence::Mode::trace_mut(&mut self.mode) {
-            sequence::Trace::accept(trace, session, id, charge);
-        }
+        sequence::Mode::accept(&mut self.mode, session, id, charge)
     }
 
     fn release(
@@ -257,14 +220,10 @@ where
         charge: hold::Charge,
         cause: cause::Transport,
     ) {
-        if let Some(trace) = sequence::Mode::trace_mut(&mut self.mode) {
-            sequence::Trace::release(trace, id, charge, cause);
-        }
+        sequence::Mode::release(&mut self.mode, id, charge, cause)
     }
 
     fn close(&mut self, session: &mut Self::Session, conn: conn::Id<'d, ID>) {
-        if let Some(trace) = sequence::Mode::trace_mut(&mut self.mode) {
-            sequence::Trace::close(trace, session, conn);
-        }
+        sequence::Mode::close(&mut self.mode, session, conn)
     }
 }

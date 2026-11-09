@@ -1,12 +1,15 @@
 use std::ops::ControlFlow;
 
-use dope::{core::driver::route::Identity, manifold::network::listener::conn::Id};
+use dope::{
+    core::{BranchError, driver::route::Identity},
+    manifold::network::listener::conn::Id,
+};
 use sark_core::{
     decode::{self, request, state},
     life,
     manifold::{schedule::typed, task::app::Runtime},
 };
-use sark_http::request::body::Ref;
+use sark_http::{field::metadata::section::rules, request::body::Ref};
 
 use crate::{
     conn::{self, event},
@@ -25,20 +28,14 @@ use crate::{
     stream,
 };
 
-pub(in crate::server::task::app) struct Admit<'a, 'state, 'd, ID: Identity + 'd, R, Q>
-where
-    R: Runtime<'d, Target = Target<'d, ID>> + decode::Guarded,
-{
-    head: Drive<'a, 'state, 'd, ID, R, Q>,
-}
-
 pub(in crate::server::task::app) trait Begin<'d, R: Runtime<'d>>:
     Sized
 {
-    fn begin<ID: Identity + 'd, Q>(
+    fn begin<ID: Identity + 'd, Q, F: rules::Policy>(
         self,
-        head: Drive<'_, '_, 'd, ID, R, Q>,
+        head: Drive<'_, '_, 'd, ID, R, Q, F>,
         stream: stream::Key,
+        report: impl FnMut(Id<'d, ID>, stream::Key, &dyn std::fmt::Debug),
     ) -> Result<(), conn::Error>
     where
         R: Runtime<'d, Target = Target<'d, ID>>,
@@ -46,36 +43,37 @@ pub(in crate::server::task::app) trait Begin<'d, R: Runtime<'d>>:
         Q::Retention: Handoff;
 }
 
-impl<'a, 'state, 'd, ID: Identity + 'd, R, Q> Admit<'a, 'state, 'd, ID, R, Q>
+impl<'a, 'state, 'd, ID: Identity + 'd, R, Q, F> Drive<'a, 'state, 'd, ID, R, Q, F>
 where
     R: Runtime<'d, Target = Target<'d, ID>> + decode::Guarded,
     Q: Transitions<Id<'d, ID>>,
     Q::Retention: Handoff,
+    F: rules::Policy,
 {
-    pub(in crate::server::task::app) const fn new(head: Drive<'a, 'state, 'd, ID, R, Q>) -> Self {
-        Self { head }
-    }
-
-    pub(in crate::server::task::app) fn next(self) -> Result<(), conn::Error> {
-        if !self.head.state.connection.streams().headers().is_ready() {
+    pub(in crate::server::task::app) fn admit_next(
+        self,
+        report: impl FnMut(Id<'d, ID>, stream::Key, &dyn std::fmt::Debug),
+    ) -> Result<(), conn::Error> {
+        if !self.state.connection.streams().headers().is_ready() {
             return Ok(());
         }
-        let Some((stream, routed)) = self.head.state.data().take_route() else {
+        let Some((stream, routed)) = self.state.data().take_route() else {
             return Ok(());
         };
-        self.resume(stream, routed.into_state())?;
+        self.resume(stream, routed.into_state(), report)?;
         Ok(())
     }
 
-    fn resume<F>(
+    fn resume<I>(
         self,
         stream: stream::Key,
-        routed: request::Guarded<<R::Routes as state::Family<R::Prepared>>::State<F>>,
+        routed: request::Guarded<<R::Routes as state::Family<R::Prepared>>::State<I>>,
+        mut report: impl FnMut(Id<'d, ID>, stream::Key, &dyn std::fmt::Debug),
     ) -> Result<(), conn::Error>
     where
-        F: Input<'d>,
+        I: Input<'d>,
     {
-        let mut head = self.head;
+        let mut head = self;
         let call = identify(head.conn, stream);
         let slot = match head.state.vacant(stream) {
             Some(slot) => slot,
@@ -85,7 +83,7 @@ where
                         // SAFETY: this fresh or deferred request remains in
                         // this exact admission Book while the slot is refused.
                         unsafe { exchange::raw::Closing::new(routed, &mut ledger) }
-                            .discard::<F, _>(head.mode.body(call))
+                            .discard::<I, _>(head.mode.body(call))
                     })
                 });
                 let error = match result {
@@ -98,28 +96,29 @@ where
         };
         let next = 'admission: {
             let writer = Encoder::new(slot.connection, stream, Ref::from_slice(&[]));
-            let result = admit::run::<R, F, Q::Retention, event::Retirement>(
+            let result = admit::run::<R, I, Q::Retention, event::Retirement, _>(
                 head.router.as_ref().get_ref(),
                 routed,
                 writer,
             );
             let (reply, input) = match result {
                 Ok(ControlFlow::Continue(ready)) => break 'admission Ok(Some(ready)),
-                Ok(ControlFlow::Break((value, input))) => {
-                    let reply = match value {
-                        ControlFlow::Continue(wire) => (response::Response::Encoded(wire), None),
-                        ControlFlow::Break(head) => (
-                            response::Response::Head {
-                                head,
-                                outcome: life::Outcome::Rejected,
-                                count: response::Count::Settled,
-                            },
-                            Some(conn::DataBlock::Egress),
-                        ),
+                Ok(ControlFlow::Break((reply, input))) => (Ok(reply), input),
+                Err((error, failed, input)) => {
+                    let code = match error {
+                        BranchError::First(error) => {
+                            crate::server::runtime::app::response(
+                                head.mode,
+                                identify(head.conn, failed),
+                                &error,
+                                &mut report,
+                            );
+                            error.code()
+                        }
+                        BranchError::Second(code) => code,
                     };
-                    (Ok(reply), input)
+                    (Err((code, failed)), input)
                 }
-                Err((error, failed, input)) => (Err((error, failed)), input),
             };
             let release = slot.body_credit.scope(|mut ledger| {
                 // SAFETY: the rejected input was produced by this exact
@@ -131,8 +130,31 @@ where
                 break 'admission Err((error.code(), stream));
             }
             match reply {
-                Ok((next, block)) => {
-                    slot.response.insert(typed::Next::Control(next, block));
+                Ok(reply) => {
+                    Transitions::ready(head.mode, call);
+                    let state = sark_core::manifold::task::response::State::Complete(
+                        life::Outcome::Rejected,
+                    );
+                    let next = match reply {
+                        ControlFlow::Continue(receipt) => match receipt.observe(head.mode, call) {
+                            Some(pending) => {
+                                typed::Next::Data(response::Data::Body { pending, state }, None)
+                            }
+                            None => {
+                                call.retire(head.mode, life::Outcome::Rejected);
+                                break 'admission Ok(None);
+                            }
+                        },
+                        ControlFlow::Break(head) => typed::Next::Control(
+                            response::Response::Head {
+                                head,
+                                state,
+                                count: response::Count::Settled,
+                            },
+                            Some(conn::DataBlock::Egress),
+                        ),
+                    };
+                    slot.response.insert(next);
                     Ok(None)
                 }
                 Err(error) => Err(error),
@@ -144,7 +166,7 @@ where
                 // this same Drive and Book through guard completion.
                 unsafe { header::raw::accept(head, stream, ready) }?;
             }
-            Ok(None) => Transitions::ready(head.mode, call),
+            Ok(None) => {}
             Err((error, failed)) => {
                 head.reset(failed, error);
             }
@@ -158,10 +180,11 @@ impl<'d, R> Begin<'d, R>
 where
     R: Runtime<'d> + decode::Guarded,
 {
-    fn begin<ID: Identity + 'd, Q>(
+    fn begin<ID: Identity + 'd, Q, F: rules::Policy>(
         self,
-        head: Drive<'_, '_, 'd, ID, R, Q>,
+        head: Drive<'_, '_, 'd, ID, R, Q, F>,
         stream: stream::Key,
+        report: impl FnMut(Id<'d, ID>, stream::Key, &dyn std::fmt::Debug),
     ) -> Result<(), conn::Error>
     where
         R: Runtime<'d, Target = Target<'d, ID>>,
@@ -173,7 +196,7 @@ where
             head.state.data().try_route(stream, self, evidence)?;
             return Ok(());
         }
-        Admit::new(head).resume(stream, self)
+        head.resume(stream, self, report)
     }
 }
 
@@ -189,10 +212,11 @@ where
         >>::State<Accepted<'d>>,
     >,
 {
-    fn begin<ID: Identity + 'd, Q>(
+    fn begin<ID: Identity + 'd, Q, F: rules::Policy>(
         self,
-        head: Drive<'_, '_, 'd, ID, R, Q>,
+        head: Drive<'_, '_, 'd, ID, R, Q, F>,
         stream: stream::Key,
+        _: impl FnMut(Id<'d, ID>, stream::Key, &dyn std::fmt::Debug),
     ) -> Result<(), conn::Error>
     where
         R: Runtime<'d, Target = Target<'d, ID>>,
@@ -211,10 +235,11 @@ where
     request::Plain<U>: Begin<'d, R>,
     request::Guarded<G>: Begin<'d, R>,
 {
-    fn begin<ID: Identity + 'd, Q>(
+    fn begin<ID: Identity + 'd, Q, F: rules::Policy>(
         self,
-        head: Drive<'_, '_, 'd, ID, R, Q>,
+        head: Drive<'_, '_, 'd, ID, R, Q, F>,
         stream: stream::Key,
+        report: impl FnMut(Id<'d, ID>, stream::Key, &dyn std::fmt::Debug),
     ) -> Result<(), conn::Error>
     where
         R: Runtime<'d, Target = Target<'d, ID>>,
@@ -222,8 +247,8 @@ where
         Q::Retention: Handoff,
     {
         match self {
-            Self::Plain(request) => request.begin(head, stream),
-            Self::Guarded(request) => request.begin(head, stream),
+            Self::Plain(request) => request.begin(head, stream, report),
+            Self::Guarded(request) => request.begin(head, stream, report),
         }
     }
 }

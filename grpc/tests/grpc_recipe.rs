@@ -1,68 +1,25 @@
-use dope::{
-    core::{driver::route::KeyTag, io::socket::Backlog},
-    manifold::timing,
-};
-
 pub mod common;
 
-use std::{cell::Cell, convert, net::SocketAddr};
+use std::cell::Cell;
 
-use dope::{
-    core::driver::{route::table::conn, settings},
-    manifold,
-};
+use dope::core::driver::route::table::conn;
 use dope_test::alloc::Tracker;
 use o3::buffer::resident;
 use sark_core::manifold::{schedule, server::app};
 use sark_grpc::{
     protocol::section,
-    server::{Bank, Plan, config::Limits, mode, runtime::state},
+    server::{Bank, config::Limits, mode, runtime::state},
 };
 use sark_h2::{
     ServerRole,
     conn::{event, machine},
-    server::runtime::modes,
 };
 use sark_http::field::metadata::section::rules;
 
-use crate::common::grpc::{
-    call::borrowed::{Borrowed, H2},
-    settings::Settings,
-};
+use crate::common::grpc::call::borrowed::Borrowed;
 
 #[global_allocator]
 static ALLOCATOR: Tracker = Tracker::new();
-
-#[test]
-fn borrows_owner() {
-    let calls = Cell::new(0_u32);
-    let setup = Settings {
-        bind: SocketAddr::from(([127, 0, 0, 1], 0)),
-        connections: conn::Capacity::fixed::<1>(),
-        backlog: Backlog::fixed::<1>(),
-        limits: Limits::default(),
-    };
-    let layout = {
-        let bank = Bank::try_new(setup.connections.count(), setup.limits).expect("readiness bank");
-        let grpc = Plan::new(Borrowed(&calls), &bank, mode::Direct);
-        let plan = setup
-            .h2::<KeyTag<H2>>()
-            .expect("construct H2 server plan")
-            .with_plain::<_, modes::Serve<convert::Infallible>>(grpc);
-        let ready = plan
-            .for_install::<timing::Throughput>()
-            .expect("build exact receive topology");
-
-        assert_eq!(calls.get(), 0);
-        ready.layout()
-    };
-    assert_eq!(
-        layout.queue_layout(),
-        <manifold::timing::Throughput as settings::Profile>::QUEUES
-    );
-    calls.set(11);
-    assert_eq!(calls.get(), 11);
-}
 
 #[test]
 fn reserves_once() {

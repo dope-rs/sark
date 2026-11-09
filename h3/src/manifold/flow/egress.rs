@@ -200,13 +200,10 @@ impl<'session, 'd, P: rules::Policy> Egress<'session, 'd, P> {
     {
         let owner = self.session.bind_scope(quic)?.owner();
         let mut net = flow::Transport::new(quic, &mut self.session.receive_credits, owner, None);
-        let mut released = false;
-        loop {
-            let report = net.pump::<P, C, O>(&mut self.session.h3, life, handle)?;
-            released |= report.has_release();
-            if report.flush() != Flush::Pending {
-                return Ok(report::Report::new(report.flush(), released));
-            }
+        let mut report = net.pump::<P, C, O>(&mut self.session.h3, life, handle)?;
+        while report.flush() == Flush::Pending {
+            report = report.merged(net.pump::<P, C, O>(&mut self.session.h3, life, handle)?);
         }
+        Ok(report)
     }
 }

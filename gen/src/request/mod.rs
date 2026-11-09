@@ -161,9 +161,7 @@ pub(super) fn build(
     for (idx, (_, kind)) in captures.iter().enumerate() {
         match kind {
             types::ValueKind::Bytes => {}
-            types::ValueKind::Usize | types::ValueKind::U64 | types::ValueKind::Bool => {
-                ids.push(format_ident!("Path{idx}"))
-            }
+            _ => ids.push(format_ident!("Path{idx}")),
         }
     }
     let (id_def, proof, error) = if ids.is_empty() {
@@ -197,7 +195,8 @@ pub(super) fn build(
         )
     } else {
         imports.push(slot.clone());
-        let (decl, def, get, spans, set) = headplan.slots(paths, &vis, &slot, &identity);
+        let (decl, def, get, spans, set, encoding) =
+            headplan.slots(paths, &vis, &slot, &identity, &raw_head);
         let policy = prefixes::build(paths, &headplan, &name, &slot)?;
         let methods = scan::build(paths, &raw_head, &error, &get, &spans, &set);
         (
@@ -208,6 +207,7 @@ pub(super) fn build(
                 #policy
                 impl #ns_core::route::field::header::Fields<#name<'static>> for #slot {
                     #methods
+                    #encoding
                 }
             },
         )
@@ -303,7 +303,7 @@ pub(super) fn build(
     own_init.push(quote!(#marker: ::core::marker::PhantomData));
     let modes = body.mode_impls(paths, &vis, &storage);
     let (in_err, parsed, body_arg) = body.parsing(paths, path_err);
-    let (body_ty, plan) = body.task(paths);
+    let (body_ty, source) = body.task(paths);
 
     let (raw_ty, path_ty, own_path, path_api) = if captures.is_empty() {
         (
@@ -382,7 +382,7 @@ pub(super) fn build(
         reject,
         ty: task_ty,
         start,
-    } = task.build(paths, plan);
+    } = task.build(paths, source);
     let path_in = if captures.is_empty() {
         quote!(())
     } else {

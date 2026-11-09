@@ -32,7 +32,7 @@ impl<'d> Frame<'d> {
 /// Text that outlives the exact input its validation observed.
 pub(in crate::client) enum Text<'d> {
     /// A whole frame's exact range, admitted as UTF-8 and retained.
-    Retained(buffer::raw::Utf8<resident::Shared<'d>>),
+    Retained(buffer::storage::Str<resident::Shared<'d>>),
     /// The fragment assembler's joined owner.
     Assembled(String),
 }
@@ -117,7 +117,7 @@ impl<'d> Head<'d> {
             Whole::Text => {
                 // SAFETY: prepare validated this exact immutable payload
                 // as UTF-8; retention preserves its exact range and bytes.
-                let text = unsafe { buffer::raw::Utf8::new(payload) };
+                let text = unsafe { buffer::raw::utf8(payload) };
                 Self(Kind::Frame(Frame::Text(Text::Retained(text))))
             }
             Whole::Binary => Self(Kind::Frame(Frame::Binary(Bytes::Retained(payload)))),

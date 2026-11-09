@@ -6,7 +6,6 @@ use o3::{
     buffer::{self, storage},
     depot::arena::slab::key,
 };
-use sark_core::manifold::client::event::Shutdown;
 
 use crate::{Reason, message, metadata};
 
@@ -202,30 +201,6 @@ pub(in crate::client) enum Cancel {
     Complete(Index),
 }
 
-#[derive(Clone, Copy, Default, PartialEq, Eq)]
-pub(in crate::client) enum Phase {
-    #[default]
-    Open,
-    Drain,
-    Failed,
-}
-
-impl Phase {
-    fn observe(&mut self, shutdown: Shutdown) {
-        if *self == Self::Failed {
-            return;
-        }
-        *self = match shutdown {
-            Shutdown::Clean => Self::Drain,
-            Shutdown::Failed => Self::Failed,
-        };
-    }
-
-    pub(in crate::client) const fn is_open(self) -> bool {
-        matches!(self, Self::Open)
-    }
-}
-
 struct Fault(Option<crate::Status>);
 
 impl Fault {
@@ -275,6 +250,6 @@ unsafe impl<'scope> table::raw::Index<'scope> for Slot<'scope> {
     fn index(self) -> bounded::U32<0, { u32::MAX - 1 }> {
         // SAFETY: the table constructor admitted the common extent as a compact
         // capacity, and the scoped receive index lies strictly below it.
-        unsafe { bounded::raw::Proof::assume(self.index.index() as u32) }.retain()
+        unsafe { bounded::raw::u32(self.index.index() as u32) }
     }
 }

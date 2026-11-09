@@ -99,7 +99,7 @@ impl field::Source for Fields<'_> {
 
 #[derive(PartialEq, Eq)]
 pub struct Head {
-    fields: section::Request,
+    fields: section::Valid,
 }
 
 impl Head {
@@ -113,36 +113,40 @@ impl Head {
     }
 
     pub fn from_fields<S: Metadata + ?Sized>(fields: &S) -> Result<Self, crate::Status> {
-        let fields = section::Plan::build(fields, rules::Kind::Request)?;
+        let fields = section::build(fields, rules::Kind::Request)?;
         Self::from_owner(fields)
     }
 
     pub(crate) fn from_owner(fields: section::Owner) -> Result<Self, crate::Status> {
         Ok(Self {
-            fields: section::Request::new(fields)?,
+            fields: section::Valid::try_from(fields, rules::Kind::Request)?,
         })
     }
 
     pub(crate) fn trailers(fields: section::Owner) -> Result<metadata::Decoded, crate::Status> {
-        let fields = fields.validate(rules::Kind::RequestTrailers)?;
+        let fields = section::Valid::try_from(fields, rules::Kind::RequestTrailers)?;
         Ok(metadata::Decoded::from(fields))
     }
 
     pub fn path(&self) -> &[u8] {
-        section::View::<section::Request>::new(&self.fields).required()
+        section::View::<Head>::new(self).required()
     }
 
     pub fn authority(&self) -> Option<&[u8]> {
-        self.fields.authority()
+        section::View::<Head>::new(self).authority()
     }
 
     /// The admitted timeout; absence is unlimited and zero expires immediately.
     pub fn timeout(&self) -> Option<Duration> {
-        section::View::<section::Valid>::new(self.fields.owner()).timeout()
+        section::View::<section::Valid>::new(&self.fields).timeout()
     }
 
     pub fn metadata(&self) -> metadata::View<'_> {
-        metadata::View::from(self.fields.owner())
+        metadata::View::from(&self.fields)
+    }
+
+    pub(in crate::protocol) const fn owner(&self) -> &section::Valid {
+        &self.fields
     }
 }
 

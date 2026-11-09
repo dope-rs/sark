@@ -1,6 +1,9 @@
 use std::{io, net, num::NonZero};
 
-use dope_test::harness::peer::{self, Stream, TcpAcceptor};
+use dope_test::harness::{
+    GUARD,
+    peer::{self, Stream, TcpAcceptor},
+};
 
 mod conn;
 mod error;
@@ -67,6 +70,7 @@ pub fn counted(
 /// After client teardown, checks every queued connection for submitted bytes.
 pub fn empty(acceptor: &mut TcpAcceptor<'_>) -> Result<(), Error> {
     while let Some(accepted) = acceptor.try_accept().map_err(Error::Io)? {
+        accepted.read_wait(Some(GUARD)).map_err(Error::Io)?;
         closed(&mut Conn::new(&accepted))?;
     }
     Ok(())

@@ -10,7 +10,6 @@ use dope_quic::{
 use o3::{
     alloc, buffer,
     depot::map::{self, flat},
-    mem::Rejected,
 };
 
 use crate::manifold::Credit;
@@ -26,20 +25,6 @@ pub(super) struct Ledger {
     entries: flat::Table<Entry>,
 }
 
-pub(super) enum Hold<'ledger, 'scope> {
-    Vacant {
-        entry: map::Vacancy<&'ledger mut flat::Table<Entry>, u64>,
-        stream_id: Id,
-        credit: credit::Credit<'scope>,
-    },
-    Merge(credit::Merge<'ledger, 'scope>),
-}
-
-pub(super) enum Rejection {
-    Capacity,
-    Mismatch { held: usize },
-}
-
 impl Ledger {
     pub(super) fn try_new(plan: map::Plan) -> Result<Self, alloc::Error> {
         Ok(Self {
@@ -48,38 +33,48 @@ impl Ledger {
     }
 
     pub(super) fn try_hold<
-        'ledger,
         'scope,
         const ID: u8,
         B: stream::Recv,
         const RECONCILE: bool,
         D: buffer::raw::Segment,
     >(
-        &'ledger mut self,
+        &mut self,
         id: Id,
         credit: credit::Credit<'scope>,
         recv: &mut recv::Receive<'_, 'scope, ID, B, RECONCILE, D>,
-    ) -> Result<Hold<'ledger, 'scope>, Rejected<credit::Credit<'scope>, Rejection>> {
+    ) -> Result<(), Credit> {
         let hash = id.number();
-        let Some(entry) = self.entries.entry(hash, |entry| entry.stream_id == id) else {
-            return Err(Rejected::new(credit, Rejection::Capacity));
-        };
-        match entry {
-            flat::Entry::Occupied(entry) => {
+        match self.entries.entry(hash, |entry| entry.stream_id == id) {
+            None => {
+                return Err(Credit::Capacity {
+                    stream_id: id,
+                    credit: credit.release_conn(recv).detach(recv),
+                });
+            }
+            Some(flat::Entry::Occupied(entry)) => {
                 let entry = entry.into_mut();
                 let held = entry.credit.len();
-                entry
-                    .credit
-                    .try_admit(credit, recv)
-                    .map(Hold::Merge)
-                    .map_err(|credit| Rejected::new(credit, Rejection::Mismatch { held }))
+                match entry.credit.try_admit(credit, recv) {
+                    Ok(merge) => merge.commit(recv),
+                    Err(credit) => {
+                        return Err(Credit::Mismatch {
+                            stream_id: id,
+                            held,
+                            credit: credit.release_conn(recv).detach(recv),
+                        });
+                    }
+                }
             }
-            flat::Entry::Vacant(entry) => Ok(Hold::Vacant {
-                entry,
-                stream_id: id,
-                credit,
-            }),
+            Some(flat::Entry::Vacant(entry)) => {
+                let credit = credit.release_conn(recv).detach(recv);
+                entry.insert(Entry {
+                    stream_id: id,
+                    credit,
+                });
+            }
         }
+        Ok(())
     }
 
     pub(super) fn try_take(
@@ -115,32 +110,5 @@ impl Ledger {
         self.entries
             .remove(id.number(), |entry| entry.stream_id == id)
             .map(|entry| entry.credit)
-    }
-}
-
-impl<'scope> Hold<'_, 'scope> {
-    pub(super) fn commit<
-        const ID: u8,
-        B: stream::Recv,
-        const RECONCILE: bool,
-        D: buffer::raw::Segment,
-    >(
-        self,
-        recv: &mut recv::Receive<'_, 'scope, ID, B, RECONCILE, D>,
-    ) {
-        match self {
-            Self::Vacant {
-                entry,
-                stream_id: id,
-                credit,
-            } => {
-                let credit = credit.release_conn(recv).detach(recv);
-                entry.insert(Entry {
-                    stream_id: id,
-                    credit,
-                });
-            }
-            Self::Merge(merge) => merge.commit(recv),
-        }
     }
 }

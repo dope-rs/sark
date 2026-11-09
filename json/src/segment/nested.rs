@@ -186,7 +186,7 @@ impl<'d, T: Decode<C>, C: Copy> Nested<'d, T, C> {
                     Progress::Pending => return Ok(ControlFlow::Continue(())),
                     Progress::Ready(value) => {
                         // SAFETY: Group reserved this slot; projection and decoding preserve it.
-                        unsafe { alloc::raw::VecExt::vacancy(&mut self.values) }.insert(value);
+                        (unsafe { alloc::raw::VecExt::vacancy(&mut self.values) })(value);
                         self.state = State::Delimiter;
                         return Ok(ControlFlow::Continue(()));
                     }

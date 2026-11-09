@@ -14,6 +14,7 @@ use sark_core::{
     life::Observer as _,
     manifold::{stream::Boundary, task::app::Runtime},
 };
+use sark_http::field::metadata::section::rules;
 
 use crate::{
     conn::Error,
@@ -35,8 +36,8 @@ use crate::{
 /// Dispatches a concrete request under the Book that has retained its body.
 /// # Safety
 /// `input` must retain its original Book custody through fresh or deferred admission.
-pub(super) unsafe fn accept<'a, 'state, 'd, ID, R, Q>(
-    head: Drive<'a, 'state, 'd, ID, R, Q>,
+pub(super) unsafe fn accept<'a, 'state, 'd, ID, R, Q, F: rules::Policy>(
+    head: Drive<'a, 'state, 'd, ID, R, Q, F>,
     stream: stream::Key,
     input: <<R::Prepared as request::Prepared>::Family as Family<R::Prepared>>::State<Accepted<'d>>,
 ) -> Result<(), Error>
@@ -48,20 +49,21 @@ where
     Dispatch { head, stream }.run(input)
 }
 
-struct Dispatch<'a, 'state, 'd, ID: Identity + 'd, R, Q>
+struct Dispatch<'a, 'state, 'd, ID: Identity + 'd, R, Q, F: rules::Policy>
 where
     R: Runtime<'d, Target = Target<'d, ID>>,
 {
-    head: Drive<'a, 'state, 'd, ID, R, Q>,
+    head: Drive<'a, 'state, 'd, ID, R, Q, F>,
     stream: stream::Key,
 }
 
-impl<'a, 'state, 'd, ID: Identity + 'd, R, Q> Dispatch<'a, 'state, 'd, ID, R, Q>
+impl<'a, 'state, 'd, ID: Identity + 'd, R, Q, F> Dispatch<'a, 'state, 'd, ID, R, Q, F>
 where
     R: Runtime<'d, Target = Target<'d, ID>>,
     Q: state::Transitions<conn::Id<'d, ID>>,
+    F: rules::Policy,
 {
-    fn into_parts(self) -> (Drive<'a, 'state, 'd, ID, R, Q>, stream::Key) {
+    fn into_parts(self) -> (Drive<'a, 'state, 'd, ID, R, Q, F>, stream::Key) {
         (self.head, self.stream)
     }
 
@@ -221,8 +223,8 @@ where
     }
 }
 
-impl<'a, 'state, 'd, ID: Identity + 'd, R, Q> Map<R::Prepared, Accepted<'d>, Receiving<'d>>
-    for Dispatch<'a, 'state, 'd, ID, R, Q>
+impl<'a, 'state, 'd, ID: Identity + 'd, R, Q, F: rules::Policy>
+    Map<R::Prepared, Accepted<'d>, Receiving<'d>> for Dispatch<'a, 'state, 'd, ID, R, Q, F>
 where
     R: Runtime<'d, Target = Target<'d, ID>>,
     Q: state::Transitions<conn::Id<'d, ID>>,

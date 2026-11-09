@@ -70,7 +70,7 @@ impl<'d> Buf<'d> {
         source: resident::Shared<'d>,
     ) -> Result<(), conn::Error> {
         match self.chunks.try_push(source) {
-            Ok(segments::Push::Loaded | segments::Push::Discarded(_)) => Ok(()),
+            Ok(_) => Ok(()),
             Err(rejected) => Err(conn::Error::SegmentPush(rejected.discard())),
         }
     }

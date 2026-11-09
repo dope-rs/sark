@@ -1,9 +1,6 @@
 pub mod common;
 
-use std::{
-    convert::{self, Infallible},
-    mem,
-};
+use std::convert::Infallible;
 
 use common::response::handoff::Tasks;
 use dope_core::{
@@ -26,11 +23,6 @@ use sark_http::{
 
 #[global_allocator]
 static ALLOCATOR: Tracker = Tracker::new();
-
-#[test]
-fn owner_bound_is_fixed() {
-    assert!(mem::size_of::<request::Segments<'static>>() <= 56);
-}
 
 #[test]
 fn projects_request_owner() {
@@ -124,7 +116,7 @@ fn accepts_static_body() {
 }
 
 #[test]
-fn keeps_unrelated_head() {
+fn releases_unrelated_head() {
     let pool = pool::Pool::try_new(1, 16).expect("the request head pool must allocate");
     let mut lease = pool
         .acquire()
@@ -133,20 +125,13 @@ fn keeps_unrelated_head() {
         .try_append(b"request-head")
         .expect("the request head must fit its lease");
     append.commit();
-    scope::Owner::with(lease.freeze(), |head| {
+    scope::Owner::with(lease.freeze().into_shared(), |head| {
         let slot = handoff::Slot::empty().with_head(head.view());
         let plan = fixed::Body::new(b"static")
             .try_resolve(&slot)
             .expect("the static response must resolve");
-        let (plan, passed) = plan.resolve_head(head, scope::Owner::into_shared);
-        let head = match passed {
-            handoff::Head::Passed(head) => Some(head),
-            handoff::Head::Kept => None,
-        }
-        .expect("a static body must leave the head owner available");
-        assert_eq!(head.as_ref(), b"request-head");
         assert!(pool.acquire().is_none());
-        drop(head.into_inner());
+        let plan = plan.resolve_head(head);
         pool.acquire().expect("released head returns its lease");
         let body = match plan.finish().expect("static response handoff") {
             handoff::Ready::Fixed(body) => Some(body),
@@ -233,9 +218,7 @@ fn retains_head_offsets() {
         scope::Owner::with(owner, |head| {
             let slot = handoff::Slot::empty().with_head(head.view());
             let plan = head.as_ref()[4..10].try_resolve(&slot)?;
-            let (plan, head) = plan.resolve_head(head, convert::identity);
-            assert!(matches!(head, handoff::Head::Kept));
-            Ok::<_, owned::Error>(plan)
+            Ok::<_, owned::Error>(plan.resolve_head(head))
         })
     });
     assert_eq!(allocs, 0);

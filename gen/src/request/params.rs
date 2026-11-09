@@ -219,7 +219,7 @@ impl Expansion {
                     })#convert?
                 }
             }
-            types::ValueKind::U64 | types::ValueKind::Bool => {
+            _ => {
                 return Err(syn::Error::new_spanned(
                     &field.ty,
                     "path fields require Shared or usize",

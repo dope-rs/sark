@@ -1,23 +1,18 @@
 use std::convert::Infallible;
 
 use dope::{manifold::network::listener::conn::write, net::link::egress};
-use o3::buffer::storage;
+use o3::buffer::storage::{self, Shared};
 
-use crate::{
-    frame,
-    server::{ConnState, Error, Phase, Response, app::Sink},
-};
+use crate::server::{ConnState, Error, Phase, Response, app::Sink};
 
 pub(super) struct Output<'a> {
     pub(super) response: Response<'a>,
     pub(super) body: Option<storage::Shared>,
-    capacity: usize,
 }
 
 impl<'a> Output<'a> {
     pub(super) fn new(buffer: &'a mut [u8]) -> Self {
         Self {
-            capacity: buffer.len().saturating_sub(frame::MAX_SERVER_CONTROL_WIRE),
             response: Response::new(buffer),
             body: None,
         }
@@ -36,7 +31,7 @@ impl<'a> Output<'a> {
             self.response.user = room - (self.response.written - before);
             return result.map(Some);
         }
-        if required <= self.capacity || self.response.written != 0 {
+        if self.response.written != 0 {
             return Ok(None);
         }
         let mut owner = storage::Owned::try_with(required).map_err(Error::Allocate)?;
@@ -63,10 +58,11 @@ impl<'a> Output<'a> {
         }
     }
 
-    fn try_finish(self, state: &mut ConnState) -> Result<write::Draft<Infallible, ()>, Error> {
+    /// Completes the EOF transition before separating the output owners.
+    pub(super) fn into_parts<P>(self, state: &mut ConnState<P>) -> (usize, Option<Shared>) {
         if state.eof
             && !matches!(state.phase, Phase::Rejected(_))
-            && self.body.is_none()
+            && (self.body.is_none() || (state.phase == Phase::Active && state.acc.is_empty()))
             && !state
                 .inbound
                 .required()
@@ -74,11 +70,13 @@ impl<'a> Output<'a> {
         {
             state.phase = Phase::Closed;
         }
-        let draft = write::Draft::new(self.response.written, None, ());
-        if let Some(owner) = self.body {
-            if state.pending.is_some() {
-                return Err(Error::Pending);
-            }
+        (self.response.written, self.body)
+    }
+
+    fn try_finish(self, state: &mut ConnState) -> Result<write::Draft<Infallible, ()>, Error> {
+        let (written, body) = self.into_parts(state);
+        let draft = write::Draft::new(written, None, ());
+        if let Some(owner) = body {
             state.pending = Some(egress::NonEmpty::try_new(owner).map_err(Error::Egress)?);
             Ok(draft)
         } else if state.phase == Phase::Closed {

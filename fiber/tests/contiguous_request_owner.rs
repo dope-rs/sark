@@ -11,10 +11,7 @@ use dope_test::{
     scope::{Driver, Error},
 };
 use o3::buffer::{resident, storage};
-use sark_core::{
-    body::{Step, Transfer},
-    route::{Push as _, TaskBuild as _},
-};
+use sark_core::body::{Build as _, Push as _, Step, Transfer};
 use sark_http::{
     payload::owned::{Segment, flatten},
     request::Seq,
@@ -48,7 +45,7 @@ fn bounded_owner_transfer() {
                         let segment = Segment::from(resident::Shared::from(
                             storage::Shared::try_copy(bytes).expect("body owner"),
                         ));
-                        let next = match build.push_body(segment) {
+                        let next = match build.push(segment) {
                             Transfer::Accepted(build) => Ok(build),
                             Transfer::Rejected { error, .. } => Err(error),
                         }
@@ -56,7 +53,7 @@ fn bounded_owner_transfer() {
                         build = next;
                     }
                     let (mut build, released) =
-                        match build.finish_body(6).step(NonZero::<usize>::MIN) {
+                        match build.finish_input(6).step(NonZero::<usize>::MIN) {
                             Step::Pending { build, released } => Ok((build, released)),
                             Step::Failed { build, error, .. } => Err(Some((build, error).1)),
                             Step::NeedInput { .. } | Step::Ready { .. } => Err(None),
@@ -66,7 +63,7 @@ fn bounded_owner_transfer() {
                     let late = storage::Shared::try_copy(chunked::LATE).expect("late owner");
                     let pointer = late.as_slice().as_ptr();
                     let (next, (late, error)) =
-                        match build.push_body(Segment::from(resident::Shared::from(late))) {
+                        match build.push(Segment::from(resident::Shared::from(late))) {
                             Transfer::Rejected { build, error } => Some((build, error)),
                             Transfer::Accepted(_) => None,
                         }
@@ -119,7 +116,7 @@ fn bounded_owner_transfer() {
                     let build =
                         match SegmentedReq::try_builder(ids.try_next().expect("request identity"))
                             .expect("request fields")
-                            .push_body(Segment::from(resident::Shared::from(owner)))
+                            .push(Segment::from(resident::Shared::from(owner)))
                         {
                             Transfer::Accepted(build) => Ok(build),
                             Transfer::Rejected { error, .. } => Err(error),
@@ -134,14 +131,14 @@ fn bounded_owner_transfer() {
                         Step::Ready { .. } | Step::Pending { .. } => None,
                     }
                     .expect("open input must wait");
-                    let mut build = build.finish_body(chunked::SINGLE.len());
+                    let mut build = build.finish_input(chunked::SINGLE.len());
                     for bytes in [b"".as_slice(), chunked::LATE.as_slice()] {
                         let late = Segment::from(resident::Shared::from(
                             storage::Shared::try_copy(bytes).expect("late owner"),
                         ));
                         let late_pointer = late.as_slice().as_ptr();
                         let ((next, (late, error)), allocs) = Tracker::count(|| {
-                            match build.push_body(late) {
+                            match build.push(late) {
                                 Transfer::Rejected { build, error } => Some((build, error)),
                                 Transfer::Accepted(_) => None,
                             }
@@ -187,14 +184,14 @@ fn bounded_owner_transfer() {
             let pointer = owner.as_slice().as_ptr();
             let build = match WholeReq::try_builder(ids.try_next().expect("request identity"))
                 .expect("request fields")
-                .push_body(Segment::from(resident::Shared::from(owner)))
+                .push(Segment::from(resident::Shared::from(owner)))
             {
                 Transfer::Accepted(build) => Ok(build),
                 Transfer::Rejected { error, .. } => Err(error),
             }
             .expect("single owner transfer");
             let (step, allocs) =
-                Tracker::count(|| build.finish_body(6).step(NonZero::<usize>::MIN));
+                Tracker::count(|| build.finish_input(6).step(NonZero::<usize>::MIN));
             let (output, released) = match step {
                 Step::Ready { output, released } => Ok((output, released)),
                 Step::Failed { build, error, .. } => Err(Some((build, error).1)),

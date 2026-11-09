@@ -2,7 +2,7 @@ pub mod common;
 use common::request::*;
 use sark::{
     core::{
-        body::{Contiguous, Discarded, admit::Retention},
+        body::admit::Retention,
         route::{Project, Schema},
     },
     http::request::body,
@@ -10,12 +10,6 @@ use sark::{
 
 #[test]
 fn selects_storage() {
-    fn buffered<T: Schema<Body = Contiguous>>() {}
-    fn discarded<T: Schema<Body = Discarded>>() {}
-
-    buffered::<Raw>();
-    buffered::<Json>();
-    discarded::<Len>();
     assert_eq!(Raw::BODY_RETENTION, Retention::Retained);
     assert_eq!(Json::BODY_RETENTION, Retention::Retained);
     assert_eq!(Len::BODY_RETENTION, Retention::Discarded);

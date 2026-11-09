@@ -1,24 +1,16 @@
 use core::convert::Infallible;
-use sark_core::{
-    decode::Decode,
-    manifold::{schedule::typed, task::app::Runtime},
-};
+use sark_core::manifold::{schedule::typed, task::response::State};
 use sark_http::payload::response::status::Code;
 
 use crate::{conn, frame::numbers};
 
-pub(super) type Stored<'d, P, C, D> =
-    o3::depot::queue::indexed::lanes::typed::Value<Response<'d, P, C, D>, Data<'d, D>, Infallible>;
+pub(super) type Stored<'d, P, D, X> =
+    o3::depot::queue::indexed::lanes::typed::Value<Response<'d, P, D, X>, Data<'d, D>, Infallible>;
 
 type Progress<'d, R> = Result<
     typed::Control<
-        Response<
-            'd,
-            <R as Decode>::Prepared,
-            <R as Runtime<'d>>::Completion,
-            <R as duplex::Application<'d>>::Duplex,
-        >,
-        Data<'d, <R as duplex::Application<'d>>::Duplex>,
+        super::Reply<'d, R>,
+        super::Data<'d, R>,
         Infallible,
         conn::DataBlock,
         numbers::ErrorCode,
@@ -28,7 +20,6 @@ type Progress<'d, R> = Result<
 
 pub(super) mod deadline;
 mod driver;
-mod emission;
 pub(in crate::server) mod expiry;
 pub(super) mod input;
 mod opening;
@@ -42,41 +33,37 @@ pub(super) enum Count {
 
 pub(super) enum Duplex<I, E = PushError<I, payload::Error>> {
     Other(I),
-    Closed(payload::Error, I),
     Applied(Result<(), E>),
 }
 
 use o3::buffer::resident;
 use sark_core::{
-    body,
     decode::{exec, request},
-    duplex::{
-        self,
-        input::{PushError, Status},
-    },
-    life,
+    duplex::{self, input::PushError},
+    life::{self, exchange},
     manifold::stream::Boundary,
 };
-use sark_http::payload::owned;
+use sark_http::{field::metadata::section::rules, owner::cause, payload::owned};
 
 use crate::{
     conn::event,
     server::{
         payload,
-        response::{Head, Pending, Receipt},
+        response::{Head, Pending},
     },
 };
 
-pub(super) enum Response<'d, P, C, D: duplex::Session<'d>> {
+pub(super) enum Response<'d, P, D: duplex::Session<'d>, X> {
     Status(Code),
     Sync(request::Ready<exec::Sync, P, owned::Segments<'d>>),
-    Completion(C),
+    Fixed(X),
+    Task,
+    End,
     Head {
         head: Head<'d>,
-        outcome: life::Outcome,
+        state: State,
         count: Count,
     },
-    Encoded(Receipt<'d>),
     DuplexOpen {
         request: input::Request<'d, P>,
     },
@@ -87,16 +74,11 @@ pub(super) enum Response<'d, P, C, D: duplex::Session<'d>> {
 }
 
 pub(super) enum Data<'d, D: duplex::Session<'d>> {
-    Body {
-        pending: Pending<'d>,
-        outcome: life::Outcome,
-    },
-    Duplex {
-        input: input::Input<'d, D>,
-    },
+    Body { pending: Pending<'d>, state: State },
+    Duplex { input: input::Input<'d, D> },
 }
 
-impl<'d, P, C, D> Response<'d, P, C, D>
+impl<'d, P, D, X> Response<'d, P, D, X>
 where
     D: duplex::Session<'d>,
 {
@@ -119,14 +101,10 @@ where
                     (Self::DuplexOpen { request }, Duplex::Applied(result))
                 }
             },
-            Self::DuplexHead { head, mut input } if matches!(input.status(), Status::Open) => {
+            Self::DuplexHead { head, mut input } => {
                 let result = input.push(data, boundary);
                 (Self::DuplexHead { head, input }, Duplex::Applied(result))
             }
-            other @ Self::DuplexHead { .. } => (
-                other,
-                Duplex::Closed(payload::Error::Body(body::Error::InputFinished), data),
-            ),
             other => (other, Duplex::Other(data)),
         }
     }
@@ -143,14 +121,10 @@ where
                 };
                 (Self::DuplexOpen { request }, Duplex::Applied(result))
             }
-            Self::DuplexHead { head, mut input } if matches!(input.status(), Status::Open) => {
+            Self::DuplexHead { head, mut input } => {
                 let result = input.finish().map_err(input::Error::Machine);
                 (Self::DuplexHead { head, input }, Duplex::Applied(result))
             }
-            other @ Self::DuplexHead { .. } => (
-                other,
-                Duplex::Closed(payload::Error::Body(body::Error::InputFinished), ()),
-            ),
             other => (other, Duplex::Other(())),
         }
     }
@@ -163,29 +137,55 @@ impl<'d, D: duplex::Session<'d>> Data<'d, D> {
         boundary: Boundary,
     ) -> (Self, Duplex<event::DataPayload<resident::Shared<'d>>>) {
         match self {
-            Self::Duplex { mut input } if matches!(input.status(), Status::Open) => {
+            Self::Duplex { mut input } => {
                 let result = input.push(data, boundary);
                 (Self::Duplex { input }, Duplex::Applied(result))
             }
-            other @ Self::Duplex { .. } => (
-                other,
-                Duplex::Closed(payload::Error::Body(body::Error::InputFinished), data),
-            ),
             other @ Self::Body { .. } => (other, Duplex::Other(data)),
         }
     }
 
     pub(in crate::server::task) fn finish(self) -> (Self, Duplex<(), input::Error>) {
         match self {
-            Self::Duplex { mut input } if matches!(input.status(), Status::Open) => {
+            Self::Duplex { mut input } => {
                 let result = input.finish().map_err(input::Error::Machine);
                 (Self::Duplex { input }, Duplex::Applied(result))
             }
-            other @ Self::Duplex { .. } => (
-                other,
-                Duplex::Closed(payload::Error::Body(body::Error::InputFinished), ()),
-            ),
             other @ Self::Body { .. } => (other, Duplex::Other(())),
         }
+    }
+}
+
+/// Releases one queued response without deciding the exchange's terminal outcome.
+pub(in crate::server::task) fn discard<'d, C, P, D, F, M, X>(
+    value: Stored<'d, P, D, X>,
+    connection: &mut conn::machine::Connection<crate::ServerRole, F, resident::Shared<'d>>,
+    exchange: exchange::Id<C, crate::stream::Key>,
+    mode: &mut M,
+    cause: cause::Staging,
+) where
+    C: Copy,
+    D: duplex::Session<'d>,
+    F: rules::Policy,
+    M: life::Mode<C, crate::stream::Key>,
+{
+    use o3::depot::queue::indexed::lanes::typed::Value;
+    match value {
+        Value::Data(Data::Body { pending, .. }) => {
+            super::release_pending(mode, exchange, pending, cause);
+        }
+        Value::Control(Response::Head { head, .. }) => {
+            head.discard(connection);
+        }
+        Value::Control(Response::DuplexHead { head, input }) => {
+            head.discard(connection);
+            drop(input);
+            connection.release_duplex(exchange.stream());
+        }
+        Value::Data(Data::Duplex { input }) => {
+            drop(input);
+            connection.release_duplex(exchange.stream());
+        }
+        _ => {}
     }
 }

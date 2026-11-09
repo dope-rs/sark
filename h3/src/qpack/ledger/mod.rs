@@ -8,8 +8,8 @@ mod raw;
 mod store;
 
 pub(in crate::qpack) use frontier::Advance;
-pub(crate) use store::Plan;
-use store::{Counts, Store};
+use store::{Counts, Store, layout::Node};
+pub(crate) use store::{Occupied, Plan};
 
 use crate::qpack::{self, stream};
 
@@ -172,7 +172,8 @@ impl<'a> Admission<'a> {
 }
 
 impl Tracked<'_> {
-    pub(super) fn apply(self) {
+    /// `false` is reserved for the native response's sole initial section.
+    pub(super) fn apply(self, published: bool) {
         let Self {
             slot,
             counts,
@@ -180,7 +181,7 @@ impl Tracked<'_> {
             active,
             received,
         } = self;
-        store::Table::apply(slot, counts, blocking, received, active);
+        store::Table::apply(slot, counts, blocking, received, active, published);
     }
 }
 
@@ -214,16 +215,45 @@ impl Ledger {
         self.store.floor()
     }
 
+    fn find(&mut self, id: u64) -> Option<compact::Found<store::Table<'_, ()>>> {
+        use compact::Access as _;
+
+        store::Table {
+            ledger: self,
+            input: (),
+        }
+        .find(map::Hasher::hash(&qpack::StreamHash, &id), &id)
+    }
+
+    pub(super) fn initial(&mut self, id: u64) -> Option<Occupied<'_>> {
+        let mut occupied = self.find(id)?;
+        let section = store::Table::head(&mut occupied).section;
+        // Found returns the same exclusive ledger without mutating its live head.
+        let table = occupied.into_owner();
+        Some(Occupied {
+            owner: &mut table.ledger.store,
+            section,
+        })
+    }
+
+    /// Discards the consumed native head's sole unpublished section;
+    /// static sections and prior peer cancellation have no remaining row.
+    pub(super) fn discard_initial(&mut self, id: u64) {
+        if let Some(mut occupied) = self.find(id) {
+            store::Table::release_head(&mut occupied);
+            occupied.remove();
+        }
+    }
+
     /// Releases the oldest section on `stream_id` and returns the exact insert
     /// count proven received by that acknowledgment.
     pub(super) fn acknowledge(&mut self, id: u64, received: u64) -> Result<u64, stream::Error> {
-        let ledger = self;
-        use compact::Access as _;
-
-        let hash = map::Hasher::hash(&qpack::StreamHash, &id);
-        let mut occupied = store::Table { ledger, input: () }
-            .find(hash, &id)
+        let mut occupied = self
+            .find(id)
             .ok_or(stream::Error::UnknownSection { stream_id: id })?;
+        if store::Table::head(&mut occupied).row().node(Node::Next) == store::UNPUBLISHED {
+            return Err(stream::Error::UnknownSection { stream_id: id });
+        }
         let (required, has_next) = store::Table::release_head(&mut occupied);
         let advance = frontier::Advance::at_least(received, required);
         if has_next {
@@ -235,11 +265,7 @@ impl Ledger {
     }
 
     pub(super) fn cancel(&mut self, id: u64) {
-        let ledger = self;
-        use compact::Access as _;
-
-        let hash = map::Hasher::hash(&qpack::StreamHash, &id);
-        let Some(mut occupied) = (store::Table { ledger, input: () }).find(hash, &id) else {
+        let Some(mut occupied) = self.find(id) else {
             return;
         };
         loop {

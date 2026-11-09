@@ -30,7 +30,7 @@ impl Terminal {
             Section::Initial => rules::Kind::Response,
             Section::Trailing => rules::Kind::ResponseTrailers,
         };
-        let owner = owner.validate(kind)?;
+        let owner = Valid::try_from(owner, kind)?;
         let Some(code) = View::<Valid>::new(&owner).code() else {
             if let Some(status) = View::<Valid>::new(&owner).http_status().or(initial) {
                 return Ok(Self::Http(status));

@@ -3,7 +3,7 @@ use std::time::Duration;
 use dope::core::driver::schedule::clock::timer::Timer;
 use sark_http::payload::response::status;
 
-use crate::common::retained::State;
+use crate::common::{retained::State, route::body::OwnedReply as Reply};
 
 #[sark_fiber::request(ordered)]
 pub struct EchoReq {
@@ -16,12 +16,6 @@ pub struct EchoReq {
     pub user_id: storage::Shared,
     #[header("x-echo-marker", default = "MISSING")]
     pub marker: storage::Shared,
-}
-
-#[sark_fiber::response(raw)]
-pub struct Reply {
-    pub status: status::Code,
-    pub body: Vec<u8>,
 }
 
 #[sark_fiber::handler(pub)]

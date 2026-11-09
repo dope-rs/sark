@@ -2,7 +2,7 @@ use sark_h3::conn::push;
 use sark_http::field::literal;
 
 use crate::common::{
-    atomic::try_dynamic_sender,
+    atomic::dynamic_sender,
     conn::{Events, payload::Write as _},
     field::entry,
     message::promise::Authority,
@@ -31,7 +31,7 @@ use sark_h3::{
 
 #[test]
 fn headers_wait_for_section() {
-    let mut conn = try_dynamic_sender(2, usize::MAX).expect("dynamic sender");
+    let mut conn = dynamic_sender(2, usize::MAX);
     conn.control()
         .open(Id::new(7).expect("control stream"))
         .expect("one total slot remains");
@@ -88,7 +88,7 @@ fn headers_wait_for_section() {
 
 #[test]
 fn byte_credit_is_atomic() {
-    let mut conn = try_dynamic_sender(8, 8).expect("dynamic sender");
+    let mut conn = dynamic_sender(8, 8);
     assert!(matches!(
         Send::new(&mut conn).headers(
             Id::new(0).expect("stream id"),
@@ -134,7 +134,7 @@ fn byte_credit_is_atomic() {
 
 #[test]
 fn push_batch_is_atomic() {
-    let mut conn = try_dynamic_sender(2, usize::MAX).expect("dynamic sender");
+    let mut conn = dynamic_sender(2, usize::MAX);
     conn.control()
         .open(Id::new(7).expect("control stream"))
         .expect("one total slot remains");
@@ -189,7 +189,7 @@ fn push_batch_is_atomic() {
 
 #[test]
 fn dynamic_batch_decodes() {
-    let mut sender = try_dynamic_sender(3, usize::MAX).expect("dynamic sender");
+    let mut sender = dynamic_sender(3, usize::MAX);
     let body = b"owner".to_vec();
     let pointer = body.as_ptr();
     let prepared = sender
@@ -198,7 +198,7 @@ fn dynamic_batch_decodes() {
             Id::new(0).expect("stream id"),
             [
                 literal!(entry(b":status", b"200")),
-                literal!(entry(b"x-dynamic", b"committed")),
+                literal!(entry(b"x-dynamic", b"committed-owned-prefix")),
             ],
         )
         .expect("fixed atomic QPACK scenario must succeed");
@@ -206,7 +206,8 @@ fn dynamic_batch_decodes() {
         replies::Data::try_new(WritePayload::Owned(body)).map(|body| prepared.complete(body));
     assert!(done.is_ok(), "fixture body fits one DATA frame");
     if let Ok(batch) = done {
-        batch.commit().expect("dynamic batch must commit");
+        let charge = batch.commit().expect("dynamic batch must commit");
+        assert_eq!(charge, sender.retained(Id::ZERO).expect("response owners"));
 
         let qpack = sender
             .events()
@@ -274,11 +275,9 @@ fn dynamic_batch_decodes() {
                 .poll_token()
                 .expect("fixed atomic QPACK scenario must succeed")
             {
-                Some(Event::Headers { head, .. }) => head
-                    .into_parts()
-                    .0
-                    .iter()
-                    .any(|field| field.name == b"x-dynamic" && field.value == b"committed"),
+                Some(Event::Headers { head, .. }) => head.into_parts().0.iter().any(|field| {
+                    field.name == b"x-dynamic" && field.value == b"committed-owned-prefix"
+                }),
                 _ => false,
             });
         }

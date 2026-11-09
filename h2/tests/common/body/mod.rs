@@ -162,7 +162,6 @@ impl Peer for Connection<ClientRole> {
         loop {
             while let Some(event) = self.ingress().poll_event() {
                 if let Some(value) = visit(event) {
-                    self.try_flush(socket).map_err(ReadError::Io)?;
                     return Ok(value);
                 }
             }

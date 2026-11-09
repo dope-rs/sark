@@ -123,7 +123,6 @@ impl Error {
                 | segments::Error::Count(_)
                 | segments::Error::Logical(_)
                 | segments::Error::Resident(_)
-                | segments::Error::Total(_)
                 | segments::Error::Boundary(_) => crate::Code::Internal,
             },
             Self::LengthOverflow { .. } | Self::BodyLength { .. } | Self::Input(_) => {

@@ -3,12 +3,14 @@ use sark_h1::{
     Input,
     wire::{head, parsing},
 };
-use sark_http::{h1::head::line::error, request::span::Span};
+use sark_http::{field::head::AcceptEncoding, h1::head::line::error, request::span::Span};
 
 #[sark_fiber::request]
 pub struct HdrReq {
     #[header("x-token", default = "none")]
     pub x_token: Shared,
+    #[header("accept-encoding")]
+    pub encoding: Option<AcceptEncoding>,
 }
 
 #[sark_fiber::request]
@@ -92,9 +94,9 @@ pub trait Captured {
 }
 
 impl<'req> Captured for HdrReqHeaders<'req> {
-    type Output = &'req [u8];
+    type Output = (&'req [u8], Option<AcceptEncoding>);
     fn captured(&self) -> Self::Output {
-        self.x_token
+        (self.x_token, self.encoding)
     }
 }
 

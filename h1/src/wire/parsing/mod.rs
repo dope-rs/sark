@@ -5,6 +5,7 @@ use std::num::NonZero;
 use o3::buffer::{bytes::window::Snapshot, storage};
 use sark_core::{request, route, route::field::query};
 use sark_http::{
+    field::scan::Match,
     h1::{
         codec::canned,
         field::syntax,
@@ -68,7 +69,10 @@ impl<R: route::Schema> Request<R> {
 
     pub fn into_consume<'d, D>(self) -> crate::session::Outcome<'d, D> {
         match self {
-            Self::Wire(error) => crate::session::Outcome::Failed(error),
+            Self::Wire(error)
+            | Self::Head(head::Error::Line(head::line::Error::Admission(error))) => {
+                crate::session::Outcome::Failed(error)
+            }
             Self::Head(head::Error::Storage(error)) => {
                 crate::session::Outcome::Failed(Failure::Input(InputError::Storage(error)))
             }
@@ -239,7 +243,9 @@ impl<'d> Rejected<'d> {
         input: Input<'_>,
         permit: session::Permit,
     ) -> session::RouteOutcome<'d, P, D, H, Self> {
-        if let Err(error) = self.source.try_extend(input.as_slice()) {
+        let input = input.as_slice();
+        let limit = recv::HEAD_CAPACITY + 1 - self.len();
+        if let Err(error) = self.source.try_extend(&input[..input.len().min(limit)]) {
             return failed(error).into();
         }
         self.advance(permit)
@@ -308,17 +314,23 @@ impl<'d> LineError<'d> {
 
 pub(crate) enum LineProgress {
     Pending(Line),
-    Complete { source: Source, prior: usize },
+    Complete {
+        source: Source,
+        prior: usize,
+        used: usize,
+    },
 }
 
 impl Line {
     pub(crate) fn start<'d>(input: Input<'_>) -> Result<Self, LineError<'d>> {
-        let source = scan::State::pending_line(
-            input.as_slice(),
-            Limit::DEFAULT.with_bytes(recv::HEAD_CAPACITY),
-        )
-        .map_err(|(_, error)| LineError::Close(rejection(error)))?;
-        let capacity = NonZero::new(source.as_ref().len()).unwrap_or(NonZero::<usize>::MIN);
+        Self::snapshot(input.as_slice(), 0)
+    }
+
+    fn snapshot<'d>(input: &[u8], extra: usize) -> Result<Self, LineError<'d>> {
+        let source =
+            scan::State::pending_line(input, Limit::DEFAULT.with_bytes(recv::HEAD_CAPACITY))
+                .map_err(|(_, error)| LineError::Close(rejection(error)))?;
+        let capacity = NonZero::new(input.len() + extra).unwrap_or(NonZero::<usize>::MIN);
         let source = source.try_snapshot(capacity).map_err(line_failure)?;
         Ok(Self { source })
     }
@@ -327,18 +339,58 @@ impl Line {
         self.source.as_ref().len()
     }
 
-    pub(crate) fn advance<'d>(mut self, input: Input<'_>) -> Result<LineProgress, LineError<'d>> {
+    fn fragment<'a, 'd>(prior: &[u8], input: &'a [u8]) -> Result<&'a [u8], LineError<'d>> {
+        let end = if prior.last() == Some(&b'\r') {
+            1
+        } else {
+            let bounded = &input[..input
+                .len()
+                .min(recv::HEAD_CAPACITY.saturating_sub(prior.len()))];
+            Match::find(b'\r', bounded).map_or(input.len(), |found| found.start() + 2)
+        };
+        let actual = prior.len().saturating_add(end);
+        if actual > recv::HEAD_CAPACITY {
+            return Err(LineError::Close(rejection(ParseError::too_large(
+                actual,
+                recv::HEAD_CAPACITY,
+            ))));
+        }
+        Ok(&input[..end.min(input.len())])
+    }
+
+    pub(crate) fn prefixed<'d>(
+        prefix: sark_http::preface::Prefix,
+        input: Input<'_>,
+    ) -> Result<LineProgress, LineError<'d>> {
+        let prefix = prefix.as_ref();
+        match Head::parse(Input::Borrowed(prefix), 0) {
+            Ok(None) => {}
+            Err(_) => return Err(LineError::Close(canned::BAD_REQUEST)),
+            Ok(Some(_)) => unreachable!("preface"),
+        }
+        let fragment = Self::fragment(prefix, input.as_slice())?;
+        Self::snapshot(prefix, fragment.len())?.extend(fragment)
+    }
+
+    pub(crate) fn advance<'d>(self, input: Input<'_>) -> Result<LineProgress, LineError<'d>> {
+        let fragment = Self::fragment(self.source.as_ref(), input.as_slice())?;
+        self.extend(fragment)
+    }
+
+    fn extend<'d>(mut self, fragment: &[u8]) -> Result<LineProgress, LineError<'d>> {
         let prior = self.len();
-        self.source
-            .try_extend(input.as_slice())
-            .map_err(line_failure)?;
+        self.source.try_extend(fragment).map_err(line_failure)?;
         match self
             .source
             .advance_line()
             .map_err(|(_, error)| LineError::Close(rejection(error)))?
         {
             Progress::More(source) => Ok(LineProgress::Pending(Self { source })),
-            Progress::Complete(source) => Ok(LineProgress::Complete { source, prior }),
+            Progress::Complete(source) => Ok(LineProgress::Complete {
+                source,
+                prior,
+                used: fragment.len(),
+            }),
         }
     }
 }

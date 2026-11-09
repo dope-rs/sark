@@ -13,6 +13,7 @@ license.workspace = true
 dope.workspace = true
 sark-http.workspace = true
 sark-core.workspace = true
+sark-ws.workspace = true
 o3.workspace = true
 pin-project.workspace = true
 

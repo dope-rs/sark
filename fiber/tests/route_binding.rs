@@ -20,20 +20,21 @@ use dope_test::{
 use o3::buffer::hold::limits::Bound;
 use sark_core::{decode::Decode, duplex};
 use sark_fiber::{Config, EmptyState};
-use sark_h1::{
-    route::set::Table,
-    server::{date, deadline::policies},
-};
+use sark_h1::server::{date, deadline::policies};
 use sark_h2::server;
 use sark_http::field::metadata::block;
 
 use crate::common::{
     h1::{
         DUPLEX_STATE, FiberApplication, Layout as _, MultiDuplexApplication, PortableRouter,
-        PortableRouterTable, Session, SingleDuplexApplication,
+        Session, SingleDuplexApplication,
     },
-    h2::server::{CONNECT, EXTENDED},
+    h2::{
+        apps::Layout as _,
+        server::{CONNECT, EXTENDED},
+    },
     route::{
+        body::tunnels::{self, ConnectFirst, WebsocketFirst, WebsocketOnly},
         glue::agnostic::{self, AgnApp},
         metadata::{DecodeExt as _, EntriesExt as _},
     },
@@ -46,7 +47,6 @@ static ALLOCATOR: Tracker = Tracker::new();
 #[test]
 fn router_is_zst() {
     assert_eq!(mem::size_of::<PortableRouter>(), 0);
-    let _: <PortableRouterTable as Table<EmptyState>>::Compression = ();
 }
 
 #[test]
@@ -82,6 +82,59 @@ fn duplex_layout_is_exact() {
             ),
     );
     assert!(multiple.dimensions(policies::HeadOnly) == (1, 1, block::Connect::Enabled,),);
+
+    let counters = tunnels::Duplex::default();
+    let state = tunnels::State {
+        counters: &counters,
+        finish_output_on_input: false,
+        hold_output_on_finish: false,
+    };
+    let ws = (
+        mem::size_of::<sark_ws::server::Session<tunnels::Websocket<'_>>>(),
+        mem::align_of::<sark_ws::server::Session<tunnels::Websocket<'_>>>(),
+    );
+    assert_eq!(
+        WebsocketOnly::multiplexed::<Identity, KeyTag<0>, server::Target<'_, KeyTag<0>>>(
+            &state,
+            Config::new(1),
+        )
+        .layout(),
+        (
+            mem::size_of::<duplex::Never>(),
+            mem::align_of::<duplex::Never>()
+        ),
+    );
+    assert_eq!(
+        WebsocketFirst::multiplexed::<Identity, KeyTag<0>, server::Target<'_, KeyTag<0>>>(
+            &state,
+            Config::new(1),
+        )
+        .layout(),
+        ws,
+    );
+    assert_eq!(
+        ConnectFirst::multiplexed::<Identity, KeyTag<0>, server::Target<'_, KeyTag<0>>>(
+            &state,
+            Config::new(1),
+        )
+        .layout(),
+        ws,
+    );
+    let echo = Brand::with(|brand| {
+        tunnels::ConnectDispatch::multiplexed::<Identity, KeyTag<0>, server::Target<'_, KeyTag<0>>>(
+            brand,
+            &state,
+            Config::new(1),
+        )
+        .layout()
+    });
+    assert_eq!(
+        echo,
+        (
+            mem::size_of::<tunnels::Echo<'_>>(),
+            mem::align_of::<tunnels::Echo<'_>>()
+        )
+    );
 }
 
 #[test]
@@ -163,6 +216,37 @@ fn routes_without_alloc() {
             let (prepared, (count, bytes)) = Tracker::usage(|| app.try_head(planned));
             prepared.expect("route head must be valid");
             assert_eq!((count, bytes), (0, 0));
+
+            let fields = [
+                agnostic::FIELDS.as_slice(),
+                agnostic::BAD_ENCODING.as_slice(),
+            ]
+            .concat();
+            let full = fields
+                .try_raw(block::Connect::Disabled)
+                .expect("native field admission")
+                .try_request()
+                .ok()
+                .expect("request");
+            let planned = app
+                .try_select(fields.try_decoded().expect("decoded fields"))
+                .expect("selected fields")
+                .try_request()
+                .ok()
+                .expect("request");
+            for result in [app.try_full(full), app.try_head(planned)] {
+                assert!(matches!(
+                    result,
+                    Err(sark_core::decode::HeadError::Schema(
+                        agnostic::AgnAppHeadCause::R0001(sark_core::route::Error::Header {
+                            field: agnostic::PairReqIdentity::Header0,
+                            cause: sark_core::request::field::Error::AcceptEncoding(
+                                sark_http::field::head::Error::Value
+                            ),
+                        })
+                    ))
+                ));
+            }
         },
         Policy::new(|event| reports3.push(event), recover),
         |result| {

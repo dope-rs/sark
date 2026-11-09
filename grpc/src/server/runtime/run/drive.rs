@@ -1,10 +1,10 @@
-use std::{convert, mem};
+use std::mem;
 
 use dope::core::driver::schedule::clock;
 use o3::buffer::{resident, storage};
 use sark_core::manifold::{
     schedule,
-    server::{Connection, app, drain},
+    server::{self, Connection, app, drain},
 };
 use sark_h2::stream::Key;
 use state::active;
@@ -12,21 +12,23 @@ use state::active;
 use crate::{
     protocol::section,
     server::{
-        call,
+        call::Handler,
         config::Limits,
         egress,
         runtime::{
             policy,
-            run::{read, write},
-            state::{self, lanes},
+            run::Failure,
+            state::{self, Store, lanes},
         },
         service::{handler::Production, timers},
     },
 };
 
-pub(super) struct Driver<'a, X, F> {
+pub(super) struct Driver<'a, X, O, H, F> {
     pub(super) exec: &'a mut X,
-    pub(super) sink: &'a mut F,
+    pub(super) owner: O,
+    pub(super) context: &'a mut H,
+    pub(super) sink: F,
     pub(super) limits: &'a Limits,
 }
 
@@ -45,7 +47,7 @@ pub(super) trait Mode<'d>: state::Timing<'d> {
 
     fn poll<'r, T, C>(
         now: clock::Moment<'d>,
-        state: &mut state::Session<'r, 'd, T, Self, C>,
+        state: &mut Store<'r, 'd, T, Self, C>,
         active: &'r active::Signals,
     ) -> Option<active::Entry<'r>>
     where
@@ -63,7 +65,7 @@ pub(super) trait Mode<'d>: state::Timing<'d> {
 impl<'d> Mode<'d> for timers::Off {
     fn poll<'r, T, C>(
         _: clock::Moment<'d>,
-        state: &mut state::Session<'r, 'd, T, Self, C>,
+        state: &mut Store<'r, 'd, T, Self, C>,
         active: &'r active::Signals,
     ) -> Option<active::Entry<'r>>
     where
@@ -87,17 +89,14 @@ impl<'d> Mode<'d> for timers::Off {
 impl<'d> Mode<'d> for timers::On {
     fn poll<'r, T, C>(
         now: clock::Moment<'d>,
-        state: &mut state::Session<'r, 'd, T, Self, C>,
+        state: &mut Store<'r, 'd, T, Self, C>,
         active: &'r active::Signals,
     ) -> Option<active::Entry<'r>>
     where
         C: Connection<Key = Key, Owner = resident::Shared<'d>, Output = storage::Shared>,
     {
         if let Some(entry) = state.output_deadlines.pop(now)
-            && matches!(
-                state.calls.records.production(entry.key()),
-                Some(Production::Ready)
-            )
+            && matches!(state.calls.production(entry.key()), Some(Production::Ready))
         {
             entry.output();
         }
@@ -116,64 +115,72 @@ impl<'d> Mode<'d> for timers::On {
     }
 }
 
-impl<'a, X, F> Driver<'a, X, F> {
-    pub(super) fn new(exec: &'a mut X, limits: &'a Limits, sink: &'a mut F) -> Self {
-        Self { exec, limits, sink }
-    }
-
-    pub(super) fn egress<'r, 'd, C, O>(
+impl<'a, 'r, 'd, X, O, H, F> Driver<'a, X, O, H, F>
+where
+    O: Copy + Eq + 'd,
+    X: policy::Dispatch<'d, O, Target = active::Entry<'r>>,
+    X::Timer: Mode<'d>,
+{
+    pub(super) fn egress<C>(
         &mut self,
-        state: &mut state::Session<'r, 'd, call::Handler<X::Call, X::State>, X::Timer, C>,
+        state: &mut Store<'r, 'd, Handler<X::Call, X::State>, X::Timer, C>,
         conn: &mut C,
-        owner: O,
         active: &active::Signals,
         egress: schedule::Egress,
+        notify: impl FnMut(&mut H, schedule::Wake<Key>),
     ) -> (schedule::Report, active::Edge)
     where
         C: Connection<Key = Key, Owner = resident::Shared<'d>, Output = storage::Shared>,
-        O: Copy + Eq + 'd,
-        F: FnMut(Key, egress::Error<C::Error>),
-        X: policy::Dispatch<'d, O, Target = active::Entry<'r>>,
+        F: FnMut(&mut H, Key, egress::Error<C::Error>),
     {
+        let owner = self.owner;
         let exec = &mut self.exec;
-        state.drive(conn, egress, active, self.sink, |entry, call| {
-            exec.cancel(owner, entry, call);
-        })
+        state.drive(
+            conn,
+            egress,
+            self.context,
+            notify,
+            active,
+            &mut self.sink,
+            |entry, call| exec.cancel(owner, entry, call),
+        )
     }
 
     /// The turn time is fixed, and new call deadlines use positive durations,
     /// so only the initial due set needs draining. Output callbacks can add
     /// due output timers, which remain polled by the lane loop.
-    pub(super) fn drain<'r, 'd, C, O>(
+    pub(super) fn drain<C>(
         &mut self,
-        state: &mut state::Store<'r, 'd, call::Handler<X::Call, X::State>, X::Timer, C>,
+        store: &mut state::Store<'r, 'd, Handler<X::Call, X::State>, X::Timer, C>,
         conn: &mut C,
-        turn: &mut app::Turn<'_, '_, '_, '_, 'd, O>,
-        egress: schedule::Egress,
-    ) -> Result<drain::Progress, active::Error>
+        turn: &mut app::Turn<'_, '_, '_, 'd, O>,
+        mut protocol: impl FnMut(
+            &mut H,
+            &mut C,
+            &mut drain::Events<'_, 'd>,
+            &state::Store<'r, 'd, Handler<X::Call, X::State>, X::Timer, C>,
+        ) -> Result<Option<server::Event<C>>, C::Error>,
+        mut notify: impl FnMut(&mut H, schedule::Wake<Key>),
+        finish: impl FnOnce(&mut H, &mut C),
+    ) -> Result<drain::Progress, app::Error<C::Error, Failure>>
     where
         C: Connection<
                 Key = Key,
                 Owner = resident::Shared<'d>,
                 Fields = section::Owner,
                 Output = storage::Shared,
-                Retired = convert::Infallible,
             >,
-        O: Copy + Eq + 'd,
-        F: FnMut(Key, egress::Error<C::Error>),
-        X: policy::Dispatch<'d, O, Target = active::Entry<'r>>,
-        X::Timer: Mode<'d>,
+        F: FnMut(&mut H, Key, egress::Error<C::Error>),
     {
         let now = turn.driver().driver_ref().clock().now();
-        let owner = turn.owner();
+        let owner = self.owner;
         let work = turn.work();
         let wake = turn.wake();
-        let state::Store { state, active } = state;
-        state.egress_released |= matches!(egress, schedule::Egress::Released);
-        let active = active.get();
+        let active = store.active.get();
         drain::Events::fair(work, |mut drain| {
             let mut again = false;
             'work: {
+                let state = &mut *store;
                 while state.deadline().is_some_and(|at| at <= now) {
                     let key = match drain.next_ready(|| state.pop_deadline(now)) {
                         Ok(Some(key)) => key,
@@ -183,19 +190,19 @@ impl<'a, X, F> Driver<'a, X, F> {
                             break 'work;
                         }
                     };
-                    if let Some(entry) = state.calls.records.entry(key) {
+                    if let Some(entry) = state.calls.entry(key) {
                         self.fail(
                             state,
                             conn,
-                            owner,
                             crate::Status::from_code(crate::Code::DeadlineExceeded),
                             entry,
                         );
                     }
                 }
                 loop {
+                    let state = &mut *store;
                     if mem::take(&mut state.egress_released) {
-                        self.egress(state, conn, owner, active, schedule::Egress::Released);
+                        self.egress(state, conn, active, schedule::Egress::Released, &mut notify);
                     }
                     let cursor = state.work.waiting;
                     let retries = state.work.retries;
@@ -214,10 +221,14 @@ impl<'a, X, F> Driver<'a, X, F> {
                     });
                     match selected {
                         Some(lanes::Kind::Protocol) => {
-                            let Some(event) = drain.next(conn) else {
+                            let Some(event) = protocol(self.context, conn, &mut drain, store)
+                                .map_err(app::Error::Connection)?
+                            else {
                                 break;
                             };
-                            read::Reader::new(self).event(now, state, conn, turn, active, event)?;
+                            self.event(now, store, conn, turn, active, event)
+                                .map_err(Failure::Readiness)
+                                .map_err(app::Error::Application)?;
                         }
                         Some(lanes::Kind::Semantic) => {
                             let entry = match drain.next_ready(|| state.poll_app(active)) {
@@ -228,7 +239,7 @@ impl<'a, X, F> Driver<'a, X, F> {
                                     break;
                                 }
                             };
-                            read::Reader::new(self).semantic(state, conn, turn, entry);
+                            self.semantic(state, conn, turn, entry);
                         }
                         Some(lanes::Kind::Output) => {
                             let entry =
@@ -240,7 +251,7 @@ impl<'a, X, F> Driver<'a, X, F> {
                                         break;
                                     }
                                 };
-                            write::Writer::new(self).output(now, state, conn, owner, entry);
+                            self.output(now, state, conn, entry);
                         }
                         Some(lanes::Kind::Completion) => {
                             let (entry, done) = match drain.next_ready(|| self.exec.pop_done(owner))
@@ -252,22 +263,28 @@ impl<'a, X, F> Driver<'a, X, F> {
                                     break;
                                 }
                             };
-                            write::Writer::new(self).completion(state, conn, owner, done, entry);
+                            self.completion(state, conn, done, entry);
                             again |= self.exec.wake_tasks(owner) == policy::TaskState::Ready;
                         }
                         Some(lanes::Kind::Task) => {
                             again |= self.exec.drive_tasks(owner, work, turn.driver())
                                 == policy::TaskState::Ready;
-                            self.egress(state, conn, owner, active, schedule::Egress::Unchanged);
+                            self.egress(
+                                state,
+                                conn,
+                                active,
+                                schedule::Egress::Unchanged,
+                                &mut notify,
+                            );
                             break;
                         }
                         None => {
                             let (_, edge) = self.egress(
                                 state,
                                 conn,
-                                owner,
                                 active,
                                 schedule::Egress::Unchanged,
+                                &mut notify,
                             );
                             match edge {
                                 active::Edge::None => break,
@@ -277,6 +294,7 @@ impl<'a, X, F> Driver<'a, X, F> {
                     }
                 }
             }
+            let state = &*store;
             let result = drain.finish();
             let done = X::TASKS && self.exec.has_done(owner);
             let task = X::TASKS && active.has_work();
@@ -294,63 +312,54 @@ impl<'a, X, F> Driver<'a, X, F> {
                 || output
                 || done
                 || again
-                || state.calls.records.has_runnable();
+                || state.calls.has_runnable();
             if rearm && !result.is_exhausted() {
                 wake.wake();
             }
+            finish(self.context, conn);
             Ok(result)
         })
     }
 
-    pub(super) fn fail<'r, 'd, C, O>(
+    pub(super) fn fail<C>(
         &mut self,
-        state: &mut state::Session<'r, 'd, call::Handler<X::Call, X::State>, X::Timer, C>,
+        state: &mut Store<'r, 'd, Handler<X::Call, X::State>, X::Timer, C>,
         conn: &mut C,
-        owner: O,
         status: crate::Status,
         entry: active::Entry<'r>,
     ) where
         C: Connection<Key = Key, Owner = resident::Shared<'d>, Output = storage::Shared>,
-        O: Copy + Eq + 'd,
-        F: FnMut(Key, egress::Error<C::Error>),
-        X: policy::Dispatch<'d, O, Target = active::Entry<'r>>,
+        F: FnMut(&mut H, Key, egress::Error<C::Error>),
     {
-        self.cancel(state, owner, entry);
-        state.send_error(conn, status, entry, self.sink)
+        self.cancel(state, entry);
+        state.send_error(conn, status, entry, &mut |stream, error| {
+            (self.sink)(self.context, stream, error)
+        })
     }
 
-    pub(super) fn complete<'r, 'd, C, O>(
+    pub(super) fn complete<C>(
         &mut self,
-        state: &mut state::Session<'r, 'd, call::Handler<X::Call, X::State>, X::Timer, C>,
+        state: &mut Store<'r, 'd, Handler<X::Call, X::State>, X::Timer, C>,
         conn: &mut C,
-        owner: O,
         entry: active::Entry<'r>,
     ) where
         C: Connection<Key = Key, Owner = resident::Shared<'d>, Output = storage::Shared>,
-        O: Copy + Eq + 'd,
-        X: policy::Dispatch<'d, O, Target = active::Entry<'r>>,
     {
         <X::Timer as state::Timing<'d>>::cancel(&mut state.output_deadlines, entry);
-        self.cancel(state, owner, entry);
+        self.cancel(state, entry);
         state.complete(conn, entry);
     }
 
-    pub(super) fn cancel<'r, 'd, C, O>(
+    pub(super) fn cancel<C>(
         &mut self,
-        state: &mut state::Session<'r, 'd, call::Handler<X::Call, X::State>, X::Timer, C>,
-        owner: O,
+        state: &mut Store<'r, 'd, Handler<X::Call, X::State>, X::Timer, C>,
         entry: active::Entry<'r>,
     ) where
         C: Connection<Key = Key, Owner = resident::Shared<'d>, Output = storage::Shared>,
-        O: Copy + Eq + 'd,
-        X: policy::Dispatch<'d, O, Target = active::Entry<'r>>,
     {
-        let Some(record) = state.calls.records.get_mut(entry.key()) else {
+        let Some(call) = state.calls.handler_mut(entry.key()) else {
             return;
         };
-        let Some(call) = record.handler_mut() else {
-            return;
-        };
-        self.exec.cancel(owner, entry, call)
+        self.exec.cancel(self.owner, entry, call)
     }
 }

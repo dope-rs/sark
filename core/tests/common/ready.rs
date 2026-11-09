@@ -1,6 +1,5 @@
 use core::{cell::Cell, num::NonZero};
 
-use o3::buffer::segments;
 use sark_core::{
     body::{self, credit},
     life,
@@ -13,6 +12,7 @@ pub const BYTES: &[u8] = b"abc";
 pub struct Invalid;
 
 pub struct Ready<'d> {
+    pub released: credit::Amount,
     segments: Vec<owned::Segment<'d>>,
     finished: bool,
     outcome: Result<(), Invalid>,
@@ -22,6 +22,7 @@ pub struct Ready<'d> {
 impl<'d> Ready<'d> {
     pub fn new(outcome: Result<(), Invalid>, valid: &'d Cell<bool>) -> Self {
         Self {
+            released: credit::Amount::default(),
             segments: Vec::new(),
             finished: false,
             outcome,
@@ -45,7 +46,7 @@ impl<'d> body::Build<'d> for Ready<'d> {
         self.valid.set(self.valid.get() && self.finished);
         body::Step::Ready {
             output: self.segments,
-            released: credit::Amount::new(0, segments::Count::EMPTY),
+            released: self.released,
         }
     }
 }

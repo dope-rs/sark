@@ -23,6 +23,7 @@ pub(crate) trait Transitions<C: Copy>: life::Mode<C, stream::Key> {
     fn progress(&mut self, exchange: Id<C, stream::Key>);
     fn started(&mut self, exchange: Id<C, stream::Key>);
     fn ready(&mut self, exchange: Id<C, stream::Key>);
+    fn cancel(&mut self, key: stream::Key);
 }
 
 pub(crate) struct Projection<'a, 'd, C: Copy, M, D> {
@@ -195,6 +196,15 @@ where
     fn ready(&mut self, exchange: Id<C, stream::Key>) {
         if D::ENABLED {
             self.transition(exchange, timeline::Transition::ResponseReady);
+        }
+    }
+
+    fn cancel(&mut self, key: stream::Key) {
+        if D::ENABLED
+            && let Some(timer) = self.timer.as_mut()
+            && timer.cancel(key) == timers::Change::Changed
+        {
+            self.change = timers::Change::Changed;
         }
     }
 }

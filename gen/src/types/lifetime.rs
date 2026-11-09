@@ -26,19 +26,18 @@ impl<'a> Lifetimes<'a> {
         !denied
     }
 
-    pub(crate) fn rebind(&self, ident: &str) -> syn::Type {
-        self.rewrite(|lifetime| {
-            lifetime.ident = quote::format_ident!("{}", ident);
-        })
-    }
-
-    pub(crate) fn response(&self, request: &str, driver: &str) -> syn::Type {
+    pub(crate) fn response(
+        &self,
+        request: &syn::Lifetime,
+        driver: Option<&syn::Lifetime>,
+        state: &[syn::Lifetime],
+    ) -> syn::Type {
         self.rewrite(|lifetime| {
             let name = lifetime.ident.unraw();
             if name == "d" {
-                lifetime.ident = quote::format_ident!("{}", driver);
-            } else if name != "static" {
-                lifetime.ident = quote::format_ident!("{}", request);
+                *lifetime = driver.unwrap_or(request).clone();
+            } else if name != "static" && !state.iter().any(|state| state.ident.unraw() == name) {
+                *lifetime = request.clone();
             }
         })
     }

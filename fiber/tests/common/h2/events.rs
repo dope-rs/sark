@@ -186,12 +186,16 @@ impl<'d, ID: Identity, F: FnMut(&dyn fmt::Debug)> life::Observer<conn::Id<'d, ID
             Event::SessionClosed(_) => ("session-closed", u64::MAX),
         };
         let mut facts = self.0.take();
-        if let Event::Terminal {
-            outcome: Outcome::Cancelled,
-            ..
-        } = event
-        {
-            facts.push(("exchange-cancelled", fact.1));
+        match event {
+            Event::Terminal {
+                outcome: Outcome::Cancelled,
+                ..
+            } => facts.push(("exchange-cancelled", fact.1)),
+            Event::Terminal {
+                outcome: Outcome::Rejected,
+                ..
+            } => facts.push(("exchange-rejected", fact.1)),
+            _ => {}
         }
         facts.push(fact);
         self.0.set(facts);

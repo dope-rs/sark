@@ -7,7 +7,7 @@ pub(in crate::client) mod protocol;
 pub(in crate::client) mod request;
 pub(in crate::client) mod response;
 mod retry;
-mod reuse;
+pub(in crate::client) mod reuse;
 
 pub(in crate::client) use call::Call;
 pub(in crate::client) use retry::Retry;

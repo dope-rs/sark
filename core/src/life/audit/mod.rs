@@ -66,32 +66,7 @@ impl Projection {
     pub const fn restore(self) -> Snapshot {
         Snapshot {
             known: self.known,
-            request: snapshot::Request {
-                book_entries: self.values[0],
-                pre_admission_bytes: self.values[1],
-                pre_admission_chunks: self.values[2],
-                ready_nodes: self.values[3],
-            },
-            owner: snapshot::Owner {
-                bytes: self.values[4],
-                peak_bytes: self.values[5],
-                count: self.values[6],
-            },
-            task: snapshot::Task {
-                budget_used: self.values[7],
-                live: self.values[8],
-                completion_slots: self.values[9],
-            },
-            streams: snapshot::Streams {
-                receive: self.values[10],
-                transmit: self.values[11],
-                ready_entries: self.values[12],
-            },
-            response: snapshot::Response {
-                h3_owner_bytes: self.values[13],
-                transport_owner_bytes: self.values[14],
-                staging_owner_bytes: self.values[15],
-            },
+            values: self.values,
         }
     }
 }

@@ -20,15 +20,16 @@ pub trait Compression: Sized {
     fn encode(&mut self, bytes: &[u8]) -> Output;
 }
 
+#[doc(hidden)]
+pub type Frozen = pool::Span<
+    owners::Plain<pool::Fixed<{ Gzip::SLOTS.get() }, { Gzip::CAPACITY.get() }>>,
+    pool::Owned,
+    pool::Frozen,
+>;
+
 pub enum Output {
     Plain,
-    Compressed(
-        pool::Span<
-            owners::Plain<pool::Fixed<{ Gzip::SLOTS.get() }, { Gzip::CAPACITY.get() }>>,
-            pool::Owned,
-            pool::Frozen,
-        >,
-    ),
+    Compressed(Frozen),
 }
 
 pub struct Gzip {
@@ -63,10 +64,9 @@ impl Compression for Gzip {
         let Some(mut lease) = self.pool.acquire() else {
             return Output::Plain;
         };
-        let Some(done) = self.encoder.encode(src, lease.output()) else {
+        let Some(()) = self.encoder.encode(src, lease.output()) else {
             return Output::Plain;
         };
-        done.commit();
         Output::Compressed(lease.freeze())
     }
 }

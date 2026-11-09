@@ -1,4 +1,4 @@
-use core::{marker, mem, num, ptr, slice};
+use core::{marker, mem, num, ops::ControlFlow, ptr, slice};
 
 use scan::state;
 
@@ -53,7 +53,7 @@ enum Active {
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub struct Framer {
-    phase: Option<Active>,
+    phase: ControlFlow<num::NonZero<u32>, Active>,
     wire_bytes: usize,
     body_bytes: usize,
 }
@@ -67,7 +67,7 @@ impl Default for Framer {
 impl Framer {
     pub const fn new() -> Self {
         Self {
-            phase: Some(Active::Size(size::Size::new())),
+            phase: ControlFlow::Continue(Active::Size(size::Size::new())),
             wire_bytes: 0,
             body_bytes: 0,
         }
@@ -79,6 +79,11 @@ impl Framer {
 
     pub const fn body_bytes(&self) -> usize {
         self.body_bytes
+    }
+
+    /// Completed trailer bytes including the final CRLF. This count does not bind an input source.
+    pub fn trailer_bytes(&self) -> Option<num::NonZero<u32>> {
+        self.phase.break_value()
     }
 
     pub fn reset(&mut self) {
@@ -111,7 +116,7 @@ impl Framer {
         limits: &Limit,
         data: usize,
     ) -> Result<(Self, M::Output<'input>), Error> {
-        let Some(active) = self.phase else {
+        let ControlFlow::Continue(active) = self.phase else {
             return Ok((self, M::finished(input)));
         };
         self.drive::<M>(active, input, limits, data)
@@ -170,7 +175,7 @@ impl Framer {
                         }
                     };
                     if let Some(output) = M::data(consumed, bytes, boundary) {
-                        self.phase = Some(active);
+                        self.phase = ControlFlow::Continue(active);
                         return Ok((self, output));
                     }
                 }
@@ -192,7 +197,7 @@ impl Framer {
                     match progress {
                         trailer::Progress::More { next, consumed } => {
                             self.wire_bytes = next.wire;
-                            self.phase = Some(Active::Trailer(next.state));
+                            self.phase = ControlFlow::Continue(Active::Trailer(next.state));
                             trailer.cursor = next;
                             let output = match consumed {
                                 Some(consumed) => {
@@ -202,9 +207,13 @@ impl Framer {
                             };
                             return Ok((self, output));
                         }
-                        trailer::Progress::Complete { wire, consumed } => {
+                        trailer::Progress::Complete {
+                            wire,
+                            consumed,
+                            trailers,
+                        } => {
                             self.wire_bytes = wire;
-                            self.phase = None;
+                            self.phase = ControlFlow::Break(trailers);
                             return Ok((
                                 self,
                                 M::complete(input, consumed.saturating_add(pos), bytes),
@@ -215,7 +224,7 @@ impl Framer {
             }
         }
 
-        self.phase = Some(active);
+        self.phase = ControlFlow::Continue(active);
         Ok((self, M::pending(input, pos)))
     }
 
@@ -313,21 +322,16 @@ impl<'input> Run<'input> {
         }
     }
 
-    pub fn resolve<T>(self, pending: impl FnOnce() -> T, complete: impl FnOnce() -> T) -> T {
-        if self.state & Self::COMPLETE == 0 {
-            pending()
-        } else {
-            complete()
-        }
+    pub const fn is_complete(self) -> bool {
+        self.state & Self::COMPLETE != 0
     }
 
-    pub fn consume<T>(self, consume: impl FnOnce(&'input [u8]) -> T) -> T {
+    pub const fn into_slice(self) -> &'input [u8] {
         let len = self.state & !Self::COMPLETE;
         // SAFETY: constructors retain the full input's provenance and borrow;
         // the scan proves this prefix fits. Slice lengths are at most isize::MAX,
         // so their scanned count cannot set COMPLETE.
-        let prefix = unsafe { slice::from_raw_parts(self.source.as_ptr(), len) };
-        consume(prefix)
+        unsafe { slice::from_raw_parts(self.source.as_ptr(), len) }
     }
 }
 

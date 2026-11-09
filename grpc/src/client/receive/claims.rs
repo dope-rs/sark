@@ -204,9 +204,9 @@ impl<C: buffer::raw::Segment> Claims<C> {
     pub(super) fn cancel_feed(
         &mut self,
         key: receive::StreamKey,
-        mut release: impl FnMut(budget::Charge),
+        fault: &mut receive::Fault,
+        budget: &mut budget::Budget,
     ) -> Result<receive::Cancel, Error> {
-        let slot = key.slot(self.offset);
         let Some(stream) = self.streams.remove(key.0) else {
             return Ok(receive::Cancel::Missing);
         };
@@ -218,10 +218,10 @@ impl<C: buffer::raw::Segment> Claims<C> {
             let node = self.events.try_entry(key).map_err(Error::Event)?.remove();
             next = node.next;
             if let Some(charge) = node.delivery.charge {
-                release(charge);
+                fault.release(budget, Some(charge));
             }
         }
-        Ok(receive::Cancel::Complete(slot))
+        Ok(receive::Cancel::Complete(key.slot(self.offset)))
     }
 
     pub(super) fn try_ready(&self, mode: calls::ResponseMode) -> Result<bool, crate::Status> {

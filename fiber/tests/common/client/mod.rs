@@ -1,8 +1,4 @@
-use dope::core::driver::life::recovery::Recovery;
-
-pub fn recover(failure: Recovery<'_, '_>) -> std::convert::Infallible {
-    failure.abort()
-}
+pub use super::server::recover;
 
 pub mod config;
 

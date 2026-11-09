@@ -1,14 +1,14 @@
 pub mod common;
 
 use common::codec::{
-    Block, Scope as _,
+    Scope as _,
     decoder::{self, Decoder},
 };
 use dope::manifold::client::session::{
     codec::{self, Stateful as _, storage::Slot},
     response::Direct,
 };
-use o3::buffer::{resident, storage::Shared};
+use o3::buffer::{resident, storage, storage::Shared};
 use sark_client::protocol::{
     Error,
     codec::{
@@ -149,19 +149,20 @@ fn chunks_keep_pending() {
             if split {
                 let prefix = Shared::try_copy(b"\r\n0\r\nX: y\r\n\r").expect("trailer prefix");
                 let mut stored = decoder.storage(&prefix, &state);
-                Block::try_new(budget).expect("budget blocker").with(|| {
-                    let step = codec.decode::<_, Direct, _>(
-                        &mut stored, &mut state, &budget, decoder.limit(), |preview| match preview {
-                            Err(error) => {
-                                assert!(matches!(error, Error::Retention(_)));
-                                codec::Admission::RetryInput
-                            }
-                            Ok(_) => codec::Admission::Ready(|parsed: Result<_, Error>, _: &mut _| assert!(parsed.is_ok())),
-                        },
-                    );
-                    assert!(!step.has_consumed());
-                    assert_eq!(stored.source().as_ref(), prefix.as_slice());
-                });
+                let blocker = storage::Owned::try_allocate(&budget, budget.available())
+                    .expect("budget blocker");
+                let step = codec.decode::<_, Direct, _>(
+                    &mut stored, &mut state, &budget, decoder.limit(), |preview| match preview {
+                        Err(error) => {
+                            assert!(matches!(error, Error::Retention(_)));
+                            codec::Admission::RetryInput
+                        }
+                        Ok(_) => codec::Admission::Ready(|parsed: Result<_, Error>, _: &mut _| assert!(parsed.is_ok())),
+                    },
+                );
+                assert!(!step.has_consumed());
+                assert_eq!(stored.source().as_ref(), prefix.as_slice());
+                drop(blocker);
                 assert!(decoder.try_stored(&mut state, &mut stored, &budget)
                     .expect("trailer prefix retry").is_none());
                 assert!(stored.source().as_ref().is_empty());

@@ -170,7 +170,7 @@ impl<'a, C: session::Storage, M: Mode, S: Source> Prepared<'a, C, M, S> {
             Boundary::More
         };
         let length = config.peer.max_frame_size.take(sent);
-        let state = &mut record.stream.state;
+        let state = &mut record.state;
         let next = match state.send(stream::Event::Data { boundary }) {
             Ok(next) => next,
             Err(error) => return Outcome::Failed(conn::Error::Transition(key.id(), error), source),

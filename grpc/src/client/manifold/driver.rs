@@ -5,7 +5,11 @@ use buffer::pool;
 use dope::{
     core::{
         Errno,
-        driver::{self, route::Identity, schedule::app::Work},
+        driver::{
+            self,
+            route::Identity,
+            schedule::{Progress, app::Work, clock},
+        },
         io::socket,
     },
     manifold::{
@@ -22,7 +26,7 @@ use dope::{
         },
         service::bindings,
     },
-    net::link::{egress, event, pool::change::opening},
+    net::link::{egress, pool::change::opening},
 };
 use egress::data::{compose, pair};
 use o3::{
@@ -70,6 +74,7 @@ impl<'life, 'e: 'life, 'd: 'life, ID: Identity>
     type ConnState = ();
     type Failure = Observed;
     type Mode = mode::Plain;
+    type Receipt = ();
     type Requests = request::Enabled;
     type Response = response::Resume<Pending<'d>, Pending<'d>>;
     type Send = compose::Either<pool::Cursor, pair::Source<resident::Shared<'d>>>;
@@ -129,9 +134,7 @@ impl<'life, 'e: 'life, 'd: 'life, ID: Identity>
             Ok(head) => response::Delivery::Prepared(Pending::Owner(head)),
             Err(error) => {
                 state.fail(conn, error);
-                port.shared.wake();
-                port.shared.wake_senders();
-                port.shared.complete_all();
+                port.shared.wake_all();
                 parts
                     .close
                     .request(close::Directive::reconnect(close::Reason::Local(
@@ -281,7 +284,7 @@ impl<'life, 'e: 'life, 'd: 'life, ID: Identity>
     fn failed(
         owner: &mut Owner<'life, 'e, 'd, ID>,
         _: attempt::Completion<'_, 'd, ID>,
-        _: event::ConnectFault,
+        _: attempt::ConnectFault,
         _: &mut driver::Context<'_, 'd>,
     ) {
         owner.root().shared.wake();
@@ -310,6 +313,22 @@ impl<'life, 'e: 'life, 'd: 'life, ID: Identity>
 {
     type Drain = Ready;
 
+    fn transmit_failed(
+        owner: &Owner<'life, 'e, 'd, ID>,
+        conn: conn::Id<'d, ID>,
+        failure: conn::Transmit,
+        regions: &mut (
+            region::Token<region::Identity<'d>>,
+            region::Token<region::Identity<'d, 1>>,
+        ),
+    ) -> Option<conn::Transmit> {
+        let port = owner.root();
+        let state = port.shared.get_mut(&mut regions.1);
+        state.fail(conn, error::Error::Transmit(failure));
+        port.shared.wake_all();
+        Some(failure)
+    }
+
     fn io_fail(
         owner: &mut Owner<'life, 'e, 'd, ID>,
         failure: Errno,
@@ -320,9 +339,7 @@ impl<'life, 'e: 'life, 'd: 'life, ID: Identity>
         let mut parts = context.parts();
         let state = port.shared.get_mut(parts.driver.state_token());
         state.fail(conn, error::Error::Transport(failure));
-        port.shared.wake();
-        port.shared.wake_senders();
-        port.shared.complete_all();
+        port.shared.wake_all();
     }
 
     fn clear_send<'turn>(
@@ -347,9 +364,7 @@ impl<'life, 'e: 'life, 'd: 'life, ID: Identity>
         let port = owner.root();
         let state = port.shared.get_mut(&mut regions.1);
         state.retire(conn, reason);
-        port.shared.wake();
-        port.shared.wake_senders();
-        port.shared.complete_all();
+        port.shared.wake_all();
     }
 
     fn disconnect(
@@ -361,15 +376,21 @@ impl<'life, 'e: 'life, 'd: 'life, ID: Identity>
         let port = owner.root();
         let state = port.shared.get_mut(context.state_token());
         state.disconnect(conn, reason);
-        port.shared.wake();
-        port.shared.wake_senders();
-        port.shared.complete_all();
+        port.shared.wake_all();
     }
 }
 
 impl<'life, 'e: 'life, 'd: 'life, ID: Identity>
     policy::Scheduling<'life, 'd, Port<'e, 'd, ID>, ID, MAX_CONNECTIONS> for Driver
 {
+    fn progress(
+        owner: &Owner<'life, 'e, 'd, ID>,
+        _: &region::Token<region::Identity<'d>>,
+        _: clock::Clock<'_, 'd>,
+    ) -> Progress<'d> {
+        owner.root().shared.progress()
+    }
+
     fn park<'turn>(
         owner: &mut Owner<'life, 'e, 'd, ID>,
         work: Work<'turn, 'd>,
@@ -385,8 +406,6 @@ impl<'life, 'e: 'life, 'd: 'life, ID: Identity>
 
     fn shutdown(owner: &mut Owner<'life, 'e, 'd, ID>) {
         let shared = &owner.root().shared;
-        shared.wake();
-        shared.wake_senders();
-        shared.complete_all();
+        shared.wake_all();
     }
 }

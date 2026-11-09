@@ -20,8 +20,6 @@ use sark_h2::{
 };
 use sark_http::field::metadata::map::record::Entry;
 
-use crate::common::grpc::{call::ingress::Failure, replies};
-
 pub const FIRST_RESPONSE: &[u8] = b"first";
 pub const SECOND_RESPONSE: &[u8] = b"second";
 pub const HTTP_BODY: &[u8] = b"<h1>unavailable</h1>";
@@ -151,9 +149,11 @@ pub const HTTP_MEDIA: [(Field<'static>, Boundary); 4] = [
 
 #[derive(Debug)]
 pub enum Error {
+    Build(conn::config::Error),
     Status(Status),
     Protocol(conn::Error),
     Frame(message::Error),
+    MissingStream,
     Send {
         actual: DataOutcome,
         expected: usize,
@@ -351,9 +351,9 @@ impl<'a> Response<'a> {
         Response::new(server, second).try_trailers(Some(Code::Ok))
     }
 
-    pub fn try_wire(request: &[u8], payload: &[u8]) -> Result<Vec<u8>, Failure> {
-        let mut server = Connection::<ServerRole>::try_new().map_err(Failure::Build)?;
-        server.ingress().ingest(request).map_err(Failure::Wire)?;
+    pub fn try_wire(request: &[u8], payload: &[u8]) -> Result<Vec<u8>, Error> {
+        let mut server = Connection::<ServerRole>::try_new().map_err(Error::Build)?;
+        server.ingress().ingest(request).map_err(Error::Protocol)?;
         while let Some(event) = server.ingress().poll_event() {
             let Event::Headers {
                 stream_id: stream, ..
@@ -361,46 +361,24 @@ impl<'a> Response<'a> {
             else {
                 continue;
             };
-            let head = Block::response(&Metadata::new()).map_err(Failure::Status)?;
-            server
-                .streams()
-                .headers()
-                .respond(stream.id(), &head, Boundary::More)
-                .map_err(Failure::Wire)?;
-            let actual = server
-                .streams()
-                .try_send(stream.id(), payload, Boundary::More)
-                .map_err(Failure::Wire)?;
-            if !matches!(actual, DataOutcome::Sent(sent) if sent.get() == payload.len()) {
-                return Err(Failure::Data {
-                    expected: payload.len(),
-                    actual,
-                });
-            }
-            let tail = Block::trailers(&Status::ok(), &Metadata::new()).map_err(Failure::Status)?;
-            server
-                .streams()
-                .headers()
-                .trail(stream.id(), &tail)
-                .map_err(Failure::Wire)?;
+            let mut response = Response::new(&mut server, stream.id());
+            response.try_header()?;
+            response.try_data(payload, Boundary::More)?;
+            response.try_trailers(Some(Code::Ok))?;
         }
         Ok(server.output().first().to_vec())
     }
 
-    pub fn try_framed(request: &[u8], payload: &[u8]) -> Result<Vec<u8>, replies::Error> {
-        use replies::Error;
-
+    pub fn try_framed(request: &[u8], payload: &[u8]) -> Result<Vec<u8>, Error> {
         let mut server = Connection::<ServerRole>::try_new().map_err(Error::Build)?;
-        server.ingress().ingest(request).map_err(Error::Ingress)?;
+        server.ingress().ingest(request).map_err(Error::Protocol)?;
         let stream = iter::from_fn(|| server.ingress().poll_event())
             .find_map(|event| match event {
                 Event::Headers { stream_id: id, .. } => Some(id.id()),
                 _ => None,
             })
             .ok_or(Error::MissingStream)?;
-        Response::new(&mut server, stream)
-            .try_respond(payload)
-            .map_err(Error::Response)?;
+        Response::new(&mut server, stream).try_respond(payload)?;
         Ok(server.output().first().to_vec())
     }
 }

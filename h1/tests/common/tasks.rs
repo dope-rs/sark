@@ -198,15 +198,20 @@ pub struct BufferedBuilder<'d> {
 
 impl<'d> route::TaskBuild<'d> for BufferedBuilder<'d> {
     type Task = (admit::Stream, owned::Segments<'d>);
-    type StepError = Infallible;
 
     fn reject(error: Infallible) -> route::Reject {
         match error {}
     }
-    fn finish_body(self, _: usize) -> Self {
+}
+
+impl<'d> body::Build<'d> for BufferedBuilder<'d> {
+    type Output = route::Built<'d, (admit::Stream, owned::Segments<'d>)>;
+    type StepError = Infallible;
+
+    fn finish_input(self, _: usize) -> Self {
         self
     }
-    fn step(self, _: NonZero<usize>) -> body::Step<Self, route::Built<'d, Self::Task>, Infallible> {
+    fn step(self, _: NonZero<usize>) -> body::Step<Self, Self::Output, Infallible> {
         body::Step::Ready {
             output: route::Built::new(self.id, (self.stream, self.body)),
             released: credit::Amount::new(0, segments::Count::EMPTY),
@@ -275,32 +280,40 @@ impl<'state> duplex::Route<'state, ()> for Connect {
 pub struct Session;
 
 impl<'d> duplex::Session<'d> for Session {
-    fn receive(&mut self, _: owned::Segments<'d>) -> duplex::Action<'d> {
-        duplex::Action::idle()
+    fn receive(
+        &mut self,
+        _: owned::Segments<'d>,
+        _: &mut [u8],
+        _: &mut Vec<u8>,
+    ) -> (usize, duplex::Action<'d>) {
+        (0, duplex::Action::idle())
     }
-    fn finish(&mut self) -> duplex::Action<'d> {
-        duplex::Action::idle()
+    fn finish(&mut self, _: &mut [u8], _: &mut Vec<u8>) -> (usize, duplex::Action<'d>) {
+        (0, duplex::Action::idle())
     }
-    fn activate(&mut self) -> duplex::Action<'d> {
-        duplex::Action::idle()
+    fn activate(&mut self, _: &mut [u8], _: &mut Vec<u8>) -> (usize, duplex::Action<'d>) {
+        (0, duplex::Action::idle())
     }
 }
 
 impl<'d> route::TaskBuild<'d> for Builder<'d> {
     type Task = owned::Segments<'d>;
-    type StepError = Infallible;
+
     fn reject(error: Infallible) -> route::Reject {
         match error {}
     }
-    fn finish_body(mut self, _: usize) -> Self {
+}
+
+impl<'d> body::Build<'d> for Builder<'d> {
+    type Output = route::Built<'d, owned::Segments<'d>>;
+    type StepError = Infallible;
+
+    fn finish_input(mut self, _: usize) -> Self {
         FINISHES.set(FINISHES.get() + 1);
         self.remaining = Some(2);
         self
     }
-    fn step(
-        mut self,
-        budget: NonZero<usize>,
-    ) -> body::Step<Self, route::Built<'d, Self::Task>, Infallible> {
+    fn step(mut self, budget: NonZero<usize>) -> body::Step<Self, Self::Output, Infallible> {
         BUDGET.set(budget.get());
         let released = credit::Amount::new(0, segments::Count::EMPTY);
         match self.remaining {
@@ -328,17 +341,19 @@ impl<'d> route::TaskBuild<'d> for Builder<'d> {
 }
 
 impl<'d> route::Push<'d> for Builder<'d> {
+    fn reject_push(_: Self::Error) -> route::Reject {
+        route::Reject::Unavailable
+    }
+}
+
+impl<'d> body::Push<'d> for Builder<'d> {
     type Error = assembly::Error;
 
     fn observe<C: Copy, S: Copy, O: life::Observer<C, S>>(error: &Self::Error, observer: &mut O) {
         observer.diagnostic(error);
     }
 
-    fn reject_push(_: Self::Error) -> route::Reject {
-        route::Reject::Unavailable
-    }
-
-    fn push_body(mut self, segment: owned::Segment<'d>) -> body::Transfer<Self, Self::Error> {
+    fn push(mut self, segment: owned::Segment<'d>) -> body::Transfer<Self, Self::Error> {
         match self.retained.try_push(segment) {
             Ok(retained) => {
                 self.retained = retained;

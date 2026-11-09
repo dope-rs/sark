@@ -15,24 +15,36 @@ use dope_quic::{
     stream::Recv,
     wire::stream::Id,
 };
-use dope_test::harness::observe::VecCellExt as _;
+use dope_test::{fibers::Yield, harness::observe::VecCellExt as _};
 use o3::buffer::{
     resident::{self, bound},
-    segments,
+    segments, storage,
 };
 use sark::{Guard, Head};
 use sark_core::{duplex, duplex::Action};
 use sark_h3::frame;
 use sark_http::{
     method::Method,
-    payload::{fixed, owned, response::status},
+    payload::{
+        fixed, owned,
+        response::{
+            dispatch::{
+                Stream,
+                chunk::{self, Chunk},
+            },
+            status,
+        },
+    },
     request,
     request::body,
 };
 
+use crate::common::route::body::{Chunks, Trace};
 use crate::common::server::h3::proof::{
     Failure, Failures, Metric, SEGMENTED_FIRST, SEGMENTED_SECOND,
-    request::{BodyReq, EmptyReq, JsonReq, LargeJsonReq, NamedPathReq, SegmentReq, TreeReq},
+    request::{
+        BodyReq, EmptyReq, JsonReq, LargeJsonReq, NamedPathReq, SegmentReq, StreamReq, TreeReq,
+    },
 };
 
 pub(crate) const SATURATED_ROUTE_REQUESTS: usize = schedule::LIMIT;
@@ -69,6 +81,7 @@ pub(crate) struct State<'d> {
     pub(crate) saved: cell::Cell<Option<request::Bytes<'d>>>,
     pub(crate) cancel_dropped: rc::Rc<cell::Cell<usize>>,
     pub(crate) errors: rc::Rc<Failures>,
+    pub(crate) stream: rc::Rc<Trace>,
 }
 
 impl State<'_> {
@@ -228,6 +241,135 @@ pub(crate) async fn async_raw_h<'d>(
     })
 }
 
+#[derive(Debug)]
+pub enum StreamError<'d> {
+    Empty(chunk::Empty<'d>),
+    Allocation(o3::alloc::Exhausted),
+    Read(&'static str),
+}
+
+#[sark_fiber::handler]
+pub(crate) async fn stream_h<'d>(
+    req: StreamReq,
+    state: &State<'_>,
+) -> Stream<'static, Chunks<Result<Chunk<'d>, StreamError<'d>>>> {
+    let before = req.payload.as_slice().as_ptr();
+    Yield::new().await;
+    let payload = match state
+        .preserved(before, req.payload.as_slice().as_ptr())
+        .and_then(|()| {
+            if req.kind.as_slice() == b"resident" {
+                req.payload
+                    .project(0..9)
+                    .map_err(|rejected| state.fail(Failure::Range(rejected.discard())))
+            } else {
+                Ok(req.payload)
+            }
+        }) {
+        Ok(payload) => payload,
+        Err(error) => return Stream::new(Chunks::new([], None)).with_status(error.status),
+    };
+    let body = payload.into_body().into_inner();
+    state.stream.resident.set(body.charge().resident_bytes);
+    let two = req.kind.as_slice() == b"two_park";
+    let chunks = body
+        .into_iter()
+        .map(|part| Chunk::try_new(resident::Shared::from(part)).map_err(StreamError::Empty))
+        .chain((0..if two { 2 } else { 0 }).map(|_| {
+            let mut body = Vec::with_capacity(8192);
+            body.resize(697, b'x');
+            let body = storage::Shared::try_from(&mut body).map_err(StreamError::Allocation)?;
+            Chunk::try_new(resident::Shared::from(body)).map_err(StreamError::Empty)
+        }))
+        .chain((req.kind.as_slice() == b"fail").then_some(Err(StreamError::Read("read-failed"))));
+    Stream::new(
+        Chunks::new(chunks, Some(rc::Rc::clone(&state.stream)))
+            .park(req.kind.as_slice() == b"park" || two),
+    )
+}
+
+pub(crate) struct QpackReply<'d> {
+    headers: QpackFields,
+    body: Chunks<Result<Chunk<'d>, StreamError<'d>>>,
+}
+
+pub(crate) struct QpackFields(rc::Rc<Trace>);
+
+impl QpackFields {
+    #[dope_fiber::fiber_fn('d)]
+    async fn ready<'d>(state: &State<'d>) -> Self {
+        while state.stream.polls.get() < 4 {
+            Yield::new().await;
+        }
+        Self(rc::Rc::clone(&state.stream))
+    }
+}
+
+impl sark_http::payload::response::headers::Source for QpackFields {
+    fn emit<'field>(
+        &'field self,
+        sink: &mut impl sark_http::payload::response::headers::Sink<'field>,
+    ) {
+        self.0.heads.set(self.0.heads.get() + 1);
+        for _ in 0..2 {
+            sink.field(
+                sark_fiber::header_name!("x-qpack"),
+                sark_http::field::literal!(sark_http::field::Value::try_bytes(&[b'q'; 600])),
+            );
+        }
+    }
+}
+
+impl<'req, 'd> sark_http::payload::response::dispatch::IntoOutput<'req, 'd> for QpackReply<'d> {
+    type Output = Self;
+
+    fn into_output(self) -> Self {
+        self
+    }
+}
+
+impl<'req, 'd> sark_http::payload::response::dispatch::Emit<'req, 'd> for QpackReply<'d> {
+    type Kind = sark_http::payload::response::dispatch::Polled;
+    type Stream = Chunks<Result<Chunk<'d>, StreamError<'d>>>;
+    type Bound = bound::Unbounded;
+
+    const BODY: sark_http::payload::Kind = sark_http::payload::Kind::Stream;
+
+    fn emit<S: sark_http::payload::response::dispatch::Sink<'d>>(
+        self,
+        sink: S,
+    ) -> Result<S::Stream<Self::Stream>, S::Error> {
+        sink.stream(status::Code::OK, self.headers, self.body)
+    }
+}
+
+#[sark_fiber::handler]
+pub(crate) async fn qpack_h<'d>(req: BodyReq, state: &State<'_>) -> QpackReply<'d> {
+    let headers = QpackFields::ready(state).await;
+    let parts = req
+        .payload
+        .into_body()
+        .into_inner()
+        .into_iter()
+        .map(|part| Chunk::try_new(resident::Shared::from(part)).map_err(StreamError::Empty));
+    QpackReply {
+        headers,
+        body: Chunks::new(parts, Some(rc::Rc::clone(&state.stream))),
+    }
+}
+
+#[sark_fiber::handler]
+pub(crate) async fn qpack_fixed_h<'d>(
+    req: BodyReq,
+    state: &State<'_>,
+) -> sark_http::payload::response::fixed::Direct<QpackFields, request::Bytes<'d>> {
+    sark_http::payload::response::fixed::Direct::new(
+        status::Code::OK,
+        QpackFields::ready(state).await,
+        req.payload,
+    )
+}
+
 #[sark_fiber::handler]
 pub(crate) async fn save_raw_h(
     req: BodyReq,
@@ -324,15 +466,6 @@ pub(crate) async fn quick_h() -> FairReply<'d> {
 
 pub(crate) struct CancelGuard<'a>(&'a cell::Cell<usize>);
 
-impl CancelGuard<'_> {
-    pub(crate) fn complete<'d>(self) -> FairReply<'d> {
-        FairReply {
-            status: status::Code::OK,
-            body: fixed::Body::new(b"unexpected"),
-        }
-    }
-}
-
 impl Drop for CancelGuard<'_> {
     fn drop(&mut self) {
         self.0.set(self.0.get() + 1);
@@ -344,9 +477,12 @@ pub(crate) async fn cancel_h(
     state: &State<'_>,
     timer: Timer<'_>,
 ) -> Result<FairReply<'_>, FairReply<'d>> {
-    let guard = CancelGuard(&state.cancel_dropped);
+    let _guard = CancelGuard(&state.cancel_dropped);
     state.sleep(timer, Duration::from_secs(30))?.await;
-    Ok(guard.complete())
+    Ok(FairReply {
+        status: status::Code::OK,
+        body: fixed::Body::new(b"unexpected"),
+    })
 }
 
 #[sark_fiber::handler]
@@ -442,29 +578,37 @@ pub(crate) struct DuplexEcho {
 }
 
 impl<'d> duplex::Session<'d> for DuplexEcho {
-    fn receive(&mut self, input: owned::Segments<'d>) -> duplex::Action<'d> {
+    fn receive(
+        &mut self,
+        input: owned::Segments<'d>,
+        _: &mut [u8],
+        _: &mut Vec<u8>,
+    ) -> (usize, duplex::Action<'d>) {
         if self.finished {
             self.errors.record(Failure::DuplexInput);
-            return Action::close();
+            return (0, Action::close());
         }
-        Action::send(input)
+        (0, Action::send(input))
     }
 
-    fn finish(&mut self) -> duplex::Action<'d> {
+    fn finish(&mut self, _: &mut [u8], _: &mut Vec<u8>) -> (usize, duplex::Action<'d>) {
         if mem::replace(&mut self.finished, true) {
             self.errors.record(Failure::DuplexFinish);
         }
-        Action::close()
+        (0, Action::close())
     }
 
-    fn activate(&mut self) -> duplex::Action<'d> {
+    fn activate(&mut self, _: &mut [u8], _: &mut Vec<u8>) -> (usize, duplex::Action<'d>) {
         if self.finished {
             self.errors.record(Failure::DuplexActivate);
-            return Action::close();
+            return (0, Action::close());
         }
         match self.initial.take() {
-            Some(bytes) => Action::send(owned::Segments::from(resident::Shared::from(bytes))),
-            None => Action::idle(),
+            Some(bytes) => (
+                0,
+                Action::send(owned::Segments::from(resident::Shared::from(bytes))),
+            ),
+            None => (0, Action::idle()),
         }
     }
 }
@@ -512,5 +656,9 @@ pub(crate) SrvApp: State<'_> => {
         CONNECT "*" => duplex_h,
         CONNECT("sark-echo") "/duplex" => duplex_h,
         CONNECT("sark-start") "/duplex/start" => duplex_start_h,
+        POST "/async/stream/:kind" => request(path) async stream(capacity = 1, body = contiguous) stream_h,
+        HEAD "/async/stream/:kind" => request(path) async stream(capacity = 1, body = contiguous) stream_h,
+        POST "/async/qpack" => async stream(capacity = 1, body = contiguous) qpack_h,
+        POST "/async/qpack/fixed" => async(capacity = 1, body = contiguous) qpack_fixed_h,
     }
 }

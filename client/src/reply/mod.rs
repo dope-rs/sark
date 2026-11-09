@@ -43,11 +43,10 @@ impl<'a, S: AsRef<[u8]>> Headers<'a, S> {
 ///
 pub struct Scoped<'a, 'd> {
     status: status::Code,
-    coding: Coding,
+    coding: Option<Coding>,
     headers: response::Fields<resident::Shared<'d>>,
     trailers: Option<response::Fields<resident::Shared<'d>>>,
     body: body::Scoped<'a, 'd>,
-    omitted: bool,
 }
 
 impl<'a, 'd> Scoped<'a, 'd> {
@@ -58,7 +57,7 @@ impl<'a, 'd> Scoped<'a, 'd> {
     pub fn headers(&self) -> Headers<'_, resident::Shared<'d>> {
         Headers {
             fields: &self.headers,
-            omitted: self.omitted,
+            omitted: self.coding.is_none(),
         }
     }
 
@@ -75,11 +74,6 @@ impl<'a, 'd> Scoped<'a, 'd> {
         self.body
     }
 
-    fn omit_coding(&mut self) {
-        self.coding = Coding::None;
-        self.omitted = true;
-    }
-
     /// Detaches every owner while preserving body segment boundaries.
     /// This allocates at most one metadata block and one shared byte block.
     /// Each original nonempty segment keeps its extent in the reserved pool.
@@ -91,7 +85,7 @@ impl<'a, 'd> Scoped<'a, 'd> {
         let copies = plan.allocate()?;
         self.detach(copies, |mut source, copies| {
             Ok(match target {
-                body::Vacant::Empty => body::Retained::empty(),
+                body::Vacant::Empty => body::Retained::Empty,
                 body::Vacant::One => {
                     let Some(owner) = source.pop() else {
                         return Err(Error::BodyCount {
@@ -106,7 +100,7 @@ impl<'a, 'd> Scoped<'a, 'd> {
                             actual: Count::EMPTY,
                         });
                     };
-                    body::Retained::one(owner)
+                    body::Retained::One(owner)
                 }
                 body::Vacant::Many(mut chain) => {
                     while let Some(owner) = source.pop() {
@@ -119,7 +113,7 @@ impl<'a, 'd> Scoped<'a, 'd> {
                             });
                         }
                     }
-                    body::Retained::many(chain)
+                    chain.into_shape()
                 }
             })
         })
@@ -163,7 +157,7 @@ impl<'a, 'd> Scoped<'a, 'd> {
             headers,
             trailers,
             body,
-            omitted: self.omitted,
+            omitted: self.coding.is_none(),
         })
     }
 }

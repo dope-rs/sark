@@ -43,42 +43,37 @@ impl<'a, M> Projection<'a, M> {
     }
 }
 
-pub struct Sink<'a, C, M, F> {
+pub struct Sink<'a, C, M> {
     mode: &'a mut M,
     conn: C,
-    stream: F,
 }
 
-impl<'a, C, M, F> Sink<'a, C, M, F> {
-    pub fn new(mode: &'a mut M, conn: C, stream: F) -> Self {
-        Self { mode, conn, stream }
+impl<'a, C, M> Sink<'a, C, M> {
+    pub fn new(mode: &'a mut M, conn: C) -> Self {
+        Self { mode, conn }
     }
 }
 
-impl<C: Copy, M, F> Sink<'_, C, M, F> {
-    pub fn apply<K, S: Copy>(&mut self, effect: owner::Effect<K>)
+impl<C: Copy, M> Sink<'_, C, M> {
+    pub fn apply<S: Copy>(&mut self, effect: owner::Effect<S>)
     where
         M: life::Mode<C, S>,
-        F: FnMut(K) -> S,
-    {
-        if !M::ENABLED || effect.charge().is_empty() {
-            return;
-        }
-        let conn = self.conn;
-        let stream = &mut self.stream;
-        Projection::new(self.mode)
-            .apply(effect.map_key(|key| exchange::Id::new(conn, stream(key))));
-    }
-
-    pub fn copied<K, S: Copy>(&mut self, key: K, copy: evidence::Copy)
-    where
-        M: life::Mode<C, S>,
-        F: FnMut(K) -> S,
     {
         if !M::ENABLED {
             return;
         }
-        let exchange = exchange::Id::new(self.conn, (self.stream)(key));
+        let conn = self.conn;
+        Projection::new(self.mode).apply(effect.map_key(|key| exchange::Id::new(conn, key)));
+    }
+
+    pub fn copied<S: Copy>(&mut self, key: S, copy: evidence::Copy)
+    where
+        M: life::Mode<C, S>,
+    {
+        if !M::ENABLED {
+            return;
+        }
+        let exchange = exchange::Id::new(self.conn, key);
         let mut sink = response::Sink::new(self.mode, exchange);
         evidence::Sink::copied(&mut sink, copy);
     }

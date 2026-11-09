@@ -1,6 +1,9 @@
 use core::mem;
 
-use sark_http::field::metadata::{map::record, section::storage};
+use sark_http::field::{
+    head,
+    metadata::{map::record, section::storage},
+};
 
 use crate::{request::field, route::Schema};
 
@@ -31,6 +34,8 @@ pub trait Policy<R: Schema>: Copy {
 }
 
 pub trait Fields<R: Schema>: Slot {
+    const ENCODING: bool = false;
+
     fn slice(name: &[u8]) -> Option<Self>;
 
     fn span(name: record::Span<'_>) -> Option<Self>;
@@ -40,6 +45,15 @@ pub trait Fields<R: Schema>: Slot {
         slot: Self,
         value: &V,
     ) -> Result<(), R::Error>;
+
+    fn set_encoding<V: field::HeaderValue>(
+        headers: &mut R::RawHeaders,
+        slot: Self,
+        value: &V,
+        _encoding: head::AcceptEncoding,
+    ) -> Result<(), R::Error> {
+        Self::set(headers, slot, value)
+    }
 }
 
 #[derive(Clone, Copy)]

@@ -2,7 +2,7 @@
 use core::convert::Infallible;
 use std::ops::ControlFlow;
 
-use o3::buffer::{bytes::scope, resident::bound, storage::Shared};
+use o3::buffer::{bytes::scope, pool, resident::bound, storage::Shared};
 use sark_http::{
     field::{
         metadata::{
@@ -17,8 +17,10 @@ use sark_http::{
     },
     method,
     owner::handoff::{self, input::Bound, stage},
-    payload::response::{dispatch::Accept, status::Code},
-    request::body::Ref,
+    payload::response::{
+        dispatch::{Accept, Sink},
+        status::Code,
+    },
 };
 
 use crate::{body, decode::state::admit, request::frame::proof, route, route::field::header};
@@ -30,11 +32,6 @@ pub mod request;
 pub mod state;
 
 pub use call::Call;
-
-/// Exact projected request that can expose its retained transport body.
-pub trait Projected<'req, 'd> {
-    fn body(&self) -> Ref<'req, 'd>;
-}
 
 /// Projected request coupled to the lifetime of its body borrow.
 #[repr(C)]
@@ -73,7 +70,7 @@ pub trait Lineage<'id>: Sized {
     fn resolve_head<O: Into<scope::Owner<'id, Shared>>, P: proof::Proof>(
         self,
         head: crate::request::Head<O, P>,
-    ) -> (Self::Output, handoff::Head<crate::request::Head<O, P>>);
+    ) -> Self::Output;
 }
 
 /// Ends response preparation and returns its exact failure target.
@@ -101,6 +98,11 @@ pub trait Encode<'req, 'd: 'req>:
         > + Cancel<Target = Self::Target>;
 
     fn begin_head<'a, 'id>(self, head: scope::View<'a, 'id>) -> Self::Head<'a, 'id>;
+}
+
+/// Separates an encoded head from the body retained by a streaming task.
+pub trait Streaming<'req, 'd: 'req>: Encode<'req, 'd> + Sink<'d> {
+    fn split_stream<S>(output: Self::Stream<S>) -> (Self::Prepared, Option<S>);
 }
 
 /// Terminal semantic failure while preparing a request head.
@@ -148,7 +150,7 @@ pub trait Decode {
     type Plan: rules::Policy;
     type Cause;
     type Error<'req>;
-    type Projected<'req, 'd>: Projected<'req, 'd>
+    type Projected<'req, 'd>
     where
         'd: 'req;
 
@@ -185,6 +187,14 @@ pub trait Decode {
     ) -> Dispatched<'req, 'd, E, Self::Error<'req>>
     where
         'd: 'req;
+}
+
+/// Routes a native raw head while preserving its compile-time storage prefix.
+pub trait Full: Decode {
+    fn try_prefixed<const PREFIX: usize>(
+        &self,
+        head: RetainedHead<packed::Decoded<pool::Span, PREFIX>, Selected<rules::RetainRaw<PREFIX>>>,
+    ) -> Result<Self::Head, HeadError<Self::Cause>>;
 }
 
 /// Decoder capability implemented only by applications with guarded routes.

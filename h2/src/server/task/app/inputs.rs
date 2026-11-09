@@ -8,6 +8,7 @@ use sark_core::{
     life,
     manifold::{stream::Boundary, task::app::Runtime},
 };
+use sark_http::field::metadata::section::rules;
 
 use crate::{
     conn::event,
@@ -23,8 +24,8 @@ use crate::{
     },
 };
 
-pub(super) fn apply<'d, ID: Identity + 'd, R, Q>(
-    mut drive: drive::Drive<'_, '_, 'd, ID, R, Q>,
+pub(super) fn apply<'d, ID: Identity + 'd, R, Q, F: rules::Policy>(
+    mut drive: drive::Drive<'_, '_, 'd, ID, R, Q, F>,
     stream: crate::stream::Key,
     data: event::DataPayload<resident::Shared<'d>>,
     boundary: Boundary,
@@ -32,13 +33,17 @@ pub(super) fn apply<'d, ID: Identity + 'd, R, Q>(
     R: Runtime<'d, Target = Target<'d, ID>>,
     Q: state::Transitions<conn::Id<'d, ID>>,
 {
-    state::Transitions::progress(drive.mode, identify(drive.conn, stream));
-    if let Boundary::End = boundary {
-        drive
-            .mode
-            .observe(life::Event::InputFinished(identify(drive.conn, stream)));
-    }
-    let data = match drive.state.try_push(stream, data, boundary) {
+    let call = identify(drive.conn, stream);
+    let progress = |mode: &mut Q| {
+        state::Transitions::progress(mode, call);
+        if let Boundary::End = boundary {
+            mode.observe(life::Event::InputFinished(call));
+        }
+    };
+    let data = match drive
+        .state
+        .try_push(stream, data, boundary, || progress(drive.mode))
+    {
         Ok(ops::ControlFlow::Break(())) => return,
         Ok(ops::ControlFlow::Continue(data)) => data,
         Err(error) => {
@@ -61,13 +66,14 @@ pub(super) fn apply<'d, ID: Identity + 'd, R, Q>(
             return;
         }
     };
-    match drive.state.data().push(
-        stream,
-        data,
-        boundary,
-        drive.limits,
-        drive.mode.body(identify(drive.conn, stream)),
-    ) {
+    let mode = &mut *drive.mode;
+    match drive
+        .state
+        .data()
+        .push(stream, data, boundary, drive.limits, move || {
+            progress(mode);
+            mode.body(call)
+        }) {
         Err(error) => drive.reset(stream, error.code::<R>()),
         Ok(Progress::Idle) => {}
         Ok(Progress::Streaming) => {
@@ -82,9 +88,8 @@ pub(super) fn apply<'d, ID: Identity + 'd, R, Q>(
             drive.build(turn);
         }
         Ok(Progress::Request(request)) => {
-            let request = request.take();
-            // SAFETY: the native occupied owner was selected from this same
-            // Drive's incoming Book and consumed without another handoff.
+            // SAFETY: push removed this request from the same Drive's exact
+            // incoming Book for immediate consumption without another handoff.
             unsafe { response::raw::buffered(drive, stream, request) };
         }
     }

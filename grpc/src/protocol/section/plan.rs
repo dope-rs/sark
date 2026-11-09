@@ -3,7 +3,7 @@ use sark_http::field::metadata::{
     self, block,
     map::record,
     section::{
-        self, rules,
+        rules,
         state::{complete, decode, fixed},
         storage,
     },
@@ -11,64 +11,47 @@ use sark_http::field::metadata::{
 
 use crate::{
     Reason, protocol,
-    protocol::section::{Owner, seal},
+    protocol::section::{Owner, Plan, seal},
 };
 
-pub struct Plan;
-
-impl Plan {
-    pub(crate) fn build<S: metadata::Metadata + ?Sized>(
-        fields: &S,
-        kind: rules::Kind,
-    ) -> Result<Owner, crate::Status> {
-        let fields = fields.fields();
-        let capacity = fields.clone().try_fold(seal::LEN, |capacity, field| {
-            protocol::Block::add_capacity(capacity, field.name, field.value.len())
-        })?;
-        let lease = pool::Span::try_new(capacity)?;
-        let mut writer = storage::Writer::<Owner>::try_new(lease)?;
-        let mut section = <fixed::Raw as decode::Sink<Self>>::h2(kind, block::Connect::Disabled);
-        let mut scratch = storage::Scratch::default();
-        for field in fields {
-            let name = record::Span::from_slice(field.name);
-            let value = block::Valued::from_span(record::Span::from_slice(field.value));
-            rules::Validate::value(&mut section, value.validation());
-            let next = <fixed::Raw as complete::Sink<Self>>::select(
+pub(crate) fn build<S: metadata::Metadata + ?Sized>(
+    fields: &S,
+    kind: rules::Kind,
+) -> Result<Owner, crate::Status> {
+    let fields = fields.fields();
+    let capacity = fields.clone().try_fold(seal::LEN, |capacity, field| {
+        protocol::Block::add_capacity(capacity, field.name, field.value.len())
+    })?;
+    let lease = pool::Span::try_new(capacity)?;
+    let mut writer = storage::Writer::<Owner>::try_new(lease)?;
+    let mut section = <fixed::Raw as decode::Sink<Plan>>::h2(kind, block::Connect::Disabled);
+    let mut scratch = storage::Scratch::default();
+    for field in fields {
+        let name = record::Span::from_slice(field.name);
+        let value = block::Valued::from_span(record::Span::from_slice(field.value));
+        rules::Validate::value(&mut section, value.validation());
+        let next = <fixed::Raw as complete::Sink<Plan>>::select(
+            &mut section,
+            block::Named::from_span(name),
+        );
+        if let decode::Indexed::Buffered(rule) = next {
+            <fixed::Raw as complete::Sink<Plan>>::push::<rules::RejectPush>(
                 &mut section,
-                block::Named::from_span(name),
-            );
-            if let decode::Indexed::Buffered(rule) = next {
-                <fixed::Raw as complete::Sink<Self>>::push::<rules::RejectPush>(
-                    &mut section,
-                    &mut writer,
-                    &mut scratch,
-                    rule,
-                    name,
-                    value.span(),
-                    field.indexing,
-                )?;
-            }
+                &mut writer,
+                &mut scratch,
+                rule,
+                name,
+                value.span(),
+                field.indexing,
+            )?;
         }
-        let ((), check) = section.finish();
-        if check != block::Validation::Valid {
-            return Err(crate::Status::new(
-                crate::Code::InvalidArgument,
-                Reason::FieldSection,
-            ));
-        }
-        Ok(<Owner as storage::Block>::from(writer.finish()))
     }
-}
-
-impl section::Policy for Plan {
-    type Selection = ();
-    type Block = Owner;
-
-    fn finish(self) {
-        let Self = self;
+    let ((), check) = section.finish();
+    if check != block::Validation::Valid {
+        return Err(crate::Status::new(
+            crate::Code::InvalidArgument,
+            Reason::FieldSection,
+        ));
     }
-}
-
-impl rules::Policy for Plan {
-    type State = fixed::Raw;
+    Ok(<Owner as storage::Block>::from(writer.finish()))
 }

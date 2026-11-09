@@ -44,15 +44,14 @@ impl Encoder {
     /// Encodes one gzip member, resetting the encoder so no previous stream's
     /// dictionary state leaks in. A refused or partial stream reports
     /// `None` so the caller keeps its payload.
-    pub(super) fn encode<'a>(
+    pub(super) fn encode(
         &mut self,
         src: &[u8],
         mut output: buffer::raw::Output<
-            'a,
+            '_,
             pool::Fixed<{ Gzip::SLOTS.get() }, { Gzip::CAPACITY.get() }>,
         >,
-    ) -> Option<pool::Complete<'a, pool::Fixed<{ Gzip::SLOTS.get() }, { Gzip::CAPACITY.get() }>>>
-    {
+    ) -> Option<()> {
         let capacity = output.len();
         let bytes = output.as_mut_slice();
         let room = capacity.checked_sub(HEADER + TRAILER)?;

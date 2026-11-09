@@ -1,3 +1,5 @@
+use std::num::NonZero;
+
 use crate::{field::metadata::map::record, uri::Source};
 
 const LANE: usize = 16;
@@ -18,13 +20,7 @@ pub enum Error {
 #[derive(Clone, Copy)]
 pub(crate) struct Plan {
     end: usize,
-    query: At,
-}
-
-#[derive(Clone, Copy)]
-pub(crate) enum At {
-    Path,
-    Query(usize),
+    query: Option<NonZero<usize>>,
 }
 
 impl Plan {
@@ -32,14 +28,14 @@ impl Plan {
         self.end
     }
 
-    pub(crate) const fn query(self) -> At {
+    pub(crate) const fn query(self) -> Option<NonZero<usize>> {
         self.query
     }
 
     pub(crate) fn path_end(self) -> usize {
         match self.query {
-            At::Path => self.end,
-            At::Query(at) => at,
+            None => self.end,
+            Some(start) => start.get() - 1,
         }
     }
 }
@@ -59,9 +55,7 @@ impl<'a> Scan<'a> {
     }
 
     pub(crate) fn prefix(self) -> Outcome {
-        match run::<true>(self.0, Cursor::new(), |at, context| {
-            self.locate(at, context)
-        }) {
+        match run::<true>(self.0, |at, query| self.locate(at, query)) {
             Ok(Stage::Found(plan)) => Outcome::Complete(plan),
             Ok(Stage::Exhausted(_)) => Outcome::Incomplete,
             Err(error) => Outcome::Invalid(error),
@@ -71,15 +65,13 @@ impl<'a> Scan<'a> {
     /// Parses the whole input; reaching its end is a completed plan.
     pub(crate) fn complete(self) -> Result<Plan, Error> {
         let len = self.0.len();
-        match run::<false>(self.0, Cursor::new(), |at, context| {
-            self.locate(at, context)
-        })? {
+        match run::<false>(self.0, |at, query| self.locate(at, query))? {
             Stage::Found(plan) => Ok(plan),
-            Stage::Exhausted(cursor) => Ok(cursor.finish(len)),
+            Stage::Exhausted(query) => Ok(Plan { end: len, query }),
         }
     }
 
-    fn locate(&self, start: usize, context: Context) -> Progress {
+    fn locate(&self, start: usize, query: bool) -> Progress {
         let Some(input) = self.0.get(start..) else {
             return Progress::End;
         };
@@ -87,13 +79,13 @@ impl<'a> Scan<'a> {
         let Some((first, rest)) = lanes.split_first() else {
             return Progress::Tail(start);
         };
-        if let Some(offset) = Self::first(Self::mask(*first, context)) {
+        if let Some(offset) = Self::first(Self::mask(*first, query)) {
             return Progress::Special(start + offset);
         }
         let mut index = start + LANE;
         let (groups, rest) = rest.as_chunks::<4>();
         for group in groups {
-            let masks = group.map(|chunk| Self::mask(chunk, context));
+            let masks = group.map(|chunk| Self::mask(chunk, query));
             if masks[0] | masks[1] | masks[2] | masks[3] != 0 {
                 for (lane, mask) in masks.into_iter().enumerate() {
                     if let Some(offset) = Self::first(mask) {
@@ -104,7 +96,7 @@ impl<'a> Scan<'a> {
             index += 4 * LANE;
         }
         for lane in rest {
-            if let Some(offset) = Self::first(Self::mask(*lane, context)) {
+            if let Some(offset) = Self::first(Self::mask(*lane, query)) {
                 return Progress::Special(index + offset);
             }
             index += LANE;
@@ -121,13 +113,11 @@ impl<'a> Scan<'a> {
         (bits != 0).then(|| bits.trailing_zeros() as usize / u8::BITS as usize)
     }
 
-    fn mask(chunk: [u8; LANE], context: Context) -> u128 {
-        u128::from_le_bytes(
-            chunk.map(|byte| u8::from(!Self::is_path(byte, context)).wrapping_neg()),
-        )
+    fn mask(chunk: [u8; LANE], query: bool) -> u128 {
+        u128::from_le_bytes(chunk.map(|byte| u8::from(!Self::is_path(byte, query)).wrapping_neg()))
     }
 
-    fn is_path(byte: u8, context: Context) -> bool {
+    fn is_path(byte: u8, query: bool) -> bool {
         byte.is_ascii_alphabetic()
             | (byte.wrapping_sub(b'&') <= b';' - b'&')
             | (byte == b'!')
@@ -136,7 +126,7 @@ impl<'a> Scan<'a> {
             | (byte == b'@')
             | (byte == b'_')
             | (byte == b'~')
-            | (matches!(context, Context::Query) & (byte == b'?'))
+            | (query & (byte == b'?'))
     }
 }
 
@@ -149,53 +139,57 @@ pub(crate) fn complete_span(value: record::Span<'_>) -> Result<Plan, Error> {
     if first.is_empty() {
         return Scan::new(second).complete();
     }
-    match run::<false>(value, Cursor::new(), |at, _| Progress::Tail(at))? {
+    match run::<false>(value, |at, _| Progress::Tail(at))? {
         Stage::Found(plan) => Ok(plan),
-        Stage::Exhausted(cursor) => Ok(cursor.finish(value.len())),
+        Stage::Exhausted(query) => Ok(Plan {
+            end: value.len(),
+            query,
+        }),
     }
 }
 
 fn run<'a, const PREFIX: bool>(
     source: impl Source<'a>,
-    mut state: Cursor,
-    locate: impl Fn(usize, Context) -> Progress,
+    locate: impl Fn(usize, bool) -> Progress,
 ) -> Result<Stage, Error> {
+    let mut cursor = 0;
+    let mut query = None;
     loop {
-        let context = state.context();
-        let at = match locate(state.at(), context) {
+        let in_query = query.is_some();
+        let at = match locate(cursor, in_query) {
             Progress::Special(at) => at,
             Progress::Tail(at) => {
                 let Some(tail) = source.sub(at, source.len()) else {
-                    return Ok(Stage::Exhausted(state));
+                    return Ok(Stage::Exhausted(query));
                 };
                 let Some(offset) = tail
                     .span()
                     .iter()
-                    .position(|byte| !Scan::is_path(*byte, context))
+                    .position(|byte| !Scan::is_path(*byte, in_query))
                 else {
-                    return Ok(Stage::Exhausted(state));
+                    return Ok(Stage::Exhausted(query));
                 };
                 at + offset
             }
-            Progress::End => return Ok(Stage::Exhausted(state)),
+            Progress::End => return Ok(Stage::Exhausted(query)),
         };
         let Some(byte) = source.get(at) else {
-            return Ok(Stage::Exhausted(state));
+            return Ok(Stage::Exhausted(query));
         };
         match byte {
-            b' ' if PREFIX => return Ok(Stage::Found(state.finish(at))),
-            b'?' if matches!(context, Context::Path) => {
-                state.at = at + 1;
-                state.query = At::Query(at);
+            b' ' if PREFIX => return Ok(Stage::Found(Plan { end: at, query })),
+            b'?' if !in_query => {
+                cursor = at + 1;
+                query = NonZero::new(cursor);
             }
             b'%' => match escape(source, at) {
-                Ok(next) => state.at = next,
+                Ok(next) => cursor = next,
                 Err(Error::Escape { first, second, .. })
                     if PREFIX
                         && second.is_none()
                         && first.is_none_or(|byte| byte.is_ascii_hexdigit()) =>
                 {
-                    return Ok(Stage::Exhausted(state));
+                    return Ok(Stage::Exhausted(query));
                 }
                 Err(error) => return Err(error),
             },
@@ -224,49 +218,8 @@ enum Progress {
 /// Terminal of one scan: a located terminator, or the input running out.
 enum Stage {
     Found(Plan),
-    Exhausted(Cursor),
-}
-
-#[derive(Clone, Copy)]
-#[repr(u8)]
-enum Context {
-    Path,
-    Query,
-}
-
-#[derive(Clone, Copy)]
-struct Cursor {
-    at: usize,
-    query: At,
-}
-
-impl Cursor {
-    const fn new() -> Self {
-        Self {
-            at: 0,
-            query: At::Path,
-        }
-    }
-
-    fn at(self) -> usize {
-        self.at
-    }
-
-    fn context(self) -> Context {
-        match self.query {
-            At::Path => Context::Path,
-            At::Query(_) => Context::Query,
-        }
-    }
-
-    fn finish(self, end: usize) -> Plan {
-        Plan {
-            end,
-            query: self.query,
-        }
-    }
+    Exhausted(Option<NonZero<usize>>),
 }
 
 const _: () = assert!(core::mem::size_of::<Scan<'_>>() == core::mem::size_of::<&[u8]>());
-const _: () = assert!(core::mem::size_of::<At>() == core::mem::size_of::<Option<usize>>());
-const _: () = assert!(core::mem::size_of::<Context>() == core::mem::size_of::<bool>());
+const _: () = assert!(core::mem::size_of::<Plan>() == 2 * core::mem::size_of::<usize>());

@@ -1,6 +1,6 @@
 use book::input;
 use dope_quic::{conn::id, stream, wire::stream::Id};
-use requests::{book, entries::Completion};
+use requests::book;
 use sark_core::{
     deadline::timeline,
     life::{self, exchange},
@@ -11,7 +11,9 @@ use crate::{
     frame,
     manifold::{
         self, Phase, owners, requests,
-        server::{self, deadline, deadline::state::State, rotation, task::ingress::item::Item},
+        server::{
+            self, deadline, deadline::state::State, failure, rotation, task::ingress::item::Item,
+        },
     },
 };
 
@@ -24,7 +26,8 @@ pub(in crate::manifold::server) fn push<'d, A, L, E, const ID: u8, O, R, const R
     A: app::Runtime<'d, Target = server::Handle<'d, ID>>,
     L: rotation::Policy<'d>,
     E: State<'d>,
-    O: life::Mode<id::Handle<id::Driver<'d>, ID>, Id>,
+    O: life::Mode<id::Handle<id::Driver<'d>, ID>, Id>
+        + failure::Sink<id::Handle<id::Driver<'d>, ID>>,
     O::Retention: owners::Handoff,
     R: stream::Retain<'d>,
 {
@@ -60,7 +63,7 @@ pub(in crate::manifold::server) fn push<'d, A, L, E, const ID: u8, O, R, const R
             }
             done
         }
-        input::Push::Queued => Completion::Open,
+        input::Push::Queued => Boundary::More,
         input::Push::Inactive {
             phase: Phase::Stopped,
             ..
@@ -120,7 +123,7 @@ pub(in crate::manifold::server) fn push<'d, A, L, E, const ID: u8, O, R, const R
         manifold::close_connection_scoped(quic, deadline::code(error));
         return;
     }
-    if matches!(done, Completion::Finished) {
+    if matches!(done, Boundary::End) {
         state.finish_input(app, life, quic, handle, id, now);
     } else {
         life.observe(life::Event::InputFinished(span));

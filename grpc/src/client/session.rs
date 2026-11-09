@@ -124,18 +124,18 @@ where
             };
             match prepared.try_bind().map_err(Failure::Payload)? {
                 Offer::Prefix(value) => match requests.admit(value) {
-                    request::Admission::Ready(ready) => ready.commit_left(),
-                    request::Admission::Exhausted(_) => return Ok(Flush::Exhausted),
-                    request::Admission::Saturated(_) => return Ok(Flush::Saturated),
-                    request::Admission::Rejected(cause) => {
+                    Ok(request::Admission::Ready(ready)) => ready.commit_left(),
+                    Err(_) => return Ok(Flush::Exhausted),
+                    Ok(request::Admission::Saturated(_)) => return Ok(Flush::Saturated),
+                    Ok(request::Admission::Rejected(cause)) => {
                         return Err(Failure::Reserve(cause.cause()));
                     }
                 },
                 Offer::Body(value) => match requests.admit(value) {
-                    request::Admission::Ready(ready) => ready.commit_right(),
-                    request::Admission::Exhausted(_) => return Ok(Flush::Exhausted),
-                    request::Admission::Saturated(_) => return Ok(Flush::Saturated),
-                    request::Admission::Rejected(cause) => {
+                    Ok(request::Admission::Ready(ready)) => ready.commit_right(),
+                    Err(_) => return Ok(Flush::Exhausted),
+                    Ok(request::Admission::Saturated(_)) => return Ok(Flush::Saturated),
+                    Ok(request::Admission::Rejected(cause)) => {
                         return Err(Failure::Reserve(cause.cause()));
                     }
                 },

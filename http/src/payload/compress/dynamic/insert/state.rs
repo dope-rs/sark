@@ -9,7 +9,6 @@ use crate::{
 pub struct State {
     pub(super) tail: Cursor,
     pub(super) len: Length,
-    pub(super) checkpoint: Cursor,
     packed_name: Packed,
     pub(super) name: block::Scan,
     pub(super) value: block::Value,
@@ -27,7 +26,6 @@ impl State {
     pub(in crate::payload::compress::dynamic) fn begin(&mut self, tail: Cursor) {
         self.tail = tail;
         self.len = Length::ZERO;
-        self.checkpoint = tail;
         self.packed_name = Packed::UNFINISHED;
         self.name = block::Scan::new();
         self.value = block::Value::new();
@@ -119,7 +117,6 @@ impl Default for State {
         Self {
             tail: Cursor::ZERO,
             len: Length::INACTIVE,
-            checkpoint: Cursor::ZERO,
             packed_name: Packed::UNFINISHED,
             name: block::Scan::new(),
             value: block::Value::new(),
@@ -127,4 +124,4 @@ impl Default for State {
     }
 }
 
-const _: () = assert!(core::mem::size_of::<State>() == 5 * core::mem::size_of::<u32>());
+const _: () = assert!(core::mem::size_of::<State>() == 4 * core::mem::size_of::<u32>());

@@ -3,7 +3,7 @@ use std::{mem, ops};
 use o3::{buffer::storage, mem::slice::Ext as _};
 
 use crate::{
-    Nesting,
+    Error, Nesting,
     segment::{Atom, Cursor, Projection},
     source::string::Scan,
 };
@@ -15,6 +15,7 @@ pub(super) use name::Name;
 pub(crate) enum ValueKind {
     String { escapes: usize },
     Unsigned(u64),
+    Negative(u64),
     Number,
     True,
     False,
@@ -22,32 +23,40 @@ pub(crate) enum ValueKind {
     Compound,
 }
 
+impl ValueKind {
+    pub(crate) fn i64(self) -> crate::Result<i64> {
+        match self {
+            Self::Unsigned(value) => i64::try_from(value).map_err(|_| Error::Invalid),
+            Self::Negative(value) => 0_i64.checked_sub_unsigned(value).ok_or(Error::Invalid),
+            _ => Err(Error::Invalid),
+        }
+    }
+}
+
 const _: () = assert!(mem::size_of::<ValueKind>() == 2 * mem::size_of::<usize>());
 
 pub(super) enum Stored {
-    Original(ops::Range<usize>),
+    None,
+    Bytes(ops::Range<usize>),
+    Frame(ops::Range<usize>),
+    Segments(ops::Range<usize>),
     Copied(storage::Shared),
+    Decoded(storage::Shared),
 }
 
 pub(super) struct Value {
     pub(super) stored: Stored,
     pub(super) kind: ValueKind,
-    pub(super) projection: Projection,
-    pub(super) decoded: Option<storage::Shared>,
 }
 
 impl Value {
     pub(super) fn is_retained(&self, segment: &ops::Range<usize>) -> bool {
-        let Stored::Original(range) = &self.stored else {
-            return false;
-        };
-        let decoded = self.projection == Projection::Frame && self.decoded.is_some();
-        !decoded
-            && matches!(
-                self.projection,
-                Projection::Bytes | Projection::Frame | Projection::Segments
-            )
-            && is_overlap(range, segment)
+        match &self.stored {
+            Stored::Bytes(range) | Stored::Frame(range) | Stored::Segments(range) => {
+                is_overlap(range, segment)
+            }
+            _ => false,
+        }
     }
 }
 
@@ -80,14 +89,16 @@ impl Capture {
 
     pub(super) fn finish(self, end: usize, kind: ValueKind) -> Option<(usize, Value)> {
         let field = self.field?;
-        let stored = Stored::Original(self.start..end);
         Some((
             field,
             Value {
-                stored,
+                stored: match self.mode {
+                    Projection::None | Projection::Scalar => Stored::None,
+                    Projection::Bytes => Stored::Bytes(self.start..end),
+                    Projection::Frame => Stored::Frame(self.start..end),
+                    Projection::Segments => Stored::Segments(self.start..end),
+                },
                 kind,
-                projection: self.mode,
-                decoded: None,
             },
         ))
     }

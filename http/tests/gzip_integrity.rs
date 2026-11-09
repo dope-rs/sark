@@ -12,7 +12,10 @@ use o3::{
     buffer::{resident, storage, write::SpareExt as _},
 };
 use sark_http::payload::{
-    compress::inflate::{self, Plan},
+    compress::{
+        Compression, Gzip, Output,
+        inflate::{self, Plan},
+    },
     crc32::Hasher,
 };
 
@@ -22,7 +25,9 @@ static ALLOCATOR: Tracker = Tracker::new();
 #[test]
 fn decodes_owned() {
     let original = b"resident gunzip body".repeat(64);
-    let encoded = original.gzip();
+    let Output::Compressed(encoded) = Gzip::try_new().expect("encoder").encode(&original) else {
+        panic!("compressible body");
+    };
     let mut out = storage::Owned::try_with(original.len()).expect("test output must allocate");
     let mut spare = out.spare();
     spare.fill(0);

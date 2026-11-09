@@ -17,7 +17,6 @@ use requests::{
     exchange::{Reset, Stop},
 };
 use sark_core::{
-    deadline::timeline,
     life::{self, Observer as _, exchange},
     manifold::{stream::Section, task::app::Runtime},
 };
@@ -36,7 +35,10 @@ use crate::{
     manifold::{
         self, Diagnostic, owners, requests,
         server::{
-            self, deadline, deadline::state::State, rotation, session, task::ingress::dispatch,
+            self,
+            deadline::state::State,
+            failure, rotation, session,
+            task::ingress::{dispatch, head},
         },
     },
 };
@@ -111,11 +113,12 @@ pub(in crate::manifold::server) struct Item<
 > where
     R: Runtime<'d, Target = server::Handle<'d, ID>>,
     O: life::Mode<id::Handle<id::Driver<'d>, ID>, Id>,
+    O::Retention: owners::Handoff,
     L: rotation::Policy<'d>,
     E: State<'d>,
     B: stream::Recv,
 {
-    pub(in crate::manifold::server) state: &'a mut server::Session<'d, R, L, E>,
+    pub(in crate::manifold::server) state: &'a mut server::Session<'d, R, L, E, O::Retention>,
     pub(in crate::manifold::server) app: pin::Pin<&'a mut R>,
     pub(in crate::manifold::server) life: &'a mut O,
     pub(in crate::manifold::server) conn:
@@ -128,14 +131,15 @@ impl<'a, 'scope, 'd, R, O, L, E, B, const ID: u8, const RECONCILE: bool>
     Item<'a, 'scope, 'd, R, O, L, E, B, ID, RECONCILE>
 where
     R: Runtime<'d, Target = server::Handle<'d, ID>>,
-    O: life::Mode<id::Handle<id::Driver<'d>, ID>, Id>,
+    O: life::Mode<id::Handle<id::Driver<'d>, ID>, Id>
+        + failure::Sink<id::Handle<id::Driver<'d>, ID>>,
     O::Retention: owners::Handoff,
     L: rotation::Policy<'d>,
     E: State<'d>,
     B: stream::Recv,
 {
     pub(in crate::manifold::server) const fn new(
-        state: &'a mut server::Session<'d, R, L, E>,
+        state: &'a mut server::Session<'d, R, L, E, O::Retention>,
         app: pin::Pin<&'a mut R>,
         life: &'a mut O,
         conn: &'a mut scope::Access<'scope, ID, B, RECONCILE, resident::Shared<'d>>,
@@ -167,7 +171,10 @@ where
         {
             Ok(step) => step,
             Err(error) => {
-                self.life.diagnostic(&error);
+                self.life.failure(failure::Event::Connection {
+                    conn: self.handle,
+                    error: &error,
+                });
                 manifold::close_connection_scoped(self.conn, error.code());
                 return;
             }
@@ -195,16 +202,7 @@ where
             manifold::close_connection_scoped(self.conn, error.code());
             return;
         }
-        let (retired, failure) = match self.state.h3.h3_mut().queues.discard(stream) {
-            Ok(retired) => (retired, None),
-            Err((error, retired)) => (retired, Some(error)),
-        };
-        owners::Projection::new(self.life, self.handle).discarded(
-            retired,
-            stream,
-            stream::send::admit::Cause::Reset,
-        );
-        if let Some(error) = failure {
+        if let Err(error) = self.state.discard_response(self.life, self.handle, stream) {
             manifold::close_connection_scoped(self.conn, error.error_code());
             return;
         }
@@ -222,7 +220,7 @@ where
         self.retire(id, life::Outcome::Rejected);
     }
 
-    fn run(self, item: manifold::Delivery<'scope, 'd, R::Plan>)
+    fn run(mut self, item: manifold::Delivery<'scope, 'd, R::Plan>)
     where
         B: stream::Retain<'d>,
     {
@@ -280,7 +278,10 @@ where
                     return self.data(resident, message, data);
                 }
                 event::Event::Finished { .. } => return self.finish(resident),
-                event::Event::Reset { .. } => return self.reset(resident),
+                event::Event::Reset { .. } => match self.resolve(&resident) {
+                    Ok((_, id)) => return self.retire(id, life::Outcome::Cancelled),
+                    Err(Resolve::NotRequest | Resolve::Unbound(_) | Resolve::Stale(..)) => return,
+                },
                 event::Event::Rejected { error, .. } => return self.rejected(resident, error),
                 event::Event::Stopped {
                     stream_id: stream, ..
@@ -336,16 +337,8 @@ where
                 return;
             }
         };
-        if let Err(error) = E::transition(
-            &mut self.state.deadline,
-            id,
-            timeline::Transition::InputFinished,
-            self.now,
-        ) {
-            manifold::close_connection_scoped(self.conn, deadline::code(error));
-            return;
-        }
-        self.state.finish_input(
+        head::finish(
+            self.state,
             self.app.into_ref().get_ref(),
             self.life,
             self.conn,
@@ -353,14 +346,6 @@ where
             id,
             self.now,
         );
-    }
-
-    fn reset(mut self, resident: Presence<'scope>) {
-        let id = match self.resolve(&resident) {
-            Ok((_, id)) => id,
-            Err(Resolve::NotRequest | Resolve::Unbound(_) | Resolve::Stale(..)) => return,
-        };
-        self.retire(id, life::Outcome::Cancelled);
     }
 
     fn retire(mut self, id: requests::Id, outcome: life::Outcome) {
@@ -375,15 +360,24 @@ where
         let span = exchange::Id::new(self.handle, stream);
         match task {
             Some(task) => {
-                Runtime::cancel(self.app.as_mut(), task);
-                self.life.observe(life::Event::TaskCancelled(span));
+                if let Some(response) =
+                    server::task::cancel(task, self.app.as_mut(), self.life, span)
+                {
+                    response.discard(self.state.h3.h3_mut(), id);
+                }
             }
             None => {
                 let proof = self.life.body(span);
                 match self.state.requests.reset(id, proof) {
                     Ok(Reset::Cancelled) => {}
                     Ok(Reset::Missing) => {
-                        if let Err(error) = finish::release(self.state, self.conn, id, self.now) {
+                        if let Err(error) = finish::removed(
+                            &mut self.state.h3,
+                            self.now.at(&mut self.state.deadline),
+                            self.conn,
+                            id,
+                            false,
+                        ) {
                             manifold::close_connection_scoped(self.conn, error.code());
                         }
                         return;
@@ -398,10 +392,15 @@ where
                 }
             }
         }
-        if let Err(error) = self
-            .state
-            .finish(self.conn, id, self.life, span, outcome, self.now)
-        {
+        let retired = finish::removed(
+            &mut self.state.h3,
+            self.now.at(&mut self.state.deadline),
+            self.conn,
+            id,
+            false,
+        );
+        span.retire(self.life, outcome);
+        if let Err(error) = retired {
             manifold::close_connection_scoped(self.conn, error.code());
         }
     }
@@ -441,8 +440,11 @@ where
                 self.stop_stream(handle, stream);
                 match stop {
                     Stop::Task(task) => {
-                        Runtime::cancel(self.app.as_mut(), task);
-                        self.life.observe(life::Event::TaskCancelled(span));
+                        if let Some(response) =
+                            server::task::cancel(task, self.app.as_mut(), self.life, span)
+                        {
+                            response.discard(self.state.h3.h3_mut(), id);
+                        }
                     }
                     Stop::Exchange(bytes) => {
                         if let Err(error) =

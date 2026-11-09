@@ -199,7 +199,7 @@ impl<'d> Chunks<'d> {
         budget: resident::Budget<'d>,
         required: usize,
         maximum: usize,
-    ) -> Result<Owned<resident::Lease<'d>>, Error> {
+    ) -> Result<Owned<resident::Budget<'d>>, Error> {
         let resident = required
             .saturating_sub(2)
             .saturating_mul(retain::MAX_RESIDENT_AMPLIFICATION)

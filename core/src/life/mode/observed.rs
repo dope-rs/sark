@@ -80,24 +80,6 @@ where
 {
     type Session = Session;
     type TransportTag = Tag;
-    type Trace = Self;
-
-    fn trace(&self) -> Option<&Self::Trace> {
-        Some(self)
-    }
-
-    fn trace_mut(&mut self) -> Option<&mut Self::Trace> {
-        Some(self)
-    }
-}
-
-impl<C, O> sequence::Trace<C> for Observed<O>
-where
-    C: Copy,
-    O: life::Observer<C, u64>,
-{
-    type Session = Session;
-    type TransportTag = Tag;
 
     fn tag(&self, id: exchange::Id<C, u64>, charge: hold::Charge) -> Self::TransportTag {
         Tag::new(id.stream(), charge)
@@ -112,7 +94,7 @@ where
             .map(|(order, charge)| (exchange::Id::new(conn, order), charge))
     }
 
-    fn open(&mut self, session: &mut Self::Session, conn: C) -> exchange::Id<C, u64> {
+    fn next(&mut self, session: &mut Self::Session, conn: C) -> exchange::Id<C, u64> {
         exchange::Id::new(conn, session.advance())
     }
 

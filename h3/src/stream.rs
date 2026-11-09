@@ -58,10 +58,6 @@ impl Cancellation {
     pub const fn stream_id(&self) -> Id {
         self.0.stream_id()
     }
-
-    pub(crate) const fn into_target(self) -> Target {
-        self.0
-    }
 }
 
 /// Owner-tagged H3 target that may outlive one QUIC connection access.

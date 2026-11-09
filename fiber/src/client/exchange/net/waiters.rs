@@ -23,11 +23,11 @@ pub(in crate::client) struct Waiters<'d, ID: Identity, Tag: net::PoolTag<'d, ID>
 impl<'d, ID: Identity, Tag: net::PoolTag<'d, ID>> Waiters<'d, ID, Tag> {
     pub(in crate::client) fn try_new(
         active: queue::Queue<'d, Tag::Lanes>,
-        conn: impl FnOnce() -> Result<Tag::Connections, resident::Error>,
+        connection: Result<Tag::Connections, resident::Error>,
     ) -> Result<Self, resident::Error> {
         Ok(Self {
             active,
-            connection: conn()?,
+            connection: connection?,
             tag: marker::PhantomData,
         })
     }

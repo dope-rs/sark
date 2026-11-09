@@ -34,7 +34,7 @@ mod decoder;
 pub(crate) mod header;
 pub mod ops;
 pub(crate) use bound::Bound;
-mod ready;
+pub(in crate::conn) mod ready;
 pub mod streams;
 pub mod view;
 
@@ -344,7 +344,7 @@ where
     }
 
     fn ready(&mut self) -> Option<Self::Ready<'_>> {
-        self.ingress.events.ready().map(Ready::new)
+        ready::Incoming::new(self).map(Ready::new)
     }
 
     fn poll_wake(&mut self) -> Option<schedule::Wake<Self::Key>> {

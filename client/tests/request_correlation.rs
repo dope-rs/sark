@@ -2,7 +2,7 @@ pub mod common;
 
 use common::{
     codec::{
-        Output, Scope as _,
+        Scope as _, only,
         decoder::{self, Decoder},
     },
     response::{RESET_CHUNKS, RESET_HEAD},
@@ -84,7 +84,7 @@ fn correlates_pipeline() {
             .expect("complete response item");
         let end = output.completion();
         assert!(matches!(
-            Output::new(output).only(),
+            only(output),
             Some(Ok(response::Event::Informational(_)))
         ));
         assert!((end) == (output::Completion::Pending));
@@ -98,7 +98,7 @@ fn correlates_pipeline() {
             .expect("complete response item");
         let end = output.completion();
         assert!(matches!(
-            Output::new(output).only(),
+            only(output),
             Some(Ok(response::Event::Head(_)))
         ));
         assert!((end) == (output::Completion::Complete));
@@ -113,7 +113,7 @@ fn correlates_pipeline() {
             .expect("complete response item");
         let end = output.completion();
         assert!(matches!(
-            Output::new(output).only(),
+            only(output),
             Some(Ok(response::Event::Head(_)))
         ));
         assert!((end) == (output::Completion::Pending));
@@ -134,8 +134,7 @@ fn correlates_pipeline() {
             "body events must not consult the request correlation ledger"
         );
         let end = output.completion();
-        let data = match Output::new(output)
-            .only()
+        let data = match only(output)
             .expect("GET body must emit data")
             .expect("GET body must emit data")
         {
@@ -192,8 +191,7 @@ fn rejects_switch() {
             .try_item(&mut state, &wire, &budget, || Some(Method::Other))
             .expect("complete response item must parse")
             .expect("complete response item");
-        let error = (Output::new(output)
-            .only()
+        let error = (only(output)
             .expect("unsolicited switch must emit an error"))
         .expect_err("unsolicited switch must fail");
         assert!(matches!(

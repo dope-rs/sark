@@ -25,14 +25,9 @@ fn cached_driver_admission() {
     let mut conn = Conn::default();
     let mut cold = [0; 256];
     let first = driver.ingest(&mut conn, FULL, &mut cold, head::Connection::KeepAlive);
-    let prefix = match first.state {
-        Ok(pump::Egress::Write {
-            prefix,
-            body: pump::Body::None,
-        }) => Some(prefix),
-        _ => None,
-    }
-    .expect("cold cached response");
+    let Ok(pump::Egress::Inline { prefix }) = first.state else {
+        panic!("cold cached response");
+    };
     assert!(cold[..prefix].starts_with(b"HTTP/1.1 200 OK\r\n"));
     assert!(cold[..prefix].ends_with(b"\r\n\r\nok"));
     assert!(matches!(
@@ -46,10 +41,7 @@ fn cached_driver_admission() {
     });
     assert!(matches!(
         next.state,
-        Ok(pump::Egress::Write {
-            prefix: written,
-            body: pump::Body::None,
-        }) if written == prefix
+        Ok(pump::Egress::Inline { prefix: written }) if written == prefix
     ));
     assert_eq!(&warm[..prefix], &cold[..prefix]);
 }
@@ -66,12 +58,12 @@ fn reserves_larger_route() {
     let first = Request::wire(chunked::ONE, 1);
     let next = Request::wire(chunked::MANY, 1024);
     let cycle = driver.ingest(&mut conn, &first, &mut write, head::Connection::KeepAlive);
-    assert!(matches!(cycle.state, Ok(pump::Egress::Write { .. })));
+    assert!(matches!(cycle.state, Ok(pump::Egress::Inline { .. })));
     assert_eq!(seen.one.get(), None);
 
     let (cycle, allocs) =
         Tracker::count(|| driver.ingest(&mut conn, &next, &mut write, head::Connection::KeepAlive));
-    assert!(matches!(cycle.state, Ok(pump::Egress::Write { .. })));
+    assert!(matches!(cycle.state, Ok(pump::Egress::Inline { .. })));
     assert_eq!(allocs, 1);
     assert_eq!(seen.many.get(), None);
 }
@@ -101,7 +93,7 @@ fn reserves_page_once() {
             head::Connection::KeepAlive,
         )
     });
-    assert!(matches!(cycle.state, Ok(pump::Egress::Write { .. })));
+    assert!(matches!(cycle.state, Ok(pump::Egress::Inline { .. })));
     assert_eq!(allocs, 1);
     assert_eq!(seen.many.get(), None);
 }
@@ -130,14 +122,9 @@ fn excludes_chunk_framing() {
                 head::Connection::KeepAlive,
             );
         }
-        let prefix = match cycle.state {
-            Ok(pump::Egress::Write {
-                prefix,
-                body: pump::Body::None,
-            }) => Some(prefix),
-            _ => None,
-        }
-        .expect("inline response");
+        let Ok(pump::Egress::Inline { prefix }) = cycle.state else {
+            panic!("inline response");
+        };
         assert!(write[..prefix].starts_with(b"HTTP/1.1 200 OK\r\n"));
         assert!(write[..prefix].ends_with(b"\r\n\r\nok"));
         assert!(!seen.invalid.get());
@@ -169,6 +156,6 @@ fn frames_final_body() {
         &mut write,
         head::Connection::KeepAlive,
     );
-    assert!(matches!(last.state, Ok(pump::Egress::Write { .. })));
+    assert!(matches!(last.state, Ok(pump::Egress::Inline { .. })));
     assert!(!seen.invalid.get());
 }

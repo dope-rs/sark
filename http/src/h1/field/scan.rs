@@ -1,7 +1,7 @@
-use core::{num::NonZero, ops};
+use core::num::NonZero;
 
 use o3::buffer::{self, write};
-use write::{CopyError, SourceExt as _};
+use write::CopyError;
 
 use crate::h1::field::{self, Cursor, Entry, Limit, syntax};
 
@@ -58,14 +58,12 @@ impl<S: buffer::raw::Source> State<S> {
         mut sink: impl FnMut(Entry<'_>) -> Result<(), E>,
     ) -> Result<Progress<S>, (S, Error<E>)> {
         loop {
-            let progress = self
-                .cursor
-                .advance(self.source.as_ref(), |field| match sink(field) {
-                    Ok(()) => ops::ControlFlow::Continue(()),
-                    Err(error) => ops::ControlFlow::Break(error),
-                });
-            match progress {
-                Ok(field::Progress::Emitted(())) => {}
+            match self.cursor.advance(self.source.as_ref()) {
+                Ok(field::Progress::Field(field)) => {
+                    if let Err(error) = sink(field) {
+                        return Err((self.source, Error::Sink(error)));
+                    }
+                }
                 Ok(field::Progress::More) => return Ok(Progress::More(self)),
                 Ok(field::Progress::End(end)) => {
                     return Ok(Progress::Complete(Complete {
@@ -73,7 +71,6 @@ impl<S: buffer::raw::Source> State<S> {
                         end,
                     }));
                 }
-                Ok(field::Progress::Break(error)) => return Err((self.source, Error::Sink(error))),
                 Err(error) => return Err((self.source, Error::Syntax(error))),
             }
         }
@@ -84,7 +81,7 @@ impl<S: buffer::raw::Source> State<S> {
     where
         D: buffer::raw::Source + write::Sink,
     {
-        let target = target.try_copy(self.source.as_ref())?;
+        let target = write::try_copy(target, self.source.as_ref())?;
         Ok(State {
             source: target,
             cursor: self.cursor,

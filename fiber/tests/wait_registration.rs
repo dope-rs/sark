@@ -7,17 +7,13 @@ use common::client::runtime::{
     origins, peer, pools,
 };
 use common::server::recover;
-use dope::core::{driver::life::recovery, io::Reclaimed, platform::wake};
+use dope::core::{driver::life::recovery, io::Reclaimed};
 use dope_fiber::{
     BlockOn as _, abi,
     abi::race::{Either, Race},
     task::batch,
 };
-use dope_test::harness::{
-    GUARD,
-    peer::{AcceptScript, TcpAcceptor},
-    scenario::run::{Entry, Task as _},
-};
+use dope_test::harness::peer::{AcceptScript, TcpAcceptor};
 use sark_client::protocol::response;
 use sark_fiber::client::{Ready as _, config::Config};
 
@@ -34,6 +30,7 @@ fn rearms_after_failure() {
     )
     .expect("client plan")
     .enter(
+        (),
         |mut scope| {
             let client = scope.handle;
             let deadline = client.sleep(Duration::from_secs(3)).expect("wait deadline");
@@ -69,6 +66,7 @@ fn rearms_reserved() {
             origins::Plan::new(Config::new(server.addr().to_string()).inflight(1), 1, 4, 1)
                 .expect("client plan")
                 .enter(
+                    (),
                     |mut scope| {
                         let client = scope.handle;
                         let deadline = client
@@ -124,6 +122,7 @@ fn ready_survives_cancel() {
     )
     .expect("client plan")
     .enter(
+        (),
         |mut scope| {
             let client = scope.handle;
             let deadline = client.sleep(Duration::from_secs(3)).expect("wait deadline");
@@ -171,87 +170,106 @@ fn ready_survives_cancel() {
 
 #[test]
 fn dispatch_survives_cancel() {
-    let listener = TcpListener::bind("127.0.0.1:0").expect("reserve peer address");
-    let address = listener.local_addr().expect("peer address");
-    drop(listener);
-    let (wait, start) = wake::Ends::blocking().expect("peer release").split();
-    let peer = Entry(move || {
-        wait.wait_timeout(GUARD).expect("queued requests");
-        let listener = TcpAcceptor::bind(address).expect("start peer");
-        let stream = listener
-            .accept_for(GUARD)
-            .expect("accept client")
-            .expect("client before deadline");
-        stream.read_wait(Some(GUARD)).expect("peer deadline");
-        stream.write_wait(Some(GUARD)).expect("peer write deadline");
-        let mut conn = peer::Conn::new(&stream);
-        let path = conn
-            .try_request()
-            .expect("read request")
-            .expect("surviving request")
-            .target()
-            .to_owned();
-        conn.write_all(WAIT_RESPONSE).expect("respond once");
-        assert!(
-            conn.try_request().expect("request end").is_none(),
-            "duplicate request"
-        );
-        path
-    });
-    let (path, wire) = peer
-        .with(|| {
-            pools::Plan::new(
-            address,
-            Config::try_new("127.0.0.1").expect("HTTP host allocation").idle_timeout(Duration::ZERO),
-            1,
-            4,
-        )
-        .expect("client plan")
-        .enter(
-            |mut scope| {
-                let client = scope.handle;
-                let deadline = client.sleep(Duration::from_secs(3)).expect("request deadline");
-                let start = &start;
-                let requests = dope_fiber::fiber!('_ => async move {
-                    let waiting = Cell::new(0);
-                    let canceled = Cell::new(false);
-                    let mut pool = batch::Pool::<2>::acquire().await.expect("request task pool");
-                    batch::Join::from_fn(&mut pool, |index| {
-                        Cancel::new(
-                            client.get(WAIT_PATHS[index.get()]),
-                            || client.connections() != 0 && !canceled.replace(true),
-                            || {
-                                let count = waiting.get() + 1;
-                                waiting.set(count);
-                                if count == 2 {
-                                    start.notify().expect("release peer");
-                                }
-                            },
-                        )
-                    }).await
-                });
-                let result = scope.app.block_on(Race::new(deadline, requests))
-                    .expect("drive request tasks");
-                let Either::Right(replies) = result else {
-                    panic!("dispatch wake lost");
+    use dope_test::{fibers::Yield, harness::peer::Error as PeerError};
+
+    let reserved = TcpListener::bind("127.0.0.1:0").expect("reserve peer address");
+    let address = reserved.local_addr().expect("peer address");
+    drop(reserved);
+    pools::Plan::new(
+        address,
+        Config::try_new("127.0.0.1").expect("HTTP host allocation").idle_timeout(Duration::ZERO),
+        1,
+        4,
+    )
+    .expect("client plan")
+    .enter(
+        (),
+        |mut scope| {
+            let client = scope.handle;
+            let deadline = client.sleep(Duration::from_secs(3)).expect("request deadline");
+            let listener = Cell::new(None);
+            let listener = &listener;
+            let requests = dope_fiber::fiber!('_ => async move {
+                let waiting = Cell::new(0);
+                let canceled = Cell::new(false);
+                let mut pool = batch::Pool::<2>::acquire().await.expect("request task pool");
+                batch::Join::from_fn(&mut pool, |index| {
+                    Cancel::new(
+                        client.get(WAIT_PATHS[index.get()]),
+                        || client.connections() != 0 && !canceled.replace(true),
+                        || {
+                            waiting.set(waiting.get() + 1);
+                            if waiting.get() == 2 {
+                                listener.set(Some(TcpAcceptor::bind(address).expect("start peer")));
+                            }
+                        },
+                    )
+                }).await
+            });
+            let peer = dope_fiber::fiber!('_ => async move {
+                let listener = loop {
+                    if let Some(listener) = listener.take() { break listener; }
+                    Yield::new().await;
                 };
-                let mut ready = replies.expect("join request tasks").enumerate()
-                    .filter_map(|(index, reply)| reply.map(|reply| (index, reply)));
-                let (index, reply) = ready.next().expect("surviving request");
-                assert_eq!(reply.expect("queued response").status().as_u16(), 200);
-                assert!(ready.next().is_none(), "one notified request canceled");
-                WAIT_PATHS[index]
-            },
-            recovery::Policy::new(
-                |event| std::assert_matches!(event, Reclaimed::Shutdown),
-                recover,
-            ),
-            |result| result.expect("client execution"),
-        )
-        .expect("client shutdown")
-        })
-        .expect("peer worker");
-    assert_eq!(wire, path);
+                let stream = loop {
+                    if let Some(stream) = listener.try_accept().expect("accept client") {
+                        break stream;
+                    }
+                    Yield::new().await;
+                };
+                stream.nonblock(true);
+                let mut conn = peer::Conn::new(&stream);
+                let path = loop {
+                    match conn.try_request() {
+                        Ok(Some(request)) => break request.target().to_owned(),
+                        Ok(None) => panic!("missing request"),
+                        Err(peer::Error::Io(PeerError::Syscall(error))) if error.is_block() => {
+                            Yield::new().await;
+                        }
+                        Err(error) => panic!("request: {error:?}"),
+                    }
+                };
+                let mut response = b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".as_slice();
+                while !response.is_empty() {
+                    match stream.write(response) {
+                        Ok(0) => panic!("write zero"),
+                        Ok(written) => response = &response[written..],
+                        Err(PeerError::Syscall(error)) if error.is_block() => Yield::new().await,
+                        Err(error) => panic!("response: {error:?}"),
+                    }
+                }
+                loop {
+                    match conn.try_request() {
+                        Ok(None) => break,
+                        Ok(Some(_)) => panic!("duplicate request"),
+                        Err(peer::Error::Io(PeerError::Syscall(error))) if error.is_block() => {
+                            Yield::new().await;
+                        }
+                        Err(error) => panic!("request end: {error:?}"),
+                    }
+                }
+                path
+            });
+            // Peer polling wakes the outer join, not either parked batch slot.
+            let result = scope.app.block_on(Race::new(deadline, abi::Join::new(peer, requests)))
+                .expect("drive request tasks");
+            let Either::Right((wire, replies)) = result else {
+                panic!("dispatch wake lost");
+            };
+            let mut ready = replies.expect("join request tasks").enumerate()
+                .filter_map(|(index, reply)| reply.map(|reply| (index, reply)));
+            let (index, reply) = ready.next().expect("surviving request");
+            assert_eq!(reply.expect("queued response").status().as_u16(), 200);
+            assert!(ready.next().is_none(), "one notified request canceled");
+            assert_eq!(wire, WAIT_PATHS[index]);
+        },
+        recovery::Policy::new(
+            |event| std::assert_matches!(event, Reclaimed::Shutdown),
+            recover,
+        ),
+        |result| result.expect("client execution"),
+    )
+    .expect("client shutdown");
 }
 
 #[test]
@@ -277,6 +295,7 @@ fn dynamic_dispatch_survives_cancel() {
                 origins::Plan::new(Config::new(server.addr().to_string()).inflight(1), 1, 8, 1)
                     .expect("client plan")
                     .enter(
+                        (),
                         |mut scope| {
                             let client = scope.handle;
                             let mut held = scope

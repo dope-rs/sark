@@ -33,31 +33,21 @@ pub(super) enum Field {
     Details,
 }
 
-pub(super) struct Check {
-    pub(super) seal: Seal,
-}
-
-impl Check {
-    pub(super) fn new(kind: rules::Kind) -> Self {
-        Self {
-            seal: Seal::new(kind),
-        }
-    }
-
+impl Seal {
     pub(super) fn field(
         &mut self,
         name: record::Span<'_>,
         value: record::Span<'_>,
         indexing: Indexing,
     ) -> Result<Field, timeout::Error> {
-        if self.seal.has_fault() || (self.seal.is_info() && !name.starts_with(b":")) {
+        if self.has_fault() || (self.is_info() && !name.starts_with(b":")) {
             return Ok(Field::Ignore);
         }
-        if self.seal.kind() == rules::Kind::Request && name.is_equal(b"grpc-timeout") {
-            if self.seal.observe(seal::Flag::Timeout) == seal::Observation::Duplicate {
+        if self.kind() == rules::Kind::Request && name.is_equal(b"grpc-timeout") {
+            if self.observe(seal::Flag::Timeout) == seal::Observation::Duplicate {
                 return Err(timeout::Error::Duplicate);
             }
-            self.seal.set_timeout(timeout::Value::parse(value)?);
+            self.set_timeout(timeout::Value::parse(value)?);
             return Ok(Field::Copy);
         }
         let field = self.classify(name, block::Name::from_span(name).head());
@@ -106,7 +96,7 @@ impl Check {
                     | crate::metadata::Error::InvalidValue { .. }
                     | crate::metadata::Error::Pack(_),
                 ) => {
-                    self.seal.fault(Fault::Metadata);
+                    self.fault(Fault::Metadata);
                     (Field::Ignore, None)
                 }
             },
@@ -121,25 +111,24 @@ impl Check {
         };
         let allowed = match field {
             Field::Method | Field::Scheme | Field::Path | Field::Authority | Field::Te => {
-                self.seal.kind() == rules::Kind::Request
+                self.kind() == rules::Kind::Request
             }
-            Field::HttpStatus => self.seal.kind() == rules::Kind::Response,
-            Field::ContentType | Field::Encoding => matches!(
-                self.seal.kind(),
-                rules::Kind::Request | rules::Kind::Response
-            ),
+            Field::HttpStatus => self.kind() == rules::Kind::Response,
+            Field::ContentType | Field::Encoding => {
+                matches!(self.kind(), rules::Kind::Request | rules::Kind::Response)
+            }
             Field::GrpcStatus | Field::Message | Field::Details => matches!(
-                self.seal.kind(),
+                self.kind(),
                 rules::Kind::Response | rules::Kind::ResponseTrailers
             ),
             Field::Ignore | Field::Copy | Field::Text | Field::Binary => true,
         };
         if !allowed {
-            self.seal.fault(Fault::Metadata);
+            self.fault(Fault::Metadata);
             return Field::Ignore;
         }
-        if flag.is_some_and(|flag| self.seal.observe(flag) == seal::Observation::Duplicate) {
-            self.seal.fault(match field {
+        if flag.is_some_and(|flag| self.observe(flag) == seal::Observation::Duplicate) {
+            self.fault(match field {
                 Field::GrpcStatus => Fault::DuplicateStatus,
                 _ => Fault::Duplicate,
             });
@@ -156,7 +145,7 @@ impl Check {
             Field::Path => request::is_path(value.iter()),
             Field::HttpStatus => match Self::http_status(value) {
                 Some(status) => {
-                    self.seal.set_http(status);
+                    self.set_http(status);
                     true
                 }
                 None => false,
@@ -165,16 +154,16 @@ impl Check {
                 let grpc =
                     value.is_equal(b"application/grpc") || value.starts_with(b"application/grpc+");
                 if grpc {
-                    self.seal.observe(seal::Flag::GrpcContentType);
+                    self.observe(seal::Flag::GrpcContentType);
                 }
-                grpc || self.seal.is_non_ok()
+                grpc || self.is_non_ok()
             }
             Field::Te => value.is_equal(b"trailers"),
             // Valid retains this admission; messages only need to admit flag zero.
             Field::Encoding => value.is_equal(b"identity"),
             Field::GrpcStatus => match crate::Code::parse_span(value) {
                 Some(code) => {
-                    self.seal.set_code(code, indexing);
+                    self.set_code(code, indexing);
                     true
                 }
                 None => false,
@@ -193,7 +182,7 @@ impl Check {
                 Field::Path => Fault::Path,
                 Field::HttpStatus => Fault::HttpStatus,
                 Field::ContentType => Fault::ContentType,
-                Field::Encoding => match self.seal.kind() {
+                Field::Encoding => match self.kind() {
                     rules::Kind::Request => Fault::RequestEncoding,
                     _ => Fault::ResponseEncoding,
                 },
@@ -202,7 +191,7 @@ impl Check {
                 Field::Scheme | Field::Text | Field::Binary => Fault::Metadata,
                 _ => Fault::Capacity,
             };
-            self.seal.fault(fault);
+            self.fault(fault);
         }
     }
 
@@ -225,7 +214,7 @@ impl Check {
     }
 
     pub(super) fn require(&mut self) {
-        let required = match self.seal.kind() {
+        let required = match self.kind() {
             rules::Kind::Request => [
                 (seal::Flag::Method, Fault::Method),
                 (seal::Flag::Path, Fault::Path),
@@ -233,7 +222,7 @@ impl Check {
                 (seal::Flag::Te, Fault::Te),
             ]
             .as_slice(),
-            rules::Kind::Response if self.seal.is_non_ok() => {
+            rules::Kind::Response if self.is_non_ok() => {
                 [(seal::Flag::HttpStatus, Fault::HttpStatus)].as_slice()
             }
             rules::Kind::Response => [
@@ -243,13 +232,13 @@ impl Check {
             .as_slice(),
             rules::Kind::ResponseTrailers | rules::Kind::RequestTrailers => [].as_slice(),
             rules::Kind::PushPromise => {
-                self.seal.fault(Fault::Metadata);
+                self.fault(Fault::Metadata);
                 [].as_slice()
             }
         };
         for &(flag, fault) in required {
-            if !self.seal.has_flag(flag) {
-                self.seal.fault(fault);
+            if !self.has_flag(flag) {
+                self.fault(fault);
             }
         }
     }

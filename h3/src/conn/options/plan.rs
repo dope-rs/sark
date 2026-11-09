@@ -12,7 +12,7 @@ use o3::{
     },
 };
 use sark_http::{
-    field::metadata::section::rules,
+    field::metadata::section::{rules, storage},
     payload::compress::dynamic::{hash, mode, plan},
 };
 
@@ -368,6 +368,13 @@ impl Config {
         } = self;
         let table = table::Table::try_new(streams.ready, streams.table)?;
         let blocked = blocked::Blocked::try_new(qpack.blocked)?;
+        let field_pool =
+            storage::try_layout::<P::Block>(qpack.field_pool, qpack.max_field_section_bytes)
+                .map_err(|(capacity, error)| options::Error::Pool {
+                    slots: qpack.field_pool.slots() as usize,
+                    capacity,
+                    error,
+                })?;
         Ok(conn::Connection {
             settings: conn::Settings {
                 role,
@@ -376,15 +383,16 @@ impl Config {
                 max_frame_size: protocol.max_frame_bytes,
             },
             qpack: conn::QpackState {
-                qpack_encoder: encoder::Encoder::try_plan(
+                qpack_encoder: encoder::State::try_plan(
                     qpack.tables.encoder(),
                     qpack.encoder_sections,
                     seed,
                 )?,
+                pending_encoder: None,
                 qpack_decoder: decoder::Decoder::try_plans(
                     qpack.max_field_section_bytes,
                     qpack.tables.decoder(),
-                    qpack.field_pool,
+                    field_pool,
                 )?,
                 feedback: State::new(),
                 blocked,

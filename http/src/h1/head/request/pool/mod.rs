@@ -9,7 +9,7 @@ mod meta;
 mod open;
 
 pub use buf::Buf;
-pub(in crate::h1::head::request) use layout::{Layout, Source};
+pub(in crate::h1::head::request) use layout::Layout;
 pub use meta::Meta;
 pub use open::Open;
 

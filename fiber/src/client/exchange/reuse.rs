@@ -51,7 +51,7 @@ impl Policy {
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
-pub(super) struct Lease<'d> {
+pub(in crate::client) struct Lease<'d> {
     since: clock::Moment<'d>,
     budget: Positive,
 }
@@ -67,7 +67,7 @@ impl<'d> Lease<'d> {
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
-pub(super) enum Admission<'d> {
+pub(in crate::client) enum Admission<'d> {
     Reserved,
     Fresh,
     Active,

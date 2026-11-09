@@ -15,7 +15,7 @@ use crate::{
 
 #[derive(PartialEq, Eq)]
 pub struct Block {
-    fields: map::Fields<Vec<u8>>,
+    fields: map::Fields,
 }
 
 impl Block {

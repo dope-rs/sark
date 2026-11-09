@@ -12,6 +12,7 @@ pub(super) struct Binding<'emit> {
 impl<'emit> Binding<'emit> {
     pub(super) fn new(
         paths: &Paths,
+        core: &syn::Ident,
         source: &serve::ProtocolPlan<'_>,
         futures: &[&syn::Ident],
         makers: &[&syn::Ident],
@@ -23,6 +24,7 @@ impl<'emit> Binding<'emit> {
     ) -> Self {
         let generics = &source.spec.state_generics;
         let duplex = source.duplex.state();
+        let upgrade = source.entries.iter().any(|route| route.entry.upgrade);
         let [l_wire, l_env] = generics.lives(["__w", "env"]);
         let g_d = generics.ident("__D");
         let [g_brand, g_clock] = generics.lives(["brand", "clock"]);
@@ -42,8 +44,8 @@ impl<'emit> Binding<'emit> {
         };
         let usage = |policy, mode, stamp| {
             quote! {
-                <#g_brand, #l_env, #( #states, )* 'd, #( #values, )* #g_id, #g_wire, #policy, #mode, #stamp,
-                    #( #futures, )* #( #makers, )*>
+                <#core<#g_brand, #l_env, #( #states, )* 'd, #( #values, )* #g_id, #g_wire, #policy, #mode,
+                    #( #futures, )* #( #makers, )*>, #stamp>
             }
         };
         Self {
@@ -59,6 +61,7 @@ impl<'emit> Binding<'emit> {
                 duplex.stamp(
                     quote!(&#g_clock #ns_h1::server::date::Clock),
                     duplex.retention(paths),
+                    upgrade.then(|| quote!(::std::vec::Vec<::core::primitive::u8>)),
                 ),
             ),
             bounds,
@@ -75,5 +78,4 @@ pub(super) struct Extras {
     pub core_moves: proc_macro2::TokenStream,
     pub public_methods: proc_macro2::TokenStream,
     pub core_initializers: proc_macro2::TokenStream,
-    pub multiplexed_prepare: proc_macro2::TokenStream,
 }

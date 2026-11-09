@@ -16,7 +16,6 @@ use crate::{
 
 pub(crate) struct Section<'a, C = ()> {
     dynamic: Option<Dynamic<'a>>,
-    pending: &'a mut encoder::Wire,
     section: buffer::Cache<'a>,
     output: encoder::Output,
     status: Status,
@@ -131,20 +130,17 @@ enum Status {
 
 impl<'a, C: Capture> Section<'a, C> {
     pub(super) fn new(
-        target: &'a mut encoder::Encoder,
+        target: &'a mut encoder::State,
         stream: u64,
         identity: C,
     ) -> Result<Self, encoder::Error> {
-        let floor = target.state.floor();
-        let buffer::Parts {
-            pending,
-            mut section,
-            staged,
-        } = target.buffer.parts();
-        let received = target.state.known_received_count;
-        let dynamic = match &mut target.state.outstanding {
+        let floor = target.floor();
+        let mut section = buffer::Cache(&mut target.section);
+        let staged = &mut target.staged;
+        let received = target.known_received_count;
+        let dynamic = match &mut target.outstanding {
             encoder::Tracking::Active { table, ledger } if table.view().capacity() != 0 => {
-                match ledger.admit(stream, target.state.max_blocked_streams, received) {
+                match ledger.admit(stream, target.max_blocked_streams, received) {
                     Some(permit) => Some(Dynamic {
                         delta: encoder::Delta::try_new(table, floor, staged)?,
                         permit,
@@ -160,7 +156,6 @@ impl<'a, C: Capture> Section<'a, C> {
         let output = encoder::Output::new(section.take());
         Ok(Self {
             dynamic,
-            pending,
             section,
             output,
             status: Status::Open,
@@ -172,7 +167,6 @@ impl<'a, C: Capture> Section<'a, C> {
     pub(super) fn finish(self) -> Result<encoder::Prepared<'a, C>, encoder::Error> {
         let Self {
             dynamic,
-            pending,
             mut section,
             output,
             status,
@@ -209,7 +203,6 @@ impl<'a, C: Capture> Section<'a, C> {
             identity,
             commit: encoder::Commit {
                 tracking,
-                pending,
                 section,
                 delta,
             },

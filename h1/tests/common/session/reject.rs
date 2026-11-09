@@ -12,6 +12,7 @@ use sark_http::{
 
 pub struct Reject<'a> {
     pub calls: &'a Cell<usize>,
+    pub input: Option<&'a [u8]>,
     pub cause: Option<Failure>,
     pub reported: Vec<Option<range::Error>>,
 }
@@ -20,6 +21,7 @@ impl<'a> Reject<'a> {
     pub fn new(calls: &'a Cell<usize>, cause: Option<Failure>) -> Self {
         Self {
             calls,
+            input: None,
             cause,
             reported: Vec::new(),
         }
@@ -76,11 +78,14 @@ impl<'d, T: switch::Engine> session::Dispatch<'d, (), Infallible, T> for Reject<
     fn try_consume(
         self: Pin<&mut Self>,
         _: session::Permit,
-        _: Input<'_>,
+        input: Input<'_>,
         _: &mut [u8],
         _: &mut session::Conn<'d, (), Infallible, T>,
     ) -> session::RouteOutcome<'d, Infallible, T::Raw, Self::Head, parsing::Rejected<'d>> {
         let this = self.get_mut();
+        if let Some(expected) = this.input {
+            assert_eq!(input.as_slice(), expected);
+        }
         this.calls.set(this.calls.get() + 1);
         match this.cause.take() {
             Some(cause) => session::Outcome::Failed(cause).into(),

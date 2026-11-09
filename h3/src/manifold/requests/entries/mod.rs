@@ -2,9 +2,11 @@
 //! This pre-carrier domain cannot use the carrier-driven [`sark_core::manifold::schedule`] runtime.
 //! o3 keys, owner proofs and keyed FIFOs preserve one queue membership per record.
 
+use crate::manifold::owners;
+use sark_core::manifold::task::app;
+
 use std::mem;
 
-use borrowed::Borrowed;
 use o3::{
     alloc, depot,
     depot::{
@@ -17,11 +19,10 @@ use o3::{
         queue::{indexed::keyed, links},
     },
 };
-use sark_core::{body, decode::request, duplex};
+use sark_core::body;
 
 use crate::manifold::requests;
 
-mod borrowed;
 mod buffered;
 mod live;
 mod output;
@@ -30,9 +31,8 @@ mod slots;
 pub(in crate::manifold) mod status;
 
 pub(in crate::manifold) use buffered::{Buffered, Finished, Receiving};
+pub(in crate::manifold) use live::Failure;
 pub(in crate::manifold::requests) use live::Push;
-pub(in crate::manifold) use live::{Completion, Failure};
-pub(super) use output::{Blocked, Output};
 pub(in crate::manifold) use reserved::Reserved;
 pub(in crate::manifold::requests) use slots::Entry;
 
@@ -46,15 +46,13 @@ pub(in crate::manifold::requests) type Built<E> = (
 #[derive(Debug)]
 pub enum Tag {}
 
-pub(super) struct Entries<'d, P: request::Prepared, B: body::Build<'d>, T, D: duplex::Session<'d>> {
-    slots: runtime::Map<Slot<'d, P, B, T, D>, Tag>,
+pub(super) struct Entries<'d, A: app::Runtime<'d>, M: owners::Handoff> {
+    slots: runtime::Map<Slot<'d, A, M>, Tag>,
     ready: keyed::Fifo<key::Handle<runtime::Domain<Tag>>, runtime::Indexed>,
     blocked: keyed::Fifo<key::Handle<runtime::Domain<Tag>>, runtime::Indexed>,
 }
 
-impl<'d, P: request::Prepared, B: body::Build<'d>, T, D: duplex::Session<'d>>
-    Entries<'d, P, B, T, D>
-{
+impl<'d, A: app::Runtime<'d>, M: owners::Handoff> Entries<'d, A, M> {
     pub(super) fn try_new(plan: hash::Plan) -> Result<Self, alloc::Error> {
         Ok(Self {
             slots: runtime::Map::try_new(plan)?,
@@ -66,7 +64,7 @@ impl<'d, P: request::Prepared, B: body::Build<'d>, T, D: duplex::Session<'d>>
     pub(super) fn insert(
         &mut self,
         owner: requests::Identity,
-        entry: Entry<'d, P, B, T, D>,
+        entry: Entry<'d, A, M>,
     ) -> Result<requests::Id, errors::Create<Tag>> {
         let stream = owner.stream_id();
         let key = self.slots.try_create(
@@ -80,7 +78,7 @@ impl<'d, P: request::Prepared, B: body::Build<'d>, T, D: duplex::Session<'d>>
     pub(super) fn reserve(
         &mut self,
         owner: requests::Identity,
-    ) -> Result<Reserved<'_, 'd, P, B, T, D>, errors::Create<Tag>> {
+    ) -> Result<Reserved<'_, 'd, A, M>, errors::Create<Tag>> {
         let stream = owner.stream_id();
         let entry = self.slots.try_live(
             stream.number(),
@@ -111,7 +109,7 @@ impl<'d, P: request::Prepared, B: body::Build<'d>, T, D: duplex::Session<'d>>
         Some(requests::Id::from_entry(owner, entry.key()))
     }
 
-    pub(super) fn find(&self, id: requests::Id) -> Option<&Entry<'d, P, B, T, D>> {
+    pub(super) fn find(&self, id: requests::Id) -> Option<&Entry<'d, A, M>> {
         let key = id.entry();
         let slot = self.slots.get(key)?;
         (slot.identity == id.identity()).then_some(&slot.entry)
@@ -138,7 +136,7 @@ impl<'d, P: request::Prepared, B: body::Build<'d>, T, D: duplex::Session<'d>>
     pub(super) fn entry(
         &mut self,
         id: requests::Id,
-    ) -> Result<Occupied<'_, 'd, P, B, T, D>, requests::Error> {
+    ) -> Result<Occupied<'_, 'd, A, M>, requests::Error> {
         use runtime::entry;
 
         let entry =
@@ -153,18 +151,17 @@ impl<'d, P: request::Prepared, B: body::Build<'d>, T, D: duplex::Session<'d>>
         })
     }
 
-    pub(super) fn front(&mut self) -> Option<live::Live<'_, 'd, P, B, T, D>> {
-        let cursor = keyed::Slot::front(Front::<P, B, T, D, false> { entries: self })?;
+    pub(super) fn front(&mut self) -> Option<live::Live<'_, 'd, A, M>> {
+        let cursor = keyed::Slot::front(Front::<A, M, false> { entries: self })?;
         Some(live::Live {
             entry: State::Ready(cursor.release()),
         })
     }
 
-    pub(super) fn blocked(&mut self) -> Option<Blocked<'_, 'd, P, B, T, D>> {
-        let cursor = keyed::Slot::front(Front::<P, B, T, D, true> { entries: self })?;
-        Some(Blocked {
-            member: cursor.release(),
-        })
+    pub(super) fn resume(&mut self) {
+        if let Some(cursor) = keyed::Slot::front(Front::<A, M, true> { entries: self }) {
+            State::Blocked(cursor.release()).ready();
+        }
     }
 
     pub(super) fn is_empty<const WAIT: bool>(&self) -> bool {
@@ -178,7 +175,7 @@ impl<'d, P: request::Prepared, B: body::Build<'d>, T, D: duplex::Session<'d>>
     pub(super) fn identify(
         &mut self,
         id: requests::Id,
-    ) -> Result<live::Live<'_, 'd, P, B, T, D>, requests::Error> {
+    ) -> Result<live::Live<'_, 'd, A, M>, requests::Error> {
         Ok(live::Live {
             entry: self.entry(id)?.classify(),
         })
@@ -188,7 +185,7 @@ impl<'d, P: request::Prepared, B: body::Build<'d>, T, D: duplex::Session<'d>>
     /// reporting the roots that survived the exhaustive sweep.
     pub(super) fn drain(
         mut self,
-        mut drain: impl FnMut(requests::Id, Entry<'d, P, B, T, D>),
+        mut drain: impl FnMut(requests::Id, Entry<'d, A, M>),
     ) -> Residual {
         use runtime::entry;
 
@@ -228,9 +225,7 @@ enum Destination<E, R> {
     Remove(R),
 }
 
-impl<'d, P: request::Prepared, B: body::Build<'d>, T, D: duplex::Session<'d>, R>
-    Destination<Entry<'d, P, B, T, D>, R>
-{
+impl<'d, A: app::Runtime<'d>, M: owners::Handoff, R> Destination<Entry<'d, A, M>, R> {
     fn stop(finished: bool, out: R) -> Self {
         if finished {
             Self::Remove(out)
@@ -240,32 +235,21 @@ impl<'d, P: request::Prepared, B: body::Build<'d>, T, D: duplex::Session<'d>, R>
     }
 }
 
-pub(super) struct Occupied<
-    'a,
-    'd,
-    P: request::Prepared,
-    B: body::Build<'d>,
-    T,
-    D: duplex::Session<'d>,
-> {
-    entry: entry::Live<'a, Slot<'d, P, B, T, D>, Tag, entry::Occupied>,
+pub(super) struct Occupied<'a, 'd, A: app::Runtime<'d>, M: owners::Handoff> {
+    entry: entry::Live<'a, Slot<'d, A, M>, Tag, entry::Occupied>,
     queue: &'a mut keyed::Fifo<key::Handle<runtime::Domain<Tag>>, runtime::Indexed>,
     other: &'a mut keyed::Fifo<key::Handle<runtime::Domain<Tag>>, runtime::Indexed>,
 }
 
-impl<'a, 'd, P: request::Prepared, B: body::Build<'d>, T, D: duplex::Session<'d>>
-    Occupied<'a, 'd, P, B, T, D>
-{
-    pub(in crate::manifold::requests) fn reserve(
-        self,
-    ) -> Result<Reserved<'a, 'd, P, B, T, D>, Phase> {
+impl<'a, 'd, A: app::Runtime<'d>, M: owners::Handoff> Occupied<'a, 'd, A, M> {
+    pub(in crate::manifold::requests) fn reserve(self) -> Result<Reserved<'a, 'd, A, M>, Phase> {
         match &self.entry.get().entry {
             Entry::Reserved => Ok(self.reserved()),
             entry => Err(entry.phase()),
         }
     }
 
-    fn reserved(self) -> Reserved<'a, 'd, P, B, T, D> {
+    fn reserved(self) -> Reserved<'a, 'd, A, M> {
         Reserved {
             // SAFETY: both callers retain the exclusive map loan after creating or
             // observing `Entry::Reserved`, which is unlinked in both resident FIFOs.
@@ -274,24 +258,10 @@ impl<'a, 'd, P: request::Prepared, B: body::Build<'d>, T, D: duplex::Session<'d>
         }
     }
 
-    fn classify(mut self) -> State<'a, 'd, P, B, T, D> {
-        let place = match &self.entry.get().entry {
-            Entry::Building(_) => {
-                return match keyed::Slot::try_new(self) {
-                    Ok(cursor) => State::Ready(cursor.release()),
-                    Err(vacant) => State::Idle(vacant.release()),
-                };
-            }
-            Entry::Responding(state) => state.queue,
-            Entry::Duplex(state) => state.queue,
-            Entry::Deferred(_) => status::Queue::Ready,
-            Entry::Reserved | Entry::Pending(_) | Entry::Active(_) | Entry::Stopped => {
-                status::Queue::Idle
-            }
-        };
-        match place {
+    fn classify(mut self) -> State<'a, 'd, A, M> {
+        match self.entry.get().queue {
             status::Queue::Ready => State::Ready(
-                // SAFETY: the recorded phase places this slot in the ready FIFO carried by `queue`.
+                // SAFETY: the queue marker places this slot in the ready FIFO carried by `queue`.
                 unsafe { keyed::Slot::<_, _, true>::from_source(depot::raw::Proof::new(self)) }
                     .release(),
             ),
@@ -304,7 +274,7 @@ impl<'a, 'd, P: request::Prepared, B: body::Build<'d>, T, D: duplex::Session<'d>
                 )
             }
             status::Queue::Idle => State::Idle(
-                // SAFETY: every phase reaching `Queue::Idle` is unlinked in both resident FIFOs.
+                // SAFETY: `Queue::Idle` is unlinked in both resident FIFOs.
                 unsafe { keyed::Slot::<_, _, false>::from_source(depot::raw::Proof::new(self)) }
                     .release(),
             ),
@@ -312,21 +282,13 @@ impl<'a, 'd, P: request::Prepared, B: body::Build<'d>, T, D: duplex::Session<'d>
     }
 }
 
-pub(super) struct Member<
-    'a,
-    'd,
-    P: request::Prepared,
-    B: body::Build<'d>,
-    T,
-    D: duplex::Session<'d>,
-> {
-    owner: Occupied<'a, 'd, P, B, T, D>,
+pub(super) struct Member<'a, 'd, A: app::Runtime<'d>, M: owners::Handoff> {
+    owner: Occupied<'a, 'd, A, M>,
 }
 
-impl<'a, 'd, P: request::Prepared, B: body::Build<'d>, T, D: duplex::Session<'d>>
-    Member<'a, 'd, P, B, T, D>
-{
-    fn remove(self) -> Detached<'a, 'd, P, B, T, D> {
+impl<'a, 'd, A: app::Runtime<'d>, M: owners::Handoff> Member<'a, 'd, A, M> {
+    fn remove(mut self) -> Detached<'a, 'd, A, M> {
+        self.owner.entry.get_mut().queue = status::Queue::Idle;
         // SAFETY: a member retains its own membership in the FIFO its owner names.
         unsafe { keyed::Slot::from_source(depot::raw::Proof::new(self.owner)) }
             .remove()
@@ -341,21 +303,17 @@ impl<'a, 'd, P: request::Prepared, B: body::Build<'d>, T, D: duplex::Session<'d>
     }
 }
 
-pub(super) struct Detached<
-    'a,
-    'd,
-    P: request::Prepared,
-    B: body::Build<'d>,
-    T,
-    D: duplex::Session<'d>,
-> {
-    owner: Occupied<'a, 'd, P, B, T, D>,
+pub(super) struct Detached<'a, 'd, A: app::Runtime<'d>, M: owners::Handoff> {
+    owner: Occupied<'a, 'd, A, M>,
 }
 
-impl<'a, 'd, P: request::Prepared, B: body::Build<'d>, T, D: duplex::Session<'d>>
-    Detached<'a, 'd, P, B, T, D>
-{
-    fn push(self) -> Member<'a, 'd, P, B, T, D> {
+impl<'a, 'd, A: app::Runtime<'d>, M: owners::Handoff> Detached<'a, 'd, A, M> {
+    fn push<const WAIT: bool>(mut self) -> Member<'a, 'd, A, M> {
+        self.owner.entry.get_mut().queue = if WAIT {
+            status::Queue::Blocked
+        } else {
+            status::Queue::Ready
+        };
         // SAFETY: a detached owner left its FIFO, so this slot is vacant in the target plane.
         unsafe { keyed::Slot::<_, _, false>::from_source(depot::raw::Proof::new(self.owner)) }
             .push::<false>()
@@ -368,48 +326,42 @@ impl<'a, 'd, P: request::Prepared, B: body::Build<'d>, T, D: duplex::Session<'d>
     }
 }
 
-pub(super) struct Front<
-    'a,
-    'd,
-    P: request::Prepared,
-    B: body::Build<'d>,
-    T,
-    D: duplex::Session<'d>,
-    const WAIT: bool,
-> {
-    entries: &'a mut Entries<'d, P, B, T, D>,
+pub(super) struct Front<'a, 'd, A: app::Runtime<'d>, M: owners::Handoff, const WAIT: bool> {
+    entries: &'a mut Entries<'d, A, M>,
 }
 
 // SAFETY: `Occupied` holds one slot's exclusive map loan plus both resident FIFOs; `parts`
 // yields that slot's exact key and link, `fifo` the queue it is a member of, and every
 // transition re-establishes the pair before the borrowed root authority escapes.
-unsafe impl<'d, P: request::Prepared, B: body::Build<'d>, T, D: duplex::Session<'d>>
-    depot::raw::KeyOwner<runtime::Indexed> for Occupied<'_, 'd, P, B, T, D>
+unsafe impl<'d, A: app::Runtime<'d>, M: owners::Handoff> depot::raw::KeyOwner<runtime::Indexed>
+    for Occupied<'_, 'd, A, M>
 {
     type Key = key::Handle<runtime::Domain<Tag>>;
     type Fifo = keyed::Fifo<Self::Key, runtime::Indexed>;
 
     fn parts(&self) -> (Self::Key, &keyed::Link<Self::Key, runtime::Indexed>) {
-        depot::raw::KeyBorrow::parts(Borrowed(&self.entry))
+        (self.entry.key(), &self.entry.get().ready)
     }
 
     fn fifo(&self) -> &keyed::Fifo<Self::Key, runtime::Indexed> {
         self.queue
     }
 
-    fn entry<'a>(
-        live: depot::raw::Proof<(&'a Self, links::Index), Initialized<runtime::Indexed>>,
-    ) -> keyed::Entry<'a, Self::Key, runtime::Indexed> {
-        keyed::Entry::from_source(Borrowed(live))
+    fn link(
+        live: depot::raw::Proof<(&Self, links::Index), Initialized<runtime::Indexed>>,
+    ) -> &keyed::Link<Self::Key, runtime::Indexed> {
+        // SAFETY: the native guard borrows the unchanged store retained by the live source.
+        let live = unsafe { live.map(|(owner, index)| (&owner.entry, index)) };
+        &entry::Live::project(live).1.ready
     }
 }
 
-// SAFETY: `Member` is only released for a slot whose recorded phase proves membership in the
+// SAFETY: `Member` is only released for a slot whose queue marker proves membership in the
 // FIFO its owner names, and it consumes that owner and root authority together.
-unsafe impl<'a, 'd, P: request::Prepared, B: body::Build<'d>, T, D: duplex::Session<'d>>
-    depot::raw::KeyFinish<true, runtime::Indexed> for Occupied<'a, 'd, P, B, T, D>
+unsafe impl<'a, 'd, A: app::Runtime<'d>, M: owners::Handoff>
+    depot::raw::KeyFinish<true, runtime::Indexed> for Occupied<'a, 'd, A, M>
 {
-    type Output = Member<'a, 'd, P, B, T, D>;
+    type Output = Member<'a, 'd, A, M>;
 
     unsafe fn finish(self) -> Self::Output {
         Member { owner: self }
@@ -418,10 +370,10 @@ unsafe impl<'a, 'd, P: request::Prepared, B: body::Build<'d>, T, D: duplex::Sess
 
 // SAFETY: `Detached` is only released for a slot that left its FIFO or was proven vacant by
 // `keyed::Slot::try_new`, and it consumes the same owner and root authority.
-unsafe impl<'a, 'd, P: request::Prepared, B: body::Build<'d>, T, D: duplex::Session<'d>>
-    depot::raw::KeyFinish<false, runtime::Indexed> for Occupied<'a, 'd, P, B, T, D>
+unsafe impl<'a, 'd, A: app::Runtime<'d>, M: owners::Handoff>
+    depot::raw::KeyFinish<false, runtime::Indexed> for Occupied<'a, 'd, A, M>
 {
-    type Output = Detached<'a, 'd, P, B, T, D>;
+    type Output = Detached<'a, 'd, A, M>;
 
     unsafe fn finish(self) -> Self::Output {
         Detached { owner: self }
@@ -430,14 +382,8 @@ unsafe impl<'a, 'd, P: request::Prepared, B: body::Build<'d>, T, D: duplex::Sess
 
 // SAFETY: `Front` borrows both resident FIFOs for `'a` and returns exactly the one named by
 // `WAIT`, so a retained source keeps that FIFO's storage, endpoints and link plane.
-unsafe impl<
-    'd,
-    P: request::Prepared,
-    B: body::Build<'d>,
-    T,
-    D: duplex::Session<'d>,
-    const WAIT: bool,
-> depot::raw::KeySource<runtime::Indexed> for Front<'_, 'd, P, B, T, D, WAIT>
+unsafe impl<'d, A: app::Runtime<'d>, M: owners::Handoff, const WAIT: bool>
+    depot::raw::KeySource<runtime::Indexed> for Front<'_, 'd, A, M, WAIT>
 {
     type Key = key::Handle<runtime::Domain<Tag>>;
 
@@ -452,17 +398,10 @@ unsafe impl<
 
 // SAFETY: selection receives an initialized link of the FIFO `KeySource::fifo` returned and
 // rebuilds the owning `Occupied` from that exact slot, so every edge it walks is live in it.
-unsafe impl<
-    'a,
-    'd,
-    P: request::Prepared,
-    B: body::Build<'d>,
-    T,
-    D: duplex::Session<'d>,
-    const WAIT: bool,
-> depot::raw::KeyPlane<runtime::Indexed> for Front<'a, 'd, P, B, T, D, WAIT>
+unsafe impl<'a, 'd, A: app::Runtime<'d>, M: owners::Handoff, const WAIT: bool>
+    depot::raw::KeyPlane<runtime::Indexed> for Front<'a, 'd, A, M, WAIT>
 {
-    type Slot = Occupied<'a, 'd, P, B, T, D>;
+    type Slot = Occupied<'a, 'd, A, M>;
 
     fn select(
         live: depot::raw::Proof<(Self, links::Index), Initialized<runtime::Indexed>>,

@@ -12,7 +12,7 @@ use crate::{
         event,
         io::{
             Stream,
-            outbound::{Pending, Section},
+            outbound::{Prepared, Section},
             write::{Entry, budget},
         },
         output, push,
@@ -55,7 +55,7 @@ impl<'a, 'd, P: rules::Policy, A: rules::Push> Send<'a, 'd, P, A> {
         let conn = self.conn;
         let target = target.into();
         let pending = conn.stage(target, TYPE_HEADERS, None, fields, boundary)?;
-        pending.into_batch(None).commit()
+        pending.open().commit()
     }
 
     pub fn data(
@@ -68,12 +68,10 @@ impl<'a, 'd, P: rules::Policy, A: rules::Push> Send<'a, 'd, P, A> {
         let target = target.into();
         let data = frame::Data::new(data).map_err(conn::Error::Parse)?;
         let prefix = output::WritePrefix::try_encode(&data)?;
-        conn.queues.enqueue(Entry::single(
-            budget::WriteClass::Regular,
+        conn.queues.enqueue(
             target,
-            prefix,
-            boundary,
-        ))
+            Entry::single(budget::WriteClass::Regular, prefix, boundary),
+        )
     }
 
     pub fn owned(
@@ -133,6 +131,8 @@ impl<'a, 'd, P: rules::Policy, A: rules::Push> Send<'a, 'd, P, A> {
                 cutoff,
             }));
         }
+        let encoder_capacity =
+            o3::depot::capacity::Count::new((conn.qpack.qpack_encoder.maximum() / 32) as u32);
         let prepared = encoder::Prepared::prepare(
             &mut conn.qpack.qpack_encoder,
             target.stream_id().get(),
@@ -163,8 +163,15 @@ impl<'a, 'd, P: rules::Policy, A: rules::Push> Send<'a, 'd, P, A> {
                     return Err(conn::Error::Push(error));
                 }
             };
-        let pending = Pending::new(fields, &mut conn.queues, conn.session.qpack_encoder, None);
-        let retained = pending.into_batch(None).commit()?;
+        let pending = Prepared::new(
+            fields,
+            &mut conn.queues,
+            conn.session.qpack_encoder,
+            None,
+            &mut conn.qpack.pending_encoder,
+            encoder_capacity,
+        );
+        let retained = pending.open().commit()?;
         promise.commit();
         Ok(retained)
     }
@@ -225,12 +232,10 @@ impl<'a, 'd, P: rules::Policy, A: rules::Push> Send<'a, 'd, P, A> {
         let conn = self.conn;
         let stream = conn.session.control.ok_or(conn::Error::ControlMissing)?;
         let prefix = output::WritePrefix::try_encode(&control)?;
-        conn.queues.enqueue(Entry::single(
-            budget::WriteClass::Critical,
+        conn.queues.enqueue(
             stream,
-            prefix,
-            Boundary::More,
-        ))
+            Entry::single(budget::WriteClass::Critical, prefix, Boundary::More),
+        )
     }
 }
 

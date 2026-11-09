@@ -12,7 +12,7 @@ use crate::{
         call::bidi,
         manifold::{
             api, error, handle,
-            ops::{cancels, polls::Completion, send},
+            ops::{cancels, send},
         },
         receive,
     },
@@ -55,7 +55,8 @@ impl<'app, 'life, 'e, 'd: 'app, P: ?Sized + 'app, ID: Identity> handle::Completi
         wake: &wake::Waker<'d>,
     ) -> Result<Option<Self::Output>, error::Error> {
         let stream = self.stream.as_ref().ok_or_else(Self::consumed)?;
-        Completion::new(token, self.scope).response(&stream.response, Some((lease, wake)))
+        self.scope
+            .poll_response(token, &stream.response, Some((lease, wake)))
     }
 }
 

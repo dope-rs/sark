@@ -109,4 +109,15 @@ impl Peer {
     pub fn try_write(&mut self, plain: &[u8]) -> Result<(), Error> {
         self.0.write(plain)
     }
+
+    /// Waits for TLS closure or transport EOF and rejects leftover plaintext.
+    pub fn try_closed(&mut self) -> Result<(), Error> {
+        while self.0.read()? != 0 {}
+        if self.0.plain.is_empty() {
+            return Ok(());
+        }
+        Err(Error::Closed {
+            buffered: self.0.plain.len(),
+        })
+    }
 }

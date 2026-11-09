@@ -115,13 +115,6 @@ impl Prepared {
                 Self::#variant(#n_error) => #ns_core::route::Never::never(#n_error),
             }
         });
-        let refs = entries.iter().map(|item| {
-            let variant = &item.prepared;
-            quote! {
-                Self::#variant(#n_call) =>
-                    #n_call.body().body(),
-            }
-        });
         let vis = &spec.vis;
         let types = quote! {
             #[doc(hidden)]
@@ -130,17 +123,6 @@ impl Prepared {
                 'd: #l_input,
             {
                 #( #bodies )*
-            }
-
-            impl<#l_input, 'd: #l_input>
-                #ns_core::decode::Projected<#l_input, 'd>
-                for #body_id<#l_input, 'd>
-            {
-                fn body(&self) -> #ns_http::request::body::Ref<#l_input, 'd> {
-                    match self {
-                        #( #refs )*
-                    }
-                }
             }
 
             #[doc(hidden)]
@@ -244,7 +226,7 @@ impl Prepared {
                             ::core::ops::ControlFlow::Break(
                             ::core::result::Result::Ok(#n_prep),
                         ) => {
-                                let (#n_prep, _) =
+                                let #n_prep =
                                     #ns_core::decode::Lineage::resolve_head(
                                         #n_prep,
                                         #v_head.into_owner(),
@@ -361,7 +343,7 @@ impl Prepared {
                                     #ns_core::decode::Cancel::cancel(#n_encode),
                                 )),
                         }?;
-                        let (#n_prep, _) =
+                        let #n_prep =
                             #ns_core::decode::Lineage::resolve_head(
                                 #n_prep,
                                 #v_head.into_owner(),

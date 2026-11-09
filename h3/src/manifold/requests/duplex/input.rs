@@ -2,22 +2,24 @@ use o3::{
     buffer::{resident, segments},
     mem,
 };
-use sark_core::{
-    body,
-    duplex::{self, admit, input, machine},
-    manifold::stream::Boundary,
-};
+use sark_core::duplex::{self, input, machine};
 use sark_http::payload::owned;
 
 use crate::{Payload, manifold::requests};
 
-struct Buf<'d> {
+pub(in crate::manifold) struct Buf<'d> {
     input: segments::Chain<resident::Shared<'d>>,
 }
 
 impl<'d> Buf<'d> {
-    const fn new(input: segments::Chain<resident::Shared<'d>>) -> Self {
+    pub(in crate::manifold::requests) const fn new(
+        input: segments::Chain<resident::Shared<'d>>,
+    ) -> Self {
         Self { input }
+    }
+
+    pub(in crate::manifold::requests) fn discard(self) -> usize {
+        o3::buffer::raw::Chunks::len(&self.input)
     }
 }
 
@@ -71,59 +73,7 @@ impl<'d> input::Buf<'d> for Buf<'d> {
     }
 }
 
-#[repr(transparent)]
-pub(in crate::manifold) struct Input<'d, D>(input::State<'d, D, Buf<'d>>)
-where
-    D: duplex::Session<'d>;
-
-impl<'d, D> Input<'d, D>
-where
-    D: duplex::Session<'d>,
-{
-    pub(in crate::manifold) fn open(
-        session: D,
-        input: segments::Chain<resident::Shared<'d>>,
-    ) -> Self {
-        Self(input::State::open(session, Buf::new(input)))
-    }
-
-    pub(in crate::manifold) fn push(
-        &mut self,
-        data: Payload<'d>,
-        boundary: Boundary,
-    ) -> Result<(), mem::Rejected<Payload<'d>, requests::Error>> {
-        self.0.push(data, boundary).map_err(|error| match error {
-            input::PushError::Finished(input) => {
-                mem::Rejected::new(input, requests::Error::Body(body::Error::InputFinished))
-            }
-            input::PushError::Buffer(fail) => fail,
-            input::PushError::Finish { input, error } => {
-                mem::Rejected::new(input, requests::Error::Duplex(error))
-            }
-        })
-    }
-
-    pub(in crate::manifold) fn finish(&mut self) -> Result<(), machine::FinishError> {
-        self.0.finish()
-    }
-
-    pub(in crate::manifold) fn work(&self) -> input::Work {
-        self.0.work()
-    }
-
-    pub(in crate::manifold) fn discard(self) -> usize {
-        o3::buffer::raw::Chunks::len(&self.0.into_buffer().input)
-    }
-
-    pub(in crate::manifold) fn transact<R, E>(
-        &mut self,
-        admit: impl for<'turn> FnOnce(
-            admit::Emission<'turn, 'd, D>,
-        ) -> admit::Admission<'turn, 'd, D, R, E>,
-    ) -> (machine::Transaction<R, E>, input::Feed<usize>) {
-        self.0.transact(admit).into_parts()
-    }
-}
+pub(in crate::manifold) type Input<'d, D> = input::State<'d, D, Buf<'d>>;
 
 const _: () = {
     assert!(

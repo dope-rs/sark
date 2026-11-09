@@ -1,6 +1,6 @@
 pub mod common;
 
-use std::{cell::Cell, fmt, net::SocketAddr, sync::mpsc, thread, time::Duration};
+use std::{cell::Cell, fmt, net::SocketAddr, time::Duration};
 
 use common::h2::recover;
 use common::h2::{
@@ -25,6 +25,7 @@ use dope::{
 use dope_fiber::task::storage::scope::Brand;
 use dope_test::{fibers, reclaim::Reports};
 use sark_core::manifold::stream::Boundary;
+use sark_h2::server::task::timers;
 
 #[test]
 fn ingress_yields() {
@@ -66,103 +67,86 @@ fn ingress_yields() {
                         .observe(Log(&facts, |cause: &dyn fmt::Debug| {
                             eprintln!("lifecycle diagnostic: {cause:?}");
                         }))
-                        .try_install(stage, wire, |listener, stage| {
+                        .try_install(stage, wire, timers::Disabled, |listener, _wait, stage| {
                             stage
                                 .with_quiesce(
                                     &mut done,
                                     Host::new(listener),
                                     Duration::from_secs(5),
                                     |mut app| {
-                                        thread::scope(|threads| {
-                                            let (queued, ready) = mpsc::sync_channel(0);
-                                            let peer = threads.spawn(move || {
-                                                let (mut flood_io, mut flood) = Peer::try_connect(
-                                                    address,
-                                                    Duration::from_secs(5),
-                                                )
+                                        let (mut flood_io, mut flood) =
+                                            Peer::try_connect(address, Duration::from_secs(5))
                                                 .expect("H2 peer connection");
-                                                let (mut probe_io, mut probe) = Peer::try_connect(
-                                                    address,
-                                                    Duration::from_secs(5),
-                                                )
+                                        let (mut probe_io, mut probe) =
+                                            Peer::try_connect(address, Duration::from_secs(5))
                                                 .expect("H2 peer connection");
-                                                flood_io
-                                                    .set_write_timeout(Some(Duration::from_secs(5)))
-                                                    .expect("flood write bound");
-                                                probe_io
-                                                    .set_write_timeout(Some(Duration::from_secs(5)))
-                                                    .expect("probe write bound");
-                                                let mut streams = Vec::with_capacity(BURST);
-                                                for _ in 0..BURST {
-                                                    let stream = flood
-                                                        .streams()
-                                                        .headers()
-                                                        .request(
-                                                            Request::new(b"/ingress-flood")
-                                                                .try_headers()
-                                                                .expect("fields"),
-                                                            Boundary::More,
-                                                        )
-                                                        .expect("flood request");
-                                                    Sender::new(&mut flood)
-                                                        .try_send(stream, b"flood", Boundary::End)
-                                                        .expect("H2 peer send");
-                                                    streams.push(stream);
-                                                }
-                                                let check = probe
-                                                    .streams()
-                                                    .headers()
-                                                    .request(
-                                                        Request::new(b"/ingress-probe")
-                                                            .try_headers()
-                                                            .expect("fields"),
-                                                        Boundary::End,
-                                                    )
-                                                    .expect("probe request");
-                                                Peer::new(&mut flood_io, &mut flood)
-                                                    .try_flush()
-                                                    .expect("H2 peer flush");
-                                                Peer::new(&mut probe_io, &mut probe)
-                                                    .try_flush()
-                                                    .expect("H2 peer flush");
-                                                queued.send(()).expect("queued both wires");
-                                                let (_, body) =
-                                                    Peer::new(&mut probe_io, &mut probe)
-                                                        .try_response(check)
-                                                        .expect("H2 peer response");
-                                                assert_eq!(body, b"probe");
-                                                let (_, bodies) =
-                                                    Peer::new(&mut flood_io, &mut flood)
-                                                        .try_statuses(&streams, b"200")
-                                                        .expect("H2 peer statuses");
-                                                assert_eq!(bodies.len(), BURST);
-                                                assert!(bodies.iter().all(|body| body == b"flood"));
-                                            });
-                                            ready
-                                                .recv_timeout(Duration::from_secs(5))
-                                                .expect("both wires queued before drive");
-                                            assert_eq!(
-                                                fibers::TEST
-                                                    .try_wait(
-                                                        &mut app,
-                                                        &Count {
-                                                            facts: &facts,
-                                                            event: "session-closed",
-                                                        },
-                                                        2,
-                                                    )
-                                                    .expect("H2 progress"),
-                                                fibers::Wait::Reached
-                                            );
-                                            peer.join().expect("response reader");
-                                            let ingress = server
-                                                .state
-                                                .ingress
-                                                .as_ref()
-                                                .expect("ingress fixture");
-                                            assert!(ingress.probe_seen_at.get() < BURST);
-                                            assert_eq!(ingress.flood_started.get(), BURST);
-                                        });
+                                        for io in [&flood_io, &probe_io] {
+                                            io.set_write_timeout(Some(Duration::from_secs(5)))
+                                                .expect("peer write bound");
+                                        }
+                                        for _ in 0..BURST {
+                                            let stream = flood
+                                                .streams()
+                                                .headers()
+                                                .request(
+                                                    Request::new(b"/ingress-flood")
+                                                        .try_headers()
+                                                        .expect("fields"),
+                                                    Boundary::More,
+                                                )
+                                                .expect("flood request");
+                                            Sender::new(&mut flood)
+                                                .try_send(stream, b"flood", Boundary::End)
+                                                .expect("H2 peer send");
+                                        }
+                                        probe
+                                            .streams()
+                                            .headers()
+                                            .request(
+                                                Request::new(b"/ingress-probe")
+                                                    .try_headers()
+                                                    .expect("fields"),
+                                                Boundary::End,
+                                            )
+                                            .expect("probe request");
+                                        Peer::new(&mut flood_io, &mut flood)
+                                            .try_flush()
+                                            .expect("H2 peer flush");
+                                        Peer::new(&mut probe_io, &mut probe)
+                                            .try_flush()
+                                            .expect("H2 peer flush");
+                                        // Both connections have queued input before the first drive.
+                                        assert_eq!(
+                                            fibers::TEST
+                                                .try_wait(
+                                                    &mut app,
+                                                    &Count {
+                                                        facts: &facts,
+                                                        event: "response-committed"
+                                                    },
+                                                    (BURST + 1) as u32,
+                                                )
+                                                .expect("H2 ingress progress"),
+                                            fibers::Wait::Reached
+                                        );
+                                        drop((flood_io, probe_io));
+                                        assert_eq!(
+                                            fibers::TEST
+                                                .try_wait(
+                                                    &mut app,
+                                                    &Count {
+                                                        facts: &facts,
+                                                        event: "session-closed"
+                                                    },
+                                                    2,
+                                                )
+                                                .expect("H2 retirement"),
+                                            fibers::Wait::Reached
+                                        );
+                                        let ingress =
+                                            server.state.ingress.as_ref().expect("ingress fixture");
+                                        assert!(ingress.probe_seen_at.get() < BURST);
+                                        assert_eq!(ingress.flood_started.get(), BURST);
                                     },
                                 )
                                 .expect("runtime");

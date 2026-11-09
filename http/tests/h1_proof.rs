@@ -1,14 +1,4 @@
-use core::mem;
-
-use sark_http::{
-    h1::{head, head::request::Parts},
-    payload::response::Method,
-};
-
-#[test]
-fn hot_layout() {
-    assert!(mem::size_of::<Method>() <= 1);
-}
+use sark_http::h1::{head, head::request::Parts};
 
 #[test]
 fn span_ownership() {

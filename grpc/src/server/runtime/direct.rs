@@ -1,6 +1,6 @@
 use std::{convert, marker};
 
-use dope::core::driver::{retained, schedule::app::Work};
+use dope::core::driver::{self, schedule::app::Work};
 use o3::buffer::resident;
 use sark_core::manifold::server::app;
 
@@ -53,7 +53,7 @@ where
 
     fn start<W: Write>(
         &mut self,
-        _: &mut app::Turn<'_, '_, '_, '_, 'd, O>,
+        _: &mut app::Turn<'_, '_, '_, 'd, O>,
         _: T,
         stream: &mut service::Stream,
         head: request::Head,
@@ -106,7 +106,7 @@ where
 
     fn request<W: Write>(
         &mut self,
-        _: &mut app::Turn<'_, '_, '_, '_, 'd, O>,
+        _: &mut app::Turn<'_, '_, '_, 'd, O>,
         _: T,
         call: &mut call::Handler<H::Call, ()>,
         input: service::Request<'_, resident::Shared<'d>>,
@@ -127,7 +127,7 @@ where
         &mut self,
         _: O,
         _: Work<'_, 'd>,
-        _: &mut retained::Context<'_, '_, 'd>,
+        _: &mut driver::Context<'_, 'd>,
     ) -> TaskState {
         TaskState::Idle
     }

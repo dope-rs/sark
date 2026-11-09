@@ -2,11 +2,11 @@ use std::num::NonZero;
 
 use dope::manifold::network::listener::conn::write::{self, body, error};
 use o3::{base::num::bounded, buffer::resident::bound};
-use sark_h1::server::payload::write::{Failure, Response};
+use sark_h1::server::payload::{self, write::Failure};
 
 #[test]
 fn capacity_cause() {
-    let rejected = Response::<()>::reject::<bound::Unbounded, ()>(error::Error::Capacity(
+    let rejected = payload::write::reject::<(), bound::Unbounded, ()>(error::Error::Capacity(
         write::Reject::Header,
     ));
     assert!(matches!(rejected, Failure::Capacity(write::Reject::Header)));
@@ -19,7 +19,7 @@ fn mismatch_receipt() {
         incoming: NonZero::new(5).expect("nonzero addition"),
         maximum: 8,
     };
-    let rejected = Response::<()>::reject::<bound::Unbounded, _>(error::Error::Mismatch(
+    let rejected = payload::write::reject::<(), bound::Unbounded, _>(error::Error::Mismatch(
         error::Mismatch::Bounded {
             cause: error::Bounded::Prefix(cause),
             draft: write::Draft::new(0, None, 19),

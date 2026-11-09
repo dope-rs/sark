@@ -5,7 +5,7 @@ use sark_http::{
         line::Version,
         response::{Date, Server},
     },
-    owner::{evidence, handoff, handoff::stage},
+    owner::{handoff, handoff::stage},
     payload::{
         compress::{self, Compression},
         fixed::Body,
@@ -26,7 +26,7 @@ mod head;
 pub(super) mod written;
 
 use error::Error;
-use gzip::{Gzip, compress_bounded, compress_exact};
+use gzip::{compress_bounded, compress_exact};
 use head::{Emitted, Layout, Pending, emit_framed_head, emit_head};
 use written::Written;
 
@@ -370,11 +370,7 @@ where
         })?;
         if let Some(dst) = out.get_mut(head..used) {
             dst.copy_from_slice(raw);
-            return Ok(Written::Inline {
-                written: used,
-                body_bytes: raw.len(),
-                cause: evidence::Cause::Inline,
-            });
+            return Ok(Written::inline(used, raw.len()));
         }
     }
     stage(slot, head, body)
@@ -413,11 +409,7 @@ fn place_exact<'req, 'd, B: exact::TryBody, Q: scope::Source, O: stage::Body<'re
     })?;
     if let Some(body) = out.get_mut(head..end) {
         plan.encode(body)?;
-        return Ok(Written::Inline {
-            written: end,
-            body_bytes: len,
-            cause: evidence::Cause::Inline,
-        });
+        return Ok(Written::inline(end, len));
     }
     let body = plan.into_shared()?;
     stage(slot, head, body)
@@ -444,11 +436,7 @@ fn finish_bounded<
         let encoded = pending.encode(plan)?;
         let len = encoded.body().len();
         let (written, _) = encoded.finish()?;
-        return Ok(Written::Inline {
-            written,
-            body_bytes: len,
-            cause: evidence::Cause::Inline,
-        });
+        return Ok(Written::inline(written, len));
     }
     let body = plan.into_shared()?;
     let (head, ()) = emit_head(out, date, status, fields, body.len())?;

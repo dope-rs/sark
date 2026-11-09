@@ -12,13 +12,33 @@ use sark_http::field::metadata::{block::Version, section::rules::RetainRaw};
 fn misses_valid_method() {
     let router = ProbeRouter::new();
     for version in [Version::Two, Version::Three] {
-        for method in planned::UNMATCHED_METHODS {
-            let head = planned::try_head(version, method, planned::PATH)
+        for method in planned::UNMATCHED_METHODS
+            .into_iter()
+            .chain([b"EXTENSION-METHOD-LONG".as_slice()])
+        {
+            let selected = planned::try_head(version, method, planned::PATH)
                 .expect("retained request")
                 .try_request()
                 .ok()
                 .expect("valid request control");
-            assert!(matches!(router.try_head(head), Err(HeadError::NotFound)));
+            let raw = planned::try_fields::<RetainRaw>(version, method, planned::PATH, &[])
+                .expect("retained raw head")
+                .try_request()
+                .ok()
+                .expect("valid raw request control");
+            let prefixed =
+                planned::try_fields::<RetainRaw<26>>(version, method, planned::PATH, &[])
+                    .expect("retained prefixed head")
+                    .try_request()
+                    .ok()
+                    .expect("valid prefixed request control");
+            for result in [
+                router.try_head(selected),
+                router.try_full(raw),
+                sark_core::decode::Full::try_prefixed::<26>(&router, prefixed),
+            ] {
+                assert!(matches!(result, Err(HeadError::NotFound)));
+            }
         }
     }
 }
@@ -73,7 +93,17 @@ fn admitted_content_length() {
                 .try_request()
                 .ok()
                 .expect("valid request control");
-            for result in [router.try_head(selected), router.try_full(raw)] {
+            let prefixed =
+                planned::try_fields::<RetainRaw<26>>(version, b"POST", planned::PATH, lengths)
+                    .expect("retained prefixed head")
+                    .try_request()
+                    .ok()
+                    .expect("valid prefixed request control");
+            for result in [
+                router.try_head(selected),
+                router.try_full(raw),
+                sark_core::decode::Full::try_prefixed::<26>(&router, prefixed),
+            ] {
                 assert_eq!(
                     result
                         .expect("admitted request length")

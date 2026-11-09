@@ -115,6 +115,7 @@ where
             self.endpoint.limits(),
             schedule::Egress::Released,
             || Some(()),
+            drop,
         )
     }
 

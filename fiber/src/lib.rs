@@ -37,6 +37,6 @@ pub use dope::{
 };
 pub use dope_fiber::{abi, abi::Fiber, context};
 pub use sark_gen::{
-    define_route, define_router, define_task_route, duplex, fiber, handler, header_name, request,
-    response,
+    define_cleartext_route, define_route, define_router, define_task_route, duplex, fiber, handler,
+    header_name, request, response,
 };

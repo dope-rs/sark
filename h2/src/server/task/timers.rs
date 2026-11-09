@@ -1,5 +1,5 @@
 //! Static deadline policies and connection-local timer state.
-use core::mem;
+use core::{convert::Infallible, mem};
 
 use dope::core::driver::schedule::clock;
 use o3::{
@@ -70,13 +70,6 @@ pub(crate) enum Due {
         phase: deadline::Phase,
     },
     Critical,
-    Wake {
-        key: stream::Key,
-        reason: deadline::WakeReason,
-    },
-    Header {
-        stream_id: stream::Nonzero,
-    },
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -92,21 +85,13 @@ const _: () = assert!(mem::size_of::<Change>() == mem::size_of::<bool>());
 struct Header<'d> {
     observed: header::Header,
     at: clock::Deadline<'d>,
-    opening: Opening,
-}
-
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum Opening {
-    Ignored,
-    Pending,
-    Open,
 }
 
 /// One-allocation deadline authority owned by an admitted H2 connection.
 #[doc(hidden)]
 pub struct Controller<'d> {
     config: config::Config,
-    book: deadline::Agenda<stream::Key, clock::Deadline<'d>>,
+    book: deadline::Agenda<stream::Key, clock::Deadline<'d>, Infallible>,
     header: Option<Header<'d>>,
 }
 
@@ -129,19 +114,9 @@ impl<'d> Controller<'d> {
         }
         if let Some(previous) = self.header.take()
             && let Some(key) = previous.observed.exchange
+            && !conn.status().owns_exchange(key)
         {
-            deadline::Book::cancel_one(
-                &mut self.book,
-                key,
-                deadline::Action::Expire(deadline::Phase::Head),
-            );
-            if matches!(previous.opening, Opening::Pending) {
-                deadline::Book::cancel_one(
-                    &mut self.book,
-                    key,
-                    deadline::Action::Expire(deadline::Phase::Total),
-                );
-            }
+            deadline::Book::cancel(&mut self.book, key);
         }
         let Some(observed) = observed else {
             return Ok(if before == self.deadline() {
@@ -155,26 +130,28 @@ impl<'d> Controller<'d> {
         {
             let at = instant(self.config, deadline::Phase::Total, now);
             if let Some(at) = at {
-                schedule_at(&mut self.book, key, deadline::Phase::Total, at)?;
+                deadline::Book::schedule(
+                    &mut self.book,
+                    key,
+                    deadline::Scheduled::expire(at, deadline::Phase::Total),
+                )?;
             }
             at
         } else {
             None
         };
         let head_at = instant(self.config, deadline::Phase::Head, now);
-        if let Some(key) = observed.exchange
-            && let Some(at) = head_at
+        if observed.stage == Stage::Other
+            && head_at.is_some()
+            && let Some(key) = observed.exchange
         {
-            schedule_at(&mut self.book, key, deadline::Phase::Head, at)?;
+            deadline::Book::cancel_one(
+                &mut self.book,
+                key,
+                deadline::Action::Expire(deadline::Phase::BodyIdle),
+            );
         }
-        self.header = head_at.or(total_at).map(|at| Header {
-            observed,
-            at,
-            opening: match observed.stage {
-                Stage::Initial => Opening::Pending,
-                Stage::Other => Opening::Ignored,
-            },
-        });
+        self.header = head_at.or(total_at).map(|at| Header { observed, at });
         Ok(if before == self.deadline() {
             Change::Unchanged
         } else {
@@ -188,24 +165,17 @@ impl<'d> Controller<'d> {
         change: timeline::Transition,
         now: clock::Moment<'d>,
     ) -> Result<Change, deadline::Error<stream::Key>> {
-        if change == timeline::Transition::Open
-            && let Some(header) = self.header.as_mut()
-            && header.opening == Opening::Pending
-            && header.observed.exchange == Some(key)
-        {
-            header.opening = Opening::Open;
-            return Ok(Change::Unchanged);
-        }
         let before = self.deadline();
+        let change = if change == timeline::Transition::HeadAdmitted
+            && self.header.is_some_and(|header| {
+                header.observed.exchange == Some(key) && header.observed.stage == Stage::Other
+            }) {
+            timeline::Transition::InputAdmitted
+        } else {
+            change
+        };
         self.book
             .transition(key, self.config, change, now, clock::Moment::clamp_add)?;
-        if change == timeline::Transition::Retired
-            && self
-                .header
-                .is_some_and(|header| header.observed.exchange == Some(key))
-        {
-            self.header = None;
-        }
         Ok(if before == self.deadline() {
             Change::Unchanged
         } else {
@@ -215,10 +185,7 @@ impl<'d> Controller<'d> {
 
     pub fn deadline(&self) -> Option<clock::Deadline<'d>> {
         let exchange = deadline::Book::peek(&self.book).map(|entry| entry.1.at);
-        let header = self
-            .header
-            .filter(|header| header.observed.exchange.is_none())
-            .map(|header| header.at);
+        let header = self.header.map(|header| header.at);
         match (exchange, header) {
             (Some(left), Some(right)) => Some(left.min(right)),
             (Some(at), None) | (None, Some(at)) => Some(at),
@@ -228,17 +195,12 @@ impl<'d> Controller<'d> {
 
     pub(crate) fn poll_due(&mut self, now: clock::Moment<'d>) -> deadline::Poll<Due> {
         let exchange = deadline::Book::peek(&self.book);
-        let lone = self
-            .header
-            .filter(|header| header.observed.exchange.is_none());
-        if let Some(header) = lone
+        if let Some(header) = self.header
             && header.at <= now
             && exchange.is_none_or(|entry| header.at < entry.1.at)
         {
             self.header = None;
-            return deadline::Poll::Expired(Due::Header {
-                stream_id: header.observed.stream_id,
-            });
+            return deadline::Poll::Expired(Due::Critical);
         }
         let expired = match deadline::Book::poll_due(&mut self.book, now.into()) {
             deadline::Poll::Idle => return deadline::Poll::Idle,
@@ -253,11 +215,16 @@ impl<'d> Controller<'d> {
                     phase,
                 },
             },
-            deadline::Action::Wake(reason) => Due::Wake {
-                key: expired.key,
-                reason,
-            },
+            deadline::Action::Wake(never) => match never {},
         })
+    }
+
+    pub(in crate::server) fn cancel(&mut self, key: stream::Key) -> Change {
+        if deadline::Book::cancel(&mut self.book, key).is_earliest() {
+            Change::Changed
+        } else {
+            Change::Unchanged
+        }
     }
 }
 
@@ -270,16 +237,6 @@ fn instant<'d>(
         config::Window::Disabled => None,
         config::Window::Finite(window) => Some(now.clamp_add(window)),
     }
-}
-
-fn schedule_at<'d>(
-    book: &mut deadline::Agenda<stream::Key, clock::Deadline<'d>>,
-    key: stream::Key,
-    phase: deadline::Phase,
-    at: clock::Deadline<'d>,
-) -> Result<(), deadline::Error<stream::Key>> {
-    let item = deadline::Scheduled::expire(at, phase);
-    deadline::Book::schedule(book, key, item)
 }
 
 const _: () = assert!(mem::size_of::<Disabled>() == 0);

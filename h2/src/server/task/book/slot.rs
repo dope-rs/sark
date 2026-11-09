@@ -9,13 +9,13 @@ use crate::{
     stream,
 };
 
-pub(in crate::server::task) struct Slot<'a, 'd, P, F: rules::Policy, X, D: duplex::Session<'d>> {
+pub(in crate::server::task) struct Slot<'a, 'd, P, F: rules::Policy, D: duplex::Session<'d>, X> {
     pub(in crate::server::task) connection:
         &'a mut machine::Connection<crate::ServerRole, F, resident::Shared<'d>>,
     pub(in crate::server::task) response: typed::Vacant<
         'a,
         stream::Key,
-        response::Response<'d, P, X, D>,
+        response::Response<'d, P, D, X>,
         response::Data<'d, D>,
         Infallible,
         conn::DataBlock,

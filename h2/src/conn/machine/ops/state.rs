@@ -17,10 +17,9 @@ use crate::{
 };
 
 pub(crate) struct State<R: crate::Role> {
-    pub(in crate::conn::machine) role: marker::PhantomData<R>,
     pub(in crate::conn::machine) settings: Settings,
     pub(in crate::conn::machine) flow: Flow,
-    pub(in crate::conn::machine) lifecycle: Lifecycle,
+    pub(in crate::conn::machine) lifecycle: Lifecycle<R>,
     pub(in crate::conn::machine) active_streams: registry::Registry<R>,
     pub(in crate::conn::machine) stream_history: registry::History<R>,
 }
@@ -32,11 +31,12 @@ impl<R: crate::Role> State<R> {
         streams: registry::Registry<R>,
     ) -> Self {
         Self {
-            role: marker::PhantomData,
             settings: Settings::for_role::<R>(local),
             flow: Flow::new(recv),
             lifecycle: Lifecycle {
+                role: marker::PhantomData,
                 phase: Phase::Open,
+                queued: false,
                 acked: false,
                 goaway_received: None,
                 peer_reset_count: Reset::ZERO,
@@ -63,7 +63,7 @@ impl<R: crate::Role> State<R> {
     pub(in crate::conn::machine) fn finish_write<C: session::Storage, T>(
         &mut self,
         write: payloads::Write<C>,
-        evidence: impl FnOnce(stream::Key, usize, C) -> (C, T),
+        evidence: impl FnOnce(stream::Key, usize, &C) -> T,
     ) -> event::Write<T, C> {
         use payloads::Write;
 
@@ -79,7 +79,7 @@ impl<R: crate::Role> State<R> {
                 credit,
                 body,
             } => {
-                let (body, proof) = evidence(credit.stream(), credit.amount(), body);
+                let proof = evidence(credit.stream(), credit.amount(), &body);
                 self.accept_write(credit);
                 event::Write::Split {
                     write: proof,
@@ -179,7 +179,8 @@ impl<R: crate::Role> State<R> {
         key: stream::Key,
     ) -> Option<E::Retired> {
         let retired = self.retire_write::<C, E>(egress, key.id());
-        self.active_streams.remove_key(key);
+        self.active_streams
+            .remove_key(key, self.lifecycle.keeps_events());
         retired
     }
 
@@ -279,8 +280,10 @@ impl Flow {
     }
 }
 
-pub(in crate::conn::machine) struct Lifecycle {
+pub(in crate::conn::machine) struct Lifecycle<R: crate::Role> {
+    role: marker::PhantomData<R>,
     phase: Phase,
+    queued: bool,
     acked: bool,
     pub(in crate::conn::machine) goaway_received: Option<numbers::ErrorCode>,
     pub(in crate::conn::machine) peer_reset_count: Reset,
@@ -312,7 +315,17 @@ impl Reset {
     }
 }
 
-impl Lifecycle {
+impl Lifecycle<crate::ServerRole> {
+    pub(in crate::conn::machine) fn queue_events(&mut self) {
+        self.queued = true;
+    }
+}
+
+impl<R: crate::Role> Lifecycle<R> {
+    pub(in crate::conn::machine) fn keeps_events(&self) -> bool {
+        matches!(R::ENDPOINT, Endpoint::Server) && self.queued
+    }
+
     pub(in crate::conn::machine) fn is_goaway(&self) -> bool {
         !matches!(self.phase, Phase::Open)
     }
@@ -351,5 +364,5 @@ impl Lifecycle {
 
 const _: () = {
     assert!(mem::size_of::<Phase>() == mem::size_of::<bool>());
-    assert!(mem::size_of::<Lifecycle>() == 3 * mem::size_of::<u32>());
+    assert!(mem::size_of::<Lifecycle<crate::ServerRole>>() == 3 * mem::size_of::<u32>());
 };

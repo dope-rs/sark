@@ -1,6 +1,6 @@
 use std::ops;
 
-use o3::buffer::write::consume::Consume;
+use o3::buffer::write::{Sink as _, consume, consume::Consume};
 
 use crate::{
     fragment, inbound,
@@ -22,23 +22,35 @@ impl<'a, H: Sink> Frames<'a, H> {
         Self { user, limit }
     }
 
-    pub(super) fn pump<'b>(
-        &self,
-        path: &str,
-        state: &mut server::ConnState,
-        buffer: &'b mut [u8],
-    ) -> Output<'b> {
-        let mut out = Output::new(buffer);
-        if state.phase == server::Phase::Handshake
-            && let Err(error) = opening::drive(path, state, &mut out.response, self.user)
-        {
-            self.user.failed(server::Error::Capacity(error));
-            state.phase = server::Phase::Closed;
+    pub(super) fn append<P>(&self, state: &mut server::ConnState<P>, chunk: &[u8]) -> bool {
+        let buffered = state.acc.len();
+        if let Err(error) = consume::Error::check(chunk.len(), server::WS_MAX_ACC - buffered) {
+            if matches!(
+                state.phase,
+                server::Phase::Handshake | server::Phase::Opening
+            ) {
+                self.user.failed(opening::too_large(buffered + chunk.len()));
+                state.phase = server::Phase::Closed;
+            } else {
+                state.phase = server::Phase::MessageTooBig;
+                state.acc.clear();
+                self.user.failed(server::Error::Capacity(error));
+            }
+            return false;
         }
+        if let Err(error) = state.acc.write_slice(chunk) {
+            self.user.failed(server::Error::Allocate(error));
+            state.phase = server::Phase::Closed;
+            return false;
+        }
+        true
+    }
+
+    pub(super) fn pump<P>(&self, state: &mut server::ConnState<P>, out: &mut Output<'_>) {
         match state.phase {
-            server::Phase::Active => self.drive(state, &mut out),
-            server::Phase::Rejected(error) => {
-                state.phase = self.reject_frame(&mut out.response, error);
+            server::Phase::Active => self.drive(state, out),
+            server::Phase::Rejected(code) if out.response.close_code(code as u16).is_ok() => {
+                state.phase = server::Phase::Closed;
             }
             _ => {}
         }
@@ -48,10 +60,9 @@ impl<'a, H: Sink> Frames<'a, H> {
             }
             state.phase = server::Phase::Closed;
         }
-        out
     }
 
-    pub(super) fn drive(&self, state: &mut server::ConnState, out: &mut Output<'_>) {
+    pub(super) fn drive<P>(&self, state: &mut server::ConnState<P>, out: &mut Output<'_>) {
         let mut bytes = match state.acc.try_as_mut() {
             Ok(bytes) => bytes,
             Err(error) => {
@@ -69,10 +80,10 @@ impl<'a, H: Sink> Frames<'a, H> {
         }
     }
 
-    pub(super) fn chunk(
+    pub(super) fn chunk<P>(
         &self,
         temp: &mut Vec<u8>,
-        state: &mut server::ConnState,
+        state: &mut server::ConnState<P>,
         chunk: &[u8],
         out: &mut Output<'_>,
     ) -> server::Phase {
@@ -159,11 +170,13 @@ impl<'a, H: Sink> Frames<'a, H> {
     }
 
     fn reject_frame(&self, out: &mut server::Response<'_>, error: inbound::Fault) -> server::Phase {
-        if out.close_code(error.close_code()).is_ok() {
-            self.user.failed(server::Error::Frame(error));
+        let code = error.code();
+        let result = out.close_code(code as u16);
+        self.user.failed(server::Error::Frame(error));
+        if result.is_ok() {
             server::Phase::Closed
         } else {
-            server::Phase::Rejected(error)
+            server::Phase::Rejected(code)
         }
     }
 

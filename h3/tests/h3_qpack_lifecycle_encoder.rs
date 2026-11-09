@@ -242,7 +242,8 @@ fn zero_rejects_dynamic() {
     assert_eq!(
         decoder
             .decode(&[0x00, 0x00, 0x10])
-            .expect_err("dynamic reference requires a nonzero insertion count"),
+            .err()
+            .expect("dynamic reference requires a nonzero insertion count"),
         decoder::Error::DynamicDisabled {
             byte: 0x10,
             index: 0,

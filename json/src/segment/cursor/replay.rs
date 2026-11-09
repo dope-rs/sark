@@ -41,7 +41,7 @@ impl Replay {
     }
 
     /// Copies a prefix within both the admitted range and this input-byte budget.
-    /// The prefix contains its first byte or a nonempty admitted ASCII run.
+    /// The prefix contains its first byte or a nonempty admitted plain run.
     pub(in crate::segment) fn try_copy(
         &mut self,
         input: &Input<'_>,

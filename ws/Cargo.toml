@@ -10,6 +10,7 @@ readme.workspace = true
 license.workspace = true
 
 [dependencies]
+sark-core.workspace = true
 sark-http.workspace = true
 dope.workspace = true
 dope-fiber.workspace = true

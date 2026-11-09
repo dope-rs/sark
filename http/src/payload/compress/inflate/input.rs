@@ -129,14 +129,6 @@ impl<'a> Chunk<'a, Cursor<'a>> {
     }
 }
 
-pub(super) struct Input<'a, I>
-where
-    I: Iterator<Item = &'a [u8]>,
-{
-    segments: I,
-    cursor: Cursor<'a>,
-}
-
 /// The current source and offset, moved without the segment iterator.
 pub(super) struct Cursor<'a> {
     current: &'a [u8],
@@ -159,39 +151,14 @@ impl End {
     }
 }
 
-impl<'a, I> Input<'a, I>
-where
-    I: Iterator<Item = &'a [u8]>,
-{
-    pub(super) fn new(mut segments: I) -> Self {
-        let current = match segments.next() {
-            Some(segment) => segment,
-            None => &[],
-        };
+impl<'a> Cursor<'a> {
+    pub(super) fn new(current: &'a [u8]) -> Self {
         Self {
-            segments,
-            cursor: Cursor {
-                current,
-                consumed: Count::ZERO,
-            },
+            current,
+            consumed: Count::ZERO,
         }
     }
 
-    pub(super) fn into_parts(self) -> (I, Cursor<'a>) {
-        (self.segments, self.cursor)
-    }
-
-    pub(super) fn header<const CHECK: bool, E>(
-        &mut self,
-        checksum: Option<&Hasher>,
-        check: &mut impl FnMut() -> Result<(), E>,
-    ) -> Result<(), Checked<Error, E>> {
-        self.cursor
-            .header::<CHECK, E>(&mut self.segments, checksum, check)
-    }
-}
-
-impl<'a> Cursor<'a> {
     fn byte<const CHECK: bool, E>(
         &mut self,
         segments: &mut impl Iterator<Item = &'a [u8]>,

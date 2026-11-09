@@ -16,7 +16,6 @@ pub(crate) struct Capacity {
 #[derive(Clone, Copy)]
 pub(crate) struct Block {
     list: usize,
-    wire: usize,
 }
 
 #[repr(transparent)]
@@ -64,17 +63,19 @@ impl Capacity {
         self.storage
     }
 
-    pub(crate) fn wire(block: Block) -> Result<Wire, config::Error> {
-        let wire = block.wire();
+    pub(crate) fn wire(list: usize) -> Result<(Block, Wire), config::Error> {
+        let wire = list
+            .checked_add(Self::BLOCK_SLACK)
+            .ok_or(config::Error::HpackBlockOverflow { list })?;
         let frames = wire.max(1).div_ceil(Self::MIN_FRAME);
         let Some(capacity) = frames
             .checked_mul(frame::HEADER_LEN)
             .and_then(|heads| wire.checked_add(heads))
             .and_then(num::NonZero::<usize>::new)
         else {
-            return Err(config::Error::HpackWireOverflow { list: block.list });
+            return Err(config::Error::HpackWireOverflow { list });
         };
-        Ok(Wire(capacity))
+        Ok((Block { list }, Wire(capacity)))
     }
 
     pub(crate) const fn slots(self, wire: Wire) -> usize {
@@ -83,19 +84,8 @@ impl Capacity {
 }
 
 impl Block {
-    pub(crate) const fn new(list: usize) -> Result<Self, config::Error> {
-        match list.checked_add(Capacity::BLOCK_SLACK) {
-            Some(wire) => Ok(Self { list, wire }),
-            None => Err(config::Error::HpackBlockOverflow { list }),
-        }
-    }
-
     pub(super) const fn list(self) -> usize {
         self.list
-    }
-
-    pub(super) const fn wire(self) -> usize {
-        self.wire
     }
 }
 
@@ -150,5 +140,5 @@ impl<R: crate::Role> Initial<R> {
 }
 
 const _: () = assert!(core::mem::size_of::<Capacity>() == core::mem::size_of::<usize>());
-const _: () = assert!(core::mem::size_of::<Block>() == core::mem::size_of::<[usize; 2]>());
+const _: () = assert!(core::mem::size_of::<Block>() == core::mem::size_of::<usize>());
 const _: () = assert!(core::mem::size_of::<Wire>() == core::mem::size_of::<usize>());

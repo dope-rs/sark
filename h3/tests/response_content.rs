@@ -3,7 +3,7 @@ pub mod common;
 use std::cell::Cell;
 
 use common::{
-    atomic::content::Body,
+    atomic::{Setup, content::Body},
     conn::{Events, build::Fields as _, payload::Write as _},
     field::entry,
     message::{
@@ -27,7 +27,11 @@ use sark_http::{
     field::{literal, metadata::block::ContentError},
     payload::{
         fixed,
-        response::{Body as _, Method, dispatch::Accept, status::Code},
+        response::{
+            Body as _, Method,
+            dispatch::{Accept, Sink},
+            status::Code,
+        },
     },
 };
 
@@ -39,7 +43,7 @@ fn suppress_content() {
         (Method::Other, Code::NOT_MODIFIED),
         (Method::Other, Code::RESET_CONTENT),
     ] {
-        for kind in 0..4 {
+        for kind in 0..5 {
             let mut conn = Connection::with_role(Role::Server).expect("server");
             let calls = Cell::new(0);
             let encoder = Encoder::new(&mut conn, Target::new(Id::ZERO), method);
@@ -47,7 +51,11 @@ fn suppress_content() {
                 0 => Accept::fixed(encoder, status, (), b"body".to_vec()),
                 1 => Accept::statics(encoder, status, (), fixed::Body::new(b"body")),
                 2 => Accept::exact(encoder, status, (), Body(&calls)),
-                _ => Accept::bounded(encoder, status, (), Body(&calls)),
+                3 => Accept::bounded(encoder, status, (), Body(&calls)),
+                _ => Sink::stream(encoder, status, (), Body(&calls)).map(|(head, body)| {
+                    assert!(body.is_none());
+                    head
+                }),
             };
             result.ok().expect("prepare").finish().expect("commit");
             assert_eq!(
@@ -67,8 +75,57 @@ fn suppress_content() {
 }
 
 #[test]
+fn stream_finish_follows_data() {
+    let mut conn = Connection::with_role(Role::Server).expect("server");
+    conn.reply()
+        .send(Id::ZERO, b"body".to_vec(), Boundary::More)
+        .expect("data");
+    conn.reply().finish(Id::ZERO).expect("finish");
+    let data = conn.events().poll_write().expect("write").expect("data");
+    assert_eq!(data.boundary(), Boundary::More);
+    assert_eq!(data.into_bytes(), b"\x00\x04body");
+    let end = conn.events().poll_write().expect("write").expect("finish");
+    assert_eq!(end.boundary(), Boundary::End);
+    assert!(end.into_bytes().is_empty());
+    assert!(conn.events().poll_write().expect("drained").is_none());
+}
+
+#[test]
+fn finish_preserves_budget_error() {
+    for method in [Method::Other, Method::Head] {
+        for observed in [false, true] {
+            let mut conn = Setup::new(8, 2, usize::MAX).try_build().expect("server");
+            let encoder = Encoder::new(&mut conn, Target::new(Id::ZERO), method);
+            let prepared = match method {
+                Method::Head => Sink::stream(encoder, Code::OK, (), b"body").map(|(head, body)| {
+                    assert!(body.is_none());
+                    head
+                }),
+                _ => Accept::statics(encoder, Code::OK, (), fixed::Body::new(b"body")),
+            }
+            .ok()
+            .expect("prepared response");
+            let result = if observed {
+                prepared
+                    .try_detach()
+                    .and_then(|prepared| prepared.finish_with(()))
+                    .map(|_| ())
+            } else {
+                prepared.finish().map(|_| ())
+            };
+            assert!(matches!(result, Err(Error::BudgetWire {
+                retained: 0,
+                additional,
+                limit: 2,
+            }) if additional > 2));
+            assert!(conn.events().poll_write().expect("empty queue").is_none());
+        }
+    }
+}
+
+#[test]
 fn reject_informational() {
-    for kind in 0..4 {
+    for kind in 0..5 {
         let mut conn = Connection::with_role(Role::Server).expect("server");
         let calls = Cell::new(0);
         let encoder = Encoder::new(&mut conn, Target::new(Id::ZERO), Method::Other);
@@ -76,7 +133,8 @@ fn reject_informational() {
             0 => Accept::fixed(encoder, Code::EARLY_HINTS, (), b"body".to_vec()),
             1 => Accept::statics(encoder, Code::EARLY_HINTS, (), fixed::Body::new(b"body")),
             2 => Accept::exact(encoder, Code::EARLY_HINTS, (), Body(&calls)),
-            _ => Accept::bounded(encoder, Code::EARLY_HINTS, (), Body(&calls)),
+            3 => Accept::bounded(encoder, Code::EARLY_HINTS, (), Body(&calls)),
+            _ => Sink::stream(encoder, Code::EARLY_HINTS, (), Body(&calls)).map(|(head, _)| head),
         };
         assert!(
             matches!(result, Err((Error::Informational(Code::EARLY_HINTS), target)) if target.stream_id() == Id::ZERO)

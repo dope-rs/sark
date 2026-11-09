@@ -159,18 +159,15 @@ where
     where
         R: route::Spec<Kind = dispatch::Sync> + manifold::Route<S> + PolicyOf,
     {
-        let frame =
-            match framing::Frame::<R, Coding>::drive(found, &mut self.connection.ingress, || {
-                credit::Evidence::head(&mut proof)
-            }) {
-                Ok(framing::Progress::Complete(frame)) => frame,
-                Ok(framing::Progress::Pending(wait)) => {
-                    return self.pending(permit, wait, proof);
-                }
-                Err(reason) => {
-                    return reason.into_consume().into();
-                }
-            };
+        let frame = match framing::Frame::drive(found, &mut self.connection.ingress, &mut proof) {
+            Ok(framing::Progress::Complete(frame)) => frame,
+            Ok(framing::Progress::Pending(wait)) => {
+                return self.pending(permit, wait, proof);
+            }
+            Err(reason) => {
+                return reason.into_consume().into();
+            }
+        };
         let total = frame.total();
         let close = frame.connection;
         self.egress.output = self.egress.output.with_context(frame.response);
@@ -217,9 +214,7 @@ where
     where
         R: route::Spec<Kind = dispatch::Sync> + manifold::Route<S> + PolicyOf,
     {
-        let frame = match framing::Discard::<R>::drive(found, self.connection, || {
-            credit::Evidence::head(&mut proof)
-        }) {
+        let frame = match framing::Discard::drive(found, &mut self.connection.ingress, &mut proof) {
             Ok(framing::Discarded::Complete(frame)) => frame,
             Ok(framing::Discarded::Pending(wait)) => {
                 return self.pending(permit, wait, proof);

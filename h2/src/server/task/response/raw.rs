@@ -16,7 +16,7 @@ use sark_core::{
     life,
     manifold::task::app::Runtime,
 };
-use sark_http::payload::owned;
+use sark_http::{field::metadata::section::rules, payload::owned};
 
 use crate::{
     server::{
@@ -31,8 +31,8 @@ use crate::{
 /// Completes the exact buffered request removed from this Drive's Book.
 /// # Safety
 /// `input` must have remained in `drive`'s Book throughout its charged lifetime.
-pub(in crate::server::task) unsafe fn buffered<'d, ID, R, Q>(
-    drive: Drive<'_, '_, 'd, ID, R, Q>,
+pub(in crate::server::task) unsafe fn buffered<'d, ID, R, Q, F>(
+    drive: Drive<'_, '_, 'd, ID, R, Q, F>,
     stream: stream::Key,
     input: <<R::Prepared as request::Prepared>::Family as Family<R::Prepared>>::State<
         ingress::Receiving<'d>,
@@ -41,6 +41,7 @@ pub(in crate::server::task) unsafe fn buffered<'d, ID, R, Q>(
     ID: Identity + 'd,
     R: Runtime<'d, Target = Target<'d, ID>>,
     Q: state::Transitions<conn::Id<'d, ID>>,
+    F: rules::Policy,
 {
     Flow::fold(input, Finish { drive, stream });
 }
@@ -48,14 +49,15 @@ pub(in crate::server::task) unsafe fn buffered<'d, ID, R, Q>(
 /// Completes a selected synchronous request under its original Book account.
 /// # Safety
 /// `input` must have remained in `drive`'s Book throughout its charged lifetime.
-pub(in crate::server::task) unsafe fn sync<'d, ID, R, Q>(
-    drive: Drive<'_, '_, 'd, ID, R, Q>,
+pub(in crate::server::task) unsafe fn sync<'d, ID, R, Q, F>(
+    drive: Drive<'_, '_, 'd, ID, R, Q, F>,
     stream: stream::Key,
     input: request::Admitted<exec::Sync, R::Prepared, Buffer<'d>>,
 ) where
     ID: Identity + 'd,
     R: Runtime<'d, Target = Target<'d, ID>>,
     Q: state::Transitions<conn::Id<'d, ID>>,
+    F: rules::Policy,
 {
     (Finish { drive, stream }).sync(input);
 }
@@ -63,43 +65,47 @@ pub(in crate::server::task) unsafe fn sync<'d, ID, R, Q>(
 /// Completes a selected task request under its original Book account.
 /// # Safety
 /// `input` must have remained in `drive`'s Book throughout its charged lifetime.
-pub(in crate::server::task) unsafe fn start<'d, ID, R, Q>(
-    drive: Drive<'_, '_, 'd, ID, R, Q>,
+pub(in crate::server::task) unsafe fn start<'d, ID, R, Q, F>(
+    drive: Drive<'_, '_, 'd, ID, R, Q, F>,
     stream: stream::Key,
     input: request::Admitted<exec::Task, R::Prepared, Buffer<'d>>,
 ) where
     ID: Identity + 'd,
     R: Runtime<'d, Target = Target<'d, ID>>,
     Q: state::Transitions<conn::Id<'d, ID>>,
+    F: rules::Policy,
 {
     (Finish { drive, stream }).task(input);
 }
 
-pub(in crate::server::task) fn built<'d, ID, R, Q>(
-    drive: Drive<'_, '_, 'd, ID, R, Q>,
+pub(in crate::server::task) fn built<'d, ID, R, Q, F>(
+    drive: Drive<'_, '_, 'd, ID, R, Q, F>,
     stream: stream::Key,
     build: <R::Build as body::Build<'d>>::Output,
 ) where
     ID: Identity + 'd,
     R: Runtime<'d, Target = Target<'d, ID>>,
     Q: state::Transitions<conn::Id<'d, ID>>,
+    F: rules::Policy,
 {
     (Finish { drive, stream }).built(build);
 }
 
-struct Finish<'a, 'state, 'd, ID: Identity + 'd, R, Q>
+struct Finish<'a, 'state, 'd, ID: Identity + 'd, R, Q, F>
 where
     R: Runtime<'d, Target = Target<'d, ID>>,
+    F: rules::Policy,
 {
-    drive: Drive<'a, 'state, 'd, ID, R, Q>,
+    drive: Drive<'a, 'state, 'd, ID, R, Q, F>,
     stream: stream::Key,
 }
 
-impl<'d, ID: Identity + 'd, R, Q> Fold<R::Prepared, ingress::Receiving<'d>>
-    for Finish<'_, '_, 'd, ID, R, Q>
+impl<'d, ID: Identity + 'd, R, Q, F> Fold<R::Prepared, ingress::Receiving<'d>>
+    for Finish<'_, '_, 'd, ID, R, Q, F>
 where
     R: Runtime<'d, Target = Target<'d, ID>>,
     Q: state::Transitions<conn::Id<'d, ID>>,
+    F: rules::Policy,
 {
     type Output = ();
 
@@ -138,10 +144,11 @@ where
     }
 }
 
-impl<'a, 'state, 'd, ID: Identity + 'd, R, Q> Finish<'a, 'state, 'd, ID, R, Q>
+impl<'a, 'state, 'd, ID: Identity + 'd, R, Q, F> Finish<'a, 'state, 'd, ID, R, Q, F>
 where
     R: Runtime<'d, Target = Target<'d, ID>>,
     Q: state::Transitions<conn::Id<'d, ID>>,
+    F: rules::Policy,
 {
     fn built(mut self, build: <R::Build as body::Build<'d>>::Output) {
         let call = identify(self.drive.conn, self.stream);

@@ -3,59 +3,13 @@ use std::alloc;
 use data::{Inline, compose};
 use dispatch::chunk::Chunk;
 use dope::net::link::egress::data;
-use o3::buffer::{Residency, hold, pool, pool::owners, resident, segments};
-use sark_http::payload::{compress::Gzip, owned, response::dispatch};
+use o3::buffer::{Residency, bytes, hold, resident, segments};
+use sark_http::payload::response::dispatch;
 
 mod raw;
 pub mod write;
 
-/// Final-link HTTP/1 payload retaining its physical owners and transport tag.
-#[doc(hidden)]
-pub enum Body<'d, K: 'd = ()> {
-    Shared {
-        owner: resident::Shared<'d>,
-        tag: K,
-    },
-    Segments {
-        owners: segments::Many<resident::Shared<'d>>,
-        tag: K,
-    },
-    Frozen {
-        owner: pool::Span<
-            owners::Plain<pool::Fixed<{ Gzip::SLOTS.get() }, { Gzip::CAPACITY.get() }>>,
-            pool::Owned,
-            pool::Frozen,
-        >,
-        tag: K,
-    },
-}
-
-impl<'d, K> Body<'d, K> {
-    /// Lowers a duplex owner sum without copying bytes or segment metadata.
-    #[doc(hidden)]
-    pub fn duplex(chunk: owned::Segments<'d>, tag: K) -> Self {
-        match chunk.into_shape() {
-            segments::Shape::Empty => Self::Shared {
-                owner: resident::Shared::new(),
-                tag,
-            },
-            segments::Shape::One(owner) => Self::Shared {
-                owner: owner.into_inner(),
-                tag,
-            },
-            segments::Shape::Many(owners) => Self::Segments { owners, tag },
-        }
-    }
-
-    /// Returns every physical owner from a publication rejected before the
-    /// final link accepted it.
-    #[doc(hidden)]
-    pub fn release(self) -> K {
-        match self {
-            Self::Shared { tag, .. } | Self::Segments { tag, .. } | Self::Frozen { tag, .. } => tag,
-        }
-    }
-}
+pub use sark_core::manifold::Body;
 
 const _: () = {
     use sark_core::life::sequence::observed::Tag;
@@ -72,6 +26,15 @@ const _: () = {
     assert!(
         core::mem::size_of::<Stream<'_, Tag>>()
             == core::mem::size_of::<Frame<'_>>() + core::mem::size_of::<Tag>()
+    );
+    assert!(
+        core::mem::size_of::<compose::Either<Body<'_, ()>, Stream<'_, ()>>>()
+            == core::mem::size_of::<
+                compose::Either<
+                    compose::Either<resident::Shared<'_>, segments::Chain<resident::Shared<'_>>>,
+                    Frame<'_>,
+                >,
+            >()
     );
     assert!(
         core::mem::size_of::<compose::Either<Body<'_, Tag>, Stream<'_, Tag>>>()
@@ -252,5 +215,5 @@ fn prefix(len: usize) -> Inline<PREFIX_CAPACITY> {
     if left != 0 {
         bytes.nth(left - 1);
     }
-    Inline::from(bytes)
+    Inline::from(bytes::Prefix::from(&bytes))
 }

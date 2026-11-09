@@ -4,7 +4,7 @@ use o3::{
         array::Index,
         queue::indexed::lanes::{
             Table,
-            entry::{Slot, Withdrawn},
+            entry::{self, Withdrawn},
         },
     },
 };
@@ -12,9 +12,8 @@ use o3::{
 use crate::manifold::{
     self,
     schedule::{
-        Activity, Block, CONTROL_READY, Control, DATA_READY, Decision, Driver, LANES, Occupied,
-        Outcome, Report, Settlement, Step, Terminal, Wait, WorkClass,
-        policy::{Policy, Round},
+        Block, CONTROL_READY, Control, DATA_READY, Decision, Driver, LANES, Occupied, Report,
+        Settlement, Step, Terminal, Wait, WorkClass, policy::Policy,
     },
 };
 
@@ -27,12 +26,7 @@ pub(super) trait Source {
 
     fn is_vacant(&self, lane: Index<LANES>) -> bool;
 
-    fn turn(
-        &mut self,
-        lane: Index<LANES>,
-        class: WorkClass,
-        apply: impl FnOnce(Effect),
-    ) -> Turn<Self::Key>;
+    fn turn(&mut self, lane: Index<LANES>, class: WorkClass) -> Turn<Self::Key>;
 }
 
 pub(super) struct Drive<'a, S> {
@@ -85,21 +79,22 @@ impl<'a, S: Source> Drive<'a, S> {
                 break;
             }
             let both = has_data && control;
-            let round = if both {
-                if self.policy.is_data_next() {
-                    Round::DataFirst
+            let first = if both {
+                Some(if self.policy.is_data_next() {
+                    WorkClass::Data
                 } else {
-                    Round::ControlFirst
-                }
+                    WorkClass::Control
+                })
             } else {
-                Round::Single
+                None
             };
-            let first = matches!(round, Round::DataFirst);
             let mut activity = None;
             let mut done = false;
 
             let stop = 'round: {
-                if first && let Some(last) = tail {
+                if matches!(first, Some(WorkClass::Data))
+                    && let Some(last) = tail
+                {
                     let outcome = match self.one(DATA_READY, WorkClass::Data) {
                         Turn::Ready(outcome) => outcome,
                         Turn::Empty | Turn::Blocked => break 'round true,
@@ -113,9 +108,7 @@ impl<'a, S: Source> Drive<'a, S> {
                         Turn::Ready(outcome) => outcome,
                         Turn::Empty | Turn::Blocked => break 'round true,
                     };
-                    if activity.is_none() {
-                        activity = Some(outcome.activity);
-                    }
+                    activity = Some(outcome.activity);
                 }
 
                 while tail.is_some() && !done && self.remaining != 0 && !self.policy.is_blocked() {
@@ -125,15 +118,13 @@ impl<'a, S: Source> Drive<'a, S> {
                         Turn::Blocked => break 'round true,
                     };
                     done = Some(outcome.stream) == tail;
-                    if activity.is_none() {
-                        activity = Some(outcome.activity);
-                    }
+                    activity = Some(outcome.activity);
                 }
                 false
             };
 
             if let Some(activity) = activity {
-                self.policy.finish_round(round, activity);
+                self.policy.finish_round(first.unwrap_or(activity));
             }
             if stop || ONE_ROUND {
                 break;
@@ -146,14 +137,15 @@ impl<'a, S: Source> Drive<'a, S> {
         const {
             assert!(size_of::<Turn<S::Key>>() == size_of::<Option<TurnOutcome<S::Key>>>());
         }
-        let outcome = match self.domain.turn(source, class, |effect| match effect {
-            Effect::None => {}
-            Effect::Complete => self.report.completed += 1,
-            Effect::BlockData => self.policy.block_data(),
-        }) {
+        let outcome = match self.domain.turn(source, class) {
             Turn::Ready(outcome) => outcome,
             turn => return turn,
         };
+        match outcome.effect {
+            Effect::None => {}
+            Effect::Complete => self.report.completed += 1,
+            Effect::BlockData => self.policy.block_data(),
+        }
         self.remaining -= 1;
         self.report.turns += 1;
         Turn::Ready(outcome)
@@ -179,12 +171,7 @@ where
         self.domain.is_vacant(lane)
     }
 
-    fn turn(
-        &mut self,
-        source: Index<LANES>,
-        class: WorkClass,
-        apply: impl FnOnce(Effect),
-    ) -> Turn<K> {
+    fn turn(&mut self, source: Index<LANES>, class: WorkClass) -> Turn<K> {
         let driver = &mut *self.driver;
         let Some(current) = self.domain.front(source) else {
             return Turn::Empty;
@@ -192,17 +179,15 @@ where
         let Some(permit) = driver.permit() else {
             return Turn::Blocked;
         };
-        let stream = current.key();
         let outcome = match class {
             WorkClass::Control => region::Token::scope(|token| {
                 driver
                     .control(permit, Occupied::new(current, token.proof()))
                     .outcome
             }),
-            WorkClass::Data => data(driver, current, permit, stream),
+            WorkClass::Data => data(driver, current, permit),
         };
-        apply(outcome.1);
-        Turn::Ready(outcome.0)
+        Turn::Ready(outcome)
     }
 }
 
@@ -220,9 +205,9 @@ pub(super) enum Effect {
 
 pub(super) fn control<K, T, D>(
     driver: &mut D,
-    current: Slot<'_, K, T, LANES>,
+    current: entry::Occupied<'_, K, T, LANES>,
     run: impl FnOnce(&mut D, K, T) -> Control<T, D::Block, D::Error>,
-) -> Outcome<K>
+) -> TurnOutcome<K>
 where
     K: manifold::raw::Key,
     D: Driver<T, Key = K>,
@@ -234,32 +219,29 @@ where
             let (step, activity) = turn.into_parts();
             decide(driver, vacant, stream, value, step, activity)
         }
-        Control::Complete => (
-            TurnOutcome::new(stream, Activity::Control),
-            Effect::Complete,
-        ),
-        Control::Remove => Decision::running(stream, Activity::Control),
+        Control::Complete => TurnOutcome::new(stream, WorkClass::Control, Effect::Complete),
+        Control::Remove => Decision::running(stream, WorkClass::Control),
         Control::Failed { value, error } => settle(
             driver,
             vacant,
             stream,
             value,
             Terminal::Failed(error),
-            TurnOutcome::new(stream, Activity::Control),
+            WorkClass::Control,
         ),
     }
 }
 
 fn data<K, T, D>(
     driver: &mut D,
-    mut current: Slot<'_, K, T, LANES>,
+    mut current: entry::Occupied<'_, K, T, LANES>,
     permit: D::Permit,
-    stream: K,
-) -> Outcome<K>
+) -> TurnOutcome<K>
 where
     K: manifold::raw::Key,
     D: Driver<T, Key = K>,
 {
+    let stream = current.key();
     let step = match driver.data(permit, stream, current.get_mut()) {
         Ok(step) => step,
         Err(error) => {
@@ -268,20 +250,20 @@ where
                 current,
                 stream,
                 Terminal::Failed(error),
-                Activity::Data,
+                WorkClass::Data,
             );
         }
     };
-    borrowed(driver, current, stream, step, Activity::Data)
+    borrowed(driver, current, stream, step, WorkClass::Data)
 }
 
 pub(super) fn borrowed<K, T, D>(
     driver: &mut D,
-    current: Slot<'_, K, T, LANES>,
+    current: entry::Occupied<'_, K, T, LANES>,
     stream: K,
     step: Step<D::Block>,
-    activity: Activity,
-) -> Outcome<K>
+    activity: WorkClass,
+) -> TurnOutcome<K>
 where
     K: manifold::raw::Key,
     D: Driver<T, Key = K>,
@@ -294,9 +276,9 @@ where
         }
         Step::Blocked(block) => {
             let wait = block.wait();
-            let blocked = matches!((wait, activity), (Wait::Egress, Activity::Data));
+            let blocked = matches!((wait, activity), (Wait::Egress, WorkClass::Data));
             if !blocked || current.lane() != Some(DATA_READY) {
-                current.move_to_back(activity.class().blocked_lane(Some(wait)));
+                current.move_to_back(activity.blocked_lane(Some(wait)));
             }
             if blocked {
                 Decision::blocked(stream, activity)
@@ -314,66 +296,45 @@ fn decide<K, T, D>(
     stream: K,
     value: T,
     step: Step<D::Block>,
-    activity: Activity,
-) -> Outcome<K>
+    activity: WorkClass,
+) -> TurnOutcome<K>
 where
     K: manifold::raw::Key,
     D: Driver<T, Key = K>,
 {
     match step {
-        Step::Complete => settle(
-            driver,
-            vacant,
-            stream,
-            value,
-            Terminal::Complete,
-            TurnOutcome::new(stream, activity),
-        ),
+        Step::Complete => settle(driver, vacant, stream, value, Terminal::Complete, activity),
         Step::Progress(next) => {
             vacant.insert(value).move_to_back(next.ready_lane());
             Decision::running(stream, activity)
         }
         Step::Blocked(block) => {
             let wait = block.wait();
-            let lane = activity.class().blocked_lane(Some(wait));
+            let lane = activity.blocked_lane(Some(wait));
             let decision = match (wait, activity) {
-                (Wait::Egress, Activity::Data) => Decision::blocked(stream, activity),
+                (Wait::Egress, WorkClass::Data) => Decision::blocked(stream, activity),
                 _ => Decision::running(stream, activity),
             };
             vacant.insert(value).move_to_back(lane);
             decision
         }
-        Step::Idle => settle(
-            driver,
-            vacant,
-            stream,
-            value,
-            Terminal::Idle,
-            TurnOutcome::new(stream, activity),
-        ),
+        Step::Idle => settle(driver, vacant, stream, value, Terminal::Idle, activity),
     }
 }
 
 pub(super) fn finish<K, T, D>(
     driver: &mut D,
-    current: Slot<'_, K, T, LANES>,
+    current: entry::Occupied<'_, K, T, LANES>,
     stream: K,
     terminal: Terminal<D::Error>,
-    activity: Activity,
-) -> Outcome<K>
+    activity: WorkClass,
+) -> TurnOutcome<K>
 where
     K: manifold::raw::Key,
     D: Driver<T, Key = K>,
 {
     let (vacant, value) = current.take();
-    settle(
-        driver,
-        vacant,
-        stream,
-        value,
-        terminal,
-        TurnOutcome::new(stream, activity),
-    )
+    settle(driver, vacant, stream, value, terminal, activity)
 }
 
 fn settle<K, T, D>(
@@ -382,8 +343,8 @@ fn settle<K, T, D>(
     stream: K,
     value: T,
     terminal: Terminal<D::Error>,
-    turn: TurnOutcome<K>,
-) -> Outcome<K>
+    activity: WorkClass,
+) -> TurnOutcome<K>
 where
     K: manifold::raw::Key,
     D: Driver<T, Key = K>,
@@ -392,20 +353,24 @@ where
         Terminal::Complete => Effect::Complete,
         Terminal::Idle | Terminal::Failed(_) => Effect::None,
     };
-    let decision = (turn, effect);
     if let Settlement::Keep(value) = driver.settle(stream, value, terminal) {
         vacant.insert(value);
     }
-    decision
+    TurnOutcome::new(stream, activity, effect)
 }
 
 pub(super) struct TurnOutcome<K> {
     stream: K,
-    activity: Activity,
+    activity: WorkClass,
+    effect: Effect,
 }
 
 impl<K> TurnOutcome<K> {
-    pub(super) const fn new(stream: K, activity: Activity) -> Self {
-        Self { stream, activity }
+    pub(super) const fn new(stream: K, activity: WorkClass, effect: Effect) -> Self {
+        Self {
+            stream,
+            activity,
+            effect,
+        }
     }
 }

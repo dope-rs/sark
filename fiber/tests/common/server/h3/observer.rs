@@ -1,4 +1,4 @@
-use std::{cell, fmt, net::SocketAddr, rc};
+use std::{cell, fmt, net::SocketAddr, num::NonZero, rc};
 
 use dope::core::driver::storage;
 use dope_quic::{
@@ -14,32 +14,22 @@ use sark_core::{
     life,
     life::{audit, endpoint, exchange},
 };
-use sark_h3::{
-    conn::{
-        options,
-        options::{Protocol, plan, plan::Config},
-    },
-    manifold::server::failure,
-};
-use sark_http::field::metadata::block::Connect;
+use sark_h3::{conn::options, manifold::server::failure};
 
 use crate::common::server::h3::{
     apps::{FAIR_REQUESTS, State},
     proof::{ConnKey, Failure, Failures, LISTENER, Metric, Readiness, Shared, connection_key},
 };
 
-pub(crate) struct Storage<'d> {
-    pub(crate) state: State<'d>,
-}
-
 pub(crate) struct StoragePlan {
     pub(crate) cancel_dropped: rc::Rc<cell::Cell<usize>>,
     pub(crate) errors: rc::Rc<Failures>,
+    pub(crate) stream: rc::Rc<crate::common::route::body::Trace>,
 }
 
 impl storage::Plan for StoragePlan {
     type Output<'p, 'd>
-        = Storage<'d>
+        = State<'d>
     where
         Self: 'd,
         'd: 'p;
@@ -53,20 +43,36 @@ impl storage::Direct for StoragePlan {
         Self: 'd,
         'd: 'p,
     {
-        Storage {
-            state: State {
-                admitted: cell::Cell::new(0),
-                waiters: cell::Cell::new(Vec::with_capacity(FAIR_REQUESTS)),
-                saved: cell::Cell::new(None),
-                cancel_dropped: self.cancel_dropped,
-                errors: self.errors,
-            },
+        State {
+            admitted: cell::Cell::new(0),
+            waiters: cell::Cell::new(Vec::with_capacity(FAIR_REQUESTS)),
+            saved: cell::Cell::new(None),
+            cancel_dropped: self.cancel_dropped,
+            errors: self.errors,
+            stream: self.stream,
         }
     }
 }
 
 #[derive(Clone)]
-pub(crate) struct Probe<'a, D>(pub(crate) rc::Rc<Shared<'a>>, pub(crate) D);
+pub struct Probe<'a, D>(pub(crate) rc::Rc<Shared<'a>>, pub(crate) D);
+
+pub fn qpack_pressure<D>(probe: Probe<'_, D>) -> life::mode::Observed<Probe<'_, D>> {
+    {
+        let mut proof = probe.0.write().expect("proof");
+        proof.network.protocol.qpack.decoder = options::Decode {
+            table_bytes: 1024,
+            blocked_streams: 1,
+        };
+        let params = &mut proof.network.connect[0].params;
+        *params = params
+            .to_builder()
+            .local_bidi(640)
+            .try_build()
+            .expect("bounded response window");
+    }
+    life::mode::Observed::new(probe)
+}
 
 impl<D> failure::Packet for Probe<'_, D> {
     fn packet(&mut self, from: SocketAddr, len: usize, error: packet::Failure<'_>) {
@@ -76,17 +82,59 @@ impl<D> failure::Packet for Probe<'_, D> {
     }
 }
 
-impl<C, D> failure::Sink<C> for Probe<'_, D> {
-    fn failure(&mut self, event: failure::Event<'_, C>) {
+impl<I: Copy, D: Fn(&dyn fmt::Debug), const ID: u8> failure::Sink<id::Handle<I, ID>>
+    for Probe<'_, D>
+{
+    fn failure(&mut self, event: failure::Event<'_, id::Handle<I, ID>>) {
         match event {
             failure::Event::Create { error, .. } => self
                 .0
                 .fail(Failure::Scenario(format!("E2E H3 setup: {error:?}"))),
+            failure::Event::Connection { conn, error } => {
+                self.1(error);
+                let expected = self.0.read().map(|proof| {
+                    proof
+                        .requests
+                        .iter()
+                        .zip(&proof.replies.streams)
+                        .any(|(request, stream)| {
+                            request.expect.connection_closed
+                                && stream.is_some_and(|(owner, _)| owner == connection_key(conn))
+                        })
+                });
+                match expected {
+                    Ok(true) => {}
+                    Ok(false) => self
+                        .0
+                        .fail(Failure::Scenario(format!("E2E H3 connection: {error:?}"))),
+                    Err(error) => self.0.fail(error),
+                }
+            }
             failure::Event::Certificate(_) => self.0.reject(),
             failure::Event::Transmit { error, .. } => self.0.fail(Failure::Transmit(error)),
             failure::Event::Rejected(error) => self.0.fail(Failure::Rejected(error)),
             failure::Event::Receive(error) => self.0.fail(Failure::Socket(error)),
             failure::Event::Submit(error) => self.0.fail(Failure::Submit(error)),
+            failure::Event::Response {
+                conn,
+                stream,
+                error,
+            } => {
+                self.1(error);
+                let expected = self.0.read().map(|proof| {
+                    proof
+                        .slot(connection_key(conn), stream)
+                        .is_some_and(|slot| proof.requests[slot].expect.error.is_some())
+                });
+                match expected {
+                    Ok(true) => {}
+                    Ok(false) => self.0.fail(Failure::Scenario(format!(
+                        "unexpected response failure on stream {}: {error:?}",
+                        stream.get(),
+                    ))),
+                    Err(error) => self.0.fail(error),
+                }
+            }
         }
     }
 }
@@ -191,7 +239,18 @@ impl<'d, D: Fn(&dyn fmt::Debug)> life::Observer<id::Handle<id::Driver<'d>, LISTE
                 (Readiness::ExchangeOpened, life::Event::ExchangeOpened(_))
                     | (Readiness::HeadAdmitted, life::Event::HeadAdmitted(_))
                     | (Readiness::TaskPollPending, life::Event::TaskPollPending(_))
-            )
+            ) || (cancel.readiness == Readiness::StreamPending
+                && matches!(event, life::Event::TaskPollPending(_))
+                && proof.stream.polls.get() >= 3)
+                || match (cancel.readiness, event) {
+                    (Readiness::TaskPollReady(slot), life::Event::TaskPollReady(exchange)) => {
+                        proof.replies.streams.get(slot).is_some_and(|stream| {
+                            *stream
+                                == Some((connection_key(exchange.connection()), exchange.stream()))
+                        })
+                    }
+                    _ => false,
+                }
         });
         if ready {
             proof.cancel.ready = true;
@@ -304,7 +363,10 @@ pub enum ConfigError {
     Options(builder::Invalid),
 }
 
-pub(crate) fn config_with_streams(streams: u64) -> Result<Options, ConfigError> {
+pub(crate) fn config_with_streams(
+    streams: u64,
+    send_bytes: Option<NonZero<usize>>,
+) -> Result<Options, ConfigError> {
     let params = param::Set::builder()
         .idle_ms(30_000)
         .initial_data(1 << 20)
@@ -317,16 +379,10 @@ pub(crate) fn config_with_streams(streams: u64) -> Result<Options, ConfigError> 
         .map_err(ConfigError::Params)?;
     Options::builder()
         .transport(|path| path.params(params))
+        .streams(|streams| match send_bytes {
+            Some(limit) => streams.send_bytes(limit.get()),
+            None => streams,
+        })
         .try_build()
         .map_err(ConfigError::Options)
-}
-
-pub(crate) fn protocol() -> Result<plan::Config, options::Error> {
-    Config::new(options::Config {
-        protocol: Protocol {
-            extended_connect: Connect::Enabled,
-            ..Protocol::default()
-        },
-        ..options::Config::default()
-    })
 }

@@ -21,19 +21,6 @@ pub trait Family {
     type Graph: Default;
 }
 
-#[repr(transparent)]
-pub(in crate::server::task) struct State<S: Family> {
-    pub(in crate::server::task) graph: S::Graph,
-}
-
-impl<S: Family> State<S> {
-    pub(in crate::server::task) fn new() -> Self {
-        Self {
-            graph: S::Graph::default(),
-        }
-    }
-}
-
 impl<U> Family for request::Plain<U> {
     type Graph = PlainGraph;
 }
@@ -46,5 +33,5 @@ impl<U, G> Family for request::Start<U, G> {
     type Graph = GuardedGraph;
 }
 
-const _: () = assert!(std::mem::size_of::<State<request::Plain<()>>>() == 1);
-const _: () = assert!(std::mem::size_of::<State<request::Guarded<()>>>() == 1);
+const _: () = assert!(std::mem::size_of::<PlainGraph>() == 1);
+const _: () = assert!(std::mem::size_of::<GuardedGraph>() == 1);

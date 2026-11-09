@@ -327,7 +327,7 @@ impl Queue {
 impl Requests {
     pub(in crate::client) fn try_new(capacity: capacity::Count) -> Result<Self, alloc::Error> {
         Ok(Self {
-            raw: depot::raw::Arena::try_new(capacity)?,
+            raw: depot::raw::Arena::try_new(capacity.get())?,
         })
     }
 

@@ -20,15 +20,13 @@ pub(in crate::h1) use cursor::{Cursor, End};
 pub use entry::Entry;
 pub use transfer::Transfer;
 
-pub(in crate::h1) enum Progress<B, E = ()> {
-    Break(B),
-    /// A sink asked for the next field and carried its own continuation value.
-    Emitted(E),
+pub(in crate::h1) enum Progress<'owner> {
+    Field(Entry<'owner>),
     More,
     End(End),
 }
 
-const _: () = assert!(core::mem::size_of::<Progress<(), ()>>() == 12);
+const _: () = assert!(core::mem::size_of::<Progress<'_>>() == 64);
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(in crate::h1) struct Limit {

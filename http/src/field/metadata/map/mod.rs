@@ -82,8 +82,8 @@ impl metadata::Metadata for Vec<Owned> {
 
 /// One contiguous packed field block with no secondary-owner slot.
 #[derive(PartialEq, Eq)]
-pub struct Fields<S> {
-    bytes: S,
+pub struct Fields {
+    bytes: Vec<u8>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -92,11 +92,6 @@ pub enum Error {
     Write(consume::Error),
     ComponentTooLarge {
         len: usize,
-    },
-    CapacityOverflow {
-        current: usize,
-        name: usize,
-        value: usize,
     },
     ValueLengthMismatch {
         expected: usize,
@@ -117,18 +112,15 @@ impl From<usize> for Error {
     }
 }
 
-impl<S: AsRef<[u8]>> metadata::Metadata for Fields<S> {
-    type Iter<'a>
-        = Iter<'a>
-    where
-        S: 'a;
+impl metadata::Metadata for Fields {
+    type Iter<'a> = Iter<'a>;
 
     fn fields(&self) -> Self::Iter<'_> {
         Iter::new(self.bytes.as_ref())
     }
 }
 
-impl Fields<Vec<u8>> {
+impl Fields {
     pub const fn new() -> Self {
         Self { bytes: Vec::new() }
     }
@@ -144,15 +136,12 @@ impl Fields<Vec<u8>> {
     }
 
     pub fn push_entry(&mut self, field: Entry<'_>) -> Result<(), Error> {
-        Space::new(
-            &mut self.bytes,
-            field.name.len(),
+        self.push_with(
+            field.name,
             field.value.len(),
             field.indexing,
-        )?
-        .generated(field.name, |writer| writer.write_slice(field.value))?
-        .commit();
-        Ok(())
+            |writer| writer.write_slice(field.value),
+        )
     }
 
     /// Publishes only a successful callback that writes exactly `vlen` bytes.
@@ -181,9 +170,7 @@ impl Fields<Vec<u8>> {
             .commit();
         Ok(())
     }
-}
 
-impl<S: AsRef<[u8]>> Fields<S> {
     pub fn iter(&self) -> Iter<'_> {
         Iter::new(self.bytes.as_ref())
     }
@@ -199,11 +186,11 @@ impl<S: AsRef<[u8]>> Fields<S> {
     }
 
     pub fn ranges(&self) -> RangeIter<'_> {
-        RangeIter::new(self.bytes.as_ref())
+        RangeIter::new(self.bytes.as_ref(), 0)
     }
 }
 
-impl Default for Fields<Vec<u8>> {
+impl Default for Fields {
     fn default() -> Self {
         Self::new()
     }

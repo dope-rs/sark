@@ -26,7 +26,6 @@ impl State {
 
 pub(in crate::server) struct Pool<C: session::Storage, P> {
     lanes: pool::Lanes<message::DataChunk<C, P>>,
-    capacity: capacity::Count,
     ledger: credits::Ledger,
 }
 
@@ -43,7 +42,6 @@ impl<C: session::Storage, P> Pool<C, P> {
     ) -> Result<Self, alloc::Error> {
         Ok(Self {
             lanes: pool::Lanes::try_new(pool::Plan::from_counts(cap, calls))?,
-            capacity: cap,
             ledger: credits::Ledger::default(),
         })
     }
@@ -74,7 +72,7 @@ impl<C: session::Storage, P> Pool<C, P> {
     }
 
     pub(in crate::server) fn is_empty(&self) -> bool {
-        self.lanes.available() == self.capacity.get() && self.ledger.used() == 0
+        self.lanes.available() == self.lanes.capacity() && self.ledger.used() == 0
     }
 }
 

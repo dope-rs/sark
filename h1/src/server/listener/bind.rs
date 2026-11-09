@@ -3,10 +3,10 @@
 use dope::{
     core::{driver, driver::route::Identity},
     manifold::network::listener::handler,
-    net::wire,
+    net::{link::egress::data, wire},
 };
 use o3::alloc;
-use sark_core::{duplex, manifold::timer};
+use sark_core::duplex;
 
 use crate::server::{
     date,
@@ -23,10 +23,10 @@ pub enum Error {
 pub trait Bind<'w, 'd: 'w, ID: Identity>: Sized {
     type Wire: wire::Spec;
     type Input;
+    type Egress: data::raw::Payload<'d> + 'd;
     type Error;
-    type Application<'c, D>: handler::Application<'d, ID, Wire = Self::Wire, Input = Self::Input>
+    type Application<'c, D>: handler::Application<'d, ID, Wire = Self::Wire, Input = Self::Input, Egress = Self::Egress>
         + handler::Runtime<'w, 'd, ID>
-        + timer::Source<'d>
         + duplex::Application<'d>
     where
         'd: 'c,

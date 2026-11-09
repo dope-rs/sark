@@ -5,11 +5,14 @@ use std::{
     task::Poll,
 };
 
-use dope_test::harness::{observe::VecCellExt as _, signals::Progress};
+use dope_test::harness::{
+    observe::VecCellExt as _,
+    signals::{LocalGate, Progress},
+};
 use o3::buffer;
 use sark_core::manifold::stream::Boundary;
 use sark_grpc::{
-    Status,
+    Code, Status,
     message::Frame,
     metadata,
     protocol::request,
@@ -22,7 +25,7 @@ use sark_grpc::{
 };
 use sark_h2::{
     ClientRole,
-    conn::{self, DataOutcome, machine::Connection},
+    conn::{self, DataOutcome, event, machine::Connection},
     stream::Id,
 };
 use sark_http::field::{self, Entry, Lower, Pseudo, Value};
@@ -200,6 +203,7 @@ pub enum Event {
 pub struct Trace {
     pub flood: Cell<usize>,
     pub events: Cell<Vec<Event>>,
+    pub finished: LocalGate,
 }
 
 impl Progress for Trace {
@@ -263,6 +267,7 @@ impl Handler for Fairness<'_> {
         reply: &mut Reply<'_, W>,
     ) {
         reply.finish_with(Status::ok());
+        self.trace.finished.handle().hit();
     }
 
     fn request<P: buffer::raw::Segment, W: reply::Write>(
@@ -328,6 +333,53 @@ impl Client for Connection<ClientRole> {
             let len = bytes.len();
             socket.write_all(bytes)?;
             self.transfer().drain(len);
+        }
+    }
+}
+
+pub fn assert_replies<const N: usize>(
+    client: &mut Connection<ClientRole>,
+    ids: &[Id; N],
+    bodies: &mut [Vec<u8>; N],
+    done: &mut [bool; N],
+) {
+    while let Some(item) = client.ingress().poll_event() {
+        assert!(
+            !matches!(&item, event::Event::StreamReset { .. }),
+            "reply reset"
+        );
+        match item {
+            event::Event::Data {
+                stream_id: key,
+                data,
+                ..
+            } => {
+                let index = ids
+                    .iter()
+                    .position(|id| *id == key.id())
+                    .expect("reply stream");
+                data.for_each(|part| bodies[index].extend_from_slice(part));
+            }
+            event::Event::Headers {
+                stream_id: key,
+                head,
+                boundary: Boundary::End,
+                ..
+            } => {
+                let index = ids
+                    .iter()
+                    .position(|id| *id == key.id())
+                    .expect("reply stream");
+                assert!(!done[index], "terminal reply repeated");
+                assert_eq!(
+                    Status::from_fields(head.fields())
+                        .expect("reply status")
+                        .code(),
+                    Code::Ok
+                );
+                done[index] = true;
+            }
+            _ => {}
         }
     }
 }

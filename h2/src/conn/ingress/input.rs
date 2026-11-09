@@ -244,17 +244,16 @@ impl<C: session::Storage> FrameInput<C> {
                     return Ok(Preface::Missing);
                 };
                 source.copy(&mut preface);
-                for (offset, (actual, expected)) in
-                    preface.iter().zip(CLIENT_PREFACE.iter()).enumerate()
-                {
-                    if actual != expected {
-                        return Err(conn::Error::BadPreface {
+                conn::preface::Prefix::default()
+                    .read(&preface)
+                    .map_err(|cause| {
+                        let (_, offset, expected, actual) = cause.into_parts();
+                        conn::Error::BadPreface {
                             offset,
-                            expected: *expected,
-                            actual: *actual,
-                        });
-                    }
-                }
+                            expected,
+                            actual,
+                        }
+                    })?;
                 let event = events.vacant()?;
                 self.bytes
                     .try_consume(CLIENT_PREFACE.len())

@@ -74,11 +74,10 @@ impl<'a, 'd> Body<'a, 'd> {
         let (status, coding, headers) = self.head.into_parts();
         reply::Scoped {
             status,
-            coding,
+            coding: Some(coding),
             headers,
             trailers: self.trailers,
             body: self.body,
-            omitted: false,
         }
     }
 

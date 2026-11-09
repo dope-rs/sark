@@ -15,7 +15,7 @@ impl<'a> Tree<'a> {
 
         match self.0 {
             [] => proc_macro2::TokenStream::new(),
-            [leaf] => quote!(#ns_fiber::dope_fiber::task::storage::fixed::tree::Leaf<#leaf>),
+            [leaf] => leaf.clone(),
             leaves => {
                 let split = leaves.len() / 2;
                 let left = Self(&leaves[..split]).ty(paths);

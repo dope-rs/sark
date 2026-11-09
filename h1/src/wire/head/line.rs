@@ -18,6 +18,8 @@ use sark_http::{
     request::{self, span},
 };
 
+use super::Admission;
+
 pub enum Error<R: route::Schema> {
     Name {
         offset: usize,
@@ -46,6 +48,7 @@ pub enum Error<R: route::Schema> {
         cause: head::Error,
     },
     Header(R::Error),
+    Admission(crate::wire::Failure),
     Frame {
         slot: R::Header,
         cause: field::Error,
@@ -66,8 +69,9 @@ pub(super) enum Step<R: route::Schema> {
 }
 
 /// Applies one field whose syntax and absolute spans the native cursor admitted.
-pub(super) fn apply<R: route::Schema>(
+pub(super) fn apply<R: route::Schema, A: Admission>(
     headers: &mut R::RawHeaders,
+    admission: &mut A,
     fields: &mut Fields,
     flags: &mut head::Flags,
     coding: Coding,
@@ -76,19 +80,25 @@ pub(super) fn apply<R: route::Schema>(
 ) -> Result<(), Error<R>> {
     let slot = R::Header::slice(entry.name());
     let known = headers::Known::from_name(entry.name());
+    let mut encoding = None;
     if let Some(known) = known {
         let skip = matches!(known, headers::Known::AcceptEncoding)
             && slot.is_none()
             && !R::FULL
             && matches!(coding, Coding::Plain);
         if !skip {
-            known
-                .apply(fields, flags, entry.value(), version)
-                .map_err(|cause| Error::Field {
-                    start: entry.line_span().start(),
-                    available: entry.line_span().len(),
-                    cause,
-                })?;
+            encoding = if R::Header::ENCODING && matches!(known, headers::Known::AcceptEncoding) {
+                head::AcceptEncoding::try_apply(fields, flags, entry.value()).map(Some)
+            } else {
+                known
+                    .apply(fields, flags, entry.value(), version)
+                    .map(|()| None)
+            }
+            .map_err(|cause| Error::Field {
+                start: entry.line_span().start(),
+                available: entry.line_span().len(),
+                cause,
+            })?;
         }
         if matches!(known, headers::Known::Host) {
             fields.routing = fields
@@ -102,7 +112,17 @@ pub(super) fn apply<R: route::Schema>(
         }
     }
     if let Some(slot) = slot {
-        R::Header::set(headers, slot, &SliceValue::from(entry)).map_err(Error::Header)?;
+        let value = SliceValue::from(entry);
+        match encoding {
+            Some(encoding) => R::Header::set_encoding(headers, slot, &value, encoding),
+            None => R::Header::set(headers, slot, &value),
+        }
+        .map_err(Error::Header)?;
+    }
+    if A::FIELDS {
+        admission
+            .field(entry.name(), entry.value(), entry.value_span())
+            .map_err(Error::Admission)?;
     }
     Ok(())
 }
@@ -113,8 +133,21 @@ struct Bounds {
     end: usize,
 }
 
-pub(super) struct Scan<'a, R: route::Schema> {
+impl Bounds {
+    fn trimmed(mut self, input: &[u8]) -> Self {
+        while self.start < self.end && matches!(input.get(self.start), Some(b' ' | b'\t')) {
+            self.start += 1;
+        }
+        while self.end > self.start && matches!(input.get(self.end - 1), Some(b' ' | b'\t')) {
+            self.end -= 1;
+        }
+        self
+    }
+}
+
+pub(super) struct Scan<'a, R: route::Schema, A = ()> {
     pub(super) headers: &'a mut R::RawHeaders,
+    pub(super) admission: &'a mut A,
     pub(super) input: &'a [u8],
     pub(super) rest: &'a [u8],
     pub(super) start: usize,
@@ -124,7 +157,28 @@ pub(super) struct Scan<'a, R: route::Schema> {
     pub(super) version: Version,
 }
 
-impl<'a, R: route::Schema> Scan<'a, R> {
+impl<'a, R: route::Schema, A: Admission> Scan<'a, R, A> {
+    fn observe(&mut self, colon: usize, bounds: Bounds) -> Result<(), Step<R>> {
+        if A::FIELDS {
+            let bounds = bounds.trimmed(self.rest);
+            let name = self.try_prefix(colon)?;
+            let span = self
+                .try_span(&bounds)
+                .map_err(|cause| Step::Bad(Error::Span(request::Error::Span(cause))))?;
+            let value = span.get(self.input).ok_or_else(|| {
+                Step::Bad(Error::Point {
+                    base: span.start(),
+                    relative: span.len(),
+                    available: self.input.len(),
+                })
+            })?;
+            self.admission
+                .field(name, value, span)
+                .map_err(|error| Step::Bad(Error::Admission(error)))?;
+        }
+        Ok(())
+    }
+
     fn value(&self, colon: usize) -> Result<Bounds, Step<R>> {
         let limit = head::MAX_HEADER_LINE_BYTES;
         let capped = self.capped();
@@ -148,13 +202,6 @@ impl<'a, R: route::Schema> Scan<'a, R> {
             start,
             end: tail,
         })
-    }
-
-    fn set(&mut self, slot: R::Header, bounds: &Bounds) -> Result<(), Step<R>> {
-        let value = self
-            .try_value(bounds)
-            .map_err(|cause| Step::Bad(Error::Frame { slot, cause }))?;
-        R::Header::set(self.headers, slot, &value).map_err(|cause| Step::Bad(Error::Header(cause)))
     }
 
     fn try_value(&self, bounds: &Bounds) -> Result<SliceValue<'a>, field::Error> {
@@ -245,28 +292,14 @@ impl<'a, R: route::Schema> Scan<'a, R> {
             None => self.value(name_end),
         };
         match bounds {
-            Ok(bounds) => Step::Complete(bounds.tail),
-            Err(step) => step,
-        }
-    }
-
-    fn user_bounds(&mut self, colon: usize) -> Result<Bounds, Step<R>> {
-        match headers::Known::from_name(self.try_prefix(colon)?) {
-            Some(known) => self.scan_known(known, colon),
-            None => {
-                let Bounds {
-                    tail,
-                    mut start,
-                    mut end,
-                } = self.value(colon)?;
-                while start < tail && matches!(self.rest.get(start), Some(b' ' | b'\t')) {
-                    start += 1;
+            Ok(bounds) => {
+                let tail = bounds.tail;
+                match self.observe(name_end, bounds) {
+                    Ok(()) => Step::Complete(tail),
+                    Err(step) => step,
                 }
-                while end > start && matches!(self.rest.get(end - 1), Some(b' ' | b'\t')) {
-                    end -= 1;
-                }
-                Ok(Bounds { tail, start, end })
             }
+            Err(step) => step,
         }
     }
 
@@ -326,7 +359,7 @@ impl<'a, R: route::Schema> Scan<'a, R> {
     }
 }
 
-impl<R> Prefix<R::Header> for Scan<'_, R>
+impl<R, A: Admission> Prefix<R::Header> for Scan<'_, R, A>
 where
     R: route::Schema,
 {
@@ -337,12 +370,60 @@ where
     }
 
     fn user(mut self, slot: R::Header, colon: usize) -> Self::Output {
-        let bounds = match self.user_bounds(colon) {
+        let known = match self.try_prefix(colon) {
+            Ok(name) => headers::Known::from_name(name),
+            Err(step) => return step,
+        };
+        let mut encoding = None;
+        let bounds = if R::Header::ENCODING && matches!(known, Some(headers::Known::AcceptEncoding))
+        {
+            let capped = self.capped();
+            let start = match self.try_index(colon, 1, capped.len()) {
+                Ok(start) => start,
+                Err(step) => return step,
+            };
+            let (value, admitted) =
+                match head::AcceptEncoding::scan_line(self.fields, self.flags, &capped[start..]) {
+                    Ok(Some(value)) => value,
+                    Ok(None) => return self.incomplete(),
+                    Err(cause) => {
+                        return Step::Bad(Error::Field {
+                            start: self.start,
+                            available: capped.len(),
+                            cause,
+                        });
+                    }
+                };
+            encoding = Some(admitted);
+            Ok(Bounds {
+                tail: start + value.tail(),
+                start: start + value.start(),
+                end: start + value.end(),
+            })
+        } else {
+            match known {
+                Some(known) => self.scan_known(known, colon),
+                None => self.value(colon).map(|bounds| bounds.trimmed(self.rest)),
+            }
+        };
+        let bounds = match bounds {
             Ok(bounds) => bounds,
             Err(step) => return step,
         };
-        match self.set(slot, &bounds) {
-            Ok(()) => Step::Complete(bounds.tail),
+        let tail = bounds.tail;
+        let value = match self.try_value(&bounds) {
+            Ok(value) => value,
+            Err(cause) => return Step::Bad(Error::Frame { slot, cause }),
+        };
+        let stored = match encoding {
+            Some(encoding) => R::Header::set_encoding(self.headers, slot, &value, encoding),
+            None => R::Header::set(self.headers, slot, &value),
+        };
+        match stored
+            .map_err(|cause| Step::Bad(Error::Header(cause)))
+            .and_then(|()| self.observe(colon, bounds))
+        {
+            Ok(()) => Step::Complete(tail),
             Err(step) => step,
         }
     }

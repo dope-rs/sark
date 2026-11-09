@@ -12,7 +12,7 @@ use dope_quic::{
     runtime::{
         endpoint::{Endpoint, Run, config, owner::Owned, server},
         mux::app,
-        receive,
+        receive, routing,
     },
     rustls::ServerConfig,
     stream::Retain,
@@ -25,14 +25,14 @@ use crate::manifold::server::{
     Config, ConfigError, Handle, Handler, Mode, Setup, deadline, failure, rotation, startup,
 };
 
-type Bound<'pool, 'd, const ID: u8, R, T, O, L, E, A, C> = Result<
+type Bound<'pool, 'd, const ID: u8, R, T, O, L, E, A, C, Q> = Result<
     Endpoint<
         'd,
         ID,
         Handler<'d, <T as Bind<'d>>::Runtime, O, L, E>,
         <R as receive::Policy>::Buffer<'d>,
         Run<A, C>,
-        Owned,
+        Owned<Q>,
         datagram::Sealed<'pool>,
     >,
     startup::BindError<<T as Bind<'d>>::Error>,
@@ -40,8 +40,12 @@ type Bound<'pool, 'd, const ID: u8, R, T, O, L, E, A, C> = Result<
 
 /// Validated H3 and QUIC startup authority for one driver route.
 #[must_use = "an H3 plan must be bound to its generated application"]
-pub struct Plan<const ID: u8, R: receive::Policy = receive::Retained> {
-    endpoint: server::Plan<ID, R>,
+pub struct Plan<
+    const ID: u8,
+    R: receive::Policy = receive::Retained,
+    Q: routing::LocalRoute = routing::Plain,
+> {
+    endpoint: server::Plan<ID, R, Q>,
     config: Setup,
 }
 
@@ -60,9 +64,9 @@ impl<const ID: u8> Plan<ID> {
     }
 }
 
-impl<const ID: u8, R: receive::Policy> Plan<ID, R> {
+impl<const ID: u8, R: receive::Policy, Q: routing::LocalRoute> Plan<ID, R, Q> {
     /// Adds validated H3 limits to an existing QUIC plan without rebuilding its authority.
-    pub fn try_from(endpoint: server::Plan<ID, R>, app: Config) -> Result<Self, ConfigError> {
+    pub fn try_from(endpoint: server::Plan<ID, R, Q>, app: Config) -> Result<Self, ConfigError> {
         Ok(Self {
             endpoint,
             config: Setup::try_new(app)?,
@@ -78,7 +82,7 @@ impl<const ID: u8, R: receive::Policy> Plan<ID, R> {
         deadline: E,
         tasks: A,
         driver: &mut driver::Context<'_, 'd>,
-    ) -> Bound<'pool, 'd, ID, R, T, O, L, E, A, C>
+    ) -> Bound<'pool, 'd, ID, R, T, O, L, E, A, C, Q>
     where
         T: Bind<'d, Target = Handle<'d, ID>>,
         O: Mode<'d, ID> + failure::Packet,
@@ -105,23 +109,25 @@ impl<const ID: u8, R: receive::Policy> Plan<ID, R> {
         let seed = hash::Seed::new(driver.driver_ref().random_seed());
         endpoint
             .bind_with::<C, _, _, _, _>(driver, |binding| {
-                Handler::try_bind::<ID, _>(
-                    binding, router, config, observer, lifetime, deadline, seed,
-                )
-                .map(|handler| (handler, tasks))
-                .map_err(startup::BindError::Application)
+                Handler::try_bind(binding, router, config, observer, lifetime, deadline, seed)
+                    .map(|handler| (handler, tasks))
+                    .map_err(startup::BindError::Application)
             })
             .map_err(Into::into)
     }
 }
 
-impl<const ID: u8, R: receive::Policy> AsRef<server::Plan<ID, R>> for Plan<ID, R> {
-    fn as_ref(&self) -> &server::Plan<ID, R> {
+impl<const ID: u8, R: receive::Policy, Q: routing::LocalRoute> AsRef<server::Plan<ID, R, Q>>
+    for Plan<ID, R, Q>
+{
+    fn as_ref(&self) -> &server::Plan<ID, R, Q> {
         &self.endpoint
     }
 }
 
-impl<const ID: u8, R: receive::Policy> settings::Resource for Plan<ID, R> {
+impl<const ID: u8, R: receive::Policy, Q: routing::LocalRoute> settings::Resource
+    for Plan<ID, R, Q>
+{
     fn include_in(&self, needs: claim::Needs) -> Result<claim::Needs, errors::Claim> {
         settings::Resource::include_in(self.endpoint.as_ref(), needs)
     }

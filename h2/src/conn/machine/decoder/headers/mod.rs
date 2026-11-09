@@ -54,6 +54,7 @@ fn complete<'a, R, F, C, E>(
     prepared: header::Prepared<'a, F, C, E>,
     boundary: Boundary,
     section: Section,
+    queued: bool,
 ) -> Result<store::Action<Outcome<'a, F, C, E>>, conn::Error>
 where
     R: crate::Role,
@@ -67,11 +68,7 @@ where
     {
         Err(numbers::ErrorCode::ProtocolError)
     } else {
-        match record
-            .stream
-            .state
-            .recv(stream::Event::Headers { boundary })
-        {
+        match record.state.recv(stream::Event::Headers { boundary }) {
             Ok(next) => Ok(next),
             Err(error @ stream::Error::Protocol { .. }) => {
                 prepared.discard();
@@ -83,13 +80,13 @@ where
     let next = next.and_then(|next| {
         let (content, remaining) = match section {
             Section::Trailing => {
-                record.stream.content.trailers(record.remaining)?;
-                (record.stream.content, record.remaining)
+                record.content.trailers(record.remaining)?;
+                (record.content, record.remaining)
             }
-            Section::Initial if interim => (record.stream.content, record.remaining),
+            Section::Initial if interim => (record.content, record.remaining),
             Section::Initial => {
                 let (content, remaining) =
-                    prepared.content(record.stream.method.unwrap_or(Method::Other))?;
+                    prepared.content(record.method.unwrap_or(Method::Other))?;
                 (
                     content,
                     content.receive(remaining, 0, matches!(boundary, Boundary::End))?,
@@ -103,7 +100,7 @@ where
         Err(error) => {
             let notify = match R::ENDPOINT {
                 Endpoint::Client => true,
-                Endpoint::Server => matches!(record.stream.peer_section, Section::Trailing),
+                Endpoint::Server => matches!(record.section(), Section::Trailing),
             };
             let reset = if notify {
                 Some(prepared.reject())
@@ -113,18 +110,22 @@ where
             };
             return Ok(store::Action::Reset(
                 error,
+                queued && notify,
                 Outcome::Reset(key, error, reset),
             ));
         }
     };
-    record.stream.state = next;
-    record.stream.content = content;
+    record.state = next;
+    record.content = content;
     record.remaining = remaining;
     if matches!((R::ENDPOINT, section), (Endpoint::Server, Section::Initial)) {
-        record.stream.method = prepared.method();
+        record.method = prepared.method();
     }
     if !interim {
-        record.stream.peer_section = Section::Trailing;
+        record.complete_head();
+    }
+    if queued && matches!(boundary, Boundary::End) {
+        record.queue_end();
     }
     prepared.commit(key, boundary, section);
     Ok(if next == stream::State::Closed {
@@ -207,7 +208,7 @@ where
         let outcome;
         'open: {
             let admitted = active.admit(history, stream, limit, |key, record| {
-                let section = record.stream.peer_section;
+                let section = record.section();
                 let action = if matches!((section, boundary), (Section::Trailing, Boundary::More)) {
                     headers::Action::Reset(numbers::ErrorCode::ProtocolError)
                 } else {
@@ -254,12 +255,20 @@ where
                     let reset = events::Reset::new(vacancy, None);
                     return Ok(store::Action::Reset(
                         error,
+                        life.keeps_events(),
                         Outcome::Reset(key, error, Some(reset)),
                     ));
                 }
                 let prepared =
                     Self::prepare(&mut input, events, headers, start, len, total, section)?;
-                complete::<R, _, _, _>(key, record, prepared, boundary, section)
+                complete::<R, _, _, _>(
+                    key,
+                    record,
+                    prepared,
+                    boundary,
+                    section,
+                    life.keeps_events(),
+                )
             })?;
             let flow = match admitted {
                 store::Admission::Active(done) => ControlFlow::Break(done),
@@ -336,6 +345,7 @@ where
                             peer.initial_window_size,
                             local.initial_window_size,
                             0,
+                            false,
                         );
                         opening.commit();
                     }
@@ -385,25 +395,19 @@ where
                 total,
                 Section::Initial,
             )?;
-            match prepared.validation() {
-                header::Validation::Valid => {}
-                header::Validation::Rejected { .. } => {
-                    prepared.discard();
-                    opening.commit();
-                    egress
-                        .outbound
-                        .reset(id, numbers::ErrorCode::ProtocolError)?;
-                    return Ok(());
+            let content = match prepared.validation() {
+                header::Validation::Valid => {
+                    prepared
+                        .content(Method::Other)
+                        .and_then(|(content, remaining)| {
+                            Ok((
+                                content,
+                                content.receive(remaining, 0, matches!(boundary, Boundary::End))?,
+                            ))
+                        })
                 }
-            }
-            let content = prepared
-                .content(Method::Other)
-                .and_then(|(content, remaining)| {
-                    Ok((
-                        content,
-                        content.receive(remaining, 0, matches!(boundary, Boundary::End))?,
-                    ))
-                });
+                header::Validation::Rejected { .. } => Err(numbers::ErrorCode::ProtocolError),
+            };
             let (content, remaining) = match content {
                 Ok(content) => content,
                 Err(error) => {
@@ -418,6 +422,7 @@ where
                 peer.initial_window_size,
                 local.initial_window_size,
                 remaining,
+                life.keeps_events() && matches!(boundary, Boundary::End),
             );
             opening.commit();
             prepared.commit(key, boundary, Section::Initial);

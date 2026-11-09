@@ -17,7 +17,7 @@ use sark_h1::server::{
 };
 use sark_http::payload::response::status;
 
-use crate::common::server;
+use crate::common::{route::body::OwnedReply, server};
 
 #[derive(Debug)]
 pub enum Error {
@@ -49,17 +49,11 @@ pub fn try_serve(
 
 pub const PING: &[u8] = b"GET /ping HTTP/1.1\r\nHost: x\r\n\r\n";
 
-#[sark_fiber::response(raw)]
-pub struct PingReply {
-    pub status: status::Code,
-    pub body: Vec<u8>,
-}
-
 #[sark_fiber::handler(pub)]
-fn ping() -> PingReply {
+fn ping() -> OwnedReply {
     let mut body = Vec::new();
     body.extend_from_slice(b"pong");
-    PingReply {
+    OwnedReply {
         status: status::Code::OK,
         body,
     }
@@ -71,18 +65,12 @@ pub struct UpReq {
     pub payload: BodyLen,
 }
 
-#[sark_fiber::response(raw)]
-pub struct UpReply {
-    pub status: status::Code,
-    pub body: Vec<u8>,
-}
-
 #[sark_fiber::handler(pub)]
 #[max_body(16 * 1024 * 1024)]
-fn up(req: UpReq) -> UpReply {
+fn up(req: UpReq) -> OwnedReply {
     let mut body = Vec::new();
     body.extend_from_slice(req.payload.len().to_string().as_bytes());
-    UpReply {
+    OwnedReply {
         status: status::Code::OK,
         body,
     }

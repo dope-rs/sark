@@ -8,6 +8,7 @@ pub use sark_core::{
     route::guard::{Guard, Head},
 };
 pub use sark_gen::{
-    define_route, define_router, define_task_route, duplex, handler, header_name, request, response,
+    define_cleartext_route, define_route, define_router, define_task_route, duplex, handler,
+    header_name, request, response,
 };
 pub use sark_http as http;

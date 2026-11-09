@@ -20,7 +20,7 @@ use sark_h2::{
     frame::{
         Ack, Block,
         layout::{Header, Headers},
-        numbers::{SettingId, Type},
+        numbers::{ErrorCode, SettingId, Type},
         payload::Continuation,
     },
     hpack::encode::Encoder,
@@ -31,7 +31,11 @@ use sark_http::field::{self, metadata::map::record::Entry};
 use crate::common::{
     capacity,
     headers::Counted,
-    protocol::{Session, conn::Controls},
+    protocol::{
+        Session,
+        conn::Controls,
+        session::{Frame, Wire},
+    },
 };
 
 #[test]
@@ -391,10 +395,8 @@ fn reset_commits_hpack_once() {
 
 #[test]
 fn refusal_advances_hpack() {
-    let mut settings = Settings::DEFAULT;
-    settings.max_concurrent_streams = Some(1);
     let mut server = Connection::<ServerRole>::with_config(Config {
-        local_settings: settings,
+        stream_capacity: 1,
         recv_window_target: 65_535,
         ..Config::default()
     })
@@ -418,7 +420,11 @@ fn refusal_advances_hpack() {
                 .expect("capacity fixture"),
         )
         .expect("ingest the admitted header block");
-    while server.ingress().poll_event().is_some() {}
+    assert!(matches!(
+        server.ingress().poll_event(),
+        Some(Event::Headers { stream_id, .. }) if stream_id.id() == Id::FIRST_CLIENT
+    ));
+    assert!(server.ingress().poll_event().is_none());
 
     let refused = [
         Entry::new(b":method", b"GET"),
@@ -426,19 +432,51 @@ fn refusal_advances_hpack() {
         Entry::new(b":path", b"/refused"),
         Entry::new(b"x-shift", b"discarded"),
     ];
+    let id = Id::new(3).expect("stream three");
+    let mut input = capacity::Fields::new(id, &refused)
+        .try_headers(&mut encoder, Boundary::More)
+        .expect("refused request");
+    input.extend_from_slice(
+        &Controls::new(Ack::Required)
+            .try_ping(*b"refused!")
+            .expect("following control"),
+    );
     server
         .ingress()
-        .ingest(
-            &capacity::Fields::new(Id::new(3).expect("construct stream three"), &refused)
-                .try_encode(&mut encoder)
-                .expect("capacity fixture"),
-        )
+        .ingest(&input)
         .expect("decode and refuse the excess stream");
+    assert_eq!(
+        Wire::new(server.output().first())
+            .try_reset()
+            .expect("reset"),
+        Some((id, ErrorCode::RefusedStream))
+    );
     assert_eq!(
         capacity::Wire::new(server.output().first())
             .try_count(Type::RstStream)
             .expect("capacity fixture"),
         1
+    );
+    assert!(matches!(
+        server.ingress().poll_event(),
+        Some(Event::Ping { ack: Ack::Required, opaque }) if opaque == *b"refused!"
+    ));
+    assert!(server.ingress().poll_event().is_none());
+    server.transfer().drain(usize::MAX);
+    server
+        .ingress()
+        .ingest(
+            &Frame::new(id.into_u32(), b"in flight")
+                .try_data(Boundary::More)
+                .expect("late refused DATA"),
+        )
+        .expect("discard late refused DATA");
+    assert!(server.ingress().poll_event().is_none());
+    assert_eq!(
+        Wire::new(server.output().first())
+            .try_reset()
+            .expect("reset"),
+        Some((id, ErrorCode::StreamClosed))
     );
     server.transfer().drain(usize::MAX);
 

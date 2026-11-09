@@ -3,20 +3,24 @@ use std::convert;
 use dope::{
     core,
     core::driver::{
-        self,
         route::{Identity, KeyTag},
         storage,
     },
     manifold::{
-        app::receive,
+        self,
+        app::{Host, env, receive},
         network::listener::{
-            conn,
+            self, conn,
             handler::{Application, Runtime, failures},
             topology::factory,
         },
+        timing,
     },
-    net::{link::pool::recv::input, wire},
-    runtime::topology::recipe,
+    net::{link::pool::recv::input, tcp, wire},
+    runtime::{
+        executor::Startup,
+        topology::{lending, recipe},
+    },
 };
 use o3::buffer::{resident, resident::bound::Unbounded};
 use sark_core::manifold::server::app;
@@ -131,11 +135,11 @@ where
             Failure = run::Failure,
             Egress<'d> = Unbounded,
         >,
-    for<'d> App<run::Service<'a, direct::Policy<H, active::Entry<'a>>>, W, F>:
+    for<'d> App<'d, run::Service<'a, direct::Policy<H, active::Entry<'a>>>, W, F>:
         Runtime<'d, 'd, ID> + Application<'d, ID, Wire = W, Input = receive::Scoped>,
 {
     type Application<'d>
-        = App<run::Service<'a, direct::Policy<H, active::Entry<'a>>>, W, F>
+        = App<'d, run::Service<'a, direct::Policy<H, active::Entry<'a>>>, W, F>
     where
         Self: 'd,
         W: 'd,
@@ -157,88 +161,138 @@ where
     }
 }
 
-impl<'a, H: Handler> modes::Family<storage::Value<H>, KeyTag<0>>
+impl<'a, 'stage, 'scope, 'life: 'scope, 'p: 'life, 'd: 'p, H, Q, N, O>
+    modes::Family<lending::Stage<'stage, 'scope, 'life, 'p, 'd, storage::Value<H>, Q>, N, KeyTag<0>>
     for Plan<'a, recipe::Borrow, mode::Demand<mode::UnaryTag>>
+where
+    H: Handler + 'd,
+    Self: 'd,
+    Q: Startup,
+    N: for<'s, 'n, 'r, 'f> lending::Next<
+            lending::Stage<'stage, 'scope, 'life, 'p, 'd, storage::Value<H>, Q>,
+            Host<
+                listener::Listener<
+                    'n,
+                    'r,
+                    'f,
+                    'd,
+                    'd,
+                    KeyTag<0>,
+                    App<'d, run::Service<'a, unary::Policy<'s, 'a, 'life, 'd, H>>, wire::Identity>,
+                    env::Bundle<tcp::Tcp, wire::Identity, timing::Throughput>,
+                >,
+            >,
+            Output = O,
+        >,
 {
-    type Failure = <modes::Serve<mode::Error> as modes::Failure>::Error;
+    type Output = O;
+    type Error = manifold::BuildError<
+        core::BranchError<
+            <Self as recipe::Build<storage::Value<H>>>::Error,
+            <modes::Serve<mode::Error> as modes::Failure>::Error,
+        >,
+    >;
 
-    type Application<'s, 'life, 'p, 'd>
-        = App<run::Service<'a, unary::Policy<'s, 'a, 'life, 'd, H>>, wire::Identity>
-    where
-        'd: 'p,
-        'p: 'life,
-        'd: 'life,
-        Self: 'd,
-        storage::Value<H>: 'd;
-
-    fn with<'life, 'p, 'd, O>(
-        built: Self::Output<'life, 'p, 'd>,
-        conn: server::Plan,
-        binding: driver::Binding<'d>,
-        run: impl for<'s> FnOnce(Self::Application<'s, 'life, 'p, 'd>) -> O,
-    ) -> Result<O, Self::Failure>
-    where
-        'd: 'p,
-        'p: 'life,
-        'd: 'life,
-        Self: 'd,
-        storage::Value<H>: 'd,
-    {
+    fn install(
+        self,
+        plan: sark_h2::server::runtime::Plan<KeyTag<0>>,
+        stage: &mut lending::Stage<'stage, 'scope, 'life, 'p, 'd, storage::Value<H>, Q>,
+        next: N,
+    ) -> Result<O, Self::Error> {
+        let built = recipe::Build::<storage::Value<H>>::build(self, stage.storage())
+            .map_err(core::BranchError::First)
+            .map_err(manifold::BuildError::Factory)?;
         let (app, bank, exec) = built.into_parts();
+        let (install, conn) = plan.into_install(wire::domain::Local::new(wire::Identity));
+        let binding = install.binding(stage.driver().driver_ref());
         let capacity = exec.capacity();
         executor::with(capacity, binding.owners(), |tasks| {
             let policy = unary::Policy::new(app, tasks);
             let app = run::Service::new(policy, bank);
-            let app = App::new(app, conn, failures::Close).map_err(core::BranchError::Second)?;
-            Ok(run(app))
+            let app = App::new(app, conn, failures::Close)
+                .map_err(core::BranchError::Second)
+                .map_err(core::BranchError::Second)
+                .map_err(manifold::BuildError::Factory)?;
+            install
+                .in_stage(stage, app, |listener, _wait, stage| {
+                    next.run(Host::new(listener), stage)
+                })
+                .map_err(manifold::BuildError::Create)
         })
         .map_err(|cause| mode::Error::Task {
             requested: capacity,
             cause,
         })
-        .map_err(core::BranchError::First)?
+        .map_err(core::BranchError::First)
+        .map_err(core::BranchError::Second)
+        .map_err(manifold::BuildError::Factory)?
     }
 }
 
-impl<'a, H: stream::Handler> modes::Family<storage::Value<H>, KeyTag<0>>
+impl<'a, 'stage, 'scope, 'life: 'scope, 'p: 'life, 'd: 'p, H, Q, N, O>
+    modes::Family<lending::Stage<'stage, 'scope, 'life, 'p, 'd, storage::Value<H>, Q>, N, KeyTag<0>>
     for Plan<'a, recipe::Borrow, mode::Demand<mode::StreamTag>>
+where
+    H: stream::Handler + 'd,
+    Self: 'd,
+    Q: Startup,
+    N: for<'s, 'n, 'r, 'f> lending::Next<
+            lending::Stage<'stage, 'scope, 'life, 'p, 'd, storage::Value<H>, Q>,
+            Host<
+                listener::Listener<
+                    'n,
+                    'r,
+                    'f,
+                    'd,
+                    'd,
+                    KeyTag<0>,
+                    App<'d, run::Service<'a, Policy<'s, 'a, 'life, 'd, H>>, wire::Identity>,
+                    env::Bundle<tcp::Tcp, wire::Identity, timing::Throughput>,
+                >,
+            >,
+            Output = O,
+        >,
 {
-    type Failure = <modes::Serve<mode::Error> as modes::Failure>::Error;
+    type Output = O;
+    type Error = manifold::BuildError<
+        core::BranchError<
+            <Self as recipe::Build<storage::Value<H>>>::Error,
+            <modes::Serve<mode::Error> as modes::Failure>::Error,
+        >,
+    >;
 
-    type Application<'s, 'life, 'p, 'd>
-        = App<run::Service<'a, Policy<'s, 'a, 'life, 'd, H>>, wire::Identity>
-    where
-        'd: 'p,
-        'p: 'life,
-        'd: 'life,
-        Self: 'd,
-        storage::Value<H>: 'd;
-
-    fn with<'life, 'p, 'd, O>(
-        built: Self::Output<'life, 'p, 'd>,
-        conn: server::Plan,
-        binding: driver::Binding<'d>,
-        run: impl for<'s> FnOnce(Self::Application<'s, 'life, 'p, 'd>) -> O,
-    ) -> Result<O, Self::Failure>
-    where
-        'd: 'p,
-        'p: 'life,
-        'd: 'life,
-        Self: 'd,
-        storage::Value<H>: 'd,
-    {
+    fn install(
+        self,
+        plan: sark_h2::server::runtime::Plan<KeyTag<0>>,
+        stage: &mut lending::Stage<'stage, 'scope, 'life, 'p, 'd, storage::Value<H>, Q>,
+        next: N,
+    ) -> Result<O, Self::Error> {
+        let built = recipe::Build::<storage::Value<H>>::build(self, stage.storage())
+            .map_err(core::BranchError::First)
+            .map_err(manifold::BuildError::Factory)?;
         let (app, bank, exec) = built.into_parts();
+        let (install, conn) = plan.into_install(wire::domain::Local::new(wire::Identity));
+        let binding = install.binding(stage.driver().driver_ref());
         let capacity = exec.capacity();
         executor::with(capacity, binding.owners(), |tasks| {
             let policy = Policy::new(app, tasks);
             let app = run::Service::new(policy, bank);
-            let app = App::new(app, conn, failures::Close).map_err(core::BranchError::Second)?;
-            Ok(run(app))
+            let app = App::new(app, conn, failures::Close)
+                .map_err(core::BranchError::Second)
+                .map_err(core::BranchError::Second)
+                .map_err(manifold::BuildError::Factory)?;
+            install
+                .in_stage(stage, app, |listener, _wait, stage| {
+                    next.run(Host::new(listener), stage)
+                })
+                .map_err(manifold::BuildError::Create)
         })
         .map_err(|cause| mode::Error::Task {
             requested: capacity,
             cause,
         })
-        .map_err(core::BranchError::First)?
+        .map_err(core::BranchError::First)
+        .map_err(core::BranchError::Second)
+        .map_err(manifold::BuildError::Factory)?
     }
 }

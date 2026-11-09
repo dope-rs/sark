@@ -26,6 +26,8 @@ pub const BODY: &[u8] =
     b"POST / HTTP/1.1\r\nHost: empty\r\nX-Proof: kept\r\nContent-Length: 1\r\n\r\nx";
 pub const CHUNKED: &[u8] =
     b"POST / HTTP/1.1\r\nHost: empty\r\nX-Proof: kept\r\nTransfer-Encoding: chunked\r\n\r\n1\r\nx\r\n0\r\n\r\n";
+pub const ENCODING_BODY: &[u8] =
+    b"POST / HTTP/1.1\r\nHost: empty\r\nX-Proof: kept\r\nAccept-Encoding: br\r\nAccept-Encoding: gzip\r\nContent-Length: 1\r\n\r\nx";
 
 thread_local! {
     pub static DROPS: Cell<usize> = const { Cell::new(0) };
@@ -46,6 +48,8 @@ pub struct Inspected {
     pub len: BodyLen,
     #[header("x-proof")]
     pub proof: Option<Shared>,
+    #[header("accept-encoding")]
+    pub encoding: Option<sark_http::field::head::AcceptEncoding>,
 }
 
 #[sark_fiber::response(raw)]

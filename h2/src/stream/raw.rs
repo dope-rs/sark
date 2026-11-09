@@ -10,7 +10,7 @@ const unsafe fn restore(raw: u64) -> Key {
     Key {
         id: Nonzero(Id::from_wire((raw >> 32) as u32)),
         // SAFETY: The retained Key's physical slot excludes the sentinel.
-        slot: unsafe { bounded::raw::Proof::assume(raw as u32) }.retain(),
+        slot: unsafe { bounded::raw::u32(raw as u32) },
     }
 }
 
@@ -47,7 +47,6 @@ const _: () = assert!(core::mem::size_of::<Option<Marked>>() == core::mem::size_
 
 unsafe impl depot::raw::Key for Key {
     type Raw = u64;
-    type Live = Self;
 
     const VACANT: Self::Raw = 0;
 
@@ -61,11 +60,6 @@ unsafe impl depot::raw::Key for Key {
 
     fn from_raw(raw: Stored<Self>) -> Self {
         // SAFETY: Stored<Self> retains this exact stream domain and logical identity.
-        unsafe { <Self as depot::raw::Key>::rebuild(raw) }
-    }
-
-    unsafe fn rebuild<K: depot::raw::Key<Raw = u64>>(raw: Stored<K>) -> Self {
-        // SAFETY: Stored and rebuild's caller preserve the emitted stream Key domain.
         unsafe { restore(raw.into_raw()) }
     }
 
@@ -73,14 +67,6 @@ unsafe impl depot::raw::Key for Key {
         let id = Id::new((raw >> 32) as u32)?.nonzero()?;
         let slot = bounded::U32::new(raw as u32)?;
         Some(Self { id, slot })
-    }
-
-    fn into_live(self) -> Self::Live {
-        self
-    }
-
-    fn from_live(live: Self::Live) -> Self {
-        live
     }
 }
 

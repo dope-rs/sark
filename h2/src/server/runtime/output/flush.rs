@@ -3,7 +3,7 @@ use core::mem;
 use conn::write;
 use data::compose;
 use dope::{
-    core::driver::{retained, route::Identity},
+    core::driver::{self, route::Identity},
     manifold::network::listener,
     net::{
         link::egress::{self, data},
@@ -15,11 +15,12 @@ use o3::buffer::{
     hold,
     resident::{self, bound},
 };
-use output::{
-    Error, Failure,
-    track::{Progress, Proof, Sink, Track},
+use output::{Error, Failure};
+use sark_core::{
+    life::{self, exchange, owners},
+    manifold::Body,
 };
-use sark_core::life;
+use sark_http::owner::{self, cause};
 use write::error;
 
 use crate::{conn::event, frame::numbers, server::runtime::output, stream};
@@ -32,6 +33,17 @@ type Admission<'d, P, G> = Result<
     (egress::Excess<P>, <P as Evidence<'d>>::Receipt),
 >;
 
+pub(in crate::server) struct Proof {
+    stream: stream::Key,
+    charge: hold::Charge,
+}
+
+#[derive(Clone, Copy)]
+pub(in crate::server) enum Progress {
+    Blocked,
+    Committed,
+}
+
 enum Cycle<R> {
     Empty,
     Write(R),
@@ -43,6 +55,7 @@ pub(in crate::server) enum End {
 }
 
 const _: () = {
+    assert!(mem::size_of::<Progress>() == 1);
     assert!(mem::size_of::<End>() == mem::size_of::<bool>());
     assert!(mem::align_of::<End>() == mem::align_of::<bool>());
 };
@@ -50,18 +63,15 @@ const _: () = {
 pub(in crate::server) trait Evidence<'d>: data::raw::Payload<'d> + Sized {
     type Write;
     type Receipt: Default;
-    type Track<'a, C: Copy + 'a, M: life::Mode<C, stream::Key> + 'a>: Sink<Self::Receipt>;
+    fn observe<C: Copy, M: life::Mode<C, stream::Key>>(
+        _: Self::Receipt,
+        _: &mut M,
+        _: C,
+        _: owner::Change,
+    ) {
+    }
 
-    fn track<'a, C: Copy + 'a, M: life::Mode<C, stream::Key> + 'a>(
-        mode: &'a mut M,
-        conn: C,
-    ) -> Self::Track<'a, C, M>;
-
-    fn retain(
-        stream: stream::Key,
-        bytes: usize,
-        body: resident::Shared<'d>,
-    ) -> (resident::Shared<'d>, Self::Write);
+    fn retain(stream: stream::Key, bytes: usize) -> Self::Write;
 
     fn admit<G: bound::Bound>(
         write: Self::Write,
@@ -77,18 +87,7 @@ pub(in crate::server) trait Evidence<'d>: data::raw::Payload<'d> + Sized {
 impl<'d> Evidence<'d> for resident::Shared<'d> {
     type Write = ();
     type Receipt = ();
-    type Track<'a, C: Copy + 'a, M: life::Mode<C, stream::Key> + 'a> = Track<()>;
-
-    fn track<'a, C: Copy + 'a, M: life::Mode<C, stream::Key> + 'a>(
-        _: &'a mut M,
-        _: C,
-    ) -> Self::Track<'a, C, M> {
-        Track::new(())
-    }
-
-    fn retain(_: stream::Key, _: usize, body: resident::Shared<'d>) -> (resident::Shared<'d>, ()) {
-        (body, ())
-    }
+    fn retain(_: stream::Key, _: usize) {}
 
     fn admit<G: bound::Bound>(
         _: Self::Write,
@@ -108,41 +107,65 @@ impl<'d> Evidence<'d> for resident::Shared<'d> {
     }
 }
 
-impl<'d> Evidence<'d> for compose::Tagged<resident::Shared<'d>, stream::Key> {
-    type Write = Proof;
-    type Receipt = Option<Proof>;
-    type Track<'a, C: Copy + 'a, M: life::Mode<C, stream::Key> + 'a> = Track<(C, &'a mut M)>;
+impl<'d, S: data::raw::Payload<'d>> Evidence<'d> for compose::Either<Body<'d, ()>, S> {
+    type Write = ();
+    type Receipt = ();
+    fn retain(_: stream::Key, _: usize) {}
 
-    fn track<'a, C: Copy + 'a, M: life::Mode<C, stream::Key> + 'a>(
-        mode: &'a mut M,
-        conn: C,
-    ) -> Self::Track<'a, C, M> {
-        Track::new((conn, mode))
+    fn admit<G: bound::Bound>(
+        _: Self::Write,
+        body: resident::Shared<'d>,
+    ) -> Admission<'d, Self, G> {
+        let body = egress::Load::new(Self::Left(Body::Shared {
+            owner: body,
+            tag: (),
+        }))
+        .try_bound::<G>()
+        .map_err(|cause| (cause, ()))?;
+        Ok((body, ()))
     }
 
-    fn retain(
-        stream: stream::Key,
-        bytes: usize,
+    fn admit_owned<G: bound::Bound>(
+        _: stream::Key,
         body: resident::Shared<'d>,
-    ) -> (resident::Shared<'d>, Proof) {
-        let charge = data::raw::Payload::charge(&body);
-        (
-            body,
-            Proof {
-                stream,
-                charge: hold::Charge::from_owner(bytes, charge.resident_bytes),
-            },
-        )
+    ) -> Admission<'d, Self, G> {
+        Self::admit::<G>((), body)
+    }
+}
+
+impl<'d> Evidence<'d> for compose::Tagged<resident::Shared<'d>, stream::Key> {
+    type Write = (stream::Key, usize);
+    type Receipt = Option<Proof>;
+
+    fn observe<C: Copy, M: life::Mode<C, stream::Key>>(
+        receipt: Self::Receipt,
+        mode: &mut M,
+        conn: C,
+        change: owner::Change,
+    ) {
+        if let Some(receipt) = receipt {
+            owners::Projection::new(mode).apply(owner::Effect::new(
+                exchange::Id::new(conn, receipt.stream),
+                receipt.charge,
+                change,
+            ));
+        }
+    }
+
+    fn retain(stream: stream::Key, bytes: usize) -> Self::Write {
+        (stream, bytes)
     }
 
     fn admit<G: bound::Bound>(
-        write: Self::Write,
+        (stream, bytes): Self::Write,
         body: resident::Shared<'d>,
     ) -> Admission<'d, Self, G> {
-        match egress::Load::new(body)
-            .tagged(write.stream)
-            .try_bound::<G>()
-        {
+        let body = egress::Load::new(body).tagged(stream);
+        let write = Proof {
+            stream,
+            charge: hold::Charge::from_owner(bytes, body.charge().resident().get()),
+        };
+        match body.try_bound::<G>() {
             Ok(body) => Ok((body, Some(write))),
             Err(cause) => Err((cause, Some(write))),
         }
@@ -160,25 +183,34 @@ impl<'d> Evidence<'d> for compose::Tagged<resident::Shared<'d>, stream::Key> {
     }
 }
 
-fn flush_into<'d, ID: Identity, W, C, E, G, S>(
+pub(in crate::server) fn finish<'d, ID: Identity, W, C, E, G, M>(
     conn: &mut conn::Ctx<'_, '_, '_, '_, '_, 'd, ID, W, C, data::Bound<E, G>>,
-    driver: &mut retained::Context<'_, '_, 'd>,
-    end: End,
-    accepted: &mut S,
-) -> Result<(), Failure>
+    driver: &mut driver::Context<'_, 'd>,
+    error: Option<numbers::ErrorCode>,
+    mode: &mut M,
+) -> Result<Progress, (Failure, Progress)>
 where
     W: wire::Spec,
     C: output::State<'d>,
     E: Evidence<'d>,
     G: bound::Bound,
-    S: Sink<E::Receipt>,
+    M: life::Mode<conn::Id<'d, ID>, stream::Key>,
 {
+    let end = match error {
+        Some(error) => {
+            conn.state_mut().protocol().control().goaway(error);
+            End::Close
+        }
+        None => conn.state_mut().settle(),
+    };
+    let owner = conn.id();
+    let mut progress = Progress::Blocked;
     loop {
         if !conn.state_mut().protocol().transfer().has_write() {
             if matches!(end, End::Close) {
                 conn.close_after();
             }
-            return Ok(());
+            return Ok(progress);
         }
         let outcome = conn.write().try_commit(driver, |state, mut prefix| {
             let bound = match state
@@ -225,11 +257,12 @@ where
         });
         match outcome {
             Ok(write::Outcome::Committed(Cycle::Write(receipt))) => {
-                accepted.accept(receipt);
+                progress = Progress::Committed;
+                E::observe(receipt, mode, owner, owner::Change::Handoff);
             }
-            Ok(write::Outcome::Committed(Cycle::Empty)) => return Ok(()),
+            Ok(write::Outcome::Committed(Cycle::Empty)) => return Ok(progress),
             Ok(write::Outcome::Deferred(_) | write::Outcome::Closed) => {
-                return Ok(());
+                return Ok(progress);
             }
             Err(cause) => {
                 let (failure, receipt) = match cause {
@@ -264,68 +297,27 @@ where
                     }
                 };
                 match receipt {
-                    Cycle::Write(receipt) => accepted.reject(receipt),
+                    Cycle::Write(receipt) => {
+                        progress = Progress::Committed;
+                        E::observe(
+                            receipt,
+                            mode,
+                            owner,
+                            owner::Change::StagingReleased(cause::Staging::Closed),
+                        );
+                    }
                     Cycle::Empty => {}
                 }
                 match failure {
                     Ok(failure) => {
                         conn.close_after();
-                        return Err(failure);
+                        return Err((failure, progress));
                     }
                     Err(failure) => conn.write().reject(failure),
                 }
-                return Ok(());
+                return Ok(progress);
             }
         }
-    }
-}
-
-pub(in crate::server) struct Flush<'a, T> {
-    conn: &'a mut T,
-}
-
-impl<'a, T> Flush<'a, T> {
-    pub(in crate::server) fn new(conn: &'a mut T) -> Self {
-        Self { conn }
-    }
-}
-
-impl<'a, 'e, 'n, 'p, 's, 'w, 'd: 'w, ID: Identity, W, C, E, G>
-    Flush<'a, conn::Ctx<'e, 'n, 'p, 's, 'w, 'd, ID, W, C, data::Bound<E, G>>>
-where
-    W: wire::Spec,
-    C: output::State<'d>,
-    E: Evidence<'d>,
-    G: bound::Bound,
-{
-    pub(in crate::server) fn observe<M: life::Mode<conn::Id<'d, ID>, stream::Key>>(
-        self,
-        driver: &mut retained::Context<'_, '_, 'd>,
-        error: Option<numbers::ErrorCode>,
-        mode: &mut M,
-    ) {
-        if let Err((cause, _)) = self.finish(driver, error, mode) {
-            mode.diagnostic(&cause);
-        }
-    }
-
-    pub(in crate::server) fn finish<M: life::Mode<conn::Id<'d, ID>, stream::Key>>(
-        self,
-        driver: &mut retained::Context<'_, '_, 'd>,
-        error: Option<numbers::ErrorCode>,
-        mode: &mut M,
-    ) -> Result<Progress, (Failure, Progress)> {
-        let end = match error {
-            Some(error) => {
-                self.conn.state_mut().protocol().control().goaway(error);
-                End::Close
-            }
-            None => self.conn.state_mut().settle(),
-        };
-        let mut accepted = E::track(mode, self.conn.id());
-        flush_into(self.conn, driver, end, &mut accepted)
-            .map_err(|failure| (failure, accepted.progress()))?;
-        Ok(accepted.progress())
     }
 }
 

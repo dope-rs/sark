@@ -129,55 +129,6 @@ where
         let mut policy = policies::Direct;
         self.state
             .cancel_unary(call.stream, call.completion, &mut policy);
-    }
-}
-
-impl<'scope, P, C> session::Session<'scope, P, C>
-where
-    C: Storage,
-    P: Plan<
-            C,
-            Key = stream::Key,
-            Fields = section::Owner,
-            Selection = (),
-            Connection: Connection<Error = conn::Error>,
-        >,
-{
-    pub(in crate::client) fn try_unary<'notify, D: crate::Codec>(
-        &mut self,
-        path: &[u8],
-        peer: Option<&[u8]>,
-        metadata: &metadata::Metadata,
-        codec: &mut D,
-        message: &D::Encode,
-        done: &mut policies::Notify<'notify, '_, '_>,
-    ) -> call::Admission<Handle<'scope, P::Key>> {
-        self.state
-            .start_single::<receive::UnaryKey, _, _>(path, peer, metadata, codec, message, done)
-            .map(|started| Handle {
-                brand: self.brand,
-                stream: started.stream,
-                completion: started.completion,
-            })
-    }
-
-    pub(in crate::client) fn poll_unary<'notify>(
-        &mut self,
-        call: &Handle<'scope, P::Key>,
-        done: &mut policies::Notify<'notify, '_, '_>,
-    ) -> Result<receive::Progress<receive::UnaryResult<C>>, crate::Status> {
-        let result = self.state.poll_unary(call.completion, done)?;
-        if matches!(result, receive::Progress::Pending(_)) {
-            self.state.ingress.take_error()?;
-        }
-        Ok(result)
-    }
-
-    pub(in crate::client) fn cancel_unary<'notify>(
-        &mut self,
-        call: Handle<'scope, P::Key>,
-        done: &mut policies::Notify<'notify, '_, '_>,
-    ) {
-        self.state.cancel_unary(call.stream, call.completion, done);
+        self.state.refill(&mut policy);
     }
 }

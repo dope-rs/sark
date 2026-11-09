@@ -83,7 +83,7 @@ where
     where
         T: ticket::Ticket<P, C>,
     {
-        if !self.ingress.phase.is_open() {
+        if self.ingress.closed {
             return Err(crate::Status::new(
                 crate::Code::Unavailable,
                 Reason::ConnectionDraining,
@@ -142,7 +142,6 @@ where
         if self.cancel(stream, policy).is_none() {
             self.ingress.cancel_unary(key);
         }
-        self.refill(policy);
     }
 
     pub(super) fn poll_stream<R: policies::Policy<P, C>>(
@@ -171,7 +170,6 @@ where
         if self.cancel(stream, policy).is_none() {
             self.ingress.cancel_feed(key);
         }
-        self.refill(policy);
     }
 
     pub(super) fn drive<R: policies::Policy<P, C>>(
@@ -188,6 +186,20 @@ where
             .drive(&mut self.connection, egress, &mut |record| {
                 let _ = policy.cancel(&mut self.ingress, record.response);
             })
+    }
+
+    pub(super) fn drive_ingress<R: policies::Policy<P, C>>(
+        &mut self,
+        result: Result<(), conn::Error>,
+        policy: &mut R,
+    ) -> Result<(), crate::Status> {
+        self.ingress.drive(
+            &mut self.connection,
+            &mut self.calls,
+            &mut self.egress,
+            result,
+            policy,
+        )
     }
 
     pub(super) fn refill<R: policies::Policy<P, C>>(&mut self, policy: &mut R) {

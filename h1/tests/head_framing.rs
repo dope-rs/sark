@@ -8,6 +8,7 @@ use std::{
 };
 
 use common::head::{self, OWNED_PREFIX, OWNED_SUFFIX, OWNED_TAIL, Request, SETS};
+use dope_test::alloc::Tracker;
 use o3::buffer::write::Sink as _;
 use sark_h1::{
     Input,
@@ -16,11 +17,12 @@ use sark_h1::{
         head::{Block, Error, line},
         parsing::{
             self,
-            framing::{Head, HeadProgress, PendingHead},
+            framing::{Head, HeadProgress, PendingHead, Plain},
             raw,
         },
     },
 };
+
 use sark_http::{
     field::{head::Error::ContentLength, text::IntError},
     h1::{
@@ -29,6 +31,9 @@ use sark_http::{
     },
 };
 
+#[global_allocator]
+static ALLOCATOR: Tracker = Tracker::new();
+
 #[test]
 fn setters_and_owner() {
     SETS.set(Vec::new());
@@ -36,27 +41,22 @@ fn setters_and_owner() {
     let source = parsing::Head::parse(Input::Borrowed(&input), u8::MAX)
         .expect("line")
         .expect("complete line");
-    let mut pending = match Head::<Request>::start(raw::Bound::empty(&source))
-        .ok()
-        .expect("fields")
-    {
-        HeadProgress::Pending(pending) => Some(pending),
-        HeadProgress::Complete(_) => None,
-    }
-    .expect("pending fields");
+    let mut pending =
+        match Head::<Request, Plain, head::Admission>::start(raw::Bound::empty(&source))
+            .ok()
+            .expect("fields")
+        {
+            HeadProgress::Pending(pending) => Some(pending),
+            HeadProgress::Complete(_) => None,
+        }
+        .expect("pending fields");
     let values = SETS.take();
     assert_eq!(values.as_slice(), [b"once"]);
     SETS.set(values);
     input.fill(b'!');
     for byte in b"fragmented" {
-        let outcome: RouteOutcome<
-            '_,
-            Infallible,
-            Infallible,
-            PendingHead<Request>,
-            parsing::Rejected<'_>,
-        > = pending
-            .try_resume(
+        let outcome = pending
+            .try_resume::<Infallible, Infallible, _>(
                 Input::Borrowed(slice::from_ref(byte)),
                 Permit::new(),
                 convert::identity,
@@ -70,18 +70,28 @@ fn setters_and_owner() {
         }
         .expect("pending field");
     }
-    let outcome: RouteOutcome<
-        '_,
-        Infallible,
-        Infallible,
-        PendingHead<Request>,
-        parsing::Rejected<'_>,
-    > = pending
-        .try_resume(
+    let outcome = pending
+        .try_resume::<Infallible, Infallible, _>(
             Input::Borrowed(b"\r\n\r\n"),
             Permit::new(),
             convert::identity,
             |head, _| {
+                let (head, admission) = head.into_admission();
+                assert_eq!((admission.fields, admission.finishes), (3, 1));
+                assert_eq!(
+                    admission
+                        .other
+                        .expect("field span")
+                        .get(head.source().input().as_slice()),
+                    Some(b"fragmented".as_slice())
+                );
+                let whole = Head::<common::Request, Plain, head::Admission>::parse(
+                    raw::Bound::empty(head.source()),
+                )
+                .ok()
+                .flatten()
+                .expect("whole head");
+                assert_eq!(whole.into_admission().1.other, admission.other);
                 assert!(
                     head.source()
                         .input()
@@ -158,6 +168,72 @@ fn bad_field_rejects() {
         })))
     ));
     assert!(SETS.take().is_empty());
+}
+
+#[test]
+fn upgrade_errors_follow_canonical_field_admission() {
+    let allowed = Request::upgrade_limit(false);
+    let limit = Request::upgrade_limit(true);
+    let rejected = Request::bounded(64, 0);
+    for (wire, expected, through) in head::INVALID_UPGRADES
+        .into_iter()
+        .map(|(wire, error)| (wire, Some(error), wire.len()))
+        .chain([
+            (
+                allowed.as_slice(),
+                Some(sark_ws::upgrade::Error::Connection),
+                allowed.len(),
+            ),
+            (limit.as_slice(), None, limit.len()),
+            (
+                rejected.as_slice(),
+                Some(sark_ws::upgrade::Error::Connection),
+                Request::PREFIX.len(),
+            ),
+        ])
+    {
+        for split in Request::PREFIX.len()..=through {
+            let source = parsing::Head::parse(Input::Borrowed(&wire[..split]), u8::MAX)
+                .expect("request line")
+                .expect("complete request line");
+            let measurement = Tracker::begin();
+            let error = match Head::<Request, Plain, sark_h1::route::duplex::Upgrade>::start(
+                raw::Bound::empty(&source),
+            ) {
+                Err(error) => error,
+                Ok(HeadProgress::Pending(pending)) => match pending
+                    .try_resume::<Infallible, Infallible, _>(
+                        Input::Borrowed(&wire[split..]),
+                        Permit::new(),
+                        convert::identity,
+                        |_, _| panic!("invalid opening reached the handler"),
+                    ) {
+                    Err(error) => error,
+                    Ok(_) => panic!("invalid opening did not fail immediately"),
+                },
+                Ok(HeadProgress::Complete(_)) => panic!("invalid opening admitted"),
+            };
+            let allocation = measurement.finish();
+            assert!(allocation.allocated_bytes < 32 * 1024 + 256, "{allocation:?}");
+            if expected.is_none() {
+                assert!(matches!(
+                    error,
+                    parsing::Request::Head(
+                        Error::Fields {
+                            actual: 129,
+                            limit: 128
+                        } | Error::Syntax(sark_http::h1::field::syntax::Error::TooMany)
+                    )
+                ));
+            }
+            let actual = match error.into_consume::<Infallible>() {
+                Outcome::Failed(sark_h1::wire::Failure::Upgrade(error)) => Some(error),
+                Outcome::Close(reply) if reply.as_slice() == canned::BAD_REQUEST.as_slice() => None,
+                _ => panic!("opening error lost"),
+            };
+            assert_eq!(actual, expected);
+        }
+    }
 }
 
 #[test]
@@ -270,7 +346,7 @@ fn http10_ignores_upgrade() {
 }
 
 #[test]
-fn whole() {
+fn whole_and_split() {
     SETS.set(Vec::new());
     for field in Request::LONG_FIELDS {
         for width in [8191, 8192, 8193] {
@@ -283,24 +359,17 @@ fn whole() {
                 matches!(complete, Ok(HeadProgress::Complete(_))),
                 width <= 8192
             );
-        }
-    }
-    assert!(SETS.take().is_empty());
-}
-
-#[test]
-fn split() {
-    SETS.set(Vec::new());
-    for field in Request::LONG_FIELDS {
-        for width in [8191, 8192, 8193] {
-            let input = Request::long(width, field);
+            assert!(SETS.take().is_empty());
             for split in [Request::PREFIX.len() + field.len(), input.len() - 3] {
                 let source = parsing::Head::parse(Input::Borrowed(&input[..split]), u8::MAX)
                     .expect("line")
                     .expect("complete line");
                 let pending = match Head::<Request>::start(raw::Bound::empty(&source)) {
                     Ok(HeadProgress::Pending(pending)) => Some(pending),
-                    Err(_) if width > 8192 => continue,
+                    Err(parsing::Request::Head(Error::Line(line::Error::Limit {
+                        observed: 8194,
+                        limit: 8192,
+                    }))) if width > 8192 => continue,
                     _ => None,
                 }
                 .expect("pending field");
@@ -342,13 +411,7 @@ fn owned_line_keeps_head() {
         ControlFlow::Break(_) => None,
     }
     .expect("complete");
-    let outcome: RouteOutcome<
-        '_,
-        Infallible,
-        Infallible,
-        PendingHead<Request>,
-        parsing::Rejected<'_>,
-    > = PendingHead::<Request>::try_start(
+    let outcome = PendingHead::<Request>::try_start::<Infallible, Infallible, _>(
         raw::Bound::empty(source),
         Permit::new(),
         convert::identity,
@@ -380,17 +443,111 @@ fn owned_line_keeps_head() {
 
 #[test]
 fn bounds_head_length() {
-    let mut accepted = common::Request::field_block(false);
+    let mut accepted = common::Request::field_block(64 * 1024);
     accepted.resize(accepted.len() + 64 * 1024, 0xa5);
     assert!(matches!(
         Block::<()>::parse::<common::Request>(&accepted, 0, 128, Coding::Plain, Version::Eleven),
         Ok(Some(_))
     ));
-    let rejected = common::Request::field_block(true);
+    let rejected = common::Request::field_block(64 * 1024 + 1);
     assert!(matches!(
         Block::<()>::parse::<common::Request>(&rejected, 0, 128, Coding::Plain, Version::Eleven),
         Err(Error::Length { len }) if len == 64 * 1024 + 1
     ));
+}
+
+#[test]
+fn route_bound_precedes_retention() {
+    const LIMIT: usize = 16 * 1024;
+    for extra in [0, 1] {
+        let wire = Request::bounded(LIMIT, extra);
+        for split in [16, LIMIT - 2, wire.len()] {
+            let source = parsing::Head::parse(Input::Borrowed(&wire[..split]), u8::MAX)
+                .expect("request line")
+                .expect("complete line");
+            let measurement = Tracker::begin();
+            let started = Head::<Request, Plain, head::Admission>::start(raw::Bound::empty(&source));
+            let allocation = measurement.finish();
+            match (split == wire.len(), started) {
+                (true, Ok(HeadProgress::Complete(head))) => {
+                    assert_eq!(extra, 0);
+                    assert_eq!(allocation.allocations, 0);
+                    assert_eq!(head.into_admission().1.finishes, 1);
+                }
+                (false, Ok(HeadProgress::Pending(pending))) => {
+                    let measurement = Tracker::begin();
+                    let outcome = pending.try_resume::<Infallible, Infallible, _>(
+                        Input::Borrowed(&wire[split..]),
+                        Permit::new(),
+                        convert::identity,
+                        |head, _| {
+                            assert_eq!(extra, 0);
+                            let (head, admission) = head.into_admission();
+                            assert_eq!(admission.finishes, 1);
+                            assert_eq!(head.source().input().as_slice(), wire);
+                            Outcome::Close(canned::NOT_FOUND).into()
+                        },
+                    );
+                    let allocation = measurement.finish();
+                    if extra == 0 {
+                        assert!(matches!(
+                            outcome,
+                            Ok(RouteOutcome::Outcome(Outcome::Close(_)))
+                        ));
+                    } else {
+                        assert!(
+                            matches!(outcome, Err(parsing::Request::Head(Error::Length { len })) if len == wire.len())
+                        );
+                        assert!(
+                            allocation.allocated_bytes < 2 * LIMIT + 256,
+                            "{allocation:?}"
+                        );
+                    }
+                }
+                (true, Err(parsing::Request::Head(Error::Length { len }))) => {
+                    assert_eq!(extra, 1);
+                    assert_eq!(len, wire.len());
+                    assert_eq!(allocation.allocations, 0);
+                }
+                _ => panic!("header admission"),
+            }
+        }
+    }
+    let limit = 64 * 1024;
+    for extra in [0, 1] {
+        let wire = Request::bounded(limit, extra);
+        let source = parsing::Head::parse(Input::Borrowed(&wire[..16]), u8::MAX)
+            .expect("request line")
+            .expect("complete line");
+        let RouteOutcome::AwaitReject { pending, .. } =
+            parsing::Rejected::start::<Infallible, Infallible, Infallible>(
+                &source,
+                Permit::new(),
+                canned::NOT_FOUND,
+            )
+        else {
+            panic!("pending rejected head");
+        };
+        let measurement = Tracker::begin();
+        let outcome = pending.resume::<Infallible, Infallible, Infallible>(
+            Input::Borrowed(&wire[16..]),
+            Permit::new(),
+        );
+        let allocation = measurement.finish();
+        let expected = if extra == 0 {
+            canned::NOT_FOUND
+        } else {
+            canned::PAYLOAD_TOO_LARGE
+        };
+        assert!(matches!(
+            outcome,
+            RouteOutcome::Outcome(Outcome::Close(reply)) if reply.as_slice() == expected.as_slice()
+        ));
+        assert!(
+            allocation.allocated_bytes < 2 * limit + 256,
+            "{allocation:?}"
+        );
+    }
 }
 
 #[test]

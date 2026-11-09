@@ -8,7 +8,6 @@ use crate::{
     },
 };
 
-#[derive(Clone)]
 pub(in crate::manifold::server) struct Setup {
     pub(in crate::manifold::server) protocol: plan::Config,
     pub(in crate::manifold::server) requests: settings::Plan,

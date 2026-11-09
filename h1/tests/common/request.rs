@@ -27,8 +27,7 @@ impl Request {
     pub const HEAD: &[u8] =
         b"POST /retain?key=value HTTP/1.1\r\nHost: local\r\nContent-Length: 1\r\n\r\n";
 
-    pub fn field_block(oversize: bool) -> Vec<u8> {
-        let len = 64 * 1024 + usize::from(oversize);
+    pub fn field_block(len: usize) -> Vec<u8> {
         let mut wire = b"Host: local\r\n".to_vec();
         while len - wire.len() > 2 {
             let value = (len - wire.len() - 10).min(1024);

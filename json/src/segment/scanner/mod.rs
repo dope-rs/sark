@@ -4,15 +4,14 @@ use o3::buffer::{resident, segments};
 use sark_http::payload::owned;
 
 use crate::segment::{
-    Admitted, Document, Field, Order, Push, ScanProgress, Transfer, input, is_overlap,
+    Admitted, Document, Field, Order, Push, ScanProgress, input, is_overlap,
     state::{Pin, Value},
 };
 mod plan;
 mod prepared;
 mod scan;
 pub(super) use prepared::Prepared;
-use scan::Scan;
-pub(super) use scan::Selection;
+pub(super) use scan::{Scanning, Selection};
 
 pub(super) enum Scanner<'d> {
     Open(Scanning<'d>),
@@ -20,10 +19,6 @@ pub(super) enum Scanner<'d> {
     Preparing(Prepared<'d>),
 }
 
-pub(super) struct Scanning<'d> {
-    scan: Scan<'d>,
-    pub(super) stream: Stream,
-}
 pub(super) struct Released {
     pub(super) bytes: usize,
     pub(super) chunks: segments::Count,
@@ -149,20 +144,17 @@ impl Stream {
 }
 impl<'d> Scanner<'d> {
     pub(super) fn admitted(input: Admitted<'d>, selection: Selection<'d>) -> Self {
-        Self::Closed(Scanning {
-            scan: Scan::admitted(input, selection),
-            stream: Stream::new(),
-        })
+        Self::Closed(Scanning::new(input.input, selection))
     }
 
     pub(super) fn try_stream(
         fields: &'d [Field<'d>],
         order: Order,
     ) -> Result<Self, crate::segment::Create> {
-        Ok(Self::Open(Scanning {
-            scan: Scan::try_stream(fields, order)?,
-            stream: Stream::new(),
-        }))
+        Ok(Self::Open(Scanning::new(
+            input::Input::empty(),
+            Selection::try_new(fields, order)?,
+        )))
     }
     pub(super) fn new<I, O>(owners: I, fields: &'d [Field<'d>], order: Order) -> crate::Result<Self>
     where
@@ -170,45 +162,26 @@ impl<'d> Scanner<'d> {
         I::IntoIter: ExactSizeIterator,
         resident::Shared<'d>: From<O>,
     {
-        Ok(Self::Closed(Scanning {
-            scan: Scan::new(owners, fields, order)?,
-            stream: Stream::new(),
-        }))
+        Ok(Self::Closed(Scanning::new(
+            input::Input::new(owners)?,
+            Selection::try_new(fields, order).map_err(crate::Error::Allocation)?,
+        )))
     }
     pub(super) fn try_new(
         owners: owned::Segments<'d>,
         fields: &'d [Field<'d>],
         order: Order,
     ) -> Result<Self, crate::segment::Create> {
-        Ok(Self::Closed(Scanning {
-            scan: Scan::try_new(owners, fields, order)?,
-            stream: Stream::new(),
-        }))
+        Ok(Self::Closed(Scanning::new(
+            input::Input::try_new(owners)?,
+            Selection::try_new(fields, order)?,
+        )))
     }
-    pub(super) fn push(self, segment: resident::Shared<'d>) -> Transfer<Self, Push<'d>> {
+    pub(super) fn push(&mut self, segment: resident::Shared<'d>) -> Result<(), Push<'d>> {
         let Self::Open(scanner) = self else {
-            return Transfer::Rejected {
-                state: self,
-                error: Push::Complete(segment),
-            };
+            return Err(Push::Complete(segment));
         };
-        let Scanning { scan, stream } = scanner;
-        scan.push(segment).map(
-            |scan| Self::Open(Scanning { scan, stream }),
-            |error| match error {
-                input::Failure::Length { len, add, owner } => Push::Length { len, add, owner },
-                input::Failure::Segments {
-                    current,
-                    add,
-                    owner,
-                } => Push::Segments {
-                    current,
-                    add,
-                    owner,
-                },
-                input::Failure::Allocation { error, owner } => Push::Allocation { error, owner },
-            },
-        )
+        scanner.input.push(segment)
     }
     pub(super) fn close(self) -> Self {
         match self {
@@ -225,7 +198,7 @@ impl<'d> Scanner<'d> {
 }
 impl<'d> Scanning<'d> {
     pub(super) fn release(self) -> crate::segment::Release<'d> {
-        Document::new(self.scan.input, self.scan.selection.values).release()
+        Document::new(self.input, self.selection.values).release()
     }
 
     pub(super) fn step(
@@ -235,38 +208,29 @@ impl<'d> Scanning<'d> {
     ) -> crate::Result<(ScanProgress, usize)> {
         let mut left = budget.get();
         while left != 0 {
-            let pin = self.scan.state.pin(self.scan.cursor.absolute);
-            let end = self.scan.cursor.segment;
+            let pin = self.state.pin(self.cursor.absolute);
+            let end = self.cursor.segment;
             if self
                 .stream
-                .reap(
-                    &mut self.scan.input,
-                    &self.scan.selection.values,
-                    end,
-                    pin,
-                    &mut left,
-                )
+                .reap(&mut self.input, &self.selection.values, end, pin, &mut left)
                 .is_pending()
             {
                 break;
             }
-            if self.scan.state.is_done() {
+            if self.state.is_done() {
                 return Ok((ScanProgress::Ready, left));
             }
-            if !closed
-                && self.scan.cursor.absolute == self.scan.input.len()
-                && self.scan.state.can_wait()
-            {
+            if !closed && self.cursor.absolute == self.input.len() && self.state.can_wait() {
                 return Ok((ScanProgress::NeedInput, left));
             }
             if left == 0 {
                 break;
             }
-            let skipped = self.scan.skip(left);
+            let skipped = self.skip(left);
             if skipped != 0 {
                 left -= skipped;
             } else {
-                self.scan.transition(&mut left)?;
+                self.transition(&mut left)?;
             }
         }
         Ok((ScanProgress::Pending, left))

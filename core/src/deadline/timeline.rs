@@ -31,6 +31,7 @@ impl<P: Ord> PartialOrd for Expiry<P> {
 #[repr(u8)]
 #[derive(Clone, Copy, Eq, PartialEq)]
 pub enum Transition {
+    /// Starts the exchange without extending a total admitted by its raw head.
     Open,
     AwaitingHead,
     HeadAdmitted,
@@ -109,6 +110,9 @@ impl<P: Copy + Ord> Timeline<P> {
     {
         match step {
             Transition::Open => {
+                if self.get(deadline::Phase::Total).is_some() {
+                    return Change::Unchanged;
+                }
                 let total = Self::instant(config, deadline::Phase::Total, now, &mut add);
                 self.insert_at(total, deadline::Phase::Total)
             }

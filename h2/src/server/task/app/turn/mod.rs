@@ -2,46 +2,35 @@ use o3::mem::quota::Admission;
 mod guard;
 pub(super) mod schedule;
 
-use std::pin;
+use std::marker;
 
 use dope::{
-    core::driver::{
-        retained,
-        route::Identity,
-        schedule::{app, ready},
-    },
+    core::driver::{self, route::Identity, schedule::app},
     manifold::network::listener::conn,
+    net::wire,
 };
 use sark_core::{
     body,
     decode::{self, request},
-    manifold::{schedule::Egress, task::app::Runtime},
-};
-
-use crate::{
-    conn::{Error, event},
-    server,
-    server::{
-        response::Handoff,
-        runtime::input,
-        state::Transitions,
-        task::{
-            app::{drive, header::admit},
-            registry, *,
-        },
+    manifold::{
+        schedule::Egress,
+        server::{app as semantic, drain},
+        task::app::Runtime,
     },
 };
 
-pub(super) struct Scope<'a, 'd, ID: Identity + 'd, R>
-where
-    R: Runtime<'d, Target = Target<'d, ID>>,
-{
-    pub(super) router: pin::Pin<&'a mut R>,
-    pub(super) tasks: &'a mut registry::Table<'d, ID, R::Task>,
-    pub(super) conn: conn::Id<'d, ID>,
-    pub(super) parent: ready::Target<'d>,
-    pub(super) index: &'a mut registry::Index,
-}
+use crate::{
+    conn::Error,
+    server::{
+        response::Handoff,
+        runtime::{app::Fault, input},
+        state::Transitions,
+        task::{
+            app::{drive, header::admit},
+            *,
+        },
+    },
+};
 
 #[derive(Clone, Copy)]
 pub(super) enum Availability {
@@ -72,99 +61,86 @@ pub(super) enum Outcome {
     Account,
 }
 
-pub(super) struct Turn<'a, 'state, 'work, 'owner, 'd: 'owner, ID: Identity + 'd, R, Q>
+pub(super) struct Turn<'a, 'state, 'work, 'd, ID: Identity + 'd, R, Q, W, A, P>
 where
     R: Runtime<'d, Target = Target<'d, ID>>,
+    A: service::Select<R> + semantic::Application<'d, service::Connection<'d, A>, conn::Id<'d, ID>>,
 {
-    scope: Scope<'a, 'd, ID, R>,
-    state: &'a mut Borrowed<'state, 'd, R>,
-    limits: server::Config,
-    mode: &'a mut Q,
+    drive: drive::Drive<'a, 'state, 'd, ID, R, Q, A::Fields>,
     work: app::Work<'work, 'd>,
-    driver: retained::Context<'a, 'owner, 'd>,
+    driver: driver::Context<'a, 'd>,
     ready: Ready,
+    service: &'a mut A,
+    service_state: &'a mut service::State<'d, ID, A>,
+    fault: &'a mut P,
+    wire: marker::PhantomData<fn() -> W>,
 }
 
-impl<'a, 'state, 'work, 'owner, 'd: 'owner, ID: Identity + 'd, R, Q>
-    Turn<'a, 'state, 'work, 'owner, 'd, ID, R, Q>
+impl<'a, 'state, 'work, 'd, ID: Identity + 'd, R, Q, W, A, P>
+    Turn<'a, 'state, 'work, 'd, ID, R, Q, W, A, P>
 where
     R: Runtime<'d, Target = Target<'d, ID>>,
+    A: service::Select<R> + semantic::Application<'d, service::Connection<'d, A>, conn::Id<'d, ID>>,
+    W: wire::Spec,
     Q: Transitions<conn::Id<'d, ID>>,
     Q::Retention: Handoff,
+    P: Fault<'d, W, A::Failure, ID, Build<A::Build>>,
 {
     pub(super) fn new(
-        scope: Scope<'a, 'd, ID, R>,
-        state: &'a mut Borrowed<'state, 'd, R>,
-        limits: server::Config,
-        mode: &'a mut Q,
+        drive: drive::Drive<'a, 'state, 'd, ID, R, Q, A::Fields>,
         work: app::Work<'work, 'd>,
-        driver: retained::Context<'a, 'owner, 'd>,
+        driver: driver::Context<'a, 'd>,
         ready: Ready,
+        service: &'a mut A,
+        service_state: &'a mut service::State<'d, ID, A>,
+        fault: &'a mut P,
     ) -> Self {
         Self {
-            scope,
-            state,
-            limits,
-            mode,
+            drive,
             work,
             driver,
             ready,
+            service,
+            service_state,
+            fault,
+            wire: marker::PhantomData,
         }
     }
 
-    fn build(&mut self) -> Admission<Result<Outcome, Error>> {
+    fn build(&mut self) -> Admission<Result<Outcome, semantic::Error<Error, A::Failure>>> {
         if matches!(self.ready.build, Availability::Idle) {
             return Admission::Empty;
         }
-        let Some(permit) = self.work.permit() else {
-            self.scope.parent.wake();
+        if self.work.permit().is_none() {
+            self.drive.parent.wake();
             return Admission::Exhausted;
-        };
-        Admission::Item(permit.run(|| {
-            let built = self
-                .state
-                .data()
-                .build()
-                .drive(body::DEFAULT_BUILD_STEP_BUDGET, |stream| {
-                    self.mode.body(identify(self.scope.conn, stream))
-                });
-            drive::Drive {
-                router: self.scope.router.as_mut(),
-                tasks: self.scope.tasks,
-                conn: self.scope.conn,
-                parent: self.scope.parent,
-                index: self.scope.index,
-                state: self.state,
-                limits: self.limits,
-                mode: self.mode,
-            }
-            .build(built);
-            Ok(Outcome::Wake)
-        }))
+        }
+        let built = self
+            .drive
+            .state
+            .data()
+            .build()
+            .drive(body::DEFAULT_BUILD_STEP_BUDGET, |stream| {
+                self.drive.mode.body(identify(self.drive.conn, stream))
+            });
+        self.drive.build(built);
+        Admission::Item(Ok(Outcome::Wake))
     }
 
-    fn task(&mut self) -> Admission<Result<Outcome, Error>> {
+    fn task(&mut self) -> Admission<Result<Outcome, semantic::Error<Error, A::Failure>>> {
         if matches!(self.ready.task, Availability::Idle) {
             return Admission::Empty;
         }
         if matches!(self.budget(), Budget::Spent) {
             return Admission::Exhausted;
         }
-        drive::Drive {
-            router: self.scope.router.as_mut(),
-            tasks: self.scope.tasks,
-            conn: self.scope.conn,
-            parent: self.scope.parent,
-            index: self.scope.index,
-            state: self.state,
-            limits: self.limits,
-            mode: self.mode,
-        }
-        .batch(self.work, &mut self.driver);
+        self.drive
+            .reborrow()
+            .batch::<A>(self.work, &mut self.driver, self.fault.response());
         Admission::Item(Ok(Outcome::Wake))
     }
 
-    fn ingress(&mut self) -> Admission<Result<Outcome, Error>>
+    fn ingress(&mut self) -> Admission<Result<Outcome, semantic::Error<Error, A::Failure>>>
     where
         <R::Head as request::Head>::Start: admit::Begin<'d, R>,
     {
@@ -174,65 +150,67 @@ where
         if matches!(self.budget(), Budget::Spent) {
             return Admission::Exhausted;
         }
-        let mut run = drive::Drive {
-            router: self.scope.router.as_mut(),
-            tasks: self.scope.tasks,
-            conn: self.scope.conn,
-            parent: self.scope.parent,
-            index: self.scope.index,
-            state: self.state,
-            limits: self.limits,
-            mode: self.mode,
-        };
+        let id = self.drive.conn;
+        let service = &mut *self.service;
+        let state = &mut *self.service_state;
+        let fault = &mut *self.fault;
+        let mut turn = semantic::Turn::new(id, self.work, self.drive.parent, &mut self.driver);
         let result = input::Read::new(
-            &mut run,
+            &mut self.drive,
             drive::Drive::connection,
-            |run: &mut drive::Drive<'_, '_, 'd, ID, R, Q>| run.drain(self.work),
+            |run: &mut drive::Drive<'_, '_, 'd, ID, R, Q, A::Fields>| {
+                run.drain::<A, W, P>(service, state, &mut turn, Egress::Unchanged, fault)
+            },
         )
-        .resume::<R::Plan, event::Retirement>();
-        let outcome = match result {
-            Ok(report) => {
-                if report.is_exhausted() {
-                    self.scope.parent.wake();
-                }
-                Ok(Outcome::Account)
-            }
-            Err(error)
+        .resume();
+        let outcome = match drain::Progress::error(result, self.drive.parent) {
+            None => Ok(Outcome::Account),
+            Some(semantic::Error::Connection(error))
                 if error.is_pressure()
-                    && self.state.connection.ingress().is_blocked()
-                    && (!self.state.connection.output().is_empty()
-                        || !self.state.build_ready.is_empty()) =>
+                    && self.drive.state.connection.ingress().is_blocked()
+                    && (!self.drive.state.connection.output().is_empty()
+                        || !self.drive.state.build_ready.is_empty()) =>
             {
                 Ok(Outcome::Wake)
             }
-            Err(error) => Err(error),
+            Some(error) => Err(error),
         };
         Admission::Item(outcome)
     }
 
-    fn egress(&mut self, pump: Pump) -> Admission<Result<Outcome, Error>> {
+    fn egress(
+        &mut self,
+        pump: Pump,
+    ) -> Admission<Result<Outcome, semantic::Error<Error, A::Failure>>> {
         if matches!(self.ready.output, Availability::Idle) {
             return Admission::Empty;
         }
         if matches!(self.budget(), Budget::Spent) {
             return Admission::Exhausted;
         }
+        let mut response = self.fault.response();
         let report = match pump {
-            Pump::Round => self.state.pump::<true, _, _, _>(
-                self.scope.router.as_mut(),
-                self.scope.conn,
-                self.limits,
+            Pump::Round => self.drive.state.pump::<true, _, _, _, A>(
+                self.drive.router.as_mut(),
+                self.drive.tasks,
+                self.drive.index,
+                self.drive.conn,
+                self.drive.limits,
                 Egress::Unchanged,
                 self.work,
-                self.mode,
+                self.drive.mode,
+                &mut response,
             ),
-            Pump::Single => self.state.pump::<false, _, _, _>(
-                self.scope.router.as_mut(),
-                self.scope.conn,
-                self.limits,
+            Pump::Single => self.drive.state.pump::<false, _, _, _, A>(
+                self.drive.router.as_mut(),
+                self.drive.tasks,
+                self.drive.index,
+                self.drive.conn,
+                self.drive.limits,
                 Egress::Unchanged,
                 self.work,
-                self.mode,
+                self.drive.mode,
+                &mut response,
             ),
         };
         if report.turns == 0 {
@@ -245,28 +223,22 @@ where
         }))
     }
 
-    fn admission(&mut self) -> Admission<Result<Outcome, Error>>
+    fn admission(&mut self) -> Admission<Result<Outcome, semantic::Error<Error, A::Failure>>>
     where
         R: decode::Guarded,
     {
-        if !self.state.can_admit() {
+        if !self.drive.state.can_admit() {
             return Admission::Empty;
         }
         if matches!(self.budget(), Budget::Spent) {
             return Admission::Exhausted;
         }
-        let result = admit::Admit::new(drive::Drive {
-            router: self.scope.router.as_mut(),
-            tasks: self.scope.tasks,
-            conn: self.scope.conn,
-            parent: self.scope.parent,
-            index: self.scope.index,
-            state: self.state,
-            limits: self.limits,
-            mode: self.mode,
-        })
-        .next();
-        Admission::Item(result.map(|()| Outcome::Wake))
+        let result = self.drive.reborrow().admit_next(self.fault.response());
+        Admission::Item(
+            result
+                .map(|()| Outcome::Wake)
+                .map_err(semantic::Error::Connection),
+        )
     }
 
     fn pump(&self) -> Pump {
@@ -277,7 +249,7 @@ where
     }
 
     fn guarded_pump(&mut self) -> Pump {
-        if self.state.can_admit() {
+        if self.drive.state.can_admit() {
             Pump::Round
         } else {
             self.pump()
@@ -288,7 +260,7 @@ where
         if self.work.remaining() != 0 {
             return Budget::Open;
         }
-        self.scope.parent.wake();
+        self.drive.parent.wake();
         Budget::Spent
     }
 }

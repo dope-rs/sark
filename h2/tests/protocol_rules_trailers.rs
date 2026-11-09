@@ -8,7 +8,7 @@ use common::{
 };
 use sark_h2::{
     ServerRole,
-    conn::{event::Event, machine::Connection},
+    conn::{config, event::Event, machine::Connection},
     frame::payload::Continuation,
     stream::Id,
 };
@@ -16,64 +16,83 @@ pub mod common;
 
 use sark_core::manifold::stream::{Boundary, Section};
 use sark_h2::{frame, frame::numbers::ErrorCode};
-use sark_http::field::metadata::map::record::Entry;
+use sark_http::field::metadata::{map::record::Entry, section::rules};
 
 #[test]
 fn accepts_trailers() {
-    let mut conn = Connection::<ServerRole>::try_new().expect("server fixture");
-    Session::new(&mut conn)
-        .try_prime()
-        .expect("protocol fixture");
-    let initial = Frame::new(
-        1,
-        &Request::new(&[]).try_encode().expect("protocol fixture"),
-    )
-    .try_headers(Boundary::More, frame::Block::End)
-    .expect("protocol wire fixture");
-    conn.ingress()
-        .ingest(&initial)
-        .expect("initial request HEADERS frame fits ingress");
-    assert!(matches!(
-        conn.ingress().poll_event(),
-        Some(Event::Headers { .. })
-    ));
-    conn.ingress()
-        .ingest(
-            &session::Frame::new(1, b"x")
-                .try_data(Boundary::More)
-                .expect("protocol wire fixture"),
-        )
-        .expect("request DATA frame fits ingress");
-    assert!(matches!(
-        conn.ingress().poll_event(),
-        Some(Event::Data { .. })
-    ));
-    conn.transfer().drain(usize::MAX);
-
-    let block = Fields::new(&[Entry::new(b"x-trailer", b"v")])
-        .try_encode()
-        .expect("protocol fixture");
-    let trailing = Frame::new(1, &block)
-        .try_headers(Boundary::End, frame::Block::End)
-        .expect("protocol wire fixture");
-    conn.ingress()
-        .ingest(&trailing)
-        .expect("trailing HEADERS frame fits ingress");
-    let ev = conn.ingress().poll_event().expect("trailing Headers event");
-    assert!(matches!(
-        ev,
-        Event::Headers {
-            section: Section::Trailing,
-            boundary: Boundary::End,
-            ..
+    for len in [991, 992] {
+        let plan = config::Validated::new(config::Config {
+            local_settings: config::Settings {
+                max_header_list_size: Some(1024),
+                ..config::Settings::DEFAULT
+            },
+            ..config::Config::default()
+        })
+        .expect("header limits");
+        let mut conn = Connection::<ServerRole, rules::RetainRaw<26>>::from_plan(plan)
+            .expect("prefixed header storage");
+        Session::new(&mut conn).try_prime().expect("preface");
+        let initial = Request::new(&[]).try_encode().expect("request head");
+        conn.ingress()
+            .ingest(
+                &Frame::new(1, &initial)
+                    .try_headers(Boundary::More, frame::Block::End)
+                    .expect("request frame"),
+            )
+            .expect("request admission");
+        assert!(matches!(
+            conn.ingress().poll_event(),
+            Some(Event::Headers { .. })
+        ));
+        conn.ingress()
+            .ingest(
+                &Frame::new(1, b"x")
+                    .try_data(Boundary::More)
+                    .expect("request DATA frame"),
+            )
+            .expect("request DATA admission");
+        assert!(matches!(
+            conn.ingress().poll_event(),
+            Some(Event::Data { .. })
+        ));
+        conn.transfer().drain(usize::MAX);
+        let value = vec![b'a'; len];
+        let fields = Fields::new(&[Entry::new(b"x", &value)]).encode_never();
+        conn.ingress()
+            .ingest(
+                &Frame::new(1, &fields)
+                    .try_headers(Boundary::End, frame::Block::End)
+                    .expect("trailer frame"),
+            )
+            .expect("trailer admission");
+        let event = conn.ingress().poll_event();
+        if len == 991 {
+            assert!(matches!(
+                event,
+                Some(Event::Headers {
+                    head,
+                    section: Section::Trailing,
+                    boundary: Boundary::End,
+                    ..
+                }) if head.fields().get(b"x") == Some(value.as_slice())
+            ));
+            assert!(
+                Wire::new(conn.output().first())
+                    .try_reset()
+                    .expect("protocol wire fixture")
+                    .is_none()
+            );
+        } else {
+            assert!(matches!(
+                event,
+                Some(Event::StreamReset {
+                    error: ErrorCode::ProtocolError,
+                    validation: Some(rejected),
+                    ..
+                }) if rejected.admit == sark_h2::hpack::decode::limit::Admission::Exceeded
+            ));
         }
-    ));
-    assert!(
-        Wire::new(conn.output().first())
-            .try_reset()
-            .expect("protocol wire fixture")
-            .is_none()
-    );
+    }
 }
 
 #[test]

@@ -1,5 +1,6 @@
 use common::client::recover;
 use common::client::{
+    config::{Config as _, FLAVORS},
     response::framing::{self, BODY, CHUNK, CHUNKS, SEGMENT},
     runtime::peer,
 };
@@ -67,74 +68,35 @@ fn preserves_segments() {
         |server| {
             let addr = server.addr();
 
-            let (status, segments, joined) = Request::new(
-                Flavor::Fixed,
-                &(addr).to_string(),
-                Config::try_new("127.0.0.1").expect("HTTP host allocation"),
-                Method::GET,
-                "/scoped-chunked",
-                &[],
-                &[],
-            )
-            .try_scoped(
-                |result| {
-                    let response = result.expect("scoped response");
-                    (
-                        response.status().as_u16(),
-                        response
-                            .body()
-                            .segments()
-                            .map(<[u8]>::to_vec)
-                            .collect::<Vec<_>>(),
-                        response.body().contiguous().is_some(),
-                    )
-                },
-                recovery::Policy::new(
-                    |event| std::assert_matches!(event, Reclaimed::Shutdown),
-                    recover,
-                ),
-                |result| result.expect("client execution"),
-            )
-            .expect("client scenario");
-
-            assert_eq!(status, 200);
-            assert_eq!(segments.len(), 2);
-            assert_eq!(segments[0], vec![b'a'; SEGMENT]);
-            assert_eq!(segments[1], vec![b'b'; SEGMENT]);
-            assert!(!joined, "fragmented scoped response must not be joined");
-
-            let (next, parts, merged) = Request::new(
-                Flavor::OnDemand,
-                "",
-                Config::new(server.addr().to_string()),
-                Method::GET,
-                "/scoped-chunked",
-                &[],
-                &[],
-            )
-            .try_scoped(
-                |result| {
-                    let response = result.expect("scoped response");
-                    (
-                        response.status().as_u16(),
-                        response
-                            .body()
-                            .segments()
-                            .map(<[u8]>::to_vec)
-                            .collect::<Vec<_>>(),
-                        response.body().contiguous().is_some(),
-                    )
-                },
-                recovery::Policy::new(
-                    |event| std::assert_matches!(event, Reclaimed::Shutdown),
-                    recover,
-                ),
-                |result| result.expect("client execution"),
-            )
-            .expect("client scenario");
-            assert_eq!(next, status);
-            assert_eq!(parts, segments);
-            assert_eq!(merged, joined);
+            for flavor in FLAVORS {
+                Request::new(
+                    flavor,
+                    &addr.to_string(),
+                    flavor.try_config(addr).expect("HTTP host allocation"),
+                    Method::GET,
+                    "/scoped-chunked",
+                    &[],
+                    &[],
+                )
+                .try_scoped(
+                    |result| {
+                        let response = result.expect("scoped response");
+                        assert_eq!(response.status().as_u16(), 200);
+                        assert_eq!(response.body().segments().len(), 2);
+                        assert!(response.body().contiguous().is_none());
+                        for (segment, expected) in response.body().segments().zip([b'a', b'b']) {
+                            assert_eq!(segment.len(), SEGMENT);
+                            assert!(segment.iter().all(|byte| *byte == expected));
+                        }
+                    },
+                    recovery::Policy::new(
+                        |event| std::assert_matches!(event, Reclaimed::Shutdown),
+                        recover,
+                    ),
+                    |result| result.expect("client execution"),
+                )
+                .expect("client scenario");
+            }
             server
                 .stop()
                 .expect("peer thread")
@@ -249,57 +211,34 @@ fn decodes_trailers() {
         |server| {
             let addr = server.addr();
 
-            let resp = Request::new(
-                Flavor::Fixed,
-                &(addr).to_string(),
-                Config::try_new("127.0.0.1").expect("HTTP host allocation"),
-                Method::GET,
-                "/chunked-trailers",
-                &[],
-                &[],
-            )
-            .try_run(
-                |result| result.expect("HTTP response"),
-                recovery::Policy::new(
-                    |event| std::assert_matches!(event, Reclaimed::Shutdown),
-                    recover,
-                ),
-                |result| result.expect("client execution"),
-            )
-            .expect("HTTP request execution");
-            assert_eq!(resp.status().as_u16(), 200);
-            let body = str::from_utf8(resp.body().as_slice()).expect("utf8 body");
-            assert_eq!(body, "abcdef");
-            let fields = resp.trailers().expect("chunked response trailers");
-            assert_eq!(fields.get("x-checksum").expect("checksum trailer"), b"42");
-
-            let dynamic = Request::new(
-                Flavor::OnDemand,
-                "",
-                Config::new(server.addr().to_string()),
-                Method::GET,
-                "/chunked-trailers",
-                &[],
-                &[],
-            )
-            .try_run(
-                |result| result.expect("HTTP response"),
-                recovery::Policy::new(
-                    |event| std::assert_matches!(event, Reclaimed::Shutdown),
-                    recover,
-                ),
-                |result| result.expect("client execution"),
-            )
-            .expect("HTTP request execution");
-            assert_eq!(dynamic.status(), resp.status());
-            assert_eq!(dynamic.body().as_slice(), resp.body().as_slice());
-            assert_eq!(
-                dynamic
-                    .trailers()
-                    .expect("on-demand chunked response trailers")
-                    .get("x-checksum"),
-                fields.get("x-checksum")
-            );
+            let [resp, dynamic] = FLAVORS.map(|flavor| {
+                Request::new(
+                    flavor,
+                    &addr.to_string(),
+                    flavor.try_config(addr).expect("HTTP host allocation"),
+                    Method::GET,
+                    "/chunked-trailers",
+                    &[],
+                    &[],
+                )
+                .try_run(
+                    |result| result.expect("HTTP response"),
+                    recovery::Policy::new(
+                        |event| std::assert_matches!(event, Reclaimed::Shutdown),
+                        recover,
+                    ),
+                    |result| result.expect("client execution"),
+                )
+                .expect("HTTP request execution")
+            });
+            for response in [&resp, &dynamic] {
+                assert_eq!(response.status().as_u16(), 200);
+                assert_eq!(response.body().as_slice(), b"abcdef");
+                assert_eq!(
+                    response.trailers().expect("chunked response trailers").get("x-checksum"),
+                    Some(b"42".as_slice())
+                );
+            }
 
             let (status, body, trailers, info) = Reader::new(
                 addr,

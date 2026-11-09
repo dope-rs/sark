@@ -16,13 +16,16 @@ use sark_h3::{conn::options, manifold::server::deadline};
 /// Checks responses, lifecycle accounting, and native receive-route teardown.
 fn run<'a>(scenario: Scenario<'a>, protocol: options::Config) {
     scenario.try_run_with(
+        common::server::h3::sessions::plain,
         protocol,
+        None,
         Disabled,
         deadline::Disabled,
         |error: Recovery<'_, '_>| -> Infallible {
             panic!("connection recovery: {:?}", error.cause())
         },
         |error| panic!("server diagnostic: {error:?}"),
+        sark_core::life::mode::Observed::new,
         |outcome| outcome.unwrap_or_else(|error| panic!("scenario failed: {error:?}")),
     );
 }

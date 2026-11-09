@@ -39,6 +39,10 @@ fn exchange_lifetime() {
             }))
     );
 
+    assert!(
+        timeline.transition(config, timeline::Transition::Open, 1, add)
+            == deadline::Mutation::Unchanged
+    );
     timeline.transition(config, timeline::Transition::HeadAdmitted, 1, add);
     assert!(
         (timeline.next())

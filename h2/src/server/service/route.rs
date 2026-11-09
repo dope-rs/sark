@@ -133,8 +133,7 @@ impl<H: Handler> decode::Decode for Route<H> {
             let request = Request::new(&head, body.into_inner());
             let prepared = Immediate::emit(self.handler.handle(request), encoder)
                 .map_err(|(error, encoder)| (dispatch::Error::Encode(error), encoder))?;
-            let (prepared, _) = decode::Lineage::resolve_head(prepared, head);
-            Ok(prepared)
+            Ok(decode::Lineage::resolve_head(prepared, head))
         })
     }
 }

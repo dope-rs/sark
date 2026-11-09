@@ -21,6 +21,8 @@ fn scalar_rejection() {
         b" -123456789012345678901234567890,",
         b" 1.23456789012345678901234567890,",
         b" 1e123456789012345678901234567890,",
+        b" -1.5,",
+        b" -1e0,",
     ] {
         let mut index = 1;
         assert!(matches!(input.parse_u64(&mut index), Err(Error::Invalid)));

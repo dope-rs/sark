@@ -50,4 +50,4 @@ pub enum Error {
     },
 }
 
-const _: () = assert!(mem::size_of::<Error>() == 5 * mem::size_of::<usize>());
+const _: () = assert!(mem::size_of::<Error>() == 4 * mem::size_of::<usize>());

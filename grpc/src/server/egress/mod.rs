@@ -54,7 +54,6 @@ pub(in crate::server) struct Store<K: manifold::raw::Key> {
     credits: credits::Ledger,
     wire_limit: usize,
     message_limit: capacity::Count,
-    message_capacity: usize,
     active: usize,
 }
 
@@ -71,7 +70,6 @@ impl<K: manifold::raw::Key> Store<K> {
             credits: credits::Ledger::default(),
             wire_limit: bytes,
             message_limit: limit,
-            message_capacity: messages.get(),
             active: 0,
         })
     }
@@ -155,7 +153,7 @@ impl<K: manifold::raw::Key> Store<K> {
     pub(super) fn is_quiescent(&self) -> bool {
         self.active == 0
             && self.credits.used() == 0
-            && self.lanes.available() == self.message_capacity
+            && self.lanes.available() == self.lanes.capacity()
     }
 
     pub(super) fn control<W>(

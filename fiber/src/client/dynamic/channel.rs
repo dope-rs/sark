@@ -19,7 +19,7 @@ use dope::{
         },
     },
     net::{
-        link::{egress::metadata::arena, event},
+        link::egress::metadata::arena,
         tcp,
         wire::{self, domain},
     },
@@ -52,7 +52,7 @@ const _: () =
 pub(in crate::client) enum Failure {
     IdentityExhausted,
     Activation(net::Open),
-    Attempt(event::ConnectFault),
+    Attempt(attempt::ConnectFault),
 }
 
 impl<M> From<Failure> for connect::Error<M> {
@@ -163,9 +163,10 @@ impl<ID: Identity> Plan<ID> {
 impl<'o, 'q, 'e, 'b, 'c, 'd, ID: Identity> Port<'o, 'q, 'e, 'b, 'c, 'd, ID> {
     pub(in crate::client::dynamic) fn reclaim(&self, outcome: Outcome<'d, ID>) {
         if let Outcome::Connected(conn) = outcome {
-            self.protocol
-                .io
-                .close(conn, close::Reason::Local(close::LocalOrigin::Superseded));
+            self.protocol.io.close(
+                conn,
+                close::Directive::reconnect(close::Reason::Local(close::LocalOrigin::Superseded)),
+            );
         }
     }
 

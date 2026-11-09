@@ -5,9 +5,6 @@ use std::{
     io::{self, Read as _},
     net::TcpListener,
     pin::Pin,
-    sync::mpsc,
-    thread,
-    time::Duration,
 };
 
 use common::{
@@ -19,7 +16,11 @@ use dope::core::driver::life::recovery;
 use dope_fiber::{abi::poll_fn, context};
 use dope_test::{
     fibers::Wait,
-    harness::{observe::Trace, signals::Gate},
+    harness::{
+        observe::Trace,
+        scenario::run::{Entry, Task as _},
+        signals::Gate,
+    },
 };
 use sark_ws::client::{self, channel, mode};
 
@@ -27,8 +28,7 @@ use sark_ws::client::{self, channel, mode};
 fn selected_stops_redial() {
     let listener = TcpListener::bind("127.0.0.1:0").expect("listener");
     let address = listener.local_addr().expect("listener address");
-    let (release, wait) = mpsc::channel();
-    let peer = thread::spawn(move || {
+    let peer = Entry(move || {
         let (first, _) = listener.accept().expect("first connection");
         let head = app::Upgrade::new(&first).try_head().expect("first head");
         let (mut second, _) = listener.accept().expect("second connection");
@@ -36,8 +36,8 @@ fn selected_stops_redial() {
         app::Upgrade::new(&first)
             .try_respond(&app::Head::new(&head).try_accept().expect("first key"))
             .expect("first upgrade");
-        wait.recv_timeout(Duration::from_secs(3))
-            .expect("first selected");
+        let (_, opcode, data) = first.try_client(&mut Vec::new()).expect("selected send");
+        assert_eq!((opcode, data.as_slice()), (1, b"selected".as_slice()));
         app::Upgrade::new(&second)
             .try_respond(&app::Head::new(&next).try_accept().expect("second key"))
             .expect("second upgrade");
@@ -50,55 +50,57 @@ fn selected_stops_redial() {
         );
     });
 
-    let events = Trace::new();
-    let closed = Gate::new();
-    let config = client::Config::new("localhost", "/").expect("configuration");
-    topology::Plan::new(address, config, 2, 1)
-        .enter(
-            |domain| {
-                domain.run(
-                    channel::App::<_, mode::Egress>::new(Borrowed {
-                        events: &events,
-                        closed: &closed,
-                        message: &|_| {},
-                    }),
-                    |mut app| {
-                        let handle = app.client();
-                        let mut send = handle.try_driver().expect("exclusive sender");
-                        let opening = poll_fn(|cx: Pin<&mut context::Context<'_, '_>>| {
-                            send.poll_active(cx.as_ref().completion())
-                        });
-                        app.drive_within(opening)
-                            .expect("opening driver")
-                            .expect("opening wake")
-                            .expect("selected connection");
-                        release.send(()).expect("release second upgrade");
-                        assert_eq!(
-                            app.try_until(&closed, 1).expect("second retirement"),
-                            Wait::Reached
-                        );
-                        app.pause(Duration::from_millis(50))
-                            .expect("stable selection");
-                        app.drive(handle.send_text("retained"))
-                            .expect("send driver")
-                            .expect("selected send");
-                        assert_eq!(
-                            app.try_until(&closed, 2).expect("peer completed send"),
-                            Wait::Reached
-                        );
-                    },
-                )
-            },
-            recovery::Policy::new(
-                |_| {},
-                |failure: recovery::Recovery<'_, '_>| -> Infallible {
-                    panic!("{:?}", failure.cause())
+    peer.with(|| {
+        let events = Trace::new();
+        let closed = Gate::new();
+        let config = client::Config::new("localhost", "/").expect("configuration");
+        topology::Plan::new(address, config, 2, 1)
+            .enter(
+                |domain| {
+                    domain.run(
+                        channel::App::<_, mode::Egress>::new(Borrowed {
+                            events: &events,
+                            closed: &closed,
+                            message: &|_| {},
+                        }),
+                        |mut app| {
+                            let handle = app.client();
+                            let mut send = handle.try_driver().expect("exclusive sender");
+                            let opening = poll_fn(|cx: Pin<&mut context::Context<'_, '_>>| {
+                                send.poll_active(cx.as_ref().completion())
+                            });
+                            app.drive_within(opening)
+                                .expect("opening driver")
+                                .expect("opening wake")
+                                .expect("selected connection");
+                            app.drive(handle.send_text("selected"))
+                                .expect("send driver")
+                                .expect("selected send");
+                            assert_eq!(
+                                app.try_until(&closed, 1).expect("second retirement"),
+                                Wait::Reached
+                            );
+                            app.drive(handle.send_text("retained"))
+                                .expect("send driver")
+                                .expect("selected send");
+                            assert_eq!(
+                                app.try_until(&closed, 2).expect("peer completed send"),
+                                Wait::Reached
+                            );
+                        },
+                    )
                 },
-            ),
-            |result| result.expect("client execution"),
-        )
-        .as_ref()
-        .map_err(|error| error.kind())
-        .expect("client setup");
-    peer.join().expect("peer");
+                recovery::Policy::new(
+                    |_| {},
+                    |failure: recovery::Recovery<'_, '_>| -> Infallible {
+                        panic!("{:?}", failure.cause())
+                    },
+                ),
+                |result| result.expect("client execution"),
+            )
+            .as_ref()
+            .map_err(|error| error.kind())
+            .expect("client setup");
+    })
+    .expect("peer");
 }

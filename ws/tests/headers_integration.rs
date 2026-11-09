@@ -1,7 +1,8 @@
-use std::{net::TcpListener, str, sync::mpsc, thread, time::Duration};
+use std::{io::Read, net::TcpListener, str};
 
 use common::{app, client::Probe, upgrade::OWNED_HEADERS};
 use dope::core::{driver::life::recovery, io::Reclaimed};
+use dope_test::harness::scenario::run::{Entry, Task as _};
 use sark_http::field;
 use sark_ws::{client, client::headers};
 
@@ -81,51 +82,38 @@ fn owned_headers_are_unique() {
     {
         let sock = TcpListener::bind("127.0.0.1:0").expect("bind handshake probe");
         let addr = sock.local_addr().expect("handshake probe address");
-        let (tx, rx) = mpsc::channel();
-        let server = thread::spawn(move || {
-            let (stream, _) = sock.accept().expect("accept handshake probe");
+        let ((), req) = Entry(move || {
+            let (mut stream, _) = sock.accept().expect("accept handshake probe");
             let req = app::Upgrade::new(&stream).try_head().expect("request head");
             app::Upgrade::new(&stream)
                 .try_respond(&app::Head::new(&req).try_accept().expect("opening accept"))
                 .expect("opening response");
-            rx.recv_timeout(Duration::from_secs(3))
-                .expect("client completed handshake");
+            while stream.read(&mut [0; 64]).expect("client close") != 0 {}
             req
-        });
-
-        let config = {
-            let agent = String::from("sark\tcafé");
-            let name = String::from("X-Configured");
-            let value = String::from("config");
-            let config = client::Config::new("[::1]:443", "/ws/%2F?q=%0D%0A");
-            let config = config.expect("endpoint");
-            let config = config.user_agent(agent.as_str());
-            let config = config.expect("agent");
-            let config = config.with_header(name.as_str(), value.as_str());
-            let config = config.expect("header");
-            let config = config.with_header("X-Removed", "gone");
-            config.expect("header")
-        };
-        let probe =
-            Probe::new(addr, config).with_headers(vec![("X-Dynamic".into(), "handler".into())]);
-        let probe = probe.expect("headers");
-        let result = probe.omit(vec!["x-removed".into()]).open(
-            |result| {
-                result
-                    .as_ref()
-                    .map_err(|cause| cause.cause())
-                    .expect("opening");
-            },
-            recovery::Policy::new(|event| retired.push(event), common::recover),
-            |result| result.expect("WebSocket probe"),
-        );
-        result
-            .as_ref()
-            .map_err(|cause| cause.kind())
-            .expect("topology");
-        drop(result);
-        tx.send(()).expect("release handshake probe");
-        let req = server.join().expect("handshake probe");
+        })
+        .with(|| {
+            let config = {
+                let agent = String::from("sark\tcafé");
+                let name = String::from("X-Configured");
+                let value = String::from("config");
+                let config = client::Config::new("[::1]:443", "/ws/%2F?q=%0D%0A");
+                let config = config.expect("endpoint");
+                let config = config.user_agent(agent.as_str());
+                let config = config.expect("agent");
+                let config = config.with_header(name.as_str(), value.as_str());
+                let config = config.expect("header");
+                let config = config.with_header("X-Removed", "gone");
+                config.expect("header")
+            };
+            let probe =
+                Probe::new(addr, config).with_headers(vec![("X-Dynamic".into(), "handler".into())]);
+            let probe = probe.expect("headers");
+            drop(probe.omit(vec!["x-removed".into()]).run(
+                common::client::Goal::Open,
+                recovery::Policy::new(|event| retired.push(event), common::recover),
+            ));
+        })
+        .expect("handshake probe");
         let req = str::from_utf8(&req).expect("ASCII handshake request");
         assert!(req.starts_with("GET /ws/%2F?q=%0D%0A HTTP/1.1\r\nHost: [::1]:443\r\n"));
         assert!(req.contains("\r\nUser-Agent: sark\tcafé\r\n"));

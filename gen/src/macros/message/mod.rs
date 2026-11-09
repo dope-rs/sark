@@ -27,7 +27,7 @@ impl Message {
     }
 
     pub(crate) fn expand(self) -> syn::Result<proc_macro2::TokenStream> {
-        let root = runtime::grpc()?;
+        let root = runtime::require("sark-grpc", "Message")?;
         let name = &self.input.ident;
         let lifetime = types::Generics::new(self.input.generics.clone()).lifetime("a");
         let (generics, args, clause) = self.input.generics.split_for_impl();

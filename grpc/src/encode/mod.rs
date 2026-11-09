@@ -80,9 +80,9 @@ impl Sink for pool::Span {
     ) -> Result<Self::Output, Status> {
         self.truncate(0);
         let frozen = match source {
-            Some(source) => pool::Copy::try_new(source, self)
-                .map_err(|error| Status::capacity(Reason::RetainedCapacity, error))?
-                .commit(),
+            Some(source) => self
+                .try_copy(source)
+                .map_err(|error| Status::capacity(Reason::RetainedCapacity, error))?,
             None => self.freeze(),
         };
         Ok(frozen.into_shared())

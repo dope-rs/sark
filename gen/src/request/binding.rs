@@ -38,6 +38,12 @@ fn defaults(
             let lit = LitInt::new(&format!("{n}usize"), default.span());
             quote::quote! { #lit }
         }
+        types::ValueKind::Encoding => {
+            return Err(syn::Error::new_spanned(
+                default,
+                "AcceptEncoding has no default",
+            ));
+        }
         types::ValueKind::Bool => {
             use syn::LitBool;
             let b = if raw == "true" {
@@ -75,9 +81,7 @@ fn field(
                 types::ValueKind::Bytes => {
                     "non-Option request header/query Shared fields require default = \"...\""
                 }
-                types::ValueKind::Usize | types::ValueKind::U64 | types::ValueKind::Bool => {
-                    "non-Option request header/query typed fields require default = \"...\""
-                }
+                _ => "non-Option request header/query typed fields require default = \"...\"",
             };
             syn::Error::new_spanned(ty, message)
         })?;
@@ -110,13 +114,8 @@ fn field(
                     }
                 }
             }
-            (types::ValueKind::Usize | types::ValueKind::U64 | types::ValueKind::Bool, None) => {
-                quote::quote! { #ident }
-            }
-            (
-                types::ValueKind::Usize | types::ValueKind::U64 | types::ValueKind::Bool,
-                Some(fallback),
-            ) => {
+            (_, None) => quote::quote! { #ident },
+            (_, Some(fallback)) => {
                 quote::quote! {
                     match #ident {
                         ::core::option::Option::Some(#value) => #value,

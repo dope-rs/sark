@@ -78,47 +78,72 @@ fn retains_failed_owner() {
 
 #[test]
 fn rejects_ready_before_input_end_on_retry() {
-    Account::new().scope(|mut ledger| {
-        let valid = Cell::new(true);
-        let pool = pool::Pool::try_new(1, 8).expect("one input slot");
-        let source = pool
-            .try_copy(BYTES)
-            .expect("input fits")
-            .expect("vacant slot");
-        let open = Track::try_start(BYTES.len()).expect("admitted body");
-        let segment = owned::Segment::from(resident::Shared::from(source.into_shared()));
-        let (buffered, pushed) = open.retain(segment, &mut ledger);
-        assert!(matches!(pushed, buffered::Push::Accepted));
-        let mut stream = buffered
-            .try_stream(Ready::new(Ok(()), &valid), Boundary::More, Checked::new)
-            .map_err(Rejected::discard)
-            .expect("retained input becomes a stream");
-        let mut evidence = Trace::default();
-        for _ in 0..2 {
-            let Drive::Rejected {
-                stream: next,
-                error: body::Error::InputIncomplete,
-            } = stream.try_step(&mut ledger, &mut evidence, NonZero::<usize>::MIN)
-            else {
-                panic!("ready output requires finished input");
+    for boundary in [Boundary::More, Boundary::End] {
+        Account::new().scope(|mut ledger| {
+            let valid = Cell::new(true);
+            let pool = pool::Pool::try_new(1, 8).expect("one input slot");
+            let source = pool
+                .try_copy(BYTES)
+                .expect("input fits")
+                .expect("vacant slot");
+            let open = Track::try_start(BYTES.len()).expect("admitted body");
+            let segment = owned::Segment::from(resident::Shared::from(source.into_shared()));
+            let (buffered, pushed) = open.retain(segment, &mut ledger);
+            assert!(matches!(pushed, buffered::Push::Accepted));
+            let mut build = Ready::new(Ok(()), &valid);
+            if boundary == Boundary::End {
+                build.released = credit::Amount::new(4, segments::Count::ONE);
+            }
+            let stream = buffered
+                .try_stream(build, boundary, Checked::new)
+                .map_err(Rejected::discard)
+                .expect("retained input becomes a stream");
+            let mut evidence = Trace::default();
+            let stream = match stream.try_step(&mut ledger, &mut evidence, NonZero::<usize>::MIN) {
+                Drive::Rejected {
+                    stream,
+                    error: body::Error::InputIncomplete,
+                } if boundary == Boundary::More => stream,
+                Drive::Failed { stream, error } if boundary == Boundary::End => {
+                    assert_eq!(
+                        error,
+                        flow::Error::Credit(credit::Error::ByteUnderflow {
+                            scope: credit::Scope::Request,
+                            current: 3,
+                            removed: 4,
+                        })
+                    );
+                    stream
+                }
+                _ => panic!("incorrect failure"),
             };
-            stream = next;
-        }
-        assert!(evidence.changes.is_empty());
-        assert_eq!(ledger.retained(), CREDIT);
-        assert_eq!(pool.available(), 0);
-        assert!(matches!(
-            stream.discard(&mut ledger, &mut evidence),
-            credit::Discard::Applied
-        ));
-        assert_eq!(pool.available(), 1);
-        assert!(ledger.retained().is_empty());
-        assert!(
-            evidence.changes
-                == [credit::Mutation::Released {
-                    credit: CREDIT,
-                    disposition: credit::Disposition::Discarded,
-                }]
-        );
-    });
+            assert!(evidence.changes.is_empty());
+            assert_eq!(ledger.retained(), CREDIT);
+            assert_eq!(pool.available(), 0);
+            let release = match stream.try_step(&mut ledger, &mut evidence, NonZero::<usize>::MIN) {
+                Drive::Rejected {
+                    stream,
+                    error: body::Error::InputIncomplete,
+                } if boundary == Boundary::More => stream.into_release(),
+                Drive::Ready(ready) if boundary == Boundary::End => {
+                    assert!(evidence.changes == [credit::Mutation::BuildReady]);
+                    ready.into_release()
+                }
+                _ => panic!("incorrect retry"),
+            };
+            assert!(matches!(
+                release.try_discard(&mut ledger, &mut evidence),
+                credit::Discard::Applied
+            ));
+            assert_eq!(pool.available(), 1);
+            assert!(ledger.retained().is_empty());
+            assert!(
+                evidence.changes[usize::from(boundary == Boundary::End)..]
+                    == [credit::Mutation::Released {
+                        credit: CREDIT,
+                        disposition: credit::Disposition::Discarded,
+                    }]
+            );
+        });
+    }
 }

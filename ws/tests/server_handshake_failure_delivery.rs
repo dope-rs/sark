@@ -83,7 +83,7 @@ fn rejection_cause_once() {
             for request in [BAD_KEY, BAD_PATH] {
                 let mut socket = TcpStream::try_socket(bind).expect("peer");
                 socket.write_all(request).expect("request");
-                let (head, _) = socket.try_head().expect("rejection");
+                let (head, _) = socket.try_head(&mut Vec::new()).expect("rejection");
                 assert!(head.starts_with(b"HTTP/1.1 400"));
             }
             for (fields, status) in [
@@ -96,7 +96,7 @@ fn rejection_cause_once() {
             ] {
                 let mut socket = TcpStream::try_socket(bind).expect("peer");
                 socket.write_all(&with_headers(fields)).expect("opening");
-                let (head, _) = socket.try_head().expect("rejection");
+                let (head, _) = socket.try_head(&mut Vec::new()).expect("rejection");
                 assert!(head.starts_with(status));
             }
         },
@@ -156,7 +156,7 @@ fn opening_policy_preserves_borrowed_fields_and_rejects_before_frames() {
                     let mut request = with_headers(fields);
                     request.extend(b"tail".try_masked(0x2, true).expect("coalesced frame"));
                     socket.write_all(&request).expect("opening and frame");
-                    let (head, tail) = socket.try_head().expect("opening response");
+                    let (head, tail) = socket.try_head(&mut Vec::new()).expect("opening response");
                     assert!(head.starts_with(if allowed {
                         b"HTTP/1.1 101"
                     } else {

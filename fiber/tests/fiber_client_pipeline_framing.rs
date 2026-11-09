@@ -127,6 +127,7 @@ fn orders_informational() {
             let dynamic = origins::Plan::new(Config::new(server.addr().to_string()), 2, 1, 2)
                 .expect("dynamic client plan")
                 .enter(
+                    (),
                     |mut app| {
                         app.app
                             .block_on(app.handle.collect_with(

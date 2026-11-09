@@ -9,10 +9,7 @@ use dope::{
     net::link::{egress::reserve::exact, event},
 };
 use o3::{
-    depot::{
-        arena::pool::{Shared, shared},
-        queue::indexed::lanes::entry,
-    },
+    depot::{arena::pool::Shared, queue::indexed::lanes::entry},
     mem::rc,
 };
 
@@ -44,15 +41,11 @@ pub enum Kind {
 ///
 /// The cause cannot outlive the domain-local store that admitted it.
 #[repr(transparent)]
-pub struct Cause<'owner, E = Infallible>(
-    Shared<'owner, shared::Resident<E>, shared::Header<E>, shared::Initialized>,
-);
+pub struct Cause<'owner, E = Infallible>(Shared<'owner, E>);
 
 impl<'owner, E> Cause<'owner, E> {
     #[doc(hidden)]
-    pub const fn new(
-        lease: Shared<'owner, shared::Resident<E>, shared::Header<E>, shared::Initialized>,
-    ) -> Self {
+    pub const fn new(lease: Shared<'owner, E>) -> Self {
         Self(lease)
     }
 }

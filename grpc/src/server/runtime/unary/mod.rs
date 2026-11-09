@@ -1,6 +1,6 @@
 //! Unary tasks over one exact driver-domain scheduler.
 use dope::{
-    core::driver::{retained, route::KeyTag, schedule::app::Work},
+    core::driver::{self, route::KeyTag, schedule::app::Work},
     manifold::network::listener::conn::Id,
 };
 use dope_fiber::task::storage::set::group;
@@ -77,7 +77,7 @@ where
 
     fn request<W: Write>(
         &mut self,
-        turn: &mut app::Turn<'_, '_, '_, '_, 'd, Id<'d, KeyTag<0>>>,
+        turn: &mut app::Turn<'_, '_, '_, 'd, Id<'d, KeyTag<0>>>,
         target: active::Entry<'r>,
         state: &mut call::Handler<(), Self::State>,
         input: service::Request<'_, resident::Shared<'d>>,
@@ -137,7 +137,7 @@ where
         &mut self,
         owner: Id<'d, KeyTag<0>>,
         work: Work<'_, 'd>,
-        driver: &mut retained::Context<'_, '_, 'd>,
+        driver: &mut driver::Context<'_, 'd>,
     ) -> policy::TaskState {
         self.tasks.drive_with(owner, work, driver, |_, _| {});
         self.task_state(owner)

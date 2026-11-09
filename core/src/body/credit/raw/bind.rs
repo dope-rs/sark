@@ -1,4 +1,4 @@
-use crate::body::{self, buffered, credit, flow, ingress, stream};
+use crate::body::{self, buffered, credit, ingress, stream};
 
 // SAFETY: only the account proof changes; the exact amount remains owned once.
 unsafe impl<O: credit::Origin> credit::raw::Bind for credit::Release<O> {
@@ -20,19 +20,6 @@ unsafe impl<O: credit::Origin> credit::raw::Bind for ingress::State<O> {
             track: self.track,
             credit: self.credit,
             origin,
-        }
-    }
-}
-
-// SAFETY: the finished track and all its credit remain in the same owner.
-unsafe impl<O: credit::Origin> credit::raw::Bind for ingress::Finished<O> {
-    type Origin = O;
-    type Bound<Q: credit::Origin> = ingress::Finished<Q>;
-
-    unsafe fn bind<Q: credit::Origin>(self, origin: Q) -> Self::Bound<Q> {
-        // SAFETY: the caller authenticates the enclosing finished owner's account.
-        ingress::Finished {
-            state: unsafe { self.state.bind(origin) },
         }
     }
 }
@@ -92,20 +79,5 @@ unsafe impl<'d, B: body::Build<'d>, O: credit::Origin> credit::raw::Bind
     unsafe fn bind<Q: credit::Origin>(self, origin: Q) -> Self::Bound<Q> {
         // SAFETY: the caller authenticates this exact stream's persistent custody.
         stream::Stream::from_parts(unsafe { self.state.bind(origin) }, self.flow)
-    }
-}
-
-// SAFETY: the finished owner and built output move unchanged with the new proof.
-unsafe impl<'d, B: body::Build<'d>, O: credit::Origin> credit::raw::Bind for flow::Ready<'d, B, O> {
-    type Origin = O;
-    type Bound<Q: credit::Origin> = flow::Ready<'d, B, Q>;
-
-    unsafe fn bind<Q: credit::Origin>(self, origin: Q) -> Self::Bound<Q> {
-        flow::Ready {
-            // SAFETY: this is the exact ingress retained by the authenticated output.
-            state: unsafe { self.state.bind(origin) },
-            output: self.output,
-            lifetime: self.lifetime,
-        }
     }
 }

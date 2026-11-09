@@ -61,11 +61,14 @@ fn reports_rejected_ingress() {
             linked: 0,
         }
         .try_run_with(
+            common::server::h3::sessions::plain,
             Default::default(),
+            None,
             Disabled,
             deadline::Disabled,
             |error: Recovery<'_, '_>| -> Infallible { panic!("{:?}", error.cause()) },
             |error| assert!(cause.replace(Some(format!("{error:?}"))).is_none()),
+            sark_core::life::mode::Observed::new,
             |outcome| outcome.expect("invalid ingress closes without waiting for input"),
         );
         assert_eq!(cause.take().as_deref(), Some(expected));
@@ -115,11 +118,14 @@ fn rejected_head_reconciles_pending_parser_credit() {
             linked: 1,
         }
         .try_run_with(
+            common::server::h3::sessions::plain,
             protocol,
+            None,
             Disabled,
             deadline::Disabled,
             |error: Recovery<'_, '_>| -> Infallible { panic!("{:?}", error.cause()) },
             |error| panic!("{unknown} unknown frames: {error:?}"),
+            sark_core::life::mode::Observed::new,
             |outcome| outcome.unwrap_or_else(|error| panic!("{unknown} unknown frames: {error:?}")),
         );
         assert!(proof.cancel.followup);
@@ -142,24 +148,20 @@ fn rejected_request_drains_inflight_data_before_reusing_capacity() {
         proof::{DIALER, LISTENER, Proof, Shared},
     };
     use dope::{
-        core::{
-            driver::{
-                life::{creation::Attempt, recovery},
-                route::KeyTag,
-                settings::{
-                    self,
-                    claim::{Claim, Needs},
-                    demands,
-                },
-                storage,
+        core::driver::{
+            life::{creation::Attempt, recovery},
+            route::KeyTag,
+            settings::{
+                self,
+                claim::{Claim, Needs},
+                demands,
             },
-            io::Reclaimed,
+            storage,
         },
         net::wire,
         runtime::{
             control,
             executor::{Executor, session},
-            shutdown,
         },
     };
     use dope_fiber::task::storage::scope::Brand;
@@ -213,7 +215,7 @@ fn rejected_request_drains_inflight_data_before_reusing_capacity() {
         config.protocol.streams.capacity = 1;
         let server = Embedded::<LISTENER>::try_new(
             tls,
-            config_with_streams(2).expect("server streams"),
+            config_with_streams(2, None).expect("server streams"),
             plan,
             config,
         )
@@ -228,7 +230,6 @@ fn rejected_request_drains_inflight_data_before_reusing_capacity() {
             .expect("task claims")
             .apply_to(settings::Config::default())
             .expect("driver config");
-        let (source, stop) = shutdown::Pair::new().expect("shutdown").split();
         let mut rejected = Spec::new(path, b"x");
         rejected.data.split = Some(0);
         rejected.data.defer_tail = true;
@@ -245,18 +246,17 @@ fn rejected_request_drains_inflight_data_before_reusing_capacity() {
         let proof = Rc::new(Shared::new(Proof::new(
             vec![rejected, quick],
             Instant::now() + Duration::from_secs(5),
-            stop,
             None,
         )));
         let storage = StoragePlan {
             cancel_dropped: Rc::clone(&proof.read().expect("proof").cancel.dropped),
             errors: Rc::clone(&proof.failures),
+            stream: Rc::clone(&proof.read().expect("proof").stream),
         };
         let delivered = Cell::new(false);
         let mut create = Attempt::new();
         Executor::new(&mut create, config)
         .unwrap_or_else(|error| panic!("driver: {:?}", error.kind()))
-        .shutdown(source).expect("shutdown source")
         .with_plan(storage::Scope::new((
             forward.try_arena().expect("forward arena"), reverse.try_arena().expect("reverse arena"),
         )))
@@ -265,7 +265,7 @@ fn rejected_request_drains_inflight_data_before_reusing_capacity() {
                 let state = storage::Direct::build(storage);
                 Brand::with(|brand| {
                     let router = SrvApp::multiplexed::<wire::Identity, KeyTag<LISTENER>, _>(
-                        brand, &state.state, sark_fiber::Config::new(1),
+                        brand, &state, sark_fiber::Config::new(1),
                     );
                     let (forward, reverse) = *scope.storage();
                     let runtime = {
@@ -286,7 +286,7 @@ fn rejected_request_drains_inflight_data_before_reusing_capacity() {
                             run: move |mut client, mut server, mut forward, mut reverse, now| {
                                 if let Some(auth) = auth.take() {
                                     client.connect(now, server_addr, &auth,
-                                        config_with_streams(2).expect("client streams"), routing::Plain)
+                                        config_with_streams(2, None).expect("client streams"), routing::Plain)
                                         .expect("connect");
                                 }
                                 assert!(client.relay(&mut server, &mut forward, now).is_ok(), "forward relay");
@@ -343,8 +343,8 @@ fn rejected_request_drains_inflight_data_before_reusing_capacity() {
                             },
                         }
                     };
-                    match scope.with_app(&mut session::Completion::new(), runtime, |app| {
-                        app.run_for(dope_test::harness::GUARD)
+                    match scope.with_app(&mut session::Completion::new(), runtime, |mut app| {
+                        proof.failures.try_wait(&mut app)
                     }) {
                         Ok(Ok(_)) => assert!(delivered.get(), "late DATA and input termination actually consumed"),
                         Ok(Err(error)) => panic!("execution: {error:?}"),
@@ -352,7 +352,7 @@ fn rejected_request_drains_inflight_data_before_reusing_capacity() {
                     }
                 });
             }, recovery::Policy::new(
-                |event| assert!(matches!(event, Reclaimed::Shutdown)),
+                |event| panic!("unexpected retirement: {event:?}"),
                 |error: Recovery<'_, '_>| -> Infallible { panic!("{:?}", error.cause()) },
             )).as_ref().map_err(|error| error.cause()).expect("driver retirement");
         });

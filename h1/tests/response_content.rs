@@ -79,7 +79,7 @@ fn cache_match() {
         policy,
     );
     assert!(
-        matches!(outcome, output::Outcome::SendCopied { body_bytes, .. } if body_bytes == replies::BYTES.len())
+        matches!(outcome, output::Outcome::SendCopied { copy, .. } if copy.written == replies::BYTES.len())
     );
     for context in [
         Context::new(Method::Head, Version::Eleven),
@@ -109,13 +109,13 @@ fn cache_match() {
     );
     assert!(matches!(
         cold,
-        output::Outcome::SendCopied { body_bytes: 0, .. }
+        output::Outcome::SendCopied { copy, .. } if copy.written == 0
     ));
     let hot = output::Egress::new(&mut write, DATE, context)
         .cached(&mut cache::Cache::new(&mut entry), route::Cache::Store);
     assert!(matches!(
         hot,
-        Some(output::Outcome::SendCopied { body_bytes: 0, .. })
+        Some(output::Outcome::SendCopied { copy, .. }) if copy.written == 0
     ));
     assert_eq!(calls.get(), 0);
 }

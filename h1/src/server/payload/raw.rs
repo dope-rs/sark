@@ -1,12 +1,9 @@
 use std::num;
 
-use dope::net::link::egress::data::{self, compose, exec};
-use o3::{
-    buffer,
-    buffer::{Residency as _, hold, resident, segments, segments::scatter},
-};
+use dope::net::link::egress::data::{self, exec};
+use o3::buffer::{self, hold, segments::scatter};
 
-use crate::server::payload::{Body, Cursor, Frame, Inner, State, Stream};
+use crate::server::payload::{Cursor, Frame, Inner, State, Stream};
 
 fn cursor<'a, 'd>(frame: &'a Frame<'d>, offset: data::Offset) -> Option<Cursor<'a, 'd>> {
     if offset.get() >= frame.len() {
@@ -63,7 +60,6 @@ unsafe impl<'a, 'd> buffer::raw::Scatter<'a> for Cursor<'a, 'd> {
     unsafe fn advance<const MAX: usize>(
         &mut self,
         cap: num::NonZero<usize>,
-        _left: num::NonZero<usize>,
     ) -> buffer::raw::Chunk<'a, MAX> {
         let (bytes, state) = match self.0 {
             State::Prefix { parts, bytes } => {
@@ -99,75 +95,6 @@ unsafe impl<'a, 'd> buffer::raw::Scatter<'a> for Cursor<'a, 'd> {
         // SAFETY: the closed state excludes empty spans, caps the emitted
         // prefix, and carries the exact logical suffix length.
         unsafe { buffer::raw::Chunk::new(bytes) }
-    }
-}
-
-// SAFETY: Every variant retains its original immutable owner and derives cursor length and charge from that owner.
-unsafe impl<'d, K> data::raw::Payload<'d> for Body<'d, K> {
-    type Mode = exec::Fallible;
-    type Cursor<'a>
-        = compose::Either<
-        &'a [u8],
-        <segments::Chain<resident::Shared<'d>> as buffer::raw::Chunks>::Cursor<'a>,
-    >
-    where
-        Self: 'a;
-
-    fn len(&self) -> usize {
-        match self {
-            Self::Shared { owner, .. } => data::raw::Payload::len(owner),
-            Self::Segments { owners, .. } => data::raw::Payload::len(owners.as_chain()),
-            Self::Frozen { owner, .. } => owner.len(),
-        }
-    }
-
-    fn charge(&self) -> hold::Charge {
-        match self {
-            Self::Shared { owner, .. } => data::raw::Payload::charge(owner),
-            Self::Segments { owners, .. } => data::raw::Payload::charge(owners.as_chain()),
-            Self::Frozen { owner, .. } => hold::Charge::from_owner(owner.len(), owner.resident()),
-        }
-    }
-
-    fn start(&self) -> Self::Cursor<'_> {
-        match self {
-            Self::Shared { owner, .. } => compose::Either::Left(owner.as_ref()),
-            Self::Segments { owners, .. } => {
-                compose::Either::Right(buffer::raw::Chunks::start(owners.as_chain()))
-            }
-            Self::Frozen { owner, .. } => compose::Either::Left(owner.as_ref()),
-        }
-    }
-
-    fn cursor(&self, offset: data::Offset) -> Option<Self::Cursor<'_>> {
-        match self {
-            Self::Shared { owner, .. } => {
-                data::raw::Payload::cursor(owner, offset).map(compose::Either::Left)
-            }
-            Self::Segments { owners, .. } => {
-                data::raw::Payload::cursor(owners.as_chain(), offset).map(compose::Either::Right)
-            }
-            Self::Frozen { owner, .. } => offset.tail(owner.as_ref()).map(compose::Either::Left),
-        }
-    }
-
-    unsafe fn resume(
-        &self,
-        position: &mut scatter::raw::Position,
-        offset: data::Offset,
-    ) -> Self::Cursor<'_> {
-        // SAFETY: this immutable variant retains the original owner and topology.
-        match self {
-            Self::Shared { owner, .. } => compose::Either::Left(unsafe {
-                data::raw::Payload::resume(owner, position, offset)
-            }),
-            Self::Segments { owners, .. } => compose::Either::Right(unsafe {
-                data::raw::Payload::resume(owners.as_chain(), position, offset)
-            }),
-            Self::Frozen { owner, .. } => {
-                compose::Either::Left(unsafe { owner.as_ref().get_unchecked(offset.get()..) })
-            }
-        }
     }
 }
 

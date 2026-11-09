@@ -1,17 +1,15 @@
 use std::marker;
 
-use conn::deadline::Arm;
 use dope::{
     core::{
         self,
-        driver::{self, retained, route::Identity, storage},
+        driver::{self, route::Identity},
     },
     manifold::{
         app::receive,
         network::listener::{conn, handler, topology::factory},
     },
     net::{link::pool::recv::input, wire},
-    runtime::topology::recipe,
 };
 use sark_core::{
     life::mode,
@@ -29,7 +27,7 @@ use crate::{
         runtime::{
             self, Connection, Context,
             app::{App, Fault},
-            output::{flush::Flush, track::Progress},
+            output::flush::{self, Evidence, Progress},
         },
         state, sync,
     },
@@ -40,32 +38,16 @@ pub trait Failure {
 }
 
 /// Builds a plaintext application while retaining its borrowed service storage.
-pub trait Family<S, ID: Identity>: recipe::Build<S>
-where
-    S: storage::Plan,
-{
-    type Failure;
-    type Application<'s, 'life, 'p, 'd>: handler::Application<'d, ID, Wire = wire::Identity, Input = receive::Scoped>
-        + handler::Runtime<'d, 'd, ID>
-    where
-        'd: 'p,
-        'p: 'life,
-        Self: 'd,
-        ID: 'd,
-        S: 'd;
+pub trait Family<C, N, ID: Identity> {
+    type Output;
+    type Error;
 
-    fn with<'life, 'p, 'd, O>(
-        service: Self::Output<'life, 'p, 'd>,
-        plan: server::Plan,
-        binding: driver::Binding<'d>,
-        run: impl for<'s> FnOnce(Self::Application<'s, 'life, 'p, 'd>) -> O,
-    ) -> Result<O, Self::Failure>
-    where
-        'd: 'p,
-        'p: 'life,
-        Self: 'd,
-        ID: 'd,
-        S: 'd;
+    fn install(
+        self,
+        plan: runtime::Plan<ID>,
+        context: &mut C,
+        next: N,
+    ) -> Result<Self::Output, Self::Error>;
 }
 
 pub struct Sync;
@@ -114,11 +96,11 @@ where
     T: for<'d> sync::Dispatch<'d>,
     W: input::Execution,
     receive::Scoped: receive::Mode<W>,
-    for<'d> App<sync::Route<T>, W, F>: handler::Runtime<'d, 'd, ID>
+    for<'d> App<'d, sync::Route<T>, W, F>: handler::Runtime<'d, 'd, ID>
         + handler::Application<'d, ID, Wire = W, Input = receive::Scoped>,
 {
     type Application<'d>
-        = App<sync::Route<T>, W, F>
+        = App<'d, sync::Route<T>, W, F>
     where
         Self: 'd,
         W: 'd,
@@ -135,42 +117,48 @@ where
         ID: 'd,
         <Sync as factory::ReceiveSpec>::Input: 'd,
     {
-        App::from_sync(self.0, plan, self.1)
+        let machine = config::Validated::new(plan.build()?)?;
+        let minimum = plan.resident_len();
+        let route = sync::Route::new(self.0, plan.config());
+        let layout = app::Spec::layout(&route);
+        App::from_machine(route, layout, machine, minimum, self.1)
     }
 }
-pub(super) trait Deadline<'d, ID: Identity, A, W, F>
+pub(super) trait Deadline<'d, ID: Identity, A, W, F, E>
 where
     A: app::Application<'d, Connection<'d, A>, conn::Id<'d, ID>>,
     W: wire::Spec,
     F: Fault<'d, W, A::Failure, ID, runtime::Build<A::Build>>,
+    E: Evidence<'d>,
 {
     const TIMING: handler::Timing;
 
     fn flush(
-        run: &mut App<A, W, F>,
-        conn: &mut Context<'_, '_, '_, '_, '_, 'd, ID, A, W>,
-        driver: &mut retained::Context<'_, '_, 'd>,
+        run: &mut App<'d, A, W, F, E>,
+        conn: &mut Context<'_, '_, '_, '_, '_, 'd, ID, A, W, E>,
+        driver: &mut driver::Context<'_, 'd>,
     );
 
     fn timeout(
-        run: &mut App<A, W, F>,
-        conn: &mut Context<'_, '_, '_, '_, '_, 'd, ID, A, W>,
-        driver: &mut retained::Context<'_, '_, 'd>,
+        run: &mut App<'d, A, W, F, E>,
+        conn: &mut Context<'_, '_, '_, '_, '_, 'd, ID, A, W, E>,
+        driver: &mut driver::Context<'_, 'd>,
     ) -> handler::Timeout<'d>;
 }
 
-impl<'d, ID: Identity, A, W, F> Deadline<'d, ID, A, W, F> for timing::Off
+impl<'d, ID: Identity, A, W, F, E> Deadline<'d, ID, A, W, F, E> for timing::Off
 where
     A: app::Application<'d, Connection<'d, A>, conn::Id<'d, ID>>,
     W: wire::Spec,
     F: Fault<'d, W, A::Failure, ID, runtime::Build<A::Build>>,
+    E: Evidence<'d>,
 {
     const TIMING: handler::Timing = handler::Timing::disabled();
 
     fn flush(
-        run: &mut App<A, W, F>,
-        conn: &mut Context<'_, '_, '_, '_, '_, 'd, ID, A, W>,
-        driver: &mut retained::Context<'_, '_, 'd>,
+        run: &mut App<'d, A, W, F, E>,
+        conn: &mut Context<'_, '_, '_, '_, '_, 'd, ID, A, W, E>,
+        driver: &mut driver::Context<'_, 'd>,
     ) {
         let owner = conn.id();
         let work = conn.work();
@@ -178,10 +166,16 @@ where
         let app = &mut run.app;
         let fault = &mut run.fault;
         let result = loop {
-            let output = Flush::new(conn).finish(driver, None, &mut mode::Disabled);
-            match <F as Fault<'d, W, A::Failure, ID, runtime::Build<A::Build>>>::output(
-                fault, owner, output,
-            ) {
+            let progress = match flush::finish(conn, driver, None, &mut mode::Disabled) {
+                Ok(progress) => progress,
+                Err((cause, progress)) => {
+                    <F as Fault<'d, W, A::Failure, ID, runtime::Build<A::Build>>>::output(
+                        fault, owner, cause,
+                    );
+                    progress
+                }
+            };
+            match progress {
                 Progress::Blocked => break Ok(()),
                 Progress::Committed => {}
             }
@@ -195,7 +189,11 @@ where
                 &mut state.carrier,
                 &mut turn,
                 schedule::Egress::Released,
-                |cause| {
+                &mut *fault,
+                |_, conn, drain, _| Ok(drain.next(conn)),
+                |_, _| {},
+                |_, _| {},
+                |fault, cause| {
                     <F as Fault<'d, W, A::Failure, ID, runtime::Build<A::Build>>>::diagnostic(
                         fault, owner, cause,
                     );
@@ -214,50 +212,51 @@ where
     }
 
     fn timeout(
-        _: &mut App<A, W, F>,
-        _: &mut Context<'_, '_, '_, '_, '_, 'd, ID, A, W>,
-        _: &mut retained::Context<'_, '_, 'd>,
+        _: &mut App<'d, A, W, F, E>,
+        _: &mut Context<'_, '_, '_, '_, '_, 'd, ID, A, W, E>,
+        _: &mut driver::Context<'_, 'd>,
     ) -> handler::Timeout<'d> {
         handler::Timeout::Discard
     }
 }
 
-impl<'d, ID: Identity, A, W, F> Deadline<'d, ID, A, W, F> for timing::On
+impl<'d, ID: Identity, A, W, F, E> Deadline<'d, ID, A, W, F, E> for timing::On
 where
     A: app::Timed<'d, Connection<'d, A>, conn::Id<'d, ID>>,
     W: wire::Spec,
     F: Fault<'d, W, A::Failure, ID, runtime::Build<A::Build>>,
+    E: Evidence<'d>,
 {
     const TIMING: handler::Timing = handler::Timing::managed();
 
     fn flush(
-        run: &mut App<A, W, F>,
-        conn: &mut Context<'_, '_, '_, '_, '_, 'd, ID, A, W>,
-        driver: &mut retained::Context<'_, '_, 'd>,
+        run: &mut App<'d, A, W, F, E>,
+        conn: &mut Context<'_, '_, '_, '_, '_, 'd, ID, A, W, E>,
+        driver: &mut driver::Context<'_, 'd>,
     ) {
-        <timing::Off as Deadline<'d, ID, A, W, F>>::flush(run, conn, driver);
+        <timing::Off as Deadline<'d, ID, A, W, F, E>>::flush(run, conn, driver);
         let due = app::Timed::deadline(&run.app, &conn.state().app);
-        match state::try_sync(due, conn) {
-            Arm::Armed => {}
-            Arm::Disabled | Arm::Sealed | Arm::Overflow(_) => {
-                let output = Flush::new(conn).finish(
-                    driver,
-                    Some(numbers::ErrorCode::InternalError),
-                    &mut mode::Disabled,
-                );
+        if let Err(cause) = state::try_sync(due, conn) {
+            conn.deadline().reject(cause);
+            if let Err((cause, _)) = flush::finish(
+                conn,
+                driver,
+                Some(numbers::ErrorCode::InternalError),
+                &mut mode::Disabled,
+            ) {
                 <F as Fault<'d, W, A::Failure, ID, runtime::Build<A::Build>>>::output(
                     &mut run.fault,
                     conn.id(),
-                    output,
+                    cause,
                 );
             }
         }
     }
 
     fn timeout(
-        run: &mut App<A, W, F>,
-        conn: &mut Context<'_, '_, '_, '_, '_, 'd, ID, A, W>,
-        driver: &mut retained::Context<'_, '_, 'd>,
+        run: &mut App<'d, A, W, F, E>,
+        conn: &mut Context<'_, '_, '_, '_, '_, 'd, ID, A, W, E>,
+        driver: &mut driver::Context<'_, 'd>,
     ) -> handler::Timeout<'d> {
         run.activate::<ID, timing::Off>(conn, driver, schedule::Egress::Unchanged);
         let update = app::Timed::deadline(&run.app, &conn.state().app)

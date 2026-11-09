@@ -201,25 +201,6 @@ pub enum Transfer<S, E> {
     Rejected { state: S, error: E },
 }
 
-impl<S, E> Transfer<S, E> {
-    pub(crate) fn map<T, F>(
-        self,
-        state: impl FnOnce(S) -> T,
-        error: impl FnOnce(E) -> F,
-    ) -> Transfer<T, F> {
-        match self {
-            Self::Accepted(value) => Transfer::Accepted(state(value)),
-            Self::Rejected {
-                state: value,
-                error: cause,
-            } => Transfer::Rejected {
-                state: state(value),
-                error: error(cause),
-            },
-        }
-    }
-}
-
 /// Resumable decoder. Input, replay, field lookup, and owner release work are
 /// charged to the caller-provided budget. Its driver brand cannot be widened even
 /// when the scanner owns every input segment.
@@ -311,24 +292,13 @@ impl<'d, T: Decode<C>, C: Copy> Decoder<'d, T, C> {
 
     /// Transfers one retained transport owner into the decoder.
     pub fn push(mut self, segment: resident::Shared<'d>) -> Transfer<Self, Push<'d>> {
-        let Some(phase) = self.phase.occupied() else {
-            return Transfer::Rejected {
-                state: self,
-                error: Push::Complete(segment),
-            };
+        let result = match self.phase.get_mut() {
+            Some(Phase::Scan(scanner)) => scanner.push(segment),
+            _ => Err(Push::Complete(segment)),
         };
-        let (phase, vacant) = phase.take();
-        let (phase, error) = match phase {
-            Phase::Scan(scanner) => match scanner.push(segment) {
-                Transfer::Accepted(scanner) => (Phase::Scan(scanner), None),
-                Transfer::Rejected { state, error } => (Phase::Scan(state), Some(error)),
-            },
-            phase => (phase, Some(Push::Complete(segment))),
-        };
-        vacant.insert(phase);
-        match error {
-            Some(error) => Transfer::Rejected { state: self, error },
-            None => Transfer::Accepted(self),
+        match result {
+            Ok(()) => Transfer::Accepted(self),
+            Err(error) => Transfer::Rejected { state: self, error },
         }
     }
 

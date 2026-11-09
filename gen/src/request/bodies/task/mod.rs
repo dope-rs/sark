@@ -1,5 +1,7 @@
 use crate::{macros::tokens::local, runtime::paths::Paths};
 
+use super::Source;
+
 mod json;
 mod retain;
 
@@ -8,12 +10,6 @@ pub(in crate::request) struct Names<'tokens> {
     pub(in crate::request) builder: &'tokens syn::Ident,
     pub(in crate::request) params: &'tokens proc_macro2::TokenStream,
     pub(in crate::request) headers: &'tokens proc_macro2::TokenStream,
-}
-
-pub(in crate::request) enum Plan<'a> {
-    Discarded,
-    Raw { segmented: bool },
-    Json(&'a syn::Type),
 }
 
 pub(in crate::request) struct Output {
@@ -212,21 +208,21 @@ impl Task<'_> {
         }
     }
 
-    pub(in crate::request) fn build(self, paths: &Paths, plan: Plan<'_>) -> Output {
+    pub(in crate::request) fn build(self, paths: &Paths, source: &Source) -> Output {
         let ns_http = &paths.http;
         let builder = self.names.builder;
         let params = self.names.params;
         let headers = self.names.headers;
         let field = self.authority.map(|peer| quote::quote!(authority: #peer,));
         let vis = self.vis;
-        let mut output = match plan {
-            Plan::Json(json) => json::build(self, paths, json),
-            Plan::Raw { segmented: split } => Retain {
+        let mut output = match source {
+            Source::Json(json) => json::build(self, paths, &json.ty),
+            Source::Raw(raw) => Retain {
                 task: self,
-                segmented: split,
+                segmented: raw.segmented,
             }
             .build(paths),
-            Plan::Discarded => self.discard(paths),
+            Source::Discarded => self.discard(paths),
         };
         let fields = output.declaration;
         output.declaration = quote::quote! {
@@ -264,13 +260,17 @@ impl Task<'_> {
             definition: quote::quote! {
                 impl<'d> #ns_core::route::TaskBuild<'d> for #builder<'d> {
                     type Task = #request<'d>;
-                    type StepError = ::core::convert::Infallible;
 
                     fn reject(#error: Self::StepError) -> #ns_core::route::Reject {
                         match #error {}
                     }
+                }
 
-                    fn finish_body(mut self, #len: ::core::primitive::usize) -> Self {
+                impl<'d> #ns_core::body::Build<'d> for #builder<'d> {
+                    type Output = #ns_core::route::Built<'d, #request<'d>>;
+                    type StepError = ::core::convert::Infallible;
+
+                    fn finish_input(mut self, #len: ::core::primitive::usize) -> Self {
                         self.body_len = #len;
                         self.input_finished = true;
                         self
@@ -281,7 +281,7 @@ impl Task<'_> {
                         _: ::core::num::NonZero<::core::primitive::usize>,
                     ) -> #ns_core::body::Step<
                         Self,
-                        #ns_core::route::Built<'d, Self::Task>,
+                        Self::Output,
                         Self::StepError,
                     > {
                         let #released =

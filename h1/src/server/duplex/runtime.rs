@@ -3,7 +3,7 @@ use std::{convert, marker, mem};
 use conn::write::{self, body};
 use dope::{
     self,
-    core::driver::{retained, route::Identity},
+    core::driver::{self, route::Identity},
     manifold::{
         app::receive,
         network::listener::{conn, handler},
@@ -24,37 +24,18 @@ use crate::{server::payload, session, switch};
 
 const POLICY: hold::Policy = hold::Policy::share();
 
-enum Wake {
-    Idle,
-    Turn,
-}
-
-enum Closed {
-    Continue,
-    ContinueTurn,
-    Close,
-    CloseTurn,
-}
-
-impl Closed {
-    const fn close(self) -> Self {
-        match self {
-            Self::Continue | Self::Close => Self::Close,
-            Self::ContinueTurn | Self::CloseTurn => Self::CloseTurn,
-        }
-    }
-}
-
 /// One borrowed raw-transition I/O turn.
 pub struct Runtime<'a, C, K = ()> {
     conn: &'a mut C,
+    scratch: &'a mut Vec<u8>,
     tag: marker::PhantomData<fn() -> K>,
 }
 
 impl<'a, C, K> Runtime<'a, C, K> {
-    pub fn new(conn: &'a mut C) -> Self {
+    pub fn new(conn: &'a mut C, scratch: &'a mut Vec<u8>) -> Self {
         Self {
             conn,
+            scratch,
             tag: marker::PhantomData,
         }
     }
@@ -93,7 +74,7 @@ where
     K: Copy + Default + 'd,
 {
     /// Applies one raw activation, preserving input finish after HTTP drain.
-    pub fn activate(mut self, driver: &mut retained::Context<'_, '_, 'd>) {
+    pub fn activate(mut self, driver: &mut driver::Context<'_, 'd>) {
         if self.conn.is_closing() {
             self.finish_input(driver);
             return;
@@ -110,7 +91,7 @@ where
     pub fn chunk<R: hold::raw::Retain<'d>>(
         mut self,
         input: scope::Deferred<'_, 'd, R>,
-        driver: &mut retained::Context<'_, '_, 'd>,
+        driver: &mut driver::Context<'_, 'd>,
     ) -> receive::Outcome {
         let raw = match self.conn.state_mut().raw_mut() {
             Ok(raw) => raw,
@@ -159,7 +140,7 @@ where
     }
 
     /// Delivers an orderly peer input finish without closing live output.
-    pub fn finish_input(mut self, driver: &mut retained::Context<'_, '_, 'd>) -> handler::Drain {
+    pub fn finish_input(mut self, driver: &mut driver::Context<'_, 'd>) -> handler::Drain {
         let raw = match self.conn.state_mut().raw_mut() {
             Ok(raw) => raw,
             Err(switch::Mode::Http | switch::Mode::Switching(_)) => {
@@ -211,7 +192,7 @@ where
         Ok(owned::Segments::from(part))
     }
 
-    fn flush(&mut self, driver: &mut retained::Context<'_, '_, 'd>) -> receive::Outcome {
+    fn flush(&mut self, driver: &mut driver::Context<'_, 'd>) -> receive::Outcome {
         use write::error::Error;
 
         let raw = match self.conn.state_mut().raw_mut() {
@@ -229,28 +210,35 @@ where
         match raw.output() {
             machine::Output::Open => {}
             machine::Output::Finished => {
-                let closed = Self::flush_closed(raw);
-                return self.apply_closed(closed);
+                return match Self::flush_closed(raw, self.scratch) {
+                    machine::After::Idle => receive::Outcome::Continue,
+                    machine::After::Turn => {
+                        self.conn.wake_target().wake();
+                        receive::Outcome::Continue
+                    }
+                    machine::After::Finished => {
+                        self.conn.close_after();
+                        receive::Outcome::CloseAfter
+                    }
+                };
             }
         }
+        let scratch = &mut *self.scratch;
         match self.conn.write().try_draft(
             driver,
-            move |state, _| -> Result<_, convert::Infallible> {
+            move |state, buffer| -> Result<_, convert::Infallible> {
                 let raw = match state.raw_mut() {
                     Ok(raw) => raw,
                     Err(switch::Mode::Http | switch::Mode::Switching(_)) => {
-                        return Ok(write::Draft::new(0, None, Wake::Idle).close_after());
+                        return Ok(write::Draft::new(0, None, machine::After::Idle).close_after());
                     }
                 };
                 Ok(
-                    match raw.transact(|send| {
+                    match raw.transact(buffer, scratch, |written, send| {
                         let (payload, end, after) = send.into_parts();
-                        let wake = match after {
-                            machine::After::Idle | machine::After::Finished => Wake::Idle,
-                            machine::After::Turn => Wake::Turn,
-                        };
                         let draft = |output: Option<_>| {
-                            let draft = write::Draft::new(0, output.map(Value::Unchecked), wake);
+                            let draft =
+                                write::Draft::new(written, output.map(Value::Unchecked), after);
                             match end {
                                 machine::End::Open => draft,
                                 machine::End::FinishOutput => draft.shutdown(),
@@ -259,12 +247,10 @@ where
                         };
                         match payload {
                             admit::Payload::Present { output, permit } => {
-                                let output = egress::Load::new(payload::Body::duplex(
-                                    owned::Segments::from(output),
-                                    K::default(),
-                                ))
-                                .into_left()
-                                .unbounded();
+                                let output =
+                                    egress::Load::new(payload::Body::duplex(output, K::default()))
+                                        .into_left()
+                                        .unbounded();
                                 permit.commit::<_, convert::Infallible>(draft(Some(output)))
                             }
                             admit::Payload::Vacant(permit) => {
@@ -273,18 +259,24 @@ where
                         }
                     }) {
                         machine::Transaction::Committed { receipt: done, .. } => done,
-                        machine::Transaction::Violation(machine::Violation::OutputAfterFinish) => {
-                            write::Draft::new(0, None, Wake::Idle).close_after()
+                        machine::Transaction::Violation(
+                            machine::Violation::OutputAfterFinish
+                            | machine::Violation::PrefixCapacity { .. }
+                            | machine::Violation::PrefixPending,
+                        ) => write::Draft::new(0, None, machine::After::Idle).close_after(),
+                        machine::Transaction::Idle => {
+                            write::Draft::new(0, None, machine::After::Idle)
                         }
-                        machine::Transaction::Idle => write::Draft::new(0, None, Wake::Idle),
                         machine::Transaction::Pending { receipt } => receipt.close_after(),
                         machine::Transaction::Rejected(never) => match never {},
                     },
                 )
             },
         ) {
-            Ok(write::Outcome::Committed(Wake::Idle)) => receive::Outcome::Continue,
-            Ok(write::Outcome::Committed(Wake::Turn)) => {
+            Ok(write::Outcome::Committed(machine::After::Idle | machine::After::Finished)) => {
+                receive::Outcome::Continue
+            }
+            Ok(write::Outcome::Committed(machine::After::Turn)) => {
                 self.conn.wake_target().wake();
                 receive::Outcome::Continue
             }
@@ -303,69 +295,26 @@ where
         }
     }
 
-    fn flush_closed(raw: &mut machine::Machine<'d, D>) -> Closed {
-        let turn = raw.transact(|send| {
-            let (payload, end, after) = send.into_parts();
-            match payload {
-                admit::Payload::Present { output, permit } => {
-                    drop(output);
-                    let receipt = match after {
-                        machine::After::Turn => Closed::CloseTurn,
-                        machine::After::Idle | machine::After::Finished => Closed::Close,
-                    };
-                    permit.commit::<_, convert::Infallible>(receipt)
-                }
-                admit::Payload::Vacant(permit) => {
-                    let receipt = match (end, after) {
-                        (machine::End::FinishSession, machine::After::Turn) => Closed::CloseTurn,
-                        (
-                            machine::End::FinishSession,
-                            machine::After::Idle | machine::After::Finished,
-                        )
-                        | (
-                            machine::End::Open | machine::End::FinishOutput,
-                            machine::After::Finished,
-                        ) => Closed::Close,
-                        (machine::End::Open | machine::End::FinishOutput, machine::After::Turn) => {
-                            Closed::ContinueTurn
-                        }
-                        (machine::End::Open | machine::End::FinishOutput, machine::After::Idle) => {
-                            Closed::Continue
-                        }
-                    };
-                    permit.commit::<_, convert::Infallible>(receipt)
-                }
-            }
+    fn flush_closed(raw: &mut machine::Machine<'d, D>, scratch: &mut Vec<u8>) -> machine::After {
+        let turn = raw.transact(&mut [], scratch, |_, send| {
+            // Finished output rejects every payload before this admission.
+            let admit::Payload::Vacant(permit) = send.into_parts().0 else {
+                unreachable!("closed")
+            };
+            permit.commit::<_, convert::Infallible>(())
         });
         match turn {
-            machine::Transaction::Committed { receipt: done, .. } => done,
-            machine::Transaction::Idle => Closed::Continue,
-            machine::Transaction::Violation(machine::Violation::OutputAfterFinish) => Closed::Close,
-            machine::Transaction::Pending { receipt } => receipt.close(),
+            machine::Transaction::Committed { after, .. } => after,
+            machine::Transaction::Idle => machine::After::Idle,
+            machine::Transaction::Violation(
+                machine::Violation::OutputAfterFinish
+                | machine::Violation::PrefixCapacity { .. }
+                | machine::Violation::PrefixPending,
+            ) => machine::After::Finished,
+            machine::Transaction::Pending { .. } => unreachable!("committed"),
             machine::Transaction::Rejected(never) => match never {},
-        }
-    }
-
-    fn apply_closed(&mut self, closed: Closed) -> receive::Outcome {
-        match closed {
-            Closed::Continue => receive::Outcome::Continue,
-            Closed::ContinueTurn => {
-                self.conn.wake_target().wake();
-                receive::Outcome::Continue
-            }
-            Closed::Close => {
-                self.conn.close_after();
-                receive::Outcome::CloseAfter
-            }
-            Closed::CloseTurn => {
-                self.conn.wake_target().wake();
-                self.conn.close_after();
-                receive::Outcome::CloseAfter
-            }
         }
     }
 }
 
-const _: () = assert!(mem::size_of::<Runtime<'static, (), ()>>() == mem::size_of::<usize>());
-const _: () = assert!(mem::size_of::<Wake>() == mem::size_of::<u8>());
-const _: () = assert!(mem::size_of::<Closed>() == mem::size_of::<u8>());
+const _: () = assert!(mem::size_of::<Runtime<'static, (), ()>>() == 2 * mem::size_of::<usize>());

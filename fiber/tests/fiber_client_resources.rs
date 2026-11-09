@@ -48,6 +48,7 @@ fn retains_provider_state() {
 
     use cartel_redis::client::{plan, settings, settings::init};
     use common::{
+        h2::{peer::Peer, server::Request},
         route::glue::{
             task,
             task::generics::{self, App, State},
@@ -55,8 +56,17 @@ fn retains_provider_state() {
         server,
     };
     use dope::{
-        core::{BranchError, driver::storage::With},
-        manifold::{BuildError, app::env::Bundle, service},
+        core::{
+            BranchError,
+            driver::storage::With,
+            io::socket::{self, Listener},
+        },
+        manifold::{
+            BuildError,
+            app::{Host as ListenerHost, env::Bundle},
+            network::listener::config,
+            service,
+        },
         net::{
             tcp::Tcp,
             wire::{Identity, domain},
@@ -65,14 +75,33 @@ fn retains_provider_state() {
     };
     use dope_fiber::task::storage::scope::Brand;
     use dope_test::harness::server::Pair;
+    use sark_core::manifold::stream::Boundary;
     use sark_fiber::{Config, Throughput, server::PrepareError};
     use sark_h1::server::{date::Clock, run};
+    use sark_h2::server::{runtime::Plan as H2Plan, task::timers::Disabled};
+    use sark_http::field::{self, Entry, Pseudo, Value};
 
     let harness = Pair::bind().expect("bind dependent listener");
+    let h2 = Listener::bind(SocketAddr::from(([127, 0, 0, 1], 0))).expect("dependent H2 listener");
+    let h2_address = h2.local_addr();
     let plan = server::Plan::new(harness.addr(), time::Duration::from_secs(5)).build();
     harness
         .check(
             |context, listener| {
+                let h2 = H2Plan::<KeyTag<3>>::new(
+                    config::Prepared {
+                        bind: h2_address,
+                        connections: driver::route::table::conn::Capacity::fixed::<1>(),
+                        per_ip: None,
+                        direct_flights: Default::default(),
+                        backlog: socket::Backlog::fixed::<1>(),
+                        stream: Default::default(),
+                        transport: Default::default(),
+                        egress: Default::default(),
+                    },
+                    driver::settings::Receive::fixed::<64, { 32 << 10 }>(),
+                    common::h2::server::CONFIG,
+                ).expect("dependent H2 plan").with_bound(h2);
                 let first = String::from("provider response");
                 let encoded = Cell::new(0);
                 let bytes = first.as_bytes();
@@ -110,13 +139,15 @@ fn retains_provider_state() {
                 let mut completion = session::Completion::new();
                 let report = &mut completion;
                 let profile = plan.config();
-                let plan = provider.compose(storage, plan, move |plan, owner, stage| {
+                let plan = provider.compose(storage, (plan, h2), move |(plan, h2), owner, stage| {
                     stage.hold(owner, |held, stage| {
                         Brand::with(|brand| {
+                          Brand::with(|h2_brand| {
                             plan.prepare_in(
                                 stage,
                                 domain::Local::new(Identity),
                                 |prepared, wait, stage| {
+                                  h2.tasks((), 2).prepare_in(stage, domain::Local::<Identity, KeyTag<3>>::new(Identity), |h2, _wait, stage| {
                                     let result = held.lend_scope(stage, report, |issued| {
                                         let (client, permit) = issued.into_parts();
                                         let state = std::pin::pin!(State::<_, 2> {
@@ -129,19 +160,32 @@ fn retains_provider_state() {
                                                 }
                                             ),
                                         });
-                                        App::run_prepared(
-                                            brand,
-                                            state.as_ref(),
-                                            config,
-                                            prepared,
-                                            wait,
-                                            permit,
+                                        permit.try_run(
+                                            |mut driver| {
+                                                let app = App::new(
+                                                    brand,
+                                                    state.as_ref().get_ref(),
+                                                    config,
+                                                );
+                                                let app = prepared
+                                                    .build(app, &mut driver)
+                                                    .map_err(BranchError::First)?;
+                                                let router = App::multiplexed::<_, 2, Identity, KeyTag<3>, _>(
+                                                    h2_brand, state.as_ref().get_ref(), config,
+                                                );
+                                                let h2 = h2.build(router, Disabled, &mut driver)
+                                                    .map_err(BranchError::Second)?;
+                                                Ok((server::accept::Listeners::new(app, ListenerHost::new(h2)), wait))
+                                            },
+                                            |wait, app| run::run(wait, app),
                                         )
                                     });
                                     run::Failure::lending(result)
+                                  }).map_err(|error| run::Failure::Install(BranchError::Second(BuildError::Create(error))))?
                                 },
                             )
-                            .map_err(|error| run::Failure::Install(BuildError::Create(error)))?
+                            .map_err(|error| run::Failure::Install(BranchError::First(BuildError::Create(error))))?
+                          })
                         })
                     })
                 });
@@ -164,7 +208,7 @@ fn retains_provider_state() {
                         finish(result)
                     },
                 );
-                assert_eq!(encoded.get(), 1);
+                assert_eq!(encoded.get(), 2);
                 Ok::<_, PrepareError>(())
             },
             |address| {
@@ -180,6 +224,14 @@ fn retains_provider_state() {
                     .read_to_end(&mut response)
                     .expect("read dependent response");
                 assert!(response.ends_with(b"provider response"));
+                let (mut socket, mut client) = Peer::try_connect(h2_address, time::Duration::from_secs(3))
+                    .expect("dependent H2 client");
+                let mut headers = Request::new(b"/").try_headers().expect("H2 request fields");
+                headers[0] = Entry::pseudo(Pseudo::Method, field::literal!(Value::try_bytes(b"GET")));
+                let stream = client.streams().headers().request(headers, Boundary::End).expect("H2 request");
+                Peer::new(&mut socket, &mut client).try_flush().expect("H2 request flush");
+                let (_, body) = Peer::new(&mut socket, &mut client).try_response(stream).expect("H2 response");
+                assert_eq!(body, b"provider response");
             },
             |result| assert!(result.is_ok(), "dependent preparation: {:?}", result.err()),
         )
@@ -354,6 +406,7 @@ fn fixed_host_is_borrowed() {
     )
     .expect("fixed client topology")
     .enter(
+        (),
         |scope| {
             let client = scope.handle;
             let (host, alloc) = Tracker::usage(|| client.host());
@@ -374,6 +427,7 @@ fn host_borrows_authority() {
     origins::Plan::new(Config::new(String::from("[2001:DB8::1]:8080")), 1, 1, 1)
         .expect("on-demand client topology")
         .enter(
+            (),
             |app| {
                 let client = app.handle;
                 let (host, alloc) = Tracker::usage(|| client.host());

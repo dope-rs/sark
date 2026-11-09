@@ -4,8 +4,10 @@ use dope_quic::{stream::send, wire::stream::Id};
 use o3::{
     buffer::{hold, resident},
     depot::queue::{group, ring},
+    mem,
 };
 use sark_core::manifold::stream::Boundary;
+use sark_http::field::metadata::section::rules;
 
 use crate::{
     conn,
@@ -28,6 +30,55 @@ pub(in crate::conn) use permit::Permit;
 pub(in crate::conn) use single::Single;
 
 type Events<'d, S, B> = ring::Fifo<event::Event<'d, S, B, event::Token>>;
+
+impl<'d> Stage<'d> for output::WritePrefix {
+    fn class(&self) -> budget::WriteClass {
+        budget::WriteClass::Critical
+    }
+
+    fn charge(&self) -> output::WriteCharge {
+        self.charge()
+    }
+
+    fn into_write(self, target: stream::Target) -> plan::Record<'d> {
+        plan::Record::single(target, self, Boundary::More)
+    }
+}
+
+impl<'d> Stage<'d> for ring::Front<'_, ring::Fifo<(output::WritePrefix, u64)>> {
+    fn class(&self) -> budget::WriteClass {
+        budget::WriteClass::Critical
+    }
+
+    fn charge(&self) -> output::WriteCharge {
+        self.get().0.charge()
+    }
+
+    fn into_write(self, target: stream::Target) -> plan::Record<'d> {
+        plan::Record::single(target, self.remove().0, Boundary::More)
+    }
+}
+
+impl<'d, P: rules::Policy, A: rules::Push> conn::Connection<'d, P, A> {
+    pub(crate) fn publish_encoder(&mut self) -> Result<(), conn::Error> {
+        let Some(front) = self
+            .qpack
+            .pending_encoder
+            .as_mut()
+            .and_then(ring::Fifo::front_entry)
+        else {
+            return Ok(());
+        };
+        let target = self
+            .session
+            .qpack_encoder
+            .ok_or(conn::Error::EncoderMissing)?;
+        Single::new(&mut self.queues, target, front)
+            .map_err(mem::Rejected::discard)?
+            .commit::<hold::evidence::Off>();
+        Ok(())
+    }
+}
 
 pub(crate) struct Queues<'d, S, B> {
     pub(in crate::conn) waiters: wait::Table,
@@ -201,10 +252,14 @@ impl<'d, S, B> Queues<'d, S, B> {
         }
     }
 
-    pub(in crate::conn) fn enqueue(&mut self, entry: Entry<'d>) -> Result<(), conn::Error> {
-        match Single::new(self, entry) {
+    pub(in crate::conn) fn enqueue(
+        &mut self,
+        target: stream::Target,
+        entry: Entry<'d>,
+    ) -> Result<(), conn::Error> {
+        match Single::new(self, target, entry) {
             Ok(permit) => {
-                permit.commit();
+                permit.commit::<hold::evidence::Off>();
                 Ok(())
             }
             Err(rejected) => Err(rejected.discard()),
@@ -289,10 +344,10 @@ impl<'d, S, B> Queues<'d, S, B> {
 
 const _: () = {
     assert!(core::mem::size_of::<Completion>() == 1);
-    assert!(core::mem::size_of::<Source<'static, 'static>>() == 9 * core::mem::size_of::<usize>());
+    assert!(core::mem::size_of::<Source<'static, 'static>>() == 7 * core::mem::size_of::<usize>());
     assert!(
         core::mem::size_of::<Prepared<'static, 'static, 'static>>()
-            == 13 * core::mem::size_of::<usize>()
+            == 11 * core::mem::size_of::<usize>()
     );
 };
 

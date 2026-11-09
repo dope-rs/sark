@@ -171,24 +171,17 @@ pub(crate) enum State<'req, 'd, S = Infallible, B = body::Retained<'req, 'd>> {
 const _: () = assert!(size_of::<State<'static, 'static>>() <= 11 * size_of::<usize>());
 
 impl<'req, 'd, 'id, B: stage::Body<'req, 'd>> Plan<'req, 'd, scope::Range<'id>, B> {
-    pub fn resolve_head<O>(
+    pub fn resolve_head<O: Into<scope::Owner<'id, storage::Shared>>>(
         self,
         head: O,
-        retain: impl FnOnce(O) -> scope::Owner<'id, storage::Shared>,
-    ) -> (Plan<'req, 'd, Infallible, B>, handoff::Head<O>) {
-        match self.state {
-            State::Ready { origin, body } => (
-                Plan::new(State::Ready { origin, body }),
-                handoff::Head::Passed(head),
-            ),
-            State::Body(body) => (Plan::new(State::Body(body)), handoff::Head::Passed(head)),
-            State::Head { origin, selected } => (
-                Plan::new(State::Ready {
-                    origin,
-                    body: Ready::Retained(retain(head).project(selected)),
-                }),
-                handoff::Head::Kept,
-            ),
-        }
+    ) -> Plan<'req, 'd, Infallible, B> {
+        Plan::new(match self.state {
+            State::Ready { origin, body } => State::Ready { origin, body },
+            State::Body(body) => State::Body(body),
+            State::Head { origin, selected } => State::Ready {
+                origin,
+                body: Ready::Retained(head.into().project(selected)),
+            },
+        })
     }
 }

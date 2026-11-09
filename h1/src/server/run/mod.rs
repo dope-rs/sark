@@ -6,6 +6,7 @@ mod prepared;
 mod root;
 mod watch;
 
+pub use dope::manifold::network::listener::{Wait, Watch};
 pub use failure::{Cause, ExecutionError, Failure, RunCause, RunError};
 pub use plan::Plan;
 pub use prepared::Prepared;
@@ -13,7 +14,7 @@ pub use prepared::Prepared;
 pub use root::Root;
 #[doc(hidden)]
 pub use watch::Pending;
-pub use watch::{Wait, Watch};
+pub use watch::run;
 
 pub type Output<T> = std::result::Result<T, ExecutionError>;
 

@@ -263,7 +263,7 @@ impl Class {
 }
 
 impl Error {
-    pub(crate) const fn code(self) -> numbers::ErrorCode {
+    pub(crate) const fn code(&self) -> numbers::ErrorCode {
         self.class().code()
     }
 
@@ -282,7 +282,6 @@ impl Error {
                 | segments::Error::Count(_)
                 | segments::Error::Logical(_)
                 | segments::Error::Resident(_)
-                | segments::Error::Total(_)
                 | segments::Error::Boundary(_) => {
                     Class::Protocol(numbers::ErrorCode::InternalError)
                 }
@@ -489,7 +488,7 @@ impl From<outputs::Full> for Error {
 
 impl From<&Error> for numbers::ErrorCode {
     fn from(error: &Error) -> Self {
-        error.class().code()
+        error.code()
     }
 }
 

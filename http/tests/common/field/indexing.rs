@@ -108,7 +108,7 @@ pub const PSEUDO: Result<headers::Group<'static>, headers::Error> = headers::Gro
 );
 
 pub struct Store<'a> {
-    pub fields: &'a mut map::Fields<Vec<u8>>,
+    pub fields: &'a mut map::Fields,
     pub result: Result<(), map::Error>,
 }
 

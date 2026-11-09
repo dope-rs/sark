@@ -27,7 +27,7 @@ pub(super) fn generate(
     let ns_core = &paths.core;
     let ns_fiber = &paths.fiber;
 
-    let ident = &ctx.exec.task.fiber;
+    let ident = &ctx.exec.fiber;
     let prep = &state.prepared;
     let fibers = ctx.exec.fibers().iter().copied().map(|(task, fiber)| {
         let var = task.prepared();
@@ -35,6 +35,7 @@ pub(super) fn generate(
         let field = syn::Index::from(fiber.slot);
         let path = fiber.path().route(&ctx.plan.spec.state_generics);
         let kind = task.variant();
+        let source = task.make(paths, &n_task);
         quote! {
             #prep::#var(#slot {
                 head: #v_head,
@@ -59,7 +60,7 @@ pub(super) fn generate(
                         #ns_fiber::manifold::runtime::Runnable
                     >::handle(#v_this.#f_time),
                 ));
-                let #n_task = #n_insert((#n_task, #n_target));
+                let #n_task = #n_insert((#source, #n_target));
                 ::core::result::Result::Ok(
                     #ident::#kind(#n_task),
                 )

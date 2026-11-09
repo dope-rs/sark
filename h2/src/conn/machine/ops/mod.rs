@@ -128,9 +128,8 @@ where
     }
 
     pub(crate) fn bind_link<const PREFIX: usize>(
-        mut self,
+        self,
     ) -> Result<Option<Bound<'a, R, C, PREFIX>>, io::Error> {
-        self.flush_resets();
         let conn = self.conn;
         let Some(write) = conn.egress.outbound.transfer().bind_link()? else {
             return Ok(None);
@@ -170,10 +169,10 @@ where
         write: payloads::Write<C>,
         evidence: impl FnOnce(crate::stream::Key, &C) -> T,
     ) -> event::Write<T, C> {
-        let write = self.conn.state.finish_write(write, |stream, _, body| {
-            let proof = evidence(stream, &body);
-            (body, proof)
-        });
+        let write = self
+            .conn
+            .state
+            .finish_write(write, |stream, _, body| evidence(stream, body));
         self.flush_resets();
         write
     }

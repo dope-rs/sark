@@ -7,13 +7,18 @@ pub(in crate::app::serve::handle::h1) struct Tasks {
 }
 
 impl Tasks {
-    pub(super) fn build(paths: &Paths, ctx: &handle::Context<'_, '_, '_>) -> Self {
+    pub(super) fn build(
+        paths: &Paths,
+        ctx: &handle::Context<'_, '_, '_>,
+        dispatch: &syn::Ident,
+    ) -> Self {
         let f_life = local("lifecycle");
         let symbols = &ctx.plan.spec.state_generics;
+        let v_routes = symbols.local("routes");
         let [v_cancel, n_active] = symbols.locals(["cancellation", "__activity"]);
         let [n_charge, n_drive] = symbols.locals(["__charge", "__drive"]);
         let [n_exch, n_kind] = symbols.locals(["__exchange", "__kind"]);
-        let [n_owner, n_prog] = symbols.locals(["__owner", "__progress"]);
+        let [n_owner, n_prog, n_flow] = symbols.locals(["__owner", "__progress", "__flow"]);
         let [n_resp, n_live] = symbols.locals(["__response", "__running"]);
         let [n_tag, n_task] = symbols.locals(["__tag", "__task"]);
         let [n_turn, n_tasks] = symbols.locals(["__task_turn", "__tasks"]);
@@ -29,23 +34,34 @@ impl Tasks {
         let tasks = ctx.exec.tasks();
         let fibers = ctx.exec.fibers();
         let streams = ctx.exec.streams();
-        let ident = &ctx.exec.task.identity;
+        let ident = &ctx.exec.identity;
         let view = quote!((#v_link.state()));
         let state = quote!((#v_link.state_mut()));
-        let farms = fibers.iter().map(|pair| {
-            let task = pair.0;
-            let var = task.variant();
-            let store = task.path().route(&ctx.plan.spec.state_generics);
-            quote! {
+        let arms: Vec<proc_macro2::TokenStream> = fibers
+            .iter()
+            .map(|&(task, fiber)| (task, Some(fiber)))
+            .chain(streams.iter().copied().map(|task| (task, None)))
+            .map(|(task, fiber)| {
+                let var = task.variant();
+                let store = task.path().route(&ctx.plan.spec.state_generics);
+                let date = fiber.map(|_| &v_tdate);
+                let date = date.as_slice();
+                let (poll, kind) = match fiber {
+                    Some(fiber) if fiber.stream => (quote!(poll_stream), quote!(#n_kind,)),
+                    Some(_) => (quote!(poll), quote!()),
+                    None => (quote!(stream), quote!(#n_kind,)),
+                };
+                quote! {
                     #ident::#var(#n_task) => {
                         let mut #n_tasks = #store;
-                        let #v_tdate = #v_date.load();
+                        #(let #date = #v_date.load();)*
                         #ns_fiber::manifold::H1::new(
                             #n_tasks.as_mut(),
                             #n_task,
                             #n_resp,
-                        ).poll(
-                            &#v_tdate,
+                        ).#poll(
+                            #kind
+                            #( &#date, )*
                             #ident::#var,
                             #v_link,
                             #v_driver,
@@ -53,30 +69,9 @@ impl Tasks {
                             #n_exch,
                         )
                     },
-            }
-        });
-        let sarms = streams.iter().map(|task| {
-            let var = task.variant();
-            let store = task.path().route(&ctx.plan.spec.state_generics);
-            quote! {
-                    #ident::#var(#n_task) => {
-                        let mut #n_tasks = #store;
-                        #ns_fiber::manifold::H1::new(
-                            #n_tasks.as_mut(),
-                            #n_task,
-                            #n_resp,
-                        ).stream(
-                            #n_kind,
-                            #ident::#var,
-                            #v_link,
-                            #v_driver,
-                            #v_this.#f_life,
-                            #n_exch,
-                        )
-                    },
-            }
-        });
-        let arms: Vec<proc_macro2::TokenStream> = farms.chain(sarms).collect();
+                }
+            })
+            .collect();
         let pump = quote! {
             let #n_exch = #ns_core::life::sequence::Mode::current(
                 #v_this.#f_life,
@@ -99,7 +94,13 @@ impl Tasks {
         };
         let body = if tasks.is_empty() {
             quote! {
-                let #n_drive = #ns_h1::server::conn::driver::Driver::new(self, #v_date).progress(
+                let mut #v_routes = #dispatch {
+                    app: self,
+                    id: #v_link.id(),
+                    date: #v_date,
+                };
+                let #n_drive = #ns_h1::server::conn::driver::progress(
+                    ::core::pin::Pin::new(&mut #v_routes),
                     #v_link,
                     #v_driver,
                 );
@@ -121,13 +122,23 @@ impl Tasks {
                         return #ns_h1::server::deadline::Progress::default();
                     }
                 }
-                let #n_drive =
-                    #ns_h1::server::conn::driver::Driver::new(self.as_mut(), #v_date)
-                        .progress(#v_link, #v_driver);
+                let #n_drive = {
+                    let mut #v_routes = #dispatch {
+                        app: self.as_mut(),
+                        id: #v_link.id(),
+                        date: #v_date,
+                    };
+                    #ns_h1::server::conn::driver::progress(
+                        ::core::pin::Pin::new(&mut #v_routes),
+                        #v_link,
+                        #v_driver,
+                    )
+                };
                 let #n_active = #ns_h1::pump::Tasks::activity(&#view.async_state);
-                let (_, #n_prog) = #n_drive.settle(#n_active, || {
+                let (#n_flow, #n_prog) = #n_drive.into_parts();
+                if #n_flow.is_runnable(#n_active) {
                     self.activate(#v_date, #v_link, #v_driver);
-                });
+                }
                 #n_prog
             }
         };
@@ -155,21 +166,37 @@ impl Tasks {
                 let task = pair.0;
                 let var = task.variant();
                 let store = task.path().route(&ctx.plan.spec.state_generics);
+                if !pair.1.stream {
+                    return quote! {
+                        #ident::#var(#v_task) => {
+                            let mut #v_slab = #store;
+                            match #ns_fiber::dope_fiber::task::storage::fixed::staged::Store::remove_state(#v_slab.as_mut(), #v_task) {
+                                #ns_fiber::dope_fiber::task::storage::fixed::staged::Removal::Staged =>
+                                    #ns_h1::server::task::turn::Turn::StagedCancelled,
+                                #ns_fiber::dope_fiber::task::storage::fixed::staged::Removal::Live
+                                | #ns_fiber::dope_fiber::task::storage::fixed::staged::Removal::Absent =>
+                                    #ns_h1::server::task::turn::Turn::ConnectionCancelled,
+                            }
+                        },
+                    };
+                }
                 quote! {
                         #ident::#var(#v_task) => {
                             let mut #v_slab = #store;
-                            match #ns_fiber::dope_fiber::task::storage::fixed::staged::Store::remove_state(
-                                #v_slab.as_mut(),
-                                #v_task,
-                            ) {
-                                ::core::option::Option::Some(
-                                    #ns_fiber::dope_fiber::task::storage::fixed::staged::State::Staged,
-                                ) => #ns_h1::server::task::turn::Turn::StagedCancelled,
-                                ::core::option::Option::Some(
-                                    #ns_fiber::dope_fiber::task::storage::fixed::staged::State::Live
-                                    | #ns_fiber::dope_fiber::task::storage::fixed::staged::State::Vacant,
-                                )
-                                | ::core::option::Option::None => {
+                            let #v_staged = match #v_kind {
+                                #ns_h1::server::task::runtime::Kind::Stream
+                                | #ns_h1::server::task::runtime::Kind::Closing => true,
+                                #ns_h1::server::task::runtime::Kind::Fiber =>
+                                    #ns_fiber::dope_fiber::task::storage::fixed::local::Stream::get_mut(
+                                        #v_slab.as_mut(), &#v_task,
+                                    ).is_some_and(|#n_tasks| #n_tasks.is_head()),
+                            };
+                            match #v_slab.remove(#v_task) {
+                                #ns_fiber::dope_fiber::task::storage::fixed::local::Removal::Removed if #v_staged => {
+                                    #ns_h1::server::task::turn::Turn::StagedCancelled
+                                }
+                                #ns_fiber::dope_fiber::task::storage::fixed::local::Removal::Removed
+                                | #ns_fiber::dope_fiber::task::storage::fixed::local::Removal::Absent => {
                                     #ns_h1::server::task::turn::Turn::ConnectionCancelled
                                 }
                             }
@@ -182,18 +209,14 @@ impl Tasks {
             quote! {
                     #ident::#var(#v_task) => {
                         let mut #v_slab = #store;
-                        match #v_slab.remove(#v_task) {
-                            #ns_fiber::dope_fiber::task::storage::fixed::local::Removal::Removed
-                            | #ns_fiber::dope_fiber::task::storage::fixed::local::Removal::Absent => {
-                                match #v_kind {
-                                    #ns_h1::server::task::runtime::Kind::Closing => {
-                                        #ns_h1::server::task::turn::Turn::StagedCancelled
-                                    }
-                                    #ns_h1::server::task::runtime::Kind::Fiber
-                                    | #ns_h1::server::task::runtime::Kind::Stream => {
-                                        #ns_h1::server::task::turn::Turn::ConnectionCancelled
-                                    }
-                                }
+                        let _ = #v_slab.remove(#v_task);
+                        match #v_kind {
+                            #ns_h1::server::task::runtime::Kind::Closing => {
+                                #ns_h1::server::task::turn::Turn::StagedCancelled
+                            }
+                            #ns_h1::server::task::runtime::Kind::Fiber
+                            | #ns_h1::server::task::runtime::Kind::Stream => {
+                                #ns_h1::server::task::turn::Turn::ConnectionCancelled
                             }
                         }
                     },

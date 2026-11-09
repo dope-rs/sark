@@ -1,22 +1,4 @@
-use core::primitive;
-
 use sark_http::payload::{fixed, response::status};
-
-use self::{Boolean as bool, Byte as u8, Half as u16, Wide as u64, Word as u32};
-
-struct Byte;
-struct Half;
-struct Word;
-struct Wide;
-struct Boolean;
-struct Option<T>(T);
-struct Some<T>(T);
-struct None;
-struct Ok<T>(T);
-struct Err<T>(T);
-
-const _: (u8, u16, u32, u64, Some<()>, None) = (u8, u16, u32, u64, Some(()), None);
-const _: (bool, Option<primitive::u8>, Ok<()>, Err<()>) = (bool, Option(0), Ok(()), Err(()));
 
 #[sark_fiber::request]
 pub struct Request {

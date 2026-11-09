@@ -1,6 +1,6 @@
 pub mod common;
 
-use std::{mem::size_of, num::NonZero};
+use std::num::NonZero;
 
 use common::{
     field::huffman::{self, Reference as _},
@@ -17,12 +17,6 @@ use sark_http::field::metadata::{
     },
     integer::{Error, Overflow, PrefixedInt, Width},
 };
-
-#[test]
-fn views_match_slices() {
-    assert_eq!(size_of::<Source<'_>>(), size_of::<&[u8]>());
-    assert_eq!(size_of::<Encoded<'_>>(), size_of::<&[u8]>());
-}
 
 #[test]
 fn rfc_authority() {

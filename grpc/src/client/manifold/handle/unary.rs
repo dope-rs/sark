@@ -12,10 +12,7 @@ use crate::{
     Reason,
     client::{
         call::unary,
-        manifold::{
-            error, handle,
-            ops::{cancels, polls::Completion},
-        },
+        manifold::{error, handle, ops::cancels},
         receive,
     },
 };
@@ -45,7 +42,7 @@ impl<'app, 'life, 'e, 'd: 'app, P: ?Sized + 'app, ID: Identity> Unary<'app, 'lif
         error::Error,
     > {
         let call = self.call.as_ref().ok_or_else(Self::consumed)?;
-        let result = Completion::new(token, self.scope).unary(call, None)?;
+        let result = self.scope.poll_unary(token, call, None)?;
         if result.is_some() {
             self.call = None;
         }
@@ -96,7 +93,7 @@ impl<'app, 'life, 'e, 'd: 'app, P: ?Sized + 'app, ID: Identity> Unary<'app, 'lif
         'life: 'target,
     {
         let call = self.call.as_ref().ok_or_else(Self::consumed)?;
-        match Completion::new(token, self.scope).unary(call, Some((lease, wake)))? {
+        match self.scope.poll_unary(token, call, Some((lease, wake)))? {
             Some(result) => {
                 self.call = None;
                 task::Poll::Ready(Ok(result))

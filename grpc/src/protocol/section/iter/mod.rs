@@ -47,7 +47,7 @@ pub(crate) struct Iter<'a> {
 impl<'a> Iter<'a> {
     pub(crate) fn from(owner: &'a Valid) -> Self {
         Self {
-            state: State::Fields(<Fields<'a> as raw::Records<'a>>::new(owner)),
+            state: State::Fields(Fields::new(owner)),
         }
     }
 }
@@ -59,7 +59,7 @@ impl<'a> Iterator for Iter<'a> {
         loop {
             match &mut self.state {
                 State::Fields(current) => {
-                    let (name, value, indexing) = raw::Records::next(current)?;
+                    let (name, value, indexing) = current.next()?;
                     match value {
                         Value::Plain(value) => {
                             return Some(Entry::new(name, value).with_index(indexing));
@@ -83,7 +83,7 @@ impl<'a> Iterator for Iter<'a> {
                     let fields = *fields;
                     let name = *name;
                     let indexing = *indexing;
-                    let (value, tail) = raw::Joined::take(*parts);
+                    let (value, tail) = parts.take();
                     match tail {
                         Tail::Last(rest) => {
                             self.state = State::Final {

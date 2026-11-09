@@ -10,10 +10,7 @@ use crate::{
     Reason,
     client::{
         call::response,
-        manifold::{
-            api, error, handle,
-            ops::{cancels, polls::Completion},
-        },
+        manifold::{api, error, handle, ops::cancels},
         receive,
     },
 };
@@ -55,7 +52,7 @@ impl<'app, 'life, 'e, 'd: 'app, P: ?Sized + 'app, ID: Identity> handle::Completi
                 Reason::ResponseCancelled,
             ))
         })?;
-        Completion::new(token, self.scope).response(stream, Some((lease, wake)))
+        self.scope.poll_response(token, stream, Some((lease, wake)))
     }
 }
 

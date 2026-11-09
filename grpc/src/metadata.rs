@@ -18,7 +18,7 @@ where
 /// do not rescan the block before encoding it.
 #[derive(Default, PartialEq, Eq)]
 pub struct Metadata {
-    fields: map::Fields<Vec<u8>>,
+    fields: map::Fields,
 }
 
 /// Driver-local decoded metadata owner with a niche-backed empty state.

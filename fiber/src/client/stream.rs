@@ -96,32 +96,32 @@ impl<'app, 'e, 'b, 'c, 'd: 'app, B: ?Sized, ID: Identity> Stream<'app, 'e, 'b, '
         let item = match io.try_reserve(claim.region(), conn, wire) {
             Reserve::Item(item) => item,
             Reserve::Unknown(wire) | Reserve::Inactive(wire) => {
-                wire.recycle();
+                drop(wire);
                 return Err(Error::NotConnected);
             }
             Reserve::Rejected(cause) => {
                 let (load, cause) = cause.into_parts();
                 let charge = load.charge();
-                load.into_inner().recycle();
+                drop(load.into_inner());
                 return Err(Error::Capacity(capacity::Error::RequestEgress(
                     Rejection::Capacity { charge, cause },
                 )));
             }
             Reserve::Invalid(cause) => {
                 let (load, cause) = Rejected::<load::Value<_>>::from(cause).into_parts();
-                load.into_inner().recycle();
+                drop(load.into_inner());
                 return Err(Error::Capacity(capacity::Error::RequestEgress(cause)));
             }
             Reserve::Empty(cause) => {
                 let (load, cause) = cause.into_parts();
-                load.into_inner().recycle();
+                drop(load.into_inner());
                 return Err(Error::Capacity(capacity::Error::RequestEgress(
                     Rejection::Empty(cause),
                 )));
             }
         };
         let item = item.validate().map_err(|wire| {
-            wire.into_inner().recycle();
+            drop(wire.into_inner());
             Error::NotConnected
         })?;
         item.try_commit(move |token| {
@@ -139,7 +139,7 @@ impl<'app, 'e, 'b, 'c, 'd: 'app, B: ?Sized, ID: Identity> Stream<'app, 'e, 'b, '
         })
         .map_err(|rejected| {
             let (wire, cause) = rejected.into_parts();
-            wire.into_inner().recycle();
+            drop(wire.into_inner());
             cause
         })
     }
@@ -187,10 +187,12 @@ impl<'d, B: ?Sized, ID: Identity, E> phases::Events<'d> for Stream<'_, '_, '_, '
 impl<B: ?Sized, ID: Identity, E> Drop for Stream<'_, '_, '_, '_, '_, B, ID, E> {
     fn drop(&mut self) {
         if matches!(*self.state, State::Active(_)) {
-            use close::{LocalOrigin, Reason};
+            use close::{Directive, LocalOrigin, Reason};
 
-            self.io
-                .close(self.conn, Reason::Local(LocalOrigin::OperationCancelled));
+            self.io.close(
+                self.conn,
+                Directive::reconnect(Reason::Local(LocalOrigin::OperationCancelled)),
+            );
         }
     }
 }

@@ -18,14 +18,9 @@ fn resumes_drained_tail() {
         let cycle = driver.ingest(&mut conn, HEAD, &mut write, head::Connection::KeepAlive);
         assert_eq!(cycle.discard_remaining, 4);
         assert!(matches!(cycle.progress.head(), deadline::Head::Body));
-        let prefix = match cycle.state {
-            Ok(pump::Egress::Write {
-                prefix,
-                body: pump::Body::None,
-            }) => Some(prefix),
-            _ => None,
-        }
-        .expect("response");
+        let Ok(pump::Egress::Inline { prefix }) = cycle.state else {
+            panic!("response");
+        };
         assert!(matches!(
             pump::Drain::complete(&mut conn),
             pump::Completion::None
@@ -42,7 +37,7 @@ fn resumes_drained_tail() {
         let cycle = driver.ingest(&mut conn, input, &mut write, head::Connection::KeepAlive);
         assert!(matches!(cycle.progress.head(), deadline::Head::Ready));
         assert!(matches!(cycle.state,
-            Ok(pump::Egress::Write { prefix: written, body: pump::Body::None }) if written == prefix
+            Ok(pump::Egress::Inline { prefix: written }) if written == prefix
         ));
         assert!(write[..prefix].ends_with(b"\r\n\r\nok"));
         assert!(matches!(
@@ -83,7 +78,7 @@ fn discarded_method_body_policy() {
         assert_eq!(cycle.discard_remaining, 0);
         if expected == 200 {
             assert!(matches!(cycle.state,
-                Ok(pump::Egress::Write { prefix, body: pump::Body::None })
+                Ok(pump::Egress::Inline { prefix })
                     if write[..prefix].starts_with(SUCCESS)
             ));
         } else {
@@ -94,7 +89,7 @@ fn discarded_method_body_policy() {
             };
             assert!(matches!(cycle.connection, head::Connection::Close));
             assert!(matches!(cycle.state,
-                Ok(pump::Egress::Write { prefix: 0, body: pump::Body::Static(reply) })
+                Ok(pump::Egress::Static { prefix: 0, body: reply })
                     if reply.as_slice() == expected.as_slice()
             ));
         }
@@ -125,7 +120,7 @@ fn rejects_after_admission() {
             input.fill(b'!');
             let last = driver.ingest(&mut conn, tail, &mut write, head::Connection::KeepAlive);
             assert!(matches!(last.state,
-                Ok(pump::Egress::Write { prefix: 0, body: pump::Body::Static(reply) })
+                Ok(pump::Egress::Static { prefix: 0, body: reply })
                     if reply.as_slice() == expected.as_slice()
             ));
         }
@@ -172,14 +167,9 @@ fn fragmented_line_pipeline() {
         &mut write,
         head::Connection::KeepAlive,
     );
-    let prefix = match cycle.state {
-        Ok(pump::Egress::Write {
-            prefix,
-            body: pump::Body::None,
-        }) => Some(prefix),
-        _ => None,
-    }
-    .expect("responses");
+    let Ok(pump::Egress::Inline { prefix }) = cycle.state else {
+        panic!("responses");
+    };
     assert_eq!(
         write[..prefix]
             .windows(SUCCESS.len())
@@ -208,7 +198,7 @@ fn retains_upload_pipeline() {
             let mut write = [0; 1024];
             let cycle = driver.ingest(&mut conn, &input, &mut write, head::Connection::KeepAlive);
             assert!(matches!(cycle.state,
-                Ok(pump::Egress::Write { prefix, body: pump::Body::None })
+                Ok(pump::Egress::Inline { prefix })
                     if write[..prefix].starts_with(SUCCESS)
                         && write[..prefix].ends_with(b"\r\n\r\nok")
             ));
@@ -225,14 +215,9 @@ fn retains_upload_pipeline() {
         let mut write = [0; 2048];
         let cycle = driver.ingest(&mut conn, &[], &mut write, head::Connection::KeepAlive);
         assert_eq!(cycle.discard_remaining, 0);
-        let prefix = match cycle.state {
-            Ok(pump::Egress::Write {
-                prefix,
-                body: pump::Body::None,
-            }) => Some(prefix),
-            _ => None,
-        }
-        .expect("responses");
+        let Ok(pump::Egress::Inline { prefix }) = cycle.state else {
+            panic!("responses");
+        };
         assert_eq!(
             write[..prefix]
                 .windows(SUCCESS.len())

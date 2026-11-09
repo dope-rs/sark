@@ -213,7 +213,9 @@ where
         ) -> admit::Admission<'turn, 'd, D, R, E>,
     ) -> Turn<machine::Transaction<R, E>, B::Receipt> {
         let feed = self.feed();
-        let step = self.raw.transact(admit);
+        let step = self
+            .raw
+            .transact(&mut [], &mut Vec::new(), |_, emission| admit(emission));
         Turn { step, feed }
     }
 

@@ -13,6 +13,7 @@ pub struct Spec<'a> {
     pub data: Data<'a>,
     pub expect: Expected<'a>,
     pub dispatch: Dispatch,
+    pub read_response: bool,
 }
 
 impl<'a> Spec<'a> {
@@ -41,6 +42,7 @@ impl<'a> Spec<'a> {
                 connection_closed: false,
             },
             dispatch: Dispatch::Initial,
+            read_response: true,
         }
     }
 
@@ -95,6 +97,14 @@ pub struct Expected<'a> {
 
 #[sark_fiber::request]
 pub(crate) struct BodyReq {
+    #[raw_body]
+    pub(crate) payload: storage::Shared,
+}
+
+#[sark_fiber::request]
+pub(crate) struct StreamReq {
+    #[path]
+    pub(crate) kind: storage::Shared,
     #[raw_body]
     pub(crate) payload: storage::Shared,
 }

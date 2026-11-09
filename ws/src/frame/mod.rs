@@ -312,10 +312,7 @@ impl<'p> Frame<'p> {
             .map(storage::Exact::into_shared)
     }
 
-    pub(crate) fn write_into<const EXACT: bool>(
-        self,
-        out: &mut spans::Writer<'_, '_, EXACT>,
-    ) -> Result<(), consume::Error> {
+    pub(crate) fn write_into(self, out: &mut spans::Writer<'_, '_>) -> Result<(), consume::Error> {
         let (prefix, used) = self.prefix();
         // SAFETY: prefix emits at most fourteen initialized bytes from the
         // retained Plan, whose admitted header width and mask remain unchanged.

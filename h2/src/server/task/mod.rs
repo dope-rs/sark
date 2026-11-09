@@ -2,12 +2,11 @@
 
 use core::convert::Infallible;
 
-use conn::deadline;
 use data::compose;
 use dope::{
-    core::driver::{retained, route::Identity},
+    core::driver::route::Identity,
     manifold::network::listener::{conn, handler},
-    net::{link::egress::data, wire},
+    net::link::egress::data,
 };
 use ingress::errors;
 use o3::{
@@ -18,34 +17,30 @@ use o3::{
 use sark_core::{
     body, decode, duplex, life,
     life::{exchange, mode, owners},
-    manifold::{schedule::typed, task::app::Runtime},
+    manifold::{schedule::typed, server::app as semantic, task::app::Runtime},
 };
 use sark_http::owner::{self, cause};
 
 use crate::{
-    conn::{DataBlock, Error, event},
+    conn::{DataBlock, event},
     frame::numbers,
-    server::{
-        self,
-        response::Pending,
-        runtime::output::{self, flush},
-    },
+    server::response::Pending,
     stream,
 };
 
 type Reply<'d, R> = response::Response<
     'd,
     <R as decode::Decode>::Prepared,
-    <R as Runtime<'d>>::Completion,
     <R as duplex::Application<'d>>::Duplex,
+    <R as Runtime<'d>>::Fixed,
 >;
 
 type Data<'d, R> = response::Data<'d, <R as duplex::Application<'d>>::Duplex>;
 type Resident<'d, R> = response::Stored<
     'd,
     <R as decode::Decode>::Prepared,
-    <R as Runtime<'d>>::Completion,
     <R as duplex::Application<'d>>::Duplex,
+    <R as Runtime<'d>>::Fixed,
 >;
 type Next<'d, R> = typed::Next<Reply<'d, R>, Data<'d, R>, Infallible, DataBlock>;
 
@@ -55,49 +50,37 @@ type Built<'d, B> = body::BuildOutcome<
     errors::Build<<B as body::Build<'d>>::StepError>,
 >;
 
-type Borrowed<'a, 'd, R> = book::Turn<
+type Borrowed<'a, 'd, R, F = <R as decode::Decode>::Plan> = book::Turn<
     'a,
     'd,
     <R as decode::Decode>::Prepared,
     <R as decode::Decode>::Routes,
-    <R as decode::Decode>::Plan,
+    F,
     <R as Runtime<'d>>::Build,
-    <R as Runtime<'d>>::Completion,
     <R as duplex::Application<'d>>::Duplex,
+    <R as Runtime<'d>>::Fixed,
 >;
 
-type Carrier<'d, R, D> = State<
+type Carrier<'d, R, D, F = <R as decode::Decode>::Plan, S = ()> = State<
     'd,
     <R as decode::Decode>::Prepared,
     <R as decode::Decode>::Routes,
-    <R as decode::Decode>::Plan,
+    F,
     <R as Runtime<'d>>::Build,
-    <R as Runtime<'d>>::Completion,
     <R as duplex::Application<'d>>::Duplex,
+    <R as Runtime<'d>>::Fixed,
     <D as timers::Policy<'d>>::State,
+    S,
 >;
 
-type Context<'a, 'b, 'c, 'e, 'f, 'd, ID, R, W, M, D> = conn::Ctx<
-    'a,
-    'b,
-    'c,
-    'e,
-    'f,
-    'd,
-    ID,
-    W,
-    Carrier<'d, R, D>,
-    data::Bound<<M as Transport<'d, ID>>::Output, <R as decode::Decode>::Egress<'d>>,
->;
-
-type Retired<'a, 'b, 'd, ID, R, W, M, D> = conn::Retired<
+type Retired<'a, 'b, 'd, ID, R, W, M, D, A = service::Native<R>> = conn::Retired<
     'a,
     'b,
     'd,
     ID,
     W,
-    Carrier<'d, R, D>,
-    data::Bound<<M as Transport<'d, ID>>::Output, <R as decode::Decode>::Egress<'d>>,
+    Carrier<'d, R, D, <A as semantic::Spec>::Fields, service::State<'d, ID, A>>,
+    data::Bound<<M as Transport<'d, ID>>::Output, <A as semantic::Spec>::Egress<'d>>,
 >;
 
 mod app;
@@ -105,6 +88,7 @@ mod book;
 mod ingress;
 pub(in crate::server) mod registry;
 pub(in crate::server) mod response;
+pub mod service;
 mod state;
 pub mod timers;
 pub mod works;
@@ -115,27 +99,12 @@ pub(in crate::server) use state::State;
 use crate::server::Target;
 
 #[derive(Debug, Eq, PartialEq)]
-pub enum Build {
+pub enum Build<E = Infallible> {
     Connection(crate::conn::Build),
     Book(alloc::Error),
     Tasks(alloc::Error),
     Deadlines(heap::Error),
-}
-
-/// Scheduling and protocol bounds for the generated H2 adapter.
-pub(in crate::server) struct Config {
-    plan: server::Plan,
-    tasks: usize,
-}
-
-impl Config {
-    pub(in crate::server) const fn new(plan: server::Plan, tasks: usize) -> Self {
-        Self { plan, tasks }
-    }
-
-    pub(super) const fn into_parts(self) -> (server::Plan, usize) {
-        (self.plan, self.tasks)
-    }
+    Service(E),
 }
 
 fn identify<C: Copy>(conn: C, stream: stream::Key) -> exchange::Id<C, stream::Key> {
@@ -163,8 +132,8 @@ fn release_pending<'d, C: Copy, M: life::Mode<C, stream::Key>>(
 pub trait Transport<'d, ID: Identity>: life::Mode<conn::Id<'d, ID>, stream::Key> {
     type Output: data::raw::Payload<'d> + 'd;
 
-    fn release<R: decode::Decode>(
-        egress: data::Bound<Self::Output, R::Egress<'d>>,
+    fn release<B: resident::bound::Bound>(
+        egress: data::Bound<Self::Output, B>,
         cause: handler::Disposition,
     ) -> Option<owner::Effect<stream::Key>>;
 }
@@ -172,8 +141,8 @@ pub trait Transport<'d, ID: Identity>: life::Mode<conn::Id<'d, ID>, stream::Key>
 impl<'d, ID: Identity> Transport<'d, ID> for mode::Disabled {
     type Output = resident::Shared<'d>;
 
-    fn release<R: decode::Decode>(
-        _: data::Bound<Self::Output, R::Egress<'d>>,
+    fn release<B: resident::bound::Bound>(
+        _: data::Bound<Self::Output, B>,
         _: handler::Disposition,
     ) -> Option<owner::Effect<stream::Key>> {
         None
@@ -186,8 +155,8 @@ where
 {
     type Output = compose::Tagged<resident::Shared<'d>, stream::Key>;
 
-    fn release<R: decode::Decode>(
-        egress: data::Bound<Self::Output, R::Egress<'d>>,
+    fn release<B: resident::bound::Bound>(
+        egress: data::Bound<Self::Output, B>,
         cause: handler::Disposition,
     ) -> Option<owner::Effect<stream::Key>> {
         let (charge, tag) = {
@@ -206,52 +175,9 @@ where
     }
 }
 
-fn finish_transport<'d, ID: Identity, R, W, C, M>(
-    conn: &mut conn::Ctx<'_, '_, '_, '_, '_, 'd, ID, W, C, data::Bound<M::Output, R::Egress<'d>>>,
-    driver: &mut retained::Context<'_, '_, 'd>,
-    error: Option<Error>,
-    mode: &mut M,
-) where
-    W: wire::Spec,
-    C: output::State<'d>,
-    R: decode::Decode,
-    M: Transport<'d, ID>,
-    M::Output: flush::Evidence<'d>,
-{
-    let error = error.as_ref().map(|cause| {
-        mode.diagnostic(cause);
-        numbers::ErrorCode::from(cause)
-    });
-    flush::Flush::new(conn).observe(driver, error, mode);
-}
-
 pub(in crate::server::task) enum Sync {
     Armed,
     Finished,
-}
-
-fn arm_transport<'d, ID: Identity, R, W, C, M>(
-    conn: &mut conn::Ctx<'_, '_, '_, '_, '_, 'd, ID, W, C, data::Bound<M::Output, R::Egress<'d>>>,
-    driver: &mut retained::Context<'_, '_, 'd>,
-    arm: deadline::Arm<'d>,
-    mode: &mut M,
-) -> Sync
-where
-    W: wire::Spec,
-    C: output::State<'d>,
-    R: decode::Decode,
-    M: Transport<'d, ID>,
-    M::Output: flush::Evidence<'d>,
-{
-    use deadline::Arm;
-
-    match arm {
-        Arm::Armed => Sync::Armed,
-        Arm::Disabled | Arm::Sealed | Arm::Overflow(_) => {
-            flush::Flush::new(conn).observe(driver, Some(numbers::ErrorCode::InternalError), mode);
-            Sync::Finished
-        }
-    }
 }
 
 fn release_retired<C: Copy, M: life::Mode<C, stream::Key>>(
@@ -266,4 +192,16 @@ fn release_retired<C: Copy, M: life::Mode<C, stream::Key>>(
         charge,
         owner::Change::StagingReleased(cause),
     ));
+}
+
+fn rejected<'d, R: Runtime<'d>>(
+    failure: sark_core::manifold::schedule::Insert<stream::Key, Next<'d, R>>,
+) -> (stream::Key, numbers::ErrorCode) {
+    use sark_core::manifold::schedule::Insert;
+    match failure {
+        Insert::Full { stream, .. } => (stream, numbers::ErrorCode::EnhanceYourCalm),
+        Insert::Occupied { stream, .. } | Insert::Excluded { stream, .. } => {
+            (stream, numbers::ErrorCode::InternalError)
+        }
+    }
 }

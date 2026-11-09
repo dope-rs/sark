@@ -18,7 +18,7 @@ pub(crate) struct Events<
     C: session::Storage = storage::Shared,
     E: event::Evidence = event::Retirement,
 > {
-    queue: Queue<S, B, C, E>,
+    pub(in crate::conn) queue: Queue<S, B, C, E>,
 }
 
 impl<S, B, C: session::Storage, E: event::Evidence> Events<S, B, C, E> {
@@ -30,10 +30,6 @@ impl<S, B, C: session::Storage, E: event::Evidence> Events<S, B, C, E> {
         Ok(Self { queue })
     }
 
-    pub(crate) fn ready(&mut self) -> Option<event::Ready<'_, event::Event<S, B, C, E>>> {
-        self.queue.front_entry().map(event::Ready::new)
-    }
-
     pub(crate) fn is_empty(&self) -> bool {
         self.queue.is_empty()
     }
@@ -43,14 +39,16 @@ impl<S, B, C: session::Storage, E: event::Evidence> Events<S, B, C, E> {
             let Some(front) = self.queue.front_entry() else {
                 break;
             };
-            let (event, vacant) = front.take();
-            if !matches!(
-                &event,
+            if matches!(
+                front.get(),
                 event::Event::Headers { stream_id, .. }
                     | event::Event::Data { stream_id, .. }
                     | event::Event::StreamReset { stream_id, .. }
                     if *stream_id == key
             ) {
+                front.discard();
+            } else {
+                let (event, vacant) = front.take();
                 vacant.push_back(event);
             }
         }

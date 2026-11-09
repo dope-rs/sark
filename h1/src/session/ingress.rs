@@ -21,6 +21,7 @@ pub(super) enum Protocol<'d, P, R, H> {
     Ready(R),
     PendingHead(H),
     Line(parsing::Line),
+    Prefix(sark_http::preface::Prefix),
     Reject(parsing::Rejected<'d>),
 }
 
@@ -31,6 +32,7 @@ impl<'d, P, R, H> Protocol<'d, P, R, H> {
             | Self::Ready(_)
             | Self::PendingHead(_)
             | Self::Line(_)
+            | Self::Prefix(_)
             | Self::Reject(_) => recv::Window::Head,
             Self::Body(_) | Self::Working(_) => recv::Window::Body,
         }
@@ -40,11 +42,14 @@ impl<'d, P, R, H> Protocol<'d, P, R, H> {
     ///
     /// Reading only the frame kind and taking the body later would be two
     /// derivations of one decision; the value returned here is that decision.
-    pub(super) fn take_frame(&mut self) -> Frame<'d, P, R, H> {
+    pub(super) fn take_frame(&mut self, input: crate::Input<'_>) -> Frame<'d, P, R, H> {
         match mem::replace(self, Self::Head) {
             Self::Head => Frame::Head(HeadFrame::New),
             Self::PendingHead(head) => Frame::Head(HeadFrame::Pending(head)),
-            Self::Line(line) => Frame::Head(HeadFrame::Line(line)),
+            Self::Line(line) => Frame::Head(HeadFrame::Line(line.advance(input))),
+            Self::Prefix(prefix) => {
+                Frame::Head(HeadFrame::Line(parsing::Line::prefixed(prefix, input)))
+            }
             Self::Reject(reject) => Frame::Head(HeadFrame::Rejected(reject)),
             Self::Body(pending) => Frame::Body(pending),
             Self::Working(pending) => Frame::Working(pending),
@@ -64,7 +69,7 @@ pub(super) enum Frame<'d, P, R, H> {
 pub(super) enum HeadFrame<'d, H> {
     New,
     Pending(H),
-    Line(parsing::Line),
+    Line(Result<parsing::LineProgress, parsing::LineError<'d>>),
     Rejected(parsing::Rejected<'d>),
 }
 
@@ -125,17 +130,21 @@ pub struct Ingress<'d, Pending, Ready = Infallible, Heads = Infallible> {
 
 impl<'d, Pending, Ready, Heads> Default for Ingress<'d, Pending, Ready, Heads> {
     fn default() -> Self {
-        Self {
-            recv: recv::Buffer::default(),
-            framing: FramingState::default(),
-            payload: ingress::Ingress::default(),
-            protocol: Protocol::default(),
-            discard_remaining: 0,
-        }
+        Self::new(Protocol::default())
     }
 }
 
 impl<'d, Pending, Ready, Heads> Ingress<'d, Pending, Ready, Heads> {
+    pub(super) fn new(protocol: Protocol<'d, Pending, Ready, Heads>) -> Self {
+        Self {
+            recv: recv::Buffer::default(),
+            framing: FramingState::default(),
+            payload: ingress::Ingress::default(),
+            protocol,
+            discard_remaining: 0,
+        }
+    }
+
     /// A continuation still owns work which does not require another input byte.
     #[doc(hidden)]
     pub fn is_ready(&self) -> bool {
@@ -180,7 +189,10 @@ impl<'d, Pending, Ready, Heads> Ingress<'d, Pending, Ready, Heads> {
     pub fn retire(&mut self) {
         if matches!(
             self.protocol,
-            Protocol::PendingHead(_) | Protocol::Line(_) | Protocol::Reject(_)
+            Protocol::PendingHead(_)
+                | Protocol::Line(_)
+                | Protocol::Prefix(_)
+                | Protocol::Reject(_)
         ) {
             self.protocol = Protocol::Head;
         }
@@ -205,6 +217,7 @@ impl<'d, Pending, Ready, Heads> Ingress<'d, Pending, Ready, Heads> {
             Protocol::Ready(pending) => (1, ready(pending) as usize),
             Protocol::PendingHead(value) => (1, pending(value) as usize),
             Protocol::Line(line) => (1, line.len()),
+            Protocol::Prefix(prefix) => (1, prefix.as_ref().len()),
             Protocol::Reject(reject) => (1, reject.len()),
         };
         audit::Snapshot::default().request(

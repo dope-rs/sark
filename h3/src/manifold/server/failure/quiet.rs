@@ -33,6 +33,7 @@ impl<C, O: Sink<C>> Sink<C> for Quiet<O> {
 
 impl<C: Copy, S: Copy, O> life::Mode<C, S> for Quiet<O> {
     const ENABLED: bool = false;
+    const RESPONSE_CHARGE: bool = false;
     type Retention = evidence::Off;
     type Observer = Infallible;
     type Body<'a>

@@ -57,8 +57,8 @@ impl<'app, 'life, 'e, 'd: 'app, P: ?Sized + 'app, ID: Identity> Stream<'app, 'li
         let port = self.scope.port;
         let conn = self.scope.connection;
         match send::Sender::bound(token, port, conn).try_request(stream, codec, message)? {
-            send::Outcome::Sent => Ok(()),
-            send::Outcome::Pending => Err(error::Error::Protocol(call::Admission::<()>::reject())),
+            Some(()) => Ok(()),
+            None => Err(error::Error::Protocol(call::Admission::<()>::reject())),
         }
     }
 

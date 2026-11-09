@@ -26,6 +26,33 @@ pub struct Scalars {
     pub token: sark_json::Token<8>,
 }
 
+#[sark_json::json]
+pub struct Signed {
+    pub name: Shared,
+    pub price: i64,
+    pub quantity: i64,
+}
+
+pub const SIGNED_VALUES: [(&[primitive::u8], (i64, i64)); 2] = [
+    (
+        br#"{"name":"item","price":-9223372036854775808,"quantity":9223372036854775807}"#,
+        (i64::MIN, i64::MAX),
+    ),
+    (br#"{"name":"item","price":-0,"quantity":-1}"#, (0, -1)),
+];
+pub const SIGNED_INVALID: [&[primitive::u8]; 3] = [
+    br#"{"name":"item","price":9223372036854775808,"quantity":0}"#,
+    br#"{"name":"item","price":-9223372036854775809,"quantity":0}"#,
+    br#"{"name":"item","price":-1.5,"quantity":0}"#,
+];
+
+#[sark_json::json]
+pub struct NullableText {
+    pub name: option::Option<Shared>,
+}
+
+pub const NULL_TEXT_DUPLICATE: &[primitive::u8] = br#"{"name":null,"name":{"ignored":[true]}}"#;
+
 pub const FIELD_VALUES: [(&[primitive::u8], option::Option<u64>); 3] = [
     (br#"{"flag":true,"token":null}"#, option::Option::None),
     (
@@ -123,3 +150,11 @@ pub struct RenamedSequence {
     #[field(seq, name = "wire-values")]
     pub values: vec::Vec<Shared>,
 }
+
+pub const NON_STRING_FIELDS: [&[primitive::u8]; 5] = [
+    br#"{"name":123,"tags":[],"wire-values":[123]}"#,
+    br#"{"name":true,"tags":[],"wire-values":[true]}"#,
+    br#"{"name":null,"tags":[],"wire-values":[null]}"#,
+    br#"{"name":[],"tags":[],"wire-values":[[]]}"#,
+    br#"{"name":{},"tags":[],"wire-values":[{}]}"#,
+];

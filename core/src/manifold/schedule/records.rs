@@ -1,8 +1,7 @@
 use lanes::entry;
-type Vacant<'a, K, T> = entry::Slot<'a, K, T, LANES, direct::Vacant<'a, K, lanes::Node<T, LANES>>>;
 use o3::{
     alloc,
-    depot::{capacity, map::direct, queue::indexed::lanes},
+    depot::{capacity, queue::indexed::lanes},
 };
 
 use crate::manifold::{
@@ -59,7 +58,7 @@ impl<K: manifold::raw::Key, T> Records<K, T> {
         &mut self,
         stream: K,
         value: I,
-    ) -> Result<(Vacant<'_, K, T>, I), Insert<K, I>> {
+    ) -> Result<(entry::Vacancy<'_, K, T, LANES>, I), Insert<K, I>> {
         let used = self.slots.len();
         let limit = self.limit.get();
         let vacant = match self.slots.try_vacant(stream) {

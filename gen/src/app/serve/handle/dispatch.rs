@@ -12,13 +12,13 @@ pub(in crate::app::serve::handle) struct Dispatch {
 
 pub(in crate::app::serve::handle) struct Methods {
     pub(in crate::app::serve::handle) method_mask: proc_macro2::TokenStream,
-    pub(in crate::app::serve::handle) decoded_method_key: proc_macro2::TokenStream,
     pub(in crate::app::serve::handle) head_method_key: proc_macro2::TokenStream,
 }
 
 pub(in crate::app::serve) struct Shape {
     pub(in crate::app::serve) base_bounds: proc_macro2::TokenStream,
     pub(in crate::app::serve) generic_def: proc_macro2::TokenStream,
+    pub(in crate::app::serve) core_generic_def: proc_macro2::TokenStream,
     pub(in crate::app::serve) protocol_generic_def: proc_macro2::TokenStream,
     pub(in crate::app::serve) generic_use: proc_macro2::TokenStream,
     pub(in crate::app::serve) multiplexed_generic_use: proc_macro2::TokenStream,
@@ -29,8 +29,6 @@ impl Methods {
     pub(in crate::app::serve::handle) fn build(paths: &Paths, spec: &spec::Spec) -> Self {
         use quote::quote;
         let symbols = &spec.state_generics;
-        let [v_httpm] = symbols.locals(["__http_method"]);
-        let [v_dkey] = symbols.locals(["decoded_method_key"]);
         let [v_mbytes, v_mkey] = symbols.locals(["__method_bytes", "__method_key"]);
 
         let mut enabled = [false; route::Method::ALL.len()];
@@ -45,21 +43,6 @@ impl Methods {
         };
         let bits = methods().map(|method| method.bit_token(paths));
         let mask = quote!(0u8 #( | #bits )*);
-        let dchecks = methods().map(|method| {
-            let http = method.http_token(paths);
-            let key = method.key_token(paths);
-            quote! {
-                if #v_httpm == #http {
-                    ::core::option::Option::Some(#key)
-                }
-            }
-        });
-        let decoded = quote! {
-            let #v_dkey = #( #dchecks else )*
-            {
-                ::core::option::Option::None
-            };
-        };
         let hchecks = methods().map(|method| {
             let bytes = method.bytes_token();
             let key = method.key_token(paths);
@@ -78,7 +61,6 @@ impl Methods {
 
         Self {
             method_mask: mask,
-            decoded_method_key: decoded,
             head_method_key: head,
         }
     }
@@ -102,17 +84,20 @@ impl Shape {
         let values = &spec.state_generics.arguments;
         let clauses = &spec.state_generics.predicates;
         let routes = &spec.route_bounds;
-        let task = &context.exec.task;
-        let slabs = &task.slab_bounds;
-        let make_req = &task.producer_bounds;
+        let core = &context.core_ident;
+        let slabs = &context.exec.slab_bounds;
+        let make_req = &context.exec.producer_bounds;
         let base = quote! {
         #( #clauses, )*
         #( #routes )*
         #( #make_req )*
         #( #slabs )*
         };
-        let (futures, makers) = context.exec.producers();
-        let generic = quote! {
+        let generic = |stamp: bool| {
+            let (futures, makers) = context.exec.producers();
+            let stamp = stamp.then_some(&g_stamp);
+            let stamp = stamp.as_slice();
+            quote! {
             <
                 #g_brand: #l_env,
                 #l_env,
@@ -123,10 +108,11 @@ impl Shape {
                 #g_wire: #ns_fiber::dope::net::wire::Spec + #l_env,
                 #g_store: #ns_fiber::manifold::runtime::Storage,
                 #g_mode,
-                #g_stamp,
+                #( #stamp, )*
                 #( #futures, )*
                 #( #makers, )*
             >
+            }
         };
         let (futures, makers) = context.exec.producers();
         let proto = quote! {
@@ -145,11 +131,11 @@ impl Shape {
         };
         let (futures, makers) = context.exec.producers();
         let use_ = quote! {
-            <#g_brand, #l_env, #( #lives, )* 'd, #( #values, )* #g_id, #g_wire, #g_store, #g_mode, #g_stamp, #( #futures, )* #( #makers, )*>
+            <#core<#g_brand, #l_env, #( #lives, )* 'd, #( #values, )* #g_id, #g_wire, #g_store, #g_mode, #( #futures, )* #( #makers, )*>, #g_stamp>
         };
         let (futures, makers) = context.exec.producers();
         let multi = quote! {
-            <
+            <#core<
                 #g_brand,
                 #l_env,
                 #( #lives, )*
@@ -159,15 +145,15 @@ impl Shape {
                 #g_wire,
                 #ns_fiber::manifold::runtime::Prepared<#g_target>,
                 #ns_core::life::mode::Disabled,
-                (),
                 #( #futures, )*
                 #( #makers, )*
-            >
+            >, ()>
         };
 
         Self {
             base_bounds: base,
-            generic_def: generic,
+            generic_def: generic(true),
+            core_generic_def: generic(false),
             protocol_generic_def: proto,
             generic_use: use_,
             multiplexed_generic_use: multi,

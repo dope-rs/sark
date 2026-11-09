@@ -6,6 +6,8 @@ use core::mem;
 
 use known::Known;
 
+pub use parse::AcceptEncoding;
+
 use crate::{
     field::text::IntError,
     h1::{
@@ -36,25 +38,12 @@ const _: () = {
 pub struct Flags(u16);
 
 impl Flags {
-    pub const CONNECTION_CLOSE: u16 = 1 << 9;
-    pub const CONNECTION_KEEP_ALIVE: u16 = 1 << 10;
-
     pub fn is_set(self, bit: u16) -> bool {
         (self.0 & bit) != 0
     }
 
     pub fn set(&mut self, bit: u16) {
         self.0 |= bit;
-    }
-
-    pub fn is_close(self, version: &[u8]) -> bool {
-        if self.is_set(Self::CONNECTION_CLOSE) {
-            return true;
-        }
-        if self.is_set(Self::CONNECTION_KEEP_ALIVE) {
-            return false;
-        }
-        version == b"HTTP/1.0"
     }
 }
 

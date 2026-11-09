@@ -145,7 +145,9 @@ fn capture(state: audit::Snapshot, failed: &Cell<Option<audit::Snapshot>>) {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Identity {
     Opened(u64),
+    Committed(u64),
     Handoff(u64, hold::Charge),
+    StagingReleased(u64),
     Released(u64, hold::Charge),
     Retired(u64),
     Closed,
@@ -173,6 +175,7 @@ impl<'d, ID: route::Identity, D: Fn(&dyn fmt::Debug)> life::Observer<conn::Id<'d
 
         let fact = match event {
             Event::ExchangeOpened(exchange) => Identity::Opened(exchange.stream()),
+            Event::ResponseCommitted { exchange, .. } => Identity::Committed(exchange.stream()),
             Event::ResponseOwnership(effect) => match effect.change() {
                 Change::StagingAcquired(
                     cause::Acquire::Committed | cause::Acquire::Split | cause::Acquire::StreamChunk,
@@ -184,7 +187,7 @@ impl<'d, ID: route::Identity, D: Fn(&dyn fmt::Debug)> life::Observer<conn::Id<'d
                     | cause::Staging::Reset
                     | cause::Staging::Closed
                     | cause::Staging::PeerRetired,
-                ) => return,
+                ) => Identity::StagingReleased(effect.key().stream()),
                 Change::TransportReleased(
                     cause::Transport::Sent
                     | cause::Transport::Acked

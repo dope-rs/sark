@@ -1,10 +1,14 @@
 use common::client::recover;
 use common::client::runtime::peer;
 use dope::core::{driver::life::recovery, io::Reclaimed};
-use dope_test::harness::{GUARD, peer::AcceptScript};
+use dope_test::harness::{
+    GUARD,
+    peer::{AcceptScript, TcpAcceptor},
+    scenario::run::{self, Task as _},
+};
 pub mod common;
 
-use std::{mem, net::Shutdown, sync::mpsc, time::Duration};
+use std::{mem, net::Shutdown, str, time::Duration};
 
 use common::client::{
     config::{Config as _, FLAVORS},
@@ -16,7 +20,6 @@ use common::client::{
         peer::Response as _,
     },
 };
-use dope::core::platform::wake;
 use dope_fiber::BlockOn as _;
 use sark::client::protocol::retry::Policy;
 use sark_client::{
@@ -28,98 +31,82 @@ use sark_http::{field, h1::switch, method::Method};
 
 #[test]
 fn rejects_invalid_headers() {
-    let (quiesced, release) = wake::Ends::blocking()
-        .expect("validation observation gate")
-        .split();
-    AcceptScript::with(
-        move |acceptor| {
-            quiesced
-                .wait_timeout(GUARD)
-                .expect("validation drivers quiesce");
-            peer::empty(acceptor)
-        },
-        |server| {
-            for flavor in FLAVORS {
-                for (headers, expected) in [
-                    (
-                        &[("Host", "other.example")][..],
-                        RequestError::ReservedHeader,
-                    ),
-                    (
-                        &[("Transfer-Encoding", "chunked")][..],
-                        RequestError::ReservedHeader,
-                    ),
-                    (
-                        &[("bad name", "value")][..],
-                        RequestError::HeaderName(field::Error::InvalidByte {
-                            index: 3,
-                            byte: b' ',
-                        }),
-                    ),
-                    (
-                        &[("x-test", "bad\r\nvalue")][..],
-                        RequestError::HeaderValue(field::Error::InvalidByte {
-                            index: 3,
-                            byte: b'\r',
-                        }),
-                    ),
-                    (
-                        &[("x-test", "bad\0value")][..],
-                        RequestError::HeaderValue(field::Error::InvalidByte { index: 3, byte: 0 }),
-                    ),
-                    (
-                        &[("x-test", "bad\u{b}value")][..],
-                        RequestError::HeaderValue(field::Error::InvalidByte { index: 3, byte: 11 }),
-                    ),
-                    (
-                        &[("x-test", "bad\u{c}value")][..],
-                        RequestError::HeaderValue(field::Error::InvalidByte { index: 3, byte: 12 }),
-                    ),
-                    (
-                        &[("x-test", "bad\u{7f}value")][..],
-                        RequestError::HeaderValue(field::Error::InvalidByte {
-                            index: 3,
-                            byte: 127,
-                        }),
-                    ),
-                ] {
-                    Request::new(
-                        flavor,
-                        &server.addr().to_string(),
-                        Config::new(server.addr().to_string()),
-                        Method::GET,
-                        "/",
-                        headers,
-                        &[],
-                    )
-                    .try_run(
-                        |outcome| {
-                            let failure = (outcome)
-                                .err()
-                                .expect("invalid headers must fail before submission");
-                            assert!((failure.safety()) == (Safety::BeforeSubmit));
-                            assert!(matches!(
-                                failure.cause(),
-                                Error::Request(actual) if *actual == expected
-                            ));
-                        },
-                        recovery::Policy::new(
-                            |event| std::assert_matches!(event, Reclaimed::Shutdown),
-                            recover,
-                        ),
-                        |result| result.expect("client execution"),
-                    )
-                    .expect("HTTP request execution");
-                }
-            }
-            release.notify().expect("validation observation release");
-            server
-                .finish()
-                .expect("peer thread")
-                .expect("validation never submits any bytes");
-        },
-    )
-    .expect("spawn validation peer")
+    let mut acceptor = TcpAcceptor::bind(([127, 0, 0, 1], 0).into()).expect("validation listener");
+    let addr = acceptor.local_addr().expect("listener address").to_string();
+    for flavor in FLAVORS {
+        for (headers, expected) in [
+            (
+                &[("Host", "other.example")][..],
+                RequestError::ReservedHeader,
+            ),
+            (
+                &[("Transfer-Encoding", "chunked")][..],
+                RequestError::ReservedHeader,
+            ),
+            (
+                &[("bad name", "value")][..],
+                RequestError::HeaderName(field::Error::InvalidByte {
+                    index: 3,
+                    byte: b' ',
+                }),
+            ),
+            (
+                &[("x-test", "bad\r\nvalue")][..],
+                RequestError::HeaderValue(field::Error::InvalidByte {
+                    index: 3,
+                    byte: b'\r',
+                }),
+            ),
+            (
+                &[("x-test", "bad\0value")][..],
+                RequestError::HeaderValue(field::Error::InvalidByte { index: 3, byte: 0 }),
+            ),
+            (
+                &[("x-test", "bad\u{b}value")][..],
+                RequestError::HeaderValue(field::Error::InvalidByte { index: 3, byte: 11 }),
+            ),
+            (
+                &[("x-test", "bad\u{c}value")][..],
+                RequestError::HeaderValue(field::Error::InvalidByte { index: 3, byte: 12 }),
+            ),
+            (
+                &[("x-test", "bad\u{7f}value")][..],
+                RequestError::HeaderValue(field::Error::InvalidByte {
+                    index: 3,
+                    byte: 127,
+                }),
+            ),
+        ] {
+            Request::new(
+                flavor,
+                &addr,
+                Config::new(addr.clone()),
+                Method::GET,
+                "/",
+                headers,
+                &[],
+            )
+            .try_run(
+                |outcome| {
+                    let failure = (outcome)
+                        .err()
+                        .expect("invalid headers must fail before submission");
+                    assert!((failure.safety()) == (Safety::BeforeSubmit));
+                    assert!(matches!(
+                        failure.cause(),
+                        Error::Request(actual) if *actual == expected
+                    ));
+                },
+                recovery::Policy::new(
+                    |event| std::assert_matches!(event, Reclaimed::Shutdown),
+                    recover,
+                ),
+                |result| result.expect("client execution"),
+            )
+            .expect("HTTP request execution");
+            peer::empty(&mut acceptor).expect("validation never submits any bytes");
+        }
+    }
 }
 
 #[test]
@@ -135,6 +122,7 @@ fn failed_origin_keeps_slot() {
             origins::Plan::new(config, 1, 1, 1)
                 .expect("dynamic plan")
                 .enter(
+                    (),
                     |mut app| {
                         let client = app.handle;
                         let failed = app
@@ -200,56 +188,39 @@ fn failed_origin_keeps_slot() {
 #[test]
 fn rejects_connect() {
     for flavor in FLAVORS {
-        let (quiesced, release) = wake::Ends::blocking()
-            .expect("CONNECT observation gate")
-            .split();
-        AcceptScript::with(
-            move |acceptor| {
-                quiesced
-                    .wait_timeout(GUARD)
-                    .expect("CONNECT driver quiesces");
-                peer::empty(acceptor)
-            },
-            |peer| {
-                Request::new(
-                    flavor,
-                    &peer.addr().to_string(),
-                    flavor
-                        .try_config(peer.addr())
-                        .expect("HTTP host allocation"),
-                    Method::CONNECT,
-                    "example.test:443",
-                    &[],
-                    &[],
-                )
-                .try_run(
-                    |outcome| {
-                        let failure = (outcome)
-                            .err()
-                            .expect("CONNECT must not reach HTTP message mode");
-                        assert!((failure.safety()) == (Safety::BeforeSubmit));
-                        assert!(
-                            matches!(
-                                failure.cause(),
-                                Error::Request(RequestError::UnsupportedTransition)
-                            ),
-                            "{failure:?}"
-                        );
-                    },
-                    recovery::Policy::new(
-                        |event| std::assert_matches!(event, Reclaimed::Shutdown),
-                        recover,
-                    ),
-                    |result| result.expect("client execution"),
-                )
-                .expect("HTTP request execution");
-                release.notify().expect("CONNECT observation release");
-                peer.finish()
-                    .expect("peer thread")
-                    .expect("CONNECT never submits any bytes");
-            },
+        let mut acceptor = TcpAcceptor::bind(([127, 0, 0, 1], 0).into()).expect("CONNECT listener");
+        let addr = acceptor.local_addr().expect("listener address");
+        Request::new(
+            flavor,
+            &addr.to_string(),
+            flavor.try_config(addr).expect("HTTP host allocation"),
+            Method::CONNECT,
+            "example.test:443",
+            &[],
+            &[],
         )
-        .expect("spawn CONNECT rejection peer")
+        .try_run(
+            |outcome| {
+                let failure = (outcome)
+                    .err()
+                    .expect("CONNECT must not reach HTTP message mode");
+                assert!((failure.safety()) == (Safety::BeforeSubmit));
+                assert!(
+                    matches!(
+                        failure.cause(),
+                        Error::Request(RequestError::UnsupportedTransition)
+                    ),
+                    "{failure:?}"
+                );
+            },
+            recovery::Policy::new(
+                |event| std::assert_matches!(event, Reclaimed::Shutdown),
+                recover,
+            ),
+            |result| result.expect("client execution"),
+        )
+        .expect("HTTP request execution");
+        peer::empty(&mut acceptor).expect("CONNECT never submits any bytes");
     }
 }
 
@@ -362,42 +333,14 @@ fn attempts() {
 #[test]
 fn get_retries() {
     for flavor in FLAVORS {
-        let (quiesced, release) = wake::Ends::blocking()
-            .expect("retry observation gate")
-            .split();
-        AcceptScript::with(
-            move |acceptor| {
-                for first in [true, false] {
-                    let stream = acceptor.accept()?;
-                    let mut conn = peer::Conn::new(&stream);
-                    let request = conn.try_request()?.expect("retry request");
-                    assert_eq!(request.method(), "GET");
-                    assert_eq!(request.target(), "/effect");
-                    if first {
-                        stream.shutdown(Shutdown::Both)?;
-                        continue;
-                    }
-                    conn.write_all(
-                        b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok",
-                    )?;
-                    quiesced.wait_timeout(GUARD).expect("retry driver quiesces");
-                    peer::closed(&mut conn)?;
-                }
-                peer::empty(acceptor)
-            },
-            |server| {
-                let config = Config::new(server.addr().to_string())
-                    .retry(Policy::default())
-                    .timeout(Duration::from_secs(3));
-                let response = Request::new(
-                    flavor,
-                    &server.addr().to_string(),
-                    config,
-                    Method::GET,
-                    "/effect",
-                    &[],
-                    &[],
-                )
+        let mut acceptor = TcpAcceptor::bind(([127, 0, 0, 1], 0).into()).expect("retry listener");
+        let addr = acceptor.local_addr().expect("listener address");
+        let (served, ()) = run::Entry(move || {
+            let addr = addr.to_string();
+            let config = Config::new(addr.clone())
+                .retry(Policy::default())
+                .timeout(Duration::from_secs(3));
+            let response = Request::new(flavor, &addr, config, Method::GET, "/effect", &[], &[])
                 .try_run(
                     |result| result.expect("HTTP response"),
                     recovery::Policy::new(
@@ -407,27 +350,42 @@ fn get_retries() {
                     |result| result.expect("client execution"),
                 )
                 .expect("HTTP request execution");
-                release.notify().expect("retry observation release");
-                server
-                    .finish()
-                    .expect("peer thread")
-                    .expect("exactly two retry requests");
-                assert_eq!(response.status().as_u16(), 200);
-            },
-        )
-        .expect("spawn retry peer")
+            assert_eq!(response.status().as_u16(), 200);
+        })
+        .with(|| {
+            for first in [true, false] {
+                let stream = acceptor.accept_for(GUARD)?.expect("retry connection");
+                stream.read_wait(Some(GUARD))?;
+                stream.write_wait(Some(GUARD))?;
+                stream.set_nodelay(true)?;
+                let mut conn = peer::Conn::new(&stream);
+                let request = conn.try_request()?.expect("retry request");
+                assert_eq!(request.method(), "GET");
+                assert_eq!(request.target(), "/effect");
+                if first {
+                    stream.shutdown(Shutdown::Both)?;
+                    continue;
+                }
+                conn.write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok",
+                )?;
+                peer::closed(&mut conn)?;
+            }
+            Ok::<_, peer::Error>(())
+        })
+        .expect("client worker");
+        served.expect("exactly two retry requests");
+        peer::empty(&mut acceptor).expect("no extra retry requests");
     }
 }
 
 #[test]
 fn uses_exact_authority() {
-    let (tx, rx) = mpsc::channel();
     AcceptScript::with(
-        move |acceptor| {
-            peer::serve_each(acceptor, move |stream, request| {
-                (tx.send(request.wire().to_vec()))
-                    .as_ref()
-                    .expect("record authority request");
+        |acceptor| {
+            peer::serve_each(acceptor, |stream, request| {
+                let request = str::from_utf8(request.wire()).expect("ASCII request");
+                assert!(request.contains("\r\nHost: [2001:DB8::1]:8080\r\n"));
                 let response = "HTTP/1.1 200 OK"
                     .response(&[("Connection", "close"), ("Content-Length", "2")], b"ok");
                 stream.write_all(response.as_slice())
@@ -453,11 +411,6 @@ fn uses_exact_authority() {
             )
             .expect("HTTP request execution");
             assert_eq!(response.status().as_u16(), 200);
-            let request = rx.recv_timeout(Duration::from_secs(2));
-            let request = request.expect("captured request");
-            let request = String::from_utf8(request);
-            let request = request.expect("ASCII request");
-            assert!(request.contains("\r\nHost: [2001:DB8::1]:8080\r\n"));
             server
                 .stop()
                 .expect("peer thread")

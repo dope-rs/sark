@@ -47,11 +47,10 @@ fn admission_and_retirement() {
             let limits = calls::Settings::new(Some(1), Some(1), Some(8), Some(1))
                 .try_build().expect("one call and one output owner");
             clients::Plan::new(address, limits, limits.calls()).expect("gRPC client plan")
-                .enter(|mut scope| {
-                    let client = scope.handle;
-                    fibers::TEST.try_run(&mut scope.app, client.wait_active())
+                .enter(|mut app, client| {
+                    fibers::TEST.try_run(&mut app, client.wait_active())
                         .expect("client drive").expect("active gRPC connection");
-                    fibers::TEST.try_run(&mut scope.app, dope_fiber::fiber!('_ => async move {
+                    fibers::TEST.try_run(&mut app, dope_fiber::fiber!('_ => async move {
                         let metadata = Metadata::new();
                         let path = b"/proof/Chat".to_vec();
                         assert!(fibers::TEST.poll_once(
@@ -120,7 +119,7 @@ fn admission_and_retirement() {
                 }, recovery::Policy::new(
                     |event| assert!(matches!(event, Reclaimed::Shutdown), "unexpected client retirement: {event:?}"),
                     common::recover,
-                ), |result| result.expect("gRPC client completion"))
+                ))
                 .expect("gRPC client runtime");
         },
     ).expect("manifold stream roundtrip");
@@ -150,9 +149,8 @@ fn tiny_input_preserves_control_progress() {
                 clients::Plan::new(address, limits, 1)
                     .expect("gRPC client plan")
                     .enter(
-                        |mut scope| {
-                            let client = scope.handle;
-                            fibers::TEST.try_run(&mut scope.app, dope_fiber::fiber!('_ => async move {
+                        |mut app, client| {
+                            fibers::TEST.try_run(&mut app, dope_fiber::fiber!('_ => async move {
                                 client.wait_active().await.expect("active gRPC connection");
                                 let path = b"/proof/Tiny";
                                 let metadata = Metadata::new();
@@ -186,7 +184,6 @@ fn tiny_input_preserves_control_progress() {
                             |event| assert!(matches!(event, Reclaimed::Shutdown), "unexpected client retirement: {event:?}"),
                             common::recover,
                         ),
-                        |result| result.expect("gRPC client completion"),
                     )
                     .expect("gRPC client runtime");
             },
@@ -197,19 +194,16 @@ fn tiny_input_preserves_control_progress() {
 
 #[test]
 fn rejected_calls_reset() {
-    use std::{
-        sync::mpsc,
-        time::{Duration, Instant},
-    };
+    use std::time::Duration;
 
-    use dope_test::harness::{GUARD, peer::TcpScript};
+    use common::grpc::native::Peer;
+    use dope::core::io::socket::Listener;
+    use dope_fiber::task::done::Once;
+    use dope_test::harness::GUARD;
     use sark_core::manifold::schedule::Insert;
-    use sark_grpc::{Reason, client::config, details::Diagnostic};
+    use sark_grpc::client::config;
     use sark_h2::{
-        frame::{
-            layout::Header,
-            numbers::{Flags, Type},
-        },
+        frame::{numbers::ErrorCode, payload::Payload},
         stream::Id,
     };
 
@@ -222,238 +216,128 @@ fn rejected_calls_reset() {
 
     for method in [Method::Unary, Method::Request, Method::Bidi] {
         let unary = matches!(method, Method::Unary);
-        let (progress, observed) = mpsc::sync_channel(1);
-        let (release, proceed) = mpsc::sync_channel(1);
-        TcpScript::with(
-        move |stream| {
-            let mut preface = [0; 24];
-            stream.read_exact(&mut preface).expect("client preface");
-            assert_eq!(&preface, b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n");
-            let reset = loop {
-                let mut bytes = [0; 9];
-                let received = stream.read_exact(&mut bytes);
-                if matches!(received, Err(dope_test::harness::peer::Error::TimedOut)) {
-                    break false;
+        let listener = Listener::bind(([127, 0, 0, 1], 0).into()).expect("native H2 peer");
+        let limits = if unary {
+            config::Limits::default()
+                .try_bytes(0)
+                .expect("empty messages allowed")
+        } else {
+            config::Limits::default()
+                .try_calls(1)
+                .expect("one gRPC call")
+        };
+        clients::Plan::new(listener.local_addr(), limits, 2).expect("two H2 slots")
+            .enter_peer(listener, |mut app, client, listener| {
+                app.drive_for(GUARD, Once::new(client.wait_active()))
+                    .expect("client drive").expect("active connection");
+                let mut peer = app.drive_for(GUARD, Once::new(Peer::accept(listener, &[
+                            0, 0, 0, 4, 0, 0, 0, 0, 0,
+                            0, 0, 0, 4, 1, 0, 0, 0, 0,
+                ]))).expect("server SETTINGS and acknowledgment");
+                let metadata = Metadata::new();
+                let retained = if unary {
+                    None
+                } else {
+                    let request = app.drive_for(GUARD, Once::new(
+                        client.open_request(b"/proof/Held", None, &metadata),
+                    )).expect("first request drive").expect("retained first request");
+                    while !app.drive_for(GUARD, Once::new(peer.next(|frame| {
+                        matches!(frame, Payload::Headers(head) if head.stream_id() == Id::FIRST_CLIENT)
+                    }))).expect("first request on wire") {}
+                    Some(request)
+                };
+                let message = vec![b'x'];
+                let error = match method {
+                    Method::Unary => app.drive_for(GUARD, Once::new(
+                        client.unary(b"/proof/Reject", None, &metadata, Bytes, &message),
+                    )).expect("rejected unary drive").err().expect("message exceeds zero-byte limit"),
+                    Method::Request => app.drive_for(GUARD, Once::new(
+                        client.open_request(b"/proof/Reject", None, &metadata),
+                    )).expect("rejected request drive").err().expect("gRPC slot excluded"),
+                    Method::Bidi => app.drive_for(GUARD, Once::new(
+                        client.open_bidi(b"/proof/Reject", None, &metadata),
+                    )).expect("rejected bidi drive").err().expect("gRPC slot excluded"),
+                };
+                if unary {
+                    assert!(matches!(error, Error::Protocol(status) if matches!(
+                        Diagnostic::from(&status),
+                        Diagnostic::Local { code: Code::ResourceExhausted, reason: Reason::MessageLarge }
+                    )));
+                } else {
+                    assert!(matches!(error, Error::Protocol(status) if status.code() == Code::Internal && matches!(
+                        Diagnostic::from(&status),
+                        Diagnostic::Insert {
+                            cause: Insert::Excluded { stream, value: (), index: 1, capacity: 1 },
+                            reset: Ok(()),
+                        } if stream.id().into_u32() == 3
+                    )));
                 }
-                received.expect("client frame");
-                let header = Header::parse(&bytes).expect("client frame header");
-                let mut payload = vec![0; header.length.into_usize()];
-                stream.read_exact(&mut payload).expect("client frame payload");
-                let settled = header.kind == Type::Settings && header.flags.contains(Flags::ACK);
-                let opened = !unary && header.kind == Type::Headers && header.stream_id == Id::FIRST_CLIENT;
-                if header.kind == Type::Settings && !settled {
-                    stream.write_all(&[
-                        0, 0, 0, 4, 0, 0, 0, 0, 0,
-                        0, 0, 0, 4, 1, 0, 0, 0, 0,
-                    ]).expect("server SETTINGS and client SETTINGS acknowledgment");
-                }
-                if settled || opened {
-                    progress.send(None).expect("client progress observer");
-                    if unary || opened {
-                        proceed.recv_timeout(GUARD).expect("rejection completed");
-                        stream.read_wait(Some(Duration::from_millis(200)))
-                            .expect("reset deadline");
-                    }
-                }
-                if header.kind == Type::RstStream {
-                    assert_eq!(header.stream_id.into_u32(), if unary { 1 } else { 3 });
-                    assert_eq!(payload, [0, 0, 0, if unary { 8 } else { 7 }]);
-                    break true;
-                }
-            };
-            progress.send(Some(reset)).expect("reset observer");
-            proceed.recv_timeout(GUARD).expect("client runtime retired");
-        },
-        |peer| {
-            let limits = if unary {
-                config::Limits::default().try_bytes(0).expect("empty messages allowed")
-            } else {
-                config::Limits::default().try_calls(1).expect("one gRPC call")
-            };
-            let reset = clients::Plan::new(peer.addr(), limits, 2).expect("two H2 slots")
-                .enter(|mut scope| {
-                    let client = scope.handle;
-                    fibers::TEST.try_run(&mut scope.app, client.wait_active())
-                        .expect("client drive").expect("active connection");
-                    let metadata = Metadata::new();
-                    let mut retained = None;
-                    let started = Instant::now();
-                    loop {
-                        match observed.try_recv() {
-                            Ok(settled) => {
-                                assert_eq!(settled, None);
-                                if !unary && retained.is_none() {
-                                    retained = Some(fibers::TEST.try_run(
-                                        &mut scope.app,
-                                        client.open_request(b"/proof/Held", None, &metadata),
-                                    ).expect("first request drive").expect("retained first request"));
-                                    continue;
+                let reset = app.drive_for(Duration::from_millis(200), Once::new(
+                    dope_fiber::fiber!('_ => async move {
+                        loop {
+                            if let Some(reset) = peer.next(|frame| {
+                                if let Payload::RstStream(reset) = frame {
+                                    Some((reset.stream_id(), reset.error()))
+                                } else {
+                                    None
                                 }
-                                break;
-                            }
-                            Err(error) => {
-                                assert_eq!(error, mpsc::TryRecvError::Empty, "client progress observer");
-                                assert!(started.elapsed() < GUARD, "client progress deadline");
-                                fibers::TEST.try_pause(&mut scope.app, Duration::from_millis(10))
-                                    .expect("drive SETTINGS and first request");
+                            }).await {
+                                break reset;
                             }
                         }
-                    }
-                    fibers::TEST.try_pause(&mut scope.app, Duration::from_millis(100))
-                        .expect("retire prior I/O before rejection");
-                    let message = vec![b'x'];
-                    let error = match method {
-                        Method::Unary => fibers::TEST.try_run(
-                            &mut scope.app,
-                            client.unary(b"/proof/Reject", None, &metadata, Bytes, &message),
-                        ).expect("rejected unary drive").err().expect("message exceeds zero-byte limit"),
-                        Method::Request => fibers::TEST.try_run(
-                            &mut scope.app,
-                            client.open_request(b"/proof/Reject", None, &metadata),
-                        ).expect("rejected request drive").err().expect("gRPC slot excluded"),
-                        Method::Bidi => fibers::TEST.try_run(
-                            &mut scope.app,
-                            client.open_bidi(b"/proof/Reject", None, &metadata),
-                        ).expect("rejected bidi drive").err().expect("gRPC slot excluded"),
-                    };
-                    if unary {
-                        assert!(matches!(error, Error::Protocol(status) if matches!(
-                            Diagnostic::from(&status),
-                            Diagnostic::Local { code: Code::ResourceExhausted, reason: Reason::MessageLarge }
-                        )));
-                    } else {
-                        assert!(matches!(error, Error::Protocol(status) if status.code() == Code::Internal && matches!(
-                            Diagnostic::from(&status),
-                            Diagnostic::Insert {
-                                cause: Insert::Excluded { stream, value: (), index: 1, capacity: 1 },
-                                reset: Ok(()),
-                            } if stream.id().into_u32() == 3
-                        )));
-                    }
-                    release.send(()).expect("observe reset after rejection");
-                    fibers::TEST.try_pause(&mut scope.app, Duration::from_millis(500))
-                        .expect("drive idle client");
-                    let reset = observed.recv_timeout(GUARD).expect("reset observation").expect("reset phase");
-                    drop(retained);
-                    reset
-                }, recovery::Policy::new(
-                    |event| assert!(matches!(event, Reclaimed::Shutdown), "unexpected client retirement: {event:?}"),
-                    common::recover,
-                ), |result| result.expect("gRPC client completion"))
-                .expect("gRPC client runtime");
-            release.send(()).expect("release scripted peer after client retirement");
-            peer.finish().expect("scripted H2 peer");
-            assert!(reset, "rejected {method:?} must flush its reset without another gRPC operation");
-        },
-    ).expect("scripted H2 server");
+                    }),
+                )).expect("rejection flushes reset without another gRPC operation");
+                assert_eq!(reset.0.into_u32(), if unary { 1 } else { 3 });
+                assert_eq!(reset.1, if unary { ErrorCode::Cancel } else { ErrorCode::RefusedStream });
+                drop(retained);
+            }, recovery::Policy::new(
+                |event| assert!(matches!(event, Reclaimed::Shutdown), "unexpected client retirement: {event:?}"),
+                common::recover,
+            ))
+            .expect("gRPC client runtime");
     }
 }
 
 #[test]
 fn sender_notification_survives_cancel() {
-    use std::{
-        cell::Cell,
-        time::{Duration, Instant},
-    };
+    use std::{cell::Cell, task::Poll};
 
-    use common::grpc::native::{CancelSender, Sender};
-    use dope::core::platform::wake;
-    use dope_fiber::task::batch;
-    use dope_test::harness::{GUARD, peer::TcpScript};
-    use sark_h2::frame::{
-        layout::Header,
-        numbers::{Flags, Type},
+    use common::grpc::native::{CancelSender, Peer, Sender, ZERO_WINDOW};
+    use dope::core::io::socket::Listener;
+    use dope_fiber::{
+        abi,
+        task::{batch, done::Once},
     };
+    use dope_test::harness::GUARD;
+    use sark_h2::frame::payload::Payload;
 
     for sender in [Sender::Unary, Sender::Stream, Sender::Borrowed] {
         let opening = !matches!(sender, Sender::Borrowed);
-        let (settled, handshake) = wake::Ends::blocking().expect("handshake signal").split();
-        let (release, queued) = wake::Ends::blocking()
-            .expect("sender admission signal")
-            .split();
-        let (finished, finish) = wake::Ends::blocking()
-            .expect("peer lifetime signal")
-            .split();
-        TcpScript::with(
-            move |stream| {
-                let mut preface = [0; 24];
-                stream.read_exact(&mut preface).expect("client preface");
-                assert_eq!(&preface, b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n");
-                // Keep every request owner resident until both senders are queued.
-                stream.write_all(&[
-                    0, 0, 6, 4, 0, 0, 0, 0, 0, 0, 4, 0, 0, 0, 0,
-                    0, 0, 0, 4, 1, 0, 0, 0, 0,
-                ]).expect("zero stream window and SETTINGS acknowledgment");
-                let mut opened = 0;
-                while opened != if opening { 1 } else { 3 } {
-                    let mut bytes = [0; 9];
-                    stream.read_exact(&mut bytes).expect("initial frame");
-                    let header = Header::parse(&bytes).expect("initial frame header");
-                    let mut payload = vec![0; header.length.into_usize()];
-                    stream.read_exact(&mut payload).expect("initial frame payload");
-                    if header.kind == Type::Settings && header.flags.contains(Flags::ACK) {
-                        handshake.notify().expect("zero window installed");
-                    }
-                    if header.kind == Type::Headers {
-                        opened += 1;
-                    }
-                    assert_ne!(header.kind, Type::Data, "zero window retains the output owner");
-                }
-                release.wait_timeout(GUARD).expect("both senders registered");
-                // Only stream 1 becomes writable; this frame requires no reply.
-                stream.write_all(&[0, 0, 4, 8, 0, 0, 0, 0, 1, 0, 0, 0, 6])
-                    .expect("release exactly one six-byte request owner");
-                if opening {
-                    loop {
-                        let mut bytes = [0; 9];
-                        stream.read_exact(&mut bytes).expect("surviving call frame");
-                        let header = Header::parse(&bytes).expect("surviving call header");
-                        let mut payload = vec![0; header.length.into_usize()];
-                        stream.read_exact(&mut payload).expect("surviving call payload");
-                        if header.kind == Type::Headers {
-                            assert_eq!(header.stream_id.into_u32(), 3, "canceled waiter never opened a call");
-                            stream.write_all(&[0, 0, 4, 3, 0, 0, 0, 0, 3, 0, 0, 0, 8])
-                                .expect("complete the admitted survivor with CANCEL");
-                            break;
-                        }
-                    }
-                }
-                finished.wait_timeout(GUARD).expect("client runtime retired");
-            },
-            |peer| {
-                let limits = calls::Settings::new(Some(if opening { 2 } else { 3 }), Some(3), Some(8), Some(1))
-                    .try_build().expect("one output owner and distinct call slots");
-                clients::Plan::with_waiters(peer.addr(), limits, limits.calls(), 2).expect("two sender registrations")
-                    .enter(|mut scope| {
-                        let client = scope.handle;
-                        fibers::TEST.try_run(&mut scope.app, client.wait_active())
-                            .expect("client drive").expect("active connection");
-                        let started = Instant::now();
-                        loop {
-                            match settled.wait_timeout(Duration::ZERO) {
-                                Ok(()) => break,
-                                Err(wake::WaitError::Timeout { .. }) => {
-                                    assert!(started.elapsed() < GUARD, "zero-window handshake deadline");
-                                    fibers::TEST.try_pause(&mut scope.app, Duration::from_millis(10))
-                                        .expect("drive zero-window handshake");
-                                }
-                                Err(error) => panic!("handshake signal: {error:?}"),
-                            }
-                        }
-                        let cancelled = Cell::new(false);
-                        let observed = &cancelled;
-                        let queued = &queued;
-                        let result = fibers::TEST.try_run(&mut scope.app, dope_fiber::fiber!('_ => async move {
+        let listener = Listener::bind(([127, 0, 0, 1], 0).into()).expect("native H2 peer");
+        let limits =
+            calls::Settings::new(Some(if opening { 2 } else { 3 }), Some(3), Some(8), Some(1))
+                .try_build()
+                .expect("one output owner and distinct call slots");
+        clients::Plan::with_waiters(listener.local_addr(), limits, limits.calls(), 2)
+            .expect("two sender registrations")
+            .enter_peer(listener, |mut app, client, listener| {
+                app.drive_for(GUARD, Once::new(client.wait_active()))
+                    .expect("client drive").expect("active connection");
+                let mut peer = app.drive_for(GUARD, Once::new(Peer::accept(listener, ZERO_WINDOW)))
+                    .expect("zero-window SETTINGS handshake");
+                let waiting = Cell::new(0);
+                let waiting = &waiting;
+                let calls = dope_fiber::fiber!('_ => async move {
+                    let root = abi::poll_fn(|context| Poll::Ready(context.as_ref().root_waker())).await;
                             let metadata = Metadata::new();
                             let message = vec![b'x'];
                             let mut held = client.open_request(b"/proof/Held", None, &metadata)
                                 .await.expect("retained request");
-                            let waiting = Cell::new(0);
                             let register = || {
                                 let count = waiting.get() + 1;
                                 waiting.set(count);
                                 if count == 2 {
-                                    queued.notify().expect("release after both registrations");
+                                    root.wake();
                                 }
                             };
                             let mut pool = batch::Pool::<2>::acquire().await.expect("separate sender tasks");
@@ -463,7 +347,6 @@ fn sender_notification_survives_cancel() {
                                     CancelSender::new(
                                         client.unary(b"/proof/Unary", None, &metadata, Bytes, &message),
                                         index.get() == 0,
-                                        observed,
                                         register,
                                     )
                                 }).await.expect("notified unary senders");
@@ -477,7 +360,6 @@ fn sender_notification_survives_cancel() {
                                     CancelSender::new(
                                         client.stream(b"/proof/Stream", None, &metadata, Bytes, &message),
                                         index.get() == 0,
-                                        observed,
                                         register,
                                     )
                                 }).await.expect("notified stream senders");
@@ -494,7 +376,7 @@ fn sender_notification_survives_cancel() {
                                     .await.expect("second retained stream");
                                 held.send(Bytes, &message).await.expect("occupy sole output owner");
                                 let mut results = batch::Join::from_map(&mut pool, [(true, &mut first), (false, &mut second)], |(cancel, stream)| {
-                                    CancelSender::new(stream.send(Bytes, &message), cancel, observed, register)
+                                    CancelSender::new(stream.send(Bytes, &message), cancel, register)
                                 }).await.expect("notified borrowed senders");
                                 assert!(results.next().expect("first sender").is_none());
                                 results.next().expect("second sender").expect("surviving notification")
@@ -502,17 +384,181 @@ fn sender_notification_survives_cancel() {
                             }
                             assert_eq!(waiting.get(), 2);
                             drop(held);
-                        }));
-                        assert!(cancelled.get(), "first sender was notified and canceled before admission");
-                        result.expect("canceled notification must wake the surviving sender");
-                    }, recovery::Policy::new(
-                        |event| assert!(matches!(event, Reclaimed::Shutdown), "unexpected client retirement: {event:?}"),
-                        common::recover,
-                    ), |result| result.expect("gRPC client completion"))
-                    .expect("gRPC client runtime");
-                finish.notify().expect("release peer after client retirement");
-                peer.finish().expect("scripted H2 peer");
-            },
-        ).expect("scripted H2 server");
+                    });
+                    let release = dope_fiber::fiber!('_ => async move {
+                        let mut opened = 0;
+                        while opened != if opening { 1 } else { 3 } {
+                            opened += usize::from(peer.next(|frame| {
+                                assert!(!matches!(frame, Payload::Data(_)), "zero window retains the output owner");
+                                matches!(frame, Payload::Headers(_))
+                            }).await);
+                        }
+                        // Wake only the race root: Join still requires each sender's own readiness.
+                        abi::poll_fn(|_| if waiting.get() == 2 { Poll::Ready(()) } else { Poll::Pending }).await;
+                        peer.write(&[0, 0, 4, 8, 0, 0, 0, 0, 1, 0, 0, 0, 6]).await;
+                        if opening {
+                            loop {
+                                if let Some(id) = peer.next(|frame| match frame {
+                                    Payload::Headers(head) => Some(head.stream_id()),
+                                    _ => None,
+                                }).await {
+                                    assert_eq!(id.into_u32(), 3, "canceled waiter never opened a call");
+                                    peer.write(&[0, 0, 4, 3, 0, 0, 0, 0, 3, 0, 0, 0, 8]).await;
+                                    break;
+                                }
+                            }
+                        }
+                        abi::Pending::<()>::new().await
+                    });
+                let result = app.drive_for(GUARD, Once::new(abi::race::Race::new(calls, release)));
+                assert!(matches!(result.expect("canceled notification must wake the surviving sender"), abi::race::Either::Left(())));
+            }, recovery::Policy::new(
+                |event| assert!(matches!(event, Reclaimed::Shutdown), "unexpected client retirement: {event:?}"),
+                common::recover,
+            ))
+            .expect("gRPC client runtime");
+    }
+}
+
+#[test]
+fn queued_cancellations_release_before_refill() {
+    use common::grpc::native::{CANCELLATION_RESPONSES, DEFAULT_SETTINGS, Peer};
+    use dope::core::io::socket::Listener;
+    use dope_fiber::task::done::Once;
+    use dope_test::harness::GUARD;
+    use sark_grpc::client::config::{Input, Limits};
+    use sark_h2::frame::{Ack, payload::Payload};
+
+    let listener = Listener::bind(([127, 0, 0, 1], 0).into()).expect("native H2 peer");
+    let limits = Limits::default()
+        .try_calls(3)
+        .expect("three calls")
+        .try_bytes(2)
+        .expect("two-byte messages")
+        .try_input(Input::try_new(3, 8, 2, 16, 2).expect("two retained response bytes"))
+        .expect("bounded input");
+    clients::Plan::new(listener.local_addr(), limits, 3).expect("client plan")
+        .enter_peer(listener, |mut app, client, listener| {
+            app.drive_for(GUARD, Once::new(dope_fiber::fiber!('_ => async move {
+                client.wait_active().await.expect("active connection");
+                let mut peer = Peer::accept(listener, DEFAULT_SETTINGS).await;
+                let metadata = Metadata::new();
+                let request = Vec::new();
+                let queued = client.stream(b"/proof/Queued", None, &metadata, Bytes, &request)
+                    .await.expect("streaming response claim");
+                let mut codec = Bytes;
+                let held = client.poll_unary(b"/proof/Held", None, &metadata, &mut codec, &request)
+                    .await.expect("unfinished unary claim");
+                let mut waiting = client.poll_unary(b"/proof/Waiting", None, &metadata, &mut codec, &request)
+                    .await.expect("pending unary claim");
+                loop {
+                    if peer.next(|frame| matches!(frame,
+                        Payload::Headers(head) if head.stream_id().into_u32() == 5,
+                    )).await {
+                        break;
+                    }
+                }
+                peer.write(CANCELLATION_RESPONSES).await;
+                loop {
+                    if peer.next(|frame| matches!(frame,
+                        Payload::Ping(ping) if ping.ack == Ack::Complete,
+                    )).await {
+                        break;
+                    }
+                }
+                assert!(fibers::TEST.poll_once(waiting.recv()).await.is_none(), "queued input can be released");
+                drop(queued);
+                drop(held);
+                let response = waiting.recv().await.expect("queued cancellations release both bytes before refill")
+                    .into_payload().expect("successful response");
+                assert_eq!(response.contiguous(), Some(b"ok".as_slice()));
+            }))).expect("cancellation batch completes");
+        }, recovery::Policy::new(
+            |event| assert!(matches!(event, Reclaimed::Shutdown), "unexpected client retirement: {event:?}"),
+            common::recover,
+        ))
+        .expect("gRPC client runtime");
+}
+
+#[test]
+fn split_cancellation_preserves_reused_claim() {
+    use common::grpc::native::{
+        Peer, SPLIT_RETAINED_RESPONSE, SPLIT_REUSED_RESPONSE, UNIMPLEMENTED_RESPONSE, ZERO_WINDOW,
+    };
+    use dope::core::io::socket::Listener;
+    use dope_fiber::task::done::Once;
+    use dope_test::harness::GUARD;
+    use sark_grpc::client::config::{Input, Limits, Output};
+    use sark_h2::frame::{numbers::ErrorCode, payload::Payload};
+
+    for response_first in [false, true] {
+        let listener = Listener::bind(([127, 0, 0, 1], 0).into()).expect("native H2 peer");
+        let limits = Limits::try_new(
+            2,
+            1,
+            Input::try_new(1, 4, 1, 8, 1).expect("two streaming response claims"),
+            Output::try_new(1).expect("one request owner"),
+        )
+        .expect("bounded client");
+        clients::Plan::new(listener.local_addr(), limits, 2).expect("client plan")
+            .enter_peer(listener, |mut app, client, listener| {
+                app.drive_for(GUARD, Once::new(dope_fiber::fiber!('_ => async move {
+                    client.wait_active().await.expect("active connection");
+                    let mut peer = Peer::accept(listener, ZERO_WINDOW).await;
+                    let metadata = Metadata::new();
+                    let retained = client.open_bidi(b"/proof/Retained", None, &metadata)
+                        .await.expect("first response claim").finish().await.expect("closed request half");
+                    let old = client.open_bidi(b"/proof/Old", None, &metadata)
+                        .await.expect("second response claim");
+                    let (mut send, mut response) = old.split().expect("split authority");
+                    let message = calls::SMALL_RESPONSE.to_vec();
+                    send.send(Bytes, &message).await.expect("zero window retains sole request owner");
+                    while !peer.next(|frame| matches!(frame,
+                        Payload::Headers(head) if head.stream_id().into_u32() == 3,
+                    )).await {}
+                    peer.write(SPLIT_RETAINED_RESPONSE).await;
+                    peer.write(UNIMPLEMENTED_RESPONSE).await;
+                    loop {
+                        let event = response.recv(Bytes).await.expect("old terminal response");
+                        if let Decoded::Trailers { status } = &*event {
+                            assert_eq!(status.code(), Code::Unimplemented);
+                            break;
+                        }
+                    }
+                    let mut live = client.open_bidi(b"/proof/Reused", None, &metadata)
+                        .await.expect("terminal consumption frees the only response claim");
+                    assert!(fibers::TEST.poll_once(live.send(Bytes, &message)).await.is_none());
+                    if response_first {
+                        drop(response);
+                        drop(send);
+                    } else {
+                        drop(send);
+                        drop(response);
+                    }
+                    live.send(Bytes, &message).await.expect("old split cancellation releases request owner");
+                    while !peer.next(|frame| {
+                        if let Payload::RstStream(frame) = frame {
+                            assert_eq!(frame.stream_id().into_u32(), 3);
+                            assert_eq!(frame.error(), ErrorCode::Cancel);
+                            true
+                        } else {
+                            false
+                        }
+                    }).await {}
+                    peer.write(SPLIT_REUSED_RESPONSE).await;
+                    loop {
+                        let event = live.recv(Bytes).await.expect("reused response claim stays alive");
+                        if let Decoded::Trailers { status } = &*event {
+                            assert_eq!(status.code(), Code::Ok);
+                            break;
+                        }
+                    }
+                    drop(retained);
+                }))).expect("both split drop orders preserve the reused call");
+            }, recovery::Policy::new(
+                |event| assert!(matches!(event, Reclaimed::Shutdown), "unexpected client retirement: {event:?}"),
+                common::recover,
+            ))
+            .expect("gRPC client runtime");
     }
 }

@@ -1,9 +1,9 @@
 use core::{convert::Infallible, mem, pin};
 
-use o3::buffer::{pool, pool::owners, storage, write::consume};
+use o3::buffer::{storage, write::consume};
 use sark_http::{
     h1::codec::canned,
-    payload::{compress::Gzip, fixed::Body, owned},
+    payload::{compress, fixed::Body, owned},
 };
 use session::{
     drain,
@@ -20,13 +20,7 @@ use crate::{
 pub(crate) enum SplitBody<'d> {
     Static(Body<'d>),
     Shared(storage::Shared),
-    Frozen(
-        pool::Span<
-            owners::Plain<pool::Fixed<{ Gzip::SLOTS.get() }, { Gzip::CAPACITY.get() }>>,
-            pool::Owned,
-            pool::Frozen,
-        >,
-    ),
+    Frozen(compress::Frozen),
     Segmented(owned::Segments<'d>),
 }
 
@@ -98,7 +92,7 @@ impl<'d, H> Batch<'d, H> {
                 deadline::Head::Ready,
                 deadline::Body::None,
             ));
-            let (result, consumed) = match conn.ingress.protocol.take_frame() {
+            let (result, consumed) = match conn.ingress.protocol.take_frame(rest) {
                 Frame::Head(pending) => {
                     let result = match pending {
                         HeadFrame::Pending(pending) => disp
@@ -108,7 +102,7 @@ impl<'d, H> Batch<'d, H> {
                         HeadFrame::Rejected(pending) => disp
                             .as_mut()
                             .resume_error(pending, permit, rest, write, conn),
-                        HeadFrame::Line(line) => match line.advance(rest) {
+                        HeadFrame::Line(line) => match line {
                             Ok(parsing::LineProgress::Pending(line)) => {
                                 permit.defer();
                                 conn.ingress.protocol = Protocol::Line(line);
@@ -119,10 +113,33 @@ impl<'d, H> Batch<'d, H> {
                                 ));
                                 break;
                             }
-                            Ok(parsing::LineProgress::Complete { source, prior }) => disp
-                                .as_mut()
-                                .consume_line(permit, source, write, conn)
-                                .after_line(prior),
+                            Ok(parsing::LineProgress::Complete {
+                                source,
+                                prior,
+                                used,
+                            }) => {
+                                let result = disp
+                                    .as_mut()
+                                    .consume_line(permit, source, write, conn)
+                                    .after_line(prior);
+                                match result {
+                                    session::RouteOutcome::AwaitHead { permit, pending }
+                                        if used < rest.as_slice().len() =>
+                                    {
+                                        out.consumed += rest.consume_max(used);
+                                        disp.as_mut()
+                                            .resume_head(pending, permit, rest, write, conn)
+                                    }
+                                    session::RouteOutcome::AwaitReject { permit, pending }
+                                        if used < rest.as_slice().len() =>
+                                    {
+                                        out.consumed += rest.consume_max(used);
+                                        disp.as_mut()
+                                            .resume_error(pending, permit, rest, write, conn)
+                                    }
+                                    result => result,
+                                }
+                            }
                             Err(error) => session::Outcome::Close(
                                 disp.as_mut().reject_line(permit, conn, error),
                             )

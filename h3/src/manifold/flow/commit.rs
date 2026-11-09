@@ -9,51 +9,44 @@ use stream::send;
 use crate::{conn::io::write, manifold::owners};
 
 pub(super) struct Commit<'id, 'a, 'q, 'd, O, C> {
-    prepared: write::Prepared<'id, 'q, 'd>,
-    report: (&'a mut O, C, hold::Charge),
-}
-
-impl<'id, 'a, 'q, 'd, O, C> Commit<'id, 'a, 'q, 'd, O, C> {
-    pub(super) const fn new(
-        prepared: write::Prepared<'id, 'q, 'd>,
-        life: &'a mut O,
-        handle: C,
-        charge: hold::Charge,
-    ) -> Self {
-        Self {
-            prepared,
-            report: (life, handle, charge),
-        }
-    }
-
-    pub(super) fn restore(self, owner: write::Flight<'id, 'd>) {
-        let Self { prepared, .. } = self;
-        prepared.restore(owner);
-    }
+    pub(super) prepared: write::Prepared<'id, 'q, 'd>,
+    pub(super) report: owners::Projection<'a, O, C>,
 }
 
 impl<'id, 'a, 'q, 'd, C: Copy, O: life::Mode<C, Id>>
     admit::Commit<Shared<'d>, write::Flight<'id, 'd>> for Commit<'id, 'a, 'q, 'd, O, C>
 {
+    type Observation = hold::Charge;
     type Retained = write::Completion;
     type Discarded = write::Completion;
 
+    fn observe(&mut self, owner: &write::Flight<'id, 'd>) -> Self::Observation {
+        if O::ENABLED {
+            owner.retained()
+        } else {
+            Default::default()
+        }
+    }
+
     fn retained(
         self,
+        charge: Self::Observation,
         admitted: admit::Admission<'_, Shared<'d>, write::Flight<'id, 'd>>,
     ) -> Self::Retained {
         let Self { prepared, report } = self;
         let done = prepared.commit();
-        let (life, handle, charge) = report;
-        owners::Projection::new(life, handle).admitted(charge, admitted.source().id());
+        report.admitted(charge, admitted.source().id());
         done
     }
 
-    fn discarded(self, gone: admit::Discard<write::Flight<'id, 'd>>) -> Self::Discarded {
+    fn discarded(
+        self,
+        charge: Self::Observation,
+        gone: admit::Discard<write::Flight<'id, 'd>>,
+    ) -> Self::Discarded {
         let Self { prepared, report } = self;
         let done = prepared.commit();
-        let (life, handle, charge) = report;
-        owners::Projection::new(life, handle).discarded(charge, gone.source().id(), gone.cause());
+        report.discarded(charge, gone.source().id(), gone.cause());
         done
     }
 }
@@ -62,6 +55,6 @@ const _: () = assert!(
     mem::size_of::<Commit<'static, 'static, 'static, 'static, (), u64>>()
         == mem::size_of::<(
             write::Prepared<'static, 'static, 'static>,
-            (&'static mut (), u64, hold::Charge),
+            owners::Projection<'static, (), u64>,
         )>()
 );

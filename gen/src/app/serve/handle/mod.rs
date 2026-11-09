@@ -24,9 +24,24 @@ pub(super) struct Context<'view, 'source, 'spec> {
 /// H1-only route state. Task-only expansion has no value of this type, making
 /// continuation, cache, guard, and duplex planning unreachable there.
 pub(in crate::app::serve) struct H1Plan<'source, 'spec> {
+    pub(super) cleartext: Option<&'source proc_macro2::TokenStream>,
     pub(super) cache_count: usize,
     pub(super) duplex: &'source duplex::Plan<'spec>,
     pub(super) continuations: plan::Plan<'source, 'spec>,
+}
+
+pub(in crate::app::serve) fn h1_payload(
+    paths: &Paths,
+    tag: proc_macro2::TokenStream,
+) -> proc_macro2::TokenStream {
+    let ns_fiber = &paths.fiber;
+    let ns_h1 = &paths.h1;
+    quote::quote! {
+        #ns_fiber::dope::net::link::egress::data::compose::Either<
+            #ns_h1::server::payload::Body<'d, #tag>,
+            #ns_h1::server::payload::Stream<'d, #tag>,
+        >
+    }
 }
 
 fn emit_guards<M>(
@@ -144,8 +159,10 @@ impl<'source, 'spec> H1Plan<'source, 'spec> {
     pub(in crate::app::serve) fn new(
         plan: &'source serve::ProtocolPlan<'spec>,
         exec: &serve::Execution<'source, 'spec>,
+        cleartext: Option<&'source proc_macro2::TokenStream>,
     ) -> Self {
         Self {
+            cleartext,
             cache_count: exec.sync_count(),
             duplex: &plan.duplex,
             continuations: plan::Plan::full(plan),
@@ -172,16 +189,19 @@ pub(super) fn build<'source, 'spec>(
         &context.plan.entries,
         context.plan.duplex.connect(),
     );
+    let core = crate::macros::tokens::local("core");
     let decode = decode::Decode::build(
         paths,
         context.plan.spec,
         &dispatch.methods,
         &head,
         &context.plan.entries,
+        quote::quote!(self.#core),
     );
     let tasks = tasks::Tasks::build(paths, &context);
     let neutral = task::Task::new(paths, &context, &decode.prepared.state)
         .build(paths, &context, &dispatch, &head, &decode, &tasks);
+    let duplex = plan.duplex.definitions(paths, h1.is_some());
     match h1 {
         Some(h1) => {
             use h1::types::Types;
@@ -189,6 +209,7 @@ pub(super) fn build<'source, 'spec>(
             let h1 = Types::build(paths, &context, h1, &dispatch);
             (
                 quote::quote! {
+                    #duplex
                     #neutral
                     #h1
                 },
@@ -196,6 +217,10 @@ pub(super) fn build<'source, 'spec>(
                 dispatch.shape,
             )
         }
-        None => (neutral, decode.contract, dispatch.shape),
+        None => (
+            quote::quote!(#duplex #neutral),
+            decode.contract,
+            dispatch.shape,
+        ),
     }
 }

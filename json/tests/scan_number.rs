@@ -29,11 +29,10 @@ fn reject_invalid_numbers() {
 }
 
 #[test]
-fn rejects_unsigned_zero() {
-    let mut index = 1;
-    std::assert_matches!(
-        b" 01,".as_slice().parse_u64(&mut index),
-        Err(Error::Invalid)
-    );
-    assert_eq!(index, 1);
+fn rejects_unsigned_sign_and_leading_zero() {
+    for input in [b" 01,".as_slice(), b" -0,", b" -1,"] {
+        let mut index = 1;
+        std::assert_matches!(input.parse_u64(&mut index), Err(Error::Invalid));
+        assert_eq!(index, 1);
+    }
 }

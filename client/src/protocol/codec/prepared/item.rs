@@ -133,11 +133,13 @@ impl<'id, 'input, 'd, R: buffer::Cursor + hold::raw::Retain<'d>> Item<'id, 'inpu
                 mut chunks,
                 consumed,
             } => {
-                let fields = fields
-                    .map(Bound::try_into)
-                    .transpose()
-                    .map_err(Error::Retention)?
-                    .map(response::Fields::admit);
+                let fields = match fields.map(Bound::try_into).transpose() {
+                    Ok(fields) => fields.map(response::Fields::admit),
+                    Err(error) => {
+                        *framing = Framing::Chunked(chunks);
+                        return Err(Error::Retention(error));
+                    }
+                };
                 let data = chunks.pending.finish()?;
                 Ok((
                     Framing::Head,

@@ -79,9 +79,7 @@ impl<'d, ID: Identity> ReadyQueue<'d, ID, ()> for FixedReady<'d, ID> {
         bound: &Positioned<'_, '_, 'd, ID, (), S>,
     ) -> Result<(), entry::Error<NonZero<u32>>> {
         let queue = token.borrow_mut(&self.queue);
-        if let entry::State::Vacant(vacant) =
-            queue.entry::<0>(bound.connection().index().into_usize())?
-        {
+        if let Some(vacant) = queue.entry::<0>(bound.connection().index().into_usize())? {
             vacant.insert::<false>(()).commit();
         }
         Ok(())

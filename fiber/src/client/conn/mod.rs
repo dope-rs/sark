@@ -1,4 +1,4 @@
-use std::{convert::Infallible, marker::PhantomData, mem};
+use std::{marker::PhantomData, mem};
 
 use app::{
     admit::Registered,
@@ -35,7 +35,7 @@ use o3::{
     buffer,
     buffer::{hold, pool, resident},
 };
-use policy::{end, output, start};
+use policy::{end, start};
 use sark_client::protocol::codec::{Codec, State, Storage};
 
 use crate::client::{
@@ -80,6 +80,7 @@ where
     type Connect = Full;
     type ConnState = Reuse;
     type Failure = Observed;
+    type Receipt = ();
     type Requests = request::Enabled;
     type Send = pool::Cursor;
 
@@ -129,7 +130,7 @@ where
             session::Input,
         )>,
     > {
-        Some(output::Flush::<Infallible, _>::Context(
+        Some(
             |(owner, ctx, input): (
                 &mut Self,
                 &mut turns::Context<'_, '_, 'd, Self::ConnState, Self::Send, ID>,
@@ -140,7 +141,7 @@ where
                     .root
                     .input(id, input, ctx.close_status(), ctx.region());
             },
-        ))
+        )
     }
 }
 
@@ -304,7 +305,7 @@ where
     fn failed(
         &mut self,
         _: attempt::Completion<'_, 'd, ID>,
-        _: event::ConnectFault,
+        _: attempt::ConnectFault,
         _: &mut driver::Context<'_, 'd>,
     ) {
         self.root.protocol.transport.waiters.wake_io();
@@ -340,17 +341,24 @@ where
 {
     type Drain = Ready;
 
+    fn take_close(&self, id: conn::Id<'d, ID>) -> Option<close::Directive> {
+        self.root.protocol().io.take_close(id)
+    }
+
     fn transmit_failed(
         &self,
         id: conn::Id<'d, ID>,
         failure: conn::Transmit,
-        region: &mut region::Token<region::Identity<'d>>,
+        regions: &mut (
+            region::Token<region::Identity<'d>>,
+            region::Token<region::Identity<'d, 1>>,
+        ),
     ) -> Option<conn::Transmit> {
-        self.root
-            .protocol()
-            .transport
-            .pool
-            .failed(region, id, report::Failure::Transmit(failure));
+        self.root.protocol().transport.pool.failed(
+            &mut regions.0,
+            id,
+            report::Failure::Transmit(failure),
+        );
         None
     }
 
@@ -396,10 +404,7 @@ where
         ctx: &mut turns::Retirement<'_, 'turn, 'd>,
     ) -> egress::Cleared {
         let (work, region) = ctx.parts();
-        self.root
-            .protocol()
-            .io
-            .retire(conn, work, region, pool::Cursor::recycle)
+        self.root.protocol().io.retire(conn, work, region, drop)
     }
 
     fn clear_recv<'turn>(
@@ -420,7 +425,7 @@ impl<'s, 'o, 'q, 'e, 'b, 'c, 'd, ID: Identity, O> session::Failed<'d, ID>
     fn failed(
         &mut self,
         attempt: attempt::Completion<'_, 'd, ID>,
-        cause: event::ConnectFault,
+        cause: attempt::ConnectFault,
         _: &mut driver::Context<'_, 'd>,
     ) {
         self.root.fail(&attempt, Failure::Attempt(cause));
@@ -439,7 +444,7 @@ impl<'s, 'o, 'q, 'e, 'b, 'c, 'd, ID: Identity, O> session::Exhausted<'d, ID>
         let cause = match cause {
             opening::Exhaustion::Identity => Failure::IdentityExhausted,
             opening::Exhaustion::Submission(error) => Failure::Attempt(
-                event::ConnectFault::Transport(event::ConnectError::Admission(error)),
+                attempt::ConnectFault::Transport(event::ConnectError::Admission(error)),
             ),
         };
         self.root.fail(&attempt, cause);

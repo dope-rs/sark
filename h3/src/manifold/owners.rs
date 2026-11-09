@@ -1,5 +1,5 @@
 //! Statically selected H3 lifecycle and owner projection.
-use std::convert::{Infallible, identity};
+use std::convert::Infallible;
 
 use dope_quic::{
     conn::{
@@ -15,10 +15,12 @@ use o3::buffer::{
         evidence::{Mode, Off, On},
     },
     resident::Shared,
-    storage,
 };
 use resident::Local;
-use sark_core::life::{self, Observer as _, audit, exchange, mode, owners};
+use sark_core::{
+    life::{self, Observer as _, audit, exchange, mode, owners},
+    manifold::task::response,
+};
 use sark_http::{
     field::metadata::section::rules,
     owner::{self, cause, evidence, handoff::stage},
@@ -27,184 +29,9 @@ use send::admit;
 use stream::{release, send};
 
 use crate::{
-    conn::{self, io::replies, output},
-    frame,
+    conn, frame,
     manifold::{self, Diagnostic, encoder},
-    qpack,
 };
-
-#[must_use]
-pub struct Commit {
-    body_bytes: usize,
-    charge: hold::Charge,
-    linked: hold::Charge,
-    copied: Option<evidence::Copy>,
-}
-
-impl Commit {
-    pub(in crate::manifold) const fn new(
-        bytes: usize,
-        charge: hold::Charge,
-        linked: hold::Charge,
-    ) -> Self {
-        Self {
-            body_bytes: bytes,
-            charge,
-            linked,
-            copied: None,
-        }
-    }
-
-    const fn copied(
-        bytes: usize,
-        charge: hold::Charge,
-        linked: hold::Charge,
-        copied: Option<evidence::Copy>,
-    ) -> Self {
-        Self {
-            body_bytes: bytes,
-            charge,
-            linked,
-            copied,
-        }
-    }
-
-    pub(in crate::manifold) fn code(error: conn::Error) -> frame::ErrorCode {
-        use conn::Error;
-        use qpack::encoder;
-
-        match error {
-            cause @ Error::Qpack(_) if cause.is_pressure() => frame::ErrorCode::ExcessiveLoad,
-            Error::Feedback(_)
-            | Error::Encode(
-                encoder::Error::Allocation(_)
-                | encoder::Error::Buffer(_)
-                | encoder::Error::Huffman(_)
-                | encoder::Error::FieldCapacity { .. }
-                | encoder::Error::FieldSection { .. }
-                | encoder::Error::Capacity { .. },
-            )
-            | Error::Request(_)
-            | Error::Response(_)
-            | Error::Retain(_)
-            | Error::Size(_)
-            | Error::Build(storage::BuildError::Capacity(_) | storage::BuildError::Exhausted(_))
-            | Error::Prefix { .. }
-            | Error::PrefixOverflow { .. }
-            | Error::Output(output::Error::Charge(_))
-            | Error::Reply(replies::Error::Output(output::Error::Charge(_)))
-            | Error::BatchRegularWire { .. }
-            | Error::BatchRegularResident { .. }
-            | Error::BatchCriticalWire { .. }
-            | Error::BatchCriticalResident { .. }
-            | Error::QueueRegular { .. }
-            | Error::BudgetWire { .. }
-            | Error::BudgetResident { .. }
-            | Error::BudgetRegularWire { .. }
-            | Error::BudgetRegularResident { .. }
-            | Error::EventCapacity { .. }
-            | Error::CreditCapacity { .. }
-            | Error::StreamCapacity { .. }
-            | Error::StreamAdmission { .. }
-            | Error::QpackLength { .. }
-            | Error::CreditOverflow { .. }
-            | Error::SectionLength { .. }
-            | Error::SectionPrefix { .. } => frame::ErrorCode::ExcessiveLoad,
-            cause @ (Error::Egress(_)
-            | Error::Encode(encoder::Error::ConnectDisabled)
-            | Error::GoAway(_)
-            | Error::Push(_)
-            | Error::Retention(_)
-            | Error::Output(output::Error::Retention(_))
-            | Error::Reply(replies::Error::Output(output::Error::Retention(_)))
-            | Error::SegmentPush(_)
-            | Error::SegmentTake(_)
-            | Error::Wait(_)) => cause.error_code(),
-            Error::Informational(_)
-            | Error::Parse(_)
-            | Error::Qpack(_)
-            | Error::Encode(_)
-            | Error::FrameUnexpected(_)
-            | Error::MissingSettings(_)
-            | Error::ClosedCriticalStream(_)
-            | Error::Target(_)
-            | Error::GoAwayId(_)
-            | Error::GoAwayOrder { .. }
-            | Error::PushIdOrder { .. }
-            | Error::PushStream { .. }
-            | Error::RequestStream { .. }
-            | Error::CriticalExists { .. }
-            | Error::Identity { .. }
-            | Error::Bound { .. }
-            | Error::UnboundOpen
-            | Error::UnboundHold
-            | Error::FeedbackIncrement { .. }
-            | Error::FeedbackGrowth { .. }
-            | Error::BudgetReleaseWire { .. }
-            | Error::BudgetReleaseResident { .. }
-            | Error::BudgetRegularReleaseWire { .. }
-            | Error::BudgetRegularReleaseResident { .. }
-            | Error::QpackEncoderStream(_)
-            | Error::QpackDecoderStream(_)
-            | Error::ReceiveCapacity { .. }
-            | Error::ReceiveRelease { .. }
-            | Error::ReceiveCopy { .. }
-            | Error::Handoff(_)
-            | Error::Build(storage::BuildError::Build(_) | storage::BuildError::Length(_))
-            | Error::PrefixWrite { .. }
-            | Error::PrefixLength { .. }
-            | Error::VarInt { .. }
-            | Error::StreamKind { .. }
-            | Error::ControlExists { .. }
-            | Error::EncoderExists { .. }
-            | Error::DecoderExists { .. }
-            | Error::ControlMissing
-            | Error::EncoderMissing
-            | Error::Reply(replies::Error::Empty | replies::Error::Length(_))
-            | Error::Length(_)
-            | Error::ResponseLength { .. }
-            | Error::ReceiveRange { .. }
-            | Error::TokenMismatch { .. }
-            | Error::ReceiveState { .. }
-            | Error::Consume(_)
-            | Error::AppendBlocked { .. }
-            | Error::HandoffBlocked { .. }
-            | Error::FinishBlocked { .. }
-            | Error::DeferBlocked { .. }
-            | Error::CreditMode { .. }
-            | Error::CreditOpen { .. }
-            | Error::StreamMissing { .. }
-            | Error::StreamResidual { .. }
-            | Error::Incomplete { .. }
-            | Error::DuplicateSettings(_)
-            | Error::MessageMissing { .. }
-            | Error::Malformed { .. }
-            | Error::Content { .. }
-            | Error::PushRejected { .. } => frame::ErrorCode::Internal,
-        }
-    }
-
-    pub(in crate::manifold) fn observe<C: Copy, O: life::Mode<C, Id>>(
-        self,
-        life: &mut O,
-        id: exchange::Id<C, Id>,
-    ) {
-        if let Some(copy) = self.copied {
-            life.observe(life::Event::ResponseBodyCopied {
-                exchange: id,
-                read: copy.read,
-                written: copy.written,
-                cause: copy.cause,
-            });
-        }
-        life.observe(life::Event::ResponseCommitted {
-            exchange: id,
-            body_bytes: self.body_bytes,
-            charge: self.charge,
-            linked: self.linked,
-        });
-    }
-}
 
 /// Owner-bound capability for projecting one H3 lifecycle effect.
 #[repr(C)]
@@ -227,10 +54,6 @@ impl Closed {
 impl<'a, O, C> Projection<'a, O, C> {
     pub const fn new(observer: &'a mut O, handle: C) -> Self {
         Self { observer, handle }
-    }
-
-    pub(in crate::manifold) fn into_parts(self) -> (&'a mut O, C) {
-        (self.observer, self.handle)
     }
 }
 
@@ -270,7 +93,7 @@ impl<C: Copy, O: life::Mode<C, Id>> Projection<'_, O, C> {
         if !O::ENABLED || id.kind() != Kind::ClientBidi {
             return;
         }
-        let mut sink = owners::Sink::new(self.observer, self.handle, identity);
+        let mut sink = owners::Sink::new(self.observer, self.handle);
         sink.apply(owner::Effect::new(id, charge, owner::Change::Handoff));
     }
 
@@ -295,7 +118,7 @@ impl<C: Copy, O: life::Mode<C, Id>> Projection<'_, O, C> {
             return;
         }
         if effect.key().kind() == Kind::ClientBidi {
-            let mut sink = owners::Sink::new(self.observer, self.handle, identity);
+            let mut sink = owners::Sink::new(self.observer, self.handle);
             sink.apply(effect);
         }
     }
@@ -417,31 +240,34 @@ where
 }
 
 pub trait Handoff: release::Mode + Sized {
-    fn resolve<'req, 'd: 'req, F: rules::Policy, I: stage::Body<'req, 'd>>(
-        enc: encoder::Prepared<'_, 'req, 'd, F, Infallible, I>,
-    ) -> Result<Commit, frame::ErrorCode>;
+    fn defer<'req, 'd: 'req, F: rules::Policy, I: stage::Body<'req, 'd>>(
+        enc: encoder::Initial<encoder::Prepared<'_, 'req, 'd, F, Infallible, I>>,
+        state: response::State,
+    ) -> Result<encoder::Pending<'d, Self>, conn::Error>;
 
     fn charge(proof: Self::Projection) -> hold::Charge;
 
+    fn copied(copied: bool, bytes: usize) -> Option<evidence::Copy>;
+
     fn try_detach<'a, 'req, 'd: 'req, F: rules::Policy, I: stage::Body<'req, 'd>>(
         enc: encoder::Prepared<'a, 'req, 'd, F, Infallible, I>,
-    ) -> Result<encoder::Detached<'a, 'd, F, Self, I::Deferred>, frame::ErrorCode>
+    ) -> Result<encoder::Detached<'a, 'd, F, Self, I::Deferred>, conn::Error>
     where
         I::Deferred: stage::Deferred<'d>;
 
-    fn finish<'d, F: rules::Policy, D: stage::Deferred<'d>>(
-        enc: encoder::Detached<'_, 'd, F, Self, D>,
+    fn defer_with<'d, F: rules::Policy, D: stage::Deferred<'d>>(
+        enc: encoder::Initial<encoder::Detached<'_, 'd, F, Self, D>>,
         body: D::Owner,
-    ) -> Result<Commit, frame::ErrorCode>;
+        outcome: life::Outcome,
+    ) -> Result<encoder::Pending<'d, Self>, conn::Error>;
 }
 
 impl Handoff for Off {
-    fn resolve<'req, 'd: 'req, F: rules::Policy, I: stage::Body<'req, 'd>>(
-        enc: encoder::Prepared<'_, 'req, 'd, F, Infallible, I>,
-    ) -> Result<Commit, frame::ErrorCode> {
-        let bytes = enc.body_bytes();
-        let charge = enc.finish().map_err(Commit::code)?;
-        Ok(Commit::new(bytes, charge, Default::default()))
+    fn defer<'req, 'd: 'req, F: rules::Policy, I: stage::Body<'req, 'd>>(
+        enc: encoder::Initial<encoder::Prepared<'_, 'req, 'd, F, Infallible, I>>,
+        state: response::State,
+    ) -> Result<encoder::Pending<'d, Self>, conn::Error> {
+        enc.0.defer(state)
     }
 
     fn charge(proof: Self::Projection) -> hold::Charge {
@@ -449,53 +275,58 @@ impl Handoff for Off {
         hold::Charge::default()
     }
 
+    fn copied(_: bool, _: usize) -> Option<evidence::Copy> {
+        None
+    }
+
     fn try_detach<'a, 'req, 'd: 'req, F: rules::Policy, I: stage::Body<'req, 'd>>(
         enc: encoder::Prepared<'a, 'req, 'd, F, Infallible, I>,
-    ) -> Result<encoder::Detached<'a, 'd, F, Self, I::Deferred>, frame::ErrorCode>
+    ) -> Result<encoder::Detached<'a, 'd, F, Self, I::Deferred>, conn::Error>
     where
         I::Deferred: stage::Deferred<'d>,
     {
         Ok(enc.detach())
     }
 
-    fn finish<'d, F: rules::Policy, D: stage::Deferred<'d>>(
-        enc: encoder::Detached<'_, 'd, F, Self, D>,
+    fn defer_with<'d, F: rules::Policy, D: stage::Deferred<'d>>(
+        enc: encoder::Initial<encoder::Detached<'_, 'd, F, Self, D>>,
         body: D::Owner,
-    ) -> Result<Commit, frame::ErrorCode> {
-        let bytes = enc.body_bytes();
-        let charge = enc.finish_with(body).map_err(Commit::code)?;
-        Ok(Commit::new(bytes, charge, Default::default()))
+        outcome: life::Outcome,
+    ) -> Result<encoder::Pending<'d, Self>, conn::Error> {
+        enc.0.defer_with(body, outcome)
     }
 }
 
 impl Handoff for On {
-    fn resolve<'req, 'd: 'req, F: rules::Policy, I: stage::Body<'req, 'd>>(
-        enc: encoder::Prepared<'_, 'req, 'd, F, Infallible, I>,
-    ) -> Result<Commit, frame::ErrorCode> {
-        let bytes = enc.body_bytes();
-        let (charge, linked, copied) = enc.try_finish().map_err(Commit::code)?;
-        Ok(Commit::copied(bytes, charge, linked, copied))
+    fn defer<'req, 'd: 'req, F: rules::Policy, I: stage::Body<'req, 'd>>(
+        enc: encoder::Initial<encoder::Prepared<'_, 'req, 'd, F, Infallible, I>>,
+        state: response::State,
+    ) -> Result<encoder::Pending<'d, Self>, conn::Error> {
+        enc.0.try_defer(state)
     }
 
     fn charge(proof: Self::Projection) -> hold::Charge {
         proof
     }
 
+    fn copied(copied: bool, bytes: usize) -> Option<evidence::Copy> {
+        copied.then(|| evidence::Copy::borrowed(bytes))
+    }
+
     fn try_detach<'a, 'req, 'd: 'req, F: rules::Policy, I: stage::Body<'req, 'd>>(
         enc: encoder::Prepared<'a, 'req, 'd, F, Infallible, I>,
-    ) -> Result<encoder::Detached<'a, 'd, F, Self, I::Deferred>, frame::ErrorCode>
+    ) -> Result<encoder::Detached<'a, 'd, F, Self, I::Deferred>, conn::Error>
     where
         I::Deferred: stage::Deferred<'d>,
     {
-        enc.try_detach().map_err(Commit::code)
+        enc.try_detach()
     }
 
-    fn finish<'d, F: rules::Policy, D: stage::Deferred<'d>>(
-        enc: encoder::Detached<'_, 'd, F, Self, D>,
+    fn defer_with<'d, F: rules::Policy, D: stage::Deferred<'d>>(
+        enc: encoder::Initial<encoder::Detached<'_, 'd, F, Self, D>>,
         body: D::Owner,
-    ) -> Result<Commit, frame::ErrorCode> {
-        let bytes = enc.body_bytes();
-        let (charge, linked, copied) = enc.finish_with(body).map_err(Commit::code)?;
-        Ok(Commit::copied(bytes, charge, linked, copied))
+        outcome: life::Outcome,
+    ) -> Result<encoder::Pending<'d, Self>, conn::Error> {
+        enc.0.defer_with(body, outcome)
     }
 }

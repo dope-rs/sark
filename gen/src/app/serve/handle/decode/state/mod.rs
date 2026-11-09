@@ -1,7 +1,4 @@
-use handle::{
-    decode::{arms, body},
-    head,
-};
+use handle::{decode::arms, head};
 
 use crate::{
     app::{
@@ -36,7 +33,7 @@ impl State {
         let ns_core = &paths.core;
         let [v_body, v_slot, v_map, v_ret] = ["body", "slot", "map", "retained"].map(local);
         let [v_output, v_each, v_fold, v_visit] = ["output", "each", "fold", "visit"].map(local);
-        let [v_head, v_len, v_method] = ["head", "content_length", "method"].map(local);
+        let [v_head, v_len] = ["head", "content_length"].map(local);
         let [v_bound, v_limit, v_error, v_state] =
             ["boundary", "limit", "error", "state"].map(local);
 
@@ -68,7 +65,9 @@ impl State {
         let mut finish = Vec::new();
         let mut p_end = Vec::new();
         let mut g_end = Vec::new();
-        let mut bodies = body::Body::new();
+        let mut bodies = Vec::new();
+        let mut p_bodies = Vec::new();
+        let mut g_bodies = Vec::new();
         let mut c_open = arms::Arms::new();
         let mut p_open = arms::Arms::new();
         let mut g_open = arms::Arms::new();
@@ -159,6 +158,15 @@ impl State {
                 Self::#finished(#v_slot, #v_body) => #v_fold.#done_fn(#v_slot, #v_body),
             };
             folds.push(f_arms.clone());
+            let b_arms = quote! {
+                Self::#open(.., #v_body) => #v_visit.apply(
+                    #ns_core::decode::state::body::Value::#open_ty(#v_body),
+                ),
+                Self::#finished(.., #v_body) => #v_visit.apply(
+                    #ns_core::decode::state::body::Value::#done_ty(#v_body),
+                ),
+            };
+            bodies.push(b_arms.clone());
             kinds.push(quote! {
                 #ident::#open(#v_slot, #v_body) => #v_fold.open(#v_slot, #v_body),
                 #ident::#finished(#v_slot, #v_body) => #v_fold.finished(#v_slot, #v_body),
@@ -172,7 +180,6 @@ impl State {
             };
             finish.push(end_arms.clone());
             let gated = !entry.guards.is_empty();
-            bodies.push(paths, &open_ty, &done_ty, &open, &finished, gated);
             let branch = if gated { &mut g_open } else { &mut p_open };
             match item.kind {
                 spec::Kind::Sync => {
@@ -202,6 +209,7 @@ impl State {
                 p_maps.push(sub_map);
                 p_each.push(e_arms);
                 p_folds.push(f_arms);
+                p_bodies.push(b_arms);
                 p_end.push(end_arms);
                 admits.push(quote! {
                     Self::#open(#v_slot, #v_body) => match
@@ -226,6 +234,7 @@ impl State {
                 g_maps.push(sub_map);
                 g_each.push(e_arms);
                 g_folds.push(f_arms);
+                g_bodies.push(b_arms);
                 g_end.push(end_arms);
             }
 
@@ -238,6 +247,7 @@ impl State {
                 }
             };
             let started = |phase: &syn::Ident, body: proc_macro2::TokenStream| {
+                let method = entry.method.http_token(paths);
                 let state = if entry.guards.is_empty() {
                     quote! { #plain::#phase(#req_slot, #body) }
                 } else {
@@ -246,16 +256,16 @@ impl State {
                 if all_p {
                     quote! { #ns_core::decode::request::Plain::new(#state) }
                 } else if all_g {
-                    quote! { #ns_core::decode::request::Guarded::new(#state, #v_method) }
+                    quote! { #ns_core::decode::request::Guarded::new(#state, #method) }
                 } else if entry.guards.is_empty() {
                     quote! { #ns_core::decode::request::Start::plain(#state) }
                 } else {
-                    quote! { #ns_core::decode::request::Start::guarded(#state, #v_method) }
+                    quote! { #ns_core::decode::request::Start::guarded(#state, #method) }
                 }
             };
             let restore = quote! {
                 #selected::#variant(#head {
-                    head: #v_head, method: #v_method, content_length: #v_len,
+                    head: #v_head, content_length: #v_len,
                 })
             };
             match item.kind {
@@ -264,7 +274,7 @@ impl State {
                     let done_v = started(&finished, quote!(()));
                     start.push(quote! {
                         Self::#variant(#head {
-                            head: #v_head, method: #v_method, content_length: #v_len,
+                            head: #v_head, content_length: #v_len,
                         }) => ::core::result::Result::Ok(match #v_bound {
                             #ns_core::manifold::stream::Boundary::End => #done_v,
                             #ns_core::manifold::stream::Boundary::More => #open_v,
@@ -276,7 +286,7 @@ impl State {
                     let done_v = started(&finished, quote!(#v_body));
                     start.push(quote! {
                         Self::#variant(#head {
-                            head: #v_head, method: #v_method, content_length: #v_len,
+                            head: #v_head, content_length: #v_len,
                         }) => match #body.try_start(#v_limit, #v_bound) {
                             ::core::result::Result::Ok(
                                 #ns_core::body::admit::Start::Open(#v_body),
@@ -340,11 +350,11 @@ impl State {
             maps: &map_arms,
             each: &each,
             folds: &folds,
+            bodies: &bodies,
             finish: &finish,
             open: &c_open,
         }
         .render(paths);
-        let [c_body, p_body, g_body] = bodies.render(paths, &ident, &plain, &guarded);
         let p_types = (!all_g).then(|| {
             let p_flow = flow::Flow {
                 prepared: &prepared,
@@ -353,6 +363,7 @@ impl State {
                 maps: &p_maps,
                 each: &p_each,
                 folds: &p_folds,
+                bodies: &p_bodies,
                 finish: &p_end,
                 open: &p_open,
             }
@@ -365,7 +376,6 @@ impl State {
                     type State<F: #ns_core::decode::state::Set> = #plain<F>;
                 }
                 #p_flow
-                #p_body
                 impl<F, G> #ns_core::decode::state::Admission<#prepared, F, G> for #plain<F>
                 where
                     F: #ns_core::decode::state::Set,
@@ -389,6 +399,7 @@ impl State {
                 maps: &g_maps,
                 each: &g_each,
                 folds: &g_folds,
+                bodies: &g_bodies,
                 finish: &g_end,
                 open: &g_open,
             }
@@ -401,7 +412,6 @@ impl State {
                     type State<F: #ns_core::decode::state::Set> = #guarded<F>;
                 }
                 #g_flow
-                #g_body
             }
         });
         let tokens = quote! {
@@ -421,7 +431,6 @@ impl State {
             }
             #uniform
             #core
-            #c_body
             #p_types
             #g_types
 

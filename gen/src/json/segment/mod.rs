@@ -634,6 +634,7 @@ fn scalar_value(
     let class = scalar::Classified::of(&field.ty)?;
     let decode = match class.scalar {
         scalar::Scalar::U64 => quote::quote!(#v_value.u64()?),
+        scalar::Scalar::I64 => quote::quote!(#v_value.i64()?),
         scalar::Scalar::Bool => quote::quote!(#v_value.boolean()?),
         scalar::Scalar::Shared => {
             if field.mode.raw {
@@ -651,8 +652,7 @@ fn scalar_value(
                 quote::quote!(#v_value.inline_raw()?)
             }
         }
-        scalar::Scalar::I64
-        | scalar::Scalar::F64
+        scalar::Scalar::F64
         | scalar::Scalar::String
         | scalar::Scalar::Borrowed
         | scalar::Scalar::Bytes => {

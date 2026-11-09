@@ -1,5 +1,7 @@
 //! Parsing and state updates for HTTP headers with protocol-level semantics.
 
+use core::num::NonZero;
+
 use crate::{
     field::{
         head::{Error, Flags, headers::Bounds},
@@ -134,14 +136,95 @@ const GZIP_EXCLUDED: u16 = 1 << 5;
 const WILDCARD_ALLOWED: u16 = 1 << 6;
 const WILDCARD_EXCLUDED: u16 = 1 << 7;
 
+const GZIP: usize = 0;
+const BR: usize = 1;
+const IDENTITY: usize = 2;
+const WILDCARD: usize = 3;
+
+/// Coding qualities use 0..=1000; repeated explicit qualities use their minimum.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AcceptEncoding([NonZero<u16>; 4]);
+
+impl Default for AcceptEncoding {
+    fn default() -> Self {
+        Self([NonZero::<u16>::MAX; 4])
+    }
+}
+
+impl AcceptEncoding {
+    pub fn try_parse(raw: &[u8]) -> Result<Self, Error> {
+        let (_, encoding) = scan::<true>(raw)?;
+        Ok(encoding)
+    }
+
+    pub fn try_apply(
+        fields: &mut request::Fields,
+        flags: &mut Flags,
+        raw: &[u8],
+    ) -> Result<Self, Error> {
+        let (next, encoding) = scan::<true>(raw)?;
+        apply(fields, flags, next);
+        Ok(encoding)
+    }
+
+    pub fn scan_line(
+        fields: &mut request::Fields,
+        flags: &mut Flags,
+        raw: &[u8],
+    ) -> Result<Option<(Bounds, Self)>, Error> {
+        let Some(bounds) = trim_line(raw)? else {
+            return Ok(None);
+        };
+        let encoding = Self::try_apply(fields, flags, bounds.value(raw))?;
+        Ok(Some((bounds, encoding)))
+    }
+
+    pub fn append(&mut self, other: Self) {
+        for (target, value) in self.0.iter_mut().zip(other.0) {
+            *target = (*target).min(value);
+        }
+    }
+
+    pub fn gzip(self) -> u16 {
+        Self::resolve(self.0[GZIP], self.0[WILDCARD])
+    }
+
+    pub fn br(self) -> u16 {
+        Self::resolve(self.0[BR], self.0[WILDCARD])
+    }
+
+    fn resolve(value: NonZero<u16>, wildcard: NonZero<u16>) -> u16 {
+        match value {
+            value if value != NonZero::<u16>::MAX => value.get() - 1,
+            _ if wildcard != NonZero::<u16>::MAX => wildcard.get() - 1,
+            _ => 0,
+        }
+    }
+
+    pub fn identity(self) -> u16 {
+        match self.0[IDENTITY] {
+            q if q != NonZero::<u16>::MAX => q.get() - 1,
+            _ if self.0[WILDCARD] == NonZero::<u16>::MIN => 0,
+            _ => 1000,
+        }
+    }
+}
+
 /// Accumulates supported coding admission across all field lines. An explicit
 /// gzip member overrides the wildcard, and an explicit zero remains excluded.
 pub(super) fn ae_value(
-    scan: &mut request::Fields,
+    fields: &mut request::Fields,
     flags: &mut Flags,
     raw: &[u8],
 ) -> Result<(), Error> {
-    let mut next = *flags;
+    let (next, _) = scan::<false>(raw)?;
+    apply(fields, flags, next);
+    Ok(())
+}
+
+fn scan<const FULL: bool>(raw: &[u8]) -> Result<(Flags, AcceptEncoding), Error> {
+    let mut next = Flags::default();
+    let mut encoding = AcceptEncoding::default();
     for member in raw.split(|&byte| byte == b',') {
         let member = crate::field::Error::trim_ows(member);
         if member.is_empty() {
@@ -155,38 +238,61 @@ pub(super) fn ae_value(
             return Err(Error::Value);
         }
         let token = &member[..end];
-        let allowed = quality(&member[end..])?;
-        if token.eq_ignore_ascii_case(b"gzip") {
+        let quality = quality::<FULL>(&member[end..])?;
+        let slot = if token.eq_ignore_ascii_case(b"gzip") {
             next.set(GZIP_SEEN);
-            next.set(if allowed { GZIP_ALLOWED } else { GZIP_EXCLUDED });
+            next.set(if quality != 0 {
+                GZIP_ALLOWED
+            } else {
+                GZIP_EXCLUDED
+            });
+            GZIP
         } else if token == b"*" {
-            next.set(if allowed {
+            next.set(if quality != 0 {
                 WILDCARD_ALLOWED
             } else {
                 WILDCARD_EXCLUDED
             });
+            WILDCARD
+        } else if FULL && token.eq_ignore_ascii_case(b"br") {
+            BR
+        } else if FULL && token.eq_ignore_ascii_case(b"identity") {
+            IDENTITY
+        } else {
+            continue;
+        };
+        if FULL && let Some(value) = NonZero::new(quality + 1) {
+            match slot {
+                GZIP => encoding.0[GZIP] = encoding.0[GZIP].min(value),
+                BR => encoding.0[BR] = encoding.0[BR].min(value),
+                IDENTITY => encoding.0[IDENTITY] = encoding.0[IDENTITY].min(value),
+                _ => encoding.0[WILDCARD] = encoding.0[WILDCARD].min(value),
+            }
         }
     }
-    let allowed = if next.is_set(GZIP_SEEN) {
-        next.is_set(GZIP_ALLOWED) && !next.is_set(GZIP_EXCLUDED)
+    Ok((next, encoding))
+}
+
+fn apply(fields: &mut request::Fields, flags: &mut Flags, next: Flags) {
+    flags.0 |= next.0;
+    let allowed = if flags.is_set(GZIP_SEEN) {
+        flags.is_set(GZIP_ALLOWED) && !flags.is_set(GZIP_EXCLUDED)
     } else {
-        next.is_set(WILDCARD_ALLOWED) && !next.is_set(WILDCARD_EXCLUDED)
+        flags.is_set(WILDCARD_ALLOWED) && !flags.is_set(WILDCARD_EXCLUDED)
     };
-    scan.message.set_coding(if allowed {
+    fields.message.set_coding(if allowed {
         request::Coding::Gzip
     } else {
         request::Coding::Plain
     });
-    *flags = next;
-    Ok(())
 }
 
 /// The quality grammar has only four significant digits; parsing it directly
 /// keeps malformed controls and parameters out of the admitted field value.
-fn quality(raw: &[u8]) -> Result<bool, Error> {
+fn quality<const FULL: bool>(raw: &[u8]) -> Result<u16, Error> {
     let raw = crate::field::Error::trim_ows(raw);
     if raw.is_empty() {
-        return Ok(true);
+        return Ok(if FULL { 1000 } else { 1 });
     }
     let Some(raw) = raw.strip_prefix(b";") else {
         return Err(Error::Value);
@@ -212,11 +318,24 @@ fn quality(raw: &[u8]) -> Result<bool, Error> {
     } else {
         rest.strip_prefix(b".").ok_or(Error::Value)?
     };
-    if fraction.len() > 3
-        || !fraction.iter().all(u8::is_ascii_digit)
-        || (whole == b'1' && fraction.iter().any(|&byte| byte != b'0'))
-    {
+    if fraction.len() > 3 {
         return Err(Error::Value);
     }
-    Ok(whole == b'1' || fraction.iter().any(|&byte| byte != b'0'))
+    let mut quality = u16::from(whole == b'1');
+    if FULL {
+        quality *= 1000;
+    }
+    let mut scale = 100;
+    for &byte in fraction {
+        if !byte.is_ascii_digit() || (whole == b'1' && byte != b'0') {
+            return Err(Error::Value);
+        }
+        if FULL {
+            quality += u16::from(byte - b'0') * scale;
+            scale /= 10;
+        } else {
+            quality |= u16::from(byte != b'0');
+        }
+    }
+    Ok(quality)
 }

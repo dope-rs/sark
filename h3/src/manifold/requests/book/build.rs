@@ -1,19 +1,17 @@
+use crate::manifold::owners;
+use sark_core::manifold::task::app;
 use std::num::NonZero;
 
-use sark_core::{
-    body::{self, credit},
-    decode::request,
-    duplex,
-};
+use sark_core::body::{self, credit};
 
 use crate::manifold::requests::{self, book::Book, entries};
 
-impl<'d, P: request::Prepared, B: body::Build<'d>, T, D: duplex::Session<'d>> Book<'d, P, B, T, D> {
+impl<'d, A: app::Runtime<'d>, M: owners::Handoff> Book<'d, A, M> {
     pub(in crate::manifold) fn drive<E, F>(
         &mut self,
         budget: NonZero<usize>,
         proof: F,
-    ) -> Result<entries::Built<B::StepError>, requests::Error>
+    ) -> Result<entries::Built<<A::Build as body::Build<'d>>::StepError>, requests::Error>
     where
         E: credit::Evidence,
         F: FnOnce(requests::Id) -> E,

@@ -1,10 +1,11 @@
+use crate::manifold::owners;
 use core::marker::PhantomData;
+use sark_core::manifold::task::app;
 use std::num::NonZero;
 
 use sark_core::{
     body::{self, credit, input, stream},
-    decode::request,
-    duplex::Session,
+    duplex::input::PushError,
     manifold::stream::Boundary,
 };
 use sark_http::payload::response::Body as _;
@@ -12,12 +13,12 @@ use sark_http::payload::response::Body as _;
 use crate::{
     Payload,
     manifold::{
-        Phase,
+        Phase, encoder,
         requests::{
             self, Error,
             entries::{
                 self, Destination,
-                live::{Completion, Failure, Live, Push},
+                live::{Failure, Live, Push},
                 status,
             },
             exchange, task,
@@ -31,24 +32,22 @@ mod buffers;
 pub(in crate::manifold::requests) struct Credit<
     'a,
     'd,
-    P: request::Prepared,
-    B: body::Build<'d>,
-    T,
-    D: Session<'d>,
+    A: app::Runtime<'d>,
+    M: owners::Handoff,
     O: credit::Origin,
 > {
-    live: Live<'a, 'd, P, B, T, D>,
+    live: Live<'a, 'd, A, M>,
     origin: O,
     invariant: PhantomData<fn(O) -> O>,
 }
 
 // SAFETY: rebinding retains the same exclusive request slot, queue roots and
 // owners; the carrier supplies the exact account origin retained by Credit.
-unsafe impl<'a, 'd, P: request::Prepared, B: body::Build<'d>, T, D: Session<'d>> credit::raw::Bind
-    for Live<'a, 'd, P, B, T, D>
+unsafe impl<'a, 'd, A: app::Runtime<'d>, M: owners::Handoff> credit::raw::Bind
+    for Live<'a, 'd, A, M>
 {
     type Origin = credit::raw::Stored;
-    type Bound<O: credit::Origin> = Credit<'a, 'd, P, B, T, D, O>;
+    type Bound<O: credit::Origin> = Credit<'a, 'd, A, M, O>;
 
     unsafe fn bind<O: credit::Origin>(self, origin: O) -> Self::Bound<O> {
         Credit {
@@ -59,9 +58,7 @@ unsafe impl<'a, 'd, P: request::Prepared, B: body::Build<'d>, T, D: Session<'d>>
     }
 }
 
-impl<'a, 'd, P: request::Prepared, B: body::Build<'d>, T, D: Session<'d>, O: credit::Origin>
-    Credit<'a, 'd, P, B, T, D, O>
-{
+impl<'a, 'd, A: app::Runtime<'d>, M: owners::Handoff, O: credit::Origin> Credit<'a, 'd, A, M, O> {
     pub(in crate::manifold::requests) fn reset<E: credit::Evidence>(
         self,
         ledger: &mut credit::raw::Ledger<'_, O>,
@@ -91,25 +88,30 @@ impl<'a, 'd, P: request::Prepared, B: body::Build<'d>, T, D: Session<'d>, O: cre
             | entries::Entry::Responding(_)
             | entries::Entry::Duplex(_) => Destination::Remove(Ok(Reset::Cancelled)),
             entries::Entry::Stopped => Destination::Remove(Ok(Reset::Missing)),
-            entry @ entries::Entry::Active(_) => Destination::Stay(entry, Ok(Reset::Missing)),
+            entry @ (entries::Entry::Active(_)
+            | entries::Entry::Response(_)
+            | entries::Entry::Closing(_)) => Destination::Stay(entry, Ok(Reset::Missing)),
         })
     }
 
-    pub(in crate::manifold::requests) fn try_finish<E: credit::Evidence>(
+    pub(in crate::manifold::requests) fn try_finish<E: credit::Evidence, F>(
         self,
         ledger: &mut credit::raw::Ledger<'_, O>,
         proof: E,
-    ) -> Result<exchange::Termination<'d, P>, exchange::Error> {
+        response: impl FnOnce(task::Buffered<'d, A::Prepared>) -> Result<encoder::Pending<'d, M>, F>,
+    ) -> Result<exchange::Termination<F>, exchange::Error> {
         use exchange::Termination;
 
         let method = self.live.entry.get().method;
+        let idle = self.live.entry.get().queue == status::Queue::Idle;
         let origin = self.origin;
         self.live.entry.run(|entry| match entry {
             entries::Entry::Reserved => Destination::Remove(Ok(Termination::Cancelled)),
             entries::Entry::Stopped => Destination::Remove(Ok(Termination::Removed)),
-            entry @ (entries::Entry::Active(_) | entries::Entry::Deferred(_)) => {
-                Destination::Stay(entry, Ok(Termination::Retained))
-            }
+            entry @ (entries::Entry::Active(_)
+            | entries::Entry::Deferred(_)
+            | entries::Entry::Response(_)
+            | entries::Entry::Closing(_)) => Destination::Stay(entry, Ok(Termination::Retained)),
             entry @ entries::Entry::Responding(_) => {
                 Destination::Stay(entry, Ok(Termination::InputFinished))
             }
@@ -117,10 +119,15 @@ impl<'a, 'd, P: request::Prepared, B: body::Build<'d>, T, D: Session<'d>, O: cre
                 // SAFETY: this selected slot owns the body charged to origin.
                 match unsafe { buffers::try_finish(wait, ledger, proof, origin) } {
                     Ok(entries::Finished::Sync(request)) => {
-                        Destination::Remove(Ok(Termination::Completed(task::Buffered {
-                            request,
-                            method,
-                        })))
+                        match response(task::Buffered { request, method }) {
+                            Ok(response) => Destination::Ready(
+                                entries::Entry::Response(response),
+                                Ok(Termination::Completed(Ok(()))),
+                            ),
+                            Err(error) => {
+                                Destination::Remove(Ok(Termination::Completed(Err(error))))
+                            }
+                        }
                     }
                     Ok(entries::Finished::Task(request)) => Destination::Ready(
                         entries::Entry::Deferred(task::Input::Buffered(request)),
@@ -148,15 +155,16 @@ impl<'a, 'd, P: request::Prepared, B: body::Build<'d>, T, D: Session<'d>, O: cre
                         Err(exchange::Error::Request(error.into())),
                     );
                 }
-                match state.queue.wake() {
-                    status::Wake::Linked => Destination::Ready(
+                if idle {
+                    Destination::Ready(
                         entries::Entry::Duplex(state),
                         Ok(Termination::InputFinished),
-                    ),
-                    status::Wake::Present => Destination::Stay(
+                    )
+                } else {
+                    Destination::Stay(
                         entries::Entry::Duplex(state),
                         Ok(Termination::InputFinished),
-                    ),
+                    )
                 }
             }
         })
@@ -166,7 +174,7 @@ impl<'a, 'd, P: request::Prepared, B: body::Build<'d>, T, D: Session<'d>, O: cre
         self,
         ledger: &mut credit::raw::Ledger<'_, O>,
         proof: E,
-    ) -> Result<exchange::Stop<T>, requests::Error> {
+    ) -> Result<exchange::Stop<task::Owned<'d, A::Task, M>>, requests::Error> {
         use exchange::Stop;
 
         let finished = self.live.entry.get().finished;
@@ -175,13 +183,19 @@ impl<'a, 'd, P: request::Prepared, B: body::Build<'d>, T, D: Session<'d>, O: cre
             entries::Entry::Stopped => {
                 Destination::Stay(entries::Entry::Stopped, Ok(Stop::Ignored))
             }
-            entries::Entry::Active(task) => Destination::stop(finished, Ok(Stop::Task(task))),
+            entries::Entry::Active(active) => {
+                Destination::stop(finished, Ok(Stop::Task(task::Owned::Active(active))))
+            }
+            entries::Entry::Response(response) | entries::Entry::Closing(response) => {
+                Destination::stop(finished, Ok(Stop::Task(task::Owned::Response(response))))
+            }
             entries::Entry::Reserved
             | entries::Entry::Deferred(_)
             | entries::Entry::Responding(_) => Destination::stop(finished, Ok(Stop::Exchange(0))),
-            entries::Entry::Duplex(state) => {
-                Destination::stop(finished, Ok(Stop::Exchange(state.input.discard())))
-            }
+            entries::Entry::Duplex(state) => Destination::stop(
+                finished,
+                Ok(Stop::Exchange(state.input.into_buffer().discard())),
+            ),
             entries::Entry::Pending(body) => Destination::stop(
                 finished,
                 // SAFETY: this selected slot owns the body charged to origin.
@@ -207,7 +221,7 @@ impl<'a, 'd, P: request::Prepared, B: body::Build<'d>, T, D: Session<'d>, O: cre
         ledger: &mut credit::raw::Ledger<'_, O>,
         proof: F,
         budget: NonZero<usize>,
-    ) -> Result<entries::Built<B::StepError>, Phase>
+    ) -> Result<entries::Built<<A::Build as body::Build<'d>>::StepError>, Phase>
     where
         E: credit::Evidence,
         F: FnOnce(requests::Id) -> E,
@@ -294,6 +308,8 @@ impl<'a, 'd, P: request::Prepared, B: body::Build<'d>, T, D: Session<'d>, O: cre
             entry @ (entries::Entry::Pending(_)
             | entries::Entry::Deferred(_)
             | entries::Entry::Responding(_)
+            | entries::Entry::Response(_)
+            | entries::Entry::Closing(_)
             | entries::Entry::Duplex(_)) => Destination::Stay(entry, Ok(BuildOutcome::Idle)),
             entry => {
                 let phase = entry.phase();
@@ -304,9 +320,7 @@ impl<'a, 'd, P: request::Prepared, B: body::Build<'d>, T, D: Session<'d>, O: cre
     }
 }
 
-impl<'a, 'd, P: request::Prepared, B: body::Push<'d>, T, D: Session<'d>, O: credit::Origin>
-    Credit<'a, 'd, P, B, T, D, O>
-{
+impl<'a, 'd, A: app::Runtime<'d>, M: owners::Handoff, O: credit::Origin> Credit<'a, 'd, A, M, O> {
     pub(in crate::manifold::requests) fn push<E: credit::Evidence>(
         self,
         ledger: &mut credit::raw::Ledger<'_, O>,
@@ -315,8 +329,9 @@ impl<'a, 'd, P: request::Prepared, B: body::Push<'d>, T, D: Session<'d>, O: cred
         boundary: Boundary,
         request: credit::Limits,
         conn: credit::Limits,
-    ) -> Push<B::Error> {
+    ) -> Push<<A::Build as body::Push<'d>>::Error> {
         let origin = self.origin;
+        let idle = self.live.entry.get().queue == status::Queue::Idle;
         self.live.entry.run(|entry| match entry {
             entries::Entry::Pending(mut body) => {
                 // SAFETY: the loan names this selected slot's issuing account.
@@ -324,7 +339,7 @@ impl<'a, 'd, P: request::Prepared, B: body::Push<'d>, T, D: Session<'d>, O: cred
                     Ok(()) => Destination::Stay(
                         entries::Entry::Pending(body),
                         Push::Accepted {
-                            completion: Completion::from(boundary),
+                            completion: boundary,
                         },
                     ),
                     Err(error) => {
@@ -352,7 +367,7 @@ impl<'a, 'd, P: request::Prepared, B: body::Push<'d>, T, D: Session<'d>, O: cred
                         Destination::Ready(
                             entries::Entry::Building(build),
                             Push::Accepted {
-                                completion: Completion::Open,
+                                completion: Boundary::More,
                             },
                         )
                     }
@@ -367,23 +382,26 @@ impl<'a, 'd, P: request::Prepared, B: body::Push<'d>, T, D: Session<'d>, O: cred
                 }
             }
             entries::Entry::Duplex(mut state) => match state.input.push(input, boundary) {
-                Ok(()) => match state.queue.wake() {
-                    status::Wake::Linked => {
-                        Destination::Ready(entries::Entry::Duplex(state), Push::Queued)
-                    }
-                    status::Wake::Present => {
-                        Destination::Stay(entries::Entry::Duplex(state), Push::Queued)
-                    }
-                },
+                Ok(()) if idle => Destination::Ready(entries::Entry::Duplex(state), Push::Queued),
+                Ok(()) => Destination::Stay(entries::Entry::Duplex(state), Push::Queued),
                 Err(rejected) => {
-                    let (_, error) = rejected.into_parts();
+                    let (input, error) = match rejected {
+                        PushError::Finished(input) => {
+                            (input, Error::Body(body::Error::InputFinished))
+                        }
+                        PushError::Buffer(rejected) => rejected.into_parts(),
+                        PushError::Finish { input, error } => (input, Error::Duplex(error)),
+                    };
+                    drop(input);
                     Destination::Stay(entries::Entry::Duplex(state), Push::Request(error))
                 }
             },
-            entry @ entries::Entry::Responding(_) => Destination::Stay(
+            entry @ (entries::Entry::Responding(_)
+            | entries::Entry::Response(_)
+            | entries::Entry::Closing(_)) => Destination::Stay(
                 entry,
                 Push::Accepted {
-                    completion: Completion::from(boundary),
+                    completion: boundary,
                 },
             ),
             entry => {

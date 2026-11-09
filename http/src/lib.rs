@@ -3,6 +3,7 @@ pub mod h1;
 pub mod method;
 pub mod owner;
 pub mod payload;
+pub mod preface;
 pub mod request;
 pub mod uri;
 

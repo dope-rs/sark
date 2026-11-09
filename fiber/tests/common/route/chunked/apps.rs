@@ -14,6 +14,7 @@ use sark_http::{
 };
 
 use crate::common::retained::{Failure, State};
+use crate::common::route::body::OwnedReply;
 
 #[sark_fiber::request]
 pub struct SegmentedReq {
@@ -102,12 +103,6 @@ pub struct DiscardReq {
 pub struct Borrowed<'req, 'd> {
     pub status: status::Code,
     pub body: body::Ref<'req, 'd>,
-}
-
-#[sark_fiber::response(raw)]
-pub struct OwnedReply {
-    pub status: status::Code,
-    pub body: Vec<u8>,
 }
 
 #[sark_fiber::response(raw)]

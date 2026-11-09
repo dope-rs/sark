@@ -1,20 +1,11 @@
 use std::io::Write;
 
-use dope::core::driver::life::recovery;
-
 pub mod common;
 
 use std::{cell::Cell, convert::Infallible, time::Duration};
 
-use common::session::Connect;
-use dope::{
-    core::driver::route::{FrameworkTag, Tag, kind},
-    runtime::{
-        executor::session::{Completion, Error},
-        topology,
-    },
-};
-use dope_test::{harness::server::Pair, reclaim::Reports};
+use common::session::{Connect, Serve};
+use dope_test::harness::server::Pair;
 use sark_core::manifold::stream::Boundary;
 use sark_h2::{
     conn::CLIENT_PREFACE,
@@ -25,7 +16,6 @@ use sark_h2::{
         numbers::{ErrorCode, Flags, Type},
     },
     hpack::encode::{Encoder, Mode},
-    server::Server,
     stream::Id,
 };
 use sark_http::field::metadata::map::record::Entry;
@@ -43,40 +33,16 @@ fn rejects_split_trailers() {
     pair.check(
         move |context, listener| {
             let calls = Cell::new(0);
-            let prepared =
-                Server::from_handler(Echo(&calls), Echo::try_plan(bind).expect("H2 server plan"))
-                    .prepare_on(listener)
-                    .expect("H2 server resources");
-            let mut reports =
-                Reports::<1>::new(prepared.layout(), [<FrameworkTag<kind::Any> as Tag>::ROUTE]);
-            let mut finish = Completion::new();
-            prepared.enter_with(
-                context,
-                |worker| {
-                    worker.lend(|plan, stage| {
-                        plan.install(stage, |host, stage| {
-                            stage.with_app(&mut finish, host, |app| {
-                                app.run().inspect(|_| assert_eq!(calls.get(), 1))
-                            })
-                        })
-                        .map_err(topology::Failure::Install)?
-                        .map_err(topology::Failure::Run)?
-                        .map_err(|cause| topology::Failure::Run(Error::Drive(cause)))
-                    })
-                },
-                recovery::Policy::new(|event| reports.push(event), common::recover),
-                |result| {
-                    let result = match result {
-                        Ok(result) => result.map_err(topology::RunError::Failure),
-                        Err(error) => Err(topology::RunError::from(error)),
-                    };
-                    result
-                        .as_ref()
-                        .map(|_| ())
-                        .map_err(topology::RunError::cause)
-                        .expect("H2 server shutdown")
-                },
-            );
+            let reports = Echo(&calls)
+                .try_serve(
+                    Echo::try_plan(bind).expect("H2 server plan"),
+                    context,
+                    listener,
+                    common::recover,
+                    |result| result.expect("H2 server shutdown"),
+                )
+                .expect("H2 server resources");
+            assert_eq!(calls.get(), 1);
             assert!(
                 reports.events().expect("H2 retirement").is_empty(),
                 "retirement: {reports:?}"

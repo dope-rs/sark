@@ -3,12 +3,16 @@ use std::{marker::PhantomData, mem, num::NonZero};
 
 use dope::{
     core::driver::route::Identity,
-    manifold::client::{conn, port::error::Open},
+    manifold::client::{
+        conn,
+        port::{self, error::Open},
+    },
 };
 use dope_fiber::reply::layout;
 use o3::{
     alloc::{self, array},
     base::{cell::region, time::Positive},
+    buffer::pool,
     depot::queue::indexed::lanes::entry,
 };
 
@@ -23,7 +27,6 @@ use crate::client::{
 #[derive(Clone, Copy)]
 pub(super) enum State<P, T> {
     Vacant,
-    Admitting,
     Admitted(P),
     Connecting(P),
     Ready(P, T),
@@ -39,7 +42,7 @@ impl<P: Copy, T: Copy> State<P, T> {
             | Self::Receiving(position, tag)
             | Self::Closing(position, tag)
             | Self::Drained(position, tag) => Some((position, tag)),
-            Self::Vacant | Self::Admitting | Self::Admitted(_) | Self::Connecting(_) => None,
+            Self::Vacant | Self::Admitted(_) | Self::Connecting(_) => None,
         }
     }
 }
@@ -59,26 +62,6 @@ pub(in crate::client) struct Bound<'a, 'd, ID: Identity, Tag: Copy, S, P> {
 
 pub(in crate::client) type Positioned<'a, 'b, 'd, ID, Tag, S> =
     Bound<'a, 'd, ID, Tag, S, layout::Position<'b, 'd, ID>>;
-
-/// Holds an admitted reply position until transport activation commits.
-pub(in crate::client::exchange::net) struct Admission<'a, 'b, 'd, ID: Identity, Tag: Copy, S> {
-    entry: &'a Entry<'d, Tag, S, layout::Position<'b, 'd, ID>>,
-    position: layout::Position<'b, 'd, ID>,
-}
-
-impl<'b, 'd, ID: Identity, Tag: Copy, S> Admission<'_, 'b, 'd, ID, Tag, S> {
-    pub(in crate::client::exchange::net) fn commit(self) -> layout::Position<'b, 'd, ID> {
-        let this = mem::ManuallyDrop::new(self);
-        this.entry.state.set(State::Admitted(this.position));
-        this.position
-    }
-}
-
-impl<ID: Identity, Tag: Copy, S> Drop for Admission<'_, '_, '_, ID, Tag, S> {
-    fn drop(&mut self) {
-        self.entry.state.set(State::Vacant);
-    }
-}
 
 /// Reserves an admitted generation until activation commits.
 /// Its report remains vacant: construction initializes it, and reuse requires
@@ -154,20 +137,20 @@ impl<'b, 'd, ID: Identity, Tag: net::PoolTag<'d, ID>, S> Directory<'b, 'd, ID, T
         })
     }
 
-    pub(in crate::client::exchange::net) fn try_admit(
+    pub(in crate::client::exchange::net) fn try_activate(
         &self,
-        id: conn::Id<'d, ID>,
-    ) -> Result<Admission<'_, 'b, 'd, ID, Tag, S>, net::Open> {
-        let position =
-            layout::Position::try_new(*self.entries.extent(), id).map_err(net::Open::Reply)?;
+        io: &port::Port<'_, 'd, pool::Cursor, ID>,
+        active: &conn::Activation<'_, 'd, ID>,
+    ) -> Result<layout::Position<'b, 'd, ID>, net::Open> {
+        let position = layout::Position::try_new(*self.entries.extent(), active.connection())
+            .map_err(net::Open::Reply)?;
         let entry = position.entry(&self.entries);
-        match entry.state.get() {
-            State::Vacant => {
-                entry.state.set(State::Admitting);
-                Ok(Admission { entry, position })
-            }
-            _ => Err(net::Open::Transport(Open::Occupied)),
+        if !matches!(entry.state.get(), State::Vacant) {
+            return Err(net::Open::Transport(Open::Occupied));
         }
+        io.try_activate(active).map_err(net::Open::Transport)?;
+        entry.state.set(State::Admitted(position));
+        Ok(position)
     }
 
     pub(super) fn try_connect(

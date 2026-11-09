@@ -1,5 +1,3 @@
-use core::marker::PhantomData;
-
 use o3::buffer::resident;
 use sark_core::{
     decode::{self, request},
@@ -23,7 +21,7 @@ where
     R: decode::Decode,
     R::Prepared: request::Synchronous,
 {
-    pub(in crate::server::sync) fn pump<'a, const ROUND: bool, B, P>(
+    pub(in crate::server::sync) fn pump<'a, const ROUND: bool, B, P, D>(
         &'a mut self,
         conn: &'a mut machine::Connection<
             crate::ServerRole,
@@ -36,11 +34,13 @@ where
         limits: server::Config,
         egress: schedule::Egress,
         permit: B,
+        report: D,
     ) -> schedule::Report
     where
         'd: 'a,
         B: FnMut() -> Option<P>,
-        driver::Driver<'a, 'd, R, <R::Head as request::Head>::Start, B>: typed::Driver<
+        D: FnMut(conn::Error),
+        driver::Driver<'a, 'd, R, B, D>: typed::Driver<
                 Phase<'d, R>,
                 response::Pending<'d>,
                 Receiving<'d, R>,
@@ -55,7 +55,7 @@ where
             limits,
             credit: &mut self.credit,
             permit,
-            mode: PhantomData::<<R::Head as request::Head>::Start>,
+            report,
         };
         match ROUND {
             true => self.runtime.drive_round(driver),

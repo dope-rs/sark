@@ -51,6 +51,7 @@ fn reports_write_failure() {
                 |failure: Failure<
                     '_,
                     '_,
+                    '_,
                     wire::Identity,
                     KeyTag<0>,
                     run::Failure,
@@ -115,6 +116,7 @@ fn active_write() {
             let reports = Cell::new(0);
             let report = Report::new(
                 |failure: Failure<
+                    '_,
                     '_,
                     '_,
                     wire::Identity,

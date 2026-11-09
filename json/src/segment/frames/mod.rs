@@ -160,7 +160,7 @@ impl<'d, C: Context, F: Capture<C>> Frames<'d, C, F> {
 
     fn store(&mut self, bytes: storage::Shared) {
         // SAFETY: capture reserved this slot; copying preserves the exclusive values table.
-        unsafe { alloc::raw::VecExt::vacancy(&mut self.values) }.insert(F::bind(
+        (unsafe { alloc::raw::VecExt::vacancy(&mut self.values) })(F::bind(
             self.context,
             Captured {
                 bytes,
@@ -237,7 +237,7 @@ impl<'d, C: Context, F: Capture<C>> Frames<'d, C, F> {
                                 start: self.cursor.absolute,
                                 string: Scan::new(input.is_admitted()),
                             };
-                        } else if F::MODE == Mode::Plain {
+                        } else if F::MODE != Mode::Raw {
                             return Err(Error::Invalid);
                         } else if matches!(byte, b'{' | b'[') {
                             let nesting = if input.is_admitted() {

@@ -5,7 +5,7 @@ use dope::{
         Errno,
         driver::schedule::ready::wake::{fanout, table},
     },
-    manifold::client::close,
+    manifold::client::{close, conn},
     net::link::{egress::reserve::exact, pool::change::opening},
 };
 use o3::{
@@ -30,6 +30,7 @@ pub enum Error {
     Sender(fifo::Reject),
     Disconnected(close::Reason),
     Transport(Errno),
+    Transmit(conn::Transmit),
     Protocol(crate::Status),
     Create(session::Create<Build, alloc::Error>),
     Prepare(io::Error),

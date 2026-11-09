@@ -203,22 +203,24 @@ impl<M: Validation> String<M> {
         }
     }
 
-    /// Returns an admitted ASCII run that leaves every state field unchanged.
+    /// Returns an admitted plain run that leaves every state field unchanged.
     pub(crate) fn skip<'a>(&self, chunk: &'a [u8]) -> &'a [u8] {
-        if !matches!(self.escape, Escape::Plain) || self.utf8.left != 0 {
+        if !matches!(self.escape, Escape::Plain) || (M::CHECK && self.utf8.left != 0) {
             return &chunk[..0];
         }
         let words = chunk.as_chunks::<8>().0;
         let start = words
             .iter()
-            .position(|word| !crate::bytes::is_plain::<true>(u64::from_ne_bytes(*word)))
+            .position(|word| !crate::bytes::is_plain(u64::from_ne_bytes(*word), M::CHECK, M::CHECK))
             .unwrap_or(words.len())
             * 8;
         // SAFETY: the word index is bounded by this input's complete chunks.
         let rest = unsafe { chunk.get_unchecked(start..) };
         let len = rest
             .iter()
-            .position(|byte| !matches!(byte, 0x20..=0x7f) || matches!(byte, b'"' | b'\\'))
+            .position(|byte| {
+                (M::CHECK && !matches!(byte, 0x20..=0x7f)) || matches!(byte, b'"' | b'\\')
+            })
             .unwrap_or(rest.len());
         // SAFETY: len is bounded by rest, so start + len remains within this input.
         unsafe { chunk.get_unchecked(..start + len) }

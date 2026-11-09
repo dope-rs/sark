@@ -1,4 +1,4 @@
-use o3::{buffer::hold, mem};
+use o3::buffer::hold;
 use sark_core::manifold::stream::Boundary;
 
 use crate::{
@@ -11,84 +11,69 @@ use crate::{
 
 pub(in crate::conn) struct Entry<'d> {
     class: budget::WriteClass,
-    charge: output::WriteCharge,
-    write: plan::Record<'d>,
+    boundary: Boundary,
+    plan: plan::Plan<Option<output::WritePayload<'d>>>,
 }
 
 pub(in crate::conn) trait Stage<'d>: Sized {
     fn class(&self) -> budget::WriteClass;
     fn charge(&self) -> output::WriteCharge;
-    fn target(&self) -> stream::Target;
-    fn into_write(self) -> plan::Record<'d>;
+    fn into_write(self, target: stream::Target) -> plan::Record<'d>;
 }
 
 impl<'d> Entry<'d> {
     pub(in crate::conn) fn single(
         class: budget::WriteClass,
-        target: stream::Target,
         prefix: output::WritePrefix,
         boundary: Boundary,
     ) -> Self {
-        let charge = prefix.charge();
         Self {
             class,
-            charge,
-            write: plan::Record::single(target, prefix, boundary),
+            boundary,
+            plan: plan::Plan::single(prefix),
         }
     }
 
-    pub(in crate::conn) fn try_frame<T: output::Payload<'d>>(
+    pub(in crate::conn) fn frame(
         class: budget::WriteClass,
-        target: stream::Target,
         prefix: output::WritePrefix,
-        payload: T,
+        payload: Vec<u8>,
         boundary: Boundary,
-    ) -> Result<Self, mem::Rejected<T, output::Error>> {
-        let (plan, _) = plan::Plan::try_new(prefix, payload)?;
-        Ok(Self::planned(class, target, plan, boundary))
+    ) -> Self {
+        Self::planned(class, plan::Plan::new(prefix, payload), boundary)
     }
 
     pub(in crate::conn::io) fn planned<T: output::Payload<'d>>(
         class: budget::WriteClass,
-        target: stream::Target,
         plan: plan::Plan<T>,
         boundary: Boundary,
     ) -> Self {
         Self {
             class,
-            charge: plan.charge(),
-            write: plan.into_write(target, boundary),
+            boundary,
+            plan: plan.freeze(),
         }
     }
 
-    pub(in crate::conn) fn finish(mut self) -> Self {
-        self.write = self.write.finish();
-        self
-    }
-
-    pub(in crate::conn) fn target(&self) -> stream::Target {
-        self.write.target()
+    pub(in crate::conn) fn finish(&mut self) {
+        self.boundary = Boundary::End;
     }
 
     pub(in crate::conn) fn retained(&self) -> hold::Charge {
-        self.write.retained()
+        self.plan.retained()
     }
 }
 
 impl<'d> Stage<'d> for Entry<'d> {
-    fn target(&self) -> stream::Target {
-        self.write.target()
-    }
-
     fn class(&self) -> budget::WriteClass {
         self.class
     }
 
     fn charge(&self) -> output::WriteCharge {
-        self.charge
+        self.plan.charge()
     }
 
-    fn into_write(self) -> plan::Record<'d> {
-        self.write
+    fn into_write(self, target: stream::Target) -> plan::Record<'d> {
+        self.plan.into_write(target, self.boundary)
     }
 }

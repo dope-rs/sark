@@ -1,5 +1,5 @@
 use core::mem;
-use std::{net, rc::Rc};
+use std::rc::Rc;
 
 use dope::{
     core::driver::{
@@ -11,7 +11,7 @@ use dope::{
 };
 use dope_quic::{
     errors::Code,
-    runtime::{endpoint, endpoint::client},
+    runtime::{endpoint, endpoint::client, receive, routing},
 };
 use sark_h3::{frame, manifold::server::startup::Plan};
 
@@ -100,12 +100,19 @@ where
                     .first()
                     .copied()
                     .flatten()
-                    .map(|(conn, stream)| (conn, cancel.action, stream))
+                    .map(|(conn, stream)| {
+                        (
+                            conn,
+                            cancel.action,
+                            stream,
+                            proof.network.protocol.qpack.decoder.table_bytes != 0,
+                        )
+                    })
             } else {
                 None
             }
         };
-        if let Some((target, action, stream)) = cancel {
+        if let Some((target, action, stream, decoder_open)) = cancel {
             let Some(handle) = this.client.sole() else {
                 return Err(Failure::Scenario(
                     "cancellation target connection is no longer active".to_owned(),
@@ -125,14 +132,37 @@ where
                     CancelAction::StopSending => {
                         stop_stream(&mut conn, stream, frame::ErrorCode::RequestCancelled)
                     }
-                    CancelAction::Qpack => {
-                        let mut wire = vec![frame::STREAM_TYPE_QPACK_DECODER.get() as u8];
-                        sark_h3::qpack::stream::Instruction::StreamCancellation {
-                            stream_id: stream.get(),
-                        }
-                        .encode(&mut wire);
+                    CancelAction::Qpack
+                    | CancelAction::QpackAcknowledgment
+                    | CancelAction::QpackIncrement => {
+                        use sark_h3::qpack::stream::Instruction;
+
+                        let mut wire = Vec::new();
                         let mut streams = conn.streams();
-                        let decoder = streams.send().open_uni()?;
+                        let decoder = if decoder_open {
+                            // start_scope opens client control stream 2, then decoder stream 6.
+                            streams.view().resolve_send(
+                                dope_quic::wire::stream::Id::new(6)
+                                    .ok_or(dope_quic::conn::stream::Error::InvalidStream)?,
+                            )?
+                        } else {
+                            wire.push(frame::STREAM_TYPE_QPACK_DECODER.get() as u8);
+                            streams.send().open_uni()?
+                        };
+                        let instruction = match action {
+                            CancelAction::QpackAcknowledgment => {
+                                Instruction::SectionAcknowledgment {
+                                    stream_id: stream.get(),
+                                }
+                            }
+                            CancelAction::QpackIncrement => Instruction::InsertCountIncrement {
+                                increment: std::num::NonZero::<u64>::MIN,
+                            },
+                            _ => Instruction::StreamCancellation {
+                                stream_id: stream.get(),
+                            },
+                        };
+                        instruction.encode(&mut wire);
                         streams.send().send(decoder, &wire)
                     }
                     CancelAction::KeyClose => {
@@ -194,7 +224,7 @@ where
                 proof.replies.finished[0] = true;
                 proof.stop_done();
             }
-            proof.cancel.request.is_some() && proof.network.failures.is_pending()
+            proof.cancel.request.is_some() && !proof.network.failures.done.get()
         };
         Ok(if pending {
             control::Flow::More
@@ -204,15 +234,15 @@ where
     }
 }
 
-pub(crate) struct RunPlan<'a> {
-    pub(crate) plan: Plan<LISTENER>,
+pub(crate) struct RunPlan<'a, Q: routing::LocalRoute, P> {
+    pub(crate) plan: Plan<LISTENER, receive::Retained, Q>,
     pub(crate) proof: Rc<Shared<'a>>,
     pub(crate) client: client::Plan<DIALER>,
-    pub(crate) reservation: net::UdpSocket,
+    pub(crate) reservation: P,
     pub(crate) task_capacity: slots::Slots,
 }
 
-impl settings::Resource for RunPlan<'_> {
+impl<Q: routing::LocalRoute, P> settings::Resource for RunPlan<'_, Q, P> {
     fn include_in(&self, needs: claim::Needs) -> Result<claim::Needs, errors::Claim> {
         let needs = self.plan.include_in(needs)?;
         let needs = self.client.as_ref().include_in(needs)?;

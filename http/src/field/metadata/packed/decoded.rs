@@ -12,7 +12,7 @@ use crate::field::metadata::{self, lower::plain::Error, map, packed, section::st
 
 #[derive(Debug)]
 #[repr(transparent)]
-pub struct Decoded<S = pool::Span<owners::Plain<pool::Layout>, pool::Owned, pool::Frozen>> {
+pub struct Decoded<S = pool::Span, const PREFIX: usize = 0> {
     storage: S,
 }
 
@@ -25,15 +25,22 @@ impl Decoded {
     }
 }
 
-impl From<Decoded> for Shared {
-    fn from(value: Decoded) -> Self {
-        value.storage.into_shared()
+impl<const PREFIX: usize> Decoded<pool::Span, PREFIX> {
+    /// Consumes the record proof and returns its exclusively owned storage.
+    pub fn into_lease(self) -> pool::Span {
+        self.storage
     }
 }
 
-impl<S: AsRef<[u8]>> Decoded<S> {
+impl<const PREFIX: usize> From<Decoded<pool::Span, PREFIX>> for Shared {
+    fn from(value: Decoded<pool::Span, PREFIX>) -> Self {
+        value.storage.freeze().into_shared()
+    }
+}
+
+impl<S: AsRef<[u8]>, const PREFIX: usize> Decoded<S, PREFIX> {
     pub fn iter(&self) -> Iter<'_> {
-        Iter::new(self.storage.as_ref())
+        Iter::new(&self.storage.as_ref()[PREFIX..])
     }
 
     pub fn len(&self) -> usize {
@@ -41,7 +48,7 @@ impl<S: AsRef<[u8]>> Decoded<S> {
     }
 
     pub fn is_empty(&self) -> bool {
-        self.storage.as_ref().is_empty()
+        self.storage.as_ref().len() == PREFIX
     }
 
     pub fn get(&self, name: &[u8]) -> Option<&[u8]> {
@@ -55,56 +62,56 @@ impl<S: AsRef<[u8]>> Decoded<S> {
     }
 
     pub fn ranges(&self) -> RangeIter<'_> {
-        RangeIter::new(self.storage.as_ref())
+        RangeIter::new(self.storage.as_ref(), PREFIX)
     }
 
     pub fn try_to_owned(&self) -> Result<Vec<Owned>, alloc::Error> {
         let mut fields = Vec::new();
         for field in self.iter() {
-            let slot = alloc::Vacant::try_new(&mut fields)?;
-            slot.insert(Owned::try_from(field)?);
+            alloc::try_vacant(&mut fields)?(Owned::try_from(field)?);
         }
         Ok(fields)
     }
 }
 
-impl metadata::Metadata for Decoded {
+impl<const PREFIX: usize> metadata::Metadata for Decoded<pool::Span, PREFIX> {
     type Iter<'a> = Iter<'a>;
 
     fn fields(&self) -> Self::Iter<'_> {
-        Iter::new(self.storage.as_ref())
+        self.iter()
     }
 }
 
-impl storage::Block for Decoded {
+impl<const PREFIX: usize> storage::Block for Decoded<pool::Span, PREFIX> {
     type Format = storage::Raw;
+    const PREFIX: &'static [u8] = &[0; PREFIX];
 
     fn from(storage: storage::Finished<Self>) -> Self {
         Self {
-            storage: storage.into_frozen(),
+            storage: storage.into_lease(),
         }
     }
 
     fn into_bytes(self) -> storage::Bytes {
-        storage::Bytes::new(self.storage)
+        storage::Bytes::new(self.storage.freeze())
     }
 }
 
-impl<S: AsRef<[u8]>> AsRef<[u8]> for Decoded<S> {
+impl<S: AsRef<[u8]>, const PREFIX: usize> AsRef<[u8]> for Decoded<S, PREFIX> {
     fn as_ref(&self) -> &[u8] {
         self.storage.as_ref()
     }
 }
 
-impl PartialEq for Decoded {
+impl<const PREFIX: usize> PartialEq for Decoded<pool::Span, PREFIX> {
     fn eq(&self, other: &Self) -> bool {
         self.storage.as_ref() == other.storage.as_ref()
     }
 }
 
-impl Eq for Decoded {}
+impl<const PREFIX: usize> Eq for Decoded<pool::Span, PREFIX> {}
 
-impl<'a> IntoIterator for &'a Decoded {
+impl<'a, const PREFIX: usize> IntoIterator for &'a Decoded<pool::Span, PREFIX> {
     type Item = Entry<'a>;
     type IntoIter = Iter<'a>;
 
@@ -119,45 +126,55 @@ const _: () = assert!(
 );
 const _: () = assert!(mem::size_of::<Option<Decoded>>() == mem::size_of::<Decoded>());
 
-impl storage::Scope for Decoded {
+impl<const PREFIX: usize> storage::Scope for Decoded<pool::Span, PREFIX> {
     type Scoped<'id> = Decoded<
         scope::Owner<'id, pool::Span<owners::Plain<pool::Layout>, pool::Owned, pool::Frozen>>,
+        PREFIX,
     >;
 
     fn scope<T>(self, use_head: impl for<'id> FnOnce(Self::Scoped<'id>) -> T) -> T {
-        scope::Owner::with(self.storage, |storage| use_head(Decoded { storage }))
+        // Freeze before issuing an identity; a scoped or shared owner cannot
+        // recover the mutable lease through the unscoped consuming boundary.
+        scope::Owner::with(self.storage.freeze(), |storage| {
+            use_head(Decoded { storage })
+        })
     }
 }
 
-impl<'id>
-    Decoded<scope::Owner<'id, pool::Span<owners::Plain<pool::Layout>, pool::Owned, pool::Frozen>>>
+impl<'id, const PREFIX: usize>
+    Decoded<
+        scope::Owner<'id, pool::Span<owners::Plain<pool::Layout>, pool::Owned, pool::Frozen>>,
+        PREFIX,
+    >
 {
     pub fn view(&self) -> scope::View<'_, 'id> {
         self.storage.view()
     }
 }
 
-impl<'id>
+impl<'id, const PREFIX: usize>
     From<
         Decoded<
             scope::Owner<'id, pool::Span<owners::Plain<pool::Layout>, pool::Owned, pool::Frozen>>,
+            PREFIX,
         >,
     > for scope::Owner<'id, Shared>
 {
     fn from(
         head: Decoded<
             scope::Owner<'id, pool::Span<owners::Plain<pool::Layout>, pool::Owned, pool::Frozen>>,
+            PREFIX,
         >,
     ) -> Self {
         head.storage.into_shared()
     }
 }
 
-impl storage::Writer<Decoded> {
+impl<const PREFIX: usize> storage::Writer<Decoded<pool::Span, PREFIX>> {
     /// Commits a field after its producer supplies the name boundary.
     pub fn try_write<E>(
         &mut self,
-        write: impl FnOnce(&mut spans::Writer<'_, '_, false>) -> Result<usize, E>,
+        write: impl FnOnce(&mut spans::Writer<'_, '_>) -> Result<usize, E>,
     ) -> Result<(), E>
     where
         E: From<Error>,
@@ -168,7 +185,7 @@ impl storage::Writer<Decoded> {
     pub fn try_write_as<E>(
         &mut self,
         indexing: crate::field::Indexing,
-        write: impl FnOnce(&mut spans::Writer<'_, '_, false>) -> Result<usize, E>,
+        write: impl FnOnce(&mut spans::Writer<'_, '_>) -> Result<usize, E>,
     ) -> Result<(), E>
     where
         E: From<Error>,

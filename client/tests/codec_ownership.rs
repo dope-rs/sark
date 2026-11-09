@@ -1,4 +1,4 @@
-use common::codec::{Block, Output, Retain, Scope as _, decoder::Decoder};
+use common::codec::{Retain, Scope as _, decoder::Decoder, only};
 use o3::buffer::resident::staging::{Buf, Layout, Plan, Pool};
 use sark_client::protocol::response::Event;
 use sark_http::h1::head::Boundary;
@@ -30,21 +30,22 @@ fn retention_is_atomic() {
             let mut state = codec::Stateful::state(&codec, budget);
             let decoder = Decoder::try_new(&codec).expect("codec staging");
             let mut stored = decoder.storage(&source, &state);
-            Block::try_new(budget).expect("resident blocker").with(|| {
-                Retain {
-                    result: decoder.try_stored(&mut state, &mut stored, &budget),
-                    budget,
-                }
-                .try_verify()
-                .ok()
-                .expect("exact resident retention error");
-            });
+            let blocker = storage::Owned::try_allocate(&budget, budget.available())
+                .expect("resident blocker");
+            Retain {
+                result: decoder.try_stored(&mut state, &mut stored, &budget),
+                budget,
+            }
+            .try_verify()
+            .ok()
+            .expect("exact resident retention error");
+            drop(blocker);
             let (parsed, _) = (decoder
                 .try_stored(&mut state, &mut stored, &budget)
                 .expect("codec parse"))
             .expect("head retention retry must parse");
             assert!(matches!(
-                Output::new(parsed).only(),
+                only(parsed),
                 Some(Ok(protocol::response::Event::Head(_)))
             ));
         }
@@ -63,20 +64,21 @@ fn retention_is_atomic() {
             let body = (Shared::try_copy(b"hello")).expect("body fixture storage");
             let decoder = Decoder::try_new(&codec).expect("codec staging");
             let mut stored = decoder.storage(&body, &state);
-            Block::try_new(budget).expect("resident blocker").with(|| {
-                Retain {
-                    result: decoder.try_stored(&mut state, &mut stored, &budget),
-                    budget,
-                }
-                .try_verify()
-                .ok()
-                .expect("exact resident retention error");
-            });
+            let blocker = storage::Owned::try_allocate(&budget, budget.available())
+                .expect("resident blocker");
+            Retain {
+                result: decoder.try_stored(&mut state, &mut stored, &budget),
+                budget,
+            }
+            .try_verify()
+            .ok()
+            .expect("exact resident retention error");
+            drop(blocker);
             let (parsed, _) = (decoder
                 .try_stored(&mut state, &mut stored, &budget)
                 .expect("codec parse"))
             .expect("body retention retry must parse");
-            let (data,) = match Output::new(parsed).only() {
+            let (data,) = match only(parsed) {
                 Some(Ok(Event::Data(data))) => Some((data,)),
                 _ => None,
             }
@@ -115,7 +117,7 @@ fn retention_is_atomic() {
                 .expect("codec parse"))
             .expect("retention retry must parse");
             assert_eq!(body.plans(), 2, "retention must reuse the approved prefix");
-            let (data,) = match Output::new(parsed).only() {
+            let (data,) = match only(parsed) {
                 Some(Ok(Event::Data(data))) => Some((data,)),
                 _ => None,
             }
@@ -148,15 +150,15 @@ fn eof_retry_is_atomic() {
         );
         let decoder = Decoder::try_new(&codec).expect("codec staging");
         let stored = decoder.storage(&window, &state);
-        let (stored, state) = Block::try_new(budget).expect("resident blocker").with(|| {
-            let (owners, result) = decoder.try_finish(state, stored, &budget);
-            Retain { result, budget }
-                .try_verify()
-                .ok()
-                .expect("exact resident retention error");
-            assert_eq!(window.as_slice(), b"body");
-            owners
-        });
+        let blocker = storage::Owned::try_allocate(&budget, budget.available())
+            .expect("resident blocker");
+        let ((stored, state), result) = decoder.try_finish(state, stored, &budget);
+        Retain { result, budget }
+            .try_verify()
+            .ok()
+            .expect("exact resident retention error");
+        assert_eq!(window.as_slice(), b"body");
+        drop(blocker);
         let (_owners, finish) = decoder.try_finish(state, stored, &budget);
         let (head,) = match Some(finish) {
             Some(Ok(codec::Finish::Item(head))) => Some((head,)),
@@ -164,7 +166,7 @@ fn eof_retry_is_atomic() {
         }
         .expect("retry must complete the EOF body");
         let end = head.completion();
-        let (data,) = match Output::new(head).only() {
+        let (data,) = match only(head) {
             Some(Ok(Event::Data(data))) => Some((data,)),
             _ => None,
         }
@@ -320,7 +322,7 @@ fn small_ranges_compact() {
             .try_parse(&mut state, &response, &budget)
             .expect("codec parse"))
         .expect("response head must parse");
-        let (head,) = match Output::new(parsed).only() {
+        let (head,) = match only(parsed) {
             Some(Ok(Event::Head(head))) => Some((head,)),
             _ => None,
         }
@@ -337,7 +339,7 @@ fn small_ranges_compact() {
             .expect("codec parse"))
         .expect("response body must parse");
         assert_eq!(consumed.get(), 5);
-        let (data,) = match Output::new(event).only() {
+        let (data,) = match only(event) {
             Some(Ok(Event::Data(data))) => Some((data,)),
             _ => None,
         }
@@ -379,7 +381,7 @@ fn large_chunk_is_shared() {
         });
         let (event, _) = (parsed).expect("chunk event must parse");
         assert_eq!(allocs, 0);
-        let (data,) = match Output::new(event).only() {
+        let (data,) = match only(event) {
             Some(Ok(Event::Data(data))) => Some((data,)),
             _ => None,
         }

@@ -63,7 +63,7 @@ impl<'d> Decoder<'d> {
         mut response: Scoped<'a, 'd>,
         check: &mut impl FnMut() -> Result<(), E>,
     ) -> Result<Scoped<'a, 'd>, Checked<crate::Error, E>> {
-        if response.coding != Coding::Gzip {
+        if response.coding != Some(Coding::Gzip) {
             return Ok(response);
         }
         let decoded = apply::<CHECK, E>(
@@ -79,7 +79,7 @@ impl<'d> Decoder<'d> {
                     .body
                     .replace_with(body)
                     .map_err(|error| Checked::Work(crate::Error::Capacity(error)))?;
-                response.omit_coding();
+                response.coding = None;
             }
             Err(Checked::Work(error)) if self.policy == Policy::Strict => {
                 return Err(Checked::Work(crate::Error::Decompression(error)));

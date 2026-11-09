@@ -113,6 +113,11 @@ pub(crate) fn pump<'d, P: rules::Policy, A: rules::Push, E: From<conn::Error>>(
     }
     let mut released = false;
     for _ in 0..WRITE_QUANTUM {
+        if let Err(error) = conn.publish_encoder()
+            && !conn.queues.is_pressure(&error)
+        {
+            return Err(error.into());
+        }
         let feedback = conn.session.qpack_decoder;
         let Some(taken) = conn.queues.take(&mut conn.qpack.feedback, feedback) else {
             return Ok((Flush::Drained, released));
@@ -130,7 +135,7 @@ pub(crate) fn pump<'d, P: rules::Policy, A: rules::Push, E: From<conn::Error>>(
             }
         }
     }
-    let flush = if conn.queues.has_write(&conn.qpack.feedback) {
+    let flush = if conn.queues.has_write(&conn.qpack.feedback) || conn.qpack.has_pending_encoder() {
         Flush::Pending
     } else {
         Flush::Drained
