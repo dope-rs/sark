@@ -292,15 +292,13 @@ impl<'observe: 'd, 'd, ID: route::Identity> handler::Borrowed<'d, ID> for App<'o
                 let tail = chunk.try_retain();
                 assert!(tail.is_ok(), "retain tail: {:?}", tail.as_ref().err());
                 this.checks[5].set(this.checks[5].get() + 1);
-                let Ok(mut tail) = tail else {
+                let Ok(tail) = tail else {
                     return receive::Outcome::CloseAfter;
                 };
-                let restrict = tail.try_restrict(range);
-                assert!(restrict.is_ok(), "restrict tail: {restrict:?}");
+                let tail = tail
+                    .project(range)
+                    .unwrap_or_else(|rejected| panic!("restrict tail: {:?}", rejected.error()));
                 this.checks[6].set(this.checks[6].get() + 1);
-                if restrict.is_err() {
-                    return receive::Outcome::CloseAfter;
-                }
                 let staged = conn.state_mut().staged_mut();
                 assert!(staged.is_ok(), "raw owner must remain staged until drain");
                 this.checks[7].set(this.checks[7].get() + 1);

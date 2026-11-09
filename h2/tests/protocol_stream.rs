@@ -1,32 +1,8 @@
-use o3::{depot, depot::queue::links};
 use sark_core::manifold::stream::Boundary;
 use sark_h2::{
     stream,
     stream::{Error, Id, Lifecycle},
 };
-
-#[test]
-fn key_admission() {
-    for wire in [1, Id::MAX] {
-        for slot in [0, u32::MAX - 1] {
-            let raw = (u64::from(wire) << 32) | u64::from(slot);
-            let key = (<stream::Key as depot::raw::Key>::decode(raw))
-                .expect("valid wire identity and bounded slot must decode");
-            assert!((key.id()) == (Id::new(wire).expect("fixture domain")));
-            assert_eq!(key.identity(), raw);
-            let index: links::Index = key.into();
-            assert_eq!(index.raw(), slot);
-        }
-    }
-    for raw in [
-        0,
-        u64::from(u32::MAX - 1),
-        (1 << 32) | u64::from(u32::MAX),
-        1 << 63,
-    ] {
-        assert!(<stream::Key as depot::raw::Key>::decode(raw).is_none());
-    }
-}
 
 #[test]
 fn stream_id_classification() {

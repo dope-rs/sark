@@ -307,11 +307,8 @@ impl<'a> Types<'a> {
                 .enumerate()
                 .map(|(index, item)| {
                     let variant = &item.pending_variant;
-                    let complete = route::complete(
-                        index,
-                        &context.plan.spec.state_generics,
-                        &quote!(#v_routes),
-                    );
+                    let complete =
+                        route::complete(index, &context.plan.spec.state_generics, &v_routes);
                     quote! {
                         #heads::#variant(#v_wait) => match #v_wait.try_resume(
                             #v_input,

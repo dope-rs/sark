@@ -21,21 +21,6 @@ pub(super) struct Sequence {
     stream: cell::Cell<Option<Stream>>,
 }
 
-impl Sequence {
-    fn with(
-        &self,
-        f: impl FnOnce(&mut Stream) -> Result<(), client::Error>,
-    ) -> Result<(), client::Error> {
-        let mut stream = match self.stream.take() {
-            Some(stream) => stream,
-            None => Stream::try_new()?,
-        };
-        let result = f(&mut stream);
-        self.stream.set(Some(stream));
-        result
-    }
-}
-
 const MASK_DOMAIN: random::Domain = random::Namespace::new(*b"sark\0ws\0").fixed();
 const MASK_LANE: u64 = u64::from_be_bytes(*b"mask key");
 
@@ -138,7 +123,11 @@ impl<'a> Plan<'a> {
         masks: &Sequence,
         mut push: impl FnMut(egress::NonEmpty<storage::Shared>) -> Result<(), client::Error>,
     ) -> Result<(), client::Error> {
-        masks.with(move |stream| {
+        let mut stream = match masks.stream.take() {
+            Some(stream) => stream,
+            None => Stream::try_new()?,
+        };
+        let result = (move |stream: &mut Stream| {
             for frame in self.frames {
                 let mask = stream.advance();
                 let frame = egress::NonEmpty::try_new(frame.bind(mask).try_owned()?)
@@ -146,7 +135,9 @@ impl<'a> Plan<'a> {
                 push(frame)?;
             }
             Ok(())
-        })
+        })(&mut stream);
+        masks.stream.set(Some(stream));
+        result
     }
 }
 
