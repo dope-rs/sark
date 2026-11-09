@@ -177,6 +177,14 @@ where
         self.state.connection
     }
 
+    pub(super) fn can_resume(&mut self) -> bool
+    where
+        <R::Head as request::Head>::Start: turn::schedule::Schedule<'d, R>,
+    {
+        !self.state.connection.output().is_empty()
+            || <R::Head as request::Head>::Start::is_ready(self.state)
+    }
+
     pub(super) fn reborrow(&mut self) -> Drive<'_, 'state, 'd, ID, R, Q, F> {
         Drive {
             router: self.router.as_mut(),
@@ -197,12 +205,14 @@ where
         work: app::Work<'_, 'd>,
         driver: &mut driver::Context<'_, 'd>,
         mut report: impl FnMut(conn::Id<'d, ID>, stream::Key, &dyn std::fmt::Debug),
-    ) where
+    ) -> drain::Progress
+    where
         Q::Retention: Handoff,
     {
         use task::owner;
         let scope = owner::Scope::Exact(owner::Owner::from(self.conn));
         let mut done = false;
+        let mut progress = drain::Progress::default();
         loop {
             let handoff: handoffs::Completion<'_, '_, 'd, ID, R, Q, _, F> = handoffs::Completion {
                 tasks: &mut *self.tasks,
@@ -228,8 +238,13 @@ where
                     receipt.settle(step::Flow::Yield)
                 }
                 Turn::PendingReady(receipt) => receipt.settle(step::Flow::Batch),
-                Turn::Idle | Turn::Deferred => break,
+                Turn::Idle => break,
+                Turn::Deferred => {
+                    progress.exhaust();
+                    break;
+                }
             };
+            progress.record();
             match flow {
                 step::Flow::Batch => {}
                 step::Flow::Yield => break,
@@ -248,6 +263,7 @@ where
                 &mut report,
             );
         }
+        progress
     }
 
     pub(in crate::server::task) fn queue(&mut self, stream: stream::Key, value: Reply<'d, R>) {
@@ -406,6 +422,7 @@ where
         state: &mut service::State<'d, ID, A>,
         turn: &mut sark_core::manifold::server::app::Turn<'_, '_, '_, 'd, conn::Id<'d, ID>>,
         egress: schedule::Egress,
+        retry: bool,
         fault: &mut P,
     ) -> Result<drain::Progress, sark_core::manifold::server::app::Error<Error, A::Failure>>
     where
@@ -430,12 +447,13 @@ where
         let conn = self.conn;
         let parent = self.parent;
         let limits = self.limits;
-        let progress = service.drive(
+        let mut progress = drain::Progress::default();
+        let drained = service.drive(
             state,
             connection,
             turn,
             egress,
-            &mut (book, router, tasks, index, mode, fault),
+            &mut (book, router, tasks, index, mode, &mut *fault),
             |(book, router, tasks, index, mode, fault), connection, drain, state| {
                 let mut book = book::Turn::new(connection, book);
                 let Some(ready) = book.ready() else {
@@ -503,19 +521,8 @@ where
             |(book, router, tasks, index, mode, fault), connection| {
                 let mut state = book::Turn::new(connection, book);
                 let mut report = fault.response();
-                state.pump::<true, _, _, _, A>(
-                    router.as_mut(),
-                    tasks,
-                    index,
-                    conn,
-                    limits,
-                    schedule::Egress::Unchanged,
-                    work,
-                    &mut **mode,
-                    &mut report,
-                );
-                if state.connection.ingress().is_blocked() && state.responses.has_runnable() {
-                    state.pump::<false, _, _, _, A>(
+                if state
+                    .pump::<true, _, _, _, A>(
                         router.as_mut(),
                         tasks,
                         index,
@@ -525,13 +532,43 @@ where
                         work,
                         &mut **mode,
                         &mut report,
-                    );
+                    )
+                    .turns
+                    != 0
+                {
+                    progress.record();
+                }
+                if state.connection.ingress().is_blocked() && state.responses.has_runnable() {
+                    if state
+                        .pump::<false, _, _, _, A>(
+                            router.as_mut(),
+                            tasks,
+                            index,
+                            conn,
+                            limits,
+                            schedule::Egress::Unchanged,
+                            work,
+                            &mut **mode,
+                            &mut report,
+                        )
+                        .turns
+                        != 0
+                    {
+                        progress.record();
+                    }
                 }
             },
             |(.., fault), cause| {
                 fault.diagnostic(conn, cause);
             },
         )?;
+        progress.merge(drained);
+        if retry && !progress.has_drained() && !progress.is_exhausted() {
+            progress.merge(
+                self.reborrow()
+                    .batch::<A>(work, turn.driver(), fault.response()),
+            );
+        }
         self.wakes::<A>(state);
         Ok(progress)
     }

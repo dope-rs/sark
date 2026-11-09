@@ -129,7 +129,7 @@ impl<'d, A: Spec, W: wire::Spec, F, E: data::raw::Payload<'d>> App<'d, A, W, F, 
         Read::new(
             state,
             output::State::protocol,
-            |state: &mut State<'d, A, conn::Id<'d, ID>>| {
+            |state: &mut State<'d, A, conn::Id<'d, ID>>, _| {
                 let mut turn = app::Turn::new(owner, work, wake, driver);
                 app.drive(
                     &mut state.app,
@@ -226,7 +226,7 @@ impl<'d, A: Spec, W: wire::Spec, F, E: data::raw::Payload<'d>> App<'d, A, W, F, 
         let result = Read::new(
             state,
             output::State::protocol,
-            |state: &mut State<'d, A, conn::Id<'d, ID>>| {
+            |state: &mut State<'d, A, conn::Id<'d, ID>>, _| {
                 let mut turn = app::Turn::new(owner, work, wake, driver);
                 app.drive(
                     &mut state.app,

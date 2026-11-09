@@ -27,7 +27,7 @@ where
         rules::RejectPush,
         E,
     >,
-    D: FnMut(&mut T) -> Result<Progress, X>,
+    D: FnMut(&mut T, bool) -> Result<Progress, X>,
     X: Fault,
 {
     pub(in crate::server) fn new(context: &'a mut T, protocol: P, events: D) -> Self {
@@ -58,28 +58,16 @@ where
             }
             conn.ingress().has_event() || conn.ingress().is_blocked()
         };
-        let total = if work {
-            match self.resume_inner() {
-                Ok(total) => total,
-                Err(error) => {
-                    if !error.connection().is_some_and(conn::Error::is_pressure)
-                        || !(self.protocol)(self.context).ingress().is_blocked()
-                    {
-                        source.discard();
-                    }
-                    return Err(error);
-                }
-            }
+        let result = if work {
+            self.resume_inner()
         } else {
-            Progress::default()
+            Ok(Progress::default())
         };
-        if total.is_exhausted() {
-            return Ok(total);
-        }
-        let result = source.borrow((self.protocol)(self.context));
-        let result = self.drive(result, total, |context, protocol| {
-            source.borrow(protocol(context))
-        });
+        let result = match result {
+            Ok(total) if total.is_exhausted() => return Ok(total),
+            Ok(total) => self.drive(total, |context, protocol| source.borrow(protocol(context))),
+            Err(error) => Err(error),
+        };
         if let Err(error) = &result
             && (!error.connection().is_some_and(conn::Error::is_pressure)
                 || !(self.protocol)(self.context).ingress().is_blocked())
@@ -97,35 +85,29 @@ where
     }
 
     fn resume_inner(&mut self) -> Result<Progress, X> {
-        let total = (self.events)(self.context)?;
+        let total = (self.events)(self.context, false)?;
         if total.is_exhausted() || !(self.protocol)(self.context).ingress().is_blocked() {
             return Ok(total);
         }
-        let result = (self.protocol)(self.context).ingress().resume();
-        self.drive(result, total, |context, protocol| {
+        self.drive(total, |context, protocol| {
             protocol(context).ingress().resume()
         })
     }
 
-    fn drive<N>(
-        &mut self,
-        mut result: Result<(), conn::Error>,
-        mut total: Progress,
-        mut next: N,
-    ) -> Result<Progress, X>
+    fn drive<N>(&mut self, mut total: Progress, mut next: N) -> Result<Progress, X>
     where
         N: FnMut(&mut T, &mut P) -> Result<(), conn::Error>,
     {
         loop {
-            let error = match result {
+            let error = match next(self.context, &mut self.protocol) {
                 Err(error) if error.is_pressure() => error,
                 result => {
                     result?;
-                    total.merge((self.events)(self.context)?);
+                    total.merge((self.events)(self.context, false)?);
                     return Ok(total);
                 }
             };
-            let drained = (self.events)(self.context)?;
+            let drained = (self.events)(self.context, true)?;
             total.merge(drained);
             if drained.is_exhausted() && (self.protocol)(self.context).ingress().is_blocked() {
                 return Ok(total);
@@ -133,7 +115,6 @@ where
             if drained.is_exhausted() || !drained.has_drained() {
                 return Err(error.into());
             }
-            result = next(self.context, &mut self.protocol);
         }
     }
 }

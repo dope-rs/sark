@@ -39,7 +39,7 @@ fn selects_existing_protocol_owners() {
                 let rpc = client.streams().headers().request(fields, Boundary::More).expect("RPC");
                 assert!(matches!(client.streams().try_send(rpc, &[0; 5], Boundary::End).expect("message"),
                     DataOutcome::Sent(bytes) if bytes.get() == 5));
-                tls::flush(&mut client, &mut wire).expect("request");
+                common::h2::peer::flush(&mut client, &mut wire).expect("request");
                 let mut body = Vec::new();
                 let mut status = None;
                 let mut input = [0; 4096];
@@ -68,7 +68,7 @@ fn selects_existing_protocol_owners() {
                                 Event::PrefaceComplete | Event::SettingsApplied | Event::SettingsAck)),
                         }
                     }
-                    tls::flush(&mut client, &mut wire).expect("acknowledgments");
+                    common::h2::peer::flush(&mut client, &mut wire).expect("acknowledgments");
                 }
                 assert_eq!(status, Some(Code::Ok));
                 assert_eq!(body, [0, 0, 0, 0, 2, 8, 1]);

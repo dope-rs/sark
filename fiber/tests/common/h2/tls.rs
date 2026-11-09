@@ -1,4 +1,4 @@
-use std::{cell::Cell, io, io::Write, iter, sync::Arc};
+use std::{cell::Cell, iter, sync::Arc};
 
 use dope::{
     core::{
@@ -21,7 +21,6 @@ use sark_grpc::{
     },
 };
 use sark_h2::{
-    ClientRole, conn::machine::Connection,
     server::{runtime::Plan, task::timers::{Controller, Policy}},
 };
 use sark_http::{
@@ -72,7 +71,11 @@ pub struct Reply<'d> {
 }
 
 #[sark_fiber::handler(pub)]
-async fn shared(state: &State) -> Reply<'d> {
+async fn shared(request: super::apps::DuplexReq, state: &State) -> Reply<'d> {
+    if !request.marker.is_empty() {
+        drop(request);
+        dope_fiber::abi::poll_fn(|_| std::task::Poll::<()>::Pending).await;
+    }
     Yield::new().await;
     state.0.set(state.0.get() + 1);
     Reply {
@@ -91,7 +94,7 @@ fn half_close(
 
 sark_fiber::define_route! {
     pub Shared: State => {
-        GET "/shared" => async(capacity = 1, body = discarded) shared,
+        GET "/shared" => request(header) async(capacity = 1, body = discarded) shared,
         CONNECT "*" => half_close,
     }
 }
@@ -227,16 +230,4 @@ pub fn client_config() -> Result<Arc<rustls::ClientConfig>, dope_tls::Error> {
     let mut config = Identity::client(key)?;
     config.alpn_protocols.push(b"h2".to_vec());
     Ok(Arc::new(config))
-}
-
-pub fn flush(client: &mut Connection<ClientRole>, wire: &mut impl Write) -> io::Result<()> {
-    loop {
-        let output = client.output().first();
-        if output.is_empty() {
-            return wire.flush();
-        }
-        wire.write_all(output)?;
-        let length = output.len();
-        client.transfer().drain(length);
-    }
 }

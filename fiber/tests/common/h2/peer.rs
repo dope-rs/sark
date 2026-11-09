@@ -25,6 +25,18 @@ use sark_h2::{
 };
 use sark_http::field::metadata::map::Owned;
 
+pub fn flush(client: &mut Connection<ClientRole>, wire: &mut impl io::Write) -> io::Result<()> {
+    loop {
+        let output = client.output().first();
+        if output.is_empty() {
+            return wire.flush();
+        }
+        wire.write_all(output)?;
+        let length = output.len();
+        client.transfer().drain(length);
+    }
+}
+
 #[derive(Debug)]
 pub enum Error {
     Io(io::Error),
@@ -79,19 +91,7 @@ impl<'a> Peer<'a> {
     }
 
     pub fn try_flush(self) -> Result<(), Error> {
-        let Self {
-            socket: stream,
-            client,
-        } = self;
-        loop {
-            let output = client.output().first();
-            if output.is_empty() {
-                return Ok(());
-            }
-            stream.write_all(output).map_err(Error::Io)?;
-            let written = output.len();
-            client.transfer().drain(written);
-        }
+        flush(self.client, self.socket).map_err(Error::Io)
     }
 
     pub fn try_faults(self, stream: Id) -> Result<(), Error> {

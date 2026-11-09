@@ -33,6 +33,11 @@ impl State {
         }
     }
 
+    pub fn guard_counts(&self) -> (usize, usize) {
+        let guard = self.guard.as_ref().expect("guard fixture");
+        (guard.checks.get(), guard.handlers.get())
+    }
+
     pub fn try_body() -> Result<Self, storage::AllocError> {
         let body = storage::Owned::try_filled(2 * 1024 * 1024, 0x6b)?.freeze();
         Ok(Self {

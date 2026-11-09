@@ -16,7 +16,7 @@ use crate::{
             Borrowed, Build, Target,
             app::{
                 header::admit::Begin,
-                turn::{Availability, Outcome, Turn, guard::Guard},
+                turn::{Outcome, Turn, guard::Guard},
             },
             service, works,
         },
@@ -43,20 +43,10 @@ where
 
     fn account(graph: &mut Self::Graph);
 
-    fn has_pending<F: rules::Policy>(state: &mut Borrowed<'_, 'd, R, F>) -> Availability;
+    fn has_local<F: rules::Policy>(state: &mut Borrowed<'_, 'd, R, F>) -> bool;
 
-    fn has_local<F: rules::Policy>(state: &mut Borrowed<'_, 'd, R, F>) -> Availability {
-        Self::has_pending(state)
-    }
-
-    fn is_ready<F: rules::Policy>(state: &mut Borrowed<'_, 'd, R, F>) -> Availability {
-        match Self::has_local(state) {
-            Availability::Ready => Availability::Ready,
-            Availability::Idle if state.has_events() || state.responses.has_runnable() => {
-                Availability::Ready
-            }
-            Availability::Idle => Availability::Idle,
-        }
+    fn is_ready<F: rules::Policy>(state: &mut Borrowed<'_, 'd, R, F>) -> bool {
+        Self::has_local(state) || state.has_events() || state.responses.has_runnable()
     }
 }
 
@@ -94,12 +84,8 @@ where
         graph.account(works::Plain::Egress);
     }
 
-    fn has_pending<F: rules::Policy>(state: &mut Borrowed<'_, 'd, R, F>) -> Availability {
-        if state.build_ready.is_empty() {
-            Availability::Idle
-        } else {
-            Availability::Ready
-        }
+    fn has_local<F: rules::Policy>(state: &mut Borrowed<'_, 'd, R, F>) -> bool {
+        !state.build_ready.is_empty()
     }
 }
 
@@ -138,19 +124,7 @@ where
         graph.account(works::Guarded::Egress);
     }
 
-    fn has_pending<F: rules::Policy>(state: &mut Borrowed<'_, 'd, R, F>) -> Availability {
-        if state.admission_ready.is_empty() && state.build_ready.is_empty() {
-            Availability::Idle
-        } else {
-            Availability::Ready
-        }
-    }
-
-    fn has_local<F: rules::Policy>(state: &mut Borrowed<'_, 'd, R, F>) -> Availability {
-        if state.can_admit() || !state.build_ready.is_empty() {
-            Availability::Ready
-        } else {
-            Availability::Idle
-        }
+    fn has_local<F: rules::Policy>(state: &mut Borrowed<'_, 'd, R, F>) -> bool {
+        state.can_admit() || !state.build_ready.is_empty()
     }
 }

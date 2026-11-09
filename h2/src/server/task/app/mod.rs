@@ -56,7 +56,7 @@ use crate::{
         runtime::{app::Fault, input, startup::Failure},
         state, task,
         task::{
-            app::turn::{Availability, schedule::Schedule},
+            app::turn::schedule::Schedule,
             book,
             response::{deadline::Deadline, expiry},
             timers, *,
@@ -283,29 +283,40 @@ where
                 };
                 let result = {
                     let mut application = semantic::Turn::new(id, work, parent, driver);
-                    input::Read::new(&mut run, drive::Drive::connection, |run| {
+                    input::Read::new(&mut run, drive::Drive::connection, |run, retry| {
                         run.drain::<A, W, P>(
                             this.service,
                             &mut state.service,
                             &mut application,
                             sark_core::manifold::schedule::Egress::Unchanged,
+                            retry,
                             this.fault,
                         )
                     })
                     .read(&mut source)
                 };
                 run.mode.observe_head(run.state.connection);
-                match drain::Progress::error(result, parent) {
-                    None => {}
-                    Some(error)
+                let progress = match result {
+                    Ok(progress) => progress,
+                    Err(error)
                         if error.connection().is_some_and(conn::Error::is_pressure)
-                            && run.state.connection.ingress().is_blocked() => {}
-                    Some(error) => return Err(error),
-                }
+                            && run.state.connection.ingress().is_blocked()
+                            && run.can_resume() =>
+                    {
+                        drain::Progress::default()
+                    }
+                    Err(error) => return Err(error),
+                };
                 let scope = owner::Scope::Exact(owner::Owner::from(id));
-                if Runtime::has_work(run.router.as_ref(), scope) {
-                    run.reborrow()
-                        .batch::<A>(work, driver, this.fault.response());
+                if progress.is_exhausted() {
+                    parent.wake();
+                } else if Runtime::has_work(run.router.as_ref(), scope)
+                    && run
+                        .reborrow()
+                        .batch::<A>(work, driver, this.fault.response())
+                        .is_exhausted()
+                {
+                    parent.wake();
                 }
                 run.wakes::<A>(&mut state.service);
                 Ok(expiry)
@@ -333,7 +344,7 @@ where
         if matches!(&result, Ok(Deadline::Wake)) {
             parent.wake();
         }
-        if matches!(pending, turn::Availability::Ready) {
+        if pending {
             parent.wake();
         }
         let scope = owner::Scope::Exact(owner::Owner::from(id));
@@ -443,6 +454,7 @@ where
                     &mut state.service,
                     &mut semantic::Turn::new(id, work, parent, driver),
                     schedule::Egress::Unchanged,
+                    false,
                     fault,
                 )?;
                 if progress.is_exhausted() {
@@ -599,32 +611,15 @@ where
         let parent = conn.wake_target();
         let work = conn.work();
         let scope = owner::Scope::Exact(owner::Owner::from(id));
-        let task = if Runtime::has_work(router.as_ref(), scope) {
-            turn::Availability::Ready
-        } else {
-            turn::Availability::Idle
-        };
+        let task = Runtime::has_work(router.as_ref(), scope);
         let now = driver.driver_ref().clock().now();
         let (result, expiry, change, timer_fault) = {
             let state = conn.state_mut();
-            let builds = if state.book.build_ready.is_empty() {
-                turn::Availability::Idle
-            } else {
-                turn::Availability::Ready
-            };
-            let input = if A::ENABLED
+            let builds = !state.book.build_ready.is_empty();
+            let input = A::ENABLED
                 || state.carrier.ingress().has_event()
-                || state.carrier.ingress().is_blocked()
-            {
-                turn::Availability::Ready
-            } else {
-                turn::Availability::Idle
-            };
-            let output = if state.book.responses.has_runnable() {
-                turn::Availability::Ready
-            } else {
-                turn::Availability::Idle
-            };
+                || state.carrier.ingress().is_blocked();
+            let output = state.book.responses.has_runnable();
             let mut mode = state::Projection::new(mode, &mut state.deadlines, now, timers);
             let mut turn = book::Turn::new(&mut state.carrier, &mut state.book);
             let index = &mut state.task_index;
@@ -697,10 +692,7 @@ where
                 .wakes::<A>(&mut state.service);
             }
             let (change, error) = mode.finish();
-            if matches!(
-                <R::Head as request::Head>::Start::is_ready(&mut turn),
-                turn::Availability::Ready
-            ) {
+            if <R::Head as request::Head>::Start::is_ready(&mut turn) {
                 parent.wake();
             }
             (result, expiry, change, error)
@@ -846,11 +838,7 @@ where
         let parent = conn.wake_target();
         let work = conn.work();
         let scope = owner::Scope::Exact(owner::Owner::from(id));
-        let tasks = if Runtime::has_work(this.router.as_ref(), scope) {
-            Availability::Ready
-        } else {
-            Availability::Idle
-        };
+        let tasks = Runtime::has_work(this.router.as_ref(), scope);
         let now = driver.driver_ref().clock().now();
         let result = (|| {
             let state = conn.state_mut();
@@ -858,12 +846,7 @@ where
                 state.book.responses.wake_egress();
                 A::released(&mut state.service);
             }
-            let input =
-                if state.carrier.ingress().has_event() || state.carrier.ingress().is_blocked() {
-                    Availability::Ready
-                } else {
-                    Availability::Idle
-                };
+            let input = state.carrier.ingress().has_event() || state.carrier.ingress().is_blocked();
             let mut mode =
                 state::Projection::new(this.mode, &mut state.deadlines, now, this.deadlines);
             let mut book = book::Turn::new(&mut state.carrier, &mut state.book);
@@ -893,6 +876,7 @@ where
                         &mut state.service,
                         &mut semantic::Turn::new(id, work, parent, driver),
                         schedule::Egress::Unchanged,
+                        false,
                         fault,
                     )?;
                     if progress.is_exhausted() {
@@ -907,19 +891,17 @@ where
                 };
                 let mut response = fault.response();
                 match (local, tasks, input) {
-                    (Availability::Idle, Availability::Idle, Availability::Idle) => {
-                        run.state.pump::<false, _, _, _, A>(
-                            run.router.as_mut(),
-                            run.tasks,
-                            run.index,
-                            id,
-                            limits,
-                            egress,
-                            work,
-                            run.mode,
-                            &mut response,
-                        )
-                    }
+                    (false, false, false) => run.state.pump::<false, _, _, _, A>(
+                        run.router.as_mut(),
+                        run.tasks,
+                        run.index,
+                        id,
+                        limits,
+                        egress,
+                        work,
+                        run.mode,
+                        &mut response,
+                    ),
                     _ => run.state.pump::<true, _, _, _, A>(
                         run.router.as_mut(),
                         run.tasks,
@@ -935,15 +917,8 @@ where
             }
             run.wakes::<A>(&mut state.service);
             let local = <R::Head as request::Head>::Start::has_local(run.state);
-            let active = if run.state.has_input() || run.state.responses.has_runnable() {
-                Availability::Ready
-            } else {
-                Availability::Idle
-            };
-            let wake = match (local, input, active) {
-                (Availability::Idle, Availability::Idle, Availability::Idle) => Availability::Idle,
-                _ => Availability::Ready,
-            };
+            let active = run.state.has_input() || run.state.responses.has_runnable();
+            let wake = local || input || active;
             let (change, error) = mode.finish();
             Ok((wake, due, change, error))
         })();
@@ -993,15 +968,15 @@ where
             Self::flush_transport(&mut conn, driver, None, this.mode, fault);
         }
         if matches!(due, Deadline::Expired) {
-            if A::ENABLED || matches!(wake, Availability::Ready) {
+            if A::ENABLED || wake {
                 parent.wake();
             }
             return;
         }
-        if matches!(tasks, Availability::Ready) {
+        if tasks {
             Runtime::wake(this.router.as_mut(), scope);
         }
-        if matches!(wake, Availability::Ready) || matches!(due, Deadline::Wake) {
+        if wake || matches!(due, Deadline::Wake) {
             parent.wake();
         }
     }

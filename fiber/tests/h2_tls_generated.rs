@@ -284,7 +284,7 @@ fn shares_driver_storage_with_h1() {
                 let mut client = Connection::<ClientRole>::try_new().expect("H2 client");
                 let mut batch = Vec::new();
                 if phase == Some(deadline::Phase::Total) {
-                    tls::flush(&mut client, &mut batch).expect("connection preface");
+                    common::h2::peer::flush(&mut client, &mut batch).expect("connection preface");
                     payload::Ping { ack: frame::Ack::Required, opaque: *b"half-end" }
                         .encode(&mut batch).expect("initial head fence");
                 }
@@ -311,7 +311,7 @@ fn shares_driver_storage_with_h1() {
                     assert_eq!(wire.write(&batch).expect("one CONNECT plaintext record"), batch.len());
                     wire.flush().expect("publish fragmented CONNECT");
                 } else {
-                    tls::flush(&mut client, &mut wire).expect("TLS request");
+                    common::h2::peer::flush(&mut client, &mut wire).expect("TLS request");
                 }
                 assert_eq!(wire.conn.alpn_protocol(), Some(b"h2".as_slice()));
                 let mut input = [0; 4096];
@@ -378,7 +378,7 @@ fn shares_driver_storage_with_h1() {
                                 }
                                 // The pending SETTINGS ACK follows CONT and fills the sole
                                 // event slot, driving the initial FIN before Header is cleared.
-                                tls::flush(&mut client, &mut batch).expect("fenced H2 output");
+                                common::h2::peer::flush(&mut client, &mut batch).expect("fenced H2 output");
                                 assert!(batch.len() < 16 << 10);
                                 assert_eq!(wire.write(&batch).expect("one fenced plaintext record"), batch.len());
                                 wire.flush().expect("publish fenced output");
@@ -402,12 +402,12 @@ fn shares_driver_storage_with_h1() {
                         assert!(matches!(client.streams().try_send(initial, &[], Boundary::End)
                             .expect("legal tunnel EOF"), DataOutcome::Ended));
                         client.control().ping(*b"half-end").expect("failure settlement fence");
-                        tls::flush(&mut client, &mut wire).expect("EOF and fence");
+                        common::h2::peer::flush(&mut client, &mut wire).expect("EOF and fence");
                         ended = false;
                     }
                     // Keep the Total case silent after its initial CONTINUATION.
                     if !half_close {
-                        tls::flush(&mut client, &mut wire).expect("H2 acknowledgments");
+                        common::h2::peer::flush(&mut client, &mut wire).expect("H2 acknowledgments");
                     }
                     if phase == Some(deadline::Phase::Handler) && ended && closing.is_none() {
                         let mut batch = Vec::new();
@@ -417,7 +417,7 @@ fn shares_driver_storage_with_h1() {
                         }
                         let stream = client.streams().headers().request(HEADERS, Boundary::More)
                             .expect("request before its partial trailer");
-                        tls::flush(&mut client, &mut batch).expect("append initial head");
+                        common::h2::peer::flush(&mut client, &mut batch).expect("append initial head");
                         layout::Headers::new(stream, Boundary::End, frame::Block::More, None, &[0])
                             .expect("partial trailer").encode(&mut batch).expect("trailer bytes");
                         // One TLS record queues the initial HEAD behind LIMIT control
@@ -443,12 +443,30 @@ fn shares_driver_storage_with_h1() {
 #[test]
 fn shares_tls_connection_with_grpc() {
     for reject in [true, false] {
+        mixed_grpc(reject, false);
+    }
+}
+
+#[test]
+fn releases_or_rejects_header_pressure() {
+    mixed_grpc(false, true);
+}
+
+fn mixed_grpc(reject: bool, pressure: bool) {
     let pair = Pair::bind().expect("mixed H2 listener");
-    pair.run(
+    pair.check(
         |context, listener| {
-            let plan = tls::plan(listener)
+            let mut plan = tls::plan(listener)
                 .expect("mixed H2 plan")
                 .with_streams(std::num::NonZero::new(2).expect("two streams"));
+            if pressure {
+                plan = plan.with_config(config::Config {
+                    stream_capacity: 2,
+                    payload_capacity: config::capacity::Payload::new(64, 1)
+                        .expect("one retained request head"),
+                    ..Default::default()
+                });
+            }
             let owner = wire::domain::Owner::<Tls<roles::Server>, KeyTag<2>>::try_new(
                 plan.connections(),
             ).expect("mixed TLS owner");
@@ -483,7 +501,7 @@ fn shares_tls_connection_with_grpc() {
                             Failure::Construction(cause) => {
                                 assert!(matches!(cause, sark_h2::server::task::Build::Deadlines(
                                     o3::depot::heap::Error::Allocation { capacity, error: o3::alloc::Exhausted, .. }
-                                ) if capacity.raw() == 2));
+                                ) if capacity.raw() == 2), "{cause:?}");
                                 assert!(terminal.replace(Some(true)).is_none());
                             }
                             Failure::Drive {
@@ -491,7 +509,13 @@ fn shares_tls_connection_with_grpc() {
                                     sark_h2::conn::Error::CriticalDeadline,
                                 ),
                                 ..
-                            } => assert!(terminal.replace(Some(false)).is_none()),
+                            } if !pressure => assert!(terminal.replace(Some(false)).is_none()),
+                            Failure::Drive {
+                                cause: sark_core::manifold::server::app::Error::Connection(
+                                    sark_h2::conn::Error::HeaderDecodeFull { used: 1, limit: 1 },
+                                ),
+                                ..
+                            } if pressure => assert!(terminal.replace(Some(false)).is_none()),
                             Failure::Drive { cause, .. } | Failure::Diagnostic { cause, .. } => {
                                 panic!("mixed drive: {cause:?}")
                             }
@@ -520,7 +544,7 @@ fn shares_tls_connection_with_grpc() {
                                     &mut finish, Host::new(listener), Duration::from_secs(2),
                                 ).expect("mixed session").expect("mixed drive");
                             });
-                            assert_eq!(state.0.get(), if reject { 0 } else { 5 }, "HTTP siblings and follow-up");
+                            assert_eq!(state.0.get(), if reject || pressure { 0 } else { 5 }, "HTTP siblings and follow-up");
                         },
                     ).expect("mixed TLS preparation");
                 }),
@@ -530,8 +554,7 @@ fn shares_tls_connection_with_grpc() {
                 },
             );
             assert!(reports.events().expect("mixed retirement").is_empty(), "{reports:?}");
-            assert_eq!(terminal.get(), Some(reject));
-            Ok::<_, Infallible>(())
+            Ok::<_, Infallible>(terminal.get())
         },
         |address| {
             let mut socket = TcpStream::connect(address).expect("mixed TLS connect");
@@ -553,6 +576,69 @@ fn shares_tls_connection_with_grpc() {
                 ..Default::default()
             }).expect("mixed H2 client");
             let frame = Frame::try_header(Compression::Plain, 0).expect("empty protobuf frame");
+            let stream = if pressure {
+                let mut fields = HEADERS.to_vec();
+                fields.push(Entry::new(
+                    field::literal!(Lower::try_bytes(b"x-duplex-header")),
+                    field::literal!(Value::try_bytes(b"retained")),
+                ));
+                let http = client.streams().headers().request_key(fields, Boundary::End)
+                    .expect("header released by a parked task");
+                let mut batch = Vec::new();
+                common::h2::peer::flush(&mut client, &mut batch).expect("first request");
+                let metadata = Metadata::new();
+                let fields = request::Fields::new(b"/benchmark.BenchmarkService/Missing", Some(b"localhost"), &metadata)
+                    .expect("immediate gRPC response").with_scheme(request::Scheme::Https);
+                let rpc = client.streams().headers().request(fields, Boundary::End)
+                    .expect("request behind retained header");
+                let mut encoded = Vec::new();
+                common::h2::peer::flush(&mut client, &mut encoded).expect("second request");
+                let header = layout::Header::parse(&encoded).expect("request frame");
+                assert_eq!(encoded.len(), frame::HEADER_LEN + header.length.into_usize());
+                layout::Headers::new(rpc, Boundary::End, frame::Block::End, Some(layout::Priority {
+                    sharing: layout::Sharing::Shared,
+                    dependency: sark_h2::stream::Id::CONNECTION,
+                    weight: 0,
+                }), &encoded[frame::HEADER_LEN..]).expect("retained decoder path")
+                    .encode(&mut batch).expect("priority request");
+                assert!(batch.len() < 16 << 10);
+                assert_eq!(wire.write(&batch).expect("one plaintext record"), batch.len());
+                wire.flush().expect("publish retained requests");
+                let mut input = [0; 4096];
+                'resumed: loop {
+                    let read = wire.read(&mut input).expect("response after releasing header");
+                    assert_ne!(read, 0, "resumed request");
+                    client.ingress().ingest(&input[..read]).expect("resumed ingress");
+                    while let Some(event) = client.ingress().poll_event() {
+                        match event {
+                            Event::Headers { stream_id, head, boundary: Boundary::End, .. } => {
+                                assert_eq!(stream_id.id(), rpc);
+                                assert_eq!(Status::from_fields(head.fields()).expect("resumed status").code(),
+                                    GrpcCode::Unimplemented);
+                                break 'resumed;
+                            }
+                            Event::GoAway { error, .. } => panic!("releasable header: {error:?}"),
+                            _ => {}
+                        }
+                    }
+                }
+                client.streams().try_cancel(http, frame::numbers::ErrorCode::Cancel)
+                    .expect("retire parked HTTP task");
+                let mut metadata = Metadata::new();
+                metadata.push(b"x-request", b"request-only").expect("retained metadata");
+                let fields = request::Fields::new(tls::UNARY, Some(b"localhost"), &metadata)
+                    .expect("gRPC request fields").with_scheme(request::Scheme::Https);
+                let first = client.streams().headers().request(fields, Boundary::More)
+                    .expect("buffered gRPC head");
+                assert!(matches!(client.streams().try_send(first, &frame, Boundary::More)
+                    .expect("gRPC message"), DataOutcome::Sent(bytes) if bytes.get() == frame.len()));
+                client.streams().headers().trail(first, [Entry::new(
+                    field::literal!(Lower::try_bytes(b"x-request-tail")),
+                    field::literal!(Value::try_bytes(b"tail-only")),
+                )]).expect("trailer needs a second header owner");
+                common::h2::peer::flush(&mut client, &mut wire).expect("header pressure batch");
+                first
+            } else {
             for (path, count, messages, expected) in [
                 (Some(tls::UNARY), b"0".as_slice(), 1, GrpcCode::Ok),
                 (Some(tls::STREAM), b"3".as_slice(), 3, GrpcCode::Ok),
@@ -585,7 +671,7 @@ fn shares_tls_connection_with_grpc() {
                     }
                     stream
                 });
-                tls::flush(&mut client, &mut wire).expect("mixed requests");
+                common::h2::peer::flush(&mut client, &mut wire).expect("mixed requests");
                 assert_eq!(wire.conn.alpn_protocol(), Some(b"h2".as_slice()));
                 let mut bodies = [Vec::new(), Vec::new()];
                 let mut heads = [false; 2];
@@ -654,7 +740,7 @@ fn shares_tls_connection_with_grpc() {
                             ), "unexpected mixed H2 event"),
                         }
                     }
-                    tls::flush(&mut client, &mut wire).expect("mixed H2 acknowledgments");
+                    common::h2::peer::flush(&mut client, &mut wire).expect("mixed H2 acknowledgments");
                     if late && ended[1] {
                         late = false;
                         assert!(!heads[0], "HTTP input holds the other physical slot");
@@ -664,7 +750,7 @@ fn shares_tls_connection_with_grpc() {
                             DataOutcome::Ended
                         ));
                         client.control().ping(*b"old-tail").expect("late input fence");
-                        tls::flush(&mut client, &mut wire).expect("old input tail and fence");
+                        common::h2::peer::flush(&mut client, &mut wire).expect("old input tail and fence");
                     }
                 }
                 assert_eq!(bodies[0], RESPONSE);
@@ -678,24 +764,31 @@ fn shares_tls_connection_with_grpc() {
                 .expect("partial head").encode(&mut batch).expect("head bytes");
             assert_eq!(wire.write(&batch).expect("partial head plaintext record"), batch.len());
             wire.flush().expect("publish partial head");
+            stream
+            };
             let mut input = [0; 4096];
             'terminal: loop {
-                let read = wire.read(&mut input).expect("partial head deadline");
-                assert_ne!(read, 0, "deadline GOAWAY");
+                let read = wire.read(&mut input).expect("terminal H2 response");
+                assert_ne!(read, 0, "terminal GOAWAY");
                 client.ingress().ingest(&input[..read]).expect("deadline ingress");
                 while let Some(event) = client.ingress().poll_event() {
                     match event {
                         Event::GoAway { last_stream_id, error, .. } => {
-                            assert_eq!(last_stream_id, stream);
-                            assert_eq!(error, frame::numbers::ErrorCode::InternalError);
+                            if !pressure { assert_eq!(last_stream_id, stream); }
+                            assert_eq!(error, if pressure {
+                                frame::numbers::ErrorCode::EnhanceYourCalm
+                            } else {
+                                frame::numbers::ErrorCode::InternalError
+                            });
                             break 'terminal;
                         }
+                        Event::PrefaceComplete | Event::SettingsApplied | Event::SettingsAck if pressure => {}
                         _ => panic!("unexpected partial head response"),
                     }
                 }
             }
             wire.sock.read_to_end(&mut Vec::new()).expect("mixed TLS retirement");
         },
+        |terminal| assert_eq!(terminal.expect("mixed TLS server"), Some(reject)),
     ).expect("HTTP and gRPC share one TLS H2 connection");
-    }
 }

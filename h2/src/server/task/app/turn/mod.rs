@@ -25,29 +25,15 @@ use crate::{
         response::Handoff,
         runtime::{app::Fault, input},
         state::Transitions,
-        task::{
-            app::{drive, header::admit},
-            *,
-        },
+        task::{app::drive, *},
     },
 };
 
-#[derive(Clone, Copy)]
-pub(super) enum Availability {
-    Idle,
-    Ready,
-}
-
 pub(super) struct Ready {
-    pub(super) build: Availability,
-    pub(super) task: Availability,
-    pub(super) input: Availability,
-    pub(super) output: Availability,
-}
-
-enum Budget {
-    Open,
-    Spent,
+    pub(super) build: bool,
+    pub(super) task: bool,
+    pub(super) input: bool,
+    pub(super) output: bool,
 }
 
 enum Pump {
@@ -108,7 +94,7 @@ where
     }
 
     fn build(&mut self) -> Admission<Result<Outcome, semantic::Error<Error, A::Failure>>> {
-        if matches!(self.ready.build, Availability::Idle) {
+        if !self.ready.build {
             return Admission::Empty;
         }
         if self.work.permit().is_none() {
@@ -128,26 +114,30 @@ where
     }
 
     fn task(&mut self) -> Admission<Result<Outcome, semantic::Error<Error, A::Failure>>> {
-        if matches!(self.ready.task, Availability::Idle) {
+        if !self.ready.task {
             return Admission::Empty;
         }
-        if matches!(self.budget(), Budget::Spent) {
+        if !self.has_budget() {
             return Admission::Exhausted;
         }
-        self.drive
-            .reborrow()
-            .batch::<A>(self.work, &mut self.driver, self.fault.response());
+        let progress =
+            self.drive
+                .reborrow()
+                .batch::<A>(self.work, &mut self.driver, self.fault.response());
+        if progress.is_exhausted() || self.drive.state.connection.ingress().is_blocked() {
+            self.drive.parent.wake();
+        }
         Admission::Item(Ok(Outcome::Wake))
     }
 
     fn ingress(&mut self) -> Admission<Result<Outcome, semantic::Error<Error, A::Failure>>>
     where
-        <R::Head as request::Head>::Start: admit::Begin<'d, R>,
+        <R::Head as request::Head>::Start: schedule::Schedule<'d, R>,
     {
-        if matches!(self.ready.input, Availability::Idle) {
+        if !self.ready.input {
             return Admission::Empty;
         }
-        if matches!(self.budget(), Budget::Spent) {
+        if !self.has_budget() {
             return Admission::Exhausted;
         }
         let id = self.drive.conn;
@@ -158,8 +148,8 @@ where
         let result = input::Read::new(
             &mut self.drive,
             drive::Drive::connection,
-            |run: &mut drive::Drive<'_, '_, 'd, ID, R, Q, A::Fields>| {
-                run.drain::<A, W, P>(service, state, &mut turn, Egress::Unchanged, fault)
+            |run: &mut drive::Drive<'_, '_, 'd, ID, R, Q, A::Fields>, retry| {
+                run.drain::<A, W, P>(service, state, &mut turn, Egress::Unchanged, retry, fault)
             },
         )
         .resume();
@@ -168,8 +158,7 @@ where
             Some(semantic::Error::Connection(error))
                 if error.is_pressure()
                     && self.drive.state.connection.ingress().is_blocked()
-                    && (!self.drive.state.connection.output().is_empty()
-                        || !self.drive.state.build_ready.is_empty()) =>
+                    && self.drive.can_resume() =>
             {
                 Ok(Outcome::Wake)
             }
@@ -182,10 +171,10 @@ where
         &mut self,
         pump: Pump,
     ) -> Admission<Result<Outcome, semantic::Error<Error, A::Failure>>> {
-        if matches!(self.ready.output, Availability::Idle) {
+        if !self.ready.output {
             return Admission::Empty;
         }
-        if matches!(self.budget(), Budget::Spent) {
+        if !self.has_budget() {
             return Admission::Exhausted;
         }
         let mut response = self.fault.response();
@@ -216,10 +205,10 @@ where
         if report.turns == 0 {
             return Admission::Empty;
         }
-        Admission::Item(Ok(match self.ready.task {
-            Availability::Ready => Outcome::Wake,
-            Availability::Idle if report.completed != 0 => Outcome::Wake,
-            Availability::Idle => Outcome::Idle,
+        Admission::Item(Ok(if self.ready.task || report.completed != 0 {
+            Outcome::Wake
+        } else {
+            Outcome::Idle
         }))
     }
 
@@ -230,7 +219,7 @@ where
         if !self.drive.state.can_admit() {
             return Admission::Empty;
         }
-        if matches!(self.budget(), Budget::Spent) {
+        if !self.has_budget() {
             return Admission::Exhausted;
         }
         let result = self.drive.reborrow().admit_next(self.fault.response());
@@ -242,9 +231,10 @@ where
     }
 
     fn pump(&self) -> Pump {
-        match (self.ready.build, self.ready.task, self.ready.input) {
-            (Availability::Idle, Availability::Idle, Availability::Idle) => Pump::Single,
-            _ => Pump::Round,
+        if self.ready.build || self.ready.task || self.ready.input {
+            Pump::Round
+        } else {
+            Pump::Single
         }
     }
 
@@ -256,12 +246,12 @@ where
         }
     }
 
-    fn budget(&self) -> Budget {
+    fn has_budget(&self) -> bool {
         if self.work.remaining() != 0 {
-            return Budget::Open;
+            return true;
         }
         self.drive.parent.wake();
-        Budget::Spent
+        false
     }
 }
 

@@ -376,24 +376,7 @@ fn rejects_oversized_body() {
                 let result = server.try_run(context, listener, mode::Disabled, recover, |result| {
                     result.expect("H2 execution")
                 });
-                result.map(|()| {
-                    (
-                        server
-                            .state
-                            .guard
-                            .as_ref()
-                            .expect("guard fixture")
-                            .checks
-                            .get(),
-                        server
-                            .state
-                            .guard
-                            .as_ref()
-                            .expect("guard fixture")
-                            .handlers
-                            .get(),
-                    )
-                })
+                result.map(|()| server.state.guard_counts())
             },
             |address| {
                 let (mut socket, mut client) =
@@ -438,24 +421,7 @@ fn rejects_finished_body() {
                 let result = server.try_run(context, listener, mode::Disabled, recover, |result| {
                     result.expect("H2 execution")
                 });
-                result.map(|()| {
-                    (
-                        server
-                            .state
-                            .guard
-                            .as_ref()
-                            .expect("guard fixture")
-                            .checks
-                            .get(),
-                        server
-                            .state
-                            .guard
-                            .as_ref()
-                            .expect("guard fixture")
-                            .handlers
-                            .get(),
-                    )
-                })
+                result.map(|()| server.state.guard_counts())
             },
             |address| {
                 let (mut socket, mut client) =

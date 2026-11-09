@@ -44,11 +44,6 @@ pub(in crate::server) enum Progress {
     Committed,
 }
 
-enum Cycle<R> {
-    Empty,
-    Write(R),
-}
-
 pub(in crate::server) enum End {
     Close,
     Keep,
@@ -219,13 +214,13 @@ where
                 .bind_link::<{ write::Prefix::CAPACITY }>()
             {
                 Ok(Some(bound)) => bound,
-                Ok(None) => return prefix.commit(None, Cycle::Empty).map_err(Error::Commit),
+                Ok(None) => return prefix.commit(None, None).map_err(Error::Commit),
                 Err(cause) => return Err(Error::Input(cause)),
             };
             let drained = bound.is_drained();
             let output = bound
                 .commit_with(&mut prefix, E::retain)
-                .map_err(|cause| Error::Commit(error::Build::prefix(cause, None, Cycle::Empty)))?;
+                .map_err(|cause| Error::Commit(error::Build::prefix(cause, None, None)))?;
             let (body, receipt) = match output {
                 event::Write::Buffered(_) => Ok((None, E::Receipt::default())),
                 event::Write::Owned {
@@ -241,11 +236,9 @@ where
             }
             .map_err(|(cause, receipt)| Error::Bound {
                 cause,
-                receipt: Cycle::Write(receipt),
+                receipt: Some(receipt),
             })?;
-            let commit = prefix
-                .commit(body, Cycle::Write(receipt))
-                .map_err(Error::Commit)?;
+            let commit = prefix.commit(body, Some(receipt)).map_err(Error::Commit)?;
             let end = match (&end, drained) {
                 (End::Close, true) => End::Close,
                 (End::Close, false) | (End::Keep, _) => End::Keep,
@@ -256,20 +249,18 @@ where
             })
         });
         match outcome {
-            Ok(write::Outcome::Committed(Cycle::Write(receipt))) => {
+            Ok(write::Outcome::Committed(Some(receipt))) => {
                 progress = Progress::Committed;
                 E::observe(receipt, mode, owner, owner::Change::Handoff);
             }
-            Ok(write::Outcome::Committed(Cycle::Empty)) => return Ok(progress),
+            Ok(write::Outcome::Committed(None)) => return Ok(progress),
             Ok(write::Outcome::Deferred(_) | write::Outcome::Closed) => {
                 return Ok(progress);
             }
             Err(cause) => {
                 let (failure, receipt) = match cause {
-                    error::Error::Capacity(cause) => (Ok(Failure::Capacity(cause)), Cycle::Empty),
-                    error::Error::Build(Error::Input(cause)) => {
-                        (Ok(Failure::Input(cause)), Cycle::Empty)
-                    }
+                    error::Error::Capacity(cause) => (Ok(Failure::Capacity(cause)), None),
+                    error::Error::Build(Error::Input(cause)) => (Ok(Failure::Input(cause)), None),
                     error::Error::Build(Error::Bound { cause, receipt }) => {
                         (Err(cause.into()), receipt)
                     }
@@ -297,7 +288,7 @@ where
                     }
                 };
                 match receipt {
-                    Cycle::Write(receipt) => {
+                    Some(receipt) => {
                         progress = Progress::Committed;
                         E::observe(
                             receipt,
@@ -306,7 +297,7 @@ where
                             owner::Change::StagingReleased(cause::Staging::Closed),
                         );
                     }
-                    Cycle::Empty => {}
+                    None => {}
                 }
                 match failure {
                     Ok(failure) => {

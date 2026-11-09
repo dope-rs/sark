@@ -756,6 +756,7 @@ fn deferred_guard_resumes() {
                     ..GuardProbe::default()
                 });
                 let server = Server::new(config, 1, state).with_config(config::Config {
+                    payload_capacity: capacity::Payload::new(64, 1).expect("one header owner"),
                     hpack_encoder: capacity::Encoder {
                         header_list: 9 << 10,
                         ..Default::default()
@@ -766,10 +767,7 @@ fn deferred_guard_resumes() {
                     .try_run(context, listener, mode::Disabled, recover, |result| {
                         result.expect("H2 execution")
                     })
-                    .map(|()| {
-                        let guard = server.state.guard.as_ref().expect("guard fixture");
-                        (guard.checks.get(), guard.handlers.get())
-                    })
+                    .map(|()| server.state.guard_counts())
             },
             |address| {
                 let (mut socket, mut client) =
