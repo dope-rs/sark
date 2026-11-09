@@ -96,14 +96,12 @@ impl Machine {
                 .iter()
                 .filter_map(|path| path.segments.get(key.depth))
                 .filter_map(route::Seg::literal)
-                .map(<[u8]>::to_vec)
                 .collect::<collections::BTreeSet<_>>()
                 .into_iter()
                 .map(|literal| {
                     let mut routes = params.clone();
                     routes.extend(active.iter().copied().filter(|path| {
-                        path.segments.get(key.depth).and_then(route::Seg::literal)
-                            == Some(literal.as_slice())
+                        path.segments.get(key.depth).and_then(route::Seg::literal) == Some(literal)
                     }));
                     routes.sort_unstable();
                     let next = Self::intern(
@@ -114,7 +112,7 @@ impl Machine {
                         &mut keys,
                         &mut queue,
                     );
-                    (literal, next)
+                    (literal.to_vec(), next)
                 })
                 .collect();
             states.push(State {

@@ -16,7 +16,7 @@ o3.workspace = true
 # Byte search used by the framing scanners.
 memchr = "=2.8.3"
 # Raw deflate codec; the gzip header and trailer are written in this crate.
-miniz_oxide = { version = "0.8.9", default-features = false, features = ["with-alloc"] }
+miniz_oxide = { version = "0.9.1", default-features = false, features = ["with-alloc"] }
 
 [dev-dependencies]
 dope-test.workspace = true

@@ -48,7 +48,6 @@ impl Trailer {
     }
 
     pub(in crate::h1) fn scan(mut self, input: &[u8]) -> Result<(Progress, &[u8]), Error> {
-        let mut consumed = None;
         for (offset, &byte) in input.iter().enumerate() {
             let wire = Framer::wire(self.cursor.wire, 1, &self.limits)?;
             let progress = self
@@ -56,10 +55,10 @@ impl Trailer {
                 .state
                 .scan(byte, self.cursor.wire, &self.limits)?;
             self.cursor.wire = wire;
-            let next = NonZero::<usize>::MIN.saturating_add(offset);
             match progress {
                 ControlFlow::Continue(state) => self.cursor.state = state,
                 ControlFlow::Break(trailers) => {
+                    let next = NonZero::<usize>::MIN.saturating_add(offset);
                     return Ok((
                         Progress::Complete {
                             wire,
@@ -70,12 +69,11 @@ impl Trailer {
                     ));
                 }
             }
-            consumed = Some(next);
         }
         Ok((
             Progress::More {
                 next: self.cursor,
-                consumed,
+                consumed: NonZero::new(input.len()),
             },
             input,
         ))

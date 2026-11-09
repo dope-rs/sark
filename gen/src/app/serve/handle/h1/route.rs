@@ -20,7 +20,7 @@ pub(super) enum Source {
 pub(super) fn complete(
     index: usize,
     generics: &crate::types::Generics,
-    receiver: &proc_macro2::TokenStream,
+    receiver: &proc_macro2::Ident,
 ) -> proc_macro2::TokenStream {
     let [n_shead, v_conn] = generics.locals(["__sark_head", "conn"]);
     let [v_link, v_date] = generics.locals(["connection", "date"]);
@@ -191,7 +191,7 @@ pub(super) fn emit<'view, 'source, 'spec>(
                 )
             }
         };
-        let complete = complete(index, &ctx.plan.spec.state_generics, &quote!(#v_routes));
+        let complete = complete(index, &ctx.plan.spec.state_generics, &v_routes);
         return quote! {
             return match #start(
                 #found,
@@ -226,7 +226,7 @@ pub(super) fn emit<'view, 'source, 'spec>(
                 }
             }
         };
-        let complete = complete(index, &ctx.plan.spec.state_generics, &quote!(#v_routes));
+        let complete = complete(index, &ctx.plan.spec.state_generics, &v_routes);
         return quote! {
             let #n_shead = match #parse {
                 ::core::result::Result::Ok(

@@ -283,15 +283,7 @@ impl<R: route::Spec, C, A: head::Admission> PendingHead<R, C, A> {
         let progress = head::Pending::try_start::<R::Request>(owner, coding, MAX_HEADER_COUNT)
             .map_err(parsing::Request::Head)?;
         Ok(Self::settle(
-            progress,
-            params,
-            permit,
-            select,
-            |head, permit| session::RouteOutcome::AwaitHead {
-                permit,
-                pending: pending(head),
-            },
-            complete,
+            progress, params, permit, select, pending, complete,
         ))
     }
 
@@ -324,31 +316,32 @@ impl<R: route::Spec, C, A: head::Admission> PendingHead<R, C, A> {
             params,
             permit,
             select,
-            |head, permit| session::RouteOutcome::AwaitHead {
-                permit,
-                pending: pending(head),
-            },
+            pending,
             |head, permit| complete(head, permit).after_head(prior),
         ))
     }
 
-    fn settle<T>(
+    fn settle<'d, P, D, H>(
         progress: head::Progress<<R::Request as route::Schema>::RawHeaders, A>,
         params: <R::Request as route::Schema>::RawParams,
         permit: session::Permit,
         select: impl FnOnce(Coding) -> C,
-        pending: impl FnOnce(Self, session::Permit) -> T,
-        complete: impl for<'a, 'req> FnOnce(Head<'a, 'req, R, C, A>, session::Permit) -> T,
-    ) -> T {
+        pending: impl FnOnce(Self) -> H,
+        complete: impl for<'a, 'req> FnOnce(
+            Head<'a, 'req, R, C, A>,
+            session::Permit,
+        )
+            -> session::RouteOutcome<'d, P, D, H, parsing::Rejected<'d>>,
+    ) -> session::RouteOutcome<'d, P, D, H, parsing::Rejected<'d>> {
         match progress {
-            head::Progress::Pending(fields) => pending(
-                Self {
+            head::Progress::Pending(fields) => session::RouteOutcome::AwaitHead {
+                permit,
+                pending: pending(Self {
                     fields,
                     params,
                     coding: PhantomData,
-                },
-                permit,
-            ),
+                }),
+            },
             head::Progress::Complete(owner, parsed) => owner.with_shared(|view, request| {
                 let source = parsing::Head {
                     input: crate::Input::Buffered(view),

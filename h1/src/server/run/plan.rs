@@ -53,8 +53,7 @@ pub struct Plan<
 {
     listener: Config<ListenerId, P>,
     bound: Option<Listener>,
-    date: interval::Component<DateId>,
-    input: marker::PhantomData<fn() -> I>,
+    input: marker::PhantomData<fn() -> (I, DateId)>,
     deadline: D,
 }
 
@@ -67,7 +66,6 @@ where
         Self {
             listener,
             bound: None,
-            date: interval::Component::every_second(),
             input: marker::PhantomData,
             deadline,
         }
@@ -90,7 +88,6 @@ where
         Plan {
             listener: self.listener,
             bound: self.bound,
-            date: self.date,
             input: self.input,
             deadline,
         }
@@ -273,7 +270,6 @@ where
         Plan {
             listener: self.listener,
             bound: self.bound,
-            date: self.date,
             input: marker::PhantomData,
             deadline: self.deadline,
         }
@@ -283,7 +279,6 @@ where
         Plan {
             listener: self.listener,
             bound: self.bound,
-            date: self.date,
             input: marker::PhantomData,
             deadline: self.deadline,
         }
@@ -301,6 +296,6 @@ where
 
         let needs =
             Layout::<ListenerId, I>::new(self.listener.listener.connections()).include_in(needs)?;
-        self.date.include_in(needs)
+        interval::Component::<DateId>::every_second().include_in(needs)
     }
 }

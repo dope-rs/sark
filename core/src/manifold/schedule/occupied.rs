@@ -32,6 +32,10 @@ impl<'a, K: manifold::raw::Key, T, B: Block, Q> Occupied<'a, K, T, B, Q> {
         self.slot.remove()
     }
 
+    pub fn discard(self) {
+        self.slot.discard();
+    }
+
     /// Changes the resident owner while preserving its exact queue position.
     pub fn change<R>(self, run: impl FnOnce(T) -> (T, R)) -> (Self, R) {
         let Self { slot, scope, .. } = self;

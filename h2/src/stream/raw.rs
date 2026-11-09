@@ -62,12 +62,6 @@ unsafe impl depot::raw::Key for Key {
         // SAFETY: Stored<Self> retains this exact stream domain and logical identity.
         unsafe { restore(raw.into_raw()) }
     }
-
-    fn decode(raw: Self::Raw) -> Option<Self> {
-        let id = Id::new((raw >> 32) as u32)?.nonzero()?;
-        let slot = bounded::U32::new(raw as u32)?;
-        Some(Self { id, slot })
-    }
 }
 
 // SAFETY: Key retains its nonzero wire stream id and bounded physical slot.

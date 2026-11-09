@@ -145,8 +145,6 @@ fn outbound_retains_layout() {
                 recovery::Policy::new(|_| {}, common::recover),
                 |result| result.expect("WebSocket execution"),
             )
-            .as_ref()
-            .map_err(|cause| cause.kind())
             .expect("WebSocket operation");
         assert_eq!(messages.hits(), 0);
     })
@@ -266,7 +264,7 @@ fn controls_wait_capacity() {
                     ),
                     |result| result.expect("WebSocket execution"),
                 )
-                .as_ref().map_err(|cause| cause.kind()).expect("WebSocket operation");
+                .expect("WebSocket operation");
 
             assert!(matches!(
                 reason.values().expect("close observations").as_ref(),
@@ -347,8 +345,6 @@ fn borrowed_handler_retires() {
                 recovery::Policy::new(|event| retired.push(event), common::recover),
                 |result| result.expect("WebSocket execution"),
             )
-            .as_ref()
-            .map_err(|cause| cause.kind())
             .expect("WebSocket operation");
 
         assert!(matches!(

@@ -155,13 +155,6 @@ impl<'a, K: manifold::raw::Key> Draft<'a, K> {
         })
     }
 
-    fn pending_full() -> crate::Status {
-        crate::Status::new(
-            crate::Code::ResourceExhausted,
-            Reason::PendingResponseCapacity,
-        )
-    }
-
     fn invalid(reason: Reason) -> crate::Status {
         crate::Status::new(crate::Code::Internal, reason)
     }
@@ -273,7 +266,9 @@ impl<'a, K: manifold::raw::Key> Draft<'a, K> {
             || !metadata.is_empty();
         let (change, work) = match position {
             Position::Vacant(slot) if altered => {
-                let total = active.checked_add(1).ok_or_else(Self::pending_full)?;
+                let total = active
+                    .checked_add(1)
+                    .ok_or_else(|| PushError::Full.into_status())?;
                 let mut pending = pending::Pending::new(key, metadata);
                 pending.trailer = trailer;
                 (

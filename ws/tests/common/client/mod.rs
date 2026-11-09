@@ -138,10 +138,7 @@ impl Probe {
                 Err(Failure::Deadline) => panic!("WebSocket probe: Deadline"),
             },
         );
-        match result {
-            Ok(observed) => observed,
-            Err(error) => panic!("WebSocket topology: {:?}", error.kind()),
-        }
+        result.expect("WebSocket topology")
     }
 }
 

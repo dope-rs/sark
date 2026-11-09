@@ -35,7 +35,7 @@ impl Prepared {
         let [n_result, n_output] = symbols.locals(["__outcome", "__output"]);
         let [n_params] = symbols.locals(["__params"]);
         let [n_prep, n_proj] = symbols.locals(["__prepared", "__project"]);
-        let [n_failed, n_req] = symbols.locals(["__rejected", "__request"]);
+        let [n_req] = symbols.locals(["__request"]);
         let [n_resp, n_scope] = symbols.locals(["__response", "__scope"]);
         let [n_slot, n_source] = symbols.locals(["__slot", "__source"]);
         let [n_view, n_visit] = symbols.locals(["__view", "__visit"]);
@@ -190,7 +190,6 @@ impl Prepared {
                     {
                         #take
                         #v_head.scope(|#v_head| {
-                        let #n_result = {
                         let #n_encode = #ns_core::decode::Encode::begin_head(
                             #n_encode,
                             #v_head.owner().owner().view(),
@@ -203,22 +202,11 @@ impl Prepared {
                                 ::core::option::Option::Some(#n_head.path()),
                                 #n_head.authority(),
                             );
-                        let #n_result =
-                            <#head_ty as #ns_core::route::guard::Slot<#state_ty>>::try_admit(
+                        match <#head_ty as #ns_core::route::guard::Slot<#state_ty>>::try_admit(
                                 #n_ghead,
                                 #app,
                                 #n_encode,
-                        );
-                        match #n_result {
-                            ::core::ops::ControlFlow::Continue(_) => {
-                                ::core::ops::ControlFlow::Continue(())
-                            }
-                            ::core::ops::ControlFlow::Break(#n_failed) => {
-                                ::core::ops::ControlFlow::Break(#n_failed)
-                            }
-                        }
-                        };
-                        match #n_result {
+                        ).map_continue(::core::mem::drop) {
                             ::core::ops::ControlFlow::Continue(()) => {
                                 let #v_head = #v_head.into_inner();
                                 ::core::ops::ControlFlow::Continue(#put)

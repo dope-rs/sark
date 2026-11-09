@@ -64,14 +64,14 @@ use crate::common::server::h3::{
 };
 
 type Result<'a, T> = std::result::Result<T, Error<'a>>;
-type Planned<Q, P> = Result<'static, (Plan<LISTENER, receive::Retained, Q>, P)>;
+type Planned<'g, Q, P> = Result<'static, (Plan<'g, LISTENER, receive::Retained, Q>, P)>;
 
 pub fn plain(
     (address, reservation): (SocketAddr, UdpSocket),
     tls: ServerConfig,
     options: Options,
     endpoint: Config,
-) -> Planned<routing::Plain, UdpSocket> {
+) -> Planned<'static, routing::Plain, UdpSocket> {
     let plan = Plan::new(address, tls, options, endpoint).map_err(Error::Endpoint)?;
     Ok((plan, reservation))
 }
@@ -120,15 +120,15 @@ pub struct Scenario<'a> {
 }
 
 impl<'a> Scenario<'a> {
-    pub(crate) fn try_prepare<Q: routing::LocalRoute, P>(
+    pub(crate) fn try_prepare<'g, Q: routing::LocalRoute, P>(
         &mut self,
         protocol: options::Config,
         send_bytes: Option<num::NonZero<usize>>,
-        make: impl FnOnce((SocketAddr, UdpSocket), ServerConfig, Options, Config) -> Planned<Q, P>,
+        make: impl FnOnce((SocketAddr, UdpSocket), ServerConfig, Options, Config) -> Planned<'g, Q, P>,
     ) -> Result<
         '_,
         (
-            topology::Prepared<StoragePlan, RunPlan<'a, Q, P>>,
+            topology::Prepared<StoragePlan, RunPlan<'g, 'a, Q, P>>,
             Rc<Shared<'a>>,
         ),
     > {
@@ -235,9 +235,9 @@ impl<'a> Scenario<'a> {
         Ok((prepared, proof))
     }
 
-    pub fn try_run_with<Q: routing::LocalRoute, P, L, D, O, Out>(
+    pub fn try_run_with<'g, Q: routing::LocalRoute, P, L, D, O, Out>(
         mut self,
-        make: impl FnOnce((SocketAddr, UdpSocket), ServerConfig, Options, Config) -> Planned<Q, P>,
+        make: impl FnOnce((SocketAddr, UdpSocket), ServerConfig, Options, Config) -> Planned<'g, Q, P>,
         protocol: options::Config,
         send_bytes: Option<num::NonZero<usize>>,
         lifetime: L,
