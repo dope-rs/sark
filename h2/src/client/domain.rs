@@ -2,10 +2,7 @@ use std::marker;
 
 use sark_core::{
     life::session,
-    manifold::{
-        client::domain,
-        schedule::{self, data},
-    },
+    manifold::{client::domain, schedule},
 };
 use sark_http::field::metadata::section::rules;
 
@@ -20,65 +17,6 @@ use crate::{
 pub struct Domain<T, F = rules::RetainRaw> {
     pub(super) inner: schedule::Runtime<stream::Key, T, conn::DataBlock>,
     pub(super) marker: marker::PhantomData<fn() -> F>,
-}
-
-struct Drive<'a, F, C, D, E>
-where
-    F: rules::Policy,
-    C: session::Storage,
-{
-    connection: &'a mut Connection<ClientRole, F, C>,
-    driver: &'a mut D,
-    failure: Option<domain::Failure<E, stream::Key>>,
-}
-
-impl<F, C, T, D> data::Driver<T> for Drive<'_, F, C, D, D::Error>
-where
-    F: rules::Policy,
-    C: session::Storage,
-    D: domain::Driver<Connection<ClientRole, F, C>, T>,
-{
-    type Key = stream::Key;
-    type Block = conn::DataBlock;
-    type Error = D::Error;
-
-    fn can_continue(&self) -> bool {
-        self.failure.is_none()
-    }
-
-    fn turn(
-        &mut self,
-        key: stream::Key,
-        value: &mut T,
-    ) -> Result<schedule::Turn<Self::Block>, Self::Error> {
-        self.driver.data(self.connection, key, value)
-    }
-
-    fn settle(
-        &mut self,
-        key: stream::Key,
-        value: &mut T,
-        term: schedule::Terminal<Self::Error>,
-    ) -> data::Settlement {
-        match self.driver.settle(self.connection, key, value, term) {
-            domain::Settlement::Keep => data::Settlement::Keep,
-            domain::Settlement::Remove => data::Settlement::Remove,
-            domain::Settlement::Failed {
-                disposition: place,
-                error,
-            } => {
-                self.failure = Some(error);
-                match place {
-                    domain::Disposition::Keep => data::Settlement::Keep,
-                    domain::Disposition::Remove => data::Settlement::Remove,
-                }
-            }
-        }
-    }
-
-    fn remove(&mut self, value: T) {
-        self.driver.removed(value);
-    }
 }
 
 impl<F, C, T> domain::Domain<Connection<ClientRole, F, C>, T> for Domain<T, F>
@@ -143,15 +81,6 @@ where
         conn: &mut Connection<ClientRole, F, C>,
         driver: &mut D,
     ) -> Result<schedule::Report, domain::Failure<D::Error, stream::Key>> {
-        let mut turn = Drive {
-            connection: conn,
-            driver,
-            failure: None,
-        };
-        let report = self.inner.drive_data(&mut turn);
-        match turn.failure {
-            Some(error) => Err(error),
-            None => Ok(report),
-        }
+        domain::try_drive(&mut self.inner, conn, driver)
     }
 }

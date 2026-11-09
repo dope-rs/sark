@@ -7,7 +7,7 @@ use crate::{
         self,
         client::{self, io},
         schedule,
-        schedule::{Error, Report, Terminal, Turn},
+        schedule::{Error, Report, Terminal, Turn, data},
         stream,
     },
 };
@@ -72,6 +72,77 @@ where
     ) -> Settlement<Self::Error, C::Key>;
 
     fn removed(&mut self, value: T);
+}
+
+/// Drives resident client data while preserving the first settlement failure.
+pub fn try_drive<C, T, D>(
+    runtime: &mut schedule::Runtime<C::Key, T, C::Block>,
+    connection: &mut C,
+    driver: &mut D,
+) -> Result<Report, Failure<D::Error, C::Key>>
+where
+    C: client::Connection,
+    C::Block: schedule::Block,
+    D: Driver<C, T>,
+{
+    let mut turn = Drive {
+        connection,
+        driver,
+        failure: None,
+    };
+    let report = runtime.drive_data(&mut turn);
+    match turn.failure {
+        Some(error) => Err(error),
+        None => Ok(report),
+    }
+}
+
+struct Drive<'a, C: client::Connection, D, E> {
+    connection: &'a mut C,
+    driver: &'a mut D,
+    failure: Option<Failure<E, C::Key>>,
+}
+
+impl<C, T, D> data::Driver<T> for Drive<'_, C, D, D::Error>
+where
+    C: client::Connection,
+    C::Block: schedule::Block,
+    D: Driver<C, T>,
+{
+    type Key = C::Key;
+    type Block = C::Block;
+    type Error = D::Error;
+
+    fn can_continue(&self) -> bool {
+        self.failure.is_none()
+    }
+
+    fn turn(&mut self, key: Self::Key, value: &mut T) -> Result<Turn<Self::Block>, Self::Error> {
+        self.driver.data(self.connection, key, value)
+    }
+
+    fn settle(
+        &mut self,
+        key: Self::Key,
+        value: &mut T,
+        term: Terminal<Self::Error>,
+    ) -> data::Settlement {
+        match self.driver.settle(self.connection, key, value, term) {
+            Settlement::Keep => data::Settlement::Keep,
+            Settlement::Remove => data::Settlement::Remove,
+            Settlement::Failed { disposition, error } => {
+                self.failure = Some(error);
+                match disposition {
+                    Disposition::Keep => data::Settlement::Keep,
+                    Disposition::Remove => data::Settlement::Remove,
+                }
+            }
+        }
+    }
+
+    fn remove(&mut self, value: T) {
+        self.driver.removed(value);
+    }
 }
 
 /// Carrier-selected resident storage and scheduling policy.

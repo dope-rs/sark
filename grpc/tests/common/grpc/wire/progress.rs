@@ -8,7 +8,7 @@ use o3::{
 };
 use sark_core::manifold::{
     client::{Connection, domain, event, io},
-    schedule::{self, data},
+    schedule,
     stream::Boundary,
 };
 use sark_grpc::protocol::section;
@@ -297,65 +297,6 @@ impl<'c, T> domain::Domain<Carrier<'c>, T> for Domain<T> {
         conn: &mut Carrier<'c>,
         driver: &mut D,
     ) -> Result<schedule::Report, domain::Failure<D::Error, stream::Key>> {
-        let mut drive = Drive {
-            conn,
-            driver,
-            failure: None,
-        };
-        let report = self.0.drive_data(&mut drive);
-        match drive.failure {
-            Some(error) => Err(error),
-            None => Ok(report),
-        }
-    }
-}
-
-struct Drive<'a, 'c, D, E> {
-    conn: &'a mut Carrier<'c>,
-    driver: &'a mut D,
-    failure: Option<domain::Failure<E, stream::Key>>,
-}
-
-impl<'c, T, D: domain::Driver<Carrier<'c>, T>> data::Driver<T> for Drive<'_, 'c, D, D::Error> {
-    type Key = stream::Key;
-    type Block = conn::DataBlock;
-    type Error = D::Error;
-
-    fn can_continue(&self) -> bool {
-        self.failure.is_none()
-    }
-
-    fn turn(
-        &mut self,
-        key: Self::Key,
-        value: &mut T,
-    ) -> Result<schedule::Turn<Self::Block>, Self::Error> {
-        self.driver.data(self.conn, key, value)
-    }
-
-    fn settle(
-        &mut self,
-        key: Self::Key,
-        value: &mut T,
-        term: schedule::Terminal<Self::Error>,
-    ) -> data::Settlement {
-        match self.driver.settle(self.conn, key, value, term) {
-            domain::Settlement::Keep => data::Settlement::Keep,
-            domain::Settlement::Remove => data::Settlement::Remove,
-            domain::Settlement::Failed {
-                disposition: place,
-                error,
-            } => {
-                self.failure = Some(error);
-                match place {
-                    domain::Disposition::Keep => data::Settlement::Keep,
-                    domain::Disposition::Remove => data::Settlement::Remove,
-                }
-            }
-        }
-    }
-
-    fn remove(&mut self, value: T) {
-        self.driver.removed(value);
+        domain::try_drive(&mut self.0, conn, driver)
     }
 }
