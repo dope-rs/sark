@@ -35,14 +35,16 @@ impl Progress {
         }
     }
 
-    pub(crate) fn exhaust(&mut self) {
+    /// Records work deferred by bounded admission.
+    pub fn exhaust(&mut self) {
         self.0 = match self.0 {
             State::Idle | State::Exhausted => State::Exhausted,
             State::Drained | State::Both => State::Both,
         };
     }
 
-    pub(crate) fn record(&mut self) {
+    /// Records work already admitted by its executing owner.
+    pub fn record(&mut self) {
         self.0 = match self.0 {
             State::Idle | State::Drained => State::Drained,
             State::Exhausted | State::Both => State::Both,

@@ -10,7 +10,7 @@ use runtime::{
     schedule::{self, start},
     state::active,
 };
-use sark_core::manifold::server::app;
+use sark_core::manifold::server::{app, drain::Progress};
 
 use crate::server::{
     call, runtime,
@@ -50,14 +50,6 @@ where
             user,
             codec: H::Codec::default(),
             tasks,
-        }
-    }
-
-    fn task_state(&self, owner: Id<'d, KeyTag<0>>) -> policy::TaskState {
-        if self.tasks.has_work_for(owner) {
-            policy::TaskState::Ready
-        } else {
-            policy::TaskState::Idle
         }
     }
 }
@@ -138,14 +130,12 @@ where
         owner: Id<'d, KeyTag<0>>,
         work: Work<'_, 'd>,
         driver: &mut driver::Context<'_, 'd>,
-    ) -> policy::TaskState {
-        self.tasks.drive_with(owner, work, driver, |_, _| {});
-        self.task_state(owner)
+    ) -> Progress {
+        self.tasks.drive_with(owner, work, driver, |_, _| {})
     }
 
-    fn wake_tasks(&mut self, owner: Id<'d, KeyTag<0>>) -> policy::TaskState {
+    fn wake_tasks(&mut self) {
         self.tasks.wake_next();
-        self.task_state(owner)
     }
 
     fn pop_done(

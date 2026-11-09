@@ -2,7 +2,7 @@ use std::{convert, marker};
 
 use dope::core::driver::{self, schedule::app::Work};
 use o3::buffer::resident;
-use sark_core::manifold::server::app;
+use sark_core::manifold::server::{app, drain::Progress};
 
 use crate::{
     message, metadata,
@@ -10,7 +10,7 @@ use crate::{
     server::{
         call,
         runtime::{
-            policy::{self, RequestState, TaskState},
+            policy::{self, RequestState},
             state,
         },
         service::{
@@ -123,18 +123,11 @@ where
         false
     }
 
-    fn drive_tasks(
-        &mut self,
-        _: O,
-        _: Work<'_, 'd>,
-        _: &mut driver::Context<'_, 'd>,
-    ) -> TaskState {
-        TaskState::Idle
+    fn drive_tasks(&mut self, _: O, _: Work<'_, 'd>, _: &mut driver::Context<'_, 'd>) -> Progress {
+        Progress::default()
     }
 
-    fn wake_tasks(&mut self, _: O) -> TaskState {
-        TaskState::Idle
-    }
+    fn wake_tasks(&mut self) {}
 
     fn pop_done(&mut self, _: O) -> Option<(T, convert::Infallible)> {
         None

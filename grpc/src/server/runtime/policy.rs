@@ -1,6 +1,6 @@
 use dope::core::driver::{self, schedule::app::Work};
 use o3::buffer::resident;
-use sark_core::manifold::server::app;
+use sark_core::manifold::server::{app, drain::Progress};
 
 use crate::server::runtime::schedule::wake;
 
@@ -97,12 +97,6 @@ pub enum Rearm {
     Read,
 }
 
-#[derive(Clone, Copy, Eq, PartialEq)]
-pub enum TaskState {
-    Idle,
-    Ready,
-}
-
 pub trait Dispatch<'d, O>
 where
     O: Copy + Eq + 'd,
@@ -183,9 +177,9 @@ where
         owner: O,
         work: Work<'_, 'd>,
         driver: &mut driver::Context<'_, 'd>,
-    ) -> TaskState;
+    ) -> Progress;
 
-    fn wake_tasks(&mut self, owner: O) -> TaskState;
+    fn wake_tasks(&mut self);
 
     fn pop_done(&mut self, owner: O) -> Option<(Self::Target, Self::Completion)>;
 

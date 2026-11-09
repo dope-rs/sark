@@ -12,6 +12,7 @@ use dope::{
     manifold::network::listener::conn::Id,
 };
 use dope_fiber::{abi, context::wake::RootWaker, task::storage};
+use sark_core::manifold::server::drain::Progress;
 use set::group;
 use storage::set;
 
@@ -82,7 +83,7 @@ where
             },
             parent,
         )?;
-        self.drive_with(owner, ctx.work, ctx.driver, observe);
+        let _ = self.drive_with(owner, ctx.work, ctx.driver, observe);
         let started = match self.tasks.take(id) {
             Ok((_, output)) => start::Start::Ready(output),
             Err(id) => start::Start::Pending(id),
@@ -107,13 +108,17 @@ where
         work: Work<'_, 'd>,
         driver: &mut driver::Context<'_, 'd>,
         mut observe: Observe,
-    ) where
+    ) -> Progress
+    where
         Observe: FnMut(T, pin::Pin<&mut F>),
     {
+        let mut progress = Progress::default();
         self.tasks.poll_with(active, work, driver, |task, fiber| {
-            observe(task.target, fiber)
+            progress.record();
+            observe(task.target, fiber);
         });
         self.collect(active);
+        progress
     }
 
     pub(in crate::server) fn has_done(&self, owner: Id<'d, KeyTag<0>>) -> bool {

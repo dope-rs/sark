@@ -11,7 +11,7 @@ use runtime::{
     schedule::{self, start, wake},
     state::active,
 };
-use sark_core::manifold::server::app;
+use sark_core::manifold::server::{app, drain::Progress};
 use stream::Route as _;
 
 use crate::{
@@ -71,14 +71,6 @@ where
                 entry.app();
                 entry.output();
             }
-        }
-    }
-
-    fn task_state(&self, owner: Id<'d, KeyTag<0>>) -> policy::TaskState {
-        if self.tasks.has_work_for(owner) {
-            policy::TaskState::Ready
-        } else {
-            policy::TaskState::Idle
         }
     }
 }
@@ -293,16 +285,14 @@ where
         owner: Id<'d, KeyTag<0>>,
         work: Work<'_, 'd>,
         driver: &mut driver::Context<'_, 'd>,
-    ) -> policy::TaskState {
+    ) -> Progress {
         self.tasks.drive_with(owner, work, driver, |entry, fiber| {
             Self::signal(entry, fiber.take_events());
-        });
-        self.task_state(owner)
+        })
     }
 
-    fn wake_tasks(&mut self, owner: Id<'d, KeyTag<0>>) -> policy::TaskState {
+    fn wake_tasks(&mut self) {
         self.tasks.wake_next();
-        self.task_state(owner)
     }
 
     fn pop_done(&mut self, _: Id<'d, KeyTag<0>>) -> Option<(active::Entry<'r>, Self::Completion)> {

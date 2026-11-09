@@ -178,7 +178,7 @@ where
         let wake = turn.wake();
         let active = store.active.get();
         drain::Events::fair(work, |mut drain| {
-            let mut again = false;
+            let mut tasks = drain::Progress::default();
             'work: {
                 let state = &mut *store;
                 while state.deadline().is_some_and(|at| at <= now) {
@@ -264,11 +264,10 @@ where
                                 }
                             };
                             self.completion(state, conn, done, entry);
-                            again |= self.exec.wake_tasks(owner) == policy::TaskState::Ready;
+                            self.exec.wake_tasks();
                         }
                         Some(lanes::Kind::Task) => {
-                            again |= self.exec.drive_tasks(owner, work, turn.driver())
-                                == policy::TaskState::Ready;
+                            tasks = self.exec.drive_tasks(owner, work, turn.driver());
                             self.egress(
                                 state,
                                 conn,
@@ -295,7 +294,11 @@ where
                 }
             }
             let state = &*store;
-            let result = drain.finish();
+            let mut result = drain.finish();
+            result.merge(tasks);
+            if X::TASKS && self.exec.has_tasks(owner) {
+                result.exhaust();
+            }
             let done = X::TASKS && self.exec.has_done(owner);
             let task = X::TASKS && active.has_work();
             let output = X::Timer::has_output(
@@ -311,7 +314,6 @@ where
                 || task
                 || output
                 || done
-                || again
                 || state.calls.has_runnable();
             if rearm && !result.is_exhausted() {
                 wake.wake();
