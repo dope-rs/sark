@@ -305,9 +305,9 @@ dependencies = [
 
 [[package]]
 name = "dope-quic"
-version = "0.59.1"
+version = "0.59.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3b8a9662dba6c23db043fe55cc6dd705a8e8b41b7a5ba93184aacb5722aa249b"
+checksum = "a1a9c3b113e69c8339d8b3c741e17c1f46fd6acd000b3566a43e2914d14a5c21"
 dependencies = [
  "aws-lc-rs",
  "dope",
