@@ -1,6 +1,6 @@
 use sark_http::field::metadata::block;
 
-use crate::hpack::decode::limit;
+use crate::{conn::event, hpack::decode::limit};
 
 mod input;
 mod prepared;
@@ -13,11 +13,7 @@ pub(crate) use prepared::{Prepared, Reset};
 #[derive(Clone, Copy)]
 pub(crate) enum Validation {
     Valid,
-    Rejected {
-        admit: limit::Admission,
-        sealed: block::Validation,
-        finished: block::Validation,
-    },
+    Rejected(event::Rejected),
 }
 
 impl Validation {
@@ -30,11 +26,11 @@ impl Validation {
             (limit::Admission::Admitted, block::Validation::Valid, block::Validation::Valid) => {
                 Self::Valid
             }
-            (admit, sealed, finished) => Self::Rejected {
+            (admit, sealed, finished) => Self::Rejected(event::Rejected {
                 admit,
                 sealed,
                 finished,
-            },
+            }),
         }
     }
 }

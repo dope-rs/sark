@@ -63,7 +63,7 @@ where
     E: event::Evidence,
 {
     let interim = matches!(prepared.response(), Some(block::Response::Informational));
-    let next = if matches!(prepared.validation(), header::Validation::Rejected { .. })
+    let next = if matches!(prepared.validation(), header::Validation::Rejected(_))
         || interim && matches!(boundary, Boundary::End)
     {
         Err(numbers::ErrorCode::ProtocolError)
@@ -406,7 +406,7 @@ where
                             ))
                         })
                 }
-                header::Validation::Rejected { .. } => Err(numbers::ErrorCode::ProtocolError),
+                header::Validation::Rejected(_) => Err(numbers::ErrorCode::ProtocolError),
             };
             let (content, remaining) = match content {
                 Ok(content) => content,

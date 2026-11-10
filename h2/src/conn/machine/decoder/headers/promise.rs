@@ -85,7 +85,7 @@ impl Promise {
             store::Admission::Full(opening) => {
                 let error = match prepared.validation() {
                     header::Validation::Valid => numbers::ErrorCode::RefusedStream,
-                    header::Validation::Rejected { .. } => numbers::ErrorCode::ProtocolError,
+                    header::Validation::Rejected(_) => numbers::ErrorCode::ProtocolError,
                 };
                 prepared.discard();
                 opening.commit();
@@ -100,7 +100,7 @@ impl Promise {
         };
         match prepared.validation() {
             header::Validation::Valid => {}
-            header::Validation::Rejected { .. } => {
+            header::Validation::Rejected(_) => {
                 prepared.discard();
                 opening.commit();
                 return outbound.reset(target, numbers::ErrorCode::ProtocolError);

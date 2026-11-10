@@ -97,15 +97,7 @@ impl<'a, P: rules::Policy, C: session::Storage, E: event::Evidence> Prepared<'a,
         self.frame.commit();
         let check = match self.validation {
             header::Validation::Valid => None,
-            header::Validation::Rejected {
-                admit,
-                sealed,
-                finished,
-            } => Some(event::Rejected {
-                admit,
-                sealed,
-                finished,
-            }),
+            header::Validation::Rejected(cause) => Some(cause),
         };
         events::Reset::new(self.event, check)
     }
