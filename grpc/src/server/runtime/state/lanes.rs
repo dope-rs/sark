@@ -23,8 +23,6 @@ impl Kind {
 
 #[derive(Default)]
 pub(in crate::server::runtime) struct Schedule {
-    pub(super) semantic: usize,
-    pub(super) output: usize,
     pub(in crate::server::runtime) waiting: usize,
     /// Remaining rows in the circular sweep admitted by the last capacity release.
     pub(in crate::server::runtime) retries: usize,

@@ -1,7 +1,10 @@
 use std::{convert::Infallible, mem, ops, pin};
 
 use dope::{
-    core::driver::{route::Identity, schedule::app},
+    core::driver::{
+        route::Identity,
+        schedule::{app, ready},
+    },
     manifold::network::listener::conn::Id,
 };
 use o3::{
@@ -16,7 +19,7 @@ use sark_core::{
     life::{self, audit, exchange},
     manifold::{
         schedule::{self, typed},
-        server::{Connection as _, Event, drain},
+        server::{Connection as _, Event, app as semantic, drain},
         stream::Boundary,
         task::app::Runtime,
     },
@@ -38,6 +41,25 @@ use crate::{
     },
     stream,
 };
+
+pub(super) fn wakes<'d, ID: Identity + 'd, R, A>(
+    book: &mut Borrowed<'_, 'd, R, A::Fields>,
+    parent: ready::Target<'d>,
+    state: &mut service::State<'d, ID, A>,
+) where
+    R: Runtime<'d, Target = Target<'d, ID>>,
+    A: service::Select<R> + semantic::Application<'d, service::Connection<'d, A>, Id<'d, ID>>,
+{
+    if !A::ENABLED {
+        return;
+    }
+    while let Some(wake) = book.connection.flow().poll_wake() {
+        let http = book.responses.wake(wake) != 0;
+        if A::wake(state, wake) || http {
+            parent.wake();
+        }
+    }
+}
 
 pub(super) struct Book<'d, P, G, B, D, X>
 where

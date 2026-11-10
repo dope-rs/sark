@@ -136,7 +136,7 @@ where
             Egress<'d> = Unbounded,
         >,
     for<'d> App<'d, run::Service<'a, direct::Policy<H, active::Entry<'a>>>, W, F>:
-        Runtime<'d, 'd, ID> + Application<'d, ID, Wire = W, Input = receive::Scoped>,
+        Runtime<'d, 'd, ID> + Application<'d, ID, Wire = W, Input = receive::Scoped<true>>,
 {
     type Application<'d>
         = App<'d, run::Service<'a, direct::Policy<H, active::Entry<'a>>>, W, F>

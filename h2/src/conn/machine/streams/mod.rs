@@ -1,10 +1,6 @@
 use std::num::NonZero;
 
-use conn::{
-    event,
-    outputs::{Barrier, modes},
-    registry,
-};
+use conn::{event, outputs::modes, registry};
 use o3::buffer::{resident, segments, storage};
 use sark_core::{life::session, manifold::stream::Boundary};
 use sark_http::{self, field::metadata::section::rules, payload::owned};
@@ -137,7 +133,6 @@ where
     }
 
     fn flush_reset(&mut self) {
-        self.conn.egress.outbound.set_barrier(Barrier::Blocked);
         self.conn.state.flush_resets(&mut self.conn.egress.outbound);
     }
 

@@ -57,8 +57,7 @@ impl<'a> Input<'a> {
             .map_err(InputError::Range)?
         {
             Self::Buffered(view)
-                if <storage::Shared as hold::raw::Retain<'_>>::charge(&view)
-                    .resident_bytes
+                if <storage::Shared as hold::raw::Retain<'_>>::resident(&view)
                     .saturating_sub(view.len())
                     > ingress::PAGE_BYTES =>
             {

@@ -4,7 +4,7 @@ use std::{cell::Cell, fmt, num::NonZero, time::Duration};
 
 use common::h2::recover;
 use common::h2::{
-    apps::NESTED_JSON,
+    apps::{NESTED_JSON, RETAINED_NAME},
     events::Log,
     facts::{GuardProbe, State},
     peer::{Peer, Sender},
@@ -246,14 +246,14 @@ fn retains_indexed_header() {
                     .headers()
                     .request(
                         Request::new(b"/users/beta/teams/alpha/retained-header?q=request-query")
-                            .try_named(b"first-indexed-final-owner")
+                            .try_named(RETAINED_NAME)
                             .expect("valid named request fields"),
                         Boundary::End,
                     )
                     .expect("start retained-header request");
                 socket.set_nodelay(true).expect("H2 TCP_NODELAY");
                 Peer::new(&mut socket, &mut client)
-                    .try_fragment(NonZero::new(3).expect("fragment size"))
+                    .try_fragment(NonZero::new(32).expect("fragment size"))
                     .expect("H2 peer fragment");
                 for index in 0..40 {
                     let owner = format!("turnover-{index:03}-{}", "x".repeat(96));
@@ -282,7 +282,7 @@ fn retains_indexed_header() {
                         .map(|field| field.value.as_slice()),
                     Some(&b"200"[..]),
                 );
-                assert_eq!(response, b"first-indexed-final-owner");
+                assert_eq!(response, RETAINED_NAME);
             },
             |result| {
                 result.expect("H2 setup");

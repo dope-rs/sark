@@ -144,7 +144,7 @@ sark_fiber::define_cleartext_route! {
 }
 
 pub fn run_plain(context: shutdown::ReadySource<'_>, listener: Listener) {
-    let plan = server::Plan::new(listener.local_addr(), Duration::from_secs(2)).build().scoped();
+    let plan = server::Plan::new(listener.local_addr(), Duration::from_secs(2)).build().scoped::<true>();
     let mut reports = server::Plan::try_reports(&plan).expect("claims");
     let prepared = plan.with_bound(listener).prepare(()).expect("resources");
     let bank = Bank::try_new(NonZero::new(1).expect("one connection"), Limits::default())

@@ -155,7 +155,7 @@ pub(super) fn build(
             (def, args)
         };
         let source = if mixed && matches!(proto.duplex, duplex::State::Disabled) {
-            quote!(#ns_fiber::dope::manifold::app::receive::Scoped)
+            quote!(#ns_fiber::dope::manifold::app::receive::Scoped<true>)
         } else {
             source.clone()
         };
@@ -289,10 +289,17 @@ pub(super) fn build(
                 }
             }
         });
-        let is_gated = (mixed && matches!(proto.duplex, duplex::State::Enabled)).then(|| {
+        let is_gated = mixed.then(|| {
+            let enabled = matches!(proto.duplex, duplex::State::Enabled);
             quote! {
                 fn is_gated(#v_link: &Self::Conn) -> ::core::primitive::bool {
-                    ::core::matches!(#v_link, #mixed_conn::Http1(_))
+                    match #v_link {
+                        #mixed_conn::Http1(_) => #enabled,
+                        #mixed_conn::Http2(#v_link) => <#http2 as
+                            #ns_fiber::dope::manifold::network::listener::handler::Application<'d, #g_id>
+                        >::is_gated(#v_link),
+                        #mixed_conn::Pending(_) => false,
+                    }
                 }
             }
         });
@@ -361,22 +368,20 @@ pub(super) fn build(
                     >,
                 }
             });
-            let http_query = mixed.then(|| {
-                quote! {
-                    if !::core::matches!(#v_link.state(), #mixed_conn::Http1(_)) {
-                        return false;
-                    }
-                    let #v_link = #v_link.map_state(#mixed_conn::h1);
-                }
-            });
-            let http_drained = mixed.then(|| {
-                quote! {
-                    if !::core::matches!(#v_link.state(), #mixed_conn::Http1(_)) {
-                        return #ns_fiber::dope::manifold::network::listener::handler::PostDrain::Idle;
-                    }
-                    let mut #v_link = #v_link.map_state(#mixed_conn::h1_mut);
-                }
-            });
+            let blocked_enter = enter(
+                Some(quote! {
+                    #ns_fiber::dope::manifold::network::listener::handler::Application::is_blocked(
+                        #h2_ref, #v_link.map_state(#mixed_conn::h2),
+                    )
+                }),
+                quote!(false),
+                &h1_ref,
+            );
+            let http_drained = enter(
+                None,
+                quote!(#ns_fiber::dope::manifold::network::listener::handler::PostDrain::Idle),
+                &h1_mut,
+            );
             let h1_stamp = mixed.then(|| {
                 quote! {
                     let #v_date = ::core::pin::Pin::new(&mut #v_date.get_mut().0);
@@ -538,40 +543,28 @@ pub(super) fn build(
             };
             let recv = match duplex {
                 duplex::State::Enabled => quote! {
-                    fn is_blocked(
-                        self: ::core::pin::Pin<&Self>,
-                        #v_link: #ns_fiber::dope::manifold::network::listener::conn::Ref<
-                            '_,
-                            '_,
-                            '_,
-                            '_,
-                            'd,
-                             #g_id,
-                            #g_wire,
-                            #outer_conn,
-                            #egress,
-                        >,
-                    ) -> ::core::primitive::bool {
-                        #http_query
                         match #v_link.state().raw() {
-                            ::core::result::Result::Ok(#v_raw) => match (#v_raw.hold(), #v_raw.access()) {
-                                (
-                                    #ns_core::duplex::machine::Hold::Released,
-                                    #ns_core::duplex::machine::Access::Vacant(()),
-                                ) => false,
-                                (
-                                    #ns_core::duplex::machine::Hold::Held,
-                                    #ns_core::duplex::machine::Access::Vacant(()),
-                                )
-                                | (_, #ns_core::duplex::machine::Access::Blocked) => true,
-                            },
+                            ::core::result::Result::Ok(#v_raw) => {
+                                ::core::matches!(#v_raw.hold(), #ns_core::duplex::machine::Hold::Held)
+                                    || ::core::matches!(#v_raw.access(), #ns_core::duplex::machine::Access::Blocked)
+                            }
                             ::core::result::Result::Err(#ns_h1::switch::Mode::Http) => false,
                             ::core::result::Result::Err(#ns_h1::switch::Mode::Switching(_)) => true,
                         }
-                    }
                 },
-                duplex::State::Disabled => proc_macro2::TokenStream::new(),
+                duplex::State::Disabled => quote!(false),
             };
+            let recv = (mixed || matches!(duplex, duplex::State::Enabled)).then(|| {
+                quote! {
+                    fn is_blocked(
+                        self: ::core::pin::Pin<&Self>,
+                        #v_link: #conn_ref,
+                    ) -> ::core::primitive::bool {
+                        #blocked_enter
+                        #recv
+                    }
+                }
+            });
             let close = match duplex {
                 duplex::State::Enabled => quote! {
                     match #v_link.state_mut().raw_mut() {
@@ -916,6 +909,13 @@ pub(super) fn build(
                     }
                 }
             };
+            let drains = mixed.then(|| {
+                quote! {
+                    fn drains(#v_link: &Self::Conn) -> ::core::primitive::bool {
+                        ::core::matches!(#v_link, #mixed_conn::Http1(_))
+                    }
+                }
+            });
             let gated = match duplex {
                 duplex::State::Enabled => quote! {
                     impl<#def>
@@ -925,6 +925,8 @@ pub(super) fn build(
                         #bounds
                         #g_mode: #ns_h1::server::deadline::Mode<'d, #g_id>,
                     {
+                        #drains
+
                         fn send_drained<#g_event>(
                             self: ::core::pin::Pin<&mut Self>,
                             mut #v_link: #ns_fiber::dope::manifold::network::listener::conn::Drained<

@@ -214,6 +214,23 @@ where
             }
         }
     }
+
+    #[inline(always)]
+    fn deadline(
+        timers: &D,
+        state: &mut Carrier<'d, R, D, A::Fields, service::State<'d, ID, A>>,
+        service: Option<&A>,
+    ) -> Option<clock::Deadline<'d>>
+    where
+        D: timers::Policy<'d>,
+        A: semantic::Timed<'d, service::Connection<'d, A>, Id<'d, ID>>,
+    {
+        timers::Policy::controller(timers, &mut state.deadlines)
+            .and_then(|timer| timer.deadline())
+            .into_iter()
+            .chain(service.and_then(|service| service.deadline(&state.service)))
+            .min()
+    }
 }
 
 impl<'w, 'd: 'w, ID: Identity + 'd, R, W, M, D, P, S, A> handler::Scoped<'w, 'd, ID>
@@ -223,7 +240,7 @@ where
     A: service::Select<R> + semantic::Timed<'d, service::Connection<'d, A>, Id<'d, ID>>,
     R::Head: request::Head<Start = S>,
     W: Execution + 'd,
-    receive::Scoped: receive::Mode<W>,
+    receive::Scoped<true>: receive::Mode<W>,
     M: Transport<'d, ID>,
     M::Output: flush::Evidence<'d>,
     M::Retention: Handoff,
@@ -318,22 +335,22 @@ where
                 {
                     parent.wake();
                 }
-                run.wakes::<A>(&mut state.service);
+                book::wakes::<ID, R, A>(run.state, parent, &mut state.service);
                 Ok(expiry)
             })();
             let (change, fault) = mode.finish();
             let pending = S::is_ready(&mut turn);
             (result, pending, change, fault)
         };
+        if let (Err(error), None) = (&result, &fault)
+            && input::pending(&mut conn, error)
+        {
+            result = Ok(Deadline::Ready);
+        }
         let arm = if (A::ENABLED && result.is_ok())
             || (!A::ENABLED && matches!(change, timers::Change::Changed))
         {
-            let state = conn.state_mut();
-            let deadline = timers::Policy::controller(this.deadlines, &mut state.deadlines)
-                .and_then(|timer| timer.deadline())
-                .into_iter()
-                .chain(this.service.deadline(&state.service))
-                .min();
+            let deadline = Self::deadline(this.deadlines, conn.state_mut(), Some(this.service));
             Some(state::try_sync(deadline, &mut conn))
         } else {
             None
@@ -379,7 +396,7 @@ where
     R: Runtime<'d, Target = Target<'d, ID>>,
     A: service::Select<R> + semantic::Timed<'d, service::Connection<'d, A>, Id<'d, ID>>,
     W: Execution + 'd,
-    receive::Scoped: receive::Mode<W>,
+    receive::Scoped<true>: receive::Mode<W>,
     M: Transport<'d, ID>,
     M::Output: flush::Evidence<'d>,
     M::Retention: Handoff,
@@ -393,8 +410,19 @@ where
     type WireFailure = P;
     type Retirement = task::Retire;
     type Egress = data::Bound<M::Output, A::Egress<'d>>;
-    type Input = receive::Scoped;
+    type Input = receive::Scoped<true>;
     type Send = send::Reported<send::Run>;
+
+    fn is_gated(conn: &Self::Conn) -> bool {
+        conn.carrier.status().input_blocked()
+    }
+
+    fn is_blocked(
+        self: pin::Pin<&Self>,
+        conn: Ref<'_, '_, '_, '_, 'd, ID, W, Self::Conn, Self::Egress>,
+    ) -> bool {
+        !conn.state().carrier.output().is_empty()
+    }
 
     fn deadline(self: pin::Pin<&Self>, _: clock::Clock<'_, 'd>) -> Option<clock::Deadline<'d>> {
         None
@@ -474,14 +502,7 @@ where
                 return handler::Timeout::CloseAfter;
             }
         };
-        let due = {
-            let state = conn.state_mut();
-            timers::Policy::controller(this.deadlines, &mut state.deadlines)
-                .and_then(|ctl| ctl.deadline())
-                .into_iter()
-                .chain(service.deadline(&state.service))
-                .min()
-        };
+        let due = Self::deadline(this.deadlines, conn.state_mut(), Some(service));
         if matches!(turn, Deadline::Wake | Deadline::Expired) {
             conn.wake_target().wake();
         }
@@ -613,7 +634,7 @@ where
         let scope = owner::Scope::Exact(owner::Owner::from(id));
         let task = Runtime::has_work(router.as_ref(), scope);
         let now = driver.driver_ref().clock().now();
-        let (result, expiry, change, timer_fault) = {
+        let (mut result, expiry, change, timer_fault) = {
             let state = conn.state_mut();
             let builds = !state.book.build_ready.is_empty();
             let input = A::ENABLED
@@ -679,17 +700,7 @@ where
             };
             mode.observe_head(turn.connection);
             if result.is_ok() {
-                drive::Drive {
-                    router: router.as_mut(),
-                    tasks,
-                    conn: id,
-                    parent,
-                    index,
-                    state: &mut turn,
-                    limits: *limits,
-                    mode: &mut mode,
-                }
-                .wakes::<A>(&mut state.service);
+                book::wakes::<ID, R, A>(&mut turn, parent, &mut state.service);
             }
             let (change, error) = mode.finish();
             if <R::Head as request::Head>::Start::is_ready(&mut turn) {
@@ -697,17 +708,15 @@ where
             }
             (result, expiry, change, error)
         };
+        if let (Err(error), None) = (&result, &timer_fault)
+            && input::pending(&mut conn, error)
+        {
+            result = Ok(());
+        }
         if (A::ENABLED && result.is_ok())
             || (!A::ENABLED && matches!(change, timers::Change::Changed))
         {
-            let deadline = {
-                let state = conn.state_mut();
-                timers::Policy::controller(timers, &mut state.deadlines)
-                    .and_then(|timer| timer.deadline())
-                    .into_iter()
-                    .chain(service.deadline(&state.service))
-                    .min()
-            };
+            let deadline = Self::deadline(timers, conn.state_mut(), Some(service));
             let arm = state::try_sync(deadline, &mut conn);
             if matches!(
                 Self::arm_transport(&mut conn, driver, arm, mode, fault),
@@ -792,7 +801,7 @@ where
     R: Runtime<'d, Target = Target<'d, ID>>,
     A: service::Select<R> + semantic::Timed<'d, service::Connection<'d, A>, Id<'d, ID>>,
     W: Execution + 'd,
-    receive::Scoped: receive::Mode<W>,
+    receive::Scoped<true>: receive::Mode<W>,
     M: Transport<'d, ID>,
     M::Output: flush::Evidence<'d>,
     M::Retention: Handoff,
@@ -817,7 +826,7 @@ where
     R: Runtime<'d, Target = Target<'d, ID>>,
     A: service::Select<R> + semantic::Timed<'d, service::Connection<'d, A>, Id<'d, ID>>,
     W: Execution + 'd,
-    receive::Scoped: receive::Mode<W>,
+    receive::Scoped<true>: receive::Mode<W>,
     M: Transport<'d, ID>,
     M::Output: flush::Evidence<'d>,
     M::Retention: Handoff,
@@ -915,7 +924,7 @@ where
                     ),
                 };
             }
-            run.wakes::<A>(&mut state.service);
+            book::wakes::<ID, R, A>(run.state, parent, &mut state.service);
             let local = <R::Head as request::Head>::Start::has_local(run.state);
             let active = run.state.has_input() || run.state.responses.has_runnable();
             let wake = local || input || active;
@@ -930,19 +939,11 @@ where
             }
         };
         if A::ENABLED || matches!(change, timers::Change::Changed) {
-            let next = {
-                let state = conn.state_mut();
-                let deadline = timers::Policy::controller(this.deadlines, &mut state.deadlines)
-                    .and_then(|timer| timer.deadline());
-                if A::ENABLED {
-                    deadline
-                        .into_iter()
-                        .chain(service.deadline(&state.service))
-                        .min()
-                } else {
-                    deadline
-                }
-            };
+            let next = Self::deadline(
+                this.deadlines,
+                conn.state_mut(),
+                A::ENABLED.then_some(&*service),
+            );
             let arm = state::try_sync(next, &mut conn);
             if matches!(
                 Self::arm_transport(&mut conn, driver, arm, this.mode, fault),

@@ -203,10 +203,6 @@ impl<C: session::Storage> Outbound<C> {
         self.bytes.capacity() - limits::Capacity::RESET_SLACK
     }
 
-    pub(in crate::conn) fn set_barrier(&mut self, barrier: Barrier) {
-        self.terminal_barrier = barrier;
-    }
-
     fn initialize<R: crate::Role>(
         &mut self,
         settings: config::Wire,

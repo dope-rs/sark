@@ -87,11 +87,11 @@ impl<'input> buffer::Read<'input> for View<'input> {
 
 // SAFETY: The gate changes only copy/share policy; both preserve the immutable view bytes.
 unsafe impl<'d> hold::raw::Retain<'d> for Gate {
-    fn charge<'a>(plan: &Self::View<'a>) -> hold::Charge
+    fn resident<'a>(plan: &Self::View<'a>) -> usize
     where
         Self: 'a,
     {
-        <Shared as hold::raw::Retain<'d>>::charge(&plan.view)
+        <Shared as hold::raw::Retain<'d>>::resident(&plan.view)
     }
 
     fn try_retain<'a>(

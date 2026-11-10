@@ -186,15 +186,12 @@ where
         let ready = if self.work.retry_next && blocked.is_some() {
             None
         } else {
-            active.pop::<1>(self.work.output)
+            active.pop::<1>()
         };
         let index = match ready {
             Some(entry) => {
                 self.work.retry_next = true;
-                let index = entry.index().raw();
-                let next = index + 1;
-                self.work.output = if next == active.capacity() { 0 } else { next };
-                index
+                entry.index().raw()
             }
             None => {
                 let entry = blocked?;
@@ -219,14 +216,7 @@ where
         &mut self,
         active: &'a active::Signals,
     ) -> Option<active::Entry<'r>> {
-        let entry = active.pop::<0>(self.work.semantic)?;
-        let index = entry.index().raw();
-        self.work.semantic = if index + 1 == active.capacity() {
-            0
-        } else {
-            index + 1
-        };
-        self.calls.entry_at(index)
+        self.calls.entry_at(active.pop::<0>()?.index().raw())
     }
 
     pub(in crate::server::runtime) fn discard(&mut self, entry: active::Entry<'r>, conn: &mut S) {

@@ -146,6 +146,10 @@ where
         self.conn.state.lifecycle.is_closing()
     }
 
+    pub(crate) fn input_blocked(&self) -> bool {
+        self.conn.ingress.decoder_blocked
+    }
+
     pub fn has_stream(&self, id: stream::Id) -> bool {
         self.stream_key(id).is_some()
     }

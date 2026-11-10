@@ -54,9 +54,6 @@ where
         self,
         report: impl FnMut(Id<'d, ID>, stream::Key, &dyn std::fmt::Debug),
     ) -> Result<(), conn::Error> {
-        if !self.state.connection.streams().headers().is_ready() {
-            return Ok(());
-        }
         let Some((stream, routed)) = self.state.data().take_route() else {
             return Ok(());
         };

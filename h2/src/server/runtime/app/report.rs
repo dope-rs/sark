@@ -67,7 +67,7 @@ where
     A: Spec,
     App<'d, A, W, Self, E>: Application<'d, ID, Wire = W>,
     W: Execution + 'd,
-    receive::Scoped: receive::Mode<W>,
+    receive::Scoped<true>: receive::Mode<W>,
     F: for<'a> FnMut(
         Failure<
             'a,

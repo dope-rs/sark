@@ -58,12 +58,9 @@ where
     }
 
     pub(super) fn finish_drain(&mut self, service: schedule::Quiescence) -> handler::Drain {
-        let activity = self.activity(service);
-        if matches!(
-            self.carrier.control().finish(activity),
-            machine::ops::Drain::Complete
-        ) {
-            return handler::Drain::Complete;
+        if self.carrier.status().is_draining() {
+            let activity = self.activity(service);
+            self.carrier.control().finish(activity);
         }
         match self.carrier.status().is_closing() {
             true => handler::Drain::Complete,

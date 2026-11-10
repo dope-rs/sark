@@ -29,7 +29,7 @@ where
     R: Runtime<'d, Target = Target<'d, ID>>,
     A: service::Select<R> + semantic::Timed<'d, service::Connection<'d, A>, Id<'d, ID>>,
     W: Execution + 'd,
-    receive::Scoped: receive::Mode<W>,
+    receive::Scoped<true>: receive::Mode<W>,
     M: Transport<'d, ID>,
     M::Output: flush::Evidence<'d>,
     M::Retention: Handoff,

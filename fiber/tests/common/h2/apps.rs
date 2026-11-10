@@ -301,6 +301,8 @@ pub(crate) async fn repark(state: &State, timer: Timer<'_>) -> StaticReply<'d> {
     }
 }
 
+pub(crate) const RETAINED_NAME: &[u8] = &[b'h'; 1024];
+
 #[sark_fiber::handler(pub)]
 pub(crate) async fn retained_header<'d>(
     request: HeaderReq,
@@ -325,7 +327,7 @@ pub(crate) async fn retained_header<'d>(
         || request.team_id.as_slice().as_ptr() != team_ptr
         || request.user_id.as_slice().as_ptr() != user_ptr
         || request.authority.as_slice() != b"localhost"
-        || request.name.as_slice() != b"first-indexed-final-owner"
+        || request.name.as_slice() != RETAINED_NAME
         || request.req.as_slice() != b"request-query"
         || request.team_id.as_slice() != b"alpha"
         || request.user_id.as_slice() != b"beta"

@@ -36,10 +36,6 @@ pub enum Error {
         requested: usize,
         capacity: usize,
     },
-    Remainder {
-        consumed: usize,
-        total: usize,
-    },
     BodyCount {
         expected: segments::Count,
         actual: segments::Count,

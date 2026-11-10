@@ -43,11 +43,11 @@ impl<R: buffer::Cursor> buffer::Cursor for Source<'_, R> {
 
 // SAFETY: Selection offsets and retention preserve the original proven source view.
 unsafe impl<'d, R: buffer::Cursor + hold::raw::Retain<'d>> hold::raw::Retain<'d> for Source<'_, R> {
-    fn charge<'a>(plan: &Self::View<'a>) -> hold::Charge
+    fn resident<'a>(plan: &Self::View<'a>) -> usize
     where
         Self: 'a,
     {
-        R::charge(plan)
+        R::resident(plan)
     }
 
     fn try_retain<'a>(

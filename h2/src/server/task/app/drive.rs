@@ -569,27 +569,7 @@ where
                     .batch::<A>(work, turn.driver(), fault.response()),
             );
         }
-        self.wakes::<A>(state);
+        book::wakes::<ID, R, A>(self.state, self.parent, state);
         Ok(progress)
-    }
-
-    pub(super) fn wakes<A>(&mut self, state: &mut service::State<'d, ID, A>)
-    where
-        A: service::Select<R, Fields = F>
-            + sark_core::manifold::server::app::Application<
-                'd,
-                service::Connection<'d, A>,
-                conn::Id<'d, ID>,
-            >,
-    {
-        if !A::ENABLED {
-            return;
-        }
-        while let Some(wake) = self.state.connection.flow().poll_wake() {
-            let http = self.state.responses.wake(wake) != 0;
-            if A::wake(state, wake) || http {
-                self.parent.wake();
-            }
-        }
     }
 }

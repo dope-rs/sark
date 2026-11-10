@@ -86,7 +86,7 @@ where
     where
         F: Bind<'d, Target = Target<'d, ID>>,
         <<F::Runtime as decode::Decode>::Head as request::Head>::Start: works::Family,
-        task::App<'d, ID, F::Runtime, W, M, D, P>: handler::Application<'d, ID, Wire = W, Input = receive::Scoped, Egress = E>
+        task::App<'d, ID, F::Runtime, W, M, D, P>: handler::Application<'d, ID, Wire = W, Input = receive::Scoped<true>, Egress = E>
             + handler::Runtime<'w, 'd, ID>,
     {
         self.bind(factory, deadlines, service::Native::new(), driver)
@@ -106,7 +106,7 @@ where
         F: Bind<'d, Target = Target<'d, ID>>,
         <<F::Runtime as decode::Decode>::Head as request::Head>::Start: works::Family,
         A: service::Select<F::Runtime>,
-        task::App<'d, ID, F::Runtime, W, M, D, P, A>: handler::Application<'d, ID, Wire = W, Input = receive::Scoped, Egress = E>
+        task::App<'d, ID, F::Runtime, W, M, D, P, A>: handler::Application<'d, ID, Wire = W, Input = receive::Scoped<true>, Egress = E>
             + handler::Runtime<'w, 'd, ID>,
     {
         let binding = self.listener.binding(driver.driver_ref());
@@ -149,7 +149,7 @@ where
         F: Bind<'d, Target = Target<'d, ID>>,
         <<F::Runtime as decode::Decode>::Head as request::Head>::Start: works::Family,
         A: service::Select<F::Runtime>,
-        task::App<'d, ID, F::Runtime, W, mode::Disabled, D, P, A>: handler::Application<'d, ID, Wire = W, Input = receive::Scoped, Egress = E>
+        task::App<'d, ID, F::Runtime, W, mode::Disabled, D, P, A>: handler::Application<'d, ID, Wire = W, Input = receive::Scoped<true>, Egress = E>
             + handler::Runtime<'w, 'd, ID>,
     {
         self.bind(factory, deadlines, service, driver)
@@ -266,7 +266,7 @@ impl<ID: Identity, F, M, P> Tasks<ID, F, M, P> {
         S: storage::Plan,
         Q: executor::Startup,
         <<F::Runtime as decode::Decode>::Head as request::Head>::Start: works::Family,
-        task::App<'d, ID, F::Runtime, W, M, D, P>: handler::Application<'d, ID, Wire = W, Input = receive::Scoped>
+        task::App<'d, ID, F::Runtime, W, M, D, P>: handler::Application<'d, ID, Wire = W, Input = receive::Scoped<true>>
             + handler::Runtime<'life, 'd, ID>,
         N: for<'n, 'p, 's> FnOnce(
             Bound<'n, 'p, 's, 'life, 'd, ID, F::Runtime, W, M, D, P>,

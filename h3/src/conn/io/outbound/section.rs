@@ -66,7 +66,7 @@ impl<'q, 'd> Section<'q, 'd> {
                     leading: lead_len,
                     fields,
                 })?;
-            let fields = section.prefix_len();
+            let fields = fields - section.lines().len();
             let head_len = lead_len
                 .checked_add(fields)
                 .ok_or(conn::Error::SectionPrefix {

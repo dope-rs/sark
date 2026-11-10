@@ -196,7 +196,9 @@ where
             net::Event::Settled(settled) => {
                 let outcome = match settled.outcome() {
                     net::Outcome::Sent(bytes) => Outcome::Sent { bytes: *bytes },
-                    net::Outcome::Failed(errno) => Outcome::Failed { errno: *errno },
+                    net::Outcome::Failed(errno) | net::Outcome::GsoFailed(errno) => {
+                        Outcome::Failed { errno: *errno }
+                    }
                     net::Outcome::Submit(error) => {
                         if error.cause() == SubmitCause::IdentityExhausted {
                             failure::Sink::failure(observer, failure::Event::Submit(*error));

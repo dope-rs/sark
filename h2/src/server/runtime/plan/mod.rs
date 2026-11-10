@@ -197,6 +197,6 @@ pub(super) fn receive_claim(receive: settings::Receive) -> claim::Claim {
 impl<ID: Identity> settings::Resource for Plan<ID> {
     fn include_in(&self, needs: claim::Needs) -> Result<claim::Needs, errors::Claim> {
         let needs = needs.include(receive_claim(self.connection.receive()))?;
-        Layout::<ID, receive::Scoped>::new(self.listener.connections()).include_in(needs)
+        Layout::<ID, receive::Scoped<true>>::new(self.listener.connections()).include_in(needs)
     }
 }

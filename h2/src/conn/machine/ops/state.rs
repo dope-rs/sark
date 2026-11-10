@@ -194,7 +194,6 @@ impl<R: crate::Role> State<R> {
     ) -> Result<(), conn::Error> {
         let retired = self.retire_write::<C, E>(egress, key.id());
         let outbound = &mut egress.outbound;
-        outbound.set_barrier(outputs::Barrier::Blocked);
         self.flush_resets(outbound);
         if let Some(notify) = notify {
             notify.commit(key, error, retired);

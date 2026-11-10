@@ -87,11 +87,7 @@ impl Signals {
 
     pub(in crate::server::runtime) fn pop<const PLANE: usize>(
         &self,
-        cursor: usize,
     ) -> Option<set::Entry<&set::State<config::Call, usize, 3>, config::Call, usize, 3>> {
-        self.sets
-            .get::<PLANE>()
-            .pop_from(index::Ordinal::new(cursor))
-            .map(set::Entry::into_entry)
+        set::Entry::take_front(&self.sets, set::Id::at::<PLANE>()).map(set::Entry::into_entry)
     }
 }

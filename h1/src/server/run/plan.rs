@@ -266,7 +266,9 @@ impl<ListenerId: Identity, DateId: Identity, P, D> Plan<ListenerId, DateId, P, r
 where
     P: settings::Profile + timing::Policy,
 {
-    pub fn scoped(self) -> Plan<ListenerId, DateId, P, receive::Scoped, D> {
+    pub fn scoped<const GATED: bool>(
+        self,
+    ) -> Plan<ListenerId, DateId, P, receive::Scoped<GATED>, D> {
         Plan {
             listener: self.listener,
             bound: self.bound,

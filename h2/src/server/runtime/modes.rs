@@ -84,20 +84,20 @@ impl<E> Failure for Serve<E> {
 }
 
 impl factory::ReceiveSpec for Sync {
-    type Input = receive::Scoped;
+    type Input = receive::Scoped<true>;
 }
 
 impl<E> factory::ReceiveSpec for Serve<E> {
-    type Input = receive::Scoped;
+    type Input = receive::Scoped<true>;
 }
 
 impl<T, W, F, ID: Identity> Direct<Sync, W, ID> for (T, F)
 where
     T: for<'d> sync::Dispatch<'d>,
     W: input::Execution,
-    receive::Scoped: receive::Mode<W>,
+    receive::Scoped<true>: receive::Mode<W>,
     for<'d> App<'d, sync::Route<T>, W, F>: handler::Runtime<'d, 'd, ID>
-        + handler::Application<'d, ID, Wire = W, Input = receive::Scoped>,
+        + handler::Application<'d, ID, Wire = W, Input = receive::Scoped<true>>,
 {
     type Application<'d>
         = App<'d, sync::Route<T>, W, F>
@@ -161,53 +161,33 @@ where
         driver: &mut driver::Context<'_, 'd>,
     ) {
         let owner = conn.id();
-        let work = conn.work();
         let wake = conn.wake_target();
-        let app = &mut run.app;
-        let fault = &mut run.fault;
-        let result = loop {
+        loop {
             let progress = match flush::finish(conn, driver, None, &mut mode::Disabled) {
                 Ok(progress) => progress,
                 Err((cause, progress)) => {
                     <F as Fault<'d, W, A::Failure, ID, runtime::Build<A::Build>>>::output(
-                        fault, owner, cause,
+                        &mut run.fault,
+                        owner,
+                        cause,
                     );
                     progress
                 }
             };
-            match progress {
-                Progress::Blocked => break Ok(()),
-                Progress::Committed => {}
+            if matches!(progress, Progress::Blocked) {
+                return;
             }
-            let state = conn.state_mut();
-            if state.carrier.status().is_closing() {
+            if conn.state().carrier.status().is_closing() {
                 continue;
             }
-            let mut turn = app::Turn::new(owner, work, wake, driver);
-            let progress = match app.drive(
-                &mut state.app,
-                &mut state.carrier,
-                &mut turn,
-                schedule::Egress::Released,
-                &mut *fault,
-                |_, conn, drain, _| Ok(drain.next(conn)),
-                |_, _| {},
-                |_, _| {},
-                |fault, cause| {
-                    <F as Fault<'d, W, A::Failure, ID, runtime::Build<A::Build>>>::diagnostic(
-                        fault, owner, cause,
-                    );
-                },
-            ) {
+            let progress = match run.resume(conn, driver, schedule::Egress::Released, None) {
                 Ok(progress) => progress,
-                Err(error) => break Err(error),
+                Err(error) if runtime::input::pending(conn, &error) => continue,
+                Err(error) => return run.fail(conn, driver, error),
             };
             if progress.is_exhausted() {
                 wake.wake();
             }
-        };
-        if let Err(error) = result {
-            run.fail(conn, driver, error);
         }
     }
 
@@ -235,6 +215,9 @@ where
         driver: &mut driver::Context<'_, 'd>,
     ) {
         <timing::Off as Deadline<'d, ID, A, W, F, E>>::flush(run, conn, driver);
+        if conn.state().carrier.status().is_closing() {
+            return;
+        }
         let due = app::Timed::deadline(&run.app, &conn.state().app);
         if let Err(cause) = state::try_sync(due, conn) {
             conn.deadline().reject(cause);
@@ -258,7 +241,10 @@ where
         conn: &mut Context<'_, '_, '_, '_, '_, 'd, ID, A, W, E>,
         driver: &mut driver::Context<'_, 'd>,
     ) -> handler::Timeout<'d> {
-        run.activate::<ID, timing::Off>(conn, driver, schedule::Egress::Unchanged);
+        run.activate::<ID, timing::Off>(conn, driver, schedule::Egress::Unchanged, None);
+        if conn.state().carrier.status().is_closing() {
+            return handler::Timeout::Discard;
+        }
         let update = app::Timed::deadline(&run.app, &conn.state().app)
             .map_or(handler::Deadline::Clear, handler::Deadline::Arm);
         handler::Timeout::Continue(update)

@@ -291,7 +291,9 @@ pub(super) fn extras<'emit, 'source, 'spec>(
         let config = duplex::State::Enabled.config(paths);
         let input = match duplex {
             duplex::State::Enabled => input.clone(),
-            duplex::State::Disabled => quote!(#ns_fiber::dope::manifold::app::receive::Scoped),
+            duplex::State::Disabled => {
+                quote!(#ns_fiber::dope::manifold::app::receive::Scoped<true>)
+            }
         };
         let captures = decls.iter().filter_map(|param| match param {
             syn::GenericParam::Type(param) => Some(&param.ident),
