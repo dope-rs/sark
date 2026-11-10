@@ -94,7 +94,7 @@ impl<H, M, ID: Identity> Logic<H, M, ID> {
             return;
         }
         let head = match head {
-            Ok(head) => head,
+            Ok(ref head) => head,
             Err(error) => {
                 parser.phase = protocol::Phase::Closed;
                 Self::close(&mut ctx.parts(), client::CloseReason::Decode(error));
@@ -103,9 +103,9 @@ impl<H, M, ID: Identity> Logic<H, M, ID> {
         };
         let mut parts = ctx.parts();
         let conn = parts.conn_id;
-        match head.0 {
+        let message = match &head.0 {
             protocol::Kind::Opened { accept } => {
-                match parts.state.open(accept) {
+                match parts.state.open(*accept) {
                     protocol::Handshake::Opened => {
                         match port.shared.conn_id.bind(conn, Connection::Open) {
                             identity::Bind::Bound => {}
@@ -126,32 +126,38 @@ impl<H, M, ID: Identity> Logic<H, M, ID> {
                 port.shared.wake_waiter();
                 port.shared.wake();
                 M::open(&mut self.handler, port, &mut parts);
+                return;
             }
-            protocol::Kind::Frame(frame) => {
-                M::message(&mut self.handler, frame.message(), &mut parts)
-            }
-            protocol::Kind::Continuation => {}
-            protocol::Kind::Control(event) => match &event {
-                protocol::Control::Ping(payload) => M::message(
+            protocol::Kind::Text(text) => client::Message::Text(text.as_str()),
+            protocol::Kind::AssembledText(text) => client::Message::Text(text.as_str()),
+            protocol::Kind::Binary(bytes) => client::Message::Binary(bytes.as_slice()),
+            protocol::Kind::AssembledBinary(bytes) => client::Message::Binary(bytes.as_slice()),
+            protocol::Kind::Pong(bytes) => client::Message::Pong(bytes.as_slice()),
+            protocol::Kind::Ping(bytes) => {
+                M::message(
                     &mut self.handler,
-                    client::Message::Ping(payload.as_slice()),
+                    client::Message::Ping(bytes.as_slice()),
                     &mut parts,
-                ),
-                protocol::Control::Close(close) => {
-                    parser.phase = protocol::Phase::Closed;
-                    port.shared.conn_id.clear(conn);
-                    port.shared.wake();
-                    let reason = match close.reason().try_to_owned() {
-                        Ok(reason) => client::CloseReason::RemoteClose {
-                            code: close.code(),
-                            reason,
-                        },
-                        Err(error) => client::CloseReason::Allocation(error),
-                    };
-                    Self::close(&mut parts, reason);
-                }
-            },
-        }
+                );
+                return;
+            }
+            protocol::Kind::Continuation => return,
+            protocol::Kind::Close(close) => {
+                parser.phase = protocol::Phase::Closed;
+                port.shared.conn_id.clear(conn);
+                port.shared.wake();
+                let reason = match close.reason().try_to_owned() {
+                    Ok(reason) => client::CloseReason::RemoteClose {
+                        code: close.code(),
+                        reason,
+                    },
+                    Err(error) => client::CloseReason::Allocation(error),
+                };
+                Self::close(&mut parts, reason);
+                return;
+            }
+        };
+        M::message(&mut self.handler, message, &mut parts);
     }
 
     fn prepare<'d>(

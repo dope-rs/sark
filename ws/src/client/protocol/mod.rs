@@ -31,7 +31,7 @@ pub(in crate::client) mod raw;
 
 mod head;
 pub use head::Head;
-pub(super) use head::{Control, Kind};
+pub(super) use head::Kind;
 
 pub(super) enum Phase {
     Connecting,
