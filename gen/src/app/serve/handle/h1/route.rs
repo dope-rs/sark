@@ -338,7 +338,7 @@ pub(super) fn emit<'view, 'source, 'spec>(
                         let #v_make = #v_this.#f_makers.#index;
                         #ns_h1::route::task::Endpoint::new(
                             #v_conn,
-                        ).dispatch::<#route, _, _, _, _>(
+                        ).dispatch::<#route, _, _, _>(
                             #n_seq,
                             #v_permit,
                             #n_shead,

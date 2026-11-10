@@ -152,17 +152,17 @@ impl<'d, R: route::Spec<Request: route::Own<RawParams = (), Mode = route::Stream
         let mut conn: session::Conn = session::Conn::default();
         let mut input = None;
         let mut attempts = 0;
-        let admit = |request, consumed, close, _, _: &mut ()| {
-            input = Some(request);
-            session::Outcome::<Infallible>::Park { consumed, close }
-        };
-        let outcome = task::Endpoint::new(&mut conn).dispatch::<R, _, _, _, _>(
+        let outcome = task::Endpoint::new(&mut conn).dispatch::<R, _, _, _>(
             id,
             session::Permit::new(),
             head,
-            || {
+            |request, consumed, close, _, _: &mut ()| {
                 attempts += 1;
-                accept.then_some(admit)
+                if !accept {
+                    return session::Outcome::Close(canned::SERVICE_UNAVAILABLE);
+                }
+                input = Some(request);
+                session::Outcome::<Infallible>::Park { consumed, close }
             },
             |pending, parts, proof| pending.try_discard(parts, proof),
             credit::Disabled::new(),
@@ -268,11 +268,11 @@ where
         let id = this.id;
         let admit = |input, consumed, close, _, _: &mut ()| this.admit(input, consumed, close);
         task::Endpoint::new(conn)
-            .dispatch::<R, _, _, _, _>(
+            .dispatch::<R, _, _, _>(
                 id,
                 permit,
                 head,
-                || Some(admit),
+                admit,
                 |pending, parts, proof| pending.try_discard(parts, proof),
                 credit::Disabled::new(),
             )
@@ -337,13 +337,7 @@ where
     ) -> session::BodyOutcome<'d, Self::Ready> {
         let this = self.get_mut();
         let admit = |input, consumed, close, _, _: &mut ()| this.admit(input, consumed, close);
-        pending.finish(
-            complete,
-            permit,
-            runtime,
-            || Some(admit),
-            credit::Disabled::new(),
-        )
+        pending.finish(complete, permit, runtime, admit, credit::Disabled::new())
     }
 
     fn resume_body(
@@ -355,6 +349,6 @@ where
     ) -> session::BodyOutcome<'d, Self::Ready> {
         let this = self.get_mut();
         let admit = |input, consumed, close, _, _: &mut ()| this.admit(input, consumed, close);
-        ready.resume(permit, runtime, || Some(admit), credit::Disabled::new())
+        ready.resume(permit, runtime, admit, credit::Disabled::new())
     }
 }

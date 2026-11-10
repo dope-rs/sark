@@ -7,7 +7,6 @@ use sark_core::{
     route,
 };
 use sark_http::{
-    h1::codec::canned,
     payload::{fixed, owned},
     request::Id,
 };
@@ -41,19 +40,18 @@ where
         Self { connection: conn }
     }
 
-    pub fn dispatch<R, Source, Admit, Feed, E>(
+    pub fn dispatch<R, Admit, Feed, E>(
         self,
         id: Id<'d>,
         permit: session::Permit,
         found: framing::Head<'_, '_, R>,
-        source: Source,
+        admit: Admit,
         feed: Feed,
         mut proof: E,
     ) -> session::RouteOutcome<'d, Pending<'d, R>, Transitions::Raw>
     where
         R: route::Spec<Request: route::Own>,
         <R::Request as route::Own>::Mode: Mode<'d, R>,
-        Source: FnOnce() -> Option<Admit>,
         Admit: FnOnce(
             Input<'d, R>,
             usize,
@@ -127,9 +125,6 @@ where
             Err(reason) => {
                 return reason.into_consume().into();
             }
-        };
-        let Some(admit) = source() else {
-            return session::Outcome::Close(canned::SERVICE_UNAVAILABLE).into();
         };
         admit(
             input,

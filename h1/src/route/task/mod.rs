@@ -400,16 +400,15 @@ impl<'d, R: route::Spec<Request: route::Own>> Streaming<'d, R> {
         }
     }
 
-    pub fn finish<Runtime, Source, Admit, E, D>(
+    pub fn finish<Runtime, Admit, E, D>(
         self,
         done: session::Complete,
         permit: session::Permit,
         rt: &mut Runtime,
-        source: Source,
+        admit: Admit,
         mut proof: E,
     ) -> session::BodyOutcome<'d, Ready<'d, R>, D>
     where
-        Source: FnOnce() -> Option<Admit>,
         Admit: FnOnce(
             Input<'d, R>,
             usize,
@@ -425,7 +424,7 @@ impl<'d, R: route::Spec<Request: route::Own>> Streaming<'d, R> {
                 return session::BodyOutcome::Complete(session::Outcome::Close(reply));
             }
         };
-        Ready { pending }.complete(done.consumed, permit, rt, source, proof)
+        Ready { pending }.complete(done.consumed, permit, rt, admit, proof)
     }
 }
 
@@ -443,15 +442,14 @@ impl<'d, R: route::Spec<Request: route::Own>> Ready<'d, R> {
         self.pending.cancel(proof);
     }
 
-    pub fn resume<Runtime, Source, Admit, E, D>(
+    pub fn resume<Runtime, Admit, E, D>(
         self,
         permit: session::Permit,
         rt: &mut Runtime,
-        source: Source,
+        admit: Admit,
         proof: E,
     ) -> session::BodyOutcome<'d, Self, D>
     where
-        Source: FnOnce() -> Option<Admit>,
         Admit: FnOnce(
             Input<'d, R>,
             usize,
@@ -461,19 +459,18 @@ impl<'d, R: route::Spec<Request: route::Own>> Ready<'d, R> {
         ) -> session::Outcome<'d, D>,
         E: credit::Evidence,
     {
-        self.complete(0, permit, rt, source, proof)
+        self.complete(0, permit, rt, admit, proof)
     }
 
-    fn complete<Runtime, Source, Admit, E, D>(
+    fn complete<Runtime, Admit, E, D>(
         self,
         used: usize,
         permit: session::Permit,
         rt: &mut Runtime,
-        source: Source,
+        admit: Admit,
         mut proof: E,
     ) -> session::BodyOutcome<'d, Self, D>
     where
-        Source: FnOnce() -> Option<Admit>,
         Admit: FnOnce(
             Input<'d, R>,
             usize,
@@ -527,9 +524,6 @@ impl<'d, R: route::Spec<Request: route::Own>> Ready<'d, R> {
                     let reply = Streaming::<R>::discard(ready.into_release(), ledger, proof, reply);
                     return Err(session::Outcome::Close(reply));
                 }
-            };
-            let Some(admit) = source() else {
-                return Err(session::Outcome::Close(canned::SERVICE_UNAVAILABLE));
             };
             Err(admit(Input::Ready { request }, used, close, response, rt))
         });

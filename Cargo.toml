@@ -38,7 +38,7 @@ dope-net = "0.68.0"
 dope-runtime = "0.68.0"
 dope-tls = "0.58.0"
 dope-quic = "0.59.3"
-o3 = "0.52.2"
+o3 = "0.52.4"
 dope-test = "0.68.0"
 pin-project = "1"
 prost = { version = "=0.14.4", default-features = false, features = ["std"] }

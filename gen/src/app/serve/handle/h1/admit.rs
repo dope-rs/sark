@@ -24,6 +24,7 @@ pub(in crate::app::serve::handle) fn fiber(
     let ns_core = &paths.core;
     let ns_fiber = &paths.fiber;
     let ns_h1 = &paths.h1;
+    let ns_http = &paths.http;
     use quote::quote;
 
     let stored = if task.is_stream() {
@@ -33,34 +34,35 @@ pub(in crate::app::serve::handle) fn fiber(
     };
     quote! {{
         let #n_source = #n_tasks.as_mut();
-        move || {
-            #ns_fiber::dope_fiber::task::storage::fixed::direct::Source::admit(#n_source).map(
-                |#n_admit| {
-                    move |
-                        #n_input: #ns_core::manifold::task::request::Input<'d, #route>,
-                        #n_used,
-                        #n_close,
-                        #n_resp: #ns_h1::wire::response::Context,
-                        #n_run: &mut #runtime,
-                    | {
-                        let #n_task = (#make)((#n_input, #state, #timer));
-                        let #n_task = #ns_fiber::dope_fiber::task::storage::fixed::direct::Insert::insert(
-                            #n_admit,
-                            #stored,
-                        );
-                        #n_run.insert(
-                            #ns_h1::server::task::runtime::Running::fiber(
-                                #identity::#variant(#n_task),
-                                #n_resp,
-                            ),
-                        );
-                        #ns_h1::session::Outcome::Park {
-                            consumed: #n_used,
-                            close: #n_close,
-                        }
-                    }
-                },
-            )
+        move |
+            #n_input: #ns_core::manifold::task::request::Input<'d, #route>,
+            #n_used,
+            #n_close,
+            #n_resp: #ns_h1::wire::response::Context,
+            #n_run: &mut #runtime,
+        | {
+            let ::core::option::Option::Some(#n_admit) =
+                #ns_fiber::dope_fiber::task::storage::fixed::direct::Source::admit(#n_source)
+            else {
+                return #ns_h1::session::Outcome::Close(
+                    #ns_http::h1::codec::canned::SERVICE_UNAVAILABLE,
+                );
+            };
+            let #n_task = (#make)((#n_input, #state, #timer));
+            let #n_task = #ns_fiber::dope_fiber::task::storage::fixed::direct::Insert::insert(
+                #n_admit,
+                #stored,
+            );
+            #n_run.insert(
+                #ns_h1::server::task::runtime::Running::fiber(
+                    #identity::#variant(#n_task),
+                    #n_resp,
+                ),
+            );
+            #ns_h1::session::Outcome::Park {
+                consumed: #n_used,
+                close: #n_close,
+            }
         }
     }}
 }

@@ -293,16 +293,13 @@ fn body_yields() {
                 .expect("complete framing");
             let mut conn: session::Conn = session::Conn::default();
             let outcome = task::Endpoint::new(&mut conn)
-                .dispatch::<Request<body::Segmented>, _, _, _, _>(
+                .dispatch::<Request<body::Segmented>, _, _, _>(
                     id,
                     session::Permit::new(),
                     head,
-                    || {
+                    |_, consumed, close, _, _: &mut ()| {
                         admitted.set(admitted.get() + 1);
-                        Some(|_, consumed, close, _, _: &mut ()| session::Outcome::Park {
-                            consumed,
-                            close,
-                        })
+                        session::Outcome::Park { consumed, close }
                     },
                     |pending, parts, proof| pending.try_retain(parts, proof),
                     &mut evidence,
@@ -316,39 +313,33 @@ fn body_yields() {
                 .try_retain(owned::Segments::from(source), &mut evidence)
                 .ok()
                 .expect("accepted body");
-            let outcome =
-                pending.finish(
-                    session::Complete {
-                        body_len: 1,
-                        consumed: 1,
-                    },
-                    session::Permit::new(),
-                    &mut (),
-                    || {
-                        admitted.set(admitted.get() + 1);
-                        Some(|_, consumed, close, _, _: &mut ()| {
-                            session::Outcome::<Infallible>::Park { consumed, close }
-                        })
-                    },
-                    &mut evidence,
-                );
+            let outcome = pending.finish(
+                session::Complete {
+                    body_len: 1,
+                    consumed: 1,
+                },
+                session::Permit::new(),
+                &mut (),
+                |_, consumed, close, _, _: &mut ()| {
+                    admitted.set(admitted.get() + 1);
+                    session::Outcome::<Infallible>::Park { consumed, close }
+                },
+                &mut evidence,
+            );
             let session::BodyOutcome::Pending(ready) = outcome else {
                 panic!("body assembly must yield on its first step");
             };
             assert_eq!(STEPS.get(), 1);
             assert_eq!(admitted.get(), 0);
-            let outcome =
-                ready.resume(
-                    session::Permit::new(),
-                    &mut (),
-                    || {
-                        admitted.set(admitted.get() + 1);
-                        Some(|_, consumed, close, _, _: &mut ()| {
-                            session::Outcome::<Infallible>::Park { consumed, close }
-                        })
-                    },
-                    &mut evidence,
-                );
+            let outcome = ready.resume(
+                session::Permit::new(),
+                &mut (),
+                |_, consumed, close, _, _: &mut ()| {
+                    admitted.set(admitted.get() + 1);
+                    session::Outcome::<Infallible>::Park { consumed, close }
+                },
+                &mut evidence,
+            );
             let session::BodyOutcome::Pending(ready) = outcome else {
                 panic!("body assembly must yield on its second step");
             };
@@ -357,25 +348,21 @@ fn body_yields() {
             let outcome = ready.resume(
                 session::Permit::new(),
                 &mut (),
-                || {
-                    Some(
-                        |input: request::Input<'_, Request<body::Segmented>>,
-                         consumed,
-                         close,
-                         _,
-                         _: &mut ()| {
-                            let request = match input {
-                                request::Input::Ready { request } => Some(request),
-                                request::Input::Buffered(_) => None,
-                            }
-                            .expect("completed body");
-                            let (_, body) = request.into_parts();
-                            let bytes = body.segment(0).expect("retained body");
-                            assert_eq!(bytes, b"x");
-                            assert_eq!(bytes.as_ptr(), pointer);
-                            session::Outcome::<Infallible>::Park { consumed, close }
-                        },
-                    )
+                |input: request::Input<'_, Request<body::Segmented>>,
+                 consumed,
+                 close,
+                 _,
+                 _: &mut ()| {
+                    let request = match input {
+                        request::Input::Ready { request } => Some(request),
+                        request::Input::Buffered(_) => None,
+                    }
+                    .expect("completed body");
+                    let (_, body) = request.into_parts();
+                    let bytes = body.segment(0).expect("retained body");
+                    assert_eq!(bytes, b"x");
+                    assert_eq!(bytes.as_ptr(), pointer);
+                    session::Outcome::<Infallible>::Park { consumed, close }
                 },
                 &mut evidence,
             );
@@ -445,11 +432,11 @@ fn buffered_body_starts_at_fin() {
                         .ok()
                         .expect("framing")
                         .expect("complete framing");
-                    let outcome = task::Endpoint::new(&mut conn).dispatch::<Buffered, _, _, _, _>(
+                    let outcome = task::Endpoint::new(&mut conn).dispatch::<Buffered, _, _, _>(
                         id,
                         session::Permit::new(),
                         head,
-                        || Some(tasks::admit_buffered),
+                        tasks::admit_buffered,
                         |pending, parts, proof| pending.try_retain(parts, proof),
                         &mut evidence,
                     );
@@ -482,7 +469,7 @@ fn buffered_body_starts_at_fin() {
                             },
                             session::Permit::new(),
                             &mut conn.async_state,
-                            || Some(tasks::admit_buffered),
+                            tasks::admit_buffered,
                             &mut evidence,
                         );
                         let session::BodyOutcome::Complete(outcome) = outcome else {

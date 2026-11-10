@@ -558,9 +558,9 @@ checksum = "1d87ecb2933e8aeadb3e3a02b828fed80a7528047e68b4f424523a0981a3a084"
 
 [[package]]
 name = "o3"
-version = "0.52.2"
+version = "0.52.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "530682dc867c30839c911beb3f7062327318b98273fd0af14973227d73a3c8bf"
+checksum = "0c4279007fdb45ce04250e79a7404dd09c514b00df801a982f1cdca3225f1c66"
 
 [[package]]
 name = "once_cell"

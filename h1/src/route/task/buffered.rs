@@ -5,10 +5,7 @@ use sark_core::{
     request::{Parts, raw::Parsed},
     route,
 };
-use sark_http::{
-    h1::codec::canned,
-    payload::{fixed, owned, response::Body as _},
-};
+use sark_http::payload::{fixed, owned, response::Body as _};
 
 use crate::{
     session,
@@ -119,16 +116,15 @@ impl<'d, R: route::Spec<Request: route::Own>> Pending<'d, R> {
         self.body.abandon(proof);
     }
 
-    pub fn finish<Runtime, Source, Admit, E, D>(
+    pub fn finish<Runtime, Admit, E, D>(
         self,
         done: session::Complete,
         permit: session::Permit,
         rt: &mut Runtime,
-        source: Source,
+        admit: Admit,
         mut proof: E,
     ) -> session::BodyOutcome<'d, super::Ready<'d, R>, D>
     where
-        Source: FnOnce() -> Option<Admit>,
         Admit: FnOnce(
             Input<'d, R>,
             usize,
@@ -177,9 +173,6 @@ impl<'d, R: route::Spec<Request: route::Own>> Pending<'d, R> {
                         reply,
                     ));
                 }
-            };
-            let Some(admit) = source() else {
-                return session::Outcome::Close(canned::SERVICE_UNAVAILABLE);
             };
             admit(
                 Input::Buffered(head.with_body(body)),
