@@ -76,7 +76,8 @@ fn closes_and_retries() {
             |worker| {
                 worker.lend(|setup, stage| {
                     setup.install(stage, |root, stage| {
-                        topology::lending::Stage::with_quiesce(
+                        let (root, wait) = root.into_parts();
+                        let result = topology::lending::Stage::with_quiesce(
                             stage,
                             completion,
                             root,
@@ -118,7 +119,9 @@ fn closes_and_retries() {
                                     )
                                     .expect("listener operation");
                             },
-                        )
+                        );
+                        assert!(wait.watch().error().is_none(), "listener accept");
+                        result
                     })
                 })
             },
@@ -217,7 +220,8 @@ fn switch_moves_tail_once() {
         |worker| {
             worker.lend(|setup, stage| {
                 setup.install(stage, |root, stage| {
-                    topology::lending::Stage::with_quiesce(
+                    let (root, wait) = root.into_parts();
+                    let result = topology::lending::Stage::with_quiesce(
                         stage,
                         completion,
                         root,
@@ -275,7 +279,9 @@ fn switch_moves_tail_once() {
                             assert_eq!(owner.get(), Some(7));
                             assert_eq!(raw.take().as_slice(), b"taillater");
                         },
-                    )
+                    );
+                    assert!(wait.watch().error().is_none(), "listener accept");
+                    result
                 })
             })
         },

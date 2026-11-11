@@ -4,15 +4,15 @@ use crate::{
 };
 
 mod duplex;
-pub(in crate::app::serve) mod layout;
+mod flat;
 mod task;
 
 pub(in crate::app::serve) use task::Task;
 
 pub(in crate::app::serve) struct TaskSpec<'a> {
-    capacity: &'a syn::Expr,
+    capacity: &'a Option<syn::Expr>,
     slot: usize,
-    path: layout::Path,
+    quota: Option<usize>,
 }
 
 pub(in crate::app::serve) struct RouteSpec<'a, M> {
@@ -67,26 +67,12 @@ pub(in crate::app::serve) struct Fiber<'a> {
     slot: usize,
     future: syn::Ident,
     maker: syn::Ident,
-    path: layout::Path,
+    quota: Option<usize>,
 }
 
 impl TaskSpec<'_> {
-    fn tag(&self, owner: &syn::Ident) -> syn::Ident {
-        quote::format_ident!("__{}TaskTag{:04}", owner, self.slot)
-    }
-
     fn variant(&self) -> syn::Ident {
         quote::format_ident!("Task{:04}", self.slot)
-    }
-
-    const fn path(&self) -> &layout::Path {
-        &self.path
-    }
-}
-
-impl Fiber<'_> {
-    pub(in crate::app::serve) const fn path(&self) -> &layout::Path {
-        &self.path
     }
 }
 
@@ -139,12 +125,10 @@ impl Fiber<'_> {
 pub(in crate::app::serve) struct Execution<'a, 'spec> {
     tasks: Vec<Task<'a, 'spec>>,
     fibers: Vec<(Task<'a, 'spec>, &'a Fiber<'spec>)>,
-    streams: Vec<Task<'a, 'spec>>,
     sync: usize,
     identity: syn::Ident,
     fiber: syn::Ident,
-    direct: Vec<proc_macro2::TokenStream>,
-    queued: Vec<proc_macro2::TokenStream>,
+
     producer_bounds: Vec<proc_macro2::TokenStream>,
     slab_bounds: Vec<proc_macro2::TokenStream>,
 }
@@ -152,52 +136,25 @@ pub(in crate::app::serve) struct Execution<'a, 'spec> {
 impl<'a, 'spec> Execution<'a, 'spec> {
     fn new(paths: &Paths, plan: &'a ProtocolPlan<'spec>) -> Self {
         let spec = plan.spec;
-        let [g_id, g_store] = spec.state_generics.idents(["__ID", "__P"]);
         let l_env = spec.state_generics.lifetime("env");
         let state_ty = spec.state.ty();
         let ns_core = &paths.core;
         let ns_fiber = &paths.fiber;
         let mut tasks = Vec::new();
         let mut fibers = Vec::new();
-        let mut streams = Vec::new();
-        let mut direct = Vec::new();
-        let mut queued = Vec::new();
         let mut producer_bounds = Vec::new();
         let mut slab_bounds = Vec::new();
         let mut sync = 0;
         let owner = &spec.name;
         for route in &plan.entries {
-            let (task, stored, bound, tag) = match &route.mode {
+            let (task, bound) = match &route.mode {
                 Mode::Sync { cache } => {
                     sync = *cache + 1;
                     continue;
                 }
                 Mode::Fiber { task: spec, fiber } => {
                     let task = Task::new(route, spec);
-                    let capacity = task.capacity();
-                    let tag = task.tag(owner);
-                    let (ty, bound) = task.store_fiber(paths, fiber, state_ty);
-                    let output = task.fiber_output(paths, state_ty);
-                    let stored = if fiber.stream {
-                        quote::quote!(#ty)
-                    } else {
-                        quote::quote!(#ns_fiber::dope_fiber::task::storage::fixed::staged::Task<#ty, #output>)
-                    };
-                    let pool = if fiber.stream {
-                        quote::quote!(Stream)
-                    } else {
-                        quote::quote!(Pool)
-                    };
-                    queued.push(quote::quote! {
-                        #ns_fiber::dope_fiber::task::storage::fixed::tree::Leaf<
-                        #ns_fiber::dope_fiber::task::storage::fixed::schedule::#pool<
-                            'd,
-                            #ty,
-                            { #capacity },
-                            #tag<#g_id>,
-                            <#g_store as #ns_fiber::manifold::runtime::Storage>::Target,
-                        >>
-                    });
+                    let bound = task.fiber_bound(paths, fiber, state_ty);
                     let route = task.route();
                     let future = &fiber.future;
                     let maker = &fiber.maker;
@@ -214,39 +171,24 @@ impl<'a, 'spec> Execution<'a, 'spec> {
                             )) -> #future,
                     });
                     fibers.push((task, fiber));
-                    (task, stored, bound, tag)
+                    (task, bound)
                 }
                 Mode::Stream { task: spec } => {
                     let task = Task::new(route, spec);
-                    let tag = task.tag(owner);
-                    let (ty, bound) = task.store_stream(paths);
-                    streams.push(task);
-                    (task, ty, bound, tag)
+                    let (_, bound) = task.store_stream(paths);
+                    (task, bound)
                 }
                 Mode::Duplex { .. } => continue,
             };
-            let capacity = task.capacity();
-            direct.push(quote::quote! {
-                #ns_fiber::dope_fiber::task::storage::fixed::tree::Leaf<#ns_fiber::dope_fiber::task::storage::fixed::Slab<
-                    'd,
-                    #stored,
-                    { #capacity },
-                    #tag<#g_id>,
-                    #ns_fiber::o3::depot::arena::slab::storage::Heap,
-                >>
-            });
             slab_bounds.push(bound);
             tasks.push(task);
         }
         Self {
             tasks,
             fibers,
-            streams,
             sync,
             identity: quote::format_ident!("__{}Task", owner),
             fiber: quote::format_ident!("__{}Fiber", owner),
-            direct,
-            queued,
             producer_bounds,
             slab_bounds,
         }
@@ -258,10 +200,6 @@ impl<'a, 'spec> Execution<'a, 'spec> {
 
     pub(in crate::app::serve) fn fibers(&self) -> &[(Task<'a, 'spec>, &'a Fiber<'spec>)] {
         &self.fibers
-    }
-
-    pub(in crate::app::serve) fn streams(&self) -> &[Task<'a, 'spec>] {
-        &self.streams
     }
 
     pub(in crate::app::serve) fn producers(
@@ -293,22 +231,11 @@ pub(in crate::app::serve) struct ProtocolPlan<'spec> {
 
 impl<'spec> ProtocolPlan<'spec> {
     fn entries(
-        paths: &Paths,
         spec: &'spec spec::Spec,
         duplex: &mut duplex::Plan<'spec>,
     ) -> Vec<RouteSpec<'spec, Mode<'spec>>> {
-        let mut tasks = 0;
-        let mut fibers = 0;
-        for entry in spec.route_specs.iter() {
-            match &entry.mode {
-                spec::Mode::Fiber { .. } => {
-                    tasks += 1;
-                    fibers += 1;
-                }
-                spec::Mode::Stream { .. } => tasks += 1,
-                spec::Mode::Sync | spec::Mode::Duplex => {}
-            }
-        }
+        let mut direct_quota = 0;
+        let mut queued_quota = 0;
         let mut cache = 0;
         let mut task = 0;
         let mut producer = 0;
@@ -338,12 +265,20 @@ impl<'spec> ProtocolPlan<'spec> {
                                 task: TaskSpec {
                                     capacity,
                                     slot: tslot,
-                                    path: layout::Path::new(paths, tasks, tslot),
+                                    quota: capacity.as_ref().map(|_| {
+                                        let index = direct_quota;
+                                        direct_quota += 1;
+                                        index
+                                    }),
                                 },
                                 fiber: Fiber {
                                     stream: *stream,
                                     body,
-                                    path: layout::Path::new(paths, fibers, pslot),
+                                    quota: capacity.as_ref().map(|_| {
+                                        let index = queued_quota;
+                                        queued_quota += 1;
+                                        index
+                                    }),
                                     slot: pslot,
                                     future: spec.state_generics.ident(&format!("__F{pslot:04}")),
                                     maker: spec.state_generics.ident(&format!("__MK{pslot:04}")),
@@ -360,7 +295,11 @@ impl<'spec> ProtocolPlan<'spec> {
                                 task: TaskSpec {
                                     capacity,
                                     slot,
-                                    path: layout::Path::new(paths, tasks, slot),
+                                    quota: capacity.as_ref().map(|_| {
+                                        let index = direct_quota;
+                                        direct_quota += 1;
+                                        index
+                                    }),
                                 },
                             },
                         )
@@ -382,9 +321,9 @@ impl<'spec> ProtocolPlan<'spec> {
         self.entries.get(index)
     }
 
-    fn new(paths: &Paths, spec: &'spec spec::Spec) -> Self {
+    fn new(spec: &'spec spec::Spec) -> Self {
         let mut duplex = duplex::Plan::new(spec);
-        let entries = Self::entries(paths, spec, &mut duplex);
+        let entries = Self::entries(spec, &mut duplex);
         Self {
             spec,
             entries,
@@ -400,7 +339,7 @@ pub(super) fn build(
 ) -> proc_macro2::TokenStream {
     use quote::quote;
 
-    let plan = ProtocolPlan::new(paths, spec);
+    let plan = ProtocolPlan::new(spec);
     let exec = Execution::new(paths, &plan);
     let h1 = match &h1 {
         crate::runtime::H1::Available(cleartext) => {

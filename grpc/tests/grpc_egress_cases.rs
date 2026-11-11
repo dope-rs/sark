@@ -87,8 +87,10 @@ fn backpressure() {
                         worker
                             .lend(|plan, stage| {
                                 plan.install(stage, |app, stage| {
-                                    Stage::with_app(stage, &mut finish, app, |app| {
-                                        let result = app.run();
+                                    let (app, wait) = app.into_parts();
+                                    let watch = wait.watch();
+                                    watch.finish(Stage::with_app(stage, &mut finish, app, |app| {
+                                        let result = wait.run(app);
                                         assert_eq!(dropped.hits(), 1);
                                         let mut observed = requests.take();
                                         let request = observed.pop();
@@ -103,12 +105,10 @@ fn backpressure() {
                                             Some(b"retained-through-response".as_slice())
                                         );
                                         result
-                                    })?
-                                    .map_err(session::Error::Drive)
+                                    }))
                                 })
                             })
                             .map_err(topology::Failure::Install)?
-                            .map_err(topology::Failure::Run)
                     },
                     recovery::Policy::new(|report| reports.push(report), common::recover),
                     |result| {
@@ -281,18 +281,18 @@ fn stream_timer() {
                         worker
                             .lend(|plan, stage| {
                                 plan.install(stage, |app, stage| {
-                                    Stage::with_app(stage, &mut finish, app, |app| {
-                                        let result = app.run();
+                                    let (app, wait) = app.into_parts();
+                                    let watch = wait.watch();
+                                    watch.finish(Stage::with_app(stage, &mut finish, app, |app| {
+                                        let result = wait.run(app);
                                         assert_eq!(dropped.hits(), 1);
                                         assert_eq!(error.get(), None);
                                         assert_eq!(polls.get(), 3);
                                         result
-                                    })?
-                                    .map_err(session::Error::Drive)
+                                    }))
                                 })
                             })
                             .map_err(topology::Failure::Install)?
-                            .map_err(topology::Failure::Run)
                     },
                     recovery::Policy::new(|report| reports.push(report), common::recover),
                     |result| {

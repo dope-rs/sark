@@ -51,7 +51,7 @@ fn rejection_cause_once() {
                     worker
                         .with(lending::Clean(&mut finish))
                         .map_err(topology::Failure::Install)?
-                        .map_err(topology::Failure::Run)
+                        .map_err(|error| error.map_install(|never| match never {}))
                 },
                 recovery::Policy::new(|_| {}, common::recover),
                 |result| assert!(matches!(result, Ok(Ok(())))),

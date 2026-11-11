@@ -1,11 +1,10 @@
-use std::ops::ControlFlow;
-
 use dope::runtime::{
     executor::{self, session},
     shutdown,
+    topology::lending,
 };
 
-use super::{ExecutionError, Output, Wait, Watch};
+use super::{Failure, Output, Wait, Watch};
 
 /// Keeps the first failure observable through dependent and provider retirement.
 #[doc(hidden)]
@@ -25,26 +24,39 @@ where
     Q: executor::Startup,
 {
     let watch = wait.watch();
-    let output = match app.drive_until(wait) {
-        Ok(ControlFlow::Break(cause)) => Err(ExecutionError::Accept { cause, drive: None }),
-        Ok(ControlFlow::Continue(requested)) => Ok(requested),
-        Err(error) => Err(ExecutionError::Drive(error)),
-    };
+    let output = wait.run(app);
     Pending { watch, output }
 }
 
-impl<T> Pending<'_, '_, T> {
-    pub(super) fn finish(self) -> Output<T> {
-        match (self.watch.error(), self.output) {
-            (None, output) => output,
-            (Some(cause), Ok(_)) => Err(ExecutionError::Accept { cause, drive: None }),
-            (Some(cause), Err(ExecutionError::Drive(drive))) => Err(ExecutionError::Accept {
-                cause,
-                drive: Some(drive),
-            }),
-            (Some(cause), Err(ExecutionError::Accept { drive, .. })) => {
-                Err(ExecutionError::Accept { cause, drive })
-            }
+/// Resolves the listener result after the session has retired its owners.
+pub fn session<'report, I, T>(
+    result: session::Result<'report, Pending<'_, '_, T>>,
+) -> Result<T, Failure<'report, I, T>> {
+    match result {
+        Ok(Pending { watch, output }) => watch.finish(Ok(output)),
+        Err(session::Error::Quiesce {
+            output: Pending { watch, output },
+            drive,
+            disarm,
+        }) => watch.finish(Err(session::Error::Quiesce {
+            output,
+            drive,
+            disarm,
+        })),
+        Err(session::Error::Drive(error)) => Err(Failure::Run(session::Error::Drive(error))),
+        Err(session::Error::Install { cause, disarm }) => {
+            Err(Failure::Run(session::Error::Install { cause, disarm }))
         }
+    }
+}
+
+/// Resolves a dependent server only after its provider has also quiesced.
+pub fn lending<'report, I, T>(
+    result: lending::Result<'report, I, Pending<'_, '_, T>>,
+) -> Result<T, Failure<'report, I, T>> {
+    match result {
+        Ok(output) => session(Ok(output)),
+        Err(lending::Error::Build(error)) => Err(Failure::Install(error)),
+        Err(lending::Error::Run(error)) => session(Err(error)),
     }
 }

@@ -42,7 +42,6 @@ impl Routes {
         use quote::quote;
 
         let state_ty = types.names.state_ty;
-        let task_id = &context.exec.identity;
         let runtime = &types.routing.runtime;
         let duplex = &types.protocol.duplex_ty;
         let cont = &h1.continuations;
@@ -169,7 +168,8 @@ impl Routes {
                     serve::Mode::Fiber { task, fiber } => {
                         let task = serve::Task::new(route, task);
                         let prod = syn::Index::from(fiber.slot);
-                        let tasks = task.path().route(&context.plan.spec.state_generics);
+                        let f_tasks = local("tasks");
+                        let tasks = quote!(#v_this.#f_tasks.as_mut().scope());
                         let source = admit::fiber(
                             paths,
                             context,
@@ -225,14 +225,9 @@ impl Routes {
                     }
                     serve::Mode::Stream { task } => {
                         let task = serve::Task::new(route, task);
-                        let tasks = task.path().route(&context.plan.spec.state_generics);
-                        let source = admit::stream(
-                            paths,
-                            &context.plan.spec.state_generics,
-                            task_id,
-                            runtime,
-                            &task.variant(),
-                        );
+                        let f_tasks = local("tasks");
+                        let tasks = quote!(#v_this.#f_tasks.as_mut().scope());
+                        let source = admit::stream(paths, context, task, runtime);
                         quote! {
                             #owner::#pending(#v_wait) => {
                                 let mut #n_tasks = #tasks;

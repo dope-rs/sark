@@ -52,7 +52,9 @@ impl Scope {
             }
             match &mut entry.mode {
                 spec::Mode::Fiber { capacity, .. } | spec::Mode::Stream { capacity } => {
-                    imports.constant(capacity);
+                    if let Some(capacity) = capacity {
+                        imports.constant(capacity);
+                    }
                 }
                 spec::Mode::Sync | spec::Mode::Duplex => {}
             }

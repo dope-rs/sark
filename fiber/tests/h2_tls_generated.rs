@@ -181,7 +181,7 @@ fn shares_driver_storage_with_h1() {
                                                         ).expect("partial HTTP head deadline");
                                                         let listener = h2.build(h2_app, timer, &mut stage.driver())
                                                             .expect("timed TLS listener");
-                                                        run::Failure::<Infallible, _>::session(stage.with_app(
+                                                        run::session::<Infallible, _>(stage.with_app(
                                                             &mut finish,
                                                             server::accept::Listeners::new(root, Host::new(listener)),
                                                             |app| run::run(wait, app),
@@ -191,7 +191,7 @@ fn shares_driver_storage_with_h1() {
                                                             h2_app, sark_h2::server::task::timers::Disabled,
                                                             &mut stage.driver(),
                                                         ).expect("TLS listener");
-                                                        run::Failure::<Infallible, _>::session(stage.with_app(
+                                                        run::session::<Infallible, _>(stage.with_app(
                                                             &mut finish,
                                                             server::accept::Listeners::new(root, Host::new(listener)),
                                                             |app| run::run(wait, app),

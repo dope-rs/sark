@@ -71,12 +71,12 @@ pub(super) struct Route {
 pub(super) enum Kind {
     Sync,
     Async {
-        capacity: syn::Expr,
+        capacity: Option<syn::Expr>,
         body: Body,
         stream: bool,
     },
     Stream {
-        capacity: syn::Expr,
+        capacity: Option<syn::Expr>,
     },
 }
 
@@ -318,7 +318,7 @@ impl parse::Parse for Body {
     }
 }
 
-fn parse_capacity(input: parse::ParseStream<'_>) -> syn::Result<syn::Expr> {
+fn parse_capacity(input: parse::ParseStream<'_>) -> syn::Result<Option<syn::Expr>> {
     let key = input.parse::<syn::Ident>()?;
     if key == "body" {
         return Err(syn::Error::new(
@@ -330,7 +330,11 @@ fn parse_capacity(input: parse::ParseStream<'_>) -> syn::Result<syn::Expr> {
         return Err(syn::Error::new(key.span(), "expected `capacity`"));
     }
     input.parse::<syn::Token![=]>()?;
-    input.parse()
+    let capacity = input.parse::<syn::Expr>()?;
+    Ok(match capacity {
+        syn::Expr::Path(path) if path.qself.is_none() && path.path.is_ident("global") => None,
+        capacity => Some(capacity),
+    })
 }
 
 fn finish_options(input: parse::ParseStream<'_>, is_async: bool) -> syn::Result<()> {

@@ -49,6 +49,7 @@ type Run<'a> = error::Run<
     'a,
     convert::Infallible,
     manifold::BuildError<BranchError<convert::Infallible, config::Error>>,
+    manifold::network::listener::ExecutionError,
 >;
 
 /// Test-only H2 transport settings paired with gRPC semantic limits.
@@ -146,7 +147,7 @@ impl Settings {
                 worker
                     .with(lending::Clean(&mut finish))
                     .map_err(topology::Failure::Install)?
-                    .map_err(topology::Failure::Run)
+                    .map_err(|error| error.map_install(|never| match never {}))
             },
             recovery::Policy::new(|report| reports.push(report), recover),
             |result| {

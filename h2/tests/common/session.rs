@@ -29,7 +29,15 @@ pub trait Serve: Handler + Sized {
         listener: Listener,
         recover: impl recovery::Recover,
         done: impl for<'a> FnOnce(
-            Result<(), error::Run<'a, Infallible, manifold::BuildError<config::Error>>>,
+            Result<
+                (),
+                error::Run<
+                    'a,
+                    Infallible,
+                    manifold::BuildError<config::Error>,
+                    manifold::network::listener::ExecutionError,
+                >,
+            >,
         ),
     ) -> Result<reclaim::Reports<1>, errors::Claim> {
         let prepared = Server::from_handler(self, plan).prepare_on(listener)?;
@@ -44,7 +52,7 @@ pub trait Serve: Handler + Sized {
                 worker
                     .with(lending::Run(&mut finish))
                     .map_err(topology::Failure::Install)?
-                    .map_err(topology::Failure::Run)
+                    .map_err(|error| error.map_install(|never| match never {}))
             },
             recovery::Policy::new(|report| reports.push(report), recover),
             |result| {

@@ -53,6 +53,7 @@ pub(super) fn build(
     let body = &tasks.send_body;
     let wake = &tasks.wake_body;
     let close = &tasks.close_body;
+    let task_methods = &types.task_methods;
     let cancel = &routes.cancel_arms;
     let retire_pending =
         (!cancel.is_empty()).then(|| quote::quote!(#v_exch.retire(#v_this.#f_life, #v_result);));
@@ -94,6 +95,8 @@ pub(super) fn build(
             #bounds
             #g_mode: #ns_h1::server::deadline::Mode<'d, #g_id>,
         {
+            #task_methods
+
             fn send<#g_event>(
                 mut self: ::core::pin::Pin<&mut Self>,
                 #v_date: &#ns_h1::server::date::Clock,

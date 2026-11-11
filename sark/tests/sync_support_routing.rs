@@ -99,7 +99,7 @@ fn static_uses_zero_flights() {
                         worker
                             .with(lending::Run(&mut finish))
                             .map_err(topology::Failure::Install)?
-                            .map_err(topology::Failure::Run)
+                            .map_err(|error| error.map_install(|never| match never {}))
                     },
                     recovery::Policy::new(
                         |report| reports.push(report),

@@ -18,14 +18,10 @@ static ALLOCATOR: Tracker = Tracker::new();
 
 #[test]
 fn resumes_stream_after_final_drain() {
-    use sark_h1::{server::task::runtime, wire::response::Context};
-    use sark_http::{h1::head::line::Version, payload::response::Method};
+    use sark_h1::server::task::runtime;
 
     let mut conn: Conn<'_, runtime::Runtime<'_, ()>, Infallible> = Conn::default();
-    conn.async_state.insert(runtime::Running::stream(
-        (),
-        Context::new(Method::Other, Version::Eleven),
-    ));
+    conn.async_state.insert(runtime::Running::Body(()));
     conn.settle(head::Connection::Close);
     assert!(matches!(pump::Drain::progress(&mut conn), pump::Next::None));
     assert!(matches!(

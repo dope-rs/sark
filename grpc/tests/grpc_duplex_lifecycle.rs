@@ -79,16 +79,16 @@ fn bidi_ingress() {
                         worker
                             .lend(|plan, stage| {
                                 plan.install(stage, |app, stage| {
-                                    Stage::with_app(stage, &mut finish, app, |app| {
-                                        let result = app.run();
+                                    let (app, wait) = app.into_parts();
+                                    let watch = wait.watch();
+                                    watch.finish(Stage::with_app(stage, &mut finish, app, |app| {
+                                        let result = wait.run(app);
                                         assert_eq!(dropped.hits(), 1);
                                         result
-                                    })?
-                                    .map_err(session::Error::Drive)
+                                    }))
                                 })
                             })
                             .map_err(topology::Failure::Install)?
-                            .map_err(topology::Failure::Run)
                     },
                     recovery::Policy::new(|report| reports.push(report), common::recover),
                     |result| {
@@ -161,19 +161,19 @@ fn late_ingress() {
                         worker
                             .lend(|plan, stage| {
                                 plan.install(stage, |app, stage| {
-                                    Stage::with_app(stage, &mut finish, app, |app| {
-                                        let result = app.run();
+                                    let (app, wait) = app.into_parts();
+                                    let watch = wait.watch();
+                                    watch.finish(Stage::with_app(stage, &mut finish, app, |app| {
+                                        let result = wait.run(app);
                                         assert_eq!(dropped.hits(), 1);
                                         assert_eq!(ingress.get(), 0);
                                         assert_eq!(error.get(), None);
                                         assert_eq!(polls.get(), 1);
                                         result
-                                    })?
-                                    .map_err(session::Error::Drive)
+                                    }))
                                 })
                             })
                             .map_err(topology::Failure::Install)?
-                            .map_err(topology::Failure::Run)
                     },
                     recovery::Policy::new(|report| reports.push(report), common::recover),
                     |result| {
@@ -247,19 +247,19 @@ fn bidi_timer() {
                         worker
                             .lend(|plan, stage| {
                                 plan.install(stage, |app, stage| {
-                                    Stage::with_app(stage, &mut finish, app, |app| {
-                                        let result = app.run();
+                                    let (app, wait) = app.into_parts();
+                                    let watch = wait.watch();
+                                    watch.finish(Stage::with_app(stage, &mut finish, app, |app| {
+                                        let result = wait.run(app);
                                         assert_eq!(dropped.hits(), 1);
                                         assert_eq!(ingress.get(), 0);
                                         assert_eq!(error.get(), None);
                                         assert_eq!(polls.get(), 3);
                                         result
-                                    })?
-                                    .map_err(session::Error::Drive)
+                                    }))
                                 })
                             })
                             .map_err(topology::Failure::Install)?
-                            .map_err(topology::Failure::Run)
                     },
                     recovery::Policy::new(|report| reports.push(report), common::recover),
                     |result| {

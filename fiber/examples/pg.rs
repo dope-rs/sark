@@ -238,7 +238,7 @@ impl Server {
                                     permit,
                                 )
                             });
-                            run::Failure::lending(result)
+                            run::lending(result)
                         },
                     )
                     .map_err(|error| run::Failure::Install(BuildError::Create(error)))?

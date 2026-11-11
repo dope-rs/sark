@@ -129,8 +129,7 @@ fn protocol_failure_stops_before_finish() {
                 client.transfer().drain(count);
             }
             let active = scheduler.begin();
-            let mut turn =
-                app::Turn::new((), active.turn().app(), ready.target(), &mut context);
+            let mut turn = app::Turn::new((), active.turn().app(), ready.target(), &mut context);
             let mut consumed = 0;
             let mut finished = false;
             let result = app::Application::drive(
@@ -245,7 +244,8 @@ fn event_budget() {
         |worker| {
             worker.lend(|plan, stage| {
                 plan.install(stage, |host, stage| {
-                    stage.with_app(&mut finish, host, |mut app| {
+                    let (host, wait) = host.into_parts();
+                    let result = stage.with_app(&mut finish, host, |mut app| {
                         flood_h2.try_flush(&flood_io).expect("write frames");
                         assert_eq!(
                             fibers::TEST
@@ -272,7 +272,9 @@ fn event_budget() {
                         assert!(matches!(events.as_slice(), [Event::First, Event::Probe(seen), Event::Done(total)] if *seen < BURST && *total == BURST), "unfair or repeated events: {events:?}");
                         trace.events.set(events);
                         assert_eq!(trace.flood.get(), BURST, "flood callback count");
-                    })
+                    });
+                    assert!(wait.watch().error().is_none(), "listener accept");
+                    result
                 })
             })
         },
@@ -354,7 +356,8 @@ fn output_retries() {
             |worker| {
                 worker.lend(|plan, stage| {
                     plan.install(stage, |host, stage| {
-                        stage.with_app(&mut finish, host, |mut app| {
+                        let (host, wait) = host.into_parts();
+                        let result = stage.with_app(&mut finish, host, |mut app| {
                             let mut peer = Peer::try_config(
                                 address,
                                 config::Config {
@@ -457,7 +460,9 @@ fn output_retries() {
                                 "released probe waited for all {seen} of {BURST} ready outputs"
                             );
                             drop(peer);
-                        })
+                        });
+                        assert!(wait.watch().error().is_none(), "listener accept");
+                        result
                     })
                 })
             },

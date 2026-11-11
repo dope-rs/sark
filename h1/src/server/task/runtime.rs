@@ -7,42 +7,13 @@ use crate::{
     wire::{output, response},
 };
 
-/// H1 scheduling phase stored beside an executor-owned task identifier.
-#[derive(Clone, Copy, PartialEq, Eq)]
+/// One task with exactly the authority needed by its HTTP/1 phase.
 #[repr(u8)]
-pub enum Kind {
-    Fiber,
-    Stream,
-    Closing,
-}
-
-/// One executor-owned task with its H1 phase and admitted request context.
-pub struct Running<T> {
-    task: T,
-    kind: Kind,
-    request: response::Context,
-}
-
-impl<T> Running<T> {
-    pub const fn fiber(task: T, request: response::Context) -> Self {
-        Self::from_parts(task, Kind::Fiber, request)
-    }
-
-    pub const fn stream(task: T, request: response::Context) -> Self {
-        Self::from_parts(task, Kind::Stream, request)
-    }
-
-    pub fn into_parts(self) -> (T, Kind, response::Context) {
-        (self.task, self.kind, self.request)
-    }
-
-    pub const fn from_parts(task: T, kind: Kind, request: response::Context) -> Self {
-        Self {
-            task,
-            kind,
-            request,
-        }
-    }
+pub enum Running<T, E = T> {
+    Future(response::Context, T),
+    Head(response::Context, T),
+    Body(T),
+    Closing(E),
 }
 
 /// One deferred wire frame retaining its validated geometry and transport identity.
@@ -79,13 +50,13 @@ impl<'d, K, B: bound::Bound> Stream<'d, K, B> {
 }
 
 /// Per-connection executor overlay retained by the H1 session.
-pub struct Runtime<'d, T, S = (), K = (), B: bound::Bound = bound::Unbounded> {
-    running: Option<Running<T>>,
+pub struct Runtime<'d, T, S = (), K = (), B: bound::Bound = bound::Unbounded, E = T> {
+    running: Option<Running<T, E>>,
     stream: Option<Stream<'d, K, B>>,
     session: S,
 }
 
-impl<T, S: Default, K, B: bound::Bound> Default for Runtime<'_, T, S, K, B> {
+impl<T, S: Default, K, B: bound::Bound, E> Default for Runtime<'_, T, S, K, B, E> {
     fn default() -> Self {
         Self {
             running: None,
@@ -95,12 +66,12 @@ impl<T, S: Default, K, B: bound::Bound> Default for Runtime<'_, T, S, K, B> {
     }
 }
 
-impl<'d, T, S, K, B: bound::Bound> Runtime<'d, T, S, K, B> {
-    pub fn take(&mut self) -> Option<Running<T>> {
+impl<'d, T, S, K, B: bound::Bound, E> Runtime<'d, T, S, K, B, E> {
+    pub fn take(&mut self) -> Option<Running<T, E>> {
         self.running.take()
     }
 
-    pub fn insert(&mut self, run: Running<T>) {
+    pub fn insert(&mut self, run: Running<T, E>) {
         self.running = Some(run);
     }
 
@@ -147,14 +118,12 @@ impl<'d, T, S, K, B: bound::Bound> Runtime<'d, T, S, K, B> {
     }
 }
 
-impl<T, S, K, B: bound::Bound> pump::Tasks for Runtime<'_, T, S, K, B> {
+impl<T, S, K, B: bound::Bound, E> pump::Tasks for Runtime<'_, T, S, K, B, E> {
     fn activity(&self) -> pump::Activity {
         match &self.running {
             None => pump::Activity::Idle,
-            Some(run) => match run.kind {
-                Kind::Fiber => pump::Activity::Task,
-                Kind::Stream | Kind::Closing => pump::Activity::Stream,
-            },
+            Some(Running::Future(..) | Running::Head(..)) => pump::Activity::Task,
+            Some(Running::Body(_) | Running::Closing(_)) => pump::Activity::Stream,
         }
     }
 }

@@ -232,103 +232,121 @@ fn opening_bound_precedes_retention() {
                     |worker| {
                         worker.lend(|listener, stage| {
                             listener.install(stage, |root, stage| {
-                                stage.with_quiesce(completion, root, GUARD, |mut app| {
-                                    let mut held = TcpStream::try_socket(bind).expect("held peer");
-                                    held.set_write_timeout(Some(GUARD)).expect("input deadline");
-                                    held.write_all(OPENING).expect("held opening");
-                                    held.set_nonblocking(true).expect("nonblocking peer");
-                                    let mut head = Vec::new();
-                                    let mut response = peer::try_poll(&mut app, &mut || {
-                                        held.try_upgrade(&mut head)
-                                    })
-                                    .expect("held upgrade");
-                                    let mut socket =
-                                        TcpStream::try_socket(bind).expect("opening connection");
-                                    socket.set_nonblocking(true).expect("nonblocking opening");
-                                    Backend::set(
-                                        held.as_fd(),
-                                        Kind::RecvBuffer,
-                                        &Value::new(256 * 1024),
-                                    )
-                                    .expect("bounded receive window");
-                                    peer::try_write(&mut app, &held, &start)
-                                        .expect("start held response");
-                                    let mut prefix = (&held).take(10);
-                                    peer::try_poll(&mut app, &mut || {
-                                        prefix.read_to_end(&mut response).map_err(peer::Read::Io)
-                                    })
-                                    .expect("held frame header");
-                                    assert_eq!(response, [0x82, 127, 0, 0, 0, 0, 0, 64, 0, 0]);
+                                let (root, wait) = root.into_parts();
+                                let result =
+                                    stage.with_quiesce(completion, root, GUARD, |mut app| {
+                                        let mut held =
+                                            TcpStream::try_socket(bind).expect("held peer");
+                                        held.set_write_timeout(Some(GUARD))
+                                            .expect("input deadline");
+                                        held.write_all(OPENING).expect("held opening");
+                                        held.set_nonblocking(true).expect("nonblocking peer");
+                                        let mut head = Vec::new();
+                                        let mut response = peer::try_poll(&mut app, &mut || {
+                                            held.try_upgrade(&mut head)
+                                        })
+                                        .expect("held upgrade");
+                                        let mut socket = TcpStream::try_socket(bind)
+                                            .expect("opening connection");
+                                        socket.set_nonblocking(true).expect("nonblocking opening");
+                                        Backend::set(
+                                            held.as_fd(),
+                                            Kind::RecvBuffer,
+                                            &Value::new(256 * 1024),
+                                        )
+                                        .expect("bounded receive window");
+                                        peer::try_write(&mut app, &held, &start)
+                                            .expect("start held response");
+                                        let mut prefix = (&held).take(10);
+                                        peer::try_poll(&mut app, &mut || {
+                                            prefix
+                                                .read_to_end(&mut response)
+                                                .map_err(peer::Read::Io)
+                                        })
+                                        .expect("held frame header");
+                                        assert_eq!(response, [0x82, 127, 0, 0, 0, 0, 0, 64, 0, 0]);
 
-                                    let mut request =
-                                        try_padded(u8::from(!accepted)).expect("padded opening");
-                                    if accepted {
-                                        request.extend(
-                                            vec![0x5a; 32 * 1024]
-                                                .try_masked(0x2, true)
-                                                .expect("coalesced large frame"),
-                                        );
-                                    }
-                                    peer::try_write(&mut app, &socket, &request[..length - split])
+                                        let mut request = try_padded(u8::from(!accepted))
+                                            .expect("padded opening");
+                                        if accepted {
+                                            request.extend(
+                                                vec![0x5a; 32 * 1024]
+                                                    .try_masked(0x2, true)
+                                                    .expect("coalesced large frame"),
+                                            );
+                                        }
+                                        peer::try_write(
+                                            &mut app,
+                                            &socket,
+                                            &request[..length - split],
+                                        )
                                         .expect("incomplete opening prefix");
-                                    assert_eq!(
-                                        fibers::TEST
-                                            .try_wait(&mut app, &prefix_seen.handle(), 1)
-                                            .expect("prefix consumed before delimiter suffix"),
-                                        fibers::Wait::Reached
-                                    );
-                                    peer::try_write(&mut app, &socket, &request[length - split..])
-                                        .expect("delimiter suffix and coalesced frame");
-                                    let end = socket.shutdown(Shutdown::Write);
-                                    if accepted {
-                                        end.expect("opening EOF");
                                         assert_eq!(
                                             fibers::TEST
-                                                .try_wait(&mut app, &settled.handle(), 1)
-                                                .expect(
-                                                    "input settled while output remains blocked"
-                                                ),
+                                                .try_wait(&mut app, &prefix_seen.handle(), 1)
+                                                .expect("prefix consumed before delimiter suffix"),
                                             fibers::Wait::Reached
                                         );
-                                    } else {
-                                        assert_eq!(
-                                            peer::try_poll(&mut app, &mut || {
-                                                socket.read(&mut [0; 1]).map_err(peer::Read::Io)
-                                            })
-                                            .expect("early rejection EOF"),
-                                            0
-                                        );
-                                    }
+                                        peer::try_write(
+                                            &mut app,
+                                            &socket,
+                                            &request[length - split..],
+                                        )
+                                        .expect("delimiter suffix and coalesced frame");
+                                        let end = socket.shutdown(Shutdown::Write);
+                                        if accepted {
+                                            end.expect("opening EOF");
+                                            assert_eq!(
+                                                fibers::TEST
+                                                    .try_wait(&mut app, &settled.handle(), 1)
+                                                    .expect(
+                                                        "input settled while output remains blocked"
+                                                    ),
+                                                fibers::Wait::Reached
+                                            );
+                                        } else {
+                                            assert_eq!(
+                                                peer::try_poll(&mut app, &mut || {
+                                                    socket.read(&mut [0; 1]).map_err(peer::Read::Io)
+                                                })
+                                                .expect("early rejection EOF"),
+                                                0
+                                            );
+                                        }
 
-                                    assert_eq!(
-                                        peer::try_poll(&mut app, &mut || held
-                                            .try_next(&mut response))
-                                        .expect("held response"),
-                                        (0x2, vec![0xa7; 4 * 1024 * 1024])
-                                    );
-                                    if accepted {
-                                        let (head, mut tail) =
-                                            peer::try_poll(&mut app, &mut || {
-                                                socket.try_head(&mut head).map_err(peer::Read::Io)
-                                            })
-                                            .expect("bounded upgrade");
-                                        assert!(head.starts_with(b"HTTP/1.1 101"));
                                         assert_eq!(
-                                            peer::try_poll(&mut app, &mut || socket
-                                                .try_next(&mut tail))
-                                            .expect("coalesced frame response"),
+                                            peer::try_poll(&mut app, &mut || held
+                                                .try_next(&mut response))
+                                            .expect("held response"),
                                             (0x2, vec![0xa7; 4 * 1024 * 1024])
                                         );
-                                        assert!(tail.is_empty());
-                                        assert_eq!(
-                                            peer::try_poll(&mut app, &mut || {
-                                                socket.read(&mut [0; 1]).map_err(peer::Read::Io)
-                                            })
-                                            .expect("server EOF"),
-                                            0
-                                        );
-                                    }
-                                })
+                                        if accepted {
+                                            let (head, mut tail) =
+                                                peer::try_poll(&mut app, &mut || {
+                                                    socket
+                                                        .try_head(&mut head)
+                                                        .map_err(peer::Read::Io)
+                                                })
+                                                .expect("bounded upgrade");
+                                            assert!(head.starts_with(b"HTTP/1.1 101"));
+                                            assert_eq!(
+                                                peer::try_poll(&mut app, &mut || socket
+                                                    .try_next(&mut tail))
+                                                .expect("coalesced frame response"),
+                                                (0x2, vec![0xa7; 4 * 1024 * 1024])
+                                            );
+                                            assert!(tail.is_empty());
+                                            assert_eq!(
+                                                peer::try_poll(&mut app, &mut || {
+                                                    socket.read(&mut [0; 1]).map_err(peer::Read::Io)
+                                                })
+                                                .expect("server EOF"),
+                                                0
+                                            );
+                                        }
+                                    });
+                                assert!(wait.watch().error().is_none(), "listener accept");
+                                result
                             })
                         })
                     },

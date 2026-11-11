@@ -1,4 +1,8 @@
-use crate::{app::serve::handle, macros::tokens::local, runtime::paths::Paths};
+use crate::{
+    app::serve::{flat, handle},
+    macros::tokens::local,
+    runtime::paths::Paths,
+};
 
 pub(in crate::app::serve::handle::h1) struct Tasks {
     pub(in crate::app::serve::handle::h1) send_body: proc_macro2::TokenStream,
@@ -42,55 +46,25 @@ impl Tasks {
         let f_life = local("lifecycle");
         let [v_cancel, n_active] = symbols.locals(["cancellation", "__activity"]);
         let [n_charge, n_owner, n_flow] = symbols.locals(["__charge", "__owner", "__flow"]);
-        let [n_exch, n_kind] = symbols.locals(["__exchange", "__kind"]);
-        let [n_resp, n_live] = symbols.locals(["__response", "__running"]);
+        let [n_exch] = symbols.locals(["__exchange"]);
+        let [n_live] = symbols.locals(["__running"]);
         let [n_tag, n_task] = symbols.locals(["__tag", "__task"]);
         let [n_turn, n_tasks] = symbols.locals(["__task_turn", "__tasks"]);
-        let [v_kind, v_active, v_slab] = symbols.locals(["kind", "running", "slab"]);
-        let [v_staged, v_task, v_tdate] = symbols.locals(["staged", "task", "task_date"]);
+        let [v_active] = symbols.locals(["running"]);
+        let [v_staged, v_task] = symbols.locals(["staged", "task"]);
         let [v_this] = symbols.locals(["this"]);
         let ns_core = &paths.core;
         let ns_fiber = &paths.fiber;
-        let fibers = ctx.exec.fibers();
-        let streams = ctx.exec.streams();
-        let ident = &ctx.exec.identity;
+        let f_tasks = local("tasks");
+        let f_quotas = local("quotas");
+        let quota = ctx
+            .exec
+            .tasks()
+            .iter()
+            .any(|task| task.quota().is_some())
+            .then(|| quote!(#v_this.#f_quotas,));
         let view = quote!((#v_link.state()));
         let state = quote!((#v_link.state_mut()));
-        let arms: Vec<proc_macro2::TokenStream> = fibers
-            .iter()
-            .map(|&(task, fiber)| (task, Some(fiber)))
-            .chain(streams.iter().copied().map(|task| (task, None)))
-            .map(|(task, fiber)| {
-                let var = task.variant();
-                let store = task.path().route(&ctx.plan.spec.state_generics);
-                let date = fiber.map(|_| &v_tdate);
-                let date = date.as_slice();
-                let (poll, kind) = match fiber {
-                    Some(fiber) if fiber.stream => (quote!(poll_stream), quote!(#n_kind,)),
-                    Some(_) => (quote!(poll), quote!()),
-                    None => (quote!(stream), quote!(#n_kind,)),
-                };
-                quote! {
-                    #ident::#var(#n_task) => {
-                        let mut #n_tasks = #store;
-                        #(let #date = #v_date.load();)*
-                        #ns_fiber::manifold::H1::new(
-                            #n_tasks.as_mut(),
-                            #n_task,
-                            #n_resp,
-                        ).#poll(
-                            #kind
-                            #( &#date, )*
-                            #ident::#var,
-                            #v_link,
-                            #v_driver,
-                            #v_this.#f_life,
-                            #n_exch,
-                        )
-                    },
-                }
-            })
-            .collect();
         let pump = quote! {
             let #n_exch = #ns_core::life::sequence::Mode::current(
                 #v_this.#f_life,
@@ -100,10 +74,10 @@ impl Tasks {
             if let ::core::option::Option::Some(#n_exch) = #n_exch
                 && let ::core::option::Option::Some(#n_live) = #state.async_state.take()
             {
-                let (#n_task, #n_kind, #n_resp) = #n_live.into_parts();
-                let #n_turn = match #n_task {
-                    #( #arms )*
-                };
+                let mut #n_tasks = #v_this.#f_tasks.as_mut().scope();
+                let #n_turn = Self::__task(
+                    &mut #n_tasks, #quota #n_live, #v_date, #v_link, #v_driver, #v_this.#f_life, #n_exch,
+                );
                 #n_turn.settle(
                     #v_this.#f_life,
                     #state.async_state.session_mut(),
@@ -158,69 +132,31 @@ impl Tasks {
                 }
             }
         };
-        let fdrops = fibers
-            .iter()
-            .map(|pair| {
-                let task = pair.0;
-                let var = task.variant();
-                let store = task.path().route(&ctx.plan.spec.state_generics);
-                if !pair.1.stream {
-                    return quote! {
-                        #ident::#var(#v_task) => {
-                            let mut #v_slab = #store;
-                            match #ns_fiber::dope_fiber::task::storage::fixed::staged::Store::remove_state(#v_slab.as_mut(), #v_task) {
-                                #ns_fiber::dope_fiber::task::storage::fixed::staged::Removal::Staged =>
-                                    #ns_h1::server::task::turn::Turn::StagedCancelled,
-                                #ns_fiber::dope_fiber::task::storage::fixed::staged::Removal::Live
-                                | #ns_fiber::dope_fiber::task::storage::fixed::staged::Removal::Absent =>
-                                    #ns_h1::server::task::turn::Turn::ConnectionCancelled,
-                            }
-                        },
-                    };
+        let staged = flat::staged(ctx.plan.spec, ctx.exec, true, quote!(#v_task.get()));
+        let remove = flat::remove(
+            ctx.plan.spec,
+            ctx.exec,
+            false,
+            &v_task,
+            quote!(#v_this.#f_quotas),
+        );
+        let cancel = quote! {
+            match #n_tasks.entry(#n_task) {
+                Ok(mut #v_task) => {
+                    let #v_staged = #staged;
+                    #remove
+                    if #v_staged { #ns_h1::server::task::turn::Turn::StagedCancelled }
+                    else { #ns_h1::server::task::turn::Turn::ConnectionCancelled }
                 }
-                quote! {
-                        #ident::#var(#v_task) => {
-                            let mut #v_slab = #store;
-                            let #v_staged = match #v_kind {
-                                #ns_h1::server::task::runtime::Kind::Stream
-                                | #ns_h1::server::task::runtime::Kind::Closing => true,
-                                #ns_h1::server::task::runtime::Kind::Fiber =>
-                                    #ns_fiber::dope_fiber::task::storage::fixed::local::Stream::get_mut(
-                                        #v_slab.as_mut(), &#v_task,
-                                    ).is_some_and(|#n_tasks| #n_tasks.is_head()),
-                            };
-                            match #v_slab.remove(#v_task) {
-                                #ns_fiber::dope_fiber::task::storage::fixed::local::Removal::Removed if #v_staged => {
-                                    #ns_h1::server::task::turn::Turn::StagedCancelled
-                                }
-                                #ns_fiber::dope_fiber::task::storage::fixed::local::Removal::Removed
-                                | #ns_fiber::dope_fiber::task::storage::fixed::local::Removal::Absent => {
-                                    #ns_h1::server::task::turn::Turn::ConnectionCancelled
-                                }
-                            }
-                        },
-                }
-            });
-        let sdrops = streams.iter().map(|task| {
-            let var = task.variant();
-            let store = task.path().route(&ctx.plan.spec.state_generics);
-            quote! {
-                    #ident::#var(#v_task) => {
-                        let mut #v_slab = #store;
-                        let _ = #v_slab.remove(#v_task);
-                        match #v_kind {
-                            #ns_h1::server::task::runtime::Kind::Closing => {
-                                #ns_h1::server::task::turn::Turn::StagedCancelled
-                            }
-                            #ns_h1::server::task::runtime::Kind::Fiber
-                            | #ns_h1::server::task::runtime::Kind::Stream => {
-                                #ns_h1::server::task::turn::Turn::ConnectionCancelled
-                            }
-                        }
-                    },
+                Err(_) => #ns_h1::server::task::turn::Turn::ConnectionCancelled,
             }
-        });
-        let drops: Vec<proc_macro2::TokenStream> = fdrops.chain(sdrops).collect();
+        };
+        let closing = quote! {
+            match #n_tasks.entry(#n_task) {
+                Ok(mut #v_task) => { #remove #ns_h1::server::task::turn::Turn::StagedCancelled }
+                Err(_) => #ns_h1::server::task::turn::Turn::ConnectionCancelled,
+            }
+        };
         let close = quote! {
             let mut #v_this = self.project();
             let #n_exch = #ns_core::life::sequence::Mode::current(
@@ -248,9 +184,12 @@ impl Tasks {
                 }
             }
             if let ::core::option::Option::Some(#v_active) = #state.async_state.take() {
-                let (#v_task, #v_kind, _) = #v_active.into_parts();
-                let #v_cancel = match #v_task {
-                    #( #drops )*
+                let mut #n_tasks = #v_this.#f_tasks.as_mut().scope();
+                let #v_cancel = match #v_active {
+                    #ns_h1::server::task::runtime::Running::Future(_, #n_task)
+                    | #ns_h1::server::task::runtime::Running::Head(_, #n_task)
+                    | #ns_h1::server::task::runtime::Running::Body(#n_task) => { #cancel }
+                    #ns_h1::server::task::runtime::Running::Closing(#n_task) => { #closing }
                 };
                 if let ::core::option::Option::Some(#n_exch) = #n_exch {
                     #v_cancel.settle(

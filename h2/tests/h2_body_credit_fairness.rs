@@ -6,10 +6,8 @@ use std::{cell::Cell, convert::Infallible, net::TcpStream, time::Duration};
 use common::session::Connect;
 use dope::{
     core::driver::route::{FrameworkTag, Tag, kind},
-    runtime::{
-        executor::session::{Completion, Error},
-        topology,
-    },
+    manifold::network::listener::ExecutionError,
+    runtime::{executor::session::Completion, topology},
 };
 use dope_test::{harness::server::Pair, reclaim::Reports};
 use sark_core::manifold::stream::Boundary;
@@ -68,18 +66,17 @@ fn yields_and_retains_owner() {
                 |worker| {
                     worker.lend(|plan, stage| {
                         plan.install(stage, |host, stage| {
-                            stage.with_app(&mut finish, host, |app| {
+                            let (host, wait) = host.into_parts();
+                            wait.watch().finish(stage.with_app(&mut finish, host, |app| {
                                 app.run_for(Duration::from_secs(3)).inspect(|_| {
                                     let at = trace.seen.get().expect("probe dispatched");
                                     assert!(at < BURST,
                                         "probe dispatched only after all {BURST} flood owners ({at})");
                                     assert_eq!(trace.flood.get(), BURST);
-                                })
-                            })
+                                }).map_err(ExecutionError::Drive)
+                            }))
                         })
                         .map_err(topology::Failure::Install)?
-                        .map_err(topology::Failure::Run)?
-                        .map_err(|cause| topology::Failure::Run(Error::Drive(cause)))
                     })
                 },
                 recovery::Policy::new(

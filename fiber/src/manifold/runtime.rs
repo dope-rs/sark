@@ -5,12 +5,8 @@ use dope_fiber::{
     abi,
     task::storage::{fixed, scope},
 };
-use fixed::{
-    direct, quota,
-    schedule::{Plan, Plane, queue},
-    tree,
-};
 use manifold::task::{self, request::Input, response::Output};
+use o3::depot::{arena::slab::storage::Heap, capacity::Count};
 use sark_core::{manifold, route};
 
 /// Marks routes executed by the fiber runtime.
@@ -22,15 +18,10 @@ pub trait Storage {
     type Target: Copy;
     type Protocol<Cold, Bound>;
     type Resource<Bound>;
+    type Quota<Direct, Queued>;
 
-    type Tasks<'s, 'd, D, S>
-    where
-        D: tree::Tree<'d>,
-        S: tree::Tree<'d>;
-
-    type DirectOnly<'s, 'd, D>
-    where
-        D: tree::Tree<'d>;
+    type Tasks<'s, 'd, DF, SF, D, M>;
+    type DirectOnly<'s, 'd, F, D>;
 }
 
 /// Marks storage whose scheduler identity is executable.
@@ -49,34 +40,22 @@ impl Storage for Direct {
     type Target = ();
     type Protocol<Cold, Bound> = Bound;
     type Resource<Bound> = Bound;
+    type Quota<Direct, Queued> = Direct;
 
-    type Tasks<'s, 'd, D, S>
-        = scope::Owned<'s, direct::Plane<'d, D, quota::Bounded>>
-    where
-        D: tree::Tree<'d>,
-        S: tree::Tree<'d>;
-
-    type DirectOnly<'s, 'd, D>
-        = scope::Owned<'s, direct::Plane<'d, D, quota::Bounded>>
-    where
-        D: tree::Tree<'d>;
+    type Tasks<'s, 'd, DF, SF, D, M> =
+        scope::Owned<'s, fixed::Slab<'d, DF, { u32::MAX as usize }, D, Heap>>;
+    type DirectOnly<'s, 'd, F, D> =
+        scope::Owned<'s, fixed::Slab<'d, F, { u32::MAX as usize }, D, Heap>>;
 }
 
 impl Storage for Cold {
     type Target = ();
     type Protocol<Cold, Bound> = Cold;
     type Resource<Bound> = ();
+    type Quota<Direct, Queued> = ();
 
-    type Tasks<'s, 'd, D, S>
-        = (scope::Brand<'s>, direct::Plan<'d, D>)
-    where
-        D: tree::Tree<'d>,
-        S: tree::Tree<'d>;
-
-    type DirectOnly<'s, 'd, D>
-        = (scope::Brand<'s>, direct::Plan<'d, D>)
-    where
-        D: tree::Tree<'d>;
+    type Tasks<'s, 'd, DF, SF, D, M> = (scope::Brand<'s>, Count);
+    type DirectOnly<'s, 'd, F, D> = (scope::Brand<'s>, Count);
 }
 
 impl Runnable for Direct {
@@ -95,34 +74,23 @@ impl<T: task::Target> Storage for Multi<T> {
     type Target = T;
     type Protocol<Cold, Bound> = ();
     type Resource<Bound> = ();
+    type Quota<Direct, Queued> = ();
 
-    type Tasks<'s, 'd, D, S>
-        = (scope::Brand<'s>, Plan<'d, S>)
-    where
-        D: tree::Tree<'d>,
-        S: tree::Tree<'d>;
-
-    type DirectOnly<'s, 'd, D>
-        = ()
-    where
-        D: tree::Tree<'d>;
+    type Tasks<'s, 'd, DF, SF, D, M> = (scope::Brand<'s>, Count);
+    type DirectOnly<'s, 'd, F, D> = ();
 }
 
 impl<T: task::Target> Storage for Prepared<T> {
     type Target = T;
     type Protocol<Cold, Bound> = ();
     type Resource<Bound> = Bound;
+    type Quota<Direct, Queued> = Queued;
 
-    type Tasks<'s, 'd, D, S>
-        = scope::Owned<'s, Plane<'d, S, quota::Bounded, queue::Owned<'d, T>>>
-    where
-        D: tree::Tree<'d>,
-        S: tree::Tree<'d>;
-
-    type DirectOnly<'s, 'd, D>
-        = ()
-    where
-        D: tree::Tree<'d>;
+    type Tasks<'s, 'd, DF, SF, D, M> = scope::Owned<
+        's,
+        fixed::schedule::Storage<'d, SF, D, T, M, fixed::schedule::queue::Owned<'d, T>>,
+    >;
+    type DirectOnly<'s, 'd, F, D> = ();
 }
 
 impl<T: task::Target> Runnable for Prepared<T> {

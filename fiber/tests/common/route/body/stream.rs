@@ -143,7 +143,11 @@ impl<C: Copy, S: Copy> life::Observer<C, S> for Observer<'_> {
     }
 
     fn diagnostic<E: fmt::Debug>(&mut self, cause: &E) {
-        assert!(self.diagnostics.replace(Some(format!("{cause:?}"))).is_none());
+        assert!(
+            self.diagnostics
+                .replace(Some(format!("{cause:?}")))
+                .is_none()
+        );
     }
 
     fn audit(&mut self, _: C, snapshot: audit::Snapshot) {
@@ -171,6 +175,14 @@ fn failing(state: &Failure<'_>) -> Stream<'static, Chunks<Result<Chunk<'d>, &'st
 #[sark_fiber::handler(pub)]
 async fn later<'a>(state: &Failure<'a>) -> Stream<'static, Chunks<Result<Chunk<'d>, &'a str>>> {
     Yield::new().await;
+    dope_fiber::abi::poll_fn(|context| {
+        let work = context.as_ref().work();
+        for _ in 0..work.remaining() {
+            work.permit().expect("remaining credit").run(|| ());
+        }
+        std::task::Poll::Ready(())
+    })
+    .await;
     state.stream(state.cause)
 }
 
@@ -185,8 +197,8 @@ fn next() -> OwnedReply {
 sark_fiber::define_route! {
     pub StreamFailureDispatch<'a>: Failure<'a> => {
         GET "/direct" => stream(capacity = 1) failing,
-        GET "/later" => async stream(capacity = 1, body = discarded) later,
-        HEAD "/later" => async stream(capacity = 1, body = discarded) later,
+        GET "/later" => async stream(capacity = global, body = discarded) later,
+        HEAD "/later" => async stream(capacity = global, body = discarded) later,
         GET "/next" => next,
     }
 }

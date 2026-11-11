@@ -94,73 +94,86 @@ fn opening_survives_eof() {
                     |worker| {
                         worker.lend(|listener, stage| {
                             listener.install(stage, |root, stage| {
-                                stage.with_quiesce(completion, root, GUARD, |mut app| {
-                                    let mut held = TcpStream::try_socket(bind).expect("held peer");
-                                    held.set_write_timeout(Some(GUARD)).expect("input deadline");
-                                    held.write_all(OPENING).expect("held opening");
-                                    held.set_nonblocking(true).expect("nonblocking peer");
-                                    let mut head = Vec::new();
-                                    let mut response = peer::try_poll(&mut app, &mut || {
-                                        held.try_upgrade(&mut head)
-                                    })
-                                    .expect("held upgrade");
-                                    let mut socket =
-                                        TcpStream::try_socket(bind).expect("opening connection");
-                                    socket.set_nonblocking(true).expect("nonblocking opening");
-                                    Backend::set(
-                                        held.as_fd(),
-                                        Kind::RecvBuffer,
-                                        &Value::new(256 * 1024),
-                                    )
-                                    .expect("bounded receive window");
-                                    assert!(response.is_empty());
-                                    peer::try_write(
-                                        &mut app,
-                                        &held,
-                                        &b"start".try_masked(0x2, true).expect("request"),
-                                    )
-                                    .expect("start held response");
-                                    let mut prefix = (&held).take(10);
-                                    peer::try_poll(&mut app, &mut || {
-                                        prefix.read_to_end(&mut response).map_err(peer::Read::Io)
-                                    })
-                                    .expect("held frame header");
-                                    assert_eq!(response, [0x82, 127, 0, 0, 0, 0, 0, 64, 0, 0]);
-
-                                    peer::try_write(&mut app, &socket, request)
-                                        .expect("opening request");
-                                    socket.shutdown(Shutdown::Write).expect("opening EOF");
-                                    assert_eq!(
-                                        fibers::TEST
-                                            .try_wait(&mut app, &observed.handle(), 1)
-                                            .expect(
-                                                "real app consumed EOF before releasing output"
-                                            ),
-                                        fibers::Wait::Reached
-                                    );
-
-                                    assert_eq!(
-                                        peer::try_poll(&mut app, &mut || held
-                                            .try_next(&mut response))
-                                        .expect("held response"),
-                                        (0x2, vec![0xa7; 4 * 1024 * 1024])
-                                    );
-                                    if reject {
-                                        let (head, tail) = peer::try_poll(&mut app, &mut || {
-                                            socket.try_head(&mut head).map_err(peer::Read::Io)
+                                let (root, wait) = root.into_parts();
+                                let result =
+                                    stage.with_quiesce(completion, root, GUARD, |mut app| {
+                                        let mut held =
+                                            TcpStream::try_socket(bind).expect("held peer");
+                                        held.set_write_timeout(Some(GUARD))
+                                            .expect("input deadline");
+                                        held.write_all(OPENING).expect("held opening");
+                                        held.set_nonblocking(true).expect("nonblocking peer");
+                                        let mut head = Vec::new();
+                                        let mut response = peer::try_poll(&mut app, &mut || {
+                                            held.try_upgrade(&mut head)
                                         })
-                                        .expect("deferred rejection");
-                                        assert!(head.starts_with(b"HTTP/1.1 400 Bad Request\r\n"));
-                                        assert!(tail.is_empty());
-                                    }
-                                    assert_eq!(
+                                        .expect("held upgrade");
+                                        let mut socket = TcpStream::try_socket(bind)
+                                            .expect("opening connection");
+                                        socket.set_nonblocking(true).expect("nonblocking opening");
+                                        Backend::set(
+                                            held.as_fd(),
+                                            Kind::RecvBuffer,
+                                            &Value::new(256 * 1024),
+                                        )
+                                        .expect("bounded receive window");
+                                        assert!(response.is_empty());
+                                        peer::try_write(
+                                            &mut app,
+                                            &held,
+                                            &b"start".try_masked(0x2, true).expect("request"),
+                                        )
+                                        .expect("start held response");
+                                        let mut prefix = (&held).take(10);
                                         peer::try_poll(&mut app, &mut || {
-                                            socket.read(&mut [0; 1]).map_err(peer::Read::Io)
+                                            prefix
+                                                .read_to_end(&mut response)
+                                                .map_err(peer::Read::Io)
                                         })
-                                        .expect("server EOF"),
-                                        0
-                                    );
-                                })
+                                        .expect("held frame header");
+                                        assert_eq!(response, [0x82, 127, 0, 0, 0, 0, 0, 64, 0, 0]);
+
+                                        peer::try_write(&mut app, &socket, request)
+                                            .expect("opening request");
+                                        socket.shutdown(Shutdown::Write).expect("opening EOF");
+                                        assert_eq!(
+                                            fibers::TEST
+                                                .try_wait(&mut app, &observed.handle(), 1)
+                                                .expect(
+                                                    "real app consumed EOF before releasing output"
+                                                ),
+                                            fibers::Wait::Reached
+                                        );
+
+                                        assert_eq!(
+                                            peer::try_poll(&mut app, &mut || held
+                                                .try_next(&mut response))
+                                            .expect("held response"),
+                                            (0x2, vec![0xa7; 4 * 1024 * 1024])
+                                        );
+                                        if reject {
+                                            let (head, tail) =
+                                                peer::try_poll(&mut app, &mut || {
+                                                    socket
+                                                        .try_head(&mut head)
+                                                        .map_err(peer::Read::Io)
+                                                })
+                                                .expect("deferred rejection");
+                                            assert!(
+                                                head.starts_with(b"HTTP/1.1 400 Bad Request\r\n")
+                                            );
+                                            assert!(tail.is_empty());
+                                        }
+                                        assert_eq!(
+                                            peer::try_poll(&mut app, &mut || {
+                                                socket.read(&mut [0; 1]).map_err(peer::Read::Io)
+                                            })
+                                            .expect("server EOF"),
+                                            0
+                                        );
+                                    });
+                                assert!(wait.watch().error().is_none(), "listener accept");
+                                result
                             })
                         })
                     },

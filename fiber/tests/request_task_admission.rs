@@ -13,11 +13,7 @@ use dope_fiber::{
     abi::Task,
     context::Context,
     task::storage::{
-        fixed::{
-            quota,
-            schedule::{self, Pool},
-            tree,
-        },
+        fixed::schedule::{self, Pool},
         scope,
     },
 };
@@ -183,7 +179,7 @@ fn discard_keeps_pipeline() {
 
 #[test]
 fn first_poll_drops_request() {
-    type Tasks<'d, F> = tree::Leaf<Pool<'d, F, 1, Domain, ()>>;
+    type Tasks<'d, F> = Pool<'d, F, Domain, ()>;
     let mut reports = Vec::new();
     Driver::new(settings::Config::default()).with_scope(
         |scope| {
@@ -204,8 +200,8 @@ fn first_poll_drops_request() {
                         .dispatch(),
                 )
                 .expect("ready slot");
-            let routes: Tasks<'_, _> = tree::Build::try_build().expect("fixed route storage");
-            let mut tasks = pin!(schedule::Plane::bounded(routes, quota::Limit::new(1)));
+            let mut tasks =
+                pin!(Tasks::try_new(o3::depot::capacity::Count::new(1)).expect("fixed storage"));
             // Retain earlier outputs while the next request reuses the only task slot.
             let completed = scope::Scope::with(tasks.as_mut(), |mut tasks| {
                 [empty::HEAD, empty::BODY, empty::CHUNKED].map(|wire| {
@@ -244,13 +240,12 @@ fn first_poll_drops_request() {
                     )
                     .expect("tracked request");
                     let _ = tasks
-                        .as_mut()
-                        .route::<tree::Here>()
                         .try_admit((), target.target().into())
-                        .expect("fixed quota released before output")((
-                        Tracked::invoke_task((input.expect("admitted input"), &calls, timer)),
-                        (),
-                    ));
+                        .expect("fixed quota released before output")
+                        .insert((
+                            Tracked::invoke_task((input.expect("admitted input"), &calls, timer)),
+                            (),
+                        ));
                     assert_eq!(calls.get(), 0);
                     assert_eq!(DROPS.get(), 0);
                     let turn = control.begin();
@@ -260,7 +255,7 @@ fn first_poll_drops_request() {
                         panic!("fixed task ready");
                     };
                     let schedule::result::Outcome::Complete { output, .. } =
-                        selected.only().drive(&mut driver)
+                        selected.drive(&mut driver)
                     else {
                         panic!("fixed task complete");
                     };

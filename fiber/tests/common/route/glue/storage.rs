@@ -63,9 +63,9 @@ fn stream_handler() -> Stream<'req, IterStream<array::IntoIter<Chunk<'d>, 1>>> {
 
 sark_fiber::define_route! {
     pub GlobalBudgetApp<'state>: State<'state> => {
-        GET "/held" => async(capacity = 2, body = discarded) held_handler,
-        GET "/quick" => async(capacity = 2, body = discarded) narrow_handler,
-        GET "/stream" => stream(capacity = 2) stream_handler,
+        GET "/held" => async(capacity = global, body = discarded) held_handler,
+        GET "/quick" => async(capacity = global, body = discarded) narrow_handler,
+        GET "/stream" => stream(capacity = global) stream_handler,
     }
 }
 

@@ -87,7 +87,7 @@ fn listener_prepares() {
                     Config::new(1),
                 );
                 let (result, activity) = Tracker::activity(|| {
-                    Tracker::fail_after(1, || {
+                    Tracker::fail_after(0, || {
                         bind::Bind::try_bind(app, binding, policies::HeadOnly, &clock)
                     })
                 });
@@ -95,8 +95,8 @@ fn listener_prepares() {
                     result,
                     Err(bind::Error::Allocation(alloc::Error::Exhausted))
                 ));
-                assert_eq!(activity.allocations, 1);
-                assert_eq!(activity.deallocations, 1);
+                assert_eq!(activity.allocations, 0);
+                assert_eq!(activity.deallocations, 0);
                 assert_eq!(activity.allocated_bytes, activity.deallocated_bytes);
             });
             Brand::with(|brand| {
@@ -110,7 +110,7 @@ fn listener_prepares() {
                     bind::Bind::try_bind(app, binding, policies::HeadOnly, &clock)
                 });
                 let runtime = runtime.expect("direct task storage binding");
-                assert_eq!(allocs, 3);
+                assert_eq!(allocs, 1);
                 hint::black_box(&runtime);
             });
         },

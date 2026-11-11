@@ -1,5 +1,6 @@
 use crate::runtime::paths::Paths;
 
+mod drive;
 mod tasks;
 
 use crate::app::serve::{
@@ -65,6 +66,7 @@ pub(in crate::app::serve::handle) struct Types<'a> {
     pub(super) http_mut: proc_macro2::TokenStream,
     pub(super) audit: proc_macro2::TokenStream,
     pub(super) tasks: tasks::Tasks,
+    pub(super) task_methods: proc_macro2::TokenStream,
 }
 
 impl<'a> Types<'a> {
@@ -226,6 +228,13 @@ impl<'a> Types<'a> {
                 )
             };
             let task = &context.exec.identity;
+            let ended = if context.exec.tasks().is_empty() {
+                quote!(#task<#g_brand, 'd, #g_id>)
+            } else {
+                quote!(#ns_fiber::dope_fiber::task::storage::fixed::Id<
+                #g_brand, 'd, #g_id, #ns_fiber::dope_fiber::task::storage::fixed::local::Ended,
+            >)
+            };
             let runtime = quote! {
                 #ns_h1::server::task::runtime::Runtime<
                     'd,
@@ -237,6 +246,7 @@ impl<'a> Types<'a> {
                         #ns_fiber::dope::manifold::network::listener::conn::Id<'d, #g_id>,
                     >>::TransportTag,
                     #bound,
+                    #ended,
                 >
             };
             let rejected = terminal::rejected(paths, &context.plan.spec.state_generics);
@@ -435,7 +445,9 @@ impl<'a> Types<'a> {
                 #probe
             }
         };
+        let task_methods = drive::methods(paths, context, &view, bound);
         Self {
+            task_methods,
             names: Names {
                 generics: &spec.state_generics,
                 state_ty: state,

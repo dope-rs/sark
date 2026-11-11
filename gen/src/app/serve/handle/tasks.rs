@@ -1,5 +1,5 @@
 use crate::{
-    app::serve::{handle, layout},
+    app::serve::{flat, handle},
     macros::tokens::local,
     runtime::paths::Paths,
 };
@@ -53,62 +53,73 @@ impl Tasks {
                 },
             };
         }
-        let routes = fibers.iter().map(|pair| {
-            let path = pair.1.path();
-            let variant = pair.0.variant();
-            let (yielded, completed) = if pair.1.stream {
-                (
-                    quote!(#ns_core::manifold::task::app::Turn::Ready(
-                        #ns_core::manifold::task::app::Handoff::ready(#n_hand, #n_target, #n_output),
-                        #n_ticket,
-                    )),
-                    quote!(#ns_core::manifold::task::app::Handoff::ready(
-                        #n_hand, #n_target, #ns_core::manifold::task::response::Event::<::core::convert::Infallible>::End,
-                    )),
-                )
-            } else {
-                (
-                    quote!(match #n_output {}),
-                    quote!(#ns_core::manifold::task::app::Handoff::complete(
-                        #n_hand, #n_target, #fixed::#variant(#n_output),
-                    )),
-                )
-            };
-            quote! {
-                |(#n_driver, #n_hand), #n_ready| {
-                    let (#n_seen, #n_ticket) = #ns_fiber::dope_fiber::task::storage::fixed::schedule::selected::route::Entry::<_, #path, _, _>::step(
-                        #n_ready,
-                        #n_driver,
-                    );
-                    match #n_seen {
-                        #ns_fiber::dope_fiber::task::storage::fixed::schedule::result::Outcome::Pending { target: #n_target } => {
-                            #ns_core::manifold::task::app::Handoff::pending(
-                                #n_hand,
-                                #n_target,
-                            );
-                            #ns_core::manifold::task::app::Turn::Pending(#n_ticket)
-                        }
-                        #ns_fiber::dope_fiber::task::storage::fixed::schedule::result::Outcome::PendingReady { target: #n_target } => {
-                            #ns_core::manifold::task::app::Handoff::pending(
-                                #n_hand,
-                                #n_target,
-                            );
-                            #ns_core::manifold::task::app::Turn::PendingReady(#n_ticket)
-                        }
-                        #ns_fiber::dope_fiber::task::storage::fixed::schedule::result::Outcome::Yielded { target: #n_target, output: #n_output } => {
-                            #yielded
-                        }
-                        #ns_fiber::dope_fiber::task::storage::fixed::schedule::result::Outcome::Complete { target: #n_target, output: #n_output } => {
-                            #ns_core::manifold::task::app::Turn::Ready(
-                                #completed,
-                                #n_ticket,
-                            )
-                        }
+        let phase = flat::name(ctx.plan.spec, true);
+        let projection = quote::format_ident!("{}Projection", phase);
+        let event = quote::format_ident!("{}Event", phase);
+        let completed = quote::format_ident!("{}Completed", phase);
+        let f_quotas = local("quotas");
+        let has_streams = fibers.iter().any(|(_, fiber)| fiber.stream);
+        let fixed_quota = fibers
+            .iter()
+            .filter(|(_, fiber)| !fiber.stream)
+            .map(|(task, fiber)| {
+                let variant = task.variant();
+                let credit = fiber
+                    .quota
+                    .map(|index| quote!(#v_this.#f_quotas[#index] += 1;));
+                quote!(#fixed::#variant(_) => { #credit })
+            });
+        let fixed_complete = quote! {
+            match &#n_output { #(#fixed_quota,)* }
+            #ns_core::manifold::task::app::Handoff::complete(#n_hand, #n_target, #n_output)
+        };
+        let completion = if has_streams {
+            let fixed_arm = fibers.iter().any(|(_, fiber)| !fiber.stream).then(|| {
+                quote! {
+                    #completed::Fixed(#n_output) => { #fixed_complete }
+                }
+            });
+            let mut end_names = Vec::new();
+            let end_arms: Vec<_> = fibers.iter().filter(|(_, fiber)| fiber.stream).filter_map(|(task, fiber)| {
+                let end = flat::end(*task);
+                if end_names.contains(&end) { return None; }
+                end_names.push(end.clone());
+                let credit = fiber.quota.map(|index| quote!(#v_this.#f_quotas[#index] += 1;));
+                Some(quote! {
+                    #completed::#end => {
+                        #credit
+                        #ns_core::manifold::task::app::Handoff::ready(#n_hand, #n_target,
+                            #ns_core::manifold::task::response::Event::<::core::convert::Infallible>::End)
                     }
+                })
+            }).collect();
+            quote!(match #n_output { #fixed_arm #(#end_arms,)* })
+        } else {
+            fixed_complete
+        };
+        let yielded = if has_streams {
+            let failures = fibers.iter().filter(|(_, fiber)| fiber.stream).map(|(task, _)| {
+                let error = task.phase("Error");
+                quote!(#event::#error(#n_output) => #ns_core::manifold::task::app::Handoff::ready(
+                    #n_hand, #n_target, #ns_core::manifold::task::response::Event::Failed(#n_output)),)
+            });
+            quote! {
+                match #n_output {
+                    #event::Head => #ns_core::manifold::task::app::Handoff::ready(#n_hand, #n_target,
+                        #ns_core::manifold::task::response::Event::<::core::convert::Infallible>::Head),
+                    #event::Chunk(#n_output) => #ns_core::manifold::task::app::Handoff::ready(#n_hand, #n_target,
+                        #ns_core::manifold::task::response::Event::<::core::convert::Infallible>::Chunk(#n_output)),
+                    #(#failures)*
                 }
             }
-        }).collect::<Vec<_>>();
-        let routes = layout::Tree::new(&routes).value(paths);
+        } else {
+            quote!(match #n_output {})
+        };
+        let yielded = if has_streams {
+            quote!(#ns_core::manifold::task::app::Turn::Ready({ #yielded }, #n_ticket))
+        } else {
+            yielded
+        };
         let drive = quote! {
             let mut #v_this = self.project().#f_core.project();
             let mut #n_tasks = #v_this.#f_tasks.as_mut().scope();
@@ -121,11 +132,21 @@ impl Tasks {
                 }
                 #ns_fiber::dope_fiber::task::storage::fixed::schedule::result::Selection::Ready(#n_ready) => #n_ready,
             };
-            #ns_fiber::dope_fiber::task::storage::fixed::schedule::selected::route::Routes::run(
-                #routes,
-                (#n_driver, #n_hand),
-                #n_ready,
-            )
+            let (#n_seen, #n_ticket) = #n_ready.step(#n_driver);
+            match #n_seen {
+                #ns_fiber::dope_fiber::task::storage::fixed::schedule::result::Outcome::Pending { target: #n_target } => {
+                    #ns_core::manifold::task::app::Handoff::pending(#n_hand, #n_target);
+                    #ns_core::manifold::task::app::Turn::Pending(#n_ticket)
+                }
+                #ns_fiber::dope_fiber::task::storage::fixed::schedule::result::Outcome::PendingReady { target: #n_target } => {
+                    #ns_core::manifold::task::app::Handoff::pending(#n_hand, #n_target);
+                    #ns_core::manifold::task::app::Turn::PendingReady(#n_ticket)
+                }
+                #ns_fiber::dope_fiber::task::storage::fixed::schedule::result::Outcome::Yielded { target: #n_target, output: #n_output } =>
+                    { #yielded },
+                #ns_fiber::dope_fiber::task::storage::fixed::schedule::result::Outcome::Complete { target: #n_target, output: #n_output } =>
+                    #ns_core::manifold::task::app::Turn::Ready({ #completion }, #n_ticket),
+            }
         };
         let work = quote!(match self
             .project_ref()
@@ -159,85 +180,73 @@ impl Tasks {
                 }
             }
         };
-        let cancel = fibers.iter().map(|(task, fiber)| {
-            let var = task.variant();
-            let path = fiber.path();
-            quote! {
-                #ident::#var(#n_task) => {
-                    #v_this.#f_tasks
-                        .as_mut()
-                        .scope()
-                        .into_route::<#path>()
-                        .remove(#n_task);
-                }
-            }
-        });
+        let n_entry = symbols.local("__entry");
+        let remove = flat::remove(
+            ctx.plan.spec,
+            ctx.exec,
+            true,
+            &n_entry,
+            quote!(#v_this.#f_quotas),
+        );
         let one = quote! {
             let mut #v_this = self.project().#f_core.project();
-            match #n_task {
-                #( #cancel, )*
-            }
+            let mut #n_tasks = #v_this.#f_tasks.as_mut().scope();
+            if let Ok(mut #n_entry) = #n_tasks.entry(#n_task) { #remove }
         };
-        let emit = fibers.iter().map(|(task, fiber)| {
-            let var = task.variant();
-            let path = fiber.path();
-            let emit = if fiber.stream {
-                quote! {
-                    match #v_this.#f_tasks.as_mut().scope().into_route::<#path>()
-                        .get_mut(#n_task).map(|#n_task| #n_task.head(|#n_output| {
-                            match #n_output.emit(#n_make) {
-                                Ok((#n_ready, #n_output, #n_seen)) => {
-                                    let #n_seen = if #n_output.is_some() {
-                                        #ns_core::manifold::task::response::State::Streaming
-                                    } else {
-                                        #ns_core::manifold::task::response::State::Complete(#n_seen)
-                                    };
-                                    (#n_output, Ok((#n_ready, #n_seen)))
+        let emit = fibers.iter().filter(|(_, fiber)| fiber.stream).map(|(task, _)| {
+            let head = task.phase("Head");
+            let body = task.phase("Body");
+            let end = flat::end(*task);
+            quote! {
+                #projection::#head(#n_output, _) => {
+                    // SAFETY: Head is unpinned; replace it immediately before any fallible operation.
+                    let #n_output = unsafe {
+                        let #n_output = ::core::ptr::read(#n_output);
+                        ::core::ptr::write(#n_ready.as_mut().get_unchecked_mut(), #phase::#end { held: true });
+                        #n_output
+                    };
+                    match #n_output.emit(#n_make) {
+                        Ok((#n_output, #n_seen, #n_ticket)) => {
+                            let #n_seen = match #n_seen {
+                                Some(#n_seen) => {
+                                    #n_ready.set(#phase::#body(#n_seen, true));
+                                    #ns_core::manifold::task::response::State::Streaming
                                 }
-                                Err(#n_output) => (None, Err(#n_output)),
-                            }
-                        }))
-                    {
-                        Ok(Some(#n_ready)) => #ns_core::manifold::task::response::Access::Ready(#n_ready),
-                        Ok(None) | Err(#ns_fiber::dope_fiber::task::storage::fixed::schedule::result::Error::Active) =>
-                            #ns_core::manifold::task::response::Access::Active,
-                        Err(#ns_fiber::dope_fiber::task::storage::fixed::schedule::result::Error::Absent) =>
-                            #ns_core::manifold::task::response::Access::Absent,
+                                None => #ns_core::manifold::task::response::State::Complete(#n_ticket),
+                            };
+                            #ns_core::manifold::task::response::Access::Ready(Ok((#n_output, #n_seen)))
+                        }
+                        Err(#n_output) => #ns_core::manifold::task::response::Access::Ready(Err(#n_output)),
                     }
                 }
-            } else {
-                quote!(#ns_core::manifold::task::response::Access::Absent)
-            };
-            quote!(#ident::#var(#n_task) => { #emit },)
+            }
         });
+        let access = |result: proc_macro2::TokenStream| {
+            quote! {
+                match #result {
+                    Ok(#n_ready) => #ns_core::manifold::task::response::Access::Ready(#n_ready),
+                    Err(#ns_fiber::dope_fiber::task::storage::fixed::schedule::result::Error::Active) =>
+                        #ns_core::manifold::task::response::Access::Active,
+                    Err(#ns_fiber::dope_fiber::task::storage::fixed::schedule::result::Error::Absent) =>
+                        #ns_core::manifold::task::response::Access::Absent,
+                }
+            }
+        };
+        let resumption = access(
+            quote!(self.project().#f_core.project().#f_tasks.as_mut().scope().resume(#n_task)),
+        );
         let emission = quote! {
             let mut #v_this = self.project().#f_core.project();
-            match #n_task {
-                #( #emit )*
-            }
-        };
-        let resume = fibers.iter().map(|(task, fiber)| {
-            let var = task.variant();
-            let path = fiber.path();
-            let resume = if fiber.stream {
-                quote! {
-                    match #v_this.#f_tasks.as_mut().scope().into_route::<#path>().resume(#n_task) {
-                        Ok(()) => #ns_core::manifold::task::response::Access::Ready(()),
-                        Err(#ns_fiber::dope_fiber::task::storage::fixed::schedule::result::Error::Active) =>
-                            #ns_core::manifold::task::response::Access::Active,
-                        Err(#ns_fiber::dope_fiber::task::storage::fixed::schedule::result::Error::Absent) =>
-                            #ns_core::manifold::task::response::Access::Absent,
-                    }
-                }
-            } else {
-                quote!(#ns_core::manifold::task::response::Access::Absent)
-            };
-            quote!(#ident::#var(#n_task) => { #resume },)
-        });
-        let resumption = quote! {
-            let mut #v_this = self.project().#f_core.project();
-            match #n_task {
-                #( #resume )*
+            let mut #n_tasks = #v_this.#f_tasks.as_mut().scope();
+            match #n_tasks.get_mut(#n_task) {
+                Ok(mut #n_ready) => match #n_ready.as_mut().project() {
+                    #(#emit,)*
+                    _ => #ns_core::manifold::task::response::Access::Active,
+                },
+                Err(#ns_fiber::dope_fiber::task::storage::fixed::schedule::result::Error::Active) =>
+                    #ns_core::manifold::task::response::Access::Active,
+                Err(#ns_fiber::dope_fiber::task::storage::fixed::schedule::result::Error::Absent) =>
+                    #ns_core::manifold::task::response::Access::Absent,
             }
         };
         Self {

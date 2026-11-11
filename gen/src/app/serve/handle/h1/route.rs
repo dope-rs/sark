@@ -138,7 +138,6 @@ pub(super) fn emit<'view, 'source, 'spec>(
 
     let spec = ctx.plan.spec;
     let state = spec.state.ty();
-    let ident = &ctx.exec.identity;
     let cont = &h1.continuations;
     use syn::Index;
     let Some(plan) = ctx.plan.route(index) else {
@@ -293,7 +292,8 @@ pub(super) fn emit<'view, 'source, 'spec>(
         serve::Mode::Fiber { task, fiber } => {
             let task = serve::Task::new(plan, task);
             let index = Index::from(fiber.slot);
-            let tasks = task.path().route(&spec.state_generics);
+            let f_tasks = local("tasks");
+            let tasks = quote!(#v_this.#f_tasks.as_mut().scope());
             let source = admit::fiber(
                 paths,
                 ctx,
@@ -355,14 +355,9 @@ pub(super) fn emit<'view, 'source, 'spec>(
         }
         serve::Mode::Stream { task } => {
             let task = serve::Task::new(plan, task);
-            let tasks = task.path().route(&spec.state_generics);
-            let source = admit::stream(
-                paths,
-                &ctx.plan.spec.state_generics,
-                ident,
-                runtime,
-                &task.variant(),
-            );
+            let f_tasks = local("tasks");
+            let tasks = quote!(#v_this.#f_tasks.as_mut().scope());
+            let source = admit::stream(paths, ctx, task, runtime);
             let invoke = quote! {
                 {
                     let mut #n_tasks = #tasks;

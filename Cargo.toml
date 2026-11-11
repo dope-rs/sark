@@ -19,7 +19,7 @@ members = [
 [workspace.package]
 edition = "2024"
 rust-version = "1.98"
-version = "0.31.0"
+version = "0.32.0"
 description = "the L7 layer for dope"
 repository = "https://github.com/dope-rs/sark"
 readme = "README.md"
@@ -28,32 +28,32 @@ authors = ["inq <gofiri@gmail.com>"]
 
 [workspace.dependencies]
 clap = { version = "4.6.6", default-features = false, features = ["std", "help", "usage", "error-context"] }
-cartel-pg = "0.38.0"
-cartel-redis = "0.38.0"
-dope = "0.68.0"
-dope-core = "0.68.0"
-dope-fiber = "0.68.0"
-dope-gen = "0.68.0"
-dope-net = "0.68.0"
-dope-runtime = "0.68.0"
-dope-tls = "0.58.0"
-dope-quic = "0.59.4"
+cartel-pg = "0.39.0"
+cartel-redis = "0.39.0"
+dope = "0.69.0"
+dope-core = "0.69.0"
+dope-fiber = "0.69.0"
+dope-gen = "0.69.0"
+dope-net = "0.69.0"
+dope-runtime = "0.69.0"
+dope-tls = "0.59.0"
+dope-quic = "0.60.1"
 o3 = "0.52.4"
-dope-test = "0.68.0"
+dope-test = "0.69.0"
 pin-project = "1"
 prost = { version = "=0.14.4", default-features = false, features = ["std"] }
 prost-build = "0.14.4"
-sark-core = { path = "core", version = "0.31.0" }
-sark-gen = { path = "gen", version = "0.31.0" }
-sark-h1 = { path = "h1", version = "0.31.0" }
-sark-ws = { path = "ws", version = "0.31.0" }
-sark-h2 = { path = "h2", version = "0.31.0" }
-sark-h3 = { path = "h3", version = "0.31.0" }
-sark-http = { path = "http", version = "0.31.0" }
-sark-grpc = { path = "grpc", version = "0.31.0" }
-sark-json = { path = "json", version = "0.31.0" }
-sark = { path = "sark", version = "0.31.0" }
-sark-client = { path = "client", version = "0.31.0" }
+sark-core = { path = "core", version = "0.32.0" }
+sark-gen = { path = "gen", version = "0.32.0" }
+sark-h1 = { path = "h1", version = "0.32.0" }
+sark-ws = { path = "ws", version = "0.32.0" }
+sark-h2 = { path = "h2", version = "0.32.0" }
+sark-h3 = { path = "h3", version = "0.32.0" }
+sark-http = { path = "http", version = "0.32.0" }
+sark-grpc = { path = "grpc", version = "0.32.0" }
+sark-json = { path = "json", version = "0.32.0" }
+sark = { path = "sark", version = "0.32.0" }
+sark-client = { path = "client", version = "0.32.0" }
 
 [profile.release]
 lto = "fat"

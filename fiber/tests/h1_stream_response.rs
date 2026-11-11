@@ -194,7 +194,7 @@ fn late_failure_closes() {
                             stage,
                             domain::Local::<wire::Identity, _>::new(wire::Identity),
                             app,
-                            |root, wait, stage| run::Failure::<Infallible, _>::session(
+                            |root, wait, stage| run::session::<Infallible, _>(
                                 stage.with_app(&mut done, root, |app| run::run(wait, app)),
                             ),
                         ).expect("install").as_ref().map_err(run::Failure::cause).expect("session");

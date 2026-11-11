@@ -69,10 +69,12 @@ pub(super) fn extras<'emit, 'source, 'spec>(
     let limits = binding.bounds;
     let moves = binding.task_moves;
     let prep = binding.task_prepare;
+    let counts = serve::flat::counts(paths, spec, exec, false);
     let startup = branded.then(|| {
         quote! {
             let (#v_brand, #v_tasks) = #v_tasks;
-            let #v_tasks = #v_tasks.try_prepare()
+            #counts
+            let #v_tasks = #ns_fiber::dope_fiber::task::storage::fixed::Slab::try_new_with_capacity(#v_tasks)
                 .map_err(#ns_h1::server::listener::bind::Error::Allocation)?;
             let #v_tasks = #ns_fiber::dope_fiber::task::storage::scope::Owned::new(#v_tasks, #v_brand);
         }

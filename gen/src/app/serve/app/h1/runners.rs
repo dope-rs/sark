@@ -95,7 +95,7 @@ fn definitions(
     let input = duplex.input_type(paths);
     let run = quote::quote! {
         #v_plan.install(#v_stage, #v_wire, #v_app, |#v_root, #v_wait, #v_stage| {
-            #ns_h1::server::run::Failure::session(
+            #ns_h1::server::run::session(
                 #v_stage.with_app(#v_finish, #v_root, |#v_app| #ns_h1::server::run::run(#v_wait, #v_app)),
             )
         }).map_err(|#v_error| #ns_h1::server::run::Failure::Install(

@@ -1,5 +1,5 @@
 use crate::{
-    app::serve::{self, handle, layout},
+    app::serve::{self, flat, handle},
     macros::tokens::local,
     runtime::paths::Paths,
 };
@@ -60,12 +60,31 @@ pub(super) fn build<'source, 'spec>(
         .collect();
     let identity = &exec.identity;
     let fiber = &exec.fiber;
-    let (tags, variants): (Vec<_>, Vec<_>) = tasks
+    let dflat = flat::build(paths, spec, exec, false);
+    let qflat = flat::build(paths, spec, exec, true);
+    let dty = &dflat.ty;
+    let qty = &qflat.ty;
+    let mode = &qflat.mode;
+    let direct_quota = tasks
         .iter()
-        .map(|task| (task.tag(api), task.variant()))
-        .unzip();
-    let dtree = layout::Tree::new(&exec.direct).ty(paths);
-    let qtree = layout::Tree::new(&exec.queued).ty(paths);
+        .filter(|task| task.capacity().is_some())
+        .count();
+    let queued_quota = exec
+        .fibers()
+        .iter()
+        .filter(|(task, _)| task.capacity().is_some())
+        .count();
+    let f_quotas = local("quotas");
+    let v_quotas = symbols.local("quotas");
+    let quota_field = (direct_quota != 0).then(|| {
+        quote! {
+            #f_quotas: <#g_store as #ns_fiber::manifold::runtime::Storage>::Quota<
+                [u32; #direct_quota], [u32; #queued_quota],
+            >,
+        }
+    });
+    let quota_init = (direct_quota != 0).then(|| quote!(#f_quotas: (),));
+    let quota_move = (direct_quota != 0).then(|| quote!(#f_quotas: #v_quotas,));
     let core_def = &shape.core_generic_def;
     let prod_f = if makers.is_empty() {
         TokenStream::new()
@@ -84,7 +103,8 @@ pub(super) fn build<'source, 'spec>(
                 <#g_store as #ns_fiber::manifold::runtime::Storage>::DirectOnly<
                     #g_brand,
                     'd,
-                    #dtree,
+                    #dty,
+                    #g_id,
                 >,
         }
     } else {
@@ -94,30 +114,25 @@ pub(super) fn build<'source, 'spec>(
                 <#g_store as #ns_fiber::manifold::runtime::Storage>::Tasks<
                     #g_brand,
                     'd,
-                    #dtree,
-                    #qtree,
+                    #dty,
+                    #qty,
+                    #g_id,
+                    #mode,
                 >,
         }
     };
     let direct = quote! {
         #f_tasks: (
             #v_brand,
-            #ns_fiber::dope_fiber::task::storage::fixed::direct::Plan::new(
-                #ns_fiber::dope_fiber::task::storage::fixed::quota::Limit::new(#v_config.capacity()),
+            #ns_fiber::o3::depot::capacity::Count::new(
+                #v_config.capacity().min(u32::MAX as usize) as u32,
             ),
         ),
     };
     let scheduled = if fibers == 0 {
         quote! { #f_tasks: (), }
     } else {
-        quote! {
-            #f_tasks: (
-                #v_brand,
-                #ns_fiber::dope_fiber::task::storage::fixed::schedule::Plan::new(
-                    #ns_fiber::dope_fiber::task::storage::fixed::quota::Limit::new(#v_config.capacity()),
-                ),
-            ),
-        }
+        direct.clone()
     };
     let ids_f = (fibers != 0).then(|| {
         quote! {
@@ -141,6 +156,7 @@ pub(super) fn build<'source, 'spec>(
     } else {
         quote! {
             #store_f
+            #quota_field
             #prod_f
             #ids_f
         }
@@ -149,48 +165,16 @@ pub(super) fn build<'source, 'spec>(
         if tasks.is_empty() {
             TokenStream::new()
         } else {
-            quote! { #prod_i #storage #ids_i }
+            quote! { #prod_i #storage #ids_i #quota_init }
         }
     });
     let moves = if tasks.is_empty() {
         TokenStream::new()
     } else if makers.is_empty() {
-        quote! { #f_tasks: #v_tasks, #ids_mv }
+        quote! { #f_tasks: #v_tasks, #ids_mv #quota_move }
     } else {
-        quote! { #f_tasks: #v_tasks, #f_makers: #v_maker, #ids_mv }
+        quote! { #f_tasks: #v_tasks, #f_makers: #v_maker, #ids_mv #quota_move }
     };
-    let tag_defs = tags.iter().map(|tag| {
-        quote! {
-            struct #tag<__TASK_ID: #ns_fiber::Identity>(
-                ::core::marker::PhantomData<fn() -> __TASK_ID>,
-            );
-        }
-    });
-    let var_defs = variants
-        .iter()
-        .zip(tags.iter())
-        .map(|(variant, tag)| {
-            quote! {
-                #variant(
-                    #ns_fiber::dope_fiber::task::storage::Id<'d, #ns_fiber::dope_fiber::task::storage::scope::Domain<#g_brand, #tag<__TASK_ID>>>,
-                )
-            }
-        })
-        .collect::<Vec<_>>();
-    let fvars = exec
-        .fibers()
-        .iter()
-        .map(|pair| {
-            let task = pair.0;
-            let variant = task.variant();
-            let tag = task.tag(api);
-            quote! {
-                #variant(
-                    #ns_fiber::dope_fiber::task::storage::fixed::schedule::Id<'d, #ns_fiber::dope_fiber::task::storage::scope::Domain<#g_brand, #tag<__TASK_ID>>>,
-                )
-            }
-        })
-        .collect::<Vec<_>>();
     let id_def = if !h1 {
         TokenStream::new()
     } else if tasks.is_empty() {
@@ -203,10 +187,8 @@ pub(super) fn build<'source, 'spec>(
         }
     } else {
         quote! {
-            #[must_use = "dropping a task identity does not cancel or remove its fiber"]
-            enum #identity<#g_brand, 'd, __TASK_ID: #ns_fiber::Identity> {
-                #( #var_defs, )*
-            }
+            type #identity<#g_brand, 'd, __TASK_ID> =
+                #ns_fiber::dope_fiber::task::storage::fixed::Id<#g_brand, 'd, __TASK_ID>;
         }
     };
     let fdef = if fibers == 0 {
@@ -222,10 +204,8 @@ pub(super) fn build<'source, 'spec>(
         }
     } else {
         quote! {
-            #[must_use = "dropping a task identity does not cancel or remove its fiber"]
-            enum #fiber<#g_brand, 'd, __TASK_ID: #ns_fiber::Identity> {
-                #( #fvars, )*
-            }
+            type #fiber<#g_brand, 'd, __TASK_ID> =
+                #ns_fiber::dope_fiber::task::storage::fixed::schedule::Id<#g_brand, 'd, __TASK_ID>;
         }
     };
     let bounds = &shape.base_bounds;
@@ -279,12 +259,16 @@ pub(super) fn build<'source, 'spec>(
         >, ()>
     };
     let hot = &shape.multiplexed_generic_use;
+    let counts = flat::counts(paths, spec, exec, true);
+    let empty_quota = (direct_quota != 0 && queued_quota == 0).then(|| quote!(let #v_quotas = [];));
     let bind = if fibers == 0 {
-        TokenStream::new()
+        quote!(#empty_quota)
     } else {
         quote! {
             let (#v_brand, #v_tasks) = #v_tasks;
-            let #v_tasks = #v_tasks.try_prepare(#n_bind.owners())?;
+            #counts
+            #empty_quota
+            let #v_tasks = #ns_fiber::dope_fiber::task::storage::fixed::schedule::Storage::try_owned(#v_tasks, #n_bind.owners())?;
             let #v_tasks = #ns_fiber::dope_fiber::task::storage::scope::Owned::new(#v_tasks, #v_brand);
         }
     };
@@ -338,8 +322,11 @@ pub(super) fn build<'source, 'spec>(
             }
         }
     };
+    let ddefinition = &dflat.definition;
+    let qdefinition = &qflat.definition;
     let tags = quote! {
-        #( #tag_defs )*
+        #ddefinition
+        #qdefinition
         #id_def
         #fdef
     };

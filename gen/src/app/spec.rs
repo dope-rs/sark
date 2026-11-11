@@ -36,12 +36,12 @@ impl Homogeneity {
 pub(super) enum Mode {
     Sync,
     Fiber {
-        capacity: syn::Expr,
+        capacity: Option<syn::Expr>,
         body: inputs::Body,
         stream: bool,
     },
     Stream {
-        capacity: syn::Expr,
+        capacity: Option<syn::Expr>,
     },
     Duplex,
 }
@@ -199,10 +199,18 @@ impl Spec {
                 names.visit_type_path(guard);
             }
             match &route.kind {
-                inputs::Kind::Async { capacity, .. } | inputs::Kind::Stream { capacity } => {
+                inputs::Kind::Async {
+                    capacity: Some(capacity),
+                    ..
+                }
+                | inputs::Kind::Stream {
+                    capacity: Some(capacity),
+                } => {
                     names.visit_expr(capacity);
                 }
-                inputs::Kind::Sync => {}
+                inputs::Kind::Sync
+                | inputs::Kind::Async { capacity: None, .. }
+                | inputs::Kind::Stream { capacity: None } => {}
             }
         }
         let mut built = routes

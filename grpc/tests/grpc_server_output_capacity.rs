@@ -169,7 +169,8 @@ fn released_waiters() {
                 |worker| {
                     worker.lend(|plan, stage| {
                         plan.install(stage, |app, stage| {
-                            Stage::with_app(stage, &mut finish, app, |mut app| {
+                            let (app, wait) = app.into_parts();
+                            let result = Stage::with_app(stage, &mut finish, app, |mut app| {
                                 let waiters = if cancel {
                                     Either::Left(
                                         Waiters::try_pair(address).expect("zero-window requests"),
@@ -226,7 +227,9 @@ fn released_waiters() {
                                 );
                                 assert_eq!(completed.hits(), want);
                                 waiters
-                            })
+                            });
+                            assert!(wait.watch().error().is_none(), "listener accept");
+                            result
                         })
                     })
                 },
