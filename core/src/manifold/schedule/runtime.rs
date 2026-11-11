@@ -228,13 +228,6 @@ impl<K: manifold::raw::Key, T, B: Block> Runtime<K, T, B> {
         }
         report
     }
-
-    pub fn drive_round<D>(&mut self, driver: &mut D) -> Report
-    where
-        D: Driver<T, Key = K, Block = B>,
-    {
-        Drive::new(&mut self.records.slots, &mut self.policy, driver).run::<true>()
-    }
 }
 
 impl<K: manifold::raw::Key, T, B: Block> ops::Deref for Runtime<K, T, B> {

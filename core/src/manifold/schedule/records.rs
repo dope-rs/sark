@@ -87,17 +87,4 @@ impl<K: manifold::raw::Key, T> Records<K, T> {
     pub fn remove(&mut self, stream: K) -> Option<T> {
         self.slots.entry(stream).map(entry::Slot::remove)
     }
-
-    /// Removes the admitted record after its fallible cleanup succeeds.
-    pub fn try_remove<E>(
-        &mut self,
-        stream: K,
-        clear: impl FnOnce(&mut T) -> Result<(), E>,
-    ) -> Result<Option<T>, E> {
-        let Some(mut entry) = self.slots.entry(stream) else {
-            return Ok(None);
-        };
-        clear(entry.get_mut())?;
-        Ok(Some(entry.remove()))
-    }
 }

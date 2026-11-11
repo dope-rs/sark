@@ -1,10 +1,10 @@
-use std::{cell, convert::Infallible, marker, ops::ControlFlow};
+use std::{cell, marker};
 
 use o3::{base::cell::region, depot::queue::indexed::lanes::entry};
 
 use crate::manifold::{
     self,
-    schedule::{Block, Control, ControlTurn, Decision, Driver, LANES, Terminal, WorkClass, drive},
+    schedule::{Block, ControlTurn, Decision, Driver, LANES, Terminal, WorkClass, drive},
 };
 
 /// One admitted resident owner and its control scheduling authority.
@@ -28,55 +28,8 @@ impl<'a, K: manifold::raw::Key, T, B: Block, Q> Occupied<'a, K, T, B, Q> {
         self.slot.get_mut()
     }
 
-    pub fn remove(self) -> T {
-        self.slot.remove()
-    }
-
     pub fn discard(self) {
         self.slot.discard();
-    }
-
-    /// Changes the resident owner while preserving its exact queue position.
-    pub fn change<R>(self, run: impl FnOnce(T) -> (T, R)) -> (Self, R) {
-        let Self { slot, scope, .. } = self;
-        let (vacant, value) = slot.take();
-        let (value, result) = run(value);
-        (Self::new(vacant.restore(value), scope), result)
-    }
-
-    /// Replaces and schedules the resident owner on Continue, or removes it on
-    /// Break. An unchanged control lane preserves its queue position.
-    pub fn control<R>(self, run: impl FnOnce(T) -> ControlFlow<R, (T, Option<B>, R)>) -> R {
-        match self.try_control::<_, Infallible>(|value| Ok(run(value))) {
-            Ok(result) => result,
-            Err(never) => match never {},
-        }
-    }
-
-    /// A rejected transition restores its owner and preserves the original lane
-    /// and queue position. Accepted transitions follow `control`.
-    pub fn try_control<R, E>(
-        self,
-        run: impl FnOnce(T) -> Result<ControlFlow<R, (T, Option<B>, R)>, (T, E)>,
-    ) -> Result<R, E> {
-        let source = self.slot.lane();
-        let (vacant, value) = self.slot.take();
-        match run(value) {
-            Err((value, error)) => {
-                vacant.restore(value);
-                Err(error)
-            }
-            Ok(ControlFlow::Break(result)) => Ok(result),
-            Ok(ControlFlow::Continue((value, blocked, result))) => {
-                let lane = WorkClass::Control.blocked_lane(blocked.map(Block::wait));
-                if Some(lane) == source {
-                    vacant.restore(value);
-                } else {
-                    vacant.insert(value).move_to_back(lane);
-                }
-                Ok(result)
-            }
-        }
     }
 }
 
@@ -110,17 +63,5 @@ impl<'a, 'id, K: manifold::raw::Key, T, B: Block> Occupied<'a, K, T, B, region::
             drive::borrowed(driver, self.slot, stream, step, activity),
             self.scope,
         )
-    }
-
-    /// Runs a control transition that consumes its resident owner.
-    pub fn owned<D>(
-        self,
-        driver: &mut D,
-        run: impl FnOnce(&mut D, K, T) -> Control<T, B, D::Error>,
-    ) -> Decision<'id, K>
-    where
-        D: Driver<T, Key = K, Block = B>,
-    {
-        Decision::bind(drive::control(driver, self.slot, run), self.scope)
     }
 }

@@ -15,10 +15,6 @@ impl schedule::Block for Blocked {
     }
 }
 
-pub enum Failure {
-    Pending { remaining: usize },
-}
-
 pub struct Permit<'a>(&'a Cell<bool>);
 
 impl Drop for Permit<'_> {
@@ -33,7 +29,6 @@ pub struct Reject<'a> {
     pub repeat: bool,
     pub data: bool,
     pub retain: bool,
-    pub owned: bool,
     pub live: bool,
     pub dropped: &'a Cell<bool>,
 }
@@ -73,21 +68,12 @@ impl<'a> schedule::Driver<Box<usize>> for Reject<'a> {
         permit: Self::Permit,
         entry: schedule::Occupied<'_, Self::Key, Box<usize>, Blocked, region::Identity<'id>>,
     ) -> schedule::Decision<'id, Self::Key> {
-        if self.owned {
-            entry.owned(self, |driver, _, value| {
-                let permit = permit;
-                driver.calls += 1;
-                driver.live = !permit.0.get();
-                schedule::Control::Failed { value, error: 13 }
-            })
-        } else {
-            entry.borrowed(self, |driver, _, _| {
-                let permit = permit;
-                driver.calls += 1;
-                driver.live = !permit.0.get();
-                Err(13)
-            })
-        }
+        entry.borrowed(self, |driver, _, _| {
+            let permit = permit;
+            driver.calls += 1;
+            driver.live = !permit.0.get();
+            Err(13)
+        })
     }
 
     fn data(

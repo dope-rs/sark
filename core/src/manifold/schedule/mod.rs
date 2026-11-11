@@ -10,7 +10,7 @@ mod records;
 mod runtime;
 mod vacant;
 
-use std::{convert::Infallible, marker};
+use std::marker;
 
 use o3::{
     base::cell::region,
@@ -205,14 +205,6 @@ impl<B: Copy> DataTurn<B> {
 
 /// The same scheduling steps as [`DataTurn`], named for the control quantum.
 type Step<B> = DataTurn<B>;
-
-/// Result of a control quantum that consumed its resident value.
-pub enum Control<T, B, E = Infallible> {
-    Retain { value: T, turn: ControlTurn<B> },
-    Failed { value: T, error: E },
-    Complete,
-    Remove,
-}
 
 /// Exact storage destination after a terminal event.
 pub enum Settlement<T> {

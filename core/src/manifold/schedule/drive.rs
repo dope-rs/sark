@@ -2,18 +2,15 @@ use o3::{
     base::cell::region,
     depot::{
         array::Index,
-        queue::indexed::lanes::{
-            Table,
-            entry::{self, Withdrawn},
-        },
+        queue::indexed::lanes::{Table, entry},
     },
 };
 
 use crate::manifold::{
     self,
     schedule::{
-        Block, CONTROL_READY, Control, DATA_READY, Decision, Driver, LANES, Occupied, Report,
-        Settlement, Step, Terminal, Wait, WorkClass, policy::Policy,
+        Block, CONTROL_READY, DATA_READY, Decision, Driver, LANES, Occupied, Report, Settlement,
+        Step, Terminal, Wait, WorkClass, policy::Policy,
     },
 };
 
@@ -203,35 +200,6 @@ pub(super) enum Effect {
     BlockData,
 }
 
-pub(super) fn control<K, T, D>(
-    driver: &mut D,
-    current: entry::Occupied<'_, K, T, LANES>,
-    run: impl FnOnce(&mut D, K, T) -> Control<T, D::Block, D::Error>,
-) -> TurnOutcome<K>
-where
-    K: manifold::raw::Key,
-    D: Driver<T, Key = K>,
-{
-    let stream = current.key();
-    let (vacant, value) = current.take();
-    match run(driver, stream, value) {
-        Control::Retain { value, turn } => {
-            let (step, activity) = turn.into_parts();
-            decide(driver, vacant, stream, value, step, activity)
-        }
-        Control::Complete => TurnOutcome::new(stream, WorkClass::Control, Effect::Complete),
-        Control::Remove => Decision::running(stream, WorkClass::Control),
-        Control::Failed { value, error } => settle(
-            driver,
-            vacant,
-            stream,
-            value,
-            Terminal::Failed(error),
-            WorkClass::Control,
-        ),
-    }
-}
-
 fn data<K, T, D>(
     driver: &mut D,
     mut current: entry::Occupied<'_, K, T, LANES>,
@@ -290,38 +258,6 @@ where
     }
 }
 
-fn decide<K, T, D>(
-    driver: &mut D,
-    vacant: Withdrawn<'_, K, T, LANES>,
-    stream: K,
-    value: T,
-    step: Step<D::Block>,
-    activity: WorkClass,
-) -> TurnOutcome<K>
-where
-    K: manifold::raw::Key,
-    D: Driver<T, Key = K>,
-{
-    match step {
-        Step::Complete => settle(driver, vacant, stream, value, Terminal::Complete, activity),
-        Step::Progress(next) => {
-            vacant.insert(value).move_to_back(next.ready_lane());
-            Decision::running(stream, activity)
-        }
-        Step::Blocked(block) => {
-            let wait = block.wait();
-            let lane = activity.blocked_lane(Some(wait));
-            let decision = match (wait, activity) {
-                (Wait::Egress, WorkClass::Data) => Decision::blocked(stream, activity),
-                _ => Decision::running(stream, activity),
-            };
-            vacant.insert(value).move_to_back(lane);
-            decision
-        }
-        Step::Idle => settle(driver, vacant, stream, value, Terminal::Idle, activity),
-    }
-}
-
 pub(super) fn finish<K, T, D>(
     driver: &mut D,
     current: entry::Occupied<'_, K, T, LANES>,
@@ -334,21 +270,6 @@ where
     D: Driver<T, Key = K>,
 {
     let (vacant, value) = current.take();
-    settle(driver, vacant, stream, value, terminal, activity)
-}
-
-fn settle<K, T, D>(
-    driver: &mut D,
-    vacant: Withdrawn<'_, K, T, LANES>,
-    stream: K,
-    value: T,
-    terminal: Terminal<D::Error>,
-    activity: WorkClass,
-) -> TurnOutcome<K>
-where
-    K: manifold::raw::Key,
-    D: Driver<T, Key = K>,
-{
     let effect = match &terminal {
         Terminal::Complete => Effect::Complete,
         Terminal::Idle | Terminal::Failed(_) => Effect::None,

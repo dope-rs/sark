@@ -1,5 +1,5 @@
 pub mod common;
-use std::{mem, ops::ControlFlow};
+use std::mem;
 
 use common::schedule::vacant::{Blocked, Bounded as _, Handle as _};
 use dope_test::alloc::Tracker;
@@ -190,48 +190,6 @@ fn insertion_schedules_data() {
     assert_eq!(allocs, 0);
     assert!(run.has_runnable());
     assert_eq!(run.remove(stream), Some(7));
-    assert!(!run.has_runnable());
-}
-
-#[test]
-fn occupied_carries_owner() {
-    let mut run: Runtime<Handle, Box<usize>, Blocked> =
-        Runtime::try_new().expect("bounded runtime fixture");
-    let owner = Box::new(7);
-    let address = (&*owner) as *const usize;
-    some(run.vacant(Handle::key(0))).store(owner);
-
-    {
-        let mut entry = some(run.entry(Handle::key(0)));
-        **entry.get_mut() += 1;
-    }
-    assert_eq!(run.get(Handle::key(0)).map(|value| **value), Some(8));
-    assert!(!run.has_runnable());
-
-    let (result, allocs) = Tracker::count(|| {
-        some(run.entry(Handle::key(0)))
-            .control(|owner| ControlFlow::Continue((owner, Some(Blocked::Stream), 17)))
-    });
-    assert_eq!((result, allocs, run.len()), (17, 0, 1));
-
-    let mut calls = 0;
-    let (result, allocs) = Tracker::count(|| {
-        some(run.entry(Handle::key(0))).try_control::<(), _>(|owner| {
-            calls += 1;
-            Err((owner, "retained"))
-        })
-    });
-    assert_eq!((result, allocs, calls), (Err("retained"), 0, 1));
-    assert!(!run.has_runnable());
-    assert_eq!(run.wake(schedule::Wake::Connection), 0);
-    assert_eq!(run.wake(schedule::Wake::Stream(Handle::key(0))), 1);
-
-    let (owner, allocs) =
-        Tracker::count(|| some(run.entry(Handle::key(0))).control(ControlFlow::Break));
-    assert_eq!(allocs, 0);
-    assert_eq!((&*owner) as *const usize, address);
-    assert_eq!(*owner, 8);
-    assert!(run.is_empty());
     assert!(!run.has_runnable());
 }
 
