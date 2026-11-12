@@ -18,7 +18,7 @@ use sark_http::{
         request::Coding,
         response::{Date, Server},
     },
-    owner::handoff,
+    owner::{evidence, handoff},
     payload::{
         compress::{Compression, Gzip, Output},
         fixed::Body,
@@ -33,6 +33,47 @@ use sark_http::{
 
 #[global_allocator]
 static ALLOCATOR: Tracker = Tracker::new();
+
+#[test]
+fn borrowed_plain_uses_output_room() {
+    let source = Vec::from(b"plain".as_slice());
+    let mut gzip = Gzip::try_new().expect("gzip");
+    let mut head = 512;
+    for inline in [true, false] {
+        let mut bytes = [0; 512];
+        let (outcome, allocs) = Tracker::count(|| {
+            output::Egress::new(&mut bytes[..head], DATE, fields::RESPONSE).route(
+                fixed::Direct::new(Code::OK, (), source.as_slice()),
+                handoff::Slot::ready(None),
+                cache::Cache::empty(),
+                &mut gzip,
+                Coding::Gzip,
+                common::body::replies::POLICY,
+            )
+        });
+        match outcome {
+            output::Outcome::SendCopied { written, copy, .. } if inline => {
+                assert_eq!(allocs, 0);
+                assert!(copy.cause == evidence::Cause::Inline);
+                assert_eq!((copy.read, copy.written), (source.len(), source.len()));
+                head = written - source.len();
+                assert_eq!(&bytes[head..written], source.as_slice());
+            }
+            output::Outcome::SendOwnedCopy {
+                hdr_written,
+                body,
+                cause,
+                ..
+            } if !inline => {
+                assert_eq!(allocs, 1);
+                assert_eq!(hdr_written, head);
+                assert!(cause == evidence::Cause::Borrowed);
+                assert_eq!(body.as_ref(), source.as_slice());
+            }
+            _ => panic!("borrowed placement"),
+        }
+    }
+}
 
 #[test]
 fn frames_compressed() {

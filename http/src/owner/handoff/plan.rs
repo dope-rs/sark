@@ -1,4 +1,4 @@
-use std::{convert::Infallible, ptr};
+use std::{convert::Infallible, ops::ControlFlow, ptr};
 
 use handoff::{Error, Origin, Pending, Ready, origin::Source, stage};
 use o3::buffer::{
@@ -26,9 +26,33 @@ impl<'req, 'd, S, B: stage::Body<'req, 'd>> Plan<'req, 'd, S, B> {
         slot: &handoff::Slot<'req, 'd, H, B>,
         bytes: &[u8],
     ) -> Result<Self, owned::Error> {
+        match Self::try_select(slot, bytes)? {
+            Some(plan) => Ok(plan),
+            None => Self::try_copy(slot.origin(), bytes),
+        }
+    }
+
+    pub(crate) fn try_borrow_into<H: scope::Source<Selection = S>>(
+        slot: &handoff::Slot<'req, 'd, H, B>,
+        bytes: &[u8],
+        out: &mut [u8],
+    ) -> Result<ControlFlow<usize, Self>, owned::Error> {
+        if let Some(plan) = Self::try_select(slot, bytes)? {
+            return Ok(ControlFlow::Continue(plan));
+        }
+        if let Some(written) = handoff::copy::into(out, bytes) {
+            return Ok(ControlFlow::Break(written));
+        }
+        Self::try_copy(slot.origin(), bytes).map(ControlFlow::Continue)
+    }
+
+    fn try_select<H: scope::Source<Selection = S>>(
+        slot: &handoff::Slot<'req, 'd, H, B>,
+        bytes: &[u8],
+    ) -> Result<Option<Self>, owned::Error> {
         let origin = slot.origin();
         if bytes.is_empty() {
-            return Ok(Self::new(origin.clear()));
+            return Ok(Some(Self::new(origin.clear())));
         }
         if let Source::Retained(body) = origin.source {
             if body
@@ -36,19 +60,19 @@ impl<'req, 'd, S, B: stage::Body<'req, 'd>> Plan<'req, 'd, S, B> {
                 .as_slice()
                 .is_some_and(|whole| ptr::eq(whole, bytes))
             {
-                return Ok(Self::new(State::Body(body)));
+                return Ok(Some(Self::new(State::Body(body))));
             }
             if let Some(body) = body.borrow().try_slice(bytes)? {
-                return Ok(Self::new(State::Ready {
+                return Ok(Some(Self::new(State::Ready {
                     origin,
                     body: Ready::Linked(body),
-                }));
+                })));
             }
         }
         if let Some(selected) = slot.head.select(bytes) {
-            return Ok(Self::new(State::Head { origin, selected }));
+            return Ok(Some(Self::new(State::Head { origin, selected })));
         }
-        Self::try_copy(origin, bytes)
+        Ok(None)
     }
 
     pub(crate) fn try_retain(

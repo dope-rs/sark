@@ -1,3 +1,5 @@
+use std::ops::ControlFlow;
+
 use o3::buffer::bytes::scope;
 use sark_http::{
     field,
@@ -182,7 +184,16 @@ impl<'req, 'd: 'req, Q: scope::Source, O: stage::Body<'req, 'd>, C: Compression,
                     return stage(slot, head.len(), body);
                 };
                 let zipped = match gzip.encode(raw) {
-                    compress::Output::Plain => return stage(slot, head.len(), body),
+                    compress::Output::Plain => {
+                        let len = head.len();
+                        let Some(out) = head.into_inner().get_mut(len..) else {
+                            return stage(slot, len, body);
+                        };
+                        return Ok(match body.try_resolve_into(&slot, out)? {
+                            ControlFlow::Break(written) => Written::inline(len + written, written),
+                            ControlFlow::Continue(plan) => staged(len, plan.stage()),
+                        });
+                    }
                     compress::Output::Compressed(zipped) => zipped,
                 };
                 let head = head.gzip(date, zipped.len())?;
@@ -451,18 +462,23 @@ fn stage<'req, 'd, B, Q: scope::Source, O: stage::Body<'req, 'd>>(
 where
     B: response::Body<'d>,
 {
-    use handoff::stage;
-
     let plan = response::Body::try_resolve(body, &slot)?;
-    match plan.stage() {
-        stage::State::Body(body) => Ok(Written::RequestBody {
+    Ok(staged(head, plan.stage()))
+}
+
+fn staged<'req, 'd, H, B: stage::Body<'req, 'd>>(
+    head: usize,
+    body: stage::State<'d, H, B>,
+) -> Written<'d, B::Deferred, H> {
+    match body {
+        stage::State::Body(body) => Written::RequestBody {
             head,
             body: body.defer(),
-        }),
-        stage::State::Ready(body) => Ok(Written::Body { head, body }),
-        stage::State::Head(input) => Ok(Written::Head {
+        },
+        stage::State::Ready(body) => Written::Body { head, body },
+        stage::State::Head(input) => Written::Head {
             written: head,
             input,
-        }),
+        },
     }
 }

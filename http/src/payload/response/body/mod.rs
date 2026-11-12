@@ -1,4 +1,4 @@
-use std::iter::FusedIterator;
+use std::{iter::FusedIterator, ops::ControlFlow};
 
 use o3::buffer::{bytes::scope, storage};
 
@@ -32,6 +32,15 @@ pub trait Body<'d>: Sized + Sealed {
         self,
         slot: &handoff::Slot<'req, 'd, H, O>,
     ) -> Result<handoff::Plan<'req, 'd, H::Selection, O>, owned::Error>;
+
+    #[doc(hidden)]
+    fn try_resolve_into<'req, H: scope::Source, O: stage::Body<'req, 'd>>(
+        self,
+        slot: &handoff::Slot<'req, 'd, H, O>,
+        _: &mut [u8],
+    ) -> Result<ControlFlow<usize, handoff::Plan<'req, 'd, H::Selection, O>>, owned::Error> {
+        self.try_resolve(slot).map(ControlFlow::Continue)
+    }
 }
 
 impl<'d> Body<'d> for [u8; 0] {
@@ -72,6 +81,14 @@ impl<'d> Body<'d> for &[u8] {
     ) -> Result<handoff::Plan<'req, 'd, H::Selection, O>, owned::Error> {
         handoff::Plan::try_borrow(slot, self)
     }
+
+    fn try_resolve_into<'req, H: scope::Source, O: stage::Body<'req, 'd>>(
+        self,
+        slot: &handoff::Slot<'req, 'd, H, O>,
+        out: &mut [u8],
+    ) -> Result<ControlFlow<usize, handoff::Plan<'req, 'd, H::Selection, O>>, owned::Error> {
+        handoff::Plan::try_borrow_into(slot, self, out)
+    }
 }
 
 impl<'d> Body<'d> for &str {
@@ -90,6 +107,14 @@ impl<'d> Body<'d> for &str {
         slot: &handoff::Slot<'req, 'd, H, O>,
     ) -> Result<handoff::Plan<'req, 'd, H::Selection, O>, owned::Error> {
         handoff::Plan::try_borrow(slot, self.as_bytes())
+    }
+
+    fn try_resolve_into<'req, H: scope::Source, O: stage::Body<'req, 'd>>(
+        self,
+        slot: &handoff::Slot<'req, 'd, H, O>,
+        out: &mut [u8],
+    ) -> Result<ControlFlow<usize, handoff::Plan<'req, 'd, H::Selection, O>>, owned::Error> {
+        handoff::Plan::try_borrow_into(slot, self.as_bytes(), out)
     }
 }
 

@@ -1,4 +1,4 @@
-use std::iter::FusedIterator;
+use std::{iter::FusedIterator, ops::ControlFlow};
 
 use o3::buffer::{
     bytes::scope,
@@ -182,6 +182,20 @@ impl<'src, 'd> response::Body<'d> for Ref<'src, 'd> {
             return handoff::Plan::try_view(origin, self);
         }
         Ok(handoff::Plan::new(origin.clear()))
+    }
+
+    fn try_resolve_into<'req, H: scope::Source, O: stage::Body<'req, 'd>>(
+        self,
+        slot: &handoff::Slot<'req, 'd, H, O>,
+        out: &mut [u8],
+    ) -> Result<ControlFlow<usize, handoff::Plan<'req, 'd, H::Selection, O>>, owned::Error> {
+        if matches!(self.storage, RefStorage::Slice(_) | RefStorage::Ranges(_))
+            && let Some(bytes) = self.as_slice()
+            && let Some(written) = handoff::copy::into(out, bytes)
+        {
+            return Ok(ControlFlow::Break(written));
+        }
+        self.try_resolve(slot).map(ControlFlow::Continue)
     }
 }
 
