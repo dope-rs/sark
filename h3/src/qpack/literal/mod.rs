@@ -23,11 +23,6 @@ pub(super) struct Literal<'a, S: sources::Source + ?Sized + 'a = [u8]> {
     encoding: strings::Encoding,
 }
 
-pub(super) enum Access<'a> {
-    Raw(record::Span<'a>),
-    Materialize,
-}
-
 pub(super) enum Raw<'a> {
     Plain(&'a [u8]),
     Huffman(source::Measured<'a>),
@@ -210,39 +205,69 @@ impl<'a, S: sources::Source + ?Sized + 'a> Literal<'a, S> {
         }
     }
 
-    pub(super) fn access(&self) -> Access<'a> {
+    #[inline(always)]
+    fn borrow(&self, max_len: usize) -> Result<Option<(record::Span<'a>, usize)>, Error> {
         match self.encoding {
-            strings::Encoding::Huffman => return Access::Materialize,
+            strings::Encoding::Huffman => return Ok(None),
             strings::Encoding::Plain => {}
         }
-        match &self.bytes {
-            LiteralBytes::Borrowed(bytes) => Access::Raw(record::Span::from_slice(bytes)),
-            LiteralBytes::Split(bytes) => Access::Raw(*bytes),
-            LiteralBytes::Cursor(span) => match span.form() {
-                sources::Form::Contiguous(bytes) => Access::Raw(record::Span::from_slice(bytes)),
-                sources::Form::Segmented => Access::Materialize,
-            },
-        }
+        let bytes = match &self.bytes {
+            LiteralBytes::Borrowed(bytes) => record::Span::from_slice(bytes),
+            LiteralBytes::Split(bytes) => *bytes,
+            LiteralBytes::Cursor(span) => {
+                let Some((first, second)) = span.as_slices() else {
+                    return Ok(None);
+                };
+                record::Span::new(first, second)
+            }
+        };
+        let left = match max_len.checked_sub(bytes.len()) {
+            Some(left) => left,
+            None => {
+                if matches!(&self.bytes, LiteralBytes::Cursor(_)) && !bytes.parts().1.is_empty() {
+                    return Ok(None);
+                }
+                return Err(Error::FieldCapacity {
+                    available: max_len,
+                    required: bytes.len(),
+                });
+            }
+        };
+        Ok(Some((bytes, left)))
     }
 
+    #[inline(always)]
     pub(super) fn decode_into<'scratch>(
         &self,
         scratch: &'scratch mut buffer::Values,
         max_len: usize,
-    ) -> Result<block::Valued<'scratch>, Error> {
+    ) -> Result<(block::Valued<'scratch>, usize), Error>
+    where
+        'a: 'scratch,
+    {
+        if let Some((bytes, left)) = self.borrow(max_len)? {
+            return Ok((block::Valued::from_span(bytes), left));
+        }
         scratch.clear();
-        self.write_to(&mut scratch.writer(None), max_len)?;
-        Ok(scratch.valued())
+        let len = self.write_to(&mut scratch.writer(None), max_len)?;
+        Ok((scratch.valued(), max_len - len))
     }
 
+    #[inline(always)]
     pub(super) fn decode_name<'scratch>(
         &self,
         scratch: &'scratch mut buffer::Names,
         max_len: usize,
-    ) -> Result<block::Named<'scratch>, Error> {
+    ) -> Result<(block::Named<'scratch>, usize), Error>
+    where
+        'a: 'scratch,
+    {
+        if let Some((bytes, left)) = self.borrow(max_len)? {
+            return Ok((block::Named::from_span(bytes), left));
+        }
         scratch.clear();
-        self.write_to(&mut scratch.writer(None), max_len)?;
-        Ok(scratch.named())
+        let len = self.write_to(&mut scratch.writer(None), max_len)?;
+        Ok((scratch.named(), max_len - len))
     }
 
     pub(super) fn validate(&self, max_len: usize) -> Result<(usize, block::Validation), Error> {

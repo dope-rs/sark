@@ -17,40 +17,23 @@ use sark_http::field::{
 
 use crate::qpack::{decoder::Error, identity::Identity, literal};
 
-#[derive(Clone, Copy)]
-#[repr(transparent)]
-struct Budget(usize);
-
-impl Budget {
-    const fn new(value: usize) -> Self {
-        Self(value)
-    }
-
-    fn subtract(self, required: usize) -> Result<Self, Error> {
-        self.0
-            .checked_sub(required)
-            .map(Self)
-            .ok_or(Error::FieldCapacity {
-                available: self.0,
-                required,
-            })
-    }
-
-    const fn get(self) -> usize {
-        self.0
-    }
+fn subtract(available: usize, required: usize) -> Result<usize, Error> {
+    available.checked_sub(required).ok_or(Error::FieldCapacity {
+        available,
+        required,
+    })
 }
 
 pub(super) struct RawOutput<'a> {
     fields: &'a mut storage::Writer<Decoded>,
-    remaining: Budget,
+    remaining: usize,
 }
 
 impl<'a> RawOutput<'a> {
     pub(super) fn new(fields: &'a mut storage::Writer<Decoded>, left: usize) -> Self {
         Self {
             fields,
-            remaining: Budget::new(left),
+            remaining: left,
         }
     }
 
@@ -60,12 +43,12 @@ impl<'a> RawOutput<'a> {
         value: literal::Literal<'_, S>,
         indexing: Indexing,
     ) -> Result<(), Error> {
-        let budget = self.remaining.subtract(32)?;
+        let budget = subtract(self.remaining, 32)?;
         self.fields.try_write_as::<Error>(indexing, |writer| {
-            let name_len = name.write_to(writer, budget.get())?;
-            let limit = budget.subtract(name_len)?;
-            let data_len = value.write_to(writer, limit.get())?;
-            self.remaining = limit.subtract(data_len)?;
+            let name_len = name.write_to(writer, budget)?;
+            let limit = subtract(budget, name_len)?;
+            let data_len = value.write_to(writer, limit)?;
+            self.remaining = subtract(limit, data_len)?;
             Ok(name_len)
         })
     }
@@ -75,8 +58,8 @@ impl<'a> RawOutput<'a> {
         name: record::Span<'_>,
         value: record::Span<'_>,
     ) -> Result<(), Error> {
-        let limit = self.remaining.subtract(32)?.subtract(name.len())?;
-        self.remaining = limit.subtract(value.len())?;
+        let limit = subtract(subtract(self.remaining, 32)?, name.len())?;
+        self.remaining = subtract(limit, value.len())?;
         self.fields.try_write::<Error>(|writer| {
             let (name_a, name_b) = name.parts();
             write::Sink::write_slice(writer, name_a)?;
@@ -91,7 +74,7 @@ impl<'a> RawOutput<'a> {
 
 pub(super) struct FieldOutput<'a, P: rules::Policy> {
     consumer: complete::Decoder<'a, P>,
-    remaining: Budget,
+    remaining: usize,
     identity: Option<&'a mut Identity>,
 }
 
@@ -108,7 +91,7 @@ impl<'a, P: rules::Policy> FieldOutput<'a, P> {
     ) -> Self {
         Self {
             consumer,
-            remaining: Budget::new(left),
+            remaining: left,
             identity,
         }
     }
@@ -125,8 +108,8 @@ impl<'a, P: rules::Policy> FieldOutput<'a, P> {
         name: block::Named<'_>,
         value: block::Valued<'_>,
     ) -> Result<(), Error> {
-        let limit = self.remaining.subtract(32)?.subtract(name.span().len())?;
-        let left = limit.subtract(value.span().len())?;
+        let limit = subtract(subtract(self.remaining, 32)?, name.span().len())?;
+        let left = subtract(limit, value.span().len())?;
         if let Some(identity) = &mut self.identity {
             identity.try_field(name.span(), value.span())?;
         }
@@ -147,49 +130,28 @@ impl<'a, P: rules::Policy> FieldOutput<'a, P> {
         value: literal::Literal<'_, S>,
         indexing: Indexing,
     ) -> Result<(), Error> {
-        let budget = self.remaining.subtract(32)?;
+        let budget = subtract(self.remaining, 32)?;
         let (name, limit) = match name {
-            Name::Known(name) => (name, budget.subtract(name.span().len())?),
-            Name::Literal(name) => match name.access() {
-                literal::Access::Raw(name) => {
-                    let limit = budget.subtract(name.len())?;
-                    (block::Named::from_span(name), limit)
-                }
-                literal::Access::Materialize => {
-                    let name = name.decode_name(&mut *scratch.name, budget.get())?;
-                    (name, budget.subtract(name.span().len())?)
-                }
-            },
+            Name::Known(name) => (name, subtract(budget, name.span().len())?),
+            Name::Literal(name) => name.decode_name(&mut *scratch.name, budget)?,
         };
         let decision = self.consumer.select(name);
         match decision {
             Selection::Skipped(field) => {
                 let left = if let Some(identity) = &mut self.identity {
-                    let value = match value.access() {
-                        literal::Access::Raw(value) => block::Valued::from_span(value),
-                        literal::Access::Materialize => {
-                            value.decode_into(&mut *scratch.value, limit.get())?
-                        }
-                    };
-                    let left = limit.subtract(value.span().len())?;
+                    let (value, left) = value.decode_into(&mut *scratch.value, limit)?;
                     identity.try_field(name.span(), value.span())?;
                     field.validate(value.validation());
                     left
                 } else {
-                    let (len, valid) = value.validate(limit.get())?;
+                    let (len, valid) = value.validate(limit)?;
                     field.validate(valid);
-                    limit.subtract(len)?
+                    subtract(limit, len)?
                 };
                 self.remaining = left;
             }
             Selection::Buffered(field) => {
-                let value = match value.access() {
-                    literal::Access::Raw(value) => block::Valued::from_span(value),
-                    literal::Access::Materialize => {
-                        value.decode_into(&mut *scratch.value, limit.get())?
-                    }
-                };
-                let left = limit.subtract(value.span().len())?;
+                let (value, left) = value.decode_into(&mut *scratch.value, limit)?;
                 if let Some(identity) = &mut self.identity {
                     identity.try_field(name.span(), value.span())?;
                 }
@@ -215,7 +177,6 @@ impl<'a> Scratch<'a> {
 }
 
 const _: () = {
-    assert!(core::mem::size_of::<Budget>() == core::mem::size_of::<usize>());
     assert!(core::mem::size_of::<RawOutput<'static>>() == 2 * core::mem::size_of::<usize>());
     assert!(core::mem::size_of::<Scratch<'static>>() == 2 * core::mem::size_of::<usize>());
 };

@@ -159,6 +159,20 @@ impl<'a, I: Chunks<'a>> Span<'a, I> {
         }
     }
 
+    #[inline(always)]
+    pub(crate) fn as_slices(&self) -> Option<(&'a [u8], &'a [u8])> {
+        let mut cursor = self.cursor.clone();
+        cursor.fill();
+        let first = cursor.current;
+        if let Some(bytes) = first.get(..self.len) {
+            return Some((bytes, &[]));
+        }
+        cursor.current = &[];
+        cursor.remaining -= first.len();
+        cursor.fill();
+        Some((first, cursor.current.get(..self.len - first.len())?))
+    }
+
     pub(crate) fn chunks(&self) -> Bounded<'a, I> {
         let mut cursor = self.cursor.clone();
         cursor.remaining = self.len;

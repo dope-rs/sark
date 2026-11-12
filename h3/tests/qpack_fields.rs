@@ -458,7 +458,7 @@ fn field_paths_are_packed() {
 }
 
 #[test]
-fn retains_huffman_heads() {
+fn retains_literal_heads() {
     use sark_h3::{
         conn::{
             event::Event,
@@ -467,58 +467,151 @@ fn retains_huffman_heads() {
         frame,
     };
 
-    let values = [
-        (b"alpha".as_slice(), b"bravo".as_slice()),
-        (b"charlie".as_slice(), b"delta".as_slice()),
-    ];
-    let mut conn = Connection::with_role(Role::Server).expect("request connection");
-    let mut encoder = Encoder::new();
-    encoder.set_encoding(Encoding::Huffman);
-    let mut retained = Vec::new();
-    for (index, (first, second)) in values.iter().copied().enumerate() {
-        let fields = [
-            literal!(entry(b":method", b"GET")),
-            literal!(entry(b":scheme", b"https")),
-            literal!(entry(b":authority", b"example.test")),
-            literal!(entry(b":path", b"/literal")),
-            entry(b"x-first", first).expect("field fixture"),
-            entry(b"x-second", second).expect("field fixture"),
+    for encoding in [Encoding::Plain, Encoding::Huffman] {
+        let values = [
+            (b"alpha".as_slice(), b"bravo".as_slice()),
+            (b"charlie".as_slice(), b"delta".as_slice()),
         ];
-        let stream = Id::new(index as u64 * 4).expect("request stream");
-        let mut block = Vec::new();
-        encoder
-            .encode(stream.get(), fields, &mut block)
-            .expect("literal block");
-        let mut wire = Vec::new();
-        frame::Payload::encode(frame::TYPE_HEADERS, &block, &mut wire).expect("headers frame");
-        let (fields, (allocs, _)) = Tracker::usage(|| {
-            assert!(
-                Receive::new(&mut conn)
-                    .borrowed(stream, &wire, Boundary::End)
-                    .is_ok(),
-                "request ingress",
-            );
-            loop {
-                match conn.events().poll_token() {
-                    Ok(Step::Item(Event::Headers { head, .. })) => break head.into_parts().0,
-                    step => {
-                        assert!(step.is_ok(), "request event");
-                        assert!(!matches!(step, Ok(Step::Idle)), "headers pending");
+        let mut conn = Connection::with_role(Role::Server).expect("request connection");
+        let mut encoder = Encoder::new();
+        encoder.set_encoding(encoding);
+        let mut retained = Vec::new();
+        for (index, (first, second)) in values.iter().copied().enumerate() {
+            let fields = [
+                literal!(entry(b":method", b"GET")),
+                literal!(entry(b":scheme", b"https")),
+                literal!(entry(b":authority", b"example.test")),
+                literal!(entry(b":path", b"/literal")),
+                entry(b"x-first", first).expect("field fixture"),
+                entry(b"x-second", second).expect("field fixture"),
+            ];
+            let stream = Id::new(index as u64 * 4).expect("request stream");
+            let mut block = Vec::new();
+            encoder
+                .encode(stream.get(), fields, &mut block)
+                .expect("literal block");
+            let mut wire = Vec::new();
+            frame::Payload::encode(frame::TYPE_HEADERS, &block, &mut wire).expect("headers frame");
+            let fragments = match encoding {
+                Encoding::Plain => {
+                    let name = wire
+                        .windows(7)
+                        .position(|bytes| bytes == b"x-first")
+                        .expect("literal name")
+                        + 3;
+                    let value = wire
+                        .windows(first.len())
+                        .position(|bytes| bytes == first)
+                        .expect("literal value")
+                        + 2;
+                    [&wire[..name], &wire[name..value], &wire[value..]]
+                }
+                Encoding::Huffman => [&[][..], &[][..], &wire],
+            };
+            let (fields, (allocs, _)) = Tracker::usage(|| {
+                for (part, bytes) in fragments.into_iter().enumerate() {
+                    if bytes.is_empty() {
+                        continue;
+                    }
+                    Receive::new(&mut conn)
+                        .borrowed(
+                            stream,
+                            bytes,
+                            if part == 2 {
+                                Boundary::End
+                            } else {
+                                Boundary::More
+                            },
+                        )
+                        .expect("request ingress");
+                }
+                loop {
+                    match conn.events().poll_token() {
+                        Ok(Step::Item(Event::Headers { head, .. })) => break head.into_parts().0,
+                        step => {
+                            assert!(step.is_ok(), "request event");
+                            assert!(!matches!(step, Ok(Step::Idle)), "headers pending");
+                        }
                     }
                 }
-            }
-        });
-        assert_eq!(
-            allocs,
-            [4, 2][index],
-            "borrowed ingress preserves cold and reused scratch allocation counts"
-        );
-        retained.push(fields);
+            });
+            assert_eq!(
+                allocs,
+                match encoding {
+                    Encoding::Plain => [3, 4][index],
+                    Encoding::Huffman => [4, 2][index],
+                },
+                "split plain literals allocate only ingress segments and retained fields"
+            );
+            retained.push(fields);
+        }
+        for (fields, (first, second)) in retained.iter().zip(values) {
+            assert_eq!(fields.get(b":authority"), Some(b"example.test".as_slice()));
+            assert_eq!(fields.get(b":path"), Some(b"/literal".as_slice()));
+            assert_eq!(fields.get(b"x-first"), Some(first));
+            assert_eq!(fields.get(b"x-second"), Some(second));
+        }
     }
-    for (fields, (first, second)) in retained.iter().zip(values) {
-        assert_eq!(fields.get(b":authority"), Some(b"example.test".as_slice()));
-        assert_eq!(fields.get(b":path"), Some(b"/literal".as_slice()));
-        assert_eq!(fields.get(b"x-first"), Some(first));
-        assert_eq!(fields.get(b"x-second"), Some(second));
+}
+
+#[test]
+fn split_literal_capacity() {
+    use sark_h3::{
+        conn::{
+            io::Receive,
+            options::{Config, Ingress},
+        },
+        frame,
+    };
+
+    let mut block = Vec::new();
+    Encoder::new()
+        .encode(0, [literal!(entry(b"x-split", b"0123456789"))], &mut block)
+        .expect("literal block");
+    let mut wire = Vec::new();
+    frame::Payload::encode(frame::TYPE_HEADERS, &block, &mut wire).expect("headers frame");
+    let name = wire
+        .windows(7)
+        .position(|bytes| bytes == b"x-split")
+        .expect("literal name")
+        + 3;
+    let value = wire
+        .windows(10)
+        .position(|bytes| bytes == b"0123456789")
+        .expect("literal value")
+        + 5;
+    for (limit, written, additional, maximum) in [(38, 3, 4, 6), (48, 5, 5, 9)] {
+        let mut conn = Connection::with_config(
+            Role::Server,
+            Config {
+                ingress: Ingress {
+                    field_section_bytes: limit,
+                    ..Ingress::default()
+                },
+                ..Config::default()
+            },
+        )
+        .expect("bounded connection");
+        for bytes in [&wire[..name], &wire[name..value]] {
+            Receive::new(&mut conn)
+                .borrowed(Id::ZERO, bytes, Boundary::More)
+                .expect("partial header");
+        }
+        let error = Receive::new(&mut conn)
+            .borrowed(Id::ZERO, &wire[value..], Boundary::End)
+            .and_then(|()| {
+                crate::common::conn::Events::new(&mut conn)
+                    .poll_token()
+                    .map(|_| ())
+            })
+            .expect_err("split literal exceeds field budget");
+        assert_eq!(
+            error,
+            conn::Error::Qpack(decoder::Error::LiteralCapacity {
+                written,
+                additional,
+                maximum
+            })
+        );
     }
 }
