@@ -2,7 +2,12 @@ use std::num::NonZero;
 
 use o3::mem::slice::Ext as _;
 
-use crate::{Error, input::is_whitespace, segment::Atom, source::string::String};
+use crate::{
+    Error,
+    input::is_whitespace,
+    segment::Atom,
+    source::string::{Checked, String},
+};
 
 pub(crate) const MAX_DEPTH: usize = 128;
 const PER_WORD: usize = u64::BITS as usize / 4;
@@ -23,29 +28,29 @@ enum Phase {
 
 /// Four grammar bits per container, with no input owner or borrowed segment.
 #[derive(Clone, Copy)]
-pub(crate) struct Nesting {
+pub(crate) struct Nesting<const UTF8: bool = true> {
     stack: [u64; WORDS],
     depth: u8,
     limit: NonZero<u8>,
-    mode: Mode,
+    mode: Mode<UTF8>,
 }
 
 #[derive(Clone, Copy)]
-enum Mode {
+enum Mode<const UTF8: bool> {
     Structural,
-    String(String),
+    String(String<Checked<UTF8>>),
     Atom(Atom),
     Admitted { quoted: bool, escaped: bool },
 }
 
-enum Change {
-    Mode(Mode),
-    Set { phase: Phase, mode: Mode },
+enum Change<const UTF8: bool> {
+    Mode(Mode<UTF8>),
+    Set { phase: Phase, mode: Mode<UTF8> },
     Open { phase: Phase, child: Phase },
     Close,
 }
 
-impl Nesting {
+impl<const UTF8: bool> Nesting<UTF8> {
     /// Validates a run that leaves the current grammar state unchanged.
     pub(crate) fn skip<'a>(&self, chunk: &'a [u8]) -> &'a [u8] {
         match &self.mode {
@@ -170,7 +175,7 @@ impl Nesting {
         Ok(self.depth == 0)
     }
 
-    fn transition(&mut self, byte: u8) -> crate::Result<Change> {
+    fn transition(&mut self, byte: u8) -> crate::Result<Change<UTF8>> {
         if is_whitespace(byte) {
             return Ok(Change::Mode(Mode::Structural));
         }
@@ -223,7 +228,7 @@ impl Nesting {
         }
     }
 
-    fn value(&self, byte: u8, phase: Phase) -> crate::Result<Change> {
+    fn value(&self, byte: u8, phase: Phase) -> crate::Result<Change<UTF8>> {
         let mode = match byte {
             b'"' => Mode::String(String::new()),
             b'{' | b'[' => {

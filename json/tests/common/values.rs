@@ -4,6 +4,7 @@ pub const INVALID_TEXT: &[u8] = b"\xff";
 pub const INVALID_PLAIN: &[u8] = b"a\"b";
 pub const INVALID_RAW: &[u8] = b"[true,]";
 pub const ESCAPED_TEXT: &[u8] = br#""a\"b""#;
+pub const RAW_TEXT: &str = r#"{"é":["한","\uD83D\uDE00"]}"#;
 
 #[sark_json::json(encode)]
 pub struct Item {
@@ -14,6 +15,8 @@ pub struct Item {
 #[sark_json::json(encode)]
 pub struct BorrowedText<'a> {
     pub value: &'a [u8],
+    #[field(raw)]
+    pub raw: &'a [u8],
 }
 
 #[sark_json::json(encode)]

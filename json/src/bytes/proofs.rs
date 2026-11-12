@@ -93,6 +93,17 @@ impl<T: Backing> Raw<T> {
     }
 }
 
+impl<T: Backing> TryFrom<Text<T>> for Raw<T> {
+    type Error = Rejected<Text<T>, crate::Error>;
+
+    fn try_from(text: Text<T>) -> Result<Self, Self::Error> {
+        if let Err(error) = crate::input::try_raw(text.as_str()) {
+            return Err(Rejected::new(text, error));
+        }
+        Ok(Self { text })
+    }
+}
+
 impl<'a> From<&'a str> for Text<&'a [u8]> {
     fn from(owner: &'a str) -> Self {
         Self::admitted(owner.as_bytes())

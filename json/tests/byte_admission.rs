@@ -1,6 +1,8 @@
 pub mod common;
 
-use common::values::{ESCAPED_TEXT, INVALID_PLAIN, INVALID_RAW, INVALID_TEXT};
+use std::num::NonZero;
+
+use common::values::{ESCAPED_TEXT, INVALID_PLAIN, INVALID_RAW, INVALID_TEXT, RAW_TEXT};
 use dope_test::alloc::Tracker;
 use o3::buffer::write;
 use sark_json::{Plain, PlainError, Raw, Text, writing::Writer};
@@ -45,6 +47,41 @@ fn raw_rejects_with_owner() {
         .into_parts();
     assert!(matches!(error, sark_json::Error::Invalid));
     assert_eq!((owner.as_ptr(), owner.as_slice()), (ptr, INVALID_RAW));
+}
+
+#[test]
+fn raw_from_text() {
+    for input in [RAW_TEXT, r#""é한\uD83D\uDE00""#] {
+        let original = (input.as_ptr(), input.as_bytes());
+        let (raw, usage) =
+            Tracker::usage(|| Raw::try_from(Text::from(input)).expect("raw grammar"));
+        assert_eq!(usage, (0, 0));
+        assert_eq!((raw.as_ptr(), raw.as_slice()), original);
+    }
+
+    for input in common::decode::INVALID
+        .iter()
+        .copied()
+        .chain(["é".as_bytes(), b"null true"])
+    {
+        let (owner, error) = match std::str::from_utf8(input) {
+            Ok(text) => {
+                let (owner, error) = Raw::try_from(Text::from(text))
+                    .expect_err("invalid grammar")
+                    .into_parts();
+                (owner.into_inner(), error)
+            }
+            Err(_) => Raw::try_new(input).expect_err("invalid UTF-8").into_parts(),
+        };
+        assert!(matches!(error, sark_json::Error::Invalid));
+        assert_eq!((owner.as_ptr(), owner), (input.as_ptr(), input));
+    }
+
+    let text = Text::from(common::nested::Node::json(NonZero::new(65).expect("depth")));
+    let original = (text.as_ptr(), text.len());
+    let (text, error) = Raw::try_from(text).expect_err("depth limit").into_parts();
+    assert!(matches!(error, sark_json::Error::Depth));
+    assert_eq!((text.as_ptr(), text.len()), original);
 }
 
 #[test]

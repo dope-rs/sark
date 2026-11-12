@@ -6,7 +6,10 @@ use crate::{
     Error, Nesting,
     parsing::Depth,
     segment::{Atom, ValueKind},
-    source::{outputs, string::String},
+    source::{
+        outputs,
+        string::{Checked, String},
+    },
 };
 
 #[derive(Clone, Copy, Eq, PartialEq)]
@@ -91,7 +94,7 @@ impl Input for [u8] {
     }
 
     fn skip_depth(&self, index: &mut usize, depth: Depth) -> crate::Result<()> {
-        let next = value_with(self, ws_at(self, *index), None, depth)?;
+        let next = value_with::<true>(self, ws_at(self, *index), None, depth)?;
         *index = next;
         Ok(())
     }
@@ -233,7 +236,7 @@ pub(crate) fn inline_plain<'a>(
         capacity: usize::from(capacity),
         overhead: 2,
     };
-    let (span, end) = string_with(input, *index, Some(limit))?;
+    let (span, end) = string_with::<true>(input, *index, Some(limit))?;
     if span.escaped {
         return Err(Error::Invalid);
     }
@@ -253,20 +256,28 @@ pub(crate) fn inline_depth(
         capacity: usize::from(capacity),
         overhead: 0,
     };
-    let end = value_with(input, start, Some(limit), depth)?;
+    let end = value_with::<true>(input, start, Some(limit), depth)?;
     *index = end;
     Ok(start..end)
 }
 
-fn value_with(
+pub(crate) fn try_raw(input: &str) -> crate::Result<()> {
+    let input = input.as_bytes();
+    let mut end = value_with::<false>(input, ws_at(input, 0), None, Depth::ROOT)?;
+    input.finish(&mut end)
+}
+
+fn value_with<const UTF8: bool>(
     input: &[u8],
     index: usize,
     limit: Option<Limit>,
     depth: Depth,
 ) -> crate::Result<usize> {
     match input.get(index) {
-        Some(b'"') => string_with(input, index, limit).map(|(_, end)| end),
-        Some(&open) if matches!(open, b'{' | b'[') => group_at(input, index, open, limit, depth),
+        Some(b'"') => string_with::<UTF8>(input, index, limit).map(|(_, end)| end),
+        Some(&open) if matches!(open, b'{' | b'[') => {
+            group_at::<UTF8>(input, index, open, limit, depth)
+        }
         Some(&first) if matches!(first, b't' | b'f' | b'n' | b'-' | b'0'..=b'9') => {
             atom_with::<false>(input, index, first, limit).map(|(_, end)| end)
         }
@@ -298,17 +309,17 @@ fn atom_with<const INTEGER: bool>(
 }
 
 fn string_at(input: &[u8], index: usize) -> crate::Result<(StringSpan<'_>, usize)> {
-    string_with(input, index, None)
+    string_with::<true>(input, index, None)
 }
 
-fn string_with(
+fn string_with<const UTF8: bool>(
     input: &[u8],
     index: usize,
     limit: Option<Limit>,
 ) -> crate::Result<(StringSpan<'_>, usize)> {
     let start = byte_at(input, index, b'"').ok_or(Error::Invalid)?;
     check_limit(limit, start)?;
-    let mut string = String::new();
+    let mut string = String::<Checked<UTF8>>::new();
     let mut next = start;
     let scan_end = limit.map_or(input.len(), |limit| limit.scan_end(input.len()));
     while next < input.len() {
@@ -340,7 +351,7 @@ fn string_with(
     Err(Error::Invalid)
 }
 
-fn group_at(
+fn group_at<const UTF8: bool>(
     input: &[u8],
     index: usize,
     open: u8,
@@ -349,7 +360,7 @@ fn group_at(
 ) -> crate::Result<usize> {
     let mut next = byte_at(input, index, open).ok_or(Error::Invalid)?;
     check_limit(limit, next)?;
-    let mut nesting = Nesting::start_depth(open, depth)?;
+    let mut nesting = Nesting::<UTF8>::start_depth(open, depth)?;
     let scan_end = limit.map_or(input.len(), |limit| limit.scan_end(input.len()));
     while next < input.len() {
         // SAFETY: the preceding limit check and loop bound admit this same-input suffix.

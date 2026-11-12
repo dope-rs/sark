@@ -18,9 +18,13 @@ fn maps_nonfinite_to_null() {
 fn encodes_borrowed_bytes() {
     let value = BorrowedText {
         value: sark_json::Text::from("driver-owned"),
+        raw: sark_json::Raw::try_from(sark_json::Text::from(RAW_TEXT)).expect("raw"),
     };
     let encoded = value.try_encode().expect("encode");
-    assert_eq!(encoded.as_slice(), br#"{"value":"driver-owned"}"#);
+    assert_eq!(
+        encoded.as_slice(),
+        r#"{"value":"driver-owned","raw":{"é":["한","\uD83D\uDE00"]}}"#.as_bytes()
+    );
 }
 
 #[test]

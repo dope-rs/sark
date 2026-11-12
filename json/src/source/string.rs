@@ -3,7 +3,7 @@ use std::{convert::Infallible, marker::PhantomData};
 use crate::Error;
 
 #[derive(Clone, Copy)]
-pub(crate) enum Checked {}
+pub(crate) enum Checked<const UTF8: bool = true> {}
 
 /// Internal replay mode; its enclosing owner state retains the admitted range.
 #[derive(Clone, Copy)]
@@ -12,12 +12,14 @@ pub(crate) enum Admitted {}
 pub(crate) trait Validation {
     type Error;
     const CHECK: bool;
+    const UTF8: bool = Self::CHECK;
     fn require(valid: bool) -> Result<(), Self::Error>;
 }
 
-impl Validation for Checked {
+impl<const UTF8: bool> Validation for Checked<UTF8> {
     type Error = Error;
     const CHECK: bool = true;
+    const UTF8: bool = UTF8;
     fn require(valid: bool) -> crate::Result<()> {
         if valid { Ok(()) } else { Err(Error::Invalid) }
     }
@@ -167,13 +169,13 @@ impl Decoded {
     }
 }
 
-impl String {
+impl<const UTF8: bool> String<Checked<UTF8>> {
     pub(crate) const fn removed(&self) -> usize {
         self.removed
     }
 
     pub(crate) fn step(&mut self, byte: u8) -> crate::Result<Option<Decoded>> {
-        if matches!(self.escape, Escape::Plain) && self.utf8.left == 0 && byte == b'"' {
+        if matches!(self.escape, Escape::Plain) && (!UTF8 || self.utf8.left == 0) && byte == b'"' {
             return Ok(None);
         }
         self.content(byte).map(Some)
@@ -205,13 +207,13 @@ impl<M: Validation> String<M> {
 
     /// Returns an admitted plain run that leaves every state field unchanged.
     pub(crate) fn skip<'a>(&self, chunk: &'a [u8]) -> &'a [u8] {
-        if !matches!(self.escape, Escape::Plain) || (M::CHECK && self.utf8.left != 0) {
+        if !matches!(self.escape, Escape::Plain) || (M::UTF8 && self.utf8.left != 0) {
             return &chunk[..0];
         }
         let words = chunk.as_chunks::<8>().0;
         let start = words
             .iter()
-            .position(|word| !crate::bytes::is_plain(u64::from_ne_bytes(*word), M::CHECK, M::CHECK))
+            .position(|word| !crate::bytes::is_plain(u64::from_ne_bytes(*word), M::UTF8, M::CHECK))
             .unwrap_or(words.len())
             * 8;
         // SAFETY: the word index is bounded by this input's complete chunks.
@@ -219,7 +221,9 @@ impl<M: Validation> String<M> {
         let len = rest
             .iter()
             .position(|byte| {
-                (M::CHECK && !matches!(byte, 0x20..=0x7f)) || matches!(byte, b'"' | b'\\')
+                (M::CHECK && *byte < 0x20)
+                    || (M::UTF8 && !byte.is_ascii())
+                    || matches!(byte, b'"' | b'\\')
             })
             .unwrap_or(rest.len());
         // SAFETY: len is bounded by rest, so start + len remains within this input.
@@ -229,7 +233,7 @@ impl<M: Validation> String<M> {
     fn content(&mut self, byte: u8) -> Result<Decoded, M::Error> {
         let output = match self.escape {
             Escape::Plain => {
-                if M::CHECK && self.utf8.left != 0 {
+                if M::UTF8 && self.utf8.left != 0 {
                     M::require(byte >= self.utf8.min && byte <= self.utf8.max)?;
                     self.utf8.left -= 1;
                     self.utf8.min = 0x80;
@@ -238,7 +242,7 @@ impl<M: Validation> String<M> {
                 } else if byte == b'\\' {
                     self.escape = Escape::Start;
                     Decoded::empty()
-                } else if byte < 0x80 || !M::CHECK {
+                } else if byte < 0x80 || !M::UTF8 {
                     M::require(byte >= 0x20)?;
                     Decoded::byte(byte)
                 } else {
