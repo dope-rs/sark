@@ -23,6 +23,7 @@ use sark_http::{
 use crate::{Backing, Plain, Raw, Text, TextValue};
 
 mod escape;
+mod raw;
 
 #[repr(transparent)]
 #[must_use = "continue the writer chain"]
@@ -95,11 +96,11 @@ impl<'a, W: write::Sink> Writer<'a, W> {
     pub fn put_u64(self, value: u64) -> ControlFlow<Failure<'a, W>, Self> {
         let mut digits;
         let bytes = if value < 100 {
-            let pair = &Digits::PAIRS[value as usize];
+            let pair = &raw::PAIRS[value as usize];
             if value < 10 { &pair[1..] } else { pair }
         } else {
-            digits = Digits { bytes: [0; 20] };
-            digits.write(value)
+            digits = [mem::MaybeUninit::uninit(); 10];
+            raw::write(value, &mut digits)
         };
         self.put(bytes)
     }
@@ -145,35 +146,6 @@ const _: () = {
         >() == mem::size_of::<usize>() * 3
     );
 };
-
-struct Digits {
-    bytes: [u8; 20],
-}
-
-impl Digits {
-    const PAIRS: [[u8; 2]; 100] = {
-        let mut pairs = [[0; 2]; 100];
-        let mut value = 0;
-        while value < pairs.len() {
-            pairs[value] = [b'0' + (value / 10) as u8, b'0' + (value % 10) as u8];
-            value += 1;
-        }
-        pairs
-    };
-
-    fn write(&mut self, mut value: u64) -> &[u8] {
-        let bytes = &mut self.bytes;
-        let mut start = bytes.len();
-        while value >= 100 {
-            start -= 2;
-            bytes[start..start + 2].copy_from_slice(&Self::PAIRS[(value % 100) as usize]);
-            value /= 100;
-        }
-        start -= 2;
-        bytes[start..start + 2].copy_from_slice(&Self::PAIRS[value as usize]);
-        &bytes[start + usize::from(value < 10)..]
-    }
-}
 
 pub trait Size {
     fn json_size(&self) -> usize;
