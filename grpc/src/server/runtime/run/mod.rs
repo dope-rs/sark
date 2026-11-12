@@ -1,9 +1,8 @@
 //! gRPC server runtime over H2 stream identities.
+use std::ops::ControlFlow;
+
 use dope::core::driver::schedule::clock;
-use o3::{
-    buffer::resident,
-    depot::{capacity::Count, queue::pool},
-};
+use o3::{buffer::resident, depot::queue::pool};
 use resident::bound;
 use sark_core::{
     decode,
@@ -29,7 +28,7 @@ use crate::{
         egress,
         runtime::{
             Connection, policy,
-            state::{self, active},
+            state::{self, active, storage::Storage as _},
         },
     },
 };
@@ -51,6 +50,7 @@ pub enum Fault {
 /// An exact local failure observed by the server host.
 #[derive(Debug)]
 pub enum Failure {
+    Build(state::Error),
     Readiness(active::Error),
     Output { stream: Key, cause: Fault },
 }
@@ -103,18 +103,20 @@ where
     O: Copy + Eq + 'd,
     X: policy::Dispatch<'d, O, Target = active::Entry<'a>>,
     X::Timer: drive::Mode<'d>,
+    X::Storage<state::Store<'a, 'd, Handler<X::Call, X::State>, X::Timer>>:
+        state::storage::Storage<state::Store<'a, 'd, Handler<X::Call, X::State>, X::Timer>>,
 {
-    type State = state::Store<'a, 'd, Handler<X::Call, X::State>, X::Timer>;
+    type State = state::State<'a, X::Storage<Self::Selection>>;
+    type Selection = state::Store<'a, 'd, Handler<X::Call, X::State>, X::Timer>;
     type Timing = timing::On;
     type Build = state::Error;
 
     fn state(&self, cap: app::Capacity) -> Result<Self::State, Self::Build> {
-        let messages = if X::BUFFERED {
-            pool::Plan::from_counts(self.bank.limits.input().count(), cap.streams())
-        } else {
-            pool::Plan::from_counts(Count::new(0), Count::new(0))
-        };
-        state::Store::try_new(self.bank, cap, messages)
+        let active = self.bank.try_take(cap)?;
+        let storage = X::Storage::try_new(cap, |cap| {
+            state::Store::try_new(&self.bank.limits, cap, X::BUFFERED)
+        })?;
+        Ok(state::State { storage, active })
     }
 
     fn drive<H>(
@@ -128,7 +130,7 @@ where
             &mut H,
             &mut Connection<'d, E>,
             &mut drain::Events<'_, 'd>,
-            &Self::State,
+            Option<&Self::Selection>,
         ) -> Result<Option<server::Event<Connection<'d, E>>>, conn::Error>,
         notify: impl FnMut(&mut H, schedule::Wake<Key>),
         finish: impl FnOnce(&mut H, &mut Connection<'d, E>),
@@ -151,6 +153,10 @@ where
 
     /// Cancels every task before releasing any retained call payload.
     fn close(&mut self, state: &mut Self::State, conn: &mut Connection<'d, E>, owner: O) {
+        let active = state.active.get();
+        let ControlFlow::Continue(state) = state.storage.entry() else {
+            return;
+        };
         for index in 0..state.calls.capacity() {
             let Some(stream) = state.calls.key_at(index) else {
                 continue;
@@ -168,15 +174,15 @@ where
                 times.cancel(entry);
             }
         }
-        state.active.get().clear();
+        active.clear();
         state.retire(conn);
-        match <X::Timer as state::Timing<'d>>::activity(state) {
+        match <X::Timer as state::Timing<'d>>::activity(state, state.is_quiescent(active)) {
             schedule::Quiescence::Busy => conn.fail(),
             schedule::Quiescence::Quiet => {}
         }
     }
 
-    fn selected(state: &Self::State, event: &server::Event<Connection<'d, E>>) -> bool {
+    fn selected(state: Option<&Self::Selection>, event: &server::Event<Connection<'d, E>>) -> bool {
         match event {
             server::Event::Head {
                 head,
@@ -188,9 +194,11 @@ where
                         || field.value.starts_with(b"application/grpc+"))
             }),
             server::Event::Head { message, .. } | server::Event::Data { message, .. } => {
-                state.calls.entry(message.key()).is_some()
+                state.is_some_and(|state| state.calls.entry(message.key()).is_some())
             }
-            server::Event::Reset { stream, .. } => state.calls.entry(*stream).is_some(),
+            server::Event::Reset { stream, .. } => {
+                state.is_some_and(|state| state.calls.entry(*stream).is_some())
+            }
             server::Event::Control | server::Event::Established | server::Event::Retired(_) => {
                 false
             }
@@ -198,15 +206,26 @@ where
     }
 
     fn wake(state: &mut Self::State, wake: schedule::Wake<Key>) -> bool {
-        state.calls.wake(wake) != 0
+        match state.storage.entry() {
+            ControlFlow::Continue(state) => state.calls.wake(wake) != 0,
+            ControlFlow::Break(_) => false,
+        }
     }
 
     fn released(state: &mut Self::State) {
-        state.egress_released = true;
+        if let ControlFlow::Continue(state) = state.storage.entry() {
+            state.egress_released = true;
+        }
     }
 
     fn activity(state: &Self::State) -> schedule::Quiescence {
-        <X::Timer as state::Timing<'d>>::activity(state)
+        match state.storage.get() {
+            Some(store) => <X::Timer as state::Timing<'d>>::activity(
+                store,
+                store.is_quiescent(state.active.get()),
+            ),
+            None => schedule::Quiescence::Quiet,
+        }
     }
 }
 
@@ -215,8 +234,11 @@ where
     O: Copy + Eq + 'd,
     X: policy::Dispatch<'d, O, Target = active::Entry<'a>>,
     X::Timer: drive::Mode<'d>,
+    X::Storage<state::Store<'a, 'd, Handler<X::Call, X::State>, X::Timer>>:
+        state::storage::Storage<state::Store<'a, 'd, Handler<X::Call, X::State>, X::Timer>>,
 {
     fn deadline(&self, state: &Self::State) -> Option<clock::Deadline<'d>> {
+        let state = state.storage.get()?;
         let call = state.deadline();
         let output = <X::Timer as state::Timing<'d>>::deadline(&state.output_deadlines);
         match (call, output) {

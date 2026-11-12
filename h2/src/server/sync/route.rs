@@ -62,6 +62,7 @@ where
     O: Copy,
 {
     type State = Book<'d, R>;
+    type Selection = ();
     type Timing = timing::Off;
     type Build = alloc::Error;
 
@@ -81,7 +82,7 @@ where
             &mut H,
             &mut Connection<'d, Self>,
             &mut drain::Events<'_, 'd>,
-            &Self::State,
+            Option<&Self::Selection>,
         ) -> Result<Option<Event<Connection<'d, Self>>>, crate::conn::Error>,
         _: impl FnMut(&mut H, schedule::Wake<crate::stream::Key>),
         finish: impl FnOnce(&mut H, &mut Connection<'d, Self>),
@@ -136,7 +137,7 @@ where
         self.router.clear(state, carrier);
     }
 
-    fn selected(_: &Self::State, _: &Event<Connection<'d, Self>>) -> bool {
+    fn selected(_: Option<&()>, _: &Event<Connection<'d, Self>>) -> bool {
         true
     }
 

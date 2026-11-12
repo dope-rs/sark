@@ -16,7 +16,9 @@ use sark_h2::{
 };
 
 use crate::server::{
-    Bank, Lease, call, calls, egress,
+    call, calls,
+    config::Limits,
+    egress,
     runtime::{
         Connection,
         run::Fault,
@@ -36,7 +38,6 @@ pub struct Store<'r, 'd, T, P: timers::Policy> {
     pub(in crate::server::runtime) deadline_capacity: capacity::Count,
     pub(in crate::server::runtime) call_deadlines:
         Option<deadline::Exact<Key, clock::Deadline<'d>>>,
-    pub(in crate::server::runtime) active: Lease<'r>,
 }
 
 pub(in crate::server::runtime) fn try_deadline<'d>(
@@ -113,16 +114,19 @@ where
     }
 
     pub(in crate::server::runtime) fn try_new(
-        bank: &'r Bank,
+        limits: &Limits,
         cap: Capacity,
-        messages: pool::Plan,
+        buffered: bool,
     ) -> Result<Self, state::Error> {
-        let active = bank.try_take(cap)?;
         let times = P::try_new(cap.streams()).map_err(state::Error::Deadlines)?;
-        let limits = &bank.limits;
         let input = limits.input();
         let output = limits.output();
         let chunks = capacity::Count::new(cap.data());
+        let messages = if buffered {
+            pool::Plan::from_counts(input.count(), cap.streams())
+        } else {
+            pool::Plan::from_counts(capacity::Count::new(0), capacity::Count::new(0))
+        };
         Ok(Self {
             calls: calls::Store::try_new(cap.streams(), chunks, messages)
                 .map_err(state::Error::Storage)?,
@@ -143,8 +147,15 @@ where
             egress_released: false,
             deadline_capacity: cap.streams(),
             call_deadlines: None,
-            active,
         })
+    }
+
+    pub(in crate::server::runtime) fn is_quiescent(&self, active: &active::Signals) -> bool {
+        self.calls.is_quiescent()
+            && self.egress.is_quiescent()
+            && active.is_quiescent()
+            && self.segments.is_idle()
+            && self.deadline().is_none()
     }
 
     pub(in crate::server::runtime) fn deadline(&self) -> Option<clock::Deadline<'d>> {

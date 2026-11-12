@@ -1,4 +1,4 @@
-use std::mem;
+use std::{mem, ops::ControlFlow};
 
 use dope::core::driver::schedule::clock;
 use o3::buffer::resident;
@@ -7,6 +7,7 @@ use sark_core::{
     manifold::{
         schedule,
         server::{self, Connection as _, drain},
+        stream::Section,
     },
 };
 use sark_h2::{
@@ -24,7 +25,7 @@ use crate::server::{
     runtime::{
         Connection, policy,
         run::Failure,
-        state::{self, Store, lanes},
+        state::{self, Store, lanes, storage::Storage as _},
     },
     service::{handler::Production, timers},
 };
@@ -184,14 +185,17 @@ where
     /// due output timers, which remain polled by the lane loop.
     pub(super) fn drain<E: event::Evidence>(
         &mut self,
-        store: &mut state::Store<'r, 'd, Handler<X::Call, X::State>, X::Timer>,
+        state: &mut state::State<
+            'r,
+            X::Storage<Store<'r, 'd, Handler<X::Call, X::State>, X::Timer>>,
+        >,
         conn: &mut Connection<'d, E>,
         turn: &mut app::Turn<'_, '_, '_, 'd, O>,
         mut protocol: impl FnMut(
             &mut H,
             &mut Connection<'d, E>,
             &mut drain::Events<'_, 'd>,
-            &state::Store<'r, 'd, Handler<X::Call, X::State>, X::Timer>,
+            Option<&Store<'r, 'd, Handler<X::Call, X::State>, X::Timer>>,
         )
             -> Result<Option<server::Event<Connection<'d, E>>>, conn::Error>,
         mut notify: impl FnMut(&mut H, schedule::Wake<Key>),
@@ -199,79 +203,101 @@ where
     ) -> Result<drain::Progress, app::Error<Failure>>
     where
         F: FnMut(&mut H, Key, egress::Error<conn::Error>),
+        X::Storage<Store<'r, 'd, Handler<X::Call, X::State>, X::Timer>>:
+            state::storage::Storage<Store<'r, 'd, Handler<X::Call, X::State>, X::Timer>>,
     {
         let now = turn.driver().driver_ref().clock().now();
         let owner = self.owner;
         let work = turn.work();
         let wake = turn.wake();
-        let active = store.active.get();
+        let active = state.active.get();
         drain::Events::fair(work, |mut drain| {
-            let mut tasks = drain::Progress::default();
-            'work: {
-                let state = &mut *store;
-                while state.deadline().is_some_and(|at| at <= now) {
-                    let key = match drain.next_ready(|| state.pop_deadline(now)) {
-                        Ok(Some(key)) => key,
-                        Ok(None) => break 'work,
-                        Err(drain::Empty) => {
-                            conn.fail();
-                            break 'work;
+            let store = match state.storage.entry() {
+                ControlFlow::Continue(store) => Some(store),
+                ControlFlow::Break((storage, capacity)) => 'cold: {
+                    while conn.has_event() {
+                        let Some(event) = protocol(self.context, conn, &mut drain, None)
+                            .map_err(app::Error::Connection)?
+                        else {
+                            break;
+                        };
+                        if matches!(
+                            event,
+                            server::Event::Head {
+                                section: Section::Initial,
+                                ..
+                            }
+                        ) {
+                            break 'cold Some(
+                                self.try_ready(storage, capacity, conn, turn, active, now, event)?,
+                            );
                         }
-                    };
-                    if let Some(entry) = state.calls.entry(key) {
-                        self.fail(
-                            state,
-                            conn,
-                            crate::Status::from_code(crate::Code::DeadlineExceeded),
-                            entry,
-                        );
                     }
+                    None
                 }
-                loop {
+            };
+            let mut tasks = drain::Progress::default();
+            let rearm = if let Some(store) = store {
+                'work: {
                     let state = &mut *store;
-                    if mem::take(&mut state.egress_released) {
-                        self.egress(state, conn, active, schedule::Egress::Released, &mut notify);
+                    while state.deadline().is_some_and(|at| at <= now) {
+                        let key = match drain.next_ready(|| state.pop_deadline(now)) {
+                            Ok(Some(key)) => key,
+                            Ok(None) => break 'work,
+                            Err(drain::Empty) => {
+                                conn.fail();
+                                break 'work;
+                            }
+                        };
+                        if let Some(entry) = state.calls.entry(key) {
+                            self.fail(
+                                state,
+                                conn,
+                                crate::Status::from_code(crate::Code::DeadlineExceeded),
+                                entry,
+                            );
+                        }
                     }
-                    let cursor = state.work.waiting;
-                    let retries = state.work.retries;
-                    let selected = state.work.select(X::TASKS, |lane| match lane {
-                        lanes::Kind::Protocol => conn.has_event(),
-                        lanes::Kind::Semantic => active.has_semantic(),
-                        lanes::Kind::Output => X::Timer::has_output(
-                            now,
-                            &state.output_deadlines,
-                            active,
-                            cursor,
-                            retries,
-                        ),
-                        lanes::Kind::Completion => X::TASKS && self.exec.has_done(owner),
-                        lanes::Kind::Task => X::TASKS && self.exec.has_tasks(owner),
-                    });
-                    match selected {
-                        Some(lanes::Kind::Protocol) => {
-                            let Some(event) = protocol(self.context, conn, &mut drain, store)
-                                .map_err(app::Error::Connection)?
-                            else {
-                                break;
-                            };
-                            self.event(now, store, conn, turn, active, event)
-                                .map_err(Failure::Readiness)
-                                .map_err(app::Error::Application)?;
+                    loop {
+                        let state = &mut *store;
+                        if mem::take(&mut state.egress_released) {
+                            self.egress(
+                                state,
+                                conn,
+                                active,
+                                schedule::Egress::Released,
+                                &mut notify,
+                            );
                         }
-                        Some(lanes::Kind::Semantic) => {
-                            let entry = match drain.next_ready(|| state.poll_app(active)) {
-                                Ok(Some(stream)) => stream,
-                                Ok(None) => break,
-                                Err(drain::Empty) => {
-                                    conn.fail();
+                        let cursor = state.work.waiting;
+                        let retries = state.work.retries;
+                        let selected = state.work.select(X::TASKS, |lane| match lane {
+                            lanes::Kind::Protocol => conn.has_event(),
+                            lanes::Kind::Semantic => active.has_semantic(),
+                            lanes::Kind::Output => X::Timer::has_output(
+                                now,
+                                &state.output_deadlines,
+                                active,
+                                cursor,
+                                retries,
+                            ),
+                            lanes::Kind::Completion => X::TASKS && self.exec.has_done(owner),
+                            lanes::Kind::Task => X::TASKS && self.exec.has_tasks(owner),
+                        });
+                        match selected {
+                            Some(lanes::Kind::Protocol) => {
+                                let Some(event) =
+                                    protocol(self.context, conn, &mut drain, Some(store))
+                                        .map_err(app::Error::Connection)?
+                                else {
                                     break;
-                                }
-                            };
-                            self.semantic(state, conn, turn, entry);
-                        }
-                        Some(lanes::Kind::Output) => {
-                            let entry =
-                                match drain.next_ready(|| X::Timer::poll(now, state, active)) {
+                                };
+                                self.event(now, store, conn, turn, active, event)
+                                    .map_err(Failure::Readiness)
+                                    .map_err(app::Error::Application)?;
+                            }
+                            Some(lanes::Kind::Semantic) => {
+                                let entry = match drain.next_ready(|| state.poll_app(active)) {
                                     Ok(Some(stream)) => stream,
                                     Ok(None) => break,
                                     Err(drain::Empty) => {
@@ -279,76 +305,126 @@ where
                                         break;
                                     }
                                 };
-                            self.output(now, state, conn, entry);
-                        }
-                        Some(lanes::Kind::Completion) => {
-                            let (entry, done) = match drain.next_ready(|| self.exec.pop_done(owner))
-                            {
-                                Ok(Some(done)) => done,
-                                Ok(None) => break,
-                                Err(drain::Empty) => {
-                                    conn.fail();
-                                    break;
+                                self.semantic(state, conn, turn, entry);
+                            }
+                            Some(lanes::Kind::Output) => {
+                                let entry =
+                                    match drain.next_ready(|| X::Timer::poll(now, state, active)) {
+                                        Ok(Some(stream)) => stream,
+                                        Ok(None) => break,
+                                        Err(drain::Empty) => {
+                                            conn.fail();
+                                            break;
+                                        }
+                                    };
+                                self.output(now, state, conn, entry);
+                            }
+                            Some(lanes::Kind::Completion) => {
+                                let (entry, done) =
+                                    match drain.next_ready(|| self.exec.pop_done(owner)) {
+                                        Ok(Some(done)) => done,
+                                        Ok(None) => break,
+                                        Err(drain::Empty) => {
+                                            conn.fail();
+                                            break;
+                                        }
+                                    };
+                                self.completion(state, conn, done, entry);
+                                self.exec.wake_tasks();
+                            }
+                            Some(lanes::Kind::Task) => {
+                                tasks = self.exec.drive_tasks(owner, work, turn.driver());
+                                self.egress(
+                                    state,
+                                    conn,
+                                    active,
+                                    schedule::Egress::Unchanged,
+                                    &mut notify,
+                                );
+                                break;
+                            }
+                            None => {
+                                let (_, edge) = self.egress(
+                                    state,
+                                    conn,
+                                    active,
+                                    schedule::Egress::Unchanged,
+                                    &mut notify,
+                                );
+                                match edge {
+                                    active::Edge::None => break,
+                                    active::Edge::Wake => {}
                                 }
-                            };
-                            self.completion(state, conn, done, entry);
-                            self.exec.wake_tasks();
-                        }
-                        Some(lanes::Kind::Task) => {
-                            tasks = self.exec.drive_tasks(owner, work, turn.driver());
-                            self.egress(
-                                state,
-                                conn,
-                                active,
-                                schedule::Egress::Unchanged,
-                                &mut notify,
-                            );
-                            break;
-                        }
-                        None => {
-                            let (_, edge) = self.egress(
-                                state,
-                                conn,
-                                active,
-                                schedule::Egress::Unchanged,
-                                &mut notify,
-                            );
-                            match edge {
-                                active::Edge::None => break,
-                                active::Edge::Wake => {}
                             }
                         }
                     }
                 }
-            }
-            let state = &*store;
+                let state = &*store;
+                if X::TASKS && self.exec.has_tasks(owner) {
+                    tasks.exhaust();
+                }
+                let done = X::TASKS && self.exec.has_done(owner);
+                let task = X::TASKS && active.has_work();
+                let output = X::Timer::has_output(
+                    now,
+                    &state.output_deadlines,
+                    active,
+                    state.work.waiting,
+                    state.work.retries,
+                );
+                conn.has_event()
+                    || state.deadline().is_some_and(|at| at <= now)
+                    || state.egress_released
+                    || task
+                    || output
+                    || done
+                    || state.calls.has_runnable()
+            } else {
+                let pending = conn.has_event();
+                if !pending {
+                    while let Some(wake) = conn.poll_wake() {
+                        notify(self.context, wake);
+                    }
+                }
+                pending
+            };
             let mut result = drain.finish();
             result.merge(tasks);
-            if X::TASKS && self.exec.has_tasks(owner) {
-                result.exhaust();
-            }
-            let done = X::TASKS && self.exec.has_done(owner);
-            let task = X::TASKS && active.has_work();
-            let output = X::Timer::has_output(
-                now,
-                &state.output_deadlines,
-                active,
-                state.work.waiting,
-                state.work.retries,
-            );
-            let rearm = conn.has_event()
-                || state.deadline().is_some_and(|at| at <= now)
-                || state.egress_released
-                || task
-                || output
-                || done
-                || state.calls.has_runnable();
             if rearm && !result.is_exhausted() {
                 wake.wake();
             }
             finish(self.context, conn);
             Ok(result)
         })
+    }
+
+    #[inline(never)]
+    fn try_ready<'s, E: event::Evidence>(
+        &mut self,
+        storage: &'s mut X::Storage<Store<'r, 'd, Handler<X::Call, X::State>, X::Timer>>,
+        capacity: app::Capacity,
+        conn: &mut Connection<'d, E>,
+        turn: &mut app::Turn<'_, '_, '_, 'd, O>,
+        active: &'r active::Signals,
+        now: clock::Moment<'d>,
+        event: server::Event<Connection<'d, E>>,
+    ) -> Result<&'s mut Store<'r, 'd, Handler<X::Call, X::State>, X::Timer>, app::Error<Failure>>
+    where
+        F: FnMut(&mut H, Key, egress::Error<conn::Error>),
+        X::Storage<Store<'r, 'd, Handler<X::Call, X::State>, X::Timer>>:
+            state::storage::Storage<Store<'r, 'd, Handler<X::Call, X::State>, X::Timer>>,
+    {
+        let store = Store::try_new(self.limits, capacity, X::BUFFERED)
+            .map_err(Failure::Build)
+            .map_err(app::Error::Application)?;
+        let store = storage.insert(store);
+        store
+            .work
+            .select(X::TASKS, |lane| lane == lanes::Kind::Protocol);
+        self.event(now, store, conn, turn, active, event)
+            .map_err(Failure::Readiness)
+            .map_err(app::Error::Application)?;
+        Ok(store)
     }
 
     pub(super) fn fail<E: event::Evidence>(

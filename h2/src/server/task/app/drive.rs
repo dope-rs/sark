@@ -450,6 +450,7 @@ where
             turn,
             egress,
             &mut (book, router, tasks, index, mode, &mut *fault),
+            #[inline(always)]
             |(book, router, tasks, index, mode, fault), connection, drain, state| {
                 let mut book = book::Turn::new(connection, book);
                 let Some(ready) = book.ready() else {

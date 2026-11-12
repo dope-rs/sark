@@ -84,6 +84,7 @@ where
     type Call = ();
     type Completion = Infallible;
     type State = Option<group::Id<'s, 'd, Domain>>;
+    type Storage<T> = T;
     type Target = active::Entry<'r>;
     type Timer = timers::Off;
 

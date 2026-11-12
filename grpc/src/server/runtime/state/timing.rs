@@ -13,15 +13,7 @@ use crate::server::{
 pub trait Timing<'d>: timers::Policy {
     fn try_new<'r>(cap: Count) -> Result<Self::State<'r, 'd>, heap::Error>;
 
-    fn is_quiescent<T>(state: &state::Store<'_, 'd, T, Self>) -> bool {
-        state.calls.is_quiescent()
-            && state.egress.is_quiescent()
-            && state.active.get().is_quiescent()
-            && state.segments.is_idle()
-            && state.deadline().is_none()
-    }
-
-    fn activity<T>(state: &state::Store<'_, 'd, T, Self>) -> Quiescence;
+    fn activity<T>(state: &state::Store<'_, 'd, T, Self>, quiet: bool) -> Quiescence;
 
     fn timers<'a, 'r>(
         times: &'a mut <Self as timers::Policy>::State<'r, 'd>,
@@ -42,8 +34,8 @@ impl<'d> Timing<'d> for timers::Off {
         Ok(())
     }
 
-    fn activity<T>(state: &state::Store<'_, 'd, T, Self>) -> Quiescence {
-        if Self::is_quiescent(state) {
+    fn activity<T>(_: &state::Store<'_, 'd, T, Self>, quiet: bool) -> Quiescence {
+        if quiet {
             Quiescence::Quiet
         } else {
             Quiescence::Busy
@@ -68,8 +60,8 @@ impl<'d> Timing<'d> for timers::On {
         })
     }
 
-    fn activity<T>(state: &state::Store<'_, 'd, T, Self>) -> Quiescence {
-        if Self::is_quiescent(state) && state.output_deadlines.is_empty() {
+    fn activity<T>(state: &state::Store<'_, 'd, T, Self>, quiet: bool) -> Quiescence {
+        if quiet && state.output_deadlines.is_empty() {
             Quiescence::Quiet
         } else {
             Quiescence::Busy

@@ -118,6 +118,7 @@ pub trait Spec {
 /// Monomorphized semantic runtime driven by a protocol-specific host.
 pub trait Application<'d, E: event::Evidence, O>: Spec<Egress<'d>: 'd> {
     type State;
+    type Selection;
     type Timing;
     type Build;
 
@@ -134,7 +135,7 @@ pub trait Application<'d, E: event::Evidence, O>: Spec<Egress<'d>: 'd> {
             &mut H,
             &mut Connection<'d, Self, E>,
             &mut drain::Events<'_, 'd>,
-            &Self::State,
+            Option<&Self::Selection>,
         )
             -> Result<Option<server::Event<Connection<'d, Self, E>>>, conn::Error>,
         notify: impl FnMut(&mut H, schedule::Wake<crate::stream::Key>),
@@ -144,7 +145,10 @@ pub trait Application<'d, E: event::Evidence, O>: Spec<Egress<'d>: 'd> {
 
     fn close(&mut self, state: &mut Self::State, carrier: &mut Connection<'d, Self, E>, owner: O);
 
-    fn selected(state: &Self::State, event: &server::Event<Connection<'d, Self, E>>) -> bool;
+    fn selected(
+        state: Option<&Self::Selection>,
+        event: &server::Event<Connection<'d, Self, E>>,
+    ) -> bool;
 
     fn wake(state: &mut Self::State, wake: schedule::Wake<crate::stream::Key>) -> bool;
 

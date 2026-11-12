@@ -105,6 +105,7 @@ where
     type Call: Default;
     type Completion;
     type State: Default;
+    type Storage<T>;
     type Target: Copy;
     type Timer: state::Timing<'d>;
 

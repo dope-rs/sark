@@ -47,6 +47,7 @@ where
     type Call = H::Call;
     type Completion = convert::Infallible;
     type State = ();
+    type Storage<S> = std::ops::ControlFlow<app::Capacity, S>;
     type Target = T;
     type Timer = H::Timer;
 

@@ -86,6 +86,7 @@ where
     R: decode::Decode<Egress<'d>: 'd>,
 {
     type State = ();
+    type Selection = ();
     type Timing = timing::On;
     type Build = Infallible;
 
@@ -95,7 +96,7 @@ where
 
     fn drive<H>(
         &mut self,
-        state: &mut (),
+        _: &mut (),
         carrier: &mut Connection<'d, Self, E>,
         turn: &mut app::Turn<'_, '_, '_, 'd, O>,
         _: schedule::Egress,
@@ -104,7 +105,7 @@ where
             &mut H,
             &mut Connection<'d, Self, E>,
             &mut drain::Events<'_, 'd>,
-            &Self::State,
+            Option<&Self::Selection>,
         ) -> Result<
             Option<server::Event<Connection<'d, Self, E>>>,
             crate::conn::Error,
@@ -114,7 +115,7 @@ where
         _: impl FnMut(&mut H, app::Error<Self::Failure>),
     ) -> Result<drain::Progress, app::Error<Self::Failure>> {
         drain::Events::fair(turn.work(), |mut drain| {
-            while protocol(context, carrier, &mut drain, state)
+            while protocol(context, carrier, &mut drain, None)
                 .map_err(app::Error::Connection)?
                 .is_some()
             {}
@@ -125,7 +126,7 @@ where
 
     fn close(&mut self, _: &mut (), _: &mut Connection<'d, Self, E>, _: O) {}
 
-    fn selected(_: &(), _: &server::Event<Connection<'d, Self, E>>) -> bool {
+    fn selected(_: Option<&()>, _: &server::Event<Connection<'d, Self, E>>) -> bool {
         false
     }
 
