@@ -323,21 +323,36 @@ impl<H: Sink> App<H> {
         let limit = self.limit;
         let user = &self.user;
         let temp = &mut self.temp;
-        let result = conn.write().try_prefix(driver, |state, buffer| {
-            let mut out = Output::new(buffer);
-            if let Some((opening, accept)) = accept {
-                state.phase = match opening::upgrade(user, opening, &mut out.response, accept) {
-                    Ok(phase) => phase,
-                    Err(error) => {
-                        user.failed(server::Error::Capacity(error));
-                        Phase::Closed
-                    }
+        let result = conn.write().try_prefix(driver, |state, mut prefix| {
+            {
+                let mut writer = prefix.writer();
+                let mut split = match writer.try_split(0, writer.remaining()) {
+                    Ok(split) => split,
+                    Err(_) => unreachable!("prefix"),
                 };
+                let mut out = Output::new(split.body());
+                if let Some((opening, accept)) = accept {
+                    state.phase = match opening::upgrade(user, opening, &mut out.response, accept) {
+                        Ok(phase) => phase,
+                        Err(error) => {
+                            user.failed(server::Error::Capacity(error));
+                            Phase::Closed
+                        }
+                    };
+                }
+                if state.phase == Phase::Active {
+                    state.phase = Frames::new(user, limit).chunk(temp, state, chunk, &mut out);
+                }
+                if out.finish(state, &self.user) && split.try_commit().is_err() {
+                    unreachable!("prefix");
+                }
             }
-            if state.phase == Phase::Active {
-                state.phase = Frames::new(user, limit).chunk(temp, state, chunk, &mut out);
+            let commit = prefix.commit(None, ());
+            if state.phase == Phase::Closed && state.pending.is_none() {
+                commit.close_after()
+            } else {
+                commit
             }
-            out.finish(state, &self.user)
         });
         match Self::finish(conn, result) {
             Commit::Committed => match Self::send_pending(conn, driver) {
@@ -353,13 +368,13 @@ impl<H: Sink> App<H> {
         conn: &mut Ctx<'_, '_, '_, '_, '_, 'd, ID>,
         driver: &mut driver::Context<'_, 'd>,
     ) -> Commit {
-        let result = conn.write().try_prefix(driver, |state, buffer| {
-            let mut out = server::Response::new(buffer);
+        let result = conn.write().try_prefix(driver, |state, mut prefix| {
+            let mut out = server::Response::new(prefix.writer());
             if let Err(error) = out.put_raw(server::Response::REJECTION) {
                 self.user.failed(server::Error::Capacity(error));
             }
             state.phase = Phase::Closed;
-            write::Draft::new(out.written, None, ()).close_after()
+            prefix.commit(None, ()).close_after()
         });
         Self::finish(conn, result)
     }
@@ -377,16 +392,32 @@ impl<H: Sink> App<H> {
             return;
         }
         let opening = matches!(conn.state().phase, Phase::Handshake | Phase::Opening);
-        let result = conn.write().try_prefix(driver, |state, buffer| {
-            let mut out = Output::new(buffer);
-            if state.phase == Phase::Opening
-                && let Err(error) = opening::drive(&self.path, state, &mut out.response, &self.user)
+        let result = conn.write().try_prefix(driver, |state, mut prefix| {
             {
-                self.user.failed(server::Error::Capacity(error));
-                state.phase = Phase::Closed;
+                let mut writer = prefix.writer();
+                let mut split = match writer.try_split(0, writer.remaining()) {
+                    Ok(split) => split,
+                    Err(_) => unreachable!("prefix"),
+                };
+                let mut out = Output::new(split.body());
+                if state.phase == Phase::Opening
+                    && let Err(error) =
+                        opening::drive(&self.path, state, &mut out.response, &self.user)
+                {
+                    self.user.failed(server::Error::Capacity(error));
+                    state.phase = Phase::Closed;
+                }
+                Frames::new(&self.user, self.limit).pump(state, &mut out);
+                if out.finish(state, &self.user) && split.try_commit().is_err() {
+                    unreachable!("prefix");
+                }
             }
-            Frames::new(&self.user, self.limit).pump(state, &mut out);
-            out.finish(state, &self.user)
+            let commit = prefix.commit(None, ());
+            if state.phase == Phase::Closed && state.pending.is_none() {
+                commit.close_after()
+            } else {
+                commit
+            }
         });
         let result = Self::finish(conn, result);
         if opening && !matches!(conn.state().phase, Phase::Handshake | Phase::Opening) {

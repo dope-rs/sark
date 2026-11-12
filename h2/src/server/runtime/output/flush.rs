@@ -214,13 +214,13 @@ where
                 .bind_link::<{ write::Prefix::CAPACITY }>()
             {
                 Ok(Some(bound)) => bound,
-                Ok(None) => return prefix.commit(None, None).map_err(Error::Commit),
+                Ok(None) => return Ok(prefix.commit(None, None)),
                 Err(cause) => return Err(Error::Input(cause)),
             };
             let drained = bound.is_drained();
             let output = bound
                 .commit_with(&mut prefix, E::retain)
-                .map_err(|cause| Error::Commit(error::Build::prefix(cause, None, None)))?;
+                .map_err(Error::Prefix)?;
             let (body, receipt) = match output {
                 event::Write::Buffered(_) => Ok((None, E::Receipt::default())),
                 event::Write::Owned {
@@ -238,7 +238,7 @@ where
                 cause,
                 receipt: Some(receipt),
             })?;
-            let commit = prefix.commit(body, Some(receipt)).map_err(Error::Commit)?;
+            let commit = prefix.commit(body.map(egress::load::Value::Unchecked), Some(receipt));
             let end = match (&end, drained) {
                 (End::Close, true) => End::Close,
                 (End::Close, false) | (End::Keep, _) => End::Keep,
@@ -264,24 +264,7 @@ where
                     error::Error::Build(Error::Bound { cause, receipt }) => {
                         (Err(cause.into()), receipt)
                     }
-                    error::Error::Build(Error::Commit(error::Build::Prefix {
-                        cause,
-                        receipt,
-                        ..
-                    })) => (Ok(Failure::Prefix(cause)), receipt),
-                    error::Error::Build(Error::Commit(error::Build::Rejected {
-                        cause,
-                        receipt,
-                        ..
-                    })) => {
-                        let (_, cause) = cause.into_parts();
-                        (Ok(Failure::Rejected(cause)), receipt)
-                    }
-                    error::Error::Build(Error::Commit(error::Build::Overflow {
-                        cause,
-                        receipt,
-                        ..
-                    })) => (Ok(Failure::Overflow(cause)), receipt),
+                    error::Error::Build(Error::Prefix(cause)) => (Ok(Failure::Prefix(cause)), None),
                     error::Error::Mismatch(cause) => {
                         let (cause, receipt) = cause.into_parts();
                         (Ok(Failure::Mismatch(cause)), receipt)

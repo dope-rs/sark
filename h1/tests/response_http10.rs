@@ -7,6 +7,7 @@ use common::{
     fields::DATE,
     tasks::{Request, Streaming},
 };
+use o3::buffer::write::Slice;
 use sark_core::body::credit;
 use sark_h1::{
     Input,
@@ -33,11 +34,12 @@ fn fixed_connections() {
     for version in [Version::Ten, Version::Eleven] {
         for connection in [head::Connection::Close, head::Connection::KeepAlive] {
             let mut write = [0; 256];
+            let mut writer = Slice::new(&mut write);
             let response = Context::new(Method::Other, version);
-            let outcome = output::Egress::new(&mut write, DATE, response)
+            let outcome = output::Egress::new(writer.reborrow(), DATE, response)
                 .plain(fixed::Direct::new(Code::OK, (), replies::BYTES), connection);
             let (written, len) = match outcome {
-                output::Outcome::SendCopied { written, copy, .. } => Some((written, copy.written)),
+                output::Outcome::SendCopied { copy, .. } => Some((writer.len(), copy.written)),
                 _ => None,
             }
             .expect("fixed response");
@@ -80,11 +82,16 @@ fn cached_connections() {
             .response();
         let mut cold = [0; 256];
         assert!(
-            output::Egress::new(&mut cold, DATE, response)
-                .cached(&mut cache::Cache::new(&mut entry), route::Cache::Store)
-                .is_none()
+            output::Egress::new(
+                o3::buffer::write::Slice::new(&mut cold).reborrow(),
+                DATE,
+                response
+            )
+            .cached(&mut cache::Cache::new(&mut entry), route::Cache::Store)
+            .is_none()
         );
-        let outcome = output::Egress::new(&mut cold, DATE, response).route(
+        let mut writer = Slice::new(&mut cold);
+        let outcome = output::Egress::new(writer.reborrow(), DATE, response).route(
             fixed::Direct::new(Code::OK, (), replies::BYTES),
             handoff::Slot::ready(None),
             cache::Cache::new(&mut entry),
@@ -93,7 +100,7 @@ fn cached_connections() {
             policy,
         );
         let (written, len) = match outcome {
-            output::Outcome::SendCopied { written, copy, .. } => Some((written, copy.written)),
+            output::Outcome::SendCopied { copy, .. } => Some((writer.len(), copy.written)),
             _ => None,
         }
         .expect("cached response");
@@ -105,8 +112,12 @@ fn cached_connections() {
         assert_eq!(&cold[written - len..written], replies::BYTES);
         let mut hot = [0; 256];
         assert!(matches!(
-            output::Egress::new(&mut hot, DATE, response)
-                .cached(&mut cache::Cache::new(&mut entry), route::Cache::Store),
+            output::Egress::new(
+                o3::buffer::write::Slice::new(&mut hot).reborrow(),
+                DATE,
+                response
+            )
+            .cached(&mut cache::Cache::new(&mut entry), route::Cache::Store),
             Some(output::Outcome::SendCopied { .. })
         ));
         assert_eq!(hot, cold);
@@ -132,7 +143,11 @@ fn stream_ten() {
         let state = Cell::new(0);
         let admitted = Cell::new(false);
         let outcome = stream::Endpoint::new(
-            output::Egress::new(&mut write, DATE, parsed.response()),
+            output::Egress::new(
+                o3::buffer::write::Slice::new(&mut write).reborrow(),
+                DATE,
+                parsed.response(),
+            ),
             &mut conn,
         )
         .dispatch::<Streaming, _, _, _, _>(
@@ -154,7 +169,11 @@ fn stream_ten() {
                     },
                     session::Permit::new(),
                     stream::Execution::new(
-                        output::Egress::new(&mut write, DATE, response),
+                        output::Egress::new(
+                            o3::buffer::write::Slice::new(&mut write).reborrow(),
+                            DATE,
+                            response,
+                        ),
                         &state,
                         &mut (),
                         || Some(|(), _: &mut (), _: Context| admitted.set(true)),

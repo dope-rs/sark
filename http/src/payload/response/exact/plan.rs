@@ -1,5 +1,8 @@
 use o3::{
-    buffer::{storage, write::consume},
+    buffer::{
+        storage,
+        write::{Slice, consume},
+    },
     mem::Rejected,
 };
 
@@ -45,13 +48,19 @@ impl<B: TryBody> Plan<B> {
         storage::Exact::try_build(len, |out| body.encode(out)).map(storage::Exact::into_shared)
     }
 
-    pub fn encode(self, out: &mut [u8]) -> Result<(), storage::BuildError<consume::Error>> {
+    pub fn encode<L: std::borrow::BorrowMut<usize>>(
+        self,
+        out: &mut Slice<'_, L>,
+    ) -> Result<(), storage::BuildError<consume::Error>> {
         let Self {
             body,
             len: expected,
         } = self;
-        response::try_encode(out, expected, body)?
+        let mut split = response::try_encode(out, expected, body)?;
+        split
+            .body()
             .try_complete()
-            .map_err(storage::BuildError::Length)
+            .map_err(storage::BuildError::Length)?;
+        split.try_commit().map_err(storage::BuildError::Build)
     }
 }

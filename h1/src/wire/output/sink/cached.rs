@@ -1,4 +1,4 @@
-use o3::buffer::storage;
+use o3::buffer::{storage, write::Slice};
 use sark_http::{
     field,
     payload::response::{self, bounded, exact, status::Code},
@@ -62,7 +62,7 @@ pub(super) fn exact<H: field::Source, B: exact::TryBody>(
     date: Headers<'_>,
 ) -> Result<cache::Entry, sink::Error> {
     render(status, fields, plan.len(), date, |out| {
-        plan.encode(out).map_err(sink::Error::from)
+        plan.encode(&mut Slice::new(out)).map_err(sink::Error::from)
     })
 }
 
@@ -77,16 +77,18 @@ pub(super) fn bounded<H: field::Source, B: bounded::Body>(
     let cap = layout.capacity();
     let mut bytes = storage::Owned::try_filled(cap, 0).map_err(Error::Storage)?;
     let actual = bytes.len();
-    let Some(pending) = Pending::place(&layout, &mut bytes) else {
+    let mut out = Slice::new(&mut bytes);
+    let mut target = out.reborrow();
+    let Some(mut pending) = Pending::place(&layout, &mut target) else {
         return Err(Error::HeadCapacity {
             required: cap,
             actual,
         }
         .into());
     };
-    let encoded = pending.encode(plan)?;
-    let len = encoded.body().len();
-    let (used, offset) = encoded.finish()?;
+    let len = pending.encode(plan)?;
+    let offset = pending.finish()?;
+    let used = out.len();
     bytes.truncate(used);
     Ok(cache::Entry::try_new(
         bytes.freeze(),

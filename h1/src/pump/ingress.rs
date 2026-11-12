@@ -1,6 +1,7 @@
 //! Ingress transaction boundary.
 
 use core::{mem, pin};
+use o3::buffer::write::Slice;
 
 use o3::buffer::Complete as _;
 use session::batch;
@@ -117,7 +118,7 @@ impl Ingress {
         conn: &mut session::Conn<'d, Runtime, Pending, Transitions, Ready, Heads>,
         disp: pin::Pin<&mut D>,
         input: &[u8],
-        write: &mut [u8],
+        mut write: Slice<'_, &mut usize>,
         prior: head::Connection,
     ) -> pump::Cycle<'d, Transitions::Staged>
     where
@@ -135,23 +136,32 @@ impl Ingress {
                 );
             }
         };
+        let mut staged = write
+            .try_split(0, write.remaining())
+            .unwrap_or_else(|_| unreachable!("output"));
         let (batch, source) = match prepared {
             Some(buffer) => {
                 let view = crate::Input::Buffered(buffer.view());
                 (
-                    batch::Batch::drive(conn, disp, view, write, prior),
+                    batch::Batch::drive(conn, disp, view, staged.body(), prior),
                     Source::Buffered,
                 )
             }
             None => {
                 let view = crate::Input::Borrowed(input);
                 (
-                    batch::Batch::drive(conn, disp, view, write, prior),
+                    batch::Batch::drive(conn, disp, view, staged.body(), prior),
                     Source::Borrowed(input),
                 )
             }
         };
-        Self::settle(conn, batch, source)
+        let cycle = Self::settle(conn, batch, source, !staged.body().is_empty());
+        if cycle.state.is_ok() {
+            staged
+                .try_commit()
+                .unwrap_or_else(|_| unreachable!("output"));
+        }
+        cycle
     }
 
     /// Clears bytes accepted by the transport's native discard path.
@@ -172,6 +182,7 @@ impl Ingress {
         conn: &mut session::Conn<'d, Runtime, Pending, Transitions, Ready, Heads>,
         batch: batch::Batch<'d, Transitions::Staged>,
         source: Source<'_>,
+        written: bool,
     ) -> pump::Cycle<'d, Transitions::Staged> {
         let (tail, accepted) = match (source, batch.tail) {
             (_, batch::Tail::Absorb)
@@ -225,50 +236,29 @@ impl Ingress {
 
         conn.deferred = batch.connection;
         let (egress, intent) = match (conn.async_state.activity(), batch.output) {
-            (pump::Activity::Task | pump::Activity::Stream, batch::Output::Streamed) => (
-                pump::Egress::Inline {
-                    prefix: batch.written,
-                },
-                head::Connection::KeepAlive,
-            ),
+            (pump::Activity::Task | pump::Activity::Stream, batch::Output::Streamed) => {
+                (pump::Egress::Inline, head::Connection::KeepAlive)
+            }
             (pump::Activity::Task | pump::Activity::Stream, batch::Output::Park) => {
                 (pump::Egress::Wake, head::Connection::KeepAlive)
             }
             (_, batch::Output::Split(body)) => {
-                let prefix = batch.written;
                 let egress = match body {
-                    batch::SplitBody::Static(body) => pump::Egress::Static { prefix, body },
-                    batch::SplitBody::Shared(body) => pump::Egress::Shared { prefix, body },
-                    batch::SplitBody::Frozen(body) => pump::Egress::Frozen { prefix, body },
-                    batch::SplitBody::Segmented(body) => pump::Egress::Segmented { prefix, body },
+                    batch::SplitBody::Static(body) => pump::Egress::Static { body },
+                    batch::SplitBody::Shared(body) => pump::Egress::Shared { body },
+                    batch::SplitBody::Frozen(body) => pump::Egress::Frozen { body },
+                    batch::SplitBody::Segmented(body) => pump::Egress::Segmented { body },
                 };
                 (egress, batch.connection)
             }
-            (_, batch::Output::Close(reason)) if batch.written > 0 => {
+            (_, batch::Output::Close(reason)) if written => {
                 conn.deferred_action = Some(reason);
-                (
-                    pump::Egress::Inline {
-                        prefix: batch.written,
-                    },
-                    batch.connection,
-                )
+                (pump::Egress::Inline, batch.connection)
             }
-            (_, batch::Output::None | batch::Output::Park | batch::Output::Yield)
-                if batch.written > 0 =>
-            {
-                (
-                    pump::Egress::Inline {
-                        prefix: batch.written,
-                    },
-                    batch.connection,
-                )
+            (_, batch::Output::None | batch::Output::Park | batch::Output::Yield) if written => {
+                (pump::Egress::Inline, batch.connection)
             }
-            (_, batch::Output::Streamed) => (
-                pump::Egress::Inline {
-                    prefix: batch.written,
-                },
-                batch.connection,
-            ),
+            (_, batch::Output::Streamed) => (pump::Egress::Inline, batch.connection),
             (_, batch::Output::Yield) => (pump::Egress::Wake, batch.connection),
             (_, batch::Output::Close(reason)) => {
                 conn.deferred = head::Connection::Close;

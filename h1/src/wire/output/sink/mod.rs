@@ -1,6 +1,5 @@
-use std::ops::ControlFlow;
-
 use o3::buffer::bytes::scope;
+use o3::buffer::write::Slice;
 use sark_http::{
     field,
     h1::head::{
@@ -9,7 +8,7 @@ use sark_http::{
     },
     owner::{handoff, handoff::stage},
     payload::{
-        compress::{self, Compression},
+        compress::Compression,
         fixed::Body,
         response::{self, Content, bounded, dispatch, exact, headers, status::Code},
     },
@@ -28,11 +27,9 @@ mod head;
 pub(super) mod written;
 
 use error::Error;
-use gzip::{compress_bounded, compress_exact};
-use head::{Emitted, Layout, Pending, emit_framed_head, emit_head};
+use gzip::{compress_body, compress_bounded, compress_exact};
+use head::{Layout, Pending, emit_framed_head, emit_head};
 use written::Written;
-
-pub(super) type Stream<S> = (usize, Option<S>);
 
 pub(super) enum Mode<'a, C: Compression> {
     Plain,
@@ -57,7 +54,7 @@ pub(super) struct Sink<
     C: Compression,
     A = (),
 > {
-    out: &'a mut [u8],
+    out: Slice<'a, &'a mut usize>,
     date: Headers<'a>,
     mode: Mode<'a, C>,
     slot: handoff::Slot<'req, 'd, Q, O>,
@@ -68,7 +65,7 @@ impl<'a, 'req, 'd, Q: scope::Source, O: stage::Body<'req, 'd>, C: Compression>
     Sink<'a, 'req, 'd, Q, O, C>
 {
     pub(super) const fn new(
-        out: &'a mut [u8],
+        out: Slice<'a, &'a mut usize>,
         date: &'a [u8; 29],
         response: Context,
         mode: Mode<'a, C>,
@@ -136,9 +133,8 @@ impl<'a, 'req, 'd, Q: scope::Source, O: stage::Body<'req, 'd>, C: Compression, A
                 cache,
             ),
             Mode::Plain | Mode::Compress(_) => {
-                let (head, ()) = emit_framed_head(self.out, self.date, status, fields, frame)?;
+                emit_framed_head::<_, _, ()>(self.out, self.date, status, fields, frame)?;
                 Ok(Written::Body {
-                    head,
                     body: handoff::Ready::Empty,
                 })
             }
@@ -175,34 +171,7 @@ impl<'req, 'd: 'req, Q: scope::Source, O: stage::Body<'req, 'd>, C: Compression,
                 cached::body(status, &fields, body, date)?,
                 cache,
             ),
-            Mode::Compress(gzip) => {
-                let head = Emitted::new(out, date, status, &fields, body.len())?;
-                if head.encodings() != 0 {
-                    return stage(slot, head.len(), body);
-                }
-                let Some(raw) = body.as_slice() else {
-                    return stage(slot, head.len(), body);
-                };
-                let zipped = match gzip.encode(raw) {
-                    compress::Output::Plain => {
-                        let len = head.len();
-                        let Some(out) = head.into_inner().get_mut(len..) else {
-                            return stage(slot, len, body);
-                        };
-                        return Ok(match body.try_resolve_into(&slot, out)? {
-                            ControlFlow::Break(written) => Written::inline(len + written, written),
-                            ControlFlow::Continue(plan) => staged(len, plan.stage()),
-                        });
-                    }
-                    compress::Output::Compressed(zipped) => zipped,
-                };
-                let head = head.gzip(date, zipped.len())?;
-                Ok(Written::Compressed {
-                    head,
-                    body: zipped,
-                    read: raw.len(),
-                })
-            }
+            Mode::Compress(gzip) => compress_body(out, date, status, &fields, body, gzip, slot),
             Mode::Plain => plain_body(out, date, status, &fields, body, slot),
         }
     }
@@ -236,8 +205,8 @@ impl<'req, 'd: 'req, Q: scope::Source, O: stage::Body<'req, 'd>, C: Compression,
                 cache,
             ),
             Mode::Plain | Mode::Compress(_) => {
-                let (head, ()) = emit_head(out, date, status, &fields, body.len())?;
-                stage(slot, head, body)
+                emit_head::<_, ()>(out, date, status, &fields, body.len())?;
+                stage(slot, body)
             }
         }
     }
@@ -304,7 +273,7 @@ impl<'req, 'd: 'req, Q: scope::Source, O: stage::Body<'req, 'd>, C: Compression,
 impl<'req, 'd: 'req, Q: scope::Source, O: stage::Body<'req, 'd>, C: Compression> dispatch::Sink<'d>
     for Sink<'_, 'req, 'd, Q, O, C>
 {
-    type Stream<S> = Stream<S>;
+    type Stream<S> = Option<S>;
 
     fn stream<H, S>(
         self,
@@ -321,14 +290,14 @@ impl<'req, 'd: 'req, Q: scope::Source, O: stage::Body<'req, 'd>, C: Compression>
         };
         self.with_admit(admit)
             .stream(status, fields, stream)
-            .map(|(head, body)| (head, body.map(|((), stream)| stream)))
+            .map(|body| body.map(|((), stream)| stream))
     }
 }
 
 impl<'req, 'd: 'req, Q: scope::Source, O: stage::Body<'req, 'd>, C: Compression, A>
     dispatch::Sink<'d> for Sink<'_, 'req, 'd, Q, O, C, Admit<A>>
 {
-    type Stream<S> = Stream<(A, S)>;
+    type Stream<S> = Option<(A, S)>;
 
     fn stream<H, S>(
         self,
@@ -349,19 +318,24 @@ impl<'req, 'd: 'req, Q: scope::Source, O: stage::Body<'req, 'd>, C: Compression,
                     if self.date.response.version() == Version::Ten {
                         return Err(Error::StreamingVersion(Version::Ten));
                     }
-                    let (head, ()) =
-                        emit_framed_head(self.out, self.date, status, &fields, framing::Chunked)?;
-                    return Ok((head, Some((admit, stream))));
+                    emit_framed_head::<_, _, ()>(
+                        self.out,
+                        self.date,
+                        status,
+                        &fields,
+                        framing::Chunked,
+                    )?;
+                    return Ok(Some((admit, stream)));
                 }
             },
         };
-        let (head, ()) = emit_framed_head(self.out, self.date, status, &fields, frame)?;
-        Ok((head, None))
+        emit_framed_head::<_, _, ()>(self.out, self.date, status, &fields, frame)?;
+        Ok(None)
     }
 }
 
 fn plain_body<'req, 'd, H, B, Q: scope::Source, O: stage::Body<'req, 'd>>(
-    out: &mut [u8],
+    mut out: Slice<'_, &mut usize>,
     date: Headers<'_>,
     status: Code,
     fields: &H,
@@ -372,19 +346,18 @@ where
     H: field::Source,
     B: response::Body<'d>,
 {
-    let (head, ()) = emit_head(out, date, status, fields, body.len())?;
+    let (head, ()) = emit_head(out.reborrow(), date, status, fields, body.len())?;
     let inline = if B::INLINE { body.as_slice() } else { None };
     if let Some(raw) = inline {
-        let used = head.checked_add(raw.len()).ok_or(Error::Overflow {
+        head.checked_add(raw.len()).ok_or(Error::Overflow {
             base: head,
             added: raw.len(),
         })?;
-        if let Some(dst) = out.get_mut(head..used) {
-            dst.copy_from_slice(raw);
-            return Ok(Written::inline(used, raw.len()));
+        if o3::buffer::write::Sink::write_slice(&mut out, raw).is_ok() {
+            return Ok(Written::inline(raw.len()));
         }
     }
-    stage(slot, head, body)
+    stage(slot, body)
 }
 
 fn finish_exact<
@@ -395,7 +368,7 @@ fn finish_exact<
     Q: scope::Source,
     O: stage::Body<'req, 'd>,
 >(
-    out: &mut [u8],
+    mut out: Slice<'_, &mut usize>,
     date: Headers<'_>,
     status: Code,
     fields: &H,
@@ -403,30 +376,31 @@ fn finish_exact<
     slot: handoff::Slot<'req, 'd, Q, O>,
 ) -> Result<Written<'d, O::Deferred, Q::Selection>, Error> {
     let len = plan.len();
-    let (head, ()) = emit_head(out, date, status, fields, len)?;
+    let (head, ()) = emit_head(out.reborrow(), date, status, fields, len)?;
     place_exact(out, head, plan, slot)
 }
 
 fn place_exact<'req, 'd, B: exact::TryBody, Q: scope::Source, O: stage::Body<'req, 'd>>(
-    out: &mut [u8],
+    mut out: Slice<'_, &mut usize>,
     head: usize,
     plan: exact::Plan<B>,
     slot: handoff::Slot<'req, 'd, Q, O>,
 ) -> Result<Written<'d, O::Deferred, Q::Selection>, Error> {
     let len = plan.len();
-    let end = head.checked_add(len).ok_or(Error::Overflow {
+    head.checked_add(len).ok_or(Error::Overflow {
         base: head,
         added: len,
     })?;
-    if let Some(body) = out.get_mut(head..end) {
-        plan.encode(body)?;
-        return Ok(Written::inline(end, len));
+    if len <= out.remaining() {
+        plan.encode(&mut out)?;
+        return Ok(Written::inline(len));
     }
     let body = plan.into_shared()?;
-    stage(slot, head, body)
+    stage(slot, body)
 }
 
 fn finish_bounded<
+    'out,
     'req,
     'd,
     H: field::Source,
@@ -434,7 +408,7 @@ fn finish_bounded<
     Q: scope::Source,
     O: stage::Body<'req, 'd>,
 >(
-    out: &mut [u8],
+    mut out: Slice<'out, &'out mut usize>,
     date: Headers<'_>,
     status: Code,
     fields: &H,
@@ -443,42 +417,33 @@ fn finish_bounded<
 ) -> Result<Written<'d, O::Deferred, Q::Selection>, Error> {
     let max = plan.max_len();
     let layout = Layout::new(date, status, fields, max)?;
-    if let Some(pending) = Pending::place(&layout, out) {
-        let encoded = pending.encode(plan)?;
-        let len = encoded.body().len();
-        let (written, _) = encoded.finish()?;
-        return Ok(Written::inline(written, len));
+    if let Some(mut pending) = Pending::place(&layout, &mut out) {
+        let len = pending.encode(plan)?;
+        pending.finish()?;
+        return Ok(Written::inline(len));
     }
     let body = plan.into_shared()?;
-    let (head, ()) = emit_head(out, date, status, fields, body.len())?;
-    stage(slot, head, body)
+    emit_head::<_, ()>(out, date, status, fields, body.len())?;
+    stage(slot, body)
 }
 
 fn stage<'req, 'd, B, Q: scope::Source, O: stage::Body<'req, 'd>>(
     slot: handoff::Slot<'req, 'd, Q, O>,
-    head: usize,
     body: B,
 ) -> Result<Written<'d, O::Deferred, Q::Selection>, Error>
 where
     B: response::Body<'d>,
 {
     let plan = response::Body::try_resolve(body, &slot)?;
-    Ok(staged(head, plan.stage()))
+    Ok(staged(plan.stage()))
 }
 
 fn staged<'req, 'd, H, B: stage::Body<'req, 'd>>(
-    head: usize,
     body: stage::State<'d, H, B>,
 ) -> Written<'d, B::Deferred, H> {
     match body {
-        stage::State::Body(body) => Written::RequestBody {
-            head,
-            body: body.defer(),
-        },
-        stage::State::Ready(body) => Written::Body { head, body },
-        stage::State::Head(input) => Written::Head {
-            written: head,
-            input,
-        },
+        stage::State::Body(body) => Written::RequestBody { body: body.defer() },
+        stage::State::Ready(body) => Written::Body { body },
+        stage::State::Head(input) => Written::Head { input },
     }
 }

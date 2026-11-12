@@ -36,9 +36,8 @@ fn borrowed_message_plan() {
     }
     let frame = Frame::from_payload(input.into());
     let decoded = Prost::<Packet>::new()
-        .decode(frame.view())
+        .decode_frame(frame)
         .expect("matching protobuf bytes across retained segments");
-    drop(frame);
     assert_eq!(decoded.data, data);
 }
 
@@ -59,10 +58,9 @@ fn retains_decode_error() {
         .expect("admitted segment capacity");
     let frame = Frame::from_payload(input.into());
     let error = Prost::<Packet>::new()
-        .decode(frame.view())
+        .decode_frame(frame)
         .err()
         .expect("truncated byte field");
-    drop(frame);
     assert_eq!(error.code(), sark_grpc::Code::Internal);
     assert!(matches!(
         Diagnostic::from(&error),

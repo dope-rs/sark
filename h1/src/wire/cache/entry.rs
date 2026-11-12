@@ -1,3 +1,4 @@
+use o3::buffer::write::{Sink as _, Slice};
 use std::{num::NonZero, ptr};
 
 use o3::{
@@ -68,43 +69,37 @@ impl Entry {
 
     pub fn try_write(
         &self,
-        out: &mut [u8],
+        mut out: Slice<'_, &mut usize>,
         date: &[u8; consts::DATE_LEN],
     ) -> Result<Option<Cached>, rc::Error> {
         let bytes = self.bytes.as_ref();
-        let (len, cached) = if out.len() >= bytes.len() {
+        let (len, cached) = if out.remaining() >= bytes.len() {
             (
                 bytes.len(),
                 Cached::Fixed {
-                    len: bytes.len(),
                     body: bytes.len() - self.head,
                 },
             )
-        } else if out.len() >= self.head {
+        } else if out.remaining() >= self.head {
             // SAFETY: construction admits head within this immutable owner;
             // no API changes the owner or its validated visible extent.
             let body =
                 unsafe { buffer::raw::Segment::try_project(&self.bytes, self.head..bytes.len()) }?;
-            (
-                self.head,
-                Cached::Shared {
-                    head: self.head,
-                    body,
-                },
-            )
+            (self.head, Cached::Shared { body })
         } else {
             return Ok(None);
         };
-        // SAFETY: the branch admits this output prefix, and construction admits
-        // head within bytes. Exclusive out cannot overlap this immutable owner.
-        unsafe { ptr::copy_nonoverlapping(bytes.as_ptr(), out.as_mut_ptr(), len) };
+        let start = out.len();
+        out.write_slice(&bytes[..len])
+            .unwrap_or_else(|_| unreachable!("capacity"));
+        let out = out.into_mut();
         if let Some(end) = self.date {
             // SAFETY: construction admits the complete date field within head;
             // both output paths cover head and retain the original exclusive out.
             unsafe {
                 ptr::copy_nonoverlapping(
                     date.as_ptr(),
-                    out.as_mut_ptr().add(end.get() - consts::DATE_LEN),
+                    out.as_mut_ptr().add(start + end.get() - consts::DATE_LEN),
                     consts::DATE_LEN,
                 );
             }

@@ -7,6 +7,7 @@ use common::{
     fields::{DATE, RESPONSE},
     tasks::Streaming,
 };
+use o3::buffer::write::Slice;
 use sark_core::body::credit;
 use sark_h1::{
     Input,
@@ -31,21 +32,26 @@ fn omits_body() {
             let calls = Cell::new(0);
             let mut gzip = Compressor { calls: 0 };
             let mut write = [0; 256];
-            let outcome =
-                output::Egress::new(&mut write, DATE, Context::new(method, Version::Eleven)).route(
-                    Reply {
-                        status,
-                        shape,
-                        calls: &calls,
-                    },
-                    handoff::Slot::ready(None),
-                    cache::Cache::empty(),
-                    &mut gzip,
-                    Coding::Gzip,
-                    replies::POLICY,
-                );
+            let mut writer = Slice::new(&mut write);
+            let outcome = output::Egress::new(
+                writer.reborrow(),
+                DATE,
+                Context::new(method, Version::Eleven),
+            )
+            .route(
+                Reply {
+                    status,
+                    shape,
+                    calls: &calls,
+                },
+                handoff::Slot::ready(None),
+                cache::Cache::empty(),
+                &mut gzip,
+                Coding::Gzip,
+                replies::POLICY,
+            );
             let written = match outcome {
-                output::Outcome::Send { written, .. } => Some(written),
+                output::Outcome::Send { .. } => Some(writer.len()),
                 _ => None,
             }
             .expect("head-only response");
@@ -70,7 +76,12 @@ fn cache_match() {
         cache: route::Cache::Store,
         ..replies::POLICY
     };
-    let outcome = output::Egress::new(&mut write, DATE, RESPONSE).route(
+    let outcome = output::Egress::new(
+        o3::buffer::write::Slice::new(&mut write).reborrow(),
+        DATE,
+        RESPONSE,
+    )
+    .route(
         fixed::Direct::new(Code::OK, (), replies::BYTES),
         handoff::Slot::ready(None),
         cache::Cache::new(&mut entry),
@@ -87,15 +98,24 @@ fn cache_match() {
     ] {
         write.fill(0xa5);
         assert!(
-            output::Egress::new(&mut write, DATE, context)
-                .cached(&mut cache::Cache::new(&mut entry), route::Cache::Store)
-                .is_none()
+            output::Egress::new(
+                o3::buffer::write::Slice::new(&mut write).reborrow(),
+                DATE,
+                context
+            )
+            .cached(&mut cache::Cache::new(&mut entry), route::Cache::Store)
+            .is_none()
         );
         assert!(write.iter().all(|byte| *byte == 0xa5));
     }
     let calls = Cell::new(0);
     let context = Context::new(Method::Head, Version::Eleven);
-    let cold = output::Egress::new(&mut write, DATE, context).route(
+    let cold = output::Egress::new(
+        o3::buffer::write::Slice::new(&mut write).reborrow(),
+        DATE,
+        context,
+    )
+    .route(
         Reply {
             status: Code::OK,
             shape: Shape::Exact,
@@ -111,8 +131,12 @@ fn cache_match() {
         cold,
         output::Outcome::SendCopied { copy, .. } if copy.written == 0
     ));
-    let hot = output::Egress::new(&mut write, DATE, context)
-        .cached(&mut cache::Cache::new(&mut entry), route::Cache::Store);
+    let hot = output::Egress::new(
+        o3::buffer::write::Slice::new(&mut write).reborrow(),
+        DATE,
+        context,
+    )
+    .cached(&mut cache::Cache::new(&mut entry), route::Cache::Store);
     assert!(matches!(
         hot,
         Some(output::Outcome::SendCopied { copy, .. }) if copy.written == 0
@@ -132,6 +156,7 @@ fn omits_stream() {
             .expect("framing");
         let mut conn: session::Conn = session::Conn::default();
         let mut write = [0; 256];
+        let mut writer = Slice::new(&mut write);
         let calls = Cell::new(0);
         let observed_calls = &calls;
         let state = Cell::new(1);
@@ -141,7 +166,7 @@ fn omits_stream() {
             drops: &drops,
         };
         let result = stream::Endpoint::new(
-            output::Egress::new(&mut write, DATE, parsed.response()),
+            output::Egress::new(writer.reborrow(), DATE, parsed.response()),
             &mut conn,
         )
         .dispatch::<Streaming, _, _, _, _>(
@@ -157,9 +182,9 @@ fn omits_stream() {
         );
         let written = match result {
             session::RouteOutcome::Outcome(session::Outcome::Complete {
-                response: output::Complete::Inline { written },
+                response: output::Complete::Inline,
                 ..
-            }) => Some(written),
+            }) => Some(writer.len()),
             _ => None,
         }
         .expect("head-only stream");
@@ -187,11 +212,15 @@ fn phase_error() {
         ),
     ] {
         let mut write = [0xa5; 256];
-        let result = output::Egress::new(&mut write, DATE, Context::new(method, Version::Eleven))
-            .plain(
-                fixed::Direct::new(status, (), replies::BYTES),
-                head::Connection::KeepAlive,
-            );
+        let result = output::Egress::new(
+            o3::buffer::write::Slice::new(&mut write).reborrow(),
+            DATE,
+            Context::new(method, Version::Eleven),
+        )
+        .plain(
+            fixed::Direct::new(status, (), replies::BYTES),
+            head::Connection::KeepAlive,
+        );
         assert!(
             matches!(result, output::Outcome::Failed(Failure::Output(actual)) if actual == expected)
         );

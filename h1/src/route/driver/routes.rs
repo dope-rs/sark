@@ -1,3 +1,4 @@
+use o3::buffer::write::Slice;
 use std::ops::ControlFlow;
 
 use sark_core::{
@@ -244,7 +245,7 @@ pub(super) struct Egress<'turn, C: compress::Compression> {
     pub(super) response_cache: &'turn mut [Option<cache::Entry>],
     pub(super) gzip: &'turn mut C,
     pub(super) date: &'turn [u8; 29],
-    pub(super) write: &'turn mut [u8],
+    pub(super) write: Slice<'turn, &'turn mut usize>,
 }
 
 /// Bypassed routes need no slot; stored responses retain their table index proof.

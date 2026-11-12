@@ -1,3 +1,4 @@
+use o3::buffer::write::Slice;
 pub mod branches;
 pub mod chunked;
 pub mod fields;
@@ -110,17 +111,17 @@ impl<'d, ID: Identity> duplex::Session<'d> for Session<ID> {
     fn receive(
         &mut self,
         _: owned::Segments<'d>,
-        _: &mut [u8],
+        _: Slice<'_, &mut usize>,
         _: &mut Vec<u8>,
-    ) -> (usize, duplex::Action<'d>) {
-        (0, duplex::Action::close())
+    ) -> duplex::Action<'d> {
+        duplex::Action::close()
     }
 
-    fn finish(&mut self, _: &mut [u8], _: &mut Vec<u8>) -> (usize, duplex::Action<'d>) {
-        (0, Self::END)
+    fn finish(&mut self, _: Slice<'_, &mut usize>, _: &mut Vec<u8>) -> duplex::Action<'d> {
+        Self::END
     }
 
-    fn activate(&mut self, _: &mut [u8], _: &mut Vec<u8>) -> (usize, duplex::Action<'d>) {
-        (0, Self::IDLE)
+    fn activate(&mut self, _: Slice<'_, &mut usize>, _: &mut Vec<u8>) -> duplex::Action<'d> {
+        Self::IDLE
     }
 }

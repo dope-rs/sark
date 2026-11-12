@@ -13,7 +13,10 @@ use dope::{
         wire,
     },
 };
-use o3::buffer::{hold, resident, resident::bound};
+use o3::{
+    base::cell::region,
+    buffer::{hold, resident, resident::bound},
+};
 use sark_core::life::{self, exchange, sequence};
 use sark_http::payload::fixed;
 use write::{body, body::Admit, error};
@@ -27,7 +30,8 @@ use crate::{
 type Bound<'d, K, G> =
     data::Bound<compose::Either<payload::Body<'d, K>, payload::Stream<'d, K>>, G>;
 type Rejected<'d, K, R> = (egress::Excess<payload::Body<'d, K>>, R);
-type DraftResult<'d, K, G, R> = Result<write::Draft<Bound<'d, K, G>, R>, Rejected<'d, K, R>>;
+type CommitResult<'id, 'd, K, G, R> =
+    Result<write::Commit<region::Identity<'id>, Value<Bound<'d, K, G>>, R>, Rejected<'d, K, R>>;
 
 #[derive(Clone, Copy, Eq, PartialEq)]
 pub(in crate::server) enum Wake {
@@ -53,36 +57,27 @@ pub enum Failure<R> {
 
 const _: () = assert!(core::mem::size_of::<Wake>() == 1);
 
-fn try_finish<'d, K: 'd, G: bound::Bound, R>(
+fn try_finish<'id, 'd, K: 'd, G: bound::Bound, R>(
+    prefix: write::Prefix<'_, 'id>,
     egress: pump::Egress<'d>,
     tag: K,
     connection: head::Connection,
     receipt: R,
-) -> DraftResult<'d, K, G, R> {
-    let (written, body) = match egress {
-        pump::Egress::None | pump::Egress::Wake => (0, None),
-        pump::Egress::Inline { prefix } => (prefix, None),
-        pump::Egress::Static { prefix, body } => (
-            prefix,
-            Some(payload::Body::Shared {
-                owner: resident::Shared::from(body.as_slice()),
-                tag,
-            }),
-        ),
-        pump::Egress::Shared { prefix, body } => (
-            prefix,
-            Some(payload::Body::Shared {
-                owner: resident::Shared::from(body),
-                tag,
-            }),
-        ),
-        pump::Egress::Frozen { prefix, body } => {
-            (prefix, Some(payload::Body::Frozen { owner: body, tag }))
+) -> CommitResult<'id, 'd, K, G, R> {
+    let body = match egress {
+        pump::Egress::None | pump::Egress::Wake | pump::Egress::Inline => None,
+        pump::Egress::Static { body } => Some(payload::Body::Shared {
+            owner: resident::Shared::from(body.as_slice()),
+            tag,
+        }),
+        pump::Egress::Shared { body } => Some(payload::Body::Shared {
+            owner: resident::Shared::from(body),
+            tag,
+        }),
+        pump::Egress::Frozen { body } => Some(payload::Body::Frozen { owner: body, tag }),
+        pump::Egress::Segmented { body } => {
+            body.take().map(|body| payload::Body::duplex(body, tag))
         }
-        pump::Egress::Segmented { prefix, body } => (
-            prefix,
-            body.take().map(|body| payload::Body::duplex(body, tag)),
-        ),
     };
     let body = match body {
         Some(body) => match egress::Load::new(body).try_bound::<G>() {
@@ -91,18 +86,19 @@ fn try_finish<'d, K: 'd, G: bound::Bound, R>(
         },
         None => None,
     };
-    let draft = write::Draft::new(written, body, receipt);
+    let commit = prefix.commit(body, receipt);
     Ok(match connection {
-        head::Connection::KeepAlive => draft,
-        head::Connection::Close => draft.close_after(),
+        head::Connection::KeepAlive => commit,
+        head::Connection::Close => commit.close_after(),
     })
 }
 
-/// Projects one pump cycle into a recoverable final-link draft.
-pub fn try_cycle<'d, K: Copy + Default + 'd, G: bound::Bound, H>(
+/// Projects one pump cycle into a recoverable final-link commit.
+pub fn try_cycle<'id, 'd, K: Copy + Default + 'd, G: bound::Bound, H>(
+    prefix: write::Prefix<'_, 'id>,
     cycle: pump::Cycle<'d, H>,
     tagger: impl FnOnce(hold::Charge) -> K,
-) -> DraftResult<'d, K, G, CycleCommit<K, H>> {
+) -> CommitResult<'id, 'd, K, G, CycleCommit<K, H>> {
     let charge = match cycle.state.as_ref() {
         Ok(pump::Egress::Shared { body, .. }) => output::Owner::shared(body).charge,
         Ok(pump::Egress::Frozen { body, .. }) => output::Owner::shared(body).charge,
@@ -124,6 +120,7 @@ pub fn try_cycle<'d, K: Copy + Default + 'd, G: bound::Bound, H>(
         _ => Wake::None,
     };
     try_finish(
+        prefix,
         egress,
         tag,
         cycle.connection,
@@ -138,13 +135,14 @@ pub fn try_cycle<'d, K: Copy + Default + 'd, G: bound::Bound, H>(
     )
 }
 
-/// Projects one output decision into a recoverable final-link draft.
-pub fn try_outcome<'d, G: bound::Bound, C: Copy, M: sequence::Mode<C>, R>(
+/// Projects one output decision into a recoverable final-link commit.
+pub fn try_outcome<'id, 'd, G: bound::Bound, C: Copy, M: sequence::Mode<C>, R>(
+    prefix: write::Prefix<'_, 'id>,
     outcome: output::Outcome<'d>,
     life: &mut M,
     exchange: exchange::Id<C, u64>,
     settle: impl FnOnce(head::Connection, turn::Completion<M::Retention>) -> R,
-) -> DraftResult<'d, M::TransportTag, G, R>
+) -> CommitResult<'id, 'd, M::TransportTag, G, R>
 where
     M::Retention: turn::Mode,
     M::TransportTag: 'd,
@@ -178,7 +176,7 @@ where
     } else {
         sequence::Mode::tag(life, exchange, charge)
     };
-    try_finish(egress, tag, conn, receipt)
+    try_finish(prefix, egress, tag, conn, receipt)
 }
 
 /// Releases rejected physical owners and returns the exact route action.

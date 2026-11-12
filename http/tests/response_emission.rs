@@ -286,9 +286,11 @@ fn admits_status_extensions() {
 #[test]
 fn direct_underflow() {
     let mut bytes = [0xa5; 3];
+    let mut out = o3::buffer::write::Slice::new(&mut bytes);
     let error = exact::Plan::new(Short)
-        .encode(&mut bytes)
+        .encode(&mut out)
         .expect_err("direct underflow must retain its exact span gap");
+    assert!(out.is_empty());
     let owned = exact::Plan::new(Short)
         .into_shared()
         .expect_err("owned underflow must retain its exact span gap");

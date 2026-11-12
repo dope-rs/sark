@@ -2,10 +2,7 @@ use std::mem;
 
 use o3::buffer::{storage, write::consume};
 use sark_http::{
-    h1::{
-        codec::numbers,
-        head::line::{self, Request},
-    },
+    h1::head::line::{self, Request},
     method::Known,
     payload::response::Method,
 };
@@ -95,21 +92,6 @@ pub enum Error {
     HeadCapacity { required: usize, actual: usize },
     HeadLength { expected: usize, actual: usize },
     Storage(storage::AllocError),
-}
-
-impl From<numbers::Error> for Error {
-    fn from(error: numbers::Error) -> Self {
-        match error {
-            numbers::Error::Overflow { current, added } => Self::WriteOverflow {
-                current,
-                added: added.get(),
-            },
-            numbers::Error::Capacity { required, actual } => Self::WriteCapacity {
-                required: required.get(),
-                actual,
-            },
-        }
-    }
 }
 
 const _: () = {

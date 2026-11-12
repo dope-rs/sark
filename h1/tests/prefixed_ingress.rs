@@ -29,7 +29,7 @@ fn joins_the_prior_prefix_at_the_existing_line_owner() {
                 &mut conn,
                 Pin::new(&mut handler),
                 b"OST /x HTTP/1.1\r\nHost: x\r\n\r\nbody",
-                &mut [0; 2048],
+                o3::buffer::write::Slice::new(&mut [0; 2048]).reborrow(),
                 head::Connection::KeepAlive,
             )
         });
@@ -54,7 +54,7 @@ fn retains_prefix_until_output_capacity_returns() {
         &mut conn,
         Pin::new(&mut handler),
         &[],
-        &mut [0; 2048],
+        o3::buffer::write::Slice::new(&mut [0; 2048]).reborrow(),
         head::Connection::KeepAlive,
     );
     assert_eq!(calls.get(), 1);

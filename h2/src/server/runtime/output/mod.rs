@@ -1,11 +1,8 @@
 use dope::{
     manifold::network::listener::conn::write::{self, error},
-    net::link::egress::{self, load},
+    net::link::egress,
 };
-use o3::{
-    base::num::bounded,
-    buffer::{bytes::bounded::Overflow, resident},
-};
+use o3::buffer::{resident, write::consume};
 use sark_core::manifold::client::io;
 use sark_http::field::metadata::section::rules;
 
@@ -21,21 +18,19 @@ pub(in crate::server) mod flush;
 pub enum Failure {
     Capacity(write::Reject),
     Input(io::Error),
-    Prefix(bounded::Error),
-    Rejected(load::Error),
-    Overflow(Overflow),
+    Prefix(consume::Error),
     Mismatch(error::Cause),
 }
 
 /// One output failure with its unmodified owner and retirement receipt.
-enum Error<B, E, R> {
+enum Error<B, R> {
     Input(io::Error),
     /// A refused owner retained until its bound failure and receipt are retired.
     Bound {
         cause: egress::Excess<B>,
         receipt: R,
     },
-    Commit(error::Build<E, R>),
+    Prefix(consume::Error),
 }
 
 pub(in crate::server) trait State<'d> {

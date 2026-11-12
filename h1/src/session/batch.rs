@@ -1,6 +1,9 @@
 use core::{convert::Infallible, mem, pin};
 
-use o3::buffer::{storage, write::consume};
+use o3::buffer::{
+    storage,
+    write::{Sink as _, Slice},
+};
 use sark_http::{
     h1::codec::canned,
     payload::{compress, fixed::Body, owned},
@@ -47,7 +50,6 @@ const _: () = {
 
 pub(crate) struct Batch<'d, H> {
     pub(crate) consumed: usize,
-    pub(crate) written: usize,
     pub(crate) output: Output<'d>,
     pub(crate) connection: head::Connection,
     pub(crate) progress: deadline::Progress,
@@ -61,7 +63,7 @@ impl<'d, H> Batch<'d, H> {
         conn: &mut session::Conn<'d, Runtime, Pending, Transitions, Ready, Heads>,
         mut disp: pin::Pin<&mut D>,
         input: crate::Input<'_>,
-        buf: &mut [u8],
+        mut write: Slice<'_, &mut usize>,
         prior: head::Connection,
     ) -> Self
     where
@@ -70,7 +72,6 @@ impl<'d, H> Batch<'d, H> {
     {
         let mut out = Self {
             consumed: 0,
-            written: 0,
             output: Output::None,
             connection: prior,
             progress: deadline::Progress::default(),
@@ -78,16 +79,19 @@ impl<'d, H> Batch<'d, H> {
         };
         let mut permit = session::Permit::new();
         let mut rest = input;
-        let capacity = buf.len();
+        let capacity = write.remaining();
         let minimum = capacity.min(1024);
-        let mut write = buf;
         for _ in 0..MAX_PIPELINE {
-            if write.len() < minimum || matches!(out.connection, head::Connection::Close) {
+            if write.remaining() < minimum || matches!(out.connection, head::Connection::Close) {
                 break;
             }
             if rest.as_slice().is_empty() && !conn.ingress.is_ready() {
                 break;
             }
+            let mut staged = write
+                .try_split(0, write.remaining())
+                .unwrap_or_else(|_| unreachable!("output"));
+            let mut target = staged.body();
             out.progress.merge(deadline::Progress::new(
                 deadline::Head::Ready,
                 deadline::Body::None,
@@ -95,13 +99,24 @@ impl<'d, H> Batch<'d, H> {
             let (result, consumed) = match conn.ingress.protocol.take_frame(rest) {
                 Frame::Head(pending) => {
                     let result = match pending {
-                        HeadFrame::Pending(pending) => disp
-                            .as_mut()
-                            .resume_head(pending, permit, rest, write, conn),
-                        HeadFrame::New => disp.as_mut().try_consume(permit, rest, write, conn),
-                        HeadFrame::Rejected(pending) => disp
-                            .as_mut()
-                            .resume_error(pending, permit, rest, write, conn),
+                        HeadFrame::Pending(pending) => disp.as_mut().resume_head(
+                            pending,
+                            permit,
+                            rest,
+                            target.reborrow(),
+                            conn,
+                        ),
+                        HeadFrame::New => {
+                            disp.as_mut()
+                                .try_consume(permit, rest, target.reborrow(), conn)
+                        }
+                        HeadFrame::Rejected(pending) => disp.as_mut().resume_error(
+                            pending,
+                            permit,
+                            rest,
+                            target.reborrow(),
+                            conn,
+                        ),
                         HeadFrame::Line(line) => match line {
                             Ok(parsing::LineProgress::Pending(line)) => {
                                 permit.defer();
@@ -120,22 +135,32 @@ impl<'d, H> Batch<'d, H> {
                             }) => {
                                 let result = disp
                                     .as_mut()
-                                    .consume_line(permit, source, write, conn)
+                                    .consume_line(permit, source, target.reborrow(), conn)
                                     .after_line(prior);
                                 match result {
                                     session::RouteOutcome::AwaitHead { permit, pending }
                                         if used < rest.as_slice().len() =>
                                     {
                                         out.consumed += rest.consume_max(used);
-                                        disp.as_mut()
-                                            .resume_head(pending, permit, rest, write, conn)
+                                        disp.as_mut().resume_head(
+                                            pending,
+                                            permit,
+                                            rest,
+                                            target.reborrow(),
+                                            conn,
+                                        )
                                     }
                                     session::RouteOutcome::AwaitReject { permit, pending }
                                         if used < rest.as_slice().len() =>
                                     {
                                         out.consumed += rest.consume_max(used);
-                                        disp.as_mut()
-                                            .resume_error(pending, permit, rest, write, conn)
+                                        disp.as_mut().resume_error(
+                                            pending,
+                                            permit,
+                                            rest,
+                                            target.reborrow(),
+                                            conn,
+                                        )
                                     }
                                     result => result,
                                 }
@@ -235,13 +260,18 @@ impl<'d, H> Batch<'d, H> {
                         break;
                     };
                     let consumed = done.consumed;
-                    let result = disp.as_mut().finish_body(task, done, permit, write, app);
+                    let result =
+                        disp.as_mut()
+                            .finish_body(task, done, permit, target.reborrow(), app);
                     (result, consumed)
                 }
                 Frame::Ready(task) => {
-                    let result =
-                        disp.as_mut()
-                            .resume_body(task, permit, write, &mut conn.async_state);
+                    let result = disp.as_mut().resume_body(
+                        task,
+                        permit,
+                        target.reborrow(),
+                        &mut conn.async_state,
+                    );
                     (result, 0)
                 }
                 Frame::Working(task) => {
@@ -335,55 +365,38 @@ impl<'d, H> Batch<'d, H> {
                         }
                     };
                     out.connection = out.connection.join(next);
-                    let (written, body) = match reply {
-                        output::Complete::Inline { written: wrote }
-                        | output::Complete::Copy { written: wrote, .. } => (wrote, None),
-                        output::Complete::Static {
-                            hdr_written: head,
-                            body,
-                        } => (head, Some(SplitBody::Static(body))),
-                        output::Complete::Shared {
-                            hdr_written: head,
-                            body,
+                    let body = match reply {
+                        output::Complete::Inline | output::Complete::Copy { .. } => None,
+                        output::Complete::Static { body } => Some(SplitBody::Static(body)),
+                        output::Complete::Shared { body }
+                        | output::Complete::Owned { body, .. } => Some(SplitBody::Shared(body)),
+                        output::Complete::Compressed { body, .. } => Some(SplitBody::Frozen(body)),
+                        output::Complete::Segments { body } | output::Complete::Linked { body } => {
+                            Some(SplitBody::Segmented(body))
                         }
-                        | output::Complete::Owned {
-                            hdr_written: head,
-                            body,
-                            ..
-                        } => (head, Some(SplitBody::Shared(body))),
-                        output::Complete::Compressed {
-                            hdr_written: head,
-                            body,
-                            ..
-                        } => (head, Some(SplitBody::Frozen(body))),
-                        output::Complete::Segments {
-                            hdr_written: head,
-                            body,
-                        }
-                        | output::Complete::Linked {
-                            hdr_written: head,
-                            body,
-                        } => (head, Some(SplitBody::Segmented(body))),
                     };
-                    if let Err(error) = Self::try_advance(&mut write, written) {
-                        out.output = Output::Rejected(error);
-                        break;
-                    }
                     match body {
                         None => {}
                         Some(SplitBody::Static(body)) => {
-                            if let Some(target) = write.split_off_mut(..body.len()) {
-                                target.copy_from_slice(body.as_slice());
-                            } else {
+                            if target.write_slice(body.as_slice()).is_err() {
                                 out.output = Output::Split(SplitBody::Static(body));
+                                staged
+                                    .try_commit()
+                                    .unwrap_or_else(|_| unreachable!("output"));
                                 break;
                             }
                         }
                         Some(body) => {
                             out.output = Output::Split(body);
+                            staged
+                                .try_commit()
+                                .unwrap_or_else(|_| unreachable!("output"));
                             break;
                         }
                     }
+                    staged
+                        .try_commit()
+                        .unwrap_or_else(|_| unreachable!("output"));
                     if matches!(drain, drain::Drain::Pending) {
                         break;
                     }
@@ -403,7 +416,7 @@ impl<'d, H> Batch<'d, H> {
                         out.output = Output::Close(disp.as_mut().abort_body(conn, error));
                         break;
                     }
-                    let staged = match conn.transitions.try_stage(next) {
+                    let transition = match conn.transitions.try_stage(next) {
                         Ok(staged) => staged,
                         Err(error) => {
                             out.output = Output::Rejected(pump::Reject::Switch {
@@ -414,35 +427,27 @@ impl<'d, H> Batch<'d, H> {
                         }
                     };
                     out.tail = Tail::Handoff {
-                        staged,
+                        staged: transition,
                         start: out.consumed,
                     };
                     match reply {
-                        output::Switch::Inline { written: wrote } => {
-                            if let Err(error) = Self::try_advance(&mut write, wrote) {
-                                out.output = Output::Rejected(error);
-                            }
-                        }
+                        output::Switch::Inline => {}
                         output::Switch::Static(reply) => {
-                            if let Some(target) = write.split_off_mut(..reply.len()) {
-                                target.copy_from_slice(reply.as_slice());
-                            } else {
+                            if target.write_slice(reply.as_slice()).is_err() {
                                 out.output = Output::Split(SplitBody::Static(reply));
                             }
                         }
                     }
+                    staged
+                        .try_commit()
+                        .unwrap_or_else(|_| unreachable!("output"));
                     break;
                 }
-                session::Outcome::Streamed {
-                    written: wrote,
-                    close,
-                    ..
-                } => {
+                session::Outcome::Streamed { close, .. } => {
                     out.connection = out.connection.join(close);
-                    if let Err(error) = Self::try_advance(&mut write, wrote) {
-                        out.output = Output::Rejected(error);
-                        break;
-                    }
+                    staged
+                        .try_commit()
+                        .unwrap_or_else(|_| unreachable!("output"));
                     out.output = Output::Streamed;
                     break;
                 }
@@ -472,13 +477,6 @@ impl<'d, H> Batch<'d, H> {
                 deadline::Body::None,
             ));
         }
-        out.written = capacity - write.len();
         out
-    }
-
-    fn try_advance(write: &mut &mut [u8], amount: usize) -> Result<(), pump::Reject> {
-        consume::Consume::try_consume(write, amount).map_err(|error| {
-            pump::Reject::new(pump::Operation::Write, pump::Cause::Capacity(error))
-        })
     }
 }

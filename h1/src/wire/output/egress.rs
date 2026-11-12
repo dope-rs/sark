@@ -1,3 +1,4 @@
+use o3::buffer::write::Slice;
 use std::{convert::Infallible, mem};
 
 use o3::buffer::storage;
@@ -8,7 +9,7 @@ use sark_http::{
     payload::{compress::Compression, response::dispatch},
     request::Id,
 };
-use sink::{Mode, Sink, Stream, written::Written};
+use sink::{Mode, Sink, written::Written};
 
 use crate::{
     route,
@@ -17,14 +18,18 @@ use crate::{
 
 /// Writes response decisions into the caller-provided egress region.
 pub struct Egress<'a, I = ()> {
-    write: &'a mut [u8],
+    write: Slice<'a, &'a mut usize>,
     date: &'a [u8; 29],
     input: I,
     response: response::Context,
 }
 
 impl<'a> Egress<'a> {
-    pub fn new(write: &'a mut [u8], date: &'a [u8; 29], response: response::Context) -> Self {
+    pub fn new(
+        write: Slice<'a, &'a mut usize>,
+        date: &'a [u8; 29],
+        response: response::Context,
+    ) -> Self {
         Self {
             write,
             date,
@@ -45,10 +50,12 @@ impl<'a> Egress<'a> {
     ) -> Option<output::Outcome<'d>> {
         match policy {
             route::Cache::Bypass => None,
-            route::Cache::Store => match cache.try_write(self.write, self.date, self.response) {
-                Ok(cached) => cached.map(Self::from_cache),
-                Err(error) => Some(output::Outcome::Failed(Failure::Output(error.into()))),
-            },
+            route::Cache::Store => {
+                match cache.try_write(self.write.reborrow(), self.date, self.response) {
+                    Ok(cached) => cached.map(Self::from_cache),
+                    Err(error) => Some(output::Outcome::Failed(Failure::Output(error.into()))),
+                }
+            }
         }
     }
 
@@ -118,15 +125,7 @@ impl<'a> Egress<'a> {
             >(
                 written,
                 |written| (Self::outcome(Ok(written), conn), None),
-                |(written, stream)| {
-                    (
-                        output::Outcome::Send {
-                            written,
-                            connection: conn,
-                        },
-                        stream,
-                    )
-                },
+                |stream| (output::Outcome::Send { connection: conn }, stream),
             ),
             Err(error) => (output::Outcome::Failed(Failure::Output(error)), None),
         }
@@ -138,7 +137,7 @@ impl<'a> Egress<'a> {
         reply: S,
         policy: route::Policy,
         admit: output::Admit<A>,
-    ) -> Result<Stream<(A, S::Stream)>, Failure>
+    ) -> Result<Option<(A, S::Stream)>, Failure>
     where
         'd: 'req,
         S: dispatch::Emit<'req, 'd, Kind = dispatch::Polled>,
@@ -164,38 +163,29 @@ impl<'a> Egress<'a> {
             Err(error) => return output::Outcome::Failed(Failure::Output(error)),
         };
         match sent {
-            Written::Inline {
-                written: used,
-                copy,
-            } => output::Outcome::SendCopied {
-                written: used,
+            Written::Inline { copy } => output::Outcome::SendCopied {
                 copy,
                 connection: conn,
             },
-            Written::Compressed { head, body, read } => output::Outcome::SendCompressed {
-                hdr_written: head,
+            Written::Compressed { body, read } => output::Outcome::SendCompressed {
                 body,
                 read,
                 connection: conn,
             },
-            Written::Body { head, body } => Self::body_outcome(head, body, conn),
-            Written::Head { written, input } => Self::head_outcome(written, input.into(), conn),
-            Written::RequestBody { head, body } => {
-                output::Outcome::SendRequestBody(output::Pending::new(head, body, conn))
+            Written::Body { body } => Self::body_outcome(body, conn),
+            Written::Head { input } => Self::head_outcome(input.into(), conn),
+            Written::RequestBody { body } => {
+                output::Outcome::SendRequestBody(output::Pending::new(body, conn))
             }
         }
     }
 
     fn body_outcome<'d, P>(
-        head: usize,
         ready: handoff::Ready<'d>,
         conn: head::Connection,
     ) -> output::Outcome<'d, P> {
         match ready {
-            handoff::Ready::Empty => output::Outcome::Send {
-                written: head,
-                connection: conn,
-            },
+            handoff::Ready::Empty => output::Outcome::Send { connection: conn },
             handoff::Ready::Owned(mut body) => {
                 let body = match storage::Shared::try_from(&mut body) {
                     Ok(body) => body,
@@ -206,7 +196,6 @@ impl<'a> Egress<'a> {
                     }
                 };
                 output::Outcome::SendShared {
-                    hdr_written: head,
                     body,
                     connection: conn,
                 }
@@ -214,29 +203,24 @@ impl<'a> Egress<'a> {
             handoff::Ready::Copied(body) => {
                 let (body, copy) = body.into_parts();
                 output::Outcome::SendOwnedCopy {
-                    hdr_written: head,
                     body,
                     cause: copy.cause,
                     connection: conn,
                 }
             }
             handoff::Ready::Retained(body) => output::Outcome::SendShared {
-                hdr_written: head,
                 body,
                 connection: conn,
             },
             handoff::Ready::Segmented(body) => output::Outcome::SendSegmented {
-                hdr_written: head,
                 body,
                 connection: conn,
             },
             handoff::Ready::Linked(body) => output::Outcome::SendLinked {
-                hdr_written: head,
                 body,
                 connection: conn,
             },
             handoff::Ready::Fixed(body) => output::Outcome::SendStatic {
-                hdr_written: head,
                 body,
                 connection: conn,
             },
@@ -244,14 +228,12 @@ impl<'a> Egress<'a> {
     }
 
     fn head_outcome<'d, P>(
-        written: usize,
         input: crate::Input<'_>,
         conn: head::Connection,
     ) -> output::Outcome<'d, P> {
         match input {
             crate::Input::Borrowed(bytes) => match storage::Shared::try_copy(bytes) {
                 Ok(body) => output::Outcome::SendOwnedCopy {
-                    hdr_written: written,
                     body,
                     cause: evidence::Cause::Borrowed,
                     connection: conn,
@@ -260,7 +242,6 @@ impl<'a> Egress<'a> {
             },
             crate::Input::Buffered(view) => match view.try_retain() {
                 Ok(body) => output::Outcome::SendShared {
-                    hdr_written: written,
                     body,
                     connection: conn,
                 },
@@ -271,8 +252,7 @@ impl<'a> Egress<'a> {
 
     fn from_cache<'d>(cached: cache::Cached) -> output::Outcome<'d> {
         match cached {
-            cache::Cached::Fixed { len, body } => output::Outcome::SendCopied {
-                written: len,
+            cache::Cached::Fixed { body } => output::Outcome::SendCopied {
                 copy: evidence::Copy {
                     read: body,
                     written: body,
@@ -280,8 +260,7 @@ impl<'a> Egress<'a> {
                 },
                 connection: head::Connection::KeepAlive,
             },
-            cache::Cached::Shared { head, body } => output::Outcome::SendShared {
-                hdr_written: head,
+            cache::Cached::Shared { body } => output::Outcome::SendShared {
                 body,
                 connection: head::Connection::KeepAlive,
             },
@@ -291,7 +270,7 @@ impl<'a> Egress<'a> {
 
 impl<'a, 'req> Egress<'a, crate::Input<'req>> {
     pub fn bind(
-        write: &'a mut [u8],
+        write: Slice<'a, &'a mut usize>,
         date: &'a [u8; 29],
         input: crate::Input<'req>,
         response: response::Context,
@@ -304,7 +283,7 @@ impl<'a, 'req> Egress<'a, crate::Input<'req>> {
         }
     }
 
-    pub fn into_parts(self) -> (&'a mut [u8], &'a [u8; 29]) {
+    pub fn into_parts(self) -> (Slice<'a, &'a mut usize>, &'a [u8; 29]) {
         (self.write, self.date)
     }
 }
@@ -329,6 +308,6 @@ impl<'input, 'req, 'd: 'req> guard::Reject<'req, 'd> for Egress<'_, crate::Input
 }
 
 const _: () = {
-    assert!(mem::size_of::<Egress<'_>>() == 4 * mem::size_of::<usize>());
-    assert!(mem::size_of::<Egress<'_, crate::Input<'_>>>() <= 7 * mem::size_of::<usize>());
+    assert!(mem::size_of::<Egress<'_>>() == 5 * mem::size_of::<usize>());
+    assert!(mem::size_of::<Egress<'_, crate::Input<'_>>>() <= 8 * mem::size_of::<usize>());
 };

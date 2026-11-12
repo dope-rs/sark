@@ -1,6 +1,7 @@
 //! Mutable resources for direct, synchronous HTTP/1 routing.
 
 use core::pin;
+use o3::buffer::write::Slice;
 use std::{convert::Infallible, ops::ControlFlow};
 
 use o3::{alloc, mem::Rejected};
@@ -64,7 +65,7 @@ impl<'router, R: Router> Driver<'router, R> {
         &mut self,
         conn: &mut Connection<'io, R::State, R::Table>,
         input: &[u8],
-        write: &mut [u8],
+        write: Slice<'_, &mut usize>,
         prior: head::Connection,
     ) -> pump::Cycle<'io> {
         let input = match pump::Ingress::preflight(conn, input) {
@@ -101,7 +102,7 @@ impl<'router, R: Router> Driver<'router, R> {
     fn select<'turn, 'io>(
         &'turn mut self,
         permit: session::Permit,
-        write: &'turn mut [u8],
+        write: Slice<'turn, &'turn mut usize>,
         conn: &'turn mut Connection<'io, R::State, R::Table>,
     ) -> routes::Select<'turn, 'io, R> {
         routes::Select {
@@ -132,7 +133,7 @@ impl<'io, R: Router> session::Dispatch<'io, (), <R::Table as set::Table<R::State
         mut self: pin::Pin<&mut Self>,
         permit: session::Permit,
         input: crate::Input<'_>,
-        write: &mut [u8],
+        write: Slice<'_, &mut usize>,
         conn: &mut Connection<'io, R::State, R::Table>,
     ) -> Outcome<'io, R::State, R::Table> {
         let methods = <R::Table as set::Table<R::State>>::METHODS;
@@ -160,7 +161,7 @@ impl<'io, R: Router> session::Dispatch<'io, (), <R::Table as set::Table<R::State
         mut self: pin::Pin<&mut Self>,
         permit: session::Permit,
         source: parsing::Source,
-        write: &mut [u8],
+        write: Slice<'_, &mut usize>,
         conn: &mut Connection<'io, R::State, R::Table>,
     ) -> Outcome<'io, R::State, R::Table> {
         let methods = <R::Table as set::Table<R::State>>::METHODS;
@@ -191,7 +192,7 @@ impl<'io, R: Router> session::Dispatch<'io, (), <R::Table as set::Table<R::State
         pending: Self::Head,
         permit: session::Permit,
         input: crate::Input<'_>,
-        write: &mut [u8],
+        write: Slice<'_, &mut usize>,
         conn: &mut Connection<'io, R::State, R::Table>,
     ) -> Outcome<'io, R::State, R::Table> {
         <R::Table as set::Table<R::State>>::resume_head(
@@ -232,7 +233,7 @@ impl<'io, R: Router> session::Dispatch<'io, (), <R::Table as set::Table<R::State
         wait: <R::Table as set::Table<R::State>>::Pending<'io>,
         body: session::Complete,
         permit: session::Permit,
-        write: &mut [u8],
+        write: Slice<'_, &mut usize>,
         rt: &mut (),
     ) -> session::BodyOutcome<'io, Self::Ready> {
         let () = *rt;
@@ -257,7 +258,7 @@ impl<'io, R: Router> session::Dispatch<'io, (), <R::Table as set::Table<R::State
         self: pin::Pin<&mut Self>,
         ready: Self::Ready,
         _: session::Permit,
-        _: &mut [u8],
+        _: Slice<'_, &mut usize>,
         _: &mut (),
     ) -> session::BodyOutcome<'io, Self::Ready> {
         match ready {}

@@ -1,5 +1,5 @@
 use dope::manifold::network::listener::conn::write;
-use o3::base::num::bounded;
+use o3::buffer::write::consume;
 use sark_core::life::session;
 
 use crate::conn::{event, machine::ops::state, outputs::transfer};
@@ -23,7 +23,7 @@ where
         self,
         prefix: &mut write::Prefix<'_, '_>,
         evidence: impl FnOnce(crate::stream::Key, usize) -> T,
-    ) -> Result<event::Write<T, C>, bounded::Error> {
+    ) -> Result<event::Write<T, C>, consume::Error> {
         let Self { state, write: head } = self;
         head.commit_to(prefix, |write, tail| {
             let output = state.finish_write(write, |stream, bytes, _| evidence(stream, bytes));

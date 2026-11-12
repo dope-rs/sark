@@ -1,7 +1,7 @@
 use std::num;
 
 use dope::net::link::egress::data::{self, exec};
-use o3::buffer::{self, hold, segments::scatter};
+use o3::buffer::{self, hold};
 
 use crate::server::payload::{Cursor, Frame, Inner, State, Stream};
 
@@ -101,6 +101,7 @@ unsafe impl<'a, 'd> buffer::raw::Scatter<'a> for Cursor<'a, 'd> {
 // SAFETY: The closed frame variants retain fixed spans; the cursor traverses exactly those spans in wire order.
 unsafe impl<'d, K> data::raw::Payload<'d> for Stream<'d, K> {
     type Mode = exec::Fallible;
+    type Position = ();
     type Cursor<'a>
         = Cursor<'a, 'd>
     where
@@ -122,11 +123,7 @@ unsafe impl<'d, K> data::raw::Payload<'d> for Stream<'d, K> {
         cursor(&self.frame, offset)
     }
 
-    unsafe fn resume(
-        &self,
-        _: &mut scatter::raw::Position,
-        offset: data::Offset,
-    ) -> Self::Cursor<'_> {
+    unsafe fn resume(&self, _: &mut Self::Position, offset: data::Offset) -> Self::Cursor<'_> {
         // SAFETY: resume requires this offset to lie strictly below the frame length.
         unsafe { resume(&self.frame, offset) }
     }
@@ -135,6 +132,7 @@ unsafe impl<'d, K> data::raw::Payload<'d> for Stream<'d, K> {
 // SAFETY: The closed frame variants retain fixed spans; the cursor traverses exactly those spans in wire order.
 unsafe impl<'d> data::raw::Payload<'d> for Frame<'d> {
     type Mode = exec::Fallible;
+    type Position = ();
     type Cursor<'a>
         = Cursor<'a, 'd>
     where
@@ -162,11 +160,7 @@ unsafe impl<'d> data::raw::Payload<'d> for Frame<'d> {
         cursor(self, offset)
     }
 
-    unsafe fn resume(
-        &self,
-        _: &mut scatter::raw::Position,
-        offset: data::Offset,
-    ) -> Self::Cursor<'_> {
+    unsafe fn resume(&self, _: &mut Self::Position, offset: data::Offset) -> Self::Cursor<'_> {
         // SAFETY: resume requires this offset to lie strictly below the frame length.
         unsafe { resume(self, offset) }
     }

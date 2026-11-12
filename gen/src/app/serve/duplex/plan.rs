@@ -240,19 +240,19 @@ impl<'spec> Plan<'spec> {
                 fn receive(
                     &mut self,
                     #v_input: #ns_http::payload::owned::Segments<'d>,
-                    #v_output: &mut [::core::primitive::u8],
+                    #v_output: #ns_core::o3::buffer::write::Slice<'_, &mut ::core::primitive::usize>,
                     #v_scratch: &mut ::std::vec::Vec<::core::primitive::u8>,
-                ) -> (::core::primitive::usize, #ns_core::duplex::Action<'d>) {
+                ) -> #ns_core::duplex::Action<'d> {
                     match self { #( Self::#variants(#v_sess, _) => #v_sess.receive(#v_input, #v_output, #v_scratch), )* }
                 }
 
                 #[inline(always)]
-                fn finish(&mut self, #v_output: &mut [::core::primitive::u8], #v_scratch: &mut ::std::vec::Vec<::core::primitive::u8>) -> (::core::primitive::usize, #ns_core::duplex::Action<'d>) {
+                fn finish(&mut self, #v_output: #ns_core::o3::buffer::write::Slice<'_, &mut ::core::primitive::usize>, #v_scratch: &mut ::std::vec::Vec<::core::primitive::u8>) -> #ns_core::duplex::Action<'d> {
                     match self { #( Self::#variants(#v_sess, _) => #v_sess.finish(#v_output, #v_scratch), )* }
                 }
 
                 #[inline(always)]
-                fn activate(&mut self, #v_output: &mut [::core::primitive::u8], #v_scratch: &mut ::std::vec::Vec<::core::primitive::u8>) -> (::core::primitive::usize, #ns_core::duplex::Action<'d>) {
+                fn activate(&mut self, #v_output: #ns_core::o3::buffer::write::Slice<'_, &mut ::core::primitive::usize>, #v_scratch: &mut ::std::vec::Vec<::core::primitive::u8>) -> #ns_core::duplex::Action<'d> {
                     match self { #( Self::#variants(#v_sess, _) => #v_sess.activate(#v_output, #v_scratch), )* }
                 }
             }

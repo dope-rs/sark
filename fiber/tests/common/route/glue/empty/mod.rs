@@ -188,7 +188,7 @@ impl<'d, R: route::Spec<Request: route::Own<RawParams = (), Mode = route::Stream
                 &mut conn,
                 Pin::new(&mut carrier),
                 part,
-                &mut [0; 2048],
+                o3::buffer::write::Slice::new(&mut [0; 2048]).reborrow(),
                 head::Connection::KeepAlive,
             );
             if let Some(error) = carrier.error.take() {
@@ -203,7 +203,7 @@ impl<'d, R: route::Spec<Request: route::Own<RawParams = (), Mode = route::Stream
             &mut conn,
             Pin::new(&mut carrier),
             &[],
-            &mut [0; 2048],
+            o3::buffer::write::Slice::new(&mut [0; 2048]).reborrow(),
             head::Connection::KeepAlive,
         );
         if let Some(error) = carrier.error.take() {
@@ -241,7 +241,7 @@ where
         self: Pin<&mut Self>,
         permit: session::Permit,
         input: sark_h1::Input<'_>,
-        _: &mut [u8],
+        _: o3::buffer::write::Slice<'_, &mut usize>,
         conn: &mut Connection<'d, R>,
     ) -> Outcome<'d, R, parsing::Rejected<'d>> {
         use sark_h1::wire::parsing::raw;
@@ -283,7 +283,7 @@ where
         self: Pin<&mut Self>,
         permit: session::Permit,
         source: parsing::Source,
-        write: &mut [u8],
+        write: o3::buffer::write::Slice<'_, &mut usize>,
         conn: &mut Connection<'d, R>,
     ) -> Outcome<'d, R, parsing::Rejected<'d>> {
         let source = source.freeze();
@@ -300,7 +300,7 @@ where
         pending: Self::Head,
         _: session::Permit,
         _: sark_h1::Input<'_>,
-        _: &mut [u8],
+        _: o3::buffer::write::Slice<'_, &mut usize>,
         _: &mut Connection<'d, R>,
     ) -> Outcome<'d, R, parsing::Rejected<'d>> {
         match pending {}
@@ -332,7 +332,7 @@ where
         pending: task::Pending<'d, R>,
         complete: session::Complete,
         permit: session::Permit,
-        _: &mut [u8],
+        _: o3::buffer::write::Slice<'_, &mut usize>,
         runtime: &mut (),
     ) -> session::BodyOutcome<'d, Self::Ready> {
         let this = self.get_mut();
@@ -344,7 +344,7 @@ where
         self: Pin<&mut Self>,
         ready: Self::Ready,
         permit: session::Permit,
-        _: &mut [u8],
+        _: o3::buffer::write::Slice<'_, &mut usize>,
         runtime: &mut (),
     ) -> session::BodyOutcome<'d, Self::Ready> {
         let this = self.get_mut();

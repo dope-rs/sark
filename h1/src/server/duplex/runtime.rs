@@ -16,7 +16,7 @@ use egress::{
     load::Value,
 };
 use hold::scope;
-use o3::buffer::{hold, resident::bound};
+use o3::buffer::{hold, resident::bound, write::Slice};
 use sark_core::duplex;
 use sark_http::payload::owned;
 
@@ -224,53 +224,50 @@ where
             }
         }
         let scratch = &mut *self.scratch;
-        match self.conn.write().try_draft(
+        match self.conn.write().try_commit(
             driver,
-            move |state, buffer| -> Result<_, convert::Infallible> {
+            move |state, mut prefix| -> Result<_, convert::Infallible> {
                 let raw = match state.raw_mut() {
                     Ok(raw) => raw,
                     Err(switch::Mode::Http | switch::Mode::Switching(_)) => {
-                        return Ok(write::Draft::new(0, None, machine::After::Idle).close_after());
+                        return Ok(prefix.commit(None, machine::After::Idle).close_after());
                     }
                 };
-                Ok(
-                    match raw.transact(buffer, scratch, |written, send| {
-                        let (payload, end, after) = send.into_parts();
-                        let draft = |output: Option<_>| {
-                            let draft =
-                                write::Draft::new(written, output.map(Value::Unchecked), after);
-                            match end {
-                                machine::End::Open => draft,
-                                machine::End::FinishOutput => draft.shutdown(),
-                                machine::End::FinishSession => draft.close_after(),
-                            }
-                        };
-                        match payload {
-                            admit::Payload::Present { output, permit } => {
-                                let output =
-                                    egress::Load::new(payload::Body::duplex(output, K::default()))
-                                        .into_left()
-                                        .unbounded();
-                                permit.commit::<_, convert::Infallible>(draft(Some(output)))
-                            }
-                            admit::Payload::Vacant(permit) => {
-                                permit.commit::<_, convert::Infallible>(draft(None))
-                            }
+                let (body, end, after) = match raw.transact(prefix.writer(), scratch, |send| {
+                    let (payload, end, after) = send.into_parts();
+                    match payload {
+                        admit::Payload::Present { output, permit } => {
+                            let output =
+                                egress::Load::new(payload::Body::duplex(output, K::default()))
+                                    .into_left()
+                                    .unbounded();
+                            permit.commit::<_, convert::Infallible>((
+                                Some(Value::Unchecked(output)),
+                                end,
+                                after,
+                            ))
                         }
-                    }) {
-                        machine::Transaction::Committed { receipt: done, .. } => done,
-                        machine::Transaction::Violation(
-                            machine::Violation::OutputAfterFinish
-                            | machine::Violation::PrefixCapacity { .. }
-                            | machine::Violation::PrefixPending,
-                        ) => write::Draft::new(0, None, machine::After::Idle).close_after(),
-                        machine::Transaction::Idle => {
-                            write::Draft::new(0, None, machine::After::Idle)
+                        admit::Payload::Vacant(permit) => {
+                            permit.commit::<_, convert::Infallible>((None, end, after))
                         }
-                        machine::Transaction::Pending { receipt } => receipt.close_after(),
-                        machine::Transaction::Rejected(never) => match never {},
-                    },
-                )
+                    }
+                }) {
+                    machine::Transaction::Committed { receipt, .. } => receipt,
+                    machine::Transaction::Violation(
+                        machine::Violation::OutputAfterFinish | machine::Violation::PrefixPending,
+                    ) => (None, machine::End::FinishSession, machine::After::Idle),
+                    machine::Transaction::Idle => (None, machine::End::Open, machine::After::Idle),
+                    machine::Transaction::Pending {
+                        receipt: (body, _, after),
+                    } => (body, machine::End::FinishSession, after),
+                    machine::Transaction::Rejected(never) => match never {},
+                };
+                let commit = prefix.commit(body, after);
+                Ok(match end {
+                    machine::End::Open => commit,
+                    machine::End::FinishOutput => commit.shutdown(),
+                    machine::End::FinishSession => commit.close_after(),
+                })
             },
         ) {
             Ok(write::Outcome::Committed(machine::After::Idle | machine::After::Finished)) => {
@@ -296,7 +293,7 @@ where
     }
 
     fn flush_closed(raw: &mut machine::Machine<'d, D>, scratch: &mut Vec<u8>) -> machine::After {
-        let turn = raw.transact(&mut [], scratch, |_, send| {
+        let turn = raw.transact(Slice::new(&mut []).reborrow(), scratch, |send| {
             // Finished output rejects every payload before this admission.
             let admit::Payload::Vacant(permit) = send.into_parts().0 else {
                 unreachable!("closed")
@@ -307,9 +304,7 @@ where
             machine::Transaction::Committed { after, .. } => after,
             machine::Transaction::Idle => machine::After::Idle,
             machine::Transaction::Violation(
-                machine::Violation::OutputAfterFinish
-                | machine::Violation::PrefixCapacity { .. }
-                | machine::Violation::PrefixPending,
+                machine::Violation::OutputAfterFinish | machine::Violation::PrefixPending,
             ) => machine::After::Finished,
             machine::Transaction::Pending { .. } => unreachable!("committed"),
             machine::Transaction::Rejected(never) => match never {},

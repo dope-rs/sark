@@ -1,6 +1,6 @@
 //! Lossless absolute-URI and client-target proofs.
 
-use std::{num, str};
+use std::{mem, num, str};
 
 use o3::alloc::{self, StrExt as _, array};
 
@@ -207,7 +207,7 @@ impl Target {
             }
             parsed.host().len()
         };
-        let mut digits = [0; 20];
+        let mut digits = [mem::MaybeUninit::uninit(); 20];
         let port = port.map(|port| raw::decimal(port, &mut digits));
         let port_len = port.map_or(0, |port| port.len() + 1);
         let end = host

@@ -1,3 +1,4 @@
+use o3::buffer::write::Slice;
 use std::convert::Infallible;
 
 use duplex::machine;
@@ -228,7 +229,7 @@ where
         self,
         permit: session::Permit,
         found: framing::Head<'_, '_, R, framing::Plain, Upgrade>,
-        write: &mut [u8],
+        write: Slice<'_, &mut usize>,
         wrap: Wrap,
         mut proof: E,
     ) -> session::RouteOutcome<'d, Infallible, machine::Machine<'d, D>>
@@ -260,8 +261,8 @@ where
             Ok(raw) => raw,
             Err(error) => return session::Outcome::Failed(error).into(),
         };
-        let written = match ws::Response::upgrade_into(write, &accept) {
-            Ok(written) => written,
+        match ws::Response::upgrade_into(write, &accept) {
+            Ok(_) => {}
             Err(error) => {
                 raw.handler().failed(ws::Error::Capacity(error));
                 return session::Outcome::Failed(Failure::Output(
@@ -290,7 +291,7 @@ where
             .switch(
                 switch::Transition::new(Kind::Upgrade, machine::Machine::new(wrap(raw))),
                 session::Buffered::new(used),
-                output::Switch::Inline { written },
+                output::Switch::Inline,
             )
             .into()
     }

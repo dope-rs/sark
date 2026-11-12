@@ -32,7 +32,7 @@ use sark_h1::{
         payload,
     },
     session,
-    wire::{Failure, InputError, head, output, parsing},
+    wire::{Failure, InputError, head, output, parsing, response},
 };
 use sark_http::payload::{fixed, owned};
 use settings::{claim, errors};
@@ -194,20 +194,12 @@ impl<'a: 'd, 'd> session::Dispatch<'d, (), Infallible> for App<'a> {
     type Ready = Infallible;
     type Head = Infallible;
 
-    fn abort_body(
-        self: Pin<&mut Self>,
-        _: &mut session::Conn<'d, (), Infallible>,
-        error: Failure,
-    ) -> fixed::Body<'d> {
-        panic!("unexpected rejection: {error:?}")
-    }
-
     fn resume_head(
         self: Pin<&mut Self>,
         pending: Self::Head,
         _: session::Permit,
         _: Input<'_>,
-        _: &mut [u8],
+        _: o3::buffer::write::Slice<'_, &mut usize>,
         _: &mut session::Conn<'d, (), Infallible>,
     ) -> session::RouteOutcome<'d, Infallible, Infallible, Self::Head, parsing::Rejected<'d>> {
         match pending {}
@@ -217,7 +209,7 @@ impl<'a: 'd, 'd> session::Dispatch<'d, (), Infallible> for App<'a> {
         self: Pin<&mut Self>,
         permit: session::Permit,
         source: parsing::Source,
-        write: &mut [u8],
+        write: o3::buffer::write::Slice<'_, &mut usize>,
         conn: &mut session::Conn<'d, (), Infallible>,
     ) -> session::RouteOutcome<'d, Infallible, Infallible, Self::Head, parsing::Rejected<'d>> {
         let source = source.freeze();
@@ -228,7 +220,7 @@ impl<'a: 'd, 'd> session::Dispatch<'d, (), Infallible> for App<'a> {
         self: Pin<&mut Self>,
         permit: session::Permit,
         input: Input<'_>,
-        output: &mut [u8],
+        mut output: o3::buffer::write::Slice<'_, &mut usize>,
         _: &mut session::Conn<'d, (), Infallible>,
     ) -> session::RouteOutcome<'d, Infallible, Infallible, Self::Head, parsing::Rejected<'d>> {
         match input.as_slice().first() {
@@ -239,13 +231,16 @@ impl<'a: 'd, 'd> session::Dispatch<'d, (), Infallible> for App<'a> {
             .into(),
             Some(b'A') => {
                 self.facts.routed.set(self.facts.routed.get() + 1);
-                output[..PREFIX.len()].copy_from_slice(PREFIX);
+                if let Err(error) = o3::buffer::write::Sink::write_slice(&mut output, PREFIX) {
+                    return session::Outcome::Failed(Failure::Output(output::Error::Wire(
+                        response::Error::ValueCapacity(error),
+                    )))
+                    .into();
+                }
                 session::Outcome::Complete {
                     permit,
                     consumption: session::Consumption::Buffered(session::Buffered::new(1)),
-                    response: output::Complete::Inline {
-                        written: PREFIX.len(),
-                    },
+                    response: output::Complete::Inline,
                     connection: head::Connection::KeepAlive,
                 }
                 .into()
@@ -255,17 +250,16 @@ impl<'a: 'd, 'd> session::Dispatch<'d, (), Infallible> for App<'a> {
                 let body = match storage::Shared::try_copy(b"bound-owner") {
                     Ok(body) => body,
                     Err(error) => {
-                        let error = Failure::Input(InputError::Storage(error));
-                        panic!("unexpected rejection: {error:?}");
+                        return session::Outcome::Failed(Failure::Input(InputError::Storage(
+                            error,
+                        )))
+                        .into();
                     }
                 };
                 session::Outcome::Complete {
                     permit,
                     consumption: session::Consumption::Buffered(session::Buffered::new(1)),
-                    response: output::Complete::Shared {
-                        hdr_written: 0,
-                        body,
-                    },
+                    response: output::Complete::Shared { body },
                     connection: head::Connection::KeepAlive,
                 }
                 .into()
@@ -274,7 +268,7 @@ impl<'a: 'd, 'd> session::Dispatch<'d, (), Infallible> for App<'a> {
                 self.facts.rejected.set(self.facts.rejected.get() + 1);
                 session::Outcome::Close(fixed::Body::new(self.reason)).into()
             }
-            _ => panic!("unexpected input: {:?}", input.as_slice()),
+            _ => session::Outcome::Failed(Failure::BadRequest).into(),
         }
     }
 
@@ -304,7 +298,7 @@ impl<'a: 'd, 'd> session::Dispatch<'d, (), Infallible> for App<'a> {
         wait: Infallible,
         _: session::Complete,
         _: session::Permit,
-        _: &mut [u8],
+        _: o3::buffer::write::Slice<'_, &mut usize>,
         _: &mut (),
     ) -> session::BodyOutcome<'d, Self::Ready> {
         match wait {}
@@ -314,7 +308,7 @@ impl<'a: 'd, 'd> session::Dispatch<'d, (), Infallible> for App<'a> {
         self: Pin<&mut Self>,
         ready: Self::Ready,
         _: session::Permit,
-        _: &mut [u8],
+        _: o3::buffer::write::Slice<'_, &mut usize>,
         _: &mut (),
     ) -> session::BodyOutcome<'d, Self::Ready> {
         match ready {}
@@ -396,16 +390,10 @@ impl<'a: 'd, 'd, ID: route::Identity> retire::Policy<'d, App<'a>, ID> for Retire
         match app.facts.failure.get() {
             None => assert!(conn.failure().is_none()),
             Some(expected) => {
-                let Some(conn::Failure::Write(conn::write::body::Failure::Bound {
-                    charge,
-                    maximum,
-                })) = conn.failure()
-                else {
-                    panic!("exact owner bound failure must reach final retirement");
-                };
-                assert_eq!(charge.bytes().get(), expected.logical_bytes);
-                assert_eq!(charge.resident().get(), expected.resident_bytes);
-                assert_eq!(*maximum, 0);
+                assert!(matches!(conn.failure(), Some(conn::Failure::Write(
+                    conn::write::body::Failure::Bound { charge, maximum }
+                )) if charge.bytes().get() == expected.logical_bytes
+                    && charge.resident().get() == expected.resident_bytes && *maximum == 0));
                 assert_eq!(app.facts.rejected.get(), 1);
             }
         }

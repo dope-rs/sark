@@ -19,9 +19,9 @@ pub(super) unsafe fn slice(value: &str, range: ops::Range<usize>) -> &str {
     unsafe { value.get_unchecked(range) }
 }
 
-pub(super) fn decimal(port: NonZero<u16>, digits: &mut [u8; 20]) -> &str {
-    let bytes = usize::from(port.get()).decimal(digits);
-    // SAFETY: Wire::decimal emits only initialized ASCII decimal digits.
+pub(super) fn decimal(port: NonZero<u16>, digits: &mut [mem::MaybeUninit<u8>; 20]) -> &str {
+    let bytes = usize::from(port.get()).decimal_uninit(digits);
+    // SAFETY: Wire::decimal_uninit emits only initialized ASCII decimal digits.
     unsafe { str::from_utf8_unchecked(bytes) }
 }
 

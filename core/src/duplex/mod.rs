@@ -1,5 +1,6 @@
 //! Protocol-neutral contracts for accepted byte streams.
 use core::convert::Infallible;
+use o3::buffer::write::Slice;
 type Opened<S, B, E> = Result<(S, B), (OpenError<E>, B)>;
 use sark_http::{field::metadata::block, payload::owned};
 
@@ -100,14 +101,14 @@ pub trait Session<'d> {
     fn receive(
         &mut self,
         input: owned::Segments<'d>,
-        output: &mut [u8],
+        output: Slice<'_, &mut usize>,
         scratch: &mut Vec<u8>,
-    ) -> (usize, Action<'d>);
+    ) -> Action<'d>;
 
     /// Observes the peer's orderly end of the input direction exactly once.
-    fn finish(&mut self, output: &mut [u8], scratch: &mut Vec<u8>) -> (usize, Action<'d>);
+    fn finish(&mut self, output: Slice<'_, &mut usize>, scratch: &mut Vec<u8>) -> Action<'d>;
 
-    fn activate(&mut self, output: &mut [u8], scratch: &mut Vec<u8>) -> (usize, Action<'d>);
+    fn activate(&mut self, output: Slice<'_, &mut usize>, scratch: &mut Vec<u8>) -> Action<'d>;
 }
 
 /// Uninhabited session used by generated applications with no duplex routes.
@@ -117,17 +118,17 @@ impl<'d> Session<'d> for Never {
     fn receive(
         &mut self,
         _: owned::Segments<'d>,
-        _: &mut [u8],
+        _: Slice<'_, &mut usize>,
         _: &mut Vec<u8>,
-    ) -> (usize, Action<'d>) {
+    ) -> Action<'d> {
         match *self {}
     }
 
-    fn finish(&mut self, _: &mut [u8], _: &mut Vec<u8>) -> (usize, Action<'d>) {
+    fn finish(&mut self, _: Slice<'_, &mut usize>, _: &mut Vec<u8>) -> Action<'d> {
         match *self {}
     }
 
-    fn activate(&mut self, _: &mut [u8], _: &mut Vec<u8>) -> (usize, Action<'d>) {
+    fn activate(&mut self, _: Slice<'_, &mut usize>, _: &mut Vec<u8>) -> Action<'d> {
         match *self {}
     }
 }

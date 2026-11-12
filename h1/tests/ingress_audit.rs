@@ -14,7 +14,7 @@ fn bounded_head_total() {
         &mut conn,
         Pin::new(&mut pending),
         b"head",
-        &mut [0; 1],
+        o3::buffer::write::Slice::new(&mut [0; 1]).reborrow(),
         head::Connection::KeepAlive,
     );
     assert!(cycle.state.is_ok());

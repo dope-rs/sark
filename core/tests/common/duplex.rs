@@ -1,8 +1,9 @@
+use o3::buffer::write::Slice;
 use std::{cell::Cell, collections::VecDeque};
 
 use dope_test::harness::observe::VecCellExt as _;
 use o3::{
-    buffer::{resident, storage},
+    buffer::{resident, storage, write::Sink as _},
     mem::Rejected,
 };
 use sark_core::duplex::{self, admit, input};
@@ -76,22 +77,19 @@ impl<'d> duplex::Session<'d> for Ending<'_> {
     fn receive(
         &mut self,
         _: owned::Segments<'d>,
-        _: &mut [u8],
+        _: Slice<'_, &mut usize>,
         _: &mut Vec<u8>,
-    ) -> (usize, duplex::Action<'d>) {
-        (0, duplex::Action::idle())
+    ) -> duplex::Action<'d> {
+        duplex::Action::idle()
     }
 
-    fn activate(&mut self, _: &mut [u8], _: &mut Vec<u8>) -> (usize, duplex::Action<'d>) {
-        (0, duplex::Action::idle().activate())
+    fn activate(&mut self, _: Slice<'_, &mut usize>, _: &mut Vec<u8>) -> duplex::Action<'d> {
+        duplex::Action::idle().activate()
     }
 
-    fn finish(&mut self, _: &mut [u8], _: &mut Vec<u8>) -> (usize, duplex::Action<'d>) {
+    fn finish(&mut self, _: Slice<'_, &mut usize>, _: &mut Vec<u8>) -> duplex::Action<'d> {
         self.0.push(Event::Finished);
-        (
-            0,
-            duplex::Action::send_end(resident::Shared::from(b"end".as_slice())),
-        )
+        duplex::Action::send_end(resident::Shared::from(b"end".as_slice()))
     }
 }
 
@@ -99,24 +97,24 @@ impl<'d> duplex::Session<'d> for Session<'_> {
     fn receive(
         &mut self,
         input: owned::Segments<'d>,
-        _: &mut [u8],
+        _: Slice<'_, &mut usize>,
         _: &mut Vec<u8>,
-    ) -> (usize, duplex::Action<'d>) {
+    ) -> duplex::Action<'d> {
         let event = match input.contiguous() {
             Some(b"first") => Event::First,
             Some(b"second") => Event::Second,
             _ => Event::Bad,
         };
         self.0.push(event);
-        (0, duplex::Action::idle())
+        duplex::Action::idle()
     }
-    fn activate(&mut self, _: &mut [u8], _: &mut Vec<u8>) -> (usize, duplex::Action<'d>) {
+    fn activate(&mut self, _: Slice<'_, &mut usize>, _: &mut Vec<u8>) -> duplex::Action<'d> {
         self.0.push(Event::Activate);
-        (0, duplex::Action::idle().activate())
+        duplex::Action::idle().activate()
     }
-    fn finish(&mut self, _: &mut [u8], _: &mut Vec<u8>) -> (usize, duplex::Action<'d>) {
+    fn finish(&mut self, _: Slice<'_, &mut usize>, _: &mut Vec<u8>) -> duplex::Action<'d> {
         self.0.push(Event::Finished);
-        (0, duplex::Action::close())
+        duplex::Action::close()
     }
 }
 
@@ -124,16 +122,16 @@ impl<'d> duplex::Session<'d> for Terminal {
     fn receive(
         &mut self,
         _: owned::Segments<'d>,
-        _: &mut [u8],
+        _: Slice<'_, &mut usize>,
         _: &mut Vec<u8>,
-    ) -> (usize, duplex::Action<'d>) {
-        (0, duplex::Action::close())
+    ) -> duplex::Action<'d> {
+        duplex::Action::close()
     }
-    fn finish(&mut self, _: &mut [u8], _: &mut Vec<u8>) -> (usize, duplex::Action<'d>) {
-        (0, duplex::Action::end())
+    fn finish(&mut self, _: Slice<'_, &mut usize>, _: &mut Vec<u8>) -> duplex::Action<'d> {
+        duplex::Action::end()
     }
-    fn activate(&mut self, _: &mut [u8], _: &mut Vec<u8>) -> (usize, duplex::Action<'d>) {
-        (0, duplex::Action::close())
+    fn activate(&mut self, _: Slice<'_, &mut usize>, _: &mut Vec<u8>) -> duplex::Action<'d> {
+        duplex::Action::close()
     }
 }
 
@@ -141,21 +139,21 @@ impl<'d> duplex::Session<'d> for Idle<'_> {
     fn receive(
         &mut self,
         _: owned::Segments<'d>,
-        _: &mut [u8],
+        _: Slice<'_, &mut usize>,
         _: &mut Vec<u8>,
-    ) -> (usize, duplex::Action<'d>) {
+    ) -> duplex::Action<'d> {
         self.0.push(Event::Bad);
-        (0, duplex::Action::idle())
+        duplex::Action::idle()
     }
 
-    fn activate(&mut self, _: &mut [u8], _: &mut Vec<u8>) -> (usize, duplex::Action<'d>) {
+    fn activate(&mut self, _: Slice<'_, &mut usize>, _: &mut Vec<u8>) -> duplex::Action<'d> {
         self.0.push(Event::Activate);
-        (0, duplex::Action::idle())
+        duplex::Action::idle()
     }
 
-    fn finish(&mut self, _: &mut [u8], _: &mut Vec<u8>) -> (usize, duplex::Action<'d>) {
+    fn finish(&mut self, _: Slice<'_, &mut usize>, _: &mut Vec<u8>) -> duplex::Action<'d> {
         self.0.push(Event::Finished);
-        (0, duplex::Action::idle())
+        duplex::Action::idle()
     }
 }
 
@@ -169,26 +167,25 @@ impl<'d> duplex::Session<'d> for Prefix<'_> {
     fn receive(
         &mut self,
         _: owned::Segments<'d>,
-        output: &mut [u8],
+        output: Slice<'_, &mut usize>,
         scratch: &mut Vec<u8>,
-    ) -> (usize, duplex::Action<'d>) {
+    ) -> duplex::Action<'d> {
         self.finish(output, scratch)
     }
 
-    fn finish(&mut self, output: &mut [u8], _: &mut Vec<u8>) -> (usize, duplex::Action<'d>) {
+    fn finish(&mut self, mut output: Slice<'_, &mut usize>, _: &mut Vec<u8>) -> duplex::Action<'d> {
         self.calls.set(self.calls.get() + 1);
-        output.fill(b'p');
-        (
-            self.written,
-            if self.body {
-                duplex::Action::send_end(resident::Shared::from(b"end".as_slice()))
-            } else {
-                duplex::Action::end()
-            },
-        )
+        output
+            .write_slice(&b"p"[..self.written])
+            .expect("prefix capacity");
+        if self.body {
+            duplex::Action::send_end(resident::Shared::from(b"end".as_slice()))
+        } else {
+            duplex::Action::end()
+        }
     }
 
-    fn activate(&mut self, _: &mut [u8], _: &mut Vec<u8>) -> (usize, duplex::Action<'d>) {
-        (0, duplex::Action::end())
+    fn activate(&mut self, _: Slice<'_, &mut usize>, _: &mut Vec<u8>) -> duplex::Action<'d> {
+        duplex::Action::end()
     }
 }

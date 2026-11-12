@@ -35,7 +35,7 @@ impl<'a> Reject<'a> {
             conn,
             Pin::new(self),
             b"rejected request",
-            &mut [0; 2048],
+            o3::buffer::write::Slice::new(&mut [0; 2048]).reborrow(),
             head::Connection::KeepAlive,
         )
     }
@@ -58,7 +58,7 @@ impl<'d, T: switch::Engine> session::Dispatch<'d, (), Infallible, T> for Reject<
         pending: Self::Head,
         _: session::Permit,
         _: Input<'_>,
-        _: &mut [u8],
+        _: o3::buffer::write::Slice<'_, &mut usize>,
         _: &mut session::Conn<'d, (), Infallible, T>,
     ) -> session::RouteOutcome<'d, Infallible, T::Raw, Self::Head, parsing::Rejected<'d>> {
         match pending {}
@@ -68,7 +68,7 @@ impl<'d, T: switch::Engine> session::Dispatch<'d, (), Infallible, T> for Reject<
         self: Pin<&mut Self>,
         permit: session::Permit,
         source: parsing::Source,
-        write: &mut [u8],
+        write: o3::buffer::write::Slice<'_, &mut usize>,
         conn: &mut session::Conn<'d, (), Infallible, T>,
     ) -> session::RouteOutcome<'d, Infallible, T::Raw, Self::Head, parsing::Rejected<'d>> {
         let source = source.freeze();
@@ -79,7 +79,7 @@ impl<'d, T: switch::Engine> session::Dispatch<'d, (), Infallible, T> for Reject<
         self: Pin<&mut Self>,
         _: session::Permit,
         input: Input<'_>,
-        _: &mut [u8],
+        _: o3::buffer::write::Slice<'_, &mut usize>,
         _: &mut session::Conn<'d, (), Infallible, T>,
     ) -> session::RouteOutcome<'d, Infallible, T::Raw, Self::Head, parsing::Rejected<'d>> {
         let this = self.get_mut();
@@ -119,7 +119,7 @@ impl<'d, T: switch::Engine> session::Dispatch<'d, (), Infallible, T> for Reject<
         pending: Infallible,
         _: session::Complete,
         _: session::Permit,
-        _: &mut [u8],
+        _: o3::buffer::write::Slice<'_, &mut usize>,
         _: &mut (),
     ) -> session::BodyOutcome<'d, Self::Ready, T::Raw> {
         match pending {}
@@ -129,7 +129,7 @@ impl<'d, T: switch::Engine> session::Dispatch<'d, (), Infallible, T> for Reject<
         self: Pin<&mut Self>,
         ready: Self::Ready,
         _: session::Permit,
-        _: &mut [u8],
+        _: o3::buffer::write::Slice<'_, &mut usize>,
         _: &mut (),
     ) -> session::BodyOutcome<'d, Self::Ready, T::Raw> {
         match ready {}

@@ -6,7 +6,7 @@ use common::{
     body::{Bounded, Counted},
     fields::{self, DATE, ENTRIES},
 };
-use o3::buffer::{Residency as _, storage};
+use o3::buffer::{Residency as _, storage, write::Slice};
 use sark_h1::{
     route,
     wire::{
@@ -88,24 +88,26 @@ fn date_ends_at_body() {
     let mut short = [0xa5; 28];
     assert!(
         entry
-            .try_write(&mut short, DATE)
+            .try_write(o3::buffer::write::Slice::new(&mut short).reborrow(), DATE)
             .expect("short output")
             .is_none()
     );
     assert_eq!(short, [0xa5; 28]);
     let mut head = [0; 29];
-    let cached = entry.try_write(&mut head, DATE).expect("head output");
-    assert!(
-        matches!(cached, Some(cache::Cached::Shared { head: 29, body })
-        if body.as_slice() == b"x")
-    );
-    assert_eq!(&head, DATE);
+    let mut writer = Slice::new(&mut head);
+    let cached = entry
+        .try_write(writer.reborrow(), DATE)
+        .expect("head output");
+    assert!(matches!(cached, Some(cache::Cached::Shared { body })
+        if body.as_slice() == b"x"));
+    assert_eq!(writer.into_mut(), DATE);
     let mut full = [0; 30];
-    let cached = entry.try_write(&mut full, DATE).expect("full output");
-    assert!(matches!(
-        cached,
-        Some(cache::Cached::Fixed { len: 30, body: 1 })
-    ));
+    let mut writer = Slice::new(&mut full);
+    let cached = entry
+        .try_write(writer.reborrow(), DATE)
+        .expect("full output");
+    assert!(matches!(cached, Some(cache::Cached::Fixed { body: 1 })));
+    assert_eq!(writer.len(), 30);
     assert_eq!(&full[..29], DATE);
     assert_eq!(full[29], b'x');
 }
@@ -114,14 +116,15 @@ fn date_ends_at_body() {
 fn empty_prefix() {
     let empty =
         Entry::try_new(storage::Shared::new(), None, 0, fields::RESPONSE).expect("empty entry");
+    let mut writer = Slice::new(&mut []);
     assert!(matches!(
-        empty.try_write(&mut [], DATE),
-        Ok(Some(cache::Cached::Fixed { len: 0, body: 0 }))
+        empty.try_write(writer.reborrow(), DATE),
+        Ok(Some(cache::Cached::Fixed { body: 0 }))
     ));
     let bytes = storage::Shared::try_copy(b"body").expect("cache storage");
     let entry = Entry::try_new(bytes, None, 4, fields::RESPONSE).expect("body without head");
-    assert!(matches!(entry.try_write(&mut [], DATE),
-        Ok(Some(cache::Cached::Shared { head: 0, body })) if body.as_slice() == b"body"
+    assert!(matches!(entry.try_write(writer.reborrow(), DATE),
+        Ok(Some(cache::Cached::Shared { body })) if body.as_slice() == b"body"
     ));
 }
 
@@ -131,7 +134,8 @@ fn bounded_cache_prefix() {
         let encodes = Cell::new(0);
         let mut entry = None;
         let mut cold = [0xa5; 256];
-        let outcome = output::Egress::new(&mut cold, DATE, fields::RESPONSE).route(
+        let mut writer = Slice::new(&mut cold);
+        let outcome = output::Egress::new(writer.reborrow(), DATE, fields::RESPONSE).route(
             Bounded {
                 fields: (),
                 body: Counted {
@@ -151,8 +155,8 @@ fn bounded_cache_prefix() {
             ),
         );
         let written = match outcome {
-            output::Outcome::SendCopied { written, copy, .. } if copy.written == source.len() => {
-                Some(written)
+            output::Outcome::SendCopied { copy, .. } if copy.written == source.len() => {
+                Some(writer.len())
             }
             _ => None,
         }
@@ -165,12 +169,12 @@ fn bounded_cache_prefix() {
         assert_eq!(&cold[head..written], source);
 
         let mut warm = [0xa5; 256];
-        let outcome = output::Egress::new(&mut warm, DATE, fields::RESPONSE)
+        let mut writer = Slice::new(&mut warm);
+        let outcome = output::Egress::new(writer.reborrow(), DATE, fields::RESPONSE)
             .cached(&mut cache::Cache::new(&mut entry), route::Cache::Store)
             .expect("cached prefix");
-        assert!(
-            matches!(outcome, output::Outcome::SendCopied { written: len, .. } if len == written)
-        );
+        assert!(matches!(outcome, output::Outcome::SendCopied { .. }));
+        assert_eq!(writer.len(), written);
         assert_eq!(warm, cold);
     }
 }
@@ -179,10 +183,11 @@ fn bounded_cache_prefix() {
 fn retains_large() {
     let mut entry = None;
     let mut cold = [0xa5; 256];
+    let mut writer = Slice::new(&mut cold);
     let (head, first) = {
         let source = [b'x'; 512];
         let response = statics::Direct::new(Code::OK, ENTRIES, Body::new(&source));
-        let outcome = output::Egress::new(&mut cold, DATE, fields::RESPONSE).route(
+        let outcome = output::Egress::new(writer.reborrow(), DATE, fields::RESPONSE).route(
             response,
             handoff::Slot::ready(None),
             cache::Cache::new(&mut entry),
@@ -196,11 +201,7 @@ fn retains_large() {
             ),
         );
         match outcome {
-            output::Outcome::SendShared {
-                hdr_written: head,
-                body,
-                ..
-            } => Some((head, body)),
+            output::Outcome::SendShared { body, .. } => Some((writer.len(), body)),
             _ => None,
         }
         .expect("cache must retain the body when only its head fits")
@@ -212,16 +213,21 @@ fn retains_large() {
 
     let mut short = [0xa5; 256];
     assert!(
-        output::Egress::new(&mut short[..head - 1], DATE, fields::RESPONSE)
-            .cached(&mut cache::Cache::new(&mut entry), route::Cache::Store)
-            .is_none()
+        output::Egress::new(
+            o3::buffer::write::Slice::new(&mut short[..head - 1]).reborrow(),
+            DATE,
+            fields::RESPONSE
+        )
+        .cached(&mut cache::Cache::new(&mut entry), route::Cache::Store)
+        .is_none()
     );
     assert!(short.iter().all(|byte| *byte == 0xa5));
 
     let mut date = *DATE;
     date[17] = b'1';
     let mut hot = [0xa5; 256];
-    let outcome = output::Egress::new(&mut hot[..head], &date, fields::RESPONSE)
+    let mut writer = Slice::new(&mut hot[..head]);
+    let outcome = output::Egress::new(writer.reborrow(), &date, fields::RESPONSE)
         .cached(&mut cache::Cache::new(&mut entry), route::Cache::Store)
         .expect("cached head fits");
     let owner = match outcome.retention() {
@@ -234,11 +240,7 @@ fn retains_large() {
     assert_eq!(owner.charge.owners, 1);
     assert!(matches!(outcome.copy(), output::Copy::Uncopied));
     let (len, body) = match outcome {
-        output::Outcome::SendShared {
-            hdr_written: len,
-            body,
-            ..
-        } => Some((len, body)),
+        output::Outcome::SendShared { body, .. } => Some((writer.len(), body)),
         _ => None,
     }
     .expect("transport must own the cached body");
@@ -252,20 +254,20 @@ fn retains_large() {
     assert!(hot[head..].iter().all(|byte| *byte == 0xa5));
 
     let mut inline = [0; 1024];
-    let outcome = output::Egress::new(&mut inline, &date, fields::RESPONSE)
+    let mut writer = Slice::new(&mut inline);
+    let outcome = output::Egress::new(writer.reborrow(), &date, fields::RESPONSE)
         .cached(&mut cache::Cache::new(&mut entry), route::Cache::Store)
         .expect("whole cached response fits");
     assert!(matches!(
         outcome,
         output::Outcome::SendCopied {
-            written,
             copy: evidence::Copy {
                 written: 512,
                 cause: evidence::Cause::Cached,
                 ..
             },
             ..
-        } if written == head + 512
+        } if writer.len() == head + 512
     ));
     assert_eq!(&inline[head..head + 512], first.as_slice());
 

@@ -244,37 +244,25 @@ where
             .store
             .vacant(proof)
             .map_err(conn::Error::Admission)?;
-        let key = vacant.insert(
-            stream::Lifecycle::open_local(boundary),
-            send,
-            recv,
-            0,
-            false,
-        );
+        let key = vacant.key();
         let outputs::Egress {
             outbound,
             headers: encoder,
         } = &mut self.conn.egress;
-        let method = match encoder.encode(
+        let method = encoder.encode(
             outbound,
             key,
             source,
             boundary,
             &self.conn.state.settings.peer,
-        ) {
-            Ok(method) => method,
-            Err(error) => {
-                self.conn.state.active_streams.remove_key(key, false);
-                return Err(error);
-            }
-        };
-        self.conn
-            .state
-            .active_streams
-            .store
-            .active_mut(key)
-            .ok_or(conn::Error::InactiveStream(key))?
-            .method = Some(method);
+        )?;
+        vacant.insert(
+            stream::Lifecycle::open_local(boundary, method),
+            send,
+            recv,
+            0,
+            false,
+        );
         next.commit();
         Ok(key)
     }

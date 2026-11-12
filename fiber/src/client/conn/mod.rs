@@ -123,7 +123,9 @@ impl<'d, ID: Identity, P, O> session::Output<'d, ID> for Connector<'_, ID, P, O>
 where
     P: Kind<'d, ID>,
 {
-    fn flush() -> Option<
+    fn flush<'w, W: wire::Spec + 'w>(
+        _: &W::Connection<'w, ID>,
+    ) -> Option<
         impl for<'a, 'x, 't, 'io> Call<(
             &'a mut Self,
             &'x mut turns::Context<'t, 'io, 'd, Self::ConnState, Self::Send, ID>,

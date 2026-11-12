@@ -160,7 +160,7 @@ pub(super) fn build<'view, 'source>(
                 self: ::core::pin::Pin<&mut Self>,
                 #v_permit: #ns_h1::session::Permit,
                 #input,
-                #v_write: &mut [::core::primitive::u8],
+                #v_write: #ns_http::o3::buffer::write::Slice<'_, &mut usize>,
                 #v_conn: &mut #conn,
             ) -> #ns_h1::session::RouteOutcome<
                 'd,
@@ -292,7 +292,7 @@ pub(super) fn build<'view, 'source>(
                 #v_wait: #head,
                 #v_permit: #ns_h1::session::Permit,
                 #v_input: #ns_h1::Input<'_>,
-                #v_write: &mut [::core::primitive::u8],
+                #v_write: #ns_http::o3::buffer::write::Slice<'_, &mut usize>,
                 #v_conn: &mut #conn,
             ) -> #ns_h1::session::RouteOutcome<'d, #wait, #raw, #head, #ns_h1::wire::parsing::Rejected<'d>> {
                 let #v_routes = self.get_mut();
@@ -308,7 +308,7 @@ pub(super) fn build<'view, 'source>(
                 #v_wait: #ns_h1::wire::parsing::Rejected<'d>,
                 #v_permit: #ns_h1::session::Permit,
                 #v_input: #ns_h1::Input<'_>,
-                _: &mut [::core::primitive::u8],
+                _: #ns_http::o3::buffer::write::Slice<'_, &mut usize>,
                 #v_conn: &mut #conn,
             ) -> #ns_h1::session::RouteOutcome<'d, #wait, #raw, #head, #ns_h1::wire::parsing::Rejected<'d>> {
                 let #v_this = self.get_mut();
@@ -356,7 +356,7 @@ pub(super) fn build<'view, 'source>(
                 #v_wait: #wait,
                 #v_body: #ns_h1::session::Complete,
                 #v_permit: #ns_h1::session::Permit,
-                #v_write: &mut [::core::primitive::u8],
+                #v_write: #ns_http::o3::buffer::write::Slice<'_, &mut usize>,
                 #v_run: &mut #rt,
             ) -> #ns_h1::session::BodyOutcome<'d, #ready, #raw> {
                 let #v_routes = self.get_mut();
@@ -379,7 +379,7 @@ pub(super) fn build<'view, 'source>(
                 self: ::core::pin::Pin<&mut Self>,
                 #v_ready: Self::Ready,
                 #v_permit: #ns_h1::session::Permit,
-                _: &mut [::core::primitive::u8],
+                _: #ns_http::o3::buffer::write::Slice<'_, &mut usize>,
                 #v_run: &mut #rt,
             ) -> #ns_h1::session::BodyOutcome<'d, #ready, #raw> {
                 let mut #v_routes = self.get_mut().app.as_mut();

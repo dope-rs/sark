@@ -253,4 +253,4 @@ where
     }
 }
 
-const _: () = assert!(mem::size_of::<Egress<'static, 'static>>() == 6 * mem::size_of::<usize>());
+const _: () = assert!(mem::size_of::<Egress<'static, 'static>>() == 7 * mem::size_of::<usize>());

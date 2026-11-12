@@ -184,10 +184,15 @@ impl<'src, 'd> response::Body<'d> for Ref<'src, 'd> {
         Ok(handoff::Plan::new(origin.clear()))
     }
 
-    fn try_resolve_into<'req, H: scope::Source, O: stage::Body<'req, 'd>>(
+    fn try_resolve_into<
+        'req,
+        H: scope::Source,
+        O: stage::Body<'req, 'd>,
+        L: std::borrow::BorrowMut<usize>,
+    >(
         self,
         slot: &handoff::Slot<'req, 'd, H, O>,
-        out: &mut [u8],
+        out: &mut o3::buffer::write::Slice<'_, L>,
     ) -> Result<ControlFlow<usize, handoff::Plan<'req, 'd, H::Selection, O>>, owned::Error> {
         if matches!(self.storage, RefStorage::Slice(_) | RefStorage::Ranges(_))
             && let Some(bytes) = self.as_slice()

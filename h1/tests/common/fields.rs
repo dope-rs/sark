@@ -90,7 +90,12 @@ pub fn try_encode<'d>(
     let response = fixed::Direct::new(Code::OK, source, Body::new(input));
     let mut bytes = [0; 512];
     let mut gzip = Gzip::try_new()?;
-    Ok(output::Egress::new(&mut bytes, DATE, RESPONSE).route(
+    Ok(output::Egress::new(
+        o3::buffer::write::Slice::new(&mut bytes).reborrow(),
+        DATE,
+        RESPONSE,
+    )
+    .route(
         response,
         handoff::Slot::ready(None),
         cache::Cache::empty(),

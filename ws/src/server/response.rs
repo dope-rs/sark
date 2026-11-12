@@ -1,14 +1,12 @@
-use std::mem;
-
 use o3::buffer::{
     storage,
-    write::{SpareExt as _, consume},
+    write::{Sink as _, Slice, SpareExt as _, consume},
 };
 
 use crate::{frame, inbound};
 
 enum Target<'a> {
-    Inline(&'a mut [u8]),
+    Inline(Slice<'a, &'a mut usize>),
     Owned(&'a mut storage::Owned),
 }
 
@@ -24,8 +22,8 @@ impl<'a> Response<'a> {
     pub const FORBIDDEN: &'static [u8] =
         b"HTTP/1.1 403 Forbidden\r\nConnection: close\r\nContent-Length: 0\r\n\r\n";
 
-    pub(super) fn new(write: &'a mut [u8]) -> Self {
-        let user = write.len();
+    pub(super) fn new(write: Slice<'a, &'a mut usize>) -> Self {
+        let user = write.remaining();
         Self {
             target: Target::Inline(write),
             written: 0,
@@ -51,7 +49,10 @@ impl<'a> Response<'a> {
     }
 
     /// Writes the complete opening response into already reserved output.
-    pub fn upgrade_into(write: &'a mut [u8], accept: &[u8; 28]) -> Result<usize, consume::Error> {
+    pub fn upgrade_into(
+        write: Slice<'a, &'a mut usize>,
+        accept: &[u8; 28],
+    ) -> Result<usize, consume::Error> {
         let mut out = Self::new(write);
         out.upgrade(accept)?;
         Ok(out.written)
@@ -59,12 +60,7 @@ impl<'a> Response<'a> {
 
     pub(super) fn put_raw(&mut self, src: &[u8]) -> Result<(), consume::Error> {
         match &mut self.target {
-            Target::Inline(write) => {
-                consume::Error::check(src.len(), write.len())?;
-                let (dst, tail) = mem::take(write).split_at_mut(src.len());
-                dst.copy_from_slice(src);
-                *write = tail;
-            }
+            Target::Inline(write) => write.write_slice(src)?,
             Target::Owned(owner) => owner.try_extend(src)?,
         }
         self.written += src.len();
@@ -87,13 +83,8 @@ impl<'a> Response<'a> {
         consume::Error::check(required, room)?;
         match &mut self.target {
             Target::Inline(write) => {
-                // SAFETY: the admitted frame and exclusive response remain here.
-                // Room is either available capacity or the user budget kept
-                // within that capacity; no target mutation follows admission.
-                let (dst, tail) = unsafe { mem::take(write).split_at_mut_unchecked(required) };
-                // SAFETY: this split retains exactly the admitted frame's wire length.
-                unsafe { frame::raw::write(frame, dst) };
-                *write = tail;
+                let (prefix, used) = frame.prefix();
+                write.write_slices([&prefix[..used], data])?;
             }
             Target::Owned(owner) => {
                 let mut spare = owner.spare();
@@ -110,7 +101,7 @@ impl<'a> Response<'a> {
 
     fn available(&self) -> usize {
         match &self.target {
-            Target::Inline(write) => write.len(),
+            Target::Inline(write) => write.remaining(),
             Target::Owned(owner) => owner.capacity() - owner.len(),
         }
     }

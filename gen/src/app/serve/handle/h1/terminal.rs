@@ -232,7 +232,7 @@ pub(super) fn guard(
         let (#v_write, #v_date) = match <#slot as #ns_core::route::guard::Slot<#state>>::try_admit(
             #n_ghead,
             #v_state,
-            #ns_h1::wire::output::Egress::bind(&mut *#v_write, #v_date, #v_input, #n_resp),
+            #ns_h1::wire::output::Egress::bind(#v_write, #v_date, #v_input, #n_resp),
         ) {
             ::core::ops::ControlFlow::Continue(#n_reject) => #n_reject.into_parts(),
             ::core::ops::ControlFlow::Break(#n_gout) => {

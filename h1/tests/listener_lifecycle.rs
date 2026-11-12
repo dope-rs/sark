@@ -182,6 +182,7 @@ fn switch_moves_tail_once() {
     let raw = Rc::new(Cell::new(Vec::new()));
     let owner = Rc::new(Cell::new(None));
     let checks: [Cell<usize>; 9] = Default::default();
+    let rejected = Cell::new(None);
 
     let send_buf = (option::Buffer::try_from(1024)).expect("socket send buffer");
     let config = config::Prepared {
@@ -207,6 +208,7 @@ fn switch_moves_tail_once() {
             raw: raw.clone(),
             owner: owner.clone(),
             checks: &checks,
+            rejected: &rejected,
         },
     );
     let prepared = topology::Plan::new((), setup)
@@ -302,6 +304,7 @@ fn switch_moves_tail_once() {
         reports.events().expect("valid reclamation").is_empty(),
         "unexpected reclaimed server operations: {reports:?}"
     );
+    assert!(rejected.get().is_none(), "preflight: {:?}", rejected.get());
     let [
         switched,
         live,

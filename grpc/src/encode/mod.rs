@@ -125,6 +125,6 @@ where
         &mut self,
         frame: crate::message::Frame<C>,
     ) -> Result<Decode, crate::Status> {
-        Ok(Decode::decode(frame.cursor())?)
+        self.decode(frame.view())
     }
 }

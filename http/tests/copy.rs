@@ -3,7 +3,7 @@ use std::ops::ControlFlow;
 use dope_test::alloc::Tracker;
 use o3::{
     alloc,
-    buffer::{hold::ranges, storage},
+    buffer::{hold::ranges, storage, write::Slice},
 };
 use sark_http::{
     owner::handoff,
@@ -22,35 +22,39 @@ fn inline_handoff_preserves_copy_leaves() {
     let mut out = [0; 5];
     Tracker::fail_after(0, || {
         for result in [
-            source.as_slice().try_resolve_into(&slot, &mut out),
+            source
+                .as_slice()
+                .try_resolve_into(&slot, &mut Slice::new(&mut out)),
             std::str::from_utf8(&source)
                 .expect("utf8")
-                .try_resolve_into(&slot, &mut out),
-            body::Ref::from_slice(&source).try_resolve_into(&slot, &mut out),
-            body::Ref::from_ranges(&ranges).try_resolve_into(&slot, &mut out),
+                .try_resolve_into(&slot, &mut Slice::new(&mut out)),
+            body::Ref::from_slice(&source).try_resolve_into(&slot, &mut Slice::new(&mut out)),
+            body::Ref::from_ranges(&ranges).try_resolve_into(&slot, &mut Slice::new(&mut out)),
         ] {
             assert!(matches!(result, Ok(ControlFlow::Break(5))));
         }
         assert_eq!(out, source);
         assert!(matches!(
-            source.as_slice().try_resolve_into(&slot, &mut out[..4]),
+            source
+                .as_slice()
+                .try_resolve_into(&slot, &mut Slice::new(&mut out[..4])),
             Err(owned::Error::Storage(storage::AllocError::Exhausted(
                 alloc::Exhausted
             )))
         ));
         assert!(matches!(
             Tracker::fail_after(0, || body::Ref::from_slice(&source)
-                .try_resolve_into(&slot, &mut out[..4])),
+                .try_resolve_into(&slot, &mut Slice::new(&mut out[..4]))),
             Err(owned::Error::Build(storage::BuildError::Exhausted(
                 alloc::Exhausted
             )))
         ));
         assert!(matches!(
-            body::Ref::discarded(5).try_resolve_into(&slot, &mut out),
+            body::Ref::discarded(5).try_resolve_into(&slot, &mut Slice::new(&mut out)),
             Err(owned::Error::Discarded)
         ));
         assert!(matches!(
-            body::Ref::discarded(0).try_resolve_into(&slot, &mut out),
+            body::Ref::discarded(0).try_resolve_into(&slot, &mut Slice::new(&mut out)),
             Ok(ControlFlow::Continue(_))
         ));
     });
@@ -65,10 +69,10 @@ fn inline_handoff_keeps_existing_owners() {
     let mut out = [0; 5];
     let ((), counts) = Tracker::counts(|| {
         for result in [
-            view.try_resolve_into(&slot, &mut out),
+            view.try_resolve_into(&slot, &mut Slice::new(&mut out)),
             view.as_slice()
                 .expect("contiguous")
-                .try_resolve_into(&slot, &mut out),
+                .try_resolve_into(&slot, &mut Slice::new(&mut out)),
         ] {
             let Ok(ControlFlow::Continue(plan)) = result else {
                 panic!("retained placement");
@@ -86,7 +90,8 @@ fn inline_handoff_keeps_existing_owners() {
     assert_eq!(out, [0; 5]);
     let source = Vec::from(b"abcde".as_slice());
     let pointer = source.as_ptr();
-    let Ok(ControlFlow::Continue(plan)) = source.try_resolve_into(&slot, &mut out) else {
+    let Ok(ControlFlow::Continue(plan)) = source.try_resolve_into(&slot, &mut Slice::new(&mut out))
+    else {
         panic!("owned placement");
     };
     let handoff::Ready::Owned(body) = plan.finish().expect("owned body") else {

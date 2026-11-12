@@ -170,9 +170,9 @@ where
     };
 
     let prior = pump::Ingress::deferred(conn.state());
-    let commit = conn.write().try_draft(driver, |state, write| {
-        let cycle = pump::Ingress::drive(state, routes.as_mut(), bytes, write, prior);
-        payload::write::try_cycle(cycle, |charge| {
+    let commit = conn.write().try_commit(driver, |state, mut prefix| {
+        let cycle = pump::Ingress::drive(state, routes.as_mut(), bytes, prefix.writer(), prior);
+        payload::write::try_cycle(prefix, cycle, |charge| {
             routes.as_mut().response_tag(&mut state.async_state, charge)
         })
     });

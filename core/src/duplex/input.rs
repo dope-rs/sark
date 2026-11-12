@@ -213,9 +213,11 @@ where
         ) -> admit::Admission<'turn, 'd, D, R, E>,
     ) -> Turn<machine::Transaction<R, E>, B::Receipt> {
         let feed = self.feed();
-        let step = self
-            .raw
-            .transact(&mut [], &mut Vec::new(), |_, emission| admit(emission));
+        let step = self.raw.transact(
+            o3::buffer::write::Slice::new(&mut []).reborrow(),
+            &mut Vec::new(),
+            admit,
+        );
         Turn { step, feed }
     }
 

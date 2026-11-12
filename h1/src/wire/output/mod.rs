@@ -67,42 +67,34 @@ pub enum Copy {
 /// A transport-independent HTTP/1 output decision.
 pub enum Outcome<'d, P = Infallible> {
     Send {
-        written: usize,
         connection: head::Connection,
     },
     SendCopied {
-        written: usize,
         copy: evidence::Copy,
         connection: head::Connection,
     },
     SendStatic {
-        hdr_written: usize,
         body: fixed::Body<'d>,
         connection: head::Connection,
     },
     SendShared {
-        hdr_written: usize,
         body: storage::Shared,
         connection: head::Connection,
     },
     SendCompressed {
-        hdr_written: usize,
         body: compress::Frozen,
         read: usize,
         connection: head::Connection,
     },
     SendSegmented {
-        hdr_written: usize,
         body: owned::Segments<'d>,
         connection: head::Connection,
     },
     SendLinked {
-        hdr_written: usize,
         body: owned::Segments<'d>,
         connection: head::Connection,
     },
     SendOwnedCopy {
-        hdr_written: usize,
         body: storage::Shared,
         cause: evidence::Cause,
         connection: head::Connection,
@@ -114,36 +106,27 @@ pub enum Outcome<'d, P = Infallible> {
 
 /// A response completed synchronously while consuming a request frame.
 pub enum Complete<'d> {
-    Inline {
-        written: usize,
-    },
+    Inline,
     Copy {
-        written: usize,
         copy: evidence::Copy,
     },
     Static {
-        hdr_written: usize,
         body: fixed::Body<'d>,
     },
     Shared {
-        hdr_written: usize,
         body: storage::Shared,
     },
     Compressed {
-        hdr_written: usize,
         body: compress::Frozen,
         read: usize,
     },
     Segments {
-        hdr_written: usize,
         body: owned::Segments<'d>,
     },
     Linked {
-        hdr_written: usize,
         body: owned::Segments<'d>,
     },
     Owned {
-        hdr_written: usize,
         body: storage::Shared,
         cause: evidence::Cause,
     },
@@ -153,7 +136,7 @@ impl Complete<'_> {
     /// Projects owner without cloning or moving the response body.
     pub fn retention(&self) -> Origin {
         match self {
-            Self::Inline { .. } => Origin::Response(Owner::default()),
+            Self::Inline => Origin::Response(Owner::default()),
             Self::Copy { copy, .. } => Origin::Response(Owner::inline(copy.written)),
             Self::Static { body, .. } => Origin::Response(Owner::inline(body.len())),
             Self::Shared { body, .. } => Origin::Response(Owner::shared(body)),
@@ -177,7 +160,7 @@ impl Complete<'_> {
                 written: body.len(),
                 cause: *cause,
             }),
-            Self::Inline { .. }
+            Self::Inline
             | Self::Static { .. }
             | Self::Shared { .. }
             | Self::Segments { .. }
@@ -188,7 +171,7 @@ impl Complete<'_> {
 
 /// Complete switching-response wire bytes with no HTTP message body.
 pub enum Switch<'d> {
-    Inline { written: usize },
+    Inline,
     Static(fixed::Body<'d>),
 }
 
@@ -236,76 +219,56 @@ impl<'d, P> Outcome<'d, P> {
 impl<'d> Outcome<'d, usize> {
     pub(crate) fn link(self, owner: owned::Segments<'d>) -> Outcome<'d> {
         match self {
-            Self::Send {
-                written,
-                connection: conn,
-            } => Outcome::Send {
-                written,
-                connection: conn,
-            },
+            Self::Send { connection: conn } => Outcome::Send { connection: conn },
             Self::SendCopied {
-                written,
                 copy,
                 connection: conn,
             } => Outcome::SendCopied {
-                written,
                 copy,
                 connection: conn,
             },
             Self::SendStatic {
-                hdr_written: head,
                 body,
                 connection: conn,
             } => Outcome::SendStatic {
-                hdr_written: head,
                 body,
                 connection: conn,
             },
             Self::SendShared {
-                hdr_written: head,
                 body,
                 connection: conn,
             } => Outcome::SendShared {
-                hdr_written: head,
                 body,
                 connection: conn,
             },
             Self::SendCompressed {
-                hdr_written: head,
                 body,
                 read,
                 connection: conn,
             } => Outcome::SendCompressed {
-                hdr_written: head,
                 body,
                 read,
                 connection: conn,
             },
             Self::SendSegmented {
-                hdr_written: head,
                 body,
                 connection: conn,
             } => Outcome::SendSegmented {
-                hdr_written: head,
                 body,
                 connection: conn,
             },
             Self::SendLinked {
-                hdr_written: head,
                 body,
                 connection: conn,
             } => Outcome::SendLinked {
-                hdr_written: head,
                 body,
                 connection: conn,
             },
             Self::SendOwnedCopy {
-                hdr_written: head,
                 body,
                 cause,
                 connection: conn,
             } => Outcome::SendOwnedCopy {
-                hdr_written: head,
                 body,
                 cause,
                 connection: conn,
@@ -328,91 +291,37 @@ impl<'d> Outcome<'d> {
         close: head::Connection,
     ) -> session::Outcome<'d, D> {
         let (reply, response) = match self {
-            Self::Send {
-                written: sent,
-                connection: conn,
-            } => (Complete::Inline { written: sent }, conn),
+            Self::Send { connection: conn } => (Complete::Inline, conn),
             Self::SendCopied {
-                written: sent,
                 copy,
                 connection: conn,
-            } => (
-                Complete::Copy {
-                    written: sent,
-                    copy,
-                },
-                conn,
-            ),
+            } => (Complete::Copy { copy }, conn),
             Self::SendStatic {
-                hdr_written: head,
                 body,
                 connection: conn,
-            } => (
-                Complete::Static {
-                    hdr_written: head,
-                    body,
-                },
-                conn,
-            ),
+            } => (Complete::Static { body }, conn),
             Self::SendShared {
-                hdr_written: head,
                 body,
                 connection: conn,
-            } => (
-                Complete::Shared {
-                    hdr_written: head,
-                    body,
-                },
-                conn,
-            ),
+            } => (Complete::Shared { body }, conn),
             Self::SendCompressed {
-                hdr_written: head,
                 body,
                 read,
                 connection: conn,
-            } => (
-                Complete::Compressed {
-                    hdr_written: head,
-                    body,
-                    read,
-                },
-                conn,
-            ),
+            } => (Complete::Compressed { body, read }, conn),
             Self::SendSegmented {
-                hdr_written: head,
                 body,
                 connection: conn,
-            } => (
-                Complete::Segments {
-                    hdr_written: head,
-                    body,
-                },
-                conn,
-            ),
+            } => (Complete::Segments { body }, conn),
             Self::SendLinked {
-                hdr_written: head,
                 body,
                 connection: conn,
-            } => (
-                Complete::Linked {
-                    hdr_written: head,
-                    body,
-                },
-                conn,
-            ),
+            } => (Complete::Linked { body }, conn),
             Self::SendOwnedCopy {
-                hdr_written: head,
                 body,
                 cause,
                 connection: conn,
-            } => (
-                Complete::Owned {
-                    hdr_written: head,
-                    body,
-                    cause,
-                },
-                conn,
-            ),
+            } => (Complete::Owned { body, cause }, conn),
             Self::SendRequestBody(pending) => match pending.body {},
             Self::Close(reason) => return session::Outcome::Close(reason),
             Self::Failed(error) => return session::Outcome::Failed(error),
@@ -428,6 +337,6 @@ impl<'d> Outcome<'d> {
 
 const _: () = {
     assert!(mem::size_of::<Outcome<'static, usize>>() == mem::size_of::<Outcome<'static>>());
-    assert!(mem::size_of::<Complete<'static>>() == mem::size_of::<Outcome<'static>>());
+    assert!(mem::size_of::<Complete<'static>>() <= mem::size_of::<Outcome<'static>>());
     assert!(mem::size_of::<Outcome<'static>>() <= 8 * mem::size_of::<usize>());
 };

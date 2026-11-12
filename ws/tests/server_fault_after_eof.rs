@@ -22,7 +22,7 @@ use dope_test::{
     fibers,
     harness::{GUARD, scenario::process::Deadline, signals::LocalGate},
 };
-use o3::buffer::storage;
+use o3::buffer::{storage, write::Slice};
 use sark_core::duplex::Session as _;
 use sark_http::h1::head::{Boundary, ParseError};
 use sark_ws::{
@@ -66,14 +66,16 @@ fn reports_fault_before_deferred_close() {
         let mut session = server::Session::new(sink, 1024, 1024);
         let input = storage::Shared::try_copy(b"\x81\x00").expect("frame owner");
         let mut scratch = Vec::new();
-        assert_eq!(
-            session.receive(input.into(), &mut [0; 3], &mut scratch).0,
-            0
-        );
+        let mut bytes = [0; 3];
+        let mut output = Slice::new(&mut bytes);
+        let _ = session.receive(input.into(), output.reborrow(), &mut scratch);
+        assert!(output.is_empty());
         assert_eq!(failure.get(), Some(fault));
         if retry {
             let mut output = [0; 4];
-            assert_eq!(session.activate(&mut output, &mut scratch).0, output.len());
+            let mut writer = Slice::new(&mut output);
+            let _ = session.activate(writer.reborrow(), &mut scratch);
+            assert_eq!(writer.len(), 4);
             assert_eq!(output, [0x88, 0x02, 0x03, 0xea]);
         }
         drop(session);

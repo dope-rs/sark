@@ -47,7 +47,11 @@ impl Retain {
     ) -> session::RouteOutcome<'d, sync::Pending<'d, Request>> {
         sync::Endpoint::new(
             sync::Egress::new(
-                output::Egress::new(&mut self.write, DATE, head.response()),
+                output::Egress::new(
+                    o3::buffer::write::Slice::new(&mut self.write).reborrow(),
+                    DATE,
+                    head.response(),
+                ),
                 cache::Cache::empty(),
                 &mut self.gzip,
             ),
@@ -68,7 +72,11 @@ impl Retain {
             session::Permit::new(),
             &self.state,
             sync::Egress::new(
-                output::Egress::new(&mut self.write, DATE, RESPONSE),
+                output::Egress::new(
+                    o3::buffer::write::Slice::new(&mut self.write).reborrow(),
+                    DATE,
+                    RESPONSE,
+                ),
                 cache::Cache::empty(),
                 &mut self.gzip,
             ),

@@ -204,9 +204,7 @@ where
             machine::Transaction::Pending { receipt } => Ok(receipt),
             machine::Transaction::Rejected(error) => Err(error),
             machine::Transaction::Violation(
-                machine::Violation::OutputAfterFinish
-                | machine::Violation::PrefixCapacity { .. }
-                | machine::Violation::PrefixPending,
+                machine::Violation::OutputAfterFinish | machine::Violation::PrefixPending,
             ) => Err(numbers::ErrorCode::InternalError),
             machine::Transaction::Committed {
                 after: machine::After::Finished,

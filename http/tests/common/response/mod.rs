@@ -201,7 +201,7 @@ impl<'d> dispatch::Accept<'d> for Capture {
             return Err((error, self));
         }
         self.body.resize(len, 0);
-        match plan.encode(&mut self.body) {
+        match plan.encode(&mut write::Slice::new(&mut self.body)) {
             Ok(()) => Ok(self),
             Err(error) => Err((Error::Exact(error), self)),
         }
@@ -228,8 +228,8 @@ impl<'d> dispatch::Accept<'d> for Capture {
             return Err((error, self));
         }
         self.body.resize(max, 0);
-        let written = match plan.encode(&mut self.body) {
-            Ok(written) => written.len(),
+        let written = match plan.encode(&mut write::Slice::new(&mut self.body)) {
+            Ok(written) => written,
             Err(error) => return Err((Error::Bounded(error), self)),
         };
         self.body.truncate(written);

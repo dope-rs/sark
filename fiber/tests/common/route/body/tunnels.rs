@@ -4,7 +4,8 @@ use dope::{
     net::wire::{open, terminal},
 };
 use dope_tls::tls::Tls;
-use o3::buffer::resident;
+use o3::buffer::write::Slice;
+use o3::buffer::{resident, write::Sink as _};
 use sark_core::duplex;
 use sark_h1::server::listener::failure::Policy;
 use sark_http::payload::{owned, response::status::Code};
@@ -29,21 +30,21 @@ impl<'d> duplex::Session<'d> for Echo<'_> {
     fn receive(
         &mut self,
         input: owned::Segments<'d>,
-        _: &mut [u8],
+        _: Slice<'_, &mut usize>,
         _: &mut Vec<u8>,
-    ) -> (usize, duplex::Action<'d>) {
+    ) -> duplex::Action<'d> {
         if self.output_finished || self.counters.input_finished.get() != 0 {
             self.counters.receive(input.len());
-            return (0, duplex::Action::idle());
+            return duplex::Action::idle();
         }
         if self.finish_output_on_input {
             self.output_finished = true;
-            return (0, duplex::Action::send_end(input));
+            return duplex::Action::send_end(input);
         }
-        (0, duplex::Action::send(input))
+        duplex::Action::send(input)
     }
 
-    fn finish(&mut self, _: &mut [u8], _: &mut Vec<u8>) -> (usize, duplex::Action<'d>) {
+    fn finish(&mut self, _: Slice<'_, &mut usize>, _: &mut Vec<u8>) -> duplex::Action<'d> {
         self.counters.finish();
         let action = if self.hold_output_on_finish {
             duplex::Action::send(resident::Shared::from(b"finished".as_slice()))
@@ -52,17 +53,20 @@ impl<'d> duplex::Session<'d> for Echo<'_> {
         } else {
             duplex::Action::send_end(resident::Shared::from(b"finished".as_slice()))
         };
-        (0, action)
+        action
     }
 
-    fn activate(&mut self, output: &mut [u8], _: &mut Vec<u8>) -> (usize, duplex::Action<'d>) {
+    fn activate(
+        &mut self,
+        mut output: Slice<'_, &mut usize>,
+        _: &mut Vec<u8>,
+    ) -> duplex::Action<'d> {
         self.counters.activate();
-        let written = output.len().min(b"ready".len());
-        output[..written].copy_from_slice(&b"ready"[..written]);
-        (
-            written,
-            duplex::Action::send(resident::Shared::from(&b"ready"[written..])),
-        )
+        let written = output.remaining().min(b"ready".len());
+        output
+            .write_slice(&b"ready"[..written])
+            .expect("ready prefix");
+        duplex::Action::send(resident::Shared::from(&b"ready"[written..]))
     }
 }
 

@@ -1,4 +1,4 @@
-use std::{mem, ops::Range};
+use std::mem;
 
 use o3::buffer::write::{self, Sink as _};
 use sark_http::{
@@ -192,10 +192,17 @@ impl<'field, C: Count> field::Sink<'field> for Fields<'_, '_, C> {
             let len = encoded.encoded_len();
             self.out.put(name)?;
             self.out.put(b": ")?;
-            let mut value = write::Slice::new(self.out.take(len)?);
+            let current = self.out.len();
+            let mut split = self
+                .out
+                .out
+                .try_split(0, len)
+                .map_err(|error| Writer::failure(current, error))?;
+            let mut value = split.body();
             encoded
                 .try_write(|bytes| value.write_slice(bytes))
                 .map_err(Error::ValueCapacity)?;
+            split.try_commit().map_err(Error::ValueCapacity)?;
             self.out.put(consts::CRLF)?;
             count(total, name)
         })();
@@ -275,52 +282,12 @@ const _: () = assert!(mem::size_of::<Option<Error>>() <= 3 * mem::size_of::<usiz
 const OK: &[u8] = b"HTTP/1.1 200 OK\r\n";
 
 pub(in crate::wire) struct Writer<'a> {
-    out: &'a mut [u8],
-    offset: usize,
-}
-
-fn get_mut(out: &mut [u8], start: usize, len: usize) -> Result<(&mut [u8], usize), Error> {
-    let end = start.checked_add(len).ok_or(Error::WriteOverflow {
-        current: start,
-        added: len,
-    })?;
-    let actual = out.len();
-    let out = out.get_mut(start..end).ok_or(Error::WriteCapacity {
-        required: end,
-        actual,
-    })?;
-    Ok((out, end))
+    out: write::Slice<'a, &'a mut usize>,
 }
 
 impl<'a> Writer<'a> {
-    pub(in crate::wire) fn new(out: &'a mut [u8], len: usize) -> Result<Self, Error> {
-        let actual = out.len();
-        Ok(Self {
-            out: out.get_mut(..len).ok_or(Error::WriteCapacity {
-                required: len,
-                actual,
-            })?,
-            offset: 0,
-        })
-    }
-
-    pub(in crate::wire) fn exact(out: &'a mut [u8]) -> Self {
-        Self { out, offset: 0 }
-    }
-
-    pub(in crate::wire) fn reborrow(&mut self) -> Writer<'_> {
-        Writer {
-            out: self.out,
-            offset: self.offset,
-        }
-    }
-
-    pub(in crate::wire) fn get_mut(&mut self, range: Range<usize>) -> Option<&mut [u8]> {
-        self.out.get_mut(range)
-    }
-
-    pub(in crate::wire) fn into_inner(self) -> &'a mut [u8] {
-        self.out
+    pub(in crate::wire) fn exact(out: write::Slice<'a, &'a mut usize>) -> Self {
+        Self { out }
     }
 
     pub(in crate::wire) fn status_len(status: Code) -> usize {
@@ -332,29 +299,36 @@ impl<'a> Writer<'a> {
     }
 
     pub(in crate::wire) fn len(&self) -> usize {
-        self.offset
+        self.out.len()
     }
 
     pub(in crate::wire) fn finish(self) -> usize {
-        self.offset
+        self.out.finish()
     }
 
     pub(in crate::wire) fn put(&mut self, bytes: &[u8]) -> Result<(), Error> {
-        let (out, end) = get_mut(self.out, self.offset, bytes.len())?;
-        out.copy_from_slice(bytes);
-        self.offset = end;
-        Ok(())
+        let current = self.out.len();
+        self.out
+            .write_slice(bytes)
+            .map_err(|error| Self::failure(current, error))
     }
 
     pub(in crate::wire) fn put_decimal(&mut self, value: usize) -> Result<(), Error> {
-        self.offset = value.try_write(self.out, self.offset)?.get();
-        Ok(())
+        self.put(value.decimal_uninit(&mut [mem::MaybeUninit::uninit(); 20]))
     }
 
-    pub(in crate::wire) fn take(&mut self, len: usize) -> Result<&mut [u8], Error> {
-        let (out, end) = get_mut(self.out, self.offset, len)?;
-        self.offset = end;
-        Ok(out)
+    fn failure(current: usize, error: write::consume::Error) -> Error {
+        let (added, room) = error.into_parts();
+        match current.checked_add(added.get()) {
+            Some(required) => Error::WriteCapacity {
+                required,
+                actual: current + room,
+            },
+            None => Error::WriteOverflow {
+                current,
+                added: added.get(),
+            },
+        }
     }
 
     pub(in crate::wire) fn put_status(

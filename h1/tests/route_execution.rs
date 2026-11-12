@@ -17,7 +17,7 @@ use dope::core::{
     driver::{self, life::recovery, schedule::ready::task::owner, settings},
 };
 use dope_test::scope::{self, Driver};
-use o3::buffer::{Complete as _, segments, storage};
+use o3::buffer::{Complete as _, segments, storage, write::Slice};
 use sark_core::{
     body::{self, Build as _, credit},
     duplex::machine,
@@ -57,7 +57,11 @@ fn method_body_allowance() {
             let mut write = [0; 512];
             let mut evidence = Credits(Vec::new());
             let outcome = stream::Endpoint::new(
-                output::Egress::new(&mut write, fields::DATE, parsed.response()),
+                output::Egress::new(
+                    o3::buffer::write::Slice::new(&mut write).reborrow(),
+                    fields::DATE,
+                    parsed.response(),
+                ),
                 &mut conn,
             )
             .dispatch::<Streaming, _, _, _, _>(
@@ -122,8 +126,9 @@ fn discarded_stream_length() {
         let mut conn: session::Conn = session::Conn::default();
         let state = Cell::new(0);
         let mut write = [0; 512];
+        let mut writer = Slice::new(&mut write);
         let outcome = stream::Endpoint::new(
-            output::Egress::new(&mut write, fields::DATE, parsed.response()),
+            output::Egress::new(writer.reborrow(), fields::DATE, parsed.response()),
             &mut conn,
         )
         .dispatch::<Streaming, _, _, _, _>(
@@ -142,7 +147,7 @@ fn discarded_stream_length() {
                 },
                 session::Permit::new(),
                 stream::Execution::new(
-                    output::Egress::new(&mut write, fields::DATE, parsed.response()),
+                    output::Egress::new(writer.reborrow(), fields::DATE, parsed.response()),
                     &state,
                     &mut (),
                     || Some(|(), _: &mut (), _| {}),
@@ -153,7 +158,7 @@ fn discarded_stream_length() {
             session::RouteOutcome::AwaitReject { pending, .. } => match pending {},
         };
         let written = match outcome {
-            session::Outcome::Streamed { written, .. } => Some(written),
+            session::Outcome::Streamed { .. } => Some(writer.len()),
             _ => None,
         }
         .expect("stream did not start");
@@ -178,7 +183,11 @@ fn stream_capacity() {
         let state = Cell::new(0);
         let mut write = [0xa5; 512];
         let outcome = stream::Endpoint::new(
-            output::Egress::new(&mut write, fields::DATE, parsed.response()),
+            output::Egress::new(
+                o3::buffer::write::Slice::new(&mut write).reborrow(),
+                fields::DATE,
+                parsed.response(),
+            ),
             &mut conn,
         )
         .dispatch::<Streaming, _, _, _, _>(
@@ -197,7 +206,11 @@ fn stream_capacity() {
                 },
                 session::Permit::new(),
                 stream::Execution::new(
-                    output::Egress::new(&mut write, fields::DATE, parsed.response()),
+                    output::Egress::new(
+                        o3::buffer::write::Slice::new(&mut write).reborrow(),
+                        fields::DATE,
+                        parsed.response(),
+                    ),
                     &state,
                     &mut (),
                     || tasks::stream(false),

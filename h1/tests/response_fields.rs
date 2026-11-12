@@ -6,6 +6,7 @@ use common::fields::{
     Counted, DATE, DRIFT_VALUES, Drifting, ENCODED_BODY, ENTRIES, GENERATED_IDENTITY, GROUP,
     GROUP_ENCODING, IDENTITY, RESPONSE, try_encode,
 };
+use o3::buffer::write::Slice;
 use sark_h1::{
     route,
     wire::{Failure, cache, head, output},
@@ -30,19 +31,17 @@ fn head_emits_once() {
     let response =
         statics::Direct::new(Code::OK, Counted { emissions: &emits }, Body::new(b"body"));
     let mut bytes = [0; 512];
-    let outcome = output::Egress::new(&mut bytes, DATE, RESPONSE)
+    let mut writer = Slice::new(&mut bytes);
+    let outcome = output::Egress::new(writer.reborrow(), DATE, RESPONSE)
         .plain(response, head::Connection::KeepAlive);
-    let output::Outcome::SendStatic {
-        hdr_written: head_len,
-        ..
-    } = outcome
-    else {
+    let output::Outcome::SendStatic { .. } = outcome else {
         panic!("valid static response must be emitted");
     };
 
     assert_eq!(emits.get(), 1);
     assert!(
-        bytes[..head_len]
+        writer
+            .into_mut()
             .windows(b"x-actual: present\r\n".len())
             .any(|window| window == b"x-actual: present\r\n")
     );
@@ -51,13 +50,12 @@ fn head_emits_once() {
 #[test]
 fn grouped_capacity() {
     let mut expected = [0xa5; 256];
+    let mut writer = Slice::new(&mut expected);
     let response = statics::Direct::new(Code::OK, ENTRIES, Body::new(b"body"));
-    let length = match output::Egress::new(&mut expected, DATE, RESPONSE)
+    let length = match output::Egress::new(writer.reborrow(), DATE, RESPONSE)
         .plain(response, head::Connection::KeepAlive)
     {
-        output::Outcome::SendStatic {
-            hdr_written: len, ..
-        } => Some(len),
+        output::Outcome::SendStatic { .. } => Some(writer.len()),
         _ => None,
     }
     .expect("the complete scalar header must fit");
@@ -65,27 +63,22 @@ fn grouped_capacity() {
     for capacity in 0..=length {
         let mut scalar = [0xa5; 256];
         let mut grouped = scalar;
+        let mut scalar_writer = Slice::new(&mut scalar[..capacity]);
+        let mut grouped_writer = Slice::new(&mut grouped[..capacity]);
         let response = statics::Direct::new(Code::OK, ENTRIES, Body::new(b"body"));
-        let first = output::Egress::new(&mut scalar[..capacity], DATE, RESPONSE)
+        let first = output::Egress::new(scalar_writer.reborrow(), DATE, RESPONSE)
             .plain(response, head::Connection::KeepAlive);
         let response = statics::Direct::new(Code::OK, GROUP, Body::new(b"body"));
-        let second = output::Egress::new(&mut grouped[..capacity], DATE, RESPONSE)
+        let second = output::Egress::new(grouped_writer.reborrow(), DATE, RESPONSE)
             .plain(response, head::Connection::KeepAlive);
         let results = match (first, second) {
             (
                 output::Outcome::Failed(Failure::Output(scalar)),
                 output::Outcome::Failed(Failure::Output(grouped)),
             ) => Some((Err(scalar), Err(grouped))),
-            (
-                output::Outcome::SendStatic {
-                    hdr_written: scalar,
-                    ..
-                },
-                output::Outcome::SendStatic {
-                    hdr_written: grouped,
-                    ..
-                },
-            ) => Some((Ok(scalar), Ok(grouped))),
+            (output::Outcome::SendStatic { .. }, output::Outcome::SendStatic { .. }) => {
+                Some((Ok(scalar_writer.len()), Ok(grouped_writer.len())))
+            }
             _ => None,
         };
         let (left, right) = results.expect("matching output variants");
@@ -111,7 +104,12 @@ fn cache_rejects_drift() {
         let mut bytes = [0; 512];
         let result = Gzip::try_new();
         let mut gzip = result.expect("test gzip allocation");
-        let outcome = output::Egress::new(&mut bytes, DATE, RESPONSE).route(
+        let outcome = output::Egress::new(
+            o3::buffer::write::Slice::new(&mut bytes).reborrow(),
+            DATE,
+            RESPONSE,
+        )
+        .route(
             response,
             handoff::Slot::ready(None),
             cache::Cache::empty(),

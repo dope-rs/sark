@@ -6,7 +6,7 @@ use o3::{
         arena::{slab, slab::entries},
         map,
         map::flat,
-        queue::indexed::keyed,
+        queue::{indexed::keyed, links},
     },
 };
 
@@ -597,6 +597,10 @@ impl<R: crate::Role> Registry<R> {
 }
 
 impl Vacant<'_> {
+    pub(crate) fn key(&self) -> stream::Key {
+        stream::Key::from_parts(self.id, self.slot.index())
+    }
+
     pub(crate) fn insert(
         self,
         stream: stream::Lifecycle,
@@ -607,40 +611,35 @@ impl Vacant<'_> {
     ) -> stream::Key {
         use flow::Window;
 
+        let key = self.key();
         let Self {
-            id,
+            id: _,
             index,
             slot,
             count,
         } = self;
-        let slot = slot
-            .stage_with(|index| {
-                let key = stream::Key::from_parts(id, index);
-                let active = Active {
-                    state: stream.state,
-                    method: stream.method,
-                    content: stream.content,
-                    peer: if end {
-                        Live::End
-                    } else {
-                        match stream.peer_section {
-                            sark_core::manifold::stream::Section::Initial => Live::Initial,
-                            sark_core::manifold::stream::Section::Trailing => Live::Trailing,
-                        }
-                    },
-                    send_window: Window::with(send as i32),
-                    recv_window: Window::with(recv as i32),
-                    pending_release: 0,
-                    remaining,
-                };
-                Record {
-                    key,
-                    send: keyed::Link::from(index),
-                    state: State::Active(active),
+        let active = Active {
+            state: stream.state,
+            method: stream.method,
+            content: stream.content,
+            peer: if end {
+                Live::End
+            } else {
+                match stream.peer_section {
+                    sark_core::manifold::stream::Section::Initial => Live::Initial,
+                    sark_core::manifold::stream::Section::Trailing => Live::Trailing,
                 }
-            })
-            .commit();
-        let key = slot.get().key;
+            },
+            send_window: Window::with(send as i32),
+            recv_window: Window::with(recv as i32),
+            pending_release: 0,
+            remaining,
+        };
+        slot.insert(Record {
+            key,
+            send: keyed::Link::from(links::Index::from(key)),
+            state: State::Active(active),
+        });
         index.insert(key);
         *count += 1;
         key

@@ -7,6 +7,7 @@ use common::{
     fields::{self, DATE, IDENTITY},
 };
 use dope_test::alloc::Tracker;
+use o3::buffer::write::Slice;
 use sark_h1::{
     route,
     wire::{cache, head, output},
@@ -47,9 +48,10 @@ fn preencoded_inline() {
         },
     );
     let mut bytes = [0; 512];
+    let mut writer = Slice::new(&mut bytes);
     let mut gzip = Gzip::try_new().expect("test gzip allocation");
     let (outcome, allocs) = Tracker::count(|| {
-        output::Egress::new(&mut bytes, DATE, fields::RESPONSE).route(
+        output::Egress::new(writer.reborrow(), DATE, fields::RESPONSE).route(
             response,
             handoff::Slot::ready(None),
             cache::Cache::empty(),
@@ -63,9 +65,10 @@ fn preencoded_inline() {
             ),
         )
     });
-    let output::Outcome::SendCopied { written, copy, .. } = outcome else {
+    let output::Outcome::SendCopied { copy, .. } = outcome else {
         panic!("preencoded response must keep its inline body");
     };
+    let written = writer.len();
     assert_eq!(allocs, 0);
     assert_eq!(encodes.get(), 1);
     assert_eq!(&bytes[written - copy.written..written], b"encoded");
@@ -75,6 +78,7 @@ fn preencoded_inline() {
 fn plain_compressor() {
     let encodes = Cell::new(0);
     let mut bytes = [0; 512];
+    let mut writer = Slice::new(&mut bytes);
     let (outcome, allocs) = Tracker::count(|| {
         <() as Compression>::try_new().expect("plain policy");
         let response = exact::Direct::new(
@@ -85,7 +89,7 @@ fn plain_compressor() {
                 encodes: &encodes,
             },
         );
-        output::Egress::new(&mut bytes, DATE, fields::RESPONSE).route(
+        output::Egress::new(writer.reborrow(), DATE, fields::RESPONSE).route(
             response,
             handoff::Slot::ready(None),
             cache::Cache::empty(),
@@ -99,9 +103,10 @@ fn plain_compressor() {
             ),
         )
     });
-    let output::Outcome::SendCopied { written, copy, .. } = outcome else {
+    let output::Outcome::SendCopied { copy, .. } = outcome else {
         panic!("plain compression must keep its inline body");
     };
+    let written = writer.len();
     assert_eq!(allocs, 0);
     assert_eq!(encodes.get(), 1);
     assert_eq!(&bytes[written - copy.written..written], b"plain");
@@ -121,9 +126,10 @@ fn reuses_inline_on_limit() {
     );
     let date = b"Mon, 01 Jan 2026 00:00:00 GMT";
     let mut bytes = vec![0; body.len() + 1024];
+    let mut writer = Slice::new(&mut bytes);
     let result = Gzip::try_new();
     let mut gzip = result.expect("test gzip pool allocation");
-    let outcome = output::Egress::new(&mut bytes, date, fields::RESPONSE).route(
+    let outcome = output::Egress::new(writer.reborrow(), date, fields::RESPONSE).route(
         response,
         handoff::Slot::ready(None),
         cache::Cache::empty(),
@@ -136,9 +142,10 @@ fn reuses_inline_on_limit() {
             Server::Include,
         ),
     );
-    let output::Outcome::SendCopied { written, copy, .. } = outcome else {
+    let output::Outcome::SendCopied { copy, .. } = outcome else {
         panic!("unavailable gzip must keep the encoded inline body");
     };
+    let written = writer.len();
     assert_eq!(encodes.get(), 1);
     assert_eq!(copy.written, body.len());
     assert_eq!(&bytes[written - copy.written..written], body.as_slice());
@@ -159,7 +166,8 @@ fn encodes_bounded_once() {
     );
     let date = b"Mon, 01 Jan 2026 00:00:00 GMT";
     let mut bytes = [0; 128];
-    let outcome = output::Egress::new(&mut bytes, date, fields::RESPONSE)
+    let mut writer = Slice::new(&mut bytes);
+    let outcome = output::Egress::new(writer.reborrow(), date, fields::RESPONSE)
         .plain(response, head::Connection::KeepAlive);
     let output::Outcome::SendShared { body: retained, .. } = outcome else {
         panic!("bounded body must retain its one materialization");
@@ -182,8 +190,9 @@ fn bounded_reuses_inline() {
         },
     );
     let mut bytes = vec![0; body.len() * 2 + 1024];
+    let mut writer = Slice::new(&mut bytes);
     let mut gzip = Gzip::try_new().expect("test gzip pool allocation");
-    let outcome = output::Egress::new(&mut bytes, DATE, fields::RESPONSE).route(
+    let outcome = output::Egress::new(writer.reborrow(), DATE, fields::RESPONSE).route(
         response,
         handoff::Slot::ready(None),
         cache::Cache::empty(),
@@ -197,7 +206,7 @@ fn bounded_reuses_inline() {
         ),
     );
     let (written, len) = match outcome {
-        output::Outcome::SendCopied { written, copy, .. } => Some((written, copy.written)),
+        output::Outcome::SendCopied { copy, .. } => Some((writer.len(), copy.written)),
         _ => None,
     }
     .expect("bounded fallback keeps the inline body");
@@ -221,8 +230,9 @@ fn compresses_bounded_once() {
     );
     let date = b"Mon, 01 Jan 2026 00:00:00 GMT";
     let mut bytes = [0; 2048];
+    let mut writer = Slice::new(&mut bytes);
     let mut gzip = Gzip::try_new().expect("test gzip pool allocation");
-    let outcome = output::Egress::new(&mut bytes, date, fields::RESPONSE).route(
+    let outcome = output::Egress::new(writer.reborrow(), date, fields::RESPONSE).route(
         response,
         handoff::Slot::ready(None),
         cache::Cache::empty(),
@@ -236,12 +246,7 @@ fn compresses_bounded_once() {
         ),
     );
     let (head_len, zipped, read) = match outcome {
-        output::Outcome::SendCompressed {
-            hdr_written: head,
-            body,
-            read,
-            ..
-        } => Some((head, body, read)),
+        output::Outcome::SendCompressed { body, read, .. } => Some((writer.len(), body, read)),
         _ => None,
     }
     .expect("bounded response must compress");

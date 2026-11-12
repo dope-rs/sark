@@ -229,9 +229,9 @@ where
         }
         Done::Violation { id, error } => {
             let code = match error {
-                machine::Violation::OutputAfterFinish
-                | machine::Violation::PrefixCapacity { .. }
-                | machine::Violation::PrefixPending => frame::ErrorCode::Internal,
+                machine::Violation::OutputAfterFinish | machine::Violation::PrefixPending => {
+                    frame::ErrorCode::Internal
+                }
             };
             (id, Err(code))
         }

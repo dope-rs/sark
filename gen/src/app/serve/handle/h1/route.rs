@@ -86,7 +86,7 @@ pub(super) fn methods<'view, 'source, 'spec>(
                 #n_shead: #ns_h1::wire::parsing::framing::Head<
                     #head_lt, #req_lt, #route, #coding #admission,
                 >,
-                #v_write: &mut [::core::primitive::u8],
+                #v_write: #ns_http::o3::buffer::write::Slice<'_, &mut usize>,
                 #v_date: &[::core::primitive::u8; 29],
                 #v_conn: &mut #conn,
             ) -> #ns_h1::session::RouteOutcome<

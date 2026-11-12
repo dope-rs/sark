@@ -32,10 +32,13 @@ impl<'req, 'd, S, B: stage::Body<'req, 'd>> Plan<'req, 'd, S, B> {
         }
     }
 
-    pub(crate) fn try_borrow_into<H: scope::Source<Selection = S>>(
+    pub(crate) fn try_borrow_into<
+        H: scope::Source<Selection = S>,
+        L: std::borrow::BorrowMut<usize>,
+    >(
         slot: &handoff::Slot<'req, 'd, H, B>,
         bytes: &[u8],
-        out: &mut [u8],
+        out: &mut o3::buffer::write::Slice<'_, L>,
     ) -> Result<ControlFlow<usize, Self>, owned::Error> {
         if let Some(plan) = Self::try_select(slot, bytes)? {
             return Ok(ControlFlow::Continue(plan));

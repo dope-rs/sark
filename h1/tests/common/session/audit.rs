@@ -14,7 +14,7 @@ impl<'d> Dispatch<'d, (), Infallible> for Pending {
         self: Pin<&mut Self>,
         permit: session::Permit,
         _: Input<'_>,
-        _: &mut [u8],
+        _: o3::buffer::write::Slice<'_, &mut usize>,
         _: &mut session::Conn<'d, (), Infallible, switch::Disabled, Infallible, ()>,
     ) -> session::RouteOutcome<'d, Infallible, Infallible, (), parsing::Rejected<'d>> {
         session::RouteOutcome::AwaitHead {
@@ -27,7 +27,7 @@ impl<'d> Dispatch<'d, (), Infallible> for Pending {
         self: Pin<&mut Self>,
         permit: session::Permit,
         source: parsing::Source,
-        write: &mut [u8],
+        write: o3::buffer::write::Slice<'_, &mut usize>,
         conn: &mut session::Conn<'d, (), Infallible, switch::Disabled, Infallible, ()>,
     ) -> session::RouteOutcome<'d, Infallible, Infallible, (), parsing::Rejected<'d>> {
         let source = source.freeze();
@@ -39,7 +39,7 @@ impl<'d> Dispatch<'d, (), Infallible> for Pending {
         _: (),
         permit: session::Permit,
         input: Input<'_>,
-        write: &mut [u8],
+        write: o3::buffer::write::Slice<'_, &mut usize>,
         conn: &mut session::Conn<'d, (), Infallible, switch::Disabled, Infallible, ()>,
     ) -> session::RouteOutcome<'d, Infallible, Infallible, (), parsing::Rejected<'d>> {
         self.try_consume(permit, input, write, conn)
@@ -71,7 +71,7 @@ impl<'d> Dispatch<'d, (), Infallible> for Pending {
         pending: Infallible,
         _: session::Complete,
         _: session::Permit,
-        _: &mut [u8],
+        _: o3::buffer::write::Slice<'_, &mut usize>,
         _: &mut (),
     ) -> session::BodyOutcome<'d, Self::Ready> {
         match pending {}
@@ -81,7 +81,7 @@ impl<'d> Dispatch<'d, (), Infallible> for Pending {
         self: Pin<&mut Self>,
         ready: Self::Ready,
         _: session::Permit,
-        _: &mut [u8],
+        _: o3::buffer::write::Slice<'_, &mut usize>,
         _: &mut (),
     ) -> session::BodyOutcome<'d, Self::Ready> {
         match ready {}

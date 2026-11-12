@@ -2,7 +2,7 @@
 
 use o3::buffer::{
     storage,
-    write::{Sink, Slice, consume},
+    write::{Sink, Slice, Split, consume},
 };
 
 use crate::payload::response::status::Code;
@@ -75,16 +75,17 @@ pub trait Encode: Sized {
         W: Sink<Error = consume::Error>;
 }
 
-fn try_encode(
-    out: &mut [u8],
+fn try_encode<'writer, 'target, L: std::borrow::BorrowMut<usize>>(
+    out: &'writer mut Slice<'target, L>,
     limit: usize,
     body: impl Encode,
-) -> Result<Slice<'_>, storage::BuildError<consume::Error>> {
-    consume::Error::check(limit, out.len()).map_err(storage::BuildError::Build)?;
-    let mut writer = Slice::new(&mut out[..limit]);
-    body.encode(&mut writer)
+) -> Result<Split<'writer, 'target, L>, storage::BuildError<consume::Error>> {
+    let mut split = out
+        .try_split(0, limit)
         .map_err(storage::BuildError::Build)?;
-    Ok(writer)
+    body.encode(&mut split.body())
+        .map_err(storage::BuildError::Build)?;
+    Ok(split)
 }
 
 use std::borrow::Cow;

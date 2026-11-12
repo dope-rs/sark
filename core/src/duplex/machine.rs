@@ -1,7 +1,7 @@
 //! Affine duplex transition machine.
 use core::marker;
 
-use o3::buffer::{resident, segments};
+use o3::buffer::{resident, segments, write::Slice};
 use sark_http::payload::owned;
 
 use crate::duplex::{self, admit};
@@ -211,7 +211,6 @@ pub enum Transaction<R, E> {
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum Violation {
     OutputAfterFinish,
-    PrefixCapacity { written: usize, capacity: usize },
     PrefixPending,
 }
 
@@ -298,15 +297,18 @@ impl<'d, D: duplex::Session<'d>> Machine<'d, D> {
     /// Joins at most one session callback to one native admission attempt.
     pub fn transact<R, E>(
         &mut self,
-        output: &mut [u8],
+        mut output: Slice<'_, &mut usize>,
         scratch: &mut Vec<u8>,
         admit: impl for<'turn> FnOnce(
-            usize,
             admit::Emission<'turn, 'd, D>,
         ) -> admit::Admission<'turn, 'd, D, R, E>,
     ) -> Transaction<R, E> {
-        let (written, staged) = match self.phase.action() {
-            Some(staged) => (0, staged),
+        let mut split = match output.try_split(0, output.remaining()) {
+            Ok(split) => split,
+            Err(_) => unreachable!("prefix"),
+        };
+        let staged = match self.phase.action() {
+            Some(staged) => staged,
             None => {
                 let pending = self.pending.is_some();
                 let turn = matches!(self.phase, Phase::Turn);
@@ -321,35 +323,26 @@ impl<'d, D: duplex::Session<'d>> Machine<'d, D> {
                 } else {
                     Resume::Idle
                 };
-                let (written, action) = if let Some(input) = self.pending.take() {
+                let action = if let Some(input) = self.pending.take() {
                     self.session
-                        .receive(owned::Segments::from(input), output, scratch)
+                        .receive(owned::Segments::from(input), split.body(), scratch)
                 } else if activate {
                     self.flags &= !INITIAL_ACTIVATION;
-                    self.session.activate(output, scratch)
+                    self.session.activate(split.body(), scratch)
                 } else {
                     self.flags &= !INPUT_FINISH_PENDING;
-                    self.session.finish(output, scratch)
+                    self.session.finish(split.body(), scratch)
                 };
                 let (output, dir) = action.into_parts();
                 self.pending = output.and_then(owned::Segments::take);
                 self.phase = Phase::from_action(dir, resume);
-                (
-                    written,
-                    Staged {
-                        directive: dir,
-                        resume,
-                    },
-                )
+                Staged {
+                    directive: dir,
+                    resume,
+                }
             }
         };
-        if written > output.len() {
-            self.terminate();
-            return Transaction::Violation(Violation::PrefixCapacity {
-                written,
-                capacity: output.len(),
-            });
-        }
+        let written = split.body().len();
         if matches!(self.output, Output::Finished) && (written != 0 || self.pending.is_some()) {
             self.terminate();
             return Transaction::Violation(Violation::OutputAfterFinish);
@@ -384,13 +377,16 @@ impl<'d, D: duplex::Session<'d>> Machine<'d, D> {
         let admit::Admission {
             decision,
             owner: marker::PhantomData,
-        } = admit(written, emit);
+        } = admit(emit);
         match decision {
             admit::Decision::Pending { .. } | admit::Decision::Blocked { .. } if written != 0 => {
                 self.terminate();
                 Transaction::Violation(Violation::PrefixPending)
             }
             admit::Decision::Committed { receipt: proof } => {
+                if split.try_commit().is_err() {
+                    unreachable!("prefix");
+                }
                 self.phase = match next.settled {
                     After::Idle => Phase::Idle,
                     After::Turn => Phase::Turn,

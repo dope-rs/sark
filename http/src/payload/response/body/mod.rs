@@ -1,6 +1,6 @@
 use std::{iter::FusedIterator, ops::ControlFlow};
 
-use o3::buffer::{bytes::scope, storage};
+use o3::buffer::{bytes::scope, storage, write::Slice};
 
 use crate::{
     owner::{handoff, handoff::stage},
@@ -34,10 +34,15 @@ pub trait Body<'d>: Sized + Sealed {
     ) -> Result<handoff::Plan<'req, 'd, H::Selection, O>, owned::Error>;
 
     #[doc(hidden)]
-    fn try_resolve_into<'req, H: scope::Source, O: stage::Body<'req, 'd>>(
+    fn try_resolve_into<
+        'req,
+        H: scope::Source,
+        O: stage::Body<'req, 'd>,
+        L: std::borrow::BorrowMut<usize>,
+    >(
         self,
         slot: &handoff::Slot<'req, 'd, H, O>,
-        _: &mut [u8],
+        _: &mut Slice<'_, L>,
     ) -> Result<ControlFlow<usize, handoff::Plan<'req, 'd, H::Selection, O>>, owned::Error> {
         self.try_resolve(slot).map(ControlFlow::Continue)
     }
@@ -82,10 +87,15 @@ impl<'d> Body<'d> for &[u8] {
         handoff::Plan::try_borrow(slot, self)
     }
 
-    fn try_resolve_into<'req, H: scope::Source, O: stage::Body<'req, 'd>>(
+    fn try_resolve_into<
+        'req,
+        H: scope::Source,
+        O: stage::Body<'req, 'd>,
+        L: std::borrow::BorrowMut<usize>,
+    >(
         self,
         slot: &handoff::Slot<'req, 'd, H, O>,
-        out: &mut [u8],
+        out: &mut Slice<'_, L>,
     ) -> Result<ControlFlow<usize, handoff::Plan<'req, 'd, H::Selection, O>>, owned::Error> {
         handoff::Plan::try_borrow_into(slot, self, out)
     }
@@ -109,10 +119,15 @@ impl<'d> Body<'d> for &str {
         handoff::Plan::try_borrow(slot, self.as_bytes())
     }
 
-    fn try_resolve_into<'req, H: scope::Source, O: stage::Body<'req, 'd>>(
+    fn try_resolve_into<
+        'req,
+        H: scope::Source,
+        O: stage::Body<'req, 'd>,
+        L: std::borrow::BorrowMut<usize>,
+    >(
         self,
         slot: &handoff::Slot<'req, 'd, H, O>,
-        out: &mut [u8],
+        out: &mut Slice<'_, L>,
     ) -> Result<ControlFlow<usize, handoff::Plan<'req, 'd, H::Selection, O>>, owned::Error> {
         handoff::Plan::try_borrow_into(slot, self.as_bytes(), out)
     }

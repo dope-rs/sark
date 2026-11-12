@@ -62,7 +62,7 @@ impl<'d> Dispatch<'d, (), convert::Infallible, switch::Enabled<Staged>> for Swit
         pending: Self::Head,
         _: session::Permit,
         _: Input<'_>,
-        _: &mut [u8],
+        _: o3::buffer::write::Slice<'_, &mut usize>,
         _: &mut session::Conn<'d, (), convert::Infallible, switch::Enabled<Staged>>,
     ) -> RouteOutcome<'d, convert::Infallible, Staged, Self::Head, parsing::Rejected<'d>> {
         match pending {}
@@ -72,7 +72,7 @@ impl<'d> Dispatch<'d, (), convert::Infallible, switch::Enabled<Staged>> for Swit
         self: Pin<&mut Self>,
         permit: session::Permit,
         source: parsing::Source,
-        write: &mut [u8],
+        write: o3::buffer::write::Slice<'_, &mut usize>,
         conn: &mut session::Conn<'d, (), convert::Infallible, switch::Enabled<Staged>>,
     ) -> RouteOutcome<'d, convert::Infallible, Staged, Self::Head, parsing::Rejected<'d>> {
         let source = source.freeze();
@@ -83,7 +83,7 @@ impl<'d> Dispatch<'d, (), convert::Infallible, switch::Enabled<Staged>> for Swit
         self: Pin<&mut Self>,
         _: session::Permit,
         _: Input<'_>,
-        _: &mut [u8],
+        _: o3::buffer::write::Slice<'_, &mut usize>,
         _: &mut session::Conn<'d, (), convert::Infallible, switch::Enabled<Staged>>,
     ) -> RouteOutcome<'d, convert::Infallible, Staged, Self::Head, parsing::Rejected<'d>> {
         let next = switch::Transition::new(
@@ -127,7 +127,7 @@ impl<'d> Dispatch<'d, (), convert::Infallible, switch::Enabled<Staged>> for Swit
         pending: convert::Infallible,
         _: session::Complete,
         _: session::Permit,
-        _: &mut [u8],
+        _: o3::buffer::write::Slice<'_, &mut usize>,
         _: &mut (),
     ) -> session::BodyOutcome<'d, Self::Ready, Staged> {
         match pending {}
@@ -137,7 +137,7 @@ impl<'d> Dispatch<'d, (), convert::Infallible, switch::Enabled<Staged>> for Swit
         self: Pin<&mut Self>,
         ready: Self::Ready,
         _: session::Permit,
-        _: &mut [u8],
+        _: o3::buffer::write::Slice<'_, &mut usize>,
         _: &mut (),
     ) -> session::BodyOutcome<'d, Self::Ready, Staged> {
         match ready {}
@@ -152,6 +152,7 @@ pub struct App<'a> {
     pub raw: Rc<Cell<Vec<u8>>>,
     pub owner: Rc<Cell<Option<u8>>>,
     pub checks: &'a [Cell<usize>; 9],
+    pub rejected: &'a Cell<Option<pump::Reject>>,
 }
 
 impl App<'_> {
@@ -251,19 +252,20 @@ impl<'observe: 'd, 'd, ID: route::Identity> handler::Borrowed<'d, ID> for App<'o
             pump::Preflight::Settled | pump::Preflight::Finished => {
                 return receive::Outcome::Continue;
             }
-            pump::Preflight::Rejected(_) => {
-                panic!("unexpected preflight failure");
+            pump::Preflight::Rejected(error) => {
+                this.rejected.set(Some(error));
+                return receive::Outcome::CloseAfter;
             }
         };
 
-        let commit = conn.write().try_draft(driver, |state, prefix| {
+        let commit = conn.write().try_commit(driver, |state, mut prefix| {
             let http = state;
             let mut disp = SwitchOne;
             let cycle = pump::Ingress::drive(
                 http,
                 Pin::new(&mut disp),
                 bytes,
-                prefix,
+                prefix.writer(),
                 head::Connection::KeepAlive,
             );
             assert!(matches!(cycle.connection, head::Connection::KeepAlive));
@@ -272,21 +274,33 @@ impl<'observe: 'd, 'd, ID: route::Identity> handler::Borrowed<'d, ID> for App<'o
                 "switch must publish its exact static response owner"
             );
             this.checks[3].set(this.checks[3].get() + 1);
-            payload::write::try_cycle(cycle, |_| ())
+            payload::write::try_cycle(prefix, cycle, |_| ())
         });
-        let Ok(write::Outcome::Committed(receipt)) = &commit else {
-            panic!("switching response must commit exactly once");
-        };
+        let commit = commit
+            .map_err(|error| match error {
+                write::error::Error::Capacity(cause) => Err(Err(cause)),
+                write::error::Error::Build((cause, _)) => Ok((
+                    cause.load.charge().bytes().get(),
+                    cause.load.charge().resident().get(),
+                    cause.maximum,
+                )),
+                write::error::Error::Mismatch(error) => Err(Ok(error.into_parts().0)),
+            })
+            .expect("switch response admission");
         assert!(
-            receipt.state.is_ok(),
-            "switch response committed its protocol state"
+            matches!(&commit, write::Outcome::Committed(_)),
+            "switch response must commit"
         );
-        assert!(
-            matches!(&receipt.tail, pump::Tail::Handoff { .. }),
-            "switching response must carry its exact suffix"
-        );
-        this.checks[4].set(this.checks[4].get() + 1);
-        if let Ok(write::Outcome::Committed(receipt)) = commit {
+        if let write::Outcome::Committed(receipt) = commit {
+            assert!(
+                receipt.state.is_ok(),
+                "switch response committed its protocol state"
+            );
+            assert!(
+                matches!(&receipt.tail, pump::Tail::Handoff { .. }),
+                "switch response suffix"
+            );
+            this.checks[4].set(this.checks[4].get() + 1);
             let tail = receipt.tail;
             if let pump::Tail::Handoff { staged: (), range } = tail {
                 let tail = chunk.try_retain();
@@ -297,7 +311,8 @@ impl<'observe: 'd, 'd, ID: route::Identity> handler::Borrowed<'d, ID> for App<'o
                 };
                 let tail = tail
                     .project(range)
-                    .unwrap_or_else(|rejected| panic!("restrict tail: {:?}", rejected.error()));
+                    .map_err(o3::mem::Rejected::discard)
+                    .expect("restrict tail");
                 this.checks[6].set(this.checks[6].get() + 1);
                 let staged = conn.state_mut().staged_mut();
                 assert!(staged.is_ok(), "raw owner must remain staged until drain");

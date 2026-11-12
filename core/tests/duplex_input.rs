@@ -1,6 +1,9 @@
 use std::{cell::Cell, collections::VecDeque};
 
-use o3::buffer::resident;
+use o3::buffer::{
+    resident,
+    write::{Sink as _, Slice},
+};
 use sark_http::payload::owned;
 pub mod common;
 use sark_core::{
@@ -129,14 +132,17 @@ fn fin_preempts_reactivation_and_waits_for_admission() {
     let events = Cell::new(Vec::new());
     let mut machine = machine::Machine::new(Ending(&events));
     assert!(matches!(
-        machine.transact(&mut [], &mut Vec::new(), |_, emit| Ending::admit(emit)),
+        machine.transact(
+            Slice::new(&mut []).reborrow(),
+            &mut Vec::new(),
+            Ending::admit
+        ),
         machine::Transaction::Committed { .. }
     ));
     machine.finish(()).expect("first input finish").0.commit();
 
     for pending in [true, true, false] {
-        let turn = machine.transact(&mut [], &mut Vec::new(), |written, emit| {
-            assert_eq!(written, 0);
+        let turn = machine.transact(Slice::new(&mut []).reborrow(), &mut Vec::new(), |emit| {
             let (payload, end, after) = emit.into_parts();
             assert!(matches!(end, machine::End::FinishOutput));
             assert!(matches!(after, machine::After::Finished));
@@ -193,7 +199,7 @@ fn late_input_finish_does_not_repeat_output_fin() {
         if finish {
             machine.finish(()).expect("late input finish").0.commit();
         }
-        let turn = machine.transact(&mut [], &mut Vec::new(), |_, emit| {
+        let turn = machine.transact(Slice::new(&mut []).reborrow(), &mut Vec::new(), |emit| {
             let (payload, actual, _) = emit.into_parts();
             assert!(actual == end);
             match payload {
@@ -210,45 +216,44 @@ fn late_input_finish_does_not_repeat_output_fin() {
 }
 
 #[test]
-fn rejects_invalid_prefix_before_admission() {
-    for (written, finished, expected) in [
-        (
-            2,
-            false,
-            machine::Violation::PrefixCapacity {
-                written: 2,
-                capacity: 1,
-            },
+fn rejects_output_after_finish_before_admission() {
+    let calls = Cell::new(0);
+    let mut machine = machine::Machine::new(Prefix {
+        calls: &calls,
+        written: 1,
+        body: false,
+    });
+    assert!(matches!(
+        machine.transact(
+            Slice::new(&mut []).reborrow(),
+            &mut Vec::new(),
+            Prefix::admit
         ),
-        (1, true, machine::Violation::OutputAfterFinish),
-    ] {
-        let calls = Cell::new(0);
-        let mut machine = machine::Machine::new(Prefix {
-            calls: &calls,
-            written,
-            body: false,
-        });
-        if finished {
-            assert!(matches!(
-                machine.transact(&mut [], &mut Vec::new(), |_, emit| Prefix::admit(emit)),
-                machine::Transaction::Committed { .. }
-            ));
-        }
-        let machine::Access::Vacant(input) = machine.input() else {
-            panic!("vacant input");
-        };
-        input.commit(resident::Shared::from(b"input".as_slice()).into());
-        let turn = machine.transact::<(), ()>(&mut [0], &mut Vec::new(), |_, _| {
-            panic!("invalid prefix admitted")
-        });
-        assert!(matches!(turn, machine::Transaction::Violation(actual) if actual == expected));
-        assert_eq!(calls.get(), 1);
-        assert!(matches!(machine.progress(), machine::Progress::Finished));
-        assert!(matches!(
-            machine.transact::<(), ()>(&mut [], &mut Vec::new(), |_, _| panic!("retired callback")),
-            machine::Transaction::Idle
-        ));
-    }
+        machine::Transaction::Committed { .. }
+    ));
+    let machine::Access::Vacant(input) = machine.input() else {
+        panic!("vacant input");
+    };
+    input.commit(resident::Shared::from(b"input".as_slice()).into());
+    let mut bytes = [0; 2];
+    let mut output = Slice::new(&mut bytes);
+    output.write_byte(b'q').expect("prior prefix");
+    let turn = machine.transact::<(), ()>(output.reborrow(), &mut Vec::new(), |_| {
+        panic!("invalid prefix admitted")
+    });
+    assert!(matches!(
+        turn,
+        machine::Transaction::Violation(machine::Violation::OutputAfterFinish)
+    ));
+    assert_eq!(output.into_mut(), b"q");
+    assert_eq!(calls.get(), 1);
+    assert!(matches!(machine.progress(), machine::Progress::Finished));
+    assert!(matches!(
+        machine.transact::<(), ()>(Slice::new(&mut []).reborrow(), &mut Vec::new(), |_| panic!(
+            "retired callback"
+        )),
+        machine::Transaction::Idle
+    ));
 }
 
 #[test]
@@ -265,9 +270,9 @@ fn prefix_cannot_be_pending_or_blocked() {
         };
         input.commit(resident::Shared::from(b"input".as_slice()).into());
         machine.finish(()).expect("input finish").0.commit();
-        let mut output = [0];
-        let turn = machine.transact(&mut output, &mut Vec::new(), |written, emit| {
-            assert_eq!(written, 1);
+        let mut bytes = [0];
+        let mut output = Slice::new(&mut bytes);
+        let turn = machine.transact(output.reborrow(), &mut Vec::new(), |emit| {
             let (payload, end, _) = emit.into_parts();
             assert!(matches!(end, machine::End::FinishOutput));
             match payload {
@@ -279,13 +284,18 @@ fn prefix_cannot_be_pending_or_blocked() {
             turn,
             machine::Transaction::Violation(machine::Violation::PrefixPending)
         ));
-        assert_eq!(output, *b"p");
+        assert!(output.is_empty());
+        assert_eq!(bytes, *b"p");
         assert_eq!(calls.get(), 1);
         assert!(matches!(machine.hold(), machine::Hold::Released));
         assert!(matches!(machine.progress(), machine::Progress::Finished));
         machine.retire();
         assert!(matches!(
-            machine.transact::<(), ()>(&mut [], &mut Vec::new(), |_, _| panic!("retired callback")),
+            machine.transact::<(), ()>(
+                Slice::new(&mut []).reborrow(),
+                &mut Vec::new(),
+                |_| panic!("retired callback")
+            ),
             machine::Transaction::Idle
         ));
     }

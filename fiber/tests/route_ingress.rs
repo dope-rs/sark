@@ -1,6 +1,7 @@
 pub mod common;
 
 use dope_test::alloc::Tracker;
+use o3::buffer::write::Slice;
 use sark_h1::{pump, route::Driver, session::Conn, wire::head};
 
 use crate::common::{
@@ -24,26 +25,36 @@ fn cached_driver_admission() {
     let mut driver = Driver::try_new(&router, *DATE).expect("cached driver");
     let mut conn = Conn::default();
     let mut cold = [0; 256];
-    let first = driver.ingest(&mut conn, FULL, &mut cold, head::Connection::KeepAlive);
-    let Ok(pump::Egress::Inline { prefix }) = first.state else {
+    let mut cold = Slice::new(&mut cold);
+    let first = driver.ingest(
+        &mut conn,
+        FULL,
+        cold.reborrow(),
+        head::Connection::KeepAlive,
+    );
+    let Ok(pump::Egress::Inline) = first.state else {
         panic!("cold cached response");
     };
-    assert!(cold[..prefix].starts_with(b"HTTP/1.1 200 OK\r\n"));
-    assert!(cold[..prefix].ends_with(b"\r\n\r\nok"));
+    let cold = cold.into_mut();
+    assert!(cold.starts_with(b"HTTP/1.1 200 OK\r\n"));
+    assert!(cold.ends_with(b"\r\n\r\nok"));
     assert!(matches!(
         pump::Drain::complete(&mut conn),
         pump::Completion::None
     ));
 
     let mut warm = [0; 256];
+    let mut warm = Slice::new(&mut warm);
     let next = Tracker::fail_after(0, || {
-        driver.ingest(&mut conn, FULL, &mut warm, head::Connection::KeepAlive)
+        driver.ingest(
+            &mut conn,
+            FULL,
+            warm.reborrow(),
+            head::Connection::KeepAlive,
+        )
     });
-    assert!(matches!(
-        next.state,
-        Ok(pump::Egress::Inline { prefix: written }) if written == prefix
-    ));
-    assert_eq!(&warm[..prefix], &cold[..prefix]);
+    assert!(matches!(next.state, Ok(pump::Egress::Inline)));
+    assert_eq!(warm.into_mut(), cold);
 }
 
 #[test]
@@ -57,13 +68,24 @@ fn reserves_larger_route() {
     let mut write = [0; 2048];
     let first = Request::wire(chunked::ONE, 1);
     let next = Request::wire(chunked::MANY, 1024);
-    let cycle = driver.ingest(&mut conn, &first, &mut write, head::Connection::KeepAlive);
-    assert!(matches!(cycle.state, Ok(pump::Egress::Inline { .. })));
+    let cycle = driver.ingest(
+        &mut conn,
+        &first,
+        o3::buffer::write::Slice::new(&mut write).reborrow(),
+        head::Connection::KeepAlive,
+    );
+    assert!(matches!(cycle.state, Ok(pump::Egress::Inline)));
     assert_eq!(seen.one.get(), None);
 
-    let (cycle, allocs) =
-        Tracker::count(|| driver.ingest(&mut conn, &next, &mut write, head::Connection::KeepAlive));
-    assert!(matches!(cycle.state, Ok(pump::Egress::Inline { .. })));
+    let (cycle, allocs) = Tracker::count(|| {
+        driver.ingest(
+            &mut conn,
+            &next,
+            o3::buffer::write::Slice::new(&mut write).reborrow(),
+            head::Connection::KeepAlive,
+        )
+    });
+    assert!(matches!(cycle.state, Ok(pump::Egress::Inline)));
     assert_eq!(allocs, 1);
     assert_eq!(seen.many.get(), None);
 }
@@ -80,7 +102,7 @@ fn reserves_page_once() {
     let cycle = driver.ingest(
         &mut conn,
         &wire[..split],
-        &mut write,
+        o3::buffer::write::Slice::new(&mut write).reborrow(),
         head::Connection::KeepAlive,
     );
     assert!(matches!(cycle.state, Ok(pump::Egress::None)));
@@ -89,11 +111,11 @@ fn reserves_page_once() {
         driver.ingest(
             &mut conn,
             &wire[split..],
-            &mut write,
+            o3::buffer::write::Slice::new(&mut write).reborrow(),
             head::Connection::KeepAlive,
         )
     });
-    assert!(matches!(cycle.state, Ok(pump::Egress::Inline { .. })));
+    assert!(matches!(cycle.state, Ok(pump::Egress::Inline)));
     assert_eq!(allocs, 1);
     assert_eq!(seen.many.get(), None);
 }
@@ -107,10 +129,11 @@ fn excludes_chunk_framing() {
         let mut driver = Driver::try_new(&router, *DATE).expect("route driver");
         let mut conn = Conn::default();
         let mut write = [0; 2048];
+        let mut write = Slice::new(&mut write);
         let mut cycle = driver.ingest(
             &mut conn,
             &WIRE[..split],
-            &mut write,
+            write.reborrow(),
             head::Connection::KeepAlive,
         );
         if split < WIRE.len() {
@@ -118,15 +141,16 @@ fn excludes_chunk_framing() {
             cycle = driver.ingest(
                 &mut conn,
                 &WIRE[split..],
-                &mut write,
+                write.reborrow(),
                 head::Connection::KeepAlive,
             );
         }
-        let Ok(pump::Egress::Inline { prefix }) = cycle.state else {
+        let Ok(pump::Egress::Inline) = cycle.state else {
             panic!("inline response");
         };
-        assert!(write[..prefix].starts_with(b"HTTP/1.1 200 OK\r\n"));
-        assert!(write[..prefix].ends_with(b"\r\n\r\nok"));
+        let write = write.into_mut();
+        assert!(write.starts_with(b"HTTP/1.1 200 OK\r\n"));
+        assert!(write.ends_with(b"\r\n\r\nok"));
         assert!(!seen.invalid.get());
     }
 }
@@ -147,15 +171,20 @@ fn frames_final_body() {
     let mut write = [0; 2048];
     let split = chunked::SPLIT;
     for part in [&WIRE[..8], &WIRE[8..split]] {
-        let first = driver.ingest(&mut conn, part, &mut write, head::Connection::KeepAlive);
+        let first = driver.ingest(
+            &mut conn,
+            part,
+            o3::buffer::write::Slice::new(&mut write).reborrow(),
+            head::Connection::KeepAlive,
+        );
         assert!(matches!(first.state, Ok(pump::Egress::None)));
     }
     let last = driver.ingest(
         &mut conn,
         &WIRE[split..],
-        &mut write,
+        o3::buffer::write::Slice::new(&mut write).reborrow(),
         head::Connection::KeepAlive,
     );
-    assert!(matches!(last.state, Ok(pump::Egress::Inline { .. })));
+    assert!(matches!(last.state, Ok(pump::Egress::Inline)));
     assert!(!seen.invalid.get());
 }

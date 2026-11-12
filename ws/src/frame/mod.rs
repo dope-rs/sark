@@ -5,8 +5,6 @@ use o3::buffer::{
     write::{Sink, consume, spans},
 };
 
-pub(crate) mod raw;
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Error {
     Reserved { bits: u8 },
@@ -324,7 +322,7 @@ impl<'p> Frame<'p> {
         Ok(())
     }
 
-    fn prefix(self) -> ([u8; 14], usize) {
+    pub(crate) fn prefix(self) -> ([u8; 14], usize) {
         let mut dst = [0; 14];
         let head = usize::from(self.plan.head);
         let len = self.plan.payload_len;
@@ -363,7 +361,7 @@ impl Writer<'_, '_> {
 
     fn write(self) {
         let (prefix, used) = self.frame.prefix();
-        // SAFETY: bind or raw::write admits this exact destination against the
+        // SAFETY: bind admits this exact destination against the
         // retained Frame. Its complete wire length includes this header.
         let (header, tail) = unsafe { self.dst.split_at_mut_unchecked(used) };
         // SAFETY: prefix emits at most fourteen bytes from the admitted Plan.

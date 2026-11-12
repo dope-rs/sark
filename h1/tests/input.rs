@@ -22,7 +22,7 @@ fn retains_guard_window() {
     let response = fixed::Direct::new(Code::OK, fields, source);
     let mut output = [0; 128];
     let result = output::Egress::bind(
-        &mut output,
+        o3::buffer::write::Slice::new(&mut output).reborrow(),
         b"Mon, 01 Jan 2026 00:00:00 GMT",
         Input::Buffered(window),
         fields::RESPONSE,
@@ -46,7 +46,7 @@ fn copies_guard_window() {
     let response = fixed::Direct::new(Code::OK, fields, source);
     let mut output = [0; 128];
     let result = output::Egress::bind(
-        &mut output,
+        o3::buffer::write::Slice::new(&mut output).reborrow(),
         b"Mon, 01 Jan 2026 00:00:00 GMT",
         Input::Borrowed(window),
         fields::RESPONSE,

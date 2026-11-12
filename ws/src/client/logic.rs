@@ -30,7 +30,10 @@ use dope::{
         },
         service::bindings,
     },
-    net::link::{egress, pool::change::opening},
+    net::{
+        link::{egress, pool::change::opening},
+        wire,
+    },
 };
 use o3::{
     alloc::StrExt as _,
@@ -411,7 +414,9 @@ impl<'life, 'e: 'life, 'd: 'e, ID: Identity, H, M: Event<'d, H, ID>>
 impl<'life, 'e: 'life, 'd: 'e, ID: Identity + 'life, H, M>
     policy::Output<'life, 'd, Port<'e, 'd, ID>, ID, MAX_CONNECTIONS> for Logic<H, M, ID>
 {
-    fn flush() -> Option<
+    fn flush<'w, W: wire::Spec + 'w>(
+        _: &W::Connection<'w, ID>,
+    ) -> Option<
         impl for<'a, 'x, 'y, 'z> Call<(
             &'a mut Owner<'life, 'e, 'd, H, M, ID>,
             &'x mut turns::Context<'y, 'z, 'd, Self::ConnState, Self::Send, ID>,

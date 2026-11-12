@@ -254,11 +254,11 @@ impl Request {
                 .map_err(Error::Capacity)?;
         }
         if !body.is_empty() {
-            let mut digits = [0; 20];
+            let mut digits = [std::mem::MaybeUninit::uninit(); 20];
             buffer
                 .write_slices([
                     b"Content-Length: ",
-                    body.len().decimal(&mut digits),
+                    body.len().decimal_uninit(&mut digits),
                     b"\r\n",
                 ])
                 .map_err(capacity::Error::RequestBytes)

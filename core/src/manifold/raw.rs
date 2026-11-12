@@ -3,7 +3,7 @@ use core::num::NonZero;
 use dope_net::link::egress::data::{self, compose, exec};
 use o3::{
     buffer,
-    buffer::{Residency as _, hold, resident, segments, segments::scatter},
+    buffer::{Residency as _, hold, resident, segments},
     depot,
     depot::arena::slab::key,
 };
@@ -36,6 +36,7 @@ unsafe impl<Tag, const MAX: u32> Key for key::Handle<Tag, MAX> {
 // SAFETY: Every variant retains its original immutable owner and derives cursor length and charge from that owner.
 unsafe impl<'d, K> data::raw::Payload<'d> for Body<'d, K> {
     type Mode = exec::Fallible;
+    type Position = data::position::Saved;
     type Cursor<'a>
         = compose::Either<
         &'a [u8],
@@ -85,13 +86,13 @@ unsafe impl<'d, K> data::raw::Payload<'d> for Body<'d, K> {
 
     unsafe fn resume(
         &self,
-        position: &mut scatter::raw::Position,
+        position: &mut Self::Position,
         offset: data::Offset,
     ) -> Self::Cursor<'_> {
         // SAFETY: this immutable variant retains the original owner and topology.
         match self {
             Self::Shared { owner, .. } => compose::Either::Left(unsafe {
-                data::raw::Payload::resume(owner, position, offset)
+                data::raw::Payload::resume(owner, &mut position.1, offset)
             }),
             Self::Segments { owners, .. } => compose::Either::Right(unsafe {
                 data::raw::Payload::resume(owners.as_chain(), position, offset)

@@ -47,13 +47,21 @@ pub(super) fn methods(
         let credit = task.quota().map(|index| quote!(quotas[#index] += 1;));
         let emit = quote! {
             let deferred = #h1::pump::Ingress::deferred(state);
-            let (outcome, stream) = #h1::route::task::Egress::new(write, &date, deferred, request)
-                .finish::<#route, #output>(output);
+            let (outcome, stream) = {
+                let mut write = prefix.writer();
+                let mut staged = write.try_split(0, write.remaining()).unwrap_or_else(|_| unreachable!("output"));
+                let result = #h1::route::task::Egress::new(staged.body(), &date, deferred, request)
+                    .finish::<#route, #output>(output);
+                if !matches!(&result.0, #h1::wire::output::Outcome::Close(_) | #h1::wire::output::Outcome::Failed(_)) {
+                    staged.try_commit().unwrap_or_else(|_| unreachable!("output"));
+                }
+                result
+            };
         };
         let finish = if fiber.stream {
             quote! {
                 #emit
-                let result = #h1::server::payload::write::try_outcome(outcome, life, exchange, |intent, done| {
+                let result = #h1::server::payload::write::try_outcome(prefix, outcome, life, exchange, |intent, done| {
                     state.settle(intent);
                     stream.is_none().then_some(done)
                 });
@@ -69,7 +77,7 @@ pub(super) fn methods(
                 #credit
                 #emit
                 let _ = stream;
-                #h1::server::payload::write::try_outcome(outcome, life, exchange, |intent, done| {
+                #h1::server::payload::write::try_outcome(prefix, outcome, life, exchange, |intent, done| {
                     state.settle(intent);
                     Some(done)
                 })
@@ -170,7 +178,7 @@ pub(super) fn methods(
                 };
                 let (task, mut member) = entry.into_parts();
                 let date = date.load();
-                let result = conn.write().try_draft(driver, |state, write| {
+                let result = conn.write().try_commit(driver, |state, mut prefix| {
                     let mut value = member.value();
                     match value.as_mut().project() { #(#heads,)* _ => unreachable!("phase") }
                 });

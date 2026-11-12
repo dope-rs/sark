@@ -43,7 +43,6 @@ pub enum Operation {
     Prepare,
     Consume,
     Append,
-    Write,
     Switch(Kind),
     Task,
 }
@@ -99,23 +98,17 @@ pub enum Egress<'d> {
     None,
     /// The runtime parked work and needs its target scheduled.
     Wake,
-    Inline {
-        prefix: usize,
-    },
+    Inline,
     Static {
-        prefix: usize,
         body: fixed::Body<'d>,
     },
     Shared {
-        prefix: usize,
         body: storage::Shared,
     },
     Frozen {
-        prefix: usize,
         body: compress::Frozen,
     },
     Segmented {
-        prefix: usize,
         body: owned::Segments<'d>,
     },
 }
@@ -123,47 +116,20 @@ pub enum Egress<'d> {
 impl<'d> Egress<'d> {
     pub(crate) fn output(action: output::Outcome<'d>) -> (Self, head::Connection) {
         match action {
-            output::Outcome::Send {
-                written: prefix,
-                connection,
-            }
-            | output::Outcome::SendCopied {
-                written: prefix,
-                connection,
-                ..
-            } => (Self::Inline { prefix }, connection),
-            output::Outcome::SendStatic {
-                hdr_written: prefix,
-                body,
-                connection,
-            } => (Self::Static { prefix, body }, connection),
-            output::Outcome::SendShared {
-                hdr_written: prefix,
-                body,
-                connection,
-            }
+            output::Outcome::Send { connection }
+            | output::Outcome::SendCopied { connection, .. } => (Self::Inline, connection),
+            output::Outcome::SendStatic { body, connection } => (Self::Static { body }, connection),
+            output::Outcome::SendShared { body, connection }
             | output::Outcome::SendOwnedCopy {
-                hdr_written: prefix,
-                body,
-                connection,
-                ..
-            } => (Self::Shared { prefix, body }, connection),
+                body, connection, ..
+            } => (Self::Shared { body }, connection),
             output::Outcome::SendCompressed {
-                hdr_written: prefix,
-                body,
-                connection,
-                ..
-            } => (Self::Frozen { prefix, body }, connection),
-            output::Outcome::SendSegmented {
-                hdr_written: prefix,
-                body,
-                connection,
+                body, connection, ..
+            } => (Self::Frozen { body }, connection),
+            output::Outcome::SendSegmented { body, connection }
+            | output::Outcome::SendLinked { body, connection } => {
+                (Self::Segmented { body }, connection)
             }
-            | output::Outcome::SendLinked {
-                hdr_written: prefix,
-                body,
-                connection,
-            } => (Self::Segmented { prefix, body }, connection),
             output::Outcome::SendRequestBody(pending) => match pending.body {},
             output::Outcome::Close(reason) => Self::close(reason),
             output::Outcome::Failed(error) => Self::close(error.body()),
@@ -174,10 +140,7 @@ impl<'d> Egress<'d> {
         let action = if reason.is_empty() {
             Self::None
         } else {
-            Self::Static {
-                prefix: 0,
-                body: reason,
-            }
+            Self::Static { body: reason }
         };
         (action, head::Connection::Close)
     }

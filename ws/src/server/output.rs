@@ -1,7 +1,8 @@
-use std::convert::Infallible;
-
-use dope::{manifold::network::listener::conn::write, net::link::egress};
-use o3::buffer::storage::{self, Shared};
+use dope::net::link::egress;
+use o3::buffer::{
+    storage::{self, Shared},
+    write::Slice,
+};
 
 use crate::server::{ConnState, Error, Phase, Response, app::Sink};
 
@@ -11,7 +12,7 @@ pub(super) struct Output<'a> {
 }
 
 impl<'a> Output<'a> {
-    pub(super) fn new(buffer: &'a mut [u8]) -> Self {
+    pub(super) fn new(buffer: Slice<'a, &'a mut usize>) -> Self {
         Self {
             response: Response::new(buffer),
             body: None,
@@ -43,23 +44,19 @@ impl<'a> Output<'a> {
         result.map(Some)
     }
 
-    pub(super) fn finish<H: Sink>(
-        self,
-        state: &mut ConnState,
-        user: &H,
-    ) -> write::Draft<Infallible, ()> {
+    pub(super) fn finish<H: Sink>(self, state: &mut ConnState, user: &H) -> bool {
         match self.try_finish(state) {
-            Ok(draft) => draft,
+            Ok(()) => true,
             Err(error) => {
                 user.failed(error);
                 state.phase = Phase::Closed;
-                write::Draft::new(0, None, ()).close_after()
+                false
             }
         }
     }
 
     /// Completes the EOF transition before separating the output owners.
-    pub(super) fn into_parts<P>(self, state: &mut ConnState<P>) -> (usize, Option<Shared>) {
+    pub(super) fn into_parts<P>(self, state: &mut ConnState<P>) -> Option<Shared> {
         if state.eof
             && !matches!(state.phase, Phase::Rejected(_))
             && (self.body.is_none() || (state.phase == Phase::Active && state.acc.is_empty()))
@@ -70,19 +67,14 @@ impl<'a> Output<'a> {
         {
             state.phase = Phase::Closed;
         }
-        (self.response.written, self.body)
+        self.body
     }
 
-    fn try_finish(self, state: &mut ConnState) -> Result<write::Draft<Infallible, ()>, Error> {
-        let (written, body) = self.into_parts(state);
-        let draft = write::Draft::new(written, None, ());
+    fn try_finish(self, state: &mut ConnState) -> Result<(), Error> {
+        let body = self.into_parts(state);
         if let Some(owner) = body {
             state.pending = Some(egress::NonEmpty::try_new(owner).map_err(Error::Egress)?);
-            Ok(draft)
-        } else if state.phase == Phase::Closed {
-            Ok(draft.close_after())
-        } else {
-            Ok(draft)
         }
+        Ok(())
     }
 }

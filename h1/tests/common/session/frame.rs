@@ -32,7 +32,7 @@ impl<'d> Dispatch<'d, (), Infallible> for Frame<'d> {
         pending: Self::Head,
         _: Permit,
         _: Input<'_>,
-        _: &mut [u8],
+        _: o3::buffer::write::Slice<'_, &mut usize>,
         _: &mut Conn<'d, (), Infallible>,
     ) -> session::RouteOutcome<'d, Infallible, Infallible, Self::Head, parsing::Rejected<'d>> {
         match pending {}
@@ -42,7 +42,7 @@ impl<'d> Dispatch<'d, (), Infallible> for Frame<'d> {
         self: Pin<&mut Self>,
         permit: Permit,
         source: parsing::Source,
-        write: &mut [u8],
+        write: o3::buffer::write::Slice<'_, &mut usize>,
         conn: &mut Conn<'d, (), Infallible>,
     ) -> session::RouteOutcome<'d, Infallible, Infallible, Self::Head, parsing::Rejected<'d>> {
         let source = source.freeze();
@@ -53,7 +53,7 @@ impl<'d> Dispatch<'d, (), Infallible> for Frame<'d> {
         self: Pin<&mut Self>,
         permit: Permit,
         input: Input<'_>,
-        write: &mut [u8],
+        mut write: o3::buffer::write::Slice<'_, &mut usize>,
         _: &mut Conn<'d, (), Infallible>,
     ) -> session::RouteOutcome<'d, Infallible, Infallible, Self::Head, parsing::Rejected<'d>> {
         let this = self.get_mut();
@@ -63,11 +63,11 @@ impl<'d> Dispatch<'d, (), Infallible> for Frame<'d> {
         {
             return next.into();
         }
-        write[0] = input.as_slice()[0];
+        o3::buffer::write::Sink::write_byte(&mut write, input.as_slice()[0]).expect("inline frame");
         Outcome::Complete {
             permit,
             consumption: Consumption::Buffered(Buffered::new(1)),
-            response: output::Complete::Inline { written: 1 },
+            response: output::Complete::Inline,
             connection: head::Connection::KeepAlive,
         }
         .into()
@@ -99,7 +99,7 @@ impl<'d> Dispatch<'d, (), Infallible> for Frame<'d> {
         pending: Infallible,
         _: session::Complete,
         _: Permit,
-        _: &mut [u8],
+        _: o3::buffer::write::Slice<'_, &mut usize>,
         _: &mut (),
     ) -> session::BodyOutcome<'d, Self::Ready> {
         match pending {}
@@ -109,7 +109,7 @@ impl<'d> Dispatch<'d, (), Infallible> for Frame<'d> {
         self: Pin<&mut Self>,
         ready: Self::Ready,
         _: session::Permit,
-        _: &mut [u8],
+        _: o3::buffer::write::Slice<'_, &mut usize>,
         _: &mut (),
     ) -> session::BodyOutcome<'d, Self::Ready> {
         match ready {}

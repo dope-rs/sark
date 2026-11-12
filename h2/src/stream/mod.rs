@@ -248,14 +248,14 @@ impl Lifecycle {
         }
     }
 
-    pub(crate) const fn open_local(boundary: Boundary) -> Self {
+    pub(crate) const fn open_local(boundary: Boundary, method: Method) -> Self {
         Self {
             state: match boundary {
                 Boundary::End => State::HalfClosedLocal,
                 Boundary::More => State::Open,
             },
             peer_section: Section::Initial,
-            method: None,
+            method: Some(method),
             content: Content::Unbounded,
         }
     }

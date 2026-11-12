@@ -1,5 +1,6 @@
 //! HTTP/1 routing contracts and connection ownership.
 use core::{convert::Infallible, pin};
+use o3::buffer::write::Slice;
 
 use o3::buffer::storage::range;
 use sark_http::{
@@ -148,7 +149,6 @@ pub enum Outcome<'d, D = Infallible> {
     },
     Streamed {
         consumed: usize,
-        written: usize,
         close: head::Connection,
     },
     Park {
@@ -297,7 +297,7 @@ pub trait Dispatch<'d, Runtime, Pending = (), Transitions: switch::Engine = swit
         self: pin::Pin<&mut Self>,
         permit: Permit,
         input: crate::Input<'_>,
-        write: &mut [u8],
+        write: Slice<'_, &mut usize>,
         conn: &mut Conn<'d, Runtime, Pending, Transitions, Self::Ready, Self::Head>,
     ) -> RouteOutcome<'d, Pending, Transitions::Raw, Self::Head, parsing::Rejected<'d>>;
 
@@ -305,7 +305,7 @@ pub trait Dispatch<'d, Runtime, Pending = (), Transitions: switch::Engine = swit
         self: pin::Pin<&mut Self>,
         permit: Permit,
         source: parsing::Source,
-        write: &mut [u8],
+        write: Slice<'_, &mut usize>,
         conn: &mut Conn<'d, Runtime, Pending, Transitions, Self::Ready, Self::Head>,
     ) -> RouteOutcome<'d, Pending, Transitions::Raw, Self::Head, parsing::Rejected<'d>>;
 
@@ -314,7 +314,7 @@ pub trait Dispatch<'d, Runtime, Pending = (), Transitions: switch::Engine = swit
         pending: Self::Head,
         permit: Permit,
         input: crate::Input<'_>,
-        write: &mut [u8],
+        write: Slice<'_, &mut usize>,
         conn: &mut Conn<'d, Runtime, Pending, Transitions, Self::Ready, Self::Head>,
     ) -> RouteOutcome<'d, Pending, Transitions::Raw, Self::Head, parsing::Rejected<'d>>;
 
@@ -323,7 +323,7 @@ pub trait Dispatch<'d, Runtime, Pending = (), Transitions: switch::Engine = swit
         pending: parsing::Rejected<'d>,
         permit: Permit,
         input: crate::Input<'_>,
-        _: &mut [u8],
+        _: Slice<'_, &mut usize>,
         _: &mut Conn<'d, Runtime, Pending, Transitions, Self::Ready, Self::Head>,
     ) -> RouteOutcome<'d, Pending, Transitions::Raw, Self::Head, parsing::Rejected<'d>> {
         pending.resume(input, permit)
@@ -351,7 +351,7 @@ pub trait Dispatch<'d, Runtime, Pending = (), Transitions: switch::Engine = swit
         pending: Pending,
         complete: Complete,
         permit: Permit,
-        write: &mut [u8],
+        write: Slice<'_, &mut usize>,
         runtime: &mut Runtime,
     ) -> BodyOutcome<'d, Self::Ready, Transitions::Raw>;
 
@@ -359,7 +359,7 @@ pub trait Dispatch<'d, Runtime, Pending = (), Transitions: switch::Engine = swit
         self: pin::Pin<&mut Self>,
         ready: Self::Ready,
         permit: Permit,
-        write: &mut [u8],
+        write: Slice<'_, &mut usize>,
         runtime: &mut Runtime,
     ) -> BodyOutcome<'d, Self::Ready, Transitions::Raw>;
 }

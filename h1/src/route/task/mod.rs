@@ -1,5 +1,6 @@
 //! Task-route execution over borrowed HTTP/1 protocol storage.
 use o3::base::cell::region;
+use o3::buffer::write::Slice;
 use sark_http::payload::response::Body as _;
 mod buffered;
 mod endpoint;
@@ -33,7 +34,7 @@ type Origin<'id> = region::Identity<'id>;
 /// Borrowed HTTP/1 output resources for one completed generated task.
 #[doc(hidden)]
 pub struct Egress<'turn> {
-    write: &'turn mut [u8],
+    write: Slice<'turn, &'turn mut usize>,
     date: &'turn [u8; 29],
     connection: head::Connection,
     response: Context,
@@ -41,7 +42,7 @@ pub struct Egress<'turn> {
 
 impl<'turn> Egress<'turn> {
     pub fn new(
-        write: &'turn mut [u8],
+        write: Slice<'turn, &'turn mut usize>,
         date: &'turn [u8; 29],
         conn: head::Connection,
         response: Context,
@@ -77,7 +78,7 @@ impl<'turn> Egress<'turn> {
     }
 }
 
-const _: () = assert!(mem::size_of::<Egress<'static>>() == 4 * mem::size_of::<usize>());
+const _: () = assert!(mem::size_of::<Egress<'static>>() == 5 * mem::size_of::<usize>());
 
 /// The request's construction mode selects its exact retained H1 state.
 pub type Pending<'d, R> =

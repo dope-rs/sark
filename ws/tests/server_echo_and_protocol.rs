@@ -1,7 +1,7 @@
 use dope_test::alloc::Tracker;
 pub mod common;
 
-use o3::buffer::storage;
+use o3::buffer::{storage, write::Slice};
 use sark_core::duplex::{admit, machine};
 use sark_http::payload::{owned, response::Body as _};
 use std::{
@@ -35,7 +35,7 @@ fn session_retains_tail_across_owned_output() {
         let mut scratch = Vec::new();
         if eof {
             assert!(matches!(
-                session.transact(&mut [], &mut scratch, |_, emit| {
+                session.transact(Slice::new(&mut []).reborrow(), &mut scratch, |emit| {
                     match emit.into_parts().0 {
                         admit::Payload::Vacant(permit) => permit.commit::<_, ()>(()),
                         admit::Payload::Present { .. } => panic!("initial output"),
@@ -71,21 +71,22 @@ fn session_retains_tail_across_owned_output() {
         let mut owned = 0;
         for _ in 0..8 {
             let mut prefix = [0; 160];
-            let turn = session.transact(&mut prefix, &mut scratch, |written, emit| {
+            let mut writer = Slice::new(&mut prefix);
+            let turn = session.transact(writer.reborrow(), &mut scratch, |emit| {
                 match emit.into_parts().0 {
                     admit::Payload::Present { output, permit } if !deferred => {
                         assert_eq!(calls.get(), 1);
                         deferred = true;
-                        permit.pending::<_, ()>(output, (written, None))
+                        permit.pending::<_, ()>(output, None)
                     }
                     admit::Payload::Present { output, permit } => {
                         assert_eq!(calls.get(), owned + 1);
-                        permit.commit((written, Some(output)))
+                        permit.commit(Some(output))
                     }
-                    admit::Payload::Vacant(permit) => permit.commit((written, None)),
+                    admit::Payload::Vacant(permit) => permit.commit(None),
                 }
             });
-            let (written, body) = match turn {
+            let body = match turn {
                 machine::Transaction::Committed { receipt, .. } => receipt,
                 machine::Transaction::Pending { receipt } => {
                     if eof {
@@ -95,7 +96,7 @@ fn session_retains_tail_across_owned_output() {
                 }
                 _ => panic!("output admission"),
             };
-            output.extend_from_slice(&prefix[..written]);
+            output.extend_from_slice(writer.into_mut());
             if let Some(body) = body {
                 owned += 1;
                 for chunk in owned::Segments::from(body).segments() {
@@ -147,22 +148,17 @@ fn final_fragment_waits_for_output() {
     let mut output = Vec::new();
     for pass in 0..2 {
         let mut prefix = [0; 160];
-        let turn = session.transact(&mut prefix, &mut scratch, |written, emit| {
+        let mut writer = Slice::new(&mut prefix);
+        let turn = session.transact(writer.reborrow(), &mut scratch, |emit| {
             match emit.into_parts().0 {
-                admit::Payload::Present { output, permit } => {
-                    permit.commit::<_, ()>((written, Some(output)))
-                }
-                admit::Payload::Vacant(permit) => permit.commit((written, None)),
+                admit::Payload::Present { output, permit } => permit.commit::<_, ()>(Some(output)),
+                admit::Payload::Vacant(permit) => permit.commit(None),
             }
         });
-        let machine::Transaction::Committed {
-            receipt: (written, body),
-            ..
-        } = turn
-        else {
+        let machine::Transaction::Committed { receipt: body, .. } = turn else {
             panic!("output admission");
         };
-        output.extend_from_slice(&prefix[..written]);
+        output.extend_from_slice(writer.into_mut());
         if let Some(body) = body {
             for chunk in owned::Segments::from(body).segments() {
                 output.extend_from_slice(chunk);

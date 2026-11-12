@@ -7,7 +7,7 @@ use common::{
     fields::{self, DATE, ENTRIES},
 };
 use dope_test::alloc::Tracker;
-use o3::buffer::storage;
+use o3::buffer::{storage, write::Slice};
 use sark_h1::{
     route,
     wire::{Failure, cache, head, output},
@@ -41,8 +41,9 @@ fn borrowed_plain_uses_output_room() {
     let mut head = 512;
     for inline in [true, false] {
         let mut bytes = [0; 512];
+        let mut writer = Slice::new(&mut bytes[..head]);
         let (outcome, allocs) = Tracker::count(|| {
-            output::Egress::new(&mut bytes[..head], DATE, fields::RESPONSE).route(
+            output::Egress::new(writer.reborrow(), DATE, fields::RESPONSE).route(
                 fixed::Direct::new(Code::OK, (), source.as_slice()),
                 handoff::Slot::ready(None),
                 cache::Cache::empty(),
@@ -52,21 +53,17 @@ fn borrowed_plain_uses_output_room() {
             )
         });
         match outcome {
-            output::Outcome::SendCopied { written, copy, .. } if inline => {
+            output::Outcome::SendCopied { copy, .. } if inline => {
+                let written = writer.len();
                 assert_eq!(allocs, 0);
                 assert!(copy.cause == evidence::Cause::Inline);
                 assert_eq!((copy.read, copy.written), (source.len(), source.len()));
                 head = written - source.len();
                 assert_eq!(&bytes[head..written], source.as_slice());
             }
-            output::Outcome::SendOwnedCopy {
-                hdr_written,
-                body,
-                cause,
-                ..
-            } if !inline => {
+            output::Outcome::SendOwnedCopy { body, cause, .. } if !inline => {
                 assert_eq!(allocs, 1);
-                assert_eq!(hdr_written, head);
+                assert_eq!(writer.len(), head);
                 assert!(cause == evidence::Cause::Borrowed);
                 assert_eq!(body.as_ref(), source.as_slice());
             }
@@ -87,9 +84,10 @@ fn frames_compressed() {
     );
     let date = b"Mon, 01 Jan 2026 00:00:00 GMT";
     let mut bytes = [0; 1024];
+    let mut writer = Slice::new(&mut bytes);
     let result = Gzip::try_new();
     let mut gzip = result.expect("test gzip pool allocation");
-    let outcome = output::Egress::new(&mut bytes, date, fields::RESPONSE).route(
+    let outcome = output::Egress::new(writer.reborrow(), date, fields::RESPONSE).route(
         response,
         handoff::Slot::ready(None),
         cache::Cache::empty(),
@@ -97,16 +95,10 @@ fn frames_compressed() {
         Coding::Gzip,
         route::Policy::new(route::Cache::Bypass, Coding::Gzip, Date::Omit, Server::Omit),
     );
-    let output::Outcome::SendCompressed {
-        hdr_written: head_len,
-        body,
-        read,
-        ..
-    } = outcome
-    else {
+    let output::Outcome::SendCompressed { body, read, .. } = outcome else {
         panic!("gzip policy must retain the compressed owner");
     };
-    let result = str::from_utf8(&bytes[..head_len]);
+    let result = str::from_utf8(writer.into_mut());
     let head = result.expect("valid H1 head");
     assert_eq!(read, payload.len());
     assert!(head.contains("content-encoding: gzip\r\n"));
@@ -131,9 +123,10 @@ fn fixed_fields_emit_once() {
         storage::Shared::try_copy(COMPRESSIBLE).expect("body"),
     );
     let mut bytes = [0; 512];
+    let mut writer = Slice::new(&mut bytes);
     let mut gzip = Gzip::try_new().expect("gzip");
     let (outcome, allocs) = Tracker::count(|| {
-        output::Egress::new(&mut bytes, DATE, fields::RESPONSE).route(
+        output::Egress::new(writer.reborrow(), DATE, fields::RESPONSE).route(
             response,
             handoff::Slot::ready(None),
             cache::Cache::empty(),
@@ -148,9 +141,7 @@ fn fixed_fields_emit_once() {
         )
     });
     let length = match outcome {
-        output::Outcome::SendCompressed {
-            hdr_written: len, ..
-        } => Some(len),
+        output::Outcome::SendCompressed { .. } => Some(writer.len()),
         _ => None,
     }
     .expect("compressed response");
@@ -181,9 +172,10 @@ fn exact_fields_emit_once() {
             },
         );
         let mut bytes = [0; 2048];
+        let mut writer = Slice::new(&mut bytes[..capacity]);
         let mut gzip = Gzip::try_new().expect("gzip");
         let (outcome, allocs) = Tracker::count(|| {
-            output::Egress::new(&mut bytes[..capacity], DATE, fields::RESPONSE).route(
+            output::Egress::new(writer.reborrow(), DATE, fields::RESPONSE).route(
                 response,
                 handoff::Slot::ready(None),
                 cache::Cache::empty(),
@@ -198,9 +190,7 @@ fn exact_fields_emit_once() {
             )
         });
         let length = match outcome {
-            output::Outcome::SendCompressed {
-                hdr_written: len, ..
-            } => Some(len),
+            output::Outcome::SendCompressed { .. } => Some(writer.len()),
             _ => None,
         }
         .expect("compressed response");
@@ -233,8 +223,9 @@ fn bounded_keeps_fields() {
         },
     };
     let mut bytes = [0; 256];
+    let mut writer = Slice::new(&mut bytes);
     let mut gzip = Gzip::try_new().expect("gzip");
-    let outcome = output::Egress::new(&mut bytes, DATE, fields::RESPONSE).route(
+    let outcome = output::Egress::new(writer.reborrow(), DATE, fields::RESPONSE).route(
         response,
         handoff::Slot::ready(None),
         cache::Cache::empty(),
@@ -248,11 +239,7 @@ fn bounded_keeps_fields() {
         ),
     );
     let (len, body) = match outcome {
-        output::Outcome::SendCompressed {
-            hdr_written: len,
-            body,
-            ..
-        } => Some((len, body)),
+        output::Outcome::SendCompressed { body, .. } => Some((writer.len(), body)),
         _ => None,
     }
     .expect("bounded response must compress");
@@ -285,33 +272,32 @@ fn fixed_scalar_capacity() {
         ),
     ];
     let mut complete = [0xa5; 256];
+    let mut writer = Slice::new(&mut complete);
     let response = statics::Direct::new(Code::OK, fields, Body::new(zipped.as_ref()));
-    let head_len = match output::Egress::new(&mut complete, DATE, fields::RESPONSE)
+    let head_len = match output::Egress::new(writer.reborrow(), DATE, fields::RESPONSE)
         .plain(response, head::Connection::KeepAlive)
     {
-        output::Outcome::SendStatic {
-            hdr_written: len, ..
-        } => Some(len),
+        output::Outcome::SendStatic { .. } => Some(writer.len()),
         _ => None,
     }
     .expect("complete gzip head");
 
     for capacity in 0..=head_len {
         let mut expected = [0xa5; 256];
+        let mut writer = Slice::new(&mut expected[..capacity]);
         let response = statics::Direct::new(Code::OK, ENTRIES, Body::new(COMPRESSIBLE));
-        let plain = output::Egress::new(&mut expected[..capacity], DATE, fields::RESPONSE)
+        let plain = output::Egress::new(writer.reborrow(), DATE, fields::RESPONSE)
             .plain(response, head::Connection::KeepAlive);
         let wanted = match plain {
             output::Outcome::Failed(Failure::Output(error)) => Some(Err(error)),
             output::Outcome::SendStatic { .. } => {
                 let response = statics::Direct::new(Code::OK, fields, Body::new(zipped.as_ref()));
-                match output::Egress::new(&mut expected[..capacity], DATE, fields::RESPONSE)
+                let mut writer = Slice::new(&mut expected[..capacity]);
+                match output::Egress::new(writer.reborrow(), DATE, fields::RESPONSE)
                     .plain(response, head::Connection::KeepAlive)
                 {
                     output::Outcome::Failed(Failure::Output(error)) => Some(Err(error)),
-                    output::Outcome::SendStatic {
-                        hdr_written: len, ..
-                    } => Some(Ok(len)),
+                    output::Outcome::SendStatic { .. } => Some(Ok(writer.len())),
                     _ => None,
                 }
             }
@@ -320,8 +306,9 @@ fn fixed_scalar_capacity() {
         .expect("scalar response or capacity failure");
 
         let mut actual = [0xa5; 256];
+        let mut writer = Slice::new(&mut actual[..capacity]);
         let response = fixed::Direct::new(Code::OK, ENTRIES, Body::new(COMPRESSIBLE));
-        let outcome = output::Egress::new(&mut actual[..capacity], DATE, fields::RESPONSE).route(
+        let outcome = output::Egress::new(writer.reborrow(), DATE, fields::RESPONSE).route(
             response,
             handoff::Slot::ready(None),
             cache::Cache::empty(),
@@ -336,9 +323,7 @@ fn fixed_scalar_capacity() {
         );
         let got = match outcome {
             output::Outcome::Failed(Failure::Output(error)) => Some(Err(error)),
-            output::Outcome::SendCompressed {
-                hdr_written: len, ..
-            } => Some(Ok(len)),
+            output::Outcome::SendCompressed { .. } => Some(Ok(writer.len())),
             _ => None,
         }
         .expect("compressed response or capacity failure");

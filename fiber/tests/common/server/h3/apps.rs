@@ -1,3 +1,4 @@
+use o3::buffer::write::Slice;
 use std::{cell, mem, ops::ControlFlow, rc, task::Poll, time::Duration};
 
 use dope::core::driver::{
@@ -581,34 +582,31 @@ impl<'d> duplex::Session<'d> for DuplexEcho {
     fn receive(
         &mut self,
         input: owned::Segments<'d>,
-        _: &mut [u8],
+        _: Slice<'_, &mut usize>,
         _: &mut Vec<u8>,
-    ) -> (usize, duplex::Action<'d>) {
+    ) -> duplex::Action<'d> {
         if self.finished {
             self.errors.record(Failure::DuplexInput);
-            return (0, Action::close());
+            return Action::close();
         }
-        (0, Action::send(input))
+        Action::send(input)
     }
 
-    fn finish(&mut self, _: &mut [u8], _: &mut Vec<u8>) -> (usize, duplex::Action<'d>) {
+    fn finish(&mut self, _: Slice<'_, &mut usize>, _: &mut Vec<u8>) -> duplex::Action<'d> {
         if mem::replace(&mut self.finished, true) {
             self.errors.record(Failure::DuplexFinish);
         }
-        (0, Action::close())
+        Action::close()
     }
 
-    fn activate(&mut self, _: &mut [u8], _: &mut Vec<u8>) -> (usize, duplex::Action<'d>) {
+    fn activate(&mut self, _: Slice<'_, &mut usize>, _: &mut Vec<u8>) -> duplex::Action<'d> {
         if self.finished {
             self.errors.record(Failure::DuplexActivate);
-            return (0, Action::close());
+            return Action::close();
         }
         match self.initial.take() {
-            Some(bytes) => (
-                0,
-                Action::send(owned::Segments::from(resident::Shared::from(bytes))),
-            ),
-            None => (0, Action::idle()),
+            Some(bytes) => Action::send(owned::Segments::from(resident::Shared::from(bytes))),
+            None => Action::idle(),
         }
     }
 }

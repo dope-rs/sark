@@ -90,13 +90,8 @@ impl<'turn, 'env, S, Runtime, Tasks> Execution<'turn, 'env, S, Runtime, Tasks> {
                 return session::Outcome::Failed(Failure::Projection(failure.discard()));
             }
         };
-        let (wrote, stream) = streamed;
-        let Some((admit, stream)) = stream else {
-            return output::Outcome::Send {
-                written: wrote,
-                connection: close,
-            }
-            .into_consume(
+        let Some((admit, stream)) = streamed else {
+            return output::Outcome::Send { connection: close }.into_consume(
                 permit,
                 session::Consumption::Buffered(session::Buffered::new(used)),
                 close,
@@ -106,7 +101,6 @@ impl<'turn, 'env, S, Runtime, Tasks> Execution<'turn, 'env, S, Runtime, Tasks> {
         admit(stream, runtime, response);
         session::Outcome::Streamed {
             consumed: used,
-            written: wrote,
             close,
         }
     }

@@ -1,10 +1,15 @@
-use o3::buffer::storage;
+use o3::buffer::{
+    storage,
+    write::{Sink as _, Slice},
+};
 
 use crate::owner::evidence;
 
-pub(crate) fn into(out: &mut [u8], bytes: &[u8]) -> Option<usize> {
-    let out = out.get_mut(..bytes.len())?;
-    out.copy_from_slice(bytes);
+pub(crate) fn into<L: std::borrow::BorrowMut<usize>>(
+    out: &mut Slice<'_, L>,
+    bytes: &[u8],
+) -> Option<usize> {
+    out.write_slice(bytes).ok()?;
     Some(bytes.len())
 }
 

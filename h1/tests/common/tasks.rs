@@ -283,16 +283,24 @@ impl<'d> duplex::Session<'d> for Session {
     fn receive(
         &mut self,
         _: owned::Segments<'d>,
-        _: &mut [u8],
+        _: o3::buffer::write::Slice<'_, &mut usize>,
         _: &mut Vec<u8>,
-    ) -> (usize, duplex::Action<'d>) {
-        (0, duplex::Action::idle())
+    ) -> duplex::Action<'d> {
+        duplex::Action::idle()
     }
-    fn finish(&mut self, _: &mut [u8], _: &mut Vec<u8>) -> (usize, duplex::Action<'d>) {
-        (0, duplex::Action::idle())
+    fn finish(
+        &mut self,
+        _: o3::buffer::write::Slice<'_, &mut usize>,
+        _: &mut Vec<u8>,
+    ) -> duplex::Action<'d> {
+        duplex::Action::idle()
     }
-    fn activate(&mut self, _: &mut [u8], _: &mut Vec<u8>) -> (usize, duplex::Action<'d>) {
-        (0, duplex::Action::idle())
+    fn activate(
+        &mut self,
+        _: o3::buffer::write::Slice<'_, &mut usize>,
+        _: &mut Vec<u8>,
+    ) -> duplex::Action<'d> {
+        duplex::Action::idle()
     }
 }
 
