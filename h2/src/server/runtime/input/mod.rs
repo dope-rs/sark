@@ -1,3 +1,4 @@
+use crate::server::app;
 use dope::{
     core::driver::route::Identity,
     manifold::network::listener::conn::Ctx,
@@ -6,7 +7,6 @@ use dope::{
         wire,
     },
 };
-use sark_core::manifold::server::app;
 
 use crate::{conn, server::runtime::output};
 
@@ -45,7 +45,7 @@ impl Fault for conn::Error {
     }
 }
 
-impl<E> Fault for app::Error<conn::Error, E> {
+impl<E> Fault for app::Error<E> {
     fn connection(&self) -> Option<&conn::Error> {
         match self {
             Self::Connection(error) => Some(error),

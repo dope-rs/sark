@@ -10,19 +10,13 @@ mod records;
 mod runtime;
 mod vacant;
 
-use std::marker;
-
-use o3::{
-    base::cell::region,
-    depot::{array::Index, map::direct},
-};
+use o3::depot::{array::Index, map::direct};
 pub use occupied::Occupied;
 pub use records::Records;
 pub use runtime::Runtime;
 pub use vacant::Vacant;
 
 use crate::manifold;
-use drive::TurnOutcome;
 
 const LANES: usize = 7;
 const CONTROL_READY: Index<LANES> = Index::at::<0>();
@@ -261,32 +255,9 @@ pub trait Settle<T> {
     fn settle(
         &mut self,
         stream: Self::Key,
-        value: T,
+        value: &mut T,
         terminal: Terminal<Self::Error>,
-    ) -> Settlement<T>;
-}
-
-#[repr(transparent)]
-pub struct Decision<'id, K> {
-    outcome: TurnOutcome<K>,
-    _scope: marker::PhantomData<region::Identity<'id>>,
-}
-
-impl<'id, K> Decision<'id, K> {
-    fn bind(outcome: TurnOutcome<K>, _scope: region::Identity<'id>) -> Self {
-        Self {
-            outcome,
-            _scope: marker::PhantomData,
-        }
-    }
-
-    const fn running(stream: K, activity: WorkClass) -> TurnOutcome<K> {
-        TurnOutcome::new(stream, activity, drive::Effect::None)
-    }
-
-    const fn blocked(stream: K, activity: WorkClass) -> TurnOutcome<K> {
-        TurnOutcome::new(stream, activity, drive::Effect::BlockData)
-    }
+    ) -> Settlement<()>;
 }
 
 /// Payload-specific state machine driven inside one resident domain.
@@ -296,11 +267,12 @@ pub trait Driver<T>: Settle<T> {
 
     fn permit(&mut self) -> Option<Self::Permit>;
 
-    fn control<'id>(
+    fn control(
         &mut self,
         permit: Self::Permit,
-        entry: Occupied<'_, Self::Key, T, Self::Block, region::Identity<'id>>,
-    ) -> Decision<'id, Self::Key>;
+        stream: Self::Key,
+        value: &mut T,
+    ) -> Result<ControlTurn<Self::Block>, Self::Error>;
 
     fn data(
         &mut self,

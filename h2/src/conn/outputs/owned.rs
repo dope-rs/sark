@@ -26,7 +26,7 @@ impl<'a, C: session::Storage> Owned<'a, C> {
         block: wire::Block,
     ) -> Result<ControlFlow<(wire::Block, outputs::Full), Self>, (group::Error<1>, wire::Block)>
     {
-        let len = block.len();
+        let len = block.as_ref().len();
         if !outbound
             .room::<modes::Retained>()
             .is_some_and(|room| len <= room)

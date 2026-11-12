@@ -1,27 +1,32 @@
 use std::mem;
 
 use dope::core::driver::schedule::clock;
-use o3::buffer::{resident, storage};
-use sark_core::manifold::{
-    schedule,
-    server::{self, Connection, app, drain},
+use o3::buffer::resident;
+use sark_core::{
+    deadline::Book,
+    manifold::{
+        schedule,
+        server::{self, Connection as _, drain},
+    },
 };
-use sark_h2::stream::Key;
+use sark_h2::{
+    conn::{self, event},
+    server::app,
+    stream::Key,
+};
 use state::active;
 
-use crate::{
-    protocol::section,
-    server::{
-        call::Handler,
-        config::Limits,
-        egress,
-        runtime::{
-            policy,
-            run::Failure,
-            state::{self, Store, lanes},
-        },
-        service::{handler::Production, timers},
+use crate::server::{
+    call::{self, Handler},
+    calls,
+    config::Limits,
+    egress,
+    runtime::{
+        Connection, policy,
+        run::Failure,
+        state::{self, Store, lanes},
     },
+    service::{handler::Production, timers},
 };
 
 pub(super) struct Driver<'a, X, O, H, F> {
@@ -45,13 +50,11 @@ pub(super) trait Mode<'d>: state::Timing<'d> {
             || <Self as state::Timing<'d>>::deadline(times).is_some_and(|at| at <= now)
     }
 
-    fn poll<'r, T, C>(
+    fn poll<'r, T>(
         now: clock::Moment<'d>,
-        state: &mut Store<'r, 'd, T, Self, C>,
+        state: &mut Store<'r, 'd, T, Self>,
         active: &'r active::Signals,
-    ) -> Option<active::Entry<'r>>
-    where
-        C: Connection<Key = Key, Owner = resident::Shared<'d>, Output = storage::Shared>;
+    ) -> Option<active::Entry<'r>>;
 
     fn output<'a, 'r: 'a>(
         now: clock::Moment<'d>,
@@ -63,14 +66,11 @@ pub(super) trait Mode<'d>: state::Timing<'d> {
 }
 
 impl<'d> Mode<'d> for timers::Off {
-    fn poll<'r, T, C>(
+    fn poll<'r, T>(
         _: clock::Moment<'d>,
-        state: &mut Store<'r, 'd, T, Self, C>,
+        state: &mut Store<'r, 'd, T, Self>,
         active: &'r active::Signals,
-    ) -> Option<active::Entry<'r>>
-    where
-        C: Connection<Key = Key, Owner = resident::Shared<'d>, Output = storage::Shared>,
-    {
+    ) -> Option<active::Entry<'r>> {
         state.poll_output(active)
     }
 
@@ -87,14 +87,11 @@ impl<'d> Mode<'d> for timers::Off {
 }
 
 impl<'d> Mode<'d> for timers::On {
-    fn poll<'r, T, C>(
+    fn poll<'r, T>(
         now: clock::Moment<'d>,
-        state: &mut Store<'r, 'd, T, Self, C>,
+        state: &mut Store<'r, 'd, T, Self>,
         active: &'r active::Signals,
-    ) -> Option<active::Entry<'r>>
-    where
-        C: Connection<Key = Key, Owner = resident::Shared<'d>, Output = storage::Shared>,
-    {
+    ) -> Option<active::Entry<'r>> {
         if let Some(entry) = state.output_deadlines.pop(now)
             && matches!(state.calls.production(entry.key()), Some(Production::Ready))
         {
@@ -121,56 +118,87 @@ where
     X: policy::Dispatch<'d, O, Target = active::Entry<'r>>,
     X::Timer: Mode<'d>,
 {
-    pub(super) fn egress<C>(
+    pub(super) fn egress<E: event::Evidence>(
         &mut self,
-        state: &mut Store<'r, 'd, Handler<X::Call, X::State>, X::Timer, C>,
-        conn: &mut C,
+        state: &mut Store<'r, 'd, Handler<X::Call, X::State>, X::Timer>,
+        conn: &mut Connection<'d, E>,
         active: &active::Signals,
         egress: schedule::Egress,
-        notify: impl FnMut(&mut H, schedule::Wake<Key>),
+        mut notify: impl FnMut(&mut H, schedule::Wake<Key>),
     ) -> (schedule::Report, active::Edge)
     where
-        C: Connection<Key = Key, Owner = resident::Shared<'d>, Output = storage::Shared>,
-        F: FnMut(&mut H, Key, egress::Error<C::Error>),
+        F: FnMut(&mut H, Key, egress::Error<conn::Error>),
     {
         let owner = self.owner;
-        let exec = &mut self.exec;
-        state.drive(
-            conn,
-            egress,
-            self.context,
-            notify,
-            active,
-            &mut self.sink,
-            |entry, call| exec.cancel(owner, entry, call),
-        )
+        let exec = &mut *self.exec;
+        let context = &mut *self.context;
+        let sink = &mut self.sink;
+        let (report, released) = {
+            let Store {
+                calls,
+                egress: output,
+                output_deadlines: times,
+                call_deadlines: book,
+                ..
+            } = state;
+            let calls::Store {
+                records,
+                data,
+                messages,
+            } = calls;
+            records.resume(
+                || conn.poll_wake().inspect(|wake| notify(context, *wake)),
+                egress,
+            );
+            let mut retire =
+                |record: &mut call::State<'r, Handler<X::Call, X::State>, resident::Shared<'d>>| {
+                    let entry = record.entry;
+                    if let Some(book) = book {
+                        book.cancel(entry.key());
+                    }
+                    <X::Timer as state::Timing<'d>>::cancel(times, entry);
+                    if let Some(call) = record.active() {
+                        exec.cancel(owner, entry, &mut call.handler);
+                    }
+                    calls::Store::<_, _, _, conn::DataBlock>::release(record, data, messages)
+                };
+            let mut sink = |stream, error| sink(context, stream, error);
+            let mut driver = egress::driver::Driver::new(conn, output, &mut sink, &mut retire);
+            let report = records.drive(&mut driver);
+            (report, driver.released)
+        };
+        state.release(released);
+        let edge = if active
+            .blocked(state.work.waiting, state.work.retries)
+            .is_some()
+        {
+            active::Edge::Wake
+        } else {
+            active::Edge::None
+        };
+        (report, edge)
     }
 
     /// The turn time is fixed, and new call deadlines use positive durations,
     /// so only the initial due set needs draining. Output callbacks can add
     /// due output timers, which remain polled by the lane loop.
-    pub(super) fn drain<C>(
+    pub(super) fn drain<E: event::Evidence>(
         &mut self,
-        store: &mut state::Store<'r, 'd, Handler<X::Call, X::State>, X::Timer, C>,
-        conn: &mut C,
+        store: &mut state::Store<'r, 'd, Handler<X::Call, X::State>, X::Timer>,
+        conn: &mut Connection<'d, E>,
         turn: &mut app::Turn<'_, '_, '_, 'd, O>,
         mut protocol: impl FnMut(
             &mut H,
-            &mut C,
+            &mut Connection<'d, E>,
             &mut drain::Events<'_, 'd>,
-            &state::Store<'r, 'd, Handler<X::Call, X::State>, X::Timer, C>,
-        ) -> Result<Option<server::Event<C>>, C::Error>,
+            &state::Store<'r, 'd, Handler<X::Call, X::State>, X::Timer>,
+        )
+            -> Result<Option<server::Event<Connection<'d, E>>>, conn::Error>,
         mut notify: impl FnMut(&mut H, schedule::Wake<Key>),
-        finish: impl FnOnce(&mut H, &mut C),
-    ) -> Result<drain::Progress, app::Error<C::Error, Failure>>
+        finish: impl FnOnce(&mut H, &mut Connection<'d, E>),
+    ) -> Result<drain::Progress, app::Error<Failure>>
     where
-        C: Connection<
-                Key = Key,
-                Owner = resident::Shared<'d>,
-                Fields = section::Owner,
-                Output = storage::Shared,
-            >,
-        F: FnMut(&mut H, Key, egress::Error<C::Error>),
+        F: FnMut(&mut H, Key, egress::Error<conn::Error>),
     {
         let now = turn.driver().driver_ref().clock().now();
         let owner = self.owner;
@@ -323,15 +351,14 @@ where
         })
     }
 
-    pub(super) fn fail<C>(
+    pub(super) fn fail<E: event::Evidence>(
         &mut self,
-        state: &mut Store<'r, 'd, Handler<X::Call, X::State>, X::Timer, C>,
-        conn: &mut C,
+        state: &mut Store<'r, 'd, Handler<X::Call, X::State>, X::Timer>,
+        conn: &mut Connection<'d, E>,
         status: crate::Status,
         entry: active::Entry<'r>,
     ) where
-        C: Connection<Key = Key, Owner = resident::Shared<'d>, Output = storage::Shared>,
-        F: FnMut(&mut H, Key, egress::Error<C::Error>),
+        F: FnMut(&mut H, Key, egress::Error<conn::Error>),
     {
         self.cancel(state, entry);
         state.send_error(conn, status, entry, &mut |stream, error| {
@@ -339,26 +366,22 @@ where
         })
     }
 
-    pub(super) fn complete<C>(
+    pub(super) fn complete<E: event::Evidence>(
         &mut self,
-        state: &mut Store<'r, 'd, Handler<X::Call, X::State>, X::Timer, C>,
-        conn: &mut C,
+        state: &mut Store<'r, 'd, Handler<X::Call, X::State>, X::Timer>,
+        conn: &mut Connection<'d, E>,
         entry: active::Entry<'r>,
-    ) where
-        C: Connection<Key = Key, Owner = resident::Shared<'d>, Output = storage::Shared>,
-    {
+    ) {
         <X::Timer as state::Timing<'d>>::cancel(&mut state.output_deadlines, entry);
         self.cancel(state, entry);
         state.complete(conn, entry);
     }
 
-    pub(super) fn cancel<C>(
+    pub(super) fn cancel(
         &mut self,
-        state: &mut Store<'r, 'd, Handler<X::Call, X::State>, X::Timer, C>,
+        state: &mut Store<'r, 'd, Handler<X::Call, X::State>, X::Timer>,
         entry: active::Entry<'r>,
-    ) where
-        C: Connection<Key = Key, Owner = resident::Shared<'d>, Output = storage::Shared>,
-    {
+    ) {
         let Some(call) = state.calls.handler_mut(entry.key()) else {
             return;
         };

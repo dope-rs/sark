@@ -1,8 +1,9 @@
+use sark_h2::server::app;
 use std::{convert, marker};
 
 use dope::core::driver::{self, schedule::app::Work};
 use o3::buffer::resident;
-use sark_core::manifold::server::{app, drain::Progress};
+use sark_core::manifold::server::drain::Progress;
 
 use crate::{
     message, metadata,

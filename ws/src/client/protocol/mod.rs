@@ -272,7 +272,9 @@ impl Codec {
             Err(error) => return Err(reject(progress, Fault::Frame(error), state, admit)),
         };
         let reply = match &prepared {
-            inbound::Prepared::Ready(_) => None,
+            inbound::Prepared::Message(_)
+            | inbound::Prepared::Fragment(_)
+            | inbound::Prepared::Pong(_) => None,
             inbound::Prepared::Required(need) => Some(need.reply()),
         };
         let emit = match admit(Ok(reply)) {

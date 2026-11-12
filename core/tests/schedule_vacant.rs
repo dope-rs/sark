@@ -135,35 +135,6 @@ fn probe_keeps_empty() {
 }
 
 #[test]
-fn input_is_preserved() {
-    let mut run = Runtime::<Handle, usize, Blocked>::try_new().expect("bounded runtime fixture");
-    let absent = Box::new(11);
-    let addr = (&*absent) as *const usize;
-    let (result, allocs) = Tracker::count(|| {
-        run.try_apply(Handle::key(0), absent, |value, input| {
-            Ok::<_, ((), Box<usize>)>((Activation::Keep, (*value, input)))
-        })
-    });
-    assert_eq!(allocs, 0);
-    let (_, input) = fail(result);
-    assert_eq!((&*input) as *const usize, addr);
-
-    some(run.vacant(Handle::key(0))).insert(7, None);
-    let input = Box::new(13_usize);
-    let addr = (&*input) as *const usize;
-    let (result, allocs) = Tracker::count(|| {
-        run.try_apply(Handle::key(0), input, |value, input| {
-            assert_eq!(*value, 7);
-            Err::<(Activation<Blocked>, ()), _>(((), input))
-        })
-    });
-    assert_eq!(allocs, 0);
-    let (_, input) = fail(result);
-    assert_eq!((&*input) as *const usize, addr);
-    assert_eq!(run.get(Handle::key(0)), Some(&7));
-}
-
-#[test]
 fn moves_wait_lane() {
     let mut run = Runtime::<Handle, usize, Blocked>::try_new().expect("bounded runtime fixture");
     let stream = Handle::key(0);
@@ -171,11 +142,7 @@ fn moves_wait_lane() {
         .as_ref()
         .expect("test operation must succeed");
 
-    (run.transaction(stream, |_| {
-        Ok::<_, ()>((Activation::control(Some(Blocked::Stream)), ()))
-    }))
-    .as_ref()
-    .expect("test operation must succeed");
+    some(run.entry(stream)).activate(Activation::control(Some(Blocked::Stream)));
 
     assert_eq!(run.wake(schedule::Wake::Connection), 0);
     assert_eq!(run.wake(schedule::Wake::Stream(stream)), 1);

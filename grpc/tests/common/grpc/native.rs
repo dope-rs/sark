@@ -150,6 +150,7 @@ pub struct Facts {
     pub messages: Cell<usize>,
     pub closed: Cell<bool>,
     pub drops: Cell<usize>,
+    pub shape: Option<stream::Shape>,
 }
 
 pub struct Handler<'a>(pub &'a Facts);
@@ -198,11 +199,17 @@ impl<'d> abi::Fiber<'d> for Task<'_> {
     }
 }
 
+impl stream::Route for Handler<'_> {
+    fn shape(&self) -> stream::Shape {
+        self.0.shape.unwrap_or(stream::Shape::Bidi)
+    }
+}
+
 impl stream::Handler for Handler<'_> {
     type Request<'d> = ();
     type Response = ();
     type Codec = Prost<()>;
-    type Route = ();
+    type Route = Self;
     type Task<'life, 'd>
         = Task<'life>
     where
@@ -210,13 +217,13 @@ impl stream::Handler for Handler<'_> {
         Self: 'life;
 
     fn codec(&self, _: &stream::Request) -> Result<(Self::Codec, Self::Route), Status> {
-        Ok((Prost::new(), ()))
+        Ok((Prost::new(), Self(self.0)))
     }
 
     fn stream<'life, 'd>(
         &'life self,
         _: stream::Request,
-        (): (),
+        _: Self::Route,
     ) -> stream::Call<Self::Task<'life, 'd>>
     where
         'd: 'life,

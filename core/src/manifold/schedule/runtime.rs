@@ -1,18 +1,14 @@
 use std::{cell, marker, ops};
 
-use lanes::entry;
-use o3::{
-    alloc,
-    depot::{array, capacity, queue::indexed::lanes},
-};
+use o3::{alloc, depot::capacity};
 
 use crate::manifold::{
     self,
     schedule::{
         Activation, Block, CONNECTION_WAIT, CONTROL_CONNECTION_WAIT, CONTROL_EGRESS_WAIT,
-        CONTROL_READY, CONTROL_STREAM_WAIT, DATA_READY, Driver, Egress, Error, InsertResult, LANES,
-        Occupied, Records, Report, STREAM_WAIT, Terminal, Turn, Vacant, Wait, Wake, WorkClass,
-        data, drive::Drive, policy::Policy,
+        CONTROL_READY, CONTROL_STREAM_WAIT, DATA_READY, Driver, Egress, InsertResult, Occupied,
+        Records, Report, STREAM_WAIT, Terminal, Turn, Vacant, Wait, Wake, data, drive::Drive,
+        policy::Policy,
     },
 };
 
@@ -21,35 +17,6 @@ pub struct Runtime<K: manifold::raw::Key, T, B: Block> {
     records: Records<K, T>,
     policy: Policy,
     block: marker::PhantomData<cell::Cell<B>>,
-}
-
-fn select<B: Block>(next: Activation<B>) -> Option<(array::Index<LANES>, bool)> {
-    match next {
-        Activation::Keep => None,
-        Activation::Activate {
-            blocked: block,
-            class,
-        } => {
-            let wait = block.map(Block::wait);
-            Some((
-                class.blocked_lane(wait),
-                matches!((class, wait), (WorkClass::Data, Some(Wait::Egress))),
-            ))
-        }
-    }
-}
-
-fn apply<K: manifold::raw::Key, T>(
-    entry: entry::Occupied<'_, K, T, LANES>,
-    (lane, block_data): (array::Index<LANES>, bool),
-    policy: &mut Policy,
-) {
-    if Some(lane) != entry.lane() {
-        entry.move_to_back(lane);
-    }
-    if block_data {
-        policy.block_data();
-    }
 }
 
 impl<K: manifold::raw::Key, T, B: Block> Runtime<K, T, B> {
@@ -68,10 +35,10 @@ impl<K: manifold::raw::Key, T, B: Block> Runtime<K, T, B> {
 
     /// Admits one resident owner and retains its exact queue membership.
     pub fn entry(&mut self, stream: K) -> Option<Occupied<'_, K, T, B>> {
-        self.records
-            .slots
-            .entry(stream)
-            .map(|slot| Occupied::new(slot, ()))
+        Some(Occupied::new(
+            self.records.slots.entry(stream)?,
+            &mut self.policy,
+        ))
     }
 
     pub fn vacant(&mut self, stream: K) -> Option<Vacant<'_, K, T, B>> {
@@ -84,9 +51,7 @@ impl<K: manifold::raw::Key, T, B: Block> Runtime<K, T, B> {
     pub fn try_insert(&mut self, stream: K, value: T, next: Activation<B>) -> InsertResult<K, T> {
         let (vacant, value) = self.records.try_vacant(stream, value)?;
         let entry = vacant.insert(value);
-        if let Some(place) = select(next) {
-            apply(entry, place, &mut self.policy);
-        }
+        Occupied::new(entry, &mut self.policy).activate(next);
         Ok(())
     }
 
@@ -94,37 +59,6 @@ impl<K: manifold::raw::Key, T, B: Block> Runtime<K, T, B> {
     pub fn try_store(&mut self, stream: K, make: impl FnOnce() -> T) -> InsertResult<K, ()> {
         self.records.try_vacant(stream, ())?.0.insert(make());
         Ok(())
-    }
-
-    pub fn transaction<R, E>(
-        &mut self,
-        stream: K,
-        run: impl FnOnce(&mut T) -> Result<(Activation<B>, R), E>,
-    ) -> Result<R, Error<E>> {
-        self.try_apply(stream, (), |value, input| {
-            run(value).map_err(|error| (error, input))
-        })
-        .map_err(|(error, ())| error)
-    }
-
-    /// Runs one resident transaction while preserving an input owner when the
-    /// key is absent or preparation rejects it.
-    pub fn try_apply<I, R, E>(
-        &mut self,
-        stream: K,
-        input: I,
-        run: impl FnOnce(&mut T, I) -> Result<(Activation<B>, R), (E, I)>,
-    ) -> Result<R, (Error<E>, I)> {
-        let mut entry = match self.records.slots.entry(stream) {
-            Some(entry) => entry,
-            None => return Err((Error::Missing, input)),
-        };
-        let (next, result) = run(entry.get_mut(), input)
-            .map_err(|(error, input)| (Error::Rejected(error), input))?;
-        if let Some(place) = select(next) {
-            apply(entry, place, &mut self.policy);
-        }
-        Ok(result)
     }
 
     pub fn wake(&mut self, wake: Wake<K>) -> usize {

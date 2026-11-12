@@ -75,8 +75,9 @@ impl<'a> Types<'a> {
         context: &'a handle::Context<'view, 'source, 'spec>,
         plan: &'a handle::H1Plan<'source, 'spec>,
         dispatch: &'a dispatch::Dispatch,
+        direct: &proc_macro2::TokenStream,
     ) -> proc_macro2::TokenStream {
-        let types = Self::new(paths, context, plan, dispatch);
+        let types = Self::new(paths, context, plan, dispatch, direct);
         let routes = routes::Routes::new(paths, context, plan, &types);
         let methods = route::methods(paths, context, plan, &types);
         let routing = routing::build(paths, &types, &routes, &methods);
@@ -92,9 +93,9 @@ impl<'a> Types<'a> {
         context: &'a handle::Context<'view, 'source, 'spec>,
         plan: &'a handle::H1Plan<'source, 'spec>,
         dispatch: &'a dispatch::Dispatch,
+        direct: &proc_macro2::TokenStream,
     ) -> Self {
         let symbols = &context.plan.spec.state_generics;
-        let [n_bytes] = symbols.locals(["__bytes"]);
         let [n_owners, n_http] = symbols.locals(["__connection_tasks", "__http"]);
         let [n_run, n_snap] = symbols.locals(["__runtime", "__snapshot"]);
         let [v_link, v_wait] = symbols.locals(["connection", "pending"]);
@@ -187,7 +188,7 @@ impl<'a> Types<'a> {
                         >
                     };
                     (
-                        quote!(#app #g_h2a: #ns_core::manifold::server::app::Spec, #g_h2f,),
+                        quote!(#app #g_h2a: #ns_h2::server::app::Spec, #g_h2f,),
                         app_use(quote!((#stamp, #h2))),
                     )
                 })
@@ -425,16 +426,14 @@ impl<'a> Types<'a> {
                     .audit(|#v_wait| match #v_wait.route { #( #heads )* }, |_| 0,
                         |#v_wait| match #v_wait { #( #lengths )* })
                     .task(#n_owners, #n_owners, 0)
-                    .owners(#n_run.owners())
+                    .owners(#n_owners)
                     .stage_bytes(#n_run.staged_bytes())
                     .conn_ready(0)
                     .wire_bytes(
                         #v_link.response_len(),
                     );
-                if let ::core::option::Option::Some(#n_bytes) =
-                    #n_run.cleared()
-                {
-                    #n_snap = #n_snap.owner_bytes(#n_bytes);
+                if #n_owners == 0 {
+                    #n_snap = #n_snap.owner_bytes(0);
                 }
                 #n_snap
             }
@@ -445,7 +444,7 @@ impl<'a> Types<'a> {
                 #probe
             }
         };
-        let task_methods = drive::methods(paths, context, &view, bound);
+        let task_methods = drive::methods(paths, context, direct, &view, bound);
         Self {
             task_methods,
             names: Names {

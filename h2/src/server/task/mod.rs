@@ -1,4 +1,5 @@
 //! Generated-task HTTP/2 execution with pre-FIN request construction.
+use crate::server::app as semantic;
 
 use core::convert::Infallible;
 
@@ -17,7 +18,7 @@ use o3::{
 use sark_core::{
     body, decode, duplex, life,
     life::{exchange, mode, owners},
-    manifold::{schedule::typed, server::app as semantic, task::app::Runtime},
+    manifold::{schedule::typed, task::app::Runtime},
 };
 use sark_http::owner::{self, cause};
 

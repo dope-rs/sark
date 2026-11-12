@@ -1,3 +1,4 @@
+use crate::server::app::{self, Spec};
 use std::{convert::Infallible, fmt, pin};
 
 use dope::{
@@ -16,14 +17,7 @@ use dope::{
     },
 };
 use o3::base::Call;
-use sark_core::{
-    decode::request,
-    life,
-    manifold::{
-        server::app::{self, Spec},
-        task::app::Runtime,
-    },
-};
+use sark_core::{decode::request, life, manifold::task::app::Runtime};
 
 use crate::{
     frame::numbers,
@@ -121,8 +115,7 @@ where
     R: Runtime<'d>,
     <R::Head as request::Head>::Start: task::works::Family,
     W: Execution + 'd,
-    A: task::service::Select<R>
-        + app::Timed<'d, task::service::Connection<'d, A>, conn::Id<'d, ID>>,
+    A: task::service::Select<R> + app::Timed<'d, crate::conn::event::Retirement, conn::Id<'d, ID>>,
     task::App<'d, ID, R, W, M, D, Self, A>: Application<'d, ID, Wire = W>,
     F: for<'a> FnMut(Failure<'a, 'w, 'd, W, ID, A::Failure, task::Build<A::Build>>),
 {
@@ -170,15 +163,11 @@ pub(in crate::server) trait Fault<'d, W: wire::Spec, E, ID: Identity, B> {
 
     fn output(&mut self, id: conn::Id<'d, ID>, cause: output::Failure);
 
-    fn diagnostic(&mut self, id: conn::Id<'d, ID>, cause: app::Error<crate::conn::Error, E>);
+    fn diagnostic(&mut self, id: conn::Id<'d, ID>, cause: app::Error<E>);
 
     fn response(&mut self) -> impl FnMut(conn::Id<'d, ID>, crate::stream::Key, &dyn fmt::Debug);
 
-    fn failed(
-        &mut self,
-        id: conn::Id<'d, ID>,
-        cause: app::Error<crate::conn::Error, E>,
-    ) -> numbers::ErrorCode;
+    fn failed(&mut self, id: conn::Id<'d, ID>, cause: app::Error<E>) -> numbers::ErrorCode;
 }
 
 impl<'d, W: wire::Spec, E, ID: Identity, B> Fault<'d, W, E, ID, B> for failures::Close {
@@ -188,7 +177,7 @@ impl<'d, W: wire::Spec, E, ID: Identity, B> Fault<'d, W, E, ID, B> for failures:
 
     fn output(&mut self, _: conn::Id<'d, ID>, _: output::Failure) {}
 
-    fn diagnostic(&mut self, _: conn::Id<'d, ID>, cause: app::Error<crate::conn::Error, E>) {
+    fn diagnostic(&mut self, _: conn::Id<'d, ID>, cause: app::Error<E>) {
         drop(cause);
     }
 
@@ -196,11 +185,7 @@ impl<'d, W: wire::Spec, E, ID: Identity, B> Fault<'d, W, E, ID, B> for failures:
         |_, _, _| {}
     }
 
-    fn failed(
-        &mut self,
-        _: conn::Id<'d, ID>,
-        cause: app::Error<crate::conn::Error, E>,
-    ) -> numbers::ErrorCode {
+    fn failed(&mut self, _: conn::Id<'d, ID>, cause: app::Error<E>) -> numbers::ErrorCode {
         match cause {
             app::Error::Connection(cause) => cause.code(),
             app::Error::Application(_) => numbers::ErrorCode::InternalError,
@@ -221,7 +206,7 @@ where
         (self.0)(Failure::Output { id, cause });
     }
 
-    fn diagnostic(&mut self, id: conn::Id<'d, ID>, cause: app::Error<crate::conn::Error, E>) {
+    fn diagnostic(&mut self, id: conn::Id<'d, ID>, cause: app::Error<E>) {
         (self.0)(Failure::Diagnostic { id, cause });
     }
 
@@ -229,11 +214,7 @@ where
         move |id, stream, cause| (self.0)(Failure::Response { id, stream, cause })
     }
 
-    fn failed(
-        &mut self,
-        id: conn::Id<'d, ID>,
-        cause: app::Error<crate::conn::Error, E>,
-    ) -> numbers::ErrorCode {
+    fn failed(&mut self, id: conn::Id<'d, ID>, cause: app::Error<E>) -> numbers::ErrorCode {
         let code = match &cause {
             app::Error::Connection(cause) => numbers::ErrorCode::from(cause),
             app::Error::Application(_) => numbers::ErrorCode::InternalError,

@@ -24,6 +24,7 @@ use crate::{
     frame,
 };
 
+pub mod app;
 pub(crate) mod payload;
 #[doc(hidden)]
 pub mod response;

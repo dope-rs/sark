@@ -193,10 +193,15 @@ impl<'state, P: Peer> Admission<'state, P> {
         Ok(match self.kind {
             Kind::Data(proof) => {
                 let proof = self.inbound.fragments.prepare(proof, data)?;
-                Prepared::Ready(Ready {
-                    pending: Pending::new(&mut self.inbound.pending_end),
-                    kind: ReadyKind::Data(proof),
-                })
+                let pending = Pending::new(&mut self.inbound.pending_end);
+                match proof {
+                    fragment::Prepared::Message(complete) => {
+                        Prepared::Message(Message { pending, complete })
+                    }
+                    fragment::Prepared::Fragment(partial) => {
+                        Prepared::Fragment(Fragment { pending, partial })
+                    }
+                }
             }
             Kind::Close => Prepared::Required(Required {
                 inbound: self.inbound,
@@ -206,9 +211,9 @@ impl<'state, P: Peer> Admission<'state, P> {
                 inbound: self.inbound,
                 kind: Event::Ping(data),
             }),
-            Kind::Pong => Prepared::Ready(Ready {
+            Kind::Pong => Prepared::Pong(Pong {
                 pending: Pending::new(&mut self.inbound.pending_end),
-                kind: ReadyKind::Pong(data),
+                payload: data,
             }),
         })
     }
@@ -220,51 +225,16 @@ impl Admission<'_, ClientPeer> {
     }
 }
 
-pub enum ReadyEvent<'payload> {
-    Data(fragment::Push<'payload>),
-    Pong(&'payload [u8]),
-}
-
 /// A fully validated frame awaiting its causal commit edge.
 pub enum Prepared<'state, 'payload, P> {
-    Ready(Ready<'state, 'payload, P>),
+    Message(Message<'state, 'payload, P>),
+    Fragment(Fragment<'state, 'payload, P>),
+    Pong(Pong<'state, 'payload, P>),
     Required(Required<'state, 'payload, P>),
 }
 
-impl<'state, 'payload, P> Prepared<'state, 'payload, P> {
-    /// Splits this prepared frame exactly once into the causal path it owns: the
-    /// admission that completed a message carries the exact bounded length into
-    /// [`Message`], and neither path re-derives completeness.
-    pub(crate) fn split(self) -> Split<'state, 'payload, P> {
-        match self {
-            Self::Ready(Ready {
-                pending,
-                kind: ReadyKind::Data(proof),
-            }) => match proof {
-                fragment::Prepared::Message(complete) => {
-                    Split::Message(Message { pending, complete })
-                }
-                fragment::Prepared::Fragment(partial) => {
-                    Split::Control(Control::Fragment(pending, partial))
-                }
-            },
-            Self::Ready(Ready {
-                pending,
-                kind: ReadyKind::Pong(_),
-            }) => Split::Control(Control::Pong(pending)),
-            Self::Required(need) => Split::Control(Control::Required(need)),
-        }
-    }
-}
-
-/// One prepared frame split into the single causal path it can commit.
-pub(crate) enum Split<'state, 'payload, P> {
-    Message(Message<'state, 'payload, P>),
-    Control(Control<'state, 'payload, P>),
-}
-
-/// A data frame that completes exactly one message of [`Message::len`] bytes.
-pub(crate) struct Message<'state, 'payload, P> {
+/// A validated complete message awaiting output admission.
+pub struct Message<'state, 'payload, P> {
     pending: Pending<'state, P>,
     complete: fragment::Ready<'state, 'payload>,
 }
@@ -276,49 +246,10 @@ impl<'payload, P: Peer> Message<'_, 'payload, P> {
     }
 
     /// Commits the message its own admission already bounded.
-    pub(crate) fn commit(self) -> fragment::Message<'payload> {
+    pub fn commit(self) -> fragment::Message<'payload> {
         let message = self.complete.commit();
         self.pending.settle();
         message
-    }
-}
-
-/// Every prepared frame that is not a complete data message.
-pub(crate) enum Control<'state, 'payload, P> {
-    /// A data fragment that awaits more input.
-    Fragment(Pending<'state, P>, fragment::Pending<'state, 'payload>),
-    /// A pong ready to commit; its payload stays owned by the inbound state.
-    Pong(Pending<'state, P>),
-    /// A mandatory close or ping that commits only with its staged reply.
-    Required(Required<'state, 'payload, P>),
-}
-
-impl<'payload, P: Peer> Control<'_, 'payload, P> {
-    /// Commits a mandatory frame only with proof minted by the live response
-    /// sink that staged its exact reply.
-    pub(crate) fn commit_with<E>(
-        self,
-        send: impl for<'reply> FnOnce(Request<'reply, 'payload>) -> Result<Receipt<'reply, 'payload>, E>,
-    ) -> Result<ops::ControlFlow<()>, E> {
-        let pending = match self {
-            Self::Fragment(pending, partial) => {
-                partial.commit();
-                pending
-            }
-            Self::Pong(pending) => pending,
-            Self::Required(need) => {
-                let reply = need.reply();
-                send(Request { reply: &reply })?;
-                let event = need.kind;
-                need.inbound.settle();
-                return Ok(match event {
-                    Event::Close(_) => ops::ControlFlow::Break(()),
-                    Event::Ping(_) => ops::ControlFlow::Continue(()),
-                });
-            }
-        };
-        pending.settle();
-        Ok(ops::ControlFlow::Continue(()))
     }
 }
 
@@ -386,19 +317,27 @@ impl<'state, P> Pending<'state, P> {
     }
 }
 
-pub struct Ready<'state, 'payload, P> {
+pub struct Fragment<'state, 'payload, P> {
     pending: Pending<'state, P>,
-    kind: ReadyKind<'state, 'payload>,
+    partial: fragment::Pending<'state, 'payload>,
 }
 
-impl<'payload, P: Peer> Ready<'_, 'payload, P> {
-    pub fn commit(self) -> ReadyEvent<'payload> {
-        let event = match self.kind {
-            ReadyKind::Data(proof) => ReadyEvent::Data(proof.commit()),
-            ReadyKind::Pong(data) => ReadyEvent::Pong(data),
-        };
+impl<P: Peer> Fragment<'_, '_, P> {
+    pub fn commit(self) {
+        self.partial.commit();
         self.pending.settle();
-        event
+    }
+}
+
+pub struct Pong<'state, 'payload, P> {
+    pending: Pending<'state, P>,
+    payload: &'payload [u8],
+}
+
+impl<'payload, P: Peer> Pong<'_, 'payload, P> {
+    pub fn commit(self) -> &'payload [u8] {
+        self.pending.settle();
+        self.payload
     }
 }
 
@@ -419,6 +358,16 @@ pub enum Event<'payload> {
 }
 
 impl<'payload, P: Peer> Required<'_, 'payload, P> {
+    pub(crate) fn commit_with<E>(
+        self,
+        send: impl for<'reply> FnOnce(Request<'reply, 'payload>) -> Result<Receipt<'reply, 'payload>, E>,
+    ) -> Result<Event<'payload>, E> {
+        let reply = self.reply();
+        send(Request { reply: &reply })?;
+        self.inbound.settle();
+        Ok(self.kind)
+    }
+
     pub(crate) fn reply(&self) -> Reply<'payload> {
         match &self.kind {
             Event::Close(close) => Reply {
@@ -441,9 +390,4 @@ impl<'payload, P: Peer> Required<'_, 'payload, P> {
             event: self.kind,
         }
     }
-}
-
-enum ReadyKind<'state, 'payload> {
-    Data(fragment::Prepared<'state, 'payload>),
-    Pong(&'payload [u8]),
 }

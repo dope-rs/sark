@@ -1,11 +1,11 @@
 //! Typed HTTP/2 listener topology.
 
+use crate::server::app::Spec;
 use dope::{
     manifold::network::listener::conn::{Ctx, Id},
     net::link::egress::data,
 };
 use o3::buffer::resident;
-use sark_core::manifold::server::app::Spec;
 use sark_http::field::metadata::section::rules;
 
 use crate::conn::{self, event, machine};
@@ -28,12 +28,12 @@ pub use plan::{
 };
 pub use recipe::Recipe;
 
-pub type Connection<'d, A> = machine::Connection<
+pub type Connection<'d, A, E = event::Ignore> = machine::Connection<
     crate::ServerRole,
     <A as Spec>::Fields,
     resident::Shared<'d>,
     rules::RejectPush,
-    event::Ignore,
+    E,
 >;
 
 type Context<'e, 'a, 'p, 's, 'w, 'd, ID, A, W, E> = Ctx<

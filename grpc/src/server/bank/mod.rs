@@ -10,7 +10,7 @@ use o3::{
     alloc::array,
     depot::{capacity::Count, index},
 };
-use sark_core::manifold::server::app;
+use sark_h2::server::app;
 
 use crate::server::{
     config,

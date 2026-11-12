@@ -9,6 +9,7 @@ use crate::{
 pub(super) fn methods(
     paths: &Paths,
     ctx: &handle::Context<'_, '_, '_>,
+    ty: &TokenStream,
     slot: &TokenStream,
     bound: &TokenStream,
 ) -> TokenStream {
@@ -25,7 +26,6 @@ pub(super) fn methods(
     let phase = flat::name(spec, false);
     let projection = quote::format_ident!("{}Projection", phase);
     let event = quote::format_ident!("{}Event", phase);
-    let ty = flat::build(paths, spec, ctx.exec, false).ty;
     let live = quote!(#ns::dope_fiber::task::storage::fixed::Id<#brand, 'd, #id>);
     let ended = quote!(#ns::dope_fiber::task::storage::fixed::Id<#brand, 'd, #id, #ns::dope_fiber::task::storage::fixed::local::Ended>);
     let count = ctx

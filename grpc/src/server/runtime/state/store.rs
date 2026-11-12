@@ -1,46 +1,71 @@
 use dope::core::driver::schedule::clock;
 use o3::{
     base::time::Positive,
-    buffer::{resident, segments, storage},
-    depot::{capacity, index::set},
+    buffer::{resident, segments},
+    depot::{capacity, index::set, queue::pool},
 };
+use sark_core::manifold::server::Connection as _;
 use sark_core::{
     deadline::{self, Book},
-    manifold::{self, client::event::Reset, schedule, server, server::app::Capacity},
+    manifold::{self, client::event::Reset},
 };
-use sark_h2::stream::Key;
+use sark_h2::{
+    conn::{self, event},
+    server::app::Capacity,
+    stream::Key,
+};
 
 use crate::server::{
-    Bank, Lease, calls, egress,
+    Bank, Lease, call, calls, egress,
     runtime::{
+        Connection,
         run::Fault,
         state::{self, active, lanes},
     },
     service::timers,
 };
 
-pub struct Store<'r, 'd, T, P: timers::Policy, S>
-where
-    S: server::Connection<Key = Key, Owner = resident::Shared<'d>, Output = storage::Shared>,
-{
+pub struct Store<'r, 'd, T, P: timers::Policy> {
     pub(in crate::server::runtime) calls:
-        calls::Store<'r, T, resident::Shared<'d>, S::Permit, S::Block>,
-    pub(in crate::server::runtime) egress: egress::Store<Key>,
+        calls::Store<'r, T, resident::Shared<'d>, event::Permit, conn::DataBlock>,
+    pub(in crate::server::runtime) egress: egress::Store,
     pub(in crate::server::runtime) segments: segments::Pool<resident::Shared<'d>>,
     pub(in crate::server::runtime) output_deadlines: P::State<'r, 'd>,
     pub(in crate::server::runtime) work: lanes::Schedule,
     pub(in crate::server::runtime) egress_released: bool,
-    deadline_capacity: capacity::Count,
-    call_deadlines: Option<deadline::Exact<Key, clock::Deadline<'d>>>,
+    pub(in crate::server::runtime) deadline_capacity: capacity::Count,
+    pub(in crate::server::runtime) call_deadlines:
+        Option<deadline::Exact<Key, clock::Deadline<'d>>>,
     pub(in crate::server::runtime) active: Lease<'r>,
 }
 
-impl<'r, 'd, T, P, S> Store<'r, 'd, T, P, S>
+pub(in crate::server::runtime) fn try_deadline<'d>(
+    book: &mut Option<deadline::Exact<Key, clock::Deadline<'d>>>,
+    capacity: capacity::Count,
+    stream: Key,
+    now: clock::Moment<'d>,
+    timeout: Positive,
+) -> Result<(), crate::Status> {
+    let at = now.try_add(timeout.get())?;
+    let book = match book {
+        Some(book) => book,
+        slot @ None => slot.insert(deadline::Exact::try_new(capacity)?),
+    };
+    book.schedule(
+        stream,
+        deadline::Scheduled::expire(at, deadline::Phase::Total),
+    )?;
+    Ok(())
+}
+
+impl<'r, 'd, T, P> Store<'r, 'd, T, P>
 where
     P: state::Timing<'d>,
-    S: server::Connection<Key = Key, Owner = resident::Shared<'d>, Output = storage::Shared>,
 {
-    pub(in crate::server::runtime) fn retire(&mut self, conn: &mut S) {
+    pub(in crate::server::runtime) fn retire<E: event::Evidence>(
+        &mut self,
+        conn: &mut Connection<'d, E>,
+    ) {
         for index in 0..self.calls.capacity() {
             let Some(stream) = self.calls.key_at(index) else {
                 continue;
@@ -50,7 +75,7 @@ where
         self.egress_released = false;
     }
 
-    fn remove(&mut self, conn: &mut S, stream: Key) {
+    fn remove<E: event::Evidence>(&mut self, conn: &mut Connection<'d, E>, stream: Key) {
         match self.egress.remove(stream, conn) {
             Ok(released) => self.release(released),
             Err(
@@ -64,7 +89,7 @@ where
         self.remove_call(conn, stream);
     }
 
-    fn release(&mut self, released: egress::Release) {
+    pub(in crate::server::runtime) fn release(&mut self, released: egress::Release) {
         if released.prepared {
             self.calls.wake_egress();
         }
@@ -73,7 +98,7 @@ where
         }
     }
 
-    fn remove_call(&mut self, conn: &mut S, stream: Key) {
+    fn remove_call<E: event::Evidence>(&mut self, conn: &mut Connection<'d, E>, stream: Key) {
         self.cancel_time(stream);
         match self.calls.try_remove(stream) {
             Ok(()) => {}
@@ -90,6 +115,7 @@ where
     pub(in crate::server::runtime) fn try_new(
         bank: &'r Bank,
         cap: Capacity,
+        messages: pool::Plan,
     ) -> Result<Self, state::Error> {
         let active = bank.try_take(cap)?;
         let times = P::try_new(cap.streams()).map_err(state::Error::Deadlines)?;
@@ -98,7 +124,7 @@ where
         let output = limits.output();
         let chunks = capacity::Count::new(cap.data());
         Ok(Self {
-            calls: calls::Store::try_new(cap.streams(), chunks, input.count())
+            calls: calls::Store::try_new(cap.streams(), chunks, messages)
                 .map_err(state::Error::Storage)?,
             egress: egress::Store::try_new(
                 cap.streams(),
@@ -119,24 +145,6 @@ where
             call_deadlines: None,
             active,
         })
-    }
-
-    pub(in crate::server::runtime) fn try_deadline(
-        &mut self,
-        stream: Key,
-        now: clock::Moment<'d>,
-        timeout: Positive,
-    ) -> Result<(), crate::Status> {
-        let at = now.try_add(timeout.get())?;
-        let book = match &mut self.call_deadlines {
-            Some(book) => book,
-            slot @ None => slot.insert(deadline::Exact::try_new(self.deadline_capacity)?),
-        };
-        book.schedule(
-            stream,
-            deadline::Scheduled::expire(at, deadline::Phase::Total),
-        )?;
-        Ok(())
     }
 
     pub(in crate::server::runtime) fn deadline(&self) -> Option<clock::Deadline<'d>> {
@@ -164,7 +172,11 @@ where
 
     /// Ends the application half of a call while preserving any already
     /// committed response owner until the egress driver releases it.
-    pub(in crate::server::runtime) fn complete(&mut self, conn: &mut S, entry: active::Entry<'r>) {
+    pub(in crate::server::runtime) fn complete<E: event::Evidence>(
+        &mut self,
+        conn: &mut Connection<'d, E>,
+        entry: active::Entry<'r>,
+    ) {
         let stream = entry.key();
         match self.calls.complete(stream) {
             Ok(()) => {}
@@ -219,7 +231,11 @@ where
         self.calls.entry_at(active.pop::<0>()?.index().raw())
     }
 
-    pub(in crate::server::runtime) fn discard(&mut self, entry: active::Entry<'r>, conn: &mut S) {
+    pub(in crate::server::runtime) fn discard<E: event::Evidence>(
+        &mut self,
+        entry: active::Entry<'r>,
+        conn: &mut Connection<'d, E>,
+    ) {
         let stream = entry.key();
         if self.calls.key_at(manifold::raw::Key::slot(stream)) != Some(stream) {
             return;
@@ -228,54 +244,12 @@ where
         self.remove(conn, stream);
     }
 
-    pub(in crate::server::runtime) fn drive<H>(
+    pub(in crate::server::runtime) fn send_error<E: event::Evidence>(
         &mut self,
-        conn: &mut S,
-        egress: schedule::Egress,
-        context: &mut H,
-        notify: impl FnMut(&mut H, schedule::Wake<Key>),
-        active: &active::Signals,
-        sink: &mut impl FnMut(&mut H, Key, egress::Error<S::Error>),
-        mut cancel: impl FnMut(active::Entry<'r>, &mut T),
-    ) -> (schedule::Report, active::Edge) {
-        let times = &mut self.output_deadlines;
-        let book = &mut self.call_deadlines;
-        let (report, released) = self.calls.drive(
-            &mut self.egress,
-            conn,
-            egress,
-            context,
-            notify,
-            sink,
-            |record| {
-                let entry = record.entry;
-                if let Some(book) = book {
-                    book.cancel(entry.key());
-                }
-                P::cancel(times, entry);
-                if let Some(call) = record.active() {
-                    cancel(entry, &mut call.handler);
-                }
-            },
-        );
-        self.release(released);
-        let edge = if active
-            .blocked(self.work.waiting, self.work.retries)
-            .is_some()
-        {
-            active::Edge::Wake
-        } else {
-            active::Edge::None
-        };
-        (report, edge)
-    }
-
-    pub(in crate::server::runtime) fn send_error(
-        &mut self,
-        conn: &mut S,
+        conn: &mut Connection<'d, E>,
         status: crate::Status,
         entry: active::Entry<'r>,
-        sink: &mut impl FnMut(Key, egress::Error<S::Error>),
+        sink: &mut impl FnMut(Key, egress::Error<conn::Error>),
     ) {
         let stream = entry.key();
         match self.calls.key_at(manifold::raw::Key::slot(stream)) {
@@ -283,12 +257,13 @@ where
                 return conn.reset(stream, Reset::Internal);
             }
             Some(_) => {}
-            None => {
-                if let Err(error) = self.calls.try_reserve(entry) {
+            None => match self.calls.try_reserve(entry) {
+                Ok(vacant) => vacant.store(call::State::reserved(entry), None),
+                Err(error) => {
                     conn.reset(stream, Reset::Internal);
                     return sink(stream, egress::Error::Fault(Fault::Response(error.into())));
                 }
-            }
+            },
         }
         self.cancel_time(stream);
         P::cancel(&mut self.output_deadlines, entry);

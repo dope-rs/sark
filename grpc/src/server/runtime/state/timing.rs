@@ -1,13 +1,9 @@
 use dope::core::driver::schedule::clock;
-use o3::{
-    buffer::{resident, storage},
-    depot::{
-        capacity::Count,
-        heap::{self, keyed},
-    },
+use o3::depot::{
+    capacity::Count,
+    heap::{self, keyed},
 };
-use sark_core::manifold::{schedule::Quiescence, server};
-use sark_h2::stream::Key;
+use sark_core::manifold::schedule::Quiescence;
 
 use crate::server::{
     runtime::state::{self, active},
@@ -17,10 +13,7 @@ use crate::server::{
 pub trait Timing<'d>: timers::Policy {
     fn try_new<'r>(cap: Count) -> Result<Self::State<'r, 'd>, heap::Error>;
 
-    fn is_quiescent<T, S>(state: &state::Store<'_, 'd, T, Self, S>) -> bool
-    where
-        S: server::Connection<Key = Key, Owner = resident::Shared<'d>, Output = storage::Shared>,
-    {
+    fn is_quiescent<T>(state: &state::Store<'_, 'd, T, Self>) -> bool {
         state.calls.is_quiescent()
             && state.egress.is_quiescent()
             && state.active.get().is_quiescent()
@@ -28,9 +21,7 @@ pub trait Timing<'d>: timers::Policy {
             && state.deadline().is_none()
     }
 
-    fn activity<T, S>(state: &state::Store<'_, 'd, T, Self, S>) -> Quiescence
-    where
-        S: server::Connection<Key = Key, Owner = resident::Shared<'d>, Output = storage::Shared>;
+    fn activity<T>(state: &state::Store<'_, 'd, T, Self>) -> Quiescence;
 
     fn timers<'a, 'r>(
         times: &'a mut <Self as timers::Policy>::State<'r, 'd>,
@@ -51,10 +42,7 @@ impl<'d> Timing<'d> for timers::Off {
         Ok(())
     }
 
-    fn activity<T, S>(state: &state::Store<'_, 'd, T, Self, S>) -> Quiescence
-    where
-        S: server::Connection<Key = Key, Owner = resident::Shared<'d>, Output = storage::Shared>,
-    {
+    fn activity<T>(state: &state::Store<'_, 'd, T, Self>) -> Quiescence {
         if Self::is_quiescent(state) {
             Quiescence::Quiet
         } else {
@@ -80,10 +68,7 @@ impl<'d> Timing<'d> for timers::On {
         })
     }
 
-    fn activity<T, S>(state: &state::Store<'_, 'd, T, Self, S>) -> Quiescence
-    where
-        S: server::Connection<Key = Key, Owner = resident::Shared<'d>, Output = storage::Shared>,
-    {
+    fn activity<T>(state: &state::Store<'_, 'd, T, Self>) -> Quiescence {
         if Self::is_quiescent(state) && state.output_deadlines.is_empty() {
             Quiescence::Quiet
         } else {

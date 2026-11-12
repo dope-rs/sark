@@ -1,4 +1,5 @@
 //! Static host for protocol-independent server applications.
+use crate::server::app::{self, Spec};
 use dope::core::{driver::route::Identity, random};
 use sark_http::payload::compress::dynamic::hash;
 
@@ -26,21 +27,15 @@ pub use report::Report;
 pub(in crate::server) use report::{Fault, response};
 use sark_core::{
     life::mode,
-    manifold::{
-        schedule,
-        server::{
-            app::{self, Spec},
-            drain,
-        },
-    },
+    manifold::{schedule, server::drain},
 };
 
 use crate::{
-    conn::{Error, config, ingress::PrefacePhase, preface},
+    conn::{config, ingress::PrefacePhase, preface},
     server::{
         self,
         runtime::{
-            self, Connection, Context,
+            self, Context,
             input::{self, Read, Turn},
             modes::Deadline,
             output::{
@@ -100,7 +95,7 @@ impl<'d, A: Spec, W: wire::Spec, F, E: data::raw::Payload<'d>> App<'d, A, W, F, 
         _: preface::Complete,
     ) -> Result<State<'d, A, conn::Id<'d, ID>>, runtime::Build<A::Build>>
     where
-        A: app::Application<'d, Connection<'d, A>, conn::Id<'d, ID>>,
+        A: app::Application<'d, crate::conn::event::Ignore, conn::Id<'d, ID>>,
     {
         State::try_new(
             &self.app,
@@ -117,10 +112,10 @@ impl<'d, A: Spec, W: wire::Spec, F, E: data::raw::Payload<'d>> App<'d, A, W, F, 
         driver: &mut driver::Context<'_, 'd>,
         mut egress: schedule::Egress,
         source: Option<&mut Turn<'_, 'w, 'd, W>>,
-    ) -> Result<drain::Progress, app::Error<Error, A::Failure>>
+    ) -> Result<drain::Progress, app::Error<A::Failure>>
     where
         'd: 'w,
-        A: app::Application<'d, Connection<'d, A>, conn::Id<'d, ID>>,
+        A: app::Application<'d, crate::conn::event::Ignore, conn::Id<'d, ID>>,
         F: Fault<'d, W, A::Failure, ID, runtime::Build<A::Build>>,
     {
         let owner = conn.id();
@@ -161,9 +156,9 @@ impl<'d, A: Spec, W: wire::Spec, F, E: data::raw::Payload<'d>> App<'d, A, W, F, 
         &mut self,
         conn: &mut Context<'_, '_, '_, '_, '_, 'd, ID, A, W, E>,
         driver: &mut driver::Context<'_, 'd>,
-        error: app::Error<Error, A::Failure>,
+        error: app::Error<A::Failure>,
     ) where
-        A: app::Application<'d, Connection<'d, A>, conn::Id<'d, ID>>,
+        A: app::Application<'d, crate::conn::event::Ignore, conn::Id<'d, ID>>,
         F: Fault<'d, W, A::Failure, ID, runtime::Build<A::Build>>,
         E: Evidence<'d>,
     {
@@ -190,7 +185,7 @@ impl<'d, A: Spec, W: wire::Spec, F, E: data::raw::Payload<'d>> App<'d, A, W, F, 
         mut source: Option<Turn<'_, 'w, 'd, W>>,
     ) where
         'd: 'w,
-        A: app::Application<'d, Connection<'d, A>, conn::Id<'d, ID>>,
+        A: app::Application<'d, crate::conn::event::Ignore, conn::Id<'d, ID>>,
         F: Fault<'d, W, A::Failure, ID, runtime::Build<A::Build>>,
         E: Evidence<'d>,
         T: Deadline<'d, ID, A, W, F, E>,
@@ -215,7 +210,7 @@ impl<A: Spec, W: wire::Spec, F, E> Unpin for App<'_, A, W, F, E> {}
 
 impl<'d, ID: Identity, A, W, F, E> handler::Application<'d, ID> for App<'d, A, W, F, E>
 where
-    A: app::Application<'d, Connection<'d, A>, conn::Id<'d, ID>>,
+    A: app::Application<'d, crate::conn::event::Ignore, conn::Id<'d, ID>>,
     F: Fault<'d, W, A::Failure, ID, runtime::Build<A::Build>>,
     A::Timing: Deadline<'d, ID, A, W, F, E>,
     E: Evidence<'d> + 'd,
@@ -331,7 +326,7 @@ where
 
 impl<'d, ID: Identity, A, W, F, E> send::Drive<'d, ID> for App<'d, A, W, F, E>
 where
-    A: app::Application<'d, Connection<'d, A>, conn::Id<'d, ID>>,
+    A: app::Application<'d, crate::conn::event::Ignore, conn::Id<'d, ID>>,
     F: Fault<'d, W, A::Failure, ID, runtime::Build<A::Build>>,
     A::Timing: Deadline<'d, ID, A, W, F, E>,
     E: Evidence<'d> + 'd,
@@ -354,7 +349,7 @@ where
 
 impl<'w, 'd: 'w, ID: Identity, A, W, F, E> handler::Scoped<'w, 'd, ID> for App<'d, A, W, F, E>
 where
-    A: app::Application<'d, Connection<'d, A>, conn::Id<'d, ID>>,
+    A: app::Application<'d, crate::conn::event::Ignore, conn::Id<'d, ID>>,
     F: Fault<'d, W, A::Failure, ID, runtime::Build<A::Build>>,
     A::Timing: Deadline<'d, ID, A, W, F, E>,
     E: Evidence<'d> + 'd,

@@ -44,19 +44,8 @@ impl From<str::Utf8Error> for Utf8 {
     }
 }
 
-pub enum Push<'a> {
-    DirectText(&'a str),
-    DirectBinary(&'a [u8]),
-    AssembledText(String),
-    AssembledBinary(Vec<u8>),
-    NeedMore,
-}
-
 /// One message committed by the frame whose admission already bounded it.
-///
-/// [`Push::NeedMore`] cannot be represented here: a value of this type exists
-/// only for a frame that completed a message.
-pub(crate) enum Message<'a> {
+pub enum Message<'a> {
     WholeText(&'a str),
     WholeBinary(&'a [u8]),
     JoinedText(String),
@@ -212,23 +201,6 @@ impl Complete {
 pub(crate) enum Prepared<'state, 'payload> {
     Message(Ready<'state, 'payload>),
     Fragment(Pending<'state, 'payload>),
-}
-
-impl<'payload> Prepared<'_, 'payload> {
-    pub(crate) fn commit(self) -> Push<'payload> {
-        match self {
-            Self::Message(message) => match message.commit() {
-                Message::WholeText(text) => Push::DirectText(text),
-                Message::WholeBinary(data) => Push::DirectBinary(data),
-                Message::JoinedText(text) => Push::AssembledText(text),
-                Message::JoinedBinary(data) => Push::AssembledBinary(data),
-            },
-            Self::Fragment(fragment) => {
-                fragment.commit();
-                Push::NeedMore
-            }
-        }
-    }
 }
 
 /// A validated completion retains the source and any fragment owner until commit.

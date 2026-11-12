@@ -1,6 +1,6 @@
 use std::cell::Cell;
 
-use o3::{base::cell::region, depot::arena::slab::key};
+use o3::depot::arena::slab::key;
 use sark_core::manifold::schedule;
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum Blocked {
@@ -40,15 +40,15 @@ impl schedule::Settle<Box<usize>> for Reject<'_> {
     fn settle(
         &mut self,
         _: Self::Key,
-        value: Box<usize>,
+        value: &mut Box<usize>,
         terminal: schedule::Terminal<usize>,
-    ) -> schedule::Settlement<Box<usize>> {
+    ) -> schedule::Settlement<()> {
         self.repeat |= self
             .settled
-            .replace((*value, self.calls, terminal, self.dropped.get()))
+            .replace((**value, self.calls, terminal, self.dropped.get()))
             .is_some();
         if self.retain {
-            schedule::Settlement::Keep(value)
+            schedule::Settlement::Keep(())
         } else {
             schedule::Settlement::Remove
         }
@@ -63,17 +63,15 @@ impl<'a> schedule::Driver<Box<usize>> for Reject<'a> {
         (self.calls == 0).then(|| Permit(self.dropped))
     }
 
-    fn control<'id>(
+    fn control(
         &mut self,
         permit: Self::Permit,
-        entry: schedule::Occupied<'_, Self::Key, Box<usize>, Blocked, region::Identity<'id>>,
-    ) -> schedule::Decision<'id, Self::Key> {
-        entry.borrowed(self, |driver, _, _| {
-            let permit = permit;
-            driver.calls += 1;
-            driver.live = !permit.0.get();
-            Err(13)
-        })
+        _: Self::Key,
+        _: &mut Box<usize>,
+    ) -> Result<schedule::ControlTurn<Blocked>, usize> {
+        self.calls += 1;
+        self.live = !permit.0.get();
+        Err(13)
     }
 
     fn data(

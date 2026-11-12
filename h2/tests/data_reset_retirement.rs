@@ -71,36 +71,44 @@ fn retires_rejected_data() {
 }
 
 #[test]
-fn releases_before_notify() {
-    let (_, mut server, id) = Upload::new(Config::default())
-        .try_connect()
-        .expect("upload");
-    server
-        .streams()
-        .headers()
-        .respond(id, RESPONSE_OK, Boundary::More)
-        .expect("response");
-    server.transfer().drain(usize::MAX);
-    let credit = server.status().send_window();
-    let pool = Pool::try_new(1, RETAINED_BODY.len()).expect("body pool");
-    let mut slot = pool.acquire().expect("body slot");
-    slot.try_append(&RETAINED_BODY).expect("body fits").commit();
-    let body = slot.freeze().into_shared();
-    let charge = hold::Charge::from_owner(body.len(), body.resident());
-    let sent = server
-        .streams()
-        .try_shared(id, &body, Boundary::More)
-        .expect("retained body");
-    assert!(matches!(sent, DataOutcome::Sent(count) if count.get() == RETAINED_BODY.len()));
-    drop(body);
+fn releases_owner() {
+    for cancel in [false, true] {
+        let (_, mut server, id) = Upload::new(Config::default())
+            .try_connect()
+            .expect("upload");
+        server
+            .streams()
+            .headers()
+            .respond(id, RESPONSE_OK, Boundary::More)
+            .expect("response");
+        server.transfer().drain(usize::MAX);
+        let credit = server.status().send_window();
+        let pool = Pool::try_new(1, RETAINED_BODY.len()).expect("body pool");
+        let mut slot = pool.acquire().expect("body slot");
+        slot.try_append(&RETAINED_BODY).expect("body fits").commit();
+        let body = slot.freeze().into_shared();
+        let charge = hold::Charge::from_owner(body.len(), body.resident());
+        let sent = server
+            .streams()
+            .try_shared(id, &body, Boundary::More)
+            .expect("retained body");
+        assert!(matches!(sent, DataOutcome::Sent(count) if count.get() == RETAINED_BODY.len()));
+        drop(body);
 
-    let mut notified = 0;
-    server.transfer().discard(|retired| {
-        assert_eq!(pool.available(), 1, "owner released before notification");
-        assert_eq!(retired.stream_id.id(), id);
-        assert_eq!(retired.charge, charge);
-        notified += 1;
-    });
-    assert_eq!(notified, 1);
-    assert!(server.status().send_window() == credit);
+        if cancel {
+            let key = server.status().stream_key(id).expect("active stream");
+            server.streams().cancel(key, ErrorCode::Cancel);
+        } else {
+            let mut notified = 0;
+            server.transfer().discard(|retired| {
+                assert_eq!(pool.available(), 1, "owner released before notification");
+                assert_eq!(retired.stream_id.id(), id);
+                assert_eq!(retired.charge, charge);
+                notified += 1;
+            });
+            assert_eq!(notified, 1);
+        }
+        assert_eq!(pool.available(), 1);
+        assert!(server.status().send_window() == credit);
+    }
 }

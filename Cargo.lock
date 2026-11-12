@@ -234,9 +234,9 @@ dependencies = [
 
 [[package]]
 name = "dope-core"
-version = "0.69.0"
+version = "0.69.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d871e8f045751f4ebc10e31d7ae88419b90f63a0cdf07679749e104a0757bd88"
+checksum = "b06f1ee85878731fce56c6214cb2aa348e9e45879a3b57842be384feaed5fbb4"
 dependencies = [
  "dope-kqueue",
  "dope-sys",

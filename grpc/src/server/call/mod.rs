@@ -55,24 +55,20 @@ impl<'r, T, C: session::Storage> State<'r, T, C> {
         }
     }
 
-    pub(in crate::server) fn initialize(
-        &mut self,
+    pub(in crate::server) fn new(
+        entry: active::Entry<'r>,
         input: input::Input<C>,
         handler: T,
         output: Production,
-    ) -> Result<(), Mismatch> {
-        if !matches!(self.phase, Phase::Reserved) {
-            return Err(Mismatch {
-                expected: Kind::Reserved,
-                actual: self.phase.kind(),
-            });
+    ) -> Self {
+        Self {
+            entry,
+            phase: Phase::Active(Active {
+                input: Some(input),
+                handler,
+                output,
+            }),
         }
-        self.phase = Phase::Active(Active {
-            input: Some(input),
-            handler,
-            output,
-        });
-        Ok(())
     }
 
     pub(in crate::server) fn active(&mut self) -> Option<&mut Active<T, C>> {

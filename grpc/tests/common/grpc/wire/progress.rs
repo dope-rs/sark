@@ -278,14 +278,15 @@ impl<'c, T> domain::Domain<Carrier<'c>, T> for Domain<T> {
         check: impl FnOnce(&T) -> Result<(domain::Activation<conn::DataBlock>, P), E>,
         commit: impl FnOnce(&mut T, P) -> R,
     ) -> Result<R, schedule::Error<E>> {
-        self.0.transaction(key, |value| {
-            let (next, plan) = check(value)?;
-            let next = match next {
-                domain::Activation::Keep => schedule::Activation::Keep,
-                domain::Activation::Data(wait) => schedule::Activation::data(wait),
-            };
-            Ok((next, commit(value, plan)))
-        })
+        let mut entry = self.0.entry(key).ok_or(schedule::Error::Missing)?;
+        let (next, plan) = check(entry.get_mut()).map_err(schedule::Error::Rejected)?;
+        let next = match next {
+            domain::Activation::Keep => schedule::Activation::Keep,
+            domain::Activation::Data(wait) => schedule::Activation::data(wait),
+        };
+        let result = commit(entry.get_mut(), plan);
+        entry.activate(next);
+        Ok(result)
     }
 
     fn resume(&mut self, conn: &mut Carrier<'c>, egress: schedule::Egress) {

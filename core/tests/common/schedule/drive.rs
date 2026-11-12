@@ -1,6 +1,6 @@
 use std::{convert::Infallible, num::NonZero};
 
-use o3::{base::cell::region, depot::arena::slab::key};
+use o3::depot::arena::slab::key;
 use sark_core::manifold::schedule;
 
 #[derive(Clone, Copy, Eq, PartialEq)]
@@ -24,10 +24,10 @@ impl schedule::Settle<usize> for Driver {
     fn settle(
         &mut self,
         _: key::Handle,
-        value: usize,
+        _: &mut usize,
         _: schedule::Terminal<Infallible>,
-    ) -> schedule::Settlement<usize> {
-        schedule::Settlement::Keep(value)
+    ) -> schedule::Settlement<()> {
+        schedule::Settlement::Keep(())
     }
 }
 
@@ -41,18 +41,17 @@ impl schedule::Driver<usize> for Driver {
         Some(NonZero::<usize>::MIN)
     }
 
-    fn control<'id>(
+    fn control(
         &mut self,
         permit: NonZero<usize>,
-        entry: schedule::Occupied<'_, Self::Key, usize, Block, region::Identity<'id>>,
-    ) -> schedule::Decision<'id, Self::Key> {
-        entry.borrowed(self, |_, _, value| {
-            *value += permit.get();
-            Ok(schedule::ControlTurn::new(
-                schedule::Turn::Progress,
-                schedule::WorkClass::Control,
-            ))
-        })
+        _: Self::Key,
+        value: &mut usize,
+    ) -> Result<schedule::ControlTurn<Block>, Infallible> {
+        *value += permit.get();
+        Ok(schedule::ControlTurn::new(
+            schedule::Turn::Progress,
+            schedule::WorkClass::Control,
+        ))
     }
 
     fn data(

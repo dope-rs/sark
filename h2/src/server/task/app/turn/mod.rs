@@ -1,3 +1,4 @@
+use crate::server::app as semantic;
 use o3::mem::quota::Admission;
 mod guard;
 pub(super) mod schedule;
@@ -12,11 +13,7 @@ use dope::{
 use sark_core::{
     body,
     decode::{self, request},
-    manifold::{
-        schedule::Egress,
-        server::{app as semantic, drain},
-        task::app::Runtime,
-    },
+    manifold::{schedule::Egress, server::drain, task::app::Runtime},
 };
 
 use crate::{
@@ -50,7 +47,8 @@ pub(super) enum Outcome {
 pub(super) struct Turn<'a, 'state, 'work, 'd, ID: Identity + 'd, R, Q, W, A, P>
 where
     R: Runtime<'d, Target = Target<'d, ID>>,
-    A: service::Select<R> + semantic::Application<'d, service::Connection<'d, A>, conn::Id<'d, ID>>,
+    A: service::Select<R>
+        + semantic::Application<'d, crate::conn::event::Retirement, conn::Id<'d, ID>>,
 {
     drive: drive::Drive<'a, 'state, 'd, ID, R, Q, A::Fields>,
     work: app::Work<'work, 'd>,
@@ -66,7 +64,8 @@ impl<'a, 'state, 'work, 'd, ID: Identity + 'd, R, Q, W, A, P>
     Turn<'a, 'state, 'work, 'd, ID, R, Q, W, A, P>
 where
     R: Runtime<'d, Target = Target<'d, ID>>,
-    A: service::Select<R> + semantic::Application<'d, service::Connection<'d, A>, conn::Id<'d, ID>>,
+    A: service::Select<R>
+        + semantic::Application<'d, crate::conn::event::Retirement, conn::Id<'d, ID>>,
     W: wire::Spec,
     Q: Transitions<conn::Id<'d, ID>>,
     Q::Retention: Handoff,
@@ -93,7 +92,7 @@ where
         }
     }
 
-    fn build(&mut self) -> Admission<Result<Outcome, semantic::Error<Error, A::Failure>>> {
+    fn build(&mut self) -> Admission<Result<Outcome, semantic::Error<A::Failure>>> {
         if !self.ready.build {
             return Admission::Empty;
         }
@@ -113,7 +112,7 @@ where
         Admission::Item(Ok(Outcome::Wake))
     }
 
-    fn task(&mut self) -> Admission<Result<Outcome, semantic::Error<Error, A::Failure>>> {
+    fn task(&mut self) -> Admission<Result<Outcome, semantic::Error<A::Failure>>> {
         if !self.ready.task {
             return Admission::Empty;
         }
@@ -130,7 +129,7 @@ where
         Admission::Item(Ok(Outcome::Wake))
     }
 
-    fn ingress(&mut self) -> Admission<Result<Outcome, semantic::Error<Error, A::Failure>>>
+    fn ingress(&mut self) -> Admission<Result<Outcome, semantic::Error<A::Failure>>>
     where
         <R::Head as request::Head>::Start: schedule::Schedule<'d, R>,
     {
@@ -167,10 +166,7 @@ where
         Admission::Item(outcome)
     }
 
-    fn egress(
-        &mut self,
-        pump: Pump,
-    ) -> Admission<Result<Outcome, semantic::Error<Error, A::Failure>>> {
+    fn egress(&mut self, pump: Pump) -> Admission<Result<Outcome, semantic::Error<A::Failure>>> {
         if !self.ready.output {
             return Admission::Empty;
         }
@@ -212,7 +208,7 @@ where
         }))
     }
 
-    fn admission(&mut self) -> Admission<Result<Outcome, semantic::Error<Error, A::Failure>>>
+    fn admission(&mut self) -> Admission<Result<Outcome, semantic::Error<A::Failure>>>
     where
         R: decode::Guarded,
     {

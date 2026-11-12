@@ -1,26 +1,29 @@
 use std::{cell, marker};
 
-use o3::{base::cell::region, depot::queue::indexed::lanes::entry};
+use o3::depot::queue::indexed::lanes::entry;
 
 use crate::manifold::{
     self,
-    schedule::{Block, ControlTurn, Decision, Driver, LANES, Terminal, WorkClass, drive},
+    schedule::{Activation, Block, LANES, Wait, WorkClass, policy::Policy},
 };
 
-/// One admitted resident owner and its control scheduling authority.
+/// One admitted resident owner.
 #[must_use = "an occupied entry retains its exclusive schedule borrow"]
-pub struct Occupied<'a, K: manifold::raw::Key, T, B: Block, Q = ()> {
+pub struct Occupied<'a, K: manifold::raw::Key, T, B: Block> {
     slot: entry::Occupied<'a, K, T, LANES>,
+    policy: &'a mut Policy,
     block: marker::PhantomData<cell::Cell<B>>,
-    scope: Q,
 }
 
-impl<'a, K: manifold::raw::Key, T, B: Block, Q> Occupied<'a, K, T, B, Q> {
-    pub(super) const fn new(slot: entry::Occupied<'a, K, T, LANES>, scope: Q) -> Self {
+impl<'a, K: manifold::raw::Key, T, B: Block> Occupied<'a, K, T, B> {
+    pub(super) const fn new(
+        slot: entry::Occupied<'a, K, T, LANES>,
+        policy: &'a mut Policy,
+    ) -> Self {
         Self {
             slot,
+            policy,
             block: marker::PhantomData,
-            scope,
         }
     }
 
@@ -28,40 +31,21 @@ impl<'a, K: manifold::raw::Key, T, B: Block, Q> Occupied<'a, K, T, B, Q> {
         self.slot.get_mut()
     }
 
+    pub fn activate(self, next: Activation<B>) {
+        let Activation::Activate { blocked, class } = next else {
+            return;
+        };
+        let wait = blocked.map(Block::wait);
+        let lane = class.blocked_lane(wait);
+        if self.slot.lane() != Some(lane) {
+            self.slot.move_to_back(lane);
+        }
+        if matches!((class, wait), (WorkClass::Data, Some(Wait::Egress))) {
+            self.policy.block_data();
+        }
+    }
+
     pub fn discard(self) {
         self.slot.discard();
-    }
-}
-
-impl<'a, 'id, K: manifold::raw::Key, T, B: Block> Occupied<'a, K, T, B, region::Identity<'id>> {
-    /// Runs a control quantum without withdrawing its resident owner.
-    pub fn borrowed<D>(
-        mut self,
-        driver: &mut D,
-        run: impl FnOnce(&mut D, K, &mut T) -> Result<ControlTurn<B>, D::Error>,
-    ) -> Decision<'id, K>
-    where
-        D: Driver<T, Key = K, Block = B>,
-    {
-        let stream = self.slot.key();
-        let (step, activity) = match run(driver, stream, self.slot.get_mut()) {
-            Ok(turn) => turn.into_parts(),
-            Err(error) => {
-                return Decision::bind(
-                    drive::finish(
-                        driver,
-                        self.slot,
-                        stream,
-                        Terminal::Failed(error),
-                        WorkClass::Control,
-                    ),
-                    self.scope,
-                );
-            }
-        };
-        Decision::bind(
-            drive::borrowed(driver, self.slot, stream, step, activity),
-            self.scope,
-        )
     }
 }

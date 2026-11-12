@@ -1,5 +1,3 @@
-use std::ops;
-
 use o3::buffer::write::{Sink as _, consume, consume::Consume};
 
 use crate::{
@@ -115,8 +113,8 @@ impl<'a, H: Sink> Frames<'a, H> {
                         return sources::Mask::Restore(self.reject_frame(&mut out.response, error));
                     }
                 };
-                match prepared.split() {
-                    inbound::Split::Message(message) => {
+                match prepared {
+                    inbound::Prepared::Message(message) => {
                         let result = self.user.capacity(message.len()).and_then(|capacity| {
                             out.try_message(capacity, |response| {
                                 self.dispatch(message.commit(), response)
@@ -131,10 +129,18 @@ impl<'a, H: Sink> Frames<'a, H> {
                             }
                         }
                     }
-                    inbound::Split::Control(control) => {
-                        let next = match control.commit_with(|reply| out.response.reply(reply)) {
-                            Ok(ops::ControlFlow::Break(())) => server::Phase::Closed,
-                            Ok(ops::ControlFlow::Continue(())) => server::Phase::Active,
+                    inbound::Prepared::Fragment(fragment) => {
+                        fragment.commit();
+                        sources::Mask::Commit(server::Phase::Active)
+                    }
+                    inbound::Prepared::Pong(pong) => {
+                        pong.commit();
+                        sources::Mask::Commit(server::Phase::Active)
+                    }
+                    inbound::Prepared::Required(need) => {
+                        let next = match need.commit_with(|reply| out.response.reply(reply)) {
+                            Ok(inbound::Event::Close(_)) => server::Phase::Closed,
+                            Ok(inbound::Event::Ping(_)) => server::Phase::Active,
                             Err(_) => return sources::Mask::Restore(server::Phase::Active),
                         };
                         sources::Mask::Commit(next)

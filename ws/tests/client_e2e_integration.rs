@@ -310,7 +310,7 @@ fn borrowed_handler_retires() {
             )
             .expect("WebSocket operation");
         stream
-            .write_all(b"\x81\x04loan\x88\x02\x03\xe8")
+            .write_all(b"\x8a\x04loan\x88\x02\x03\xe8")
             .expect("send borrowed events");
         std::io::copy(&mut stream, &mut std::io::sink()).expect("borrowed client terminates");
     });
@@ -331,7 +331,7 @@ fn borrowed_handler_retires() {
                             events: &events,
                             closed: &closed,
                             message: &|message| {
-                                assert!(matches!(message, client::Message::Text("loan")))
+                                assert!(matches!(message, client::Message::Pong(b"loan")))
                             },
                         }),
                         |mut app| {

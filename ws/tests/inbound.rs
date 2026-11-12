@@ -69,12 +69,12 @@ fn direct_borrow() {
     let wire = [0x81, 2, b'o', b'k'];
     let want = wire[2..].as_ptr();
     let ready = match input.try_prepare(&wire) {
-        Ok(Some(inbound::Prepared::Ready(ready))) => Some(ready),
+        Ok(Some(inbound::Prepared::Message(ready))) => Some(ready),
         _ => None,
     }
     .expect("data frame cannot require a reply");
     let data = match ready.commit() {
-        inbound::ReadyEvent::Data(fragment::Push::DirectText(data)) => Some(data),
+        fragment::Message::WholeText(data) => Some(data),
         _ => None,
     }
     .expect("complete text must remain direct");
@@ -140,14 +140,11 @@ fn split_text() {
     for (first, last, expected) in protocol::SPLIT_TEXT {
         let mut input = inbound::Inbound::<inbound::ServerPeer>::new(usize::MAX);
         let ready = match input.try_prepare(first) {
-            Ok(Some(inbound::Prepared::Ready(ready))) => Some(ready),
+            Ok(Some(inbound::Prepared::Fragment(ready))) => Some(ready),
             _ => None,
         }
         .expect("text fragment cannot require a reply");
-        assert!(matches!(
-            ready.commit(),
-            inbound::ReadyEvent::Data(fragment::Push::NeedMore)
-        ));
+        ready.commit();
 
         let Ok(expected) = expected else {
             assert_eq!(
@@ -158,12 +155,12 @@ fn split_text() {
         };
         drop(input.try_prepare(last));
         let ready = match input.try_prepare(last) {
-            Ok(Some(inbound::Prepared::Ready(ready))) => Some(ready),
+            Ok(Some(inbound::Prepared::Message(ready))) => Some(ready),
             _ => None,
         }
         .expect("continuation cannot require a reply");
         let text = match ready.commit() {
-            inbound::ReadyEvent::Data(fragment::Push::AssembledText(text)) => Some(text),
+            fragment::Message::JoinedText(text) => Some(text),
             _ => None,
         }
         .expect("final text must assemble");
@@ -176,14 +173,11 @@ fn bad_text() {
     let mut input = inbound::Inbound::<inbound::ServerPeer>::new(usize::MAX);
     let first = [0x01, 1, b'a'];
     let ready = match input.try_prepare(&first) {
-        Ok(Some(inbound::Prepared::Ready(ready))) => Some(ready),
+        Ok(Some(inbound::Prepared::Fragment(ready))) => Some(ready),
         _ => None,
     }
     .expect("text fragment cannot require a reply");
-    assert!(matches!(
-        ready.commit(),
-        inbound::ReadyEvent::Data(fragment::Push::NeedMore)
-    ));
+    ready.commit();
 
     let bad = [0x80, 1, 0xff];
     for pass in 0..2 {
@@ -215,7 +209,7 @@ fn invalid_split_tail() {
     use inbound::{Decode, Fault, Inbound, Prepared, ServerPeer};
     let mut input = Inbound::<ServerPeer>::new(usize::MAX);
     let first = match input.try_prepare(&[0x01, 1, 0xe2]).expect("frame") {
-        Some(Prepared::Ready(first)) => Some(first),
+        Some(Prepared::Fragment(first)) => Some(first),
         _ => None,
     }
     .expect("text");
@@ -244,7 +238,7 @@ fn fragment_retry() {
     );
     assert_eq!(error.close_code(), 1011);
     let first = match input.try_prepare(TEXT_PREFIX).expect("retry") {
-        Some(inbound::Prepared::Ready(first)) => Some(first),
+        Some(inbound::Prepared::Fragment(first)) => Some(first),
         _ => None,
     }
     .expect("fragment");
@@ -259,7 +253,7 @@ fn fragment_retry() {
         panic!("reserve without commit: {error:?}");
     }
     let last = match input.try_prepare(TEXT_SUFFIX).expect("retry") {
-        Some(inbound::Prepared::Ready(last)) => Some(last),
+        Some(inbound::Prepared::Message(last)) => Some(last),
         _ => None,
     }
     .expect("message");
@@ -267,6 +261,6 @@ fn fragment_retry() {
     assert_eq!(usage, (0, 0));
     assert!(matches!(
         event,
-        inbound::ReadyEvent::Data(fragment::Push::AssembledText(text)) if text == "€abcdefghijklmnop"
+        fragment::Message::JoinedText(text) if text == "€abcdefghijklmnop"
     ));
 }

@@ -357,8 +357,8 @@ pub(super) fn build(
             let slot = &proto.h1_slot;
             let scoped_bounds = mixed.then(|| {
                 quote! {
-                    #g_h2a: #ns_core::manifold::server::app::Application<
-                        'd, #ns_h2::server::runtime::Connection<'d, #g_h2a>,
+                    #g_h2a: #ns_h2::server::app::Application<
+                        'd, #ns_h2::conn::event::Ignore,
                         #ns_fiber::dope::manifold::network::listener::conn::Id<'d, #g_id>,
                     >,
                     #http2: #ns_fiber::dope::manifold::network::listener::handler::Scoped<

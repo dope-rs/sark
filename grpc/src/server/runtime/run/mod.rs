@@ -1,19 +1,23 @@
 //! gRPC server runtime over H2 stream identities.
 use dope::core::driver::schedule::clock;
 use o3::{
-    buffer::{resident, storage},
-    depot::queue::pool,
+    buffer::resident,
+    depot::{capacity::Count, queue::pool},
 };
 use resident::bound;
 use sark_core::{
     decode,
     manifold::{
         schedule,
-        server::{self, Connection, app, drain, timing},
+        server::{self, Connection as _, drain, timing},
         stream::{Message as _, Section},
     },
 };
-use sark_h2::{server::task::service::Select, stream::Key};
+use sark_h2::{
+    conn::{self, event},
+    server::{app, task::service::Select},
+    stream::Key,
+};
 use sark_http::field::metadata::section::state::{RetainedHead, Selected};
 
 use crate::{
@@ -24,7 +28,7 @@ use crate::{
         call::Handler,
         egress,
         runtime::{
-            policy,
+            Connection, policy,
             state::{self, active},
         },
     },
@@ -94,45 +98,44 @@ impl<R: decode::Full, X> Select<R> for Service<'_, X> {
     }
 }
 
-impl<'a, 'd, C, O, X> app::Application<'d, C, O> for Service<'a, X>
+impl<'a, 'd, E: event::Evidence, O, X> app::Application<'d, E, O> for Service<'a, X>
 where
-    C: Connection<
-            Key = Key,
-            Owner = resident::Shared<'d>,
-            Fields = section::Owner,
-            Output = storage::Shared,
-        >,
     O: Copy + Eq + 'd,
     X: policy::Dispatch<'d, O, Target = active::Entry<'a>>,
     X::Timer: drive::Mode<'d>,
 {
-    type State = state::Store<'a, 'd, Handler<X::Call, X::State>, X::Timer, C>;
+    type State = state::Store<'a, 'd, Handler<X::Call, X::State>, X::Timer>;
     type Timing = timing::On;
     type Build = state::Error;
 
     fn state(&self, cap: app::Capacity) -> Result<Self::State, Self::Build> {
-        state::Store::try_new(self.bank, cap)
+        let messages = if X::BUFFERED {
+            pool::Plan::from_counts(self.bank.limits.input().count(), cap.streams())
+        } else {
+            pool::Plan::from_counts(Count::new(0), Count::new(0))
+        };
+        state::Store::try_new(self.bank, cap, messages)
     }
 
     fn drive<H>(
         &mut self,
         state: &mut Self::State,
-        conn: &mut C,
+        conn: &mut Connection<'d, E>,
         turn: &mut app::Turn<'_, '_, '_, 'd, O>,
         egress: schedule::Egress,
         context: &mut H,
         protocol: impl FnMut(
             &mut H,
-            &mut C,
+            &mut Connection<'d, E>,
             &mut drain::Events<'_, 'd>,
             &Self::State,
-        ) -> Result<Option<server::Event<C>>, C::Error>,
+        ) -> Result<Option<server::Event<Connection<'d, E>>>, conn::Error>,
         notify: impl FnMut(&mut H, schedule::Wake<Key>),
-        finish: impl FnOnce(&mut H, &mut C),
-        mut report: impl FnMut(&mut H, app::Error<C::Error, Self::Failure>),
-    ) -> Result<drain::Progress, app::Error<C::Error, Self::Failure>> {
+        finish: impl FnOnce(&mut H, &mut Connection<'d, E>),
+        mut report: impl FnMut(&mut H, app::Error<Self::Failure>),
+    ) -> Result<drain::Progress, app::Error<Self::Failure>> {
         if matches!(egress, schedule::Egress::Released) {
-            Self::released(state);
+            <Self as app::Application<'d, E, O>>::released(state);
         }
         drive::Driver {
             exec: &mut self.exec,
@@ -147,7 +150,7 @@ where
     }
 
     /// Cancels every task before releasing any retained call payload.
-    fn close(&mut self, state: &mut Self::State, conn: &mut C, owner: O) {
+    fn close(&mut self, state: &mut Self::State, conn: &mut Connection<'d, E>, owner: O) {
         for index in 0..state.calls.capacity() {
             let Some(stream) = state.calls.key_at(index) else {
                 continue;
@@ -173,7 +176,7 @@ where
         }
     }
 
-    fn selected(state: &Self::State, event: &server::Event<C>) -> bool {
+    fn selected(state: &Self::State, event: &server::Event<Connection<'d, E>>) -> bool {
         match event {
             server::Event::Head {
                 head,
@@ -207,14 +210,8 @@ where
     }
 }
 
-impl<'a, 'd, C, O, X> app::Timed<'d, C, O> for Service<'a, X>
+impl<'a, 'd, E: event::Evidence, O, X> app::Timed<'d, E, O> for Service<'a, X>
 where
-    C: Connection<
-            Key = Key,
-            Owner = resident::Shared<'d>,
-            Fields = section::Owner,
-            Output = storage::Shared,
-        >,
     O: Copy + Eq + 'd,
     X: policy::Dispatch<'d, O, Target = active::Entry<'a>>,
     X::Timer: drive::Mode<'d>,
@@ -230,7 +227,7 @@ where
 }
 
 impl Failure {
-    fn from_output<E>(stream: Key, error: egress::Error<E>) -> app::Error<E, Self> {
+    fn from_output(stream: Key, error: egress::Error<conn::Error>) -> app::Error<Self> {
         match error {
             egress::Error::Write(error) => app::Error::Connection(error),
             egress::Error::Fault(cause) => app::Error::Application(Self::Output { stream, cause }),

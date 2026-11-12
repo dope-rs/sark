@@ -362,8 +362,8 @@ pub(super) fn extras<'emit, 'source, 'spec>(
                 #g_recv: #ns_fiber::dope::net::link::pool::change::Prepare<
                     #l_wire, 'd, #g_id, #identity,
                 >,
-                #g_h2a: #ns_core::manifold::server::app::Application<
-                    'd, #ns_h2::server::runtime::Connection<'d, #g_h2a>,
+                #g_h2a: #ns_h2::server::app::Application<
+                    'd, #ns_h2::conn::event::Ignore,
                     #ns_fiber::dope::manifold::network::listener::conn::Id<'d, #g_id>,
                 >,
                 #h2: #ns_fiber::dope::manifold::network::listener::handler::Scoped<

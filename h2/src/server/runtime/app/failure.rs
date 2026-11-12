@@ -1,11 +1,11 @@
 use std::{convert::Infallible, fmt};
 
+use crate::server::app;
 use dope::{
     core::driver::route::Identity,
     manifold::network::listener::conn,
     net::wire::{self, open, terminal},
 };
-use sark_core::manifold::server::app;
 
 use crate::server::runtime::output;
 
@@ -14,11 +14,11 @@ pub enum Failure<'a, 'w, 'd: 'w, W: wire::Spec + 'w, ID: Identity, E = Infallibl
     Construction(B),
     Drive {
         id: conn::Id<'d, ID>,
-        cause: app::Error<crate::conn::Error, E>,
+        cause: app::Error<E>,
     },
     Diagnostic {
         id: conn::Id<'d, ID>,
-        cause: app::Error<crate::conn::Error, E>,
+        cause: app::Error<E>,
     },
     Output {
         id: conn::Id<'d, ID>,

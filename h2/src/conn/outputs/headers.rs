@@ -177,7 +177,7 @@ impl Encoder {
             }
         };
         let mut block =
-            wire::Wire::new(span, peer.max_frame_size).map_err(conn::Error::HeaderWire)?;
+            wire::Wire::new(span, peer.max_frame_size, target).map_err(conn::Error::HeaderWire)?;
         let limit = peer
             .max_header_list_size
             .map_or(self.capacity.list(), |limit| {
@@ -191,7 +191,7 @@ impl Encoder {
             peer.enable_connect_protocol,
             method,
         );
-        let mut block = match block.finish() {
+        let block = match block.finish() {
             Ok(block) => block,
             Err(error) => {
                 self.state.restore(commit.discard());
@@ -202,7 +202,6 @@ impl Encoder {
             self.state.restore(commit.discard());
             return Err(conn::Error::HeaderEncode(error));
         }
-        block.seal(target.key().id(), target.boundary());
         Ok(Encoded {
             block,
             commit,
@@ -221,7 +220,7 @@ impl Encoder {
         encoded: Encoded<T>,
     ) -> Result<ControlFlow<(Encoded<T>, outputs::Full), T>, conn::Error> {
         let stream = encoded.stream();
-        let wire_len = encoded.block.len();
+        let wire_len = encoded.block.as_ref().len();
         let (encoded, full) = if wire_len >= self.blocks.capacity().get().div_ceil(2) as usize {
             let Encoded {
                 block,

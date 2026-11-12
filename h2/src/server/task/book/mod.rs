@@ -1,3 +1,4 @@
+use crate::server::app as semantic;
 use std::{convert::Infallible, mem, ops, pin};
 
 use dope::{
@@ -19,7 +20,7 @@ use sark_core::{
     life::{self, audit, exchange},
     manifold::{
         schedule::{self, typed},
-        server::{Connection as _, Event, app as semantic, drain},
+        server::{Connection as _, Event, drain},
         stream::Boundary,
         task::app::Runtime,
     },
@@ -48,7 +49,7 @@ pub(super) fn wakes<'d, ID: Identity + 'd, R, A>(
     state: &mut service::State<'d, ID, A>,
 ) where
     R: Runtime<'d, Target = Target<'d, ID>>,
-    A: service::Select<R> + semantic::Application<'d, service::Connection<'d, A>, Id<'d, ID>>,
+    A: service::Select<R> + semantic::Application<'d, crate::conn::event::Retirement, Id<'d, ID>>,
 {
     if !A::ENABLED {
         return;
@@ -224,8 +225,8 @@ where
         admitted();
         let result = match entry {
             typed::Entry::Control(entry) => entry.change(|value| value.push(data, boundary)).1,
-            typed::Entry::Data(entry) => {
-                let (entry, result) = entry.change(|value| value.push(data, boundary));
+            typed::Entry::Data(mut entry) => {
+                let result = entry.get_mut().push(data, boundary);
                 if matches!(result, response::Duplex::Applied(Ok(()))) {
                     entry.activate(None);
                 }
@@ -252,8 +253,8 @@ where
         admitted();
         let result = match entry {
             typed::Entry::Control(entry) => entry.change(|value| value.finish()).1,
-            typed::Entry::Data(entry) => {
-                let (entry, result) = entry.change(|value| value.finish());
+            typed::Entry::Data(mut entry) => {
+                let result = entry.get_mut().finish();
                 if matches!(result, response::Duplex::Applied(Ok(()))) {
                     entry.activate(None);
                 }

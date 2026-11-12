@@ -1,6 +1,6 @@
 use std::{convert::Infallible, num::NonZero};
 
-use o3::{base::cell::region, depot::arena::slab::key};
+use o3::depot::arena::slab::key;
 use sark_core::manifold::schedule;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -46,9 +46,9 @@ impl schedule::Settle<Stage> for Writer {
     fn settle(
         &mut self,
         _: key::Handle,
-        value: Stage,
+        _: &mut Stage,
         terminal: schedule::Terminal<Infallible>,
-    ) -> schedule::Settlement<Stage> {
+    ) -> schedule::Settlement<()> {
         match terminal {
             schedule::Terminal::Complete => {
                 self.closed += 1;
@@ -56,7 +56,7 @@ impl schedule::Settle<Stage> for Writer {
             }
             schedule::Terminal::Idle => {
                 self.idle += 1;
-                schedule::Settlement::Keep(value)
+                schedule::Settlement::Keep(())
             }
             schedule::Terminal::Failed(error) => match error {},
         }
@@ -73,33 +73,32 @@ impl schedule::Driver<Stage> for Writer {
         Some(permit)
     }
 
-    fn control<'id>(
+    fn control(
         &mut self,
         permit: NonZero<usize>,
-        entry: schedule::Occupied<'_, Self::Key, Stage, Blocked, region::Identity<'id>>,
-    ) -> schedule::Decision<'id, Self::Key> {
-        entry.borrowed(self, |driver, _, value| {
-            driver.invalid |= permit.get() != driver.remaining + 1;
-            driver.control += 1;
-            Ok(match value {
-                Stage::Head if driver.control == 1 => {
-                    schedule::ControlTurn::blocked(driver.block.unwrap_or(Blocked::Egress))
-                }
-                Stage::Head => {
-                    *value = Stage::Body;
-                    schedule::ControlTurn::progress(schedule::WorkClass::Data)
-                }
-                Stage::Fused => {
-                    *value = Stage::Body;
-                    driver.data += 1;
-                    schedule::ControlTurn::fused(
-                        schedule::Turn::Blocked(Blocked::Egress),
-                        schedule::WorkClass::Data,
-                    )
-                }
-                Stage::Body => schedule::ControlTurn::idle(),
-                Stage::Trailer => schedule::ControlTurn::complete(),
-            })
+        _: Self::Key,
+        value: &mut Stage,
+    ) -> Result<schedule::ControlTurn<Blocked>, Infallible> {
+        self.invalid |= permit.get() != self.remaining + 1;
+        self.control += 1;
+        Ok(match value {
+            Stage::Head if self.control == 1 => {
+                schedule::ControlTurn::blocked(self.block.unwrap_or(Blocked::Egress))
+            }
+            Stage::Head => {
+                *value = Stage::Body;
+                schedule::ControlTurn::progress(schedule::WorkClass::Data)
+            }
+            Stage::Fused => {
+                *value = Stage::Body;
+                self.data += 1;
+                schedule::ControlTurn::fused(
+                    schedule::Turn::Blocked(Blocked::Egress),
+                    schedule::WorkClass::Data,
+                )
+            }
+            Stage::Body => schedule::ControlTurn::idle(),
+            Stage::Trailer => schedule::ControlTurn::complete(),
         })
     }
 

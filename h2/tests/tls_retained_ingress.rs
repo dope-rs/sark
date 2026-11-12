@@ -1,3 +1,4 @@
+use sark_h2::server::app::Error;
 pub mod common;
 
 use std::{
@@ -38,7 +39,7 @@ use dope_tls::{
     },
 };
 use o3::alloc;
-use sark_core::manifold::{server::app::Error, stream::Boundary};
+use sark_core::manifold::stream::Boundary;
 use sark_h2::{
     ClientRole,
     conn::{self, DataOutcome, event::Event, machine::Connection},

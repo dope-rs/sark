@@ -5,7 +5,7 @@ use sark_h2::stream::Key;
 
 use crate::{
     Reason, metadata,
-    server::{calls, egress::draft, service, service::reply},
+    server::{calls, egress::draft, service, service::handler::Production, service::reply},
 };
 
 impl<'r, T, C, P, B> calls::Store<'r, T, C, P, B>
@@ -51,22 +51,28 @@ where
         status: Option<crate::Status>,
         life: draft::Lifecycle,
     ) -> Result<(), crate::Status> {
+        let open = matches!(life, draft::Lifecycle::Open);
         let prepared = draft.prepare(metadata, trailers, status, life)?;
         let key = prepared.key();
         let work = prepared.work();
-        match self.update(key, move |call| {
-            let call = call
-                .active()
-                .ok_or_else(|| crate::Status::new(crate::Code::Internal, Reason::ReplyInactive))?;
-            prepared.apply(&mut call.output);
-            Ok((work, ()))
-        }) {
-            Ok(()) => Ok(()),
-            Err(schedule::Error::Missing) => Err(crate::Status::new(
-                crate::Code::Internal,
-                Reason::ReplyUnknown,
-            )),
-            Err(schedule::Error::Rejected(status)) => Err(status),
+        let mut entry = self
+            .records
+            .entry(key)
+            .ok_or_else(|| crate::Status::new(crate::Code::Internal, Reason::ReplyUnknown))?;
+        let call = entry
+            .get_mut()
+            .active()
+            .ok_or_else(|| crate::Status::new(crate::Code::Internal, Reason::ReplyInactive))?;
+        if open {
+            call.output = Production::Ready;
         }
+        prepared.apply();
+        if let Some(class) = work {
+            entry.activate(schedule::Activation::Activate {
+                blocked: None,
+                class,
+            });
+        }
+        Ok(())
     }
 }

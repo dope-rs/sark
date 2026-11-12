@@ -13,7 +13,6 @@ pub(crate) mod limits;
 pub(crate) mod modes;
 mod owned;
 pub(crate) mod payloads;
-pub(crate) mod retained;
 pub(crate) mod transfer;
 mod wire;
 use crate::{
@@ -123,10 +122,6 @@ impl<C: session::Storage> Outbound<C> {
 
     pub(crate) fn transfer(&mut self) -> transfer::Transfer<'_, C> {
         transfer::Transfer::new(self)
-    }
-
-    pub(crate) fn retained(&mut self) -> retained::Retained<'_, C> {
-        retained::Retained::new(self)
     }
 
     pub(crate) fn len(&self) -> usize {

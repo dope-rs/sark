@@ -23,7 +23,7 @@ use cursor::Cursor;
 pub use document::{
     Document, admitted::Admitted, project::Project, release::Release, value::Value,
 };
-pub use nested::Nested;
+pub use nested::{Nested, release};
 use scanner::{Prepared, Scanner};
 pub(crate) use state::ValueKind;
 use state::{Capture, ScanProgress, State, Stored, is_delimiter, is_overlap};

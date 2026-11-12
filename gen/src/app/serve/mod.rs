@@ -337,8 +337,6 @@ pub(super) fn build(
     spec: &spec::Spec,
     h1: crate::runtime::H1,
 ) -> proc_macro2::TokenStream {
-    use quote::quote;
-
     let plan = ProtocolPlan::new(spec);
     let exec = Execution::new(paths, &plan);
     let h1 = match &h1 {
@@ -347,10 +345,5 @@ pub(super) fn build(
         }
         crate::runtime::H1::Missing => None,
     };
-    let (handle, contract, shape) = handle::build(paths, &plan, &exec, h1.as_ref());
-    let app = app::build(paths, &plan, &exec, h1.as_ref(), &contract, &shape);
-    quote! {
-        #app
-        #handle
-    }
+    handle::build(paths, &plan, &exec, h1.as_ref())
 }

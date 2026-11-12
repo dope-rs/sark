@@ -4,17 +4,9 @@ use std::cell::Cell;
 
 use dope::core::driver::route::table::conn;
 use dope_test::alloc::Tracker;
-use o3::buffer::resident;
-use sark_core::manifold::{schedule, server::app};
-use sark_grpc::{
-    protocol::section,
-    server::{Bank, config::Limits, mode, runtime::state},
-};
-use sark_h2::{
-    ServerRole,
-    conn::{event, machine},
-};
-use sark_http::field::metadata::section::rules;
+use sark_core::manifold::schedule;
+use sark_grpc::server::{Bank, config::Limits, mode, runtime::state};
+use sark_h2::{conn::event, server::app};
 
 use crate::common::grpc::call::borrowed::Borrowed;
 
@@ -61,18 +53,7 @@ fn drops_prefix() {
 
 fn check_reservations<'d, A>(app: A)
 where
-    A: app::Application<
-            'd,
-            machine::Connection<
-                ServerRole,
-                section::Plan,
-                resident::Shared<'d>,
-                rules::RejectPush,
-                event::Ignore,
-            >,
-            (),
-            Build = state::Error,
-        >,
+    A: app::Application<'d, event::Ignore, (), Build = state::Error>,
 {
     use app::Capacity;
     use o3::depot::capacity::Count;

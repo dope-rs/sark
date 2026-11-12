@@ -1,23 +1,24 @@
+use std::mem;
+
 use dope::core::driver::schedule::clock;
-use o3::buffer::{resident, storage};
-use sark_core::manifold::{
-    self,
-    server::{Connection, app},
+use sark_core::manifold;
+use sark_h2::{
+    conn::{self, event},
+    server::app,
+    stream::Key,
 };
-use sark_h2::stream::Key;
 
 use crate::{
     Reason,
     server::{
         call::Handler,
-        calls,
         egress::{self, draft},
         runtime::{
-            policy,
+            Connection, policy,
             run::drive,
             state::{self, Store, active},
         },
-        service::{self, handler, reply::Reply},
+        service::{self, handler, messages::Messages, reply::Reply},
     },
 };
 
@@ -35,29 +36,45 @@ where
     X: policy::Dispatch<'d, O, Target = active::Entry<'r>>,
     X::Timer: drive::Mode<'d>,
 {
-    pub(super) fn finish<C>(
+    pub(super) fn finish<E: event::Evidence>(
         &mut self,
-        state: &mut Store<'r, 'd, Handler<X::Call, X::State>, X::Timer, C>,
-        conn: &mut C,
+        state: &mut Store<'r, 'd, Handler<X::Call, X::State>, X::Timer>,
+        conn: &mut Connection<'d, E>,
         turn: &mut app::Turn<'_, '_, '_, 'd, O>,
         entry: active::Entry<'r>,
     ) where
-        C: Connection<Key = Key, Owner = resident::Shared<'d>, Output = storage::Shared>,
-        F: FnMut(&mut H, Key, egress::Error<C::Error>),
+        F: FnMut(&mut H, Key, egress::Error<conn::Error>),
     {
         let owner = self.owner;
         let key = entry.key();
         let result = (|| {
-            let egress = &mut state.egress;
-            let exec = &mut self.exec;
-            let result = state.calls.try_finish(key, move |call, request| {
-                let draft = draft::Draft::try_new(egress, key)?;
-                Ok(match request {
-                    calls::Request::Live { output, trailers } => {
+            let Some(record) = state.calls.records.get_mut(key) else {
+                return Ok(None);
+            };
+            let Some(call) = record.active() else {
+                return Ok(None);
+            };
+            let Some(input) = call.input.as_mut() else {
+                return Ok(None);
+            };
+            let index = manifold::raw::Key::slot(key);
+            state.calls.data.try_bind(index)?.try_release(input)?;
+            let output: Result<_, crate::Status> = match input.head.take() {
+                None => {
+                    let trailers = mem::take(&mut input.trailers);
+                    (|| {
+                        let draft = draft::Draft::try_new(&mut state.egress, key)?;
                         let mut reply = Reply::with_writer(draft);
                         let mut cx = service::Stream::new(key.id());
-                        exec.trailers(owner, entry, call, &mut cx, trailers, &mut reply);
-                        let next = match (output, reply.is_finished()) {
+                        self.exec.trailers(
+                            owner,
+                            entry,
+                            &mut call.handler,
+                            &mut cx,
+                            trailers,
+                            &mut reply,
+                        );
+                        let next = match (call.output, reply.is_finished()) {
                             (_, true) => handler::RequestState::Complete,
                             (handler::Production::Ready, false) => handler::RequestState::Produce,
                             (handler::Production::Idle, false) => {
@@ -65,22 +82,37 @@ where
                                 handler::RequestState::Complete
                             }
                         };
-                        Output::Live(reply, next)
-                    }
-                    calls::Request::Buffered(input) => {
+                        Ok(Output::Live(reply, next))
+                    })()
+                }
+                Some(head) => {
+                    let mut messages = match state.calls.messages.try_bind_mut(index) {
+                        Ok(messages) => messages,
+                        Err(error) => {
+                            input.head = Some(head);
+                            return Err(error.into());
+                        }
+                    };
+                    let input = service::Request {
+                        stream_id: key.id(),
+                        head,
+                        messages: Messages::new(messages.borrow_mut()),
+                        trailers: mem::take(&mut input.trailers),
+                    };
+                    let output = (|| {
+                        let draft = draft::Draft::try_new(&mut state.egress, key)?;
                         let mut output = service::Response::with_writer(draft);
-                        let next = exec.request(turn, entry, call, input, &mut output);
-                        Output::Buffered(output, next)
-                    }
-                })
-            });
-            let output = match result {
-                Ok(Some(Ok(output))) => output,
-                Ok(Some(Err(status))) => return Err(status),
-                Ok(None) => return Ok(None),
-                Err(error) => return Err(error.status()),
+                        let next =
+                            self.exec
+                                .request(turn, entry, &mut call.handler, input, &mut output);
+                        Ok(Output::Buffered(output, next))
+                    })();
+                    messages.clear();
+                    output
+                }
             };
-            let next = match output {
+            call.input = None;
+            let next = match output? {
                 Output::Live(reply, next) => {
                     state.calls.reply(reply)?;
                     next
@@ -115,15 +147,14 @@ where
         }
     }
 
-    pub(super) fn completion<C>(
+    pub(super) fn completion<E: event::Evidence>(
         &mut self,
-        state: &mut Store<'r, 'd, Handler<X::Call, X::State>, X::Timer, C>,
-        conn: &mut C,
+        state: &mut Store<'r, 'd, Handler<X::Call, X::State>, X::Timer>,
+        conn: &mut Connection<'d, E>,
         done: X::Completion,
         entry: active::Entry<'r>,
     ) where
-        C: Connection<Key = Key, Owner = resident::Shared<'d>, Output = storage::Shared>,
-        F: FnMut(&mut H, Key, egress::Error<C::Error>),
+        F: FnMut(&mut H, Key, egress::Error<conn::Error>),
     {
         let key = entry.key();
         let result = (|| {
@@ -149,15 +180,14 @@ where
         }
     }
 
-    pub(super) fn output<C>(
+    pub(super) fn output<E: event::Evidence>(
         &mut self,
         now: clock::Moment<'d>,
-        state: &mut Store<'r, 'd, Handler<X::Call, X::State>, X::Timer, C>,
-        conn: &mut C,
+        state: &mut Store<'r, 'd, Handler<X::Call, X::State>, X::Timer>,
+        conn: &mut Connection<'d, E>,
         entry: active::Entry<'r>,
     ) where
-        C: Connection<Key = Key, Owner = resident::Shared<'d>, Output = storage::Shared>,
-        F: FnMut(&mut H, Key, egress::Error<C::Error>),
+        F: FnMut(&mut H, Key, egress::Error<conn::Error>),
     {
         let key = entry.key();
         let result = (|| {

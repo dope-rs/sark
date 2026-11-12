@@ -1,3 +1,4 @@
+use crate::server::app;
 use std::{convert::Infallible, marker};
 
 use dope::core::driver::schedule::clock;
@@ -6,7 +7,7 @@ use sark_core::{
     decode,
     manifold::{
         schedule,
-        server::{self, Connection as Carrier, app, drain, timing},
+        server::{self, drain, timing},
     },
 };
 use sark_http::field::metadata::section::{
@@ -14,15 +15,12 @@ use sark_http::field::metadata::section::{
     state::{RetainedHead, Selected},
 };
 
-pub(crate) type Connection<'d, A> = crate::conn::machine::Connection<
-    crate::ServerRole,
-    <A as app::Spec>::Fields,
-    o3::buffer::resident::Shared<'d>,
->;
+pub(crate) type Connection<'d, A, E = crate::conn::event::Retirement> =
+    crate::server::runtime::Connection<'d, A, E>;
 
 pub(crate) type State<'d, ID, A> = <A as app::Application<
     'd,
-    Connection<'d, A>,
+    crate::conn::event::Retirement,
     dope::manifold::network::listener::conn::Id<'d, ID>,
 >>::State;
 
@@ -83,9 +81,8 @@ impl<R: decode::Decode> Select<R> for Native<R> {
     }
 }
 
-impl<'d, C, O, R> app::Application<'d, C, O> for Native<R>
+impl<'d, E: crate::conn::event::Evidence, O, R> app::Application<'d, E, O> for Native<R>
 where
-    C: Carrier,
     R: decode::Decode<Egress<'d>: 'd>,
 {
     type State = ();
@@ -99,20 +96,23 @@ where
     fn drive<H>(
         &mut self,
         state: &mut (),
-        carrier: &mut C,
+        carrier: &mut Connection<'d, Self, E>,
         turn: &mut app::Turn<'_, '_, '_, 'd, O>,
         _: schedule::Egress,
         context: &mut H,
         mut protocol: impl FnMut(
             &mut H,
-            &mut C,
+            &mut Connection<'d, Self, E>,
             &mut drain::Events<'_, 'd>,
             &Self::State,
-        ) -> Result<Option<server::Event<C>>, C::Error>,
-        _: impl FnMut(&mut H, schedule::Wake<C::Key>),
-        finish: impl FnOnce(&mut H, &mut C),
-        _: impl FnMut(&mut H, app::Error<C::Error, Self::Failure>),
-    ) -> Result<drain::Progress, app::Error<C::Error, Self::Failure>> {
+        ) -> Result<
+            Option<server::Event<Connection<'d, Self, E>>>,
+            crate::conn::Error,
+        >,
+        _: impl FnMut(&mut H, schedule::Wake<crate::stream::Key>),
+        finish: impl FnOnce(&mut H, &mut Connection<'d, Self, E>),
+        _: impl FnMut(&mut H, app::Error<Self::Failure>),
+    ) -> Result<drain::Progress, app::Error<Self::Failure>> {
         drain::Events::fair(turn.work(), |mut drain| {
             while protocol(context, carrier, &mut drain, state)
                 .map_err(app::Error::Connection)?
@@ -123,13 +123,13 @@ where
         })
     }
 
-    fn close(&mut self, _: &mut (), _: &mut C, _: O) {}
+    fn close(&mut self, _: &mut (), _: &mut Connection<'d, Self, E>, _: O) {}
 
-    fn selected(_: &(), _: &server::Event<C>) -> bool {
+    fn selected(_: &(), _: &server::Event<Connection<'d, Self, E>>) -> bool {
         false
     }
 
-    fn wake(_: &mut (), _: schedule::Wake<C::Key>) -> bool {
+    fn wake(_: &mut (), _: schedule::Wake<crate::stream::Key>) -> bool {
         false
     }
 
@@ -140,9 +140,8 @@ where
     }
 }
 
-impl<'d, C, O, R> app::Timed<'d, C, O> for Native<R>
+impl<'d, E: crate::conn::event::Evidence, O, R> app::Timed<'d, E, O> for Native<R>
 where
-    C: Carrier,
     R: decode::Decode<Egress<'d>: 'd>,
 {
     fn deadline(&self, _: &()) -> Option<clock::Deadline<'d>> {

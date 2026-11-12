@@ -5,29 +5,14 @@ use std::mem;
 use o3::buffer::storage;
 use sark_core::life::session;
 
-use crate::{
-    message, metadata,
-    protocol::request,
-    server::{call::chunks, service::handler::StreamMode},
-};
+use crate::{message, metadata, protocol::request, server::call::chunks};
 
 pub(in crate::server) struct Input<C: session::Storage = storage::Shared> {
-    pub(in crate::server) request: Request,
+    pub(in crate::server) head: Option<request::Head>,
     pub(in crate::server) deframer: message::Deframer<C>,
     pub(in crate::server) data: chunks::State,
     pub(in crate::server) trailers: metadata::Decoded,
 }
-
-pub(in crate::server) enum Request {
-    Live,
-    Buffered(request::Head),
-    Finished,
-}
-
-const _: () = {
-    assert!(mem::size_of::<Request>() <= mem::size_of::<(Option<request::Head>, StreamMode)>());
-    assert!(mem::align_of::<Request>() == mem::align_of::<request::Head>());
-};
 
 pub(in crate::server) enum Turn<C: session::Storage = storage::Shared> {
     Frame(message::Frame<C>),
@@ -43,9 +28,9 @@ const _: () = {
 };
 
 impl<C: session::Storage> Input<C> {
-    pub(in crate::server::call) fn new(request: Request, limit: usize) -> Self {
+    pub(in crate::server::call) fn new(head: Option<request::Head>, limit: usize) -> Self {
         Self {
-            request,
+            head,
             deframer: message::Deframer::new(limit),
             data: chunks::State::default(),
             trailers: metadata::Decoded::new(),

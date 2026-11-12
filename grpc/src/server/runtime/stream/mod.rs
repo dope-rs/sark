@@ -4,14 +4,15 @@ use dope::{
     core::driver::{self, route::KeyTag, schedule::app::Work},
     manifold::network::listener::conn::Id,
 };
-use dope_fiber::task::storage::set::group;
+use dope_fiber::task::storage::set::{self, group};
 use o3::buffer::resident;
 use runtime::{
-    Call, executor, policy,
+    executor, policy,
     schedule::{self, start, wake},
     state::active,
 };
-use sark_core::manifold::server::{app, drain::Progress};
+use sark_core::manifold::server::drain::Progress;
+use sark_h2::server::app;
 use stream::Route as _;
 
 use crate::{
@@ -47,7 +48,7 @@ pub struct Policy<'s, 'r, 'life, 'd: 'life, H>
 where
     H: stream::Handler + 'life,
 {
-    tasks: executor::Scheduler<'s, 'd, Domain, Fiber<'life, 'd, H>, active::Entry<'r>>,
+    tasks: executor::Tasks<'s, 'd, Domain, Fiber<'life, 'd, H>, active::Entry<'r>>,
     user: &'life H,
 }
 
@@ -57,7 +58,7 @@ where
 {
     pub(in crate::server) const fn new(
         user: &'life H,
-        tasks: executor::Scheduler<'s, 'd, Domain, Fiber<'life, 'd, H>, active::Entry<'r>>,
+        tasks: executor::Tasks<'s, 'd, Domain, Fiber<'life, 'd, H>, active::Entry<'r>>,
     ) -> Self {
         Self { tasks, user }
     }
@@ -82,11 +83,12 @@ where
 {
     type Call = ();
     type Completion = Infallible;
-    type State = Call<group::Id<'s, 'd, Domain>>;
+    type State = Option<group::Id<'s, 'd, Domain>>;
     type Target = active::Entry<'r>;
     type Timer = timers::Off;
 
     const TASKS: bool = true;
+    const BUFFERED: bool = false;
 
     fn start<W: Write>(
         &mut self,
@@ -108,7 +110,7 @@ where
             Ok(start) => start,
             Err(status) => {
                 reply.finish_with(status);
-                return Opened::live(Handler::new((), Call::default()));
+                return Opened::live(Handler::new((), None));
             }
         };
         let shape = route.shape();
@@ -116,7 +118,8 @@ where
         let call = self.user.stream(input, route);
         *reply.metadata_mut() = call.metadata;
         let fiber = stream::Fiber::new(call.task, codec, shape, timer);
-        let task = match self.tasks.start_with(
+        let task = match executor::start_with(
+            &mut self.tasks,
             fiber,
             owner,
             target,
@@ -125,16 +128,16 @@ where
                 work,
                 driver,
             },
-            |entry, fiber| Self::signal(entry, fiber.take_events()),
+            |entry, fiber| Self::signal(entry, fiber.exchange().take_events()),
         ) {
             Ok(start::Start::Ready(never)) => match never {},
             Ok(start::Start::Pending(task)) => task,
             Err(error) => {
                 reply.finish_with(error.into());
-                return Opened::live(Handler::new((), Call::default()));
+                return Opened::live(Handler::new((), None));
             }
         };
-        Opened::producing(Handler::new((), Call::new(task)))
+        Opened::producing(Handler::new((), Some(task)))
     }
 
     fn message<W: Write>(
@@ -147,13 +150,13 @@ where
         reply: &mut Reply<'_, W>,
     ) -> policy::Rearm {
         let (_, state) = state.split();
-        let Some(task) = state.task() else {
+        let Some(task) = state.as_ref() else {
             reply.finish_with(crate::Status::from_code(crate::Code::Internal));
             return policy::Rearm::Stop;
         };
-        let result = self.tasks.access(task, |fiber| {
-            fiber.push_with(|codec| crate::Codec::decode_frame(codec, frame))
-        });
+        let result = self
+            .tasks
+            .access(task, |fiber| fiber.exchange().push(frame));
         let Some(result) = result else {
             reply.finish_with(crate::Status::from_code(crate::Code::Internal));
             return policy::Rearm::Stop;
@@ -189,11 +192,13 @@ where
         reply: &mut Reply<'_, W>,
     ) {
         let (_, state) = state.split();
-        let Some(task) = state.task() else {
+        let Some(task) = state.as_ref() else {
             reply.finish_with(crate::Status::from_code(crate::Code::Internal));
             return;
         };
-        let result = self.tasks.access(task, |fiber| fiber.close(tail));
+        let result = self
+            .tasks
+            .access(task, |fiber| fiber.exchange().close(tail));
         let Some(result) = result else {
             reply.finish_with(crate::Status::from_code(crate::Code::Internal));
             return;
@@ -219,7 +224,7 @@ where
         reply: &mut Reply<'_, W>,
     ) -> policy::Output {
         let (_, state) = state.split();
-        let Some(task) = state.task() else {
+        let Some(task) = state.as_ref() else {
             reply.finish_with(crate::Status::from_code(crate::Code::Internal));
             return policy::Output::Complete;
         };
@@ -230,9 +235,9 @@ where
                 return policy::Output::Complete;
             }
         };
-        let output = self.tasks.access(task, |fiber| {
-            fiber.drive(ready, |codec, value| reply.try_encode(codec, value))
-        });
+        let output = self
+            .tasks
+            .access(task, |fiber| fiber.exchange().drive(ready, reply));
         let Some(output) = output else {
             reply.finish_with(crate::Status::from_code(crate::Code::Internal));
             return policy::Output::Complete;
@@ -273,7 +278,7 @@ where
     }
 
     fn has_tasks(&self, owner: Id<'d, KeyTag<0>>) -> bool {
-        self.tasks.has_work_for(owner)
+        matches!(self.tasks.work_for(owner), set::Work::Pending)
     }
 
     fn has_done(&self, _: Id<'d, KeyTag<0>>) -> bool {
@@ -286,8 +291,8 @@ where
         work: Work<'_, 'd>,
         driver: &mut driver::Context<'_, 'd>,
     ) -> Progress {
-        self.tasks.drive_with(owner, work, driver, |entry, fiber| {
-            Self::signal(entry, fiber.take_events());
+        executor::drive_with(&mut self.tasks, owner, work, driver, |entry, fiber| {
+            Self::signal(entry, fiber.exchange().take_events());
         })
     }
 
@@ -316,6 +321,8 @@ where
         _: active::Entry<'r>,
         state: &mut Handler<(), Self::State>,
     ) {
-        state.split().1.cancel(|task| self.tasks.cancel(task))
+        if let Some(task) = state.split().1.take() {
+            self.tasks.discard(task);
+        }
     }
 }

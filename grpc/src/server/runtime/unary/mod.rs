@@ -3,14 +3,15 @@ use dope::{
     core::driver::{self, route::KeyTag, schedule::app::Work},
     manifold::network::listener::conn::Id,
 };
-use dope_fiber::task::storage::set::group;
+use dope_fiber::task::storage::set::{self, group};
 use o3::buffer::resident;
 use runtime::{
-    Call, executor, policy,
+    executor, policy,
     schedule::{self, start},
     state::active,
 };
-use sark_core::manifold::server::{app, drain::Progress};
+use sark_core::manifold::server::drain::Progress;
+use sark_h2::server::app;
 
 use crate::server::{
     call, runtime,
@@ -35,7 +36,7 @@ where
 {
     user: &'life H,
     codec: H::Codec,
-    tasks: executor::Scheduler<'s, 'd, Domain, H::Task<'life, 'd>, active::Entry<'r>>,
+    tasks: executor::Tasks<'s, 'd, Domain, H::Task<'life, 'd>, active::Entry<'r>>,
 }
 
 impl<'s, 'r, 'life, 'd: 'life, H> Policy<'s, 'r, 'life, 'd, H>
@@ -44,7 +45,7 @@ where
 {
     pub(in crate::server) fn new(
         user: &'life H,
-        tasks: executor::Scheduler<'s, 'd, Domain, H::Task<'life, 'd>, active::Entry<'r>>,
+        tasks: executor::Tasks<'s, 'd, Domain, H::Task<'life, 'd>, active::Entry<'r>>,
     ) -> Self {
         Self {
             user,
@@ -61,7 +62,7 @@ where
 {
     type Call = ();
     type Completion = modes::Response<H::Response>;
-    type State = Call<group::Id<'s, 'd, Domain>>;
+    type State = Option<group::Id<'s, 'd, Domain>>;
     type Target = active::Entry<'r>;
     type Timer = timers::Off;
 
@@ -87,11 +88,12 @@ where
                 return policy::RequestState::Complete;
             }
         };
-        let Some(vacant) = state.vacant() else {
+        if state.is_some() {
             output.finish_with(crate::Status::from_code(crate::Code::Internal));
             return policy::RequestState::Complete;
-        };
-        match self.tasks.start_with(
+        }
+        match executor::start_with(
+            &mut self.tasks,
             self.user.unary(driver.driver_ref().timer(), input),
             owner,
             target,
@@ -107,7 +109,7 @@ where
                 policy::RequestState::Complete
             }
             Ok(start::Start::Pending(task)) => {
-                vacant.insert(task);
+                *state = Some(task);
                 policy::RequestState::Pending
             }
             Err(error) => {
@@ -118,11 +120,11 @@ where
     }
 
     fn has_tasks(&self, owner: Id<'d, KeyTag<0>>) -> bool {
-        self.tasks.has_work_for(owner)
+        matches!(self.tasks.work_for(owner), set::Work::Pending)
     }
 
     fn has_done(&self, owner: Id<'d, KeyTag<0>>) -> bool {
-        self.tasks.has_done(owner)
+        self.tasks.contains(owner)
     }
 
     fn drive_tasks(
@@ -131,7 +133,7 @@ where
         work: Work<'_, 'd>,
         driver: &mut driver::Context<'_, 'd>,
     ) -> Progress {
-        self.tasks.drive_with(owner, work, driver, |_, _| {})
+        executor::drive_with(&mut self.tasks, owner, work, driver, |_, _| {})
     }
 
     fn wake_tasks(&mut self) {
@@ -142,7 +144,9 @@ where
         &mut self,
         owner: Id<'d, KeyTag<0>>,
     ) -> Option<(active::Entry<'r>, Self::Completion)> {
-        self.tasks.pop_done(owner)
+        self.tasks
+            .pop(owner)
+            .map(|(task, output)| (task.target, output))
     }
 
     fn publish<W: Write>(
@@ -168,6 +172,8 @@ where
         _: active::Entry<'r>,
         state: &mut call::Handler<(), Self::State>,
     ) {
-        state.split().1.cancel(|task| self.tasks.cancel(task))
+        if let Some(task) = state.split().1.take() {
+            self.tasks.discard(task);
+        }
     }
 }

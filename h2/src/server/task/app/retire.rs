@@ -1,3 +1,4 @@
+use crate::server::app as semantic;
 use std::pin;
 
 use dope::{
@@ -8,11 +9,7 @@ use dope::{
     },
     net::link::pool::recv::input::Execution,
 };
-use sark_core::{
-    decode::request,
-    life,
-    manifold::{server::app as semantic, task::app::Runtime},
-};
+use sark_core::{decode::request, life, manifold::task::app::Runtime};
 
 use crate::server::{
     Target,
@@ -27,7 +24,7 @@ impl<'d, ID: Identity + 'd, R, W, M, D, P, A> retire::Policy<'d, App<'d, ID, R, 
     for Retire
 where
     R: Runtime<'d, Target = Target<'d, ID>>,
-    A: service::Select<R> + semantic::Timed<'d, service::Connection<'d, A>, Id<'d, ID>>,
+    A: service::Select<R> + semantic::Timed<'d, crate::conn::event::Retirement, Id<'d, ID>>,
     W: Execution + 'd,
     receive::Scoped<true>: receive::Mode<W>,
     M: Transport<'d, ID>,

@@ -1,5 +1,6 @@
 use core::{marker, mem};
 
+use o3::buffer::hold;
 use sark_core::{life::session, manifold::schedule};
 
 use crate::{
@@ -113,7 +114,7 @@ impl<R: crate::Role> State<R> {
         credit.accept(&mut flow.send_window, stream);
     }
 
-    fn cancel_flow(&mut self, credit: flow::Reserved) {
+    pub(in crate::conn::machine) fn cancel_flow(&mut self, credit: flow::Reserved) {
         let key = credit.stream();
         let Self {
             flow,
@@ -131,19 +132,7 @@ impl<R: crate::Role> State<R> {
         }
     }
 
-    pub(in crate::conn::machine) fn cancel_write(
-        &mut self,
-        write: event::Staging,
-    ) -> event::Retirement {
-        let (charge, credit) = write.into_parts();
-        let stream = credit.stream();
-        self.cancel_flow(credit);
-        event::Retirement {
-            stream_id: stream,
-            charge,
-        }
-    }
-
+    /// Drains a subset of the ledger's admitted byte totals and bounded record count.
     pub(in crate::conn::machine) fn retire_write<C, E>(
         &mut self,
         egress: &mut outputs::Egress<C>,
@@ -158,18 +147,30 @@ impl<R: crate::Role> State<R> {
         {
             egress.headers.discard(key);
         }
-        let outbound = &mut egress.outbound;
-        if E::OBSERVED {
-            let retired = outbound
-                .retained()
-                .discard(id, |credit| self.cancel_flow(credit));
-            retired.and_then(E::project)
-        } else {
-            outbound
-                .retained()
-                .cancel(id, |credit| self.cancel_flow(credit));
-            None
-        }
+        let mut retired: Option<event::Retirement> = None;
+        egress.outbound.payloads.drain(id, |payload, resident| {
+            let payloads::Shared::Data(data) = payload else {
+                return;
+            };
+            if E::OBSERVED {
+                let body_len = data.body.as_ref().map_or(0, |body| body.as_ref().len());
+                let released = hold::Charge::from_owner(body_len, resident);
+                let charge = match &retired {
+                    Some(event::Retirement { charge: total, .. }) => hold::Charge::from_commit(
+                        total.logical_bytes.wrapping_add(released.logical_bytes),
+                        total.resident_bytes.wrapping_add(released.resident_bytes),
+                        total.owners.wrapping_add(released.owners),
+                    ),
+                    None => released,
+                };
+                retired = Some(event::Retirement {
+                    stream_id: data.credit.stream(),
+                    charge,
+                });
+            }
+            self.cancel_flow(data.credit);
+        });
+        retired.and_then(E::project)
     }
 
     /// Closes an active stream after its wire reset has committed.

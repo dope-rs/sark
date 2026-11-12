@@ -22,15 +22,13 @@ use dope::{
         topology::{lending, recipe},
     },
 };
-use o3::buffer::{resident, resident::bound::Unbounded};
-use sark_core::manifold::server::app;
+use o3::buffer::resident::bound::Unbounded;
+use sark_h2::server::app;
 use sark_h2::{
-    ServerRole,
-    conn::{event, machine},
+    conn::event,
     server,
     server::runtime::{app::App, modes},
 };
-use sark_http::field::metadata::section::rules;
 
 use self::{
     runtime::{direct, executor, prepare::Prepared, run, stream::Policy, unary},
@@ -123,13 +121,7 @@ where
     W: input::Execution,
     for<'d> run::Service<'a, direct::Policy<H, active::Entry<'a>>>: app::Application<
             'd,
-            machine::Connection<
-                ServerRole,
-                section::Plan,
-                resident::Shared<'d>,
-                rules::RejectPush,
-                event::Ignore,
-            >,
+            event::Ignore,
             conn::Id<'d, ID>,
             Fields = section::Plan,
             Failure = run::Failure,

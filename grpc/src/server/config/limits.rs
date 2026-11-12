@@ -1,7 +1,7 @@
 use std::num::NonZero;
 
 use o3::depot::capacity;
-use sark_core::manifold::server::app;
+use sark_h2::server::app;
 
 use crate::server::config::{
     Input, Output,

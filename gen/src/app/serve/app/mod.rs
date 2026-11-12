@@ -14,7 +14,7 @@ pub(super) fn build<'source, 'spec>(
     surface: Option<&handle::H1Plan<'source, 'spec>>,
     contract: &proc_macro2::TokenStream,
     shape: &handle::dispatch::Shape,
-) -> proc_macro2::TokenStream {
+) -> (proc_macro2::TokenStream, proc_macro2::TokenStream) {
     let [f_tasks, f_makers, f_ids] = ["tasks", "task_producers", "ids"].map(local);
     let symbols = &source.spec.state_generics;
     let [n_bind, v_brand, v_ids] = symbols.locals(["__binding", "brand", "ids"]);
@@ -337,7 +337,7 @@ pub(super) fn build<'source, 'spec>(
     let public = quote! { #( #clauses, )* #( #routes )* };
     let state_b = quote! { #( #lives: #l_env, )* };
     let state_p = quote! { #( #decls, )* };
-    tokens::build(
+    let app = tokens::build(
         paths,
         tokens::Prelude {
             definitions: &defs,
@@ -364,5 +364,6 @@ pub(super) fn build<'source, 'spec>(
             branded: !tasks.is_empty(),
         },
         spec,
-    )
+    );
+    (app, dflat.ty)
 }

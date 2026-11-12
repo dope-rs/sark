@@ -1,6 +1,6 @@
 use crate::{
     app::{
-        serve::{self, duplex, handle::h1::plan},
+        serve::{self, app, duplex, handle::h1::plan},
         spec,
     },
     runtime::paths::Paths,
@@ -175,11 +175,7 @@ pub(super) fn build<'source, 'spec>(
     plan: &'source serve::ProtocolPlan<'spec>,
     exec: &serve::Execution<'source, 'spec>,
     h1: Option<&H1Plan<'source, 'spec>>,
-) -> (
-    proc_macro2::TokenStream,
-    proc_macro2::TokenStream,
-    dispatch::Shape,
-) {
+) -> proc_macro2::TokenStream {
     let context = Context::new(plan, exec);
     let dispatch = dispatch::Dispatch::build(paths, &context);
     let head = head::Head::build(
@@ -201,26 +197,13 @@ pub(super) fn build<'source, 'spec>(
     let tasks = tasks::Tasks::build(paths, &context);
     let neutral = task::Task::new(paths, &context, &decode.prepared.state)
         .build(paths, &context, &dispatch, &head, &decode, &tasks);
+    let (app, direct) = app::build(paths, plan, exec, h1, &decode.contract, &dispatch.shape);
     let duplex = plan.duplex.definitions(paths, h1.is_some());
-    match h1 {
-        Some(h1) => {
-            use h1::types::Types;
-
-            let h1 = Types::build(paths, &context, h1, &dispatch);
-            (
-                quote::quote! {
-                    #duplex
-                    #neutral
-                    #h1
-                },
-                decode.contract,
-                dispatch.shape,
-            )
-        }
-        None => (
-            quote::quote!(#duplex #neutral),
-            decode.contract,
-            dispatch.shape,
-        ),
+    let h1 = h1.map(|plan| h1::types::Types::build(paths, &context, plan, &dispatch, &direct));
+    quote::quote! {
+        #app
+        #duplex
+        #neutral
+        #h1
     }
 }

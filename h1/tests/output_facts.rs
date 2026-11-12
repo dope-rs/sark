@@ -79,7 +79,8 @@ fn linked_uses_enum_state() {
         life::exchange::Id::new((), 0),
         |conn, _| conn,
     )
-    .unwrap_or_else(|_| panic!("linked response"));
+    .map_err(|(cause, _)| (cause.load.charge(), cause.maximum))
+    .expect("linked response");
     let (written, body, connection, _) = response.into_parts();
     assert!(matches!(
         (written, body.map(|body| body.into_inner().into_inner()), connection),

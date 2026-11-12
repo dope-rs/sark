@@ -2,7 +2,7 @@ use core::marker;
 
 use conn::{Message, config, event, ingress, outputs};
 use dope::core::random;
-use o3::buffer::{pool, pool::owners, storage};
+use o3::buffer::{pool, storage};
 use sark_core::{
     life::session,
     manifold::{
@@ -325,7 +325,7 @@ where
     type Fields = F::Block;
     type Selection = Selected<F>;
     type Control = Option<block::Plan>;
-    type Permit = pool::Span<owners::Plain<pool::Width<1>>, pool::Owned, pool::Frozen>;
+    type Permit = event::Permit;
     type Data = event::DataPayload<C>;
     type Retired = E::Retired;
     type Output = storage::Shared;

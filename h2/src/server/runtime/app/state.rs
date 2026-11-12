@@ -1,9 +1,7 @@
+use crate::server::app::{self, Capacity, Spec};
 use std::marker;
 
-use sark_core::manifold::{
-    schedule,
-    server::app::{self, Capacity, Spec},
-};
+use sark_core::manifold::schedule;
 use sark_http::payload::compress::dynamic::hash;
 
 use crate::{
@@ -16,7 +14,7 @@ use crate::{
 
 pub struct State<'d, A, O>
 where
-    A: app::Application<'d, Connection<'d, A>, O>,
+    A: app::Application<'d, crate::conn::event::Ignore, O>,
 {
     pub(in crate::server::runtime) carrier: Connection<'d, A>,
     pub(in crate::server::runtime) app: A::State,
@@ -25,7 +23,7 @@ where
 
 impl<'d, A, O> State<'d, A, O>
 where
-    A: app::Application<'d, Connection<'d, A>, O>,
+    A: app::Application<'d, crate::conn::event::Ignore, O>,
 {
     pub(super) fn try_new(
         app: &A,
@@ -61,7 +59,7 @@ where
 
 impl<'d, A, O> output::State<'d> for State<'d, A, O>
 where
-    A: app::Application<'d, Connection<'d, A>, O>,
+    A: app::Application<'d, crate::conn::event::Ignore, O>,
 {
     type Fields = <A as Spec>::Fields;
     type Evidence = event::Ignore;

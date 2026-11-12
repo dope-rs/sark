@@ -1,4 +1,4 @@
-use o3::buffer::{pool, storage};
+use o3::buffer::{hold, pool, storage};
 use sark_core::{
     life::session,
     manifold::{client::io, schedule},
@@ -118,8 +118,21 @@ where
         self.conn
             .egress
             .outbound
-            .retained()
-            .clear(|write| release(state.cancel_write(write)));
+            .payloads
+            .clear(|payload| match payload {
+                payloads::Shared::Wire(_) => {}
+                payloads::Shared::Data(data) => {
+                    let body_len = data.body.as_ref().map_or(0, |body| body.as_ref().len());
+                    let resident = data.body.as_ref().map_or(0, |body| body.resident());
+                    drop(data.body);
+                    let stream_id = data.credit.stream();
+                    state.cancel_flow(data.credit);
+                    release(event::Retirement {
+                        stream_id,
+                        charge: hold::Charge::from_owner(body_len, resident),
+                    });
+                }
+            });
     }
 
     pub(crate) fn has_write(&mut self) -> bool {

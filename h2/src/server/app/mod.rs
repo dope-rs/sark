@@ -1,6 +1,6 @@
 //! Static application binding for HTTP server carriers.
 
-use dope_core::driver::{
+use dope::core::driver::{
     self,
     schedule::{app, clock, ready},
 };
@@ -8,9 +8,14 @@ use o3::{buffer::resident, depot::capacity};
 use resident::bound;
 use sark_http::field::metadata::section::rules;
 
-use crate::manifold::{
+use sark_core::manifold::{
     schedule,
     server::{self, drain, timing},
+};
+
+use crate::{
+    conn::{self, event},
+    server::runtime::Connection,
 };
 
 mod error;
@@ -110,29 +115,8 @@ pub trait Spec {
     fn layout(&self) -> Layout;
 }
 
-/// Binds an exact-lifetime application to one concrete carrier and owner.
-pub trait Bind<'d, C, O>: Spec<Egress<'d>: 'd> + Sized
-where
-    C: server::Connection,
-{
-    type App: Application<
-            'd,
-            C,
-            O,
-            Fields = Self::Fields,
-            Failure = Self::Failure,
-            Egress<'d> = Self::Egress<'d>,
-        >;
-    type Error;
-
-    fn bind(self) -> Result<Self::App, Self::Error>;
-}
-
 /// Monomorphized semantic runtime driven by a protocol-specific host.
-pub trait Application<'d, C, O>: Spec<Egress<'d>: 'd>
-where
-    C: server::Connection,
-{
+pub trait Application<'d, E: event::Evidence, O>: Spec<Egress<'d>: 'd> {
     type State;
     type Timing;
     type Build;
@@ -142,26 +126,27 @@ where
     fn drive<H>(
         &mut self,
         state: &mut Self::State,
-        carrier: &mut C,
+        carrier: &mut Connection<'d, Self, E>,
         turn: &mut Turn<'_, '_, '_, 'd, O>,
         egress: schedule::Egress,
         context: &mut H,
         protocol: impl FnMut(
             &mut H,
-            &mut C,
+            &mut Connection<'d, Self, E>,
             &mut drain::Events<'_, 'd>,
             &Self::State,
-        ) -> Result<Option<server::Event<C>>, C::Error>,
-        notify: impl FnMut(&mut H, schedule::Wake<C::Key>),
-        finish: impl FnOnce(&mut H, &mut C),
-        report: impl FnMut(&mut H, Error<C::Error, Self::Failure>),
-    ) -> Result<drain::Progress, Error<C::Error, Self::Failure>>;
+        )
+            -> Result<Option<server::Event<Connection<'d, Self, E>>>, conn::Error>,
+        notify: impl FnMut(&mut H, schedule::Wake<crate::stream::Key>),
+        finish: impl FnOnce(&mut H, &mut Connection<'d, Self, E>),
+        report: impl FnMut(&mut H, Error<Self::Failure>),
+    ) -> Result<drain::Progress, Error<Self::Failure>>;
 
-    fn close(&mut self, state: &mut Self::State, carrier: &mut C, owner: O);
+    fn close(&mut self, state: &mut Self::State, carrier: &mut Connection<'d, Self, E>, owner: O);
 
-    fn selected(state: &Self::State, event: &server::Event<C>) -> bool;
+    fn selected(state: &Self::State, event: &server::Event<Connection<'d, Self, E>>) -> bool;
 
-    fn wake(state: &mut Self::State, wake: schedule::Wake<C::Key>) -> bool;
+    fn wake(state: &mut Self::State, wake: schedule::Wake<crate::stream::Key>) -> bool;
 
     /// Records released egress capacity without executing application work.
     fn released(state: &mut Self::State);
@@ -170,9 +155,6 @@ where
 }
 
 /// Deadline query implemented only by applications with timed state.
-pub trait Timed<'d, C, O>: Application<'d, C, O, Timing = timing::On>
-where
-    C: server::Connection,
-{
+pub trait Timed<'d, E: event::Evidence, O>: Application<'d, E, O, Timing = timing::On> {
     fn deadline(&self, state: &Self::State) -> Option<clock::Deadline<'d>>;
 }

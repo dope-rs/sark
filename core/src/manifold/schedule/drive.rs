@@ -1,16 +1,13 @@
-use o3::{
-    base::cell::region,
-    depot::{
-        array::Index,
-        queue::indexed::lanes::{Table, entry},
-    },
+use o3::depot::{
+    array::Index,
+    queue::indexed::lanes::{Table, entry},
 };
 
 use crate::manifold::{
     self,
     schedule::{
-        Block, CONTROL_READY, DATA_READY, Decision, Driver, LANES, Occupied, Report, Settlement,
-        Step, Terminal, Wait, WorkClass, policy::Policy,
+        Block, CONTROL_READY, ControlTurn, DATA_READY, Driver, LANES, Report, Settlement, Step,
+        Terminal, Wait, WorkClass, policy::Policy,
     },
 };
 
@@ -170,19 +167,24 @@ where
 
     fn turn(&mut self, source: Index<LANES>, class: WorkClass) -> Turn<K> {
         let driver = &mut *self.driver;
-        let Some(current) = self.domain.front(source) else {
+        let Some(mut current) = self.domain.front(source) else {
             return Turn::Empty;
         };
         let Some(permit) = driver.permit() else {
             return Turn::Blocked;
         };
-        let outcome = match class {
-            WorkClass::Control => region::Token::scope(|token| {
-                driver
-                    .control(permit, Occupied::new(current, token.proof()))
-                    .outcome
-            }),
-            WorkClass::Data => data(driver, current, permit),
+        let stream = current.key();
+        let result = match class {
+            WorkClass::Control => driver
+                .control(permit, stream, current.get_mut())
+                .map(ControlTurn::into_parts),
+            WorkClass::Data => driver
+                .data(permit, stream, current.get_mut())
+                .map(|step| (step, WorkClass::Data)),
+        };
+        let outcome = match result {
+            Ok((step, activity)) => borrowed(driver, current, stream, step, activity),
+            Err(error) => finish(driver, current, stream, Terminal::Failed(error), class),
         };
         Turn::Ready(outcome)
     }
@@ -200,32 +202,7 @@ pub(super) enum Effect {
     BlockData,
 }
 
-fn data<K, T, D>(
-    driver: &mut D,
-    mut current: entry::Occupied<'_, K, T, LANES>,
-    permit: D::Permit,
-) -> TurnOutcome<K>
-where
-    K: manifold::raw::Key,
-    D: Driver<T, Key = K>,
-{
-    let stream = current.key();
-    let step = match driver.data(permit, stream, current.get_mut()) {
-        Ok(step) => step,
-        Err(error) => {
-            return finish(
-                driver,
-                current,
-                stream,
-                Terminal::Failed(error),
-                WorkClass::Data,
-            );
-        }
-    };
-    borrowed(driver, current, stream, step, WorkClass::Data)
-}
-
-pub(super) fn borrowed<K, T, D>(
+fn borrowed<K, T, D>(
     driver: &mut D,
     current: entry::Occupied<'_, K, T, LANES>,
     stream: K,
@@ -240,7 +217,7 @@ where
         Step::Complete => finish(driver, current, stream, Terminal::Complete, activity),
         Step::Progress(next) => {
             current.move_to_back(next.ready_lane());
-            Decision::running(stream, activity)
+            TurnOutcome::new(stream, activity, Effect::None)
         }
         Step::Blocked(block) => {
             let wait = block.wait();
@@ -249,18 +226,18 @@ where
                 current.move_to_back(activity.blocked_lane(Some(wait)));
             }
             if blocked {
-                Decision::blocked(stream, activity)
+                TurnOutcome::new(stream, activity, Effect::BlockData)
             } else {
-                Decision::running(stream, activity)
+                TurnOutcome::new(stream, activity, Effect::None)
             }
         }
         Step::Idle => finish(driver, current, stream, Terminal::Idle, activity),
     }
 }
 
-pub(super) fn finish<K, T, D>(
+fn finish<K, T, D>(
     driver: &mut D,
-    current: entry::Occupied<'_, K, T, LANES>,
+    mut current: entry::Occupied<'_, K, T, LANES>,
     stream: K,
     terminal: Terminal<D::Error>,
     activity: WorkClass,
@@ -269,13 +246,13 @@ where
     K: manifold::raw::Key,
     D: Driver<T, Key = K>,
 {
-    let (vacant, value) = current.take();
     let effect = match &terminal {
         Terminal::Complete => Effect::Complete,
         Terminal::Idle | Terminal::Failed(_) => Effect::None,
     };
-    if let Settlement::Keep(value) = driver.settle(stream, value, terminal) {
-        vacant.insert(value);
+    match driver.settle(stream, current.get_mut(), terminal) {
+        Settlement::Keep(()) => current.unlink(),
+        Settlement::Remove => current.discard(),
     }
     TurnOutcome::new(stream, activity, effect)
 }

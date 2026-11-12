@@ -21,9 +21,12 @@ impl<'a, K: manifold::raw::Key, T, B: Block> Vacant<'a, K, T, B> {
         }
     }
 
-    /// Stores an owner that waits for an external input before becoming runnable.
-    pub fn store(self, value: T) {
-        self.slot.insert(value);
+    /// Stores an admitted owner with its initial runnable class.
+    pub fn store(self, value: T, ready: Option<WorkClass>) {
+        let slot = self.slot.insert(value);
+        if let Some(class) = ready {
+            slot.move_to_back(class.ready_lane());
+        }
     }
 
     pub fn insert(self, value: T, blocked: Option<B>) {

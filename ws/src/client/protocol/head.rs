@@ -30,20 +30,24 @@ impl<'d> Head<'d> {
         range: ops::Range<usize>,
     ) -> Result<Self, Fault> {
         let kind = match prepared {
-            inbound::Prepared::Ready(ready) => match ready.commit() {
-                inbound::ReadyEvent::Data(fragment::Push::DirectText(_)) => Whole::Text,
-                inbound::ReadyEvent::Data(fragment::Push::DirectBinary(_)) => Whole::Binary,
-                inbound::ReadyEvent::Data(fragment::Push::AssembledText(text)) => {
+            inbound::Prepared::Message(message) => match message.commit() {
+                fragment::Message::WholeText(_) => Whole::Text,
+                fragment::Message::WholeBinary(_) => Whole::Binary,
+                fragment::Message::JoinedText(text) => {
                     return Ok(Self(Kind::AssembledText(text)));
                 }
-                inbound::ReadyEvent::Data(fragment::Push::AssembledBinary(bytes)) => {
+                fragment::Message::JoinedBinary(bytes) => {
                     return Ok(Self(Kind::AssembledBinary(bytes)));
                 }
-                inbound::ReadyEvent::Data(fragment::Push::NeedMore) => {
-                    return Ok(Self(Kind::Continuation));
-                }
-                inbound::ReadyEvent::Pong(_) => Whole::Pong,
             },
+            inbound::Prepared::Fragment(fragment) => {
+                fragment.commit();
+                return Ok(Self(Kind::Continuation));
+            }
+            inbound::Prepared::Pong(pong) => {
+                pong.commit();
+                Whole::Pong
+            }
             inbound::Prepared::Required(need) => match need.defer().event {
                 inbound::Event::Ping(_) => Whole::Ping,
                 inbound::Event::Close(close) => Whole::Close(close.code()),

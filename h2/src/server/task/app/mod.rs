@@ -1,3 +1,4 @@
+use crate::server::app as semantic;
 use dope::core::{driver::route::Identity, random};
 use sark_http::payload::compress::dynamic::hash;
 
@@ -42,7 +43,7 @@ use sark_core::{
     life::{mode, owners},
     manifold::{
         schedule,
-        server::{app as semantic, drain},
+        server::drain,
         task::app::{Bind, Runtime},
     },
 };
@@ -150,7 +151,7 @@ where
         mode: &mut M,
         fault: &mut P,
     ) where
-        A: semantic::Application<'d, service::Connection<'d, A>, Id<'d, ID>>,
+        A: semantic::Application<'d, crate::conn::event::Retirement, Id<'d, ID>>,
         M: Transport<'d, ID>,
         M::Output: flush::Evidence<'d>,
         P: Fault<'d, W, A::Failure, ID, task::Build<A::Build>>,
@@ -167,11 +168,11 @@ where
     fn finish_transport<C: output::State<'d>>(
         conn: &mut Ctx<'_, '_, '_, '_, '_, 'd, ID, W, C, data::Bound<M::Output, A::Egress<'d>>>,
         driver: &mut driver::Context<'_, 'd>,
-        error: semantic::Error<Error, A::Failure>,
+        error: semantic::Error<A::Failure>,
         mode: &mut M,
         fault: &mut P,
     ) where
-        A: semantic::Application<'d, service::Connection<'d, A>, Id<'d, ID>>,
+        A: semantic::Application<'d, crate::conn::event::Retirement, Id<'d, ID>>,
         M: Transport<'d, ID>,
         M::Output: flush::Evidence<'d>,
         P: Fault<'d, W, A::Failure, ID, task::Build<A::Build>>,
@@ -194,7 +195,7 @@ where
         fault: &mut P,
     ) -> Sync
     where
-        A: semantic::Application<'d, service::Connection<'d, A>, Id<'d, ID>>,
+        A: semantic::Application<'d, crate::conn::event::Retirement, Id<'d, ID>>,
         M: Transport<'d, ID>,
         M::Output: flush::Evidence<'d>,
         P: Fault<'d, W, A::Failure, ID, task::Build<A::Build>>,
@@ -223,7 +224,7 @@ where
     ) -> Option<clock::Deadline<'d>>
     where
         D: timers::Policy<'d>,
-        A: semantic::Timed<'d, service::Connection<'d, A>, Id<'d, ID>>,
+        A: semantic::Timed<'d, crate::conn::event::Retirement, Id<'d, ID>>,
     {
         timers::Policy::controller(timers, &mut state.deadlines)
             .and_then(|timer| timer.deadline())
@@ -237,7 +238,7 @@ impl<'w, 'd: 'w, ID: Identity + 'd, R, W, M, D, P, S, A> handler::Scoped<'w, 'd,
     for App<'d, ID, R, W, M, D, P, A>
 where
     R: Runtime<'d, Target = Target<'d, ID>>,
-    A: service::Select<R> + semantic::Timed<'d, service::Connection<'d, A>, Id<'d, ID>>,
+    A: service::Select<R> + semantic::Timed<'d, crate::conn::event::Retirement, Id<'d, ID>>,
     R::Head: request::Head<Start = S>,
     W: Execution + 'd,
     receive::Scoped<true>: receive::Mode<W>,
@@ -394,7 +395,7 @@ impl<'d, ID: Identity + 'd, R, W, M, D, P, A> handler::Application<'d, ID>
     for App<'d, ID, R, W, M, D, P, A>
 where
     R: Runtime<'d, Target = Target<'d, ID>>,
-    A: service::Select<R> + semantic::Timed<'d, service::Connection<'d, A>, Id<'d, ID>>,
+    A: service::Select<R> + semantic::Timed<'d, crate::conn::event::Retirement, Id<'d, ID>>,
     W: Execution + 'd,
     receive::Scoped<true>: receive::Mode<W>,
     M: Transport<'d, ID>,
@@ -799,7 +800,7 @@ where
 impl<'d, ID: Identity + 'd, R, W, M, D, P, A> send::Report<'d, ID> for App<'d, ID, R, W, M, D, P, A>
 where
     R: Runtime<'d, Target = Target<'d, ID>>,
-    A: service::Select<R> + semantic::Timed<'d, service::Connection<'d, A>, Id<'d, ID>>,
+    A: service::Select<R> + semantic::Timed<'d, crate::conn::event::Retirement, Id<'d, ID>>,
     W: Execution + 'd,
     receive::Scoped<true>: receive::Mode<W>,
     M: Transport<'d, ID>,
@@ -824,7 +825,7 @@ where
 impl<'d, ID: Identity + 'd, R, W, M, D, P, A> send::Drive<'d, ID> for App<'d, ID, R, W, M, D, P, A>
 where
     R: Runtime<'d, Target = Target<'d, ID>>,
-    A: service::Select<R> + semantic::Timed<'d, service::Connection<'d, A>, Id<'d, ID>>,
+    A: service::Select<R> + semantic::Timed<'d, crate::conn::event::Retirement, Id<'d, ID>>,
     W: Execution + 'd,
     receive::Scoped<true>: receive::Mode<W>,
     M: Transport<'d, ID>,

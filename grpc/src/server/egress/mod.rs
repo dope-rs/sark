@@ -5,7 +5,10 @@ use o3::{
     buffer::storage,
     depot::{capacity, queue::pool},
 };
-use sark_core::manifold::{self, schedule, server, stream};
+use sark_core::manifold::{
+    self, raw::Key as _, schedule, server,
+    stream::{self, Write as _},
+};
 
 use crate::{
     message,
@@ -49,15 +52,14 @@ impl Payload {
     }
 }
 
-pub(in crate::server) struct Store<K: manifold::raw::Key> {
-    lanes: pool::Lanes<Payload, pending::State<K>>,
+pub(in crate::server) struct Store {
+    lanes: pool::Lanes<Payload, pending::State>,
     credits: credits::Ledger,
     wire_limit: usize,
     message_limit: capacity::Count,
-    active: usize,
 }
 
-impl<K: manifold::raw::Key> Store<K> {
+impl Store {
     pub(in crate::server) fn try_new(
         calls: capacity::Count,
         messages: capacity::Count,
@@ -66,35 +68,33 @@ impl<K: manifold::raw::Key> Store<K> {
     ) -> Result<Self, alloc::Error> {
         let plan = pool::Plan::from_counts(messages, calls);
         Ok(Self {
-            lanes: pool::Lanes::<_, pending::State<K>>::try_new(plan)?,
+            lanes: pool::Lanes::try_new(plan)?,
             credits: credits::Ledger::default(),
             wire_limit: bytes,
             message_limit: limit,
-            active: 0,
         })
     }
 
-    fn try_pending(&self, key: K) -> Result<bool, Fault> {
+    fn try_pending<K: manifold::raw::Key>(&self, key: K) -> Result<bool, Fault> {
         let lane = self.lanes.try_bind(key.slot()).map_err(Fault::Lane)?;
         match lane.state().pending.as_ref() {
-            Some(pending) if pending.key == key => Ok(true),
-            Some(_) => Err(Fault::Protocol),
+            Some(_) => Ok(true),
             None if lane.is_empty() => Ok(false),
             None => Err(Fault::Accounting),
         }
     }
 
-    pub(super) fn remove<S: server::Connection<Key = K, Output = storage::Shared>>(
+    pub(super) fn remove<S: server::Connection<Output = storage::Shared>>(
         &mut self,
-        key: K,
+        key: S::Key,
         conn: &mut S,
     ) -> Result<Release, Fault> {
         self.replace(key, conn, None).map(|(released, _)| released)
     }
 
-    pub(super) fn fail<S: server::Connection<Key = K, Output = storage::Shared>>(
+    pub(super) fn fail<S: server::Connection<Output = storage::Shared>>(
         &mut self,
-        key: K,
+        key: S::Key,
         conn: &mut S,
         status: crate::Status,
     ) -> Result<(Release, bool), Fault> {
@@ -103,35 +103,24 @@ impl<K: manifold::raw::Key> Store<K> {
         self.replace(key, conn, Some(trailer))
     }
 
-    fn replace<S: server::Connection<Key = K, Output = storage::Shared>>(
+    fn replace<S: server::Connection<Output = storage::Shared>>(
         &mut self,
-        key: K,
+        key: S::Key,
         conn: &mut S,
         trailer: Option<pending::Trailer>,
     ) -> Result<(Release, bool), Fault> {
-        let Self {
-            lanes,
-            credits,
-            active,
-            ..
-        } = self;
+        let Self { lanes, credits, .. } = self;
         let mut lane = lanes.try_bind_mut(key.slot()).map_err(Fault::Lane)?;
         let empty = lane.is_empty();
         let state = lane.state_mut();
         let bytes = state.charge.amount();
         let pending = match state.pending.as_ref() {
-            Some(pending) if pending.key == key => Some(pending),
-            Some(_) => return Err(Fault::Protocol),
+            Some(pending) => Some(pending),
             None if empty && bytes == 0 => None,
             None => return Err(Fault::Accounting),
         };
-        let output = trailer.and_then(|trailer| pending::Pending::failed(key, pending, trailer));
+        let output = trailer.and_then(|trailer| pending::Pending::failed(pending, trailer));
         let retained = output.is_some();
-        let next = match (pending.is_some(), retained) {
-            (true, false) => active.checked_sub(1).ok_or(Fault::Accounting)?,
-            (false, true) => active.checked_add(1).ok_or(Fault::Accounting)?,
-            (true, true) | (false, false) => *active,
-        };
         let released = Release {
             prepared: pending
                 .is_some_and(|pending| matches!(pending.phase, pending::Phase::Prepared(_))),
@@ -146,24 +135,21 @@ impl<K: manifold::raw::Key> Store<K> {
         release.commit();
         lane.clear();
         lane.state_mut().pending = output;
-        *active = next;
         Ok((released, retained))
     }
 
     pub(super) fn is_quiescent(&self) -> bool {
-        self.active == 0
-            && self.credits.used() == 0
-            && self.lanes.available() == self.lanes.capacity()
+        self.credits.used() == 0 && self.lanes.available() == self.lanes.capacity()
     }
 
-    pub(super) fn control<W>(
+    pub(super) fn control<S>(
         &mut self,
-        key: K,
-        writer: impl FnOnce() -> W,
+        key: S::Key,
+        conn: &mut S,
         released: &mut bool,
-    ) -> Result<schedule::ControlTurn<W::Block>, Error<W::Error>>
+    ) -> Result<schedule::ControlTurn<S::Block>, Error<S::Error>>
     where
-        W: stream::Write<storage::Shared>,
+        S: server::Connection<Output = storage::Shared>,
     {
         let mut lane = self
             .lanes
@@ -175,10 +161,7 @@ impl<K: manifold::raw::Key> Store<K> {
             .pending
             .as_mut()
             .ok_or(Error::Fault(Fault::Protocol))?;
-        if current.key != key {
-            return Err(Error::Fault(Fault::Protocol));
-        }
-        let mut writer = writer();
+        let mut writer = conn.writer(key);
         let (boundary, control) = match &current.phase {
             pending::Phase::Head(metadata) => {
                 let boundary = stream::Boundary::More;
@@ -235,14 +218,14 @@ impl<K: manifold::raw::Key> Store<K> {
         })
     }
 
-    pub(super) fn data<W>(
+    pub(super) fn data<S>(
         &mut self,
-        key: K,
-        writer: impl FnOnce() -> W,
+        key: S::Key,
+        conn: &mut S,
         released: &mut bool,
-    ) -> Result<schedule::DataTurn<W::Block>, Error<W::Error>>
+    ) -> Result<schedule::DataTurn<S::Block>, Error<S::Error>>
     where
-        W: stream::Write<storage::Shared>,
+        S: server::Connection<Output = storage::Shared>,
     {
         let Self { lanes, credits, .. } = self;
         let mut lane = lanes
@@ -255,9 +238,6 @@ impl<K: manifold::raw::Key> Store<K> {
             .pending
             .as_mut()
             .ok_or(Error::Fault(Fault::Accounting))?;
-        if current.key != key {
-            return Err(Error::Fault(Fault::Protocol));
-        }
         let offset = match &mut current.phase {
             pending::Phase::Body { offset } => offset,
             pending::Phase::Head(_) | pending::Phase::Prepared(_) => {
@@ -265,7 +245,7 @@ impl<K: manifold::raw::Key> Store<K> {
             }
         };
         let header = payload.header();
-        let mut writer = writer();
+        let mut writer = conn.writer(key);
         let written = match writer
             .data(&header, payload.shared(), *offset, stream::Boundary::More)
             .map_err(Error::Write)?

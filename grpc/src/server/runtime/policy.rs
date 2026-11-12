@@ -1,6 +1,7 @@
 use dope::core::driver::{self, schedule::app::Work};
 use o3::buffer::resident;
-use sark_core::manifold::server::{app, drain::Progress};
+use sark_core::manifold::server::drain::Progress;
+use sark_h2::server::app;
 
 use crate::server::runtime::schedule::wake;
 
@@ -108,6 +109,7 @@ where
     type Timer: state::Timing<'d>;
 
     const TASKS: bool;
+    const BUFFERED: bool = true;
 
     fn start<W: Write>(
         &mut self,

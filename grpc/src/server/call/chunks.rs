@@ -118,9 +118,6 @@ impl<C: session::Storage, P> Queue<'_, C, P> {
         stream: &mut input::Input<C>,
         segments: &segments::Pool<C>,
     ) -> Result<input::Turn<C>, crate::Status> {
-        if matches!(stream.request, input::Request::Finished) {
-            return Ok(input::Turn::Complete);
-        }
         let next = match self.lane.front_mut() {
             Some(mut front) => {
                 let chunk = front.get_mut();

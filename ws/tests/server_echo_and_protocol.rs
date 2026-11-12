@@ -125,6 +125,58 @@ fn session_retains_tail_across_owned_output() {
 }
 
 #[test]
+fn final_fragment_waits_for_output() {
+    let calls = Cell::new(0);
+    let echo = Echo {
+        calls: &calls,
+        repeat: None,
+        activity: &|_| {},
+        failed: &|error| panic!("session failure: {error:?}"),
+    };
+    let mut session = machine::Machine::new(sark_ws::server::Session::new(echo, 1024, 1024));
+    let mut wire = b"x".try_masked(0x2, true).expect("first message");
+    wire.extend([b'a'; 16].try_masked(0x2, false).expect("fragment"));
+    wire.extend([b'b'; 48].try_masked(0x0, true).expect("final fragment"));
+    let machine::Access::Vacant(slot) = session.input() else {
+        panic!("initial input slot");
+    };
+    slot.commit(owned::Segments::from(
+        storage::Shared::try_copy(&wire).expect("input"),
+    ));
+    let mut scratch = Vec::new();
+    let mut output = Vec::new();
+    for pass in 0..2 {
+        let mut prefix = [0; 160];
+        let turn = session.transact(&mut prefix, &mut scratch, |written, emit| {
+            match emit.into_parts().0 {
+                admit::Payload::Present { output, permit } => {
+                    permit.commit::<_, ()>((written, Some(output)))
+                }
+                admit::Payload::Vacant(permit) => permit.commit((written, None)),
+            }
+        });
+        let machine::Transaction::Committed {
+            receipt: (written, body),
+            ..
+        } = turn
+        else {
+            panic!("output admission");
+        };
+        output.extend_from_slice(&prefix[..written]);
+        if let Some(body) = body {
+            for chunk in owned::Segments::from(body).segments() {
+                output.extend_from_slice(chunk);
+            }
+        }
+        assert_eq!(calls.get(), pass + 1);
+    }
+    let mut expected = b"\x82\x01x\x82\x40".to_vec();
+    expected.extend([b'a'; 16]);
+    expected.extend([b'b'; 48]);
+    assert_eq!(output, expected);
+}
+
+#[test]
 fn split_writes_echo() {
     run_echo(1, None, None, |bind| {
         for split in [1, 15, OPENING.len() - 3] {

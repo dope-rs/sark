@@ -1,6 +1,3 @@
-mod call;
-pub use call::Call;
-
 /// Direct request execution.
 pub mod direct;
 /// Driver-local task execution.
@@ -19,3 +16,11 @@ pub mod state;
 pub mod stream;
 /// Unary task execution.
 pub mod unary;
+
+pub(in crate::server) type Connection<'d, E> = sark_h2::conn::machine::Connection<
+    sark_h2::ServerRole,
+    crate::protocol::section::Plan,
+    o3::buffer::resident::Shared<'d>,
+    sark_http::field::metadata::section::rules::RejectPush,
+    E,
+>;

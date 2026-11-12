@@ -1,3 +1,4 @@
+use crate::server::app;
 use std::marker;
 
 use dope::{
@@ -13,10 +14,7 @@ use dope::{
 };
 use sark_core::{
     life::mode,
-    manifold::{
-        schedule,
-        server::{app, timing},
-    },
+    manifold::{schedule, server::timing},
 };
 
 use crate::{
@@ -25,7 +23,7 @@ use crate::{
     server::{
         self,
         runtime::{
-            self, Connection, Context,
+            self, Context,
             app::{App, Fault},
             output::flush::{self, Evidence, Progress},
         },
@@ -126,7 +124,7 @@ where
 }
 pub(super) trait Deadline<'d, ID: Identity, A, W, F, E>
 where
-    A: app::Application<'d, Connection<'d, A>, conn::Id<'d, ID>>,
+    A: app::Application<'d, crate::conn::event::Ignore, conn::Id<'d, ID>>,
     W: wire::Spec,
     F: Fault<'d, W, A::Failure, ID, runtime::Build<A::Build>>,
     E: Evidence<'d>,
@@ -148,7 +146,7 @@ where
 
 impl<'d, ID: Identity, A, W, F, E> Deadline<'d, ID, A, W, F, E> for timing::Off
 where
-    A: app::Application<'d, Connection<'d, A>, conn::Id<'d, ID>>,
+    A: app::Application<'d, crate::conn::event::Ignore, conn::Id<'d, ID>>,
     W: wire::Spec,
     F: Fault<'d, W, A::Failure, ID, runtime::Build<A::Build>>,
     E: Evidence<'d>,
@@ -202,7 +200,7 @@ where
 
 impl<'d, ID: Identity, A, W, F, E> Deadline<'d, ID, A, W, F, E> for timing::On
 where
-    A: app::Timed<'d, Connection<'d, A>, conn::Id<'d, ID>>,
+    A: app::Timed<'d, crate::conn::event::Ignore, conn::Id<'d, ID>>,
     W: wire::Spec,
     F: Fault<'d, W, A::Failure, ID, runtime::Build<A::Build>>,
     E: Evidence<'d>,

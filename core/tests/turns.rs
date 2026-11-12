@@ -78,32 +78,38 @@ fn preserves_continuations() {
 
 #[test]
 fn preserves_idle_owner() {
-    let mut run = Runtime::try_bounded(capacity::Count::new(1), capacity::Count::new(1))
-        .expect("one resident slot");
-    let key = key::Handle::from_parts(key::Parts::new(0, key::Generation::MIN));
-    (run.try_insert(key, Stage::Body, schedule::Activation::control(None)))
-        .as_ref()
-        .expect("test operation must succeed");
-    let mut writer = Writer::default();
-    assert!(matches!(
-        run.drive(&mut writer),
-        schedule::Report {
-            turns: 0,
-            completed: 0
-        }
-    ));
-    assert!(run.has_runnable());
-    writer.remaining = 1;
-    assert!(matches!(
-        run.drive(&mut writer),
-        schedule::Report {
-            turns: 1,
-            completed: 0
-        }
-    ));
-    assert!(!run.has_runnable());
-    assert!(matches!(run.get(key), Some(Stage::Body)));
-    assert_eq!(writer.idle, 1);
-    assert_eq!(writer.closed, 0);
-    assert!(!writer.invalid);
+    for (ready, control, data) in [
+        (None, 0, 0),
+        (Some(schedule::WorkClass::Control), 1, 0),
+        (Some(schedule::WorkClass::Data), 0, 1),
+    ] {
+        let mut run = Runtime::try_bounded(capacity::Count::new(1), capacity::Count::new(1))
+            .expect("one resident slot");
+        let key = key::Handle::from_parts(key::Parts::new(0, key::Generation::MIN));
+        let mut writer = Writer::default();
+        let ((), allocs) = Tracker::count(|| {
+            run.vacant(key)
+                .expect("vacant owner")
+                .store(Stage::Body, ready);
+            assert!(matches!(
+                run.drive(&mut writer),
+                schedule::Report {
+                    turns: 0,
+                    completed: 0
+                }
+            ));
+            assert_eq!(run.has_runnable(), ready.is_some());
+            writer.remaining = 1;
+            assert_eq!(run.drive(&mut writer).turns, control + data);
+        });
+        assert_eq!(allocs, 0);
+        assert!(!run.has_runnable());
+        assert!(matches!(run.get(key), Some(Stage::Body)));
+        assert_eq!(
+            (writer.control, writer.data, writer.idle),
+            (control, data, control)
+        );
+        assert_eq!(writer.closed, 0);
+        assert!(!writer.invalid);
+    }
 }

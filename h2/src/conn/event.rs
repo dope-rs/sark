@@ -16,7 +16,7 @@ use sark_http::field::metadata::{
     },
 };
 
-use crate::{conn::outputs::payloads, flow, frame, frame::numbers, hpack::decode::limit, stream};
+use crate::{conn::outputs::payloads, frame, frame::numbers, hpack::decode::limit, stream};
 
 /// Smallest contiguous prefix owner that can always join one retained DATA
 /// body without first consuming protocol state.
@@ -24,6 +24,8 @@ use crate::{conn::outputs::payloads, flow, frame, frame::numbers, hpack::decode:
 pub const MIN_RETAINED_WRITE_PREFIX_CAPACITY: usize = frame::HEADER_LEN + payloads::INLINE_PREFIX;
 
 pub use crate::conn::machine::ready::Incoming as Ready;
+
+pub type Permit = pool::Span<owners::Plain<pool::Width<1>>, pool::Owned, pool::Frozen>;
 
 /// Exact header admission and semantic validation that rejected a stream.
 #[derive(Clone, Copy, Debug)]
@@ -147,22 +149,6 @@ impl Evidence for Ignore {
     }
 }
 
-#[must_use = "staged DATA owns flow credit until the machine accepts or cancels it"]
-pub(crate) struct Staging {
-    pub(crate) charge: hold::Charge,
-    pub(crate) credit: flow::Reserved,
-}
-
-impl Staging {
-    pub(crate) fn into_parts(self) -> (hold::Charge, flow::Reserved) {
-        (self.charge, self.credit)
-    }
-}
-
-const _: () = assert!(
-    core::mem::size_of::<Staging>() == core::mem::size_of::<(hold::Charge, flow::Reserved)>()
-);
-
 impl Retirement {
     pub(crate) fn from_body<C: session::Storage>(stream: stream::Key, body: &C) -> Self {
         Self {
@@ -254,7 +240,7 @@ impl<C: session::Storage> DataPayload<C> {
 }
 
 impl<C: session::Storage> Payload<C> for DataPayload<C> {
-    type Permit = pool::Span<owners::Plain<pool::Width<1>>, pool::Owned, pool::Frozen>;
+    type Permit = Permit;
 
     fn into_parts(self) -> (segments::Chain<C>, Self::Permit) {
         (self.segments, self.permit)

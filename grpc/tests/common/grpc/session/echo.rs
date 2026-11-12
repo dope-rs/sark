@@ -2,11 +2,14 @@ use std::cell::Cell;
 
 use dope_test::alloc::Tracker;
 use o3::buffer;
-use sark_grpc::server::service::{
-    Request, Response,
-    handler::{Handler, RequestState},
-    reply::Write,
-    timers,
+use sark_grpc::{
+    protocol::request,
+    server::service::{
+        Request, Response, Stream,
+        handler::{Handler, RequestState, Start},
+        reply::{Reply, Write},
+        timers,
+    },
 };
 
 pub struct Echo<'a>(pub &'a Cell<Option<usize>>);
@@ -14,6 +17,23 @@ pub struct Echo<'a>(pub &'a Cell<Option<usize>>);
 impl Handler for Echo<'_> {
     type Call = ();
     type Timer = timers::Off;
+
+    fn start<W: Write>(
+        &mut self,
+        _: &mut (),
+        _: &mut Stream,
+        head: &request::Head,
+        reply: &mut Reply<'_, W>,
+    ) -> Start<()> {
+        if head.path() == b"/test/prepare" {
+            reply.push_message(b"discarded".to_vec());
+            reply
+                .trailers_mut()
+                .push(b"x-trailer", b"unfinished")
+                .expect("valid trailer");
+        }
+        Start::buffered(())
+    }
 
     fn request<P: buffer::raw::Segment, W: Write>(
         &mut self,

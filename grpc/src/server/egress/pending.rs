@@ -1,4 +1,4 @@
-use sark_core::manifold::{self, schedule, stream::Boundary};
+use sark_core::manifold::{schedule, stream::Boundary};
 
 use crate::{
     metadata,
@@ -32,23 +32,21 @@ impl Trailer {
     }
 }
 
-pub(super) struct Pending<K: manifold::raw::Key> {
-    pub(super) key: K,
+pub(super) struct Pending {
     pub(super) phase: Phase,
     pub(super) trailer: Option<Trailer>,
 }
 
-impl<K: manifold::raw::Key> Pending<K> {
-    pub(super) fn new(key: K, metadata: metadata::Metadata) -> Self {
+impl Pending {
+    pub(super) fn new(metadata: metadata::Metadata) -> Self {
         Self {
-            key,
             phase: Phase::Head(metadata),
             trailer: None,
         }
     }
 
     /// Replaces only output that has not crossed a message-framing boundary.
-    pub(super) fn failed(key: K, pending: Option<&Self>, trailer: Trailer) -> Option<Self> {
+    pub(super) fn failed(pending: Option<&Self>, trailer: Trailer) -> Option<Self> {
         let phase = match pending.map(|pending| &pending.phase) {
             None | Some(Phase::Head(_) | Phase::Prepared(Boundary::More)) => {
                 Phase::Head(metadata::Metadata::new())
@@ -59,7 +57,6 @@ impl<K: manifold::raw::Key> Pending<K> {
             Some(Phase::Body { .. }) => return None,
         };
         Some(Self {
-            key,
             phase,
             trailer: Some(trailer),
         })
@@ -82,16 +79,8 @@ impl<K: manifold::raw::Key> Pending<K> {
 }
 
 /// A lane's credit account exists independently of its response metadata.
-pub(super) struct State<K: manifold::raw::Key> {
+#[derive(Default)]
+pub(super) struct State {
     pub(super) charge: credits::Charge,
-    pub(super) pending: Option<Pending<K>>,
-}
-
-impl<K: manifold::raw::Key> Default for State<K> {
-    fn default() -> Self {
-        Self {
-            charge: credits::Charge::default(),
-            pending: None,
-        }
-    }
+    pub(super) pending: Option<Pending>,
 }

@@ -7,7 +7,7 @@ use sark_h2::{
     frame::{
         HEADER_LEN,
         layout::Header,
-        numbers::{Flags, Type},
+        numbers::{Flags, Length, Type},
     },
 };
 
@@ -17,6 +17,13 @@ fn emits_one_frame() {
     conn.transfer().drain(usize::MAX);
     let stream = conn.streams().headers().request([], Boundary::More);
     let stream = stream.expect("request head");
+    let empty = Header {
+        length: Length::ZERO,
+        kind: Type::Headers,
+        flags: Flags(Flags::END_HEADERS),
+        stream_id: stream,
+    };
+    assert_eq!(conn.output().first(), empty.wire_bytes());
     conn.transfer().drain(usize::MAX);
 
     let written = conn

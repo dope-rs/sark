@@ -132,26 +132,22 @@ where
 
 impl<'d, D: duplex::Session<'d>> Data<'d, D> {
     pub(in crate::server::task) fn push(
-        self,
+        &mut self,
         data: event::DataPayload<resident::Shared<'d>>,
         boundary: Boundary,
-    ) -> (Self, Duplex<event::DataPayload<resident::Shared<'d>>>) {
+    ) -> Duplex<event::DataPayload<resident::Shared<'d>>> {
         match self {
-            Self::Duplex { mut input } => {
-                let result = input.push(data, boundary);
-                (Self::Duplex { input }, Duplex::Applied(result))
-            }
-            other @ Self::Body { .. } => (other, Duplex::Other(data)),
+            Self::Duplex { input } => Duplex::Applied(input.push(data, boundary)),
+            Self::Body { .. } => Duplex::Other(data),
         }
     }
 
-    pub(in crate::server::task) fn finish(self) -> (Self, Duplex<(), input::Error>) {
+    pub(in crate::server::task) fn finish(&mut self) -> Duplex<(), input::Error> {
         match self {
-            Self::Duplex { mut input } => {
-                let result = input.finish().map_err(input::Error::Machine);
-                (Self::Duplex { input }, Duplex::Applied(result))
+            Self::Duplex { input } => {
+                Duplex::Applied(input.finish().map_err(input::Error::Machine))
             }
-            other @ Self::Body { .. } => (other, Duplex::Other(())),
+            Self::Body { .. } => Duplex::Other(()),
         }
     }
 }

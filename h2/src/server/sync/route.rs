@@ -1,3 +1,4 @@
+use crate::server::app;
 use std::convert::Infallible;
 
 use o3::alloc;
@@ -5,7 +6,7 @@ use sark_core::{
     decode::{self, request},
     manifold::{
         schedule,
-        server::{Event, app, drain, timing},
+        server::{Event, drain, timing},
     },
 };
 
@@ -55,7 +56,7 @@ where
     }
 }
 
-impl<'d, R, O> app::Application<'d, Connection<'d, Route<R>>, O> for Route<R>
+impl<'d, R, O> app::Application<'d, crate::conn::event::Ignore, O> for Route<R>
 where
     R: Dispatch<'d>,
     O: Copy,
@@ -84,8 +85,8 @@ where
         ) -> Result<Option<Event<Connection<'d, Self>>>, crate::conn::Error>,
         _: impl FnMut(&mut H, schedule::Wake<crate::stream::Key>),
         finish: impl FnOnce(&mut H, &mut Connection<'d, Self>),
-        mut report: impl FnMut(&mut H, app::Error<crate::conn::Error, Self::Failure>),
-    ) -> Result<drain::Progress, app::Error<crate::conn::Error, Self::Failure>> {
+        mut report: impl FnMut(&mut H, app::Error<Self::Failure>),
+    ) -> Result<drain::Progress, app::Error<Self::Failure>> {
         let mut report = |error| report(context, app::Error::Connection(error));
         if matches!(egress, schedule::Egress::Released) {
             match Self::State::has_input(carrier) {

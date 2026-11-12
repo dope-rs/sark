@@ -97,15 +97,6 @@ impl<'d, T, S, K, B: bound::Bound, E> Runtime<'d, T, S, K, B, E> {
     }
 
     #[doc(hidden)]
-    pub const fn cleared(&self) -> Option<usize> {
-        if self.running.is_none() {
-            Some(0)
-        } else {
-            None
-        }
-    }
-
-    #[doc(hidden)]
     pub const fn owners(&self) -> usize {
         if self.running.is_some() { 1 } else { 0 }
     }

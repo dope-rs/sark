@@ -1,3 +1,4 @@
+use sark_h2::server::app;
 pub mod common;
 
 use std::{cell::Cell, convert::Infallible};
@@ -16,10 +17,7 @@ use common::grpc::{
 };
 use dope::{core::driver::route::KeyTag, net::wire};
 use dope_test::harness::server::Pair;
-use sark_core::manifold::{
-    server::app,
-    stream::{Boundary, Section},
-};
+use sark_core::manifold::stream::{Boundary, Section};
 use sark_grpc::{
     Code,
     server::{

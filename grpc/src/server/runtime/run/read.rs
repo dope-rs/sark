@@ -1,25 +1,29 @@
 use dope::core::driver::schedule::clock;
-use o3::{
-    base::time::Positive,
-    buffer::{resident, storage},
+use o3::{base::time::Positive, buffer::resident, depot::capacity::Count};
+use sark_core::{
+    deadline,
+    manifold::{
+        server,
+        stream::{Boundary, Message, Section},
+    },
 };
-use sark_core::manifold::{
-    server::{self, Connection, app},
-    stream::{Boundary, Message, Section},
+use sark_h2::{
+    conn::{self, event},
+    server::app,
+    stream::Key,
 };
-use sark_h2::stream::Key;
 
 use crate::{
     Reason, message,
-    protocol::{request, section},
+    protocol::request,
     server::{
-        call::{Handler, input},
+        call::{self, Handler, input},
         calls,
         egress::{self, draft},
         runtime::{
-            policy,
+            Connection, policy,
             run::drive,
-            state::{Store, active},
+            state::{self, Store, active},
         },
         service::{self, handler, reply::Reply},
     },
@@ -31,23 +35,17 @@ where
     X: policy::Dispatch<'d, O, Target = active::Entry<'r>>,
     X::Timer: drive::Mode<'d>,
 {
-    pub(super) fn event<C>(
+    pub(super) fn event<E: event::Evidence>(
         &mut self,
         now: clock::Moment<'d>,
-        state: &mut Store<'r, 'd, Handler<X::Call, X::State>, X::Timer, C>,
-        conn: &mut C,
+        state: &mut Store<'r, 'd, Handler<X::Call, X::State>, X::Timer>,
+        conn: &mut Connection<'d, E>,
         turn: &mut app::Turn<'_, '_, '_, 'd, O>,
         active: &'r active::Signals,
-        event: server::Event<C>,
+        event: server::Event<Connection<'d, E>>,
     ) -> Result<(), active::Error>
     where
-        C: Connection<
-                Key = Key,
-                Owner = resident::Shared<'d>,
-                Fields = section::Owner,
-                Output = storage::Shared,
-            >,
-        F: FnMut(&mut H, Key, egress::Error<C::Error>),
+        F: FnMut(&mut H, Key, egress::Error<conn::Error>),
     {
         use server::Event;
 
@@ -55,29 +53,105 @@ where
             Event::Head {
                 message: frame,
                 head,
-                section: Section::Trailing,
-                ..
+                section,
             } => {
                 let stream = frame.key();
-                let Some(entry) = state.calls.entry(stream) else {
-                    return Ok(());
+                let entry = match section {
+                    Section::Initial => {
+                        let entry = active.try_entry(stream)?;
+                        'head: {
+                            let head = match request::Head::from_owner(head.into_parts().0) {
+                                Ok(head) => head,
+                                Err(status) => {
+                                    self.fail(state, conn, status, entry);
+                                    break 'head;
+                                }
+                            };
+                            let vacant = match state.calls.try_reserve(entry) {
+                                Ok(vacant) => vacant,
+                                Err(error) => {
+                                    self.fail(state, conn, crate::Status::from(error), entry);
+                                    break 'head;
+                                }
+                            };
+                            let start = (|| match self.try_start(
+                                now,
+                                &mut state.egress,
+                                &mut state.call_deadlines,
+                                state.deadline_capacity,
+                                turn,
+                                entry,
+                                head,
+                            ) {
+                                Ok((opened, reply)) => {
+                                    let done = reply.is_finished();
+                                    let (app, output, input) =
+                                        opened.into_input(self.limits.bytes());
+                                    let output = if done {
+                                        handler::Production::Idle
+                                    } else {
+                                        output
+                                    };
+                                    let (metadata, trailers, status, draft) = reply.into_parts();
+                                    let (ready, result) = match draft.prepare(
+                                        metadata,
+                                        trailers,
+                                        status,
+                                        draft::Lifecycle::Keep,
+                                    ) {
+                                        Ok(prepared) => {
+                                            let ready = prepared.work();
+                                            prepared.apply();
+                                            (ready, Ok((done, output)))
+                                        }
+                                        Err(status) => (None, Err(status)),
+                                    };
+                                    vacant
+                                        .store(call::State::new(entry, input, app, output), ready);
+                                    result
+                                }
+                                Err(status) => {
+                                    vacant.store(call::State::reserved(entry), None);
+                                    Err(status)
+                                }
+                            })();
+                            let (done, output) = match start {
+                                Ok(outcome) => outcome,
+                                Err(status) => {
+                                    self.fail(state, conn, status, entry);
+                                    break 'head;
+                                }
+                            };
+                            match (done, output) {
+                                (true, _) => {
+                                    self.complete(state, conn, entry);
+                                }
+                                (false, handler::Production::Ready) => entry.output(),
+                                (false, handler::Production::Idle) => {}
+                            }
+                        }
+                        entry
+                    }
+                    Section::Trailing => {
+                        let Some(entry) = state.calls.entry(stream) else {
+                            return Ok(());
+                        };
+                        match request::Head::trailers(head.into_parts().0) {
+                            Ok(meta) => {
+                                if let Some(input) = state.calls.stream_mut(stream) {
+                                    input.trailers = meta;
+                                }
+                            }
+                            Err(status) => self.fail(state, conn, status, entry),
+                        }
+                        entry
+                    }
                 };
-                self.trailers(state, conn, head.into_parts().0, entry);
-                if matches!(frame.boundary(), Boundary::End) {
-                    Self::end(state, entry);
-                }
-            }
-            Event::Head {
-                message: frame,
-                head,
-                ..
-            } => {
-                let stream = frame.key();
-                let entry = active.try_entry(stream)?;
-                let boundary = frame.boundary();
-                self.headers(now, state, conn, turn, head.into_parts().0, entry);
-                if matches!(boundary, Boundary::End) {
-                    Self::end(state, entry);
+                if matches!(frame.boundary(), Boundary::End)
+                    && let Some(input) = state.calls.stream_mut(stream)
+                {
+                    input.data.end();
+                    entry.app();
                 }
             }
             Event::Data {
@@ -102,104 +176,45 @@ where
         Ok(())
     }
 
-    fn headers<C>(
+    #[inline(always)]
+    fn try_start<'e>(
         &mut self,
         now: clock::Moment<'d>,
-        state: &mut Store<'r, 'd, Handler<X::Call, X::State>, X::Timer, C>,
-        conn: &mut C,
+        egress: &'e mut egress::Store,
+        call_deadlines: &mut Option<deadline::Exact<Key, clock::Deadline<'d>>>,
+        deadline_capacity: Count,
         turn: &mut app::Turn<'_, '_, '_, 'd, O>,
-        fields: section::Owner,
         entry: active::Entry<'r>,
-    ) where
-        C: Connection<Key = Key, Owner = resident::Shared<'d>, Output = storage::Shared>,
-        F: FnMut(&mut H, Key, egress::Error<C::Error>),
-    {
+        head: request::Head,
+    ) -> Result<
+        (
+            call::Opened<Handler<X::Call, X::State>>,
+            Reply<'e, draft::Draft<'e, Key>>,
+        ),
+        crate::Status,
+    > {
         let stream = entry.key();
-        let head = match request::Head::from_owner(fields) {
-            Ok(head) => head,
-            Err(status) => {
-                self.fail(state, conn, status, entry);
-                return;
-            }
-        };
-        match state.calls.try_reserve(entry) {
-            Ok(()) => {}
-            Err(error) => {
-                self.fail(state, conn, crate::Status::from(error), entry);
-                return;
-            }
+        if let Some(timeout) = head.timeout() {
+            let timeout = Positive::try_new(timeout)
+                .map_err(|_| crate::Status::from_code(crate::Code::DeadlineExceeded))?;
+            state::try_deadline(call_deadlines, deadline_capacity, stream, now, timeout)?;
         }
-        let result = (|| {
-            if let Some(timeout) = head.timeout() {
-                let timeout = Positive::try_new(timeout)
-                    .map_err(|_| crate::Status::from_code(crate::Code::DeadlineExceeded))?;
-                state.try_deadline(stream, now, timeout)?;
-            }
-            let draft = draft::Draft::try_new(&mut state.egress, stream)?;
-            let mut reply = Reply::with_writer(draft);
-            let mut cx = service::Stream::new(stream.id());
-            let opened = self.exec.start(turn, entry, &mut cx, head, &mut reply);
-            let done = reply.is_finished();
-            let (app, output, input) = opened.into_input(self.limits.bytes());
-            let output = match (output, done) {
-                (handler::Production::Ready, false) => handler::Production::Ready,
-                (handler::Production::Idle | handler::Production::Ready, true)
-                | (handler::Production::Idle, false) => handler::Production::Idle,
-            };
-            state
-                .calls
-                .initialize(stream, input, app, output)
-                .map_err(calls::Error::status)?;
-            state.calls.reply(reply)?;
-            Ok((done, output))
-        })();
-        let (done, output) = match result {
-            Ok(outcome) => outcome,
-            Err(status) => {
-                self.fail(state, conn, status, entry);
-                return;
-            }
-        };
-        match (done, output) {
-            (true, _) => {
-                self.complete(state, conn, entry);
-            }
-            (false, handler::Production::Ready) => entry.output(),
-            (false, handler::Production::Idle) => {}
-        }
+        let draft = draft::Draft::try_new(egress, stream)?;
+        let mut reply = Reply::with_writer(draft);
+        let mut cx = service::Stream::new(stream.id());
+        let opened = self.exec.start(turn, entry, &mut cx, head, &mut reply);
+        Ok((opened, reply))
     }
 
-    fn trailers<C>(
+    fn data<E: event::Evidence>(
         &mut self,
-        state: &mut Store<'r, 'd, Handler<X::Call, X::State>, X::Timer, C>,
-        conn: &mut C,
-        fields: section::Owner,
-        entry: active::Entry<'r>,
-    ) where
-        C: Connection<Key = Key, Owner = resident::Shared<'d>, Output = storage::Shared>,
-        F: FnMut(&mut H, Key, egress::Error<C::Error>),
-    {
-        let stream = entry.key();
-        match request::Head::trailers(fields) {
-            Ok(meta) => {
-                if let Some(input) = state.calls.stream_mut(stream) {
-                    input.trailers = meta;
-                }
-            }
-            Err(status) => self.fail(state, conn, status, entry),
-        }
-    }
-
-    fn data<C>(
-        &mut self,
-        state: &mut Store<'r, 'd, Handler<X::Call, X::State>, X::Timer, C>,
-        conn: &mut C,
-        data: C::Data,
+        state: &mut Store<'r, 'd, Handler<X::Call, X::State>, X::Timer>,
+        conn: &mut Connection<'d, E>,
+        data: event::DataPayload<resident::Shared<'d>>,
         boundary: Boundary,
         entry: active::Entry<'r>,
     ) where
-        C: Connection<Key = Key, Owner = resident::Shared<'d>, Output = storage::Shared>,
-        F: FnMut(&mut H, Key, egress::Error<C::Error>),
+        F: FnMut(&mut H, Key, egress::Error<conn::Error>),
     {
         let stream = entry.key();
         let data = message::DataChunk::new(data);
@@ -218,41 +233,24 @@ where
         Self::rearm(state, entry);
     }
 
-    fn end<C>(
-        state: &mut Store<'r, 'd, Handler<X::Call, X::State>, X::Timer, C>,
+    fn rearm(
+        state: &mut Store<'r, 'd, Handler<X::Call, X::State>, X::Timer>,
         entry: active::Entry<'r>,
-    ) where
-        C: Connection<Key = Key, Owner = resident::Shared<'d>, Output = storage::Shared>,
-    {
-        let stream = entry.key();
-        let Some(call) = state.calls.stream_mut(stream) else {
-            return;
-        };
-        call.data.end();
-        entry.app();
-    }
-
-    fn rearm<C>(
-        state: &mut Store<'r, 'd, Handler<X::Call, X::State>, X::Timer, C>,
-        entry: active::Entry<'r>,
-    ) where
-        C: Connection<Key = Key, Owner = resident::Shared<'d>, Output = storage::Shared>,
-    {
+    ) {
         let stream = entry.key();
         if state.calls.has_input(stream) {
             entry.app();
         }
     }
 
-    pub(super) fn semantic<C>(
+    pub(super) fn semantic<E: event::Evidence>(
         &mut self,
-        state: &mut Store<'r, 'd, Handler<X::Call, X::State>, X::Timer, C>,
-        conn: &mut C,
+        state: &mut Store<'r, 'd, Handler<X::Call, X::State>, X::Timer>,
+        conn: &mut Connection<'d, E>,
         turn: &mut app::Turn<'_, '_, '_, 'd, O>,
         entry: active::Entry<'r>,
     ) where
-        C: Connection<Key = Key, Owner = resident::Shared<'d>, Output = storage::Shared>,
-        F: FnMut(&mut H, Key, egress::Error<C::Error>),
+        F: FnMut(&mut H, Key, egress::Error<conn::Error>),
     {
         let stream = entry.key();
         let input = self.limits.input();
@@ -286,15 +284,14 @@ where
         }
     }
 
-    fn dispatch<C>(
+    fn dispatch<E: event::Evidence>(
         &mut self,
-        state: &mut Store<'r, 'd, Handler<X::Call, X::State>, X::Timer, C>,
-        conn: &mut C,
+        state: &mut Store<'r, 'd, Handler<X::Call, X::State>, X::Timer>,
+        conn: &mut Connection<'d, E>,
         frame: message::Frame<resident::Shared<'d>>,
         entry: active::Entry<'r>,
     ) where
-        C: Connection<Key = Key, Owner = resident::Shared<'d>, Output = storage::Shared>,
-        F: FnMut(&mut H, Key, egress::Error<C::Error>),
+        F: FnMut(&mut H, Key, egress::Error<conn::Error>),
     {
         let stream = entry.key();
         let bytes = frame.len() + message::HEADER_LEN;

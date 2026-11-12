@@ -211,7 +211,7 @@ fn emit(
                     &context,
                 )
             })
-            .collect::<syn::Result<Vec<_>>>()?;
+            .collect::<Vec<_>>();
         let job = if field.mode.seq {
             let elem = types::View::new(&field.ty).vector().ok_or_else(|| {
                 syn::Error::new_spanned(&field.ty, "#[field(seq)] requires a Vec<T> field")
@@ -428,14 +428,14 @@ fn emit(
                 &context,
             )
         })
-        .collect::<syn::Result<Vec<_>>>()?;
+        .collect::<Vec<_>>();
     let release_value = fields
         .iter()
         .map(|field| {
             let ident = &field.ident;
             release_value(paths, field, quote::quote!(self.#ident), request, &context)
         })
-        .collect::<syn::Result<Vec<_>>>()?;
+        .collect::<Vec<_>>();
     Ok(quote::quote! {
         enum #phase #scope {
             #(#variants,)*
@@ -563,62 +563,40 @@ fn release_value(
     value: proc_macro2::TokenStream,
     request: bool,
     context: &proc_macro2::TokenStream,
-) -> syn::Result<proc_macro2::TokenStream> {
+) -> proc_macro2::TokenStream {
     let ns_json = &paths.json;
-    let [v_budget, v_values, v_value] = ["__budget", "__values", "__value"].map(tokens::local);
-    let nested = if field.mode.nested {
-        let ty = if field.mode.seq {
-            types::View::new(&field.ty).vector().ok_or_else(|| {
-                syn::Error::new_spanned(&field.ty, "#[field(seq)] requires a Vec<T> field")
-            })?
-        } else {
-            &field.ty
-        };
-        let ty = if request {
-            quote::quote!(<#ty as #ns_json::segment::IntoRequest>::Request<'req>)
-        } else {
-            quote::quote!(#ty)
-        };
-        quote::quote! {
-            if <#ty as #ns_json::segment::Decode<#context>>::release(#v_value, #v_budget).is_pending() {
-                return ::core::task::Poll::Pending;
-            }
-        }
-    } else {
-        proc_macro2::TokenStream::new()
-    };
-    Ok(if field.mode.seq {
-        let remaining = field.mode.nested.then(|| {
-            quote::quote! {
-                if *#v_budget == 0 {
-                    return ::core::task::Poll::Pending;
-                }
-            }
-        });
-        quote::quote! {
+    let [v_budget, v_values] = ["__budget", "__values"].map(tokens::local);
+    if field.mode.seq && !field.mode.nested {
+        return quote::quote! {
             {
                 let #v_values = &mut #value;
-                while let ::core::option::Option::Some(#v_value) = #v_values.last_mut() {
+                while !#v_values.is_empty() {
                     if *#v_budget == 0 {
                         return ::core::task::Poll::Pending;
                     }
-                    #nested
-                    #remaining
                     *#v_budget -= 1;
-                    ::core::mem::drop(#v_values.pop());
+                    #v_values.truncate(#v_values.len() - 1);
                 }
             }
-        }
+        };
+    }
+    let release = if field.mode.seq {
+        quote::quote!(#ns_json::segment::release::<_, #context>)
     } else if field.mode.nested {
-        quote::quote! {
-            {
-                let #v_value = &mut #value;
-                #nested
-            }
+        let ty = &field.ty;
+        if request {
+            quote::quote!(<<#ty as #ns_json::segment::IntoRequest>::Request<'req> as #ns_json::segment::Decode<#context>>::release)
+        } else {
+            quote::quote!(<#ty as #ns_json::segment::Decode<#context>>::release)
         }
     } else {
-        proc_macro2::TokenStream::new()
-    })
+        return proc_macro2::TokenStream::new();
+    };
+    quote::quote! {
+        if #release(&mut #value, #v_budget).is_pending() {
+            return ::core::task::Poll::Pending;
+        }
+    }
 }
 
 fn scalar_value(

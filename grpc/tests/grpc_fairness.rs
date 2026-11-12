@@ -55,8 +55,9 @@ fn protocol_failure_stops_before_finish() {
     };
     use dope_test::scope::Driver;
     use o3::buffer::resident;
-    use sark_core::manifold::{schedule, server::app};
+    use sark_core::manifold::schedule;
     use sark_grpc::protocol::section;
+    use sark_h2::server::app;
     use sark_h2::{ServerRole, conn::Error};
 
     let config = settings::Config::new(
@@ -105,10 +106,7 @@ fn protocol_failure_stops_before_finish() {
                 .ingress()
                 .try_bind(budget)
                 .expect("ingress ownership");
-            let mut state = app::Application::<
-                Connection<ServerRole, section::Plan, resident::Shared<'_>>,
-                (),
-            >::state(
+            let mut state = app::Application::<sark_h2::conn::event::Retirement, ()>::state(
                 &service,
                 app::Capacity::new(plan.stream_count(), plan.data_events().raw()),
             )

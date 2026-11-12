@@ -35,17 +35,17 @@ impl<T> Opened<T> {
         self,
         limit: usize,
     ) -> (T, handler::Production, input::Input<C>) {
-        let (call, output, request) = match self.0 {
+        let (call, output, head) = match self.0 {
             State::Retained { start, head } => {
-                let request = match start.mode {
-                    handler::StreamMode::Live => input::Request::Live,
-                    handler::StreamMode::Buffered => input::Request::Buffered(head),
+                let head = match start.mode {
+                    handler::StreamMode::Live => None,
+                    handler::StreamMode::Buffered => Some(head),
                 };
-                (start.call, start.output, request)
+                (start.call, start.output, head)
             }
-            State::Live(call) => (call, handler::Production::Idle, input::Request::Live),
-            State::Producing(call) => (call, handler::Production::Ready, input::Request::Live),
+            State::Live(call) => (call, handler::Production::Idle, None),
+            State::Producing(call) => (call, handler::Production::Ready, None),
         };
-        (call, output, input::Input::new(request, limit))
+        (call, output, input::Input::new(head, limit))
     }
 }

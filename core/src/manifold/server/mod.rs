@@ -5,7 +5,6 @@ use crate::{
     manifold::{self, client::event::Reset, schedule, stream},
 };
 
-pub mod app;
 pub mod drain;
 mod event;
 pub mod timing;

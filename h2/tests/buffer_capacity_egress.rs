@@ -65,100 +65,109 @@ fn continuation_retries() {
         numbers::{Flags, Type},
     };
 
-    let config = Config {
-        local_settings: Settings {
-            max_header_list_size: Some(32_768),
-            ..Settings::DEFAULT
-        },
-        hpack_encoder: capacity::Encoder {
-            header_list: 32_768,
-            ..Default::default()
-        },
-        outbound_capacity: 65_536,
-        ..Config::default()
-    };
-    let mut client = Connection::<ClientRole>::with_config(config).expect("request client");
-    let mut server = Connection::<ServerRole>::with_config(config).expect("request peer");
-    let value = vec![b'~'; 20 * 1024];
-    let id = client
-        .streams()
-        .headers()
-        .request(
-            [
-                field::literal!(entry(b":method", b"GET")),
-                field::literal!(entry(b":scheme", b"http")),
-                field::literal!(entry(b":path", b"/")),
-                field::literal!(entry(b":authority", b"localhost")),
-                entry(b"x-span", &value).expect("plain header value"),
-            ],
-            Boundary::End,
-        )
-        .expect("retain a header block spanning two frames");
-    let queued = client.outbound_len();
-    let prefixes = pool::Pool::try_new(1, 256).expect("transfer prefix pool");
-    let prepared = client
-        .prepare(prefixes.cursor().expect("prefix slot"))
-        .ok()
-        .expect("prepare retained headers");
-    let offered = prepared.try_bind().expect("bind retained headers");
-    assert!(matches!(&offered, io::Offer::Body(_)));
-    drop(offered);
-    assert_eq!(prefixes.available(), 1);
-    assert_eq!(client.outbound_len(), queued);
+    for (length, flags) in [
+        (16_363, Flags::END_STREAM | Flags::END_HEADERS),
+        (20 * 1024, Flags::END_STREAM),
+    ] {
+        let config = Config {
+            local_settings: Settings {
+                max_header_list_size: Some(32_768),
+                ..Settings::DEFAULT
+            },
+            hpack_encoder: capacity::Encoder {
+                header_list: 24 * 1024,
+                ..Default::default()
+            },
+            outbound_capacity: 65_536,
+            ..Config::default()
+        };
+        let mut client = Connection::<ClientRole>::with_config(config).expect("request client");
+        let mut server = Connection::<ServerRole>::with_config(config).expect("request peer");
+        let value = vec![b'~'; length];
+        let id = client
+            .streams()
+            .headers()
+            .request(
+                [
+                    field::literal!(entry(b":method", b"GET")),
+                    field::literal!(entry(b":scheme", b"http")),
+                    field::literal!(entry(b":path", b"/")),
+                    field::literal!(entry(b":authority", b"localhost")),
+                    entry(b"x-span", &value).expect("plain header value"),
+                ],
+                Boundary::End,
+            )
+            .expect("retain framed headers");
+        let queued = client.outbound_len();
+        let prefixes = pool::Pool::try_new(1, 256).expect("transfer prefix pool");
+        let prepared = client
+            .prepare(prefixes.cursor().expect("prefix slot"))
+            .ok()
+            .expect("prepare retained headers");
+        let offered = prepared.try_bind().expect("bind retained headers");
+        assert!(matches!(&offered, io::Offer::Body(_)));
+        drop(offered);
+        assert_eq!(prefixes.available(), 1);
+        assert_eq!(client.outbound_len(), queued);
 
-    let mut prefix = [0; 256];
-    let (len, body) = match client.take(&mut prefix).expect("retry retained headers") {
-        io::Output::Split {
-            prefix_len: len,
-            body,
-        } => Some((len, body)),
-        io::Output::Buffered(_) => None,
+        let mut prefix = [0; 256];
+        let (len, body) = match client.take(&mut prefix).expect("retry retained headers") {
+            io::Output::Split {
+                prefix_len: len,
+                body,
+            } => Some((len, body)),
+            io::Output::Buffered(_) => None,
+        }
+        .expect("retained headers");
+        assert_eq!(client.outbound_len(), 0);
+        let first = Header::parse(body.as_slice()).expect("HEADERS frame");
+        assert_eq!(
+            (
+                first.kind,
+                first.length.into_usize(),
+                first.flags.0,
+                first.stream_id
+            ),
+            (Type::Headers, 16_384, flags, id)
+        );
+        let offset = frame::HEADER_LEN + first.length.into_usize();
+        if flags == Flags::END_STREAM {
+            let last = Header::parse(&body.as_slice()[offset..]).expect("CONTINUATION frame");
+            assert_eq!(
+                (last.kind, last.flags.0, last.stream_id),
+                (Type::Continuation, Flags::END_HEADERS, id)
+            );
+            assert_eq!(
+                offset + frame::HEADER_LEN + last.length.into_usize(),
+                body.len()
+            );
+        } else {
+            assert_eq!(offset, body.len());
+        }
+
+        server
+            .ingress()
+            .ingest(&prefix[..len])
+            .expect("peer preface");
+        server
+            .ingress()
+            .ingest_owned(body)
+            .expect("decode retained headers");
+        let (stream, boundary, fields) = iter::from_fn(|| server.ingress().poll_event())
+            .find_map(|event| match event {
+                Event::Headers {
+                    stream_id: stream,
+                    head,
+                    boundary,
+                    ..
+                } => Some((stream, boundary, head.into_parts().0)),
+                _ => None,
+            })
+            .expect("decoded request");
+        assert_eq!(stream.id(), id);
+        assert!(matches!(boundary, Boundary::End));
+        assert_eq!(fields.get(b"x-span"), Some(value.as_slice()));
     }
-    .expect("retained headers");
-    assert_eq!(client.outbound_len(), 0);
-    let first = Header::parse(body.as_slice()).expect("HEADERS frame");
-    assert_eq!(
-        (
-            first.kind,
-            first.length.into_usize(),
-            first.flags.0,
-            first.stream_id
-        ),
-        (Type::Headers, 16_384, Flags::END_STREAM, id)
-    );
-    let offset = frame::HEADER_LEN + first.length.into_usize();
-    let last = Header::parse(&body.as_slice()[offset..]).expect("CONTINUATION frame");
-    assert_eq!(
-        (last.kind, last.flags.0, last.stream_id),
-        (Type::Continuation, Flags::END_HEADERS, id)
-    );
-    assert_eq!(
-        offset + frame::HEADER_LEN + last.length.into_usize(),
-        body.len()
-    );
-
-    server
-        .ingress()
-        .ingest(&prefix[..len])
-        .expect("peer preface");
-    server
-        .ingress()
-        .ingest_owned(body)
-        .expect("decode retained headers");
-    let (stream, boundary, fields) = iter::from_fn(|| server.ingress().poll_event())
-        .find_map(|event| match event {
-            Event::Headers {
-                stream_id: stream,
-                head,
-                boundary,
-                ..
-            } => Some((stream, boundary, head.into_parts().0)),
-            _ => None,
-        })
-        .expect("decoded request");
-    assert_eq!(stream.id(), id);
-    assert!(matches!(boundary, Boundary::End));
-    assert_eq!(fields.get(b"x-span"), Some(value.as_slice()));
 }
 
 #[test]

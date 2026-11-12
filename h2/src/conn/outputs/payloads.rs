@@ -38,11 +38,11 @@ pub(in crate::conn) enum Shared<C: session::Storage> {
 }
 
 pub(in crate::conn) struct Data<B> {
-    pub(super) credit: flow::Reserved,
+    pub(in crate::conn) credit: flow::Reserved,
     mark: Mark,
     pub(super) header: [u8; frame::HEADER_LEN],
     pub(super) inline: Inline,
-    pub(super) body: B,
+    pub(in crate::conn) body: B,
 }
 
 pub(in crate::conn) struct Wire<C> {
@@ -305,25 +305,31 @@ impl<C: session::Storage> Ledger<C> {
         })
     }
 
-    pub(super) fn clear(&mut self, release: impl FnMut(Shared<C>)) {
+    pub(in crate::conn) fn clear(&mut self, release: impl FnMut(Shared<C>)) {
         self.records.clear(release);
         self.bytes = 0;
         self.resident = 0;
     }
 
-    pub(super) fn drain(&mut self, id: stream::Id, mut release: impl FnMut(Shared<C>)) {
+    pub(in crate::conn) fn drain(
+        &mut self,
+        id: stream::Id,
+        mut release: impl FnMut(Shared<C>, usize),
+    ) {
         let bytes = &mut self.bytes;
         let resident = &mut self.resident;
         self.records
             .drain_owner(u64::from(id.into_u32()), Index::at::<0>(), |payload| {
+                let charge = payload.data_len();
+                let retained = payload.resident();
                 Taken {
                     bytes: &mut *bytes,
                     resident: &mut *resident,
-                    charge: payload.data_len(),
-                    retained: payload.resident(),
+                    charge,
+                    retained,
                 }
                 .commit();
-                release(payload);
+                release(payload, retained);
             });
     }
 

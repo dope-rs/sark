@@ -12,25 +12,36 @@ use crate::{
 pub(super) struct Wire {
     bytes: pool::Span,
     max_frame: numbers::Limit,
-    block_len: usize,
+    continuation: [u8; frame::HEADER_LEN],
     frame_len: usize,
     error: Option<consume::Error>,
 }
 
-/// A complete wire owner whose stream-dependent frame headers are patchable.
-pub(super) struct Block {
-    bytes: pool::Span,
-    max_frame: numbers::Limit,
-    block_len: usize,
-}
+/// One complete framed header block.
+pub(super) struct Block(pool::Span);
 
 impl Wire {
-    pub(super) fn new(mut bytes: pool::Span, max: numbers::Limit) -> Result<Self, consume::Error> {
-        bytes.try_append(&[0; frame::HEADER_LEN])?.commit();
+    pub(super) fn new(
+        mut bytes: pool::Span,
+        max: numbers::Limit,
+        target: stream::raw::Marked,
+    ) -> Result<Self, consume::Error> {
+        let mut header = layout::Header {
+            length: max.take(max.into_usize()),
+            kind: numbers::Type::Headers,
+            flags: numbers::Flags(
+                u8::from(matches!(target.boundary(), Boundary::End)) * numbers::Flags::END_STREAM,
+            ),
+            stream_id: target.key().id(),
+        }
+        .wire_bytes();
+        bytes.try_append(&header)?.commit();
+        header[3] = numbers::Type::Continuation as u8;
+        header[4] = 0;
         Ok(Self {
             bytes,
             max_frame: max,
-            block_len: 0,
+            continuation: header,
             frame_len: 0,
             error: None,
         })
@@ -40,7 +51,7 @@ impl Wire {
         if self.frame_len == self.max_frame.into_usize() {
             if let Err(error) = self
                 .bytes
-                .try_append(&[0; frame::HEADER_LEN])
+                .try_append(&self.continuation)
                 .map(|append| append.commit())
             {
                 self.error = Some(error);
@@ -51,14 +62,22 @@ impl Wire {
         true
     }
 
-    pub(super) fn finish(self) -> Result<Block, consume::Error> {
+    pub(super) fn finish(mut self) -> Result<Block, consume::Error> {
         match self.error {
             Some(error) => Err(error),
-            None => Ok(Block {
-                bytes: self.bytes,
-                max_frame: self.max_frame,
-                block_len: self.block_len,
-            }),
+            None => {
+                let end = self.bytes.len() - self.frame_len;
+                // SAFETY: each frame starts with its header; payload writes
+                // advance the span length and frame_len together.
+                let last = unsafe {
+                    self.bytes
+                        .as_mut_slice()
+                        .get_unchecked_mut(end - frame::HEADER_LEN..end)
+                };
+                last[..3].copy_from_slice(&self.max_frame.take(self.frame_len).wire_bytes());
+                last[4] |= numbers::Flags::END_HEADERS;
+                Ok(Block(self.bytes))
+            }
         }
     }
 }
@@ -84,7 +103,6 @@ impl field::Writer for Wire {
             return;
         }
         self.frame_len += 1;
-        self.block_len += 1;
     }
 
     fn write_slice(&mut self, bytes: &[u8]) {
@@ -107,73 +125,21 @@ impl field::Writer for Wire {
                 return;
             }
             self.frame_len += take;
-            self.block_len += take;
             rest = &rest[take..];
         }
     }
 }
 
 impl Block {
-    pub(super) fn len(&self) -> usize {
-        self.bytes.len()
-    }
-
-    /// Every payload frame is preceded by one fixed header and the block counts
-    /// payload bytes only, so the buffer is `[header][payload]` pairs strided by
-    /// `max_frame + HEADER_LEN`.
-    pub(super) fn seal(&mut self, id: stream::Id, boundary: Boundary) {
-        let step = self.max_frame.into_usize() + frame::HEADER_LEN;
-        let mut left = self.block_len;
-        let mut first = true;
-        for chunk in self.bytes.as_mut_slice().chunks_mut(step) {
-            let length = self.max_frame.take(left);
-            let len = length.into_usize();
-            let chain = if len == left {
-                frame::Block::End
-            } else {
-                frame::Block::More
-            };
-            let flags = (u8::from(first && matches!(boundary, Boundary::End))
-                * numbers::Flags::END_STREAM)
-                | match chain {
-                    frame::Block::More => 0,
-                    frame::Block::End => numbers::Flags::END_HEADERS,
-                };
-            let header = layout::Header {
-                length,
-                kind: if first {
-                    numbers::Type::Headers
-                } else {
-                    numbers::Type::Continuation
-                },
-                flags: numbers::Flags(flags),
-                stream_id: id,
-            }
-            .wire_bytes();
-            // SAFETY: `Limit` admits at least 16384, so `step` exceeds
-            // `HEADER_LEN`; `Wire` writes one header per frame and advances
-            // `block_len` only by payload bytes, so every full chunk is one
-            // header plus `max_frame` payload bytes and the final chunk is one
-            // header plus the remainder, which is never shorter than the header.
-            let (target, _) = unsafe { chunk.split_at_mut_unchecked(frame::HEADER_LEN) };
-            target.copy_from_slice(&header);
-            left -= len;
-            if matches!(chain, frame::Block::End) {
-                break;
-            }
-            first = false;
-        }
-    }
-
     pub(super) fn into_shared(self) -> storage::Shared {
-        self.bytes.freeze().into_shared()
+        self.0.freeze().into_shared()
     }
 }
 
 impl AsRef<[u8]> for Block {
     fn as_ref(&self) -> &[u8] {
-        self.bytes.as_ref()
+        self.0.as_ref()
     }
 }
 
-const _: () = assert!(core::mem::size_of::<Block>() <= 5 * core::mem::size_of::<usize>());
+const _: () = assert!(core::mem::size_of::<Block>() == core::mem::size_of::<pool::Span>());

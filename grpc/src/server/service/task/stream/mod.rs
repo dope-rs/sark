@@ -1,4 +1,4 @@
-use std::{convert::Infallible, mem, pin, task};
+use std::{convert::Infallible, pin, task};
 
 use dope::core::driver::schedule::clock::timer;
 use dope_fiber::{abi, context};
@@ -129,12 +129,6 @@ pub trait Work<'d, Request, Response, Codec>: Sized {
     ) -> task::Poll<Finish>;
 }
 
-enum Phase {
-    Running,
-    Finished(Finish),
-    Drained,
-}
-
 /// Scheduler-owned task and its exact request/response exchange.
 #[doc(hidden)]
 #[pin_project::pin_project]
@@ -142,7 +136,6 @@ pub struct Fiber<'d, T, Request, Response, Codec> {
     #[pin]
     task: T,
     exchange: exchange::Exchange<Request, Response, Codec>,
-    phase: Phase,
     timer: timer::Timer<'d>,
 }
 
@@ -156,46 +149,14 @@ impl<'d, T, Request, Response, Codec> Fiber<'d, T, Request, Response, Codec> {
         Self {
             task,
             exchange: exchange::Exchange::new(codec, shape),
-            phase: Phase::Running,
             timer,
         }
     }
 
-    pub(in crate::server) fn push_with<E>(
+    pub(in crate::server) fn exchange(
         self: pin::Pin<&mut Self>,
-        decode: impl FnOnce(&mut Codec) -> Result<Request, E>,
-    ) -> Result<(), exchange::PushError<E>> {
-        self.project().exchange.push_with(decode)
-    }
-
-    pub(in crate::server) fn close(
-        self: pin::Pin<&mut Self>,
-        tail: metadata::Decoded,
-    ) -> Result<(), exchange::CloseError> {
-        self.project().exchange.close(tail)
-    }
-
-    pub(in crate::server) fn drive(
-        self: pin::Pin<&mut Self>,
-        ready: task::Poll<()>,
-        encode: impl FnOnce(&mut Codec, &Response) -> Result<task::Poll<()>, crate::Status>,
-    ) -> exchange::Output {
-        let this = self.project();
-        let output = this.exchange.drive(ready, encode);
-        if !matches!(output, exchange::Output::Pending) {
-            return output;
-        }
-        match mem::replace(this.phase, Phase::Drained) {
-            Phase::Finished(finish) => this.exchange.complete(finish),
-            phase @ (Phase::Running | Phase::Drained) => {
-                *this.phase = phase;
-                exchange::Output::Pending
-            }
-        }
-    }
-
-    pub(in crate::server) fn take_events(self: pin::Pin<&mut Self>) -> exchange::Events {
-        self.project().exchange.take_events()
+    ) -> &mut exchange::Exchange<Request, Response, Codec> {
+        self.project().exchange
     }
 }
 
@@ -208,10 +169,10 @@ where
     fn poll(call: context::PollCall<'_, '_, 'd, Self>) -> task::Poll<Self::Output> {
         let (fiber, admit) = call.into_admit();
         let this = fiber.project();
-        if matches!(this.phase, Phase::Running) {
+        if matches!(this.exchange.phase, exchange::Phase::Running) {
             let io = Context::new(this.exchange, *this.timer);
             if let task::Poll::Ready(finish) = T::poll(this.task, io, admit) {
-                *this.phase = Phase::Finished(finish);
+                this.exchange.phase = exchange::Phase::Finished(finish);
                 this.exchange.wake();
             }
         }

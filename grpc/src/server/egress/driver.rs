@@ -1,4 +1,4 @@
-use o3::{base::cell::region, buffer::storage};
+use o3::buffer::storage;
 use sark_core::{
     life::session,
     manifold::{client::event::Reset, schedule, server},
@@ -9,7 +9,7 @@ use crate::server::{call, calls, egress};
 pub(in crate::server) struct Driver<'a, S: server::Connection, F, R> {
     sink: &'a mut F,
     connection: &'a mut S,
-    store: &'a mut egress::Store<S::Key>,
+    store: &'a mut egress::Store,
     retire: &'a mut R,
     pub(in crate::server) released: egress::Release,
 }
@@ -21,7 +21,7 @@ where
 {
     pub(in crate::server) fn new(
         conn: &'a mut S,
-        store: &'a mut egress::Store<S::Key>,
+        store: &'a mut egress::Store,
         sink: &'a mut F,
         retire: &'a mut R,
     ) -> Self {
@@ -70,9 +70,9 @@ where
     fn settle(
         &mut self,
         stream: S::Key,
-        mut call: call::State<'r, T, C>,
+        call: &mut call::State<'r, T, C>,
         terminal: schedule::Terminal<Self::Error>,
-    ) -> schedule::Settlement<call::State<'r, T, C>> {
+    ) -> schedule::Settlement<()> {
         let failed = matches!(terminal, schedule::Terminal::Failed(_));
         let pending = match terminal {
             schedule::Terminal::Idle => self.store.try_pending(stream),
@@ -85,21 +85,21 @@ where
         };
         match pending {
             Ok(pending) if !failed && (pending || !call.is_done()) => {
-                return schedule::Settlement::Keep(call);
+                return schedule::Settlement::Keep(());
             }
             Ok(_) => {}
             Err(fault) => {
                 self.connection.fail();
                 self.terminal(stream, fault.into());
-                return schedule::Settlement::Keep(call);
+                return schedule::Settlement::Keep(());
             }
         }
-        match (self.retire)(&mut call) {
+        match (self.retire)(call) {
             Ok(()) => schedule::Settlement::Remove,
             Err(error) => {
                 self.connection.fail();
                 self.terminal(stream, egress::Fault::Response(error.status()).into());
-                schedule::Settlement::Keep(call)
+                schedule::Settlement::Keep(())
             }
         }
     }
@@ -119,24 +119,14 @@ where
         Some(())
     }
 
-    fn control<'id>(
+    fn control(
         &mut self,
         (): Self::Permit,
-        entry: schedule::Occupied<
-            '_,
-            Self::Key,
-            call::State<'r, T, C>,
-            Self::Block,
-            region::Identity<'id>,
-        >,
-    ) -> schedule::Decision<'id, Self::Key> {
-        entry.borrowed(self, |driver, key, _| {
-            driver.store.control(
-                key,
-                || driver.connection.writer(key),
-                &mut driver.released.prepared,
-            )
-        })
+        key: Self::Key,
+        _: &mut call::State<'r, T, C>,
+    ) -> Result<schedule::ControlTurn<Self::Block>, Self::Error> {
+        self.store
+            .control(key, self.connection, &mut self.released.prepared)
     }
 
     fn data(
@@ -145,10 +135,7 @@ where
         key: S::Key,
         _: &mut call::State<'r, T, C>,
     ) -> Result<schedule::DataTurn<Self::Block>, Self::Error> {
-        self.store.data(
-            key,
-            || self.connection.writer(key),
-            &mut self.released.output,
-        )
+        self.store
+            .data(key, self.connection, &mut self.released.output)
     }
 }

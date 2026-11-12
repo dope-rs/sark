@@ -37,6 +37,19 @@ enum State<'d, T: Decode<C>, C: Copy> {
     Release,
 }
 
+/// Retires completed nested values within the caller's work budget.
+#[inline(always)]
+pub fn release<T: Decode<C>, C: Copy>(values: &mut Vec<T>, budget: &mut usize) -> Poll<()> {
+    while let Some(value) = values.last_mut() {
+        if *budget == 0 || <T as Decode<C>>::release(value, budget).is_pending() || *budget == 0 {
+            return Poll::Pending;
+        }
+        values.truncate(values.len() - 1);
+        *budget -= 1;
+    }
+    Poll::Ready(())
+}
+
 impl<'d, T: Decode> Nested<'d, T> {
     pub fn one(input: storage::Shared) -> crate::Result<Self> {
         Self::new(iter::once(input))
@@ -84,15 +97,8 @@ impl<'d, T: Decode<C>, C: Copy> Nested<'d, T, C> {
         if state.is_pending() {
             return Poll::Pending;
         }
-        while let Some(value) = self.values.last_mut() {
-            if *budget == 0 || <T as Decode<C>>::release(value, budget).is_pending() {
-                return Poll::Pending;
-            }
-            if *budget == 0 {
-                return Poll::Pending;
-            }
-            drop(self.values.pop());
-            *budget -= 1;
+        if release::<T, C>(&mut self.values, budget).is_pending() {
+            return Poll::Pending;
         }
         self.input.release(budget).0
     }

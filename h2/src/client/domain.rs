@@ -62,14 +62,15 @@ where
         check: impl FnOnce(&T) -> Result<(domain::Activation<conn::DataBlock>, P), E>,
         commit: impl FnOnce(&mut T, P) -> R,
     ) -> Result<R, schedule::Error<E>> {
-        self.inner.transaction(key, |value| {
-            let (act, plan) = check(&*value)?;
-            let act = match act {
-                domain::Activation::Keep => schedule::Activation::Keep,
-                domain::Activation::Data(wait) => schedule::Activation::data(wait),
-            };
-            Ok((act, commit(value, plan)))
-        })
+        let mut entry = self.inner.entry(key).ok_or(schedule::Error::Missing)?;
+        let (act, plan) = check(entry.get_mut()).map_err(schedule::Error::Rejected)?;
+        let act = match act {
+            domain::Activation::Keep => schedule::Activation::Keep,
+            domain::Activation::Data(wait) => schedule::Activation::data(wait),
+        };
+        let result = commit(entry.get_mut(), plan);
+        entry.activate(act);
+        Ok(result)
     }
 
     fn resume(&mut self, conn: &mut Connection<ClientRole, F, C>, egress: schedule::Egress) {

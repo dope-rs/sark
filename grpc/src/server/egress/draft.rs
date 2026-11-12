@@ -12,10 +12,7 @@ use crate::{
     server::{
         call::credits,
         egress::{self, Payload, pending},
-        service::{
-            handler::Production,
-            reply::{Write, proof::Proof},
-        },
+        service::reply::{Write, proof::Proof},
     },
 };
 
@@ -66,46 +63,42 @@ enum Output<'a> {
     },
 }
 
-enum Position<'a, K: manifold::raw::Key> {
-    Vacant(&'a mut Option<pending::Pending<K>>),
-    Open(&'a mut pending::Pending<K>),
-    Complete(&'a mut pending::Pending<K>),
+enum Position<'a> {
+    Vacant(&'a mut Option<pending::Pending>),
+    Open(&'a mut pending::Pending),
+    Complete(&'a mut pending::Pending),
 }
 
 pub(in crate::server) struct Draft<'a, K: manifold::raw::Key> {
     key: K,
-    position: Position<'a, K>,
+    position: Position<'a>,
     output: Output<'a>,
-    active: &'a mut usize,
     message_limit: capacity::Count,
     wire_limit: usize,
     ready: bool,
 }
 
-pub(super) struct Prepared<'a, K: manifold::raw::Key> {
+pub(in crate::server) struct Prepared<'a, K: manifold::raw::Key> {
     key: K,
-    change: Change<'a, K>,
+    change: Change<'a>,
     message: Option<Message<'a>>,
-    life: Lifecycle,
     work: Option<schedule::WorkClass>,
 }
 
-enum Change<'a, K: manifold::raw::Key> {
+enum Change<'a> {
     None,
     Open {
-        slot: &'a mut Option<pending::Pending<K>>,
-        pending: pending::Pending<K>,
-        active: &'a mut usize,
-        total: usize,
+        slot: &'a mut Option<pending::Pending>,
+        pending: pending::Pending,
     },
     Trailer {
-        pending: &'a mut pending::Pending<K>,
+        pending: &'a mut pending::Pending,
         trailer: pending::Trailer,
     },
 }
 
 #[repr(u8)]
-pub(super) enum Lifecycle {
+pub(in crate::server) enum Lifecycle {
     Keep,
     Open,
 }
@@ -118,7 +111,7 @@ pub(in crate::server) enum PushError {
 
 impl<'a, K: manifold::raw::Key> Draft<'a, K> {
     pub(in crate::server) fn try_new(
-        store: &'a mut egress::Store<K>,
+        store: &'a mut egress::Store,
         key: K,
     ) -> Result<Self, crate::Status> {
         let lane = store.lanes.try_bind_mut(key.slot())?;
@@ -126,9 +119,6 @@ impl<'a, K: manifold::raw::Key> Draft<'a, K> {
         let (slot, state) = lane.reserve();
         let position = match &mut state.pending {
             Some(pending) => {
-                if pending.key != key {
-                    return Err(Self::invalid(Reason::StaleStream));
-                }
                 if pending.trailer.is_some() {
                     Position::Complete(pending)
                 } else {
@@ -148,7 +138,6 @@ impl<'a, K: manifold::raw::Key> Draft<'a, K> {
                     staged: credits::Staged::new(&mut store.credits, &mut state.charge),
                 },
             },
-            active: &mut store.active,
             message_limit: store.message_limit,
             wire_limit: store.wire_limit,
             ready,
@@ -160,7 +149,7 @@ impl<'a, K: manifold::raw::Key> Draft<'a, K> {
     }
 
     fn framed_len(
-        position: &Position<'_, K>,
+        position: &Position<'_>,
         limit: capacity::Count,
         len: usize,
     ) -> Result<usize, PushError> {
@@ -231,7 +220,7 @@ impl<'a, K: manifold::raw::Key> Draft<'a, K> {
         Ok(())
     }
 
-    pub(super) fn prepare(
+    pub(in crate::server) fn prepare(
         self,
         metadata: metadata::Metadata,
         trailers: metadata::Metadata,
@@ -242,7 +231,6 @@ impl<'a, K: manifold::raw::Key> Draft<'a, K> {
             key,
             position,
             output,
-            active,
             ready,
             ..
         } = self;
@@ -266,18 +254,10 @@ impl<'a, K: manifold::raw::Key> Draft<'a, K> {
             || !metadata.is_empty();
         let (change, work) = match position {
             Position::Vacant(slot) if altered => {
-                let total = active
-                    .checked_add(1)
-                    .ok_or_else(|| PushError::Full.into_status())?;
-                let mut pending = pending::Pending::new(key, metadata);
+                let mut pending = pending::Pending::new(metadata);
                 pending.trailer = trailer;
                 (
-                    Change::Open {
-                        slot,
-                        pending,
-                        active,
-                        total,
-                    },
+                    Change::Open { slot, pending },
                     Some(schedule::WorkClass::Control),
                 )
             }
@@ -308,7 +288,6 @@ impl<'a, K: manifold::raw::Key> Draft<'a, K> {
             key,
             change,
             message,
-            life,
             work,
         })
     }
@@ -329,23 +308,14 @@ impl<K: manifold::raw::Key> Prepared<'_, K> {
     pub(super) fn key(&self) -> K {
         self.key
     }
-    pub(super) fn work(&self) -> Option<schedule::WorkClass> {
+    pub(in crate::server) fn work(&self) -> Option<schedule::WorkClass> {
         self.work
     }
-    pub(super) fn apply(self, output: &mut Production) {
-        if matches!(self.life, Lifecycle::Open) {
-            *output = Production::Ready;
-        }
+    pub(in crate::server) fn apply(self) {
         match self.change {
             Change::None => {}
-            Change::Open {
-                slot,
-                pending,
-                active,
-                total,
-            } => {
+            Change::Open { slot, pending } => {
                 *slot = Some(pending);
-                *active = total;
             }
             Change::Trailer { pending, trailer } => pending.trailer = Some(trailer),
         }

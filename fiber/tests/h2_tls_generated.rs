@@ -505,13 +505,13 @@ fn mixed_grpc(reject: bool, pressure: bool) {
                                 assert!(terminal.replace(Some(true)).is_none());
                             }
                             Failure::Drive {
-                                cause: sark_core::manifold::server::app::Error::Connection(
+                                cause: sark_h2::server::app::Error::Connection(
                                     sark_h2::conn::Error::CriticalDeadline,
                                 ),
                                 ..
                             } if !pressure => assert!(terminal.replace(Some(false)).is_none()),
                             Failure::Drive {
-                                cause: sark_core::manifold::server::app::Error::Connection(
+                                cause: sark_h2::server::app::Error::Connection(
                                     sark_h2::conn::Error::HeaderDecodeFull { used: 1, limit: 1 },
                                 ),
                                 ..

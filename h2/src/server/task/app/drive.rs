@@ -420,18 +420,14 @@ where
         &mut self,
         service: &mut A,
         state: &mut service::State<'d, ID, A>,
-        turn: &mut sark_core::manifold::server::app::Turn<'_, '_, '_, 'd, conn::Id<'d, ID>>,
+        turn: &mut crate::server::app::Turn<'_, '_, '_, 'd, conn::Id<'d, ID>>,
         egress: schedule::Egress,
         retry: bool,
         fault: &mut P,
-    ) -> Result<drain::Progress, sark_core::manifold::server::app::Error<Error, A::Failure>>
+    ) -> Result<drain::Progress, crate::server::app::Error<A::Failure>>
     where
         A: service::Select<R, Fields = F>
-            + sark_core::manifold::server::app::Application<
-                'd,
-                service::Connection<'d, A>,
-                conn::Id<'d, ID>,
-            >,
+            + crate::server::app::Application<'d, crate::conn::event::Retirement, conn::Id<'d, ID>>,
         Q::Retention: Handoff,
         W: wire::Spec,
         P: Fault<'d, W, A::Failure, ID, Build<A::Build>>,
