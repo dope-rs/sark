@@ -84,7 +84,6 @@ fn encoder_resumes_request() {
         });
         now = client
             .view()
-            .recovery()
             .send_at(now + Duration::from_millis(1));
         Peer::new(&mut space, &mut client)
             .try_send(&mut server, now, |_| {})
@@ -107,7 +106,6 @@ fn encoder_resumes_request() {
     });
     now = client
         .view()
-        .recovery()
         .send_at(now + Duration::from_millis(1));
     Peer::new(&mut space, &mut client)
         .try_send(&mut server, now, |_| {})

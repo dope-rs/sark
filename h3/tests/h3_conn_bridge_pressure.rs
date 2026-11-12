@@ -136,7 +136,6 @@ fn ack_wakes_retry() {
         .expect("HTTP/3 bridge ingress");
     let set_ack = client
         .view()
-        .recovery()
         .send_at(set_at + Duration::from_millis(1));
     Peer::new(&mut space, &mut client)
         .try_send(&mut server, set_ack, certificate)
@@ -245,7 +244,6 @@ fn ack_wakes_retry() {
         .expect("HTTP/3 bridge ingress");
     let head_ack = client
         .view()
-        .recovery()
         .send_at(head_at + Duration::from_millis(1));
     Peer::new(&mut space, &mut client)
         .try_send(&mut server, head_ack, certificate)
@@ -337,7 +335,6 @@ fn ack_wakes_retry() {
     });
     let ack_one = client
         .view()
-        .recovery()
         .send_at(first_at + Duration::from_millis(1));
     Peer::new(&mut space, &mut client)
         .try_send(&mut server, ack_one, certificate)
@@ -402,7 +399,6 @@ fn ack_wakes_retry() {
     });
     let ack_two = client
         .view()
-        .recovery()
         .send_at(next_at + Duration::from_millis(1));
     Peer::new(&mut space, &mut client)
         .try_send(&mut server, ack_two, certificate)
@@ -448,7 +444,6 @@ fn ack_wakes_retry() {
     });
     let ack_last = client
         .view()
-        .recovery()
         .send_at(last_at + Duration::from_millis(1));
     Peer::new(&mut space, &mut client)
         .try_send(&mut server, ack_last, certificate)

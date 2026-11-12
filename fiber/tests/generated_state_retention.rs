@@ -17,7 +17,7 @@ use common::{
 use dope::{
     core::driver::life::recovery::Policy,
     net::wire::{self, domain},
-    runtime::{executor::session, topology},
+    runtime::executor::session,
 };
 use dope_fiber::task::storage::scope::Brand;
 use dope_test::harness::server::Pair;
@@ -159,8 +159,7 @@ fn retains_scoped_body() {
                                         result.ok().expect("checked session").expect("drive")
                                     })
                                 })
-                            }
-                            .map_err(topology::Failure::Install);
+                            };
                             assert_eq!(encoded.get(), 1);
                             assert_eq!(state.observed.get(), Some("independent"));
                             result
@@ -168,13 +167,13 @@ fn retains_scoped_body() {
                     },
                     Policy::new(|event| reports.push(event), recover),
                     |result| {
-                        let result = result.map_err(topology::RunError::from);
                         result
                             .as_ref()
-                            .map_err(|error| error.cause())
+                            .map_err(|error| {
+                                error.kind().map(|output| output.as_ref().map(|_| ()))
+                            })
                             .expect("topology")
                             .as_ref()
-                            .map_err(|error| error.cause())
                             .expect("worker");
                     },
                 );

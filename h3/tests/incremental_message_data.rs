@@ -438,7 +438,6 @@ fn data_spans_quic_window() {
     for _ in 0..4096 {
         now = client
             .view()
-            .recovery()
             .send_at(now + Duration::from_millis(1));
         Peer::new(&mut space, &mut client)
             .try_send(&mut server, now, |_| {})
@@ -468,7 +467,6 @@ fn data_spans_quic_window() {
         }
         now = server
             .view()
-            .recovery()
             .send_at(now + Duration::from_millis(1));
         Peer::new(&mut space, &mut server)
             .try_send(&mut client, now, |_| {})

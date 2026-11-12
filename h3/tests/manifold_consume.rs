@@ -66,7 +66,7 @@ fn qpack_cancellation_stops_response_owner() {
                 streams.send().send(send, &request).expect("request bytes");
                 streams.send().finish(send).expect("request FIN");
             });
-            now = client.view().recovery().send_at(now);
+            now = client.view().send_at(now);
             Peer::new(&mut space, &mut client)
                 .try_send(&mut server, now, certificate)
                 .expect("request transfer");
@@ -123,7 +123,6 @@ fn qpack_cancellation_stops_response_owner() {
         });
         now = client
             .view()
-            .recovery()
             .send_at(now + Duration::from_millis(1));
         Peer::new(&mut space, &mut client)
             .try_send(&mut server, now, certificate)
@@ -187,7 +186,7 @@ fn goaway_preserves_ids() {
             .send(control, &[0, 4, 0, 7, 1, 0])
             .expect("peer shutdown");
     });
-    let now = server.view().recovery().send_at(Instant::now());
+    let now = server.view().send_at(Instant::now());
     Peer::new(&mut space, &mut server)
         .try_send(&mut quic, now, certificate)
         .expect("peer shutdown transfer");
@@ -230,7 +229,7 @@ fn raw_terminal_binding() {
                 .expect("request bytes");
             id
         });
-        let mut now = client.view().recovery().send_at(Instant::now());
+        let mut now = client.view().send_at(Instant::now());
         Peer::new(&mut space, &mut client)
             .try_send(&mut server, now, certificate)
             .expect("request transfer");
@@ -250,7 +249,6 @@ fn raw_terminal_binding() {
             });
             now = server
                 .view()
-                .recovery()
                 .send_at(now + Duration::from_millis(1));
             Peer::new(&mut space, &mut server)
                 .try_send(&mut client, now, certificate)
@@ -327,7 +325,7 @@ fn stop_preserves_queued_final_headers() {
                 .expect("request output");
             target.stream_id()
         });
-        let mut now = client.view().recovery().send_at(Instant::now());
+        let mut now = client.view().send_at(Instant::now());
         Peer::new(&mut space, &mut client)
             .try_send(&mut server, now, certificate)
             .expect("request transfer");
@@ -349,7 +347,6 @@ fn stop_preserves_queued_final_headers() {
             });
             now = server
                 .view()
-                .recovery()
                 .send_at(now + Duration::from_millis(1));
             Peer::new(&mut space, &mut server)
                 .try_send(&mut client, now, certificate)
@@ -433,14 +430,12 @@ fn reset_reconciles_final_credit_quantum() {
         });
         now = client
             .view()
-            .recovery()
             .send_at(now + Duration::from_millis(1));
         Peer::new(&mut space, &mut client)
             .try_send(&mut server, now, certificate)
             .expect("request transfer");
         now = server
             .view()
-            .recovery()
             .send_at(now + Duration::from_millis(30));
         Peer::new(&mut space, &mut server)
             .try_send(&mut client, now, certificate)
@@ -459,7 +454,6 @@ fn reset_reconciles_final_credit_quantum() {
         });
         now = server
             .view()
-            .recovery()
             .send_at(now + Duration::from_millis(1));
         Peer::new(&mut space, &mut server)
             .try_send(&mut client, now, certificate)
@@ -479,7 +473,6 @@ fn reset_reconciles_final_credit_quantum() {
             });
             now = server
                 .view()
-                .recovery()
                 .send_at(now + Duration::from_millis(1));
             Peer::new(&mut space, &mut server)
                 .try_send(&mut client, now, certificate)
@@ -603,7 +596,6 @@ fn rejected_stream_absorbs_inflight_data() {
             });
             now = client
                 .view()
-                .recovery()
                 .send_at(now + Duration::from_millis(1));
             // Keep the server's STOP/RESET packets queued: the peer may still send.
             Peer::new(&mut space, &mut client)
@@ -699,7 +691,7 @@ fn raw_unknown_uni_releases_binding() {
             streams.send().send(send, &[0x21]).expect("unknown type");
             send.id()
         });
-        let mut now = server.view().recovery().send_at(Instant::now());
+        let mut now = server.view().send_at(Instant::now());
         Peer::new(&mut space, &mut server)
             .try_send(&mut client, now, certificate)
             .expect("unknown stream transfer");
@@ -726,7 +718,6 @@ fn raw_unknown_uni_releases_binding() {
         });
         now = server
             .view()
-            .recovery()
             .send_at(now + Duration::from_millis(1));
         Peer::new(&mut space, &mut server)
             .try_send(&mut client, now, certificate)

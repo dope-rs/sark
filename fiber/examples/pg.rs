@@ -23,7 +23,6 @@ use cartel_pg::{
         results::{self, Collection, Validated},
         traits::{Begin as _, Client, Status as _, Transaction as _},
     },
-    dsl::query::ops::{Arrange as _, Change as _, Fetch as _},
     pg_instance,
     port::{Port, config},
     protocol::PickPolicy,
@@ -69,7 +68,6 @@ const USER_PAGE_CAPACITY: i64 = 100;
 const PG_RECONNECT_BACKOFF: Duration = Duration::from_millis(500);
 
 #[derive(PgTable, PgRow)]
-#[row(view)]
 struct User {
     id: i64,
     name: String,
@@ -124,7 +122,7 @@ where
     C: Client<'_, PG_CONNECTOR_ID, Schema = Db>,
 {
     let id = user_id(request.id)?;
-    let user = User::by_id(pg.query(), id.get()).await?;
+    let user = User::by_id(*pg, id.get()).await?;
     Ok(body::response(user.validate()?)?)
 }
 
@@ -139,7 +137,7 @@ where
     }
     let id = user_id(request.id)?;
     let tx = pg.transaction().begin().await?;
-    let outcome = User::rename(tx.query(), id.get(), name).await;
+    let outcome = User::rename(&tx, id.get(), name).await;
     tx.finish(outcome).await?;
     Ok(body::response(())?)
 }
@@ -149,7 +147,7 @@ async fn list_users<C>(pg: &C) -> Result<Response<Rows<C::Batch>>, body::Error<'
 where
     C: Client<'_, PG_CONNECTOR_ID, Schema = Db>,
 {
-    let users = User::page(pg.query(), 0, USER_PAGE_CAPACITY).await?;
+    let users = User::page(*pg, 0, USER_PAGE_CAPACITY).await?;
     Ok(body::response(users.validate()?)?)
 }
 

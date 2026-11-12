@@ -27,7 +27,7 @@ use dope::{
     core::{driver::life::recovery::Policy, io::socket::Listener},
     manifold::app::receive::limits::Budget,
     net::wire::{self, domain},
-    runtime::{executor::session, topology},
+    runtime::executor::session,
 };
 use dope_fiber::task::storage::scope::Brand;
 use dope_test::{
@@ -443,7 +443,7 @@ fn runs_scoped_duplex() {
                                 let config = Config::new(server::MAX_CONNECTIONS)
                                     .with_budget(Budget::new(Bound::new(4096), 0));
                                 let wire = domain::Local::<wire::Identity, _>::new(wire::Identity);
-                                let result = match kind {
+                                match kind {
                                     Kind::Multiple => {
                                         let (state, config, report) = (&state, config, &mut finish);
                                         let app = MultiDuplexApplication::new(state, config);
@@ -479,15 +479,19 @@ fn runs_scoped_duplex() {
                                         assert_eq!(state.source.get(), bytes.len());
                                         result
                                     }
-                                };
-                                result.map_err(topology::Failure::Install)
+                                }
                             })
                         },
                         Policy::new(|event| reports.push(event), recover),
                         |result| {
-                            let result = result.map_err(topology::RunError::from);
-                            result.as_ref().map_err(|error| error.cause()).expect("topology")
-                                .as_ref().map_err(|error| error.cause()).expect("worker");
+                            result
+                                .as_ref()
+                                .map_err(|error| {
+                                    error.kind().map(|output| output.as_ref().map(|_| ()))
+                                })
+                                .expect("topology")
+                                .as_ref()
+                                .expect("worker");
                         },
                     );
                     assert!(reports.events().expect("reclaimed resources").is_empty(), "server retirement: {reports:?}");
