@@ -68,7 +68,7 @@ where
     /// Decodes one exact receive scope, retaining complete DATA only at its
     /// final payload range. `consumed` is reset and records the committed prefix
     /// of this source, including commits made before a returned error.
-    pub fn borrow_scope<S: buffer::Complete + hold::raw::Retain<'d>, B>(
+    pub fn borrow_scope<S: buffer::Cursor + hold::raw::Retain<'d>, B>(
         &mut self,
         source: &scope::Input<'_, 'd, S, B>,
         consumed: &mut usize,
