@@ -141,7 +141,7 @@ impl<P: Peer> Inbound<P> {
 
         Ok(Decode::Ready(Admission {
             inbound: self,
-            head,
+            span: head.start()..head.payload_end(),
             kind,
             mask,
         }))
@@ -158,22 +158,22 @@ pub enum Decode<'state, P: Peer> {
 ///
 pub struct Admission<'state, P: Peer> {
     inbound: &'state mut Inbound<P>,
-    head: frame::Head,
+    span: ops::Range<num::NonZero<usize>>,
     kind: Kind,
     mask: P::Witness,
 }
 
 impl<'state, P: Peer> Admission<'state, P> {
     pub fn frame_len(&self) -> num::NonZero<usize> {
-        self.head.payload_end()
+        self.span.end
     }
 
     pub fn range(&self) -> ops::Range<usize> {
-        self.head.start().get()..self.head.payload_end().get()
+        self.span.start.get()..self.span.end.get()
     }
 
     pub fn payload_len(&self) -> usize {
-        self.head.payload_len()
+        self.span.end.get() - self.span.start.get()
     }
 
     /// Validates the payload without committing fragmentation or frame progress.
@@ -183,9 +183,9 @@ impl<'state, P: Peer> Admission<'state, P> {
         self,
         data: &'payload [u8],
     ) -> Result<Prepared<'state, 'payload, P>, Fault> {
-        if data.len() != self.head.payload_len() {
+        if data.len() != self.payload_len() {
             return Err(Fault::Payload {
-                expected: self.head.payload_len(),
+                expected: self.payload_len(),
                 actual: data.len(),
             });
         }
