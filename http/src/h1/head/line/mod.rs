@@ -38,6 +38,12 @@ pub struct Response<'a> {
 }
 
 impl Request<'_> {
+    /// Checks for no CR except an optional trailing CR.
+    pub fn try_partial(bytes: &[u8]) -> Result<(), error::Request> {
+        Cursor::pending(bytes)?;
+        Ok(())
+    }
+
     pub fn parse(bytes: &[u8]) -> Result<Option<Request<'_>>, error::Request> {
         Self::parse_with(bytes, method::Known::ALL)
     }

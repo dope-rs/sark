@@ -4,7 +4,7 @@ use o3::{
     buffer::{self, bytes::window::Snapshot, storage, write},
     mem::Rejected,
 };
-use scan::{Progress, line};
+use scan::Progress;
 use write::CopyError;
 
 use crate::h1::head::{
@@ -68,26 +68,6 @@ impl<S: buffer::raw::Source> State<S> {
             source,
             inner: self.inner.clone(),
         })
-    }
-
-    /// Retains the exact incomplete line after the request-line parser needs input.
-    pub fn pending_line(source: S, limit: Limit) -> Result<Self, (S, ParseError<Infallible>)> {
-        match state::State::pending_line(Kind, source.as_ref(), limit) {
-            Ok(inner) => Ok(Self { source, inner }),
-            Err(error) => Err((source, error)),
-        }
-    }
-
-    /// Scans only newly appended line bytes and transfers the unchanged source.
-    pub fn advance_line(self) -> Result<line::Progress<S>, (S, ParseError<Infallible>)> {
-        match self.inner.advance_line(self.source.as_ref()) {
-            Ok((_, true)) => Ok(line::Progress::Complete(self.source)),
-            Ok((inner, false)) => Ok(line::Progress::More(Self {
-                source: self.source,
-                inner,
-            })),
-            Err(error) => Err((self.source, error)),
-        }
     }
 
     /// Copies the exact retained prefix without parsing any byte again.

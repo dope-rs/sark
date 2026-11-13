@@ -2,7 +2,7 @@
 use core::convert::Infallible;
 use std::num::NonZero;
 
-use o3::buffer::{bytes::window::Snapshot, storage};
+use o3::buffer::{bytes::window::Snapshot, storage, write::Sink as _};
 use sark_core::{request, route, route::field::query};
 use sark_http::{
     field::scan::Match,
@@ -12,7 +12,7 @@ use sark_http::{
         head::{
             Boundary, Limit, ParseError,
             line::{self, error},
-            request::{scan, scan::line::Progress},
+            request::scan,
         },
     },
     payload::fixed,
@@ -294,7 +294,7 @@ pub(super) fn rejection<'d>(cause: ParseError<Infallible>) -> fixed::Body<'d> {
 
 /// Append-only ownership while the initial request line is incomplete.
 pub(crate) struct Line {
-    source: scan::State<Source>,
+    source: Source,
 }
 
 #[doc(hidden)]
@@ -327,11 +327,16 @@ impl Line {
     }
 
     fn snapshot<'d>(input: &[u8], extra: usize) -> Result<Self, LineError<'d>> {
-        let source =
-            scan::State::pending_line(input, Limit::DEFAULT.with_bytes(recv::HEAD_CAPACITY))
-                .map_err(|(_, error)| LineError::Close(rejection(error)))?;
+        if input.len() > recv::HEAD_CAPACITY {
+            return Err(LineError::Close(rejection(ParseError::too_large(
+                input.len(),
+                recv::HEAD_CAPACITY,
+            ))));
+        }
+        line::Request::try_partial(input)
+            .map_err(|_| LineError::Close(rejection(ParseError::invalid())))?;
         let capacity = NonZero::new(input.len() + extra).unwrap_or(NonZero::<usize>::MIN);
-        let source = source.try_snapshot(capacity).map_err(line_failure)?;
+        let source = Source::try_copy(input, capacity).map_err(line_failure)?;
         Ok(Self { source })
     }
 
@@ -379,18 +384,15 @@ impl Line {
 
     fn extend<'d>(mut self, fragment: &[u8]) -> Result<LineProgress, LineError<'d>> {
         let prior = self.len();
-        self.source.try_extend(fragment).map_err(line_failure)?;
-        match self
-            .source
-            .advance_line()
-            .map_err(|(_, error)| LineError::Close(rejection(error)))?
-        {
-            Progress::More(source) => Ok(LineProgress::Pending(Self { source })),
-            Progress::Complete(source) => Ok(LineProgress::Complete {
-                source,
+        self.source.write_slice(fragment).map_err(line_failure)?;
+        match self.source.as_ref() {
+            [.., b'\r', b'\n'] => Ok(LineProgress::Complete {
+                source: self.source,
                 prior,
                 used: fragment.len(),
             }),
+            [.., b'\r', _] => Err(LineError::Close(rejection(ParseError::invalid()))),
+            _ => Ok(LineProgress::Pending(self)),
         }
     }
 }

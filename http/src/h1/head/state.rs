@@ -54,38 +54,6 @@ enum Phase<K: Kind> {
 }
 
 impl<K: Kind> State<K> {
-    pub(super) fn pending_line(
-        kind: K,
-        owner: &[u8],
-        limit: Limit,
-    ) -> Result<Self, ParseError<Infallible>> {
-        if owner.len() > limit.bytes() {
-            return Err(ParseError::too_large(owner.len(), limit.bytes()));
-        }
-        let cursor = line::Cursor::pending(owner).map_err(|_| ParseError::invalid())?;
-        Ok(Self {
-            phase: Phase::Line {
-                kind,
-                cursor,
-                limit,
-            },
-        })
-    }
-
-    pub(super) fn advance_line(
-        mut self,
-        owner: &[u8],
-    ) -> Result<(Self, bool), ParseError<Infallible>> {
-        let Phase::Line { cursor, limit, .. } = &mut self.phase else {
-            return Err(ParseError::invalid());
-        };
-        let (next, end) = cursor
-            .scan(owner, limit.bytes())
-            .map_err(ParseError::Boundary)?;
-        *cursor = next;
-        Ok((self, end.is_some()))
-    }
-
     pub(super) const fn new(kind: K, limit: Limit) -> Self {
         Self {
             phase: Phase::Start { kind, limit },

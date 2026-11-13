@@ -61,3 +61,42 @@ fn retains_prefix_until_output_capacity_returns() {
     assert!(matches!(cycle.state, Ok(pump::Egress::Static { body, .. })
         if body.as_slice() == canned::BAD_REQUEST.as_slice()));
 }
+
+#[test]
+fn resumes_only_through_the_first_line_ending() {
+    let expected = b"POST /x HTTP/1.1\r\n";
+    let mut tail = *b"OST /x HTTP/1.1\r\nHost: x\r\n\r\nGET /next HTTP/1.1\r\n\r\n";
+    let lf = expected.len() - 2;
+    for ending in [b'\n', b'X', b'\r'] {
+        tail[lf] = ending;
+        for split in 1..=lf {
+            let (_, Read::Pending(prefix)) = Prefix::default().read(b"P").expect("prefix") else {
+                panic!("partial preface");
+            };
+            let calls = Cell::new(0);
+            let mut handler = Reject::new(&calls, None);
+            handler.input = Some(expected);
+            let mut conn = Conn::<(), Infallible>::prefixed(prefix);
+            let first = pump::Ingress::drive(
+                &mut conn,
+                Pin::new(&mut handler),
+                &tail[..split],
+                o3::buffer::write::Slice::new(&mut [0; 2048]).reborrow(),
+                head::Connection::KeepAlive,
+            );
+            assert!(matches!(first.state, Ok(pump::Egress::None)));
+            assert_eq!(calls.get(), 0);
+            let cycle = pump::Ingress::drive(
+                &mut conn,
+                Pin::new(&mut handler),
+                &tail[split..],
+                o3::buffer::write::Slice::new(&mut [0; 2048]).reborrow(),
+                head::Connection::KeepAlive,
+            );
+            assert_eq!(calls.get(), usize::from(ending == b'\n'));
+            assert!(matches!(cycle.connection, head::Connection::Close));
+            assert!(matches!(cycle.state, Ok(pump::Egress::Static { body, .. })
+                if body.as_slice() == canned::BAD_REQUEST.as_slice()));
+        }
+    }
+}
