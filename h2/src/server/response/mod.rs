@@ -29,8 +29,26 @@ mod detached;
 mod head;
 mod pending;
 mod prepared;
+mod raw;
 mod receipt;
 mod status;
+
+use raw::Inline;
+
+enum Payload<P> {
+    Handoff(P),
+    Inline(Inline),
+}
+
+const _: () = {
+    assert!(
+        size_of::<Payload<handoff::Plan<'static, 'static>>>()
+            == size_of::<handoff::Plan<'static, 'static>>()
+    );
+    assert!(
+        size_of::<Payload<handoff::Pending<'static>>>() == size_of::<handoff::Pending<'static>>()
+    );
+};
 
 pub(in crate::server) use detached::Detached;
 #[doc(hidden)]
@@ -224,25 +242,30 @@ impl<
         status: Code,
         headers: H,
     ) -> Result<<Self as dispatch::Accept<'d>>::Output, <Self as dispatch::Accept<'d>>::Error> {
-        self.prepare(status, headers, fixed::Body::new(&[]), Boundary::End)
+        self.prepare(
+            status,
+            headers,
+            Payload::Handoff(fixed::Body::new(&[])),
+            Boundary::End,
+        )
     }
 
     fn prepare<H, B>(
         self,
         status: Code,
         headers: H,
-        value: B,
+        value: Payload<B>,
         end: Boundary,
     ) -> Result<<Self as dispatch::Accept<'d>>::Output, <Self as dispatch::Accept<'d>>::Error>
     where
         H: headers::Source,
         B: Body<'d>,
     {
-        let boundary = if value.is_empty() {
-            end
-        } else {
-            Boundary::More
+        let empty = match &value {
+            Payload::Handoff(value) => value.is_empty(),
+            Payload::Inline(value) => value.len() == 0,
         };
+        let boundary = if empty { end } else { Boundary::More };
         let Self {
             connection: conn,
             stream,
@@ -257,8 +280,13 @@ impl<
             connection: conn,
             stream,
         };
-        let body = Body::try_resolve(value, &body)
-            .map_err(|error| (conn::Error::Response(error), stream))?;
+        let body = match value {
+            Payload::Handoff(value) => Payload::Handoff(
+                Body::try_resolve(value, &body)
+                    .map_err(|error| (conn::Error::Response(error), stream))?,
+            ),
+            Payload::Inline(value) => Payload::Inline(value),
+        };
         Ok(Prepared { staged, body })
     }
 }
@@ -284,7 +312,7 @@ impl<
         if self.omit(status)? {
             return self.empty(status, headers);
         }
-        self.prepare(status, headers, body, Boundary::End)
+        self.prepare(status, headers, Payload::Handoff(body), Boundary::End)
     }
 
     fn exact<H, B>(mut self, status: Code, headers: H, body: B) -> Result<Self::Output, Self::Error>
@@ -297,9 +325,12 @@ impl<
         }
         let plan = exact::Plan::try_new(body)
             .map_err(|rejected| (conn::Error::Size(rejected.discard()), self.stream))?;
-        let body = plan
-            .into_shared()
-            .map_err(|error| (conn::Error::Build(error), self.stream))?;
+        let body = if plan.len() <= Inline::CAPACITY {
+            Inline::try_exact(plan).map(Payload::Inline)
+        } else {
+            plan.into_shared().map(Payload::Handoff)
+        }
+        .map_err(|error| (conn::Error::Build(error), self.stream))?;
         self.prepare(status, headers, body, Boundary::End)
     }
 
@@ -316,9 +347,13 @@ impl<
         if self.omit(status)? {
             return self.empty(status, headers);
         }
-        let body = bounded::Plan::new(body)
-            .into_shared()
-            .map_err(|error| (conn::Error::Build(error), self.stream))?;
+        let plan = bounded::Plan::new(body);
+        let body = if plan.max_len() <= Inline::CAPACITY {
+            Inline::try_bounded(plan).map(Payload::Inline)
+        } else {
+            plan.into_shared().map(Payload::Handoff)
+        }
+        .map_err(|error| (conn::Error::Build(error), self.stream))?;
         self.prepare(status, headers, body, Boundary::End)
     }
 }
@@ -344,8 +379,13 @@ impl<
         if self.omit(status)? {
             return self.empty(status, headers).map(|head| (head, None));
         }
-        self.prepare(status, headers, fixed::Body::new(&[]), Boundary::More)
-            .map(|head| (head, Some(stream)))
+        self.prepare(
+            status,
+            headers,
+            Payload::Handoff(fixed::Body::new(&[])),
+            Boundary::More,
+        )
+        .map(|head| (head, Some(stream)))
     }
 }
 

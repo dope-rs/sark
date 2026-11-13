@@ -21,6 +21,8 @@ pub const CONNECT: [field::Entry<'static>; 2] = [
 ];
 
 pub struct Body<'a> {
+    pub bytes: &'a [u8],
+    pub len: usize,
     pub encoded: &'a Cell<usize>,
     pub dropped: &'a Cell<usize>,
 }
@@ -31,19 +33,19 @@ impl Encode for Body<'_> {
         W: Sink<Error = consume::Error>,
     {
         self.encoded.set(self.encoded.get() + 1);
-        out.write_slice(b"body")
+        out.write_slice(self.bytes)
     }
 }
 
 impl exact::Body for Body<'_> {
     fn encoded_len(&self) -> usize {
-        4
+        self.len
     }
 }
 
 impl bounded::Body for Body<'_> {
     fn max_len(&self) -> usize {
-        4
+        self.len
     }
 }
 

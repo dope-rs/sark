@@ -8,7 +8,10 @@ use sark_http::{
 
 use crate::{
     conn,
-    server::{response::Pending, state::Transitions},
+    server::{
+        response::{Pending, raw::Inline},
+        state::Transitions,
+    },
     stream,
 };
 
@@ -20,6 +23,10 @@ pub struct Receipt<'d> {
 }
 
 impl<'d> Receipt<'d> {
+    pub(super) fn inline(body: Inline) -> Self {
+        Self::new(Pending::inline(body), hold::Charge::default(), None)
+    }
+
     pub(super) fn from_ready(
         body: handoff::Ready<'d>,
         linked: hold::Charge,

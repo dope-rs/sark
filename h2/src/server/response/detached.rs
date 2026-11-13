@@ -9,7 +9,7 @@ use sark_http::{
 
 use crate::{
     conn::{self, event},
-    server::response::{Handoff, Head, Receipt, head::Staged},
+    server::response::{Handoff, Head, Payload, Receipt, head::Staged},
 };
 
 pub(in crate::server) struct Detached<
@@ -21,7 +21,7 @@ pub(in crate::server) struct Detached<
     D = Infallible,
 > {
     pub(in crate::server::response) staged: Staged<'a, 'd, F, E>,
-    pub(in crate::server::response) body: handoff::Pending<'d, M, D>,
+    pub(in crate::server::response) body: Payload<handoff::Pending<'d, M, D>>,
 }
 
 impl<'a, 'd, F: rules::Policy, M: Handoff, E: event::Evidence, D: stage::Deferred<'d>>
@@ -32,7 +32,13 @@ impl<'a, 'd, F: rules::Policy, M: Handoff, E: event::Evidence, D: stage::Deferre
         request: D::Owner,
     ) -> Result<ops::ControlFlow<Head<'d>, Receipt<'d>>, conn::Error> {
         let Self { staged, body } = self;
-        let receipt = M::finish(body, request)?;
+        let receipt = match body {
+            Payload::Handoff(body) => M::finish(body, request)?,
+            Payload::Inline(body) => {
+                drop(request);
+                Receipt::inline(body)
+            }
+        };
         staged.defer(receipt)
     }
 }

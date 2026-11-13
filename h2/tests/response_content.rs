@@ -103,6 +103,8 @@ fn skip_head_encoding() {
             let encoded = Cell::new(0);
             let dropped = Cell::new(0);
             let body = Body {
+                bytes: b"body",
+                len: 4,
                 encoded: &encoded,
                 dropped: &dropped,
             };
@@ -152,7 +154,7 @@ fn requires_request_head() {
                 encoder,
                 Code::OK,
                 (),
-                Body { encoded: &encoded, dropped: &dropped },
+                Body { bytes: b"body", len: 4, encoded: &encoded, dropped: &dropped },
             ),
             Err((Error::InactiveStream(key), returned)) if key == stream && returned == stream
         ));

@@ -1,12 +1,27 @@
 pub mod common;
-use std::{cell::Cell, mem};
+use std::{cell::Cell, mem, pin::Pin};
 
-use common::response::{__SarkHandlerBorrowedX626F72726F776564 as Borrowed, *};
+use common::{
+    response::{__SarkHandlerBorrowedX626F72726F776564 as Borrowed, *},
+    sync::Client,
+};
 use dope_test::alloc::Tracker;
+use o3::{base::cell::region, buffer::resident};
 use sark::http::{
-    field::{self, Value},
+    field::{self, Value, metadata::section::rules},
     o3::buffer::{storage::Shared, write::Staged},
     payload::response::{dispatch::Complete as _, exact, headers::head::Head, status::Code},
+    request::body::Ref,
+};
+use sark_core::manifold::{schedule, stream::Boundary};
+use sark_h2::{
+    ClientRole, ServerRole,
+    conn::{
+        config::{Config, Validated},
+        event::Event,
+        machine::Connection,
+    },
+    server::response::Encoder,
 };
 use sark_json::Text;
 
@@ -92,6 +107,72 @@ fn writes_unsigned_no_alloc() {
         assert_eq!(allocs, 0);
         assert_eq!(&out[..written], expected.as_bytes());
     }
+}
+
+#[test]
+fn writes_unsigned_h2_no_alloc() {
+    let mut domain = resident::Domain::new();
+    region::Token::scope_pinned(Pin::new(&mut domain), |token, domain| {
+        let budget = domain
+            .get_mut()
+            .try_budget(Config::default().inbound_capacity, token.proof())
+            .expect("ingress capacity");
+        for value in [0, 2, usize::MAX] {
+            let expected = value.to_string();
+            let mut client = Connection::<ClientRole>::try_new().expect("client");
+            let request = Client::new(&mut client).try_get(b"/").expect("request");
+            let plan = Validated::new(Config::default()).expect("server plan");
+            let mut server =
+                Connection::<ServerRole, rules::RetainRaw, resident::Shared<'_>>::from_plan(plan)
+                    .expect("server");
+            server.ingress().try_bind(budget).expect("ingress budget");
+            server.ingress().ingest(&request).expect("request ingress");
+            let stream = std::iter::from_fn(|| server.ingress().poll_event())
+                .find_map(|event| match event {
+                    Event::Headers { stream_id, .. } => Some(stream_id),
+                    _ => None,
+                })
+                .expect("request stream key");
+            let response = Unsigned {
+                status: Code::OK,
+                body: value,
+            }
+            .into_fixed();
+            let encoder = Encoder::new(&mut server, stream, Ref::from_slice(&[]));
+            let (prepared, allocations) = Tracker::count(|| response.complete(encoder));
+            let prepared = prepared.expect("unsigned response");
+            assert_eq!(allocations, 0);
+            let mut pending = prepared
+                .finish()
+                .expect("commit response")
+                .expect("decimal body");
+            assert!(matches!(
+                pending.turn(&mut server, stream).expect("response DATA"),
+                schedule::Turn::Complete
+            ));
+            let (first, second) = server.output().slices();
+            client.ingress().ingest(first).expect("response prefix");
+            client.ingress().ingest(second).expect("response suffix");
+            let (received, data, boundary) = std::iter::from_fn(|| client.ingress().poll_event())
+                .find_map(|event| match event {
+                    Event::Data {
+                        stream_id,
+                        data,
+                        boundary,
+                    } => Some((stream_id, data, boundary)),
+                    _ => None,
+                })
+                .expect("decoded response DATA");
+            assert_eq!(received.id(), stream.id());
+            assert!(matches!(boundary, Boundary::End));
+            assert!(
+                data.segments()
+                    .flat_map(|part| part.as_slice())
+                    .copied()
+                    .eq(expected.bytes())
+            );
+        }
+    });
 }
 
 #[test]

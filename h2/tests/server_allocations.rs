@@ -5,36 +5,201 @@ use common::{
     Repeater,
     capacity::try_start,
     headers::Generated,
-    protocol::{conn::Controls, session::Frame},
+    protocol::{
+        Session,
+        conn::{Control, Controls},
+        session::Frame,
+    },
     recipe::Lexical,
+    response::Body,
     retain::Frames,
 };
 use dope::core::driver::settings;
 use dope_test::alloc::Tracker;
 use o3::{
     base::cell::region,
-    buffer::{self, hold::scope, pool::Pool, resident, storage},
+    buffer::{self, hold, hold::scope, pool::Pool, resident, storage},
 };
-use sark_core::manifold::stream::Boundary;
+use sark_core::manifold::{schedule, stream::Boundary};
 use sark_h2::{
     ClientRole, ServerRole,
     conn::{
-        DataOutcome,
+        DataBlock, DataOutcome, Error,
         config::{Config, Validated, capacity},
         event::Event,
         machine::Connection,
     },
-    frame::{Ack, numbers::ErrorCode},
+    frame::{
+        Ack,
+        numbers::{ErrorCode, SettingId},
+    },
     server::{
         self,
+        response::Encoder,
         service::Route,
         sync::{Conn, Endpoint},
     },
 };
-use sark_http::field::metadata::section::rules;
+use sark_http::{
+    field::metadata::section::rules,
+    payload::response::{dispatch::Accept, status::Code},
+    request::body::Ref,
+};
 
 #[global_allocator]
 static ALLOCATOR: Tracker = Tracker::new();
+
+#[test]
+fn inline_body_survives_flow_pressure() {
+    let mut domain = resident::Domain::new();
+    region::Token::scope_pinned(Pin::new(&mut domain), |token, domain| {
+        let budget = domain
+            .get_mut()
+            .try_budget(Config::default().inbound_capacity, token.proof())
+            .expect("ingress capacity");
+        for bounded in [false, true] {
+            let (mut server, stream) = Session::try_request(budget).expect("request");
+            let settings = Controls::new(Ack::Required)
+                .try_settings(&[(SettingId::InitialWindowSize as u16, 0)])
+                .expect("closed stream window");
+            server.ingress().ingest(&settings).expect("peer settings");
+            while server.ingress().poll_event().is_some() {}
+            server.transfer().drain(usize::MAX);
+            let encoded = Cell::new(0);
+            let dropped = Cell::new(0);
+            let body = Body {
+                bytes: b"body",
+                len: 4,
+                encoded: &encoded,
+                dropped: &dropped,
+            };
+            let encoder = Encoder::new(&mut server, stream, Ref::from_slice(&[]));
+            let (prepared, allocations) = Tracker::count(|| {
+                if bounded {
+                    Accept::bounded(encoder, Code::OK, (), body)
+                } else {
+                    Accept::exact(encoder, Code::OK, (), body)
+                }
+            });
+            let prepared = prepared.expect("inline response");
+            assert_eq!(allocations, 0);
+            assert_eq!((encoded.get(), dropped.get()), (1, 1));
+            let mut pending = prepared
+                .finish()
+                .expect("commit response")
+                .expect("inline body");
+            server.transfer().drain(usize::MAX);
+            assert!(matches!(
+                pending.turn(&mut server, stream).expect("blocked response"),
+                schedule::Turn::Blocked(DataBlock::StreamFlow)
+            ));
+            assert_eq!(pending.retention(), hold::Charge::from_commit(4, 0, 0));
+            assert!(server.output().is_empty());
+            let window = Control::new(stream.id().into_u32())
+                .try_window(2)
+                .expect("two bytes of credit");
+            for (bytes, boundary, remaining) in
+                [(b"bo", Boundary::More, 2), (b"dy", Boundary::End, 0)]
+            {
+                server.ingress().ingest(&window).expect("peer credit");
+                let turn = pending.turn(&mut server, stream).expect("response DATA");
+                assert!(
+                    turn == if remaining == 0 {
+                        schedule::Turn::Complete
+                    } else {
+                        schedule::Turn::Progress
+                    }
+                );
+                assert_eq!(
+                    pending.retention(),
+                    hold::Charge::from_commit(remaining, 0, 0)
+                );
+                let expected = Frame::new(stream.id().into_u32(), bytes)
+                    .try_data(boundary)
+                    .expect("expected DATA");
+                assert_eq!(server.output().first(), expected);
+                server.transfer().drain(usize::MAX);
+            }
+        }
+    });
+}
+
+#[test]
+fn inline_body_capacity_and_errors() {
+    let mut domain = resident::Domain::new();
+    region::Token::scope_pinned(Pin::new(&mut domain), |token, domain| {
+        let budget = domain
+            .get_mut()
+            .try_budget(Config::default().inbound_capacity, token.proof())
+            .expect("ingress capacity");
+        for (bounded, len, written) in [
+            (false, 0, 0),
+            (false, 22, 22),
+            (false, 23, 23),
+            (true, 0, 0),
+            (true, 22, 21),
+            (true, 23, 23),
+        ] {
+            let (mut server, stream) = Session::try_request(budget).expect("request");
+            let encoded = Cell::new(0);
+            let dropped = Cell::new(0);
+            let bytes = &[b'x'; 23][..written];
+            let body = Body {
+                bytes,
+                len,
+                encoded: &encoded,
+                dropped: &dropped,
+            };
+            let encoder = Encoder::new(&mut server, stream, Ref::from_slice(&[]));
+            let (prepared, allocations) = Tracker::count(|| {
+                if bounded {
+                    Accept::bounded(encoder, Code::OK, (), body)
+                } else {
+                    Accept::exact(encoder, Code::OK, (), body)
+                }
+            });
+            let prepared = prepared.expect("admitted response");
+            assert_eq!(allocations, usize::from(len > 22));
+            assert_eq!((encoded.get(), dropped.get()), (1, 1));
+            let pending = prepared.finish().expect("commit response");
+            server.transfer().drain(usize::MAX);
+            if written == 0 {
+                assert!(pending.is_none());
+            } else {
+                let mut pending = pending.expect("encoded body");
+                assert!(matches!(
+                    pending.turn(&mut server, stream).expect("response DATA"),
+                    schedule::Turn::Complete
+                ));
+                let expected = Frame::new(stream.id().into_u32(), bytes)
+                    .try_data(Boundary::End)
+                    .expect("expected DATA");
+                assert_eq!(server.output().first(), expected);
+            }
+        }
+
+        let (mut server, stream) = Session::try_request(budget).expect("request");
+        let encoded = Cell::new(0);
+        let dropped = Cell::new(0);
+        let body = Body {
+            bytes: b"bad",
+            len: 4,
+            encoded: &encoded,
+            dropped: &dropped,
+        };
+        let encoder = Encoder::new(&mut server, stream, Ref::from_slice(&[]));
+        assert!(matches!(
+            Accept::exact(encoder, Code::OK, (), body),
+            Err((Error::Build(storage::BuildError::Length(error)), returned))
+                if returned == stream
+                    && error.into_parts().0.get() == 4
+                    && error.into_parts().1 == 3
+        ));
+        assert_eq!((encoded.get(), dropped.get()), (1, 1));
+        assert!(server.output().is_empty());
+        assert!(server.status().has_key(stream));
+    });
+}
 
 #[test]
 fn body_reuse_is_stable() {

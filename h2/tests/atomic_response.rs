@@ -119,26 +119,24 @@ fn restores_owner() {
             .get_mut()
             .try_budget(Config::default().inbound_capacity, token.proof())
             .expect("ingress capacity");
-        let (mut server, stream) = Session::try_request(budget).expect("request connection");
-        let encoder = response::Encoder::new(&mut server, stream, Ref::from_slice(&[]));
-        let prepared = Accept::fixed(
-            encoder,
-            Code::OK,
-            Set::<'static, 0>::new(),
-            b"retained-owner".to_vec(),
-        );
-        let prepared = prepared.expect("response must prepare");
-        let pending = prepared.finish();
-        let mut pending = pending
-            .expect("atomic response commit")
-            .expect("response body remains pending");
-        let retained = pending.retention();
-        server.streams().cancel(stream, ErrorCode::Cancel);
+        for len in [13, 1 << 20] {
+            let (mut server, stream) = Session::try_request(budget).expect("request connection");
+            let encoder = response::Encoder::new(&mut server, stream, Ref::from_slice(&[]));
+            let prepared =
+                Accept::fixed(encoder, Code::OK, Set::<'static, 0>::new(), vec![b'x'; len]);
+            let prepared = prepared.expect("response must prepare");
+            let pending = prepared.finish();
+            let mut pending = pending
+                .expect("atomic response commit")
+                .expect("response body remains pending");
+            let retained = pending.retention();
+            server.streams().cancel(stream, ErrorCode::Cancel);
 
-        assert!(matches!(
-            pending.turn(&mut server, stream),
-            Err(Error::InactiveStream(found)) if found == stream
-        ));
-        assert!(pending.retention() == retained);
+            assert!(matches!(
+                pending.turn(&mut server, stream),
+                Err(Error::InactiveStream(found)) if found == stream
+            ));
+            assert!(pending.retention() == retained);
+        }
     });
 }
