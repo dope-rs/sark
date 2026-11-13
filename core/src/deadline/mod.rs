@@ -332,14 +332,14 @@ impl<K: manifold::raw::Key, P: Copy + Ord, W: Copy + Ord> Agenda<K, P, W> {
         }
         match plan {
             Plan::Vacant(mut entry) => {
-                let mut lane = Lane::EMPTY;
+                let lane = entry.resident_mut();
+                *lane = Lane::EMPTY;
                 if lane.phases.apply(config, change, now, add) == timeline::Change::Unchanged {
                     return Ok(());
                 }
                 let Some(next) = lane.next() else {
                     return Ok(());
                 };
-                *entry.resident_mut() = lane;
                 entry.insert(next);
             }
             Plan::Occupied(mut entry) => {
@@ -364,9 +364,9 @@ impl<K: manifold::raw::Key, P: Copy + Ord, W: Copy + Ord> Book<K, P, W> for Agen
         let plan = self.try_entry(key)?;
         match plan {
             Plan::Vacant(mut entry) => {
-                let mut lane = Lane::EMPTY;
+                let lane = entry.resident_mut();
+                *lane = Lane::EMPTY;
                 let minimum = lane.set(item);
-                *entry.resident_mut() = lane;
                 entry.insert(minimum);
             }
             Plan::Occupied(mut entry) => {

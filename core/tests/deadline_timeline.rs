@@ -289,6 +289,9 @@ fn transition_preserves_minimum() {
         (Transition::ResponseCommitted, 1, Some((10, Phase::Total))),
         (Transition::Open, 1, Some((10, Phase::Total))),
         (Transition::Retired, 1, None),
+        (Transition::InputAdmitted, 1, None),
+        (Transition::Open, 2, Some((12, Phase::Total))),
+        (Transition::Retired, 2, None),
     ] {
         assert!(agenda.transition(key, config, step, now, add).is_ok());
         assert!(agenda.peek() == expected.map(|(at, phase)| (key, Scheduled::expire(at, phase))));
