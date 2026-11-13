@@ -1,3 +1,8 @@
+use o3::{
+    buffer::storage,
+    mem::{raw, slot},
+};
+
 use crate::details::{Account, Credit};
 
 #[derive(Default)]
@@ -29,12 +34,8 @@ impl Ledger {
         total: usize,
     ) -> Result<Update<'a>, Credit> {
         let budget = Budget::new(self, charge);
-        let (charge, total) = budget.plan(added, local, total)?;
-        Ok(Update {
-            budget,
-            charge,
-            total,
-        })
+        let amounts = budget.plan(added, local, total)?;
+        Ok(Update { budget, amounts })
     }
 
     pub(in crate::server) fn shrink<'a>(
@@ -54,8 +55,7 @@ impl Ledger {
         })?;
         Ok(Update {
             budget: Budget::new(self, charge),
-            charge: left,
-            total,
+            amounts: (left, total),
         })
     }
 }
@@ -69,28 +69,22 @@ struct Budget<'a> {
 #[must_use]
 pub(in crate::server) struct Update<'a> {
     budget: Budget<'a>,
-    charge: usize,
-    total: usize,
+    amounts: (usize, usize),
 }
 
-pub(in crate::server) struct Staged<'a, T> {
+pub(in crate::server) struct Staged<'a> {
     budget: Budget<'a>,
-    state: State<T>,
+    state: slot::Storage<(storage::Shared, (usize, usize))>,
 }
 
-enum State<T> {
-    Empty,
-    Message {
-        value: T,
-        charge: usize,
-        total: usize,
-    },
+pub(in crate::server) struct Vacant<'a, 'b> {
+    state: raw::Vacant<'a, (storage::Shared, (usize, usize))>,
+    budget: &'a Budget<'b>,
 }
 
-pub(in crate::server) struct Admission<'a, T> {
-    state: &'a mut State<T>,
-    charge: usize,
-    total: usize,
+pub(in crate::server) struct Admission<'a> {
+    state: raw::Vacant<'a, (storage::Shared, (usize, usize))>,
+    amounts: (usize, usize),
 }
 
 impl<'a> Budget<'a> {
@@ -137,25 +131,28 @@ impl<'a> Budget<'a> {
 
 impl<'a> Update<'a> {
     pub(in crate::server) fn commit(self) {
-        self.budget.charge.bytes = self.charge;
-        self.budget.ledger.used = self.total;
+        let (charge, total) = self.amounts;
+        self.budget.charge.bytes = charge;
+        self.budget.ledger.used = total;
     }
 }
 
-impl<'a, T> Staged<'a, T> {
+impl<'a> Staged<'a> {
     pub(in crate::server) fn new(ledger: &'a mut Ledger, charge: &'a mut Charge) -> Self {
         Self {
             budget: Budget::new(ledger, charge),
-            state: State::Empty,
+            state: slot::Storage::new(()),
         }
     }
 
     pub(in crate::server) fn is_empty(&self) -> bool {
-        matches!(self.state, State::Empty)
+        self.state.get().is_none()
     }
 
     pub(in crate::server) fn clear(&mut self) {
-        self.state = State::Empty;
+        if let Some(state) = self.state.occupied() {
+            state.clear();
+        }
     }
 
     pub(in crate::server) fn check(
@@ -167,46 +164,43 @@ impl<'a, T> Staged<'a, T> {
         self.budget.plan(added, local, total)
     }
 
-    pub(in crate::server) fn try_grow(
-        &mut self,
-        added: usize,
-        local: usize,
-        total: usize,
-    ) -> Result<Admission<'_, T>, Credit> {
-        let (charge, total) = self.budget.plan(added, local, total)?;
-        Ok(Admission {
-            state: &mut self.state,
-            charge,
-            total,
+    pub(in crate::server) fn vacant(&mut self) -> Option<Vacant<'_, 'a>> {
+        Some(Vacant {
+            state: self.state.vacant()?,
+            budget: &self.budget,
         })
     }
 
-    pub(in crate::server) fn finish(self) -> Option<(T, Update<'a>)> {
-        match self.state {
-            State::Empty => None,
-            State::Message {
-                value,
-                charge,
-                total,
-            } => Some((
-                value,
-                Update {
-                    budget: self.budget,
-                    charge,
-                    total,
-                },
-            )),
-        }
+    pub(in crate::server) fn finish(mut self) -> Option<(storage::Shared, Update<'a>)> {
+        let (value, amounts) = self.state.occupied()?.take().0;
+        Some((
+            value,
+            Update {
+                budget: self.budget,
+                amounts,
+            },
+        ))
     }
 }
 
-impl<T> Admission<'_, T> {
-    pub(in crate::server) fn write(self, value: T) {
-        *self.state = State::Message {
-            value,
-            charge: self.charge,
-            total: self.total,
-        };
+impl<'a> Vacant<'a, '_> {
+    pub(in crate::server) fn try_grow(
+        self,
+        added: usize,
+        local: usize,
+        total: usize,
+    ) -> Result<Admission<'a>, Credit> {
+        let amounts = self.budget.plan(added, local, total)?;
+        Ok(Admission {
+            state: self.state,
+            amounts,
+        })
+    }
+}
+
+impl Admission<'_> {
+    pub(in crate::server) fn write(self, value: storage::Shared) {
+        self.state.insert((value, self.amounts));
     }
 }
 

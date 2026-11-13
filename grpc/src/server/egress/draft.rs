@@ -58,7 +58,7 @@ struct Message<'a> {
 enum Output<'a> {
     Exhausted,
     Ready {
-        staged: credits::Staged<'a, storage::Shared>,
+        staged: credits::Staged<'a>,
         slot: slots::Vacant<storage::Shared, slots::Bound<'a, storage::Shared>>,
     },
 }
@@ -194,9 +194,9 @@ impl<'a, K: manifold::raw::Key> Draft<'a, K> {
         let staged = match output {
             Output::Exhausted => None,
             Output::Ready { staged, .. } => {
-                if !staged.is_empty() {
+                let Some(staged) = staged.vacant() else {
                     return Err(PushError::Status(Self::invalid(Reason::ResponsePerTurn)));
-                }
+                };
                 Some(staged)
             }
         };
