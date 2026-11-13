@@ -15,7 +15,10 @@ pub use egress::Egress;
 pub use ingress::Ingress;
 use o3::buffer::resident::Shared;
 use resident::{Handle, Local, Owner};
-use sark_core::{life, manifold::stream::Boundary};
+use sark_core::{
+    life::{self, mode},
+    manifold::stream::Boundary,
+};
 use sark_http;
 use send::admit;
 use stream::send;
@@ -63,6 +66,25 @@ impl<'d, 'a, 'scope, const ID: u8, B: stream::Recv, const RECONCILE: bool>
     }
 
     fn pump<P, C, O>(
+        &mut self,
+        h3: &mut crate::conn::Connection<'d, P>,
+        life: &mut O,
+        handle: C,
+    ) -> Result<report::Report, manifold::Error>
+    where
+        P: rules::Policy,
+        C: Copy,
+        O: life::Mode<C, Id>,
+        B: stream::Retain<'d>,
+    {
+        if O::ENABLED {
+            self.pump_as::<P, C, O>(h3, life, handle)
+        } else {
+            self.pump_as::<P, (), mode::Disabled>(h3, &mut mode::Disabled, ())
+        }
+    }
+
+    fn pump_as<P, C, O>(
         &mut self,
         h3: &mut crate::conn::Connection<'d, P>,
         life: &mut O,
