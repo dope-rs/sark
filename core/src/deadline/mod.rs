@@ -279,38 +279,6 @@ impl<P: Copy + Ord, W: Copy + Ord> Lane<P, W> {
             .chain(self.wake.map(|item| Scheduled::wake(item.at, item.reason)))
             .min()
     }
-
-    fn clear_wake(&mut self) -> Mutation {
-        if self.wake.is_none() {
-            return Mutation::Unchanged;
-        }
-        self.wake = None;
-        Mutation::Contents
-    }
-
-    fn transition<N, F>(
-        &mut self,
-        config: config::Config,
-        change: timeline::Transition,
-        now: N,
-        add: F,
-    ) -> Mutation
-    where
-        N: Copy,
-        F: FnMut(N, Positive) -> P,
-    {
-        let before = self.next();
-        let phases = self.phases.apply(config, change, now, add);
-        let wake = if change == timeline::Transition::Retired {
-            self.clear_wake()
-        } else {
-            Mutation::Unchanged
-        };
-        if phases == timeline::Change::Unchanged && wake == Mutation::Unchanged {
-            return Mutation::Unchanged;
-        }
-        Mutation::between(before, self.next())
-    }
 }
 
 impl<K: manifold::raw::Key, P: Copy + Ord, W: Copy + Ord> Agenda<K, P, W> {
@@ -355,10 +323,17 @@ impl<K: manifold::raw::Key, P: Copy + Ord, W: Copy + Ord> Agenda<K, P, W> {
             return Ok(());
         }
         let plan = self.try_entry(key)?;
+        if change == timeline::Transition::Retired {
+            drop(add);
+            if let Plan::Occupied(entry) = plan {
+                entry.retire();
+            }
+            return Ok(());
+        }
         match plan {
             Plan::Vacant(mut entry) => {
                 let mut lane = Lane::EMPTY;
-                if lane.transition(config, change, now, add) == Mutation::Unchanged {
+                if lane.phases.apply(config, change, now, add) == timeline::Change::Unchanged {
                     return Ok(());
                 }
                 let Some(next) = lane.next() else {
@@ -368,12 +343,14 @@ impl<K: manifold::raw::Key, P: Copy + Ord, W: Copy + Ord> Agenda<K, P, W> {
                 entry.insert(next);
             }
             Plan::Occupied(mut entry) => {
-                let mutation = entry.resident_mut().transition(config, change, now, add);
-                if mutation != Mutation::Earliest {
+                if entry.resident_mut().phases.apply(config, change, now, add)
+                    == timeline::Change::Unchanged
+                {
                     return Ok(());
                 }
                 match entry.resident().next() {
-                    Some(next) => entry.set(next),
+                    Some(next) if entry.priority() != &next => entry.set(next),
+                    Some(_) => {}
                     None => entry.retire(),
                 }
             }

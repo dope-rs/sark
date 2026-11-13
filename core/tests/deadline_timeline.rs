@@ -266,6 +266,47 @@ fn wake_follows_expiry() {
 }
 
 #[test]
+fn transition_preserves_minimum() {
+    use deadline::{Book, Phase, Scheduled, WakeReason};
+    use timeline::Transition;
+
+    let plan = hash::Plan::new(1).expect("fixture capacity");
+    let mut registry =
+        runtime::Registry::<u64, Generation>::try_new(plan).expect("registry allocation");
+    let key = registry.insert(7).expect("insertion");
+    let mut agenda = deadline::Agenda::try_new(Count::new(1)).expect("agenda allocation");
+    let config = Config::new(Phase::Total, Positive::from_secs::<10>())
+        .with(Phase::BodyIdle, Positive::from_secs::<5>())
+        .with(Phase::Handler, Positive::from_secs::<5>())
+        .with(Phase::ResponseAdmission, Positive::from_secs::<20>());
+    for (step, now, expected) in [
+        (Transition::Open, 0, Some((10, Phase::Total))),
+        (Transition::HeadAdmitted, 0, Some((5, Phase::BodyIdle))),
+        (Transition::BodyProgress, 1, Some((5, Phase::BodyIdle))),
+        (Transition::HandlerStarted, 1, Some((5, Phase::BodyIdle))),
+        (Transition::InputFinished, 1, Some((6, Phase::Handler))),
+        (Transition::ResponseReady, 1, Some((10, Phase::Total))),
+        (Transition::ResponseCommitted, 1, Some((10, Phase::Total))),
+        (Transition::Open, 1, Some((10, Phase::Total))),
+        (Transition::Retired, 1, None),
+    ] {
+        assert!(agenda.transition(key, config, step, now, add).is_ok());
+        assert!(agenda.peek() == expected.map(|(at, phase)| (key, Scheduled::expire(at, phase))));
+    }
+    assert!(
+        agenda
+            .schedule(key, Scheduled::wake(1, WakeReason::DeferredOutput))
+            .is_ok()
+    );
+    assert!(
+        agenda
+            .transition(key, config, Transition::Retired, 0, add)
+            .is_ok()
+    );
+    assert!(agenda.is_empty());
+}
+
+#[test]
 fn poll_bounds_renewals() {
     use deadline::{Book, Poll};
 
