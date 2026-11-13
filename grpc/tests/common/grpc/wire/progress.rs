@@ -293,11 +293,14 @@ impl<'c, T> domain::Domain<Carrier<'c>, T> for Domain<T> {
         self.0.resume(|| conn.native.flow().poll_wake(), egress);
     }
 
-    fn drive<D: domain::Driver<Carrier<'c>, T>>(
+    fn drive<D>(
         &mut self,
         conn: &mut Carrier<'c>,
         driver: &mut D,
-    ) -> Result<schedule::Report, domain::Failure<D::Error, stream::Key>> {
-        domain::try_drive(&mut self.0, conn, driver)
+    ) -> Result<schedule::Report, D::Failure>
+    where
+        D: schedule::data::Driver<Carrier<'c>, T, Key = stream::Key, Block = conn::DataBlock>,
+    {
+        self.0.try_drive_data(conn, driver)
     }
 }

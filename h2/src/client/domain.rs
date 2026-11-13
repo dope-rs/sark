@@ -77,11 +77,19 @@ where
         self.inner.resume(|| conn.flow().poll_wake(), egress);
     }
 
-    fn drive<D: domain::Driver<Connection<ClientRole, F, C>, T>>(
+    fn drive<D>(
         &mut self,
         conn: &mut Connection<ClientRole, F, C>,
         driver: &mut D,
-    ) -> Result<schedule::Report, domain::Failure<D::Error, stream::Key>> {
-        domain::try_drive(&mut self.inner, conn, driver)
+    ) -> Result<schedule::Report, D::Failure>
+    where
+        D: schedule::data::Driver<
+                Connection<ClientRole, F, C>,
+                T,
+                Key = stream::Key,
+                Block = conn::DataBlock,
+            >,
+    {
+        self.inner.try_drive_data(conn, driver)
     }
 }

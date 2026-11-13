@@ -7,8 +7,8 @@ use crate::manifold::{
     schedule::{
         Activation, Block, CONNECTION_WAIT, CONTROL_CONNECTION_WAIT, CONTROL_EGRESS_WAIT,
         CONTROL_READY, CONTROL_STREAM_WAIT, DATA_READY, Driver, Egress, InsertResult, Occupied,
-        Records, Report, STREAM_WAIT, Terminal, Turn, Vacant, Wait, Wake, data, drive::Drive,
-        policy::Policy,
+        Records, Report, STREAM_WAIT, Settlement, Terminal, Turn, Vacant, Wait, Wake, data,
+        drive::Drive, policy::Policy,
     },
 };
 
@@ -114,9 +114,13 @@ impl<K: manifold::raw::Key, T, B: Block> Runtime<K, T, B> {
         Drive::new(&mut self.records.slots, &mut self.policy, driver).run::<false>()
     }
 
-    pub fn drive_data<D>(&mut self, driver: &mut D) -> Report
+    pub fn try_drive_data<C, D>(
+        &mut self,
+        context: &mut C,
+        driver: &mut D,
+    ) -> Result<Report, D::Failure>
     where
-        D: data::Driver<T, Key = K, Block = B>,
+        D: data::Driver<C, T, Key = K, Block = B>,
     {
         let mut report = Report::default();
         let mut left = self.records.len();
@@ -129,7 +133,7 @@ impl<K: manifold::raw::Key, T, B: Block> Runtime<K, T, B> {
             }
             left -= 1;
             let stream = current.key();
-            let turn = driver.turn(stream, current.get_mut());
+            let turn = driver.turn(context, stream, current.get_mut());
             let (terminal, lane, blocked) = match turn {
                 Ok(Turn::Complete) => (Some(Terminal::Complete), None, false),
                 Ok(Turn::Idle) => (Some(Terminal::Idle), None, false),
@@ -142,17 +146,19 @@ impl<K: manifold::raw::Key, T, B: Block> Runtime<K, T, B> {
                 Err(error) => (Some(Terminal::Failed(error)), None, false),
             };
             let complete = matches!(&terminal, Some(Terminal::Complete));
-            match terminal.map(|terminal| driver.settle(stream, current.get_mut(), terminal)) {
-                Some(data::Settlement::Keep) => current.unlink(),
-                Some(data::Settlement::Remove) => {
-                    let value = current.remove();
-                    driver.remove(value);
-                }
-                None => {
-                    if let Some(lane) = lane {
-                        current.move_to_back(lane);
+            if let Some(terminal) = terminal {
+                let (settlement, result) =
+                    driver.settle(context, stream, current.get_mut(), terminal);
+                match settlement {
+                    Settlement::Keep(()) => current.unlink(),
+                    Settlement::Remove => {
+                        let value = current.remove();
+                        driver.remove(value);
                     }
                 }
+                result?;
+            } else if let Some(lane) = lane {
+                current.move_to_back(lane);
             }
             report.turns += 1;
             report.completed += usize::from(complete);
@@ -160,7 +166,7 @@ impl<K: manifold::raw::Key, T, B: Block> Runtime<K, T, B> {
                 self.policy.block_data();
             }
         }
-        report
+        Ok(report)
     }
 }
 

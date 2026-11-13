@@ -92,3 +92,42 @@ fn alternates_one_permit() {
         );
     }
 }
+
+#[test]
+fn settles_first_data_failure() {
+    let mut runtime = schedule::Runtime::<key::Handle, usize, Block>::try_bounded(
+        capacity::Count::new(2),
+        capacity::Count::new(2),
+    )
+    .expect("two scheduler entries");
+    let keys =
+        [0, 1].map(|index| key::Handle::from_parts(key::Parts::new(index, key::Generation::MIN)));
+    for key in keys {
+        runtime
+            .try_insert(key, 0, schedule::Activation::data(None))
+            .as_ref()
+            .expect("scheduled owner");
+    }
+    let mut driver = Driver {
+        remaining: 0,
+        probes: 0,
+    };
+    assert_eq!(
+        runtime
+            .try_drive_data(&mut (), &mut driver)
+            .expect("gate stops before a turn")
+            .turns,
+        0
+    );
+    assert_eq!(driver.probes, 0);
+    assert_eq!(
+        keys.map(|key| runtime.get(key).copied()),
+        [Some(0), Some(0)]
+    );
+    driver.remaining = 1;
+    let (result, allocs) = Tracker::count(|| runtime.try_drive_data(&mut (), &mut driver));
+    assert!(matches!(result, Err(1)));
+    assert_eq!(allocs, 0);
+    assert_eq!(driver.probes, 2);
+    assert_eq!(keys.map(|key| runtime.get(key).copied()), [None, Some(0)]);
+}

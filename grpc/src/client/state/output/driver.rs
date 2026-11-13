@@ -188,15 +188,18 @@ impl<'a, R> Driver<'a, R> {
     }
 }
 
-impl<Cn, C, R> domain::Driver<Cn, calls::Record<C>> for Driver<'_, R>
+impl<Cn, C, R> schedule::data::Driver<Cn, calls::Record<C>> for Driver<'_, R>
 where
     C: session::Storage,
     Cn: client::Connection<Owner = C, Error = conn::Error>,
     R: FnMut(calls::Record<C>),
 {
+    type Key = Cn::Key;
+    type Block = Cn::Block;
     type Error = RequestError;
+    type Failure = domain::Failure<RequestError, Cn::Key>;
 
-    fn data(
+    fn turn(
         &mut self,
         conn: &mut Cn,
         key: Cn::Key,
@@ -224,45 +227,40 @@ where
         key: Cn::Key,
         record: &mut calls::Record<C>,
         term: schedule::Terminal<Self::Error>,
-    ) -> domain::Settlement<Self::Error, Cn::Key> {
-        match term {
+    ) -> (schedule::Settlement<()>, Result<(), Self::Failure>) {
+        let cause = match term {
             schedule::Terminal::Complete => {
-                if record.response.is_none() && matches!(record.boundary, Boundary::End) {
-                    domain::Settlement::Remove
-                } else {
-                    domain::Settlement::Keep
-                }
-            }
-            schedule::Terminal::Idle => {
-                self.requests.clear(&mut record.requests);
-                match conn.reset(key, Reset::Internal) {
-                    Ok(()) => domain::Settlement::Remove,
-                    Err(error) => domain::Settlement::Failed {
-                        disposition: domain::Disposition::Keep,
-                        error: domain::Failure::Idle(error),
+                return (
+                    if record.response.is_none() && matches!(record.boundary, Boundary::End) {
+                        schedule::Settlement::Remove
+                    } else {
+                        schedule::Settlement::Keep(())
                     },
-                }
+                    Ok(()),
+                );
             }
-            schedule::Terminal::Failed(cause) => {
-                self.requests.clear(&mut record.requests);
-                match conn.reset(key, Reset::Internal) {
-                    Ok(()) => domain::Settlement::Failed {
-                        disposition: domain::Disposition::Remove,
-                        error: domain::Failure::Turn(cause),
-                    },
-                    Err(error) => domain::Settlement::Failed {
-                        disposition: domain::Disposition::Keep,
-                        error: domain::Failure::Settle {
-                            terminal: cause,
-                            error,
-                        },
-                    },
-                }
-            }
+            schedule::Terminal::Idle => None,
+            schedule::Terminal::Failed(cause) => Some(cause),
+        };
+        self.requests.clear(&mut record.requests);
+        match (conn.reset(key, Reset::Internal), cause) {
+            (Ok(()), None) => (schedule::Settlement::Remove, Ok(())),
+            (Ok(()), Some(cause)) => (
+                schedule::Settlement::Remove,
+                Err(domain::Failure::Turn(cause)),
+            ),
+            (Err(error), None) => (
+                schedule::Settlement::Keep(()),
+                Err(domain::Failure::Idle(error)),
+            ),
+            (Err(error), Some(terminal)) => (
+                schedule::Settlement::Keep(()),
+                Err(domain::Failure::Settle { terminal, error }),
+            ),
         }
     }
 
-    fn removed(&mut self, mut record: calls::Record<C>) {
+    fn remove(&mut self, mut record: calls::Record<C>) {
         self.requests.clear(&mut record.requests);
         (self.on_retire)(record);
     }

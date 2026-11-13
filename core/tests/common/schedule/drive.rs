@@ -64,3 +64,42 @@ impl schedule::Driver<usize> for Driver {
         Ok(schedule::DataTurn::Progress(schedule::WorkClass::Data))
     }
 }
+
+impl schedule::data::Driver<(), usize> for Driver {
+    type Key = key::Handle;
+    type Block = Block;
+    type Error = usize;
+    type Failure = usize;
+
+    fn can_continue(&self) -> bool {
+        self.remaining != 0
+    }
+
+    fn turn(
+        &mut self,
+        _: &mut (),
+        _: key::Handle,
+        value: &mut usize,
+    ) -> Result<schedule::Turn<Block>, usize> {
+        self.probes += 1;
+        *value += 1;
+        Err(*value)
+    }
+
+    fn settle(
+        &mut self,
+        _: &mut (),
+        _: key::Handle,
+        _: &mut usize,
+        terminal: schedule::Terminal<usize>,
+    ) -> (schedule::Settlement<()>, Result<(), usize>) {
+        let schedule::Terminal::Failed(error) = terminal else {
+            unreachable!("terminal")
+        };
+        (schedule::Settlement::Remove, Err(error))
+    }
+
+    fn remove(&mut self, value: usize) {
+        self.probes += value;
+    }
+}
