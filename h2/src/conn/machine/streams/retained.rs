@@ -1,4 +1,4 @@
-use core::{marker, num::NonZero};
+use core::{mem, num::NonZero, ops::Deref};
 
 use o3::{
     buffer,
@@ -29,12 +29,33 @@ pub struct Retained<
     pub(super) conn: &'a mut machine::Connection<R, F, C, A, E>,
 }
 
-pub(super) struct Parts<'a, C: session::Storage> {
+pub(in crate::conn::machine) trait Body:
+    Deref<Target = storage::Shared>
+{
+    fn try_take(self, complete: bool) -> Result<storage::Shared, rc::Error>;
+}
+
+impl Body for &storage::Shared {
+    fn try_take(self, _: bool) -> Result<storage::Shared, rc::Error> {
+        self.try_clone()
+    }
+}
+
+impl Body for &mut storage::Shared {
+    fn try_take(self, complete: bool) -> Result<storage::Shared, rc::Error> {
+        if complete {
+            Ok(mem::take(self))
+        } else {
+            self.try_clone()
+        }
+    }
+}
+
+pub(super) struct Parts<'a, B: Body> {
     pub(super) prefix: &'a [u8],
-    pub(super) body: &'a storage::Shared,
+    pub(super) body: B,
     pub(super) off: usize,
     len: usize,
-    marker: marker::PhantomData<fn() -> C>,
 }
 
 pub(super) struct Front<'d>(pub(super) segments::Nonempty<resident::Shared<'d>>);
@@ -56,34 +77,18 @@ const _: () = {
     assert!(align_of::<Retained<'static, crate::ClientRole>>() == align_of::<usize>());
 };
 
-impl<'a, C: session::Storage> Parts<'a, C> {
-    fn try_new(
-        prefix: &'a [u8],
-        body: &'a storage::Shared,
-        off: usize,
-    ) -> Result<Self, conn::Error> {
-        let tail = body.len().checked_sub(off).ok_or(conn::Error::DataRange {
-            offset: off,
-            prefix: prefix.len(),
-            body: body.len(),
-        })?;
-        Ok(Self {
-            prefix,
-            body,
-            off,
-            len: prefix.len() + tail,
-            marker: marker::PhantomData,
-        })
-    }
-
-    pub(super) fn take(self, amount: usize) -> Result<(payloads::Inline, Option<C>), rc::Error> {
+impl<B: Body> Parts<'_, B> {
+    pub(super) fn try_take<C: session::Storage>(
+        self,
+        amount: usize,
+    ) -> Result<(payloads::Inline, Option<C>), rc::Error> {
         let head = amount.min(self.prefix.len());
         let used = amount - head;
         let inline = payloads::Inline::prefix(self.prefix, head);
         let body = if used == 0 {
             None
         } else {
-            let mut body = self.body.try_clone()?;
+            let mut body = self.body.try_take(amount == self.len)?;
             body.consume_max(self.off);
             let part = buffer::raw::Segment::prefix(body, used);
             Some(C::from(part))
@@ -92,14 +97,14 @@ impl<'a, C: session::Storage> Parts<'a, C> {
     }
 }
 
-impl<C: session::Storage> streams::Source for Parts<'_, C> {
+impl<B: Body> streams::Source for Parts<'_, B> {
     fn len(&self) -> usize {
         self.len
     }
 
     fn resident(&self, amount: usize) -> usize {
         let body = amount.saturating_sub(self.prefix.len());
-        hold::Charge::from_owner(body, buffer::Residency::resident(self.body)).resident_bytes
+        hold::Charge::from_owner(body, buffer::Residency::resident(&*self.body)).resident_bytes
     }
 }
 
@@ -135,15 +140,25 @@ where
     }
 
     /// Queues a copied prefix and retained owner range without copying the body.
-    pub(crate) fn try_parts(
+    pub(in crate::conn::machine) fn try_parts(
         &mut self,
         key: stream::Key,
         prefix: &[u8],
-        body: &storage::Shared,
+        body: impl Body,
         off: usize,
         boundary: Boundary,
     ) -> Result<conn::DataOutcome, conn::Error> {
-        let parts = Parts::try_new(prefix, body, off)?;
+        let tail = body.len().checked_sub(off).ok_or(conn::Error::DataRange {
+            offset: off,
+            prefix: prefix.len(),
+            body: body.len(),
+        })?;
+        let parts = Parts {
+            prefix,
+            body,
+            off,
+            len: prefix.len() + tail,
+        };
         let limit = if prefix.len() > payloads::INLINE_PREFIX {
             streams::Limit(NonZero::<usize>::MIN.saturating_add(payloads::INLINE_PREFIX - 1))
         } else {

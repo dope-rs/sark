@@ -70,7 +70,7 @@ where
     fn data(
         &mut self,
         prefix: &[u8],
-        payload: &storage::Shared,
+        payload: &mut storage::Shared,
         offset: usize,
         boundary: stream::Boundary,
     ) -> Result<stream::Data<Self::Block>, Self::Error> {

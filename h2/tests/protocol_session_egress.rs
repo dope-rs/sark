@@ -13,7 +13,11 @@ use crate::common::headers::entry;
 
 pub mod common;
 
-use sark_core::manifold::stream::Boundary;
+use o3::buffer::storage;
+use sark_core::manifold::{
+    server::Connection as _,
+    stream::{Boundary, Data, Write as _},
+};
 use sark_h2::{
     ClientRole, ServerRole,
     conn::{Error, machine::Connection},
@@ -187,10 +191,11 @@ fn trailers_emit_final() {
             .expect("protocol fixture"),
         )
         .expect("protocol scenario precondition");
-    assert!(
-        conn.ingress().poll_event().is_some(),
-        "scenario emits the expected event"
-    );
+    let event = conn.ingress().poll_event();
+    assert!(event.is_some(), "scenario emits the expected event");
+    let Some(Event::Headers { stream_id: key, .. }) = event else {
+        panic!("expected request headers");
+    };
     conn.streams()
         .headers()
         .respond(
@@ -200,6 +205,28 @@ fn trailers_emit_final() {
         )
         .expect("protocol scenario precondition");
     conn.transfer().drain(usize::MAX);
+
+    let mut payload = storage::Shared::try_copy(&[b'x'; 16_384]).expect("response owner");
+    assert!(matches!(
+        conn.writer(key).data(b"head", &mut payload, 0, Boundary::More),
+        Ok(Data::Written(bytes)) if bytes.get() == 16_384
+    ));
+    assert_eq!(payload.len(), 16_384);
+    assert!(matches!(
+        conn.writer(key).data(b"head", &mut payload, 16_384, Boundary::More),
+        Ok(Data::Written(bytes)) if bytes.get() == 4
+    ));
+    assert!(payload.is_empty());
+    for expected in [16_380, 4] {
+        let write = conn
+            .transfer()
+            .take_write(&mut [0; 32])
+            .expect("retained DATA");
+        let sark_h2::conn::event::Write::Split { body, .. } = write else {
+            panic!("expected retained DATA");
+        };
+        assert_eq!(body.len(), expected);
+    }
 
     conn.streams()
         .headers()

@@ -79,10 +79,12 @@ pub trait Write<P> {
         boundary: Boundary,
     ) -> Result<Control<Self::Block>, Self::Error>;
 
+    /// May take the payload only after accepting its final bytes.
+    /// Errors, backpressure, and partial writes leave the payload unchanged.
     fn data(
         &mut self,
         prefix: &[u8],
-        payload: &P,
+        payload: &mut P,
         offset: usize,
         boundary: Boundary,
     ) -> Result<Data<Self::Block>, Self::Error>;

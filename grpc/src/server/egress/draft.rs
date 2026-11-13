@@ -11,7 +11,7 @@ use crate::{
     Reason, details, message, metadata,
     server::{
         call::credits,
-        egress::{self, Payload, pending},
+        egress::{self, pending},
         service::reply::{Write, proof::Proof},
     },
 };
@@ -50,16 +50,16 @@ impl<const N: usize> Source<'_, N> {
 }
 
 struct Message<'a> {
-    payload: Payload,
-    slot: slots::Vacant<Payload, slots::Bound<'a, Payload>>,
+    payload: storage::Shared,
+    slot: slots::Vacant<storage::Shared, slots::Bound<'a, storage::Shared>>,
     credit: credits::Update<'a>,
 }
 
 enum Output<'a> {
     Exhausted,
     Ready {
-        staged: credits::Staged<'a, Payload>,
-        slot: slots::Vacant<Payload, slots::Bound<'a, Payload>>,
+        staged: credits::Staged<'a, storage::Shared>,
+        slot: slots::Vacant<storage::Shared, slots::Bound<'a, storage::Shared>>,
     },
 }
 
@@ -216,7 +216,7 @@ impl<'a, K: manifold::raw::Key> Draft<'a, K> {
             .try_grow(bytes, *wire, *wire)
             .map_err(PushError::Credit)?;
         let payload = source.try_build().map_err(PushError::Status)?;
-        admit.write(Payload(payload));
+        admit.write(payload);
         Ok(())
     }
 

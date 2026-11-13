@@ -34,26 +34,8 @@ pub(super) struct Release {
     pub(super) output: bool,
 }
 
-/// An immutable payload whose length and complete framing were admitted together.
-#[repr(transparent)]
-struct Payload(storage::Shared);
-
-impl Payload {
-    fn shared(&self) -> &storage::Shared {
-        &self.0
-    }
-
-    fn header(&self) -> [u8; message::HEADER_LEN] {
-        message::Frame::header(message::Compression::Plain, self.0.len() as u32)
-    }
-
-    fn wire_len(&self) -> usize {
-        self.0.len() + message::HEADER_LEN
-    }
-}
-
 pub(in crate::server) struct Store {
-    lanes: pool::Lanes<Payload, pending::State>,
+    lanes: pool::Lanes<storage::Shared, pending::State>,
     credits: credits::Ledger,
     wire_limit: usize,
     message_limit: capacity::Count,
@@ -244,16 +226,16 @@ impl Store {
                 return Err(Error::Fault(Fault::Protocol));
             }
         };
-        let header = payload.header();
+        let header = message::Frame::header(message::Compression::Plain, payload.len() as u32);
+        let len = payload.len() + message::HEADER_LEN;
         let mut writer = conn.writer(key);
         let written = match writer
-            .data(&header, payload.shared(), *offset, stream::Boundary::More)
+            .data(&header, payload, *offset, stream::Boundary::More)
             .map_err(Error::Write)?
         {
             stream::Data::Written(written) => written.get(),
             stream::Data::Blocked(block) => return Ok(schedule::DataTurn::Blocked(block)),
         };
-        let len = payload.wire_len();
         let pos = offset
             .checked_add(written)
             .ok_or(Error::Fault(Fault::Accounting))?;

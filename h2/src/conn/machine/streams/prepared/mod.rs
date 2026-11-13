@@ -284,7 +284,9 @@ impl<'a, 'd: 'a> Prepared<'a, resident::Shared<'d>, modes::Retained, retained::F
     }
 }
 
-impl<C: session::Storage> Prepared<'_, C, modes::Retained, retained::Parts<'_, C>> {
+impl<C: session::Storage, B: retained::Body>
+    Prepared<'_, C, modes::Retained, retained::Parts<'_, B>>
+{
     pub(super) fn send(self) -> Result<Sent, conn::Error> {
         let Bound {
             slot,
@@ -294,7 +296,7 @@ impl<C: session::Storage> Prepared<'_, C, modes::Retained, retained::Parts<'_, C
             source,
         } = self.bind().map_err(|(error, _)| error)?;
         let (inline, body) = source
-            .take(commit.length.into_usize())
+            .try_take(commit.length.into_usize())
             .map_err(conn::Error::Retain)?;
         let (sent, credit) = commit.commit();
         let payload = payloads::Shared::data(mark, header, inline, body, credit);
