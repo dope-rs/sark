@@ -28,12 +28,16 @@ impl<'req, const N: usize> Set<'req, N> {
     }
 
     pub fn from_optional(items: [Option<value::Item<'req>>; N]) -> Self {
-        let mut set = Self::new();
-        for (slot, item) in set.entries.iter_mut().zip(items.into_iter().flatten()) {
-            *slot = item;
-            set.len += 1;
-        }
-        set
+        let mut items = items.into_iter().flatten();
+        let mut len = 0;
+        let entries = std::array::from_fn(|_| match items.next() {
+            Some(item) => {
+                len += 1;
+                item
+            }
+            None => value::Item::placeholder(),
+        });
+        Self { entries, len }
     }
 
     pub fn is_empty(&self) -> bool {
