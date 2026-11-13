@@ -45,11 +45,12 @@ static ALLOCATOR: Tracker = Tracker::new();
 
 #[test]
 fn reports_fault_before_deferred_close() {
-    let fault = inbound::Fault::Mask {
-        expected: inbound::Mask::Masked,
-        actual: inbound::Mask::Clear,
-    };
-    for retry in [false, true] {
+    let fault = inbound::Fault::CloseText(sark_ws::fragment::Utf8 {
+        valid: 0,
+        error: Some(1),
+    });
+    let wire = [3, 232, 0xff].try_masked(0x8, true).expect("close");
+    for (retry, split) in [(false, 0), (true, 0), (true, 1)] {
         let calls = Cell::new(0);
         let failure = Cell::new(None);
         let sink = Echo {
@@ -64,11 +65,13 @@ fn reports_fault_before_deferred_close() {
             },
         };
         let mut session = server::Session::new(sink, 1024, 1024);
-        let input = storage::Shared::try_copy(b"\x81\x00").expect("frame owner");
         let mut scratch = Vec::new();
         let mut bytes = [0; 3];
         let mut output = Slice::new(&mut bytes);
-        let _ = session.receive(input.into(), output.reborrow(), &mut scratch);
+        for chunk in [&wire[..split], &wire[split..]] {
+            let input = storage::Shared::try_copy(chunk).expect("frame owner");
+            let _ = session.receive(input.into(), output.reborrow(), &mut scratch);
+        }
         assert!(output.is_empty());
         assert_eq!(failure.get(), Some(fault));
         if retry {
@@ -76,7 +79,7 @@ fn reports_fault_before_deferred_close() {
             let mut writer = Slice::new(&mut output);
             let _ = session.activate(writer.reborrow(), &mut scratch);
             assert_eq!(writer.len(), 4);
-            assert_eq!(output, [0x88, 0x02, 0x03, 0xea]);
+            assert_eq!(output, [0x88, 0x02, 0x03, 0xef]);
         }
         drop(session);
     }

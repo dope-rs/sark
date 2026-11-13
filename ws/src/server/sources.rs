@@ -3,7 +3,7 @@ use std::mem;
 use o3::buffer::write::{Sink, SpareExt as _, Staged};
 
 use crate::{
-    inbound,
+    inbound::{self, ClientPeer, Prepared},
     server::{Acc, Error},
 };
 
@@ -17,9 +17,9 @@ pub(super) trait Frame {
 
     fn read<'state, T>(
         &mut self,
-        input: &'state mut inbound::Inbound<inbound::ClientPeer>,
+        input: &'state mut inbound::Inbound<ClientPeer>,
         limit: usize,
-        apply: impl FnOnce(inbound::Admission<'state, inbound::ClientPeer>, &[u8]) -> Mask<T>,
+        apply: impl for<'payload> FnOnce(Prepared<'state, 'payload, ClientPeer>) -> Mask<T>,
     ) -> Result<Option<Mask<T>>, Error>
     where
         Self: Sized,
@@ -40,7 +40,7 @@ pub(super) trait Frame {
 
     fn unmask<'state, T>(
         selected: Selection<'_, 'state, Self>,
-        apply: impl FnOnce(inbound::Admission<'state, inbound::ClientPeer>, &[u8]) -> Mask<T>,
+        apply: impl for<'payload> FnOnce(Prepared<'state, 'payload, ClientPeer>) -> Mask<T>,
     ) -> Result<Mask<T>, Error>
     where
         Self: Sized;
@@ -50,7 +50,7 @@ pub(super) trait Frame {
 
 pub(super) struct Selection<'source, 'state, S> {
     source: &'source mut S,
-    frame: inbound::Admission<'state, inbound::ClientPeer>,
+    frame: inbound::Admission<'state, ClientPeer>,
 }
 
 pub(super) struct Borrowed<'a> {
@@ -66,7 +66,7 @@ impl Frame for &mut &mut [u8] {
 
     fn unmask<'state, T>(
         selected: Selection<'_, 'state, Self>,
-        apply: impl FnOnce(inbound::Admission<'state, inbound::ClientPeer>, &[u8]) -> Mask<T>,
+        apply: impl for<'payload> FnOnce(Prepared<'state, 'payload, ClientPeer>) -> Mask<T>,
     ) -> Result<Mask<T>, Error> {
         let Selection { source, frame } = selected;
         let end = frame.frame_len().get();
@@ -74,18 +74,21 @@ impl Frame for &mut &mut [u8] {
         // SAFETY: Selection exclusively retains the same source whose complete
         // frame was admitted; decoding and projection cannot change its extent.
         let payload = unsafe { source.get_unchecked_mut(frame.range()) };
-        let result = apply(frame, mask.apply(payload));
+        let result = frame
+            .prepare(mask.apply(payload))
+            .map(apply)
+            .map_err(Error::Frame);
         match &result {
-            Mask::Restore(_) => {
+            Err(_) | Ok(Mask::Restore(_)) => {
                 mask.apply(payload);
             }
-            Mask::Commit(_) => {
+            Ok(Mask::Commit(_)) => {
                 // SAFETY: this exact frame's admitted end remains within the
                 // original source; only its disjoint payload bytes were changed.
                 **source = unsafe { mem::take(*source).get_unchecked_mut(end..) };
             }
         }
-        Ok(result)
+        result
     }
 
     fn finish(self, discard: bool) -> Result<(), Error> {
@@ -103,7 +106,7 @@ impl Frame for Borrowed<'_> {
 
     fn unmask<'state, T>(
         selected: Selection<'_, 'state, Self>,
-        apply: impl FnOnce(inbound::Admission<'state, inbound::ClientPeer>, &[u8]) -> Mask<T>,
+        apply: impl for<'payload> FnOnce(Prepared<'state, 'payload, ClientPeer>) -> Mask<T>,
     ) -> Result<Mask<T>, Error> {
         let Selection { source, frame } = selected;
         let end = frame.frame_len().get();
@@ -121,7 +124,7 @@ impl Frame for Borrowed<'_> {
             spare.commit();
         }
         stage.commit();
-        let result = apply(frame, source.scratch);
+        let result = apply(frame.prepare(source.scratch).map_err(Error::Frame)?);
         if matches!(&result, Mask::Commit(_)) {
             // SAFETY: the same source retained above is still unchanged, and
             // the admitted frame proves this suffix starts within its extent.

@@ -106,45 +106,37 @@ impl<'a, H: Sink> Frames<'a, H> {
             if out.body.is_some() {
                 break;
             }
-            let result = src.read(input, self.limit, |frame, data| {
-                let prepared = match frame.prepare(data) {
-                    Ok(prepared) => prepared,
-                    Err(error) => {
-                        return sources::Mask::Restore(self.reject_frame(&mut out.response, error));
-                    }
-                };
-                match prepared {
-                    inbound::Prepared::Message(message) => {
-                        let result = self.user.capacity(message.len()).and_then(|capacity| {
-                            out.try_message(capacity, |response| {
-                                self.dispatch(message.commit(), response)
-                            })
-                        });
-                        match result {
-                            Ok(Some(next)) => sources::Mask::Commit(next),
-                            Ok(None) => sources::Mask::Restore(server::Phase::Active),
-                            Err(error) => {
-                                self.user.failed(error);
-                                sources::Mask::Commit(server::Phase::Closed)
-                            }
+            let result = src.read(input, self.limit, |prepared| match prepared {
+                inbound::Prepared::Message(message) => {
+                    let result = self.user.capacity(message.len()).and_then(|capacity| {
+                        out.try_message(capacity, |response| {
+                            self.dispatch(message.commit(), response)
+                        })
+                    });
+                    match result {
+                        Ok(Some(next)) => sources::Mask::Commit(next),
+                        Ok(None) => sources::Mask::Restore(server::Phase::Active),
+                        Err(error) => {
+                            self.user.failed(error);
+                            sources::Mask::Commit(server::Phase::Closed)
                         }
                     }
-                    inbound::Prepared::Fragment(fragment) => {
-                        fragment.commit();
-                        sources::Mask::Commit(server::Phase::Active)
-                    }
-                    inbound::Prepared::Pong(pong) => {
-                        pong.commit();
-                        sources::Mask::Commit(server::Phase::Active)
-                    }
-                    inbound::Prepared::Required(need) => {
-                        let next = match need.commit_with(|reply| out.response.reply(reply)) {
-                            Ok(inbound::Event::Close(_)) => server::Phase::Closed,
-                            Ok(inbound::Event::Ping(_)) => server::Phase::Active,
-                            Err(_) => return sources::Mask::Restore(server::Phase::Active),
-                        };
-                        sources::Mask::Commit(next)
-                    }
+                }
+                inbound::Prepared::Fragment(fragment) => {
+                    fragment.commit();
+                    sources::Mask::Commit(server::Phase::Active)
+                }
+                inbound::Prepared::Pong(pong) => {
+                    pong.commit();
+                    sources::Mask::Commit(server::Phase::Active)
+                }
+                inbound::Prepared::Required(need) => {
+                    let next = match need.commit_with(|reply| out.response.reply(reply)) {
+                        Ok(inbound::Event::Close(_)) => server::Phase::Closed,
+                        Ok(inbound::Event::Ping(_)) => server::Phase::Active,
+                        Err(_) => return sources::Mask::Restore(server::Phase::Active),
+                    };
+                    sources::Mask::Commit(next)
                 }
             });
             let result = match result {
