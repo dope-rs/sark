@@ -96,7 +96,8 @@ impl<'d> Accept<'d> for SliceSink<'_, '_> {
         let plan =
             exact::Plan::try_new(body).map_err(|rejected| Error::Size(rejected.discard()))?;
         let len = plan.len();
-        plan.encode(self.0).map_err(Error::Build)?;
+        plan.encode(&mut write::Slice::new(self.0))
+            .map_err(Error::Build)?;
         Ok((status, len))
     }
 }

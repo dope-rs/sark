@@ -12,7 +12,7 @@ use sark::{
     },
     http::{
         h1::target::Target,
-        o3::buffer::{Complete as _, storage::Shared},
+        o3::buffer::{Complete as _, storage::Shared, write::Slice},
         payload::owned::Segments,
         request,
         request::{Form, Layout},
@@ -37,12 +37,9 @@ use sark_h1::wire::{head, output};
 #[global_allocator]
 static ALLOCATOR: Tracker = Tracker::new();
 
-fn inline_body(egress: pump::Egress<'_>, want: &[u8], out: &[u8]) -> usize {
-    let Egress::Inline { prefix } = egress else {
-        panic!("inline response expected");
-    };
-    assert!(out[..prefix].ends_with(want));
-    prefix
+fn inline_body(egress: pump::Egress<'_>, want: &[u8], out: &[u8]) {
+    assert!(matches!(egress, Egress::Inline), "inline response expected");
+    assert!(out.ends_with(want));
 }
 
 #[test]
@@ -59,17 +56,20 @@ fn borrowed_h1_allocations() {
         .expect("route caches must bind");
     let mut conn = Conn::default();
     let mut write = [0_u8; 4096];
+    let mut out = Slice::new(&mut write);
 
-    let (cycle, allocs) =
-        Tracker::count(|| driver.ingest(&mut conn, req, &mut write, head::Connection::KeepAlive));
+    let (cycle, allocs) = Tracker::count(|| {
+        driver.ingest(&mut conn, req, out.reborrow(), head::Connection::KeepAlive)
+    });
 
     let egress = cycle
         .state
         .expect("allocation route must produce transport output");
-    let used = inline_body(egress, body, &write);
+    let write = out.into_mut();
+    inline_body(egress, body, write);
     assert_eq!(allocs, 0);
     assert!(matches!(cycle.progress.head(), deadline::Head::Ready));
-    assert!(write[..used].starts_with(b"HTTP/1.1 200"));
+    assert!(write.starts_with(b"HTTP/1.1 200"));
 }
 
 #[test]
@@ -103,26 +103,25 @@ fn chunk_ranges_keep_source() {
             let mut conn = Conn::default();
             let mut write = [0_u8; 4096];
             for warm in [false, true] {
+                let mut out = Slice::new(&mut write);
                 let (outcome, allocs) = Tracker::count(|| {
                     Pin::new(&mut &mut driver).try_consume(
                         session::Permit::new(),
                         input,
-                        &mut write,
+                        out.reborrow(),
                         &mut conn,
                     )
                 });
-                let written = match outcome {
-                    session::RouteOutcome::Outcome(session::Outcome::Complete {
-                        response:
-                            output::Complete::Inline { written }
-                            | output::Complete::Copy { written, .. },
-                        ..
-                    }) => Some(written),
-                    _ => None,
-                }
-                .expect("completed chunk response");
-                assert!(write[..written].starts_with(b"HTTP/1.1 200"));
-                assert!(write[..written].ends_with(b"borrowed-body"));
+                let session::RouteOutcome::Outcome(session::Outcome::Complete {
+                    response: output::Complete::Inline | output::Complete::Copy { .. },
+                    ..
+                }) = outcome
+                else {
+                    panic!("completed chunk response");
+                };
+                let out = out.into_mut();
+                assert!(out.starts_with(b"HTTP/1.1 200"));
+                assert!(out.ends_with(b"borrowed-body"));
                 if warm {
                     assert_eq!(allocs, copies);
                 }
@@ -138,19 +137,21 @@ fn chunk_ranges_keep_source() {
             .expect("route caches must bind");
         let mut conn = Conn::default();
         let mut write = [0_u8; 4096];
+        let mut out = Slice::new(&mut write);
         let cycle = driver.ingest(
             &mut conn,
             window.as_slice(),
-            &mut write,
+            out.reborrow(),
             head::Connection::KeepAlive,
         );
-        let used = inline_body(
+        let write = out.into_mut();
+        inline_body(
             cycle.state.expect("chunk pipeline"),
             b"borrowed-body",
-            &write,
+            write,
         );
         assert_eq!(
-            write[..used]
+            write
                 .windows(b"HTTP/1.1 200".len())
                 .filter(|part| *part == b"HTTP/1.1 200")
                 .count(),
@@ -170,14 +171,19 @@ fn drip_allocations(req: &'static [u8], head: usize) -> usize {
     let mut conn = Conn::default();
     let mut write = [0_u8; 4096];
 
-    let warm = driver.ingest(&mut conn, req, &mut write, head::Connection::KeepAlive);
-    assert!(matches!(warm.state, Ok(Egress::Inline { .. })));
+    let warm = driver.ingest(
+        &mut conn,
+        req,
+        Slice::new(&mut write).reborrow(),
+        head::Connection::KeepAlive,
+    );
+    assert!(matches!(warm.state, Ok(Egress::Inline)));
 
     let (done, allocs) = Tracker::count(|| {
         let prefix = driver.ingest(
             &mut conn,
             &req[..head],
-            &mut write,
+            Slice::new(&mut write).reborrow(),
             head::Connection::KeepAlive,
         );
         assert!(matches!(prefix.state, Ok(Egress::None)));
@@ -186,10 +192,10 @@ fn drip_allocations(req: &'static [u8], head: usize) -> usize {
             let cycle = driver.ingest(
                 &mut conn,
                 slice::from_ref(byte),
-                &mut write,
+                Slice::new(&mut write).reborrow(),
                 head::Connection::KeepAlive,
             );
-            done = matches!(cycle.state, Ok(Egress::Inline { .. }));
+            done = matches!(cycle.state, Ok(Egress::Inline));
         }
         done
     });
@@ -236,17 +242,20 @@ fn absolute_form_allocates() {
         .expect("route caches must bind");
     let mut conn = Conn::default();
     let mut write = [0_u8; 4096];
+    let mut out = Slice::new(&mut write);
 
-    let (cycle, allocs) =
-        Tracker::count(|| driver.ingest(&mut conn, req, &mut write, head::Connection::KeepAlive));
-    let used = inline_body(
+    let (cycle, allocs) = Tracker::count(|| {
+        driver.ingest(&mut conn, req, out.reborrow(), head::Connection::KeepAlive)
+    });
+    let write = out.into_mut();
+    inline_body(
         cycle.state.expect("borrowed route must be accepted"),
         body,
-        &write,
+        write,
     );
 
     assert_eq!(allocs, 0);
-    assert!(write[..used].starts_with(b"HTTP/1.1 200"));
+    assert!(write.starts_with(b"HTTP/1.1 200"));
 }
 
 #[test]
@@ -266,16 +275,19 @@ fn reordered_path_allocates() {
         .expect("route caches must bind");
     let mut conn = Conn::default();
     let mut write = [0_u8; 4096];
+    let mut out = Slice::new(&mut write);
 
-    let (cycle, allocs) =
-        Tracker::count(|| driver.ingest(&mut conn, req, &mut write, head::Connection::KeepAlive));
-    let used = inline_body(
+    let (cycle, allocs) = Tracker::count(|| {
+        driver.ingest(&mut conn, req, out.reborrow(), head::Connection::KeepAlive)
+    });
+    let write = out.into_mut();
+    inline_body(
         cycle.state.expect("reordered route must be accepted"),
         body,
-        &write,
+        write,
     );
     assert_eq!(allocs, 0);
-    assert!(write[..used].starts_with(b"HTTP/1.1 200"));
+    assert!(write.starts_with(b"HTTP/1.1 200"));
 }
 
 #[test]
@@ -300,18 +312,25 @@ fn named_path_survives_body() {
     let [line, headers, body, end] = NAMED_PATH_FRAGMENTS;
 
     for fragment in [line, headers, body] {
-        let cycle = driver.ingest(&mut conn, fragment, &mut write, head::Connection::KeepAlive);
+        let cycle = driver.ingest(
+            &mut conn,
+            fragment,
+            Slice::new(&mut write).reborrow(),
+            head::Connection::KeepAlive,
+        );
         assert!(matches!(cycle.state, Ok(Egress::None)));
         assert_eq!(state.request_head.get(), 0);
     }
 
-    let cycle = driver.ingest(&mut conn, end, &mut write, head::Connection::KeepAlive);
-    let used = inline_body(
+    let mut out = Slice::new(&mut write);
+    let cycle = driver.ingest(&mut conn, end, out.reborrow(), head::Connection::KeepAlive);
+    let write = out.into_mut();
+    inline_body(
         cycle.state.expect("fragmented named path response"),
         b"beta",
-        &write,
+        write,
     );
-    assert!(write[..used].starts_with(b"HTTP/1.1 200"));
+    assert!(write.starts_with(b"HTTP/1.1 200"));
     assert_ne!(state.request_head.get(), 0);
     assert!(
         !state.invalid_path.get(),
@@ -433,8 +452,16 @@ fn cold_status(wire: &[u8], split: usize) -> u16 {
 
     let mut status = None;
     for chunk in [&wire[..split], &wire[split..]] {
-        let cycle = driver.ingest(&mut conn, chunk, &mut write, head::Connection::KeepAlive);
-        if let Ok(Egress::Static { prefix: 0, body }) = cycle.state {
+        let mut out = Slice::new(&mut write);
+        let cycle = driver.ingest(
+            &mut conn,
+            chunk,
+            out.reborrow(),
+            head::Connection::KeepAlive,
+        );
+        if let Ok(Egress::Static { body }) = cycle.state
+            && out.is_empty()
+        {
             let wire = body.as_slice();
             status = Some(
                 if wire.starts_with(b"HTTP/1.1 400") {

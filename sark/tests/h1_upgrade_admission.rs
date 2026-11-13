@@ -1,3 +1,4 @@
+use o3::buffer::write::Slice;
 use sark_h1::{pump::Egress, route::Driver, session::Conn};
 
 pub mod common;
@@ -19,9 +20,15 @@ fn partial_upgrade_rejected() {
             let mut write = [0_u8; 4096];
 
             for chunk in [&wire[..split], &wire[split..]] {
-                let cycle =
-                    driver.ingest(&mut conn, chunk, &mut write, head::Connection::KeepAlive);
-                if let Ok(Egress::Static { prefix: 0, body }) = cycle.state
+                let mut out = Slice::new(&mut write);
+                let cycle = driver.ingest(
+                    &mut conn,
+                    chunk,
+                    out.reborrow(),
+                    head::Connection::KeepAlive,
+                );
+                if let Ok(Egress::Static { body }) = cycle.state
+                    && out.is_empty()
                     && body.as_slice().starts_with(b"HTTP/1.1 400")
                 {
                     continue 'split;

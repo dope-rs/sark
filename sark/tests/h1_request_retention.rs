@@ -2,6 +2,7 @@ pub mod common;
 
 use common::discard::DATE;
 use dope_test::alloc::Tracker;
+use o3::buffer::write::Slice;
 use sark_h1::{pump, route::Driver, server::deadline, session::Conn, wire::head};
 
 #[global_allocator]
@@ -15,12 +16,14 @@ fn resumes_drained_tail() {
         let mut driver = Driver::try_new(&router, *DATE).expect("route driver");
         let mut conn = Conn::default();
         let mut write = [0; 2048];
-        let cycle = driver.ingest(&mut conn, HEAD, &mut write, head::Connection::KeepAlive);
+        let mut out = Slice::new(&mut write);
+        let cycle = driver.ingest(&mut conn, HEAD, out.reborrow(), head::Connection::KeepAlive);
         assert_eq!(cycle.discard_remaining, 4);
         assert!(matches!(cycle.progress.head(), deadline::Head::Body));
-        let Ok(pump::Egress::Inline { prefix }) = cycle.state else {
+        let Ok(pump::Egress::Inline) = cycle.state else {
             panic!("response");
         };
+        let prefix = out.len();
         assert!(matches!(
             pump::Drain::complete(&mut conn),
             pump::Completion::None
@@ -34,12 +37,17 @@ fn resumes_drained_tail() {
         } else {
             TAIL
         };
-        let cycle = driver.ingest(&mut conn, input, &mut write, head::Connection::KeepAlive);
+        let mut out = Slice::new(&mut write);
+        let cycle = driver.ingest(
+            &mut conn,
+            input,
+            out.reborrow(),
+            head::Connection::KeepAlive,
+        );
         assert!(matches!(cycle.progress.head(), deadline::Head::Ready));
-        assert!(matches!(cycle.state,
-            Ok(pump::Egress::Inline { prefix: written }) if written == prefix
-        ));
-        assert!(write[..prefix].ends_with(b"\r\n\r\nok"));
+        assert!(matches!(cycle.state, Ok(pump::Egress::Inline)));
+        assert_eq!(out.len(), prefix);
+        assert!(out.into_mut().ends_with(b"\r\n\r\nok"));
         assert!(matches!(
             pump::Drain::complete(&mut conn),
             pump::Completion::None
@@ -55,10 +63,20 @@ fn discarded_input_finishes() {
     let mut conn = Conn::default();
     let mut write = [0; 2048];
     for input in [HEAD, b"bo"] {
-        let cycle = driver.ingest(&mut conn, input, &mut write, head::Connection::KeepAlive);
+        let cycle = driver.ingest(
+            &mut conn,
+            input,
+            Slice::new(&mut write).reborrow(),
+            head::Connection::KeepAlive,
+        );
         assert!(matches!(cycle.progress.head(), deadline::Head::Body));
     }
-    let cycle = driver.ingest(&mut conn, b"dy", &mut write, head::Connection::KeepAlive);
+    let cycle = driver.ingest(
+        &mut conn,
+        b"dy",
+        Slice::new(&mut write).reborrow(),
+        head::Connection::KeepAlive,
+    );
     assert_eq!(cycle.discard_remaining, 0);
     assert!(matches!(cycle.progress.head(), deadline::Head::Ready));
 }
@@ -74,13 +92,17 @@ fn discarded_method_body_policy() {
     for &(input, expected) in BODY_POLICY {
         let mut conn = Conn::default();
         let mut write = [0; 512];
-        let cycle = driver.ingest(&mut conn, input, &mut write, head::Connection::KeepAlive);
+        let mut out = Slice::new(&mut write);
+        let cycle = driver.ingest(
+            &mut conn,
+            input,
+            out.reborrow(),
+            head::Connection::KeepAlive,
+        );
         assert_eq!(cycle.discard_remaining, 0);
         if expected == 200 {
-            assert!(matches!(cycle.state,
-                Ok(pump::Egress::Inline { prefix })
-                    if write[..prefix].starts_with(SUCCESS)
-            ));
+            assert!(matches!(cycle.state, Ok(pump::Egress::Inline)));
+            assert!(out.into_mut().starts_with(SUCCESS));
         } else {
             let expected = match expected {
                 400 => canned::BAD_REQUEST,
@@ -88,8 +110,9 @@ fn discarded_method_body_policy() {
                 _ => panic!("body policy rejection"),
             };
             assert!(matches!(cycle.connection, head::Connection::Close));
+            assert!(out.is_empty());
             assert!(matches!(cycle.state,
-                Ok(pump::Egress::Static { prefix: 0, body: reply })
+                Ok(pump::Egress::Static { body: reply })
                     if reply.as_slice() == expected.as_slice()
             ));
         }
@@ -114,13 +137,20 @@ fn rejects_after_admission() {
             let mut write = [0; 512];
             let mut input = MISSING_HEAD.to_vec();
             for part in input.chunks(split) {
-                let first = driver.ingest(&mut conn, part, &mut write, head::Connection::KeepAlive);
+                let first = driver.ingest(
+                    &mut conn,
+                    part,
+                    Slice::new(&mut write).reborrow(),
+                    head::Connection::KeepAlive,
+                );
                 assert!(matches!(first.state, Ok(pump::Egress::None)));
             }
             input.fill(b'!');
-            let last = driver.ingest(&mut conn, tail, &mut write, head::Connection::KeepAlive);
+            let mut out = Slice::new(&mut write);
+            let last = driver.ingest(&mut conn, tail, out.reborrow(), head::Connection::KeepAlive);
+            assert!(out.is_empty());
             assert!(matches!(last.state,
-                Ok(pump::Egress::Static { prefix: 0, body: reply })
+                Ok(pump::Egress::Static { body: reply })
                     if reply.as_slice() == expected.as_slice()
             ));
         }
@@ -135,10 +165,20 @@ fn preserves_head_lease() {
     for partial in [PREFIX, &HEAD[..HEAD.len() - 2], MISSING_HEAD] {
         let mut conn = Conn::default();
         let mut write = [0; 2048];
-        let cycle = driver.ingest(&mut conn, partial, &mut write, head::Connection::KeepAlive);
+        let cycle = driver.ingest(
+            &mut conn,
+            partial,
+            Slice::new(&mut write).reborrow(),
+            head::Connection::KeepAlive,
+        );
         let mut progress = cycle.progress;
         assert!(matches!(progress.head(), deadline::Head::Pending));
-        let cycle = driver.ingest(&mut conn, &[], &mut write, head::Connection::KeepAlive);
+        let cycle = driver.ingest(
+            &mut conn,
+            &[],
+            Slice::new(&mut write).reborrow(),
+            head::Connection::KeepAlive,
+        );
         assert!(matches!(cycle.progress.head(), deadline::Head::Unchanged));
         progress.merge(cycle.progress);
         let cycle = driver.retain(&mut conn, &[]);
@@ -158,20 +198,26 @@ fn fragmented_line_pipeline() {
     let mut input = [0];
     for byte in PREFIX {
         input[0] = *byte;
-        let cycle = driver.ingest(&mut conn, &input, &mut write, head::Connection::KeepAlive);
+        let cycle = driver.ingest(
+            &mut conn,
+            &input,
+            Slice::new(&mut write).reborrow(),
+            head::Connection::KeepAlive,
+        );
         assert!(matches!(cycle.state, Ok(pump::Egress::None)));
     }
+    let mut out = Slice::new(&mut write);
     let cycle = driver.ingest(
         &mut conn,
         &PIPELINE[PREFIX.len()..],
-        &mut write,
+        out.reborrow(),
         head::Connection::KeepAlive,
     );
-    let Ok(pump::Egress::Inline { prefix }) = cycle.state else {
+    let Ok(pump::Egress::Inline) = cycle.state else {
         panic!("responses");
     };
     assert_eq!(
-        write[..prefix]
+        out.into_mut()
             .windows(SUCCESS.len())
             .filter(|part| *part == SUCCESS)
             .count(),
@@ -196,12 +242,16 @@ fn retains_upload_pipeline() {
             let cycle = driver.retain(&mut conn, &PIPELINE[..PIPELINE.len() / 2]);
             assert!(matches!(cycle.state, Ok(pump::Egress::Wake)));
             let mut write = [0; 1024];
-            let cycle = driver.ingest(&mut conn, &input, &mut write, head::Connection::KeepAlive);
-            assert!(matches!(cycle.state,
-                Ok(pump::Egress::Inline { prefix })
-                    if write[..prefix].starts_with(SUCCESS)
-                        && write[..prefix].ends_with(b"\r\n\r\nok")
-            ));
+            let mut out = Slice::new(&mut write);
+            let cycle = driver.ingest(
+                &mut conn,
+                &input,
+                out.reborrow(),
+                head::Connection::KeepAlive,
+            );
+            assert!(matches!(cycle.state, Ok(pump::Egress::Inline)));
+            let out = out.into_mut();
+            assert!(out.starts_with(SUCCESS) && out.ends_with(b"\r\n\r\nok"));
             assert!(matches!(
                 pump::Drain::complete(&mut conn),
                 pump::Completion::Resume
@@ -213,19 +263,20 @@ fn retains_upload_pipeline() {
             }
         }
         let mut write = [0; 2048];
-        let cycle = driver.ingest(&mut conn, &[], &mut write, head::Connection::KeepAlive);
+        let mut out = Slice::new(&mut write);
+        let cycle = driver.ingest(&mut conn, &[], out.reborrow(), head::Connection::KeepAlive);
         assert_eq!(cycle.discard_remaining, 0);
-        let Ok(pump::Egress::Inline { prefix }) = cycle.state else {
+        let Ok(pump::Egress::Inline) = cycle.state else {
             panic!("responses");
         };
+        let out = out.into_mut();
         assert_eq!(
-            write[..prefix]
-                .windows(SUCCESS.len())
+            out.windows(SUCCESS.len())
                 .filter(|part| *part == SUCCESS)
                 .count(),
             2
         );
-        assert!(write[..prefix].ends_with(b"\r\n\r\nok"));
+        assert!(out.ends_with(b"\r\n\r\nok"));
         assert!(matches!(
             pump::Drain::complete(&mut conn),
             pump::Completion::None

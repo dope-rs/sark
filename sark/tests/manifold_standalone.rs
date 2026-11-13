@@ -5,18 +5,17 @@ pub mod common;
 
 use common::stand::*;
 use dope_test::alloc::Tracker;
+use o3::buffer::write::Slice;
 use sark_h1::{route::Driver, wire::head};
 
 #[global_allocator]
 static ALLOCATOR: Tracker = Tracker::new();
 
 #[track_caller]
-fn assert_reply(cycle: &pump::Cycle<'_>, write: &[u8], body: &[u8]) {
-    let Ok(Egress::Inline { prefix }) = &cycle.state else {
+fn assert_reply(cycle: &pump::Cycle<'_>, reply: &[u8], body: &[u8]) {
+    let Ok(Egress::Inline) = &cycle.state else {
         panic!("request must produce an inline reply");
     };
-    assert!(*prefix <= write.len());
-    let reply = &write[..*prefix];
     assert!(reply.starts_with(b"HTTP/1.1 200 OK\r\n"));
     assert!(
         reply.ends_with(body),
@@ -37,9 +36,15 @@ fn router_drives_borrow() {
         let mut conn = Conn::default();
         let mut write = [0_u8; 4096];
 
-        let cycle = driver.ingest(&mut conn, REQUEST, &mut write, head::Connection::KeepAlive);
+        let mut writer = Slice::new(&mut write);
+        let cycle = driver.ingest(
+            &mut conn,
+            REQUEST,
+            writer.reborrow(),
+            head::Connection::KeepAlive,
+        );
 
-        assert_reply(&cycle, &write, body);
+        assert_reply(&cycle, writer.into_mut(), body);
         assert!(cycle.progress.head() == Head::Ready);
         assert!(matches!(cycle.connection, head::Connection::KeepAlive));
     }
@@ -68,18 +73,18 @@ fn router_uses_param_trie() {
     ] {
         let request = format!("GET {path} HTTP/1.1\r\nHost: local\r\n\r\n");
         let mut conn = Conn::default();
+        let mut writer = Slice::new(&mut write);
         let cycle = driver.ingest(
             &mut conn,
             request.as_bytes(),
-            &mut write,
+            writer.reborrow(),
             head::Connection::KeepAlive,
         );
-        let response = match cycle.state {
-            Ok(Egress::Inline { prefix }) => Some(&write[..prefix]),
-            Ok(Egress::Static { prefix: 0, body }) => Some(body.as_slice()),
-            _ => None,
-        }
-        .expect("router response must be complete");
+        let response: &[u8] = match cycle.state {
+            Ok(Egress::Inline) => writer.into_mut(),
+            Ok(Egress::Static { body }) if writer.is_empty() => body.as_slice(),
+            _ => panic!("router response must be complete"),
+        };
         assert_eq!(response.get(9..12), Some(status.as_bytes()), "{path}");
         let start = response
             .windows(4)
@@ -104,7 +109,7 @@ fn chunked_finishes_once() {
         let first = driver.ingest(
             &mut conn,
             b"POST /echo HTTP/1.1\r\nHost: local\r\nTransfer-Encoding: chunked\r\n\r\n7\r\nchu",
-            &mut write,
+            Slice::new(&mut write).reborrow(),
             head::Connection::KeepAlive,
         );
         assert!(matches!(first.state, Ok(Egress::None)));
@@ -112,18 +117,19 @@ fn chunked_finishes_once() {
         let middle = driver.ingest(
             &mut conn,
             b"nked\r\n5\r\n-bo",
-            &mut write,
+            Slice::new(&mut write).reborrow(),
             head::Connection::KeepAlive,
         );
         assert!(matches!(middle.state, Ok(Egress::None)));
 
+        let mut writer = Slice::new(&mut write);
         let final_ = driver.ingest(
             &mut conn,
             b"dy\r\n0\r\n\r\n",
-            &mut write,
+            writer.reborrow(),
             head::Connection::KeepAlive,
         );
-        assert_reply(&final_, &write, want);
+        assert_reply(&final_, writer.into_mut(), want);
     }
 }
 
@@ -147,21 +153,23 @@ let mut driver = Driver::try_new(&router, *b"Thu, 01 Jan 1970 00:00:00 GMT").exp
         let mut conn = Conn::default();
         let mut write = [0_u8; 4096];
 
+        let mut writer = Slice::new(&mut write);
         let first = driver.ingest(
             &mut conn,
             head,
-            &mut write,
+            writer.reborrow(),
             head::Connection::KeepAlive,
         );
-        assert!(matches!(first.state, Ok(Egress::Static { prefix: 0, body: value }) if value == sark_h1::CONTINUE_100));
+        assert!(matches!(first.state, Ok(Egress::Static { body: value }) if value == sark_h1::CONTINUE_100 && writer.is_empty()));
 
+        let mut writer = Slice::new(&mut write);
         let final_ = driver.ingest(
             &mut conn,
             body,
-            &mut write,
+            writer.reborrow(),
             head::Connection::KeepAlive,
         );
-        assert_reply(&final_, &write, b"body");
+        assert_reply(&final_, writer.into_mut(), b"body");
             }
 }
 
@@ -176,13 +184,14 @@ let router = Router::new(&state);
 let mut driver = Driver::try_new(&router, *b"Thu, 01 Jan 1970 00:00:00 GMT").expect("route caches must bind");
         let mut conn = Conn::default();
         let mut write = [0_u8; 4096];
+        let mut writer = Slice::new(&mut write);
         let reply = driver.ingest(
             &mut conn,
             req,
-            &mut write,
+            writer.reborrow(),
             head::Connection::KeepAlive,
         );
-        assert_reply(&reply, &write, b"body");
+        assert_reply(&reply, writer.into_mut(), b"body");
             }
 }
 
@@ -193,14 +202,15 @@ let mut driver = Driver::try_new(&router, *b"Thu, 01 Jan 1970 00:00:00 GMT").exp
             .expect("route caches must bind");
         let mut conn = Conn::default();
         let mut write = [0_u8; 4096];
+        let mut writer = Slice::new(&mut write);
         let bad = driver.ingest(
             &mut conn,
             b"POST /echo HTTP/1.1\r\nHost: local\r\nContent-Length: 4\r\nExpect: fancy\r\n\r\n",
-            &mut write,
+            writer.reborrow(),
             head::Connection::KeepAlive,
         );
         assert!(
-            matches!(bad.state, Ok(Egress::Static { prefix: 0, body: value }) if value == canned::BAD_REQUEST)
+            matches!(bad.state, Ok(Egress::Static { body: value }) if value == canned::BAD_REQUEST && writer.is_empty())
         );
         assert!(matches!(bad.connection, head::Connection::Close));
     }
@@ -219,20 +229,21 @@ fn assert_all_splits(req: &[u8], want: &'static [u8]) {
             let first = driver.ingest(
                 &mut conn,
                 &req[..split],
-                &mut write,
+                Slice::new(&mut write).reborrow(),
                 head::Connection::KeepAlive,
             );
             assert!(
                 matches!(first.state, Ok(Egress::None)),
                 "split {split} emitted before the terminal request byte"
             );
+            let mut writer = Slice::new(&mut write);
             let second = driver.ingest(
                 &mut conn,
                 &req[split..],
-                &mut write,
+                writer.reborrow(),
                 head::Connection::KeepAlive,
             );
-            assert_reply(&second, &write, want);
+            assert_reply(&second, writer.into_mut(), want);
         }
     }
 }
@@ -260,32 +271,39 @@ fn connection_pending() {
         let mut second = Conn::default();
         let mut write = [0_u8; 4096];
 
-        let cycle = driver.ingest(&mut first, PARTIAL, &mut write, head::Connection::KeepAlive);
+        let cycle = driver.ingest(
+            &mut first,
+            PARTIAL,
+            Slice::new(&mut write).reborrow(),
+            head::Connection::KeepAlive,
+        );
         assert!(matches!(cycle.state, Ok(Egress::None)));
 
         let cycle = driver.ingest(
             &mut second,
             PARTIAL,
-            &mut write,
+            Slice::new(&mut write).reborrow(),
             head::Connection::KeepAlive,
         );
         assert!(matches!(cycle.state, Ok(Egress::None)));
 
+        let mut writer = Slice::new(&mut write);
         let cycle = driver.ingest(
             &mut first,
             b"-body",
-            &mut write,
+            writer.reborrow(),
             head::Connection::KeepAlive,
         );
-        assert_reply(&cycle, &write, b"borrowed-body");
+        assert_reply(&cycle, writer.into_mut(), b"borrowed-body");
 
+        let mut writer = Slice::new(&mut write);
         let cycle = driver.ingest(
             &mut second,
             b"-body",
-            &mut write,
+            writer.reborrow(),
             head::Connection::KeepAlive,
         );
-        assert_reply(&cycle, &write, b"borrowed-body");
+        assert_reply(&cycle, writer.into_mut(), b"borrowed-body");
     }
 }
 
@@ -307,17 +325,27 @@ fn framing_reuses_ranges() {
             .enumerate()
         {
             let (_, alloc) = Tracker::count(|| {
-                let first =
-                    driver.ingest(&mut conn, header, &mut write, head::Connection::KeepAlive);
+                let first = driver.ingest(
+                    &mut conn,
+                    header,
+                    Slice::new(&mut write).reborrow(),
+                    head::Connection::KeepAlive,
+                );
                 assert!(matches!(first.state, Ok(Egress::None)));
                 let body = if header == CHUNKED {
                     b"4\r\nbody\r\n0\r\n\r\n".as_slice()
                 } else {
                     b"body"
                 };
-                let cycle = driver.ingest(&mut conn, body, &mut write, head::Connection::KeepAlive);
+                let mut writer = Slice::new(&mut write);
+                let cycle = driver.ingest(
+                    &mut conn,
+                    body,
+                    writer.reborrow(),
+                    head::Connection::KeepAlive,
+                );
                 assert!(matches!(cycle.connection, head::Connection::KeepAlive));
-                assert_reply(&cycle, &write, b"body");
+                assert_reply(&cycle, writer.into_mut(), b"body");
             });
             if turn == 1 {
                 baseline = alloc;
@@ -345,7 +373,13 @@ fn ingress_resumes() {
         assert!(matches!(held.state, Ok(Egress::Wake)));
 
         let mut write = [0_u8; 4096];
-        let cycle = driver.ingest(&mut conn, &[], &mut write, head::Connection::KeepAlive);
-        assert_reply(&cycle, &write, b"42");
+        let mut writer = Slice::new(&mut write);
+        let cycle = driver.ingest(
+            &mut conn,
+            &[],
+            writer.reborrow(),
+            head::Connection::KeepAlive,
+        );
+        assert_reply(&cycle, writer.into_mut(), b"42");
     }
 }

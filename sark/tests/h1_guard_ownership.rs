@@ -2,7 +2,7 @@ pub mod common;
 
 use std::cell::Cell;
 
-use buffer::Residency as _;
+use buffer::{Residency as _, write::Slice};
 use common::guard::*;
 use dope_test::alloc::Tracker;
 use sark::http::o3::buffer;
@@ -29,8 +29,14 @@ fn guard_copies_borrowed() {
     let path = &req[start..end];
     let mut write = [0_u8; 256];
 
-    let (cycle, alloc) =
-        Tracker::count(|| driver.ingest(&mut conn, &req, &mut write, head::Connection::KeepAlive));
+    let (cycle, alloc) = Tracker::count(|| {
+        driver.ingest(
+            &mut conn,
+            &req,
+            Slice::new(&mut write).reborrow(),
+            head::Connection::KeepAlive,
+        )
+    });
     let Egress::Shared { body, .. } = cycle
         .state
         .expect("borrowed request head must become one exact shared body")
@@ -59,8 +65,14 @@ fn guard_moves_buffered() {
     let retained = driver.retain(&mut conn, &req);
     assert!(matches!(retained.state, Ok(Egress::Wake)));
 
-    let (cycle, alloc) =
-        Tracker::count(|| driver.ingest(&mut conn, &[], &mut write, head::Connection::KeepAlive));
+    let (cycle, alloc) = Tracker::count(|| {
+        driver.ingest(
+            &mut conn,
+            &[],
+            Slice::new(&mut write).reborrow(),
+            head::Connection::KeepAlive,
+        )
+    });
     let Egress::Shared { body, .. } = cycle
         .state
         .expect("buffered request head must retain its existing backing")
