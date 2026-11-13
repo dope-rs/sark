@@ -4,7 +4,7 @@ use o3::buffer::{
 };
 use sark_http::{
     field,
-    payload::response::{bounded, status::Code},
+    payload::response::{Encode, status::Code},
 };
 
 use crate::wire::{
@@ -182,11 +182,10 @@ impl<'writer, 'out, 'date, 'field, H> Pending<'writer, 'out, 'date, 'field, H> {
         })
     }
 
-    pub(super) fn encode<B: bounded::Body>(
-        &mut self,
-        plan: bounded::Plan<B>,
-    ) -> Result<usize, Error> {
-        plan.encode(&mut self.split.body()).map_err(Into::into)
+    pub(super) fn encode(&mut self, body: impl Encode) -> Result<usize, Error> {
+        let mut out = self.split.body();
+        body.encode(&mut out).map_err(storage::BuildError::Build)?;
+        Ok(out.len())
     }
 }
 
