@@ -109,7 +109,7 @@ impl<'q, 'd> TakenWrite<'q, 'd> {
     pub(crate) fn with<R>(
         self,
         run: impl for<'id> FnOnce(Flight<'id, 'd>, Prepared<'id, 'q, 'd>) -> R,
-    ) -> Result<R, conn::Error> {
+    ) -> R {
         let Self {
             write,
             source,
@@ -117,20 +117,16 @@ impl<'q, 'd> TakenWrite<'q, 'd> {
             budget,
         } = self;
         let charge = write.charge();
-        match budget.try_release(class, charge) {
-            Ok(proof) => Ok(run(
-                Flight::new(write),
-                Prepared {
-                    source,
-                    proof,
-                    brand: marker::PhantomData,
-                },
-            )),
-            Err(error) => {
-                source.restore(write);
-                Err(error)
-            }
-        }
+        run(
+            Flight::new(write),
+            Prepared {
+                source,
+                budget,
+                class,
+                charge,
+                brand: marker::PhantomData,
+            },
+        )
     }
 }
 
@@ -157,19 +153,16 @@ impl<'q, 'd> Source<'q, 'd> {
 #[must_use = "a prepared write must be committed or restored"]
 pub(crate) struct Prepared<'id, 'q, 'd> {
     source: Source<'q, 'd>,
-    proof: budget::Release<'q>,
+    budget: &'q mut budget::WriteBudget,
+    class: budget::WriteClass,
+    charge: output::WriteCharge,
     brand: marker::PhantomData<fn(&'id mut ()) -> &'id mut ()>,
 }
 
 impl<'id, 'q, 'd> Prepared<'id, 'q, 'd> {
     pub(crate) fn commit(self) -> Completion {
-        let Self {
-            source,
-            proof,
-            brand: _,
-        } = self;
-        proof.commit();
-        match source {
+        self.budget.release(self.class, self.charge);
+        match self.source {
             Source::Queued { .. } => Completion::Queued,
             Source::DecoderFeedback { wire } => {
                 wire.clear();
@@ -179,13 +172,7 @@ impl<'id, 'q, 'd> Prepared<'id, 'q, 'd> {
     }
 
     pub(crate) fn restore(self, write: Flight<'id, 'd>) {
-        let Self {
-            source,
-            proof,
-            brand: _,
-        } = self;
-        proof.cancel();
-        source.restore(write.into_record());
+        self.source.restore(write.into_record());
     }
 
     pub(in crate::conn) fn finish(self, write: Flight<'id, 'd>) -> (output::Write<'d>, Completion) {
@@ -319,9 +306,8 @@ impl<'d, S, B> Queues<'d, S, B> {
                 let charge = write.charge();
                 let retained = write.retained();
                 let next = retired.try_add(retained).map_err(conn::Error::Retention)?;
-                let release = self.write_budget.try_release(class, charge)?;
                 item.remove();
-                release.commit();
+                self.write_budget.release(class, charge);
                 retired = next;
             }
             Ok(())

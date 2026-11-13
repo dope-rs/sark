@@ -163,22 +163,6 @@ pub enum Error {
         additional: usize,
         limit: usize,
     },
-    BudgetReleaseWire {
-        retained: usize,
-        released: usize,
-    },
-    BudgetReleaseResident {
-        retained: usize,
-        released: usize,
-    },
-    BudgetRegularReleaseWire {
-        retained: usize,
-        released: usize,
-    },
-    BudgetRegularReleaseResident {
-        retained: usize,
-        released: usize,
-    },
     Egress(group::Error<2>),
     EventCapacity {
         len: usize,
@@ -461,10 +445,6 @@ impl Error {
             Self::Build(storage::BuildError::Build(_) | storage::BuildError::Length(_))
             | Self::ReceiveRelease { .. }
             | Self::ReceiveCopy { .. }
-            | Self::BudgetReleaseWire { .. }
-            | Self::BudgetReleaseResident { .. }
-            | Self::BudgetRegularReleaseWire { .. }
-            | Self::BudgetRegularReleaseResident { .. }
             | Self::Bound { .. }
             | Self::UnboundOpen
             | Self::UnboundHold

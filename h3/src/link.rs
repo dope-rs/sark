@@ -92,7 +92,7 @@ pub(crate) fn pump<'d, P: rules::Policy, A: rules::Push, E: From<conn::Error>>(
         let Some(taken) = conn.queues.take(&mut conn.qpack.feedback, feedback) else {
             return Ok((Flush::Drained, released));
         };
-        let Some(done) = taken.with(&mut send)?? else {
+        let Some(done) = taken.with(&mut send)? else {
             return Ok((Flush::Blocked, released));
         };
         match done {

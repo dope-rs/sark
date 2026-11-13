@@ -50,13 +50,6 @@ pub(super) struct Allowance<'a> {
     room: usize,
 }
 
-#[must_use = "a checked budget release must be committed or cancelled"]
-pub(super) struct Release<'a> {
-    budget: &'a mut WriteBudget,
-    class: WriteClass,
-    charge: output::WriteCharge,
-}
-
 impl Change<'_> {
     pub(super) fn commit(self) {
         self.budget.retained = self.retained;
@@ -79,20 +72,6 @@ impl<'a> Allowance<'a> {
         self.change.retained.wire_bytes -= self.room - growth.bytes();
         self.change.commit();
     }
-}
-
-impl Release<'_> {
-    pub(super) fn commit(self) {
-        self.budget.retained.wire_bytes -= self.charge.wire_bytes;
-        self.budget.retained.resident_bytes -= self.charge.resident_bytes;
-        if self.class == WriteClass::Regular {
-            self.budget.regular.wire_bytes -= self.charge.wire_bytes;
-            self.budget.regular.resident_bytes -= self.charge.resident_bytes;
-        }
-    }
-
-    /// Abandons this checked release without changing the budget.
-    pub(super) fn cancel(self) {}
 }
 
 pub(in crate::conn) struct WriteBudget {
@@ -269,40 +248,13 @@ impl WriteBudget {
         })
     }
 
-    pub(super) fn try_release(
-        &mut self,
-        class: WriteClass,
-        charge: output::WriteCharge,
-    ) -> Result<Release<'_>, conn::Error> {
-        if charge.wire_bytes > self.retained.wire_bytes {
-            return Err(conn::Error::BudgetReleaseWire {
-                retained: self.retained.wire_bytes,
-                released: charge.wire_bytes,
-            });
+    pub(super) fn release(&mut self, class: WriteClass, charge: output::WriteCharge) {
+        self.retained.wire_bytes -= charge.wire_bytes;
+        self.retained.resident_bytes -= charge.resident_bytes;
+        if class == WriteClass::Regular {
+            self.regular.wire_bytes -= charge.wire_bytes;
+            self.regular.resident_bytes -= charge.resident_bytes;
         }
-        if charge.resident_bytes > self.retained.resident_bytes {
-            return Err(conn::Error::BudgetReleaseResident {
-                retained: self.retained.resident_bytes,
-                released: charge.resident_bytes,
-            });
-        }
-        if class == WriteClass::Regular && charge.wire_bytes > self.regular.wire_bytes {
-            return Err(conn::Error::BudgetRegularReleaseWire {
-                retained: self.regular.wire_bytes,
-                released: charge.wire_bytes,
-            });
-        }
-        if class == WriteClass::Regular && charge.resident_bytes > self.regular.resident_bytes {
-            return Err(conn::Error::BudgetRegularReleaseResident {
-                retained: self.regular.resident_bytes,
-                released: charge.resident_bytes,
-            });
-        }
-        Ok(Release {
-            budget: self,
-            class,
-            charge,
-        })
     }
 
     pub(in crate::conn) const fn wire_len(&self) -> usize {

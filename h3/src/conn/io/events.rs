@@ -79,7 +79,7 @@ where
         let Some(taken) = conn.queues.take(&mut conn.qpack.feedback, feedback) else {
             return Ok(None);
         };
-        let (write, done) = taken.with(|write, prepared| prepared.finish(write))?;
+        let (write, done) = taken.with(|write, prepared| prepared.finish(write));
         if done.is_feedback() {
             Self::new(conn).resume()?;
         }
