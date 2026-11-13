@@ -631,8 +631,7 @@ impl Vacant<'_> {
                 }
             },
             send_window: Window::with(send as i32),
-            recv_window: Window::with(recv as i32),
-            pending_release: 0,
+            recv_window: recv,
             remaining,
         };
         slot.insert(Record {

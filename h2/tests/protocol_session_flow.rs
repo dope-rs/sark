@@ -181,34 +181,56 @@ fn upload_replenishes() {
 
 #[test]
 fn data_closes_remote() {
-    let mut conn = Connection::<ServerRole>::try_new().expect("server fixture");
-    Session::new(&mut conn)
-        .try_prime()
-        .expect("protocol fixture");
+    use sark_h2::flow::Window;
 
-    let block = Fields::new(&GET).try_encode().expect("protocol fixture");
-    (conn.ingress().ingest(
-        &Frame::new(1, &block)
-            .try_headers(Boundary::More, Block::End)
-            .expect("protocol fixture"),
-    ))
-    .as_ref()
-    .expect("test operation must succeed");
-    assert!(conn.ingress().poll_event().is_some());
-    (conn.ingress().ingest(
-        &Frame::new(1, b"x")
-            .try_data(Boundary::End)
-            .expect("protocol fixture"),
-    ))
-    .as_ref()
-    .expect("test operation must succeed");
-    assert!(conn.ingress().poll_event().is_some());
-    assert!(
-        (conn
-            .status()
-            .stream_state(Id::new(1).expect("fixture domain")))
-            == (Some(stream::State::HalfClosedRemote))
-    );
+    for (initial, target, payload) in [
+        (
+            Settings::DEFAULT.initial_window_size,
+            Config::default().recv_window_target,
+            b"x".as_slice(),
+        ),
+        (0, 0, b"".as_slice()),
+        (Window::MAX as u32, Window::MAX as u32, b"x".as_slice()),
+    ] {
+        let mut conn = Connection::<ServerRole>::with_config(Config {
+            local_settings: Settings {
+                initial_window_size: initial,
+                ..Settings::DEFAULT
+            },
+            recv_window_target: target,
+            ..Config::default()
+        })
+        .expect("server fixture");
+        Session::new(&mut conn)
+            .try_prime()
+            .expect("protocol fixture");
+        let block = Fields::new(&GET).try_encode().expect("protocol fixture");
+        conn.ingress()
+            .ingest(
+                &Frame::new(1, &block)
+                    .try_headers(Boundary::More, Block::End)
+                    .expect("protocol fixture"),
+            )
+            .expect("request head");
+        assert!(conn.ingress().poll_event().is_some());
+        let before = conn.status().recv_window().value();
+        conn.ingress()
+            .ingest(
+                &Frame::new(1, payload)
+                    .try_data(Boundary::End)
+                    .expect("protocol fixture"),
+            )
+            .expect("final DATA");
+        assert!(conn.ingress().poll_event().is_some());
+        assert!(
+            conn.status().stream_state(Id::FIRST_CLIENT) == Some(stream::State::HalfClosedRemote)
+        );
+        assert!(conn.status().recv_window() == Window::with(before - payload.len() as i32));
+        assert!(
+            conn.status().recv_for(Id::FIRST_CLIENT)
+                == Some(Window::with(initial as i32 - payload.len() as i32))
+        );
+    }
 }
 
 #[test]

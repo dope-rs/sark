@@ -38,8 +38,7 @@ pub(crate) struct Active {
     pub(crate) content: stream::Content,
     peer: store::Live,
     pub(crate) send_window: flow::Window,
-    pub(crate) recv_window: flow::Window,
-    pub(crate) pending_release: u32,
+    pub(crate) recv_window: u32,
     pub(crate) remaining: u64,
 }
 

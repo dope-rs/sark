@@ -45,8 +45,12 @@ impl Target {
         }
     }
 
-    pub(crate) const fn get(self) -> u32 {
-        self.0
+    pub(crate) const fn initial(self) -> u32 {
+        if self.0 < Window::INITIAL as u32 {
+            Window::INITIAL as u32
+        } else {
+            self.0
+        }
     }
 
     pub(crate) const fn low(self) -> u32 {
@@ -74,16 +78,6 @@ impl Window {
             value,
             committed: value,
         }
-    }
-
-    pub(crate) const fn for_target(target: Target) -> Self {
-        let target = target.get() as i32;
-        let value = if target < Self::INITIAL {
-            Self::INITIAL
-        } else {
-            target
-        };
-        Self::with(value)
     }
 
     pub const fn value(self) -> i32 {
@@ -158,36 +152,10 @@ pub(crate) struct Reserved {
     amount: u32,
 }
 
-pub(crate) struct ReleasePair<'a> {
-    pub conn: &'a mut u32,
-    pub stream: &'a mut u32,
-    pub conn_threshold: u32,
-    pub stream_threshold: u32,
-}
-
 pub(crate) struct Endpoint<'a> {
-    window: &'a mut Window,
-    pending: &'a mut u32,
-    next: i32,
-    held: u32,
+    window: &'a mut u32,
+    next: u32,
     bump: Option<numbers::Increment>,
-}
-
-#[derive(Clone, Copy, Eq, PartialEq)]
-#[repr(u8)]
-enum Refill {
-    Enabled,
-    Disabled,
-}
-
-const _: () = {
-    assert!(core::mem::size_of::<Refill>() == core::mem::size_of::<bool>());
-    assert!(core::mem::align_of::<Refill>() == core::mem::align_of::<bool>());
-};
-
-pub(crate) struct Admission<'a> {
-    pub conn: Endpoint<'a>,
-    pub stream: Result<Endpoint<'a>, Receive>,
 }
 
 impl<'a> Pair<'a> {
@@ -201,33 +169,6 @@ impl<'a> Pair<'a> {
             pair: self,
             stream,
         }
-    }
-
-    pub(crate) fn receive_data(
-        self,
-        amount: numbers::Length,
-        releases: ReleasePair<'a>,
-        boundary: Boundary,
-    ) -> Result<Admission<'a>, Receive> {
-        let conn = Endpoint::new(
-            self.conn,
-            releases.conn,
-            releases.conn_threshold,
-            amount,
-            Refill::Enabled,
-        )?;
-        let refill = match boundary {
-            Boundary::More => Refill::Enabled,
-            Boundary::End => Refill::Disabled,
-        };
-        let stream = Endpoint::new(
-            self.stream,
-            releases.stream,
-            releases.stream_threshold,
-            amount,
-            refill,
-        );
-        Ok(Admission { conn, stream })
     }
 }
 
@@ -298,51 +239,59 @@ const _: () = {
 };
 
 impl<'a> Endpoint<'a> {
-    fn new(
-        window: &'a mut Window,
-        pending: &'a mut u32,
+    #[inline]
+    pub(crate) fn receive_data(
+        window: &'a mut u32,
+        amount: numbers::Length,
+        target: Target,
+    ) -> Result<Self, Receive> {
+        Self::new(
+            window,
+            target.initial(),
+            target.low(),
+            amount,
+            Boundary::More,
+        )
+    }
+
+    #[inline]
+    pub(crate) fn new(
+        window: &'a mut u32,
+        base: u32,
         limit: u32,
         amount: numbers::Length,
-        refill: Refill,
+        boundary: Boundary,
     ) -> Result<Self, Receive> {
         let amount = amount.into_u32();
-        let debit = amount as i32;
-        if debit > window.value.max(0) {
+        if amount > *window {
             return Err(Receive::Stalled {
-                available: window.value,
+                available: *window as i32,
                 amount,
             });
         }
         if amount == 0 {
             return Ok(Self {
-                next: window.value,
-                held: *pending,
+                next: *window,
                 bump: None,
                 window,
-                pending,
             });
         }
-        // Receive windows conserve value + pending from the admitted initial limit.
-        let held = *pending + amount;
-        let spent = window.value - debit;
-        let (next, held, bump) = match refill {
-            Refill::Disabled => (spent, held, None),
-            Refill::Enabled if held < limit => (spent, held, None),
-            Refill::Enabled => {
+        let spent = *window - amount;
+        let held = base - spent;
+        let (next, bump) = match boundary {
+            Boundary::End => (spent, None),
+            Boundary::More if held < limit => (spent, None),
+            Boundary::More => {
                 let Some(bump) = numbers::Increment::new(held) else {
-                    return Err(Receive::Refill { spent, held });
+                    return Err(Receive::Refill {
+                        spent: spent as i32,
+                        held,
+                    });
                 };
-                let next = spent + bump.into_i32();
-                (next, 0, Some(bump))
+                (base, Some(bump))
             }
         };
-        Ok(Self {
-            window,
-            pending,
-            next,
-            held,
-            bump,
-        })
+        Ok(Self { window, next, bump })
     }
 
     pub(crate) const fn bump(&self) -> Option<numbers::Increment> {
@@ -350,19 +299,6 @@ impl<'a> Endpoint<'a> {
     }
 
     pub(crate) fn commit(self) {
-        self.window.value = self.next;
-        self.window.committed = self.next;
-        *self.pending = self.held;
-    }
-}
-
-impl Window {
-    pub(crate) fn receive_data<'a>(
-        &'a mut self,
-        amount: numbers::Length,
-        pending: &'a mut u32,
-        limit: u32,
-    ) -> Result<Endpoint<'a>, Receive> {
-        Endpoint::new(self, pending, limit, amount, Refill::Enabled)
+        *self.window = self.next;
     }
 }

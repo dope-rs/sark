@@ -127,7 +127,7 @@ where
     }
 
     pub fn recv_window(&self) -> flow::Window {
-        self.conn.state.flow.recv_window
+        flow::Window::with(self.conn.state.flow.recv_window as i32)
     }
 
     pub fn recv_goaway(&self) -> Option<numbers::ErrorCode> {
@@ -195,7 +195,8 @@ where
     }
 
     pub fn recv_for(&self, id: stream::Id) -> Option<flow::Window> {
-        self.record(id).map(|record| record.recv_window)
+        self.record(id)
+            .map(|record| flow::Window::with(record.recv_window as i32))
     }
 }
 

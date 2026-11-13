@@ -207,15 +207,12 @@ where
     };
     let total = frame::HEADER_LEN + flow.into_usize();
 
-    let conn_low = state.flow.recv_window_target.low();
-    let flow_low = (state.settings.local.initial_window_size / 2).max(1);
+    let conn_target = state.flow.recv_window_target;
+    let stream_base = state.settings.local.initial_window_size;
     let state::State {
-        flow:
-            state::Flow {
-                recv_window: recv,
-                pending_release: pending,
-                ..
-            },
+        flow: state::Flow {
+            recv_window: recv, ..
+        },
         active_streams: active,
         stream_history: history,
         lifecycle: life,
@@ -231,7 +228,7 @@ where
                 .reject(conn::Error::Protocol(conn::Protocol::Idle(id)));
         }
         Lookup::Class(registry::Past::Closed) => {
-            let receive = match recv.receive_data(flow, pending, conn_low) {
+            let receive = match flow::Endpoint::receive_data(recv, flow, conn_target) {
                 Ok(receive) => receive,
                 Err(error) => {
                     return input.prepare(total)?.reject(conn::Error::from(error));
@@ -269,7 +266,7 @@ where
     let (next, remaining) = match next {
         Ok(next) => next,
         Err(error) => {
-            let receive = match recv.receive_data(flow, pending, conn_low) {
+            let receive = match flow::Endpoint::receive_data(recv, flow, conn_target) {
                 Ok(receive) => receive,
                 Err(error) => {
                     return input.prepare(total)?.reject(conn::Error::from(error));
@@ -287,43 +284,32 @@ where
             return Ok(());
         }
     };
-    let receive = flow::Pair {
-        conn: recv,
-        stream: &mut record.recv_window,
-    }
-    .receive_data(
+    let conn = match flow::Endpoint::receive_data(recv, flow, conn_target) {
+        Ok(conn) => conn,
+        Err(error) => {
+            return input.prepare(total)?.reject(conn::Error::Receive(error));
+        }
+    };
+    let stream = match flow::Endpoint::new(
+        &mut record.recv_window,
+        stream_base,
+        (stream_base / 2).max(1),
         flow,
-        flow::ReleasePair {
-            conn: pending,
-            stream: &mut record.pending_release,
-            conn_threshold: conn_low,
-            stream_threshold: flow_low,
-        },
         boundary,
-    );
-    let (conn, stream) = match receive {
-        Ok(flow::Admission {
-            conn,
-            stream: Ok(stream),
-        }) => (conn, stream),
-        Ok(flow::Admission {
-            conn: credit,
-            stream: Err(cause),
-        }) => {
+    ) {
+        Ok(stream) => stream,
+        Err(cause) => {
             let reset = events.vacant()?;
             let frame = input.prepare(total)?;
             let error = conn::Error::Receive(cause).code();
             egress
                 .outbound
-                .data_control(proof, credit.bump(), None, Some(error))?;
-            credit.commit();
+                .data_control(proof, conn.bump(), None, Some(error))?;
+            conn.commit();
             frame.commit();
             let retired = state.retire::<C, E>(egress, key);
             events::Reset::new(reset, None).commit(key, error, retired);
             return Ok(());
-        }
-        Err(error) => {
-            return input.prepare(total)?.reject(conn::Error::Receive(error));
         }
     };
     let data = input.prepare_data(events, content.start, content.len(), total)?;

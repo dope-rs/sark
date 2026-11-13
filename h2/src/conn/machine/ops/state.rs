@@ -254,9 +254,8 @@ impl Settings {
 
 pub(in crate::conn::machine) struct Flow {
     pub(in crate::conn::machine) send_window: flow::Window,
-    pub(in crate::conn::machine) recv_window: flow::Window,
+    pub(in crate::conn::machine) recv_window: u32,
     pub(in crate::conn::machine) recv_window_target: flow::Target,
-    pub(in crate::conn::machine) pending_release: u32,
     opened: ops::Opened,
 }
 
@@ -264,9 +263,8 @@ impl Flow {
     fn new(recv: flow::Target) -> Self {
         Self {
             send_window: flow::Window::new(),
-            recv_window: flow::Window::for_target(recv),
+            recv_window: recv.initial(),
             recv_window_target: recv,
-            pending_release: 0,
             opened: ops::Opened::Idle,
         }
     }
