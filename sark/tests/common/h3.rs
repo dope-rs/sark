@@ -12,10 +12,10 @@ use sark_h3::{
         event::{Event, Role},
         io::{Receive, Step},
         options::{self, plan},
-        output::WritePayload,
+        output::{self, WritePayload},
     },
     frame::{self, Payload, TYPE_HEADERS},
-    link::{self, Outcome, Transport},
+    link::{Outcome, Transport},
     qpack::encoder::{self, Encoder},
 };
 use sark_http::{
@@ -151,7 +151,7 @@ pub struct Wire {
 pub struct Capture(pub Vec<u8>, pub Boundary);
 
 impl<'d> Transport<'d> for Wire {
-    fn send_write<'id>(&mut self, write: link::Write<'id, 'd>) -> Outcome<'id, 'd> {
+    fn send_write(&mut self, write: &output::Write<'d>) -> Outcome {
         let boundary = write.boundary();
         let capture = self
             .sent
@@ -159,8 +159,8 @@ impl<'d> Transport<'d> for Wire {
             .or_insert(Capture(Vec::new(), boundary));
         capture.1 = boundary;
         let bytes = &mut capture.0;
-        bytes.extend_from_slice(write.prefix());
-        if let Some(payload) = write.payload() {
+        bytes.extend_from_slice(&write.prefix);
+        if let Some(payload) = write.payload.as_ref() {
             match payload {
                 WritePayload::Owned(payload) => bytes.extend_from_slice(payload),
                 WritePayload::Shared(payload) => {

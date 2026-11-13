@@ -2,8 +2,8 @@ use std::ptr;
 
 use dope_quic::wire::stream::Id;
 use sark_h3::{
-    conn::output::WritePayload,
-    link::{self, Outcome, Transport},
+    conn::output::{self, WritePayload},
+    link::{Outcome, Transport},
 };
 
 pub struct BlockOnce {
@@ -18,12 +18,12 @@ pub struct BlockData {
 }
 
 impl<'d> Transport<'d> for BlockOnce {
-    fn send_write<'id>(&mut self, write: link::Write<'id, 'd>) -> Outcome<'id, 'd> {
-        let pointer = write.payload().map_or(ptr::null(), first_segment_ptr);
+    fn send_write(&mut self, write: &output::Write<'d>) -> Outcome {
+        let pointer = write.payload.as_ref().map_or(ptr::null(), first_segment_ptr);
         if !self.blocked {
             self.blocked = true;
             self.payload = pointer;
-            return Outcome::Blocked(write);
+            return Outcome::Blocked;
         }
         if pointer != self.payload {
             self.mismatch.get_or_insert(pointer);
@@ -33,9 +33,9 @@ impl<'d> Transport<'d> for BlockOnce {
 }
 
 impl<'d> Transport<'d> for BlockData {
-    fn send_write<'id>(&mut self, write: link::Write<'id, 'd>) -> Outcome<'id, 'd> {
+    fn send_write(&mut self, write: &output::Write<'d>) -> Outcome {
         if write.stream_id() == Id::ZERO {
-            Outcome::Blocked(write)
+            Outcome::Blocked
         } else {
             self.accepted.push(write.stream_id());
             Outcome::Accepted

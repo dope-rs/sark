@@ -8,7 +8,7 @@ use sark_h3::{
         output,
         output::{WritePayload, WritePrefix},
     },
-    link::{self, Outcome, Transport},
+    link::{Outcome, Transport},
 };
 
 pub trait Prefix {
@@ -32,13 +32,13 @@ pub struct Capture {
 }
 
 impl<'d> Transport<'d> for Capture {
-    fn send_write<'id>(&mut self, write: link::Write<'id, 'd>) -> Outcome<'id, 'd> {
+    fn send_write(&mut self, write: &output::Write<'d>) -> Outcome {
         let boundary = write.boundary();
-        match write.prefix() {
+        match &write.prefix {
             WritePrefix::Inline(_) => self.inline_writes += 1,
             WritePrefix::Owned(_) => self.owned_writes += 1,
         }
-        if let Some(payload) = write.payload() {
+        if let Some(payload) = write.payload.as_ref() {
             match payload {
                 WritePayload::Owned(_) => self.owned_writes += 1,
                 WritePayload::Shared(_) => self.owned_writes += 1,

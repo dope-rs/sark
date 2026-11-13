@@ -65,39 +65,9 @@ pub enum Receive<'d, C> {
     Finished,
 }
 
-/// One admitted write whose unchanged owner may return after backpressure.
-#[repr(transparent)]
-pub struct Write<'id, 'd>(write::Flight<'id, 'd>);
-
-impl<'id, 'd> Write<'id, 'd> {
-    fn new(write: write::Flight<'id, 'd>) -> Self {
-        Self(write)
-    }
-
-    pub const fn stream_id(&self) -> Id {
-        self.0.get().stream_id()
-    }
-
-    pub const fn boundary(&self) -> Boundary {
-        self.0.get().boundary()
-    }
-
-    pub const fn prefix(&self) -> &output::WritePrefix {
-        &self.0.get().prefix
-    }
-
-    pub fn payload(&self) -> Option<&output::WritePayload<'d>> {
-        self.0.payload.as_ref()
-    }
-
-    fn into_flight(self) -> write::Flight<'id, 'd> {
-        self.0
-    }
-}
-
-pub enum Outcome<'id, 'd> {
+pub enum Outcome {
     Accepted,
-    Blocked(Write<'id, 'd>),
+    Blocked,
 }
 
 /// Drains one bounded turn while preserving each admitted write's exact brand.
@@ -144,18 +114,21 @@ pub(crate) fn pump<'d, P: rules::Policy, A: rules::Push, E: From<conn::Error>>(
 }
 
 pub trait Transport<'d> {
-    /// Attempts one indivisible owner handoff.
-    fn send_write<'id>(&mut self, write: Write<'id, 'd>) -> Outcome<'id, 'd>;
+    /// Attempts one indivisible write.
+    fn send_write(&mut self, write: &output::Write<'d>) -> Outcome;
 
     fn pump_writes<P: rules::Policy, A: rules::Push>(
         &mut self,
         conn: &mut conn::Connection<'d, P, A>,
     ) -> Result<Flush, conn::Error> {
         pump(conn, |write, prepared| {
-            Ok(match self.send_write(Write::new(write)) {
-                Outcome::Accepted => Some(prepared.commit()),
-                Outcome::Blocked(owner) => {
-                    prepared.restore(owner.into_flight());
+            Ok(match self.send_write(write.get()) {
+                Outcome::Accepted => {
+                    drop(write);
+                    Some(prepared.commit())
+                }
+                Outcome::Blocked => {
+                    prepared.restore(write);
                     None
                 }
             })
@@ -163,11 +136,6 @@ pub trait Transport<'d> {
         .map(|(flush, _)| flush)
     }
 }
-
-const _: () = assert!(
-    core::mem::size_of::<Write<'static, 'static>>()
-        == core::mem::size_of::<output::Write<'static>>()
-);
 
 pub trait Recv<'d> {
     type Credit;
