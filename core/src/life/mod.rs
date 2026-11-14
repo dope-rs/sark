@@ -106,6 +106,9 @@ pub trait Mode<C: Copy, S: Copy> {
     /// Whether response commits need exact retained-owner charges.
     const RESPONSE_CHARGE: bool = true;
 
+    /// Whether stream-chunk acquisition needs exact retained-owner charges.
+    const STREAM_CHARGE: bool = true;
+
     type Retention: evidence::Mode;
     type Observer: Observer<C, S>;
 

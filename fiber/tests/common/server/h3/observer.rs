@@ -1,4 +1,4 @@
-use std::{cell, fmt, net::SocketAddr, num::NonZero, rc};
+use std::{cell, convert::Infallible, fmt, net::SocketAddr, num::NonZero, rc};
 
 use dope::core::driver::storage;
 use dope_quic::{
@@ -7,14 +7,29 @@ use dope_quic::{
         life::options::{Options, builder},
     },
     proto::param,
-    runtime::mux::handler::{hook::wire::packet, net},
+    runtime::mux::handler::{
+        hook::{
+            life::{close, closing},
+            set,
+            wire::{endpoint as wire_endpoint, ingress, packet},
+        },
+        net,
+    },
+    stream::Retain,
     wire::stream::Id,
 };
+use o3::buffer::{hold, resident};
 use sark_core::{
+    body::credit,
     life,
     life::{audit, endpoint, exchange},
+    manifold::task::app::Runtime,
 };
-use sark_h3::{conn::options, manifold::server::failure};
+use sark_h3::{
+    conn::options,
+    manifold::server::{self, deadline, failure, rotation},
+};
+use sark_http::owner::{Change, cause};
 
 use crate::common::server::h3::{
     apps::{FAIR_REQUESTS, State},
@@ -56,6 +71,95 @@ impl storage::Direct for StoragePlan {
 
 #[derive(Clone)]
 pub struct Probe<'a, D>(pub(crate) rc::Rc<Shared<'a>>, pub(crate) D);
+
+pub struct StreamObserver<'a, D> {
+    pub probe: Probe<'a, D>,
+    pub charge: &'a cell::Cell<Option<hold::Charge>>,
+}
+
+impl<C: Copy, S: Copy, D> life::Mode<C, S> for StreamObserver<'_, D> {
+    const ENABLED: bool = false;
+    type Retention = hold::evidence::Off;
+    type Observer = Infallible;
+    type Body<'a>
+        = credit::Disabled
+    where
+        Self: 'a,
+        C: 'a,
+        S: 'a;
+
+    fn observer(&mut self) -> Option<&mut Self::Observer> {
+        None
+    }
+
+    fn observe(&mut self, event: life::Event<C, S>) {
+        if let life::Event::ResponseOwnership(effect) = event
+            && effect.change() == Change::StagingAcquired(cause::Acquire::StreamChunk)
+        {
+            assert_eq!(self.charge.replace(Some(effect.charge())), None);
+        }
+    }
+
+    fn body<'a>(&'a mut self, _: exchange::Id<C, S>) -> Self::Body<'a>
+    where
+        C: 'a,
+        S: 'a,
+    {
+        credit::Disabled::new()
+    }
+}
+
+impl<E, T, D> endpoint::Mode<E, T> for StreamObserver<'_, D> {
+    const ENABLED: bool = false;
+    type Observer = Infallible;
+
+    fn observer(&mut self) -> Option<&mut Self::Observer> {
+        None
+    }
+}
+
+impl<D> failure::Packet for StreamObserver<'_, D> {
+    fn packet(&mut self, from: SocketAddr, len: usize, error: packet::Failure<'_>) {
+        self.probe.packet(from, len, error);
+    }
+}
+
+impl<I: Copy, D: Fn(&dyn fmt::Debug), const ID: u8> failure::Sink<id::Handle<I, ID>>
+    for StreamObserver<'_, D>
+{
+    fn failure(&mut self, event: failure::Event<'_, id::Handle<I, ID>>) {
+        self.probe.failure(event);
+    }
+}
+
+impl<'d, D: Fn(&dyn fmt::Debug), const ID: u8> server::Mode<'d, ID> for StreamObserver<'_, D> {
+    type Events<R, L, E, Q, B>
+        = set::Set<
+        set::On,
+        set::Off,
+        set::On,
+        set::Off,
+        set::Off,
+        set::On,
+        ingress::Off,
+        Q,
+        wire_endpoint::Off,
+        closing::Off,
+        close::On,
+    >
+    where
+        R: Runtime<'d, Target = server::Handle<'d, ID>>,
+        L: rotation::Policy<'d>,
+        E: deadline::Policy<'d>,
+        B: Retain<'d>,
+        Q: packet::Mode<
+                server::Handler<'d, R, Self, L, E, Q>,
+                ID,
+                B,
+                resident::Shared<'d>,
+                id::Driver<'d>,
+            >;
+}
 
 pub fn qpack_pressure<D>(probe: Probe<'_, D>) -> life::mode::Observed<Probe<'_, D>> {
     {

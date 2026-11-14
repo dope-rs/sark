@@ -6,6 +6,7 @@ pub(super) mod receive;
 use std::{mem, ops::ControlFlow, pin};
 
 use dope_quic::{stream, wire::stream::Id};
+use o3::buffer::hold;
 use owners::Projection;
 use requests::task::{self, Pending};
 use sark_core::{
@@ -221,12 +222,17 @@ where
                             },
                         }
                     }
-                    Pending::Chunk(chunk) => Some(
-                        h3.h3_mut()
-                            .reply()
-                            .send_chunk(id.target(), chunk)
-                            .map_err(|(error, chunk)| (error, Pending::Chunk(chunk))),
-                    ),
+                    Pending::Chunk(chunk) => {
+                        let reply = h3.h3_mut().reply();
+                        let sent = if O::STREAM_CHARGE {
+                            Some(reply.send_chunk::<hold::evidence::On>(id.target(), chunk))
+                        } else {
+                            reply
+                                .send_chunk::<hold::evidence::Off>(id.target(), chunk)
+                                .map_or_else(|error| Some(Err(error)), |_| None)
+                        };
+                        sent.map(|sent| sent.map_err(|(error, chunk)| (error, Pending::Chunk(chunk))))
+                    }
                     Pending::End => {
                         pending = Pending::End;
                         Some(

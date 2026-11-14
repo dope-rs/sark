@@ -618,6 +618,40 @@ fn json_failure_precedes_next_data() {
 }
 
 #[test]
+fn stream_observes_without_retention() {
+    use common::server::h3::observer::StreamObserver;
+    use o3::buffer::hold;
+
+    let charge = Cell::new(None);
+    let proof = Scenario {
+        name: "custom-stream-observer",
+        requests: vec![Spec::new(b"/async/stream/resident", b"retained-input")],
+        expected_bodies: vec![Some(b"retained-")],
+        task_capacity: 1,
+        cancellation: None,
+        must_finish_before_last: None,
+        linked: 0,
+    }
+    .try_run_with(
+        common::server::h3::sessions::plain,
+        Default::default(),
+        None,
+        Disabled,
+        deadline::Disabled,
+        recover,
+        |cause| panic!("{cause:?}"),
+        |probe| StreamObserver {
+            probe,
+            charge: &charge,
+        },
+        |outcome| outcome.expect("custom stream observation"),
+    );
+    let resident = proof.stream.resident.get();
+    assert!(resident > 0);
+    assert_eq!(charge.get(), Some(hold::Charge::from_owner(9, resident)));
+}
+
+#[test]
 fn stream_failure_isolated() {
     use sark_h3::manifold::server::failure::Quiet;
 

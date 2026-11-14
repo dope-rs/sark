@@ -208,28 +208,28 @@ impl<'a, 'd, P: rules::Policy, A: rules::Push> Reply<'a, 'd, P, A> {
         data: T,
         boundary: Boundary,
     ) -> Result<hold::Charge, (conn::Error, T)> {
-        self.send_with(target.into(), try_data(data)?, boundary)
+        self.send_with::<hold::evidence::On, _>(target.into(), try_data(data)?, boundary)
             .map_err(|(error, plan)| (error, plan.into_payload()))
     }
 
-    pub(crate) fn send_chunk(
+    pub(crate) fn send_chunk<M: release::Mode>(
         self,
         target: stream::Target,
         plan: Plan<Chunk<'d>>,
-    ) -> Result<hold::Charge, (conn::Error, Plan<Chunk<'d>>)> {
-        self.send_with(target, plan, Boundary::More)
+    ) -> Result<M::Projection, (conn::Error, Plan<Chunk<'d>>)> {
+        self.send_with::<M, _>(target, plan, Boundary::More)
     }
 
-    fn send_with<T: output::Payload<'d>>(
+    fn send_with<M: release::Mode, T: output::Payload<'d>>(
         self,
         target: stream::Target,
         plan: Plan<T>,
         boundary: Boundary,
-    ) -> Result<hold::Charge, (conn::Error, Plan<T>)> {
+    ) -> Result<M::Projection, (conn::Error, Plan<T>)> {
         let conn = self.conn;
         use write::Single;
         let ([(plan, _)], error) = match Single::new(&mut conn.queues, target, (plan, boundary)) {
-            Ok(permit) => return Ok(permit.commit::<hold::evidence::On>()),
+            Ok(permit) => return Ok(permit.commit::<M>()),
             Err(rejected) => rejected.into_parts(),
         };
         let error = if conn.queues.is_pressure(&error) {
