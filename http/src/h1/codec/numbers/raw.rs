@@ -20,16 +20,16 @@ impl Wire for usize {
 
     fn decimal_uninit(mut self, buf: &mut [MaybeUninit<u8>; 20]) -> &[u8] {
         let mut start = buf.len();
-        loop {
+        while self >= 10 {
             start -= 1;
             buf[start].write(b'0' + (self % 10) as u8);
             self /= 10;
-            if self == 0 {
-                let bytes = &buf[start..];
-                // SAFETY: every byte of this suffix was initialized above;
-                // usize has at most 20 decimal digits and the borrow is retained.
-                return unsafe { slice::from_raw_parts(bytes.as_ptr().cast(), bytes.len()) };
-            }
         }
+        start -= 1;
+        buf[start].write(b'0' + self as u8);
+        let bytes = &buf[start..];
+        // SAFETY: every byte of this suffix was initialized above;
+        // usize has at most 20 decimal digits and the borrow is retained.
+        unsafe { slice::from_raw_parts(bytes.as_ptr().cast(), bytes.len()) }
     }
 }
