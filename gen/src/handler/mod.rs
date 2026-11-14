@@ -410,8 +410,12 @@ impl Handler {
                     }
                 };
                 let extra_types = &types[usize::from(request)..];
+                let extra = (0..extra_types.len())
+                    .map(|index| generics.local(&format!("arg{index}")))
+                    .collect::<Vec<_>>();
                 fun.sig.inputs = syn::parse_quote!(
-                    #call: (#ns_core::manifold::task::request::Input<'d, #name>, #( #extra_types, )*)
+                    (#v_input, #( #extra, )*):
+                        (#ns_core::manifold::task::request::Input<'d, #name>, #( #extra_types, )*)
                 );
                 if matches!(input.state, State::Generic(_)) {
                     fun.sig.generics.params.push(syn::parse_quote!(__SarkState));
@@ -424,19 +428,15 @@ impl Handler {
                 fun.sig.output = syn::parse_quote!(
                     -> #ns_core::manifold::task::response::Output<'d, #name, #state>
                 );
-                let extra = (1..=usize::from(state_at.is_some())
-                    + usize::from(matches!(input.timer, Timer::Present)))
-                    .map(syn::Index::from)
-                    .collect::<Vec<_>>();
-                let admitted_request = request.then(|| quote::quote!(#call.0.1,));
+                let admitted_request = request.then(|| quote::quote!(#call.1,));
                 let (ready, id) = if request {
-                    (quote::quote!(#call.into_parts()), quote::quote!(#call.0.0))
+                    (quote::quote!(#call.into_parts()), quote::quote!(#call.0))
                 } else {
-                    (quote::quote!(#call.into_parts().0), quote::quote!(#call.0))
+                    (quote::quote!(#call.into_parts().0), quote::quote!(#call))
                 };
                 fun.block = Box::new(syn::parse_quote!({
-                    let #call = (
-                        match #call::start::<#state>(#call.0) {
+                    let (#call, #( #extra, )*) = (
+                        match #call::start::<#state>(#v_input) {
                             ::core::result::Result::Ok(::core::ops::ControlFlow::Break(#call)) =>
                                 #ready,
                             ::core::result::Result::Ok(::core::ops::ControlFlow::Continue(mut #call)) => {
@@ -452,10 +452,10 @@ impl Handler {
                             }
                             ::core::result::Result::Err(#call) => return #call,
                         },
-                        #( #call.#extra, )*
+                        #( #extra, )*
                     );
                     #ns_core::manifold::task::response::Output::response(#id, async {
-                        let (#( #patterns, )*) = (#admitted_request #( #call.#extra, )*);
+                        let (#( #patterns, )*) = (#admitted_request #( #extra, )*);
                         #body
                     }.await)
                 }));
