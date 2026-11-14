@@ -103,7 +103,7 @@ impl<'d> state::State<'d> for Controller<'d> {
             .book
             .transition(
                 id.entry(),
-                state.config,
+                &state.config,
                 change,
                 now,
                 clock::Moment::clamp_add,

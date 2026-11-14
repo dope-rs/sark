@@ -77,7 +77,7 @@ impl<P: Copy + Ord> Timeline<P> {
 
     pub fn transition<N, F>(
         &mut self,
-        config: config::Config,
+        config: &config::Config,
         step: Transition,
         now: N,
         mut add: F,
@@ -99,7 +99,7 @@ impl<P: Copy + Ord> Timeline<P> {
     /// Callers retaining callback ownership pass a mutable borrow.
     pub(super) fn apply<N, F>(
         &mut self,
-        config: config::Config,
+        config: &config::Config,
         step: Transition,
         now: N,
         mut add: F,
@@ -212,7 +212,7 @@ impl<P: Copy + Ord> Timeline<P> {
     }
 
     /// Checks the active idle lane once before evaluating and retaining progress.
-    pub(super) fn progress<N, F>(&mut self, config: config::Config, now: N, mut add: F) -> Change
+    pub(super) fn progress<N, F>(&mut self, config: &config::Config, now: N, mut add: F) -> Change
     where
         N: Copy,
         F: FnMut(N, Positive) -> P,
@@ -260,7 +260,7 @@ impl<P: Copy + Ord> Timeline<P> {
     }
 
     fn instant<N, F>(
-        config: config::Config,
+        config: &config::Config,
         phase: deadline::Phase,
         now: N,
         add: &mut F,

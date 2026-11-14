@@ -29,7 +29,7 @@ fn exchange_lifetime() {
         .with(deadline::Phase::ResponseAdmission, secs_3);
     let mut timeline = timeline::Timeline::EMPTY;
 
-    let opened = timeline.transition(config, timeline::Transition::AwaitingHead, 0, add);
+    let opened = timeline.transition(&config, timeline::Transition::AwaitingHead, 0, add);
     assert!((opened) == (deadline::Mutation::Earliest));
     assert!(
         (timeline.next())
@@ -40,10 +40,10 @@ fn exchange_lifetime() {
     );
 
     assert!(
-        timeline.transition(config, timeline::Transition::Open, 1, add)
+        timeline.transition(&config, timeline::Transition::Open, 1, add)
             == deadline::Mutation::Unchanged
     );
-    timeline.transition(config, timeline::Transition::HeadAdmitted, 1, add);
+    timeline.transition(&config, timeline::Transition::HeadAdmitted, 1, add);
     assert!(
         (timeline.next())
             == (Some(timeline::Expiry {
@@ -52,7 +52,7 @@ fn exchange_lifetime() {
             }))
     );
     assert!(
-        (timeline.transition(config, timeline::Transition::BodyProgress, 5, add,))
+        (timeline.transition(&config, timeline::Transition::BodyProgress, 5, add,))
             == (deadline::Mutation::Contents)
     );
     assert!(timeline.pop_due(6).is_none());
@@ -64,9 +64,9 @@ fn exchange_lifetime() {
             }))
     );
 
-    timeline.transition(config, timeline::Transition::HandlerStarted, 6, add);
-    timeline.transition(config, timeline::Transition::InputFinished, 7, add);
-    timeline.transition(config, timeline::Transition::ResponseReady, 8, add);
+    timeline.transition(&config, timeline::Transition::HandlerStarted, 6, add);
+    timeline.transition(&config, timeline::Transition::InputFinished, 7, add);
+    timeline.transition(&config, timeline::Transition::ResponseReady, 8, add);
     assert!(
         (timeline.next())
             == (Some(timeline::Expiry {
@@ -74,7 +74,7 @@ fn exchange_lifetime() {
                 phase: deadline::Phase::ResponseAdmission,
             }))
     );
-    timeline.transition(config, timeline::Transition::ResponseCommitted, 9, add);
+    timeline.transition(&config, timeline::Transition::ResponseCommitted, 9, add);
     assert!(
         (timeline.next())
             == (Some(timeline::Expiry {
@@ -82,11 +82,11 @@ fn exchange_lifetime() {
                 phase: deadline::Phase::Total,
             }))
     );
-    timeline.transition(config, timeline::Transition::Retired, 9, add);
+    timeline.transition(&config, timeline::Transition::Retired, 9, add);
     assert!(timeline.is_empty());
 
-    timeline.transition(config, timeline::Transition::AwaitingHead, 10, add);
-    timeline.transition(config, timeline::Transition::InputAdmitted, 11, add);
+    timeline.transition(&config, timeline::Transition::AwaitingHead, 10, add);
+    timeline.transition(&config, timeline::Transition::InputAdmitted, 11, add);
     assert!(
         (timeline.next())
             == (Some(timeline::Expiry {
@@ -101,9 +101,9 @@ fn head_replaces_progress() {
     let config = Config::new(deadline::Phase::BodyIdle, Positive::from_secs::<10>())
         .with(deadline::Phase::Head, Positive::from_secs::<1>());
     let mut timeline = timeline::Timeline::EMPTY;
-    timeline.transition(config, timeline::Transition::HeadAdmitted, 0, add);
-    timeline.transition(config, timeline::Transition::BodyProgress, 1, add);
-    timeline.transition(config, timeline::Transition::AwaitingHead, 2, add);
+    timeline.transition(&config, timeline::Transition::HeadAdmitted, 0, add);
+    timeline.transition(&config, timeline::Transition::BodyProgress, 1, add);
+    timeline.transition(&config, timeline::Transition::AwaitingHead, 2, add);
     assert!(
         timeline.pop_due(3)
             == Some(timeline::Expiry {
@@ -121,8 +121,8 @@ fn total_precedes_phase() {
         .with(deadline::Phase::Head, secs_5)
         .with(deadline::Phase::Handler, secs_5);
     let mut timeline = timeline::Timeline::EMPTY;
-    timeline.transition(config, timeline::Transition::AwaitingHead, 0, add);
-    timeline.transition(config, timeline::Transition::HandlerStarted, 0, add);
+    timeline.transition(&config, timeline::Transition::AwaitingHead, 0, add);
+    timeline.transition(&config, timeline::Transition::HandlerStarted, 0, add);
 
     assert!(
         (timeline.pop_due(5))
@@ -293,7 +293,7 @@ fn transition_preserves_minimum() {
         (Transition::Open, 2, Some((12, Phase::Total))),
         (Transition::Retired, 2, None),
     ] {
-        assert!(agenda.transition(key, config, step, now, add).is_ok());
+        assert!(agenda.transition(key, &config, step, now, add).is_ok());
         assert!(agenda.peek() == expected.map(|(at, phase)| (key, Scheduled::expire(at, phase))));
     }
     assert!(
@@ -303,7 +303,7 @@ fn transition_preserves_minimum() {
     );
     assert!(
         agenda
-            .transition(key, config, Transition::Retired, 0, add)
+            .transition(key, &config, Transition::Retired, 0, add)
             .is_ok()
     );
     assert!(agenda.is_empty());
@@ -326,12 +326,12 @@ fn poll_bounds_renewals() {
     for key in keys {
         assert!(
             agenda
-                .transition(key, config, timeline::Transition::HeadAdmitted, 0, add)
+                .transition(key, &config, timeline::Transition::HeadAdmitted, 0, add)
                 .is_ok()
         );
         assert!(
             agenda
-                .transition(key, config, timeline::Transition::BodyProgress, 3, add)
+                .transition(key, &config, timeline::Transition::BodyProgress, 3, add)
                 .is_ok()
         );
     }

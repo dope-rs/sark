@@ -128,7 +128,7 @@ impl<'d> Controller<'d> {
         let total_at = if let Some(key) = observed.exchange
             && observed.stage == Stage::Initial
         {
-            let at = instant(self.config, deadline::Phase::Total, now);
+            let at = instant(&self.config, deadline::Phase::Total, now);
             if let Some(at) = at {
                 deadline::Book::schedule(
                     &mut self.book,
@@ -140,7 +140,7 @@ impl<'d> Controller<'d> {
         } else {
             None
         };
-        let head_at = instant(self.config, deadline::Phase::Head, now);
+        let head_at = instant(&self.config, deadline::Phase::Head, now);
         if observed.stage == Stage::Other
             && head_at.is_some()
             && let Some(key) = observed.exchange
@@ -175,7 +175,7 @@ impl<'d> Controller<'d> {
             change
         };
         self.book
-            .transition(key, self.config, change, now, clock::Moment::clamp_add)?;
+            .transition(key, &self.config, change, now, clock::Moment::clamp_add)?;
         Ok(if before == self.deadline() {
             Change::Unchanged
         } else {
@@ -229,7 +229,7 @@ impl<'d> Controller<'d> {
 }
 
 fn instant<'d>(
-    config: config::Config,
+    config: &config::Config,
     phase: deadline::Phase,
     now: clock::Moment<'d>,
 ) -> Option<clock::Deadline<'d>> {

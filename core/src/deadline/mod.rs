@@ -306,7 +306,7 @@ impl<K: manifold::raw::Key, P: Copy + Ord, W: Copy + Ord> Agenda<K, P, W> {
     pub fn transition<N, F>(
         &mut self,
         key: K,
-        config: config::Config,
+        config: &config::Config,
         change: timeline::Transition,
         now: N,
         add: F,

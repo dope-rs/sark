@@ -45,7 +45,7 @@ impl Config {
         Ok(self.with(phase, window))
     }
 
-    pub const fn window(self, phase: deadline::Phase) -> Window {
+    pub const fn window(&self, phase: deadline::Phase) -> Window {
         self.windows[phase as usize]
     }
 

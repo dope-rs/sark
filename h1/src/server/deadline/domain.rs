@@ -68,7 +68,7 @@ impl<'d, ID: Identity> Bound<'d, ID> {
 
     fn transition(
         &mut self,
-        config: config::Config,
+        config: &config::Config,
         change: timeline::Transition,
         now: clock::Moment<'d>,
     ) {
@@ -106,14 +106,17 @@ impl<'d, ID: Identity> Domain<'d, ID> {
     /// Looks up the slot for `conn`. Route indices are bounded by the shared
     /// index encoding, not by this domain's resident capacity, so a missing
     /// slot is a connection this domain does not track, never a fault.
-    fn slot_mut(&mut self, conn: conn::Id<'d, ID>) -> Option<&mut Option<Bound<'d, ID>>> {
-        self.slots.get_mut(conn.index().into_usize())
+    fn slot_mut<'a>(
+        slots: &'a mut [Option<Bound<'d, ID>>],
+        conn: conn::Id<'d, ID>,
+    ) -> Option<&'a mut Option<Bound<'d, ID>>> {
+        slots.get_mut(conn.index().into_usize())
     }
 
     /// Binds this slot to `conn`, replacing any timeline left behind by the
     /// session that previously owned the same recycled route index.
     fn bind(&mut self, conn: conn::Id<'d, ID>) {
-        let Some(slot) = self.slot_mut(conn) else {
+        let Some(slot) = Self::slot_mut(&mut self.slots, conn) else {
             return;
         };
         *slot = Some(Bound::new(conn));
@@ -129,8 +132,8 @@ impl<'d, ID: Identity> Domain<'d, ID> {
         change: timeline::Transition,
     ) {
         let conn = exchange.connection();
-        let config = self.config;
-        let Some(bound) = self.resolve_mut(conn) else {
+        let config = &self.config;
+        let Some(bound) = Self::resolve_mut(&mut self.slots, conn) else {
             return;
         };
         match change {
@@ -175,8 +178,11 @@ impl<'d, ID: Identity> Domain<'d, ID> {
 
     /// Resolves the timeline owner for `conn`. A vacant slot or a recycled
     /// index that belongs to a different session simply has nothing to track.
-    fn resolve_mut(&mut self, conn: conn::Id<'d, ID>) -> Option<&mut Bound<'d, ID>> {
-        match self.slot_mut(conn)? {
+    fn resolve_mut<'a>(
+        slots: &'a mut [Option<Bound<'d, ID>>],
+        conn: conn::Id<'d, ID>,
+    ) -> Option<&'a mut Bound<'d, ID>> {
+        match Self::slot_mut(slots, conn)? {
             None => None,
             Some(bound) if bound.belongs(conn) => Some(bound),
             Some(_) => None,
@@ -281,8 +287,8 @@ impl<'d, ID: Identity> Domain<'d, ID> {
         body: deadline::Body,
     ) -> deadline::Root<clock::Deadline<'d>> {
         self.now = Some(now);
-        let config = self.config;
-        let Some(bound) = self.resolve_mut(conn) else {
+        let config = &self.config;
+        let Some(bound) = Self::resolve_mut(&mut self.slots, conn) else {
             return deadline::Root::Unchanged;
         };
         if matches!(head, deadline::Head::Pending) && matches!(bound.activity, Activity::Idle(_)) {
@@ -302,7 +308,7 @@ impl<'d, ID: Identity> Domain<'d, ID> {
         now: clock::Moment<'d>,
     ) -> deadline::Due<conn::Id<'d, ID>, clock::Deadline<'d>> {
         self.now = Some(now);
-        let Some(bound) = self.resolve_mut(conn) else {
+        let Some(bound) = Self::resolve_mut(&mut self.slots, conn) else {
             return deadline::Due {
                 expiry: None,
                 root: deadline::Root::Unchanged,
@@ -324,7 +330,7 @@ impl<'d, ID: Identity> Domain<'d, ID> {
     }
 
     pub(super) fn close(&mut self, conn: conn::Id<'d, ID>) {
-        let Some(slot) = self.slot_mut(conn) else {
+        let Some(slot) = Self::slot_mut(&mut self.slots, conn) else {
             return;
         };
         if matches!(slot, Some(bound) if bound.belongs(conn)) {
