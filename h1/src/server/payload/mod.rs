@@ -3,7 +3,7 @@ use std::alloc;
 use data::{Inline, compose};
 use dispatch::chunk::Chunk;
 use dope::net::link::egress::data;
-use o3::buffer::{Residency, bytes, hold, resident, segments};
+use o3::buffer::{Residency, hold, resident, segments};
 use sark_http::payload::response::dispatch;
 
 mod raw;
@@ -192,28 +192,21 @@ pub struct Cursor<'a, 'd>(State<'a, 'd>);
 const _: () = assert!(size_of::<Cursor<'static, 'static>>() == 4 * size_of::<usize>());
 
 fn prefix(len: usize) -> Inline<PREFIX_CAPACITY> {
-    let mut bytes = [0; PREFIX_CAPACITY];
-    let [digits @ .., cr, lf] = &mut bytes;
-    *cr = b'\r';
-    *lf = b'\n';
+    let mut output = Inline::<PREFIX_CAPACITY>::new();
+    let digits = (usize::BITS / 4 - len.leading_zeros() / 4) as usize;
+    let bytes = output.backing_mut();
     let mut value = len;
-    let mut left = digits.len();
-    for slot in digits.iter_mut().rev() {
-        if value == 0 {
-            break;
-        }
+    for slot in bytes[..digits].iter_mut().rev() {
         let digit = (value & 0xf) as u8;
         *slot = if digit < 10 {
             b'0' + digit
         } else {
             b'a' + digit - 10
         };
-        left -= 1;
         value >>= 4;
     }
-    let mut bytes = bytes.into_iter();
-    if left != 0 {
-        bytes.nth(left - 1);
-    }
-    Inline::from(bytes::Prefix::from(&bytes))
+    bytes[digits] = b'\r';
+    bytes[digits + 1] = b'\n';
+    output.fit(digits + 2).commit();
+    output
 }
