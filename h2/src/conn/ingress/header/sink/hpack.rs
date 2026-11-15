@@ -10,27 +10,18 @@ use sark_http::{
 };
 use state::decode::{Indexed, Session, Start};
 
-use crate::{
-    conn::ingress::header::sink::Header,
-    hpack::decode::{self, sink},
-};
+use crate::hpack::decode::{self, sink};
 
-pub(in crate::conn::ingress) struct Hpack<P: rules::Policy, A: rules::Push> {
-    session: Session<P>,
+pub(in crate::conn::ingress) struct Hpack<'a, P: rules::Policy, A: rules::Push> {
+    session: &'a mut Session<P>,
     push: marker::PhantomData<fn() -> A>,
 }
 
-impl<P: rules::Policy, A: rules::Push> Hpack<P, A> {
-    pub(super) fn new(session: Session<P>) -> Self {
+impl<'a, P: rules::Policy, A: rules::Push> Hpack<'a, P, A> {
+    pub(super) fn new(session: &'a mut Session<P>) -> Self {
         Self {
             session,
             push: marker::PhantomData,
-        }
-    }
-
-    pub(in crate::conn::ingress) fn into_header(self) -> Header<P> {
-        Header {
-            session: self.session,
         }
     }
 
@@ -39,7 +30,7 @@ impl<P: rules::Policy, A: rules::Push> Hpack<P, A> {
     }
 }
 
-impl<P: rules::Policy, A: rules::Push> sink::Direct for Hpack<P, A> {
+impl<P: rules::Policy, A: rules::Push> sink::Direct for Hpack<'_, P, A> {
     type Error = decode::Failure<lower::Error>;
 
     fn string(&mut self, cursor: &mut strings::Cursor, input: &[u8]) -> Result<(), Self::Error> {
@@ -61,7 +52,7 @@ impl<P: rules::Policy, A: rules::Push> sink::Direct for Hpack<P, A> {
     }
 }
 
-impl<P: rules::Policy, A: rules::Push> sink::Store for Hpack<P, A> {
+impl<P: rules::Policy, A: rules::Push> sink::Store for Hpack<'_, P, A> {
     type Rule = ();
     type Completion = ();
 
@@ -71,7 +62,7 @@ impl<P: rules::Policy, A: rules::Push> sink::Store for Hpack<P, A> {
     }
 
     fn begin(
-        mut self,
+        self,
         name: Option<block::Named<'_>>,
         indexing: field::Indexing,
     ) -> sink::Output<Self, sink::Begin<Self::Rule, Self::Completion>> {
@@ -90,7 +81,7 @@ impl<P: rules::Policy, A: rules::Push> sink::Store for Hpack<P, A> {
     }
 
     fn indexed(
-        mut self,
+        self,
         name: Option<block::Named<'_>>,
     ) -> sink::Output<Self, sink::Indexed<Self::Rule>> {
         let indexed = match self.session.indexed(name) {
@@ -107,7 +98,7 @@ impl<P: rules::Policy, A: rules::Push> sink::Store for Hpack<P, A> {
     }
 
     fn field(
-        mut self,
+        self,
         (): Self::Rule,
         value: block::Valued<'_>,
         indexing: field::Indexing,
@@ -119,7 +110,7 @@ impl<P: rules::Policy, A: rules::Push> sink::Store for Hpack<P, A> {
         }
     }
 
-    fn direct(mut self, (): Self::Completion) -> Result<Self, (Self, Self::Error)> {
+    fn direct(self, (): Self::Completion) -> Result<Self, (Self, Self::Error)> {
         match self.session.direct::<A>() {
             Ok(()) => Ok(self),
             Err(cause) => Err(self.failed(cause)),

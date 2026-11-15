@@ -399,7 +399,7 @@ impl<P: rules::Policy> Blocks<P> {
             })?;
         let connect = self.connect;
         self.decoder.map_idle(|decoder, scratch| {
-            let sink = match sink::Header::try_new(lease, part.kind, connect, scratch) {
+            let mut sink = match sink::Header::try_new(lease, part.kind, connect, scratch) {
                 Ok(sink) => sink,
                 Err((scratch, cause)) => {
                     return (
@@ -411,26 +411,26 @@ impl<P: rules::Policy> Blocks<P> {
             let (first, rest) = bytes.split();
             let Some(rest) = rest else {
                 return match decoder.decode_to::<Decode, _>(first, sink.hpack::<A>()) {
-                    Ok((decoder, admit, sink)) => match sink.into_header().finish(admit) {
+                    Ok((decoder, admit, _)) => match sink.finish(admit) {
                         Ok((scratch, decoded)) => (Mode::Idle(decoder, scratch), Ok(decoded)),
                         Err(cause) => (Mode::Failed, Err(cause)),
                     },
-                    Err((sink, cause)) => {
-                        drop(sink.into_header().recycle());
+                    Err((_, cause)) => {
+                        drop(sink.recycle());
                         (Mode::Failed, Err(cause.into()))
                     }
                 };
             };
             let mut budget = decoder.budget();
             let block = Phase::<Decode>::Representation(decoder);
-            let (block, sink) = match block.feed_all(
+            let block = match block.feed_all(
                 &mut budget,
                 iter::once(first).chain(rest),
                 sink.hpack::<A>(),
             ) {
-                Ok((block, sink)) => (block, sink.into_header()),
-                Err((sink, cause)) => {
-                    drop(sink.into_header().recycle());
+                Ok((block, _)) => block,
+                Err((_, cause)) => {
+                    drop(sink.recycle());
                     return (Mode::Failed, Err(cause.into()));
                 }
             };

@@ -34,15 +34,15 @@ impl<P: rules::Policy> Source<P> {
             Self::Store {
                 block,
                 mut budget,
-                sink,
+                mut sink,
             } => match block.feed_all(&mut budget, parts, sink.hpack::<A>()) {
-                Ok((block, sink)) => Ok(Self::Store {
+                Ok((block, _)) => Ok(Self::Store {
                     block,
                     budget,
-                    sink: sink.into_header(),
+                    sink,
                 }),
-                Err((sink, cause)) => {
-                    drop(sink.into_header().recycle());
+                Err((_, cause)) => {
+                    drop(sink.recycle());
                     Err(cause)
                 }
             },

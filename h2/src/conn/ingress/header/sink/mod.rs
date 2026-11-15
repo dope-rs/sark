@@ -31,8 +31,8 @@ impl<P: rules::Policy> Header<P> {
         Session::try_new(lease, kind, connect, scratch).map(|session| Self { session })
     }
 
-    pub(in crate::conn::ingress) fn hpack<A: rules::Push>(self) -> hpack::Hpack<P, A> {
-        hpack::Hpack::new(self.session)
+    pub(in crate::conn::ingress) fn hpack<A: rules::Push>(&mut self) -> hpack::Hpack<'_, P, A> {
+        hpack::Hpack::new(&mut self.session)
     }
 
     pub(in crate::conn::ingress) fn finish_block(
