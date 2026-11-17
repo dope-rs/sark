@@ -193,7 +193,7 @@ where
     }
 
     fn flush(&mut self, driver: &mut driver::Context<'_, 'd>) -> receive::Outcome {
-        use write::error::Error;
+        use write::error::Admission;
 
         let raw = match self.conn.state_mut().raw_mut() {
             Ok(raw) => raw,
@@ -223,17 +223,22 @@ where
                 };
             }
         }
-        let scratch = &mut *self.scratch;
-        match self.conn.write().try_commit(
-            driver,
-            move |state, mut prefix| -> Result<_, convert::Infallible> {
+        let admission = 'output: {
+            let scratch = &mut *self.scratch;
+            let mut native_slot = mem::MaybeUninit::uninit();
+            let mut native = match self.conn.write().try_open(driver, &mut native_slot) {
+                Ok(native) => native,
+                Err(cause) => break 'output cause,
+            };
+            let (body, end, after) = 'prepare: {
+                let (state, writer) = native.get_mut().parts();
                 let raw = match state.raw_mut() {
                     Ok(raw) => raw,
                     Err(switch::Mode::Http | switch::Mode::Switching(_)) => {
-                        return Ok(prefix.commit(None, machine::After::Idle).close_after());
+                        break 'prepare (None, machine::End::FinishSession, machine::After::Idle);
                     }
                 };
-                let (body, end, after) = match raw.transact(prefix.writer(), scratch, |send| {
+                match raw.transact(writer, scratch, |send| {
                     let (payload, end, after) = send.into_parts();
                     match payload {
                         admit::Payload::Present { output, permit } => {
@@ -261,34 +266,38 @@ where
                         receipt: (body, _, after),
                     } => (body, machine::End::FinishSession, after),
                     machine::Transaction::Rejected(never) => match never {},
-                };
-                let commit = prefix.commit(body, after);
-                Ok(match end {
-                    machine::End::Open => commit,
-                    machine::End::FinishOutput => commit.shutdown(),
-                    machine::End::FinishSession => commit.close_after(),
-                })
-            },
-        ) {
-            Ok(write::Outcome::Committed(machine::After::Idle | machine::After::Finished)) => {
-                receive::Outcome::Continue
+                }
+            };
+            let end = match end {
+                machine::End::Open => write::End::Open,
+                machine::End::FinishOutput => write::End::Shutdown,
+                machine::End::FinishSession => write::End::Close,
+            };
+            let result = match body {
+                Some(body) => write::Output::try_publish(native, body, end),
+                None => write::Output::finish(native, end),
+            };
+            if let Err(cause) = result {
+                self.conn
+                    .write()
+                    .reject(body::Failure::Mismatch(cause.into_cause()));
+                return receive::Outcome::CloseAfter;
             }
-            Ok(write::Outcome::Committed(machine::After::Turn)) => {
-                self.conn.wake_target().wake();
-                receive::Outcome::Continue
-            }
-            Ok(write::Outcome::Deferred(..)) => receive::Outcome::Continue,
-            Ok(write::Outcome::Closed) => receive::Outcome::CloseAfter,
-            Err(Error::Capacity(cause)) => {
+            return match after {
+                machine::After::Idle | machine::After::Finished => receive::Outcome::Continue,
+                machine::After::Turn => {
+                    self.conn.wake_target().wake();
+                    receive::Outcome::Continue
+                }
+            };
+        };
+        match admission {
+            Admission::Deferred(_) => receive::Outcome::Continue,
+            Admission::Closed => receive::Outcome::CloseAfter,
+            Admission::Rejected(cause) => {
                 self.conn.write().reject(body::Failure::Capacity(cause));
                 receive::Outcome::CloseAfter
             }
-            Err(Error::Mismatch(error)) => {
-                let (cause, _) = error.into_parts();
-                self.conn.write().reject(body::Failure::Mismatch(cause));
-                receive::Outcome::CloseAfter
-            }
-            Err(Error::Build(never)) => match never {},
         }
     }
 

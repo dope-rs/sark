@@ -331,8 +331,6 @@ impl codec::Codec for Codec {
 impl codec::Stateful for Codec {
     type State<'d> = State<'d>;
     type Storage<S> = Storage<S>;
-    type Outcome<'d> = Parsed<'d>;
-    type Preview<'a> = Preview<'a>;
 
     fn state<'d>(&self, budget: resident::Budget<'d>) -> State<'d> {
         State::new(budget)
@@ -357,8 +355,10 @@ impl codec::Stateful for Codec {
     fn edit<S>(storage: &mut Storage<S>) -> Edit<'_, S> {
         Edit::new(&mut storage.source)
     }
+}
 
-    fn decode<'d, S, T: Outcome, F>(
+impl Codec {
+    pub fn decode<'d, S, T: Outcome, F>(
         &self,
         storage: &mut Storage<S>,
         state: &mut State<'d>,
@@ -456,7 +456,7 @@ impl codec::Stateful for Codec {
         step
     }
 
-    fn finish<'slot, 'id, 'd, S, T: Outcome, F>(
+    pub fn finish<'slot, 'id, 'd, S, T: Outcome, F>(
         &self,
         mut owner: Owner<'slot, 'id, Storage<S>, State<'d>>,
         budget: &resident::Budget<'d>,

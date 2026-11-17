@@ -1,5 +1,5 @@
 use sark_h2::server::app;
-use std::{convert, marker};
+use std::marker;
 
 use dope::core::driver::{self, schedule::app::Work};
 use o3::buffer::resident;
@@ -16,7 +16,7 @@ use crate::{
         },
         service::{
             self,
-            handler::{self, Handler},
+            handler::Handler,
             reply::{Reply, Write},
             timers,
         },
@@ -45,7 +45,6 @@ where
     T: Copy,
 {
     type Call = H::Call;
-    type Completion = convert::Infallible;
     type State = ();
     type Storage<S> = std::ops::ControlFlow<app::Capacity, S>;
     type Target = T;
@@ -121,30 +120,11 @@ where
         false
     }
 
-    fn has_done(&self, _: O) -> bool {
-        false
-    }
-
     fn drive_tasks(&mut self, _: O, _: Work<'_, 'd>, _: &mut driver::Context<'_, 'd>) -> Progress {
         Progress::default()
     }
 
     fn wake_tasks(&mut self) {}
-
-    fn pop_done(&mut self, _: O) -> Option<(T, convert::Infallible)> {
-        None
-    }
-
-    fn publish<W: Write>(
-        &mut self,
-        _: O,
-        _: T,
-        _: &mut call::Handler<H::Call, ()>,
-        done: convert::Infallible,
-        _: &mut service::Response<'_, W>,
-    ) -> handler::RequestState {
-        match done {}
-    }
 }
 
 const _: () = assert!(size_of::<Policy<(), ()>>() == 0);

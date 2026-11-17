@@ -258,44 +258,43 @@ impl<'observe: 'd, 'd, ID: route::Identity> handler::Borrowed<'d, ID> for App<'o
             }
         };
 
-        let commit = conn.write().try_commit(driver, |state, mut prefix| {
-            let http = state;
+        let mut native_slot = std::mem::MaybeUninit::uninit();
+        let mut native = conn
+            .write()
+            .try_open(driver, &mut native_slot)
+            .expect("switch output admission");
+        let receipt = {
+            let (http, writer) = native.get_mut().parts();
             let mut disp = SwitchOne;
-            let cycle = pump::Ingress::drive(
+            pump::Ingress::drive(
                 http,
                 Pin::new(&mut disp),
                 bytes,
-                prefix.writer(),
+                writer,
                 head::Connection::KeepAlive,
-            );
-            assert!(matches!(cycle.connection, head::Connection::KeepAlive));
-            assert!(
-                matches!(&cycle.state, Ok(pump::Egress::Static { .. })),
-                "switch must publish its exact static response owner"
-            );
-            this.checks[3].set(this.checks[3].get() + 1);
-            payload::write::try_cycle(prefix, cycle, |_| ())
-        });
-        let commit = commit
-            .map_err(|error| match error {
-                write::error::Error::Capacity(cause) => Err(Err(cause)),
-                write::error::Error::Build((cause, _)) => Ok((
-                    cause.load.charge().bytes().get(),
-                    cause.load.charge().resident().get(),
-                    cause.maximum,
-                )),
-                write::error::Error::Mismatch(error) => Err(Ok(error.into_parts().0)),
-            })
-            .expect("switch response admission");
+            )
+        };
+        assert!(matches!(receipt.connection, head::Connection::KeepAlive));
         assert!(
-            matches!(&commit, write::Outcome::Committed(_)),
-            "switch response must commit"
+            matches!(&receipt.state, Ok(pump::Egress::Static { .. })),
+            "switch must publish its exact static response owner"
         );
-        if let write::Outcome::Committed(receipt) = commit {
-            assert!(
-                receipt.state.is_ok(),
-                "switch response committed its protocol state"
-            );
+        this.checks[3].set(this.checks[3].get() + 1);
+        let egress = receipt.state.expect("switch protocol state");
+        let body = payload::write::try_prepare(egress, ());
+        let result = payload::write::try_publish(native, body, write::End::Open);
+        result
+            .map_err(|cause| match cause {
+                write::body::Failure::Payload(cause) => format!("payload: {cause:?}"),
+                write::body::Failure::Capacity(cause) => format!("capacity: {cause:?}"),
+                write::body::Failure::Mismatch(cause) => format!("mismatch: {cause:?}"),
+                write::body::Failure::Reserve(cause) => format!("reserve: {cause:?}"),
+                write::body::Failure::Bound { charge, maximum } => {
+                    format!("bound: {charge:?}, {maximum}")
+                }
+            })
+            .expect("switch output");
+        {
             assert!(
                 matches!(&receipt.tail, pump::Tail::Handoff { .. }),
                 "switch response suffix"

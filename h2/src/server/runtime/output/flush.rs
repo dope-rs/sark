@@ -207,69 +207,89 @@ where
             }
             return Ok(progress);
         }
-        let outcome = conn.write().try_commit(driver, |state, mut prefix| {
-            let bound = match state
-                .protocol()
-                .transfer()
-                .bind_link::<{ write::Prefix::CAPACITY }>()
-            {
-                Ok(Some(bound)) => bound,
-                Ok(None) => return Ok(prefix.commit(None, None)),
-                Err(cause) => return Err(Error::Input(cause)),
+        let outcome = 'write: {
+            let mut native_slot = mem::MaybeUninit::uninit();
+            let mut native = match conn.write().try_open(driver, &mut native_slot) {
+                Ok(native) => native,
+                Err(error::Admission::Deferred(_) | error::Admission::Closed) => {
+                    return Ok(progress);
+                }
+                Err(error::Admission::Rejected(cause)) => {
+                    break 'write Err((Ok(Failure::Capacity(cause)), None));
+                }
             };
-            let drained = bound.is_drained();
-            let output = bound
-                .commit_with(&mut prefix, E::retain)
-                .map_err(Error::Prefix)?;
-            let (body, receipt) = match output {
-                event::Write::Buffered(_) => Ok((None, E::Receipt::default())),
-                event::Write::Owned {
-                    stream_id: stream,
-                    prefix_len: _,
-                    body,
-                } => E::admit_owned::<G>(stream, body).map(|(body, receipt)| (Some(body), receipt)),
-                event::Write::Split {
-                    write,
-                    prefix_len: _,
-                    body,
-                } => E::admit::<G>(write, body).map(|(body, receipt)| (Some(body), receipt)),
+            let prepared = 'prepare: {
+                let (state, mut prefix) = native.get_mut().parts();
+                let bound = match state
+                    .protocol()
+                    .transfer()
+                    .bind_link::<{ write::HEADER_CAPACITY }>()
+                {
+                    Ok(Some(bound)) => bound,
+                    Ok(None) => break 'prepare Ok((None, None, write::End::Open)),
+                    Err(cause) => break 'prepare Err(Error::Input(cause)),
+                };
+                let drained = bound.is_drained();
+                let output = match bound.commit_with(&mut prefix, E::retain) {
+                    Ok(output) => output,
+                    Err(cause) => break 'prepare Err(Error::Prefix(cause)),
+                };
+                let admitted = match output {
+                    event::Write::Buffered(_) => Ok((None, E::Receipt::default())),
+                    event::Write::Owned {
+                        stream_id: stream,
+                        prefix_len: _,
+                        body,
+                    } => E::admit_owned::<G>(stream, body)
+                        .map(|(body, receipt)| (Some(body), receipt)),
+                    event::Write::Split {
+                        write,
+                        prefix_len: _,
+                        body,
+                    } => E::admit::<G>(write, body).map(|(body, receipt)| (Some(body), receipt)),
+                };
+                let (body, receipt) = match admitted {
+                    Ok(output) => output,
+                    Err((cause, receipt)) => {
+                        break 'prepare Err(Error::Bound {
+                            cause,
+                            receipt: Some(receipt),
+                        });
+                    }
+                };
+                let end = match (&end, drained) {
+                    (End::Close, true) => write::End::Close,
+                    (End::Close, false) | (End::Keep, _) => write::End::Open,
+                };
+                Ok((body.map(egress::load::Value::Unchecked), Some(receipt), end))
+            };
+            let (body, receipt, end) = match prepared {
+                Ok(prepared) => prepared,
+                Err(cause) => {
+                    drop(native);
+                    break 'write Err(match cause {
+                        Error::Input(cause) => (Ok(Failure::Input(cause)), None),
+                        Error::Prefix(cause) => (Ok(Failure::Prefix(cause)), None),
+                        Error::Bound { cause, receipt } => (Err(cause.into()), receipt),
+                    });
+                }
+            };
+            let published = match body {
+                Some(body) => write::Output::try_publish(native, body, end),
+                None => write::Output::finish(native, end),
+            };
+            match published {
+                Ok(()) => Ok(receipt),
+                Err(cause) => Err((Ok(Failure::Mismatch(cause.into_cause())), receipt)),
             }
-            .map_err(|(cause, receipt)| Error::Bound {
-                cause,
-                receipt: Some(receipt),
-            })?;
-            let commit = prefix.commit(body.map(egress::load::Value::Unchecked), Some(receipt));
-            let end = match (&end, drained) {
-                (End::Close, true) => End::Close,
-                (End::Close, false) | (End::Keep, _) => End::Keep,
-            };
-            Ok(match end {
-                End::Close => commit.close_after(),
-                End::Keep => commit,
-            })
-        });
+        };
         match outcome {
-            Ok(write::Outcome::Committed(Some(receipt))) => {
+            Ok(Some(receipt)) => {
                 progress = Progress::Committed;
                 E::observe(receipt, mode, owner, owner::Change::Handoff);
             }
-            Ok(write::Outcome::Committed(None)) => return Ok(progress),
-            Ok(write::Outcome::Deferred(_) | write::Outcome::Closed) => {
-                return Ok(progress);
-            }
-            Err(cause) => {
-                let (failure, receipt) = match cause {
-                    error::Error::Capacity(cause) => (Ok(Failure::Capacity(cause)), None),
-                    error::Error::Build(Error::Input(cause)) => (Ok(Failure::Input(cause)), None),
-                    error::Error::Build(Error::Bound { cause, receipt }) => {
-                        (Err(cause.into()), receipt)
-                    }
-                    error::Error::Build(Error::Prefix(cause)) => (Ok(Failure::Prefix(cause)), None),
-                    error::Error::Mismatch(cause) => {
-                        let (cause, receipt) = cause.into_parts();
-                        (Ok(Failure::Mismatch(cause)), receipt)
-                    }
-                };
+            Ok(None) => return Ok(progress),
+            Err((failure, receipt)) => {
                 match receipt {
                     Some(receipt) => {
                         progress = Progress::Committed;

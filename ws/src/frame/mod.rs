@@ -2,7 +2,7 @@ use std::num;
 
 use o3::buffer::{
     storage,
-    write::{Sink, consume, spans},
+    write::{Init as _, Sink, consume, spans},
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

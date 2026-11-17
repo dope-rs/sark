@@ -1,6 +1,6 @@
 use std::mem;
 
-use o3::buffer::write::{Sink, SpareExt as _, Staged};
+use o3::buffer::write::{Init as _, Sink, SpareExt as _, Staged};
 
 use crate::{
     inbound::{self, ClientPeer, Prepared},

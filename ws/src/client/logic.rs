@@ -251,7 +251,6 @@ impl<'life, 'e: 'life, 'd: 'e, ID: Identity, H, M: Event<'d, H, ID>>
     where
         S: buffer::Cursor + hold::raw::Retain<'d> + buffer::raw::Consume,
     {
-        use codec::Stateful as _;
         let port = owner.root();
         let logic = owner.logic_mut();
         let active = matches!(parser.phase, protocol::Phase::Active(_));
@@ -280,7 +279,6 @@ impl<'life, 'e: 'life, 'd: 'e, ID: Identity, H, M: Event<'d, H, ID>>
     where
         S: buffer::Cursor + hold::raw::Retain<'d> + buffer::raw::Consume,
     {
-        use codec::Stateful as _;
         let port = owner.root();
         let logic = owner.logic_mut();
         let (_, parser) = input.parts();

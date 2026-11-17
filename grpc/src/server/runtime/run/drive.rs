@@ -274,14 +274,17 @@ where
                         let selected = state.work.select(X::TASKS, |lane| match lane {
                             lanes::Kind::Protocol => conn.has_event(),
                             lanes::Kind::Semantic => active.has_semantic(),
-                            lanes::Kind::Output => X::Timer::has_output(
-                                now,
-                                &state.output_deadlines,
-                                active,
-                                cursor,
-                                retries,
-                            ),
-                            lanes::Kind::Completion => X::TASKS && self.exec.has_done(owner),
+                            lanes::Kind::Output => {
+                                !X::COMPLETES
+                                    && X::Timer::has_output(
+                                        now,
+                                        &state.output_deadlines,
+                                        active,
+                                        cursor,
+                                        retries,
+                                    )
+                            }
+                            lanes::Kind::Completion => X::COMPLETES && active.has_output(),
                             lanes::Kind::Task => X::TASKS && self.exec.has_tasks(owner),
                         });
                         match selected {
@@ -297,7 +300,8 @@ where
                                     .map_err(app::Error::Application)?;
                             }
                             Some(lanes::Kind::Semantic) => {
-                                let entry = match drain.next_ready(|| state.poll_app(active)) {
+                                let entry = match drain.next_ready(|| state.poll_ready::<0>(active))
+                                {
                                     Ok(Some(stream)) => stream,
                                     Ok(None) => break,
                                     Err(drain::Empty) => {
@@ -320,16 +324,16 @@ where
                                 self.output(now, state, conn, entry);
                             }
                             Some(lanes::Kind::Completion) => {
-                                let (entry, done) =
-                                    match drain.next_ready(|| self.exec.pop_done(owner)) {
-                                        Ok(Some(done)) => done,
-                                        Ok(None) => break,
-                                        Err(drain::Empty) => {
-                                            conn.fail();
-                                            break;
-                                        }
-                                    };
-                                self.completion(state, conn, done, entry);
+                                let entry = match drain.next_ready(|| state.poll_ready::<1>(active))
+                                {
+                                    Ok(Some(entry)) => entry,
+                                    Ok(None) => break,
+                                    Err(drain::Empty) => {
+                                        conn.fail();
+                                        break;
+                                    }
+                                };
+                                self.completion(state, conn, entry);
                                 self.exec.wake_tasks();
                             }
                             Some(lanes::Kind::Task) => {
@@ -363,21 +367,20 @@ where
                 if X::TASKS && self.exec.has_tasks(owner) {
                     tasks.exhaust();
                 }
-                let done = X::TASKS && self.exec.has_done(owner);
                 let task = X::TASKS && active.has_work();
-                let output = X::Timer::has_output(
-                    now,
-                    &state.output_deadlines,
-                    active,
-                    state.work.waiting,
-                    state.work.retries,
-                );
+                let output = !X::COMPLETES
+                    && X::Timer::has_output(
+                        now,
+                        &state.output_deadlines,
+                        active,
+                        state.work.waiting,
+                        state.work.retries,
+                    );
                 conn.has_event()
                     || state.deadline().is_some_and(|at| at <= now)
                     || state.egress_released
                     || task
                     || output
-                    || done
                     || state.calls.has_runnable()
             } else {
                 let pending = conn.has_event();

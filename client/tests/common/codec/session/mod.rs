@@ -8,7 +8,7 @@ use dope::{
         session::{
             self, Blocking,
             app::drain::Ready,
-            codec::{self, Admission, Stateful as _, mode, staging::Limit, storage::Owner},
+            codec::{self, Admission, mode, staging::Limit, storage::Owner},
             policy,
             response::{Direct, Immediate},
             turns,

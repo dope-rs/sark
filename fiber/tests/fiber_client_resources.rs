@@ -109,7 +109,7 @@ fn retains_provider_state() {
                 let assembly = plan::Plan::<2>::new(
                     settings::Config::new(generics::REDIS).expect("Redis limits"),
                 )
-                .assemble::<Bundle<Tcp, Identity, Throughput>>(
+                .assemble::<Bundle<Tcp, Identity, Throughput>, _, _, _>(
                     service::Snapshot::empty(service::Revision::new(1)),
                     settings::DEFAULT_BACKOFF,
                     settings::DEFAULT_BACKOFF_MAXIMUM,

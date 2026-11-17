@@ -77,6 +77,7 @@ impl<C: Copy, O: life::Mode<C, Id>> Projection<'_, O, C> {
         }
         let cause = match event.cause {
             release::Cause::Acked => cause::Transport::Acked,
+            release::Cause::ResetAcked => return,
             release::Cause::Stopped => cause::Transport::Stopped,
             release::Cause::Reset => cause::Transport::Reset,
             release::Cause::Closed => cause::Transport::Closed,

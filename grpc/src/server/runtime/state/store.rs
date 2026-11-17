@@ -235,11 +235,11 @@ where
         self.calls.entry_at(index)
     }
 
-    pub(in crate::server::runtime) fn poll_app<'a>(
+    pub(in crate::server::runtime) fn poll_ready<'a, const PLANE: usize>(
         &mut self,
         active: &'a active::Signals,
     ) -> Option<active::Entry<'r>> {
-        self.calls.entry_at(active.pop::<0>()?.index().raw())
+        self.calls.entry_at(active.pop::<PLANE>()?.index().raw())
     }
 
     pub(in crate::server::runtime) fn discard<E: event::Evidence>(

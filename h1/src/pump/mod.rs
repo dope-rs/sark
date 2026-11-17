@@ -114,7 +114,7 @@ pub enum Egress<'d> {
 }
 
 impl<'d> Egress<'d> {
-    pub(crate) fn output(action: output::Outcome<'d>) -> (Self, head::Connection) {
+    pub fn output(action: output::Outcome<'d>) -> (Self, head::Connection) {
         match action {
             output::Outcome::Send { connection }
             | output::Outcome::SendCopied { connection, .. } => (Self::Inline, connection),

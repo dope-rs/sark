@@ -200,12 +200,15 @@ where
                         .map(crate::client::exchange::request::Kind::transition)
                 })
         });
-        codec::Stateful::decode(&protocol.codec, storage, parser, budget, limit, move |_| {
-            codec::Admission::Ready(move |parsed, parser: &mut State<'d>| {
-                let current = current.unwrap_or_else(|| pool.directory.try_current(ctx.conn_id));
-                net::Output::prepare(root, current, parsed, parser, ctx)
+        protocol
+            .codec
+            .decode(storage, parser, budget, limit, move |_| {
+                codec::Admission::Ready(move |parsed, parser: &mut State<'d>| {
+                    let current =
+                        current.unwrap_or_else(|| pool.directory.try_current(ctx.conn_id));
+                    net::Output::prepare(root, current, parsed, parser, ctx)
+                })
             })
-        })
     }
 
     fn finish<'slot, 'id, S>(
@@ -222,17 +225,19 @@ where
         S: buffer::Cursor + hold::raw::Retain<'d> + buffer::raw::Consume,
     {
         let root = self.root;
-        codec::Stateful::finish(&root.protocol().codec, input, budget, limit, move |_| {
-            codec::Admission::Ready(move |parsed, parser: &mut State<'d>| {
-                let current = root
-                    .protocol()
-                    .transport
-                    .pool
-                    .directory
-                    .try_current(ctx.conn_id);
-                net::Output::prepare(root, current, parsed, parser, ctx)
+        root.protocol()
+            .codec
+            .finish(input, budget, limit, move |_| {
+                codec::Admission::Ready(move |parsed, parser: &mut State<'d>| {
+                    let current = root
+                        .protocol()
+                        .transport
+                        .pool
+                        .directory
+                        .try_current(ctx.conn_id);
+                    net::Output::prepare(root, current, parsed, parser, ctx)
+                })
             })
-        })
     }
 }
 

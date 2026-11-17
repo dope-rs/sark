@@ -1,9 +1,11 @@
 //! Unary tasks over one exact driver-domain scheduler.
+use core::task::Poll;
+
 use dope::{
     core::driver::{self, route::KeyTag, schedule::app::Work},
     manifold::network::listener::conn::Id,
 };
-use dope_fiber::task::storage::set::{self, group};
+use dope_fiber::task::storage::set;
 use o3::buffer::resident;
 use runtime::{
     executor, policy,
@@ -17,7 +19,7 @@ use crate::server::{
     call, runtime,
     service::{
         self,
-        handler::{self, modes, unary},
+        handler::{self, unary},
         reply::Write,
         task::unary::Handler,
         timers,
@@ -53,6 +55,12 @@ where
             tasks,
         }
     }
+
+    fn signal(entry: active::Entry<'r>, status: Poll<()>) {
+        if status.is_ready() {
+            entry.output();
+        }
+    }
 }
 
 impl<'s, 'r, 'life, 'd: 'life, H> policy::Dispatch<'d, Id<'d, KeyTag<0>>>
@@ -61,13 +69,13 @@ where
     H: Handler + 'life,
 {
     type Call = ();
-    type Completion = modes::Response<H::Response>;
-    type State = Option<group::Id<'s, 'd, Domain>>;
+    type State = Option<set::Id<'s, 'd, Domain>>;
     type Storage<T> = T;
     type Target = active::Entry<'r>;
     type Timer = timers::Off;
 
     const TASKS: bool = true;
+    const COMPLETES: bool = true;
 
     fn request<W: Write>(
         &mut self,
@@ -103,9 +111,10 @@ where
                 work,
                 driver,
             },
-            |_, _| {},
+            |entry, _, status| Self::signal(entry, status),
         ) {
             Ok(start::Start::Ready(value)) => {
+                target.clear_output();
                 value.apply(&mut self.codec, output);
                 policy::RequestState::Complete
             }
@@ -121,11 +130,7 @@ where
     }
 
     fn has_tasks(&self, owner: Id<'d, KeyTag<0>>) -> bool {
-        matches!(self.tasks.work_for(owner), set::Work::Pending)
-    }
-
-    fn has_done(&self, owner: Id<'d, KeyTag<0>>) -> bool {
-        self.tasks.contains(owner)
+        self.tasks.has_work_for(owner)
     }
 
     fn drive_tasks(
@@ -134,36 +139,33 @@ where
         work: Work<'_, 'd>,
         driver: &mut driver::Context<'_, 'd>,
     ) -> Progress {
-        executor::drive_with(&mut self.tasks, owner, work, driver, |_, _| {})
+        executor::drive_with(&mut self.tasks, owner, work, driver, |entry, _, status| {
+            Self::signal(entry, status);
+        })
     }
 
     fn wake_tasks(&mut self) {
         self.tasks.wake_next();
     }
 
-    fn pop_done(
-        &mut self,
-        owner: Id<'d, KeyTag<0>>,
-    ) -> Option<(active::Entry<'r>, Self::Completion)> {
-        self.tasks
-            .pop(owner)
-            .map(|(task, output)| (task.target, output))
-    }
-
     fn publish<W: Write>(
         &mut self,
         _: Id<'d, KeyTag<0>>,
         _: active::Entry<'r>,
-        state: &mut call::Handler<(), Self::State>,
-        done: Self::Completion,
+        call: &mut call::Handler<(), Self::State>,
         output: &mut service::Response<'_, W>,
     ) -> handler::RequestState {
-        let (_, state) = state.split();
-        if state.take().is_some() {
-            done.apply(&mut self.codec, output);
-        } else {
-            output.finish_with(crate::Status::from_code(crate::Code::Internal));
+        let (_, state) = call.split();
+        if let Some(task) = state.take() {
+            match self.tasks.take(task) {
+                Ok(done) => {
+                    done.apply(&mut self.codec, output);
+                    return handler::RequestState::Complete;
+                }
+                Err(task) => *state = Some(task),
+            }
         }
+        output.finish_with(crate::Status::from_code(crate::Code::Internal));
         handler::RequestState::Complete
     }
 

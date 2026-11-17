@@ -1,5 +1,4 @@
-use dope::manifold::network::listener::conn::write;
-use o3::buffer::write::consume;
+use o3::buffer::write;
 use sark_core::life::session;
 
 use crate::conn::{event, machine::ops::state, outputs::transfer};
@@ -19,11 +18,11 @@ where
         self.write.is_drained()
     }
 
-    pub(crate) fn commit_with<T>(
+    pub(crate) fn commit_with<W: write::Sink, T>(
         self,
-        prefix: &mut write::Prefix<'_, '_>,
+        prefix: &mut W,
         evidence: impl FnOnce(crate::stream::Key, usize) -> T,
-    ) -> Result<event::Write<T, C>, consume::Error> {
+    ) -> Result<event::Write<T, C>, W::Error> {
         let Self { state, write: head } = self;
         head.commit_to(prefix, |write, tail| {
             let output = state.finish_write(write, |stream, bytes, _| evidence(stream, bytes));

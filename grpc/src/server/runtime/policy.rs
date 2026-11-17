@@ -63,7 +63,7 @@ impl Output {
             Self::Blocked => handler::OutputState::Blocked,
             Self::Pending => handler::OutputState::Pending,
             Self::Complete => handler::OutputState::Complete,
-            Self::Wake(wake::Error::Missing | wake::Error::Inactive) => {
+            Self::Wake(wake::Error::Inactive) => {
                 return Err(crate::Status::from_code(crate::Code::Cancelled));
             }
         };
@@ -103,13 +103,13 @@ where
     O: Copy + Eq + 'd,
 {
     type Call: Default;
-    type Completion;
     type State: Default;
     type Storage<T>;
     type Target: Copy;
     type Timer: state::Timing<'d>;
 
     const TASKS: bool;
+    const COMPLETES: bool = false;
     const BUFFERED: bool = true;
 
     fn start<W: Write>(
@@ -173,8 +173,6 @@ where
 
     fn has_tasks(&self, owner: O) -> bool;
 
-    fn has_done(&self, owner: O) -> bool;
-
     fn drive_tasks(
         &mut self,
         owner: O,
@@ -184,16 +182,15 @@ where
 
     fn wake_tasks(&mut self);
 
-    fn pop_done(&mut self, owner: O) -> Option<(Self::Target, Self::Completion)>;
-
     fn publish<W: Write>(
         &mut self,
-        owner: O,
-        target: Self::Target,
-        call: &mut call::Handler<Self::Call, Self::State>,
-        done: Self::Completion,
-        output: &mut service::Response<'_, W>,
-    ) -> handler::RequestState;
+        _: O,
+        _: Self::Target,
+        _: &mut call::Handler<Self::Call, Self::State>,
+        _: &mut service::Response<'_, W>,
+    ) -> handler::RequestState {
+        unreachable!("completion")
+    }
 
     fn cancel(&mut self, _: O, _: Self::Target, call: &mut call::Handler<Self::Call, Self::State>) {
         *call.split().1 = Self::State::default();

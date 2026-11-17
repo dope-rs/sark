@@ -1,4 +1,4 @@
-use std::{convert, pin};
+use std::{convert, mem, pin};
 
 use dope::core::{
     driver::{
@@ -323,37 +323,42 @@ impl<H: Sink> App<H> {
         let limit = self.limit;
         let user = &self.user;
         let temp = &mut self.temp;
-        let result = conn.write().try_prefix(driver, |state, mut prefix| {
-            {
-                let mut writer = prefix.writer();
-                let mut split = match writer.try_split(0, writer.remaining()) {
-                    Ok(split) => split,
-                    Err(_) => unreachable!("prefix"),
-                };
-                let mut out = Output::new(split.body());
-                if let Some((opening, accept)) = accept {
-                    state.phase = match opening::upgrade(user, opening, &mut out.response, accept) {
-                        Ok(phase) => phase,
-                        Err(error) => {
-                            user.failed(server::Error::Capacity(error));
-                            Phase::Closed
-                        }
-                    };
+        let result = 'write: {
+            let mut native_slot = mem::MaybeUninit::uninit();
+            let mut native = match conn.write().try_prefix(driver, &mut native_slot) {
+                Ok(native) => native,
+                Err(cause) => break 'write Err(cause),
+            };
+            let end = {
+                let (state, mut writer) = native.get_mut().parts();
+                {
+                    let mut staged = writer.stage();
+                    let mut out = Output::new(staged.body());
+                    if let Some((opening, accept)) = accept {
+                        state.phase =
+                            match opening::upgrade(user, opening, &mut out.response, accept) {
+                                Ok(phase) => phase,
+                                Err(error) => {
+                                    user.failed(server::Error::Capacity(error));
+                                    Phase::Closed
+                                }
+                            };
+                    }
+                    if state.phase == Phase::Active {
+                        state.phase = Frames::new(user, limit).chunk(temp, state, chunk, &mut out);
+                    }
+                    if out.finish(state, user) {
+                        staged.commit();
+                    }
                 }
-                if state.phase == Phase::Active {
-                    state.phase = Frames::new(user, limit).chunk(temp, state, chunk, &mut out);
+                if state.phase == Phase::Closed && state.pending.is_none() {
+                    write::End::Close
+                } else {
+                    write::End::Open
                 }
-                if out.finish(state, &self.user) && split.try_commit().is_err() {
-                    unreachable!("prefix");
-                }
-            }
-            let commit = prefix.commit(None, ());
-            if state.phase == Phase::Closed && state.pending.is_none() {
-                commit.close_after()
-            } else {
-                commit
-            }
-        });
+            };
+            Ok(write::Output::finish(native, end))
+        };
         match Self::finish(conn, result) {
             Commit::Committed => match Self::send_pending(conn, driver) {
                 Commit::Committed | Commit::Deferred => Commit::Committed,
@@ -368,14 +373,22 @@ impl<H: Sink> App<H> {
         conn: &mut Ctx<'_, '_, '_, '_, '_, 'd, ID>,
         driver: &mut driver::Context<'_, 'd>,
     ) -> Commit {
-        let result = conn.write().try_prefix(driver, |state, mut prefix| {
-            let mut out = server::Response::new(prefix.writer());
-            if let Err(error) = out.put_raw(server::Response::REJECTION) {
-                self.user.failed(server::Error::Capacity(error));
+        let result = 'write: {
+            let mut native_slot = mem::MaybeUninit::uninit();
+            let mut native = match conn.write().try_prefix(driver, &mut native_slot) {
+                Ok(native) => native,
+                Err(cause) => break 'write Err(cause),
+            };
+            {
+                let (state, writer) = native.get_mut().parts();
+                let mut out = server::Response::new(writer);
+                if let Err(error) = out.put_raw(server::Response::REJECTION) {
+                    self.user.failed(server::Error::Capacity(error));
+                }
+                state.phase = Phase::Closed;
             }
-            state.phase = Phase::Closed;
-            prefix.commit(None, ()).close_after()
-        });
+            Ok(write::Output::finish(native, write::End::Close))
+        };
         Self::finish(conn, result)
     }
 
@@ -392,33 +405,37 @@ impl<H: Sink> App<H> {
             return;
         }
         let opening = matches!(conn.state().phase, Phase::Handshake | Phase::Opening);
-        let result = conn.write().try_prefix(driver, |state, mut prefix| {
-            {
-                let mut writer = prefix.writer();
-                let mut split = match writer.try_split(0, writer.remaining()) {
-                    Ok(split) => split,
-                    Err(_) => unreachable!("prefix"),
-                };
-                let mut out = Output::new(split.body());
-                if state.phase == Phase::Opening
-                    && let Err(error) =
-                        opening::drive(&self.path, state, &mut out.response, &self.user)
+        let result = 'write: {
+            let mut native_slot = mem::MaybeUninit::uninit();
+            let mut native = match conn.write().try_prefix(driver, &mut native_slot) {
+                Ok(native) => native,
+                Err(cause) => break 'write Err(cause),
+            };
+            let end = {
+                let (state, mut writer) = native.get_mut().parts();
                 {
-                    self.user.failed(server::Error::Capacity(error));
-                    state.phase = Phase::Closed;
+                    let mut staged = writer.stage();
+                    let mut out = Output::new(staged.body());
+                    if state.phase == Phase::Opening
+                        && let Err(error) =
+                            opening::drive(&self.path, state, &mut out.response, &self.user)
+                    {
+                        self.user.failed(server::Error::Capacity(error));
+                        state.phase = Phase::Closed;
+                    }
+                    Frames::new(&self.user, self.limit).pump(state, &mut out);
+                    if out.finish(state, &self.user) {
+                        staged.commit();
+                    }
                 }
-                Frames::new(&self.user, self.limit).pump(state, &mut out);
-                if out.finish(state, &self.user) && split.try_commit().is_err() {
-                    unreachable!("prefix");
+                if state.phase == Phase::Closed && state.pending.is_none() {
+                    write::End::Close
+                } else {
+                    write::End::Open
                 }
-            }
-            let commit = prefix.commit(None, ());
-            if state.phase == Phase::Closed && state.pending.is_none() {
-                commit.close_after()
-            } else {
-                commit
-            }
-        });
+            };
+            Ok(write::Output::finish(native, end))
+        };
         let result = Self::finish(conn, result);
         if opening && !matches!(conn.state().phase, Phase::Handshake | Phase::Opening) {
             conn.deadline().cancel();
@@ -430,18 +447,14 @@ impl<H: Sink> App<H> {
 
     fn finish<'d, ID: Identity>(
         conn: &mut Ctx<'_, '_, '_, '_, '_, 'd, ID>,
-        result: Result<write::Outcome<()>, error::Error<storage::Shared, (), convert::Infallible>>,
+        result: Result<Result<(), error::Mismatch<storage::Shared>>, error::Admission>,
     ) -> Commit {
         let cause = match result {
-            Ok(write::Outcome::Committed(())) => return Commit::Committed,
-            Ok(write::Outcome::Deferred(_)) => return Commit::Deferred,
-            Ok(write::Outcome::Closed) => None,
-            Err(error::Error::Capacity(error)) => Some(body::Failure::Capacity(error)),
-            Err(error::Error::Mismatch(error)) => {
-                let (error, ()) = error.into_parts();
-                Some(body::Failure::Mismatch(error))
-            }
-            Err(error::Error::Build(error)) => match error {},
+            Ok(Ok(())) => return Commit::Committed,
+            Err(error::Admission::Deferred(_)) => return Commit::Deferred,
+            Err(error::Admission::Closed) => None,
+            Err(error::Admission::Rejected(cause)) => Some(body::Failure::Capacity(cause)),
+            Ok(Err(cause)) => Some(body::Failure::Mismatch(cause.into_cause())),
         };
         conn.state_mut().phase = Phase::Closed;
         if let Some(cause) = cause {

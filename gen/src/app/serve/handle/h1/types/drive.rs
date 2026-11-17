@@ -39,6 +39,51 @@ pub(super) fn methods(
     let entry = syn::Ident::new("entry", proc_macro2::Span::call_site());
     let remove = flat::remove(spec, ctx.exec, false, &entry, quote!(quotas));
     let output = spec.state.ty();
+    let settle = quote! {
+        if let #h1::wire::output::Outcome::Failed(error) = &outcome {
+            #core::life::Mode::diagnostic(life, error);
+        }
+        let held = outcome.retention();
+        let charge = match held {
+            #h1::wire::output::Retention::Response(owner)
+            | #h1::wire::output::Retention::Linked(owner) => owner.charge,
+            #h1::wire::output::Retention::Rejected => #ns::o3::buffer::hold::Charge::default(),
+        };
+        let done = <<#mode as #core::life::Mode<_, u64>>::Retention as turn::Mode>::complete(held);
+        if let Some(sink) = #core::life::Mode::observer(life)
+            && let #h1::wire::output::Copy::Copied(copy) = outcome.copy()
+        {
+            #core::life::Observer::observe(sink, #core::life::Event::ResponseBodyCopied {
+                exchange, read: copy.read, written: copy.written, cause: copy.cause,
+            });
+        }
+        let (egress, intent) = #h1::pump::Egress::output(outcome);
+        state.settle(intent);
+        let tag = if charge.resident_bytes == 0 {
+            <<#mode as #core::life::sequence::Mode<_>>::TransportTag as Default>::default()
+        } else {
+            #core::life::sequence::Mode::tag(life, exchange, charge)
+        };
+        let body = #h1::server::payload::write::try_prepare(egress, tag);
+        let end = match intent {
+            #h1::wire::head::Connection::KeepAlive => write::End::Open,
+            #h1::wire::head::Connection::Close => write::End::Close,
+        };
+    };
+    let send = quote! {
+        let sent = #h1::server::payload::write::try_publish(native, body, end);
+    };
+    let complete = quote! {
+        #send
+        let done = match sent {
+            Ok(()) => done,
+            Err(cause) => {
+                conn.write().reject(cause);
+                turn::Completion::Rejected
+            }
+        };
+        return turn::Turn::retired(ready, done);
+    };
     let heads = ctx.exec.fibers().iter().map(|(task, fiber)| {
         let head = task.phase("Head");
         let body = task.phase("Body");
@@ -48,12 +93,11 @@ pub(super) fn methods(
         let emit = quote! {
             let deferred = #h1::pump::Ingress::deferred(state);
             let (outcome, stream) = {
-                let mut write = prefix.writer();
-                let mut staged = write.try_split(0, write.remaining()).unwrap_or_else(|_| unreachable!("output"));
+                let mut staged = writer.stage();
                 let result = #h1::route::task::Egress::new(staged.body(), &date, deferred, request)
                     .finish::<#route, #output>(output);
                 if !matches!(&result.0, #h1::wire::output::Outcome::Close(_) | #h1::wire::output::Outcome::Failed(_)) {
-                    staged.try_commit().unwrap_or_else(|_| unreachable!("output"));
+                    staged.commit();
                 }
                 result
             };
@@ -61,15 +105,27 @@ pub(super) fn methods(
         let finish = if fiber.stream {
             quote! {
                 #emit
-                let result = #h1::server::payload::write::try_outcome(prefix, outcome, life, exchange, |intent, done| {
-                    state.settle(intent);
-                    stream.is_none().then_some(done)
-                });
-                match stream {
-                    Some(stream) => value.set(#phase::#body(stream)),
-                    None => { member.discard(); #credit }
+                #settle
+                if let Some(stream) = stream {
+                    value.set(#phase::#body(stream));
+                    #send
+                    return match sent {
+                        Ok(()) => {
+                            conn.state_mut().async_state.insert(Running::Body(task));
+                            conn.wake_target().wake();
+                            turn::Turn::Streaming { ready }
+                        }
+                        Err(cause) => {
+                            member.discard();
+                            #credit
+                            conn.write().reject(cause);
+                            turn::Turn::retired(ready, turn::Completion::Rejected)
+                        }
+                    };
                 }
-                result
+                member.discard();
+                #credit
+                #complete
             }
         } else {
             quote! {
@@ -77,10 +133,8 @@ pub(super) fn methods(
                 #credit
                 #emit
                 let _ = stream;
-                #h1::server::payload::write::try_outcome(prefix, outcome, life, exchange, |intent, done| {
-                    state.settle(intent);
-                    Some(done)
-                })
+                #settle
+                #complete
             }
         };
         quote! {
@@ -176,44 +230,34 @@ pub(super) fn methods(
                         _ => unreachable!("phase"),
                     },
                 };
-                let (task, mut member) = entry.into_parts();
                 let date = date.load();
-                let result = conn.write().try_commit(driver, |state, mut prefix| {
+                let admission = 'write: {
+                    let mut native_slot = ::core::mem::MaybeUninit::uninit();
+                    let mut native = match conn.write().try_open(driver, &mut native_slot) {
+                        Ok(native) => native,
+                        Err(cause) => break 'write cause,
+                    };
+                    let (task, mut member) = entry.into_parts();
+                    let (state, mut writer) = native.get_mut().parts();
                     let mut value = member.value();
                     match value.as_mut().project() { #(#heads,)* _ => unreachable!("phase") }
-                });
-                let failure = match result {
-                    Ok(write::Outcome::Committed(None)) => {
-                        conn.state_mut().async_state.insert(Running::Body(task));
-                        conn.wake_target().wake();
-                        return turn::Turn::Streaming { ready };
-                    }
-                    Ok(write::Outcome::Committed(Some(done))) => return turn::Turn::retired(ready, done),
-                    Ok(write::Outcome::Deferred(_)) => {
-                        conn.state_mut().async_state.insert(Running::Head(request, task));
+                };
+                let failure = match admission {
+                    write::error::Admission::Deferred(_) => {
+                        conn.state_mut().async_state.insert(Running::Head(request, entry.into_id()));
                         return match ready {
                             turn::Readiness::NewlyReady => turn::Turn::ReadyDeferred,
                             turn::Readiness::Staged => turn::Turn::StagedDeferred,
                         };
                     }
-                    Ok(write::Outcome::Closed) => None,
-                    Err(cause) => match #h1::server::payload::write::reject(cause) {
-                        #h1::server::payload::write::Failure::Capacity(cause) => Some(body::Failure::Capacity(cause)),
-                        #h1::server::payload::write::Failure::Rejected { cause, receipt: Some(_) } => {
-                            conn.write().reject(cause);
-                            return turn::Turn::retired(ready, turn::Completion::Rejected);
-                        }
-                        #h1::server::payload::write::Failure::Rejected { cause, receipt: None } => Some(cause),
-                    }
+                    write::error::Admission::Closed => None,
+                    write::error::Admission::Rejected(cause) => Some(body::Failure::Capacity(cause)),
                 };
-                let removed = match tasks.entry(task) {
-                    Ok(mut entry) => { #remove true }
-                    Err(_) => false,
-                };
+                let mut entry = entry;
+                #remove
                 if let Some(cause) = failure { conn.write().reject(cause); }
                 else { Self::__release(conn); }
-                if removed { turn::Turn::retired(ready, turn::Completion::Rejected) }
-                else { conn.close_after(); turn::Turn::ConnectionCancelled }
+                turn::Turn::retired(ready, turn::Completion::Rejected)
         }
     };
     quote! {

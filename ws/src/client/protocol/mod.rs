@@ -299,8 +299,6 @@ impl Codec {
 impl codec::Stateful for Codec {
     type State<'d> = State;
     type Storage<S> = Storage<S>;
-    type Outcome<'d> = Head<'d>;
-    type Preview<'a> = Option<inbound::Reply<'a>>;
 
     fn state<'d>(&self, _: resident::Budget<'d>) -> Self::State<'d> {
         State::default()
@@ -329,14 +327,16 @@ impl codec::Stateful for Codec {
         storage.progress = Progress::new(state);
         Self::edit(storage)
     }
+}
 
-    fn decode<'d, S, T, F>(
+impl Codec {
+    pub fn decode<'d, S, T, F>(
         &self,
         storage: &mut Storage<S>,
         state: &mut State,
         budget: &resident::Budget<'d>,
         limit: Limit,
-        admit: impl FnOnce(Result<Self::Preview<'_>, &Fault>) -> codec::Admission<F>,
+        admit: impl FnOnce(Result<Option<inbound::Reply<'_>>, &Fault>) -> codec::Admission<F>,
     ) -> codec::Step<T>
     where
         S: buffer::Cursor + hold::raw::Retain<'d> + buffer::raw::Consume,
@@ -443,12 +443,12 @@ impl codec::Stateful for Codec {
         step
     }
 
-    fn finish<'slot, 'id, 'd, S, T, F>(
+    pub fn finish<'slot, 'id, 'd, S, T, F>(
         &self,
         mut input: storage::Owner<'slot, 'id, Storage<S>, State>,
         _: &resident::Budget<'d>,
         _: Limit,
-        admit: impl FnOnce(Result<Self::Preview<'_>, &Fault>) -> codec::Admission<F>,
+        admit: impl FnOnce(Result<Option<inbound::Reply<'_>>, &Fault>) -> codec::Admission<F>,
     ) -> (
         storage::Owner<'slot, 'id, Storage<S>, State>,
         Result<codec::Finish<T>, T>,

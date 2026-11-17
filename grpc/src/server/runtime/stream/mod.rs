@@ -1,10 +1,9 @@
 //! Streaming tasks over one exact driver-domain scheduler.
-use core::convert::Infallible;
 use dope::{
     core::driver::{self, route::KeyTag, schedule::app::Work},
     manifold::network::listener::conn::Id,
 };
-use dope_fiber::task::storage::set::{self, group};
+use dope_fiber::task::storage::set;
 use o3::buffer::resident;
 use runtime::{
     executor, policy,
@@ -22,7 +21,7 @@ use crate::{
         call::{Handler, Opened},
         runtime,
         service::{
-            self, handler,
+            self,
             reply::{Reply, Write},
             task::stream::{self, exchange},
             timers,
@@ -82,8 +81,7 @@ where
     H: stream::Handler + 'life,
 {
     type Call = ();
-    type Completion = Infallible;
-    type State = Option<group::Id<'s, 'd, Domain>>;
+    type State = Option<set::Id<'s, 'd, Domain>>;
     type Storage<T> = T;
     type Target = active::Entry<'r>;
     type Timer = timers::Off;
@@ -129,7 +127,7 @@ where
                 work,
                 driver,
             },
-            |entry, fiber| Self::signal(entry, fiber.exchange().take_events()),
+            |entry, fiber, _| Self::signal(entry, fiber.exchange().take_events()),
         ) {
             Ok(start::Start::Ready(never)) => match never {},
             Ok(start::Start::Pending(task)) => task,
@@ -177,7 +175,7 @@ where
                 return policy::Rearm::Stop;
             }
         }
-        if let Err(wake::Error::Missing | wake::Error::Inactive) = self.tasks.try_wake(task) {
+        if let Err(wake::Error::Inactive) = self.tasks.try_wake(task) {
             reply.finish_with(crate::Status::from_code(crate::Code::Cancelled));
         }
         policy::Rearm::Stop
@@ -211,7 +209,7 @@ where
                 return;
             }
         }
-        if let Err(wake::Error::Missing | wake::Error::Inactive) = self.tasks.try_wake(task) {
+        if let Err(wake::Error::Inactive) = self.tasks.try_wake(task) {
             reply.finish_with(crate::Status::from_code(crate::Code::Cancelled));
         }
     }
@@ -279,11 +277,7 @@ where
     }
 
     fn has_tasks(&self, owner: Id<'d, KeyTag<0>>) -> bool {
-        matches!(self.tasks.work_for(owner), set::Work::Pending)
-    }
-
-    fn has_done(&self, _: Id<'d, KeyTag<0>>) -> bool {
-        false
+        self.tasks.has_work_for(owner)
     }
 
     fn drive_tasks(
@@ -292,28 +286,13 @@ where
         work: Work<'_, 'd>,
         driver: &mut driver::Context<'_, 'd>,
     ) -> Progress {
-        executor::drive_with(&mut self.tasks, owner, work, driver, |entry, fiber| {
+        executor::drive_with(&mut self.tasks, owner, work, driver, |entry, fiber, _| {
             Self::signal(entry, fiber.exchange().take_events());
         })
     }
 
     fn wake_tasks(&mut self) {
         self.tasks.wake_next();
-    }
-
-    fn pop_done(&mut self, _: Id<'d, KeyTag<0>>) -> Option<(active::Entry<'r>, Self::Completion)> {
-        None
-    }
-
-    fn publish<W: Write>(
-        &mut self,
-        _: Id<'d, KeyTag<0>>,
-        _: active::Entry<'r>,
-        _: &mut Handler<(), Self::State>,
-        done: Self::Completion,
-        _: &mut service::Response<'_, W>,
-    ) -> handler::RequestState {
-        match done {}
     }
 
     fn cancel(

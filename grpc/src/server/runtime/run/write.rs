@@ -151,7 +151,6 @@ where
         &mut self,
         state: &mut Store<'r, 'd, Handler<X::Call, X::State>, X::Timer>,
         conn: &mut Connection<'d, E>,
-        done: X::Completion,
         entry: active::Entry<'r>,
     ) where
         F: FnMut(&mut H, Key, egress::Error<conn::Error>),
@@ -164,9 +163,7 @@ where
                 .handler_mut(key)
                 .ok_or_else(|| crate::Status::new(crate::Code::Internal, Reason::CallState))?;
             let mut output = service::Response::with_writer(draft);
-            let phase = self
-                .exec
-                .publish(self.owner, entry, call, done, &mut output);
+            let phase = self.exec.publish(self.owner, entry, call, &mut output);
             match phase {
                 handler::RequestState::Complete => state.calls.response(output)?,
                 handler::RequestState::Produce => state.calls.open(output)?,

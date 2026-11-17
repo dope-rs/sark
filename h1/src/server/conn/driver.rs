@@ -1,4 +1,4 @@
-use std::pin;
+use std::{mem, pin};
 
 use conn::write::{self, body};
 use data::compose;
@@ -7,18 +7,12 @@ use dope::{
     manifold::network::listener::conn,
     net::{link::egress::data, wire},
 };
+use o3::buffer::hold;
 use wire::receive::discard;
 
 use crate::{
     pump,
-    server::{
-        conn::router,
-        deadline,
-        payload::{
-            self,
-            write::{CycleCommit, Failure, Wake},
-        },
-    },
+    server::{conn::router, deadline, payload},
     session, switch,
 };
 
@@ -170,74 +164,100 @@ where
     };
 
     let prior = pump::Ingress::deferred(conn.state());
-    let commit = conn.write().try_commit(driver, |state, mut prefix| {
-        let cycle = pump::Ingress::drive(state, routes.as_mut(), bytes, prefix.writer(), prior);
-        payload::write::try_cycle(prefix, cycle, |charge| {
-            routes.as_mut().response_tag(&mut state.async_state, charge)
-        })
-    });
-    let CycleCommit {
-        progress,
-        discard_remaining: left,
-        state,
-        transport: sent,
-        wake,
-        tail,
-    } = match commit {
-        Ok(write::Outcome::Committed(done)) => done,
-        Ok(write::Outcome::Deferred(
-            write::Deferred::Turn | write::Deferred::Capacity | write::Deferred::OrderedDrain,
-        )) => {
+    let admission = 'output: {
+        let mut native_slot = mem::MaybeUninit::uninit();
+        let mut native = match conn.write().try_open(driver, &mut native_slot) {
+            Ok(native) => native,
+            Err(cause) => break 'output cause,
+        };
+        let (cycle, tag, sent) = {
+            let (state, writer) = native.get_mut().parts();
+            let cycle = pump::Ingress::drive(state, routes.as_mut(), bytes, writer, prior);
+            let charge = match cycle.state.as_ref() {
+                Ok(pump::Egress::Shared { body }) => {
+                    crate::wire::output::Owner::shared(body).charge
+                }
+                Ok(pump::Egress::Frozen { body }) => {
+                    crate::wire::output::Owner::shared(body).charge
+                }
+                Ok(pump::Egress::Segmented { body }) => body.charge(),
+                _ => hold::Charge::default(),
+            };
+            let (tag, sent) = if charge.resident_bytes == 0 {
+                (H::TransportTag::default(), None)
+            } else {
+                let tag = routes.as_mut().response_tag(&mut state.async_state, charge);
+                (tag, Some(tag))
+            };
+            (cycle, tag, sent)
+        };
+        let pump::Cycle {
+            progress,
+            discard_remaining: left,
+            state,
+            connection,
+            tail,
+        } = cycle;
+        let (egress, state) = match state {
+            Ok(egress) => (egress, Ok(())),
+            Err(cause) => (pump::Egress::None, Err(cause)),
+        };
+        let wake = matches!(egress, pump::Egress::Wake);
+        let body = payload::write::try_prepare(egress, tag);
+        let end = match connection {
+            crate::wire::head::Connection::KeepAlive => write::End::Open,
+            crate::wire::head::Connection::Close => write::End::Close,
+        };
+        if let Err(cause) = payload::write::try_publish(native, body, end) {
+            if let Some(tag) = sent {
+                routes
+                    .as_mut()
+                    .cancel(&mut conn.state_mut().async_state, tag);
+            }
+            conn.write().reject(cause);
+            return Drive::new(Flow::Closed);
+        }
+        if wake {
+            conn.wake_target().wake();
+        }
+        if let Err(error) = state {
+            routes.as_mut().failure(&crate::wire::Failure::Pump(error));
+            conn.close_after();
+            return Drive::new(Flow::Closed);
+        }
+        if let Some(tag) = sent {
+            routes
+                .as_mut()
+                .accept(&mut conn.state_mut().async_state, tag);
+        }
+        if let Some(prefix) = discard::Prefix::try_new(left)
+            && matches!(conn.try_discard(prefix), discard::Start::Started)
+        {
+            pump::Ingress::discard(conn.state_mut());
+        }
+        return Drive {
+            flow: Flow::Continue,
+            tail,
+            progress,
+        };
+    };
+    match admission {
+        write::error::Admission::Deferred(_) => {
             let held = pump::Ingress::retain(conn.state_mut(), bytes);
-            return match held.state {
+            match held.state {
                 Ok(()) => Drive::new(Flow::Continue).with_input(held.progress),
                 Err(error) => {
                     routes.as_mut().failure(&crate::wire::Failure::Pump(error));
                     conn.close_after();
                     Drive::new(Flow::Closed).with_input(held.progress)
                 }
-            };
-        }
-        Ok(write::Outcome::Closed) => return Drive::new(Flow::Closed),
-        Err(cause) => {
-            let (receipt, failure) = match payload::write::reject(cause) {
-                Failure::Capacity(cause) => (None, body::Failure::Capacity(cause)),
-                Failure::Rejected { cause, receipt } => (Some(receipt), cause),
-            };
-            if let Some(receipt) = receipt
-                && let Some(tag) = receipt.transport
-            {
-                routes
-                    .as_mut()
-                    .cancel(&mut conn.state_mut().async_state, tag);
             }
-            conn.write().reject(failure);
-            return Drive::new(Flow::Closed);
         }
-    };
-    match wake {
-        Wake::None => {}
-        Wake::Pending => conn.wake_target().wake(),
-    }
-    if let Err(error) = state {
-        routes.as_mut().failure(&crate::wire::Failure::Pump(error));
-        conn.close_after();
-        return Drive::new(Flow::Closed);
-    }
-    if let Some(tag) = sent {
-        routes
-            .as_mut()
-            .accept(&mut conn.state_mut().async_state, tag);
-    }
-    if let Some(prefix) = discard::Prefix::try_new(left)
-        && matches!(conn.try_discard(prefix), discard::Start::Started)
-    {
-        pump::Ingress::discard(conn.state_mut());
-    }
-    Drive {
-        flow: Flow::Continue,
-        tail,
-        progress,
+        write::error::Admission::Closed => Drive::new(Flow::Closed),
+        write::error::Admission::Rejected(cause) => {
+            conn.write().reject(body::Failure::Capacity(cause));
+            Drive::new(Flow::Closed)
+        }
     }
 }
 

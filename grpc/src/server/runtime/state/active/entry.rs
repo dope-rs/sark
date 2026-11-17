@@ -30,6 +30,10 @@ impl<'a> Entry<'a> {
         self.row.set(set::Id::at::<1>());
     }
 
+    pub(in crate::server) fn clear_output(self) {
+        self.row.clear(set::Id::at::<1>());
+    }
+
     pub(in crate::server) fn block(self) {
         self.row.clear(set::Id::at::<1>());
         self.row.set(set::Id::at::<2>());
