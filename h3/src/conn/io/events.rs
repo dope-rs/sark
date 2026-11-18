@@ -76,10 +76,11 @@ where
             return Err(error);
         }
         let feedback = conn.session.qpack_decoder;
-        let Some(taken) = conn.queues.take(&mut conn.qpack.feedback, feedback) else {
+        let Some(front) = conn.queues.front(&mut conn.qpack.feedback, feedback) else {
             return Ok(None);
         };
-        let (write, done) = taken.with(|write, prepared| prepared.finish(write));
+        let done = front.completion();
+        let write = front.into_output();
         if done.is_feedback() {
             Self::new(conn).resume()?;
         }

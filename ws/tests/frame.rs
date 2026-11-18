@@ -101,21 +101,14 @@ fn outputs_match() {
     let data = b"causal-control-causal-control-causal-control!";
     let mask = [0x11, 0x22, 0x33, 0x44];
     let plan = frame::Plan::new(0x9, true, data.len(), true).expect("wire length");
-    let mut direct = vec![0xa5; plan.wire_len() + 3];
-    assert_eq!(
-        plan.bind(data, Some(mask))
-            .expect("matching payload and mask")
-            .bind(&mut direct)
-            .expect("roomy destination")
-            .encode(),
-        plan.wire_len()
-    );
-
-    let owned = plan
+    let frame = plan
         .bind(data, Some(mask))
-        .expect("matching payload and mask")
-        .try_owned()
-        .expect("exact owned frame");
+        .expect("matching payload and mask");
+    let mut direct = vec![0xa5; plan.wire_len() + 3];
+    let written = frame.bind(&mut direct).expect("roomy destination").encode();
+    assert_eq!(written, plan.wire_len());
+
+    let owned = frame.try_owned().expect("exact owned frame");
     assert_eq!(owned.as_ref(), &direct[..plan.wire_len()]);
     assert_eq!(&direct[plan.wire_len()..], &[0xa5; 3]);
     assert_eq!(
@@ -162,12 +155,22 @@ fn bind_rejects_drift() {
 
 #[test]
 fn owned_masked_extended() {
-    let data = vec![0x5a; 65_537];
-    let plan = frame::Plan::new(0x2, true, data.len(), true).expect("admitted");
-    let frame = plan.bind(&data, Some([1, 2, 3, 4])).expect("admitted");
-    let mut direct = vec![0; plan.wire_len()];
-    frame.bind(&mut direct).expect("admitted").encode();
-    let owned = frame.try_owned().expect("admitted");
-    assert_eq!(owned.as_ref(), direct);
-    assert_eq!(owned.resident(), plan.wire_len());
+    let cases: &[(usize, &[u8])] = &[
+        (0, &[0x82, 0x80, 1, 2, 3, 4]),
+        (126, &[0x82, 0xfe, 0, 126, 1, 2, 3, 4]),
+        (65_537, &[0x82, 0xff, 0, 0, 0, 0, 0, 1, 0, 1, 1, 2, 3, 4]),
+    ];
+    for &(len, header) in cases {
+        let data = vec![0x5a; len];
+        let plan = frame::Plan::new(0x2, true, data.len(), true).expect("admitted");
+        let frame = plan.bind(&data, Some([1, 2, 3, 4])).expect("admitted");
+        let mut direct = vec![0xa5; plan.wire_len() + 4];
+        frame.bind(&mut direct[1..]).expect("admitted").encode();
+        let owned = frame.try_owned().expect("admitted");
+        assert_eq!(direct[0], 0xa5);
+        assert_eq!(&direct[1..1 + header.len()], header);
+        assert_eq!(&direct[1 + plan.wire_len()..], &[0xa5; 3]);
+        assert_eq!(owned.as_ref(), &direct[1..1 + plan.wire_len()]);
+        assert_eq!(owned.resident(), plan.wire_len());
+    }
 }

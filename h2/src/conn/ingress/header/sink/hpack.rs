@@ -53,9 +53,6 @@ impl<P: rules::Policy, A: rules::Push> sink::Direct for Hpack<'_, P, A> {
 }
 
 impl<P: rules::Policy, A: rules::Push> sink::Store for Hpack<'_, P, A> {
-    type Rule = ();
-    type Completion = ();
-
     fn validate(&mut self, value: block::Validation) -> Result<(), Self::Error> {
         self.session.validate(value);
         Ok(())
@@ -65,41 +62,22 @@ impl<P: rules::Policy, A: rules::Push> sink::Store for Hpack<'_, P, A> {
         self,
         name: Option<block::Named<'_>>,
         indexing: field::Indexing,
-    ) -> sink::Output<Self, sink::Begin<Self::Rule, Self::Completion>> {
-        let start = match self.session.begin(name, indexing) {
-            Ok(start) => start,
-            Err(cause) => return Err(self.failed(cause)),
-        };
-        Ok((
-            self,
-            match start {
-                Start::Skip => sink::Begin::Skip,
-                Start::Buffered(rule) => sink::Begin::Buffered(rule),
-                Start::Direct(done) | Start::Scratch(done) => sink::Begin::Direct(done),
-            },
-        ))
+    ) -> sink::Output<Self, Start<(), ()>> {
+        match self.session.begin(name, indexing) {
+            Ok(start) => Ok((self, start)),
+            Err(cause) => Err(self.failed(cause)),
+        }
     }
 
-    fn indexed(
-        self,
-        name: Option<block::Named<'_>>,
-    ) -> sink::Output<Self, sink::Indexed<Self::Rule>> {
-        let indexed = match self.session.indexed(name) {
-            Ok(indexed) => indexed,
-            Err(cause) => return Err(self.failed(cause)),
-        };
-        Ok((
-            self,
-            match indexed {
-                Indexed::Skip => sink::Indexed::Skip,
-                Indexed::Buffered(rule) => sink::Indexed::Buffered(rule),
-            },
-        ))
+    fn indexed(self, name: Option<block::Named<'_>>) -> sink::Output<Self, Indexed<()>> {
+        match self.session.indexed(name) {
+            Ok(indexed) => Ok((self, indexed)),
+            Err(cause) => Err(self.failed(cause)),
+        }
     }
 
     fn field(
         self,
-        (): Self::Rule,
         value: block::Valued<'_>,
         indexing: field::Indexing,
         name: block::Named<'_>,
@@ -110,7 +88,7 @@ impl<P: rules::Policy, A: rules::Push> sink::Store for Hpack<'_, P, A> {
         }
     }
 
-    fn direct(self, (): Self::Completion) -> Result<Self, (Self, Self::Error)> {
+    fn direct(self) -> Result<Self, (Self, Self::Error)> {
         match self.session.direct::<A>() {
             Ok(()) => Ok(self),
             Err(cause) => Err(self.failed(cause)),

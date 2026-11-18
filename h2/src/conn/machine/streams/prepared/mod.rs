@@ -32,7 +32,6 @@ pub(super) struct Prepared<'a, C: session::Storage, M: Mode, S> {
 }
 
 struct Commit<'a, M: Mode> {
-    length: numbers::Length,
     next_state: stream::State,
     state: &'a mut stream::State,
     debit: flow::Debit<'a>,
@@ -85,10 +84,11 @@ impl<C: session::Storage> Source for C {
 
 impl Commit<'_, modes::Buffered> {
     fn commit(self) -> Sent {
+        let length = self.debit.length();
         self.debit.commit();
         *self.state = self.next_state;
         Sent {
-            length: self.length,
+            length,
             state: self.next_state,
         }
     }
@@ -96,11 +96,12 @@ impl Commit<'_, modes::Buffered> {
 
 impl Commit<'_, modes::Retained> {
     fn commit(self) -> (Sent, flow::Reserved) {
+        let length = self.debit.length();
         let credit = self.debit.reserve();
         *self.state = self.next_state;
         (
             Sent {
-                length: self.length,
+                length,
                 state: self.next_state,
             },
             credit,
@@ -135,7 +136,7 @@ impl<'a, C: session::Storage, M: Mode, S: Source> Prepared<'a, C, M, S> {
                 },
             ..
         } = conn;
-        let frame = config.peer.max_frame_size.into_usize();
+        let frame = config.peer.max_frame_size;
         let record = match active.store.active_mut(key) {
             Some(record) => record,
             None => return Outcome::Failed(conn::Error::InactiveStream(key), source),
@@ -162,14 +163,13 @@ impl<'a, C: session::Storage, M: Mode, S: Source> Prepared<'a, C, M, S> {
             conn: &mut flow.send_window,
             stream: send,
         }
-        .debit_up_to(key, len.min(frame).min(room).min(max.get()));
-        let sent = debit.len();
+        .debit_up_to(key, frame.take(len.min(room).min(max.get())));
+        let sent = debit.length().into_usize();
         let boundary = if sent == len {
             boundary
         } else {
             Boundary::More
         };
-        let length = config.peer.max_frame_size.take(sent);
         let state = &mut record.state;
         let next = match state.send(stream::Event::Data { boundary }) {
             Ok(next) => next,
@@ -185,7 +185,6 @@ impl<'a, C: session::Storage, M: Mode, S: Source> Prepared<'a, C, M, S> {
             boundary,
             output: &mut egress.outbound,
             commit: Commit {
-                length,
                 next_state: next,
                 state,
                 debit,
@@ -202,7 +201,8 @@ impl<C: session::Storage> Prepared<'_, C, modes::Buffered, layout::Parts<'_>> {
         // frame size, output room, requested limit, and both flow windows. The
         // private Prepared retains these immutable slices and that same length
         // until commit, so both ranges remain within their original sources.
-        let (first, second) = unsafe { raw::parts(self.source, self.commit.length.into_usize()) };
+        let (first, second) =
+            unsafe { raw::parts(self.source, self.commit.debit.length().into_usize()) };
         let Self {
             stream_id: id,
             boundary,
@@ -210,7 +210,7 @@ impl<C: session::Storage> Prepared<'_, C, modes::Buffered, layout::Parts<'_>> {
             commit,
             source: _,
         } = self;
-        let header = layout::Data::wire_header(id, boundary, commit.length);
+        let header = layout::Data::wire_header(id, boundary, commit.debit.length());
         output.try_append([&header, first, second])?.commit();
         Ok(commit.commit())
     }
@@ -233,7 +233,7 @@ impl<'a, C: session::Storage, S> Prepared<'a, C, modes::Retained, S> {
         Ok(Bound {
             slot,
             mark,
-            header: layout::Data::wire_header(id, boundary, commit.length),
+            header: layout::Data::wire_header(id, boundary, commit.debit.length()),
             commit,
             source,
         })
@@ -249,7 +249,7 @@ impl<'a, C: session::Storage> Prepared<'a, C, modes::Retained, C> {
             commit,
             source,
         } = self.bind()?;
-        let (body, rest) = buffer::raw::Segment::try_split(source, commit.length.into_usize())
+        let (body, rest) = buffer::raw::Segment::try_split(source, commit.debit.length().into_usize())
             .map_err(|(error, source)| (conn::Error::Retain(error), source))?;
         let (sent, credit) = commit.commit();
         let payload =
@@ -274,7 +274,7 @@ impl<'a, 'd: 'a> Prepared<'a, resident::Shared<'d>, modes::Retained, retained::F
             .bind()
             .map_err(|(error, retained::Front(source))| (error, source))?;
         let (body, rest) = source
-            .try_pop(commit.length.into_usize())
+            .try_pop(commit.debit.length().into_usize())
             .map_err(|(error, source)| (conn::Error::Retain(error), source))?;
         let (sent, credit) = commit.commit();
         let payload =
@@ -296,7 +296,7 @@ impl<C: session::Storage, B: retained::Body>
             source,
         } = self.bind().map_err(|(error, _)| error)?;
         let (inline, body) = source
-            .try_take(commit.length.into_usize())
+            .try_take(commit.debit.length().into_usize())
             .map_err(conn::Error::Retain)?;
         let (sent, credit) = commit.commit();
         let payload = payloads::Shared::data(mark, header, inline, body, credit);

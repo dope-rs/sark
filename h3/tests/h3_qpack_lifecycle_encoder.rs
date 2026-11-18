@@ -35,58 +35,49 @@ fn blocked_stream_fifo() {
 
     assert!(
         !encoder
-            .encode_for(0, [a])
+            .try_field(0, a)
             .expect("fixed QPACK test contract must hold")
-            .is_dynamic()
     );
     assert!(!encoder.take_wire().is_empty());
     assert!(
         encoder
-            .encode_for(0, [a])
+            .try_field(0, a)
             .expect("fixed QPACK test contract must hold")
-            .is_dynamic()
     );
 
     assert!(
         !encoder
-            .encode_for(4, [b])
+            .try_field(4, b)
             .expect("fixed QPACK test contract must hold")
-            .is_dynamic()
     );
     assert!(!encoder.take_wire().is_empty());
     assert!(
         !encoder
-            .encode_for(4, [b])
+            .try_field(4, b)
             .expect("fixed QPACK test contract must hold")
-            .is_dynamic()
     );
 
     assert!(
         encoder
-            .encode_for(0, [b])
+            .try_field(0, b)
             .expect("fixed QPACK test contract must hold")
-            .is_dynamic()
     );
-    let (used, len) = encoder
+    encoder
         .try_feedback(Instruction::SectionAcknowledgment { stream_id: 0 })
         .expect("QPACK feedback");
-    assert_eq!(used, len);
     assert!(
         !encoder
-            .encode_for(4, [b])
+            .try_field(4, b)
             .expect("fixed QPACK test contract must hold")
-            .is_dynamic()
     );
 
-    let (used, len) = encoder
+    encoder
         .try_feedback(Instruction::SectionAcknowledgment { stream_id: 0 })
         .expect("QPACK feedback");
-    assert_eq!(used, len);
     assert!(
         encoder
-            .encode_for(4, [b])
+            .try_field(4, b)
             .expect("fixed QPACK test contract must hold")
-            .is_dynamic()
     );
 }
 
@@ -103,9 +94,8 @@ fn ack_advances_fifo() {
     assert!(!encoder.take_wire().is_empty());
     assert!(
         encoder
-            .encode_for(0, [a])
+            .try_field(0, a)
             .expect("fixed QPACK test contract must hold")
-            .is_dynamic()
     );
     encoder
         .encode_for(8, [b])
@@ -113,33 +103,28 @@ fn ack_advances_fifo() {
     assert!(!encoder.take_wire().is_empty());
     assert!(
         encoder
-            .encode_for(0, [b])
+            .try_field(0, b)
             .expect("fixed QPACK test contract must hold")
-            .is_dynamic()
     );
 
     encoder.set_blocked(0);
-    let (used, len) = encoder
+    encoder
         .try_feedback(Instruction::SectionAcknowledgment { stream_id: 0 })
         .expect("QPACK feedback");
-    assert_eq!(used, len);
     assert!(
         !encoder
-            .encode_for(4, [b])
-            .expect("fixed QPACK test contract must hold")
-            .is_dynamic(),
+            .try_field(4, b)
+            .expect("fixed QPACK test contract must hold"),
         "the first ACK must prove only the first section's insert count"
     );
 
-    let (used, len) = encoder
+    encoder
         .try_feedback(Instruction::SectionAcknowledgment { stream_id: 0 })
         .expect("QPACK feedback");
-    assert_eq!(used, len);
     assert!(
         encoder
-            .encode_for(12, [b])
-            .expect("fixed QPACK test contract must hold")
-            .is_dynamic(),
+            .try_field(12, b)
+            .expect("fixed QPACK test contract must hold"),
         "the second FIFO ACK releases the newer required insert count"
     );
 }
@@ -156,27 +141,23 @@ fn cancel_reuses_slot() {
     assert!(!encoder.take_wire().is_empty());
     assert!(
         encoder
-            .encode_for(0, [field])
+            .try_field(0, field)
             .expect("fixed QPACK test contract must hold")
-            .is_dynamic()
     );
     assert!(
         !encoder
-            .encode_for(4, [field])
-            .expect("fixed QPACK test contract must hold")
-            .is_dynamic(),
+            .try_field(4, field)
+            .expect("fixed QPACK test contract must hold"),
         "ledger exhaustion must degrade compression, not response liveness"
     );
 
-    let (used, len) = encoder
+    encoder
         .try_feedback(Instruction::StreamCancellation { stream_id: 0 })
         .expect("QPACK feedback");
-    assert_eq!(used, len);
     assert!(
         encoder
-            .encode_for(4, [field])
+            .try_field(4, field)
             .expect("fixed QPACK test contract must hold")
-            .is_dynamic()
     );
 
     let mut stale = Vec::new();
@@ -369,10 +350,9 @@ fn refs_block_eviction() {
         "another section cannot evict an outstanding reference"
     );
 
-    let (used, len) = encoder
+    encoder
         .try_feedback(Instruction::StreamCancellation { stream_id: 0 })
         .expect("QPACK feedback");
-    assert_eq!(used, len);
     encoder
         .encode_for(12, [b])
         .expect("fixed QPACK test contract must hold");
@@ -380,12 +360,11 @@ fn refs_block_eviction() {
         encoder.take_wire().is_empty(),
         "cancellation releases references without acknowledging table receipt"
     );
-    let (used, len) = encoder
+    encoder
         .try_feedback(Instruction::InsertCountIncrement {
             increment: NonZero::<u64>::MIN,
         })
         .expect("insertion receipt");
-    assert_eq!(used, len);
     assert!(
         encoder
             .encode_for(20, [a, b])
@@ -403,10 +382,9 @@ fn refs_block_eviction() {
         encoder.take_wire().is_empty(),
         "outstanding references protect received entries"
     );
-    let (used, len) = encoder
+    encoder
         .try_feedback(Instruction::StreamCancellation { stream_id: 20 })
         .expect("received section cancellation");
-    assert_eq!(used, len);
     encoder
         .encode_for(28, [b])
         .expect("received unreferenced entry can be evicted");
@@ -420,20 +398,14 @@ fn selected_ref_eviction() {
     let mut encoder = Encoder::try_dynamic(72, 4, 0).expect("QPACK encoder");
     assert!(!encoder.take_wire().is_empty());
     for stream in [0, 4] {
-        assert!(
-            !encoder
-                .encode_for(stream, [a])
-                .expect("speculative insertion")
-                .is_dynamic()
-        );
+        assert!(!encoder.try_field(stream, a).expect("speculative insertion"));
     }
     assert!(!encoder.take_wire().is_empty());
-    let (used, len) = encoder
+    encoder
         .try_feedback(Instruction::InsertCountIncrement {
             increment: NonZero::new(2).expect("insert count"),
         })
         .expect("received duplicate entries");
-    assert_eq!(used, len);
     assert_eq!(
         encoder
             .encode_for(8, [a])

@@ -1,5 +1,3 @@
-use std::{marker, ops};
-
 use dope_quic::{stream::send, wire::stream::Id};
 use o3::{
     buffer::{hold, resident},
@@ -97,87 +95,58 @@ pub(crate) enum Gate {
     Held,
 }
 
-#[must_use = "a taken write must be committed or restored"]
-pub(crate) struct TakenWrite<'q, 'd> {
-    write: plan::Record<'d>,
+#[must_use = "dropping the front preserves the queued write"]
+pub(crate) struct Front<'q, 'd> {
     source: Source<'q, 'd>,
     class: budget::WriteClass,
     budget: &'q mut budget::WriteBudget,
 }
 
-impl<'q, 'd> TakenWrite<'q, 'd> {
-    pub(crate) fn with<R>(
-        self,
-        run: impl for<'id> FnOnce(Flight<'id, 'd>, Prepared<'id, 'q, 'd>) -> R,
-    ) -> R {
-        let Self {
-            write,
-            source,
-            class,
-            budget,
-        } = self;
-        let charge = write.charge();
-        run(
-            Flight::new(write),
-            Prepared {
-                source,
-                budget,
-                class,
-                charge,
-                brand: marker::PhantomData,
-            },
-        )
-    }
-}
-
 enum Source<'q, 'd> {
-    Queued {
-        vacancy: group::Vacancy<'q, plan::Record<'d>, 2>,
-    },
+    Queued(group::Front<'q, plan::Record<'d>, 2>),
     DecoderFeedback {
+        write: plan::Record<'d>,
         wire: &'q mut State,
     },
 }
 
-impl<'q, 'd> Source<'q, 'd> {
-    fn restore(self, write: plan::Record<'d>) {
-        match self {
-            Self::Queued { vacancy, .. } => {
-                vacancy.restore(write);
-            }
-            Self::DecoderFeedback { .. } => {}
+impl<'q, 'd> Front<'q, 'd> {
+    fn record(&self) -> &plan::Record<'d> {
+        match &self.source {
+            Source::Queued(front) => front.get(),
+            Source::DecoderFeedback { write, .. } => write,
         }
     }
-}
 
-#[must_use = "a prepared write must be committed or restored"]
-pub(crate) struct Prepared<'id, 'q, 'd> {
-    source: Source<'q, 'd>,
-    budget: &'q mut budget::WriteBudget,
-    class: budget::WriteClass,
-    charge: output::WriteCharge,
-    brand: marker::PhantomData<fn(&'id mut ()) -> &'id mut ()>,
-}
+    pub(crate) fn get(&self) -> &output::Write<'d> {
+        self.record().get()
+    }
 
-impl<'id, 'q, 'd> Prepared<'id, 'q, 'd> {
-    pub(crate) fn commit(self) -> Completion {
-        self.budget.release(self.class, self.charge);
+    pub(crate) fn retained(&self) -> hold::Charge {
+        self.record().retained()
+    }
+
+    pub(crate) const fn completion(&self) -> Completion {
         match self.source {
-            Source::Queued { .. } => Completion::Queued,
-            Source::DecoderFeedback { wire } => {
+            Source::Queued(_) => Completion::Queued,
+            Source::DecoderFeedback { .. } => Completion::Feedback,
+        }
+    }
+
+    fn into_record(self) -> plan::Record<'d> {
+        let charge = self.record().charge();
+        self.budget.release(self.class, charge);
+        match self.source {
+            Source::Queued(front) => front.remove(),
+            Source::DecoderFeedback { write, wire } => {
                 wire.clear();
-                Completion::Feedback
+                write
             }
         }
     }
 
-    pub(crate) fn restore(self, write: Flight<'id, 'd>) {
-        self.source.restore(write.into_record());
-    }
-
-    pub(in crate::conn) fn finish(self, write: Flight<'id, 'd>) -> (output::Write<'d>, Completion) {
-        let done = self.commit();
-        (write.into_record().into_output(), done)
+    pub(crate) fn into_output(self) -> output::Write<'d> {
+        self.into_record().into_output()
     }
 }
 
@@ -257,33 +226,33 @@ impl<'d, S, B> Queues<'d, S, B> {
         !feedback.is_empty() || !self.writes.is_empty()
     }
 
-    pub(crate) fn take<'q>(
+    pub(crate) fn front<'q>(
         &'q mut self,
         wire: &'q mut State,
         target: Option<stream::Target>,
-    ) -> Option<TakenWrite<'q, 'd>> {
+    ) -> Option<Front<'q, 'd>> {
         if let Some(target) = target
             && !wire.is_empty()
         {
             let bytes = wire.bytes();
-            return Some(TakenWrite {
-                write: plan::Record::single(
-                    target,
-                    output::WritePrefix::Inline(bytes),
-                    Boundary::More,
-                ),
-                source: Source::DecoderFeedback { wire },
+            return Some(Front {
+                source: Source::DecoderFeedback {
+                    write: plan::Record::single(
+                        target,
+                        output::WritePrefix::Inline(bytes),
+                        Boundary::More,
+                    ),
+                    wire,
+                },
                 class: budget::WriteClass::Critical,
                 budget: &mut self.write_budget,
             });
         }
         let order = [budget::WriteClass::Critical, budget::WriteClass::Regular]
             .map(|class| (class.lane(), class));
-        let (class, taken) = self.writes.take_first(order)?;
-        let (write, vacancy) = taken;
-        Some(TakenWrite {
-            write,
-            source: Source::Queued { vacancy },
+        let (class, front) = self.writes.select(order)?;
+        Some(Front {
+            source: Source::Queued(front),
             class,
             budget: &mut self.write_budget,
         })
@@ -328,59 +297,15 @@ impl<'d, S, B> Queues<'d, S, B> {
     }
 }
 
-const _: () = {
-    assert!(core::mem::size_of::<Completion>() == 1);
-    assert!(core::mem::size_of::<Source<'static, 'static>>() <= 4 * core::mem::size_of::<usize>());
-    assert!(
-        core::mem::size_of::<Prepared<'static, 'static, 'static>>()
-            <= 8 * core::mem::size_of::<usize>()
-    );
-};
-
-/// The original write, invariant in one admission operation's brand.
-#[repr(transparent)]
-pub(crate) struct Flight<'id, 'd> {
-    write: plan::Record<'d>,
-    brand: marker::PhantomData<fn(&'id mut ()) -> &'id mut ()>,
-}
-
-impl<'id, 'd> Flight<'id, 'd> {
-    const fn new(write: plan::Record<'d>) -> Self {
-        Self {
-            write,
-            brand: marker::PhantomData,
-        }
-    }
-
-    pub(crate) const fn get(&self) -> &output::Write<'d> {
-        self.write.get()
-    }
-
-    fn into_record(self) -> plan::Record<'d> {
-        self.write
-    }
-
-    pub(crate) fn retained(&self) -> hold::Charge {
-        self.write.retained()
-    }
-}
-
-impl<'d> ops::Deref for Flight<'_, 'd> {
-    type Target = output::Write<'d>;
-    fn deref(&self) -> &Self::Target {
-        self.write.get()
-    }
-}
+const _: () = assert!(core::mem::size_of::<Completion>() == 1);
 
 // SAFETY: the original batch stays owned and unchanged until admission consumes it.
-unsafe impl<'d> send::raw::Batch<resident::Shared<'d>> for Flight<'_, 'd> {
+unsafe impl<'d> send::raw::Batch<resident::Shared<'d>> for Front<'_, 'd> {
     fn demand(&self) -> Result<send::Demand, send::Overflow> {
-        self.write.demand()
+        self.record().demand()
     }
 
     fn into_parts(self) -> send::Parts<resident::Shared<'d>> {
-        self.write.into_parts()
+        self.into_record().into_parts()
     }
 }
-
-const _: () = assert!(size_of::<Flight<'static, 'static>>() == size_of::<output::Write<'static>>());

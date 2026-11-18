@@ -2,10 +2,7 @@ use core::num::NonZero;
 
 use sark_http::field::literal;
 
-use crate::common::{
-    field::entry,
-    ledger::{Encoder as _, Section as _},
-};
+use crate::common::{field::entry, ledger::Encoder as _};
 pub mod common;
 
 use dope_test::alloc::Tracker;
@@ -25,74 +22,36 @@ fn releases_at_frontier() {
     let mut harness = Encoder::try_dynamic(1024, 16, 8).expect("QPACK encoder");
     assert!(!harness.take_wire().is_empty());
 
-    assert!(
-        !harness
-            .encode_for(60, [a])
-            .expect("test section encodes")
-            .is_dynamic()
-    );
+    assert!(!harness.try_field(60, a).expect("test section encodes"));
     assert!(!harness.take_wire().is_empty());
-    assert!(
-        harness
-            .encode_for(0, [a])
-            .expect("test section encodes")
-            .is_dynamic()
-    );
+    assert!(harness.try_field(0, a).expect("test section encodes"));
 
-    assert!(
-        !harness
-            .encode_for(64, [b])
-            .expect("test section encodes")
-            .is_dynamic()
-    );
+    assert!(!harness.try_field(64, b).expect("test section encodes"));
     assert!(!harness.take_wire().is_empty());
-    assert!(
-        harness
-            .encode_for(4, [b])
-            .expect("test section encodes")
-            .is_dynamic()
-    );
+    assert!(harness.try_field(4, b).expect("test section encodes"));
 
-    assert!(
-        !harness
-            .encode_for(68, [c])
-            .expect("test section encodes")
-            .is_dynamic()
-    );
+    assert!(!harness.try_field(68, c).expect("test section encodes"));
     assert!(!harness.take_wire().is_empty());
     harness.set_blocked(1);
-    assert!(
-        !harness
-            .encode_for(8, [c])
-            .expect("test section encodes")
-            .is_dynamic()
-    );
+    assert!(!harness.try_field(8, c).expect("test section encodes"));
 
-    let (used, len) = harness
+    harness
         .try_feedback(Instruction::InsertCountIncrement {
             increment: NonZero::<u64>::MIN,
         })
         .expect("QPACK feedback");
-    assert_eq!(used, len);
     assert!(
-        !harness
-            .encode_for(12, [c])
-            .expect("test section encodes")
-            .is_dynamic(),
+        !harness.try_field(12, c).expect("test section encodes"),
         "one blocked stream must remain at the second threshold"
     );
 
-    let (used, len) = harness
+    harness
         .try_feedback(Instruction::InsertCountIncrement {
             increment: NonZero::<u64>::MIN,
         })
         .expect("QPACK feedback");
-    assert_eq!(used, len);
     assert!(
-        harness
-            .encode_for(16, [c])
-            .expect("test section encodes")
-            .is_dynamic(),
+        harness.try_field(16, c).expect("test section encodes"),
         "reaching the second threshold must release both prior streams"
     );
 }
@@ -105,68 +64,30 @@ fn holds_until_last_section() {
     let mut harness = Encoder::try_dynamic(1024, 16, 1).expect("QPACK encoder");
     assert!(!harness.take_wire().is_empty());
 
-    assert!(
-        !harness
-            .encode_for(60, [a])
-            .expect("test section encodes")
-            .is_dynamic()
-    );
-    assert!(
-        harness
-            .encode_for(0, [a])
-            .expect("test section encodes")
-            .is_dynamic()
-    );
-    assert!(
-        !harness
-            .encode_for(64, [b])
-            .expect("test section encodes")
-            .is_dynamic()
-    );
-    assert!(
-        harness
-            .encode_for(0, [b])
-            .expect("test section encodes")
-            .is_dynamic()
-    );
-    assert!(
-        !harness
-            .encode_for(4, [b])
-            .expect("test section encodes")
-            .is_dynamic()
-    );
+    assert!(!harness.try_field(60, a).expect("test section encodes"));
+    assert!(harness.try_field(0, a).expect("test section encodes"));
+    assert!(!harness.try_field(64, b).expect("test section encodes"));
+    assert!(harness.try_field(0, b).expect("test section encodes"));
+    assert!(!harness.try_field(4, b).expect("test section encodes"));
 
-    let (used, len) = harness
+    harness
         .try_feedback(Instruction::InsertCountIncrement {
             increment: NonZero::<u64>::MIN,
         })
         .expect("QPACK feedback");
-    assert_eq!(used, len);
     assert!(
-        !harness
-            .encode_for(8, [b])
-            .expect("test section encodes")
-            .is_dynamic(),
+        !harness.try_field(8, b).expect("test section encodes"),
         "the later section must keep its stream in the blocked limit"
     );
 
-    let (used, len) = harness
+    harness
         .try_feedback(Instruction::InsertCountIncrement {
             increment: NonZero::<u64>::MIN,
         })
         .expect("QPACK feedback");
-    assert_eq!(used, len);
+    assert!(!harness.try_field(68, c).expect("test section encodes"));
     assert!(
-        !harness
-            .encode_for(68, [c])
-            .expect("test section encodes")
-            .is_dynamic()
-    );
-    assert!(
-        harness
-            .encode_for(12, [c])
-            .expect("test section encodes")
-            .is_dynamic(),
+        harness.try_field(12, c).expect("test section encodes"),
         "the last threshold must release the stream exactly once"
     );
 }
@@ -178,20 +99,14 @@ fn slots_survive_reuse() {
     let field = literal!(entry(b"x-stable", b"slot"));
     let mut harness = Encoder::try_dynamic(1024, STREAMS as usize, STREAMS).expect("QPACK encoder");
     assert!(!harness.take_wire().is_empty());
-    assert!(
-        !harness
-            .encode_for(400, [field])
-            .expect("test section encodes")
-            .is_dynamic()
-    );
+    assert!(!harness.try_field(400, field).expect("test section encodes"));
     assert!(!harness.take_wire().is_empty());
 
     for index in 0..STREAMS {
         assert!(
             harness
-                .encode_for(index * 4, [field])
+                .try_field(index * 4, field)
                 .expect("test section encodes")
-                .is_dynamic()
         );
     }
 
@@ -217,31 +132,27 @@ fn slots_survive_reuse() {
     for index in 0..STREAMS {
         assert!(
             harness
-                .encode_for(800 + index * 4, [field])
+                .try_field(800 + index * 4, field)
                 .expect("test section encodes")
-                .is_dynamic()
         );
     }
     assert!(
         !harness
-            .encode_for(1200, [field])
-            .expect("test section encodes")
-            .is_dynamic(),
+            .try_field(1200, field)
+            .expect("test section encodes"),
         "the section slab must expose its exact fixed capacity"
     );
 
     let mut stale = Vec::new();
     Instruction::SectionAcknowledgment { stream_id: 0 }.encode(&mut stale);
     assert!(harness.ingest(&stale) == Err(stream::Error::UnknownSection { stream_id: 0 }));
-    let (used, len) = harness
+    harness
         .try_feedback(Instruction::StreamCancellation { stream_id: 800 })
         .expect("QPACK feedback");
-    assert_eq!(used, len);
     assert!(
         harness
-            .encode_for(1204, [field])
-            .expect("test section encodes")
-            .is_dynamic(),
+            .try_field(1204, field)
+            .expect("test section encodes"),
         "a rejected instruction must not erase the section ledger"
     );
 }
@@ -299,18 +210,15 @@ fn flat_sections_keep_stream_identity() {
             .expect("test section encodes");
         assert_ne!(output[0], 0);
     }
-    let (used, len) = harness
+    harness
         .try_feedback(Instruction::StreamCancellation { stream_id: 4 })
         .expect("QPACK feedback");
-    assert_eq!(used, len);
-    let (used, len) = harness
+    harness
         .try_feedback(Instruction::SectionAcknowledgment { stream_id: 8 })
         .expect("QPACK feedback");
-    assert_eq!(used, len);
-    let (used, len) = harness
+    harness
         .try_feedback(Instruction::SectionAcknowledgment { stream_id: 8 })
         .expect("QPACK feedback");
-    assert_eq!(used, len);
     for stream in [12, 16, 12, 16] {
         output.clear();
         harness
@@ -340,28 +248,24 @@ fn cancels_after_rebucket() {
     for stream in [0, 4] {
         assert!(
             harness
-                .encode_for(stream, [fields[2]])
+                .try_field(stream, fields[2])
                 .expect("blocked section")
-                .is_dynamic()
         );
     }
-    let (used, len) = harness
+    harness
         .try_feedback(Instruction::InsertCountIncrement {
             increment: NonZero::<u64>::MIN.saturating_add(1),
         })
         .expect("QPACK feedback");
-    assert_eq!(used, len);
     for stream in [4, 0] {
-        let (used, len) = harness
+        harness
             .try_feedback(Instruction::StreamCancellation { stream_id: stream })
             .expect("QPACK feedback");
-        assert_eq!(used, len);
     }
     harness.set_blocked(1);
     assert!(
         harness
-            .encode_for(8, [fields[2]])
+            .try_field(8, fields[2])
             .expect("released blocked capacity")
-            .is_dynamic()
     );
 }

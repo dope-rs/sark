@@ -14,10 +14,8 @@ use sark_http::{
 use crate::{
     Endpoint,
     conn::{build, event},
-    hpack::decode::mode::Store,
+    hpack::decode::mode::Store as Decode,
 };
-
-type Decode = Store<(), ()>;
 
 pub(crate) mod events;
 pub(crate) mod header;

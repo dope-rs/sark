@@ -2,8 +2,10 @@ use std::num;
 
 use o3::buffer::{
     storage,
-    write::{Init as _, Sink, consume, spans},
+    write::{Init as _, consume},
 };
+
+mod raw;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Error {
@@ -306,75 +308,8 @@ impl<'p> Frame<'p> {
     /// Builds one exact-capacity shared owner. A masked payload is read and
     /// written once; freezing transfers the same allocation into egress.
     pub fn try_owned(self) -> Result<storage::Shared, storage::BuildError<consume::Error>> {
-        storage::Exact::try_build(self.plan.wire_len, |out| self.write_into(out))
+        storage::Exact::try_build(self.plan.wire_len, |out| out.try_init(&self))
             .map(storage::Exact::into_shared)
-    }
-
-    pub(crate) fn write_into(self, out: &mut spans::Writer<'_, '_>) -> Result<(), consume::Error> {
-        let (prefix, used) = self.prefix();
-        // SAFETY: prefix emits at most fourteen initialized bytes from the
-        // retained Plan, whose admitted header width and mask remain unchanged.
-        out.write_slice(unsafe { prefix.get_unchecked(..used) })?;
-        match self.mask {
-            Some(mask) => out.try_init(&crate::mask::Key::new(mask).initializer(self.payload))?,
-            None => out.write_slice(self.payload)?,
-        }
-        Ok(())
-    }
-
-    pub(crate) fn prefix(self) -> ([u8; 14], usize) {
-        let mut dst = [0; 14];
-        let head = usize::from(self.plan.head);
-        let len = self.plan.payload_len;
-        dst[0] = if self.plan.fin {
-            0x80 | self.plan.opcode
-        } else {
-            self.plan.opcode
-        };
-        let bit = if self.plan.masked { 0x80 } else { 0 };
-        let wire = (len as u64).to_be_bytes();
-        if head == 2 {
-            dst[1] = bit | wire[7];
-        } else if head == 4 {
-            dst[1] = bit | 126;
-            dst[2..4].copy_from_slice(&wire[6..]);
-        } else {
-            dst[1] = bit | 127;
-            dst[2..10].copy_from_slice(&wire);
-        }
-        let used = head + if self.plan.masked { 4 } else { 0 };
-        if let Some(mask) = self.mask {
-            // SAFETY: every Frame constructor preserves head in {2, 4, 10}
-            // and mask presence equal to plan.masked, so these four bytes fit.
-            unsafe { dst.get_unchecked_mut(head..head + 4) }.copy_from_slice(&mask);
-        }
-        (dst, used)
-    }
-}
-
-impl Writer<'_, '_> {
-    pub fn encode(self) -> usize {
-        let len = self.frame.plan.wire_len;
-        self.write();
-        len
-    }
-
-    fn write(self) {
-        let (prefix, used) = self.frame.prefix();
-        // SAFETY: bind admits this exact destination against the
-        // retained Frame. Its complete wire length includes this header.
-        let (header, tail) = unsafe { self.dst.split_at_mut_unchecked(used) };
-        // SAFETY: prefix emits at most fourteen bytes from the admitted Plan.
-        header.copy_from_slice(unsafe { prefix.get_unchecked(..used) });
-        // SAFETY: all Frame constructors retain the exact payload, and its
-        // length plus used equals the wire length admitted by this Writer.
-        let output = unsafe { tail.get_unchecked_mut(..self.frame.payload.len()) };
-        match self.frame.mask {
-            Some(mask) => {
-                crate::mask::Key::new(mask).copy(output, self.frame.payload);
-            }
-            None => output.copy_from_slice(self.frame.payload),
-        }
     }
 }
 

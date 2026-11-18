@@ -11,7 +11,7 @@ impl From<decode::Decoder> for Block {
     fn from(decoder: decode::Decoder) -> Self {
         let budget = decoder.budget();
         Self {
-            phase: Phase::Representation(decoder),
+            phase: Phase::new(decoder),
             budget,
         }
     }
@@ -24,7 +24,7 @@ impl Block {
     {
         let Self { phase, mut budget } = self;
         let (phase, _) = phase
-            .decode(&mut budget, input, sink)
+            .feed_all(&mut budget, [input], sink)
             .map_err(|(_, cause)| cause)?;
         Ok(Self { phase, budget })
     }

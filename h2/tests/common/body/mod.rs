@@ -1,4 +1,4 @@
-use std::net;
+use std::{convert::Infallible, net};
 
 use dope::{
     core::{driver::route::KeyTag, io::socket::option::Switch},
@@ -8,6 +8,7 @@ use sark_h2::{conn::DataOutcome, frame::numbers};
 use sark_http::{field, o3::buffer::resident::bound, payload::response::status::Code};
 
 use crate::common::headers::{TEXT, entry};
+use crate::common::session::Serve;
 
 pub mod fairness;
 
@@ -23,6 +24,7 @@ use dope::{
     },
     manifold::network::listener::config,
     net::tcp,
+    runtime::executor,
 };
 use sark_core::manifold::stream::Boundary;
 use sark_h2::{
@@ -229,6 +231,28 @@ impl Peer for Connection<ClientRole> {
             None
         })
     }
+}
+
+pub fn serve<C: executor::Build>(
+    server: Config,
+    bind: net::SocketAddr,
+    context: C,
+    listener: socket::Listener,
+) -> Result<(), Infallible> {
+    let reports = Echo
+        .try_serve(
+            server.try_plan(bind).expect("H2 server plan"),
+            context,
+            listener,
+            crate::common::recover,
+            |result| result.expect("H2 server runtime"),
+        )
+        .expect("H2 server resources");
+    assert!(
+        reports.events().expect("H2 retirement").is_empty(),
+        "{reports:?}"
+    );
+    Ok(())
 }
 
 pub struct Echo;

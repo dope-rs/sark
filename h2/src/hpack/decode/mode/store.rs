@@ -1,37 +1,40 @@
-use core::{marker::PhantomData, mem};
+use core::mem;
 
 use decode::mode::{self, Active, Facts, Field, Flow, Kind, Name, NameRoute, Route, Value};
-use sark_http::field::metadata::{block, strings::Cursor};
+use sark_http::field::metadata::{
+    block,
+    section::state::decode::{Indexed, Start},
+    strings::Cursor,
+};
 
 use crate::hpack::decode::{self, limit, sink, strings};
 
 #[derive(Clone, Copy)]
-enum State<R, D> {
+enum State {
     PlainSkip,
-    PlainBuffered(R),
-    PlainDirect(D),
+    PlainBuffered,
+    PlainDirect,
     IndexedSkip,
-    IndexedBuffered(R),
+    IndexedBuffered,
 }
 
 #[derive(Clone, Copy)]
-#[repr(transparent)]
-pub(crate) struct Store<R, D>(PhantomData<fn() -> (R, D)>);
+pub(crate) struct Store;
 
 #[derive(Clone, Copy)]
-pub(crate) struct Storage<R, D> {
+pub(crate) struct Storage {
     facts: Facts,
-    state: State<R, D>,
+    state: State,
 }
 
 #[derive(Clone, Copy)]
 pub(crate) struct Direct(());
 
-const _: () = assert!(mem::size_of::<Store<usize, ()>>() == 0);
+const _: () = assert!(mem::size_of::<Store>() == 0);
 const _: () = assert!(mem::size_of::<Direct>() == 0);
-const _: () = assert!(mem::size_of::<Storage<usize, ()>>() == 4 * mem::size_of::<usize>());
+const _: () = assert!(mem::size_of::<Storage>() == 3 * mem::size_of::<usize>());
 
-impl<R: Copy, D: Copy> Store<R, D> {
+impl Store {
     fn skip<S: sink::Store>(
         mut sink: S,
         budget: &mut limit::Budget,
@@ -44,19 +47,15 @@ impl<R: Copy, D: Copy> Store<R, D> {
         Ok(sink)
     }
 
-    fn buffered<S>(
+    fn buffered<S: sink::Store>(
         mut sink: S,
         budget: &mut limit::Budget,
-        rule: R,
         facts: Facts,
         name: block::Named<'_>,
         value: block::Valued<'_>,
-    ) -> Result<S, (S, S::Error)>
-    where
-        S: sink::Store<Rule = R, Completion = D>,
-    {
+    ) -> Result<S, (S, S::Error)> {
         match budget.admit(facts.len, value.span().len()) {
-            limit::Admission::Admitted => sink.field(rule, value, facts.index.indexing(), name),
+            limit::Admission::Admitted => sink.field(value, facts.index.indexing(), name),
             limit::Admission::Exceeded => {
                 sink.rollback();
                 Ok(sink)
@@ -65,12 +64,12 @@ impl<R: Copy, D: Copy> Store<R, D> {
     }
 }
 
-impl<R: Copy, D: Copy> Kind for Store<R, D> {
+impl Kind for Store {
     type Direct = Direct;
-    type Active = Storage<R, D>;
+    type Active = Storage;
 
     fn new() -> Self {
-        Self(PhantomData)
+        Self
     }
 
     fn name(self) -> NameRoute {
@@ -78,16 +77,14 @@ impl<R: Copy, D: Copy> Kind for Store<R, D> {
     }
 }
 
-impl<R: Copy, D: Copy> Active for Storage<R, D> {
+impl Active for Storage {
     type Direct = Direct;
 
     fn route(self) -> Route<Self::Direct> {
         match self.state {
             State::PlainSkip => Route::Validate,
-            State::PlainBuffered(_) | State::IndexedSkip | State::IndexedBuffered(_) => {
-                Route::Retain
-            }
-            State::PlainDirect(_) => Route::Direct(Direct(())),
+            State::PlainBuffered | State::IndexedSkip | State::IndexedBuffered => Route::Retain,
+            State::PlainDirect => Route::Direct(Direct(())),
         }
     }
 
@@ -114,12 +111,7 @@ impl<S: sink::Direct> mode::Direct<S> for Direct {
     }
 }
 
-impl<R, D, S> Flow<S> for Store<R, D>
-where
-    R: Copy,
-    D: Copy,
-    S: sink::Store<Rule = R, Completion = D>,
-{
+impl<S: sink::Store> Flow<S> for Store {
     type Error = S::Error;
 
     fn validate(sink: &mut S, value: block::Validation) -> Result<(), Self::Error> {
@@ -136,8 +128,8 @@ where
                 let (sink, indexed) = sink.indexed(span)?;
                 (
                     match indexed {
-                        sink::Indexed::Skip => State::IndexedSkip,
-                        sink::Indexed::Buffered(rule) => State::IndexedBuffered(rule),
+                        Indexed::Skip => State::IndexedSkip,
+                        Indexed::Buffered(()) => State::IndexedBuffered,
                     },
                     sink,
                 )
@@ -146,9 +138,9 @@ where
                 let (sink, begin) = sink.begin(span, facts.index.indexing())?;
                 (
                     match begin {
-                        sink::Begin::Skip => State::PlainSkip,
-                        sink::Begin::Buffered(rule) => State::PlainBuffered(rule),
-                        sink::Begin::Direct(done) => State::PlainDirect(done),
+                        Start::Skip => State::PlainSkip,
+                        Start::Buffered(()) => State::PlainBuffered,
+                        Start::Direct(()) | Start::Scratch(()) => State::PlainDirect,
                     },
                     sink,
                 )
@@ -169,8 +161,8 @@ where
         };
         let (sink, indexed) = sink.indexed(Some(name))?;
         match indexed {
-            sink::Indexed::Skip => Self::skip(sink, budget, facts.len, value),
-            sink::Indexed::Buffered(rule) => Self::buffered(sink, budget, rule, facts, name, value),
+            Indexed::Skip => Self::skip(sink, budget, facts.len, value),
+            Indexed::Buffered(()) => Self::buffered(sink, budget, facts, name, value),
         }
     }
 
@@ -188,17 +180,17 @@ where
                     budget.admit(facts.len, len);
                 }
             },
-            State::PlainBuffered(rule) | State::IndexedBuffered(rule) => match field.value {
+            State::PlainBuffered | State::IndexedBuffered => match field.value {
                 Value::Retained(value) => {
-                    return Self::buffered(sink, budget, rule, facts, field.name, value);
+                    return Self::buffered(sink, budget, facts, field.name, value);
                 }
                 Value::Counted(len) => {
                     budget.exceed(facts.len, len);
                     sink.rollback();
                 }
             },
-            State::PlainDirect(done) => match budget.admit(facts.len, field.value.len()) {
-                limit::Admission::Admitted => return sink.direct(done),
+            State::PlainDirect => match budget.admit(facts.len, field.value.len()) {
+                limit::Admission::Admitted => return sink.direct(),
                 limit::Admission::Exceeded => sink.rollback(),
             },
         }

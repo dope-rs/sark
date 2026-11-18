@@ -1,6 +1,6 @@
 use o3::buffer::{
     storage,
-    write::{Sink as _, Slice, SpareExt as _, consume},
+    write::{Init as _, Sink as _, Slice, SpareExt as _, consume},
 };
 
 use crate::{frame, inbound};
@@ -82,14 +82,11 @@ impl<'a> Response<'a> {
         let required = frame.wire_len();
         consume::Error::check(required, room)?;
         match &mut self.target {
-            Target::Inline(write) => {
-                let (prefix, used) = frame.prefix();
-                write.write_slices([&prefix[..used], data])?;
-            }
+            Target::Inline(write) => write.try_init(&frame)?,
             Target::Owned(owner) => {
                 let mut spare = owner.spare();
                 let mut writer = spare.bounded();
-                frame.write_into(&mut writer)?;
+                writer.try_init(&frame)?;
                 writer.commit();
                 spare.commit();
             }

@@ -10,15 +10,7 @@ use sark_http::{
     payload::compress::dynamic::insert::{self, stages, write},
 };
 
-use crate::hpack::decode::{self, decoder::Machine, limit, mode, strings};
-
-pub(in crate::hpack::decode) struct Payload<'a, T> {
-    stage: &'a mut T,
-}
-
-pub(in crate::hpack::decode) struct Scratch<'a> {
-    decoder: &'a mut Machine<stages::Ready>,
-}
+use crate::hpack::decode::{self, decoder::Core, limit, mode, strings};
 
 #[repr(u8)]
 pub(in crate::hpack::decode) enum Outcome {
@@ -47,58 +39,42 @@ impl Outcome {
     }
 }
 
-impl<'a, T> Payload<'a, T> {
-    pub(in crate::hpack::decode) fn new(stage: &'a mut T) -> Self {
-        Self { stage }
+pub(in crate::hpack::decode) fn feed<T: stages::Write>(
+    stage: &mut T,
+    string: &mut limit::StringState,
+    payload: &[u8],
+) -> Result<Outcome, decode::Error> {
+    match string.string.feed_into(payload, stage.writer()) {
+        Ok(_) => Ok(Outcome::Stored),
+        Err(failure) => Outcome::failed(failure),
     }
 }
 
-impl<'a> Scratch<'a> {
-    pub(in crate::hpack::decode) fn new(decoder: &'a mut Machine<stages::Ready>) -> Self {
-        Self { decoder }
-    }
-}
-
-impl<T: stages::Write> Payload<'_, T> {
-    pub(in crate::hpack::decode) fn feed(
-        &mut self,
-        string: &mut limit::StringState,
-        payload: &[u8],
-    ) -> Result<Outcome, decode::Error> {
-        match string.string.feed_into(payload, self.stage.writer()) {
-            Ok(_) => Ok(Outcome::Stored),
-            Err(failure) => Outcome::failed(failure),
-        }
-    }
-
-    pub(in crate::hpack::decode) fn store(
-        &mut self,
-        encoded: strings::Encoded<'_>,
-    ) -> Result<Outcome, decode::Error> {
-        match encoded.encoding {
-            Encoding::Huffman => {
-                if let Err(failure) =
-                    source::Encoded::new(encoded.payload).write_to(self.stage.writer())
-                {
-                    return Outcome::failed(failure);
-                }
+pub(in crate::hpack::decode) fn store<T: stages::Write>(
+    stage: &mut T,
+    encoded: strings::Encoded<'_>,
+) -> Result<Outcome, decode::Error> {
+    match encoded.encoding {
+        Encoding::Huffman => {
+            if let Err(failure) = source::Encoded::new(encoded.payload).write_to(stage.writer()) {
+                return Outcome::failed(failure);
             }
-            Encoding::Plain => {
-                let mut writer = self.stage.writer();
-                match writer.write_slice(encoded.payload) {
-                    Ok(()) => {}
-                    Err(write::Error::Capacity { .. } | write::Error::Length { .. }) => {
-                        writer.rollback();
-                        return Ok(Outcome::Overflow);
-                    }
+        }
+        Encoding::Plain => {
+            let mut writer = stage.writer();
+            match writer.write_slice(encoded.payload) {
+                Ok(()) => {}
+                Err(write::Error::Capacity { .. } | write::Error::Length { .. }) => {
+                    writer.rollback();
+                    return Ok(Outcome::Overflow);
                 }
             }
         }
-        Ok(Outcome::Stored)
     }
+    Ok(Outcome::Stored)
 }
 
-impl Scratch<'_> {
+impl Core {
     pub(in crate::hpack::decode) fn feed_name<M: mode::Kind>(
         &mut self,
         string: &mut limit::StringState,
@@ -107,12 +83,9 @@ impl Scratch<'_> {
     ) -> Result<(), decode::Error> {
         if matches!(context.route(), mode::NameRoute::Count) {
             return match context.index() {
-                mode::Index::Indexed => Self::discard(
-                    string,
-                    context.limit(),
-                    &mut self.decoder.name_scratch,
-                    payload,
-                ),
+                mode::Index::Indexed => {
+                    Self::discard(string, context.limit(), &mut self.name_scratch, payload)
+                }
                 mode::Index::Plain | mode::Index::Never => Self::count(&mut string.string, payload),
             };
         }
@@ -122,7 +95,7 @@ impl Scratch<'_> {
         Self::store(
             &mut string.string,
             &mut string.retention,
-            self.decoder.name_scratch.writer(context.limit().option()),
+            self.name_scratch.writer(context.limit().option()),
             payload,
         )
     }
@@ -145,19 +118,16 @@ impl Scratch<'_> {
                 Self::store(
                     &mut string.string,
                     &mut string.retention,
-                    self.decoder.value_scratch.writer(context.limit().option()),
+                    self.value_scratch.writer(context.limit().option()),
                     payload,
                 )?;
                 Ok(())
             }
             mode::Route::Count => {
                 match context.index() {
-                    mode::Index::Indexed => Self::discard(
-                        string,
-                        context.limit(),
-                        &mut self.decoder.value_scratch,
-                        payload,
-                    )?,
+                    mode::Index::Indexed => {
+                        Self::discard(string, context.limit(), &mut self.value_scratch, payload)?
+                    }
                     mode::Index::Plain | mode::Index::Never => {
                         Self::count(&mut string.string, payload)?;
                     }

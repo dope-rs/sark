@@ -2,14 +2,14 @@ use sark_h2::conn::DataOutcome;
 
 pub mod common;
 
-use std::{convert::Infallible, time::Duration};
+use std::time::Duration;
 
-use common::session::{Connect, Serve};
+use common::session::Connect;
 use dope_test::harness::server::Pair;
 use sark_core::manifold::stream::Boundary;
 use sark_h2::{ClientRole, conn::machine::Connection, frame::numbers::ErrorCode};
 
-use crate::common::body::{Configure, Echo, LIMITS, PROBE, Peer, headers};
+use crate::common::body::{LIMITS, PROBE, Peer, headers, serve};
 
 #[test]
 fn rejects_second_owner() {
@@ -19,22 +19,7 @@ fn rejects_second_owner() {
     let pair = Pair::bind().expect("H2 body-credit harness");
     let bind = pair.addr();
     pair.check(
-        move |context, listener| {
-            let reports = Echo
-                .try_serve(
-                    server.try_plan(bind).expect("H2 server plan"),
-                    context,
-                    listener,
-                    common::recover,
-                    |result| result.expect("H2 server runtime"),
-                )
-                .expect("H2 server resources");
-            assert!(
-                reports.events().expect("H2 retirement").is_empty(),
-                "{reports:?}"
-            );
-            Ok::<(), Infallible>(())
-        },
+        move |context, listener| serve(server, bind, context, listener),
         |address| {
             let mut socket = address
                 .try_connect(Duration::from_secs(3))
@@ -84,22 +69,7 @@ fn reset_returns_credit() {
     let pair = Pair::bind().expect("H2 body-credit harness");
     let bind = pair.addr();
     pair.check(
-        move |context, listener| {
-            let reports = Echo
-                .try_serve(
-                    server.try_plan(bind).expect("H2 server plan"),
-                    context,
-                    listener,
-                    common::recover,
-                    |result| result.expect("H2 server runtime"),
-                )
-                .expect("H2 server resources");
-            assert!(
-                reports.events().expect("H2 retirement").is_empty(),
-                "{reports:?}"
-            );
-            Ok::<(), Infallible>(())
-        },
+        move |context, listener| serve(server, bind, context, listener),
         |address| {
             let mut socket = address
                 .try_connect(Duration::from_secs(3))
@@ -169,22 +139,7 @@ fn rejects_atomically() {
     let pair = Pair::bind().expect("H2 body-credit harness");
     let bind = pair.addr();
     pair.check(
-        move |context, listener| {
-            let reports = Echo
-                .try_serve(
-                    server.try_plan(bind).expect("H2 server plan"),
-                    context,
-                    listener,
-                    common::recover,
-                    |result| result.expect("H2 server runtime"),
-                )
-                .expect("H2 server resources");
-            assert!(
-                reports.events().expect("H2 retirement").is_empty(),
-                "{reports:?}"
-            );
-            Ok::<(), Infallible>(())
-        },
+        move |context, listener| serve(server, bind, context, listener),
         |address| {
             let mut socket = address
                 .try_connect(Duration::from_secs(3))
@@ -254,22 +209,7 @@ fn empty_fin_uses_no_credit() {
     let pair = Pair::bind().expect("H2 body-credit harness");
     let bind = pair.addr();
     pair.check(
-        move |context, listener| {
-            let reports = Echo
-                .try_serve(
-                    server.try_plan(bind).expect("H2 server plan"),
-                    context,
-                    listener,
-                    common::recover,
-                    |result| result.expect("H2 server runtime"),
-                )
-                .expect("H2 server resources");
-            assert!(
-                reports.events().expect("H2 retirement").is_empty(),
-                "{reports:?}"
-            );
-            Ok::<(), Infallible>(())
-        },
+        move |context, listener| serve(server, bind, context, listener),
         |address| {
             let mut socket = address
                 .try_connect(Duration::from_secs(3))

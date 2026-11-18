@@ -42,6 +42,10 @@ impl Length {
         self.0 as usize
     }
 
+    pub(crate) fn take(self, left: usize) -> Self {
+        Self(left.min(self.into_usize()) as u32)
+    }
+
     pub(crate) const fn from_wire(high: u8, middle: u8, low: u8) -> Self {
         Self(u32::from_be_bytes([0, high, middle, low]))
     }
@@ -72,7 +76,7 @@ impl Limit {
     }
 
     pub(crate) fn take(self, left: usize) -> Length {
-        Length(left.min(self.into_usize()) as u32)
+        Length(self.into_u32()).take(left)
     }
 }
 

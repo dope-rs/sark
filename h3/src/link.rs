@@ -70,13 +70,10 @@ pub enum Outcome {
     Blocked,
 }
 
-/// Drains one bounded turn while preserving each admitted write's exact brand.
+/// Drains one bounded turn while borrowing each pending write until admission.
 pub(crate) fn pump<'d, P: rules::Policy, A: rules::Push, E: From<conn::Error>>(
     conn: &mut conn::Connection<'d, P, A>,
-    mut send: impl for<'id, 'q> FnMut(
-        write::Flight<'id, 'd>,
-        write::Prepared<'id, 'q, 'd>,
-    ) -> Result<Option<write::Completion>, E>,
+    mut send: impl for<'q> FnMut(write::Front<'q, 'd>) -> Result<Option<write::Completion>, E>,
 ) -> Result<(Flush, bool), E> {
     if io::ingress::schedule::Status::new(conn).cancelled(None) {
         return Ok((Flush::Blocked, false));
@@ -89,10 +86,10 @@ pub(crate) fn pump<'d, P: rules::Policy, A: rules::Push, E: From<conn::Error>>(
             return Err(error.into());
         }
         let feedback = conn.session.qpack_decoder;
-        let Some(taken) = conn.queues.take(&mut conn.qpack.feedback, feedback) else {
+        let Some(front) = conn.queues.front(&mut conn.qpack.feedback, feedback) else {
             return Ok((Flush::Drained, released));
         };
-        let Some(done) = taken.with(&mut send)? else {
+        let Some(done) = send(front)? else {
             return Ok((Flush::Blocked, released));
         };
         match done {
@@ -121,16 +118,14 @@ pub trait Transport<'d> {
         &mut self,
         conn: &mut conn::Connection<'d, P, A>,
     ) -> Result<Flush, conn::Error> {
-        pump(conn, |write, prepared| {
+        pump(conn, |write| {
             Ok(match self.send_write(write.get()) {
                 Outcome::Accepted => {
-                    drop(write);
-                    Some(prepared.commit())
+                    let done = write.completion();
+                    drop(write.into_output());
+                    Some(done)
                 }
-                Outcome::Blocked => {
-                    prepared.restore(write);
-                    None
-                }
+                Outcome::Blocked => None,
             })
         })
         .map(|(flush, _)| flush)

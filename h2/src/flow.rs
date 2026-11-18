@@ -142,7 +142,7 @@ pub struct Pair<'a> {
 pub(crate) struct Debit<'a> {
     pair: Pair<'a>,
     stream: stream::Key,
-    amount: i32,
+    length: numbers::Length,
 }
 
 #[must_use = "reserved flow credit must be accepted, canceled, or transferred"]
@@ -163,9 +163,9 @@ impl<'a> Pair<'a> {
         self.conn.available().min(self.stream.available())
     }
 
-    pub(crate) fn debit_up_to(self, stream: stream::Key, limit: usize) -> Debit<'a> {
+    pub(crate) fn debit_up_to(self, stream: stream::Key, limit: numbers::Length) -> Debit<'a> {
         Debit {
-            amount: self.available().min(limit) as i32,
+            length: limit.take(self.available()),
             pair: self,
             stream,
         }
@@ -173,21 +173,22 @@ impl<'a> Pair<'a> {
 }
 
 impl Debit<'_> {
-    pub(crate) fn len(&self) -> usize {
-        self.amount as usize
+    pub(crate) fn length(&self) -> numbers::Length {
+        self.length
     }
 
     pub(crate) fn commit(self) {
-        self.pair.conn.value -= self.amount;
-        self.pair.conn.committed -= self.amount;
-        self.pair.stream.value -= self.amount;
-        self.pair.stream.committed -= self.amount;
+        let amount = self.length.into_u32() as i32;
+        self.pair.conn.value -= amount;
+        self.pair.conn.committed -= amount;
+        self.pair.stream.value -= amount;
+        self.pair.stream.committed -= amount;
     }
 
     pub(crate) fn reserve(self) -> Reserved {
-        let amount = self.amount as u32;
-        self.pair.conn.value -= self.amount;
-        self.pair.stream.value -= self.amount;
+        let amount = self.length.into_u32();
+        self.pair.conn.value -= amount as i32;
+        self.pair.stream.value -= amount as i32;
         Reserved {
             stream: self.stream,
             amount,

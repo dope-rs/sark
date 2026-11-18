@@ -176,7 +176,7 @@ impl<P: rules::Policy> Blocks<P> {
                     }
                 };
                 let budget = decoder.budget();
-                let block = Phase::<Decode>::Representation(decoder);
+                let block = Phase::<Decode>::new(decoder);
                 (
                     Mode::Active(Active {
                         pending: head,
@@ -195,11 +195,7 @@ impl<P: rules::Policy> Blocks<P> {
                 (
                     Mode::Active(Active {
                         pending: head,
-                        source: Source::Discard(
-                            Phase::<Discard>::Representation(decoder),
-                            budget,
-                            scratch,
-                        ),
+                        source: Source::Discard(Phase::<Discard>::new(decoder), budget, scratch),
                         wire_len: 0,
                     }),
                     Ok(()),
@@ -222,7 +218,7 @@ impl<P: rules::Policy> Blocks<P> {
                 None => decoder.discard(first),
                 Some(rest) => {
                     let mut budget = decoder.budget();
-                    let block = Phase::<Discard>::Representation(decoder);
+                    let block = Phase::<Discard>::new(decoder);
                     match block.feed_all(&mut budget, iter::once(first).chain(rest), ()) {
                         Ok((block, ())) => block.finish(),
                         Err(((), cause)) => Err(cause),
@@ -409,9 +405,10 @@ impl<P: rules::Policy> Blocks<P> {
                 }
             };
             let (first, rest) = bytes.split();
+            let mut budget = decoder.budget();
             let Some(rest) = rest else {
-                return match decoder.decode_to::<Decode, _>(first, sink.hpack::<A>()) {
-                    Ok((decoder, admit, _)) => match sink.finish(admit) {
+                return match decoder.decode_to::<Decode, _>(first, &mut budget, sink.hpack::<A>()) {
+                    Ok((decoder, _)) => match sink.finish(budget.admission) {
                         Ok((scratch, decoded)) => (Mode::Idle(decoder, scratch), Ok(decoded)),
                         Err(cause) => (Mode::Failed, Err(cause)),
                     },
@@ -421,8 +418,7 @@ impl<P: rules::Policy> Blocks<P> {
                     }
                 };
             };
-            let mut budget = decoder.budget();
-            let block = Phase::<Decode>::Representation(decoder);
+            let block = Phase::<Decode>::new(decoder);
             let block = match block.feed_all(
                 &mut budget,
                 iter::once(first).chain(rest),

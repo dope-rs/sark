@@ -96,25 +96,14 @@ impl<'d, 'a, 'scope, const ID: u8, B: stream::Recv, const RECONCILE: bool>
         O: life::Mode<C, Id>,
         B: stream::Retain<'d>,
     {
-        let (flush, done) = link::pump(h3, |write, prepared| -> Result<_, manifold::Error> {
+        let (flush, done) = link::pump(h3, |write| -> Result<_, manifold::Error> {
             let commit = commit::Commit {
-                prepared,
                 report: owners::Projection::new(&mut *life, handle),
             };
             match self.send(write, commit) {
                 admit::Outcome::Retained(done) | admit::Outcome::Discarded(done) => Ok(Some(done)),
-                admit::Outcome::Blocked { owner, commit } => {
-                    commit.prepared.restore(owner);
-                    Ok(None)
-                }
-                admit::Outcome::Failed {
-                    owner,
-                    commit,
-                    error,
-                } => {
-                    commit.prepared.restore(owner);
-                    Err(error.into())
-                }
+                admit::Outcome::Blocked { .. } => Ok(None),
+                admit::Outcome::Failed { error, .. } => Err(error.into()),
             }
         })?;
         if flush != Flush::Blocked
@@ -129,12 +118,12 @@ impl<'d, 'a, 'scope, const ID: u8, B: stream::Recv, const RECONCILE: bool>
         Ok(report::Report::new(flush, done))
     }
 
-    fn send<'id, C: admit::Commit<Shared<'d>, write::Flight<'id, 'd>>>(
+    fn send<'q, C: admit::Commit<Shared<'d>, write::Front<'q, 'd>>>(
         &mut self,
-        write: write::Flight<'id, 'd>,
+        write: write::Front<'q, 'd>,
         commit: C,
-    ) -> admit::Outcome<Shared<'d>, C, resident::Error, write::Flight<'id, 'd>> {
-        let target = write.target();
+    ) -> admit::Outcome<Shared<'d>, C, resident::Error, write::Front<'q, 'd>> {
+        let target = write.get().target();
         let id = target.stream_id();
         let handle = match target.key() {
             Some(key) => {
