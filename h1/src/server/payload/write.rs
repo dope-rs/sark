@@ -121,7 +121,7 @@ where
     let body = match egress::NonEmpty::try_new(body) {
         Ok(body) => body,
         Err(cause) => {
-            conn.write().reject(body::Failure::Payload(cause));
+            conn.reject_write(body::Failure::Payload(cause));
             return None;
         }
     };
@@ -135,11 +135,11 @@ where
                     maximum: parts.1.get(),
                 }
             };
-            conn.write().reject(cause);
+            conn.reject_write(cause);
             return None;
         }
     };
-    let rejected = match conn.write().admit(body, driver) {
+    let rejected = match conn.admit(body, driver) {
         Admit::Committed | Admit::Closed(_) => None,
         Admit::Deferred { .. } => {
             return Some(reason);
@@ -151,7 +151,7 @@ where
         }
     };
     if let Some(cause) = rejected {
-        conn.write().reject(cause);
+        conn.reject_write(cause);
     }
     None
 }

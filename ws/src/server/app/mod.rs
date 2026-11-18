@@ -243,7 +243,7 @@ impl<H: Sink> App<H> {
             && conn.state().acc.is_empty()
             && chunk.len() <= WS_MAX_ACC
         {
-            match conn.write().pending() {
+            match conn.pending_output() {
                 egress::Pending::Present => {}
                 egress::Pending::Absent => match opening::admit(&self.path, chunk) {
                     Ok(None) => {
@@ -284,7 +284,7 @@ impl<H: Sink> App<H> {
             && conn.state().acc.is_empty()
             && chunk.len() <= WS_MAX_ACC
         {
-            match conn.write().pending() {
+            match conn.pending_output() {
                 egress::Pending::Present => {}
                 egress::Pending::Absent => match self.try_direct(&mut conn, chunk, None, driver) {
                     Commit::Committed => return Outcome::Continue,
@@ -325,7 +325,7 @@ impl<H: Sink> App<H> {
         let temp = &mut self.temp;
         let result = 'write: {
             let mut native_slot = mem::MaybeUninit::uninit();
-            let mut native = match conn.write().try_prefix(driver, &mut native_slot) {
+            let mut native = match conn.try_prefix(driver, &mut native_slot) {
                 Ok(native) => native,
                 Err(cause) => break 'write Err(cause),
             };
@@ -375,7 +375,7 @@ impl<H: Sink> App<H> {
     ) -> Commit {
         let result = 'write: {
             let mut native_slot = mem::MaybeUninit::uninit();
-            let mut native = match conn.write().try_prefix(driver, &mut native_slot) {
+            let mut native = match conn.try_prefix(driver, &mut native_slot) {
                 Ok(native) => native,
                 Err(cause) => break 'write Err(cause),
             };
@@ -407,7 +407,7 @@ impl<H: Sink> App<H> {
         let opening = matches!(conn.state().phase, Phase::Handshake | Phase::Opening);
         let result = 'write: {
             let mut native_slot = mem::MaybeUninit::uninit();
-            let mut native = match conn.write().try_prefix(driver, &mut native_slot) {
+            let mut native = match conn.try_prefix(driver, &mut native_slot) {
                 Ok(native) => native,
                 Err(cause) => break 'write Err(cause),
             };
@@ -458,7 +458,7 @@ impl<H: Sink> App<H> {
         };
         conn.state_mut().phase = Phase::Closed;
         if let Some(cause) = cause {
-            conn.write().reject(cause);
+            conn.reject_write(cause);
         } else {
             conn.close_after();
         }
@@ -475,7 +475,7 @@ impl<H: Sink> App<H> {
         driver: &mut driver::Context<'_, 'd>,
     ) -> Commit {
         if let Some(load) = conn.state_mut().pending.take() {
-            match conn.write().admit(load, driver) {
+            match conn.admit(load, driver) {
                 body::Admit::Committed => {}
                 body::Admit::Deferred { load, .. } => {
                     conn.state_mut().pending = Some(load);
@@ -486,13 +486,13 @@ impl<H: Sink> App<H> {
                     return Commit::Closed;
                 }
                 body::Admit::Rejected { cause, .. } => {
-                    conn.write().reject(body::Failure::Capacity(cause));
+                    conn.reject_write(body::Failure::Capacity(cause));
                     Self::close(conn);
                     return Commit::Closed;
                 }
                 body::Admit::Unavailable(rejected) => {
                     let (_, cause) = rejected.into_parts();
-                    conn.write().reject(body::Failure::Reserve(cause));
+                    conn.reject_write(body::Failure::Reserve(cause));
                     Self::close(conn);
                     return Commit::Closed;
                 }

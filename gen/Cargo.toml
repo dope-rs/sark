@@ -1,6 +1,6 @@
 [package]
 name = "sark-gen"
-version.workspace = true
+version = "0.36.1"
 edition.workspace = true
 rust-version.workspace = true
 description = "Sark proc-macro generators"

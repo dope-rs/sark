@@ -209,7 +209,7 @@ where
         }
         let outcome = 'write: {
             let mut native_slot = mem::MaybeUninit::uninit();
-            let mut native = match conn.write().try_open(driver, &mut native_slot) {
+            let mut native = match conn.try_output(driver, &mut native_slot) {
                 Ok(native) => native,
                 Err(error::Admission::Deferred(_) | error::Admission::Closed) => {
                     return Ok(progress);
@@ -307,7 +307,7 @@ where
                         conn.close_after();
                         return Err((failure, progress));
                     }
-                    Err(failure) => conn.write().reject(failure),
+                    Err(failure) => conn.reject_write(failure),
                 }
                 return Ok(progress);
             }

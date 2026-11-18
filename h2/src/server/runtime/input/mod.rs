@@ -32,7 +32,7 @@ where
     let protocol = connection.state_mut().protocol();
     protocol.ingress().is_blocked()
         && (!protocol.output().is_empty()
-            || matches!(connection.write().pending(), egress::Pending::Present))
+            || matches!(connection.pending_output(), egress::Pending::Present))
 }
 
 pub(in crate::server) trait Fault: From<conn::Error> {

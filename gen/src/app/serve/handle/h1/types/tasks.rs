@@ -124,7 +124,7 @@ impl Tasks {
                 #ns_h1::pump::Activity::Idle => {}
                 #ns_h1::pump::Activity::Stream
                     if ::core::matches!(
-                        #v_link.write().pending(),
+                        #v_link.pending_output(),
                         #ns_fiber::dope::net::link::egress::Pending::Present
                     ) => {}
                 #ns_h1::pump::Activity::Task | #ns_h1::pump::Activity::Stream => {

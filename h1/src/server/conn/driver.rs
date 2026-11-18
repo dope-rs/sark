@@ -166,7 +166,7 @@ where
     let prior = pump::Ingress::deferred(conn.state());
     let admission = 'output: {
         let mut native_slot = mem::MaybeUninit::uninit();
-        let mut native = match conn.write().try_open(driver, &mut native_slot) {
+        let mut native = match conn.try_output(driver, &mut native_slot) {
             Ok(native) => native,
             Err(cause) => break 'output cause,
         };
@@ -214,7 +214,7 @@ where
                     .as_mut()
                     .cancel(&mut conn.state_mut().async_state, tag);
             }
-            conn.write().reject(cause);
+            conn.reject_write(cause);
             return Drive::new(Flow::Closed);
         }
         if wake {
@@ -255,7 +255,7 @@ where
         }
         write::error::Admission::Closed => Drive::new(Flow::Closed),
         write::error::Admission::Rejected(cause) => {
-            conn.write().reject(body::Failure::Capacity(cause));
+            conn.reject_write(body::Failure::Capacity(cause));
             Drive::new(Flow::Closed)
         }
     }

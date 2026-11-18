@@ -175,7 +175,7 @@ where
         };
         match hold {
             machine::Hold::Held => handler::Drain::Pending,
-            machine::Hold::Released => match self.conn.write().pending() {
+            machine::Hold::Released => match self.conn.pending_output() {
                 egress::Pending::Present => handler::Drain::Pending,
                 egress::Pending::Absent => handler::Drain::Complete,
             },
@@ -226,7 +226,7 @@ where
         let admission = 'output: {
             let scratch = &mut *self.scratch;
             let mut native_slot = mem::MaybeUninit::uninit();
-            let mut native = match self.conn.write().try_open(driver, &mut native_slot) {
+            let mut native = match self.conn.try_output(driver, &mut native_slot) {
                 Ok(native) => native,
                 Err(cause) => break 'output cause,
             };
@@ -279,8 +279,7 @@ where
             };
             if let Err(cause) = result {
                 self.conn
-                    .write()
-                    .reject(body::Failure::Mismatch(cause.into_cause()));
+                    .reject_write(body::Failure::Mismatch(cause.into_cause()));
                 return receive::Outcome::CloseAfter;
             }
             return match after {
@@ -295,7 +294,7 @@ where
             Admission::Deferred(_) => receive::Outcome::Continue,
             Admission::Closed => receive::Outcome::CloseAfter,
             Admission::Rejected(cause) => {
-                self.conn.write().reject(body::Failure::Capacity(cause));
+                self.conn.reject_write(body::Failure::Capacity(cause));
                 receive::Outcome::CloseAfter
             }
         }

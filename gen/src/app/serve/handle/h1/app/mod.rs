@@ -819,7 +819,7 @@ pub(super) fn build(
                                 let ControlFlow::Continue(#n_out) = #n_out else {
                                     return #n_out;
                                 };
-                                if self.conn.write().pending() == egress::Pending::Present {
+                                if self.conn.pending_output() == egress::Pending::Present {
                                     return ControlFlow::Break(#n_out);
                                 }
                                 #progress

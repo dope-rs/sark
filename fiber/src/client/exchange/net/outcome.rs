@@ -20,30 +20,27 @@ impl<'d, E> Outcome<'d, E> {
             Err(error) => Self::Error(error),
         }
     }
+}
 
-    pub(in crate::client) fn into_result(self) -> Result<response::Event<'d>, Error<E>> {
-        match self {
-            Self::Event(event) => Ok(event),
-            Self::Error(error) => Err(Error::Protocol(error)),
-            Self::Transport(error) => Err(Error::Transport(error)),
-            Self::Terminal(error) => Err(Error::Capacity(error)),
-        }
-    }
+impl<'s, 'b, 'c, 'd, E> recv::Spec<'s, 'b, 'c, 'd, Outcome<'d, E>> for Outcome<'d, E> {
+    type Context = ();
+    type Mode = ();
 }
 
 impl<'s, 'b, 'c, 'd, E> recv::Extract<'s, 'b, 'c, 'd, Outcome<'d, E>> for Outcome<'d, E> {
-    type Context = ();
     type Output = Result<response::Event<'d>, Failure<E>>;
 
     fn extract(
         _: &Self::Context,
         slot: &mut reply::Slot<'_, 's, 'b, 'c, 'd, Outcome<'d, E>, Outcome<'d, E>>,
     ) -> Option<Self::Output> {
-        let item = slot.pop().or_else(|| slot.pop_error())?;
-        Some(
-            item.into_result()
-                .map_err(|cause| Failure::new(cause, Safety::PossiblyCommitted)),
-        )
+        let cause = match slot.pop().or_else(|| slot.pop_error())? {
+            Self::Event(event) => return Some(Ok(event)),
+            Self::Error(error) => Error::Protocol(error),
+            Self::Transport(error) => Error::Transport(error),
+            Self::Terminal(error) => Error::Capacity(error),
+        };
+        Some(Err(Failure::new(cause, Safety::PossiblyCommitted)))
     }
 }
 

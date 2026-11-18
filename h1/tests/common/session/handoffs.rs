@@ -260,8 +260,7 @@ impl<'observe: 'd, 'd, ID: route::Identity> handler::Borrowed<'d, ID> for App<'o
 
         let mut native_slot = std::mem::MaybeUninit::uninit();
         let mut native = conn
-            .write()
-            .try_open(driver, &mut native_slot)
+            .try_output(driver, &mut native_slot)
             .expect("switch output admission");
         let receipt = {
             let (http, writer) = native.get_mut().parts();

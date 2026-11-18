@@ -78,7 +78,7 @@ pub(super) fn methods(
         let done = match sent {
             Ok(()) => done,
             Err(cause) => {
-                conn.write().reject(cause);
+                conn.reject_write(cause);
                 turn::Completion::Rejected
             }
         };
@@ -118,7 +118,7 @@ pub(super) fn methods(
                         Err(cause) => {
                             member.discard();
                             #credit
-                            conn.write().reject(cause);
+                            conn.reject_write(cause);
                             turn::Turn::retired(ready, turn::Completion::Rejected)
                         }
                     };
@@ -233,7 +233,7 @@ pub(super) fn methods(
                 let date = date.load();
                 let admission = 'write: {
                     let mut native_slot = ::core::mem::MaybeUninit::uninit();
-                    let mut native = match conn.write().try_open(driver, &mut native_slot) {
+                    let mut native = match conn.try_output(driver, &mut native_slot) {
                         Ok(native) => native,
                         Err(cause) => break 'write cause,
                     };
@@ -255,7 +255,7 @@ pub(super) fn methods(
                 };
                 let mut entry = entry;
                 #remove
-                if let Some(cause) = failure { conn.write().reject(cause); }
+                if let Some(cause) = failure { conn.reject_write(cause); }
                 else { Self::__release(conn); }
                 turn::Turn::retired(ready, turn::Completion::Rejected)
         }
@@ -336,13 +336,13 @@ pub(super) fn methods(
                             Ok(body) => Ok(body),
                             Err(rejected) => {
                                 let (body, maximum) = rejected.into_parts();
-                                conn.write().reject(body::Failure::Bound { charge: body.charge(), maximum: maximum.get() });
+                                conn.reject_write(body::Failure::Bound { charge: body.charge(), maximum: maximum.get() });
                                 Err(body.into_inner())
                             }
                         },
                         Err(rejected) => {
                             let (body, cause) = rejected.into_parts();
-                            conn.write().reject(body::Failure::Payload(cause));
+                            conn.reject_write(body::Failure::Payload(cause));
                             Err(body.into_inner())
                         }
                     };
@@ -352,7 +352,7 @@ pub(super) fn methods(
                     Err(body) => Err(body),
                     Ok(body) => {
                         let charge = data::raw::Payload::charge(body.as_inner());
-                        match conn.write().admit_right(body, driver) {
+                        match conn.admit_right(body, driver) {
                             body::Admit::Committed => {
                                 sequence::Mode::accept(life, conn.state_mut().async_state.session_mut(), exchange, charge);
                                 Ok(None)
@@ -360,12 +360,12 @@ pub(super) fn methods(
                             body::Admit::Deferred { load, .. } => Ok(Some(load)),
                             body::Admit::Closed(load) => Err(load.into_unbound().into_inner()),
                             body::Admit::Rejected { cause, load } => {
-                                conn.write().reject(body::Failure::Capacity(cause));
+                                conn.reject_write(body::Failure::Capacity(cause));
                                 Err(load.into_unbound().into_inner())
                             }
                             body::Admit::Unavailable(rejected) => {
                                 let (load, cause) = rejected.into_parts();
-                                conn.write().reject(body::Failure::Reserve(cause));
+                                conn.reject_write(body::Failure::Reserve(cause));
                                 Err(load.into_unbound().into_inner())
                             }
                         }
