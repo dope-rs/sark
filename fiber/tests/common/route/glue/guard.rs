@@ -118,5 +118,6 @@ sark_fiber::define_route! {
             ],
         },
         GET "/open" => open,
+        HEAD "/open" => open,
     }
 }

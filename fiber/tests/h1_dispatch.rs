@@ -197,6 +197,7 @@ fn guard_integration() {
                         Event::LogPass,
                         Event::Access(Some(b"/nested/inner/x".to_vec())),
                         Event::Open,
+                        Event::Open,
                     ],
                     "guard scope and handler order",
                 );
@@ -225,6 +226,31 @@ fn guard_integration() {
 
                 let resp = guarded_get(bind, "/nonexistent");
                 assert_eq!(resp.status_line(), b"HTTP/1.1 404 Not Found", "404 status");
+
+                for (method, tail, status) in [
+                    ("GET", "Content-Length: 1\r\nExpect: 100-continue\r\n\r\n", 400),
+                    ("HEAD", "Content-Length: 1\r\n\r\nx", 400),
+                    (
+                        "HEAD",
+                        "Transfer-Encoding: chunked\r\nExpect: 100-continue\r\n\r\n0\r\n\r\n",
+                        400,
+                    ),
+                    (
+                        "GET",
+                        "Content-Length: 1048577\r\nExpect: 100-continue\r\n\r\n",
+                        413,
+                    ),
+                    ("HEAD", "Content-Length: 0\r\n\r\n", 200),
+                ] {
+                    let request = format!(
+                        "{method} /open HTTP/1.1\r\nHost: x\r\nConnection: close\r\n{tail}"
+                    );
+                    let response = bind.try_request(&[request.as_bytes()]).expect("body policy");
+                    assert!(
+                        response.starts_with(format!("HTTP/1.1 {status} ").as_bytes()),
+                        "{method} {tail:?}: {response:?}",
+                    );
+                }
             },
             |result| {
                 assert!(
@@ -285,6 +311,23 @@ fn survives_bad_lengths() {
                             "bad Content-Length {clen:?} produced non-4xx response: {text}"
                         );
                     }
+                }
+
+                for (path, fields, status) in [
+                    ("/echo", "Connection: close, Upgrade\r\n", 400),
+                    ("/echo", "Connection: close\r\nUpgrade: websocket\r\n", 400),
+                    ("/missing", "Connection: close\r\nContent-Length: 1\r\n", 400),
+                    ("/missing", "Connection: close\r\n", 404),
+                ] {
+                    let prefix =
+                        format!("POST {path} HTTP/1.1\r\nHost: x\r\nContent-Length: 0\r\n");
+                    let response = bind
+                        .try_request(&[prefix.as_bytes(), fields.as_bytes(), b"\r\n"])
+                        .expect("framing response");
+                    assert!(
+                        response.starts_with(format!("HTTP/1.1 {status} ").as_bytes()),
+                        "{path} {fields:?}: {response:?}",
+                    );
                 }
 
                 let mut sock = TcpStream::connect(bind).expect("connect");

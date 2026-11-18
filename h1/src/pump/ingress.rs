@@ -106,11 +106,7 @@ impl Ingress {
                 deadline::Progress::new(progress.head(), deadline::Body::None),
             ),
         };
-        pump::Retention {
-            state,
-            progress,
-            discard_remaining: conn.ingress.discard_remaining,
-        }
+        pump::Retention { state, progress }
     }
 
     /// Parses, dispatches, and settles one borrowed-input transaction.

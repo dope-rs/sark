@@ -1,8 +1,10 @@
 use core::{
+    cell::Cell,
     mem::{align_of, needs_drop, size_of},
     ops,
 };
 
+use dope_runtime::civil::{Error as CivilError, Source as _, System};
 use o3::base::time;
 
 const DAYS: [[u8; 3]; 7] = [
@@ -60,6 +62,48 @@ impl ops::Deref for Stamp {
 
     fn deref(&self) -> &Self::Target {
         &self.0
+    }
+}
+
+/// Driver-local civil clock for automatic HTTP/1 Date fields.
+pub struct Clock {
+    stamp: Cell<Stamp>,
+}
+
+impl Clock {
+    pub fn new() -> Result<Self, Error> {
+        Ok(Self {
+            stamp: Cell::new(Self::read()?),
+        })
+    }
+
+    pub fn load(&self) -> Stamp {
+        self.stamp.get()
+    }
+
+    /// Advances the cached stamp when civil time is representable. A failed
+    /// sample leaves the last valid HTTP date intact.
+    pub fn refresh(&self) {
+        if let Ok(stamp) = Self::read() {
+            self.stamp.set(stamp);
+        }
+    }
+
+    fn read() -> Result<Stamp, Error> {
+        let now = System::NEW.read()?;
+        Stamp::from_unix(now.floor_secs()).ok_or(Error::Range)
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Error {
+    Civil(CivilError),
+    Range,
+}
+
+impl From<CivilError> for Error {
+    fn from(error: CivilError) -> Self {
+        Self::Civil(error)
     }
 }
 

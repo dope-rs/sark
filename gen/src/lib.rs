@@ -105,7 +105,7 @@ pub fn define_router(input: proc_macro::TokenStream) -> proc_macro::TokenStream 
     use self::app::App;
     let input = syn::parse_macro_input!(input as app::inputs::Input);
     emit(
-        |paths| App::new_router(paths, input).map(|app| app.router(paths, paths.h1())),
+        |paths| App::new_router(paths, input).map(|app| app.router(paths)),
         runtime::Requirement::Portable,
     )
 }

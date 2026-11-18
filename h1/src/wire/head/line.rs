@@ -63,7 +63,8 @@ pub enum Error<R: route::Schema> {
 }
 
 pub(super) enum Step<R: route::Schema> {
-    Complete(usize),
+    Field(usize),
+    End(usize),
     NeedMore,
     Bad(Error<R>),
 }
@@ -158,7 +159,8 @@ pub(super) struct Scan<'a, R: route::Schema, A = ()> {
 }
 
 impl<'a, R: route::Schema, A: Admission> Scan<'a, R, A> {
-    fn observe(&mut self, colon: usize, bounds: Bounds) -> Result<(), Step<R>> {
+    fn observe(&mut self, colon: usize, bounds: Bounds) -> Result<usize, Step<R>> {
+        let tail = bounds.tail;
         if A::FIELDS {
             let bounds = bounds.trimmed(self.rest);
             let name = self.try_prefix(colon)?;
@@ -176,7 +178,7 @@ impl<'a, R: route::Schema, A: Admission> Scan<'a, R, A> {
                 .field(name, value, span)
                 .map_err(|error| Step::Bad(Error::Admission(error)))?;
         }
-        Ok(())
+        Ok(self.start + tail + 2)
     }
 
     fn value(&self, colon: usize) -> Result<Bounds, Step<R>> {
@@ -261,7 +263,7 @@ impl<'a, R: route::Schema, A: Admission> Scan<'a, R, A> {
         };
         if term == b'\r' {
             return Err(if name_end == 0 && capped.get(1) == Some(&b'\n') {
-                Step::Complete(0)
+                Step::End(self.start + 2)
             } else if name_end == 0 && capped.len() == 1 {
                 Step::NeedMore
             } else {
@@ -291,14 +293,8 @@ impl<'a, R: route::Schema, A: Admission> Scan<'a, R, A> {
             Some(known) => self.scan_known(known, name_end),
             None => self.value(name_end),
         };
-        match bounds {
-            Ok(bounds) => {
-                let tail = bounds.tail;
-                match self.observe(name_end, bounds) {
-                    Ok(()) => Step::Complete(tail),
-                    Err(step) => step,
-                }
-            }
+        match bounds.and_then(|bounds| self.observe(name_end, bounds)) {
+            Ok(next) => Step::Field(next),
             Err(step) => step,
         }
     }
@@ -410,7 +406,6 @@ where
             Ok(bounds) => bounds,
             Err(step) => return step,
         };
-        let tail = bounds.tail;
         let value = match self.try_value(&bounds) {
             Ok(value) => value,
             Err(cause) => return Step::Bad(Error::Frame { slot, cause }),
@@ -423,7 +418,7 @@ where
             .map_err(|cause| Step::Bad(Error::Header(cause)))
             .and_then(|()| self.observe(colon, bounds))
         {
-            Ok(()) => Step::Complete(tail),
+            Ok(next) => Step::Field(next),
             Err(step) => step,
         }
     }

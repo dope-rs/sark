@@ -150,7 +150,6 @@ impl<'d> Egress<'d> {
 pub struct Retention {
     pub(crate) state: Result<(), Reject>,
     pub(crate) progress: deadline::Progress,
-    pub(crate) discard_remaining: usize,
 }
 
 /// Exact callback-borrowed suffix disposition after an ingress cycle.
@@ -176,42 +175,6 @@ pub struct Cycle<'d, H = Infallible> {
 }
 
 impl<'d, H> Cycle<'d, H> {
-    pub(crate) fn settled(left: usize) -> Self {
-        let head = if left == 0 {
-            deadline::Head::Ready
-        } else {
-            deadline::Head::Body
-        };
-        Self::ready(
-            Egress::None,
-            deadline::Progress::new(head, deadline::Body::None),
-            head::Connection::KeepAlive,
-            left,
-            Tail::Empty,
-        )
-    }
-
-    pub(crate) fn failed(error: Reject, left: usize) -> Self {
-        Self::rejected(
-            error,
-            deadline::Progress::new(deadline::Head::Ready, deadline::Body::None),
-            left,
-        )
-    }
-
-    pub(crate) fn retained(held: Retention) -> Self {
-        match held.state {
-            Ok(()) => Self::ready(
-                Egress::Wake,
-                held.progress,
-                head::Connection::KeepAlive,
-                held.discard_remaining,
-                Tail::Empty,
-            ),
-            Err(error) => Self::rejected(error, held.progress, held.discard_remaining),
-        }
-    }
-
     fn ready(
         egress: Egress<'d>,
         progress: deadline::Progress,

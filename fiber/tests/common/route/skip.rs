@@ -1,7 +1,5 @@
 use sark_http::payload::{fixed, response::status};
 
-pub const FULL: &[u8] = b"GET /full HTTP/1.1\r\nHost: local\r\n\r\n";
-
 #[sark_fiber::response(raw)]
 #[header("content-type", "text/plain")]
 pub struct PingReply<'d> {
@@ -43,12 +41,6 @@ async fn no_date() -> PingReply<'d> {
     PingReply {
         status: status::Code::OK,
         body: fixed::Body::new(b"ok"),
-    }
-}
-
-sark_fiber::define_router! {
-    pub CachedRouter: () => {
-        GET "/full" => full,
     }
 }
 

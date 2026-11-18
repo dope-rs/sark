@@ -76,13 +76,6 @@ pub struct NamedPath {
     pub user_id: storage::Shared,
 }
 
-pub const NAMED_PATH_FRAGMENTS: [&[u8]; 4] = [
-    b"POST /users/be",
-    b"ta/teams/alpha HTTP/1.1\r\nHost: local\r\nTransfer-Encoding: chu",
-    b"nked\r\n\r\n1\r\nx\r\n",
-    b"0\r\n\r\n",
-];
-
 #[sark::handler(pub)]
 pub(crate) fn item(request: ItemRequest, state: &State) -> EchoResponse<'req> {
     state.request_head.set(request.id.as_ptr().addr());

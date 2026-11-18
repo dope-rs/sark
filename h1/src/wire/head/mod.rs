@@ -66,12 +66,6 @@ pub enum Error<R: route::Schema> {
     Method(Semantic),
     Layout(target::Error),
     UnsupportedTransferEncoding,
-    Offset {
-        base: usize,
-        relative: usize,
-        suffix: usize,
-        available: usize,
-    },
 }
 
 /// One scanned HTTP/1 field block before request-target admission.
@@ -182,26 +176,6 @@ impl<H, A: Admission> Block<H, A> {
         self.fields.message.coding()
     }
 
-    fn advance<R: route::Schema>(
-        input: &[u8],
-        base: usize,
-        relative: usize,
-    ) -> Result<usize, Error<R>> {
-        const SUFFIX: usize = 2;
-
-        let next = relative
-            .checked_add(SUFFIX)
-            .and_then(|offset| base.checked_add(offset))
-            .filter(|next| *next <= input.len())
-            .ok_or(Error::Offset {
-                base,
-                relative,
-                suffix: SUFFIX,
-                available: input.len(),
-            })?;
-        Ok(next)
-    }
-
     /// Scans one route-specific HTTP/1 field block.
     #[doc(hidden)]
     pub fn parse<R>(
@@ -275,10 +249,10 @@ impl<H, A: Admission> Block<H, A> {
                 version,
             };
             match R::Header::prefix(prefix) {
-                line::Step::Complete(0) => break Some(Self::advance::<R>(input, pos, 0)?),
-                line::Step::Complete(relative) => {
+                line::Step::End(end) => break Some(end),
+                line::Step::Field(next) => {
                     count += 1;
-                    pos = Self::advance::<R>(input, pos, relative)?;
+                    pos = next;
                 }
                 line::Step::NeedMore => break None,
                 line::Step::Bad(cause) => return Err(Error::Line(cause)),

@@ -1,11 +1,11 @@
 pub mod common;
 use std::convert::Infallible;
 
-use common::deadline::{Generation, Range};
+use common::deadline::{Generation, Range, key};
 use o3::{
     base::time::Positive,
     depot::{
-        arena::{hash, hash::runtime},
+        arena::slab::key::{Generation as Epoch, Handle, Parts},
         capacity::Count,
     },
 };
@@ -149,12 +149,9 @@ fn total_precedes_phase() {
 
 #[test]
 fn resident_generation() {
-    let plan = (hash::Plan::new(1)).expect("the fixture capacity must fit");
-    let mut registry =
-        (runtime::Registry::<u64, Generation>::try_new(plan)).expect("registry allocation");
     let agenda = deadline::Agenda::<_, _>::try_new(Count::new(1));
     let mut agenda = agenda.expect("agenda allocation");
-    let first = (registry.insert(7)).expect("first generation insertion");
+    let first = key::<Generation>(0);
     assert!(
         deadline::Book::schedule(
             &mut agenda,
@@ -162,9 +159,10 @@ fn resident_generation() {
             deadline::Scheduled::expire(11_u64, deadline::Phase::Head),
         ) == Ok(())
     );
-    assert_eq!(registry.entry(first).map(|entry| entry.remove()), Some(7));
-
-    let next = (registry.insert(9)).expect("next generation insertion");
+    let next = Handle::from_parts(Parts::new(
+        0,
+        Epoch::MIN.checked_add(1).expect("next generation"),
+    ));
     assert!(
         deadline::Book::schedule(
             &mut agenda,
@@ -186,13 +184,7 @@ fn resident_generation() {
 
 #[test]
 fn range_error_keeps_domain() {
-    let plan = (hash::Plan::new(2)).expect("the fixture capacity must fit");
-    let mut registry =
-        (runtime::Registry::<u64, Range>::try_new(plan)).expect("registry allocation");
-    let first = (registry.insert(7)).expect("first insertion");
-    let outside = (registry.insert(9)).expect("second insertion");
-    assert_eq!(first.index(), 0);
-    assert_eq!(outside.index(), 1);
+    let outside = key::<Range>(1);
 
     let item = deadline::Scheduled::expire(11_u64, deadline::Phase::Head);
     let error = deadline::Error::OutOfRange {
@@ -209,10 +201,7 @@ fn range_error_keeps_domain() {
 
 #[test]
 fn replace_preserves_lanes() {
-    let plan = hash::Plan::new(1).expect("fixture capacity");
-    let mut registry =
-        runtime::Registry::<u64, Generation>::try_new(plan).expect("registry allocation");
-    let key = registry.insert(7).expect("first insertion");
+    let key = key::<Generation>(0);
     let mut agenda =
         deadline::Agenda::<_, _, Infallible>::try_new(Count::new(1)).expect("agenda allocation");
     for (previous, phase) in [
@@ -241,10 +230,7 @@ fn replace_preserves_lanes() {
 
 #[test]
 fn wake_follows_expiry() {
-    let plan = hash::Plan::new(1).expect("fixture capacity");
-    let mut registry =
-        runtime::Registry::<u64, Generation>::try_new(plan).expect("registry allocation");
-    let key = registry.insert(7).expect("first insertion");
+    let key = key::<Generation>(0);
     let mut agenda = deadline::Agenda::try_new(Count::new(1)).expect("agenda allocation");
     let items = [
         deadline::Scheduled::expire(10_u64, deadline::Phase::Total),
@@ -270,10 +256,7 @@ fn transition_preserves_minimum() {
     use deadline::{Book, Phase, Scheduled, WakeReason};
     use timeline::Transition;
 
-    let plan = hash::Plan::new(1).expect("fixture capacity");
-    let mut registry =
-        runtime::Registry::<u64, Generation>::try_new(plan).expect("registry allocation");
-    let key = registry.insert(7).expect("insertion");
+    let key = key::<Generation>(0);
     let mut agenda = deadline::Agenda::try_new(Count::new(1)).expect("agenda allocation");
     let config = Config::new(Phase::Total, Positive::from_secs::<10>())
         .with(Phase::BodyIdle, Positive::from_secs::<5>())
@@ -313,14 +296,8 @@ fn transition_preserves_minimum() {
 fn poll_bounds_renewals() {
     use deadline::{Book, Poll};
 
-    let plan = hash::Plan::new(3).expect("fixture capacity");
-    let mut registry =
-        runtime::Registry::<u64, Generation>::try_new(plan).expect("registry allocation");
-    let keys = [
-        registry.insert(1).expect("first insertion"),
-        registry.insert(2).expect("second insertion"),
-    ];
-    let due = registry.insert(3).expect("third insertion");
+    let [first, second, due] = [0, 1, 2].map(key::<Generation>);
+    let keys = [first, second];
     let mut agenda = deadline::Agenda::<_, _>::try_new(Count::new(3)).expect("agenda allocation");
     let config = Config::new(deadline::Phase::BodyIdle, Positive::from_secs::<5>());
     for key in keys {

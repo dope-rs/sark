@@ -2,26 +2,16 @@
 
 use std::mem;
 
-use sark_core::route::table;
-use sark_http::{
-    h1::head::{
-        request::Coding,
-        response::{Date, Server},
-    },
-    payload::fixed,
+use sark_http::h1::head::{
+    request::Coding,
+    response::{Date, Server},
 };
 
-use crate::wire::Failure;
-
-mod driver;
 pub mod duplex;
 mod pending;
-pub mod set;
 pub mod stream;
 pub mod sync;
 pub mod task;
-
-pub use driver::Driver;
 
 /// Response-cache action selected for one HTTP/1 route.
 #[derive(Clone, Copy)]
@@ -53,14 +43,6 @@ impl Policy {
 
 const _: () = assert!(mem::size_of::<Policy>() == 4 * mem::size_of::<bool>());
 const _: () = assert!(mem::size_of::<Cache>() == mem::size_of::<bool>());
-
-/// Supplies protocol policy without adding HTTP/1 state to a route type.
-pub trait Router: table::Router<Table: set::Table<Self::State>> {
-    /// Selects the terminal consumer of exact HTTP/1 failures.
-    fn failure<'d>(&self, cause: &Failure) -> fixed::Body<'d> {
-        cause.body()
-    }
-}
 
 #[doc(hidden)]
 pub trait PolicyOf {

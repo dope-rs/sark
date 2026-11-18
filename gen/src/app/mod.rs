@@ -55,15 +55,11 @@ impl App {
         })
     }
 
-    pub(super) fn router(
-        mut self,
-        paths: &Paths,
-        h1: crate::runtime::H1,
-    ) -> proc_macro2::TokenStream {
+    pub(super) fn router(mut self, paths: &Paths) -> proc_macro2::TokenStream {
         use self::serve::handle::router;
 
         let (scope, schema) = self.prepare(paths);
-        let handle = router::build(paths, &self.spec, h1);
+        let handle = router::build(paths, &self.spec);
         scope.finish(quote::quote! {
             #schema
             #handle
