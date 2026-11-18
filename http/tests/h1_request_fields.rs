@@ -34,43 +34,37 @@ fn empty() {
 
 #[test]
 fn length() {
-    let headers = &[Entry::new(b"Content-Length", b"42")];
-    let scan = (Fields::try_scan(headers)).expect("valid request fields");
-    assert_eq!(scan.message.length(), Some(42));
+    for (value, length) in [
+        (b"42".as_slice(), 42),
+        (b"  42  ", 42),
+        (b"0", 0),
+        (b"0042", 42),
+    ] {
+        let headers = &[Entry::new(b"Content-Length", value)];
+        let scan = (Fields::try_scan(headers)).expect("valid request fields");
+        assert_eq!(scan.message.length(), Some(length));
+    }
 }
 
 #[test]
 fn duplicate_length() {
-    let headers = &[
-        Entry::new(b"Content-Length", b"42"),
-        Entry::new(b"Content-Length", b"42"),
-    ];
-    assert!(Fields::try_scan(headers).is_err());
+    for value in [b"42", b"99"] {
+        let headers = &[
+            Entry::new(b"Content-Length", b"42"),
+            Entry::new(b"Content-Length", value),
+        ];
+        assert!(Fields::try_scan(headers).is_err());
+    }
 }
 
 #[test]
-fn conflicting_lengths() {
-    let headers = &[
-        Entry::new(b"Content-Length", b"42"),
-        Entry::new(b"Content-Length", b"99"),
-    ];
-    assert!(Fields::try_scan(headers).is_err());
-}
-
-#[test]
-fn chunked() {
-    let headers = &[Entry::new(b"Transfer-Encoding", b"chunked")];
-    let scan = (Fields::try_scan(headers)).expect("valid request fields");
-    assert!(scan.message.has_coding());
-    assert!(scan.message.is_chunked());
-}
-
-#[test]
-fn non_chunked() {
-    let headers = &[Entry::new(b"Transfer-Encoding", b"gzip")];
-    let scan = (Fields::try_scan(headers)).expect("valid request fields");
-    assert!(scan.message.has_coding());
-    assert!(!scan.message.is_chunked());
+fn transfer_coding() {
+    for (value, chunked) in [(b"chunked".as_slice(), true), (b"gzip", false)] {
+        let headers = [Entry::new(b"Transfer-Encoding", value)];
+        let scan = Fields::try_scan(&headers).expect("valid request fields");
+        assert!(scan.message.has_coding());
+        assert_eq!(scan.message.is_chunked(), chunked);
+    }
 }
 
 #[test]
@@ -103,13 +97,6 @@ fn invalid_lengths() {
 }
 
 #[test]
-fn trimmed_length() {
-    let headers = &[Entry::new(b"Content-Length", b"  42  ")];
-    let scan = (Fields::try_scan(headers)).expect("valid request fields");
-    assert_eq!(scan.message.length(), Some(42));
-}
-
-#[test]
 fn empty_name() {
     let headers = &[
         Entry::new(b"", b"ignored"),
@@ -133,20 +120,6 @@ fn case_insensitive() {
     let headers = &[Entry::new(b"CONTENT-LENGTH", b"42")];
     let fields = (Fields::try_scan(headers)).expect("valid request fields");
     assert_eq!(fields.message.length(), Some(42));
-}
-
-#[test]
-fn zero_length() {
-    let headers = &[Entry::new(b"Content-Length", b"0")];
-    let scan = (Fields::try_scan(headers)).expect("valid request fields");
-    assert_eq!(scan.message.length(), Some(0));
-}
-
-#[test]
-fn leading_zeros() {
-    let headers = &[Entry::new(b"Content-Length", b"0042")];
-    let scan = (Fields::try_scan(headers)).expect("valid request fields");
-    assert_eq!(scan.message.length(), Some(42));
 }
 
 #[test]
@@ -193,19 +166,13 @@ fn rejects_double_chunked() {
 }
 
 #[test]
-fn rejects_conflicting_len() {
-    assert!(
-        Fields::try_headers(&[(Known::ContentLength, b"5"), (Known::ContentLength, b"7"),])
-            .is_err()
-    );
-}
-
-#[test]
 fn rejects_duplicate_len() {
-    assert!(
-        Fields::try_headers(&[(Known::ContentLength, b"5"), (Known::ContentLength, b"5"),])
-            .is_err()
-    );
+    for value in [b"7".as_slice(), b"5"] {
+        assert!(
+            Fields::try_headers(&[(Known::ContentLength, b"5"), (Known::ContentLength, value)])
+                .is_err()
+        );
+    }
 }
 
 #[test]

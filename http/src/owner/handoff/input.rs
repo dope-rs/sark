@@ -93,8 +93,7 @@ impl<'req, 'd, P: stage::Proof> Bound<'req, 'd, P> {
     fn slot(view: body::Ref<'req, 'd>, proof: P) -> Slot<'req, 'd, (), Self> {
         let source = match view.try_retained() {
             Ok(body) => origin::Source::Retained(Self { body, proof }),
-            Err(body) if body.is_empty() => origin::Source::Empty,
-            Err(_) => origin::Source::Borrowed(PhantomData),
+            Err(_) => origin::Source::Empty(PhantomData),
         };
         Slot {
             origin: Origin { source },

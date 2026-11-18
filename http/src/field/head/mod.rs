@@ -4,8 +4,6 @@ mod parse;
 
 use core::mem;
 
-use known::Known;
-
 pub use parse::AcceptEncoding;
 
 use crate::{
@@ -89,16 +87,16 @@ impl Name {
             Self::Status => b":status",
             Self::Authority => b":authority",
             Self::Protocol => b":protocol",
-            Self::Host => Known::Host.as_str().as_bytes(),
-            Self::Connection => Known::Connection.as_str().as_bytes(),
-            Self::ContentLength => Known::ContentLength.as_str().as_bytes(),
-            Self::TransferEncoding => Known::TransferEncoding.as_str().as_bytes(),
-            Self::Expect => Known::Expect.as_str().as_bytes(),
-            Self::AcceptEncoding => Known::AcceptEncoding.as_str().as_bytes(),
-            Self::Te => Known::Te.as_str().as_bytes(),
-            Self::KeepAlive => Known::KeepAlive.as_str().as_bytes(),
-            Self::ProxyConnection => Known::ProxyConnection.as_str().as_bytes(),
-            Self::Upgrade => Known::Upgrade.as_str().as_bytes(),
+            Self::Host => known::HOST.as_bytes(),
+            Self::Connection => known::CONNECTION.as_bytes(),
+            Self::ContentLength => known::CONTENT_LENGTH.as_bytes(),
+            Self::TransferEncoding => known::TRANSFER_ENCODING.as_bytes(),
+            Self::Expect => known::EXPECT.as_bytes(),
+            Self::AcceptEncoding => known::ACCEPT_ENCODING.as_bytes(),
+            Self::Te => known::TE.as_bytes(),
+            Self::KeepAlive => known::KEEP_ALIVE.as_bytes(),
+            Self::ProxyConnection => known::PROXY_CONNECTION.as_bytes(),
+            Self::Upgrade => known::UPGRADE.as_bytes(),
             Self::Invalid | Self::Regular => b"",
         }
     }

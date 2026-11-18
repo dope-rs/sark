@@ -8,7 +8,7 @@ use crate::{
         scan::{Bytes, Outcome},
         text::{Ascii, IntError},
     },
-    h1::head::request,
+    h1::{field, head::request},
 };
 
 pub(super) const fn is_whitespace(byte: u8) -> bool {
@@ -39,16 +39,16 @@ pub(super) fn clen_line(scan: &mut request::Fields, raw: &[u8]) -> Result<Option
 }
 
 pub(super) fn te_line(scan: &mut request::Fields, raw: &[u8]) -> Result<Option<Bounds>, Error> {
-    let (bounds, value) = match try_token_line_lit(raw, b"chunked") {
-        Some(bounds) => (bounds, b"chunked".as_slice()),
+    let (bounds, message) = match try_token_line_lit(raw, b"chunked") {
+        Some(bounds) => (bounds, scan.message.try_append(field::Transfer::CHUNKED)),
         None => {
             let Some(bounds) = trim_line(raw)? else {
                 return Ok(None);
             };
-            (bounds, bounds.value(raw))
+            (bounds, scan.message.try_coding(bounds.value(raw)))
         }
     };
-    scan.message = scan.message.try_coding(value).map_err(Error::Message)?;
+    scan.message = message.map_err(Error::Message)?;
     Ok(Some(bounds))
 }
 

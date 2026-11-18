@@ -6,7 +6,7 @@ pub mod path;
 mod scheme;
 pub mod target;
 
-use core::net;
+use core::{net, num::NonZero};
 
 pub use error::Error;
 pub use host::Host;
@@ -122,7 +122,7 @@ impl<'a> Authority<'a> {
     }
 
     pub(crate) fn is_reg(value: &[u8]) -> bool {
-        is_reg_span(record::Span::from_slice(value))
+        reg_name_len(record::Span::from_slice(value)).is_some_and(|len| len.get() == value.len())
     }
 
     pub(crate) fn is_ip(value: &[u8]) -> bool {
@@ -192,10 +192,6 @@ impl<'a> Source<'a> for record::Span<'a> {
     }
 }
 
-fn is_digits<'a, S: Source<'a>>(value: S) -> bool {
-    value.span().iter().all(u8::is_ascii_digit)
-}
-
 impl<'a, S: Source<'a>> Parts<S> {
     fn parse(value: S) -> Result<Self, Error> {
         let len = value.len();
@@ -227,7 +223,7 @@ impl<'a, S: Source<'a>> Parts<S> {
                 let Some(port) = suffix.sub(1, suffix.len()) else {
                     return Err(Error::InvalidPort);
                 };
-                if !is_digits(port) {
+                if !port.span().iter().all(u8::is_ascii_digit) {
                     return Err(Error::InvalidPort);
                 }
                 Some(port)
@@ -237,30 +233,22 @@ impl<'a, S: Source<'a>> Parts<S> {
             };
             return Ok(Self { host, port });
         }
-        let span = value.span();
-        let mut bytes = span.iter();
-        let colon = bytes.position(|byte| *byte == b':');
-        if bytes.any(|byte| *byte == b':') {
-            return Err(Error::InvalidHost);
-        }
-        let host_end = colon.unwrap_or(len);
-        let Some(host) = value.sub(0, host_end) else {
-            return Err(Error::InvalidHost);
-        };
-        if !is_reg_span(host.span()) {
-            return Err(Error::InvalidHost);
-        }
-        let port = match colon {
-            Some(index) => {
-                let Some(port) = value.sub(index + 1, len) else {
-                    return Err(Error::InvalidPort);
-                };
-                if !is_digits(port) {
-                    return Err(Error::InvalidPort);
-                }
-                Some(port)
+        let end = reg_name_len(value.span()).ok_or(Error::InvalidHost)?.get();
+        let host = value.sub(0, end).ok_or(Error::InvalidHost)?;
+        let port = if end == len {
+            None
+        } else {
+            let port = value.sub(end + 1, len).ok_or(Error::InvalidPort)?;
+            let span = port.span();
+            let mut bytes = span.iter().copied();
+            if let Some(bad) = bytes.find(|byte| !byte.is_ascii_digit()) {
+                return Err(if bad == b':' || bytes.any(|byte| byte == b':') {
+                    Error::InvalidHost
+                } else {
+                    Error::InvalidPort
+                });
             }
-            None => None,
+            Some(port)
         };
         Ok(Self { host, port })
     }
@@ -294,23 +282,21 @@ fn normalized_port_span(
     }
 }
 
-fn is_reg_span(value: record::Span<'_>) -> bool {
-    if value.is_empty() {
-        return false;
-    }
-    let mut bytes = value.iter().copied();
-    while let Some(byte) = bytes.next() {
+fn reg_name_len(value: record::Span<'_>) -> Option<NonZero<usize>> {
+    let mut bytes = value.iter().enumerate();
+    while let Some((index, &byte)) = bytes.next() {
+        if byte == b':' {
+            return NonZero::new(index);
+        }
         if byte == b'%' {
-            if bytes.next().is_none_or(|byte| !byte.is_ascii_hexdigit())
-                || bytes.next().is_none_or(|byte| !byte.is_ascii_hexdigit())
-            {
-                return false;
+            if !bytes.next()?.1.is_ascii_hexdigit() || !bytes.next()?.1.is_ascii_hexdigit() {
+                return None;
             }
         } else if !is_reg_byte(byte) {
-            return false;
+            return None;
         }
     }
-    true
+    NonZero::new(value.len())
 }
 
 fn is_reg_byte(byte: u8) -> bool {

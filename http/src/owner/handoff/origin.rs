@@ -16,11 +16,10 @@ pub(crate) struct Origin<'req, 'd, B = body::Retained<'req, 'd>> {
 
 #[derive(Clone, Copy)]
 pub(in crate::owner::handoff) enum Source<'req, 'd, B = body::Retained<'req, 'd>> {
-    Empty,
     /// A borrowed projection carries no owner that a response can link to.
     /// Its bytes are valid for `'req` within the projection domain `'d`;
     /// this arm preserves that relation.
-    Borrowed(PhantomData<&'req &'d ()>),
+    Empty(PhantomData<&'req &'d ()>),
     Retained(B),
     Task(Id<'d>),
 }
@@ -29,7 +28,7 @@ impl<'req, 'd> Origin<'req, 'd> {
     pub(crate) const fn new(body: body::Ref<'req, 'd>) -> Self {
         let source = match body.try_retained() {
             Ok(body) => Source::Retained(body),
-            Err(_) => Source::Borrowed(PhantomData),
+            Err(_) => Source::Empty(PhantomData),
         };
         Self { source }
     }
@@ -38,7 +37,7 @@ impl<'req, 'd> Origin<'req, 'd> {
 impl<'req, 'd, B: stage::Body<'req, 'd>> Origin<'req, 'd, B> {
     pub(crate) const fn empty() -> Self {
         Self {
-            source: Source::Empty,
+            source: Source::Empty(PhantomData),
         }
     }
 

@@ -3,7 +3,7 @@ use std::borrow::Cow;
 use o3::alloc::{self, StrExt as _};
 
 use crate::{
-    field::{self, Error, head::known::Known, storage},
+    field::{self, Error, head::known, storage},
     h1::field::Entry,
 };
 
@@ -57,11 +57,11 @@ impl<'a> Name<&'a [u8]> {
 }
 
 impl<'field> Name<Cow<'field, str>> {
-    pub const CONTENT_TYPE: Self = Self(Cow::Borrowed(Known::ContentType.as_str()));
+    pub const CONTENT_TYPE: Self = Self(Cow::Borrowed(known::CONTENT_TYPE));
 
     pub fn try_copy(name: &[u8]) -> Result<Self, storage::Error> {
-        if let Some(known) = Known::from_bytes(name) {
-            return Ok(Self(Cow::from(known)));
+        if let Some(known) = known::from_bytes(name) {
+            return Ok(Self(Cow::Borrowed(known)));
         }
         let name = Name::try_bytes(name).map_err(storage::Error::Syntax)?;
         Self::try_lowered(name).map_err(storage::Error::Allocation)
@@ -69,8 +69,8 @@ impl<'field> Name<Cow<'field, str>> {
 
     pub(crate) fn try_entry(field: Entry<'_>) -> Result<Self, alloc::Exhausted> {
         let name = field.name();
-        match Known::from_bytes(name) {
-            Some(known) => Ok(Self(Cow::from(known))),
+        match known::from_bytes(name) {
+            Some(known) => Ok(Self(Cow::Borrowed(known))),
             None => Self::try_lowered(Name(name)),
         }
     }
@@ -87,8 +87,8 @@ impl<'field> Name<Cow<'field, str>> {
 
     pub(crate) fn try_lower(mut self) -> Result<Self, alloc::Exhausted> {
         if self.0.bytes().any(|byte| byte.is_ascii_uppercase()) {
-            match Known::from_bytes(self.0.as_bytes()) {
-                Some(known) => self.0 = Cow::from(known),
+            match known::from_bytes(self.0.as_bytes()) {
+                Some(known) => self.0 = Cow::Borrowed(known),
                 None => {
                     let mut name = storage::try_own(self.0)?;
                     name.make_ascii_lowercase();

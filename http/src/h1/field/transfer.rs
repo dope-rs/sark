@@ -24,6 +24,11 @@ impl Default for Transfer {
 }
 
 impl Transfer {
+    pub(crate) const CHUNKED: Self = Self {
+        codings: 1,
+        last: framing::Transfer::Chunked,
+    };
+
     pub fn parse(mut self, value: &[u8]) -> Result<Self, value::Error> {
         let mut parser = Parser::new(value);
         parser.skip_ows();

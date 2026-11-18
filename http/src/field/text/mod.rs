@@ -28,50 +28,42 @@ impl<'a> Ascii<'a> {
     }
 
     pub fn parse_usize(&self) -> Result<usize, IntError> {
-        let (value, end) = self.parse_prefix()?;
-        if end != self.bytes.len() {
-            return Err(IntError::InvalidByte);
-        }
-        Ok(value)
+        Ok(parse::<{ usize::MAX as u64 }, false>(self.bytes)?.0 as usize)
     }
 
     pub fn parse_prefix(&self) -> Result<(usize, usize), IntError> {
-        parse(self.bytes, 0usize, |value, digit| {
-            value.checked_mul(10)?.checked_add(usize::from(digit))
-        })
+        let (value, end) = parse::<{ usize::MAX as u64 }, true>(self.bytes)?;
+        Ok((value as usize, end))
     }
 
     pub fn parse_u64(&self) -> Result<u64, IntError> {
-        let (value, end) = parse(self.bytes, 0u64, |value, digit| {
-            value.checked_mul(10)?.checked_add(u64::from(digit))
-        })?;
-        if end != self.bytes.len() {
-            return Err(IntError::InvalidByte);
-        }
-        Ok(value)
+        Ok(parse::<{ u64::MAX }, false>(self.bytes)?.0)
     }
 }
 
-fn parse<T>(
-    bytes: &[u8],
-    zero: T,
-    mut push: impl FnMut(T, u8) -> Option<T>,
-) -> Result<(T, usize), IntError> {
+fn parse<const MAX: u64, const PREFIX: bool>(bytes: &[u8]) -> Result<(u64, usize), IntError> {
     if bytes.is_empty() {
         return Err(IntError::Empty);
     }
 
-    let mut value = zero;
+    let checked = bytes.len() > MAX.ilog10() as usize;
+    let mut value = 0u64;
     let mut end = 0usize;
     for &byte in bytes {
         if !byte.is_ascii_digit() {
-            break;
+            if PREFIX && end != 0 {
+                break;
+            }
+            return Err(IntError::InvalidByte);
         }
-        value = push(value, byte - b'0').ok_or(IntError::Overflow)?;
-        end += 1;
-    }
-    if end == 0 {
-        return Err(IntError::InvalidByte);
+        let digit = u64::from(byte - b'0');
+        if checked && (value > MAX / 10 || value == MAX / 10 && digit > MAX % 10) {
+            return Err(IntError::Overflow);
+        }
+        value = value * 10 + digit;
+        if PREFIX {
+            end += 1;
+        }
     }
     Ok((value, end))
 }

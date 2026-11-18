@@ -186,7 +186,7 @@ impl Fields {
     }
 
     pub fn ranges(&self) -> RangeIter<'_> {
-        RangeIter::new(self.bytes.as_ref(), 0)
+        RangeIter::new(self.iter(), 0)
     }
 }
 

@@ -40,7 +40,9 @@ impl<const PREFIX: usize> From<Decoded<pool::Span, PREFIX>> for Shared {
 
 impl<S: AsRef<[u8]>, const PREFIX: usize> Decoded<S, PREFIX> {
     pub fn iter(&self) -> Iter<'_> {
-        Iter::new(&self.storage.as_ref()[PREFIX..])
+        // SAFETY: Finished admits PREFIX bytes; frozen and scoped owners preserve
+        // that extent without exposing mutable storage.
+        Iter::new(unsafe { self.storage.as_ref().get_unchecked(PREFIX..) })
     }
 
     pub fn len(&self) -> usize {
@@ -62,7 +64,7 @@ impl<S: AsRef<[u8]>, const PREFIX: usize> Decoded<S, PREFIX> {
     }
 
     pub fn ranges(&self) -> RangeIter<'_> {
-        RangeIter::new(self.storage.as_ref(), PREFIX)
+        RangeIter::new(self.iter(), PREFIX)
     }
 
     pub fn try_to_owned(&self) -> Result<Vec<Owned>, alloc::Error> {
