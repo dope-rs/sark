@@ -126,8 +126,8 @@ impl<'id, 'input, 'd, R: buffer::Cursor + hold::raw::Retain<'d>> Item<'id, 'inpu
         framing: &mut Framing<'d>,
         budget: resident::Budget<'d>,
     ) -> Result<(Framing<'d>, Parsed<'d>, End<'id>), Error> {
-        match self {
-            Self::Chunk(chunk) => chunk.try_commit(framing, budget),
+        let (data, fields, consumed) = match self {
+            Self::Chunk(chunk) => return chunk.try_commit(framing, budget),
             Self::Complete {
                 fields,
                 mut chunks,
@@ -140,52 +140,44 @@ impl<'id, 'input, 'd, R: buffer::Cursor + hold::raw::Retain<'d>> Item<'id, 'inpu
                         return Err(Error::Retention(error));
                     }
                 };
-                let data = chunks.pending.finish()?;
-                Ok((
-                    Framing::Head,
-                    Chunks::complete(data, fields).into(),
-                    consumed,
-                ))
+                (chunks.pending.finish()?, fields, consumed)
             }
             Self::Append {
                 mut plan,
                 mut pending,
             } => loop {
-                match plan.try_append(|| pending.finish()) {
-                    Ok((owner, consumed, data)) => {
-                        let owner = owner.into_owner();
-                        let fields =
-                            (!owner.is_empty()).then(|| response::Fields::admit(owner.freeze()));
-                        return Ok((
-                            Framing::Head,
-                            Chunks::complete(data, fields).into(),
-                            consumed,
-                        ));
-                    }
-                    Err(rejected) => {
-                        let (mut retained, error) = rejected.into_parts();
-                        let error = match error {
-                            trailer::AppendError::Ready(error) => error,
-                            trailer::AppendError::Capacity(error) => {
-                                match Chunks::grow(budget, &mut retained, error) {
-                                    Ok(()) => {
-                                        plan = retained;
-                                        continue;
-                                    }
-                                    Err(error) => error,
-                                }
-                            }
-                        };
-                        *framing = Self::Append {
-                            plan: retained,
-                            pending,
+                let error = match plan.try_append() {
+                    Ok(append) => match pending.finish() {
+                        Ok(data) => {
+                            let (owner, consumed) = append.commit();
+                            let owner = owner.into_owner();
+                            let fields = (!owner.is_empty())
+                                .then(|| response::Fields::admit(owner.freeze()));
+                            break (data, fields, consumed);
                         }
-                        .cancel();
-                        return Err(error);
+                        Err(error) => {
+                            plan = append.cancel();
+                            error
+                        }
+                    },
+                    Err(rejected) => {
+                        let (retained, error) = rejected.into_parts();
+                        plan = retained;
+                        match Chunks::grow(budget, &mut plan, error) {
+                            Ok(()) => continue,
+                            Err(error) => error,
+                        }
                     }
-                }
+                };
+                *framing = Self::Append { plan, pending }.cancel();
+                return Err(error);
             },
-        }
+        };
+        Ok((
+            Framing::Head,
+            Chunks::complete(data, fields).into(),
+            consumed,
+        ))
     }
 }
 

@@ -47,6 +47,9 @@ pub struct More<T> {
 
 pub struct Ready<T>(T);
 
+#[must_use]
+pub struct Append<'input, 'd, T>(Plan<'input, 'd, Ready<T>>);
+
 /// The exact completed trailer owner, excluding the terminating empty line.
 pub struct Complete<'d> {
     source: Owned<resident::Budget<'d>>,
@@ -56,18 +59,6 @@ pub struct Complete<'d> {
 pub enum StoreError {
     Prefix(NonZero<usize>),
     Capacity(consume::Error),
-}
-
-#[derive(Debug)]
-pub enum AppendError<E> {
-    Capacity(consume::Error),
-    Ready(E),
-}
-
-impl<E> From<consume::Error> for AppendError<E> {
-    fn from(error: consume::Error) -> Self {
-        Self::Capacity(error)
-    }
 }
 
 impl Pending<'_> {
@@ -201,7 +192,7 @@ impl<'d, T> Plan<'_, 'd, More<T>> {
     }
 }
 
-impl<'d, T> Plan<'_, 'd, Ready<T>> {
+impl<'input, 'd, T> Plan<'input, 'd, Ready<T>> {
     /// Borrows completed field lines before appending or releasing either source.
     pub fn fields(&self) -> [&[u8]; 2] {
         let prefix = self.state.source.as_slice();
@@ -219,24 +210,36 @@ impl<'d, T> Plan<'_, 'd, Ready<T>> {
         }
     }
 
-    /// Publishes completed bytes only after capacity and final work succeed.
-    pub fn try_append<V, E>(
-        self,
-        ready: impl FnOnce() -> Result<V, E>,
-    ) -> Result<(Complete<'d>, T, V), Rejected<Self, AppendError<E>>> {
-        let mut this = self;
-        let mut spare = this.state.source.spare();
-        let value = match spare.try_append(this.bytes, || ready().map_err(AppendError::Ready)) {
-            Ok(value) => value,
-            Err(error) => {
-                return Err(Rejected::new(this, error));
+    pub fn try_append(self) -> Result<Append<'input, 'd, T>, Rejected<Self, consume::Error>> {
+        let source = &self.state.source;
+        match consume::Error::check(self.bytes.len(), source.capacity() - source.len()) {
+            Ok(()) => Ok(Append(self)),
+            Err(error) => Err(Rejected::new(self, error)),
+        }
+    }
+}
+
+impl<'input, 'd, T> Append<'input, 'd, T> {
+    pub fn cancel(self) -> Plan<'input, 'd, Ready<T>> {
+        self.0
+    }
+
+    pub fn commit(self) -> (Complete<'d>, T) {
+        let plan = self.0;
+        let mut source = plan.state.source;
+        let start = source.len();
+        let bytes = plan.bytes;
+        // SAFETY: admission retained this exclusive owner with room for all bytes.
+        // Ready proved the final CRLF spans the two disjoint slices.
+        unsafe {
+            if bytes.len() > 2 {
+                bytes
+                    .as_ptr()
+                    .copy_to_nonoverlapping(source.as_mut_ptr().add(start), bytes.len() - 2);
             }
-        };
-        spare.commit();
-        let mut source = this.state.source;
-        let len = source.len() - 2;
-        source.truncate(len);
-        Ok((Complete { source }, this.next.0, value))
+            source.set_len(start + bytes.len() - 2);
+        }
+        (Complete { source }, plan.next.0)
     }
 }
 

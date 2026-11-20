@@ -157,41 +157,56 @@ fn finish_alloc_failure_releases() {
 
 #[test]
 fn chunk_retries_budget() {
-    resident::Domain::try_scope(output::DATA_LIMIT, |budget| {
+    resident::Domain::try_scope(output::DATA_LIMIT + 3, |budget| {
         let codec = Codec::default();
         let mut state = codec::Stateful::state(&codec, budget);
-        let head = (Shared::try_copy(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n"))
+        let head = Shared::try_copy(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n")
             .expect("head fixture storage");
-        let fragment = (Shared::try_copy(b"3\r\nabc\r\n")).expect("fragment fixture storage");
+        let fragment = Shared::try_copy(b"3\r\nabc\r\n").expect("fragment fixture storage");
+        let decoder = Decoder::try_new(&codec).expect("codec staging");
         assert!(
-            Decoder::try_new(&codec)
-                .expect("codec staging")
+            decoder
                 .try_parse(&mut state, &head, &budget)
                 .expect("codec parse")
                 .is_some()
         );
-        let decoder = Decoder::try_new(&codec).expect("codec staging");
         let mut stored = decoder.storage(&fragment, &state);
         let blocker =
             storage::Owned::try_allocate(&budget, budget.available()).expect("resident blocker");
         assert_budget(decoder.try_stored(&mut state, &mut stored, &budget), budget);
         drop(blocker);
-        let (_, consumed) = (decoder
+        let (_, consumed) = decoder
             .try_stored(&mut state, &mut stored, &budget)
-            .expect("codec parse"))
-        .expect("fragment retry must parse");
+            .expect("codec parse")
+            .expect("fragment retry must parse");
         assert_eq!(&fragment.as_slice()[consumed.get()..], b"\r\n");
-        let end = (Shared::try_copy(b"\r\n0\r\n\r\n")).expect("end fixture storage");
-        let (head, _) = (Decoder::try_new(&codec)
-            .expect("codec staging")
-            .try_parse(&mut state, &end, &budget)
-            .expect("codec parse"))
-        .expect("chunk terminator must parse");
-        let (data,) = match only(head) {
-            Some(Ok(Event::Data(data))) => Some((data,)),
-            _ => None,
-        }
-        .expect("chunk terminator must emit data");
+        let prefix = Shared::try_copy(b"\r\n0\r\n\r").expect("trailer prefix");
+        assert!(
+            decoder
+                .try_parse(&mut state, &prefix, &budget)
+                .expect("prefix")
+                .is_none()
+        );
+        let end = Shared::try_copy(b"\n").expect("trailer end");
+        let mut stored = decoder.storage(&end, &state);
+        // Grow the one-byte trailer owner, then fail pending body compaction.
+        let failed =
+            Tracker::fail_after(1, || decoder.try_stored(&mut state, &mut stored, &budget));
+        assert!(matches!(
+            failed,
+            Err(common::codec::decoder::Error::Protocol(
+                protocol::Error::Compact(Error::Exhausted)
+            ))
+        ));
+        assert_eq!(stored.source().as_ref(), b"\n");
+        let (head, used) = decoder
+            .try_stored(&mut state, &mut stored, &budget)
+            .expect("compact retry")
+            .expect("complete response");
+        assert_eq!(used.get(), 1);
+        let Some(Ok(Event::Data(data))) = only(head) else {
+            panic!("missing body")
+        };
         assert_eq!(data.as_slice(), b"abc");
     })
     .expect("resident test domain");
