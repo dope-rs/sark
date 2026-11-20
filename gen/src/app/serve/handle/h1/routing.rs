@@ -18,7 +18,7 @@ pub(super) fn build<'view, 'source>(
     let [v_exch, v_head, v_input] = symbols.locals(["exchange", "head", "input"]);
     let [v_method, v_result, v_parsed] = symbols.locals(["method", "outcome", "parsed"]);
     let [v_wait, v_permit, v_ready] = symbols.locals(["pending", "permit", "ready"]);
-    let [v_resp, v_run, v_source] = symbols.locals(["response", "runtime", "source"]);
+    let [v_run, v_source] = symbols.locals(["runtime", "source"]);
     let [v_stamp, v_this] = symbols.locals(["stamp", "this"]);
     let [v_write, v_routes] = symbols.locals(["write", "routes"]);
     let [g_id, g_mode] = types.names.generics.idents(["__ID", "__M"]);
@@ -65,60 +65,14 @@ pub(super) fn build<'view, 'source>(
         }
     });
     let finish = &routes.finish_arms;
-    let finish_body =
-        (!finish.is_empty()).then(|| quote!(#v_routes.__finish_body(#v_exch, #v_result, #v_run)));
     let ready = &proto.connections.ready;
     let head = &proto.connections.head;
     let resume = &routes.resume_arms;
-    let finished = terminal::completed(paths, types.names.generics, &quote!(#v_run.session_mut()));
-    let complete = quote! {
-                match &#v_result {
-                    #ns_h1::session::Outcome::Park { .. } => {
-                        #ns_core::life::Mode::observe(
-                            #v_this.#f_life,
-                            #ns_core::life::Event::TaskAdmitted(#v_exch),
-                        );
-                    }
-                    #ns_h1::session::Outcome::Streamed { .. } => {
-                        #ns_core::life::sequence::Mode::commit(
-                            #v_this.#f_life,
-                            #v_run.session_mut(),
-                            #v_exch,
-                            0,
-                            #ns_http::o3::buffer::hold::Charge::default(),
-                        );
-                        #ns_core::life::Mode::observe(
-                            #v_this.#f_life,
-                            #ns_core::life::Event::TaskAdmitted(#v_exch),
-                        );
-                    }
-                    #ns_h1::session::Outcome::Complete { response: #v_resp, .. } => {
-                        #finished
-                    }
-                    #ns_h1::session::Outcome::Switch { .. } => {
-                        #ns_core::life::sequence::Mode::commit(
-                            #v_this.#f_life,
-                            #v_run.session_mut(),
-                            #v_exch,
-                            0,
-                            #ns_http::o3::buffer::hold::Charge::default(),
-                        );
-                        #v_exch.retire(
-                            #v_this.#f_life,
-                            #ns_core::life::Outcome::Completed,
-                        );
-                    }
-                    #ns_h1::session::Outcome::Close(_)
-                    | #ns_h1::session::Outcome::Failed(_) => {
-                        #v_exch.retire(
-                            #v_this.#f_life,
-                            #ns_core::life::Outcome::Rejected,
-                        );
-                    }
-                    #ns_h1::session::Outcome::NeedMore { .. } => {}
-                }
-                #v_result
+    let settled = quote! {
+        #v_result.settle::<false, _, _>(#v_this.#f_life, #v_run.session_mut(), #v_exch);
+        #ns_h1::session::BodyOutcome::Complete(#v_result)
     };
+    let finish_body = (!finish.is_empty()).then_some(&settled);
     let build = if resume.is_empty() {
         quote!(match #v_ready {})
     } else {
@@ -126,7 +80,7 @@ pub(super) fn build<'view, 'source>(
             let mut #v_this = #v_routes.as_mut().project();
             let #v_exch = #v_ready.exchange;
             let #v_result = match #v_ready.route { #resume };
-            #v_routes.__finish_body(#v_exch, #v_result, #v_run)
+            #settled
         }
     };
     let consume = [false, true].map(|owned| {
@@ -260,18 +214,6 @@ pub(super) fn build<'view, 'source>(
         {
             #methods
 
-            fn __finish_body(
-                self: ::core::pin::Pin<&mut Self>,
-                #v_exch: #ns_core::life::exchange::Id<
-                    #ns_fiber::dope::manifold::network::listener::conn::Id<'d, #g_id>, ::core::primitive::u64,
-                >,
-                #v_result: #ns_h1::session::Outcome<'d, #raw>,
-                #v_run: &mut #rt,
-            ) -> #ns_h1::session::BodyOutcome<'d, #ready, #raw> {
-                let mut #v_this = self.project();
-                let #v_result = { #complete };
-                #ns_h1::session::BodyOutcome::Complete(#v_result)
-            }
         }
 
         impl<#g_turn, #def> #ns_h1::session::Dispatch<'d, #rt, #wait, #policy>

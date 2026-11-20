@@ -117,7 +117,7 @@ pub(super) fn emit<'view, 'source, 'spec>(
     let [n_tasks, v_conn, v_date] = symbols.locals(["__tasks", "conn", "date"]);
     let [v_error, v_exch, v_head] = symbols.locals(["error", "exchange", "head"]);
     let [v_result, v_parsed, v_wait] = symbols.locals(["outcome", "parsed", "pending"]);
-    let [v_permit, v_resp, v_state] = symbols.locals(["permit", "response", "state"]);
+    let [v_permit, v_state] = symbols.locals(["permit", "state"]);
     let [v_this, v_write] = symbols.locals(["this", "write"]);
     let v_routes = symbols.local("routes");
     let ns_core = &paths.core;
@@ -148,9 +148,6 @@ pub(super) fn emit<'view, 'source, 'spec>(
     let head = &plan.pending_variant;
     let open = terminal::open(paths, &ctx.plan.spec.state_generics);
     let failed = terminal::failed(paths, &ctx.plan.spec.state_generics);
-    let reject = quote! {
-        #ns_core::life::sequence::Mode::reject(#v_this.#f_life, #v_exch);
-    };
     let parsed = match source {
         Source::Owned => quote!(#v_parsed),
         Source::Borrowed | Source::Resumed => quote!(&#v_parsed),
@@ -337,72 +334,6 @@ pub(super) fn emit<'view, 'source, 'spec>(
             (quote!(), invoke)
         }
     };
-    let input = quote! {
-        #ns_core::life::Mode::observe(
-            #v_this.#f_life,
-            #ns_core::life::Event::InputFinished(#v_exch),
-        );
-    };
-    let commit = quote! {
-        #ns_core::life::sequence::Mode::commit(
-            #v_this.#f_life,
-            #v_conn.async_state.session_mut(),
-            #v_exch,
-            0,
-            #ns_http::o3::buffer::hold::Charge::default(),
-        );
-    };
-    let response = match &plan.mode {
-        serve::Mode::Sync | serve::Mode::Stream { .. } => {
-            let finished = terminal::completed(
-                paths,
-                &ctx.plan.spec.state_generics,
-                &quote!(#v_conn.async_state.session_mut()),
-            );
-            quote! {
-                #ns_h1::session::Outcome::Complete { response: #v_resp, .. } => {
-                    #input
-                    #finished
-                }
-            }
-        }
-        serve::Mode::Duplex { .. } | serve::Mode::Fiber { .. } => quote! {
-            #ns_h1::session::Outcome::Complete { .. } => {}
-        },
-    };
-    let watch = match &plan.mode {
-        serve::Mode::Sync | serve::Mode::Duplex { .. } => {
-            quote! {
-                #ns_h1::session::Outcome::Switch { .. } => {
-                    #input
-                    #commit
-                    #v_exch.retire(#v_this.#f_life, #ns_core::life::Outcome::Completed);
-                }
-                #ns_h1::session::Outcome::Streamed { .. }
-                | #ns_h1::session::Outcome::Park { .. } => {}
-            }
-        }
-        serve::Mode::Fiber { .. } | serve::Mode::Stream { .. } => {
-            let admitted = quote! {
-                #ns_core::life::Mode::observe(
-                    #v_this.#f_life,
-                    #ns_core::life::Event::TaskAdmitted(#v_exch),
-                );
-            };
-            quote! {
-                #ns_h1::session::Outcome::Park { .. } => {
-                    #input
-                    #admitted
-                }
-                #ns_h1::session::Outcome::Streamed { .. } => {
-                    #input
-                    #commit
-                    #admitted
-                }
-                #ns_h1::session::Outcome::Switch { .. } => {}
-            }
-        }
-    };
     let name = cont.name();
     let pending = cont.route();
     let body = if plan.entry.upgrade {
@@ -435,13 +366,7 @@ pub(super) fn emit<'view, 'source, 'spec>(
             #ns_h1::session::RouteOutcome::AwaitHead { pending: #v_wait, .. }
             | #ns_h1::session::RouteOutcome::AwaitReject { pending: #v_wait, .. } => match #v_wait {},
             #ns_h1::session::RouteOutcome::Outcome(#v_value) => {
-                match &#v_value {
-                    #response
-                    #watch
-                    #ns_h1::session::Outcome::Close(_)
-                    | #ns_h1::session::Outcome::Failed(_) => { #reject }
-                    #ns_h1::session::Outcome::NeedMore { .. } => {}
-                }
+                #v_value.settle::<true, _, _>(#v_this.#f_life, #v_conn.async_state.session_mut(), #v_exch);
                 #ns_h1::session::RouteOutcome::Outcome(#v_value)
             }
             #body

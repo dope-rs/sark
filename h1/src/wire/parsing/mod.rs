@@ -298,12 +298,21 @@ pub(crate) struct Line {
 }
 
 #[doc(hidden)]
-pub enum LineError<'d> {
+pub enum Rejection<'d> {
     Close(fixed::Body<'d>),
     Failed(Failure),
 }
 
-impl<'d> LineError<'d> {
+impl<'d, D> From<Rejection<'d>> for session::Outcome<'d, D> {
+    fn from(error: Rejection<'d>) -> Self {
+        match error {
+            Rejection::Close(body) => Self::Close(body),
+            Rejection::Failed(error) => Self::Failed(error),
+        }
+    }
+}
+
+impl<'d> Rejection<'d> {
     pub fn response(self, failure: impl FnOnce(&Failure) -> fixed::Body<'d>) -> fixed::Body<'d> {
         match self {
             Self::Close(body) => body,
@@ -322,19 +331,19 @@ pub(crate) enum LineProgress {
 }
 
 impl Line {
-    pub(crate) fn start<'d>(input: Input<'_>) -> Result<Self, LineError<'d>> {
+    pub(crate) fn start<'d>(input: Input<'_>) -> Result<Self, Rejection<'d>> {
         Self::snapshot(input.as_slice(), 0)
     }
 
-    fn snapshot<'d>(input: &[u8], extra: usize) -> Result<Self, LineError<'d>> {
+    fn snapshot<'d>(input: &[u8], extra: usize) -> Result<Self, Rejection<'d>> {
         if input.len() > recv::HEAD_CAPACITY {
-            return Err(LineError::Close(rejection(ParseError::too_large(
+            return Err(Rejection::Close(rejection(ParseError::too_large(
                 input.len(),
                 recv::HEAD_CAPACITY,
             ))));
         }
         line::Request::try_partial(input)
-            .map_err(|_| LineError::Close(rejection(ParseError::invalid())))?;
+            .map_err(|_| Rejection::Close(rejection(ParseError::invalid())))?;
         let capacity = NonZero::new(input.len() + extra).unwrap_or(NonZero::<usize>::MIN);
         let source = Source::try_copy(input, capacity).map_err(line_failure)?;
         Ok(Self { source })
@@ -344,7 +353,7 @@ impl Line {
         self.source.as_ref().len()
     }
 
-    fn fragment<'a, 'd>(prior: &[u8], input: &'a [u8]) -> Result<&'a [u8], LineError<'d>> {
+    fn fragment<'a, 'd>(prior: &[u8], input: &'a [u8]) -> Result<&'a [u8], Rejection<'d>> {
         let end = if prior.last() == Some(&b'\r') {
             1
         } else {
@@ -355,7 +364,7 @@ impl Line {
         };
         let actual = prior.len().saturating_add(end);
         if actual > recv::HEAD_CAPACITY {
-            return Err(LineError::Close(rejection(ParseError::too_large(
+            return Err(Rejection::Close(rejection(ParseError::too_large(
                 actual,
                 recv::HEAD_CAPACITY,
             ))));
@@ -366,23 +375,23 @@ impl Line {
     pub(crate) fn prefixed<'d>(
         prefix: sark_http::preface::Prefix,
         input: Input<'_>,
-    ) -> Result<LineProgress, LineError<'d>> {
+    ) -> Result<LineProgress, Rejection<'d>> {
         let prefix = prefix.as_ref();
         match Head::parse(Input::Borrowed(prefix), 0) {
             Ok(None) => {}
-            Err(_) => return Err(LineError::Close(canned::BAD_REQUEST)),
+            Err(_) => return Err(Rejection::Close(canned::BAD_REQUEST)),
             Ok(Some(_)) => unreachable!("preface"),
         }
         let fragment = Self::fragment(prefix, input.as_slice())?;
         Self::snapshot(prefix, fragment.len())?.extend(fragment)
     }
 
-    pub(crate) fn advance<'d>(self, input: Input<'_>) -> Result<LineProgress, LineError<'d>> {
+    pub(crate) fn advance<'d>(self, input: Input<'_>) -> Result<LineProgress, Rejection<'d>> {
         let fragment = Self::fragment(self.source.as_ref(), input.as_slice())?;
         self.extend(fragment)
     }
 
-    fn extend<'d>(mut self, fragment: &[u8]) -> Result<LineProgress, LineError<'d>> {
+    fn extend<'d>(mut self, fragment: &[u8]) -> Result<LineProgress, Rejection<'d>> {
         let prior = self.len();
         self.source.write_slice(fragment).map_err(line_failure)?;
         match self.source.as_ref() {
@@ -391,12 +400,12 @@ impl Line {
                 prior,
                 used: fragment.len(),
             }),
-            [.., b'\r', _] => Err(LineError::Close(rejection(ParseError::invalid()))),
+            [.., b'\r', _] => Err(Rejection::Close(rejection(ParseError::invalid()))),
             _ => Ok(LineProgress::Pending(self)),
         }
     }
 }
 
-fn line_failure<'d>(error: storage::AllocError) -> LineError<'d> {
-    LineError::Failed(Failure::Input(InputError::Storage(error)))
+fn line_failure<'d>(error: storage::AllocError) -> Rejection<'d> {
+    Rejection::Failed(Failure::Input(InputError::Storage(error)))
 }

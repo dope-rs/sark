@@ -10,6 +10,8 @@ pub mod stream;
 pub mod sync;
 pub mod task;
 
+pub use pending::Pending;
+
 /// HTTP/1-only response policy selected after routing.
 #[derive(Clone, Copy)]
 pub struct Policy {

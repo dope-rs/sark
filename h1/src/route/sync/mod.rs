@@ -1,5 +1,5 @@
 //! Synchronous HTTP/1 route execution over borrowed protocol storage.
-use core::{convert::Infallible, mem};
+use core::{convert::Infallible, mem, ops::ControlFlow};
 
 use sark_core::{
     body,
@@ -7,17 +7,19 @@ use sark_core::{
     decode::Call,
     manifold, route,
 };
-use sark_http::payload::{compress, response::dispatch};
+use sark_http::{
+    owner::handoff,
+    payload::{
+        compress,
+        response::{Body as _, dispatch},
+    },
+};
 
 use crate::{
-    route::PolicyOf,
+    route::{Pending, PolicyOf},
     session, switch,
     wire::{Failure, body::View, output, parsing::framing},
 };
-
-mod pending;
-
-pub use pending::Pending;
 
 /// Borrowed resources required to produce one synchronous HTTP/1 response.
 /// The aggregate owns no allocation and keeps every output borrow live for the
@@ -55,6 +57,74 @@ impl<'turn, C: compress::Compression> Egress<'turn, C> {
             },
         )
         .map_err(|failure| Failure::Projection(failure.discard()))?
+    }
+}
+
+impl<'d, R: route::Spec> Pending<'d, R> {
+    pub fn respond<S, E, D>(
+        self,
+        done: session::Complete,
+        permit: session::Permit,
+        state: &S,
+        egress: Egress<'_, impl compress::Compression>,
+        mut proof: E,
+    ) -> session::Outcome<'d, D>
+    where
+        E: credit::Evidence,
+        R: manifold::Route<S> + route::Spec<Kind = dispatch::Sync> + PolicyOf,
+    {
+        let Self {
+            head,
+            response,
+            content_length,
+            body: mut owner,
+        } = self;
+        let Egress { output, gzip } = egress;
+        let output = output.with_context(response);
+        let mut body = match Self::admit(&mut owner, done.body_len, content_length, &mut proof) {
+            Ok(body) => body,
+            Err(error) => return error.into(),
+        };
+        let ready = match <<R::Request as route::Schema>::Body as body::Project>::try_project(
+            &mut body,
+            (head.borrow(), state, output, gzip),
+            |scope| {
+                let ((request, state, output, gzip), view) = scope.into_parts();
+                let input = view.body();
+                let call = Call::new(request, view);
+                let reply = call.try_invoke::<R, S>(state).map_err(|error| {
+                    Failure::Route(<R::Request as route::Project>::reject(error))
+                })?;
+                output.try_stage(reply, handoff::Slot::new(input), gzip, R::POLICY)
+            },
+        ) {
+            Ok(Ok(ready)) => ready,
+            Ok(Err(error)) => return session::Outcome::Failed(error),
+            Err(failure) => {
+                return session::Outcome::Failed(Failure::Projection(failure.discard()));
+            }
+        };
+        let ready = match ready {
+            ControlFlow::Continue(ready) => {
+                drop(owner);
+                ready
+            }
+            ControlFlow::Break(declared) => {
+                let body = owner;
+                let actual = body.len();
+                if actual != declared {
+                    return session::Outcome::Failed(Failure::Admission(
+                        body::Error::LengthMismatch { actual, declared },
+                    ));
+                }
+                output::Complete::Linked { body }
+            }
+        };
+        ready.into_consume(
+            permit,
+            session::Consumption::Buffered(session::Buffered::new(done.consumed)),
+            response.connection(),
+        )
     }
 }
 
@@ -103,26 +173,6 @@ where
         }
     }
 
-    fn pending<R: route::Spec, E: credit::Evidence>(
-        &mut self,
-        permit: session::Permit,
-        frame: framing::Pending<R>,
-        proof: E,
-    ) -> session::RouteOutcome<'d, Pending<'d, R>, Transitions::Raw> {
-        let state = frame.state;
-        let expect = frame.expectation;
-        let mut wait = Pending::from_frame(frame);
-        if let Err(error) = wait.push_body(self.connection.ingress.payload.take(), proof) {
-            return session::Outcome::Failed(Failure::Assembly(error)).into();
-        }
-        permit.commit();
-        session::RouteOutcome::AwaitBody {
-            state,
-            expectation: expect,
-            pending: wait,
-        }
-    }
-
     fn buffered<R, S, E: credit::Evidence>(
         mut self,
         permit: session::Permit,
@@ -136,7 +186,7 @@ where
         let frame = match framing::Frame::drive(found, &mut self.connection.ingress, &mut proof) {
             Ok(framing::Progress::Complete(frame)) => frame,
             Ok(framing::Progress::Pending(wait)) => {
-                return self.pending(permit, wait, proof);
+                return Pending::start(wait, self.connection.ingress.payload.take(), permit, proof);
             }
             Err(reason) => {
                 return reason.into_consume().into();
@@ -174,7 +224,7 @@ where
         let frame = match framing::Discard::drive(found, &mut self.connection.ingress, &mut proof) {
             Ok(framing::Discarded::Complete(frame)) => frame,
             Ok(framing::Discarded::Pending(wait)) => {
-                return self.pending(permit, wait, proof);
+                return Pending::start(wait, self.connection.ingress.payload.take(), permit, proof);
             }
             Err(reason) => {
                 return reason.into_consume().into();

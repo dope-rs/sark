@@ -121,7 +121,7 @@ impl Routes {
                         let #v_output = #ns_h1::wire::output::Egress::new(
                             #v_write, #v_date, #v_wait.response(),
                         );
-                        #v_wait.finish::<#state_ty, _, _>(
+                        #v_wait.respond::<#state_ty, _, _>(
                             #v_body,
                             #v_permit,
                             *#v_this.#f_state,
@@ -202,20 +202,12 @@ impl Routes {
                                 #v_run,
                                 #source,
                             );
-                            let #v_result = #v_wait.finish::<
-                                #state_ty,
-                                _,
-                                _,
-                                _,
-                                _,
-                                _,
-                            >(
+                            #v_wait.stream::<#state_ty, _, _, _, _, _>(
                                 #v_body,
                                 #v_permit,
                                 #v_exec,
                                 #evidence,
-                            );
-                            #v_result
+                            )
                         }
                     }
                 }
@@ -227,7 +219,7 @@ impl Routes {
                                 *#v_this.#f_state,
                                 |#v_sess| #wrapped,
                             );
-                            #v_wait.finish::<#state_ty, #duplex, _, _>(
+                            #v_wait.connect::<#state_ty, #duplex, _, _>(
                                 #v_body,
                                 #v_permit,
                                 #v_finish,

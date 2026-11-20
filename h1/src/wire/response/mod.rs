@@ -87,6 +87,13 @@ impl Context {
         self
     }
 
+    pub(crate) const fn connection(self) -> Connection {
+        match self.version {
+            Version::Ten | Version::ElevenClose => Connection::Close,
+            Version::TenKeepAlive | Version::Eleven => Connection::KeepAlive,
+        }
+    }
+
     pub(in crate::wire) const fn connection_field(self) -> &'static [u8] {
         match self.version {
             Version::TenKeepAlive => consts::KEEP_ALIVE,

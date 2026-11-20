@@ -146,7 +146,7 @@ fn stream_ten() {
             session::RouteOutcome::AwaitBody { pending, .. } => {
                 let response = pending.response();
                 assert_eq!(response.version(), Version::Ten);
-                pending.finish(
+                pending.stream(
                     session::Complete {
                         body_len: 1,
                         consumed: 1,

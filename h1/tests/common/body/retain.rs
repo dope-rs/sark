@@ -3,7 +3,7 @@ use std::{cell::Cell, convert::Infallible, ptr};
 use o3::alloc;
 use sark_core::body::credit;
 use sark_h1::{
-    route::sync,
+    route::{Pending, sync},
     session,
     wire::{output, parsing::framing},
 };
@@ -41,7 +41,7 @@ impl Retain {
         conn: &mut session::Conn<'d>,
         permit: session::Permit,
         head: framing::Head<'_, '_, Request>,
-    ) -> session::RouteOutcome<'d, sync::Pending<'d, Request>> {
+    ) -> session::RouteOutcome<'d, Pending<'d, Request>> {
         sync::Endpoint::new(
             sync::Egress::new(
                 output::Egress::new(
@@ -58,9 +58,9 @@ impl Retain {
 
     pub fn finish<'d>(
         &mut self,
-        pending: sync::Pending<'d, Request>,
+        pending: Pending<'d, Request>,
     ) -> session::Outcome<'d, Infallible> {
-        pending.finish::<_, _, Infallible>(
+        pending.respond::<_, _, Infallible>(
             session::Complete {
                 consumed: 1,
                 body_len: 1,

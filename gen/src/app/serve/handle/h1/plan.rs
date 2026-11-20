@@ -98,17 +98,9 @@ impl<'source, 'spec> Plan<'source, 'spec> {
             let variant = &item.pending_variant;
             let route = &item.entry.route;
             let pending = match item.kind {
-                spec::Kind::Sync => {
-                    quote::quote!(#ns_h1::route::sync::Pending<'d, #route>)
-                }
-                spec::Kind::Fiber => {
-                    quote::quote!(#ns_h1::route::task::Pending<'d, #route>)
-                }
-                spec::Kind::Stream => {
-                    quote::quote!(#ns_h1::route::stream::Pending<'d, #route>)
-                }
-                spec::Kind::Duplex => {
-                    quote::quote!(#ns_h1::route::duplex::Pending<'d, #route>)
+                spec::Kind::Fiber => quote::quote!(#ns_h1::route::task::Pending<'d, #route>),
+                spec::Kind::Sync | spec::Kind::Stream | spec::Kind::Duplex => {
+                    quote::quote!(#ns_h1::route::Pending<'d, #route>)
                 }
             };
             quote::quote!(#variant(#pending),)

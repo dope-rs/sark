@@ -49,11 +49,7 @@ pub(super) fn methods(
         let (held, egress, intent, stream) = match outcome {
             Ok((body, stream)) => {
                 let held = body.retention();
-                if let Some(sink) = observer && let Some(copy) = body.copy() {
-                    #core::life::Observer::observe(sink, #core::life::Event::ResponseBodyCopied {
-                        exchange, read: copy.read, written: copy.written, cause: copy.cause,
-                    });
-                }
+                body.observe_copy(observer, exchange);
                 (Some(held), #h1::pump::Egress::from(body), deferred, stream)
             }
             Err(error) => {

@@ -1,8 +1,9 @@
 //! HTTP/1 routing contracts and connection ownership.
 use core::{convert::Infallible, pin};
-use o3::buffer::{Complete as _, write::Slice};
+use o3::buffer::{Complete as _, hold, write::Slice};
 
 use o3::buffer::storage::range;
+use sark_core::life::{self, exchange, sequence};
 use sark_http::{
     h1::field::expect,
     payload::{fixed, owned},
@@ -158,6 +159,47 @@ pub enum Outcome<'d, D = Infallible> {
     Failed(crate::wire::Failure),
 }
 
+impl<D> Outcome<'_, D> {
+    pub fn settle<const AT_HEAD: bool, C: Copy, M: sequence::Mode<C>>(
+        &self,
+        mode: &mut M,
+        session: &mut M::Session,
+        id: exchange::Id<C, u64>,
+    ) {
+        match self {
+            Self::Complete { .. } | Self::Switch { .. } => {
+                if AT_HEAD {
+                    mode.observe(life::Event::InputFinished(id));
+                }
+                if let Self::Complete { response, .. } = self {
+                    response.observe_copy(mode.observer(), id);
+                    response.commit_retention(mode, session, id);
+                } else {
+                    mode.commit(session, id, 0, hold::Charge::default());
+                }
+                id.retire(mode, life::Outcome::Completed);
+            }
+            Self::Park { .. } | Self::Streamed { .. } => {
+                if AT_HEAD {
+                    mode.observe(life::Event::InputFinished(id));
+                }
+                if matches!(self, Self::Streamed { .. }) {
+                    mode.commit(session, id, 0, hold::Charge::default());
+                }
+                mode.observe(life::Event::TaskAdmitted(id));
+            }
+            Self::Close(_) | Self::Failed(_) => {
+                if AT_HEAD {
+                    mode.reject(id);
+                } else {
+                    id.retire(mode, life::Outcome::Rejected);
+                }
+            }
+            Self::NeedMore { .. } => {}
+        }
+    }
+}
+
 /// Result of the only routing pass for a request head.
 pub enum RouteOutcome<'d, P, D = Infallible, H = Infallible, Rejected = Infallible> {
     Outcome(Outcome<'d, D>),
@@ -276,7 +318,7 @@ pub trait Dispatch<'d, Runtime, Pending = (), Transitions: switch::Engine = swit
         self: pin::Pin<&mut Self>,
         _: Permit,
         _: &mut Conn<'d, Runtime, Pending, Transitions, Self::Ready, Self::Head>,
-        error: parsing::LineError<'d>,
+        error: parsing::Rejection<'d>,
     ) -> fixed::Body<'d> {
         error.response(|cause| self.failure(cause))
     }

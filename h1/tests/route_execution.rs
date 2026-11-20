@@ -134,7 +134,7 @@ fn discarded_stream_length() {
         );
         let outcome = match outcome {
             session::RouteOutcome::Outcome(outcome) => outcome,
-            session::RouteOutcome::AwaitBody { pending, .. } => pending.finish(
+            session::RouteOutcome::AwaitBody { pending, .. } => pending.stream(
                 session::Complete {
                     body_len: 1,
                     consumed: 1,
@@ -191,7 +191,7 @@ fn stream_capacity() {
         );
         let outcome = match outcome {
             session::RouteOutcome::Outcome(outcome) => outcome,
-            session::RouteOutcome::AwaitBody { pending, .. } => pending.finish(
+            session::RouteOutcome::AwaitBody { pending, .. } => pending.stream(
                 session::Complete {
                     body_len: 1,
                     consumed: 1,

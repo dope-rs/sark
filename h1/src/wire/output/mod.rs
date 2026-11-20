@@ -1,6 +1,7 @@
 use core::mem;
 
-use o3::buffer::storage;
+use o3::buffer::{hold, storage};
+use sark_core::life::{self, exchange, sequence};
 use sark_http::{
     owner::evidence,
     payload::{
@@ -106,6 +107,36 @@ impl<'d> Complete<'d> {
             | Self::Segments { .. }
             | Self::Linked { .. } => None,
         }
+    }
+
+    pub fn observe_copy<C: Copy, O: life::Observer<C, u64>>(
+        &self,
+        observer: Option<&mut O>,
+        id: exchange::Id<C, u64>,
+    ) {
+        if let Some(observer) = observer
+            && let Some(copy) = self.copy()
+        {
+            observer.observe(life::Event::ResponseBodyCopied {
+                exchange: id,
+                read: copy.read,
+                written: copy.written,
+                cause: copy.cause,
+            });
+        }
+    }
+
+    pub fn commit_retention<C: Copy, M: sequence::Mode<C>>(
+        &self,
+        mode: &mut M,
+        session: &mut M::Session,
+        id: exchange::Id<C, u64>,
+    ) {
+        let (owner, linked) = match self.retention() {
+            Origin::Response(owner) => (owner, hold::Charge::default()),
+            Origin::Linked(owner) => (owner, owner.charge),
+        };
+        mode.commit_link(session, id, owner.len, owner.charge, linked);
     }
 
     pub fn into_consume<D>(

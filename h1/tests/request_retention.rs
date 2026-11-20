@@ -8,7 +8,7 @@ use o3::buffer::{Complete as _, storage};
 use sark_core::body::credit;
 use sark_h1::{
     Input,
-    route::sync,
+    route::Pending,
     session,
     wire::parsing::{self, framing, raw},
 };
@@ -41,7 +41,7 @@ fn retention_follows_window() {
         });
         assert_eq!(allocs, expected);
         assert!(fixture.state.get().0.is_null());
-        let mut pending: sync::Pending<'static, Request> = match outcome {
+        let mut pending: Pending<'static, Request> = match outcome {
             session::RouteOutcome::AwaitBody { pending, .. } => Some(pending),
             _ => None,
         }
@@ -95,7 +95,7 @@ fn retains_fragmented_head() {
         )
         .ok()
         .expect("head resumed");
-    let mut pending: sync::Pending<'static, Request> = match outcome {
+    let mut pending: Pending<'static, Request> = match outcome {
         session::RouteOutcome::AwaitBody { pending, .. } => Some(pending),
         _ => None,
     }

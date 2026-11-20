@@ -2,21 +2,14 @@ use o3::buffer::write::Slice;
 use std::convert::Infallible;
 
 use duplex::machine;
-use o3::buffer::{segments::assembly, storage};
-use sark_core::{
-    body,
-    body::{admit::Length, credit},
-    decode::Call,
-    duplex, route,
-};
+use sark_core::{body, body::credit, decode::Call, duplex, route};
 use sark_http::{
     h1::{
-        codec::canned,
         framing::RequestBody,
         head::{line::Request, request::Fields},
         switch::Kind,
     },
-    payload::{fixed, owned},
+    payload::fixed,
     request::span::Span,
 };
 pub use sark_ws::server::Upgrade as WebSocket;
@@ -24,7 +17,7 @@ use sark_ws::{server as ws, upgrade};
 use ws::app::Sink as _;
 
 use crate::{
-    route::pending,
+    route::Pending,
     session, switch,
     wire::{Failure, body::View, head, output, parsing::framing, response},
 };
@@ -62,33 +55,8 @@ impl head::Admission for Upgrade {
     }
 }
 
-/// Request owners retained while a CONNECT body is arriving.
-pub struct Pending<'d, R: route::Spec> {
-    head: framing::Parsed<storage::Shared, R>,
-    response: response::Context,
-    content_length: Length,
-    body: pending::Body<'d>,
-}
-
 impl<'d, R: route::Spec> Pending<'d, R> {
-    /// Framing admission bounded this immutable head by HEAD_CAPACITY.
-    pub fn head_len(&self) -> u32 {
-        self.head.owner().as_ref().len() as u32
-    }
-
-    pub fn push_body<E: credit::Evidence>(
-        &mut self,
-        parts: owned::Segments<'d>,
-        proof: E,
-    ) -> Result<(), assembly::Error> {
-        self.body.push(parts, proof)
-    }
-
-    pub fn cancel<E: credit::Evidence>(self, proof: E) {
-        self.body.discard(proof);
-    }
-
-    pub fn finish<'env, S, D, Wrap, E>(
+    pub fn connect<'env, S, D, Wrap, E>(
         self,
         done: session::Complete,
         permit: session::Permit,
@@ -107,23 +75,22 @@ impl<'d, R: route::Spec> Pending<'d, R> {
         let Self {
             head,
             response,
-            content_length: want,
-            body,
+            content_length,
+            body: mut owner,
         } = self;
-        let session::Complete {
-            body_len: total,
-            consumed: used,
-        } = done;
-        if !body.matches(<R::Request as route::Schema>::BODY_RETENTION, total) {
-            body.discard(proof);
-            return session::Outcome::Close(canned::BAD_REQUEST);
-        }
-        let mut owner = body;
-        let body = match owner.try_admit::<R, E>(total, want, &mut proof) {
+        let body = match Self::admit(&mut owner, done.body_len, content_length, &mut proof) {
             Ok(body) => body,
-            Err(error) => return session::Outcome::Failed(Failure::reject(error)),
+            Err(error) => return error.into(),
         };
-        construct::<R, S, D, Wrap>(head.borrow(), body, state, response, wrap, used, permit)
+        construct::<R, S, D, Wrap>(
+            head.borrow(),
+            body,
+            state,
+            response,
+            wrap,
+            done.consumed,
+            permit,
+        )
     }
 }
 
@@ -199,20 +166,7 @@ where
         let frame = match framing::Frame::drive(found, &mut self.connection.ingress, &mut proof) {
             Ok(framing::Progress::Complete(frame)) => frame,
             Ok(framing::Progress::Pending(wait)) => {
-                let mut route = Pending {
-                    head: wait.head,
-                    response: wait.response,
-                    content_length: wait.declared_body_len,
-                    body: pending::Body::new(),
-                };
-                if let Err(error) = route.push_body(self.connection.ingress.payload.take(), proof) {
-                    return session::Outcome::Failed(Failure::Assembly(error)).into();
-                }
-                return session::RouteOutcome::AwaitBody {
-                    state: wait.state,
-                    expectation: wait.expectation,
-                    pending: route,
-                };
+                return Pending::start(wait, self.connection.ingress.payload.take(), permit, proof);
             }
             Err(reason) => {
                 return reason.into_consume().into();
