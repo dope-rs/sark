@@ -174,14 +174,7 @@ impl<'src, 'd> response::Body<'d> for Ref<'src, 'd> {
         self,
         slot: &handoff::Slot<'req, 'd, H, O>,
     ) -> Result<handoff::Plan<'req, 'd, H::Selection, O>, owned::Error> {
-        let origin = slot.origin();
-        if !self.is_empty() {
-            if let RefStorage::Retained(view) = self.storage {
-                return handoff::Plan::try_retain(origin, view);
-            }
-            return handoff::Plan::try_view(origin, self);
-        }
-        Ok(handoff::Plan::new(origin.clear()))
+        handoff::Plan::try_view(slot, self)
     }
 
     fn try_resolve_into<

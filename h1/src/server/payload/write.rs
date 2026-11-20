@@ -3,7 +3,7 @@
 use conn::write;
 use data::compose;
 use dope::{
-    core::driver::{self, route::Identity},
+    core::driver::route::Identity,
     manifold::network::listener::conn,
     net::{
         link::{
@@ -17,8 +17,7 @@ use o3::{
     buffer::{resident, resident::bound},
     mem::slot,
 };
-use sark_http::payload::fixed;
-use write::{body, body::Admit};
+use write::body;
 
 use crate::{pump, server::payload};
 
@@ -94,64 +93,4 @@ where
         None => write::Output::finish(native, end),
     }
     .map_err(|cause| body::Failure::Mismatch(cause.into_cause()))
-}
-
-/// Returns the same immutable borrow when its projection remains unadmitted.
-pub(in crate::server) fn send_static<
-    'd,
-    K: Default + 'd,
-    ID: Identity,
-    W,
-    C,
-    G: bound::Bound + 'd,
->(
-    conn: &mut conn::Ctx<'_, '_, '_, '_, '_, 'd, ID, W, C, Bound<'d, K, G>>,
-    body: fixed::Body<'d>,
-    driver: &mut driver::Context<'_, 'd>,
-) -> Option<fixed::Body<'d>>
-where
-    W: wire::Spec,
-{
-    let reason = body;
-    let body = body.as_slice();
-    let body = payload::Body::Shared {
-        owner: resident::Shared::from(body),
-        tag: K::default(),
-    };
-    let body = match egress::NonEmpty::try_new(body) {
-        Ok(body) => body,
-        Err(cause) => {
-            conn.reject_write(body::Failure::Payload(cause));
-            return None;
-        }
-    };
-    let body = match body.into_left().try_bound::<G>() {
-        Ok(body) => body,
-        Err(rejected) => {
-            let cause = {
-                let parts = rejected.into_parts();
-                body::Failure::Bound {
-                    charge: parts.0.charge(),
-                    maximum: parts.1.get(),
-                }
-            };
-            conn.reject_write(cause);
-            return None;
-        }
-    };
-    let rejected = match conn.admit(body, driver) {
-        Admit::Committed | Admit::Closed(_) => None,
-        Admit::Deferred { .. } => {
-            return Some(reason);
-        }
-        Admit::Rejected { cause, .. } => Some(body::Failure::Capacity(cause)),
-        Admit::Unavailable(cause) => {
-            let parts = cause.into_parts();
-            Some(body::Failure::Reserve(parts.1))
-        }
-    };
-    if let Some(cause) = rejected {
-        conn.reject_write(cause);
-    }
-    None
 }

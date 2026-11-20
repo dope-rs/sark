@@ -192,8 +192,7 @@ pub(super) fn build<'source, 'spec>(
         quote::quote!(self.#core),
     );
     let tasks = tasks::Tasks::build(paths, &context);
-    let neutral = task::Task::new(paths, &context, &decode.prepared.state)
-        .build(paths, &context, &dispatch, &head, &decode, &tasks);
+    let neutral = task::build(paths, &context, &dispatch, &decode, &tasks);
     let (app, direct) = app::build(paths, plan, exec, h1, &decode.contract, &dispatch.shape);
     let duplex = plan.duplex.definitions(paths, h1.is_some());
     let h1 = h1.map(|plan| h1::types::Types::build(paths, &context, plan, &dispatch, &direct));

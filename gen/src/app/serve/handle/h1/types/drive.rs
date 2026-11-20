@@ -49,7 +49,6 @@ pub(super) fn methods(
             | #h1::wire::output::Retention::Linked(owner) => owner.charge,
             #h1::wire::output::Retention::Rejected => #ns::o3::buffer::hold::Charge::default(),
         };
-        let done = <<#mode as #core::life::Mode<_, u64>>::Retention as turn::Mode>::complete(held);
         if let Some(sink) = #core::life::Mode::observer(life)
             && let #h1::wire::output::Copy::Copied(copy) = outcome.copy()
         {
@@ -75,14 +74,13 @@ pub(super) fn methods(
     };
     let complete = quote! {
         #send
-        let done = match sent {
-            Ok(()) => done,
+        return match sent {
+            Ok(()) => turn::Turn::published(ready, held),
             Err(cause) => {
                 conn.reject_write(cause);
-                turn::Completion::Rejected
+                turn::Turn::Rejected { ready }
             }
         };
-        return turn::Turn::retired(ready, done);
     };
     let heads = ctx.exec.fibers().iter().map(|(task, fiber)| {
         let head = task.phase("Head");
@@ -119,7 +117,7 @@ pub(super) fn methods(
                             member.discard();
                             #credit
                             conn.reject_write(cause);
-                            turn::Turn::retired(ready, turn::Completion::Rejected)
+                            turn::Turn::Rejected { ready }
                         }
                     };
                 }
@@ -166,7 +164,7 @@ pub(super) fn methods(
                     #core::life::Mode::diagnostic(life, &cause);
                     conn.state_mut().settle(head::Connection::Close);
                     conn.close_after();
-                    break turn::Turn::retired(terminal, turn::Completion::Rejected);
+                    break turn::Turn::Rejected { ready: terminal };
                 }
             }
         });
@@ -257,7 +255,7 @@ pub(super) fn methods(
                 #remove
                 if let Some(cause) = failure { conn.reject_write(cause); }
                 else { Self::__release(conn); }
-                turn::Turn::retired(ready, turn::Completion::Rejected)
+                turn::Turn::Rejected { ready }
         }
     };
     quote! {
@@ -381,10 +379,10 @@ pub(super) fn methods(
                             sequence::Mode::unstage(life, conn.state_mut().async_state.session_mut(), owner, charge);
                         }
                         break match &entry {
-                            ControlFlow::Break(_) => turn::Turn::retired(ready, turn::Completion::Rejected),
+                            ControlFlow::Break(_) => turn::Turn::Rejected { ready },
                             ControlFlow::Continue(_) => match terminal {
                                 turn::Readiness::NewlyReady => turn::Turn::TransportCancelled,
-                                turn::Readiness::Staged => turn::Turn::retired(terminal, turn::Completion::Rejected),
+                                turn::Readiness::Staged => turn::Turn::Rejected { ready: terminal },
                             }
                         };
                     }
@@ -416,7 +414,7 @@ pub(super) fn methods(
                 }
                 match end {
                     payload::End::More => {}
-                    payload::End::Last => break turn::Turn::retired(ready, turn::Completion::Completed),
+                    payload::End::Last => break turn::Turn::Completed { ready },
                 }
             };
             match entry { ControlFlow::Break(mut entry) => { #remove } ControlFlow::Continue(mut entry) => { #remove } }

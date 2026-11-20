@@ -1,57 +1,51 @@
 pub mod common;
 
-use core::convert::Infallible;
-
-use o3::buffer::segments;
 use sark_core::{
     body::{
         Error,
-        admit::{Length, Open, Plan, Retention, Start, Stream, Track},
+        admit::{Length, Plan, Retention, Start, Stream},
         buffered, credit,
         credit::raw::Account,
-        input,
     },
     manifold::stream::Boundary,
 };
 
-fn push(open: Track<Open>, bytes: usize) -> Result<(), Error> {
-    Account::new().scope(|mut ledger| {
-        let mut body = buffered::State::<(), _>::start(open, &ledger);
-        let limits = credit::Limits::new(usize::MAX, usize::MAX);
-        let mut retained = 0;
-        let result = body.try_push(
-            &mut ledger,
-            credit::Disabled::new(),
-            input::Input::new((), bytes, segments::Count::EMPTY),
-            limits,
-            limits,
-            |store, ()| {
-                retained += 1;
-                assert!(store.is_none(), "discarded body cannot retain storage");
-                buffered::Retain::<(), (), Infallible>::Accepted { storage: store }
-            },
-        );
-        assert_eq!(retained, 0);
-        match result {
-            buffered::Push::Accepted | buffered::Push::Discarded(()) => Ok(()),
-            buffered::Push::Rejected { input: (), error } => Err(match error {
-                buffered::Error::Body(error) => error,
-                buffered::Error::Retain(never) => match never {},
-            }),
-        }
-    })
-}
-
 #[test]
-fn declared_overrun() {
-    let open = common::discarded(16, Some(4)).expect("declared input must remain open");
-    assert!(matches!(
-        push(open, 5),
-        Err(Error::LengthMismatch {
-            actual: 5,
-            declared: 4
-        })
-    ));
+fn rejects_body_overruns() {
+    for (max, declared, expected) in [
+        (
+            16,
+            Some(4),
+            Error::LengthMismatch {
+                actual: 5,
+                declared: 4,
+            },
+        ),
+        (
+            4,
+            None,
+            Error::TooLarge {
+                actual: 5,
+                limit: 4,
+            },
+        ),
+    ] {
+        Account::new().scope(|mut ledger| {
+            let open = common::discarded(max, declared).expect("open discarded input");
+            let mut body = buffered::State::start(open, &ledger);
+            let (
+                false,
+                buffered::Push::Rejected {
+                    input: (),
+                    error: buffered::Error::Body(error),
+                },
+            ) = common::push_discarded(&mut body, &mut ledger, 5)
+            else {
+                panic!("overrun must return the rejected input and body error");
+            };
+            assert_eq!(error, expected);
+        });
+    }
 }
 
 #[test]
@@ -59,22 +53,10 @@ fn declared_underrun_first() {
     Account::new().scope(|mut ledger| {
         let open = common::discarded(16, Some(4)).expect("declared input must remain open");
         let mut body = buffered::State::<(), _>::start(open, &ledger);
-        let limits = credit::Limits::new(usize::MAX, usize::MAX);
-        let mut retained = 0;
-        let result = body.try_push(
-            &mut ledger,
-            credit::Disabled::new(),
-            input::Input::new((), 3, segments::Count::EMPTY),
-            limits,
-            limits,
-            |store, ()| {
-                retained += 1;
-                assert!(store.is_none(), "discarded body cannot retain storage");
-                buffered::Retain::<(), (), Infallible>::Accepted { storage: store }
-            },
-        );
-        assert!(matches!(result, buffered::Push::Discarded(())));
-        assert_eq!(retained, 0);
+        assert!(matches!(
+            common::push_discarded(&mut body, &mut ledger, 3),
+            (false, buffered::Push::Discarded(()))
+        ));
 
         let failure = body
             .try_finish(&mut ledger, &mut credit::Disabled::new())
@@ -86,13 +68,11 @@ fn declared_underrun_first() {
                 declared: 4
             }
         ));
-        match &failure {
-            buffered::Rejected::Admission { state, .. } => {
-                assert_eq!(state.len(), 3);
-                assert!(state.retention() == Retention::Discarded);
-            }
-            outcome => assert!(matches!(outcome, buffered::Rejected::Admission { .. })),
-        }
+        let buffered::Rejected::Admission { state, .. } = &failure else {
+            panic!("declared underrun must return the admission state");
+        };
+        assert_eq!(state.len(), 3);
+        assert!(state.retention() == Retention::Discarded);
         assert!(ledger.retained().is_empty());
         drop(
             failure
@@ -100,18 +80,6 @@ fn declared_underrun_first() {
                 .expect("discarded input retains zero credit"),
         );
     });
-}
-
-#[test]
-fn limit_overrun() {
-    let open = common::discarded(4, None).expect("unknown input must remain open");
-    assert!(matches!(
-        push(open, 5),
-        Err(Error::TooLarge {
-            actual: 5,
-            limit: 4
-        })
-    ));
 }
 
 #[test]
@@ -184,26 +152,16 @@ fn admit_declared_length() {
 #[test]
 fn finished_retains_limit() {
     Account::new().scope(|mut ledger| {
-        let done = match Plan::new(Retention::Discarded, 8, Length::Unknown, Stream::Buffered)
-            .try_start(4, Boundary::End)
-            .expect("empty finished body")
-        {
-            Start::Finished(done) => done,
-            outcome => {
-                assert!(matches!(outcome, Start::Finished(_)), "finished phase");
-                return;
-            }
+        let Start::Finished(done) =
+            Plan::new(Retention::Discarded, 8, Length::Unknown, Stream::Buffered)
+                .try_start(4, Boundary::End)
+                .expect("empty finished body")
+        else {
+            panic!("finished phase");
         };
         let mut body = buffered::State::<(), _>::ended(done, &ledger);
-        let limits = credit::Limits::new(usize::MAX, usize::MAX);
-        let result = body.try_push(
-            &mut ledger,
-            credit::Disabled::new(),
-            input::Input::new((), 1, segments::Count::EMPTY),
-            limits,
-            limits,
-            |storage, ()| buffered::Retain::<(), (), Infallible>::Accepted { storage },
-        );
+        let (retained, result) = common::push_discarded(&mut body, &mut ledger, 1);
+        assert!(!retained);
         assert!(matches!(
             result,
             buffered::Push::Rejected {
@@ -221,16 +179,9 @@ fn overflow_keeps_operands() {
     Account::new().scope(|mut ledger| {
         let open = common::discarded(usize::MAX, None).expect("unbounded input");
         let mut body = buffered::State::<(), _>::start(open, &ledger);
-        let limits = credit::Limits::new(usize::MAX, usize::MAX);
         for added in [usize::MAX, 1] {
-            let result = body.try_push(
-                &mut ledger,
-                credit::Disabled::new(),
-                input::Input::new((), added, segments::Count::EMPTY),
-                limits,
-                limits,
-                |storage, ()| buffered::Retain::<(), (), Infallible>::Accepted { storage },
-            );
+            let (retained, result) = common::push_discarded(&mut body, &mut ledger, added);
+            assert!(!retained);
             if added == usize::MAX {
                 assert!(matches!(result, buffered::Push::Discarded(())));
             } else {

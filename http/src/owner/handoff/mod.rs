@@ -51,10 +51,9 @@ pub enum Error {
     Overflow(hold::Overflow),
 }
 
-pub(crate) use origin::Origin;
+use origin::Origin;
 pub use pending::Pending;
 pub use plan::Plan;
-pub(crate) use plan::State;
 pub use ready::Ready;
 pub use slot::Slot;
 

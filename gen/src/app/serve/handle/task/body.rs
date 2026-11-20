@@ -1,6 +1,4 @@
-use decode::state;
-use handle::{decode, task};
-use task::Task;
+use proc_macro2::TokenStream;
 
 use crate::{
     app::{inputs, serve::handle, spec},
@@ -8,13 +6,20 @@ use crate::{
     runtime::paths::Paths,
 };
 
+pub(super) struct Body {
+    pub(super) ident: syn::Ident,
+    pub(super) definition: proc_macro2::TokenStream,
+    pub(super) reject_step: proc_macro2::TokenStream,
+    pub(super) reject_push: proc_macro2::TokenStream,
+    pub(super) start_body: proc_macro2::TokenStream,
+    pub(super) built_body: proc_macro2::TokenStream,
+}
+
 pub(super) fn build(
     paths: &Paths,
     ctx: &handle::Context<'_, '_, '_>,
-    state: &state::State,
-    opens: Vec<proc_macro2::TokenStream>,
-    route: proc_macro2::TokenStream,
-) -> Task {
+    prep: &syn::Ident,
+) -> Body {
     let [f_core, f_ids, f_makers] = ["core", "ids", "task_producers"].map(local);
     let [f_state, f_time] = ["state", "timer"].map(local);
     let symbols = &ctx.plan.spec.state_generics;
@@ -37,168 +42,103 @@ pub(super) fn build(
 
     let spec = ctx.plan.spec;
     let vis = &spec.vis;
-    let prep = &state.prepared;
     let ident = quote::format_ident!("{}TaskBuild", spec.name);
     let ready_id = quote::format_ident!("{}TaskReady", spec.name);
-    let fibers = ctx
-        .exec
-        .fibers()
-        .iter()
-        .map(|pair| (pair.0, pair.0.prepared(), pair.1.body))
-        .collect::<Vec<_>>();
-    let defs = fibers.iter().map(|fiber| {
-        let route = fiber.0.route();
-        let var = fiber.1;
-        quote! {
-            #var(
-                <<#route as #ns_core::route::Spec>::Request as #ns_core::route::Own>::TaskBuilder<'d>,
-            ),
-        }
-    });
-    let ready_v = fibers.iter().map(|fiber| {
-        let route = fiber.0.route();
-        let var = fiber.1;
-        quote! {
-            #var(
-                #ns_core::route::Built<
-                    'd,
-                    <<#route as #ns_core::route::Spec>::Request
-                        as #ns_core::route::Own>::Task<'d>,
-                >,
-            ),
-        }
-    });
+    let fibers = ctx.exec.fibers();
     let push_id = quote::format_ident!("{}TaskPush", spec.name);
-    let push_v: Vec<_> = fibers
-        .iter()
-        .map(|fiber| {
-            let route = fiber.0.route();
-            let var = fiber.1;
-            match fiber.2 {
-                inputs::Body::Discarded => quote! {
-                    #var(#ns_http::payload::owned::Segment<'d>),
+    let step_id = quote::format_ident!("{}TaskStep", spec.name);
+    let mut defs = TokenStream::new();
+    let mut ready_v = TokenStream::new();
+    let mut push_v = TokenStream::new();
+    let mut step_v = TokenStream::new();
+    let mut rej_push = TokenStream::new();
+    let mut observed = TokenStream::new();
+    let mut rej_step = TokenStream::new();
+    let mut pushes = TokenStream::new();
+    let mut finish = TokenStream::new();
+    let mut steps = TokenStream::new();
+    for (item, fiber) in fibers {
+        let route = item.route();
+        let var = item.prepared();
+        let request = quote!(<#route as #ns_core::route::Spec>::Request);
+        let builder = quote!(<#request as #ns_core::route::Own>::TaskBuilder<'d>);
+        defs.extend(quote!(#var(#builder),));
+        ready_v.extend(
+            quote!(#var(#ns_core::route::Built<'d, <#request as #ns_core::route::Own>::Task<'d>>),),
+        );
+
+        if matches!(fiber.body, inputs::Body::Discarded) {
+            push_v.extend(quote!(#var(#ns_http::payload::owned::Segment<'d>),));
+            rej_push.extend(quote!(#push_id::#var(_) => #ns_core::route::Reject::Internal,));
+            observed.extend(quote!(#push_id::#var(_) => #v_obs.diagnostic(&"discarded"),));
+            pushes.extend(quote! {
+                Self::#var(#v_build) => #ns_core::body::Transfer::Rejected {
+                    build: Self::#var(#v_build), error: #push_id::#var(#v_seg),
                 },
-                inputs::Body::Json | inputs::Body::Segmented | inputs::Body::Contiguous => {
-                    quote! {
-                        #var(
-                            <<<#route as #ns_core::route::Spec>::Request
-                                as #ns_core::route::Own>::TaskBuilder<'d>
-                                as #ns_core::body::Push<'d>>::Error,
-                        ),
-                    }
-                }
+            });
+        } else {
+            let push = quote!(<#builder as #ns_core::body::Push<'d>>);
+            push_v.extend(quote!(#var(#push::Error),));
+            rej_push.extend(quote! {
+                #push_id::#var(#v_error) => <#builder as #ns_core::route::Push<'d>>::reject_push(#v_error),
+            });
+            observed.extend(quote!(#push_id::#var(#v_error) => #push::observe(#v_error, #v_obs),));
+            pushes.extend(quote! {
+                Self::#var(#v_build) => #ns_core::body::Push::push(#v_build, #v_seg)
+                    .map(Self::#var).map_err(#push_id::#var),
+            });
+        }
+        let step_error = match fiber.body {
+            inputs::Body::Json | inputs::Body::Contiguous => {
+                step_v.extend(quote!(#var(<#builder as #ns_core::body::Build<'d>>::StepError),));
+                rej_step.extend(quote! {
+                    #step_id::#var(#v_error) => <#builder as #ns_core::route::TaskBuild<'d>>::reject(#v_error),
+                });
+                quote!(#step_id::#var)
             }
-        })
-        .collect();
-    let push_ty = match push_v.is_empty() {
-        true => quote!(::core::convert::Infallible),
-        false => quote!(#push_id<'d>),
+            inputs::Body::Discarded | inputs::Body::Segmented => {
+                quote!(|#v_never| match #v_never {})
+            }
+        };
+        steps.extend(quote! {
+            Self::#var(#v_build) => #ns_core::body::Build::step(#v_build, #v_budget)
+                .map(Self::#var, #ready_id::#var, #step_error),
+        });
+        finish.extend(quote! {
+            Self::#var(#v_build) => Self::#var(#ns_core::body::Build::finish_input(#v_build, #v_len)),
+        });
+    }
+    let has = !fibers.is_empty();
+    let push_ty = if has {
+        quote!(#push_id<'d>)
+    } else {
+        quote!(::core::convert::Infallible)
     };
-    let push_def = (!push_v.is_empty()).then(|| {
+    let push_def = has.then(|| {
         quote! {
             #[doc(hidden)]
-            #vis enum #push_id<'d> {
-                #( #push_v )*
-            }
+            #vis enum #push_id<'d> { #push_v }
         }
     });
-    let step_id = quote::format_ident!("{}TaskStep", spec.name);
-    let step_v: Vec<_> = fibers
-        .iter()
-        .filter(|fiber| matches!(fiber.2, inputs::Body::Json | inputs::Body::Contiguous))
-        .map(|fiber| {
-            let route = fiber.0.route();
-            let var = fiber.1;
-            quote! {
-                #var(
-                    <<<#route as #ns_core::route::Spec>::Request
-                        as #ns_core::route::Own>::TaskBuilder<'d>
-                        as #ns_core::body::Build<'d>>::StepError,
-                ),
-            }
-        })
-        .collect();
-    let step_ty = match step_v.is_empty() {
-        true => quote!(::core::convert::Infallible),
-        false => quote!(#step_id<'d>),
+    let step_ty = if step_v.is_empty() {
+        quote!(::core::convert::Infallible)
+    } else {
+        quote!(#step_id<'d>)
     };
     let step_def = (!step_v.is_empty()).then(|| {
         quote! {
             #[doc(hidden)]
             #[derive(::core::fmt::Debug)]
-            #vis enum #step_id<'d> {
-                #( #step_v )*
-            }
+            #vis enum #step_id<'d> { #step_v }
         }
     });
-    let rej_push = if push_v.is_empty() {
-        quote!(match #n_error {})
+    let rej_push = quote!(match #n_error { #rej_push });
+    let observed = if has {
+        quote!(match #v_error { #observed })
     } else {
-        let arms = fibers.iter().map(|fiber| {
-            let route = fiber.0.route();
-            let var = fiber.1;
-            match fiber.2 {
-                inputs::Body::Discarded => quote! {
-                    #push_id::#var(_) => #ns_core::route::Reject::Internal
-                },
-                inputs::Body::Json | inputs::Body::Segmented | inputs::Body::Contiguous => {
-                    quote! {
-                        #push_id::#var(#v_error) =>
-                            <<<#route as #ns_core::route::Spec>::Request
-                                as #ns_core::route::Own>::TaskBuilder<'d>
-                                as #ns_core::route::Push<'d>>::reject_push(#v_error)
-                    }
-                }
-            }
-        });
-        quote! {
-            match #n_error {
-                #( #arms, )*
-            }
-        }
-    };
-    let observed = if push_v.is_empty() {
         quote!(match *#v_error {})
-    } else {
-        let arms = fibers.iter().map(|fiber| {
-            let route = fiber.0.route();
-            let var = fiber.1;
-            match fiber.2 {
-                inputs::Body::Discarded => quote! {
-                    #push_id::#var(_) => #v_obs.diagnostic(&"discarded"),
-                },
-                inputs::Body::Json | inputs::Body::Segmented | inputs::Body::Contiguous => quote! {
-                    #push_id::#var(#v_error) =>
-                        <<<#route as #ns_core::route::Spec>::Request
-                            as #ns_core::route::Own>::TaskBuilder<'d>
-                            as #ns_core::body::Push<'d>>::observe(#v_error, #v_obs),
-                },
-            }
-        });
-        quote!(match #v_error { #( #arms )* })
     };
-    let rej_step = if step_v.is_empty() {
-        quote!(match #n_error {})
-    } else {
-        let arms = fibers
-            .iter()
-            .filter(|fiber| matches!(fiber.2, inputs::Body::Json | inputs::Body::Contiguous))
-            .map(|fiber| {
-                let route = fiber.0.route();
-                let var = fiber.1;
-                quote! {
-                    #step_id::#var(#v_error) =>
-                        <<<#route as #ns_core::route::Spec>::Request
-                            as #ns_core::route::Own>::TaskBuilder<'d>
-                            as #ns_core::route::TaskBuild<'d>>::reject(#v_error)
-                }
-            });
-        quote! {
-            match #n_error {
-                #( #arms, )*
-            }
-        }
-    };
+    let rej_step = quote!(match #n_error { #rej_step });
     let start: Vec<proc_macro2::TokenStream> = ctx
         .plan
         .entries
@@ -243,52 +183,6 @@ pub(super) fn build(
             }
         })
         .collect();
-    let pushes = fibers.iter().map(|fiber| {
-        let var = fiber.1;
-        match fiber.2 {
-            inputs::Body::Discarded => quote! {
-                Self::#var(#v_build) => #ns_core::body::Transfer::Rejected {
-                    build: Self::#var(#v_build),
-                    error: #push_id::#var(#v_seg),
-                }
-            },
-            inputs::Body::Json | inputs::Body::Segmented | inputs::Body::Contiguous => quote! {
-                Self::#var(#v_build) =>
-                    #ns_core::body::Push::push(#v_build, #v_seg)
-                        .map(Self::#var)
-                        .map_err(#push_id::#var)
-            },
-        }
-    });
-    let finish = fibers.iter().map(|fiber| {
-        let var = fiber.1;
-        quote! {
-            Self::#var(#v_build) =>
-                Self::#var(#ns_core::body::Build::finish_input(#v_build, #v_len))
-        }
-    });
-    let steps = fibers.iter().map(|fiber| {
-        let var = fiber.1;
-        match fiber.2 {
-            inputs::Body::Discarded | inputs::Body::Segmented => quote! {
-                Self::#var(#v_build) =>
-                    #ns_core::body::Build::step(#v_build, #v_budget).map(
-                        Self::#var,
-                        #ready_id::#var,
-                        |#v_never| match #v_never {},
-                    )
-            },
-            inputs::Body::Json | inputs::Body::Contiguous => quote! {
-                Self::#var(#v_build) =>
-                    #ns_core::body::Build::step(#v_build, #v_budget).map(
-                        Self::#var,
-                        #ready_id::#var,
-                        #step_id::#var,
-                    )
-            },
-        }
-    });
-    let has = !fibers.is_empty();
     let never = match has {
         true => proc_macro2::TokenStream::new(),
         false => quote! {
@@ -310,13 +204,13 @@ pub(super) fn build(
 
         #[doc(hidden)]
         #vis enum #ident<'d> {
-            #( #defs )*
+            #defs
             #never
         }
 
         #[doc(hidden)]
         #vis enum #ready_id<'d> {
-            #( #ready_v )*
+            #ready_v
             #never
         }
 
@@ -329,7 +223,7 @@ pub(super) fn build(
                 #v_len: ::core::primitive::usize,
             ) -> Self {
                 match self {
-                    #( #finish, )*
+                    #finish
                     #dead
                 }
             }
@@ -343,7 +237,7 @@ pub(super) fn build(
                 Self::StepError,
             > {
                 match self {
-                    #( #steps, )*
+                    #steps
                     #dead
                 }
             }
@@ -365,7 +259,7 @@ pub(super) fn build(
                 #v_seg: #ns_http::payload::owned::Segment<'d>,
             ) -> #ns_core::body::Transfer<Self, Self::Error> {
                 match self {
-                    #( #pushes, )*
+                    #pushes
                     #dead
                 }
             }
@@ -384,14 +278,10 @@ pub(super) fn build(
             #( #start, )*
         }
     };
-    let arms = ctx
-        .exec
-        .fibers()
+    let arms = fibers
         .iter()
-        .map(|pair| {
-            let item = pair.0;
+        .map(|(item, fiber)| {
             let var = item.prepared();
-            let fiber = pair.1;
             let field = syn::Index::from(fiber.slot);
             let flat = crate::app::serve::flat::name(ctx.plan.spec, true);
             let kind = item.phase("Future");
@@ -435,9 +325,7 @@ pub(super) fn build(
             #empty
         }
     };
-    Task {
-        opens,
-        dispatch_body: route,
+    Body {
         ident,
         definition: def,
         reject_step: rej_step,

@@ -116,3 +116,24 @@ pub fn discarded(max_body: usize, declared: Option<usize>) -> Result<Track<Open>
     )
     .try_open(usize::MAX)
 }
+
+pub fn push_discarded<O: credit::Origin>(
+    body: &mut buffered::State<(), O>,
+    ledger: &mut credit::raw::Ledger<'_, O>,
+    bytes: usize,
+) -> (bool, buffered::Push<(), Infallible>) {
+    let limits = credit::Limits::new(usize::MAX, usize::MAX);
+    let mut retained = false;
+    let result = body.try_push(
+        ledger,
+        credit::Disabled,
+        input::Input::new((), bytes, segments::Count::EMPTY),
+        limits,
+        limits,
+        |storage, ()| {
+            retained = true;
+            buffered::Retain::Accepted { storage }
+        },
+    );
+    (retained, result)
+}

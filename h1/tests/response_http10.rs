@@ -15,7 +15,7 @@ use sark_h1::{
     session,
     wire::{
         Failure, head, output,
-        parsing::{self, framing, raw},
+        parsing::{framing, raw},
         response::Context,
     },
 };
@@ -33,9 +33,7 @@ use sark_http::{
 fn fixed_connections() {
     let policy = route::Policy::new(Coding::Plain, Date::Include, Server::Include);
     for &(request, connection) in replies::CONNECTIONS {
-        let parsed = parsing::Head::parse(Input::Borrowed(request), u8::MAX)
-            .expect("line")
-            .expect("head");
+        let parsed = common::head::parsed(Input::Borrowed(request), u8::MAX);
         let response = head::Parsed::<()>::parse::<Request>(&parsed, 128)
             .ok()
             .flatten()
@@ -78,9 +76,7 @@ fn stream_ten() {
         if !split {
             request.push(b'x');
         }
-        let parsed = parsing::Head::parse(Input::Borrowed(&request), u8::MAX)
-            .expect("line")
-            .expect("head");
+        let parsed = common::head::parsed(Input::Borrowed(&request), u8::MAX);
         let head = framing::Head::<Streaming>::parse(raw::Bound::empty(&parsed))
             .ok()
             .flatten()

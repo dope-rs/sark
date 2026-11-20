@@ -63,7 +63,7 @@ impl<'d> Ready<'d> {
             Self::Owned(body) => hold::Charge::from_owner(body.len(), 0),
             Self::Copied(body) => hold::Charge::from_owner(body.len(), 0),
             Self::Retained(body) => body.backing().map_or_else(hold::Charge::default, |owner| {
-                if origin.source.is_linked(owner) {
+                if origin.is_linked(owner) {
                     hold::Charge::from_owner(owner.len(), owner.resident())
                 } else {
                     hold::Charge::default()
@@ -72,7 +72,7 @@ impl<'d> Ready<'d> {
             Self::Segmented(body) => {
                 let mut total = hold::Charge::default();
                 for owner in body.backings() {
-                    if origin.source.is_linked(owner) {
+                    if origin.is_linked(owner) {
                         let charge = hold::Charge::from_owner(owner.len(), owner.resident());
                         total = total.try_add(charge)?;
                     }

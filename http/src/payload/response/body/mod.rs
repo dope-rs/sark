@@ -64,7 +64,7 @@ impl<'d> Body<'d> for [u8; 0] {
         slot: &handoff::Slot<'req, 'd, H, O>,
     ) -> Result<handoff::Plan<'req, 'd, H::Selection, O>, owned::Error> {
         match self {
-            [] => Ok(handoff::Plan::new(slot.origin().clear())),
+            [] => Ok(slot.clear()),
         }
     }
 }
@@ -119,7 +119,7 @@ impl<'d> Body<'d> for Vec<u8> {
         self,
         slot: &handoff::Slot<'req, 'd, H, O>,
     ) -> Result<handoff::Plan<'req, 'd, H::Selection, O>, owned::Error> {
-        Ok(handoff::Plan::new(slot.origin().owned(self)))
+        Ok(slot.owned(self))
     }
 }
 
@@ -138,7 +138,7 @@ impl<'d> Body<'d> for String {
         self,
         slot: &handoff::Slot<'req, 'd, H, O>,
     ) -> Result<handoff::Plan<'req, 'd, H::Selection, O>, owned::Error> {
-        Ok(handoff::Plan::new(slot.origin().owned(self.into_bytes())))
+        Ok(slot.owned(self.into_bytes()))
     }
 }
 
@@ -155,7 +155,7 @@ impl<'d> Body<'d> for storage::Owned {
         self,
         slot: &handoff::Slot<'req, 'd, H, O>,
     ) -> Result<handoff::Plan<'req, 'd, H::Selection, O>, owned::Error> {
-        Ok(handoff::Plan::new(slot.origin().shared(self.freeze())))
+        Ok(slot.shared(self.freeze()))
     }
 }
 
@@ -172,6 +172,6 @@ impl<'d> Body<'d> for storage::Shared {
         self,
         slot: &handoff::Slot<'req, 'd, H, O>,
     ) -> Result<handoff::Plan<'req, 'd, H::Selection, O>, owned::Error> {
-        Ok(handoff::Plan::new(slot.origin().shared(self)))
+        Ok(slot.shared(self))
     }
 }

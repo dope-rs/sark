@@ -16,6 +16,12 @@ use sark_http::{
     request::{body::Ref, span::Span},
 };
 
+pub fn parsed(input: sark_h1::Input<'_>, methods: u8) -> sark_h1::wire::parsing::Head<'_> {
+    sark_h1::wire::parsing::Head::parse(input, methods)
+        .expect("valid request line")
+        .expect("complete request line")
+}
+
 thread_local! {
     pub static SETS: Cell<Vec<Vec<u8>>> = const { Cell::new(Vec::new()) };
 }

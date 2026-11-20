@@ -203,13 +203,12 @@ impl<'d, H> Cycle<'d, H> {
 }
 
 /// Work after the transport completes a write submission.
-#[must_use = "send completion may require a close response or buffered-input resume"]
-pub enum Completion<'d> {
+#[must_use = "final drain may require another turn or a protocol switch"]
+pub enum Completion {
     None,
     Resume,
     /// A switching response committed its raw-protocol owner.
     Switch,
-    Close(fixed::Body<'d>),
 }
 
 /// Work that cannot commit a raw-protocol switch.
@@ -218,14 +217,4 @@ pub enum Next<'d> {
     None,
     Resume,
     Close(fixed::Body<'d>),
-}
-
-impl<'d> From<Next<'d>> for Completion<'d> {
-    fn from(done: Next<'d>) -> Self {
-        match done {
-            Next::None => Self::None,
-            Next::Resume => Self::Resume,
-            Next::Close(reason) => Self::Close(reason),
-        }
-    }
 }

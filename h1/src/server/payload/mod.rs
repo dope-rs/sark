@@ -105,11 +105,6 @@ impl<'d, K> Stream<'d, K> {
     }
 
     #[doc(hidden)]
-    pub fn into_parts(self) -> (Frame<'d>, K) {
-        (self.frame, self.tag)
-    }
-
-    #[doc(hidden)]
     pub fn release(self) -> K {
         self.tag
     }
@@ -150,25 +145,8 @@ impl<'d> Frame<'d> {
     }
 
     #[doc(hidden)]
-    pub const fn len(&self) -> usize {
-        self.charge.logical_bytes
-    }
-
-    pub const fn is_empty(&self) -> bool {
-        self.charge.logical_bytes == 0
-    }
-
-    #[doc(hidden)]
     pub const fn retention(&self) -> hold::Charge {
         self.charge
-    }
-
-    #[doc(hidden)]
-    pub fn into_chunk(self) -> Option<Chunk<'d>> {
-        match self.inner {
-            Inner::Chunk(parts) => Some(parts.body),
-            Inner::Terminator(_) => None,
-        }
     }
 }
 

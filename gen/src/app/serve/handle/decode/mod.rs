@@ -1,3 +1,6 @@
+use proc_macro2::TokenStream;
+use quote::{format_ident, quote};
+
 use handle::{dispatch, head};
 
 use crate::{
@@ -10,19 +13,17 @@ use crate::{
 };
 
 mod arms;
-mod prepared;
-pub(super) mod state;
+mod state;
 
 pub(in crate::app::serve) fn egress<M>(
     paths: &Paths,
     spec: &spec::Spec,
     entries: &[serve::RouteSpec<'_, M>],
     lifetime: &syn::Lifetime,
-) -> proc_macro2::TokenStream {
+) -> TokenStream {
     let ns_core = &paths.core;
     let ns_http = &paths.http;
     let state = spec.state.ty();
-    use quote::quote;
 
     let bounds = entries.iter().map(|item| {
         let route = &item.entry.route;
@@ -56,21 +57,44 @@ pub(in crate::app::serve) fn egress<M>(
 }
 
 pub(super) struct Decode {
-    pub(super) contract: proc_macro2::TokenStream,
-    pub(super) guard: Option<proc_macro2::TokenStream>,
-    pub(super) method: proc_macro2::TokenStream,
-    pub(super) full: proc_macro2::TokenStream,
-    pub(super) prepared: prepared::Prepared,
+    pub(super) contract: TokenStream,
+    guard: Option<TokenStream>,
+    method: TokenStream,
+    full: TokenStream,
+    pub(super) prepared: syn::Ident,
+    definitions: TokenStream,
 }
 
 impl Decode {
+    pub(super) fn implement(
+        &self,
+        paths: &Paths,
+        params: &TokenStream,
+        target: TokenStream,
+    ) -> TokenStream {
+
+        let core = &paths.core;
+        let definitions = &self.definitions;
+        let decode = &self.method;
+        let full = &self.full;
+        let guarded = self.guard.as_ref().map(|guard| quote! {
+            impl #params #core::decode::Guarded for #target { #guard }
+        });
+        quote! {
+            #definitions
+            impl #params #core::decode::Decode for #target { #decode }
+            impl #params #core::decode::Full for #target { #full }
+            #guarded
+        }
+    }
+
     pub(super) fn build<M>(
         paths: &Paths,
         spec: &spec::Spec,
         methods: &dispatch::Methods,
         head: &head::Head,
         entries: &[serve::RouteSpec<'_, M>],
-        receiver: proc_macro2::TokenStream,
+        receiver: TokenStream,
     ) -> Self {
         let f_state = local("state");
         let symbols = &spec.state_generics;
@@ -96,13 +120,17 @@ impl Decode {
         let [n_select, n_target] = symbols.locals(["__selection", "__target"]);
         let [n_trange, n_visit] = symbols.locals(["__target_range", "__visit"]);
         let [v_error] = symbols.locals(["error"]);
+        let [n_call, n_error, n_fail] = symbols.locals(["__call", "__error", "__failure"]);
+        let [n_ghead, n_input, n_result] = symbols.locals(["__guard_head", "__input", "__outcome"]);
+        let [n_resp, n_scope, n_slot] = symbols.locals(["__response", "__scope", "__slot"]);
+        let [n_source, v_len, v_head] = symbols.locals(["__source", "content_length", "head"]);
+        let [n_hdrs, n_params, n_view] = symbols.locals(["__headers", "__params", "__view"]);
         let [l_driver, l_req, l_out, l_input] =
             spec.state_generics
                 .lives(["__sark_driver", "__sark_request", "o", "req"]);
         let [g_e, g_f, g_g, g_i, g_t, g_v] = spec
             .state_generics
             .idents(["__E", "__F", "__G", "__I", "__T", "__V"]);
-        use quote::quote;
 
         let ns_core = &paths.core;
         let ns_http = &paths.http;
@@ -119,20 +147,283 @@ impl Decode {
         let matcher = &head.full_head_matcher;
         let arms = &head.planned_route_arms;
         let key = &methods.head_method_key;
-        let state = match &spec.state {
+        let app = match &spec.state {
             spec::State::Bound(_) => quote!(#receiver.#f_state),
             spec::State::Empty(_) => quote!(#ns_core::manifold::EmptyState::REF),
         };
-        let prepared = prepared::Prepared::build(paths, spec, head, entries, &state);
-        let exec = &prepared.state.prepared;
-        let request = &prepared.state.request;
-        let guarded = &prepared.state.guarded;
-        let routes_f = &prepared.state.routes;
-        let admits = &prepared.guard_arms;
-        let dispatch = &prepared.dispatch_arms;
-        let project = &prepared.projection_arms;
-        let error_ty = &prepared.error_type;
-        let body_ty = &prepared.body_type;
+
+        let state = state::State::build(paths, spec, head, entries);
+        let exec = &state.prepared;
+        let request = &state.request;
+        let guarded = &state.guarded;
+        let routes_f = &state.routes;
+        let state_ty = spec.state.ty();
+        let error_id = format_ident!("{}ProjectError", spec.name);
+        let body_id = format_ident!("{}Projected", spec.name);
+        let error_ty = quote!(#error_id<#l_input>);
+        let body_ty = quote!(#body_id<#l_input, #l_driver>);
+        let mut variants = TokenStream::new();
+        let mut bodies = TokenStream::new();
+        let mut errors = TokenStream::new();
+        let mut rejects = TokenStream::new();
+        let mut bounds = TokenStream::new();
+        let mut never = TokenStream::new();
+        let mut admits = TokenStream::new();
+        let mut dispatch = TokenStream::new();
+        let mut project = TokenStream::new();
+        for item in entries {
+            let entry = item.entry;
+            let route = &entry.route;
+            let schema = quote!(<#route as #ns_core::route::Spec>::Request);
+            let variant = &item.prepared;
+            let head_slot = &item.head;
+            variants.extend(quote!(#variant(#head_slot),));
+            bodies.extend(quote! {
+                #variant(
+                    #ns_core::decode::Call<
+                        #ns_core::request::raw::Parsed<
+                            #ns_core::request::Head<
+                                #ns_http::field::metadata::section::storage::Bytes,
+                                <#schema as #ns_core::route::Schema>::Frame,
+                            >,
+                            #schema,
+                        >,
+                        #ns_core::body::Scoped<
+                            #l_input,
+                            'd,
+                            <#schema as #ns_core::route::Schema>::Body,
+                        >,
+                    >,
+                ),
+            });
+            errors.extend(quote! {
+                #variant(<#schema as #ns_core::route::Project>::Error<#l_input>),
+            });
+            rejects.extend(quote! {
+                Self::#variant(#n_error) =>
+                    <#schema as #ns_core::route::Project>::reject(#n_error),
+            });
+            bounds.extend(quote! {
+                <#schema as #ns_core::route::Project>::Error<#l_input>:
+                    #ns_core::route::Never,
+            });
+            never.extend(quote! {
+                Self::#variant(#n_error) => #ns_core::route::Never::never(#n_error),
+            });
+            if !entry.guards.is_empty() {
+                let slot = &item.request;
+                let open = format_ident!("{variant}Open");
+                let finished = format_ident!("{variant}Finished");
+                let (enter, leave) = match item.kind {
+                    spec::Kind::Sync => (quote!(sync_open), quote!(sync_done)),
+                    spec::Kind::Fiber => (quote!(task_open), quote!(task_done)),
+                    spec::Kind::Duplex => (quote!(duplex_open), quote!(duplex_done)),
+                    spec::Kind::Stream => (quote!(reject_open), quote!(reject_done)),
+                };
+                let (take, put) = match item.kind {
+                    spec::Kind::Duplex => (
+                        quote! {
+                            let #slot { head: #v_head, content_length: #v_len } = #n_slot;
+                        },
+                        quote! { #slot { head: #v_head, content_length: #v_len } },
+                    ),
+                    spec::Kind::Sync | spec::Kind::Fiber | spec::Kind::Stream => (
+                        quote! { let #slot { head: #v_head } = #n_slot; },
+                        quote! { #slot { head: #v_head } },
+                    ),
+                };
+                let guard = quote! {
+                    {
+                        #take
+                        #v_head.scope(|#v_head| {
+                            let #n_encode = #ns_core::decode::Encode::begin_head(
+                                #n_encode,
+                                #v_head.owner().owner().view(),
+                            );
+                            let #n_head = #v_head.owner().borrow();
+                            let #n_ghead =
+                                #ns_core::route::guard::Head::from_parts(
+                                    &#n_method,
+                                    #n_head.form(),
+                                    ::core::option::Option::Some(#n_head.path()),
+                                    #n_head.authority(),
+                                );
+                            match <#head_slot as #ns_core::route::guard::Slot<#state_ty>>::try_admit(
+                                #n_ghead, #app, #n_encode,
+                            ).map_continue(::core::mem::drop) {
+                                ::core::ops::ControlFlow::Continue(()) => {
+                                    let #v_head = #v_head.into_inner();
+                                    ::core::ops::ControlFlow::Continue(#put)
+                                }
+                                ::core::ops::ControlFlow::Break(::core::result::Result::Ok(#n_prep)) => {
+                                    let #n_prep =
+                                        #ns_core::decode::Lineage::resolve_head(
+                                            #n_prep,
+                                            #v_head.into_owner(),
+                                        );
+                                    ::core::ops::ControlFlow::Break(
+                                        ::core::result::Result::Ok(#n_prep),
+                                    )
+                                }
+                                ::core::ops::ControlFlow::Break(
+                                    ::core::result::Result::Err((#n_error, #n_encode)),
+                                ) => {
+                                    ::core::ops::ControlFlow::Break(
+                                        ::core::result::Result::Err((
+                                            #ns_core::decode::dispatch::Error::Encode(#n_error),
+                                            #n_encode,
+                                        )),
+                                    )
+                                }
+                            }
+                        })
+                    }
+                };
+                for (phase, visit) in [(&open, enter), (&finished, leave)] {
+                    admits.extend(quote! {
+                        #guarded::#phase(#n_slot, #n_body) => {
+                            let #n_result = #guard;
+                            let (#n_slot, #n_body) = #ns_core::decode::state::admit::TryVisit::#visit(
+                                #n_visit, #n_result, #n_body,
+                            )?;
+                            ::core::ops::ControlFlow::Continue(#request::#phase(#n_slot, #n_body))
+                        },
+                    });
+                }
+            }
+            dispatch.extend(match item.kind {
+                spec::Kind::Sync => quote! {
+                    #body_id::#variant(#n_call) => {
+                        let (#v_head, #n_body) =
+                            #n_call.into_parts();
+                        #v_head.scope(|#v_head| {
+                            let #n_encode = #ns_core::decode::Encode::begin_head(
+                                #n_encode,
+                                #v_head.owner().owner().view(),
+                            );
+                            let #n_head = #v_head.borrow();
+                            let #n_resp = (|| {
+                                let #n_body = #n_body.into_inner();
+                                let #n_view = #n_body.into();
+                                let #n_params = <<#route as #ns_core::route::Spec>::Request
+                                    as #ns_core::route::Project>::from_params(&#n_head)?;
+                                let #n_hdrs = <<#route as #ns_core::route::Spec>::Request
+                                    as #ns_core::route::Project>::from_headers(&#n_head)?;
+                                let #n_body = <<#route as #ns_core::route::Spec>::Request
+                                    as #ns_core::route::Project>::parse_body(#n_body)?;
+                                let #n_req = #ns_core::request::View::from_head(
+                                    #n_head.into_owner(), #n_view,
+                                );
+                                ::core::result::Result::Ok(
+                                    <#route as #ns_core::manifold::Route<#state_ty>>::invoke(
+                                        (#n_params, &#n_req, #n_hdrs, #n_body, #app),
+                                    ),
+                                )
+                        })();
+                        let #n_prep = match #n_resp {
+                            ::core::result::Result::Ok(#n_resp) =>
+                                #ns_http::payload::response::dispatch::Complete::complete(
+                                    #n_resp,
+                                    #n_encode,
+                                ).map_err(|(#n_error, #n_encode)| (
+                                    #ns_core::decode::dispatch::Error::Encode(#n_error),
+                                    #n_encode,
+                                )),
+                            ::core::result::Result::Err(#n_error) =>
+                                ::core::result::Result::Err((
+                                    #ns_core::decode::dispatch::Error::Invalid(
+                                        #error_id::#variant(#n_error),
+                                    ),
+                                    #ns_core::decode::Cancel::cancel(#n_encode),
+                                )),
+                        }?;
+                        let #n_prep =
+                            #ns_core::decode::Lineage::resolve_head(
+                                #n_prep,
+                                #v_head.into_owner(),
+                            );
+                        ::core::result::Result::Ok(#n_prep)
+                        })
+                    },
+                },
+                spec::Kind::Fiber | spec::Kind::Stream | spec::Kind::Duplex => quote! {
+                    #body_id::#variant(_) =>
+                        ::core::result::Result::Err(
+                            (
+                                #ns_core::decode::dispatch::Error::Unsupported,
+                                #ns_core::decode::Cancel::cancel(#n_encode),
+                            ),
+                        ),
+                },
+            });
+            project.extend(quote! {
+                #exec::#variant(#n_slot) => {
+                    <<#schema as #ns_core::route::Schema>::Body
+                        as #ns_core::body::Project>::try_input(
+                        #n_body,
+                        #n_slot,
+                        |#n_scope| {
+                            let (#n_slot, #n_body, #n_source) = #n_scope.into_source();
+                            #n_proj(
+                                #ns_core::decode::Scoped::<Self, _>::new(
+                                    #body_id::#variant(
+                                        #ns_core::decode::Call::new(#n_slot.head, #n_body),
+                                    ),
+                                    #n_source,
+                                ),
+                            )
+                        },
+                    ).map_err(|#n_fail| {
+                        #n_fail.map(|(#n_input, #n_slot)| (#exec::#variant(#n_slot), #n_input))
+                    })
+                },
+            });
+        }
+        let vis = &spec.vis;
+        let slots = &state.slots;
+        let flow = &state.definition;
+        let plan_definition = &head.plan;
+        let guard_impls = handle::emit_guards(paths, spec, entries);
+        let definitions = quote! {
+            #plan_definition
+            #( #slots )*
+            #( #guard_impls )*
+            #[doc(hidden)]
+            #vis enum #head_ty { #variants }
+            #flow
+
+            #[doc(hidden)]
+            #vis enum #body_id<#l_input, 'd>
+            where
+                'd: #l_input,
+            {
+                #bodies
+            }
+
+            #[doc(hidden)]
+            #vis enum #error_id<#l_input> {
+                #errors
+            }
+
+            impl<#l_input> #error_id<#l_input> {
+                fn reject(self) -> #ns_core::route::Reject {
+                    match self {
+                        #rejects
+                    }
+                }
+            }
+
+            impl<#l_input> #ns_core::route::Never for #error_id<#l_input>
+            where
+                #bounds
+            {
+                fn never<#g_t>(self) -> #g_t {
+                    match self {
+                        #never
+                    }
+                }
+            }
+        };
         let target = quote! {
             let #n_hbytes = #n_fields.as_bytes();
             let #n_trange = match #n_plan.form() {
@@ -228,7 +519,7 @@ impl Decode {
             }
         };
         let bound = egress(paths, spec, entries, &l_out);
-        let (guard, guards) = if entries.iter().any(|item| !item.entry.guards.is_empty()) {
+        let (guard, guards) = if !admits.is_empty() {
             (
                 Some(quote! {
                     #[inline(always)]
@@ -260,14 +551,14 @@ impl Decode {
                     > {
                         let (#n_req, #n_method) = #n_req.into_parts();
                         match #n_req {
-                            #( #admits )*
+                            #admits
                         }
                     }
                 }),
                 quote!(+ #ns_core::decode::Guarded),
             )
         } else {
-            (None, proc_macro2::TokenStream::new())
+            (None, TokenStream::new())
         };
         let contract = quote! {
             for<#l_out, #l_input> #ns_core::decode::Decode<
@@ -380,7 +671,7 @@ impl Decode {
             >
             {
                 match #n_prep {
-                    #( #project )*
+                    #project
                 }
             }
 
@@ -410,7 +701,7 @@ impl Decode {
                 ),
             > {
                 match #n_req {
-                    #( #dispatch, )*
+                    #dispatch
                 }
             }
         };
@@ -419,7 +710,8 @@ impl Decode {
             guard,
             method: tokens,
             full,
-            prepared,
+            prepared: state.prepared,
+            definitions,
         }
     }
 }

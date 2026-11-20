@@ -8,13 +8,16 @@ impl Drain {
     /// Resolves work after the final-link owner reports a complete drain.
     pub fn complete<'d, Runtime, Pending, Transitions, Ready, Heads>(
         conn: &mut session::Conn<'d, Runtime, Pending, Transitions, Ready, Heads>,
-    ) -> pump::Completion<'d>
+    ) -> pump::Completion
     where
         Runtime: pump::Tasks,
         Transitions: switch::Engine,
     {
         match conn.transitions.commit() {
-            switch::Commit::Ordinary => Self::ordinary(conn, pump::Next::Resume).into(),
+            switch::Commit::Ordinary => match Self::ordinary(conn, pump::Next::Resume) {
+                pump::Next::None => pump::Completion::None,
+                pump::Next::Resume | pump::Next::Close(_) => pump::Completion::Resume,
+            },
             switch::Commit::Switch => pump::Completion::Switch,
         }
     }
@@ -45,7 +48,7 @@ impl Drain {
             pump::Activity::Stream => return stream,
             pump::Activity::Idle | pump::Activity::Task => {}
         }
-        if let Some(reason) = conn.deferred_action.take() {
+        if let Some(reason) = conn.deferred_action {
             conn.deferred = head::Connection::Close;
             return pump::Next::Close(reason);
         }

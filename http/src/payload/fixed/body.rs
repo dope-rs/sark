@@ -47,7 +47,7 @@ where
         self,
         slot: &handoff::Slot<'req, 'd, H, O>,
     ) -> Result<handoff::Plan<'req, 'd, H::Selection, O>, owned::Error> {
-        Ok(handoff::Plan::new(slot.origin().fixed(self)))
+        Ok(slot.fixed(self))
     }
 }
 

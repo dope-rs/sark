@@ -1,10 +1,13 @@
 pub mod common;
 
-use common::response::{coding, headers, try_complete};
+use common::response::{coding, headers};
 use dope_test::alloc::Tracker;
 use sark_http::{
     field::Value,
-    h1::head::{Limit, response::State},
+    h1::{
+        codec::decode::response::Decoder,
+        head::{Limit, response::State},
+    },
     payload::response::{Method, Response, status::Code},
 };
 
@@ -13,10 +16,7 @@ static ALLOCATOR: Tracker = Tracker::new();
 
 #[test]
 fn connect_transition_stays_typed() {
-    use sark_http::h1::{
-        codec::decode::response::{Decoder, Error},
-        framing,
-    };
+    use sark_http::h1::{codec::decode::response::Error, framing};
 
     let wire = common::head::CONNECT_RESPONSES[1];
     assert!(matches!(
@@ -29,7 +29,7 @@ fn connect_transition_stays_typed() {
 
 #[test]
 fn body_allocation_failures() {
-    use sark_http::h1::codec::decode::response::{Decoder, Error};
+    use sark_http::h1::codec::decode::response::Error;
 
     let decoder = Decoder::new(Method::Other);
     assert!(matches!(
@@ -67,7 +67,8 @@ fn constructors_keep_parts() {
 
 #[test]
 fn trailers_stay_separate() {
-    let response = try_complete(headers::TRAILERS)
+    let response = Decoder::new(Method::Other)
+        .decode(headers::TRAILERS)
         .expect("response must decode")
         .expect("test input must be complete");
     assert_eq!(
@@ -83,7 +84,8 @@ fn trailers_stay_separate() {
 
 #[test]
 fn header_repeats_preserved() {
-    let response = try_complete(headers::REPEATED)
+    let response = Decoder::new(Method::Other)
+        .decode(headers::REPEATED)
         .expect("response must decode")
         .expect("test input must be complete");
     let cookies: Vec<_> = response
@@ -109,7 +111,8 @@ fn header_repeats_preserved() {
 
 #[test]
 fn status_code() {
-    let response = try_complete(headers::STATUS)
+    let response = Decoder::new(Method::Other)
+        .decode(headers::STATUS)
         .expect("response must decode")
         .expect("test input must be complete");
     assert_eq!(response.status().as_u16(), 599);
@@ -117,8 +120,6 @@ fn status_code() {
 
 #[test]
 fn decoded_headers_own_data() {
-    use sark_http::h1::codec::decode::response::Decoder;
-
     let response = {
         let wire = headers::TRAILERS.to_vec();
         Decoder::new(Method::Other)

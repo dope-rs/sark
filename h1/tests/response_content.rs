@@ -15,7 +15,7 @@ use sark_h1::{
     session,
     wire::{
         Failure, head, output,
-        parsing::{self, framing, raw},
+        parsing::{framing, raw},
         response::{self, Context},
     },
 };
@@ -97,9 +97,7 @@ fn omits_body() {
 #[test]
 fn omits_stream() {
     for &request in replies::HEADS {
-        let parsed = parsing::Head::parse(Input::Borrowed(request), u8::MAX)
-            .expect("line")
-            .expect("head");
+        let parsed = common::head::parsed(Input::Borrowed(request), u8::MAX);
         let head = framing::Head::<Streaming>::parse(raw::Bound::empty(&parsed))
             .ok()
             .flatten()

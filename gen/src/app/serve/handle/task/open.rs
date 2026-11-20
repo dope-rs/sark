@@ -1,6 +1,3 @@
-use decode::state;
-use handle::decode;
-
 use crate::{
     app::{
         serve::{self, handle},
@@ -13,7 +10,7 @@ use crate::{
 pub(super) fn generate(
     paths: &Paths,
     ctx: &handle::Context<'_, '_, '_>,
-    state: &state::State,
+    prep: &syn::Ident,
 ) -> Vec<proc_macro2::TokenStream> {
     let [f_core, f_state] = ["core", "state"].map(local);
     let symbols = &ctx.plan.spec.state_generics;
@@ -24,7 +21,6 @@ pub(super) fn generate(
 
     let ns_core = &paths.core;
 
-    let prep = &state.prepared;
     let error = format_ident!("{}ProjectError", ctx.plan.spec.name);
     let state_ty = ctx.plan.spec.state.ty();
     let rejects = ctx

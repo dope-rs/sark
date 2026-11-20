@@ -5,15 +5,6 @@ use o3::buffer::{self, hold};
 
 use crate::server::payload::{Cursor, Frame, Inner, State, Stream};
 
-fn cursor<'a, 'd>(frame: &'a Frame<'d>, offset: data::Offset) -> Option<Cursor<'a, 'd>> {
-    if offset.get() >= frame.len() {
-        return None;
-    }
-    // SAFETY: this immutable frame retains every span and the checked offset
-    // lies strictly below their exact total length.
-    Some(unsafe { resume(frame, offset) })
-}
-
 /// # Safety
 /// The offset must lie strictly below the frame's logical length.
 unsafe fn resume<'a, 'd>(frame: &'a Frame<'d>, offset: data::Offset) -> Cursor<'a, 'd> {
@@ -108,7 +99,7 @@ unsafe impl<'d, K> data::raw::Payload<'d> for Stream<'d, K> {
         Self: 'a;
 
     fn len(&self) -> usize {
-        self.frame.len()
+        self.frame.charge.logical_bytes
     }
 
     fn charge(&self) -> hold::Charge {
@@ -116,38 +107,7 @@ unsafe impl<'d, K> data::raw::Payload<'d> for Stream<'d, K> {
     }
 
     fn start(&self) -> Self::Cursor<'_> {
-        data::raw::Payload::start(&self.frame)
-    }
-
-    fn cursor(&self, offset: data::Offset) -> Option<Self::Cursor<'_>> {
-        cursor(&self.frame, offset)
-    }
-
-    unsafe fn resume(&self, _: &mut Self::Position, offset: data::Offset) -> Self::Cursor<'_> {
-        // SAFETY: resume requires this offset to lie strictly below the frame length.
-        unsafe { resume(&self.frame, offset) }
-    }
-}
-
-// SAFETY: The closed frame variants retain fixed spans; the cursor traverses exactly those spans in wire order.
-unsafe impl<'d> data::raw::Payload<'d> for Frame<'d> {
-    type Mode = exec::Fallible;
-    type Position = ();
-    type Cursor<'a>
-        = Cursor<'a, 'd>
-    where
-        Self: 'a;
-
-    fn len(&self) -> usize {
-        self.charge.logical_bytes
-    }
-
-    fn charge(&self) -> hold::Charge {
-        self.charge
-    }
-
-    fn start(&self) -> Self::Cursor<'_> {
-        Cursor(match &self.inner {
+        Cursor(match &self.frame.inner {
             Inner::Chunk(parts) => State::Prefix {
                 parts,
                 bytes: parts.prefix.as_ref(),
@@ -157,11 +117,15 @@ unsafe impl<'d> data::raw::Payload<'d> for Frame<'d> {
     }
 
     fn cursor(&self, offset: data::Offset) -> Option<Self::Cursor<'_>> {
-        cursor(self, offset)
+        if offset.get() >= self.len() {
+            return None;
+        }
+        // SAFETY: the checked offset lies inside this immutable frame.
+        Some(unsafe { resume(&self.frame, offset) })
     }
 
     unsafe fn resume(&self, _: &mut Self::Position, offset: data::Offset) -> Self::Cursor<'_> {
         // SAFETY: resume requires this offset to lie strictly below the frame length.
-        unsafe { resume(self, offset) }
+        unsafe { resume(&self.frame, offset) }
     }
 }

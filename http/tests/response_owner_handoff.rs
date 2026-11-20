@@ -3,10 +3,7 @@ pub mod common;
 use std::convert::Infallible;
 
 use common::response::handoff::Tasks;
-use dope_core::{
-    BranchError,
-    driver::{life::recovery, settings},
-};
+use dope_core::driver::{life::recovery, settings};
 use dope_test::{
     alloc::Tracker,
     scope::{Driver, Error},
@@ -95,6 +92,20 @@ fn segments_foreign_request() {
 
         assert!(charge == hold::Charge::default());
     });
+}
+
+#[test]
+fn releases_empty_response_at_selection() {
+    let body = Vec::<u8>::with_capacity(1);
+    let measurement = Tracker::begin();
+    let plan = body
+        .try_resolve(&handoff::Slot::empty())
+        .expect("select empty body");
+    assert_eq!(measurement.finish().deallocations, 1);
+    assert!(matches!(
+        plan.finish().expect("empty body"),
+        handoff::Ready::Empty
+    ));
 }
 
 #[test]
@@ -329,10 +340,7 @@ fn ids(run: impl for<'d> FnOnce(request::Seq<'d>)) {
         |result| {
             result
                 .as_ref()
-                .map_err(|error| match error {
-                    Error::Create(error) => BranchError::First(error.kind()),
-                    Error::Close(error) => BranchError::Second(error.cause()),
-                })
+                .map_err(Error::cause)
                 .expect("identity scope lifetime");
         },
     );

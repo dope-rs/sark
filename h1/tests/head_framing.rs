@@ -38,9 +38,7 @@ static ALLOCATOR: Tracker = Tracker::new();
 fn setters_and_owner() {
     SETS.set(Vec::new());
     let mut input = b"GET / HTTP/1.1\r\nHost: local\r\nX-Count: once\r\nX-Other: ".to_vec();
-    let source = parsing::Head::parse(Input::Borrowed(&input), u8::MAX)
-        .expect("line")
-        .expect("complete line");
+    let source = head::parsed(Input::Borrowed(&input), u8::MAX);
     let mut pending =
         match Head::<Request, Plain, head::Admission>::start(raw::Bound::empty(&source))
             .ok()
@@ -112,9 +110,7 @@ fn captured_list_members() {
     let wire = head::CSV_FIELD;
     for split in Request::PREFIX.len()..=wire.len() {
         SETS.set(Vec::new());
-        let source = parsing::Head::parse(Input::Borrowed(&wire[..split]), u8::MAX)
-            .expect("request line")
-            .expect("complete request line");
+        let source = head::parsed(Input::Borrowed(&wire[..split]), u8::MAX);
         match Head::<Request>::start(raw::Bound::empty(&source))
             .ok()
             .expect("admitted field")
@@ -140,12 +136,10 @@ fn captured_list_members() {
 #[test]
 fn bad_field_rejects() {
     SETS.set(Vec::new());
-    let source = parsing::Head::parse(
+    let source = head::parsed(
         Input::Borrowed(b"GET / HTTP/1.1\r\nHost: local\r\nContent-Length: "),
         u8::MAX,
-    )
-    .expect("line")
-    .expect("complete line");
+    );
     let pending = match Head::<Request>::start(raw::Bound::empty(&source))
         .ok()
         .expect("fields")
@@ -193,9 +187,7 @@ fn upgrade_errors_follow_canonical_field_admission() {
         ])
     {
         for split in Request::PREFIX.len()..=through {
-            let source = parsing::Head::parse(Input::Borrowed(&wire[..split]), u8::MAX)
-                .expect("request line")
-                .expect("complete request line");
+            let source = head::parsed(Input::Borrowed(&wire[..split]), u8::MAX);
             let measurement = Tracker::begin();
             let error = match Head::<Request, Plain, sark_h1::route::duplex::Upgrade>::start(
                 raw::Bound::empty(&source),
@@ -241,9 +233,7 @@ fn transfer_coding_admission() {
     for &(coding, supported) in head::TRANSFER_CODINGS {
         let wire = Request::transfer(coding);
         for split in Request::TRANSFER_PREFIX.len()..=wire.len() {
-            let source = parsing::Head::parse(Input::Borrowed(&wire[..split]), u8::MAX)
-                .expect("request line")
-                .expect("complete request line");
+            let source = head::parsed(Input::Borrowed(&wire[..split]), u8::MAX);
             let result = match Head::<Request>::start(raw::Bound::empty(&source)) {
                 Ok(HeadProgress::Complete(_)) => Ok(()),
                 Ok(HeadProgress::Pending(pending)) => pending
@@ -290,9 +280,7 @@ fn http10_ignores_upgrade() {
         b"GET / HTTP/1.0\r\nHost: local\r\nConnection: upgrade\r\nUpgrade: web socket\r\n\r\n";
     for split in [wire.len(), wire.len() - 8, wire.len() - 3] {
         SETS.set(Vec::new());
-        let source = parsing::Head::parse(Input::Borrowed(&wire[..split]), u8::MAX)
-            .expect("line")
-            .expect("complete line");
+        let source = head::parsed(Input::Borrowed(&wire[..split]), u8::MAX);
         match Head::<Request>::start(raw::Bound::empty(&source))
             .ok()
             .expect("HTTP/1.0 fields")
@@ -317,12 +305,10 @@ fn http10_ignores_upgrade() {
         assert_eq!(SETS.take().as_slice(), [b"web socket"]);
     }
 
-    let source = parsing::Head::parse(
+    let source = head::parsed(
         Input::Borrowed(b"GET / HTTP/1.0\r\nHost: local\r\nUpgrade: web"),
         u8::MAX,
-    )
-    .expect("line")
-    .expect("complete line");
+    );
     let pending = match Head::<Request>::start(raw::Bound::empty(&source))
         .ok()
         .expect("pending fields")
@@ -351,9 +337,7 @@ fn whole_and_split() {
     for field in Request::LONG_FIELDS {
         for width in [8191, 8192, 8193] {
             let input = Request::long(width, field);
-            let source = parsing::Head::parse(Input::Borrowed(&input), u8::MAX)
-                .expect("line")
-                .expect("complete line");
+            let source = head::parsed(Input::Borrowed(&input), u8::MAX);
             let complete = Head::<Request>::start(raw::Bound::empty(&source));
             assert_eq!(
                 matches!(complete, Ok(HeadProgress::Complete(_))),
@@ -361,9 +345,7 @@ fn whole_and_split() {
             );
             assert!(SETS.take().is_empty());
             for split in [Request::PREFIX.len() + field.len(), input.len() - 3] {
-                let source = parsing::Head::parse(Input::Borrowed(&input[..split]), u8::MAX)
-                    .expect("line")
-                    .expect("complete line");
+                let source = head::parsed(Input::Borrowed(&input[..split]), u8::MAX);
                 let pending = match Head::<Request>::start(raw::Bound::empty(&source)) {
                     Ok(HeadProgress::Pending(pending)) => Some(pending),
                     Err(parsing::Request::Head(Error::Line(line::Error::Limit {
@@ -462,9 +444,7 @@ fn route_bound_precedes_retention() {
     for extra in [0, 1] {
         let wire = Request::bounded(LIMIT, extra);
         for split in [16, LIMIT - 2, wire.len()] {
-            let source = parsing::Head::parse(Input::Borrowed(&wire[..split]), u8::MAX)
-                .expect("request line")
-                .expect("complete line");
+            let source = head::parsed(Input::Borrowed(&wire[..split]), u8::MAX);
             let measurement = Tracker::begin();
             let started = Head::<Request, Plain, head::Admission>::start(raw::Bound::empty(&source));
             let allocation = measurement.finish();
@@ -516,9 +496,7 @@ fn route_bound_precedes_retention() {
     let limit = 64 * 1024;
     for extra in [0, 1] {
         let wire = Request::bounded(limit, extra);
-        let source = parsing::Head::parse(Input::Borrowed(&wire[..16]), u8::MAX)
-            .expect("request line")
-            .expect("complete line");
+        let source = head::parsed(Input::Borrowed(&wire[..16]), u8::MAX);
         let RouteOutcome::AwaitReject { pending, .. } =
             parsing::Rejected::start::<Infallible, Infallible, Infallible>(
                 &source,

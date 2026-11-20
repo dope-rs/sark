@@ -18,28 +18,15 @@ use o3::{
 };
 use sark_http::{
     field,
-    h1::codec::decode::{
-        fields,
-        response::{Collected, Decoder, Error as DecodeError, Progress},
-    },
     payload::{
         fixed,
         response::{
-            Body, Method, bounded, dispatch, exact,
+            Body, bounded, dispatch, exact,
             headers::{Entry, Name, Sink, Source},
             status::Code,
         },
     },
 };
-
-pub fn try_complete<'field>(
-    wire: &[u8],
-) -> Result<Option<Collected<'field>>, DecodeError<fields::Error>> {
-    Ok(match Decoder::new(Method::Other).decode(wire)? {
-        Progress::Complete(response) => Some(response),
-        Progress::More => None,
-    })
-}
 
 #[derive(Debug)]
 pub enum Error {

@@ -119,7 +119,7 @@ pub(super) fn build(
                 let mut #v_this = self.project();
                 let #v_exch = #v_wait.exchange;
                 let #v_result = match #v_wait.route {
-                    #( #cancel, )*
+                    #cancel
                 };
                 #retire_pending
             }
@@ -328,7 +328,7 @@ pub(super) fn build(
         let (send, start, eof, gate, recv, stop, input, gated, scratch) = {
             let dispatch = &types.names.dispatch_ident;
             let v_routes = symbols.local("routes");
-            let [v_reason, v_slot] = symbols.locals(["reason", "slot"]);
+            let v_slot = symbols.local("slot");
             let [n_drive] = symbols.locals(["__drive"]);
             let [n_prog, v_action] = symbols.locals(["__progress", "action"]);
             let [v_budget, v_bytes, v_chunk] = symbols.locals(["budget", "bytes", "chunk"]);
@@ -957,10 +957,6 @@ pub(super) fn build(
                                         }
                                     }
                                     #ns_h1::pump::Completion::Resume => {
-                                        #ns_fiber::dope::manifold::network::listener::handler::PostDrain::Activate
-                                    }
-                                    #ns_h1::pump::Completion::Close(#v_reason) => {
-                                        #v_link.state_mut().defer(#v_reason);
                                         #ns_fiber::dope::manifold::network::listener::handler::PostDrain::Activate
                                     }
                                     #ns_h1::pump::Completion::Switch => {

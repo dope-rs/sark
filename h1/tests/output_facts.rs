@@ -28,10 +28,10 @@ fn inline_copy_tracks_body() {
             cause: evidence::Cause::Compressed,
         })
     ));
-    let done = <On as turn::Mode>::complete(action.retention());
+    let done = turn::Turn::<On>::published(turn::Readiness::Staged, action.retention());
     assert!(matches!(
         done,
-        turn::Completion::Response { owner, .. } if owner.len == 17
+        turn::Turn::Response { owner, linked: false, .. } if owner.len == 17
     ));
 }
 
@@ -65,8 +65,8 @@ fn linked_uses_enum_state() {
         connection: head::Connection::KeepAlive,
     };
     assert!(matches!(
-        action.retention(),
-        output::Retention::Linked(owner) if owner.len == 8
+        turn::Turn::<On>::published(turn::Readiness::NewlyReady, action.retention()),
+        turn::Turn::Response { owner, linked: true, .. } if owner.len == 8
     ));
     assert!(matches!(action.copy(), output::Copy::Uncopied));
     let response = action.into_consume::<()>(

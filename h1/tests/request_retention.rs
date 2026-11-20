@@ -29,9 +29,7 @@ fn retention_follows_window() {
             None => Input::Borrowed(&input[offset..end]),
         };
         let pointer = head.as_slice().as_ptr();
-        let parsed = parsing::Head::parse(head, u8::MAX)
-            .expect("request line")
-            .expect("complete request line");
+        let parsed = common::head::parsed(head, u8::MAX);
         let mut fixture = Retain::try_new().expect("response resources");
         let mut conn = session::Conn::default();
         let (outcome, allocs) = Tracker::count(|| {
@@ -74,9 +72,7 @@ fn retention_follows_window() {
 fn retains_fragmented_head() {
     let split = Request::HEAD.len() - 2;
     let mut input = Request::HEAD[..split].to_vec();
-    let source = parsing::Head::parse(Input::Borrowed(&input), u8::MAX)
-        .expect("line")
-        .expect("complete line");
+    let source = common::head::parsed(Input::Borrowed(&input), u8::MAX);
     let (progress, usage) = Tracker::activity(|| {
         framing::Head::<Request, Coding>::start(raw::Bound::empty(&source), Coding::Plain)
             .ok()
