@@ -10,7 +10,7 @@ use dope_test::alloc::Tracker;
 use o3::buffer::write::Slice;
 use sark_h1::{
     route,
-    wire::{cache, head, output},
+    wire::{head, output},
 };
 use sark_http::{
     h1::head::{
@@ -54,15 +54,9 @@ fn preencoded_inline() {
         output::Egress::new(writer.reborrow(), DATE, fields::RESPONSE).route(
             response,
             handoff::Slot::ready(None),
-            cache::Cache::empty(),
             &mut gzip,
             Coding::Gzip,
-            route::Policy::new(
-                route::Cache::Bypass,
-                Coding::Gzip,
-                Date::Include,
-                Server::Include,
-            ),
+            route::Policy::new(Coding::Gzip, Date::Include, Server::Include),
         )
     });
     let output::Outcome::SendCopied { copy, .. } = outcome else {
@@ -92,15 +86,9 @@ fn plain_compressor() {
         output::Egress::new(writer.reborrow(), DATE, fields::RESPONSE).route(
             response,
             handoff::Slot::ready(None),
-            cache::Cache::empty(),
             &mut (),
             Coding::Gzip,
-            route::Policy::new(
-                route::Cache::Bypass,
-                Coding::Gzip,
-                Date::Include,
-                Server::Include,
-            ),
+            route::Policy::new(Coding::Gzip, Date::Include, Server::Include),
         )
     });
     let output::Outcome::SendCopied { copy, .. } = outcome else {
@@ -132,15 +120,9 @@ fn reuses_inline_on_limit() {
     let outcome = output::Egress::new(writer.reborrow(), date, fields::RESPONSE).route(
         response,
         handoff::Slot::ready(None),
-        cache::Cache::empty(),
         &mut gzip,
         Coding::Gzip,
-        route::Policy::new(
-            route::Cache::Bypass,
-            Coding::Gzip,
-            Date::Include,
-            Server::Include,
-        ),
+        route::Policy::new(Coding::Gzip, Date::Include, Server::Include),
     );
     let output::Outcome::SendCopied { copy, .. } = outcome else {
         panic!("unavailable gzip must keep the encoded inline body");
@@ -195,15 +177,9 @@ fn bounded_reuses_inline() {
     let outcome = output::Egress::new(writer.reborrow(), DATE, fields::RESPONSE).route(
         response,
         handoff::Slot::ready(None),
-        cache::Cache::empty(),
         &mut gzip,
         Coding::Gzip,
-        route::Policy::new(
-            route::Cache::Bypass,
-            Coding::Gzip,
-            Date::Include,
-            Server::Include,
-        ),
+        route::Policy::new(Coding::Gzip, Date::Include, Server::Include),
     );
     let (written, len) = match outcome {
         output::Outcome::SendCopied { copy, .. } => Some((writer.len(), copy.written)),
@@ -235,15 +211,9 @@ fn compresses_bounded_once() {
     let outcome = output::Egress::new(writer.reborrow(), date, fields::RESPONSE).route(
         response,
         handoff::Slot::ready(None),
-        cache::Cache::empty(),
         &mut gzip,
         Coding::Gzip,
-        route::Policy::new(
-            route::Cache::Bypass,
-            Coding::Gzip,
-            Date::Include,
-            Server::Include,
-        ),
+        route::Policy::new(Coding::Gzip, Date::Include, Server::Include),
     );
     let (head_len, zipped, read) = match outcome {
         output::Outcome::SendCompressed { body, read, .. } => Some((writer.len(), body, read)),

@@ -63,7 +63,7 @@ pub(super) fn methods<'view, 'source, 'spec>(
             .upgrade
             .then(|| quote::quote!(, #ns_h1::route::duplex::Upgrade));
         let coding = match plan.mode {
-            serve::Mode::Sync { .. } => quote::quote!(#ns_http::h1::head::request::Coding),
+            serve::Mode::Sync => quote::quote!(#ns_http::h1::head::request::Coding),
             serve::Mode::Duplex { .. } | serve::Mode::Fiber { .. } | serve::Mode::Stream { .. } => {
                 quote::quote!(#ns_h1::wire::parsing::framing::Plain)
             }
@@ -117,7 +117,7 @@ pub(super) fn emit<'view, 'source, 'spec>(
     runtime: &proc_macro2::TokenStream,
     source: Source,
 ) -> proc_macro2::TokenStream {
-    let [f_life, f_cache, f_gzip] = ["lifecycle", "response_cache", "gzip"].map(local);
+    let [f_life, f_gzip] = ["lifecycle", "gzip"].map(local);
     let [f_ids, f_time, f_makers] = ["ids", "timer", "task_producers"].map(local);
     let symbols = &ctx.plan.spec.state_generics;
     let [v_expect, v_make] = symbols.locals(["expectation", "producer"]);
@@ -174,7 +174,7 @@ pub(super) fn emit<'view, 'source, 'spec>(
     };
     if matches!(source, Source::Owned) {
         let (start, coding) = match &plan.mode {
-            serve::Mode::Sync { .. } => (
+            serve::Mode::Sync => (
                 quote! {
                     #ns_h1::wire::parsing::framing::PendingHead::<
                         #route,
@@ -213,7 +213,7 @@ pub(super) fn emit<'view, 'source, 'spec>(
     let guard = terminal::guard(paths, &ctx.plan.spec.state_generics, &method, slot, state);
     if matches!(source, Source::Borrowed) {
         let parse = match &plan.mode {
-            serve::Mode::Sync { .. } => quote! {
+            serve::Mode::Sync => quote! {
                 #ns_h1::wire::parsing::framing::Head::<
                     #route,
                     #ns_http::h1::head::request::Coding,
@@ -268,27 +268,23 @@ pub(super) fn emit<'view, 'source, 'spec>(
                 },
             )
         }
-        serve::Mode::Sync { cache } => {
-            let index = Index::from(*cache);
-            (
-                quote!(),
-                quote! {
-                    #ns_h1::route::sync::Endpoint::new(
-                        #ns_h1::route::sync::Egress::new(
-                            #ns_h1::wire::output::Egress::new(#v_write, #v_date, #n_resp),
-                            #ns_h1::wire::cache::Cache::new(&mut #v_this.#f_cache[#index]),
-                            #v_this.#f_gzip,
-                        ),
-                        #v_conn,
-                    ).dispatch::<#route, #state, _>(
-                        #v_permit,
-                        #n_shead,
-                        #v_state,
-                        #ns_core::life::Mode::body(#v_this.#f_life, #v_exch),
-                    )
-                },
-            )
-        }
+        serve::Mode::Sync => (
+            quote!(),
+            quote! {
+                #ns_h1::route::sync::Endpoint::new(
+                    #ns_h1::route::sync::Egress::new(
+                        #ns_h1::wire::output::Egress::new(#v_write, #v_date, #n_resp),
+                        #v_this.#f_gzip,
+                    ),
+                    #v_conn,
+                ).dispatch::<#route, #state, _>(
+                    #v_permit,
+                    #n_shead,
+                    #v_state,
+                    #ns_core::life::Mode::body(#v_this.#f_life, #v_exch),
+                )
+            },
+        ),
         serve::Mode::Fiber { task, fiber } => {
             let task = serve::Task::new(plan, task);
             let index = Index::from(fiber.slot);
@@ -395,7 +391,7 @@ pub(super) fn emit<'view, 'source, 'spec>(
         );
     };
     let response = match &plan.mode {
-        serve::Mode::Sync { .. } | serve::Mode::Stream { .. } => {
+        serve::Mode::Sync | serve::Mode::Stream { .. } => {
             let finished = terminal::completed(
                 paths,
                 &ctx.plan.spec.state_generics,
@@ -413,7 +409,7 @@ pub(super) fn emit<'view, 'source, 'spec>(
         },
     };
     let watch = match &plan.mode {
-        serve::Mode::Sync { .. } | serve::Mode::Duplex { .. } => {
+        serve::Mode::Sync | serve::Mode::Duplex { .. } => {
             quote! {
                 #ns_h1::session::Outcome::Switch { .. } => {
                     #input

@@ -63,17 +63,8 @@ pub enum Host {
 }
 
 #[derive(Clone, Copy, Default, PartialEq, Eq)]
-#[repr(u8)]
-enum HostState {
-    #[default]
-    Missing,
-    Empty,
-    Authority,
-}
-
-#[derive(Clone, Copy, Default, PartialEq, Eq)]
 pub struct Request {
-    host: HostState,
+    host: Option<Host>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -131,7 +122,7 @@ impl Target {
             };
         }
         if method == b"CONNECT" {
-            return if is_connect(target) {
+            return if uri::Authority::has_nonempty_port(target) == Ok(true) {
                 Ok(Self {
                     path: span::Span::default(),
                     query: Part::Missing,
@@ -159,7 +150,7 @@ impl Target {
             let auth = if value.is_empty() {
                 Part::Missing
             } else {
-                uri::Authority::parse(value).map_err(Error::Authority)?;
+                uri::Authority::validate(value).map_err(Error::Authority)?;
                 Part::Present(Operation::Authority.check(span_at, value.len())?)
             };
             (auth, span_at + value.len(), suffix)
@@ -321,22 +312,18 @@ pub struct Plan {
 impl Request {
     pub fn try_host(self, value: &[u8]) -> Result<Self, HostError> {
         let host = Host::parse(value).map_err(HostError::Authority)?;
-        self.try_push(host)
+        self.with_host(host)
     }
 
-    pub(crate) fn try_push(mut self, value: Host) -> Result<Self, HostError> {
-        if !matches!(self.host, HostState::Missing) {
-            return Err(HostError::Duplicate);
+    pub(crate) fn with_host(self, host: Host) -> Result<Self, HostError> {
+        match self.host {
+            None => Ok(Self { host: Some(host) }),
+            Some(_) => Err(HostError::Duplicate),
         }
-        self.host = match value {
-            Host::Empty => HostState::Empty,
-            Host::Authority => HostState::Authority,
-        };
-        Ok(self)
     }
 
     pub const fn has_host(self) -> bool {
-        !matches!(self.host, HostState::Missing)
+        self.host.is_some()
     }
 
     pub fn finish(self, method: &[u8], target: &[u8], version: &[u8]) -> Result<Plan, Error> {
@@ -347,15 +334,15 @@ impl Request {
     /// Finalizes authority semantics from a request-target that was already
     /// validated by the request-line parser.
     pub fn finish_plan(self, target: Target, version: &[u8]) -> Result<Plan, Error> {
-        if version == b"HTTP/1.1" && matches!(self.host, HostState::Missing) {
+        if version == b"HTTP/1.1" && self.host.is_none() {
             return Err(Error::MissingHost);
         }
 
         let source = match target.source() {
             Some(source) => source,
             None => match self.host {
-                HostState::Authority => Source::Host,
-                HostState::Missing | HostState::Empty => Source::Empty,
+                Some(Host::Authority) => Source::Host,
+                None | Some(Host::Empty) => Source::Empty,
             },
         };
         Ok(Plan {
@@ -407,7 +394,7 @@ impl Host {
         if value.is_empty() {
             return Ok(Self::Empty);
         }
-        uri::Authority::parse(value)?;
+        uri::Authority::validate(value)?;
         Ok(Self::Authority)
     }
 }
@@ -442,24 +429,6 @@ fn scheme(value: &[u8]) -> Option<&[u8]> {
         }
     }
     None
-}
-
-fn is_connect(value: &[u8]) -> bool {
-    if value.first() == Some(&b'[') {
-        let Some(close) = value.iter().position(|byte| *byte == b']') else {
-            return false;
-        };
-        return close > 1
-            && uri::Authority::is_ip(&value[1..close])
-            && uri::Authority::is_port(&value[close + 1..]);
-    }
-
-    let Some(colon) = value.iter().rposition(|byte| *byte == b':') else {
-        return false;
-    };
-    !value[..colon].contains(&b':')
-        && uri::Authority::is_reg(&value[..colon])
-        && uri::Authority::is_port(&value[colon..])
 }
 
 const _: () = assert!(core::mem::size_of::<Target>() <= 4 * core::mem::size_of::<usize>());

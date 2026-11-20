@@ -234,6 +234,26 @@ fn normalizes_authorities() {
 }
 
 #[test]
+fn split_authority_keeps_the_first_unaccepted_byte() {
+    let name = Authority::parse(b"ab:443").expect("valid reference");
+    for (value, expected) in [
+        (b"a%62:443".as_slice(), Ok(true)),
+        (b"a%6:443", Err(uri::Error::InvalidHost)),
+        (b":80", Err(uri::Error::InvalidHost)),
+        (b"a:4x", Err(uri::Error::InvalidPort)),
+        (b"a:4x:", Err(uri::Error::InvalidHost)),
+    ] {
+        for split in 0..=value.len() {
+            let (first, second) = value.split_at(split);
+            assert_eq!(
+                name.compare_span(Span::new(first, second), Scheme::Https),
+                expected
+            );
+        }
+    }
+}
+
+#[test]
 fn parses_ip_literals() {
     use core::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 

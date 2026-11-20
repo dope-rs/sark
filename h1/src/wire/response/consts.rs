@@ -7,4 +7,3 @@ pub(super) const CONTENT_LENGTH: &[u8] = b"Content-Length: ";
 pub(super) const CHUNKED: &[u8] = b"Transfer-Encoding: chunked\r\n";
 pub(super) const STATUS: &[u8] = b"HTTP/1.1 ";
 pub(in crate::wire) const DATE_LEN: usize = 29;
-pub(in crate::wire) const PLACEHOLDER_DATE: &[u8; DATE_LEN] = b"Mon, 01 Jan 2000 00:00:00 GMT";

@@ -14,7 +14,7 @@ use sark_h1::{
     route::{self, stream},
     session,
     wire::{
-        Failure, cache, head, output,
+        Failure, head, output,
         parsing::{self, framing, raw},
         response::Context,
     },
@@ -26,51 +26,12 @@ use sark_http::{
         response::{Date, Server},
     },
     owner::handoff,
-    payload::response::{Method, fixed, status::Code},
+    payload::response::{fixed, status::Code},
 };
 
 #[test]
 fn fixed_connections() {
-    for version in [Version::Ten, Version::Eleven] {
-        for connection in [head::Connection::Close, head::Connection::KeepAlive] {
-            let mut write = [0; 256];
-            let mut writer = Slice::new(&mut write);
-            let response = Context::new(Method::Other, version);
-            let outcome = output::Egress::new(writer.reborrow(), DATE, response)
-                .plain(fixed::Direct::new(Code::OK, (), replies::BYTES), connection);
-            let (written, len) = match outcome {
-                output::Outcome::SendCopied { copy, .. } => Some((writer.len(), copy.written)),
-                _ => None,
-            }
-            .expect("fixed response");
-            let head = str::from_utf8(&write[..written - len]).expect("head");
-            assert!(head.starts_with(match version {
-                Version::Ten => "HTTP/1.0 200 OK\r\n",
-                Version::Eleven => "HTTP/1.1 200 OK\r\n",
-            }));
-            assert_eq!(
-                head.contains("Connection: keep-alive\r\n"),
-                version == Version::Ten && matches!(connection, head::Connection::KeepAlive)
-            );
-            assert_eq!(
-                head.contains("Connection: close\r\n"),
-                version == Version::Eleven && matches!(connection, head::Connection::Close)
-            );
-            assert!(!head.contains("Transfer-Encoding:"));
-            assert_eq!(&write[written - len..written], replies::BYTES);
-        }
-    }
-}
-
-#[test]
-fn cached_connections() {
-    let mut entry = None;
-    let policy = route::Policy::new(
-        route::Cache::Store,
-        Coding::Plain,
-        Date::Include,
-        Server::Include,
-    );
+    let policy = route::Policy::new(Coding::Plain, Date::Include, Server::Include);
     for &(request, connection) in replies::CONNECTIONS {
         let parsed = parsing::Head::parse(Input::Borrowed(request), u8::MAX)
             .expect("line")
@@ -80,47 +41,33 @@ fn cached_connections() {
             .flatten()
             .expect("admitted head")
             .response();
-        let mut cold = [0; 256];
-        assert!(
-            output::Egress::new(
-                o3::buffer::write::Slice::new(&mut cold).reborrow(),
-                DATE,
-                response
-            )
-            .cached(&mut cache::Cache::new(&mut entry), route::Cache::Store)
-            .is_none()
-        );
-        let mut writer = Slice::new(&mut cold);
-        let outcome = output::Egress::new(writer.reborrow(), DATE, response).route(
+        let mut bytes = [0; 256];
+        let mut writer = Slice::new(&mut bytes);
+        let result = output::Egress::new(writer.reborrow(), DATE, response).route(
             fixed::Direct::new(Code::OK, (), replies::BYTES),
             handoff::Slot::ready(None),
-            cache::Cache::new(&mut entry),
             &mut (),
             Coding::Plain,
             policy,
         );
-        let (written, len) = match outcome {
-            output::Outcome::SendCopied { copy, .. } => Some((writer.len(), copy.written)),
-            _ => None,
-        }
-        .expect("cached response");
-        let head = str::from_utf8(&cold[..written - len]).expect("head");
+        let output::Outcome::SendCopied { copy, .. } = result else {
+            panic!("fixed response must be copied");
+        };
+        let wire = writer.into_mut();
+        let (head, body) = wire.split_at(wire.len() - copy.written);
+        let head = str::from_utf8(head).expect("head");
+        let status = if request.starts_with(b"GET / HTTP/1.0\r\n") {
+            "HTTP/1.0 200 OK\r\n"
+        } else {
+            "HTTP/1.1 200 OK\r\n"
+        };
+        assert!(head.starts_with(status));
         assert_eq!(
             head.lines().find(|line| line.starts_with("Connection:")),
             connection
         );
-        assert_eq!(&cold[written - len..written], replies::BYTES);
-        let mut hot = [0; 256];
-        assert!(matches!(
-            output::Egress::new(
-                o3::buffer::write::Slice::new(&mut hot).reborrow(),
-                DATE,
-                response
-            )
-            .cached(&mut cache::Cache::new(&mut entry), route::Cache::Store),
-            Some(output::Outcome::SendCopied { .. })
-        ));
-        assert_eq!(hot, cold);
+        assert!(!head.contains("Transfer-Encoding:"));
+        assert_eq!(body, replies::BYTES);
     }
 }
 

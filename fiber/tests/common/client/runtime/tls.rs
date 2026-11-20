@@ -8,6 +8,7 @@ use dope::{
             route::{KeyTag, table, table::conn::Capacity},
             settings, storage,
         },
+        io::Reclaimed,
     },
     manifold::{
         app::{Host, env},
@@ -35,7 +36,10 @@ use dope_tls::{
 use sark_fiber::client::{Ready, channel, config, config::report, conn::Connector, request};
 use settings::errors;
 
-use crate::common::client::runtime::{self, Failure, WaitError};
+use crate::common::client::{
+    recover,
+    runtime::{self, Failure, WaitError},
+};
 
 type Network = env::Bundle<tcp::Tcp, tls::Tls<roles::Client>, timing::Balanced>;
 
@@ -190,14 +194,13 @@ impl Plan {
         })
     }
 
-    pub fn enter<R, Out>(
+    pub fn enter<R>(
         self,
         run: impl for<'app, 'life, 's, 'm, 'h, 'n, 'f, 'e, 'b, 'c, 'w, 'd> FnOnce(
             Scope<'app, 'life, 's, 'm, 'h, 'n, 'f, 'e, 'b, 'c, 'w, 'd>,
         ) -> R,
-        policy: impl recovery::Observe,
-        done: impl for<'a> FnOnce(Result<R, runtime::Error<'a>>) -> Out,
-    ) -> Result<Out, Error<Out>> {
+        report: impl FnMut(Reclaimed),
+    ) -> Result<R, Error<R>> {
         let mut finish = session::Completion::new();
         let finish = &mut finish;
         let Self {
@@ -250,8 +253,8 @@ impl Plan {
                     .map_err(Failure::Port)?
                 })
             },
-            policy,
-            |result| runtime::finish(result, done),
+            recovery::Policy::new(report, recover),
+            runtime::finish,
         );
         failures.finish(value)
     }

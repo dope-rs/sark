@@ -1,11 +1,10 @@
 use std::{convert::Infallible, thread, time::Duration};
 
-use common::client::recover;
+use common::client::assert_shutdown;
 use common::client::{
     gzip, retry,
     runtime::{origins, peer, pools},
 };
-use dope::core::{driver::life::recovery, io::Reclaimed};
 use dope_fiber::{
     BlockOn as _,
     task::{done::Once, time::budget::Elapsed},
@@ -111,11 +110,7 @@ fn processing_bound() {
                                 }
                             }
                         },
-                        recovery::Policy::new(
-                            |event| std::assert_matches!(event, Reclaimed::Shutdown),
-                            recover,
-                        ),
-                        |result| result.expect("client execution"),
+                        assert_shutdown,
                     )
                     .expect("client shutdown");
             }
@@ -172,11 +167,7 @@ fn recovered_process_attempt() {
                                 assert_eq!(attempt.get(), 3);
                                 assert_eq!(response.body().contiguous(), Some(b"ok".as_slice()));
                             },
-                            recovery::Policy::new(
-                                |event| std::assert_matches!(event, Reclaimed::Shutdown),
-                                recover,
-                            ),
-                            |result| result.expect("client execution"),
+                            assert_shutdown,
                         )
                         .expect("fixed client shutdown");
                 } else {
@@ -217,11 +208,7 @@ fn recovered_process_attempt() {
                                     assert_eq!(response.body().contiguous(), Some(b"ok".as_slice()));
                                 }
                             },
-                            recovery::Policy::new(
-                                |event| std::assert_matches!(event, Reclaimed::Shutdown),
-                                recover,
-                            ),
-                            |result| result.expect("client execution"),
+                            assert_shutdown,
                         )
                         .expect("client shutdown");
                 }
@@ -322,11 +309,7 @@ fn pending_process_cancels() {
                                 .expect("replacement response");
                             assert_eq!(next.body().contiguous(), Some(b"ok".as_slice()));
                         },
-                        recovery::Policy::new(
-                            |event| std::assert_matches!(event, Reclaimed::Shutdown),
-                            recover,
-                        ),
-                        |result| result.expect("client execution"),
+                        assert_shutdown,
                     )
                     .expect("client shutdown");
                 server
@@ -414,10 +397,7 @@ fn manual_completion_checks() {
                                 .expect("drive reuse").into_output().expect("reused response");
                             assert_eq!(response.body().contiguous(), Some(b"decoded".as_slice()));
                         },
-                        recovery::Policy::new(
-                            |event| std::assert_matches!(event, Reclaimed::Shutdown), recover,
-                        ),
-                        |result| result.expect("client execution"),
+                        assert_shutdown,
                     )
                     .expect("client shutdown");
                 server.stop().expect("peer thread").expect("stop peer");

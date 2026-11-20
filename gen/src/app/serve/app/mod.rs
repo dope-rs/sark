@@ -5,7 +5,6 @@ use crate::{
 };
 mod h1;
 mod surfaces;
-mod tokens;
 
 pub(super) fn build<'source, 'spec>(
     paths: &Paths,
@@ -20,17 +19,17 @@ pub(super) fn build<'source, 'spec>(
     let [n_bind, v_brand, v_ids] = symbols.locals(["__binding", "brand", "ids"]);
     let v_config = symbols.local("config");
     let [v_maker, v_tasks] = symbols.locals(["task_producers", "tasks"]);
-    let [l_env, g_brand] = source.spec.state_generics.lives(["env", "brand"]);
-    let [g_target, g_id, g_store, g_wire] = source
-        .spec
-        .state_generics
-        .idents(["__C", "__ID", "__P", "__W"]);
+    let [l_env, g_brand] = symbols.lives(["env", "brand"]);
+    let [g_target, g_id, g_mode, g_store, g_stamp, g_wire] =
+        symbols.idents(["__C", "__ID", "__M", "__P", "__S", "__W"]);
+    let g_part = symbols.ident("__CORE");
     let ns_core = &paths.core;
     let ns_http = &paths.http;
     let ns_fiber = &paths.fiber;
     use proc_macro2::TokenStream;
     use quote::{format_ident, quote};
     let spec = source.spec;
+    let vis = &spec.vis;
     let api = &spec.name;
     let name = format_ident!("{}Inner", api);
     let core_id = format_ident!("{}Core", name);
@@ -209,19 +208,14 @@ pub(super) fn build<'source, 'spec>(
         }
     };
     let bounds = &shape.base_bounds;
-    let names = tokens::Names {
-        generics,
-        core: &core_id,
-        name: &name,
-        public_name: api,
-    };
     let extras = match surface {
         Some(plan) => h1::extras(
             paths,
             plan,
             source,
             exec,
-            &names,
+            &core_id,
+            &name,
             surfaces::Binding::new(
                 paths,
                 &core_id,
@@ -272,18 +266,24 @@ pub(super) fn build<'source, 'spec>(
             let #v_tasks = #ns_fiber::dope_fiber::task::storage::scope::Owned::new(#v_tasks, #v_brand);
         }
     };
-    let prep = quote! {
-        #bind
-        #ids_prep
-    };
     let [f_time, f_life, f_state] = ["timer", "lifecycle", "state"].map(local);
     let [f_mark, f_core, f_stamp] = ["marker", "core", "stamp"].map(local);
     let [v_core, v_life] = generics.locals(["core", "lifecycle"]);
     let [v_stamp, v_state] = generics.locals(["stamp", "state"]);
-    let error = quote! {
-        #ns_fiber::dope_fiber::task::storage::fixed::schedule::queue::PrepareError
-    };
-    let factory = quote! {
+    let ddefinition = &dflat.definition;
+    let qdefinition = &qflat.definition;
+    let sources = exec.fibers().iter().map(|(task, fiber)| {
+        crate::app::spec::fiber_bound(paths, task.route(), state_ty, fiber.stream)
+    });
+    let brand = (!tasks.is_empty())
+        .then(|| quote!(#v_brand: #ns_fiber::dope_fiber::task::storage::scope::Brand<#g_brand>,));
+    let scheduled = &tinit[1];
+    let app = quote! {
+        #defs
+        #ddefinition
+        #qdefinition
+        #id_def
+        #fdef
         impl #proto
             #ns_core::manifold::task::app::Bind<'d>
             for #name #cold
@@ -292,7 +292,7 @@ pub(super) fn build<'source, 'spec>(
         {
             type Target = #g_target;
             type Runtime = #name #hot;
-            type Error = #error;
+            type Error = #ns_fiber::dope_fiber::task::storage::fixed::schedule::queue::PrepareError;
 
             fn try_bind(
                 self,
@@ -307,7 +307,8 @@ pub(super) fn build<'source, 'spec>(
                     #f_state: #v_state,
                     #f_mark: ::core::marker::PhantomData,
                 } = #v_core;
-                #prep
+                #bind
+                #ids_prep
                 ::core::result::Result::Ok(#name {
                     #f_core: #core_id {
                         #core_mv
@@ -321,49 +322,80 @@ pub(super) fn build<'source, 'spec>(
                 })
             }
         }
+
+        #[#ns_fiber::pin_project::pin_project(!Unpin)]
+        struct #core_id #core_def
+        where
+            #( #clauses, )* #( #slabs )* #( #sources )*
+        {
+            #core_f
+            #fields
+            #f_time: <#g_store as
+                #ns_fiber::manifold::runtime::Storage
+            >::Resource<#ns_fiber::driver::schedule::clock::timer::Timer<'d>>,
+            #f_life: #g_mode,
+            #f_state: &#l_env #state_ty,
+            #f_mark: ::core::marker::PhantomData<
+                (#g_id, #g_wire, #g_store, fn(&#g_brand ()) -> &#g_brand ()),
+            >,
+        }
+
+        #[#ns_fiber::pin_project::pin_project]
+        struct #name<#g_part, #g_stamp> {
+            #[pin]
+            #f_core: #g_part,
+            #[pin]
+            #f_stamp: #g_stamp,
+        }
+
+        #vis struct #api;
+
+        impl #api {
+            #methods
+
+            /// Constructs a statically branded multiplexed application.
+            #[inline(always)]
+            #vis fn multiplexed<
+                #g_brand: #l_env,
+                #l_env,
+                #( #lives: #l_env, )*
+                'd: #l_env,
+                #( #decls, )*
+                #g_wire: #ns_fiber::dope::net::wire::Spec + #l_env,
+                #g_id: #ns_fiber::Identity + #l_env,
+                #g_target: #ns_core::manifold::task::Target + 'd,
+            >(
+                #brand
+                #v_state: &#l_env #state_ty,
+                #v_config: #ns_fiber::Config,
+            ) -> impl #ns_core::manifold::task::app::Bind<
+                    'd,
+                    Target = #g_target,
+                    Error = #ns_fiber::dope_fiber::task::storage::fixed::schedule::queue::PrepareError,
+                    Runtime: #contract,
+                >
+                + #l_env
+            where
+                #( #clauses, )* #( #routes )*
+            {
+                #name {
+                    #f_core: #core_id {
+                        #core_i
+                        #scheduled
+                        #f_time: (),
+                        #f_life: #ns_core::life::mode::Disabled,
+                        #f_state: #v_state,
+                        #f_mark: ::core::marker::PhantomData::<(
+                            #g_id,
+                            #g_wire,
+                            #ns_fiber::manifold::runtime::Multi<#g_target>,
+                            fn(&#g_brand ()) -> &#g_brand (),
+                        )>,
+                    },
+                    #f_stamp: (),
+                }
+            }
+        }
     };
-    let ddefinition = &dflat.definition;
-    let qdefinition = &qflat.definition;
-    let tags = quote! {
-        #ddefinition
-        #qdefinition
-        #id_def
-        #fdef
-    };
-    let sources = exec.fibers().iter().map(|(task, fiber)| {
-        crate::app::spec::fiber_bound(paths, task.route(), state_ty, fiber.stream)
-    });
-    let slab = quote! { #( #clauses, )* #( #slabs )* #( #sources )* };
-    let public = quote! { #( #clauses, )* #( #routes )* };
-    let state_b = quote! { #( #lives: #l_env, )* };
-    let state_p = quote! { #( #decls, )* };
-    let app = tokens::build(
-        paths,
-        tokens::Prelude {
-            definitions: &defs,
-            task_tags: &tags,
-            factory: &factory,
-        },
-        names,
-        tokens::Generics {
-            core_parameters: core_def,
-            state_bounds: &state_b,
-            state_parameters: &state_p,
-        },
-        tokens::Bounds {
-            runtime: contract,
-            slab: &slab,
-            public: &public,
-        },
-        tokens::Fields {
-            core: &core_f,
-            task: &fields,
-            public_methods: &methods,
-            core_initializers: &core_i,
-            task_initializers: &tinit[1],
-            branded: !tasks.is_empty(),
-        },
-        spec,
-    );
     (app, dflat.ty)
 }

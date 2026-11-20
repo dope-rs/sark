@@ -1,6 +1,6 @@
 use std::{convert::Infallible, net::SocketAddr};
 
-use dope::core::driver::life::recovery;
+use dope::core::io::Reclaimed;
 use dope_fiber::BlockOn as _;
 use sark_client::protocol::response::Event;
 use sark_fiber::client::config::Config;
@@ -34,8 +34,7 @@ impl<'a> Reader<'a> {
     pub fn try_run<R, C>(
         self,
         check: C,
-        policy: impl recovery::Observe,
-        done: impl for<'run> FnOnce(Result<Result<R, Step>, runtime::Error<'run>>) -> Result<R, Step>,
+        report: impl FnMut(Reclaimed),
     ) -> Result<R, Error<runtime::Failure, Infallible>>
     where
         C: for<'d> FnOnce(Result<Capture, Exchange<'d>>) -> R,
@@ -85,8 +84,7 @@ impl<'a> Reader<'a> {
                     })();
                     Ok::<R, Step>(check(outcome))
                 },
-                policy,
-                done,
+                report,
             )
             .map_err(Error::Fixed)?
             .map_err(Error::Step)?;

@@ -68,7 +68,6 @@ impl Handler {
 
         use crate::types::{Generics, Lifetimes};
         let configs::Attrs {
-            cache,
             max_body: max,
             head_skip: skips,
         } = configs::Attrs::take(&mut self.fun)?;
@@ -324,18 +323,9 @@ impl Handler {
         }
         use configs::Response;
         let response = match mode {
-            Mode::Native => Response::Native {
-                output: &output,
-                cache,
-            },
-            Mode::Task => Response::Plain {
-                kind: quote::quote!(#ns_fiber::manifold::runtime::NativeFiber),
-                cache,
-            },
-            Mode::Duplex => Response::Plain {
-                kind: quote::quote!(#ns_core::duplex::Shape),
-                cache,
-            },
+            Mode::Native => Response::Native(&output),
+            Mode::Task => Response::Plain(quote::quote!(#ns_fiber::manifold::runtime::NativeFiber)),
+            Mode::Duplex => Response::Plain(quote::quote!(#ns_core::duplex::Shape)),
         };
         let spec = response.build(paths, &name, req, max.as_ref(), skips, h1);
         let (outer, inner) = match mode {

@@ -1,3 +1,6 @@
+pub mod common;
+
+use common::response::try_complete;
 use sark_http::{
     h1::codec::decode::response::{Decoder, Progress},
     payload::response::{Method, status::Code},
@@ -56,11 +59,9 @@ fn binary_body() {
     let mut buf = raw.into_bytes();
     buf.extend_from_slice(&body);
 
-    let reply = match (Decoder::new(Method::Other).decode(&buf)).expect("response must decode") {
-        Progress::Complete(value) => Some(value),
-        Progress::More => None,
-    }
-    .expect("test input must be complete");
+    let reply = try_complete(&buf)
+        .expect("response must decode")
+        .expect("test input must be complete");
     assert_eq!(reply.body().as_slice(), &body[..]);
 }
 
@@ -77,22 +78,18 @@ fn maximum_length() {
 #[test]
 fn transfer_fields() {
     let raw = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: gzip\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n0\r\n\r\n";
-    let reply = match (Decoder::new(Method::Other).decode(raw)).expect("response must decode") {
-        Progress::Complete(value) => Some(value),
-        Progress::More => None,
-    }
-    .expect("test input must be complete");
+    let reply = try_complete(raw)
+        .expect("response must decode")
+        .expect("test input must be complete");
     assert_eq!(reply.body().as_slice(), b"hello");
 }
 
 #[test]
 fn tab_value() {
     let raw = b"HTTP/1.1 200 OK\r\nX-Tab: val\tue\r\nContent-Length: 0\r\n\r\n";
-    let reply = match (Decoder::new(Method::Other).decode(raw)).expect("response must decode") {
-        Progress::Complete(value) => Some(value),
-        Progress::More => None,
-    }
-    .expect("test input must be complete");
+    let reply = try_complete(raw)
+        .expect("response must decode")
+        .expect("test input must be complete");
     let value = reply.headers().get("x-tab").expect("x-tab field");
     assert_eq!(value.as_bytes(), b"val\tue");
 }
@@ -113,11 +110,9 @@ fn eof_head() {
 #[test]
 fn colon_value() {
     let raw = b"HTTP/1.1 200 OK\r\nX-Data: a:b:c:d:e\r\nContent-Length: 0\r\n\r\n";
-    let reply = match (Decoder::new(Method::Other).decode(raw)).expect("response must decode") {
-        Progress::Complete(value) => Some(value),
-        Progress::More => None,
-    }
-    .expect("test input must be complete");
+    let reply = try_complete(raw)
+        .expect("response must decode")
+        .expect("test input must be complete");
     let value = reply.headers().get("x-data").expect("x-data field");
     assert_eq!(value.as_bytes(), b"a:b:c:d:e");
 }
@@ -125,11 +120,9 @@ fn colon_value() {
 #[test]
 fn empty_reason() {
     let raw = b"HTTP/1.1 200 \r\nContent-Length: 0\r\n\r\n";
-    let reply = match (Decoder::new(Method::Other).decode(raw)).expect("response must decode") {
-        Progress::Complete(value) => Some(value),
-        Progress::More => None,
-    }
-    .expect("test input must be complete");
+    let reply = try_complete(raw)
+        .expect("response must decode")
+        .expect("test input must be complete");
     assert!(reply.status() == Code::OK);
 }
 
@@ -137,11 +130,9 @@ fn empty_reason() {
 fn cookie_value() {
     let raw =
         b"HTTP/1.1 200 OK\r\nSet-Cookie: id=abc; Path=/; HttpOnly\r\nContent-Length: 0\r\n\r\n";
-    let reply = match (Decoder::new(Method::Other).decode(raw)).expect("response must decode") {
-        Progress::Complete(value) => Some(value),
-        Progress::More => None,
-    }
-    .expect("test input must be complete");
+    let reply = try_complete(raw)
+        .expect("response must decode")
+        .expect("test input must be complete");
     let value = reply.headers().get("set-cookie").expect("set-cookie field");
     assert_eq!(value.as_bytes(), b"id=abc; Path=/; HttpOnly");
 }

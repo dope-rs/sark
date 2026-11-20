@@ -1,9 +1,8 @@
-use common::client::recover;
+use common::client::assert_shutdown;
 use common::client::{
     pool::{BURST, WINDOW},
     runtime::peer,
 };
-use dope::core::driver::life::recovery;
 use dope_test::alloc::Tracker;
 
 #[global_allocator]
@@ -31,7 +30,6 @@ use common::client::{
         pools,
     },
 };
-use dope::core::io::Reclaimed;
 use dope_fiber::{BlockOn as _, abi::Join};
 use sark_fiber::client::config::Config;
 use sark_http::method::Method;
@@ -79,11 +77,7 @@ fn active_skips_idle_lease() {
                 )
                 .try_run(
                     |result| result.expect("client scenario"),
-                    recovery::Policy::new(
-                        |event| std::assert_matches!(event, Reclaimed::Shutdown),
-                        recover,
-                    ),
-                    |result| result.expect("client execution"),
+                    assert_shutdown,
                 )
                 .expect("client scenario");
                 assert_eq!(status, 200);
@@ -147,11 +141,7 @@ fn close_head_revokes_pool() {
             )
             .try_run(
                 |result| result.expect("client scenario"),
-                recovery::Policy::new(
-                    |event| std::assert_matches!(event, Reclaimed::Shutdown),
-                    recover,
-                ),
-                |result| result.expect("client execution"),
+                assert_shutdown,
             )
             .expect("client scenario");
             assert_eq!(status, 200);
@@ -216,11 +206,7 @@ fn drop_seals_same_poll() {
                 )
                 .try_run(
                     |result| result.expect("client scenario"),
-                    recovery::Policy::new(
-                        |event| std::assert_matches!(event, Reclaimed::Shutdown),
-                        recover,
-                    ),
-                    |result| result.expect("client execution"),
+                    assert_shutdown,
                 )
                 .expect("client scenario");
                 assert!((status) == (200));
@@ -282,11 +268,7 @@ fn burst_socket_per_request() {
                         let ((a, b), (c, d)) = app.app.block_on(burst).expect("burst drive");
                         [a, b, c, d].map(|result| result.expect("burst response").status().as_u16())
                     },
-                    recovery::Policy::new(
-                        |event| std::assert_matches!(event, Reclaimed::Shutdown),
-                        recover,
-                    ),
-                    |result| result.expect("client execution"),
+                    assert_shutdown,
                 )
                 .expect("burst execution");
             assert_eq!(codes, [200; BURST]);
@@ -332,8 +314,7 @@ fn queued_body_yields() {
                             "resident events bypassed the continuation budget: {turns}"
                         );
                     },
-                    recovery::Policy::new(|_| {}, recover),
-                    |result| result.expect("client execution"),
+                    |_| {},
                 )
                 .expect("fixed shutdown");
             server
@@ -373,11 +354,7 @@ fn recovers_stale_idle() {
             )
             .try_run(
                 |result| result.expect("batch response").status().as_u16(),
-                recovery::Policy::new(
-                    |event| std::assert_matches!(event, Reclaimed::Shutdown),
-                    recover,
-                ),
-                |result| result.expect("client execution"),
+                assert_shutdown,
             )
             .expect("client scenario");
             assert_eq!(codes, vec![200, 200, 200, 200, 200, 200, 200, 200]);

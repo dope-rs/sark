@@ -1,6 +1,5 @@
-use common::client::recover;
+use common::client::assert_shutdown;
 use common::client::runtime::peer;
-use dope::core::driver::life::recovery;
 use dope_test::harness::{
     GUARD,
     peer::{AcceptScript, TcpAcceptor},
@@ -18,7 +17,6 @@ use common::client::{
         origins, pools,
     },
 };
-use dope::core::io::Reclaimed;
 use dope::{manifold::client::attempt, net::link::event};
 use dope_fiber::{BlockOn as _, task::time::budget};
 use sark::client::protocol::retry::Policy;
@@ -95,11 +93,7 @@ fn observed_reconnect_keeps_commitment() {
                             ))
                         ) if errno.is_refused()));
                     },
-                    recovery::Policy::new(
-                        |event| std::assert_matches!(event, Reclaimed::Shutdown),
-                        recover,
-                    ),
-                    |result| result.expect("client execution"),
+                    assert_shutdown,
                 )
                 .expect("client shutdown");
         },
@@ -138,11 +132,7 @@ fn post_is_not_replayed() {
                             error.safety(),
                         )
                     },
-                    recovery::Policy::new(
-                        |event| std::assert_matches!(event, Reclaimed::Shutdown),
-                        recover,
-                    ),
-                    |result| result.expect("client execution"),
+                    assert_shutdown,
                 )
                 .expect("HTTP request execution");
                 assert!((outcome) == (true, Safety::PossiblyCommitted));
@@ -198,11 +188,7 @@ fn buffered_timeout_commits() {
                         error.safety(),
                     )
                 },
-                recovery::Policy::new(
-                    |event| std::assert_matches!(event, Reclaimed::Shutdown),
-                    recover,
-                ),
-                |result| result.expect("client execution"),
+                assert_shutdown,
             )
             .expect("HTTP request execution");
             assert!((outcome) == (true, Safety::PossiblyCommitted));
@@ -270,11 +256,7 @@ fn stream_failure_commits() {
                                 }
                             }
                         },
-                        recovery::Policy::new(
-                            |event| std::assert_matches!(event, Reclaimed::Shutdown),
-                            recover,
-                        ),
-                        |result| result.expect("client execution"),
+                        assert_shutdown,
                     )
                     .expect("fixed stream failure shutdown"),
                 Flavor::OnDemand => origins::Plan::new(config, 1, 1, 1)
@@ -313,11 +295,7 @@ fn stream_failure_commits() {
                                 }
                             }
                         },
-                        recovery::Policy::new(
-                            |event| std::assert_matches!(event, Reclaimed::Shutdown),
-                            recover,
-                        ),
-                        |result| result.expect("client execution"),
+                        assert_shutdown,
                     )
                     .expect("on-demand stream failure shutdown"),
             }
@@ -374,16 +352,12 @@ fn redirect_failure_commits() {
                         Error::Request(RequestError::CrossOrigin)
                     ));
                 },
-                recovery::Policy::new(
-                    |event| {
-                        assert!(
-                            matches!(event, dope::core::io::Reclaimed::Shutdown),
-                            "unexpected client retirement: {event:?}"
-                        )
-                    },
-                    recover,
-                ),
-                |result| result.expect("client execution"),
+                |event| {
+                    assert!(
+                        matches!(event, dope::core::io::Reclaimed::Shutdown),
+                        "unexpected client retirement: {event:?}"
+                    )
+                },
             )
             .expect("HTTP request execution");
         })
@@ -436,11 +410,7 @@ fn scoped_timeout_commits() {
                         failure.safety(),
                     )
                 },
-                recovery::Policy::new(
-                    |event| std::assert_matches!(event, Reclaimed::Shutdown),
-                    recover,
-                ),
-                |result| result.expect("client execution"),
+                assert_shutdown,
             )
             .expect("scoped request execution");
             assert!((outcome) == (true, Safety::PossiblyCommitted));
@@ -490,11 +460,7 @@ fn scoped_capacity_commits() {
                         failure.safety(),
                     )
                 },
-                recovery::Policy::new(
-                    |event| std::assert_matches!(event, Reclaimed::Shutdown),
-                    recover,
-                ),
-                |result| result.expect("client execution"),
+                assert_shutdown,
             )
             .expect("scoped request execution");
             assert!((outcome) == (true, Safety::PossiblyCommitted));

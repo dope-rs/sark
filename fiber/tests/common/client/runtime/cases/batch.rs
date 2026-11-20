@@ -1,13 +1,16 @@
 use std::{convert::Infallible, net::SocketAddr, num::NonZero, time::Duration};
 
-use dope::{core::driver::life::recovery, manifold::client::attempt::queue::mailbox};
+use dope::{
+    core::io::Reclaimed,
+    manifold::client::attempt::queue::mailbox,
+};
 use dope_fiber::{BlockOn as _, task::done};
 use sark_client::{Failure, reply::Scoped};
 use sark_fiber::client::{Ready, Request, config::Config};
 use sark_http::method::Method;
 
 use crate::common::client::runtime::{
-    self, WaitError,
+    WaitError,
     cases::{
         Flavor,
         request::{Error, Step},
@@ -49,10 +52,7 @@ impl<'request> Batch<'request> {
     pub fn try_run<C>(
         self,
         mut check: C,
-        policy: impl recovery::Observe,
-        done: impl for<'a> FnOnce(
-            Result<Result<Vec<u16>, Step>, runtime::Error<'a>>,
-        ) -> Result<Vec<u16>, Step>,
+        report: impl FnMut(Reclaimed),
     ) -> Result<Vec<u16>, Error>
     where
         C: for<'scope, 'd> FnMut(
@@ -93,8 +93,7 @@ impl<'request> Batch<'request> {
                         }
                         Ok::<_, Step>(codes)
                     },
-                    policy,
-                    done,
+                    report,
                 )
                 .map_err(Error::Fixed)?
                 .map_err(Error::Step)?,
@@ -120,8 +119,7 @@ impl<'request> Batch<'request> {
                         }
                         Ok::<_, Step>(codes)
                     },
-                    policy,
-                    done,
+                    report,
                 )
                 .map_err(Error::Dynamic)?
                 .map_err(Error::Step)?,
@@ -132,10 +130,7 @@ impl<'request> Batch<'request> {
     pub fn try_clock<C>(
         self,
         mut check: C,
-        policy: impl recovery::Observe,
-        done: impl for<'a> FnOnce(
-            Result<Result<Vec<u16>, Step>, runtime::Error<'a>>,
-        ) -> Result<Vec<u16>, Step>,
+        report: impl FnMut(Reclaimed),
     ) -> Result<Vec<u16>, Error>
     where
         C: for<'scope, 'd> FnMut(
@@ -181,8 +176,7 @@ impl<'request> Batch<'request> {
                         }
                         Ok::<_, Step>(codes)
                     },
-                    policy,
-                    done,
+                    report,
                 )
                 .map_err(Error::Fixed)?
                 .map_err(Error::Step)?,
@@ -209,8 +203,7 @@ impl<'request> Batch<'request> {
                         }
                         Ok::<_, Step>(codes)
                     },
-                    policy,
-                    done,
+                    report,
                 )
                 .map_err(Error::Dynamic)?
                 .map_err(Error::Step)?,

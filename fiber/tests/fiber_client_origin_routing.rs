@@ -2,7 +2,7 @@ pub mod common;
 
 use std::{io, net::TcpListener, time::Duration};
 
-use common::client::recover;
+use common::client::assert_shutdown;
 use common::client::{
     routes::*,
     runtime::{
@@ -10,7 +10,6 @@ use common::client::{
         peer::{self, Response as _},
     },
 };
-use dope::core::{driver::life::recovery, io::Reclaimed};
 use dope_fiber::BlockOn as _;
 use dope_test::harness::peer::{AcceptScript, Stream};
 use sark_fiber::client::config::Config;
@@ -53,11 +52,7 @@ fn redirect_cannot_replay_secrets() {
                             .expect("cross-origin redirect must fail");
                         assert!(matches!(failure.cause(), sark_client::Error::Request(sark_client::RequestError::CrossOrigin)));
                     },
-                    recovery::Policy::new(
-                        |event| std::assert_matches!(event, Reclaimed::Shutdown),
-                        recover,
-                    ),
-                    |result| result.expect("client execution"),
+                    assert_shutdown,
                 )
                 .expect("client scope");
             target.set_nonblocking(true).expect("observe redirect target");
@@ -100,11 +95,7 @@ fn absolute_rejects_headers_and_body_before_dial() {
                 ));
             }
         },
-        recovery::Policy::new(
-            |event| std::assert_matches!(event, Reclaimed::Shutdown),
-            recover,
-        ),
-        |result| result.expect("client execution"),
+        assert_shutdown,
     )
     .expect("client scope");
     for listener in [origin, target] {
@@ -150,11 +141,7 @@ fn redirect_alias_reuses_origin() {
                         .expect("drive HTTP request")
                         .expect("same-origin redirect response")
                 },
-                recovery::Policy::new(
-                    |event| std::assert_matches!(event, Reclaimed::Shutdown),
-                    recover,
-                ),
-                |result| result.expect("client execution"),
+                assert_shutdown,
             )
             .expect("client scope");
             assert_eq!(response.body().as_slice(), b"arrived");
@@ -213,11 +200,7 @@ fn routes_each_origin() {
                                         })
                                         .collect::<Vec<_>>()
                                 },
-                                recovery::Policy::new(
-                                    |event| std::assert_matches!(event, Reclaimed::Shutdown),
-                                    recover,
-                                ),
-                                |result| result.expect("client execution"),
+                                assert_shutdown,
                             )
                             .expect("client scope");
                     let bodies = replies

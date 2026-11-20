@@ -1,7 +1,7 @@
-use common::client::recover;
+use common::client::assert_shutdown;
 use common::client::runtime::{cases::Flavor, origins, peer, peer::Conn, pools};
 use dope::{
-    core::{driver::life::recovery, io::Reclaimed},
+    core::io::Reclaimed,
     manifold::client::attempt::queue::mailbox,
     runtime::executor::drive,
 };
@@ -54,11 +54,7 @@ fn response_at_cap_succeeds() {
                 )
                 .try_run(
                     |result| result.expect("HTTP response"),
-                    recovery::Policy::new(
-                        |event| std::assert_matches!(event, Reclaimed::Shutdown),
-                        recover,
-                    ),
-                    |result| result.expect("client execution"),
+                    assert_shutdown,
                 )
                 .expect("HTTP request execution");
                 assert_eq!(resp.status().as_u16(), 200);
@@ -115,11 +111,7 @@ fn response_over_cap_errors() {
                         ));
                         assert!((error.safety()) == (Safety::PossiblyCommitted));
                     },
-                    recovery::Policy::new(
-                        |event| std::assert_matches!(event, Reclaimed::Shutdown),
-                        recover,
-                    ),
-                    |result| result.expect("client execution"),
+                    assert_shutdown,
                 )
                 .expect("HTTP request execution");
             }
@@ -181,11 +173,7 @@ fn queue_limit_at_delivery() {
                         ));
                         assert!((error.safety()) == (Safety::PossiblyCommitted));
                     },
-                    recovery::Policy::new(
-                        |event| std::assert_matches!(event, Reclaimed::Shutdown),
-                        recover,
-                    ),
-                    |result| result.expect("client execution"),
+                    assert_shutdown,
                 )
                 .expect("HTTP request execution");
             }
@@ -248,11 +236,7 @@ fn wire_memory_at_ingress() {
                         assert!(spare <= 256);
                         assert!((error.safety()) == (Safety::PossiblyCommitted));
                     },
-                    recovery::Policy::new(
-                        |event| std::assert_matches!(event, Reclaimed::Shutdown),
-                        recover,
-                    ),
-                    |result| result.expect("client execution"),
+                    assert_shutdown,
                 )
                 .expect("HTTP request execution");
             }
@@ -308,16 +292,13 @@ fn staging_ceiling_closes() {
                     );
                     checked = true;
                 };
-                let policy = recovery::Policy::new(
-                    |event| std::assert_matches!(
-                        event,
-                        Reclaimed::Shutdown | Reclaimed::Socket {
-                            result: Ok(()),
-                            close: None,
-                            ..
-                        }
-                    ),
-                    recover,
+                let report = |event| std::assert_matches!(
+                    event,
+                    Reclaimed::Shutdown | Reclaimed::Socket {
+                        result: Ok(()),
+                        close: None,
+                        ..
+                    }
                 );
                 match flavor {
                     Flavor::Fixed => pools::Plan::new(server.addr(), config, 1, 1)
@@ -334,8 +315,7 @@ fn staging_ceiling_closes() {
                                 }));
                                 std::assert_matches!(result, Err(drive::Error::Shutdown));
                             },
-                            policy,
-                            |result| result.expect("client execution"),
+                            report,
                         )
                         .expect("fixed HTTP request execution"),
                     Flavor::OnDemand => origins::Plan::new(config, 1, 1, 1)
@@ -350,8 +330,7 @@ fn staging_ceiling_closes() {
                                 }));
                                 std::assert_matches!(result, Err(drive::Error::Shutdown));
                             },
-                            policy,
-                            |result| result.expect("client execution"),
+                            report,
                         )
                         .expect("on-demand HTTP request execution"),
                 }
@@ -427,11 +406,7 @@ fn timeout_retry() {
                                     assert_eq!(failure.safety(), Safety::PossiblyCommitted);
                                 }
                             },
-                            recovery::Policy::new(
-                                |event| std::assert_matches!(event, Reclaimed::Shutdown),
-                                recover,
-                            ),
-                            |result| result.expect("client execution"),
+                            assert_shutdown,
                         )
                         .expect("HTTP request execution");
                     server

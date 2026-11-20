@@ -22,10 +22,9 @@ pub(super) struct Context<'view, 'source, 'spec> {
 }
 
 /// H1-only route state. Task-only expansion has no value of this type, making
-/// continuation, cache, guard, and duplex planning unreachable there.
+/// continuation, guard, and duplex planning unreachable there.
 pub(in crate::app::serve) struct H1Plan<'source, 'spec> {
     pub(super) cleartext: Option<&'source proc_macro2::TokenStream>,
-    pub(super) cache_count: usize,
     pub(super) duplex: &'source duplex::Plan<'spec>,
     pub(super) continuations: plan::Plan<'source, 'spec>,
 }
@@ -158,12 +157,10 @@ impl<'view, 'source, 'spec> Context<'view, 'source, 'spec> {
 impl<'source, 'spec> H1Plan<'source, 'spec> {
     pub(in crate::app::serve) fn new(
         plan: &'source serve::ProtocolPlan<'spec>,
-        exec: &serve::Execution<'source, 'spec>,
         cleartext: Option<&'source proc_macro2::TokenStream>,
     ) -> Self {
         Self {
             cleartext,
-            cache_count: exec.sync_count(),
             duplex: &plan.duplex,
             continuations: plan::Plan::full(plan),
         }

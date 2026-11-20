@@ -3,7 +3,7 @@ use std::{cell::Cell, convert::Infallible};
 use request::frame::{self, proof};
 use route::field::{header, query};
 use sark_core::{body::Contiguous, manifold, request, route};
-use sark_h1::route::{Cache, Policy, PolicyOf};
+use sark_h1::route::{Policy, PolicyOf};
 use sark_http::{
     h1::head::{
         request::Coding,
@@ -19,8 +19,7 @@ use sark_http::{
 pub struct Request;
 
 impl PolicyOf for Request {
-    const POLICY: Policy =
-        Policy::new(Cache::Bypass, Coding::Plain, Date::Include, Server::Include);
+    const POLICY: Policy = Policy::new(Coding::Plain, Date::Include, Server::Include);
 }
 
 impl Request {

@@ -8,7 +8,7 @@ use common::client::{
         SATURATION_INFLIGHT, SATURATION_LAST_RESPONSE, SATURATION_MAX_CONNECTIONS, SATURATION_PATH,
         SATURATION_WAVES,
     },
-    recover,
+    assert_shutdown,
     runtime::{
         peer::{self, Conn, Error},
         pools,
@@ -17,8 +17,6 @@ use common::client::{
 use dope::core::{
     Backend, Errno,
     dope_sys::io::poll::{self, Poll as _},
-    driver::life::recovery,
-    io::Reclaimed,
 };
 use dope_fiber::BlockOn as _;
 use dope_test::{
@@ -176,11 +174,7 @@ fn saturates_each_lane() {
                             (0, Some(200), 2)
                         );
                     },
-                    recovery::Policy::new(
-                        |event| std::assert_matches!(event, Reclaimed::Shutdown),
-                        recover,
-                    ),
-                    |result| result.expect("client execution"),
+                    assert_shutdown,
                 )
                 .expect("fixed saturation client topology must install, drive, and shut down");
 

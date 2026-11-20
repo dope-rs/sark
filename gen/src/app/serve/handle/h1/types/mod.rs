@@ -407,7 +407,7 @@ impl<'a> Types<'a> {
             let variant = &route.pending_variant;
             match route.mode {
                 serve::Mode::Fiber { .. } => quote!(#owner::#variant(_) => 0,),
-                serve::Mode::Sync { .. }
+                serve::Mode::Sync
                 | serve::Mode::Stream { .. }
                 | serve::Mode::Duplex { .. } => {
                     quote!(#owner::#variant(ref #v_wait) => #v_wait.head_len(),)

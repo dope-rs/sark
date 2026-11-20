@@ -178,7 +178,7 @@ fn skip_shapes_headers() {
                 assert!(full.contains("Date: "), "full keeps Date: {full:?}");
                 assert!(
                     !full.contains("Mon, 01 Jan 2000"),
-                    "full Date must be patched at the live offset, not the placeholder: {full:?}"
+                    "full must emit the live Date: {full:?}"
                 );
                 assert!(
                     full.ends_with("\r\n\r\nok"),
@@ -194,11 +194,11 @@ fn skip_shapes_headers() {
                 );
                 assert!(
                     no_srv.contains("Date: "),
-                    "no-server keeps patchable Date: {no_srv:?}"
+                    "no-server keeps Date: {no_srv:?}"
                 );
                 assert!(
                     !no_srv.contains("Mon, 01 Jan 2000"),
-                    "no-server Date must be patched at the shifted offset: {no_srv:?}"
+                    "no-server must emit the live Date: {no_srv:?}"
                 );
                 assert!(
                     no_srv.ends_with("\r\n\r\nok"),

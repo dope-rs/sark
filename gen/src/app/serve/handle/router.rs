@@ -10,26 +10,6 @@ use crate::{
     runtime::paths::Paths,
 };
 
-pub(in crate::app) fn coding(paths: &Paths, spec: &spec::Spec) -> proc_macro2::TokenStream {
-    use quote::quote;
-
-    let ns_h1 = &paths.h1;
-    let ns_http = &paths.http;
-    let routes = spec
-        .route_specs
-        .iter()
-        .filter(|entry| matches!(entry.mode, spec::Mode::Sync))
-        .map(|entry| &entry.route);
-    quote! {
-        <#ns_h1::wire::output::Select<{
-            false #( || ::core::matches!(
-                <#routes as #ns_h1::route::PolicyOf>::POLICY.coding,
-                #ns_http::h1::head::request::Coding::Gzip,
-            ) )*
-        }> as #ns_h1::wire::output::Selected>::Compression
-    }
-}
-
 pub(in crate::app) fn build(paths: &Paths, spec: &spec::Spec) -> proc_macro2::TokenStream {
     let f_state = local("state");
     let symbols = &spec.state_generics;

@@ -78,31 +78,6 @@ impl Seg {
         }
         Ok(())
     }
-
-    pub(super) fn literal(&self) -> Option<&[u8]> {
-        match self {
-            Self::Literal(bytes) => Some(bytes),
-            Self::Param => None,
-        }
-    }
-
-    pub(super) fn is_literal(&self) -> bool {
-        self.literal().is_some()
-    }
-
-    pub(super) fn is_overlap(&self, other: &Self) -> bool {
-        match (self.literal(), other.literal()) {
-            (Some(left), Some(right)) => left == right,
-            (left, right) => left.is_none() || right.is_none(),
-        }
-    }
-
-    pub(super) fn is_within(&self, other: &Self) -> bool {
-        match other.literal() {
-            Some(right) => self.literal() == Some(right),
-            None => true,
-        }
-    }
 }
 
 impl Method {

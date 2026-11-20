@@ -66,18 +66,6 @@ fn parse_connection(raw: &[u8]) -> Result<field::Connection, Error> {
 }
 
 impl Known {
-    const PREFIX_INITIALS: u32 = {
-        let mut initials = 0;
-        let mut index = 0;
-        while index < Name::H1.len() {
-            let first = Name::H1[index].wire()[0];
-            assert!(first.is_ascii_lowercase(), "initial");
-            initials |= 1 << (first - b'a');
-            index += 1;
-        }
-        initials
-    };
-
     pub fn from_name(name: &[u8]) -> Option<Self> {
         Self::from_kind(Name::from_h1(name)?)
     }
@@ -85,21 +73,25 @@ impl Known {
     /// Recognizes a complete canonical field name and its following colon.
     /// The exact literal match also establishes the name's token grammar.
     pub fn from_prefix(raw: &[u8]) -> Option<(Self, usize)> {
-        let first = raw.first()?.to_ascii_lowercase();
-        let initial = 1u32.checked_shl(u32::from(first.wrapping_sub(b'a')))?;
-        if Self::PREFIX_INITIALS & initial == 0 {
-            return None;
+        match raw.first()?.to_ascii_lowercase() {
+            b'h' => Self::Host.prefix(raw, Name::Host.wire()),
+            b'c' => match raw.get(3)?.to_ascii_lowercase() {
+                b'n' => Self::Connection.prefix(raw, Name::Connection.wire()),
+                b't' => Self::ContentLength.prefix(raw, Name::ContentLength.wire()),
+                _ => None,
+            },
+            b't' => Self::TransferEncoding.prefix(raw, Name::TransferEncoding.wire()),
+            b'e' => Self::Expect.prefix(raw, Name::Expect.wire()),
+            b'a' => Self::AcceptEncoding.prefix(raw, Name::AcceptEncoding.wire()),
+            b'u' => Self::Upgrade.prefix(raw, Name::Upgrade.wire()),
+            _ => None,
         }
-        for name in Name::H1 {
-            let wire = name.wire();
-            if wire.first() == Some(&first)
-                && raw.get(wire.len()) == Some(&b':')
-                && raw[..wire.len()].eq_ignore_ascii_case(wire)
-            {
-                return Self::from_kind(name).map(|known| (known, wire.len()));
-            }
-        }
-        None
+    }
+
+    fn prefix(self, raw: &[u8], wire: &[u8]) -> Option<(Self, usize)> {
+        let len = wire.len();
+        (raw.get(len) == Some(&b':') && raw[..len].eq_ignore_ascii_case(wire))
+            .then_some((self, len))
     }
 
     fn from_kind(name: Name) -> Option<Self> {

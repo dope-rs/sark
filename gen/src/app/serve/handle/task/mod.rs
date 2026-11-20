@@ -42,7 +42,7 @@ impl Task {
 
     /// Emits the complete protocol-neutral handle surface directly. H1 state is
     /// intentionally absent from the signature, so task expansion cannot reach
-    /// listener, continuation, cache, or sequential-lifecycle generation.
+    /// listener, continuation, or sequential-lifecycle generation.
     pub(super) fn build(
         self,
         paths: &Paths,

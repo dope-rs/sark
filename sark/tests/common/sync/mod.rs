@@ -217,7 +217,11 @@ sark::define_router! {
         POST "/echo" => echo,
         POST "/headers" => large_head,
         GET "/large" => large,
+        GET "/items/first/detail" => static_only,
         GET "/items/:id" => request(path) item,
+        GET "/items/:id/view" => request(path) item,
+        GET "/items/fixed" => static_only,
+        GET "/items/last/detail" => static_only,
         GET "/users/:user_id/teams/:team_id" => request(path) named_path,
         POST "/users/:user_id/teams/:team_id" => request(path) named_path,
     }

@@ -1,3 +1,6 @@
+pub mod common;
+
+use common::response::try_complete;
 use sark_http::{
     h1::codec::decode::response::{Decoder, Progress},
     payload::response::{Method, status::Code},
@@ -22,11 +25,8 @@ fn partial_inputs() {
 fn body_presence() {
     let fixed = b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n";
     {
-        let reply =
-            match (Decoder::new(Method::Other).decode(fixed)).expect("response must decode") {
-                Progress::Complete(value) => Some(value),
-                Progress::More => None,
-            }
+        let reply = try_complete(fixed)
+            .expect("response must decode")
             .expect("test input must be complete");
         assert!(reply.body().is_empty());
     };
@@ -104,11 +104,9 @@ fn invalid_fields() {
 #[test]
 fn empty_value() {
     let raw = b"HTTP/1.1 200 OK\r\nX-Empty:\r\nContent-Length: 0\r\n\r\n";
-    let reply = match (Decoder::new(Method::Other).decode(raw)).expect("response must decode") {
-        Progress::Complete(value) => Some(value),
-        Progress::More => None,
-    }
-    .expect("test input must be complete");
+    let reply = try_complete(raw)
+        .expect("response must decode")
+        .expect("test input must be complete");
     let value = reply.headers().get("x-empty").expect("x-empty field");
     assert_eq!(value.as_bytes(), b"");
 }
@@ -117,11 +115,8 @@ fn empty_value() {
 fn long_value() {
     let value = "x".repeat(10240);
     let raw = format!("HTTP/1.1 200 OK\r\nX-Long: {value}\r\nContent-Length: 0\r\n\r\n");
-    let reply =
-        match (Decoder::new(Method::Other).decode(raw.as_bytes())).expect("response must decode") {
-            Progress::Complete(value) => Some(value),
-            Progress::More => None,
-        }
+    let reply = try_complete(raw.as_bytes())
+        .expect("response must decode")
         .expect("test input must be complete");
     let value = reply.headers().get("x-long").expect("x-long field");
     assert_eq!(value.as_bytes().len(), 10240);
@@ -135,13 +130,9 @@ fn header_limit() {
     }
     raw.push_str("Content-Length: 0\r\n\r\n");
     {
-        let reply = match (Decoder::new(Method::Other).decode(raw.as_bytes()))
+        let reply = try_complete(raw.as_bytes())
             .expect("response must decode")
-        {
-            Progress::Complete(value) => Some(value),
-            Progress::More => None,
-        }
-        .expect("test input must be complete");
+            .expect("test input must be complete");
         assert_eq!(reply.headers().len(), 100);
     };
 
@@ -156,22 +147,18 @@ fn header_limit() {
 #[test]
 fn opaque_reason() {
     let raw = "HTTP/1.1 200 OK™\r\nContent-Length: 0\r\n\r\n".as_bytes();
-    let reply = match (Decoder::new(Method::Other).decode(raw)).expect("response must decode") {
-        Progress::Complete(value) => Some(value),
-        Progress::More => None,
-    }
-    .expect("test input must be complete");
+    let reply = try_complete(raw)
+        .expect("response must decode")
+        .expect("test input must be complete");
     assert!(reply.status() == Code::OK);
 }
 
 #[test]
 fn pipelined_tail() {
     let raw = b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhelloHTTP/1.1 200 OK\r\n";
-    let reply = match (Decoder::new(Method::Other).decode(raw)).expect("response must decode") {
-        Progress::Complete(value) => Some(value),
-        Progress::More => None,
-    }
-    .expect("test input must be complete");
+    let reply = try_complete(raw)
+        .expect("response must decode")
+        .expect("test input must be complete");
     assert_eq!(reply.body().as_slice(), b"hello");
 }
 
@@ -180,13 +167,9 @@ fn valid_lengths() {
     for name in ["Content-Length", "CONTENT-LENGTH"] {
         for value in ["0005", " 5 "] {
             let raw = format!("HTTP/1.1 200 OK\r\n{name}: {value}\r\n\r\nhello");
-            let reply = match (Decoder::new(Method::Other).decode(raw.as_bytes()))
+            let reply = try_complete(raw.as_bytes())
                 .expect("response must decode")
-            {
-                Progress::Complete(value) => Some(value),
-                Progress::More => None,
-            }
-            .expect("test input must be complete");
+                .expect("test input must be complete");
             assert_eq!(reply.body().as_slice(), b"hello");
         }
     }
@@ -202,11 +185,9 @@ fn incomplete_eof() {
 #[test]
 fn chunk_extensions() {
     let raw = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n5;ext1=val1;ext2=val2\r\nhello\r\n0\r\n\r\n";
-    let reply = match (Decoder::new(Method::Other).decode(raw)).expect("response must decode") {
-        Progress::Complete(value) => Some(value),
-        Progress::More => None,
-    }
-    .expect("test input must be complete");
+    let reply = try_complete(raw)
+        .expect("response must decode")
+        .expect("test input must be complete");
     assert_eq!(reply.body().as_slice(), b"hello");
 }
 
@@ -214,10 +195,8 @@ fn chunk_extensions() {
 fn chunk_case() {
     let raw =
         b"HTTP/1.1 200 OK\r\nTransfer-Encoding: CHUNKED\r\n\r\nf\r\n012345678901234\r\n0\r\n\r\n";
-    let reply = match (Decoder::new(Method::Other).decode(raw)).expect("response must decode") {
-        Progress::Complete(value) => Some(value),
-        Progress::More => None,
-    }
-    .expect("test input must be complete");
+    let reply = try_complete(raw)
+        .expect("response must decode")
+        .expect("test input must be complete");
     assert_eq!(reply.body().as_slice(), b"012345678901234");
 }

@@ -27,7 +27,7 @@ impl Routes {
         h1: &handle::H1Plan<'source, 'spec>,
         types: &types::Types<'_>,
     ) -> Self {
-        let [f_state, f_life, f_cache] = ["state", "lifecycle", "response_cache"].map(local);
+        let [f_state, f_life] = ["state", "lifecycle"].map(local);
         let [f_gzip, f_time, f_makers] = ["gzip", "timer", "task_producers"].map(local);
         let symbols = &context.plan.spec.state_generics;
         let [n_tasks, v_body, v_date] = symbols.locals(["__tasks", "body", "date"]);
@@ -103,7 +103,7 @@ impl Routes {
                             }
                         }
                     }
-                    serve::Mode::Sync { .. }
+                    serve::Mode::Sync
                     | serve::Mode::Stream { .. }
                     | serve::Mode::Duplex { .. } => {
                         quote! {
@@ -139,32 +139,20 @@ impl Routes {
             .map(|route| {
                 let pending = &route.pending_variant;
                 match &route.mode {
-                    serve::Mode::Sync { cache } => {
-                        let cache = syn::Index::from(*cache);
-                        quote! {
-                            #owner::#pending(#v_wait) => {
-                                let #v_output = #ns_h1::wire::output::Egress::new(
-                                    #v_write, #v_date, #v_wait.response(),
-                                );
-                                #v_wait.finish::<#state_ty, _, _>(
-                                    #v_body,
-                                    #v_permit,
-                                    *#v_this.#f_state,
-                                    #ns_h1::route::sync::Egress::new(
-                                        #v_output,
-                                        #ns_h1::wire::cache::Cache::new(
-                                            &mut #v_this.#f_cache[#cache],
-                                        ),
-                                        #v_this.#f_gzip,
-                                    ),
-                                    #ns_core::life::Mode::body(
-                                        #v_this.#f_life,
-                                        #v_exch,
-                                    ),
-                                )
-                            }
+                    serve::Mode::Sync => quote! {
+                        #owner::#pending(#v_wait) => {
+                            let #v_output = #ns_h1::wire::output::Egress::new(
+                                #v_write, #v_date, #v_wait.response(),
+                            );
+                            #v_wait.finish::<#state_ty, _, _>(
+                                #v_body,
+                                #v_permit,
+                                *#v_this.#f_state,
+                                #ns_h1::route::sync::Egress::new(#v_output, #v_this.#f_gzip),
+                                #ns_core::life::Mode::body(#v_this.#f_life, #v_exch),
+                            )
                         }
-                    }
+                    },
                     serve::Mode::Fiber { task, fiber } => {
                         let task = serve::Task::new(route, task);
                         let prod = syn::Index::from(fiber.slot);

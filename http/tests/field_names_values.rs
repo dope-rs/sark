@@ -134,6 +134,14 @@ fn shares_request_names() {
         head::Name::from_h1(b"kEeP-aLiVe"),
         Some(head::Name::KeepAlive)
     );
+    assert!(Known::from_name(b"kEeP-aLiVe").is_none());
+    for raw in [
+        b"keep-alive:".as_slice(),
+        b"conNeCtIoX:",
+        b"contEntXlength:",
+    ] {
+        assert!(Known::from_prefix(raw).is_none());
+    }
     for name in [b"".as_slice(), b"hoss", b"te", b"proxy-connection"] {
         assert_eq!(head::Name::from_h1(name), None);
     }

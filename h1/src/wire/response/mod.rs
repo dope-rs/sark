@@ -1,6 +1,6 @@
 use std::mem;
 
-use o3::buffer::{storage, write::consume};
+use o3::buffer::write::consume;
 use sark_http::{
     h1::head::line::{self, Request},
     method::Known,
@@ -89,9 +89,7 @@ pub enum Error {
     EncodingOverflow { current: usize },
     WriteCapacity { required: usize, actual: usize },
     ValueCapacity(consume::Error),
-    HeadCapacity { required: usize, actual: usize },
     HeadLength { expected: usize, actual: usize },
-    Storage(storage::AllocError),
 }
 
 const _: () = {

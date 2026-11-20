@@ -66,7 +66,7 @@ impl<'d, R: route::Spec> Pending<'d, R> {
         done: session::Complete,
         permit: session::Permit,
         state: &S,
-        egress: Egress<'_, '_, impl compress::Compression>,
+        egress: Egress<'_, impl compress::Compression>,
         mut proof: E,
     ) -> session::Outcome<'d, D>
     where
@@ -89,20 +89,8 @@ impl<'d, R: route::Spec> Pending<'d, R> {
             body.discard(proof);
             return session::Outcome::Close(canned::BAD_REQUEST);
         }
-        let Egress {
-            output,
-            mut cache,
-            gzip,
-        } = egress;
-        let mut output = output.with_context(response);
-        if let Some(ready) = output.cached(&mut cache, R::POLICY.cache) {
-            body.discard(proof);
-            return ready.into_consume(
-                permit,
-                session::Consumption::Buffered(session::Buffered::new(used)),
-                close,
-            );
-        }
+        let Egress { output, gzip } = egress;
+        let output = output.with_context(response);
         let mut owner = body;
         let mut body = match owner.try_admit::<R, E>(total, want, &mut proof) {
             Ok(body) => body,
@@ -110,22 +98,15 @@ impl<'d, R: route::Spec> Pending<'d, R> {
         };
         let ready = match <<R::Request as route::Schema>::Body as body::Project>::try_project(
             &mut body,
-            (head.borrow(), state, output, cache, gzip, coding),
+            (head.borrow(), state, output, gzip, coding),
             |scope| -> Result<output::Outcome<'d, usize>, Failure> {
-                let ((request, state, output, cache, gzip, coding), view) = scope.into_parts();
+                let ((request, state, output, gzip, coding), view) = scope.into_parts();
                 let input = view.body();
                 let call = Call::new(request, view);
                 let reply = call.try_invoke::<R, S>(state).map_err(|error| {
                     Failure::Route(<R::Request as route::Project>::reject(error))
                 })?;
-                Ok(output.route(
-                    reply,
-                    handoff::Slot::new(input),
-                    cache,
-                    gzip,
-                    coding,
-                    R::POLICY,
-                ))
+                Ok(output.route(reply, handoff::Slot::new(input), gzip, coding, R::POLICY))
             },
         ) {
             Ok(Ok(ready)) => ready,

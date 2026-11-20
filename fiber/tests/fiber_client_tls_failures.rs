@@ -1,4 +1,3 @@
-use dope::core::driver::life::recovery;
 pub mod common;
 
 use std::{
@@ -7,7 +6,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use common::client::recover;
+use common::client::assert_shutdown;
 use common::client::{
     Cause, runtime,
     runtime::{
@@ -16,7 +15,7 @@ use common::client::{
     },
     tls,
 };
-use dope::core::{Errno, io::Reclaimed};
+use dope::core::Errno;
 use dope_fiber::{
     BlockOn as _,
     reply::{Progress, order::Depth},
@@ -133,11 +132,7 @@ fn recycles_failures() {
                         );
                     }
                 },
-                recovery::Policy::new(
-                    |event| std::assert_matches!(event, Reclaimed::Shutdown),
-                    recover,
-                ),
-                |result| result.expect("client execution"),
+                assert_shutdown,
             );
             result.expect("run retained-failure client");
         })
@@ -246,11 +241,7 @@ fn skips_blocked_report() {
                         .ok()
                         .expect("released report reused");
                 },
-                recovery::Policy::new(
-                    |event| std::assert_matches!(event, Reclaimed::Shutdown),
-                    recover,
-                ),
-                |result| result.expect("client execution"),
+                assert_shutdown,
             )
             .expect("TLS client execution");
         })

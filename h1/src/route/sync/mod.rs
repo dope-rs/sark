@@ -16,7 +16,7 @@ use sark_http::{
 use crate::{
     route::PolicyOf,
     session, switch,
-    wire::{Failure, body::View, cache, output, parsing::framing},
+    wire::{Failure, body::View, output, parsing::framing},
 };
 
 mod pending;
@@ -26,23 +26,14 @@ pub use pending::Pending;
 /// Borrowed resources required to produce one synchronous HTTP/1 response.
 /// The aggregate owns no allocation and keeps every output borrow live for the
 /// complete route execution.
-pub struct Egress<'turn, 'cache, C: compress::Compression = compress::Gzip> {
+pub struct Egress<'turn, C: compress::Compression = compress::Gzip> {
     output: output::Egress<'turn>,
-    cache: cache::Cache<'cache>,
     gzip: &'turn mut C,
 }
 
-impl<'turn, 'cache, C: compress::Compression> Egress<'turn, 'cache, C> {
-    pub fn new(
-        output: output::Egress<'turn>,
-        cache: cache::Cache<'cache>,
-        gzip: &'turn mut C,
-    ) -> Self {
-        Self {
-            output,
-            cache,
-            gzip,
-        }
+impl<'turn, C: compress::Compression> Egress<'turn, C> {
+    pub fn new(output: output::Egress<'turn>, gzip: &'turn mut C) -> Self {
+        Self { output, gzip }
     }
 
     fn invoke<'d, R, S>(
@@ -60,23 +51,12 @@ impl<'turn, 'cache, C: compress::Compression> Egress<'turn, 'cache, C> {
             (request, state, self, coding),
             |scope| -> Result<output::Outcome<'d>, Failure> {
                 let ((request, state, egress, coding), view) = scope.into_parts();
-                let Egress {
-                    output,
-                    cache,
-                    gzip,
-                } = egress;
+                let Egress { output, gzip } = egress;
                 let call = Call::new(request, view);
                 let reply = call.try_invoke::<R, S>(state).map_err(|error| {
                     Failure::Route(<R::Request as route::Project>::reject(error))
                 })?;
-                Ok(output.route(
-                    reply,
-                    handoff::Slot::ready(None),
-                    cache,
-                    gzip,
-                    coding,
-                    R::POLICY,
-                ))
+                Ok(output.route(reply, handoff::Slot::ready(None), gzip, coding, R::POLICY))
             },
         )
         .map_err(|failure| Failure::Projection(failure.discard()))?
@@ -86,7 +66,6 @@ impl<'turn, 'cache, C: compress::Compression> Egress<'turn, 'cache, C> {
 pub struct Endpoint<
     'a,
     'd,
-    'cache,
     Runtime,
     Stored,
     Transitions = switch::Disabled,
@@ -94,17 +73,17 @@ pub struct Endpoint<
     Heads = Infallible,
     C: compress::Compression = compress::Gzip,
 > {
-    egress: Egress<'a, 'cache, C>,
+    egress: Egress<'a, C>,
     connection: &'a mut session::Conn<'d, Runtime, Stored, Transitions, Ready, Heads>,
 }
 
-impl<'a, 'd, 'cache, Runtime, Stored, Transitions, Ready, Heads, C: compress::Compression>
-    Endpoint<'a, 'd, 'cache, Runtime, Stored, Transitions, Ready, Heads, C>
+impl<'a, 'd, Runtime, Stored, Transitions, Ready, Heads, C: compress::Compression>
+    Endpoint<'a, 'd, Runtime, Stored, Transitions, Ready, Heads, C>
 where
     Transitions: switch::Engine,
 {
     pub fn new(
-        egress: Egress<'a, 'cache, C>,
+        egress: Egress<'a, C>,
         conn: &'a mut session::Conn<'d, Runtime, Stored, Transitions, Ready, Heads>,
     ) -> Self {
         Self {
@@ -169,21 +148,7 @@ where
             }
         };
         let total = frame.total();
-        let close = frame.connection;
         self.egress.output = self.egress.output.with_context(frame.response);
-        if let Some(ready) = self
-            .egress
-            .output
-            .cached(&mut self.egress.cache, R::POLICY.cache)
-        {
-            return ready
-                .into_consume(
-                    permit,
-                    session::Consumption::Buffered(session::Buffered::new(total)),
-                    close,
-                )
-                .into();
-        }
         let (request, mut body, _, close, coding, _) = match frame.into_parts() {
             Ok(parts) => parts,
             Err(error) => return error.into_consume().into(),
@@ -228,14 +193,7 @@ where
             Err(error) => return error.into_consume().into(),
         };
         self.egress.output = self.egress.output.with_context(response);
-        if let Some(ready) = self
-            .egress
-            .output
-            .cached(&mut self.egress.cache, R::POLICY.cache)
-        {
-            return ready.into_consume(permit, used, close).into();
-        }
-        let body = View::from_slice(&[]);
+        let body = View::Slice(&[]);
         let mut body = match body.finish::<R>(total, want) {
             Ok(body) => body,
             Err(error) => {
@@ -253,4 +211,4 @@ where
     }
 }
 
-const _: () = assert!(mem::size_of::<Egress<'static, 'static>>() == 7 * mem::size_of::<usize>());
+const _: () = assert!(mem::size_of::<Egress<'static>>() == 6 * mem::size_of::<usize>());

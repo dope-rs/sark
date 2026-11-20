@@ -15,12 +15,10 @@ use sark_http::{
 };
 
 use crate::wire::{
-    cache,
     output::Admit,
     response::{Context, framing},
 };
 
-mod cached;
 pub(super) mod error;
 mod gzip;
 mod head;
@@ -28,13 +26,12 @@ pub(super) mod written;
 
 use error::Error;
 use gzip::{compress_body, compress_bounded, compress_exact};
-use head::{Layout, Pending, emit_framed_head, emit_head};
+use head::{Pending, emit_framed_head, emit_head};
 use written::Written;
 
 pub(super) enum Mode<'a, C: Compression> {
     Plain,
     Compress(&'a mut C),
-    Cache(cache::Cache<'a>),
 }
 
 #[derive(Clone, Copy)]
@@ -125,20 +122,10 @@ impl<'a, 'req, 'd, Q: scope::Source, O: stage::Body<'req, 'd>, C: Compression, A
         fields: &H,
         frame: framing::Empty,
     ) -> Result<Written<'d, O::Deferred, Q::Selection>, Error> {
-        match self.mode {
-            Mode::Cache(cache) => Written::cached(
-                self.out,
-                self.date.value,
-                cached::empty(status, fields, frame, self.date)?,
-                cache,
-            ),
-            Mode::Plain | Mode::Compress(_) => {
-                emit_framed_head::<_, _, ()>(self.out, self.date, status, fields, frame)?;
-                Ok(Written::Body {
-                    body: handoff::Ready::Empty,
-                })
-            }
-        }
+        emit_framed_head::<_, _, ()>(self.out, self.date, status, fields, frame)?;
+        Ok(Written::Body {
+            body: handoff::Ready::Empty,
+        })
     }
 }
 
@@ -165,12 +152,6 @@ impl<'req, 'd: 'req, Q: scope::Source, O: stage::Body<'req, 'd>, C: Compression,
             ..
         } = self;
         match mode {
-            Mode::Cache(cache) => Written::cached(
-                out,
-                date.value,
-                cached::body(status, &fields, body, date)?,
-                cache,
-            ),
             Mode::Compress(gzip) => compress_body(out, date, status, &fields, body, gzip, slot),
             Mode::Plain => plain_body(out, date, status, &fields, body, slot),
         }
@@ -190,25 +171,8 @@ impl<'req, 'd: 'req, Q: scope::Source, O: stage::Body<'req, 'd>, C: Compression,
         if let Some(frame) = self.omission(status)? {
             return self.empty(status, &fields, frame);
         }
-        let Self {
-            out,
-            date,
-            mode,
-            slot,
-            ..
-        } = self;
-        match mode {
-            Mode::Cache(cache) => Written::cached(
-                out,
-                date.value,
-                cached::body(status, &fields, body, date)?,
-                cache,
-            ),
-            Mode::Plain | Mode::Compress(_) => {
-                emit_head::<_, ()>(out, date, status, &fields, body.len())?;
-                stage(slot, body)
-            }
-        }
+        emit_head::<_, ()>(self.out, self.date, status, &fields, body.len())?;
+        stage(self.slot, body)
     }
 
     fn exact<H, B>(self, status: Code, fields: H, body: B) -> Result<Self::Output, Self::Error>
@@ -229,12 +193,6 @@ impl<'req, 'd: 'req, Q: scope::Source, O: stage::Body<'req, 'd>, C: Compression,
             ..
         } = self;
         match mode {
-            Mode::Cache(cache) => Written::cached(
-                out,
-                date.value,
-                cached::exact(status, &fields, plan, date)?,
-                cache,
-            ),
             Mode::Compress(gzip) => compress_exact(out, date, status, &fields, plan, gzip, slot),
             Mode::Plain => finish_exact(out, date, status, &fields, plan, slot),
         }
@@ -258,12 +216,6 @@ impl<'req, 'd: 'req, Q: scope::Source, O: stage::Body<'req, 'd>, C: Compression,
             ..
         } = self;
         match mode {
-            Mode::Cache(cache) => Written::cached(
-                out,
-                date.value,
-                cached::bounded(status, &fields, plan, date)?,
-                cache,
-            ),
             Mode::Compress(gzip) => compress_bounded(out, date, status, &fields, plan, gzip, slot),
             Mode::Plain => finish_bounded(out, date, status, &fields, plan, slot),
         }
@@ -416,8 +368,7 @@ fn finish_bounded<
     slot: handoff::Slot<'req, 'd, Q, O>,
 ) -> Result<Written<'d, O::Deferred, Q::Selection>, Error> {
     let max = plan.max_len();
-    let layout = Layout::new(date, status, fields, max)?;
-    if let Some(mut pending) = Pending::place(&layout, &mut out) {
+    if let Some(mut pending) = Pending::try_place(&mut out, date, status, fields, max)? {
         let len = pending.encode(plan)?;
         pending.finish()?;
         return Ok(Written::inline(len));

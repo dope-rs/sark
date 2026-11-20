@@ -1,6 +1,5 @@
-use common::client::recover;
+use common::client::assert_shutdown;
 use common::client::runtime::peer;
-use dope::core::{driver::life::recovery, io::Reclaimed};
 use dope_test::harness::peer::{AcceptScript, Stream};
 pub mod common;
 
@@ -43,11 +42,7 @@ fn survives_peer_close() {
             )
             .try_run(
                 |result| result.expect("batch response").status().as_u16(),
-                recovery::Policy::new(
-                    |event| std::assert_matches!(event, Reclaimed::Shutdown),
-                    recover,
-                ),
-                |result| result.expect("client execution"),
+                assert_shutdown,
             )
             .expect("client scenario");
             assert_eq!(codes, vec![200, 200, 200, 200, 200, 200]);
@@ -89,11 +84,7 @@ fn drains_long_sequence() {
             )
             .try_run(
                 |result| result.expect("batch response").status().as_u16(),
-                recovery::Policy::new(
-                    |event| std::assert_matches!(event, Reclaimed::Shutdown),
-                    recover,
-                ),
-                |result| result.expect("client execution"),
+                assert_shutdown,
             )
             .expect("client scenario");
             assert_eq!(codes.len(), 10);
@@ -136,11 +127,7 @@ fn reuses_one_slot() {
                 )
                 .try_run(
                     |result| result.expect("batch response").status().as_u16(),
-                    recovery::Policy::new(
-                        |event| std::assert_matches!(event, Reclaimed::Shutdown),
-                        recover,
-                    ),
-                    |result| result.expect("client execution"),
+                    assert_shutdown,
                 )
                 .expect("client scenario");
                 assert!((codes) == ([200, 200]));
@@ -196,11 +183,7 @@ fn rejects_excess_response_before_reusing_one_slot() {
                         }))
                         .expect("sequential requests")
                 },
-                recovery::Policy::new(
-                    |event| std::assert_matches!(event, Reclaimed::Shutdown),
-                    recover,
-                ),
-                |result| result.expect("client execution"),
+                assert_shutdown,
             )
             .expect("client scenario");
             assert_eq!(codes, [200, 201]);
@@ -240,11 +223,7 @@ fn http10_needs_persistence() {
                     )
                     .try_run(
                         |result| result.expect("batch response").status().as_u16(),
-                        recovery::Policy::new(
-                            |event| std::assert_matches!(event, Reclaimed::Shutdown),
-                            recover,
-                        ),
-                        |result| result.expect("client execution"),
+                        assert_shutdown,
                     )
                     .expect("client scenario");
                     assert_eq!(codes, [200, 200]);
@@ -290,11 +269,7 @@ fn bounds_peer_timeout() {
                 )
                 .try_run(
                     |result| result.expect("batch response").status().as_u16(),
-                    recovery::Policy::new(
-                        |event| std::assert_matches!(event, Reclaimed::Shutdown),
-                        recover,
-                    ),
-                    |result| result.expect("client execution"),
+                    assert_shutdown,
                 )
                 .expect("client scenario");
                 assert_eq!(codes, [200, 200]);
@@ -341,11 +316,7 @@ fn clock_governs_reuse() {
                     )
                     .try_clock(
                         |result| result.expect("batch response").status().as_u16(),
-                        recovery::Policy::new(
-                            |event| std::assert_matches!(event, Reclaimed::Shutdown),
-                            recover,
-                        ),
-                        |result| result.expect("client execution"),
+                        assert_shutdown,
                     )
                     .expect("client scenario");
                     assert!((codes) == ([200, 200]));
@@ -389,11 +360,7 @@ fn zero_disables_reuse() {
                 )
                 .try_run(
                     |result| result.expect("batch response").status().as_u16(),
-                    recovery::Policy::new(
-                        |event| std::assert_matches!(event, Reclaimed::Shutdown),
-                        recover,
-                    ),
-                    |result| result.expect("client execution"),
+                    assert_shutdown,
                 )
                 .expect("client scenario");
                 assert_eq!(codes, [200, 200]);
@@ -438,11 +405,7 @@ fn missing_hint_resets() {
                 )
                 .try_run(
                     |result| result.expect("batch response").status().as_u16(),
-                    recovery::Policy::new(
-                        |event| std::assert_matches!(event, Reclaimed::Shutdown),
-                        recover,
-                    ),
-                    |result| result.expect("client execution"),
+                    assert_shutdown,
                 )
                 .expect("client scenario");
                 assert_eq!(codes, [200, 200, 200]);
@@ -486,11 +449,7 @@ fn recovers_silent_close() {
             )
             .try_run(
                 |result| result.expect("batch response").status().as_u16(),
-                recovery::Policy::new(
-                    |event| std::assert_matches!(event, Reclaimed::Shutdown),
-                    recover,
-                ),
-                |result| result.expect("client execution"),
+                assert_shutdown,
             )
             .expect("client scenario");
             assert_eq!(codes, vec![200, 200, 200, 200, 200, 200, 200, 200]);

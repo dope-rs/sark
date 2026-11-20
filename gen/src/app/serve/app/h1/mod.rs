@@ -2,9 +2,9 @@ use crate::{
     app::{
         serve::{
             self,
-            app::{surfaces, tokens},
+            app::surfaces,
             duplex,
-            handle::{self, decode, router},
+            handle::{self, decode},
         },
         spec::Driver,
     },
@@ -19,18 +19,19 @@ pub(super) fn extras<'emit, 'source, 'spec>(
     plan: &handle::H1Plan<'source, 'spec>,
     source: &'source serve::ProtocolPlan<'spec>,
     exec: &'emit serve::Execution<'source, 'spec>,
-    names: &tokens::Names<'emit>,
+    core: &syn::Ident,
+    inner: &syn::Ident,
     binding: surfaces::Binding<'emit>,
     tasks: &'emit proc_macro2::TokenStream,
 ) -> surfaces::Extras {
-    let [f_cache, f_gzip, f_time] = ["response_cache", "gzip", "timer"].map(local);
+    let [f_gzip, f_time] = ["gzip", "timer"].map(local);
     let [f_life, f_state, f_mark] = ["lifecycle", "state", "marker"].map(local);
     let [f_core, f_stamp] = ["core", "stamp"].map(local);
     let symbols = &source.spec.state_generics;
     let [n_bind, n_clock] = symbols.locals(["__binding", "__clock"]);
     let [n_until, v_brand, v_config] = symbols.locals(["__deadline", "brand", "config"]);
     let [v_core, v_gzip, v_life] = symbols.locals(["core", "gzip", "lifecycle"]);
-    let [v_obs, v_cache] = symbols.locals(["observer", "response_cache"]);
+    let v_obs = symbols.local("observer");
     let [v_retain, v_stamp, v_state] = symbols.locals(["retention", "stamp", "state"]);
     let [v_tasks] = symbols.locals(["tasks"]);
     let v_h2 = symbols.local("h2");
@@ -61,8 +62,6 @@ pub(super) fn extras<'emit, 'source, 'spec>(
     let decls = &symbols.parameters;
     let clauses = &symbols.predicates;
     let routes = &spec.route_bounds;
-    let inner = names.name;
-    let core = names.core;
     let params = &binding.generic;
     let cold = &binding.cold_direct;
     let bound = &binding.bound_direct;
@@ -79,7 +78,6 @@ pub(super) fn extras<'emit, 'source, 'spec>(
             let #v_tasks = #ns_fiber::dope_fiber::task::storage::scope::Owned::new(#v_tasks, #v_brand);
         }
     });
-    let count = plan.cache_count;
     let pending = plan.continuations.definitions(paths);
     let duplex = plan.duplex.state();
     let input = duplex.input_type(paths);
@@ -128,36 +126,36 @@ pub(super) fn extras<'emit, 'source, 'spec>(
     };
     let runs = runners.definitions;
     let serve = runners.methods;
-    let coding = router::coding(paths, spec);
-    let gz_field = (count != 0).then(|| {
-        quote! {
-            #f_gzip: <#g_store as
-                #ns_fiber::manifold::runtime::Storage
-            >::Protocol<(), #coding>,
-        }
-    });
-    let gz_init = (count != 0).then(|| quote! { #f_gzip: (), });
-    let gz_move = (count != 0).then(|| quote!(#f_gzip: #v_gzip,));
-    let cache = quote!([::core::option::Option<#ns_h1::wire::cache::Entry>; #count]);
-    let fields = quote! {
-        #f_cache: <#g_store as #ns_fiber::manifold::runtime::Storage>::Protocol<#cache, #cache>,
-        #gz_field
+    let mut sync = source
+        .entries
+        .iter()
+        .filter(|route| matches!(route.mode, serve::Mode::Sync))
+        .map(|route| &route.entry.route)
+        .peekable();
+    let (fields, init, owned, bind_gz) = if sync.peek().is_some() {
+        let coding = quote! {
+            <#ns_h1::wire::output::Select<{
+                false #( || ::core::matches!(
+                    <#sync as #ns_h1::route::PolicyOf>::POLICY.coding,
+                    #ns_http::h1::head::request::Coding::Gzip,
+                ) )*
+            }> as #ns_h1::wire::output::Selected>::Compression
+        };
+        (
+            quote! {
+                #f_gzip: <#g_store as #ns_fiber::manifold::runtime::Storage>::Protocol<(), #coding>,
+            },
+            quote!(#f_gzip: (),),
+            quote!(#f_gzip: #v_gzip,),
+            quote! {
+                let () = #v_gzip;
+                let #v_gzip = <#coding as #ns_http::payload::compress::Compression>::try_new()
+                    .map_err(#ns_h1::server::listener::bind::Error::Allocation)?;
+            },
+        )
+    } else {
+        Default::default()
     };
-    let init = quote! {
-        #f_cache: [const { ::core::option::Option::None }; #count],
-        #gz_init
-    };
-    let owned = quote! {
-        #f_cache: #v_cache,
-        #gz_move
-    };
-    let bind_gz = (count != 0).then(|| {
-        quote! {
-            let () = #v_gzip;
-            let #v_gzip = <#coding as #ns_http::payload::compress::Compression>::try_new()
-                .map_err(#ns_h1::server::listener::bind::Error::Allocation)?;
-        }
-    });
     let wire = quote! {
         <#input as #ns_fiber::dope::net::link::pool::recv::input::Mode<#g_wire>>::Reserve:
             #ns_fiber::dope::net::link::pool::recv::reserve::Choice<
@@ -505,6 +503,6 @@ pub(super) fn extras<'emit, 'source, 'spec>(
         core_fields: fields,
         core_moves: owned,
         public_methods: methods,
-        core_initializers: quote! { #f_cache: (), #gz_init },
+        core_initializers: init,
     }
 }

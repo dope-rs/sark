@@ -88,73 +88,43 @@ pub fn expectation(mut scan: Fields) -> Result<expect::Decision, Failure> {
     try_admit(scan, b"POST", b"/").map(|admit| admit.expectation())
 }
 
-pub trait Request: Sized {
-    fn try_headers(headers: &[(Known, &[u8])]) -> Result<RequestBody, Failure>;
-    fn try_hosts(method: &[u8], target: &[u8], hosts: &[&[u8]]) -> Result<RequestBody, Failure>;
-    fn try_upgrade(headers: &[(Known, &[u8])]) -> Result<RequestBody, Failure>;
-    fn try_scan(headers: &[Entry<'_>]) -> Result<Self, head::Error>;
-    fn try_body(self) -> Result<RequestBody, Semantic>;
+fn request_fields<'a>(
+    headers: impl IntoIterator<Item = (Known, &'a [u8])>,
+) -> Result<Fields, head::Error> {
+    let mut scan = Fields::default();
+    let mut flags = Flags::default();
+    for (header, value) in headers {
+        header.apply(&mut scan, &mut flags, value, Version::Eleven)?;
+    }
+    Ok(scan)
 }
 
-impl Request for Fields {
-    fn try_headers(headers: &[(Known, &[u8])]) -> Result<RequestBody, Failure> {
-        let mut scan = Fields::default();
-        let mut flags = Flags::default();
-        for &(header, value) in headers {
-            header
-                .apply(&mut scan, &mut flags, value, Version::Eleven)
-                .map_err(Failure::Field)?;
-        }
-        Known::Host
-            .apply(&mut scan, &mut flags, b"test.invalid", Version::Eleven)
-            .map_err(Failure::Field)?;
-        let target = target::Target::parse(b"GET", b"/")
-            .map_err(|error| Failure::Semantic(Semantic::Authority(error)))?;
-        scan.admit_target(target, b"HTTP/1.1", target::Policy::AllowEmpty)
-            .map(|admit| admit.body())
-            .map_err(Failure::Semantic)
-    }
+const HOST: (Known, &[u8]) = (Known::Host, b"test.invalid");
 
-    fn try_hosts(method: &[u8], target: &[u8], hosts: &[&[u8]]) -> Result<RequestBody, Failure> {
-        let mut scan = Fields::default();
-        let mut flags = Flags::default();
-        for &host in hosts {
-            Known::Host
-                .apply(&mut scan, &mut flags, host, Version::Eleven)
-                .map_err(Failure::Field)?;
-        }
-        try_admit(scan, method, target).map(|admit| admit.body())
-    }
+pub fn try_headers(headers: &[(Known, &[u8])]) -> Result<RequestBody, Failure> {
+    let scan = request_fields(headers.iter().copied().chain([HOST])).map_err(Failure::Field)?;
+    try_body(scan, target::Policy::AllowEmpty).map_err(Failure::Semantic)
+}
 
-    fn try_upgrade(headers: &[(Known, &[u8])]) -> Result<RequestBody, Failure> {
-        let mut scan = Fields::default();
-        let mut flags = Flags::default();
-        Known::Host
-            .apply(&mut scan, &mut flags, b"origin.example", Version::Eleven)
-            .map_err(Failure::Field)?;
-        for &(header, value) in headers {
-            header
-                .apply(&mut scan, &mut flags, value, Version::Eleven)
-                .map_err(Failure::Field)?;
-        }
-        try_admit(scan, b"GET", b"/").map(|admit| admit.body())
-    }
+pub fn try_request(
+    method: &[u8],
+    target: &[u8],
+    headers: &[(Known, &[u8])],
+) -> Result<RequestBody, Failure> {
+    let scan = request_fields(headers.iter().copied()).map_err(Failure::Field)?;
+    try_admit(scan, method, target).map(|admit| admit.body())
+}
 
-    fn try_scan(headers: &[Entry<'_>]) -> Result<Self, head::Error> {
-        let mut scan = Fields::default();
-        let mut flags = Flags::default();
-        for header in headers {
-            if let Some(known) = Known::from_name(header.name) {
-                known.apply(&mut scan, &mut flags, header.value, Version::Eleven)?;
-            }
-        }
-        Known::Host.apply(&mut scan, &mut flags, b"test.invalid", Version::Eleven)?;
-        Ok(scan)
-    }
+pub fn try_scan(headers: &[Entry<'_>]) -> Result<Fields, head::Error> {
+    let known = headers
+        .iter()
+        .filter_map(|entry| Some((Known::from_name(entry.name)?, entry.value)));
+    request_fields(known.chain([HOST]))
+}
 
-    fn try_body(self) -> Result<RequestBody, Semantic> {
-        let target = target::Target::parse(b"GET", b"/").map_err(Semantic::Authority)?;
-        self.admit_target(target, b"HTTP/1.1", target::Policy::Require)
-            .map(|admit| admit.body())
-    }
+pub fn try_body(fields: Fields, policy: target::Policy) -> Result<RequestBody, Semantic> {
+    let target = target::Target::parse(b"GET", b"/").map_err(Semantic::Authority)?;
+    fields
+        .admit_target(target, b"HTTP/1.1", policy)
+        .map(|admit| admit.body())
 }

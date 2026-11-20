@@ -2,7 +2,7 @@ use std::ops::ControlFlow;
 
 use o3::buffer::{
     bytes::scope,
-    write::{Slice, Split},
+    write::{Slice, Stage},
 };
 use sark_http::{
     field,
@@ -16,7 +16,7 @@ use sark_http::{
 use crate::wire::output::sink::{
     self, Headers,
     error::Error,
-    head::{Layout, Pending, emit_fields, emit_head, emit_tail},
+    head::{Pending, emit_fields, emit_head, emit_tail},
     place_exact,
     written::Written,
 };
@@ -68,7 +68,7 @@ pub(super) fn compress_exact<
     let mut tail = staged_tail(&mut out, date, len)?;
     let head = base + tail.body().len();
     if encodings != 0 {
-        tail.try_commit().unwrap_or_else(|_| unreachable!("head"));
+        tail.commit();
         return place_exact(out, head, plan, slot);
     }
     head.checked_add(len).ok_or(Error::Overflow {
@@ -79,7 +79,7 @@ pub(super) fn compress_exact<
         plan.encode(&mut tail.body())?;
         match gzip.encode(&tail.body().into_mut()[head - base..]) {
             compress::Output::Plain => {
-                tail.try_commit().unwrap_or_else(|_| unreachable!("head"));
+                tail.commit();
                 return Ok(Written::inline(len));
             }
             compress::Output::Compressed(zipped) => zipped,
@@ -88,7 +88,7 @@ pub(super) fn compress_exact<
         let body = plan.into_shared()?;
         match gzip.encode(body.as_ref()) {
             compress::Output::Plain => {
-                tail.try_commit().unwrap_or_else(|_| unreachable!("head"));
+                tail.commit();
                 return sink::stage(slot, body);
             }
             compress::Output::Compressed(zipped) => zipped,
@@ -120,11 +120,11 @@ where
     let encodings = emit_fields(out.reborrow(), date, status, fields)?;
     let mut tail = staged_tail(&mut out, date, body.len())?;
     if encodings != 0 {
-        tail.try_commit().unwrap_or_else(|_| unreachable!("head"));
+        tail.commit();
         return sink::stage(slot, body);
     }
     let Some(raw) = body.as_slice() else {
-        tail.try_commit().unwrap_or_else(|_| unreachable!("head"));
+        tail.commit();
         return sink::stage(slot, body);
     };
     let read = raw.len();
@@ -134,7 +134,7 @@ where
                 ControlFlow::Break(written) => Written::inline(written),
                 ControlFlow::Continue(plan) => sink::staged(plan.stage()),
             };
-            tail.try_commit().unwrap_or_else(|_| unreachable!("head"));
+            tail.commit();
             return Ok(written);
         }
         compress::Output::Compressed(zipped) => zipped,
@@ -148,11 +148,9 @@ fn staged_tail<'writer, 'out>(
     out: &'writer mut Slice<'out, &'out mut usize>,
     date: Headers<'_>,
     len: usize,
-) -> Result<Split<'writer, 'out, &'out mut usize>, Error> {
+) -> Result<Stage<'writer, 'out, &'out mut usize>, Error> {
     let base = out.len();
-    let mut tail = out
-        .try_split(0, out.remaining())
-        .unwrap_or_else(|_| unreachable!("head"));
+    let mut tail = out.stage();
     emit_tail(tail.body(), date, len).map_err(|error| match error {
         crate::wire::response::Error::WriteCapacity { required, actual } => {
             crate::wire::response::Error::WriteCapacity {
@@ -195,8 +193,7 @@ pub(super) fn compress_bounded<
     slot: handoff::Slot<'req, 'd, Q, O>,
 ) -> Result<Written<'d, O::Deferred, Q::Selection>, Error> {
     let max = plan.max_len();
-    let layout = Layout::new(date, status, fields, max)?;
-    if let Some(mut pending) = Pending::place(&layout, &mut out) {
+    if let Some(mut pending) = Pending::try_place(&mut out, date, status, fields, max)? {
         let len = pending.encode(plan)?;
         if pending.encodings() == 0
             && let compress::Output::Compressed(zipped) = gzip.encode(pending.body())
@@ -216,12 +213,12 @@ pub(super) fn compress_bounded<
     let encodings = emit_fields(out.reborrow(), date, status, fields)?;
     let tail = staged_tail(&mut out, date, len)?;
     if encodings != 0 {
-        tail.try_commit().unwrap_or_else(|_| unreachable!("head"));
+        tail.commit();
         return sink::stage(slot, body);
     }
     let zipped = match gzip.encode(body.as_ref()) {
         compress::Output::Plain => {
-            tail.try_commit().unwrap_or_else(|_| unreachable!("head"));
+            tail.commit();
             return sink::stage(slot, body);
         }
         compress::Output::Compressed(zipped) => zipped,

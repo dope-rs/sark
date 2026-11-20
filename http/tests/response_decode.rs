@@ -1,13 +1,10 @@
 pub mod common;
 
-use common::response::{coding, headers};
+use common::response::{coding, headers, try_complete};
 use dope_test::alloc::Tracker;
 use sark_http::{
     field::Value,
-    h1::{
-        codec::decode::response::Progress,
-        head::{Limit, response::State},
-    },
+    h1::head::{Limit, response::State},
     payload::response::{Method, Response, status::Code},
 };
 
@@ -70,76 +67,52 @@ fn constructors_keep_parts() {
 
 #[test]
 fn trailers_stay_separate() {
-    use sark_http::h1::codec::decode::response::Decoder;
-
-    let wire = headers::TRAILERS;
-    {
-        let response =
-            match (Decoder::new(Method::Other).decode(wire)).expect("response must decode") {
-                Progress::Complete(value) => Some(value),
-                Progress::More => None,
-            }
-            .expect("test input must be complete");
-        assert_eq!(
-            response.headers().get("x-head").map(Value::as_bytes),
-            Some(b"head".as_slice()),
-        );
-        assert!(!response.headers().contains_key("x-tail"));
-        assert_eq!(
-            response.trailers().get("x-tail").map(Value::as_bytes),
-            Some(headers::OPAQUE),
-        );
-    };
+    let response = try_complete(headers::TRAILERS)
+        .expect("response must decode")
+        .expect("test input must be complete");
+    assert_eq!(
+        response.headers().get("x-head").map(Value::as_bytes),
+        Some(b"head".as_slice()),
+    );
+    assert!(!response.headers().contains_key("x-tail"));
+    assert_eq!(
+        response.trailers().get("x-tail").map(Value::as_bytes),
+        Some(headers::OPAQUE),
+    );
 }
 
 #[test]
 fn header_repeats_preserved() {
-    use sark_http::h1::codec::decode::response::Decoder;
+    let response = try_complete(headers::REPEATED)
+        .expect("response must decode")
+        .expect("test input must be complete");
+    let cookies: Vec<_> = response
+        .headers()
+        .iter()
+        .filter(|entry| entry.0.as_str() == "set-cookie")
+        .map(|entry| entry.1.as_bytes())
+        .collect();
 
-    let wire = headers::REPEATED;
-    {
-        let response =
-            match (Decoder::new(Method::Other).decode(wire)).expect("response must decode") {
-                Progress::Complete(value) => Some(value),
-                Progress::More => None,
-            }
-            .expect("test input must be complete");
-        let cookies: Vec<_> = response
-            .headers()
-            .iter()
-            .filter(|entry| entry.0.as_str() == "set-cookie")
-            .map(|entry| entry.1.as_bytes())
-            .collect();
-
-        assert_eq!(cookies, [b"a=1".as_slice(), headers::OPAQUE]);
-        assert_eq!(
-            response.headers().get("Set-Cookie").map(Value::as_bytes),
-            Some(b"a=1".as_slice())
-        );
-        assert_eq!(response.headers().len(), 3);
-        let names: Vec<_> = response
-            .headers()
-            .iter()
-            .map(|(name, _)| name.as_str())
-            .collect();
-        assert_eq!(names, ["set-cookie", "set-cookie", "content-length"]);
-    };
+    assert_eq!(cookies, [b"a=1".as_slice(), headers::OPAQUE]);
+    assert_eq!(
+        response.headers().get("Set-Cookie").map(Value::as_bytes),
+        Some(b"a=1".as_slice())
+    );
+    assert_eq!(response.headers().len(), 3);
+    let names: Vec<_> = response
+        .headers()
+        .iter()
+        .map(|(name, _)| name.as_str())
+        .collect();
+    assert_eq!(names, ["set-cookie", "set-cookie", "content-length"]);
 }
 
 #[test]
 fn status_code() {
-    use sark_http::h1::codec::decode::response::Decoder;
-
-    let wire = headers::STATUS;
-    {
-        let response =
-            match (Decoder::new(Method::Other).decode(wire)).expect("response must decode") {
-                Progress::Complete(value) => Some(value),
-                Progress::More => None,
-            }
-            .expect("test input must be complete");
-        assert_eq!(response.status().as_u16(), 599);
-    };
+    let response = try_complete(headers::STATUS)
+        .expect("response must decode")
+        .expect("test input must be complete");
+    assert_eq!(response.status().as_u16(), 599);
 }
 
 #[test]

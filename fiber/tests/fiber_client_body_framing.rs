@@ -1,10 +1,9 @@
-use common::client::recover;
+use common::client::assert_shutdown;
 use common::client::{
     config::{Config as _, FLAVORS},
     response::framing::{self, BODY, CHUNK, CHUNKS, SEGMENT},
     runtime::peer,
 };
-use dope::core::{driver::life::recovery, io::Reclaimed};
 use dope_test::harness::peer::AcceptScript;
 pub mod common;
 
@@ -37,11 +36,7 @@ fn decodes_body() {
             )
             .try_run(
                 |result| result.expect("HTTP response"),
-                recovery::Policy::new(
-                    |event| std::assert_matches!(event, Reclaimed::Shutdown),
-                    recover,
-                ),
-                |result| result.expect("client execution"),
+                assert_shutdown,
             )
             .expect("HTTP request execution");
             assert_eq!(resp.status().as_u16(), 200);
@@ -89,11 +84,7 @@ fn preserves_segments() {
                             assert!(segment.iter().all(|byte| *byte == expected));
                         }
                     },
-                    recovery::Policy::new(
-                        |event| std::assert_matches!(event, Reclaimed::Shutdown),
-                        recover,
-                    ),
-                    |result| result.expect("client execution"),
+                    assert_shutdown,
                 )
                 .expect("client scenario");
             }
@@ -129,11 +120,7 @@ fn decodes_large_body() {
             )
             .try_run(
                 |result| result.expect("HTTP response"),
-                recovery::Policy::new(
-                    |event| std::assert_matches!(event, Reclaimed::Shutdown),
-                    recover,
-                ),
-                |result| result.expect("client execution"),
+                assert_shutdown,
             )
             .expect("HTTP request execution");
             assert_eq!(resp.status().as_u16(), 200);
@@ -181,11 +168,7 @@ fn frames_large_chunk() {
             )
             .try_run(
                 |result| result.expect("HTTP response"),
-                recovery::Policy::new(
-                    |event| std::assert_matches!(event, Reclaimed::Shutdown),
-                    recover,
-                ),
-                |result| result.expect("client execution"),
+                assert_shutdown,
             )
             .expect("HTTP request execution");
             assert_eq!(response.body().as_slice().len(), BODY);
@@ -223,11 +206,7 @@ fn decodes_trailers() {
                 )
                 .try_run(
                     |result| result.expect("HTTP response"),
-                    recovery::Policy::new(
-                        |event| std::assert_matches!(event, Reclaimed::Shutdown),
-                        recover,
-                    ),
-                    |result| result.expect("client execution"),
+                    assert_shutdown,
                 )
                 .expect("HTTP request execution")
             });
@@ -250,11 +229,7 @@ fn decodes_trailers() {
                     let read = result.expect("client scenario");
                     (read.status, read.body, read.trailers, read.info)
                 },
-                recovery::Policy::new(
-                    |event| std::assert_matches!(event, Reclaimed::Shutdown),
-                    recover,
-                ),
-                |result| result.expect("client execution"),
+                assert_shutdown,
             )
             .expect("client scenario");
             assert_eq!(status, 200);
@@ -293,11 +268,7 @@ fn buffered_body_until_eof() {
             )
             .try_run(
                 |result| result.expect("HTTP response"),
-                recovery::Policy::new(
-                    |event| std::assert_matches!(event, Reclaimed::Shutdown),
-                    recover,
-                ),
-                |result| result.expect("client execution"),
+                assert_shutdown,
             )
             .expect("HTTP request execution");
             assert_eq!(response.status().as_u16(), 200);
@@ -330,11 +301,7 @@ fn streaming_body_until_eof() {
                     let read = result.expect("client scenario");
                     (read.status, read.body, read.trailers, read.info)
                 },
-                recovery::Policy::new(
-                    |event| std::assert_matches!(event, Reclaimed::Shutdown),
-                    recover,
-                ),
-                |result| result.expect("client execution"),
+                assert_shutdown,
             )
             .expect("client scenario");
             assert_eq!(status, 200);

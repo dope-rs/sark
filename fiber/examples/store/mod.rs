@@ -95,7 +95,7 @@ impl Server {
             service::Endpoint::new(upstream, upstream),
         );
         let assembly = redis
-            .assemble::<Bundle<Tcp, Identity, Throughput>>(
+            .assemble::<Bundle<Tcp, Identity, Throughput>, _, _, _>(
                 snapshot,
                 settings::DEFAULT_BACKOFF,
                 Duration::from_secs(30),
