@@ -3,11 +3,7 @@
 use core::convert::Infallible;
 use std::{mem, ops};
 
-use o3::{
-    alloc,
-    buffer::{storage, write::consume},
-    mem::rc,
-};
+use o3::buffer::storage;
 use sark_http::{
     h1::switch::Kind,
     payload::{compress, fixed, owned},
@@ -19,11 +15,9 @@ use crate::{
 };
 
 mod drain;
-mod ingress;
 mod reject;
 
 pub use drain::Drain;
-pub use ingress::Ingress;
 pub use reject::Reject;
 
 /// Exact disposition before an HTTP ingress drive acquires transport output.
@@ -47,17 +41,8 @@ pub enum Operation {
     Task,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
-pub(crate) enum Cause {
-    Capacity(consume::Error),
-    Consume(consume::Error),
-    Range { offset: usize, capacity: usize },
-    Exhausted(alloc::Exhausted),
-    Retain(rc::Error),
-}
-
 impl Preflight {
-    fn from(state: Result<(), Reject>) -> Self {
+    pub(crate) fn from(state: Result<(), Reject>) -> Self {
         match state {
             Ok(()) => Self::Settled,
             Err(error) => Self::Rejected(error),
@@ -170,33 +155,15 @@ pub struct Cycle<'d, H = Infallible> {
     pub state: Result<Egress<'d>, Reject>,
     pub progress: deadline::Progress,
     pub connection: head::Connection,
-    pub discard_remaining: usize,
     pub tail: Tail<H>,
 }
 
 impl<'d, H> Cycle<'d, H> {
-    fn ready(
-        egress: Egress<'d>,
-        progress: deadline::Progress,
-        conn: head::Connection,
-        left: usize,
-        tail: Tail<H>,
-    ) -> Self {
-        Self {
-            state: Ok(egress),
-            progress,
-            connection: conn,
-            discard_remaining: left,
-            tail,
-        }
-    }
-
-    fn rejected(error: Reject, progress: deadline::Progress, left: usize) -> Self {
+    pub(crate) fn rejected(error: Reject, progress: deadline::Progress) -> Self {
         Self {
             state: Err(error),
             progress,
             connection: head::Connection::Close,
-            discard_remaining: left,
             tail: Tail::Empty,
         }
     }

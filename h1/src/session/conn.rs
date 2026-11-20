@@ -4,7 +4,13 @@ use core::{convert::Infallible, mem};
 use o3::buffer::storage;
 use sark_http::{h1::switch::Kind, payload::fixed};
 
-use crate::{pump, session::Ingress, switch, wire::head};
+use crate::{
+    pump,
+    server::deadline,
+    session::Ingress,
+    switch,
+    wire::{head, recv},
+};
 
 /// Protocol root with inline runtime and transition policy.
 ///
@@ -54,6 +60,85 @@ impl<'d, Runtime: Default, Pending, Transitions: Default, Ready, Heads>
 impl<'d, Runtime, Pending, Transitions: switch::Engine, Ready, Heads>
     Conn<'d, Runtime, Pending, Transitions, Ready, Heads>
 {
+    /// Handles states which cannot acquire a transport write buffer.
+    pub fn preflight(&mut self, input: &[u8]) -> pump::Preflight
+    where
+        Runtime: pump::Tasks,
+    {
+        match self.mode() {
+            switch::Mode::Switching(kind) => {
+                return pump::Preflight::from(
+                    self.ingress
+                        .recv
+                        .backlog(pump::Operation::Switch(kind), input),
+                );
+            }
+            switch::Mode::Raw(kind) => {
+                return pump::Preflight::Rejected(pump::Reject::Raw(kind));
+            }
+            switch::Mode::Http => {}
+        }
+        match self.async_state.activity() {
+            pump::Activity::Idle => {}
+            pump::Activity::Task | pump::Activity::Stream => {
+                return pump::Preflight::from(
+                    self.ingress.recv.backlog(pump::Operation::Task, input),
+                );
+            }
+        }
+        if matches!(self.deferred, head::Connection::Close) || self.deferred_action.is_some() {
+            self.ingress.discard_remaining -= input.len().min(self.ingress.discard_remaining);
+            return pump::Preflight::Settled;
+        }
+        if self.ingress.discard_remaining > 0 {
+            let take = input.len().min(self.ingress.discard_remaining);
+            let (_, tail) = input.split_at(take);
+            return match self.ingress.absorb(tail) {
+                Ok(()) => {
+                    self.ingress.discard_remaining -= take;
+                    if !tail.is_empty() {
+                        pump::Preflight::Resume
+                    } else if self.ingress.discard_remaining == 0 {
+                        pump::Preflight::Finished
+                    } else {
+                        pump::Preflight::Settled
+                    }
+                }
+                Err(error) => pump::Preflight::Rejected(error),
+            };
+        }
+        pump::Preflight::Drive
+    }
+
+    /// Retains ingress while transport write capacity is unavailable.
+    pub fn retain(&mut self, input: &[u8]) -> pump::Retention {
+        let window = self.ingress.protocol.window();
+        let progress = match (input.is_empty(), window) {
+            (false, recv::Window::Head) => {
+                deadline::Progress::new(deadline::Head::Pending, deadline::Body::None)
+            }
+            (false, recv::Window::Body) => {
+                deadline::Progress::new(deadline::Head::Body, deadline::Body::Progress)
+            }
+            (true, recv::Window::Head) if self.ingress.recv.is_ready() => {
+                deadline::Progress::new(deadline::Head::Pending, deadline::Body::None)
+            }
+            (true, recv::Window::Head | recv::Window::Body) => deadline::Progress::default(),
+        };
+        let (state, progress) = match self.ingress.absorb(input) {
+            Ok(()) => (Ok(()), progress),
+            Err(error) => (
+                Err(error),
+                deadline::Progress::new(progress.head(), deadline::Body::None),
+            ),
+        };
+        pump::Retention { state, progress }
+    }
+
+    pub const fn deferred(&self) -> head::Connection {
+        self.deferred
+    }
+
     /// Restores a close response for the next output-capable turn.
     #[doc(hidden)]
     pub fn defer(&mut self, reason: fixed::Body<'d>) {

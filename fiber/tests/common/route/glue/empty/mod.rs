@@ -1,7 +1,6 @@
 use std::{cell::Cell, convert::Infallible, pin::Pin};
 
 use dope::core::driver::schedule::sequence;
-use o3::buffer;
 use sark_core::{body::credit, manifold::task::request::Input, route};
 use sark_fiber::request::BodyLen;
 use sark_h1::{
@@ -184,12 +183,10 @@ impl<'d, R: route::Spec<Request: route::Own<RawParams = (), Mode = route::Stream
         };
         let mut conn = Connection::default();
         for part in [first, last].into_iter().filter(|part| !part.is_empty()) {
-            let cycle = pump::Ingress::drive(
-                &mut conn,
+            let cycle = conn.drive(
                 Pin::new(&mut carrier),
                 part,
                 o3::buffer::write::Slice::new(&mut [0; 2048]).reborrow(),
-                head::Connection::KeepAlive,
             );
             if let Some(error) = carrier.error.take() {
                 return Err(error);
@@ -199,12 +196,10 @@ impl<'d, R: route::Spec<Request: route::Own<RawParams = (), Mode = route::Stream
         let consumed = carrier.consumed;
         let input = carrier.input.take().ok_or(Error::Input { request: 0 })?;
         carrier.id = sequence.try_next().map_err(Error::Identity)?;
-        let cycle = pump::Ingress::drive(
-            &mut conn,
+        let cycle = conn.drive(
             Pin::new(&mut carrier),
             &[],
             o3::buffer::write::Slice::new(&mut [0; 2048]).reborrow(),
-            head::Connection::KeepAlive,
         );
         if let Some(error) = carrier.error.take() {
             return Err(error);
@@ -277,22 +272,6 @@ where
                 credit::Disabled::new(),
             )
             .with_head()
-    }
-
-    fn consume_line(
-        self: Pin<&mut Self>,
-        permit: session::Permit,
-        source: parsing::Source,
-        write: o3::buffer::write::Slice<'_, &mut usize>,
-        conn: &mut Connection<'d, R>,
-    ) -> Outcome<'d, R, parsing::Rejected<'d>> {
-        let source = source.freeze();
-        self.try_consume(
-            permit,
-            sark_h1::Input::Buffered(buffer::Complete::view(&source)),
-            write,
-            conn,
-        )
     }
 
     fn resume_head(

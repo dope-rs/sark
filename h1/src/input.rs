@@ -30,6 +30,14 @@ impl<'a> Input<'a> {
         }
     }
 
+    pub(crate) fn advance(&mut self, used: usize) -> Result<(), InputError> {
+        let len = self.as_slice().len();
+        *self = self
+            .try_get(used..len)
+            .map_err(|_| InputError::Range(range::Error::new(0..used, len)))?;
+        Ok(())
+    }
+
     /// Advances the retained window by the largest fitting prefix.
     pub(crate) fn consume_max(&mut self, max: usize) -> usize {
         match self {

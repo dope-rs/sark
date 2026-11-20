@@ -21,7 +21,7 @@ use dope::{
 };
 use dope_test::harness::signals::Gate;
 use handler::{failures, retire, send};
-use o3::buffer::{Complete as _, bytes::TryRetain, hold, resident::bound, storage};
+use o3::buffer::{bytes::TryRetain, hold, resident::bound, storage};
 use sark_h1::{
     Input,
     server::{
@@ -203,17 +203,6 @@ impl<'a: 'd, 'd> session::Dispatch<'d, (), Infallible> for App<'a> {
         _: &mut session::Conn<'d, (), Infallible>,
     ) -> session::RouteOutcome<'d, Infallible, Infallible, Self::Head, parsing::Rejected<'d>> {
         match pending {}
-    }
-
-    fn consume_line(
-        self: Pin<&mut Self>,
-        permit: session::Permit,
-        source: parsing::Source,
-        write: o3::buffer::write::Slice<'_, &mut usize>,
-        conn: &mut session::Conn<'d, (), Infallible>,
-    ) -> session::RouteOutcome<'d, Infallible, Infallible, Self::Head, parsing::Rejected<'d>> {
-        let source = source.freeze();
-        self.try_consume(permit, Input::Buffered(source.view()), write, conn)
     }
 
     fn try_consume(

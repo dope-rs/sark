@@ -36,36 +36,35 @@ impl Buffer {
         if self.tail.is_empty() {
             return Ok(None);
         }
-        Self::reject(
-            pump::Operation::Prepare,
-            self.tail.write_slice(incoming).map_err(Self::allocation),
-        )?;
-        let retained = self.tail.try_snapshot().map_err(pump::Cause::Retain);
-        Self::reject(pump::Operation::Prepare, retained)
+        let operation = pump::Operation::Prepare;
+        self.backlog(operation, incoming)?;
+        self.tail
+            .try_snapshot()
+            .map_err(|cause| pump::Reject::Retain { operation, cause })
     }
 
     pub(crate) fn consume(&mut self, amount: usize) -> Result<(), pump::Reject> {
-        let consumed = self.tail.try_consume(amount).map_err(pump::Cause::Consume);
-        Self::reject(pump::Operation::Consume, consumed)?;
+        self.tail
+            .try_consume(amount)
+            .map_err(|cause| pump::Reject::Consume {
+                operation: pump::Operation::Consume,
+                cause,
+            })?;
         if self.tail.is_empty() {
             self.tail = Snapshot::new();
         }
         Ok(())
     }
 
-    pub(crate) fn backlog(&mut self, op: pump::Operation, src: &[u8]) -> Result<(), pump::Reject> {
-        Self::reject(op, self.tail.write_slice(src).map_err(Self::allocation))
-    }
-
-    fn allocation(error: storage::AllocError) -> pump::Cause {
-        match error {
-            storage::AllocError::Capacity(error) => pump::Cause::Capacity(error),
-            storage::AllocError::Exhausted(error) => pump::Cause::Exhausted(error),
-        }
-    }
-
-    fn reject<T>(op: pump::Operation, result: Result<T, pump::Cause>) -> Result<T, pump::Reject> {
-        result.map_err(|cause| pump::Reject::new(op, cause))
+    pub(crate) fn backlog(
+        &mut self,
+        operation: pump::Operation,
+        src: &[u8],
+    ) -> Result<(), pump::Reject> {
+        self.tail.write_slice(src).map_err(|error| match error {
+            storage::AllocError::Capacity(cause) => pump::Reject::Capacity { operation, cause },
+            storage::AllocError::Exhausted(cause) => pump::Reject::Exhausted { operation, cause },
+        })
     }
 }
 

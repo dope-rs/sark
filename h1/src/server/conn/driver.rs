@@ -149,7 +149,7 @@ where
     Runtime: pump::Tasks,
     W: wire::Spec,
 {
-    let bytes = match pump::Ingress::preflight(conn.state_mut(), bytes) {
+    let bytes = match conn.state_mut().preflight(bytes) {
         pump::Preflight::Drive => bytes,
         pump::Preflight::Resume => &[],
         pump::Preflight::Finished => {
@@ -166,7 +166,6 @@ where
         }
     };
 
-    let prior = pump::Ingress::deferred(conn.state());
     let admission = 'output: {
         let mut native_slot = mem::MaybeUninit::uninit();
         let mut native = match conn.try_output(driver, &mut native_slot) {
@@ -175,7 +174,7 @@ where
         };
         let (cycle, tag, sent) = {
             let (state, writer) = native.get_mut().parts();
-            let cycle = pump::Ingress::drive(state, routes.as_mut(), bytes, writer, prior);
+            let cycle = state.drive(routes.as_mut(), bytes, writer);
             let charge = match cycle.state.as_ref() {
                 Ok(pump::Egress::Shared { body }) => {
                     crate::wire::output::Owner::shared(body).charge
@@ -196,7 +195,6 @@ where
         };
         let pump::Cycle {
             progress,
-            discard_remaining: left,
             state,
             connection,
             tail,
@@ -207,11 +205,7 @@ where
         };
         let wake = matches!(egress, pump::Egress::Wake);
         let body = payload::write::try_prepare(egress, tag);
-        let end = match connection {
-            crate::wire::head::Connection::KeepAlive => write::End::Open,
-            crate::wire::head::Connection::Close => write::End::Close,
-        };
-        if let Err(cause) = payload::write::try_publish(native, body, end) {
+        if let Err(cause) = payload::write::try_publish(native, body, connection) {
             if let Some(tag) = sent {
                 routes
                     .as_mut()
@@ -233,10 +227,10 @@ where
                 .as_mut()
                 .accept(&mut conn.state_mut().async_state, tag);
         }
-        if let Some(prefix) = discard::Prefix::try_new(left)
+        if let Some(prefix) = discard::Prefix::try_new(conn.state().ingress.discard_remaining)
             && matches!(conn.try_discard(prefix), discard::Start::Started)
         {
-            pump::Ingress::discard(conn.state_mut());
+            conn.state_mut().ingress.end_discard();
         }
         return Drive {
             flow: Flow::Continue,
@@ -246,7 +240,7 @@ where
     };
     match admission {
         write::error::Admission::Deferred(_) => {
-            let held = pump::Ingress::retain(conn.state_mut(), bytes);
+            let held = conn.state_mut().retain(bytes);
             match held.state {
                 Ok(()) => Drive::new(Flow::Continue).with_input(held.progress),
                 Err(error) => {

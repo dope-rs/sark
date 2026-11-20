@@ -3,10 +3,7 @@ use std::mem;
 use o3::{alloc, buffer::write::consume, mem::rc};
 use sark_http::h1::switch::Kind;
 
-use crate::{
-    pump::{Cause, Operation},
-    switch,
-};
+use crate::{pump::Operation, switch};
 
 /// Exact reason retained ingress could not accept one transport transition.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -18,11 +15,6 @@ pub enum Reject {
     Consume {
         operation: Operation,
         cause: consume::Error,
-    },
-    Range {
-        operation: Operation,
-        offset: usize,
-        capacity: usize,
     },
     Exhausted {
         operation: Operation,
@@ -37,34 +29,6 @@ pub enum Reject {
         actual: switch::Mode,
         attempted: Kind,
     },
-}
-
-impl Reject {
-    pub(crate) const fn new(op: Operation, cause: Cause) -> Self {
-        match cause {
-            Cause::Capacity(cause) => Self::Capacity {
-                operation: op,
-                cause,
-            },
-            Cause::Consume(cause) => Self::Consume {
-                operation: op,
-                cause,
-            },
-            Cause::Range { offset, capacity } => Self::Range {
-                operation: op,
-                offset,
-                capacity,
-            },
-            Cause::Exhausted(cause) => Self::Exhausted {
-                operation: op,
-                cause,
-            },
-            Cause::Retain(cause) => Self::Retain {
-                operation: op,
-                cause,
-            },
-        }
-    }
 }
 
 const _: () = {

@@ -28,7 +28,7 @@ use dope::{
     },
 };
 use dope_test::harness::signals::Gate;
-use o3::buffer::{Complete as _, bytes::TryRetain, resident::bound, storage};
+use o3::buffer::{bytes::TryRetain, resident::bound, storage};
 use sark_h1::{
     Input, pump,
     pump::Completion,
@@ -66,17 +66,6 @@ impl<'d> Dispatch<'d, (), convert::Infallible, switch::Enabled<Staged>> for Swit
         _: &mut session::Conn<'d, (), convert::Infallible, switch::Enabled<Staged>>,
     ) -> RouteOutcome<'d, convert::Infallible, Staged, Self::Head, parsing::Rejected<'d>> {
         match pending {}
-    }
-
-    fn consume_line(
-        self: Pin<&mut Self>,
-        permit: session::Permit,
-        source: parsing::Source,
-        write: o3::buffer::write::Slice<'_, &mut usize>,
-        conn: &mut session::Conn<'d, (), convert::Infallible, switch::Enabled<Staged>>,
-    ) -> RouteOutcome<'d, convert::Infallible, Staged, Self::Head, parsing::Rejected<'d>> {
-        let source = source.freeze();
-        self.try_consume(permit, Input::Buffered(source.view()), write, conn)
     }
 
     fn try_consume(
@@ -246,7 +235,7 @@ impl<'observe: 'd, 'd, ID: route::Identity> handler::Borrowed<'d, ID> for App<'o
             return receive::Outcome::Continue;
         }
         let http = conn.state_mut();
-        let bytes = match pump::Ingress::preflight(http, chunk.as_ref()) {
+        let bytes = match http.preflight(chunk.as_ref()) {
             pump::Preflight::Drive => chunk.as_ref(),
             pump::Preflight::Resume => &[][..],
             pump::Preflight::Settled | pump::Preflight::Finished => {
@@ -265,13 +254,7 @@ impl<'observe: 'd, 'd, ID: route::Identity> handler::Borrowed<'d, ID> for App<'o
         let receipt = {
             let (http, writer) = native.get_mut().parts();
             let mut disp = SwitchOne;
-            pump::Ingress::drive(
-                http,
-                Pin::new(&mut disp),
-                bytes,
-                writer,
-                head::Connection::KeepAlive,
-            )
+            http.drive(Pin::new(&mut disp), bytes, writer)
         };
         assert!(matches!(receipt.connection, head::Connection::KeepAlive));
         assert!(
@@ -281,7 +264,7 @@ impl<'observe: 'd, 'd, ID: route::Identity> handler::Borrowed<'d, ID> for App<'o
         this.checks[3].set(this.checks[3].get() + 1);
         let egress = receipt.state.expect("switch protocol state");
         let body = payload::write::try_prepare(egress, ());
-        let result = payload::write::try_publish(native, body, write::End::Open);
+        let result = payload::write::try_publish(native, body, receipt.connection);
         result
             .map_err(|cause| match cause {
                 write::body::Failure::Payload(cause) => format!("payload: {cause:?}"),

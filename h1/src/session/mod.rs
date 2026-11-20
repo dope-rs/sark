@@ -1,6 +1,6 @@
 //! HTTP/1 routing contracts and connection ownership.
 use core::{convert::Infallible, pin};
-use o3::buffer::write::Slice;
+use o3::buffer::{Complete as _, write::Slice};
 
 use o3::buffer::storage::range;
 use sark_http::{
@@ -13,9 +13,8 @@ use crate::{
     wire::{InputError, head, output, parsing},
 };
 
-pub(crate) mod batch;
 mod conn;
-mod drain;
+mod drive;
 mod ingress;
 
 pub use conn::Conn;
@@ -307,7 +306,10 @@ pub trait Dispatch<'d, Runtime, Pending = (), Transitions: switch::Engine = swit
         source: parsing::Source,
         write: Slice<'_, &mut usize>,
         conn: &mut Conn<'d, Runtime, Pending, Transitions, Self::Ready, Self::Head>,
-    ) -> RouteOutcome<'d, Pending, Transitions::Raw, Self::Head, parsing::Rejected<'d>>;
+    ) -> RouteOutcome<'d, Pending, Transitions::Raw, Self::Head, parsing::Rejected<'d>> {
+        let source = source.freeze();
+        self.try_consume(permit, crate::Input::Buffered(source.view()), write, conn)
+    }
 
     fn resume_head(
         self: pin::Pin<&mut Self>,

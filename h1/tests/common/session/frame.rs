@@ -1,6 +1,6 @@
 use std::{convert::Infallible, pin::Pin};
 
-use o3::buffer::{Complete as _, storage::range};
+use o3::buffer::storage::range;
 use sark_h1::{
     Input, session,
     session::{Buffered, Conn, Consumption, Dispatch, Outcome, Permit},
@@ -36,17 +36,6 @@ impl<'d> Dispatch<'d, (), Infallible> for Frame<'d> {
         _: &mut Conn<'d, (), Infallible>,
     ) -> session::RouteOutcome<'d, Infallible, Infallible, Self::Head, parsing::Rejected<'d>> {
         match pending {}
-    }
-
-    fn consume_line(
-        self: Pin<&mut Self>,
-        permit: Permit,
-        source: parsing::Source,
-        write: o3::buffer::write::Slice<'_, &mut usize>,
-        conn: &mut Conn<'d, (), Infallible>,
-    ) -> session::RouteOutcome<'d, Infallible, Infallible, Self::Head, parsing::Rejected<'d>> {
-        let source = source.freeze();
-        self.try_consume(permit, Input::Buffered(source.view()), write, conn)
     }
 
     fn try_consume(

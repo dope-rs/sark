@@ -1,9 +1,9 @@
 use std::{cell::Cell, convert::Infallible, pin::Pin};
 
-use o3::buffer::{Complete as _, storage::range};
+use o3::buffer::storage::range;
 use sark_h1::{
     Input, pump, session, switch,
-    wire::{Failure, InputError, head, parsing},
+    wire::{Failure, InputError, parsing},
 };
 use sark_http::{
     h1::codec::canned,
@@ -31,12 +31,10 @@ impl<'a> Reject<'a> {
         &mut self,
         conn: &mut session::Conn<'d, (), Infallible, T>,
     ) -> pump::Cycle<'d, T::Staged> {
-        pump::Ingress::drive(
-            conn,
+        conn.drive(
             Pin::new(self),
             b"rejected request",
             o3::buffer::write::Slice::new(&mut [0; 2048]).reborrow(),
-            head::Connection::KeepAlive,
         )
     }
 }
@@ -62,17 +60,6 @@ impl<'d, T: switch::Engine> session::Dispatch<'d, (), Infallible, T> for Reject<
         _: &mut session::Conn<'d, (), Infallible, T>,
     ) -> session::RouteOutcome<'d, Infallible, T::Raw, Self::Head, parsing::Rejected<'d>> {
         match pending {}
-    }
-
-    fn consume_line(
-        self: Pin<&mut Self>,
-        permit: session::Permit,
-        source: parsing::Source,
-        write: o3::buffer::write::Slice<'_, &mut usize>,
-        conn: &mut session::Conn<'d, (), Infallible, T>,
-    ) -> session::RouteOutcome<'d, Infallible, T::Raw, Self::Head, parsing::Rejected<'d>> {
-        let source = source.freeze();
-        self.try_consume(permit, Input::Buffered(source.view()), write, conn)
     }
 
     fn try_consume(

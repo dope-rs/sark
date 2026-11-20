@@ -25,12 +25,10 @@ fn joins_the_prior_prefix_at_the_existing_line_owner() {
         handler.input = valid.then_some(b"POST /x HTTP/1.1\r\n".as_slice());
         let (cycle, allocations) = Tracker::count(|| {
             let mut conn = Conn::<(), Infallible>::prefixed(prefix);
-            pump::Ingress::drive(
-                &mut conn,
+            conn.drive(
                 Pin::new(&mut handler),
                 b"OST /x HTTP/1.1\r\nHost: x\r\n\r\nbody",
                 o3::buffer::write::Slice::new(&mut [0; 2048]).reborrow(),
-                head::Connection::KeepAlive,
             )
         });
         assert_eq!(calls.get(), usize::from(valid));
@@ -46,16 +44,14 @@ fn retains_prefix_until_output_capacity_returns() {
         panic!("partial preface");
     };
     let mut conn = Conn::<(), Infallible>::prefixed(prefix);
-    pump::Ingress::retain(&mut conn, b"OST /x HTTP/1.1\r\nHost: x\r\n\r\n");
+    conn.retain(b"OST /x HTTP/1.1\r\nHost: x\r\n\r\n");
     let calls = Cell::new(0);
     let mut handler = Reject::new(&calls, None);
     handler.input = Some(b"POST /x HTTP/1.1\r\n");
-    let cycle = pump::Ingress::drive(
-        &mut conn,
+    let cycle = conn.drive(
         Pin::new(&mut handler),
         &[],
         o3::buffer::write::Slice::new(&mut [0; 2048]).reborrow(),
-        head::Connection::KeepAlive,
     );
     assert_eq!(calls.get(), 1);
     assert!(matches!(cycle.state, Ok(pump::Egress::Static { body, .. })
@@ -77,21 +73,17 @@ fn resumes_only_through_the_first_line_ending() {
             let mut handler = Reject::new(&calls, None);
             handler.input = Some(expected);
             let mut conn = Conn::<(), Infallible>::prefixed(prefix);
-            let first = pump::Ingress::drive(
-                &mut conn,
+            let first = conn.drive(
                 Pin::new(&mut handler),
                 &tail[..split],
                 o3::buffer::write::Slice::new(&mut [0; 2048]).reborrow(),
-                head::Connection::KeepAlive,
             );
             assert!(matches!(first.state, Ok(pump::Egress::None)));
             assert_eq!(calls.get(), 0);
-            let cycle = pump::Ingress::drive(
-                &mut conn,
+            let cycle = conn.drive(
                 Pin::new(&mut handler),
                 &tail[split..],
                 o3::buffer::write::Slice::new(&mut [0; 2048]).reborrow(),
-                head::Connection::KeepAlive,
             );
             assert_eq!(calls.get(), usize::from(ending == b'\n'));
             assert!(matches!(cycle.connection, head::Connection::Close));

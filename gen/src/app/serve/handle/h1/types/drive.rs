@@ -64,13 +64,9 @@ pub(super) fn methods(
             #core::life::sequence::Mode::tag(life, exchange, charge)
         };
         let body = #h1::server::payload::write::try_prepare(egress, tag);
-        let end = match intent {
-            #h1::wire::head::Connection::KeepAlive => write::End::Open,
-            #h1::wire::head::Connection::Close => write::End::Close,
-        };
     };
     let send = quote! {
-        let sent = #h1::server::payload::write::try_publish(native, body, end);
+        let sent = #h1::server::payload::write::try_publish(native, body, intent);
     };
     let complete = quote! {
         #send
@@ -89,7 +85,7 @@ pub(super) fn methods(
         let route = task.route();
         let credit = task.quota().map(|index| quote!(quotas[#index] += 1;));
         let emit = quote! {
-            let deferred = #h1::pump::Ingress::deferred(state);
+            let deferred = state.deferred();
             let (outcome, stream) = {
                 let mut staged = writer.stage();
                 let result = #h1::route::task::Egress::new(staged.body(), &date, deferred, request)
@@ -423,7 +419,7 @@ pub(super) fn methods(
         }
 
         fn __release<#event_life>(conn: &mut #slot) {
-            if matches!(#h1::pump::Ingress::deferred(conn.state_mut()), #h1::wire::head::Connection::Close) { conn.close_after(); }
+            if matches!(conn.state().deferred(), #h1::wire::head::Connection::Close) { conn.close_after(); }
         }
     }
 }

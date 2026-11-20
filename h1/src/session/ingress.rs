@@ -4,7 +4,7 @@ use std::{convert::Infallible, mem};
 use sark_core::{body::admit::Retention, life::audit};
 
 use crate::{
-    pump,
+    pump, session,
     wire::{
         Failure,
         body::{chunked, fixed, ingress},
@@ -37,40 +37,6 @@ impl<'d, P, R, H> Protocol<'d, P, R, H> {
             Self::Body(_) | Self::Working(_) => recv::Window::Body,
         }
     }
-
-    /// Takes the next frame decision together with the pending body it selected.
-    ///
-    /// Reading only the frame kind and taking the body later would be two
-    /// derivations of one decision; the value returned here is that decision.
-    pub(super) fn take_frame(&mut self, input: crate::Input<'_>) -> Frame<'d, P, R, H> {
-        match mem::replace(self, Self::Head) {
-            Self::Head => Frame::Head(HeadFrame::New),
-            Self::PendingHead(head) => Frame::Head(HeadFrame::Pending(head)),
-            Self::Line(line) => Frame::Head(HeadFrame::Line(line.advance(input))),
-            Self::Prefix(prefix) => {
-                Frame::Head(HeadFrame::Line(parsing::Line::prefixed(prefix, input)))
-            }
-            Self::Reject(reject) => Frame::Head(HeadFrame::Rejected(reject)),
-            Self::Body(pending) => Frame::Body(pending),
-            Self::Working(pending) => Frame::Working(pending),
-            Self::Ready(pending) => Frame::Ready(pending),
-        }
-    }
-}
-
-/// One frame decision that owns the pending body it selected.
-pub(super) enum Frame<'d, P, R, H> {
-    Head(HeadFrame<'d, H>),
-    Body(P),
-    Working(P),
-    Ready(R),
-}
-
-pub(super) enum HeadFrame<'d, H> {
-    New,
-    Pending(H),
-    Line(Result<parsing::LineProgress, parsing::LineError<'d>>),
-    Rejected(parsing::Rejected<'d>),
 }
 
 enum FramingState {
@@ -279,8 +245,25 @@ impl<'d, Pending, Ready, Heads> Ingress<'d, Pending, Ready, Heads> {
         self.recv.backlog(pump::Operation::Append, bytes)
     }
 
-    pub(crate) fn recv_window(&self) -> recv::Window {
-        self.protocol.window()
+    pub(super) fn consume(
+        &mut self,
+        frame: session::Consumption,
+        window: &mut crate::Input<'_>,
+    ) -> Result<bool, Failure> {
+        let used = match frame {
+            session::Consumption::Buffered(buffered) => buffered.used(),
+            session::Consumption::Discard(discard) => discard.head(),
+        };
+        window.advance(used).map_err(Failure::Input)?;
+        let complete = match frame {
+            session::Consumption::Buffered(_) => true,
+            session::Consumption::Discard(discard) => {
+                self.discard_remaining = discard.body() - window.consume_max(discard.body());
+                self.discard_remaining == 0
+            }
+        };
+        self.finish_frame();
+        Ok(complete)
     }
 
     pub fn finish_frame(&mut self) {

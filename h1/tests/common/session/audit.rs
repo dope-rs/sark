@@ -1,6 +1,5 @@
 use std::{convert::Infallible, pin::Pin};
 
-use o3::buffer::Complete as _;
 use sark_h1::{Input, session, session::Dispatch, switch, wire::parsing};
 use sark_http::payload::{fixed, owned};
 
@@ -21,17 +20,6 @@ impl<'d> Dispatch<'d, (), Infallible> for Pending {
             permit,
             pending: (),
         }
-    }
-
-    fn consume_line(
-        self: Pin<&mut Self>,
-        permit: session::Permit,
-        source: parsing::Source,
-        write: o3::buffer::write::Slice<'_, &mut usize>,
-        conn: &mut session::Conn<'d, (), Infallible, switch::Disabled, Infallible, ()>,
-    ) -> session::RouteOutcome<'d, Infallible, Infallible, (), parsing::Rejected<'d>> {
-        let source = source.freeze();
-        self.try_consume(permit, Input::Buffered(source.view()), write, conn)
     }
 
     fn resume_head(

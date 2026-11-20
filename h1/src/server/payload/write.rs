@@ -19,7 +19,7 @@ use o3::{
 };
 use write::body;
 
-use crate::{pump, server::payload};
+use crate::{pump, server::payload, wire::head};
 
 type Bound<'d, K, G> =
     data::Bound<compose::Either<payload::Body<'d, K>, payload::Stream<'d, K>>, G>;
@@ -76,7 +76,7 @@ pub fn try_publish<'d, K: 'd, G: bound::Bound + 'd, ID: Identity, W, C>(
         >,
     >,
     body: Prepared<'d, K, G>,
-    end: write::End,
+    connection: head::Connection,
 ) -> Result<(), body::Failure>
 where
     W: wire::Spec + 'd,
@@ -87,6 +87,10 @@ where
             drop(native);
             return Err(cause.into());
         }
+    };
+    let end = match connection {
+        head::Connection::KeepAlive => write::End::Open,
+        head::Connection::Close => write::End::Close,
     };
     match body {
         Some(body) => write::Output::try_publish(native, body, end),

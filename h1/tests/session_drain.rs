@@ -89,12 +89,10 @@ fn preserves_cause_once() {
     let error = range::Error::new(3..7, 4);
     let mut handler = Reject::new(&calls, Some(Failure::Input(InputError::Range(error))));
     let mut conn: Conn<'_, (), Infallible> = Conn::default();
-    let cycle = pump::Ingress::drive(
-        &mut conn,
+    let cycle = conn.drive(
         Pin::new(&mut handler),
         b"request",
         o3::buffer::write::Slice::new(&mut [0; 2048]).reborrow(),
-        head::Connection::KeepAlive,
     );
     assert_eq!(handler.reported, [Some(error)]);
     assert!(matches!(cycle.state,
@@ -112,21 +110,14 @@ fn pump_ingress_allocations() {
         let mut writer = Slice::new(&mut write);
         let input = b"xy";
         let input = if buffered {
-            let (_, usage) = Tracker::activity(|| pump::Ingress::retain(&mut conn, input));
+            let (_, usage) = Tracker::activity(|| conn.retain(input));
             assert!(usage.allocated_bytes <= input.len() + 64);
             &[][..]
         } else {
             input.as_slice()
         };
-        let (cycle, alloc) = Tracker::count(|| {
-            pump::Ingress::drive(
-                &mut conn,
-                Pin::new(&mut disp),
-                input,
-                writer.reborrow(),
-                head::Connection::KeepAlive,
-            )
-        });
+        let (cycle, alloc) =
+            Tracker::count(|| conn.drive(Pin::new(&mut disp), input, writer.reborrow()));
 
         assert_eq!(alloc, 0);
         assert!(matches!(cycle.state, Ok(pump::Egress::Inline)));
@@ -162,26 +153,42 @@ fn rejects_terminal_cursor() {
         };
         let mut bytes = [0; 2048];
         let mut writer = Slice::new(&mut bytes);
-        let (cycle, allocs) = Tracker::count(|| {
-            pump::Ingress::drive(
-                &mut conn,
-                Pin::new(&mut disp),
-                b"xy",
-                writer.reborrow(),
-                head::Connection::KeepAlive,
-            )
-        });
+        let (cycle, allocs) =
+            Tracker::count(|| conn.drive(Pin::new(&mut disp), b"xy", writer.reborrow()));
         assert_eq!(allocs, 0);
         assert_eq!(disp.calls, 2);
         assert_eq!(writer.into_mut(), b"x");
         assert_eq!(disp.reported, [Some(range::Error::new(0..usize::MAX, 1))]);
         assert!(matches!(cycle.connection, head::Connection::KeepAlive));
         assert!(matches!(cycle.state, Ok(pump::Egress::Inline)));
-        assert!(
-            matches!(pump::Drain::progress(&mut conn), pump::Next::Close(body)
-                if body.as_slice() == canned::BAD_REQUEST.as_slice()
-            )
-        );
-        assert!(matches!(pump::Drain::progress(&mut conn), pump::Next::None));
+        let reason = conn.action().expect("pending close").as_slice();
+        assert_eq!(reason, canned::BAD_REQUEST.as_slice());
+        for _ in 0..2 {
+            assert!(matches!(pump::Drain::progress(&mut conn), pump::Next::Close(body)
+                if std::ptr::eq(body.as_slice(), reason)));
+        }
     }
+}
+
+#[test]
+fn rejected_suffix_rolls_back_the_turn() {
+    use o3::buffer::write::Sink as _;
+
+    let mut conn = Conn::default();
+    let mut disp = Frame::default();
+    let mut bytes = [0; 2];
+    let mut writer = Slice::new(&mut bytes);
+    writer.write_byte(b'z').expect("existing output");
+    let cycle = Tracker::fail_after(0, || {
+        conn.drive(Pin::new(&mut disp), b"xy", writer.reborrow())
+    });
+    assert_eq!(disp.calls, 1);
+    assert!(matches!(
+        cycle.state,
+        Err(pump::Reject::Exhausted {
+            operation: pump::Operation::Append,
+            ..
+        })
+    ));
+    assert_eq!(writer.into_mut(), b"z");
 }
