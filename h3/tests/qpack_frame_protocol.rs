@@ -3,9 +3,9 @@ use core::num::NonZero;
 use sark_http::field::literal;
 
 use crate::common::{
-    conn::{Events, build::Settings as _, payload::Write as _},
+    conn::{build::Settings as _, next_event, payload::Write as _},
     field::entry,
-    message::promise::Authority,
+    message::{promise::Authority, validate},
     qpack,
     qpack::{NeverValue, Wire as _},
 };
@@ -108,9 +108,7 @@ fn peer_count_wrap() {
         )
         .expect("settings input");
     assert!(matches!(
-        Events::new(&mut sender)
-            .poll_token()
-            .expect("settings event"),
+        next_event(&mut sender).expect("settings event"),
         Some(Event::Settings(_))
     ));
     let id = Id::new(3).expect("encoder id");
@@ -255,9 +253,7 @@ fn never_index_forward() {
             Boundary::More,
         )
         .expect("encoder input");
-    Events::new(&mut conn)
-        .poll_token()
-        .expect("insertion processed");
+    next_event(&mut conn).expect("insertion processed");
     Receive::new(&mut conn)
         .owned(
             Id::ZERO,
@@ -265,10 +261,7 @@ fn never_index_forward() {
             Boundary::More,
         )
         .expect("response input");
-    let fields = match Events::new(&mut conn)
-        .poll_token()
-        .expect("planned never-index literal")
-    {
+    let fields = match next_event(&mut conn).expect("planned never-index literal") {
         Some(Event::Headers { head, .. }) => Some(head.into_parts().0),
         _ => None,
     }
@@ -326,7 +319,7 @@ fn initial_capacity_zero() {
             b"\x02\x41x\x01y".to_vec(),
             Boundary::More,
         )
-        .and_then(|()| Events::new(&mut conn).poll_token().map(|_| ()))
+        .and_then(|()| next_event(&mut conn).map(|_| ()))
         .expect_err("capacity instruction required");
     assert_eq!(error.error_code(), ErrorCode::QpackEncoderStream);
 }
@@ -354,7 +347,7 @@ fn bounded_payload_error() {
             b"\x01\x00".to_vec(),
             Boundary::More,
         )
-        .and_then(|()| Events::new(&mut conn).poll_token().map(|_| ()))
+        .and_then(|()| next_event(&mut conn).map(|_| ()))
         .expect_err("bounded settings integer");
     assert!(matches!(error, Error::Parse(ParseError::PayloadInteger(cause)) if cause == short));
     assert_eq!(error.error_code(), ErrorCode::Payload);
@@ -370,7 +363,7 @@ fn reserved_frames() {
         let mut conn = Connection::with_role(Role::Server).expect("connection");
         let error = Receive::new(&mut conn)
             .owned(Id::ZERO, vec![kind, 0], Boundary::More)
-            .and_then(|()| Events::new(&mut conn).poll_token().map(|_| ()))
+            .and_then(|()| next_event(&mut conn).map(|_| ()))
             .expect_err("reserved frame type");
         assert_eq!(error.error_code(), ErrorCode::FrameUnexpected);
     }
@@ -390,11 +383,10 @@ fn discarded_value_grammar() {
             .expect("plan")
             .build(Role::Server)
             .expect("connection");
-        let error = Receive::new(&mut conn)
+        Receive::new(&mut conn)
             .owned(Id::ZERO, wire, Boundary::More)
-            .and_then(|()| Events::new(&mut conn).poll_token().map(|_| ()))
-            .expect_err("discard does not bypass value validation");
-        assert_eq!(error.error_code(), ErrorCode::Message);
+            .expect("literal field section");
+        validate::expect_malformed(&mut conn, Id::ZERO);
     }
 }
 
@@ -417,15 +409,14 @@ fn indexed_value_grammar() {
     Receive::new(&mut conn)
         .owned(Id::new(2).expect("encoder id"), code, Boundary::More)
         .expect("table input");
-    Events::new(&mut conn).poll_token().expect("table updated");
+    next_event(&mut conn).expect("table updated");
 
     let mut wire = Vec::new();
     Payload::encode(frame::TYPE_HEADERS, &block, &mut wire).expect("headers");
-    let error = Receive::new(&mut conn)
+    Receive::new(&mut conn)
         .owned(Id::ZERO, wire, Boundary::More)
-        .and_then(|()| Events::new(&mut conn).poll_token().map(|_| ()))
-        .expect_err("indexed value validity reaches discarded policy");
-    assert_eq!(error.error_code(), ErrorCode::Message);
+        .expect("indexed field section");
+    validate::expect_malformed(&mut conn, Id::ZERO);
 }
 
 #[test]

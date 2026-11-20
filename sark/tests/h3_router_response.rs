@@ -1,4 +1,4 @@
-use sark_h3::{conn::Error, qpack::encoder::Encoder};
+use sark_h3::qpack::encoder::Encoder;
 
 pub mod common;
 
@@ -12,7 +12,7 @@ use sark_core::{
 use sark_h3::{
     conn::{
         Connection,
-        event::{Completion, Event, Role},
+        event::{Completion, Event, Rejection, Role},
         io::{Receive, Send, Step},
     },
     link::{Flush, Transport},
@@ -365,42 +365,51 @@ fn decodes_huffman_plan() {
 }
 
 #[test]
-fn rejects_bad_authority() {
+fn rejects_incomplete_and_conflicting_request_fields() {
     let app = H3Router::new();
     let mut qpack = Encoder::new();
-    let wire = qpack
-        .try_frame(Id::ZERO, [
-            const { Entry::pseudo(Pseudo::Method, field::literal!(Value::try_bytes(b"GET"))) },
-            const { Entry::pseudo(Pseudo::Scheme, field::literal!(Value::try_bytes(b"https"))) },
-            const {
-                Entry::pseudo(
-                    Pseudo::Authority,
-                    field::literal!(Value::try_bytes(b"origin.example")),
-                )
-            },
-            const { Entry::pseudo(Pseudo::Path, field::literal!(Value::try_bytes(b"/json"))) },
-            const {
-                Entry::new(
-                    field::literal!(field::Lower::try_bytes(b"host")),
-                    field::literal!(Value::try_bytes(b"other.example")),
-                )
-            },
-            const {
-                Entry::new(
-                    field::literal!(field::Lower::try_bytes(b"x-name")),
-                    field::literal!(Value::try_bytes(b"alice")),
-                )
-            },
-        ])
-        .expect("H3 frame");
+    let fields = [
+        const { Entry::pseudo(Pseudo::Method, field::literal!(Value::try_bytes(b"GET"))) },
+        const { Entry::pseudo(Pseudo::Scheme, field::literal!(Value::try_bytes(b"https"))) },
+        const {
+            Entry::pseudo(
+                Pseudo::Authority,
+                field::literal!(Value::try_bytes(b"origin.example")),
+            )
+        },
+        const { Entry::pseudo(Pseudo::Path, field::literal!(Value::try_bytes(b"/json"))) },
+        const {
+            Entry::new(
+                field::literal!(field::Lower::try_bytes(b"host")),
+                field::literal!(Value::try_bytes(b"other.example")),
+            )
+        },
+        const {
+            Entry::new(
+                field::literal!(field::Lower::try_bytes(b"x-name")),
+                field::literal!(Value::try_bytes(b"alice")),
+            )
+        },
+    ];
     let mut server = app.try_conn().expect("H3 connection");
-    std::assert_matches!(
-        Receive::new(&mut server).owned(Id::ZERO, wire, Boundary::End),
-        Err(Error::Malformed {
-            stream_id: 0,
-            kind: rules::Kind::Request,
-        }),
-    );
+    for (id, fields) in [
+        (Id::ZERO, &fields[..3]),
+        (Id::new(4).expect("request id"), &fields[..]),
+    ] {
+        let wire = qpack.try_frame(id, fields).expect("H3 frame");
+        Receive::new(&mut server)
+            .owned(id, wire, Boundary::End)
+            .expect("request framing");
+        assert!(matches!(
+            server.events().poll_token().expect("stream rejection"),
+            Step::Item(Event::Rejected {
+                stream_id,
+                error: Rejection::Malformed {
+                    kind: rules::Kind::Request,
+                },
+            }) if stream_id == id.into()
+        ));
+    }
     assert!(matches!(
         server
             .events()

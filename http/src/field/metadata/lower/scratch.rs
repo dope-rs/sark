@@ -23,33 +23,26 @@ impl Scratch {
         (self.bytes, self.scan.finish())
     }
 
-    pub(super) fn string(
-        mut self,
-        mut cursor: strings::Cursor,
+    pub(super) fn try_string(
+        &mut self,
+        cursor: &mut strings::Cursor,
         input: &[u8],
-    ) -> (Self, lower::Step) {
-        let bound = match cursor.output_bound(input.len()) {
-            Ok(bound) => bound,
-            Err(cause) => return (self, lower::Step::Bound { cause }),
-        };
-        if let Err(cause) = storage::try_reserve(&mut self.bytes, bound) {
-            return (
-                self,
-                lower::Step::Store {
-                    cause: lower::Error::Scratch(cause),
-                },
-            );
-        }
+    ) -> Result<(), lower::StringError> {
+        let bound = cursor
+            .output_bound(input.len())
+            .map_err(lower::StringError::Bound)?;
+        storage::try_reserve(&mut self.bytes, bound)
+            .map_err(|cause| lower::StringError::Store(lower::Error::Scratch(cause)))?;
         let current = self.bytes.len();
         let rest = cursor.remaining();
         let sink = Writer {
             bytes: write::Reserved::from(&mut self.bytes).into_staged(),
             scan: &mut self.scan,
         };
-        let step = match cursor.feed_into(input, sink) {
+        match cursor.feed_into(input, sink) {
             Ok((_, sink)) => {
                 sink.bytes.commit();
-                lower::Step::Ready { cursor }
+                Ok(())
             }
             Err(failure) => {
                 let decoder::Failure {
@@ -60,22 +53,23 @@ impl Scratch {
                 let stored = [current, current + sink.bytes.len()];
                 sink.bytes.commit();
                 match cause {
-                    decoder::DecodeError::InvalidEncoding(cause) => lower::Step::Decode {
-                        cause: decoder::DecodeError::InvalidEncoding(cause),
-                        progress,
-                    },
-                    decoder::DecodeError::Sink(cause) => lower::Step::Store {
-                        cause: lower::Error::SinkProgress {
+                    decoder::DecodeError::InvalidEncoding(cause) => {
+                        Err(lower::StringError::Decode {
+                            cause: decoder::DecodeError::InvalidEncoding(cause),
+                            progress,
+                        })
+                    }
+                    decoder::DecodeError::Sink(cause) => {
+                        Err(lower::StringError::Store(lower::Error::SinkProgress {
                             cause,
                             stored,
                             remaining: rest,
                             input: [input.len(), progress.consumed(), progress.decoded()],
-                        },
-                    },
+                        }))
+                    }
                 }
             }
-        };
-        (self, step)
+        }
     }
 }
 

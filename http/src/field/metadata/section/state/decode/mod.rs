@@ -298,8 +298,7 @@ impl<P: rules::Plan> Sink<P> for state::Decoder<P> {
         value: record::Span<'_>,
         indexing: field::Indexing,
     ) -> Result<(), lower::Error> {
-        input.try_ready()?;
-        let push = lower::Lower::new(&mut input.lease, scratch, self)
+        let push = lower::Lower::new(input.try_ready_lease()?, scratch, self)
             .try_push_as(rule, name, value, indexing)?;
         push.commit::<A>();
         Ok(())
@@ -375,8 +374,7 @@ where
         value: record::Span<'_>,
         indexing: field::Indexing,
     ) -> Result<(), lower::Error> {
-        input.try_ready()?;
-        let field = plain::Plain::try_new(&mut input.lease, name, value, indexing)?;
+        let field = plain::Plain::try_new(input.try_ready_lease()?, name, value, indexing)?;
         field.push_raw::<A>(scratch, self, known);
         Ok(())
     }
@@ -467,17 +465,16 @@ impl Sink<rules::Discard> for fixed::Discard {
         indexing: field::Indexing,
     ) -> Result<(), lower::Error> {
         use lower::fixed::Authority;
-        input.try_ready()?;
+        let lease = input.try_ready_lease()?;
         match rule {
             fixed::Omit::Authority => {
-                let field =
-                    Authority::try_new(&mut input.lease, scratch, self, name, value, indexing)?;
+                let field = Authority::try_new(lease, scratch, self, name, value, indexing)?;
                 field.push::<A>();
             }
             fixed::Omit::Discard(known) => self.discard::<A>(
                 known,
                 record::View::new(name, value).with_index(indexing),
-                input.lease.as_slice(),
+                lease.as_slice(),
                 scratch.authority(),
             ),
             fixed::Omit::Skip => {}

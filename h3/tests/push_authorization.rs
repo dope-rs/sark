@@ -1,7 +1,7 @@
 use std::cell::Cell;
 
 use crate::common::{
-    conn::Events,
+    conn::next_event,
     field::{Switching, entry},
     stream::Stream as _,
 };
@@ -154,7 +154,7 @@ fn goaway_stops_new_pushes() {
         )
         .expect("peer push cutoff");
     assert!(matches!(
-        Events::new(&mut conn).poll_token().expect("goaway event"),
+        next_event(&mut conn).expect("goaway event"),
         Some(Event::GoAway { id: 2 })
     ));
     for push_id in [1, 2] {

@@ -1,13 +1,9 @@
 use sark_http::{
-    field::metadata::{
-        block::Value,
-        strings::{Cursor, Encoding},
-    },
+    field::metadata::strings::Encoding,
     payload::compress::dynamic::insert::stages,
 };
 
 use crate::hpack::decode::{
-    self,
     decoder::{Core, literal, lookup},
     limit, mode,
     phase::State,
@@ -81,11 +77,7 @@ pub(in crate::hpack::decode) fn name_prefix<M, S>(
 where
     M: mode::Flow<S>,
 {
-    let value = first & 0x7f;
-    let encoding = match first & 0x80 {
-        0 => Encoding::Plain,
-        _ => Encoding::Huffman,
-    };
+    let (value, encoding) = strings::prefix(first);
     if value < 0x7f {
         name_length(core, table, context, u64::from(value), encoding, sink)
     } else {
@@ -93,10 +85,7 @@ where
             State::ReadyNameLength(
                 table,
                 context,
-                limit::LengthState {
-                    number: limit::Number::new(0x7f),
-                    encoding,
-                },
+                limit::LengthState::new(encoding),
             ),
             sink,
         ))
@@ -114,10 +103,7 @@ pub(in crate::hpack::decode) fn name_length<M, S>(
 where
     M: mode::Flow<S>,
 {
-    if value > strings::MAX_LITERAL_LEN as u64 {
-        return Err((sink, decode::Error::BadString.into()));
-    }
-    let len = value as usize;
+    let (len, sink) = mode::carry(sink, strings::length(value))?;
     let retain = match (context.route(), encoding) {
         (mode::NameRoute::Retain, Encoding::Huffman) => strings::Retention::Retained,
         (mode::NameRoute::Retain, Encoding::Plain) => match context.limit().admit(len) {
@@ -127,11 +113,7 @@ where
         (mode::NameRoute::Count, _) => strings::Retention::Counted,
     };
     core.name_scratch.clear();
-    let string = limit::StringState {
-        string: Cursor::new(len, encoding),
-        validation: Value::new(),
-        retention: retain,
-    };
+    let string = limit::StringState::new(len, encoding, retain);
     if len != 0 {
         return Ok((State::ReadyNameString(table, context, string), sink));
     }
@@ -150,11 +132,7 @@ pub(in crate::hpack::decode) fn value_prefix<M, S>(
 where
     M: mode::Flow<S>,
 {
-    let value = first & 0x7f;
-    let encoding = match first & 0x80 {
-        0 => Encoding::Plain,
-        _ => Encoding::Huffman,
-    };
+    let (value, encoding) = strings::prefix(first);
     if value < 0x7f {
         value_length(
             core,
@@ -170,10 +148,7 @@ where
             State::ReadyValueLength(
                 table,
                 context,
-                limit::LengthState {
-                    number: limit::Number::new(0x7f),
-                    encoding,
-                },
+                limit::LengthState::new(encoding),
             ),
             sink,
         ))
@@ -192,10 +167,7 @@ pub(in crate::hpack::decode) fn value_length<M, S>(
 where
     M: mode::Flow<S>,
 {
-    if value > strings::MAX_LITERAL_LEN as u64 {
-        return Err((sink, decode::Error::BadString.into()));
-    }
-    let len = value as usize;
+    let (len, sink) = mode::carry(sink, strings::length(value))?;
     let retain = match (context.route(), encoding) {
         (mode::Route::Retain, Encoding::Huffman) => strings::Retention::Retained,
         (mode::Route::Retain, Encoding::Plain) => match context.limit().admit(len) {
@@ -207,11 +179,7 @@ where
         }
     };
     core.value_scratch.clear();
-    let string = limit::StringState {
-        string: Cursor::new(len, encoding),
-        validation: Value::new(),
-        retention: retain,
-    };
+    let string = limit::StringState::new(len, encoding, retain);
     if len != 0 {
         return Ok((State::ReadyValueString(table, context, string), sink));
     }
@@ -229,11 +197,7 @@ pub(in crate::hpack::decode) fn staged_name_prefix<M, S>(
 where
     M: mode::Flow<S>,
 {
-    let value = first & 0x7f;
-    let encoding = match first & 0x80 {
-        0 => Encoding::Plain,
-        _ => Encoding::Huffman,
-    };
+    let (value, encoding) = strings::prefix(first);
     if value < 0x7f {
         staged_name_length(core, table, context, u64::from(value), encoding, sink)
     } else {
@@ -241,10 +205,7 @@ where
             State::StagedNameLength(
                 table,
                 context,
-                limit::LengthState {
-                    number: limit::Number::new(0x7f),
-                    encoding,
-                },
+                limit::LengthState::new(encoding),
             ),
             sink,
         ))
@@ -262,16 +223,9 @@ pub(in crate::hpack::decode) fn staged_name_length<M, S>(
 where
     M: mode::Flow<S>,
 {
-    if value > strings::MAX_LITERAL_LEN as u64 {
-        return Err((sink, decode::Error::BadString.into()));
-    }
+    let (len, sink) = mode::carry(sink, strings::length(value))?;
     core.name_scratch.clear();
-    let len = value as usize;
-    let string = limit::StringState {
-        string: Cursor::new(len, encoding),
-        validation: Value::new(),
-        retention: strings::Retention::Retained,
-    };
+    let string = limit::StringState::new(len, encoding, strings::Retention::Retained);
     if len != 0 {
         return Ok((State::StagedNameString(table, context, string), sink));
     }
@@ -290,11 +244,7 @@ pub(in crate::hpack::decode) fn staged_value_prefix<M, S>(
 where
     M: mode::Flow<S>,
 {
-    let value = first & 0x7f;
-    let encoding = match first & 0x80 {
-        0 => Encoding::Plain,
-        _ => Encoding::Huffman,
-    };
+    let (value, encoding) = strings::prefix(first);
     if value < 0x7f {
         staged_value_length(
             core,
@@ -310,10 +260,7 @@ where
             State::StagedValueLength(
                 table,
                 context,
-                limit::LengthState {
-                    number: limit::Number::new(0x7f),
-                    encoding,
-                },
+                limit::LengthState::new(encoding),
             ),
             sink,
         ))
@@ -332,16 +279,9 @@ pub(in crate::hpack::decode) fn staged_value_length<M, S>(
 where
     M: mode::Flow<S>,
 {
-    if value > strings::MAX_LITERAL_LEN as u64 {
-        return Err((sink, decode::Error::BadString.into()));
-    }
+    let (len, sink) = mode::carry(sink, strings::length(value))?;
     core.value_scratch.clear();
-    let len = value as usize;
-    let string = limit::StringState {
-        string: Cursor::new(len, encoding),
-        validation: Value::new(),
-        retention: strings::Retention::Retained,
-    };
+    let string = limit::StringState::new(len, encoding, strings::Retention::Retained);
     if len != 0 {
         return Ok((State::StagedValueString(table, context, string), sink));
     }

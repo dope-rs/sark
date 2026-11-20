@@ -8,11 +8,7 @@ use std::{
 };
 
 use dope::{
-    core::{
-        driver::route::{FrameworkTag, KeyTag, Tag, kind, table::conn},
-        io::socket::Backlog,
-    },
-    manifold::timing,
+    core::driver::route::{FrameworkTag, Tag, kind},
     runtime::{executor::session, topology, topology::lending::Stage},
 };
 use dope_test::{
@@ -28,7 +24,6 @@ use sark_grpc::server::{
     mode,
     service::handler::output::Duplex,
 };
-use sark_h2::server::runtime::modes;
 
 use crate::common::{
     codec::Bytes,
@@ -42,14 +37,11 @@ use crate::common::{
 #[test]
 fn bidi_ingress() {
     let harness = Pair::bind().expect("gRPC bidi harness");
-    let bind = harness.addr();
-    let config = Settings {
-        bind,
-        connections: conn::Capacity::fixed::<4>(),
-        backlog: Backlog::fixed::<16>(),
-        limits: Limits::default()
+    let config = Settings::new(
+        harness.addr(),
+        Limits::default()
             .with_output(Output::try_new(1, 9).expect("one-message bidi output budget")),
-    };
+    );
 
     harness
         .run(
@@ -60,15 +52,7 @@ fn bidi_ingress() {
                 let bank = Bank::try_new(config.connections.count(), config.limits)
                     .expect("gRPC readiness bank");
                 let prepared = config
-                    .h2::<KeyTag<0>>()
-                    .expect("H2 plan")
-                    .with_bound(listener)
-                    .with_plain::<_, modes::Serve<Infallible>>(Plan::new(
-                        handler,
-                        &bank,
-                        mode::Direct,
-                    ))
-                    .for_install::<timing::Throughput>()
+                    .try_prepare(listener, Plan::new(handler, &bank, mode::Direct))
                     .expect("server resources");
                 let mut reports =
                     Reports::new(prepared.layout(), [<FrameworkTag<kind::Any> as Tag>::ROUTE]);
@@ -119,13 +103,7 @@ fn bidi_ingress() {
 #[test]
 fn late_ingress() {
     let harness = Pair::bind().expect("gRPC early-completion harness");
-    let bind = harness.addr();
-    let config = Settings {
-        bind,
-        connections: conn::Capacity::fixed::<4>(),
-        backlog: Backlog::fixed::<16>(),
-        limits: Limits::default(),
-    };
+    let config = Settings::new(harness.addr(), Limits::default());
 
     harness
         .run(
@@ -142,15 +120,7 @@ fn late_ingress() {
                 let bank = Bank::try_new(config.connections.count(), config.limits)
                     .expect("gRPC readiness bank");
                 let prepared = config
-                    .h2::<KeyTag<0>>()
-                    .expect("H2 plan")
-                    .with_bound(listener)
-                    .with_plain::<_, modes::Serve<Infallible>>(Plan::new(
-                        handler,
-                        &bank,
-                        mode::Direct,
-                    ))
-                    .for_install::<timing::Throughput>()
+                    .try_prepare(listener, Plan::new(handler, &bank, mode::Direct))
                     .expect("server resources");
                 let mut reports =
                     Reports::new(prepared.layout(), [<FrameworkTag<kind::Any> as Tag>::ROUTE]);
@@ -205,13 +175,7 @@ fn late_ingress() {
 #[test]
 fn bidi_timer() {
     let harness = Pair::bind().expect("gRPC deferred-output harness");
-    let bind = harness.addr();
-    let config = Settings {
-        bind,
-        connections: conn::Capacity::fixed::<4>(),
-        backlog: Backlog::fixed::<16>(),
-        limits: Limits::default(),
-    };
+    let config = Settings::new(harness.addr(), Limits::default());
 
     harness
         .run(
@@ -228,15 +192,7 @@ fn bidi_timer() {
                 let bank = Bank::try_new(config.connections.count(), config.limits)
                     .expect("gRPC readiness bank");
                 let prepared = config
-                    .h2::<KeyTag<0>>()
-                    .expect("H2 plan")
-                    .with_bound(listener)
-                    .with_plain::<_, modes::Serve<Infallible>>(Plan::new(
-                        handler,
-                        &bank,
-                        mode::Direct,
-                    ))
-                    .for_install::<timing::Throughput>()
+                    .try_prepare(listener, Plan::new(handler, &bank, mode::Direct))
                     .expect("server resources");
                 let mut reports =
                     Reports::new(prepared.layout(), [<FrameworkTag<kind::Any> as Tag>::ROUTE]);

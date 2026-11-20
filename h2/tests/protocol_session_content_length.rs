@@ -3,6 +3,7 @@ pub mod common;
 use common::{
     hpack::{Fields, GET},
     protocol::{
+        self,
         Session,
         content_length::{
             BODY, CONNECT_STATUSES, EMPTY_LENGTHS, EMPTY_RESPONSES, FORBIDDEN_LENGTHS, LENGTHS,
@@ -134,10 +135,7 @@ fn requests_count_unpadded_data_once() {
 #[test]
 fn initial_end_requires_empty_content() {
     for (length, empty) in EMPTY_LENGTHS {
-        let mut server = Connection::<ServerRole>::try_new().expect("server");
-        Session::new(&mut server)
-            .try_prime()
-            .expect("client preface");
+        let mut server = protocol::try_connection::<ServerRole>().expect("client preface");
         let request = Fields::new(&[
             GET[0],
             GET[1],
@@ -155,8 +153,7 @@ fn initial_end_requires_empty_content() {
                     .expect("request headers"),
             )
             .expect("request ingress");
-        let mut conn = Connection::<ClientRole>::try_new().expect("client");
-        Session::new(&mut conn).try_prime().expect("peer preface");
+        let mut conn = protocol::try_connection::<ClientRole>().expect("peer preface");
         let stream = Session::new(&mut conn).try_open().expect("request");
         let block = Fields::new(&[
             Entry::new(b":status", b"200"),
@@ -213,8 +210,7 @@ fn initial_end_requires_empty_content() {
 fn empty_response_semantics_override_length_metadata() {
     for (request, response) in EMPTY_RESPONSES {
         for body in [None, Some(&[][..]), Some(BODY)] {
-            let mut conn = Connection::<ClientRole>::try_new().expect("client");
-            Session::new(&mut conn).try_prime().expect("peer preface");
+            let mut conn = protocol::try_connection::<ClientRole>().expect("peer preface");
             let stream = conn
                 .streams()
                 .headers()
@@ -275,8 +271,7 @@ fn empty_response_semantics_override_length_metadata() {
 #[test]
 fn forbidden_response_lengths_reset_before_delivery() {
     for (request, status, length) in FORBIDDEN_LENGTHS {
-        let mut conn = Connection::<ClientRole>::try_new().expect("client");
-        Session::new(&mut conn).try_prime().expect("peer preface");
+        let mut conn = protocol::try_connection::<ClientRole>().expect("peer preface");
         let stream = conn
             .streams()
             .headers()
@@ -310,8 +305,7 @@ fn forbidden_response_lengths_reset_before_delivery() {
 fn connect_success_retains_tunnel_data() {
     for status in CONNECT_STATUSES {
         for trailers in [false, true] {
-            let mut conn = Connection::<ClientRole>::try_new().expect("client");
-            Session::new(&mut conn).try_prime().expect("peer preface");
+            let mut conn = protocol::try_connection::<ClientRole>().expect("peer preface");
             let stream = conn
                 .streams()
                 .headers()
@@ -424,8 +418,7 @@ fn connect_request_data_is_tunnel_before_response() {
 #[test]
 fn connect_failure_response_keeps_exact_content_length() {
     for length in [b"3".as_slice(), b"4".as_slice()] {
-        let mut conn = Connection::<ClientRole>::try_new().expect("client");
-        Session::new(&mut conn).try_prime().expect("peer preface");
+        let mut conn = protocol::try_connection::<ClientRole>().expect("peer preface");
         let stream = conn
             .streams()
             .headers()

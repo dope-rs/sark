@@ -1,7 +1,7 @@
 use sark_http::field::literal;
 
 use crate::common::{
-    conn::{Events, build::Fields as _},
+    conn::{build::Fields as _, next_event},
     field::entry,
     message::{
         Frame as _,
@@ -41,7 +41,7 @@ fn push_fin_after_headers() {
         )
         .expect("promise before push stream");
     assert!(matches!(
-        Events::new(&mut conn).poll_token().expect("promise event"),
+        next_event(&mut conn).expect("promise event"),
         Some(Event::PushPromise { push_id: 0, .. })
     ));
     let id = Id::new(3).expect("push stream");
@@ -57,14 +57,13 @@ fn push_fin_after_headers() {
         )
         .expect("push headers");
     assert!(matches!(
-        Events::new(&mut conn).poll_token().expect("headers"),
+        next_event(&mut conn).expect("headers"),
         Some(Event::PushHeaders { .. })
     ));
     Receive::new(&mut conn)
         .borrowed(id, &[], Boundary::End)
         .expect("push fin");
-    let finished = Events::new(&mut conn)
-        .poll_token()
+    let finished = next_event(&mut conn)
         .expect("completion")
         .expect("finished");
     assert!(matches!(finished.completion(), Completion::End(stream) if stream == id.into()));

@@ -1,7 +1,7 @@
 use common::{
     hpack::{Fields, GET},
     protocol::{
-        Session,
+        self,
         conn::Control,
         session::{Authority, Frame},
     },
@@ -19,8 +19,8 @@ use sark_core::manifold::{
     stream::{Boundary, Data, Write as _},
 };
 use sark_h2::{
-    ClientRole, ServerRole,
-    conn::{Error, machine::Connection},
+    ServerRole,
+    conn::Error,
     frame,
     frame::{layout::Header, numbers::ErrorCode},
     stream,
@@ -29,10 +29,7 @@ use sark_h2::{
 
 #[test]
 fn reset_removes_stream() {
-    let mut conn = Connection::<ServerRole>::try_new().expect("server fixture");
-    Session::new(&mut conn)
-        .try_prime()
-        .expect("protocol fixture");
+    let mut conn = protocol::try_connection::<ServerRole>().expect("protocol fixture");
 
     let block = Fields::new(&GET).try_encode().expect("protocol fixture");
     conn.ingress()
@@ -82,10 +79,7 @@ fn reset_removes_stream() {
 
 #[test]
 fn first_local_stream() {
-    let mut conn = Connection::<ClientRole>::with_push::<Authority>().expect("client fixture");
-    Session::new(&mut conn)
-        .try_prime()
-        .expect("protocol fixture");
+    let mut conn = protocol::try_push::<Authority>().expect("protocol fixture");
 
     let id = conn
         .streams()
@@ -115,10 +109,7 @@ fn first_local_stream() {
 
 #[test]
 fn next_local_stream() {
-    let mut conn = Connection::<ClientRole>::with_push::<Authority>().expect("client fixture");
-    Session::new(&mut conn)
-        .try_prime()
-        .expect("protocol fixture");
+    let mut conn = protocol::try_push::<Authority>().expect("protocol fixture");
 
     let id1 = conn
         .streams()
@@ -136,10 +127,7 @@ fn next_local_stream() {
 
 #[test]
 fn response_emits_headers() {
-    let mut conn = Connection::<ServerRole>::try_new().expect("server fixture");
-    Session::new(&mut conn)
-        .try_prime()
-        .expect("protocol fixture");
+    let mut conn = protocol::try_connection::<ServerRole>().expect("protocol fixture");
 
     let block = Fields::new(&GET).try_encode().expect("protocol fixture");
     conn.ingress()
@@ -176,10 +164,7 @@ fn response_emits_headers() {
 
 #[test]
 fn trailers_emit_final() {
-    let mut conn = Connection::<ServerRole>::try_new().expect("server fixture");
-    Session::new(&mut conn)
-        .try_prime()
-        .expect("protocol fixture");
+    let mut conn = protocol::try_connection::<ServerRole>().expect("protocol fixture");
 
     conn.ingress()
         .ingest(
@@ -248,10 +233,7 @@ fn trailers_emit_final() {
 
 #[test]
 fn trailers_close_request() {
-    let mut conn = Connection::<ClientRole>::with_push::<Authority>().expect("client fixture");
-    Session::new(&mut conn)
-        .try_prime()
-        .expect("protocol fixture");
+    let mut conn = protocol::try_push::<Authority>().expect("protocol fixture");
 
     let id = conn
         .streams()
@@ -281,10 +263,7 @@ fn trailers_close_request() {
 
 #[test]
 fn rejects_bad_trailers() {
-    let mut conn = Connection::<ClientRole>::with_push::<Authority>().expect("client fixture");
-    Session::new(&mut conn)
-        .try_prime()
-        .expect("protocol fixture");
+    let mut conn = protocol::try_push::<Authority>().expect("protocol fixture");
     let id = conn
         .streams()
         .headers()
@@ -320,10 +299,7 @@ fn rejects_bad_trailers() {
 
 #[test]
 fn rejects_bad_response() {
-    let mut conn = Connection::<ServerRole>::try_new().expect("server fixture");
-    Session::new(&mut conn)
-        .try_prime()
-        .expect("protocol fixture");
+    let mut conn = protocol::try_connection::<ServerRole>().expect("protocol fixture");
     conn.ingress()
         .ingest(
             &Frame::new(

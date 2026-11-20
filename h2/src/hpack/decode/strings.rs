@@ -9,7 +9,23 @@ use sark_http::field::metadata::{
 
 use crate::hpack::decode::{self, limit, sink};
 
-pub(super) const MAX_LITERAL_LEN: usize = 1 << 24;
+const MAX_LITERAL_LEN: usize = 1 << 24;
+
+pub(super) fn prefix(first: u8) -> (u8, strings::Encoding) {
+    let encoding = match first & 0x80 {
+        0 => strings::Encoding::Plain,
+        _ => strings::Encoding::Huffman,
+    };
+    (first & 0x7f, encoding)
+}
+
+pub(super) fn length(value: u64) -> Result<usize, decode::Error> {
+    if value > MAX_LITERAL_LEN as u64 {
+        Err(decode::Error::BadString)
+    } else {
+        Ok(value as usize)
+    }
+}
 
 pub(crate) struct Decoded {
     pub(super) len: usize,
@@ -34,17 +50,11 @@ impl<'a> Encoded<'a> {
         let Some(&first) = input.first() else {
             return Err(decode::Error::NeedMore);
         };
-        let encoding = match first & 0x80 {
-            0 => strings::Encoding::Plain,
-            _ => strings::Encoding::Huffman,
-        };
+        let (_, encoding) = prefix(first);
         let mut tail = *input;
-        let len = integer::PrefixedInt::<7>::take(&mut tail)?.get();
-        if len > MAX_LITERAL_LEN as u64 {
-            return Err(decode::Error::BadString);
-        }
+        let len = length(integer::PrefixedInt::<7>::take(&mut tail)?.get())?;
         let (payload, tail) = tail
-            .split_at_checked(len as usize)
+            .split_at_checked(len)
             .ok_or(decode::Error::NeedMore)?;
         *input = tail;
         Ok(Self { payload, encoding })

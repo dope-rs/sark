@@ -1,7 +1,7 @@
 use sark_h3::{conn::Error, frame};
 
 use crate::common::{
-    conn::{Events, build::Fields as _},
+    conn::{build::Fields as _, next_event},
     field::entry,
     message::{Frame as _, promise::Authority},
     stream,
@@ -39,10 +39,8 @@ fn informational_final() {
         Receive::new(&mut conn)
             .owned(Id::ZERO, wire, boundary)
             .expect("receive");
-        assert!(
-            matches!(Events::new(&mut conn).poll_token().expect("event"),
-            Some(Event::Headers { message, section: Section::Initial, .. }) if message.boundary() == boundary)
-        );
+        assert!(matches!(next_event(&mut conn).expect("event"),
+            Some(Event::Headers { message, section: Section::Initial, .. }) if message.boundary() == boundary));
     }
 }
 

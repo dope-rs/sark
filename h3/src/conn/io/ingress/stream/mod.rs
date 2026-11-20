@@ -13,7 +13,10 @@ mod uni;
 
 use crate::{
     conn,
-    conn::io::{Resume, ingress::Parts},
+    conn::{
+        event,
+        io::{Resume, ingress::Parts},
+    },
     link::Status,
 };
 
@@ -37,18 +40,18 @@ pub(super) fn drive<'d, P: rules::Policy, A: rules::Push>(
     } else {
         request(conn, id, resume)
     };
-    match result {
-        Err(conn::Error::Content { error, .. }) => {
-            let vacancy = conn.queues.try_event()?;
-            let token = conn.streams.reject(id)?;
-            vacancy.push_front(crate::conn::event::Event::Rejected {
-                stream_id: token,
-                error,
-            });
-            Ok(Status::Suspended)
-        }
-        result => result,
-    }
+    let error = match result {
+        Err(conn::Error::Content { error, .. }) => event::Rejection::Content(error),
+        Err(conn::Error::Malformed { kind, .. }) => event::Rejection::Malformed { kind },
+        result => return result,
+    };
+    let vacancy = conn.queues.try_event()?;
+    let token = conn.streams.reject(id)?;
+    vacancy.push_front(event::Event::Rejected {
+        stream_id: token,
+        error,
+    });
+    Ok(Status::Suspended)
 }
 
 fn request<'d, P: rules::Policy, A: rules::Push>(

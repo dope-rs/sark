@@ -19,9 +19,9 @@ use crate::field::{
 
 #[doc(hidden)]
 pub struct Input<B: storage::Block> {
-    pub(in crate::field::metadata) lease: pool::Span,
+    lease: pool::Span,
     block: marker::PhantomData<B>,
-    pub(super) phase: stage::Stage,
+    phase: stage::Stage,
     pub(in crate::field::metadata) indexing: crate::field::Indexing,
 }
 
@@ -37,6 +37,13 @@ impl<B: storage::Block> Input<B> {
 
     pub fn try_ready(&self) -> Result<(), lower::State> {
         self.phase.try_ready()
+    }
+
+    pub(in crate::field::metadata) fn try_ready_lease(
+        &mut self,
+    ) -> Result<&mut pool::Span, lower::State> {
+        self.try_ready()?;
+        Ok(&mut self.lease)
     }
 
     pub fn try_scratch(&mut self, scratch: &mut storage::Scratch) -> Result<(), lower::State> {
@@ -60,34 +67,27 @@ impl<B: storage::Block> Input<B> {
         Ok(())
     }
 
-    pub fn string(
+    pub fn try_string(
         &mut self,
         scratch: &mut storage::Scratch,
-        cursor: strings::Cursor,
+        cursor: &mut strings::Cursor,
         input: &[u8],
-    ) -> lower::Step {
-        let lease = &mut self.lease;
-        let (phase, step) = match mem::replace(&mut self.phase, stage::Stage::Ready) {
-            stage::Stage::Scratch(bytes) => {
-                let (bytes, step) = bytes.string(cursor, input);
-                match step {
-                    lower::Step::Store { cause } => {
-                        let mut bytes = bytes.into_vec();
-                        bytes.clear();
-                        mem::swap(&mut bytes, &mut scratch.authority);
-                        (stage::Stage::Ready, lower::Step::Store { cause })
-                    }
-                    step => (stage::Stage::Scratch(bytes), step),
-                }
+    ) -> Result<(), lower::StringError> {
+        let result = match &mut self.phase {
+            stage::Stage::Scratch(bytes) => bytes.try_string(cursor, input),
+            stage::Stage::Tagged(field) if !field.stored() => {
+                field.try_string(&mut self.lease, cursor, input)
             }
-            stage::Stage::Tagged(field) => field.string(lease, cursor, input),
             phase => {
-                let cause = lower::Error::State(phase.state());
-                (phase, lower::Step::Store { cause })
+                return Err(lower::StringError::Store(lower::Error::State(
+                    phase.state(),
+                )));
             }
         };
-        self.phase = phase;
-        step
+        if matches!(result, Err(lower::StringError::Store(_))) {
+            self.rollback(scratch);
+        }
+        result
     }
 
     /// The retained class selects validation; direct completion only observes the value.

@@ -1,7 +1,7 @@
 pub mod common;
 
 use common::{
-    conn::{Events, build::Fields as _, payload::Data as _},
+    conn::{build::Fields as _, next_event, payload::Data as _},
     field::entry,
     message::{Frame as _, promise::Authority},
 };
@@ -38,7 +38,7 @@ fn queued_payload_holds_budget_until_polled() {
             Boundary::More,
         )
         .expect("headers");
-    let _ = Events::new(&mut conn).poll_token().expect("headers");
+    let _ = next_event(&mut conn).expect("headers");
 
     let frame = b"12345678".try_frame(TYPE_DATA).expect("DATA frame");
     Receive::new(&mut conn)
@@ -53,8 +53,7 @@ fn queued_payload_holds_budget_until_polled() {
         }),
     );
 
-    let data = Events::new(&mut conn)
-        .poll_token()
+    let data = next_event(&mut conn)
         .expect("DATA event")
         .into_data()
         .expect("payload");
@@ -90,7 +89,7 @@ fn reset_reclaims_queued_open_budget() {
                 Boundary::More,
             )
             .expect("headers");
-        let _ = Events::new(&mut conn).poll_token().expect("headers");
+        let _ = next_event(&mut conn).expect("headers");
         let data = resident::Shared::from(storage::Shared::try_copy(&frame).expect("frame"));
         assert!(matches!(
             Receive::new(&mut conn).hold(id, data, Boundary::End),
@@ -102,17 +101,12 @@ fn reset_reclaims_queued_open_budget() {
                 .expect("same-origin reset");
         }
         assert!(matches!(
-            Events::new(&mut conn).poll_token().expect("reset"),
+            next_event(&mut conn).expect("reset"),
             Some(Event::Reset { stream_id, error_code, origin: Origin::Transport, released })
                 if stream_id == id.into() && error_code == Code::from_u16(2)
                     && released == frame.len()
         ));
-        assert!(
-            Events::new(&mut conn)
-                .poll_token()
-                .expect("drained")
-                .is_none()
-        );
+        assert!(next_event(&mut conn).expect("drained").is_none());
     }
 }
 

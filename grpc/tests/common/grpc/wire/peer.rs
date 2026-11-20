@@ -20,7 +20,7 @@ use sark_http::field::{self, Entry, Lower, Pseudo, Value};
 
 use crate::common::grpc::{
     session::fairness::Client as _,
-    wire::{Failure, Transfer},
+    wire::{Failure, transfer},
 };
 
 pub struct Peer {
@@ -60,11 +60,7 @@ impl Peer {
                 .map_err(sark_h2::conn::Error::InactiveStream)
                 .map_err(Failure::Protocol)?;
         }
-        Transfer {
-            client,
-            server: &mut server,
-        }
-        .try_response()?;
+        transfer::try_response(client, &mut server)?;
         Ok(count)
     }
 

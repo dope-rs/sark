@@ -2,7 +2,7 @@ use sark_http::field::literal;
 
 use crate::common::{
     conn::{
-        Connection as _, Events,
+        Connection as _, next_event,
         payload::{Capture, Data as _, Owned as _, Write as _},
     },
     field::entry,
@@ -201,8 +201,7 @@ fn owned_event_keeps_alloc() {
         .owned(stream, wire, Boundary::More)
         .expect("fixed owned-payload scenario must succeed");
 
-    let data = Events::new(&mut receiver)
-        .poll_token()
+    let data = next_event(&mut receiver)
         .expect("fixed owned-payload scenario must succeed")
         .into_data()
         .expect("complete DATA frame emits one data event");
@@ -235,8 +234,7 @@ fn fragment_keeps_alloc() {
     Receive::new(&mut receiver)
         .owned(stream, wire, Boundary::More)
         .expect("fixed owned-payload scenario must succeed");
-    let first = Events::new(&mut receiver)
-        .poll_token()
+    let first = next_event(&mut receiver)
         .expect("first fragment event")
         .into_data()
         .expect("DATA streams before the entire frame arrives");
@@ -249,8 +247,7 @@ fn fragment_keeps_alloc() {
         .owned(stream, tail, Boundary::More)
         .expect("fixed owned-payload scenario must succeed");
 
-    let data = Events::new(&mut receiver)
-        .poll_token()
+    let data = next_event(&mut receiver)
         .expect("fixed owned-payload scenario must succeed")
         .into_data()
         .expect("the remaining DATA emits a second event");
@@ -290,13 +287,11 @@ fn adjacent_events_share() {
         .owned(stream, wire, Boundary::More)
         .expect("fixed owned-payload scenario must succeed");
 
-    let first = Events::new(&mut receiver)
-        .poll_token()
+    let first = next_event(&mut receiver)
         .expect("fixed owned-payload scenario must succeed")
         .into_data()
         .expect("first frame emits the first data event");
-    let second = Events::new(&mut receiver)
-        .poll_token()
+    let second = next_event(&mut receiver)
         .expect("fixed owned-payload scenario must succeed")
         .into_data()
         .expect("second frame emits the second data event");

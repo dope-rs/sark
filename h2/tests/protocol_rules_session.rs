@@ -1,10 +1,10 @@
 use common::{
     hpack::Fields,
-    protocol::{Session, rules::Request, session::Frame},
+    protocol::{self, rules::Request, session::Frame},
 };
 use sark_h2::{
     ServerRole,
-    conn::{event::Event, machine::Connection},
+    conn::event::Event,
     stream::Id,
 };
 pub mod common;
@@ -15,10 +15,7 @@ use sark_http::field::metadata::map::record::Entry;
 
 #[test]
 fn continues_after_failure() {
-    let mut conn = Connection::<ServerRole>::try_new().expect("server fixture");
-    Session::new(&mut conn)
-        .try_prime()
-        .expect("protocol fixture");
+    let mut conn = protocol::try_connection::<ServerRole>().expect("protocol fixture");
     let bad = Fields::new(&[
         Entry::new(b":scheme", b"http"),
         Entry::new(b":path", b"/"),
@@ -54,10 +51,7 @@ fn continues_after_failure() {
 
 #[test]
 fn keeps_dynamic_updates() {
-    let mut conn = Connection::<ServerRole>::try_new().expect("server fixture");
-    Session::new(&mut conn)
-        .try_prime()
-        .expect("protocol fixture");
+    let mut conn = protocol::try_connection::<ServerRole>().expect("protocol fixture");
     let mut encoder = Encoder::try_new(4096).expect("HPACK encoder capacity");
     let bad = Fields::new(&[
         Entry::new(b":method", b"GET"),

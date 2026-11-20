@@ -599,11 +599,7 @@ fn split_literal_capacity() {
         }
         let error = Receive::new(&mut conn)
             .borrowed(Id::ZERO, &wire[value..], Boundary::End)
-            .and_then(|()| {
-                crate::common::conn::Events::new(&mut conn)
-                    .poll_token()
-                    .map(|_| ())
-            })
+            .and_then(|()| crate::common::conn::next_event(&mut conn).map(|_| ()))
             .expect_err("split literal exceeds field budget");
         assert_eq!(
             error,

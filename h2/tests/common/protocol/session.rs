@@ -18,6 +18,15 @@ pub const SELF_DEPENDENT_HEADERS: &[u8] = &[
     0, 0, 11, 1, 0x24, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0x82, 0x86, 0x84, 1, 1, b'x',
 ];
 
+pub fn header(length: u32, kind: Type, flags: u8, stream: u32) -> Header {
+    Header {
+        length: Length::new(length).expect("fixture domain"),
+        kind,
+        flags: Flags(flags),
+        stream_id: Id::new(stream).expect("fixture domain"),
+    }
+}
+
 #[derive(Clone, Copy)]
 pub struct Authority;
 

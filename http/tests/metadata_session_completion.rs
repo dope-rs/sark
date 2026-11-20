@@ -224,11 +224,7 @@ fn rejects_direct_value() {
             let invalid = dynamics::INVALID;
             let mut cursor = Cursor::new(invalid.len(), Encoding::Plain);
             for bytes in invalid.chunks(1) {
-                cursor = match session.string(cursor, bytes) {
-                    lower::Step::Ready { cursor } => Some(cursor),
-                    _ => None,
-                }
-                .expect("direct string");
+                assert!(session.try_string(&mut cursor, bytes).is_ok());
             }
             session
                 .direct::<rules::RejectPush>()

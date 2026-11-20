@@ -1,6 +1,6 @@
 use common::{
     hpack::Fields,
-    protocol::{Session, rules::Settings, session::Frame},
+    protocol::{self, rules::Settings, session::Frame},
 };
 use sark_h2::{ServerRole, conn::machine::Connection};
 pub mod common;
@@ -20,10 +20,7 @@ fn uses_local_policy() {
     ])
     .try_encode()
     .expect("protocol fixture");
-    let mut conn = Connection::<ServerRole>::try_new().expect("server fixture");
-    Session::new(&mut conn)
-        .try_prime()
-        .expect("protocol fixture");
+    let mut conn = protocol::try_connection::<ServerRole>().expect("protocol fixture");
     conn.ingress()
         .ingest(
             &Frame::new(1, &standard)
@@ -56,10 +53,7 @@ fn uses_local_policy() {
     ])
     .try_encode()
     .expect("protocol fixture");
-    let mut disabled = Connection::<ServerRole>::try_new().expect("server fixture");
-    Session::new(&mut disabled)
-        .try_prime()
-        .expect("protocol fixture");
+    let mut disabled = protocol::try_connection::<ServerRole>().expect("protocol fixture");
     disabled
         .ingress()
         .ingest(
@@ -70,11 +64,8 @@ fn uses_local_policy() {
         .expect("disabled extended CONNECT frame fits ingress");
     assert!(disabled.ingress().poll_event().is_none());
 
-    let mut enabled = Settings::extended()
-        .try_connect::<ServerRole>()
-        .expect("protocol fixture");
-    Session::new(&mut enabled)
-        .try_prime()
+    let mut enabled: Connection<ServerRole> = Settings::extended()
+        .try_connect()
         .expect("protocol fixture");
     enabled
         .ingress()

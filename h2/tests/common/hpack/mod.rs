@@ -62,6 +62,7 @@ impl<'a> Field<'a> {
 }
 
 pub mod bound;
+pub mod rfc;
 pub mod stream;
 
 pub const GET: [Entry<'static>; 4] = [

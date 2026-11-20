@@ -11,7 +11,7 @@ use common::{
             },
             ingress::INCOMPLETE_RESPONSES,
         },
-        wire::Transfer,
+        wire::transfer,
     },
 };
 use sark_core::manifold::stream::{Boundary, Section};
@@ -46,16 +46,14 @@ fn peer_reset_codes() {
                 &mut client, b"/svc/Sibling", None, &Metadata::new(), b""
             ).expect("sibling");
             let mut server = Connection::<ServerRole>::try_new().expect("server");
-            let ids = Transfer { client: &mut client, server: &mut server }
-                .try_request().expect("requests");
+            let ids = transfer::try_request(&mut client, &mut server).expect("requests");
             assert_eq!(ids.len(), 3);
             for id in &ids[..2] {
                 let key = server.status().stream_key(*id).expect("live request");
                 server.streams().try_cancel(key, wire).expect("peer reset");
             }
             Response::new(&mut server, ids[2]).try_respond(FIRST_RESPONSE).expect("sibling response");
-            Transfer { client: &mut client, server: &mut server }
-                .try_response().expect("stream-local resets");
+            transfer::try_response(&mut client, &mut server).expect("stream-local resets");
             for status in [
                 unary::Session::poll(&mut client, &unary).err().expect("unary reset"),
                 response::Session::try_poll(&mut client, &stream).err().expect("stream reset"),
@@ -90,12 +88,8 @@ fn bad_status_stays_local() {
                 .expect("stream");
             let stream = bidi::Session::finish(&mut client, bidi).expect("request end");
             let mut server = Connection::<ServerRole>::try_new().expect("server");
-            let ids = Transfer {
-                client: &mut client,
-                server: &mut server,
-            }
-            .try_request()
-            .expect("requests");
+            let ids = transfer::try_request(&mut client, &mut server)
+                .expect("requests");
             assert_eq!(ids.len(), 3);
             for id in [ids[0], ids[2]] {
                 Response::new(&mut server, id)
@@ -105,12 +99,8 @@ fn bad_status_stays_local() {
             Response::new(&mut server, ids[1])
                 .try_respond(FIRST_RESPONSE)
                 .expect("sibling response");
-            Transfer {
-                client: &mut client,
-                server: &mut server,
-            }
-            .try_response()
-            .expect("malformed status stays local");
+            transfer::try_response(&mut client, &mut server)
+                .expect("malformed status stays local");
             let failure = loop {
                 match response::Session::try_poll(&mut client, &stream) {
                     Ok(Some(receive::Response::Headers { .. })) => {}
@@ -155,12 +145,8 @@ fn reset_after_response_retires_request() {
             .expect("open request");
         let sibling = client.try_unary(1).expect("sibling");
         let mut server = Connection::<ServerRole>::try_new().expect("server");
-        let ids = Transfer {
-            client: &mut client,
-            server: &mut server,
-        }
-        .try_request()
-        .expect("requests");
+        let ids = transfer::try_request(&mut client, &mut server)
+            .expect("requests");
         Response::new(&mut server, ids[0])
             .try_http(b"200", Some(b"application/grpc"), Some(b"0"), Boundary::End)
             .expect("response finishes before request");
@@ -175,12 +161,8 @@ fn reset_after_response_retires_request() {
         Response::new(&mut server, ids[1])
             .try_respond(FIRST_RESPONSE)
             .expect("sibling response");
-        Transfer {
-            client: &mut client,
-            server: &mut server,
-        }
-        .try_response()
-        .expect("request reset preserves queued response");
+        transfer::try_response(&mut client, &mut server)
+            .expect("request reset preserves queued response");
         assert!(
             matches!(bidi::Session::try_poll(&mut client, &early).expect("early lookup"),
             Some(receive::Response::Trailers { status }) if status.code() == sark_grpc::Code::Ok)
@@ -216,12 +198,8 @@ fn bad_message_stays_local() {
         Session::with_limits(plan, limits, |mut client| {
             let calls = client.try_unary(3).expect("concurrent calls");
             let mut server = Connection::<ServerRole>::try_new().expect("server");
-            let ids = Transfer {
-                client: &mut client,
-                server: &mut server,
-            }
-            .try_request()
-            .expect("requests");
+            let ids = transfer::try_request(&mut client, &mut server)
+                .expect("requests");
             Response::new(&mut server, ids[0])
                 .try_respond(b"")
                 .expect("occupy completion");
@@ -234,12 +212,8 @@ fn bad_message_stays_local() {
             Response::new(&mut server, ids[2])
                 .try_respond(SMALL_RESPONSE)
                 .expect("sibling response");
-            Transfer {
-                client: &mut client,
-                server: &mut server,
-            }
-            .try_response()
-            .expect("stream errors preserve the connection");
+            transfer::try_response(&mut client, &mut server)
+                .expect("stream errors preserve the connection");
             assert!(client.is_blocked());
             assert!(
                 unary::Session::try_poll(&mut client, &calls[0])
@@ -293,13 +267,12 @@ fn terminal_event_pressure() {
             .expect("stream");
         let call = bidi::Session::finish(&mut client, call).expect("request end");
         let mut server = Connection::<ServerRole>::try_new().expect("server");
-        let ids = Transfer { client: &mut client, server: &mut server }
-            .try_request().expect("request");
+        let ids = transfer::try_request(&mut client, &mut server).expect("request");
         let mut frame = Vec::new();
         Bytes::try_frame(message::Compression::Plain, b"terminal", &mut frame).expect("frame");
         Response::new(&mut server, ids[0]).try_header().expect("headers");
         Response::new(&mut server, ids[0]).try_data(&frame, Boundary::End).expect("terminal data");
-        Transfer { client: &mut client, server: &mut server }.try_response().expect("response");
+        transfer::try_response(&mut client, &mut server).expect("response");
         assert!(matches!(response::Session::try_poll(&mut client, &call),
             Ok(Some(receive::Response::Headers { .. }))));
         let event = response::Session::try_poll(&mut client, &call).expect("message").expect("queued message");

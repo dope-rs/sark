@@ -2,10 +2,7 @@ use sark_h3::{conn::Error, stream::Mismatch};
 use sark_http::field::literal;
 
 use crate::common::{
-    conn::{
-        bridge::{Pair, certificate},
-        wire::{Ingress, Peer},
-    },
+    conn::bridge::{Pair, certificate, try_receive, try_send},
     field::entry,
 };
 
@@ -56,18 +53,12 @@ fn settings_round_trip() {
         .expect("client control stream must be admissible");
 
     let t1 = Instant::now();
-    Peer::new(&mut space, &mut client)
-        .try_send(&mut server, t1, certificate)
+    try_send(&mut space, &mut client, &mut server, t1, certificate)
         .expect("QUIC bridge transfer");
-    Ingress::new(&mut h3)
-        .try_receive(&mut server)
-        .expect("HTTP/3 bridge ingress");
-    Peer::new(&mut space, &mut server)
-        .try_send(&mut client, t1, certificate)
+    try_receive(&mut h3, &mut server).expect("HTTP/3 bridge ingress");
+    try_send(&mut space, &mut server, &mut client, t1, certificate)
         .expect("QUIC bridge transfer");
-    Ingress::new(&mut peer)
-        .try_receive(&mut client)
-        .expect("HTTP/3 bridge ingress");
+    try_receive(&mut peer, &mut client).expect("HTTP/3 bridge ingress");
 
     server.with_scope(|mut scope| {
         let settings = h3
@@ -114,8 +105,7 @@ fn settings_round_trip() {
         .expect("request output must settle");
 
     let t2 = Instant::now();
-    Peer::new(&mut space, &mut client)
-        .try_send(&mut server, t2, certificate)
+    try_send(&mut space, &mut client, &mut server, t2, certificate)
         .expect("QUIC bridge transfer");
     let key = server.with_scope(|mut scope| {
         scope
@@ -124,9 +114,7 @@ fn settings_round_trip() {
             .key(stream)
             .expect("resident request stream")
     });
-    Ingress::new(&mut h3)
-        .try_receive(&mut server)
-        .expect("HTTP/3 bridge ingress");
+    try_receive(&mut h3, &mut server).expect("HTTP/3 bridge ingress");
 
     server.with_scope(|mut scope| {
         let headers = h3.ingress().consume(&mut scope, |event| {
@@ -166,8 +154,7 @@ fn settings_round_trip() {
     });
 
     let ack_at = t2 + Duration::from_millis(30);
-    Peer::new(&mut space, &mut server)
-        .try_send(&mut client, ack_at, certificate)
+    try_send(&mut space, &mut server, &mut client, ack_at, certificate)
         .expect("request ACK precedes response");
     client.with_scope(|mut scope| {
         let streams = scope.streams();
@@ -181,12 +168,9 @@ fn settings_round_trip() {
         .headers(stream, [literal!(entry(b":status", b"200"))], Boundary::End)
         .expect("response headers");
     h3.egress().settle(&mut server).expect("response output");
-    Peer::new(&mut space, &mut server)
-        .try_send(&mut client, ack_at, certificate)
+    try_send(&mut space, &mut server, &mut client, ack_at, certificate)
         .expect("response transfer");
-    Ingress::new(&mut peer)
-        .try_receive(&mut client)
-        .expect("response keeps request identity");
+    try_receive(&mut peer, &mut client).expect("response keeps request identity");
     client.with_scope(|mut scope| {
         let response = peer
             .ingress()
@@ -228,12 +212,9 @@ fn qpack_limits() {
         peer.egress()
             .start(&mut client)
             .expect("peer control stream");
-        Peer::new(&mut space, &mut client)
-            .try_send(&mut server, Instant::now(), certificate)
+        try_send(&mut space, &mut client, &mut server, Instant::now(), certificate)
             .expect("peer SETTINGS transfer");
-        Ingress::new(&mut h3)
-            .try_receive(&mut server)
-            .expect("encoder negotiates its own allocation");
+        try_receive(&mut h3, &mut server).expect("encoder negotiates its own allocation");
     }
 }
 

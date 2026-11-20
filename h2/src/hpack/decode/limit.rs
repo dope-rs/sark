@@ -256,6 +256,15 @@ pub(crate) struct LengthState {
     pub(super) encoding: Encoding,
 }
 
+impl LengthState {
+    pub(super) const fn new(encoding: Encoding) -> Self {
+        Self {
+            number: Number::new(0x7f),
+            encoding,
+        }
+    }
+}
+
 impl Number {
     pub(super) const fn new(prefix: u64) -> Self {
         Self(integer::Continuation::new(prefix))
@@ -280,4 +289,14 @@ pub(crate) struct StringState {
     pub(super) string: Cursor,
     pub(super) retention: strings::Retention,
     pub(super) validation: block::Value,
+}
+
+impl StringState {
+    pub(super) fn new(len: usize, encoding: Encoding, retention: strings::Retention) -> Self {
+        Self {
+            string: Cursor::new(len, encoding),
+            retention,
+            validation: block::Value::new(),
+        }
+    }
 }

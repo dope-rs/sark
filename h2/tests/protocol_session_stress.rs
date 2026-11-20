@@ -1,7 +1,7 @@
 use common::{
     hpack::{FIRST_DYNAMIC, Fields, GET, INDEXED_FIELDS, INDEXED_NAMES},
     protocol::{
-        Session,
+        self,
         conn::{Control, Controls},
         session::{Frame, Wire},
     },
@@ -22,7 +22,7 @@ use sark_core::manifold::{
 };
 use sark_h2::{
     ServerRole,
-    conn::{Error, event::Event, machine::Connection},
+    conn::{Error, event::Event},
     frame,
     frame::{
         Ack,
@@ -34,10 +34,7 @@ use sark_h2::{
 
 #[test]
 fn rapid_reset_is_distinct() {
-    let mut conn = Connection::<ServerRole>::try_new().expect("server fixture");
-    Session::new(&mut conn)
-        .try_prime()
-        .expect("protocol fixture");
+    let mut conn = protocol::try_connection::<ServerRole>().expect("protocol fixture");
     let block = Fields::new(&GET).try_encode().expect("protocol fixture");
     let mut id = 1u32;
     let mut hit = false;
@@ -73,10 +70,7 @@ fn rapid_reset_is_distinct() {
 
 #[test]
 fn ping_flood_is_bounded() {
-    let mut conn = Connection::<ServerRole>::try_new().expect("server fixture");
-    Session::new(&mut conn)
-        .try_prime()
-        .expect("protocol fixture");
+    let mut conn = protocol::try_connection::<ServerRole>().expect("protocol fixture");
     conn.transfer().drain(usize::MAX);
     let ping = Controls::new(Ack::Required)
         .try_ping([1, 2, 3, 4, 5, 6, 7, 8])
@@ -109,10 +103,7 @@ fn ping_flood_is_bounded() {
 
 #[test]
 fn completions_stay_bounded() {
-    let mut conn = Connection::<ServerRole>::try_new().expect("server fixture");
-    Session::new(&mut conn)
-        .try_prime()
-        .expect("protocol fixture");
+    let mut conn = protocol::try_connection::<ServerRole>().expect("protocol fixture");
     let block = Fields::new(&GET).try_encode().expect("protocol fixture");
     let mut id = 1u32;
     for _ in 0..1000 {
@@ -140,8 +131,7 @@ fn completions_stay_bounded() {
 
 #[test]
 fn late_frames_survive_many_resets() {
-    let mut conn = Connection::<ServerRole>::try_new().expect("server fixture");
-    Session::new(&mut conn).try_prime().expect("primed server");
+    let mut conn = protocol::try_connection::<ServerRole>().expect("primed server");
     let block = Fields::new(&GET).try_encode().expect("request headers");
     for id in (1..=513).step_by(2) {
         conn.ingress()
@@ -223,10 +213,7 @@ fn late_frames_survive_many_resets() {
 
 #[test]
 fn rejects_declared_size() {
-    let mut conn = Connection::<ServerRole>::try_new().expect("server fixture");
-    Session::new(&mut conn)
-        .try_prime()
-        .expect("protocol fixture");
+    let mut conn = protocol::try_connection::<ServerRole>().expect("protocol fixture");
     let mut hdr = Vec::new();
     hdr.extend_from_slice(
         &Header {
@@ -249,10 +236,7 @@ fn rejects_declared_size() {
 
 #[test]
 fn rejects_unknown_size() {
-    let mut conn = Connection::<ServerRole>::try_new().expect("server fixture");
-    Session::new(&mut conn)
-        .try_prime()
-        .expect("protocol fixture");
+    let mut conn = protocol::try_connection::<ServerRole>().expect("protocol fixture");
     let big: u32 = 16_777_000;
     let mut hdr = vec![(big >> 16) as u8, (big >> 8) as u8, big as u8, 0xFF, 0x00];
     hdr.extend_from_slice(&0u32.to_be_bytes());
@@ -268,10 +252,7 @@ fn rejects_unknown_size() {
 
 #[test]
 fn rejects_empty_followup() {
-    let mut conn = Connection::<ServerRole>::try_new().expect("server fixture");
-    Session::new(&mut conn)
-        .try_prime()
-        .expect("protocol fixture");
+    let mut conn = protocol::try_connection::<ServerRole>().expect("protocol fixture");
     let block = Fields::new(&GET).try_encode().expect("protocol fixture");
     conn.ingress()
         .ingest(
@@ -289,10 +270,7 @@ fn rejects_empty_followup() {
 
 #[test]
 fn caps_continuations() {
-    let mut conn = Connection::<ServerRole>::try_new().expect("server fixture");
-    Session::new(&mut conn)
-        .try_prime()
-        .expect("protocol fixture");
+    let mut conn = protocol::try_connection::<ServerRole>().expect("protocol fixture");
     conn.ingress()
         .ingest(
             &Frame::new(1, &[])
@@ -327,10 +305,7 @@ fn caps_continuations() {
 
 #[test]
 fn default_caps_streams() {
-    let mut conn = Connection::<ServerRole>::try_new().expect("server fixture");
-    Session::new(&mut conn)
-        .try_prime()
-        .expect("protocol fixture");
+    let mut conn = protocol::try_connection::<ServerRole>().expect("protocol fixture");
     assert_eq!(conn.settings().local().max_concurrent_streams, Some(256));
     let block = Fields::new(&GET).try_encode().expect("protocol fixture");
     let mut id = 1u32;

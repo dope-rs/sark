@@ -161,8 +161,12 @@ impl<P: rules::Policy> Session<P> {
         Ok(())
     }
 
-    pub fn string(&mut self, cursor: strings::Cursor, input: &[u8]) -> lower::Step {
-        self.input.string(&mut self.scratch, cursor, input)
+    pub fn try_string(
+        &mut self,
+        cursor: &mut strings::Cursor,
+        input: &[u8],
+    ) -> Result<(), lower::StringError> {
+        self.input.try_string(&mut self.scratch, cursor, input)
     }
 
     pub fn rollback(&mut self) {

@@ -1,8 +1,7 @@
-use sark_h3::conn::Connection;
 use sark_http::field::literal;
 
 use crate::common::{
-    conn::{Connection as _, Events, build::Fields as _},
+    conn::{Connection as _, build::Fields as _, next_event},
     field::entry,
     message::validate::{self, UPPERCASE},
 };
@@ -11,75 +10,55 @@ pub mod common;
 
 use dope_quic::wire::stream::Id;
 use sark_core::manifold::stream::Boundary;
-use sark_h3::conn::{Error, event::Event, io::Receive};
-use sark_http::field::metadata::{block::Connect, section::rules};
+use sark_h3::conn::{Connection, Error, event::Event, io::Receive};
+use sark_http::field::metadata::block::Connect;
 
 #[test]
-fn rejects_invalid_path() {
+fn isolates_malformed_requests() {
+    let method = literal!(entry(b":method", b"GET"));
+    let scheme = literal!(entry(b":scheme", b"https"));
+    let authority = literal!(entry(b":authority", b"example.test"));
+    let path = literal!(entry(b":path", b"/"));
+    let bad_path = entry(b":path", validate::INVALID_PATH).expect("field bytes");
+    let regular = literal!(entry(b"x-regular", b"1"));
+    let mut conn = Connection::try_validate(Connect::Disabled).expect("connection");
+    for (stream, fields) in [
+        (0, &[method, scheme, authority, bad_path][..]),
+        (4, &[method, path][..]),
+        (8, &[method, scheme, path, regular, authority][..]),
+    ] {
+        let id = Id::new(stream).expect("request stream");
+        let wire = fields.try_headers().expect("request fields");
+        Receive::new(&mut conn)
+            .owned(id, wire, Boundary::More)
+            .expect("request framing");
+        validate::expect_malformed(&mut conn, id);
+    }
+    let uppercase = Id::new(12).expect("request stream");
+    Receive::new(&mut conn)
+        .borrowed(uppercase, UPPERCASE, Boundary::More)
+        .expect("request framing");
+    validate::expect_malformed(&mut conn, uppercase);
+
+    let next = Id::new(16).expect("request stream");
+    let valid = [
+        method,
+        scheme,
+        authority,
+        path,
+        literal!(entry(b"te", b"trailers")),
+    ];
+    Receive::new(&mut conn)
+        .owned(
+            next,
+            valid.try_headers().expect("request fields"),
+            Boundary::More,
+        )
+        .expect("next request");
     assert!(matches!(
-        validate::try_ingest_request(&[
-            literal!(entry(b":method", b"GET")),
-            literal!(entry(b":scheme", b"https")),
-            literal!(entry(b":authority", b"example.test")),
-            entry(b":path", validate::INVALID_PATH).expect("valid field bytes"),
-        ]),
-        Err(validate::Error::Connection(Error::Malformed {
-            stream_id: 0,
-            kind: rules::Kind::Request,
-        }))
+        next_event(&mut conn).expect("poll next request"),
+        Some(Event::Headers { message, .. }) if message.stream_id() == next.into()
     ));
-}
-
-#[test]
-fn validates_request_fields() {
-    assert!(
-        matches!(
-            validate::try_ingest_request(&[
-                literal!(entry(b":method", b"GET")),
-                literal!(entry(b":path", b"/")),
-            ]),
-            Err(validate::Error::Connection(Error::Malformed {
-                stream_id: 0,
-                kind: rules::Kind::Request,
-            }))
-        ),
-        "the request pseudo-header set must be complete",
-    );
-    assert!(
-        matches!(
-            validate::try_ingest_request(&[
-                literal!(entry(b":method", b"GET")),
-                literal!(entry(b":scheme", b"https")),
-                literal!(entry(b":path", b"/")),
-                literal!(entry(b"x-regular", b"1")),
-                literal!(entry(b":authority", b"example.test")),
-            ]),
-            Err(validate::Error::Connection(Error::Malformed {
-                stream_id: 0,
-                kind: rules::Kind::Request,
-            }))
-        ),
-        "pseudo-headers cannot follow regular fields",
-    );
-    let mut conn = Connection::try_validate(Connect::Disabled).expect("validation connection");
-    assert!(
-        Receive::new(&mut conn).borrowed(Id::ZERO, UPPERCASE, Boundary::More)
-            == Err(Error::Malformed {
-                stream_id: 0,
-                kind: rules::Kind::Request,
-            }),
-        "uppercase field names are forbidden",
-    );
-    assert!(
-        validate::try_ingest_request(&[
-            literal!(entry(b":method", b"GET")),
-            literal!(entry(b":scheme", b"https")),
-            literal!(entry(b":authority", b"example.test")),
-            literal!(entry(b":path", b"/")),
-            literal!(entry(b"te", b"trailers")),
-        ])
-        .is_ok(),
-    );
 }
 
 #[test]
@@ -96,8 +75,7 @@ fn gates_connect_by_setting() {
     Receive::new(&mut conn)
         .owned(Id::ZERO, standard, Boundary::More)
         .expect("standard CONNECT request must be admitted");
-    let control = Events::new(&mut conn)
-        .poll_token()
+    let control = next_event(&mut conn)
         .expect("standard CONNECT event polling must succeed")
         .and_then(|event| match event {
             Event::Headers { head, .. } => head.into_parts().2,
@@ -116,20 +94,16 @@ fn gates_connect_by_setting() {
     .try_headers()
     .expect("validation fields");
     let mut disabled = Connection::try_validate(Connect::Disabled).expect("validation connection");
-    assert!(
-        Receive::new(&mut disabled).owned(Id::ZERO, extended.clone(), Boundary::More)
-            == Err(Error::Malformed {
-                stream_id: 0,
-                kind: rules::Kind::Request,
-            }),
-    );
+    Receive::new(&mut disabled)
+        .owned(Id::ZERO, extended.clone(), Boundary::More)
+        .expect("Extended CONNECT framing");
+    validate::expect_malformed(&mut disabled, Id::ZERO);
 
     let mut enabled = Connection::try_validate(Connect::Enabled).expect("validation connection");
     Receive::new(&mut enabled)
         .owned(Id::ZERO, extended, Boundary::More)
         .expect("enabled Extended CONNECT request must be admitted");
-    let control = Events::new(&mut enabled)
-        .poll_token()
+    let control = next_event(&mut enabled)
         .expect("Extended CONNECT event polling must succeed")
         .and_then(|event| match event {
             Event::Headers { head, .. } => head.into_parts().2,

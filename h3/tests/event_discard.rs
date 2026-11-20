@@ -1,4 +1,4 @@
-use crate::common::conn::{Connection as _, Events};
+use crate::common::conn::{Connection as _, next_event};
 pub mod common;
 
 use dope_quic::{errors::Code, wire::stream::Id};
@@ -29,7 +29,7 @@ fn discards_wrapped_events() {
         Receive::new(&mut conn)
             .borrowed(Id::ZERO, wire, boundary)
             .expect("DATA fixture");
-        match Events::new(&mut conn).poll_token().expect("DATA event") {
+        match next_event(&mut conn).expect("DATA event") {
             Some(Event::Data { message, data }) => (message, data),
             _ => panic!("DATA event"),
         }

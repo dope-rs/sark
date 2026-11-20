@@ -1,7 +1,7 @@
 use common::{
     hpack::{Fields, GET},
     protocol::{
-        Session,
+        self, Session,
         session::{Frame, Wire},
     },
 };
@@ -25,10 +25,7 @@ use crate::common::protocol::session::Authority;
 
 #[test]
 fn rejects_early_followup() {
-    let mut conn = Connection::<ClientRole>::with_push::<Authority>().expect("client fixture");
-    Session::new(&mut conn)
-        .try_prime()
-        .expect("protocol fixture");
+    let mut conn = protocol::try_push::<Authority>().expect("protocol fixture");
     let block = Fields::new(&GET).try_encode().expect("protocol fixture");
 
     assert!(matches!(
@@ -46,15 +43,10 @@ fn rejects_early_followup() {
 
 #[test]
 fn rejects_nested_push() {
-    let mut conn = Connection::<ClientRole>::with_push::<Authority>().expect("client fixture");
+    let mut conn = protocol::try_push::<Authority>().expect("protocol fixture");
     Session::new(&mut conn)
-        .try_prime()
-        .expect("protocol fixture");
-    conn.streams()
-        .headers()
-        .request([field::literal!(entry(b":method", b"GET"))], Boundary::End)
+        .try_start()
         .expect("protocol scenario precondition");
-    conn.transfer().drain(usize::MAX);
 
     conn.ingress()
         .ingest(
@@ -105,10 +97,7 @@ fn rejects_nested_push() {
 
 #[test]
 fn rejects_after_remote() {
-    let mut conn = Connection::<ClientRole>::with_push::<Authority>().expect("client fixture");
-    Session::new(&mut conn)
-        .try_prime()
-        .expect("protocol fixture");
+    let mut conn = protocol::try_push::<Authority>().expect("protocol fixture");
     conn.streams()
         .headers()
         .request([field::literal!(entry(b":method", b"GET"))], Boundary::More)
@@ -152,15 +141,10 @@ fn rejects_after_remote() {
 
 #[test]
 fn accepts_push_after_close() {
-    let mut conn = Connection::<ClientRole>::with_push::<Authority>().expect("client fixture");
+    let mut conn = protocol::try_push::<Authority>().expect("protocol fixture");
     Session::new(&mut conn)
-        .try_prime()
-        .expect("protocol fixture");
-    conn.streams()
-        .headers()
-        .request([field::literal!(entry(b":method", b"GET"))], Boundary::End)
+        .try_start()
         .expect("protocol scenario precondition");
-    conn.transfer().drain(usize::MAX);
     let response = Fields::new(&[Entry::new(b":status", b"200")])
         .try_encode()
         .expect("protocol fixture");
@@ -206,10 +190,7 @@ fn accepts_push_after_close() {
 
 #[test]
 fn accepts_push_after_many_resets() {
-    let mut conn = Connection::<ClientRole>::with_push::<Authority>().expect("client fixture");
-    Session::new(&mut conn)
-        .try_prime()
-        .expect("protocol fixture");
+    let mut conn = protocol::try_push::<Authority>().expect("protocol fixture");
     for _ in 0..257 {
         let id = conn
             .streams()
@@ -267,15 +248,10 @@ fn accepts_push_after_many_resets() {
 
 #[test]
 fn rejects_reused_promise() {
-    let mut conn = Connection::<ClientRole>::with_push::<Authority>().expect("client fixture");
+    let mut conn = protocol::try_push::<Authority>().expect("protocol fixture");
     Session::new(&mut conn)
-        .try_prime()
-        .expect("protocol fixture");
-    conn.streams()
-        .headers()
-        .request([field::literal!(entry(b":method", b"GET"))], Boundary::End)
+        .try_start()
         .expect("protocol scenario precondition");
-    conn.transfer().drain(usize::MAX);
     let invalid = Fields::new(&[
         Entry::new(b":scheme", b"http"),
         Entry::new(b":path", b"/missing-method"),
@@ -329,11 +305,9 @@ fn refused_push_drains_head() {
     Session::new(&mut conn)
         .try_prime()
         .expect("protocol fixture");
-    conn.streams()
-        .headers()
-        .request([field::literal!(entry(b":method", b"GET"))], Boundary::End)
+    Session::new(&mut conn)
+        .try_start()
         .expect("protocol scenario precondition");
-    conn.transfer().drain(usize::MAX);
     conn.ingress()
         .ingest(
             &Frame::new(

@@ -1,7 +1,7 @@
 use common::{
     hpack::{Fields, GET},
     protocol::{
-        Session,
+        self, Session,
         conn::Controls,
         session::{Frame, Wire},
     },
@@ -234,15 +234,10 @@ fn all_push_hpack_splits() {
     .expect("protocol fixture");
 
     for split in 0..=block.len() {
-        let mut conn = Connection::<ClientRole>::with_push::<Authority>().expect("client fixture");
+        let mut conn = protocol::try_push::<Authority>().expect("protocol fixture");
         Session::new(&mut conn)
-            .try_prime()
-            .expect("protocol fixture");
-        conn.streams()
-            .headers()
-            .request([field::literal!(entry(b":method", b"GET"))], Boundary::End)
+            .try_start()
             .expect("protocol scenario precondition");
-        conn.transfer().drain(usize::MAX);
 
         conn.ingress()
             .ingest(

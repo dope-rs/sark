@@ -11,7 +11,7 @@ use sark_h3::{
 };
 use sark_http::field::metadata::block::Connect;
 
-use crate::common::conn::{Events, build::Settings as _};
+use crate::common::conn::{build::Settings as _, next_event};
 
 pub mod content;
 pub mod pressure;
@@ -76,7 +76,7 @@ pub fn dynamic_sender<'d>(writes: usize, bytes: usize) -> Connection<'d> {
         )
         .expect("peer SETTINGS");
     assert!(matches!(
-        Events::new(&mut conn).poll_token().expect("SETTINGS event"),
+        next_event(&mut conn).expect("SETTINGS event"),
         Some(Event::Settings(settings)) if settings == peer
     ));
     conn.control().set_capacity(256).expect("table capacity");

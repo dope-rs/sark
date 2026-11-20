@@ -8,11 +8,7 @@ use std::{
 };
 
 use dope::{
-    core::{
-        driver::route::{FrameworkTag, KeyTag, Tag, kind, table::conn},
-        io::socket::Backlog,
-    },
-    manifold::timing,
+    core::driver::route::{FrameworkTag, Tag, kind},
     runtime::{executor::session, topology, topology::lending::Stage},
 };
 use dope_test::{
@@ -32,7 +28,6 @@ use sark_grpc::{
         service::handler::output::Streaming,
     },
 };
-use sark_h2::server::runtime::modes;
 
 use crate::common::{
     codec::Bytes,
@@ -46,14 +41,11 @@ use crate::common::{
 #[test]
 fn backpressure() {
     let harness = Pair::bind().expect("gRPC server-streaming harness");
-    let bind = harness.addr();
-    let config = Settings {
-        bind,
-        connections: conn::Capacity::fixed::<4>(),
-        backlog: Backlog::fixed::<16>(),
-        limits: Limits::default()
+    let config = Settings::new(
+        harness.addr(),
+        Limits::default()
             .with_output(Output::try_new(1, 13).expect("one-message server-stream output budget")),
-    };
+    );
 
     harness
         .run(
@@ -68,15 +60,7 @@ fn backpressure() {
                 let bank = Bank::try_new(config.connections.count(), config.limits)
                     .expect("gRPC readiness bank");
                 let prepared = config
-                    .h2::<KeyTag<0>>()
-                    .expect("H2 plan")
-                    .with_bound(listener)
-                    .with_plain::<_, modes::Serve<Infallible>>(Plan::new(
-                        handler,
-                        &bank,
-                        mode::Direct,
-                    ))
-                    .for_install::<timing::Throughput>()
+                    .try_prepare(listener, Plan::new(handler, &bank, mode::Direct))
                     .expect("server resources");
                 let mut reports =
                     Reports::new(prepared.layout(), [<FrameworkTag<kind::Any> as Tag>::ROUTE]);
@@ -153,13 +137,7 @@ fn backpressure() {
 #[test]
 fn status() {
     let harness = Pair::bind().expect("gRPC generated-status harness");
-    let bind = harness.addr();
-    let config = Settings {
-        bind,
-        connections: conn::Capacity::fixed::<4>(),
-        backlog: Backlog::fixed::<16>(),
-        limits: Limits::default(),
-    };
+    let config = Settings::new(harness.addr(), Limits::default());
 
     harness
         .run(
@@ -239,13 +217,7 @@ fn encode_rollback() {
 #[test]
 fn stream_timer() {
     let harness = Pair::bind().expect("gRPC server-stream deferred-output harness");
-    let bind = harness.addr();
-    let config = Settings {
-        bind,
-        connections: conn::Capacity::fixed::<4>(),
-        backlog: Backlog::fixed::<16>(),
-        limits: Limits::default(),
-    };
+    let config = Settings::new(harness.addr(), Limits::default());
 
     harness
         .run(
@@ -262,15 +234,7 @@ fn stream_timer() {
                 let bank = Bank::try_new(config.connections.count(), config.limits)
                     .expect("gRPC readiness bank");
                 let prepared = config
-                    .h2::<KeyTag<0>>()
-                    .expect("H2 plan")
-                    .with_bound(listener)
-                    .with_plain::<_, modes::Serve<Infallible>>(Plan::new(
-                        handler,
-                        &bank,
-                        mode::Direct,
-                    ))
-                    .for_install::<timing::Throughput>()
+                    .try_prepare(listener, Plan::new(handler, &bank, mode::Direct))
                     .expect("server resources");
                 let mut reports =
                     Reports::new(prepared.layout(), [<FrameworkTag<kind::Any> as Tag>::ROUTE]);

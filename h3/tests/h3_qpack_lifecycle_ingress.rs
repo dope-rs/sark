@@ -5,7 +5,7 @@ use sark_h3::{conn::io::Resume, frame::TYPE_HEADERS};
 use sark_http::field::literal;
 
 use crate::common::{
-    conn::{Connection as _, Events, payload::Write as _},
+    conn::{Connection as _, next_event, payload::Write as _},
     field::entry,
     ledger::Section as _,
     message::Frame as _,
@@ -136,8 +136,7 @@ fn reset_unblocks_next() {
         )
         .expect("fixed H3 QPACK scenario must succeed");
     assert!(
-        Events::new(&mut receiver)
-            .poll_token()
+        next_event(&mut receiver)
             .expect("fixed H3 QPACK scenario must succeed")
             .is_none()
     );
@@ -193,8 +192,7 @@ fn reset_unblocks_next() {
             == Id::new(7).expect("stream id")
     );
     assert!(matches!(
-        Events::new(&mut receiver)
-            .poll_token()
+        next_event(&mut receiver)
             .expect("fixed H3 QPACK scenario must succeed"),
         Some(Event::Reset {
             stream_id,
@@ -253,9 +251,7 @@ fn reset_unblocks_next() {
             Boundary::End,
         )
         .expect("fixed H3 QPACK scenario must succeed");
-    let event = Events::new(&mut receiver)
-        .poll_token()
-        .expect("fixed H3 QPACK scenario must succeed");
+    let event = next_event(&mut receiver).expect("fixed H3 QPACK scenario must succeed");
     assert!(
         match event {
             Some(Event::Headers { message, head, .. }) => {
@@ -443,7 +439,7 @@ fn credit_waits_for_unblock() {
             .is_none()
     );
     assert!(
-        matches!(Events::new(&mut receiver).poll_token().expect("fixed H3 QPACK scenario must succeed"), Some(Event::Headers {
+        matches!(next_event(&mut receiver).expect("fixed H3 QPACK scenario must succeed"), Some(Event::Headers {
             message,
             ..
         }) if message.stream_id() == Id::new(0).expect("stream id").into() && message.boundary() == Boundary::More)

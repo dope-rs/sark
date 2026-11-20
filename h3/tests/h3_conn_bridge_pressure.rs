@@ -2,10 +2,7 @@ use sark_h3::conn::Error;
 use sark_http::field::literal;
 
 use crate::common::{
-    conn::{
-        bridge::{Pair, certificate},
-        wire::{Ingress, Peer},
-    },
+    conn::bridge::{Pair, certificate, try_receive, try_send},
     field::entry,
 };
 
@@ -122,27 +119,18 @@ fn ack_wakes_retry() {
         .start(&mut client)
         .expect("client control stream must be admissible");
     let set_at = Instant::now() + Duration::from_secs(1);
-    Peer::new(&mut space, &mut client)
-        .try_send(&mut server, set_at, certificate)
+    try_send(&mut space, &mut client, &mut server, set_at, certificate)
         .expect("QUIC bridge transfer");
-    Ingress::new(&mut h3)
-        .try_receive(&mut server)
-        .expect("HTTP/3 bridge ingress");
-    Peer::new(&mut space, &mut server)
-        .try_send(&mut client, set_at, certificate)
+    try_receive(&mut h3, &mut server).expect("HTTP/3 bridge ingress");
+    try_send(&mut space, &mut server, &mut client, set_at, certificate)
         .expect("QUIC bridge transfer");
-    Ingress::new(&mut peer)
-        .try_receive(&mut client)
-        .expect("HTTP/3 bridge ingress");
+    try_receive(&mut peer, &mut client).expect("HTTP/3 bridge ingress");
     let set_ack = client
         .view()
         .send_at(set_at + Duration::from_millis(1));
-    Peer::new(&mut space, &mut client)
-        .try_send(&mut server, set_ack, certificate)
+    try_send(&mut space, &mut client, &mut server, set_ack, certificate)
         .expect("QUIC bridge transfer");
-    Ingress::new(&mut h3)
-        .try_receive(&mut server)
-        .expect("HTTP/3 bridge ingress");
+    try_receive(&mut h3, &mut server).expect("HTTP/3 bridge ingress");
     assert_eq!(
         server.view().with_streams(|view| view.usage().wire_bytes()),
         0
@@ -199,12 +187,9 @@ fn ack_wakes_retry() {
         "request headers must flush"
     );
     let req_at = set_ack + Duration::from_millis(1);
-    Peer::new(&mut space, &mut client)
-        .try_send(&mut server, req_at, certificate)
+    try_send(&mut space, &mut client, &mut server, req_at, certificate)
         .expect("QUIC bridge transfer");
-    Ingress::new(&mut h3)
-        .try_receive(&mut server)
-        .expect("HTTP/3 bridge ingress");
+    try_receive(&mut h3, &mut server).expect("HTTP/3 bridge ingress");
     server.with_scope(|mut scope| {
         let headers = h3
             .ingress()
@@ -236,21 +221,15 @@ fn ack_wakes_retry() {
         "response headers must flush"
     );
     let head_at = req_at + Duration::from_millis(1);
-    Peer::new(&mut space, &mut server)
-        .try_send(&mut client, head_at, certificate)
+    try_send(&mut space, &mut server, &mut client, head_at, certificate)
         .expect("QUIC bridge transfer");
-    Ingress::new(&mut peer)
-        .try_receive(&mut client)
-        .expect("HTTP/3 bridge ingress");
+    try_receive(&mut peer, &mut client).expect("HTTP/3 bridge ingress");
     let head_ack = client
         .view()
         .send_at(head_at + Duration::from_millis(1));
-    Peer::new(&mut space, &mut client)
-        .try_send(&mut server, head_ack, certificate)
+    try_send(&mut space, &mut client, &mut server, head_ack, certificate)
         .expect("QUIC bridge transfer");
-    Ingress::new(&mut h3)
-        .try_receive(&mut server)
-        .expect("HTTP/3 bridge ingress");
+    try_receive(&mut h3, &mut server).expect("HTTP/3 bridge ingress");
     assert_eq!(
         server.view().with_streams(|view| view.usage().wire_bytes()),
         0
@@ -315,12 +294,9 @@ fn ack_wakes_retry() {
     assert!(h3.h3().retained(request).expect("original retained charge") == held);
 
     let first_at = head_ack + Duration::from_millis(1);
-    Peer::new(&mut space, &mut server)
-        .try_send(&mut client, first_at, certificate)
+    try_send(&mut space, &mut server, &mut client, first_at, certificate)
         .expect("QUIC bridge transfer");
-    Ingress::new(&mut peer)
-        .try_receive(&mut client)
-        .expect("HTTP/3 bridge ingress");
+    try_receive(&mut peer, &mut client).expect("HTTP/3 bridge ingress");
     client.with_scope(|mut scope| {
         let data = peer
             .ingress()
@@ -336,12 +312,9 @@ fn ack_wakes_retry() {
     let ack_one = client
         .view()
         .send_at(first_at + Duration::from_millis(1));
-    Peer::new(&mut space, &mut client)
-        .try_send(&mut server, ack_one, certificate)
+    try_send(&mut space, &mut client, &mut server, ack_one, certificate)
         .expect("QUIC bridge transfer");
-    Ingress::new(&mut h3)
-        .try_receive(&mut server)
-        .expect("HTTP/3 bridge ingress");
+    try_receive(&mut h3, &mut server).expect("HTTP/3 bridge ingress");
     assert_eq!(
         server.view().with_streams(|view| view.usage().wire_bytes()),
         10
@@ -379,12 +352,9 @@ fn ack_wakes_retry() {
     assert_eq!(tail.owners, 1);
 
     let next_at = ack_one + Duration::from_millis(1);
-    Peer::new(&mut space, &mut server)
-        .try_send(&mut client, next_at, certificate)
+    try_send(&mut space, &mut server, &mut client, next_at, certificate)
         .expect("QUIC bridge transfer");
-    Ingress::new(&mut peer)
-        .try_receive(&mut client)
-        .expect("HTTP/3 bridge ingress");
+    try_receive(&mut peer, &mut client).expect("HTTP/3 bridge ingress");
     client.with_scope(|mut scope| {
         let data = peer
             .ingress()
@@ -400,12 +370,9 @@ fn ack_wakes_retry() {
     let ack_two = client
         .view()
         .send_at(next_at + Duration::from_millis(1));
-    Peer::new(&mut space, &mut client)
-        .try_send(&mut server, ack_two, certificate)
+    try_send(&mut space, &mut client, &mut server, ack_two, certificate)
         .expect("QUIC bridge transfer");
-    Ingress::new(&mut h3)
-        .try_receive(&mut server)
-        .expect("HTTP/3 bridge ingress");
+    try_receive(&mut h3, &mut server).expect("HTTP/3 bridge ingress");
     assert_eq!(
         server.view().with_streams(|view| view.usage().wire_bytes()),
         3
@@ -418,12 +385,9 @@ fn ack_wakes_retry() {
     );
 
     let last_at = ack_two + Duration::from_millis(1);
-    Peer::new(&mut space, &mut server)
-        .try_send(&mut client, last_at, certificate)
+    try_send(&mut space, &mut server, &mut client, last_at, certificate)
         .expect("QUIC bridge transfer");
-    Ingress::new(&mut peer)
-        .try_receive(&mut client)
-        .expect("HTTP/3 bridge ingress");
+    try_receive(&mut peer, &mut client).expect("HTTP/3 bridge ingress");
     client.with_scope(|mut scope| {
         let data = peer
             .ingress()
@@ -445,12 +409,9 @@ fn ack_wakes_retry() {
     let ack_last = client
         .view()
         .send_at(last_at + Duration::from_millis(1));
-    Peer::new(&mut space, &mut client)
-        .try_send(&mut server, ack_last, certificate)
+    try_send(&mut space, &mut client, &mut server, ack_last, certificate)
         .expect("QUIC bridge transfer");
-    Ingress::new(&mut h3)
-        .try_receive(&mut server)
-        .expect("HTTP/3 bridge ingress");
+    try_receive(&mut h3, &mut server).expect("HTTP/3 bridge ingress");
     assert_eq!(
         server.view().with_streams(|view| view.usage().wire_bytes()),
         0

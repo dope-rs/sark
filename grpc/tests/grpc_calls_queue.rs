@@ -1,4 +1,4 @@
-use crate::common::grpc::wire::Transfer;
+use crate::common::grpc::wire::transfer;
 pub mod common;
 
 use sark_grpc::{
@@ -37,12 +37,8 @@ fn drains_before_retiring() {
                 )
                 .into_result()
                 .expect("one response claim");
-                let ids = Transfer {
-                    client: &mut client,
-                    server: &mut server,
-                }
-                .try_request()
-                .expect("gRPC request transfer");
+                let ids = transfer::try_request(&mut client, &mut server)
+                    .expect("gRPC request transfer");
                 assert_eq!(ids.len(), 1);
                 let id = ids[0];
                 Response::new(&mut server, id)
@@ -51,12 +47,8 @@ fn drains_before_retiring() {
                 Response::new(&mut server, id)
                     .try_message(b"queued")
                     .expect("gRPC response fixture");
-                Transfer {
-                    client: &mut client,
-                    server: &mut server,
-                }
-                .try_response()
-                .expect("gRPC response transfer");
+                transfer::try_response(&mut client, &mut server)
+                    .expect("gRPC response transfer");
                 if code == Code::Ok {
                     let trailers =
                         Block::trailers(&Status::ok(), &metadata).expect("successful trailers");
@@ -72,12 +64,8 @@ fn drains_before_retiring() {
                         .try_cancel(key, numbers::ErrorCode::Cancel)
                         .expect("reset the response");
                 }
-                Transfer {
-                    client: &mut client,
-                    server: &mut server,
-                }
-                .try_response()
-                .expect("gRPC response transfer");
+                transfer::try_response(&mut client, &mut server)
+                    .expect("gRPC response transfer");
                 assert!(matches!(
                     response::Session::try_poll(&mut client, &stream),
                     Ok(Some(receive::Response::Headers { .. }))
@@ -143,23 +131,15 @@ fn reuses_open_claim() {
             )
             .into_result()
             .expect("one response claim");
-            let ids = Transfer {
-                client: &mut client,
-                server: &mut server,
-            }
-            .try_request()
-            .expect("gRPC request transfer");
+            let ids = transfer::try_request(&mut client, &mut server)
+                .expect("gRPC request transfer");
             assert_eq!(ids.len(), 1);
             let id = ids[0];
             Response::new(&mut server, id)
                 .try_header()
                 .expect("gRPC response fixture");
-            Transfer {
-                client: &mut client,
-                server: &mut server,
-            }
-            .try_response()
-            .expect("gRPC response transfer");
+            transfer::try_response(&mut client, &mut server)
+                .expect("gRPC response transfer");
             assert!(matches!(
                 response::Session::try_poll(&mut client, &stream),
                 Ok(Some(receive::Response::Headers { .. }))
@@ -173,12 +153,8 @@ fn reuses_open_claim() {
                 Response::new(&mut server, id)
                     .try_message(payload)
                     .expect("gRPC response fixture");
-                Transfer {
-                    client: &mut client,
-                    server: &mut server,
-                }
-                .try_response()
-                .expect("gRPC response transfer");
+                transfer::try_response(&mut client, &mut server)
+                    .expect("gRPC response transfer");
                 let event = response::Session::try_poll(&mut client, &stream)
                     .expect("later delivery uses the same claim")
                     .expect("later message is queued");
@@ -196,12 +172,8 @@ fn reuses_open_claim() {
                 .headers()
                 .trail(id, &trailers)
                 .expect("close response");
-            Transfer {
-                client: &mut client,
-                server: &mut server,
-            }
-            .try_response()
-            .expect("gRPC response transfer");
+            transfer::try_response(&mut client, &mut server)
+                .expect("gRPC response transfer");
             assert!(matches!(response::Session::try_poll(&mut client, &stream),
                 Ok(Some(receive::Response::Trailers { status })) if status.code() == Code::Ok));
         },

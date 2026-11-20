@@ -67,6 +67,18 @@ fn source_matches_protobuf() {
 }
 
 #[test]
+fn largest_field_number() {
+    use o3::buffer::storage;
+    use sark_grpc::encode::{Field, Plan as _};
+
+    let mut owner = storage::Shared::new();
+    Field::<{ (1 << 29) - 1 }>::new(b"x")
+        .write(&mut owner)
+        .expect("encode field");
+    assert_eq!(owner.as_slice(), b"\xfa\xff\xff\xff\x0f\x01x");
+}
+
+#[test]
 fn rejects_short_lease() {
     use o3::buffer::pool;
 

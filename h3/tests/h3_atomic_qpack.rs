@@ -3,7 +3,7 @@ use sark_http::field::literal;
 
 use crate::common::{
     atomic::dynamic_sender,
-    conn::{Events, payload::Write as _},
+    conn::{next_event, payload::Write as _},
     field::entry,
     message::promise::Authority,
     qpack::Instruction,
@@ -271,8 +271,7 @@ fn dynamic_batch_decodes() {
                     Boundary::More,
                 )
                 .expect("fixed atomic QPACK scenario must succeed");
-            assert!(match Events::new(&mut receiver)
-                .poll_token()
+            assert!(match next_event(&mut receiver)
                 .expect("fixed atomic QPACK scenario must succeed")
             {
                 Some(Event::Headers { head, .. }) => head.into_parts().0.iter().any(|field| {

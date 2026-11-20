@@ -2,7 +2,7 @@ use sark_h3::{conn::io::Step, frame::TYPE_HEADERS};
 use sark_http::field::literal;
 
 use crate::common::{
-    conn::Events,
+    conn::next_event,
     field::entry,
     ledger::{Section as _, owner::Held},
     message::Frame as _,
@@ -147,11 +147,11 @@ fn saturation_resumes_owner() {
     assert_eq!(link.accepted, [(0, wire_len)]);
     assert!(link.rejected.is_empty());
     assert!(
-        matches!(Events::new(&mut receiver).poll_token().expect("fixed H3 transport scenario must succeed"), Some(Event::Headers { message, .. })
+        matches!(next_event(&mut receiver).expect("fixed H3 transport scenario must succeed"), Some(Event::Headers { message, .. })
             if message.stream_id() == Id::new(0).expect("stream id").into() && message.boundary() == Boundary::More)
     );
     assert!(
-        matches!(Events::new(&mut receiver).poll_token().expect("fixed H3 transport scenario must succeed"), Some(Event::Data { message, data })
+        matches!(next_event(&mut receiver).expect("fixed H3 transport scenario must succeed"), Some(Event::Data { message, data })
             if message.stream_id() == Id::new(0).expect("stream id").into()
                 && matches!(message.boundary(), Boundary::End)
                 && data.segments().flatten().copied().eq(b"retained-body".iter().copied()))
@@ -195,12 +195,11 @@ fn token_survives_ingress() {
         .expect("fixed H3 transport scenario must succeed");
     assert_eq!(link.accepted, [(0, wire_len)]);
     assert!(
-        matches!(Events::new(&mut receiver).poll_token().expect("fixed H3 transport scenario must succeed"), Some(Event::Headers { message, .. })
+        matches!(next_event(&mut receiver).expect("fixed H3 transport scenario must succeed"), Some(Event::Headers { message, .. })
             if message.stream_id() == token && matches!(message.boundary(), Boundary::End))
     );
     assert!(
-        Events::new(&mut receiver)
-            .poll_token()
+        next_event(&mut receiver)
             .expect("fixed H3 transport scenario must succeed")
             .is_none()
     );
@@ -310,8 +309,7 @@ fn pump_commits_credit() {
         .expect("fixed H3 transport scenario must succeed");
     assert!(link.released.is_empty());
     assert!(
-        Events::new(&mut receiver)
-            .poll_token()
+        next_event(&mut receiver)
             .expect("fixed H3 transport scenario must succeed")
             .is_none()
     );
@@ -329,19 +327,19 @@ fn pump_commits_credit() {
         [(2, wire_len), (0, req_len), (4, next_len), (0, data_len),]
     );
     assert!(
-        matches!(Events::new(&mut receiver).poll_token().expect("fixed H3 transport scenario must succeed"), Some(Event::Headers {
+        matches!(next_event(&mut receiver).expect("fixed H3 transport scenario must succeed"), Some(Event::Headers {
             message,
             ..
         }) if message.stream_id() == Id::new(0).expect("stream id").into() && message.boundary() == Boundary::More)
     );
     assert!(
-        matches!(Events::new(&mut receiver).poll_token().expect("fixed H3 transport scenario must succeed"), Some(Event::Headers {
+        matches!(next_event(&mut receiver).expect("fixed H3 transport scenario must succeed"), Some(Event::Headers {
             message,
             ..
         }) if message.stream_id() == Id::new(4).expect("stream id").into() && matches!(message.boundary(), Boundary::End))
     );
     assert!(
-        matches!(Events::new(&mut receiver).poll_token().expect("fixed H3 transport scenario must succeed"), Some(Event::Data {
+        matches!(next_event(&mut receiver).expect("fixed H3 transport scenario must succeed"), Some(Event::Data {
             data,
             message,
             ..
@@ -349,8 +347,7 @@ fn pump_commits_credit() {
             && matches!(message.boundary(), Boundary::End))
     );
     assert!(
-        Events::new(&mut receiver)
-            .poll_token()
+        next_event(&mut receiver)
             .expect("fixed H3 transport scenario must succeed")
             .is_none()
     );

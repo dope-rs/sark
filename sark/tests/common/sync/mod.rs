@@ -1,7 +1,8 @@
-use std::{cell::Cell, ops::ControlFlow};
+use std::{cell::Cell, ops::ControlFlow, pin::Pin};
 
 use dope::core::driver::settings;
 use o3::{
+    base::cell::region,
     buffer::{raw::Slices, resident, storage},
     mem::rc,
 };
@@ -17,7 +18,7 @@ use sark_h2::{
     },
 };
 use sark_http::{
-    field::{self, Value},
+    field::{self, Pseudo, Value},
     method::Method,
     payload::{
         fixed,
@@ -32,6 +33,19 @@ pub const LIMITS: server::Config = server::Config {
     max_connection_body_chunks: 16 << 10,
     max_outbound_bytes: 1 << 20,
 };
+
+pub const OUTBOUND_LIMIT: usize = 1;
+
+pub fn backpressure_plan(body_bytes: usize) -> server::Plan {
+    let limits = server::Config {
+        max_request_body_bytes: body_bytes,
+        max_connection_body_bytes: body_bytes,
+        max_outbound_bytes: OUTBOUND_LIMIT,
+        ..LIMITS
+    };
+    server::Plan::new(limits, settings::Receive::fixed::<2, { 16 << 10 }>())
+        .expect("test limits fit the receive plan")
+}
 
 #[derive(Debug)]
 pub enum Build {
@@ -52,6 +66,28 @@ pub fn try_build<R>(router: R, limits: server::Config) -> Result<sync::Endpoint<
     sync::Endpoint::try_new(router, plan).map_err(Build::Endpoint)
 }
 
+pub fn with_domain(run: impl for<'d> FnOnce(&'d mut resident::Domain, region::Identity<'d>)) {
+    let mut domain = resident::Domain::new();
+    region::Token::scope_pinned(Pin::new(&mut domain), |token, domain| {
+        run(domain.get_mut(), token.proof());
+    });
+}
+
+pub fn connection<'e, 'd: 'e, R: sync::Dispatch<'d>>(
+    endpoint: &'e sync::Endpoint<R>,
+    domain: &'d mut resident::Domain,
+    proof: region::Identity<'d>,
+    capacity: usize,
+) -> sync::Conn<'e, 'd, R> {
+    let budget = domain.try_budget(capacity, proof).expect("resident budget");
+    let mut server = sync::Conn::try_new(endpoint).expect("sync connection");
+    server
+        .ingress()
+        .try_bind(budget)
+        .expect("connection retention");
+    server
+}
+
 pub struct State {
     pub request_body: Cell<usize>,
     pub request_head: Cell<usize>,
@@ -59,6 +95,19 @@ pub struct State {
     pub large_body: storage::Shared,
     pub invalid_path: Cell<bool>,
     pub header_error: Cell<Option<field::Error>>,
+}
+
+impl State {
+    pub fn new(large_body: storage::Shared) -> Self {
+        Self {
+            request_body: Cell::new(0),
+            request_head: Cell::new(0),
+            invalid_path: Cell::new(false),
+            header_error: Cell::new(None),
+            dispatches: Cell::new(0),
+            large_body,
+        }
+    }
 }
 
 #[sark::request]
@@ -194,6 +243,7 @@ sark::define_router! {
     }
 }
 
+#[derive(Default)]
 pub struct DeniedState {
     pub guards: Cell<usize>,
     pub dispatches: Cell<usize>,
@@ -289,32 +339,52 @@ pub struct Client<'a> {
     connection: &'a mut machine::Connection<ClientRole>,
 }
 
+pub fn client() -> machine::Connection<ClientRole> {
+    machine::Connection::try_new().expect("client fixture")
+}
+
+pub fn try_peer(
+    settings: config::Settings,
+    recv_window_target: u32,
+) -> Result<machine::Connection<ClientRole>, config::Error> {
+    machine::Connection::with_config(config::Config {
+        local_settings: settings,
+        recv_window_target,
+        ..Default::default()
+    })
+}
+
 impl<'a> Client<'a> {
-    /// Admits fixture bytes once; literal callers evaluate this at compile time.
-    pub const fn field<'f>(
-        name: &'f [u8],
-        value: &'f [u8],
-    ) -> Result<field::Entry<'f>, field::Error> {
-        let value = match field::Value::try_bytes(value) {
-            Ok(value) => value,
-            Err(error) => return Err(error),
-        };
-        let pseudo = match name {
-            b":method" => field::Pseudo::Method,
-            b":scheme" => field::Pseudo::Scheme,
-            b":authority" => field::Pseudo::Authority,
-            b":path" => field::Pseudo::Path,
-            b":protocol" => field::Pseudo::Protocol,
-            b":status" => field::Pseudo::Status,
-            _ => {
-                let name = match field::Lower::try_bytes(name) {
-                    Ok(name) => name,
-                    Err(error) => return Err(error),
-                };
-                return Ok(field::Entry::new(name, value));
-            }
-        };
-        Ok(field::Entry::pseudo(pseudo, value))
+    const SCHEME: field::Entry<'static> =
+        field::Entry::pseudo(Pseudo::Scheme, field::literal!(Value::try_bytes(b"http")));
+    const AUTHORITY: field::Entry<'static> = field::Entry::pseudo(
+        Pseudo::Authority,
+        field::literal!(Value::try_bytes(b"localhost")),
+    );
+
+    pub const fn get_head(path: Value<&[u8]>) -> [field::Entry<'_>; 4] {
+        [
+            field::Entry::pseudo(Pseudo::Method, field::literal!(Value::try_bytes(b"GET"))),
+            Self::SCHEME,
+            field::Entry::pseudo(Pseudo::Path, path),
+            Self::AUTHORITY,
+        ]
+    }
+
+    pub const fn post_head<'f>(
+        path: Value<&'f [u8]>,
+        length: Value<&'f [u8]>,
+    ) -> [field::Entry<'f>; 5] {
+        [
+            field::Entry::pseudo(Pseudo::Method, field::literal!(Value::try_bytes(b"POST"))),
+            Self::SCHEME,
+            field::Entry::pseudo(Pseudo::Path, path),
+            Self::AUTHORITY,
+            field::Entry::new(
+                field::literal!(field::Lower::try_bytes(b"content-length")),
+                length,
+            ),
+        ]
     }
 
     pub fn new(conn: &'a mut machine::Connection<ClientRole>) -> Self {
@@ -326,12 +396,7 @@ impl<'a> Client<'a> {
             .streams()
             .headers()
             .request(
-                [
-                    field::literal!(Self::field(b":method", b"GET")),
-                    field::literal!(Self::field(b":scheme", b"http")),
-                    Self::field(b":path", path).map_err(Build::Field)?,
-                    field::literal!(Self::field(b":authority", b"localhost")),
-                ],
+                Self::get_head(Value::try_bytes(path).map_err(Build::Field)?),
                 Boundary::End,
             )
             .map_err(Build::Protocol)?;
@@ -344,14 +409,10 @@ impl<'a> Client<'a> {
             .streams()
             .headers()
             .request(
-                [
-                    field::literal!(Self::field(b":method", b"POST")),
-                    field::literal!(Self::field(b":scheme", b"http")),
-                    Self::field(b":path", path).map_err(Build::Field)?,
-                    field::literal!(Self::field(b":authority", b"localhost")),
-                    Self::field(b"content-length", body.len().to_string().as_bytes())
-                        .map_err(Build::Field)?,
-                ],
+                Self::post_head(
+                    Value::try_bytes(path).map_err(Build::Field)?,
+                    Value::try_bytes(body.len().to_string().as_bytes()).map_err(Build::Field)?,
+                ),
                 Boundary::More,
             )
             .map_err(Build::Protocol)?;

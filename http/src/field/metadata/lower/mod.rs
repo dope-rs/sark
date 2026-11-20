@@ -1,6 +1,6 @@
 use core::{convert::Infallible, mem};
 
-use crate::field::metadata::{map::record, strings};
+use crate::field::metadata::map::record;
 
 #[doc(hidden)]
 pub mod fixed;
@@ -71,25 +71,17 @@ impl From<plain::Error> for Error {
 }
 
 #[doc(hidden)]
-#[must_use = "handle the direct string transition"]
-pub enum Step {
-    Ready {
-        cursor: strings::Cursor,
-    },
-    Bound {
-        cause: decoder::Error,
-    },
+pub enum StringError {
+    Bound(decoder::Error),
     Decode {
         cause: decoder::DecodeError<Infallible>,
         progress: decoder::Progress,
     },
-    Store {
-        cause: Error,
-    },
+    Store(Error),
 }
 
 const _: () = assert!(mem::size_of::<Result<(), Error>>() == mem::size_of::<Error>());
-const _: () = assert!(mem::size_of::<Step>() == mem::size_of::<Error>());
+const _: () = assert!(mem::size_of::<Result<(), StringError>>() == mem::size_of::<Error>());
 
 #[doc(hidden)]
 pub struct Lower<'a, P: section::Policy> {

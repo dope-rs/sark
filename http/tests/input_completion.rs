@@ -35,12 +35,12 @@ fn keeps_scratch_prefix() {
     let mut input = lower::Input::new(writer);
     input.try_scratch(&mut scratch).expect("scratch");
     assert!(matches!(
-        input.string(
+        input.try_string(
             &mut scratch,
-            Cursor::new(huffman::LONG.len(), Encoding::Plain),
+            &mut Cursor::new(huffman::LONG.len(), Encoding::Plain),
             huffman::LONG,
         ),
-        lower::Step::Ready { .. }
+        Ok(())
     ));
     input.rollback(&mut scratch);
     let pointer = scratch.authority().as_ptr();
@@ -62,25 +62,24 @@ fn keeps_scratch_prefix() {
     .expect("scratch selection");
     input.try_scratch(&mut scratch).expect("ready");
     assert!(matches!(
-        input.string(
+        input.try_string(
             &mut scratch,
-            Cursor::new(huffman::PREFIX.len(), Encoding::Plain),
+            &mut Cursor::new(huffman::PREFIX.len(), Encoding::Plain),
             huffman::PREFIX,
         ),
-        lower::Step::Ready { .. }
+        Ok(())
     ));
-    let progress = match input.string(
-        &mut scratch,
-        Cursor::new(huffman::INVALID.len(), Encoding::Huffman),
-        huffman::INVALID,
-    ) {
-        lower::Step::Decode {
+    let mut cursor = Cursor::new(huffman::INVALID.len(), Encoding::Huffman);
+    let before = cursor;
+    let progress = match input.try_string(&mut scratch, &mut cursor, huffman::INVALID) {
+        Err(lower::StringError::Decode {
             cause: DecodeError::InvalidEncoding(decoder::Error),
             progress,
-        } => Some(progress),
+        }) => Some(progress),
         _ => None,
     }
     .expect("invalid encoding");
+    assert!(cursor == before);
     assert_eq!((progress.consumed(), progress.decoded()), (5, 3));
     done.try_finish::<rules::RejectPush>(&mut state, &mut input, &mut scratch)
         .expect("retain decoded prefix");
@@ -119,10 +118,10 @@ fn rejects_invalid_start() {
     let mut input = lower::Input::new(writer);
     let mut scratch = storage::Scratch::default();
     assert!(matches!(
-        input.string(&mut scratch, Cursor::new(1, Encoding::Plain), b"x"),
-        lower::Step::Store {
-            cause: lower::Error::State(lower::State::Ready)
-        }
+        input.try_string(&mut scratch, &mut Cursor::new(1, Encoding::Plain), b"x"),
+        Err(lower::StringError::Store(lower::Error::State(
+            lower::State::Ready
+        )))
     ));
     input.try_scratch(&mut scratch).expect("ready");
     assert_eq!(input.try_ready(), Err(lower::State::Scratch));
@@ -152,8 +151,8 @@ fn rejects_early_finish() {
     .expect("begin");
     assert!(matches!(start, Start::Direct(_)));
     assert!(matches!(
-        input.string(&mut scratch, Cursor::new(2, Encoding::Plain), b"a"),
-        lower::Step::Ready { .. }
+        input.try_string(&mut scratch, &mut Cursor::new(2, Encoding::Plain), b"a"),
+        Ok(())
     ));
     let cause = Omit
         .try_finish::<rules::RejectPush>(&mut state, &mut input, &mut scratch)
@@ -186,14 +185,14 @@ fn rejects_stored_mutation() {
     )
     .expect("begin");
     assert!(matches!(
-        input.string(&mut scratch, Cursor::new(1, Encoding::Plain), b"a"),
-        lower::Step::Ready { .. }
+        input.try_string(&mut scratch, &mut Cursor::new(1, Encoding::Plain), b"a"),
+        Ok(())
     ));
     assert!(matches!(
-        input.string(&mut scratch, Cursor::new(1, Encoding::Plain), b"b"),
-        lower::Step::Store {
-            cause: lower::Error::State(lower::State::Stored)
-        }
+        input.try_string(&mut scratch, &mut Cursor::new(1, Encoding::Plain), b"b"),
+        Err(lower::StringError::Store(lower::Error::State(
+            lower::State::Stored
+        )))
     ));
     assert!(matches!(
         <fixed::Discard as Sink<rules::Discard>>::field::<rules::RejectPush>(
@@ -231,12 +230,12 @@ fn uses_stored_length() {
     )
     .expect("begin");
     assert!(matches!(
-        input.string(&mut scratch, Cursor::new(2, Encoding::Plain), b"a"),
-        lower::Step::Ready { .. }
+        input.try_string(&mut scratch, &mut Cursor::new(2, Encoding::Plain), b"a"),
+        Ok(())
     ));
     assert!(matches!(
-        input.string(&mut scratch, Cursor::new(1, Encoding::Plain), b"b"),
-        lower::Step::Ready { .. }
+        input.try_string(&mut scratch, &mut Cursor::new(1, Encoding::Plain), b"b"),
+        Ok(())
     ));
     Omit.try_finish::<rules::RejectPush>(&mut state, &mut input, &mut scratch)
         .expect("complete");

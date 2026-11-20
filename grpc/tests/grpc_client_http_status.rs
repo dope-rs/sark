@@ -8,7 +8,7 @@ use common::grpc::{
             SECOND_RESPONSE, Settings,
         },
     },
-    wire::Transfer,
+    wire::transfer,
 };
 use sark_core::manifold::stream::Boundary;
 use sark_grpc::{
@@ -33,16 +33,16 @@ fn ignores_informational() {
             let call = bidi::Session::open(&mut client, b"/svc/Watch", None, &Metadata::new()).expect("call");
             let call = bidi::Session::finish(&mut client, call).expect("request end");
             let mut server = Connection::<ServerRole>::try_new().expect("server");
-            let ids = Transfer { client: &mut client, server: &mut server }.try_request().expect("request");
+            let ids = transfer::try_request(&mut client, &mut server).expect("request");
             let mut info = Block::new();
             info.push(b":status", b"103").expect("informational status");
             info.push(b"x-meta-bin", b"!").expect("HTTP metadata");
             info.push(b"grpc-status", b"0").expect("interim metadata");
             server.streams().headers().respond(ids[0], &info, Boundary::More).expect("informational headers");
-            Transfer { client: &mut client, server: &mut server }.try_response().expect("interim response");
+            transfer::try_response(&mut client, &mut server).expect("interim response");
             assert!(response::Session::try_poll(&mut client, &call).expect("ignore informational fields").is_none());
             Response::new(&mut server, ids[0]).try_respond(FIRST_RESPONSE).expect("final response");
-            Transfer { client: &mut client, server: &mut server }.try_response().expect("final transfer");
+            transfer::try_response(&mut client, &mut server).expect("final transfer");
             assert!(matches!(response::Session::try_poll(&mut client, &call), Ok(Some(receive::Response::Headers { .. }))));
             let event = response::Session::try_poll(&mut client, &call).expect("message").expect("queued message");
             let message = match event {
@@ -63,12 +63,8 @@ fn terminal_status_priority() {
             |mut client| {
                 let calls = client.try_unary(2).expect("concurrent unary calls");
                 let mut server = Connection::<ServerRole>::try_new().expect("server");
-                let streams = Transfer {
-                    client: &mut client,
-                    server: &mut server,
-                }
-                .try_request()
-                .expect("request transfer");
+                let streams = transfer::try_request(&mut client, &mut server)
+                    .expect("request transfer");
                 assert_eq!(streams.len(), 2);
                 Response::new(&mut server, streams[0])
                     .try_http(b"503", media, code, Boundary::End)
@@ -76,12 +72,8 @@ fn terminal_status_priority() {
                 Response::new(&mut server, streams[1])
                     .try_respond(FIRST_RESPONSE)
                     .expect("concurrent success");
-                Transfer {
-                    client: &mut client,
-                    server: &mut server,
-                }
-                .try_response()
-                .expect("HTTP error remains local to its call");
+                transfer::try_response(&mut client, &mut server)
+                    .expect("HTTP error remains local to its call");
 
                 let response = unary::Session::try_poll(&mut client, &calls[0])
                     .expect("error call lookup")
@@ -121,12 +113,8 @@ fn rejects_ok_media() {
             |mut client| {
                 let calls = client.try_unary(3).expect("concurrent unary calls");
                 let mut server = Connection::<ServerRole>::try_new().expect("server");
-                let streams = Transfer {
-                    client: &mut client,
-                    server: &mut server,
-                }
-                .try_request()
-                .expect("request transfer");
+                let streams = transfer::try_request(&mut client, &mut server)
+                    .expect("request transfer");
                 Response::new(&mut server, streams[0])
                     .try_respond(FIRST_RESPONSE)
                     .expect("occupy completion slot");
@@ -145,12 +133,8 @@ fn rejects_ok_media() {
                 Response::new(&mut server, streams[2])
                     .try_respond(SECOND_RESPONSE)
                     .expect("healthy response after rejected media");
-                Transfer {
-                    client: &mut client,
-                    server: &mut server,
-                }
-                .try_response()
-                .expect("invalid media stays local while completion is full");
+                transfer::try_response(&mut client, &mut server)
+                    .expect("invalid media stays local while completion is full");
 
                 drop(
                     unary::Session::try_poll(&mut client, &calls[0])
@@ -189,12 +173,8 @@ fn drains_http_body() {
             |mut client| {
                 let calls = client.try_unary(2).expect("concurrent unary calls");
                 let mut server = Connection::<ServerRole>::try_new().expect("server");
-                let streams = Transfer {
-                    client: &mut client,
-                    server: &mut server,
-                }
-                .try_request()
-                .expect("request transfer");
+                let streams = transfer::try_request(&mut client, &mut server)
+                    .expect("request transfer");
                 assert_eq!(streams.len(), 2);
                 Response::new(&mut server, streams[0])
                     .try_http(b"503", Some(b"text/html"), None, Boundary::More)
@@ -208,12 +188,8 @@ fn drains_http_body() {
                 Response::new(&mut server, streams[0])
                     .try_trailers(code)
                     .expect("terminal headers");
-                Transfer {
-                    client: &mut client,
-                    server: &mut server,
-                }
-                .try_response()
-                .expect("HTTP error body drains without failing the connection");
+                transfer::try_response(&mut client, &mut server)
+                    .expect("HTTP error body drains without failing the connection");
 
                 let response = unary::Session::try_poll(&mut client, &calls[0])
                     .expect("error call lookup")
@@ -243,12 +219,8 @@ fn retains_grpc_override() {
         |mut client| {
             let calls = client.try_unary(2).expect("concurrent unary calls");
             let mut server = Connection::<ServerRole>::try_new().expect("server");
-            let streams = Transfer {
-                client: &mut client,
-                server: &mut server,
-            }
-            .try_request()
-            .expect("request transfer");
+            let streams = transfer::try_request(&mut client, &mut server)
+                .expect("request transfer");
             assert_eq!(streams.len(), 2);
             Response::new(&mut server, streams[0])
                 .try_http(b"503", Some(b"application/grpc"), None, Boundary::More)
@@ -262,12 +234,8 @@ fn retains_grpc_override() {
             Response::new(&mut server, streams[0])
                 .try_trailers(Some(Code::Ok))
                 .expect("successful gRPC status overrides initial HTTP status");
-            Transfer {
-                client: &mut client,
-                server: &mut server,
-            }
-            .try_response()
-            .expect("gRPC responses remain independent");
+            transfer::try_response(&mut client, &mut server)
+                .expect("gRPC responses remain independent");
 
             let response = unary::Session::try_poll(&mut client, &calls[0])
                 .expect("first call lookup")
@@ -301,12 +269,8 @@ fn ends_without_trailers() {
         |mut client| {
             let calls = client.try_unary(2).expect("concurrent unary calls");
             let mut server = Connection::<ServerRole>::try_new().expect("server");
-            let streams = Transfer {
-                client: &mut client,
-                server: &mut server,
-            }
-            .try_request()
-            .expect("request transfer");
+            let streams = transfer::try_request(&mut client, &mut server)
+                .expect("request transfer");
             assert_eq!(streams.len(), 2);
             Response::new(&mut server, streams[0])
                 .try_http(b"503", None, None, Boundary::More)
@@ -317,12 +281,8 @@ fn ends_without_trailers() {
             Response::new(&mut server, streams[1])
                 .try_respond(FIRST_RESPONSE)
                 .expect("concurrent success");
-            Transfer {
-                client: &mut client,
-                server: &mut server,
-            }
-            .try_response()
-            .expect("missing gRPC trailers remain local to their call");
+            transfer::try_response(&mut client, &mut server)
+                .expect("missing gRPC trailers remain local to their call");
 
             let response = unary::Session::try_poll(&mut client, &calls[0])
                 .expect("error call lookup")

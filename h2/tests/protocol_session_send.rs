@@ -1,7 +1,7 @@
 use common::{
     hpack::{Fields, GET},
     protocol::{
-        Session,
+        self, Session,
         conn::{Control, Controls},
         session::{Authority, Frame},
     },
@@ -24,10 +24,7 @@ use sark_h2::{
 
 #[test]
 fn bad_data_keeps_credit() {
-    let mut conn = Connection::<ClientRole>::with_push::<Authority>().expect("client fixture");
-    Session::new(&mut conn)
-        .try_prime()
-        .expect("protocol fixture");
+    let mut conn = protocol::try_push::<Authority>().expect("protocol fixture");
     let id = conn
         .streams()
         .headers()
@@ -131,10 +128,7 @@ fn stalled_data_chunks() {
 
 #[test]
 fn window_resumes_data() {
-    let mut conn = Connection::<ClientRole>::with_push::<Authority>().expect("client fixture");
-    Session::new(&mut conn)
-        .try_prime()
-        .expect("protocol fixture");
+    let mut conn = protocol::try_push::<Authority>().expect("protocol fixture");
 
     let id = conn
         .streams()
@@ -193,10 +187,7 @@ fn window_resumes_data() {
 
 #[test]
 fn settings_adjust_window() {
-    let mut conn = Connection::<ServerRole>::try_new().expect("server fixture");
-    Session::new(&mut conn)
-        .try_prime()
-        .expect("protocol fixture");
+    let mut conn = protocol::try_connection::<ServerRole>().expect("protocol fixture");
 
     let block = Fields::new(&GET).try_encode().expect("protocol fixture");
     conn.ingress()

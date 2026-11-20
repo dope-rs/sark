@@ -3,10 +3,7 @@ pub mod common;
 use std::time::{Duration, Instant};
 
 use common::{
-    conn::{
-        bridge::Pair,
-        wire::{Ingress, Peer},
-    },
+    conn::bridge::{Pair, try_receive, try_send},
     field::entry,
     ledger::Section as _,
 };
@@ -85,12 +82,9 @@ fn encoder_resumes_request() {
         now = client
             .view()
             .send_at(now + Duration::from_millis(1));
-        Peer::new(&mut space, &mut client)
-            .try_send(&mut server, now, |_| {})
+        try_send(&mut space, &mut client, &mut server, now, |_| {})
             .expect("request transfer");
-        Ingress::new(&mut h3)
-            .try_receive(&mut server)
-            .expect("blocked ingress");
+        try_receive(&mut h3, &mut server).expect("blocked ingress");
         server.with_scope(|mut scope| {
             assert!(matches!(
                 h3.ingress().consume(&mut scope, |_| ()),
@@ -107,12 +101,9 @@ fn encoder_resumes_request() {
     now = client
         .view()
         .send_at(now + Duration::from_millis(1));
-    Peer::new(&mut space, &mut client)
-        .try_send(&mut server, now, |_| {})
+    try_send(&mut space, &mut client, &mut server, now, |_| {})
         .expect("encoder transfer");
-    Ingress::new(&mut h3)
-        .try_receive(&mut server)
-        .expect("encoder ingress");
+    try_receive(&mut h3, &mut server).expect("encoder ingress");
     server.with_scope(|mut scope| {
         let head = h3
             .ingress()

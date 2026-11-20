@@ -15,8 +15,8 @@ use dope::{
     },
     manifold::{
         self,
-        app::env::quota,
-        network::listener::{config::Flights, handler::failures},
+        app::env::{self, quota},
+        network::listener::{config::Flights, handler::failures, topology::Direct},
         timing,
     },
     net::{tcp, wire},
@@ -36,6 +36,15 @@ use sark_h2::{
 };
 
 const H2: u8 = 0;
+
+type Prepared<F> = topology::Prepared<
+    (),
+    Direct<
+        KeyTag<H2>,
+        env::Bundle<tcp::Tcp, wire::Identity, timing::Throughput>,
+        runtime::Local<F, modes::Serve<convert::Infallible>>,
+    >,
+>;
 
 #[derive(Debug)]
 pub enum Error {
@@ -100,6 +109,15 @@ impl Settings {
         )
     }
 
+    pub fn try_prepare<F>(&self, listener: Listener, service: F) -> Result<Prepared<F>, Error> {
+        self.h2::<KeyTag<H2>>()
+            .map_err(Error::Config)?
+            .with_bound(listener)
+            .with_plain::<_, modes::Serve<convert::Infallible>>(service)
+            .for_install::<timing::Throughput>()
+            .map_err(Error::Layout)
+    }
+
     pub fn try_serve_on<H: Handler, C: executor::Build>(
         self,
         handler: H,
@@ -129,15 +147,10 @@ impl Settings {
             modes::Direct<modes::Serve<convert::Infallible>, wire::Identity, KeyTag<H2>>,
     {
         let bank = Bank::try_new(self.connections.count(), self.limits).map_err(Error::Bank)?;
-        let prepared = self
-            .h2::<KeyTag<H2>>()
-            .map_err(Error::Config)?
-            .with_bound(listener)
-            .with_plain::<_, modes::Serve<convert::Infallible>>(
-                Plan::new(handler, &bank, mode::Direct).report(report),
-            )
-            .for_install::<timing::Throughput>()
-            .map_err(Error::Layout)?;
+        let prepared = self.try_prepare(
+            listener,
+            Plan::new(handler, &bank, mode::Direct).report(report),
+        )?;
         let mut reports =
             Reports::<_>::new(prepared.layout(), [<FrameworkTag<kind::Any> as Tag>::ROUTE]);
         let mut finish = Completion::new();

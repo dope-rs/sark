@@ -5,7 +5,6 @@ use o3::buffer::{self, pool, storage};
 use crate::{Reason, Status};
 
 mod field;
-mod varint;
 
 pub use field::Field;
 

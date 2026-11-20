@@ -1,10 +1,12 @@
+pub mod common;
+
+use common::protocol::session::header;
 use sark_h2::{
     frame,
     frame::{
         Ack,
         controls::{Priority, RstStream, Settings},
-        layout::Header,
-        numbers::{Flags, Increment, Length, ParseError, Type},
+        numbers::{Increment, ParseError, Type},
         payload::{Continuation, Payload, Ping, WindowUpdate},
     },
     stream::Id,
@@ -12,12 +14,7 @@ use sark_h2::{
 
 #[test]
 fn ping_size_beats_protocol() {
-    let h = Header {
-        length: Length::new(7).expect("fixture domain"),
-        kind: Type::Ping,
-        flags: Flags(0),
-        stream_id: Id::new(1).expect("fixture domain"),
-    };
+    let h = header(7, Type::Ping, 0, 1);
     assert!(
         Ping::parse(h, &[0u8; 7])
             == Err(ParseError::FrameSize {
@@ -30,12 +27,7 @@ fn ping_size_beats_protocol() {
 
 #[test]
 fn priority_checks_size() {
-    let h = Header {
-        length: Length::new(4).expect("fixture domain"),
-        kind: Type::Priority,
-        flags: Flags(0),
-        stream_id: Id::new(0).expect("fixture domain"),
-    };
+    let h = header(4, Type::Priority, 0, 0);
     assert!(
         Priority::parse(h, &[0, 0, 0, 0])
             == Err(ParseError::FrameSize {
@@ -48,12 +40,7 @@ fn priority_checks_size() {
 
 #[test]
 fn rst_size_beats_protocol() {
-    let h = Header {
-        length: Length::new(3).expect("fixture domain"),
-        kind: Type::RstStream,
-        flags: Flags(0),
-        stream_id: Id::new(0).expect("fixture domain"),
-    };
+    let h = header(3, Type::RstStream, 0, 0);
     assert!(
         RstStream::parse(h, &[0, 0, 0])
             == Err(ParseError::FrameSize {
@@ -66,12 +53,7 @@ fn rst_size_beats_protocol() {
 
 #[test]
 fn settings_checks_size() {
-    let h = Header {
-        length: Length::new(5).expect("fixture domain"),
-        kind: Type::Settings,
-        flags: Flags(0),
-        stream_id: Id::new(3).expect("fixture domain"),
-    };
+    let h = header(5, Type::Settings, 0, 3);
     assert!(
         Settings::parse(h, &[0u8; 5])
             == Err(ParseError::SettingsSize {
@@ -83,12 +65,7 @@ fn settings_checks_size() {
 
 #[test]
 fn window_r_bit() {
-    let h = Header {
-        length: Length::new(4).expect("fixture domain"),
-        kind: Type::WindowUpdate,
-        flags: Flags(0),
-        stream_id: Id::new(1).expect("fixture domain"),
-    };
+    let h = header(4, Type::WindowUpdate, 0, 1);
     let result = WindowUpdate::parse(h, &[0xff, 0xff, 0xff, 0xff]);
     let w = result.expect("valid frame fixture must parse");
     assert_eq!(w.increment.get(), 0x7fff_ffff);
@@ -96,12 +73,7 @@ fn window_r_bit() {
 
 #[test]
 fn cont_zero_stream() {
-    let h = Header {
-        length: Length::new(0).expect("fixture domain"),
-        kind: Type::Continuation,
-        flags: Flags(0),
-        stream_id: Id::new(0).expect("fixture domain"),
-    };
+    let h = header(0, Type::Continuation, 0, 0);
     assert!(
         Continuation::parse(h, &[])
             == Err(ParseError::Stream {
