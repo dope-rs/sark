@@ -7,7 +7,7 @@ use common::fields::{
     RESPONSE, try_encode,
 };
 use o3::buffer::write::Slice;
-use sark_h1::wire::{Failure, head, output};
+use sark_h1::wire::{Failure, output};
 use sark_http::field;
 use sark_http::payload::{
     fixed::Body,
@@ -20,9 +20,12 @@ fn head_emits_once() {
     let response = Static::new(Code::OK, Counted { emissions: &emits }, Body::new(b"body"));
     let mut bytes = [0; 512];
     let mut writer = Slice::new(&mut bytes);
-    let outcome = output::Egress::new(writer.reborrow(), DATE, RESPONSE)
-        .plain(response, head::Connection::KeepAlive);
-    let output::Outcome::SendStatic { .. } = outcome else {
+    let outcome = output::Egress::new(writer.reborrow(), DATE, RESPONSE).try_route(
+        response,
+        &mut (),
+        common::fields::PLAIN,
+    );
+    let Ok(output::Complete::Static { .. }) = outcome else {
         panic!("valid static response must be emitted");
     };
 
@@ -40,10 +43,12 @@ fn grouped_capacity() {
     let mut expected = [0xa5; 256];
     let mut writer = Slice::new(&mut expected);
     let response = Static::new(Code::OK, ENTRIES, Body::new(b"body"));
-    let length = match output::Egress::new(writer.reborrow(), DATE, RESPONSE)
-        .plain(response, head::Connection::KeepAlive)
-    {
-        output::Outcome::SendStatic { .. } => Some(writer.len()),
+    let length = match output::Egress::new(writer.reborrow(), DATE, RESPONSE).try_route(
+        response,
+        &mut (),
+        common::fields::PLAIN,
+    ) {
+        Ok(output::Complete::Static { .. }) => Some(writer.len()),
         _ => None,
     }
     .expect("the complete scalar header must fit");
@@ -54,17 +59,22 @@ fn grouped_capacity() {
         let mut scalar_writer = Slice::new(&mut scalar[..capacity]);
         let mut grouped_writer = Slice::new(&mut grouped[..capacity]);
         let response = Static::new(Code::OK, ENTRIES, Body::new(b"body"));
-        let first = output::Egress::new(scalar_writer.reborrow(), DATE, RESPONSE)
-            .plain(response, head::Connection::KeepAlive);
+        let first = output::Egress::new(scalar_writer.reborrow(), DATE, RESPONSE).try_route(
+            response,
+            &mut (),
+            common::fields::PLAIN,
+        );
         let response = Static::new(Code::OK, GROUP, Body::new(b"body"));
-        let second = output::Egress::new(grouped_writer.reborrow(), DATE, RESPONSE)
-            .plain(response, head::Connection::KeepAlive);
+        let second = output::Egress::new(grouped_writer.reborrow(), DATE, RESPONSE).try_route(
+            response,
+            &mut (),
+            common::fields::PLAIN,
+        );
         let results = match (first, second) {
-            (
-                output::Outcome::Failed(Failure::Output(scalar)),
-                output::Outcome::Failed(Failure::Output(grouped)),
-            ) => Some((Err(scalar), Err(grouped))),
-            (output::Outcome::SendStatic { .. }, output::Outcome::SendStatic { .. }) => {
+            (Err(Failure::Output(scalar)), Err(Failure::Output(grouped))) => {
+                Some((Err(scalar), Err(grouped)))
+            }
+            (Ok(output::Complete::Static { .. }), Ok(output::Complete::Static { .. })) => {
                 Some((Ok(scalar_writer.len()), Ok(grouped_writer.len())))
             }
             _ => None,
@@ -85,8 +95,8 @@ fn encoding_preserves_body() {
 
 fn preserve(source: impl field::Source<headers::Application>) {
     let input = ENCODED_BODY;
-    let outcome = try_encode(source, &input).expect("compression");
-    let output::Outcome::SendStatic { body, .. } = outcome else {
+    let outcome = try_encode(source, &input);
+    let Ok(output::Complete::Static { body }) = outcome else {
         panic!("an existing encoding must preserve the original body");
     };
     assert_eq!(body.as_slice(), input);

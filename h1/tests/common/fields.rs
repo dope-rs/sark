@@ -1,9 +1,8 @@
 use std::cell::Cell;
 
-use o3::alloc;
 use sark_h1::{
     route,
-    wire::{output, response::Context},
+    wire::{Failure, output, response::Context},
 };
 use sark_http::{
     field,
@@ -18,6 +17,8 @@ use sark_http::{
 pub const DATE: &[u8; 29] = b"Mon, 01 Jan 2026 00:00:00 GMT";
 pub const RESPONSE: Context = Context::new(Method::Other, Version::Eleven);
 pub const GZIP_RESPONSE: Context = RESPONSE.with_coding(Coding::Gzip);
+pub const PLAIN: route::Policy =
+    route::Policy::new(route::Mode::Plain, Date::Include, Server::Include);
 pub const GZIP_POLICY: route::Policy =
     route::Policy::new(route::Mode::Gzip, Date::Include, Server::Include);
 pub const ENCODED_BODY: [u8; 256] = [b'x'; 256];
@@ -75,24 +76,21 @@ pub const GENERATED_IDENTITY: Generated<'static> = Generated {
 pub fn try_encode<'d>(
     source: impl field::Source<headers::Application>,
     input: &'d [u8],
-) -> Result<output::Outcome<'d>, alloc::Error> {
-    use sark_http::{
-        owner::handoff,
-        payload::{
-            compress::{Compression as _, Gzip},
-            fixed::Body,
-            response::{Fixed, status::Code},
-        },
+) -> Result<output::Complete<'d>, Failure> {
+    use sark_http::payload::{
+        compress::{Compression as _, Gzip},
+        fixed::Body,
+        response::{Fixed, status::Code},
     };
     let response = Fixed::new(Code::OK, source, Body::new(input));
     let mut bytes = [0; 512];
-    let mut gzip = Gzip::try_new()?;
-    Ok(output::Egress::new(
+    let mut gzip = Gzip::try_new().expect("gzip fixture");
+    output::Egress::new(
         o3::buffer::write::Slice::new(&mut bytes).reborrow(),
         DATE,
         GZIP_RESPONSE,
     )
-    .route(response, handoff::Slot::ready(None), &mut gzip, GZIP_POLICY))
+    .try_route(response, &mut gzip, GZIP_POLICY)
 }
 
 impl field::Source<headers::Application> for Generated<'_> {

@@ -109,18 +109,17 @@ pub(super) fn rejected(paths: &Paths, generics: &crate::types::Generics) -> Toke
 pub(super) fn copied(
     paths: &Paths,
     generics: &crate::types::Generics,
-    response: &TokenStream,
+    copy: &TokenStream,
 ) -> TokenStream {
     let f_life = local("lifecycle");
     let [n_copy, n_out, v_exch] = generics.locals(["__copy", "__out", "exchange"]);
     let [v_this] = generics.locals(["this"]);
     let ns_core = &paths.core;
-    let ns_h1 = &paths.h1;
     quote! {
         if let ::core::option::Option::Some(#n_out) =
             #ns_core::life::Mode::observer(#v_this.#f_life)
         {
-            if let #ns_h1::wire::output::Copy::Copied(#n_copy) = #response.copy() {
+            if let ::core::option::Option::Some(#n_copy) = #copy {
                 #ns_core::life::Observer::observe(
                     #n_out,
                     #ns_core::life::Event::ResponseBodyCopied {
@@ -138,7 +137,6 @@ pub(super) fn copied(
 pub(super) fn retention_arms(
     paths: &Paths,
     generics: &crate::types::Generics,
-    origin: &TokenStream,
     session: &TokenStream,
 ) -> TokenStream {
     let f_life = local("lifecycle");
@@ -146,6 +144,7 @@ pub(super) fn retention_arms(
     let [v_this] = generics.locals(["this"]);
     let ns_core = &paths.core;
     let ns_http = &paths.http;
+    let ns_h1 = &paths.h1;
     let commit = |linked: TokenStream| {
         quote! {
             #ns_core::life::sequence::Mode::commit_link(
@@ -161,8 +160,8 @@ pub(super) fn retention_arms(
     let response = commit(quote!(#ns_http::o3::buffer::hold::Charge::default()));
     let linked = commit(quote!(#n_retain.charge));
     quote! {
-        #origin::Response(#n_retain) => { #response }
-        #origin::Linked(#n_retain) => { #linked }
+        #ns_h1::wire::output::Origin::Response(#n_retain) => { #response }
+        #ns_h1::wire::output::Origin::Linked(#n_retain) => { #linked }
     }
 }
 
@@ -174,14 +173,8 @@ pub(super) fn completed(
     let f_life = local("lifecycle");
     let [v_exch, v_resp, v_this] = generics.locals(["exchange", "response", "this"]);
     let ns_core = &paths.core;
-    let ns_h1 = &paths.h1;
-    let copied = copied(paths, generics, &quote!(#v_resp));
-    let retained = retention_arms(
-        paths,
-        generics,
-        &quote!(#ns_h1::wire::output::Origin),
-        session,
-    );
+    let copied = copied(paths, generics, &quote!(#v_resp.copy()));
+    let retained = retention_arms(paths, generics, session);
     quote! {
         #copied
         match #v_resp.retention() { #retained }
@@ -203,7 +196,8 @@ pub(super) fn guard(
     let [n_gform] = generics.locals(["__guard_form"]);
     let [n_ghead] = generics.locals(["__guard_head"]);
     let [n_gmeth] = generics.locals(["__guard_method"]);
-    let n_gout = generics.local("__guard_outcome");
+    let [n_gout, n_body, n_error] =
+        generics.locals(["__guard_outcome", "__guard_body", "__guard_error"]);
     let [n_resp, v_conn, v_date] = generics.locals(["__response", "conn", "date"]);
     let [v_exch, v_head, v_parsed, n_shead] =
         generics.locals(["exchange", "head", "parsed", "__sark_head"]);
@@ -223,13 +217,15 @@ pub(super) fn guard(
         quote!(break #pass),
     );
     let open = open(paths, generics);
-    let copied = copied(paths, generics, &quote!(#n_gout));
-    let retained = retention_arms(
+    let copied = copied(
         paths,
         generics,
-        &quote!(#ns_h1::wire::output::Retention),
-        &quote!(#v_conn.async_state.session_mut()),
+        &quote!(match &#n_gout {
+            ::core::result::Result::Ok(#n_body) => #n_body.copy(),
+            ::core::result::Result::Err(_) => ::core::option::Option::None,
+        }),
     );
+    let retained = retention_arms(paths, generics, &quote!(#v_conn.async_state.session_mut()));
     Some(quote! { #pass: {
         let #v_parsed = #n_shead.source();
         let #v_head = #v_parsed.request();
@@ -256,15 +252,18 @@ pub(super) fn guard(
             #ns_core::life::Event::HeadAdmitted(#v_exch),
         );
         #copied
-        match #n_gout.retention() {
-            #retained
-            #ns_h1::wire::output::Retention::Rejected => {}
-        }
+        let #n_gout = match #n_gout {
+            ::core::result::Result::Ok(#n_body) => {
+                match #n_body.retention() { #retained }
+                #n_body.into_consume(
+                    #v_permit,
+                    #ns_h1::session::Consumption::Buffered(#ns_h1::session::Buffered::new(0)),
+                    #ns_h1::wire::head::Connection::Close,
+                )
+            }
+            ::core::result::Result::Err(#n_error) => #ns_h1::session::Outcome::Failed(#n_error),
+        };
         #v_exch.retire(#v_this.#f_life, #ns_core::life::Outcome::Rejected);
-        return #n_gout.into_consume(
-            #v_permit,
-            #ns_h1::session::Consumption::Buffered(#ns_h1::session::Buffered::new(0)),
-            #ns_h1::wire::head::Connection::Close,
-        ).into();
+        return #n_gout.into();
     } })
 }

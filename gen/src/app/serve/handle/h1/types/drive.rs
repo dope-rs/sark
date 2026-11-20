@@ -40,23 +40,31 @@ pub(super) fn methods(
     let remove = flat::remove(spec, ctx.exec, false, &entry, quote!(quotas));
     let output = spec.state.ty();
     let settle = quote! {
-        if let #h1::wire::output::Outcome::Failed(error) = &outcome {
+        if let Err(error) = &outcome
+            && !matches!(error, #h1::wire::Failure::Route(_))
+        {
             #core::life::Mode::diagnostic(life, error);
         }
-        let held = outcome.retention();
-        let charge = match held {
-            #h1::wire::output::Retention::Response(owner)
-            | #h1::wire::output::Retention::Linked(owner) => owner.charge,
-            #h1::wire::output::Retention::Rejected => #ns::o3::buffer::hold::Charge::default(),
+        let observer = #core::life::Mode::observer(life);
+        let (held, egress, intent, stream) = match outcome {
+            Ok((body, stream)) => {
+                let held = body.retention();
+                if let Some(sink) = observer && let Some(copy) = body.copy() {
+                    #core::life::Observer::observe(sink, #core::life::Event::ResponseBodyCopied {
+                        exchange, read: copy.read, written: copy.written, cause: copy.cause,
+                    });
+                }
+                (Some(held), #h1::pump::Egress::from(body), deferred, stream)
+            }
+            Err(error) => {
+                let (egress, intent) = #h1::pump::Egress::close(error.body());
+                (None, egress, intent, None)
+            }
         };
-        if let Some(sink) = #core::life::Mode::observer(life)
-            && let #h1::wire::output::Copy::Copied(copy) = outcome.copy()
-        {
-            #core::life::Observer::observe(sink, #core::life::Event::ResponseBodyCopied {
-                exchange, read: copy.read, written: copy.written, cause: copy.cause,
-            });
-        }
-        let (egress, intent) = #h1::pump::Egress::output(outcome);
+        let charge = match held {
+            Some(#h1::wire::output::Origin::Response(owner) | #h1::wire::output::Origin::Linked(owner)) => owner.charge,
+            None => #ns::o3::buffer::hold::Charge::default(),
+        };
         state.settle(intent);
         let tag = if charge.resident_bytes == 0 {
             <<#mode as #core::life::sequence::Mode<_>>::TransportTag as Default>::default()
@@ -86,11 +94,11 @@ pub(super) fn methods(
         let credit = task.quota().map(|index| quote!(quotas[#index] += 1;));
         let emit = quote! {
             let deferred = state.deferred();
-            let (outcome, stream) = {
+            let outcome = {
                 let mut staged = writer.stage();
-                let result = #h1::route::task::Egress::new(staged.body(), &date, deferred, request)
-                    .finish::<#route, #output>(output);
-                if !matches!(&result.0, #h1::wire::output::Outcome::Close(_) | #h1::wire::output::Outcome::Failed(_)) {
+                let result = #h1::wire::output::Egress::new(staged.body(), &date, request)
+                    .try_task::<#route, #output>(output, deferred);
+                if result.is_ok() {
                     staged.commit();
                 }
                 result
@@ -126,8 +134,8 @@ pub(super) fn methods(
                 member.discard();
                 #credit
                 #emit
-                let _ = stream;
                 #settle
+                let _ = stream;
                 #complete
             }
         };

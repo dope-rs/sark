@@ -91,7 +91,7 @@ impl<'turn, 'env, S, Runtime, Tasks> Execution<'turn, 'env, S, Runtime, Tasks> {
             }
         };
         let Some((admit, stream)) = streamed else {
-            return output::Outcome::Send { connection: close }.into_consume(
+            return output::Complete::Inline.into_consume(
                 permit,
                 session::Consumption::Buffered(session::Buffered::new(used)),
                 close,

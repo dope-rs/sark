@@ -1,11 +1,10 @@
 //! Task-route execution over borrowed HTTP/1 protocol storage.
 use o3::base::cell::region;
-use o3::buffer::write::Slice;
 use sark_http::payload::response::Body as _;
 mod buffered;
 mod endpoint;
 
-use std::{convert, mem};
+use std::convert;
 
 pub use endpoint::Endpoint;
 use sark_core::{
@@ -22,57 +21,14 @@ use sark_http::{
     h1::codec::canned,
     payload::{fixed, owned},
 };
-use task::{request::Input, response};
+use task::request::Input;
 
 use crate::{
     session,
-    wire::{Failure, head, output, response::Context},
+    wire::{Failure, head, response::Context},
 };
 
 type Origin<'id> = region::Identity<'id>;
-
-/// Borrowed HTTP/1 output resources for one completed generated task.
-#[doc(hidden)]
-pub struct Egress<'turn> {
-    write: Slice<'turn, &'turn mut usize>,
-    date: &'turn [u8; 29],
-    connection: head::Connection,
-    response: Context,
-}
-
-impl<'turn> Egress<'turn> {
-    pub fn new(
-        write: Slice<'turn, &'turn mut usize>,
-        date: &'turn [u8; 29],
-        conn: head::Connection,
-        response: Context,
-    ) -> Self {
-        Self {
-            write,
-            date,
-            connection: conn,
-            response,
-        }
-    }
-
-    pub fn finish<'d, R: route::Task<'d, A> + crate::route::PolicyOf, A>(
-        self,
-        output: response::Output<'d, R, A>,
-    ) -> (output::Outcome<'d>, Option<response::Stream<'d, R, A>>) {
-        let (id, outcome) = output.into_parts();
-        match outcome {
-            response::Outcome::Response(reply) => {
-                output::Egress::new(self.write, self.date, self.response)
-                    .plain_task::<'d, 'd, R::Output>(reply, id, self.connection, R::POLICY)
-            }
-            response::Outcome::Rejected(error) => {
-                (output::Outcome::Close(Failure::Route(error).body()), None)
-            }
-        }
-    }
-}
-
-const _: () = assert!(mem::size_of::<Egress<'static>>() == 5 * mem::size_of::<usize>());
 
 /// The request's construction mode selects its exact retained H1 state.
 pub type Pending<'d, R> =

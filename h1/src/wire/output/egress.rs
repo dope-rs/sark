@@ -1,12 +1,14 @@
 use o3::buffer::write::Slice;
-use std::{convert::Infallible, mem};
+use std::{convert::Infallible, mem, ops::ControlFlow};
 
 use o3::buffer::storage;
-use sark_core::route::guard;
+use sark_core::{manifold::task, route::guard};
 use sark_http::{
     owner::{evidence, handoff, handoff::stage},
-    payload::{compress::Compression, response::dispatch},
-    request::Id,
+    payload::{
+        compress::Compression,
+        response::{dispatch, dispatch::Emit},
+    },
 };
 use sink::{Mode, Sink, written::Written};
 
@@ -42,51 +44,56 @@ impl<'a> Egress<'a> {
         self
     }
 
-    pub fn route<'req, 'd, R, O: stage::Body<'req, 'd>>(
+    pub fn try_route<'req, 'd: 'req, R>(
+        self,
+        reply: R,
+        gzip: &mut impl Compression,
+        policy: route::Policy,
+    ) -> Result<output::Complete<'d>, Failure>
+    where
+        R: dispatch::Emit<'req, 'd, Kind = dispatch::Sync>,
+    {
+        let ControlFlow::Continue(ready) =
+            self.try_stage(reply, handoff::Slot::ready(None), gzip, policy)?;
+        Ok(ready)
+    }
+
+    pub(crate) fn try_stage<'req, 'd: 'req, R, O: stage::Body<'req, 'd>>(
         self,
         reply: R,
         slot: handoff::Slot<'req, 'd, (), O>,
         gzip: &mut impl Compression,
         policy: route::Policy,
-    ) -> output::Outcome<'d, O::Deferred>
+    ) -> Result<ControlFlow<O::Deferred, output::Complete<'d>>, Failure>
     where
-        'd: 'req,
         R: dispatch::Emit<'req, 'd, Kind = dispatch::Sync>,
     {
         let mode = Mode::new(policy.mode, self.response.coding(), gzip);
         let sink = Sink::new(self.write, self.date, self.response, mode, slot).with_policy(policy);
-        Self::outcome(reply.emit(sink), head::Connection::KeepAlive)
+        Self::try_finish(reply.emit(sink).map_err(Failure::Output)?)
     }
 
-    pub fn plain<'req, 'd, S>(self, reply: S, conn: head::Connection) -> output::Outcome<'d>
-    where
-        'd: 'req,
-        S: dispatch::Emit<'req, 'd, Kind = dispatch::Sync>,
-    {
-        let sink = Sink::new(
-            self.write,
-            self.date,
-            self.response.with_connection(conn),
-            Mode::<()>::Plain,
-            handoff::Slot::ready(None),
-        );
-        Self::outcome(reply.emit(sink), conn)
-    }
-
-    pub fn plain_task<'req, 'd, S>(
+    pub fn try_task<'d, R: sark_core::route::Task<'d, A> + route::PolicyOf, A>(
         self,
-        reply: S,
-        id: Id<'d>,
+        output: task::response::Output<'d, R, A>,
         conn: head::Connection,
-        policy: route::Policy,
-    ) -> (output::Outcome<'d>, Option<S::Stream>)
-    where
-        'd: 'req,
-        S: dispatch::Emit<'req, 'd>,
-    {
+    ) -> Result<
+        (
+            output::Complete<'d>,
+            Option<task::response::Stream<'d, R, A>>,
+        ),
+        Failure,
+    > {
+        let (id, response) = output.into_parts();
+        let reply = match response {
+            task::response::Outcome::Response(reply) => reply,
+            task::response::Outcome::Rejected(error) => return Err(Failure::Route(error)),
+        };
         let mut gzip = ();
-        let mode = match policy.mode {
-            route::Mode::RequiredGzip => Mode::new(policy.mode, self.response.coding(), &mut gzip),
+        let mode = match R::POLICY.mode {
+            route::Mode::RequiredGzip => {
+                Mode::new(R::POLICY.mode, self.response.coding(), &mut gzip)
+            }
             route::Mode::Plain | route::Mode::Gzip => Mode::Plain,
         };
         let sink = Sink::new(
@@ -96,19 +103,17 @@ impl<'a> Egress<'a> {
             mode,
             handoff::Slot::ready(Some(id)),
         )
-        .with_policy(policy);
-        match reply.emit(sink) {
-            Ok(written) => <S::Kind as dispatch::Dispatch>::fold::<
-                Sink<'_, 'req, 'd, (), Infallible, ()>,
-                S::Stream,
-                _,
-            >(
-                written,
-                |written| (Self::outcome(Ok(written), conn), None),
-                |stream| (output::Outcome::Send { connection: conn }, stream),
-            ),
-            Err(error) => (output::Outcome::Failed(Failure::Output(error)), None),
-        }
+        .with_policy(R::POLICY);
+        let written = reply.emit(sink).map_err(Failure::Output)?;
+        <<R::Output as Emit<'d, 'd>>::Kind as dispatch::Dispatch>::fold::<
+            Sink<'_, 'd, 'd, (), Infallible, ()>,
+            task::response::Stream<'d, R, A>,
+            _,
+        >(
+            written,
+            |written| Ok((Self::try_ready(written)?, None)),
+            |stream| Ok((output::Complete::Inline, stream)),
+        )
     }
 
     /// Writes and transfers one streaming response without widening its shape.
@@ -139,100 +144,53 @@ impl<'a> Egress<'a> {
         reply.emit(sink).map_err(Failure::Output)
     }
 
-    fn outcome<'input, 'd, P, H: Into<crate::Input<'input>>>(
-        sent: Result<Written<'d, P, H>, output::Error>,
-        conn: head::Connection,
-    ) -> output::Outcome<'d, P> {
-        let sent = match sent {
-            Ok(sent) => sent,
-            Err(error) => return output::Outcome::Failed(Failure::Output(error)),
-        };
-        match sent {
-            Written::Inline { copy } => output::Outcome::SendCopied {
-                copy,
-                connection: conn,
-            },
-            Written::Compressed { body, read } => output::Outcome::SendCompressed {
-                body,
-                read,
-                connection: conn,
-            },
-            Written::Body { body } => Self::body_outcome(body, conn),
-            Written::Head { input } => Self::head_outcome(input.into(), conn),
-            Written::RequestBody { body } => {
-                output::Outcome::SendRequestBody(output::Pending::new(body, conn))
-            }
-        }
+    fn try_ready<'input, 'd, H: Into<crate::Input<'input>>>(
+        written: Written<'d, Infallible, H>,
+    ) -> Result<output::Complete<'d>, Failure> {
+        let ControlFlow::Continue(ready) = Self::try_finish(written)?;
+        Ok(ready)
     }
 
-    fn body_outcome<'d, P>(
-        ready: handoff::Ready<'d>,
-        conn: head::Connection,
-    ) -> output::Outcome<'d, P> {
-        match ready {
-            handoff::Ready::Empty => output::Outcome::Send { connection: conn },
-            handoff::Ready::Owned(mut body) => {
-                let body = match storage::Shared::try_from(&mut body) {
-                    Ok(body) => body,
-                    Err(error) => {
-                        return output::Outcome::Failed(Failure::Output(
-                            output::Error::Allocation(error),
-                        ));
-                    }
-                };
-                output::Outcome::SendShared {
-                    body,
-                    connection: conn,
-                }
-            }
-            handoff::Ready::Copied(body) => {
-                let (body, copy) = body.into_parts();
-                output::Outcome::SendOwnedCopy {
-                    body,
-                    cause: copy.cause,
-                    connection: conn,
-                }
-            }
-            handoff::Ready::Retained(body) => output::Outcome::SendShared {
-                body,
-                connection: conn,
-            },
-            handoff::Ready::Segmented(body) => output::Outcome::SendSegmented {
-                body,
-                connection: conn,
-            },
-            handoff::Ready::Linked(body) => output::Outcome::SendLinked {
-                body,
-                connection: conn,
-            },
-            handoff::Ready::Fixed(body) => output::Outcome::SendStatic {
-                body,
-                connection: conn,
-            },
-        }
-    }
-
-    fn head_outcome<'d, P>(
-        input: crate::Input<'_>,
-        conn: head::Connection,
-    ) -> output::Outcome<'d, P> {
-        match input {
-            crate::Input::Borrowed(bytes) => match storage::Shared::try_copy(bytes) {
-                Ok(body) => output::Outcome::SendOwnedCopy {
-                    body,
+    fn try_finish<'input, 'd, P, H: Into<crate::Input<'input>>>(
+        written: Written<'d, P, H>,
+    ) -> Result<ControlFlow<P, output::Complete<'d>>, Failure> {
+        use output::Complete;
+        let ready = match written {
+            Written::Inline { copy } => Complete::Copy { copy },
+            Written::Compressed { body, read } => Complete::Compressed { body, read },
+            Written::RequestBody { body } => return Ok(ControlFlow::Break(body)),
+            Written::Head { input } => match input.into() {
+                crate::Input::Borrowed(bytes) => Complete::Owned {
+                    body: storage::Shared::try_copy(bytes)
+                        .map_err(|error| Failure::Input(InputError::Storage(error)))?,
                     cause: evidence::Cause::Borrowed,
-                    connection: conn,
                 },
-                Err(error) => output::Outcome::Failed(Failure::Input(InputError::Storage(error))),
-            },
-            crate::Input::Buffered(view) => match view.try_retain() {
-                Ok(body) => output::Outcome::SendShared {
-                    body,
-                    connection: conn,
+                crate::Input::Buffered(view) => Complete::Shared {
+                    body: view
+                        .try_retain()
+                        .map_err(|error| Failure::Input(InputError::Share(error)))?,
                 },
-                Err(error) => output::Outcome::Failed(Failure::Input(InputError::Share(error))),
             },
-        }
+            Written::Body { body } => match body {
+                handoff::Ready::Empty => Complete::Inline,
+                handoff::Ready::Owned(mut body) => Complete::Shared {
+                    body: storage::Shared::try_from(&mut body)
+                        .map_err(|error| Failure::Output(output::Error::Allocation(error)))?,
+                },
+                handoff::Ready::Copied(body) => {
+                    let (body, copy) = body.into_parts();
+                    Complete::Owned {
+                        body,
+                        cause: copy.cause,
+                    }
+                }
+                handoff::Ready::Retained(body) => Complete::Shared { body },
+                handoff::Ready::Segmented(body) => Complete::Segments { body },
+                handoff::Ready::Linked(body) => Complete::Linked { body },
+                handoff::Ready::Fixed(body) => Complete::Static { body },
+            },
+        };
+        Ok(ControlFlow::Continue(ready))
     }
 }
 
@@ -253,7 +211,7 @@ impl<'a, 'req> Egress<'a, crate::Input<'req>> {
 }
 
 impl<'input, 'req, 'd: 'req> guard::Reject<'req, 'd> for Egress<'_, crate::Input<'input>> {
-    type Break = output::Outcome<'d>;
+    type Break = Result<output::Complete<'d>, Failure>;
 
     fn try_reject<R>(self, response: R) -> Self::Break
     where
@@ -267,7 +225,7 @@ impl<'input, 'req, 'd: 'req> guard::Reject<'req, 'd> for Egress<'_, crate::Input
             Mode::<()>::Plain,
             slot,
         );
-        Egress::outcome(response.complete(sink), head::Connection::Close)
+        Egress::try_ready(response.complete(sink).map_err(Failure::Output)?)
     }
 }
 

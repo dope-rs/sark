@@ -7,10 +7,7 @@ use sark_core::{
     decode::Call,
     manifold, route,
 };
-use sark_http::{
-    owner::handoff,
-    payload::{compress, response::dispatch},
-};
+use sark_http::payload::{compress, response::dispatch};
 
 use crate::{
     route::PolicyOf,
@@ -40,21 +37,21 @@ impl<'turn, C: compress::Compression> Egress<'turn, C> {
         request: framing::Parsed<&[u8], R>,
         body: &mut body::Body<View<'_, 'd>>,
         state: &S,
-    ) -> Result<output::Outcome<'d>, Failure>
+    ) -> Result<output::Complete<'d>, Failure>
     where
         R: route::Spec<Kind = dispatch::Sync> + manifold::Route<S> + PolicyOf,
     {
         <<R::Request as route::Schema>::Body as body::Project>::try_project(
             body,
             (request, state, self),
-            |scope| -> Result<output::Outcome<'d>, Failure> {
+            |scope| -> Result<output::Complete<'d>, Failure> {
                 let ((request, state, egress), view) = scope.into_parts();
                 let Egress { output, gzip } = egress;
                 let call = Call::new(request, view);
                 let reply = call.try_invoke::<R, S>(state).map_err(|error| {
                     Failure::Route(<R::Request as route::Project>::reject(error))
                 })?;
-                Ok(output.route(reply, handoff::Slot::ready(None), gzip, R::POLICY))
+                output.try_route(reply, gzip, R::POLICY)
             },
         )
         .map_err(|failure| Failure::Projection(failure.discard()))?

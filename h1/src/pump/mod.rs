@@ -98,30 +98,21 @@ pub enum Egress<'d> {
     },
 }
 
-impl<'d> Egress<'d> {
-    pub fn output(action: output::Outcome<'d>) -> (Self, head::Connection) {
-        match action {
-            output::Outcome::Send { connection }
-            | output::Outcome::SendCopied { connection, .. } => (Self::Inline, connection),
-            output::Outcome::SendStatic { body, connection } => (Self::Static { body }, connection),
-            output::Outcome::SendShared { body, connection }
-            | output::Outcome::SendOwnedCopy {
-                body, connection, ..
-            } => (Self::Shared { body }, connection),
-            output::Outcome::SendCompressed {
-                body, connection, ..
-            } => (Self::Frozen { body }, connection),
-            output::Outcome::SendSegmented { body, connection }
-            | output::Outcome::SendLinked { body, connection } => {
-                (Self::Segmented { body }, connection)
-            }
-            output::Outcome::SendRequestBody(pending) => match pending.body {},
-            output::Outcome::Close(reason) => Self::close(reason),
-            output::Outcome::Failed(error) => Self::close(error.body()),
+impl<'d> From<output::Complete<'d>> for Egress<'d> {
+    fn from(response: output::Complete<'d>) -> Self {
+        use output::Complete;
+        match response {
+            Complete::Inline | Complete::Copy { .. } => Self::Inline,
+            Complete::Static { body } => Self::Static { body },
+            Complete::Shared { body } | Complete::Owned { body, .. } => Self::Shared { body },
+            Complete::Compressed { body, .. } => Self::Frozen { body },
+            Complete::Segments { body } | Complete::Linked { body } => Self::Segmented { body },
         }
     }
+}
 
-    pub(crate) fn close(reason: fixed::Body<'d>) -> (Self, head::Connection) {
+impl<'d> Egress<'d> {
+    pub fn close(reason: fixed::Body<'d>) -> (Self, head::Connection) {
         let action = if reason.is_empty() {
             Self::None
         } else {

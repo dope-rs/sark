@@ -1,34 +1,29 @@
 use o3::buffer::{hold::evidence::On, storage};
-use sark_h1::{
-    server::task::turn,
-    session,
-    wire::{head, output},
-};
+use sark_h1::{pump, server::task::turn, wire::output};
 use sark_http::{owner::evidence, payload::owned::Segments};
 
 #[test]
 fn inline_copy_tracks_body() {
-    let action: output::Outcome<'static> = output::Outcome::SendCopied {
+    let action: output::Complete<'static> = output::Complete::Copy {
         copy: evidence::Copy {
             read: 23,
             written: 17,
             cause: evidence::Cause::Compressed,
         },
-        connection: head::Connection::KeepAlive,
     };
     assert!(matches!(
         action.retention(),
-        output::Retention::Response(owner) if owner.len == 17
+        output::Origin::Response(owner) if owner.len == 17
     ));
     assert!(matches!(
         action.copy(),
-        output::Copy::Copied(evidence::Copy {
+        Some(evidence::Copy {
             read: 23,
             written: 17,
             cause: evidence::Cause::Compressed,
         })
     ));
-    let done = turn::Turn::<On>::published(turn::Readiness::Staged, action.retention());
+    let done = turn::Turn::<On>::published(turn::Readiness::Staged, Some(action.retention()));
     assert!(matches!(
         done,
         turn::Turn::Response { owner, linked: false, .. } if owner.len == 17
@@ -39,14 +34,13 @@ fn inline_copy_tracks_body() {
 fn borrow_copy_is_reported() {
     let body = storage::Shared::try_copy(b"response")
         .expect("eight response bytes must fit shared storage");
-    let action: output::Outcome<'static> = output::Outcome::SendOwnedCopy {
+    let action: output::Complete<'static> = output::Complete::Owned {
         body,
         cause: evidence::Cause::Borrowed,
-        connection: head::Connection::KeepAlive,
     };
     assert!(matches!(
         action.copy(),
-        output::Copy::Copied(evidence::Copy {
+        Some(evidence::Copy {
             read: 8,
             written: 8,
             cause: evidence::Cause::Borrowed,
@@ -60,27 +54,15 @@ fn linked_uses_enum_state() {
         .expect("eight response bytes must fit shared storage");
     let body = Segments::from(body);
     let original = body.segment(0).expect("response segment").as_ptr();
-    let action: output::Outcome<'static> = output::Outcome::SendLinked {
-        body,
-        connection: head::Connection::KeepAlive,
-    };
+    let action: output::Complete<'static> = output::Complete::Linked { body };
     assert!(matches!(
-        turn::Turn::<On>::published(turn::Readiness::NewlyReady, action.retention()),
+        turn::Turn::<On>::published(turn::Readiness::NewlyReady, Some(action.retention())),
         turn::Turn::Response { owner, linked: true, .. } if owner.len == 8
     ));
-    assert!(matches!(action.copy(), output::Copy::Uncopied));
-    let response = action.into_consume::<()>(
-        session::Permit::new(),
-        session::Consumption::Buffered(session::Buffered::new(0)),
-        head::Connection::KeepAlive,
-    );
+    assert!(action.copy().is_none());
     assert!(matches!(
-        response,
-        session::Outcome::Complete {
-            response: output::Complete::Linked { body },
-            connection: head::Connection::KeepAlive,
-            ..
-        }
+        pump::Egress::from(action),
+        pump::Egress::Segmented { body }
             if body.segment(0).expect("response segment").as_ptr() == original
     ));
 }

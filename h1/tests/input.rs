@@ -25,7 +25,7 @@ fn retains_guard_window() {
         fields::RESPONSE,
     )
     .try_reject(response);
-    let output::Outcome::SendShared { body, .. } = result else {
+    let Ok(output::Complete::Shared { body }) = result else {
         panic!("guard response must retain its buffered owner");
     };
     assert_eq!(body.as_slice().as_ptr(), source.as_ptr());
@@ -49,7 +49,7 @@ fn copies_guard_window() {
         fields::RESPONSE,
     )
     .try_reject(response);
-    let output::Outcome::SendOwnedCopy { body, .. } = result else {
+    let Ok(output::Complete::Owned { body, .. }) = result else {
         panic!("guard response must copy its borrowed body");
     };
     assert_ne!(body.as_slice().as_ptr(), source.as_ptr());

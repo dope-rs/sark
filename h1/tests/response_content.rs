@@ -14,14 +14,13 @@ use sark_h1::{
     route::stream,
     session,
     wire::{
-        Failure, head, output,
+        Failure, output,
         parsing::{framing, raw},
         response::{self, Context},
     },
 };
 use sark_http::{
     h1::head::{line::Version, request::Coding},
-    owner::handoff,
     payload::response::{Fixed, Method, status::Code},
 };
 
@@ -31,17 +30,18 @@ fn bounded_overflow_preserves_output() {
     let mut bytes = [0; 128];
     let mut writer = Slice::new(&mut bytes);
     writer.write_slice(b"prior").unwrap();
-    let outcome = output::Egress::new(writer.reborrow(), DATE, common::fields::RESPONSE).plain(
+    let outcome = output::Egress::new(writer.reborrow(), DATE, common::fields::RESPONSE).try_route(
         Reply {
             status: Code::OK,
             shape: Shape::Bounded,
             calls: &calls,
         },
-        head::Connection::KeepAlive,
+        &mut (),
+        common::fields::PLAIN,
     );
     assert!(matches!(
         outcome,
-        output::Outcome::Failed(Failure::Output(output::Error::Wire(
+        Err(Failure::Output(output::Error::Wire(
             response::Error::PlanOverflow {
                 current: 108,
                 added: usize::MAX,
@@ -65,18 +65,17 @@ fn omits_body() {
                 DATE,
                 Context::new(method, Version::Eleven).with_coding(Coding::Gzip),
             )
-            .route(
+            .try_route(
                 Reply {
                     status,
                     shape,
                     calls: &calls,
                 },
-                handoff::Slot::ready(None),
                 &mut gzip,
                 replies::POLICY,
             );
             let written = match outcome {
-                output::Outcome::Send { .. } => Some(writer.len()),
+                Ok(output::Complete::Inline) => Some(writer.len()),
                 _ => None,
             }
             .expect("head-only response");
@@ -164,13 +163,12 @@ fn phase_error() {
             DATE,
             Context::new(method, Version::Eleven),
         )
-        .plain(
+        .try_route(
             Fixed::new(status, (), replies::BYTES),
-            head::Connection::KeepAlive,
+            &mut (),
+            common::fields::PLAIN,
         );
-        assert!(
-            matches!(result, output::Outcome::Failed(Failure::Output(actual)) if actual == expected)
-        );
+        assert!(matches!(result, Err(Failure::Output(actual)) if actual == expected));
         assert!(write.iter().all(|byte| *byte == 0xa5));
     }
 }

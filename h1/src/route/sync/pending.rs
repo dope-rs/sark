@@ -1,4 +1,6 @@
 //! Retained state for an incomplete synchronous request.
+use core::ops::ControlFlow;
+
 use o3::buffer::{segments::assembly, storage};
 use sark_core::{
     body,
@@ -9,7 +11,10 @@ use sark_core::{
 use sark_http::{
     h1::codec::canned,
     owner::handoff,
-    payload::{compress, owned, response::dispatch},
+    payload::{
+        compress, owned,
+        response::{Body as _, dispatch},
+    },
 };
 
 use crate::{
@@ -96,14 +101,14 @@ impl<'d, R: route::Spec> Pending<'d, R> {
         let ready = match <<R::Request as route::Schema>::Body as body::Project>::try_project(
             &mut body,
             (head.borrow(), state, output, gzip),
-            |scope| -> Result<output::Outcome<'d, usize>, Failure> {
+            |scope| {
                 let ((request, state, output, gzip), view) = scope.into_parts();
                 let input = view.body();
                 let call = Call::new(request, view);
                 let reply = call.try_invoke::<R, S>(state).map_err(|error| {
                     Failure::Route(<R::Request as route::Project>::reject(error))
                 })?;
-                Ok(output.route(reply, handoff::Slot::new(input), gzip, R::POLICY))
+                output.try_stage(reply, handoff::Slot::new(input), gzip, R::POLICY)
             },
         ) {
             Ok(Ok(ready)) => ready,
@@ -112,7 +117,22 @@ impl<'d, R: route::Spec> Pending<'d, R> {
                 return session::Outcome::Failed(Failure::Projection(failure.discard()));
             }
         };
-        let ready = ready.link(owner.finish());
+        let ready = match ready {
+            ControlFlow::Continue(ready) => {
+                drop(owner);
+                ready
+            }
+            ControlFlow::Break(declared) => {
+                let body = owner.finish();
+                let actual = body.len();
+                if actual != declared {
+                    return session::Outcome::Failed(Failure::Admission(
+                        body::Error::LengthMismatch { actual, declared },
+                    ));
+                }
+                output::Complete::Linked { body }
+            }
+        };
         ready.into_consume(
             permit,
             session::Consumption::Buffered(session::Buffered::new(used)),

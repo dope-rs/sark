@@ -69,11 +69,11 @@ pub enum Turn<R: Mode = evidence::Off> {
 }
 
 impl<R: Mode> Turn<R> {
-    pub fn published(ready: Readiness, held: output::Retention) -> Self {
+    pub fn published(ready: Readiness, held: Option<output::Origin>) -> Self {
         let (owner, linked) = match held {
-            output::Retention::Response(owner) => (owner, R::Link::default()),
-            output::Retention::Linked(owner) => (owner, R::LINKED),
-            output::Retention::Rejected => return Self::Rejected { ready },
+            Some(output::Origin::Response(owner)) => (owner, R::Link::default()),
+            Some(output::Origin::Linked(owner)) => (owner, R::LINKED),
+            None => return Self::Rejected { ready },
         };
         Self::Response {
             ready,

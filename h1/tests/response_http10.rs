@@ -25,7 +25,6 @@ use sark_http::{
         request::Coding,
         response::{Date, Server},
     },
-    owner::handoff,
     payload::response::{Fixed, status::Code},
 };
 
@@ -42,13 +41,12 @@ fn fixed_connections() {
             .with_coding(Coding::Plain);
         let mut bytes = [0; 256];
         let mut writer = Slice::new(&mut bytes);
-        let result = output::Egress::new(writer.reborrow(), DATE, response).route(
+        let result = output::Egress::new(writer.reborrow(), DATE, response).try_route(
             Fixed::new(Code::OK, (), replies::BYTES),
-            handoff::Slot::ready(None),
             &mut (),
             policy,
         );
-        let output::Outcome::SendCopied { copy, .. } = result else {
+        let Ok(output::Complete::Copy { copy }) = result else {
             panic!("fixed response must be copied");
         };
         let wire = writer.into_mut();
