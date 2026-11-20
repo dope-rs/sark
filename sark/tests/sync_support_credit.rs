@@ -1,31 +1,21 @@
-use common::sync::{Client, try_build};
-
 pub mod common;
 
-use std::{cell::Cell, pin::Pin};
-
-use dope::core::driver::settings;
 use dope_test::alloc::Tracker;
-use o3::{
-    base::cell::region,
-    buffer::{
-        resident::{self, Shared},
-        storage,
-    },
-};
+use o3::buffer::{resident::Shared, storage};
 use sark_core::manifold::stream::Boundary;
 use sark_h2::{
-    ClientRole,
-    conn::{DataOutcome, machine},
+    conn::DataOutcome,
     frame::numbers::ErrorCode,
-    server,
-    server::{sync, sync::Endpoint},
+    server::{self, sync::Endpoint},
 };
-use sark_http::field;
+use sark_http::field::{self, Value};
 
 use crate::common::{
     drained::Drained,
-    sync::{DeniedState, GuardRouter, LIMITS, Router, State, StaticRouter},
+    sync::{
+        Client, DeniedState, GuardRouter, LIMITS, OUTBOUND_LIMIT, Router, State, StaticRouter,
+        backpressure_plan, client, connection, try_build, with_domain,
+    },
 };
 
 #[global_allocator]
@@ -33,31 +23,15 @@ static ALLOCATOR: Tracker = Tracker::new();
 
 #[test]
 fn route_bounds_tail() {
-    let mut domain = resident::Domain::new();
-    region::Token::scope_pinned(Pin::new(&mut domain), |token, domain| {
-        let state = State {
-            request_body: Cell::new(0),
-            request_head: Cell::new(0),
-            invalid_path: Cell::new(false),
-            header_error: Cell::new(None),
-            dispatches: Cell::new(0),
-            large_body: storage::Shared::new(),
-        };
+    with_domain(|domain, proof| {
+        let state = State::new(storage::Shared::new());
         let router = Router::new(&state);
-        let mut client = machine::Connection::<ClientRole>::try_new().expect("client fixture");
+        let mut client = client();
         let wire = Client::new(&mut client)
             .try_post(b"/echo", b"owner-preserved")
             .expect("sync fixture");
         let endpoint = try_build(router, LIMITS).expect("sync fixture");
-        let budget = domain
-            .get_mut()
-            .try_budget(LIMITS.max_connection_body_bytes, token.proof())
-            .expect("resident budget");
-        let mut server = sync::Conn::try_new(&endpoint).expect("sync connection");
-        server
-            .ingress()
-            .try_bind(budget)
-            .expect("connection retention");
+        let mut server = connection(&endpoint, domain, proof, LIMITS.max_connection_body_bytes);
 
         server
             .ingress()
@@ -77,23 +51,14 @@ fn route_bounds_tail() {
 
 #[test]
 fn static_has_no_owner() {
-    let mut domain = resident::Domain::new();
-    region::Token::scope_pinned(Pin::new(&mut domain), |token, domain| {
+    with_domain(|domain, proof| {
         let router = StaticRouter::new();
-        let mut client = machine::Connection::<ClientRole>::try_new().expect("client fixture");
+        let mut client = client();
         let wire = Client::new(&mut client)
             .try_get(b"/static")
             .expect("sync fixture");
         let endpoint = try_build(router, LIMITS).expect("sync fixture");
-        let budget = domain
-            .get_mut()
-            .try_budget(LIMITS.max_connection_body_bytes, token.proof())
-            .expect("resident budget");
-        let mut server = sync::Conn::try_new(&endpoint).expect("sync connection");
-        server
-            .ingress()
-            .try_bind(budget)
-            .expect("connection retention");
+        let mut server = connection(&endpoint, domain, proof, LIMITS.max_connection_body_bytes);
         server
             .ingress()
             .ingest_owned(Shared::from(wire))
@@ -111,16 +76,10 @@ fn static_has_no_owner() {
 
 #[test]
 fn oversize_skips_guard() {
-    let mut domain = resident::Domain::new();
-    region::Token::scope_pinned(Pin::new(&mut domain), |token, domain| {
-        let state = DeniedState {
-            guards: Cell::new(0),
-            invalid_guard: Cell::new(false),
-            header_error: Cell::new(None),
-            dispatches: Cell::new(0),
-        };
+    with_domain(|domain, proof| {
+        let state = DeniedState::default();
         let router = GuardRouter::new(&state);
-        let mut client = machine::Connection::<ClientRole>::try_new().expect("client fixture");
+        let mut client = client();
         let wire = Client::new(&mut client)
             .try_post(b"/guarded", b"larger-than-limit")
             .expect("sync fixture");
@@ -130,15 +89,7 @@ fn oversize_skips_guard() {
             ..LIMITS
         };
         let endpoint = try_build(router, limits).expect("sync fixture");
-        let budget = domain
-            .get_mut()
-            .try_budget(LIMITS.max_connection_body_bytes, token.proof())
-            .expect("resident budget");
-        let mut server = sync::Conn::try_new(&endpoint).expect("sync connection");
-        server
-            .ingress()
-            .try_bind(budget)
-            .expect("connection retention");
+        let mut server = connection(&endpoint, domain, proof, LIMITS.max_connection_body_bytes);
         server
             .ingress()
             .ingest_owned(Shared::from(wire))
@@ -164,41 +115,24 @@ fn oversize_skips_guard() {
 
 #[test]
 fn finished_body_rejected() {
-    let mut domain = resident::Domain::new();
-    region::Token::scope_pinned(Pin::new(&mut domain), |token, domain| {
-        let state = DeniedState {
-            guards: Cell::new(0),
-            invalid_guard: Cell::new(false),
-            header_error: Cell::new(None),
-            dispatches: Cell::new(0),
-        };
+    with_domain(|domain, proof| {
+        let state = DeniedState::default();
         let router = GuardRouter::new(&state);
-        let mut client = machine::Connection::<ClientRole>::try_new().expect("client fixture");
+        let mut client = client();
         client
             .streams()
             .headers()
             .request(
-                [
-                    field::literal!(Client::field(b":method", b"POST")),
-                    field::literal!(Client::field(b":scheme", b"http")),
-                    field::literal!(Client::field(b":path", b"/guarded")),
-                    field::literal!(Client::field(b":authority", b"localhost")),
-                    field::literal!(Client::field(b"content-length", b"1")),
-                ],
+                Client::post_head(
+                    field::literal!(Value::try_bytes(b"/guarded")),
+                    field::literal!(Value::try_bytes(b"1")),
+                ),
                 Boundary::End,
             )
             .expect("the finished declaration fits the client stream table");
         let wire = Client::new(&mut client).try_take().expect("sync fixture");
         let endpoint = try_build(router, LIMITS).expect("sync fixture");
-        let budget = domain
-            .get_mut()
-            .try_budget(LIMITS.max_connection_body_bytes, token.proof())
-            .expect("resident budget");
-        let mut server = sync::Conn::try_new(&endpoint).expect("sync connection");
-        server
-            .ingress()
-            .try_bind(budget)
-            .expect("connection retention");
+        let mut server = connection(&endpoint, domain, proof, LIMITS.max_connection_body_bytes);
         server
             .ingress()
             .ingest_owned(Shared::from(wire))
@@ -224,41 +158,24 @@ fn finished_body_rejected() {
 
 #[test]
 fn guard_precedes_body() {
-    let mut domain = resident::Domain::new();
-    region::Token::scope_pinned(Pin::new(&mut domain), |token, domain| {
-        let state = DeniedState {
-            guards: Cell::new(0),
-            invalid_guard: Cell::new(false),
-            header_error: Cell::new(None),
-            dispatches: Cell::new(0),
-        };
+    with_domain(|domain, proof| {
+        let state = DeniedState::default();
         let router = GuardRouter::new(&state);
-        let mut client = machine::Connection::<ClientRole>::try_new().expect("client fixture");
+        let mut client = client();
         let stream = client
             .streams()
             .headers()
             .request(
-                [
-                    field::literal!(Client::field(b":method", b"POST")),
-                    field::literal!(Client::field(b":scheme", b"http")),
-                    field::literal!(Client::field(b":path", b"/guarded")),
-                    field::literal!(Client::field(b":authority", b"localhost")),
-                    field::literal!(Client::field(b"content-length", b"4")),
-                ],
+                Client::post_head(
+                    field::literal!(Value::try_bytes(b"/guarded")),
+                    field::literal!(Value::try_bytes(b"4")),
+                ),
                 Boundary::More,
             )
             .expect("the guarded request head fits the client stream table");
         let head = Client::new(&mut client).try_take().expect("sync fixture");
         let endpoint = try_build(router, LIMITS).expect("sync fixture");
-        let budget = domain
-            .get_mut()
-            .try_budget(LIMITS.max_connection_body_bytes, token.proof())
-            .expect("resident budget");
-        let mut server = sync::Conn::try_new(&endpoint).expect("sync connection");
-        server
-            .ingress()
-            .try_bind(budget)
-            .expect("connection retention");
+        let mut server = connection(&endpoint, domain, proof, LIMITS.max_connection_body_bytes);
 
         server
             .ingress()
@@ -304,16 +221,10 @@ fn guard_precedes_body() {
 
 #[test]
 fn deferred_guard_is_once() {
-    let mut domain = resident::Domain::new();
-    region::Token::scope_pinned(Pin::new(&mut domain), |token, domain| {
-        let state = DeniedState {
-            guards: Cell::new(0),
-            invalid_guard: Cell::new(false),
-            header_error: Cell::new(None),
-            dispatches: Cell::new(0),
-        };
+    with_domain(|domain, proof| {
+        let state = DeniedState::default();
         let router = GuardRouter::new(&state);
-        let mut client = machine::Connection::<ClientRole>::try_new().expect("client fixture");
+        let mut client = client();
         let value = vec![b'~'; 16_000];
         let occupied = Client::new(&mut client)
             .try_post(b"/occupy", &value)
@@ -322,13 +233,10 @@ fn deferred_guard_is_once() {
             .streams()
             .headers()
             .request(
-                [
-                    field::literal!(Client::field(b":method", b"POST")),
-                    field::literal!(Client::field(b":scheme", b"http")),
-                    field::literal!(Client::field(b":path", b"/guarded")),
-                    field::literal!(Client::field(b":authority", b"localhost")),
-                    field::literal!(Client::field(b"content-length", b"4")),
-                ],
+                Client::post_head(
+                    field::literal!(Value::try_bytes(b"/guarded")),
+                    field::literal!(Value::try_bytes(b"4")),
+                ),
                 Boundary::More,
             )
             .expect("the deferred guarded head fits the client stream table");
@@ -340,26 +248,11 @@ fn deferred_guard_is_once() {
             DataOutcome::Sent(sent) if sent.get() == 2
         ));
         let pending = Client::new(&mut client).try_take().expect("sync fixture");
-        let limits = server::Config {
-            max_request_body_bytes: 16 << 10,
-            max_request_body_chunks: 4 << 10,
-            max_connection_body_bytes: 16 << 10,
-            max_connection_body_chunks: 16 << 10,
-            max_outbound_bytes: 1,
-        };
-        let receive = settings::Receive::fixed::<2, { 16 << 10 }>();
-        let plan = server::Plan::new(limits, receive).expect("test limits fit the receive plan");
+        let body_bytes = 16 << 10;
+        let plan = backpressure_plan(body_bytes);
         let endpoint = Endpoint::try_with(router, plan, 8)
             .expect("eight streams fit the test endpoint layout");
-        let budget = domain
-            .get_mut()
-            .try_budget(limits.max_connection_body_bytes, token.proof())
-            .expect("resident budget");
-        let mut server = sync::Conn::try_new(&endpoint).expect("sync connection");
-        server
-            .ingress()
-            .try_bind(budget)
-            .expect("connection retention");
+        let mut server = connection(&endpoint, domain, proof, body_bytes);
 
         server
             .ingress()
@@ -378,7 +271,7 @@ fn deferred_guard_is_once() {
         server.pump();
         assert_eq!(state.dispatches.get(), 1);
         assert_eq!(state.guards.get(), 0);
-        assert!(server.output().len() > limits.max_outbound_bytes);
+        assert!(server.output().len() > OUTBOUND_LIMIT);
         Drained::try_for(&mut server).expect("H2 response capture");
 
         let (report, allocs) = Tracker::usage(|| server.pump());

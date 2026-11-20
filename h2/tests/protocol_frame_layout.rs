@@ -1,3 +1,4 @@
+use common::protocol::session::header;
 use sark_core::manifold::stream::Boundary;
 use sark_h2::{
     frame,
@@ -5,7 +6,7 @@ use sark_h2::{
         controls::{Priority, RstStream},
         layout,
         layout::{Data, Header, Headers, Sharing},
-        numbers::{Flags, Length, ParseError, Type},
+        numbers::{Flags, ParseError, Type},
         payload::Payload,
     },
     stream::Id,
@@ -43,12 +44,7 @@ fn headers_self_dependency() {
 
 #[test]
 fn header_be() {
-    let h = Header {
-        length: Length::new(0x010203).expect("fixture domain"),
-        kind: Type::Headers,
-        flags: Flags(0x25),
-        stream_id: Id::new(0x0a_0b_0c_0d).expect("fixture domain"),
-    };
+    let h = header(0x010203, Type::Headers, 0x25, 0x0a_0b_0c_0d);
     let out = h.wire_bytes();
     assert_eq!(out, [1, 2, 3, 1, 0x25, 0x0a, 0x0b, 0x0c, 0x0d]);
     let result = Header::parse(&out);
@@ -83,12 +79,7 @@ fn header_bad_type() {
 
 #[test]
 fn data_zero_stream() {
-    let h = Header {
-        length: Length::new(1).expect("fixture domain"),
-        kind: Type::Data,
-        flags: Flags(0),
-        stream_id: Id::new(0).expect("fixture domain"),
-    };
+    let h = header(1, Type::Data, 0, 0);
     assert!(
         Data::parse(h, b"x")
             == Err(ParseError::Stream {
@@ -105,13 +96,7 @@ fn data_padding() {
     let inner: &[u8] = b"abc";
     let len = 1 + inner.len() + pad_len as usize;
     bytes.extend_from_slice(
-        &Header {
-            length: Length::new(len as u32).expect("fixture domain"),
-            kind: Type::Data,
-            flags: Flags(Flags::PADDED | Flags::END_STREAM),
-            stream_id: Id::new(5).expect("fixture domain"),
-        }
-        .wire_bytes(),
+        &header(len as u32, Type::Data, Flags::PADDED | Flags::END_STREAM, 5).wire_bytes(),
     );
     bytes.push(pad_len);
     bytes.extend_from_slice(inner);
@@ -132,12 +117,7 @@ fn data_padding() {
 #[test]
 fn padding_overflow() {
     let payload = [10u8, 1, 2];
-    let h = Header {
-        length: Length::new(3).expect("fixture domain"),
-        kind: Type::Data,
-        flags: Flags(Flags::PADDED),
-        stream_id: Id::new(1).expect("fixture domain"),
-    };
+    let h = header(3, Type::Data, Flags::PADDED, 1);
     assert!(
         Data::parse(h, &payload)
             == Err(ParseError::Padding {
@@ -166,12 +146,12 @@ fn headers_priority_padded() {
     let overhead = 5;
     let len = 1 + overhead + f.block().len() + pad_len as usize;
     bytes.extend_from_slice(
-        &Header {
-            length: Length::new(len as u32).expect("fixture domain"),
-            kind: Type::Headers,
-            flags: Flags(Flags::END_STREAM | Flags::END_HEADERS | Flags::PRIORITY | Flags::PADDED),
-            stream_id: Id::new(11).expect("fixture domain"),
-        }
+        &header(
+            len as u32,
+            Type::Headers,
+            Flags::END_STREAM | Flags::END_HEADERS | Flags::PRIORITY | Flags::PADDED,
+            11,
+        )
         .wire_bytes(),
     );
     bytes.push(pad_len);
@@ -186,12 +166,7 @@ fn headers_priority_padded() {
 
 #[test]
 fn priority_zero_stream() {
-    let h = Header {
-        length: Length::new(5).expect("fixture domain"),
-        kind: Type::Priority,
-        flags: Flags(0),
-        stream_id: Id::new(0).expect("fixture domain"),
-    };
+    let h = header(5, Type::Priority, 0, 0);
     assert!(
         Priority::parse(h, &[0, 0, 0, 0, 0])
             == Err(ParseError::Stream {
@@ -203,12 +178,7 @@ fn priority_zero_stream() {
 
 #[test]
 fn priority_self_dependency() {
-    let h = Header {
-        length: Length::new(5).expect("fixture domain"),
-        kind: Type::Priority,
-        flags: Flags(0),
-        stream_id: Id::new(1).expect("fixture domain"),
-    };
+    let h = header(5, Type::Priority, 0, 1);
     assert!(
         Priority::parse(h, &[0, 0, 0, 1, 0])
             == Err(ParseError::Dependency {
@@ -220,12 +190,7 @@ fn priority_self_dependency() {
 
 #[test]
 fn rst_zero_stream() {
-    let h = Header {
-        length: Length::new(4).expect("fixture domain"),
-        kind: Type::RstStream,
-        flags: Flags(0),
-        stream_id: Id::new(0).expect("fixture domain"),
-    };
+    let h = header(4, Type::RstStream, 0, 0);
     assert!(
         RstStream::parse(h, &[0, 0, 0, 0])
             == Err(ParseError::Stream {

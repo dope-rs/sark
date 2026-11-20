@@ -1,6 +1,5 @@
 use std::{convert, net::TcpStream};
 
-use common::sync::{Client, try_build, wire::Window};
 use dope::{
     core::{
         driver::{life::recovery, route::KeyTag},
@@ -12,11 +11,8 @@ use dope::{
     },
 };
 use dope_test::reclaim;
-use sark_h2::conn::config::{Config, Settings};
 
 pub mod common;
-
-use std::{cell::Cell, pin::Pin};
 
 use dope::{
     core::{
@@ -30,18 +26,15 @@ use dope::{
     net::tcp,
 };
 use dope_test::harness::server::Pair;
-use o3::{
-    base::cell::region,
-    buffer::{
-        resident::{self, Shared},
-        storage,
-    },
-};
-use sark_h2::{ClientRole, conn::machine, server, server::sync};
+use o3::buffer::{resident::Shared, storage};
+use sark_h2::{conn::config::Settings, server};
 
 use crate::common::{
     drained::Drained,
-    sync::{LIMITS, Router, State, StaticRouter},
+    sync::{
+        Client, LIMITS, Router, State, StaticRouter, client, connection, try_build, try_peer,
+        wire::Window, with_domain,
+    },
 };
 
 #[test]
@@ -76,7 +69,7 @@ fn static_uses_zero_flights() {
         },
     )
     .expect("static router plan");
-    let mut client = machine::Connection::<ClientRole>::try_new().expect("client fixture");
+    let mut client = client();
     let request = Client::new(&mut client)
         .try_get(b"/static")
         .expect("sync fixture")
@@ -151,31 +144,15 @@ fn static_uses_zero_flights() {
 
 #[test]
 fn head_tail_is_bounded() {
-    let mut domain = resident::Domain::new();
-    region::Token::scope_pinned(Pin::new(&mut domain), |token, domain| {
-        let state = State {
-            request_body: Cell::new(0),
-            request_head: Cell::new(0),
-            invalid_path: Cell::new(false),
-            header_error: Cell::new(None),
-            dispatches: Cell::new(0),
-            large_body: storage::Shared::new(),
-        };
+    with_domain(|domain, proof| {
+        let state = State::new(storage::Shared::new());
         let router = Router::new(&state);
-        let mut client = machine::Connection::<ClientRole>::try_new().expect("client fixture");
+        let mut client = client();
         let wire = Client::new(&mut client)
             .try_get(b"/items/42")
             .expect("sync fixture");
         let endpoint = try_build(router, LIMITS).expect("sync fixture");
-        let budget = domain
-            .get_mut()
-            .try_budget(LIMITS.max_connection_body_bytes, token.proof())
-            .expect("resident budget");
-        let mut server = sync::Conn::try_new(&endpoint).expect("sync connection");
-        server
-            .ingress()
-            .try_bind(budget)
-            .expect("connection retention");
+        let mut server = connection(&endpoint, domain, proof, LIMITS.max_connection_body_bytes);
 
         server
             .ingress()
@@ -192,31 +169,15 @@ fn head_tail_is_bounded() {
 
 #[test]
 fn named_path_round_trips() {
-    let mut domain = resident::Domain::new();
-    region::Token::scope_pinned(Pin::new(&mut domain), |token, domain| {
-        let state = State {
-            request_body: Cell::new(0),
-            request_head: Cell::new(0),
-            invalid_path: Cell::new(false),
-            header_error: Cell::new(None),
-            dispatches: Cell::new(0),
-            large_body: storage::Shared::new(),
-        };
+    with_domain(|domain, proof| {
+        let state = State::new(storage::Shared::new());
         let router = Router::new(&state);
-        let mut client = machine::Connection::<ClientRole>::try_new().expect("client fixture");
+        let mut client = client();
         let wire = Client::new(&mut client)
             .try_get(b"/users/beta/teams/alpha")
             .expect("sync fixture");
         let endpoint = try_build(router, LIMITS).expect("sync fixture");
-        let budget = domain
-            .get_mut()
-            .try_budget(LIMITS.max_connection_body_bytes, token.proof())
-            .expect("resident budget");
-        let mut server = sync::Conn::try_new(&endpoint).expect("sync connection");
-        server
-            .ingress()
-            .try_bind(budget)
-            .expect("connection retention");
+        let mut server = connection(&endpoint, domain, proof, LIMITS.max_connection_body_bytes);
 
         server
             .ingress()
@@ -237,40 +198,19 @@ fn named_path_round_trips() {
 
 #[test]
 fn backpressure_bounds_tail() {
-    let mut domain = resident::Domain::new();
-    region::Token::scope_pinned(Pin::new(&mut domain), |token, domain| {
-        let state = State {
-            request_body: Cell::new(0),
-            request_head: Cell::new(0),
-            invalid_path: Cell::new(false),
-            header_error: Cell::new(None),
-            dispatches: Cell::new(0),
-            large_body: storage::Shared::new(),
-        };
+    with_domain(|domain, proof| {
+        let state = State::new(storage::Shared::new());
         let router = Router::new(&state);
         let settings = Settings {
             initial_window_size: 4,
             ..Settings::default()
         };
-        let mut client = machine::Connection::<ClientRole>::with_config(Config {
-            local_settings: settings,
-            recv_window_target: 65_535,
-            ..Default::default()
-        })
-        .expect("small receive window");
+        let mut client = try_peer(settings, 65_535).expect("small receive window");
         let wire = Client::new(&mut client)
             .try_post(b"/echo", b"backpressure-body")
             .expect("sync fixture");
         let endpoint = try_build(router, LIMITS).expect("sync fixture");
-        let budget = domain
-            .get_mut()
-            .try_budget(LIMITS.max_connection_body_bytes, token.proof())
-            .expect("resident budget");
-        let mut server = sync::Conn::try_new(&endpoint).expect("sync connection");
-        server
-            .ingress()
-            .try_bind(budget)
-            .expect("connection retention");
+        let mut server = connection(&endpoint, domain, proof, LIMITS.max_connection_body_bytes);
 
         server
             .ingress()

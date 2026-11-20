@@ -1,4 +1,4 @@
-use std::{convert::Infallible, net};
+use std::{convert::Infallible, net, time::Duration};
 
 use dope::{
     core::{driver::route::KeyTag, io::socket::option::Switch},
@@ -8,7 +8,7 @@ use sark_h2::{conn::DataOutcome, frame::numbers};
 use sark_http::{field, o3::buffer::resident::bound, payload::response::status::Code};
 
 use crate::common::headers::{TEXT, entry};
-use crate::common::session::Serve;
+use crate::common::session::{Connect, Serve};
 
 pub mod fairness;
 
@@ -24,8 +24,8 @@ use dope::{
     },
     manifold::network::listener::config,
     net::tcp,
-    runtime::executor,
 };
+use dope_test::harness::server::Pair;
 use sark_core::manifold::stream::Boundary;
 use sark_h2::{
     ClientRole,
@@ -233,26 +233,36 @@ impl Peer for Connection<ClientRole> {
     }
 }
 
-pub fn serve<C: executor::Build>(
-    server: Config,
-    bind: net::SocketAddr,
-    context: C,
-    listener: socket::Listener,
-) -> Result<(), Infallible> {
-    let reports = Echo
-        .try_serve(
-            server.try_plan(bind).expect("H2 server plan"),
-            context,
-            listener,
-            crate::common::recover,
-            |result| result.expect("H2 server runtime"),
-        )
-        .expect("H2 server resources");
-    assert!(
-        reports.events().expect("H2 retirement").is_empty(),
-        "{reports:?}"
-    );
-    Ok(())
+pub fn serve(server: Config, peer: impl FnOnce(&mut Connection<ClientRole>, &mut TcpStream)) {
+    let pair = Pair::bind().expect("H2 body-credit harness");
+    let bind = pair.addr();
+    pair.run(
+        move |context, listener| {
+            let reports = Echo
+                .try_serve(
+                    server.try_plan(bind).expect("H2 server plan"),
+                    context,
+                    listener,
+                    crate::common::recover,
+                    |result| result.expect("H2 server runtime"),
+                )
+                .expect("H2 server resources");
+            assert!(
+                reports.events().expect("H2 retirement").is_empty(),
+                "{reports:?}"
+            );
+            Ok::<_, Infallible>(())
+        },
+        |address| {
+            let mut socket = address
+                .try_connect(Duration::from_secs(3))
+                .expect("H2 peer connection");
+            let mut client =
+                Connection::<ClientRole>::try_new().expect("default H2 client plan is valid");
+            peer(&mut client, &mut socket);
+        },
+    )
+    .expect("body-credit E2E");
 }
 
 pub struct Echo;

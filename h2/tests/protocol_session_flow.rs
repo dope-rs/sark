@@ -1,6 +1,7 @@
 use common::{
     hpack::{Fields, GET},
     protocol::{
+        self,
         Session,
         session::{Frame, Wire},
     },
@@ -352,10 +353,7 @@ fn backpressure_keeps_flow() {
 
 #[test]
 fn rejects_large_frame() {
-    let mut conn = Connection::<ServerRole>::try_new().expect("server fixture");
-    Session::new(&mut conn)
-        .try_prime()
-        .expect("protocol fixture");
+    let mut conn = protocol::try_connection::<ServerRole>().expect("protocol fixture");
 
     let bytes = [0, 0x40, 1, 0, 0, 0, 0, 0, 1];
     assert!(matches!(

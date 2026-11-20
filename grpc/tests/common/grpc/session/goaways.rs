@@ -12,17 +12,13 @@ use sark_h2::{
     stream,
 };
 
-use crate::common::grpc::wire::{Failure, Peer, Transfer};
+use crate::common::grpc::wire::{Failure, Peer, transfer};
 
 pub fn try_peer(
     client: &mut session::Session<'_, client::Plan<section::Plan>>,
 ) -> Result<(Connection<ServerRole>, Vec<stream::Key>), Failure> {
     let (mut server, streams) = Peer::try_server(client)?;
-    Transfer {
-        client,
-        server: &mut server,
-    }
-    .try_response()?;
+    transfer::try_response(client, &mut server)?;
     Ok((server, streams))
 }
 

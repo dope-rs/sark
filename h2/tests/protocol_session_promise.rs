@@ -1,7 +1,7 @@
 use common::{
     hpack::{Fields, GET},
     protocol::{
-        Session,
+        self, Session,
         conn::{Control, Controls},
         session::{Frame, Wire},
     },
@@ -26,10 +26,7 @@ use crate::common::protocol::session::Authority;
 
 #[test]
 fn push_registers_stream() {
-    let mut conn = Connection::<ClientRole>::with_push::<Authority>().expect("client fixture");
-    Session::new(&mut conn)
-        .try_prime()
-        .expect("protocol fixture");
+    let mut conn = protocol::try_push::<Authority>().expect("protocol fixture");
 
     let id = conn
         .streams()
@@ -98,11 +95,7 @@ fn rejects_push_on_tunnel() {
     let block = Fields::new(&GET).try_encode().expect("push fixture");
     for status in [None, Some(b"200"), Some(b"403")] {
         for fragmented in [false, true] {
-            let mut conn =
-                Connection::<ClientRole>::with_push::<Authority>().expect("client fixture");
-            Session::new(&mut conn)
-                .try_prime()
-                .expect("protocol fixture");
+            let mut conn = protocol::try_push::<Authority>().expect("protocol fixture");
             let id = conn
                 .streams()
                 .headers()
@@ -179,11 +172,9 @@ fn push_resumes_event() {
     Session::new(&mut conn)
         .try_prime()
         .expect("protocol fixture");
-    conn.streams()
-        .headers()
-        .request([field::literal!(entry(b":method", b"GET"))], Boundary::End)
+    Session::new(&mut conn)
+        .try_start()
         .expect("protocol scenario precondition");
-    conn.transfer().drain(usize::MAX);
 
     let block = Fields::new(&[
         Entry::new(b":method", b"GET"),
@@ -234,10 +225,7 @@ fn push_resumes_event() {
 
 #[test]
 fn accepts_push_on_open() {
-    let mut conn = Connection::<ClientRole>::with_push::<Authority>().expect("client fixture");
-    Session::new(&mut conn)
-        .try_prime()
-        .expect("protocol fixture");
+    let mut conn = protocol::try_push::<Authority>().expect("protocol fixture");
     conn.streams()
         .headers()
         .request([field::literal!(entry(b":method", b"GET"))], Boundary::More)
@@ -277,61 +265,11 @@ fn accepts_push_on_open() {
 }
 
 #[test]
-fn rejects_unsafe_push() {
-    let mut conn = Connection::<ClientRole>::with_push::<Authority>().expect("client fixture");
-    Session::new(&mut conn)
-        .try_prime()
-        .expect("protocol fixture");
-    conn.streams()
-        .headers()
-        .request([field::literal!(entry(b":method", b"GET"))], Boundary::End)
-        .expect("protocol scenario precondition");
-    conn.transfer().drain(usize::MAX);
-    let block = Fields::new(&[
-        Entry::new(b":method", b"POST"),
-        Entry::new(b":scheme", b"http"),
-        Entry::new(b":path", b"/unsafe"),
-        Entry::new(b":authority", b"x"),
-    ])
-    .try_encode()
-    .expect("protocol fixture");
-
-    conn.ingress()
-        .ingest(
-            &Frame::new(1, &block)
-                .try_push(2, frame::Block::End)
-                .expect("protocol fixture"),
-        )
-        .expect("protocol scenario precondition");
-
-    assert!(conn.ingress().poll_event().is_none());
-    assert!(
-        (Wire::new(conn.output().first())
-            .try_reset()
-            .expect("protocol fixture"))
-            == (Some((
-                Id::new(2).expect("fixture domain"),
-                ErrorCode::ProtocolError
-            )))
-    );
-    assert!(
-        !conn
-            .status()
-            .has_stream(Id::new(2).expect("fixture domain"))
-    );
-}
-
-#[test]
 fn rejects_content_push() {
-    let mut conn = Connection::<ClientRole>::with_push::<Authority>().expect("client fixture");
+    let mut conn = protocol::try_push::<Authority>().expect("protocol fixture");
     Session::new(&mut conn)
-        .try_prime()
-        .expect("protocol fixture");
-    conn.streams()
-        .headers()
-        .request([field::literal!(entry(b":method", b"GET"))], Boundary::End)
+        .try_start()
         .expect("protocol scenario precondition");
-    conn.transfer().drain(usize::MAX);
     let block = Fields::new(&[
         Entry::new(b":method", b"GET"),
         Entry::new(b":scheme", b"http"),
@@ -378,15 +316,10 @@ fn rejects_content_push() {
 
 #[test]
 fn accepts_empty_head_push() {
-    let mut conn = Connection::<ClientRole>::with_push::<Authority>().expect("client fixture");
+    let mut conn = protocol::try_push::<Authority>().expect("protocol fixture");
     Session::new(&mut conn)
-        .try_prime()
-        .expect("protocol fixture");
-    conn.streams()
-        .headers()
-        .request([field::literal!(entry(b":method", b"GET"))], Boundary::End)
+        .try_start()
         .expect("protocol scenario precondition");
-    conn.transfer().drain(usize::MAX);
     let block = Fields::new(&[
         Entry::new(b":method", b"HEAD"),
         Entry::new(b":scheme", b"http"),
@@ -442,15 +375,10 @@ fn post_goaway_refuses_push() {
     let block = Fields::new(&GET).try_encode().expect("protocol fixture");
     let promised = Id::new(2).expect("fixture domain");
     for split in [0, block.len() / 2] {
-        let mut conn = Connection::<ClientRole>::with_push::<Authority>().expect("client fixture");
+        let mut conn = protocol::try_push::<Authority>().expect("protocol fixture");
         Session::new(&mut conn)
-            .try_prime()
-            .expect("protocol fixture");
-        conn.streams()
-            .headers()
-            .request([field::literal!(entry(b":method", b"GET"))], Boundary::End)
+            .try_start()
             .expect("request fixture");
-        conn.transfer().drain(usize::MAX);
         if split != 0 {
             conn.ingress()
                 .ingest(

@@ -1,14 +1,14 @@
 use core::ops;
 
 use o3::buffer::{pool, write};
-use write::{SpareExt as _, consume, edit};
+use write::SpareExt as _;
 
 use crate::field::{
     head,
     metadata::{
         block,
         huffman::decoder,
-        lower::{self, stage},
+        lower,
         map::record,
         section::{
             rules,
@@ -19,41 +19,14 @@ use crate::field::{
     },
 };
 
-#[must_use = "continue or roll back the open tagged field"]
-struct Value {
+#[must_use = "finish, continue, or roll back the tagged field"]
+pub(super) struct Tagged {
     start: usize,
-    value_at: usize,
     known: head::Name,
     tag: storage::Tag,
     indexing: crate::field::Indexing,
     scan: block::Value,
-}
-
-#[must_use = "finish or roll back the stored tagged field"]
-struct Stored {
-    value: Value,
-    end: usize,
-}
-
-#[must_use = "finish, continue, or roll back the tagged field"]
-#[repr(transparent)]
-pub(super) struct Tagged(State);
-
-enum State {
-    Open(Value),
-    Stored(Stored),
-}
-
-#[must_use = "apply the tagged field transition"]
-enum Next {
-    Open {
-        field: Value,
-        step: lower::Step,
-    },
-    Stored {
-        field: Stored,
-        cursor: strings::Cursor,
-    },
+    stored: bool,
 }
 
 impl Tagged {
@@ -64,82 +37,122 @@ impl Tagged {
         indexing: crate::field::Indexing,
     ) -> Self {
         let start = append.as_slice().len();
-        let value_at = start + storage::Tag::PREFIX_LEN;
         append.commit();
-        Self(State::Open(Value {
+        Self {
             start,
-            value_at,
             known,
             tag,
             indexing,
             scan: block::Value::new(),
-        }))
+            stored: false,
+        }
     }
 
-    pub(super) fn string(
-        self,
-        lease: &mut pool::Span,
-        cursor: strings::Cursor,
-        input: &[u8],
-    ) -> (stage::Stage, lower::Step) {
-        match self.0 {
-            State::Open(field) => match field.string(lease, cursor, input) {
-                Next::Open {
-                    field,
-                    step: lower::Step::Store { cause },
-                } => {
-                    lease.truncate(field.start);
-                    (stage::Stage::Ready, lower::Step::Store { cause })
-                }
-                Next::Open { field, step } => {
-                    (stage::Stage::Tagged(Self(State::Open(field))), step)
-                }
-                Next::Stored { field, cursor } => (
-                    stage::Stage::Tagged(Self(State::Stored(field))),
-                    lower::Step::Ready { cursor },
-                ),
-            },
-            State::Stored(field) => (
-                stage::Stage::Tagged(Self(State::Stored(field))),
-                lower::Step::Store {
-                    cause: lower::Error::State(lower::State::Stored),
-                },
-            ),
-        }
+    pub(super) fn stored(&self) -> bool {
+        self.stored
     }
 
     pub(super) fn state(&self) -> lower::State {
-        match self.0 {
-            State::Open(_) => lower::State::Tagged,
-            State::Stored(_) => lower::State::Stored,
+        if self.stored {
+            lower::State::Stored
+        } else {
+            lower::State::Tagged
         }
     }
 
-    fn try_stored(self, lease: &mut pool::Span) -> Result<Stored, lower::Error> {
-        match self.0 {
-            State::Open(field) => {
-                if lease.len() != field.value_at {
-                    lease.truncate(field.start);
-                    return Err(lower::Error::State(lower::State::Tagged));
+    fn value_at(&self) -> usize {
+        self.start + storage::Tag::PREFIX_LEN
+    }
+
+    pub(super) fn try_string(
+        &mut self,
+        lease: &mut pool::Span,
+        cursor: &mut strings::Cursor,
+        input: &[u8],
+    ) -> Result<(), lower::StringError> {
+        let current = lease.len();
+        let edit = lease
+            .try_prefix::<{ storage::Tag::PREFIX_LEN }>(self.start)
+            .map_err(|cause| lower::StringError::Store(lower::Error::Edit(cause)))?;
+        let remaining = cursor.remaining();
+        match cursor.feed_into(input, edit) {
+            Ok((_, mut edit)) => {
+                if matches!(cursor.completion(), strings::Completion::Complete) {
+                    let len = current - self.value_at() + edit.len();
+                    edit.prefix()
+                        .copy_from_slice(&self.tag.prefix_u32(len as u32, self.indexing));
+                    self.stored = true;
                 }
-                Ok(field.stored())
+                edit.commit();
+                // SAFETY: this edit only appends to the exclusively held span.
+                self.scan
+                    .extend(unsafe { lease.as_slice().get_unchecked(current..) });
+                Ok(())
             }
-            State::Stored(field) => Ok(field),
+            Err(decoder::Failure {
+                sink,
+                cause,
+                progress,
+            }) => match cause {
+                decoder::DecodeError::InvalidEncoding(cause) => Err(lower::StringError::Decode {
+                    cause: decoder::DecodeError::InvalidEncoding(cause),
+                    progress,
+                }),
+                decoder::DecodeError::Sink(cause) => {
+                    Err(lower::StringError::Store(lower::Error::SinkProgress {
+                        cause,
+                        stored: [current, current + sink.len()],
+                        remaining,
+                        input: [input.len(), progress.consumed(), progress.decoded()],
+                    }))
+                }
+            },
         }
     }
 
-    pub(super) fn try_finish<P, A>(
+    fn try_range(&self, lease: &mut pool::Span) -> Result<ops::Range<usize>, lower::Error> {
+        let range = self.value_at()..lease.len();
+        if !self.stored && range.start != range.end {
+            lease.truncate(self.start);
+            return Err(lower::Error::State(lower::State::Tagged));
+        }
+        Ok(range)
+    }
+
+    fn try_field<'a>(
+        &self,
+        bytes: &'a [u8],
+        range: &ops::Range<usize>,
+    ) -> Result<record::View<'a>, lower::Error> {
+        let value = bytes.get(range.clone()).ok_or(lower::Error::Layout([
+            range.start,
+            range.end,
+            bytes.len(),
+        ]))?;
+        Ok(record::View::new(
+            record::Span::from_slice(&[]),
+            record::Span::from_slice(value),
+        )
+        .with_index(self.indexing))
+    }
+
+    pub(super) fn try_finish<P: rules::Plan, A: rules::Push>(
         self,
         lease: &mut pool::Span,
         scratch: &storage::Scratch,
         state: &mut state::Decoder<P>,
-    ) -> Result<(), lower::Error>
-    where
-        P: rules::Plan,
-        A: rules::Push,
-    {
-        self.try_stored(lease)?
-            .try_finish::<P, A>(lease, scratch, state)
+    ) -> Result<(), lower::Error> {
+        let range = self.try_range(lease)?;
+        let bytes = lease.as_slice();
+        let field = self.try_field(bytes, &range)?;
+        rules::Validate::value(state, self.scan.finish());
+        match state.retain::<A>(self.known, field, bytes, scratch.authority()) {
+            rules::Retention::Discard => self.rollback(lease),
+            rules::Retention::Retain => {
+                state.store(self.known, rules::Store::Tagged(self.tag), range, bytes)
+            }
+        }
+        Ok(())
     }
 
     pub(super) fn try_omit<A: rules::Push>(
@@ -148,179 +161,18 @@ impl Tagged {
         scratch: &storage::Scratch,
         state: &mut fixed::Discard,
     ) -> Result<(), lower::Error> {
-        self.try_stored(lease)?.try_omit::<A>(lease, scratch, state)
-    }
-
-    pub(super) fn rollback(self, lease: &mut pool::Span) {
-        match self.0 {
-            State::Open(field) => lease.truncate(field.start),
-            State::Stored(field) => lease.truncate(field.value.start),
-        }
-    }
-}
-
-impl Value {
-    fn stored(self) -> Stored {
-        Stored {
-            end: self.value_at,
-            value: self,
-        }
-    }
-
-    /// The edit admits bytes within the pool capacity.
-    fn string(self, lease: &mut pool::Span, mut cursor: strings::Cursor, input: &[u8]) -> Next {
-        let current = lease.len();
-        let edit = match lease.try_prefix::<{ storage::Tag::PREFIX_LEN }>(self.start) {
-            Ok(edit) => edit,
-            Err(cause) => return self.store(lower::Error::Edit(cause)),
-        };
-        let before = cursor;
-        let mut next = match cursor.feed_into(input, edit) {
-            Ok((_, edit)) => self.ready(current, cursor, edit),
-            Err(failure) => self.failed(current, before, input.len(), failure),
-        };
-        let scan = match &mut next {
-            Next::Open { field, .. } => &mut field.scan,
-            Next::Stored { field, .. } => &mut field.value.scan,
-        };
-        // SAFETY: this owner's edit only appends on commit; a failed edit leaves
-        // its original length intact. Rollback occurs after this scan returns.
-        scan.extend(unsafe { lease.as_slice().get_unchecked(current..) });
-        next
-    }
-
-    fn ready(
-        self,
-        current: usize,
-        cursor: strings::Cursor,
-        mut edit: edit::Edit<'_, { storage::Tag::PREFIX_LEN }>,
-    ) -> Next {
-        let added = edit.len();
-        match cursor.completion() {
-            strings::Completion::Pending => {
-                edit.commit();
-                return self.open(lower::Step::Ready { cursor });
-            }
-            strings::Completion::Complete => {}
-        }
-        edit.prefix().copy_from_slice(
-            &self
-                .tag
-                .prefix_u32((current - self.value_at + added) as u32, self.indexing),
-        );
-        let stored = Stored {
-            end: current + added,
-            value: self,
-        };
-        edit.commit();
-        Next::Stored {
-            field: stored,
-            cursor,
-        }
-    }
-
-    fn failed(
-        self,
-        current: usize,
-        before: strings::Cursor,
-        len: usize,
-        failure: decoder::Failure<edit::Edit<'_, { storage::Tag::PREFIX_LEN }>, consume::Error>,
-    ) -> Next {
-        let decoder::Failure {
-            sink,
-            cause,
-            progress,
-        } = failure;
-        let stored = [current, current + sink.len()];
-        let input = [len, progress.consumed(), progress.decoded()];
-        match cause {
-            decoder::DecodeError::InvalidEncoding(cause) => {
-                let cause = decoder::DecodeError::InvalidEncoding(cause);
-                self.open(lower::Step::Decode { cause, progress })
-            }
-            decoder::DecodeError::Sink(cause) => self.store(lower::Error::SinkProgress {
-                cause,
-                stored,
-                remaining: before.remaining(),
-                input,
-            }),
-        }
-    }
-
-    fn open(self, step: lower::Step) -> Next {
-        Next::Open { field: self, step }
-    }
-
-    fn store(self, cause: lower::Error) -> Next {
-        self.open(lower::Step::Store { cause })
-    }
-}
-
-impl Stored {
-    fn try_finish<P, A>(
-        self,
-        lease: &mut pool::Span,
-        scratch: &storage::Scratch,
-        state: &mut state::Decoder<P>,
-    ) -> Result<(), lower::Error>
-    where
-        P: rules::Plan,
-        A: rules::Push,
-    {
-        let range = self.range();
-        let stored = self.value;
-        let Some(value) = lease.as_slice().get(range.clone()) else {
-            return Err(lower::Error::Layout([
-                stored.value_at,
-                self.end,
-                lease.len(),
-            ]));
-        };
-        let value = record::Span::from_slice(value);
-        rules::Validate::value(state, stored.scan.finish());
-        let field =
-            record::View::new(record::Span::from_slice(&[]), value).with_index(stored.indexing);
-        let keep = state.retain::<A>(stored.known, field, lease.as_slice(), scratch.authority());
-        match keep {
-            rules::Retention::Discard => lease.truncate(stored.start),
-            rules::Retention::Retain => state.store(
-                stored.known,
-                rules::Store::Tagged(stored.tag),
-                range,
-                lease.as_slice(),
-            ),
-        }
-        Ok(())
-    }
-
-    fn try_omit<A: rules::Push>(
-        self,
-        lease: &mut pool::Span,
-        scratch: &storage::Scratch,
-        state: &mut fixed::Discard,
-    ) -> Result<(), lower::Error> {
-        let range = self.range();
-        let stored = self.value;
-        let Some(value) = lease.as_slice().get(range.clone()) else {
-            return Err(lower::Error::Layout([
-                stored.value_at,
-                self.end,
-                lease.len(),
-            ]));
-        };
-        let value = record::Span::from_slice(value);
-        rules::Validate::value(state, stored.scan.finish());
-        let field =
-            record::View::new(record::Span::from_slice(&[]), value).with_index(stored.indexing);
-        let keep = state.retain::<A>(stored.known, field, lease.as_slice(), scratch.authority());
-        match keep {
-            rules::Retention::Discard => lease.truncate(stored.start),
+        let range = self.try_range(lease)?;
+        let bytes = lease.as_slice();
+        let field = self.try_field(bytes, &range)?;
+        rules::Validate::value(state, self.scan.finish());
+        match state.retain::<A>(self.known, field, bytes, scratch.authority()) {
+            rules::Retention::Discard => self.rollback(lease),
             rules::Retention::Retain => state.store(range),
         }
         Ok(())
     }
 
-    fn range(&self) -> ops::Range<usize> {
-        self.value.value_at..self.end
+    pub(super) fn rollback(self, lease: &mut pool::Span) {
+        lease.truncate(self.start);
     }
 }

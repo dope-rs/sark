@@ -5,10 +5,9 @@ use std::{convert::Infallible, io::Read, net::TcpStream, time::Duration};
 
 use dope::{
     core::{
-        driver::route::{FrameworkTag, KeyTag, Tag, kind},
+        driver::route::{FrameworkTag, Tag, kind},
         io::socket::Listener,
     },
-    manifold::timing,
     runtime::executor::session,
 };
 use dope_test::{
@@ -29,7 +28,6 @@ use sark_h2::{
     ClientRole,
     conn::{DataOutcome, config, machine::Connection},
     frame::numbers::ErrorCode,
-    server::runtime::modes,
 };
 
 use crate::common::{
@@ -99,18 +97,17 @@ fn event_budget() {
     let bank =
         Bank::try_new(settings.connections.count(), settings.limits).expect("gRPC readiness bank");
     let prepared = settings
-        .h2::<KeyTag<0>>()
-        .expect("H2 server plan")
-        .with_bound(listener)
-        .with_plain::<_, modes::Serve<Infallible>>(Plan::new(
-            Fairness {
-                trace: &trace,
-                first: true,
-            },
-            &bank,
-            mode::Direct,
-        ))
-        .for_install::<timing::Throughput>()
+        .try_prepare(
+            listener,
+            Plan::new(
+                Fairness {
+                    trace: &trace,
+                    first: true,
+                },
+                &bank,
+                mode::Direct,
+            ),
+        )
         .expect("server resources");
     let mut reports = Reports::new(prepared.layout(), [<FrameworkTag<kind::Any> as Tag>::ROUTE]);
     let mut finish = session::Completion::new();
@@ -213,15 +210,7 @@ fn output_retries() {
         let trace = OutputTrace::new(competing);
         let bank = Bank::try_new(settings.connections.count(), limits).expect("gRPC bank");
         let prepared = settings
-            .h2::<KeyTag<0>>()
-            .expect("H2 plan")
-            .with_bound(listener)
-            .with_plain::<_, modes::Serve<Infallible>>(Plan::new(
-                OutputFairness(&trace),
-                &bank,
-                mode::Direct,
-            ))
-            .for_install::<timing::Throughput>()
+            .try_prepare(listener, Plan::new(OutputFairness(&trace), &bank, mode::Direct))
             .expect("server resources");
         let mut reports =
             Reports::new(prepared.layout(), [<FrameworkTag<kind::Any> as Tag>::ROUTE]);

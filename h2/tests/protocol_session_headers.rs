@@ -2,7 +2,7 @@ use common::{
     headers::Authority,
     hpack::{Fields, GET},
     protocol::{
-        Session,
+        self, Session,
         conn::Controls,
         session::{Frame, OK_RESPONSE},
     },
@@ -62,8 +62,7 @@ fn rejects_unpromised() {
 #[test]
 fn accepts_promised() {
     for chain in [frame::Block::End, frame::Block::More] {
-        let mut conn = Connection::<ClientRole>::with_push::<Authority>().expect("client fixture");
-        Session::new(&mut conn).try_prime().expect("primed client");
+        let mut conn = protocol::try_push::<Authority>().expect("primed client");
         Session::new(&mut conn).try_start().expect("local request");
         let block = Fields::new(&GET).try_encode().expect("promised request");
         conn.ingress()
@@ -107,10 +106,7 @@ fn accepts_promised() {
 
 #[test]
 fn headers_self_dependency() {
-    let mut conn = Connection::<ServerRole>::try_new().expect("server fixture");
-    Session::new(&mut conn)
-        .try_prime()
-        .expect("protocol fixture");
+    let mut conn = protocol::try_connection::<ServerRole>().expect("protocol fixture");
     assert_eq!(
         conn.ingress()
             .ingest(common::protocol::session::SELF_DEPENDENT_HEADERS),
@@ -123,10 +119,7 @@ fn headers_self_dependency() {
 
 #[test]
 fn headers_open_stream() {
-    let mut conn = Connection::<ServerRole>::try_new().expect("server fixture");
-    Session::new(&mut conn)
-        .try_prime()
-        .expect("protocol fixture");
+    let mut conn = protocol::try_connection::<ServerRole>().expect("protocol fixture");
 
     let block = Fields::new(&GET).try_encode().expect("protocol fixture");
     let frame = Frame::new(1, &block)
@@ -165,10 +158,7 @@ fn headers_open_stream() {
 
 #[test]
 fn headers_close_remote() {
-    let mut conn = Connection::<ServerRole>::try_new().expect("server fixture");
-    Session::new(&mut conn)
-        .try_prime()
-        .expect("protocol fixture");
+    let mut conn = protocol::try_connection::<ServerRole>().expect("protocol fixture");
 
     let block = Fields::new(&GET).try_encode().expect("protocol fixture");
     let frame = Frame::new(1, &block)
@@ -191,10 +181,7 @@ fn headers_close_remote() {
 
 #[test]
 fn continuation_assembles() {
-    let mut conn = Connection::<ServerRole>::try_new().expect("server fixture");
-    Session::new(&mut conn)
-        .try_prime()
-        .expect("protocol fixture");
+    let mut conn = protocol::try_connection::<ServerRole>().expect("protocol fixture");
 
     let block = Fields::new(&GET).try_encode().expect("protocol fixture");
     let split_a = &block[..2];
@@ -280,10 +267,7 @@ fn fused_owners_match() {
     }
 
     let decode = |fused: bool| {
-        let mut conn = Connection::<ServerRole>::try_new().expect("server fixture");
-        Session::new(&mut conn)
-            .try_prime()
-            .expect("protocol fixture");
+        let mut conn = protocol::try_connection::<ServerRole>().expect("protocol fixture");
         if fused {
             let mut wire = Vec::new();
             for frame in &frames {
@@ -335,10 +319,7 @@ fn all_hpack_splits() {
     .expect("protocol fixture");
 
     for split in 0..=block.len() {
-        let mut conn = Connection::<ServerRole>::try_new().expect("server fixture");
-        Session::new(&mut conn)
-            .try_prime()
-            .expect("protocol fixture");
+        let mut conn = protocol::try_connection::<ServerRole>().expect("protocol fixture");
         conn.ingress()
             .ingest(
                 &Frame::new(1, &block[..split])
@@ -383,10 +364,7 @@ fn all_receive_splits() {
         .expect("protocol fixture");
 
     for split in 0..=frame.len() {
-        let mut conn = Connection::<ServerRole>::try_new().expect("server fixture");
-        Session::new(&mut conn)
-            .try_prime()
-            .expect("protocol fixture");
+        let mut conn = protocol::try_connection::<ServerRole>().expect("protocol fixture");
         conn.ingress()
             .ingest(&frame[..split])
             .expect("protocol scenario precondition");
@@ -402,10 +380,7 @@ fn all_receive_splits() {
 
 #[test]
 fn rejects_foreign_frame() {
-    let mut conn = Connection::<ServerRole>::try_new().expect("server fixture");
-    Session::new(&mut conn)
-        .try_prime()
-        .expect("protocol fixture");
+    let mut conn = protocol::try_connection::<ServerRole>().expect("protocol fixture");
 
     let block = Fields::new(&GET).try_encode().expect("protocol fixture");
     conn.ingress()
@@ -427,10 +402,7 @@ fn rejects_foreign_frame() {
 
 #[test]
 fn rejects_interleaved_data() {
-    let mut conn = Connection::<ServerRole>::try_new().expect("server fixture");
-    Session::new(&mut conn)
-        .try_prime()
-        .expect("protocol fixture");
+    let mut conn = protocol::try_connection::<ServerRole>().expect("protocol fixture");
 
     let block = Fields::new(&GET).try_encode().expect("protocol fixture");
     conn.ingress()
@@ -452,10 +424,7 @@ fn rejects_interleaved_data() {
 
 #[test]
 fn rejects_wrong_stream() {
-    let mut conn = Connection::<ServerRole>::try_new().expect("server fixture");
-    Session::new(&mut conn)
-        .try_prime()
-        .expect("protocol fixture");
+    let mut conn = protocol::try_connection::<ServerRole>().expect("protocol fixture");
 
     let block = Fields::new(&GET).try_encode().expect("protocol fixture");
     conn.ingress()

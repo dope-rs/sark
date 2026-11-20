@@ -3,13 +3,13 @@ pub mod common;
 use common::{
     hpack::{Fields, GET},
     protocol::{
-        Session,
+        self,
         session::{Frame, Wire},
     },
 };
 use sark_core::manifold::stream::Boundary;
 use sark_h2::{
-    ServerRole, conn::machine::Connection, frame, frame::numbers::ErrorCode, stream::Id,
+    ServerRole, frame, frame::numbers::ErrorCode, stream::Id,
 };
 
 #[test]
@@ -17,10 +17,7 @@ fn post_goaway_refuses_head() {
     let block = Fields::new(&GET).try_encode().expect("protocol fixture");
     let id = Id::new(3).expect("fixture domain");
     for split in [block.len(), block.len() / 2] {
-        let mut conn = Connection::<ServerRole>::try_new().expect("server fixture");
-        Session::new(&mut conn)
-            .try_prime()
-            .expect("protocol fixture");
+        let mut conn = protocol::try_connection::<ServerRole>().expect("protocol fixture");
         conn.control().goaway(ErrorCode::NoError);
         conn.transfer().drain(usize::MAX);
 

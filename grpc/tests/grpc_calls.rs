@@ -1,6 +1,6 @@
 use sark_grpc::{Code, client::io::Session as _};
 
-use crate::common::grpc::wire::Transfer;
+use crate::common::grpc::wire::transfer;
 pub mod common;
 use sark_grpc::{
     client::{
@@ -47,12 +47,8 @@ fn recycles_request_owner() {
                 Admission::Pending
             ));
 
-            let streams = Transfer {
-                client: &mut client,
-                server: &mut server,
-            }
-            .try_request()
-            .expect("gRPC request transfer");
+            let streams = transfer::try_request(&mut client, &mut server)
+                .expect("gRPC request transfer");
             assert_eq!(streams.len(), 1);
             let id = streams[0];
             assert_eq!(client.owner_cap(), 1);
@@ -62,24 +58,16 @@ fn recycles_request_owner() {
             let call = request::Session::finish(&mut client, stream)
                 .expect("request-to-response transition");
             assert_eq!(
-                Transfer {
-                    client: &mut client,
-                    server: &mut server
-                }
-                .try_request()
-                .expect("gRPC request transfer"),
+                transfer::try_request(&mut client, &mut server)
+                    .expect("gRPC request transfer"),
                 [id]
             );
 
             Response::new(&mut server, id)
                 .try_respond(b"two-messages")
                 .expect("gRPC response fixture");
-            Transfer {
-                client: &mut client,
-                server: &mut server,
-            }
-            .try_response()
-            .expect("gRPC response transfer");
+            transfer::try_response(&mut client, &mut server)
+                .expect("gRPC response transfer");
             let result = unary::Session::try_poll(&mut client, &call)
                 .expect("exact completion lookup")
                 .expect("client-streaming response");
@@ -118,24 +106,16 @@ fn reverses_uploads() {
                 request::Session::finish(&mut client, first).expect("first response transition");
             let second =
                 request::Session::finish(&mut client, second).expect("second response transition");
-            let streams = Transfer {
-                client: &mut client,
-                server: &mut server,
-            }
-            .try_request()
-            .expect("gRPC request transfer");
+            let streams = transfer::try_request(&mut client, &mut server)
+                .expect("gRPC request transfer");
             assert_eq!(streams.len(), 2);
             let slow_id = streams[0];
             let fast_id = streams[1];
             Response::new(&mut server, fast_id)
                 .try_respond(b"second")
                 .expect("gRPC response fixture");
-            Transfer {
-                client: &mut client,
-                server: &mut server,
-            }
-            .try_response()
-            .expect("gRPC response transfer");
+            transfer::try_response(&mut client, &mut server)
+                .expect("gRPC response transfer");
             assert!(
                 unary::Session::try_poll(&mut client, &first)
                     .expect("first response lookup")
@@ -154,12 +134,8 @@ fn reverses_uploads() {
             Response::new(&mut server, slow_id)
                 .try_respond(b"first")
                 .expect("gRPC response fixture");
-            Transfer {
-                client: &mut client,
-                server: &mut server,
-            }
-            .try_response()
-            .expect("gRPC response transfer");
+            transfer::try_response(&mut client, &mut server)
+                .expect("gRPC response transfer");
             let first = unary::Session::try_poll(&mut client, &first)
                 .expect("first response lookup")
                 .expect("first response completes last");
@@ -235,33 +211,21 @@ fn shares_event_slab() {
             )
             .into_result()
             .expect("second response capability");
-            let streams = Transfer {
-                client: &mut client,
-                server: &mut server,
-            }
-            .try_request()
-            .expect("gRPC request transfer");
+            let streams = transfer::try_request(&mut client, &mut server)
+                .expect("gRPC request transfer");
             assert_eq!(streams.len(), 2);
             let id_a = streams[0];
             let id_b = streams[1];
             Response::new(&mut server, id_b)
                 .try_respond(b"second-response")
                 .expect("gRPC response fixture");
-            Transfer {
-                client: &mut client,
-                server: &mut server,
-            }
-            .try_response()
-            .expect("gRPC response transfer");
+            transfer::try_response(&mut client, &mut server)
+                .expect("gRPC response transfer");
             Response::new(&mut server, id_a)
                 .try_respond(b"first-response")
                 .expect("gRPC response fixture");
-            Transfer {
-                client: &mut client,
-                server: &mut server,
-            }
-            .try_response()
-            .expect("gRPC response transfer");
+            transfer::try_response(&mut client, &mut server)
+                .expect("gRPC response transfer");
             assert!(
                 response::Session::try_poll(&mut client, &first)
                     .expect("first response lookup")
@@ -292,12 +256,8 @@ fn shares_bidi_identity() {
             bidi::Session::try_send(&mut client, &mut stream, &mut codec, &b"one".to_vec())
                 .into_result()
                 .expect("first bidi message");
-            let streams = Transfer {
-                client: &mut client,
-                server: &mut server,
-            }
-            .try_request()
-            .expect("gRPC request transfer");
+            let streams = transfer::try_request(&mut client, &mut server)
+                .expect("gRPC request transfer");
             assert_eq!(streams.len(), 1);
             let id = streams[0];
             bidi::Session::try_send(&mut client, &mut stream, &mut codec, &b"two".to_vec())
@@ -306,23 +266,15 @@ fn shares_bidi_identity() {
             let response = bidi::Session::finish(&mut client, stream)
                 .expect("request half-close preserves response half");
             assert_eq!(
-                Transfer {
-                    client: &mut client,
-                    server: &mut server
-                }
-                .try_request()
-                .expect("gRPC request transfer"),
+                transfer::try_request(&mut client, &mut server)
+                    .expect("gRPC request transfer"),
                 [id]
             );
             Response::new(&mut server, id)
                 .try_respond(b"same-call-response")
                 .expect("gRPC response fixture");
-            Transfer {
-                client: &mut client,
-                server: &mut server,
-            }
-            .try_response()
-            .expect("gRPC response transfer");
+            transfer::try_response(&mut client, &mut server)
+                .expect("gRPC response transfer");
             assert_eq!(
                 drain_response(&mut client, &response),
                 b"same-call-response"
@@ -351,23 +303,15 @@ fn splits_bidi_progress() {
             bidi::Session::try_half(&mut client, &mut send, &mut codec, &b"split".to_vec())
                 .into_result()
                 .expect("split request authority sends independently");
-            let streams = Transfer {
-                client: &mut client,
-                server: &mut server,
-            }
-            .try_request()
-            .expect("gRPC request transfer");
+            let streams = transfer::try_request(&mut client, &mut server)
+                .expect("gRPC request transfer");
             assert_eq!(streams.len(), 1);
             let id = streams[0];
             Response::new(&mut server, id)
                 .try_respond(b"split-response")
                 .expect("gRPC response fixture");
-            Transfer {
-                client: &mut client,
-                server: &mut server,
-            }
-            .try_response()
-            .expect("gRPC response transfer");
+            transfer::try_response(&mut client, &mut server)
+                .expect("gRPC response transfer");
 
             bidi::Session::try_half(
                 &mut client,
@@ -380,12 +324,8 @@ fn splits_bidi_progress() {
             bidi::Session::finish_half(&mut client, send)
                 .expect("finishing the send half does not consume receive ownership");
             assert_eq!(
-                Transfer {
-                    client: &mut client,
-                    server: &mut server
-                }
-                .try_request()
-                .expect("gRPC request transfer"),
+                transfer::try_request(&mut client, &mut server)
+                    .expect("gRPC request transfer"),
                 [id]
             );
             assert_eq!(drain_response(&mut client, &response), b"split-response");
@@ -408,23 +348,15 @@ fn reclaims_early_response() {
             let stream = bidi::Session::open(&mut client, b"/proof/Chat", None, &metadata)
                 .expect("first bidi identity");
             let (mut stale, response) = stream.split();
-            let streams = Transfer {
-                client: &mut client,
-                server: &mut server,
-            }
-            .try_request()
-            .expect("gRPC request transfer");
+            let streams = transfer::try_request(&mut client, &mut server)
+                .expect("gRPC request transfer");
             assert_eq!(streams.len(), 1);
             let id = streams[0];
             Response::new(&mut server, id)
                 .try_respond(b"early-response")
                 .expect("gRPC response fixture");
-            Transfer {
-                client: &mut client,
-                server: &mut server,
-            }
-            .try_response()
-            .expect("gRPC response transfer");
+            transfer::try_response(&mut client, &mut server)
+                .expect("gRPC response transfer");
             response::Session::cancel(&mut client, response);
 
             let mut fresh = bidi::Session::open(&mut client, b"/proof/Chat", None, &metadata)

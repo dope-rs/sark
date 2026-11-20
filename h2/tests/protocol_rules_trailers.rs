@@ -1,6 +1,7 @@
 use common::{
     hpack::Fields,
     protocol::{
+        self,
         Session,
         rules::{Request, Settings, Wire},
         session::{self, Frame},
@@ -97,10 +98,7 @@ fn accepts_trailers() {
 
 #[test]
 fn rejects_pseudo_trailer() {
-    let mut conn = Connection::<ServerRole>::try_new().expect("server fixture");
-    Session::new(&mut conn)
-        .try_prime()
-        .expect("protocol fixture");
+    let mut conn = protocol::try_connection::<ServerRole>().expect("protocol fixture");
     let initial = Frame::new(
         1,
         &Request::new(&[]).try_encode().expect("protocol fixture"),
@@ -157,10 +155,7 @@ fn rejects_pseudo_trailer() {
 
 #[test]
 fn validates_continuation() {
-    let mut conn = Connection::<ServerRole>::try_new().expect("server fixture");
-    Session::new(&mut conn)
-        .try_prime()
-        .expect("protocol fixture");
+    let mut conn = protocol::try_connection::<ServerRole>().expect("protocol fixture");
     let block = Fields::new(&[
         Entry::new(b":scheme", b"http"),
         Entry::new(b":path", b"/"),
@@ -208,12 +203,9 @@ fn validates_continuation() {
 #[test]
 fn rejects_split_limit() {
     let max = Request::new(&[]).size() - 1;
-    let mut conn = Settings::limited(max)
-        .try_connect::<ServerRole>()
+    let mut conn: Connection<ServerRole> = Settings::limited(max)
+        .try_connect()
         .expect("header limit fixture");
-    Session::new(&mut conn)
-        .try_prime()
-        .expect("protocol fixture");
     let block = Request::new(&[]).try_encode().expect("protocol fixture");
     let split = block.len() / 2;
     conn.ingress()

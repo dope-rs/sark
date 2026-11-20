@@ -15,10 +15,9 @@ use common::{
 };
 use dope::{
     core::{
-        driver::route::{FrameworkTag, KeyTag, Tag, kind},
+        driver::route::{FrameworkTag, Tag, kind},
         io::socket::Listener,
     },
-    manifold::timing,
     runtime::{executor::session, topology::lending::Stage},
 };
 use dope_fiber::abi::race::Either;
@@ -39,7 +38,6 @@ use sark_grpc::{
         mode,
     },
 };
-use sark_h2::server::runtime::modes;
 
 #[test]
 fn impossible_capacity() {
@@ -156,11 +154,7 @@ fn released_waiters() {
             let bank =
                 Bank::try_new(settings.connections.count(), settings.limits).expect("server bank");
             let prepared = settings
-                .h2::<KeyTag<0>>()
-                .expect("H2 plan")
-                .with_bound(listener)
-                .with_plain::<_, modes::Serve<Infallible>>(Plan::new(handler, &bank, mode::Direct))
-                .for_install::<timing::Throughput>()
+                .try_prepare(listener, Plan::new(handler, &bank, mode::Direct))
                 .expect("server resources");
             let mut reports =
                 Reports::new(prepared.layout(), [<FrameworkTag<kind::Any> as Tag>::ROUTE]);

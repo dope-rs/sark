@@ -22,10 +22,7 @@ use sark_http::{
     request::body::Ref,
 };
 
-use crate::common::{
-    INITIAL_SETTINGS,
-    headers::{Authority, entry},
-};
+use crate::common::{INITIAL_SETTINGS, headers::entry};
 
 pub struct Session<'a, R: Role, P: Policy, C: Storage, A: Push> {
     conn: &'a mut Connection<R, P, C, A>,
@@ -47,6 +44,14 @@ impl<'a, R: Role, P: Policy, C: Storage, A: Push> Session<'a, R, P, C, A> {
         conn.transfer().drain(usize::MAX);
         Ok(())
     }
+}
+
+pub fn try_connection<R: Role>() -> Result<Connection<R>, ReplyError> {
+    rules::Settings::default().try_connect()
+}
+
+pub fn try_push<A: Push>() -> Result<Connection<ClientRole, RetainRaw, Shared, A>, ReplyError> {
+    rules::Settings::default().try_connect()
 }
 
 pub mod conn;
@@ -158,7 +163,7 @@ impl<'d, P: Policy> Session<'_, ServerRole, P, resident::Shared<'d>, RejectPush>
     }
 }
 
-impl Session<'_, ClientRole, RetainRaw, Shared, Authority> {
+impl<P: Policy, A: Push> Session<'_, ClientRole, P, Shared, A> {
     pub fn try_start(self) -> Result<(), Error> {
         self.conn
             .streams()

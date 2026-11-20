@@ -1,8 +1,9 @@
 use common::{
     hpack::Fields,
     protocol::{
+        self,
         Session,
-        rules::{INVALID_PATH, Request, Retained, Settings, Wire},
+        rules::{INVALID_REQUESTS, Request, Retained, Settings, Wire},
         session::Frame,
     },
 };
@@ -22,55 +23,69 @@ use sark_http::field::metadata::map::record::Entry;
 use crate::common::protocol::rules::Declared;
 
 #[test]
-fn rejects_invalid_path() {
-    let mut conn = Connection::<ServerRole>::try_new().expect("server fixture");
-    Session::new(&mut conn)
-        .try_prime()
+fn rejects_invalid_request_fields() {
+    for &fields in INVALID_REQUESTS {
+        let mut conn = protocol::try_connection::<ServerRole>().expect("protocol fixture");
+        let block = Fields::new(fields).try_encode().expect("protocol fixture");
+        let frame = Frame::new(1, &block)
+            .try_headers(Boundary::End, Block::End)
+            .expect("protocol wire fixture");
+        conn.ingress().ingest(&frame).expect("request ingress");
+        assert!(conn.ingress().poll_event().is_none(), "{fields:?}");
+        assert_eq!(
+            Wire::new(conn.output().first())
+                .try_reset()
+                .expect("protocol wire fixture"),
+            Some((Id::new(1).expect("stream"), ErrorCode::ProtocolError)),
+            "{fields:?}",
+        );
+    }
+}
+
+#[test]
+fn rejects_missing_path() {
+    let mut conn = protocol::try_connection::<ServerRole>().expect("protocol fixture");
+    let [method, scheme, _, authority] = common::hpack::GET;
+    let block = Fields::new(&[method, scheme, authority])
+        .try_encode()
         .expect("protocol fixture");
-    let block = Fields::new(&[
-        Entry::new(b":method", b"GET"),
-        Entry::new(b":scheme", b"https"),
-        Entry::new(b":authority", b"example.test"),
-        Entry::new(b":path", INVALID_PATH),
-    ])
-    .try_encode()
-    .expect("protocol fixture");
     let frame = Frame::new(1, &block)
         .try_headers(Boundary::End, Block::End)
         .expect("protocol wire fixture");
-    conn.ingress().ingest(&frame).expect("request ingress");
+    conn.ingress()
+        .ingest(&frame)
+        .expect("missing-path HEADERS frame fits ingress");
+    let stream = Id::new(1).expect("fixture domain");
+    assert!(!conn.status().has_stream(stream));
     assert!(conn.ingress().poll_event().is_none());
     assert_eq!(
         Wire::new(conn.output().first())
             .try_reset()
             .expect("protocol wire fixture"),
-        Some((Id::new(1).expect("stream"), ErrorCode::ProtocolError)),
+        Some((stream, ErrorCode::ProtocolError)),
     );
 }
 
 #[test]
-fn accepts_full_pseudo() {
-    let mut conn = Connection::<ServerRole>::try_new().expect("server fixture");
-    Session::new(&mut conn)
-        .try_prime()
-        .expect("protocol fixture");
-    let frame = Frame::new(
-        1,
-        &Request::new(&[]).try_encode().expect("protocol fixture"),
-    )
-    .try_headers(Boundary::End, Block::End)
-    .expect("protocol wire fixture");
-    conn.ingress()
-        .ingest(&frame)
-        .expect("complete request HEADERS frame fits ingress");
-    let ev = conn.ingress().poll_event().expect("Headers event");
-    assert!(matches!(ev, Event::Headers { .. }));
-    assert!(
-        Wire::new(conn.output().first())
-            .try_reset()
-            .expect("protocol wire fixture")
-            .is_none()
-    );
+fn accepts_request_with_or_without_te_trailers() {
+    let trailers: &[(&[u8], &[u8])] = &[(b"te", b"TrAiLeRs")];
+    for extra in [&[][..], trailers] {
+        let mut conn = protocol::try_connection::<ServerRole>().expect("protocol fixture");
+        let block = Request::new(extra).try_encode().expect("protocol fixture");
+        let frame = Frame::new(1, &block)
+            .try_headers(Boundary::End, Block::End)
+            .expect("protocol wire fixture");
+        conn.ingress().ingest(&frame).expect("request ingress");
+        let event = conn.ingress().poll_event().expect("Headers event");
+        assert!(matches!(event, Event::Headers { .. }), "{extra:?}");
+        assert!(
+            Wire::new(conn.output().first())
+                .try_reset()
+                .expect("protocol wire fixture")
+                .is_none(),
+            "{extra:?}",
+        );
+    }
 }
 
 #[test]
@@ -144,12 +159,9 @@ fn rejects_tagged_value() {
 #[test]
 fn accepts_header_limit() {
     let max = Request::new(&[]).size();
-    let mut conn = Settings::limited(max)
-        .try_connect::<ServerRole>()
+    let mut conn: Connection<ServerRole> = Settings::limited(max)
+        .try_connect()
         .expect("header limit fixture");
-    Session::new(&mut conn)
-        .try_prime()
-        .expect("protocol fixture");
     let frame = Frame::new(
         1,
         &Request::new(&[]).try_encode().expect("protocol fixture"),
@@ -172,12 +184,9 @@ fn accepts_header_limit() {
 #[test]
 fn rejects_header_limit() {
     let max = Request::new(&[]).size() - 1;
-    let mut conn = Settings::limited(max)
-        .try_connect::<ServerRole>()
+    let mut conn: Connection<ServerRole> = Settings::limited(max)
+        .try_connect()
         .expect("header limit fixture");
-    Session::new(&mut conn)
-        .try_prime()
-        .expect("protocol fixture");
     let frame = Frame::new(
         1,
         &Request::new(&[]).try_encode().expect("protocol fixture"),
@@ -203,40 +212,5 @@ fn rejects_header_limit() {
         !conn
             .status()
             .has_stream(Id::new(1).expect("fixture domain"))
-    );
-}
-
-#[test]
-fn rejects_uppercase_name() {
-    let mut conn = Connection::<ServerRole>::try_new().expect("server fixture");
-    Session::new(&mut conn)
-        .try_prime()
-        .expect("protocol fixture");
-    let block = Fields::new(&[
-        Entry::new(b":method", b"GET"),
-        Entry::new(b":scheme", b"http"),
-        Entry::new(b":path", b"/"),
-        Entry::new(b":authority", b"x"),
-        Entry::new(b"Host", b"x"),
-    ])
-    .try_encode()
-    .expect("protocol fixture");
-    let frame = Frame::new(1, &block)
-        .try_headers(Boundary::End, Block::End)
-        .expect("protocol wire fixture");
-    conn.ingress()
-        .ingest(&frame)
-        .expect("uppercase-name HEADERS frame fits ingress");
-    assert!(conn.ingress().poll_event().is_none());
-    let rst = Wire::new(conn.output().first())
-        .try_reset()
-        .expect("protocol wire fixture")
-        .expect("RST_STREAM emitted");
-    assert!(
-        (rst)
-            == (
-                Id::new(1).expect("fixture domain"),
-                ErrorCode::ProtocolError
-            )
     );
 }

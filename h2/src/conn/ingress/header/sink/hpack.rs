@@ -34,16 +34,13 @@ impl<P: rules::Policy, A: rules::Push> sink::Direct for Hpack<'_, P, A> {
     type Error = decode::Failure<lower::Error>;
 
     fn string(&mut self, cursor: &mut strings::Cursor, input: &[u8]) -> Result<(), Self::Error> {
-        match self.session.string(*cursor, input) {
-            lower::Step::Ready { cursor: next } => {
-                *cursor = next;
-                Ok(())
-            }
-            lower::Step::Bound { cause } => Err(decode::Error::from(cause).into()),
-            lower::Step::Decode { cause, progress } => {
+        match self.session.try_string(cursor, input) {
+            Ok(()) => Ok(()),
+            Err(lower::StringError::Bound(cause)) => Err(decode::Error::from(cause).into()),
+            Err(lower::StringError::Decode { cause, progress }) => {
                 Err(decode::Error::encoding(cause, progress).into())
             }
-            lower::Step::Store { cause } => Err(decode::Failure::Sink(cause)),
+            Err(lower::StringError::Store(cause)) => Err(decode::Failure::Sink(cause)),
         }
     }
 

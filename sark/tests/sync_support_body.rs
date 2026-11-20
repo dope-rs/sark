@@ -1,30 +1,18 @@
-use common::sync::{Client, try_build};
-
 pub mod common;
 
-use std::{cell::Cell, pin::Pin};
-
 use dope_test::alloc::Tracker;
-use o3::{
-    base::cell::region,
-    buffer::{
-        resident::{self, Shared},
-        storage,
-    },
-};
+use o3::buffer::{resident::Shared, storage};
 use sark_core::manifold::stream::Boundary;
 use sark_h2::{
-    ClientRole,
-    conn::{DataOutcome, machine},
+    conn::DataOutcome,
     frame::numbers::ErrorCode,
-    server,
-    server::sync,
+    server::{self, sync},
 };
-use sark_http::field;
+use sark_http::field::{self, Value};
 
 use crate::common::{
     drained::Drained,
-    sync::{LIMITS, Router, State},
+    sync::{Client, LIMITS, Router, State, client, try_build, with_domain},
 };
 
 #[global_allocator]
@@ -46,33 +34,21 @@ fn fragment_retention_bound() {
             false,
         ),
     ] {
-        let mut domain = resident::Domain::new();
-        region::Token::scope_pinned(Pin::new(&mut domain), |token, domain| {
+        with_domain(|domain, proof| {
             let budget = domain
-                .get_mut()
-                .try_budget(prefix.len() + suffix.len(), token.proof())
+                .try_budget(prefix.len() + suffix.len(), proof)
                 .expect("fragment retention budget");
-            let state = State {
-                request_body: Cell::new(0),
-                request_head: Cell::new(0),
-                invalid_path: Cell::new(false),
-                header_error: Cell::new(None),
-                dispatches: Cell::new(0),
-                large_body: storage::Shared::new(),
-            };
+            let state = State::new(storage::Shared::new());
             let router = Router::new(&state);
-            let mut client = machine::Connection::<ClientRole>::try_new().expect("client fixture");
+            let mut client = client();
             let stream = client
                 .streams()
                 .headers()
                 .request(
-                    [
-                        field::literal!(Client::field(b":method", b"POST")),
-                        field::literal!(Client::field(b":scheme", b"http")),
-                        field::literal!(Client::field(b":path", b"/echo")),
-                        field::literal!(Client::field(b":authority", b"localhost")),
-                        Client::field(b"content-length", length).expect("content length"),
-                    ],
+                    Client::post_head(
+                        field::literal!(Value::try_bytes(b"/echo")),
+                        Value::try_bytes(length).expect("content length"),
+                    ),
                     Boundary::More,
                 )
                 .expect("the fragmented request fits the client stream table");
@@ -134,29 +110,18 @@ fn fragment_retention_bound() {
 
 #[test]
 fn second_owner_rejected() {
-    let mut domain = resident::Domain::new();
-    region::Token::scope_pinned(Pin::new(&mut domain), |token, domain| {
-        let state = State {
-            request_body: Cell::new(0),
-            request_head: Cell::new(0),
-            invalid_path: Cell::new(false),
-            header_error: Cell::new(None),
-            dispatches: Cell::new(0),
-            large_body: storage::Shared::new(),
-        };
+    with_domain(|domain, proof| {
+        let state = State::new(storage::Shared::new());
         let router = Router::new(&state);
-        let mut client = machine::Connection::<ClientRole>::try_new().expect("client fixture");
+        let mut client = client();
         let stream = client
             .streams()
             .headers()
             .request(
-                [
-                    field::literal!(Client::field(b":method", b"POST")),
-                    field::literal!(Client::field(b":scheme", b"http")),
-                    field::literal!(Client::field(b":path", b"/echo")),
-                    field::literal!(Client::field(b":authority", b"localhost")),
-                    field::literal!(Client::field(b"content-length", b"2")),
-                ],
+                Client::post_head(
+                    field::literal!(Value::try_bytes(b"/echo")),
+                    field::literal!(Value::try_bytes(b"2")),
+                ),
                 Boundary::More,
             )
             .expect("the two-chunk request fits the client stream table");
@@ -185,8 +150,7 @@ fn second_owner_rejected() {
         let endpoint = try_build(router, limits).expect("sync fixture");
         let mut server = sync::Conn::try_new(&endpoint).expect("sync connection");
         let budget = domain
-            .get_mut()
-            .try_budget(limits.max_connection_body_bytes, token.proof())
+            .try_budget(limits.max_connection_body_bytes, proof)
             .expect("connection body budget");
         server.ingress().try_bind(budget).expect("retention domain");
 
@@ -215,29 +179,18 @@ fn second_owner_rejected() {
 
 #[test]
 fn reset_returns_credit() {
-    let mut domain = resident::Domain::new();
-    region::Token::scope_pinned(Pin::new(&mut domain), |token, domain| {
-        let state = State {
-            request_body: Cell::new(0),
-            request_head: Cell::new(0),
-            invalid_path: Cell::new(false),
-            header_error: Cell::new(None),
-            dispatches: Cell::new(0),
-            large_body: storage::Shared::new(),
-        };
+    with_domain(|domain, proof| {
+        let state = State::new(storage::Shared::new());
         let router = Router::new(&state);
-        let mut client = machine::Connection::<ClientRole>::try_new().expect("client fixture");
+        let mut client = client();
         let key = client
             .streams()
             .headers()
             .request_key(
-                [
-                    field::literal!(Client::field(b":method", b"POST")),
-                    field::literal!(Client::field(b":scheme", b"http")),
-                    field::literal!(Client::field(b":path", b"/echo")),
-                    field::literal!(Client::field(b":authority", b"localhost")),
-                    field::literal!(Client::field(b"content-length", b"2")),
-                ],
+                Client::post_head(
+                    field::literal!(Value::try_bytes(b"/echo")),
+                    field::literal!(Value::try_bytes(b"2")),
+                ),
                 Boundary::More,
             )
             .expect("the reset request fits the client stream table");
@@ -259,8 +212,7 @@ fn reset_returns_credit() {
         let endpoint = try_build(router, limits).expect("sync fixture");
         let mut server = sync::Conn::try_new(&endpoint).expect("sync connection");
         let budget = domain
-            .get_mut()
-            .try_budget(limits.max_connection_body_bytes, token.proof())
+            .try_budget(limits.max_connection_body_bytes, proof)
             .expect("connection body budget");
         server.ingress().try_bind(budget).expect("retention domain");
         for wire in [head, data] {

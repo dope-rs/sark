@@ -1,7 +1,7 @@
 use o3::depot::arena::slab::key;
 use sark_grpc::Code;
 
-use crate::common::grpc::wire::Transfer;
+use crate::common::grpc::wire::transfer;
 pub mod common;
 
 use sark_core::manifold::stream::Boundary;
@@ -75,12 +75,8 @@ fn missing_status_retires() {
             )
             .into_result()
             .expect("unary request");
-            let streams = Transfer {
-                client: &mut client,
-                server: &mut server,
-            }
-            .try_request()
-            .expect("gRPC request transfer");
+            let streams = transfer::try_request(&mut client, &mut server)
+                .expect("gRPC request transfer");
             assert_eq!(streams.len(), 1);
             let id = streams[0];
 
@@ -165,24 +161,16 @@ fn early_reply_reclaims() {
                 let metadata = Metadata::new();
                 let stream = request::Session::open(&mut client, b"/proof/Upload", None, &metadata)
                     .expect("first upload identity");
-                let streams = Transfer {
-                    client: &mut client,
-                    server: &mut server,
-                }
-                .try_request()
-                .expect("gRPC request transfer");
+                let streams = transfer::try_request(&mut client, &mut server)
+                    .expect("gRPC request transfer");
                 assert_eq!(streams.len(), 1);
                 let id = streams[0];
 
                 Response::new(&mut server, id)
                     .try_respond(b"early-unary-response")
                     .expect("gRPC response fixture");
-                Transfer {
-                    client: &mut client,
-                    server: &mut server,
-                }
-                .try_response()
-                .expect("gRPC response transfer");
+                transfer::try_response(&mut client, &mut server)
+                    .expect("gRPC response transfer");
                 if closed {
                     let call = request::Session::finish(&mut client, stream)
                         .expect("close request after its response completes");

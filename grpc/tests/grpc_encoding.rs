@@ -7,7 +7,7 @@ use common::{
             Open as _,
             calls::{FIRST_RESPONSE, Response},
         },
-        wire::Transfer,
+        wire::transfer,
     },
     headers,
 };
@@ -80,12 +80,8 @@ fn rejects_response_encoding_locally() {
             |mut client| {
                 let calls = client.try_unary(2).expect("concurrent calls");
                 let mut server = Connection::<ServerRole>::try_new().expect("server");
-                let streams = Transfer {
-                    client: &mut client,
-                    server: &mut server,
-                }
-                .try_request()
-                .expect("request transfer");
+                let streams = transfer::try_request(&mut client, &mut server)
+                    .expect("request transfer");
                 let mut fields = Block::response(&Metadata::new()).expect("response fields");
                 fields.push(b"grpc-encoding", b"gzip").expect("encoding");
                 if matches!(boundary, Boundary::End) {
@@ -99,12 +95,8 @@ fn rejects_response_encoding_locally() {
                 Response::new(&mut server, streams[1])
                     .try_respond(FIRST_RESPONSE)
                     .expect("concurrent success");
-                Transfer {
-                    client: &mut client,
-                    server: &mut server,
-                }
-                .try_response()
-                .expect("encoding rejection is local to its call");
+                transfer::try_response(&mut client, &mut server)
+                    .expect("encoding rejection is local to its call");
 
                 let status = unary::Session::try_poll(&mut client, &calls[0])
                     .err()
@@ -136,12 +128,8 @@ fn admits_only_plain_response_frames() {
                 |mut client| {
                     let calls = client.try_unary(1).expect("call");
                     let mut server = Connection::<ServerRole>::try_new().expect("server");
-                    let streams = Transfer {
-                        client: &mut client,
-                        server: &mut server,
-                    }
-                    .try_request()
-                    .expect("request transfer");
+                    let streams = transfer::try_request(&mut client, &mut server)
+                        .expect("request transfer");
                     let mut fields = Block::response(&Metadata::new()).expect("response fields");
                     if let Some(encoding) = encoding {
                         fields.push(b"grpc-encoding", encoding).expect("encoding");
@@ -158,12 +146,8 @@ fn admits_only_plain_response_frames() {
                         .try_data(&frame, Boundary::More)
                         .expect("response message");
                     response.try_trailers(Some(Code::Ok)).expect("trailers");
-                    Transfer {
-                        client: &mut client,
-                        server: &mut server,
-                    }
-                    .try_response()
-                    .expect("frame rejection stays local");
+                    transfer::try_response(&mut client, &mut server)
+                        .expect("frame rejection stays local");
                     match compression {
                         Compression::Plain => {
                             let response = unary::Session::try_poll(&mut client, &calls[0])

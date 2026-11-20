@@ -4,7 +4,7 @@ use common::{
     codec::Bytes,
     grpc::{
         call::calls::{Response, Settings},
-        wire::Transfer,
+        wire::transfer,
     },
 };
 use sark_grpc::{
@@ -38,12 +38,8 @@ fn only_own_pending() {
                     .into_result()
                     .expect("response stream")
                 });
-                let ids = Transfer {
-                    client: &mut client,
-                    server: &mut server,
-                }
-                .try_request()
-                .expect("requests");
+                let ids = transfer::try_request(&mut client, &mut server)
+                    .expect("requests");
                 Response::new(&mut server, ids[0])
                     .try_header()
                     .expect("first header");
@@ -55,12 +51,8 @@ fn only_own_pending() {
                 Response::new(&mut server, ids[1])
                     .try_respond(b"retained")
                     .expect("other response");
-                Transfer {
-                    client: &mut client,
-                    server: &mut server,
-                }
-                .try_response()
-                .expect("responses");
+                transfer::try_response(&mut client, &mut server)
+                    .expect("responses");
                 assert!(client.is_blocked());
                 response::Session::cancel(&mut client, cancel);
                 assert!(matches!(

@@ -1,6 +1,6 @@
 use core::{convert::Infallible, ops};
 
-use o3::alloc;
+use o3::{alloc, buffer::storage::Shared};
 use sark_h2::{
     Role,
     conn::{config, config::Config, machine::Connection},
@@ -22,9 +22,47 @@ use sark_http::field::metadata::{
     },
 };
 
-use crate::common::hpack;
+use crate::common::{
+    hpack,
+    protocol::{ReplyError, Session},
+};
 
 pub const INVALID_PATH: &[u8] = b"x";
+
+pub const INVALID_REQUESTS: &[&[Entry<'static>]] = {
+    let [method, scheme, path, authority] = hpack::GET;
+    &[
+        &[method, scheme, path, Entry::new(b":foo", b"bar")],
+        &[method, scheme, path, Entry::new(b":status", b"200")],
+        &[method, scheme, Entry::new(b"content-type", b"text/plain"), path],
+        &[method, scheme, path, authority, Entry::new(b"connection", b"keep-alive")],
+        &[method, scheme, path, authority, Entry::new(b"keep-alive", b"timeout=5")],
+        &[method, scheme, path, authority, Entry::new(b"transfer-encoding", b"chunked")],
+        &[method, scheme, path, authority, Entry::new(b"te", b"gzip")],
+        &[
+            method,
+            Entry::new(b":scheme", b"https"),
+            Entry::new(b":authority", b"example.test"),
+            Entry::new(b":path", INVALID_PATH),
+        ],
+        &[method, scheme, path, authority, Entry::new(b"Host", b"x")],
+        &[method, scheme, Entry::new(b":path", b""), authority],
+        &[method, Entry::new(b":method", b"POST"), scheme, path, authority],
+    ]
+};
+
+pub const INVALID_RESPONSES: &[&[Entry<'static>]] = &[
+    &[Entry::new(b"content-type", b"text/plain")],
+    &[
+        Entry::new(b":status", b"200"),
+        Entry::new(b"Content-Type", b"text/plain"),
+    ],
+    &[
+        Entry::new(b":status", b"200"),
+        Entry::new(b":method", b"GET"),
+    ],
+    &[Entry::new(b":status", b"200"), Entry::new(b":foo", b"bar")],
+];
 
 #[derive(Debug)]
 pub enum Build {
@@ -169,6 +207,7 @@ impl<'a> Retained<'a> {
     }
 }
 
+#[derive(Default)]
 pub struct Settings {
     config: Config,
 }
@@ -198,8 +237,14 @@ impl Settings {
             },
         }
     }
-    pub fn try_connect<R: Role>(self) -> Result<Connection<R>, config::Error> {
-        Connection::<R>::with_config(self.config)
+    pub fn try_connect<R: Role, A: Push>(
+        self,
+    ) -> Result<Connection<R, rules::RetainRaw, Shared, A>, ReplyError> {
+        let mut conn = Connection::<R>::try_push::<A>(self.config).map_err(ReplyError::Config)?;
+        Session::new(&mut conn)
+            .try_prime()
+            .map_err(ReplyError::Protocol)?;
+        Ok(conn)
     }
 }
 

@@ -14,7 +14,6 @@ use common::{
 };
 use sark_h2::{conn::event::Event, frame::payload::Continuation, stream::Id};
 
-use crate::common::headers::entry;
 pub mod common;
 use o3::buffer::storage::Shared;
 use sark_core::manifold::stream::Boundary;
@@ -28,13 +27,10 @@ use sark_h2::{
     frame::numbers::ErrorCode,
     hpack::encode::Encoder,
 };
-use sark_http::field::{
-    self,
-    metadata::{
-        block,
-        map::record::Entry,
-        section::{rules::Discard, storage::Tag},
-    },
+use sark_http::field::metadata::{
+    block,
+    map::record::Entry,
+    section::{rules::Discard, storage::Tag},
 };
 
 use crate::common::protocol::rules::{Authority, Stable};
@@ -371,11 +367,9 @@ fn validates_push_method() {
     Session::new(&mut conn)
         .try_prime()
         .expect("protocol fixture");
-    conn.streams()
-        .headers()
-        .request([field::literal!(entry(b":method", b"GET"))], Boundary::End)
+    Session::new(&mut conn)
+        .try_start()
         .expect("client request stream opens");
-    conn.transfer().drain(usize::MAX);
     let block = Fields::new(&[
         Entry::new(b":method", b"POST"),
         Entry::new(b":scheme", b"https"),
@@ -414,11 +408,9 @@ fn validates_push_authority() {
     Session::new(&mut conn)
         .try_prime()
         .expect("protocol fixture");
-    conn.streams()
-        .headers()
-        .request([field::literal!(entry(b":method", b"GET"))], Boundary::End)
+    Session::new(&mut conn)
+        .try_start()
         .expect("client request stream opens");
-    conn.transfer().drain(usize::MAX);
     let block = Fields::new(&[
         Entry::new(b":method", b"GET"),
         Entry::new(b":scheme", b"https"),

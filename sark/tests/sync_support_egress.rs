@@ -1,34 +1,20 @@
-use common::sync::{Client, try_build, wire::Window};
-use sark_h2::{
-    conn,
-    conn::{config, config::Settings},
-    frame::numbers::Limit,
-    stream::Id,
-};
-
 pub mod common;
 
-use std::{cell::Cell, pin::Pin};
-
-use dope::core::driver::settings;
 use dope_test::alloc::Tracker;
-use o3::{
-    base::cell::region,
-    buffer::{
-        resident::{self, Shared},
-        storage,
-    },
-};
+use o3::buffer::{resident::Shared, storage};
 use sark_h2::{
-    ClientRole,
-    conn::machine,
-    server,
-    server::{sync, sync::Endpoint},
+    conn::{self, config::Settings},
+    frame::numbers::Limit,
+    server::sync::{self, Endpoint},
+    stream::Id,
 };
 
 use crate::common::{
     drained::Drained,
-    sync::{LIMITS, Router, State},
+    sync::{
+        Client, LIMITS, OUTBOUND_LIMIT, Router, State, backpressure_plan, client, try_build,
+        try_peer, wire::Window, with_domain,
+    },
 };
 
 #[global_allocator]
@@ -40,22 +26,13 @@ fn warm_dispatch_is_bounded() {
         (b"steady-state".as_slice(), true),
         ([b'x'; 64].as_slice(), false),
     ] {
-        let mut domain = resident::Domain::new();
-        region::Token::scope_pinned(Pin::new(&mut domain), |token, domain| {
+        with_domain(|domain, proof| {
             let budget = domain
-                .get_mut()
-                .try_budget(payload.len(), token.proof())
+                .try_budget(payload.len(), proof)
                 .expect("response body retention budget");
-            let state = State {
-                request_body: Cell::new(0),
-                request_head: Cell::new(0),
-                invalid_path: Cell::new(false),
-                header_error: Cell::new(None),
-                dispatches: Cell::new(0),
-                large_body: storage::Shared::new(),
-            };
+            let state = State::new(storage::Shared::new());
             let router = Router::new(&state);
-            let mut client = machine::Connection::<ClientRole>::try_new().expect("client fixture");
+            let mut client = client();
             let endpoint = try_build(router, LIMITS).expect("sync fixture");
             let mut server = sync::Conn::try_new(&endpoint).expect("sync connection");
             server.ingress().try_bind(budget).expect("retention domain");
@@ -105,38 +82,21 @@ fn warm_dispatch_is_bounded() {
 
 #[test]
 fn head_waits_without_alloc() {
-    let mut domain = resident::Domain::new();
-    region::Token::scope_pinned(Pin::new(&mut domain), |token, domain| {
-        let state = State {
-            request_body: Cell::new(0),
-            request_head: Cell::new(0),
-            invalid_path: Cell::new(false),
-            header_error: Cell::new(None),
-            dispatches: Cell::new(0),
-            large_body: storage::Shared::new(),
-        };
+    with_domain(|domain, proof| {
+        let state = State::new(storage::Shared::new());
         let router = Router::new(&state);
-        let mut client = machine::Connection::<ClientRole>::try_new().expect("client fixture");
+        let mut client = client();
         let value = vec![b'~'; 16_000];
         let wire = Client::new(&mut client)
             .try_post(b"/headers", &value)
             .expect("sync fixture");
-        let limits = server::Config {
-            max_request_body_bytes: 16 << 10,
-            max_request_body_chunks: 4 << 10,
-            max_connection_body_bytes: 16 << 10,
-            max_connection_body_chunks: 16 << 10,
-            max_outbound_bytes: 1,
-        };
-        let receive = settings::Receive::fixed::<2, { 16 << 10 }>();
-        let plan = server::Plan::new(limits, receive).expect("test limits fit the receive plan");
+        let plan = backpressure_plan(16 << 10);
         let resident = plan.resident_len();
         let endpoint = Endpoint::try_with(router, plan, 256)
             .expect("the header test stream count fits the endpoint layout");
         let mut server = sync::Conn::try_new(&endpoint).expect("sync connection");
         let budget = domain
-            .get_mut()
-            .try_budget(resident, token.proof())
+            .try_budget(resident, proof)
             .expect("planned receive budget");
         server.ingress().try_bind(budget).expect("retention domain");
 
@@ -157,7 +117,7 @@ fn head_waits_without_alloc() {
         });
         assert_eq!(allocs, (0, 0));
         assert_eq!(state.dispatches.get(), 1);
-        assert!(server.output().len() > limits.max_outbound_bytes);
+        assert!(server.output().len() > OUTBOUND_LIMIT);
         assert!(
             !server
                 .status()
@@ -176,51 +136,29 @@ fn head_waits_without_alloc() {
 
 #[test]
 fn large_body_keeps_owner() {
-    let mut domain = resident::Domain::new();
-    region::Token::scope_pinned(Pin::new(&mut domain), |token, domain| {
+    with_domain(|domain, proof| {
         let body = storage::Owned::try_filled(100_000, b'x')
             .expect("the large response body fits test storage")
             .freeze();
         let base = body.as_slice().as_ptr().addr();
         let body_len = body.len();
-        let state = State {
-            request_body: Cell::new(0),
-            request_head: Cell::new(0),
-            invalid_path: Cell::new(false),
-            header_error: Cell::new(None),
-            dispatches: Cell::new(0),
-            large_body: body,
-        };
+        let state = State::new(body);
         let router = Router::new(&state);
         let peer = Settings {
             max_frame_size: Limit::MAX,
             ..Settings::default()
         };
-        let mut client = machine::Connection::<ClientRole>::with_config(config::Config {
-            local_settings: peer,
-            recv_window_target: 65_535,
-            ..Default::default()
-        })
-        .expect("large peer frame setting");
+        let mut client = try_peer(peer, 65_535).expect("large peer frame setting");
         let wire = Client::new(&mut client)
             .try_get(b"/large")
             .expect("sync fixture");
-        let limits = server::Config {
-            max_request_body_bytes: 1,
-            max_request_body_chunks: 4 << 10,
-            max_connection_body_bytes: 1,
-            max_connection_body_chunks: 16 << 10,
-            max_outbound_bytes: 1,
-        };
-        let receive = settings::Receive::fixed::<2, { 16 << 10 }>();
-        let plan = server::Plan::new(limits, receive).expect("test limits fit the receive plan");
+        let plan = backpressure_plan(1);
         let resident = plan.resident_len();
         let endpoint = Endpoint::try_with(router, plan, 8)
             .expect("eight streams fit the large-body endpoint layout");
         let mut server = sync::Conn::try_new(&endpoint).expect("sync connection");
         let budget = domain
-            .get_mut()
-            .try_budget(resident, token.proof())
+            .try_budget(resident, proof)
             .expect("planned receive budget");
         server.ingress().try_bind(budget).expect("retention domain");
 

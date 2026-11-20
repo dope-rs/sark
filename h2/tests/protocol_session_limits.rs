@@ -1,7 +1,7 @@
 use common::{
     hpack::{Fields, GET},
     protocol::{
-        Session,
+        self, Session,
         conn::{Control, Controls},
         session::{Authority, Frame, Wire},
     },
@@ -192,10 +192,7 @@ fn zero_limit_keeps_slots() {
 
 #[test]
 fn goaway_tracks_peer_id() {
-    let mut conn = Connection::<ServerRole>::try_new().expect("server fixture");
-    Session::new(&mut conn)
-        .try_prime()
-        .expect("protocol fixture");
+    let mut conn = protocol::try_connection::<ServerRole>().expect("protocol fixture");
 
     let block = Fields::new(&GET).try_encode().expect("protocol fixture");
     conn.ingress()
@@ -245,10 +242,7 @@ fn goaway_tracks_peer_id() {
 
 #[test]
 fn window_update_expands() {
-    let mut conn = Connection::<ClientRole>::with_push::<Authority>().expect("client fixture");
-    Session::new(&mut conn)
-        .try_prime()
-        .expect("protocol fixture");
+    let mut conn = protocol::try_push::<Authority>().expect("protocol fixture");
 
     let id = conn
         .streams()
@@ -280,10 +274,7 @@ fn window_update_expands() {
 
 #[test]
 fn server_rejects_push() {
-    let mut conn = Connection::<ServerRole>::try_new().expect("server fixture");
-    Session::new(&mut conn)
-        .try_prime()
-        .expect("protocol fixture");
+    let mut conn = protocol::try_connection::<ServerRole>().expect("protocol fixture");
 
     let block = Fields::new(&GET).try_encode().expect("protocol fixture");
     conn.ingress()
@@ -313,10 +304,7 @@ fn server_rejects_push() {
 
 #[test]
 fn reset_emits_and_evicts() {
-    let mut conn = Connection::<ServerRole>::try_new().expect("server fixture");
-    Session::new(&mut conn)
-        .try_prime()
-        .expect("protocol fixture");
+    let mut conn = protocol::try_connection::<ServerRole>().expect("protocol fixture");
 
     let block = Fields::new(&GET).try_encode().expect("protocol fixture");
     conn.ingress()
@@ -351,10 +339,7 @@ fn reset_emits_and_evicts() {
 
 #[test]
 fn rejects_peer_parity() {
-    let mut conn = Connection::<ServerRole>::try_new().expect("server fixture");
-    Session::new(&mut conn)
-        .try_prime()
-        .expect("protocol fixture");
+    let mut conn = protocol::try_connection::<ServerRole>().expect("protocol fixture");
 
     let block = Fields::new(&GET).try_encode().expect("protocol fixture");
     assert!(matches!(

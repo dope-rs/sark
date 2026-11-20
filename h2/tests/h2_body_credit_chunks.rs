@@ -1,13 +1,7 @@
-use sark_h2::conn::DataOutcome;
-
 pub mod common;
 
-use std::time::Duration;
-
-use common::session::Connect;
-use dope_test::harness::server::Pair;
 use sark_core::manifold::stream::Boundary;
-use sark_h2::{ClientRole, conn::machine::Connection, frame::numbers::ErrorCode};
+use sark_h2::{conn::DataOutcome, frame::numbers::ErrorCode};
 
 use crate::common::body::{LIMITS, PROBE, Peer, headers, serve};
 
@@ -16,49 +10,36 @@ fn rejects_second_owner() {
     let mut server = LIMITS;
     server.max_request_body_chunks = 1;
     server.max_connection_body_chunks = 2;
-    let pair = Pair::bind().expect("H2 body-credit harness");
-    let bind = pair.addr();
-    pair.check(
-        move |context, listener| serve(server, bind, context, listener),
-        |address| {
-            let mut socket = address
-                .try_connect(Duration::from_secs(3))
-                .expect("H2 peer connection");
-            let mut client =
-                Connection::<ClientRole>::try_new().expect("default H2 client plan is valid");
+    serve(server, |client, socket| {
+        let stream = client
+            .streams()
+            .headers()
+            .request(
+                headers(b"/too-many-owners", b"2").expect("request fields"),
+                Boundary::More,
+            )
+            .expect("start bounded request");
+        client
+            .try_send_all(stream, b"a", false)
+            .expect("H2 request DATA");
+        client
+            .control()
+            .ping(PROBE)
+            .expect("queue first-owner probe");
+        client.try_flush(socket).expect("H2 peer flush");
+        client.try_ping(socket).expect("H2 peer progress");
 
-            let stream = client
-                .streams()
-                .headers()
-                .request(
-                    headers(b"/too-many-owners", b"2").expect("request fields"),
-                    Boundary::More,
-                )
-                .expect("start bounded request");
+        client
+            .try_send_all(stream, b"b", true)
+            .expect("H2 request DATA");
+        client.try_flush(socket).expect("H2 peer flush");
+        assert_eq!(
             client
-                .try_send_all(stream, b"a", false)
-                .expect("H2 request DATA");
-            client
-                .control()
-                .ping(PROBE)
-                .expect("queue first-owner probe");
-            client.try_flush(&mut socket).expect("H2 peer flush");
-            client.try_ping(&mut socket).expect("H2 peer progress");
-
-            client
-                .try_send_all(stream, b"b", true)
-                .expect("H2 request DATA");
-            client.try_flush(&mut socket).expect("H2 peer flush");
-            assert_eq!(
-                client
-                    .try_reset(&mut socket, stream)
-                    .expect("H2 peer reset"),
-                ErrorCode::EnhanceYourCalm,
-            );
-        },
-        |result| result.expect("H2 server runtime"),
-    )
-    .expect("body-credit E2E");
+                .try_reset(socket, stream)
+                .expect("H2 peer reset"),
+            ErrorCode::EnhanceYourCalm,
+        );
+    });
 }
 
 #[test]
@@ -66,69 +47,56 @@ fn reset_returns_credit() {
     let mut server = LIMITS;
     server.max_request_body_chunks = 2;
     server.max_connection_body_chunks = 1;
-    let pair = Pair::bind().expect("H2 body-credit harness");
-    let bind = pair.addr();
-    pair.check(
-        move |context, listener| serve(server, bind, context, listener),
-        |address| {
-            let mut socket = address
-                .try_connect(Duration::from_secs(3))
-                .expect("H2 peer connection");
-            let mut client =
-                Connection::<ClientRole>::try_new().expect("default H2 client plan is valid");
+    serve(server, |client, socket| {
+        let old = client
+            .streams()
+            .headers()
+            .request(
+                headers(b"/abandoned", b"2").expect("request fields"),
+                Boundary::More,
+            )
+            .expect("start abandoned request");
+        client
+            .try_send_all(old, b"a", false)
+            .expect("H2 request DATA");
+        client
+            .control()
+            .ping(PROBE)
+            .expect("queue retained-owner probe");
+        client.try_flush(socket).expect("H2 peer flush");
+        client.try_ping(socket).expect("H2 peer progress");
 
-            let old = client
-                .streams()
-                .headers()
-                .request(
-                    headers(b"/abandoned", b"2").expect("request fields"),
-                    Boundary::More,
-                )
-                .expect("start abandoned request");
-            client
-                .try_send_all(old, b"a", false)
-                .expect("H2 request DATA");
-            client
-                .control()
-                .ping(PROBE)
-                .expect("queue retained-owner probe");
-            client.try_flush(&mut socket).expect("H2 peer flush");
-            client.try_ping(&mut socket).expect("H2 peer progress");
+        let key = client
+            .status()
+            .stream_key(old)
+            .expect("active request stream");
+        client
+            .streams()
+            .try_cancel(key, ErrorCode::Cancel)
+            .expect("reset retained request");
+        client.control().ping(PROBE).expect("queue reset probe");
+        client.try_flush(socket).expect("H2 peer flush");
+        client.try_ping(socket).expect("H2 peer progress");
 
-            let key = client
-                .status()
-                .stream_key(old)
-                .expect("active request stream");
+        let next = client
+            .streams()
+            .headers()
+            .request(
+                headers(b"/replacement", b"1").expect("request fields"),
+                Boundary::More,
+            )
+            .expect("start replacement request");
+        client
+            .try_send_all(next, b"b", true)
+            .expect("H2 request DATA");
+        client.try_flush(socket).expect("H2 peer flush");
+        assert_eq!(
             client
-                .streams()
-                .try_cancel(key, ErrorCode::Cancel)
-                .expect("reset retained request");
-            client.control().ping(PROBE).expect("queue reset probe");
-            client.try_flush(&mut socket).expect("H2 peer flush");
-            client.try_ping(&mut socket).expect("H2 peer progress");
-
-            let next = client
-                .streams()
-                .headers()
-                .request(
-                    headers(b"/replacement", b"1").expect("request fields"),
-                    Boundary::More,
-                )
-                .expect("start replacement request");
-            client
-                .try_send_all(next, b"b", true)
-                .expect("H2 request DATA");
-            client.try_flush(&mut socket).expect("H2 peer flush");
-            assert_eq!(
-                client
-                    .try_read(&mut socket, next)
-                    .expect("H2 response body"),
-                b"b"
-            );
-        },
-        |result| result.expect("H2 server runtime"),
-    )
-    .expect("body-credit E2E");
+                .try_read(socket, next)
+                .expect("H2 response body"),
+            b"b"
+        );
+    });
 }
 
 #[test]
@@ -136,69 +104,56 @@ fn rejects_atomically() {
     let mut server = LIMITS;
     server.max_request_body_chunks = 2;
     server.max_connection_body_chunks = 1;
-    let pair = Pair::bind().expect("H2 body-credit harness");
-    let bind = pair.addr();
-    pair.check(
-        move |context, listener| serve(server, bind, context, listener),
-        |address| {
-            let mut socket = address
-                .try_connect(Duration::from_secs(3))
-                .expect("H2 peer connection");
-            let mut client =
-                Connection::<ClientRole>::try_new().expect("default H2 client plan is valid");
+    serve(server, |client, socket| {
+        let owner = client
+            .streams()
+            .headers()
+            .request(
+                headers(b"/owner", b"1").expect("request fields"),
+                Boundary::More,
+            )
+            .expect("start owner request");
+        client
+            .try_send_all(owner, b"a", false)
+            .expect("H2 request DATA");
+        client.control().ping(PROBE).expect("queue owner probe");
+        client.try_flush(socket).expect("H2 peer flush");
+        client.try_ping(socket).expect("H2 peer progress");
 
-            let owner = client
-                .streams()
-                .headers()
-                .request(
-                    headers(b"/owner", b"1").expect("request fields"),
-                    Boundary::More,
-                )
-                .expect("start owner request");
+        let rejected = client
+            .streams()
+            .headers()
+            .request(
+                headers(b"/rejected", b"1").expect("request fields"),
+                Boundary::More,
+            )
+            .expect("start competing request");
+        client
+            .try_send_all(rejected, b"x", true)
+            .expect("H2 request DATA");
+        client.try_flush(socket).expect("H2 peer flush");
+        assert_eq!(
             client
-                .try_send_all(owner, b"a", false)
-                .expect("H2 request DATA");
-            client.control().ping(PROBE).expect("queue owner probe");
-            client.try_flush(&mut socket).expect("H2 peer flush");
-            client.try_ping(&mut socket).expect("H2 peer progress");
+                .try_reset(socket, rejected)
+                .expect("H2 peer reset"),
+            ErrorCode::EnhanceYourCalm,
+        );
 
-            let rejected = client
-                .streams()
-                .headers()
-                .request(
-                    headers(b"/rejected", b"1").expect("request fields"),
-                    Boundary::More,
-                )
-                .expect("start competing request");
+        assert_eq!(
             client
-                .try_send_all(rejected, b"x", true)
-                .expect("H2 request DATA");
-            client.try_flush(&mut socket).expect("H2 peer flush");
-            assert_eq!(
-                client
-                    .try_reset(&mut socket, rejected)
-                    .expect("H2 peer reset"),
-                ErrorCode::EnhanceYourCalm,
-            );
-
-            assert_eq!(
-                client
-                    .streams()
-                    .try_send(owner, b"", Boundary::End)
-                    .expect("owner stream remains writable after peer rejection"),
-                DataOutcome::Ended,
-            );
-            client.try_flush(&mut socket).expect("H2 peer flush");
-            assert_eq!(
-                client
-                    .try_read(&mut socket, owner)
-                    .expect("H2 response body"),
-                b"a"
-            );
-        },
-        |result| result.expect("H2 server runtime"),
-    )
-    .expect("body-credit E2E");
+                .streams()
+                .try_send(owner, b"", Boundary::End)
+                .expect("owner stream remains writable after peer rejection"),
+            DataOutcome::Ended,
+        );
+        client.try_flush(socket).expect("H2 peer flush");
+        assert_eq!(
+            client
+                .try_read(socket, owner)
+                .expect("H2 response body"),
+            b"a"
+        );
+    });
 }
 
 #[test]
@@ -206,41 +161,28 @@ fn empty_fin_uses_no_credit() {
     let mut server = LIMITS;
     server.max_request_body_chunks = 0;
     server.max_connection_body_chunks = 0;
-    let pair = Pair::bind().expect("H2 body-credit harness");
-    let bind = pair.addr();
-    pair.check(
-        move |context, listener| serve(server, bind, context, listener),
-        |address| {
-            let mut socket = address
-                .try_connect(Duration::from_secs(3))
-                .expect("H2 peer connection");
-            let mut client =
-                Connection::<ClientRole>::try_new().expect("default H2 client plan is valid");
-
-            let stream = client
+    serve(server, |client, socket| {
+        let stream = client
+            .streams()
+            .headers()
+            .request(
+                headers(b"/empty", b"0").expect("request fields"),
+                Boundary::More,
+            )
+            .expect("start empty request");
+        assert_eq!(
+            client
                 .streams()
-                .headers()
-                .request(
-                    headers(b"/empty", b"0").expect("request fields"),
-                    Boundary::More,
-                )
-                .expect("start empty request");
-            assert_eq!(
-                client
-                    .streams()
-                    .try_send(stream, b"", Boundary::End)
-                    .expect("empty FIN fits zero chunk credit"),
-                DataOutcome::Ended,
-            );
-            client.try_flush(&mut socket).expect("H2 peer flush");
-            assert!(
-                client
-                    .try_read(&mut socket, stream)
-                    .expect("H2 response body")
-                    .is_empty()
-            );
-        },
-        |result| result.expect("H2 server runtime"),
-    )
-    .expect("body-credit E2E");
+                .try_send(stream, b"", Boundary::End)
+                .expect("empty FIN fits zero chunk credit"),
+            DataOutcome::Ended,
+        );
+        client.try_flush(socket).expect("H2 peer flush");
+        assert!(
+            client
+                .try_read(socket, stream)
+                .expect("H2 response body")
+                .is_empty()
+        );
+    });
 }

@@ -1,36 +1,21 @@
-use common::sync::{Client, try_build};
-use sark_h2::{
-    conn,
-    conn::{config, config::Settings},
-    frame::numbers::Limit,
-};
-
 pub mod common;
 
-use std::{cell::Cell, pin::Pin};
-
-use dope::core::driver::settings;
 use dope_test::alloc::Tracker;
-use o3::{
-    base::cell::region,
-    buffer::{
-        resident::{self, Shared},
-        storage,
-    },
-};
+use o3::buffer::{resident::Shared, storage};
 use sark_core::manifold::stream::Boundary;
 use sark_h2::{
-    ClientRole,
-    conn::machine,
-    frame::numbers::ErrorCode,
-    server,
-    server::{sync, sync::Endpoint},
+    conn::{self, config::Settings},
+    frame::numbers::{ErrorCode, Limit},
+    server::sync::Endpoint,
 };
-use sark_http::field;
+use sark_http::field::{self, Value};
 
 use crate::common::{
     drained::Drained,
-    sync::{LIMITS, Router, State},
+    sync::{
+        Client, LIMITS, Router, State, backpressure_plan, connection, try_build, try_peer,
+        with_domain,
+    },
 };
 
 #[global_allocator]
@@ -38,39 +23,21 @@ static ALLOCATOR: Tracker = Tracker::new();
 
 #[test]
 fn streams_round_robin() {
-    let mut domain = resident::Domain::new();
-    region::Token::scope_pinned(Pin::new(&mut domain), |token, domain| {
+    with_domain(|domain, proof| {
         let body = storage::Owned::try_filled(150_000, b'x')
             .expect("the multiplexed response body fits test storage")
             .freeze();
         let base = body.as_slice().as_ptr().addr();
         let body_len = body.len();
-        let state = State {
-            request_body: Cell::new(0),
-            request_head: Cell::new(0),
-            invalid_path: Cell::new(false),
-            header_error: Cell::new(None),
-            dispatches: Cell::new(0),
-            large_body: body,
-        };
+        let state = State::new(body);
         let router = Router::new(&state);
         let peer = Settings {
             max_frame_size: Limit::MAX,
             initial_window_size: 1_000_000,
             ..Settings::default()
         };
-        let mut client = machine::Connection::<ClientRole>::with_config(config::Config {
-            local_settings: peer,
-            recv_window_target: 1_000_000,
-            ..Default::default()
-        })
-        .expect("large multiplexed receive windows");
-        let request = [
-            field::literal!(Client::field(b":method", b"GET")),
-            field::literal!(Client::field(b":scheme", b"http")),
-            field::literal!(Client::field(b":path", b"/large")),
-            field::literal!(Client::field(b":authority", b"localhost")),
-        ];
+        let mut client = try_peer(peer, 1_000_000).expect("large multiplexed receive windows");
+        let request = Client::get_head(field::literal!(Value::try_bytes(b"/large")));
         let first = client
             .streams()
             .headers()
@@ -83,26 +50,10 @@ fn streams_round_robin() {
             .expect("the second large request fits the client stream table");
         let wire = Client::new(&mut client).try_take().expect("sync fixture");
 
-        let limits = server::Config {
-            max_request_body_bytes: 1,
-            max_request_body_chunks: 4 << 10,
-            max_connection_body_bytes: 1,
-            max_connection_body_chunks: 16 << 10,
-            max_outbound_bytes: 1,
-        };
-        let receive = settings::Receive::fixed::<2, { 16 << 10 }>();
-        let plan = server::Plan::new(limits, receive).expect("test limits fit the receive plan");
+        let plan = backpressure_plan(1);
         let endpoint = Endpoint::try_with(router, plan, 8)
             .expect("eight streams fit the multiplexed endpoint layout");
-        let budget = domain
-            .get_mut()
-            .try_budget(wire.len(), token.proof())
-            .expect("resident budget");
-        let mut server = sync::Conn::try_new(&endpoint).expect("sync connection");
-        server
-            .ingress()
-            .try_bind(budget)
-            .expect("connection retention");
+        let mut server = connection(&endpoint, domain, proof, wire.len());
 
         server
             .ingress()
@@ -177,52 +128,27 @@ fn streams_round_robin() {
 
 #[test]
 fn reset_wakes_next() {
-    let mut domain = resident::Domain::new();
-    region::Token::scope_pinned(Pin::new(&mut domain), |token, domain| {
+    with_domain(|domain, proof| {
         let body = storage::Owned::try_filled(150_000, b'x')
             .expect("the reset response body fits test storage")
             .freeze();
         let base = body.as_slice().as_ptr().addr();
         let end = base + body.len();
-        let state = State {
-            request_body: Cell::new(0),
-            request_head: Cell::new(0),
-            invalid_path: Cell::new(false),
-            header_error: Cell::new(None),
-            dispatches: Cell::new(0),
-            large_body: body,
-        };
+        let state = State::new(body);
         let router = Router::new(&state);
-        let mut client = machine::Connection::<ClientRole>::with_config(config::Config {
-            local_settings: Settings::DEFAULT,
-            recv_window_target: 65_535,
-            ..Default::default()
-        })
-        .expect("standard connection receive window");
+        let mut client =
+            try_peer(Settings::DEFAULT, 65_535).expect("standard connection receive window");
         let key = client
             .streams()
             .headers()
             .request_key(
-                [
-                    field::literal!(Client::field(b":method", b"GET")),
-                    field::literal!(Client::field(b":scheme", b"http")),
-                    field::literal!(Client::field(b":path", b"/large")),
-                    field::literal!(Client::field(b":authority", b"localhost")),
-                ],
+                Client::get_head(field::literal!(Value::try_bytes(b"/large"))),
                 Boundary::End,
             )
             .expect("the first reset candidate fits the client stream table");
         let head = Client::new(&mut client).try_take().expect("sync fixture");
         let endpoint = try_build(router, LIMITS).expect("sync fixture");
-        let budget = domain
-            .get_mut()
-            .try_budget(LIMITS.max_connection_body_bytes, token.proof())
-            .expect("resident budget");
-        let mut server = sync::Conn::try_new(&endpoint).expect("sync connection");
-        server
-            .ingress()
-            .try_bind(budget)
-            .expect("connection retention");
+        let mut server = connection(&endpoint, domain, proof, LIMITS.max_connection_body_bytes);
 
         server
             .ingress()
@@ -241,12 +167,7 @@ fn reset_wakes_next() {
             .streams()
             .headers()
             .request(
-                [
-                    field::literal!(Client::field(b":method", b"GET")),
-                    field::literal!(Client::field(b":scheme", b"http")),
-                    field::literal!(Client::field(b":path", b"/items/survivor")),
-                    field::literal!(Client::field(b":authority", b"localhost")),
-                ],
+                Client::get_head(field::literal!(Value::try_bytes(b"/items/survivor"))),
                 Boundary::End,
             )
             .expect("the survivor request fits the client stream table");

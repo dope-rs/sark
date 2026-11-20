@@ -5,7 +5,7 @@ use common::grpc::{
         Open as _,
         calls::{FIRST_RESPONSE, Response, SECOND_RESPONSE, UNARY_BUDGETS},
     },
-    wire::Transfer,
+    wire::transfer,
 };
 use o3::buffer::segments;
 use sark_grpc::{
@@ -37,21 +37,13 @@ fn isolates_held_budget() {
             |mut client| {
                 let calls = client.try_unary(2).expect("concurrent unary calls");
                 let mut server = Connection::<ServerRole>::try_new().expect("server");
-                let streams = Transfer {
-                    client: &mut client,
-                    server: &mut server,
-                }
-                .try_request()
-                .expect("request transfer");
+                let streams = transfer::try_request(&mut client, &mut server)
+                    .expect("request transfer");
                 assert_eq!(streams.len(), 2);
                 Response::try_overlap(&mut server, [streams[0], streams[1]])
                     .expect("both messages precede either call's trailers");
-                Transfer {
-                    client: &mut client,
-                    server: &mut server,
-                }
-                .try_response()
-                .expect("call capacity does not fail the connection");
+                transfer::try_response(&mut client, &mut server)
+                    .expect("call capacity does not fail the connection");
 
                 let error = unary::Session::try_poll(&mut client, &calls[1])
                     .err()
@@ -94,21 +86,13 @@ fn isolates_held_segments() {
         |mut client| {
             let calls = client.try_unary(2).expect("concurrent unary calls");
             let mut server = Connection::<ServerRole>::try_new().expect("server");
-            let streams = Transfer {
-                client: &mut client,
-                server: &mut server,
-            }
-            .try_request()
-            .expect("request transfer");
+            let streams = transfer::try_request(&mut client, &mut server)
+                .expect("request transfer");
             assert_eq!(streams.len(), 2);
             Response::try_overlap(&mut server, [streams[0], streams[1]])
                 .expect("both messages precede either call's trailers");
-            Transfer {
-                client: &mut client,
-                server: &mut server,
-            }
-            .try_response()
-            .expect("segment capacity does not fail the connection");
+            transfer::try_response(&mut client, &mut server)
+                .expect("segment capacity does not fail the connection");
 
             let error = unary::Session::try_poll(&mut client, &calls[1])
                 .err()
@@ -152,12 +136,8 @@ fn consumed_payload_blocks() {
         |mut client| {
             let calls = client.try_unary(2).expect("concurrent unary calls");
             let mut server = Connection::<ServerRole>::try_new().expect("server");
-            let streams = Transfer {
-                client: &mut client,
-                server: &mut server,
-            }
-            .try_request()
-            .expect("request transfer");
+            let streams = transfer::try_request(&mut client, &mut server)
+                .expect("request transfer");
             assert_eq!(streams.len(), 2);
             Response::new(&mut server, streams[0])
                 .try_respond(FIRST_RESPONSE)
@@ -165,12 +145,8 @@ fn consumed_payload_blocks() {
             Response::new(&mut server, streams[1])
                 .try_respond(SECOND_RESPONSE)
                 .expect("second response waits for retained segment");
-            Transfer {
-                client: &mut client,
-                server: &mut server,
-            }
-            .try_response()
-            .expect("completed response applies backpressure");
+            transfer::try_response(&mut client, &mut server)
+                .expect("completed response applies backpressure");
 
             let held = unary::Session::try_poll(&mut client, &calls[0])
                 .expect("first call lookup")

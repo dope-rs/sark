@@ -19,7 +19,7 @@ use sark_http::{
         Indexing, head,
         metadata::{
             block::{self, Validation},
-            lower::{self, Input, Step},
+            lower::{self, Input, StringError},
             map::record::{Entry, Span},
             section::{
                 rules::{self, Kind},
@@ -175,8 +175,8 @@ fn store_failure_resets() {
     ))
     .expect("a tagged field must begin in an empty prefix-sized lease");
     assert!(matches!(start, Start::Direct(Plan)));
-    let cause = match input.string(&mut scratch, Cursor::new(1, Encoding::Plain), b"x") {
-        Step::Store { cause } => Some(cause),
+    let cause = match input.try_string(&mut scratch, &mut Cursor::new(1, Encoding::Plain), b"x") {
+        Err(StringError::Store(cause)) => Some(cause),
         _ => None,
     }
     .expect("a full tagged lease must report its exact storage failure");
@@ -457,8 +457,12 @@ fn retains_huffman_tail() {
     )
     .expect("begin");
     assert!(matches!(
-        input.string(&mut scratch, Cursor::new(1, Encoding::Huffman), &[0x1f]),
-        lower::Step::Ready { .. }
+        input.try_string(
+            &mut scratch,
+            &mut Cursor::new(1, Encoding::Huffman),
+            &[0x1f]
+        ),
+        Ok(())
     ));
     Omit.try_finish::<rules::RejectPush>(&mut state, &mut input, &mut scratch)
         .expect("finish");

@@ -1,10 +1,12 @@
+pub mod common;
+
+use common::protocol::session::header;
 use sark_h2::{
     frame,
     frame::{
         Ack,
         controls::Settings,
-        layout::Header,
-        numbers::{ErrorCode, Flags, Length, ParseError, Type},
+        numbers::{ErrorCode, Flags, ParseError, Type},
         payload::{GoAway, Ping, PushPromise, WindowUpdate},
     },
     stream::Id,
@@ -29,12 +31,7 @@ fn settings_unknown_id() {
 
 #[test]
 fn rejects_ack_payload() {
-    let h = Header {
-        length: Length::new(6).expect("fixture domain"),
-        kind: Type::Settings,
-        flags: Flags(Flags::ACK),
-        stream_id: Id::new(0).expect("fixture domain"),
-    };
+    let h = header(6, Type::Settings, Flags::ACK, 0);
     assert!(
         Settings::parse(h, &[0u8; 6])
             == Err(ParseError::SettingsSize {
@@ -46,12 +43,7 @@ fn rejects_ack_payload() {
 
 #[test]
 fn settings_stream_id() {
-    let h = Header {
-        length: Length::new(0).expect("fixture domain"),
-        kind: Type::Settings,
-        flags: Flags(Flags::ACK),
-        stream_id: Id::new(3).expect("fixture domain"),
-    };
+    let h = header(0, Type::Settings, Flags::ACK, 3);
     assert!(
         Settings::parse(h, &[])
             == Err(ParseError::Connection {
@@ -63,12 +55,7 @@ fn settings_stream_id() {
 
 #[test]
 fn push_zero_stream() {
-    let h = Header {
-        length: Length::new(4).expect("fixture domain"),
-        kind: Type::PushPromise,
-        flags: Flags(0),
-        stream_id: Id::new(0).expect("fixture domain"),
-    };
+    let h = header(4, Type::PushPromise, 0, 0);
     assert!(
         PushPromise::parse(h, &[0, 0, 0, 1])
             == Err(ParseError::Stream {
@@ -80,12 +67,7 @@ fn push_zero_stream() {
 
 #[test]
 fn push_zero_promised() {
-    let h = Header {
-        length: Length::new(4).expect("fixture domain"),
-        kind: Type::PushPromise,
-        flags: Flags(0),
-        stream_id: Id::new(1).expect("fixture domain"),
-    };
+    let h = header(4, Type::PushPromise, 0, 1);
     assert!(
         PushPromise::parse(h, &[0, 0, 0, 0])
             == Err(ParseError::Promise {
@@ -97,12 +79,7 @@ fn push_zero_promised() {
 
 #[test]
 fn ping_stream() {
-    let h = Header {
-        length: Length::new(8).expect("fixture domain"),
-        kind: Type::Ping,
-        flags: Flags(0),
-        stream_id: Id::new(1).expect("fixture domain"),
-    };
+    let h = header(8, Type::Ping, 0, 1);
     assert!(
         Ping::parse(h, &[0u8; 8])
             == Err(ParseError::Connection {
@@ -114,12 +91,7 @@ fn ping_stream() {
 
 #[test]
 fn goaway_short() {
-    let h = Header {
-        length: Length::new(7).expect("fixture domain"),
-        kind: Type::GoAway,
-        flags: Flags(0),
-        stream_id: Id::new(0).expect("fixture domain"),
-    };
+    let h = header(7, Type::GoAway, 0, 0);
     assert!(
         GoAway::parse(h, &[0u8; 7])
             == Err(ParseError::FrameMinimum {
@@ -132,23 +104,13 @@ fn goaway_short() {
 
 #[test]
 fn window_zero() {
-    let h = Header {
-        length: Length::new(4).expect("fixture domain"),
-        kind: Type::WindowUpdate,
-        flags: Flags(0),
-        stream_id: Id::new(1).expect("fixture domain"),
-    };
+    let h = header(4, Type::WindowUpdate, 0, 1);
     assert!(WindowUpdate::parse(h, &[0, 0, 0, 0]) == Err(ParseError::ZeroIncrement));
 }
 
 #[test]
 fn window_size() {
-    let h = Header {
-        length: Length::new(3).expect("fixture domain"),
-        kind: Type::WindowUpdate,
-        flags: Flags(0),
-        stream_id: Id::new(1).expect("fixture domain"),
-    };
+    let h = header(3, Type::WindowUpdate, 0, 1);
     assert!(
         WindowUpdate::parse(h, &[0, 0, 0])
             == Err(ParseError::FrameSize {
