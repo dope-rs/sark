@@ -60,7 +60,8 @@ impl<'d, R: route::Spec> Pending<'d, R> {
         self,
         done: session::Complete,
         permit: session::Permit,
-        finish: (&'env S, Wrap),
+        state: &'env S,
+        wrap: Wrap,
         mut proof: E,
     ) -> session::Outcome<'d, machine::Machine<'d, D>>
     where
@@ -71,7 +72,6 @@ impl<'d, R: route::Spec> Pending<'d, R> {
         E: credit::Evidence,
         'd: 'env,
     {
-        let (state, wrap) = finish;
         let Self {
             head,
             response,
@@ -94,61 +94,14 @@ impl<'d, R: route::Spec> Pending<'d, R> {
     }
 }
 
-/// CONNECT admission endpoint.
-pub struct Endpoint<
-    'a,
-    'env,
-    'd,
-    S,
-    Runtime,
-    Stored: 'a,
-    D: duplex::Session<'d>,
-    Ready = Infallible,
-    Heads = Infallible,
-> where
-    'd: 'a,
-    Runtime: 'a,
-    D: 'a,
+impl<'d, Runtime, Stored, D: duplex::Session<'d>, Ready, Heads>
+    session::Conn<'d, Runtime, Stored, switch::Enabled<machine::Machine<'d, D>>, Ready, Heads>
 {
-    state: &'env S,
-    connection: &'a mut session::Conn<
-        'd,
-        Runtime,
-        Stored,
-        switch::Enabled<machine::Machine<'d, D>>,
-        Ready,
-        Heads,
-    >,
-}
-
-impl<'a, 'env, 'd, S, Runtime, Stored: 'a, D: duplex::Session<'d>, Ready, Heads>
-    Endpoint<'a, 'env, 'd, S, Runtime, Stored, D, Ready, Heads>
-where
-    'd: 'a,
-    Runtime: 'a,
-    D: 'a,
-{
-    pub fn new(
-        state: &'env S,
-        conn: &'a mut session::Conn<
-            'd,
-            Runtime,
-            Stored,
-            switch::Enabled<machine::Machine<'d, D>>,
-            Ready,
-            Heads,
-        >,
-    ) -> Self {
-        Self {
-            state,
-            connection: conn,
-        }
-    }
-
-    pub fn dispatch<R, Wrap, E>(
-        self,
+    pub fn dispatch_connect<'env, R, S, Wrap, E>(
+        &mut self,
         permit: session::Permit,
         found: framing::Head<'_, '_, R>,
+        state: &'env S,
         wrap: Wrap,
         mut proof: E,
     ) -> session::RouteOutcome<'d, Pending<'d, R>, machine::Machine<'d, D>>
@@ -163,10 +116,10 @@ where
         if matches!(found.connection(), head::Connection::Close) {
             return session::Outcome::Failed(Failure::BadRequest).into();
         }
-        let frame = match framing::Frame::drive(found, &mut self.connection.ingress, &mut proof) {
+        let frame = match framing::Frame::drive(found, &mut self.ingress, &mut proof) {
             Ok(framing::Progress::Complete(frame)) => frame,
             Ok(framing::Progress::Pending(wait)) => {
-                return Pending::start(wait, self.connection.ingress.payload.take(), permit, proof);
+                return Pending::start(wait, self.ingress.payload.take(), permit, proof);
             }
             Err(reason) => {
                 return reason.into_consume().into();
@@ -176,13 +129,14 @@ where
             Ok(parts) => parts,
             Err(error) => return error.into_consume().into(),
         };
-        construct::<R, S, D, Wrap>(request, body, self.state, response, wrap, total, permit).into()
+        construct::<R, S, D, Wrap>(request, body, state, response, wrap, total, permit).into()
     }
 
-    pub fn upgrade<R, Wrap, E>(
-        self,
+    pub fn upgrade_websocket<'env, R, S, Wrap, E>(
+        &mut self,
         permit: session::Permit,
         found: framing::Head<'_, '_, R, Upgrade>,
+        state: &'env S,
         write: Slice<'_, &mut usize>,
         wrap: Wrap,
         mut proof: E,
@@ -199,7 +153,7 @@ where
         let input = source.input().as_slice();
         let target = source.request().target();
         let (found, (accept, origin, cookie)) = found.into_admission();
-        let frame = match framing::Frame::drive(found, &mut self.connection.ingress, &mut proof) {
+        let frame = match framing::Frame::drive(found, &mut self.ingress, &mut proof) {
             Ok(framing::Progress::Complete(frame)) => frame,
             Ok(framing::Progress::Pending(_)) => {
                 return session::Outcome::Failed(Failure::BadRequest).into();
@@ -211,7 +165,7 @@ where
             Err(error) => return error.into_consume().into(),
         };
         let authority = request.owner().authority();
-        let raw = match open::<R, S>(request, body, self.state) {
+        let raw = match open::<R, S>(request, body, state) {
             Ok(raw) => raw,
             Err(error) => return session::Outcome::Failed(error).into(),
         };

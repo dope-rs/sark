@@ -1,6 +1,9 @@
 use std::{cell::Cell, convert::Infallible, marker::PhantomData, num::NonZero};
 
-use o3::buffer::segments::{self, assembly};
+use o3::buffer::{
+    segments::{self, assembly},
+    write::Slice,
+};
 use sark_core::{
     body::{self, admit, credit},
     duplex, life, manifold,
@@ -11,9 +14,14 @@ use sark_core::{
     },
 };
 use sark_h1::{
+    Input,
     route::{Mode, Policy, PolicyOf},
     session,
-    wire::{head::Connection, response::Context},
+    wire::{
+        head::Connection,
+        parsing::{self, framing, raw},
+        response::Context,
+    },
 };
 use sark_http::{
     h1::head::response::{Date, Server},
@@ -223,8 +231,47 @@ pub struct Builder<'d> {
 }
 
 pub struct Streaming<const PRESENT: bool = true>;
-pub fn stream(ready: bool) -> Option<impl FnOnce((), &mut (), Context)> {
-    ready.then_some(|(), _: &mut (), _: Context| {})
+pub fn try_dispatch_stream(
+    input: &[u8],
+    writer: &mut Slice<'_>,
+    state: &Cell<usize>,
+    slot: Option<&Cell<bool>>,
+) -> Result<Option<session::Outcome<'static>>, parsing::Request<Request>> {
+    let parsed = super::head::parsed(Input::Borrowed(input), u8::MAX);
+    let Some(head) = framing::Head::<Streaming>::parse::<false>(raw::Bound::empty(&parsed))? else {
+        return Ok(None);
+    };
+    let mut conn: session::Conn = session::Conn::default();
+    let reserve = || slot.map(|installed| move |(), _: &mut (), _: Context| installed.set(true));
+    let date = super::fields::DATE;
+    Ok(Some(
+        match conn.dispatch_stream::<Streaming, _, _, _, _>(
+            session::Permit::new(),
+            head,
+            state,
+            writer.reborrow(),
+            date,
+            reserve,
+            credit::Disabled,
+        ) {
+            session::RouteOutcome::Outcome(outcome) => outcome,
+            session::RouteOutcome::AwaitBody { pending, .. } => pending.stream(
+                session::Complete {
+                    body_len: 1,
+                    consumed: 1,
+                },
+                session::Permit::new(),
+                state,
+                writer.reborrow(),
+                date,
+                &mut (),
+                reserve,
+                credit::Disabled,
+            ),
+            session::RouteOutcome::AwaitHead { pending, .. } => match pending {},
+            session::RouteOutcome::AwaitReject { pending, .. } => match pending {},
+        },
+    ))
 }
 impl<const PRESENT: bool> route::Spec for Streaming<PRESENT> {
     type Kind = dispatch::Polled;

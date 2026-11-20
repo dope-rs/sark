@@ -6,7 +6,6 @@ mod endpoint;
 
 use std::convert;
 
-pub use endpoint::Endpoint;
 use sark_core::{
     body::{
         self,

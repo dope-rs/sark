@@ -10,9 +10,7 @@ use common::{
 use o3::buffer::write::{Sink as _, Slice};
 use sark_core::body::credit;
 use sark_h1::{
-    Input,
-    route::stream,
-    session,
+    Input, session,
     wire::{
         Failure, output,
         parsing::{framing, raw},
@@ -111,14 +109,12 @@ fn omits_stream() {
             state: &state,
             drops: &drops,
         };
-        let result = stream::Endpoint::new(
-            output::Egress::new(writer.reborrow(), DATE, parsed.response()),
-            &mut conn,
-        )
-        .dispatch::<Streaming, _, _, _, _>(
+        let result = conn.dispatch_stream::<Streaming, _, _, _, _>(
             session::Permit::new(),
             head,
             &state,
+            writer.reborrow(),
+            DATE,
             move || {
                 let capture = capture;
                 observed_calls.set(observed_calls.get() + 1);

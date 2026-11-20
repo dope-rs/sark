@@ -1,5 +1,3 @@
-use std::convert::Infallible;
-
 use sark_core::{
     body::{admit::Plan, credit},
     manifold::task::request::Input,
@@ -17,31 +15,11 @@ use crate::{
     wire::{Failure, head, parsing::framing, response},
 };
 
-pub struct Endpoint<
-    'a,
-    'd,
-    Runtime,
-    Continuations,
-    Transitions = switch::Disabled,
-    Ready = Infallible,
-    Heads = Infallible,
-> {
-    connection: &'a mut session::Conn<'d, Runtime, Continuations, Transitions, Ready, Heads>,
-}
-
-impl<'a, 'd, Runtime, Continuations, Transitions, Ready, Heads>
-    Endpoint<'a, 'd, Runtime, Continuations, Transitions, Ready, Heads>
-where
-    Transitions: switch::Engine,
+impl<'d, Runtime, Stored, Transitions: switch::Engine, Ready, Heads>
+    session::Conn<'d, Runtime, Stored, Transitions, Ready, Heads>
 {
-    pub fn new(
-        conn: &'a mut session::Conn<'d, Runtime, Continuations, Transitions, Ready, Heads>,
-    ) -> Self {
-        Self { connection: conn }
-    }
-
-    pub fn dispatch<R, Admit, Feed, E>(
-        self,
+    pub fn dispatch_task<R, Admit, Feed, E>(
+        &mut self,
         id: Id<'d>,
         permit: session::Permit,
         found: framing::Head<'_, '_, R>,
@@ -66,7 +44,7 @@ where
         ) -> Result<Pending<'d, R>, fixed::Body<'d>>,
         E: credit::Evidence,
     {
-        let frame = match framing::Frame::drive(found, &mut self.connection.ingress, &mut proof) {
+        let frame = match framing::Frame::drive(found, &mut self.ingress, &mut proof) {
             Ok(framing::Progress::Complete(frame)) => frame,
             Ok(framing::Progress::Pending(wait)) => {
                 let req = wait.head.with_id(id);
@@ -95,7 +73,7 @@ where
                         return session::Outcome::Close(reply).into();
                     }
                 };
-                let parts = self.connection.ingress.payload.take();
+                let parts = self.ingress.payload.take();
                 let body = match feed(body, parts, proof) {
                     Ok(body) => body,
                     Err(reply) => return session::Outcome::Close(reply).into(),
@@ -126,13 +104,6 @@ where
                 return reason.into_consume().into();
             }
         };
-        admit(
-            input,
-            total,
-            close,
-            response,
-            &mut self.connection.async_state,
-        )
-        .into()
+        admit(input, total, close, response, &mut self.async_state).into()
     }
 }

@@ -203,23 +203,26 @@ pub(super) fn emit<'view, 'source, 'spec>(
         };
     }
     let guard = terminal::guard(paths, symbols, plan.entry, state);
-    let context = (guard.is_some()
-        || matches!(plan.mode, serve::Mode::Sync | serve::Mode::Stream { .. }))
-    .then(|| quote!(let #n_resp = #n_shead.response();));
+    let context = (guard.is_some() || matches!(plan.mode, serve::Mode::Sync))
+        .then(|| quote!(let #n_resp = #n_shead.response();));
     let (prepare, invoke) = match &plan.mode {
         serve::Mode::Duplex { family } => {
             let wrap = h1.duplex.wrap(*family, false, quote!(#v_sess));
             let (method, write) = if plan.entry.upgrade {
-                (quote!(upgrade::<#route, _, _>), quote!(#v_write,))
+                (
+                    quote!(upgrade_websocket::<#route, #state, _, _>),
+                    quote!(#v_write,),
+                )
             } else {
-                (quote!(dispatch::<#route, _, _>), quote!())
+                (quote!(dispatch_connect::<#route, #state, _, _>), quote!())
             };
             (
                 quote!(),
                 quote! {
-                    #ns_h1::route::duplex::Endpoint::new(#v_state, #v_conn).#method(
+                    #v_conn.#method(
                         #v_permit,
                         #n_shead,
+                        #v_state,
                         #write
                         |#v_sess| #wrap,
                         #ns_core::life::Mode::body(#v_this.#f_life, #v_exch),
@@ -291,9 +294,7 @@ pub(super) fn emit<'view, 'source, 'spec>(
                             #ns_fiber::manifold::runtime::Runnable
                         >::handle(#v_this.#f_time);
                         let #v_make = #v_this.#f_makers.#index;
-                        #ns_h1::route::task::Endpoint::new(
-                            #v_conn,
-                        ).dispatch::<#route, _, _, _>(
+                        #v_conn.dispatch_task::<#route, _, _, _>(
                             #n_seq,
                             #v_permit,
                             #n_shead,
@@ -316,13 +317,12 @@ pub(super) fn emit<'view, 'source, 'spec>(
             let invoke = quote! {
                 {
                     let mut #n_tasks = #tasks;
-                    #ns_h1::route::stream::Endpoint::new(
-                        #ns_h1::wire::output::Egress::new(#v_write, #v_date, #n_resp),
-                        #v_conn,
-                    ).dispatch::<#route, #state, _, _, _>(
+                    #v_conn.dispatch_stream::<#route, #state, _, _, _>(
                         #v_permit,
                         #n_shead,
                         #v_state,
+                        #v_write,
+                        #v_date,
                         #source,
                         #ns_core::life::Mode::body(
                             #v_this.#f_life,

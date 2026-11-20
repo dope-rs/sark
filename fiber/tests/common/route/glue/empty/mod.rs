@@ -151,7 +151,7 @@ impl<'d, R: route::Spec<Request: route::Own<RawParams = (), Mode = route::Stream
         let mut conn: session::Conn = session::Conn::default();
         let mut input = None;
         let mut attempts = 0;
-        let outcome = task::Endpoint::new(&mut conn).dispatch::<R, _, _, _>(
+        let outcome = conn.dispatch_task::<R, _, _, _>(
             id,
             session::Permit::new(),
             head,
@@ -262,16 +262,15 @@ where
         };
         let id = this.id;
         let admit = |input, consumed, close, _, _: &mut ()| this.admit(input, consumed, close);
-        task::Endpoint::new(conn)
-            .dispatch::<R, _, _, _>(
-                id,
-                permit,
-                head,
-                admit,
-                |pending, parts, proof| pending.try_discard(parts, proof),
-                credit::Disabled::new(),
-            )
-            .with_head()
+        conn.dispatch_task::<R, _, _, _>(
+            id,
+            permit,
+            head,
+            admit,
+            |pending, parts, proof| pending.try_discard(parts, proof),
+            credit::Disabled::new(),
+        )
+        .with_head()
     }
 
     fn resume_head(

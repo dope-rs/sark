@@ -25,9 +25,7 @@ use sark_core::{
     route::Own as _,
 };
 use sark_h1::{
-    Input,
-    route::{duplex, stream, task},
-    session,
+    Input, session,
     switch::Enabled,
     wire::{
         Failure, head, output,
@@ -54,18 +52,12 @@ fn method_body_allowance() {
             let state = Cell::new(0);
             let mut write = [0; 512];
             let mut evidence = Credits(Vec::new());
-            let outcome = stream::Endpoint::new(
-                output::Egress::new(
-                    o3::buffer::write::Slice::new(&mut write).reborrow(),
-                    fields::DATE,
-                    parsed.response(),
-                ),
-                &mut conn,
-            )
-            .dispatch::<Streaming, _, _, _, _>(
+            let outcome = conn.dispatch_stream::<Streaming, _, _, _, _>(
                 session::Permit::new(),
                 head,
                 &state,
+                Slice::new(&mut write).reborrow(),
+                fields::DATE,
                 || Some(|(), _: &mut (), _| {}),
                 &mut evidence,
             );
@@ -112,51 +104,17 @@ fn transition_admission() {
 #[test]
 fn discarded_stream_length() {
     for input in [tasks::HEAD, tasks::COMPLETE] {
-        let parsed = common::head::parsed(Input::Borrowed(input), u8::MAX);
-        let head = framing::Head::<Streaming>::parse::<false>(raw::Bound::empty(&parsed))
-            .ok()
-            .expect("framing")
-            .expect("complete framing");
-        let mut conn: session::Conn = session::Conn::default();
         let state = Cell::new(0);
+        let installed = Cell::new(false);
         let mut write = [0; 512];
         let mut writer = Slice::new(&mut write);
-        let outcome = stream::Endpoint::new(
-            output::Egress::new(writer.reborrow(), fields::DATE, parsed.response()),
-            &mut conn,
-        )
-        .dispatch::<Streaming, _, _, _, _>(
-            session::Permit::new(),
-            head,
-            &state,
-            || Some(|(), _: &mut (), _| {}),
-            credit::Disabled::new(),
-        );
-        let outcome = match outcome {
-            session::RouteOutcome::Outcome(outcome) => outcome,
-            session::RouteOutcome::AwaitBody { pending, .. } => pending.stream(
-                session::Complete {
-                    body_len: 1,
-                    consumed: 1,
-                },
-                session::Permit::new(),
-                stream::Execution::new(
-                    output::Egress::new(writer.reborrow(), fields::DATE, parsed.response()),
-                    &state,
-                    &mut (),
-                    || Some(|(), _: &mut (), _| {}),
-                ),
-                credit::Disabled::new(),
-            ),
-            session::RouteOutcome::AwaitHead { pending, .. } => match pending {},
-            session::RouteOutcome::AwaitReject { pending, .. } => match pending {},
-        };
-        let written = match outcome {
-            session::Outcome::Streamed { .. } => Some(writer.len()),
-            _ => None,
-        }
-        .expect("stream did not start");
-        let head = str::from_utf8(&write[..written]).expect("response head");
+        let outcome = tasks::try_dispatch_stream(input, &mut writer, &state, Some(&installed));
+        assert!(matches!(
+            outcome,
+            Ok(Some(session::Outcome::Streamed { .. }))
+        ));
+        assert!(installed.get());
+        let head = str::from_utf8(writer.into_mut()).expect("response head");
         assert!(!head.contains("Date:"));
         assert!(!head.contains("Server:"));
         assert_eq!(state.get(), 1);
@@ -166,53 +124,10 @@ fn discarded_stream_length() {
 #[test]
 fn stream_capacity() {
     for input in [tasks::HEAD, tasks::COMPLETE] {
-        let parsed = common::head::parsed(Input::Borrowed(input), u8::MAX);
-        let head = framing::Head::<Streaming>::parse::<false>(raw::Bound::empty(&parsed))
-            .ok()
-            .flatten()
-            .expect("framing");
-        let mut conn: session::Conn = session::Conn::default();
         let state = Cell::new(0);
         let mut write = [0xa5; 512];
-        let outcome = stream::Endpoint::new(
-            output::Egress::new(
-                o3::buffer::write::Slice::new(&mut write).reborrow(),
-                fields::DATE,
-                parsed.response(),
-            ),
-            &mut conn,
-        )
-        .dispatch::<Streaming, _, _, _, _>(
-            session::Permit::new(),
-            head,
-            &state,
-            || tasks::stream(false),
-            credit::Disabled,
-        );
-        let outcome = match outcome {
-            session::RouteOutcome::Outcome(outcome) => outcome,
-            session::RouteOutcome::AwaitBody { pending, .. } => pending.stream(
-                session::Complete {
-                    body_len: 1,
-                    consumed: 1,
-                },
-                session::Permit::new(),
-                stream::Execution::new(
-                    output::Egress::new(
-                        o3::buffer::write::Slice::new(&mut write).reborrow(),
-                        fields::DATE,
-                        parsed.response(),
-                    ),
-                    &state,
-                    &mut (),
-                    || tasks::stream(false),
-                ),
-                credit::Disabled,
-            ),
-            session::RouteOutcome::AwaitHead { pending, .. } => match pending {},
-            session::RouteOutcome::AwaitReject { pending, .. } => match pending {},
-        };
-        assert!(matches!(outcome, session::Outcome::Close(_)));
+        let outcome = tasks::try_dispatch_stream(input, &mut Slice::new(&mut write), &state, None);
+        assert!(matches!(outcome, Ok(Some(session::Outcome::Close(_)))));
         assert_eq!(state.get(), 0);
         assert!(write.iter().all(|&byte| byte == 0xa5));
     }
@@ -228,9 +143,10 @@ fn closing_connect() {
             .expect("complete framing");
         let mut conn: session::Conn<'_, (), (), Enabled<machine::Machine<'_, Session>>> =
             session::Conn::default();
-        let outcome = duplex::Endpoint::new(&(), &mut conn).dispatch::<Connect, _, _>(
+        let outcome = conn.dispatch_connect::<Connect, _, _, _>(
             session::Permit::new(),
             head,
+            &(),
             convert::identity,
             credit::Disabled::new(),
         );
@@ -251,9 +167,10 @@ fn connect_keeps_version() {
             .expect("complete framing");
         let mut conn: session::Conn<'_, (), (), Enabled<machine::Machine<'_, Session>>> =
             session::Conn::default();
-        let outcome = duplex::Endpoint::new(&(), &mut conn).dispatch::<Connect, _, _>(
+        let outcome = conn.dispatch_connect::<Connect, _, _, _>(
             session::Permit::new(),
             head,
+            &(),
             convert::identity,
             credit::Disabled,
         );
@@ -293,18 +210,17 @@ fn body_yields() {
             .expect("framing")
             .expect("complete framing");
             let mut conn: session::Conn = session::Conn::default();
-            let outcome = task::Endpoint::new(&mut conn)
-                .dispatch::<Request<body::Segmented>, _, _, _>(
-                    id,
-                    session::Permit::new(),
-                    head,
-                    |_, consumed, close, _, _: &mut ()| {
-                        admitted.set(admitted.get() + 1);
-                        session::Outcome::Park { consumed, close }
-                    },
-                    |pending, parts, proof| pending.try_retain(parts, proof),
-                    &mut evidence,
-                );
+            let outcome = conn.dispatch_task::<Request<body::Segmented>, _, _, _>(
+                id,
+                session::Permit::new(),
+                head,
+                |_, consumed, close, _, _: &mut ()| {
+                    admitted.set(admitted.get() + 1);
+                    session::Outcome::Park { consumed, close }
+                },
+                |pending, parts, proof| pending.try_retain(parts, proof),
+                &mut evidence,
+            );
             let session::RouteOutcome::AwaitBody { pending, .. } = outcome else {
                 panic!("dispatch must await the request body");
             };
@@ -432,7 +348,7 @@ fn buffered_body_starts_at_fin() {
                             .ok()
                             .expect("framing")
                             .expect("complete framing");
-                    let outcome = task::Endpoint::new(&mut conn).dispatch::<Buffered, _, _, _>(
+                    let outcome = conn.dispatch_task::<Buffered, _, _, _>(
                         id,
                         session::Permit::new(),
                         head,

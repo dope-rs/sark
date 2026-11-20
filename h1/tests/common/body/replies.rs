@@ -45,7 +45,7 @@ pub const HEADS: &[&[u8]] = &[
     b"HEAD / HTTP/1.0\r\nHost: local\r\n\r\n",
     b"HEAD / HTTP/1.1\r\nHost: local\r\n\r\n",
 ];
-pub const STREAM_TEN: &[u8] = b"POST / HTTP/1.0\r\nHost: local\r\nContent-Length: 1\r\n\r\n";
+pub const STREAM_TEN: &[u8] = b"POST / HTTP/1.0\r\nHost: local\r\nContent-Length: 1\r\n\r\nx";
 
 pub struct Untouched<'a>(pub &'a Cell<usize>);
 

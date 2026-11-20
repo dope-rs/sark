@@ -5,14 +5,12 @@ use std::{cell::Cell, str};
 use common::{
     body::replies,
     fields::DATE,
-    tasks::{Request, Streaming},
+    tasks::{self, Request, Streaming},
 };
 use o3::buffer::write::Slice;
 use sark_core::body::credit;
 use sark_h1::{
-    Input,
-    route::{self, stream},
-    session,
+    Input, route, session,
     wire::{
         Failure, head, output,
         parsing::{framing, raw},
@@ -88,14 +86,12 @@ fn absent_stream_completes_with_zero_length() {
         let mut conn: session::Conn = session::Conn::default();
         let mut bytes = [0; 128];
         let mut writer = Slice::new(&mut bytes);
-        let outcome = stream::Endpoint::new(
-            output::Egress::new(writer.reborrow(), DATE, parsed.response()),
-            &mut conn,
-        )
-        .dispatch::<Streaming<false>, _, _, _, _>(
+        let outcome = conn.dispatch_stream::<Streaming<false>, _, _, _, _>(
             session::Permit::new(),
             head,
             &Cell::new(0),
+            writer.reborrow(),
+            DATE,
             || Some(|(), _: &mut (), _: Context| panic!("absent producer installed")),
             credit::Disabled::new(),
         );
@@ -112,67 +108,21 @@ fn absent_stream_completes_with_zero_length() {
 
 #[test]
 fn stream_ten() {
-    for split in [false, true] {
-        let mut request = replies::STREAM_TEN.to_vec();
-        if !split {
-            request.push(b'x');
-        }
-        let parsed = common::head::parsed(Input::Borrowed(&request), u8::MAX);
-        let head = framing::Head::<Streaming>::parse::<false>(raw::Bound::empty(&parsed))
-            .ok()
-            .flatten()
-            .expect("framing");
+    let request = replies::STREAM_TEN;
+    for input in [request, &request[..request.len() - 1]] {
         let mut write = [0xa5; 256];
-        let mut conn: session::Conn = session::Conn::default();
-        let state = Cell::new(0);
         let admitted = Cell::new(false);
-        let outcome = stream::Endpoint::new(
-            output::Egress::new(
-                o3::buffer::write::Slice::new(&mut write).reborrow(),
-                DATE,
-                parsed.response(),
-            ),
-            &mut conn,
-        )
-        .dispatch::<Streaming, _, _, _, _>(
-            session::Permit::new(),
-            head,
-            &state,
-            || Some(|(), _: &mut (), _: Context| admitted.set(true)),
-            credit::Disabled::new(),
+        let outcome = tasks::try_dispatch_stream(
+            input,
+            &mut Slice::new(&mut write),
+            &Cell::new(0),
+            Some(&admitted),
         );
-        let outcome = match outcome {
-            session::RouteOutcome::Outcome(outcome) => outcome,
-            session::RouteOutcome::AwaitBody { pending, .. } => {
-                let response = pending.response();
-                assert_eq!(response.version(), Version::Ten);
-                pending.stream(
-                    session::Complete {
-                        body_len: 1,
-                        consumed: 1,
-                    },
-                    session::Permit::new(),
-                    stream::Execution::new(
-                        output::Egress::new(
-                            o3::buffer::write::Slice::new(&mut write).reborrow(),
-                            DATE,
-                            response,
-                        ),
-                        &state,
-                        &mut (),
-                        || Some(|(), _: &mut (), _: Context| admitted.set(true)),
-                    ),
-                    credit::Disabled::new(),
-                )
-            }
-            session::RouteOutcome::AwaitHead { pending, .. } => match pending {},
-            session::RouteOutcome::AwaitReject { pending, .. } => match pending {},
-        };
         assert!(matches!(
             outcome,
-            session::Outcome::Failed(Failure::Output(output::Error::StreamingVersion(
-                Version::Ten
-            )))
+            Ok(Some(session::Outcome::Failed(Failure::Output(
+                output::Error::StreamingVersion(Version::Ten)
+            ))))
         ));
         assert!(!admitted.get());
         assert!(write.iter().all(|byte| *byte == 0xa5));

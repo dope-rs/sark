@@ -32,8 +32,7 @@ impl Routes {
         let [f_gzip, f_time, f_makers] = ["gzip", "timer", "task_producers"].map(local);
         let symbols = &context.plan.spec.state_generics;
         let [n_tasks, v_body, v_date] = symbols.locals(["__tasks", "body", "date"]);
-        let [v_error, v_exch, v_exec] = symbols.locals(["error", "exchange", "execution"]);
-        let [v_finish, v_result] = symbols.locals(["finish", "outcome"]);
+        let [v_error, v_exch, v_result] = symbols.locals(["error", "exchange", "outcome"]);
         let [v_output, v_wait, v_permit] = symbols.locals(["output", "pending", "permit"]);
         let [v_ready, v_run, v_sess] = symbols.locals(["ready", "runtime", "session"]);
         let [v_this, v_write] = symbols.locals(["this", "write"]);
@@ -193,20 +192,9 @@ impl Routes {
                     quote! {
                         #owner::#pending(#v_wait) => {
                             let mut #n_tasks = #tasks;
-                            let #v_output = #ns_h1::wire::output::Egress::new(
-                                #v_write, #v_date, #v_wait.response(),
-                            );
-                            let #v_exec = #ns_h1::route::stream::Execution::new(
-                                #v_output,
-                                *#v_this.#f_state,
-                                #v_run,
-                                #source,
-                            );
                             #v_wait.stream::<#state_ty, _, _, _, _, _>(
-                                #v_body,
-                                #v_permit,
-                                #v_exec,
-                                #evidence,
+                                #v_body, #v_permit, *#v_this.#f_state,
+                                #v_write, #v_date, #v_run, #source, #evidence,
                             )
                         }
                     }
@@ -214,18 +202,9 @@ impl Routes {
                 serve::Mode::Duplex { family } => {
                     let wrapped = h1.duplex.wrap(*family, false, quote!(#v_sess));
                     quote! {
-                        #owner::#pending(#v_wait) => {
-                            let #v_finish = (
-                                *#v_this.#f_state,
-                                |#v_sess| #wrapped,
-                            );
-                            #v_wait.connect::<#state_ty, #duplex, _, _>(
-                                #v_body,
-                                #v_permit,
-                                #v_finish,
-                                #evidence,
-                            )
-                        }
+                        #owner::#pending(#v_wait) => #v_wait.connect::<#state_ty, #duplex, _, _>(
+                            #v_body, #v_permit, *#v_this.#f_state, |#v_sess| #wrapped, #evidence,
+                        )
                     }
                 }
             };
