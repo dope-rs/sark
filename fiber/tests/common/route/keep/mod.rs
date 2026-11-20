@@ -127,7 +127,7 @@ impl<O> Server<O> {
                     );
                     plan.install(
                         stage,
-                        domain::Local::<wire::Identity, _>::new(wire::Identity),
+                        domain::Local::new(wire::Identity),
                         app,
                         |root, _wait, stage| {
                             let result = stage

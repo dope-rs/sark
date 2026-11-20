@@ -35,13 +35,10 @@ pub(super) fn extras<'emit, 'source, 'spec>(
     let [v_retain, v_stamp, v_state] = symbols.locals(["retention", "stamp", "state"]);
     let [v_tasks] = symbols.locals(["tasks"]);
     let v_h2 = symbols.local("h2");
-    let [v_prep, v_driver, v_app, v_permit, v_wait] =
-        symbols.locals(["prepared", "driver", "app", "permit", "wait"]);
+    let [v_prep, v_driver, v_app] = symbols.locals(["prepared", "driver", "app"]);
     let [l_wire, l_env] = symbols.lives(["__w", "env"]);
-    let [l_n, l_p, l_s, l_issued, l_life, l_watch] =
-        symbols.lives(["__n", "__p", "__s", "__issued", "__life", "__watch"]);
-    let [g_date, g_prof, g_recv, g_owner, g_shutdown] =
-        symbols.idents(["__DATE", "__PROFILE", "__RECEIVER", "__OWNER", "__SHUTDOWN"]);
+    let [l_n, l_p, l_s] = symbols.lives(["__n", "__p", "__s"]);
+    let [g_date, g_recv] = symbols.idents(["__DATE", "__RECEIVER"]);
     let [g_d, g_o] = symbols.idents(["__D", "__O"]);
     let [g_env, g_h2a, g_h2f] = symbols.idents(["__ENV", "__H2A", "__H2F"]);
     let [g_brand, g_clock] = symbols.lives(["brand", "clock"]);
@@ -197,10 +194,6 @@ pub(super) fn extras<'emit, 'source, 'spec>(
         #( #routes )*
         #state_ty: #ns_h1::server::listener::failure::Policy<#g_wire>,
         #wire
-    };
-    let bind_key = match branded {
-        true => quote!(#v_brand),
-        false => quote!(_),
     };
     let binding = quote! {
         impl #params #ns_h1::server::listener::bind::Bind<#l_wire, 'd, #g_id>
@@ -392,72 +385,12 @@ pub(super) fn extras<'emit, 'source, 'spec>(
         quote!(#ns_core::life::mode::Observed::new(#v_obs)),
     );
     let create = create(&quote!(#g_wire), quote!(#ns_core::life::mode::Disabled));
-    let prepared = quote! {
-        #ns_h1::server::run::Prepared<
-            #l_n, #l_p, #l_s, #l_wire, 'd, #g_id, #g_date,
-            #ns_fiber::dope::manifold::app::env::Bundle<
-                #ns_fiber::dope::net::tcp::Tcp, #g_wire, #g_prof,
-            >,
-            #g_recv, #plain_egress, #input, #g_d,
-        >
-    };
     let defs = quote! {
         #pending
         #binding
         #runs
     };
     let methods = quote! {
-        /// Builds and runs this application while consuming its provider permit.
-        #vis fn run_prepared<
-            #l_env, #g_brand: #l_env, #l_wire, #l_n, #l_p, #l_s,
-            #l_issued, #l_life: #l_issued, #l_watch,
-            #( #lives: #l_env, )* 'd: #l_wire + #l_env + #l_life + #l_watch,
-            #( #decls, )*
-            #g_id: #ns_fiber::Identity + 'd,
-            #g_wire: #ns_fiber::dope::net::link::pool::recv::input::Execution + 'd,
-            #g_date: #ns_fiber::Identity,
-            #g_prof, #g_recv, #g_d, #g_owner, #g_shutdown,
-        >(
-            #bind_key: #ns_fiber::dope_fiber::task::storage::scope::Brand<#g_brand>,
-            #v_state: ::core::pin::Pin<&#l_env #state_ty>,
-            #v_config: #config,
-            #v_prep: #prepared,
-            #v_wait: #ns_h1::server::run::Wait<#l_watch, 'd>,
-            #v_permit: #ns_fiber::dope::runtime::topology::lending::Permit<
-                #l_issued, #l_life, 'd, #g_owner, #g_shutdown,
-            >,
-        ) -> #ns_fiber::dope::runtime::topology::lending::Outcome<
-            #l_issued, #l_life, 'd, #g_owner, #g_shutdown,
-            #ns_fiber::dope::manifold::BuildError<#ns_h1::server::listener::bind::Error>,
-            #ns_h1::server::run::Pending<
-                #l_watch, 'd,
-                #ns_fiber::dope::runtime::shutdown::Requested<#g_shutdown>,
-            >,
-        >
-        where
-            #ctor_b
-            #g_prof: #ns_fiber::dope::core::driver::settings::Profile
-                + #ns_fiber::dope::manifold::timing::Policy,
-            #g_recv: #ns_fiber::dope::net::link::pool::change::Prepare<
-                #l_wire, 'd, #g_id, #g_wire,
-            >,
-            #g_d: #ns_h1::server::deadline::policies::Policy<'d, #g_id>,
-            #plain_egress: #ns_fiber::dope::net::link::egress::data::raw::Payload<'d> + 'd,
-            #prepared: #l_env,
-            #g_owner: #ns_fiber::dope::runtime::topology::lending::raw::Resume<'d>,
-            #g_shutdown: #ns_fiber::dope::runtime::executor::Startup,
-        {
-            #v_permit.try_run(
-                |mut #v_driver| {
-                    let #v_state = #v_state.get_ref();
-                    let #v_app = { #create };
-                    #v_prep.build(#v_app, &mut #v_driver)
-                        .map(|#v_app| (#v_app, ()))
-                },
-                |(), #v_app| #ns_h1::server::run::run(#v_wait, #v_app),
-            )
-        }
-
         #vis fn new #ctor_g(
             #brand
             #v_state: &#l_env #state_ty,

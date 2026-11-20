@@ -253,12 +253,12 @@ where
         Budget::new(A::retention(&self.retention), self.receive_resident_bytes)
     }
 
-    fn scoped_chunk<'e>(
+    fn scoped_chunk<'s, 'e>(
         self: pin::Pin<&mut Self>,
         mut conn: Ctx<'e, '_, '_, '_, 'w, 'd, ID, W, Self::Conn, Self::Egress>,
-        chunk: scoped::Input<'_, 'w, 'd, W>,
+        chunk: scoped::Input<'s, 'w, 'd, W>,
         driver: &mut driver::Context<'_, 'd>,
-    ) -> receive::Outcome {
+    ) -> Result<receive::Outcome, scoped::Pending<'s>> {
         let id = conn.id();
         let parent = conn.wake_target();
         let work = conn.work();
@@ -281,13 +281,13 @@ where
                 &mut turn,
                 &mut mode,
             );
-            let result = (|| {
+            let result = 'events: {
                 match expiry {
                     Deadline::Ready => {}
                     Deadline::Critical => {
-                        return Err(semantic::Error::Connection(conn::Error::CriticalDeadline));
+                        break 'events Err(semantic::Error::Connection(conn::Error::CriticalDeadline));
                     }
-                    Deadline::Expired | Deadline::Wake => return Ok(expiry),
+                    Deadline::Expired | Deadline::Wake => break 'events Ok(expiry),
                 }
                 let mut run = drive::Drive {
                     router: this.router.as_mut(),
@@ -313,6 +313,9 @@ where
                     })
                     .read(&mut source)
                 };
+                if source.is_failed() {
+                    return source.settle();
+                }
                 run.mode.observe_head(run.state.connection);
                 let progress = match result {
                     Ok(progress) => progress,
@@ -323,7 +326,7 @@ where
                     {
                         drain::Progress::default()
                     }
-                    Err(error) => return Err(error),
+                    Err(error) => break 'events Err(error),
                 };
                 let scope = owner::Scope::Exact(owner::Owner::from(id));
                 if progress.is_exhausted() {
@@ -338,7 +341,7 @@ where
                 }
                 book::wakes::<ID, R, A>(run.state, parent, &mut state.service);
                 Ok(expiry)
-            })();
+            };
             let (change, fault) = mode.finish();
             let pending = S::is_ready(&mut turn);
             (result, pending, change, fault)
@@ -373,8 +376,7 @@ where
                 Sync::Finished
             )
         {
-            source.discard();
-            return receive::Outcome::Continue;
+            return Ok(receive::Outcome::Continue);
         }
         if result.is_err() {
             source.discard();
@@ -387,7 +389,7 @@ where
             Ok(_) => Self::flush_transport(&mut conn, driver, None, this.mode, this.fault),
             Err(error) => Self::finish_transport(&mut conn, driver, error, this.mode, this.fault),
         }
-        receive::Outcome::Continue
+        source.settle()
     }
 }
 
@@ -412,7 +414,20 @@ where
     type Retirement = task::Retire;
     type Egress = data::Bound<M::Output, A::Egress<'d>>;
     type Input = receive::Scoped<true>;
-    type Send = send::Reported<send::Run>;
+    type Send = send::Run;
+
+    fn released(
+        self: pin::Pin<&mut Self>,
+        conn: Id<'d, ID>,
+        egress: Self::Egress,
+        cause: handler::Disposition,
+    ) {
+        let this = self.project();
+        if let Some(effect) = <M as Transport<'d, ID>>::release::<A::Egress<'d>>(egress, cause) {
+            owners::Projection::new(this.mode)
+                .apply(effect.map_key(|stream| identify(conn, stream)));
+        }
+    }
 
     fn is_gated(conn: &Self::Conn) -> bool {
         conn.carrier.status().input_blocked()
@@ -794,31 +809,6 @@ where
             life::Mode::diagnostic(this.mode, &cause);
         }
         state.turn().close(id, this.mode);
-    }
-}
-
-impl<'d, ID: Identity + 'd, R, W, M, D, P, A> send::Report<'d, ID> for App<'d, ID, R, W, M, D, P, A>
-where
-    R: Runtime<'d, Target = Target<'d, ID>>,
-    A: service::Select<R> + semantic::Timed<'d, crate::conn::event::Retirement, Id<'d, ID>>,
-    W: Execution + 'd,
-    receive::Scoped<true>: receive::Mode<W>,
-    M: Transport<'d, ID>,
-    M::Output: flush::Evidence<'d>,
-    M::Retention: Handoff,
-    D: timers::Policy<'d>,
-    P: Fault<'d, W, A::Failure, ID, task::Build<A::Build>>,
-    <R::Head as request::Head>::Start: Schedule<'d, R>,
-{
-    const ENABLED: bool = true;
-
-    fn released(self: pin::Pin<&mut Self>, release: handler::Release<'d, ID, Self::Egress>) {
-        let (conn, egress, cause) = release.into_parts();
-        let this = self.project();
-        if let Some(effect) = <M as Transport<'d, ID>>::release::<A::Egress<'d>>(egress, cause) {
-            owners::Projection::new(this.mode)
-                .apply(effect.map_key(|stream| identify(conn, stream)));
-        }
     }
 }
 

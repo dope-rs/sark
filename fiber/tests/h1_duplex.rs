@@ -78,7 +78,7 @@ fn serve(
                     );
                     plan.install(
                         stage,
-                        domain::Local::<wire::Identity, _>::new(wire::Identity),
+                        domain::Local::new(wire::Identity),
                         router,
                         |root, _wait, stage| {
                             stage
@@ -442,7 +442,7 @@ fn runs_scoped_duplex() {
                                 let state = DUPLEX_STATE;
                                 let config = Config::new(server::MAX_CONNECTIONS)
                                     .with_budget(Budget::new(Bound::new(4096), 0));
-                                let wire = domain::Local::<wire::Identity, _>::new(wire::Identity);
+                                let wire = domain::Local::new(wire::Identity);
                                 match kind {
                                     Kind::Multiple => {
                                         let (state, config, report) = (&state, config, &mut finish);

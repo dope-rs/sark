@@ -76,7 +76,7 @@ impl<H: Sink> factory::Direct<KeyTag<0>, env::Bundle<tcp::Tcp, wire::Identity, t
     type Error = convert::Infallible;
 
     type Wire<'d>
-        = domain::Local<'d, wire::Identity, KeyTag<0>>
+        = domain::Local<wire::Identity>
     where
         Self: 'd;
 
@@ -84,7 +84,7 @@ impl<H: Sink> factory::Direct<KeyTag<0>, env::Bundle<tcp::Tcp, wire::Identity, t
     where
         Self: 'd,
     {
-        Ok((self, domain::Local::new(Default::default())))
+        Ok((self, domain::Local::new(wire::Identity)))
     }
 }
 

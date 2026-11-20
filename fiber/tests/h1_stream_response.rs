@@ -192,10 +192,10 @@ fn late_failure_closes() {
                         );
                         plan.install(
                             stage,
-                            domain::Local::<wire::Identity, _>::new(wire::Identity),
+                            domain::Local::new(wire::Identity),
                             app,
-                            |root, wait, stage| run::session::<Infallible, _>(
-                                stage.with_app(&mut done, root, |app| run::run(wait, app)),
+                            |root, wait, stage| wait.watch().finish::<Infallible, _>(
+                                stage.with_app(&mut done, root, |app| wait.run(app)),
                             ),
                         ).expect("install").as_ref().map_err(run::Failure::cause).expect("session");
                     })),

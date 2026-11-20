@@ -8,7 +8,7 @@ use dope::{
     manifold::{
         self,
         app::{Host, creation, env, receive},
-        client::{app::request, session::codec::staging},
+        client::session::codec::staging,
         network::{client::Pool, client::topology as connector, listener},
         service::{self, bindings, sync},
         timing,
@@ -42,7 +42,6 @@ type Setup = connector::Install<
     net::SocketAddr,
     16,
     connector::plan::Local<staging::Direct>,
-    request::Enabled,
 >;
 type Provider<'life, 'e, 'd> =
     bindings::Bound<'life, 'd, channel::Port<'e, 'd>, Driver, KeyTag<0>, MAX_CONNECTIONS>;
@@ -93,6 +92,28 @@ pub enum Failure {
     Receive(read::Capacity),
 }
 
+type Output<'r, R> = Result<session::Result<'r, R>, manifold::BuildError<std::convert::Infallible>>;
+
+fn finish<'r, R, I>(
+    result: Result<Output<'r, R>, topology::EnterError<'_, settings::Error, I, Output<'r, R>>>,
+) -> R {
+    let session = match result {
+        Ok(output) => Ok(output),
+        Err(ref error) => Err(error.kind().map(|output| {
+            output
+                .as_ref()
+                .map(|session| session.as_ref().map(|_| ()).map_err(session::Error::cause))
+        })),
+    }
+    .expect("gRPC topology")
+    .expect("gRPC install");
+    match session {
+        Ok(output) => Ok(output),
+        Err(ref error) => Err(error.cause()),
+    }
+    .expect("gRPC session")
+}
+
 pub struct Plan(topology::Plan<settings::Settings, Setup>);
 
 impl Plan {
@@ -135,17 +156,16 @@ impl Plan {
             .0
             .for_profile::<timing::Balanced>()
             .map_err(Failure::Claim)?;
-        let mut finish = session::Completion::new();
-        let (prepared, completion, timeout) = (prepared, &mut finish, GUARD);
+        let mut completion = session::Completion::new();
         Ok(prepared.try_scoped(
             |worker| {
                 worker.lend(|setup, stage| {
                     setup.install(stage, |root, stage| {
                         topology::lending::Stage::with_quiesce(
                             stage,
-                            completion,
+                            &mut completion,
                             root,
-                            timeout,
+                            GUARD,
                             |mut app| {
                                 let handle = app.root_client();
                                 run(app, handle)
@@ -155,19 +175,7 @@ impl Plan {
                 })
             },
             policy,
-            |result| match result {
-                Ok(Ok(Ok(result))) => result,
-                Ok(Ok(Err(error))) => panic!("gRPC session: {:?}", error.cause()),
-                Ok(Err(error)) => panic!("gRPC install: {error:?}"),
-                Err(error) => {
-                    let cause = error.kind().map(|output| {
-                        output.as_ref().map(|session| {
-                            session.as_ref().map(|_| ()).map_err(session::Error::cause)
-                        })
-                    });
-                    panic!("gRPC topology: {cause:?}")
-                }
-            },
+            finish,
         ))
     }
 
@@ -208,7 +216,7 @@ impl Plan {
                 .with_receive(driver::settings::Receive::fixed::<4, { 16 << 10 }>()),
         )
         .map_err(Failure::Claim)?;
-        let mut finish = session::Completion::new();
+        let mut completion = session::Completion::new();
         Ok(prepared.try_scoped(
             |worker| {
                 worker.lend(|(setup, _), stage| {
@@ -238,7 +246,7 @@ impl Plan {
                             |listener, stage| {
                                 let peer = listener.handle();
                                 stage.with_quiesce(
-                                    &mut finish,
+                                    &mut completion,
                                     Root {
                                         grpc: root,
                                         peer: listener,
@@ -256,19 +264,7 @@ impl Plan {
                 })
             },
             policy,
-            |result| match result {
-                Ok(Ok(Ok(result))) => result,
-                Ok(Ok(Err(error))) => panic!("gRPC session: {:?}", error.cause()),
-                Ok(Err(error)) => panic!("gRPC install: {error:?}"),
-                Err(error) => {
-                    let cause = error.kind().map(|output| {
-                        output.as_ref().map(|session| {
-                            session.as_ref().map(|_| ()).map_err(session::Error::cause)
-                        })
-                    });
-                    panic!("gRPC topology: {cause:?}")
-                }
-            },
+            finish,
         ))
     }
 }

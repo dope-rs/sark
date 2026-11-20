@@ -1,5 +1,3 @@
-use core::convert::Infallible;
-
 use bindings::endpoint::State;
 use buffer::pool;
 use dope::{
@@ -30,11 +28,11 @@ use dope::{
 };
 use egress::data::{compose, pair};
 use o3::{
-    base::{Call, cell::region},
+    base::cell::region,
     buffer,
     buffer::{hold, hold::scope::Deferred, resident, write::consume::scope},
 };
-use policy::{admit, output};
+use policy::admit;
 use port::error::Open;
 use sark_core::manifold::client::domain;
 use sark_h2::client;
@@ -149,44 +147,28 @@ impl<'life, 'e: 'life, 'd: 'life, ID: Identity>
 impl<'life, 'e: 'life, 'd: 'life, ID: Identity + 'life>
     policy::Output<'life, 'd, Port<'e, 'd, ID>, ID, MAX_CONNECTIONS> for Driver
 {
-    fn sent() -> impl for<'a, 'x> Call<(
-        &'a mut Owner<'life, 'e, 'd, ID>,
-        conn::Id<'d, ID>,
-        egress::Pending,
-        &'x mut region::Token<region::Identity<'d, 1>>,
-    )> {
-        output::Sent::<Infallible, _>::Connection(
-            |(owner, conn, token): (
-                &mut Owner<'life, 'e, 'd, ID>,
-                conn::Id<'d, ID>,
-                &mut region::Token<region::Identity<'d, 1>>,
-            )| {
-                let port = owner.root();
-                let state = port.shared.get_mut(token);
-                port.shared.wake_space(state);
-                if state.has_output(conn) {
-                    state.signal(conn);
-                }
-            },
-        )
+    fn sent(
+        owner: &mut Owner<'life, 'e, 'd, ID>,
+        conn: conn::Id<'d, ID>,
+        _: egress::Pending,
+        token: &mut region::Token<region::Identity<'d, 1>>,
+    ) {
+        let port = owner.root();
+        let state = port.shared.get_mut(token);
+        port.shared.wake_space(state);
+        if state.has_output(conn) {
+            state.signal(conn);
+        }
     }
 
-    fn cancel() -> impl for<'a, 'x> Call<(
-        &'a Owner<'life, 'e, 'd, ID>,
-        Self::Send,
-        &'x mut region::Token<region::Identity<'d, 1>>,
-    )> {
-        output::Cancel::<Infallible, Infallible, _>::Context(
-            |(owner, _, token): (
-                &Owner<'life, 'e, 'd, ID>,
-                Self::Send,
-                &mut region::Token<region::Identity<'d, 1>>,
-            )| {
-                let port = owner.root();
-                let state = port.shared.get_mut(token);
-                port.shared.wake_space(state);
-            },
-        )
+    fn cancel(
+        owner: &Owner<'life, 'e, 'd, ID>,
+        _: Self::Send,
+        token: &mut region::Token<region::Identity<'d, 1>>,
+    ) {
+        let port = owner.root();
+        let state = port.shared.get_mut(token);
+        port.shared.wake_space(state);
     }
 }
 

@@ -61,8 +61,8 @@ fn construction_keeps_allocation_owner() {
                         );
                         plan.tasks(factory, 1).observe(Log(&events, |cause: &dyn fmt::Debug| {
                             causes.push(format!("{cause:?}"));
-                        })).try_install(
-                            stage, wire::domain::Local::<wire::Identity, _>::new(wire::Identity),
+                        })).try_install::<wire::Identity, _, _, _, _, _, _>(
+                            stage, wire::domain::Local::new(wire::Identity),
                             timers::Disabled,
                             |listener, _wait, stage| {
                                 let seed = stage.driver().driver_ref().random_seed().map(|words| words);
@@ -153,7 +153,7 @@ fn stream_failure_isolated() {
                                     )
                                     .try_install(
                                         stage,
-                                        wire::domain::Local::<wire::Identity, _>::new(
+                                        wire::domain::Local::new(
                                             wire::Identity,
                                         ),
                                         timers::Disabled,
@@ -321,7 +321,7 @@ fn response_header_cause_once() {
                         let router = H2TaskApp::multiplexed::<wire::Identity, KeyTag<0>, _>(
                             brand, &server.state, sark_fiber::Config::new(2),
                         );
-                        let wire = wire::domain::Local::<wire::Identity, KeyTag<0>>::new(wire::Identity);
+                        let wire = wire::domain::Local::new(wire::Identity);
                         if mixed {
                             let bank = stage.storage();
                             plan.tasks((), 2).report(

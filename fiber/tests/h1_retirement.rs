@@ -65,7 +65,7 @@ fn retires_body() {
                 );
                 plan.install(
                     stage,
-                    domain::Local::<wire::Identity, _>::new(wire::Identity),
+                    domain::Local::new(wire::Identity),
                     router,
                     |root, _wait, stage| {
                         stage
@@ -303,7 +303,7 @@ fn deadline_after_eof() {
             let router = stacks::Routes::with_observer(
                 brand, &state, sark_fiber::Config::new(server::MAX_CONNECTIONS), Probe(&events, &audits, diagnose_h1),
             );
-            plan.install(stage, domain::Local::<wire::Identity, _>::new(wire::Identity), router,
+            plan.install(stage, domain::Local::new(wire::Identity), router,
                 |root, _wait, stage| {
                     stage.with_quiesce(&mut done, root, Duration::from_secs(3), |mut app| {
                         let mut socket = TcpStream::connect(address).expect("connect");

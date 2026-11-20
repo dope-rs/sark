@@ -147,7 +147,8 @@ fn retains_provider_state() {
                                 stage,
                                 domain::Local::new(Identity),
                                 |prepared, wait, stage| {
-                                  h2.tasks((), 2).prepare_in(stage, domain::Local::<Identity, KeyTag<3>>::new(Identity), |h2, _wait, stage| {
+                                  h2.tasks((), 2).prepare_in::<Identity, _, _, _, _, _, _>(stage, domain::Local::new(Identity), |h2, _wait, stage| {
+                                    let watch = wait.watch();
                                     let result = held.lend_scope(stage, report, |issued| {
                                         let (client, permit) = issued.into_parts();
                                         let state = std::pin::pin!(State::<_, 2> {
@@ -177,10 +178,10 @@ fn retains_provider_state() {
                                                     .map_err(BranchError::Second)?;
                                                 Ok((server::accept::Listeners::new(app, ListenerHost::new(h2)), wait))
                                             },
-                                            |wait, app| run::run(wait, app),
+                                            run::Wait::run,
                                         )
                                     });
-                                    run::lending(result)
+                                    run::lending(watch, result)
                                   }).map_err(|error| run::Failure::Install(BranchError::Second(BuildError::Create(error))))?
                                 },
                             )

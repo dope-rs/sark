@@ -65,7 +65,7 @@ where
     type Error = M::Error;
 
     type Wire<'d>
-        = domain::Local<'d, wire::Identity, ID>
+        = domain::Local<wire::Identity>
     where
         ID: 'd,
         Self: 'd;
@@ -76,7 +76,7 @@ where
         Self: 'd,
     {
         let app = F::build(self.service, self.connection)?;
-        Ok((app, domain::Local::new(Default::default())))
+        Ok((app, domain::Local::new(wire::Identity)))
     }
 }
 

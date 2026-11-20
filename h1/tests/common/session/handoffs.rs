@@ -344,7 +344,7 @@ impl factory::Direct<KeyTag<0>, Bundle<tcp::Tcp, Identity, Throughput>> for App<
         Self: 'd;
     type Error = convert::Infallible;
     type Wire<'d>
-        = domain::Local<'d, Identity, KeyTag<0>>
+        = domain::Local<Identity>
     where
         Self: 'd;
 

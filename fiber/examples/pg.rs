@@ -217,26 +217,23 @@ impl Server {
         let plan = provider.compose(storage, plan, move |plan, owner, stage| {
             stage.hold(owner, |held, stage| {
                 Brand::with(|brand| {
-                    plan.prepare_in(
+                    plan.prepare_in::<Identity, _, _, _, _, _>(
                         stage,
                         domain::Local::new(Identity),
                         |prepared, wait, stage| {
+                            let watch = wait.watch();
                             let result = held.lend_scope(stage, report, |issued| {
                                 let (client, permit) = issued.into_parts();
-                                let state = std::pin::pin!({
-                                    client.status().set_policy(policy);
-                                    client
-                                });
-                                App::run_prepared(
-                                    brand,
-                                    state.as_ref(),
-                                    config,
-                                    prepared,
-                                    wait,
-                                    permit,
+                                client.status().set_policy(policy);
+                                permit.try_run(
+                                    |mut driver| {
+                                        let app = App::new(brand, &client, config);
+                                        prepared.build(app, &mut driver).map(|app| (app, ()))
+                                    },
+                                    |(), app| wait.run(app),
                                 )
                             });
-                            run::lending(result)
+                            run::lending(watch, result)
                         },
                     )
                     .map_err(|error| run::Failure::Install(BuildError::Create(error)))?

@@ -14,7 +14,6 @@ use dope::{
     manifold::{
         app::env,
         client::{
-            app::request,
             port,
             session::{codec::staging, ingress},
         },
@@ -94,7 +93,6 @@ type Install<ID, E> = topology::Install<
     Address<E>,
     16,
     Local<staging::Direct>,
-    request::Enabled,
 >;
 
 pub struct Settings<ID: route::Identity = route::KeyTag<0>> {

@@ -355,7 +355,7 @@ impl factory::Direct<route::KeyTag<0>, Bundle<tcp::Tcp, Identity, Throughput>> f
         Self: 'd;
     type Error = Infallible;
     type Wire<'d>
-        = domain::Local<'d, Identity, route::KeyTag<0>>
+        = domain::Local<Identity>
     where
         Self: 'd;
 
