@@ -11,50 +11,27 @@ use std::{
     time::Duration,
 };
 
-use common::server::recover;
 use common::{
     route::{
         chunked::peer::Peer,
         keep::{
-            KeepAliveDispatch, LARGE_STATIC_BODY, Server,
+            self, KeepAliveDispatch, LARGE_STATIC_BODY,
             events::{Identity, IdentityLog, Log, diagnose},
         },
     },
     server,
 };
-use dope::{
-    core::driver::{life::recovery::Policy, route::KeyTag},
-    net::wire,
-};
-use dope_test::harness::server::Pair;
+use dope::{core::driver::route::KeyTag, net::wire};
 use sark_fiber::Config;
 
 #[test]
 fn rejects_one_exchange() {
-    let harness = Pair::bind().expect("bind isolated listener");
-    let bind = harness.addr();
-    let server = server::Plan::new(bind, Duration::from_secs(10)).build();
+    let (harness, server) = server::Plan::isolated();
     let mut events = Vec::new();
 
     harness
-        .check(
-            |context, listener| {
-                let log = Cell::new(Vec::new());
-                let audits = Cell::new(None);
-                let mut reports = server::Plan::try_reports(&server).expect("claims");
-                Server::new(server, Log(&log, &audits, diagnose))
-                    .try_run(
-                        context,
-                        listener,
-                        Policy::new(|event| reports.push(event), recover),
-                        |result| result.expect("observed server"),
-                    )
-                    .map(|()| {
-                        assert_eq!(audits.get(), None);
-                        assert!(reports.events().expect("reclaimed resources").is_empty());
-                        log.into_inner()
-                    })
-            },
+        .run(
+            |context, listener| keep::try_record(server, context, listener, &mut events),
             |bind| {
                 let mut socket = TcpStream::connect(bind).expect("connect observed H1 rejection");
                 socket
@@ -74,9 +51,8 @@ fn rejects_one_exchange() {
                     .expect("read rejection response");
                 assert!(response.contains("404 Not Found"), "response: {response}");
             },
-            |result| events = result.expect("rejects_one_exchange server shutdown"),
         )
-        .expect("observed H1 rejection runtime");
+        .expect("rejects_one_exchange server shutdown");
 
     for expected in [
         "exchange-opened",
@@ -102,30 +78,12 @@ fn rejects_one_exchange() {
 
 #[test]
 fn keeps_connection_open() {
-    let harness = Pair::bind().expect("bind isolated listener");
-    let bind = harness.addr();
-    let server = server::Plan::new(bind, Duration::from_secs(10)).build();
+    let (harness, server) = server::Plan::isolated();
     let mut events = Vec::new();
 
     harness
-        .check(
-            |context, listener| {
-                let log = Cell::new(Vec::new());
-                let audits = Cell::new(None);
-                let mut reports = server::Plan::try_reports(&server).expect("claims");
-                Server::new(server, Log(&log, &audits, diagnose))
-                    .try_run(
-                        context,
-                        listener,
-                        Policy::new(|event| reports.push(event), recover),
-                        |result| result.expect("observed server"),
-                    )
-                    .map(|()| {
-                        assert_eq!(audits.get(), None);
-                        assert!(reports.events().expect("reclaimed resources").is_empty());
-                        log.into_inner()
-                    })
-            },
+        .run(
+            |context, listener| keep::try_record(server, context, listener, &mut events),
             |bind| {
                 let mut sock = TcpPeer::at(bind).try_connect().expect("connect");
                 sock.read_wait(Some(Duration::from_secs(2)))
@@ -155,9 +113,8 @@ fn keeps_connection_open() {
                 let last = String::from_utf8(last).expect("closing response text");
                 assert!(last.contains("200 OK"), "last: {}", last);
             },
-            |result| events = result.expect("keeps_connection_open server shutdown"),
         )
-        .expect("harness");
+        .expect("keeps_connection_open server shutdown");
 
     for expected in ["session-opened", "session-established", "session-closed"] {
         assert!(events.contains(&expected), "missing {expected}: {events:?}");
@@ -187,29 +144,20 @@ fn keeps_connection_open() {
 
 #[test]
 fn orders_owner_release() {
-    let harness = Pair::bind().expect("bind isolated listener");
-    let bind = harness.addr();
-    let server = server::Plan::new(bind, Duration::from_secs(10)).build();
+    let (harness, server) = server::Plan::isolated();
     let mut events = Vec::new();
 
     harness
-        .check(
+        .run(
             |context, listener| {
-                let log = Cell::new(Vec::new());
                 let audits = Cell::new(None);
-                let mut reports = server::Plan::try_reports(&server).expect("claims");
-                Server::new(server, IdentityLog(&log, &audits, diagnose))
-                    .try_run(
-                        context,
-                        listener,
-                        Policy::new(|event| reports.push(event), recover),
-                        |result| result.expect("observed server"),
-                    )
-                    .map(|()| {
-                        assert_eq!(audits.get(), None);
-                        assert!(reports.events().expect("reclaimed resources").is_empty());
-                        log.into_inner()
-                    })
+                keep::try_run(
+                    server,
+                    context,
+                    listener,
+                    IdentityLog(Cell::from_mut(&mut events), &audits, diagnose),
+                    &audits,
+                )
             },
             |bind| {
                 let mut socket = TcpStream::connect(bind).expect("connect pipelined H1 client");
@@ -238,9 +186,8 @@ fn orders_owner_release() {
                 );
                 assert!(response.len() >= 64 * 1024, "response too short");
             },
-            |result| events = result.expect("orders_owner_release server shutdown"),
         )
-        .expect("pipelined H1 runtime");
+        .expect("orders_owner_release server shutdown");
 
     let opened = Identity::select(&events, |event| match event {
         Identity::Opened(ordinal) => Some(ordinal),
@@ -316,30 +263,12 @@ fn orders_owner_release() {
 
 #[test]
 fn static_stays_borrowed() {
-    let harness = Pair::bind().expect("bind isolated listener");
-    let bind = harness.addr();
-    let server = server::Plan::new(bind, Duration::from_secs(10)).build();
+    let (harness, server) = server::Plan::isolated();
     let mut events = Vec::new();
 
     harness
-        .check(
-            |context, listener| {
-                let log = Cell::new(Vec::new());
-                let audits = Cell::new(None);
-                let mut reports = server::Plan::try_reports(&server).expect("claims");
-                Server::new(server, Log(&log, &audits, diagnose))
-                    .try_run(
-                        context,
-                        listener,
-                        Policy::new(|event| reports.push(event), recover),
-                        |result| result.expect("observed server"),
-                    )
-                    .map(|()| {
-                        assert_eq!(audits.get(), None);
-                        assert!(reports.events().expect("reclaimed resources").is_empty());
-                        log.into_inner()
-                    })
-            },
+        .run(
+            |context, listener| keep::try_record(server, context, listener, &mut events),
             |bind| {
                 let mut socket = TcpStream::connect(bind).expect("connect static H1 client");
                 socket
@@ -365,9 +294,8 @@ fn static_stays_borrowed() {
                     .expect("complete response head");
                 assert_eq!(body, LARGE_STATIC_BODY);
             },
-            |result| events = result.expect("static_stays_borrowed server shutdown"),
         )
-        .expect("large static H1 runtime");
+        .expect("static_stays_borrowed server shutdown");
 
     for name in ["response-handoff", "response-transport-released"] {
         assert_eq!(
@@ -400,30 +328,12 @@ fn disabled_omits_ledger() {
 
 #[test]
 fn suspended_body_owns() {
-    let harness = Pair::bind().expect("bind isolated listener");
-    let bind = harness.addr();
-    let server = server::Plan::new(bind, Duration::from_secs(10)).build();
+    let (harness, server) = server::Plan::isolated();
     let mut events = Vec::new();
 
     harness
-        .check(
-            |context, listener| {
-                let log = Cell::new(Vec::new());
-                let audits = Cell::new(None);
-                let mut reports = server::Plan::try_reports(&server).expect("claims");
-                Server::new(server, Log(&log, &audits, diagnose))
-                    .try_run(
-                        context,
-                        listener,
-                        Policy::new(|event| reports.push(event), recover),
-                        |result| result.expect("observed server"),
-                    )
-                    .map(|()| {
-                        assert_eq!(audits.get(), None);
-                        assert!(reports.events().expect("reclaimed resources").is_empty());
-                        log.into_inner()
-                    })
-            },
+        .run(
+            |context, listener| keep::try_record(server, context, listener, &mut events),
             |bind| {
                 let mut socket = TcpStream::connect(bind).expect("connect observed H1 body");
                 socket
@@ -448,9 +358,8 @@ fn suspended_body_owns() {
                 assert!(response.contains("200 OK"), "response: {response}");
                 assert!(response.ends_with("body:12"), "response: {response}");
             },
-            |result| events = result.expect("suspended_body_owns server shutdown"),
         )
-        .expect("observed H1 body runtime");
+        .expect("suspended_body_owns server shutdown");
 
     let reserved = events
         .iter()

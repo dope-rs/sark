@@ -13,7 +13,7 @@ use common::h2::{
     apps::H2TaskApp,
     events::{Credit, CreditLog, Log},
     facts::State,
-    peer::{Peer, Sender},
+    peer::{Peer, try_send},
     server::{CONFIG, Request, Server},
 };
 use dope::{
@@ -428,8 +428,6 @@ fn preserves_preface_cause() {
                         Observed::new(Log(&events, |cause: &dyn fmt::Debug| {
                             causes.push(format!("{cause:?}"));
                         })),
-                        recover,
-                        |result| result.expect("H2 execution"),
                     )
                     .expect("H2 setup");
                 assert_eq!(
@@ -453,17 +451,9 @@ fn preserves_preface_cause() {
 #[test]
 fn keeps_queued_rejection() {
     let harness = Pair::bind().expect("H2 harness");
-    let (mut socket, mut client) =
-        Peer::try_connect(harness.addr(), Duration::from_secs(3)).expect("H2 peer connection");
-    let stream = client
-        .streams()
-        .headers()
-        .request(
-            Request::new(b"/blocked")
-                .try_headers()
-                .expect("valid request fields"),
-            Boundary::More,
-        )
+    let (mut socket, mut client) = Peer::connect(harness.addr());
+    let stream = Request::new(b"/blocked")
+        .try_start(&mut client, Boundary::More)
         .expect("start H2 request");
     Peer::new(&mut socket, &mut client)
         .try_faults(stream)
@@ -480,8 +470,6 @@ fn keeps_queued_rejection() {
                         Observed::new(Log(&events, |cause: &dyn fmt::Debug| {
                             causes.push(format!("{cause:?}"));
                         })),
-                        recover,
-                        |result| result.expect("H2 execution"),
                     )
                     .expect("H2 setup");
                 let mut expected = [
@@ -516,32 +504,24 @@ fn keeps_queued_rejection() {
 #[test]
 fn json_failure_precedes_next_data() {
     let harness = Pair::bind().expect("H2 harness");
-    let (mut socket, mut client) =
-        Peer::try_connect(harness.addr(), Duration::from_secs(3)).expect("H2 peer connection");
-    let stream = client
-        .streams()
-        .headers()
-        .request(
-            Request::new(b"/large")
-                .try_headers()
-                .expect("valid request fields"),
-            Boundary::More,
-        )
+    let (mut socket, mut client) = Peer::connect(harness.addr());
+    let stream = Request::new(b"/large")
+        .try_start(&mut client, Boundary::More)
         .expect("start JSON request");
     // More DATA than one admitted turn can consume, all queued before the
     // server starts. The first invalid byte must fail before the next push.
     for index in 0..2 * schedule::LIMIT {
-        Sender::new(&mut client)
-            .try_send(
-                stream,
-                b"!",
-                if index + 1 == 2 * schedule::LIMIT {
-                    Boundary::End
-                } else {
-                    Boundary::More
-                },
-            )
-            .expect("queue JSON DATA");
+        try_send(
+            &mut client,
+            stream,
+            b"!",
+            if index + 1 == 2 * schedule::LIMIT {
+                Boundary::End
+            } else {
+                Boundary::More
+            },
+        )
+        .expect("queue JSON DATA");
     }
     Peer::new(&mut socket, &mut client)
         .try_flush()
@@ -562,8 +542,6 @@ fn json_failure_precedes_next_data() {
                             }),
                             state: &credit,
                         }),
-                        recover,
-                        |result| result.expect("H2 execution"),
                     )
                     .expect("H2 setup");
                 let credit = credit.into_inner();

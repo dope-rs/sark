@@ -2,8 +2,8 @@ use std::{convert::Infallible, time::Duration};
 
 use dope::{
     core::{
+        BranchError,
         driver::{
-            life::recovery,
             route::{FrameworkTag, KeyTag, Tag, kind},
             settings::{self},
         },
@@ -21,20 +21,27 @@ use dope::{
     runtime::{
         executor::session,
         shutdown,
-        topology::{self, error, lending},
+        topology::{self, lending},
     },
 };
 use dope_fiber::task::{storage::scope::Brand, time::sleep};
-use dope_test::reclaim;
-use sark_core::{deadline::config::Config, life, life::mode};
+use dope_test::{
+    harness::{scenario::run, server::Pair},
+    reclaim,
+};
+use sark_core::{deadline::config::Config, life, life::mode, manifold::stream::Boundary};
 use sark_h2::{
-    conn::config,
+    ClientRole,
+    conn::{config, machine::Connection},
     server::{self, runtime::Plan, task::timers},
     stream,
 };
 use sark_http::field::{self, Lower, Value};
 
-use crate::common::h2::{apps::*, facts::*, *};
+use crate::common::{
+    h2::{apps::*, facts::*, peer::Peer, *},
+    server::reporting,
+};
 
 pub const CONFIG: server::Config = server::Config {
     max_request_body_bytes: 4 << 20,
@@ -43,6 +50,25 @@ pub const CONFIG: server::Config = server::Config {
     max_connection_body_chunks: 16 << 10,
     max_outbound_bytes: 64 << 10,
 };
+
+pub fn check(
+    config: server::Config,
+    task_cap: usize,
+    client: impl FnOnce(&mut Peer<'_>),
+) -> Result<(), run::Error<Infallible>> {
+    Pair::bind().expect("H2 harness").run(
+        move |context, listener| {
+            Server::new(config, task_cap, State::default())
+                .try_run(context, listener, mode::Disabled)
+                .expect("H2 setup");
+            Ok(())
+        },
+        |address| {
+            let (mut socket, mut connection) = Peer::connect(address);
+            client(&mut Peer::new(&mut socket, &mut connection));
+        },
+    )
+}
 
 pub struct Server {
     config: server::Config,
@@ -201,17 +227,12 @@ where
 }
 
 impl Server {
-    pub fn try_run<M, Out>(
+    pub fn try_run(
         &self,
         context: shutdown::ReadySource,
         listener: Listener,
-        mode: M,
-        recover: impl recovery::Recover,
-        done: impl for<'a> FnOnce(Result<(), error::Run<'a, Infallible, Install>>) -> Out,
-    ) -> Result<Out, Error>
-    where
-        M: RunMode,
-    {
+        mode: impl RunMode,
+    ) -> Result<(), Error> {
         let prepared = topology::Plan::new(
             (),
             self.try_plan(listener.local_addr())
@@ -220,48 +241,43 @@ impl Server {
         )
         .for_receive::<timing::Throughput>()
         .map_err(Error::Layout)?;
-        {
-            let Self {
-                state,
-                task_cap,
-                config: _,
-                protocol: _,
-                lifetime: _,
-            } = self;
-            let mut reports = reclaim::Reports::<1>::new(
-                prepared.layout(),
-                [<FrameworkTag<kind::Any> as Tag>::ROUTE],
-            );
-            let mut finish = session::Completion::new();
-            let finish = &mut finish;
-            let result = prepared.enter_with(
-                context,
-                move |scope| {
-                    scope.lend(|plan, stage| mode.run(plan, stage, state, *task_cap, finish))
-                },
-                recovery::Policy::new(|report| reports.push(report), recover),
-                |result| {
-                    let result = match result {
-                        Ok(result) => result.map_err(topology::RunError::Failure),
-                        Err(error) => Err(topology::RunError::from(error)),
-                    };
-                    done(result.as_ref().copied().map_err(topology::RunError::cause))
-                },
-            );
-            let (invalid, timer, layout) = state.observed();
-            if invalid || timer.is_some() || layout != Some(DUPLEX_LAYOUT) {
-                return Err(Error::Handler {
-                    invalid,
-                    timer,
-                    layout,
-                });
-            }
-            let events = reports.into_events().map_err(Error::Reclaim)?;
-            if !events.is_empty() {
-                return Err(Error::Retired(events));
-            }
-            Ok(result)
+        let Self { state, task_cap, .. } = self;
+        let mut reports = reclaim::Reports::<1>::new(
+            prepared.layout(),
+            [<FrameworkTag<kind::Any> as Tag>::ROUTE],
+        );
+        let mut finish = session::Completion::new();
+        let finish = &mut finish;
+        prepared.enter_with(
+            context,
+            move |scope| {
+                scope.lend(|plan, stage| mode.run(plan, stage, state, *task_cap, finish))
+            },
+            reporting(&mut reports),
+            |result| {
+                let result = match result {
+                    Ok(result) => result.map_err(topology::RunError::Failure),
+                    Err(error) => Err(topology::RunError::from(error)),
+                };
+                result
+                    .as_ref()
+                    .map_err(topology::RunError::cause)
+                    .expect("H2 execution");
+            },
+        );
+        let (invalid, timer, layout) = state.observed();
+        if invalid || timer.is_some() || layout != Some(DUPLEX_LAYOUT) {
+            return Err(Error::Handler {
+                invalid,
+                timer,
+                layout,
+            });
         }
+        let events = reports.into_events().map_err(Error::Reclaim)?;
+        if !events.is_empty() {
+            return Err(Error::Retired(events));
+        }
+        Ok(())
     }
 }
 
@@ -272,6 +288,19 @@ pub struct Request<'a> {
 impl<'a> Request<'a> {
     pub const fn new(path: &'a [u8]) -> Self {
         Self { path }
+    }
+
+    pub fn try_start(
+        self,
+        client: &mut Connection<ClientRole>,
+        boundary: Boundary,
+    ) -> Result<stream::Id, BranchError<field::Error, sark_h2::conn::Error>> {
+        let fields = self.try_headers().map_err(BranchError::First)?;
+        client
+            .streams()
+            .headers()
+            .request(fields, boundary)
+            .map_err(BranchError::Second)
     }
 
     pub fn try_headers(self) -> Result<[Entry<'a>; 4], field::Error> {

@@ -2,7 +2,6 @@ pub mod common;
 
 use std::{cell::Cell, io::Read as _, time::Duration};
 
-use common::h2::recover;
 use common::{
     h2::{
         events::{Log, PoolLog},
@@ -44,47 +43,35 @@ fn sent_completes_drain() {
                         Positive::from_millis::<250>(),
                         Positive::from_secs::<10>(),
                     ))
-                    .try_run(context, listener, mode::Disabled, recover, |result| {
-                        result.expect("H2 execution")
-                    })
+                    .try_run(context, listener, mode::Disabled)
             },
             |address| {
-                let (mut socket, mut client) =
-                    Peer::try_connect(address, Duration::from_secs(3)).expect("H2 peer connection");
-                Peer::new(&mut socket, &mut client)
-                    .try_settings()
-                    .expect("H2 settings");
-                Peer::new(&mut socket, &mut client)
-                    .try_pause()
-                    .expect("pause response window");
-                let stream = client
-                    .streams()
-                    .headers()
-                    .request(
-                        Request::new(b"/unbounded")
-                            .try_headers()
-                            .expect("valid request fields"),
-                        Boundary::End,
-                    )
+                let (mut socket, mut client) = Peer::connect(address);
+                let mut peer = Peer::new(&mut socket, &mut client);
+                peer.try_settings().expect("H2 settings");
+                peer.try_pause().expect("pause response window");
+                let stream = Request::new(b"/unbounded")
+                    .try_start(peer.client, Boundary::End)
                     .expect("request");
-                Peer::new(&mut socket, &mut client)
-                    .try_flush()
-                    .expect("H2 peer flush");
+                peer.try_flush().expect("H2 peer flush");
                 let mut goaway = false;
                 let mut credited = false;
                 let mut ended = false;
                 let mut body = 0;
                 let mut input = [0; 16 << 10];
                 loop {
-                    let received = socket.read(&mut input).expect("EOF before drain timeout");
+                    let received = peer
+                        .socket
+                        .read(&mut input)
+                        .expect("EOF before drain timeout");
                     if received == 0 {
                         break;
                     }
-                    client
+                    peer.client
                         .ingress()
                         .ingest(&input[..received])
                         .expect("H2 input");
-                    while let Some(event) = client.ingress().poll_event() {
+                    while let Some(event) = peer.client.ingress().poll_event() {
                         match event {
                             Event::GoAway {
                                 last_stream_id: last,
@@ -122,8 +109,7 @@ fn sent_completes_drain() {
                         }
                     }
                     if goaway && !credited {
-                        Peer::new(&mut socket, &mut client)
-                            .try_credit(stream, Increment::new(2 << 20).expect("body credit"))
+                        peer.try_credit(stream, Increment::new(2 << 20).expect("body credit"))
                             .expect("release response window");
                         credited = true;
                     }
@@ -155,32 +141,24 @@ fn deadline_completes_drain() {
                             Positive::from_millis::<250>(),
                             Positive::from_secs::<10>(),
                         ));
-                    server
-                        .try_run(context, listener, timer, recover, |result| {
-                            result.expect("H2 execution")
-                        })
-                        .map(|output| {
-                            if streaming {
-                                assert_eq!(server.state.stream.polls.get(), 2);
-                                assert_eq!(server.state.stream.drops.get(), 1);
-                                assert!(!server.state.stream.moved.get());
-                            }
-                            output
-                        })
+                    server.try_run(context, listener, timer).map(|output| {
+                        if streaming {
+                            assert_eq!(server.state.stream.polls.get(), 2);
+                            assert_eq!(server.state.stream.drops.get(), 1);
+                            assert!(!server.state.stream.moved.get());
+                        }
+                        output
+                    })
                 },
                 |address| {
-                    let (mut socket, mut client) =
-                        Peer::try_connect(address, Duration::from_secs(3))
-                            .expect("H2 peer connection");
-                    Peer::new(&mut socket, &mut client)
-                        .try_settings()
-                        .expect("H2 settings");
+                    let (mut socket, mut client) = Peer::connect(address);
+                    let mut peer = Peer::new(&mut socket, &mut client);
+                    peer.try_settings().expect("H2 settings");
                     if blocked {
-                        Peer::new(&mut socket, &mut client)
-                            .try_pause()
-                            .expect("pause response window");
+                        peer.try_pause().expect("pause response window");
                     }
-                    let stream = client
+                    let stream = peer
+                        .client
                         .streams()
                         .headers()
                         .request(
@@ -200,23 +178,24 @@ fn deadline_completes_drain() {
                             },
                         )
                         .expect("request");
-                    Peer::new(&mut socket, &mut client)
-                        .try_flush()
-                        .expect("H2 peer flush");
+                    peer.try_flush().expect("H2 peer flush");
                     let mut goaway = false;
                     let mut reset = false;
                     let mut committed = false;
                     let mut input = [0; 4096];
                     loop {
-                        let received = socket.read(&mut input).expect("EOF before drain timeout");
+                        let received = peer
+                            .socket
+                            .read(&mut input)
+                            .expect("EOF before drain timeout");
                         if received == 0 {
                             break;
                         }
-                        client
+                        peer.client
                             .ingress()
                             .ingest(&input[..received])
                             .expect("H2 input");
-                        while let Some(event) = client.ingress().poll_event() {
+                        while let Some(event) = peer.client.ingress().poll_event() {
                             match event {
                                 Event::GoAway {
                                     last_stream_id: last,
@@ -290,21 +269,16 @@ fn releases_before_notify() {
                             pool: &pool,
                             released: &released,
                         }),
-                        recover,
-                        |result| result.expect("H2 execution"),
                     )
                     .map(|()| (log.into_inner(), released.get()))
             },
             |address| {
-                let (mut socket, mut client) =
-                    Peer::try_connect(address, Duration::from_secs(3)).expect("H2 peer connection");
-                Peer::new(&mut socket, &mut client)
-                    .try_settings()
-                    .expect("H2 settings");
-                Peer::new(&mut socket, &mut client)
-                    .try_pause()
-                    .expect("block response DATA");
-                let stream = client
+                let (mut socket, mut client) = Peer::connect(address);
+                let mut peer = Peer::new(&mut socket, &mut client);
+                peer.try_settings().expect("H2 settings");
+                peer.try_pause().expect("block response DATA");
+                let stream = peer
+                    .client
                     .streams()
                     .headers()
                     .request(
@@ -314,18 +288,16 @@ fn releases_before_notify() {
                         Boundary::End,
                     )
                     .expect("response stream");
-                Peer::new(&mut socket, &mut client)
-                    .try_flush()
-                    .expect("request flush");
+                peer.try_flush().expect("request flush");
                 let mut input = [0; 4096];
                 loop {
-                    let read = socket.read(&mut input).expect("response HEADERS");
+                    let read = peer.socket.read(&mut input).expect("response HEADERS");
                     assert_ne!(read, 0, "response must commit before closing");
-                    client
+                    peer.client
                         .ingress()
                         .ingest(&input[..read])
                         .expect("response input");
-                    while let Some(event) = client.ingress().poll_event() {
+                    while let Some(event) = peer.client.ingress().poll_event() {
                         if matches!(event, Event::Headers {
                             stream_id, boundary: Boundary::More, ..
                         } if stream_id == stream)
@@ -333,9 +305,7 @@ fn releases_before_notify() {
                             return;
                         }
                     }
-                    Peer::new(&mut socket, &mut client)
-                        .try_flush()
-                        .expect("settings acknowledgement");
+                    peer.try_flush().expect("settings acknowledgement");
                 }
             },
             |result| {

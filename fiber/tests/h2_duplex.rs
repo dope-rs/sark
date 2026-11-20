@@ -2,12 +2,11 @@ pub mod common;
 
 use std::{cell::Cell, fmt, iter, time::Duration};
 
-use common::h2::recover;
 use common::h2::{
     apps::{PHYSICAL_BODY, STATIC_DUPLEX_BODY, STATIC_DUPLEX_INPUT},
     events::Log,
     facts::{Identity, State},
-    peer::{Peer, Sender},
+    peer::{Peer, try_send},
     server::{CONFIG, CONNECT, EXTENDED, Request, Server},
 };
 
@@ -52,13 +51,7 @@ fn prove_h2_duplex(connect: Connect, input: &'static [u8], expected: &'static [u
             move |context, listener| {
                 let log = Cell::new(Vec::new());
                 let server = Server::new(config, 8, State::default());
-                let result = server.try_run(
-                    context,
-                    listener,
-                    Observed::new(Log(&log, diagnose)),
-                    recover,
-                    |result| result.expect("H2 execution"),
-                );
+                let result = server.try_run(context, listener, Observed::new(Log(&log, diagnose)));
                 assert_eq!(
                     server.state.header.get(),
                     Some(*b"retained-after-pseudo-fields")
@@ -92,9 +85,7 @@ fn prove_h2_duplex(connect: Connect, input: &'static [u8], expected: &'static [u
                     }
                 }
                 .expect("start CONNECT stream");
-                Sender::new(&mut client)
-                    .try_send(stream, input, Boundary::End)
-                    .expect("H2 peer send");
+                try_send(&mut client, stream, input, Boundary::End).expect("H2 peer send");
                 Peer::new(&mut socket, &mut client)
                     .try_flush()
                     .expect("H2 peer flush");
@@ -166,47 +157,27 @@ fn duplex_backpressure() {
             move |context, listener| {
                 let log = Cell::new(Vec::new());
                 Server::new(config, 8, State::default())
-                    .try_run(
-                        context,
-                        listener,
-                        Observed::new(Log(&log, diagnose)),
-                        recover,
-                        |result| result.expect("H2 execution"),
-                    )
+                    .try_run(context, listener, Observed::new(Log(&log, diagnose)))
                     .map(|()| log.into_inner())
             },
             |address| {
-                let (mut socket, mut client) =
-                    Peer::try_connect(address, Duration::from_secs(3)).expect("H2 peer connection");
-                Peer::new(&mut socket, &mut client)
-                    .try_settings()
-                    .expect("H2 peer settings");
-                let first = client
-                    .streams()
-                    .headers()
-                    .request(
-                        Request::new(b"/quick")
-                            .try_headers()
-                            .expect("valid request fields"),
-                        Boundary::End,
-                    )
+                let (mut socket, mut client) = Peer::connect(address);
+                let mut peer = Peer::new(&mut socket, &mut client);
+                peer.try_settings().expect("H2 peer settings");
+                let first = Request::new(b"/quick")
+                    .try_start(peer.client, Boundary::End)
                     .expect("start saturating H2 response");
-                let stream = client
+                let stream = peer
+                    .client
                     .streams()
                     .headers()
                     .request(CONNECT, Boundary::More)
                     .expect("start backpressured CONNECT stream");
-                Sender::new(&mut client)
-                    .try_send(stream, b"first", Boundary::More)
-                    .expect("H2 peer send");
-                Sender::new(&mut client)
-                    .try_send(stream, b"last", Boundary::End)
-                    .expect("H2 peer send");
-                Peer::new(&mut socket, &mut client)
-                    .try_flush()
-                    .expect("H2 peer flush");
+                try_send(peer.client, stream, b"first", Boundary::More).expect("H2 peer send");
+                try_send(peer.client, stream, b"last", Boundary::End).expect("H2 peer send");
+                peer.try_flush().expect("H2 peer flush");
 
-                let (_, bodies) = Peer::new(&mut socket, &mut client)
+                let (_, bodies) = peer
                     .try_statuses(&[first, stream], b"200")
                     .expect("H2 peer statuses");
                 assert_eq!(bodies[0], b"quick");
@@ -258,36 +229,21 @@ fn static_burst_no_owner() {
             move |context, listener| {
                 let log = Cell::new(Vec::new());
                 Server::new(config, BURST, State::default())
-                    .try_run(
-                        context,
-                        listener,
-                        Observed::new(Log(&log, diagnose)),
-                        recover,
-                        |result| result.expect("H2 execution"),
-                    )
+                    .try_run(context, listener, Observed::new(Log(&log, diagnose)))
                     .map(|()| log.into_inner())
             },
             move |address| {
-                let (mut socket, mut client) =
-                    Peer::try_connect(address, Duration::from_secs(3)).expect("H2 peer connection");
+                let (mut socket, mut client) = Peer::connect(address);
+                let mut peer = Peer::new(&mut socket, &mut client);
                 let wanted = iter::repeat_with(|| {
-                    client
-                        .streams()
-                        .headers()
-                        .request(
-                            Request::new(b"/physical")
-                                .try_headers()
-                                .expect("valid request fields"),
-                            Boundary::End,
-                        )
+                    Request::new(b"/physical")
+                        .try_start(peer.client, Boundary::End)
                         .expect("start observed H2 burst member")
                 })
                 .take(BURST)
                 .collect::<Vec<_>>();
-                Peer::new(&mut socket, &mut client)
-                    .try_flush()
-                    .expect("H2 peer flush");
-                let (_, bodies) = Peer::new(&mut socket, &mut client)
+                peer.try_flush().expect("H2 peer flush");
+                let (_, bodies) = peer
                     .try_statuses(&wanted, b"200")
                     .expect("H2 peer statuses");
                 assert!(
@@ -334,32 +290,18 @@ fn large_owner_direct() {
             move |context, listener| {
                 let log = Cell::new(Vec::new());
                 Server::new(config, 1, State::try_body().expect("large response owner"))
-                    .try_run(
-                        context,
-                        listener,
-                        Observed::new(Log(&log, diagnose)),
-                        recover,
-                        |result| result.expect("H2 execution"),
-                    )
+                    .try_run(context, listener, Observed::new(Log(&log, diagnose)))
                     .map(|()| log.into_inner())
             },
             move |address| {
                 let (mut socket, mut client) =
                     Peer::try_connect(address, Duration::from_secs(5)).expect("H2 peer connection");
-                let stream = client
-                    .streams()
-                    .headers()
-                    .request(
-                        Request::new(b"/unbounded")
-                            .try_headers()
-                            .expect("valid request fields"),
-                        Boundary::End,
-                    )
+                let mut peer = Peer::new(&mut socket, &mut client);
+                let stream = Request::new(b"/unbounded")
+                    .try_start(peer.client, Boundary::End)
                     .expect("start unbounded H2 request");
-                Peer::new(&mut socket, &mut client)
-                    .try_flush()
-                    .expect("H2 peer flush");
-                let (_, bodies) = Peer::new(&mut socket, &mut client)
+                peer.try_flush().expect("H2 peer flush");
+                let (_, bodies) = peer
                     .try_statuses(&[stream], b"200")
                     .expect("H2 peer statuses");
                 assert_eq!(bodies[0].len(), 2 * 1024 * 1024);

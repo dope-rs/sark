@@ -1,47 +1,23 @@
 pub mod common;
 
 use std::{
-    cell::Cell,
     io::{Read, Write},
     net::TcpStream,
     thread,
     time::Duration,
 };
 
-use common::server::recover;
 use common::{
-    route::keep::{
-        Server,
-        events::{Log, REJECTED_REQUESTS, diagnose},
-    },
+    route::keep::{self, events::REJECTED_REQUESTS},
     server,
 };
-use dope::core::driver::life::recovery::Policy;
-use dope_test::harness::server::Pair;
 
 #[test]
 fn rejects_head_once() {
-    let pair = Pair::bind().expect("listener");
-    let plan = server::Plan::new(pair.addr(), Duration::from_secs(10)).build();
+    let (pair, plan) = server::Plan::isolated();
     let mut events = Vec::new();
-    pair.check(
-        |context, listener| {
-            let log = Cell::new(Vec::new());
-            let audits = Cell::new(None);
-            let mut reports = server::Plan::try_reports(&plan).expect("claims");
-            Server::new(plan, Log(&log, &audits, diagnose))
-                .try_run(
-                    context,
-                    listener,
-                    Policy::new(|event| reports.push(event), recover),
-                    |result| result.expect("observed server"),
-                )
-                .map(|()| {
-                    assert_eq!(audits.get(), None);
-                    assert!(reports.events().expect("reclaimed resources").is_empty());
-                    log.into_inner()
-                })
-        },
+    pair.run(
+        |context, listener| keep::try_record(plan, context, listener, &mut events),
         |address| {
             for (prefix, suffix) in REJECTED_REQUESTS {
                 for split in [false, true] {
@@ -64,7 +40,6 @@ fn rejects_head_once() {
                 }
             }
         },
-        |result| events = result.expect("server shutdown"),
     )
     .expect("observed H1 runtime");
 

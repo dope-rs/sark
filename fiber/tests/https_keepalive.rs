@@ -1,38 +1,17 @@
 pub mod common;
 
-use std::{
-    cell::Cell,
-    convert,
-    net::{Ipv4Addr, SocketAddr},
-    time::Duration,
-};
+use std::net::{Ipv4Addr, SocketAddr};
 
-use common::server::recover;
-use common::{
-    client::runtime::sockets,
-    server,
-    support::{self, Entry},
-};
-use dope::core::driver::{
-    life::recovery::Policy,
-    route::{FrameworkTag, Tag, kind},
-    settings::claim::Needs,
-};
-use dope_test::{harness::server::Pair, reclaim};
-use dope_tls::tls::endpoint;
-use sark_fiber::Config;
-use support::{Mode, Routes};
+use common::{client::runtime::sockets, server::Plan, support};
 
 fn check_plain(bind: SocketAddr) -> Result<(), sockets::Error> {
     let mut client = sockets::Plain::connect(bind)?;
-    client.request("/hello", bind)?;
-    let response = client.response()?;
-    let reply = sockets::Response::try_parse(&response)?;
-    assert_eq!((reply.status, reply.body), (200, b"hello".as_slice()));
-    client.request("/hello", bind)?;
-    let response = client.response()?;
-    let reply = sockets::Response::try_parse(&response)?;
-    assert_eq!((reply.status, reply.body), (200, b"hello".as_slice()));
+    for _ in 0..2 {
+        client.request("/hello", bind)?;
+        let response = client.response()?;
+        let reply = sockets::Response::try_parse(&response)?;
+        assert_eq!((reply.status, reply.body), (200, b"hello".as_slice()));
+    }
     Ok(())
 }
 
@@ -77,226 +56,11 @@ fn check_tls(bind: SocketAddr) -> Result<(), sockets::Error> {
     Ok(())
 }
 
-fn keepalive(mode: Mode, entry: Entry) {
-    let harness = (Pair::bind()).expect("bind ephemeral loopback harness");
-    let bind = harness.addr();
-    match mode {
-        Mode::Plain => {
-            let server = server::Plan::new(bind, Duration::from_secs(10)).build();
-            let result = match entry {
-                Entry::Configured => harness.run_unbound(
-                    move |context| {
-                        let config = Config::new(server::MAX_CONNECTIONS);
-                        let mut reports = reclaim::Reports::new(
-                            Needs::from_tree(&server)
-                                .and_then(|needs| needs.resolve::<sark_fiber::Throughput>())
-                                .expect("runtime resource claims"),
-                            [<FrameworkTag<kind::Any> as Tag>::ROUTE],
-                        );
-                        let errors = Cell::new(Vec::new());
-                        let result = Routes::serve(
-                            server,
-                            context,
-                            server::State(&errors),
-                            config,
-                            Policy::new(|event| reports.push(event), recover),
-                            |outcome| {
-                                outcome
-                                    .as_ref()
-                                    .map(|_| ())
-                                    .map_err(|error| error.cause())
-                                    .expect("server execution");
-                            },
-                        );
-                        assert!(result.is_ok(), "configured HTTP server shutdown");
-                        drop(result);
-                        let errors = errors.into_inner();
-                        assert!(errors.is_empty(), "TLS failures: {errors:?}");
-                        assert!(
-                            reports.events().expect("reclaimed resources").is_empty(),
-                            "unexpected reports server operations: {reports:?}"
-                        );
-                        Ok::<(), convert::Infallible>(())
-                    },
-                    check_plain,
-                ),
-                Entry::Bound => harness.run(
-                    move |context, listener| {
-                        let config = Config::new(server::MAX_CONNECTIONS);
-                        let mut reports = reclaim::Reports::new(
-                            Needs::from_tree(&server)
-                                .and_then(|needs| needs.resolve::<sark_fiber::Throughput>())
-                                .expect("runtime resource claims"),
-                            [<FrameworkTag<kind::Any> as Tag>::ROUTE],
-                        );
-                        let errors = Cell::new(Vec::new());
-                        let result = Routes::serve(
-                            server.with_bound(listener),
-                            context,
-                            server::State(&errors),
-                            config,
-                            Policy::new(|event| reports.push(event), recover),
-                            |outcome| {
-                                outcome
-                                    .as_ref()
-                                    .map(|_| ())
-                                    .map_err(|error| error.cause())
-                                    .expect("server execution");
-                            },
-                        );
-                        assert!(result.is_ok(), "bound HTTP server shutdown");
-                        drop(result);
-                        let errors = errors.into_inner();
-                        assert!(errors.is_empty(), "TLS failures: {errors:?}");
-                        assert!(
-                            reports.events().expect("reclaimed resources").is_empty(),
-                            "unexpected reports server operations: {reports:?}"
-                        );
-                        Ok::<(), convert::Infallible>(())
-                    },
-                    check_plain,
-                ),
-            };
-            assert!(
-                matches!(
-                    result.map(|result| result.expect("plain keepalive")),
-                    Ok(())
-                ),
-                "plain keepalive"
-            );
-        }
-        Mode::Tls => {
-            let server = server::Plan::new(bind, Duration::from_secs(10)).build();
-            let result = match entry {
-                Entry::Configured => harness.run_unbound(
-                    move |context| {
-                        let wire = endpoint::Config::from(
-                            support::tls().server().expect("TLS server config"),
-                        );
-                        let config = Config::new(server::MAX_CONNECTIONS);
-                        let mut reports = reclaim::Reports::new(
-                            Needs::from_tree(&server)
-                                .and_then(|needs| needs.resolve::<sark_fiber::Throughput>())
-                                .expect("runtime resource claims"),
-                            [<FrameworkTag<kind::Any> as Tag>::ROUTE],
-                        );
-                        let errors = Cell::new(Vec::new());
-                        let result = Routes::serve_with(
-                            server,
-                            wire,
-                            context,
-                            server::State(&errors),
-                            config,
-                            Policy::new(|event| reports.push(event), recover),
-                            |outcome| {
-                                outcome
-                                    .as_ref()
-                                    .map(|_| ())
-                                    .map_err(|error| error.cause())
-                                    .expect("server execution");
-                            },
-                        );
-                        assert!(result.is_ok(), "configured TLS server shutdown");
-                        drop(result);
-                        let errors = errors.into_inner();
-                        assert!(errors.is_empty(), "TLS failures: {errors:?}");
-                        assert!(
-                            reports.events().expect("reclaimed resources").is_empty(),
-                            "unexpected reports server operations: {reports:?}"
-                        );
-                        Ok::<(), convert::Infallible>(())
-                    },
-                    check_tls,
-                ),
-                Entry::Bound => harness.run(
-                    move |context, listener| {
-                        let wire = endpoint::Config::from(
-                            support::tls().server().expect("TLS server config"),
-                        );
-                        let config = Config::new(server::MAX_CONNECTIONS);
-                        let mut reports = reclaim::Reports::new(
-                            Needs::from_tree(&server)
-                                .and_then(|needs| needs.resolve::<sark_fiber::Throughput>())
-                                .expect("runtime resource claims"),
-                            [<FrameworkTag<kind::Any> as Tag>::ROUTE],
-                        );
-                        let errors = Cell::new(Vec::new());
-                        let result = Routes::serve_with(
-                            server.with_bound(listener),
-                            wire,
-                            context,
-                            server::State(&errors),
-                            config,
-                            Policy::new(|event| reports.push(event), recover),
-                            |outcome| {
-                                outcome
-                                    .as_ref()
-                                    .map(|_| ())
-                                    .map_err(|error| error.cause())
-                                    .expect("server execution");
-                            },
-                        );
-                        assert!(result.is_ok(), "bound TLS server shutdown");
-                        drop(result);
-                        let errors = errors.into_inner();
-                        assert!(errors.is_empty(), "TLS failures: {errors:?}");
-                        assert!(
-                            reports.events().expect("reclaimed resources").is_empty(),
-                            "unexpected reports server operations: {reports:?}"
-                        );
-                        Ok::<(), convert::Infallible>(())
-                    },
-                    check_tls,
-                ),
-            };
-            assert!(
-                matches!(result.map(|result| result.expect("TLS keepalive")), Ok(())),
-                "TLS keepalive"
-            );
-        }
-    }
-}
-
 #[test]
 fn https_streams_large_body() {
-    let harness = (Pair::bind()).expect("bind ephemeral loopback harness");
-    let bind = harness.addr();
-    let server = server::Plan::new(bind, Duration::from_secs(10)).build();
-    let result = harness.run(
-        move |context, listener| {
-            let wire = endpoint::Config::from(support::tls().server().expect("TLS server config"));
-            let mut reports = reclaim::Reports::new(
-                Needs::from_tree(&server)
-                    .and_then(|needs| needs.resolve::<sark_fiber::Throughput>())
-                    .expect("runtime resource claims"),
-                [<FrameworkTag<kind::Any> as Tag>::ROUTE],
-            );
-            let errors = Cell::new(Vec::new());
-            let result = Routes::serve_with(
-                server.with_bound(listener),
-                wire,
-                context,
-                server::State(&errors),
-                Config::new(server::MAX_CONNECTIONS),
-                Policy::new(|event| reports.push(event), recover),
-                |outcome| {
-                    outcome
-                        .as_ref()
-                        .map(|_| ())
-                        .map_err(|error| error.cause())
-                        .expect("server execution");
-                },
-            );
-            assert!(result.is_ok(), "TLS streaming server shutdown");
-            drop(result);
-            let errors = errors.into_inner();
-            assert!(errors.is_empty(), "TLS failures: {errors:?}");
-            assert!(
-                reports.events().expect("reclaimed resources").is_empty(),
-                "unexpected reports server operations: {reports:?}"
-            );
-            Ok::<(), convert::Infallible>(())
-        },
+    let (pair, plan) = Plan::isolated();
+    pair.run(
+        move |ready, listener| support::serve::<true>(plan.with_bound(listener), ready),
         |bind| {
             let mut client = sockets::Tls::connect(
                 bind,
@@ -312,21 +76,39 @@ fn https_streams_large_body() {
             drop(client);
             Ok::<_, sockets::Error>(())
         },
-    );
-    assert!(
-        matches!(
-            result.map(|result| result.expect("TLS large response")),
-            Ok(())
-        ),
-        "TLS large response"
-    );
+    )
+    .expect("TLS streaming server")
+    .expect("TLS large response");
 }
 
 #[test]
 fn modes_reuse_connections() {
-    for mode in [Mode::Plain, Mode::Tls] {
-        for entry in [Entry::Configured, Entry::Bound] {
-            keepalive(mode, entry);
-        }
-    }
+    let (pair, plan) = Plan::isolated();
+    pair.run_unbound(
+        move |ready| support::serve::<false>(plan, ready),
+        check_plain,
+    )
+    .expect("configured HTTP server")
+    .expect("plain keepalive");
+
+    let (pair, plan) = Plan::isolated();
+    pair.run(
+        move |ready, listener| support::serve::<false>(plan.with_bound(listener), ready),
+        check_plain,
+    )
+    .expect("bound HTTP server")
+    .expect("plain keepalive");
+
+    let (pair, plan) = Plan::isolated();
+    pair.run_unbound(move |ready| support::serve::<true>(plan, ready), check_tls)
+        .expect("configured TLS server")
+        .expect("TLS keepalive");
+
+    let (pair, plan) = Plan::isolated();
+    pair.run(
+        move |ready, listener| support::serve::<true>(plan.with_bound(listener), ready),
+        check_tls,
+    )
+    .expect("bound TLS server")
+    .expect("TLS keepalive");
 }

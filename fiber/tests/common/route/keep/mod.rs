@@ -1,23 +1,20 @@
-use std::{convert::Infallible, time::Duration};
+use std::{cell::Cell, time::Duration};
 
 use dope::{
     core::{
         BranchError,
-        driver::{life::recovery, route::KeyTag, settings::errors::Claim},
+        driver::{route::KeyTag, settings::errors::Claim},
         io::socket::Listener,
     },
-    manifold::{self, network::listener::conn},
-    runtime::{
-        executor,
-        topology::{self, error},
-    },
+    manifold::network::listener::conn,
+    runtime::{executor::session, shutdown::ReadySource, topology},
 };
 use sark_core::life;
 use sark_fiber::{
     Config,
     dope::net::{wire, wire::domain},
 };
-use sark_h1::server::{listener::bind, run, run::prepare};
+use sark_h1::server::run::prepare;
 use sark_http::payload::{fixed, response::status};
 
 use crate::common::{route::body::OwnedReply, server};
@@ -77,81 +74,70 @@ sark_fiber::define_route! {
     }
 }
 
-pub struct Server<O> {
-    plan: run::Plan<
-        KeyTag<{ server::HTTP_LISTENER_ID }>,
-        KeyTag<{ server::DATE_UPDATER_ID }>,
-        sark_fiber::Throughput,
-    >,
-    observer: O,
+pub fn try_record(
+    plan: server::Http1Plan,
+    context: ReadySource<'_>,
+    listener: Listener,
+    events: &mut Vec<&'static str>,
+) -> Result<(), BranchError<prepare::Error, Claim>> {
+    let audits = Cell::new(None);
+    try_run(
+        plan,
+        context,
+        listener,
+        events::Log(Cell::from_mut(events), &audits, events::diagnose),
+        &audits,
+    )
 }
 
-impl<O> Server<O> {
-    pub const fn new(
-        plan: run::Plan<
-            KeyTag<{ server::HTTP_LISTENER_ID }>,
-            KeyTag<{ server::DATE_UPDATER_ID }>,
-            sark_fiber::Throughput,
-        >,
-        observer: O,
-    ) -> Self {
-        Self { plan, observer }
-    }
-    pub fn try_run<C, R>(
-        self,
-        context: C,
-        listener: Listener,
-        policy: impl recovery::Observe,
-        finish: impl for<'a> FnOnce(
-            Result<(), error::Run<'a, Infallible, manifold::BuildError<bind::Error>>>,
-        ) -> R,
-    ) -> Result<R, BranchError<prepare::Error, Claim>>
-    where
-        C: executor::Build,
-        for<'d> O: life::Observer<conn::Id<'d, KeyTag<{ server::HTTP_LISTENER_ID }>>, u64>,
-    {
-        use executor::session;
-
-        let prepared = self.plan.with_bound(listener).prepare(())?;
-        let observer = self.observer;
-        let mut report = session::Completion::new();
-        let complete = &mut report;
-        let result = prepared.enter_with(
-            context,
-            move |scope| {
-                scope.lend(|plan, stage| {
-                    let app = KeepAliveDispatch::with_observer(
-                        &(),
-                        Config::new(server::MAX_CONNECTIONS),
-                        observer,
-                    );
-                    plan.install(
-                        stage,
-                        domain::Local::new(wire::Identity),
-                        app,
-                        |root, _wait, stage| {
-                            let result = stage
-                                .run_quiesce(complete, root, Duration::from_secs(2))
-                                .map_err(topology::Failure::Run)?;
-                            result.map_err(|error| {
-                                topology::Failure::Run(session::Error::Drive(error))
-                            })
-                        },
-                    )
-                    .map_err(topology::Failure::Install)?
-                })
-            },
-            policy,
-            |result| {
-                let result = match result {
-                    Ok(result) => result.map_err(topology::RunError::Failure),
-                    Err(error) => Err(topology::RunError::from(error)),
-                };
-                finish(result.as_ref().copied().map_err(topology::RunError::cause))
-            },
-        );
-        Ok(result)
-    }
+pub fn try_run(
+    plan: server::Http1Plan,
+    context: ReadySource<'_>,
+    listener: Listener,
+    observer: impl for<'d> life::Observer<conn::Id<'d, KeyTag<{ server::HTTP_LISTENER_ID }>>, u64>,
+    audits: &Cell<Option<life::audit::Snapshot>>,
+) -> Result<(), BranchError<prepare::Error, Claim>> {
+    let mut reports = server::Plan::try_reports(&plan).map_err(BranchError::Second)?;
+    let prepared = plan.with_bound(listener).prepare(())?;
+    let mut complete = session::Completion::new();
+    prepared.enter_with(
+        context,
+        |scope| {
+            scope.lend(|plan, stage| {
+                let app = KeepAliveDispatch::with_observer(
+                    &(),
+                    Config::new(server::MAX_CONNECTIONS),
+                    observer,
+                );
+                plan.install(
+                    stage,
+                    domain::Local::new(wire::Identity),
+                    app,
+                    |root, _wait, stage| {
+                        let result = stage
+                            .run_quiesce(&mut complete, root, Duration::from_secs(2))
+                            .map_err(topology::Failure::Run)?;
+                        result.map_err(|error| topology::Failure::Run(session::Error::Drive(error)))
+                    },
+                )
+                .map_err(topology::Failure::Install)?
+            })
+        },
+        server::reporting(&mut reports),
+        |result| {
+            let result = match result {
+                Ok(result) => result.map_err(topology::RunError::Failure),
+                Err(error) => Err(topology::RunError::from(error)),
+            };
+            result
+                .as_ref()
+                .map_err(topology::RunError::cause)
+                .expect("observed server");
+        },
+    );
+    assert_eq!(audits.get(), None);
+    server::reclaimed(&reports);
+    Ok(())
 }
 
 pub mod events;

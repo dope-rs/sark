@@ -2,19 +2,20 @@ pub mod common;
 
 use std::{
     cell::Cell,
-    convert,
     io::{Read, Write},
     net::{Shutdown, TcpStream},
     thread,
     time::{Duration, Instant},
 };
 
-use common::server::recover;
 use common::{
     retained::State,
     route::{
         chunked::{apps::ChunkedDispatch, peer::Peer},
-        glue::{hello::HelloDispatch, timer::Chain},
+        glue::{
+            hello::{self, HelloDispatch},
+            timer::Chain,
+        },
     },
     server::{self, Plan, peer::Receive as _},
 };
@@ -22,7 +23,6 @@ use dope::{
     core::{
         self, BranchError,
         driver::{
-            life::recovery::Policy,
             route::{FrameworkTag, Tag, kind},
             settings::errors::Claim,
             storage::With,
@@ -43,33 +43,22 @@ use sark_h1::server::{date, run::prepare::Error};
 
 #[test]
 fn waits_after_eof() {
-    let harness = Pair::bind().expect("bind isolated listener");
-    let bind = harness.addr();
-    let server = server::Plan::new(bind, Duration::from_secs(10)).build();
+    let (harness, server) = Plan::isolated();
 
     harness
-        .check(
+        .run(
             |context, listener| {
-                let mut reports = Plan::try_reports(&server).expect("server descriptor claims");
+                let mut reports = Plan::try_reports(&server).map_err(BranchError::Second)?;
                 let failures = Cell::new(Vec::new());
                 let result = Chain::serve(
                     server.with_bound(listener),
                     context,
                     State(&failures),
                     sark_fiber::Config::new(server::MAX_CONNECTIONS),
-                    Policy::new(|event| reports.push(event), recover),
-                    |result| {
-                        result
-                            .as_ref()
-                            .map(|_| ())
-                            .map_err(|error| error.cause())
-                            .expect("server")
-                    },
+                    server::reporting(&mut reports),
+                    |result| server::completed(&result),
                 );
-                assert!(
-                    reports.events().expect("reclaimed resources").is_empty(),
-                    "server retirement: {reports:?}"
-                );
+                server::reclaimed(&reports);
                 let failures = failures.into_inner();
                 assert!(failures.is_empty(), "timer: {failures:?}");
                 result
@@ -96,15 +85,8 @@ fn waits_after_eof() {
                 assert!(response.contains("200 OK"), "response: {response}");
                 assert!(response.ends_with("two slept"), "response: {response}");
             },
-            |result| {
-                assert!(
-                    result.is_ok(),
-                    "waits_after_eof server shutdown: {:?}",
-                    result.err()
-                );
-            },
         )
-        .expect("harness");
+        .expect("waits_after_eof server shutdown");
 }
 
 const HEAD_TIMEOUT: Duration = Duration::from_millis(500);
@@ -113,19 +95,19 @@ const HEAD_TIMEOUT: Duration = Duration::from_millis(500);
 fn input_deadline_spans_body() {
     let pair = Pair::bind().expect("body deadline listener");
     let plan = Plan::new(pair.addr(), HEAD_TIMEOUT).build();
-    pair.check(
+    pair.run(
         |context, listener| {
-            let mut reports = Plan::try_reports(&plan).expect("claims");
+            let mut reports = Plan::try_reports(&plan).map_err(BranchError::Second)?;
             let failures = Cell::new(Vec::new());
             let result = ChunkedDispatch::serve(
                 plan.with_bound(listener),
                 context,
                 State(&failures),
                 sark_fiber::Config::new(server::MAX_CONNECTIONS),
-                Policy::new(|event| reports.push(event), recover),
-                |result| assert!(result.is_ok(), "body deadline server"),
+                server::reporting(&mut reports),
+                |result| server::completed(&result),
             );
-            assert!(reports.events().expect("retired resources").is_empty());
+            server::reclaimed(&reports);
             assert!(failures.into_inner().is_empty());
             result
         },
@@ -219,7 +201,6 @@ fn input_deadline_spans_body() {
                 );
             }
         },
-        |result| assert!(result.is_ok(), "body deadline setup"),
     )
     .expect("body deadline runtime");
 }
@@ -229,29 +210,9 @@ fn stalled_head_times_out() {
     let harness = Pair::bind().expect("reserve test address");
     let bind = harness.addr();
     harness
-        .check(
+        .run(
             |context, listener| {
-                let server = server::Plan::new(bind, HEAD_TIMEOUT).build();
-                {
-                    let mut reports = Plan::try_reports(&server).expect("runtime resource claims");
-                    let result = HelloDispatch::serve(
-                        server.with_bound(listener),
-                        context,
-                        (),
-                        sark_fiber::Config::new(server::MAX_CONNECTIONS),
-                        Policy::new(|report| reports.push(report), recover),
-                        |outcome| {
-                            assert!(outcome.is_ok(), "server execution");
-                        },
-                    );
-                    assert!(result.is_ok(), "slowloris server must shut down cleanly");
-                    drop(result);
-                    assert!(
-                        reports.events().expect("reclaimed resources").is_empty(),
-                        "unexpected reclaimed server operations: {reports:?}"
-                    );
-                    Ok::<(), convert::Infallible>(())
-                }
+                hello::try_serve(Plan::new(bind, HEAD_TIMEOUT).build(), context, listener)
             },
             |bind| {
                 let mut sock = TcpStream::connect(bind).expect("connect");
@@ -275,13 +236,8 @@ fn stalled_head_times_out() {
                     "expected close or 408, got: {text:?}"
                 );
             },
-            |result| {
-                (result)
-                    .as_ref()
-                    .expect("stalled_head_times_out server shutdown");
-            },
         )
-        .expect("harness");
+        .expect("stalled_head_times_out server shutdown");
 }
 
 #[test]
@@ -289,29 +245,9 @@ fn fast_request_completes() {
     let harness = Pair::bind().expect("reserve test address");
     let bind = harness.addr();
     harness
-        .check(
+        .run(
             |context, listener| {
-                let server = server::Plan::new(bind, HEAD_TIMEOUT).build();
-                {
-                    let mut reports = Plan::try_reports(&server).expect("runtime resource claims");
-                    let result = HelloDispatch::serve(
-                        server.with_bound(listener),
-                        context,
-                        (),
-                        sark_fiber::Config::new(server::MAX_CONNECTIONS),
-                        Policy::new(|report| reports.push(report), recover),
-                        |outcome| {
-                            assert!(outcome.is_ok(), "server execution");
-                        },
-                    );
-                    assert!(result.is_ok(), "slowloris server must shut down cleanly");
-                    drop(result);
-                    assert!(
-                        reports.events().expect("reclaimed resources").is_empty(),
-                        "unexpected reclaimed server operations: {reports:?}"
-                    );
-                    Ok::<(), convert::Infallible>(())
-                }
+                hello::try_serve(Plan::new(bind, HEAD_TIMEOUT).build(), context, listener)
             },
             |bind| {
                 let mut sock = TcpStream::connect(bind).expect("connect");
@@ -328,13 +264,8 @@ fn fast_request_completes() {
                     .expect("blank line separating headers from body");
                 assert_eq!(body, "hello", "body mismatch: {text:?}");
             },
-            |result| {
-                (result)
-                    .as_ref()
-                    .expect("fast_request_completes server shutdown");
-            },
         )
-        .expect("harness");
+        .expect("fast_request_completes server shutdown");
 }
 
 #[test]
@@ -342,29 +273,9 @@ fn slow_progress_completes() {
     let harness = Pair::bind().expect("reserve test address");
     let bind = harness.addr();
     harness
-        .check(
+        .run(
             |context, listener| {
-                let server = server::Plan::new(bind, HEAD_TIMEOUT).build();
-                {
-                    let mut reports = Plan::try_reports(&server).expect("runtime resource claims");
-                    let result = HelloDispatch::serve(
-                        server.with_bound(listener),
-                        context,
-                        (),
-                        sark_fiber::Config::new(server::MAX_CONNECTIONS),
-                        Policy::new(|report| reports.push(report), recover),
-                        |outcome| {
-                            assert!(outcome.is_ok(), "server execution");
-                        },
-                    );
-                    assert!(result.is_ok(), "slowloris server must shut down cleanly");
-                    drop(result);
-                    assert!(
-                        reports.events().expect("reclaimed resources").is_empty(),
-                        "unexpected reclaimed server operations: {reports:?}"
-                    );
-                    Ok::<(), convert::Infallible>(())
-                }
+                hello::try_serve(Plan::new(bind, HEAD_TIMEOUT).build(), context, listener)
             },
             |bind| {
                 let mut sock = TcpStream::connect(bind).expect("connect");
@@ -386,13 +297,8 @@ fn slow_progress_completes() {
                 );
                 assert!(text.ends_with("hello"), "body: {text:?}");
             },
-            |result| {
-                (result)
-                    .as_ref()
-                    .expect("slow_progress_completes server shutdown");
-            },
         )
-        .expect("harness");
+        .expect("slow_progress_completes server shutdown");
 }
 
 #[test]
@@ -402,7 +308,7 @@ fn timer_floor_covers_all() {
     let harness = Pair::bind().expect("reserve test address");
     let bind = harness.addr();
     harness
-        .check(
+        .run(
             |context, listener| {
                 let server = server::Plan::new(bind, HEAD_TIMEOUT).build();
                 let baseline = Config::for_profile::<Throughput>();
@@ -447,7 +353,7 @@ fn timer_floor_covers_all() {
                                 .map_err(topology::Failure::Install)?
                             })
                         },
-                        Policy::new(|report| reports.push(report), recover),
+                        server::reporting(&mut reports),
                         |result| {
                             let result = result.map_err(topology::RunError::from);
                             result
@@ -459,10 +365,7 @@ fn timer_floor_covers_all() {
                                 .expect("worker");
                         },
                     );
-                    assert!(
-                        reports.events().expect("reclaimed resources").is_empty(),
-                        "unexpected reclaimed server operations: {reports:?}"
-                    );
+                    server::reclaimed(&reports);
                     Ok::<_, BranchError<Error, Claim>>(())
                 }
             },
@@ -502,9 +405,6 @@ fn timer_floor_covers_all() {
                     );
                 }
             },
-            |result| {
-                result.as_ref().expect("server shutdown");
-            },
         )
-        .expect("harness");
+        .expect("timer_floor_covers_all server shutdown");
 }

@@ -1,9 +1,9 @@
-use std::{net, time};
+use std::{convert::Infallible, fmt, net, time};
 
 use dope::{
     core::{
         driver::{
-            life::recovery::Recovery,
+            life::recovery::{self, Recovery},
             route::{FrameworkTag, Identity, KeyTag, Tag, kind, table::conn},
             settings::{self, claim::Needs, errors},
         },
@@ -15,11 +15,34 @@ use dope::{
     manifold::network::listener::config,
     net::tcp,
 };
-use dope_test::{harness::observe::VecCellExt as _, reclaim::Reports};
+use dope_test::{
+    harness::{observe::VecCellExt as _, server::Pair},
+    reclaim::Reports,
+};
 use sark_h1::server::{listener, run};
 
-pub fn recover(failure: Recovery<'_, '_>) -> std::convert::Infallible {
+pub fn recover(failure: Recovery<'_, '_>) -> Infallible {
     failure.abort()
+}
+
+pub fn reporting(reports: &mut Reports<1>) -> impl recovery::Observe + '_ {
+    recovery::Policy::new(move |event| reports.push(event), recover)
+}
+
+pub fn completed<I: fmt::Debug, O, T, Q>(
+    result: &Result<T, run::RunError<'_, Infallible, I, O, T, Q>>,
+) {
+    result
+        .as_ref()
+        .map_err(run::RunError::cause)
+        .expect("server");
+}
+
+pub fn reclaimed(reports: &Reports<1>) {
+    assert!(
+        reports.events().expect("reclaimed resources").is_empty(),
+        "server retirement: {reports:?}"
+    );
 }
 
 /// Maximum connection count shared by deterministic server scenarios.
@@ -31,6 +54,9 @@ pub const HTTP_LISTENER_ID: u8 = 0;
 /// Date-updater identifier used by the HTTP test topology.
 pub const DATE_UPDATER_ID: u8 = 1;
 
+pub(super) type Http1Plan =
+    run::Plan<KeyTag<HTTP_LISTENER_ID>, KeyTag<DATE_UPDATER_ID>, sark_fiber::Throughput>;
+
 /// Canonical deterministic Sark server topology.
 pub struct Plan {
     bind: net::SocketAddr,
@@ -39,6 +65,12 @@ pub struct Plan {
 }
 
 impl Plan {
+    pub fn isolated() -> (Pair, Http1Plan) {
+        let pair = Pair::bind().expect("bind isolated listener");
+        let plan = Self::new(pair.addr(), time::Duration::from_secs(10)).build();
+        (pair, plan)
+    }
+
     /// Observes retirement against this server's resolved descriptor allocation.
     pub fn try_reports(plan: &impl settings::Resource) -> Result<Reports<1>, errors::Claim> {
         Ok(Reports::new(
@@ -62,9 +94,7 @@ impl Plan {
     }
 
     /// Materializes wire-independent HTTP/1 listener settings.
-    pub fn build(
-        self,
-    ) -> run::Plan<KeyTag<HTTP_LISTENER_ID>, KeyTag<DATE_UPDATER_ID>, sark_fiber::Throughput> {
+    pub fn build(self) -> Http1Plan {
         self.build_for()
     }
 

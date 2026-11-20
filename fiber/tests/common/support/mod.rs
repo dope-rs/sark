@@ -1,3 +1,11 @@
+use std::cell::Cell;
+
+use dope::{
+    core::{BranchError, driver::settings::errors},
+    runtime::shutdown::ReadySource,
+};
+use dope_tls::tls::endpoint;
+use sark_h1::server::run::prepare;
 use sark_http::payload::response::status;
 
 use crate::common::{client::tls::Keys, server};
@@ -47,10 +55,29 @@ pub fn tls() -> Keys {
     Keys::new(&SEED)
 }
 
-#[derive(Clone, Copy)]
-pub enum Entry {
-    Configured,
-    Bound,
+pub fn serve<const TLS: bool>(
+    plan: server::Http1Plan,
+    ready: ReadySource<'_>,
+) -> Result<(), BranchError<prepare::Error, errors::Claim>> {
+    let mut reports = server::Plan::try_reports(&plan).map_err(BranchError::Second)?;
+    let failures = Cell::new(Vec::new());
+    let state = server::State(&failures);
+    let config = sark_fiber::Config::new(server::MAX_CONNECTIONS);
+    let report = server::reporting(&mut reports);
+    if TLS {
+        let wire = endpoint::Config::from(tls().server().expect("TLS server config"));
+        Routes::serve_with(plan, wire, ready, state, config, report, |outcome| {
+            server::completed(&outcome)
+        })?;
+    } else {
+        Routes::serve(plan, ready, state, config, report, |outcome| {
+            server::completed(&outcome)
+        })?;
+    }
+    let failures = failures.into_inner();
+    assert!(failures.is_empty(), "TLS failures: {failures:?}");
+    server::reclaimed(&reports);
+    Ok(())
 }
 
 pub mod resource;

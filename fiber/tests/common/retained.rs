@@ -1,13 +1,21 @@
-use std::{cell::Cell, time::Duration};
+use std::{cell::Cell, net::SocketAddr, time::Duration};
 
-use crate::common::route::body::OwnedReply as Reply;
-use dope::core::driver::schedule::clock::timer::Timer;
+use crate::common::{route::body::OwnedReply as Reply, server};
+use dope::{
+    core::{
+        BranchError,
+        driver::{schedule::clock::timer::Timer, settings::errors::Claim},
+        io::socket::Listener,
+    },
+    runtime::shutdown,
+};
 use dope_fiber::{
     abi::Fiber,
     task::time::sleep::{self, TimerExt as _},
 };
-use dope_test::harness::observe::VecCellExt as _;
+use dope_test::harness::{observe::VecCellExt as _, peer};
 use o3::buffer::{segments, storage};
+use sark_h1::server::run::prepare;
 use sark_http::{payload::response::status, request};
 
 #[derive(Debug)]
@@ -35,6 +43,35 @@ pub enum Failure {
 }
 
 pub struct State<'a>(pub &'a Cell<Vec<Failure>>);
+
+pub fn serve(
+    plan: server::Http1Plan,
+    context: shutdown::ReadySource<'_>,
+    listener: Listener,
+    tasks: usize,
+) -> Result<(), BranchError<prepare::Error, Claim>> {
+    let mut reports = server::Plan::try_reports(&plan).map_err(BranchError::Second)?;
+    let failures = Cell::new(Vec::new());
+    let result = EchoDispatch::serve(
+        plan.with_bound(listener),
+        context,
+        State(&failures),
+        sark_fiber::Config::new(tasks),
+        server::reporting(&mut reports),
+        |result| server::completed(&result),
+    );
+    server::reclaimed(&reports);
+    let failures = failures.into_inner();
+    assert!(failures.is_empty(), "retention: {failures:?}");
+    result
+}
+
+pub fn try_connect(bind: SocketAddr) -> Result<peer::Stream<'static>, peer::Error> {
+    let socket = peer::Peer::at(bind).try_connect()?;
+    socket.read_wait(Some(Duration::from_secs(3)))?;
+    socket.set_nodelay(true)?;
+    Ok(socket)
+}
 
 impl State<'_> {
     pub fn delay<'d>(&self, timer: Timer<'d>, duration: Duration) -> impl Fiber<'d, Output = ()> {
@@ -220,7 +257,7 @@ impl<'a> Echo<'a> {
         Self { id, marker, body }
     }
 
-    pub fn wire(self) -> Vec<u8> {
+    pub fn wire(&self) -> Vec<u8> {
         let Self { id, marker, body } = self;
         format!(
             "POST /echo/{id} HTTP/1.1\r\nHost: x\r\nx-echo-marker: {marker}\r\nContent-Length: {}\r\n\r\n{body}",
@@ -228,7 +265,7 @@ impl<'a> Echo<'a> {
         ).into_bytes()
     }
 
-    pub fn expected(self) -> String {
+    pub fn expected(&self) -> String {
         let Self { id, marker, body } = self;
         format!("id={id} marker={marker} payload={body}")
     }

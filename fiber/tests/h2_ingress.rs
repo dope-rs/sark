@@ -7,7 +7,7 @@ use common::h2::{
     apps::{DUPLEX_LAYOUT, H2TaskApp, Layout as _},
     events::{Count, Log},
     facts::{Ingress, ROUTE, State},
-    peer::{Peer, Sender},
+    peer::{Peer, try_send},
     server::{CONFIG, Request, Server},
 };
 use dope::{
@@ -95,8 +95,7 @@ fn ingress_yields() {
                                                     Boundary::More,
                                                 )
                                                 .expect("flood request");
-                                            Sender::new(&mut flood)
-                                                .try_send(stream, b"flood", Boundary::End)
+                                            try_send(&mut flood, stream, b"flood", Boundary::End)
                                                 .expect("H2 peer send");
                                         }
                                         probe

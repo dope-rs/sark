@@ -1,12 +1,11 @@
 pub mod common;
 
-use std::{cell::Cell, fmt, io::Write as _, time::Duration};
+use std::{cell::Cell, fmt, io::Write as _};
 
-use common::h2::recover;
 use common::h2::{
     events::{Credit, CreditLog, Log},
     facts::{GuardProbe, State},
-    peer::{Peer, Sender},
+    peer::{Peer, try_send},
     server::{CONFIG, Request, Server},
 };
 
@@ -38,30 +37,17 @@ fn records_exchange_life() {
                         context,
                         listener,
                         Observed::new(Log(&log, diagnose)),
-                        recover,
-                        |result| result.expect("H2 execution"),
                     )
                     .map(|()| log.into_inner())
             },
             |address| {
-                let (mut socket, mut client) =
-                    Peer::try_connect(address, Duration::from_secs(3)).expect("H2 peer connection");
-                let stream = client
-                    .streams()
-                    .headers()
-                    .request(
-                        Request::new(b"/quick")
-                            .try_headers()
-                            .expect("valid request fields"),
-                        Boundary::End,
-                    )
+                let (mut socket, mut client) = Peer::connect(address);
+                let mut peer = Peer::new(&mut socket, &mut client);
+                let stream = Request::new(b"/quick")
+                    .try_start(peer.client, Boundary::End)
                     .expect("start observed H2 request");
-                Peer::new(&mut socket, &mut client)
-                    .try_flush()
-                    .expect("H2 peer flush");
-                let (_, body) = Peer::new(&mut socket, &mut client)
-                    .try_response(stream)
-                    .expect("H2 peer response");
+                peer.try_flush().expect("H2 peer flush");
+                let (_, body) = peer.try_response(stream).expect("H2 peer response");
                 assert_eq!(body, b"quick");
             },
             |result| {
@@ -173,30 +159,20 @@ fn close_pending_in_order() {
                             log: Log(&log, diagnose),
                             state: &observed,
                         }),
-                        recover,
-                        |result| result.expect("H2 execution"),
                     )
                     .map(|()| (log.into_inner(), observed.into_inner()))
             },
             |address| {
-                let (mut socket, mut client) =
-                    Peer::try_connect(address, Duration::from_secs(3)).expect("H2 peer connection");
+                let (mut socket, mut client) = Peer::connect(address);
+                let mut peer = Peer::new(&mut socket, &mut client);
                 for _ in 0..3 {
-                    let stream = client
-                        .streams()
-                        .headers()
-                        .request(
-                            Request::new(b"/segmented")
-                                .try_headers()
-                                .expect("valid request fields"),
-                            Boundary::More,
-                        )
+                    let stream = Request::new(b"/segmented")
+                        .try_start(peer.client, Boundary::More)
                         .expect("pending body");
-                    Sender::new(&mut client)
-                        .try_send(stream, b"first-", Boundary::More)
-                        .expect("H2 peer send");
+                    try_send(peer.client, stream, b"first-", Boundary::More).expect("H2 peer send");
                 }
-                let fence = client
+                let fence = peer
+                    .client
                     .streams()
                     .headers()
                     .request(
@@ -206,12 +182,8 @@ fn close_pending_in_order() {
                         Boundary::End,
                     )
                     .expect("fence stream");
-                Peer::new(&mut socket, &mut client)
-                    .try_flush()
-                    .expect("H2 peer flush");
-                let (_, reply) = Peer::new(&mut socket, &mut client)
-                    .try_response(fence)
-                    .expect("H2 peer response");
+                peer.try_flush().expect("H2 peer flush");
+                let (_, reply) = peer.try_response(fence).expect("H2 peer response");
                 assert_eq!(reply, b"quick");
             },
             |result| (facts, credit) = result.expect("H2 setup"),
@@ -286,8 +258,6 @@ fn reset_pending_owner() {
                             log: Log(&log, diagnose),
                             state: &observed,
                         }),
-                        recover,
-                        |result| result.expect("H2 execution"),
                     )
                     .map(|()| {
                         assert!(server.state.body.take().is_none(), "guard consumed owner");
@@ -295,8 +265,7 @@ fn reset_pending_owner() {
                     })
             },
             |address| {
-                let (mut socket, mut client) =
-                    Peer::try_connect(address, Duration::from_secs(3)).expect("H2 peer connection");
+                let (mut socket, mut client) = Peer::connect(address);
                 let stream = client
                     .streams()
                     .headers()
@@ -373,15 +342,14 @@ fn rejects_oversized_body() {
         .check(
             move |context, listener| {
                 let server = Server::new(config, 1, State::with_guard(GuardProbe::default()));
-                let result = server.try_run(context, listener, mode::Disabled, recover, |result| {
-                    result.expect("H2 execution")
-                });
+                let result = server.try_run(context, listener, mode::Disabled);
                 result.map(|()| server.state.guard_counts())
             },
             |address| {
-                let (mut socket, mut client) =
-                    Peer::try_connect(address, Duration::from_secs(3)).expect("H2 peer connection");
-                let stream = client
+                let (mut socket, mut client) = Peer::connect(address);
+                let mut peer = Peer::new(&mut socket, &mut client);
+                let stream = peer
+                    .client
                     .streams()
                     .headers()
                     .request(
@@ -391,14 +359,10 @@ fn rejects_oversized_body() {
                         Boundary::More,
                     )
                     .expect("start oversized guarded request");
-                Peer::new(&mut socket, &mut client)
-                    .try_flush()
-                    .expect("H2 peer flush");
+                peer.try_flush().expect("H2 peer flush");
 
                 assert_eq!(
-                    Peer::new(&mut socket, &mut client)
-                        .try_reset(stream)
-                        .expect("H2 peer reset"),
+                    peer.try_reset(stream).expect("H2 peer reset"),
                     ErrorCode::EnhanceYourCalm,
                 );
             },
@@ -418,15 +382,14 @@ fn rejects_finished_body() {
         .check(
             move |context, listener| {
                 let server = Server::new(config, 1, State::with_guard(GuardProbe::default()));
-                let result = server.try_run(context, listener, mode::Disabled, recover, |result| {
-                    result.expect("H2 execution")
-                });
+                let result = server.try_run(context, listener, mode::Disabled);
                 result.map(|()| server.state.guard_counts())
             },
             |address| {
-                let (mut socket, mut client) =
-                    Peer::try_connect(address, Duration::from_secs(3)).expect("H2 peer connection");
-                let stream = client
+                let (mut socket, mut client) = Peer::connect(address);
+                let mut peer = Peer::new(&mut socket, &mut client);
+                let stream = peer
+                    .client
                     .streams()
                     .headers()
                     .request(
@@ -436,14 +399,10 @@ fn rejects_finished_body() {
                         Boundary::End,
                     )
                     .expect("start finished guarded request");
-                Peer::new(&mut socket, &mut client)
-                    .try_flush()
-                    .expect("H2 peer flush");
+                peer.try_flush().expect("H2 peer flush");
 
                 assert_eq!(
-                    Peer::new(&mut socket, &mut client)
-                        .try_reset(stream)
-                        .expect("H2 peer reset"),
+                    peer.try_reset(stream).expect("H2 peer reset"),
                     ErrorCode::ProtocolError,
                 );
             },

@@ -8,8 +8,8 @@ use common::{
         apps::{DUPLEX_LAYOUT, H2TaskApp, LARGE_JSON, Layout as _},
         events::{Count, Log},
         facts::{GuardProbe, Identity, ROUTE, State},
-        peer::{Peer, Sender},
-        server::{CONFIG, Request, Server},
+        peer::{Peer, try_send},
+        server::{CONFIG, Request, Server, check},
     },
     route::keep::events::diagnose,
     server::Plan,
@@ -37,63 +37,29 @@ use sark_h2::server::task::timers;
 
 #[test]
 fn pre_fin_yields() {
-    let harness = Pair::bind().expect("H2 harness");
-    harness
-        .check(
-            move |context, listener| {
-                Server::new(CONFIG, 8, State::default()).try_run(
-                    context,
-                    listener,
-                    mode::Disabled,
-                    recover,
-                    |result| result.expect("H2 execution"),
-                )
-            },
-            |address| {
-                let (mut socket, mut client) =
-                    Peer::try_connect(address, Duration::from_secs(3)).expect("H2 peer connection");
-                let large = client
-                    .streams()
-                    .headers()
-                    .request(
-                        Request::new(b"/large")
-                            .try_headers()
-                            .expect("valid request fields"),
-                        Boundary::More,
-                    )
-                    .expect("start large H2 request");
-                Sender::new(&mut client)
-                    .try_send(large, LARGE_JSON, Boundary::End)
-                    .expect("H2 peer send");
-                let quick = client
-                    .streams()
-                    .headers()
-                    .request(
-                        Request::new(b"/quick")
-                            .try_headers()
-                            .expect("valid request fields"),
-                        Boundary::End,
-                    )
-                    .expect("start quick H2 request");
-                Peer::new(&mut socket, &mut client)
-                    .try_flush()
-                    .expect("H2 peer flush");
+    check(CONFIG, 8, |peer| {
+        let large = Request::new(b"/large")
+            .try_start(peer.client, Boundary::More)
+            .expect("start large H2 request");
+        try_send(peer.client, large, LARGE_JSON, Boundary::End).expect("H2 peer send");
+        let quick = Request::new(b"/quick")
+            .try_start(peer.client, Boundary::End)
+            .expect("start quick H2 request");
+        peer.try_flush().expect("H2 peer flush");
 
-                let (order, bodies) = Peer::new(&mut socket, &mut client)
-                    .try_statuses(&[large, quick], b"200")
-                    .expect("H2 peer statuses");
-                let bodies = <[Vec<u8>; 2]>::try_from(bodies).expect("two response bodies");
-                assert_eq!(bodies[0], b"large");
-                assert_eq!(bodies[1], b"quick");
-                assert_eq!(
-                    order.first(),
-                    Some(&1),
-                    "cooperative JSON work must not head-of-line block a later stream",
-                );
-            },
-            |result| result.expect("H2 setup"),
-        )
-        .expect("H2 fairness runtime");
+        let (order, bodies) = peer
+            .try_statuses(&[large, quick], b"200")
+            .expect("H2 peer statuses");
+        let bodies = <[Vec<u8>; 2]>::try_from(bodies).expect("two response bodies");
+        assert_eq!(bodies[0], b"large");
+        assert_eq!(bodies[1], b"quick");
+        assert_eq!(
+            order.first(),
+            Some(&1),
+            "cooperative JSON work must not head-of-line block a later stream",
+        );
+    })
+    .expect("H2 fairness runtime");
 }
 
 #[test]
@@ -108,29 +74,16 @@ fn completion_yields_build() {
                     context,
                     listener,
                     mode::Disabled,
-                    recover,
-                    |result| result.expect("H2 execution"),
                 )
             },
             |address| {
-                let (mut task_io, mut task) =
-                    Peer::try_connect(address, Duration::from_secs(3)).expect("H2 peer connection");
-                let (mut burst_io, mut peer) =
-                    Peer::try_connect(address, Duration::from_secs(3)).expect("H2 peer connection");
+                let (mut task_io, mut task) = Peer::connect(address);
+                let (mut burst_io, mut peer) = Peer::connect(address);
 
-                let build = task
-                    .streams()
-                    .headers()
-                    .request(
-                        Request::new(b"/large")
-                            .try_headers()
-                            .expect("valid request fields"),
-                        Boundary::More,
-                    )
+                let build = Request::new(b"/large")
+                    .try_start(&mut task, Boundary::More)
                     .expect("start cooperative H2 build");
-                Sender::new(&mut task)
-                    .try_send(build, LARGE_JSON, Boundary::End)
-                    .expect("H2 peer send");
+                try_send(&mut task, build, LARGE_JSON, Boundary::End).expect("H2 peer send");
                 Peer::new(&mut task_io, &mut task)
                     .try_flush()
                     .expect("H2 peer flush");
@@ -138,14 +91,8 @@ fn completion_yields_build() {
                 let mut burst = Vec::with_capacity(BURST);
                 for _ in 0..BURST {
                     burst.push(
-                        peer.streams()
-                            .headers()
-                            .request(
-                                Request::new(b"/quick")
-                                    .try_headers()
-                                    .expect("valid request fields"),
-                                Boundary::End,
-                            )
+                        Request::new(b"/quick")
+                            .try_start(&mut peer, Boundary::End)
                             .expect("start H2 completion burst member"),
                     );
                 }
@@ -195,7 +142,7 @@ fn close_cancels_once() {
                         );
                         plan.tasks((), 2)
                             .observe(Log(&facts, diagnose))
-                            .prepare_in(stage, wire, |prepared, _wait, stage| {
+                            .prepare_in::<wire::Identity, _, _, _, _, _, _>(stage, wire, |prepared, _wait, stage| {
                                 let router =
                                     H2TaskApp::multiplexed::<wire::Identity, KeyTag<ROUTE>, _>(
                                         brand,
@@ -212,9 +159,7 @@ fn close_cancels_once() {
                                         Host::new(listener),
                                         Duration::from_secs(3),
                                         |mut app| {
-                                            let (mut socket, mut client) =
-                                                Peer::try_connect(address, Duration::from_secs(3))
-                                                    .expect("H2 peer connection");
+                                            let (mut socket, mut client) = Peer::connect(address);
                                             let first = client
                                                 .streams()
                                                 .headers()
@@ -393,9 +338,7 @@ fn burst_wakes_siblings() {
                                     start,
                                     Duration::from_secs(3),
                                     |mut app| {
-                                        let (mut socket, mut client) =
-                                            Peer::try_connect(address, Duration::from_secs(3))
-                                                .expect("H2 peer connection");
+                                        let (mut socket, mut client) = Peer::connect(address);
                                         for _ in 0..TASKS {
                                             client
                                                 .streams()
@@ -639,12 +582,10 @@ fn renewals_precede_ready_tasks() {
                                         .expect("registered task timer")
                                         .into_output();
 
-                                        Sender::new(&mut client)
-                                            .try_send(guarded, b"discarded", Boundary::End)
+                                        try_send(&mut client, guarded, b"discarded", Boundary::End)
                                             .expect("guard input completion");
                                         for stream in streams {
-                                            Sender::new(&mut client)
-                                                .try_send(stream, b"first-", Boundary::More)
+                                            try_send(&mut client, stream, b"first-", Boundary::More)
                                                 .expect("timely body progress");
                                         }
                                         Peer::new(&mut socket, &mut client)
@@ -764,16 +705,15 @@ fn deferred_guard_resumes() {
                     ..Default::default()
                 });
                 server
-                    .try_run(context, listener, mode::Disabled, recover, |result| {
-                        result.expect("H2 execution")
-                    })
+                    .try_run(context, listener, mode::Disabled)
                     .map(|()| server.state.guard_counts())
             },
             |address| {
                 let (mut socket, mut client) =
                     Peer::try_connect(address, Duration::from_secs(3)).expect("H2 peer");
+                let mut peer = Peer::new(&mut socket, &mut client);
                 let streams = array::from_fn::<_, 4, _>(|_| {
-                    client
+                    peer.client
                         .streams()
                         .headers()
                         .request(
@@ -784,10 +724,8 @@ fn deferred_guard_resumes() {
                         )
                         .expect("guarded request")
                 });
-                Peer::new(&mut socket, &mut client)
-                    .try_flush()
-                    .expect("guarded request burst");
-                let (_, bodies) = Peer::new(&mut socket, &mut client)
+                peer.try_flush().expect("guarded request burst");
+                let (_, bodies) = peer
                     .try_statuses(&streams, b"401")
                     .expect("every deferred guard resumes after egress release");
                 assert!(bodies.iter().all(|body| body == b"guarded"));

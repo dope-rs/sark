@@ -2,43 +2,34 @@ pub mod common;
 
 use std::{cell::Cell, thread, time::Duration};
 
-use common::server::recover;
 use common::{
-    retained::{Echo, EchoDispatch, NESTED, Post, State, wire},
-    route::{body::retained, chunked::peer::Peer},
+    retained::{self, Echo, NESTED, Post, State, wire},
+    route::{body::retained::EchoDispatch, chunked::peer::Peer},
     server::{self, Plan},
 };
-use dope::core::driver::life::recovery::Policy;
-use dope_test::harness::{peer::Peer as TcpPeer, server::Pair};
 use sark_fiber::Config;
 
 #[test]
 fn pipeline_keeps_bytes() {
-    let harness = Pair::bind().expect("bind isolated listener");
-    let bind = harness.addr();
-    let server = server::Plan::new(bind, Duration::from_secs(10)).build();
+    let (harness, server) = Plan::isolated();
 
-    harness.check(
+    harness.run(
         |context, listener| {
-            let mut reports = Plan::try_reports(&server).expect("server descriptor claims");
+            let mut reports = Plan::try_reports(&server).map_err(dope::core::BranchError::Second)?;
             let failures = Cell::new(Vec::new());
-            let result = retained::EchoDispatch::serve(server.with_bound(listener), context,
+            let result = EchoDispatch::serve(server.with_bound(listener), context,
                 State(&failures),
                 Config::new(server::MAX_CONNECTIONS),
-                Policy::new(|event| reports.push(event), recover),
-                |result| result.as_ref().map(|_| ()).map_err(|error| error.cause()).expect("server runtime"),
+                server::reporting(&mut reports),
+                |result| server::completed(&result),
             );
-            assert!(reports.events().expect("reclaimed resources").is_empty(), "server retirement: {reports:?}");
+            server::reclaimed(&reports);
             let failures = failures.into_inner();
             assert!(failures.is_empty(), "retention: {failures:?}");
             result
         },
         |bind| {
-            let mut sock = TcpPeer::at(bind).try_connect().expect("connect");
-            sock.read_wait(Some(Duration::from_secs(3)))
-                .expect("test socket accepts a read timeout");
-            sock.set_nodelay(true)
-                .expect("test socket accepts TCP_NODELAY");
+            let mut sock = retained::try_connect(bind).expect("connect");
 
             let req1 = b"GET http://origin.example/users/USER-REQ1/teams/TEAM-REQ1?q=kept HTTP/1.1\r\nHost: ignored.example\r\nx-echo-marker: MARKER-REQ1-VALUE\r\n\r\n";
             let req2 = b"GET /users/USER-REQ2/teams/TEAM-REQ2 HTTP/1.1\r\nHost: yyyyyyyyyyyyyyyyyyyyyyyy\r\nx-echo-marker: ZZZZZZZZZZZZZZZZZZZZZZZZ\r\n\r\n";
@@ -64,213 +55,66 @@ fn pipeline_keeps_bytes() {
                 "team=TEAM-REQ2 user=USER-REQ2 marker=ZZZZZZZZZZZZZZZZZZZZZZZZ authority=yyyyyyyyyyyyyyyyyyyyyyyy"
             );
         },
-        |result| {
-            assert!(result.is_ok(), "owned request server shutdown: {:?}", result.err());
-        },
     ).expect("harness");
 }
 
 #[test]
-fn accum_retain() {
-    let harness = Pair::bind().expect("reserve listener address");
-    let bind = harness.addr();
-    harness
-        .check(
-            |context, listener| {
-                let server = server::Plan::new(bind, Duration::from_secs(10)).build();
-                let mut reports = Plan::try_reports(&server).expect("server descriptor claims");
-                let failures = Cell::new(Vec::new());
-                let result = EchoDispatch::serve(
-                    server.with_bound(listener),
-                    context,
-                    State(&failures),
-                    Config::new(server::MAX_CONNECTIONS),
-                    Policy::new(|event| reports.push(event), recover),
-                    |result| {
-                        result
-                            .as_ref()
-                            .map(|_| ())
-                            .map_err(|error| error.cause())
-                            .expect("server runtime")
-                    },
-                );
-                assert!(
-                    reports.events().expect("reclaimed resources").is_empty(),
-                    "server retirement: {reports:?}"
-                );
-                let failures = failures.into_inner();
-                assert!(failures.is_empty(), "retention: {failures:?}");
-                result
-            },
-            |bind| {
-                let mut sock = TcpPeer::at(bind).try_connect().expect("connect");
-                sock.read_wait(Some(Duration::from_secs(3)))
-                    .expect("set bounded response timeout");
-                sock.set_nodelay(true)
-                    .expect("disable Nagle for request split");
+fn retains_split_and_whole_requests() {
+    for split in [true, false] {
+        let (harness, server) = Plan::isolated();
+        harness
+            .run(
+                |context, listener| {
+                    retained::serve(server, context, listener, server::MAX_CONNECTIONS)
+                },
+                |bind| {
+                    let mut socket = retained::try_connect(bind).expect("connect");
+                    let requests = [
+                        Echo::new("REQ1ID", "MARKER-ONE", "BODY-REQ1-AAAA"),
+                        Echo::new("REQ2ID", "MARKER-TWO", "BODY-REQ2-BBBB"),
+                    ];
+                    let first = requests[0].wire();
+                    let rest = if split {
+                        let end = first
+                            .windows(4)
+                            .position(|w| w == b"\r\n\r\n")
+                            .expect("head")
+                            + 4;
+                        let (head, body) = first.split_at(end);
+                        socket.write_all(head).expect("write first head");
+                        thread::sleep(Duration::from_millis(15));
+                        body
+                    } else {
+                        first.as_slice()
+                    };
+                    socket.write_all(rest).expect("finish first request");
+                    thread::sleep(Duration::from_millis(15));
+                    socket
+                        .write_all(&requests[1].wire())
+                        .expect("write second request");
 
-                let r1 = Echo::new("REQ1ID", "MARKER-ONE", "BODY-REQ1-AAAA").wire();
-                let head_end = r1
-                    .windows(4)
-                    .position(|w| w == b"\r\n\r\n")
-                    .expect("generated request contains a header terminator")
-                    + 4;
-                let r2 = Echo::new("REQ2ID", "MARKER-TWO", "BODY-REQ2-BBBB").wire();
-
-                sock.write_all(&r1[..head_end])
-                    .expect("write first request head");
-                thread::sleep(Duration::from_millis(15));
-                sock.write_all(&r1[head_end..])
-                    .expect("write first request body");
-                thread::sleep(Duration::from_millis(15));
-                sock.write_all(&r2).expect("write second request");
-
-                let mut acc = Vec::new();
-                let (s1, b1) = Peer::new(&mut sock, &mut acc)
-                    .try_text()
-                    .expect("HTTP response");
-                let (s2, b2) = Peer::new(&mut sock, &mut acc)
-                    .try_text()
-                    .expect("HTTP response");
-
-                assert_eq!(s1, 200, "resp1: {b1:?}");
-                assert_eq!(
-                    b1,
-                    Echo::new("REQ1ID", "MARKER-ONE", "BODY-REQ1-AAAA").expected(),
-                    "req1 head/body corrupted by accum mutation during await (COW failed?)"
-                );
-                assert_eq!(s2, 200, "resp2: {b2:?}");
-                assert_eq!(
-                    b2,
-                    Echo::new("REQ2ID", "MARKER-TWO", "BODY-REQ2-BBBB").expected()
-                );
-            },
-            |result| {
-                assert!(
-                    result.is_ok(),
-                    "server preparation failed: {:?}",
-                    result.err()
-                );
-            },
-        )
-        .expect("harness");
-}
-
-#[test]
-fn socket_retain() {
-    let harness = Pair::bind().expect("reserve listener address");
-    let bind = harness.addr();
-    harness
-        .check(
-            |context, listener| {
-                let server = server::Plan::new(bind, Duration::from_secs(10)).build();
-                let mut reports = Plan::try_reports(&server).expect("server descriptor claims");
-                let failures = Cell::new(Vec::new());
-                let result = EchoDispatch::serve(
-                    server.with_bound(listener),
-                    context,
-                    State(&failures),
-                    Config::new(server::MAX_CONNECTIONS),
-                    Policy::new(|event| reports.push(event), recover),
-                    |result| {
-                        result
-                            .as_ref()
-                            .map(|_| ())
-                            .map_err(|error| error.cause())
-                            .expect("server runtime")
-                    },
-                );
-                assert!(
-                    reports.events().expect("reclaimed resources").is_empty(),
-                    "server retirement: {reports:?}"
-                );
-                let failures = failures.into_inner();
-                assert!(failures.is_empty(), "retention: {failures:?}");
-                result
-            },
-            |bind| {
-                let mut sock = TcpPeer::at(bind).try_connect().expect("connect");
-                sock.read_wait(Some(Duration::from_secs(3)))
-                    .expect("set bounded response timeout");
-                sock.set_nodelay(true)
-                    .expect("disable Nagle for pipelining");
-
-                let r1 = Echo::new("REQ1ID", "MARKER-ONE", "BODY-REQ1-AAAA").wire();
-                let r2 = Echo::new("REQ2ID", "MARKER-TWO", "BODY-REQ2-BBBB").wire();
-
-                sock.write_all(&r1).expect("write first request");
-                thread::sleep(Duration::from_millis(15));
-                sock.write_all(&r2).expect("write second request");
-
-                let mut acc = Vec::new();
-                let (s1, b1) = Peer::new(&mut sock, &mut acc)
-                    .try_text()
-                    .expect("HTTP response");
-                let (s2, b2) = Peer::new(&mut sock, &mut acc)
-                    .try_text()
-                    .expect("HTTP response");
-
-                assert_eq!(s1, 200, "resp1: {b1:?}");
-                assert_eq!(
-                    b1,
-                    Echo::new("REQ1ID", "MARKER-ONE", "BODY-REQ1-AAAA").expected(),
-                    "req1 corrupted after socket buffer reuse (retain copy failed?)"
-                );
-                assert_eq!(s2, 200, "resp2: {b2:?}");
-                assert_eq!(
-                    b2,
-                    Echo::new("REQ2ID", "MARKER-TWO", "BODY-REQ2-BBBB").expected()
-                );
-            },
-            |result| {
-                assert!(
-                    result.is_ok(),
-                    "server preparation failed: {:?}",
-                    result.err()
-                );
-            },
-        )
-        .expect("harness");
+                    let mut buffered = Vec::new();
+                    for request in requests {
+                        let reply = Peer::new(&mut socket, &mut buffered)
+                            .try_text()
+                            .expect("HTTP response");
+                        assert_eq!(reply, (200, request.expected()), "split head: {split}");
+                    }
+                },
+            )
+            .expect("harness");
+    }
 }
 
 #[test]
 fn body_transfer() {
-    let harness = Pair::bind().expect("reserve listener address");
-    let bind = harness.addr();
+    let (harness, server) = Plan::isolated();
     harness
-        .check(
-            |context, listener| {
-                let server = server::Plan::new(bind, Duration::from_secs(10)).build();
-                let mut reports = Plan::try_reports(&server).expect("server descriptor claims");
-                let failures = Cell::new(Vec::new());
-                let result = EchoDispatch::serve(
-                    server.with_bound(listener),
-                    context,
-                    State(&failures),
-                    Config::new(server::MAX_CONNECTIONS),
-                    Policy::new(|event| reports.push(event), recover),
-                    |result| {
-                        result
-                            .as_ref()
-                            .map(|_| ())
-                            .map_err(|error| error.cause())
-                            .expect("server runtime")
-                    },
-                );
-                assert!(
-                    reports.events().expect("reclaimed resources").is_empty(),
-                    "server retirement: {reports:?}"
-                );
-                let failures = failures.into_inner();
-                assert!(failures.is_empty(), "retention: {failures:?}");
-                result
-            },
+        .run(
+            |context, listener| retained::serve(server, context, listener, server::MAX_CONNECTIONS),
             |bind| {
                 let payload = vec![b'x'; 16 * 1024];
-                let mut sock = TcpPeer::at(bind).try_connect().expect("connect");
-                sock.read_wait(Some(Duration::from_secs(3)))
-                    .expect("set bounded response timeout");
-                sock.set_nodelay(true).expect("disable Nagle for request");
+                let mut sock = retained::try_connect(bind).expect("connect");
                 sock.write_all(&wire(&payload))
                     .expect("write retained body request");
 
@@ -281,13 +125,6 @@ fn body_transfer() {
                 assert_eq!(status, 200);
                 assert_eq!(body.as_bytes(), payload);
             },
-            |result| {
-                assert!(
-                    result.is_ok(),
-                    "server preparation failed: {:?}",
-                    result.err()
-                );
-            },
         )
         .expect("harness");
 }
@@ -296,36 +133,15 @@ fn body_transfer() {
 fn listener_admission() {
     const TASKS: usize = 1;
     const { assert!(TASKS < server::MAX_CONNECTIONS) };
-    let harness = Pair::bind().expect("reserve listener address");
-    let bind = harness.addr();
+    let (harness, server) = Plan::isolated();
     harness
-        .check(
-            |context, listener| {
-                let server = server::Plan::new(bind, Duration::from_secs(10)).build();
-                let mut reports = Plan::try_reports(&server).expect("server descriptor claims");
-            let failures = Cell::new(Vec::new());
-                let result = EchoDispatch::serve(server.with_bound(listener), context,
-                    State(&failures),
-                    Config::new(TASKS),
-                    Policy::new(|event| reports.push(event), recover),
-                    |result| result.as_ref().map(|_| ()).map_err(|error| error.cause()).expect("server runtime"),
-                );
-                assert!(reports.events().expect("reclaimed resources").is_empty(), "server retirement: {reports:?}");
-                let failures = failures.into_inner();
-                assert!(failures.is_empty(), "retention: {failures:?}");
-            result
-            },
+        .run(
+            |context, listener| retained::serve(server, context, listener, TASKS),
             |bind| {
                 let head = b"POST /retained/id?q=query HTTP/1.1\r\nHost: x\r\nx-echo-marker: marker\r\nContent-Length: 2\r\nExpect: 100-continue\r\nConnection: close\r\n\r\n";
                 let mut sockets = Vec::with_capacity(server::MAX_CONNECTIONS);
                 for _ in 0..server::MAX_CONNECTIONS {
-                    let mut socket = TcpPeer::at(bind).try_connect().expect("connect");
-                    socket
-                        .read_wait(Some(Duration::from_secs(3)))
-                        .expect("set bounded continuation timeout");
-                    socket
-                        .set_nodelay(true)
-                        .expect("disable Nagle for continuation");
+                    let mut socket = retained::try_connect(bind).expect("connect");
                     socket.write_all(head).expect("write partial body");
                     let mut acc = Vec::new();
                     let (status, body) = Peer::new(&mut socket, &mut acc).try_text().expect("HTTP response");
@@ -342,50 +158,18 @@ fn listener_admission() {
                     assert_eq!(body, "xy");
                 }
             },
-            |result| {
-                assert!(result.is_ok(), "server preparation failed: {:?}", result.err());
-            },
         )
         .expect("harness");
 }
 
 #[test]
 fn json_transfer() {
-    let harness = Pair::bind().expect("reserve listener address");
-    let bind = harness.addr();
+    let (harness, server) = Plan::isolated();
     harness
-        .check(
-            |context, listener| {
-                let server = server::Plan::new(bind, Duration::from_secs(10)).build();
-                let mut reports = Plan::try_reports(&server).expect("server descriptor claims");
-                let failures = Cell::new(Vec::new());
-                let result = EchoDispatch::serve(
-                    server.with_bound(listener),
-                    context,
-                    State(&failures),
-                    Config::new(server::MAX_CONNECTIONS),
-                    Policy::new(|event| reports.push(event), recover),
-                    |result| {
-                        result
-                            .as_ref()
-                            .map(|_| ())
-                            .map_err(|error| error.cause())
-                            .expect("server runtime")
-                    },
-                );
-                assert!(
-                    reports.events().expect("reclaimed resources").is_empty(),
-                    "server retirement: {reports:?}"
-                );
-                let failures = failures.into_inner();
-                assert!(failures.is_empty(), "retention: {failures:?}");
-                result
-            },
+        .run(
+            |context, listener| retained::serve(server, context, listener, server::MAX_CONNECTIONS),
             |bind| {
-                let mut sock = TcpPeer::at(bind).try_connect().expect("connect");
-                sock.read_wait(Some(Duration::from_secs(3)))
-                    .expect("set bounded response timeout");
-                sock.set_nodelay(true).expect("disable Nagle for requests");
+                let mut sock = retained::try_connect(bind).expect("connect");
                 sock.write_all(
                     &Post::new("/retained-json", br#"{"value":"owner-backed-json"}"#).wire(),
                 )
@@ -404,13 +188,6 @@ fn json_transfer() {
                     .expect("HTTP response");
                 assert_eq!(status, 200);
                 assert_eq!(body, "first-owner");
-            },
-            |result| {
-                assert!(
-                    result.is_ok(),
-                    "server preparation failed: {:?}",
-                    result.err()
-                );
             },
         )
         .expect("harness");

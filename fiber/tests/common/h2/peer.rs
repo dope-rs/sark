@@ -69,13 +69,17 @@ pub enum Error {
 }
 
 pub struct Peer<'a> {
-    socket: &'a mut TcpStream,
-    client: &'a mut Connection<ClientRole>,
+    pub socket: &'a mut TcpStream,
+    pub client: &'a mut Connection<ClientRole>,
 }
 impl<'a> Peer<'a> {
     pub fn new(socket: &'a mut TcpStream, client: &'a mut Connection<ClientRole>) -> Self {
         Self { socket, client }
     }
+    pub fn connect(addr: SocketAddr) -> (TcpStream, Connection<ClientRole>) {
+        Self::try_connect(addr, Duration::from_secs(3)).expect("H2 peer connection")
+    }
+
     pub fn try_connect(
         addr: SocketAddr,
         timeout: Duration,
@@ -90,12 +94,12 @@ impl<'a> Peer<'a> {
         Ok(socket)
     }
 
-    pub fn try_flush(self) -> Result<(), Error> {
+    pub fn try_flush(&mut self) -> Result<(), Error> {
         flush(self.client, self.socket).map_err(Error::Io)
     }
 
-    pub fn try_faults(self, stream: Id) -> Result<(), Error> {
-        Peer::new(self.socket, self.client).try_flush()?;
+    pub fn try_faults(&mut self, stream: Id) -> Result<(), Error> {
+        self.try_flush()?;
         let mut output = Vec::new();
         Headers::new(stream, Boundary::End, frame::Block::End, None, &[0x82])
             .map_err(Error::Parse)?
@@ -114,34 +118,30 @@ impl<'a> Peer<'a> {
         Ok(())
     }
 
-    pub fn try_settings(self) -> Result<(), Error> {
-        let Self {
-            socket: stream,
-            client,
-        } = self;
-        Peer::new(stream, client).try_flush()?;
+    pub fn try_settings(&mut self) -> Result<(), Error> {
+        self.try_flush()?;
         let mut input = [0; 4096];
         loop {
-            let read = stream.read(&mut input).map_err(Error::Io)?;
+            let read = self.socket.read(&mut input).map_err(Error::Io)?;
             if read == 0 {
                 return Err(Error::Closed);
             }
-            client
+            self.client
                 .ingress()
                 .ingest(&input[..read])
                 .map_err(Error::Connection)?;
             let mut applied = false;
-            while let Some(event) = client.ingress().poll_event() {
+            while let Some(event) = self.client.ingress().poll_event() {
                 applied |= matches!(event, Event::SettingsApplied);
             }
-            Peer::new(stream, client).try_flush()?;
+            self.try_flush()?;
             if applied {
                 return Ok(());
             }
         }
     }
 
-    pub fn try_pause(self) -> Result<(), Error> {
+    pub fn try_pause(&mut self) -> Result<(), Error> {
         let mut output = Vec::new();
         controls::Settings::new(frame::Ack::Required, &[0, 4, 0, 0, 0, 0])
             .ok_or(Error::Frame {
@@ -153,7 +153,7 @@ impl<'a> Peer<'a> {
         self.socket.write_all(&output).map_err(Error::Io)
     }
 
-    pub fn try_credit(self, stream: Id, delta: numbers::Increment) -> Result<(), Error> {
+    pub fn try_credit(&mut self, stream: Id, delta: numbers::Increment) -> Result<(), Error> {
         let mut output = Vec::new();
         payload::Payload::WindowUpdate(payload::WindowUpdate {
             stream_id: stream,
@@ -164,11 +164,8 @@ impl<'a> Peer<'a> {
         self.socket.write_all(&output).map_err(Error::Io)
     }
 
-    pub fn try_fragment(self, fragment: NonZero<usize>) -> Result<(), Error> {
-        let Self {
-            socket: stream,
-            client,
-        } = self;
+    pub fn try_fragment(&mut self, fragment: NonZero<usize>) -> Result<(), Error> {
+        let (stream, client) = (&mut *self.socket, &mut *self.client);
         use sark_h2::{
             conn::CLIENT_PREFACE,
             frame::{self, layout, numbers, payload},
@@ -251,21 +248,20 @@ impl<'a> Peer<'a> {
         Ok(())
     }
 
-    pub fn try_response(self, wanted: Id) -> Result<(Vec<Owned>, Vec<u8>), Error> {
-        let Self { socket, client } = self;
+    pub fn try_response(&mut self, wanted: Id) -> Result<(Vec<Owned>, Vec<u8>), Error> {
         let mut headers = Vec::new();
         let mut body = Vec::new();
         let mut input = [0; 16 << 10];
         'read: loop {
-            let read = socket.read(&mut input).map_err(Error::Io)?;
+            let read = self.socket.read(&mut input).map_err(Error::Io)?;
             if read == 0 {
                 return Err(Error::Closed);
             }
-            client
+            self.client
                 .ingress()
                 .ingest(&input[..read])
                 .map_err(Error::Connection)?;
-            while let Some(event) = client.ingress().poll_event() {
+            while let Some(event) = self.client.ingress().poll_event() {
                 match event {
                     Event::Headers {
                         stream_id: stream,
@@ -302,24 +298,23 @@ impl<'a> Peer<'a> {
                     _ => {}
                 }
             }
-            Peer::new(socket, client).try_flush()?;
+            self.try_flush()?;
         }
         Ok((headers, body))
     }
 
-    pub fn try_reset(self, wanted: Id) -> Result<numbers::ErrorCode, Error> {
-        let Self { socket, client } = self;
+    pub fn try_reset(&mut self, wanted: Id) -> Result<numbers::ErrorCode, Error> {
         let mut input = [0; 16 << 10];
         loop {
-            let read = socket.read(&mut input).map_err(Error::Io)?;
+            let read = self.socket.read(&mut input).map_err(Error::Io)?;
             if read == 0 {
                 return Err(Error::Closed);
             }
-            client
+            self.client
                 .ingress()
                 .ingest(&input[..read])
                 .map_err(Error::Connection)?;
-            while let Some(event) = client.ingress().poll_event() {
+            while let Some(event) = self.client.ingress().poll_event() {
                 if let Event::StreamReset {
                     stream_id: stream,
                     error,
@@ -330,16 +325,15 @@ impl<'a> Peer<'a> {
                     return Ok(error);
                 }
             }
-            Peer::new(socket, client).try_flush()?;
+            self.try_flush()?;
         }
     }
 
     pub fn try_statuses(
-        self,
+        &mut self,
         wanted: &[Id],
         status: &[u8],
     ) -> Result<(Vec<usize>, Vec<Vec<u8>>), Error> {
-        let Self { socket, client } = self;
         let mut bodies = iter::repeat_with(Vec::new)
             .take(wanted.len())
             .collect::<Vec<_>>();
@@ -348,14 +342,14 @@ impl<'a> Peer<'a> {
         let mut order = Vec::with_capacity(wanted.len());
         let mut input = [0; 16 << 10];
         while order.len() != wanted.len() {
-            let read = socket.read(&mut input).map_err(Error::Io)?;
+            let read = self.socket.read(&mut input).map_err(Error::Io)?;
             if read == 0 {
                 return Err(Error::Closed);
             }
-            let mut result = client.ingress().ingest(&input[..read]);
+            let mut result = self.client.ingress().ingest(&input[..read]);
             loop {
                 let mut drained = false;
-                while let Some(event) = client.ingress().poll_event() {
+                while let Some(event) = self.client.ingress().poll_event() {
                     drained = true;
                     match event {
                         Event::Headers {
@@ -409,12 +403,12 @@ impl<'a> Peer<'a> {
                 match result {
                     Ok(()) => break,
                     Err(error) if drained && error.is_pressure() => {
-                        result = client.ingress().resume();
+                        result = self.client.ingress().resume();
                     }
                     Err(error) => return Err(Error::Connection(error)),
                 }
             }
-            Peer::new(socket, client).try_flush()?;
+            self.try_flush()?;
         }
         if !ok.iter().all(|status| *status) {
             return Err(Error::Status {
@@ -426,42 +420,38 @@ impl<'a> Peer<'a> {
     }
 }
 
-pub struct Sender<'a>(&'a mut Connection<ClientRole>);
-impl<'a> Sender<'a> {
-    pub fn new(client: &'a mut Connection<ClientRole>) -> Self {
-        Self(client)
-    }
-    pub fn try_send(self, stream: Id, bytes: &[u8], boundary: Boundary) -> Result<(), Error> {
-        let client = self.0;
-
-        let key = client
-            .status()
-            .stream_key(stream)
-            .ok_or(Error::UnknownStream(stream))?;
-        let mut offset = 0;
-        loop {
-            let outcome = client
-                .streams()
-                .try_to(key, &bytes[offset..], &[], boundary, Limit::MAX)
-                .map_err(Error::Connection)?;
-            let sent = match outcome {
-                DataOutcome::Sent(sent) => Ok(sent),
-                DataOutcome::Ended => {
-                    if offset != bytes.len() {
-                        return Err(Error::Incomplete {
-                            sent: offset,
-                            expected: bytes.len(),
-                        });
-                    }
-                    return Ok(());
+pub fn try_send(
+    client: &mut Connection<ClientRole>,
+    stream: Id,
+    bytes: &[u8],
+    boundary: Boundary,
+) -> Result<(), Error> {
+    let key = client
+        .status()
+        .stream_key(stream)
+        .ok_or(Error::UnknownStream(stream))?;
+    let mut offset = 0;
+    loop {
+        let outcome = client
+            .streams()
+            .try_to(key, &bytes[offset..], &[], boundary, Limit::MAX)
+            .map_err(Error::Connection)?;
+        let sent = match outcome {
+            DataOutcome::Sent(sent) => sent,
+            DataOutcome::Ended => {
+                if offset != bytes.len() {
+                    return Err(Error::Incomplete {
+                        sent: offset,
+                        expected: bytes.len(),
+                    });
                 }
-                DataOutcome::Blocked(cause) => Err(cause),
-            }
-            .map_err(Error::Blocked)?;
-            offset += sent.get();
-            if offset == bytes.len() {
                 return Ok(());
             }
+            DataOutcome::Blocked(cause) => return Err(Error::Blocked(cause)),
+        };
+        offset += sent.get();
+        if offset == bytes.len() {
+            return Ok(());
         }
     }
 }
