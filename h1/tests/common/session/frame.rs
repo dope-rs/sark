@@ -2,28 +2,56 @@ use std::{convert::Infallible, pin::Pin};
 
 use o3::buffer::storage::range;
 use sark_h1::{
-    Input, session,
+    Input, pump, session,
     session::{Buffered, Conn, Consumption, Dispatch, Outcome, Permit},
+    switch,
     wire::{Failure, InputError, head, output, parsing},
 };
-use sark_http::payload::{fixed, owned};
+use sark_http::{
+    h1::codec::canned,
+    payload::{fixed, owned},
+};
 
 #[derive(Default)]
 pub struct Frame<'d> {
     pub next: Option<Outcome<'d>>,
+    pub after: usize,
+    pub input: Option<&'d [u8]>,
     pub calls: usize,
-    pub reported: Vec<Option<range::Error>>,
+    pub reported: Option<Option<range::Error>>,
 }
 
-impl<'d> Dispatch<'d, (), Infallible> for Frame<'d> {
+impl<'d> Frame<'d> {
+    pub fn reject() -> Self {
+        Self {
+            next: Some(Outcome::Close(canned::BAD_REQUEST)),
+            ..Self::default()
+        }
+    }
+
+    pub fn drive<T: switch::Engine<Raw = Infallible>>(
+        &mut self,
+        conn: &mut Conn<'d, (), Infallible, T>,
+        input: &[u8],
+    ) -> pump::Cycle<'d, T::Staged> {
+        conn.drive(
+            Pin::new(self),
+            input,
+            o3::buffer::write::Slice::new(&mut [0; 2048]).reborrow(),
+        )
+    }
+}
+
+impl<'d, T: switch::Engine<Raw = Infallible>> Dispatch<'d, (), Infallible, T> for Frame<'d> {
     type Ready = Infallible;
     type Head = Infallible;
 
     fn failure(self: Pin<&mut Self>, cause: &Failure) -> fixed::Body<'d> {
-        self.get_mut().reported.push(match cause {
+        let range = match cause {
             Failure::Input(InputError::Range(error)) => Some(*error),
             _ => None,
-        });
+        };
+        assert!(self.get_mut().reported.replace(range).is_none());
         cause.body()
     }
 
@@ -33,7 +61,7 @@ impl<'d> Dispatch<'d, (), Infallible> for Frame<'d> {
         _: Permit,
         _: Input<'_>,
         _: o3::buffer::write::Slice<'_, &mut usize>,
-        _: &mut Conn<'d, (), Infallible>,
+        _: &mut Conn<'d, (), Infallible, T>,
     ) -> session::RouteOutcome<'d, Infallible, Infallible, Self::Head, parsing::Rejected<'d>> {
         match pending {}
     }
@@ -43,11 +71,14 @@ impl<'d> Dispatch<'d, (), Infallible> for Frame<'d> {
         permit: Permit,
         input: Input<'_>,
         mut write: o3::buffer::write::Slice<'_, &mut usize>,
-        _: &mut Conn<'d, (), Infallible>,
+        _: &mut Conn<'d, (), Infallible, T>,
     ) -> session::RouteOutcome<'d, Infallible, Infallible, Self::Head, parsing::Rejected<'d>> {
         let this = self.get_mut();
         this.calls += 1;
-        if this.calls > 1
+        if let Some(expected) = this.input {
+            assert_eq!(input.as_slice(), expected);
+        }
+        if this.calls > this.after
             && let Some(next) = this.next.take()
         {
             return next.into();
