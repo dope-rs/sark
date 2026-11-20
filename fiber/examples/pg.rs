@@ -21,11 +21,10 @@ use cartel_pg::{
     Config, PgRow, PgTable,
     api::{
         results::{self, Collection, Validated},
-        traits::{Begin as _, Client, Status as _, Transaction as _},
+        traits::{Begin as _, Client, Transaction as _},
     },
     pg_instance,
-    port::{Port, config},
-    protocol::PickPolicy,
+    port::{Port, config, ready},
     query_group,
 };
 use dope::{
@@ -163,17 +162,16 @@ sark::define_route! {
     }
 }
 
-struct Server {
+struct Server<P: ready::Policy> {
     user: String,
     secret: String,
     database: String,
     addr: SocketAddr,
-    limits: config::Config,
+    limits: config::Configuration<P>,
     server: listener::Config<KeyTag<HTTP_LISTENER_ID>, Throughput>,
-    policy: PickPolicy,
 }
 
-impl Server {
+impl<P: ready::Policy> Server<P> {
     fn run<'run>(
         self,
         context: process::Context<'run>,
@@ -185,11 +183,10 @@ impl Server {
             addr,
             limits,
             server,
-            policy,
         } = self;
         let auth = Config::new(user, secret, database)
             .map_err(|error| BranchError::First(BranchError::First(error)))?;
-        let port = Port::<Db, PG_CONNECTOR_ID>::plan(auth, limits);
+        let port = Port::<(Db, P), PG_CONNECTOR_ID>::plan(auth, limits);
         let snapshot = service::Snapshot::from_one(
             service::Revision::new(1),
             service::Endpoint::new(addr, addr),
@@ -224,7 +221,6 @@ impl Server {
                             let watch = wait.watch();
                             let result = held.lend_scope(stage, report, |issued| {
                                 let (client, permit) = issued.into_parts();
-                                client.status().set_policy(policy);
                                 permit.try_run(
                                     |mut driver| {
                                         let app = App::new(brand, &client, config);
@@ -264,9 +260,9 @@ impl Server {
     }
 }
 
-fn start<'signal>(
-    signal: o3::mem::slot::Vacant<'signal, dope::core::platform::signal::Receiver>,
-) -> Result<(), Error<'signal, config::Error, Setup>> {
+fn assign<'signal, P: ready::Policy>(
+    input: input::Postgres,
+) -> Result<process::Runtime<Server<P>>, Error<'signal, config::Error, Setup>> {
     let input::Postgres {
         bind: input::Bind { bind },
         pg_addr,
@@ -274,8 +270,8 @@ fn start<'signal>(
         pg_password: secret,
         pg_database: database,
         pg_pick_policy: policy,
-    } = input::Postgres::try_parse().map_err(Error::Input)?;
-    let limits = config::Config::new(config::Capacities {
+    } = input;
+    let limits = config::Configuration::new(config::Capacities {
         connections: PG_CONNECTIONS,
         inflight: PG_INFLIGHT,
         admission_waiters: PG_WAITERS,
@@ -314,12 +310,23 @@ fn start<'signal>(
             addr: pg_addr,
             limits,
             server,
-            policy,
         }])
-        .map_err(Error::Create)?
-        .run(signal, Server::run)
-        .map_err(Error::Run)?;
-    Ok(())
+        .map_err(Error::Create)
+}
+
+fn start<'signal>(
+    signal: o3::mem::slot::Vacant<'signal, dope::core::platform::signal::Receiver>,
+) -> Result<(), Error<'signal, config::Error, Setup>> {
+    let input = input::Postgres::try_parse().map_err(Error::Input)?;
+    match input.pg_pick_policy {
+        input::PickPolicy::RoundRobin => {
+            assign::<ready::RoundRobin>(input)?.run(signal, Server::run)
+        }
+        input::PickPolicy::LeastInflight => {
+            assign::<ready::LeastInflight>(input)?.run(signal, Server::run)
+        }
+    }
+    .map_err(Error::Run)
 }
 
 fn main() -> ExitCode {
