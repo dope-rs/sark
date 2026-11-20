@@ -1,7 +1,7 @@
 use std::{convert::Infallible, net::AddrParseError};
 
 use dope::{
-    core::driver::{life::recovery, schedule::clock},
+    core::{driver::schedule::clock, io::Reclaimed},
     manifold::client::attempt::queue::mailbox,
     runtime::executor::drive,
 };
@@ -69,8 +69,7 @@ impl<'a> Request<'a> {
     pub fn try_run<R, C>(
         self,
         check: C,
-        policy: impl recovery::Observe,
-        done: impl for<'run> FnOnce(Result<Result<R, Step>, runtime::Error<'run>>) -> Result<R, Step>,
+        report: impl FnMut(Reclaimed),
     ) -> Result<R, Error>
     where
         C: for<'d> FnOnce(Result<Contiguous, Failure<Infallible, mailbox::Error<'d>>>) -> R,
@@ -99,8 +98,7 @@ impl<'a> Request<'a> {
                             .map_err(Failure::widen);
                         Ok::<R, Step>(check(outcome))
                     },
-                    policy,
-                    done,
+                    report,
                 )
                 .map_err(Error::Fixed)?
                 .map_err(Error::Step)?,
@@ -116,8 +114,7 @@ impl<'a> Request<'a> {
                             .map_err(Step::Drive)?;
                         Ok::<R, Step>(check(outcome))
                     },
-                    policy,
-                    done,
+                    report,
                 )
                 .map_err(Error::Dynamic)?
                 .map_err(Error::Step)?,
@@ -127,8 +124,7 @@ impl<'a> Request<'a> {
     pub fn try_scoped<R, C>(
         self,
         check: C,
-        policy: impl recovery::Observe,
-        done: impl for<'run> FnOnce(Result<Result<R, Step>, runtime::Error<'run>>) -> Result<R, Step>,
+        report: impl FnMut(Reclaimed),
     ) -> Result<R, Error>
     where
         C: for<'scope, 'd> FnOnce(
@@ -161,8 +157,7 @@ impl<'a> Request<'a> {
                             .map_err(Failure::widen);
                         Ok::<R, Step>(check(outcome))
                     },
-                    policy,
-                    done,
+                    report,
                 )
                 .map_err(Error::Fixed)?
                 .map_err(Error::Step)?,
@@ -180,8 +175,7 @@ impl<'a> Request<'a> {
                             .map_err(Step::Drive)?;
                         Ok::<R, Step>(check(outcome))
                     },
-                    policy,
-                    done,
+                    report,
                 )
                 .map_err(Error::Dynamic)?
                 .map_err(Error::Step)?,

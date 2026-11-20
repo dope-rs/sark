@@ -2,33 +2,13 @@ use crate::{
     app::{
         serve::{
             self, duplex,
-            handle::{self, decode, dispatch, head},
+            handle::{decode, dispatch, head},
         },
         spec,
     },
     macros::tokens::local,
     runtime::paths::Paths,
 };
-
-pub(in crate::app) fn coding(paths: &Paths, spec: &spec::Spec) -> proc_macro2::TokenStream {
-    use quote::quote;
-
-    let ns_h1 = &paths.h1;
-    let ns_http = &paths.http;
-    let routes = spec
-        .route_specs
-        .iter()
-        .filter(|entry| matches!(entry.mode, spec::Mode::Sync))
-        .map(|entry| &entry.route);
-    quote! {
-        <#ns_h1::wire::output::Select<{
-            false #( || ::core::matches!(
-                <#routes as #ns_h1::route::PolicyOf>::POLICY.coding,
-                #ns_http::h1::head::request::Coding::Gzip,
-            ) )*
-        }> as #ns_h1::wire::output::Selected>::Compression
-    }
-}
 
 pub(in crate::app) fn build(paths: &Paths, spec: &spec::Spec) -> proc_macro2::TokenStream {
     let f_state = local("state");
@@ -65,14 +45,6 @@ pub(in crate::app) fn build(paths: &Paths, spec: &spec::Spec) -> proc_macro2::To
     let decls = &spec.state_generics.parameters;
     let values = &spec.state_generics.arguments;
     let clauses = &spec.state_generics.predicates;
-    let plan = &head.plan;
-    let selected = &head.names.prepared_ident;
-    let variants = &decode.prepared.variant_defs;
-    let structs = &decode.prepared.state.slots;
-    let flow = &decode.prepared.state.definition;
-    let error = &decode.prepared.type_defs;
-    let method = &decode.method;
-    let full = &decode.full;
     let mask = &methods.method_mask;
     let count = entries.len();
     let table = format_ident!("{}Table", name);
@@ -81,7 +53,6 @@ pub(in crate::app) fn build(paths: &Paths, spec: &spec::Spec) -> proc_macro2::To
     } else {
         quote!(< #( #lives, )* #( #decls, )* >)
     };
-    let guards = handle::emit_guards(paths, spec, entries);
     let impls = entries.iter().enumerate().map(|(index, item)| {
         let index = index as u32;
         let slot = &item.head;
@@ -172,26 +143,11 @@ pub(in crate::app) fn build(paths: &Paths, spec: &spec::Spec) -> proc_macro2::To
             (decl, args, router, quote!(self.#f_state))
         }
     };
-    let guarded = decode.guard.as_ref().map(|guard| {
-        quote! {
-            impl #decl #ns_core::decode::Guarded for #name #args
-            where
-                #bounds
-            {
-                #guard
-            }
-        }
-    });
+    let decoder = decode.implement(paths, &decl, quote!(#name #args where #bounds));
 
     quote! {
-        #plan
-
-        #( #structs )*
-
-        #(
-            #impls
-            #guards
-        )*
+        #decoder
+        #( #impls )*
 
         #[doc(hidden)]
         #vis enum #table {}
@@ -234,32 +190,7 @@ pub(in crate::app) fn build(paths: &Paths, spec: &spec::Spec) -> proc_macro2::To
             }
         }
 
-        #[doc(hidden)]
-        #vis enum #selected {
-            #( #variants )*
-        }
-
-        #flow
-
         #router
-
-        #error
-
-        impl #decl #ns_core::decode::Decode for #name #args
-        where
-            #bounds
-        {
-            #method
-        }
-
-        impl #decl #ns_core::decode::Full for #name #args
-        where
-            #bounds
-        {
-            #full
-        }
-
-        #guarded
 
         impl #decl #ns_core::route::table::Router for #name #args
         where

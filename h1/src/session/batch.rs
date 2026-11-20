@@ -88,9 +88,7 @@ impl<'d, H> Batch<'d, H> {
             if rest.as_slice().is_empty() && !conn.ingress.is_ready() {
                 break;
             }
-            let mut staged = write
-                .try_split(0, write.remaining())
-                .unwrap_or_else(|_| unreachable!("output"));
+            let mut staged = write.stage();
             let mut target = staged.body();
             out.progress.merge(deadline::Progress::new(
                 deadline::Head::Ready,
@@ -367,7 +365,12 @@ impl<'d, H> Batch<'d, H> {
                     out.connection = out.connection.join(next);
                     let body = match reply {
                         output::Complete::Inline | output::Complete::Copy { .. } => None,
-                        output::Complete::Static { body } => Some(SplitBody::Static(body)),
+                        output::Complete::Static { body } => {
+                            match target.write_slice(body.as_slice()) {
+                                Ok(()) => None,
+                                Err(_) => Some(SplitBody::Static(body)),
+                            }
+                        }
                         output::Complete::Shared { body }
                         | output::Complete::Owned { body, .. } => Some(SplitBody::Shared(body)),
                         output::Complete::Compressed { body, .. } => Some(SplitBody::Frozen(body)),
@@ -375,28 +378,11 @@ impl<'d, H> Batch<'d, H> {
                             Some(SplitBody::Segmented(body))
                         }
                     };
-                    match body {
-                        None => {}
-                        Some(SplitBody::Static(body)) => {
-                            if target.write_slice(body.as_slice()).is_err() {
-                                out.output = Output::Split(SplitBody::Static(body));
-                                staged
-                                    .try_commit()
-                                    .unwrap_or_else(|_| unreachable!("output"));
-                                break;
-                            }
-                        }
-                        Some(body) => {
-                            out.output = Output::Split(body);
-                            staged
-                                .try_commit()
-                                .unwrap_or_else(|_| unreachable!("output"));
-                            break;
-                        }
+                    staged.commit();
+                    if let Some(body) = body {
+                        out.output = Output::Split(body);
+                        break;
                     }
-                    staged
-                        .try_commit()
-                        .unwrap_or_else(|_| unreachable!("output"));
                     if matches!(drain, drain::Drain::Pending) {
                         break;
                     }
@@ -438,16 +424,12 @@ impl<'d, H> Batch<'d, H> {
                             }
                         }
                     }
-                    staged
-                        .try_commit()
-                        .unwrap_or_else(|_| unreachable!("output"));
+                    staged.commit();
                     break;
                 }
                 session::Outcome::Streamed { close, .. } => {
                     out.connection = out.connection.join(close);
-                    staged
-                        .try_commit()
-                        .unwrap_or_else(|_| unreachable!("output"));
+                    staged.commit();
                     out.output = Output::Streamed;
                     break;
                 }

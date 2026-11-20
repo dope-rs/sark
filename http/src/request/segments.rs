@@ -59,7 +59,7 @@ impl<'d> response::Body<'d> for Segments<'d> {
         self,
         slot: &handoff::Slot<'req, 'd, H, O>,
     ) -> Result<handoff::Plan<'req, 'd, H::Selection, O>, owned::Error> {
-        Ok(handoff::Plan::new(slot.origin().request(self)))
+        Ok(slot.request(self))
     }
 }
 

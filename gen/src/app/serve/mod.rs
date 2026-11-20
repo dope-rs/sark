@@ -46,9 +46,7 @@ impl<'a, M> RouteSpec<'a, M> {
 }
 
 pub(in crate::app::serve) enum Mode<'a> {
-    Sync {
-        cache: usize,
-    },
+    Sync,
     Fiber {
         task: TaskSpec<'a>,
         fiber: Fiber<'a>,
@@ -125,7 +123,6 @@ impl Fiber<'_> {
 pub(in crate::app::serve) struct Execution<'a, 'spec> {
     tasks: Vec<Task<'a, 'spec>>,
     fibers: Vec<(Task<'a, 'spec>, &'a Fiber<'spec>)>,
-    sync: usize,
     identity: syn::Ident,
     fiber: syn::Ident,
 
@@ -144,14 +141,9 @@ impl<'a, 'spec> Execution<'a, 'spec> {
         let mut fibers = Vec::new();
         let mut producer_bounds = Vec::new();
         let mut slab_bounds = Vec::new();
-        let mut sync = 0;
         let owner = &spec.name;
         for route in &plan.entries {
             let (task, bound) = match &route.mode {
-                Mode::Sync { cache } => {
-                    sync = *cache + 1;
-                    continue;
-                }
                 Mode::Fiber { task: spec, fiber } => {
                     let task = Task::new(route, spec);
                     let bound = task.fiber_bound(paths, fiber, state_ty);
@@ -178,7 +170,7 @@ impl<'a, 'spec> Execution<'a, 'spec> {
                     let (_, bound) = task.store_stream(paths);
                     (task, bound)
                 }
-                Mode::Duplex { .. } => continue,
+                Mode::Sync | Mode::Duplex { .. } => continue,
             };
             slab_bounds.push(bound);
             tasks.push(task);
@@ -186,7 +178,6 @@ impl<'a, 'spec> Execution<'a, 'spec> {
         Self {
             tasks,
             fibers,
-            sync,
             identity: quote::format_ident!("__{}Task", owner),
             fiber: quote::format_ident!("__{}Fiber", owner),
             producer_bounds,
@@ -214,10 +205,6 @@ impl<'a, 'spec> Execution<'a, 'spec> {
             fibers.map(|pair| &pair.1.maker),
         )
     }
-
-    pub(in crate::app::serve) const fn sync_count(&self) -> usize {
-        self.sync
-    }
 }
 
 mod app;
@@ -236,7 +223,6 @@ impl<'spec> ProtocolPlan<'spec> {
     ) -> Vec<RouteSpec<'spec, Mode<'spec>>> {
         let mut direct_quota = 0;
         let mut queued_quota = 0;
-        let mut cache = 0;
         let mut task = 0;
         let mut producer = 0;
         let owner = &spec.name;
@@ -245,11 +231,7 @@ impl<'spec> ProtocolPlan<'spec> {
             .enumerate()
             .map(|(index, entry)| {
                 let (kind, mode) = match &entry.mode {
-                    spec::Mode::Sync => {
-                        let slot = cache;
-                        cache += 1;
-                        (spec::Kind::Sync, Mode::Sync { cache: slot })
-                    }
+                    spec::Mode::Sync => (spec::Kind::Sync, Mode::Sync),
                     spec::Mode::Fiber {
                         capacity,
                         body,
@@ -341,7 +323,7 @@ pub(super) fn build(
     let exec = Execution::new(paths, &plan);
     let h1 = match &h1 {
         crate::runtime::H1::Available(cleartext) => {
-            Some(handle::H1Plan::new(&plan, &exec, cleartext.as_ref()))
+            Some(handle::H1Plan::new(&plan, cleartext.as_ref()))
         }
         crate::runtime::H1::Missing => None,
     };

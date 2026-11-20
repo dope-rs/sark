@@ -11,7 +11,7 @@ use sark_core::{
     },
 };
 use sark_h1::{
-    route::{Cache, Policy, PolicyOf},
+    route::{Policy, PolicyOf},
     session,
     wire::{head::Connection, response::Context},
 };
@@ -235,7 +235,7 @@ impl route::Spec for Streaming {
     type Stream<'d> = ();
 }
 impl PolicyOf for Streaming {
-    const POLICY: Policy = Policy::new(Cache::Bypass, Coding::Plain, Date::Omit, Server::Omit);
+    const POLICY: Policy = Policy::new(Coding::Plain, Date::Omit, Server::Omit);
 }
 impl manifold::Route<Cell<usize>> for Streaming {
     type Response<'req, 'd>

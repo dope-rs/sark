@@ -1,8 +1,7 @@
 use std::num::NonZero;
 
-use common::client::recover;
+use common::client::assert_shutdown;
 use common::client::runtime::peer;
-use dope::core::driver::life::recovery;
 use dope_test::harness::peer::AcceptScript;
 pub mod common;
 
@@ -10,7 +9,6 @@ use common::client::{
     response::owners::{self, BODY_LEN, CHUNK, SCOPED_ALLOCATIONS, Value},
     runtime::{origins, pools},
 };
-use dope::core::io::Reclaimed;
 use dope_fiber::BlockOn;
 use dope_test::alloc::Tracker;
 use sark_client::{
@@ -64,11 +62,7 @@ fn shape_and_ceiling() {
                     )
                     .expect("measure fixed responses")
                 },
-                recovery::Policy::new(
-                    |event| std::assert_matches!(event, Reclaimed::Shutdown),
-                    recover,
-                ),
-                |result| result.expect("client execution"),
+                assert_shutdown,
             )
             .expect("fixed shutdown");
             let dynamic = origins::Plan::new(Config::new(server.addr().to_string()), 1, 1, 1)
@@ -87,11 +81,7 @@ fn shape_and_ceiling() {
                         )
                         .expect("measure on-demand responses")
                     },
-                    recovery::Policy::new(
-                        |event| std::assert_matches!(event, Reclaimed::Shutdown),
-                        recover,
-                    ),
-                    |result| result.expect("client execution"),
+                    assert_shutdown,
                 )
                 .expect("on-demand shutdown");
             for [scoped, retained, flat] in [fixed, dynamic] {
@@ -203,11 +193,7 @@ fn retained_keeps_backing() {
                         );
                         retained
                     },
-                    recovery::Policy::new(
-                        |event| std::assert_matches!(event, Reclaimed::Shutdown),
-                        recover,
-                    ),
-                    |result| result.expect("client execution"),
+                    assert_shutdown,
                 )
                 .expect("fixed shutdown");
                 check_keep(response);
@@ -290,11 +276,7 @@ fn failures_keep_provenance() {
                     assert!(parts.contains(Part::Body));
                     assert!(bytes >= BODY_LEN);
                 },
-                recovery::Policy::new(
-                    |event| std::assert_matches!(event, Reclaimed::Shutdown),
-                    recover,
-                ),
-                |result| result.expect("client execution"),
+                assert_shutdown,
             )
             .expect("fixed shutdown");
             server

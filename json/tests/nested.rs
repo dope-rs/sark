@@ -1,9 +1,6 @@
 use std::{convert::Infallible, num::NonZero};
 
-use dope_core::{
-    BranchError,
-    driver::{Binding, life::recovery, schedule::ready::task::owner::Capacity, settings},
-};
+use dope_core::driver::{Binding, life::recovery, schedule::ready::task::owner::Capacity, settings};
 use dope_test::{
     alloc::Tracker,
     scope::{self, Driver},
@@ -296,10 +293,7 @@ fn request_fields_share_id() {
         |result| {
             result
                 .as_ref()
-                .map_err(|error| match error {
-                    scope::Error::Create(error) => BranchError::First(error.kind()),
-                    scope::Error::Close(error) => BranchError::Second(error.cause()),
-                })
+                .map_err(scope::Error::cause)
                 .expect("driver lifetime");
         },
     );

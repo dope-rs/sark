@@ -18,8 +18,7 @@ use runtime::paths;
 #[proc_macro_derive(Message, attributes(prost))]
 pub fn message(input: proc_macro::TokenStream) -> proc_macro::TokenStream {
     let input = syn::parse_macro_input!(input as syn::DeriveInput);
-    use macros::message::Message;
-    match Message::new(input).and_then(Message::expand) {
+    match macros::message::expand(input) {
         Ok(tokens) => tokens.into(),
         Err(error) => error.into_compile_error().into(),
     }

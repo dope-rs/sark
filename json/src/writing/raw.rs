@@ -1,14 +1,6 @@
 use std::{mem::MaybeUninit, slice};
 
-pub(super) const PAIRS: [[u8; 2]; 100] = {
-    let mut pairs = [[0; 2]; 100];
-    let mut value = 0;
-    while value < pairs.len() {
-        pairs[value] = [b'0' + (value / 10) as u8, b'0' + (value % 10) as u8];
-        value += 1;
-    }
-    pairs
-};
+use sark_http::h1::codec::numbers::raw::PAIRS;
 
 pub(super) fn write(mut value: u64, bytes: &mut [MaybeUninit<[u8; 2]>; 10]) -> &[u8] {
     let mut start = bytes.len();

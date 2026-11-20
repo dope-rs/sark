@@ -3,59 +3,34 @@ use sark_core::life::{self, audit, exchange, sequence};
 
 use crate::wire::output;
 
-pub trait Mode: evidence::Mode + Sized {
-    fn complete(held: output::Retention) -> Completion<Self>;
+pub trait Mode: evidence::Mode {
+    type Link: Default;
 
-    fn charge(proof: Self::Projection) -> hold::Charge;
+    const LINKED: Self::Link;
+
+    fn charge(linked: Self::Link, owner: hold::Charge) -> hold::Charge;
 }
 
 impl Mode for evidence::Off {
-    fn complete(held: output::Retention) -> Completion<Self> {
-        match held {
-            output::Retention::Response(owner) | output::Retention::Linked(owner) => {
-                Completion::Response {
-                    owner,
-                    linked: Default::default(),
-                }
-            }
-            output::Retention::Rejected => Completion::Rejected,
-        }
-    }
+    type Link = ();
+    const LINKED: () = ();
 
-    fn charge(proof: Self::Projection) -> hold::Charge {
-        let evidence::Off = proof;
+    fn charge((): (), _: hold::Charge) -> hold::Charge {
         hold::Charge::default()
     }
 }
 
 impl Mode for evidence::On {
-    fn complete(held: output::Retention) -> Completion<Self> {
-        match held {
-            output::Retention::Response(owner) => Completion::Response {
-                owner,
-                linked: hold::Charge::default(),
-            },
-            output::Retention::Linked(owner) => Completion::Response {
-                owner,
-                linked: owner.charge,
-            },
-            output::Retention::Rejected => Completion::Rejected,
+    type Link = bool;
+    const LINKED: bool = true;
+
+    fn charge(linked: bool, owner: hold::Charge) -> hold::Charge {
+        if linked {
+            owner
+        } else {
+            hold::Charge::default()
         }
     }
-
-    fn charge(proof: Self::Projection) -> hold::Charge {
-        proof
-    }
-}
-
-/// Final response ownership used to retire one HTTP/1 task.
-pub enum Completion<R: Mode = evidence::Off> {
-    Response {
-        owner: output::Owner,
-        linked: R::Projection,
-    },
-    Completed,
-    Rejected,
 }
 
 /// Whether this turn first observed a task becoming ready.
@@ -83,7 +58,7 @@ pub enum Turn<R: Mode = evidence::Off> {
     Response {
         ready: Readiness,
         owner: output::Owner,
-        linked: R::Projection,
+        linked: R::Link,
     },
     Completed {
         ready: Readiness,
@@ -94,15 +69,16 @@ pub enum Turn<R: Mode = evidence::Off> {
 }
 
 impl<R: Mode> Turn<R> {
-    pub fn retired(ready: Readiness, done: Completion<R>) -> Self {
-        match done {
-            Completion::Response { owner, linked } => Self::Response {
-                ready,
-                owner,
-                linked,
-            },
-            Completion::Completed => Self::Completed { ready },
-            Completion::Rejected => Self::Rejected { ready },
+    pub fn published(ready: Readiness, held: output::Retention) -> Self {
+        let (owner, linked) = match held {
+            output::Retention::Response(owner) => (owner, R::Link::default()),
+            output::Retention::Linked(owner) => (owner, R::LINKED),
+            output::Retention::Rejected => return Self::Rejected { ready },
+        };
+        Self::Response {
+            ready,
+            owner,
+            linked,
         }
     }
 
@@ -157,7 +133,7 @@ impl<R: Mode> Turn<R> {
                         id,
                         owner.len,
                         charge,
-                        R::charge(linked),
+                        R::charge(linked, charge),
                     );
                 }
                 sequence::Mode::accept(mode, session, id, charge);
@@ -219,8 +195,6 @@ impl<R: Mode> Turn<R> {
 const _: () = {
     assert!(size_of::<Readiness>() == size_of::<bool>());
     assert!(align_of::<Readiness>() == align_of::<bool>());
-    assert!(size_of::<Completion>() <= 5 * size_of::<usize>());
     assert!(size_of::<Turn>() <= 5 * size_of::<usize>());
-    assert!(size_of::<Completion<evidence::On>>() <= usize::BITS as usize);
-    assert!(size_of::<Turn<evidence::On>>() <= usize::BITS as usize);
+    assert!(size_of::<Turn<evidence::On>>() <= 5 * size_of::<usize>());
 };

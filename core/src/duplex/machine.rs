@@ -303,10 +303,7 @@ impl<'d, D: duplex::Session<'d>> Machine<'d, D> {
             admit::Emission<'turn, 'd, D>,
         ) -> admit::Admission<'turn, 'd, D, R, E>,
     ) -> Transaction<R, E> {
-        let mut split = match output.try_split(0, output.remaining()) {
-            Ok(split) => split,
-            Err(_) => unreachable!("prefix"),
-        };
+        let mut prefix = output.stage();
         let staged = match self.phase.action() {
             Some(staged) => staged,
             None => {
@@ -325,13 +322,13 @@ impl<'d, D: duplex::Session<'d>> Machine<'d, D> {
                 };
                 let action = if let Some(input) = self.pending.take() {
                     self.session
-                        .receive(owned::Segments::from(input), split.body(), scratch)
+                        .receive(owned::Segments::from(input), prefix.body(), scratch)
                 } else if activate {
                     self.flags &= !INITIAL_ACTIVATION;
-                    self.session.activate(split.body(), scratch)
+                    self.session.activate(prefix.body(), scratch)
                 } else {
                     self.flags &= !INPUT_FINISH_PENDING;
-                    self.session.finish(split.body(), scratch)
+                    self.session.finish(prefix.body(), scratch)
                 };
                 let (output, dir) = action.into_parts();
                 self.pending = output.and_then(owned::Segments::take);
@@ -342,7 +339,7 @@ impl<'d, D: duplex::Session<'d>> Machine<'d, D> {
                 }
             }
         };
-        let written = split.body().len();
+        let written = prefix.body().len();
         if matches!(self.output, Output::Finished) && (written != 0 || self.pending.is_some()) {
             self.terminate();
             return Transaction::Violation(Violation::OutputAfterFinish);
@@ -384,9 +381,7 @@ impl<'d, D: duplex::Session<'d>> Machine<'d, D> {
                 Transaction::Violation(Violation::PrefixPending)
             }
             admit::Decision::Committed { receipt: proof } => {
-                if split.try_commit().is_err() {
-                    unreachable!("prefix");
-                }
+                prefix.commit();
                 self.phase = match next.settled {
                     After::Idle => Phase::Idle,
                     After::Turn => Phase::Turn,

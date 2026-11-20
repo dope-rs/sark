@@ -14,7 +14,7 @@ use sark_h1::{
     Input, session,
     wire::{
         Failure,
-        parsing::{self, framing, raw},
+        parsing::{framing, raw},
     },
 };
 use sark_http::{
@@ -27,9 +27,7 @@ static ALLOCATOR: Tracker = Tracker::new();
 
 #[test]
 fn keeps_cause_and_credit() {
-    let source = parsing::Head::parse(Input::Borrowed(Request::HEAD), u8::MAX)
-        .expect("request line")
-        .expect("complete line");
+    let source = common::head::parsed(Input::Borrowed(Request::HEAD), u8::MAX);
     let head = framing::Head::<Request, Coding>::parse(raw::Bound::empty(&source), Coding::Plain)
         .ok()
         .flatten()

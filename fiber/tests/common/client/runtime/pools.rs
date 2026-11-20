@@ -1,7 +1,10 @@
 use std::{net, time};
 
 use dope::{
-    core::driver::{life::recovery, route::KeyTag, schedule::clock},
+    core::{
+        driver::{life::recovery, route::KeyTag, schedule::clock},
+        io::Reclaimed,
+    },
     manifold::{
         app::{Host, env},
         network::client,
@@ -17,7 +20,10 @@ use dope_test::{fibers, harness::GUARD};
 use sark_client::protocol::response;
 use sark_fiber::client::{Ready, Stream, channel, config, conn::Connector, request};
 
-use crate::common::client::runtime::{Error, Failure, WaitError, cases::stream::Exchange};
+use crate::common::client::{
+    recover,
+    runtime::{Failure, WaitError, cases::stream::Exchange},
+};
 
 type Network = env::Bundle<tcp::Tcp, wire::Identity, timing::Balanced>;
 
@@ -74,15 +80,14 @@ impl Plan {
         Ok(Self { http, address })
     }
 
-    pub fn enter<C: executor::Build, R, Out>(
+    pub fn enter<C: executor::Build, R>(
         self,
         context: C,
         run: impl for<'app, 'life, 's, 'm, 'h, 'n, 'f, 'e, 'b, 'c, 'd> FnOnce(
             Scope<'app, 'life, 's, 'm, 'h, 'n, 'f, 'e, 'b, 'c, 'd, C::Shutdown>,
         ) -> R,
-        policy: impl recovery::Observe,
-        done: impl for<'a> FnOnce(Result<R, Error<'a>>) -> Out,
-    ) -> Result<Out, Failure> {
+        report: impl FnMut(Reclaimed),
+    ) -> Result<R, Failure> {
         let mut finish = session::Completion::new();
         let finish = &mut finish;
         let Self { http, address } = self;
@@ -125,20 +130,19 @@ impl Plan {
                     .map_err(Failure::Port)?
                 })
             },
-            policy,
-            |result| super::finish(result, done),
+            recovery::Policy::new(report, recover),
+            super::finish,
         ))
     }
 
-    pub fn enter_at<R, Out>(
+    pub fn enter_at<R>(
         self,
         offset: time::Duration,
         run: impl for<'app, 'life, 's, 'm, 'h, 'n, 'f, 'e, 'b, 'c, 'd> FnOnce(
             Clock<'app, 'life, 's, 'm, 'h, 'n, 'f, 'e, 'b, 'c, 'd>,
         ) -> R,
-        policy: impl recovery::Observe,
-        done: impl for<'a> FnOnce(Result<R, Error<'a>>) -> Out,
-    ) -> Result<Out, Failure> {
+        report: impl FnMut(Reclaimed),
+    ) -> Result<R, Failure> {
         let mut finish = session::Completion::new();
         let finish = &mut finish;
         let Self { http, address } = self;
@@ -188,8 +192,8 @@ impl Plan {
                     .map_err(Failure::Port)?
                 })
             },
-            policy,
-            |result| super::finish(result, done),
+            recovery::Policy::new(report, recover),
+            super::finish,
         ))
     }
 }

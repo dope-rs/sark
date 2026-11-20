@@ -2,7 +2,7 @@ use std::num::NonZero;
 
 use dope::{core::io::transfer, net::link::egress::data};
 use o3::buffer::{self, bytes::bounded::Overflow};
-use sark_h1::server::payload::Frame;
+use sark_h1::server::payload::Stream;
 
 pub const FRAMING: &[(&[u8], &[u8])] = &[
     (b"a".as_slice(), b"1\r\na\r\n".as_slice()),
@@ -16,7 +16,7 @@ pub const FRAMING: &[(&[u8], &[u8])] = &[
     ),
 ];
 
-pub fn try_collect(frame: &Frame<'_>, cap: NonZero<usize>) -> Option<Vec<u8>> {
+pub fn try_collect<K>(frame: &Stream<'_, K>, cap: NonZero<usize>) -> Option<Vec<u8>> {
     use buffer::raw::Scatter as _;
     use data::raw::Payload as _;
     let mut chunks = frame.cursor(data::Offset::ZERO)?;

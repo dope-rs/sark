@@ -5,7 +5,7 @@ pub mod common;
 
 use std::{mem, net::SocketAddr, time};
 
-use common::client::recover;
+use common::client::{assert_shutdown, recover};
 use common::client::runtime::{origins, pools};
 use dope::{
     core::{
@@ -413,11 +413,7 @@ fn fixed_host_is_borrowed() {
             assert_eq!(host, "Example.TEST:8080");
             assert_eq!(alloc, (0, 0));
         },
-        recovery::Policy::new(
-            |event| std::assert_matches!(event, Reclaimed::Shutdown),
-            recover,
-        ),
-        |result| result.expect("client execution"),
+        assert_shutdown,
     )
     .expect("fixed application shutdown");
 }
@@ -434,11 +430,7 @@ fn host_borrows_authority() {
                 assert_eq!(host, "[2001:DB8::1]:8080");
                 assert_eq!(alloc, (0, 0));
             },
-            recovery::Policy::new(
-                |event| std::assert_matches!(event, Reclaimed::Shutdown),
-                recover,
-            ),
-            |result| result.expect("client execution"),
+            assert_shutdown,
         )
         .expect("on-demand application shutdown");
 }

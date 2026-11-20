@@ -10,7 +10,7 @@ use dope_test::alloc::Tracker;
 use o3::buffer::{storage, write::Slice};
 use sark_h1::{
     route,
-    wire::{Failure, cache, head, output},
+    wire::{Failure, head, output},
 };
 use sark_http::{
     field,
@@ -46,7 +46,6 @@ fn borrowed_plain_uses_output_room() {
             output::Egress::new(writer.reborrow(), DATE, fields::RESPONSE).route(
                 fixed::Direct::new(Code::OK, (), source.as_slice()),
                 handoff::Slot::ready(None),
-                cache::Cache::empty(),
                 &mut gzip,
                 Coding::Gzip,
                 common::body::replies::POLICY,
@@ -90,10 +89,9 @@ fn frames_compressed() {
     let outcome = output::Egress::new(writer.reborrow(), date, fields::RESPONSE).route(
         response,
         handoff::Slot::ready(None),
-        cache::Cache::empty(),
         &mut gzip,
         Coding::Gzip,
-        route::Policy::new(route::Cache::Bypass, Coding::Gzip, Date::Omit, Server::Omit),
+        route::Policy::new(Coding::Gzip, Date::Omit, Server::Omit),
     );
     let output::Outcome::SendCompressed { body, read, .. } = outcome else {
         panic!("gzip policy must retain the compressed owner");
@@ -129,15 +127,9 @@ fn fixed_fields_emit_once() {
         output::Egress::new(writer.reborrow(), DATE, fields::RESPONSE).route(
             response,
             handoff::Slot::ready(None),
-            cache::Cache::empty(),
             &mut gzip,
             Coding::Gzip,
-            route::Policy::new(
-                route::Cache::Bypass,
-                Coding::Gzip,
-                Date::Include,
-                Server::Include,
-            ),
+            route::Policy::new(Coding::Gzip, Date::Include, Server::Include),
         )
     });
     let length = match outcome {
@@ -178,15 +170,9 @@ fn exact_fields_emit_once() {
             output::Egress::new(writer.reborrow(), DATE, fields::RESPONSE).route(
                 response,
                 handoff::Slot::ready(None),
-                cache::Cache::empty(),
                 &mut gzip,
                 Coding::Gzip,
-                route::Policy::new(
-                    route::Cache::Bypass,
-                    Coding::Gzip,
-                    Date::Include,
-                    Server::Include,
-                ),
+                route::Policy::new(Coding::Gzip, Date::Include, Server::Include),
             )
         });
         let length = match outcome {
@@ -228,15 +214,9 @@ fn bounded_keeps_fields() {
     let outcome = output::Egress::new(writer.reborrow(), DATE, fields::RESPONSE).route(
         response,
         handoff::Slot::ready(None),
-        cache::Cache::empty(),
         &mut gzip,
         Coding::Gzip,
-        route::Policy::new(
-            route::Cache::Bypass,
-            Coding::Gzip,
-            Date::Include,
-            Server::Include,
-        ),
+        route::Policy::new(Coding::Gzip, Date::Include, Server::Include),
     );
     let (len, body) = match outcome {
         output::Outcome::SendCompressed { body, .. } => Some((writer.len(), body)),
@@ -311,15 +291,9 @@ fn fixed_scalar_capacity() {
         let outcome = output::Egress::new(writer.reborrow(), DATE, fields::RESPONSE).route(
             response,
             handoff::Slot::ready(None),
-            cache::Cache::empty(),
             &mut gzip,
             Coding::Gzip,
-            route::Policy::new(
-                route::Cache::Bypass,
-                Coding::Gzip,
-                Date::Include,
-                Server::Include,
-            ),
+            route::Policy::new(Coding::Gzip, Date::Include, Server::Include),
         );
         let got = match outcome {
             output::Outcome::Failed(Failure::Output(error)) => Some(Err(error)),

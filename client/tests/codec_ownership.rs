@@ -1,4 +1,4 @@
-use common::codec::{Retain, Scope as _, decoder::Decoder, only};
+use common::codec::{Scope as _, assert_budget, decoder::Decoder, only};
 use o3::buffer::resident::staging::{Buf, Layout, Plan, Pool};
 use sark_client::protocol::response::Event;
 use sark_http::h1::head::Boundary;
@@ -32,13 +32,7 @@ fn retention_is_atomic() {
             let mut stored = decoder.storage(&source, &state);
             let blocker = storage::Owned::try_allocate(&budget, budget.available())
                 .expect("resident blocker");
-            Retain {
-                result: decoder.try_stored(&mut state, &mut stored, &budget),
-                budget,
-            }
-            .try_verify()
-            .ok()
-            .expect("exact resident retention error");
+            assert_budget(decoder.try_stored(&mut state, &mut stored, &budget), budget);
             drop(blocker);
             let (parsed, _) = (decoder
                 .try_stored(&mut state, &mut stored, &budget)
@@ -66,13 +60,7 @@ fn retention_is_atomic() {
             let mut stored = decoder.storage(&body, &state);
             let blocker = storage::Owned::try_allocate(&budget, budget.available())
                 .expect("resident blocker");
-            Retain {
-                result: decoder.try_stored(&mut state, &mut stored, &budget),
-                budget,
-            }
-            .try_verify()
-            .ok()
-            .expect("exact resident retention error");
+            assert_budget(decoder.try_stored(&mut state, &mut stored, &budget), budget);
             drop(blocker);
             let (parsed, _) = (decoder
                 .try_stored(&mut state, &mut stored, &budget)
@@ -103,13 +91,7 @@ fn retention_is_atomic() {
             let decoder = Decoder::try_new(&codec).expect("codec staging");
             let mut stored = decoder.storage(&body, &state);
 
-            Retain {
-                result: decoder.try_stored(&mut state, &mut stored, &budget),
-                budget,
-            }
-            .try_verify()
-            .ok()
-            .expect("exact resident retention error");
+            assert_budget(decoder.try_stored(&mut state, &mut stored, &budget), budget);
             assert_eq!(body.plans(), 1);
             body.open();
             let (parsed, _) = (decoder
@@ -153,10 +135,7 @@ fn eof_retry_is_atomic() {
         let blocker = storage::Owned::try_allocate(&budget, budget.available())
             .expect("resident blocker");
         let ((stored, state), result) = decoder.try_finish(state, stored, &budget);
-        Retain { result, budget }
-            .try_verify()
-            .ok()
-            .expect("exact resident retention error");
+        assert_budget(result, budget);
         assert_eq!(window.as_slice(), b"body");
         drop(blocker);
         let (_owners, finish) = decoder.try_finish(state, stored, &budget);
@@ -221,13 +200,7 @@ fn chunk_retry_is_atomic() {
         let decoder = Decoder::try_new(&codec).expect("codec staging");
         let mut stored = decoder.storage(&source, &state);
 
-        Retain {
-            result: decoder.try_stored(&mut state, &mut stored, &budget),
-            budget,
-        }
-        .try_verify()
-        .ok()
-        .expect("exact resident retention error");
+        assert_budget(decoder.try_stored(&mut state, &mut stored, &budget), budget);
 
         source.open();
         let (parsed, allocs) = Tracker::count(|| {

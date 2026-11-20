@@ -4,19 +4,19 @@ use std::{cell::Cell, str};
 
 use common::{
     body::replies::{self, Capture, Compressor, Reply, Shape},
-    fields::{DATE, RESPONSE},
+    fields::DATE,
     tasks::Streaming,
 };
-use o3::buffer::write::Slice;
+use o3::buffer::write::{Sink as _, Slice};
 use sark_core::body::credit;
 use sark_h1::{
     Input,
-    route::{self, stream},
+    route::stream,
     session,
     wire::{
-        Failure, cache, head, output,
-        parsing::{self, framing, raw},
-        response::Context,
+        Failure, head, output,
+        parsing::{framing, raw},
+        response::{self, Context},
     },
 };
 use sark_http::{
@@ -24,6 +24,33 @@ use sark_http::{
     owner::handoff,
     payload::response::{Method, fixed, status::Code},
 };
+
+#[test]
+fn bounded_overflow_preserves_output() {
+    let calls = Cell::new(0);
+    let mut bytes = [0; 128];
+    let mut writer = Slice::new(&mut bytes);
+    writer.write_slice(b"prior").unwrap();
+    let outcome = output::Egress::new(writer.reborrow(), DATE, common::fields::RESPONSE).plain(
+        Reply {
+            status: Code::OK,
+            shape: Shape::Bounded,
+            calls: &calls,
+        },
+        head::Connection::KeepAlive,
+    );
+    assert!(matches!(
+        outcome,
+        output::Outcome::Failed(Failure::Output(output::Error::Wire(
+            response::Error::PlanOverflow {
+                current: 108,
+                added: usize::MAX,
+            }
+        )))
+    ));
+    assert_eq!(calls.get(), 1);
+    assert_eq!(writer.into_mut(), b"prior");
+}
 
 #[test]
 fn omits_body() {
@@ -45,7 +72,6 @@ fn omits_body() {
                     calls: &calls,
                 },
                 handoff::Slot::ready(None),
-                cache::Cache::empty(),
                 &mut gzip,
                 Coding::Gzip,
                 replies::POLICY,
@@ -69,87 +95,9 @@ fn omits_body() {
 }
 
 #[test]
-fn cache_match() {
-    let mut entry = None;
-    let mut write = [0; 256];
-    let policy = route::Policy {
-        cache: route::Cache::Store,
-        ..replies::POLICY
-    };
-    let outcome = output::Egress::new(
-        o3::buffer::write::Slice::new(&mut write).reborrow(),
-        DATE,
-        RESPONSE,
-    )
-    .route(
-        fixed::Direct::new(Code::OK, (), replies::BYTES),
-        handoff::Slot::ready(None),
-        cache::Cache::new(&mut entry),
-        &mut (),
-        Coding::Plain,
-        policy,
-    );
-    assert!(
-        matches!(outcome, output::Outcome::SendCopied { copy, .. } if copy.written == replies::BYTES.len())
-    );
-    for context in [
-        Context::new(Method::Head, Version::Eleven),
-        Context::new(Method::Other, Version::Ten),
-    ] {
-        write.fill(0xa5);
-        assert!(
-            output::Egress::new(
-                o3::buffer::write::Slice::new(&mut write).reborrow(),
-                DATE,
-                context
-            )
-            .cached(&mut cache::Cache::new(&mut entry), route::Cache::Store)
-            .is_none()
-        );
-        assert!(write.iter().all(|byte| *byte == 0xa5));
-    }
-    let calls = Cell::new(0);
-    let context = Context::new(Method::Head, Version::Eleven);
-    let cold = output::Egress::new(
-        o3::buffer::write::Slice::new(&mut write).reborrow(),
-        DATE,
-        context,
-    )
-    .route(
-        Reply {
-            status: Code::OK,
-            shape: Shape::Exact,
-            calls: &calls,
-        },
-        handoff::Slot::ready(None),
-        cache::Cache::new(&mut entry),
-        &mut (),
-        Coding::Plain,
-        policy,
-    );
-    assert!(matches!(
-        cold,
-        output::Outcome::SendCopied { copy, .. } if copy.written == 0
-    ));
-    let hot = output::Egress::new(
-        o3::buffer::write::Slice::new(&mut write).reborrow(),
-        DATE,
-        context,
-    )
-    .cached(&mut cache::Cache::new(&mut entry), route::Cache::Store);
-    assert!(matches!(
-        hot,
-        Some(output::Outcome::SendCopied { copy, .. }) if copy.written == 0
-    ));
-    assert_eq!(calls.get(), 0);
-}
-
-#[test]
 fn omits_stream() {
     for &request in replies::HEADS {
-        let parsed = parsing::Head::parse(Input::Borrowed(request), u8::MAX)
-            .expect("line")
-            .expect("head");
+        let parsed = common::head::parsed(Input::Borrowed(request), u8::MAX);
         let head = framing::Head::<Streaming>::parse(raw::Bound::empty(&parsed))
             .ok()
             .flatten()

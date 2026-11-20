@@ -1,6 +1,5 @@
-use common::client::recover;
+use common::client::assert_shutdown;
 use common::client::runtime::peer;
-use dope::core::{driver::life::recovery, io::Reclaimed};
 use dope_test::harness::{
     GUARD,
     peer::{AcceptScript, TcpAcceptor},
@@ -97,11 +96,7 @@ fn rejects_invalid_headers() {
                         Error::Request(actual) if *actual == expected
                     ));
                 },
-                recovery::Policy::new(
-                    |event| std::assert_matches!(event, Reclaimed::Shutdown),
-                    recover,
-                ),
-                |result| result.expect("client execution"),
+                assert_shutdown,
             )
             .expect("HTTP request execution");
             peer::empty(&mut acceptor).expect("validation never submits any bytes");
@@ -172,8 +167,7 @@ fn failed_origin_keeps_slot() {
                             .expect("origin capacity retained");
                         assert_eq!(reply.status().as_u16(), 204);
                     },
-                    recovery::Policy::new(|_| {}, recover),
-                    |result| result.expect("client execution"),
+                    |_| {},
                 )
                 .expect("dynamic shutdown");
             server
@@ -213,11 +207,7 @@ fn rejects_connect() {
                     "{failure:?}"
                 );
             },
-            recovery::Policy::new(
-                |event| std::assert_matches!(event, Reclaimed::Shutdown),
-                recover,
-            ),
-            |result| result.expect("client execution"),
+            assert_shutdown,
         )
         .expect("HTTP request execution");
         peer::empty(&mut acceptor).expect("CONNECT never submits any bytes");
@@ -258,11 +248,7 @@ fn rejects_switch() {
                             ))
                         ));
                     },
-                    recovery::Policy::new(
-                        |event| std::assert_matches!(event, Reclaimed::Shutdown),
-                        recover,
-                    ),
-                    |result| result.expect("client execution"),
+                    assert_shutdown,
                 )
                 .expect("HTTP request execution");
                 peer.stop()
@@ -312,11 +298,7 @@ fn attempts() {
                             assert_eq!(failure.attempt(), 2);
                             assert_eq!(failure.safety(), Safety::PossiblyCommitted);
                         },
-                        recovery::Policy::new(
-                            |event| std::assert_matches!(event, Reclaimed::Shutdown),
-                            recover,
-                        ),
-                        |result| result.expect("client execution"),
+                        assert_shutdown,
                     )
                     .expect("retry postprocessing execution");
                     server
@@ -343,11 +325,7 @@ fn get_retries() {
             let response = Request::new(flavor, &addr, config, Method::GET, "/effect", &[], &[])
                 .try_run(
                     |result| result.expect("HTTP response"),
-                    recovery::Policy::new(
-                        |event| std::assert_matches!(event, Reclaimed::Shutdown),
-                        recover,
-                    ),
-                    |result| result.expect("client execution"),
+                    assert_shutdown,
                 )
                 .expect("HTTP request execution");
             assert_eq!(response.status().as_u16(), 200);
@@ -403,11 +381,7 @@ fn uses_exact_authority() {
             )
             .try_run(
                 |result| result.expect("HTTP response"),
-                recovery::Policy::new(
-                    |event| std::assert_matches!(event, Reclaimed::Shutdown),
-                    recover,
-                ),
-                |result| result.expect("client execution"),
+                assert_shutdown,
             )
             .expect("HTTP request execution");
             assert_eq!(response.status().as_u16(), 200);

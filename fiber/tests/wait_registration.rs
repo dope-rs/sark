@@ -1,3 +1,4 @@
+use common::client::assert_shutdown;
 pub mod common;
 
 use std::{cell::Cell, net::TcpListener, task::Poll, time::Duration};
@@ -6,8 +7,6 @@ use common::client::runtime::{
     calls::{Cancel, Reconnect, WAIT_PATHS, WAIT_RESPONSE},
     origins, peer, pools,
 };
-use common::server::recover;
-use dope::core::{driver::life::recovery, io::Reclaimed};
 use dope_fiber::{
     BlockOn as _, abi,
     abi::race::{Either, Race},
@@ -40,11 +39,7 @@ fn rearms_after_failure() {
                 Ok(Either::Right(Ok(Ok(()))))
             ));
         },
-        recovery::Policy::new(
-            |event| std::assert_matches!(event, Reclaimed::Shutdown),
-            recover,
-        ),
-        |result| result.expect("client execution"),
+        assert_shutdown,
     )
     .expect("client shutdown");
 }
@@ -91,11 +86,7 @@ fn rearms_reserved() {
                             result.expect("queued client response");
                         }
                     },
-                    recovery::Policy::new(
-                        |event| std::assert_matches!(event, Reclaimed::Shutdown),
-                        recover,
-                    ),
-                    |result| result.expect("client execution"),
+                    assert_shutdown,
                 )
                 .expect("client shutdown");
             server
@@ -159,11 +150,7 @@ fn ready_survives_cancel() {
                 .expect("connection ready");
             assert!(ready.next().is_none(), "one notified waiter canceled");
         },
-        recovery::Policy::new(
-            |event| std::assert_matches!(event, Reclaimed::Shutdown),
-            recover,
-        ),
-        |result| result.expect("client execution"),
+        assert_shutdown,
     )
     .expect("client shutdown");
 }
@@ -263,11 +250,7 @@ fn dispatch_survives_cancel() {
             assert!(ready.next().is_none(), "one notified request canceled");
             assert_eq!(wire, WAIT_PATHS[index]);
         },
-        recovery::Policy::new(
-            |event| std::assert_matches!(event, Reclaimed::Shutdown),
-            recover,
-        ),
-        |result| result.expect("client execution"),
+        assert_shutdown,
     )
     .expect("client shutdown");
 }
@@ -378,11 +361,7 @@ fn dynamic_dispatch_survives_cancel() {
                             assert!(ready.next().is_none(), "one notified request canceled");
                             WAIT_PATHS[index]
                         },
-                        recovery::Policy::new(
-                            |event| std::assert_matches!(event, Reclaimed::Shutdown),
-                            recover,
-                        ),
-                        |result| result.expect("client execution"),
+                        assert_shutdown,
                     )
                     .expect("client shutdown");
             assert_eq!(

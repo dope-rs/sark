@@ -113,7 +113,9 @@ fn transfer_order() {
 
     let invalid = field::Transfer::default();
     assert!(invalid.parse(b"chunked, gzip") == Err(field::value::Error::InvalidOrdering));
-    assert!(!invalid.has_encoding(), "push must be transactional");
+    for empty in [b"chunked, \t", b"chunked; \t"] {
+        assert!(invalid.parse(empty) == Err(field::value::Error::Empty));
+    }
     assert!(invalid.parse(b"chunked; forbidden=yes") == Err(field::value::Error::InvalidByte));
     assert!(!invalid.has_encoding(), "push must be transactional");
 }

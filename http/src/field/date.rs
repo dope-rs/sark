@@ -7,6 +7,8 @@ use core::{
 use dope_runtime::civil::{Error as CivilError, Source as _, System};
 use o3::base::time;
 
+use crate::h1::codec::numbers::raw::PAIRS;
+
 const DAYS: [[u8; 3]; 7] = [
     *b"Thu", *b"Fri", *b"Sat", *b"Sun", *b"Mon", *b"Tue", *b"Wed",
 ];
@@ -14,7 +16,6 @@ const MONTHS: [[u8; 3]; 12] = [
     *b"Jan", *b"Feb", *b"Mar", *b"Apr", *b"May", *b"Jun", *b"Jul", *b"Aug", *b"Sep", *b"Oct",
     *b"Nov", *b"Dec",
 ];
-const DIGITS: [[u8; 2]; 100] = digits();
 
 /// An IMF-fixdate field value with its wire length encoded in the type.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -126,7 +127,7 @@ const fn civil(day: i64) -> (i64, u8, u8) {
 const fn pair(bytes: &mut [u8; Stamp::LEN], at: usize, value: usize) {
     // SAFETY: civil dates, daytime remainders, and the admitted four-digit year
     // supply only values below 100. Each call selects a fixed two-byte output slot.
-    let pair = unsafe { &*DIGITS.as_ptr().add(value) };
+    let pair = unsafe { &*PAIRS.as_ptr().add(value) };
     write(bytes, at, pair);
 }
 
@@ -134,16 +135,6 @@ const fn write<const N: usize>(bytes: &mut [u8; Stamp::LEN], at: usize, value: &
     // SAFETY: this module's fixed two- and three-byte slots all end at or before
     // byte 25 of the exclusively borrowed 29-byte output. Arrays of u8 align to 1.
     unsafe { bytes.as_mut_ptr().add(at).cast::<[u8; N]>().write(*value) };
-}
-
-const fn digits() -> [[u8; 2]; 100] {
-    let mut table = [[0; 2]; 100];
-    let mut value = 0;
-    while value < 100 {
-        table[value] = [b'0' + (value / 10) as u8, b'0' + (value % 10) as u8];
-        value += 1;
-    }
-    table
 }
 
 const _: () = {

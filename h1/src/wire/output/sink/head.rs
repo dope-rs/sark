@@ -10,7 +10,7 @@ use sark_http::{
 use crate::wire::{
     output::sink::{Error, Headers},
     response::{
-        self, consts,
+        self,
         framing::{self, Framing as _},
     },
 };
@@ -33,17 +33,7 @@ pub(super) fn emit_tail(
 ) -> Result<(), response::Error> {
     let mut out = response::Writer::exact(out);
     framing::Length(len).write(&mut out)?;
-    out.end_head(date.response, date.value, date.server, date.dated)?;
-    Ok(())
-}
-
-pub(super) struct Layout<'date, 'field, H> {
-    date: Headers<'date>,
-    fields: &'field H,
-    status: Code,
-    head: usize,
-    capacity: usize,
-    encodings: usize,
+    out.end_head(date.response, date.value, date.server, date.dated)
 }
 
 pub(super) struct Pending<'writer, 'out, 'date, 'field, H> {
@@ -78,108 +68,39 @@ pub(super) fn emit_framed_head<H: field::Source, F: framing::Framing, C: respons
         framing: frame,
     };
     let mut writer = response::Writer::exact(out);
-    let (_, count) = head.emit(&mut writer, date.value, date.server, date.dated)?;
+    let count = head.emit(&mut writer, date.value, date.server, date.dated)?;
     Ok((writer.finish(), count))
 }
 
-pub(super) fn render_framed_head<H, F>(
-    status: Code,
-    fields: &H,
-    frame: F,
-    tail: usize,
-    date: Headers<'_>,
-) -> Result<(storage::Owned, Option<usize>, usize), response::Error>
-where
-    H: field::Source,
-    F: framing::Framing,
-{
-    let head = response::Head {
-        response: date.response,
-        status,
-        headers: fields,
-        framing: frame,
-    };
-    let plan = head.plan(date.server, date.dated)?;
-    let expected = plan.len();
-    let total = expected
-        .checked_add(tail)
-        .ok_or(response::Error::PlanOverflow {
-            current: expected,
-            added: tail,
-        })?;
-    let mut bytes = storage::Owned::try_filled(total, 0).map_err(response::Error::Storage)?;
-    let mut out = Slice::new(&mut bytes[..expected]);
-    let mut writer = response::Writer::exact(out.reborrow());
-    let (off, ()) = head.emit(
-        &mut writer,
-        consts::PLACEHOLDER_DATE,
-        date.server,
-        date.dated,
-    )?;
-    let len = writer.finish();
-    if len != expected {
-        return Err(response::Error::HeadLength {
-            expected,
-            actual: len,
-        });
-    }
-    Ok((bytes, off, len))
-}
-
-impl<'date, 'field, H> Layout<'date, 'field, H>
-where
-    H: field::Source,
-{
-    pub(super) fn new(
+impl<'writer, 'out, 'date, 'field, H: field::Source> Pending<'writer, 'out, 'date, 'field, H> {
+    pub(super) fn try_place(
+        out: &'writer mut Slice<'out, &'out mut usize>,
         date: Headers<'date>,
         status: Code,
         fields: &'field H,
         max: usize,
-    ) -> Result<Self, response::Error> {
-        let head = response::Head {
+    ) -> Result<Option<Self>, Error> {
+        let (head, encodings) = response::Head {
             response: date.response,
             status,
             headers: fields,
             framing: framing::Padded(0),
+        }
+        .plan(date.server, date.dated)?;
+        let Ok(split) = out.try_split(head, max) else {
+            head.checked_add(max).ok_or(response::Error::PlanOverflow {
+                current: head,
+                added: max,
+            })?;
+            return Ok(None);
         };
-        let plan = head.plan(date.server, date.dated)?;
-        let len = plan.len();
-        let required = len.checked_add(max).ok_or(response::Error::PlanOverflow {
-            current: len,
-            added: max,
-        })?;
-        Ok(Self {
+        Ok(Some(Self {
+            split,
             date,
             fields,
             status,
-            head: len,
-            capacity: required,
-            encodings: plan.encodings(),
-        })
-    }
-
-    pub(super) const fn capacity(&self) -> usize {
-        self.capacity
-    }
-}
-
-impl<'writer, 'out, 'date, 'field, H> Pending<'writer, 'out, 'date, 'field, H> {
-    /// Places disjoint slices using `Layout::new`'s checked `capacity = head + max`.
-    /// Layout's private fields preserve this proof through placement.
-    pub(super) fn place(
-        layout: &Layout<'date, 'field, H>,
-        out: &'writer mut Slice<'out, &'out mut usize>,
-    ) -> Option<Self> {
-        let split = out
-            .try_split(layout.head, layout.capacity - layout.head)
-            .ok()?;
-        Some(Self {
-            split,
-            date: layout.date,
-            fields: layout.fields,
-            status: layout.status,
-            encodings: layout.encodings,
-        })
+            encodings,
+        }))
     }
 
     pub(super) fn encode(&mut self, body: impl Encode) -> Result<usize, Error> {
@@ -187,9 +108,6 @@ impl<'writer, 'out, 'date, 'field, H> Pending<'writer, 'out, 'date, 'field, H> {
         body.encode(&mut out).map_err(storage::BuildError::Build)?;
         Ok(out.len())
     }
-}
-
-impl<H: field::Source> Pending<'_, '_, '_, '_, H> {
     pub(super) const fn encodings(&self) -> usize {
         self.encodings
     }
@@ -198,7 +116,7 @@ impl<H: field::Source> Pending<'_, '_, '_, '_, H> {
         self.split.body().into_mut()
     }
 
-    pub(super) fn finish(mut self) -> Result<Option<usize>, response::Error> {
+    pub(super) fn finish(mut self) -> Result<(), response::Error> {
         let body = self.split.body().len();
         let head = response::Head {
             response: self.date.response,
@@ -207,7 +125,7 @@ impl<H: field::Source> Pending<'_, '_, '_, '_, H> {
             framing: framing::Padded(body),
         };
         let mut writer = response::Writer::exact(self.split.head());
-        let (off, ()) = head.emit(
+        head.emit::<()>(
             &mut writer,
             self.date.value,
             self.date.server,
@@ -219,7 +137,6 @@ impl<H: field::Source> Pending<'_, '_, '_, '_, H> {
                 expected: expected.get(),
                 actual,
             }
-        })?;
-        Ok(off)
+        })
     }
 }

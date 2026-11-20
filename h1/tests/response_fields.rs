@@ -3,26 +3,14 @@ pub mod common;
 use std::cell::Cell;
 
 use common::fields::{
-    Counted, DATE, DRIFT_VALUES, Drifting, ENCODED_BODY, ENTRIES, GENERATED_IDENTITY, GROUP,
-    GROUP_ENCODING, IDENTITY, RESPONSE, try_encode,
+    Counted, DATE, ENCODED_BODY, ENTRIES, GENERATED_IDENTITY, GROUP, GROUP_ENCODING, IDENTITY,
+    RESPONSE, try_encode,
 };
 use o3::buffer::write::Slice;
-use sark_h1::{
-    route,
-    wire::{Failure, cache, head, output},
-};
-use sark_http::{
-    field,
-    h1::head::{
-        request::Coding,
-        response::{Date, Server},
-    },
-    owner::handoff,
-    payload::{
-        compress::{Compression as _, Gzip},
-        fixed::Body,
-        response::{headers, statics, status::Code},
-    },
+use sark_h1::wire::{Failure, head, output};
+use sark_http::payload::{
+    fixed::Body,
+    response::{headers, statics, status::Code},
 };
 
 #[test]
@@ -85,49 +73,6 @@ fn grouped_capacity() {
         assert_eq!(right, left, "capacity {capacity}");
         assert_eq!(right.is_ok(), capacity == length);
         assert_eq!(grouped, scalar, "capacity {capacity}");
-    }
-}
-
-#[test]
-fn cache_rejects_drift() {
-    for &(first, second) in DRIFT_VALUES {
-        let emits = Cell::new(0);
-        let response = statics::Direct::new(
-            Code::OK,
-            Drifting {
-                emissions: &emits,
-                first: field::Value::try_bytes(first).expect("first"),
-                second: field::Value::try_bytes(second).expect("second"),
-            },
-            Body::new(b"body"),
-        );
-        let mut bytes = [0; 512];
-        let result = Gzip::try_new();
-        let mut gzip = result.expect("test gzip allocation");
-        let outcome = output::Egress::new(
-            o3::buffer::write::Slice::new(&mut bytes).reborrow(),
-            DATE,
-            RESPONSE,
-        )
-        .route(
-            response,
-            handoff::Slot::ready(None),
-            cache::Cache::empty(),
-            &mut gzip,
-            Coding::Plain,
-            route::Policy::new(
-                route::Cache::Store,
-                Coding::Plain,
-                Date::Include,
-                Server::Include,
-            ),
-        );
-
-        assert!(matches!(
-            outcome,
-            output::Outcome::Failed(Failure::Output(_))
-        ));
-        assert_eq!(emits.get(), 2);
     }
 }
 

@@ -1,7 +1,6 @@
 use o3::{buffer::storage, mem::rc};
 use storage::range;
 pub(crate) mod body;
-pub mod cache;
 mod failure;
 pub mod head;
 pub mod output;

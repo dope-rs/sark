@@ -3,7 +3,7 @@ use std::{borrow::Borrow, marker::PhantomData};
 use o3::buffer::bytes::scope;
 
 use crate::{
-    owner::handoff::{Origin, Project, Slot, origin, stage},
+    owner::handoff::{Origin, Project, Slot, stage},
     payload::owned,
     request::body::{self, Source as _},
 };
@@ -91,14 +91,11 @@ impl<'d> Input<'_, 'd> {
 
 impl<'req, 'd, P: stage::Proof> Bound<'req, 'd, P> {
     fn slot(view: body::Ref<'req, 'd>, proof: P) -> Slot<'req, 'd, (), Self> {
-        let source = match view.try_retained() {
-            Ok(body) => origin::Source::Retained(Self { body, proof }),
-            Err(_) => origin::Source::Empty(PhantomData),
+        let origin = match view.try_retained() {
+            Ok(body) => Origin::Retained(Self { body, proof }),
+            Err(_) => Origin::Empty(PhantomData),
         };
-        Slot {
-            origin: Origin { source },
-            head: (),
-        }
+        Slot { origin, head: () }
     }
 }
 

@@ -132,9 +132,7 @@ impl Ingress {
                 );
             }
         };
-        let mut staged = write
-            .try_split(0, write.remaining())
-            .unwrap_or_else(|_| unreachable!("output"));
+        let mut staged = write.stage();
         let (batch, source) = match prepared {
             Some(buffer) => {
                 let view = crate::Input::Buffered(buffer.view());
@@ -153,9 +151,7 @@ impl Ingress {
         };
         let cycle = Self::settle(conn, batch, source, !staged.body().is_empty());
         if cycle.state.is_ok() {
-            staged
-                .try_commit()
-                .unwrap_or_else(|_| unreachable!("output"));
+            staged.commit();
         }
         cycle
     }

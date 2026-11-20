@@ -4,10 +4,7 @@ use o3::{
     base::cell::region,
     buffer::{resident, storage::Owned},
 };
-use sark_http::h1::{
-    chunk,
-    codec::decode::{chunks, trailer},
-};
+use sark_http::h1::{chunk, codec::decode::chunks};
 
 #[test]
 fn growth_keeps_admission() {
@@ -42,25 +39,15 @@ fn growth_keeps_admission() {
             .ok()
             .expect("bound input");
         let plan = plan.split().ok().expect("complete trailer");
-        let (mut plan, _) = plan
-            .try_append(|| Ok::<_, Infallible>(()))
-            .err()
-            .expect("capacity")
-            .into_parts();
+        let (mut plan, error) = plan.try_append().err().expect("capacity").into_parts();
+        let (required, available) = error.into_parts();
+        assert_eq!((required.get(), available), (4, 0));
         assert_eq!(plan.len(), 4);
         plan.try_grow(Owned::try_allocate(&budget, 8).expect("larger owner"))
             .expect("same prefix");
-        let (plan, error) = plan
-            .try_append(|| Err::<(), _>("dependent"))
-            .err()
-            .expect("dependent failure")
-            .into_parts();
-        assert!(matches!(error, trailer::AppendError::Ready("dependent")));
+        let plan = plan.try_append().ok().expect("capacity").cancel();
         assert_eq!(plan.len(), 4);
-        let (owner, consumed, ()) = plan
-            .try_append(|| Ok::<_, Infallible>(()))
-            .ok()
-            .expect("retained admission");
+        let (owner, consumed) = plan.try_append().ok().expect("retained admission").commit();
         assert_eq!(consumed.get(), 4);
         assert_eq!(checks, 1);
         assert_eq!(
@@ -96,5 +83,14 @@ fn split_forbidden_name() {
             .into_parts();
         assert!(matches!(error, chunk::Error::Forbidden { .. }));
         assert_eq!(state.len(), 11);
+        let error = state.prepare(&[b'x'; 16_384]).err().expect("trailer limit");
+        assert!(matches!(
+            error.discard(),
+            chunk::Error::Limit {
+                axis: chunk::Axis::Trailer,
+                actual: 16_385,
+                maximum: 16_384,
+            }
+        ));
     });
 }

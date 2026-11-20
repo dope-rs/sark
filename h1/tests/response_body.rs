@@ -10,7 +10,7 @@ use dope_test::alloc::Tracker;
 use o3::buffer::write::Slice;
 use sark_h1::{
     route,
-    wire::{cache, head, output},
+    wire::{head, output},
 };
 use sark_http::{
     h1::head::{
@@ -20,14 +20,7 @@ use sark_http::{
     owner::handoff,
     payload::{
         compress::{Compression, Gzip},
-        response::{
-            bounded, exact,
-            headers::{
-                head::{Head, Template},
-                set,
-            },
-            status::Code,
-        },
+        response::headers::head::Template,
     },
 };
 
@@ -39,14 +32,7 @@ fn preencoded_inline() {
     let fields = [IDENTITY];
     let template = Template::new(&fields);
     let encodes = Cell::new(0);
-    let response = exact::Direct::new(
-        Code::OK,
-        Head::new(&template, set::Set::<0>::new()),
-        Counted {
-            bytes: b"encoded",
-            encodes: &encodes,
-        },
-    );
+    let response = Counted::exact(&template, b"encoded", &encodes);
     let mut bytes = [0; 512];
     let mut writer = Slice::new(&mut bytes);
     let mut gzip = Gzip::try_new().expect("test gzip allocation");
@@ -54,15 +40,9 @@ fn preencoded_inline() {
         output::Egress::new(writer.reborrow(), DATE, fields::RESPONSE).route(
             response,
             handoff::Slot::ready(None),
-            cache::Cache::empty(),
             &mut gzip,
             Coding::Gzip,
-            route::Policy::new(
-                route::Cache::Bypass,
-                Coding::Gzip,
-                Date::Include,
-                Server::Include,
-            ),
+            route::Policy::new(Coding::Gzip, Date::Include, Server::Include),
         )
     });
     let output::Outcome::SendCopied { copy, .. } = outcome else {
@@ -81,26 +61,13 @@ fn plain_compressor() {
     let mut writer = Slice::new(&mut bytes);
     let (outcome, allocs) = Tracker::count(|| {
         <() as Compression>::try_new().expect("plain policy");
-        let response = exact::Direct::new(
-            Code::OK,
-            Head::new(&TEMPLATE, set::Set::<0>::new()),
-            Counted {
-                bytes: b"plain",
-                encodes: &encodes,
-            },
-        );
+        let response = Counted::exact(&TEMPLATE, b"plain", &encodes);
         output::Egress::new(writer.reborrow(), DATE, fields::RESPONSE).route(
             response,
             handoff::Slot::ready(None),
-            cache::Cache::empty(),
             &mut (),
             Coding::Gzip,
-            route::Policy::new(
-                route::Cache::Bypass,
-                Coding::Gzip,
-                Date::Include,
-                Server::Include,
-            ),
+            route::Policy::new(Coding::Gzip, Date::Include, Server::Include),
         )
     });
     let output::Outcome::SendCopied { copy, .. } = outcome else {
@@ -116,14 +83,7 @@ fn plain_compressor() {
 fn reuses_inline_on_limit() {
     let encodes = Cell::new(0);
     let body = vec![b'x'; 300 * 1024];
-    let response = exact::Direct::new(
-        Code::OK,
-        Head::new(&TEMPLATE, set::Set::<0>::new()),
-        Counted {
-            bytes: &body,
-            encodes: &encodes,
-        },
-    );
+    let response = Counted::exact(&TEMPLATE, &body, &encodes);
     let date = b"Mon, 01 Jan 2026 00:00:00 GMT";
     let mut bytes = vec![0; body.len() + 1024];
     let mut writer = Slice::new(&mut bytes);
@@ -132,15 +92,9 @@ fn reuses_inline_on_limit() {
     let outcome = output::Egress::new(writer.reborrow(), date, fields::RESPONSE).route(
         response,
         handoff::Slot::ready(None),
-        cache::Cache::empty(),
         &mut gzip,
         Coding::Gzip,
-        route::Policy::new(
-            route::Cache::Bypass,
-            Coding::Gzip,
-            Date::Include,
-            Server::Include,
-        ),
+        route::Policy::new(Coding::Gzip, Date::Include, Server::Include),
     );
     let output::Outcome::SendCopied { copy, .. } = outcome else {
         panic!("unavailable gzip must keep the encoded inline body");
@@ -155,15 +109,7 @@ fn reuses_inline_on_limit() {
 fn encodes_bounded_once() {
     let encodes = Cell::new(0);
     let body = [b'x'; 512];
-    let response: bounded::Output<'_, _, 0> = bounded::Output::new(
-        Code::OK,
-        &TEMPLATE,
-        set::Set::new(),
-        Counted {
-            bytes: &body,
-            encodes: &encodes,
-        },
-    );
+    let response = Counted::bounded(&body, &encodes);
     let date = b"Mon, 01 Jan 2026 00:00:00 GMT";
     let mut bytes = [0; 128];
     let mut writer = Slice::new(&mut bytes);
@@ -180,30 +126,16 @@ fn encodes_bounded_once() {
 fn bounded_reuses_inline() {
     let encodes = Cell::new(0);
     let body = vec![b'x'; 300 * 1024];
-    let response: bounded::Output<'_, _, 0> = bounded::Output::new(
-        Code::OK,
-        &TEMPLATE,
-        set::Set::new(),
-        Counted {
-            bytes: &body,
-            encodes: &encodes,
-        },
-    );
+    let response = Counted::bounded(&body, &encodes);
     let mut bytes = vec![0; body.len() * 2 + 1024];
     let mut writer = Slice::new(&mut bytes);
     let mut gzip = Gzip::try_new().expect("test gzip pool allocation");
     let outcome = output::Egress::new(writer.reborrow(), DATE, fields::RESPONSE).route(
         response,
         handoff::Slot::ready(None),
-        cache::Cache::empty(),
         &mut gzip,
         Coding::Gzip,
-        route::Policy::new(
-            route::Cache::Bypass,
-            Coding::Gzip,
-            Date::Include,
-            Server::Include,
-        ),
+        route::Policy::new(Coding::Gzip, Date::Include, Server::Include),
     );
     let (written, len) = match outcome {
         output::Outcome::SendCopied { copy, .. } => Some((writer.len(), copy.written)),
@@ -219,15 +151,7 @@ fn bounded_reuses_inline() {
 fn compresses_bounded_once() {
     let encodes = Cell::new(0);
     let body = [b'x'; 512];
-    let response: bounded::Output<'_, _, 0> = bounded::Output::new(
-        Code::OK,
-        &TEMPLATE,
-        set::Set::new(),
-        Counted {
-            bytes: &body,
-            encodes: &encodes,
-        },
-    );
+    let response = Counted::bounded(&body, &encodes);
     let date = b"Mon, 01 Jan 2026 00:00:00 GMT";
     let mut bytes = [0; 2048];
     let mut writer = Slice::new(&mut bytes);
@@ -235,15 +159,9 @@ fn compresses_bounded_once() {
     let outcome = output::Egress::new(writer.reborrow(), date, fields::RESPONSE).route(
         response,
         handoff::Slot::ready(None),
-        cache::Cache::empty(),
         &mut gzip,
         Coding::Gzip,
-        route::Policy::new(
-            route::Cache::Bypass,
-            Coding::Gzip,
-            Date::Include,
-            Server::Include,
-        ),
+        route::Policy::new(Coding::Gzip, Date::Include, Server::Include),
     );
     let (head_len, zipped, read) = match outcome {
         output::Outcome::SendCompressed { body, read, .. } => Some((writer.len(), body, read)),

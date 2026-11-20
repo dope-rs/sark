@@ -1,6 +1,6 @@
 use std::{convert::Infallible, ops::ControlFlow, ptr};
 
-use handoff::{Error, Origin, Pending, Ready, origin::Source, stage};
+use handoff::{Error, Origin, Pending, Ready, stage};
 use o3::buffer::{
     bytes::scope,
     hold::{self, evidence},
@@ -18,8 +18,12 @@ pub struct Plan<'req, 'd, S = Infallible, B = body::Retained<'req, 'd>> {
 }
 
 impl<'req, 'd, S, B: stage::Body<'req, 'd>> Plan<'req, 'd, S, B> {
-    pub(crate) const fn new(state: State<'req, 'd, S, B>) -> Self {
+    const fn new(state: State<'req, 'd, S, B>) -> Self {
         Self { state }
+    }
+
+    pub(super) const fn ready(origin: Origin<'req, 'd, B>, body: Ready<'d>) -> Self {
+        Self::new(State::Ready { origin, body })
     }
 
     pub(crate) fn try_borrow<H: scope::Source<Selection = S>>(
@@ -28,7 +32,7 @@ impl<'req, 'd, S, B: stage::Body<'req, 'd>> Plan<'req, 'd, S, B> {
     ) -> Result<Self, owned::Error> {
         match Self::try_select(slot, bytes)? {
             Some(plan) => Ok(plan),
-            None => Self::try_copy(slot.origin(), bytes),
+            None => Self::try_copy(slot.origin, bytes),
         }
     }
 
@@ -46,18 +50,18 @@ impl<'req, 'd, S, B: stage::Body<'req, 'd>> Plan<'req, 'd, S, B> {
         if let Some(written) = handoff::copy::into(out, bytes) {
             return Ok(ControlFlow::Break(written));
         }
-        Self::try_copy(slot.origin(), bytes).map(ControlFlow::Continue)
+        Self::try_copy(slot.origin, bytes).map(ControlFlow::Continue)
     }
 
     fn try_select<H: scope::Source<Selection = S>>(
         slot: &handoff::Slot<'req, 'd, H, B>,
         bytes: &[u8],
     ) -> Result<Option<Self>, owned::Error> {
-        let origin = slot.origin();
+        let origin = slot.origin;
         if bytes.is_empty() {
-            return Ok(Some(Self::new(origin.clear())));
+            return Ok(Some(slot.clear()));
         }
-        if let Source::Retained(body) = origin.source {
+        if let Origin::Retained(body) = origin {
             if body
                 .borrow()
                 .as_slice()
@@ -66,10 +70,7 @@ impl<'req, 'd, S, B: stage::Body<'req, 'd>> Plan<'req, 'd, S, B> {
                 return Ok(Some(Self::new(State::Body(body))));
             }
             if let Some(body) = body.borrow().try_slice(bytes)? {
-                return Ok(Some(Self::new(State::Ready {
-                    origin,
-                    body: Ready::Linked(body),
-                })));
+                return Ok(Some(Self::ready(origin, Ready::Linked(body))));
             }
         }
         if let Some(selected) = slot.head.select(bytes) {
@@ -78,43 +79,32 @@ impl<'req, 'd, S, B: stage::Body<'req, 'd>> Plan<'req, 'd, S, B> {
         Ok(None)
     }
 
-    pub(crate) fn try_retain(
-        origin: Origin<'req, 'd, B>,
-        view: body::Retained<'_, 'd>,
+    pub(crate) fn try_view<H: scope::Source<Selection = S>>(
+        slot: &handoff::Slot<'req, 'd, H, B>,
+        view: body::Ref<'_, 'd>,
     ) -> Result<Self, owned::Error> {
-        if let Source::Retained(body) = origin.source
-            && view.is_same(*body.borrow())
-        {
-            return Ok(Self::new(State::Body(body)));
+        if view.is_empty() {
+            return Ok(slot.clear());
         }
-        let body = view.try_clone()?;
-        Ok(Self::new(State::Ready {
-            origin,
-            body: Ready::Segmented(body),
-        }))
-    }
-
-    pub(crate) fn try_view(
-        origin: Origin<'req, 'd, B>,
-        view: body::Ref<'_, '_>,
-    ) -> Result<Self, owned::Error> {
-        use handoff::copy;
-
-        let body = view.try_copy()?;
-        Ok(Self::new(State::Ready {
-            origin,
-            body: Ready::Copied(copy::Body::new(body)),
-        }))
+        let body = match view.try_retained() {
+            Ok(view) => {
+                if let Origin::Retained(body) = slot.origin
+                    && view.is_same(*body.borrow())
+                {
+                    return Ok(Self::new(State::Body(body)));
+                }
+                Ready::Segmented(view.try_clone()?)
+            }
+            Err(view) => Ready::Copied(handoff::copy::Body::new(view.try_copy()?)),
+        };
+        Ok(Self::ready(slot.origin, body))
     }
 
     fn try_copy(origin: Origin<'req, 'd, B>, bytes: &[u8]) -> Result<Self, owned::Error> {
         use handoff::copy;
 
         let body = storage::Shared::try_copy(bytes).map_err(owned::Error::Storage)?;
-        Ok(Self::new(State::Ready {
-            origin,
-            body: Ready::Copied(copy::Body::new(body)),
-        }))
+        Ok(Self::ready(origin, Ready::Copied(copy::Body::new(body))))
     }
 
     pub fn stage(self) -> stage::State<'d, S, B> {
@@ -183,7 +173,7 @@ impl<'req, 'd, B: stage::Body<'req, 'd>> Plan<'req, 'd, Infallible, B> {
 
 const _: () = assert!(size_of::<Plan<'static, 'static>>() == size_of::<State<'static, 'static>>());
 
-pub(crate) enum State<'req, 'd, S = Infallible, B = body::Retained<'req, 'd>> {
+enum State<'req, 'd, S = Infallible, B = body::Retained<'req, 'd>> {
     Ready {
         origin: Origin<'req, 'd, B>,
         body: Ready<'d>,

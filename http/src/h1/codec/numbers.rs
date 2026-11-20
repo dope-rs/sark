@@ -1,6 +1,6 @@
 use std::{mem::MaybeUninit, num::NonZero};
 
-mod raw;
+pub mod raw;
 
 pub trait Wire {
     fn decimal_len(self) -> NonZero<usize>;

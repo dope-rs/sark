@@ -58,7 +58,7 @@ impl<'d> Body<'d> {
         proof: &mut E,
     ) -> Result<body::Body<View<'_, 'd>>, admit::Error<View<'_, 'd>>> {
         let credit = E::credit(self.buf.len(), self.buf.count());
-        let result = View::from_body(&mut self.buf).finish::<R>(total, want);
+        let result = View::Owned(&mut self.buf).finish::<R>(total, want);
         proof.released(
             credit,
             match &result {

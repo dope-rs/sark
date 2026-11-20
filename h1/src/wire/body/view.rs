@@ -9,12 +9,7 @@ use sark_http::{
 };
 
 /// A sync-only logical body over borrowed or retained protocol storage.
-#[repr(transparent)]
-pub(crate) struct View<'req, 'd> {
-    kind: Kind<'req, 'd>,
-}
-
-enum Kind<'req, 'd> {
+pub(crate) enum View<'req, 'd> {
     Slice(&'req [u8]),
     Ranges(ranges::Set<'req, 'req, [u8]>),
     Shared(storage::Shared),
@@ -22,24 +17,6 @@ enum Kind<'req, 'd> {
 }
 
 impl<'req, 'd> View<'req, 'd> {
-    pub(crate) const fn from_slice(bytes: &'req [u8]) -> Self {
-        Self {
-            kind: Kind::Slice(bytes),
-        }
-    }
-
-    pub(crate) const fn from_body(body: &'req mut owned::Segments<'d>) -> Self {
-        Self {
-            kind: Kind::Owned(body),
-        }
-    }
-
-    pub(crate) fn from_ranges(ranges: ranges::Set<'req, 'req, [u8]>) -> Self {
-        Self {
-            kind: Kind::Ranges(ranges),
-        }
-    }
-
     pub(crate) fn finish<R: route::Spec>(
         self,
         len: usize,
@@ -66,11 +43,11 @@ impl<'d> Source<'d> for View<'_, 'd> {
     where
         'd: 'a,
     {
-        match &self.kind {
-            Kind::Slice(bytes) => Ref::from_slice(bytes),
-            Kind::Ranges(ranges) => Ref::from_ranges(ranges),
-            Kind::Shared(owner) => Ref::from(body::View::Shared(owner)),
-            Kind::Owned(body) => Ref::from(&**body),
+        match self {
+            Self::Slice(bytes) => Ref::from_slice(bytes),
+            Self::Ranges(ranges) => Ref::from_ranges(ranges),
+            Self::Shared(owner) => Ref::from(body::View::Shared(owner)),
+            Self::Owned(body) => Ref::from(&**body),
         }
     }
 
@@ -79,10 +56,10 @@ impl<'d> Source<'d> for View<'_, 'd> {
         value: V,
         project: impl for<'a> FnOnce(V, body::View<'a, 'd>) -> T,
     ) -> Result<T, (V, body::Error)> {
-        match &mut self.kind {
-            Kind::Slice(bytes) => Ok(project(value, body::View::Slice(bytes))),
-            Kind::Shared(owner) => Ok(project(value, body::View::Shared(owner))),
-            Kind::Ranges(ranges) => {
+        match self {
+            Self::Slice(bytes) => Ok(project(value, body::View::Slice(bytes))),
+            Self::Shared(owner) => Ok(project(value, body::View::Shared(owner))),
+            Self::Ranges(ranges) => {
                 let view = Ref::from_ranges(ranges);
                 if let Some(bytes) = view.as_slice() {
                     return Ok(project(value, body::View::Slice(bytes)));
@@ -92,10 +69,10 @@ impl<'d> Source<'d> for View<'_, 'd> {
                     Err(error) => return Err((value, body::Error::Owned(error))),
                 };
                 let output = project(value, body::View::Shared(&bytes));
-                self.kind = Kind::Shared(bytes);
+                *self = Self::Shared(bytes);
                 Ok(output)
             }
-            Kind::Owned(segments) => Source::try_project(&mut **segments, value, project),
+            Self::Owned(segments) => Source::try_project(&mut **segments, value, project),
         }
     }
 }

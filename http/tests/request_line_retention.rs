@@ -26,39 +26,42 @@ static ALLOCATOR: Tracker = Tracker::new();
 
 #[test]
 fn retains_line_and_fields() {
-    let input = b"GET /items?q=1 HTTP/1.1\r\nHost: example.test\r\n";
+    let input = b"GET /items?q=1 HTTP/1.1\r\nHost: example.test\r\nPart";
+    let suffix = b"ial: b\r\n\r\nBODY";
     let request = Request::parse(input).expect("line").expect("complete");
-    let (source, allocs) = Tracker::count(|| request.try_snapshot::<256>(NonZero::<usize>::MIN));
+    let capacity = NonZero::new(input.len() + suffix.len()).expect("request size");
+    let (source, allocs) = Tracker::count(|| request.try_snapshot::<256>(capacity));
     let source = source.expect("owner");
     assert_eq!(allocs, 1);
+    let initial = source.as_ref().as_ptr();
     let state = State::try_new(source, request.end(), 0, 2, 64)
-        .ok()
+        .map_err(|(_, error)| error)
         .expect("fields");
-    let mut fields = 0;
-    let progress = state
-        .advance(|_| {
-            fields += 1;
-            Ok::<_, ()>(())
-        })
-        .ok()
-        .expect("prefix");
-    let Progress::More(mut state) = progress else {
-        assert!(matches!(progress, Progress::More(_)));
-        return;
+    let mut fields = [
+        (b"Host".as_slice(), b"example.test".as_slice()),
+        (b"Partial", b"b"),
+    ]
+    .into_iter();
+    let mut check = |field: sark_http::h1::field::Entry<'_>| {
+        assert_eq!(fields.next(), Some((field.name(), field.value())));
+        Ok::<_, ()>(())
     };
-    state.try_extend(b"\r\nBODY").expect("append");
-    let progress = state
-        .advance(|_| {
-            fields += 1;
-            Ok::<_, ()>(())
-        })
-        .ok()
-        .expect("suffix");
-    let Progress::Complete(complete) = progress else {
-        assert!(matches!(progress, Progress::Complete(_)));
-        return;
+    let Progress::More(mut state) = state
+        .advance(&mut check)
+        .map_err(|(_, e)| e)
+        .expect("prefix")
+    else {
+        panic!("partial field");
     };
-    let (source, _, end) = complete.into_parts();
+    state.try_extend(suffix).expect("append");
+    let Progress::Complete(complete) = state.advance(check).map_err(|(_, e)| e).expect("suffix")
+    else {
+        panic!("complete fields");
+    };
+    assert!(fields.next().is_none());
+    let (source, terminator, end) = complete.into_parts();
+    assert_eq!(source.as_ref().as_ptr(), initial);
+    assert_eq!(&source.as_ref()[terminator..end.get() as usize], b"\r\n");
     source.with_shared(|view, retained| {
         assert_eq!(retained.method(), request.method());
         assert_eq!(retained.target(), request.target());
@@ -66,6 +69,31 @@ fn retains_line_and_fields() {
         assert_eq!(retained.query(), Some(b"q=1".as_slice()));
         assert_eq!(&view.as_slice()[end.get() as usize..], b"BODY");
     });
+}
+
+#[test]
+fn seeded_field_count() {
+    use sark_http::h1::field::{scan::Error, syntax};
+
+    let max = u32::MAX as usize;
+    for limit in [0, 1, max] {
+        let state = State::try_new(b"X: a\r\nY: b\r\n\r\n".as_slice(), 6, limit, limit, 32)
+            .expect("accepted prefix");
+        assert!(matches!(
+            state.advance(|_| Ok::<_, ()>(())),
+            Err((_, Error::Syntax(syntax::Error::TooMany)))
+        ));
+    }
+    let state = State::try_new(b"X: a\r\n\r\n".as_slice(), 0, max - 1, max, 32)
+        .expect("one remaining field");
+    let mut fields = 0;
+    let progress = state
+        .advance(|_| {
+            fields += 1;
+            Ok::<_, ()>(())
+        })
+        .expect("last field");
+    assert!(matches!(progress, Progress::Complete(_)));
     assert_eq!(fields, 1);
 }
 

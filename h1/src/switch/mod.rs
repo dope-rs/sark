@@ -25,16 +25,13 @@ pub enum Commit {
     Switch,
 }
 
-pub(super) enum State<D> {
-    Http,
-    Switching { kind: Kind, duplex: D },
-    Raw { kind: Kind, duplex: D },
+enum Phase {
+    Switching,
+    Raw,
 }
 
 /// Inline switching policy retaining the exact raw owner.
-pub struct Enabled<D> {
-    pub(super) state: State<D>,
-}
+pub struct Enabled<D>(Option<(Phase, Kind, D)>);
 
 /// Affine raw owner proposed by one successful switching route.
 pub struct Transition<D> {
@@ -50,50 +47,41 @@ pub struct Error<D> {
 
 impl<D> Default for Enabled<D> {
     fn default() -> Self {
-        Self { state: State::Http }
+        Self(None)
     }
 }
 
 impl<D> Enabled<D> {
     pub fn raw(&self) -> Result<&D, Mode<Infallible>> {
-        match &self.state {
-            State::Raw { duplex, .. } => Ok(duplex),
-            State::Http => Err(Mode::Http),
-            State::Switching { kind, .. } => Err(Mode::Switching(*kind)),
+        match &self.0 {
+            Some((Phase::Raw, _, duplex)) => Ok(duplex),
+            Some((Phase::Switching, kind, _)) => Err(Mode::Switching(*kind)),
+            None => Err(Mode::Http),
         }
     }
 
     pub fn raw_mut(&mut self) -> Result<&mut D, Mode<Infallible>> {
-        match &mut self.state {
-            State::Raw { duplex, .. } => Ok(duplex),
-            State::Http => Err(Mode::Http),
-            State::Switching { kind, .. } => Err(Mode::Switching(*kind)),
+        match &mut self.0 {
+            Some((Phase::Raw, _, duplex)) => Ok(duplex),
+            Some((Phase::Switching, kind, _)) => Err(Mode::Switching(*kind)),
+            None => Err(Mode::Http),
         }
     }
 
     pub(crate) fn active_mut(&mut self) -> Result<&mut D, Mode<Infallible, Infallible>> {
-        match &mut self.state {
-            State::Switching { duplex, .. } | State::Raw { duplex, .. } => Ok(duplex),
-            State::Http => Err(Mode::Http),
+        match &mut self.0 {
+            Some((_, _, duplex)) => Ok(duplex),
+            None => Err(Mode::Http),
         }
     }
 
     /// Accesses staged raw state only for exact ingress attachment.
     #[doc(hidden)]
     pub fn staged_mut(&mut self) -> Result<&mut D, Mode<Kind, Infallible>> {
-        match &mut self.state {
-            State::Switching { duplex, .. } => Ok(duplex),
-            State::Http => Err(Mode::Http),
-            State::Raw { kind, .. } => Err(Mode::Raw(*kind)),
-        }
-    }
-}
-
-impl<D> State<D> {
-    fn commit(self) -> (Self, Commit) {
-        match self {
-            Self::Switching { kind, duplex } => (Self::Raw { kind, duplex }, Commit::Switch),
-            state @ (Self::Http | Self::Raw { .. }) => (state, Commit::Ordinary),
+        match &mut self.0 {
+            Some((Phase::Switching, _, duplex)) => Ok(duplex),
+            Some((Phase::Raw, kind, _)) => Err(Mode::Raw(*kind)),
+            None => Err(Mode::Http),
         }
     }
 }

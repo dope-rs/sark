@@ -1,10 +1,7 @@
 //! HTTP/1 field syntax and borrow-free field state.
 
-use core::mem;
-
 use crate::field::{
     self,
-    scan::Match,
     text::{Ascii, IntError},
 };
 
@@ -80,42 +77,24 @@ impl Connection {
     pub fn try_push(mut self, value: &[u8]) -> Result<Self, TokenError> {
         let mut rest = value;
         while !rest.is_empty() {
-            let base = value.len() - rest.len();
-            let raw = match Match::find_by(rest, |byte| byte == b',') {
-                Some(comma) => {
-                    rest = comma.suffix();
-                    comma.prefix()
-                }
-                None => mem::take(&mut rest),
-            };
-            let mut token = raw;
-            while let [b' ' | b'\t', rest @ ..] = token {
-                token = rest;
-            }
-            let start = raw.len() - token.len();
-            while let [rest @ .., b' ' | b'\t'] = token {
-                token = rest;
-            }
-            if token.is_empty() {
-                continue;
-            }
-            if let Some((index, byte)) = token
-                .iter()
-                .copied()
-                .enumerate()
-                .find(|(_, byte)| !field::Error::is_name_byte(*byte))
-            {
-                return Err(TokenError {
-                    index: base + start + index,
-                    byte,
-                });
-            }
+            let (token, tail) = field::scan::split_token(field::trim_ows_start(rest));
             if token.eq_ignore_ascii_case(b"close") {
                 self.0 |= Self::CLOSE.0;
             } else if token.eq_ignore_ascii_case(b"keep-alive") {
                 self.0 |= Self::KEEP_ALIVE.0;
             } else if token.eq_ignore_ascii_case(b"upgrade") {
                 self.0 |= Self::UPGRADE;
+            }
+            let [first, ..] = tail else { break };
+            match field::trim_ows_start(tail) {
+                [b',', next @ ..] => rest = next,
+                [] => break,
+                _ => {
+                    return Err(TokenError {
+                        index: value.len() - tail.len(),
+                        byte: *first,
+                    });
+                }
             }
         }
         Ok(self)

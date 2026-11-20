@@ -1,9 +1,6 @@
 use std::{cell::Cell, convert::Infallible};
 
-use dope_core::{
-    BranchError,
-    driver::{life::recovery, schedule, settings},
-};
+use dope_core::driver::{life::recovery, schedule, settings};
 use dope_test::scope::{self, Driver};
 use sark_core::manifold::server::drain;
 
@@ -50,10 +47,7 @@ fn retained_event_waits() {
         |result| {
             result
                 .as_ref()
-                .map_err(|error| match error {
-                    scope::Error::Create(error) => BranchError::First(error.kind()),
-                    scope::Error::Close(error) => BranchError::Second(error.cause()),
-                })
+                .map_err(scope::Error::cause)
                 .expect("driver lifetime");
         },
     );

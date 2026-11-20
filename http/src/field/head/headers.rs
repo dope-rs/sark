@@ -8,7 +8,9 @@ use crate::{
     h1::{
         field,
         head::{line::Version, request},
+        target,
     },
+    uri,
 };
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -66,18 +68,6 @@ fn parse_connection(raw: &[u8]) -> Result<field::Connection, Error> {
 }
 
 impl Known {
-    const PREFIX_INITIALS: u32 = {
-        let mut initials = 0;
-        let mut index = 0;
-        while index < Name::H1.len() {
-            let first = Name::H1[index].wire()[0];
-            assert!(first.is_ascii_lowercase(), "initial");
-            initials |= 1 << (first - b'a');
-            index += 1;
-        }
-        initials
-    };
-
     pub fn from_name(name: &[u8]) -> Option<Self> {
         Self::from_kind(Name::from_h1(name)?)
     }
@@ -85,21 +75,25 @@ impl Known {
     /// Recognizes a complete canonical field name and its following colon.
     /// The exact literal match also establishes the name's token grammar.
     pub fn from_prefix(raw: &[u8]) -> Option<(Self, usize)> {
-        let first = raw.first()?.to_ascii_lowercase();
-        let initial = 1u32.checked_shl(u32::from(first.wrapping_sub(b'a')))?;
-        if Self::PREFIX_INITIALS & initial == 0 {
-            return None;
+        match raw.first()?.to_ascii_lowercase() {
+            b'h' => Self::Host.prefix(raw, Name::Host.wire()),
+            b'c' => match raw.get(3)?.to_ascii_lowercase() {
+                b'n' => Self::Connection.prefix(raw, Name::Connection.wire()),
+                b't' => Self::ContentLength.prefix(raw, Name::ContentLength.wire()),
+                _ => None,
+            },
+            b't' => Self::TransferEncoding.prefix(raw, Name::TransferEncoding.wire()),
+            b'e' => Self::Expect.prefix(raw, Name::Expect.wire()),
+            b'a' => Self::AcceptEncoding.prefix(raw, Name::AcceptEncoding.wire()),
+            b'u' => Self::Upgrade.prefix(raw, Name::Upgrade.wire()),
+            _ => None,
         }
-        for name in Name::H1 {
-            let wire = name.wire();
-            if wire.first() == Some(&first)
-                && raw.get(wire.len()) == Some(&b':')
-                && raw[..wire.len()].eq_ignore_ascii_case(wire)
-            {
-                return Self::from_kind(name).map(|known| (known, wire.len()));
-            }
-        }
-        None
+    }
+
+    fn prefix(self, raw: &[u8], wire: &[u8]) -> Option<(Self, usize)> {
+        let len = wire.len();
+        (raw.get(len) == Some(&b':') && raw[..len].eq_ignore_ascii_case(wire))
+            .then_some((self, len))
     }
 
     fn from_kind(name: Name) -> Option<Self> {
@@ -187,22 +181,43 @@ impl Known {
             Self::ContentLength => parse::clen_line(scan, raw),
             Self::TransferEncoding => parse::te_line(scan, raw),
             Self::Expect => expect_line(scan, raw),
-            Self::Host => host_line(scan, raw),
+            Self::Host => host_line(&mut scan.routing.authority, raw),
             Self::Connection => conn_line(scan, raw),
             Self::Upgrade => upgrade_line(scan, raw, version),
         }
     }
 }
 
-fn host_line(scan: &mut request::Fields, raw: &[u8]) -> Result<Option<Bounds>, Error> {
-    let Some(bounds) = parse::trim_line(raw)? else {
-        return Ok(None);
+pub(crate) fn host_line(state: &mut target::Request, raw: &[u8]) -> Result<Option<Bounds>, Error> {
+    let value = crate::field::trim_ows_start(raw);
+    let mut rest = value.iter();
+    let port = uri::registered::<true>(&mut rest);
+    let rest = rest.as_slice();
+    let start = raw.len() - value.len();
+    let end = raw.len() - rest.len();
+    let bounds = if rest.starts_with(b"\r\n") {
+        Bounds::new(end, start, end)
+    } else {
+        let Some(bounds) = parse::trim_suffix(rest, start, end)? else {
+            return Ok(None);
+        };
+        bounds
     };
-    scan.routing.authority = scan
-        .routing
-        .authority
-        .try_host(bounds.value(raw))
-        .map_err(Error::Host)?;
+    let host = if bounds.end == end {
+        if start == end {
+            target::Host::Empty
+        } else {
+            target::Host::Authority
+        }
+    } else if value.starts_with(b"[") {
+        target::Host::parse_trimmed(bounds.value(raw))
+            .map_err(|e| Error::Host(target::HostError::Authority(e)))?
+    } else {
+        let cause =
+            uri::registered_error(port.is_some(), rest.iter().copied().take(bounds.end - end));
+        return Err(Error::Host(target::HostError::Authority(cause)));
+    };
+    *state = state.with_host(host).map_err(Error::Host)?;
     Ok(Some(bounds))
 }
 

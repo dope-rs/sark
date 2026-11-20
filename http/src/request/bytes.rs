@@ -83,7 +83,7 @@ impl<'d> response::Body<'d> for Bytes<'d> {
         self,
         slot: &handoff::Slot<'req, 'd, H, O>,
     ) -> Result<handoff::Plan<'req, 'd, H::Selection, O>, owned::Error> {
-        Ok(handoff::Plan::new(slot.origin().request(self.into_body())))
+        Ok(slot.request(self.into_body()))
     }
 }
 

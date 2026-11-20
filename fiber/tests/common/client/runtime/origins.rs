@@ -1,7 +1,10 @@
 use std::time;
 
 use dope::{
-    core::driver::{life::recovery, schedule::clock},
+    core::{
+        driver::{life::recovery, schedule::clock},
+        io::Reclaimed,
+    },
     manifold::{app::Host, timing},
     runtime::{executor, executor::session, topology, topology::lending},
 };
@@ -9,7 +12,7 @@ use dope_test::harness::GUARD;
 use dynamic::channel;
 use sark_fiber::client::{config, dynamic};
 
-use crate::common::client::runtime::{Error, Failure};
+use crate::common::client::{recover, runtime::Failure};
 
 type Handle<'app, 's, 'p, 'o, 'q, 'e, 'b, 'c, 'd> = dynamic::Handle<
     'app,
@@ -38,15 +41,14 @@ impl Plan {
         Ok(Self { prepared })
     }
 
-    pub fn enter<C: executor::Build, R, Out>(
+    pub fn enter<C: executor::Build, R>(
         self,
         context: C,
         run: impl for<'app, 'life, 's, 'p, 'o, 'q, 'e, 'b, 'c, 'd> FnOnce(
             Scope<'app, 'life, 's, 'p, 'o, 'q, 'e, 'b, 'c, 'd, C::Shutdown>,
         ) -> R,
-        policy: impl recovery::Observe,
-        done: impl for<'a> FnOnce(Result<R, Error<'a>>) -> Out,
-    ) -> Result<Out, Failure> {
+        report: impl FnMut(Reclaimed),
+    ) -> Result<R, Failure> {
         let mut finish = session::Completion::new();
         let finish = &mut finish;
         Ok(self.prepared.enter_with(
@@ -70,20 +72,19 @@ impl Plan {
                     .map_err(Failure::DynamicPort)?
                 })
             },
-            policy,
-            |result| super::finish(result, done),
+            recovery::Policy::new(report, recover),
+            super::finish,
         ))
     }
 
-    pub fn enter_at<R, Out>(
+    pub fn enter_at<R>(
         self,
         offset: time::Duration,
         run: impl for<'app, 'life, 's, 'p, 'o, 'q, 'e, 'b, 'c, 'd> FnOnce(
             Clock<'app, 'life, 's, 'p, 'o, 'q, 'e, 'b, 'c, 'd>,
         ) -> R,
-        policy: impl recovery::Observe,
-        done: impl for<'a> FnOnce(Result<R, Error<'a>>) -> Out,
-    ) -> Result<Out, Failure> {
+        report: impl FnMut(Reclaimed),
+    ) -> Result<R, Failure> {
         let mut finish = session::Completion::new();
         let finish = &mut finish;
         Ok(self.prepared.with_local(
@@ -114,8 +115,8 @@ impl Plan {
                     .map_err(Failure::DynamicPort)?
                 })
             },
-            policy,
-            |result| super::finish(result, done),
+            recovery::Policy::new(report, recover),
+            super::finish,
         ))
     }
 }

@@ -1,6 +1,3 @@
-use decode::state;
-use handle::decode;
-
 use crate::{
     app::{serve::handle, spec},
     macros::tokens::local,
@@ -10,7 +7,7 @@ use crate::{
 pub(super) fn generate(
     paths: &Paths,
     ctx: &handle::Context<'_, '_, '_>,
-    state: &state::State,
+    prep: &syn::Ident,
 ) -> proc_macro2::TokenStream {
     let [f_core, f_ids, f_makers] = ["core", "ids", "task_producers"].map(local);
     let [f_state, f_time] = ["state", "timer"].map(local);
@@ -29,7 +26,6 @@ pub(super) fn generate(
 
     let flat = crate::app::serve::flat::name(ctx.plan.spec, true);
     let f_quotas = local("quotas");
-    let prep = &state.prepared;
     let fibers = ctx.exec.fibers().iter().copied().map(|(task, fiber)| {
         let var = task.prepared();
         let slot = task.request();

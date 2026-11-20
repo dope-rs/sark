@@ -5,9 +5,12 @@ use data::compose;
 use dope::{
     core::driver::{self, route::Identity},
     manifold::network::listener::conn,
-    net::{link::egress::data, wire},
+    net::{
+        link::egress::{self, data},
+        wire,
+    },
 };
-use o3::buffer::hold;
+use o3::buffer::{hold, resident};
 use wire::receive::discard;
 
 use crate::{
@@ -275,18 +278,38 @@ where
     Runtime: pump::Tasks,
     W: wire::Spec,
 {
-    match pump::Drain::progress(conn.state_mut()) {
-        pump::Next::None => Settled::new(Flow::Continue),
-        pump::Next::Close(reason) => {
-            if !reason.is_empty()
-                && let Some(reason) = payload::write::send_static(conn, reason, driver)
-            {
-                conn.state_mut().defer(reason);
-                return Settled::new(Flow::Continue);
-            }
-            conn.close_after();
-            Settled::new(Flow::Closed)
+    let reason = match pump::Drain::progress(conn.state_mut()) {
+        pump::Next::None => return Settled::new(Flow::Continue),
+        pump::Next::Resume => return resume(routes, conn, driver),
+        pump::Next::Close(reason) => reason,
+    };
+    let failure = 'write: {
+        if reason.is_empty() {
+            break 'write None;
         }
-        pump::Next::Resume => resume(routes, conn, driver),
+        let body = payload::Body::Shared {
+            owner: resident::Shared::from(reason.as_slice()),
+            tag: H::TransportTag::default(),
+        };
+        let load = match egress::Load::new(body).try_bound::<H::Egress>() {
+            Ok(load) => load,
+            Err(cause) => break 'write Some(cause.into()),
+        };
+        let body = match load.bound_left().try_nonempty() {
+            Ok(body) => body,
+            Err(cause) => break 'write Some(body::Failure::Payload(cause.into_parts().1)),
+        };
+        match conn.admit(body, driver) {
+            body::Admit::Committed | body::Admit::Closed(_) => None,
+            body::Admit::Deferred { .. } => return Settled::new(Flow::Continue),
+            body::Admit::Rejected { cause, .. } => Some(body::Failure::Capacity(cause)),
+            body::Admit::Unavailable(cause) => Some(body::Failure::Reserve(cause.into_parts().1)),
+        }
+    };
+    conn.state_mut().deferred_action = None;
+    match failure {
+        Some(cause) => conn.reject_write(cause),
+        None => conn.close_after(),
     }
+    Settled::new(Flow::Closed)
 }

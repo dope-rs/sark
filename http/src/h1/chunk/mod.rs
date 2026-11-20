@@ -13,6 +13,7 @@ pub(in crate::h1) mod trailer;
 
 pub use axis::Axis;
 pub use error::Error;
+pub(in crate::h1) use limit::Framing;
 pub use limit::Limit;
 pub use syntax::Syntax;
 
@@ -95,7 +96,8 @@ impl Framer {
         input: &'input [u8],
         limits: &Limit,
     ) -> Result<Run<'input>, Error> {
-        let (next, run) = (*self).prepare::<scan::Whole>(input, limits, usize::MAX)?;
+        let (next, run) =
+            self.prepare::<scan::Whole>(input, limits.body_bytes, &limits.framing, usize::MAX)?;
         *self = next;
         Ok(run)
     }
@@ -106,29 +108,21 @@ impl Framer {
         limits: &Limit,
         data: usize,
     ) -> Result<(Self, Fragment<'input>), Error> {
-        let (next, output) = self.prepare::<scan::Fragments>(input, limits, data)?;
+        let (next, output) =
+            self.prepare::<scan::Fragments>(input, limits.body_bytes, &limits.framing, data)?;
         Ok((next, output.fragment()))
     }
 
     pub(in crate::h1) fn prepare<'input, M: scan::Mode>(
-        self,
+        mut self,
         input: &'input [u8],
-        limits: &Limit,
+        max_body: usize,
+        limits: &Framing,
         data: usize,
     ) -> Result<(Self, M::Output<'input>), Error> {
-        let ControlFlow::Continue(active) = self.phase else {
+        let ControlFlow::Continue(mut active) = self.phase else {
             return Ok((self, M::finished(input)));
         };
-        self.drive::<M>(active, input, limits, data)
-    }
-
-    fn drive<'input, M: scan::Mode>(
-        mut self,
-        mut active: Active,
-        input: &'input [u8],
-        limits: &Limit,
-        data: usize,
-    ) -> Result<(Self, M::Output<'input>), Error> {
         let mut pos = 0usize;
         while let Some(&byte) = input.get(pos) {
             match active {
@@ -148,7 +142,7 @@ impl Framer {
                     let offset = self.wire_bytes;
                     let wire = Self::wire(self.wire_bytes, 1, limits)?;
                     let size = size.finish(byte, offset, limits.line_bytes)?;
-                    let (body, next) = Self::check_size(self.body_bytes, size.value(), limits)?;
+                    let (body, next) = Self::check_size(self.body_bytes, size.value(), max_body)?;
                     self.wire_bytes = wire;
                     self.body_bytes = body;
                     pos += 1;
@@ -192,17 +186,24 @@ impl Framer {
                     active = Active::Size(size::Size::default());
                 }
                 Active::Trailer(state) => {
-                    let mut trailer = trailer::Trailer::new(state, self.wire_bytes, *limits);
-                    let (progress, bytes) = trailer.scan(&input[pos..])?;
+                    let cursor = trailer::Cursor {
+                        state,
+                        wire: self.wire_bytes,
+                    };
+                    let (progress, bytes) = cursor.scan(&input[pos..], limits)?;
                     match progress {
                         trailer::Progress::More { next, consumed } => {
                             self.wire_bytes = next.wire;
                             self.phase = ControlFlow::Continue(Active::Trailer(next.state));
-                            trailer.cursor = next;
                             let output = match consumed {
-                                Some(consumed) => {
-                                    M::trailer(input, consumed.saturating_add(pos), bytes, trailer)
-                                }
+                                Some(consumed) => M::trailer(
+                                    input,
+                                    trailer::Pending {
+                                        bytes,
+                                        consumed: consumed.saturating_add(pos),
+                                        cursor: next,
+                                    },
+                                ),
                                 None => M::pending(input, pos),
                             };
                             return Ok((self, output));
@@ -228,7 +229,7 @@ impl Framer {
         Ok((self, M::pending(input, pos)))
     }
 
-    fn wire(current: usize, amount: usize, limits: &Limit) -> Result<usize, Error> {
+    fn wire(current: usize, amount: usize, limits: &Framing) -> Result<usize, Error> {
         let actual = current.checked_add(amount).ok_or(Error::Overflow {
             axis: Axis::Wire,
             value: current,
@@ -249,7 +250,7 @@ impl Framer {
         byte: u8,
         expected: u8,
         syntax: Syntax,
-        limits: &Limit,
+        limits: &Framing,
     ) -> Result<usize, Error> {
         let offset = wire;
         let actual = Self::wire(wire, 1, limits)?;
@@ -264,17 +265,17 @@ impl Framer {
         }
     }
 
-    fn check_size(current: usize, size: usize, limits: &Limit) -> Result<(usize, Active), Error> {
+    fn check_size(current: usize, size: usize, maximum: usize) -> Result<(usize, Active), Error> {
         let total = current.checked_add(size).ok_or(Error::Overflow {
             axis: Axis::Body,
             value: current,
             added: size,
         })?;
-        if total > limits.body_bytes {
+        if total > maximum {
             return Err(Error::Limit {
                 axis: Axis::Body,
                 actual: total,
-                maximum: limits.body_bytes,
+                maximum,
             });
         }
         let active = match num::NonZero::new(size) {

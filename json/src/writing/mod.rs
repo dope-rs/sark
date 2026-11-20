@@ -1,5 +1,5 @@
 //! JSON sizing and encoding machinery.
-use std::{mem, ops::ControlFlow};
+use std::{marker::PhantomData, mem, ops::ControlFlow};
 
 use escape::Split;
 use exact::Overflow;
@@ -11,6 +11,7 @@ use o3::{
 use ryu;
 use sark_http::{
     field::{Value, literal},
+    h1::codec::numbers,
     payload::response::{
         Encode, bounded,
         dispatch::IntoOutput,
@@ -32,11 +33,8 @@ pub struct Writer<'a, W: write::Sink> {
 }
 
 #[repr(C)]
-#[must_use = "preserve the writer and its exact failure"]
-pub struct Failure<'a, W: write::Sink> {
-    writer: Writer<'a, W>,
-    error: W::Error,
-}
+#[must_use = "preserve the sink error"]
+pub struct Failure<'a, W: write::Sink>(W::Error, PhantomData<&'a mut W>);
 
 impl<'a, W: write::Sink> Writer<'a, W> {
     pub fn new(inner: &'a mut W) -> Self {
@@ -47,10 +45,7 @@ impl<'a, W: write::Sink> Writer<'a, W> {
     pub fn put(self, src: &[u8]) -> ControlFlow<Failure<'a, W>, Self> {
         match self.inner.write_slice(src) {
             Ok(()) => ControlFlow::Continue(self),
-            Err(error) => ControlFlow::Break(Failure {
-                writer: self,
-                error,
-            }),
+            Err(error) => ControlFlow::Break(Failure(error, PhantomData)),
         }
     }
 
@@ -86,17 +81,14 @@ impl<'a, W: write::Sink> Writer<'a, W> {
             .write_slices([b"\"".as_slice(), value.as_slice(), b"\"".as_slice()])
         {
             Ok(()) => ControlFlow::Continue(self),
-            Err(error) => ControlFlow::Break(Failure {
-                writer: self,
-                error,
-            }),
+            Err(error) => ControlFlow::Break(Failure(error, PhantomData)),
         }
     }
 
     pub fn put_u64(self, value: u64) -> ControlFlow<Failure<'a, W>, Self> {
         let mut digits;
         let bytes = if value < 100 {
-            let pair = &raw::PAIRS[value as usize];
+            let pair = &numbers::raw::PAIRS[value as usize];
             if value < 10 { &pair[1..] } else { pair }
         } else {
             digits = [mem::MaybeUninit::uninit(); 10];
@@ -124,7 +116,7 @@ impl<'a, W: write::Sink> Writer<'a, W> {
 
 impl<'a, W: write::Sink> Failure<'a, W> {
     pub fn into_error(self) -> W::Error {
-        self.error
+        self.0
     }
 }
 
@@ -135,7 +127,8 @@ const _: () = {
         mem::size_of::<Option<Writer<'static, write::Slice<'static>>>>() == mem::size_of::<usize>()
     );
     assert!(
-        mem::size_of::<Failure<'static, write::Slice<'static>>>() == mem::size_of::<usize>() * 3
+        mem::size_of::<Failure<'static, write::Slice<'static>>>()
+            == mem::size_of::<write::consume::Error>()
     );
     assert!(
         mem::size_of::<
@@ -143,7 +136,7 @@ const _: () = {
                 Failure<'static, write::Slice<'static>>,
                 Writer<'static, write::Slice<'static>>,
             >,
-        >() == mem::size_of::<usize>() * 3
+        >() == mem::size_of::<write::consume::Error>()
     );
 };
 

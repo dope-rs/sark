@@ -1,7 +1,6 @@
 use core::num::NonZero;
 
 use o3::buffer::{self, write};
-use write::CopyError;
 
 use crate::h1::field::{self, Cursor, Entry, Limit, syntax};
 
@@ -74,18 +73,6 @@ impl<S: buffer::raw::Source> State<S> {
                 Err(error) => return Err((self.source, Error::Syntax(error))),
             }
         }
-    }
-
-    /// Copies the exact source while retaining its already established progress.
-    pub fn try_copy<D>(&self, target: D) -> Result<State<D>, (D, CopyError<D::Error>)>
-    where
-        D: buffer::raw::Source + write::Sink,
-    {
-        let target = write::try_copy(target, self.source.as_ref())?;
-        Ok(State {
-            source: target,
-            cursor: self.cursor,
-        })
     }
 }
 

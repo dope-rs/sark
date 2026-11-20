@@ -44,7 +44,7 @@ impl State {
         self,
         byte: u8,
         offset: usize,
-        limits: &chunk::Limit,
+        limits: &chunk::Framing,
     ) -> Result<ControlFlow<NonZero<u32>, Self>, chunk::Error> {
         let mut next = self;
         let bytes = NonZero::<u32>::MIN
@@ -138,7 +138,7 @@ impl State {
         mut self,
         byte: u8,
         offset: usize,
-        limits: &chunk::Limit,
+        limits: &chunk::Framing,
     ) -> Result<Self, chunk::Error> {
         if byte != b'\n' {
             return Err(chunk::Error::Syntax {

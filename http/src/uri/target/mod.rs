@@ -191,30 +191,27 @@ impl Target {
         port: Option<num::NonZero<u16>>,
         origin: Origin<'_>,
     ) -> Result<Self, Error> {
-        let brackets = host.contains(':') && !host.starts_with('[');
+        let brackets = !host.starts_with('[') && host.contains(':');
+        // A str fits in isize::MAX, leaving room for brackets and a decimal u16 port.
+        let authority_len = host.len() + usize::from(brackets) * 2;
         let host_end = if brackets {
             if !uri::Authority::is_ip(host.as_bytes()) {
                 return Err(Error::Authority(uri::Error::InvalidHost));
             }
-            host.len().checked_add(2).ok_or(Error::Length)?
+            authority_len
         } else {
             if host.is_empty() && port.is_some() {
                 return Err(Error::Authority(uri::Error::InvalidHost));
             }
-            let parsed = uri::Authority::parse(host.as_bytes()).map_err(Error::Authority)?;
-            if port.is_some() && parsed.port().is_some() {
+            let len = uri::host_end(host.as_bytes()).map_err(Error::Authority)?;
+            if port.is_some() && len != host.len() {
                 return Err(Error::Authority(uri::Error::InvalidPort));
             }
-            parsed.host().len()
+            len
         };
         let mut digits = [mem::MaybeUninit::uninit(); 20];
         let port = port.map(|port| raw::decimal(port, &mut digits));
-        let port_len = port.map_or(0, |port| port.len() + 1);
-        let end = host
-            .len()
-            .checked_add(usize::from(brackets) * 2)
-            .and_then(|len| len.checked_add(port_len))
-            .ok_or(Error::Length)?;
+        let end = authority_len + port.map_or(0, |port| port.len() + 1);
         let capacity = end.checked_add(origin.len()?).ok_or(Error::Length)?;
         let path_end = end.checked_add(origin.path_end()).ok_or(Error::Length)?;
         let bounds = plan::Bounds::new(0, host_end, end, path_end)?;

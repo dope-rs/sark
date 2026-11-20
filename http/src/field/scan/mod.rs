@@ -26,12 +26,6 @@ impl<'a> Match<'a> {
         Some(unsafe { raw::found(bytes, index) })
     }
 
-    pub(crate) fn find_by(bytes: &'a [u8], mut matches: impl FnMut(u8) -> bool) -> Option<Self> {
-        let index = bytes.iter().position(|byte| matches(*byte))?;
-        // SAFETY: the iterator returned this position inside the exact retained source.
-        Some(unsafe { raw::found(bytes, index) })
-    }
-
     pub const fn start(self) -> usize {
         self.end.get() - 1
     }
@@ -59,6 +53,18 @@ impl<'a> Match<'a> {
     pub fn suffix(self) -> &'a [u8] {
         raw::after::<false>(self)
     }
+}
+
+pub(crate) fn split_token(bytes: &[u8]) -> (&[u8], &[u8]) {
+    let Some(index) = bytes
+        .iter()
+        .position(|&byte| !super::Error::is_name_byte(byte))
+    else {
+        return (bytes, &[]);
+    };
+    // SAFETY: position found the delimiter in these same immutable bytes.
+    let end = unsafe { raw::found(bytes, index) };
+    (end.prefix(), end.tail())
 }
 
 #[derive(PartialEq, Eq)]

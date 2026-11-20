@@ -22,11 +22,6 @@ pub(in crate::wire) struct Head<'a, H, F> {
     pub(in crate::wire) framing: F,
 }
 
-pub(in crate::wire) struct Plan {
-    len: usize,
-    encodings: usize,
-}
-
 pub(in crate::wire) trait Count: Copy + Default {
     fn add(&mut self) -> Result<(), Error>;
 }
@@ -69,7 +64,11 @@ where
     H: field::Source,
     F: framing::Framing,
 {
-    pub(in crate::wire) fn plan(&self, server: Server, dated: Date) -> Result<Plan, Error> {
+    pub(in crate::wire) fn plan(
+        &self,
+        server: Server,
+        dated: Date,
+    ) -> Result<(usize, usize), Error> {
         let mut measure = Measure::default();
         self.headers.emit(&mut measure);
         measure.add(Writer::status_len(self.status));
@@ -97,12 +96,12 @@ where
         date: &[u8; 29],
         server: Server,
         dated: Date,
-    ) -> Result<(Option<usize>, C), Error> {
+    ) -> Result<C, Error> {
         out.put_status(self.response.version(), self.status)?;
         let count = out.fields(self.headers)?;
         self.framing.write(out)?;
-        let off = out.end_head(self.response, date, server, dated)?;
-        Ok((off, count))
+        out.end_head(self.response, date, server, dated)?;
+        Ok(count)
     }
 }
 
@@ -234,14 +233,11 @@ impl Measure {
         self.error = count(&mut self.encodings, name).err();
     }
 
-    fn finish(self) -> Result<Plan, Error> {
+    fn finish(self) -> Result<(usize, usize), Error> {
         if let Some(error) = self.error {
             return Err(error);
         }
-        Ok(Plan {
-            len: self.len,
-            encodings: self.encodings,
-        })
+        Ok((self.len, self.encodings))
     }
 }
 
@@ -264,16 +260,6 @@ impl<'field> field::Sink<'field> for Measure {
         self.add(name.len());
         self.add(value.encoded_len());
         self.finish_field(name);
-    }
-}
-
-impl Plan {
-    pub(in crate::wire) const fn len(&self) -> usize {
-        self.len
-    }
-
-    pub(in crate::wire) const fn encodings(&self) -> usize {
-        self.encodings
     }
 }
 
@@ -358,7 +344,7 @@ impl<'a> Writer<'a> {
         date: &[u8; 29],
         server: Server,
         dated: Date,
-    ) -> Result<Option<usize>, Error> {
+    ) -> Result<(), Error> {
         let connection = response.connection_field();
         if !connection.is_empty() {
             self.put(connection)?;
@@ -367,17 +353,11 @@ impl<'a> Writer<'a> {
             Server::Omit => {}
             Server::Include => self.put(consts::SERVER)?,
         }
-        let off = match dated {
-            Date::Omit => None,
-            Date::Include => {
-                self.put(consts::DATE)?;
-                let off = self.len();
-                self.put(date)?;
-                self.put(consts::CRLF)?;
-                Some(off)
-            }
-        };
-        self.put(consts::CRLF)?;
-        Ok(off)
+        if let Date::Include = dated {
+            self.put(consts::DATE)?;
+            self.put(date)?;
+            self.put(consts::CRLF)?;
+        }
+        self.put(consts::CRLF)
     }
 }

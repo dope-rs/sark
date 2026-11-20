@@ -5,7 +5,7 @@ use sark_core::body::credit;
 use sark_h1::{
     route::sync,
     session,
-    wire::{cache, output, parsing::framing},
+    wire::{output, parsing::framing},
 };
 use sark_http::{
     h1::head::request::Coding,
@@ -52,7 +52,6 @@ impl Retain {
                     DATE,
                     head.response(),
                 ),
-                cache::Cache::empty(),
                 &mut self.gzip,
             ),
             conn,
@@ -77,7 +76,6 @@ impl Retain {
                     DATE,
                     RESPONSE,
                 ),
-                cache::Cache::empty(),
                 &mut self.gzip,
             ),
             credit::Disabled::new(),

@@ -49,6 +49,7 @@ pub const REJECTED_HOSTS: &[(&str, Option<NonZero<u16>>, Error)] = &[
     ("bad:host", None, Error::InvalidHost),
     ("", Some(NonZero::<u16>::MIN), Error::InvalidHost),
     ("[::1]:80", Some(NonZero::<u16>::MIN), Error::InvalidPort),
+    ("[::1]:", Some(NonZero::<u16>::MIN), Error::InvalidPort),
 ];
 
 pub const AUTHORITY_ONLY: &str = "http:80";

@@ -1,6 +1,7 @@
 use core::{mem, num::NonZero};
 
 use chunk::trailer;
+pub use chunk::trailer::Pending;
 use o3::{
     buffer::{
         resident,
@@ -15,17 +16,10 @@ use crate::{
     h1::{chunk, field::Entry},
 };
 
-/// Partial trailer syntax paired with the exact borrowed prefix it admitted.
-pub struct Pending<'input> {
-    bytes: &'input [u8],
-    consumed: NonZero<usize>,
-    parser: trailer::Trailer,
-}
-
 /// Append-only ownership of the trailer prefix and its admitted syntax state.
 pub struct State<'d> {
     source: Owned<resident::Budget<'d>>,
-    parser: trailer::Trailer,
+    parser: trailer::Cursor,
 }
 
 /// Newly admitted input retained with its original owner through capacity growth.
@@ -53,6 +47,9 @@ pub struct More<T> {
 
 pub struct Ready<T>(T);
 
+#[must_use]
+pub struct Append<'input, 'd, T>(Plan<'input, 'd, Ready<T>>);
+
 /// The exact completed trailer owner, excluding the terminating empty line.
 pub struct Complete<'d> {
     source: Owned<resident::Budget<'d>>,
@@ -64,43 +61,8 @@ pub enum StoreError {
     Capacity(consume::Error),
 }
 
-#[derive(Debug)]
-pub enum AppendError<E> {
-    Capacity(consume::Error),
-    Ready(E),
-}
-
-impl<E> From<consume::Error> for AppendError<E> {
-    fn from(error: consume::Error) -> Self {
-        Self::Capacity(error)
-    }
-}
-
-impl<'input> Pending<'input> {
-    pub(in crate::h1::codec::decode) fn new(partial: trailer::Partial<'input>) -> Self {
-        let (bytes, consumed, parser) = partial.into_parts();
-        Self {
-            bytes,
-            consumed,
-            parser,
-        }
-    }
-
-    pub const fn consumed(&self) -> NonZero<usize> {
-        self.consumed
-    }
-
-    pub const fn len(&self) -> usize {
-        self.bytes.len()
-    }
-
-    pub const fn is_empty(&self) -> bool {
-        self.bytes.is_empty()
-    }
-
-    pub const fn capacity(&self) -> usize {
-        self.parser.capacity()
-    }
+impl Pending<'_> {
+    pub const CAPACITY: usize = chunk::Framing::DEFAULT.trailer_bytes;
 
     /// Copies the exact borrowed prefix before transferring its parsing proof.
     pub fn try_store<'d>(
@@ -112,7 +74,7 @@ impl<'input> Pending<'input> {
         }
         Ok(State {
             source: target,
-            parser: self.parser,
+            parser: self.cursor,
         })
     }
 }
@@ -130,7 +92,7 @@ impl<'d> State<'d> {
         self,
         input: &'input [u8],
     ) -> Result<Plan<'input, 'd>, Rejected<Self, chunk::Error>> {
-        let (next, bytes) = match self.parser.scan(input) {
+        let (next, bytes) = match self.parser.scan(input, &chunk::Framing::DEFAULT) {
             Ok(next) => next,
             Err(error) => return Err(Rejected::new(self, error)),
         };
@@ -224,13 +186,13 @@ impl<'d, T> Plan<'_, 'd, More<T>> {
         let mut spare = self.state.source.spare();
         spare.write_slice(self.bytes)?;
         spare.commit();
-        self.state.parser.cursor = self.next.cursor;
+        self.state.parser = self.next.cursor;
         self.bytes = &[];
         Ok(self.next.consumed.take())
     }
 }
 
-impl<'d, T> Plan<'_, 'd, Ready<T>> {
+impl<'input, 'd, T> Plan<'input, 'd, Ready<T>> {
     /// Borrows completed field lines before appending or releasing either source.
     pub fn fields(&self) -> [&[u8]; 2] {
         let prefix = self.state.source.as_slice();
@@ -248,24 +210,36 @@ impl<'d, T> Plan<'_, 'd, Ready<T>> {
         }
     }
 
-    /// Publishes completed bytes only after capacity and final work succeed.
-    pub fn try_append<V, E>(
-        self,
-        ready: impl FnOnce() -> Result<V, E>,
-    ) -> Result<(Complete<'d>, T, V), Rejected<Self, AppendError<E>>> {
-        let mut this = self;
-        let mut spare = this.state.source.spare();
-        let value = match spare.try_append(this.bytes, || ready().map_err(AppendError::Ready)) {
-            Ok(value) => value,
-            Err(error) => {
-                return Err(Rejected::new(this, error));
+    pub fn try_append(self) -> Result<Append<'input, 'd, T>, Rejected<Self, consume::Error>> {
+        let source = &self.state.source;
+        match consume::Error::check(self.bytes.len(), source.capacity() - source.len()) {
+            Ok(()) => Ok(Append(self)),
+            Err(error) => Err(Rejected::new(self, error)),
+        }
+    }
+}
+
+impl<'input, 'd, T> Append<'input, 'd, T> {
+    pub fn cancel(self) -> Plan<'input, 'd, Ready<T>> {
+        self.0
+    }
+
+    pub fn commit(self) -> (Complete<'d>, T) {
+        let plan = self.0;
+        let mut source = plan.state.source;
+        let start = source.len();
+        let bytes = plan.bytes;
+        // SAFETY: admission retained this exclusive owner with room for all bytes.
+        // Ready proved the final CRLF spans the two disjoint slices.
+        unsafe {
+            if bytes.len() > 2 {
+                bytes
+                    .as_ptr()
+                    .copy_to_nonoverlapping(source.as_mut_ptr().add(start), bytes.len() - 2);
             }
-        };
-        spare.commit();
-        let mut source = this.state.source;
-        let len = source.len() - 2;
-        source.truncate(len);
-        Ok((Complete { source }, this.next.0, value))
+            source.set_len(start + bytes.len() - 2);
+        }
+        (Complete { source }, plan.next.0)
     }
 }
 

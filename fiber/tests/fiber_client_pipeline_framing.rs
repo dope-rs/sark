@@ -1,6 +1,6 @@
 pub mod common;
 
-use common::client::recover;
+use common::client::assert_shutdown;
 use common::client::{
     config::FLAVORS,
     response::{framing, head::PIPELINED_RESPONSES},
@@ -10,7 +10,6 @@ use common::client::{
         peer::{self, Conn},
     },
 };
-use dope::core::{driver::life::recovery, io::Reclaimed};
 use dope_fiber::BlockOn as _;
 use dope_test::harness::peer::AcceptScript;
 use sark_fiber::client::config::Config;
@@ -42,11 +41,7 @@ fn pipelined_request() {
                     flavor,
                     peer.addr(),
                     |result| result.expect("pipeline response"),
-                    recovery::Policy::new(
-                        |event| std::assert_matches!(event, Reclaimed::Shutdown),
-                        recover,
-                    ),
-                    |result| result.expect("client execution"),
+                    assert_shutdown,
                 )
                 .expect("pipeline execution");
                 assert_eq!(
@@ -94,11 +89,7 @@ fn orders_informational() {
                     let read = result.expect("client scenario");
                     (read.status, read.body, read.trailers, read.info)
                 },
-                recovery::Policy::new(
-                    |event| std::assert_matches!(event, Reclaimed::Shutdown),
-                    recover,
-                ),
-                |result| result.expect("client execution"),
+                assert_shutdown,
             )
             .expect("client scenario");
             assert_eq!(status, 200);
@@ -117,11 +108,7 @@ fn orders_informational() {
             )
             .try_run(
                 |result| result.expect("HTTP response"),
-                recovery::Policy::new(
-                    |event| std::assert_matches!(event, Reclaimed::Shutdown),
-                    recover,
-                ),
-                |result| result.expect("client execution"),
+                assert_shutdown,
             )
             .expect("HTTP request execution");
             let dynamic = origins::Plan::new(Config::new(server.addr().to_string()), 2, 1, 2)
@@ -139,11 +126,7 @@ fn orders_informational() {
                             .expect("drive HTTP request")
                             .expect("HTTP response")
                     },
-                    recovery::Policy::new(
-                        |event| std::assert_matches!(event, Reclaimed::Shutdown),
-                        recover,
-                    ),
-                    |result| result.expect("client execution"),
+                    assert_shutdown,
                 )
                 .expect("client scope");
             assert_eq!(fixed.status(), dynamic.status());

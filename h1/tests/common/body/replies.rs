@@ -7,7 +7,7 @@ use o3::{
         write::{Sink, consume},
     },
 };
-use sark_h1::route::{Cache, Policy};
+use sark_h1::route::Policy;
 use sark_http::{
     h1::head::{
         request::Coding,
@@ -27,11 +27,9 @@ pub const CASES: &[(Method, Code)] = &[
     (Method::Other, Code::NOT_MODIFIED),
     (Method::Other, Code::RESET_CONTENT),
 ];
-pub const POLICY: Policy = Policy::new(Cache::Bypass, Coding::Gzip, Date::Omit, Server::Omit);
-pub const GET_TEN: &[u8] = b"GET / HTTP/1.0\r\nHost: local\r\n\r\n";
-const GET_ELEVEN: &[u8] = b"GET / HTTP/1.1\r\nHost: local\r\n\r\n";
+pub const POLICY: Policy = Policy::new(Coding::Gzip, Date::Omit, Server::Omit);
 pub const CONNECTIONS: &[(&[u8], Option<&str>)] = &[
-    (GET_TEN, None),
+    (b"GET / HTTP/1.0\r\nHost: local\r\n\r\n", None),
     (
         b"GET / HTTP/1.0\r\nHost: local\r\nConnection: keep-alive\r\n\r\n",
         Some("Connection: keep-alive"),
@@ -40,12 +38,11 @@ pub const CONNECTIONS: &[(&[u8], Option<&str>)] = &[
         b"GET / HTTP/1.0\r\nHost: local\r\nConnection: keep-alive, close\r\n\r\n",
         None,
     ),
-    (GET_ELEVEN, None),
+    (b"GET / HTTP/1.1\r\nHost: local\r\n\r\n", None),
     (
         b"GET / HTTP/1.1\r\nHost: local\r\nConnection: close\r\n\r\n",
         Some("Connection: close"),
     ),
-    (GET_ELEVEN, None),
 ];
 pub const HEADS: &[&[u8]] = &[
     b"HEAD / HTTP/1.0\r\nHost: local\r\n\r\n",

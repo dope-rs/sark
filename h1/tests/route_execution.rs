@@ -45,9 +45,7 @@ use sark_http::{
 fn method_body_allowance() {
     for &(input, expected) in discard::BODY_POLICY.iter().chain(tasks::ALLOWED_BODIES) {
         for methods in [Known::ALL, 0] {
-            let parsed = parsing::Head::parse(Input::Borrowed(input), methods)
-                .expect("head")
-                .expect("complete head");
+            let parsed = common::head::parsed(Input::Borrowed(input), methods);
             let head = framing::Head::<Streaming>::parse(raw::Bound::empty(&parsed))
                 .ok()
                 .expect("framing")
@@ -95,9 +93,7 @@ fn method_body_allowance() {
 fn transition_admission() {
     for &(input, connect) in tasks::PARTIAL_UPGRADE {
         for methods in [Known::ALL, 0] {
-            let parsed = parsing::Head::parse(Input::Borrowed(input), methods)
-                .expect("head")
-                .expect("complete head");
+            let parsed = common::head::parsed(Input::Borrowed(input), methods);
             let result = framing::Head::<Streaming>::parse(raw::Bound::empty(&parsed));
             assert!(if connect {
                 matches!(result, Ok(Some(_)))
@@ -116,9 +112,7 @@ fn transition_admission() {
 #[test]
 fn discarded_stream_length() {
     for input in [tasks::HEAD, tasks::COMPLETE] {
-        let parsed = parsing::Head::parse(Input::Borrowed(input), u8::MAX)
-            .expect("head")
-            .expect("complete head");
+        let parsed = common::head::parsed(Input::Borrowed(input), u8::MAX);
         let head = framing::Head::<Streaming>::parse(raw::Bound::empty(&parsed))
             .ok()
             .expect("framing")
@@ -172,9 +166,7 @@ fn discarded_stream_length() {
 #[test]
 fn stream_capacity() {
     for input in [tasks::HEAD, tasks::COMPLETE] {
-        let parsed = parsing::Head::parse(Input::Borrowed(input), u8::MAX)
-            .expect("head")
-            .expect("complete head");
+        let parsed = common::head::parsed(Input::Borrowed(input), u8::MAX);
         let head = framing::Head::<Streaming>::parse(raw::Bound::empty(&parsed))
             .ok()
             .flatten()
@@ -229,9 +221,7 @@ fn stream_capacity() {
 #[test]
 fn closing_connect() {
     for input in [&tasks::CONNECT[..tasks::CONNECT.len() - 1], tasks::CONNECT] {
-        let parsed = parsing::Head::parse(Input::Borrowed(input), u8::MAX)
-            .expect("head")
-            .expect("complete head");
+        let parsed = common::head::parsed(Input::Borrowed(input), u8::MAX);
         let head = framing::Head::<Connect>::parse(raw::Bound::empty(&parsed))
             .ok()
             .expect("framing")
@@ -254,9 +244,7 @@ fn closing_connect() {
 #[test]
 fn connect_keeps_version() {
     for &(input, expected) in tasks::CONNECT_VERSIONED {
-        let parsed = parsing::Head::parse(Input::Borrowed(input), u8::MAX)
-            .expect("head")
-            .expect("complete head");
+        let parsed = common::head::parsed(Input::Borrowed(input), u8::MAX);
         let head = framing::Head::<Connect>::parse(raw::Bound::empty(&parsed))
             .ok()
             .flatten()
@@ -297,9 +285,7 @@ fn body_yields() {
             let mut evidence = Credits(Vec::with_capacity(4));
             STEPS.set(0);
             FINISHES.set(0);
-            let parsed = parsing::Head::parse(Input::Borrowed(HEAD), u8::MAX)
-                .expect("request head")
-                .expect("complete head");
+            let parsed = common::head::parsed(Input::Borrowed(HEAD), u8::MAX);
             let head = framing::Head::<Request<body::Segmented>>::parse(raw::Bound::empty(&parsed))
                 .ok()
                 .expect("framing")
@@ -438,9 +424,7 @@ fn buffered_body_starts_at_fin() {
                 let (outcome, pointer) = {
                     let source = storage::Shared::try_copy(input).expect("wire owner");
                     let pointer = std::ptr::from_ref(source.as_slice().last().expect("wire byte"));
-                    let parsed = parsing::Head::parse(Input::Buffered(source.view()), u8::MAX)
-                        .expect("request head")
-                        .expect("complete head");
+                    let parsed = common::head::parsed(Input::Buffered(source.view()), u8::MAX);
                     let head = framing::Head::<Buffered>::parse(raw::Bound::empty(&parsed))
                         .ok()
                         .expect("framing")

@@ -4,5 +4,4 @@ pub enum Cause {
     Inline,
     Compressed,
     Framed,
-    Cached,
 }

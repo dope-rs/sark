@@ -50,13 +50,14 @@ impl<'id, 'input, 'd> More<'id, 'input, 'd> {
                 trailer,
                 consumed,
             } => {
-                let owner = match Chunks::allocate(budget, trailer.len(), trailer.capacity()) {
-                    Ok(owner) => owner,
-                    Err(error) => {
-                        *framing = Framing::Chunked(chunks);
-                        return Err(error);
-                    }
-                };
+                let owner =
+                    match Chunks::allocate(budget, trailer.len(), trailer::Pending::CAPACITY) {
+                        Ok(owner) => owner,
+                        Err(error) => {
+                            *framing = Framing::Chunked(chunks);
+                            return Err(error);
+                        }
+                    };
                 let trailers = match trailer.try_store(owner) {
                     Ok(trailers) => trailers,
                     Err(rejected) => {

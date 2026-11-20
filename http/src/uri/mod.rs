@@ -30,11 +30,16 @@ impl<'a> Authority<'a> {
     }
 
     pub fn parse(value: &'a [u8]) -> Result<Self, Error> {
-        let parts = Parts::<&[u8]>::parse(value)?;
-        Ok(Self {
-            host: parts.host,
-            port: parts.port,
-        })
+        let (host, port) = authority(value)?;
+        Ok(Self { host, port })
+    }
+
+    pub(crate) fn validate(value: &[u8]) -> Result<(), Error> {
+        host_end(value).map(|_| ())
+    }
+
+    pub(crate) fn has_nonempty_port(value: &[u8]) -> Result<bool, Error> {
+        Ok(value.len() - host_end(value)? > 1)
     }
 
     pub fn is_same(self, other: Self, scheme: Scheme) -> bool {
@@ -46,10 +51,10 @@ impl<'a> Authority<'a> {
     }
 
     pub(crate) fn spanned(self) -> Parsed<'a> {
-        Parsed(Parts {
+        Parsed {
             host: record::Span::from_slice(self.host),
             port: self.port.map(record::Span::from_slice),
-        })
+        }
     }
 
     pub const fn host(self) -> &'a [u8] {
@@ -108,21 +113,13 @@ impl<'a> Authority<'a> {
         if let Some(ip) = parser::Parser::new(span).v6().map(net::IpAddr::V6) {
             return Ok(ip);
         }
-        if Self::is_reg(value) {
+        let mut name = value.iter();
+        let _ = registered::<false>(&mut name);
+        if !value.is_empty() && name.as_slice().is_empty() {
             Err(Host::Name)
         } else {
             Err(Host::Invalid)
         }
-    }
-
-    pub(crate) fn is_port(value: &[u8]) -> bool {
-        value
-            .strip_prefix(b":")
-            .is_some_and(|port| !port.is_empty() && port.iter().all(u8::is_ascii_digit))
-    }
-
-    pub(crate) fn is_reg(value: &[u8]) -> bool {
-        reg_name_len(record::Span::from_slice(value)).is_some_and(|len| len.get() == value.len())
     }
 
     pub(crate) fn is_ip(value: &[u8]) -> bool {
@@ -131,27 +128,26 @@ impl<'a> Authority<'a> {
     }
 }
 
-struct Parts<S> {
-    host: S,
-    port: Option<S>,
-}
-
 /// Authority admission retained on its exact immutable record span.
-pub(crate) struct Parsed<'a>(Parts<record::Span<'a>>);
+pub(crate) struct Parsed<'a> {
+    host: record::Span<'a>,
+    port: Option<record::Span<'a>>,
+}
 
 impl<'a> Parsed<'a> {
     pub(crate) fn parse(value: record::Span<'a>) -> Result<Self, Error> {
-        Parts::parse(value).map(Self)
+        let (host, port) = authority(value)?;
+        Ok(Self { host, port })
     }
 
     /// Whether this admitted authority has a nonempty explicit decimal port.
     pub(crate) fn has_port(self) -> bool {
-        self.0.port.is_some_and(|port| !port.is_empty())
+        self.port.is_some_and(|port| !port.is_empty())
     }
 
     pub(crate) fn is_same(&self, other: Parsed<'_>, scheme: Scheme) -> bool {
-        pair::is_same(self.0.host, other.0.host)
-            && is_port_span_equivalent(self.0.port, other.0.port, scheme)
+        pair::is_same(self.host, other.host)
+            && is_port_span_equivalent(self.port, other.port, scheme)
     }
 }
 
@@ -192,65 +188,42 @@ impl<'a> Source<'a> for record::Span<'a> {
     }
 }
 
-impl<'a, S: Source<'a>> Parts<S> {
-    fn parse(value: S) -> Result<Self, Error> {
-        let len = value.len();
-        if len == 0 {
-            return Err(Error::Empty);
+fn authority<'a, S: Source<'a>>(value: S) -> Result<(S, Option<S>), Error> {
+    let end = host_end(value)?;
+    let len = value.len();
+    if end == len {
+        return Ok((value, None));
+    }
+    let port = value.sub(end + 1, len).ok_or(Error::InvalidPort)?;
+    Ok((value.sub(0, end).ok_or(Error::InvalidHost)?, Some(port)))
+}
+
+fn host_end<'a>(value: impl Source<'a>) -> Result<usize, Error> {
+    let span = value.span();
+    if span.is_empty() {
+        return Err(Error::Empty);
+    }
+    let mut rest = span.iter();
+    if value.get(0) == Some(b'[') {
+        let close = rest
+            .position(|&byte| byte == b']')
+            .ok_or(Error::InvalidHost)?;
+        let ip = value.sub(1, close).ok_or(Error::InvalidHost)?.span();
+        if close == 1 || (!is_future_span(ip) && parser::Parser::new(ip).v6().is_none()) {
+            return Err(Error::InvalidHost);
         }
-        if value.get(0) == Some(b'[') {
-            let Some(close) = value.span().iter().position(|byte| *byte == b']') else {
-                return Err(Error::InvalidHost);
-            };
-            let Some(literal) = value.sub(1, close) else {
-                return Err(Error::InvalidHost);
-            };
-            let literal = literal.span();
-            if close == 1
-                || (!is_future_span(literal) && parser::Parser::new(literal).v6().is_none())
-            {
-                return Err(Error::InvalidHost);
-            }
-            let Some(suffix) = value.sub(close + 1, len) else {
-                return Err(Error::InvalidHost);
-            };
-            let port = if suffix.len() == 0 {
-                None
-            } else {
-                if suffix.get(0) != Some(b':') {
-                    return Err(Error::InvalidPort);
-                }
-                let Some(port) = suffix.sub(1, suffix.len()) else {
-                    return Err(Error::InvalidPort);
-                };
-                if !port.span().iter().all(u8::is_ascii_digit) {
-                    return Err(Error::InvalidPort);
-                }
-                Some(port)
-            };
-            let Some(host) = value.sub(0, close + 1) else {
-                return Err(Error::InvalidHost);
-            };
-            return Ok(Self { host, port });
+        if let Some(&separator) = rest.next()
+            && (separator != b':' || !rest.all(u8::is_ascii_digit))
+        {
+            return Err(Error::InvalidPort);
         }
-        let end = reg_name_len(value.span()).ok_or(Error::InvalidHost)?.get();
-        let host = value.sub(0, end).ok_or(Error::InvalidHost)?;
-        let port = if end == len {
-            None
-        } else {
-            let port = value.sub(end + 1, len).ok_or(Error::InvalidPort)?;
-            let span = port.span();
-            let mut bytes = span.iter().copied();
-            if let Some(bad) = bytes.find(|byte| !byte.is_ascii_digit()) {
-                return Err(if bad == b':' || bytes.any(|byte| byte == b':') {
-                    Error::InvalidHost
-                } else {
-                    Error::InvalidPort
-                });
-            }
-            Some(port)
-        };
-        Ok(Self { host, port })
+        Ok(close + 1)
+    } else {
+        let port = registered::<true>(&mut rest);
+        if rest.clone().next().is_some() {
+            return Err(registered_error(port.is_some(), rest.copied()));
+        }
+        Ok(port.map_or(span.len(), NonZero::get))
     }
 }
 
@@ -282,42 +255,45 @@ fn normalized_port_span(
     }
 }
 
-fn reg_name_len(value: record::Span<'_>) -> Option<NonZero<usize>> {
-    let mut bytes = value.iter().enumerate();
-    while let Some((index, &byte)) = bytes.next() {
-        if byte == b':' {
-            return NonZero::new(index);
-        }
-        if byte == b'%' {
-            if !bytes.next()?.1.is_ascii_hexdigit() || !bytes.next()?.1.is_ascii_hexdigit() {
-                return None;
+#[inline(always)]
+pub(crate) fn registered<'a, const WITH_PORT: bool>(
+    rest: &mut (impl Iterator<Item = &'a u8> + Clone),
+) -> Option<NonZero<usize>> {
+    let len = rest.clone().count();
+    let mut next = rest.clone();
+    while let Some(&byte) = next.next() {
+        if is_reg_byte(byte)
+            || byte == b'%'
+                && next.next().is_some_and(u8::is_ascii_hexdigit)
+                && next.next().is_some_and(u8::is_ascii_hexdigit)
+        {
+            *rest = next.clone();
+        } else if WITH_PORT && byte == b':' {
+            let name = NonZero::new(len - rest.clone().count())?;
+            *rest = next.clone();
+            while next.next().is_some_and(u8::is_ascii_digit) {
+                *rest = next.clone();
             }
-        } else if !is_reg_byte(byte) {
-            return None;
+            return Some(name);
+        } else {
+            break;
         }
     }
-    NonZero::new(value.len())
+    None
+}
+
+pub(crate) fn registered_error(port: bool, mut tail: impl Iterator<Item = u8>) -> Error {
+    if !port || tail.any(|byte| byte == b':') {
+        Error::InvalidHost
+    } else {
+        Error::InvalidPort
+    }
 }
 
 fn is_reg_byte(byte: u8) -> bool {
     byte.is_ascii_alphanumeric()
-        || matches!(
-            byte,
-            b'-' | b'.'
-                | b'_'
-                | b'~'
-                | b'!'
-                | b'$'
-                | b'&'
-                | b'\''
-                | b'('
-                | b')'
-                | b'*'
-                | b'+'
-                | b','
-                | b';'
-                | b'='
-        )
+        | (byte.wrapping_sub(b'&') <= b'.' - b'&')
+        | matches!(byte, b'!' | b'$' | b';' | b'=' | b'_' | b'~')
 }
 
 fn is_future_byte(byte: u8) -> bool {

@@ -1,6 +1,6 @@
 use std::{net::SocketAddr, time::Duration};
 
-use dope::core::driver::{life::recovery, route::Identity};
+use dope::core::{driver::route::Identity, io::Reclaimed};
 use dope_fiber::BlockOn as _;
 use sark_client::protocol::response::Event;
 use sark_fiber::client::Stream;
@@ -9,7 +9,6 @@ use sark_http::method::Method;
 use crate::common::client::{
     config::Config as _,
     runtime::{
-        self,
         cases::{
             Flavor,
             request::{Error, Step},
@@ -33,8 +32,7 @@ pub fn try_run<R>(
     flavor: Flavor,
     addr: SocketAddr,
     check: impl for<'d> FnOnce(Result<(Capture, Capture), Exchange<'d>>) -> R,
-    policy: impl recovery::Observe,
-    done: impl for<'run> FnOnce(Result<Result<R, Step>, runtime::Error<'run>>) -> Result<R, Step>,
+    report: impl FnMut(Reclaimed),
 ) -> Result<R, Error> {
     let config = flavor
         .try_config(addr)
@@ -69,8 +67,7 @@ pub fn try_run<R>(
                     })();
                     Ok(check(result))
                 },
-                policy,
-                done,
+                report,
             )
             .map_err(Error::Fixed)?
             .map_err(Error::Step),
@@ -98,8 +95,7 @@ pub fn try_run<R>(
                     })();
                     Ok(check(result))
                 },
-                policy,
-                done,
+                report,
             )
             .map_err(Error::Dynamic)?
             .map_err(Error::Step),

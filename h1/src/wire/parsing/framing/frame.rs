@@ -87,17 +87,17 @@ impl<'a, 'req: 'body, 'body, 'd, R: route::Spec, C> Frame<'a, 'req, 'body, 'd, R
         };
         let (request, frame) = fields.into_frame(self.total)?;
         let view = match (<R::Request as route::Schema>::BODY_RETENTION, body) {
-            (Retention::Discarded, _) | (_, Payload::Discarded(..)) => View::from_slice(&[]),
-            (Retention::Retained, Payload::Inline(..)) => View::from_slice(frame.body()),
+            (Retention::Discarded, _) | (_, Payload::Discarded(..)) => View::Slice(&[]),
+            (Retention::Retained, Payload::Inline(..)) => View::Slice(frame.body()),
             (Retention::Retained, Payload::Chunked(body, ())) => {
                 // SAFETY: drive binds the completed decoder to these exact input
                 // bytes. Its frozen ranges cover every retained data fragment,
                 // sum to len, and stay within the consumed wire prefix.
                 let ranges =
                     unsafe { hold::ranges::Set::from_parts(frame.wire(), body.into_ranges(), len) };
-                View::from_ranges(ranges)
+                View::Ranges(ranges)
             }
-            (Retention::Retained, Payload::Streamed(body, ())) => View::from_body(body.into_body()),
+            (Retention::Retained, Payload::Streamed(body, ())) => View::Owned(body.into_body()),
         };
         let body = view
             .finish::<R>(len, length)

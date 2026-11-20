@@ -8,6 +8,7 @@ use o3::{
         write::consume,
     },
 };
+use sark_client::protocol;
 
 pub struct Gate {
     bytes: Shared,
@@ -110,12 +111,24 @@ unsafe impl<'d> hold::raw::Retain<'d> for Gate {
 
 pub mod decoder;
 mod output;
-mod retain;
 pub mod session;
 mod source;
 pub use output::only;
-pub use retain::Retain;
 pub(in crate::common::codec) use source::Source;
+
+pub fn assert_budget<T>(result: Result<T, decoder::Error>, budget: resident::Budget<'_>) {
+    let cause = result.as_ref().err();
+    let available = budget.available();
+    assert!(
+        matches!(cause, Some(decoder::Error::Protocol(protocol::Error::Retention(
+            hold::Error::Resident(resident::AllocError::Budget(error)),
+        ))) if {
+            let (required, spare) = error.into_parts();
+            spare == available && required.get() > spare
+        }),
+        "expected a budget failure with {available} bytes available, got {cause:?}",
+    );
+}
 
 // SAFETY: toggling retention policy never changes the immutable fixture bytes.
 unsafe impl buffer::raw::Source for Gate {}

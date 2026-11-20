@@ -11,8 +11,8 @@ use o3::buffer::{
     storage,
 };
 use sark_h1::server::{
-    payload::{self, End, Frame},
-    task::runtime::Stream,
+    payload::{End, Frame, Stream},
+    task::runtime::{Runtime, Stream as Staged},
 };
 use sark_http::payload::response::dispatch::chunk::Chunk;
 
@@ -26,7 +26,7 @@ fn scatter_matches_wire() {
         let owner = owner.expect("test chunk allocation succeeds");
         let body = Chunk::try_new(resident::Shared::from(owner));
         let body = body.expect("chunk fixture must be non-empty");
-        let frame = Frame::chunk(body);
+        let frame = Stream::new(Frame::chunk(body), ());
         assert_eq!(frame.len(), expected.len());
         assert_eq!(
             chunks::try_collect(&frame, NonZero::<usize>::MIN).expect("non-empty frame"),
@@ -46,7 +46,7 @@ fn offsets_match_suffix() {
     let owner = owner.expect("test chunk allocation succeeds");
     let body = Chunk::try_new(resident::Shared::from(owner));
     let body = body.expect("chunk fixture must be non-empty");
-    let frame = Frame::chunk(body);
+    let frame = Stream::new(Frame::chunk(body), ());
     let expected = b"10\r\n123456789abcdef0\r\n";
     let cap = NonZero::<usize>::new(3);
     let cap = cap.expect("non-zero traversal cap");
@@ -70,80 +70,52 @@ fn offsets_match_suffix() {
 }
 
 #[test]
-fn chunk_retains_owner() {
-    let body = storage::Shared::try_copy(&[b'x'; 4096]);
-    let body = body.expect("4096-byte test body allocation succeeds");
-    let pointer = body.as_slice().as_ptr();
-
-    let body = Chunk::try_new(resident::Shared::from(body));
-    let body = body.expect("chunk fixture must be non-empty");
-    let (frame, allocs) = Tracker::count(|| Frame::chunk(body));
-    assert_eq!(allocs, 0);
-
-    let body = frame.into_chunk();
-    let body = body.expect("data frame owns one body");
-    assert_eq!(body.owner().as_slice().as_ptr(), pointer);
-}
-
-#[test]
-fn terminator_is_inline() {
-    let (frame, allocs) = Tracker::count(Frame::terminator);
-
-    assert_eq!(allocs, 0);
+fn deferred_frames_keep_their_owner_and_order() {
+    let owner = storage::Shared::try_copy(b"same body through every retry").expect("chunk owner");
+    let pointer = owner.as_slice().as_ptr();
+    let chunk = Chunk::try_new(resident::Shared::from(owner)).expect("non-empty chunk");
+    let ((body, end), allocations) = Tracker::count(|| {
+        let [body, end] = [
+            Stream::new(Frame::chunk(chunk), 19),
+            Stream::new(Frame::terminator(), 7),
+        ]
+        .map(|frame| {
+            egress::NonEmpty::try_new(frame)
+                .expect("non-empty frame")
+                .try_bound::<bound::Unbounded>()
+                .ok()
+                .expect("unbounded frame")
+        });
+        let charge = body.charge();
+        let wire = body.geometry().wire();
+        let bytes = body.as_inner().charge().resident_bytes;
+        let mut runtime = Runtime::<(), (), _>::default();
+        assert!(runtime.try_stage(Staged::new(body)).is_ok());
+        let end = runtime.try_stage(Staged::new(end)).expect_err("full slot");
+        assert_eq!(runtime.staged_bytes(), bytes);
+        let (body, kind) = runtime.take_stream().expect("staged data").into_parts();
+        assert!(matches!(kind, End::More));
+        assert!(body.charge() == charge);
+        assert_eq!(body.geometry().wire(), wire);
+        assert!(runtime.try_stage(end).is_ok());
+        let (end, kind) = runtime
+            .take_stream()
+            .expect("staged terminator")
+            .into_parts();
+        assert!(matches!(kind, End::Last));
+        (
+            body.into_inner().into_inner(),
+            end.into_inner().into_inner(),
+        )
+    });
+    assert_eq!(allocations, 0);
+    let mut cursor = body.start();
+    let bytes = cursor.take_bytes(usize::MAX).nth(1).expect("chunk payload");
+    assert_eq!(bytes.bytes().as_ptr(), pointer);
+    assert_eq!(body.release(), 19);
     assert_eq!(
-        chunks::try_collect(&frame, NonZero::new(2).expect("non-zero cap"))
-            .expect("non-empty frame"),
+        chunks::try_collect(&end, NonZero::new(2).expect("non-zero cap")).expect("terminator"),
         b"0\r\n\r\n"
     );
-    assert!(frame.into_chunk().is_none());
-}
-
-#[test]
-fn deferred_end_is_last() {
-    let body = egress::NonEmpty::try_new(payload::Stream::new(Frame::terminator(), 7));
-    let body = body.expect("terminator has non-empty transport geometry");
-    let (body, end) = Stream::new(
-        body.try_bound::<bound::Unbounded>()
-            .ok()
-            .expect("unbounded geometry"),
-    )
-    .into_parts();
-    let (frame, tag) = body.into_inner().into_inner().into_parts();
-
-    assert_eq!(tag, 7);
-    assert!(matches!(end, End::Last));
-    assert!(frame.into_chunk().is_none());
-}
-
-#[test]
-fn deferred_body_retains() {
-    let owner = storage::Shared::try_copy(b"same body through every retry");
-    let owner = owner.expect("test operation must succeed");
-    let pointer = owner.as_slice().as_ptr();
-    let chunk = Chunk::try_new(resident::Shared::from(owner));
-    let chunk = chunk.expect("test operation must succeed");
-    let body = egress::NonEmpty::try_new(payload::Stream::new(Frame::chunk(chunk), 19));
-    let body = body
-        .expect("test operation must succeed")
-        .try_bound::<bound::Unbounded>()
-        .ok()
-        .expect("unbounded geometry");
-    let count = body.geometry().wire();
-    let charge = body.charge();
-
-    let (body, allocs) = Tracker::count(|| {
-        let staged = Stream::new(body);
-        let (body, end) = staged.into_parts();
-        assert!(matches!(end, End::More));
-        body
-    });
-    assert_eq!(allocs, 0);
-    assert!((body.geometry().wire()) == (count));
-    assert!((body.charge()) == (charge));
-
-    let (frame, tag) = body.into_inner().into_inner().into_parts();
-    assert_eq!(tag, 19);
-    let chunk = frame.into_chunk();
-    let chunk = chunk.expect("data frame retains its exact chunk owner");
-    assert_eq!(chunk.owner().as_slice().as_ptr(), pointer);
+    assert_eq!(end.release(), 7);
 }

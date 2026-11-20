@@ -27,6 +27,8 @@ fn host_validation() {
         (b"user@example.com".as_slice(), uri::Error::InvalidHost),
         (b"example.com/path", uri::Error::InvalidHost),
         (b"example.com:bad", uri::Error::InvalidPort),
+        (b"example.com:bad:", uri::Error::InvalidHost),
+        (b"[::1]:bad:", uri::Error::InvalidPort),
         (b"2001:db8::1", uri::Error::InvalidHost),
         (b"[not-ipv6]", uri::Error::InvalidHost),
         (b"bad%2", uri::Error::InvalidHost),
@@ -38,65 +40,54 @@ fn host_validation() {
 
 #[test]
 fn request_plan() {
-    let auth =
-        (target::Request::default().try_host(b"example.com")).expect("test operation must succeed");
+    use target::Form::{Absolute, Asterisk, Authority, Origin};
+    use target::Source::{Empty, Host, Target};
+
+    let request = target::Request::default();
+    let auth = request.try_host(b"example.com").expect("Host");
+    let empty = request.try_host(b"").expect("empty Host");
+    let version = b"HTTP/1.1";
     assert!(auth.try_host(b"other.example") == Err(target::HostError::Duplicate));
-    let plan = (auth.finish(b"GET", b"/items", b"HTTP/1.1")).expect("test operation must succeed");
-    assert!((plan.target_form()) == (target::Form::Origin));
-    assert!((plan.source()) == (target::Source::Host));
-
-    assert!(
-        target::Request::default().finish(b"GET", b"/", b"HTTP/1.1")
-            == Err(target::Error::MissingHost)
-    );
-    let empty = (target::Request::default().try_host(b"")).expect("test operation must succeed");
-    let plan = (empty.finish(b"GET", b"/", b"HTTP/1.1")).expect("test operation must succeed");
-    assert!((plan.source()) == (target::Source::Empty));
+    assert!(auth.try_host(b"x:bad") == Err(target::HostError::Authority(uri::Error::InvalidPort)));
+    for (request, method, uri, form, source) in [
+        (auth, "GET", "/items", Origin, Host),
+        (auth, "GET", "/ok?nested=/x?y", Origin, Host),
+        (
+            empty,
+            "GET",
+            "https://origin.example/items?q=1",
+            Absolute,
+            Target,
+        ),
+        (auth, "CONNECT", "origin.example:443", Authority, Target),
+        (auth, "OPTIONS", "*", Asterisk, Host),
+    ] {
+        let plan = request
+            .finish(method.as_bytes(), uri.as_bytes(), version)
+            .expect("request target");
+        assert!(
+            (plan.target_form(), plan.source()) == (form, source),
+            "{method} {uri}"
+        );
+    }
+    assert!(request.finish(b"GET", b"/", version) == Err(target::Error::MissingHost));
+    let plan = empty.finish(b"GET", b"/", version).expect("empty Host");
+    assert!(plan.source() == Empty);
     assert!(plan.require() == Err(target::Error::EmptyAuthority));
-
-    let absolute = (target::Request::default().try_host(b"")).expect("test operation must succeed");
-    let plan = (absolute.finish(b"GET", b"https://origin.example/items?q=1", b"HTTP/1.1"))
-        .expect("test operation must succeed");
-    assert!((plan.target_form()) == (target::Form::Absolute));
-    assert!((plan.source()) == (target::Source::Target));
-
-    let connect = (target::Request::default().try_host(b"proxy.example"))
-        .expect("test operation must succeed");
-    let plan = (connect.finish(b"CONNECT", b"origin.example:443", b"HTTP/1.1"))
-        .expect("test operation must succeed");
-    assert!((plan.target_form()) == (target::Form::Authority));
-    assert!((plan.source()) == (target::Source::Target));
+    for uri in ["origin.example", "origin.example:"] {
+        assert!(
+            auth.finish(b"CONNECT", uri.as_bytes(), version) == Err(target::Error::InvalidTarget)
+        );
+    }
+    assert!(auth.finish(b"GET", b"*", version) == Err(target::Error::InvalidTarget));
     assert!(
-        connect.finish(b"CONNECT", b"origin.example", b"HTTP/1.1")
-            == Err(target::Error::InvalidTarget)
-    );
-    assert!(
-        connect.finish(b"CONNECT", b"origin.example:", b"HTTP/1.1")
-            == Err(target::Error::InvalidTarget)
-    );
-
-    let asterisk =
-        (target::Request::default().try_host(b"example.com")).expect("test operation must succeed");
-    assert!(
-        ((asterisk.finish(b"OPTIONS", b"*", b"HTTP/1.1"))
-            .expect("test operation must succeed")
-            .target_form())
-            == (target::Form::Asterisk)
-    );
-    assert!(asterisk.finish(b"GET", b"*", b"HTTP/1.1") == Err(target::Error::InvalidTarget));
-
-    assert!(
-        (auth.finish(b"GET", b"/%zz", b"HTTP/1.1"))
-            == (Err(target::Error::Path(path::Error::Escape {
+        auth.finish(b"GET", b"/%zz", version)
+            == Err(target::Error::Path(path::Error::Escape {
                 at: 1,
                 first: Some(b'z'),
                 second: Some(b'z'),
-            })))
+            }))
     );
-    let plan = (auth.finish(b"GET", b"/ok?nested=/x?y", b"HTTP/1.1"))
-        .expect("test operation must succeed");
-    assert!((plan.target_form()) == (target::Form::Origin));
-    assert!((plan.source()) == (target::Source::Host));
 }
 
 #[test]

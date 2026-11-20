@@ -12,30 +12,20 @@ pub(super) struct Skip {
     server: Inclusion,
 }
 
-#[derive(Clone, Copy)]
-pub(super) enum Cache {
-    Bypass,
-    Store,
-}
-
 pub(super) struct Attrs {
-    pub(super) cache: Cache,
     pub(super) max_body: Option<syn::Expr>,
     pub(super) head_skip: Skip,
 }
 
 impl Attrs {
     pub(super) fn take(fun: &mut syn::ItemFn) -> syn::Result<Self> {
-        let mut cache = Cache::Bypass;
         let mut max: Option<syn::Expr> = None;
         let mut skips = Skip {
             date: Inclusion::Include,
             server: Inclusion::Include,
         };
         for attr in &fun.attrs {
-            if attr.path().is_ident("static_response") {
-                cache = Cache::Store;
-            } else if attr.path().is_ident("max_body") {
+            if attr.path().is_ident("max_body") {
                 if max.is_some() {
                     return Err(syn::Error::new_spanned(attr, "duplicate #[max_body(...)]"));
                 }
@@ -55,13 +45,8 @@ impl Attrs {
                 })?;
             }
         }
-        fun.attrs.retain(|attr| {
-            !attr.path().is_ident("static_response")
-                && !attr.path().is_ident("max_body")
-                && !attr.path().is_ident("skip")
-        });
+        fun.attrs.retain(|attr| !attr.path().is_ident("max_body") && !attr.path().is_ident("skip"));
         Ok(Self {
-            cache,
             max_body: max,
             head_skip: skips,
         })
@@ -69,14 +54,8 @@ impl Attrs {
 }
 
 pub(super) enum Response<'a> {
-    Native {
-        output: &'a syn::Type,
-        cache: Cache,
-    },
-    Plain {
-        kind: proc_macro2::TokenStream,
-        cache: Cache,
-    },
+    Native(&'a syn::Type),
+    Plain(proc_macro2::TokenStream),
 }
 
 impl<'a> Response<'a> {
@@ -93,8 +72,8 @@ impl<'a> Response<'a> {
         let ns_http = &paths.http;
         let ns_h1 = &paths.h1;
         use quote::quote;
-        let (kind, stream, coding, mode) = match self {
-            Response::Native { output, cache } => {
+        let (kind, stream, coding) = match self {
+            Response::Native(output) => {
                 let life = Lifetimes::new(output);
                 let drive = life.response(&syn::parse_quote!('__d), None, &[]);
                 let owned = life.response(&syn::parse_quote!('static), None, &[]);
@@ -107,27 +86,20 @@ impl<'a> Response<'a> {
                 let payload = quote! {
                     <#owned as #ns_core::manifold::Response<'static, 'static>>::BODY_KIND
                 };
-                let coding = match cache {
-                    Cache::Bypass => quote! {
-                        match #payload {
-                            #ns_http::payload::Kind::Inline => {
-                                #ns_http::h1::head::request::Coding::Gzip
-                            }
-                            #ns_http::payload::Kind::Static
-                            | #ns_http::payload::Kind::Stream => {
-                                #ns_http::h1::head::request::Coding::Plain
-                            }
+                let coding = quote! {
+                    match #payload {
+                        #ns_http::payload::Kind::Inline => #ns_http::h1::head::request::Coding::Gzip,
+                        #ns_http::payload::Kind::Static | #ns_http::payload::Kind::Stream => {
+                            #ns_http::h1::head::request::Coding::Plain
                         }
-                    },
-                    Cache::Store => quote!(#ns_http::h1::head::request::Coding::Plain),
+                    }
                 };
-                (kind, stream, coding, cache)
+                (kind, stream, coding)
             }
-            Response::Plain { kind, cache } => (
+            Response::Plain(kind) => (
                 kind,
                 quote!(#ns_http::payload::response::dispatch::Never),
                 quote!(#ns_http::h1::head::request::Coding::Plain),
-                cache,
             ),
         };
         let max = match max_body {
@@ -143,22 +115,15 @@ impl<'a> Response<'a> {
             Inclusion::Omit => quote!(#ns_http::h1::head::response::Server::Omit),
         };
         let policy = match h1 {
-            crate::runtime::H1::Available(_) => {
-                let cache = match mode {
-                    Cache::Bypass => quote!(#ns_h1::route::Cache::Bypass),
-                    Cache::Store => quote!(#ns_h1::route::Cache::Store),
-                };
-                quote! {
+            crate::runtime::H1::Available(_) => quote! {
                 impl #ns_h1::route::PolicyOf for #name {
                     const POLICY: #ns_h1::route::Policy = #ns_h1::route::Policy::new(
-                        #cache,
                         #coding,
                         #date,
                         #server,
                     );
                 }
-                }
-            }
+            },
             crate::runtime::H1::Missing => quote! {},
         };
 

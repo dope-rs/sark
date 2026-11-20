@@ -1,15 +1,7 @@
 use core::{num::NonZero, ops::ControlFlow};
 
-use crate::h1::chunk::{Error, Framer, Limit, Run, scan::state};
+use crate::h1::chunk::{Error, Framer, Framing, Run, scan::state};
 
-/// The exact trailer phase, with no body or size-line alternatives.
-#[derive(Clone, Copy)]
-pub(in crate::h1) struct Trailer {
-    pub(in crate::h1) cursor: Cursor,
-    limits: Limit,
-}
-
-/// Mutable scan progress; limits remain with the original trailer owner.
 #[derive(Clone, Copy)]
 pub(in crate::h1) struct Cursor {
     pub(super) state: state::State,
@@ -29,34 +21,25 @@ pub(in crate::h1) enum Progress {
 }
 
 /// The current input's exact admitted trailer prefix and its continuation.
-pub(in crate::h1) struct Partial<'input> {
-    bytes: &'input [u8],
-    consumed: NonZero<usize>,
-    next: Trailer,
+pub struct Pending<'input> {
+    pub(in crate::h1) bytes: &'input [u8],
+    pub(super) consumed: NonZero<usize>,
+    pub(in crate::h1) cursor: Cursor,
 }
 
-impl Trailer {
-    pub(super) const fn new(state: state::State, wire: usize, limits: Limit) -> Self {
-        Self {
-            cursor: Cursor { state, wire },
-            limits,
-        }
-    }
-
-    pub(in crate::h1) const fn capacity(&self) -> usize {
-        self.limits.trailers()
-    }
-
-    pub(in crate::h1) fn scan(mut self, input: &[u8]) -> Result<(Progress, &[u8]), Error> {
+impl Cursor {
+    pub(in crate::h1) fn scan<'a>(
+        &self,
+        input: &'a [u8],
+        limits: &Framing,
+    ) -> Result<(Progress, &'a [u8]), Error> {
+        let mut cursor = *self;
         for (offset, &byte) in input.iter().enumerate() {
-            let wire = Framer::wire(self.cursor.wire, 1, &self.limits)?;
-            let progress = self
-                .cursor
-                .state
-                .scan(byte, self.cursor.wire, &self.limits)?;
-            self.cursor.wire = wire;
+            let wire = Framer::wire(cursor.wire, 1, limits)?;
+            let progress = cursor.state.scan(byte, cursor.wire, limits)?;
+            cursor.wire = wire;
             match progress {
-                ControlFlow::Continue(state) => self.cursor.state = state,
+                ControlFlow::Continue(state) => cursor.state = state,
                 ControlFlow::Break(trailers) => {
                     let next = NonZero::<usize>::MIN.saturating_add(offset);
                     return Ok((
@@ -72,7 +55,7 @@ impl Trailer {
         }
         Ok((
             Progress::More {
-                next: self.cursor,
+                next: cursor,
                 consumed: NonZero::new(input.len()),
             },
             input,
@@ -80,20 +63,16 @@ impl Trailer {
     }
 }
 
-impl<'input> Partial<'input> {
-    pub(super) fn new(bytes: &'input [u8], consumed: NonZero<usize>, next: Trailer) -> Self {
-        Self {
-            bytes,
-            consumed,
-            next,
-        }
-    }
-
-    pub(in crate::h1) const fn consumed(&self) -> NonZero<usize> {
+impl Pending<'_> {
+    pub const fn consumed(&self) -> NonZero<usize> {
         self.consumed
     }
 
-    pub(in crate::h1) fn into_parts(self) -> (&'input [u8], NonZero<usize>, Trailer) {
-        (self.bytes, self.consumed, self.next)
+    pub const fn len(&self) -> usize {
+        self.bytes.len()
+    }
+
+    pub const fn is_empty(&self) -> bool {
+        self.bytes.is_empty()
     }
 }

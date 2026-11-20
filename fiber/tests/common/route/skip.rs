@@ -7,41 +7,32 @@ pub struct PingReply<'d> {
     body: fixed::Body<'d>,
 }
 
+const OK: PingReply<'static> = PingReply {
+    status: status::Code::OK,
+    body: fixed::Body::new(b"ok"),
+};
+
 #[sark_fiber::handler(pub)]
-#[static_response]
 #[skip(date, server)]
 fn lean() -> PingReply<'d> {
-    PingReply {
-        status: status::Code::OK,
-        body: fixed::Body::new(b"ok"),
-    }
+    OK
 }
 
 #[sark_fiber::handler(pub)]
-#[static_response]
 fn full() -> PingReply<'d> {
-    PingReply {
-        status: status::Code::OK,
-        body: fixed::Body::new(b"ok"),
-    }
+    OK
 }
 
 #[sark_fiber::handler(pub)]
 #[skip(server)]
 fn no_server() -> PingReply<'d> {
-    PingReply {
-        status: status::Code::OK,
-        body: fixed::Body::new(b"ok"),
-    }
+    OK
 }
 
 #[sark_fiber::handler(pub)]
 #[skip(date)]
 async fn no_date() -> PingReply<'d> {
-    PingReply {
-        status: status::Code::OK,
-        body: fixed::Body::new(b"ok"),
-    }
+    OK
 }
 
 sark_fiber::define_route! {

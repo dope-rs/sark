@@ -3,7 +3,7 @@ pub mod common;
 
 use std::{cell::Cell, convert, net::TcpListener, time::Duration};
 
-use common::client::recover;
+use common::client::assert_shutdown;
 use common::{
     client::{
         response::head::PIPELINED_RESPONSES,
@@ -120,11 +120,7 @@ fn payload_has_no_prefix() {
                     let response = response.ok().expect("checked TLS buffered response");
                     assert_eq!(response.body().contiguous(), Some(XML));
                 },
-                recovery::Policy::new(
-                    |event| std::assert_matches!(event, Reclaimed::Shutdown),
-                    recover,
-                ),
-                |result| result.expect("client execution"),
+                assert_shutdown,
             )
             .expect("run TLS stream client topology");
         },
@@ -199,16 +195,12 @@ fn lanes_reuse_connection() {
                         })).expect("sequential chunked TLS driver");
                         assert!(result.is_ok(), "sequential chunked TLS responses");
                     },
-                    recovery::Policy::new(
-                        |event| {
-                            assert!(
-                                matches!(event, Reclaimed::Shutdown),
-                                "unexpected client retirement: {event:?}"
-                            )
-                        },
-                        recover,
-                    ),
-                    |result| result.expect("client execution"),
+                    |event| {
+                        assert!(
+                            matches!(event, Reclaimed::Shutdown),
+                            "unexpected client retirement: {event:?}"
+                        )
+                    },
                 )
                 .expect("run chunked TLS client topology");
             },
@@ -266,8 +258,7 @@ fn reuses_connection() {
                 })).expect("multi-lane TLS response driver");
                 assert!(result.is_ok(), "multi-lane TLS responses");
             },
-recovery::Policy::new(|event| assert!(matches!(event, Reclaimed::Shutdown), "unexpected client retirement: {event:?}"), recover),
-|result| result.expect("client execution"),
+|event| assert!(matches!(event, Reclaimed::Shutdown), "unexpected client retirement: {event:?}"),
 )
         .expect("run multi-lane TLS client topology");
         }).expect("raw TLS server thread");
@@ -342,8 +333,7 @@ fn keeps_pipeline_order() {
             })).expect("pipelined TLS response driver");
             assert!(result.is_ok(), "pipelined TLS responses");
         },
-recovery::Policy::new(|event| assert!(matches!(event, Reclaimed::Shutdown), "unexpected client retirement: {event:?}"), recover),
-|result| result.expect("client execution"),
+|event| assert!(matches!(event, Reclaimed::Shutdown), "unexpected client retirement: {event:?}"),
 )
     .expect("run pipelined TLS client topology");
     }).expect("raw TLS server thread");

@@ -5,7 +5,7 @@ use o3::buffer::{Complete as _, storage};
 use sark_core::route::guard::Reject as _;
 use sark_h1::{
     Input,
-    wire::{output, parsing::Head},
+    wire::output,
 };
 use sark_http::payload::response::{fixed, headers::Entry, status::Code};
 
@@ -73,10 +73,7 @@ fn parses_original_window() {
         .expect("request window");
     for input in [Input::Borrowed(wire), Input::Buffered(window)] {
         let (source, path, query) = {
-            let parsed = Head::parse(input, u8::MAX)
-                .ok()
-                .flatten()
-                .expect("complete request");
+            let parsed = common::head::parsed(input, u8::MAX);
             (
                 parsed.input().as_slice(),
                 parsed.request().path().expect("origin path"),

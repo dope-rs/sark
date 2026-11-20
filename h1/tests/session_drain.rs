@@ -23,11 +23,22 @@ fn resumes_stream_after_final_drain() {
     let mut conn: Conn<'_, runtime::Runtime<'_, ()>, Infallible> = Conn::default();
     conn.async_state.insert(runtime::Running::Body(()));
     conn.settle(head::Connection::Close);
+    conn.defer(canned::BAD_REQUEST);
     assert!(matches!(pump::Drain::progress(&mut conn), pump::Next::None));
     assert!(matches!(
         pump::Drain::complete(&mut conn),
         pump::Completion::Resume
     ));
+    assert!(conn.async_state.take().is_some());
+    assert!(matches!(
+        pump::Drain::complete(&mut conn),
+        pump::Completion::Resume
+    ));
+    assert!(matches!(
+        pump::Drain::progress(&mut conn),
+        pump::Next::Close(reason) if reason == canned::BAD_REQUEST
+    ));
+    assert!(conn.action().is_some());
 }
 
 #[test]

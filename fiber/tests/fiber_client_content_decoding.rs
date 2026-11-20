@@ -1,6 +1,5 @@
-use common::client::recover;
+use common::client::assert_shutdown;
 use common::client::runtime::peer;
-use dope::core::{driver::life::recovery, io::Reclaimed};
 use dope_test::harness::peer::{AcceptScript, Stream};
 pub mod common;
 
@@ -29,10 +28,7 @@ fn decodes_gzip_body() {
         },
         |server| {
             for flavor in FLAVORS {
-                let resp = flavor.try_get(&server.addr().to_string(), Policy::Strict, "/").expect("HTTP host allocation").try_run(|result| result.expect("HTTP response"), recovery::Policy::new(
-                    |event| std::assert_matches!(event, Reclaimed::Shutdown),
-                    recover,
-                ), |result| result.expect("client execution")).expect("request scope");
+                let resp = flavor.try_get(&server.addr().to_string(), Policy::Strict, "/").expect("HTTP host allocation").try_run(|result| result.expect("HTTP response"), assert_shutdown).expect("request scope");
                 assert_eq!(resp.status().as_u16(), 200);
                 assert_eq!(
                     str::from_utf8(resp.body().as_slice()).expect("decoder returns source UTF-8"),
@@ -91,10 +87,7 @@ fn decodes_fragmented_gzip() {
                     &[],
                     &[],
                 )
-                .try_run(|result| result.expect("HTTP response"), recovery::Policy::new(
-                    |event| std::assert_matches!(event, Reclaimed::Shutdown),
-                    recover,
-                ), |result| result.expect("client execution"))
+                .try_run(|result| result.expect("HTTP response"), assert_shutdown)
                 .expect("HTTP request execution");
                 assert_eq!(response.body().as_slice(), payload);
                 assert!(response.headers().get("content-encoding").is_none());
@@ -113,10 +106,7 @@ fn decodes_fragmented_gzip() {
                         Error::Decompression(inflate::DecodeError::Stream(cause))
                             if cause.error() == (inflate::Error::Checksum { expected: crc ^ 1, actual: crc })
                     ));
-                }, recovery::Policy::new(
-                    |event| std::assert_matches!(event, Reclaimed::Shutdown),
-                    recover,
-                ), |result| result.expect("client execution"))
+                }, assert_shutdown)
                 .expect("corrupt fragmented-gzip execution");
             }
             server
@@ -165,10 +155,7 @@ fn strict_rejects_bad_gzip() {
                                 ..
                             })
                     ));
-                }, recovery::Policy::new(
-                    |event| std::assert_matches!(event, Reclaimed::Shutdown),
-                    recover,
-                ), |result| result.expect("client execution"))
+                }, assert_shutdown)
                 .expect("HTTP request execution");
             }
             server
@@ -213,10 +200,7 @@ fn rejects_false_zero_size() {
                         Error::Decompression(inflate::DecodeError::Stream(cause))
                             if matches!(cause.error(), inflate::Error::Length { expected: 0, actual: 1 })
                     ));
-                }, recovery::Policy::new(
-                    |event| std::assert_matches!(event, Reclaimed::Shutdown),
-                    recover,
-                ), |result| result.expect("client execution"))
+                }, assert_shutdown)
                 .expect("zero-size gzip execution");
             }
             server
@@ -266,10 +250,7 @@ fn rejects_decode_bomb() {
                         Error::Decompression(inflate::DecodeError::SizeLimit { actual, limit })
                             if *actual == 1024 * 1024 && *limit == 4096
                     ));
-                }, recovery::Policy::new(
-                    |event| std::assert_matches!(event, Reclaimed::Shutdown),
-                    recover,
-                ), |result| result.expect("client execution"))
+                }, assert_shutdown)
                 .expect("HTTP request execution");
             }
             server
@@ -324,10 +305,7 @@ fn honors_decode_memory() {
                             && cause.into_parts().0.get() == *requested
                             && cause.into_parts().1 == *available
                     ));
-                }, recovery::Policy::new(
-                    |event| std::assert_matches!(event, Reclaimed::Shutdown),
-                    recover,
-                ), |result| result.expect("client execution"))
+                }, assert_shutdown)
                 .expect("HTTP request execution");
 
                 let lenient = Config::new(server.addr().to_string())
@@ -343,10 +321,7 @@ fn honors_decode_memory() {
                     &[],
                     &[],
                 )
-                .try_run(|result| result.expect("HTTP response"), recovery::Policy::new(
-                    |event| std::assert_matches!(event, Reclaimed::Shutdown),
-                    recover,
-                ), |result| result.expect("client execution"))
+                .try_run(|result| result.expect("HTTP response"), assert_shutdown)
                 .expect("HTTP request execution");
                 assert_eq!(response.body().as_slice(), encoded);
                 assert_eq!(
@@ -380,10 +355,7 @@ fn lenient_keeps_bad_gzip() {
         },
         |server| {
             for flavor in FLAVORS {
-                let resp = flavor.try_get(&server.addr().to_string(), Policy::Lenient, "/").expect("HTTP host allocation").try_run(|result| result.expect("HTTP response"), recovery::Policy::new(
-                    |event| std::assert_matches!(event, Reclaimed::Shutdown),
-                    recover,
-                ), |result| result.expect("client execution")).expect("request scope");
+                let resp = flavor.try_get(&server.addr().to_string(), Policy::Lenient, "/").expect("HTTP host allocation").try_run(|result| result.expect("HTTP response"), assert_shutdown).expect("request scope");
                 assert_eq!(resp.status().as_u16(), 200);
                 assert_eq!(resp.body().as_slice(), raw);
             }

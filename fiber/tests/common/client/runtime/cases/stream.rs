@@ -1,7 +1,8 @@
 use std::{convert::Infallible, net::SocketAddr, num::NonZero, time::Duration};
 
 use dope::{
-    core::driver::life::recovery, manifold::client::attempt::queue::mailbox,
+    core::io::Reclaimed,
+    manifold::client::attempt::queue::mailbox,
     runtime::executor::drive,
 };
 use dope_fiber::{BlockOn as _, task::time::sleep};
@@ -11,7 +12,6 @@ use sark_fiber::client::config::Config;
 use sark_http::method::Method;
 
 use crate::common::client::runtime::{
-    self,
     cases::{
         Flavor,
         request::{Error, Step},
@@ -70,8 +70,7 @@ impl<'a> Stream<'a> {
     pub fn try_run<R, C>(
         self,
         check: C,
-        policy: impl recovery::Observe,
-        done: impl for<'run> FnOnce(Result<Result<R, Step>, runtime::Error<'run>>) -> Result<R, Step>,
+        report: impl FnMut(Reclaimed),
     ) -> Result<R, Error>
     where
         C: for<'d> FnOnce(Result<u16, Exchange<'d>>) -> R,
@@ -116,7 +115,7 @@ impl<'a> Stream<'a> {
                         }
                     })();
                     Ok::<R, Step>(check(outcome))
-                }, policy, done).map_err(Error::Fixed)?.map_err(Error::Step)?,
+                }, report).map_err(Error::Fixed)?.map_err(Error::Step)?,
             Flavor::OnDemand => origins::Plan::new(config, capacity.get(), 2, 1).map_err(Error::DynamicPlan)?
                 .enter((), move |mut app| -> Result<_, Step> {
                     let client = app.handle;
@@ -148,7 +147,7 @@ impl<'a> Stream<'a> {
                         }
                     })();
                     Ok::<R, Step>(check(outcome))
-                }, policy, done).map_err(Error::Dynamic)?.map_err(Error::Step)?,
+                }, report).map_err(Error::Dynamic)?.map_err(Error::Step)?,
         };
         Ok(output)
     }

@@ -19,7 +19,6 @@ pub(super) struct Route {
     path: syn::LitStr,
     pub(super) target: Target,
     params: Vec<Param>,
-    pub(super) literal_count: usize,
 }
 
 struct Param {
@@ -48,35 +47,26 @@ impl Target {
     }
 
     fn relation(&self, other: &Self) -> Relation {
-        let Some(left) = self.path() else {
-            return match other.path().is_none() {
-                true => Relation::Same,
-                false => Relation::Disjoint,
-            };
+        use route::Seg::{Literal, Param};
+        let (left, right) = match (self, other) {
+            (Self::Asterisk, Self::Asterisk) => return Relation::Same,
+            (Self::Path(left), Self::Path(right)) if left.len() == right.len() => (left, right),
+            _ => return Relation::Disjoint,
         };
-        let Some(right) = other.path() else {
-            return Relation::Disjoint;
-        };
-        if left.len() != right.len()
-            || !left
-                .iter()
-                .zip(right)
-                .all(|(left, right)| left.is_overlap(right))
-        {
-            return Relation::Disjoint;
+        let mut left_specific = false;
+        let mut right_specific = false;
+        for segments in left.iter().zip(right) {
+            match segments {
+                (Literal(a), Literal(b)) if a != b => return Relation::Disjoint,
+                (Literal(_), Param) => left_specific = true,
+                (Param, Literal(_)) => right_specific = true,
+                _ => {}
+            }
         }
-        let a_in_b = left
-            .iter()
-            .zip(right)
-            .all(|(left, right)| left.is_within(right));
-        let b_in_a = right
-            .iter()
-            .zip(left)
-            .all(|(right, left)| right.is_within(left));
-        match (a_in_b, b_in_a) {
-            (true, true) => Relation::Same,
-            (true, false) | (false, true) => Relation::Ordered,
-            (false, false) => Relation::Ambiguous,
+        match (left_specific, right_specific) {
+            (false, false) => Relation::Same,
+            (true, true) => Relation::Ambiguous,
+            _ => Relation::Ordered,
         }
     }
 }
@@ -118,13 +108,6 @@ impl Plan {
                         .collect();
                     (Target::Path(segments), params)
                 };
-                let literals = match target.path() {
-                    Some(segments) => segments
-                        .iter()
-                        .filter(|segment| segment.is_literal())
-                        .count(),
-                    None => 1,
-                };
                 Ok(Route {
                     method: entry.method,
                     protocol: entry
@@ -134,7 +117,6 @@ impl Plan {
                     path: entry.path.clone(),
                     target,
                     params,
-                    literal_count: literals,
                 })
             })
             .collect::<syn::Result<Vec<_>>>()?;

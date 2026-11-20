@@ -13,7 +13,7 @@ use sink::{Mode, Sink, written::Written};
 
 use crate::{
     route,
-    wire::{Failure, InputError, cache, head, output, output::sink, response},
+    wire::{Failure, InputError, head, output, output::sink, response},
 };
 
 /// Writes response decisions into the caller-provided egress region.
@@ -43,27 +43,10 @@ impl<'a> Egress<'a> {
         self
     }
 
-    pub fn cached<'d>(
-        &mut self,
-        cache: &mut cache::Cache<'_>,
-        policy: route::Cache,
-    ) -> Option<output::Outcome<'d>> {
-        match policy {
-            route::Cache::Bypass => None,
-            route::Cache::Store => {
-                match cache.try_write(self.write.reborrow(), self.date, self.response) {
-                    Ok(cached) => cached.map(Self::from_cache),
-                    Err(error) => Some(output::Outcome::Failed(Failure::Output(error.into()))),
-                }
-            }
-        }
-    }
-
     pub fn route<'req, 'd, R, O: stage::Body<'req, 'd>>(
         self,
         reply: R,
         slot: handoff::Slot<'req, 'd, (), O>,
-        cache: cache::Cache<'_>,
         gzip: &mut impl Compression,
         coding: Coding,
         policy: route::Policy,
@@ -72,12 +55,9 @@ impl<'a> Egress<'a> {
         'd: 'req,
         R: dispatch::Emit<'req, 'd, Kind = dispatch::Sync>,
     {
-        let mode = match policy.cache {
-            route::Cache::Store => Mode::Cache(cache),
-            route::Cache::Bypass => match coding {
-                Coding::Plain => Mode::Plain,
-                Coding::Gzip => Mode::Compress(gzip),
-            },
+        let mode = match coding {
+            Coding::Plain => Mode::Plain,
+            Coding::Gzip => Mode::Compress(gzip),
         };
         let sink = Sink::new(self.write, self.date, self.response, mode, slot).with_policy(policy);
         Self::outcome(reply.emit(sink), head::Connection::KeepAlive)
@@ -246,23 +226,6 @@ impl<'a> Egress<'a> {
                     connection: conn,
                 },
                 Err(error) => output::Outcome::Failed(Failure::Input(InputError::Share(error))),
-            },
-        }
-    }
-
-    fn from_cache<'d>(cached: cache::Cached) -> output::Outcome<'d> {
-        match cached {
-            cache::Cached::Fixed { body } => output::Outcome::SendCopied {
-                copy: evidence::Copy {
-                    read: body,
-                    written: body,
-                    cause: evidence::Cause::Cached,
-                },
-                connection: head::Connection::KeepAlive,
-            },
-            cache::Cached::Shared { body } => output::Outcome::SendShared {
-                body,
-                connection: head::Connection::KeepAlive,
             },
         }
     }

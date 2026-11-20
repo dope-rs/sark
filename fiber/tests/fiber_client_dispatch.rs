@@ -2,13 +2,12 @@ pub mod common;
 
 use std::time::Duration;
 
-use common::client::recover;
+use common::client::assert_shutdown;
 use common::client::{
     config::FLAVORS,
     retry::AGGRESSIVE,
     runtime::{cases::request::Request, peer},
 };
-use dope::core::{driver::life::recovery, io::Reclaimed};
 use dope_fiber::task::time::budget;
 use dope_test::harness::peer::TcpAcceptor;
 use sark_client::{Error, Safety, timeout};
@@ -35,11 +34,7 @@ fn dispatch_before_submit() {
                     assert_eq!(failure.attempt(), 1);
                     assert_eq!(failure.safety(), Safety::BeforeSubmit);
                 },
-                recovery::Policy::new(
-                    |event| std::assert_matches!(event, Reclaimed::Shutdown),
-                    recover,
-                ),
-                |result| result.expect("client execution"),
+                assert_shutdown,
             )
             .expect("dispatch request execution");
         peer::empty(&mut acceptor).expect("no request bytes published");

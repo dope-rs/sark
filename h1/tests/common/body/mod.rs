@@ -31,6 +31,25 @@ pub struct Counted<'a> {
     pub encodes: &'a Cell<usize>,
 }
 
+impl<'a> Counted<'a> {
+    pub fn exact<'h>(
+        template: &'h Template<'h>,
+        bytes: &'a [u8],
+        encodes: &'a Cell<usize>,
+    ) -> exact::Direct<headers::head::Head<'h, 0>, Self> {
+        exact::Direct::new(
+            Code::OK,
+            headers::head::Head::new(template, headers::set::Set::new()),
+            Self { bytes, encodes },
+        )
+    }
+
+    pub fn bounded(bytes: &'a [u8], encodes: &'a Cell<usize>) -> bounded::Output<'static, Self, 0> {
+        let body = Self { bytes, encodes };
+        bounded::Output::new(Code::OK, &TEMPLATE, headers::set::Set::new(), body)
+    }
+}
+
 impl exact::Body for Counted<'_> {
     fn encoded_len(&self) -> usize {
         self.bytes.len()

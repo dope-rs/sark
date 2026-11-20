@@ -78,31 +78,6 @@ impl Seg {
         }
         Ok(())
     }
-
-    pub(super) fn literal(&self) -> Option<&[u8]> {
-        match self {
-            Self::Literal(bytes) => Some(bytes),
-            Self::Param => None,
-        }
-    }
-
-    pub(super) fn is_literal(&self) -> bool {
-        self.literal().is_some()
-    }
-
-    pub(super) fn is_overlap(&self, other: &Self) -> bool {
-        match (self.literal(), other.literal()) {
-            (Some(left), Some(right)) => left == right,
-            (left, right) => left.is_none() || right.is_none(),
-        }
-    }
-
-    pub(super) fn is_within(&self, other: &Self) -> bool {
-        match other.literal() {
-            Some(right) => self.literal() == Some(right),
-            None => true,
-        }
-    }
 }
 
 impl Method {
@@ -117,29 +92,20 @@ impl Method {
         Self::Connect,
     ];
 
-    pub(super) fn parse(value: &syn::Ident) -> syn::Result<Self> {
-        if value == "GET" || value == "WS" {
-            Ok(Self::Get)
-        } else if value == "POST" {
-            Ok(Self::Post)
-        } else if value == "PUT" {
-            Ok(Self::Put)
-        } else if value == "PATCH" {
-            Ok(Self::Patch)
-        } else if value == "DELETE" {
-            Ok(Self::Delete)
-        } else if value == "HEAD" {
-            Ok(Self::Head)
-        } else if value == "OPTIONS" {
-            Ok(Self::Options)
-        } else if value == "CONNECT" {
-            Ok(Self::Connect)
-        } else {
-            Err(syn::Error::new_spanned(
-                value,
-                "unsupported method; use one of GET/POST/PUT/PATCH/DELETE/HEAD/OPTIONS/CONNECT/WS",
-            ))
+    pub(super) fn parse(value: &syn::Ident) -> syn::Result<(Self, bool)> {
+        let name = value.to_string();
+        if name == "WS" {
+            return Ok((Self::Get, true));
         }
+        for method in Self::ALL {
+            if name == method.spellings().0 {
+                return Ok((method, false));
+            }
+        }
+        Err(syn::Error::new_spanned(
+            value,
+            "unsupported method; use one of GET/POST/PUT/PATCH/DELETE/HEAD/OPTIONS/CONNECT/WS",
+        ))
     }
 
     pub(super) const fn ord(self) -> u8 {
@@ -153,44 +119,31 @@ impl Method {
 
     pub(super) fn key_token(self, paths: &Paths) -> proc_macro2::TokenStream {
         let ns_http = &paths.http;
-        let path = quote::format_ident!("{}", self.known_name());
+        let path = syn::Ident::new(self.spellings().1, proc_macro2::Span::call_site());
         quote::quote!(#ns_http::method::Known::#path)
     }
 
     pub(super) fn bytes_token(self) -> proc_macro2::TokenStream {
-        let bytes = proc_macro2::Literal::byte_string(self.name().as_bytes());
+        let bytes = proc_macro2::Literal::byte_string(self.spellings().0.as_bytes());
         quote::quote!(#bytes)
     }
 
     pub(super) fn http_token(self, paths: &Paths) -> proc_macro2::TokenStream {
         let ns_http = &paths.http;
-        let path = quote::format_ident!("{}", self.name());
+        let path = syn::Ident::new(self.spellings().0, proc_macro2::Span::call_site());
         quote::quote!(#ns_http::method::Method::#path)
     }
 
-    fn name(&self) -> &str {
+    fn spellings(self) -> (&'static str, &'static str) {
         match self {
-            Self::Get => "GET",
-            Self::Post => "POST",
-            Self::Put => "PUT",
-            Self::Patch => "PATCH",
-            Self::Delete => "DELETE",
-            Self::Head => "HEAD",
-            Self::Options => "OPTIONS",
-            Self::Connect => "CONNECT",
-        }
-    }
-
-    fn known_name(&self) -> &str {
-        match self {
-            Self::Get => "Get",
-            Self::Post => "Post",
-            Self::Put => "Put",
-            Self::Patch => "Patch",
-            Self::Delete => "Delete",
-            Self::Head => "Head",
-            Self::Options => "Options",
-            Self::Connect => "Connect",
+            Self::Get => ("GET", "Get"),
+            Self::Post => ("POST", "Post"),
+            Self::Put => ("PUT", "Put"),
+            Self::Patch => ("PATCH", "Patch"),
+            Self::Delete => ("DELETE", "Delete"),
+            Self::Head => ("HEAD", "Head"),
+            Self::Options => ("OPTIONS", "Options"),
+            Self::Connect => ("CONNECT", "Connect"),
         }
     }
 }

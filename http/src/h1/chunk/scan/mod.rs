@@ -11,7 +11,7 @@ pub(in crate::h1) enum Decoded<'input> {
         bytes: &'input [u8],
         boundary: Boundary,
     },
-    Trailer(trailer::Partial<'input>),
+    Trailer(trailer::Pending<'input>),
     Complete {
         consumed: NonZero<usize>,
         bytes: &'input [u8],
@@ -52,9 +52,7 @@ pub(in crate::h1) trait Mode {
 
     fn trailer<'input>(
         input: &'input [u8],
-        consumed: NonZero<usize>,
-        bytes: &'input [u8],
-        next: trailer::Trailer,
+        pending: trailer::Pending<'input>,
     ) -> Self::Output<'input>;
 
     fn complete<'input>(
@@ -80,13 +78,8 @@ impl Mode for Whole {
         Run::pending(input, consumed)
     }
 
-    fn trailer<'input>(
-        input: &'input [u8],
-        consumed: NonZero<usize>,
-        _: &'input [u8],
-        _: trailer::Trailer,
-    ) -> Run<'input> {
-        Run::pending(input, consumed.get())
+    fn trailer<'input>(input: &'input [u8], pending: trailer::Pending<'input>) -> Run<'input> {
+        Run::pending(input, pending.consumed().get())
     }
 
     fn complete<'input>(
@@ -121,13 +114,8 @@ impl Mode for Fragments {
         Decoded::More(consumed)
     }
 
-    fn trailer<'input>(
-        _: &'input [u8],
-        consumed: NonZero<usize>,
-        bytes: &'input [u8],
-        next: trailer::Trailer,
-    ) -> Decoded<'input> {
-        Decoded::Trailer(trailer::Partial::new(bytes, consumed, next))
+    fn trailer<'input>(_: &'input [u8], pending: trailer::Pending<'input>) -> Decoded<'input> {
+        Decoded::Trailer(pending)
     }
 
     fn complete<'input>(

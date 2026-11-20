@@ -33,14 +33,6 @@ pub enum Error<E> {
     ForbiddenContent { actual: usize },
 }
 
-pub enum Progress<'field> {
-    More,
-    Complete(Collected<'field>),
-}
-
-const _: () =
-    assert!(core::mem::size_of::<Progress<'_>>() == core::mem::size_of::<Option<Collected<'_>>>());
-
 pub struct Decoder {
     request: Method,
 }
@@ -99,22 +91,21 @@ impl Decoder {
         Ok(Some((head, body)))
     }
 
-    pub fn decode<'field>(&self, buf: &[u8]) -> Result<Progress<'field>, Error<fields::Error>> {
-        let (head, body) = match self.collect_body(buf)? {
-            Some(parts) => parts,
-            None => return Ok(Progress::More),
+    pub fn decode<'field>(&self, buf: &[u8]) -> Parsed<Collected<'field>, fields::Error> {
+        let Some((head, body)) = self.collect_body(buf)? else {
+            return Ok(None);
         };
 
         match head.payload {
             framing::ResponseBody::None | framing::ResponseBody::Empty(framing::Empty::Fixed) => {
-                Ok(Progress::Complete(head.complete(Vec::new(), List::new())))
+                Ok(Some(head.complete(Vec::new(), List::new())))
             }
             framing::ResponseBody::Chunked
             | framing::ResponseBody::Empty(framing::Empty::Chunked) => {
                 let Some(result) = chunks::Output::drain(body, chunks::Decoder::DEFAULT_MAX_BODY)
                     .map_err(Error::Chunk)?
                 else {
-                    return Ok(Progress::More);
+                    return Ok(None);
                 };
                 if matches!(head.payload, framing::ResponseBody::Empty(_))
                     && !result.body.is_empty()
@@ -123,17 +114,15 @@ impl Decoder {
                         actual: result.body.len(),
                     });
                 }
-                Ok(Progress::Complete(
-                    head.complete(result.body, result.trailers),
-                ))
+                Ok(Some(head.complete(result.body, result.trailers)))
             }
-            framing::ResponseBody::Fixed(len) if body.len() < len => Ok(Progress::More),
+            framing::ResponseBody::Fixed(len) if body.len() < len => Ok(None),
             framing::ResponseBody::Fixed(len) => head
                 .try_copy(&body[..len])
-                .map(Progress::Complete)
+                .map(Some)
                 .map_err(Error::Allocation),
             framing::ResponseBody::UntilEof
-            | framing::ResponseBody::Empty(framing::Empty::UntilEof) => Ok(Progress::More),
+            | framing::ResponseBody::Empty(framing::Empty::UntilEof) => Ok(None),
         }
     }
 

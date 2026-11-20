@@ -39,19 +39,12 @@ fn request_splits() {
                 (state.try_extend(&wire[split..]))
                     .as_ref()
                     .expect("test operation must succeed");
-                match state
-                    .advance(&mut emit)
-                    .expect("second fragment at {split}")
-                {
-                    scan::Progress::Complete(parts) => parts,
-                    outcome => {
-                        assert!(
-                            matches!(outcome, scan::Progress::Complete(_)),
-                            "second fragment at {split}"
-                        );
-                        return;
-                    }
-                }
+                let scan::Progress::Complete(parts) =
+                    state.advance(&mut emit).expect("valid second fragment")
+                else {
+                    panic!("second fragment at {split}");
+                };
+                parts
             }
         };
         assert_eq!(parts.wire_len().get() as usize, head_len, "split {split}");
@@ -165,27 +158,20 @@ fn request_grammar() {
                 part.push((field.name_span(), field.value_span()));
                 Ok::<_, ()>(())
             };
-            let first = state.advance(&mut emit);
-            let split_ok = match first {
-                Ok(scan::Progress::Complete(head)) => head.wire_len().get() as usize == wire.len(),
+            let (result, submitted) = match state.advance(&mut emit) {
                 Ok(scan::Progress::More(mut state)) => {
-                    (state.try_extend(&wire[split..]))
-                        .as_ref()
-                        .expect("test operation must succeed");
-                    match state.advance(&mut emit) {
-                        Ok(scan::Progress::Complete(head)) => {
-                            head.wire_len().get() as usize == wire.len()
-                        }
-                        Ok(scan::Progress::More(_)) => false,
-                        Err((source, error)) => {
-                            assert_eq!(source, wire);
-                            assert!(!matches!(error, ParseError::Sink(())));
-                            false
-                        }
-                    }
+                    state
+                        .try_extend(&wire[split..])
+                        .expect("append remaining head");
+                    (state.advance(&mut emit), wire)
                 }
+                first => (first, &wire[..split]),
+            };
+            let split_ok = match result {
+                Ok(scan::Progress::Complete(head)) => head.wire_len().get() as usize == wire.len(),
+                Ok(scan::Progress::More(_)) => false,
                 Err((source, error)) => {
-                    assert_eq!(source, &wire[..split]);
+                    assert_eq!(source, submitted);
                     assert!(!matches!(error, ParseError::Sink(())));
                     false
                 }
@@ -242,11 +228,7 @@ fn response_sink_stops() {
 fn start_line_limit() {
     let wire = b"GET /\r";
     let limit = Limit::DEFAULT.with_bytes(5);
-    let mut fields = 0;
-    let complete = request::Parts::parse(wire, limit, |_| -> Result<(), ()> {
-        fields += 1;
-        Ok(())
-    });
+    let complete = request::Parts::parse(wire, limit, |_| Err(()));
     assert!(matches!(
         complete,
         Err(ParseError::Boundary(Boundary::TooLarge {
@@ -255,30 +237,13 @@ fn start_line_limit() {
         }))
     ));
     let state = scan::State::new(wire[..5].to_vec(), limit);
-    let mut state = match state
-        .advance(|_| -> Result<(), ()> {
-            fields += 1;
-            Ok(())
-        })
-        .expect("the prefix is incomplete")
-    {
-        scan::Progress::More(state) => state,
-        outcome => {
-            assert!(
-                matches!(outcome, scan::Progress::More(_)),
-                "the prefix is incomplete"
-            );
-            return;
-        }
+    let scan::Progress::More(mut state) = state.advance(|_| Err(())).expect("prefix has no fields")
+    else {
+        panic!("the prefix is incomplete");
     };
-    (state.try_extend(&wire[5..]))
-        .as_ref()
-        .expect("test operation must succeed");
-    assert!(matches!(state.advance(|_| -> Result<(), ()> {
-            fields += 1;
-            Ok(())
-        }).err(), Some((source, ParseError::Boundary(Boundary::TooLarge { actual: 7, limit: 5 }))) if source == wire));
-    assert_eq!(fields, 0);
+    state.try_extend(&wire[5..]).expect("append remaining line");
+    assert!(matches!(state.advance(|_| Err(())),
+        Err((source, ParseError::Boundary(Boundary::TooLarge { actual: 7, limit: 5 }))) if source == wire));
 }
 
 #[test]
@@ -287,27 +252,14 @@ fn resumed_line_bounds_head() {
     let limit = Limit::DEFAULT.with_bytes(27);
     let state = scan::State::new(wire[..15].to_vec(), limit);
     let mut fields = 0;
-    let mut state = match state
-        .advance(|_| -> Result<(), ()> {
-            fields += 1;
-            Ok(())
-        })
-        .expect("the prefix is incomplete")
-    {
-        scan::Progress::More(state) => state,
-        outcome => {
-            assert!(
-                matches!(outcome, scan::Progress::More(_)),
-                "the prefix is incomplete"
-            );
-            return;
-        }
+    let scan::Progress::More(mut state) = state.advance(|_| Err(())).expect("prefix has no fields")
+    else {
+        panic!("the prefix is incomplete");
     };
-    assert_eq!(fields, 0);
-    (state.try_extend(&wire[15..]))
-        .as_ref()
-        .expect("test operation must succeed");
-    let parts = match state
+    state
+        .try_extend(&wire[15..])
+        .expect("append remaining head");
+    let scan::Progress::Complete(parts) = state
         .advance(|field| {
             assert_eq!(
                 (field.name(), field.value()),
@@ -316,16 +268,9 @@ fn resumed_line_bounds_head() {
             fields += 1;
             Ok::<(), ()>(())
         })
-        .expect("the complete head ends inside the limit")
-    {
-        scan::Progress::Complete(parts) => parts,
-        outcome => {
-            assert!(
-                matches!(outcome, scan::Progress::Complete(_)),
-                "the complete head ends inside the limit"
-            );
-            return;
-        }
+        .expect("head inside the limit")
+    else {
+        panic!("the complete head ends inside the limit");
     };
     assert_eq!(parts.wire_len().get(), 27);
     assert_eq!(parts.as_ref().line(), (b"GET".as_slice(), b"/".as_slice()));
@@ -337,53 +282,33 @@ fn copy_preserves_progress() {
     let prefix = b"GET / HTTP/1.1\r\nHost: example.test\r\n";
     let state = scan::State::new(prefix.as_slice(), Limit::DEFAULT);
     let mut fields = 0;
-    let state = match state
+    let scan::Progress::More(state) = state
         .advance(|_| {
             fields += 1;
             Ok::<_, ()>(())
         })
         .expect("valid prefix")
-    {
-        scan::Progress::More(state) => state,
-        outcome => {
-            assert!(
-                matches!(outcome, scan::Progress::More(_)),
-                "unfinished head retains its state"
-            );
-            return;
-        }
+    else {
+        panic!("unfinished head retains its state");
     };
     assert_eq!(fields, 1);
     let target = Vec::with_capacity(128);
     let (result, activity) = Tracker::measure(|| state.try_copy(target));
     assert_eq!(activity, [0; 4]);
-    let mut state = match result {
-        Ok(state) => state,
-        outcome => {
-            assert!(outcome.is_ok(), "empty target accepts the exact prefix");
-            return;
-        }
-    };
+    let mut state = result.expect("empty target accepts the exact prefix");
     assert_eq!(state.as_ref(), prefix);
     state
         .try_extend(b"Connection: close\r\n\r\n")
         .expect("append remaining head");
-    let parts = match state
+    let scan::Progress::Complete(parts) = state
         .advance(|field| {
             assert_eq!(field.name(), b"Connection");
             fields += 1;
             Ok::<_, ()>(())
         })
         .expect("complete copied head")
-    {
-        scan::Progress::Complete(parts) => parts,
-        outcome => {
-            assert!(
-                matches!(outcome, scan::Progress::Complete(_)),
-                "copied head completes"
-            );
-            return;
-        }
+    else {
+        panic!("copied head completes");
     };
     assert_eq!(parts.as_ref().line(), (b"GET".as_slice(), b"/".as_slice()));
     let end = parts.wire_len();
@@ -408,16 +333,9 @@ fn copy_rejects_prefix() {
     assert_eq!(state.as_ref(), source);
     assert_eq!(target, b"x");
     assert!(matches!(cause, CopyError::Prefix(len) if len.get() == 1));
-    let mut state = match state.try_copy(Vec::with_capacity(128)) {
-        Ok(state) => state,
-        outcome => {
-            assert!(
-                outcome.is_ok(),
-                "retained parser can retry with an empty owner"
-            );
-            return;
-        }
-    };
+    let mut state = state
+        .try_copy(Vec::with_capacity(128))
+        .expect("retained parser can retry with an empty owner");
     state
         .try_extend(b"\r\n")
         .expect("complete the original head");
@@ -436,15 +354,8 @@ fn copy_rejects_capacity() {
     let (result, activity) = Tracker::measure(|| state.try_copy(target));
     assert_eq!(activity, [0; 4]);
     let (target, cause) = result.err().expect("the prefix exceeds the destination");
-    let cause = match cause {
-        CopyError::Write(cause) => cause,
-        outcome => {
-            assert!(
-                matches!(outcome, CopyError::Write(_)),
-                "the empty destination fails only its write admission"
-            );
-            return;
-        }
+    let CopyError::Write(cause) = cause else {
+        panic!("the empty destination fails only its write admission");
     };
     let (required, room) = cause.into_parts();
     assert_eq!(required.get(), prefix.len());

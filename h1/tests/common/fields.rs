@@ -11,10 +11,6 @@ use sark_http::{
 pub const DATE: &[u8; 29] = b"Mon, 01 Jan 2026 00:00:00 GMT";
 pub const RESPONSE: Context = Context::new(Method::Other, Version::Eleven);
 pub const ENCODED_BODY: [u8; 256] = [b'x'; 256];
-pub const DRIFT_VALUES: &[(&[u8], &[u8])] = &[
-    (b"short", b"substantially-longer"),
-    (b"substantially-longer", b"short"),
-];
 
 pub const ENTRIES: [headers::Entry<'static>; 2] = [
     headers::Entry::new(
@@ -74,7 +70,7 @@ pub fn try_encode<'d>(
     source: impl headers::Source,
     input: &'d [u8],
 ) -> Result<output::Outcome<'d>, alloc::Error> {
-    use sark_h1::{route, wire::cache};
+    use sark_h1::route;
     use sark_http::{
         h1::head::{
             request::Coding,
@@ -98,15 +94,9 @@ pub fn try_encode<'d>(
     .route(
         response,
         handoff::Slot::ready(None),
-        cache::Cache::empty(),
         &mut gzip,
         Coding::Gzip,
-        route::Policy::new(
-            route::Cache::Bypass,
-            Coding::Gzip,
-            Date::Include,
-            Server::Include,
-        ),
+        route::Policy::new(Coding::Gzip, Date::Include, Server::Include),
     ))
 }
 

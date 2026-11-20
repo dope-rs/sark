@@ -125,7 +125,7 @@ pub(super) fn build<'view, 'source>(
         quote! {
             let mut #v_this = #v_routes.as_mut().project();
             let #v_exch = #v_ready.exchange;
-            let #v_result = match #v_ready.route { #( #resume, )* };
+            let #v_result = match #v_ready.route { #resume };
             #v_routes.__finish_body(#v_exch, #v_result, #v_run)
         }
     };
@@ -331,13 +331,13 @@ pub(super) fn build<'view, 'source>(
                 let mut #v_this = self.get_mut().app.as_mut().project();
                 let #v_exch = #v_wait.exchange;
                 let #v_route = match #v_wait.route {
-                    #( #data, )*
+                    #data
                 };
                 #settle_pending
             }
 
             fn has_body_work(#v_wait: &#wait) -> ::core::primitive::bool {
-                match #v_wait.route { #( #work, )* }
+                match #v_wait.route { #work }
             }
 
             fn resume_pending(
@@ -347,7 +347,7 @@ pub(super) fn build<'view, 'source>(
             ) -> ::core::result::Result<#wait, #ns_http::payload::fixed::Body<'d>> {
                 let mut #v_this = self.get_mut().app.as_mut().project();
                 let #v_exch = #v_wait.exchange;
-                let #v_route = match #v_wait.route { #( #pending, )* };
+                let #v_route = match #v_wait.route { #pending };
                 #settle_pending
             }
 
@@ -370,7 +370,7 @@ pub(super) fn build<'view, 'source>(
                     #ns_core::life::Event::InputFinished(#v_exch),
                 );
                 let #v_result = match #v_wait.route {
-                    #( #finish, )*
+                    #finish
                 };
                 #finish_body
             }

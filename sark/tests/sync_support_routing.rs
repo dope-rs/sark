@@ -143,57 +143,37 @@ fn static_uses_zero_flights() {
 }
 
 #[test]
-fn head_tail_is_bounded() {
-    with_domain(|domain, proof| {
-        let state = State::new(storage::Shared::new());
-        let router = Router::new(&state);
-        let mut client = client();
-        let wire = Client::new(&mut client)
-            .try_get(b"/items/42")
-            .expect("sync fixture");
-        let endpoint = try_build(router, LIMITS).expect("sync fixture");
-        let mut server = connection(&endpoint, domain, proof, LIMITS.max_connection_body_bytes);
+fn keeps_parameters_across_literal_branches() {
+    for (path, expected) in [
+        (b"/items/42".as_slice(), b"42".as_slice()),
+        (b"/items/first", b"first"),
+        (b"/items/last", b"last"),
+        (b"/items/fixed", b"static-only"),
+        (b"/items/fixed/view?x=1", b"fixed"),
+        (b"/items/last/detail", b"static-only"),
+        (b"/users/beta/teams/alpha", b"beta"),
+    ] {
+        with_domain(|domain, proof| {
+            let state = State::new(storage::Shared::new());
+            let endpoint = try_build(Router::new(&state), LIMITS).expect("sync fixture");
+            let wire = Client::new(&mut client()).try_get(path).expect("GET");
+            let mut server = connection(&endpoint, domain, proof, LIMITS.max_connection_body_bytes);
+            server
+                .ingress()
+                .ingest_owned(Shared::from(wire))
+                .expect("ingress credit");
+            server.drain_events();
 
-        server
-            .ingress()
-            .ingest_owned(Shared::from(wire))
-            .expect("the item request fits configured ingress credit");
-        server.drain_events();
-
-        assert_ne!(state.request_head.get(), 0);
-        let drained = Drained::try_for(&mut server).expect("H2 response capture");
-        assert!(drained.retained.is_empty());
-        assert_eq!(drained.try_all().expect("H2 response observation"), b"42");
-    });
-}
-
-#[test]
-fn named_path_round_trips() {
-    with_domain(|domain, proof| {
-        let state = State::new(storage::Shared::new());
-        let router = Router::new(&state);
-        let mut client = client();
-        let wire = Client::new(&mut client)
-            .try_get(b"/users/beta/teams/alpha")
-            .expect("sync fixture");
-        let endpoint = try_build(router, LIMITS).expect("sync fixture");
-        let mut server = connection(&endpoint, domain, proof, LIMITS.max_connection_body_bytes);
-
-        server
-            .ingress()
-            .ingest_owned(Shared::from(wire))
-            .expect("the named path request fits configured ingress credit");
-        server.drain_events();
-
-        assert_ne!(state.request_head.get(), 0);
-        let drained = Drained::try_for(&mut server).expect("H2 response capture");
-        assert!(drained.retained.is_empty());
-        assert_eq!(drained.try_all().expect("H2 response observation"), b"beta");
-        assert!(
-            !state.invalid_path.get(),
-            "named captures must bind by name"
-        );
-    });
+            assert_eq!(state.request_head.get() != 0, expected != b"static-only");
+            let drained = Drained::try_for(&mut server).expect("H2 response capture");
+            assert!(drained.retained.is_empty());
+            assert_eq!(drained.try_all().expect("H2 response"), expected);
+            assert!(
+                !state.invalid_path.get(),
+                "named captures must bind by name"
+            );
+        });
+    }
 }
 
 #[test]

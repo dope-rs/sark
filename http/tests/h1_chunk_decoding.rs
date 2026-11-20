@@ -396,6 +396,14 @@ fn segments() {
             if consumed.get() == 13
     ));
     assert!(matches!(
+        decoder.decode(b"\r\n1\r\n"),
+        Err(Error::Framing(chunk::Error::Limit {
+            axis: chunk::Axis::Body,
+            actual: 17,
+            maximum: 16,
+        }))
+    ));
+    assert!(matches!(
         decoder.try_take(b"\r\n0\r\n\r\n"),
         Ok(Event::Done { consumed, fields }) if consumed.get() == 7 && fields.section().is_empty()
     ));

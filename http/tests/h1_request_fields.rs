@@ -15,6 +15,7 @@ use sark_http::{
             line::Version,
             request::{Coding, Fields},
         },
+        target::Policy::Require,
     },
     payload::response::Method,
 };
@@ -25,11 +26,11 @@ static ALLOCATOR: Tracker = Tracker::new();
 #[test]
 fn empty() {
     let headers: &[Entry<'_>] = &[];
-    let scan = (Fields::try_scan(headers)).expect("valid request fields");
+    let scan = try_scan(headers).expect("valid request fields");
     assert_eq!(scan.message.length(), None);
     assert!(!scan.message.has_coding());
     assert!(!scan.message.is_chunked());
-    assert!(matches!(scan.try_body(), Ok(RequestBody::Empty)));
+    assert_eq!(try_body(scan, Require), Ok(RequestBody::Empty));
 }
 
 #[test]
@@ -41,7 +42,7 @@ fn length() {
         (b"0042", 42),
     ] {
         let headers = &[Entry::new(b"Content-Length", value)];
-        let scan = (Fields::try_scan(headers)).expect("valid request fields");
+        let scan = try_scan(headers).expect("valid request fields");
         assert_eq!(scan.message.length(), Some(length));
     }
 }
@@ -53,7 +54,7 @@ fn duplicate_length() {
             Entry::new(b"Content-Length", b"42"),
             Entry::new(b"Content-Length", value),
         ];
-        assert!(Fields::try_scan(headers).is_err());
+        assert!(try_scan(headers).is_err());
     }
 }
 
@@ -61,7 +62,7 @@ fn duplicate_length() {
 fn transfer_coding() {
     for (value, chunked) in [(b"chunked".as_slice(), true), (b"gzip", false)] {
         let headers = [Entry::new(b"Transfer-Encoding", value)];
-        let scan = Fields::try_scan(&headers).expect("valid request fields");
+        let scan = try_scan(&headers).expect("valid request fields");
         assert!(scan.message.has_coding());
         assert_eq!(scan.message.is_chunked(), chunked);
     }
@@ -70,15 +71,15 @@ fn transfer_coding() {
 #[test]
 fn continue_expectation() {
     let headers = &[Entry::new(b"Expect", b"100-continue")];
-    let scan = (Fields::try_scan(headers)).expect("valid request fields");
-    assert!(matches!(scan.try_body(), Ok(RequestBody::Empty)));
+    let scan = try_scan(headers).expect("valid request fields");
+    assert_eq!(try_body(scan, Require), Ok(RequestBody::Empty));
 }
 
 #[test]
 fn other_expectation() {
     let headers = &[Entry::new(b"Expect", b"some-other")];
-    let scan = (Fields::try_scan(headers)).expect("valid request fields");
-    assert!(scan.try_body().is_err());
+    let scan = try_scan(headers).expect("valid request fields");
+    assert!(try_body(scan, Require).is_err());
 }
 
 #[test]
@@ -92,7 +93,7 @@ fn invalid_lengths() {
         b"   ",
     ] {
         let headers = &[Entry::new(b"Content-Length", value)];
-        assert!(Fields::try_scan(headers).is_err(), "accepted {value:?}");
+        assert!(try_scan(headers).is_err(), "accepted {value:?}");
     }
 }
 
@@ -102,7 +103,7 @@ fn empty_name() {
         Entry::new(b"", b"ignored"),
         Entry::new(b"Content-Length", b"5"),
     ];
-    let scan = (Fields::try_scan(headers)).expect("valid request fields");
+    let scan = try_scan(headers).expect("valid request fields");
     assert_eq!(scan.message.length(), Some(5));
 }
 
@@ -112,13 +113,13 @@ fn case_insensitive() {
         Entry::new(b"TRANSFER-ENCODING", b"CHUNKED"),
         Entry::new(b"EXPECT", b"100-Continue"),
     ];
-    let fields = (Fields::try_scan(headers)).expect("valid request fields");
+    let fields = try_scan(headers).expect("valid request fields");
     assert!(fields.message.has_coding());
     assert!(fields.message.is_chunked());
-    assert!(matches!(fields.try_body(), Ok(RequestBody::Chunked)));
+    assert_eq!(try_body(fields, Require), Ok(RequestBody::Chunked));
 
     let headers = &[Entry::new(b"CONTENT-LENGTH", b"42")];
-    let fields = (Fields::try_scan(headers)).expect("valid request fields");
+    let fields = try_scan(headers).expect("valid request fields");
     assert_eq!(fields.message.length(), Some(42));
 }
 
@@ -128,60 +129,48 @@ fn other_field() {
         Entry::new(b"X-Custom", b"123"),
         Entry::new(b"Content-Length", b"77"),
     ];
-    let scan = (Fields::try_scan(headers)).expect("valid request fields");
+    let scan = try_scan(headers).expect("valid request fields");
     assert_eq!(scan.message.length(), Some(77));
 }
 
 #[test]
-fn rejects_nonfinal_chunked() {
-    assert!(Fields::try_headers(&[(Known::TransferEncoding, b"chunked, gzip")]).is_err());
-}
+fn transfer_encoding_framing() {
+    use sark_http::h1::{field::value, framing, head::Semantic};
 
-#[test]
-fn accepts_final_chunked() {
-    assert!(
-        ((Fields::try_headers(&[(Known::TransferEncoding, b"gzip, chunked")]))
-            .expect("test operation must succeed"))
-            == (RequestBody::Chunked)
-    );
-}
-
-#[test]
-fn rejects_unknown_coding() {
-    assert!(Fields::try_headers(&[(Known::TransferEncoding, b"gzip")]).is_err());
-}
-
-#[test]
-fn te_bare_chunked_accepted() {
-    assert!(
-        ((Fields::try_headers(&[(Known::TransferEncoding, b"chunked")]))
-            .expect("test operation must succeed"))
-            == (RequestBody::Chunked)
-    );
-}
-
-#[test]
-fn rejects_double_chunked() {
-    assert!(Fields::try_headers(&[(Known::TransferEncoding, b"chunked, chunked")]).is_err());
-}
-
-#[test]
-fn rejects_duplicate_len() {
-    for value in [b"7".as_slice(), b"5"] {
-        assert!(
-            Fields::try_headers(&[(Known::ContentLength, b"5"), (Known::ContentLength, value)])
-                .is_err()
+    let encoding = Known::TransferEncoding;
+    let chunked = (encoding, b"chunked".as_slice());
+    let gzip = (encoding, b"gzip".as_slice());
+    let combined = (encoding, b"gzip, chunked".as_slice());
+    for headers in [&[chunked][..], &[combined], &[gzip, chunked]] {
+        assert_eq!(try_headers(headers), Ok(RequestBody::Chunked));
+    }
+    let order = head::Error::TransferEncoding(value::Error::InvalidOrdering);
+    for invalid in [b"chunked, gzip".as_slice(), b"chunked, chunked"] {
+        assert_eq!(
+            try_headers(&[(encoding, invalid)]),
+            Err(Failure::Field(order))
         );
     }
+    let framing = framing::RequestError::Framing(framing::Error::UnframedRequestTransferEncoding);
+    assert_eq!(
+        try_headers(&[gzip]),
+        Err(Failure::Semantic(Semantic::Admission(framing)))
+    );
 }
 
 #[test]
-fn accepts_single_length() {
-    assert!(
-        ((Fields::try_headers(&[(Known::ContentLength, b"5")]))
-            .expect("test operation must succeed"))
-            == (RequestBody::Fixed(5))
-    );
+fn content_length_framing() {
+    use sark_http::h1::field;
+
+    let length = (Known::ContentLength, b"5".as_slice());
+    assert_eq!(try_headers(&[length]), Ok(RequestBody::Fixed(5)));
+    let duplicate = head::Error::Message(field::Error::DuplicateContentLength);
+    for value in [b"7", b"5"] {
+        assert_eq!(
+            try_headers(&[length, (Known::ContentLength, value)]),
+            Err(Failure::Field(duplicate))
+        );
+    }
 }
 
 #[test]
@@ -294,18 +283,6 @@ fn rejects_cl_te_second() {
 }
 
 #[test]
-fn accepts_split_transfer() {
-    assert!(
-        ((Fields::try_headers(&[
-            (Known::TransferEncoding, b"gzip"),
-            (Known::TransferEncoding, b"chunked"),
-        ]))
-        .expect("test operation must succeed"))
-            == (RequestBody::Chunked)
-    );
-}
-
-#[test]
 fn accumulates_connection() {
     for (lines, keep, close) in [
         (
@@ -343,37 +320,74 @@ fn accumulates_connection() {
 
 #[test]
 fn admits_generated_upgrade() {
-    assert!(Fields::try_upgrade(&[(Known::Connection, b"Upgrade")]).is_err());
-    assert!(Fields::try_upgrade(&[(Known::Upgrade, b"websocket")]).is_err());
-    (Fields::try_upgrade(&[
-        (Known::Connection, b"Upgrade"),
-        (Known::Upgrade, b"websocket"),
-    ]))
-    .as_ref()
-    .expect("test operation must succeed");
+    use sark_http::h1::{head::Semantic, switch};
+
+    let host = (Known::Host, b"origin.example".as_slice());
+    let connection = (Known::Connection, b"Upgrade".as_slice());
+    let upgrade = (Known::Upgrade, b"websocket".as_slice());
+    let incomplete = Semantic::Transition(switch::Error::IncompleteUpgradeRequest);
+    for field in [connection, upgrade] {
+        assert_eq!(
+            try_request(b"GET", b"/", &[host, field]),
+            Err(Failure::Semantic(incomplete))
+        );
+    }
+    assert_eq!(
+        try_request(b"GET", b"/", &[host, connection, upgrade]),
+        Ok(RequestBody::Empty)
+    );
 }
 
 #[test]
 fn rejects_bad_authority() {
-    assert!(Fields::try_hosts(b"GET", b"/", &[]).is_err());
-    assert!(Fields::try_hosts(b"GET", b"/", &[b"one", b"two"]).is_err());
-    assert!(Fields::try_hosts(b"GET", b"/", &[b"user@origin"]).is_err());
-    assert!(Fields::try_hosts(b"GET", b"/", &[b"origin:http"]).is_err());
+    use Known::Host;
+    use sark_http::{
+        h1::{
+            framing::RequestError,
+            head::Semantic,
+            target::{Error::MissingHost, HostError},
+        },
+        uri,
+    };
+
+    let missing = Semantic::Admission(RequestError::Authority(MissingHost));
+    assert_eq!(
+        try_request(b"GET", b"/", &[]),
+        Err(Failure::Semantic(missing))
+    );
+    let duplicate = [(Host, b"one".as_slice()), (Host, b"two")];
+    let user = [(Host, b"user@origin".as_slice())];
+    let port = [(Host, b"origin:http".as_slice())];
+    for (headers, cause) in [
+        (duplicate.as_slice(), HostError::Duplicate),
+        (&user, HostError::Authority(uri::Error::InvalidHost)),
+        (&port, HostError::Authority(uri::Error::InvalidPort)),
+    ] {
+        assert_eq!(
+            try_request(b"GET", b"/", headers),
+            Err(Failure::Field(head::Error::Host(cause)))
+        );
+    }
 }
 
 #[test]
 fn uses_target_authority() {
-    assert!(
-        ((Fields::try_hosts(b"GET", b"https://origin.example/items", &[b""],))
-            .expect("test operation must succeed"))
-            == (RequestBody::Empty)
+    use sark_http::h1::{head::Semantic, target};
+
+    let absolute = b"https://origin.example/items";
+    let empty = [(Known::Host, b"".as_slice())];
+    let origin = [(Known::Host, b"origin.example".as_slice())];
+    for (method, target, headers) in [
+        (b"GET".as_slice(), absolute.as_slice(), &empty),
+        (b"OPTIONS", b"*", &origin),
+    ] {
+        assert_eq!(try_request(method, target, headers), Ok(RequestBody::Empty));
+    }
+    let invalid = Semantic::Authority(target::Error::InvalidTarget);
+    assert_eq!(
+        try_request(b"GET", b"*", &origin),
+        Err(Failure::Semantic(invalid))
     );
-    assert!(
-        ((Fields::try_hosts(b"OPTIONS", b"*", &[b"origin.example"]))
-            .expect("test operation must succeed"))
-            == (RequestBody::Empty)
-    );
-    assert!(Fields::try_hosts(b"GET", b"*", &[b"origin.example"]).is_err());
 }
 
 #[test]

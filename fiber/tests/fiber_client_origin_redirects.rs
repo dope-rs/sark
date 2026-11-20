@@ -1,9 +1,8 @@
-use dope::core::{driver::life::recovery, io::Reclaimed};
 pub mod common;
 
 use std::str;
 
-use common::client::recover;
+use common::client::assert_shutdown;
 use common::client::{
     config::FLAVORS,
     routes::*,
@@ -32,11 +31,7 @@ fn follows_origin() {
                     .expect("HTTP host allocation")
                     .try_run(
                         |result| result.expect("HTTP response"),
-                        recovery::Policy::new(
-                            |event| std::assert_matches!(event, Reclaimed::Shutdown),
-                            recover,
-                        ),
-                        |result| result.expect("client execution"),
+                        assert_shutdown,
                     )
                     .expect("request scope");
                 assert_eq!(resp.status().as_u16(), 200);
@@ -65,11 +60,7 @@ fn redirect_chain_followed() {
                     .expect("HTTP host allocation")
                     .try_run(
                         |result| result.expect("HTTP response"),
-                        recovery::Policy::new(
-                            |event| std::assert_matches!(event, Reclaimed::Shutdown),
-                            recover,
-                        ),
-                        |result| result.expect("client execution"),
+                        assert_shutdown,
                     )
                     .expect("request scope");
                 assert_eq!(resp.status().as_u16(), 200);
@@ -98,11 +89,7 @@ fn resolves_relative() {
                     .expect("HTTP host allocation")
                     .try_run(
                         |result| result.expect("HTTP response"),
-                        recovery::Policy::new(
-                            |event| std::assert_matches!(event, Reclaimed::Shutdown),
-                            recover,
-                        ),
-                        |result| result.expect("client execution"),
+                        assert_shutdown,
                     )
                     .expect("request scope");
                 assert_eq!(response.status().as_u16(), 200);
@@ -128,11 +115,7 @@ fn keeps_query_path() {
                     .expect("HTTP host allocation")
                     .try_run(
                         |result| result.expect("HTTP response"),
-                        recovery::Policy::new(
-                            |event| std::assert_matches!(event, Reclaimed::Shutdown),
-                            recover,
-                        ),
-                        |result| result.expect("client execution"),
+                        assert_shutdown,
                     )
                     .expect("request scope");
                 assert_eq!(response.status().as_u16(), 200);
@@ -171,11 +154,7 @@ fn redirect_loop_rejected() {
                             Error::Redirect(redirect::Error::Loop)
                         ));
                     },
-                    recovery::Policy::new(
-                        |event| std::assert_matches!(event, Reclaimed::Shutdown),
-                        recover,
-                    ),
-                    |result| result.expect("client execution"),
+                    assert_shutdown,
                 )
                 .expect("HTTP request execution");
             }
@@ -213,11 +192,7 @@ fn rejects_cross_origin() {
                         Error::Request(RequestError::CrossOrigin)
                     ));
                 },
-                recovery::Policy::new(
-                    |event| std::assert_matches!(event, Reclaimed::Shutdown),
-                    recover,
-                ),
-                |result| result.expect("client execution"),
+                assert_shutdown,
             )
             .expect("HTTP request execution");
             server
@@ -241,11 +216,7 @@ fn accepts_terminal_304() {
                 .expect("HTTP host allocation")
                 .try_run(
                     |result| result.expect("HTTP response"),
-                    recovery::Policy::new(
-                        |event| std::assert_matches!(event, Reclaimed::Shutdown),
-                        recover,
-                    ),
-                    |result| result.expect("client execution"),
+                    assert_shutdown,
                 )
                 .expect("request scope");
             assert_eq!(response.status(), status::Code::NOT_MODIFIED);
@@ -304,11 +275,7 @@ fn preserves_method_policy() {
                 )
                 .try_run(
                     |result| result.expect("HTTP response"),
-                    recovery::Policy::new(
-                        |event| std::assert_matches!(event, Reclaimed::Shutdown),
-                        recover,
-                    ),
-                    |result| result.expect("client execution"),
+                    assert_shutdown,
                 )
                 .expect("request scope");
                 assert_eq!(response.status(), status::Code::OK);

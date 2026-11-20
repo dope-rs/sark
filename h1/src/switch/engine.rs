@@ -1,8 +1,8 @@
 //! Static switching policy implementations.
 
-use core::{convert::Infallible, mem};
+use core::convert::Infallible;
 
-use crate::switch;
+use crate::switch::{self, Phase};
 
 /// Static switching policy implemented only by canonical modes.
 pub trait Engine {
@@ -43,10 +43,10 @@ impl<D> Engine for switch::Enabled<D> {
     type Staged = ();
 
     fn mode(&self) -> switch::Mode {
-        match &self.state {
-            switch::State::Http => switch::Mode::Http,
-            switch::State::Switching { kind, .. } => switch::Mode::Switching(*kind),
-            switch::State::Raw { kind, .. } => switch::Mode::Raw(*kind),
+        match self.0 {
+            None => switch::Mode::Http,
+            Some((Phase::Switching, kind, _)) => switch::Mode::Switching(kind),
+            Some((Phase::Raw, kind, _)) => switch::Mode::Raw(kind),
         }
     }
 
@@ -58,14 +58,17 @@ impl<D> Engine for switch::Enabled<D> {
         if !matches!(mode, switch::Mode::Http) {
             return Err(switch::Error::new(mode, next));
         }
-        let switch::Transition { kind, duplex } = next;
-        self.state = switch::State::Switching { kind, duplex };
+        self.0 = Some((Phase::Switching, next.kind, next.duplex));
         Ok(())
     }
 
     fn commit(&mut self) -> switch::Commit {
-        let (state, commit) = mem::replace(&mut self.state, switch::State::Http).commit();
-        self.state = state;
-        commit
+        match &mut self.0 {
+            Some((phase @ Phase::Switching, ..)) => {
+                *phase = Phase::Raw;
+                switch::Commit::Switch
+            }
+            _ => switch::Commit::Ordinary,
+        }
     }
 }

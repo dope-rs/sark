@@ -1,4 +1,3 @@
-use core::cmp;
 use std::collections;
 
 use crate::app::route;
@@ -7,7 +6,6 @@ use crate::app::route;
 struct Path<'a> {
     index: usize,
     segments: &'a [route::Seg],
-    literals: usize,
 }
 
 #[derive(Clone, PartialEq, Eq, PartialOrd, Ord)]
@@ -38,82 +36,64 @@ impl Machine {
         let mut paths = collections::BTreeMap::<route::Method, Vec<Path<'_>>>::new();
         for (index, entry) in plan.routes.iter().enumerate() {
             match entry.target.path() {
-                Some(segments) => paths.entry(entry.method).or_default().push(Path {
-                    index,
-                    segments,
-                    literals: entry.literal_count,
-                }),
+                Some(segments) => paths
+                    .entry(entry.method)
+                    .or_default()
+                    .push(Path { index, segments }),
                 None => asterisk.entry(entry.method).or_default().push(index),
             }
         }
-        let mut initial = Vec::with_capacity(paths.len());
-        for (method, routes) in paths {
-            let key = StateKey { depth: 0, routes };
-            let id = Self::intern(key, &mut keys, &mut queue);
-            initial.push((method, id));
-        }
-        let starts = initial.into_iter().collect();
+        let starts = paths
+            .into_iter()
+            .map(|(method, routes)| {
+                (
+                    method,
+                    Self::intern(StateKey { depth: 0, routes }, &mut keys, &mut queue),
+                )
+            })
+            .collect();
 
         let mut states = Vec::new();
         while let Some(key) = queue.pop_front() {
-            let mut accept = key
-                .routes
-                .iter()
-                .copied()
-                .filter(|path| path.segments.len() == key.depth)
-                .collect::<Vec<_>>();
-            accept.sort_by_key(|path| cmp::Reverse(path.literals));
-            let accept = accept.into_iter().map(|path| path.index).collect();
-
-            let active = key
-                .routes
-                .iter()
-                .copied()
-                .filter(|path| path.segments.len() > key.depth)
-                .collect::<Vec<_>>();
-            let params = active
-                .iter()
-                .copied()
-                .filter(|path| {
-                    path.segments
-                        .get(key.depth)
-                        .is_some_and(|segment| !segment.is_literal())
-                })
-                .collect::<Vec<_>>();
-            let fallback = if params.is_empty() {
-                None
-            } else {
-                Some(Self::intern(
+            let mut accept = Vec::new();
+            let mut params = Vec::new();
+            let mut branches = collections::BTreeMap::<&[u8], Vec<Path<'_>>>::new();
+            for path in key.routes {
+                let Some(segment) = path.segments.get(key.depth) else {
+                    accept.push(path.index);
+                    continue;
+                };
+                if let route::Seg::Literal(name) = segment {
+                    // A newly encountered literal also matches every earlier parameter.
+                    let branch = branches.entry(name).or_insert_with(|| {
+                        let mut branch = Vec::with_capacity(params.len() + 1);
+                        branch.extend_from_slice(&params);
+                        branch
+                    });
+                    branch.push(path);
+                } else {
+                    for branch in branches.values_mut() {
+                        branch.push(path);
+                    }
+                    params.push(path);
+                }
+            }
+            // All paths ending here have the same depth.
+            accept.sort_by_key(|&index| plan.route(index).params.len());
+            let mut next = |routes| {
+                Self::intern(
                     StateKey {
                         depth: key.depth + 1,
-                        routes: params.clone(),
+                        routes,
                     },
                     &mut keys,
                     &mut queue,
-                ))
+                )
             };
-            let literals = active
-                .iter()
-                .filter_map(|path| path.segments.get(key.depth))
-                .filter_map(route::Seg::literal)
-                .collect::<collections::BTreeSet<_>>()
+            let fallback = (!params.is_empty()).then(|| next(params));
+            let literals = branches
                 .into_iter()
-                .map(|literal| {
-                    let mut routes = params.clone();
-                    routes.extend(active.iter().copied().filter(|path| {
-                        path.segments.get(key.depth).and_then(route::Seg::literal) == Some(literal)
-                    }));
-                    routes.sort_unstable();
-                    let next = Self::intern(
-                        StateKey {
-                            depth: key.depth + 1,
-                            routes,
-                        },
-                        &mut keys,
-                        &mut queue,
-                    );
-                    (literal.to_vec(), next)
-                })
+                .map(|(literal, routes)| (literal.to_vec(), next(routes)))
                 .collect();
             states.push(State {
                 depth: key.depth,
@@ -137,11 +117,11 @@ impl Machine {
         use collections::btree_map::Entry;
 
         let id = keys.len();
-        match keys.entry(key.clone()) {
+        match keys.entry(key) {
             Entry::Occupied(slot) => *slot.get(),
             Entry::Vacant(slot) => {
-                let id = *slot.insert(id);
-                queue.push_back(key);
+                queue.push_back(slot.key().clone());
+                slot.insert(id);
                 id
             }
         }
