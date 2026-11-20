@@ -390,7 +390,10 @@ impl Plan {
 
 impl Host {
     pub fn parse(value: &[u8]) -> Result<Self, uri::Error> {
-        let value = field::Error::trim_ows(value);
+        Self::parse_trimmed(field::Error::trim_ows(value))
+    }
+
+    pub(crate) fn parse_trimmed(value: &[u8]) -> Result<Self, uri::Error> {
         if value.is_empty() {
             return Ok(Self::Empty);
         }

@@ -197,11 +197,16 @@ where
     }
 }
 
+pub(crate) fn trim_ows_start(mut value: &[u8]) -> &[u8] {
+    while let [b' ' | b'\t', rest @ ..] = value {
+        value = rest;
+    }
+    value
+}
+
 impl Error {
-    pub fn trim_ows(mut value: &[u8]) -> &[u8] {
-        while matches!(value.first(), Some(b' ' | b'\t')) {
-            value = &value[1..];
-        }
+    pub fn trim_ows(value: &[u8]) -> &[u8] {
+        let mut value = trim_ows_start(value);
         while matches!(value.last(), Some(b' ' | b'\t')) {
             value = &value[..value.len() - 1];
         }

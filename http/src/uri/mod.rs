@@ -30,15 +30,16 @@ impl<'a> Authority<'a> {
     }
 
     pub fn parse(value: &'a [u8]) -> Result<Self, Error> {
-        authority(value, Self::new)
+        let (host, port) = authority(value)?;
+        Ok(Self { host, port })
     }
 
     pub(crate) fn validate(value: &[u8]) -> Result<(), Error> {
-        authority(value, |_, _| ())
+        host_end(value).map(|_| ())
     }
 
     pub(crate) fn has_nonempty_port(value: &[u8]) -> Result<bool, Error> {
-        authority(value, |_, port| port.is_some_and(|port| !port.is_empty()))
+        Ok(value.len() - host_end(value)? > 1)
     }
 
     pub fn is_same(self, other: Self, scheme: Scheme) -> bool {
@@ -135,7 +136,8 @@ pub(crate) struct Parsed<'a> {
 
 impl<'a> Parsed<'a> {
     pub(crate) fn parse(value: record::Span<'a>) -> Result<Self, Error> {
-        authority(value, |host, port| Self { host, port })
+        let (host, port) = authority(value)?;
+        Ok(Self { host, port })
     }
 
     /// Whether this admitted authority has a nonempty explicit decimal port.
@@ -186,47 +188,43 @@ impl<'a> Source<'a> for record::Span<'a> {
     }
 }
 
-fn authority<'a, S: Source<'a>, T>(
-    value: S,
-    finish: impl FnOnce(S, Option<S>) -> T,
-) -> Result<T, Error> {
+fn authority<'a, S: Source<'a>>(value: S) -> Result<(S, Option<S>), Error> {
+    let end = host_end(value)?;
+    let len = value.len();
+    if end == len {
+        return Ok((value, None));
+    }
+    let port = value.sub(end + 1, len).ok_or(Error::InvalidPort)?;
+    Ok((value.sub(0, end).ok_or(Error::InvalidHost)?, Some(port)))
+}
+
+fn host_end<'a>(value: impl Source<'a>) -> Result<usize, Error> {
     let span = value.span();
     if span.is_empty() {
         return Err(Error::Empty);
     }
-    let literal = value.get(0) == Some(b'[');
-    let end = if literal {
-        let close = span
-            .iter()
+    let mut rest = span.iter();
+    if value.get(0) == Some(b'[') {
+        let close = rest
             .position(|&byte| byte == b']')
             .ok_or(Error::InvalidHost)?;
         let ip = value.sub(1, close).ok_or(Error::InvalidHost)?.span();
         if close == 1 || (!is_future_span(ip) && parser::Parser::new(ip).v6().is_none()) {
             return Err(Error::InvalidHost);
         }
-        close + 1
+        if let Some(&separator) = rest.next()
+            && (separator != b':' || !rest.all(u8::is_ascii_digit))
+        {
+            return Err(Error::InvalidPort);
+        }
+        Ok(close + 1)
     } else {
-        let mut rest = span.iter();
         let port = registered::<true>(&mut rest);
         if rest.clone().next().is_some() {
             return Err(registered_error(port.is_some(), rest.copied()));
         }
-        port.map_or(span.len(), NonZero::get)
-    };
-    if end == span.len() {
-        return Ok(finish(value, None));
+        Ok(port.map_or(span.len(), NonZero::get))
     }
-    if literal && value.get(end) != Some(b':') {
-        return Err(Error::InvalidPort);
-    }
-    let port = value.sub(end + 1, span.len()).ok_or(Error::InvalidPort)?;
-    if literal && !port.span().iter().all(u8::is_ascii_digit) {
-        return Err(Error::InvalidPort);
-    }
-    Ok(finish(
-        value.sub(0, end).ok_or(Error::InvalidHost)?,
-        Some(port),
-    ))
 }
 
 fn is_port_span_equivalent(

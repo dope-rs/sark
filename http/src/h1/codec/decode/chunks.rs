@@ -1,6 +1,6 @@
 use std::num;
 
-use chunk::{scan, trailer::Partial};
+use chunk::scan;
 use o3::{alloc, buffer::write::Sink as _};
 
 use crate::{
@@ -78,7 +78,7 @@ pub struct Plan<'a> {
 
 enum Prepared<'a> {
     Event { next: Decoder, event: Event<'a> },
-    Trailer(Partial<'a>),
+    Trailer(trailer::Pending<'a>),
 }
 
 impl<'a> Plan<'a> {
@@ -96,7 +96,7 @@ impl<'a> Plan<'a> {
     /// Retaining that prefix permits later input to be scanned only once.
     pub fn into_trailer(self) -> Result<trailer::Pending<'a>, Self> {
         match self.event {
-            Prepared::Trailer(partial) => Ok(trailer::Pending::new(partial)),
+            Prepared::Trailer(pending) => Ok(pending),
             event @ Prepared::Event { .. } => Err(Self { event }),
         }
     }
@@ -105,7 +105,7 @@ impl<'a> Plan<'a> {
 #[derive(Clone, Copy)]
 pub struct Decoder {
     framer: chunk::Framer,
-    limits: chunk::Limit,
+    max_body: usize,
 }
 
 impl Default for Decoder {
@@ -124,7 +124,7 @@ impl Decoder {
     pub fn with_limit(max_body: usize) -> Self {
         Self {
             framer: chunk::Framer::new(),
-            limits: chunk::Limit::with_body(max_body),
+            max_body,
         }
     }
 
@@ -133,7 +133,7 @@ impl Decoder {
     pub fn decode_max<'a>(&self, buf: &'a [u8], max: usize) -> Result<Plan<'a>, Error> {
         let (framer, event) = self
             .framer
-            .prepare::<scan::Fragments>(buf, &self.limits, max)
+            .prepare::<scan::Fragments>(buf, self.max_body, &chunk::Framing::DEFAULT, max)
             .map_err(Error::Framing)?;
         let event = match event {
             scan::Decoded::Data {

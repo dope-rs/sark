@@ -11,10 +11,6 @@ use crate::{
     h1::{field, head::request},
 };
 
-pub(super) const fn is_whitespace(byte: u8) -> bool {
-    byte == b' ' || byte == b'\t'
-}
-
 pub(super) fn try_token_line_lit<const N: usize>(raw: &[u8], expected: &[u8; N]) -> Option<Bounds> {
     let start = if raw.first() == Some(&b' ') { 1 } else { 0 };
     let end = start + N;
@@ -28,14 +24,6 @@ pub(super) fn try_token_line_lit<const N: usize>(raw: &[u8], expected: &[u8; N])
         return None;
     }
     Some(Bounds::new(end, start, end))
-}
-
-pub(super) fn clen_line(scan: &mut request::Fields, raw: &[u8]) -> Result<Option<Bounds>, Error> {
-    let Some((len, bounds)) = parse_clen(raw)? else {
-        return Ok(None);
-    };
-    scan.message = scan.message.try_length(len).map_err(Error::Message)?;
-    Ok(Some(bounds))
 }
 
 pub(super) fn te_line(scan: &mut request::Fields, raw: &[u8]) -> Result<Option<Bounds>, Error> {
@@ -52,70 +40,44 @@ pub(super) fn te_line(scan: &mut request::Fields, raw: &[u8]) -> Result<Option<B
     Ok(Some(bounds))
 }
 
-fn scan_length(raw: &[u8]) -> Result<Option<(usize, usize, usize)>, Error> {
-    let mut idx = if raw.first() == Some(&b' ') { 1 } else { 0 };
-    while idx < raw.len() && is_whitespace(raw[idx]) {
-        idx += 1;
-    }
-    let start = idx;
-    if start == raw.len() {
+pub(super) fn clen_line(scan: &mut request::Fields, raw: &[u8]) -> Result<Option<Bounds>, Error> {
+    let rest = crate::field::trim_ows_start(raw);
+    if rest.is_empty() {
         return Ok(None);
     }
-    // SAFETY: the OWS scan stopped within this same immutable raw.
-    let rest = unsafe { raw.get_unchecked(start..) };
+    let start = raw.len() - rest.len();
     let (value, len) = Ascii::new(rest)
         .parse_prefix()
         .map_err(Error::ContentLength)?;
-    let end = start + len;
-    Ok(Some((value, start, end)))
+    // SAFETY: parse_prefix counted only digits in this immutable suffix.
+    let tail = crate::field::trim_ows_start(unsafe { rest.get_unchecked(len..) });
+    match tail {
+        [b'\r', b'\n', ..] => {
+            scan.message = scan.message.try_length(value).map_err(Error::Message)?;
+            Ok(Some(Bounds::new(raw.len() - tail.len(), start, start + len)))
+        }
+        [] | [b'\r'] => Ok(None),
+        _ => Err(Error::ContentLength(IntError::InvalidByte)),
+    }
 }
 
 pub(super) fn trim_line(raw: &[u8]) -> Result<Option<Bounds>, Error> {
-    let mut idx = 0usize;
-    while idx < raw.len() && is_whitespace(raw[idx]) {
-        idx += 1;
-    }
-    let start = idx;
-    let cr = match Bytes::new(raw).value(start) {
+    let rest = crate::field::trim_ows_start(raw);
+    let start = raw.len() - rest.len();
+    trim_suffix(rest, start, start)
+}
+
+pub(super) fn trim_suffix(rest: &[u8], start: usize, base: usize) -> Result<Option<Bounds>, Error> {
+    let cr = match Bytes::new(rest).value(0) {
         Outcome::Found(cr) => cr,
         Outcome::Partial => return Ok(None),
         Outcome::Invalid { .. } => return Err(Error::Value),
     };
-    // SAFETY: this scan found CRLF after start inside the same immutable raw.
-    let mut value = unsafe { raw.get_unchecked(start..cr) };
-    while matches!(value.last(), Some(b' ' | b'\t')) {
-        value = &value[..value.len() - 1];
+    let mut end = cr;
+    while end > 0 && matches!(rest.get(end - 1), Some(b' ' | b'\t')) {
+        end -= 1;
     }
-    let end = start + value.len();
-    Ok(Some(Bounds::new(cr, start, end)))
-}
-
-fn parse_clen(raw: &[u8]) -> Result<Option<(usize, Bounds)>, Error> {
-    let Some((value, start, end)) = scan_length(raw)? else {
-        return Ok(None);
-    };
-    // SAFETY: scan_length counted actual digits within this exact raw's suffix.
-    let rest = unsafe { raw.get_unchecked(end..) };
-    if rest.starts_with(b"\r\n") {
-        return Ok(Some((value, Bounds::new(end, start, end))));
-    }
-    let mut idx = end;
-    while idx < raw.len() && is_whitespace(raw[idx]) {
-        idx += 1;
-    }
-    if idx >= raw.len() {
-        return Ok(None);
-    }
-    if raw[idx] != b'\r' {
-        return Err(Error::ContentLength(IntError::InvalidByte));
-    }
-    if idx + 1 >= raw.len() {
-        return Ok(None);
-    }
-    if raw[idx + 1] != b'\n' {
-        return Err(Error::ContentLength(IntError::InvalidByte));
-    }
-    Ok(Some((value, Bounds::new(idx, start, end))))
+    Ok(Some(Bounds::new(base + cr, start, base + end)))
 }
 
 pub(super) fn ae_line(

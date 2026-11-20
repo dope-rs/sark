@@ -308,6 +308,11 @@ fn host_admission() {
         assert_eq!(result.err(), Some(Error::Authority(expected)));
         assert_eq!(usage, (0, 0));
     }
+    let (target, usage) = Tracker::usage(|| Target::from_host("[::1]:", None, Origin::ROOT));
+    let target = target.expect("empty port in authority");
+    assert_eq!(target.host_raw(), "[::1]");
+    assert_eq!(target.parts().port(), Some(b"".as_slice()));
+    assert_eq!(usage, (1, target.as_ref().len()));
 }
 
 #[test]

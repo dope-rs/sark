@@ -1,9 +1,6 @@
-use crate::h1::{
-    field::{
-        value,
-        value::{Match, Parser},
-    },
-    framing,
+use crate::{
+    field::trim_ows_start,
+    h1::{field::value, framing},
 };
 
 /// Stateful Transfer-Encoding validation across one or more field lines.
@@ -30,48 +27,38 @@ impl Transfer {
     };
 
     pub fn parse(mut self, value: &[u8]) -> Result<Self, value::Error> {
-        let mut parser = Parser::new(value);
-        parser.skip_ows();
-        if parser.is_done() {
-            return Err(value::Error::Empty);
-        }
+        let mut rest = trim_ows_start(value);
         loop {
+            if rest.is_empty() {
+                return Err(value::Error::Empty);
+            }
             if matches!(self.last, framing::Transfer::Chunked) {
                 return Err(value::Error::InvalidOrdering);
             }
-            let coding = if parser.token()?.eq_ignore_ascii_case(b"chunked") {
+            let (name, mut tail) = value::token(rest)?;
+            let coding = if name.eq_ignore_ascii_case(b"chunked") {
                 framing::Transfer::Chunked
             } else {
                 framing::Transfer::Other
             };
-            parser.skip_ows();
             let mut param = false;
-            while parser.take(b';') == Match::Taken {
+            while let [b';', next @ ..] = tail {
                 param = true;
-                parser.skip_ows();
-                parser.token()?;
-                parser.skip_ows();
-                if parser.take(b'=') == Match::Other {
+                let (_, separator) = value::token(trim_ows_start(next))?;
+                let [b'=', item @ ..] = separator else {
                     return Err(value::Error::InvalidByte);
-                }
-                parser.skip_ows();
-                parser.item()?;
-                parser.skip_ows();
+                };
+                tail = value::item(trim_ows_start(item))?;
             }
             if matches!(coding, framing::Transfer::Chunked) && param {
                 return Err(value::Error::InvalidByte);
             }
             self.codings = self.codings.checked_add(1).ok_or(value::Error::Overflow)?;
             self.last = coding;
-            if parser.is_done() {
-                return Ok(self);
-            }
-            if parser.take(b',') == Match::Other {
-                return Err(value::Error::InvalidByte);
-            }
-            parser.skip_ows();
-            if parser.is_done() {
-                return Err(value::Error::Empty);
+            match tail {
+                [] => return Ok(self),
+                [b',', next @ ..] => rest = trim_ows_start(next),
+                _ => return Err(value::Error::InvalidByte),
             }
         }
     }

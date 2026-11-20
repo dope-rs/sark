@@ -1,6 +1,7 @@
 use core::{mem, num::NonZero};
 
 use chunk::trailer;
+pub use chunk::trailer::Pending;
 use o3::{
     buffer::{
         resident,
@@ -15,17 +16,10 @@ use crate::{
     h1::{chunk, field::Entry},
 };
 
-/// Partial trailer syntax paired with the exact borrowed prefix it admitted.
-pub struct Pending<'input> {
-    bytes: &'input [u8],
-    consumed: NonZero<usize>,
-    parser: trailer::Trailer,
-}
-
 /// Append-only ownership of the trailer prefix and its admitted syntax state.
 pub struct State<'d> {
     source: Owned<resident::Budget<'d>>,
-    parser: trailer::Trailer,
+    parser: trailer::Cursor,
 }
 
 /// Newly admitted input retained with its original owner through capacity growth.
@@ -76,31 +70,8 @@ impl<E> From<consume::Error> for AppendError<E> {
     }
 }
 
-impl<'input> Pending<'input> {
-    pub(in crate::h1::codec::decode) fn new(partial: trailer::Partial<'input>) -> Self {
-        let (bytes, consumed, parser) = partial.into_parts();
-        Self {
-            bytes,
-            consumed,
-            parser,
-        }
-    }
-
-    pub const fn consumed(&self) -> NonZero<usize> {
-        self.consumed
-    }
-
-    pub const fn len(&self) -> usize {
-        self.bytes.len()
-    }
-
-    pub const fn is_empty(&self) -> bool {
-        self.bytes.is_empty()
-    }
-
-    pub const fn capacity(&self) -> usize {
-        self.parser.capacity()
-    }
+impl Pending<'_> {
+    pub const CAPACITY: usize = chunk::Framing::DEFAULT.trailer_bytes;
 
     /// Copies the exact borrowed prefix before transferring its parsing proof.
     pub fn try_store<'d>(
@@ -112,7 +83,7 @@ impl<'input> Pending<'input> {
         }
         Ok(State {
             source: target,
-            parser: self.parser,
+            parser: self.cursor,
         })
     }
 }
@@ -130,7 +101,7 @@ impl<'d> State<'d> {
         self,
         input: &'input [u8],
     ) -> Result<Plan<'input, 'd>, Rejected<Self, chunk::Error>> {
-        let (next, bytes) = match self.parser.scan(input) {
+        let (next, bytes) = match self.parser.scan(input, &chunk::Framing::DEFAULT) {
             Ok(next) => next,
             Err(error) => return Err(Rejected::new(self, error)),
         };
@@ -224,7 +195,7 @@ impl<'d, T> Plan<'_, 'd, More<T>> {
         let mut spare = self.state.source.spare();
         spare.write_slice(self.bytes)?;
         spare.commit();
-        self.state.parser.cursor = self.next.cursor;
+        self.state.parser = self.next.cursor;
         self.bytes = &[];
         Ok(self.next.consumed.take())
     }

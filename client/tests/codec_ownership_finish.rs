@@ -1,5 +1,5 @@
 pub mod common;
-use common::codec::{Retain, Scope as _, decoder::Decoder, only};
+use common::codec::{Scope as _, assert_budget, decoder::Decoder, only};
 use dope::manifold::client::session::codec;
 use dope_test::alloc::Tracker;
 use o3::{
@@ -174,13 +174,7 @@ fn chunk_retries_budget() {
         let mut stored = decoder.storage(&fragment, &state);
         let blocker =
             storage::Owned::try_allocate(&budget, budget.available()).expect("resident blocker");
-        Retain {
-            result: decoder.try_stored(&mut state, &mut stored, &budget),
-            budget,
-        }
-        .try_verify()
-        .ok()
-        .expect("exact resident retention error");
+        assert_budget(decoder.try_stored(&mut state, &mut stored, &budget), budget);
         drop(blocker);
         let (_, consumed) = (decoder
             .try_stored(&mut state, &mut stored, &budget)
@@ -233,14 +227,7 @@ fn split_trailers_retain() {
                 let mut stored = decoder.storage(&input, &state);
                 let blocker = storage::Owned::try_allocate(&budget, budget.available())
                     .expect("occupy trailer budget");
-                assert!(
-                    Retain {
-                        result: decoder.try_stored(&mut state, &mut stored, &budget),
-                        budget,
-                    }
-                    .try_verify()
-                    .is_ok()
-                );
+                assert_budget(decoder.try_stored(&mut state, &mut stored, &budget), budget);
                 drop(blocker);
                 assert_eq!(stored.source().as_ref(), input.as_slice());
                 let parsed = decoder

@@ -463,8 +463,7 @@ fn normalize_state(ty: syn::Type, scope: StateScope) -> syn::Type {
 fn build_route_entry(entry: Route, scope: StateScope) -> syn::Result<(Entry, Kind)> {
     use crate::app::route::Method;
     let path = entry.path;
-    let method = Method::parse(&entry.method)?;
-    let upgrade = entry.method == "WS";
+    let (method, upgrade) = Method::parse(&entry.method)?;
     if entry.protocol.is_some() && method != Method::Connect {
         return Err(syn::Error::new_spanned(
             entry.protocol,

@@ -96,5 +96,14 @@ fn split_forbidden_name() {
             .into_parts();
         assert!(matches!(error, chunk::Error::Forbidden { .. }));
         assert_eq!(state.len(), 11);
+        let error = state.prepare(&[b'x'; 16_384]).err().expect("trailer limit");
+        assert!(matches!(
+            error.discard(),
+            chunk::Error::Limit {
+                axis: chunk::Axis::Trailer,
+                actual: 16_385,
+                maximum: 16_384,
+            }
+        ));
     });
 }

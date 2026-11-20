@@ -8,7 +8,9 @@ use crate::{
     h1::{
         field,
         head::{line::Version, request},
+        target,
     },
+    uri,
 };
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -179,22 +181,43 @@ impl Known {
             Self::ContentLength => parse::clen_line(scan, raw),
             Self::TransferEncoding => parse::te_line(scan, raw),
             Self::Expect => expect_line(scan, raw),
-            Self::Host => host_line(scan, raw),
+            Self::Host => host_line(&mut scan.routing.authority, raw),
             Self::Connection => conn_line(scan, raw),
             Self::Upgrade => upgrade_line(scan, raw, version),
         }
     }
 }
 
-fn host_line(scan: &mut request::Fields, raw: &[u8]) -> Result<Option<Bounds>, Error> {
-    let Some(bounds) = parse::trim_line(raw)? else {
-        return Ok(None);
+pub(crate) fn host_line(state: &mut target::Request, raw: &[u8]) -> Result<Option<Bounds>, Error> {
+    let value = crate::field::trim_ows_start(raw);
+    let mut rest = value.iter();
+    let port = uri::registered::<true>(&mut rest);
+    let rest = rest.as_slice();
+    let start = raw.len() - value.len();
+    let end = raw.len() - rest.len();
+    let bounds = if rest.starts_with(b"\r\n") {
+        Bounds::new(end, start, end)
+    } else {
+        let Some(bounds) = parse::trim_suffix(rest, start, end)? else {
+            return Ok(None);
+        };
+        bounds
     };
-    scan.routing.authority = scan
-        .routing
-        .authority
-        .try_host(bounds.value(raw))
-        .map_err(Error::Host)?;
+    let host = if bounds.end == end {
+        if start == end {
+            target::Host::Empty
+        } else {
+            target::Host::Authority
+        }
+    } else if value.starts_with(b"[") {
+        target::Host::parse_trimmed(bounds.value(raw))
+            .map_err(|e| Error::Host(target::HostError::Authority(e)))?
+    } else {
+        let cause =
+            uri::registered_error(port.is_some(), rest.iter().copied().take(bounds.end - end));
+        return Err(Error::Host(target::HostError::Authority(cause)));
+    };
+    *state = state.with_host(host).map_err(Error::Host)?;
     Ok(Some(bounds))
 }
 
