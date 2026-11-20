@@ -7,14 +7,15 @@ use std::{
 };
 
 use dope_quic::{
-    config, conn,
+    config,
     conn::{
-        Connection,
+        self, Connection,
         life::{
             accept,
             options::{self, builder},
             tls::clients::Authority,
         },
+        output::transmit,
     },
     dope_tls,
     errors::Connect,
@@ -27,8 +28,7 @@ use o3::{
     alloc,
     buffer::{resident, write::consume},
 };
-
-use crate::common::conn::wire::{Peer, Transfer};
+use sark_h3::manifold;
 
 const CID: [u8; 8] = [0x13, 0x37, 0x13, 0x37, 0x13, 0x37, 0x13, 0x37];
 
@@ -40,6 +40,42 @@ pub fn certificate(error: &rustls::Error) {
             .expect("diagnostic descriptor"),
     );
     writeln!(stderr, "certificate: {error:?}").expect("diagnostic output");
+}
+
+type Native<'d> = Connection<0, Vec<u8>, resident::Shared<'d>>;
+
+#[derive(Debug)]
+pub enum Transfer {
+    Output(transmit::Error),
+    Input(conn::Error),
+}
+
+pub fn try_send<'d>(
+    work: &mut conn::Workspace,
+    from: &mut Native<'d>,
+    into: &mut Native<'d>,
+    now: Instant,
+    report: impl Fn(&rustls::Error),
+) -> Result<(), Transfer> {
+    let (packets, result) = from.with_scope(|mut scope| scope.output().send(now));
+    result.map_err(Transfer::Output)?;
+    for mut packet in packets {
+        into.with_scope(|mut scope| scope.input(work).recv_packet(&mut packet, now, &report))
+            .map_err(Transfer::Input)?;
+    }
+    Ok(())
+}
+
+pub fn try_receive<'d>(
+    session: &mut manifold::Session<'d>,
+    quic: &mut Native<'d>,
+) -> Result<(), manifold::Error> {
+    quic.with_scope(|mut scope| {
+        while let Some(event) = scope.streams().events().poll() {
+            session.ingress().ingest(&mut scope, manifold::Notification::from(event))?;
+        }
+        Ok(())
+    })
 }
 
 #[derive(Debug)]
@@ -57,8 +93,8 @@ pub enum Build {
     Ready { client: bool, server: bool },
 }
 pub struct Pair<'d> {
-    pub server: Connection<0, Vec<u8>, resident::Shared<'d>>,
-    pub client: Connection<0, Vec<u8>, resident::Shared<'d>>,
+    pub server: Native<'d>,
+    pub client: Native<'d>,
     pub space: conn::Workspace,
 }
 impl<'d> Pair<'d> {
@@ -103,12 +139,8 @@ impl<'d> Pair<'d> {
         let now = Instant::now();
         let mut space = conn::Workspace::try_new().map_err(Build::Workspace)?;
         for _ in 0..3 {
-            Peer::new(&mut space, &mut client)
-                .try_send(&mut server, now, &report)
-                .map_err(Build::Client)?;
-            Peer::new(&mut space, &mut server)
-                .try_send(&mut client, now, &report)
-                .map_err(Build::Server)?;
+            try_send(&mut space, &mut client, &mut server, now, &report).map_err(Build::Client)?;
+            try_send(&mut space, &mut server, &mut client, now, &report).map_err(Build::Server)?;
         }
         let ready = (
             client.view().lifecycle().is_ready(),

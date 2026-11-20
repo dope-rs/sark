@@ -4,7 +4,7 @@ use sark_h3::conn::Error;
 use sark_http::field::literal;
 
 use crate::common::{
-    conn::{Events, build::Fields as _},
+    conn::{build::Fields as _, next_event},
     field::entry,
     ledger::{Encoder as _, Section as _},
     message::promise::Authority,
@@ -176,11 +176,7 @@ fn cancel_after_request_fin_is_delivered() {
     Receive::new(&mut conn)
         .borrowed(Id::ZERO, &request, Boundary::End)
         .expect("completed request");
-    while Events::new(&mut conn)
-        .poll_token()
-        .expect("request")
-        .is_some()
-    {}
+    while next_event(&mut conn).expect("request").is_some() {}
 
     let mut feedback = vec![STREAM_TYPE_QPACK_DECODER.get() as u8];
     Instruction::StreamCancellation { stream_id: 0 }.encode(&mut feedback);
@@ -192,7 +188,7 @@ fn cancel_after_request_fin_is_delivered() {
         )
         .expect("cancellation after request FIN");
     assert!(matches!(
-        Events::new(&mut conn).poll_token().expect("typed cancellation"),
+        next_event(&mut conn).expect("typed cancellation"),
         Some(Event::QpackCancelled { stream_id }) if stream_id == Id::ZERO
     ));
 }

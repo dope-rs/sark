@@ -48,7 +48,7 @@ pub enum Event<'d, S = Selected<rules::RetainRaw>, B = packed::Decoded, I: Ident
     /// Malformed message isolated to its original stream; the consumer must cancel it.
     Rejected {
         stream_id: I,
-        error: block::ContentError,
+        error: Rejection,
     },
     Stopped {
         stream_id: I,
@@ -74,6 +74,22 @@ pub enum Event<'d, S = Selected<rules::RetainRaw>, B = packed::Decoded, I: Ident
     GoAway {
         id: u64,
     },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Rejection {
+    Malformed { kind: rules::Kind },
+    Content(block::ContentError),
+}
+
+impl Rejection {
+    pub fn into_error(self, stream: Id) -> super::Error {
+        let stream_id = stream.get();
+        match self {
+            Self::Malformed { kind } => super::Error::Malformed { stream_id, kind },
+            Self::Content(error) => super::Error::Content { stream_id, error },
+        }
+    }
 }
 
 /// Provenance of a terminal event's identity before projection.

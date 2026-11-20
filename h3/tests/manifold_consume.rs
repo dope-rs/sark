@@ -1,9 +1,8 @@
 use std::time::{Duration, Instant};
 
 use crate::common::conn::{
-    bridge::{Pair, certificate},
+    bridge::{Pair, certificate, try_receive, try_send},
     build::Fields as _,
-    wire::{Ingress, Peer},
 };
 pub mod common;
 
@@ -16,7 +15,7 @@ use sark_core::manifold::stream::Boundary;
 use sark_h3::{
     conn,
     conn::{
-        event::{Event, Origin, Role},
+        event::{Event, Origin, Rejection, Role},
         io::Step,
     },
     frame,
@@ -67,12 +66,9 @@ fn qpack_cancellation_stops_response_owner() {
                 streams.send().finish(send).expect("request FIN");
             });
             now = client.view().send_at(now);
-            Peer::new(&mut space, &mut client)
-                .try_send(&mut server, now, certificate)
+            try_send(&mut space, &mut client, &mut server, now, certificate)
                 .expect("request transfer");
-            Ingress::new(&mut h3)
-                .try_receive(&mut server)
-                .expect("request ingress");
+            try_receive(&mut h3, &mut server).expect("request ingress");
             server.with_scope(|mut scope| {
                 while !matches!(
                     h3.ingress()
@@ -124,12 +120,9 @@ fn qpack_cancellation_stops_response_owner() {
         now = client
             .view()
             .send_at(now + Duration::from_millis(1));
-        Peer::new(&mut space, &mut client)
-            .try_send(&mut server, now, certificate)
+        try_send(&mut space, &mut client, &mut server, now, certificate)
             .expect("cancellation precedes STOP_SENDING");
-        Ingress::new(&mut h3)
-            .try_receive(&mut server)
-            .expect("cancellation ingress");
+        try_receive(&mut h3, &mut server).expect("cancellation ingress");
         server.with_scope(|mut scope| {
             let mut stopped = 0;
             loop {
@@ -154,8 +147,7 @@ fn qpack_cancellation_stops_response_owner() {
             let critical = streams.view().resolve_send(control).expect("control sender");
             assert!(streams.view().is_send_open(critical));
         });
-        Ingress::new(&mut h3)
-            .try_receive(&mut server)
+        try_receive(&mut h3, &mut server)
             .expect("native Stopped preserves the original resident generation");
         server.with_scope(|mut scope| {
             while !matches!(
@@ -187,12 +179,9 @@ fn goaway_preserves_ids() {
             .expect("peer shutdown");
     });
     let now = server.view().send_at(Instant::now());
-    Peer::new(&mut space, &mut server)
-        .try_send(&mut quic, now, certificate)
+    try_send(&mut space, &mut server, &mut quic, now, certificate)
         .expect("peer shutdown transfer");
-    Ingress::new(&mut h3)
-        .try_receive(&mut quic)
-        .expect("control ingress");
+    try_receive(&mut h3, &mut quic).expect("control ingress");
     quic.with_scope(|mut scope| {
         assert!(matches!(
             h3.egress().open_scope(&mut scope),
@@ -230,8 +219,7 @@ fn raw_terminal_binding() {
             id
         });
         let mut now = client.view().send_at(Instant::now());
-        Peer::new(&mut space, &mut client)
-            .try_send(&mut server, now, certificate)
+        try_send(&mut space, &mut client, &mut server, now, certificate)
             .expect("request transfer");
         let code = Code::from_u16(42);
         let mut received_reset = false;
@@ -250,12 +238,9 @@ fn raw_terminal_binding() {
             now = server
                 .view()
                 .send_at(now + Duration::from_millis(1));
-            Peer::new(&mut space, &mut server)
-                .try_send(&mut client, now, certificate)
+            try_send(&mut space, &mut server, &mut client, now, certificate)
                 .expect("terminal transfer");
-            Ingress::new(&mut h3)
-                .try_receive(&mut client)
-                .expect("raw notification");
+            try_receive(&mut h3, &mut client).expect("raw notification");
             client.with_scope(|mut scope| {
                 let consumed = h3
                     .ingress()
@@ -326,8 +311,7 @@ fn stop_preserves_queued_final_headers() {
             target.stream_id()
         });
         let mut now = client.view().send_at(Instant::now());
-        Peer::new(&mut space, &mut client)
-            .try_send(&mut server, now, certificate)
+        try_send(&mut space, &mut client, &mut server, now, certificate)
             .expect("request transfer");
         let code = Code::from_u16(42);
         let headers = [literal!(entry(b":status", b"200"))]
@@ -348,12 +332,9 @@ fn stop_preserves_queued_final_headers() {
             now = server
                 .view()
                 .send_at(now + Duration::from_millis(1));
-            Peer::new(&mut space, &mut server)
-                .try_send(&mut client, now, certificate)
+            try_send(&mut space, &mut server, &mut client, now, certificate)
                 .expect("peer transfer");
-            Ingress::new(&mut h3)
-                .try_receive(&mut client)
-                .expect("queue peer event");
+            try_receive(&mut h3, &mut client).expect("queue peer event");
         }
         client.with_scope(|mut scope| {
             let handle = scope.streams().resident().handle(id).expect("resident");
@@ -431,14 +412,12 @@ fn reset_reconciles_final_credit_quantum() {
         now = client
             .view()
             .send_at(now + Duration::from_millis(1));
-        Peer::new(&mut space, &mut client)
-            .try_send(&mut server, now, certificate)
+        try_send(&mut space, &mut client, &mut server, now, certificate)
             .expect("request transfer");
         now = server
             .view()
             .send_at(now + Duration::from_millis(30));
-        Peer::new(&mut space, &mut server)
-            .try_send(&mut client, now, certificate)
+        try_send(&mut space, &mut server, &mut client, now, certificate)
             .expect("request FIN acknowledgement");
         client.with_scope(|mut scope| {
             let streams = scope.streams();
@@ -455,12 +434,9 @@ fn reset_reconciles_final_credit_quantum() {
         now = server
             .view()
             .send_at(now + Duration::from_millis(1));
-        Peer::new(&mut space, &mut server)
-            .try_send(&mut client, now, certificate)
+        try_send(&mut space, &mut server, &mut client, now, certificate)
             .expect("response transfer");
-        Ingress::new(&mut h3)
-            .try_receive(&mut client)
-            .expect("queue response");
+        try_receive(&mut h3, &mut client).expect("queue response");
         if reset {
             client.with_scope(|mut scope| {
                 let handle = scope.streams().resident().handle(id).expect("resident");
@@ -474,12 +450,9 @@ fn reset_reconciles_final_credit_quantum() {
             now = server
                 .view()
                 .send_at(now + Duration::from_millis(1));
-            Peer::new(&mut space, &mut server)
-                .try_send(&mut client, now, certificate)
+            try_send(&mut space, &mut server, &mut client, now, certificate)
                 .expect("reset transfer");
-            Ingress::new(&mut h3)
-                .try_receive(&mut client)
-                .expect("replace queued terminal with peer reset");
+            try_receive(&mut h3, &mut client).expect("replace queued terminal with peer reset");
         } else {
             client.with_scope(|mut scope| {
                 assert!(matches!(
@@ -598,12 +571,9 @@ fn rejected_stream_absorbs_inflight_data() {
                 .view()
                 .send_at(now + Duration::from_millis(1));
             // Keep the server's STOP/RESET packets queued: the peer may still send.
-            Peer::new(&mut space, &mut client)
-                .try_send(&mut server, now, certificate)
+            try_send(&mut space, &mut client, &mut server, now, certificate)
                 .expect("native request transfer");
-            Ingress::new(&mut h3)
-                .try_receive(&mut server)
-                .expect("native request ingress");
+            try_receive(&mut h3, &mut server).expect("native request ingress");
             server.with_scope(|mut scope| {
                 loop {
                     let step = h3
@@ -620,10 +590,10 @@ fn rejected_stream_absorbs_inflight_data() {
                                     Event::Rejected {
                                         stream_id,
                                         error:
-                                            ContentError::Exceeded {
+                                            Rejection::Content(ContentError::Exceeded {
                                                 remaining: 0,
                                                 actual: 1,
-                                            },
+                                            }),
                                     },
                                 ) if *stream_id == bad => 1,
                                 (1, Event::Headers { message, .. })
@@ -692,13 +662,10 @@ fn raw_unknown_uni_releases_binding() {
             send.id()
         });
         let mut now = server.view().send_at(Instant::now());
-        Peer::new(&mut space, &mut server)
-            .try_send(&mut client, now, certificate)
+        try_send(&mut space, &mut server, &mut client, now, certificate)
             .expect("unknown stream transfer");
         if parsed {
-            Ingress::new(&mut h3)
-                .try_receive(&mut client)
-                .expect("unknown stream ingress");
+            try_receive(&mut h3, &mut client).expect("unknown stream ingress");
             client.with_scope(|mut scope| {
                 assert!(matches!(
                     h3.ingress().consume(&mut scope, |_| ()),
@@ -719,12 +686,9 @@ fn raw_unknown_uni_releases_binding() {
         now = server
             .view()
             .send_at(now + Duration::from_millis(1));
-        Peer::new(&mut space, &mut server)
-            .try_send(&mut client, now, certificate)
+        try_send(&mut space, &mut server, &mut client, now, certificate)
             .expect("terminal transfer");
-        Ingress::new(&mut h3)
-            .try_receive(&mut client)
-            .expect("terminal ingress");
+        try_receive(&mut h3, &mut client).expect("terminal ingress");
         client.with_scope(|mut scope| {
             let event = h3
                 .ingress()

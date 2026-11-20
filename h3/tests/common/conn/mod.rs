@@ -1,11 +1,8 @@
 use sark_http::field::literal;
 pub mod bridge;
 pub mod build;
-mod events;
 pub mod native;
-pub use events::Events;
 pub mod payload;
-pub mod wire;
 
 use dope_quic::wire::stream::Id;
 use o3::buffer::hold;
@@ -13,12 +10,28 @@ use sark_core::manifold::stream::Boundary;
 use sark_h3::conn::{
     self,
     event::{Event, Role, Token},
-    io::{Receive, Send},
+    io::{Receive, Send, Step},
     options::{self, Config, Protocol},
 };
-use sark_http::field::metadata::block::Connect;
+use sark_http::field::metadata::{
+    block::Connect,
+    section::{rules, state::Selected},
+};
 
 use crate::common::{conn::payload::Write as _, field::entry, message::capacity::Capacity as _};
+
+/// Exhaustive event adapter for deterministic tests.
+pub fn next_event<'d, P: rules::Policy, A: rules::Push>(
+    conn: &mut conn::Connection<'d, P, A>,
+) -> Result<Option<Event<'d, Selected<P>, P::Block, Token>>, conn::Error> {
+    loop {
+        match conn.events().poll_token()? {
+            Step::Item(event) => return Ok(Some(event)),
+            Step::More => {}
+            Step::Idle => return Ok(None),
+        }
+    }
+}
 
 pub trait Connection: Sized {
     fn try_limited() -> Result<Self, options::Error>;
@@ -80,10 +93,7 @@ impl<'d> Connection for conn::Connection<'d> {
         Receive::new(&mut receiver)
             .owned(stream, write.into_bytes(), Boundary::More)
             .map_err(Request::Connection)?;
-        let event = match Events::new(&mut receiver)
-            .poll_token()
-            .map_err(Request::Connection)?
-        {
+        let event = match next_event(&mut receiver).map_err(Request::Connection)? {
             Some(Event::Headers { message, .. }) => Some(message.stream_id()),
             _ => None,
         };

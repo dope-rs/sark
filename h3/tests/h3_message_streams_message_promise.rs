@@ -2,7 +2,7 @@ use sark_h3::{conn::io::Send, frame::ErrorCode};
 use sark_http::field::literal;
 
 use crate::common::{
-    conn::{Events, build::Fields as _},
+    conn::{build::Fields as _, next_event},
     field::entry,
     message::{
         Frame as _,
@@ -50,7 +50,7 @@ fn promise_requires_request() {
         .owned(Id::new(0).expect("stream id"), promise, Boundary::More)
         .expect("request-stream push promise must be valid");
     assert!(
-        matches!(Events::new(&mut conn).poll_token().expect("push promise must poll"), Some(Event::PushPromise {
+        matches!(next_event(&mut conn).expect("push promise must poll"), Some(Event::PushPromise {
             message,
             push_id: 17,
             ..
@@ -74,7 +74,7 @@ fn promise_requires_request() {
         )
         .expect("promise for the inspected push");
     assert!(matches!(
-        Events::new(&mut conn).poll_token().expect("push promise"),
+        next_event(&mut conn).expect("push promise"),
         Some(Event::PushPromise { push_id: 9, .. })
     ));
     assert!(
@@ -113,13 +113,13 @@ fn final_promise_owns_fin() {
         .expect("final push promise request stream must be valid");
 
     assert!(
-        matches!(Events::new(&mut conn).poll_token().expect("initial headers must poll"), Some(Event::Headers {
+        matches!(next_event(&mut conn).expect("initial headers must poll"), Some(Event::Headers {
             message,
             ..
         }) if message.boundary() == Boundary::More)
     );
     assert!(
-        matches!(Events::new(&mut conn).poll_token().expect("final push promise must poll"), Some(Event::PushPromise {
+        matches!(next_event(&mut conn).expect("final push promise must poll"), Some(Event::PushPromise {
             message,
             push_id: 17,
             ..
@@ -127,8 +127,7 @@ fn final_promise_owns_fin() {
             && matches!(message.boundary(), Boundary::End))
     );
     assert!(
-        Events::new(&mut conn)
-            .poll_token()
+        next_event(&mut conn)
             .expect("drained request stream must poll")
             .is_none()
     );
@@ -161,14 +160,14 @@ fn reset_preserves_admitted_promise() {
             .reset(Id::ZERO, Some(Id::ZERO.into()), code)
             .expect("parent reset");
         assert!(matches!(
-            Events::new(&mut conn).poll_token().expect("preserved promise"),
+            next_event(&mut conn).expect("preserved promise"),
             Some(Event::PushPromise { message, push_id: 0, head })
                 if message.stream_id() == Id::ZERO.into()
                     && message.boundary() == Boundary::More
                     && head.fields().get(b":path") == Some(b"/asset".as_slice())
         ));
         assert!(matches!(
-            Events::new(&mut conn).poll_token().expect("parent terminal"),
+            next_event(&mut conn).expect("parent terminal"),
             Some(Event::Reset { stream_id, error_code, .. })
                 if stream_id == Id::ZERO.into() && error_code == code
         ));
@@ -180,7 +179,7 @@ fn reset_preserves_admitted_promise() {
             )
             .expect("independent push remains live");
         assert!(matches!(
-            Events::new(&mut conn).poll_token().expect("push response"),
+            next_event(&mut conn).expect("push response"),
             Some(Event::PushHeaders { message, push_id: 0, .. })
                 if message.boundary() == Boundary::End
         ));
@@ -217,8 +216,7 @@ fn missing_policy_cancels() {
         .expect("well-formed unauthorized promise must be consumed");
 
     assert!(
-        Events::new(&mut conn)
-            .poll_token()
+        next_event(&mut conn)
             .expect("cancelled promise must poll")
             .is_none()
     );
@@ -276,8 +274,7 @@ fn invalid_origin_cancels() {
             .expect("well-formed foreign promise must be consumed");
 
         assert!(
-            Events::new(&mut conn)
-                .poll_token()
+            next_event(&mut conn)
                 .expect("cancelled promise must poll")
                 .is_none()
         );
@@ -338,8 +335,7 @@ fn unsafe_promise_cancels() {
             .owned(Id::new(0).expect("stream id"), promise, Boundary::More)
             .expect("well-formed unsafe promise must be consumed");
         assert!(
-            Events::new(&mut conn)
-                .poll_token()
+            next_event(&mut conn)
                 .expect("cancelled promise must poll")
                 .is_none()
         );
@@ -397,13 +393,11 @@ fn settings_are_unique() {
         .owned(Id::new(2).expect("stream id"), wire, Boundary::More)
         .expect("first settings frame must be accepted");
     assert!(matches!(
-        Events::new(&mut conn)
-            .poll_token()
-            .expect("first settings frame must poll"),
+        next_event(&mut conn).expect("first settings frame must poll"),
         Some(Event::Settings(_))
     ));
     assert!(
-        matches!(Events::new(&mut conn).poll_token(), Err(error) if error.error_code() == ErrorCode::FrameUnexpected && error == Error::DuplicateSettings(Frame {
+        matches!(next_event(&mut conn), Err(error) if error.error_code() == ErrorCode::FrameUnexpected && error == Error::DuplicateSettings(Frame {
             stream_id: 2,
             kind: TYPE_SETTINGS.get(),
             role: Role::Server,
@@ -428,13 +422,11 @@ fn cancellation_ids() {
         )
         .expect("client control stream frames must parse through settings");
     assert!(matches!(
-        Events::new(&mut conn)
-            .poll_token()
-            .expect("client settings must poll"),
+        next_event(&mut conn).expect("client settings must poll"),
         Some(Event::Settings(_))
     ));
     assert!(matches!(
-        Events::new(&mut conn).poll_token(),
+        next_event(&mut conn),
         Ok(Some(Event::CancelPush { push_id: 17 }))
     ));
 
@@ -453,7 +445,7 @@ fn cancellation_ids() {
         )
         .expect("server cancel-push control stream must be valid");
     assert!(matches!(
-        Events::new(&mut conn).poll_token(),
+        next_event(&mut conn),
         Ok(Some(Event::CancelPush { push_id: 17 }))
     ));
 }

@@ -185,7 +185,7 @@ where
         }
     }
 
-    fn rejected(mut self, resident: Presence<'scope>, error: block::ContentError) {
+    fn rejected(mut self, resident: Presence<'scope>, error: event::Rejection) {
         let (resident, id) = match self.resolve(&resident) {
             Ok(bound) => bound,
             Err(error) => {
@@ -194,10 +194,7 @@ where
             }
         };
         let stream = id.stream_id();
-        self.life.diagnostic(&crate::conn::Error::Content {
-            stream_id: stream.get(),
-            error,
-        });
+        self.life.diagnostic(&error.into_error(stream));
         if let Err(error) = self.state.h3.ingress().reject(self.conn, stream) {
             manifold::close_connection_scoped(self.conn, error.code());
             return;

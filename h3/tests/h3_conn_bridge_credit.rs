@@ -2,10 +2,7 @@ use sark_h3::qpack::encoder::Encoder;
 use sark_http::field::literal;
 
 use crate::common::{
-    conn::{
-        bridge::{Pair, certificate},
-        wire::{Ingress, Peer},
-    },
+    conn::bridge::{Pair, certificate, try_receive, try_send},
     field::entry,
 };
 
@@ -111,12 +108,9 @@ fn blocked_credit_is_split() {
     assert_eq!(stream.get(), 0);
 
     let req_at = Instant::now();
-    Peer::new(&mut space, &mut client)
-        .try_send(&mut server, req_at, certificate)
+    try_send(&mut space, &mut client, &mut server, req_at, certificate)
         .expect("QUIC bridge transfer");
-    Ingress::new(&mut h3)
-        .try_receive(&mut server)
-        .expect("HTTP/3 bridge ingress");
+    try_receive(&mut h3, &mut server).expect("HTTP/3 bridge ingress");
     server.with_scope(|mut scope| {
         assert!(matches!(
             h3.ingress()
@@ -126,15 +120,11 @@ fn blocked_credit_is_split() {
         ));
     });
 
-    Peer::new(&mut space, &mut server)
-        .try_send(&mut client, req_at, certificate)
+    try_send(&mut space, &mut server, &mut client, req_at, certificate)
         .expect("QUIC bridge transfer");
-    Peer::new(&mut space, &mut client)
-        .try_send(&mut server, req_at, certificate)
+    try_send(&mut space, &mut client, &mut server, req_at, certificate)
         .expect("QUIC bridge transfer");
-    Ingress::new(&mut h3)
-        .try_receive(&mut server)
-        .expect("HTTP/3 bridge ingress");
+    try_receive(&mut h3, &mut server).expect("HTTP/3 bridge ingress");
     server.with_scope(|mut scope| {
         assert!(matches!(
             h3.ingress()
@@ -158,12 +148,9 @@ fn blocked_credit_is_split() {
     });
     assert_eq!(qpack_id.get(), 2);
     let enc_at = req_at + Duration::from_millis(1);
-    Peer::new(&mut space, &mut client)
-        .try_send(&mut server, enc_at, certificate)
+    try_send(&mut space, &mut client, &mut server, enc_at, certificate)
         .expect("QUIC bridge transfer");
-    Ingress::new(&mut h3)
-        .try_receive(&mut server)
-        .expect("HTTP/3 bridge ingress");
+    try_receive(&mut h3, &mut server).expect("HTTP/3 bridge ingress");
     server.with_scope(|mut scope| {
         let headers = h3.ingress().consume(&mut scope, |event| {
             matches!(event, Event::Headers { message, .. } if message.stream_id() == Id::ZERO)
@@ -177,15 +164,11 @@ fn blocked_credit_is_split() {
         ));
     });
 
-    Peer::new(&mut space, &mut server)
-        .try_send(&mut client, enc_at, certificate)
+    try_send(&mut space, &mut server, &mut client, enc_at, certificate)
         .expect("QUIC bridge transfer");
-    Peer::new(&mut space, &mut client)
-        .try_send(&mut server, enc_at, certificate)
+    try_send(&mut space, &mut client, &mut server, enc_at, certificate)
         .expect("QUIC bridge transfer");
-    Ingress::new(&mut h3)
-        .try_receive(&mut server)
-        .expect("HTTP/3 bridge ingress");
+    try_receive(&mut h3, &mut server).expect("HTTP/3 bridge ingress");
     server.with_scope(|mut scope| {
         let data = h3
             .ingress()

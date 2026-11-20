@@ -4,7 +4,7 @@ use dope_quic::wire::{stream::Id, varint::VarInt};
 use sark_http::field::literal;
 
 use crate::common::{
-    conn::{Events, build::Fields as _},
+    conn::{build::Fields as _, next_event},
     field::entry,
     message::{
         Frame as _,
@@ -63,16 +63,14 @@ fn fragmented_decode() {
             .expect("each fragment must extend the valid request frame");
     }
 
-    assert!(matches!(Events::new(&mut conn)
-            .poll_token()
+    assert!(matches!(next_event(&mut conn)
             .expect("fragmented request must poll"), Some(Event::Headers {
             section: Section::Initial,
             message,
             ..
         }) if matches!(message.boundary(), Boundary::End)));
     assert!(
-        Events::new(&mut conn)
-            .poll_token()
+        next_event(&mut conn)
             .expect("drained fragmented request must poll")
             .is_none()
     );
@@ -109,30 +107,26 @@ fn streams_share_states() {
     Receive::new(&mut conn)
         .owned(Id::new(0).expect("stream id"), wire, Boundary::End)
         .expect("fixed request stream must be valid");
-    assert!(matches!(Events::new(&mut conn)
-            .poll_token()
+    assert!(matches!(next_event(&mut conn)
             .expect("request headers must poll"), Some(Event::Headers {
             section: Section::Initial,
             message,
             ..
         }) if message.boundary() == Boundary::More));
-    assert!(matches!(Events::new(&mut conn)
-            .poll_token()
+    assert!(matches!(next_event(&mut conn)
             .expect("request body must poll"), Some(Event::Data {
             data,
             message,
             ..
         }) if data.segments().flatten().copied().eq(b"body".iter().copied()) && message.boundary() == Boundary::More));
-    assert!(matches!(Events::new(&mut conn)
-            .poll_token()
+    assert!(matches!(next_event(&mut conn)
             .expect("request trailers must poll"), Some(Event::Headers {
             section: Section::Trailing,
             message,
             ..
         }) if matches!(message.boundary(), Boundary::End)));
     assert!(
-        Events::new(&mut conn)
-            .poll_token()
+        next_event(&mut conn)
             .expect("drained request stream must poll")
             .is_none()
     );
@@ -170,9 +164,7 @@ fn streams_share_states() {
         )
         .expect("promise admission");
     assert!(matches!(
-        Events::new(&mut conn)
-            .poll_token()
-            .expect("accepted promise"),
+        next_event(&mut conn).expect("accepted promise"),
         Some(Event::PushPromise { push_id: 9, .. })
     ));
     Receive::new(&mut conn)
@@ -185,24 +177,21 @@ fn streams_share_states() {
             Boundary::End,
         )
         .expect("fixed push stream must be valid");
-    assert!(matches!(Events::new(&mut conn)
-            .poll_token()
+    assert!(matches!(next_event(&mut conn)
             .expect("push headers must poll"), Some(Event::PushHeaders {
             push_id: 9,
             section: Section::Initial,
             message,
             ..
         }) if message.boundary() == Boundary::More));
-    assert!(matches!(Events::new(&mut conn)
-            .poll_token()
+    assert!(matches!(next_event(&mut conn)
             .expect("push body must poll"), Some(Event::PushData {
             push_id: 9,
             data,
             message,
             ..
         }) if data.segments().flatten().copied().eq(b"body".iter().copied()) && message.boundary() == Boundary::More));
-    assert!(matches!(Events::new(&mut conn)
-            .poll_token()
+    assert!(matches!(next_event(&mut conn)
             .expect("push trailers must poll"), Some(Event::PushHeaders {
             push_id: 9,
             section: Section::Trailing,
@@ -210,8 +199,7 @@ fn streams_share_states() {
             ..
         }) if matches!(message.boundary(), Boundary::End)));
     assert!(
-        Events::new(&mut conn)
-            .poll_token()
+        next_event(&mut conn)
             .expect("drained push stream must poll")
             .is_none()
     );

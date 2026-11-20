@@ -19,7 +19,7 @@ use sark_http::field::{
 };
 
 use crate::common::{
-    conn::{Events, build::Fields as _},
+    conn::{build::Fields as _, next_event},
     field::entry,
     ledger::owner::Held,
     message::promise::{Authority, Push as _},
@@ -60,12 +60,7 @@ fn server_bidi_admission() {
         assert_eq!(error.error_code(), ErrorCode::StreamCreation);
         assert!(charge.is_empty());
     }
-    assert!(
-        Events::new(&mut conn)
-            .poll_token()
-            .expect("no events")
-            .is_none()
-    );
+    assert!(next_event(&mut conn).expect("no events").is_none());
     Send::new(&mut conn)
         .headers(
             Id::ZERO,
@@ -104,7 +99,7 @@ fn push_id_retirement() {
             .borrowed(Id::ZERO, &promise, Boundary::More)
             .expect("promise before fragmented stream");
         assert!(matches!(
-            Events::new(&mut conn).poll_token().expect("promise event"),
+            next_event(&mut conn).expect("promise event"),
             Some(Event::PushPromise {
                 push_id: VarInt::MAX,
                 ..
@@ -120,7 +115,7 @@ fn push_id_retirement() {
             .borrowed(id, &headers, boundary)
             .expect("admitted push continuation");
         assert!(matches!(
-            Events::new(&mut conn).poll_token().expect("push headers"),
+            next_event(&mut conn).expect("push headers"),
             Some(Event::PushHeaders {
                 push_id: VarInt::MAX,
                 ..
@@ -178,11 +173,11 @@ fn push_history_capacity() {
         )
         .expect("parent completion");
     assert!(matches!(
-        Events::new(&mut conn).poll_token().expect("parent headers"),
+        next_event(&mut conn).expect("parent headers"),
         Some(Event::Headers { .. })
     ));
     assert!(matches!(
-        Events::new(&mut conn).poll_token().expect("promise event"),
+        next_event(&mut conn).expect("promise event"),
         Some(Event::PushPromise { push_id: 0, .. })
     ));
     Receive::new(&mut conn)
@@ -193,7 +188,7 @@ fn push_history_capacity() {
         )
         .expect("first push");
     assert!(matches!(
-        Events::new(&mut conn).poll_token().expect("push headers"),
+        next_event(&mut conn).expect("push headers"),
         Some(Event::PushHeaders { push_id: 0, .. })
     ));
     let error = Receive::new(&mut conn)
@@ -232,7 +227,7 @@ fn repeated_push_promises() {
             )
             .expect("repeated promise");
         assert!(matches!(
-            Events::new(&mut conn).poll_token().expect("promise event"),
+            next_event(&mut conn).expect("promise event"),
             Some(Event::PushPromise { push_id: 0, .. })
         ));
     }
@@ -247,7 +242,7 @@ fn repeated_push_promises() {
         )
         .expect("push after repeated promises");
     assert!(matches!(
-        Events::new(&mut conn).poll_token().expect("push headers"),
+        next_event(&mut conn).expect("push headers"),
         Some(Event::PushHeaders { push_id: 0, .. })
     ));
     Receive::new(&mut conn)
@@ -258,7 +253,7 @@ fn repeated_push_promises() {
         )
         .expect("promise after received push");
     assert!(matches!(
-        Events::new(&mut conn).poll_token().expect("promise event"),
+        next_event(&mut conn).expect("promise event"),
         Some(Event::PushPromise { push_id: 0, .. })
     ));
 }
@@ -300,14 +295,13 @@ fn promise_fields_match() {
         } else {
             result.expect("same decompressed fields");
             assert!(matches!(
-                Events::new(&mut conn).poll_token().expect("promise event"),
+                next_event(&mut conn).expect("promise event"),
                 Some(Event::PushPromise { push_id: 0, .. })
             ));
         }
     }
     assert!(
-        Events::new(&mut conn)
-            .poll_token()
+        next_event(&mut conn)
             .expect("no mismatched event")
             .is_none()
     );
@@ -354,14 +348,13 @@ fn discarded_promise_match() {
         } else {
             result.expect("same discarded fields");
             assert!(matches!(
-                Events::new(&mut conn).poll_token().expect("promise event"),
+                next_event(&mut conn).expect("promise event"),
                 Some(Event::PushPromise { push_id: 0, .. })
             ));
         }
     }
     assert!(
-        Events::new(&mut conn)
-            .poll_token()
+        next_event(&mut conn)
             .expect("no mismatched event")
             .is_none()
     );
@@ -397,8 +390,7 @@ fn stream_before_promise() {
             .expect("push before promise");
         assert!(Receive::new(&mut conn).is_blocked(id));
         assert!(
-            Events::new(&mut conn)
-                .poll_token()
+            next_event(&mut conn)
                 .expect("wait for promised method")
                 .is_none()
         );
@@ -407,7 +399,7 @@ fn stream_before_promise() {
                 .reset(id, None, Code::from_u16(0))
                 .expect("reset before promise");
             assert!(matches!(
-                Events::new(&mut conn).poll_token().expect("reset event"),
+                next_event(&mut conn).expect("reset event"),
                 Some(Event::Reset { .. })
             ));
         }
@@ -422,21 +414,18 @@ fn stream_before_promise() {
         }
         for _ in 0..2 {
             assert!(matches!(
-                Events::new(&mut conn).poll_token().expect("promise event"),
+                next_event(&mut conn).expect("promise event"),
                 Some(Event::PushPromise { push_id: 0, .. })
             ));
         }
         if !reset {
             assert!(matches!(
-                Events::new(&mut conn)
-                    .poll_token()
-                    .expect("HEAD push without DATA"),
+                next_event(&mut conn).expect("HEAD push without DATA"),
                 Some(Event::PushHeaders { push_id: 0, .. })
             ));
         }
         assert!(
-            Events::new(&mut conn)
-                .poll_token()
+            next_event(&mut conn)
                 .expect("single wake and no retired push")
                 .is_none()
         );

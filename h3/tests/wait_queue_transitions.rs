@@ -1,5 +1,5 @@
 use crate::common::{
-    conn::Events,
+    conn::next_event,
     message::{Frame as _, promise::Authority},
 };
 
@@ -43,8 +43,6 @@ fn waiter_removal() {
             .is_ok()
     );
     let _ = conn.events().poll_token().expect("clear reset");
-    assert!(
-        matches!(Events::new(&mut conn).poll_token().expect("ready"),
-        Some(Event::Headers { message, .. }) if message.stream_id() == second.into())
-    );
+    assert!(matches!(next_event(&mut conn).expect("ready"),
+        Some(Event::Headers { message, .. }) if message.stream_id() == second.into()));
 }

@@ -4,7 +4,7 @@ use std::cell::Cell;
 
 use common::{
     atomic::{Setup, content::Body},
-    conn::{Events, build::Fields as _, payload::Write as _},
+    conn::{build::Fields as _, next_event, payload::Write as _},
     field::entry,
     message::{
         Frame as _,
@@ -16,7 +16,7 @@ use sark_core::manifold::stream::Boundary;
 use sark_h3::{
     conn::{
         Connection, Error,
-        event::{Event, Frame, Phase, Role, Site, Violation},
+        event::{Event, Frame, Phase, Rejection, Role, Site, Violation},
         io::{Receive, Send},
     },
     frame::{Payload, TYPE_DATA, TYPE_PUSH_PROMISE},
@@ -162,7 +162,7 @@ fn connect_content() {
             )
             .expect("CONNECT");
         assert!(matches!(
-            Events::new(&mut conn).poll_token().expect("request"),
+            next_event(&mut conn).expect("request"),
             Some(Event::Headers { .. })
         ));
         Receive::new(&mut conn)
@@ -173,7 +173,7 @@ fn connect_content() {
             )
             .expect("CONNECT input is tunnel data before the response");
         assert!(matches!(
-            Events::new(&mut conn).poll_token().expect("tunnel input"),
+            next_event(&mut conn).expect("tunnel input"),
             Some(Event::Data { data, .. }) if data.len() == 6
         ));
         let encoder = Encoder::new(&mut conn, Target::new(Id::ZERO), Method::Connect);
@@ -249,8 +249,7 @@ fn received_content_uses_originating_method() {
         Receive::new(&mut conn)
             .owned(Id::ZERO, head, boundary)
             .expect("response ingress");
-        let event = Events::new(&mut conn)
-            .poll_token()
+        let event = next_event(&mut conn)
             .expect("response event")
             .expect("response");
         let content = match event {
@@ -266,14 +265,14 @@ fn received_content_uses_originating_method() {
                             Boundary::End,
                         )
                         .expect("response DATA ingress");
-                    Events::new(&mut conn).poll_token().expect("content event")
+                    next_event(&mut conn).expect("content event")
                 }
             }
             event => Some(event),
         };
         match expected {
             Some(error) => assert!(matches!(content,
-                Some(Event::Rejected { stream_id, error: actual })
+                Some(Event::Rejected { stream_id, error: Rejection::Content(actual) })
                     if stream_id == Id::ZERO.into() && actual == error
             )),
             None => {
@@ -289,8 +288,7 @@ fn received_content_uses_originating_method() {
             }
         }
         assert!(
-            Events::new(&mut conn)
-                .poll_token()
+            next_event(&mut conn)
                 .expect("no extra response events")
                 .is_none()
         );
@@ -320,7 +318,7 @@ fn connect_rejects_push_promise() {
         )
         .expect("CONNECT response");
     assert!(matches!(
-        Events::new(&mut conn).poll_token().expect("response"),
+        next_event(&mut conn).expect("response"),
         Some(Event::Headers { .. })
     ));
     let promise = VarInt::ZERO

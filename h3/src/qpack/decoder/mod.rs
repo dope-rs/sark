@@ -55,10 +55,6 @@ type Decoded<P> = Message<Selected<P>, <P as Policy>::Block>;
 pub enum Error {
     Allocation(alloc::Error),
     FieldWrite(consume::Error),
-    FieldValidation {
-        planned: block::Validation,
-        sealed: block::Validation,
-    },
     Lower(lower::Error),
     Incomplete {
         available: usize,
@@ -296,16 +292,10 @@ impl Decoder {
                 return Ok(Message::Blocked(required));
             }
         };
-        let (head, sealed, finished, response) = finished.into_parts();
-        if finished != sealed {
-            return Err(Error::FieldValidation {
-                planned: finished,
-                sealed,
-            });
-        }
+        let (head, _, validation, response) = finished.into_parts();
         Ok(Message::Ready {
             head,
-            validation: sealed,
+            validation,
             response,
         })
     }

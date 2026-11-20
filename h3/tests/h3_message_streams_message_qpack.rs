@@ -6,7 +6,7 @@ use sark_h3::frame::Header;
 use sark_http::field::literal;
 
 use crate::common::{
-    conn::{Connection as _, Events, build::Settings as _},
+    conn::{Connection as _, build::Settings as _, next_event},
     field::entry,
     message::{
         Frame as _,
@@ -127,8 +127,7 @@ fn blocked_streams_resume() {
         )
         .expect("blocked request stream must be valid");
     assert!(
-        Events::new(&mut conn)
-            .poll_token()
+        next_event(&mut conn)
             .expect("blocked request must poll")
             .is_none()
     );
@@ -140,15 +139,14 @@ fn blocked_streams_resume() {
         )
         .expect("request encoder stream must be valid");
     assert!(
-        matches!(Events::new(&mut conn).poll_token().expect("unblocked request must poll"), Some(Event::Headers {
+        matches!(next_event(&mut conn).expect("unblocked request must poll"), Some(Event::Headers {
             section: Section::Initial,
             message,
             ..
         }) if matches!(message.boundary(), Boundary::End))
     );
     assert!(
-        Events::new(&mut conn)
-            .poll_token()
+        next_event(&mut conn)
             .expect("drained request must poll")
             .is_none()
     );
@@ -181,9 +179,7 @@ fn blocked_streams_resume() {
         )
         .expect("promise admission");
     assert!(matches!(
-        Events::new(&mut conn)
-            .poll_token()
-            .expect("accepted promise"),
+        next_event(&mut conn).expect("accepted promise"),
         Some(Event::PushPromise { push_id: 11, .. })
     ));
     Receive::new(&mut conn)
@@ -197,8 +193,7 @@ fn blocked_streams_resume() {
         )
         .expect("blocked push stream must be valid");
     assert!(
-        Events::new(&mut conn)
-            .poll_token()
+        next_event(&mut conn)
             .expect("blocked push must poll")
             .is_none()
     );
@@ -209,9 +204,7 @@ fn blocked_streams_resume() {
             Boundary::More,
         )
         .expect("push encoder stream must be valid");
-    let event = Events::new(&mut conn)
-        .poll_token()
-        .expect("unblocked push must poll");
+    let event = next_event(&mut conn).expect("unblocked push must poll");
     assert!(
         matches!(&event, Some(Event::PushHeaders {
                 push_id: 11,
@@ -222,8 +215,7 @@ fn blocked_streams_resume() {
         "unblocked push must preserve its final initial headers"
     );
     assert!(
-        Events::new(&mut conn)
-            .poll_token()
+        next_event(&mut conn)
             .expect("drained push must poll")
             .is_none()
     );
@@ -257,8 +249,7 @@ fn fragments_release() {
         .owned(Id::new(0).expect("stream id"), wire, Boundary::More)
         .expect("blocked request frame must be valid");
     assert!(
-        Events::new(&mut conn)
-            .poll_token()
+        next_event(&mut conn)
             .expect("blocked fragmented request must poll")
             .is_none()
     );
@@ -274,9 +265,7 @@ fn fragments_release() {
             .expect("each encoder fragment must extend valid instructions");
     }
     assert!(matches!(
-        Events::new(&mut conn)
-            .poll_token()
-            .expect("released request must poll"),
+        next_event(&mut conn).expect("released request must poll"),
         Some(Event::Headers {
             section: Section::Initial,
             ..
@@ -316,7 +305,7 @@ fn peer_bounds_capacity() {
         )
         .expect("fixed peer settings stream must be valid");
     assert!(
-        matches!(Events::new(&mut conn).poll_token(), Ok(Some(Event::Settings(settings))) if settings == peer)
+        matches!(next_event(&mut conn), Ok(Some(Event::Settings(settings))) if settings == peer)
     );
     conn.control()
         .set_capacity(64)
@@ -380,7 +369,7 @@ fn capacity_change_atomic() {
         )
         .expect("fixed peer settings stream must be valid");
     assert!(
-        matches!(Events::new(&mut conn).poll_token(), Ok(Some(Event::Settings(settings))) if settings == peer)
+        matches!(next_event(&mut conn), Ok(Some(Event::Settings(settings))) if settings == peer)
     );
 
     assert!(matches!(

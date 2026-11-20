@@ -213,13 +213,7 @@ impl<Q> Client<'_, Q> {
                     match event {
                         Event::Settings(_) if !link.sent => {}
                         Event::Rejected { stream_id, error } => {
-                            return Err(Failure::Receive(
-                                sark_h3::conn::Error::Content {
-                                    stream_id: stream_id.get(),
-                                    error: *error,
-                                }
-                                .into(),
-                            ));
+                            return Err(Failure::Receive(error.into_error(*stream_id).into()));
                         }
                         Event::Headers { message, head, .. } => {
                             let stream = message.stream_id();

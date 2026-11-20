@@ -3,7 +3,7 @@ use sark_h3::VarInt;
 use sark_http::field::literal;
 
 use crate::common::{
-    conn::{Connection as _, Events},
+    conn::{Connection as _, next_event},
     field::entry,
     message::{
         capacity::{Capacity as _, Request},
@@ -53,12 +53,7 @@ fn reuses_bounded_queues() {
             }
     );
     assert!(charge.is_empty());
-    assert!(
-        Events::new(&mut events)
-            .poll_token()
-            .expect("capacity event")
-            .is_some()
-    );
+    assert!(next_event(&mut events).expect("capacity event").is_some());
     let result =
         Receive::new(&mut events).stop(Id::new(4).expect("stream ID"), None, Code::from_u16(1));
     assert!(
@@ -126,12 +121,7 @@ fn headers_share_slot() {
     ))
     .expect("capacity fixture satisfies its declared invariants");
     headers(&mut conn, Id::new(0).expect("stream ID"), Boundary::End);
-    assert!(
-        Events::new(&mut conn)
-            .poll_token()
-            .expect("capacity event")
-            .is_none()
-    );
+    assert!(next_event(&mut conn).expect("capacity event").is_none());
 }
 
 #[test]
@@ -145,17 +135,12 @@ fn coalesced_is_atomic() {
     .expect("capacity fixture satisfies its declared invariants");
     headers(&mut conn, Id::new(0).expect("stream ID"), Boundary::More);
     assert!(
-        matches!(Events::new(&mut conn).poll_token().expect("capacity event"), Some(Event::Data { message, data })
+        matches!(next_event(&mut conn).expect("capacity event"), Some(Event::Data { message, data })
             if message.stream_id() == Id::new(0).expect("stream ID").into()
                 && message.boundary() == Boundary::End
                 && data.segments().flatten().copied().eq(b"body".iter().copied()))
     );
-    assert!(
-        Events::new(&mut conn)
-            .poll_token()
-            .expect("capacity event")
-            .is_none()
-    );
+    assert!(next_event(&mut conn).expect("capacity event").is_none());
 }
 
 #[test]
@@ -241,29 +226,24 @@ fn ready_streams_rotate() {
 
     headers(&mut conn, Id::new(0).expect("stream ID"), Boundary::More);
     assert!(
-        matches!(Events::new(&mut conn).poll_token().expect("capacity event"), Some(Event::Data { message, data })
+        matches!(next_event(&mut conn).expect("capacity event"), Some(Event::Data { message, data })
             if message.stream_id() == Id::new(0).expect("stream ID").into() && data.segments().flatten().copied().eq(b"a".iter().copied()))
     );
     headers(&mut conn, Id::new(4).expect("stream ID"), Boundary::End);
     assert!(
-        matches!(Events::new(&mut conn).poll_token().expect("capacity event"), Some(Event::Data { message, data })
+        matches!(next_event(&mut conn).expect("capacity event"), Some(Event::Data { message, data })
             if message.stream_id() == Id::new(0).expect("stream ID").into()
                 && data.segments().flatten().copied().eq(b"b".iter().copied())
                 && matches!(message.boundary(), Boundary::End))
     );
-    assert!(
-        Events::new(&mut conn)
-            .poll_token()
-            .expect("capacity event")
-            .is_none()
-    );
+    assert!(next_event(&mut conn).expect("capacity event").is_none());
 }
 
 #[test]
 fn segmentation_matches() {
     fn drain(conn: &mut Connection<'static>) -> Vec<(u8, Boundary, Vec<u8>)> {
         let mut events = Vec::new();
-        while let Some(event) = Events::new(conn).poll_token().expect("capacity event") {
+        while let Some(event) = next_event(conn).expect("capacity event") {
             match event {
                 Event::Headers { message, .. } => {
                     events.push((0, message.boundary(), Vec::new()));
@@ -299,8 +279,7 @@ fn segmentation_matches() {
         Boundary::More,
     ))
     .expect("capacity fixture satisfies its declared invariants");
-    let first = Events::new(&mut split)
-        .poll_token()
+    let first = next_event(&mut split)
         .expect("capacity event")
         .expect("fragmented headers event is present");
     let message = match first {
@@ -358,29 +337,25 @@ fn push_is_atomic() {
         .owned(Id::ZERO, origin, Boundary::End)
         .expect("finished origin and promise");
     assert!(matches!(
-        Events::new(&mut conn)
-            .poll_token()
-            .expect("origin response"),
+        next_event(&mut conn).expect("origin response"),
         Some(Event::Headers { .. })
     ));
     assert!(matches!(
-        Events::new(&mut conn)
-            .poll_token()
-            .expect("accepted promise"),
+        next_event(&mut conn).expect("accepted promise"),
         Some(Event::PushPromise { push_id: 0, .. })
     ));
     (Receive::new(&mut conn).owned(Id::new(3).expect("stream ID"), wire, Boundary::End))
         .expect("capacity fixture satisfies its declared invariants");
 
     assert!(
-        matches!(Events::new(&mut conn).poll_token().expect("capacity event"), Some(Event::PushHeaders {
+        matches!(next_event(&mut conn).expect("capacity event"), Some(Event::PushHeaders {
             message,
             push_id: 0,
             ..
         }) if message.stream_id() == Id::new(3).expect("stream ID").into() && message.boundary() == Boundary::More)
     );
     assert!(
-        matches!(Events::new(&mut conn).poll_token().expect("capacity event"), Some(Event::PushData {
+        matches!(next_event(&mut conn).expect("capacity event"), Some(Event::PushData {
             message,
             push_id: 0,
             data,
@@ -388,12 +363,7 @@ fn push_is_atomic() {
             && matches!(message.boundary(), Boundary::End)
             && data.segments().flatten().copied().eq(b"push-body".iter().copied()))
     );
-    assert!(
-        Events::new(&mut conn)
-            .poll_token()
-            .expect("capacity event")
-            .is_none()
-    );
+    assert!(next_event(&mut conn).expect("capacity event").is_none());
 }
 
 #[test]
@@ -406,7 +376,7 @@ fn resume_reports_error() {
         .expect("capacity fixture satisfies its declared invariants");
     headers(&mut conn, Id::new(0).expect("stream ID"), Boundary::More);
     assert!(
-        matches!(Events::new(&mut conn).poll_token(), Err(error) if error == Error::FrameUnexpected(Violation::Receive(Frame {
+        matches!(next_event(&mut conn), Err(error) if error == Error::FrameUnexpected(Violation::Receive(Frame {
             stream_id: 0,
             kind: TYPE_SETTINGS.get(),
             role: Role::Server,
@@ -429,14 +399,9 @@ fn fin_uses_fallback() {
     (Receive::new(&mut conn).borrowed(Id::new(0).expect("stream ID"), &[], Boundary::End))
         .expect("capacity fixture satisfies its declared invariants");
     assert!(
-        matches!(Events::new(&mut conn).poll_token().expect("capacity event"), Some(Event::Finished { stream_id }) if stream_id == Id::new(0).expect("stream ID").into())
+        matches!(next_event(&mut conn).expect("capacity event"), Some(Event::Finished { stream_id }) if stream_id == Id::new(0).expect("stream ID").into())
     );
-    assert!(
-        Events::new(&mut conn)
-            .poll_token()
-            .expect("capacity event")
-            .is_none()
-    );
+    assert!(next_event(&mut conn).expect("capacity event").is_none());
 }
 
 #[test]
@@ -456,7 +421,7 @@ fn stream_slots_are_reused() {
         Receive::new(&mut conn).reset(Id::new(0).expect("stream ID"), None, Code::from_u16(0));
     assert!(result.is_ok(), "reset must retire the resident stream");
     assert!(
-        matches!(Events::new(&mut conn).poll_token().expect("capacity event"), Some(Event::Reset { stream_id, .. }) if stream_id == Id::new(0).expect("stream ID").into())
+        matches!(next_event(&mut conn).expect("capacity event"), Some(Event::Reset { stream_id, .. }) if stream_id == Id::new(0).expect("stream ID").into())
     );
     (Receive::new(&mut conn).borrowed(Id::new(4).expect("stream ID"), &[], Boundary::More))
         .expect("capacity fixture satisfies its declared invariants");
@@ -485,8 +450,7 @@ fn critical_is_singleton() {
 }
 
 fn headers(conn: &mut Connection<'_>, stream: Id, boundary: Boundary) {
-    let event = Events::new(conn)
-        .poll_token()
+    let event = next_event(conn)
         .expect("capacity event")
         .expect("request headers event is present");
     assert!(matches!(&event, Event::Headers {

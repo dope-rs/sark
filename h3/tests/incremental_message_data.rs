@@ -7,11 +7,10 @@ use std::{
 
 use common::{
     conn::{
-        Events,
-        bridge::Pair,
+        bridge::{Pair, try_receive, try_send},
         build::{Fields as _, Settings as _},
+        next_event,
         payload::Prefix as _,
-        wire::{Ingress, Peer},
     },
     field::entry,
     message::{Frame as _, capacity::Request},
@@ -25,7 +24,7 @@ use sark_core::manifold::stream::{Boundary, Section};
 use sark_h3::{
     conn::{
         Connection, Error,
-        event::{Completion, Event, Role},
+        event::{Completion, Event, Rejection, Role},
         io::{Receive, Resume, Step},
         options,
     },
@@ -60,7 +59,7 @@ fn data_releases_fragments() {
         )
         .expect("headers");
     assert!(matches!(
-        Events::new(&mut conn).poll_token().expect("headers"),
+        next_event(&mut conn).expect("headers"),
         Some(Event::Headers { .. })
     ));
 
@@ -78,12 +77,7 @@ fn data_releases_fragments() {
         let expected =
             (index + 1 == header.len()).then_some((Id::ZERO, header.len(), Resume::Idle));
         assert!(conn.events().poll_credit().expect("header credit") == expected);
-        assert!(
-            Events::new(&mut conn)
-                .poll_token()
-                .expect("no empty DATA")
-                .is_none()
-        );
+        assert!(next_event(&mut conn).expect("no empty DATA").is_none());
     }
 
     for boundary in [Boundary::More, Boundary::End] {
@@ -112,14 +106,11 @@ fn data_releases_fragments() {
                     .is_none()
             );
             assert!(matches!(
-                Events::new(&mut conn).poll_token().expect("queue vacancy"),
+                next_event(&mut conn).expect("queue vacancy"),
                 Some(Event::Stopped { .. })
             ));
         }
-        let event = Events::new(&mut conn)
-            .poll_token()
-            .expect("chunk")
-            .expect("DATA");
+        let event = next_event(&mut conn).expect("chunk").expect("DATA");
         let (message, data) = match event {
             Event::Data { message, data } => Some((message, data)),
             _ => None,
@@ -142,12 +133,7 @@ fn data_releases_fragments() {
                 .is_none()
         );
     }
-    assert!(
-        Events::new(&mut conn)
-            .poll_token()
-            .expect("one completion")
-            .is_none()
-    );
+    assert!(next_event(&mut conn).expect("one completion").is_none());
 }
 
 #[test]
@@ -200,7 +186,7 @@ fn content_length_rejects_inconsistent_body() {
             )
             .expect("headers");
         assert!(matches!(
-            Events::new(&mut conn).poll_token().expect("headers"),
+            next_event(&mut conn).expect("headers"),
             Some(Event::Headers { .. })
         ));
         if tail.is_some() {
@@ -212,7 +198,7 @@ fn content_length_rejects_inconsistent_body() {
                 )
                 .expect("body prefix");
             assert!(matches!(
-                Events::new(&mut conn).poll_token().expect("body prefix"),
+                next_event(&mut conn).expect("body prefix"),
                 Some(Event::Data { data: body, .. }) if body.len() == data.len()
             ));
         }
@@ -229,18 +215,17 @@ fn content_length_rejects_inconsistent_body() {
         }
         .expect("park until rejection can be published");
         assert!(matches!(
-            Events::new(&mut conn).poll_token().expect("queue vacancy"),
+            next_event(&mut conn).expect("queue vacancy"),
             Some(Event::Stopped { .. })
         ));
         assert!(matches!(
-            Events::new(&mut conn).poll_token().expect("stream rejection"),
-            Some(Event::Rejected { stream_id, error: actual })
+            next_event(&mut conn).expect("stream rejection"),
+            Some(Event::Rejected { stream_id, error: Rejection::Content(actual) })
                 if stream_id == Id::ZERO.into() && actual == error
         ));
         assert!(Receive::new(&mut conn).is_blocked(Id::ZERO));
         assert!(
-            Events::new(&mut conn)
-                .poll_token()
+            next_event(&mut conn)
                 .expect("no invalid payload or completion")
                 .is_none()
         );
@@ -261,12 +246,7 @@ fn unknown_releases_chunks() {
         Receive::new(&mut conn)
             .owned(id, initial, Boundary::More)
             .expect("initial frame");
-        assert!(
-            Events::new(&mut conn)
-                .poll_token()
-                .expect("initial event")
-                .is_some()
-        );
+        assert!(next_event(&mut conn).expect("initial event").is_some());
         let header = VarInt::from_u8(0x21)
             .try_prefix(VarInt::new(1024).expect("unknown length"))
             .expect("unknown header");
@@ -291,12 +271,7 @@ fn unknown_releases_chunks() {
                 .expect("settled credit")
                 .is_none()
         );
-        assert!(
-            Events::new(&mut conn)
-                .poll_token()
-                .expect("no unknown event")
-                .is_none()
-        );
+        assert!(next_event(&mut conn).expect("no unknown event").is_none());
         if id == Id::ZERO {
             Receive::new(&mut conn)
                 .owned(
@@ -305,7 +280,7 @@ fn unknown_releases_chunks() {
                     Boundary::End,
                 )
                 .expect("next frame");
-            assert!(matches!(Events::new(&mut conn).poll_token().expect("body"),
+            assert!(matches!(next_event(&mut conn).expect("body"),
                 Some(Event::Data { message, data }) if data.len() == 4 && message.boundary() == Boundary::End));
         } else {
             assert_eq!(
@@ -328,7 +303,7 @@ fn fin_rejects_remainder() {
                     Boundary::More,
                 )
                 .expect("headers");
-            let _ = Events::new(&mut conn).poll_token().expect("headers");
+            let _ = next_event(&mut conn).expect("headers");
             let header = kind.try_prefix(VarInt::from_u8(10)).expect("header");
             Receive::new(&mut conn)
                 .owned(Id::ZERO, header, Boundary::More)
@@ -343,8 +318,7 @@ fn fin_rejects_remainder() {
                 })
             );
             assert!(
-                Events::new(&mut conn)
-                    .poll_token()
+                next_event(&mut conn)
                     .expect("no premature completion")
                     .is_none()
             );
@@ -362,16 +336,14 @@ fn data_stops_at_trailers() {
             Boundary::More,
         )
         .expect("headers");
-    let _ = Events::new(&mut conn).poll_token().expect("headers");
+    let _ = next_event(&mut conn).expect("headers");
     let mut first = TYPE_DATA.try_prefix(VarInt::from_u8(4)).expect("header");
     first.extend_from_slice(b"ab");
     Receive::new(&mut conn)
         .owned(Id::ZERO, first, Boundary::More)
         .expect("first fragment");
-    assert!(
-        matches!(Events::new(&mut conn).poll_token().expect("first DATA"),
-        Some(Event::Data { message, data }) if data.len() == 2 && message.boundary() == Boundary::More)
-    );
+    assert!(matches!(next_event(&mut conn).expect("first DATA"),
+        Some(Event::Data { message, data }) if data.len() == 2 && message.boundary() == Boundary::More));
     let mut last = b"cd".to_vec();
     last.extend(
         [literal!(entry(b"x-trailer", b"done"))]
@@ -381,20 +353,11 @@ fn data_stops_at_trailers() {
     Receive::new(&mut conn)
         .owned(Id::ZERO, last, Boundary::End)
         .expect("DATA and trailers");
-    assert!(
-        matches!(Events::new(&mut conn).poll_token().expect("last DATA"),
-        Some(Event::Data { message, data }) if data.segments().flatten().copied().eq(b"cd".iter().copied()) && message.boundary() == Boundary::More)
-    );
-    assert!(
-        matches!(Events::new(&mut conn).poll_token().expect("trailers"),
-        Some(Event::Headers { message, section: Section::Trailing, .. }) if message.boundary() == Boundary::End)
-    );
-    assert!(
-        Events::new(&mut conn)
-            .poll_token()
-            .expect("one completion")
-            .is_none()
-    );
+    assert!(matches!(next_event(&mut conn).expect("last DATA"),
+        Some(Event::Data { message, data }) if data.segments().flatten().copied().eq(b"cd".iter().copied()) && message.boundary() == Boundary::More));
+    assert!(matches!(next_event(&mut conn).expect("trailers"),
+        Some(Event::Headers { message, section: Section::Trailing, .. }) if message.boundary() == Boundary::End));
+    assert!(next_event(&mut conn).expect("one completion").is_none());
 }
 
 #[test]
@@ -439,12 +402,9 @@ fn data_spans_quic_window() {
         now = client
             .view()
             .send_at(now + Duration::from_millis(1));
-        Peer::new(&mut space, &mut client)
-            .try_send(&mut server, now, |_| {})
+        try_send(&mut space, &mut client, &mut server, now, |_| {})
             .expect("client transfer");
-        Ingress::new(&mut h3)
-            .try_receive(&mut server)
-            .expect("H3 ingress");
+        try_receive(&mut h3, &mut server).expect("H3 ingress");
         server.with_scope(|mut scope| {
             while let Step::Item(()) | Step::More = h3
                 .ingress()
@@ -468,8 +428,7 @@ fn data_spans_quic_window() {
         now = server
             .view()
             .send_at(now + Duration::from_millis(1));
-        Peer::new(&mut space, &mut server)
-            .try_send(&mut client, now, |_| {})
+        try_send(&mut space, &mut server, &mut client, now, |_| {})
             .expect("credit transfer");
     }
     assert!(finished);
