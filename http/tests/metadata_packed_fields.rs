@@ -24,7 +24,7 @@ use sark_http::{
         },
     },
     payload::response::headers::{
-        self, Error, Fields, Name, Source,
+        self, Error, Name,
         head::{Head, Template},
         set::Set,
     },
@@ -199,7 +199,7 @@ fn retains_never_index() {
         fields: &mut output,
         result: Ok(()),
     };
-    Fields::new(Head::new(&template, Set::<0>::new())).emit(&mut store);
+    Head::new(&template, Set::<0>::new()).emit(&mut store);
     store.result.expect("stored template fields");
     assert!(output.iter().eq(indexing::FIELDS));
 }
@@ -224,9 +224,9 @@ fn group_admission() {
     for (result, error) in indexing::MISMATCHES {
         assert_eq!(result, Err(error));
     }
-    assert_eq!(indexing::MANAGED, Err(Error::Managed));
+    assert_eq!(Name::try_bytes(b"date"), Err(Error::Managed));
     assert_eq!(
-        indexing::PSEUDO,
+        Name::try_bytes(b":status"),
         Err(Error::Syntax(field::Error::InvalidByte {
             index: 0,
             byte: b':',
@@ -236,19 +236,13 @@ fn group_admission() {
 
 #[test]
 fn group_keeps_indexing() {
-    for project in [false, true] {
-        let mut output = map::Fields::new();
-        let mut store = indexing::Store {
-            fields: &mut output,
-            result: Ok(()),
-        };
-        indexing::EMPTY.emit(&mut store);
-        if project {
-            Fields::new(indexing::GROUP).emit(&mut store);
-        } else {
-            Source::emit(&indexing::GROUP, &mut store);
-        }
-        store.result.expect("stored group fields");
-        assert!(output.iter().eq(indexing::FIELDS));
-    }
+    let mut output = map::Fields::new();
+    let mut store = indexing::Store {
+        fields: &mut output,
+        result: Ok(()),
+    };
+    indexing::EMPTY.emit(&mut store);
+    indexing::GROUP.emit(&mut store);
+    store.result.expect("stored group fields");
+    assert!(output.iter().eq(indexing::FIELDS));
 }

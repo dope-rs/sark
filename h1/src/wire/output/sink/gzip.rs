@@ -12,7 +12,7 @@ use sark_http::{
     },
     payload::{
         compress::{self, Compression},
-        response::{self, bounded, exact, status::Code},
+        response::{self, bounded, exact, headers, status::Code},
     },
 };
 
@@ -26,23 +26,23 @@ use crate::wire::output::sink::{
 
 pub(super) struct Gzip<'a, H>(pub(super) &'a H);
 
-const ENTRIES: [field::Entry<'_>; 2] = [
-    field::Entry::new(
-        field::literal!(field::Lower::try_bytes(b"content-encoding")),
+const ENTRIES: [headers::Entry<'_>; 2] = [
+    headers::Entry::new(
+        field::literal!(headers::Name::try_bytes(b"content-encoding")),
         field::literal!(field::Value::try_bytes(b"gzip")),
     ),
-    field::Entry::new(
-        field::literal!(field::Lower::try_bytes(b"vary")),
+    headers::Entry::new(
+        field::literal!(headers::Name::try_bytes(b"vary")),
         field::literal!(field::Value::try_bytes(b"Accept-Encoding")),
     ),
 ];
-pub(super) const FIELDS: field::Group<'_> = field::literal!(field::Group::try_new(
+pub(super) const FIELDS: headers::Group<'_> = field::literal!(headers::Group::try_new(
     &ENTRIES,
     b"content-encoding: gzip\r\nvary: Accept-Encoding\r\n",
 ));
 
-impl<H: field::Source> field::Source for Gzip<'_, H> {
-    fn emit<'field>(&'field self, sink: &mut impl field::Sink<'field>) {
+impl<H: field::Source<headers::Application>> field::Source<headers::Application> for Gzip<'_, H> {
+    fn emit<'field>(&'field self, sink: &mut impl field::Sink<'field, headers::Application>) {
         self.0.emit(sink);
         sink.group(&FIELDS);
     }
@@ -52,7 +52,7 @@ pub(super) fn compress_exact<
     'out,
     'req,
     'd,
-    H: field::Source,
+    H: field::Source<headers::Application>,
     B: exact::TryBody,
     Q: scope::Source,
     O: stage::Body<'req, 'd>,
@@ -117,7 +117,7 @@ pub(super) fn compress_body<'out, 'req, 'd, H, B, Q, O>(
     slot: handoff::Slot<'req, 'd, Q, O>,
 ) -> Result<Written<'d, O::Deferred, Q::Selection>, Error>
 where
-    H: field::Source,
+    H: field::Source<headers::Application>,
     B: response::Body<'d>,
     Q: scope::Source,
     O: stage::Body<'req, 'd>,
@@ -224,7 +224,7 @@ pub(super) fn compress_bounded<
     'out,
     'req,
     'd,
-    H: field::Source,
+    H: field::Source<headers::Application>,
     B: bounded::Body,
     Q: scope::Source,
     O: stage::Body<'req, 'd>,
@@ -274,7 +274,7 @@ pub(super) fn compress_bounded<
     Ok(finish(out, zipped, len, required))
 }
 
-fn gzip_head<H: field::Source>(
+fn gzip_head<H: field::Source<headers::Application>>(
     out: Slice<'_, &mut usize>,
     date: Headers<'_>,
     status: Code,

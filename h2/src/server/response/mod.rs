@@ -11,7 +11,7 @@ use o3::buffer::{
 };
 use sark_core::{decode, manifold::stream::Boundary};
 use sark_http::{
-    field::{Response, metadata::section::rules},
+    field::{self, Response, metadata::section::rules},
     owner::handoff::{self, stage},
     payload::{
         fixed,
@@ -237,7 +237,7 @@ impl<
         ))
     }
 
-    fn empty<H: headers::Source>(
+    fn empty<H: field::Source<headers::Application>>(
         self,
         status: Code,
         headers: H,
@@ -258,7 +258,7 @@ impl<
         end: Boundary,
     ) -> Result<<Self as dispatch::Accept<'d>>::Output, <Self as dispatch::Accept<'d>>::Error>
     where
-        H: headers::Source,
+        H: field::Source<headers::Application>,
         B: Body<'d>,
     {
         let empty = match &value {
@@ -271,7 +271,7 @@ impl<
             stream,
             body,
         } = self;
-        let fields = Response::new(status, headers::Fields::new(headers));
+        let fields = Response::new(status, headers);
         conn.streams()
             .headers()
             .prepare(stream, fields, boundary)
@@ -306,7 +306,7 @@ impl<
 
     fn fixed<H, B>(mut self, status: Code, headers: H, body: B) -> Result<Self::Output, Self::Error>
     where
-        H: headers::Source,
+        H: field::Source<headers::Application>,
         B: Body<'d>,
     {
         if self.omit(status)? {
@@ -317,7 +317,7 @@ impl<
 
     fn exact<H, B>(mut self, status: Code, headers: H, body: B) -> Result<Self::Output, Self::Error>
     where
-        H: headers::Source,
+        H: field::Source<headers::Application>,
         B: exact::TryBody,
     {
         if self.omit(status)? {
@@ -341,7 +341,7 @@ impl<
         body: B,
     ) -> Result<Self::Output, Self::Error>
     where
-        H: headers::Source,
+        H: field::Source<headers::Application>,
         B: bounded::Body,
     {
         if self.omit(status)? {
@@ -370,7 +370,7 @@ impl<
 {
     type Stream<S> = (<Self as dispatch::Accept<'d>>::Output, Option<S>);
 
-    fn stream<H: headers::Source, S>(
+    fn stream<H: field::Source<headers::Application>, S>(
         mut self,
         status: Code,
         headers: H,

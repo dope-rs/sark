@@ -144,7 +144,7 @@ impl<'a, 'req, 'd, Q: scope::Source, O: stage::Body<'req, 'd>, C: Compression, A
         )
     }
 
-    fn empty<H: field::Source>(
+    fn empty<H: field::Source<headers::Application>>(
         self,
         status: Code,
         fields: &H,
@@ -165,10 +165,9 @@ impl<'req, 'd: 'req, Q: scope::Source, O: stage::Body<'req, 'd>, C: Compression,
 
     fn fixed<H, B>(self, status: Code, fields: H, body: B) -> Result<Self::Output, Self::Error>
     where
-        H: headers::Source,
+        H: field::Source<headers::Application>,
         B: response::Body<'d>,
     {
-        let fields = headers::Fields::new(fields);
         if let Some(frame) = self.omission(status)? {
             return self.empty(status, &fields, frame);
         }
@@ -194,10 +193,9 @@ impl<'req, 'd: 'req, Q: scope::Source, O: stage::Body<'req, 'd>, C: Compression,
         body: Body<'body>,
     ) -> Result<Self::Output, Self::Error>
     where
-        H: headers::Source,
+        H: field::Source<headers::Application>,
         'body: 'd,
     {
-        let fields = headers::Fields::new(fields);
         if let Some(frame) = self.omission(status)? {
             return self.empty(status, &fields, frame);
         }
@@ -218,10 +216,9 @@ impl<'req, 'd: 'req, Q: scope::Source, O: stage::Body<'req, 'd>, C: Compression,
 
     fn exact<H, B>(self, status: Code, fields: H, body: B) -> Result<Self::Output, Self::Error>
     where
-        H: headers::Source,
+        H: field::Source<headers::Application>,
         B: exact::TryBody,
     {
-        let fields = headers::Fields::new(fields);
         if let Some(frame) = self.omission(status)? {
             return self.empty(status, &fields, frame);
         }
@@ -243,10 +240,9 @@ impl<'req, 'd: 'req, Q: scope::Source, O: stage::Body<'req, 'd>, C: Compression,
 
     fn bounded<H, B>(self, status: Code, fields: H, body: B) -> Result<Self::Output, Self::Error>
     where
-        H: headers::Source,
+        H: field::Source<headers::Application>,
         B: bounded::Body,
     {
-        let fields = headers::Fields::new(fields);
         if let Some(frame) = self.omission(status)? {
             return self.empty(status, &fields, frame);
         }
@@ -279,7 +275,7 @@ impl<'req, 'd: 'req, Q: scope::Source, O: stage::Body<'req, 'd>, C: Compression>
         stream: Option<S>,
     ) -> Result<Self::Stream<S>, Self::Error>
     where
-        H: headers::Source,
+        H: field::Source<headers::Application>,
     {
         let admit = match self.date.response.method() {
             response::Method::Head => Admit::Head,
@@ -303,9 +299,8 @@ impl<'req, 'd: 'req, Q: scope::Source, O: stage::Body<'req, 'd>, C: Compression,
         stream: Option<S>,
     ) -> Result<Self::Stream<S>, Self::Error>
     where
-        H: headers::Source,
+        H: field::Source<headers::Application>,
     {
-        let fields = headers::Fields::new(fields);
         let frame = self.omission(status)?;
         let frame = match self.admit {
             Admit::Head => framing::Empty::Unframed,
@@ -347,7 +342,7 @@ fn plain_body<'req, 'd, H, B, Q: scope::Source, O: stage::Body<'req, 'd>>(
     slot: handoff::Slot<'req, 'd, Q, O>,
 ) -> Result<Written<'d, O::Deferred, Q::Selection>, Error>
 where
-    H: field::Source,
+    H: field::Source<headers::Application>,
     B: response::Body<'d>,
 {
     let (head, encoded) = emit_head::<_, bool>(out.reborrow(), date, status, fields, body.len())?;
@@ -370,7 +365,7 @@ where
 fn finish_exact<
     'req,
     'd,
-    H: field::Source,
+    H: field::Source<headers::Application>,
     B: exact::TryBody,
     Q: scope::Source,
     O: stage::Body<'req, 'd>,
@@ -412,7 +407,7 @@ fn finish_bounded<
     'out,
     'req,
     'd,
-    H: field::Source,
+    H: field::Source<headers::Application>,
     B: bounded::Body,
     Q: scope::Source,
     O: stage::Body<'req, 'd>,

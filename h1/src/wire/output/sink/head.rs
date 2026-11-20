@@ -4,7 +4,7 @@ use o3::buffer::{
 };
 use sark_http::{
     field,
-    payload::response::{Encode, status::Code},
+    payload::response::{Encode, headers::Application, status::Code},
 };
 
 use crate::wire::{
@@ -19,7 +19,7 @@ pub(super) fn emit_fields(
     out: Slice<'_, &mut usize>,
     date: Headers<'_>,
     status: Code,
-    fields: &impl field::Source,
+    fields: &impl field::Source<Application>,
 ) -> Result<usize, response::Error> {
     let mut out = response::Writer::exact(out);
     out.put_status(date.response.version(), status)?;
@@ -44,7 +44,7 @@ pub(super) struct Pending<'writer, 'out, 'date, 'field, H> {
     encodings: usize,
 }
 
-pub(super) fn emit_head<H: field::Source, C: response::Count>(
+pub(super) fn emit_head<H: field::Source<Application>, C: response::Count>(
     out: Slice<'_, &mut usize>,
     date: Headers<'_>,
     status: Code,
@@ -54,7 +54,11 @@ pub(super) fn emit_head<H: field::Source, C: response::Count>(
     emit_framed_head(out, date, status, fields, framing::Length(len))
 }
 
-pub(super) fn emit_framed_head<H: field::Source, F: framing::Framing, C: response::Count>(
+pub(super) fn emit_framed_head<
+    H: field::Source<Application>,
+    F: framing::Framing,
+    C: response::Count,
+>(
     out: Slice<'_, &mut usize>,
     date: Headers<'_>,
     status: Code,
@@ -72,7 +76,9 @@ pub(super) fn emit_framed_head<H: field::Source, F: framing::Framing, C: respons
     Ok((writer.finish(), count))
 }
 
-impl<'writer, 'out, 'date, 'field, H: field::Source> Pending<'writer, 'out, 'date, 'field, H> {
+impl<'writer, 'out, 'date, 'field, H: field::Source<Application>>
+    Pending<'writer, 'out, 'date, 'field, H>
+{
     pub(super) fn try_place(
         out: &'writer mut Slice<'out, &'out mut usize>,
         date: Headers<'date>,

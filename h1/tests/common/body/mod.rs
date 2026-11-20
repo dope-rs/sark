@@ -77,8 +77,8 @@ pub struct Bounded<H, B> {
     pub body: B,
 }
 
-impl<'req, 'd, H: headers::Source, B: bounded::Body> dispatch::Complete<'req, 'd>
-    for Bounded<H, B>
+impl<'req, 'd, H: field::Source<headers::Application>, B: bounded::Body>
+    dispatch::Complete<'req, 'd> for Bounded<H, B>
 {
     const BODY: sark_http::payload::Kind = sark_http::payload::Kind::Inline;
     type Bound = bound::Unbounded;

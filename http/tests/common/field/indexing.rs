@@ -37,34 +37,32 @@ pub const FIELDS: [Entry<'static>; 2] = [
     Entry::new(b"x-generated", b"private").with_index(Indexing::Never),
 ];
 
-const GROUP_ENTRIES: [field::Entry<'static>; 2] = [
-    field::Entry::new(
-        field::literal!(field::Lower::try_bytes(FIELDS[0].name)),
+const GROUP_ENTRIES: [headers::Entry<'static>; 2] = [
+    headers::Entry::new(
+        field::literal!(headers::Name::try_bytes(FIELDS[0].name)),
         field::literal!(field::Value::try_bytes(FIELDS[0].value)),
     )
     .with_index(FIELDS[0].indexing),
-    field::Entry::new(
-        field::literal!(field::Lower::try_bytes(FIELDS[1].name)),
+    headers::Entry::new(
+        field::literal!(headers::Name::try_bytes(FIELDS[1].name)),
         field::literal!(field::Value::try_bytes(FIELDS[1].value)),
     )
     .with_index(FIELDS[1].indexing),
 ];
 
 pub const GROUP: headers::Group<'static> = field::literal!(headers::Group::try_new(
-    field::literal!(field::Group::try_new(
-        &GROUP_ENTRIES,
-        b"authorization: secret\r\nx-generated: private\r\n",
-    ))
+    &GROUP_ENTRIES,
+    b"authorization: secret\r\nx-generated: private\r\n",
 ));
 
 pub const EMPTY: field::Group<'static> = field::literal!(field::Group::try_new(&[], b""));
 
 pub const MISMATCHES: [(
-    Result<field::Group<'static>, field::Mismatch>,
+    Result<headers::Group<'static>, field::Mismatch>,
     field::Mismatch,
 ); 3] = [
     (
-        field::Group::try_new(&GROUP_ENTRIES, b"authorization: Secret"),
+        headers::Group::try_new(&GROUP_ENTRIES, b"authorization: Secret"),
         field::Mismatch {
             offset: 15,
             expected: Some(b's'),
@@ -72,7 +70,7 @@ pub const MISMATCHES: [(
         },
     ),
     (
-        field::Group::try_new(&GROUP_ENTRIES, b"authorization: "),
+        headers::Group::try_new(&GROUP_ENTRIES, b"authorization: "),
         field::Mismatch {
             offset: 15,
             expected: Some(b's'),
@@ -80,7 +78,7 @@ pub const MISMATCHES: [(
         },
     ),
     (
-        field::Group::try_new(&[], b"!"),
+        headers::Group::try_new(&[], b"!"),
         field::Mismatch {
             offset: 0,
             expected: None,
@@ -88,24 +86,6 @@ pub const MISMATCHES: [(
         },
     ),
 ];
-
-const MANAGED_ENTRIES: [field::Entry<'static>; 1] = [field::Entry::new(
-    field::literal!(field::Lower::try_bytes(b"date")),
-    field::literal!(field::Value::try_bytes(b"x")),
-)];
-
-pub const MANAGED: Result<headers::Group<'static>, headers::Error> = headers::Group::try_new(
-    field::literal!(field::Group::try_new(&MANAGED_ENTRIES, b"date: x\r\n",)),
-);
-
-const PSEUDO_ENTRIES: [field::Entry<'static>; 1] = [field::Entry::pseudo(
-    field::Pseudo::Status,
-    field::literal!(field::Value::try_bytes(b"200")),
-)];
-
-pub const PSEUDO: Result<headers::Group<'static>, headers::Error> = headers::Group::try_new(
-    field::literal!(field::Group::try_new(&PSEUDO_ENTRIES, b":status: 200\r\n",)),
-);
 
 pub struct Store<'a> {
     pub fields: &'a mut map::Fields,
@@ -132,20 +112,5 @@ impl<'field> field::Sink<'field> for Store<'_> {
                         value.try_write(|bytes| out.write_slice(bytes))
                     });
         }
-    }
-}
-
-impl<'field> headers::Sink<'field> for Store<'_> {
-    fn entry(&mut self, entry: headers::Entry<'field>) {
-        field::Sink::entry(self, entry.as_field());
-    }
-
-    fn encoded_with<E: field::Encode>(
-        &mut self,
-        name: headers::Name<&'field [u8]>,
-        value: E,
-        indexing: Indexing,
-    ) {
-        field::Sink::encoded_with(self, name.into_inner(), value, indexing);
     }
 }

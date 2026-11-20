@@ -22,7 +22,7 @@ use sark_http::{
         fixed,
         response::{
             Body, bounded, dispatch, exact,
-            headers::{Entry, Name, Sink, Source},
+            headers::{Application, Entry, Name},
             status::Code,
         },
     },
@@ -69,7 +69,11 @@ impl Capture {
         self.pointer
     }
 
-    fn head<H: Source>(mut self, status: Code, headers: &H) -> Result<Self, (Error, Self)> {
+    fn head<H: field::Source<Application>>(
+        mut self,
+        status: Code,
+        headers: &H,
+    ) -> Result<Self, (Error, Self)> {
         self.status = Some(status);
         let mut fields = Fields(&mut self.fields, None);
         headers.emit(&mut fields);
@@ -118,7 +122,7 @@ impl Fields<'_> {
     }
 }
 
-impl<'field> Sink<'field> for Fields<'_> {
+impl<'field> field::Sink<'field, Application> for Fields<'_> {
     fn entry(&mut self, field: Entry<'field>) {
         if self.1.is_none() {
             self.1 = self.try_field(field.name(), field.value()).err();
@@ -143,7 +147,7 @@ impl<'d> dispatch::Accept<'d> for Capture {
 
     fn fixed<H, B>(mut self, status: Code, headers: H, body: B) -> Result<Self::Output, Self::Error>
     where
-        H: Source,
+        H: field::Source<Application>,
         B: Body<'d>,
     {
         self = self.head(status, &headers)?;
@@ -160,7 +164,7 @@ impl<'d> dispatch::Accept<'d> for Capture {
         body: fixed::Body<'body>,
     ) -> Result<Self::Output, Self::Error>
     where
-        H: Source,
+        H: field::Source<Application>,
         'body: 'd,
     {
         self = self.head(status, &headers)?;
@@ -178,7 +182,7 @@ impl<'d> dispatch::Accept<'d> for Capture {
 
     fn exact<H, B>(mut self, status: Code, headers: H, body: B) -> Result<Self::Output, Self::Error>
     where
-        H: Source,
+        H: field::Source<Application>,
         B: exact::TryBody,
     {
         self = self.head(status, &headers)?;
@@ -208,7 +212,7 @@ impl<'d> dispatch::Accept<'d> for Capture {
         body: B,
     ) -> Result<Self::Output, Self::Error>
     where
-        H: Source,
+        H: field::Source<Application>,
         B: bounded::Body,
     {
         self = self.head(status, &headers)?;
@@ -241,7 +245,7 @@ impl<'d> dispatch::Sink<'d> for Capture {
         stream: Option<S>,
     ) -> Result<Self::Stream<S>, Self::Error>
     where
-        H: Source,
+        H: field::Source<Application>,
     {
         self = self.head(status, &headers)?;
         Ok((self, stream))

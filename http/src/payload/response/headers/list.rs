@@ -5,7 +5,6 @@ use o3::alloc;
 use crate::{
     field::{self, Lower, Value, storage},
     h1::{codec::decode::fields, field::Entry},
-    payload::response::headers,
 };
 
 type Field<'field, N> = (N, Value<Cow<'field, [u8]>>);
@@ -59,18 +58,10 @@ impl<'field, N: AsRef<[u8]>> List<'field, N> {
     }
 }
 
-impl field::Source for List<'_> {
-    fn emit<'field>(&'field self, sink: &mut impl field::Sink<'field>) {
+impl<Scope: Copy> field::Source<Scope> for List<'_, storage::Lower<Cow<'_, str>, Scope>> {
+    fn emit<'field>(&'field self, sink: &mut impl field::Sink<'field, Scope>) {
         for (name, value) in &self.entries {
-            sink.entry(field::Entry::new(name.borrow(), value.borrow()));
-        }
-    }
-}
-
-impl headers::Source for List<'_, headers::Name<Cow<'_, str>>> {
-    fn emit<'field>(&'field self, sink: &mut impl headers::Sink<'field>) {
-        for (name, value) in &self.entries {
-            sink.entry(headers::Entry::new(name.borrow(), value.borrow()));
+            sink.field(name.borrow(), value.borrow());
         }
     }
 }

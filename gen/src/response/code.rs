@@ -1,5 +1,5 @@
 use crate::{
-    response::{headers::Headers, mode::Mode},
+    response::{headers, mode::Mode},
     runtime::paths::Paths,
     types,
 };
@@ -13,8 +13,7 @@ pub(crate) fn build(
     let ns_json = &paths.json;
     use syn::{Fields, Type, ext::IdentExt};
     let name = st.ident.clone();
-    let vis = st.vis.clone();
-    let fixed = Headers::statics(&st.attrs)?;
+    let fixed = headers::statics(&st.attrs)?;
     let has_req = st
         .generics
         .lifetimes()
@@ -67,13 +66,13 @@ pub(crate) fn build(
                 types::View::new(&field.ty).is_fixed(),
             ));
         }
-        if let Some(header) = Headers::name(&field.attrs)? {
-            let ty = field.ty.clone();
+        if let Some(header) = headers::name(&field.attrs)? {
+            let ty = &field.ty;
             shape
                 .make_where_clause()
                 .predicates
                 .push(syn::parse_quote!(#ty: #ns_http::field::AsValue));
-            vars.push((ident.clone(), header, ty));
+            vars.push((ident.clone(), header));
         }
     }
     let status = status.ok_or_else(|| {
@@ -100,16 +99,7 @@ pub(crate) fn build(
     let g_sink = symbols.ident("__SINK");
     let [v_response, v_status, v_headers, v_body, v_sink] =
         symbols.locals(["response", "status", "headers", "body", "sink"]);
-    let headers = Headers::new(
-        paths,
-        &name,
-        &vis,
-        &st.generics,
-        &vars,
-        &fixed,
-        &v_response,
-        &symbols,
-    );
+    let head = headers::build(paths, &name, &vars, &fixed, &v_response, &symbols);
     st.attrs
         .retain(|attr| !attr.path().is_ident("header") && !attr.path().is_ident("header_static"));
     for field in fields.iter_mut() {
@@ -139,7 +129,6 @@ pub(crate) fn build(
             quote::quote!(#ns_http::payload::Kind::Inline),
         )
     };
-    let head = &headers.build;
     let target = quote::quote!(#name #ty_args);
     let impls = quote::quote! {
         impl #sh_impl
@@ -171,11 +160,8 @@ pub(crate) fn build(
         }
     };
 
-    let decl = &headers.decl;
     Ok(quote::quote! {
         #st
-
-        #decl
 
         #impls
     })

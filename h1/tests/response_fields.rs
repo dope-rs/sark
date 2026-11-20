@@ -8,6 +8,7 @@ use common::fields::{
 };
 use o3::buffer::write::Slice;
 use sark_h1::wire::{Failure, head, output};
+use sark_http::field;
 use sark_http::payload::{
     fixed::Body,
     response::{headers, statics, status::Code},
@@ -83,7 +84,7 @@ fn encoding_preserves_body() {
     preserve(GENERATED_IDENTITY);
 }
 
-fn preserve(source: impl headers::Source) {
+fn preserve(source: impl field::Source<headers::Application>) {
     let input = ENCODED_BODY;
     let outcome = try_encode(source, &input).expect("compression");
     let output::Outcome::SendStatic { body, .. } = outcome else {

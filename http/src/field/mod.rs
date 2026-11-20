@@ -8,9 +8,10 @@ pub mod scan;
 pub mod storage;
 pub mod text;
 
-use std::{convert::Infallible, iter::Copied, slice};
+use std::{convert::Infallible, iter::Copied, marker::PhantomData, slice};
 
-pub use storage::{Lower, Name, Value};
+pub use storage::{Name, Value};
+pub type Lower<T> = storage::Lower<T, ()>;
 
 /// Requires successful field admission at compile time.
 /// Invalid input fails during constant evaluation.
@@ -30,7 +31,7 @@ use metadata::map::record;
 use storage::encoded;
 
 pub use crate::field_literal as literal;
-use crate::payload::response::status;
+use crate::payload::response::{headers::Application, status};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Error {
@@ -90,31 +91,36 @@ pub trait Encode: encoded::Encoded {
 }
 
 /// Receives one synchronous semantic field plan without staging storage.
-pub trait Sink<'field> {
-    fn entry(&mut self, field: Entry<'field>);
+pub trait Sink<'field, Scope: Copy = ()> {
+    fn entry(&mut self, field: Entry<'field, Scope>);
 
     /// Emits a preencoded group while retaining each field's indexing policy.
-    fn group(&mut self, group: &Group<'field>) {
+    fn group(&mut self, group: &Group<'field, Scope>) {
         for entry in group.entries() {
             self.entry(*entry);
         }
     }
 
-    fn field(&mut self, name: Lower<&'field [u8]>, value: Value<&'field [u8]>) {
+    fn field(&mut self, name: storage::Lower<&'field [u8], Scope>, value: Value<&'field [u8]>) {
         self.entry(Entry::new(name, value));
     }
 
-    fn encoded_with<E: Encode>(&mut self, name: Lower<&'field [u8]>, value: E, indexing: Indexing);
+    fn encoded_with<E: Encode>(
+        &mut self,
+        name: storage::Lower<&'field [u8], Scope>,
+        value: E,
+        indexing: Indexing,
+    );
 
     /// Emits a newly generated value with indexing permitted.
-    fn generated<E: Encode>(&mut self, name: Lower<&'field [u8]>, value: E) {
+    fn generated<E: Encode>(&mut self, name: storage::Lower<&'field [u8], Scope>, value: E) {
         self.encoded_with(name, value, Indexing::Allowed);
     }
 }
 
 /// Borrows and synchronously emits one semantic field plan.
-pub trait Source {
-    fn emit<'field>(&'field self, sink: &mut impl Sink<'field>);
+pub trait Source<Scope: Copy = ()> {
+    fn emit<'field>(&'field self, sink: &mut impl Sink<'field, Scope>);
 }
 
 /// Borrows the exact bytes of a typed outgoing field value.
@@ -149,52 +155,57 @@ impl<W: Writer + ?Sized> Writer for &mut W {
     }
 }
 
-impl<S: Source + ?Sized> Source for &S {
-    fn emit<'field>(&'field self, sink: &mut impl Sink<'field>) {
+impl<Scope: Copy, S: Source<Scope> + ?Sized> Source<Scope> for &S {
+    fn emit<'field>(&'field self, sink: &mut impl Sink<'field, Scope>) {
         (**self).emit(sink);
     }
 }
 
-impl Source for [Entry<'_>] {
-    fn emit<'field>(&'field self, sink: &mut impl Sink<'field>) {
+impl<Scope: Copy> Source<Scope> for [Entry<'_, Scope>] {
+    fn emit<'field>(&'field self, sink: &mut impl Sink<'field, Scope>) {
         for field in self {
             sink.entry(*field);
         }
     }
 }
 
-impl<const N: usize> Source for [Entry<'_>; N] {
-    fn emit<'field>(&'field self, sink: &mut impl Sink<'field>) {
+impl<Scope: Copy, const N: usize> Source<Scope> for [Entry<'_, Scope>; N] {
+    fn emit<'field>(&'field self, sink: &mut impl Sink<'field, Scope>) {
         self.as_slice().emit(sink);
     }
 }
 
-impl Source for Vec<Entry<'_>> {
-    fn emit<'field>(&'field self, sink: &mut impl Sink<'field>) {
+impl<Scope: Copy> Source<Scope> for Vec<Entry<'_, Scope>> {
+    fn emit<'field>(&'field self, sink: &mut impl Sink<'field, Scope>) {
         self.as_slice().emit(sink);
     }
 }
 
-impl<'entry, 'value> Source for Copied<slice::Iter<'entry, Entry<'value>>>
+impl<'entry, 'value, Scope: Copy> Source<Scope>
+    for Copied<slice::Iter<'entry, Entry<'value, Scope>>>
 where
     'value: 'entry,
 {
-    fn emit<'field>(&'field self, sink: &mut impl Sink<'field>) {
+    fn emit<'field>(&'field self, sink: &mut impl Sink<'field, Scope>) {
         for field in self.clone() {
             sink.entry(field);
         }
     }
 }
 
-impl<'entry, 'value> Source for slice::Iter<'entry, Entry<'value>>
+impl<'entry, 'value, Scope: Copy> Source<Scope> for slice::Iter<'entry, Entry<'value, Scope>>
 where
     'value: 'entry,
 {
-    fn emit<'field>(&'field self, sink: &mut impl Sink<'field>) {
+    fn emit<'field>(&'field self, sink: &mut impl Sink<'field, Scope>) {
         for field in self.clone() {
             sink.entry(*field);
         }
     }
+}
+
+impl Source<Application> for () {
+    fn emit<'field>(&'field self, _: &mut impl Sink<'field, Application>) {}
 }
 
 pub(crate) fn trim_ows_start(mut value: &[u8]) -> &[u8] {
@@ -271,7 +282,7 @@ impl<F> Response<F> {
     }
 }
 
-impl<F: Source> Source for Response<F> {
+impl<F: Source<Application>> Source for Response<F> {
     fn emit<'field>(&'field self, sink: &mut impl Sink<'field>) {
         sink.entry(Entry::pseudo(Pseudo::Status, self.value.borrow()));
         self.fields.emit(sink);
@@ -281,7 +292,7 @@ impl<F: Source> Source for Response<F> {
 /// One admitted HTTP field whose borrowed bytes cannot change during emission.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(transparent)]
-pub struct Entry<'a>(pub(in crate::field) record::Entry<'a>);
+pub struct Entry<'a, Scope = ()>(record::Entry<'a>, PhantomData<fn() -> Scope>);
 
 /// A pseudo-field supported by HTTP/2 and HTTP/3.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -295,8 +306,8 @@ pub enum Pseudo {
 }
 
 impl<'a> Entry<'a> {
-    pub const fn new(name: Lower<&'a [u8]>, value: Value<&'a [u8]>) -> Self {
-        Self(record::Entry::new(name.0, value.0))
+    pub(in crate::field) const fn from_record(field: record::Entry<'a>) -> Self {
+        Self(field, PhantomData)
     }
 
     pub const fn pseudo(name: Pseudo, value: Value<&'a [u8]>) -> Self {
@@ -308,11 +319,17 @@ impl<'a> Entry<'a> {
             Pseudo::Protocol => b":protocol".as_slice(),
             Pseudo::Status => b":status".as_slice(),
         };
-        Self(record::Entry::new(name, value.0))
+        Self::from_record(record::Entry::new(name, value.0))
+    }
+}
+
+impl<'a, Scope> Entry<'a, Scope> {
+    pub const fn new(name: storage::Lower<&'a [u8], Scope>, value: Value<&'a [u8]>) -> Self {
+        Self(record::Entry::new(name.get(), value.0), PhantomData)
     }
 
     pub const fn with_index(self, indexing: Indexing) -> Self {
-        Self(self.0.with_index(indexing))
+        Self(self.0.with_index(indexing), PhantomData)
     }
 
     pub const fn name(self) -> &'a [u8] {
@@ -334,8 +351,8 @@ impl<'a> Entry<'a> {
 
 /// Immutable fields paired with their exact name/value line encoding.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct Group<'a> {
-    entries: &'a [Entry<'a>],
+pub struct Group<'a, Scope = ()> {
+    entries: &'a [Entry<'a, Scope>],
     wire: &'a [u8],
 }
 
@@ -352,8 +369,11 @@ struct Cursor<'a> {
     offset: usize,
 }
 
-impl<'a> Group<'a> {
-    pub const fn try_new(entries: &'a [Entry<'a>], wire: &'a [u8]) -> Result<Self, Mismatch> {
+impl<'a, Scope: Copy> Group<'a, Scope> {
+    pub const fn try_new(
+        entries: &'a [Entry<'a, Scope>],
+        wire: &'a [u8],
+    ) -> Result<Self, Mismatch> {
         let mut cursor = Cursor { wire, offset: 0 };
         let mut index = 0;
         while index < entries.len() {
@@ -378,7 +398,7 @@ impl<'a> Group<'a> {
         Ok(Self { entries, wire })
     }
 
-    pub const fn entries(&self) -> &'a [Entry<'a>] {
+    pub const fn entries(&self) -> &'a [Entry<'a, Scope>] {
         self.entries
     }
 
@@ -387,9 +407,24 @@ impl<'a> Group<'a> {
     }
 }
 
-impl Source for Group<'_> {
-    fn emit<'field>(&'field self, sink: &mut impl Sink<'field>) {
+impl<Scope: Copy> Source<Scope> for Group<'_, Scope> {
+    fn emit<'field>(&'field self, sink: &mut impl Sink<'field, Scope>) {
         sink.group(self);
+    }
+}
+
+impl<'field, S: Sink<'field>> Sink<'field, Application> for S {
+    fn entry(&mut self, entry: Entry<'field, Application>) {
+        Sink::entry(self, Entry::from_record(entry.0));
+    }
+
+    fn encoded_with<E: Encode>(
+        &mut self,
+        name: storage::Lower<&'field [u8], Application>,
+        value: E,
+        indexing: Indexing,
+    ) {
+        Sink::encoded_with(self, name.into_inner(), value, indexing);
     }
 }
 

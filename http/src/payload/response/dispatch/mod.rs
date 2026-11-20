@@ -1,7 +1,7 @@
 use o3::buffer::resident::bound;
 
 use crate::{
-    payload,
+    field, payload,
     payload::{
         fixed::Body,
         response::{
@@ -65,7 +65,7 @@ pub trait Accept<'d>: Sized {
 
     fn fixed<H, B>(self, status: Code, headers: H, body: B) -> Result<Self::Output, Self::Error>
     where
-        H: headers::Source,
+        H: field::Source<headers::Application>,
         B: response::Body<'d>;
 
     fn statics<'body, H>(
@@ -75,7 +75,7 @@ pub trait Accept<'d>: Sized {
         body: Body<'body>,
     ) -> Result<Self::Output, Self::Error>
     where
-        H: headers::Source,
+        H: field::Source<headers::Application>,
         'body: 'd,
     {
         self.fixed(status, headers, body)
@@ -83,12 +83,12 @@ pub trait Accept<'d>: Sized {
 
     fn exact<H, B>(self, status: Code, headers: H, body: B) -> Result<Self::Output, Self::Error>
     where
-        H: headers::Source,
+        H: field::Source<headers::Application>,
         B: exact::TryBody;
 
     fn bounded<H, B>(self, status: Code, headers: H, body: B) -> Result<Self::Output, Self::Error>
     where
-        H: headers::Source,
+        H: field::Source<headers::Application>,
         B: bounded::Body;
 }
 
@@ -103,7 +103,7 @@ pub trait Sink<'d>: Accept<'d> {
         stream: Option<S>,
     ) -> Result<Self::Stream<S>, Self::Error>
     where
-        H: headers::Source;
+        H: field::Source<headers::Application>;
 }
 
 pub trait Emit<'req, 'd>: Sized {

@@ -33,31 +33,27 @@ pub const ENTRIES: [headers::Entry<'static>; 2] = [
     ),
 ];
 
-const GROUP_ENTRIES: [field::Entry<'static>; 2] = [ENTRIES[0].as_field(), ENTRIES[1].as_field()];
-
-pub const GROUP: headers::Group<'static> =
-    field::literal!(headers::Group::try_new(field::literal!(
-        field::Group::try_new(&GROUP_ENTRIES, b"x-first: one\r\nx-second:  two\r\n",)
-    )));
+pub const GROUP: headers::Group<'static> = field::literal!(headers::Group::try_new(
+    &ENTRIES,
+    b"x-first: one\r\nx-second:  two\r\n",
+));
 
 pub const IDENTITY: headers::Entry<'static> = headers::Entry::new(
     field::literal!(headers::Name::try_bytes(b"content-encoding")),
     field::literal!(field::Value::try_bytes(b"identity")),
 );
 
-const ENCODING_ENTRIES: [field::Entry<'static>; 1] = [IDENTITY.as_field()];
-
-pub const GROUP_ENCODING: headers::Group<'static> =
-    field::literal!(headers::Group::try_new(field::literal!(
-        field::Group::try_new(&ENCODING_ENTRIES, b"content-encoding: identity\r\n",)
-    )));
+pub const GROUP_ENCODING: headers::Group<'static> = field::literal!(headers::Group::try_new(
+    &[IDENTITY],
+    b"content-encoding: identity\r\n",
+));
 
 pub struct Counted<'a> {
     pub emissions: &'a Cell<usize>,
 }
 
-impl headers::Source for Counted<'_> {
-    fn emit<'field>(&'field self, sink: &mut impl headers::Sink<'field>) {
+impl field::Source<headers::Application> for Counted<'_> {
+    fn emit<'field>(&'field self, sink: &mut impl field::Sink<'field, headers::Application>) {
         self.emissions.set(self.emissions.get() + 1);
         sink.entry(headers::Entry::new(
             field::literal!(headers::Name::try_bytes(b"x-actual")),
@@ -77,7 +73,7 @@ pub const GENERATED_IDENTITY: Generated<'static> = Generated {
 };
 
 pub fn try_encode<'d>(
-    source: impl headers::Source,
+    source: impl field::Source<headers::Application>,
     input: &'d [u8],
 ) -> Result<output::Outcome<'d>, alloc::Error> {
     use sark_http::{
@@ -99,8 +95,8 @@ pub fn try_encode<'d>(
     .route(response, handoff::Slot::ready(None), &mut gzip, GZIP_POLICY))
 }
 
-impl headers::Source for Generated<'_> {
-    fn emit<'field>(&'field self, sink: &mut impl headers::Sink<'field>) {
+impl field::Source<headers::Application> for Generated<'_> {
+    fn emit<'field>(&'field self, sink: &mut impl field::Sink<'field, headers::Application>) {
         sink.generated(self.name, self.value);
     }
 }
@@ -122,8 +118,8 @@ impl<'a> Drifting<'a> {
     }
 }
 
-impl headers::Source for Drifting<'_> {
-    fn emit<'field>(&'field self, sink: &mut impl headers::Sink<'field>) {
+impl field::Source<headers::Application> for Drifting<'_> {
+    fn emit<'field>(&'field self, sink: &mut impl field::Sink<'field, headers::Application>) {
         let index = self.emissions.replace(self.emissions.get() + 1);
         sink.entry(if index == 0 { self.first } else { self.second });
     }

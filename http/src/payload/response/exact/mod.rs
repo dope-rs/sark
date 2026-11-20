@@ -1,4 +1,4 @@
-use crate::payload::response::status::Code;
+use crate::{field, payload::response::status::Code};
 mod overflow;
 mod plan;
 
@@ -46,7 +46,7 @@ impl<H, B> Direct<H, B> {
 
 impl<'req, 'd, H, B> dispatch::Complete<'req, 'd> for Direct<H, B>
 where
-    H: headers::Source,
+    H: field::Source<headers::Application>,
     B: TryBody,
 {
     const BODY: crate::payload::Kind = crate::payload::Kind::Inline;

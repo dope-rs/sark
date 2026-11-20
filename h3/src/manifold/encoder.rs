@@ -12,7 +12,7 @@ use o3::buffer::{
 };
 use sark_core::{decode, life, manifold::task::response, request, request::frame::proof};
 use sark_http::{
-    field::{Response, metadata::section::rules},
+    field::{self, Response, metadata::section::rules},
     owner::{evidence, evidence::Sink as _, handoff, handoff::stage},
     payload::{
         fixed,
@@ -257,7 +257,7 @@ impl<'a, 'req, 'd: 'req, P: rules::Policy, Q: scope::Source, I: stage::Body<'req
         ))
     }
 
-    fn empty<H: headers::Source>(
+    fn empty<H: field::Source<headers::Application>>(
         self,
         status: Code,
         headers: H,
@@ -274,7 +274,7 @@ impl<'a, 'req, 'd: 'req, P: rules::Policy, Q: scope::Source, I: stage::Body<'req
         bytes: usize,
     ) -> Result<Prepared<'a, 'req, 'd, P, Q::Selection, I>, (conn::Error, stream::Cancellation)>
     where
-        H: headers::Source,
+        H: field::Source<headers::Application>,
         B: Body<'d>,
     {
         let Self {
@@ -286,7 +286,7 @@ impl<'a, 'req, 'd: 'req, P: rules::Policy, Q: scope::Source, I: stage::Body<'req
                 stream::Cancellation::new(target),
             )
         })?;
-        let fields = Response::new(status, headers::Fields::new(headers));
+        let fields = Response::new(status, headers);
         let prepared = conn
             .reply()
             .prepare(target, fields)
@@ -401,7 +401,7 @@ impl<'a, 'req, 'd: 'req, P: rules::Policy, Q: scope::Source, I: stage::Body<'req
 
     fn fixed<H, B>(self, status: Code, headers: H, body: B) -> Result<Self::Output, Self::Error>
     where
-        H: headers::Source,
+        H: field::Source<headers::Application>,
         B: Body<'d>,
     {
         if self.omit(status)? {
@@ -413,7 +413,7 @@ impl<'a, 'req, 'd: 'req, P: rules::Policy, Q: scope::Source, I: stage::Body<'req
 
     fn exact<H, B>(self, status: Code, headers: H, body: B) -> Result<Self::Output, Self::Error>
     where
-        H: headers::Source,
+        H: field::Source<headers::Application>,
         B: exact::TryBody,
     {
         if self.omit(status)? {
@@ -438,7 +438,7 @@ impl<'a, 'req, 'd: 'req, P: rules::Policy, Q: scope::Source, I: stage::Body<'req
 
     fn bounded<H, B>(self, status: Code, headers: H, body: B) -> Result<Self::Output, Self::Error>
     where
-        H: headers::Source,
+        H: field::Source<headers::Application>,
         B: bounded::Body,
     {
         if self.omit(status)? {
@@ -492,7 +492,7 @@ impl<'a, 'req, 'd: 'req, P: rules::Policy, Q: scope::Source, I: stage::Body<'req
         stream: Option<S>,
     ) -> Result<Self::Stream<S>, Self::Error>
     where
-        H: headers::Source,
+        H: field::Source<headers::Application>,
     {
         let omit = self.omit(status)?;
         let prepared = self.empty(status, headers)?;

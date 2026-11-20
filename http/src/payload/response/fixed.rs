@@ -1,5 +1,6 @@
 use o3::buffer::resident::bound;
 
+use crate::field;
 use crate::payload::response::{Body, dispatch, headers, status::Code};
 
 /// Response retaining its generated field types without an erased value enum.
@@ -29,7 +30,7 @@ impl<H, B> Direct<H, B> {
 
 impl<'req, 'd, H, B> dispatch::Complete<'req, 'd> for Direct<H, B>
 where
-    H: headers::Source,
+    H: field::Source<headers::Application>,
     B: Body<'d>,
 {
     const BODY: crate::payload::Kind = crate::payload::Kind::Inline;

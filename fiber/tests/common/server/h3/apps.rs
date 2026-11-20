@@ -306,10 +306,13 @@ impl QpackFields {
     }
 }
 
-impl sark_http::payload::response::headers::Source for QpackFields {
+impl sark_http::field::Source<sark_http::payload::response::headers::Application> for QpackFields {
     fn emit<'field>(
         &'field self,
-        sink: &mut impl sark_http::payload::response::headers::Sink<'field>,
+        sink: &mut impl sark_http::field::Sink<
+            'field,
+            sark_http::payload::response::headers::Application,
+        >,
     ) {
         self.0.heads.set(self.0.heads.get() + 1);
         for _ in 0..2 {

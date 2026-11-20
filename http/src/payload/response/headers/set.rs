@@ -1,4 +1,7 @@
-use crate::payload::response::headers::{self, value};
+use crate::{
+    field,
+    payload::response::headers::{self, value},
+};
 
 pub const DEFAULT_CAPACITY: usize = 4;
 pub struct Set<'req, const N: usize = DEFAULT_CAPACITY> {
@@ -49,8 +52,8 @@ impl<'req, const N: usize> Set<'req, N> {
     }
 }
 
-impl<const N: usize> headers::Source for Set<'_, N> {
-    fn emit<'field>(&'field self, sink: &mut impl headers::Sink<'field>) {
+impl<const N: usize> field::Source<headers::Application> for Set<'_, N> {
+    fn emit<'field>(&'field self, sink: &mut impl field::Sink<'field, headers::Application>) {
         for item in &self.entries[..self.len.min(N)] {
             sink.entry(headers::Entry::new(item.name, item.value.borrow()));
         }

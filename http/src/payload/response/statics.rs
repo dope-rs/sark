@@ -1,5 +1,6 @@
 use o3::buffer::resident::bound;
 
+use crate::field;
 use crate::payload::{
     fixed,
     response::{dispatch, headers, status::Code},
@@ -37,7 +38,8 @@ impl<'body, H> Direct<'body, H> {
     }
 }
 
-impl<'body, 'req, 'd, H: headers::Source> dispatch::Complete<'req, 'd> for Direct<'body, H>
+impl<'body, 'req, 'd, H: field::Source<headers::Application>> dispatch::Complete<'req, 'd>
+    for Direct<'body, H>
 where
     'body: 'd,
 {

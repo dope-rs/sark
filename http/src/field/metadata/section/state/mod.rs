@@ -119,7 +119,7 @@ impl<const PREFIX: usize> field::Source
 {
     fn emit<'field>(&'field self, sink: &mut impl field::Sink<'field>) {
         for field in self.fields.iter() {
-            sink.entry(field::Entry(field));
+            sink.entry(field::Entry::from_record(field));
         }
     }
 }

@@ -10,7 +10,7 @@ use sark_http::{
             response::{Date, Server},
         },
     },
-    payload::response::status::Code,
+    payload::response::{headers, status::Code},
 };
 
 use crate::wire::response::{Context, Error, consts, framing};
@@ -59,7 +59,7 @@ fn count<C: Count>(total: &mut C, name: &[u8]) -> Result<(), Error> {
     Ok(())
 }
 
-fn count_group<C: Count>(total: &mut C, group: &field::Group<'_>) -> Result<(), Error> {
+fn count_group<C: Count>(total: &mut C, group: &headers::Group<'_>) -> Result<(), Error> {
     for entry in group.entries() {
         count(total, entry.name())?;
     }
@@ -68,7 +68,7 @@ fn count_group<C: Count>(total: &mut C, group: &field::Group<'_>) -> Result<(), 
 
 impl<H, F> Head<'_, H, F>
 where
-    H: field::Source,
+    H: field::Source<headers::Application>,
     F: framing::Framing,
 {
     pub(in crate::wire) fn plan(
@@ -115,7 +115,7 @@ where
 impl Writer<'_> {
     pub(in crate::wire) fn fields<C: Count>(
         &mut self,
-        source: &impl field::Source,
+        source: &impl field::Source<headers::Application>,
     ) -> Result<C, Error> {
         let mut fields = Fields {
             out: self,
@@ -127,7 +127,7 @@ impl Writer<'_> {
 
     pub(in crate::wire) fn group<C: Count>(
         &mut self,
-        group: &field::Group<'_>,
+        group: &headers::Group<'_>,
         count: C,
     ) -> Result<C, Error> {
         let mut total = count;
@@ -157,16 +157,16 @@ struct Measure {
     error: Option<Error>,
 }
 
-impl<'field, C: Count> field::Sink<'field> for Fields<'_, '_, C> {
+impl<'field, C: Count> field::Sink<'field, headers::Application> for Fields<'_, '_, C> {
     /// Bulk admission commits bytes and count together; failures replay scalar writes.
-    fn group(&mut self, group: &field::Group<'field>) {
+    fn group(&mut self, group: &headers::Group<'field>) {
         let Ok(total) = self.state else {
             return;
         };
         self.state = self.out.group(group, total);
     }
 
-    fn entry(&mut self, entry: field::Entry<'field>) {
+    fn entry(&mut self, entry: headers::Entry<'field>) {
         let Ok(total) = &mut self.state else {
             return;
         };
@@ -186,7 +186,7 @@ impl<'field, C: Count> field::Sink<'field> for Fields<'_, '_, C> {
 
     fn encoded_with<E: field::Encode>(
         &mut self,
-        name: field::Lower<&'field [u8]>,
+        name: headers::Name<&'field [u8]>,
         encoded: E,
         _: field::Indexing,
     ) {
@@ -248,8 +248,8 @@ impl Measure {
     }
 }
 
-impl<'field> field::Sink<'field> for Measure {
-    fn entry(&mut self, entry: field::Entry<'field>) {
+impl<'field> field::Sink<'field, headers::Application> for Measure {
+    fn entry(&mut self, entry: headers::Entry<'field>) {
         let entry = entry.as_record();
         let (name, value) = (entry.name, entry.value);
         self.add(name.len());
@@ -259,7 +259,7 @@ impl<'field> field::Sink<'field> for Measure {
 
     fn encoded_with<E: field::Encode>(
         &mut self,
-        name: field::Lower<&'field [u8]>,
+        name: headers::Name<&'field [u8]>,
         value: E,
         _: field::Indexing,
     ) {

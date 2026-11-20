@@ -27,7 +27,7 @@ impl<T: storage::Bytes> Admit<T> for Lower<T> {
     /// # Safety
     /// These exact immutable bytes must already prove a nonempty lowercase HTTP token.
     unsafe fn from_raw(owner: T) -> Self {
-        Self(owner)
+        Self::from_token(owner)
     }
 }
 
@@ -44,6 +44,6 @@ impl<'a> Admit<record::Entry<'a>> for Entry<'a> {
     /// This immutable record must prove a lowercase token or supported pseudo-name and HTTP value bytes.
     /// Packed geometry and binary metadata alone are insufficient.
     unsafe fn from_raw(owner: record::Entry<'a>) -> Self {
-        Self(owner)
+        Self::from_record(owner)
     }
 }

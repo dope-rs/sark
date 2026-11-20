@@ -1,4 +1,7 @@
-use crate::payload::response::{headers, headers::set};
+use crate::{
+    field,
+    payload::response::{headers, headers::set},
+};
 
 pub struct Template<'a> {
     fields: &'a [headers::Entry<'a>],
@@ -21,9 +24,9 @@ impl<'req, const N: usize> Head<'req, N> {
     }
 }
 
-impl<const N: usize> headers::Source for Head<'_, N> {
-    fn emit<'field>(&'field self, sink: &mut impl headers::Sink<'field>) {
-        headers::Source::emit(self.template.fields, sink);
-        headers::Source::emit(&self.headers, sink);
+impl<const N: usize> field::Source<headers::Application> for Head<'_, N> {
+    fn emit<'field>(&'field self, sink: &mut impl field::Sink<'field, headers::Application>) {
+        field::Source::emit(self.template.fields, sink);
+        field::Source::emit(&self.headers, sink);
     }
 }

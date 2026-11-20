@@ -27,7 +27,7 @@ pub struct Fields<'out> {
     pub result: Result<(), consume::Error>,
 }
 
-impl<'field> headers::Sink<'field> for Fields<'_> {
+impl<'field> field::Sink<'field, headers::Application> for Fields<'_> {
     fn entry(&mut self, field: headers::Entry<'field>) {
         if self.result.is_ok() {
             self.result =
@@ -55,7 +55,7 @@ impl<'field> headers::Sink<'field> for Fields<'_> {
 pub struct SliceSink<'a, 'out>(pub &'a mut [u8], pub Option<&'a mut Fields<'out>>);
 
 impl SliceSink<'_, '_> {
-    fn fields(&mut self, headers: &impl headers::Source) -> Result<(), Error> {
+    fn fields(&mut self, headers: &impl field::Source<headers::Application>) -> Result<(), Error> {
         if let Some(fields) = &mut self.1 {
             headers.emit(*fields);
             fields.result.map_err(Error::Field)?;
@@ -68,7 +68,7 @@ impl<'d> Accept<'d> for SliceSink<'_, '_> {
     type Output = (Code, usize);
     type Error = Error;
 
-    fn fixed<H: headers::Source, B: response::Body<'d>>(
+    fn fixed<H: field::Source<headers::Application>, B: response::Body<'d>>(
         self,
         _: Code,
         _: H,
@@ -76,7 +76,7 @@ impl<'d> Accept<'d> for SliceSink<'_, '_> {
     ) -> Result<Self::Output, Self::Error> {
         Err(Error::Fixed)
     }
-    fn statics<'body: 'd, H: headers::Source>(
+    fn statics<'body: 'd, H: field::Source<headers::Application>>(
         mut self,
         status: Code,
         headers: H,
@@ -88,7 +88,7 @@ impl<'d> Accept<'d> for SliceSink<'_, '_> {
             .map_err(Error::Capacity)?;
         Ok((status, body.len()))
     }
-    fn bounded<H: headers::Source, B: bounded::Body>(
+    fn bounded<H: field::Source<headers::Application>, B: bounded::Body>(
         mut self,
         status: Code,
         headers: H,
@@ -100,7 +100,7 @@ impl<'d> Accept<'d> for SliceSink<'_, '_> {
             .map_err(Error::Build)?;
         Ok((status, len))
     }
-    fn exact<H: headers::Source, B: exact::TryBody>(
+    fn exact<H: field::Source<headers::Application>, B: exact::TryBody>(
         mut self,
         status: Code,
         headers: H,

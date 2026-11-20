@@ -2,7 +2,7 @@ use o3::buffer::resident;
 use sark_core::manifold::stream::Boundary;
 use sark_http::{
     field::{Response, metadata::section::rules},
-    payload::response::{headers::Fields, status::Code},
+    payload::response::status::Code,
 };
 
 use crate::{
@@ -38,11 +38,9 @@ impl Status {
         stream: stream::Key,
         boundary: Boundary,
     ) -> Result<Head<'d>, conn::Error> {
-        conn.streams().headers().prepare(
-            stream,
-            Response::new(self.code, Fields::new(())),
-            boundary,
-        )?;
+        conn.streams()
+            .headers()
+            .prepare(stream, Response::new(self.code, ()), boundary)?;
         Ok(Head::empty(stream))
     }
 }
