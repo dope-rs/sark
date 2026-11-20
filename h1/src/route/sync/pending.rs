@@ -7,7 +7,7 @@ use sark_core::{
     manifold, route,
 };
 use sark_http::{
-    h1::{codec::canned, head::request::Coding},
+    h1::codec::canned,
     owner::handoff,
     payload::{compress, owned, response::dispatch},
 };
@@ -23,18 +23,16 @@ pub struct Pending<'d, R: route::Spec> {
     head: framing::Parsed<storage::Shared, R>,
     connection: head::Connection,
     response: response::Context,
-    coding: Coding,
     body: pending::Body<'d>,
     content_length: Length,
 }
 
 impl<'d, R: route::Spec> Pending<'d, R> {
-    pub(crate) fn from_frame(frame: framing::Pending<R, Coding>) -> Self {
+    pub(crate) fn from_frame(frame: framing::Pending<R>) -> Self {
         Self {
             head: frame.head,
             connection: frame.connection,
             response: frame.response,
-            coding: frame.coding,
             body: pending::Body::new(),
             content_length: frame.declared_body_len,
         }
@@ -77,7 +75,6 @@ impl<'d, R: route::Spec> Pending<'d, R> {
             head,
             connection: close,
             response,
-            coding,
             body,
             content_length: want,
         } = self;
@@ -98,15 +95,15 @@ impl<'d, R: route::Spec> Pending<'d, R> {
         };
         let ready = match <<R::Request as route::Schema>::Body as body::Project>::try_project(
             &mut body,
-            (head.borrow(), state, output, gzip, coding),
+            (head.borrow(), state, output, gzip),
             |scope| -> Result<output::Outcome<'d, usize>, Failure> {
-                let ((request, state, output, gzip, coding), view) = scope.into_parts();
+                let ((request, state, output, gzip), view) = scope.into_parts();
                 let input = view.body();
                 let call = Call::new(request, view);
                 let reply = call.try_invoke::<R, S>(state).map_err(|error| {
                     Failure::Route(<R::Request as route::Project>::reject(error))
                 })?;
-                Ok(output.route(reply, handoff::Slot::new(input), gzip, coding, R::POLICY))
+                Ok(output.route(reply, handoff::Slot::new(input), gzip, R::POLICY))
             },
         ) {
             Ok(Ok(ready)) => ready,

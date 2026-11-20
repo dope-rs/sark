@@ -30,13 +30,12 @@ use crate::{
     },
 };
 
-type Split<'req, 'body, 'd, R, C> = Result<
+type Split<'req, 'body, 'd, R> = Result<
     (
         Parsed<&'req [u8], R>,
         body::Body<View<'body, 'd>>,
         usize,
         head::Connection,
-        C,
         response::Context,
     ),
     parsing::Request<<R as route::Spec>::Request>,
@@ -58,7 +57,7 @@ type Assembly<'d, R> = Result<
     parsing::Request<<R as route::Spec>::Request>,
 >;
 
-pub(crate) struct Frame<'a, 'req, 'body, 'd, R: route::Spec, C = framing::Plain> {
+pub(crate) struct Frame<'a, 'req, 'body, 'd, R: route::Spec> {
     source: parsing::raw::Bound<&'a parsing::Head<'req>, R>,
     headers: <R::Request as route::Schema>::RawHeaders,
     layout: Layout,
@@ -67,15 +66,14 @@ pub(crate) struct Frame<'a, 'req, 'body, 'd, R: route::Spec, C = framing::Plain>
     pub(crate) response: response::Context,
     /// The admitted head length shares the completion tag's alignment space.
     body: Payload<'body, 'd, NonZero<u32>>,
-    coding: C,
 }
 
-impl<'a, 'req: 'body, 'body, 'd, R: route::Spec, C> Frame<'a, 'req, 'body, 'd, R, C> {
+impl<'a, 'req: 'body, 'body, 'd, R: route::Spec> Frame<'a, 'req, 'body, 'd, R> {
     pub(crate) fn total(&self) -> usize {
         self.total
     }
 
-    pub(crate) fn into_parts(self) -> Split<'req, 'body, 'd, R, C> {
+    pub(crate) fn into_parts(self) -> Split<'req, 'body, 'd, R> {
         let len = self.body.len();
         let length = self.body.length();
         let (body, head) = self.body.into_parts();
@@ -102,21 +100,14 @@ impl<'a, 'req: 'body, 'body, 'd, R: route::Spec, C> Frame<'a, 'req, 'body, 'd, R
         let body = view
             .finish::<R>(len, length)
             .map_err(|error| parsing::Request::Wire(Failure::reject(error)))?;
-        Ok((
-            request,
-            body,
-            self.total,
-            self.connection,
-            self.coding,
-            self.response,
-        ))
+        Ok((request, body, self.total, self.connection, self.response))
     }
 
     pub(crate) fn drive<RouteState, Ready, Heads>(
-        base: framing::Head<'a, 'req, R, C>,
+        base: framing::Head<'a, 'req, R>,
         ingress: &'body mut session::Ingress<'d, RouteState, Ready, Heads>,
         proof: &mut impl credit::Evidence,
-    ) -> Result<framing::Progress<'a, 'req, 'body, 'd, R, C>, parsing::Request<R::Request>> {
+    ) -> Result<framing::Progress<'a, 'req, 'body, 'd, R>, parsing::Request<R::Request>> {
         const {
             assert!(
                 mem::size_of::<Self>()
@@ -128,7 +119,6 @@ impl<'a, 'req: 'body, 'body, 'd, R: route::Spec, C> Frame<'a, 'req, 'body, 'd, R
                         head::Connection,
                         u8,
                         usize,
-                        C,
                         response::Context,
                         Layout,
                     )>()
@@ -202,7 +192,6 @@ impl<'a, 'req: 'body, 'body, 'd, R: route::Spec, C> Frame<'a, 'req, 'body, 'd, R
             connection: base.connection,
             response: base.response,
             body: body.with_head(head),
-            coding: base.coding,
         }))
     }
 }
@@ -221,7 +210,6 @@ impl<'a, 'req: 'body, 'body, 'd, R: route::Spec<Request: route::Own>>
             connection: close,
             response,
             body,
-            coding: framing::Plain,
         } = self;
         let (body, head) = body.into_parts();
         let fields = framing::Fields {

@@ -8,6 +8,7 @@ use request::admit;
 use sark_http::{payload::owned, request::Id};
 
 use crate::{
+    body::Body,
     decode,
     decode::{dispatch, exec, request},
     duplex,
@@ -97,7 +98,7 @@ pub trait Runtime<'d>:
 
     fn try_dispatch(
         self: pin::Pin<&mut Self>,
-        req: request::Ready<exec::Task, Self::Prepared, owned::Segments<'d>>,
+        req: request::Admitted<exec::Task, Self::Prepared, Body<owned::Segments<'d>>>,
         target: Self::Target,
         owner: owner::Owner<Self::Target>,
         parent: ready::Target<'d>,

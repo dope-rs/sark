@@ -1,6 +1,7 @@
 use core::ops::ControlFlow;
 
 use dope::core::BranchError;
+use o3::buffer::{resident, segments};
 use sark_core::decode::{self, request, state};
 use sark_http::field::metadata::section::rules;
 
@@ -8,16 +9,52 @@ use crate::{
     conn::{self, event},
     frame::numbers,
     server::{
+        payload::Buffer,
         response::{self, Encoder, Handoff},
         state::exchange::{Accepted, Input, Rejected},
     },
 };
 
-mod guard;
-mod plain;
+fn resolve_body<'d, T, S>(
+    outcome: ControlFlow<T, S>,
+    body: Buffer<'d>,
+) -> ControlFlow<(T, Rejected<'d>), (S, Buffer<'d>)> {
+    match outcome {
+        ControlFlow::Continue(slot) => ControlFlow::Continue((slot, body)),
+        ControlFlow::Break(stop) => ControlFlow::Break((stop, Rejected::Body(body))),
+    }
+}
 
-pub(crate) use guard::Guard;
-pub(crate) use plain::Plain;
+impl<'d, F: Input<'d> + state::admit::Bodies> state::admit::Resolve<F> for Accepted<'d> {
+    type Stopped<T> = (T, Rejected<'d>);
+
+    fn open<T, S>(
+        outcome: ControlFlow<T, S>,
+        body: F::SyncOpen,
+    ) -> ControlFlow<Self::Stopped<T>, (S, Buffer<'d>)> {
+        resolve_body(outcome, body.into())
+    }
+
+    fn finished<T, S>(
+        outcome: ControlFlow<T, S>,
+        body: F::SyncFinished,
+    ) -> ControlFlow<Self::Stopped<T>, (S, Buffer<'d>)> {
+        resolve_body(outcome, body.into())
+    }
+
+    fn duplex<T, S>(
+        outcome: ControlFlow<T, S>,
+        body: F::DuplexOpen,
+    ) -> ControlFlow<Self::Stopped<T>, (S, Option<segments::Chain<resident::Shared<'d>>>)> {
+        match outcome {
+            ControlFlow::Continue(slot) => ControlFlow::Continue((slot, F::duplex(body))),
+            ControlFlow::Break(stop) => {
+                drop(body);
+                ControlFlow::Break((stop, Rejected::Duplex))
+            }
+        }
+    }
+}
 
 type Outcome<'d, P> = ControlFlow<
     (
@@ -41,13 +78,12 @@ pub(in crate::server) fn run<'req, 'd, R, F, M, E, P>(
 >
 where
     R: decode::Guarded,
-    F: Input<'d>,
+    F: Input<'d> + state::admit::Bodies,
     M: Handoff,
     E: event::Evidence,
     P: rules::Policy,
 {
-    let mut guard = Guard::<'d>::new();
-    match decode::Guarded::try_admit(app, routed, encoder, &mut guard) {
+    match app.try_admit::<_, _, Accepted<'d>>(routed, encoder) {
         ControlFlow::Continue(admitted) => Ok(ControlFlow::Continue(admitted)),
         ControlFlow::Break((outcome, input)) => match outcome {
             Ok(response) => {

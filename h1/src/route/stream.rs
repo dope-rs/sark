@@ -254,7 +254,7 @@ where
                 return reason.into_consume().into();
             }
         };
-        let (request, mut body, total, close, framing::Plain, response) = match frame.into_parts() {
+        let (request, mut body, total, close, response) = match frame.into_parts() {
             Ok(parts) => parts,
             Err(error) => return error.into_consume().into(),
         };

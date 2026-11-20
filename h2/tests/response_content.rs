@@ -20,7 +20,10 @@ use sark_h2::{
     stream::Id,
 };
 use sark_http::{
-    payload::response::{dispatch::Accept, status::Code},
+    payload::response::{
+        dispatch::{Accept, Sink},
+        status::Code,
+    },
     request::body::Ref,
 };
 
@@ -31,6 +34,7 @@ fn suppress_content() {
         (false, Code::NO_CONTENT),
         (false, Code::NOT_MODIFIED),
         (false, Code::RESET_CONTENT),
+        (false, Code::OK),
     ] {
         let mut domain = resident::Domain::new();
         region::Token::scope_pinned(Pin::new(&mut domain), |token, domain| {
@@ -45,8 +49,15 @@ fn suppress_content() {
             }
             .expect("request connection");
             let encoder = Encoder::new(&mut server, stream, Ref::from_slice(&[]));
-            let prepared = Accept::fixed(encoder, status, [TEXT], b"response".to_vec())
-                .expect("response head");
+            let prepared = if !head && status == Code::OK {
+                let (head, stream) = encoder
+                    .stream(status, [TEXT], None::<()>)
+                    .expect("empty stream");
+                assert!(stream.is_none());
+                head
+            } else {
+                Accept::fixed(encoder, status, [TEXT], b"response".to_vec()).expect("response head")
+            };
             assert!(prepared.finish().expect("commit response").is_none());
 
             let wire = server.output().first();

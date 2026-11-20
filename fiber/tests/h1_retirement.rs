@@ -7,7 +7,6 @@ use std::{
     time::Duration,
 };
 
-use common::server::recover;
 use common::{
     route::{
         body::session::LifetimeDispatch,
@@ -21,7 +20,7 @@ use common::{
     stacks::{self, Count, Probe, Step},
 };
 use dope::{
-    core::{driver::life::recovery::Policy, io::socket::Listener},
+    core::io::socket::Listener,
     net::wire::{self, domain},
     runtime::executor::session,
 };
@@ -31,6 +30,7 @@ use dope_test::{
     harness::{peer::Peer as TcpPeer, server::Pair, signals::LocalGate},
 };
 use o3::base::time::Positive;
+use sark_fiber::server::Serve as _;
 use sark_core::{
     deadline::{self, config},
     life::session::Config,
@@ -106,7 +106,7 @@ fn retires_body() {
                 .expect("install");
             })
         },
-        Policy::new(|event| reports.push(event), recover),
+        server::reporting(&mut reports),
         |result| {
             result
                 .as_ref()
@@ -157,7 +157,7 @@ fn retires_idle_generation() {
                     context,
                     (),
                     sark_fiber::Config::new(server::MAX_CONNECTIONS),
-                    Policy::new(|event| reports.push(event), recover),
+                    server::reporting(&mut reports),
                     |result| {
                         result
                             .as_ref()
@@ -166,10 +166,7 @@ fn retires_idle_generation() {
                             .expect("server teardown")
                     },
                 );
-                assert!(
-                    reports.events().expect("reclaimed resources").is_empty(),
-                    "server retirement: {reports:?}"
-                );
+                server::reclaimed(&reports);
                 result
             },
             |bind| {
@@ -239,7 +236,7 @@ fn completes_in_order() {
                 listener,
                 &state,
                 Probe(&log, &audits, diagnose_h1),
-                Policy::new(|event| reports.push(event), recover),
+                server::reporting(&mut reports),
                 |result| result.expect("observed server"),
             )
             .map(|()| {
@@ -324,7 +321,7 @@ fn deadline_after_eof() {
                 },
             ).expect("install");
         })),
-        Policy::new(|event| reports.push(event), recover),
+        server::reporting(&mut reports),
         |result| { result.as_ref().map_err(|error| error.cause()).expect("server teardown"); },
     );
     assert!(
@@ -380,7 +377,7 @@ fn resume_failure() {
                 listener,
                 &state,
                 Log(&log, &audits, diagnose),
-                Policy::new(|event| reports.push(event), recover),
+                server::reporting(&mut reports),
                 |result| result.expect("observed server"),
             )
             .map(|()| {

@@ -72,7 +72,7 @@ impl Target {
 }
 
 impl Plan {
-    pub(in crate::app) fn new(entries: &spec::Entries) -> syn::Result<Self> {
+    pub(in crate::app) fn new(entries: &[spec::Entry]) -> syn::Result<Self> {
         let routes = entries
             .iter()
             .map(|entry| {
@@ -150,7 +150,7 @@ impl Plan {
     pub(in crate::app) fn check_schema(
         &self,
         paths: &Paths,
-        handlers: &spec::Entries,
+        handlers: &[spec::Entry],
     ) -> proc_macro2::TokenStream {
         use quote::quote;
         let ns_core = &paths.core;

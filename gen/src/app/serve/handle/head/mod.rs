@@ -119,7 +119,6 @@ impl Head {
             let item = &entries[index];
             let route = &item.entry.route;
             let variant = &item.prepared;
-            let slot = &item.head;
             let schema = schema(index);
             let bytes =
                 (!planned).then(|| quote!(let #n_head = #ns_core::request::Head::from(#n_head);));
@@ -172,15 +171,15 @@ impl Head {
                 .map_err(#ns_core::decode::HeadError::Bind)?;
                 #bytes
                 return ::core::result::Result::Ok(
-                    #prepared::#variant(#slot {
+                    #prepared::#variant(
                         // SAFETY: this route produced both field sets from this unchanged head.
-                        head: unsafe {
+                        unsafe {
                             #ns_core::request::raw::Parsed::new(
                                 #n_head, #params, #n_rawhdr,
                             )
                         },
-                        content_length: #n_len,
-                    }),
+                        #n_len,
+                    ),
                 );
             }
         };

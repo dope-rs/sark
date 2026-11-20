@@ -18,13 +18,6 @@ pub trait Set:
     type Body;
 }
 
-/// Borrowed operation over an open buffered body without route identity.
-pub trait Each<F: Set>: Sized {
-    type Output<'a>;
-
-    fn apply<'a>(self, body: &'a mut F::Body) -> Self::Output<'a>;
-}
-
 /// Terminal operation that needs the selected route identity.
 pub trait Fold<P, F: Set>: Sized {
     type Output;

@@ -40,6 +40,7 @@ use dope_test::{
 };
 use dope_tls::tls::endpoint;
 use o3::buffer::hold::limits::Bound;
+use sark_fiber::server::Serve as _;
 use sark_fiber::Config;
 
 fn serve(
@@ -67,7 +68,7 @@ fn serve(
         |worker| {
             worker.lend(|plan, stage| {
                 Brand::with(|brand| {
-                    let router = ConnectDispatch::with_observer(
+                    let router = ConnectDispatch::with_observer::<wire::Identity, _, _>(
                         brand,
                         &state,
                         Config::new(server::MAX_CONNECTIONS)

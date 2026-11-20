@@ -20,7 +20,7 @@ use sark_core::{
 };
 use sark_http::{
     h1::codec::canned,
-    payload::{fixed, owned, response::dispatch},
+    payload::{fixed, owned},
 };
 use task::{request::Input, response};
 
@@ -62,14 +62,8 @@ impl<'turn> Egress<'turn> {
         let (id, outcome) = output.into_parts();
         match outcome {
             response::Outcome::Response(reply) => {
-                let reply = <R::Output as dispatch::IntoOutput<'d, 'd>>::into_output(reply);
                 output::Egress::new(self.write, self.date, self.response)
-                    .plain_task::<'d, 'd, <R::Output as dispatch::IntoOutput<'d, 'd>>::Output>(
-                    reply,
-                    id,
-                    self.connection,
-                    R::POLICY,
-                )
+                    .plain_task::<'d, 'd, R::Output>(reply, id, self.connection, R::POLICY)
             }
             response::Outcome::Rejected(error) => {
                 (output::Outcome::Close(Failure::Route(error).body()), None)

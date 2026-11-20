@@ -10,10 +10,7 @@ use sark_http::{
     },
     h1::{
         field::Entry,
-        head::{
-            line::Version,
-            request::{Coding, Fields},
-        },
+        head::{line::Version, request::Fields},
     },
     request::{self, span},
 };
@@ -70,12 +67,11 @@ pub(super) enum Step<R: route::Schema> {
 }
 
 /// Applies one field whose syntax and absolute spans the native cursor admitted.
-pub(super) fn apply<R: route::Schema, A: Admission>(
+pub(super) fn apply<R: route::Schema, A: Admission, const NEGOTIATE: bool>(
     headers: &mut R::RawHeaders,
     admission: &mut A,
     fields: &mut Fields,
     flags: &mut head::Flags,
-    coding: Coding,
     entry: Entry<'_>,
     version: Version,
 ) -> Result<(), Error<R>> {
@@ -86,7 +82,7 @@ pub(super) fn apply<R: route::Schema, A: Admission>(
         let skip = matches!(known, headers::Known::AcceptEncoding)
             && slot.is_none()
             && !R::FULL
-            && matches!(coding, Coding::Plain);
+            && !NEGOTIATE;
         if !skip {
             encoding = if R::Header::ENCODING && matches!(known, headers::Known::AcceptEncoding) {
                 head::AcceptEncoding::try_apply(fields, flags, entry.value()).map(Some)
@@ -146,7 +142,7 @@ impl Bounds {
     }
 }
 
-pub(super) struct Scan<'a, R: route::Schema, A = ()> {
+pub(super) struct Scan<'a, R: route::Schema, A = (), const NEGOTIATE: bool = false> {
     pub(super) headers: &'a mut R::RawHeaders,
     pub(super) admission: &'a mut A,
     pub(super) input: &'a [u8],
@@ -154,11 +150,10 @@ pub(super) struct Scan<'a, R: route::Schema, A = ()> {
     pub(super) start: usize,
     pub(super) fields: &'a mut Fields,
     pub(super) flags: &'a mut head::Flags,
-    pub(super) coding: Coding,
     pub(super) version: Version,
 }
 
-impl<'a, R: route::Schema, A: Admission> Scan<'a, R, A> {
+impl<'a, R: route::Schema, A: Admission, const NEGOTIATE: bool> Scan<'a, R, A, NEGOTIATE> {
     fn observe(&mut self, colon: usize, bounds: Bounds) -> Result<usize, Step<R>> {
         let tail = bounds.tail;
         if A::FIELDS {
@@ -285,11 +280,7 @@ impl<'a, R: route::Schema, A: Admission> Scan<'a, R, A> {
 
     fn miss(mut self, name_end: usize, known: Option<headers::Known>) -> Step<R> {
         let bounds = match known {
-            Some(headers::Known::AcceptEncoding)
-                if !R::FULL && matches!(self.coding, Coding::Plain) =>
-            {
-                self.value(name_end)
-            }
+            Some(headers::Known::AcceptEncoding) if !R::FULL && !NEGOTIATE => self.value(name_end),
             Some(known) => self.scan_known(known, name_end),
             None => self.value(name_end),
         };
@@ -355,7 +346,7 @@ impl<'a, R: route::Schema, A: Admission> Scan<'a, R, A> {
     }
 }
 
-impl<R, A: Admission> Prefix<R::Header> for Scan<'_, R, A>
+impl<R, A: Admission, const NEGOTIATE: bool> Prefix<R::Header> for Scan<'_, R, A, NEGOTIATE>
 where
     R: route::Schema,
 {

@@ -25,6 +25,7 @@ use dope_test::harness::{
 };
 use dope_tls::tls::endpoint;
 use sark_client::protocol::response::Event;
+use sark_fiber::server::Serve as _;
 use sark_fiber::{
     Config,
     client::{Ready, config},

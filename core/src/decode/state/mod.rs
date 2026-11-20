@@ -1,4 +1,4 @@
-use core::{convert::Infallible, marker::PhantomData, ops::ControlFlow};
+use core::{marker::PhantomData, ops::ControlFlow};
 
 use crate::{
     body::admit::{Finished, Open, Track},
@@ -145,91 +145,6 @@ pub trait Map<P, F: Set, G: Set>: Sized {
     ) -> ControlFlow<Self::Break, (Self::Retained, S, G::UnsupportedFinished)>;
 }
 
-/// Zero-state payload-preserving transition.
-pub struct Pass;
-
-impl<P, F, G> Map<P, F, G> for Pass
-where
-    F: Set,
-    G: Set<
-            SyncOpen = F::SyncOpen,
-            SyncFinished = F::SyncFinished,
-            TaskOpen = F::TaskOpen,
-            TaskFinished = F::TaskFinished,
-            DuplexOpen = F::DuplexOpen,
-            DuplexFinished = F::DuplexFinished,
-            UnsupportedOpen = F::UnsupportedOpen,
-            UnsupportedFinished = F::UnsupportedFinished,
-        >,
-{
-    type Break = Infallible;
-    type Retained = ();
-
-    fn sync_open<S: Slot<P>>(
-        self,
-        slot: S,
-        body: F::SyncOpen,
-    ) -> ControlFlow<Infallible, ((), S, F::SyncOpen)> {
-        ControlFlow::Continue(((), slot, body))
-    }
-
-    fn sync_done<S: Slot<P>>(
-        self,
-        slot: S,
-        body: F::SyncFinished,
-    ) -> ControlFlow<Infallible, ((), S, F::SyncFinished)> {
-        ControlFlow::Continue(((), slot, body))
-    }
-
-    fn task_open<S: Slot<P>>(
-        self,
-        slot: S,
-        body: F::TaskOpen,
-    ) -> ControlFlow<Infallible, ((), S, F::TaskOpen)> {
-        ControlFlow::Continue(((), slot, body))
-    }
-
-    fn task_done<S: Slot<P>>(
-        self,
-        slot: S,
-        body: F::TaskFinished,
-    ) -> ControlFlow<Infallible, ((), S, F::TaskFinished)> {
-        ControlFlow::Continue(((), slot, body))
-    }
-
-    fn duplex_open<S: Slot<P>>(
-        self,
-        slot: S,
-        body: F::DuplexOpen,
-    ) -> ControlFlow<Infallible, ((), S, F::DuplexOpen)> {
-        ControlFlow::Continue(((), slot, body))
-    }
-
-    fn duplex_done<S: Slot<P>>(
-        self,
-        slot: S,
-        body: F::DuplexFinished,
-    ) -> ControlFlow<Infallible, ((), S, F::DuplexFinished)> {
-        ControlFlow::Continue(((), slot, body))
-    }
-
-    fn reject_open<S: Slot<P>>(
-        self,
-        slot: S,
-        body: F::UnsupportedOpen,
-    ) -> ControlFlow<Infallible, ((), S, F::UnsupportedOpen)> {
-        ControlFlow::Continue(((), slot, body))
-    }
-
-    fn reject_done<S: Slot<P>>(
-        self,
-        slot: S,
-        body: F::UnsupportedFinished,
-    ) -> ControlFlow<Infallible, ((), S, F::UnsupportedFinished)> {
-        ControlFlow::Continue(((), slot, body))
-    }
-}
-
 /// Borrowed operation over one selected route state.
 pub trait Each<P, F: Set>: Sized {
     type Output<'a>;
@@ -352,7 +267,7 @@ pub trait Flow<P, F: Set>: Sized {
     where
         F: Finish;
 
-    fn each_open<'a, V: open::Each<F>>(&'a mut self, visit: V) -> V::Output<'a>
+    fn open_mut(&mut self) -> &mut F::Body
     where
         F: open::Set;
 
@@ -366,8 +281,8 @@ pub trait Flow<P, F: Set>: Sized {
 }
 
 /// Consuming unguarded transition into the application's admitted family.
-pub trait Admission<P, F: Set, G: Set>: Sized {
+pub trait Admission<G: admit::Payload>: Sized {
     type Output;
 
-    fn admit<V: admit::Visit<P, F, G>>(self, visit: &mut V) -> ControlFlow<V::Break, Self::Output>;
+    fn admit(self) -> Self::Output;
 }

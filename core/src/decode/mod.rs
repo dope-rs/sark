@@ -199,17 +199,15 @@ pub trait Full: Decode {
 
 /// Decoder capability implemented only by applications with guarded routes.
 pub trait Guarded: Decode {
-    fn try_admit<'req, 'd: 'req, E, F, G, V>(
+    fn try_admit<'req, 'd: 'req, E, F, G>(
         &self,
         request: request::Guarded<<Self::Routes as state::Family<Self::Prepared>>::State<F>>,
         encoder: E,
-        visit: &mut V,
-    ) -> Admission<'req, 'd, Self, E, F, G, V>
+    ) -> Admission<'req, 'd, Self, E, F, G>
     where
         E: Encode<'req, 'd>,
-        F: state::Set,
-        G: state::Set,
-        V: admit::TryVisit<Self::Prepared, F, G, <E as Encode<'req, 'd>>::Error>;
+        F: admit::Bodies,
+        G: admit::Resolve<F>;
 }
 
 type Dispatched<'req, 'd, E, F> = Result<
@@ -220,11 +218,9 @@ type Dispatched<'req, 'd, E, F> = Result<
     ),
 >;
 
-type Admission<'req, 'd, D, E, F, G, V> = ControlFlow<
-    <V as admit::TryVisit<<D as Decode>::Prepared, F, G, <E as Encode<'req, 'd>>::Error>>::Break<
-        <E as Encode<'req, 'd>>::Prepared,
-        <E as Cancel>::Target,
-    >,
+#[doc(hidden)]
+pub type Admission<'req, 'd, D, E, F, G> = ControlFlow<
+    <G as admit::Resolve<F>>::Stopped<request::admit::Encoded<'req, 'd, E>>,
     <<<D as Decode>::Prepared as request::Prepared>::Family as state::Family<
         <D as Decode>::Prepared,
     >>::State<G>,

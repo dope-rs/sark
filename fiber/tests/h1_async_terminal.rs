@@ -1,5 +1,6 @@
 pub mod common;
 
+use sark_fiber::server::Serve as _;
 use std::{
     cell::Cell,
     io::{Read, Write},

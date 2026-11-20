@@ -7,10 +7,7 @@ use sark_core::{
     },
     route,
 };
-use sark_http::{
-    h1::{framing::RequestBody, head::request::Coding},
-    request::Layout,
-};
+use sark_http::{h1::framing::RequestBody, request::Layout};
 
 use crate::{
     session,
@@ -28,7 +25,6 @@ type Discarded<'req, R> = Result<
         Length,
         session::Consumption,
         head::Connection,
-        Coding,
         response::Context,
     ),
     parsing::Request<<R as route::Spec>::Request>,
@@ -41,7 +37,6 @@ pub(crate) struct Discard<'a, 'req, R: route::Spec> {
     consumption: session::Consumption,
     connection: head::Connection,
     response: response::Context,
-    coding: Coding,
 }
 
 impl<'a, 'req, R: route::Spec> Discard<'a, 'req, R> {
@@ -53,13 +48,12 @@ impl<'a, 'req, R: route::Spec> Discard<'a, 'req, R> {
             self.content_length,
             self.consumption,
             self.connection,
-            self.coding,
             self.response,
         ))
     }
 
     pub(crate) fn drive<'d, RouteState, Ready, Heads>(
-        base: framing::Head<'a, 'req, R, Coding>,
+        base: framing::Head<'a, 'req, R>,
         ingress: &mut session::Ingress<'d, RouteState, Ready, Heads>,
         proof: &mut impl credit::Evidence,
     ) -> Result<framing::Discarded<'a, 'req, R>, parsing::Request<R::Request>> {
@@ -74,7 +68,6 @@ impl<'a, 'req, R: route::Spec> Discard<'a, 'req, R> {
                         Length,
                         session::Consumption,
                         head::Connection,
-                        Coding,
                         response::Context,
                         Layout,
                     )>()
@@ -132,7 +125,6 @@ impl<'a, 'req, R: route::Spec> Discard<'a, 'req, R> {
             consumption: used,
             connection: base.connection,
             response: base.response,
-            coding: base.coding,
         }))
     }
 }

@@ -139,7 +139,7 @@ impl<'d, R: route::Spec<Request: route::Own<RawParams = (), Mode = route::Stream
         let parsed = parsing::Head::parse(sark_h1::Input::Borrowed(wire), u8::MAX)
             .map_err(Error::Line)?
             .ok_or(Error::IncompleteLine)?;
-        let head = match framing::Head::<R>::parse(raw::Bound::empty(&parsed)) {
+        let head = match framing::Head::<R>::parse::<false>(raw::Bound::empty(&parsed)) {
             Ok(head) => head.ok_or(Error::IncompleteHead)?,
             Err(error) => {
                 return Ok((
@@ -257,7 +257,7 @@ where
                 return session::Outcome::Close(canned::BAD_REQUEST).into();
             }
         };
-        let head = match framing::Head::<R>::parse(raw::Bound::empty(&parsed)) {
+        let head = match framing::Head::<R>::parse::<false>(raw::Bound::empty(&parsed)) {
             Ok(Some(head)) => head,
             Ok(None) => {
                 this.error.get_or_insert(Error::IncompleteHead);

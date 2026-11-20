@@ -150,7 +150,7 @@ where
                 }
                 let emitted = match mem::replace(&mut output, Output::Resume) {
                     Output::Status(code) => Some(
-                        dispatch::Immediate::emit(
+                        dispatch::Complete::complete(
                             Response::new(code),
                             encoder::Encoder::new(h3.h3_mut(), id.target(), method),
                         )

@@ -58,23 +58,6 @@ impl EmptyState {
     pub const REF: &'static Self = &Self;
 }
 
-pub trait Response<'req, 'd>: Sized {
-    type Kind;
-    type Output: dispatch::Emit<'req, 'd>;
-    type Stream;
-
-    const BODY_KIND: payload::Kind = <Self::Output as dispatch::Emit<'req, 'd>>::BODY;
-}
-
-impl<'req, 'd, R> Response<'req, 'd> for R
-where
-    R: dispatch::IntoOutput<'req, 'd>,
-{
-    type Kind = <R::Output as dispatch::Emit<'req, 'd>>::Kind;
-    type Output = R::Output;
-    type Stream = <R::Output as dispatch::Emit<'req, 'd>>::Stream;
-}
-
 /// Projected request parts and the independently borrowed application state.
 pub type Args<'view, 'req, 'd, 'state, R, State> = (
     <R as route::Project>::Params<'req>,

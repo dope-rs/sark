@@ -63,7 +63,7 @@ fn omits_body() {
             let outcome = output::Egress::new(
                 writer.reborrow(),
                 DATE,
-                Context::new(method, Version::Eleven),
+                Context::new(method, Version::Eleven).with_coding(Coding::Gzip),
             )
             .route(
                 Reply {
@@ -73,7 +73,6 @@ fn omits_body() {
                 },
                 handoff::Slot::ready(None),
                 &mut gzip,
-                Coding::Gzip,
                 replies::POLICY,
             );
             let written = match outcome {
@@ -98,7 +97,7 @@ fn omits_body() {
 fn omits_stream() {
     for &request in replies::HEADS {
         let parsed = common::head::parsed(Input::Borrowed(request), u8::MAX);
-        let head = framing::Head::<Streaming>::parse(raw::Bound::empty(&parsed))
+        let head = framing::Head::<Streaming>::parse::<false>(raw::Bound::empty(&parsed))
             .ok()
             .flatten()
             .expect("framing");

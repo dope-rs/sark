@@ -1,3 +1,4 @@
+use miniz_oxide::deflate::core::TDEFLStatus;
 use o3::buffer::pool::owners;
 
 #[doc(hidden)]
@@ -18,6 +19,8 @@ pub trait Compression: Sized {
 
     /// Returns a smaller gzip body or keeps the original bytes unchanged.
     fn encode(&mut self, bytes: &[u8]) -> Output;
+
+    fn try_encode(&mut self, bytes: &[u8]) -> Result<Frozen, Error>;
 }
 
 #[doc(hidden)]
@@ -32,6 +35,26 @@ pub enum Output {
     Compressed(Frozen),
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Error {
+    Unavailable,
+    Input {
+        actual: usize,
+        limit: usize,
+    },
+    Exhausted,
+    Deflate {
+        status: TDEFLStatus,
+        read: usize,
+        wrote: usize,
+    },
+    Extent {
+        wrote: usize,
+        capacity: usize,
+        maximum: usize,
+    },
+}
+
 pub struct Gzip {
     encoder: encoder::Encoder,
     pool: pool::Pool<
@@ -44,6 +67,12 @@ impl Gzip {
     pub const SLOTS: num::NonZero<usize> = num::NonZero::<usize>::MIN.saturating_add(31);
     pub const CAPACITY: num::NonZero<usize> =
         num::NonZero::<usize>::MIN.saturating_add(256 * 1024 - 1);
+
+    fn try_compress(&mut self, src: &[u8], maximum: usize) -> Result<Frozen, Error> {
+        let mut lease = self.pool.acquire().ok_or(Error::Exhausted)?;
+        self.encoder.encode(src, lease.output(), maximum)?;
+        Ok(lease.freeze())
+    }
 }
 
 impl Compression for Gzip {
@@ -54,20 +83,23 @@ impl Compression for Gzip {
     }
 
     fn encode(&mut self, src: &[u8]) -> Output {
-        if src.len() <= encoder::FRAMING {
+        if !(encoder::FRAMING + 1..=encoder::MAX_INPUT).contains(&src.len()) {
             return Output::Plain;
         }
-        let cap = self.encoder.bound(src.len());
-        if cap > Self::CAPACITY.get() {
-            return Output::Plain;
+        match self.try_compress(src, src.len() - 1) {
+            Ok(frozen) => Output::Compressed(frozen),
+            Err(_) => Output::Plain,
         }
-        let Some(mut lease) = self.pool.acquire() else {
-            return Output::Plain;
-        };
-        let Some(()) = self.encoder.encode(src, lease.output()) else {
-            return Output::Plain;
-        };
-        Output::Compressed(lease.freeze())
+    }
+
+    fn try_encode(&mut self, src: &[u8]) -> Result<Frozen, Error> {
+        if src.len() > encoder::MAX_INPUT {
+            return Err(Error::Input {
+                actual: src.len(),
+                limit: encoder::MAX_INPUT,
+            });
+        }
+        self.try_compress(src, Self::CAPACITY.get())
     }
 }
 
@@ -78,5 +110,9 @@ impl Compression for () {
 
     fn encode(&mut self, _: &[u8]) -> Output {
         Output::Plain
+    }
+
+    fn try_encode(&mut self, _: &[u8]) -> Result<Frozen, Error> {
+        Err(Error::Unavailable)
     }
 }

@@ -24,6 +24,7 @@ use sark::http::payload::response::{
     dispatch::{Stream, chunk::Chunk},
     headers::{set, value::Item},
 };
+use sark_fiber::server::Serve as _;
 use sark_fiber::{
     Throughput,
     fiber::{IntoStream as _, IterStream},

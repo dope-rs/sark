@@ -1,7 +1,7 @@
 use core::{convert::Infallible, marker::PhantomData};
 
 use sark_core::{
-    body::{buffered, credit},
+    body::{Body, buffered, credit},
     decode::{
         exec, request,
         state::{self, Family, Set, open},
@@ -31,8 +31,8 @@ pub(in crate::manifold) struct Buffered<'d, P: request::Prepared> {
 }
 
 pub(in crate::manifold) enum Finished<'d, P> {
-    Sync(request::Ready<exec::Sync, P, owned::Segments<'d>>),
-    Task(request::Ready<exec::Task, P, owned::Segments<'d>>),
+    Sync(request::Admitted<exec::Sync, P, Body<owned::Segments<'d>>>),
+    Task(request::Admitted<exec::Task, P, Body<owned::Segments<'d>>>),
 }
 
 impl<'d, P: request::Prepared> Buffered<'d, P> {

@@ -3,6 +3,22 @@ use crate::{
     runtime::paths::Paths,
 };
 
+pub(super) fn negotiate(
+    paths: &Paths,
+    entry: &serve::RouteSpec<'_, serve::Mode<'_>>,
+) -> proc_macro2::TokenStream {
+    let ns_h1 = &paths.h1;
+    let route = &entry.entry.route;
+    if matches!(entry.mode, serve::Mode::Sync) {
+        quote::quote!(::core::matches!(
+            <#route as #ns_h1::route::PolicyOf>::POLICY.mode,
+            #ns_h1::route::Mode::Gzip | #ns_h1::route::Mode::RequiredGzip,
+        ))
+    } else {
+        quote::quote!(false)
+    }
+}
+
 /// Closed generated ownership of every routed H1 continuation.
 pub(in crate::app::serve) struct Plan<'source, 'spec> {
     generics: &'spec crate::types::Generics,
@@ -77,7 +93,6 @@ impl<'source, 'spec> Plan<'source, 'spec> {
         let ns_core = &paths.core;
         let ns_fiber = &paths.fiber;
         let ns_h1 = &paths.h1;
-        let ns_http = &paths.http;
         let life = self.bodies().next().map(|_| quote::quote!(<'d>));
         let entries = self.bodies().map(|item| {
             let variant = &item.pending_variant;
@@ -106,15 +121,13 @@ impl<'source, 'spec> Plan<'source, 'spec> {
         let headers = self.entries.iter().map(|item| {
             let variant = &item.pending_variant;
             let route = &item.entry.route;
-            let coding = if item.entry.upgrade {
-                quote::quote!(, #ns_h1::wire::parsing::framing::Plain,
-                    #ns_h1::route::duplex::Upgrade)
-            } else if item.kind == spec::Kind::Sync {
-                quote::quote!(, #ns_http::h1::head::request::Coding)
+            let admission = if item.entry.upgrade {
+                quote::quote!(#ns_h1::route::duplex::Upgrade)
             } else {
-                quote::quote!()
+                quote::quote!(())
             };
-            quote::quote!(#variant(#ns_h1::wire::parsing::framing::PendingHead<#route #coding>),)
+            let negotiate = negotiate(paths, item);
+            quote::quote!(#variant(#ns_h1::wire::parsing::framing::PendingHead<#route, #admission, { #negotiate }>),)
         });
         let builders: Vec<_> = self
             .entries

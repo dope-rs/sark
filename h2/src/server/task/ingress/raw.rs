@@ -3,10 +3,7 @@ use std::num::NonZero;
 use o3::{buffer::resident, depot::queue::indexed::keyed};
 use sark_core::{
     body::{self, credit},
-    decode::{
-        request,
-        state::{self, open},
-    },
+    decode::{request, state},
 };
 
 use crate::{
@@ -101,41 +98,10 @@ impl<'a, 'ledger, 'd, P: request::Prepared, O: credit::Origin> Buffering<'a, 'le
         data: event::DataPayload<resident::Shared<'d>>,
         limits: server::Config,
     ) -> payload::Push<event::DataPayload<resident::Shared<'d>>> {
-        state::Flow::each_open(
-            &mut self.buffered.request,
-            Feed {
-                ledger: self.ledger,
-                evidence,
-                data,
-                limits,
-            },
-        )
-    }
-}
-
-struct Feed<'a, 'ledger, 'd, O: credit::Origin, E> {
-    ledger: &'a mut credit::raw::Ledger<'ledger, O>,
-    evidence: E,
-    data: event::DataPayload<resident::Shared<'d>>,
-    limits: server::Config,
-}
-
-impl<'d, O: credit::Origin, E: credit::Evidence> open::Each<Receiving<'d>>
-    for Feed<'_, '_, 'd, O, E>
-{
-    type Output<'a> = payload::Push<event::DataPayload<resident::Shared<'d>>>;
-
-    fn apply<'a>(self, body: &'a mut payload::Buffer<'d>) -> Self::Output<'a> {
-        // SAFETY: this callback is created only by Buffering and selects the
-        // retained request's exact body under its issuing account's ledger.
+        let body = state::Flow::open_mut(&mut self.buffered.request);
+        // SAFETY: Buffering holds the selected request and its issuing ledger.
         let mut body = unsafe { payload::raw::Loan::new(body, self.ledger) };
-        let request = self.limits.request(body.max_body());
-        body.try_push(
-            self.ledger,
-            self.evidence,
-            self.data,
-            request,
-            self.limits.connection(),
-        )
+        let request = limits.request(body.max_body());
+        body.try_push(self.ledger, evidence, data, request, limits.connection())
     }
 }

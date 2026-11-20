@@ -1,4 +1,7 @@
-use sark_core::decode::{exec, request};
+use sark_core::{
+    body::Body,
+    decode::{exec, request},
+};
 use sark_http::payload::{
     owned,
     response::{Method, dispatch::chunk::Chunk},
@@ -8,12 +11,12 @@ use crate::conn::io::replies::Plan;
 use crate::manifold::{encoder, owners, requests::Id};
 
 pub(in crate::manifold) enum Input<'d, P, O> {
-    Buffered(request::Ready<exec::Task, P, owned::Segments<'d>>),
+    Buffered(request::Admitted<exec::Task, P, Body<owned::Segments<'d>>>),
     Built { output: O },
 }
 
 pub(in crate::manifold) struct Buffered<'d, P> {
-    pub(in crate::manifold) request: request::Ready<exec::Sync, P, owned::Segments<'d>>,
+    pub(in crate::manifold) request: request::Admitted<exec::Sync, P, Body<owned::Segments<'d>>>,
     pub(in crate::manifold) method: Method,
 }
 

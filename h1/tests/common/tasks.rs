@@ -11,15 +11,12 @@ use sark_core::{
     },
 };
 use sark_h1::{
-    route::{Policy, PolicyOf},
+    route::{Mode, Policy, PolicyOf},
     session,
     wire::{head::Connection, response::Context},
 };
 use sark_http::{
-    h1::head::{
-        request::Coding,
-        response::{Date, Server},
-    },
+    h1::head::response::{Date, Server},
     payload::{owned, response::dispatch},
     request::{Id, body::Ref},
 };
@@ -225,19 +222,19 @@ pub struct Builder<'d> {
     retained: owned::Segments<'d>,
 }
 
-pub struct Streaming;
+pub struct Streaming<const PRESENT: bool = true>;
 pub fn stream(ready: bool) -> Option<impl FnOnce((), &mut (), Context)> {
     ready.then_some(|(), _: &mut (), _: Context| {})
 }
-impl route::Spec for Streaming {
+impl<const PRESENT: bool> route::Spec for Streaming<PRESENT> {
     type Kind = dispatch::Polled;
     type Request = Request;
     type Stream<'d> = ();
 }
-impl PolicyOf for Streaming {
-    const POLICY: Policy = Policy::new(Coding::Plain, Date::Omit, Server::Omit);
+impl<const PRESENT: bool> PolicyOf for Streaming<PRESENT> {
+    const POLICY: Policy = Policy::new(Mode::Plain, Date::Omit, Server::Omit);
 }
-impl manifold::Route<Cell<usize>> for Streaming {
+impl<const PRESENT: bool> manifold::Route<Cell<usize>> for Streaming<PRESENT> {
     type Response<'req, 'd>
         = dispatch::Stream<'req, ()>
     where
@@ -250,7 +247,7 @@ impl manifold::Route<Cell<usize>> for Streaming {
         'd: 'req,
     {
         state.set(body);
-        dispatch::Stream::new(())
+        dispatch::Stream::new(PRESENT.then_some(()))
     }
 }
 

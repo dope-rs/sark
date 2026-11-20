@@ -1,8 +1,5 @@
 use crate::{
-    app::{
-        serve::{self, app, duplex, handle::h1::plan},
-        spec,
-    },
+    app::serve::{self, app, duplex, handle::h1::plan},
     runtime::paths::Paths,
 };
 
@@ -43,99 +40,28 @@ pub(in crate::app::serve) fn h1_payload(
     }
 }
 
-fn emit_guards<M>(
+fn guard_rejection(
     paths: &Paths,
-    spec: &spec::Spec,
-    entries: &[serve::RouteSpec<'_, M>],
-) -> Vec<proc_macro2::TokenStream> {
-    let symbols = &spec.state_generics;
-    let [n_head, n_reject] = symbols.locals(["__head", "__reject"]);
-    let [n_resp, n_state] = symbols.locals(["__response", "__state"]);
-    let [l_driver, l_req] = spec
-        .state_generics
-        .lives(["__sark_driver", "__sark_request"]);
-    let g_r = spec.state_generics.ident("__R");
-    use quote::quote;
-
-    let ns_core = &paths.core;
-    let ns_http = &paths.http;
-    let state_ty = spec.state.ty();
-    let lives = &spec.state_generics.lifetimes;
-    let decls = &spec.state_generics.parameters;
-    let clauses = &spec.state_generics.predicates;
-    let generics = match (spec.driver, lives.is_empty() && decls.is_empty()) {
-        (spec::Driver::Absent, true) => proc_macro2::TokenStream::new(),
-        (spec::Driver::Absent, false) => quote! { < #( #lives, )* #( #decls, )* > },
-        (spec::Driver::Present, _) => quote! { < 'd, #( #lives, )* #( #decls, )* > },
-    };
-    entries
-        .iter()
-        .map(|item| {
-            let slot = &item.head;
-            let entry = item.entry;
-            let guards = &entry.guards;
-            let (head, state) = match entry.guards.is_empty() {
-                true => (quote!(_), quote!(_)),
-                false => (quote!(#n_head), quote!(#n_state)),
-            };
-            let checks = entry.guards.iter().map(|guard| {
-                quote! {
-                    if let ::core::ops::ControlFlow::Break(#n_resp) =
-                        <#guard as #ns_core::route::guard::Guard<#state_ty>>::check(
-                            #n_head,
-                            #n_state,
-                        )
-                    {
-                        let #n_resp =
-                            #ns_http::payload::response::dispatch::IntoOutput::into_output(
-                                #n_resp,
-                            );
-                        return ::core::ops::ControlFlow::Break(
-                            #ns_core::route::guard::Reject::try_reject(
-                                #n_reject,
-                                #n_resp,
-                            ),
-                        );
-                    }
-                }
-            });
-            quote! {
-                impl #generics #ns_core::route::guard::Slot<#state_ty> for #slot
-                where
-                    #( #clauses, )*
-                    #( #guards: #ns_core::route::guard::Guard<#state_ty>, )*
-                {
-                    #[inline(always)]
-                    fn try_admit<
-                        #l_req,
-                        #l_driver,
-                        #g_r,
-                    >(
-                        #head: #ns_core::route::guard::Head<#l_req>,
-                        #state: &#l_req #state_ty,
-                        #n_reject: #g_r,
-                    ) -> ::core::ops::ControlFlow<
-                        <#g_r as #ns_core::route::guard::Reject<
-                            #l_req,
-                            #l_driver,
-                        >>::Break,
-                        #g_r,
-                    >
-                    where
-                        #l_driver: #l_req,
-                        #state_ty: #l_req,
-                        #g_r: #ns_core::route::guard::Reject<
-                            #l_req,
-                            #l_driver,
-                        >,
-                    {
-                        #( #checks )*
-                        ::core::ops::ControlFlow::Continue(#n_reject)
-                    }
-                }
-            }
-        })
-        .collect()
+    symbols: &crate::types::Generics,
+    guards: &[syn::TypePath],
+    state: &syn::Type,
+    app: &impl quote::ToTokens,
+    sink: proc_macro2::TokenStream,
+    pass: proc_macro2::TokenStream,
+) -> proc_macro2::TokenStream {
+    let core = &paths.core;
+    let reject = symbols.lifetime("__guard_rejected");
+    let [head, state_ref, response] =
+        symbols.locals(["__guard_head", "__guard_state", "__guard_response"]);
+    quote::quote! { #reject: {
+        let #state_ref = #app;
+        #(if let ::core::ops::ControlFlow::Break(#response) =
+            <#guards as #core::route::guard::Guard<#state>>::check(#head, #state_ref)
+        {
+            break #reject #core::route::guard::Reject::try_reject(#sink, #response);
+        })*
+        #pass
+    } }
 }
 
 impl<'view, 'source, 'spec> Context<'view, 'source, 'spec> {

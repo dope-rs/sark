@@ -5,9 +5,12 @@ use o3::{
     buffer::{storage, write::consume},
 };
 use sark_http::{
-    h1::{codec::canned, head::line::Version},
+    h1::{
+        codec::canned,
+        head::{line::Version, request::Coding},
+    },
     payload::{
-        fixed, owned,
+        compress, fixed, owned,
         response::{exact, status::Code},
     },
 };
@@ -27,6 +30,8 @@ pub enum Error {
     Informational(Code),
     Tunnel(Code),
     StreamingVersion(Version),
+    Compression(compress::Error),
+    NotAcceptable(Coding),
 }
 
 impl Error {
@@ -37,15 +42,16 @@ impl Error {
             | Self::Owner(owned::Error::Metadata(alloc::Error::Exhausted))
             | Self::Owner(owned::Error::Retain(_))
             | Self::Owner(owned::Error::Storage(storage::AllocError::Exhausted(_)))
-            | Self::Owner(owned::Error::Build(storage::BuildError::Exhausted(_))) => {
-                canned::SERVICE_UNAVAILABLE
-            }
+            | Self::Owner(owned::Error::Build(storage::BuildError::Exhausted(_)))
+            | Self::Compression(compress::Error::Exhausted) => canned::SERVICE_UNAVAILABLE,
             Self::Wire(_)
             | Self::Overflow { .. }
             | Self::Encoding { .. }
             | Self::Size(_)
             | Self::Build(_)
-            | Self::Owner(_) => canned::INTERNAL_SERVER_ERROR,
+            | Self::Owner(_)
+            | Self::Compression(_) => canned::INTERNAL_SERVER_ERROR,
+            Self::NotAcceptable(_) => canned::NOT_ACCEPTABLE,
             Self::Informational(_) | Self::Tunnel(_) | Self::StreamingVersion(_) => {
                 canned::INTERNAL_SERVER_ERROR
             }

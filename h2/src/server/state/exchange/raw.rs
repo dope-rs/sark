@@ -144,19 +144,14 @@ where
 
     fn apply(self, value: body::Value<F>) -> Self::Output {
         let Self { ledger, evidence } = self;
-        let body = match value {
-            body::Value::SyncOpen(body) => F::sync(body),
-            body::Value::SyncFinished(body) => F::sync_done(body),
-            body::Value::TaskOpen(body) => F::task(body),
-            body::Value::TaskFinished(body) => F::task_done(body),
-            body::Value::UnsupportedOpen(body) => F::other(body),
-            body::Value::UnsupportedFinished(body) => F::other_done(body),
-            body::Value::DuplexOpen(body) => {
-                F::close_duplex(body);
-                return Ok(());
-            }
-            body::Value::DuplexFinished(body) => {
-                F::end_duplex(body);
+        let body: Buffer<'d> = match value {
+            body::Value::SyncOpen(body) | body::Value::TaskOpen(body) => body.into(),
+            body::Value::UnsupportedOpen(body) => body.into(),
+            body::Value::SyncFinished(body)
+            | body::Value::TaskFinished(body)
+            | body::Value::UnsupportedFinished(body) => body.into(),
+            body::Value::DuplexOpen(body) | body::Value::DuplexFinished(body) => {
+                drop(body);
                 return Ok(());
             }
         };

@@ -32,6 +32,13 @@ impl Count for () {
     }
 }
 
+impl Count for bool {
+    fn add(&mut self) -> Result<(), Error> {
+        *self = true;
+        Ok(())
+    }
+}
+
 impl Count for usize {
     fn add(&mut self) -> Result<(), Error> {
         let current = *self;

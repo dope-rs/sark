@@ -55,13 +55,8 @@ pub enum Error<R: route::Schema> {
     Storage(storage::AllocError),
     Syntax(syntax::Error),
     Line(line::Error<R>),
-    Fields {
-        actual: usize,
-        limit: usize,
-    },
-    Length {
-        len: usize,
-    },
+    Fields { actual: usize, limit: usize },
+    Length { len: usize },
     Target(Semantic),
     Method(Semantic),
     Layout(target::Error),
@@ -112,13 +107,6 @@ pub struct Parsed<H, A: Admission = ()> {
     layout: Layout,
     connection: Connection,
     response: response::Context,
-}
-
-/// An admitted request head paired with its permitted response coding.
-#[doc(hidden)]
-pub struct Gzip<H, A: Admission = ()> {
-    head: Parsed<H, A>,
-    coding: request::Coding,
 }
 
 impl<H, A: Admission> Parsed<H, A> {
@@ -178,11 +166,10 @@ impl<H, A: Admission> Block<H, A> {
 
     /// Scans one route-specific HTTP/1 field block.
     #[doc(hidden)]
-    pub fn parse<R>(
+    pub fn parse<R, const NEGOTIATE: bool>(
         input: &[u8],
         start: usize,
         limit: usize,
-        coding: request::Coding,
         version: Version,
     ) -> Result<Option<Self>, Error<R>>
     where
@@ -190,18 +177,17 @@ impl<H, A: Admission> Block<H, A> {
         R: route::Schema<RawHeaders = H>,
     {
         Ok(
-            match Self::scan::<R>(input, start, limit, coding, version)? {
+            match Self::scan::<R, NEGOTIATE>(input, start, limit, version)? {
                 Scanned::Complete(block) => Some(block),
                 Scanned::Pending(_) => None,
             },
         )
     }
 
-    pub(crate) fn scan<'input, R>(
+    pub(crate) fn scan<'input, R, const NEGOTIATE: bool>(
         input: &'input [u8],
         start: usize,
         limit: usize,
-        coding: request::Coding,
         version: Version,
     ) -> Result<Scanned<'input, H, A>, Error<R>>
     where
@@ -237,7 +223,7 @@ impl<H, A: Admission> Block<H, A> {
                     Err(error) => return Err(Error::Syntax(error)),
                 };
             }
-            let prefix = line::Scan::<R, A> {
+            let prefix = line::Scan::<R, A, NEGOTIATE> {
                 headers: &mut headers,
                 admission: &mut admission,
                 input,
@@ -245,7 +231,6 @@ impl<H, A: Admission> Block<H, A> {
                 start: pos,
                 fields: &mut fields,
                 flags: &mut flags,
-                coding,
                 version,
             };
             match R::Header::prefix(prefix) {
@@ -286,20 +271,18 @@ impl<H, A: Admission> Block<H, A> {
 impl<H, A: Admission> Parsed<H, A> {
     /// Parses and admits one route-specific HTTP/1 request head.
     #[doc(hidden)]
-    pub fn parse<R>(source: &parsing::Head<'_>, limit: usize) -> Result<Option<Self>, Error<R>>
+    pub fn parse<R, const NEGOTIATE: bool>(
+        source: &parsing::Head<'_>,
+        limit: usize,
+    ) -> Result<Option<Self>, Error<R>>
     where
         H: Default,
         R: route::Schema<RawHeaders = H>,
     {
         let input = source.input().as_slice();
         let request = source.request();
-        let Some(block) = Block::<H, A>::parse::<R>(
-            input,
-            request.end(),
-            limit,
-            request::Coding::Plain,
-            request.version(),
-        )?
+        let Some(block) =
+            Block::<H, A>::parse::<R, NEGOTIATE>(input, request.end(), limit, request.version())?
         else {
             return Ok(None);
         };
@@ -351,38 +334,12 @@ impl<H, A: Admission> Parsed<H, A> {
             expectation: admit.expectation(),
             layout,
             connection: conn,
-            response: response.with_connection(conn),
+            response: response
+                .with_connection(conn)
+                .with_coding(fields.message.coding()),
         })
     }
 }
 
-impl<H, A: Admission> Gzip<H, A> {
-    #[doc(hidden)]
-    pub fn parse<R>(
-        source: &parsing::Head<'_>,
-        limit: usize,
-        coding: request::Coding,
-    ) -> Result<Option<Self>, Error<R>>
-    where
-        H: Default,
-        R: route::Schema<RawHeaders = H>,
-    {
-        let input = source.input().as_slice();
-        let request = source.request();
-        let Some(block) =
-            Block::<H, A>::parse::<R>(input, request.end(), limit, coding, request.version())?
-        else {
-            return Ok(None);
-        };
-        let coding = block.fields.message.coding();
-        Parsed::from_block::<R>(block, request).map(|head| Some(Self { head, coding }))
-    }
-
-    pub(crate) fn into_parts(self) -> (Parsed<H, A>, request::Coding) {
-        (self.head, self.coding)
-    }
-}
-
 const _: () = assert!(core::mem::size_of::<Parsed<()>>() <= 7 * core::mem::size_of::<usize>());
-const _: () = assert!(core::mem::size_of::<Gzip<()>>() <= 7 * core::mem::size_of::<usize>());
 const _: () = assert!(core::mem::size_of::<Connection>() == core::mem::size_of::<bool>());

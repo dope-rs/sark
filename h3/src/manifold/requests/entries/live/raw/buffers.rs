@@ -1,6 +1,5 @@
-use o3::buffer::{segments, segments::assembly};
 use sark_core::{
-    body::{buffered, credit, input},
+    body::{Body, buffered, credit, input},
     decode::{
         request,
         state::{self, Slot, open},
@@ -45,16 +44,35 @@ pub(super) unsafe fn try_push<'d, P: request::Prepared, E: credit::Evidence, O: 
 ) -> Result<(), requests::Error> {
     let bytes = input.len();
     let chunks = input.count();
-    let pushed = state::Flow::each_open(
-        &mut body.request,
-        Feed {
-            ledger,
-            evidence,
-            input,
-            bytes,
-            chunks,
-            request,
-            conn,
+    let body = state::Flow::open_mut(&mut body.request);
+    // SAFETY: the caller holds this selected slot and its issuing account.
+    let mut body = unsafe { ledger.bind_mut(body) };
+    let pushed = body.try_push(
+        ledger,
+        evidence,
+        input::Input::new(input, bytes, chunks),
+        request,
+        conn,
+        |current, input| {
+            let incoming = input.into_body();
+            match current {
+                Some(current) => match current.try_extend(incoming) {
+                    Ok(body) => buffered::Retain::Accepted {
+                        storage: Some(body),
+                    },
+                    Err(rejected) => {
+                        let ((body, incoming), error) = rejected.into_parts();
+                        buffered::Retain::Rejected {
+                            storage: Some(body),
+                            input: Payload::from_body(incoming),
+                            error,
+                        }
+                    }
+                },
+                None => buffered::Retain::Accepted {
+                    storage: Some(incoming),
+                },
+            }
         },
     );
     match pushed {
@@ -85,65 +103,6 @@ pub(super) unsafe fn try_discard<
     })
 }
 
-struct Feed<'a, 'account, 'd, E, O: credit::Origin> {
-    ledger: &'a mut credit::raw::Ledger<'account, O>,
-    evidence: E,
-    input: Payload<'d>,
-    bytes: usize,
-    chunks: segments::Count,
-    request: credit::Limits,
-    conn: credit::Limits,
-}
-
-impl<'d, E: credit::Evidence, O: credit::Origin> open::Each<Receiving<'d>>
-    for Feed<'_, '_, 'd, E, O>
-{
-    type Output<'a> = buffered::Push<Payload<'d>, assembly::Error>;
-
-    fn apply<'a>(self, body: &'a mut buffered::State<owned::Segments<'d>>) -> Self::Output<'a> {
-        let Self {
-            ledger,
-            evidence,
-            input,
-            bytes,
-            chunks,
-            request,
-            conn,
-        } = self;
-        // SAFETY: Feed is created only by the buffered operation whose caller
-        // holds the exact selected slot and its issuing account proof.
-        let mut body = unsafe { ledger.bind_mut(body) };
-        body.try_push(
-            ledger,
-            evidence,
-            input::Input::new(input, bytes, chunks),
-            request,
-            conn,
-            |current, input| {
-                let incoming = input.into_body();
-                match current {
-                    Some(current) => match current.try_extend(incoming) {
-                        Ok(body) => buffered::Retain::Accepted {
-                            storage: Some(body),
-                        },
-                        Err(rejected) => {
-                            let ((body, incoming), error) = rejected.into_parts();
-                            buffered::Retain::Rejected {
-                                storage: Some(body),
-                                input: Payload::from_body(incoming),
-                                error,
-                            }
-                        }
-                    },
-                    None => buffered::Retain::Accepted {
-                        storage: Some(incoming),
-                    },
-                }
-            },
-        )
-    }
-}
-
 struct Finish<'a, 'account, E, O: credit::Origin> {
     ledger: &'a mut credit::raw::Ledger<'account, O>,
     evidence: E,
@@ -163,7 +122,7 @@ impl<'a, 'account, E, O: credit::Origin> Finish<'a, 'account, E, O> {
         mut self,
         slot: S,
         body: buffered::State<owned::Segments<'d>>,
-    ) -> Result<request::Ready<K, P, owned::Segments<'d>>, exchange::Error>
+    ) -> Result<request::Admitted<K, P, Body<owned::Segments<'d>>>, exchange::Error>
     where
         E: credit::Evidence,
         S: Slot<P>,
@@ -175,7 +134,7 @@ impl<'a, 'account, E, O: credit::Origin> Finish<'a, 'account, E, O> {
             .admit::<K, _>(body)
             .try_map_body(|body| body.try_finish(self.ledger, &mut self.evidence))
         {
-            Ok(request) => Ok(request.ready()),
+            Ok(request) => Ok(request),
             Err(failure) => {
                 let error = *failure.error().error();
                 match failure

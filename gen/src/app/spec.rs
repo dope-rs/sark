@@ -1,5 +1,3 @@
-use std::{iter, ops};
-
 use syn::{ext::IdentExt, visit::Visit};
 
 use crate::{
@@ -15,22 +13,6 @@ pub(super) enum Kind {
     Fiber,
     Stream,
     Duplex,
-}
-
-#[derive(Clone, Copy, PartialEq, Eq)]
-pub(super) enum Homogeneity {
-    Uniform(Kind),
-    Mixed,
-}
-
-impl Homogeneity {
-    fn include(&mut self, kind: Kind) {
-        if let Self::Uniform(current) = self
-            && *current != kind
-        {
-            *self = Self::Mixed;
-        }
-    }
 }
 
 pub(super) enum Mode {
@@ -55,37 +37,6 @@ pub(super) struct Entry {
     pub(super) guards: Vec<syn::TypePath>,
     pub(super) request: inputs::Request,
     pub(super) mode: Mode,
-}
-
-pub(in crate::app) struct Entries {
-    first: Entry,
-    rest: Vec<Entry>,
-    pub(in crate::app) homogeneity: Homogeneity,
-}
-
-impl ops::Index<usize> for Entries {
-    type Output = Entry;
-
-    fn index(&self, index: usize) -> &Self::Output {
-        match index {
-            0 => &self.first,
-            index => &self.rest[index - 1],
-        }
-    }
-}
-
-impl Entries {
-    pub(in crate::app) fn iter(&self) -> impl Iterator<Item = &Entry> {
-        iter::once(&self.first).chain(self.rest.iter())
-    }
-
-    pub(in crate::app) const fn len(&self) -> usize {
-        self.rest.len() + 1
-    }
-
-    pub(in crate::app) fn iter_mut(&mut self) -> impl Iterator<Item = &mut Entry> {
-        iter::once(&mut self.first).chain(self.rest.iter_mut())
-    }
 }
 
 pub(super) enum State {
@@ -113,19 +64,9 @@ pub(super) struct Spec {
     pub(super) state: State,
     pub(super) driver: Driver,
     pub(super) state_generics: types::Generics,
-    pub(super) route_specs: Entries,
+    pub(super) route_specs: Vec<Entry>,
     pub(super) route_bounds: Vec<proc_macro2::TokenStream>,
     pub(super) route_plan: route::Plan,
-}
-
-struct Route {
-    route: syn::TypePath,
-    method: proc_macro2::Ident,
-    protocol: Option<syn::LitStr>,
-    path: syn::LitStr,
-    guards: Vec<syn::TypePath>,
-    request: inputs::Request,
-    kind: inputs::Kind,
 }
 
 #[derive(Clone, Copy)]
@@ -192,13 +133,13 @@ impl Spec {
         family.reserve().visit_type(state_ty);
         let mut routes = Vec::new();
         Self::flatten("", &[], entries, &mut routes);
-        for route in &routes {
+        for (service, guards) in &routes {
             let mut names = family.reserve();
-            names.visit_type_path(&route.route);
-            for guard in &route.guards {
+            names.visit_type_path(&service.route.ty);
+            for guard in guards {
                 names.visit_type_path(guard);
             }
-            match &route.kind {
+            match &service.route.kind {
                 inputs::Kind::Async {
                     capacity: Some(capacity),
                     ..
@@ -213,30 +154,16 @@ impl Spec {
                 | inputs::Kind::Stream { capacity: None } => {}
             }
         }
-        let mut built = routes
+        let specs = routes
             .into_iter()
-            .map(|route| build_route_entry(route, scope));
-        let (first, first_k) = match built.next() {
-            Some(first) => first?,
-            None => {
-                return Err(syn::Error::new_spanned(
-                    &name,
-                    "an application requires at least one route",
-                ));
-            }
-        };
-        let mut mix = Homogeneity::Uniform(first_k);
-        let mut rest = Vec::new();
-        for entry in built {
-            let (entry, kind) = entry?;
-            mix.include(kind);
-            rest.push(entry);
+            .map(|(service, guards)| build_route_entry(service, guards, scope))
+            .collect::<syn::Result<Vec<_>>>()?;
+        if specs.is_empty() {
+            return Err(syn::Error::new_spanned(
+                &name,
+                "an application requires at least one route",
+            ));
         }
-        let specs = Entries {
-            first,
-            rest,
-            homogeneity: mix,
-        };
         if specs.len() > u32::MAX as usize {
             return Err(syn::Error::new_spanned(
                 &name,
@@ -261,29 +188,17 @@ impl Spec {
         prefix: &str,
         guards: &[syn::TypePath],
         entries: Vec<inputs::Entry>,
-        out: &mut Vec<Route>,
+        out: &mut Vec<(inputs::Service, Vec<syn::TypePath>)>,
     ) {
         for entry in entries {
             match entry {
                 inputs::Entry::Service(service) => {
-                    let inputs::Service {
-                        method,
-                        protocol,
-                        path,
-                        request,
-                        route,
-                    } = *service;
-                    use syn::LitStr;
-                    let full = format!("{prefix}{}", path.value());
-                    out.push(Route {
-                        route: route.ty,
-                        method,
-                        protocol,
-                        path: LitStr::new(&full, path.span()),
-                        guards: guards.to_vec(),
-                        request,
-                        kind: route.kind,
-                    });
+                    let mut service = *service;
+                    service.path = syn::LitStr::new(
+                        &format!("{prefix}{}", service.path.value()),
+                        service.path.span(),
+                    );
+                    out.push((service, guards.to_vec()));
                 }
                 inputs::Entry::Scope {
                     prefix: path,
@@ -405,8 +320,7 @@ pub(super) fn fiber_bound(
     let ns_fiber = &paths.fiber;
     let ns_http = &paths.http;
     let output = quote::quote!(
-        <<#route as #ns_core::route::Task<'d, #state>>::Output
-            as #ns_http::payload::response::dispatch::IntoOutput<'d, 'd>>::Output
+        <#route as #ns_core::route::Task<'d, #state>>::Output
     );
     if stream {
         quote::quote! {
@@ -460,7 +374,11 @@ fn normalize_state(ty: syn::Type, scope: StateScope) -> syn::Type {
     }
 }
 
-fn build_route_entry(entry: Route, scope: StateScope) -> syn::Result<(Entry, Kind)> {
+fn build_route_entry(
+    entry: inputs::Service,
+    guards: Vec<syn::TypePath>,
+    scope: StateScope,
+) -> syn::Result<Entry> {
     use crate::app::route::Method;
     let path = entry.path;
     let (method, upgrade) = Method::parse(&entry.method)?;
@@ -470,7 +388,7 @@ fn build_route_entry(entry: Route, scope: StateScope) -> syn::Result<(Entry, Kin
             "only CONNECT routes can name an extended protocol",
         ));
     }
-    let route = names::route(entry.route);
+    let route = names::route(entry.route.ty);
     if method == Method::Connect {
         if entry.protocol.is_none() && path.value() != "*" {
             return Err(syn::Error::new_spanned(
@@ -485,9 +403,9 @@ fn build_route_entry(entry: Route, scope: StateScope) -> syn::Result<(Entry, Kin
             ));
         }
     }
-    let (mode, kind) = if method == Method::Connect || upgrade {
-        match (scope, entry.kind) {
-            (StateScope::Driver, inputs::Kind::Sync) => (Mode::Duplex, Kind::Duplex),
+    let mode = if method == Method::Connect || upgrade {
+        match (scope, entry.route.kind) {
+            (StateScope::Driver, inputs::Kind::Sync) => Mode::Duplex,
             (StateScope::Router, inputs::Kind::Sync) => {
                 return Err(syn::Error::new_spanned(
                     &route,
@@ -514,8 +432,8 @@ fn build_route_entry(entry: Route, scope: StateScope) -> syn::Result<(Entry, Kin
             }
         }
     } else {
-        match (scope, entry.kind) {
-            (StateScope::Driver, inputs::Kind::Sync) => (Mode::Sync, Kind::Sync),
+        match (scope, entry.route.kind) {
+            (StateScope::Driver | StateScope::Router, inputs::Kind::Sync) => Mode::Sync,
             (
                 StateScope::Driver,
                 inputs::Kind::Async {
@@ -523,18 +441,12 @@ fn build_route_entry(entry: Route, scope: StateScope) -> syn::Result<(Entry, Kin
                     body,
                     stream,
                 },
-            ) => (
-                Mode::Fiber {
-                    capacity,
-                    body,
-                    stream,
-                },
-                Kind::Fiber,
-            ),
-            (StateScope::Driver, inputs::Kind::Stream { capacity }) => {
-                (Mode::Stream { capacity }, Kind::Stream)
-            }
-            (StateScope::Router, inputs::Kind::Sync) => (Mode::Sync, Kind::Sync),
+            ) => Mode::Fiber {
+                capacity,
+                body,
+                stream,
+            },
+            (StateScope::Driver, inputs::Kind::Stream { capacity }) => Mode::Stream { capacity },
             (StateScope::Router, inputs::Kind::Async { capacity, body, .. }) => {
                 return Err(syn::Error::new_spanned(
                     capacity,
@@ -552,17 +464,14 @@ fn build_route_entry(entry: Route, scope: StateScope) -> syn::Result<(Entry, Kin
             }
         }
     };
-    Ok((
-        Entry {
-            route,
-            path,
-            method,
-            upgrade,
-            protocol: entry.protocol,
-            guards: entry.guards,
-            request: entry.request,
-            mode,
-        },
-        kind,
-    ))
+    Ok(Entry {
+        route,
+        path,
+        method,
+        upgrade,
+        protocol: entry.protocol,
+        guards,
+        request: entry.request,
+        mode,
+    })
 }

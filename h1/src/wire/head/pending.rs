@@ -8,13 +8,13 @@ use sark_http::{
         field::scan,
         head::{
             line::{Owned, Request},
-            request::{Coding, Fields},
+            request::Fields,
         },
     },
 };
 
 use crate::wire::{
-    head::{Admission, Block, Error, Gzip, Parsed, Scanned, line},
+    head::{Admission, Block, Error, Parsed, Scanned, line},
     recv,
 };
 
@@ -31,27 +31,25 @@ pub(crate) struct Partial<'input, H, A = ()> {
 }
 
 /// Typed completed fields and append-only ownership of the uncompleted head.
-pub(crate) struct Pending<H, A = ()> {
+pub(crate) struct Pending<H, A = (), const NEGOTIATE: bool = false> {
     source: scan::State<Source>,
     headers: H,
     admission: A,
     fields: Fields,
     flags: head::Flags,
-    coding: Coding,
 }
 
-pub(crate) enum Progress<H, A: Admission = ()> {
-    Pending(Pending<H, A>),
-    Complete(Source, Gzip<H, A>),
+pub(crate) enum Progress<H, A: Admission = (), const NEGOTIATE: bool = false> {
+    Pending(Pending<H, A, NEGOTIATE>),
+    Complete(Source, Parsed<H, A>),
 }
 
 impl<H, A: Admission> Partial<'_, H, A> {
-    pub(crate) fn retain<R>(
+    pub(crate) fn retain<R, const NEGOTIATE: bool>(
         self,
         request: Request<'_>,
-        coding: Coding,
         limit: usize,
-    ) -> Result<Pending<H, A>, Error<R>>
+    ) -> Result<Pending<H, A, NEGOTIATE>, Error<R>>
     where
         R: route::Schema<RawHeaders = H>,
     {
@@ -64,21 +62,19 @@ impl<H, A: Admission> Partial<'_, H, A> {
             self.admission,
             self.fields,
             self.flags,
-            coding,
             (self.pos, self.count),
             limit,
         )
     }
 }
 
-impl<H, A: Admission> Pending<H, A> {
+impl<H, A: Admission, const NEGOTIATE: bool> Pending<H, A, NEGOTIATE> {
     fn try_new<R: route::Schema<RawHeaders = H>>(
         source: Source,
         headers: H,
         admission: A,
         fields: Fields,
         flags: head::Flags,
-        coding: Coding,
         (pos, count): (usize, usize),
         limit: usize,
     ) -> Result<Self, Error<R>> {
@@ -90,31 +86,27 @@ impl<H, A: Admission> Pending<H, A> {
             admission,
             fields,
             flags,
-            coding,
         })
     }
 
     pub(crate) fn try_start<R>(
         source: Source,
-        coding: Coding,
         limit: usize,
-    ) -> Result<Progress<H, A>, Error<R>>
+    ) -> Result<Progress<H, A, NEGOTIATE>, Error<R>>
     where
         R: route::Schema<RawHeaders = H>,
         H: Default,
     {
-        let parsed = Block::<H, A>::scan::<R>(
+        let parsed = Block::<H, A>::scan::<R, NEGOTIATE>(
             source.as_ref(),
             source.request().end(),
             limit,
-            coding,
             source.request().version(),
         )?;
         match parsed {
             Scanned::Complete(block) => {
-                let coding = block.coding();
                 let head = Parsed::from_block::<R>(block, &source.request())?;
-                Ok(Progress::Complete(source, Gzip { head, coding }))
+                Ok(Progress::Complete(source, head))
             }
             Scanned::Pending(partial) => {
                 let Partial {
@@ -132,7 +124,6 @@ impl<H, A: Admission> Pending<H, A> {
                     admission,
                     fields,
                     flags,
-                    coding,
                     (pos, count),
                     limit,
                 )
@@ -145,7 +136,10 @@ impl<H, A: Admission> Pending<H, A> {
         self.source.as_ref().len()
     }
 
-    pub(crate) fn advance<R>(mut self, incoming: &[u8]) -> Result<Progress<H, A>, Error<R>>
+    pub(crate) fn advance<R>(
+        mut self,
+        incoming: &[u8],
+    ) -> Result<Progress<H, A, NEGOTIATE>, Error<R>>
     where
         R: route::Schema<RawHeaders = H>,
     {
@@ -159,17 +153,15 @@ impl<H, A: Admission> Pending<H, A> {
             mut admission,
             mut fields,
             mut flags,
-            coding,
         } = self;
         let version = source.source().request().version();
         let progress = source
             .advance(|entry| {
-                line::apply::<R, A>(
+                line::apply::<R, A, NEGOTIATE>(
                     &mut headers,
                     &mut admission,
                     &mut fields,
                     &mut flags,
-                    coding,
                     entry,
                     version,
                 )
@@ -191,7 +183,6 @@ impl<H, A: Admission> Pending<H, A> {
                     admission,
                     fields,
                     flags,
-                    coding,
                 }))
             }
             scan::Progress::Complete(complete) => {
@@ -202,10 +193,9 @@ impl<H, A: Admission> Pending<H, A> {
                     fields,
                     len,
                 };
-                let coding = block.coding();
                 let head = Parsed::from_block::<R>(block, &source.request())?;
                 source.write_slice(tail).map_err(Error::Storage)?;
-                Ok(Progress::Complete(source, Gzip { head, coding }))
+                Ok(Progress::Complete(source, head))
             }
         }
     }

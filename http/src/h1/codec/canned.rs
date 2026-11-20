@@ -7,6 +7,9 @@ pub const BAD_REQUEST: fixed::Body = fixed::Body::new(
 pub const NOT_FOUND: fixed::Body = fixed::Body::new(
     b"HTTP/1.1 404 Not Found\r\nServer: sark\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
 );
+pub const NOT_ACCEPTABLE: fixed::Body = fixed::Body::new(
+    b"HTTP/1.1 406 Not Acceptable\r\nServer: sark\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+);
 pub const REQUEST_TIMEOUT: fixed::Body = fixed::Body::new(
     b"HTTP/1.1 408 Request Timeout\r\nServer: sark\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
 );

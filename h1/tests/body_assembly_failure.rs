@@ -17,10 +17,7 @@ use sark_h1::{
         parsing::{framing, raw},
     },
 };
-use sark_http::{
-    h1::{codec::canned, head::request::Coding},
-    payload::owned,
-};
+use sark_http::{h1::codec::canned, payload::owned};
 
 #[global_allocator]
 static ALLOCATOR: Tracker = Tracker::new();
@@ -28,7 +25,7 @@ static ALLOCATOR: Tracker = Tracker::new();
 #[test]
 fn keeps_cause_and_credit() {
     let source = common::head::parsed(Input::Borrowed(Request::HEAD), u8::MAX);
-    let head = framing::Head::<Request, Coding>::parse(raw::Bound::empty(&source), Coding::Plain)
+    let head = framing::Head::<Request>::parse::<false>(raw::Bound::empty(&source))
         .ok()
         .flatten()
         .expect("complete framing");

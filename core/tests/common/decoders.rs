@@ -1,5 +1,3 @@
-use std::ops::ControlFlow;
-
 use o3::mem::Rejected;
 use sark_core::{
     body::{
@@ -84,11 +82,9 @@ pub fn try_admit(
     prepared: Prepared,
 ) -> Result<state::Uniform<Prepared, state::Admitted>, Rejected<Prepared, body::Error>> {
     let routed = request::Head::try_start(prepared, usize::MAX, Boundary::More)?;
-    let routed = routed.into_state();
-    match state::Flow::map::<state::Admitted, _>(routed, state::Pass) {
-        ControlFlow::Continue(admitted) => Ok(admitted),
-        ControlFlow::Break(never) => match never {},
-    }
+    Ok(state::Admission::<state::Admitted>::admit(
+        routed.into_state(),
+    ))
 }
 
 pub struct Take;

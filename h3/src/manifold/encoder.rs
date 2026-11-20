@@ -489,14 +489,14 @@ impl<'a, 'req, 'd: 'req, P: rules::Policy, Q: scope::Source, I: stage::Body<'req
         self,
         status: Code,
         headers: H,
-        stream: S,
+        stream: Option<S>,
     ) -> Result<Self::Stream<S>, Self::Error>
     where
         H: headers::Source,
     {
         let omit = self.omit(status)?;
         let prepared = self.empty(status, headers)?;
-        Ok((prepared, if omit { None } else { Some(stream) }))
+        Ok((prepared, if omit { None } else { stream }))
     }
 }
 

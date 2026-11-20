@@ -6,7 +6,6 @@ use crate::runtime::paths::Paths;
 
 pub(super) struct Headers {
     pub(super) decl: proc_macro2::TokenStream,
-    pub(super) ty: proc_macro2::TokenStream,
     pub(super) build: proc_macro2::TokenStream,
 }
 
@@ -54,9 +53,10 @@ impl Headers {
         args: &syn::Generics,
         vars: &[(syn::Ident, syn::LitStr, syn::Type)],
         fixed: &[(syn::LitStr, syn::LitStr)],
+        value: &syn::Ident,
+        names: &crate::types::Generics,
     ) -> Self {
         let ns_http = &paths.http;
-        let names = crate::types::Generics::new(args.clone());
         let sink = names.ident("sink");
         let source = quote::format_ident!("__{}Fields", name);
         let module = source
@@ -65,14 +65,12 @@ impl Headers {
             .map(|byte| format!("{byte:02x}"))
             .collect::<String>();
         let module = quote::format_ident!("__sark_response_{module}");
-        let mut types = Vec::with_capacity(vars.len());
         let mut values = Vec::with_capacity(vars.len());
         let mut emits = Vec::with_capacity(vars.len());
-        for (index, (ident, header, ty)) in vars.iter().enumerate() {
+        for (index, (ident, header, _)) in vars.iter().enumerate() {
             let name = super::name(paths, header);
             let index = syn::Index::from(index);
-            types.push(ty);
-            values.push(quote::quote!(self.#ident));
+            values.push(quote::quote!(#value.#ident));
             emits.push(quote::quote! {
                 #sink.field(
                     #name,
@@ -104,14 +102,10 @@ impl Headers {
 
         let (_, ty_args, _) = args.split_for_impl();
         let lifetime = names.lifetime("field");
-        let marker = quote::quote!(
-            ::core::marker::PhantomData<fn() -> *const #name #ty_args>
-        );
         let params = (0..vars.len())
             .map(|index| names.ident(&format!("__Header{index}")))
             .collect::<Vec<_>>();
         let marker_param = names.ident("__Response");
-        let ty = quote::quote!(#source<#(#types,)* #marker>);
         let writes = if fields.is_empty() {
             quote::quote!()
         } else {
@@ -169,9 +163,9 @@ impl Headers {
         let build = quote::quote! {
             #source(
                 #( #values, )*
-                ::core::marker::PhantomData,
+                ::core::marker::PhantomData::<fn() -> *const #name #ty_args>,
             )
         };
-        Self { decl, ty, build }
+        Self { decl, build }
     }
 }

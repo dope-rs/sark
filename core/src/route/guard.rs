@@ -53,12 +53,7 @@ impl<'req> Head<'req> {
 pub trait Guard<S> {
     type Egress<'d>: bound::Bound + 'd;
 
-    type Break<'req, 'd>: dispatch::IntoOutput<
-            'req,
-            'd,
-            Output: dispatch::Emit<'req, 'd, Stream = dispatch::Never>
-                        + dispatch::Immediate<'req, 'd>,
-        >
+    type Break<'req, 'd>: dispatch::Complete<'req, 'd>
     where
         'd: 'req,
         S: 'req;
@@ -78,7 +73,7 @@ pub trait Reject<'req, 'd: 'req>: Sized {
 
     fn try_reject<R>(self, response: R) -> Self::Break
     where
-        R: dispatch::Immediate<'req, 'd>;
+        R: dispatch::Complete<'req, 'd>;
 }
 
 impl<'req, 'd: 'req, E: dispatch::Accept<'d>> Reject<'req, 'd> for E {
@@ -86,24 +81,8 @@ impl<'req, 'd: 'req, E: dispatch::Accept<'d>> Reject<'req, 'd> for E {
 
     fn try_reject<R>(self, response: R) -> Self::Break
     where
-        R: dispatch::Immediate<'req, 'd>,
+        R: dispatch::Complete<'req, 'd>,
     {
-        dispatch::Immediate::emit(response, self)
+        dispatch::Complete::complete(response, self)
     }
-}
-
-/// Guard chain for one generated route occurrence.
-/// Occurrence ownership permits one route type under independently guarded
-/// scopes.
-#[doc(hidden)]
-pub trait Slot<S> {
-    fn try_admit<'req, 'd, R>(
-        head: Head<'req>,
-        state: &'req S,
-        reject: R,
-    ) -> ControlFlow<R::Break, R>
-    where
-        'd: 'req,
-        S: 'req,
-        R: Reject<'req, 'd>;
 }

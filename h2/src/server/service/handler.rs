@@ -5,7 +5,7 @@ use crate::server::service::{Bounded, Request};
 
 /// Synchronous handler whose output remains in the request's lifetime domain.
 pub trait Handler {
-    type Output<'req, 'd>: dispatch::Immediate<'req, 'd>
+    type Output<'req, 'd>: dispatch::Complete<'req, 'd>
     where
         Self: 'req,
         'd: 'req;

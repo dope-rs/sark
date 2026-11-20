@@ -13,10 +13,12 @@ use sark_http::{
     field::{Value, literal},
     h1::codec::numbers,
     payload::response::{
-        Encode, bounded,
-        dispatch::IntoOutput,
-        exact,
-        headers::{Entry, Name, head::Template, set::Set},
+        Encode, bounded, dispatch, exact,
+        headers::{
+            Entry, Name,
+            head::{Head, Template},
+            set::Set,
+        },
         status::Code,
     },
 };
@@ -384,11 +386,13 @@ impl<T: TryEncode + TryMaxSize> Body<T> {
     }
 }
 
-impl<'req, 'd, T: TryEncode + TryMaxSize> IntoOutput<'req, 'd> for Response<T> {
-    type Output = bounded::Output<'req, bounded::Plan<Body<T>>, 0>;
+impl<'req, 'd, T: TryEncode + TryMaxSize> dispatch::Complete<'req, 'd> for Response<T> {
+    type Bound = o3::buffer::resident::bound::Unbounded;
 
-    fn into_output(self) -> Self::Output {
-        bounded::Output::new(Code::OK, &HEAD, Set::new(), self.0)
+    const BODY: sark_http::payload::Kind = sark_http::payload::Kind::Inline;
+
+    fn complete<S: dispatch::Accept<'d>>(self, sink: S) -> Result<S::Output, S::Error> {
+        sink.bounded(Code::OK, Head::new(&HEAD, Set::<0>::new()), self.0)
     }
 }
 

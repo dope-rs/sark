@@ -92,14 +92,14 @@ sark_fiber::define_route! {
 
 #[sark_fiber::handler(pub)]
 fn pending() -> Stream<'req, Chunks<Chunk<'d>>, 1> {
-    Stream::new(Chunks::new(
+    Stream::new(Some(Chunks::new(
         [
             Chunk::from(b"alpha"),
             Chunk::from(b"-beta"),
             Chunk::from(b"-gamma"),
         ],
         None,
-    ))
+    )))
     .headers(set::Set::from_items([Item::borrow(
         sark_fiber::header_name!("content-type"),
         field::literal!(Value::try_bytes(b"text/plain")),
@@ -160,10 +160,10 @@ impl Failure<'_> {
         &self,
         cause: &'a str,
     ) -> Stream<'static, Chunks<Result<Chunk<'d>, &'a str>>> {
-        Stream::new(Chunks::new(
+        Stream::new(Some(Chunks::new(
             [Ok(Chunk::from(b"before-error")), Err(cause)],
             Some(Rc::clone(&self.trace)),
-        ))
+        )))
     }
 }
 

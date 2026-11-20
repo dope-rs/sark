@@ -374,9 +374,9 @@ impl<
         mut self,
         status: Code,
         headers: H,
-        stream: S,
+        stream: Option<S>,
     ) -> Result<Self::Stream<S>, Self::Error> {
-        if self.omit(status)? {
+        if self.omit(status)? || stream.is_none() {
             return self.empty(status, headers).map(|head| (head, None));
         }
         self.prepare(
@@ -385,7 +385,7 @@ impl<
             Payload::Handoff(fixed::Body::new(&[])),
             Boundary::More,
         )
-        .map(|head| (head, Some(stream)))
+        .map(|head| (head, stream))
     }
 }
 

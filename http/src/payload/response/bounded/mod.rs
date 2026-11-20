@@ -62,18 +62,6 @@ where
     }
 }
 
-impl<'req, 'd, 'head: 'req, B, const N: usize> dispatch::IntoOutput<'req, 'd>
-    for Output<'head, B, N>
-where
-    B: Body,
-{
-    type Output = Self;
-
-    fn into_output(self) -> Self::Output {
-        self
-    }
-}
-
 impl<'req, 'd, 'head: 'req, B, const N: usize> dispatch::Complete<'req, 'd> for Output<'head, B, N>
 where
     B: Body,

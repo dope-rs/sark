@@ -40,11 +40,10 @@ fn defaults_header() {
         let source = parsing::Head::parse(Input::Borrowed(wire), u8::MAX)
             .expect("request line syntax")
             .expect("complete request line");
-        let block = head::Block::<HdrReqHeadersRaw>::parse::<HdrReq>(
+        let block = head::Block::<HdrReqHeadersRaw>::parse::<HdrReq, false>(
             wire,
             source.request().end(),
             16,
-            Coding::Plain,
             source.request().version(),
         )
         .ok()
@@ -79,17 +78,17 @@ fn defaults_header() {
 #[test]
 fn captures_gzip() {
     let input: &[u8] = fields::GZIP;
-    let parsed = match head::Block::<<EncodingReq as Schema>::RawHeaders>::parse::<EncodingReq>(
-        input,
-        0,
-        16,
-        Coding::Plain,
-        Version::Eleven,
-    ) {
-        Ok(Some(parsed)) => Some(parsed),
-        _ => None,
-    }
-    .expect("valid Accept-Encoding header");
+    let parsed =
+        match head::Block::<<EncodingReq as Schema>::RawHeaders>::parse::<EncodingReq, false>(
+            input,
+            0,
+            16,
+            Version::Eleven,
+        ) {
+            Ok(Some(parsed)) => Some(parsed),
+            _ => None,
+        }
+        .expect("valid Accept-Encoding header");
     let gzip = matches!(parsed.coding(), Coding::Gzip);
     let headers = parsed.into_headers();
 
@@ -102,37 +101,35 @@ fn captures_gzip() {
 
 #[test]
 fn scans_optional_headers() {
-    for (coding, gzip) in [(Coding::Plain, false), (Coding::Gzip, true)] {
-        assert!(
-            head::Block::<MinimalHeadersRaw>::parse::<Minimal>(
-                fields::GZIP,
-                0,
-                16,
-                coding,
-                Version::Eleven
-            )
-            .is_ok_and(|parsed| parsed
-                .is_some_and(|parsed| matches!(parsed.coding(), Coding::Gzip) == gzip))
-        );
-    }
+    let input = fields::GZIP;
+    let version = Version::Eleven;
+    let strict = head::Block::<MinimalHeadersRaw>::parse::<Minimal, true>(input, 0, 16, version);
+    let plain = head::Block::<MinimalHeadersRaw>::parse::<Minimal, false>(input, 0, 16, version);
+    assert!(matches!(strict, Ok(Some(head)) if head.coding() == Coding::Gzip));
+    assert!(matches!(plain, Ok(Some(head)) if head.coding() == Coding::Plain));
 
-    let dupe = fields::DUPLICATE_EXPECT;
+    let malformed = b"Accept-Encoding: gzip;q=2\r\n\r\n";
     assert!(matches!(
-        head::Block::<MinimalHeadersRaw>::parse::<Minimal>(
-            dupe,
-            0,
-            16,
-            Coding::Plain,
-            Version::Eleven
-        ),
+        head::Block::<MinimalHeadersRaw>::parse::<Minimal, false>(malformed, 0, 16, version),
         Ok(Some(_))
     ));
     assert!(matches!(
-        head::Block::<<Full as Schema>::RawHeaders>::parse::<Full>(
+        head::Block::<MinimalHeadersRaw>::parse::<Minimal, true>(malformed, 0, 16, version),
+        Err(head::Error::Line(Error::Field {
+            cause: sark_http::field::head::Error::Value,
+            ..
+        }))
+    ));
+    let dupe = fields::DUPLICATE_EXPECT;
+    assert!(matches!(
+        head::Block::<MinimalHeadersRaw>::parse::<Minimal, false>(dupe, 0, 16, Version::Eleven),
+        Ok(Some(_))
+    ));
+    assert!(matches!(
+        head::Block::<<Full as Schema>::RawHeaders>::parse::<Full, false>(
             dupe,
             0,
             16,
-            Coding::Plain,
             Version::Eleven
         ),
         Ok(Some(_))
@@ -218,13 +215,7 @@ fn validates_header_value() {
     let input: &[u8] = fields::BARE_LF;
     assert!(
         matches!(
-            head::Block::<HdrReqHeadersRaw>::parse::<HdrReq>(
-                input,
-                0,
-                16,
-                Coding::Plain,
-                Version::Eleven
-            ),
+            head::Block::<HdrReqHeadersRaw>::parse::<HdrReq, false>(input, 0, 16, Version::Eleven),
             Err(head::Error::Line(Error::Value {
                 offset: 13,
                 actual: b'\n',
@@ -237,17 +228,17 @@ fn validates_header_value() {
 #[test]
 fn accepts_short_name() {
     let input: &[u8] = fields::SHORT;
-    let parsed = match head::Block::<<ShortHdrReq as Schema>::RawHeaders>::parse::<ShortHdrReq>(
-        input,
-        0,
-        16,
-        Coding::Plain,
-        Version::Eleven,
-    ) {
-        Ok(Some(parsed)) => Some(parsed),
-        _ => None,
-    }
-    .expect("valid short custom header");
+    let parsed =
+        match head::Block::<<ShortHdrReq as Schema>::RawHeaders>::parse::<ShortHdrReq, false>(
+            input,
+            0,
+            16,
+            Version::Eleven,
+        ) {
+            Ok(Some(parsed)) => Some(parsed),
+            _ => None,
+        }
+        .expect("valid short custom header");
     let headers = parsed.into_headers();
 
     assert_eq!(
@@ -281,11 +272,10 @@ fn rejects_bad_values() {
         fields::DEL_VALUE,
     ] {
         assert!(
-            head::Block::<<Minimal as Schema>::RawHeaders>::parse::<Minimal>(
+            head::Block::<<Minimal as Schema>::RawHeaders>::parse::<Minimal, false>(
                 block,
                 0,
                 16,
-                Coding::Plain,
                 Version::Eleven
             )
             .is_err()
@@ -296,11 +286,10 @@ fn rejects_bad_values() {
 #[test]
 fn accepts_field_bytes() {
     assert!(matches!(
-        head::Block::<<Minimal as Schema>::RawHeaders>::parse::<Minimal>(
+        head::Block::<<Minimal as Schema>::RawHeaders>::parse::<Minimal, false>(
             fields::VALID,
             0,
             16,
-            Coding::Plain,
             Version::Eleven
         ),
         Ok(Some(_))
@@ -311,11 +300,10 @@ fn accepts_field_bytes() {
 fn scans_lane_edges() {
     let long = fields::AGENT.padded(64);
     assert!(matches!(
-        head::Block::<<Minimal as Schema>::RawHeaders>::parse::<Minimal>(
+        head::Block::<<Minimal as Schema>::RawHeaders>::parse::<Minimal, false>(
             &long,
             0,
             16,
-            Coding::Plain,
             Version::Eleven
         ),
         Ok(Some(_))
@@ -323,11 +311,10 @@ fn scans_lane_edges() {
 
     let partial = fields::PARTIAL;
     assert!(matches!(
-        head::Block::<<Minimal as Schema>::RawHeaders>::parse::<Minimal>(
+        head::Block::<<Minimal as Schema>::RawHeaders>::parse::<Minimal, false>(
             partial,
             0,
             16,
-            Coding::Plain,
             Version::Eleven
         ),
         Ok(None)
@@ -337,21 +324,19 @@ fn scans_lane_edges() {
 #[test]
 fn enforces_header_count() {
     assert!(matches!(
-        head::Block::<<Minimal as Schema>::RawHeaders>::parse::<Minimal>(
+        head::Block::<<Minimal as Schema>::RawHeaders>::parse::<Minimal, false>(
             fields::BLANK,
             0,
             0,
-            Coding::Plain,
             Version::Eleven
         ),
         Ok(Some(_))
     ));
     assert!(matches!(
-        head::Block::<MinimalHeadersRaw>::parse::<Minimal>(
+        head::Block::<MinimalHeadersRaw>::parse::<Minimal, false>(
             fields::HOST_LINE,
             0,
             0,
-            Coding::Plain,
             Version::Eleven
         ),
         Err(head::Error::Fields {
@@ -365,7 +350,7 @@ fn enforces_header_count() {
 fn enforces_line_limit() {
     let block = fields::LONG.padded(MAX_HEADER_LINE_BYTES + 16);
     assert!(
-        matches!(head::Block::<MinimalHeadersRaw>::parse::<Minimal>(&block, 0, 16, Coding::Plain, Version::Eleven), Err(head::Error::Line(Error::Limit {
+        matches!(head::Block::<MinimalHeadersRaw>::parse::<Minimal, false>(&block, 0, 16, Version::Eleven), Err(head::Error::Line(Error::Limit {
             observed,
             limit: MAX_HEADER_LINE_BYTES,
         })) if observed == block.len())
@@ -376,22 +361,15 @@ fn enforces_line_limit() {
 fn rejects_fold_aliases() {
     for input in [fields::CR_NAME.as_slice(), fields::FOLD_NAME] {
         assert!(
-            head::Block::<HdrReqHeadersRaw>::parse::<HdrReq>(
-                input,
-                0,
-                16,
-                Coding::Plain,
-                Version::Eleven
-            )
-            .is_err()
+            head::Block::<HdrReqHeadersRaw>::parse::<HdrReq, false>(input, 0, 16, Version::Eleven)
+                .is_err()
         );
     }
     assert!(matches!(
-        head::Block::<HdrReqHeadersRaw>::parse::<HdrReq>(
+        head::Block::<HdrReqHeadersRaw>::parse::<HdrReq, false>(
             fields::MIXED_NAME,
             0,
             16,
-            Coding::Plain,
             Version::Eleven
         ),
         Ok(Some(_))

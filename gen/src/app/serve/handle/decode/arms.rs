@@ -25,7 +25,7 @@ impl Arms {
 
         let [v_body, v_never, v_slot, v_visit] = ["body", "never", "slot", "visit"].map(local);
         let borrow = quote! {
-            Self::#open(.., #v_body) => #v_visit.apply(#v_body),
+            Self::#open(.., #v_body) => #v_body,
             Self::#done(.., #v_never) => match *#v_never {},
         };
         let take = quote! {
@@ -70,10 +70,7 @@ impl Arms {
             consume,
         } = self;
         quote! {
-                fn each_open<'a, V: #ns_core::decode::state::open::Each<F>>(
-                    &'a mut self,
-                    #v_visit: V,
-                ) -> V::Output<'a>
+                fn open_mut(&mut self) -> &mut F::Body
                 where F: #ns_core::decode::state::open::Set,
                 { match self { #( #borrow )* } }
 

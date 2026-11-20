@@ -268,7 +268,7 @@ pub(crate) async fn stream_h<'d>(
             }
         }) {
         Ok(payload) => payload,
-        Err(error) => return Stream::new(Chunks::new([], None)).with_status(error.status),
+        Err(error) => return Stream::new(None).with_status(error.status),
     };
     let body = payload.into_body().into_inner();
     state.stream.resident.set(body.charge().resident_bytes);
@@ -283,10 +283,10 @@ pub(crate) async fn stream_h<'d>(
             Chunk::try_new(resident::Shared::from(body)).map_err(StreamError::Empty)
         }))
         .chain((req.kind.as_slice() == b"fail").then_some(Err(StreamError::Read("read-failed"))));
-    Stream::new(
+    Stream::new(Some(
         Chunks::new(chunks, Some(rc::Rc::clone(&state.stream)))
             .park(req.kind.as_slice() == b"park" || two),
-    )
+    ))
 }
 
 pub(crate) struct QpackReply<'d> {
@@ -321,14 +321,6 @@ impl sark_http::payload::response::headers::Source for QpackFields {
     }
 }
 
-impl<'req, 'd> sark_http::payload::response::dispatch::IntoOutput<'req, 'd> for QpackReply<'d> {
-    type Output = Self;
-
-    fn into_output(self) -> Self {
-        self
-    }
-}
-
 impl<'req, 'd> sark_http::payload::response::dispatch::Emit<'req, 'd> for QpackReply<'d> {
     type Kind = sark_http::payload::response::dispatch::Polled;
     type Stream = Chunks<Result<Chunk<'d>, StreamError<'d>>>;
@@ -340,7 +332,7 @@ impl<'req, 'd> sark_http::payload::response::dispatch::Emit<'req, 'd> for QpackR
         self,
         sink: S,
     ) -> Result<S::Stream<Self::Stream>, S::Error> {
-        sink.stream(status::Code::OK, self.headers, self.body)
+        sink.stream(status::Code::OK, self.headers, Some(self.body))
     }
 }
 

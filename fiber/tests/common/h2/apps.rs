@@ -204,13 +204,13 @@ pub(crate) async fn quick() -> StaticReply<'d> {
 #[sark_fiber::handler(pub)]
 pub(crate) async fn stream_hold(state: &State) -> Stream<'static, Chunks<Chunk<'d>>> {
     dope_test::fibers::Yield::new().await;
-    Stream::new(
+    Stream::new(Some(
         Chunks::new(
             [Chunk::from(b"held")],
             Some(std::rc::Rc::clone(&state.stream)),
         )
         .park(true),
-    )
+    ))
 }
 
 #[sark_fiber::handler(pub)]

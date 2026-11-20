@@ -37,13 +37,14 @@ use sark_http::{
 
 #[test]
 fn suppress_content() {
-    for (method, status) in [
-        (Method::Head, Code::OK),
-        (Method::Other, Code::NO_CONTENT),
-        (Method::Other, Code::NOT_MODIFIED),
-        (Method::Other, Code::RESET_CONTENT),
+    for (method, status, kinds) in [
+        (Method::Head, Code::OK, 0..5),
+        (Method::Other, Code::NO_CONTENT, 0..5),
+        (Method::Other, Code::NOT_MODIFIED, 0..5),
+        (Method::Other, Code::RESET_CONTENT, 0..5),
+        (Method::Other, Code::OK, 5..6),
     ] {
-        for kind in 0..5 {
+        for kind in kinds {
             let mut conn = Connection::with_role(Role::Server).expect("server");
             let calls = Cell::new(0);
             let encoder = Encoder::new(&mut conn, Target::new(Id::ZERO), method);
@@ -52,10 +53,12 @@ fn suppress_content() {
                 1 => Accept::statics(encoder, status, (), fixed::Body::new(b"body")),
                 2 => Accept::exact(encoder, status, (), Body(&calls)),
                 3 => Accept::bounded(encoder, status, (), Body(&calls)),
-                _ => Sink::stream(encoder, status, (), Body(&calls)).map(|(head, body)| {
-                    assert!(body.is_none());
-                    head
-                }),
+                _ => Sink::stream(encoder, status, (), (kind == 4).then_some(Body(&calls))).map(
+                    |(head, body)| {
+                        assert!(body.is_none());
+                        head
+                    },
+                ),
             };
             result.ok().expect("prepare").finish().expect("commit");
             assert_eq!(
@@ -97,10 +100,12 @@ fn finish_preserves_budget_error() {
             let mut conn = Setup::new(8, 2, usize::MAX).try_build().expect("server");
             let encoder = Encoder::new(&mut conn, Target::new(Id::ZERO), method);
             let prepared = match method {
-                Method::Head => Sink::stream(encoder, Code::OK, (), b"body").map(|(head, body)| {
-                    assert!(body.is_none());
-                    head
-                }),
+                Method::Head => {
+                    Sink::stream(encoder, Code::OK, (), Some(b"body")).map(|(head, body)| {
+                        assert!(body.is_none());
+                        head
+                    })
+                }
                 _ => Accept::statics(encoder, Code::OK, (), fixed::Body::new(b"body")),
             }
             .ok()
@@ -134,7 +139,8 @@ fn reject_informational() {
             1 => Accept::statics(encoder, Code::EARLY_HINTS, (), fixed::Body::new(b"body")),
             2 => Accept::exact(encoder, Code::EARLY_HINTS, (), Body(&calls)),
             3 => Accept::bounded(encoder, Code::EARLY_HINTS, (), Body(&calls)),
-            _ => Sink::stream(encoder, Code::EARLY_HINTS, (), Body(&calls)).map(|(head, _)| head),
+            _ => Sink::stream(encoder, Code::EARLY_HINTS, (), Some(Body(&calls)))
+                .map(|(head, _)| head),
         };
         assert!(
             matches!(result, Err((Error::Informational(Code::EARLY_HINTS), target)) if target.stream_id() == Id::ZERO)

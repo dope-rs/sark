@@ -116,7 +116,7 @@ impl<'writer, 'out, 'date, 'field, H: field::Source> Pending<'writer, 'out, 'dat
         self.split.body().into_mut()
     }
 
-    pub(super) fn finish(mut self) -> Result<(), response::Error> {
+    pub(super) fn finish<C: response::Count>(mut self) -> Result<C, response::Error> {
         let body = self.split.body().len();
         let head = response::Head {
             response: self.date.response,
@@ -125,7 +125,7 @@ impl<'writer, 'out, 'date, 'field, H: field::Source> Pending<'writer, 'out, 'dat
             framing: framing::Padded(body),
         };
         let mut writer = response::Writer::exact(self.split.head());
-        head.emit::<()>(
+        let encoded = head.emit::<C>(
             &mut writer,
             self.date.value,
             self.date.server,
@@ -137,6 +137,7 @@ impl<'writer, 'out, 'date, 'field, H: field::Source> Pending<'writer, 'out, 'dat
                 expected: expected.get(),
                 actual,
             }
-        })
+        })?;
+        Ok(encoded)
     }
 }

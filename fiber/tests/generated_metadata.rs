@@ -5,14 +5,11 @@ use std::{
     time::Duration,
 };
 
-use common::server::recover;
 use common::{
     route::{select::SelectiveDispatch, skip::SkipDispatch},
     server::{self, Plan, peer::Endpoint as _},
 };
-use dope::core::driver::life::recovery::Policy;
 use dope_test::harness::server::Pair;
-use sark_fiber::Config;
 
 #[test]
 fn selects_requested_fields() {
@@ -24,24 +21,14 @@ fn selects_requested_fields() {
         .check(
             |context, listener| {
                 let mut reports = Plan::try_reports(&server).expect("server descriptor claims");
-                let result = SelectiveDispatch::serve(
+                let result = server::serve::<SelectiveDispatch, _>(
                     server.with_bound(listener),
                     context,
                     (),
-                    Config::new(server::MAX_CONNECTIONS),
-                    Policy::new(|event| reports.push(event), recover),
-                    |result| {
-                        result
-                            .as_ref()
-                            .map(|_| ())
-                            .map_err(|error| error.cause())
-                            .expect("server")
-                    },
+                    server::MAX_CONNECTIONS,
+                    &mut reports,
                 );
-                assert!(
-                    reports.events().expect("reclaimed resources").is_empty(),
-                    "server retirement: {reports:?}"
-                );
+                server::reclaimed(&reports);
                 result
             },
             |addr| {
@@ -130,24 +117,14 @@ fn skip_shapes_headers() {
         .check(
             |context, listener| {
                 let mut reports = Plan::try_reports(&server).expect("server descriptor claims");
-                let result = SkipDispatch::serve(
+                let result = server::serve::<SkipDispatch, _>(
                     server.with_bound(listener),
                     context,
                     (),
-                    Config::new(server::MAX_CONNECTIONS),
-                    Policy::new(|event| reports.push(event), recover),
-                    |result| {
-                        result
-                            .as_ref()
-                            .map(|_| ())
-                            .map_err(|error| error.cause())
-                            .expect("server")
-                    },
+                    server::MAX_CONNECTIONS,
+                    &mut reports,
                 );
-                assert!(
-                    reports.events().expect("reclaimed resources").is_empty(),
-                    "server retirement: {reports:?}"
-                );
+                server::reclaimed(&reports);
                 result
             },
             |bind| {

@@ -5,8 +5,8 @@ use crate::{
     decode::{
         exec, request,
         state::{
-            Admission, Admitted, Each, Finish, Flow, Fold, Map, Set, Slot, Uniforms, Whole, admit,
-            body, open,
+            Admission, Admitted, Each, Finish, Flow, Fold, Map, Routed, Set, Slot, Uniforms, Whole,
+            admit, body, open,
         },
     },
 };
@@ -86,12 +86,12 @@ impl<P, F: Set> Flow<P, F> for Uniform<P, F> {
         })
     }
 
-    fn each_open<'a, V: open::Each<F>>(&'a mut self, visit: V) -> V::Output<'a>
+    fn open_mut(&mut self) -> &mut F::Body
     where
         F: open::Set,
     {
         match &mut self.body {
-            request::Body::Open(body) => visit.apply(body),
+            request::Body::Open(body) => body,
             request::Body::Finished(never) => match *never {},
         }
     }
@@ -126,25 +126,17 @@ impl<P, F: Set> body::Flow<F> for Uniform<P, F> {
     }
 }
 
-impl<P, F, G> Admission<P, F, G> for Uniform<P, F>
-where
-    F: Set,
-    G: Set,
-{
+impl<P, G: admit::Payload> Admission<G> for Uniform<P, Routed> {
     type Output = Uniform<P, G>;
 
-    fn admit<V: admit::Visit<P, F, G>>(self, visit: &mut V) -> ControlFlow<V::Break, Self::Output> {
-        let (slot, body) = match self.body {
-            request::Body::Open(body) => {
-                let (slot, body) = visit.sync_open(self.slot, body)?;
-                (slot, request::Body::Open(body))
-            }
-            request::Body::Finished(body) => {
-                let (slot, body) = visit.sync_done(self.slot, body)?;
-                (slot, request::Body::Finished(body))
-            }
-        };
-        ControlFlow::Continue(Uniform { slot, body })
+    fn admit(self) -> Self::Output {
+        Uniform {
+            slot: self.slot,
+            body: match self.body {
+                request::Body::Open(body) => request::Body::Open(body.into()),
+                request::Body::Finished(body) => request::Body::Finished(body.into()),
+            },
+        }
     }
 }
 

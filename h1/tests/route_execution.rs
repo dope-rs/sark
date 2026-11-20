@@ -46,7 +46,7 @@ fn method_body_allowance() {
     for &(input, expected) in discard::BODY_POLICY.iter().chain(tasks::ALLOWED_BODIES) {
         for methods in [Known::ALL, 0] {
             let parsed = common::head::parsed(Input::Borrowed(input), methods);
-            let head = framing::Head::<Streaming>::parse(raw::Bound::empty(&parsed))
+            let head = framing::Head::<Streaming>::parse::<false>(raw::Bound::empty(&parsed))
                 .ok()
                 .expect("framing")
                 .expect("complete framing");
@@ -94,7 +94,7 @@ fn transition_admission() {
     for &(input, connect) in tasks::PARTIAL_UPGRADE {
         for methods in [Known::ALL, 0] {
             let parsed = common::head::parsed(Input::Borrowed(input), methods);
-            let result = framing::Head::<Streaming>::parse(raw::Bound::empty(&parsed));
+            let result = framing::Head::<Streaming>::parse::<false>(raw::Bound::empty(&parsed));
             assert!(if connect {
                 matches!(result, Ok(Some(_)))
             } else {
@@ -113,7 +113,7 @@ fn transition_admission() {
 fn discarded_stream_length() {
     for input in [tasks::HEAD, tasks::COMPLETE] {
         let parsed = common::head::parsed(Input::Borrowed(input), u8::MAX);
-        let head = framing::Head::<Streaming>::parse(raw::Bound::empty(&parsed))
+        let head = framing::Head::<Streaming>::parse::<false>(raw::Bound::empty(&parsed))
             .ok()
             .expect("framing")
             .expect("complete framing");
@@ -167,7 +167,7 @@ fn discarded_stream_length() {
 fn stream_capacity() {
     for input in [tasks::HEAD, tasks::COMPLETE] {
         let parsed = common::head::parsed(Input::Borrowed(input), u8::MAX);
-        let head = framing::Head::<Streaming>::parse(raw::Bound::empty(&parsed))
+        let head = framing::Head::<Streaming>::parse::<false>(raw::Bound::empty(&parsed))
             .ok()
             .flatten()
             .expect("framing");
@@ -222,7 +222,7 @@ fn stream_capacity() {
 fn closing_connect() {
     for input in [&tasks::CONNECT[..tasks::CONNECT.len() - 1], tasks::CONNECT] {
         let parsed = common::head::parsed(Input::Borrowed(input), u8::MAX);
-        let head = framing::Head::<Connect>::parse(raw::Bound::empty(&parsed))
+        let head = framing::Head::<Connect>::parse::<false>(raw::Bound::empty(&parsed))
             .ok()
             .expect("framing")
             .expect("complete framing");
@@ -245,7 +245,7 @@ fn closing_connect() {
 fn connect_keeps_version() {
     for &(input, expected) in tasks::CONNECT_VERSIONED {
         let parsed = common::head::parsed(Input::Borrowed(input), u8::MAX);
-        let head = framing::Head::<Connect>::parse(raw::Bound::empty(&parsed))
+        let head = framing::Head::<Connect>::parse::<false>(raw::Bound::empty(&parsed))
             .ok()
             .flatten()
             .expect("complete framing");
@@ -286,10 +286,12 @@ fn body_yields() {
             STEPS.set(0);
             FINISHES.set(0);
             let parsed = common::head::parsed(Input::Borrowed(HEAD), u8::MAX);
-            let head = framing::Head::<Request<body::Segmented>>::parse(raw::Bound::empty(&parsed))
-                .ok()
-                .expect("framing")
-                .expect("complete framing");
+            let head = framing::Head::<Request<body::Segmented>>::parse::<false>(
+                raw::Bound::empty(&parsed),
+            )
+            .ok()
+            .expect("framing")
+            .expect("complete framing");
             let mut conn: session::Conn = session::Conn::default();
             let outcome = task::Endpoint::new(&mut conn)
                 .dispatch::<Request<body::Segmented>, _, _, _>(
@@ -425,10 +427,11 @@ fn buffered_body_starts_at_fin() {
                     let source = storage::Shared::try_copy(input).expect("wire owner");
                     let pointer = std::ptr::from_ref(source.as_slice().last().expect("wire byte"));
                     let parsed = common::head::parsed(Input::Buffered(source.view()), u8::MAX);
-                    let head = framing::Head::<Buffered>::parse(raw::Bound::empty(&parsed))
-                        .ok()
-                        .expect("framing")
-                        .expect("complete framing");
+                    let head =
+                        framing::Head::<Buffered>::parse::<false>(raw::Bound::empty(&parsed))
+                            .ok()
+                            .expect("framing")
+                            .expect("complete framing");
                     let outcome = task::Endpoint::new(&mut conn).dispatch::<Buffered, _, _, _>(
                         id,
                         session::Permit::new(),

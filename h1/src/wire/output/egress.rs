@@ -4,7 +4,6 @@ use std::{convert::Infallible, mem};
 use o3::buffer::storage;
 use sark_core::route::guard;
 use sark_http::{
-    h1::head::request::Coding,
     owner::{evidence, handoff, handoff::stage},
     payload::{compress::Compression, response::dispatch},
     request::Id,
@@ -48,17 +47,13 @@ impl<'a> Egress<'a> {
         reply: R,
         slot: handoff::Slot<'req, 'd, (), O>,
         gzip: &mut impl Compression,
-        coding: Coding,
         policy: route::Policy,
     ) -> output::Outcome<'d, O::Deferred>
     where
         'd: 'req,
         R: dispatch::Emit<'req, 'd, Kind = dispatch::Sync>,
     {
-        let mode = match coding {
-            Coding::Plain => Mode::Plain,
-            Coding::Gzip => Mode::Compress(gzip),
-        };
+        let mode = Mode::new(policy.mode, self.response.coding(), gzip);
         let sink = Sink::new(self.write, self.date, self.response, mode, slot).with_policy(policy);
         Self::outcome(reply.emit(sink), head::Connection::KeepAlive)
     }
@@ -89,11 +84,16 @@ impl<'a> Egress<'a> {
         'd: 'req,
         S: dispatch::Emit<'req, 'd>,
     {
+        let mut gzip = ();
+        let mode = match policy.mode {
+            route::Mode::RequiredGzip => Mode::new(policy.mode, self.response.coding(), &mut gzip),
+            route::Mode::Plain | route::Mode::Gzip => Mode::Plain,
+        };
         let sink = Sink::new(
             self.write,
             self.date,
             self.response.with_connection(conn),
-            Mode::<()>::Plain,
+            mode,
             handoff::Slot::ready(Some(id)),
         )
         .with_policy(policy);
@@ -122,11 +122,16 @@ impl<'a> Egress<'a> {
         'd: 'req,
         S: dispatch::Emit<'req, 'd, Kind = dispatch::Polled>,
     {
+        let mut gzip = ();
+        let mode = match policy.mode {
+            route::Mode::RequiredGzip => Mode::new(policy.mode, self.response.coding(), &mut gzip),
+            route::Mode::Plain | route::Mode::Gzip => Mode::Plain,
+        };
         let sink = Sink::new(
             self.write,
             self.date,
             self.response,
-            Mode::<()>::Plain,
+            mode,
             handoff::Slot::ready(None),
         )
         .with_policy(policy)
@@ -245,10 +250,6 @@ impl<'a, 'req> Egress<'a, crate::Input<'req>> {
             response,
         }
     }
-
-    pub fn into_parts(self) -> (Slice<'a, &'a mut usize>, &'a [u8; 29]) {
-        (self.write, self.date)
-    }
 }
 
 impl<'input, 'req, 'd: 'req> guard::Reject<'req, 'd> for Egress<'_, crate::Input<'input>> {
@@ -256,7 +257,7 @@ impl<'input, 'req, 'd: 'req> guard::Reject<'req, 'd> for Egress<'_, crate::Input
 
     fn try_reject<R>(self, response: R) -> Self::Break
     where
-        R: dispatch::Immediate<'req, 'd>,
+        R: dispatch::Complete<'req, 'd>,
     {
         let slot = handoff::Slot::ready(None).with_head(self.input);
         let sink = Sink::new(
@@ -266,7 +267,7 @@ impl<'input, 'req, 'd: 'req> guard::Reject<'req, 'd> for Egress<'_, crate::Input
             Mode::<()>::Plain,
             slot,
         );
-        Egress::outcome(response.emit(sink), head::Connection::Close)
+        Egress::outcome(response.complete(sink), head::Connection::Close)
     }
 }
 

@@ -1,7 +1,11 @@
 use proc_macro2::TokenStream;
 use quote::quote;
 
-use crate::{macros::tokens::local, runtime::paths::Paths};
+use crate::{
+    app::{serve::handle, spec},
+    macros::tokens::local,
+    runtime::paths::Paths,
+};
 
 pub(super) fn routes(
     paths: &Paths,
@@ -188,22 +192,36 @@ pub(super) fn completed(
 pub(super) fn guard(
     paths: &Paths,
     generics: &crate::types::Generics,
-    method: &impl quote::ToTokens,
-    slot: &impl quote::ToTokens,
+    entry: &spec::Entry,
     state: &syn::Type,
-) -> TokenStream {
+) -> Option<TokenStream> {
+    if entry.guards.is_empty() {
+        return None;
+    }
+    let method = entry.method.http_token(paths);
     let f_life = local("lifecycle");
     let [n_gform] = generics.locals(["__guard_form"]);
     let [n_ghead] = generics.locals(["__guard_head"]);
     let [n_gmeth] = generics.locals(["__guard_method"]);
-    let [n_gout, n_reject] = generics.locals(["__guard_outcome", "__reject"]);
+    let n_gout = generics.local("__guard_outcome");
     let [n_resp, v_conn, v_date] = generics.locals(["__response", "conn", "date"]);
-    let [v_exch, v_head, v_input] = generics.locals(["exchange", "head", "input"]);
+    let [v_exch, v_head, v_parsed, n_shead] =
+        generics.locals(["exchange", "head", "parsed", "__sark_head"]);
     let [v_permit, v_state, v_this] = generics.locals(["permit", "state", "this"]);
     let [v_write] = generics.locals(["write"]);
     let ns_core = &paths.core;
     let ns_h1 = &paths.h1;
     let ns_http = &paths.http;
+    let pass = generics.lifetime("__guard_passed");
+    let rejection = handle::guard_rejection(
+        paths,
+        generics,
+        &entry.guards,
+        state,
+        &v_state,
+        quote!(#ns_h1::wire::output::Egress::bind(#v_write, #v_date, #v_parsed.input(), #n_resp)),
+        quote!(break #pass),
+    );
     let open = open(paths, generics);
     let copied = copied(paths, generics, &quote!(#n_gout));
     let retained = retention_arms(
@@ -212,7 +230,9 @@ pub(super) fn guard(
         &quote!(#ns_h1::wire::output::Retention),
         &quote!(#v_conn.async_state.session_mut()),
     );
-    quote! {
+    Some(quote! { #pass: {
+        let #v_parsed = #n_shead.source();
+        let #v_head = #v_parsed.request();
         let #n_gmeth = #method;
         let #n_gform = match #v_head.plan().form() {
             #ns_http::h1::target::Form::Origin
@@ -229,35 +249,22 @@ pub(super) fn guard(
             #v_head.path(),
             #v_head.authority(),
         );
-        let (#v_write, #v_date) = match <#slot as #ns_core::route::guard::Slot<#state>>::try_admit(
-            #n_ghead,
-            #v_state,
-            #ns_h1::wire::output::Egress::bind(#v_write, #v_date, #v_input, #n_resp),
-        ) {
-            ::core::ops::ControlFlow::Continue(#n_reject) => #n_reject.into_parts(),
-            ::core::ops::ControlFlow::Break(#n_gout) => {
-                #open
-                #ns_core::life::Mode::observe(
-                    #v_this.#f_life,
-                    #ns_core::life::Event::HeadAdmitted(#v_exch),
-                );
-                #copied
-                match #n_gout.retention() {
-                    #retained
-                    #ns_h1::wire::output::Retention::Rejected => {}
-                }
-                #v_exch.retire(
-                    #v_this.#f_life,
-                    #ns_core::life::Outcome::Rejected,
-                );
-                return #n_gout.into_consume(
-                    #v_permit,
-                    #ns_h1::session::Consumption::Buffered(
-                        #ns_h1::session::Buffered::new(0),
-                    ),
-                    #ns_h1::wire::head::Connection::Close,
-                ).into();
-            }
-        };
-    }
+        let #n_gout = #rejection;
+        #open
+        #ns_core::life::Mode::observe(
+            #v_this.#f_life,
+            #ns_core::life::Event::HeadAdmitted(#v_exch),
+        );
+        #copied
+        match #n_gout.retention() {
+            #retained
+            #ns_h1::wire::output::Retention::Rejected => {}
+        }
+        #v_exch.retire(#v_this.#f_life, #ns_core::life::Outcome::Rejected);
+        return #n_gout.into_consume(
+            #v_permit,
+            #ns_h1::session::Consumption::Buffered(#ns_h1::session::Buffered::new(0)),
+            #ns_h1::wire::head::Connection::Close,
+        ).into();
+    } })
 }

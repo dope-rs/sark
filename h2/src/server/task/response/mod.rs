@@ -38,6 +38,7 @@ pub(super) enum Duplex<I, E = PushError<I, payload::Error>> {
 
 use o3::buffer::resident;
 use sark_core::{
+    body::Body,
     decode::{exec, request},
     duplex::{self, input::PushError},
     life::{self, exchange},
@@ -55,7 +56,7 @@ use crate::{
 
 pub(super) enum Response<'d, P, D: duplex::Session<'d>, X> {
     Status(Code),
-    Sync(request::Ready<exec::Sync, P, owned::Segments<'d>>),
+    Sync(request::Admitted<exec::Sync, P, Body<owned::Segments<'d>>>),
     Fixed(X),
     Task,
     End,

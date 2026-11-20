@@ -1,10 +1,6 @@
 use std::convert::Infallible;
 
-pub type Stream<'d, R, A> =
-    <<<R as route::Task<'d, A>>::Output as dispatch::IntoOutput<'d, 'd>>::Output as dispatch::Emit<
-        'd,
-        'd,
-    >>::Stream;
+pub type Stream<'d, R, A> = <<R as route::Task<'d, A>>::Output as dispatch::Emit<'d, 'd>>::Stream;
 
 pub type Emitted<'d, S, B> = Result<
     (
@@ -104,21 +100,17 @@ impl<'d, R: route::Task<'d, A>, A> Output<'d, R, A> {
         let sink = make(self.id);
         match self.outcome {
             Outcome::Response(response) => {
-                let emitted =
-                    dispatch::Emit::emit(dispatch::IntoOutput::into_output(response), sink)?;
+                let emitted = dispatch::Emit::emit(response, sink)?;
                 let (prepared, stream) =
-                    <<<R::Output as dispatch::IntoOutput<'d, 'd>>::Output as dispatch::Emit<
-                        'd,
-                        'd,
-                    >>::Kind as dispatch::Dispatch>::fold::<S, Stream<'d, R, A>, _>(
-                        emitted,
-                        |prepared| (prepared, None),
-                        S::split_stream,
-                    );
+                    <<R::Output as dispatch::Emit<'d, 'd>>::Kind as dispatch::Dispatch>::fold::<
+                        S,
+                        Stream<'d, R, A>,
+                        _,
+                    >(emitted, |prepared| (prepared, None), S::split_stream);
                 Ok((prepared, stream, life::Outcome::Completed))
             }
             Outcome::Rejected(reject) => {
-                let prepared = dispatch::Immediate::emit(Response::new(reject.status()), sink)?;
+                let prepared = dispatch::Complete::complete(Response::new(reject.status()), sink)?;
                 Ok((prepared, None, life::Outcome::Rejected))
             }
         }
@@ -132,17 +124,17 @@ pub trait Completion<'d>: Sized {
 impl<'d, R, A> Completion<'d> for Output<'d, R, A>
 where
     R: route::Task<'d, A>,
-    <R::Output as dispatch::IntoOutput<'d, 'd>>::Output: dispatch::Complete<'d, 'd>,
+    R::Output: dispatch::Complete<'d, 'd>,
 {
     fn emit<E: decode::Encode<'d, 'd>>(self, make: impl FnOnce(Id<'d>) -> E) -> Complete<'d, E> {
         let sink = make(self.id);
         let (prepared, outcome) = match self.outcome {
             Outcome::Response(response) => (
-                dispatch::Immediate::emit(response, sink)?,
+                dispatch::Complete::complete(response, sink)?,
                 life::Outcome::Completed,
             ),
             Outcome::Rejected(reject) => (
-                dispatch::Immediate::emit(Response::new(reject.status()), sink)?,
+                dispatch::Complete::complete(Response::new(reject.status()), sink)?,
                 life::Outcome::Rejected,
             ),
         };

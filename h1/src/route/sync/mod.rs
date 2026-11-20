@@ -8,7 +8,6 @@ use sark_core::{
     manifold, route,
 };
 use sark_http::{
-    h1::head::request::Coding,
     owner::handoff,
     payload::{compress, response::dispatch},
 };
@@ -41,22 +40,21 @@ impl<'turn, C: compress::Compression> Egress<'turn, C> {
         request: framing::Parsed<&[u8], R>,
         body: &mut body::Body<View<'_, 'd>>,
         state: &S,
-        coding: Coding,
     ) -> Result<output::Outcome<'d>, Failure>
     where
         R: route::Spec<Kind = dispatch::Sync> + manifold::Route<S> + PolicyOf,
     {
         <<R::Request as route::Schema>::Body as body::Project>::try_project(
             body,
-            (request, state, self, coding),
+            (request, state, self),
             |scope| -> Result<output::Outcome<'d>, Failure> {
-                let ((request, state, egress, coding), view) = scope.into_parts();
+                let ((request, state, egress), view) = scope.into_parts();
                 let Egress { output, gzip } = egress;
                 let call = Call::new(request, view);
                 let reply = call.try_invoke::<R, S>(state).map_err(|error| {
                     Failure::Route(<R::Request as route::Project>::reject(error))
                 })?;
-                Ok(output.route(reply, handoff::Slot::ready(None), gzip, coding, R::POLICY))
+                Ok(output.route(reply, handoff::Slot::ready(None), gzip, R::POLICY))
             },
         )
         .map_err(|failure| Failure::Projection(failure.discard()))?
@@ -95,7 +93,7 @@ where
     pub fn dispatch<R, S, E: credit::Evidence>(
         self,
         permit: session::Permit,
-        found: framing::Head<'_, '_, R, Coding>,
+        found: framing::Head<'_, '_, R>,
         state: &S,
         proof: E,
     ) -> session::RouteOutcome<'d, Pending<'d, R>, Transitions::Raw>
@@ -111,7 +109,7 @@ where
     fn pending<R: route::Spec, E: credit::Evidence>(
         &mut self,
         permit: session::Permit,
-        frame: framing::Pending<R, Coding>,
+        frame: framing::Pending<R>,
         proof: E,
     ) -> session::RouteOutcome<'d, Pending<'d, R>, Transitions::Raw> {
         let state = frame.state;
@@ -131,7 +129,7 @@ where
     fn buffered<R, S, E: credit::Evidence>(
         mut self,
         permit: session::Permit,
-        found: framing::Head<'_, '_, R, Coding>,
+        found: framing::Head<'_, '_, R>,
         state: &S,
         mut proof: E,
     ) -> session::RouteOutcome<'d, Pending<'d, R>, Transitions::Raw>
@@ -149,14 +147,11 @@ where
         };
         let total = frame.total();
         self.egress.output = self.egress.output.with_context(frame.response);
-        let (request, mut body, _, close, coding, _) = match frame.into_parts() {
+        let (request, mut body, _, close, _) = match frame.into_parts() {
             Ok(parts) => parts,
             Err(error) => return error.into_consume().into(),
         };
-        let ready = match self
-            .egress
-            .invoke::<R, S>(request, &mut body, state, coding)
-        {
+        let ready = match self.egress.invoke::<R, S>(request, &mut body, state) {
             Ok(ready) => ready,
             Err(error) => return session::Outcome::Failed(error).into(),
         };
@@ -172,7 +167,7 @@ where
     fn discard<R, S, E: credit::Evidence>(
         mut self,
         permit: session::Permit,
-        found: framing::Head<'_, '_, R, Coding>,
+        found: framing::Head<'_, '_, R>,
         state: &S,
         mut proof: E,
     ) -> session::RouteOutcome<'d, Pending<'d, R>, Transitions::Raw>
@@ -188,7 +183,7 @@ where
                 return reason.into_consume().into();
             }
         };
-        let (request, total, want, used, close, coding, response) = match frame.into_parts() {
+        let (request, total, want, used, close, response) = match frame.into_parts() {
             Ok(parts) => parts,
             Err(error) => return error.into_consume().into(),
         };
@@ -200,10 +195,7 @@ where
                 return session::Outcome::Failed(Failure::reject(error)).into();
             }
         };
-        let ready = match self
-            .egress
-            .invoke::<R, S>(request, &mut body, state, coding)
-        {
+        let ready = match self.egress.invoke::<R, S>(request, &mut body, state) {
             Ok(ready) => ready,
             Err(error) => return session::Outcome::Failed(error).into(),
         };

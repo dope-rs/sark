@@ -3,7 +3,7 @@ use crate::{
         inputs,
         serve::{
             self, handle,
-            handle::h1::{admit, terminal, types},
+            handle::h1::{admit, plan, terminal, types},
         },
     },
     macros::tokens::local,
@@ -40,8 +40,7 @@ pub(super) fn methods<'view, 'source, 'spec>(
     let f_state = local("state");
     let symbols = &ctx.plan.spec.state_generics;
     let [n_shead, v_conn] = symbols.locals(["__sark_head", "conn"]);
-    let [v_link, v_date, v_head] = symbols.locals(["connection", "date", "head"]);
-    let [v_input, v_parsed, v_permit] = symbols.locals(["input", "parsed", "permit"]);
+    let [v_link, v_date, v_permit] = symbols.locals(["connection", "date", "permit"]);
     let [v_state, v_this, v_write] = symbols.locals(["state", "this", "write"]);
     let l_env = ctx.plan.spec.state_generics.lifetime("env");
     let g_id = ctx.plan.spec.state_generics.ident("__ID");
@@ -62,12 +61,6 @@ pub(super) fn methods<'view, 'source, 'spec>(
             .entry
             .upgrade
             .then(|| quote::quote!(, #ns_h1::route::duplex::Upgrade));
-        let coding = match plan.mode {
-            serve::Mode::Sync => quote::quote!(#ns_http::h1::head::request::Coding),
-            serve::Mode::Duplex { .. } | serve::Mode::Fiber { .. } | serve::Mode::Stream { .. } => {
-                quote::quote!(#ns_h1::wire::parsing::framing::Plain)
-            }
-        };
         let body = emit(
             paths,
             ctx,
@@ -84,7 +77,7 @@ pub(super) fn methods<'view, 'source, 'spec>(
                 #v_link: #ns_fiber::dope::manifold::network::listener::conn::Id<'d, #g_id>,
                 #v_permit: #ns_h1::session::Permit,
                 #n_shead: #ns_h1::wire::parsing::framing::Head<
-                    #head_lt, #req_lt, #route, #coding #admission,
+                    #head_lt, #req_lt, #route #admission,
                 >,
                 #v_write: #ns_http::o3::buffer::write::Slice<'_, &mut usize>,
                 #v_date: &[::core::primitive::u8; 29],
@@ -98,9 +91,6 @@ pub(super) fn methods<'view, 'source, 'spec>(
             > {
                 let mut #v_this = self.project();
                 let #v_state: &#l_env #state = *#v_this.#f_state;
-                let #v_parsed = #n_shead.source();
-                let #v_input = #v_parsed.input();
-                let #v_head = #v_parsed.request();
                 #body
             }
         }
@@ -148,11 +138,12 @@ pub(super) fn emit<'view, 'source, 'spec>(
         .into_compile_error();
     };
     let route = &plan.entry.route;
-    let admission = plan
-        .entry
-        .upgrade
-        .then(|| quote!(, #ns_h1::wire::parsing::framing::Plain, #ns_h1::route::duplex::Upgrade));
-    let slot = &plan.head;
+    let admission = if plan.entry.upgrade {
+        quote!(#ns_h1::route::duplex::Upgrade)
+    } else {
+        quote!(())
+    };
+    let negotiate = plan::negotiate(paths, plan);
     let heads = cont.head();
     let head = &plan.pending_variant;
     let open = terminal::open(paths, &ctx.plan.spec.state_generics);
@@ -173,28 +164,10 @@ pub(super) fn emit<'view, 'source, 'spec>(
         quote! { #ns_h1::wire::parsing::raw::Bound::<_, #route>::empty(#parsed) }
     };
     if matches!(source, Source::Owned) {
-        let (start, coding) = match &plan.mode {
-            serve::Mode::Sync => (
-                quote! {
-                    #ns_h1::wire::parsing::framing::PendingHead::<
-                        #route,
-                        #ns_http::h1::head::request::Coding,
-                    >::try_start
-                },
-                quote!(<#route as #ns_h1::route::PolicyOf>::POLICY.coding,),
-            ),
-            serve::Mode::Duplex { .. } | serve::Mode::Fiber { .. } | serve::Mode::Stream { .. } => {
-                (
-                    quote!(#ns_h1::wire::parsing::framing::PendingHead::<#route #admission>::try_start),
-                    quote!(),
-                )
-            }
-        };
         let complete = complete(index, &ctx.plan.spec.state_generics, &v_routes);
         return quote! {
-            return match #start(
+            return match #ns_h1::wire::parsing::framing::PendingHead::<#route, #admission, { #negotiate }>::try_start(
                 #found,
-                #coding
                 #v_permit,
                 #heads::#head,
                 |#n_shead, #v_permit| {
@@ -209,25 +182,10 @@ pub(super) fn emit<'view, 'source, 'spec>(
             };
         };
     }
-    let method = plan.entry.method.http_token(paths);
-    let guard = terminal::guard(paths, &ctx.plan.spec.state_generics, &method, slot, state);
     if matches!(source, Source::Borrowed) {
-        let parse = match &plan.mode {
-            serve::Mode::Sync => quote! {
-                #ns_h1::wire::parsing::framing::Head::<
-                    #route,
-                    #ns_http::h1::head::request::Coding,
-                >::start(#found, <#route as #ns_h1::route::PolicyOf>::POLICY.coding)
-            },
-            serve::Mode::Duplex { .. } | serve::Mode::Fiber { .. } | serve::Mode::Stream { .. } => {
-                quote! {
-                    #ns_h1::wire::parsing::framing::Head::<#route #admission>::start(#found)
-                }
-            }
-        };
         let complete = complete(index, &ctx.plan.spec.state_generics, &v_routes);
         return quote! {
-            let #n_shead = match #parse {
+            let #n_shead = match #ns_h1::wire::parsing::framing::Head::<#route, #admission>::start::<{ #negotiate }>(#found) {
                 ::core::result::Result::Ok(
                     #ns_h1::wire::parsing::framing::HeadProgress::Complete(#v_head),
                 ) => #v_head,
@@ -247,6 +205,10 @@ pub(super) fn emit<'view, 'source, 'spec>(
             return #complete;
         };
     }
+    let guard = terminal::guard(paths, symbols, plan.entry, state);
+    let context = (guard.is_some()
+        || matches!(plan.mode, serve::Mode::Sync | serve::Mode::Stream { .. }))
+    .then(|| quote!(let #n_resp = #n_shead.response();));
     let (prepare, invoke) = match &plan.mode {
         serve::Mode::Duplex { family } => {
             let wrap = h1.duplex.wrap(*family, false, quote!(#v_sess));
@@ -464,7 +426,7 @@ pub(super) fn emit<'view, 'source, 'spec>(
         }
     };
     quote! {
-        let #n_resp = #n_shead.response();
+        #context
         #prepare
         #guard
         #open

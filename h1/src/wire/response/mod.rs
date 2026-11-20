@@ -2,7 +2,10 @@ use std::mem;
 
 use o3::buffer::write::consume;
 use sark_http::{
-    h1::head::line::{self, Request},
+    h1::head::{
+        line::{self, Request},
+        request::Coding,
+    },
     method::Known,
     payload::response::Method,
 };
@@ -20,6 +23,7 @@ pub(in crate::wire) use head::{Count, Head, Writer};
 pub struct Context {
     method: Method,
     version: Version,
+    coding: Coding,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -39,6 +43,7 @@ impl Context {
                 line::Version::Ten => Version::Ten,
                 line::Version::Eleven => Version::Eleven,
             },
+            coding: Coding::Plain,
         }
     }
 
@@ -54,6 +59,15 @@ impl Context {
 
     pub const fn method(self) -> Method {
         self.method
+    }
+
+    pub const fn with_coding(mut self, coding: Coding) -> Self {
+        self.coding = coding;
+        self
+    }
+
+    pub(crate) const fn coding(self) -> Coding {
+        self.coding
     }
 
     pub const fn version(self) -> line::Version {
@@ -93,6 +107,6 @@ pub enum Error {
 }
 
 const _: () = {
-    assert!(mem::size_of::<Context>() == 2);
+    assert!(mem::size_of::<Context>() == 3);
     assert!(mem::size_of::<Error>() <= 3 * mem::size_of::<usize>());
 };

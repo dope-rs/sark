@@ -46,14 +46,46 @@ fn admits_gzip_quality() {
         Known::AcceptEncoding
             .apply(&mut fields, &mut Flags::default(), raw, Version::Eleven)
             .expect("quality");
-        assert_eq!(fields.message.coding() == Coding::Gzip, gzip);
+        assert_eq!(fields.message.coding().gzip(), gzip);
         let line = [raw, b"\r\n"].concat();
         let mut fields = Fields::default();
         Known::AcceptEncoding
             .scan_line(&mut fields, &mut Flags::default(), &line, Version::Eleven)
             .expect("line")
             .expect("complete");
-        assert_eq!(fields.message.coding() == Coding::Gzip, gzip);
+        assert_eq!(fields.message.coding().gzip(), gzip);
+    }
+}
+
+#[test]
+fn retains_identity_negotiation() {
+    assert!(Fields::default().message.coding() == Coding::Plain);
+    for (values, expected) in [
+        (
+            [b"*;q=0".as_slice(), b"identity;q=1", b"gzip;q=1"].as_slice(),
+            Coding::Gzip,
+        ),
+        (
+            [b"gzip;q=1".as_slice(), b"identity;q=1", b"*;q=0"].as_slice(),
+            Coding::Gzip,
+        ),
+        (
+            [b"identity;q=0".as_slice(), b"identity;q=1", b"gzip;q=1"].as_slice(),
+            Coding::GzipOnly,
+        ),
+        (
+            [b"identity;q=0".as_slice(), b"gzip;q=0"].as_slice(),
+            Coding::Refused,
+        ),
+    ] {
+        let mut fields = Fields::default();
+        let mut flags = Flags::default();
+        for value in values {
+            Known::AcceptEncoding
+                .apply(&mut fields, &mut flags, value, Version::Eleven)
+                .expect("field");
+        }
+        assert!(fields.message.coding() == expected);
     }
 }
 

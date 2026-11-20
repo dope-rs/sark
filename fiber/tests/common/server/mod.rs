@@ -2,6 +2,7 @@ use std::{convert::Infallible, fmt, net, time};
 
 use dope::{
     core::{
+        BranchError,
         driver::{
             life::recovery::{self, Recovery},
             route::{FrameworkTag, Identity, KeyTag, Tag, kind, table::conn},
@@ -12,13 +13,15 @@ use dope::{
             option::{Buffer, Switch},
         },
     },
-    manifold::network::listener::config,
+    manifold::{app::receive, network::listener::config},
     net::tcp,
+    runtime::shutdown::ReadySource,
 };
 use dope_test::{
     harness::{observe::VecCellExt as _, server::Pair},
     reclaim::Reports,
 };
+use sark_fiber::{Config, server::Serve};
 use sark_h1::server::{listener, run};
 
 pub fn recover(failure: Recovery<'_, '_>) -> Infallible {
@@ -56,6 +59,26 @@ pub const DATE_UPDATER_ID: u8 = 1;
 
 pub(super) type Http1Plan =
     run::Plan<KeyTag<HTTP_LISTENER_ID>, KeyTag<DATE_UPDATER_ID>, sark_fiber::Throughput>;
+
+pub fn serve<A, S>(
+    plan: Http1Plan,
+    context: ReadySource<'_>,
+    state: S,
+    tasks: usize,
+    reports: &mut Reports<1>,
+) -> Result<(), BranchError<run::prepare::Error, errors::Claim>>
+where
+    A: Serve<S, Input = receive::Coupled, Config = Config>,
+{
+    A::serve(
+        plan,
+        context,
+        state,
+        Config::new(tasks),
+        reporting(reports),
+        |result| completed(&result),
+    )
+}
 
 /// Canonical deterministic Sark server topology.
 pub struct Plan {

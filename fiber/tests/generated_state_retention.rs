@@ -21,6 +21,7 @@ use dope::{
 };
 use dope_fiber::task::storage::scope::Brand;
 use dope_test::harness::server::Pair;
+use sark_fiber::server::Serve as _;
 use sark_fiber::Config;
 
 #[test]

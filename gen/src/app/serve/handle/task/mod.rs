@@ -254,10 +254,10 @@ pub(super) fn build(
 
             fn try_dispatch(
                 self: ::core::pin::Pin<&mut Self>,
-                #n_req: #ns_core::decode::request::Ready<
+                #n_req: #ns_core::decode::request::Admitted<
                     #ns_core::decode::exec::Task,
                     Self::Prepared,
-                    #ns_http::payload::owned::Segments<'d>,
+                    #ns_core::body::Body<#ns_http::payload::owned::Segments<'d>>,
                 >,
                 #n_target: Self::Target,
                 #n_owner: #ns_fiber::dope::core::driver::schedule::ready::task::owner::Owner<

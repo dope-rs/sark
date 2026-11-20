@@ -1,11 +1,6 @@
 use o3::buffer::{resident, segments};
 use sark_core::{
-    body::{
-        self,
-        admit::{self, Start},
-        buffered, credit,
-        stream::Stream,
-    },
+    body::{self, admit, buffered, credit, stream::Stream},
     manifold::stream::Boundary,
 };
 use sark_http::payload::owned;
@@ -33,13 +28,25 @@ pub(crate) enum Push<D> {
     Rejected { input: D, error: payload::Error },
 }
 
-impl<'d> Buffer<'d> {
-    pub(crate) fn start(start: Start) -> Self {
-        let inner = match start {
-            Start::Open(open) => buffered::State::new(open),
-            Start::Finished(finished) => buffered::State::finished(finished),
-        };
-        Self { inner }
+impl From<core::convert::Infallible> for Buffer<'_> {
+    fn from(never: core::convert::Infallible) -> Self {
+        match never {}
+    }
+}
+
+impl From<admit::Track<admit::Open>> for Buffer<'_> {
+    fn from(open: admit::Track<admit::Open>) -> Self {
+        Self {
+            inner: buffered::State::new(open),
+        }
+    }
+}
+
+impl From<admit::Track<admit::Finished>> for Buffer<'_> {
+    fn from(finished: admit::Track<admit::Finished>) -> Self {
+        Self {
+            inner: buffered::State::finished(finished),
+        }
     }
 }
 

@@ -1,15 +1,25 @@
 use std::cell::Cell;
 
 use o3::alloc;
-use sark_h1::wire::{output, response::Context};
+use sark_h1::{
+    route,
+    wire::{output, response::Context},
+};
 use sark_http::{
     field,
-    h1::head::line::Version,
+    h1::head::{
+        line::Version,
+        request::Coding,
+        response::{Date, Server},
+    },
     payload::response::{Method, headers},
 };
 
 pub const DATE: &[u8; 29] = b"Mon, 01 Jan 2026 00:00:00 GMT";
 pub const RESPONSE: Context = Context::new(Method::Other, Version::Eleven);
+pub const GZIP_RESPONSE: Context = RESPONSE.with_coding(Coding::Gzip);
+pub const GZIP_POLICY: route::Policy =
+    route::Policy::new(route::Mode::Gzip, Date::Include, Server::Include);
 pub const ENCODED_BODY: [u8; 256] = [b'x'; 256];
 
 pub const ENTRIES: [headers::Entry<'static>; 2] = [
@@ -70,12 +80,7 @@ pub fn try_encode<'d>(
     source: impl headers::Source,
     input: &'d [u8],
 ) -> Result<output::Outcome<'d>, alloc::Error> {
-    use sark_h1::route;
     use sark_http::{
-        h1::head::{
-            request::Coding,
-            response::{Date, Server},
-        },
         owner::handoff,
         payload::{
             compress::{Compression as _, Gzip},
@@ -89,15 +94,9 @@ pub fn try_encode<'d>(
     Ok(output::Egress::new(
         o3::buffer::write::Slice::new(&mut bytes).reborrow(),
         DATE,
-        RESPONSE,
+        GZIP_RESPONSE,
     )
-    .route(
-        response,
-        handoff::Slot::ready(None),
-        &mut gzip,
-        Coding::Gzip,
-        route::Policy::new(Coding::Gzip, Date::Include, Server::Include),
-    ))
+    .route(response, handoff::Slot::ready(None), &mut gzip, GZIP_POLICY))
 }
 
 impl headers::Source for Generated<'_> {
@@ -108,20 +107,24 @@ impl headers::Source for Generated<'_> {
 
 pub struct Drifting<'a> {
     pub emissions: &'a Cell<usize>,
-    pub first: field::Value<&'a [u8]>,
-    pub second: field::Value<&'a [u8]>,
+    pub first: headers::Entry<'a>,
+    pub second: headers::Entry<'a>,
+}
+
+impl<'a> Drifting<'a> {
+    pub fn values(emissions: &'a Cell<usize>, first: &'a [u8], second: &'a [u8]) -> Self {
+        let name = field::literal!(headers::Name::try_bytes(b"x-drift"));
+        Self {
+            emissions,
+            first: headers::Entry::new(name, field::Value::try_bytes(first).expect("first")),
+            second: headers::Entry::new(name, field::Value::try_bytes(second).expect("second")),
+        }
+    }
 }
 
 impl headers::Source for Drifting<'_> {
     fn emit<'field>(&'field self, sink: &mut impl headers::Sink<'field>) {
-        let emission = self.emissions.get();
-        self.emissions.set(self.emissions.get() + 1);
-        let value = if emission == 0 {
-            self.first
-        } else {
-            self.second
-        };
-        let name = field::literal!(headers::Name::try_bytes(b"x-drift"));
-        sink.field(name, value);
+        let index = self.emissions.replace(self.emissions.get() + 1);
+        sink.entry(if index == 0 { self.first } else { self.second });
     }
 }

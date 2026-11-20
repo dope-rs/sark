@@ -270,43 +270,50 @@ fn first_poll_drops_request() {
                     Outcome::Response(reply) if reply.status == Code::OK
                 ));
             }
-            let mut body = vec![b' '; body::DEFAULT_BUILD_STEP_BUDGET.get()];
-            body.extend_from_slice(br#"{"value":"ok"}"#);
-            let mut wire = format!(
-                "POST / HTTP/1.1\r\nHost: empty\r\nContent-Length: {}\r\n\r\n",
-                body.len(),
-            )
-            .into_bytes();
-            wire.extend_from_slice(&body);
-            let (input, _, _) = Carrier::<Built>::try_dispatch(
-                ids.try_next().expect("yielding request identity"),
-                &wire,
-                true,
-            )
-            .expect("yielding request");
-            let input = input.expect("admitted buffered request");
-            assert!(matches!(input, Input::Buffered(_)));
-            calls.set(0);
-            let mut task = pin!(Task::new(Built::invoke_task((input, &calls, timer))));
-            for ready in [false, true] {
-                let turn = control.begin();
-                let output = turn.turn().app().share::<1, _>(|share| {
-                    Context::with_target(
-                        target.target(),
-                        share.work(),
-                        driver.reborrow(),
-                        |context| context.poll(task.as_mut()),
-                    )
-                });
-                if ready {
-                    assert!(matches!(
-                        output.map(|output| output.into_parts().1),
-                        Poll::Ready(Outcome::Response(reply)) if reply.status == Code::OK
-                    ));
-                } else {
-                    assert!(output.is_pending());
+            let pad = body::DEFAULT_BUILD_STEP_BUDGET.get();
+            for (json, expected, polls) in [
+                (br#"{"value":"ok"}"#.as_slice(), Ok(Code::OK), 2),
+                (b"{}".as_slice(), Err(Code::BAD_REQUEST), 3),
+            ] {
+                let mut wire = format!(
+                    "POST / HTTP/1.1\r\nHost: empty\r\nContent-Length: {}\r\n\r\n",
+                    pad + json.len(),
+                )
+                .into_bytes();
+                wire.resize(wire.len() + pad, b' ');
+                wire.extend_from_slice(json);
+                let id = ids.try_next().expect("yielding request identity");
+                let (input, _, _) =
+                    Carrier::<Built>::try_dispatch(id, &wire, true).expect("yielding request");
+                let input = input.expect("admitted buffered request");
+                assert!(matches!(input, Input::Buffered(_)));
+                calls.set(0);
+                let mut task = pin!(Task::new(Built::invoke_task((input, &calls, timer))));
+                for poll in 1..=polls {
+                    let ready = poll == polls;
+                    let turn = control.begin();
+                    let output = turn.turn().app().share::<1, _>(|share| {
+                        Context::with_target(
+                            target.target(),
+                            share.work(),
+                            driver.reborrow(),
+                            |context| context.poll(task.as_mut()),
+                        )
+                    });
+                    let status = output.map(|output| {
+                        let (received, outcome) = output.into_parts();
+                        assert_eq!(received, id);
+                        match outcome {
+                            Outcome::Response(reply) => Ok(reply.status),
+                            Outcome::Rejected(reject) => Err(reject.status()),
+                        }
+                    });
+                    assert_eq!(
+                        status,
+                        if ready { Poll::Ready(expected) } else { Poll::Pending }
+                    );
+                    assert_eq!(calls.get(), usize::from(ready && expected.is_ok()));
                 }
-                assert_eq!(calls.get(), usize::from(ready));
             }
         },
         Policy::new(|event| reports.push(event), recover),

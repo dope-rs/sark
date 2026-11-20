@@ -100,7 +100,7 @@ pub trait Sink<'d>: Accept<'d> {
         self,
         status: Code,
         headers: H,
-        stream: S,
+        stream: Option<S>,
     ) -> Result<Self::Stream<S>, Self::Error>
     where
         H: headers::Source;
@@ -119,12 +119,6 @@ pub trait Emit<'req, 'd>: Sized {
     ) -> Result<<Self::Kind as Dispatch>::Output<'d, S, Self::Stream>, S::Error>
     where
         S: Sink<'d>;
-}
-
-pub trait IntoOutput<'req, 'd>: Sized {
-    type Output: Emit<'req, 'd>;
-
-    fn into_output(self) -> Self::Output;
 }
 
 #[doc(hidden)]
@@ -150,62 +144,27 @@ impl<'req, 'd, T: Complete<'req, 'd>> Emit<'req, 'd> for T {
     }
 }
 
-/// Response behavior that cannot produce a polled body stream.
-///
-pub trait Immediate<'req, 'd>: Sized {
-    type Bound: bound::Bound + 'd;
-
-    fn emit<S>(self, sink: S) -> Result<S::Output, S::Error>
-    where
-        S: Accept<'d>;
-}
-
-impl<'req, 'd, T> Immediate<'req, 'd> for T
+impl<'req, 'd, T, E> Complete<'req, 'd> for Result<T, E>
 where
-    T: IntoOutput<'req, 'd>,
-    T::Output: Complete<'req, 'd>,
+    T: Complete<'req, 'd>,
+    E: Complete<'req, 'd>,
 {
-    type Bound = <T::Output as Complete<'req, 'd>>::Bound;
+    type Bound = bound::Max<T::Bound, E::Bound>;
 
-    fn emit<S>(self, sink: S) -> Result<S::Output, S::Error>
-    where
-        S: Accept<'d>,
-    {
-        self.into_output().complete(sink)
-    }
-}
+    const BODY: payload::Kind = payload::Kind::Inline;
 
-impl<'req, 'd, L, R> IntoOutput<'req, 'd> for Either<L, R>
-where
-    L: Immediate<'req, 'd>,
-    R: Immediate<'req, 'd>,
-{
-    type Output = Self;
-
-    fn into_output(self) -> Self::Output {
-        self
-    }
-}
-
-impl<'req, 'd, T, E> IntoOutput<'req, 'd> for Result<T, E>
-where
-    T: Immediate<'req, 'd>,
-    E: Immediate<'req, 'd>,
-{
-    type Output = Either<T, E>;
-
-    fn into_output(self) -> Self::Output {
+    fn complete<S: Accept<'d>>(self, sink: S) -> Result<S::Output, S::Error> {
         match self {
-            Ok(output) => Either::Left(output),
-            Err(error) => Either::Right(error),
+            Ok(output) => output.complete(sink),
+            Err(error) => error.complete(sink),
         }
     }
 }
 
 impl<'req, 'd, L, R> Complete<'req, 'd> for Either<L, R>
 where
-    L: Immediate<'req, 'd>,
-    R: Immediate<'req, 'd>,
+    L: Complete<'req, 'd>,
+    R: Complete<'req, 'd>,
 {
     type Bound = bound::Max<L::Bound, R::Bound>;
 
@@ -216,8 +175,8 @@ where
         S: Accept<'d>,
     {
         match self {
-            Self::Left(output) => output.emit(sink),
-            Self::Right(output) => output.emit(sink),
+            Self::Left(output) => output.complete(sink),
+            Self::Right(output) => output.complete(sink),
         }
     }
 }
@@ -225,7 +184,7 @@ where
 pub struct Stream<'req, S, const N: usize = 0> {
     status: Code,
     headers: set::Set<'req, N>,
-    stream: S,
+    stream: Option<S>,
 }
 
 impl<S, const N: usize> Stream<'_, S, N> {
@@ -236,7 +195,7 @@ impl<S, const N: usize> Stream<'_, S, N> {
 }
 
 impl<'req, S> Stream<'req, S, 0> {
-    pub fn new(stream: S) -> Self {
+    pub fn new(stream: Option<S>) -> Self {
         Self {
             status: Code::OK,
             headers: set::Set::new(),
@@ -250,14 +209,6 @@ impl<'req, S> Stream<'req, S, 0> {
             headers,
             stream: self.stream,
         }
-    }
-}
-
-impl<'req, 'd, 'head: 'req, S, const N: usize> IntoOutput<'req, 'd> for Stream<'head, S, N> {
-    type Output = Self;
-
-    fn into_output(self) -> Self::Output {
-        self
     }
 }
 

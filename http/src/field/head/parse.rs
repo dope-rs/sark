@@ -93,10 +93,11 @@ pub(super) fn ae_line(
 }
 
 const GZIP_SEEN: u16 = 1 << 3;
-const GZIP_ALLOWED: u16 = 1 << 4;
+const IDENTITY_SEEN: u16 = 1 << 4;
 const GZIP_EXCLUDED: u16 = 1 << 5;
 const WILDCARD_ALLOWED: u16 = 1 << 6;
 const WILDCARD_EXCLUDED: u16 = 1 << 7;
+const IDENTITY_EXCLUDED: u16 = 1 << 8;
 
 const GZIP: usize = 0;
 const BR: usize = 1;
@@ -203,11 +204,9 @@ fn scan<const FULL: bool>(raw: &[u8]) -> Result<(Flags, AcceptEncoding), Error> 
         let quality = quality::<FULL>(&member[end..])?;
         let slot = if token.eq_ignore_ascii_case(b"gzip") {
             next.set(GZIP_SEEN);
-            next.set(if quality != 0 {
-                GZIP_ALLOWED
-            } else {
-                GZIP_EXCLUDED
-            });
+            if quality == 0 {
+                next.set(GZIP_EXCLUDED);
+            }
             GZIP
         } else if token == b"*" {
             next.set(if quality != 0 {
@@ -218,7 +217,11 @@ fn scan<const FULL: bool>(raw: &[u8]) -> Result<(Flags, AcceptEncoding), Error> 
             WILDCARD
         } else if FULL && token.eq_ignore_ascii_case(b"br") {
             BR
-        } else if FULL && token.eq_ignore_ascii_case(b"identity") {
+        } else if token.eq_ignore_ascii_case(b"identity") {
+            next.set(IDENTITY_SEEN);
+            if quality == 0 {
+                next.set(IDENTITY_EXCLUDED);
+            }
             IDENTITY
         } else {
             continue;
@@ -237,16 +240,19 @@ fn scan<const FULL: bool>(raw: &[u8]) -> Result<(Flags, AcceptEncoding), Error> 
 
 fn apply(fields: &mut request::Fields, flags: &mut Flags, next: Flags) {
     flags.0 |= next.0;
-    let allowed = if flags.is_set(GZIP_SEEN) {
-        flags.is_set(GZIP_ALLOWED) && !flags.is_set(GZIP_EXCLUDED)
+    let gzip = if flags.is_set(GZIP_SEEN) {
+        !flags.is_set(GZIP_EXCLUDED)
     } else {
         flags.is_set(WILDCARD_ALLOWED) && !flags.is_set(WILDCARD_EXCLUDED)
     };
-    fields.message.set_coding(if allowed {
-        request::Coding::Gzip
+    let identity = if flags.is_set(IDENTITY_SEEN) {
+        !flags.is_set(IDENTITY_EXCLUDED)
     } else {
-        request::Coding::Plain
-    });
+        !flags.is_set(WILDCARD_EXCLUDED)
+    };
+    fields
+        .message
+        .set_coding(request::Coding::from_acceptance(identity, gzip));
 }
 
 /// The quality grammar has only four significant digits; parsing it directly

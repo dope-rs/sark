@@ -50,13 +50,12 @@ fn waits_after_eof() {
             |context, listener| {
                 let mut reports = Plan::try_reports(&server).map_err(BranchError::Second)?;
                 let failures = Cell::new(Vec::new());
-                let result = Chain::serve(
+                let result = server::serve::<Chain, _>(
                     server.with_bound(listener),
                     context,
                     State(&failures),
-                    sark_fiber::Config::new(server::MAX_CONNECTIONS),
-                    server::reporting(&mut reports),
-                    |result| server::completed(&result),
+                    server::MAX_CONNECTIONS,
+                    &mut reports,
                 );
                 server::reclaimed(&reports);
                 let failures = failures.into_inner();
@@ -99,13 +98,12 @@ fn input_deadline_spans_body() {
         |context, listener| {
             let mut reports = Plan::try_reports(&plan).map_err(BranchError::Second)?;
             let failures = Cell::new(Vec::new());
-            let result = ChunkedDispatch::serve(
+            let result = server::serve::<ChunkedDispatch, _>(
                 plan.with_bound(listener),
                 context,
                 State(&failures),
-                sark_fiber::Config::new(server::MAX_CONNECTIONS),
-                server::reporting(&mut reports),
-                |result| server::completed(&result),
+                server::MAX_CONNECTIONS,
+                &mut reports,
             );
             server::reclaimed(&reports);
             assert!(failures.into_inner().is_empty());

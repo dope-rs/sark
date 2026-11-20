@@ -4,11 +4,12 @@ use sark_http::{
     field,
     h1::head::{
         line::Version,
+        request::Coding,
         response::{Date, Server},
     },
     owner::{handoff, handoff::stage},
     payload::{
-        compress::Compression,
+        compress::{self, Compression},
         fixed::Body,
         response::{self, Content, bounded, dispatch, exact, headers, status::Code},
     },
@@ -31,7 +32,34 @@ use written::Written;
 
 pub(super) enum Mode<'a, C: Compression> {
     Plain,
-    Compress(&'a mut C),
+    Compress { gzip: &'a mut C, required: bool },
+}
+
+impl<'a, C: Compression> Mode<'a, C> {
+    pub(super) fn new(mode: crate::route::Mode, coding: Coding, gzip: &'a mut C) -> Self {
+        match mode {
+            crate::route::Mode::Plain => Self::Plain,
+            crate::route::Mode::Gzip | crate::route::Mode::RequiredGzip if !coding.gzip() => {
+                Self::Plain
+            }
+            crate::route::Mode::Gzip => Self::Compress {
+                gzip,
+                required: !coding.identity(),
+            },
+            crate::route::Mode::RequiredGzip => Self::Compress {
+                gzip,
+                required: true,
+            },
+        }
+    }
+}
+
+fn identity(response: Context, encoded: bool) -> Result<(), Error> {
+    if encoded || response.coding().identity() {
+        Ok(())
+    } else {
+        Err(Error::NotAcceptable(response.coding()))
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -152,7 +180,9 @@ impl<'req, 'd: 'req, Q: scope::Source, O: stage::Body<'req, 'd>, C: Compression,
             ..
         } = self;
         match mode {
-            Mode::Compress(gzip) => compress_body(out, date, status, &fields, body, gzip, slot),
+            Mode::Compress { gzip, required } => {
+                compress_body(out, date, status, &fields, body, gzip, required, slot)
+            }
             Mode::Plain => plain_body(out, date, status, &fields, body, slot),
         }
     }
@@ -171,8 +201,19 @@ impl<'req, 'd: 'req, Q: scope::Source, O: stage::Body<'req, 'd>, C: Compression,
         if let Some(frame) = self.omission(status)? {
             return self.empty(status, &fields, frame);
         }
-        emit_head::<_, ()>(self.out, self.date, status, &fields, body.len())?;
-        stage(self.slot, body)
+        if let Mode::Compress {
+            gzip,
+            required: true,
+        } = self.mode
+        {
+            return compress_body(
+                self.out, self.date, status, &fields, body, gzip, true, self.slot,
+            );
+        }
+        let (_, encoded) = emit_head::<_, bool>(self.out, self.date, status, &fields, body.len())?;
+        let written = stage(self.slot, body)?;
+        identity(self.date.response, encoded)?;
+        Ok(written)
     }
 
     fn exact<H, B>(self, status: Code, fields: H, body: B) -> Result<Self::Output, Self::Error>
@@ -193,7 +234,9 @@ impl<'req, 'd: 'req, Q: scope::Source, O: stage::Body<'req, 'd>, C: Compression,
             ..
         } = self;
         match mode {
-            Mode::Compress(gzip) => compress_exact(out, date, status, &fields, plan, gzip, slot),
+            Mode::Compress { gzip, required } => {
+                compress_exact(out, date, status, &fields, plan, gzip, required, slot)
+            }
             Mode::Plain => finish_exact(out, date, status, &fields, plan, slot),
         }
     }
@@ -216,7 +259,9 @@ impl<'req, 'd: 'req, Q: scope::Source, O: stage::Body<'req, 'd>, C: Compression,
             ..
         } = self;
         match mode {
-            Mode::Compress(gzip) => compress_bounded(out, date, status, &fields, plan, gzip, slot),
+            Mode::Compress { gzip, required } => {
+                compress_bounded(out, date, status, &fields, plan, gzip, required, slot)
+            }
             Mode::Plain => finish_bounded(out, date, status, &fields, plan, slot),
         }
     }
@@ -231,7 +276,7 @@ impl<'req, 'd: 'req, Q: scope::Source, O: stage::Body<'req, 'd>, C: Compression>
         self,
         status: Code,
         fields: H,
-        stream: S,
+        stream: Option<S>,
     ) -> Result<Self::Stream<S>, Self::Error>
     where
         H: headers::Source,
@@ -255,7 +300,7 @@ impl<'req, 'd: 'req, Q: scope::Source, O: stage::Body<'req, 'd>, C: Compression,
         self,
         status: Code,
         fields: H,
-        stream: S,
+        stream: Option<S>,
     ) -> Result<Self::Stream<S>, Self::Error>
     where
         H: headers::Source,
@@ -266,19 +311,26 @@ impl<'req, 'd: 'req, Q: scope::Source, O: stage::Body<'req, 'd>, C: Compression,
             Admit::Head => framing::Empty::Unframed,
             Admit::Body(admit) => match frame {
                 Some(frame) => frame,
-                None => {
-                    if self.date.response.version() == Version::Ten {
-                        return Err(Error::StreamingVersion(Version::Ten));
+                None => match stream {
+                    None => framing::Empty::Zero,
+                    Some(stream) => {
+                        if self.date.response.version() == Version::Ten {
+                            return Err(Error::StreamingVersion(Version::Ten));
+                        }
+                        let (_, encoded) = emit_framed_head::<_, _, bool>(
+                            self.out,
+                            self.date,
+                            status,
+                            &fields,
+                            framing::Chunked,
+                        )?;
+                        if matches!(self.mode, Mode::Compress { required: true, .. }) {
+                            return Err(Error::Compression(compress::Error::Unavailable));
+                        }
+                        identity(self.date.response, encoded)?;
+                        return Ok(Some((admit, stream)));
                     }
-                    emit_framed_head::<_, _, ()>(
-                        self.out,
-                        self.date,
-                        status,
-                        &fields,
-                        framing::Chunked,
-                    )?;
-                    return Ok(Some((admit, stream)));
-                }
+                },
             },
         };
         emit_framed_head::<_, _, ()>(self.out, self.date, status, &fields, frame)?;
@@ -298,7 +350,7 @@ where
     H: field::Source,
     B: response::Body<'d>,
 {
-    let (head, ()) = emit_head(out.reborrow(), date, status, fields, body.len())?;
+    let (head, encoded) = emit_head::<_, bool>(out.reborrow(), date, status, fields, body.len())?;
     let inline = if B::INLINE { body.as_slice() } else { None };
     if let Some(raw) = inline {
         head.checked_add(raw.len()).ok_or(Error::Overflow {
@@ -306,10 +358,13 @@ where
             added: raw.len(),
         })?;
         if o3::buffer::write::Sink::write_slice(&mut out, raw).is_ok() {
+            identity(date.response, encoded)?;
             return Ok(Written::inline(raw.len()));
         }
     }
-    stage(slot, body)
+    let written = stage(slot, body)?;
+    identity(date.response, encoded)?;
+    Ok(written)
 }
 
 fn finish_exact<
@@ -328,8 +383,10 @@ fn finish_exact<
     slot: handoff::Slot<'req, 'd, Q, O>,
 ) -> Result<Written<'d, O::Deferred, Q::Selection>, Error> {
     let len = plan.len();
-    let (head, ()) = emit_head(out.reborrow(), date, status, fields, len)?;
-    place_exact(out, head, plan, slot)
+    let (head, encoded) = emit_head::<_, bool>(out.reborrow(), date, status, fields, len)?;
+    let written = place_exact(out, head, plan, slot)?;
+    identity(date.response, encoded)?;
+    Ok(written)
 }
 
 fn place_exact<'req, 'd, B: exact::TryBody, Q: scope::Source, O: stage::Body<'req, 'd>>(
@@ -370,12 +427,15 @@ fn finish_bounded<
     let max = plan.max_len();
     if let Some(mut pending) = Pending::try_place(&mut out, date, status, fields, max)? {
         let len = pending.encode(plan)?;
-        pending.finish()?;
+        let encoded = pending.finish::<bool>()?;
+        identity(date.response, encoded)?;
         return Ok(Written::inline(len));
     }
     let body = plan.into_shared()?;
-    emit_head::<_, ()>(out, date, status, fields, body.len())?;
-    stage(slot, body)
+    let (_, encoded) = emit_head::<_, bool>(out, date, status, fields, body.len())?;
+    let written = stage(slot, body)?;
+    identity(date.response, encoded)?;
+    Ok(written)
 }
 
 fn stage<'req, 'd, B, Q: scope::Source, O: stage::Body<'req, 'd>>(

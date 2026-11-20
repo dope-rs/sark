@@ -21,7 +21,7 @@ use crate::{
         self, payload,
         payload::Buffer,
         response,
-        state::exchange::{Accepted, Deferred, Plain, Rejected, Routed, Sync, admit},
+        state::exchange::{Accepted, Deferred, Rejected, Routed, Sync, admit},
         sync::{
             self,
             book::{self, Control, Delayed, driver::Driver, ingress::Ingress, phase::Phase},
@@ -205,15 +205,13 @@ where
     where
         T:
             state::Admission<
-                    R::Prepared,
-                    state::Routed,
                     Accepted<'d>,
                     Output = <<R::Prepared as request::Prepared>::Family as state::Family<
                         R::Prepared,
                     >>::State<Accepted<'d>>,
                 >,
     {
-        let admitted = Plain::new().admit::<R::Prepared, state::Routed, T>(request.into_state());
+        let admitted = state::Admission::<Accepted<'d>>::admit(request.into_state());
         self.store(stream, Sync::new(admitted).take(), limits)
     }
 
@@ -260,8 +258,6 @@ where
     R::Prepared: request::Synchronous,
     U: state::Flow<R::Prepared, state::Routed, Family = R::Routes>
         + state::Admission<
-            R::Prepared,
-            state::Routed,
             Accepted<'d>,
             Output = <<R::Prepared as request::Prepared>::Family as state::Family<R::Prepared>>::State<Accepted<'d>>,
         >,
@@ -320,8 +316,6 @@ where
     R::Head: request::Head<Start = Self>,
     R::Prepared: request::Synchronous,
     U: state::Admission<
-            R::Prepared,
-            state::Routed,
             Accepted<'d>,
             Output = <<R::Prepared as request::Prepared>::Family as state::Family<R::Prepared>>::State<Accepted<'d>>,
         >,

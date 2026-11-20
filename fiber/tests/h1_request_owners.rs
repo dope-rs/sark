@@ -7,7 +7,6 @@ use common::{
     route::{body::retained::EchoDispatch, chunked::peer::Peer},
     server::{self, Plan},
 };
-use sark_fiber::Config;
 
 #[test]
 fn pipeline_keeps_bytes() {
@@ -17,11 +16,12 @@ fn pipeline_keeps_bytes() {
         |context, listener| {
             let mut reports = Plan::try_reports(&server).map_err(dope::core::BranchError::Second)?;
             let failures = Cell::new(Vec::new());
-            let result = EchoDispatch::serve(server.with_bound(listener), context,
+            let result = server::serve::<EchoDispatch, _>(
+                server.with_bound(listener),
+                context,
                 State(&failures),
-                Config::new(server::MAX_CONNECTIONS),
-                server::reporting(&mut reports),
-                |result| server::completed(&result),
+                server::MAX_CONNECTIONS,
+                &mut reports,
             );
             server::reclaimed(&reports);
             let failures = failures.into_inner();

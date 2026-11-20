@@ -9,9 +9,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use dope::core::driver::life::recovery::Policy;
 use dope_test::harness::{peer::Peer, server::Pair};
-use sark_fiber::Config;
 
 use crate::common::{
     retained::State,
@@ -21,7 +19,6 @@ use crate::common::{
     },
     server::{self, Plan},
 };
-use common::server::recover;
 
 #[test]
 fn routes_dispatch_heterogeneous() {
@@ -34,24 +31,14 @@ fn routes_dispatch_heterogeneous() {
             |context, listener| {
                 let mut reports = Plan::try_reports(&server).expect("server descriptor claims");
                 let failures = Cell::new(Vec::new());
-                let result = MixedStorageApp::serve(
+                let result = server::serve::<MixedStorageApp, _>(
                     server.with_bound(listener),
                     context,
                     State(&failures),
-                    Config::new(server::MAX_CONNECTIONS),
-                    Policy::new(|event| reports.push(event), recover),
-                    |result| {
-                        result
-                            .as_ref()
-                            .map(|_| ())
-                            .map_err(|error| error.cause())
-                            .expect("server")
-                    },
+                    server::MAX_CONNECTIONS,
+                    &mut reports,
                 );
-                assert!(
-                    reports.events().expect("reclaimed resources").is_empty(),
-                    "server retirement: {reports:?}"
-                );
+                server::reclaimed(&reports);
                 let failures = failures.into_inner();
                 assert!(failures.is_empty(), "storage: {failures:?}");
                 assert!(
@@ -94,24 +81,14 @@ fn quota_is_reusable() {
             |context, listener| {
                 let mut reports = Plan::try_reports(&server).expect("server descriptor claims");
                 let failures = Cell::new(Vec::new());
-                let result = GlobalBudgetApp::serve(
+                let result = server::serve::<GlobalBudgetApp, _>(
                     server.with_bound(listener),
                     context,
                     State(&failures),
-                    Config::new(1),
-                    Policy::new(|event| reports.push(event), recover),
-                    |result| {
-                        result
-                            .as_ref()
-                            .map(|_| ())
-                            .map_err(|error| error.cause())
-                            .expect("server")
-                    },
+                    1,
+                    &mut reports,
                 );
-                assert!(
-                    reports.events().expect("reclaimed resources").is_empty(),
-                    "server retirement: {reports:?}"
-                );
+                server::reclaimed(&reports);
                 let failures = failures.into_inner();
                 assert!(failures.is_empty(), "storage: {failures:?}");
                 assert!(

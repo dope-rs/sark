@@ -33,7 +33,7 @@ impl<F> FromFn<F> {
 impl<F, O> Handler for FromFn<F>
 where
     F: for<'req, 'd, 'id> Fn(Request<'req, 'd, 'id>) -> O,
-    O: for<'req, 'd> dispatch::Immediate<'req, 'd>,
+    O: for<'req, 'd> dispatch::Complete<'req, 'd>,
 {
     type Output<'req, 'd>
         = O
@@ -41,7 +41,7 @@ where
         Self: 'req,
         'd: 'req;
 
-    type Egress<'d> = <O as dispatch::Immediate<'d, 'd>>::Bound;
+    type Egress<'d> = <O as dispatch::Complete<'d, 'd>>::Bound;
 
     fn handle<'req, 'd, 'id>(&'req self, request: Request<'req, 'd, 'id>) -> O
     where

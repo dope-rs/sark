@@ -10,6 +10,7 @@ use dope::{
     runtime::shutdown,
 };
 use dope_test::reclaim;
+use sark_fiber::server::Serve as _;
 use sark_fiber::{Config, request::BodyLen};
 use sark_h1::server::{
     listener::bind,

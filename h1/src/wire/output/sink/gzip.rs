@@ -2,11 +2,14 @@ use std::ops::ControlFlow;
 
 use o3::buffer::{
     bytes::scope,
-    write::{Slice, Stage},
+    write::{Sink as _, Slice, Stage},
 };
 use sark_http::{
     field,
-    owner::handoff::{self, stage},
+    owner::{
+        evidence,
+        handoff::{self, stage},
+    },
     payload::{
         compress::{self, Compression},
         response::{self, bounded, exact, status::Code},
@@ -60,6 +63,7 @@ pub(super) fn compress_exact<
     fields: &H,
     plan: exact::Plan<B>,
     gzip: &mut impl Compression,
+    required: bool,
     slot: handoff::Slot<'req, 'd, Q, O>,
 ) -> Result<Written<'d, O::Deferred, Q::Selection>, Error> {
     let len = plan.len();
@@ -68,6 +72,9 @@ pub(super) fn compress_exact<
     let mut tail = staged_tail(&mut out, date, len)?;
     let head = base + tail.body().len();
     if encodings != 0 {
+        if required {
+            return Err(Error::Encoding { actual: encodings });
+        }
         tail.commit();
         return place_exact(out, head, plan, slot);
     }
@@ -77,7 +84,7 @@ pub(super) fn compress_exact<
     })?;
     let zipped = if len <= tail.body().remaining() {
         plan.encode(&mut tail.body())?;
-        match gzip.encode(&tail.body().into_mut()[head - base..]) {
+        match encode(gzip, &tail.body().into_mut()[head - base..], required)? {
             compress::Output::Plain => {
                 tail.commit();
                 return Ok(Written::inline(len));
@@ -86,7 +93,7 @@ pub(super) fn compress_exact<
         }
     } else {
         let body = plan.into_shared()?;
-        match gzip.encode(body.as_ref()) {
+        match encode(gzip, body.as_ref(), required)? {
             compress::Output::Plain => {
                 tail.commit();
                 return sink::stage(slot, body);
@@ -95,11 +102,8 @@ pub(super) fn compress_exact<
         }
     };
     drop(tail);
-    gzip_tail(out, date, zipped.len())?;
-    Ok(Written::Compressed {
-        body: zipped,
-        read: len,
-    })
+    gzip_tail(out.reborrow(), date, zipped.len())?;
+    Ok(finish(out, zipped, len, required))
 }
 
 pub(super) fn compress_body<'out, 'req, 'd, H, B, Q, O>(
@@ -109,6 +113,7 @@ pub(super) fn compress_body<'out, 'req, 'd, H, B, Q, O>(
     fields: &H,
     body: B,
     gzip: &mut impl Compression,
+    required: bool,
     slot: handoff::Slot<'req, 'd, Q, O>,
 ) -> Result<Written<'d, O::Deferred, Q::Selection>, Error>
 where
@@ -120,15 +125,21 @@ where
     let encodings = emit_fields(out.reborrow(), date, status, fields)?;
     let mut tail = staged_tail(&mut out, date, body.len())?;
     if encodings != 0 {
+        if required {
+            return Err(Error::Encoding { actual: encodings });
+        }
         tail.commit();
         return sink::stage(slot, body);
     }
     let Some(raw) = body.as_slice() else {
+        if required {
+            return Err(Error::Compression(compress::Error::Unavailable));
+        }
         tail.commit();
         return sink::stage(slot, body);
     };
     let read = raw.len();
-    let zipped = match gzip.encode(raw) {
+    let zipped = match encode(gzip, raw, required)? {
         compress::Output::Plain => {
             let written = match body.try_resolve_into(&slot, &mut tail.body())? {
                 ControlFlow::Break(written) => Written::inline(written),
@@ -140,8 +151,42 @@ where
         compress::Output::Compressed(zipped) => zipped,
     };
     drop(tail);
-    gzip_tail(out, date, zipped.len())?;
-    Ok(Written::Compressed { body: zipped, read })
+    gzip_tail(out.reborrow(), date, zipped.len())?;
+    Ok(finish(out, zipped, read, required))
+}
+
+fn encode(
+    gzip: &mut impl Compression,
+    raw: &[u8],
+    required: bool,
+) -> Result<compress::Output, Error> {
+    if required {
+        gzip.try_encode(raw)
+            .map(compress::Output::Compressed)
+            .map_err(Error::Compression)
+    } else {
+        Ok(gzip.encode(raw))
+    }
+}
+
+fn finish<'d, P, H>(
+    mut out: Slice<'_, &mut usize>,
+    body: compress::Frozen,
+    read: usize,
+    required: bool,
+) -> Written<'d, P, H> {
+    let written = body.len();
+    if required && out.write_slice(body.as_ref()).is_ok() {
+        Written::Inline {
+            copy: evidence::Copy {
+                read,
+                written,
+                cause: evidence::Cause::Compressed,
+            },
+        }
+    } else {
+        Written::Compressed { body, read }
+    }
 }
 
 fn staged_tail<'writer, 'out>(
@@ -190,22 +235,20 @@ pub(super) fn compress_bounded<
     fields: &H,
     plan: bounded::Plan<B>,
     gzip: &mut impl Compression,
+    required: bool,
     slot: handoff::Slot<'req, 'd, Q, O>,
 ) -> Result<Written<'d, O::Deferred, Q::Selection>, Error> {
     let max = plan.max_len();
     if let Some(mut pending) = Pending::try_place(&mut out, date, status, fields, max)? {
         let len = pending.encode(plan)?;
-        if pending.encodings() == 0
-            && let compress::Output::Compressed(zipped) = gzip.encode(pending.body())
+        if (required || pending.encodings() == 0)
+            && let compress::Output::Compressed(zipped) = encode(gzip, pending.body(), required)?
         {
             drop(pending);
-            gzip_head(out, date, status, fields, zipped.len())?;
-            return Ok(Written::Compressed {
-                body: zipped,
-                read: len,
-            });
+            gzip_head(out.reborrow(), date, status, fields, zipped.len())?;
+            return Ok(finish(out, zipped, len, required));
         }
-        pending.finish()?;
+        pending.finish::<()>()?;
         return Ok(Written::inline(len));
     }
     let body = plan.into_shared()?;
@@ -213,10 +256,13 @@ pub(super) fn compress_bounded<
     let encodings = emit_fields(out.reborrow(), date, status, fields)?;
     let tail = staged_tail(&mut out, date, len)?;
     if encodings != 0 {
+        if required {
+            return Err(Error::Encoding { actual: encodings });
+        }
         tail.commit();
         return sink::stage(slot, body);
     }
-    let zipped = match gzip.encode(body.as_ref()) {
+    let zipped = match encode(gzip, body.as_ref(), required)? {
         compress::Output::Plain => {
             tail.commit();
             return sink::stage(slot, body);
@@ -224,11 +270,8 @@ pub(super) fn compress_bounded<
         compress::Output::Compressed(zipped) => zipped,
     };
     drop(tail);
-    gzip_tail(out, date, zipped.len())?;
-    Ok(Written::Compressed {
-        body: zipped,
-        read: len,
-    })
+    gzip_tail(out.reborrow(), date, zipped.len())?;
+    Ok(finish(out, zipped, len, required))
 }
 
 fn gzip_head<H: field::Source>(

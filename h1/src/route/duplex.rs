@@ -218,7 +218,7 @@ where
                 return reason.into_consume().into();
             }
         };
-        let (request, body, total, _, framing::Plain, response) = match frame.into_parts() {
+        let (request, body, total, _, response) = match frame.into_parts() {
             Ok(parts) => parts,
             Err(error) => return error.into_consume().into(),
         };
@@ -228,7 +228,7 @@ where
     pub fn upgrade<R, Wrap, E>(
         self,
         permit: session::Permit,
-        found: framing::Head<'_, '_, R, framing::Plain, Upgrade>,
+        found: framing::Head<'_, '_, R, Upgrade>,
         write: Slice<'_, &mut usize>,
         wrap: Wrap,
         mut proof: E,
@@ -252,7 +252,7 @@ where
             }
             Err(reason) => return reason.into_consume().into(),
         };
-        let (request, body, used, _, framing::Plain, _) = match frame.into_parts() {
+        let (request, body, used, _, _) = match frame.into_parts() {
             Ok(parts) => parts,
             Err(error) => return error.into_consume().into(),
         };

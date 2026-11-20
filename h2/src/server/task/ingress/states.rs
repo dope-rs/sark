@@ -26,35 +26,7 @@ impl<'d> open::Set for Receiving<'d> {
 }
 
 impl<'d> Input<'d> for Receiving<'d> {
-    fn sync(body: Buffer<'d>) -> Buffer<'d> {
-        body
-    }
-
-    fn task(body: Buffer<'d>) -> Buffer<'d> {
-        body
-    }
-
-    fn sync_done(never: Infallible) -> Buffer<'d> {
-        match never {}
-    }
-
-    fn task_done(never: Infallible) -> Buffer<'d> {
-        match never {}
-    }
-
     fn duplex(never: Infallible) -> Option<segments::Chain<resident::Shared<'d>>> {
-        match never {}
-    }
-
-    fn duplex_done(never: Infallible) -> Option<segments::Chain<resident::Shared<'d>>> {
-        match never {}
-    }
-
-    fn other(never: Infallible) -> Buffer<'d> {
-        match never {}
-    }
-
-    fn other_done(never: Infallible) -> Buffer<'d> {
         match never {}
     }
 }

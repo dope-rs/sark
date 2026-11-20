@@ -7,10 +7,7 @@ use sark_h1::{
     session,
     wire::{output, parsing::framing},
 };
-use sark_http::{
-    h1::head::request::Coding,
-    payload::compress::{Compression as _, Gzip},
-};
+use sark_http::payload::compress::{Compression as _, Gzip};
 
 use crate::common::{
     Request,
@@ -43,7 +40,7 @@ impl Retain {
         &mut self,
         conn: &mut session::Conn<'d>,
         permit: session::Permit,
-        head: framing::Head<'_, '_, Request, Coding>,
+        head: framing::Head<'_, '_, Request>,
     ) -> session::RouteOutcome<'d, sync::Pending<'d, Request>> {
         sync::Endpoint::new(
             sync::Egress::new(

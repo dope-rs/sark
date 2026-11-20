@@ -2,7 +2,10 @@ use core::ops;
 
 use dope::core::BranchError;
 use o3::buffer::resident;
-use sark_core::decode::{self, exec, request};
+use sark_core::{
+    body::Body,
+    decode::{self, exec, request},
+};
 use sark_http::{field::metadata::section::rules, payload::owned, request::body::Error};
 
 use crate::{
@@ -13,7 +16,7 @@ use crate::{
 };
 
 pub(in crate::server) fn try_dispatch<'d, R, M, E, F>(
-    ready: request::Ready<exec::Sync, R::Prepared, owned::Segments<'d>>,
+    ready: request::Admitted<exec::Sync, R::Prepared, Body<owned::Segments<'d>>>,
     router: &R,
     conn: &mut machine::Connection<
         crate::ServerRole,

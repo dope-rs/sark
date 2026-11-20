@@ -3,7 +3,7 @@ pub mod common;
 use std::{cell::Cell, num::NonZero};
 
 use common::response::{
-    self,
+    self, Capture,
     body::{Checked, Counted, Short},
     headers::{EMPTY, SEMANTIC, STATIC},
     status,
@@ -21,7 +21,7 @@ use sark_http::{
         owned,
         response::{
             Body as _, bounded,
-            dispatch::{self, Immediate},
+            dispatch::{self, Complete},
             exact, fixed,
             headers::{Name, head::Head, set::Set, value::Item},
             statics,
@@ -56,7 +56,9 @@ fn headers_stay_structured() {
     )]);
     let response = fixed::Direct::new(Code::CREATED, Head::new(&STATIC, dynamic), body);
 
-    let capture = response::Capture::try_from(response).expect("response encoding");
+    let capture = response
+        .complete(Capture::default())
+        .expect("response encoding");
     assert_eq!(capture.status(), Some(Code::CREATED));
     assert_eq!(
         capture.fields(),
@@ -75,7 +77,9 @@ fn templates_stay_semantic() {
     let body = result.expect("the response body must allocate");
     let response = fixed::Direct::new(Code::OK, Head::new(&SEMANTIC, Set::<0>::new()), body);
 
-    let capture = response::Capture::try_from(response).expect("response encoding");
+    let capture = response
+        .complete(Capture::default())
+        .expect("response encoding");
     assert_eq!(
         capture.fields(),
         [
@@ -93,7 +97,9 @@ fn retained_keeps_pointer() {
     let pointer = shared.as_ref().as_ptr() as usize;
     let response = fixed::Direct::new(Code::OK, (), shared);
 
-    let capture = response::Capture::try_from(response).expect("response encoding");
+    let capture = response
+        .complete(Capture::default())
+        .expect("response encoding");
     assert_eq!(capture.pointer(), Some(pointer));
 }
 
@@ -121,7 +127,9 @@ fn segments_remain_distinct() {
     assert_eq!(segments[0].as_ptr(), pointers[0]);
     assert_eq!(segments[1].as_ptr(), pointers[1]);
 
-    let capture = response::Capture::try_from(response).expect("response encoding");
+    let capture = response
+        .complete(Capture::default())
+        .expect("response encoding");
     assert_eq!(capture.body(), b"firstsecond");
     assert_eq!(capture.pointer(), None);
 }
@@ -130,7 +138,7 @@ fn segments_remain_distinct() {
 fn result_keeps_bound() {
     type Reply<'a> = Result<statics::Direct<'a, ()>, fixed::Direct<(), Body<'a>>>;
     assert!(matches!(
-        <Reply<'_> as Immediate<'_, '_>>::Bound::LIMIT,
+        <Reply<'_> as Complete<'_, '_>>::Bound::LIMIT,
         Limit::Unbounded
     ));
     let bytes = *b"on";
@@ -146,7 +154,8 @@ fn result_keeps_bound() {
         .into_iter()
         .zip([(Code::OK, &bytes[..1]), (Code::BAD_REQUEST, &bytes[1..])])
     {
-        let capture = response::Capture::try_from(response).expect("response encoding");
+        let capture =
+            dispatch::Emit::emit(response, Capture::default()).expect("response encoding");
         assert_eq!(capture.status(), Some(status));
         assert_eq!(capture.body(), body);
         assert_eq!(capture.calls(), 1);
@@ -165,15 +174,15 @@ fn stream_keeps_headers() {
         )),
         None,
     ]);
-    let output = dispatch::Stream::new(stream)
+    let output = dispatch::Stream::new(Some(stream))
         .with_status(Code::CREATED)
         .headers(fields);
     let (capture, retained) =
-        dispatch::Emit::emit(output, response::Capture::default()).expect("stream response");
+        dispatch::Emit::emit(output, Capture::default()).expect("stream response");
     assert_eq!(capture.status(), Some(Code::CREATED));
     assert_eq!(capture.fields(), [(b"x-stream".to_vec(), value.to_vec())]);
     assert_eq!(capture.calls(), 1);
-    assert!(std::ptr::eq(retained, stream));
+    assert!(matches!(retained, Some(body) if std::ptr::eq(body, stream)));
 }
 
 #[test]
@@ -185,7 +194,9 @@ fn encodes_once() {
         encodes: &encodes,
     };
     let output = bounded::Output::new(Code::OK, &EMPTY, Set::<0>::new(), body);
-    let capture = response::Capture::try_from(output).expect("response encoding");
+    let capture = output
+        .complete(Capture::default())
+        .expect("response encoding");
     assert_eq!(encodes.get(), 1);
     assert_eq!(capture.status(), Some(Code::OK));
     assert_eq!(capture.body(), b"body");
@@ -200,7 +211,7 @@ fn rejects_bad_bound() {
         encodes: &encodes,
     };
     let output = bounded::Output::new(Code::OK, &EMPTY, Set::<0>::new(), body);
-    let result = response::Capture::try_from(output);
+    let result = output.complete(Capture::default());
     assert!(matches!(
         result,
         Err((response::Error::Bounded(storage::BuildError::Build(_)), _))
@@ -229,7 +240,8 @@ fn output_carries_bound() {
     .expect("checked bound");
     let output: bounded::Output<'static, _, 0> =
         bounded::Output::new(Code::OK, &EMPTY, Set::new(), plan);
-    let capture = response::Capture::try_from::<bounded::Output<'static, _, 0>>(output)
+    let capture = output
+        .complete(Capture::default())
         .expect("response encoding");
     assert_eq!((bounds.get(), encodes.get()), (1, 1));
     assert_eq!(capture.body(), b"body");

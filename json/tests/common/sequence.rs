@@ -1,8 +1,6 @@
-use std::{cell::Cell, iter, ops::ControlFlow, slice};
+use std::{cell::Cell, iter, slice};
 
-use o3::buffer::write::Sink;
-use sark_http::payload::response::exact::Overflow;
-use sark_json::writing::{Failure, TryEncode, TryMaxSize, TrySize, Writer};
+use sark_json::writing::TryEncode;
 
 #[sark_json::json(encode)]
 pub struct Row<'__w> {
@@ -74,37 +72,5 @@ impl<'a> iter::Iterator for Iter<'a> {
 
     fn size_hint(&self) -> (usize, Option<usize>) {
         self.0.size_hint()
-    }
-}
-
-pub struct Bounded<'a> {
-    pub sizes: &'a Cell<usize>,
-    pub bounds: &'a Cell<usize>,
-    pub writes: &'a Cell<usize>,
-}
-
-impl TrySize for Bounded<'_> {
-    fn try_size(&self) -> Result<usize, Overflow> {
-        self.sizes.set(self.sizes.get() + 1);
-        Ok(4)
-    }
-}
-
-impl TryMaxSize for Bounded<'_> {
-    type Error = Overflow;
-
-    fn try_max_size(&self) -> Result<usize, Self::Error> {
-        self.bounds.set(self.bounds.get() + 1);
-        Ok(4)
-    }
-}
-
-impl TryEncode for Bounded<'_> {
-    fn try_write<'a, W: Sink>(
-        &self,
-        writer: Writer<'a, W>,
-    ) -> ControlFlow<Failure<'a, W>, Writer<'a, W>> {
-        self.writes.set(self.writes.get() + 1);
-        writer.put(b"true")
     }
 }

@@ -49,12 +49,6 @@ pub struct Capture {
 }
 
 impl Capture {
-    pub fn try_from<'req, T: dispatch::Immediate<'req, 'req>>(
-        output: T,
-    ) -> Result<Self, (Error, Self)> {
-        output.emit(Self::default())
-    }
-
     pub const fn status(&self) -> Option<Code> {
         self.status
     }
@@ -238,13 +232,13 @@ impl<'d> dispatch::Accept<'d> for Capture {
 }
 
 impl<'d> dispatch::Sink<'d> for Capture {
-    type Stream<S> = (Self, S);
+    type Stream<S> = (Self, Option<S>);
 
     fn stream<H, S>(
         mut self,
         status: Code,
         headers: H,
-        stream: S,
+        stream: Option<S>,
     ) -> Result<Self::Stream<S>, Self::Error>
     where
         H: Source,

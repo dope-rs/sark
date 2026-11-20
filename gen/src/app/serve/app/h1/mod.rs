@@ -12,8 +12,6 @@ use crate::{
     runtime::paths::Paths,
 };
 
-mod runners;
-
 pub(super) fn extras<'emit, 'source, 'spec>(
     paths: &Paths,
     plan: &handle::H1Plan<'source, 'spec>,
@@ -116,13 +114,51 @@ pub(super) fn extras<'emit, 'source, 'spec>(
         .fibers()
         .is_empty()
         .then(|| quote!(+ #ns_core::decode::Decode));
-    let runners = if matches!(spec.driver, Driver::Present) {
-        runners::Output::default()
-    } else {
-        runners::build(paths, spec, plan.duplex.state(), branded)
-    };
-    let runs = runners.definitions;
-    let serve = runners.methods;
+    let runs = matches!(spec.driver, Driver::Absent).then(|| {
+        let api = &spec.name;
+        let values = &symbols.arguments;
+        let profile = symbols.ident("__PROFILE");
+        let server = symbols.local("server");
+        let select = matches!(duplex, duplex::State::Enabled).then(|| quote!(.gated_scoped()));
+        let claim = branded.then(|| quote!(#v_brand,));
+        let token = if branded { quote!(#v_brand) } else { quote!(_) };
+        quote! {
+            impl<#(#lives,)* #(#decls,)*> #ns_fiber::server::Serve<#state_ty> for #api
+            where #(#clauses,)*
+            {
+                type Config = #config;
+                type Input = #input;
+
+                fn plan<#g_id: #ns_fiber::Identity, #g_date: #ns_fiber::Identity,
+                    #profile: #ns_fiber::dope::core::driver::settings::Profile
+                        + #ns_fiber::dope::manifold::timing::Policy>(
+                    #server: #ns_h1::server::run::Plan<#g_id, #g_date, #profile>,
+                ) -> #ns_h1::server::run::Plan<#g_id, #g_date, #profile, Self::Input> {
+                    #server #select
+                }
+
+                fn app<#g_brand: #l_env, #l_env, #l_wire, 'd: #l_wire + #l_env,
+                    #g_wire, #g_id>(
+                    #token: #ns_fiber::dope_fiber::task::storage::scope::Brand<#g_brand>,
+                    #v_state: &#l_env #state_ty, #v_config: Self::Config,
+                ) -> impl #ns_h1::server::listener::bind::Bind<
+                    #l_wire, 'd, #g_id, Wire = #g_wire, Input = Self::Input,
+                    Error = #ns_h1::server::listener::bind::Error,
+                > + #l_env
+                where
+                    #g_wire: #ns_fiber::dope::net::link::pool::recv::input::Execution + 'd,
+                    <#g_wire as #ns_fiber::dope::net::wire::Spec>::Receive:
+                        #ns_fiber::dope::net::wire::receive::Policy<#g_wire,
+                            Reserve: #ns_fiber::dope::net::link::pool::recv::reserve::Choice<
+                                #g_wire, <#g_wire as #ns_fiber::dope::net::link::pool::recv::input::Execution>::Parked>>,
+                    #g_id: #ns_fiber::Identity + 'd,
+                    #state_ty: #ns_h1::server::listener::failure::Policy<#g_wire>,
+                {
+                    Self::new::<#(#values,)* #g_wire, #g_id>(#claim #v_state, #v_config)
+                }
+            }
+        }
+    });
     let mut sync = source
         .entries
         .iter()
@@ -133,8 +169,8 @@ pub(super) fn extras<'emit, 'source, 'spec>(
         let coding = quote! {
             <#ns_h1::wire::output::Select<{
                 false #( || ::core::matches!(
-                    <#sync as #ns_h1::route::PolicyOf>::POLICY.coding,
-                    #ns_http::h1::head::request::Coding::Gzip,
+                    <#sync as #ns_h1::route::PolicyOf>::POLICY.mode,
+                    #ns_h1::route::Mode::Gzip | #ns_h1::route::Mode::RequiredGzip,
                 ) )*
             }> as #ns_h1::wire::output::Selected>::Compression
         };
@@ -403,7 +439,6 @@ pub(super) fn extras<'emit, 'source, 'spec>(
         }
 
         #cleartext
-        #serve
         /// Constructs an observed H1 application with static dispatch.
         #vis fn with_observer<
             #l_wire,

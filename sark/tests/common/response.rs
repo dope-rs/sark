@@ -11,13 +11,12 @@ use sark::http::{
         response::{bounded, dispatch::Accept, exact, headers, status::Code},
     },
 };
-use sark_json::writing::{Failure, Size, TryEncode, Writer};
+use sark_json::writing::{Failure, Size, TryEncode, TryMaxSize, Writer};
 
 #[derive(Debug)]
 pub enum Error {
     Fixed,
-    Static,
-    Bounded,
+    Capacity(consume::Error),
     Field(consume::Error),
     Size(exact::Overflow),
     Build(storage::BuildError<consume::Error>),
@@ -55,6 +54,16 @@ impl<'field> headers::Sink<'field> for Fields<'_> {
 
 pub struct SliceSink<'a, 'out>(pub &'a mut [u8], pub Option<&'a mut Fields<'out>>);
 
+impl SliceSink<'_, '_> {
+    fn fields(&mut self, headers: &impl headers::Source) -> Result<(), Error> {
+        if let Some(fields) = &mut self.1 {
+            headers.emit(*fields);
+            fields.result.map_err(Error::Field)?;
+        }
+        Ok(())
+    }
+}
+
 impl<'d> Accept<'d> for SliceSink<'_, '_> {
     type Output = (Code, usize);
     type Error = Error;
@@ -68,31 +77,36 @@ impl<'d> Accept<'d> for SliceSink<'_, '_> {
         Err(Error::Fixed)
     }
     fn statics<'body: 'd, H: headers::Source>(
-        self,
-        _: Code,
-        _: H,
-        _: fixed::Body<'body>,
+        mut self,
+        status: Code,
+        headers: H,
+        body: fixed::Body<'body>,
     ) -> Result<Self::Output, Self::Error> {
-        Err(Error::Static)
+        self.fields(&headers)?;
+        write::Slice::new(self.0)
+            .write_slice(body.as_slice())
+            .map_err(Error::Capacity)?;
+        Ok((status, body.len()))
     }
     fn bounded<H: headers::Source, B: bounded::Body>(
-        self,
-        _: Code,
-        _: H,
-        _: B,
-    ) -> Result<Self::Output, Self::Error> {
-        Err(Error::Bounded)
-    }
-    fn exact<H: headers::Source, B: exact::TryBody>(
-        self,
+        mut self,
         status: Code,
         headers: H,
         body: B,
     ) -> Result<Self::Output, Self::Error> {
-        if let Some(fields) = self.1 {
-            headers.emit(fields);
-            fields.result.map_err(Error::Field)?;
-        }
+        self.fields(&headers)?;
+        let len = bounded::Plan::new(body)
+            .encode(&mut write::Slice::new(self.0))
+            .map_err(Error::Build)?;
+        Ok((status, len))
+    }
+    fn exact<H: headers::Source, B: exact::TryBody>(
+        mut self,
+        status: Code,
+        headers: H,
+        body: B,
+    ) -> Result<Self::Output, Self::Error> {
+        self.fields(&headers)?;
         let plan =
             exact::Plan::try_new(body).map_err(|rejected| Error::Size(rejected.discard()))?;
         let len = plan.len();
@@ -157,21 +171,37 @@ pub struct Unsigned {
     pub body: usize,
 }
 
-pub struct Counted<'a>(pub &'a Cell<usize>);
+#[derive(Default)]
+pub struct Counted {
+    pub bytes: &'static [u8],
+    pub sizes: Cell<usize>,
+    pub bounds: Cell<usize>,
+    pub writes: Cell<usize>,
+}
 
-impl Size for Counted<'_> {
+impl Size for &Counted {
     fn json_size(&self) -> usize {
-        self.0.set(self.0.get() + 1);
-        2
+        self.sizes.set(self.sizes.get() + 1);
+        self.bytes.len()
     }
 }
 
-impl TryEncode for Counted<'_> {
+impl TryMaxSize for &Counted {
+    type Error = exact::Overflow;
+
+    fn try_max_size(&self) -> Result<usize, Self::Error> {
+        self.bounds.set(self.bounds.get() + 1);
+        Ok(self.bytes.len())
+    }
+}
+
+impl TryEncode for &Counted {
     fn try_write<'a, W: write::Sink>(
         &self,
         writer: Writer<'a, W>,
     ) -> ControlFlow<Failure<'a, W>, Writer<'a, W>> {
-        writer.put(b"{}")
+        self.writes.set(self.writes.get() + 1);
+        writer.put(self.bytes)
     }
 }
 
@@ -179,14 +209,14 @@ impl TryEncode for Counted<'_> {
 #[header("content-type", "application/json")]
 pub struct CountedReply<'a> {
     pub status: Code,
-    pub body: Counted<'a>,
+    pub body: &'a Counted,
 }
 
 #[sark::handler(pub)]
-pub fn borrowed<'a>(state: &Cell<&'a Cell<usize>>) -> CountedReply<'a> {
+pub fn borrowed<'a>(state: &Cell<&'a Counted>) -> CountedReply<'a> {
     CountedReply {
         status: Code::OK,
-        body: Counted(state.get()),
+        body: state.get(),
     }
 }
 

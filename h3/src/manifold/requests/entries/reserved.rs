@@ -106,14 +106,15 @@ impl<'d, A: app::Runtime<'d>, M: owners::Handoff> Reserved<'_, 'd, A, M> {
     fn finish<K>(
         &mut self,
         request: request::Admitted<K, A::Prepared, admit::Track<admit::Finished>>,
-    ) -> Result<request::Ready<K, A::Prepared, owned::Segments<'d>>, Failure<'d, K, A::Prepared>>
-    {
-        match request.try_map_body(|done| body::Body::try_new(done, owned::Segments::new())) {
-            Ok(request) => Ok(request.ready()),
-            Err(error) => {
-                self.entry.owner.entry.get_mut().entry = entries::Entry::Stopped;
-                Err(error)
-            }
+    ) -> Result<
+        request::Admitted<K, A::Prepared, body::Body<owned::Segments<'d>>>,
+        Failure<'d, K, A::Prepared>,
+    > {
+        let request =
+            request.try_map_body(|done| body::Body::try_new(done, owned::Segments::new()));
+        if request.is_err() {
+            self.entry.owner.entry.get_mut().entry = entries::Entry::Stopped;
         }
+        request
     }
 }

@@ -4,19 +4,12 @@ use std::{cell::Cell, str};
 
 use common::{
     body::{Counted, TEMPLATE},
-    fields::{self, DATE, IDENTITY},
+    fields::{self, DATE, GZIP_POLICY, GZIP_RESPONSE, IDENTITY},
 };
 use dope_test::alloc::Tracker;
 use o3::buffer::write::Slice;
-use sark_h1::{
-    route,
-    wire::{head, output},
-};
+use sark_h1::wire::{head, output};
 use sark_http::{
-    h1::head::{
-        request::Coding,
-        response::{Date, Server},
-    },
     owner::handoff,
     payload::{
         compress::{Compression, Gzip},
@@ -37,12 +30,11 @@ fn preencoded_inline() {
     let mut writer = Slice::new(&mut bytes);
     let mut gzip = Gzip::try_new().expect("test gzip allocation");
     let (outcome, allocs) = Tracker::count(|| {
-        output::Egress::new(writer.reborrow(), DATE, fields::RESPONSE).route(
+        output::Egress::new(writer.reborrow(), DATE, GZIP_RESPONSE).route(
             response,
             handoff::Slot::ready(None),
             &mut gzip,
-            Coding::Gzip,
-            route::Policy::new(Coding::Gzip, Date::Include, Server::Include),
+            GZIP_POLICY,
         )
     });
     let output::Outcome::SendCopied { copy, .. } = outcome else {
@@ -62,12 +54,11 @@ fn plain_compressor() {
     let (outcome, allocs) = Tracker::count(|| {
         <() as Compression>::try_new().expect("plain policy");
         let response = Counted::exact(&TEMPLATE, b"plain", &encodes);
-        output::Egress::new(writer.reborrow(), DATE, fields::RESPONSE).route(
+        output::Egress::new(writer.reborrow(), DATE, GZIP_RESPONSE).route(
             response,
             handoff::Slot::ready(None),
             &mut (),
-            Coding::Gzip,
-            route::Policy::new(Coding::Gzip, Date::Include, Server::Include),
+            GZIP_POLICY,
         )
     });
     let output::Outcome::SendCopied { copy, .. } = outcome else {
@@ -89,12 +80,11 @@ fn reuses_inline_on_limit() {
     let mut writer = Slice::new(&mut bytes);
     let result = Gzip::try_new();
     let mut gzip = result.expect("test gzip pool allocation");
-    let outcome = output::Egress::new(writer.reborrow(), date, fields::RESPONSE).route(
+    let outcome = output::Egress::new(writer.reborrow(), date, GZIP_RESPONSE).route(
         response,
         handoff::Slot::ready(None),
         &mut gzip,
-        Coding::Gzip,
-        route::Policy::new(Coding::Gzip, Date::Include, Server::Include),
+        GZIP_POLICY,
     );
     let output::Outcome::SendCopied { copy, .. } = outcome else {
         panic!("unavailable gzip must keep the encoded inline body");
@@ -130,12 +120,11 @@ fn bounded_reuses_inline() {
     let mut bytes = vec![0; body.len() * 2 + 1024];
     let mut writer = Slice::new(&mut bytes);
     let mut gzip = Gzip::try_new().expect("test gzip pool allocation");
-    let outcome = output::Egress::new(writer.reborrow(), DATE, fields::RESPONSE).route(
+    let outcome = output::Egress::new(writer.reborrow(), DATE, GZIP_RESPONSE).route(
         response,
         handoff::Slot::ready(None),
         &mut gzip,
-        Coding::Gzip,
-        route::Policy::new(Coding::Gzip, Date::Include, Server::Include),
+        GZIP_POLICY,
     );
     let (written, len) = match outcome {
         output::Outcome::SendCopied { copy, .. } => Some((writer.len(), copy.written)),
@@ -156,12 +145,11 @@ fn compresses_bounded_once() {
     let mut bytes = [0; 2048];
     let mut writer = Slice::new(&mut bytes);
     let mut gzip = Gzip::try_new().expect("test gzip pool allocation");
-    let outcome = output::Egress::new(writer.reborrow(), date, fields::RESPONSE).route(
+    let outcome = output::Egress::new(writer.reborrow(), date, GZIP_RESPONSE).route(
         response,
         handoff::Slot::ready(None),
         &mut gzip,
-        Coding::Gzip,
-        route::Policy::new(Coding::Gzip, Date::Include, Server::Include),
+        GZIP_POLICY,
     );
     let (head_len, zipped, read) = match outcome {
         output::Outcome::SendCompressed { body, read, .. } => Some((writer.len(), body, read)),

@@ -6,7 +6,6 @@ use std::{
     time::Duration,
 };
 
-use common::server::recover;
 use common::{
     retained::State,
     route::chunked::{
@@ -16,9 +15,8 @@ use common::{
     },
     server::{self, Plan},
 };
-use dope::core::{driver::life::recovery::Policy, io::socket::option::Buffer};
+use dope::core::io::socket::option::Buffer;
 use dope_test::harness::{peer::Error as PeerError, server::Pair};
-use sark_fiber::Config;
 
 fn serve<R>(buffers: Option<Buffer>, client: impl FnOnce(SocketAddr) -> R) -> R {
     let pair = Pair::bind().expect("listener");
@@ -32,19 +30,12 @@ fn serve<R>(buffers: Option<Buffer>, client: impl FnOnce(SocketAddr) -> R) -> R 
         |context, listener| {
             let mut reports = Plan::try_reports(&plan).expect("claims");
             let failures = Cell::new(Vec::new());
-            let result = ChunkedDispatch::serve(
+            let result = server::serve::<ChunkedDispatch, _>(
                 plan.with_bound(listener),
                 context,
                 State(&failures),
-                Config::new(server::MAX_CONNECTIONS),
-                Policy::new(|event| reports.push(event), recover),
-                |result| {
-                    result
-                        .as_ref()
-                        .map(|_| ())
-                        .map_err(|error| error.cause())
-                        .expect("server")
-                },
+                server::MAX_CONNECTIONS,
+                &mut reports,
             );
             assert!(
                 reports.events().expect("reclaimed resources").is_empty(),

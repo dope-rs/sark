@@ -96,109 +96,77 @@ pub(crate) fn build(
             .push(syn::parse_quote!(#body_ty: 'd));
     }
 
-    let headers = Headers::new(paths, &name, &vis, &st.generics, &vars, &fixed);
+    let symbols = types::Generics::new(st.generics.clone());
+    let g_sink = symbols.ident("__SINK");
+    let [v_response, v_status, v_headers, v_body, v_sink] =
+        symbols.locals(["response", "status", "headers", "body", "sink"]);
+    let headers = Headers::new(
+        paths,
+        &name,
+        &vis,
+        &st.generics,
+        &vars,
+        &fixed,
+        &v_response,
+        &symbols,
+    );
     st.attrs
         .retain(|attr| !attr.path().is_ident("header") && !attr.path().is_ident("header_static"));
     for field in fields.iter_mut() {
         field.attrs.retain(|attr| !attr.path().is_ident("header"));
     }
-    let source = &headers.ty;
-    let (ty_impl, ty_args, ty_where) = st.generics.split_for_impl();
+    let (_, ty_args, _) = st.generics.split_for_impl();
     let (sh_impl, _, sh_where) = shape.split_for_impl();
-    let mut fn_args = syn::Generics::default();
-    if !has_req {
-        fn_args.params.push(syn::parse_quote!('req));
-    }
-    if !has_d {
-        fn_args.params.push(syn::parse_quote!('d));
-    }
-    let fn_where = if raw && is_fixed {
-        quote::quote!(where 'd: 'req, #body_ty: 'd)
-    } else {
-        quote::quote!(where 'd: 'req)
-    };
     let init = if matches!(mode, Mode::Json) {
-        quote::quote!(#ns_json::writing::Body::new(self.#body))
+        quote::quote!(#ns_json::writing::Body::new(#v_response.#body))
     } else {
-        quote::quote!(self.#body)
+        quote::quote!(#v_response.#body)
     };
-    let encoded = if matches!(mode, Mode::Json) {
-        quote::quote!(#ns_json::writing::Body<#body_ty>)
-    } else {
-        quote::quote!(#body_ty)
-    };
-    let (output, ctor) = if raw {
+    let (accept, bound, kind) = if raw && is_fixed {
         (
-            quote::quote!(#ns_http::payload::response::fixed::Direct<#source, #body_ty>),
-            quote::quote!(#ns_http::payload::response::fixed::Direct::new),
+            quote::format_ident!("statics"),
+            quote::quote!(#ns_http::o3::buffer::resident::bound::AtMost<0>),
+            quote::quote!(#ns_http::payload::Kind::Static),
         )
     } else {
         (
-            quote::quote!(#ns_http::payload::response::exact::Direct<#source, #encoded>),
-            quote::quote!(#ns_http::payload::response::exact::Direct::new),
+            if raw {
+                quote::format_ident!("fixed")
+            } else {
+                quote::format_ident!("exact")
+            },
+            quote::quote!(#ns_http::o3::buffer::resident::bound::Unbounded),
+            quote::quote!(#ns_http::payload::Kind::Inline),
         )
     };
     let head = &headers.build;
-    let convert = quote::quote! {
-        #ctor(
-            self.#status,
-            #head,
-            #init,
-        )
-    };
-    let api = if raw && is_fixed {
-        quote::quote!()
-    } else {
-        quote::quote! {
-            impl #ty_impl #name #ty_args #ty_where {
-                #vis fn into_fixed #fn_args (self) -> #output
-                #fn_where
-                {
-                    #convert
-                }
-            }
-        }
-    };
-    let slice = if raw && is_fixed {
-        quote::quote! {
-            impl #ty_impl #name #ty_args #ty_where {
-                #vis fn into_static_response #fn_args (
-                    self,
-                ) -> #ns_http::payload::response::statics::Direct<'d, #source>
-                #fn_where
-                {
-                    #ns_http::payload::response::statics::Direct::new(
-                        self.#status,
-                        #head,
-                        self.#body,
-                    )
-                }
-            }
-
-        }
-    } else {
-        quote::quote!()
-    };
     let target = quote::quote!(#name #ty_args);
-    let (native, lower) = if raw && is_fixed {
-        (
-            quote::quote!(
-                #ns_http::payload::response::statics::Direct<'d, #source>
-            ),
-            quote::quote!(self.into_static_response()),
-        )
-    } else {
-        (output.clone(), quote::quote!(self.into_fixed()))
-    };
     let impls = quote::quote! {
         impl #sh_impl
-            #ns_http::payload::response::dispatch::IntoOutput<'req, 'd> for #target
+            #ns_http::payload::response::dispatch::Complete<'req, 'd> for #target
             #sh_where
         {
-            type Output = #native;
+            type Bound = #bound;
+            const BODY: #ns_http::payload::Kind = #kind;
 
-            fn into_output(self) -> Self::Output {
-                #lower
+            fn complete<#g_sink>(self, #v_sink: #g_sink) -> ::core::result::Result<
+                #g_sink::Output, #g_sink::Error,
+            >
+            where
+                #g_sink: #ns_http::payload::response::dispatch::Accept<'d>,
+            {
+                let #v_status;
+                let #v_headers;
+                let #v_body;
+                {
+                    let #v_response = self;
+                    #v_status = #v_response.#status;
+                    #v_headers = #head;
+                    #v_body = #init;
+                }
+                #ns_http::payload::response::dispatch::Accept::#accept(
+                    #v_sink, #v_status, #v_headers, #v_body,
+                )
             }
         }
     };
@@ -208,9 +176,6 @@ pub(crate) fn build(
         #st
 
         #decl
-
-        #api
-        #slice
 
         #impls
     })

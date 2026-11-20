@@ -150,20 +150,22 @@ impl<'field> Response<'field, [u8; 0]> {
     }
 }
 
-impl<'field, 'req, 'd, B> dispatch::IntoOutput<'req, 'd> for Response<'field, B, (), Code>
+impl<'field, 'req, 'd, B> dispatch::Complete<'req, 'd> for Response<'field, B, (), Code>
 where
     B: Body<'d>,
 {
-    type Output = fixed::Direct<List<'field, Name<Cow<'field, str>>>, B>;
+    type Bound = o3::buffer::resident::bound::Unbounded;
 
-    fn into_output(self) -> Self::Output {
+    const BODY: crate::payload::Kind = crate::payload::Kind::Inline;
+
+    fn complete<S: dispatch::Accept<'d>>(self, sink: S) -> Result<S::Output, S::Error> {
         let Self {
             status,
             headers,
             trailers: (),
             body,
         } = self;
-        fixed::Direct::new(status, headers, body)
+        sink.fixed(status, headers, body)
     }
 }
 

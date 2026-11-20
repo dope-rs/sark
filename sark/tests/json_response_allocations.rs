@@ -40,8 +40,7 @@ fn writes_borrowed_body() {
         },
         key,
         owned: Value::new(Shared::try_copy(b"owned").expect("owned header")).expect("valid header"),
-    }
-    .into_fixed();
+    };
     assert!(
         mem::size_of_val(&response) < mem::size_of::<exact::Direct<Head<'_, 2>, RawBody<'_>>>()
     );
@@ -75,8 +74,7 @@ fn writes_json_no_alloc() {
             shared,
             local,
         },
-    }
-    .into_fixed();
+    };
     let mut out = [0u8; 128];
 
     let (written, (allocs, _)) = Tracker::usage(|| response.complete(SliceSink(&mut out, None)));
@@ -99,7 +97,6 @@ fn writes_unsigned_no_alloc() {
                 status: Code::OK,
                 body: value,
             }
-            .into_fixed()
             .complete(SliceSink(&mut out, None))
         });
         let (status, written) = written.expect("unsigned json body");
@@ -136,8 +133,7 @@ fn writes_unsigned_h2_no_alloc() {
             let response = Unsigned {
                 status: Code::OK,
                 body: value,
-            }
-            .into_fixed();
+            };
             let encoder = Encoder::new(&mut server, stream, Ref::from_slice(&[]));
             let (prepared, allocations) = Tracker::count(|| response.complete(encoder));
             let prepared = prepared.expect("unsigned response");
@@ -177,16 +173,18 @@ fn writes_unsigned_h2_no_alloc() {
 
 #[test]
 fn visits_length_once() {
-    let visits = Cell::new(0);
-    let response: <Borrowed as sark::core::manifold::Route<Cell<&Cell<usize>>>>::Response<
+    let counts = Counted {
+        bytes: b"{}",
+        ..Counted::default()
+    };
+    let response: <Borrowed as sark::core::manifold::Route<Cell<&Counted>>>::Response<
         'static,
         'static,
     > = CountedReply {
         status: Code::OK,
-        body: Counted(&visits),
-    }
-    .into_fixed();
-    assert_eq!(visits.get(), 0);
+        body: &counts,
+    };
+    assert_eq!(counts.sizes.get(), 0);
 
     let mut out = [0u8; 16];
     let (status, written) = response
@@ -194,5 +192,5 @@ fn visits_length_once() {
         .expect("counted body");
     assert_eq!(status, Code::OK);
     assert_eq!(&out[..written], b"{}");
-    assert_eq!(visits.get(), 1);
+    assert_eq!(counts.sizes.get(), 1);
 }

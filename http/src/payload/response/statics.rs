@@ -37,17 +37,6 @@ impl<'body, H> Direct<'body, H> {
     }
 }
 
-impl<'body, 'req, 'd, H: headers::Source> dispatch::IntoOutput<'req, 'd> for Direct<'body, H>
-where
-    'body: 'd,
-{
-    type Output = Self;
-
-    fn into_output(self) -> Self::Output {
-        self
-    }
-}
-
 impl<'body, 'req, 'd, H: headers::Source> dispatch::Complete<'req, 'd> for Direct<'body, H>
 where
     'body: 'd,

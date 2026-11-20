@@ -178,9 +178,7 @@ fn routes_response() {
                 .map_err(Rejected::discard)
                 .expect("empty GET body")
                 .into_state();
-            let admitted = state::Admission::admit(started, &mut state::Pass)
-                .continue_value()
-                .expect("unguarded route");
+            let admitted = state::Admission::<state::Admitted>::admit(started);
             let request = match H3RouterRequestFamily::fold(admitted, Selected).into_request() {
                 request::Body::Finished(request) => Some(request),
                 request::Body::Open(_) => None,
@@ -189,10 +187,9 @@ fn routes_response() {
             let request = request
                 .try_map_body(|done| body::Body::try_new(done, &[][..]))
                 .ok()
-                .expect("finished body")
-                .ready();
+                .expect("finished body");
             let (response, _) = request
-                .try_project(&app, |app, request| {
+                .try_project(&app, |request| {
                     app.try_dispatch(
                         request.into_inner(),
                         encoder::Encoder::new(&mut server, Target::new(Id::ZERO), method),
@@ -200,7 +197,7 @@ fn routes_response() {
                     .map(|prepared| prepared.finish())
                     .map_err(|(error, target)| (error.narrow(), target))
                 })
-                .ok()
+                .map_err(Rejected::discard)
                 .expect("matching route projection");
             response
                 .ok()
@@ -325,9 +322,7 @@ fn decodes_huffman_plan() {
         .map_err(Rejected::discard)
         .expect("empty GET body")
         .into_state();
-    let admitted = state::Admission::admit(started, &mut state::Pass)
-        .continue_value()
-        .expect("unguarded route");
+    let admitted = state::Admission::<state::Admitted>::admit(started);
     let request = match H3RouterRequestFamily::fold(admitted, Selected).into_request() {
         request::Body::Finished(request) => Some(request),
         request::Body::Open(_) => None,
@@ -336,10 +331,9 @@ fn decodes_huffman_plan() {
     let request = request
         .try_map_body(|done| body::Body::try_new(done, &[][..]))
         .ok()
-        .expect("finished body")
-        .ready();
+        .expect("finished body");
     let (response, _) = request
-        .try_project(&app, |app, request| {
+        .try_project(&app, |request| {
             app.try_dispatch(
                 request.into_inner(),
                 encoder::Encoder::new(&mut server, Target::new(Id::ZERO), method),
@@ -347,7 +341,7 @@ fn decodes_huffman_plan() {
             .map(|prepared| prepared.finish())
             .map_err(|(error, target)| (error.narrow(), target))
         })
-        .ok()
+        .map_err(Rejected::discard)
         .expect("matching route projection");
     response
         .ok()

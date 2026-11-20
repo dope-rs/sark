@@ -3,7 +3,7 @@ use core::ops::{self, ControlFlow};
 use dope::core::BranchError;
 use o3::buffer::{hold::evidence::Off, resident};
 use sark_core::{
-    body::credit,
+    body::{Body, credit},
     decode::{self, exec, request},
     manifold::{
         schedule::{self, typed},
@@ -148,7 +148,7 @@ where
     fn request(
         &mut self,
         stream: stream::Key,
-        ready: request::Ready<exec::Sync, R::Prepared, owned::Segments<'d>>,
+        ready: request::Admitted<exec::Sync, R::Prepared, Body<owned::Segments<'d>>>,
     ) -> Control<'d, R> {
         let reply =
             try_dispatch::<R, Off, event::Ignore, _>(ready, self.router, self.connection, stream);

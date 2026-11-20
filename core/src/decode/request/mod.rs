@@ -11,11 +11,9 @@ use crate::{
 };
 
 pub mod admit;
-mod project;
-
-pub use project::Project;
 
 /// A selected request whose guard has admitted it.
+#[must_use]
 #[repr(C)]
 pub struct Admitted<K, P, B> {
     prepared: P,
@@ -44,10 +42,6 @@ impl<K, P, B> Admitted<K, P, B> {
         self.body
     }
 
-    pub fn into_parts(self) -> (P, B) {
-        (self.prepared, self.body)
-    }
-
     pub fn try_map_body<T, E>(
         self,
         f: impl FnOnce(B) -> Result<T, E>,
@@ -69,77 +63,45 @@ impl<P, B> Admitted<exec::Duplex, P, B> {
 }
 
 impl<K, P, S> Admitted<K, P, body::Body<S>> {
-    pub fn ready(self) -> Ready<K, P, S> {
-        Ready::new(self.prepared, self.body)
-    }
-}
-
-/// A selected, admitted request coupled to its completed body.
-#[must_use]
-#[repr(C)]
-#[derive(Debug)]
-pub struct Ready<K, P, S> {
-    prepared: P,
-    body: body::Body<S>,
-    kind: PhantomData<fn() -> K>,
-}
-
-impl<K, P, S> Ready<K, P, S> {
-    pub(in crate::decode) const fn new(prepared: P, body: body::Body<S>) -> Self {
-        Self {
-            prepared,
-            body,
-            kind: PhantomData,
-        }
-    }
-
-    pub const fn body(&self) -> &body::Body<S> {
-        &self.body
-    }
-
     pub const fn prepared(&self) -> &P {
         &self.prepared
     }
-
-    pub fn into_body(self) -> body::Body<S> {
-        self.body
-    }
 }
 
-impl<P, S> Ready<exec::Task, P, S> {
-    pub fn into_parts(self) -> (P, body::Body<S>) {
+impl<P, B> Admitted<exec::Task, P, B> {
+    pub fn into_parts(self) -> (P, B) {
         (self.prepared, self.body)
     }
 }
 
-impl<P, S> Ready<exec::Sync, P, S> {
+impl<P, S> Admitted<exec::Sync, P, body::Body<S>> {
     /// Borrows this completed body only for its matching selected request.
     ///
     pub fn try_project<'d, D, T, F>(
         self,
         decoder: &D,
-        f: F,
-    ) -> Result<(T, body::Body<S>), Project<exec::Sync, P, S>>
+        project: F,
+    ) -> Result<(T, body::Body<S>), Rejected<Self, request::body::Error>>
     where
         S: Source<'d>,
         D: Decode<Prepared = P>,
-        F: for<'a> FnOnce(&D, Scoped<'a, 'd, D>) -> T,
+        F: for<'a> FnOnce(Scoped<'a, 'd, D>) -> T,
     {
         let Self {
             prepared, mut body, ..
         } = self;
-        let output = match decoder.try_project(prepared, body.input(), |view| f(decoder, view)) {
+        let output = match decoder.try_project(prepared, body.input(), project) {
             Ok((output, ())) => output,
             Err(failure) => {
                 let ((prepared, _), error) = failure.into_parts();
-                return Err(Project::new(error, Ready::new(prepared, body)));
+                return Err(Rejected::new(Self::new(prepared, body), error));
             }
         };
         Ok((output, body))
     }
 }
 
-impl<'d, P> Ready<exec::Sync, P, owned::Segments<'d>> {
+impl<'d, P> Admitted<exec::Sync, P, body::Body<owned::Segments<'d>>> {
     /// Keeps response selection and the matching final owner in one generative scope.
     pub fn with_input<T>(
         self,
@@ -320,9 +282,9 @@ where
 
 const _: () = {
     type Body = body::Body<()>;
-    type ReadyProof = Ready<exec::Sync, (), ()>;
-    assert!(core::mem::size_of::<ReadyProof>() == core::mem::size_of::<Body>());
-    assert!(core::mem::align_of::<ReadyProof>() == core::mem::align_of::<Body>());
+    type Completed = Admitted<exec::Sync, (), Body>;
+    assert!(core::mem::size_of::<Completed>() == core::mem::size_of::<Body>());
+    assert!(core::mem::align_of::<Completed>() == core::mem::align_of::<Body>());
     assert!(
         core::mem::size_of::<Admitted<exec::Task, usize, usize>>()
             == 2 * core::mem::size_of::<usize>()

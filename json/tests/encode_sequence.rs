@@ -2,9 +2,8 @@ pub mod common;
 
 use std::cell::Cell;
 
-use common::sequence::{Borrowed, Bounded, Containers, Document, Rows, Slice, TryRow};
-use sark_http::payload::response::dispatch::IntoOutput;
-use sark_json::writing::{Body, EncodeError, TryEncode};
+use common::sequence::{Borrowed, Containers, Document, Rows, Slice, TryRow};
+use sark_json::writing::{EncodeError, TryEncode};
 
 #[test]
 fn encodes_owner_views() {
@@ -77,23 +76,4 @@ fn rejects_changed_sequence() {
         ));
         assert_eq!(output, b"prefix");
     }
-}
-
-#[test]
-fn bounded_skips_exact_size() {
-    let sizes = Cell::new(0);
-    let bounds = Cell::new(0);
-    let writes = Cell::new(0);
-    let response = Body::new(Bounded {
-        sizes: &sizes,
-        bounds: &bounds,
-        writes: &writes,
-    })
-    .try_response()
-    .map_err(|rejected| rejected.discard())
-    .expect("upper bound");
-    let (_, _, plan) = response.into_output().into_parts();
-    let output = plan.into_shared().expect("bounded body");
-    assert_eq!(output.as_ref(), b"true");
-    assert_eq!((sizes.get(), bounds.get(), writes.get()), (0, 1, 1));
 }

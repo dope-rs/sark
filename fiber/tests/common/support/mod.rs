@@ -5,6 +5,7 @@ use dope::{
     runtime::shutdown::ReadySource,
 };
 use dope_tls::tls::endpoint;
+use sark_fiber::server::Serve as _;
 use sark_h1::server::run::prepare;
 use sark_http::payload::response::status;
 

@@ -8,7 +8,6 @@ use std::{
     time::Duration,
 };
 
-use common::server::recover;
 use common::{
     route::{
         body::length::ClOverflowDispatch,
@@ -23,9 +22,7 @@ use common::{
         peer::{Endpoint as _, Receive as _, Response as _},
     },
 };
-use dope::core::driver::life::recovery::Policy;
 use dope_test::harness::server::Pair;
-use sark_fiber::Config;
 
 #[test]
 fn handler_return_scopes() {
@@ -35,24 +32,14 @@ fn handler_return_scopes() {
         .check(
             |context, listener| {
                 let mut reports = Plan::try_reports(&server).expect("server descriptor claims");
-                let result = HygieneRoutes::serve(
+                let result = server::serve::<HygieneRoutes, _>(
                     server.with_bound(listener),
                     context,
                     (),
-                    Config::new(server::MAX_CONNECTIONS),
-                    Policy::new(|event| reports.push(event), recover),
-                    |result| {
-                        result
-                            .as_ref()
-                            .map(|_| ())
-                            .map_err(|error| error.cause())
-                            .expect("server")
-                    },
+                    server::MAX_CONNECTIONS,
+                    &mut reports,
                 );
-                assert!(
-                    reports.events().expect("reclaimed resources").is_empty(),
-                    "server retirement: {reports:?}"
-                );
+                server::reclaimed(&reports);
                 result
             },
             |bind| {
@@ -93,18 +80,14 @@ fn rejects_bad_authority() {
         .check(
             |context, listener| {
                 let mut reports = Plan::try_reports(&server).expect("server descriptor claims");
-                let result = HelloDispatch::serve(server.with_bound(listener), context,
+                let result = server::serve::<HelloDispatch, _>(
+                    server.with_bound(listener),
+                    context,
                     (),
-                    Config::new(server::MAX_CONNECTIONS),
-                    Policy::new(
-                        |event| reports.push(event),
-                        recover,
-                    ),
-                    |result| {
-                        result.as_ref().map(|_| ()).map_err(|error| error.cause()).expect("server")
-                    },
+                    server::MAX_CONNECTIONS,
+                    &mut reports,
                 );
-                assert!(reports.events().expect("reclaimed resources").is_empty(), "server retirement: {reports:?}");
+                server::reclaimed(&reports);
                 result
             },
             |bind| {
@@ -130,6 +113,21 @@ fn rejects_bad_authority() {
                     ],
                 ).expect("segmented authority response");
                 assert!(response.starts_with(b"HTTP/1.1 200 "));
+
+                for (encoding, status) in [
+                    ("identity;q=0, gzip", 200),
+                    ("identity;q=0, gzip;q=0", 406),
+                ] {
+                    let request = format!(
+                        "GET /hello HTTP/1.1\r\nHost: origin.example\r\nAccept-Encoding: {encoding}\r\nConnection: close\r\n\r\n"
+                    );
+                    let response = bind.try_request(&[request.as_bytes()]).expect("negotiated response");
+                    assert!(response.starts_with(format!("HTTP/1.1 {status} ").as_bytes()));
+                    if status == 200 {
+                        assert!(response.windows(b"\r\ncontent-encoding: gzip\r\n".len())
+                            .any(|field| field.eq_ignore_ascii_case(b"\r\ncontent-encoding: gzip\r\n")));
+                    }
+                }
             },
             |result| {
                 assert!(result.is_ok(), "server preparation failed: {:?}", result.err());
@@ -172,24 +170,14 @@ fn guard_integration() {
             |context, listener| {
                 let events = Cell::new(Vec::new());
                 let mut reports = Plan::try_reports(&server).expect("server descriptor claims");
-                let result = GuardDispatch::serve(
+                let result = server::serve::<GuardDispatch, _>(
                     server.with_bound(listener),
                     context,
                     State(&events),
-                    Config::new(server::MAX_CONNECTIONS),
-                    Policy::new(|event| reports.push(event), recover),
-                    |result| {
-                        result
-                            .as_ref()
-                            .map(|_| ())
-                            .map_err(|error| error.cause())
-                            .expect("server")
-                    },
+                    server::MAX_CONNECTIONS,
+                    &mut reports,
                 );
-                assert!(
-                    reports.events().expect("reclaimed resources").is_empty(),
-                    "server retirement: {reports:?}"
-                );
+                server::reclaimed(&reports);
                 assert_eq!(
                     events.into_inner(),
                     [
@@ -273,18 +261,14 @@ fn survives_bad_lengths() {
         .check(
             |context, listener| {
                 let mut reports = Plan::try_reports(&server).expect("server descriptor claims");
-                let result = ClOverflowDispatch::serve(server.with_bound(listener), context,
+                let result = server::serve::<ClOverflowDispatch, _>(
+                    server.with_bound(listener),
+                    context,
                     (),
-                    Config::new(server::MAX_CONNECTIONS),
-                    Policy::new(
-                        |event| reports.push(event),
-                        recover,
-                    ),
-                    |result| {
-                        result.as_ref().map(|_| ()).map_err(|error| error.cause()).expect("server")
-                    },
+                    server::MAX_CONNECTIONS,
+                    &mut reports,
                 );
-                assert!(reports.events().expect("reclaimed resources").is_empty(), "server retirement: {reports:?}");
+                server::reclaimed(&reports);
                 result
             },
             |bind| {

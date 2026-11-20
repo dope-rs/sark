@@ -17,7 +17,7 @@ use sark_h1::{
         head::{Block, Error, line},
         parsing::{
             self,
-            framing::{Head, HeadProgress, PendingHead, Plain},
+            framing::{Head, HeadProgress, PendingHead},
             raw,
         },
     },
@@ -27,7 +27,7 @@ use sark_http::{
     field::{head::Error::ContentLength, text::IntError},
     h1::{
         codec::canned,
-        head::{line::Version, request::Coding},
+        head::line::Version,
     },
 };
 
@@ -40,7 +40,7 @@ fn setters_and_owner() {
     let mut input = b"GET / HTTP/1.1\r\nHost: local\r\nX-Count: once\r\nX-Other: ".to_vec();
     let source = head::parsed(Input::Borrowed(&input), u8::MAX);
     let mut pending =
-        match Head::<Request, Plain, head::Admission>::start(raw::Bound::empty(&source))
+        match Head::<Request, head::Admission>::start::<false>(raw::Bound::empty(&source))
             .ok()
             .expect("fields")
         {
@@ -83,7 +83,7 @@ fn setters_and_owner() {
                         .get(head.source().input().as_slice()),
                     Some(b"fragmented".as_slice())
                 );
-                let whole = Head::<common::Request, Plain, head::Admission>::parse(
+                let whole = Head::<common::Request, head::Admission>::parse::<false>(
                     raw::Bound::empty(head.source()),
                 )
                 .ok()
@@ -111,7 +111,7 @@ fn captured_list_members() {
     for split in Request::PREFIX.len()..=wire.len() {
         SETS.set(Vec::new());
         let source = head::parsed(Input::Borrowed(&wire[..split]), u8::MAX);
-        match Head::<Request>::start(raw::Bound::empty(&source))
+        match Head::<Request>::start::<false>(raw::Bound::empty(&source))
             .ok()
             .expect("admitted field")
         {
@@ -140,7 +140,7 @@ fn bad_field_rejects() {
         Input::Borrowed(b"GET / HTTP/1.1\r\nHost: local\r\nContent-Length: "),
         u8::MAX,
     );
-    let pending = match Head::<Request>::start(raw::Bound::empty(&source))
+    let pending = match Head::<Request>::start::<false>(raw::Bound::empty(&source))
         .ok()
         .expect("fields")
     {
@@ -189,7 +189,7 @@ fn upgrade_errors_follow_canonical_field_admission() {
         for split in Request::PREFIX.len()..=through {
             let source = head::parsed(Input::Borrowed(&wire[..split]), u8::MAX);
             let measurement = Tracker::begin();
-            let error = match Head::<Request, Plain, sark_h1::route::duplex::Upgrade>::start(
+            let error = match Head::<Request, sark_h1::route::duplex::Upgrade>::start::<false>(
                 raw::Bound::empty(&source),
             ) {
                 Err(error) => error,
@@ -234,7 +234,7 @@ fn transfer_coding_admission() {
         let wire = Request::transfer(coding);
         for split in Request::TRANSFER_PREFIX.len()..=wire.len() {
             let source = head::parsed(Input::Borrowed(&wire[..split]), u8::MAX);
-            let result = match Head::<Request>::start(raw::Bound::empty(&source)) {
+            let result = match Head::<Request>::start::<false>(raw::Bound::empty(&source)) {
                 Ok(HeadProgress::Complete(_)) => Ok(()),
                 Ok(HeadProgress::Pending(pending)) => pending
                     .try_resume::<Infallible, Infallible, _>(
@@ -281,7 +281,7 @@ fn http10_ignores_upgrade() {
     for split in [wire.len(), wire.len() - 8, wire.len() - 3] {
         SETS.set(Vec::new());
         let source = head::parsed(Input::Borrowed(&wire[..split]), u8::MAX);
-        match Head::<Request>::start(raw::Bound::empty(&source))
+        match Head::<Request>::start::<false>(raw::Bound::empty(&source))
             .ok()
             .expect("HTTP/1.0 fields")
         {
@@ -309,7 +309,7 @@ fn http10_ignores_upgrade() {
         Input::Borrowed(b"GET / HTTP/1.0\r\nHost: local\r\nUpgrade: web"),
         u8::MAX,
     );
-    let pending = match Head::<Request>::start(raw::Bound::empty(&source))
+    let pending = match Head::<Request>::start::<false>(raw::Bound::empty(&source))
         .ok()
         .expect("pending fields")
     {
@@ -338,7 +338,7 @@ fn whole_and_split() {
         for width in [8191, 8192, 8193] {
             let input = Request::long(width, field);
             let source = head::parsed(Input::Borrowed(&input), u8::MAX);
-            let complete = Head::<Request>::start(raw::Bound::empty(&source));
+            let complete = Head::<Request>::start::<false>(raw::Bound::empty(&source));
             assert_eq!(
                 matches!(complete, Ok(HeadProgress::Complete(_))),
                 width <= 8192
@@ -346,7 +346,7 @@ fn whole_and_split() {
             assert!(SETS.take().is_empty());
             for split in [Request::PREFIX.len() + field.len(), input.len() - 3] {
                 let source = head::parsed(Input::Borrowed(&input[..split]), u8::MAX);
-                let pending = match Head::<Request>::start(raw::Bound::empty(&source)) {
+                let pending = match Head::<Request>::start::<false>(raw::Bound::empty(&source)) {
                     Ok(HeadProgress::Pending(pending)) => Some(pending),
                     Err(parsing::Request::Head(Error::Line(line::Error::Limit {
                         observed: 8194,
@@ -428,12 +428,12 @@ fn bounds_head_length() {
     let mut accepted = common::Request::field_block(64 * 1024);
     accepted.resize(accepted.len() + 64 * 1024, 0xa5);
     assert!(matches!(
-        Block::<()>::parse::<common::Request>(&accepted, 0, 128, Coding::Plain, Version::Eleven),
+        Block::<()>::parse::<common::Request, false>(&accepted, 0, 128, Version::Eleven),
         Ok(Some(_))
     ));
     let rejected = common::Request::field_block(64 * 1024 + 1);
     assert!(matches!(
-        Block::<()>::parse::<common::Request>(&rejected, 0, 128, Coding::Plain, Version::Eleven),
+        Block::<()>::parse::<common::Request, false>(&rejected, 0, 128, Version::Eleven),
         Err(Error::Length { len }) if len == 64 * 1024 + 1
     ));
 }
@@ -446,7 +446,7 @@ fn route_bound_precedes_retention() {
         for split in [16, LIMIT - 2, wire.len()] {
             let source = head::parsed(Input::Borrowed(&wire[..split]), u8::MAX);
             let measurement = Tracker::begin();
-            let started = Head::<Request, Plain, head::Admission>::start(raw::Bound::empty(&source));
+            let started = Head::<Request, head::Admission>::start::<false>(raw::Bound::empty(&source));
             let allocation = measurement.finish();
             match (split == wire.len(), started) {
                 (true, Ok(HeadProgress::Complete(head))) => {
@@ -532,21 +532,19 @@ fn route_bound_precedes_retention() {
 fn keeps_prefix_cursor() {
     SETS.set(Vec::new());
     assert!(matches!(
-        Block::<()>::parse::<head::Request<4>>(
+        Block::<()>::parse::<head::Request<4>, false>(
             head::PREFIX_HOST,
             0,
             16,
-            Coding::Plain,
             Version::Eleven
         ),
         Ok(Some(_))
     ));
     assert!(matches!(
-        Block::<()>::parse::<head::Request<5>>(
+        Block::<()>::parse::<head::Request<5>, false>(
             head::PREFIX_HOST,
             0,
             16,
-            Coding::Plain,
             Version::Eleven
         ),
         Err(Error::Line(line::Error::Name {
@@ -555,11 +553,10 @@ fn keeps_prefix_cursor() {
         }))
     ));
     assert!(matches!(
-        Block::<()>::parse::<head::Request<8>>(
+        Block::<()>::parse::<head::Request<8>, false>(
             head::PREFIX_LENGTH,
             0,
             16,
-            Coding::Plain,
             Version::Eleven
         ),
         Err(Error::Line(line::Error::Field {

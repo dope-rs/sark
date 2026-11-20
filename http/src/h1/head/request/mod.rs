@@ -142,12 +142,33 @@ impl Fields {
 
 const _: () = assert!(core::mem::size_of::<Fields>() <= 6 * core::mem::size_of::<usize>());
 
-#[derive(Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 #[repr(u8)]
 pub enum Coding {
     #[default]
     Plain,
     Gzip,
+    GzipOnly,
+    Refused,
+}
+
+impl Coding {
+    pub const fn identity(self) -> bool {
+        matches!(self, Self::Plain | Self::Gzip)
+    }
+
+    pub const fn gzip(self) -> bool {
+        matches!(self, Self::Gzip | Self::GzipOnly)
+    }
+
+    pub(crate) const fn from_acceptance(identity: bool, gzip: bool) -> Self {
+        match (identity, gzip) {
+            (true, false) => Self::Plain,
+            (true, true) => Self::Gzip,
+            (false, true) => Self::GzipOnly,
+            (false, false) => Self::Refused,
+        }
+    }
 }
 
 const _: () = assert!(core::mem::size_of::<Coding>() == core::mem::size_of::<bool>());

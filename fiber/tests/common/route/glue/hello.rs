@@ -8,6 +8,7 @@ use sark_http::payload::response::status;
 use crate::common::{route::body::OwnedReply, server};
 
 #[sark_fiber::handler(pub)]
+#[gzip(required)]
 fn gzip() -> OwnedReply {
     let mut body = Vec::new();
     body.extend_from_slice(b"hello");
@@ -29,13 +30,12 @@ pub fn try_serve(
     listener: Listener,
 ) -> Result<(), BranchError<prepare::Error, Claim>> {
     let mut reports = server::Plan::try_reports(&plan).map_err(BranchError::Second)?;
-    HelloDispatch::serve(
+    server::serve::<HelloDispatch, _>(
         plan.with_bound(listener),
         context,
         (),
-        sark_fiber::Config::new(server::MAX_CONNECTIONS),
-        server::reporting(&mut reports),
-        |result| server::completed(&result),
+        server::MAX_CONNECTIONS,
+        &mut reports,
     )?;
     server::reclaimed(&reports);
     Ok(())

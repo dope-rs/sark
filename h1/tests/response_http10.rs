@@ -31,21 +31,21 @@ use sark_http::{
 
 #[test]
 fn fixed_connections() {
-    let policy = route::Policy::new(Coding::Plain, Date::Include, Server::Include);
+    let policy = route::Policy::new(route::Mode::Plain, Date::Include, Server::Include);
     for &(request, connection) in replies::CONNECTIONS {
         let parsed = common::head::parsed(Input::Borrowed(request), u8::MAX);
-        let response = head::Parsed::<()>::parse::<Request>(&parsed, 128)
+        let response = head::Parsed::<()>::parse::<Request, false>(&parsed, 128)
             .ok()
             .flatten()
             .expect("admitted head")
-            .response();
+            .response()
+            .with_coding(Coding::Plain);
         let mut bytes = [0; 256];
         let mut writer = Slice::new(&mut bytes);
         let result = output::Egress::new(writer.reborrow(), DATE, response).route(
             fixed::Direct::new(Code::OK, (), replies::BYTES),
             handoff::Slot::ready(None),
             &mut (),
-            Coding::Plain,
             policy,
         );
         let output::Outcome::SendCopied { copy, .. } = result else {
@@ -70,6 +70,49 @@ fn fixed_connections() {
 }
 
 #[test]
+fn absent_stream_completes_with_zero_length() {
+    for (request, expected) in [
+        (
+            b"GET / HTTP/1.0\r\nHost: local\r\n\r\n",
+            b"HTTP/1.0 200 OK\r\nContent-Length: 0\r\n\r\n",
+        ),
+        (
+            b"GET / HTTP/1.1\r\nHost: local\r\n\r\n",
+            b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n",
+        ),
+    ] {
+        let parsed = common::head::parsed(Input::Borrowed(request), u8::MAX);
+        let Ok(Some(head)) =
+            framing::Head::<Streaming<false>>::parse::<false>(raw::Bound::empty(&parsed))
+        else {
+            panic!("complete GET request");
+        };
+        let mut conn: session::Conn = session::Conn::default();
+        let mut bytes = [0; 128];
+        let mut writer = Slice::new(&mut bytes);
+        let outcome = stream::Endpoint::new(
+            output::Egress::new(writer.reborrow(), DATE, parsed.response()),
+            &mut conn,
+        )
+        .dispatch::<Streaming<false>, _, _, _, _>(
+            session::Permit::new(),
+            head,
+            &Cell::new(0),
+            || Some(|(), _: &mut (), _: Context| panic!("absent producer installed")),
+            credit::Disabled::new(),
+        );
+        assert!(matches!(
+            outcome,
+            session::RouteOutcome::Outcome(session::Outcome::Complete {
+                response: output::Complete::Inline,
+                ..
+            })
+        ));
+        assert_eq!(writer.into_mut(), expected);
+    }
+}
+
+#[test]
 fn stream_ten() {
     for split in [false, true] {
         let mut request = replies::STREAM_TEN.to_vec();
@@ -77,7 +120,7 @@ fn stream_ten() {
             request.push(b'x');
         }
         let parsed = common::head::parsed(Input::Borrowed(&request), u8::MAX);
-        let head = framing::Head::<Streaming>::parse(raw::Bound::empty(&parsed))
+        let head = framing::Head::<Streaming>::parse::<false>(raw::Bound::empty(&parsed))
             .ok()
             .flatten()
             .expect("framing");

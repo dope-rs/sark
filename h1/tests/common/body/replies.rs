@@ -7,12 +7,9 @@ use o3::{
         write::{Sink, consume},
     },
 };
-use sark_h1::route::Policy;
+use sark_h1::route::{Mode, Policy};
 use sark_http::{
-    h1::head::{
-        request::Coding,
-        response::{Date, Server},
-    },
+    h1::head::response::{Date, Server},
     payload::{
         compress::{self, Compression},
         fixed,
@@ -27,7 +24,7 @@ pub const CASES: &[(Method, Code)] = &[
     (Method::Other, Code::NOT_MODIFIED),
     (Method::Other, Code::RESET_CONTENT),
 ];
-pub const POLICY: Policy = Policy::new(Coding::Gzip, Date::Omit, Server::Omit);
+pub const POLICY: Policy = Policy::new(Mode::Gzip, Date::Omit, Server::Omit);
 pub const CONNECTIONS: &[(&[u8], Option<&str>)] = &[
     (b"GET / HTTP/1.0\r\nHost: local\r\n\r\n", None),
     (
@@ -116,6 +113,11 @@ impl Compression for Compressor {
     fn encode(&mut self, _: &[u8]) -> compress::Output {
         self.calls += 1;
         compress::Output::Plain
+    }
+
+    fn try_encode(&mut self, _: &[u8]) -> Result<compress::Frozen, compress::Error> {
+        self.calls += 1;
+        Err(compress::Error::Unavailable)
     }
 }
 

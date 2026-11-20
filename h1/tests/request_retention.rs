@@ -12,7 +12,7 @@ use sark_h1::{
     session,
     wire::parsing::{self, framing, raw},
 };
-use sark_http::{h1::head::request::Coding, payload::owned};
+use sark_http::payload::owned;
 
 #[global_allocator]
 static ALLOCATOR: Tracker = Tracker::new();
@@ -33,11 +33,10 @@ fn retention_follows_window() {
         let mut fixture = Retain::try_new().expect("response resources");
         let mut conn = session::Conn::default();
         let (outcome, allocs) = Tracker::count(|| {
-            let head =
-                framing::Head::<Request, Coding>::parse(raw::Bound::empty(&parsed), Coding::Plain)
-                    .ok()
-                    .flatten()
-                    .expect("complete framing");
+            let head = framing::Head::<Request>::parse::<false>(raw::Bound::empty(&parsed))
+                .ok()
+                .flatten()
+                .expect("complete framing");
             fixture.dispatch(&mut conn, session::Permit::new(), head)
         });
         assert_eq!(allocs, expected);
@@ -74,7 +73,7 @@ fn retains_fragmented_head() {
     let mut input = Request::HEAD[..split].to_vec();
     let source = common::head::parsed(Input::Borrowed(&input), u8::MAX);
     let (progress, usage) = Tracker::activity(|| {
-        framing::Head::<Request, Coding>::start(raw::Bound::empty(&source), Coding::Plain)
+        framing::Head::<Request>::start::<false>(raw::Bound::empty(&source))
             .ok()
             .expect("fields")
     });

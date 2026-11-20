@@ -52,13 +52,12 @@ pub fn serve(
 ) -> Result<(), BranchError<prepare::Error, Claim>> {
     let mut reports = server::Plan::try_reports(&plan).map_err(BranchError::Second)?;
     let failures = Cell::new(Vec::new());
-    let result = EchoDispatch::serve(
+    let result = server::serve::<EchoDispatch, _>(
         plan.with_bound(listener),
         context,
         State(&failures),
-        sark_fiber::Config::new(tasks),
-        server::reporting(&mut reports),
-        |result| server::completed(&result),
+        tasks,
+        &mut reports,
     );
     server::reclaimed(&reports);
     let failures = failures.into_inner();

@@ -25,9 +25,9 @@ where
     Self::IntoIter: Unpin,
 {
     fn into_stream<'req>(self) -> dispatch::Stream<'req, IterStream<Self::IntoIter>> {
-        dispatch::Stream::new(IterStream {
+        dispatch::Stream::new(Some(IterStream {
             iter: self.into_iter(),
-        })
+        }))
     }
 }
 

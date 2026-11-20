@@ -62,15 +62,11 @@ impl Handler {
         h1: crate::runtime::H1,
     ) -> syn::Result<TokenStream> {
         let ns_core = &paths.core;
-        let ns_http = &paths.http;
         let ns_fiber = &paths.fiber;
         use syn::{FnArg, ReturnType};
 
         use crate::types::{Generics, Lifetimes};
-        let configs::Attrs {
-            max_body: max,
-            head_skip: skips,
-        } = configs::Attrs::take(&mut self.fun)?;
+        let attrs = configs::Attrs::take(&mut self.fun)?;
         let Self {
             mut fun,
             entry,
@@ -110,6 +106,20 @@ impl Handler {
                 ));
             }
         };
+        if attrs.required_gzip {
+            if !matches!(mode, Mode::Native) {
+                return Err(syn::Error::new_spanned(
+                    &fun.sig,
+                    "#[gzip(required)] requires a synchronous response handler",
+                ));
+            }
+            if matches!(h1, crate::runtime::H1::Missing) {
+                return Err(syn::Error::new_spanned(
+                    &fun.sig,
+                    "#[gzip(required)] requires sark-h1",
+                ));
+            }
+        }
         let (request, schema, schema_import) = if request.is_none()
             && !matches!(mode, Mode::Duplex)
             && fun.sig.inputs.first().is_none_or(|argument| {
@@ -327,11 +337,10 @@ impl Handler {
             Mode::Task => Response::Plain(quote::quote!(#ns_fiber::manifold::runtime::NativeFiber)),
             Mode::Duplex => Response::Plain(quote::quote!(#ns_core::duplex::Shape)),
         };
-        let spec = response.build(paths, &name, req, max.as_ref(), skips, h1);
-        let (outer, inner) = match mode {
+        let spec = response.build(paths, &name, req, attrs, h1);
+        let outer = match mode {
             Mode::Native => {
                 let req_out = life.response(&out_req, Some(&out_d), &state_lives);
-                let output = life.response(&inv_req, Some(&inv_d), &state_lives);
                 let request_arg = request.then(|| quote::quote!(#v_input.0,));
                 let state_arg = state_at.map(|_| quote::quote!(#v_input.1,));
                 let projected = quote::quote!(
@@ -344,12 +353,11 @@ impl Handler {
                 } else {
                     quote::quote!({ #projected; })
                 };
-                let outer = quote::quote! {
+                quote::quote! {
                     impl #impl_lts #ns_core::manifold::Route<#state> for #name
                     where #( #bounds, )*
                     {
-                        type Response<#out_req, #out_d> =
-                            <#req_out as #ns_http::payload::response::dispatch::IntoOutput<#out_req, #out_d>>::Output
+                        type Response<#out_req, #out_d> = #req_out
                         where #out_d: #out_req;
                         #[inline(always)]
                         fn invoke<#inv_req, #inv_d, #borrow>(
@@ -360,13 +368,10 @@ impl Handler {
                         where #inv_req: #borrow, #inv_d: #inv_req
                         {
                             let #v_input = (#projected, #v_input.4);
-                            <#output as #ns_http::payload::response::dispatch::IntoOutput<#inv_req, #inv_d>>::into_output(
-                                #call((#request_arg #state_arg)),
-                            )
+                            #call((#request_arg #state_arg))
                         }
                     }
-                };
-                (outer, TokenStream::new())
+                }
             }
             Mode::Task => {
                 let state_arg = state_at.map(|_| quote::quote!(#v_input.1,));
@@ -424,119 +429,59 @@ impl Handler {
                 } else {
                     (quote::quote!(#call.into_parts().0), quote::quote!(#call))
                 };
+                let built = generics.lifetime("__sark_built");
+                let [v_id, v_task, v_error, v_output, v_old, v_yield, v_cx] =
+                    generics.locals(["id", "build", "error", "output", "_build", "yielded", "cx"]);
+                let own = quote::quote!(<<#name as #ns_core::route::Spec>::Request as #ns_core::route::Own>);
+                let input_ty = quote::quote!(#ns_core::manifold::task::request::Input);
+                let output_ty = quote::quote!(#ns_core::manifold::task::response::Output);
+                let step = quote::quote!(#ns_core::body::Step);
                 fun.block = Box::new(syn::parse_quote!({
-                    let (#call, #( #extra, )*) = (
-                        match #call::start::<#state>(#v_input) {
-                            ::core::result::Result::Ok(::core::ops::ControlFlow::Break(#call)) =>
-                                #ready,
-                            ::core::result::Result::Ok(::core::ops::ControlFlow::Continue(mut #call)) => {
-                                loop {
-                                    #call = match #call::step::<#state>(#call) {
-                                        ::core::result::Result::Ok(::core::ops::ControlFlow::Break(#call)) =>
-                                            break #ready,
-                                        ::core::result::Result::Ok(::core::ops::ControlFlow::Continue(#call)) => #call,
-                                        ::core::result::Result::Err(#call) => return #call,
-                                    };
-                                    #call::yield_once().await;
+                    let #call = #built: {
+                        let #v_req = match #v_input {
+                            #input_ty::Ready { request: #v_req } => break #built #v_req,
+                            #input_ty::Buffered(#v_req) => #v_req,
+                        };
+                        let #v_id = #v_req.owner().id();
+                        let mut #v_task = match #own::start_task(#v_req) {
+                            ::core::result::Result::Ok(#v_task) => #v_task,
+                            ::core::result::Result::Err(#v_error) =>
+                                return #output_ty::rejected(#v_id, #own::reject(#v_error)),
+                        };
+                        loop {
+                            #v_task = match #ns_core::body::Build::step(#v_task, #ns_core::body::DEFAULT_BUILD_STEP_BUDGET) {
+                                #step::Ready { output: #v_output, .. } => break #built #v_output,
+                                #step::Failed { build: #v_task, error: #v_error, .. } =>
+                                    return #output_ty::rejected(#v_id, {
+                                        let #v_old = #v_task;
+                                        <#own::TaskBuilder<'d> as #ns_core::route::TaskBuild>::reject(#v_error)
+                                    }),
+                                #step::NeedInput { build: #v_task, .. }
+                                | #step::Pending { build: #v_task, .. } => #v_task,
+                            };
+                            let mut #v_yield = false;
+                            #ns_fiber::abi::poll_fn(move |#v_cx| {
+                                if #v_yield {
+                                    ::core::task::Poll::Ready(())
+                                } else {
+                                    #v_yield = true;
+                                    #v_cx.wake();
+                                    ::core::task::Poll::Pending
                                 }
-                            }
-                            ::core::result::Result::Err(#call) => return #call,
-                        },
-                        #( #extra, )*
-                    );
-                    #ns_core::manifold::task::response::Output::response(#id, async {
+                            }).await;
+                        }
+                    };
+                    let (#call, #( #extra, )*) = (#ready, #( #extra, )*);
+                    #output_ty::response(#id, async {
                         let (#( #patterns, )*) = (#admitted_request #( #extra, )*);
                         #body
                     }.await)
                 }));
-                let [v_proof, v_credit, v_req, v_id] =
-                    generics.locals(["__sark_evidence", "released", "request", "id"]);
-                let [v_task, v_error, v_output, v_reject] =
-                    generics.locals(["build", "error", "output", "reject"]);
-                let [v_old, v_yield, v_cx] = generics.locals(["_build", "yielded", "cx"]);
-                let released = quote::quote! {
-                    let mut #v_proof = #ns_core::body::credit::Disabled::new();
-                    #ns_core::body::credit::Evidence::released(
-                        &mut #v_proof, #v_credit, #ns_core::body::credit::Disposition::Admitted,
-                    );
-                };
-                let builder = quote::quote!(
-                    <<#name as #ns_core::route::Spec>::Request as #ns_core::route::Own>::TaskBuilder<'d>
-                );
-                let admitted = quote::quote!(::core::result::Result<
-                    ::core::ops::ControlFlow<
-                        #ns_core::route::Built<'d,
-                            <<#name as #ns_core::route::Spec>::Request as #ns_core::route::Own>::Task<'d>>,
-                        (#ns_http::request::Id<'d>, #builder),
-                    >,
-                    #ns_core::manifold::task::response::Output<'d, #name, State>,
-                >);
-                let inner = quote::quote! {
-                    #[inline(always)]
-                    pub(super) fn start<'d, State>(
-                        #v_input: #ns_core::manifold::task::request::Input<'d, #name>,
-                    ) -> #admitted where #name: #ns_core::route::Task<'d, State>
-                    {
-                        match #v_input {
-                            #ns_core::manifold::task::request::Input::Ready { request: #v_req } =>
-                                ::core::result::Result::Ok(::core::ops::ControlFlow::Break(#v_req)),
-                            #ns_core::manifold::task::request::Input::Buffered(#v_req) => {
-                                let #v_id = #v_req.owner().id();
-                                match <<#name as #ns_core::route::Spec>::Request as #ns_core::route::Own>::start_task(#v_req) {
-                                    ::core::result::Result::Ok(#v_task) =>
-                                        ::core::result::Result::Ok(::core::ops::ControlFlow::Continue((#v_id, #v_task))),
-                                    ::core::result::Result::Err(#v_error) =>
-                                        ::core::result::Result::Err(#ns_core::manifold::task::response::Output::rejected(
-                                            #v_id,
-                                            <<#name as #ns_core::route::Spec>::Request as #ns_core::route::Own>::reject(#v_error),
-                                        )),
-                                }
-                            }
-                        }
-                    }
-                    #[inline(always)]
-                    pub(super) fn step<'d, State>((#v_id, #v_task): (#ns_http::request::Id<'d>, #builder))
-                        -> #admitted where #name: #ns_core::route::Task<'d, State>
-                    {
-                        match #ns_core::body::Build::step(#v_task, #ns_core::body::DEFAULT_BUILD_STEP_BUDGET) {
-                            #ns_core::body::Step::Ready { output: #v_output, released: #v_credit } => {
-                                #released
-                                ::core::result::Result::Ok(::core::ops::ControlFlow::Break(#v_output))
-                            }
-                            #ns_core::body::Step::Failed { build: #v_task, error: #v_error, released: #v_credit } => {
-                                #released
-                                let #v_reject = {
-                                    let #v_old = #v_task;
-                                    <#builder as #ns_core::route::TaskBuild>::reject(#v_error)
-                                };
-                                ::core::result::Result::Err(#ns_core::manifold::task::response::Output::rejected(#v_id, #v_reject))
-                            }
-                            #ns_core::body::Step::NeedInput { build: #v_task, released: #v_credit }
-                            | #ns_core::body::Step::Pending { build: #v_task, released: #v_credit } => {
-                                #released
-                                ::core::result::Result::Ok(::core::ops::ControlFlow::Continue((#v_id, #v_task)))
-                            }
-                        }
-                    }
-                    #[inline(always)]
-                    pub(super) fn yield_once<'d>() -> impl #ns_fiber::Fiber<'d, Output = ()> {
-                        let mut #v_yield = false;
-                        #ns_fiber::abi::poll_fn(move |#v_cx| {
-                            if #v_yield {
-                                ::core::task::Poll::Ready(())
-                            } else {
-                                #v_yield = true;
-                                #v_cx.wake();
-                                ::core::task::Poll::Pending
-                            }
-                        })
-                    }
-                };
-                (outer, inner)
+                outer
             }
             Mode::Duplex => {
                 let session = life.session(state_lt, &env.ident.to_string());
-                let outer = quote::quote! {
+                quote::quote! {
                     impl<#env, #( #lts: #env, )* #( #params, )*>
                         #ns_core::duplex::Route<#env, #state> for #name
                     where #( #bounds, )* #state: #env, #session: #env
@@ -558,8 +503,7 @@ impl Handler {
                             #call((#v_rqst, #v_state))
                         }
                     }
-                };
-                (outer, TokenStream::new())
+                }
             }
         };
         let schema_import = schema_import.into_iter();
@@ -572,7 +516,6 @@ impl Handler {
             mod #call {
                 #schema
                 #inner_vis struct #name;
-                #inner
             }
         })
     }

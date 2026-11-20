@@ -29,8 +29,7 @@ pub(in crate::app::serve) fn egress<M>(
         let route = &item.entry.route;
         match item.kind {
             spec::Kind::Fiber => quote! {
-                <<<#route as #ns_core::route::Task<'d, #state>>::Output
-                    as #ns_http::payload::response::dispatch::IntoOutput<'d, 'd>>::Output
+                <<#route as #ns_core::route::Task<'d, #state>>::Output
                     as #ns_http::payload::response::dispatch::Emit<'d, 'd>>::Bound
             },
             spec::Kind::Sync | spec::Kind::Stream => quote! {
@@ -72,13 +71,14 @@ impl Decode {
         params: &TokenStream,
         target: TokenStream,
     ) -> TokenStream {
-
         let core = &paths.core;
         let definitions = &self.definitions;
         let decode = &self.method;
         let full = &self.full;
-        let guarded = self.guard.as_ref().map(|guard| quote! {
-            impl #params #core::decode::Guarded for #target { #guard }
+        let guarded = self.guard.as_ref().map(|guard| {
+            quote! {
+                impl #params #core::decode::Guarded for #target { #guard }
+            }
         });
         quote! {
             #definitions
@@ -118,7 +118,7 @@ impl Decode {
         let [n_rproto] = symbols.locals(["__route_protocol"]);
         let [n_rtarg] = symbols.locals(["__route_target"]);
         let [n_select, n_target] = symbols.locals(["__selection", "__target"]);
-        let [n_trange, n_visit] = symbols.locals(["__target_range", "__visit"]);
+        let n_trange = symbols.local("__target_range");
         let [v_error] = symbols.locals(["error"]);
         let [n_call, n_error, n_fail] = symbols.locals(["__call", "__error", "__failure"]);
         let [n_ghead, n_input, n_result] = symbols.locals(["__guard_head", "__input", "__outcome"]);
@@ -128,9 +128,9 @@ impl Decode {
         let [l_driver, l_req, l_out, l_input] =
             spec.state_generics
                 .lives(["__sark_driver", "__sark_request", "o", "req"]);
-        let [g_e, g_f, g_g, g_i, g_t, g_v] = spec
+        let [g_e, g_f, g_g, g_i, g_t] = spec
             .state_generics
-            .idents(["__E", "__F", "__G", "__I", "__T", "__V"]);
+            .idents(["__E", "__F", "__G", "__I", "__T"]);
 
         let ns_core = &paths.core;
         let ns_http = &paths.http;
@@ -162,6 +162,8 @@ impl Decode {
         let body_id = format_ident!("{}Projected", spec.name);
         let error_ty = quote!(#error_id<#l_input>);
         let body_ty = quote!(#body_id<#l_input, #l_driver>);
+        let vis = &spec.vis;
+        let mut slots = TokenStream::new();
         let mut variants = TokenStream::new();
         let mut bodies = TokenStream::new();
         let mut errors = TokenStream::new();
@@ -176,25 +178,32 @@ impl Decode {
             let route = &entry.route;
             let schema = quote!(<#route as #ns_core::route::Spec>::Request);
             let variant = &item.prepared;
-            let head_slot = &item.head;
-            variants.extend(quote!(#variant(#head_slot),));
-            bodies.extend(quote! {
-                #variant(
-                    #ns_core::decode::Call<
-                        #ns_core::request::raw::Parsed<
-                            #ns_core::request::Head<
-                                #ns_http::field::metadata::section::storage::Bytes,
-                                <#schema as #ns_core::route::Schema>::Frame,
-                            >,
-                            #schema,
-                        >,
-                        #ns_core::body::Scoped<
-                            #l_input,
-                            'd,
-                            <#schema as #ns_core::route::Schema>::Body,
-                        >,
+            let slot = &item.request;
+            let parsed = quote! {
+                #ns_core::request::raw::Parsed<
+                    #ns_core::request::Head<
+                        #ns_http::field::metadata::section::storage::Bytes,
+                        <#schema as #ns_core::route::Schema>::Frame,
                     >,
-                ),
+                    #schema,
+                >
+            };
+            let length = quote!(::core::option::Option<::core::primitive::usize>);
+            let duplex_length =
+                (item.kind == spec::Kind::Duplex).then(|| quote!(content_length: #length,));
+            slots.extend(quote! {
+                #[doc(hidden)]
+                #vis struct #slot { head: #parsed, #duplex_length }
+                impl #ns_core::decode::state::Slot<#exec> for #slot {
+                    fn prepare(self) -> #exec { #exec::#variant(self) }
+                }
+            });
+            variants.extend(quote!(#variant(#parsed, #length),));
+            bodies.extend(quote! {
+                #variant(#ns_core::decode::Call<
+                    #parsed,
+                    #ns_core::body::Scoped<#l_input, 'd, <#schema as #ns_core::route::Schema>::Body>,
+                >),
             });
             errors.extend(quote! {
                 #variant(<#schema as #ns_core::route::Project>::Error<#l_input>),
@@ -211,14 +220,13 @@ impl Decode {
                 Self::#variant(#n_error) => #ns_core::route::Never::never(#n_error),
             });
             if !entry.guards.is_empty() {
-                let slot = &item.request;
                 let open = format_ident!("{variant}Open");
                 let finished = format_ident!("{variant}Finished");
                 let (enter, leave) = match item.kind {
-                    spec::Kind::Sync => (quote!(sync_open), quote!(sync_done)),
-                    spec::Kind::Fiber => (quote!(task_open), quote!(task_done)),
-                    spec::Kind::Duplex => (quote!(duplex_open), quote!(duplex_done)),
-                    spec::Kind::Stream => (quote!(reject_open), quote!(reject_done)),
+                    spec::Kind::Duplex => (quote!(duplex), quote!(duplex)),
+                    spec::Kind::Sync | spec::Kind::Fiber | spec::Kind::Stream => {
+                        (quote!(open), quote!(finished))
+                    }
                 };
                 let (take, put) = match item.kind {
                     spec::Kind::Duplex => (
@@ -232,6 +240,19 @@ impl Decode {
                         quote! { #slot { head: #v_head } },
                     ),
                 };
+                let rejection = handle::guard_rejection(
+                    paths,
+                    symbols,
+                    &entry.guards,
+                    state_ty,
+                    &app,
+                    quote!(#n_encode),
+                    quote! {
+                        ::core::mem::drop(#n_encode);
+                        let #v_head = #v_head.into_inner();
+                        return ::core::ops::ControlFlow::Continue(#put);
+                    },
+                );
                 let guard = quote! {
                     {
                         #take
@@ -248,44 +269,30 @@ impl Decode {
                                     ::core::option::Option::Some(#n_head.path()),
                                     #n_head.authority(),
                                 );
-                            match <#head_slot as #ns_core::route::guard::Slot<#state_ty>>::try_admit(
-                                #n_ghead, #app, #n_encode,
-                            ).map_continue(::core::mem::drop) {
-                                ::core::ops::ControlFlow::Continue(()) => {
-                                    let #v_head = #v_head.into_inner();
-                                    ::core::ops::ControlFlow::Continue(#put)
+                            ::core::ops::ControlFlow::Break(match #rejection {
+                                ::core::result::Result::Ok(#n_prep) => {
+                                    ::core::result::Result::Ok(#ns_core::decode::Lineage::resolve_head(
+                                        #n_prep, #v_head.into_owner(),
+                                    ))
                                 }
-                                ::core::ops::ControlFlow::Break(::core::result::Result::Ok(#n_prep)) => {
-                                    let #n_prep =
-                                        #ns_core::decode::Lineage::resolve_head(
-                                            #n_prep,
-                                            #v_head.into_owner(),
-                                        );
-                                    ::core::ops::ControlFlow::Break(
-                                        ::core::result::Result::Ok(#n_prep),
-                                    )
+                                ::core::result::Result::Err((#n_error, #n_encode)) => {
+                                    ::core::result::Result::Err((
+                                        #ns_core::decode::dispatch::Error::Encode(#n_error),
+                                        #n_encode,
+                                    ))
                                 }
-                                ::core::ops::ControlFlow::Break(
-                                    ::core::result::Result::Err((#n_error, #n_encode)),
-                                ) => {
-                                    ::core::ops::ControlFlow::Break(
-                                        ::core::result::Result::Err((
-                                            #ns_core::decode::dispatch::Error::Encode(#n_error),
-                                            #n_encode,
-                                        )),
-                                    )
-                                }
-                            }
+                            })
                         })
                     }
                 };
-                for (phase, visit) in [(&open, enter), (&finished, leave)] {
+                for (phase, resolve) in [(&open, enter), (&finished, leave)] {
                     admits.extend(quote! {
                         #guarded::#phase(#n_slot, #n_body) => {
                             let #n_result = #guard;
-                            let (#n_slot, #n_body) = #ns_core::decode::state::admit::TryVisit::#visit(
-                                #n_visit, #n_result, #n_body,
-                            )?;
+                            let (#n_slot, #n_body) =
+                                <#g_g as #ns_core::decode::state::admit::Resolve<#g_f>>::#resolve(
+                                    #n_result, #n_body,
+                                )?;
                             ::core::ops::ControlFlow::Continue(#request::#phase(#n_slot, #n_body))
                         },
                     });
@@ -379,15 +386,11 @@ impl Decode {
                 },
             });
         }
-        let vis = &spec.vis;
-        let slots = &state.slots;
         let flow = &state.definition;
         let plan_definition = &head.plan;
-        let guard_impls = handle::emit_guards(paths, spec, entries);
         let definitions = quote! {
             #plan_definition
-            #( #slots )*
-            #( #guard_impls )*
+            #slots
             #[doc(hidden)]
             #vis enum #head_ty { #variants }
             #flow
@@ -530,25 +533,13 @@ impl Decode {
                             #l_req,
                             #l_driver,
                         >,
-                        #g_f: #ns_core::decode::state::Set,
-                        #g_g: #ns_core::decode::state::Set,
-                        #g_v: #ns_core::decode::state::admit::TryVisit<
-                            #exec,
-                            #g_f,
-                            #g_g,
-                            <#g_e as #ns_core::decode::Encode<
-                                #l_req, #l_driver,
-                            >>::Error,
-                        >,
+                        #g_f: #ns_core::decode::state::admit::Bodies,
+                        #g_g: #ns_core::decode::state::admit::Resolve<#g_f>,
                     >(
                         &self,
                         #n_req: #ns_core::decode::request::Guarded<#guarded<#g_f>>,
                         #n_encode: #g_e,
-                        #n_visit: &mut #g_v,
-                    ) -> ::core::ops::ControlFlow<
-                        #g_v::Break<#g_e::Prepared, #g_e::Target>,
-                        #request<#g_g>,
-                    > {
+                    ) -> #ns_core::decode::Admission<#l_req, #l_driver, Self, #g_e, #g_f, #g_g> {
                         let (#n_req, #n_method) = #n_req.into_parts();
                         match #n_req {
                             #admits

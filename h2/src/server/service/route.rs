@@ -124,14 +124,14 @@ impl<H: Handler> decode::Decode for Route<H> {
             E::Target,
         ),
     > {
-        use sark_http::payload::response::dispatch::Immediate;
+        use sark_http::payload::response::dispatch::Complete;
 
         let (prepared, body) = request.into_parts();
         let head = prepared.into_head();
         head.scope(|head| {
             let encoder = decode::Encode::begin_head(encoder, head.owner().view());
             let request = Request::new(&head, body.into_inner());
-            let prepared = Immediate::emit(self.handler.handle(request), encoder)
+            let prepared = Complete::complete(self.handler.handle(request), encoder)
                 .map_err(|(error, encoder)| (dispatch::Error::Encode(error), encoder))?;
             Ok(decode::Lineage::resolve_head(prepared, head))
         })

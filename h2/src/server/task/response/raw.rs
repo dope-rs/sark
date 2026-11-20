@@ -182,75 +182,73 @@ where
         self.drive.mode.observe(life::Event::TaskAdmitted(call));
     }
 
-    fn sync(self, input: request::Admitted<exec::Sync, R::Prepared, Buffer<'d>>) {
-        self.complete(input, |mut this, input| {
-            let call = identify(this.drive.conn, this.stream);
-            this.drive.mode.observe(life::Event::BuildReady(call));
-            this.drive
-                .queue(this.stream, response::Response::Sync(input));
-        });
+    fn sync(mut self, input: request::Admitted<exec::Sync, R::Prepared, Buffer<'d>>) {
+        if let Some(input) = self.complete(input) {
+            self.drive
+                .queue(self.stream, response::Response::Sync(input));
+        }
     }
 
-    fn task(self, input: request::Admitted<exec::Task, R::Prepared, Buffer<'d>>) {
-        self.complete(input, |mut this, input| {
-            let call = identify(this.drive.conn, this.stream);
-            this.drive.mode.observe(life::Event::BuildReady(call));
-            let result =
-                match this
-                    .drive
-                    .tasks
-                    .vacant(this.drive.index, this.drive.conn, this.stream)
-                {
-                    Ok(vacant) => vacant
-                        .try_insert(|target| {
-                            Runtime::try_dispatch(
-                                this.drive.router.as_mut(),
-                                input,
-                                target,
-                                owner::Owner::from(this.drive.conn),
-                                this.drive.parent,
-                            )
-                        })
-                        .map_err(BranchError::Second),
-                    Err(error) => Err(BranchError::First(error)),
-                };
-            if let Err(cause) = result {
-                let code = match &cause {
-                    BranchError::First(error) => error.code(),
-                    BranchError::Second(error) => ingress::errors::reject_code(R::rejection(error)),
-                };
-                this.drive.reset(this.stream, code);
-                return;
-            }
-            this.drive.mode.observe(life::Event::TaskAdmitted(call));
-        });
+    fn task(mut self, input: request::Admitted<exec::Task, R::Prepared, Buffer<'d>>) {
+        let Some(input) = self.complete(input) else {
+            return;
+        };
+        let result = match self
+            .drive
+            .tasks
+            .vacant(self.drive.index, self.drive.conn, self.stream)
+        {
+            Ok(vacant) => vacant
+                .try_insert(|target| {
+                    Runtime::try_dispatch(
+                        self.drive.router.as_mut(),
+                        input,
+                        target,
+                        owner::Owner::from(self.drive.conn),
+                        self.drive.parent,
+                    )
+                })
+                .map_err(BranchError::Second),
+            Err(error) => Err(BranchError::First(error)),
+        };
+        if let Err(cause) = result {
+            let code = match &cause {
+                BranchError::First(error) => error.code(),
+                BranchError::Second(error) => ingress::errors::reject_code(R::rejection(error)),
+            };
+            self.drive.reset(self.stream, code);
+            return;
+        }
+        let call = identify(self.drive.conn, self.stream);
+        self.drive.mode.observe(life::Event::TaskAdmitted(call));
     }
 
     fn complete<K>(
-        mut self,
+        &mut self,
         input: request::Admitted<K, R::Prepared, Buffer<'d>>,
-        ready: impl FnOnce(Self, request::Ready<K, R::Prepared, owned::Segments<'d>>),
-    ) {
+    ) -> Option<request::Admitted<K, R::Prepared, body::Body<owned::Segments<'d>>>> {
         let call = identify(self.drive.conn, self.stream);
         let result = self.drive.state.body_credit.scope(|mut ledger| {
-            let input = input.try_map_body(|body| {
-                // SAFETY: Finish retains this selected or newly admitted body
-                // in the exact Book that owns this account until settlement.
-                let body = unsafe { ledger.bind(body) };
-                body.try_finish(&mut ledger, self.drive.mode.body(call))
-            });
-            match input {
-                Ok(input) => Ok(input.ready()),
-                Err(failure) => Err(payload::release_rejected(
-                    failure,
-                    &mut ledger,
-                    &mut self.drive.mode.body(call),
-                )),
-            }
+            input
+                .try_map_body(|body| {
+                    // SAFETY: Finish retains this selected or newly admitted body
+                    // in the exact Book that owns this account until settlement.
+                    let body = unsafe { ledger.bind(body) };
+                    body.try_finish(&mut ledger, self.drive.mode.body(call))
+                })
+                .map_err(|failure| {
+                    payload::release_rejected(failure, &mut ledger, &mut self.drive.mode.body(call))
+                })
         });
         match result {
-            Ok(input) => ready(self, input),
-            Err(code) => self.drive.reset(self.stream, code),
+            Ok(input) => {
+                self.drive.mode.observe(life::Event::BuildReady(call));
+                Some(input)
+            }
+            Err(code) => {
+                self.drive.reset(self.stream, code);
+                None
+            }
         }
     }
 }

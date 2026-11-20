@@ -46,8 +46,7 @@ fn retains_without_alloc() {
                     assert!(matches!(pushed, buffered::Push::Accepted));
                     finished
                 })
-                .expect("buffered request must finish")
-                .ready();
+                .expect("buffered request must finish");
             assert_eq!(request.prepared().len, bytes.len());
             assert_eq!(request.body().len(), bytes.len());
             let source = request.into_body().into_source();

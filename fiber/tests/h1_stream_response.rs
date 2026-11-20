@@ -9,13 +9,11 @@ use std::{
     time::Duration,
 };
 
-use common::server::{peer::Endpoint as _, recover};
 use common::{
     route::body::stream::*,
-    server::{self, Plan},
+    server::{self, Plan, peer::Endpoint as _},
 };
 use dope::{
-    core::driver::life::recovery::Policy,
     net::wire::{self, domain},
     runtime::executor::session,
 };
@@ -38,24 +36,14 @@ fn pending_chunks_complete() {
         .check(
             |context, listener| {
                 let mut reports = Plan::try_reports(&server).expect("server descriptor claims");
-                let result = StreamPendingDispatch::serve(
+                let result = server::serve::<StreamPendingDispatch, _>(
                     server.with_bound(listener),
                     context,
                     (),
-                    Config::new(server::MAX_CONNECTIONS),
-                    Policy::new(|event| reports.push(event), recover),
-                    |result| {
-                        result
-                            .as_ref()
-                            .map(|_| ())
-                            .map_err(|error| error.cause())
-                            .expect("server")
-                    },
+                    server::MAX_CONNECTIONS,
+                    &mut reports,
                 );
-                assert!(
-                    reports.events().expect("reclaimed resources").is_empty(),
-                    "server retirement: {reports:?}"
-                );
+                server::reclaimed(&reports);
                 result
             },
             |bind| {
@@ -92,18 +80,14 @@ fn streams_response() {
         .check(
             |context, listener| {
                 let mut reports = Plan::try_reports(&server).expect("server descriptor claims");
-                let result = StreamDispatch::serve(server.with_bound(listener), context,
+                let result = server::serve::<StreamDispatch, _>(
+                    server.with_bound(listener),
+                    context,
                     State(|result| result.expect("stream response")),
-                    Config::new(server::MAX_CONNECTIONS),
-                    Policy::new(
-                        |event| reports.push(event),
-                        recover,
-                    ),
-                    |result| {
-                        result.as_ref().map(|_| ()).map_err(|error| error.cause()).expect("server")
-                    },
+                    server::MAX_CONNECTIONS,
+                    &mut reports,
                 );
-                assert!(reports.events().expect("reclaimed resources").is_empty(), "server retirement: {reports:?}");
+                server::reclaimed(&reports);
                 result
             },
             |bind| {
@@ -199,7 +183,7 @@ fn late_failure_closes() {
                             ),
                         ).expect("install").as_ref().map_err(run::Failure::cause).expect("session");
                     })),
-                    Policy::new(|event| reports.push(event), recover),
+                    server::reporting(&mut reports),
                     |result| { result.as_ref().map_err(|error| error.cause()).expect("retirement"); },
                 );
                 assert!(reports.events().expect("reclaimed resources").is_empty());

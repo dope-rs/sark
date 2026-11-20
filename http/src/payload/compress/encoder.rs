@@ -2,7 +2,7 @@
 
 use std::{mem, num};
 
-use compress::Gzip;
+use compress::{Error, Gzip};
 use miniz_oxide::deflate::core::{
     CompressorOxide, TDEFLFlush, TDEFLStatus, compress, create_comp_flags_from_zip_params,
 };
@@ -17,6 +17,15 @@ use crate::payload::{compress, crc32::Hasher};
 const HEADER: usize = 10;
 const TRAILER: usize = 8;
 pub(super) const FRAMING: usize = HEADER + TRAILER;
+pub(super) const MAX_INPUT: usize = {
+    let mut len = Gzip::CAPACITY.get();
+    while HEADER + len + (len >> 12) + (len >> 14) + (len >> 25) + 13 + TRAILER
+        > Gzip::CAPACITY.get()
+    {
+        len -= 1;
+    }
+    len
+};
 
 /// Compression level handed to deflate within its closed 1..=10 range.
 const LEVEL: i32 = 3;
@@ -35,15 +44,7 @@ impl Encoder {
         ))
     }
 
-    /// Gzip extent bounded by zlib's `deflateBound`, including framing and
-    /// stored-block overhead for the input length.
-    pub(super) const fn bound(&self, len: usize) -> usize {
-        HEADER + len + (len >> 12) + (len >> 14) + (len >> 25) + 13 + TRAILER
-    }
-
-    /// Encodes one gzip member, resetting the encoder so no previous stream's
-    /// dictionary state leaks in. A refused or partial stream reports
-    /// `None` so the caller keeps its payload.
+    /// Encodes one gzip member within the requested extent.
     pub(super) fn encode(
         &mut self,
         src: &[u8],
@@ -51,10 +52,15 @@ impl Encoder {
             '_,
             pool::Fixed<{ Gzip::SLOTS.get() }, { Gzip::CAPACITY.get() }>,
         >,
-    ) -> Option<()> {
+        maximum: usize,
+    ) -> Result<(), Error> {
         let capacity = output.len();
         let bytes = output.as_mut_slice();
-        let room = capacity.checked_sub(HEADER + TRAILER)?;
+        let room = capacity.checked_sub(FRAMING).ok_or(Error::Extent {
+            wrote: 0,
+            capacity,
+            maximum,
+        })?;
         self.0.reset();
         let (status, read, wrote) = compress(
             &mut self.0,
@@ -63,12 +69,21 @@ impl Encoder {
             TDEFLFlush::Finish,
         );
         if status != TDEFLStatus::Done || read != src.len() {
-            return None;
+            return Err(Error::Deflate {
+                status,
+                read,
+                wrote,
+            });
         }
         let written = wrote
-            .checked_add(HEADER + TRAILER)
-            .filter(|written| *written <= capacity && *written < src.len())
-            .and_then(num::NonZero::new)?;
+            .checked_add(FRAMING)
+            .filter(|written| *written <= capacity && *written <= maximum)
+            .and_then(num::NonZero::new)
+            .ok_or(Error::Extent {
+                wrote,
+                capacity,
+                maximum,
+            })?;
         bytes[..HEADER].copy_from_slice(&[0x1f, 0x8b, 0x08, 0, 0, 0, 0, 0, 0, 0xff]);
         let end = written.get() - TRAILER;
         let mut checksum = self.1.clone();
@@ -80,7 +95,7 @@ impl Encoder {
         // SAFETY: deflate reported a complete stream and the exact nonzero extent
         // was bounded above while this output stayed borrowed by its owner.
         unsafe { output.complete(written) };
-        Some(())
+        Ok(())
     }
 }
 

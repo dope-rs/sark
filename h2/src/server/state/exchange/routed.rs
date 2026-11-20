@@ -6,7 +6,7 @@ use sark_core::{
     decode::{request, state},
 };
 
-use crate::server::{payload, payload::Buffer, state::exchange::Input};
+use crate::server::{payload, payload::Buffer};
 
 pub(crate) struct Pending<'d>(PhantomData<&'d ()>);
 
@@ -33,6 +33,10 @@ impl<'d> state::Set for Accepted<'d> {
     type UnsupportedOpen = Buffer<'d>;
     type UnsupportedFinished = Buffer<'d>;
 }
+
+impl state::admit::Payload for Accepted<'_> {}
+impl state::admit::Bodies for Pending<'_> {}
+impl state::admit::Bodies for Accepted<'_> {}
 
 impl<'d> state::Finish for Pending<'d> {
     fn sync(body: Buffer<'d>) -> Buffer<'d> {
@@ -65,7 +69,7 @@ impl<'d, P> state::Map<P, state::Routed, Pending<'d>> for Prepare<'d> {
         slot: S,
         body: admit::Track<admit::Open>,
     ) -> ControlFlow<Infallible, ((), S, Buffer<'d>)> {
-        ControlFlow::Continue(((), slot, <state::Routed as Input<'d>>::sync(body)))
+        ControlFlow::Continue(((), slot, body.into()))
     }
 
     fn sync_done<S: state::Slot<P>>(
@@ -73,7 +77,7 @@ impl<'d, P> state::Map<P, state::Routed, Pending<'d>> for Prepare<'d> {
         slot: S,
         body: admit::Track<admit::Finished>,
     ) -> ControlFlow<Infallible, ((), S, Buffer<'d>)> {
-        ControlFlow::Continue(((), slot, <state::Routed as Input<'d>>::sync_done(body)))
+        ControlFlow::Continue(((), slot, body.into()))
     }
 
     fn task_open<S: state::Slot<P>>(
@@ -81,7 +85,7 @@ impl<'d, P> state::Map<P, state::Routed, Pending<'d>> for Prepare<'d> {
         slot: S,
         body: admit::Track<admit::Open>,
     ) -> ControlFlow<Infallible, ((), S, Buffer<'d>)> {
-        ControlFlow::Continue(((), slot, <state::Routed as Input<'d>>::task(body)))
+        ControlFlow::Continue(((), slot, body.into()))
     }
 
     fn task_done<S: state::Slot<P>>(
@@ -89,7 +93,7 @@ impl<'d, P> state::Map<P, state::Routed, Pending<'d>> for Prepare<'d> {
         slot: S,
         body: admit::Track<admit::Finished>,
     ) -> ControlFlow<Infallible, ((), S, Buffer<'d>)> {
-        ControlFlow::Continue(((), slot, <state::Routed as Input<'d>>::task_done(body)))
+        ControlFlow::Continue(((), slot, body.into()))
     }
 
     fn duplex_open<S: state::Slot<P>>(
@@ -97,7 +101,7 @@ impl<'d, P> state::Map<P, state::Routed, Pending<'d>> for Prepare<'d> {
         slot: S,
         (): (),
     ) -> ControlFlow<Infallible, ((), S, Option<segments::Chain<resident::Shared<'d>>>)> {
-        ControlFlow::Continue(((), slot, <state::Routed as Input<'d>>::duplex(())))
+        ControlFlow::Continue(((), slot, None))
     }
 
     fn duplex_done<S: state::Slot<P>>(
@@ -105,7 +109,7 @@ impl<'d, P> state::Map<P, state::Routed, Pending<'d>> for Prepare<'d> {
         slot: S,
         (): (),
     ) -> ControlFlow<Infallible, ((), S, Option<segments::Chain<resident::Shared<'d>>>)> {
-        ControlFlow::Continue(((), slot, <state::Routed as Input<'d>>::duplex_done(())))
+        ControlFlow::Continue(((), slot, None))
     }
 
     fn reject_open<S: state::Slot<P>>(
@@ -113,7 +117,7 @@ impl<'d, P> state::Map<P, state::Routed, Pending<'d>> for Prepare<'d> {
         slot: S,
         body: admit::Track<admit::Open>,
     ) -> ControlFlow<Infallible, ((), S, Buffer<'d>)> {
-        ControlFlow::Continue(((), slot, <state::Routed as Input<'d>>::other(body)))
+        ControlFlow::Continue(((), slot, body.into()))
     }
 
     fn reject_done<S: state::Slot<P>>(
@@ -121,7 +125,7 @@ impl<'d, P> state::Map<P, state::Routed, Pending<'d>> for Prepare<'d> {
         slot: S,
         body: admit::Track<admit::Finished>,
     ) -> ControlFlow<Infallible, ((), S, Buffer<'d>)> {
-        ControlFlow::Continue(((), slot, <state::Routed as Input<'d>>::other_done(body)))
+        ControlFlow::Continue(((), slot, body.into()))
     }
 }
 

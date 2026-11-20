@@ -18,7 +18,7 @@ use crate::{
         response::{Encoder, Handoff},
         state::{
             Transitions,
-            exchange::{self, Accepted, Input, Plain, admit},
+            exchange::{self, Accepted, Input, admit},
         },
         task::{
             app::{drive::Drive, header},
@@ -68,7 +68,7 @@ where
         mut report: impl FnMut(Id<'d, ID>, stream::Key, &dyn std::fmt::Debug),
     ) -> Result<(), conn::Error>
     where
-        I: Input<'d>,
+        I: Input<'d> + state::admit::Bodies,
     {
         let mut head = self;
         let call = identify(head.conn, stream);
@@ -201,8 +201,6 @@ impl<'d, R, U> Begin<'d, R> for request::Plain<U>
 where
     R: Runtime<'d>,
     U: state::Admission<
-        R::Prepared,
-        state::Routed,
         Accepted<'d>,
         Output = <<R::Prepared as request::Prepared>::Family as state::Family<
             R::Prepared,
@@ -220,7 +218,7 @@ where
         Q: Transitions<Id<'d, ID>>,
         Q::Retention: Handoff,
     {
-        let input = Plain::new().admit::<R::Prepared, state::Routed, U>(self.into_state());
+        let input = state::Admission::<Accepted<'d>>::admit(self.into_state());
         // SAFETY: Plain admission just created this uncharged body for this Book.
         unsafe { header::raw::accept(head, stream, input) }
     }

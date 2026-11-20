@@ -44,18 +44,6 @@ impl<H, B> Direct<H, B> {
     }
 }
 
-impl<'req, 'd, H, B> dispatch::IntoOutput<'req, 'd> for Direct<H, B>
-where
-    H: headers::Source,
-    B: TryBody,
-{
-    type Output = Self;
-
-    fn into_output(self) -> Self::Output {
-        self
-    }
-}
-
 impl<'req, 'd, H, B> dispatch::Complete<'req, 'd> for Direct<H, B>
 where
     H: headers::Source,

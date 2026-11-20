@@ -1,6 +1,6 @@
 use o3::buffer::resident;
 use sark_core::{
-    body::credit,
+    body::{Body, credit},
     decode::{self, exec, request, state},
     manifold::schedule::typed,
 };
@@ -186,7 +186,8 @@ pub(super) unsafe fn discard(
 pub(super) unsafe fn try_body<'d, R: decode::Decode>(
     input: Receiving<'d, R>,
     account: &mut credit::raw::Account,
-) -> Result<request::Ready<exec::Sync, R::Prepared, owned::Segments<'d>>, numbers::ErrorCode> {
+) -> Result<request::Admitted<exec::Sync, R::Prepared, Body<owned::Segments<'d>>>, numbers::ErrorCode>
+{
     account.scope(|mut ledger| {
         input
             .try_map_body(|body| {
@@ -194,7 +195,6 @@ pub(super) unsafe fn try_body<'d, R: decode::Decode>(
                 let body = unsafe { ledger.bind(body) };
                 body.try_finish(&mut ledger, credit::Disabled::new())
             })
-            .map(request::Admitted::ready)
             .map_err(|failure| {
                 payload::release_rejected(failure, &mut ledger, &mut credit::Disabled::new())
             })

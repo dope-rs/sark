@@ -11,19 +11,18 @@ use crate::{
     },
 };
 
-pub(crate) struct Pending<R: route::Spec, C = framing::Plain> {
+pub(crate) struct Pending<R: route::Spec> {
     pub(crate) head: Parsed<storage::Shared, R>,
     pub(crate) state: session::BodyAwait,
     pub(crate) expectation: expect::Decision,
     pub(crate) declared_body_len: Length,
     pub(crate) connection: head::Connection,
     pub(crate) response: response::Context,
-    pub(crate) coding: C,
 }
 
-impl<R: route::Spec, C> Pending<R, C> {
+impl<R: route::Spec> Pending<R> {
     pub(in crate::wire::parsing::framing) fn new(
-        base: framing::Head<'_, '_, R, C>,
+        base: framing::Head<'_, '_, R>,
         consumed: usize,
         length: Length,
     ) -> Result<Self, parsing::Request<R::Request>> {
@@ -35,7 +34,6 @@ impl<R: route::Spec, C> Pending<R, C> {
             declared_body_len: length,
             connection: base.connection,
             response: base.response,
-            coding: base.coding,
         })
     }
 }

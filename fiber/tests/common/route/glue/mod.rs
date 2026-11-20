@@ -72,7 +72,7 @@ impl<'a> Wire<'a> {
         else {
             return Ok(None);
         };
-        head::Parsed::<R::RawHeaders>::parse::<R>(&request, max).map_err(Failure::Head)
+        head::Parsed::<R::RawHeaders>::parse::<R, false>(&request, max).map_err(Failure::Head)
     }
 }
 

@@ -1,11 +1,14 @@
-use sark_core::decode::{self, exec, request};
+use sark_core::{
+    body::Body,
+    decode::{self, exec, request},
+};
 use sark_http::payload::owned;
 
 use crate::server::{payload, response, state::exchange::Deferred, sync::book::Delayed};
 
 pub(in crate::server::sync) enum Phase<'d, R: decode::Decode> {
     Routed(Delayed<'d, R>),
-    Request(request::Ready<exec::Sync, R::Prepared, owned::Segments<'d>>),
+    Request(request::Admitted<exec::Sync, R::Prepared, Body<owned::Segments<'d>>>),
     Status(response::Status),
     Head(response::Head<'d>),
 }
