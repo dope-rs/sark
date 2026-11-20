@@ -182,7 +182,7 @@ impl<'d, A: Spec, W: wire::Spec, F, E: data::raw::Payload<'d>> App<'d, A, W, F, 
         conn: &mut Context<'_, '_, '_, '_, 'w, 'd, ID, A, W, E>,
         driver: &mut driver::Context<'_, 'd>,
         egress: schedule::Egress,
-        mut source: Option<Turn<'_, 'w, 'd, W>>,
+        mut source: Option<&mut Turn<'_, 'w, 'd, W>>,
     ) where
         'd: 'w,
         A: app::Application<'d, crate::conn::event::Ignore, conn::Id<'d, ID>>,
@@ -191,12 +191,14 @@ impl<'d, A: Spec, W: wire::Spec, F, E: data::raw::Payload<'d>> App<'d, A, W, F, 
         T: Deadline<'d, ID, A, W, F, E>,
     {
         let wake = conn.wake_target();
-        let error =
-            drain::Progress::error(self.resume(conn, driver, egress, source.as_mut()), wake);
-        if let Some(error) = error
+        let result = self.resume(conn, driver, egress, source.as_deref_mut());
+        if source.as_deref().is_some_and(Turn::is_failed) {
+            return;
+        }
+        if let Some(error) = drain::Progress::error(result, wake)
             && !input::pending(conn, &error)
         {
-            if let Some(source) = &mut source {
+            if let Some(source) = source {
                 source.discard();
             }
             self.fail(conn, driver, error);
@@ -360,19 +362,20 @@ where
         self.retention
     }
 
-    fn scoped_chunk<'e>(
+    fn scoped_chunk<'s, 'e>(
         self: pin::Pin<&mut Self>,
         mut conn: conn::Ctx<'e, '_, '_, '_, 'w, 'd, ID, W, Self::Conn, Self::Egress>,
-        chunk: scoped::Input<'_, 'w, 'd, W>,
+        chunk: scoped::Input<'s, 'w, 'd, W>,
         driver: &mut driver::Context<'_, 'd>,
-    ) -> receive::Outcome {
+    ) -> Result<receive::Outcome, scoped::Pending<'s>> {
+        let mut source = Turn::new(chunk);
         self.get_mut().activate::<ID, A::Timing>(
             &mut conn,
             driver,
             schedule::Egress::Unchanged,
-            Some(Turn::new(chunk)),
+            Some(&mut source),
         );
-        receive::Outcome::Continue
+        source.settle()
     }
 }
 

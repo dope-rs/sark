@@ -79,9 +79,7 @@ fn definitions(
     };
     let endpoint = match wire {
         Wire::Identity => quote::quote! {
-            let #v_wire = #ns_fiber::dope::net::wire::domain::Local::<
-                #ty, #g_list,
-            >::new(#v_wire);
+            let #v_wire = #ns_fiber::dope::net::wire::domain::Local::new(#v_wire);
         },
         Wire::Generic => quote::quote! {
             let #v_wire = #v_stage.storage().0.bind(#v_wire).map_err(|#v_error| {
@@ -95,8 +93,8 @@ fn definitions(
     let input = duplex.input_type(paths);
     let run = quote::quote! {
         #v_plan.install(#v_stage, #v_wire, #v_app, |#v_root, #v_wait, #v_stage| {
-            #ns_h1::server::run::session(
-                #v_stage.with_app(#v_finish, #v_root, |#v_app| #ns_h1::server::run::run(#v_wait, #v_app)),
+            #v_wait.watch().finish(
+                #v_stage.with_app(#v_finish, #v_root, |#v_app| #v_wait.run(#v_app)),
             )
         }).map_err(|#v_error| #ns_h1::server::run::Failure::Install(
             #ns_fiber::dope::core::BranchError::Second(#v_error),

@@ -62,12 +62,12 @@ fn ingress_yields() {
                     );
                     server.state.layout.set(Some(router.layout()));
                     let wire =
-                        wire::domain::Local::<wire::Identity, KeyTag<ROUTE>>::new(wire::Identity);
+                        wire::domain::Local::new(wire::Identity);
                     plan.tasks(router, 8)
                         .observe(Log(&facts, |cause: &dyn fmt::Debug| {
                             eprintln!("lifecycle diagnostic: {cause:?}");
                         }))
-                        .try_install(stage, wire, timers::Disabled, |listener, _wait, stage| {
+                        .try_install::<wire::Identity, _, _, _, _, _, _>(stage, wire, timers::Disabled, |listener, _wait, stage| {
                             stage
                                 .with_quiesce(
                                     &mut done,

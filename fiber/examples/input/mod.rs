@@ -1,6 +1,5 @@
 use std::net::SocketAddr;
 
-use cartel_pg::protocol::PickPolicy;
 pub use clap::Error;
 use clap::{Arg, ArgMatches, Command, error::ErrorKind, parser::MatchesError};
 
@@ -11,6 +10,12 @@ pub struct Bind {
 pub struct Redis {
     pub bind: Bind,
     pub redis_addr: SocketAddr,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub enum PickPolicy {
+    RoundRobin,
+    LeastInflight,
 }
 
 pub struct Postgres {

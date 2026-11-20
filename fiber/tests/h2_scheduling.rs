@@ -190,7 +190,7 @@ fn close_cancels_once() {
             |worker| {
                 worker.lend(|plan, stage| {
                     Brand::with(|brand| {
-                        let wire = wire::domain::Local::<wire::Identity, KeyTag<ROUTE>>::new(
+                        let wire = wire::domain::Local::new(
                             wire::Identity,
                         );
                         plan.tasks((), 2)
@@ -381,10 +381,10 @@ fn burst_wakes_siblings() {
                     );
                     server.state.layout.set(Some(router.layout()));
                     let wire =
-                        wire::domain::Local::<wire::Identity, KeyTag<ROUTE>>::new(wire::Identity);
+                        wire::domain::Local::new(wire::Identity);
                     plan.tasks(router, TASKS)
                         .observe(Log(&facts, diagnose))
-                        .try_install(stage, wire, timers::Disabled, |listener, _wait, stage| {
+                        .try_install::<wire::Identity, _, _, _, _, _, _>(stage, wire, timers::Disabled, |listener, _wait, stage| {
                             let start = stage.driver().driver_ref().clock().now().into();
                             stage
                                 .with_at_for(
@@ -533,10 +533,10 @@ fn renewals_precede_ready_tasks() {
                     .try_with(deadline::Phase::Handler, Duration::from_secs(1))
                     .expect("handler deadline");
                     let wire =
-                        wire::domain::Local::<wire::Identity, KeyTag<ROUTE>>::new(wire::Identity);
+                        wire::domain::Local::new(wire::Identity);
                     plan.tasks(router, 1)
                         .observe(Log(&facts, diagnose))
-                        .try_install(stage, wire, timer, |listener, _wait, stage| {
+                        .try_install::<wire::Identity, _, _, _, _, _, _>(stage, wire, timer, |listener, _wait, stage| {
                             let start = stage.driver().driver_ref().clock().now().into();
                             stage
                                 .with_at_for(

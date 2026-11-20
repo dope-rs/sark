@@ -129,9 +129,9 @@ impl RunMode for mode::Disabled {
             let router =
                 H2TaskApp::multiplexed::<wire::Identity, KeyTag<ROUTE>, _>(brand, state, fiber);
             state.layout.set(Some(router.layout()));
-            let wire = wire::domain::Local::<wire::Identity, KeyTag<ROUTE>>::new(wire::Identity);
+            let wire = wire::domain::Local::new(wire::Identity);
             plan.tasks(router, task_cap)
-                .try_install(stage, wire, timers::Disabled, |listener, _wait, stage| {
+                .try_install::<wire::Identity, _, _, _, _, _, _>(stage, wire, timers::Disabled, |listener, _wait, stage| {
                     let result = stage
                         .run_quiesce(finish, Host::new(listener), Duration::from_secs(2))
                         .map_err(topology::Failure::Run)?;
@@ -156,9 +156,9 @@ impl RunMode for Config {
             let router =
                 H2TaskApp::multiplexed::<wire::Identity, KeyTag<ROUTE>, _>(brand, state, fiber);
             state.layout.set(Some(router.layout()));
-            let wire = wire::domain::Local::<wire::Identity, KeyTag<ROUTE>>::new(wire::Identity);
+            let wire = wire::domain::Local::new(wire::Identity);
             plan.tasks(router, task_cap)
-                .try_install(stage, wire, self, |listener, _wait, stage| {
+                .try_install::<wire::Identity, _, _, _, _, _, _>(stage, wire, self, |listener, _wait, stage| {
                     let result = stage
                         .run_quiesce(finish, Host::new(listener), Duration::from_secs(2))
                         .map_err(topology::Failure::Run)?;
@@ -186,10 +186,10 @@ where
             let router =
                 H2TaskApp::multiplexed::<wire::Identity, KeyTag<ROUTE>, _>(brand, state, fiber);
             state.layout.set(Some(router.layout()));
-            let wire = wire::domain::Local::<wire::Identity, KeyTag<ROUTE>>::new(wire::Identity);
+            let wire = wire::domain::Local::new(wire::Identity);
             plan.tasks(router, task_cap)
                 .observe(self.into_inner())
-                .try_install(stage, wire, timers::Disabled, |listener, _wait, stage| {
+                .try_install::<wire::Identity, _, _, _, _, _, _>(stage, wire, timers::Disabled, |listener, _wait, stage| {
                     let result = stage
                         .run_quiesce(finish, Host::new(listener), Duration::from_secs(2))
                         .map_err(topology::Failure::Run)?;

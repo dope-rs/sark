@@ -80,7 +80,7 @@ impl factory::Direct<KeyTag<0>, Bundle<tcp::Tcp, wire::Identity, Throughput>> fo
         Self: 'd;
     type Error = Infallible;
     type Wire<'d>
-        = Local<'d, wire::Identity, KeyTag<0>>
+        = Local<wire::Identity>
     where
         Self: 'd;
 
@@ -88,7 +88,7 @@ impl factory::Direct<KeyTag<0>, Bundle<tcp::Tcp, wire::Identity, Throughput>> fo
     where
         Self: 'd,
     {
-        Ok((self, Local::new(Default::default())))
+        Ok((self, Local::new(wire::Identity)))
     }
 }
 

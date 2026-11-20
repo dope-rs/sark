@@ -100,7 +100,7 @@ pub fn run(context: shutdown::ReadySource<'_>, listener: Listener) -> (Snapshot,
                     .expect("H2 app");
                     plan.prepare_in(
                         stage,
-                        domain::Local::<wire::Identity, _>::new(wire::Identity),
+                        domain::Local::new(wire::Identity),
                         |prepared, _wait, stage| {
                             let root = ConnectDispatch::cleartext_prepared(
                                 brand,
@@ -163,7 +163,7 @@ pub fn run_plain(context: shutdown::ReadySource<'_>, listener: Listener) {
             ).expect("H2 app");
             plan.prepare_in(
                 stage,
-                domain::Local::<wire::Identity, _>::new(wire::Identity),
+                domain::Local::new(wire::Identity),
                 |prepared, _wait, stage| {
                     let root = PlainDispatch::cleartext_prepared(
                         &(),

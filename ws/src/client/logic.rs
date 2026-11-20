@@ -1,5 +1,4 @@
 use codec::storage;
-use core::convert::Infallible;
 use std::{marker, mem};
 
 use bindings::endpoint::State;
@@ -428,26 +427,22 @@ impl<'life, 'e: 'life, 'd: 'e, ID: Identity + 'life, H, M>
         )
     }
 
-    fn sent() -> impl for<'a, 'x> Call<(
-        &'a mut Owner<'life, 'e, 'd, H, M, ID>,
-        conn::Id<'d, ID>,
-        egress::Pending,
-        &'x mut region::Token<region::Identity<'d, 1>>,
-    )> {
-        output::Sent::<_>::Ready(|owner: &mut Owner<'life, 'e, 'd, H, M, ID>| {
-            owner.root().shared.wake_waiter();
-        })
+    fn sent(
+        owner: &mut Owner<'life, 'e, 'd, H, M, ID>,
+        _: conn::Id<'d, ID>,
+        _: egress::Pending,
+        _: &mut region::Token<region::Identity<'d, 1>>,
+    ) {
+        owner.root().shared.wake_waiter();
     }
 
-    fn cancel() -> impl for<'a, 'x> Call<(
-        &'a Owner<'life, 'e, 'd, H, M, ID>,
-        Self::Send,
-        &'x mut region::Token<region::Identity<'d, 1>>,
-    )> {
-        output::Cancel::<Infallible, Infallible, Infallible, _, _>::Ready(
-            mem::drop,
-            |owner: &Owner<'life, 'e, 'd, H, M, ID>| owner.root().shared.wake_waiter(),
-        )
+    fn cancel(
+        owner: &Owner<'life, 'e, 'd, H, M, ID>,
+        payload: Self::Send,
+        _: &mut region::Token<region::Identity<'d, 1>>,
+    ) {
+        drop(payload);
+        owner.root().shared.wake_waiter();
     }
 }
 

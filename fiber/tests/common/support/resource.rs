@@ -196,11 +196,11 @@ where
     ) -> Self::Output {
         let mut finish = session::Completion::new();
         let target = owner.target;
-        let app = Routes::new(&self.state, Config::new(server::MAX_CONNECTIONS));
+        let app = Routes::new::<wire::Identity, _>(&self.state, Config::new(server::MAX_CONNECTIONS));
         self.plan
             .install(
                 stage,
-                domain::Local::<wire::Identity, KeyTag<0>>::new(wire::Identity),
+                domain::Local::new(wire::Identity),
                 app,
                 |root, _wait, stage| {
                     let build = Serve { app: root, target };

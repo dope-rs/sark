@@ -1,6 +1,6 @@
 [package]
 name = "sark-fiber"
-version.workspace = true
+version = "0.37.1"
 edition.workspace = true
 rust-version.workspace = true
 description = "Fiber execution extension for the Sark facade"

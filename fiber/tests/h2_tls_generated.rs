@@ -117,7 +117,7 @@ fn shares_driver_storage_with_h1() {
                                 Brand::with(|h2_brand| {
                                     h1.prepare_in(
                                         stage,
-                                        wire::domain::Local::<wire::Identity, _>::new(wire::Identity),
+                                        wire::domain::Local::new(wire::Identity),
                                         |h1, wait, stage| {
                                             let tasks = h2.tasks((), 1);
                                             let tasks = if phase == Some(deadline::Phase::Total) {
@@ -181,20 +181,20 @@ fn shares_driver_storage_with_h1() {
                                                         ).expect("partial HTTP head deadline");
                                                         let listener = h2.build(h2_app, timer, &mut stage.driver())
                                                             .expect("timed TLS listener");
-                                                        run::session::<Infallible, _>(stage.with_app(
+                                                        wait.watch().finish::<Infallible, _>(stage.with_app(
                                                             &mut finish,
                                                             server::accept::Listeners::new(root, Host::new(listener)),
-                                                            |app| run::run(wait, app),
+                                                            |app| wait.run(app),
                                                         )).as_ref().map_err(run::Failure::cause).expect("timed TLS session");
                                                     } else {
                                                         let listener = h2.build(
                                                             h2_app, sark_h2::server::task::timers::Disabled,
                                                             &mut stage.driver(),
                                                         ).expect("TLS listener");
-                                                        run::session::<Infallible, _>(stage.with_app(
+                                                        wait.watch().finish::<Infallible, _>(stage.with_app(
                                                             &mut finish,
                                                             server::accept::Listeners::new(root, Host::new(listener)),
-                                                            |app| run::run(wait, app),
+                                                            |app| wait.run(app),
                                                         )).as_ref().map_err(run::Failure::cause).expect("TLS session");
                                                     }
                                                     calls.set(state.0.get());

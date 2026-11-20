@@ -1,7 +1,6 @@
 use crate::{macros::tokens::local, runtime::paths::Paths};
 
 mod chunk;
-mod report;
 use crate::app::serve::{
     duplex,
     handle::h1::{routes, types},
@@ -318,29 +317,24 @@ pub(super) fn build(
         } else {
             quote!(#retire)
         };
-        let send_policy = if mixed {
-            quote!(#ns_fiber::dope::manifold::network::listener::handler::send::Run)
-        } else {
-            quote!(#ns_fiber::dope::manifold::network::listener::handler::send::Reported<
-                #ns_fiber::dope::manifold::network::listener::handler::send::Run,
-            >)
-        };
         let (send, start, eof, gate, recv, stop, input, gated, scratch) = {
             let dispatch = &types.names.dispatch_ident;
             let v_routes = symbols.local("routes");
             let v_slot = symbols.local("slot");
             let [n_drive] = symbols.locals(["__drive"]);
             let [n_prog, v_action] = symbols.locals(["__progress", "action"]);
-            let [v_budget, v_bytes, v_chunk] = symbols.locals(["budget", "bytes", "chunk"]);
+            let [v_bytes, v_chunk] = symbols.locals(["bytes", "chunk"]);
             let v_prefix = symbols.local("prefix");
             let [v_raw, v_tail] = symbols.locals(["raw", "tail"]);
-            let l_wire = types.names.generics.lifetime("__w");
+            let [l_wire, l_scope] = symbols.lives(["__w", "__scope"]);
             let g_r = types.names.generics.ident("__R");
             let ns_http = &paths.http;
 
             let ns_h2 = types.h2;
             let [v_pending, v_count, v_complete] = symbols.locals(["pending", "count", "complete"]);
-            let [v_state, v_h2] = symbols.locals(["state", "h2"]);
+            let v_state = symbols.local("state");
+            let [n_install_h2, v_h2, projection] =
+                symbols.locals(["__install_h2", "h2", "projection"]);
             let chunk_mut = mixed.then(|| quote!(mut));
             let clock = if mixed {
                 quote!(#v_date.as_ref().get_ref().0)
@@ -355,6 +349,9 @@ pub(super) fn build(
             };
             let duplex = proto.duplex;
             let slot = &proto.h1_slot;
+            let h2_state = quote!(#ns_h2::server::runtime::app::State<
+                'd, #g_h2a, #ns_fiber::dope::manifold::network::listener::conn::Id<'d, #g_id>,
+            >);
             let scoped_bounds = mixed.then(|| {
                 quote! {
                     #g_h2a: #ns_h2::server::app::Application<
@@ -363,10 +360,7 @@ pub(super) fn build(
                     >,
                     #http2: #ns_fiber::dope::manifold::network::listener::handler::Scoped<
                         #l_wire, 'd, #g_id, Wire = #g_wire, Egress = #egress,
-                        Conn = #ns_h2::server::runtime::app::State<
-                            'd, #g_h2a,
-                            #ns_fiber::dope::manifold::network::listener::conn::Id<'d, #g_id>,
-                        >,
+                        Conn = #h2_state,
                         Build = #ns_h2::server::runtime::Build<#g_h2a::Build>,
                     >,
                 }
@@ -580,11 +574,20 @@ pub(super) fn build(
                 },
                 duplex::State::Disabled => quote!(#v_core.as_mut().close(&mut #v_link);),
             };
-            let v_input = symbols.local("input");
+            let [v_input, n_head, n_rest] = symbols.locals(["input", "__head", "__rest"]);
+            let scoped = quote!(#ns_fiber::dope::net::wire::receive::scoped);
+            let receive = quote!(#ns_fiber::dope::manifold::app::receive);
+            let scoped_result = quote!(::core::result::Result<#receive::Outcome, #scoped::Pending<#l_scope>>);
+            let input_error = quote! {
+                ::core::result::Result::Err(#v_cause) => return ::core::result::Result::Ok(
+                    Outcome::Failed(Failure::Input(#v_cause)),
+                ),
+            };
+            let scratch_name = symbols.local("__scratch");
             let merged_scratch = if proto.upgrade {
                 quote!(&mut #v_app.as_mut().project().#f_stamp.get_mut()#stamp.2)
             } else {
-                quote!(&mut self.scratch)
+                quote!(&mut #scratch_name)
             };
             let drive = chunk::render(paths, types, &merged_scratch, stamp.as_ref());
             let selection = mixed.then(|| {
@@ -624,255 +627,199 @@ pub(super) fn build(
                             }
                         }
                     }
-                }
-            });
-            let select = mixed.then(|| quote! {
-                use #ns_http::o3::buffer::write::consume::Consume;
-                use #ns_fiber::dope::manifold::network::listener::handler::Scoped as _;
-                use #ns_fiber::dope::net::wire::receive::scoped::Input;
 
-                match #v_link.state() {
-                    #mixed_conn::Http1(_) => {}
-                    #mixed_conn::Http2(_) => {
-                        let #v_h2 = &mut self.as_mut().project().#f_stamp.get_mut().1;
-                        return ::core::pin::Pin::new(#v_h2).scoped_chunk(
-                            #v_link.map_state(#mixed_conn::h2_mut), Input::new(#v_chunk, #v_budget), #v_driver,
-                        );
-                    }
-                    #mixed_conn::Pending(_) => {
-                        if #ns_http::o3::buffer::Source::remaining(#v_chunk) == 0 {
-                            return Outcome::Continue;
-                        }
-                        let #v_slot = #v_link.state_mut();
-                        let #mixed_conn::Pending(#v_prefix) = #v_slot else {
-                            ::core::unreachable!("protocol")
-                        };
-                        let #v_pending = !#v_prefix.as_ref().is_empty();
-                        match ::core::mem::take(#v_prefix).read(#v_chunk.as_ref()) {
-                            ::core::result::Result::Ok((
-                                #v_count, #ns_http::preface::Read::Pending(#v_state),
-                            )) => {
-                                #v_chunk.consume_max(#v_count);
-                                *#v_prefix = #v_state;
-                                if !#v_pending
-                                    && let ::core::result::Result::Err(#v_cause) = #v_link
-                                        .deadline()
-                                        .try_ensure(#v_driver.driver_ref().clock().now())
-                                {
-                                    #v_link.deadline().reject(#v_cause);
-                                    return Outcome::CloseAfter;
+                    impl<#def> #name #args
+                    where
+                        #bounds
+                        #g_mode: #ns_h1::server::deadline::Mode<'d, #g_id>,
+                    {
+                        #[inline(never)]
+                        fn #n_install_h2<#l_a, #l_scope, #l_wire, #g_event>(
+                            #v_h2: ::core::pin::Pin<&mut #http2>,
+                            #v_slot: &#l_a mut #mixed_conn<#conn, #h2_state>,
+                            #projection: #ns_fiber::dope::manifold::network::listener::conn::Projection<
+                                #l_a, #g_event, '_, '_, '_, #l_wire, 'd, #g_id, #g_wire, #egress,
+                            >,
+                            #v_complete: #ns_http::preface::Complete,
+                            #v_pending: ::core::primitive::bool,
+                            #n_head: #scoped::Head<#l_scope, #l_wire, 'd, #g_wire>,
+                            #v_count: ::core::primitive::usize,
+                            #v_driver: &mut #ns_fiber::dope::core::driver::Context<'_, 'd>,
+                        ) -> #scoped_result
+                        where 'd: #l_wire, #scoped_bounds
+                        {
+                            use #receive::{Failure, Outcome};
+                            use #ns_fiber::dope::manifold::network::listener::handler;
+                            *#v_slot = match #v_h2.connection_after_preface::<#g_id>(
+                                #v_driver.driver_ref().random_seed(), #v_complete,
+                            ) {
+                                ::core::result::Result::Ok(#v_state) => #mixed_conn::Http2(#v_state),
+                                ::core::result::Result::Err(#v_cause) => {
+                                    <#http2 as handler::Application<'d, #g_id>>::build_failed(#v_h2, #v_cause);
+                                    return ::core::result::Result::Ok(Outcome::CloseAfter);
                                 }
-                                return Outcome::Continue;
+                            };
+                            let mut #v_link = #projection.bind(#v_slot.h2_mut());
+                            if #v_pending {
+                                #v_link.deadline().cancel();
                             }
-                            ::core::result::Result::Err(#v_cause) => {
-                                *#v_slot = #mixed_conn::Http1(
-                                    #ns_h1::session::Conn::prefixed(#v_cause.into_parts().0),
-                                );
-                            }
-                            ::core::result::Result::Ok((
-                                #v_count, #ns_http::preface::Read::Complete(#v_complete),
-                            )) => {
-                                #v_chunk.consume_max(#v_count);
-                                let #v_h2 = &mut self.as_mut().project().#f_stamp.get_mut().1;
-                                match #v_h2.connection_after_preface::<#g_id>(
-                                    #v_driver.driver_ref().random_seed(), #v_complete,
-                                ) {
-                                    ::core::result::Result::Ok(#v_state) => {
-                                        *#v_slot = #mixed_conn::Http2(#v_state);
-                                    }
-                                    ::core::result::Result::Err(#v_cause) => {
-                                        <#http2 as #ns_fiber::dope::manifold::network::listener::handler::Application<'d, #g_id>>::build_failed(
-                                            ::core::pin::Pin::new(#v_h2), #v_cause,
-                                        );
-                                        return Outcome::CloseAfter;
-                                    }
-                                }
-                                if #v_pending {
-                                    #v_link.deadline().cancel();
-                                }
-                                return ::core::pin::Pin::new(#v_h2).scoped_chunk(
-                                    #v_link.map_state(#mixed_conn::h2_mut), Input::new(#v_chunk, #v_budget), #v_driver,
-                                );
-                            }
+                            let #n_rest = match #n_head.consume_max(#v_count) {
+                                ::core::result::Result::Ok(#n_rest) => #n_rest,
+                                #input_error
+                            };
+                            handler::Scoped::scoped_chunk(#v_h2, #v_link, #n_rest, #v_driver)
                         }
                     }
                 }
-                let mut #v_link = #v_link.map_state(#mixed_conn::h1_mut);
             });
             let input = match (duplex, mixed) {
                 (duplex::State::Enabled, _) | (duplex::State::Disabled, true) => {
-                    let scratch = matches!(duplex, duplex::State::Enabled) && !proto.upgrade;
-                    let scratch_field =
-                        scratch.then(|| quote!(scratch: ::std::vec::Vec<::core::primitive::u8>,));
-                    let scratch_init = scratch.then(|| quote!(scratch: ::std::vec::Vec::new(),));
-                    let read = quote::format_ident!("{}Read", name);
-                    let [r_life, turn_life] = symbols.lives(["__read", "__driver"]);
-                    let [n_head, n_count, n_whole, n_end] =
-                        symbols.locals(["__head", "__count", "__whole", "__end"]);
-                    let [n_out, n_cause] = symbols.locals(["__outcome", "__cause"]);
-                    let [n_raw, n_prefix, n_failed] =
-                        symbols.locals(["__raw", "__prefix", "__failed"]);
-                    let read_type = (!mixed || matches!(duplex, duplex::State::Disabled)).then(|| quote! {
-                        struct #read<#r_life, #turn_life, 'd, A, C> {
-                            app: ::core::pin::Pin<&#r_life mut A>,
-                            conn: &#r_life mut C,
-                            driver: &#r_life mut #ns_fiber::dope::core::driver::Context<#turn_life, 'd>,
-                            budget: &#r_life #ns_http::o3::buffer::resident::Budget<'d>,
-                            #scratch_field
+                    let enabled = matches!(duplex, duplex::State::Enabled);
+                    let scratch_init = (enabled && !proto.upgrade)
+                        .then(|| quote!(let mut #scratch_name = ::std::vec::Vec::new();));
+                    let raw_import = enabled.then(|| quote!(use #ns_h1::switch::Mode;));
+                    let http = quote!({
+                        let #v_input = #n_head.input();
+                        let #v_bytes = #v_input.as_slice();
+                        #drive
+                    });
+                    let dispatch = if enabled {
+                        quote! {
+                            match #v_link.state().mode() {
+                                Mode::Raw(_) => #ns_h1::server::duplex::Runtime::new(#v_link, #merged_scratch)
+                                    .chunk(#n_head.input().defer_all(), #v_driver),
+                                Mode::Switching(_) => return Err(#n_head.defer()),
+                                Mode::Http => #http,
+                            }
+                        }
+                    } else {
+                        http
+                    };
+                    let blocked = enabled.then(|| quote! {
+                        || match #v_link.state().raw() {
+                            Ok(#v_raw) => ::core::matches!(#v_raw.access(), #ns_core::duplex::machine::Access::Blocked),
+                            Err(Mode::Switching(_)) => true,
+                            Err(Mode::Http) => false,
                         }
                     });
-                    let (raw_import, whole, dispatch, progress) = match duplex {
-                        duplex::State::Enabled => (
-                            quote!(use #ns_h1::{server::duplex::Runtime, switch::Mode};),
-                            quote!(#n_whole),
-                            quote! {
-                                match #v_link.state().mode() {
-                                    Mode::Raw(_) => Runtime::new(
-                                        #v_link, #merged_scratch,
-                                    ).chunk(#n_whole, #v_driver),
-                                    Mode::Switching(_) => {
-                                        return (::core::option::Option::None, ControlFlow::Break(Outcome::Continue));
-                                    }
-                                    Mode::Http => {
-                                        let #v_bytes = #v_input.as_slice();
-                                        #drive
-                                    }
-                                }
-                            },
-                            quote! {
-                                match self.conn.state().raw() {
-                                    ::core::result::Result::Ok(#n_raw) => match #n_raw.access() {
-                                        #ns_core::duplex::machine::Access::Vacant(()) => {
-                                            ControlFlow::Continue(#n_out)
-                                        }
-                                        #ns_core::duplex::machine::Access::Blocked => ControlFlow::Break(#n_out),
-                                    },
-                                    ::core::result::Result::Err(Mode::Http) => ControlFlow::Continue(#n_out),
-                                    ::core::result::Result::Err(Mode::Switching(_)) => ControlFlow::Break(#n_out),
-                                }
-                            },
-                        ),
-                        duplex::State::Disabled => (
-                            quote!(),
-                            quote!(_),
-                            quote!({ let #v_bytes = #v_input.as_slice(); #drive }),
-                            quote!(ControlFlow::Continue(#n_out)),
-                        ),
+                    let head = quote! {
+                        match #v_chunk.head() {
+                            ::core::option::Option::Some(#n_head) => #n_head,
+                            ::core::option::Option::None => return Ok(Outcome::Continue),
+                        }
                     };
-                    let local_read = quote! {
-                        #read_type
-                        impl<#g_event, #def>
-                            #ns_fiber::dope::net::wire::receive::mode::access::Use<
-                                'd, #ns_fiber::dope::manifold::app::receive::Outcome,
-                            > for #read<'_, '_, 'd, #name #args, #slot>
-                        where
-                            #bounds
-                            #g_mode: #ns_h1::server::deadline::Mode<'d, #g_id>,
-                        {
-                            fn apply<#g_r>(&mut self, #n_head: &mut #g_r) -> ::core::ops::ControlFlow<
-                                #ns_fiber::dope::manifold::app::receive::Outcome,
-                                #ns_fiber::dope::manifold::app::receive::Outcome,
-                            >
-                            where
-                                #g_r: #ns_http::o3::buffer::Complete
-                                    + #ns_http::o3::buffer::hold::raw::Retain<'d>
-                                    + #ns_http::o3::buffer::write::consume::Consume
-                                    + #ns_http::o3::buffer::raw::Consume,
-                            {
-                                use ::core::ops::ControlFlow;
-                                use #ns_fiber::dope::manifold::app::receive::{Failure, Outcome};
-                                use #ns_fiber::dope::net::link::egress;
-                                #raw_import
-                                use #ns_http::o3::buffer::hold::scope::Input;
+                    let finish = quote! {
+                        match #n_head.finish() {
+                            Ok(#n_rest) => #n_rest,
+                            #input_error
+                        }
+                    };
+                    let settle = quote! {
+                        #n_rest.settle()?;
+                        return Ok(Outcome::Continue);
+                    };
+                    let read = quote! {
+                        let mut #v_app = self;
+                        #scratch_init
+                        loop {
+                            let #n_out = #dispatch;
+                            match #n_out {
+                                Outcome::Continue => {}
+                                #n_out @ (Outcome::CloseAfter | Outcome::Failed(_)) => return Ok(#n_out),
+                            }
+                            let #n_rest = #finish;
+                            if #v_link.pending_output() == #ns_fiber::dope::net::link::egress::Pending::Present #blocked {
+                                #settle
+                            }
+                            let ::core::option::Option::Some(#n_next) = #n_rest.head() else {
+                                return Ok(Outcome::Continue);
+                            };
+                            #n_head = #n_next;
+                        }
+                    };
+                    let read_chunk = if mixed {
+                        quote! {
+                            use #ns_fiber::dope::manifold::network::listener::handler::Scoped as _;
 
-                                let #v_app = &mut self.app;
-                                let #v_link = &mut *self.conn;
-                                let #v_driver = &mut *self.driver;
-                                let #n_out = Input::consume(#n_head, self.budget, |#v_input| {
-                                    let ::core::option::Option::Some(#n_count) =
-                                        ::core::num::NonZero::new(#v_input.as_slice().len())
-                                    else {
-                                        return (::core::option::Option::None, ControlFlow::Break(Outcome::Continue));
-                                    };
-                                    let (#whole, #n_end) = match #v_input.try_prefix::<{
-                                        #ns_fiber::dope::core::io::transfer::MAX_BYTES as u32
-                                    }>(0, #n_count) {
-                                        ::core::result::Result::Ok(#n_prefix) => #n_prefix,
-                                        ::core::result::Result::Err(#n_cause) => {
-                                            return (
-                                                ::core::option::Option::None,
-                                                ControlFlow::Break(Outcome::Failed(Failure::Input(#n_cause))),
-                                            );
-                                        }
-                                    };
-                                    let #n_out = #dispatch;
-                                    match #n_out {
-                                        Outcome::Continue => (
-                                            ::core::option::Option::Some(#n_end),
-                                            ControlFlow::Continue(Outcome::Continue),
-                                        ),
-                                        #n_failed @ (Outcome::CloseAfter | Outcome::Failed(_)) => {
-                                            (::core::option::Option::None, ControlFlow::Break(#n_failed))
+                            #v_link.with_state(|#v_slot, #projection| {
+                                let (#v_state, mut #n_head) = match #v_slot {
+                                    #mixed_conn::Http2(#v_state) => return #h2.scoped_chunk(
+                                        #projection.bind(#v_state), #v_chunk, #v_driver,
+                                    ),
+                                    #mixed_conn::Http1(#v_state) => (#v_state, #head),
+                                    #mixed_conn::Pending(#v_prefix) => {
+                                        let #n_head = #head;
+                                        let #v_pending = !#v_prefix.as_ref().is_empty();
+                                        match ::core::mem::take(#v_prefix).read(#n_head.input().as_slice()) {
+                                            Ok((_, #ns_http::preface::Read::Pending(#v_state))) => {
+                                                *#v_prefix = #v_state;
+                                                if !#v_pending {
+                                                    let mut #v_link = #projection.bind(#v_slot);
+                                                    if let Err(#v_cause) = #v_link.deadline().try_ensure(
+                                                        #v_driver.driver_ref().clock().now(),
+                                                    ) {
+                                                        #v_link.deadline().reject(#v_cause);
+                                                        return Ok(Outcome::CloseAfter);
+                                                    }
+                                                }
+                                                let #n_rest = #finish;
+                                                #settle
+                                            }
+                                            Err(#v_cause) => {
+                                                *#v_slot = #mixed_conn::Http1(
+                                                    #ns_h1::session::Conn::prefixed(#v_cause.into_parts().0),
+                                                );
+                                                (#v_slot.h1_mut(), #n_head)
+                                            }
+                                            Ok((#v_count, #ns_http::preface::Read::Complete(#v_complete))) => {
+                                                return Self::#n_install_h2(
+                                                    #h2, #v_slot, #projection, #v_complete, #v_pending,
+                                                    #n_head, #v_count, #v_driver,
+                                                );
+                                            }
                                         }
                                     }
-                                });
-                                let ControlFlow::Continue(#n_out) = #n_out else {
-                                    return #n_out;
                                 };
-                                if self.conn.pending_output() == egress::Pending::Present {
-                                    return ControlFlow::Break(#n_out);
-                                }
-                                #progress
-                            }
+                                let #v_link = &mut #projection.bind(#v_state);
+                                #read
+                            })
+                        }
+                    } else {
+                        quote! {
+                            let mut #n_head = #head;
+                            let #v_link = &mut #v_link;
+                            #read
                         }
                     };
                     quote! {
                         #selection
-                        #local_read
-                    impl<#l_wire, #def>
-                        #ns_fiber::dope::manifold::network::listener::handler::Scoped<#l_wire, 'd, #g_id>
-                        for #name #args
-                    where
-                        #bounds
-                        'd: #l_wire,
-                        #scoped_bounds
-                        #g_mode: #ns_h1::server::deadline::Mode<'d, #g_id>,
-                    {
-                        fn retention(&self) -> #ns_fiber::dope::manifold::app::receive::limits::Budget {
-                            #retention
+                        impl<#l_wire, #def>
+                            #ns_fiber::dope::manifold::network::listener::handler::Scoped<#l_wire, 'd, #g_id>
+                            for #name #args
+                        where
+                            #bounds
+                            'd: #l_wire,
+                            #scoped_bounds
+                            #g_mode: #ns_h1::server::deadline::Mode<'d, #g_id>,
+                        {
+                            fn retention(&self) -> #ns_fiber::dope::manifold::app::receive::limits::Budget {
+                                #retention
+                            }
+
+                            fn scoped_chunk<#l_scope, #g_event>(
+                                #chunk_mut self: ::core::pin::Pin<&mut Self>,
+                                mut #v_link: #ns_fiber::dope::manifold::network::listener::conn::Ctx<
+                                    #g_event, '_, '_, '_, #l_wire, 'd, #g_id, #g_wire, #outer_conn, #egress,
+                                >,
+                                #v_chunk: #scoped::Input<#l_scope, #l_wire, 'd, #g_wire>,
+                                #v_driver: &mut #ns_fiber::dope::core::driver::Context<'_, 'd>,
+                            ) -> #scoped_result {
+                                use ::core::result::Result::{Err, Ok};
+                                use #receive::{Failure, Outcome};
+                                #raw_import
+                                #read_chunk
+                            }
                         }
-
-                        fn scoped_chunk<#g_event>(
-                            #chunk_mut self: ::core::pin::Pin<&mut Self>,
-                            mut #v_link: #ns_fiber::dope::manifold::network::listener::conn::Ctx<
-                                #g_event,
-                                '_,
-                                '_,
-                                '_,
-                                #l_wire,
-                                'd,
-                                 #g_id,
-                                #g_wire,
-                                #outer_conn,
-                                #egress,
-                            >,
-                            #v_chunk: #ns_fiber::dope::net::wire::receive::scoped::Input<'_, #l_wire, 'd, #g_wire>,
-                            #v_driver: &mut #ns_fiber::dope::core::driver::Context<'_, 'd>,
-                        ) -> #ns_fiber::dope::manifold::app::receive::Outcome {
-                            use #ns_fiber::dope::manifold::app::receive::Outcome;
-                            let (#v_chunk, #v_budget) = #v_chunk.into_parts();
-                            #select
-                            #v_chunk.drive(Outcome::Continue, &mut #read {
-                                app: self,
-                                conn: &mut #v_link,
-                                driver: #v_driver,
-                                budget: #v_budget,
-                                #scratch_init
-                            })
-                        }
-                    }
-
-
                     }
                 }
                 (duplex::State::Disabled, false) => quote! {
@@ -1133,12 +1080,45 @@ pub(super) fn build(
         }
 
         });
+        let listener = quote!(#ns_fiber::dope::manifold::network::listener);
         let wire_failure = if mixed {
-            quote!(#ns_fiber::dope::manifold::network::listener::handler::failures::Close)
+            quote!(#listener::handler::failures::Close)
         } else {
             quote!(Self)
         };
-        let report = (!mixed).then(|| report::render(paths, types));
+        let released = (!mixed).then(|| {
+            let [v_egress, v_body, v_tag, v_charge] =
+                symbols.locals(["egress", "body", "tag", "charge"]);
+            let ns_http = &paths.http;
+            let either = quote!(#ns_fiber::dope::net::link::egress::data::compose::Either);
+            let id = quote!(#listener::conn::Id<'d, #g_id>);
+            quote! {
+                fn released(
+                    self: ::core::pin::Pin<&mut Self>,
+                    #v_link: #id,
+                    #v_egress: Self::Egress,
+                    #v_cause: #listener::handler::Disposition,
+                ) {
+                    if !<#g_mode as #ns_core::life::Mode<#id, ::core::primitive::u64>>::ENABLED {
+                        return;
+                    }
+                    let #v_tag = match #v_egress.into_inner() {
+                        #either::Left(#v_body) => #v_body.release(),
+                        #either::Right(#v_body) => #v_body.release(),
+                    };
+                    let #v_this = self.project().#f_core.project();
+                    if let ::core::option::Option::Some((#v_exch, #v_charge)) =
+                        #ns_core::life::sequence::Mode::transport(#v_this.#f_life, #v_link, #v_tag)
+                    {
+                        let #v_cause = match #v_cause {
+                            #listener::handler::Disposition::Sent => #ns_http::owner::cause::Transport::Sent,
+                            #listener::handler::Disposition::Closed => #ns_http::owner::cause::Transport::Closed,
+                        };
+                        #ns_core::life::sequence::Mode::release(#v_this.#f_life, #v_exch, #v_charge, #v_cause);
+                    }
+                }
+            }
+        });
         quote! {
         impl<#def> #ns_fiber::dope::manifold::network::listener::handler::Application<'d, #g_id>
             for #name #args
@@ -1153,7 +1133,9 @@ pub(super) fn build(
             type WireFailure = #wire_failure;
             type Egress = #egress;
             type Input = #source;
-            type Send = #send_policy;
+            type Send = #listener::handler::send::Run;
+
+            #released
 
             fn connection(
                 self: ::core::pin::Pin<&Self>,
@@ -1312,8 +1294,6 @@ pub(super) fn build(
         #failure_impl
 
         #retirement_impl
-
-        #report
 
         impl<#def>
             #ns_fiber::dope::manifold::network::listener::handler::send::Drive<'d, #g_id>

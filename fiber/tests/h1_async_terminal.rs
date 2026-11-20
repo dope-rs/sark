@@ -204,8 +204,8 @@ fn observes_either_listener_on_one_driver() {
                         );
                         first.install(stage, domain::Local::new(wire::Identity), first_app,
                             |first, mut first_wait, stage| {
-                                second.tasks(second_app, 1).try_install(
-                                    stage, domain::Local::<wire::Identity, _>::new(wire::Identity), sark_h2::server::task::timers::Disabled,
+                                second.tasks(second_app, 1).try_install::<wire::Identity, _, _, _, _, _, _>(
+                                    stage, domain::Local::new(wire::Identity), sark_h2::server::task::timers::Disabled,
                                     |second, mut second_wait, stage| {
                                         let watches = [first_wait.watch(), second_wait.watch()];
                                         let result = stage.with_app(

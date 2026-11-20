@@ -52,7 +52,7 @@ fn retains_generic_body() {
                             move |worker| {
                                 worker.lend(|plan, stage| {
                                     let wire =
-                                        domain::Local::<wire::Identity, _>::new(wire::Identity);
+                                        domain::Local::new(wire::Identity);
                                     Brand::with(|brand| {
                                         let app = generics::App::new(brand, state, config);
                                         plan.install(stage, wire, app, |root, _wait, stage| {
@@ -143,7 +143,7 @@ fn retains_scoped_body() {
                             let report = &mut finish;
                             let result = {
                                 let (wire, state, config, report) = (
-                                    domain::Local::<wire::Identity, _>::new(wire::Identity),
+                                    domain::Local::new(wire::Identity),
                                     &state,
                                     Config::new(server::MAX_CONNECTIONS),
                                     &mut *report,

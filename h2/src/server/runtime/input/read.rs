@@ -1,3 +1,5 @@
+use std::ops::ControlFlow;
+
 use dope::net::wire;
 use o3::buffer::resident;
 use sark_core::manifold::server::drain::Progress;
@@ -52,7 +54,7 @@ where
                 source.discard();
                 return Ok(Progress::default());
             }
-            if let Err(error) = conn.ingress().try_bind(source.budget()) {
+            if let Err(error) = conn.ingress().try_bind(source.budget) {
                 source.discard();
                 return Err(error.into());
             }
@@ -90,16 +92,19 @@ where
             return Ok(total);
         }
         self.drive(total, |context, protocol| {
-            protocol(context).ingress().resume()
+            ControlFlow::Continue(protocol(context).ingress().resume())
         })
     }
 
     fn drive<N>(&mut self, mut total: Progress, mut next: N) -> Result<Progress, X>
     where
-        N: FnMut(&mut T, &mut P) -> Result<(), conn::Error>,
+        N: FnMut(&mut T, &mut P) -> ControlFlow<(), Result<(), conn::Error>>,
     {
         loop {
-            let error = match next(self.context, &mut self.protocol) {
+            let ControlFlow::Continue(result) = next(self.context, &mut self.protocol) else {
+                return Ok(total);
+            };
+            let error = match result {
                 Err(error) if error.is_pressure() => error,
                 result => {
                     result?;
