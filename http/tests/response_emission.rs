@@ -5,7 +5,7 @@ use std::{cell::Cell, num::NonZero};
 use common::response::{
     self, Capture,
     body::{Checked, Counted, Short},
-    headers::{EMPTY, SEMANTIC, STATIC},
+    headers::{SEMANTIC, STATIC},
     status,
 };
 use dope_test::alloc::Tracker;
@@ -20,11 +20,11 @@ use sark_http::{
         fixed::Body,
         owned,
         response::{
-            Body as _, bounded,
+            Body as _, Bounded, Fixed, Static,
             dispatch::{self, Complete},
-            exact, fixed,
+            encoded::Plan,
+            exact,
             headers::{Name, head::Head, set::Set, value::Item},
-            statics,
             status::Code,
         },
     },
@@ -54,7 +54,7 @@ fn headers_stay_structured() {
         name.borrow(),
         Value::new("value").expect("field value"),
     )]);
-    let response = fixed::Direct::new(Code::CREATED, Head::new(&STATIC, dynamic), body);
+    let response = Fixed::new(Code::CREATED, Head::new(&STATIC, dynamic), body);
 
     let capture = response
         .complete(Capture::default())
@@ -75,7 +75,7 @@ fn headers_stay_structured() {
 fn templates_stay_semantic() {
     let result = Shared::try_copy(b"semantic");
     let body = result.expect("the response body must allocate");
-    let response = fixed::Direct::new(Code::OK, Head::new(&SEMANTIC, Set::<0>::new()), body);
+    let response = Fixed::new(Code::OK, Head::new(&SEMANTIC, Set::<0>::new()), body);
 
     let capture = response
         .complete(Capture::default())
@@ -95,7 +95,7 @@ fn retained_keeps_pointer() {
     let result = Shared::try_copy(b"retained");
     let shared = result.expect("the retained body must allocate");
     let pointer = shared.as_ref().as_ptr() as usize;
-    let response = fixed::Direct::new(Code::OK, (), shared);
+    let response = Fixed::new(Code::OK, (), shared);
 
     let capture = response
         .complete(Capture::default())
@@ -117,7 +117,7 @@ fn segments_remain_distinct() {
     let body = owned::Segments::from(first);
     let result = body.try_extend(owned::Segments::from(second));
     let body = result.expect("the second segment must append");
-    let response = fixed::Direct::new(Code::OK, (), body);
+    let response = Fixed::new(Code::OK, (), body);
 
     assert_eq!(response.body().len(), 11);
     assert!(response.body().count() == segments::Count::TWO);
@@ -136,19 +136,15 @@ fn segments_remain_distinct() {
 
 #[test]
 fn result_keeps_bound() {
-    type Reply<'a> = Result<statics::Direct<'a, ()>, fixed::Direct<(), Body<'a>>>;
+    type Reply<'a> = Result<Static<'a, ()>, Fixed<(), Body<'a>>>;
     assert!(matches!(
         <Reply<'_> as Complete<'_, '_>>::Bound::LIMIT,
         Limit::Unbounded
     ));
     let bytes = *b"on";
     let replies: [Reply<'_>; 2] = [
-        Ok(statics::Direct::new(Code::OK, (), Body::new(&bytes[..1]))),
-        Err(fixed::Direct::new(
-            Code::BAD_REQUEST,
-            (),
-            Body::new(&bytes[1..]),
-        )),
+        Ok(Static::new(Code::OK, (), Body::new(&bytes[..1]))),
+        Err(Fixed::new(Code::BAD_REQUEST, (), Body::new(&bytes[1..]))),
     ];
     for (response, (status, body)) in replies
         .into_iter()
@@ -193,7 +189,7 @@ fn encodes_once() {
         bound: 32,
         encodes: &encodes,
     };
-    let output = bounded::Output::new(Code::OK, &EMPTY, Set::<0>::new(), body);
+    let output = Bounded::new(Code::OK, (), body);
     let capture = output
         .complete(Capture::default())
         .expect("response encoding");
@@ -210,7 +206,7 @@ fn rejects_bad_bound() {
         bound: 1,
         encodes: &encodes,
     };
-    let output = bounded::Output::new(Code::OK, &EMPTY, Set::<0>::new(), body);
+    let output = Bounded::new(Code::OK, (), body);
     let result = output.complete(Capture::default());
     assert!(matches!(
         result,
@@ -231,15 +227,14 @@ fn rejects_bad_bound() {
 fn output_carries_bound() {
     let bounds = Cell::new(0);
     let encodes = Cell::new(0);
-    let plan = bounded::Plan::try_new(Checked {
+    let plan = Plan::try_bounded(Checked {
         bytes: b"body",
         bound: Ok(32),
         bounds: &bounds,
         encodes: &encodes,
     })
     .expect("checked bound");
-    let output: bounded::Output<'static, _, 0> =
-        bounded::Output::new(Code::OK, &EMPTY, Set::new(), plan);
+    let output = Bounded::new(Code::OK, (), plan);
     let capture = output
         .complete(Capture::default())
         .expect("response encoding");
@@ -262,7 +257,7 @@ fn rejection_keeps_owner() {
         encodes: &encodes,
     };
     let pointer = body.bytes.as_ptr();
-    let Err(rejected) = bounded::Plan::try_new(body) else {
+    let Err(rejected) = Plan::try_bounded(body) else {
         panic!("bound rejected");
     };
     let (body, actual) = rejected.into_parts();
@@ -299,11 +294,11 @@ fn admits_status_extensions() {
 fn direct_underflow() {
     let mut bytes = [0xa5; 3];
     let mut out = o3::buffer::write::Slice::new(&mut bytes);
-    let error = exact::Plan::new(Short)
-        .encode(&mut out)
+    let error = Plan::exact(Short)
+        .write(&mut out)
         .expect_err("direct underflow must retain its exact span gap");
     assert!(out.is_empty());
-    let owned = exact::Plan::new(Short)
+    let owned = Plan::exact(Short)
         .into_shared()
         .expect_err("owned underflow must retain its exact span gap");
     assert_eq!(error, owned);

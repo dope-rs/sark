@@ -150,7 +150,6 @@ const STATIC_FIELDS: &[Entry<'static>] = &[
     field::literal!(entry(b"x-static", b"yes")),
 ];
 pub const STATIC: Template = Template::new(STATIC_FIELDS);
-pub const EMPTY: Template = Template::new(&[]);
 const SEMANTIC_FIELDS: &[Entry<'static>] = &[
     field::literal!(entry(b"x-first", b"one")),
     field::literal!(entry(b"x-second", b" two")),

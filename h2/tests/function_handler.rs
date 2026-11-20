@@ -22,7 +22,7 @@ use sark_h2::{
         sync::{Conn, Endpoint},
     },
 };
-use sark_http::payload::response::statics::Direct;
+use sark_http::payload::response::Static;
 
 #[test]
 fn dispatches_named() {
@@ -44,7 +44,7 @@ fn dispatches_named() {
             .get_mut()
             .try_budget(capacity, token.proof())
             .expect("ingress capacity");
-        let handler = FromFn::new(Direct::reply).with_bound::<4096>();
+        let handler = FromFn::new(Static::reply).with_bound::<4096>();
         assert_eq!(size_of_val(&handler), 0);
         let endpoint = Endpoint::try_new(Route::new(handler), plan).expect("endpoint");
         let mut server = Conn::try_new(&endpoint).expect("server connection");
@@ -77,7 +77,7 @@ fn dispatches_named() {
 
 #[test]
 fn admitted_content_length() {
-    let route = Route::new(FromFn::new(Direct::reply).with_bound::<4096>());
+    let route = Route::new(FromFn::new(Static::reply).with_bound::<4096>());
     for (limit, expected) in [
         (5, None),
         (

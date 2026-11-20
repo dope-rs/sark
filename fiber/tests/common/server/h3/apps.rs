@@ -358,8 +358,8 @@ pub(crate) async fn qpack_h<'d>(req: BodyReq, state: &State<'_>) -> QpackReply<'
 pub(crate) async fn qpack_fixed_h<'d>(
     req: BodyReq,
     state: &State<'_>,
-) -> sark_http::payload::response::fixed::Direct<QpackFields, request::Bytes<'d>> {
-    sark_http::payload::response::fixed::Direct::new(
+) -> sark_http::payload::response::Fixed<QpackFields, request::Bytes<'d>> {
+    sark_http::payload::response::Fixed::new(
         status::Code::OK,
         QpackFields::ready(state).await,
         req.payload,

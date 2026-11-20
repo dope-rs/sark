@@ -13,12 +13,10 @@ use sark_http::{
     field::{Value, literal},
     h1::codec::numbers,
     payload::response::{
-        Encode, bounded, dispatch, exact,
-        headers::{
-            Entry, Name,
-            head::{Head, Template},
-            set::Set,
-        },
+        Encode, bounded, dispatch,
+        encoded::Plan,
+        exact,
+        headers::{Entry, Name},
         status::Code,
     },
 };
@@ -365,12 +363,12 @@ pub struct Body<T>(T);
 
 /// A checked JSON response retaining only its bound and original encoder owner.
 #[repr(transparent)]
-pub struct Response<T>(bounded::Plan<Body<T>>);
+pub struct Response<T>(Plan<Body<T>, false>);
 
-static HEAD: Template = Template::new(&[Entry::new(
+static HEAD: [Entry<'static>; 1] = [Entry::new(
     literal!(Name::try_bytes(b"content-type")),
     literal!(Value::try_bytes(b"application/json")),
-)]);
+)];
 
 impl<T> Body<T> {
     pub fn new(value: T) -> Self {
@@ -382,7 +380,7 @@ impl<T: TryEncode + TryMaxSize> Body<T> {
     /// Prepares an OK JSON response, checking its upper bound once before emission.
     /// The static JSON header imposes no lifetime requirement on the body.
     pub fn try_response(self) -> Result<Response<T>, Rejected<Self, T::Error>> {
-        Ok(Response(bounded::Plan::try_new(self)?))
+        Ok(Response(Plan::try_bounded(self)?))
     }
 }
 
@@ -392,7 +390,7 @@ impl<'req, 'd, T: TryEncode + TryMaxSize> dispatch::Complete<'req, 'd> for Respo
     const BODY: sark_http::payload::Kind = sark_http::payload::Kind::Inline;
 
     fn complete<S: dispatch::Accept<'d>>(self, sink: S) -> Result<S::Output, S::Error> {
-        sink.bounded(Code::OK, Head::new(&HEAD, Set::<0>::new()), self.0)
+        sink.encoded::<false>(Code::OK, &HEAD, self.0)
     }
 }
 

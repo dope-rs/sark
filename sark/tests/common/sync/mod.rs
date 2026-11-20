@@ -22,7 +22,7 @@ use sark_http::{
     method::Method,
     payload::{
         fixed,
-        response::{dispatch, headers::Entry, statics, status::Code},
+        response::{Static, dispatch, headers::Entry, status::Code},
     },
 };
 
@@ -195,16 +195,14 @@ pub struct Large {
 }
 
 #[sark::handler(pub)]
-pub(crate) fn large(
-    state: &State,
-) -> dispatch::Either<Large, statics::Direct<'d, [Entry<'req>; 0]>> {
+pub(crate) fn large(state: &State) -> dispatch::Either<Large, Static<'d, [Entry<'req>; 0]>> {
     state.dispatches.set(state.dispatches.get() + 1);
     match state.large_body.try_clone() {
         Ok(body) => dispatch::Either::Left(Large {
             status: Code::OK,
             body,
         }),
-        Err(rc::Error::Exhausted) => dispatch::Either::Right(statics::Direct::new(
+        Err(rc::Error::Exhausted) => dispatch::Either::Right(Static::new(
             Code::SERVICE_UNAVAILABLE,
             [],
             fixed::Body::new(b""),

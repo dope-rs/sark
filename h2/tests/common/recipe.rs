@@ -19,7 +19,7 @@ use sark_h2::server::{
 };
 use sark_http::payload::{
     fixed,
-    response::{headers::Entry, statics, status::Code},
+    response::{Static, headers::Entry, status::Code},
 };
 
 use crate::common::headers::TEXT;
@@ -58,7 +58,7 @@ pub trait Reply: Sized {
     fn reply(request: Request<'_, '_, '_>) -> Self;
 }
 
-impl Reply for statics::Direct<'_, [Entry<'_>; 0]> {
+impl Reply for Static<'_, [Entry<'_>; 0]> {
     fn reply(request: Request<'_, '_, '_>) -> Self {
         let body = match request.path() {
             Some(b"/") => fixed::Body::new(b"named"),
@@ -87,7 +87,7 @@ impl Lexical<'_> {
 impl Handler for Lexical<'_> {
     type Egress<'d> = bound::Unbounded;
     type Output<'req, 'd>
-        = statics::Direct<'d, [Entry<'req>; 1]>
+        = Static<'d, [Entry<'req>; 1]>
     where
         Self: 'req,
         'd: 'req;
@@ -97,6 +97,6 @@ impl Handler for Lexical<'_> {
         'd: 'req,
     {
         self.0.set(self.0.get() + 1);
-        statics::Direct::new(Code::OK, [TEXT], fixed::Body::new(b""))
+        Static::new(Code::OK, [TEXT], fixed::Body::new(b""))
     }
 }

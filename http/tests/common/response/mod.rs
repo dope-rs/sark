@@ -21,7 +21,7 @@ use sark_http::{
     payload::{
         fixed,
         response::{
-            Body, bounded, dispatch, exact,
+            Body, dispatch, encoded, exact,
             headers::{Application, Entry, Name},
             status::Code,
         },
@@ -180,57 +180,42 @@ impl<'d> dispatch::Accept<'d> for Capture {
         Ok(self)
     }
 
-    fn exact<H, B>(mut self, status: Code, headers: H, body: B) -> Result<Self::Output, Self::Error>
-    where
-        H: field::Source<Application>,
-        B: exact::TryBody,
-    {
-        self = self.head(status, &headers)?;
-        let plan = match exact::Plan::try_new(body) {
-            Ok(plan) => plan,
-            Err(rejected) => return Err((Error::Size(rejected.discard()), self)),
-        };
-        let len = plan.len();
-        if let Err(error) = self
-            .body
-            .try_reserve_exact(len.saturating_sub(self.body.len()))
-            .map_err(Error::Reserve)
-        {
-            return Err((error, self));
-        }
-        self.body.resize(len, 0);
-        match plan.encode(&mut write::Slice::new(&mut self.body)) {
-            Ok(()) => Ok(self),
-            Err(error) => Err((Error::Exact(error), self)),
-        }
-    }
-
-    fn bounded<H, B>(
+    fn encoded<const EXACT: bool>(
         mut self,
         status: Code,
-        headers: H,
-        body: B,
-    ) -> Result<Self::Output, Self::Error>
-    where
-        H: field::Source<Application>,
-        B: bounded::Body,
-    {
+        headers: impl field::Source<Application>,
+        body: impl encoded::Source<EXACT>,
+    ) -> Result<Self::Output, Self::Error> {
         self = self.head(status, &headers)?;
-        let plan = bounded::Plan::new(body);
-        let max = plan.max_len();
+        let plan = match body.try_plan() {
+            Ok(plan) => plan,
+            Err(error) => return Err((Error::Size(error.into()), self)),
+        };
+        let limit = plan.limit();
         if let Err(error) = self
             .body
-            .try_reserve_exact(max.saturating_sub(self.body.len()))
+            .try_reserve_exact(limit.saturating_sub(self.body.len()))
             .map_err(Error::Reserve)
         {
             return Err((error, self));
         }
-        self.body.resize(max, 0);
-        let written = match plan.encode(&mut write::Slice::new(&mut self.body)) {
+        self.body.resize(limit, 0);
+        let written = match plan.write(&mut write::Slice::new(&mut self.body)) {
             Ok(written) => written,
-            Err(error) => return Err((Error::Bounded(error), self)),
+            Err(error) => {
+                return Err((
+                    if EXACT {
+                        Error::Exact(error)
+                    } else {
+                        Error::Bounded(error)
+                    },
+                    self,
+                ));
+            }
         };
-        self.body.truncate(written);
+        if !EXACT {
+            self.body.truncate(written);
+        }
         Ok(self)
     }
 }

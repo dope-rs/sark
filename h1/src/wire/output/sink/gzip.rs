@@ -12,7 +12,7 @@ use sark_http::{
     },
     payload::{
         compress::{self, Compression},
-        response::{self, bounded, exact, headers, status::Code},
+        response::{self, Encode, encoded, headers, status::Code},
     },
 };
 
@@ -53,7 +53,8 @@ pub(super) fn compress_exact<
     'req,
     'd,
     H: field::Source<headers::Application>,
-    B: exact::TryBody,
+    B: Encode,
+    const EXACT: bool,
     Q: scope::Source,
     O: stage::Body<'req, 'd>,
 >(
@@ -61,12 +62,12 @@ pub(super) fn compress_exact<
     date: Headers<'_>,
     status: Code,
     fields: &H,
-    plan: exact::Plan<B>,
+    plan: encoded::Plan<B, EXACT>,
     gzip: &mut impl Compression,
     required: bool,
     slot: handoff::Slot<'req, 'd, Q, O>,
 ) -> Result<Written<'d, O::Deferred, Q::Selection>, Error> {
-    let len = plan.len();
+    let len = plan.limit();
     let encodings = emit_fields(out.reborrow(), date, status, fields)?;
     let base = out.len();
     let mut tail = staged_tail(&mut out, date, len)?;
@@ -83,7 +84,7 @@ pub(super) fn compress_exact<
         added: len,
     })?;
     let zipped = if len <= tail.body().remaining() {
-        plan.encode(&mut tail.body())?;
+        plan.write(&mut tail.body())?;
         match encode(gzip, &tail.body().into_mut()[head - base..], required)? {
             compress::Output::Plain => {
                 tail.commit();
@@ -225,7 +226,8 @@ pub(super) fn compress_bounded<
     'req,
     'd,
     H: field::Source<headers::Application>,
-    B: bounded::Body,
+    B: Encode,
+    const EXACT: bool,
     Q: scope::Source,
     O: stage::Body<'req, 'd>,
 >(
@@ -233,14 +235,14 @@ pub(super) fn compress_bounded<
     date: Headers<'_>,
     status: Code,
     fields: &H,
-    plan: bounded::Plan<B>,
+    plan: encoded::Plan<B, EXACT>,
     gzip: &mut impl Compression,
     required: bool,
     slot: handoff::Slot<'req, 'd, Q, O>,
 ) -> Result<Written<'d, O::Deferred, Q::Selection>, Error> {
-    let max = plan.max_len();
+    let max = plan.limit();
     if let Some(mut pending) = Pending::try_place(&mut out, date, status, fields, max)? {
-        let len = pending.encode(plan)?;
+        let len = pending.encode(plan.into_body())?;
         if (required || pending.encodings() == 0)
             && let compress::Output::Compressed(zipped) = encode(gzip, pending.body(), required)?
         {

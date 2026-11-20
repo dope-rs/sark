@@ -11,14 +11,13 @@ use sark_h1::wire::{Failure, head, output};
 use sark_http::field;
 use sark_http::payload::{
     fixed::Body,
-    response::{headers, statics, status::Code},
+    response::{Static, headers, status::Code},
 };
 
 #[test]
 fn head_emits_once() {
     let emits = Cell::new(0);
-    let response =
-        statics::Direct::new(Code::OK, Counted { emissions: &emits }, Body::new(b"body"));
+    let response = Static::new(Code::OK, Counted { emissions: &emits }, Body::new(b"body"));
     let mut bytes = [0; 512];
     let mut writer = Slice::new(&mut bytes);
     let outcome = output::Egress::new(writer.reborrow(), DATE, RESPONSE)
@@ -40,7 +39,7 @@ fn head_emits_once() {
 fn grouped_capacity() {
     let mut expected = [0xa5; 256];
     let mut writer = Slice::new(&mut expected);
-    let response = statics::Direct::new(Code::OK, ENTRIES, Body::new(b"body"));
+    let response = Static::new(Code::OK, ENTRIES, Body::new(b"body"));
     let length = match output::Egress::new(writer.reborrow(), DATE, RESPONSE)
         .plain(response, head::Connection::KeepAlive)
     {
@@ -54,10 +53,10 @@ fn grouped_capacity() {
         let mut grouped = scalar;
         let mut scalar_writer = Slice::new(&mut scalar[..capacity]);
         let mut grouped_writer = Slice::new(&mut grouped[..capacity]);
-        let response = statics::Direct::new(Code::OK, ENTRIES, Body::new(b"body"));
+        let response = Static::new(Code::OK, ENTRIES, Body::new(b"body"));
         let first = output::Egress::new(scalar_writer.reborrow(), DATE, RESPONSE)
             .plain(response, head::Connection::KeepAlive);
-        let response = statics::Direct::new(Code::OK, GROUP, Body::new(b"body"));
+        let response = Static::new(Code::OK, GROUP, Body::new(b"body"));
         let second = output::Egress::new(grouped_writer.reborrow(), DATE, RESPONSE)
             .plain(response, head::Connection::KeepAlive);
         let results = match (first, second) {

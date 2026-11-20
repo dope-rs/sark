@@ -1,4 +1,4 @@
-use std::num::NonZero;
+use std::{convert::Infallible, num::NonZero};
 
 /// Encoded-length arithmetic exceeded the representable domain.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -13,5 +13,11 @@ impl Overflow {
             current,
             added: NonZero::<usize>::MIN.saturating_add(added - 1),
         })
+    }
+}
+
+impl From<Infallible> for Overflow {
+    fn from(never: Infallible) -> Self {
+        match never {}
     }
 }

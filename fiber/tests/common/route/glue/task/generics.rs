@@ -2,7 +2,7 @@ use std::{cell::Cell, marker::PhantomData};
 
 use cartel_redis::client::settings;
 use dope_test::fibers::Yield;
-use sark_http::payload::response::{exact, status};
+use sark_http::payload::response::{Exact, exact, status};
 
 use crate::common::route::glue::task;
 
@@ -48,14 +48,14 @@ impl<'a, 'b, C> Source<2> for (C, task::State<'a, 'b>) {
 }
 
 #[sark::handler(pub)]
-async fn r#reply<C, const N: usize>(state: &State<C, N>) -> exact::Direct<(), C::Body>
+async fn r#reply<C, const N: usize>(state: &State<C, N>) -> Exact<(), C::Body>
 where
     'd: 'req,
     C: Source<N>,
 {
     let body = state.source.body();
     Yield::new().await;
-    exact::Direct::new(status::Code::OK, (), body)
+    Exact::new(status::Code::OK, (), body)
 }
 
 pub struct Scoped<'config, 'driver, C, const N: usize> {
@@ -66,16 +66,14 @@ pub struct Scoped<'config, 'driver, C, const N: usize> {
 }
 
 #[sark::handler(pub)]
-async fn scoped<'config, C, const N: usize>(
-    state: &Scoped<'config, '_, C, N>,
-) -> exact::Direct<(), C::Body>
+async fn scoped<'config, C, const N: usize>(state: &Scoped<'config, '_, C, N>) -> Exact<(), C::Body>
 where
     C: Source<N>,
 {
     let body = state.source.body();
     Yield::new().await;
     state.observed.set(Some(state.config.get()));
-    exact::Direct::new(status::Code::OK, (), body)
+    Exact::new(status::Code::OK, (), body)
 }
 
 sark::define_route! {

@@ -38,7 +38,7 @@ use sark_h2::{
     stream::Id,
 };
 use sark_http::{
-    payload::response::{fixed, headers},
+    payload::response::{Fixed, headers},
     request::body,
 };
 
@@ -270,7 +270,7 @@ pub struct Echo;
 impl Handler for Echo {
     type Egress<'d> = bound::Unbounded;
     type Output<'req, 'd>
-        = fixed::Direct<[headers::Entry<'req>; 1], body::Ref<'req, 'd>>
+        = Fixed<[headers::Entry<'req>; 1], body::Ref<'req, 'd>>
     where
         Self: 'req,
         'd: 'req;
@@ -279,6 +279,6 @@ impl Handler for Echo {
     where
         'd: 'req,
     {
-        fixed::Direct::new(Code::OK, [TEXT], request.body())
+        Fixed::new(Code::OK, [TEXT], request.body())
     }
 }

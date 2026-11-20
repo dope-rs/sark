@@ -26,7 +26,7 @@ use sark_h2::{
 use sark_http::{
     field::metadata::map::record::Entry,
     o3::buffer::resident::bound,
-    payload::response::{fixed, headers, status::Code},
+    payload::response::{Fixed, headers, status::Code},
     request::body::Ref,
 };
 
@@ -40,7 +40,7 @@ pub struct Echo<'a>(pub &'a Cell<usize>);
 impl Handler for Echo<'_> {
     type Egress<'d> = bound::Unbounded;
     type Output<'req, 'd>
-        = fixed::Direct<[headers::Entry<'req>; 1], Ref<'req, 'd>>
+        = Fixed<[headers::Entry<'req>; 1], Ref<'req, 'd>>
     where
         Self: 'req,
         'd: 'req;
@@ -50,7 +50,7 @@ impl Handler for Echo<'_> {
         'd: 'req,
     {
         self.0.set(self.0.get() + 1);
-        fixed::Direct::new(Code::OK, [TEXT], request.body())
+        Fixed::new(Code::OK, [TEXT], request.body())
     }
 }
 

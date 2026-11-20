@@ -4,7 +4,7 @@ use dope_test::fibers::Yield;
 use o3::buffer::write::{Sink, consume};
 use sark_http::payload::{
     fixed,
-    response::{Encode, exact, status::Code},
+    response::{Encode, Exact, exact, status::Code},
 };
 
 pub const CASES: [(&[u8], &[u8], usize); 2] = [
@@ -37,9 +37,9 @@ impl Encode for Incomplete {
 }
 
 #[sark_fiber::handler(pub)]
-async fn failed() -> exact::Direct<(), Incomplete> {
+async fn failed() -> Exact<(), Incomplete> {
     Yield::new().await;
-    exact::Direct::new(Code::OK, (), Incomplete)
+    Exact::new(Code::OK, (), Incomplete)
 }
 
 #[sark_fiber::response(raw)]

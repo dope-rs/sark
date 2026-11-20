@@ -15,7 +15,7 @@ use sark_http::{
     owner::handoff::{self, stage},
     payload::{
         fixed,
-        response::{Body, Content, bounded, dispatch, exact, headers, status::Code},
+        response::{Body, Content, dispatch, encoded, headers, status::Code},
     },
     request::{Id, body},
 };
@@ -315,41 +315,20 @@ impl<
         self.prepare(status, headers, Payload::Handoff(body), Boundary::End)
     }
 
-    fn exact<H, B>(mut self, status: Code, headers: H, body: B) -> Result<Self::Output, Self::Error>
-    where
-        H: field::Source<headers::Application>,
-        B: exact::TryBody,
-    {
-        if self.omit(status)? {
-            return self.empty(status, headers);
-        }
-        let plan = exact::Plan::try_new(body)
-            .map_err(|rejected| (conn::Error::Size(rejected.discard()), self.stream))?;
-        let body = if plan.len() <= Inline::CAPACITY {
-            Inline::try_exact(plan).map(Payload::Inline)
-        } else {
-            plan.into_shared().map(Payload::Handoff)
-        }
-        .map_err(|error| (conn::Error::Build(error), self.stream))?;
-        self.prepare(status, headers, body, Boundary::End)
-    }
-
-    fn bounded<H, B>(
+    fn encoded<const EXACT: bool>(
         mut self,
         status: Code,
-        headers: H,
-        body: B,
-    ) -> Result<Self::Output, Self::Error>
-    where
-        H: field::Source<headers::Application>,
-        B: bounded::Body,
-    {
+        headers: impl field::Source<headers::Application>,
+        body: impl encoded::Source<EXACT>,
+    ) -> Result<Self::Output, Self::Error> {
         if self.omit(status)? {
             return self.empty(status, headers);
         }
-        let plan = bounded::Plan::new(body);
-        let body = if plan.max_len() <= Inline::CAPACITY {
-            Inline::try_bounded(plan).map(Payload::Inline)
+        let plan = body
+            .try_plan()
+            .map_err(|error| (conn::Error::Size(error.into()), self.stream))?;
+        let body = if plan.limit() <= Inline::CAPACITY {
+            Inline::try_encode(plan).map(Payload::Inline)
         } else {
             plan.into_shared().map(Payload::Handoff)
         }

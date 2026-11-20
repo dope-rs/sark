@@ -76,9 +76,9 @@ fn inline_body_survives_flow_pressure() {
             let encoder = Encoder::new(&mut server, stream, Ref::from_slice(&[]));
             let (prepared, allocations) = Tracker::count(|| {
                 if bounded {
-                    Accept::bounded(encoder, Code::OK, (), body)
+                    Accept::encoded::<false>(encoder, Code::OK, (), body)
                 } else {
-                    Accept::exact(encoder, Code::OK, (), body)
+                    Accept::encoded::<true>(encoder, Code::OK, (), body)
                 }
             });
             let prepared = prepared.expect("inline response");
@@ -153,9 +153,9 @@ fn inline_body_capacity_and_errors() {
             let encoder = Encoder::new(&mut server, stream, Ref::from_slice(&[]));
             let (prepared, allocations) = Tracker::count(|| {
                 if bounded {
-                    Accept::bounded(encoder, Code::OK, (), body)
+                    Accept::encoded::<false>(encoder, Code::OK, (), body)
                 } else {
-                    Accept::exact(encoder, Code::OK, (), body)
+                    Accept::encoded::<true>(encoder, Code::OK, (), body)
                 }
             });
             let prepared = prepared.expect("admitted response");
@@ -189,7 +189,7 @@ fn inline_body_capacity_and_errors() {
         };
         let encoder = Encoder::new(&mut server, stream, Ref::from_slice(&[]));
         assert!(matches!(
-            Accept::exact(encoder, Code::OK, (), body),
+            Accept::encoded::<true>(encoder, Code::OK, (), body),
             Err((Error::Build(storage::BuildError::Length(error)), returned))
                 if returned == stream
                     && error.into_parts().0.get() == 4

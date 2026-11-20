@@ -7,8 +7,8 @@ use sark_http::{
     payload::{
         fixed,
         response::{
+            Static,
             headers::{Entry, Name},
-            statics,
             status::Code,
         },
     },
@@ -26,7 +26,7 @@ pub struct Deny;
 impl Guard<State> for Deny {
     type Egress<'d> = bound::AtMost<0>;
     type Break<'req, 'd>
-        = statics::Direct<'d, [Entry<'req>; 1]>
+        = Static<'d, [Entry<'req>; 1]>
     where
         'd: 'req;
 
@@ -35,7 +35,7 @@ impl Guard<State> for Deny {
         'd: 'req,
     {
         state.replies.set(state.replies.get() + 1);
-        ControlFlow::Break(statics::Direct::new(
+        ControlFlow::Break(Static::new(
             Code::UNAUTHORIZED,
             [Entry::new(
                 field::literal!(Name::try_bytes(b"x-large")),

@@ -22,7 +22,7 @@ use sark_h1::{
 use sark_http::{
     h1::head::{line::Version, request::Coding},
     owner::handoff,
-    payload::response::{Method, fixed, status::Code},
+    payload::response::{Fixed, Method, status::Code},
 };
 
 #[test]
@@ -165,7 +165,7 @@ fn phase_error() {
             Context::new(method, Version::Eleven),
         )
         .plain(
-            fixed::Direct::new(status, (), replies::BYTES),
+            Fixed::new(status, (), replies::BYTES),
             head::Connection::KeepAlive,
         );
         assert!(

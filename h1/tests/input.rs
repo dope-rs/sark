@@ -3,11 +3,8 @@ pub mod common;
 use common::fields;
 use o3::buffer::{Complete as _, storage};
 use sark_core::route::guard::Reject as _;
-use sark_h1::{
-    Input,
-    wire::output,
-};
-use sark_http::payload::response::{fixed, headers::Entry, status::Code};
+use sark_h1::{Input, wire::output};
+use sark_http::payload::response::{Fixed, headers::Entry, status::Code};
 
 #[test]
 fn retains_guard_window() {
@@ -19,7 +16,7 @@ fn retains_guard_window() {
     let window = window.expect("test operation must succeed");
     let source = &window.as_slice()[64..576];
     let fields: [Entry<'_>; 0] = [];
-    let response = fixed::Direct::new(Code::OK, fields, source);
+    let response = Fixed::new(Code::OK, fields, source);
     let mut output = [0; 128];
     let result = output::Egress::bind(
         o3::buffer::write::Slice::new(&mut output).reborrow(),
@@ -43,7 +40,7 @@ fn copies_guard_window() {
     let window = &owner[128..896];
     let source = &window[64..576];
     let fields: [Entry<'_>; 0] = [];
-    let response = fixed::Direct::new(Code::OK, fields, source);
+    let response = Fixed::new(Code::OK, fields, source);
     let mut output = [0; 128];
     let result = output::Egress::bind(
         o3::buffer::write::Slice::new(&mut output).reborrow(),

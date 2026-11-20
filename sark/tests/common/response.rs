@@ -8,7 +8,7 @@ use sark::http::{
     field::{self, Value},
     payload::{
         fixed, response,
-        response::{bounded, dispatch::Accept, exact, headers, status::Code},
+        response::{dispatch::Accept, encoded, exact, headers, status::Code},
     },
 };
 use sark_json::writing::{Failure, Size, TryEncode, TryMaxSize, Writer};
@@ -88,29 +88,16 @@ impl<'d> Accept<'d> for SliceSink<'_, '_> {
             .map_err(Error::Capacity)?;
         Ok((status, body.len()))
     }
-    fn bounded<H: field::Source<headers::Application>, B: bounded::Body>(
+    fn encoded<const EXACT: bool>(
         mut self,
         status: Code,
-        headers: H,
-        body: B,
+        headers: impl field::Source<headers::Application>,
+        body: impl encoded::Source<EXACT>,
     ) -> Result<Self::Output, Self::Error> {
         self.fields(&headers)?;
-        let len = bounded::Plan::new(body)
-            .encode(&mut write::Slice::new(self.0))
-            .map_err(Error::Build)?;
-        Ok((status, len))
-    }
-    fn exact<H: field::Source<headers::Application>, B: exact::TryBody>(
-        mut self,
-        status: Code,
-        headers: H,
-        body: B,
-    ) -> Result<Self::Output, Self::Error> {
-        self.fields(&headers)?;
-        let plan =
-            exact::Plan::try_new(body).map_err(|rejected| Error::Size(rejected.discard()))?;
-        let len = plan.len();
-        plan.encode(&mut write::Slice::new(self.0))
+        let plan = body.try_plan().map_err(|error| Error::Size(error.into()))?;
+        let len = plan
+            .write(&mut write::Slice::new(self.0))
             .map_err(Error::Build)?;
         Ok((status, len))
     }

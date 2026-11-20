@@ -11,7 +11,7 @@ use sark_http::{
     payload::{
         compress::{self, Compression},
         fixed::Body,
-        response::{self, Content, bounded, dispatch, exact, headers, status::Code},
+        response::{self, Content, Encode, dispatch, encoded, headers, status::Code},
     },
 };
 
@@ -214,15 +214,16 @@ impl<'req, 'd: 'req, Q: scope::Source, O: stage::Body<'req, 'd>, C: Compression,
         Ok(written)
     }
 
-    fn exact<H, B>(self, status: Code, fields: H, body: B) -> Result<Self::Output, Self::Error>
-    where
-        H: field::Source<headers::Application>,
-        B: exact::TryBody,
-    {
+    fn encoded<const EXACT: bool>(
+        self,
+        status: Code,
+        fields: impl field::Source<headers::Application>,
+        body: impl encoded::Source<EXACT>,
+    ) -> Result<Self::Output, Self::Error> {
         if let Some(frame) = self.omission(status)? {
             return self.empty(status, &fields, frame);
         }
-        let plan = exact::Plan::try_new(body).map_err(|error| Error::Size(error.discard()))?;
+        let plan = body.try_plan().map_err(|error| Error::Size(error.into()))?;
         let Self {
             out,
             date,
@@ -231,33 +232,13 @@ impl<'req, 'd: 'req, Q: scope::Source, O: stage::Body<'req, 'd>, C: Compression,
             ..
         } = self;
         match mode {
-            Mode::Compress { gzip, required } => {
+            Mode::Compress { gzip, required } if EXACT => {
                 compress_exact(out, date, status, &fields, plan, gzip, required, slot)
             }
-            Mode::Plain => finish_exact(out, date, status, &fields, plan, slot),
-        }
-    }
-
-    fn bounded<H, B>(self, status: Code, fields: H, body: B) -> Result<Self::Output, Self::Error>
-    where
-        H: field::Source<headers::Application>,
-        B: bounded::Body,
-    {
-        if let Some(frame) = self.omission(status)? {
-            return self.empty(status, &fields, frame);
-        }
-        let plan = bounded::Plan::new(body);
-        let Self {
-            out,
-            date,
-            mode,
-            slot,
-            ..
-        } = self;
-        match mode {
             Mode::Compress { gzip, required } => {
                 compress_bounded(out, date, status, &fields, plan, gzip, required, slot)
             }
+            Mode::Plain if EXACT => finish_exact(out, date, status, &fields, plan, slot),
             Mode::Plain => finish_bounded(out, date, status, &fields, plan, slot),
         }
     }
@@ -366,7 +347,8 @@ fn finish_exact<
     'req,
     'd,
     H: field::Source<headers::Application>,
-    B: exact::TryBody,
+    B: Encode,
+    const EXACT: bool,
     Q: scope::Source,
     O: stage::Body<'req, 'd>,
 >(
@@ -374,29 +356,36 @@ fn finish_exact<
     date: Headers<'_>,
     status: Code,
     fields: &H,
-    plan: exact::Plan<B>,
+    plan: encoded::Plan<B, EXACT>,
     slot: handoff::Slot<'req, 'd, Q, O>,
 ) -> Result<Written<'d, O::Deferred, Q::Selection>, Error> {
-    let len = plan.len();
+    let len = plan.limit();
     let (head, encoded) = emit_head::<_, bool>(out.reborrow(), date, status, fields, len)?;
     let written = place_exact(out, head, plan, slot)?;
     identity(date.response, encoded)?;
     Ok(written)
 }
 
-fn place_exact<'req, 'd, B: exact::TryBody, Q: scope::Source, O: stage::Body<'req, 'd>>(
+fn place_exact<
+    'req,
+    'd,
+    B: Encode,
+    const EXACT: bool,
+    Q: scope::Source,
+    O: stage::Body<'req, 'd>,
+>(
     mut out: Slice<'_, &mut usize>,
     head: usize,
-    plan: exact::Plan<B>,
+    plan: encoded::Plan<B, EXACT>,
     slot: handoff::Slot<'req, 'd, Q, O>,
 ) -> Result<Written<'d, O::Deferred, Q::Selection>, Error> {
-    let len = plan.len();
+    let len = plan.limit();
     head.checked_add(len).ok_or(Error::Overflow {
         base: head,
         added: len,
     })?;
     if len <= out.remaining() {
-        plan.encode(&mut out)?;
+        plan.write(&mut out)?;
         return Ok(Written::inline(len));
     }
     let body = plan.into_shared()?;
@@ -408,7 +397,8 @@ fn finish_bounded<
     'req,
     'd,
     H: field::Source<headers::Application>,
-    B: bounded::Body,
+    B: Encode,
+    const EXACT: bool,
     Q: scope::Source,
     O: stage::Body<'req, 'd>,
 >(
@@ -416,12 +406,12 @@ fn finish_bounded<
     date: Headers<'_>,
     status: Code,
     fields: &H,
-    plan: bounded::Plan<B>,
+    plan: encoded::Plan<B, EXACT>,
     slot: handoff::Slot<'req, 'd, Q, O>,
 ) -> Result<Written<'d, O::Deferred, Q::Selection>, Error> {
-    let max = plan.max_len();
+    let max = plan.limit();
     if let Some(mut pending) = Pending::try_place(&mut out, date, status, fields, max)? {
-        let len = pending.encode(plan)?;
+        let len = pending.encode(plan.into_body())?;
         let encoded = pending.finish::<bool>()?;
         identity(date.response, encoded)?;
         return Ok(Written::inline(len));

@@ -8,7 +8,7 @@ use sark_http::{
     h1::head::response::{Date, Server},
     payload::{
         fixed,
-        response::{dispatch, headers, statics, statics::Direct, status::Code},
+        response::{Static, dispatch, headers, status::Code},
     },
     request::body,
 };
@@ -97,7 +97,7 @@ impl route::Spec for Request {
 
 impl manifold::Route<Cell<(*const u8, bool, bool)>> for Request {
     type Response<'req, 'd>
-        = statics::Direct<'d, [headers::Entry<'req>; 0]>
+        = Static<'d, [headers::Entry<'req>; 0]>
     where
         'd: 'req;
     fn invoke<'req, 'd, 'state>(
@@ -115,6 +115,6 @@ impl manifold::Route<Cell<(*const u8, bool, bool)>> for Request {
         'd: 'req,
     {
         state.set((headers.as_ptr(), headers == Self::HEAD, body == b"z"));
-        Direct::new(Code::OK, [], fixed::Body::new(b"ok"))
+        Static::new(Code::OK, [], fixed::Body::new(b"ok"))
     }
 }

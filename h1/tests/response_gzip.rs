@@ -3,7 +3,7 @@ pub mod common;
 use std::{cell::Cell, str};
 
 use common::{
-    body::{Bounded, COMPRESSIBLE, Counted, TEMPLATE, replies},
+    body::{COMPRESSIBLE, Counted, TEMPLATE, replies},
     fields::{self, DATE, ENTRIES},
 };
 use dope_test::alloc::Tracker;
@@ -23,9 +23,8 @@ use sark_http::{
         compress::{self, Compression, Gzip, Output},
         fixed::Body,
         response::{
-            exact, fixed,
+            Bounded, Exact, Fixed, Static, exact,
             headers::{self, head::Head, set},
-            statics,
             status::Code,
         },
     },
@@ -44,7 +43,7 @@ fn borrowed_plain_uses_output_room() {
         let mut writer = Slice::new(&mut bytes[..head]);
         let (outcome, allocs) = Tracker::count(|| {
             output::Egress::new(writer.reborrow(), DATE, fields::GZIP_RESPONSE).route(
-                fixed::Direct::new(Code::OK, (), source.as_slice()),
+                Fixed::new(Code::OK, (), source.as_slice()),
                 handoff::Slot::ready(None),
                 &mut gzip,
                 replies::POLICY,
@@ -75,7 +74,7 @@ fn frames_compressed() {
     let payload = COMPRESSIBLE;
     let result = storage::Shared::try_copy(payload);
     let body = result.expect("fixture body fits shared storage");
-    let response = fixed::Direct::new(
+    let response = Fixed::new(
         Code::OK,
         Head::new(&TEMPLATE, set::Set::from_items([])),
         body,
@@ -158,8 +157,9 @@ fn actual_content_encoding_controls_admission() {
             let mut bytes = [0; 2048];
             let mut writer = Slice::new(&mut bytes);
             let outcome = output::Egress::new(writer.reborrow(), DATE, context).route(
-                Bounded {
-                    fields: fields::Drifting {
+                Bounded::new(
+                    Code::OK,
+                    fields::Drifting {
                         emissions: &emissions,
                         first: fields::IDENTITY,
                         second: if actual {
@@ -171,11 +171,11 @@ fn actual_content_encoding_controls_admission() {
                             )
                         },
                     },
-                    body: Counted {
+                    Counted {
                         bytes: COMPRESSIBLE,
                         encodes: &encodes,
                     },
-                },
+                ),
                 handoff::Slot::ready(None),
                 &mut gzip,
                 route::Policy::new(mode, Date::Omit, Server::Omit),
@@ -214,7 +214,7 @@ fn required_exhaustion_releases_source() {
     let mut writer = Slice::new(&mut bytes);
     let (outcome, counts) = Tracker::counts(|| {
         output::Egress::new(writer.reborrow(), DATE, fields::GZIP_RESPONSE).route(
-            fixed::Direct::new(Code::OK, (), source),
+            Fixed::new(Code::OK, (), source),
             handoff::Slot::ready(None),
             &mut gzip,
             route::Policy::new(route::Mode::RequiredGzip, Date::Omit, Server::Omit),
@@ -242,7 +242,7 @@ fn identity_refusal_preserves_prior_errors() {
     let mut bytes = [0; 512];
     let mut writer = Slice::new(&mut bytes);
     let outcome = output::Egress::new(writer.reborrow(), DATE, context).plain(
-        exact::Direct::new(Code::OK, (), replies::Untouched(&encodes)),
+        Exact::new(Code::OK, (), replies::Untouched(&encodes)),
         head::Connection::KeepAlive,
     );
     assert!(matches!(
@@ -278,7 +278,7 @@ fn identity_refusal_preserves_prior_errors() {
 #[test]
 fn fixed_fields_emit_once() {
     let emits = Cell::new(0);
-    let response = fixed::Direct::new(
+    let response = Fixed::new(
         Code::OK,
         fields::Drifting::values(&emits, b"first", b"a different second value"),
         storage::Shared::try_copy(COMPRESSIBLE).expect("body"),
@@ -313,7 +313,7 @@ fn exact_fields_emit_once() {
     for capacity in [256, 2048] {
         let emits = Cell::new(0);
         let encodes = Cell::new(0);
-        let response = exact::Direct::new(
+        let response = Exact::new(
             Code::OK,
             fields::Drifting::values(&emits, b"first", b"a different second value"),
             Counted {
@@ -354,13 +354,14 @@ fn exact_fields_emit_once() {
 fn bounded_keeps_fields() {
     let emits = Cell::new(0);
     let encodes = Cell::new(0);
-    let response = Bounded {
-        fields: fields::Drifting::values(&emits, b"measured", b"emitted"),
-        body: Counted {
+    let response = Bounded::new(
+        Code::OK,
+        fields::Drifting::values(&emits, b"measured", b"emitted"),
+        Counted {
             bytes: COMPRESSIBLE,
             encodes: &encodes,
         },
-    };
+    );
     let mut bytes = [0; 256];
     let mut writer = Slice::new(&mut bytes);
     let mut gzip = Gzip::try_new().expect("gzip");
@@ -405,7 +406,7 @@ fn fixed_scalar_capacity() {
     ];
     let mut complete = [0xa5; 256];
     let mut writer = Slice::new(&mut complete);
-    let response = statics::Direct::new(Code::OK, fields, Body::new(zipped.as_ref()));
+    let response = Static::new(Code::OK, fields, Body::new(zipped.as_ref()));
     let head_len = match output::Egress::new(writer.reborrow(), DATE, fields::RESPONSE)
         .plain(response, head::Connection::KeepAlive)
     {
@@ -417,13 +418,13 @@ fn fixed_scalar_capacity() {
     for capacity in 0..=head_len {
         let mut expected = [0xa5; 256];
         let mut writer = Slice::new(&mut expected[..capacity]);
-        let response = statics::Direct::new(Code::OK, ENTRIES, Body::new(COMPRESSIBLE));
+        let response = Static::new(Code::OK, ENTRIES, Body::new(COMPRESSIBLE));
         let plain = output::Egress::new(writer.reborrow(), DATE, fields::RESPONSE)
             .plain(response, head::Connection::KeepAlive);
         let wanted = match plain {
             output::Outcome::Failed(Failure::Output(error)) => Some(Err(error)),
             output::Outcome::SendStatic { .. } => {
-                let response = statics::Direct::new(Code::OK, fields, Body::new(zipped.as_ref()));
+                let response = Static::new(Code::OK, fields, Body::new(zipped.as_ref()));
                 let mut writer = Slice::new(&mut expected[..capacity]);
                 match output::Egress::new(writer.reborrow(), DATE, fields::RESPONSE)
                     .plain(response, head::Connection::KeepAlive)
@@ -439,7 +440,7 @@ fn fixed_scalar_capacity() {
 
         let mut actual = [0xa5; 256];
         let mut writer = Slice::new(&mut actual[..capacity]);
-        let response = fixed::Direct::new(Code::OK, ENTRIES, Body::new(COMPRESSIBLE));
+        let response = Fixed::new(Code::OK, ENTRIES, Body::new(COMPRESSIBLE));
         let outcome = output::Egress::new(writer.reborrow(), DATE, fields::GZIP_RESPONSE).route(
             response,
             handoff::Slot::ready(None),

@@ -112,31 +112,28 @@ pub(crate) fn build(
     } else {
         quote::quote!(#v_response.#body)
     };
-    let (accept, bound, kind) = if raw && is_fixed {
-        (
-            quote::format_ident!("statics"),
-            quote::quote!(#ns_http::o3::buffer::resident::bound::AtMost<0>),
-            quote::quote!(#ns_http::payload::Kind::Static),
-        )
+    let form = if raw && is_fixed {
+        quote::quote!(#ns_http::payload::response::output::Static)
+    } else if raw {
+        quote::quote!(#ns_http::payload::response::output::Fixed)
     } else {
-        (
-            if raw {
-                quote::format_ident!("fixed")
-            } else {
-                quote::format_ident!("exact")
-            },
-            quote::quote!(#ns_http::o3::buffer::resident::bound::Unbounded),
-            quote::quote!(#ns_http::payload::Kind::Inline),
-        )
+        quote::quote!(#ns_http::payload::response::output::Encoded<true>)
     };
+    let encoded_ty = if matches!(mode, Mode::Json) {
+        quote::quote!(#ns_json::writing::Body<#body_ty>)
+    } else {
+        quote::quote!(#body_ty)
+    };
+    let selected =
+        quote::quote!(<#form as #ns_http::payload::response::output::Form<'d, #encoded_ty>>);
     let target = quote::quote!(#name #ty_args);
     let impls = quote::quote! {
         impl #sh_impl
             #ns_http::payload::response::dispatch::Complete<'req, 'd> for #target
             #sh_where
         {
-            type Bound = #bound;
-            const BODY: #ns_http::payload::Kind = #kind;
+            type Bound = #selected::Bound;
+            const BODY: #ns_http::payload::Kind = #selected::BODY;
 
             fn complete<#g_sink>(self, #v_sink: #g_sink) -> ::core::result::Result<
                 #g_sink::Output, #g_sink::Error,
@@ -153,7 +150,7 @@ pub(crate) fn build(
                     #v_headers = #head;
                     #v_body = #init;
                 }
-                #ns_http::payload::response::dispatch::Accept::#accept(
+                #selected::emit(
                     #v_sink, #v_status, #v_headers, #v_body,
                 )
             }

@@ -5,7 +5,7 @@ use crate::{
     payload::{
         fixed::Body,
         response::{
-            self, bounded, exact,
+            self, encoded,
             headers::{self, set},
             status::Code,
         },
@@ -81,15 +81,12 @@ pub trait Accept<'d>: Sized {
         self.fixed(status, headers, body)
     }
 
-    fn exact<H, B>(self, status: Code, headers: H, body: B) -> Result<Self::Output, Self::Error>
-    where
-        H: field::Source<headers::Application>,
-        B: exact::TryBody;
-
-    fn bounded<H, B>(self, status: Code, headers: H, body: B) -> Result<Self::Output, Self::Error>
-    where
-        H: field::Source<headers::Application>,
-        B: bounded::Body;
+    fn encoded<const EXACT: bool>(
+        self,
+        status: Code,
+        headers: impl field::Source<headers::Application>,
+        body: impl encoded::Source<EXACT>,
+    ) -> Result<Self::Output, Self::Error>;
 }
 
 /// A destination that also transfers ownership of a body stream.

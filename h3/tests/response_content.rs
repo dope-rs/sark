@@ -51,8 +51,8 @@ fn suppress_content() {
             let result = match kind {
                 0 => Accept::fixed(encoder, status, (), b"body".to_vec()),
                 1 => Accept::statics(encoder, status, (), fixed::Body::new(b"body")),
-                2 => Accept::exact(encoder, status, (), Body(&calls)),
-                3 => Accept::bounded(encoder, status, (), Body(&calls)),
+                2 => Accept::encoded::<true>(encoder, status, (), Body(&calls)),
+                3 => Accept::encoded::<false>(encoder, status, (), Body(&calls)),
                 _ => Sink::stream(encoder, status, (), (kind == 4).then_some(Body(&calls))).map(
                     |(head, body)| {
                         assert!(body.is_none());
@@ -137,8 +137,8 @@ fn reject_informational() {
         let result = match kind {
             0 => Accept::fixed(encoder, Code::EARLY_HINTS, (), b"body".to_vec()),
             1 => Accept::statics(encoder, Code::EARLY_HINTS, (), fixed::Body::new(b"body")),
-            2 => Accept::exact(encoder, Code::EARLY_HINTS, (), Body(&calls)),
-            3 => Accept::bounded(encoder, Code::EARLY_HINTS, (), Body(&calls)),
+            2 => Accept::encoded::<true>(encoder, Code::EARLY_HINTS, (), Body(&calls)),
+            3 => Accept::encoded::<false>(encoder, Code::EARLY_HINTS, (), Body(&calls)),
             _ => Sink::stream(encoder, Code::EARLY_HINTS, (), Some(Body(&calls)))
                 .map(|(head, _)| head),
         };

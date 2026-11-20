@@ -1,12 +1,8 @@
-use crate::{field, payload::response::status::Code};
 mod overflow;
-mod plan;
 
-use o3::buffer::resident::bound;
 pub use overflow::Overflow;
-pub use plan::Plan;
 
-use crate::payload::response::{Encode, dispatch, headers};
+use super::Encode;
 
 pub trait Body: Encode {
     fn encoded_len(&self) -> usize;
@@ -20,47 +16,5 @@ pub trait TryBody: Encode {
 impl<B: Body> TryBody for B {
     fn try_len(&self) -> Result<usize, Overflow> {
         Ok(self.encoded_len())
-    }
-}
-
-/// Exact response retaining every generated field in its original type.
-pub struct Direct<H, B> {
-    status: Code,
-    fields: H,
-    body: B,
-}
-
-impl<H, B> Direct<H, B> {
-    pub fn new(status: Code, fields: H, body: B) -> Self {
-        Self {
-            status,
-            fields,
-            body,
-        }
-    }
-
-    pub fn status(&self) -> Code {
-        self.status
-    }
-}
-
-impl<'req, 'd, H, B> dispatch::Complete<'req, 'd> for Direct<H, B>
-where
-    H: field::Source<headers::Application>,
-    B: TryBody,
-{
-    const BODY: crate::payload::Kind = crate::payload::Kind::Inline;
-    type Bound = bound::Unbounded;
-
-    fn complete<S>(self, sink: S) -> Result<S::Output, S::Error>
-    where
-        S: dispatch::Accept<'d>,
-    {
-        let Self {
-            status,
-            fields,
-            body,
-        } = self;
-        dispatch::Accept::exact(sink, status, fields, body)
     }
 }

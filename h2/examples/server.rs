@@ -40,7 +40,7 @@ use sark_http::{
     field,
     payload::{
         fixed::Body,
-        response::{headers, statics, status::Code},
+        response::{Static, headers, status::Code},
     },
 };
 
@@ -60,7 +60,7 @@ enum Setup {
     Run,
 }
 
-fn echo<'a>(request: Request<'_, '_, '_>) -> statics::Direct<'a, [headers::Entry<'a>; 1]> {
+fn echo<'a>(request: Request<'_, '_, '_>) -> Static<'a, [headers::Entry<'a>; 1]> {
     let fields = [headers::Entry::new(
         field::literal!(headers::Name::try_bytes(b"content-type")),
         field::literal!(field::Value::try_bytes(b"text/plain; charset=utf-8")),
@@ -70,7 +70,7 @@ fn echo<'a>(request: Request<'_, '_, '_>) -> statics::Direct<'a, [headers::Entry
     } else {
         Body::new(b"hello from sark-h2\n")
     };
-    statics::Direct::new(Code::OK, fields, body)
+    Static::new(Code::OK, fields, body)
 }
 
 impl Settings {
@@ -217,9 +217,15 @@ fn run() -> io::Result<ExitCode> {
                         "echo_server: worker {cpu:?}: bus={bus:?}, handoff={handoff:?}"
                     ))?;
                     match source {
-                        Setup::Config(error) => write(format_args!("echo_server: configuration: {error:?}")),
-                        Setup::Claim(error) => write(format_args!("echo_server: driver admission: {error:?}")),
-                        Setup::Output(error) => write(format_args!("echo_server: diagnostic output: {error}")),
+                        Setup::Config(error) => {
+                            write(format_args!("echo_server: configuration: {error:?}"))
+                        }
+                        Setup::Claim(error) => {
+                            write(format_args!("echo_server: driver admission: {error:?}"))
+                        }
+                        Setup::Output(error) => {
+                            write(format_args!("echo_server: diagnostic output: {error}"))
+                        }
                         Setup::Run => write(format_args!("echo_server: worker run failed")),
                     }
                 }

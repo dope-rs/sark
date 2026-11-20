@@ -16,7 +16,7 @@ use sark_http::{
     owner::{evidence, evidence::Sink as _, handoff, handoff::stage},
     payload::{
         fixed,
-        response::{Body, Content, Method, bounded, dispatch, exact, headers, status::Code},
+        response::{Body, Content, Method, dispatch, encoded, headers, status::Code},
     },
     request::Id,
 };
@@ -411,40 +411,24 @@ impl<'a, 'req, 'd: 'req, P: rules::Policy, Q: scope::Source, I: stage::Body<'req
         self.prepare(status, headers, body, bytes)
     }
 
-    fn exact<H, B>(self, status: Code, headers: H, body: B) -> Result<Self::Output, Self::Error>
-    where
-        H: field::Source<headers::Application>,
-        B: exact::TryBody,
-    {
+    fn encoded<const EXACT: bool>(
+        self,
+        status: Code,
+        headers: impl field::Source<headers::Application>,
+        body: impl encoded::Source<EXACT>,
+    ) -> Result<Self::Output, Self::Error> {
         if self.omit(status)? {
             return self.empty(status, headers);
         }
-        let plan = match exact::Plan::try_new(body) {
+        let plan = match body.try_plan() {
             Ok(plan) => plan,
-            Err(rejected) => {
+            Err(error) => {
                 return Err((
-                    conn::Error::Size(rejected.discard()),
+                    conn::Error::Size(error.into()),
                     decode::Cancel::cancel(self),
                 ));
             }
         };
-        let body = match plan.into_shared() {
-            Ok(body) => body,
-            Err(error) => return Err((conn::Error::Build(error), decode::Cancel::cancel(self))),
-        };
-        let bytes = body.len();
-        self.prepare(status, headers, body, bytes)
-    }
-
-    fn bounded<H, B>(self, status: Code, headers: H, body: B) -> Result<Self::Output, Self::Error>
-    where
-        H: field::Source<headers::Application>,
-        B: bounded::Body,
-    {
-        if self.omit(status)? {
-            return self.empty(status, headers);
-        }
-        let plan = bounded::Plan::new(body);
         let body = match plan.into_shared() {
             Ok(body) => body,
             Err(error) => return Err((conn::Error::Build(error), decode::Cancel::cancel(self))),

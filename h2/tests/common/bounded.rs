@@ -2,7 +2,7 @@ use std::cell::Cell;
 
 use o3::buffer::resident::bound;
 use sark_h2::server::service::{Handler, Request};
-use sark_http::payload::response::{fixed, status::Code};
+use sark_http::payload::response::{Fixed, status::Code};
 
 pub const BODY_LEN: usize = 64 << 10;
 
@@ -11,7 +11,7 @@ pub struct Oversized<'a, const LIMIT: usize>(pub &'a Cell<usize>);
 impl<const LIMIT: usize> Handler for Oversized<'_, LIMIT> {
     type Egress<'d> = bound::AtMost<LIMIT>;
     type Output<'req, 'd>
-        = fixed::Direct<(), Vec<u8>>
+        = Fixed<(), Vec<u8>>
     where
         Self: 'req,
         'd: 'req;
@@ -21,6 +21,6 @@ impl<const LIMIT: usize> Handler for Oversized<'_, LIMIT> {
         'd: 'req,
     {
         self.0.set(self.0.get() + 1);
-        fixed::Direct::new(Code::OK, (), vec![b'x'; BODY_LEN])
+        Fixed::new(Code::OK, (), vec![b'x'; BODY_LEN])
     }
 }

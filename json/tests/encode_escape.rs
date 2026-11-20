@@ -1,7 +1,7 @@
 use crate::common::nested::Empty;
 pub mod common;
-use o3::buffer::storage;
-use sark_http::payload::response::exact;
+use o3::buffer::{storage, write::Slice};
+use sark_http::payload::response::encoded::Plan;
 use sark_json::{
     parsing,
     writing::{Body, TrySize, Writer},
@@ -20,11 +20,11 @@ fn escapes_adjacent() {
 
 #[test]
 fn rejects_overflow() {
-    let plan = exact::Plan::try_new(Body::new(Length::<0>))
+    let plan = Plan::try_exact(Body::new(Length::<0>))
         .map_err(|rejected| rejected.discard())
         .expect("size");
     let error = plan
-        .encode(&mut [])
+        .write(&mut Slice::new(&mut []))
         .expect_err("overflow must report the exact sink failure");
     assert!(
         matches!(error, storage::BuildError::Build(_)),
@@ -39,12 +39,12 @@ fn rejects_overflow() {
 #[test]
 fn empty_view_exact() {
     let value = <Empty as parsing::Request>::decode(b"{}").expect("decode empty JSON object");
-    let plan = exact::Plan::try_new(Body::new(value))
+    let plan = Plan::try_exact(Body::new(value))
         .map_err(|rejected| rejected.discard())
         .expect("size");
-    assert_eq!(plan.len(), 2);
+    assert_eq!(plan.limit(), 2);
     let mut bytes = [0; 2];
-    plan.encode(&mut bytes)
+    plan.write(&mut Slice::new(&mut bytes))
         .expect("write exact empty JSON object");
     assert_eq!(&bytes, b"{}");
 }

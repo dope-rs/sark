@@ -4,7 +4,7 @@ use std::cell::Cell;
 
 use dope_test::fibers::Yield;
 use o3::buffer::write::{Sink, consume};
-use sark_http::payload::response::{Encode, exact, status};
+use sark_http::payload::response::{Encode, Exact, exact, status};
 
 pub struct State<'a, 'b> {
     pub first: &'a [u8],
@@ -38,7 +38,7 @@ pub struct ModeRequest {
     mode: usize,
 }
 
-type Response<'a, 'b> = exact::Direct<(), Body<'a, 'b>>;
+type Response<'a, 'b> = Exact<(), Body<'a, 'b>>;
 type Outcome<'a, 'b> = Result<Response<'a, 'b>, Response<'a, 'b>>;
 
 struct Rejected<'a, 'b>(Body<'a, 'b>);

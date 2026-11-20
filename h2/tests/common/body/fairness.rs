@@ -3,7 +3,7 @@ use std::cell::Cell;
 use sark_h2::server::service::{Handler, Request};
 use sark_http::{
     o3::buffer::resident::bound,
-    payload::response::{fixed, headers::Entry, status::Code},
+    payload::response::{Fixed, headers::Entry, status::Code},
     request::body,
 };
 
@@ -26,7 +26,7 @@ pub struct Fairness<'a, F> {
 impl<F: Fn()> Handler for Fairness<'_, F> {
     type Egress<'d> = bound::Unbounded;
     type Output<'req, 'd>
-        = fixed::Direct<[Entry<'req>; 1], body::Ref<'req, 'd>>
+        = Fixed<[Entry<'req>; 1], body::Ref<'req, 'd>>
     where
         Self: 'req,
         'd: 'req;
@@ -45,7 +45,7 @@ impl<F: Fn()> Handler for Fairness<'_, F> {
                 (self.first)();
             }
         }
-        let response = fixed::Direct::new(Code::OK, [TEXT], body);
+        let response = Fixed::new(Code::OK, [TEXT], body);
         let returned = response
             .body()
             .as_slice()

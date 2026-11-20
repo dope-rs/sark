@@ -121,9 +121,9 @@ fn skip_head_encoding() {
             };
             let encoder = Encoder::new(&mut server, stream, Ref::from_slice(&[]));
             let prepared = if bounded {
-                Accept::bounded(encoder, Code::OK, (), body)
+                Accept::encoded::<false>(encoder, Code::OK, (), body)
             } else {
-                Accept::exact(encoder, Code::OK, (), body)
+                Accept::encoded::<true>(encoder, Code::OK, (), body)
             }
             .expect("HEAD response");
             assert_eq!(encoded.get(), 0);
@@ -161,7 +161,7 @@ fn requires_request_head() {
         let dropped = Cell::new(0);
         let encoder = Encoder::new(&mut server, stream, Ref::from_slice(&[]));
         assert!(matches!(
-            Accept::exact(
+            Accept::encoded::<true>(
                 encoder,
                 Code::OK,
                 (),

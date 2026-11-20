@@ -3,7 +3,7 @@ pub mod common;
 use std::{cell::Cell, num::NonZero};
 
 use common::encode::{Document, Value};
-use sark_http::payload::response::exact;
+use sark_http::payload::response::{encoded::Plan, exact};
 use sark_json::writing::{Body, EncodeError, TryEncode};
 
 #[test]
@@ -17,7 +17,7 @@ fn rejects_with_owner() {
             drops: &drops,
         },
     });
-    let rejected = exact::Plan::try_new(body).err().expect("overflow");
+    let rejected = Plan::try_exact(body).err().expect("overflow");
     assert_eq!(
         *rejected.error(),
         exact::Overflow {
@@ -41,10 +41,10 @@ fn sizes_once() {
             drops: &drops,
         },
     });
-    let plan = exact::Plan::try_new(body)
+    let plan = Plan::try_exact(body)
         .map_err(|rejected| rejected.discard())
         .expect("size");
-    assert_eq!(plan.len(), 14);
+    assert_eq!(plan.limit(), 14);
     let encoded = plan.into_shared().expect("encode");
     assert_eq!(encoded.as_ref(), br#"{"value":true}"#);
     assert_eq!(sizes.get(), 1);

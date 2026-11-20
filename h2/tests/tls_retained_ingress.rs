@@ -53,7 +53,7 @@ use sark_h2::{
 };
 use sark_http::payload::{
     fixed::Body,
-    response::{statics, status::Code},
+    response::{Static, status::Code},
 };
 
 #[test]
@@ -109,7 +109,7 @@ fn retains_across_records() {
                                 .all(|byte| *byte == b'x')
                         );
                         done.set(done.get() + 1);
-                        statics::Direct::new(Code::OK, [], Body::new(tls::RESPONSE))
+                        Static::new(Code::OK, [], Body::new(tls::RESPONSE))
                     });
                     let prepared = plan
                         .with_direct::<Tls<roles::Server>, _, _, modes::Sync>(

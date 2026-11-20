@@ -1,22 +1,24 @@
 //! Response state, encoding, and ownership handoff.
 
-use o3::buffer::{
-    storage,
-    write::{Sink, Slice, Split, consume},
-};
+use o3::buffer::write::{Sink, consume};
 
 use crate::payload::response::status::Code;
 
 mod body;
 pub mod bounded;
 pub mod dispatch;
+pub mod encoded;
 pub mod exact;
-pub mod fixed;
 pub mod headers;
-pub mod statics;
+pub mod output;
 pub mod status;
 
 pub use body::Body;
+
+pub type Fixed<H, B> = output::Output<H, B, output::Fixed>;
+pub type Static<'body, H> = output::Output<H, crate::payload::fixed::Body<'body>, output::Static>;
+pub type Exact<H, B> = output::Output<H, B, output::Encoded<true>>;
+pub type Bounded<H, B> = output::Output<H, B, output::Encoded<false>>;
 
 /// Request methods whose semantics affect response content.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -73,19 +75,6 @@ pub trait Encode: Sized {
     fn encode<W>(self, out: &mut W) -> Result<(), consume::Error>
     where
         W: Sink<Error = consume::Error>;
-}
-
-fn try_encode<'writer, 'target, L: std::borrow::BorrowMut<usize>>(
-    out: &'writer mut Slice<'target, L>,
-    limit: usize,
-    body: impl Encode,
-) -> Result<Split<'writer, 'target, L>, storage::BuildError<consume::Error>> {
-    let mut split = out
-        .try_split(0, limit)
-        .map_err(storage::BuildError::Build)?;
-    body.encode(&mut split.body())
-        .map_err(storage::BuildError::Build)?;
-    Ok(split)
 }
 
 use std::borrow::Cow;

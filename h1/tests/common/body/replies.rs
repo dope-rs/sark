@@ -95,8 +95,8 @@ impl<'req, 'd> dispatch::Complete<'req, 'd> for Reply<'_> {
         match self.shape {
             Shape::Fixed => sink.fixed(self.status, (), BYTES),
             Shape::Static => sink.statics(self.status, (), fixed::Body::new(BYTES)),
-            Shape::Exact => sink.exact(self.status, (), Untouched(self.calls)),
-            Shape::Bounded => sink.bounded(self.status, (), Untouched(self.calls)),
+            Shape::Exact => sink.encoded::<true>(self.status, (), Untouched(self.calls)),
+            Shape::Bounded => sink.encoded::<false>(self.status, (), Untouched(self.calls)),
         }
     }
 }

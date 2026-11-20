@@ -81,10 +81,10 @@ pub fn try_encode<'d>(
         payload::{
             compress::{Compression as _, Gzip},
             fixed::Body,
-            response::{fixed, status::Code},
+            response::{Fixed, status::Code},
         },
     };
-    let response = fixed::Direct::new(Code::OK, source, Body::new(input));
+    let response = Fixed::new(Code::OK, source, Body::new(input));
     let mut bytes = [0; 512];
     let mut gzip = Gzip::try_new()?;
     Ok(output::Egress::new(

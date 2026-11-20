@@ -4,7 +4,7 @@ use o3::buffer::{
     resident, storage,
     write::{Slice, consume},
 };
-use sark_http::payload::response::{bounded, exact};
+use sark_http::payload::response::{Encode, encoded::Plan};
 
 #[repr(C)]
 pub(in crate::server::response) struct Inline {
@@ -18,27 +18,12 @@ impl Inline {
     pub(in crate::server::response) const CAPACITY: usize =
         size_of::<resident::Shared<'static>>() - size_of::<usize>() - 2 * size_of::<u8>();
 
-    pub(in crate::server::response) fn try_exact<B: exact::TryBody>(
-        plan: exact::Plan<B>,
+    pub(in crate::server::response) fn try_encode<B: Encode, const EXACT: bool>(
+        plan: Plan<B, EXACT>,
     ) -> Result<Self, storage::BuildError<consume::Error>> {
         let mut bytes = [MaybeUninit::uninit(); Self::CAPACITY];
         let mut out = Slice::uninit(&mut bytes);
-        plan.encode(&mut out)?;
-        let extent = out.finish() as u8;
-        Ok(Self {
-            _align: [],
-            bytes,
-            extent,
-            sent: 0,
-        })
-    }
-
-    pub(in crate::server::response) fn try_bounded<B: bounded::TryBody>(
-        plan: bounded::Plan<B>,
-    ) -> Result<Self, storage::BuildError<consume::Error>> {
-        let mut bytes = [MaybeUninit::uninit(); Self::CAPACITY];
-        let mut out = Slice::uninit(&mut bytes);
-        plan.encode(&mut out)?;
+        plan.write(&mut out)?;
         let extent = out.finish() as u8;
         Ok(Self {
             _align: [],

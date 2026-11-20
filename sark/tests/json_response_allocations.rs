@@ -10,7 +10,7 @@ use o3::{base::cell::region, buffer::resident};
 use sark::http::{
     field::{self, Value, metadata::section::rules},
     o3::buffer::{storage::Shared, write::Staged},
-    payload::response::{dispatch::Complete as _, exact, headers::head::Head, status::Code},
+    payload::response::{Exact, dispatch::Complete as _, headers::head::Head, status::Code},
     request::body::Ref,
 };
 use sark_core::manifold::{schedule, stream::Boundary};
@@ -41,9 +41,7 @@ fn writes_borrowed_body() {
         key,
         owned: Value::new(Shared::try_copy(b"owned").expect("owned header")).expect("valid header"),
     };
-    assert!(
-        mem::size_of_val(&response) < mem::size_of::<exact::Direct<Head<'_, 2>, RawBody<'_>>>()
-    );
+    assert!(mem::size_of_val(&response) < mem::size_of::<Exact<Head<'_, 2>, RawBody<'_>>>());
     let mut out = [0u8; 64];
     let expected =
         b"content-type: text/plain\r\ncache-control: no-store\r\nx-key: alpha\r\nx-owned: owned\r\n";

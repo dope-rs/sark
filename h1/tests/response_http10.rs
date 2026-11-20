@@ -26,7 +26,7 @@ use sark_http::{
         response::{Date, Server},
     },
     owner::handoff,
-    payload::response::{fixed, status::Code},
+    payload::response::{Fixed, status::Code},
 };
 
 #[test]
@@ -43,7 +43,7 @@ fn fixed_connections() {
         let mut bytes = [0; 256];
         let mut writer = Slice::new(&mut bytes);
         let result = output::Egress::new(writer.reborrow(), DATE, response).route(
-            fixed::Direct::new(Code::OK, (), replies::BYTES),
+            Fixed::new(Code::OK, (), replies::BYTES),
             handoff::Slot::ready(None),
             &mut (),
             policy,
