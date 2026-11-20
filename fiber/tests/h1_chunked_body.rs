@@ -1,19 +1,18 @@
 pub mod common;
 
 use std::{
-    cell::Cell,
     net::{Shutdown, SocketAddr},
     time::Duration,
 };
 
 use common::{
-    retained::State,
+    retained,
     route::chunked::{
         apps::ChunkedDispatch,
         peer::{Error, Peer},
         wire::{LARGE_BODY_LEN, Request, UPLOAD},
     },
-    server::{self, Plan},
+    server::{MAX_CONNECTIONS, Plan},
 };
 use dope::core::io::socket::option::Buffer;
 use dope_test::harness::{peer::Error as PeerError, server::Pair};
@@ -26,29 +25,11 @@ fn serve<R>(buffers: Option<Buffer>, client: impl FnOnce(SocketAddr) -> R) -> R 
         None => plan,
     }
     .build();
-    pair.check(
+    pair.run(
         |context, listener| {
-            let mut reports = Plan::try_reports(&plan).expect("claims");
-            let failures = Cell::new(Vec::new());
-            let result = server::serve::<ChunkedDispatch, _>(
-                plan.with_bound(listener),
-                context,
-                State(&failures),
-                server::MAX_CONNECTIONS,
-                &mut reports,
-            );
-            assert!(
-                reports.events().expect("reclaimed resources").is_empty(),
-                "retirement: {reports:?}"
-            );
-            let failures = failures.take();
-            assert!(failures.is_empty(), "retention: {failures:?}");
-            result
+            retained::try_serve::<ChunkedDispatch>(plan, context, listener, MAX_CONNECTIONS)
         },
         client,
-        |result| {
-            assert!(result.is_ok(), "server shutdown: {:?}", result.err());
-        },
     )
     .expect("pair")
 }

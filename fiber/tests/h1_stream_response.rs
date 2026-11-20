@@ -11,7 +11,7 @@ use std::{
 
 use common::{
     route::body::stream::*,
-    server::{self, Plan, peer::Endpoint as _},
+    server::{self, MAX_CONNECTIONS, Plan, peer::Endpoint as _, try_serve},
 };
 use dope::{
     net::wire::{self, domain},
@@ -28,23 +28,18 @@ use sark_h1::server::run;
 
 #[test]
 fn pending_chunks_complete() {
-    let harness = Pair::bind().expect("bind isolated listener");
-    let bind = harness.addr();
-    let server = server::Plan::new(bind, Duration::from_secs(10)).build();
+    let (harness, server) = Plan::isolated();
 
     harness
-        .check(
+        .run(
             |context, listener| {
-                let mut reports = Plan::try_reports(&server).expect("server descriptor claims");
-                let result = server::serve::<StreamPendingDispatch, _>(
-                    server.with_bound(listener),
+                try_serve::<StreamPendingDispatch, _>(
+                    server,
                     context,
+                    listener,
                     (),
-                    server::MAX_CONNECTIONS,
-                    &mut reports,
-                );
-                server::reclaimed(&reports);
-                result
+                    MAX_CONNECTIONS,
+                )
             },
             |bind| {
                 let resp = bind.try_get("/stream").expect("complete pending stream");
@@ -59,36 +54,24 @@ fn pending_chunks_complete() {
                 );
                 assert!(resp.ends_with(b"5\r\nalpha\r\n5\r\n-beta\r\n6\r\n-gamma\r\n0\r\n\r\n"));
             },
-            |result| {
-                assert!(
-                    result.is_ok(),
-                    "pending_chunks_complete server shutdown: {:?}",
-                    result.err()
-                );
-            },
         )
         .expect("harness");
 }
 
 #[test]
 fn streams_response() {
-    let harness = Pair::bind().expect("bind isolated listener");
-    let bind = harness.addr();
-    let server = server::Plan::new(bind, Duration::from_secs(10)).build();
+    let (harness, server) = Plan::isolated();
 
     harness
-        .check(
+        .run(
             |context, listener| {
-                let mut reports = Plan::try_reports(&server).expect("server descriptor claims");
-                let result = server::serve::<StreamDispatch, _>(
-                    server.with_bound(listener),
+                try_serve::<StreamDispatch, _>(
+                    server,
                     context,
+                    listener,
                     State(|result| result.expect("stream response")),
-                    server::MAX_CONNECTIONS,
-                    &mut reports,
-                );
-                server::reclaimed(&reports);
-                result
+                    MAX_CONNECTIONS,
+                )
             },
             |bind| {
                 let response = bind.try_get("/stream").expect("complete stream");
@@ -139,9 +122,6 @@ fn streams_response() {
                     String::from_utf8_lossy(&response),
                 );
             },
-            |result| {
-                assert!(result.is_ok(), "streamed response server shutdown: {:?}", result.err());
-            },
         )
         .expect("harness");
 }
@@ -171,7 +151,7 @@ fn late_failure_closes() {
                     context,
                     |worker| worker.lend(|plan, stage| Brand::with(|brand| {
                         let app = StreamFailureDispatch::with_observer(
-                            brand, &state, Config::new(server::MAX_CONNECTIONS),
+                            brand, &state, Config::new(MAX_CONNECTIONS),
                             Observer { events: &events, snapshots: &snapshots, diagnostics: &diagnostics },
                         );
                         plan.install(

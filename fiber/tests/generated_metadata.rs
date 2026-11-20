@@ -1,35 +1,20 @@
 pub mod common;
 
-use std::{
-    net::{Shutdown, TcpStream},
-    time::Duration,
-};
+use std::net::{Shutdown, TcpStream};
 
 use common::{
     route::{select::SelectiveDispatch, skip::SkipDispatch},
-    server::{self, Plan, peer::Endpoint as _},
+    server::{MAX_CONNECTIONS, Plan, peer::Endpoint as _, try_serve},
 };
-use dope_test::harness::server::Pair;
 
 #[test]
 fn selects_requested_fields() {
-    let harness = Pair::bind().expect("bind isolated listener");
-    let bind = harness.addr();
-    let server = server::Plan::new(bind, Duration::from_secs(10)).build();
+    let (harness, server) = Plan::isolated();
 
     harness
-        .check(
+        .run(
             |context, listener| {
-                let mut reports = Plan::try_reports(&server).expect("server descriptor claims");
-                let result = server::serve::<SelectiveDispatch, _>(
-                    server.with_bound(listener),
-                    context,
-                    (),
-                    server::MAX_CONNECTIONS,
-                    &mut reports,
-                );
-                server::reclaimed(&reports);
-                result
+                try_serve::<SelectiveDispatch, _>(server, context, listener, (), MAX_CONNECTIONS)
             },
             |addr| {
                 TcpStream::connect(addr)
@@ -96,36 +81,18 @@ fn selects_requested_fields() {
                     Some(b"400".as_slice()),
                 );
             },
-            |result| {
-                assert!(
-                    result.is_ok(),
-                    "selective request server shutdown: {:?}",
-                    result.err()
-                );
-            },
         )
         .expect("harness");
 }
 
 #[test]
 fn skip_shapes_headers() {
-    let harness = Pair::bind().expect("bind isolated listener");
-    let bind = harness.addr();
-    let server = server::Plan::new(bind, Duration::from_secs(10)).build();
+    let (harness, server) = Plan::isolated();
 
     harness
-        .check(
+        .run(
             |context, listener| {
-                let mut reports = Plan::try_reports(&server).expect("server descriptor claims");
-                let result = server::serve::<SkipDispatch, _>(
-                    server.with_bound(listener),
-                    context,
-                    (),
-                    server::MAX_CONNECTIONS,
-                    &mut reports,
-                );
-                server::reclaimed(&reports);
-                result
+                try_serve::<SkipDispatch, _>(server, context, listener, (), MAX_CONNECTIONS)
             },
             |bind| {
                 let lean =
@@ -196,13 +163,6 @@ fn skip_shapes_headers() {
                 assert!(
                     no_date.ends_with("\r\n\r\nok"),
                     "no-date body must arrive: {no_date:?}"
-                );
-            },
-            |result| {
-                assert!(
-                    result.is_ok(),
-                    "skip_shapes_headers server shutdown: {:?}",
-                    result.err()
                 );
             },
         )

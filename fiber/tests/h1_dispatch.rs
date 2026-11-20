@@ -18,29 +18,19 @@ use common::{
         },
     },
     server::{
-        self, Plan,
+        MAX_CONNECTIONS, Plan,
         peer::{Endpoint as _, Receive as _, Response as _},
+        try_serve,
     },
 };
-use dope_test::harness::server::Pair;
 
 #[test]
 fn handler_return_scopes() {
-    let harness = Pair::bind().expect("bind isolated listener");
-    let server = server::Plan::new(harness.addr(), Duration::from_secs(10)).build();
+    let (harness, server) = Plan::isolated();
     harness
-        .check(
+        .run(
             |context, listener| {
-                let mut reports = Plan::try_reports(&server).expect("server descriptor claims");
-                let result = server::serve::<HygieneRoutes, _>(
-                    server.with_bound(listener),
-                    context,
-                    (),
-                    server::MAX_CONNECTIONS,
-                    &mut reports,
-                );
-                server::reclaimed(&reports);
-                result
+                try_serve::<HygieneRoutes, _>(server, context, listener, (), MAX_CONNECTIONS)
             },
             |bind| {
                 for (path, expected) in [("/standard", "ok"), ("/early", "early")] {
@@ -59,36 +49,18 @@ fn handler_return_scopes() {
                     assert_eq!(body, expected, "{path}");
                 }
             },
-            |result| {
-                assert!(
-                    result.is_ok(),
-                    "server preparation failed: {:?}",
-                    result.err()
-                );
-            },
         )
         .expect("harness");
 }
 
 #[test]
 fn rejects_bad_authority() {
-    let harness = Pair::bind().expect("bind isolated listener");
-    let bind = harness.addr();
-    let server = server::Plan::new(bind, Duration::from_secs(10)).build();
+    let (harness, server) = Plan::isolated();
 
     harness
-        .check(
+        .run(
             |context, listener| {
-                let mut reports = Plan::try_reports(&server).expect("server descriptor claims");
-                let result = server::serve::<HelloDispatch, _>(
-                    server.with_bound(listener),
-                    context,
-                    (),
-                    server::MAX_CONNECTIONS,
-                    &mut reports,
-                );
-                server::reclaimed(&reports);
-                result
+                try_serve::<HelloDispatch, _>(server, context, listener, (), MAX_CONNECTIONS)
             },
             |bind| {
                 for (name, wire) in [
@@ -129,9 +101,6 @@ fn rejects_bad_authority() {
                     }
                 }
             },
-            |result| {
-                assert!(result.is_ok(), "server preparation failed: {:?}", result.err());
-            },
         )
         .expect("harness");
 }
@@ -161,23 +130,19 @@ fn guarded_get(addr: net::SocketAddr, path: &str) -> Vec<u8> {
 
 #[test]
 fn guard_integration() {
-    let harness = Pair::bind().expect("bind isolated listener");
-    let bind = harness.addr();
-    let server = server::Plan::new(bind, Duration::from_secs(10)).build();
+    let (harness, server) = Plan::isolated();
 
     harness
-        .check(
+        .run(
             |context, listener| {
                 let events = Cell::new(Vec::new());
-                let mut reports = Plan::try_reports(&server).expect("server descriptor claims");
-                let result = server::serve::<GuardDispatch, _>(
-                    server.with_bound(listener),
+                let result = try_serve::<GuardDispatch, _>(
+                    server,
                     context,
+                    listener,
                     State(&events),
-                    server::MAX_CONNECTIONS,
-                    &mut reports,
+                    MAX_CONNECTIONS,
                 );
-                server::reclaimed(&reports);
                 assert_eq!(
                     events.into_inner(),
                     [
@@ -240,36 +205,18 @@ fn guard_integration() {
                     );
                 }
             },
-            |result| {
-                assert!(
-                    result.is_ok(),
-                    "server preparation failed: {:?}",
-                    result.err()
-                )
-            },
         )
         .expect("harness");
 }
 
 #[test]
 fn survives_bad_lengths() {
-    let harness = Pair::bind().expect("bind isolated listener");
-    let bind = harness.addr();
-    let server = server::Plan::new(bind, Duration::from_secs(10)).build();
+    let (harness, server) = Plan::isolated();
 
     harness
-        .check(
+        .run(
             |context, listener| {
-                let mut reports = Plan::try_reports(&server).expect("server descriptor claims");
-                let result = server::serve::<ClOverflowDispatch, _>(
-                    server.with_bound(listener),
-                    context,
-                    (),
-                    server::MAX_CONNECTIONS,
-                    &mut reports,
-                );
-                server::reclaimed(&reports);
-                result
+                try_serve::<ClOverflowDispatch, _>(server, context, listener, (), MAX_CONNECTIONS)
             },
             |bind| {
                 let lengths: &[&str] = &[
@@ -341,9 +288,6 @@ fn survives_bad_lengths() {
                     .expect("read valid POST response");
                 assert!(resp.contains("200 "), "well-formed POST failed: {resp}");
                 assert!(resp.contains("echoed"), "echo handler not reached: {resp}");
-            },
-            |result| {
-                assert!(result.is_ok(), "survives_bad_lengths server shutdown: {:?}", result.err());
             },
         )
         .expect("harness");

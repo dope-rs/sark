@@ -1,11 +1,11 @@
 pub mod common;
 
-use std::{cell::Cell, thread, time::Duration};
+use std::{thread, time::Duration};
 
 use common::{
-    retained::{self, Echo, NESTED, Post, State, wire},
-    route::{body::retained::EchoDispatch, chunked::peer::Peer},
-    server::{self, Plan},
+    retained::{self, Echo, EchoDispatch, NESTED, Post, wire},
+    route::{body::retained as users, chunked::peer::Peer},
+    server::{MAX_CONNECTIONS, Plan},
 };
 
 #[test]
@@ -14,19 +14,7 @@ fn pipeline_keeps_bytes() {
 
     harness.run(
         |context, listener| {
-            let mut reports = Plan::try_reports(&server).map_err(dope::core::BranchError::Second)?;
-            let failures = Cell::new(Vec::new());
-            let result = server::serve::<EchoDispatch, _>(
-                server.with_bound(listener),
-                context,
-                State(&failures),
-                server::MAX_CONNECTIONS,
-                &mut reports,
-            );
-            server::reclaimed(&reports);
-            let failures = failures.into_inner();
-            assert!(failures.is_empty(), "retention: {failures:?}");
-            result
+            retained::try_serve::<users::EchoDispatch>(server, context, listener, MAX_CONNECTIONS)
         },
         |bind| {
             let mut sock = retained::try_connect(bind).expect("connect");
@@ -65,7 +53,7 @@ fn retains_split_and_whole_requests() {
         harness
             .run(
                 |context, listener| {
-                    retained::serve(server, context, listener, server::MAX_CONNECTIONS)
+                    retained::try_serve::<EchoDispatch>(server, context, listener, MAX_CONNECTIONS)
                 },
                 |bind| {
                     let mut socket = retained::try_connect(bind).expect("connect");
@@ -111,7 +99,9 @@ fn body_transfer() {
     let (harness, server) = Plan::isolated();
     harness
         .run(
-            |context, listener| retained::serve(server, context, listener, server::MAX_CONNECTIONS),
+            |context, listener| {
+                retained::try_serve::<EchoDispatch>(server, context, listener, MAX_CONNECTIONS)
+            },
             |bind| {
                 let payload = vec![b'x'; 16 * 1024];
                 let mut sock = retained::try_connect(bind).expect("connect");
@@ -132,15 +122,15 @@ fn body_transfer() {
 #[test]
 fn listener_admission() {
     const TASKS: usize = 1;
-    const { assert!(TASKS < server::MAX_CONNECTIONS) };
+    const { assert!(TASKS < MAX_CONNECTIONS) };
     let (harness, server) = Plan::isolated();
     harness
         .run(
-            |context, listener| retained::serve(server, context, listener, TASKS),
+            |context, listener| retained::try_serve::<EchoDispatch>(server, context, listener, TASKS),
             |bind| {
                 let head = b"POST /retained/id?q=query HTTP/1.1\r\nHost: x\r\nx-echo-marker: marker\r\nContent-Length: 2\r\nExpect: 100-continue\r\nConnection: close\r\n\r\n";
-                let mut sockets = Vec::with_capacity(server::MAX_CONNECTIONS);
-                for _ in 0..server::MAX_CONNECTIONS {
+                let mut sockets = Vec::with_capacity(MAX_CONNECTIONS);
+                for _ in 0..MAX_CONNECTIONS {
                     let mut socket = retained::try_connect(bind).expect("connect");
                     socket.write_all(head).expect("write partial body");
                     let mut acc = Vec::new();
@@ -150,7 +140,7 @@ fn listener_admission() {
                     sockets.push((socket, acc));
                 }
 
-                assert_eq!(sockets.len(), server::MAX_CONNECTIONS);
+                assert_eq!(sockets.len(), MAX_CONNECTIONS);
                 for (mut socket, mut acc) in sockets {
                     socket.write_all(b"xy").expect("finish body");
                     let (status, body) = Peer::new(&mut socket, &mut acc).try_text().expect("HTTP response");
@@ -167,7 +157,9 @@ fn json_transfer() {
     let (harness, server) = Plan::isolated();
     harness
         .run(
-            |context, listener| retained::serve(server, context, listener, server::MAX_CONNECTIONS),
+            |context, listener| {
+                retained::try_serve::<EchoDispatch>(server, context, listener, MAX_CONNECTIONS)
+            },
             |bind| {
                 let mut sock = retained::try_connect(bind).expect("connect");
                 sock.write_all(

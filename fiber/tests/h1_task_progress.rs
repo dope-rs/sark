@@ -1,7 +1,6 @@
 pub mod common;
 
 use std::{
-    cell::Cell,
     io::{Read, Write},
     net::{Shutdown, TcpStream},
     thread,
@@ -9,15 +8,15 @@ use std::{
 };
 
 use common::{
-    retained::State,
+    retained,
     route::{
         chunked::{apps::ChunkedDispatch, peer::Peer},
         glue::{
-            hello::{self, HelloDispatch},
+            hello::HelloDispatch,
             timer::Chain,
         },
     },
-    server::{self, Plan, peer::Receive as _},
+    server::{self, MAX_CONNECTIONS, Plan, peer::Receive as _, try_serve},
 };
 use dope::{
     core::{
@@ -48,19 +47,7 @@ fn waits_after_eof() {
     harness
         .run(
             |context, listener| {
-                let mut reports = Plan::try_reports(&server).map_err(BranchError::Second)?;
-                let failures = Cell::new(Vec::new());
-                let result = server::serve::<Chain, _>(
-                    server.with_bound(listener),
-                    context,
-                    State(&failures),
-                    server::MAX_CONNECTIONS,
-                    &mut reports,
-                );
-                server::reclaimed(&reports);
-                let failures = failures.into_inner();
-                assert!(failures.is_empty(), "timer: {failures:?}");
-                result
+                retained::try_serve::<Chain>(server, context, listener, MAX_CONNECTIONS)
             },
             |bind| {
                 let mut stream = TcpStream::connect(bind).expect("connect");
@@ -96,18 +83,7 @@ fn input_deadline_spans_body() {
     let plan = Plan::new(pair.addr(), HEAD_TIMEOUT).build();
     pair.run(
         |context, listener| {
-            let mut reports = Plan::try_reports(&plan).map_err(BranchError::Second)?;
-            let failures = Cell::new(Vec::new());
-            let result = server::serve::<ChunkedDispatch, _>(
-                plan.with_bound(listener),
-                context,
-                State(&failures),
-                server::MAX_CONNECTIONS,
-                &mut reports,
-            );
-            server::reclaimed(&reports);
-            assert!(failures.into_inner().is_empty());
-            result
+            retained::try_serve::<ChunkedDispatch>(plan, context, listener, MAX_CONNECTIONS)
         },
         |address| {
             for (head, dribble) in [
@@ -210,7 +186,8 @@ fn stalled_head_times_out() {
     harness
         .run(
             |context, listener| {
-                hello::try_serve(Plan::new(bind, HEAD_TIMEOUT).build(), context, listener)
+                let plan = Plan::new(bind, HEAD_TIMEOUT).build();
+                try_serve::<HelloDispatch, _>(plan, context, listener, (), MAX_CONNECTIONS)
             },
             |bind| {
                 let mut sock = TcpStream::connect(bind).expect("connect");
@@ -245,7 +222,8 @@ fn fast_request_completes() {
     harness
         .run(
             |context, listener| {
-                hello::try_serve(Plan::new(bind, HEAD_TIMEOUT).build(), context, listener)
+                let plan = Plan::new(bind, HEAD_TIMEOUT).build();
+                try_serve::<HelloDispatch, _>(plan, context, listener, (), MAX_CONNECTIONS)
             },
             |bind| {
                 let mut sock = TcpStream::connect(bind).expect("connect");
@@ -273,7 +251,8 @@ fn slow_progress_completes() {
     harness
         .run(
             |context, listener| {
-                hello::try_serve(Plan::new(bind, HEAD_TIMEOUT).build(), context, listener)
+                let plan = Plan::new(bind, HEAD_TIMEOUT).build();
+                try_serve::<HelloDispatch, _>(plan, context, listener, (), MAX_CONNECTIONS)
             },
             |bind| {
                 let mut sock = TcpStream::connect(bind).expect("connect");
@@ -319,7 +298,7 @@ fn timer_floor_covers_all() {
                     .with_install(baseline)
                     .map_err(core::BranchError::Second)?;
                 assert!(
-                    prepared.layout().schedule().timers().count().get() > server::MAX_CONNECTIONS,
+                    prepared.layout().schedule().timers().count().get() > MAX_CONNECTIONS,
                 );
                 {
                     let mut reports = reclaim::Reports::new(
@@ -333,7 +312,7 @@ fn timer_floor_covers_all() {
                             scope.lend(|plan, stage| {
                                 let app = HelloDispatch::new(
                                     &(),
-                                    sark_fiber::Config::new(server::MAX_CONNECTIONS),
+                                    sark_fiber::Config::new(MAX_CONNECTIONS),
                                 );
                                 plan.install(
                                     stage,

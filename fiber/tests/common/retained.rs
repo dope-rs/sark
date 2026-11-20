@@ -7,6 +7,7 @@ use dope::{
         driver::{schedule::clock::timer::Timer, settings::errors::Claim},
         io::socket::Listener,
     },
+    manifold::app::receive::Coupled,
     runtime::shutdown,
 };
 use dope_fiber::{
@@ -15,6 +16,7 @@ use dope_fiber::{
 };
 use dope_test::harness::{observe::VecCellExt as _, peer};
 use o3::buffer::{segments, storage};
+use sark_fiber::{Config, server::Serve};
 use sark_h1::server::run::prepare;
 use sark_http::{payload::response::status, request};
 
@@ -44,22 +46,17 @@ pub enum Failure {
 
 pub struct State<'a>(pub &'a Cell<Vec<Failure>>);
 
-pub fn serve(
+pub fn try_serve<A>(
     plan: server::Http1Plan,
     context: shutdown::ReadySource<'_>,
     listener: Listener,
     tasks: usize,
-) -> Result<(), BranchError<prepare::Error, Claim>> {
-    let mut reports = server::Plan::try_reports(&plan).map_err(BranchError::Second)?;
+) -> Result<(), BranchError<prepare::Error, Claim>>
+where
+    A: for<'a> Serve<State<'a>, Input = Coupled, Config = Config>,
+{
     let failures = Cell::new(Vec::new());
-    let result = server::serve::<EchoDispatch, _>(
-        plan.with_bound(listener),
-        context,
-        State(&failures),
-        tasks,
-        &mut reports,
-    );
-    server::reclaimed(&reports);
+    let result = server::try_serve::<A, _>(plan, context, listener, State(&failures), tasks);
     let failures = failures.into_inner();
     assert!(failures.is_empty(), "retention: {failures:?}");
     result

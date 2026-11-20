@@ -60,24 +60,27 @@ pub const DATE_UPDATER_ID: u8 = 1;
 pub(super) type Http1Plan =
     run::Plan<KeyTag<HTTP_LISTENER_ID>, KeyTag<DATE_UPDATER_ID>, sark_fiber::Throughput>;
 
-pub fn serve<A, S>(
+pub fn try_serve<A, S>(
     plan: Http1Plan,
     context: ReadySource<'_>,
+    listener: socket::Listener,
     state: S,
     tasks: usize,
-    reports: &mut Reports<1>,
 ) -> Result<(), BranchError<run::prepare::Error, errors::Claim>>
 where
     A: Serve<S, Input = receive::Coupled, Config = Config>,
 {
+    let mut reports = Plan::try_reports(&plan).map_err(BranchError::Second)?;
     A::serve(
-        plan,
+        plan.with_bound(listener),
         context,
         state,
         Config::new(tasks),
-        reporting(reports),
+        reporting(&mut reports),
         |result| completed(&result),
-    )
+    )?;
+    reclaimed(&reports);
+    Ok(())
 }
 
 /// Canonical deterministic Sark server topology.

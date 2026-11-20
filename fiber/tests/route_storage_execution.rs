@@ -1,52 +1,31 @@
 pub mod common;
 
 use std::{
-    cell::Cell,
-    convert::Infallible,
     io::{Read, Write},
     net::TcpStream,
     thread,
     time::{Duration, Instant},
 };
 
-use dope_test::harness::{peer::Peer, server::Pair};
+use dope_test::harness::peer::Peer;
 
 use crate::common::{
-    retained::State,
+    retained,
     route::{
         chunked::wire::Request,
         glue::storage::{self, GlobalBudgetApp, MixedStorageApp},
     },
-    server::{self, Plan},
+    server::{MAX_CONNECTIONS, Plan},
 };
 
 #[test]
 fn routes_dispatch_heterogeneous() {
-    let harness = Pair::bind().expect("bind isolated listener");
-    let bind = harness.addr();
-    let server = server::Plan::new(bind, Duration::from_secs(10)).build();
+    let (harness, server) = Plan::isolated();
 
     harness
         .run(
             |context, listener| {
-                let mut reports = Plan::try_reports(&server).expect("server descriptor claims");
-                let failures = Cell::new(Vec::new());
-                let result = server::serve::<MixedStorageApp, _>(
-                    server.with_bound(listener),
-                    context,
-                    State(&failures),
-                    server::MAX_CONNECTIONS,
-                    &mut reports,
-                );
-                server::reclaimed(&reports);
-                let failures = failures.into_inner();
-                assert!(failures.is_empty(), "storage: {failures:?}");
-                assert!(
-                    result.is_ok(),
-                    "routes_dispatch_heterogeneous server shutdown: {:?}",
-                    result.err()
-                );
-                Ok::<_, Infallible>(())
+                retained::try_serve::<MixedStorageApp>(server, context, listener, MAX_CONNECTIONS)
             },
             |bind| {
                 for (path, expected) in [
@@ -72,31 +51,12 @@ fn routes_dispatch_heterogeneous() {
 
 #[test]
 fn quota_is_reusable() {
-    let harness = Pair::bind().expect("bind isolated listener");
-    let bind = harness.addr();
-    let server = server::Plan::new(bind, Duration::from_secs(10)).build();
+    let (harness, server) = Plan::isolated();
 
     harness
         .run(
             |context, listener| {
-                let mut reports = Plan::try_reports(&server).expect("server descriptor claims");
-                let failures = Cell::new(Vec::new());
-                let result = server::serve::<GlobalBudgetApp, _>(
-                    server.with_bound(listener),
-                    context,
-                    State(&failures),
-                    1,
-                    &mut reports,
-                );
-                server::reclaimed(&reports);
-                let failures = failures.into_inner();
-                assert!(failures.is_empty(), "storage: {failures:?}");
-                assert!(
-                    result.is_ok(),
-                    "quota_is_reusable server shutdown: {:?}",
-                    result.err()
-                );
-                Ok::<_, Infallible>(())
+                retained::try_serve::<GlobalBudgetApp>(server, context, listener, 1)
             },
             |bind| {
                 {
