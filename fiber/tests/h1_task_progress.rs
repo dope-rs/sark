@@ -159,102 +159,43 @@ fn input_deadline_spans_body() {
 }
 
 #[test]
-fn stalled_head_times_out() {
+fn head_deadline_distinguishes_stalled_and_complete_requests() {
     let harness = Pair::bind().expect("reserve test address");
-    let bind = harness.addr();
+    let plan = Plan::new(harness.addr(), HEAD_TIMEOUT).build();
     harness
         .run(
-            |context, listener| {
-                let plan = Plan::new(bind, HEAD_TIMEOUT).build();
-                try_serve::<HelloDispatch, _>(plan, context, listener, (), MAX_CONNECTIONS)
-            },
+            |context, listener| try_serve::<HelloDispatch, _>(plan, context, listener, (), MAX_CONNECTIONS),
             |bind| {
-                let mut sock = TcpStream::connect(bind).expect("connect");
-                sock.set_read_timeout(Some(Duration::from_secs(5)))
-                    .expect("set timeout");
-                sock.write_all(b"GET /hello HTTP/1.1\r\nHost: x\r\n")
-                    .expect("write partial head");
+                let mut stalled = TcpStream::connect(bind).expect("stalled peer");
+                stalled.set_read_timeout(Some(Duration::from_secs(5))).expect("read deadline");
+                stalled.write_all(b"GET /hello HTTP/1.1\r\nHost: x\r\n").expect("partial head");
+                let (reply, elapsed) = stalled.try_to_close().expect("partial head retirement");
+                assert!((Duration::from_millis(300)..Duration::from_secs(4)).contains(&elapsed), "stalled head closed at {elapsed:?}");
+                let text = String::from_utf8_lossy(&reply);
+                assert!(reply.is_empty() || text.contains("408"), "{text:?}");
+                drop(stalled);
 
-                let (buf, elapsed) = sock.try_to_close().expect("partial head retirement");
-                assert!(
-                    elapsed >= Duration::from_millis(300),
-                    "closed too early ({elapsed:?}); deadline must bound from first byte"
-                );
-                assert!(
-                    elapsed < Duration::from_secs(4),
-                    "not closed by head deadline ({elapsed:?})"
-                );
-                let text = String::from_utf8_lossy(&buf);
-                assert!(
-                    buf.is_empty() || text.contains("408"),
-                    "expected close or 408, got: {text:?}"
-                );
+                for parts in [
+                    &[b"GET /hello HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n".as_slice()][..],
+                    &[b"GET /hello HTTP/1.1\r\n".as_slice(), b"Host: x\r\n", b"Connection: close\r\n\r\n"],
+                ] {
+                    let mut peer = TcpStream::connect(bind).expect("complete head peer");
+                    peer.set_read_timeout(Some(Duration::from_secs(2))).expect("read deadline");
+                    for (index, part) in parts.iter().enumerate() {
+                        if index != 0 {
+                            thread::sleep(Duration::from_millis(150));
+                        }
+                        peer.write_all(part).expect("request head");
+                    }
+                    let (reply, _) = peer.try_to_close().expect("completed head response");
+                    let text = std::str::from_utf8(&reply).expect("UTF-8 response");
+                    let (head, body) = text.split_once("\r\n\r\n").expect("response boundary");
+                    assert!(head.starts_with("HTTP/1.1 200 ") && !text.contains("408"), "{text:?}");
+                    assert_eq!(body, "hello");
+                }
             },
         )
-        .expect("stalled_head_times_out server shutdown");
-}
-
-#[test]
-fn fast_request_completes() {
-    let harness = Pair::bind().expect("reserve test address");
-    let bind = harness.addr();
-    harness
-        .run(
-            |context, listener| {
-                let plan = Plan::new(bind, HEAD_TIMEOUT).build();
-                try_serve::<HelloDispatch, _>(plan, context, listener, (), MAX_CONNECTIONS)
-            },
-            |bind| {
-                let mut sock = TcpStream::connect(bind).expect("connect");
-                sock.set_read_timeout(Some(Duration::from_secs(2)))
-                    .expect("set timeout");
-                sock.write_all(b"GET /hello HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n")
-                    .expect("write");
-                let (buf, _) = sock.try_to_close().expect("completed head response");
-                let text = std::str::from_utf8(&buf).expect("UTF-8 response");
-                assert!(text.starts_with("HTTP/1.1 200 "), "status: {text:?}");
-                assert!(!text.contains("408"), "false-positive deadline: {text:?}");
-                let (_, body) = text
-                    .split_once("\r\n\r\n")
-                    .expect("blank line separating headers from body");
-                assert_eq!(body, "hello", "body mismatch: {text:?}");
-            },
-        )
-        .expect("fast_request_completes server shutdown");
-}
-
-#[test]
-fn slow_progress_completes() {
-    let harness = Pair::bind().expect("reserve test address");
-    let bind = harness.addr();
-    harness
-        .run(
-            |context, listener| {
-                let plan = Plan::new(bind, HEAD_TIMEOUT).build();
-                try_serve::<HelloDispatch, _>(plan, context, listener, (), MAX_CONNECTIONS)
-            },
-            |bind| {
-                let mut sock = TcpStream::connect(bind).expect("connect");
-                sock.set_read_timeout(Some(Duration::from_secs(2)))
-                    .expect("set timeout");
-                sock.write_all(b"GET /hello HTTP/1.1\r\n").expect("write 1");
-                thread::sleep(Duration::from_millis(150));
-                sock.write_all(b"Host: x\r\n").expect("write 2");
-                thread::sleep(Duration::from_millis(150));
-                sock.write_all(b"Connection: close\r\n\r\n")
-                    .expect("write 3");
-
-                let (buf, _) = sock.try_to_close().expect("segmented head response");
-                let text = String::from_utf8_lossy(&buf);
-                assert!(text.starts_with("HTTP/1.1 200 "), "status: {text:?}");
-                assert!(
-                    !text.contains("408"),
-                    "false close on slow progress: {text:?}"
-                );
-                assert!(text.ends_with("hello"), "body: {text:?}");
-            },
-        )
-        .expect("slow_progress_completes server shutdown");
+        .expect("deadline listener shutdown");
 }
 
 #[test]
