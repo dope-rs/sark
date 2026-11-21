@@ -11,22 +11,6 @@ pub struct Tag {
     charge: hold::Charge,
 }
 
-impl Tag {
-    pub(in crate::life) const fn new(order: u64, charge: hold::Charge) -> Self {
-        Self {
-            order: num::NonZero::<u64>::new(order),
-            charge,
-        }
-    }
-
-    pub(in crate::life) const fn parts(self) -> Option<(u64, hold::Charge)> {
-        match self.order {
-            Some(order) => Some((order.get(), self.charge)),
-            None => None,
-        }
-    }
-}
-
 /// Connection-owned sequence state present only when observation is enabled.
 #[doc(hidden)]
 #[derive(Clone, Copy, Default)]
@@ -35,8 +19,19 @@ pub struct Session {
     staging: Option<(u64, hold::Charge)>,
 }
 
-impl Session {
-    pub(in crate::life) fn advance(&mut self) -> u64 {
+impl super::Session<Tag> for Session {
+    fn tag(order: u64, charge: hold::Charge) -> Tag {
+        Tag {
+            order: num::NonZero::<u64>::new(order),
+            charge,
+        }
+    }
+
+    fn parts(tag: Tag) -> Option<(u64, hold::Charge)> {
+        tag.order.map(|order| (order.get(), tag.charge))
+    }
+
+    fn advance(&mut self) -> u64 {
         let raw = self.order.map_or(1, |order| order.get().wrapping_add(1));
         let order = match num::NonZero::<u64>::new(raw) {
             Some(order) => order,
@@ -46,21 +41,27 @@ impl Session {
         order.get()
     }
 
-    pub(in crate::life) fn current(self) -> Option<u64> {
+    fn current(&self) -> Option<u64> {
         self.order.map(num::NonZero::<u64>::get)
     }
 
-    pub(in crate::life) fn stage(&mut self, id: u64, charge: hold::Charge) {
-        if !charge.is_empty() {
-            self.staging = Some((id, charge));
+    fn stage(&mut self, id: u64, charge: hold::Charge) -> bool {
+        if charge.is_empty() {
+            return false;
         }
+        self.staging = Some((id, charge));
+        true
     }
 
-    pub(in crate::life) fn take(&mut self) {
+    fn clear_staged(&mut self, charge: hold::Charge) -> bool {
+        if charge.is_empty() {
+            return false;
+        }
         self.staging = None;
+        true
     }
 
-    pub(in crate::life) fn close(&mut self) -> Option<(u64, hold::Charge)> {
+    fn close(&mut self) -> Option<(u64, hold::Charge)> {
         let staging = self.staging;
         *self = Self::default();
         staging

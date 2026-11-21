@@ -9,8 +9,6 @@ use dope::{
     },
     manifold::network::listener::conn,
 };
-use o3::buffer::hold;
-use sark_http::owner::cause;
 
 use sark_core::{
     deadline::config,
@@ -173,98 +171,6 @@ where
 {
     type Session = M::Session;
     type TransportTag = M::TransportTag;
-    fn tag(
-        &self,
-        id: exchange::Id<conn::Id<'d, ID>, u64>,
-        charge: hold::Charge,
-    ) -> Self::TransportTag {
-        sequence::Mode::tag(&self.0, id, charge)
-    }
-
-    fn transport(
-        &self,
-        conn: conn::Id<'d, ID>,
-        tag: Self::TransportTag,
-    ) -> Option<(exchange::Id<conn::Id<'d, ID>, u64>, hold::Charge)> {
-        sequence::Mode::transport(&self.0, conn, tag)
-    }
-
-    fn next(
-        &mut self,
-        session: &mut Self::Session,
-        conn: conn::Id<'d, ID>,
-    ) -> exchange::Id<conn::Id<'d, ID>, u64> {
-        sequence::Mode::next(&mut self.0, session, conn)
-    }
-
-    fn current(
-        &self,
-        session: &Self::Session,
-        conn: conn::Id<'d, ID>,
-    ) -> Option<exchange::Id<conn::Id<'d, ID>, u64>> {
-        sequence::Mode::current(&self.0, session, conn)
-    }
-
-    fn commit(
-        &mut self,
-        session: &mut Self::Session,
-        id: exchange::Id<conn::Id<'d, ID>, u64>,
-        bytes: usize,
-        charge: hold::Charge,
-    ) {
-        sequence::Mode::commit(&mut self.0, session, id, bytes, charge)
-    }
-
-    fn commit_link(
-        &mut self,
-        session: &mut Self::Session,
-        id: exchange::Id<conn::Id<'d, ID>, u64>,
-        bytes: usize,
-        charge: hold::Charge,
-        linked: hold::Charge,
-    ) {
-        sequence::Mode::commit_link(&mut self.0, session, id, bytes, charge, linked)
-    }
-
-    fn stage(
-        &mut self,
-        session: &mut Self::Session,
-        id: exchange::Id<conn::Id<'d, ID>, u64>,
-        charge: hold::Charge,
-    ) {
-        sequence::Mode::stage(&mut self.0, session, id, charge)
-    }
-
-    fn unstage(
-        &mut self,
-        session: &mut Self::Session,
-        id: exchange::Id<conn::Id<'d, ID>, u64>,
-        charge: hold::Charge,
-    ) {
-        sequence::Mode::unstage(&mut self.0, session, id, charge)
-    }
-
-    fn accept(
-        &mut self,
-        session: &mut Self::Session,
-        id: exchange::Id<conn::Id<'d, ID>, u64>,
-        charge: hold::Charge,
-    ) {
-        sequence::Mode::accept(&mut self.0, session, id, charge)
-    }
-
-    fn release(
-        &mut self,
-        id: exchange::Id<conn::Id<'d, ID>, u64>,
-        charge: hold::Charge,
-        cause: cause::Transport,
-    ) {
-        sequence::Mode::release(&mut self.0, id, charge, cause)
-    }
-
-    fn close(&mut self, session: &mut Self::Session, conn: conn::Id<'d, ID>) {
-        sequence::Mode::close(&mut self.0, session, conn)
-    }
 }
 
 const _: () = assert!(

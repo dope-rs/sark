@@ -1,7 +1,6 @@
 //! Enabled lifecycle observation.
 
-use o3::buffer::hold::{self, evidence};
-use sark_http::owner::{self, cause};
+use o3::buffer::hold::evidence;
 use sequence::observed::{Session, Tag};
 
 use crate::life::{self, endpoint, exchange, sequence};
@@ -80,121 +79,6 @@ where
 {
     type Session = Session;
     type TransportTag = Tag;
-
-    fn tag(&self, id: exchange::Id<C, u64>, charge: hold::Charge) -> Self::TransportTag {
-        Tag::new(id.stream(), charge)
-    }
-
-    fn transport(
-        &self,
-        conn: C,
-        tag: Self::TransportTag,
-    ) -> Option<(exchange::Id<C, u64>, hold::Charge)> {
-        tag.parts()
-            .map(|(order, charge)| (exchange::Id::new(conn, order), charge))
-    }
-
-    fn next(&mut self, session: &mut Self::Session, conn: C) -> exchange::Id<C, u64> {
-        exchange::Id::new(conn, session.advance())
-    }
-
-    fn current(&self, session: &Self::Session, conn: C) -> Option<exchange::Id<C, u64>> {
-        session
-            .current()
-            .map(|order| exchange::Id::new(conn, order))
-    }
-
-    fn commit_link(
-        &mut self,
-        session: &mut Self::Session,
-        id: exchange::Id<C, u64>,
-        bytes: usize,
-        charge: hold::Charge,
-        linked: hold::Charge,
-    ) {
-        self.0.observe(life::Event::ResponseCommitted {
-            exchange: id,
-            body_bytes: bytes,
-            charge,
-            linked,
-        });
-        session.stage(id.stream(), charge);
-    }
-
-    fn stage(
-        &mut self,
-        session: &mut Self::Session,
-        id: exchange::Id<C, u64>,
-        charge: hold::Charge,
-    ) {
-        if charge.is_empty() {
-            return;
-        }
-        session.stage(id.stream(), charge);
-        self.0
-            .observe(life::Event::ResponseOwnership(owner::Effect::new(
-                id,
-                charge,
-                owner::Change::StagingAcquired(cause::Acquire::StreamChunk),
-            )));
-    }
-
-    fn unstage(
-        &mut self,
-        session: &mut Self::Session,
-        id: exchange::Id<C, u64>,
-        charge: hold::Charge,
-    ) {
-        if charge.is_empty() {
-            return;
-        }
-        session.take();
-        self.0
-            .observe(life::Event::ResponseOwnership(owner::Effect::new(
-                id,
-                charge,
-                owner::Change::StagingReleased(cause::Staging::Closed),
-            )));
-    }
-
-    fn accept(
-        &mut self,
-        session: &mut Self::Session,
-        id: exchange::Id<C, u64>,
-        charge: hold::Charge,
-    ) {
-        if charge.is_empty() {
-            return;
-        }
-        session.take();
-        self.0
-            .observe(life::Event::ResponseOwnership(owner::Effect::new(
-                id,
-                charge,
-                owner::Change::Handoff,
-            )));
-    }
-
-    fn release(&mut self, id: exchange::Id<C, u64>, charge: hold::Charge, cause: cause::Transport) {
-        self.0
-            .observe(life::Event::ResponseOwnership(owner::Effect::new(
-                id,
-                charge,
-                owner::Change::TransportReleased(cause),
-            )));
-    }
-
-    fn close(&mut self, session: &mut Self::Session, conn: C) {
-        let Some((stream, charge)) = session.close() else {
-            return;
-        };
-        self.0
-            .observe(life::Event::ResponseOwnership(owner::Effect::new(
-                exchange::Id::new(conn, stream),
-                charge,
-                owner::Change::StagingReleased(cause::Staging::Closed),
-            )));
-    }
 }
 
 const _: () = assert!(core::mem::size_of::<Observed<()>>() == 0);

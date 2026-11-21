@@ -6,12 +6,11 @@ use dope::{
     core::driver::{route::Identity, schedule::clock},
     manifold::network::listener::conn,
 };
-use o3::buffer::hold;
 use sark_core::{
     body::{credit, credit::Mode as _},
     life::{self, audit, exchange, sequence},
 };
-use sark_http::owner::cause;
+use sark_http::owner;
 
 use crate::server::deadline::{self, domain};
 
@@ -138,92 +137,7 @@ where
     type Session = M::Session;
     type TransportTag = M::TransportTag;
 
-    fn tag(
-        &self,
-        id: exchange::Id<conn::Id<'d, ID>, u64>,
-        charge: hold::Charge,
-    ) -> Self::TransportTag {
-        sequence::Mode::tag(&self.mode, id, charge)
-    }
-
-    fn transport(
-        &self,
-        conn: conn::Id<'d, ID>,
-        tag: Self::TransportTag,
-    ) -> Option<(exchange::Id<conn::Id<'d, ID>, u64>, hold::Charge)> {
-        sequence::Mode::transport(&self.mode, conn, tag)
-    }
-
-    fn next(
-        &mut self,
-        session: &mut Self::Session,
-        conn: conn::Id<'d, ID>,
-    ) -> exchange::Id<conn::Id<'d, ID>, u64> {
-        sequence::Mode::next(&mut self.mode, session, conn)
-    }
-
-    fn current(
-        &self,
-        session: &Self::Session,
-        conn: conn::Id<'d, ID>,
-    ) -> Option<exchange::Id<conn::Id<'d, ID>, u64>> {
-        sequence::Mode::current(&self.mode, session, conn)
-    }
-
-    fn commit_link(
-        &mut self,
-        session: &mut Self::Session,
-        id: exchange::Id<conn::Id<'d, ID>, u64>,
-        bytes: usize,
-        charge: hold::Charge,
-        linked: hold::Charge,
-    ) {
-        self.state.observe(life::Event::ResponseCommitted {
-            exchange: id,
-            body_bytes: bytes,
-            charge,
-            linked,
-        });
-        sequence::Mode::commit_link(&mut self.mode, session, id, bytes, charge, linked);
-    }
-
-    fn stage(
-        &mut self,
-        session: &mut Self::Session,
-        id: exchange::Id<conn::Id<'d, ID>, u64>,
-        charge: hold::Charge,
-    ) {
-        sequence::Mode::stage(&mut self.mode, session, id, charge)
-    }
-
-    fn unstage(
-        &mut self,
-        session: &mut Self::Session,
-        id: exchange::Id<conn::Id<'d, ID>, u64>,
-        charge: hold::Charge,
-    ) {
-        sequence::Mode::unstage(&mut self.mode, session, id, charge)
-    }
-
-    fn accept(
-        &mut self,
-        session: &mut Self::Session,
-        id: exchange::Id<conn::Id<'d, ID>, u64>,
-        charge: hold::Charge,
-    ) {
-        sequence::Mode::accept(&mut self.mode, session, id, charge)
-    }
-
-    fn release(
-        &mut self,
-        id: exchange::Id<conn::Id<'d, ID>, u64>,
-        charge: hold::Charge,
-        cause: cause::Transport,
-    ) {
-        sequence::Mode::release(&mut self.mode, id, charge, cause)
-    }
-
-    fn close(&mut self, session: &mut Self::Session, conn: conn::Id<'d, ID>) {
-        sequence::Mode::close(&mut self.mode, session, conn)
+    fn ownership(&mut self, effect: owner::Effect<exchange::Id<conn::Id<'d, ID>, u64>>) {
+        self.mode.ownership(effect);
     }
 }
