@@ -26,20 +26,6 @@ pub(in crate::app::serve) struct H1Plan<'source, 'spec> {
     pub(super) continuations: plan::Plan<'source, 'spec>,
 }
 
-pub(in crate::app::serve) fn h1_payload(
-    paths: &Paths,
-    tag: proc_macro2::TokenStream,
-) -> proc_macro2::TokenStream {
-    let ns_fiber = &paths.fiber;
-    let ns_h1 = &paths.h1;
-    quote::quote! {
-        #ns_fiber::dope::net::link::egress::data::compose::Either<
-            #ns_h1::server::payload::Body<'d, #tag>,
-            #ns_h1::server::payload::Stream<'d, #tag>,
-        >
-    }
-}
-
 fn guard_rejection(
     paths: &Paths,
     symbols: &crate::types::Generics,

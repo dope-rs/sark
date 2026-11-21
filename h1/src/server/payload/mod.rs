@@ -11,6 +11,9 @@ pub mod write;
 
 pub use sark_core::manifold::Body;
 
+#[doc(hidden)]
+pub type Owner<'d, K = ()> = compose::Either<Body<'d, K>, Stream<'d, K>>;
+
 const _: () = {
     use sark_core::life::sequence::observed::Tag;
 
@@ -28,7 +31,7 @@ const _: () = {
             == core::mem::size_of::<Frame<'_>>() + core::mem::size_of::<Tag>()
     );
     assert!(
-        core::mem::size_of::<compose::Either<Body<'_, ()>, Stream<'_, ()>>>()
+        core::mem::size_of::<Owner<'_>>()
             == core::mem::size_of::<
                 compose::Either<
                     compose::Either<resident::Shared<'_>, segments::Chain<resident::Shared<'_>>>,
@@ -37,7 +40,7 @@ const _: () = {
             >()
     );
     assert!(
-        core::mem::size_of::<compose::Either<Body<'_, Tag>, Stream<'_, Tag>>>()
+        core::mem::size_of::<Owner<'_, Tag>>()
             == core::mem::size_of::<
                 compose::Tagged<
                     compose::Either<

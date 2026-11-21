@@ -1,7 +1,6 @@
 use std::{mem, pin};
 
 use conn::write::{self, body};
-use data::compose;
 use dope::{
     core::driver::{self, route::Identity},
     manifold::network::listener::conn,
@@ -37,10 +36,7 @@ type Context<'a, 'b, 'c, 'e, 'f, 'd, ID, W, R, H, T> = conn::Ctx<
         <H as session::Dispatch<'d, R, <H as router::Routes<'d, R, T>>::Pending, T>>::Head,
     >,
     data::Bound<
-        compose::Either<
-            payload::Body<'d, <H as router::Routes<'d, R, T>>::TransportTag>,
-            payload::Stream<'d, <H as router::Routes<'d, R, T>>::TransportTag>,
-        >,
+        payload::Owner<'d, <H as router::Routes<'d, R, T>>::TransportTag>,
         <H as router::Routes<'d, R, T>>::Egress,
     >,
 >;
@@ -204,8 +200,7 @@ where
             Err(cause) => (pump::Egress::None, Err(cause)),
         };
         let wake = matches!(egress, pump::Egress::Wake);
-        let body = payload::write::try_prepare(egress, tag);
-        if let Err(cause) = payload::write::try_publish(native, body, connection) {
+        if let Err(cause) = payload::write::try_publish(native, egress.into_body(tag), connection) {
             if let Some(tag) = sent {
                 routes
                     .as_mut()

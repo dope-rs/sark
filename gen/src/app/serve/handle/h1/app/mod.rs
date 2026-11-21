@@ -161,9 +161,10 @@ pub(super) fn build(
         } else {
             source.clone()
         };
-        let payload = super::super::h1_payload(paths, quote!(()));
         let http2 = quote! {
-            #ns_h2::server::runtime::app::App<'d, #g_h2a, #g_wire, #g_h2f, #payload>
+            #ns_h2::server::runtime::app::App<
+                'd, #g_h2a, #g_wire, #g_h2f, #ns_h1::server::payload::Owner<'d>,
+            >
         };
         let extra = mixed.then(|| {
             quote! {

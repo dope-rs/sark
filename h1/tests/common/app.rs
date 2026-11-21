@@ -11,10 +11,7 @@ use dope::{
         timing::Throughput,
     },
     net::{
-        link::{
-            egress::data::{self, compose},
-            slot::types::CloseGate,
-        },
+        link::{egress::data, slot::types::CloseGate},
         tcp,
         wire::{Identity, domain},
     },
@@ -106,8 +103,7 @@ impl<'a: 'd, 'd, ID: route::Identity> handler::Application<'d, ID> for App<'a> {
     type Wire = Identity;
     type WireFailure = failures::Close;
     type Retirement = Retirement;
-    type Egress =
-        data::Bound<compose::Either<payload::Body<'d>, payload::Stream<'d, ()>>, bound::AtMost<0>>;
+    type Egress = data::Bound<payload::Owner<'d>, bound::AtMost<0>>;
     type Input = receive::Coupled;
     type Send = send::Run;
 

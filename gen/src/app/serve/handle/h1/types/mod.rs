@@ -181,10 +181,9 @@ impl<'a> Types<'a> {
                             quote!((#stamp, #ns_fiber::dope::manifold::app::receive::limits::Budget))
                         }
                     };
-                    let payload = handle::h1_payload(paths, quote!(()));
                     let h2 = quote! {
                         #ns_h2::server::runtime::app::App<
-                            'd, #g_h2a, #g_wire, #g_h2f, #payload,
+                            'd, #g_h2a, #g_wire, #g_h2f, #ns_h1::server::payload::Owner<'d>,
                         >
                     };
                     (
@@ -365,15 +364,14 @@ impl<'a> Types<'a> {
                 #head,
             >
         };
-        let payload = handle::h1_payload(
-            paths,
-            quote! {
-                <#g_mode as #ns_core::life::sequence::Mode<
-                    #ns_fiber::dope::manifold::network::listener::conn::Id<'d, #g_id>,
-                >>::TransportTag
-            },
-        );
-        let egress = quote!(#ns_fiber::dope::net::link::egress::data::Bound<#payload, #bound>);
+        let tag = quote! {
+            <#g_mode as #ns_core::life::sequence::Mode<
+                #ns_fiber::dope::manifold::network::listener::conn::Id<'d, #g_id>,
+            >>::TransportTag
+        };
+        let egress = quote! {
+            #ns_fiber::dope::net::link::egress::data::Bound<#ns_h1::server::payload::Owner<'d, #tag>, #bound>
+        };
         let input = duplex.input_type(paths);
         let view = quote! {
             #ns_fiber::dope::manifold::network::listener::conn::Ctx<

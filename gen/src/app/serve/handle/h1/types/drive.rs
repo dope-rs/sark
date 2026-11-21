@@ -67,14 +67,11 @@ pub(super) fn methods(
         } else {
             #core::life::sequence::Mode::tag(life, exchange, charge)
         };
-        let body = #h1::server::payload::write::try_prepare(egress, tag);
+        let body = egress.into_body(tag);
     };
-    let send = quote! {
-        let sent = #h1::server::payload::write::try_publish(native, body, intent);
-    };
+    let send = quote!(#h1::server::payload::write::try_publish(native, body, intent));
     let complete = quote! {
-        #send
-        return match sent {
+        return match #send {
             Ok(()) => turn::Turn::published(ready, held),
             Err(cause) => {
                 conn.reject_write(cause);
@@ -106,8 +103,7 @@ pub(super) fn methods(
                 #settle
                 if let Some(stream) = stream {
                     value.set(#phase::#body(stream));
-                    #send
-                    return match sent {
+                    return match #send {
                         Ok(()) => {
                             conn.state_mut().async_state.insert(Running::Body(task));
                             conn.wake_target().wake();

@@ -23,7 +23,7 @@ use dope::{
         timing::Throughput,
     },
     net::{
-        link::egress::data::{self, compose},
+        link::egress::data,
         tcp,
         wire::{Identity, domain, domain::Local},
     },
@@ -46,7 +46,6 @@ pub struct Staged {
     tail: Option<storage::Shared>,
 }
 
-type Owner<'d> = compose::Either<payload::Body<'d, ()>, payload::Stream<'d, ()>>;
 pub struct App<'a> {
     pub sent: Gate,
     pub moved: Gate,
@@ -72,7 +71,7 @@ impl<'observe: 'd, 'd, ID: route::Identity> Application<'d, ID> for App<'observe
     type Wire = Identity;
     type WireFailure = failures::Close;
     type Retirement = retire::Close;
-    type Egress = data::Bound<Owner<'d>, bound::Unbounded>;
+    type Egress = data::Bound<payload::Owner<'d>, bound::Unbounded>;
     type Input = receive::Gated;
     type Send = send::Silent;
 
@@ -177,8 +176,7 @@ impl<'observe: 'd, 'd, ID: route::Identity> handler::Borrowed<'d, ID> for App<'o
             "switch must publish its exact static response owner"
         );
         let egress = receipt.state.expect("switch protocol state");
-        let body = payload::write::try_prepare(egress, ());
-        let result = payload::write::try_publish(native, body, receipt.connection);
+        let result = payload::write::try_publish(native, egress.into_body(()), receipt.connection);
         result
             .map_err(|cause| match cause {
                 write::body::Failure::Payload(cause) => format!("payload: {cause:?}"),

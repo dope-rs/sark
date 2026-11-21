@@ -1,6 +1,5 @@
 //! Server-driven connection lifetime transitions.
 
-use data::compose;
 use dope::{
     core::driver::{self, route::Identity},
     manifold::network::listener::{conn, handler},
@@ -135,15 +134,8 @@ where
 }
 
 impl<'d, State, Pending, Ready, Heads, ID: Identity, D, K>
-    Drain<
-        'd,
-        ID,
-        data::Bound<
-            compose::Either<payload::Body<'d, K>, payload::Stream<'d, K>>,
-            bound::Unbounded,
-        >,
-        K,
-    > for session::Conn<'d, State, Pending, switch::Enabled<machine::Machine<'d, D>>, Ready, Heads>
+    Drain<'d, ID, data::Bound<payload::Owner<'d, K>, bound::Unbounded>, K>
+    for session::Conn<'d, State, Pending, switch::Enabled<machine::Machine<'d, D>>, Ready, Heads>
 where
     D: duplex::Session<'d>,
     K: Copy + Default + 'd,
@@ -160,10 +152,7 @@ where
             ID,
             W,
             Self,
-            data::Bound<
-                compose::Either<payload::Body<'d, K>, payload::Stream<'d, K>>,
-                bound::Unbounded,
-            >,
+            data::Bound<payload::Owner<'d, K>, bound::Unbounded>,
         >,
         driver: &mut driver::Context<'_, 'd>,
         scratch: &mut Vec<u8>,

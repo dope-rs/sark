@@ -11,10 +11,7 @@ use dope::{
     net::{link::egress, wire},
 };
 use duplex::{admit, machine};
-use egress::{
-    data::{self, compose},
-    load::Value,
-};
+use egress::{data, load::Value};
 use hold::scope;
 use o3::buffer::{hold, resident::bound, write::Slice};
 use sark_core::duplex;
@@ -61,10 +58,7 @@ impl<'a, 'turn, 'c, 'p, 's, 'w, 'd: 'w, State, Pending, Ready, Heads, ID: Identi
                 Ready,
                 Heads,
             >,
-            data::Bound<
-                compose::Either<payload::Body<'d, K>, payload::Stream<'d, K>>,
-                bound::Unbounded,
-            >,
+            data::Bound<payload::Owner<'d, K>, bound::Unbounded>,
         >,
         K,
     >

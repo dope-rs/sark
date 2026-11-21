@@ -88,8 +88,11 @@ pub(super) fn extras<'emit, 'source, 'spec>(
         )
     };
     let egress = |tag: proc_macro2::TokenStream| {
-        let payload = handle::h1_payload(paths, tag);
-        quote!(#ns_fiber::dope::net::link::egress::data::Bound<#payload, #egress_bound>)
+        quote! {
+            #ns_fiber::dope::net::link::egress::data::Bound<
+                #ns_h1::server::payload::Owner<'d, #tag>, #egress_bound,
+            >
+        }
     };
     let plain_egress = egress(quote!(()));
     let bind_egress = egress(quote! {
@@ -330,9 +333,10 @@ pub(super) fn extras<'emit, 'source, 'spec>(
             syn::GenericParam::Lifetime(_) => None,
         });
         let identity = quote!(#ns_fiber::dope::net::wire::Identity);
-        let payload = handle::h1_payload(paths, quote!(()));
         let h2 = quote! {
-            #ns_h2::server::runtime::app::App<'d, #g_h2a, #identity, #g_h2f, #payload>
+            #ns_h2::server::runtime::app::App<
+                'd, #g_h2a, #identity, #g_h2f, #ns_h1::server::payload::Owner<'d>,
+            >
         };
         let prepared = quote! {
             #ns_h1::server::run::Prepared<
