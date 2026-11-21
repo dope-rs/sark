@@ -114,26 +114,23 @@ fn post_is_not_replayed() {
                     .timeout(Duration::from_secs(3));
                 let outcome = Request::new(
                     flavor,
-                    &address.to_string(),
+                    address,
                     config,
                     Method::POST,
                     "/effect",
                     &[],
                     b"effect",
                 )
-                .try_run(
-                    |outcome| {
-                        let error = (outcome).err().expect("a response-free close must fail");
-                        (
-                            matches!(
-                                error.cause(),
-                                Error::Transport(error) if error.kind() == conn::Kind::RemoteEof
-                            ),
-                            error.safety(),
-                        )
-                    },
-                    assert_shutdown,
-                )
+                .try_run(|outcome| {
+                    let error = (outcome).err().expect("a response-free close must fail");
+                    (
+                        matches!(
+                            error.cause(),
+                            Error::Transport(error) if error.kind() == conn::Kind::RemoteEof
+                        ),
+                        error.safety(),
+                    )
+                })
                 .expect("HTTP request execution");
                 assert!((outcome) == (true, Safety::PossiblyCommitted));
             })
@@ -166,30 +163,27 @@ fn buffered_timeout_commits() {
                 .timeout(Duration::from_millis(50));
             let outcome = Request::new(
                 flavor,
-                &address.to_string(),
+                address,
                 config,
                 Method::POST,
                 "/effect",
                 &[],
                 b"effect",
             )
-            .try_run(
-                |outcome| {
-                    let error = (outcome)
-                        .err()
-                        .expect("a response timeout after submission must fail");
-                    (
-                        matches!(
-                            error.cause(),
-                            Error::Timeout(error)
-                                if error.phase() == timeout::Phase::Head
-                                    && error.elapsed() == budget::Elapsed::Budget
-                        ),
-                        error.safety(),
-                    )
-                },
-                assert_shutdown,
-            )
+            .try_run(|outcome| {
+                let error = (outcome)
+                    .err()
+                    .expect("a response timeout after submission must fail");
+                (
+                    matches!(
+                        error.cause(),
+                        Error::Timeout(error)
+                            if error.phase() == timeout::Phase::Head
+                                && error.elapsed() == budget::Elapsed::Budget
+                    ),
+                    error.safety(),
+                )
+            })
             .expect("HTTP request execution");
             assert!((outcome) == (true, Safety::PossiblyCommitted));
         })
@@ -336,29 +330,21 @@ fn redirect_failure_commits() {
                 .timeout(Duration::from_millis(200));
             Request::new(
                 flavor,
-                &address.to_string(),
+                address,
                 config,
                 Method::POST,
                 "/effect",
                 &[],
                 b"effect",
             )
-            .try_run(
-                |outcome| {
-                    let failure = (outcome).err().expect("redirect follow must fail");
-                    assert!((failure.safety()) == (Safety::PossiblyCommitted));
-                    assert!(matches!(
-                        failure.cause(),
-                        Error::Request(RequestError::CrossOrigin)
-                    ));
-                },
-                |event| {
-                    assert!(
-                        matches!(event, dope::core::io::Reclaimed::Shutdown),
-                        "unexpected client retirement: {event:?}"
-                    )
-                },
-            )
+            .try_run(|outcome| {
+                let failure = (outcome).err().expect("redirect follow must fail");
+                assert!((failure.safety()) == (Safety::PossiblyCommitted));
+                assert!(matches!(
+                    failure.cause(),
+                    Error::Request(RequestError::CrossOrigin)
+                ));
+            })
             .expect("HTTP request execution");
         })
         .with(|| -> Result<(), peer::Error> {
@@ -390,28 +376,25 @@ fn scoped_timeout_commits() {
 
             let outcome = Request::new(
                 flavor,
-                &address.to_string(),
+                address,
                 config,
                 Method::POST,
                 "/effect",
                 &[],
                 b"effect",
             )
-            .try_scoped(
-                |result| {
-                    let failure = result.err().expect("scoped request must fail");
-                    (
-                        matches!(
-                            failure.cause(),
-                            Error::Timeout(error)
-                                if error.phase() == timeout::Phase::Head
-                                    && error.elapsed() == budget::Elapsed::Budget
-                        ),
-                        failure.safety(),
-                    )
-                },
-                assert_shutdown,
-            )
+            .try_scoped(|result| {
+                let failure = result.err().expect("scoped request must fail");
+                (
+                    matches!(
+                        failure.cause(),
+                        Error::Timeout(error)
+                            if error.phase() == timeout::Phase::Head
+                                && error.elapsed() == budget::Elapsed::Budget
+                    ),
+                    failure.safety(),
+                )
+            })
             .expect("scoped request execution");
             assert!((outcome) == (true, Safety::PossiblyCommitted));
         })
@@ -445,23 +428,20 @@ fn scoped_capacity_commits() {
 
             let outcome = Request::new(
                 flavor,
-                &address.to_string(),
+                address,
                 config,
                 Method::POST,
                 "/effect",
                 &[],
                 b"effect",
             )
-            .try_scoped(
-                |result| {
-                    let failure = result.err().expect("scoped request must fail");
-                    (
-                        matches!(failure.cause(), Error::Protocol(protocol::Error::BodyLimit)),
-                        failure.safety(),
-                    )
-                },
-                assert_shutdown,
-            )
+            .try_scoped(|result| {
+                let failure = result.err().expect("scoped request must fail");
+                (
+                    matches!(failure.cause(), Error::Protocol(protocol::Error::BodyLimit)),
+                    failure.safety(),
+                )
+            })
             .expect("scoped request execution");
             assert!((outcome) == (true, Safety::PossiblyCommitted));
         })

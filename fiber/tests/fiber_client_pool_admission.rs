@@ -23,7 +23,7 @@ use common::client::{
     runtime::{
         calls,
         cases::{
-            Batch, Flavor,
+            Flavor,
             stream::{Scenario, Stream},
         },
         peer::Response as _,
@@ -343,18 +343,13 @@ fn recovers_stale_idle() {
                 .timeout(Duration::from_secs(2))
                 .idle_timeout(Duration::from_millis(100));
 
-            let codes = Batch::new(
-                Flavor::Fixed,
+            let codes = Flavor::Fixed.try_gets(
                 addr,
                 config,
                 NonZero::new(2).expect("client capacity"),
                 &["/1", "/2", "/3", "/4"],
                 &["/5", "/6", "/7", "/8"],
                 Some(Duration::from_millis(400)),
-            )
-            .try_run(
-                |result| result.expect("batch response").status().as_u16(),
-                assert_shutdown,
             )
             .expect("client scenario");
             assert_eq!(codes, vec![200, 200, 200, 200, 200, 200, 200, 200]);

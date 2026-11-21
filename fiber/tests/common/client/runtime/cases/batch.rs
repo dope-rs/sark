@@ -1,213 +1,145 @@
-use std::{convert::Infallible, net::SocketAddr, num::NonZero, time::Duration};
+use std::{fmt, net::SocketAddr, num::NonZero, time::Duration};
 
 use dope::{
-    core::io::Reclaimed,
-    manifold::client::attempt::queue::mailbox,
+    core::driver::schedule::clock,
+    runtime::executor::{self, session},
 };
-use dope_fiber::{BlockOn as _, task::done};
-use sark_client::{Failure, reply::Scoped};
+use dope_fiber::{BlockOn, task::done};
 use sark_fiber::client::{Ready, Request, config::Config};
 use sark_http::method::Method;
 
-use crate::common::client::runtime::{
-    WaitError,
-    cases::{
-        Flavor,
-        request::{Error, Step},
+use crate::common::client::{
+    assert_shutdown,
+    runtime::{
+        WaitError,
+        cases::{
+            Flavor,
+            request::{Error, Step},
+        },
+        origins, pools,
     },
-    origins, pools,
 };
 
-pub struct Batch<'a> {
-    flavor: Flavor,
-    addr: SocketAddr,
-    config: Config,
-    capacity: NonZero<usize>,
-    first: &'a [&'a str],
-    second: &'a [&'a str],
-    gap: Option<Duration>,
+fn get<'app, 'd: 'app>(
+    app: &mut impl BlockOn<'d>,
+    client: &impl Request<'app, 'd, Error: fmt::Debug>,
+    paths: &[&str],
+    codes: &mut Vec<u16>,
+) -> Result<(), Step> {
+    for path in paths {
+        let reply = app
+            .block_on(client.send_with(Method::GET, path, &[], &[]))
+            .map_err(Step::Drive)?
+            .expect("batch response");
+        codes.push(reply.status().as_u16());
+    }
+    Ok(())
 }
 
-impl<'request> Batch<'request> {
-    pub fn new(
-        flavor: Flavor,
+fn timed_pair<'app, 'd: 'app, D: executor::raw::App<'d>>(
+    app: &mut session::Manual<'_, '_, 'd, D>,
+    client: &impl Request<'app, 'd, Error: fmt::Debug>,
+    start: clock::Deadline<'d>,
+    gap: Duration,
+) -> Result<[u16; 2], Step> {
+    let next = start.try_add(gap).map_err(Step::Clock)?;
+    let mut codes = [0; 2];
+    for (code, (path, now)) in codes.iter_mut().zip([("/first", start), ("/second", next)]) {
+        let reply = app
+            .drive(
+                now,
+                done::Once::new(client.send_with(Method::GET, path, &[], &[])),
+            )
+            .map_err(Step::Drive)?
+            .into_output()
+            .expect("batch response");
+        *code = reply.status().as_u16();
+    }
+    Ok(codes)
+}
+
+impl Flavor {
+    pub fn try_gets(
+        self,
         addr: SocketAddr,
         config: Config,
         capacity: NonZero<usize>,
-        first: &'request [&'request str],
-        second: &'request [&'request str],
+        first: &[&str],
+        second: &[&str],
         gap: Option<Duration>,
-    ) -> Self {
-        Self {
-            flavor,
-            addr,
-            config,
-            capacity,
-            first,
-            second,
-            gap,
-        }
-    }
-
-    pub fn try_run<C>(
-        self,
-        mut check: C,
-        report: impl FnMut(Reclaimed),
-    ) -> Result<Vec<u16>, Error>
-    where
-        C: for<'scope, 'd> FnMut(
-            Result<Scoped<'scope, 'd>, Failure<Infallible, mailbox::Error<'d>>>,
-        ) -> u16,
-    {
-        let Self {
-            flavor,
-            addr,
-            config,
-            capacity,
-            first,
-            second,
-            gap,
-        } = self;
-        let codes = match flavor {
-            Flavor::Fixed => pools::Plan::new(addr, config, capacity.get(), 1)
+    ) -> Result<Vec<u16>, Error> {
+        match self {
+            Self::Fixed => pools::Plan::new(addr, config, capacity.get(), 1)
                 .map_err(Error::FixedPlan)?
                 .enter(
                     (),
-                    move |mut app| -> Result<_, Step> {
-                        let client = app.handle;
+                    |mut app| {
                         app.wait().map_err(Step::Wait)?;
                         let mut codes = Vec::with_capacity(first.len() + second.len());
-                        for (paths, pause) in [(first, None), (second, gap)] {
-                            if let Some(pause) = pause {
-                                let sleep = client.sleep(pause).map_err(Step::Timer)?;
-                                app.app.block_on(sleep).map_err(Step::Drive)?;
-                            }
-                            for path in paths {
-                                codes.push(check(
-                                    app.app
-                                        .block_on(client.get(path))
-                                        .map_err(Step::Drive)?
-                                        .map_err(Failure::widen),
-                                ));
-                            }
+                        get(&mut app.app, &app.handle, first, &mut codes)?;
+                        if let Some(gap) = gap {
+                            let sleep = app.handle.sleep(gap).map_err(Step::Timer)?;
+                            app.app.block_on(sleep).map_err(Step::Drive)?;
                         }
-                        Ok::<_, Step>(codes)
+                        get(&mut app.app, &app.handle, second, &mut codes)?;
+                        Ok(codes)
                     },
-                    report,
+                    assert_shutdown,
                 )
-                .map_err(Error::Fixed)?
-                .map_err(Error::Step)?,
-            Flavor::OnDemand => origins::Plan::new(config, 1, 1, 1)
+                .map_err(Error::Fixed)?,
+            Self::OnDemand => origins::Plan::new(config, 1, 1, 1)
                 .map_err(Error::DynamicPlan)?
                 .enter(
                     (),
-                    move |mut app| -> Result<_, Step> {
-                        let client = app.handle;
+                    |mut app| {
                         let mut codes = Vec::with_capacity(first.len() + second.len());
-                        for (paths, pause) in [(first, None), (second, gap)] {
-                            if let Some(pause) = pause {
-                                let sleep = client.sleep(pause).map_err(Step::Timer)?;
-                                app.app.block_on(sleep).map_err(Step::Drive)?;
-                            }
-                            for path in paths {
-                                codes.push(check(
-                                    app.app
-                                        .block_on(client.send_with(Method::GET, path, &[], &[]))
-                                        .map_err(Step::Drive)?,
-                                ));
-                            }
+                        get(&mut app.app, &app.handle, first, &mut codes)?;
+                        if let Some(gap) = gap {
+                            let sleep = app.handle.sleep(gap).map_err(Step::Timer)?;
+                            app.app.block_on(sleep).map_err(Step::Drive)?;
                         }
-                        Ok::<_, Step>(codes)
+                        get(&mut app.app, &app.handle, second, &mut codes)?;
+                        Ok(codes)
                     },
-                    report,
+                    assert_shutdown,
                 )
-                .map_err(Error::Dynamic)?
-                .map_err(Error::Step)?,
-        };
-        Ok(codes)
+                .map_err(Error::Dynamic)?,
+        }
+        .map_err(Error::Step)
     }
 
-    pub fn try_clock<C>(
+    pub fn try_timed_pair(
         self,
-        mut check: C,
-        report: impl FnMut(Reclaimed),
-    ) -> Result<Vec<u16>, Error>
-    where
-        C: for<'scope, 'd> FnMut(
-            Result<Scoped<'scope, 'd>, Failure<Infallible, mailbox::Error<'d>>>,
-        ) -> u16,
-    {
-        let Self {
-            flavor,
-            addr,
-            config,
-            capacity,
-            first,
-            second,
-            gap,
-        } = self;
-        let codes = match flavor {
-            Flavor::Fixed => pools::Plan::new(addr, config, capacity.get(), 1)
+        addr: SocketAddr,
+        config: Config,
+        gap: Duration,
+    ) -> Result<[u16; 2], Error> {
+        let offset = Duration::from_millis(1);
+        match self {
+            Self::Fixed => pools::Plan::new(addr, config, 1, 1)
                 .map_err(Error::FixedPlan)?
                 .enter_at(
-                    Duration::from_millis(1),
-                    move |mut app| -> Result<_, Step> {
-                        let client = app.handle;
-                        let start = app.start;
+                    offset,
+                    |mut app| {
                         app.app
-                            .drive(start, done::Once::new(client.wait_active()))
+                            .drive(app.start, done::Once::new(app.handle.wait_active()))
                             .map_err(Step::Drive)?
                             .into_output()
                             .map_err(|error| Step::Wait(WaitError::Connector(error)))?;
-                        let next = start
-                            .try_add(gap.unwrap_or_default())
-                            .map_err(Step::Clock)?;
-                        let mut codes = Vec::with_capacity(first.len() + second.len());
-                        for (paths, now) in [(first, start), (second, next)] {
-                            for path in paths {
-                                codes.push(check(
-                                    app.app
-                                        .drive(now, done::Once::new(client.get(path)))
-                                        .map_err(Step::Drive)?
-                                        .into_output()
-                                        .map_err(Failure::widen),
-                                ));
-                            }
-                        }
-                        Ok::<_, Step>(codes)
+                        timed_pair(&mut app.app, &app.handle, app.start, gap)
                     },
-                    report,
+                    assert_shutdown,
                 )
-                .map_err(Error::Fixed)?
-                .map_err(Error::Step)?,
-            Flavor::OnDemand => origins::Plan::new(config, 1, 1, 1)
+                .map_err(Error::Fixed)?,
+            Self::OnDemand => origins::Plan::new(config, 1, 1, 1)
                 .map_err(Error::DynamicPlan)?
                 .enter_at(
-                    Duration::from_millis(1),
-                    move |mut app| -> Result<_, Step> {
-                        let client = app.handle;
-                        let start = app.start;
-                        let next = start
-                            .try_add(gap.unwrap_or_default())
-                            .map_err(Step::Clock)?;
-                        let mut codes = Vec::with_capacity(first.len() + second.len());
-                        for (paths, now) in [(first, start), (second, next)] {
-                            for path in paths {
-                                codes.push(check(
-                                    app.app
-                                        .drive(now, done::Once::new(client.get(path)))
-                                        .map_err(Step::Drive)?
-                                        .into_output(),
-                                ));
-                            }
-                        }
-                        Ok::<_, Step>(codes)
-                    },
-                    report,
+                    offset,
+                    |mut app| timed_pair(&mut app.app, &app.handle, app.start, gap),
+                    assert_shutdown,
                 )
-                .map_err(Error::Dynamic)?
-                .map_err(Error::Step)?,
-        };
-        Ok(codes)
+                .map_err(Error::Dynamic)?,
+        }
+        .map_err(Error::Step)
     }
 }

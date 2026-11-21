@@ -16,6 +16,35 @@ pub use error::Error;
 pub use request::Request;
 pub use response::Response;
 
+pub fn with_body(headers: &str, body: &[u8], run: impl FnOnce(net::SocketAddr)) {
+    let mut wire = format!(
+        "HTTP/1.1 200 OK\r\n{headers}Content-Length: {}\r\nConnection: close\r\n\r\n",
+        body.len(),
+    )
+    .into_bytes();
+    wire.extend_from_slice(body);
+    with_wire(&[], &wire, run);
+}
+
+pub fn with_wire(paths: &[&str], wire: &[u8], run: impl FnOnce(net::SocketAddr)) {
+    peer::AcceptScript::with(
+        |acceptor| {
+            serve_each(acceptor, |stream, request| {
+                if !paths.is_empty() {
+                    let target = request.target();
+                    assert!(paths.contains(&target), "{target}");
+                }
+                stream.write_all(wire)
+            })
+        },
+        |server| {
+            run(server.addr());
+            server.stop().expect("peer thread").expect("response peer");
+        },
+    )
+    .expect("spawn response peer");
+}
+
 pub fn serve(
     acceptor: &mut TcpAcceptor<'_>,
     mut reply: impl for<'a> FnMut(Request<'a>) -> Vec<u8>,

@@ -6,11 +6,8 @@ pub const CHUNK: usize = 16 * 1024;
 pub const CHUNKS: usize = 160;
 pub const BODY: usize = 16 * 1024 * 1024;
 
-pub fn chunked(stream: &mut &Stream<'_>) -> Result<(), Error> {
-    let resp = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n\
+pub const CHUNKED: &[u8] = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n\
      5\r\nhello\r\n7\r\n, world\r\n0\r\n\r\n";
-    stream.write_all(resp)
-}
 
 pub fn segmented(stream: &mut &Stream<'_>) -> Result<(), Error> {
     let mut response = Vec::with_capacity(SEGMENT * 2 + 128);
@@ -51,24 +48,12 @@ pub fn single(stream: &mut &Stream<'_>) -> Result<(), Error> {
     stream.write_all(b"\r\n0\r\n\r\n")
 }
 
-pub fn trailers(stream: &mut &Stream<'_>) -> Result<(), Error> {
-    let resp = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n\
+pub const TRAILERS: &[u8] = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n\
      3\r\nabc\r\n3\r\ndef\r\n0\r\nX-Checksum: 42\r\n\r\n";
-    stream.write_all(resp)
-}
 
-pub fn buffered_eof(stream: &mut &Stream<'_>) -> Result<(), Error> {
-    let response = b"HTTP/1.1 200 OK\r\nConnection: close\r\n\r\nbody until EOF";
-    stream.write_all(response)
-}
+pub const BUFFERED_EOF: &[u8] = b"HTTP/1.1 200 OK\r\nConnection: close\r\n\r\nbody until EOF";
 
-pub fn stream_eof(stream: &mut &Stream<'_>) -> Result<(), Error> {
-    let response = b"HTTP/1.1 200 OK\r\nConnection: close\r\n\r\nstreamed body";
-    stream.write_all(response)
-}
+pub const STREAM_EOF: &[u8] = b"HTTP/1.1 200 OK\r\nConnection: close\r\n\r\nstreamed body";
 
-pub fn info(stream: &mut &Stream<'_>) -> Result<(), Error> {
-    let response = b"HTTP/1.1 100 Continue\r\n\r\n\
+pub const INFO: &[u8] = b"HTTP/1.1 100 Continue\r\n\r\n\
          HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok";
-    stream.write_all(response)
-}

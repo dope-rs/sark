@@ -5,7 +5,7 @@ use common::client::{
     config::FLAVORS,
     response::{framing, head::PIPELINED_RESPONSES},
     runtime::{
-        cases::{Flavor, events::Reader, pipeline, request::Request},
+        cases::{Flavor, events, pipeline, request::Request},
         origins,
         peer::{self, Conn},
     },
@@ -69,49 +69,24 @@ fn pipelined_request() {
 
 #[test]
 fn orders_informational() {
-    AcceptScript::with(
-        |acceptor| {
-            peer::serve_each(acceptor, |stream, request| {
-                std::assert_matches!(request.target(), "/continue" | "/continue-buffered");
-                framing::info(stream)
-            })
-        },
-        |server| {
-            let addr = server.addr();
+    peer::with_wire(
+        &["/continue", "/continue-buffered"],
+        framing::INFO,
+        |addr| {
+            let observed = events::read(addr, "/continue");
+            assert_eq!(observed.status, 200);
+            assert_eq!(observed.body, b"ok");
+            assert_eq!(observed.trailers, 0);
+            assert_eq!(observed.info, 1);
 
-            let (status, body, trailers, info) = Reader::new(
+            let fixed = Request::get(
+                Flavor::Fixed,
                 addr,
                 Config::try_new("127.0.0.1").expect("HTTP host allocation"),
-                "/continue",
-            )
-            .try_run(
-                |result| {
-                    let read = result.expect("client scenario");
-                    (read.status, read.body, read.trailers, read.info)
-                },
-                assert_shutdown,
-            )
-            .expect("client scenario");
-            assert_eq!(status, 200);
-            assert_eq!(body, b"ok");
-            assert_eq!(trailers, 0);
-            assert_eq!(info, 1);
-
-            let fixed = Request::new(
-                Flavor::Fixed,
-                &(addr).to_string(),
-                Config::try_new("127.0.0.1").expect("HTTP host allocation"),
-                Method::GET,
                 "/continue-buffered",
-                &[],
-                &[],
             )
-            .try_run(
-                |result| result.expect("HTTP response"),
-                assert_shutdown,
-            )
-            .expect("HTTP request execution");
-            let dynamic = origins::Plan::new(Config::new(server.addr().to_string()), 2, 1, 2)
+            .collect();
+            let dynamic = origins::Plan::new(Config::new(addr.to_string()), 2, 1, 2)
                 .expect("dynamic client plan")
                 .enter(
                     (),
@@ -131,11 +106,6 @@ fn orders_informational() {
                 .expect("client scope");
             assert_eq!(fixed.status(), dynamic.status());
             assert_eq!(fixed.body().as_slice(), dynamic.body().as_slice());
-            server
-                .stop()
-                .expect("peer thread")
-                .expect("stop informational peer");
         },
-    )
-    .expect("spawn informational peer");
+    );
 }

@@ -1,8 +1,7 @@
-use std::{convert::Infallible, net::AddrParseError};
+use std::{convert::Infallible, net::SocketAddr};
 
 use dope::{
-    core::{driver::schedule::clock, io::Reclaimed},
-    manifold::client::attempt::queue::mailbox,
+    core::driver::schedule::clock, manifold::client::attempt::queue::mailbox,
     runtime::executor::drive,
 };
 use dope_fiber::{BlockOn as _, task::time::sleep};
@@ -14,12 +13,14 @@ use sark_client::{
 use sark_fiber::client::{self, config, dynamic::channel};
 use sark_http::method::Method;
 
-use crate::common::client::runtime::{self, WaitError, cases::Flavor, origins, pools};
+use crate::common::client::{
+    assert_shutdown,
+    runtime::{self, WaitError, cases::Flavor, origins, pools},
+};
 
 #[derive(Debug)]
 pub enum Error<F = runtime::Failure, D = runtime::Failure> {
     Host(alloc::Exhausted),
-    Address(AddrParseError),
     FixedPlan(config::Error),
     DynamicPlan(channel::CreateError),
     Fixed(F),
@@ -37,7 +38,7 @@ pub enum Step {
 
 pub struct Request<'a> {
     flavor: Flavor,
-    addr: &'a str,
+    addr: SocketAddr,
     config: config::Config,
     method: Method,
     path: &'a str,
@@ -48,7 +49,7 @@ pub struct Request<'a> {
 impl<'a> Request<'a> {
     pub fn new(
         flavor: Flavor,
-        addr: &'a str,
+        addr: SocketAddr,
         config: config::Config,
         method: Method,
         path: &'a str,
@@ -66,11 +67,16 @@ impl<'a> Request<'a> {
         }
     }
 
-    pub fn try_run<R, C>(
-        self,
-        check: C,
-        report: impl FnMut(Reclaimed),
-    ) -> Result<R, Error>
+    pub fn get(flavor: Flavor, addr: SocketAddr, config: config::Config, path: &'a str) -> Self {
+        Self::new(flavor, addr, config, Method::GET, path, &[], &[])
+    }
+
+    pub fn collect(self) -> Contiguous {
+        self.try_run(|result| result.expect("HTTP response"))
+            .expect("HTTP request execution")
+    }
+
+    pub fn try_run<R, C>(self, check: C) -> Result<R, Error>
     where
         C: for<'d> FnOnce(Result<Contiguous, Failure<Infallible, mailbox::Error<'d>>>) -> R,
     {
@@ -83,8 +89,8 @@ impl<'a> Request<'a> {
             headers,
             body,
         } = self;
-        let output = match flavor {
-            Flavor::Fixed => pools::Plan::new(addr.parse().map_err(Error::Address)?, config, 1, 1)
+        match flavor {
+            Flavor::Fixed => pools::Plan::new(addr, config, 1, 1)
                 .map_err(Error::FixedPlan)?
                 .enter(
                     (),
@@ -98,10 +104,10 @@ impl<'a> Request<'a> {
                             .map_err(Failure::widen);
                         Ok::<R, Step>(check(outcome))
                     },
-                    report,
+                    assert_shutdown,
                 )
                 .map_err(Error::Fixed)?
-                .map_err(Error::Step)?,
+                .map_err(Error::Step),
             Flavor::OnDemand => origins::Plan::new(config, 1, 1, 1)
                 .map_err(Error::DynamicPlan)?
                 .enter(
@@ -114,18 +120,13 @@ impl<'a> Request<'a> {
                             .map_err(Step::Drive)?;
                         Ok::<R, Step>(check(outcome))
                     },
-                    report,
+                    assert_shutdown,
                 )
                 .map_err(Error::Dynamic)?
-                .map_err(Error::Step)?,
-        };
-        Ok(output)
+                .map_err(Error::Step),
+        }
     }
-    pub fn try_scoped<R, C>(
-        self,
-        check: C,
-        report: impl FnMut(Reclaimed),
-    ) -> Result<R, Error>
+    pub fn try_scoped<R, C>(self, check: C) -> Result<R, Error>
     where
         C: for<'scope, 'd> FnOnce(
             Result<Scoped<'scope, 'd>, Failure<Infallible, mailbox::Error<'d>>>,
@@ -140,8 +141,8 @@ impl<'a> Request<'a> {
             headers,
             body,
         } = self;
-        let output = match flavor {
-            Flavor::Fixed => pools::Plan::new(addr.parse().map_err(Error::Address)?, config, 1, 1)
+        match flavor {
+            Flavor::Fixed => pools::Plan::new(addr, config, 1, 1)
                 .map_err(Error::FixedPlan)?
                 .enter(
                     (),
@@ -157,10 +158,10 @@ impl<'a> Request<'a> {
                             .map_err(Failure::widen);
                         Ok::<R, Step>(check(outcome))
                     },
-                    report,
+                    assert_shutdown,
                 )
                 .map_err(Error::Fixed)?
-                .map_err(Error::Step)?,
+                .map_err(Error::Step),
             Flavor::OnDemand => origins::Plan::new(config, 1, 1, 1)
                 .map_err(Error::DynamicPlan)?
                 .enter(
@@ -175,11 +176,10 @@ impl<'a> Request<'a> {
                             .map_err(Step::Drive)?;
                         Ok::<R, Step>(check(outcome))
                     },
-                    report,
+                    assert_shutdown,
                 )
                 .map_err(Error::Dynamic)?
-                .map_err(Error::Step)?,
-        };
-        Ok(output)
+                .map_err(Error::Step),
+        }
     }
 }

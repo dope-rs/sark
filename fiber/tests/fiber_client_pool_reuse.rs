@@ -8,7 +8,7 @@ use std::{num::NonZero, time::Duration};
 use common::client::{
     config::{Config as _, FLAVORS},
     runtime::{
-        cases::{Batch, Flavor},
+        cases::Flavor,
         peer::Response as _,
     },
 };
@@ -31,18 +31,13 @@ fn survives_peer_close() {
         |server| {
             let addr = server.addr();
 
-            let codes = Batch::new(
-                Flavor::Fixed,
+            let codes = Flavor::Fixed.try_gets(
                 addr,
                 Config::try_new("127.0.0.1").expect("HTTP host allocation"),
                 NonZero::new(2).expect("client capacity"),
                 &["/1", "/2", "/3", "/4", "/5", "/6"],
                 &[],
                 None,
-            )
-            .try_run(
-                |result| result.expect("batch response").status().as_u16(),
-                assert_shutdown,
             )
             .expect("client scenario");
             assert_eq!(codes, vec![200, 200, 200, 200, 200, 200]);
@@ -73,18 +68,13 @@ fn drains_long_sequence() {
             let addr = server.addr();
 
             let paths: &[&str] = &["/a", "/b", "/c", "/d", "/e", "/f", "/g", "/h", "/i", "/j"];
-            let codes = Batch::new(
-                Flavor::Fixed,
+            let codes = Flavor::Fixed.try_gets(
                 addr,
                 Config::try_new("127.0.0.1").expect("HTTP host allocation"),
                 NonZero::new(4).expect("client capacity"),
                 paths,
                 &[],
                 None,
-            )
-            .try_run(
-                |result| result.expect("batch response").status().as_u16(),
-                assert_shutdown,
             )
             .expect("client scenario");
             assert_eq!(codes.len(), 10);
@@ -111,8 +101,7 @@ fn reuses_one_slot() {
             },
             |server| {
                 let addr = server.addr();
-                let codes = Batch::new(
-                    flavor,
+                let codes = flavor.try_gets(
                     addr,
                     flavor
                         .try_config(addr)
@@ -124,10 +113,6 @@ fn reuses_one_slot() {
                     &["/first", "/second"],
                     &[],
                     None,
-                )
-                .try_run(
-                    |result| result.expect("batch response").status().as_u16(),
-                    assert_shutdown,
                 )
                 .expect("client scenario");
                 assert!((codes) == ([200, 200]));
@@ -212,18 +197,13 @@ fn http10_needs_persistence() {
                     let addr = server.addr();
 
                     let paths = &["/first", "/second"];
-                    let codes = Batch::new(
-                        flavor,
+                    let codes = flavor.try_gets(
                         addr,
                         flavor.try_config(addr).expect("HTTP host allocation"),
                         NonZero::new(1).expect("client capacity"),
                         paths,
                         &[],
                         None,
-                    )
-                    .try_run(
-                        |result| result.expect("batch response").status().as_u16(),
-                        assert_shutdown,
                     )
                     .expect("client scenario");
                     assert_eq!(codes, [200, 200]);
@@ -258,18 +238,13 @@ fn bounds_peer_timeout() {
                     .expect("HTTP host allocation")
                     .timeout(Duration::from_secs(2))
                     .idle_timeout(Duration::from_millis(100));
-                let codes = Batch::new(
-                    flavor,
+                let codes = flavor.try_gets(
                     addr,
                     config,
                     NonZero::new(1).expect("client capacity"),
                     &["/first"],
                     &["/second"],
                     Some(Duration::from_millis(300)),
-                )
-                .try_run(
-                    |result| result.expect("batch response").status().as_u16(),
-                    assert_shutdown,
                 )
                 .expect("client scenario");
                 assert_eq!(codes, [200, 200]);
@@ -301,22 +276,14 @@ fn clock_governs_reuse() {
                 },
                 |server| {
                     let addr = server.addr();
-                    let codes = Batch::new(
-                        flavor,
+                    let codes = flavor.try_timed_pair(
                         addr,
                         flavor
                             .try_config(addr)
                             .expect("HTTP host allocation")
                             .timeout(Duration::from_secs(1))
                             .idle_timeout(Duration::from_secs(10)),
-                        NonZero::new(1).expect("client capacity"),
-                        &["/first"],
-                        &["/second"],
-                        Some(gap),
-                    )
-                    .try_clock(
-                        |result| result.expect("batch response").status().as_u16(),
-                        assert_shutdown,
+                        gap,
                     )
                     .expect("client scenario");
                     assert!((codes) == ([200, 200]));
@@ -345,8 +312,7 @@ fn zero_disables_reuse() {
             },
             |server| {
                 let addr = server.addr();
-                let codes = Batch::new(
-                    flavor,
+                let codes = flavor.try_gets(
                     addr,
                     flavor
                         .try_config(addr)
@@ -357,10 +323,6 @@ fn zero_disables_reuse() {
                     &["/first", "/second"],
                     &[],
                     None,
-                )
-                .try_run(
-                    |result| result.expect("batch response").status().as_u16(),
-                    assert_shutdown,
                 )
                 .expect("client scenario");
                 assert_eq!(codes, [200, 200]);
@@ -394,18 +356,13 @@ fn missing_hint_resets() {
                     .expect("HTTP host allocation")
                     .timeout(Duration::from_secs(3))
                     .idle_timeout(Duration::from_millis(1_800));
-                let codes = Batch::new(
-                    flavor,
+                let codes = flavor.try_gets(
                     addr,
                     config,
                     NonZero::new(1).expect("client capacity"),
                     &["/hint", "/reset"],
                     &["/after-gap"],
                     Some(Duration::from_millis(1_200)),
-                )
-                .try_run(
-                    |result| result.expect("batch response").status().as_u16(),
-                    assert_shutdown,
                 )
                 .expect("client scenario");
                 assert_eq!(codes, [200, 200, 200]);
@@ -435,8 +392,7 @@ fn recovers_silent_close() {
         |server| {
             let addr = server.addr();
 
-            let codes = Batch::new(
-                Flavor::Fixed,
+            let codes = Flavor::Fixed.try_gets(
                 addr,
                 Config::try_new("127.0.0.1")
                     .expect("HTTP host allocation")
@@ -446,10 +402,6 @@ fn recovers_silent_close() {
                 &["/1", "/2", "/3", "/4", "/5", "/6", "/7", "/8"],
                 &[],
                 None,
-            )
-            .try_run(
-                |result| result.expect("batch response").status().as_u16(),
-                assert_shutdown,
             )
             .expect("client scenario");
             assert_eq!(codes, vec![200, 200, 200, 200, 200, 200, 200, 200]);

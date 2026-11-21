@@ -1,11 +1,10 @@
-use common::client::assert_shutdown;
 use common::client::runtime::{cases::Flavor, origins, peer, peer::Conn, pools};
 use dope::{
     core::io::Reclaimed,
     manifold::client::attempt::queue::mailbox,
     runtime::executor::drive,
 };
-use dope_test::harness::peer::{AcceptScript, Stream};
+use dope_test::harness::peer::AcceptScript;
 pub mod common;
 
 use std::{convert::Infallible, str, time::Duration};
@@ -24,229 +23,95 @@ use sark_http::method::Method;
 
 #[test]
 fn response_at_cap_succeeds() {
-    AcceptScript::with(
-        move |acceptor| {
-            peer::serve_each(
-                acceptor,
-                |stream: &mut &Stream<'_>, _: peer::Request<'_>| {
-                    let body = "Hello, World!";
-                    let resp = format!(
-                        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-                        body.len(),
-                        body
-                    );
-                    stream.write_all(resp.as_bytes())
-                },
-            )
-        },
-        |server| {
-            for flavor in FLAVORS {
-                let config =
-                    Config::new(server.addr().to_string()).wire_limit("Hello, World!".len());
-                let resp = Request::new(
-                    flavor,
-                    &server.addr().to_string(),
-                    config,
-                    Method::GET,
-                    "/",
-                    &[],
-                    &[],
-                )
-                .try_run(
-                    |result| result.expect("HTTP response"),
-                    assert_shutdown,
-                )
-                .expect("HTTP request execution");
-                assert_eq!(resp.status().as_u16(), 200);
-                assert_eq!(
-                    str::from_utf8(resp.body().as_slice()).expect("peer body is source UTF-8"),
-                    "Hello, World!"
-                );
-            }
-            server
-                .stop()
-                .expect("peer thread")
-                .expect("stop response-cap peer");
-        },
-    )
-    .expect("spawn response-cap peer");
+    peer::with_body("", b"Hello, World!", |addr| {
+        for flavor in FLAVORS {
+            let config = Config::new(addr.to_string()).wire_limit("Hello, World!".len());
+            let resp = Request::get(flavor, addr, config, "/").collect();
+            assert_eq!(resp.status().as_u16(), 200);
+            assert_eq!(
+                str::from_utf8(resp.body().as_slice()).expect("peer body is source UTF-8"),
+                "Hello, World!"
+            );
+        }
+    });
 }
 
 #[test]
 fn response_over_cap_errors() {
-    AcceptScript::with(
-        move |acceptor| {
-            peer::serve_each(
-                acceptor,
-                |stream: &mut &Stream<'_>, _: peer::Request<'_>| {
-                    let body = vec![b'x'; 4096];
-                    let mut resp = format!(
-                        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-                        body.len()
-                    )
-                    .into_bytes();
-                    resp.extend_from_slice(&body);
-                    stream.write_all(&resp)
-                },
-            )
-        },
-        |server| {
-            for flavor in FLAVORS {
-                let config = Config::new(server.addr().to_string()).wire_limit(1024);
-                Request::new(
-                    flavor,
-                    &server.addr().to_string(),
-                    config,
-                    Method::GET,
-                    "/",
-                    &[],
-                    &[],
-                )
-                .try_run(
-                    |outcome| {
-                        let error = (outcome).err().expect("over-cap response must fail");
-                        assert!(matches!(
-                            error.cause(),
-                            Error::Protocol(protocol::Error::BodyLimit)
-                        ));
-                        assert!((error.safety()) == (Safety::PossiblyCommitted));
-                    },
-                    assert_shutdown,
-                )
+    peer::with_body("", &[b'x'; 4096], |addr| {
+        for flavor in FLAVORS {
+            let config = Config::new(addr.to_string()).wire_limit(1024);
+            Request::get(flavor, addr, config, "/")
+                .try_run(|outcome| {
+                    let error = outcome.err().expect("over-cap response must fail");
+                    assert!(matches!(
+                        error.cause(),
+                        Error::Protocol(protocol::Error::BodyLimit)
+                    ));
+                    assert_eq!(error.safety(), Safety::PossiblyCommitted);
+                })
                 .expect("HTTP request execution");
-            }
-            server
-                .stop()
-                .expect("peer thread")
-                .expect("stop oversized-response peer");
-        },
-    )
-    .expect("spawn oversized-response peer");
+        }
+    });
 }
 
 #[test]
 fn queue_limit_at_delivery() {
-    AcceptScript::with(
-        move |acceptor| {
-            peer::serve_each(
-                acceptor,
-                |stream: &mut &Stream<'_>, _: peer::Request<'_>| {
-                    let body = vec![b'x'; 4096];
-                    let mut response = format!(
-                        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-                        body.len()
-                    )
-                    .into_bytes();
-                    response.extend_from_slice(&body);
-                    stream.write_all(&response)
-                },
-            )
-        },
-        |server| {
-            for flavor in FLAVORS {
-                let config = Config::new(server.addr().to_string())
-                    .wire_limit(4096)
-                    .queue_bytes(64);
-                Request::new(
-                    flavor,
-                    &server.addr().to_string(),
-                    config,
-                    Method::GET,
-                    "/",
-                    &[],
-                    &[],
-                )
-                .try_run(
-                    |outcome| {
-                        let error = (outcome)
-                            .err()
-                            .expect("response queue must reject an oversized live reply");
-                        assert!(matches!(
-                            error.cause(),
-                            Error::Capacity(capacity::Error::ResponseCapacity(
-                                Capacity::Limit {
-                                    resource: Resource::Bytes,
-                                    limit,
-                                    ..
-                                }
-                            )) if limit.get() == 64
-                        ));
-                        assert!((error.safety()) == (Safety::PossiblyCommitted));
-                    },
-                    assert_shutdown,
-                )
+    peer::with_body("", &[b'x'; 4096], |addr| {
+        for flavor in FLAVORS {
+            let config = Config::new(addr.to_string())
+                .wire_limit(4096)
+                .queue_bytes(64);
+            Request::get(flavor, addr, config, "/")
+                .try_run(|outcome| {
+                    let error = outcome
+                        .err()
+                        .expect("response queue must reject an oversized live reply");
+                    assert!(matches!(
+                        error.cause(),
+                        Error::Capacity(capacity::Error::ResponseCapacity(
+                            Capacity::Limit {
+                                resource: Resource::Bytes,
+                                limit,
+                                ..
+                            }
+                        )) if limit.get() == 64
+                    ));
+                    assert_eq!(error.safety(), Safety::PossiblyCommitted);
+                })
                 .expect("HTTP request execution");
-            }
-            server
-                .stop()
-                .expect("peer thread")
-                .expect("stop queue-capacity peer");
-        },
-    )
-    .expect("spawn queue-capacity peer");
+        }
+    });
 }
 
 #[test]
 fn wire_memory_at_ingress() {
-    AcceptScript::with(
-        move |acceptor| {
-            peer::serve_each(
-                acceptor,
-                |stream: &mut &Stream<'_>, _: peer::Request<'_>| {
-                    let body = vec![b'x'; 4096];
-                    let mut response = format!(
-                        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-                        body.len()
-                    )
-                    .into_bytes();
-                    response.extend_from_slice(&body);
-                    stream.write_all(&response)
-                },
-            )
-        },
-        |server| {
-            for flavor in FLAVORS {
-                let config = Config::new(server.addr().to_string())
-                    .wire_limit(4096)
-                    .wire_memory(256)
-                    .queue_bytes(8192);
-                Request::new(
-                    flavor,
-                    &server.addr().to_string(),
-                    config,
-                    Method::GET,
-                    "/",
-                    &[],
-                    &[],
-                )
-                .try_run(
-                    |outcome| {
-                        let error = (outcome)
-                            .err()
-                            .expect("response ingress must honor its resident capacity");
-                        let budget = match error.cause() {
-                            Error::Protocol(protocol::Error::Retention(hold::Error::Account(
-                                account::Cause::Budget(budget),
-                            ))) => Some(budget),
-                            _ => None,
-                        }
-                        .expect("response retention must report its exact budget failure");
-                        let (need, spare) = budget.into_parts();
-                        assert!(need.get() > 256);
-                        assert!(spare <= 256);
-                        assert!((error.safety()) == (Safety::PossiblyCommitted));
-                    },
-                    assert_shutdown,
-                )
+    peer::with_body("", &[b'x'; 4096], |addr| {
+        for flavor in FLAVORS {
+            let config = Config::new(addr.to_string())
+                .wire_limit(4096)
+                .wire_memory(256)
+                .queue_bytes(8192);
+            Request::get(flavor, addr, config, "/")
+                .try_run(|outcome| {
+                    let error = outcome
+                        .err()
+                        .expect("response ingress must honor its resident capacity");
+                    let budget = match error.cause() {
+                        Error::Protocol(protocol::Error::Retention(hold::Error::Account(
+                            account::Cause::Budget(budget),
+                        ))) => Some(budget),
+                        _ => None,
+                    }
+                    .expect("response retention must report its exact budget failure");
+                    let (need, spare) = budget.into_parts();
+                    assert!(need.get() > 256);
+                    assert!(spare <= 256);
+                    assert_eq!(error.safety(), Safety::PossiblyCommitted);
+                })
                 .expect("HTTP request execution");
-            }
-            server
-                .stop()
-                .expect("peer thread")
-                .expect("stop resident-capacity peer");
-        },
-    )
-    .expect("spawn resident-capacity peer");
+        }
+    });
 }
 
 #[test]
@@ -382,32 +247,28 @@ fn timeout_retry() {
                     peer::empty(acceptor)
                 },
                 |server| {
-                    let addr = server.addr().to_string();
-                    let config = Config::try_new(&addr)
-                        .expect("HTTP host allocation")
+                    let addr = server.addr();
+                    let config = Config::new(addr.to_string())
                         .retry(AGGRESSIVE)
                         .timeout(total)
                         .limit(Stage::Head, head);
                     let method = if post { Method::POST } else { Method::GET };
-                    Request::new(flavor, &addr, config, method, "/", &[], &[])
-                        .try_run(
-                            |outcome| {
-                                if retry {
-                                    assert_eq!(
-                                        outcome.expect("retried response").status().as_u16(),
-                                        200
-                                    );
-                                } else {
-                                    let failure = outcome.err().expect("terminal timeout");
-                                    assert!(matches!(failure.cause(), Error::Timeout(error)
-                                        if error.phase() == timeout::Phase::Head
-                                            && error.elapsed() == elapsed));
-                                    assert_eq!(failure.attempt(), 1);
-                                    assert_eq!(failure.safety(), Safety::PossiblyCommitted);
-                                }
-                            },
-                            assert_shutdown,
-                        )
+                    Request::new(flavor, addr, config, method, "/", &[], &[])
+                        .try_run(|outcome| {
+                            if retry {
+                                assert_eq!(
+                                    outcome.expect("retried response").status().as_u16(),
+                                    200
+                                );
+                            } else {
+                                let failure = outcome.err().expect("terminal timeout");
+                                assert!(matches!(failure.cause(), Error::Timeout(error)
+                                    if error.phase() == timeout::Phase::Head
+                                        && error.elapsed() == elapsed));
+                                assert_eq!(failure.attempt(), 1);
+                                assert_eq!(failure.safety(), Safety::PossiblyCommitted);
+                            }
+                        })
                         .expect("HTTP request execution");
                     server
                         .finish()

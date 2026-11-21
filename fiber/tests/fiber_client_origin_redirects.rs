@@ -2,7 +2,6 @@ pub mod common;
 
 use std::str;
 
-use common::client::assert_shutdown;
 use common::client::{
     config::FLAVORS,
     routes::*,
@@ -27,13 +26,8 @@ fn follows_origin() {
         |server| {
             for flavor in FLAVORS {
                 let resp = flavor
-                    .try_request(&server.addr().to_string(), Method::GET, "/start", &[])
-                    .expect("HTTP host allocation")
-                    .try_run(
-                        |result| result.expect("HTTP response"),
-                        assert_shutdown,
-                    )
-                    .expect("request scope");
+                    .get(server.addr(), "/start")
+                    .collect();
                 assert_eq!(resp.status().as_u16(), 200);
                 assert_eq!(
                     str::from_utf8(resp.body().as_slice()).expect("response body is UTF-8"),
@@ -56,13 +50,8 @@ fn redirect_chain_followed() {
         |server| {
             for flavor in FLAVORS {
                 let resp = flavor
-                    .try_request(&server.addr().to_string(), Method::GET, "/a", &[])
-                    .expect("HTTP host allocation")
-                    .try_run(
-                        |result| result.expect("HTTP response"),
-                        assert_shutdown,
-                    )
-                    .expect("request scope");
+                    .get(server.addr(), "/a")
+                    .collect();
                 assert_eq!(resp.status().as_u16(), 200);
                 assert_eq!(
                     str::from_utf8(resp.body().as_slice()).expect("response body is UTF-8"),
@@ -85,13 +74,8 @@ fn resolves_relative() {
         |server| {
             for flavor in FLAVORS {
                 let response = flavor
-                    .try_request(&server.addr().to_string(), Method::GET, "/dir/start", &[])
-                    .expect("HTTP host allocation")
-                    .try_run(
-                        |result| result.expect("HTTP response"),
-                        assert_shutdown,
-                    )
-                    .expect("request scope");
+                    .get(server.addr(), "/dir/start")
+                    .collect();
                 assert_eq!(response.status().as_u16(), 200);
                 assert_eq!(response.body().as_slice(), b"ok");
             }
@@ -111,13 +95,8 @@ fn keeps_query_path() {
         |server| {
             for flavor in FLAVORS {
                 let response = flavor
-                    .try_request(&server.addr().to_string(), Method::GET, "/item?step=1", &[])
-                    .expect("HTTP host allocation")
-                    .try_run(
-                        |result| result.expect("HTTP response"),
-                        assert_shutdown,
-                    )
-                    .expect("request scope");
+                    .get(server.addr(), "/item?step=1")
+                    .collect();
                 assert_eq!(response.status().as_u16(), 200);
                 assert_eq!(response.body().as_slice(), b"ok");
             }
@@ -136,26 +115,20 @@ fn redirect_loop_rejected() {
         |acceptor| peer::serve(acceptor, peer::Request::looping),
         |server| {
             for flavor in FLAVORS {
-                Request::new(
+                Request::get(
                     flavor,
-                    &server.addr().to_string(),
+                    server.addr(),
                     Config::new(server.addr().to_string()),
-                    Method::GET,
                     "/a",
-                    &[],
-                    &[],
                 )
-                .try_run(
-                    |outcome| {
-                        let failure = (outcome).err().expect("redirect loop must be rejected");
-                        assert!((failure.safety()) == (Safety::PossiblyCommitted));
-                        assert!(matches!(
-                            failure.cause(),
-                            Error::Redirect(redirect::Error::Loop)
-                        ));
-                    },
-                    assert_shutdown,
-                )
+                .try_run(|outcome| {
+                    let failure = (outcome).err().expect("redirect loop must be rejected");
+                    assert!((failure.safety()) == (Safety::PossiblyCommitted));
+                    assert!(matches!(
+                        failure.cause(),
+                        Error::Redirect(redirect::Error::Loop)
+                    ));
+                })
                 .expect("HTTP request execution");
             }
             server
@@ -172,28 +145,22 @@ fn rejects_cross_origin() {
     AcceptScript::with(
         |acceptor| peer::serve(acceptor, |_: peer::Request<'_>| CROSS_ORIGIN.to_vec()),
         |server| {
-            Request::new(
+            Request::get(
                 Flavor::Fixed,
-                &server.addr().to_string(),
+                server.addr(),
                 Config::new(server.addr().to_string()),
-                Method::GET,
                 "/start",
-                &[],
-                &[],
             )
-            .try_run(
-                |outcome| {
-                    let failure = (outcome)
-                        .err()
-                        .expect("cross-origin redirect must be rejected");
-                    assert!((failure.safety()) == (Safety::PossiblyCommitted));
-                    assert!(matches!(
-                        failure.cause(),
-                        Error::Request(RequestError::CrossOrigin)
-                    ));
-                },
-                assert_shutdown,
-            )
+            .try_run(|outcome| {
+                let failure = (outcome)
+                    .err()
+                    .expect("cross-origin redirect must be rejected");
+                assert!((failure.safety()) == (Safety::PossiblyCommitted));
+                assert!(matches!(
+                    failure.cause(),
+                    Error::Request(RequestError::CrossOrigin)
+                ));
+            })
             .expect("HTTP request execution");
             server
                 .stop()
@@ -212,13 +179,8 @@ fn accepts_terminal_304() {
         let addr = acceptor.local_addr().expect("listener address");
         let (served, ()) = run::Entry(move || {
             let response = flavor
-                .try_request(&addr.to_string(), Method::GET, "/start", &[])
-                .expect("HTTP host allocation")
-                .try_run(
-                    |result| result.expect("HTTP response"),
-                    assert_shutdown,
-                )
-                .expect("request scope");
+                .get(addr, "/start")
+                .collect();
             assert_eq!(response.status(), status::Code::NOT_MODIFIED);
         })
         .with(|| {
@@ -263,21 +225,16 @@ fn preserves_method_policy() {
                 TcpAcceptor::bind(([127, 0, 0, 1], 0).into()).expect("policy listener");
             let addr = acceptor.local_addr().expect("listener address");
             let (observed, ()) = run::Entry(move || {
-                let addr = addr.to_string();
                 let response = Request::new(
                     flavor,
-                    &addr,
-                    Config::try_new(&addr).expect("HTTP host allocation"),
+                    addr,
+                    Config::new(addr.to_string()),
                     initial,
                     "/start",
                     &headers,
                     b"payload",
                 )
-                .try_run(
-                    |result| result.expect("HTTP response"),
-                    assert_shutdown,
-                )
-                .expect("request scope");
+                .collect();
                 assert_eq!(response.status(), status::Code::OK);
             })
             .with(|| {

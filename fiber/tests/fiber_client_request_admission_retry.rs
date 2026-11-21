@@ -1,4 +1,3 @@
-use common::client::assert_shutdown;
 use common::client::runtime::peer;
 use dope_test::harness::{
     GUARD,
@@ -31,7 +30,7 @@ use sark_http::{field, h1::switch, method::Method};
 #[test]
 fn rejects_invalid_headers() {
     let mut acceptor = TcpAcceptor::bind(([127, 0, 0, 1], 0).into()).expect("validation listener");
-    let addr = acceptor.local_addr().expect("listener address").to_string();
+    let addr = acceptor.local_addr().expect("listener address");
     for flavor in FLAVORS {
         for (headers, expected) in [
             (
@@ -78,26 +77,23 @@ fn rejects_invalid_headers() {
         ] {
             Request::new(
                 flavor,
-                &addr,
-                Config::new(addr.clone()),
+                addr,
+                Config::new(addr.to_string()),
                 Method::GET,
                 "/",
                 headers,
                 &[],
             )
-            .try_run(
-                |outcome| {
-                    let failure = (outcome)
-                        .err()
-                        .expect("invalid headers must fail before submission");
-                    assert!((failure.safety()) == (Safety::BeforeSubmit));
-                    assert!(matches!(
-                        failure.cause(),
-                        Error::Request(actual) if *actual == expected
-                    ));
-                },
-                assert_shutdown,
-            )
+            .try_run(|outcome| {
+                let failure = (outcome)
+                    .err()
+                    .expect("invalid headers must fail before submission");
+                assert!((failure.safety()) == (Safety::BeforeSubmit));
+                assert!(matches!(
+                    failure.cause(),
+                    Error::Request(actual) if *actual == expected
+                ));
+            })
             .expect("HTTP request execution");
             peer::empty(&mut acceptor).expect("validation never submits any bytes");
         }
@@ -186,29 +182,26 @@ fn rejects_connect() {
         let addr = acceptor.local_addr().expect("listener address");
         Request::new(
             flavor,
-            &addr.to_string(),
+            addr,
             flavor.try_config(addr).expect("HTTP host allocation"),
             Method::CONNECT,
             "example.test:443",
             &[],
             &[],
         )
-        .try_run(
-            |outcome| {
-                let failure = (outcome)
-                    .err()
-                    .expect("CONNECT must not reach HTTP message mode");
-                assert!((failure.safety()) == (Safety::BeforeSubmit));
-                assert!(
-                    matches!(
-                        failure.cause(),
-                        Error::Request(RequestError::UnsupportedTransition)
-                    ),
-                    "{failure:?}"
-                );
-            },
-            assert_shutdown,
-        )
+        .try_run(|outcome| {
+            let failure = (outcome)
+                .err()
+                .expect("CONNECT must not reach HTTP message mode");
+            assert!((failure.safety()) == (Safety::BeforeSubmit));
+            assert!(
+                matches!(
+                    failure.cause(),
+                    Error::Request(RequestError::UnsupportedTransition)
+                ),
+                "{failure:?}"
+            );
+        })
         .expect("HTTP request execution");
         peer::empty(&mut acceptor).expect("CONNECT never submits any bytes");
     }
@@ -226,30 +219,24 @@ fn rejects_switch() {
                 })
             },
             |peer| {
-                Request::new(
+                Request::get(
                     flavor,
-                    &peer.addr().to_string(),
+                    peer.addr(),
                     flavor
                         .try_config(peer.addr())
                         .expect("HTTP host allocation"),
-                    Method::GET,
                     "/switch",
-                    &[],
-                    &[],
                 )
-                .try_run(
-                    |outcome| {
-                        let failure = (outcome).err().expect("unsolicited 101 must be rejected");
-                        assert!((failure.safety()) == (Safety::PossiblyCommitted));
-                        assert!(matches!(
-                            failure.cause(),
-                            Error::Protocol(protocol::Error::Transition(
-                                switch::Error::UnexpectedSwitch
-                            ))
-                        ));
-                    },
-                    assert_shutdown,
-                )
+                .try_run(|outcome| {
+                    let failure = (outcome).err().expect("unsolicited 101 must be rejected");
+                    assert!((failure.safety()) == (Safety::PossiblyCommitted));
+                    assert!(matches!(
+                        failure.cause(),
+                        Error::Protocol(protocol::Error::Transition(
+                            switch::Error::UnexpectedSwitch
+                        ))
+                    ));
+                })
                 .expect("HTTP request execution");
                 peer.stop()
                     .expect("peer thread")
@@ -275,31 +262,25 @@ fn attempts() {
                     })
                 },
                 |server| {
-                    Request::new(
+                    Request::get(
                         flavor,
-                        &server.addr().to_string(),
+                        server.addr(),
                         Config::new(server.addr().to_string()).timeout(Duration::from_secs(3)),
-                        Method::GET,
                         "/",
-                        &[],
-                        &[],
                     )
-                    .try_run(
-                        |result| {
-                            let failure = result.err().expect("postprocessing must fail");
-                            assert!(if coding {
-                                matches!(failure.cause(), Error::Decompression(_))
-                            } else {
-                                matches!(
-                                    failure.cause(),
-                                    Error::Redirect(redirect::Error::Location)
-                                )
-                            });
-                            assert_eq!(failure.attempt(), 2);
-                            assert_eq!(failure.safety(), Safety::PossiblyCommitted);
-                        },
-                        assert_shutdown,
-                    )
+                    .try_run(|result| {
+                        let failure = result.err().expect("postprocessing must fail");
+                        assert!(if coding {
+                            matches!(failure.cause(), Error::Decompression(_))
+                        } else {
+                            matches!(
+                                failure.cause(),
+                                Error::Redirect(redirect::Error::Location)
+                            )
+                        });
+                        assert_eq!(failure.attempt(), 2);
+                        assert_eq!(failure.safety(), Safety::PossiblyCommitted);
+                    })
                     .expect("retry postprocessing execution");
                     server
                         .stop()
@@ -318,16 +299,11 @@ fn get_retries() {
         let mut acceptor = TcpAcceptor::bind(([127, 0, 0, 1], 0).into()).expect("retry listener");
         let addr = acceptor.local_addr().expect("listener address");
         let (served, ()) = run::Entry(move || {
-            let addr = addr.to_string();
-            let config = Config::new(addr.clone())
+            let config = Config::new(addr.to_string())
                 .retry(Policy::default())
                 .timeout(Duration::from_secs(3));
-            let response = Request::new(flavor, &addr, config, Method::GET, "/effect", &[], &[])
-                .try_run(
-                    |result| result.expect("HTTP response"),
-                    assert_shutdown,
-                )
-                .expect("HTTP request execution");
+            let response = Request::get(flavor, addr, config, "/effect")
+                .collect();
             assert_eq!(response.status().as_u16(), 200);
         })
         .with(|| {
@@ -370,20 +346,13 @@ fn uses_exact_authority() {
             })
         },
         |server| {
-            let response = Request::new(
+            let response = Request::get(
                 Flavor::Fixed,
-                &(server.addr()).to_string(),
+                server.addr(),
                 Config::try_new("[2001:DB8::1]:8080").expect("HTTP host allocation"),
-                Method::GET,
                 "/authority",
-                &[],
-                &[],
             )
-            .try_run(
-                |result| result.expect("HTTP response"),
-                assert_shutdown,
-            )
-            .expect("HTTP request execution");
+            .collect();
             assert_eq!(response.status().as_u16(), 200);
             server
                 .stop()
