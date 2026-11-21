@@ -43,7 +43,7 @@ pub(super) fn build<'view, 'source>(
     let proto = &types.protocol;
     let wait = &proto.connections.pending;
     let policy = &proto.transition_policy;
-    let egress = &types.routing.egress_bound;
+    let egress = types.routing.egress_bound;
     let raw = quote!(<#policy as #ns_h1::switch::Engine>::Raw);
     let conn = &proto.connections.http_connection;
     let rt = &route.runtime;

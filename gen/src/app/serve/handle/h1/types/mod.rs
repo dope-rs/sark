@@ -30,7 +30,7 @@ pub(super) struct Generics {
 }
 
 pub(super) struct Routing<'a> {
-    pub(super) egress_bound: proc_macro2::TokenStream,
+    pub(super) egress_bound: &'a proc_macro2::TokenStream,
     pub(super) runtime: proc_macro2::TokenStream,
     pub(super) method_mask: &'a proc_macro2::TokenStream,
     pub(super) dispatch_body: proc_macro2::TokenStream,
@@ -119,7 +119,7 @@ impl<'a> Types<'a> {
 
             let lives = &context.plan.spec.state_generics.lifetimes;
             let decls = &context.plan.spec.state_generics.parameters;
-            let values = &context.plan.spec.state_generics.arguments;
+            let task_types = &dispatch.shape.core.tasks;
             let base = &dispatch.shape.base_bounds;
             let bounds = quote! {
                 #base
@@ -132,7 +132,6 @@ impl<'a> Types<'a> {
             let params = |clock: bool| {
                 let clock = clock.then_some(&g_clock);
                 let clock = clock.as_slice();
-                let (futures, makers) = context.exec.producers();
                 quote! {
                     #g_brand: #l_env,
                     #l_env,
@@ -143,35 +142,17 @@ impl<'a> Types<'a> {
                     #g_id: #ns_fiber::Identity,
                     #g_wire: #ns_fiber::dope::net::link::pool::recv::input::Execution + 'd,
                     #g_mode,
-                    #( #futures, )*
-                    #( #makers, )*
+                    #task_types
                 }
             };
             let app = params(true);
             let duplex = plan.duplex.state();
-            let upgrade = context.plan.entries.iter().any(|route| route.entry.upgrade);
-            let stamp = duplex.stamp(
-                quote!(&#g_clock #ns_h1::server::date::Clock),
-                duplex.retention(paths),
-                upgrade.then(|| quote!(::std::vec::Vec<::core::primitive::u8>)),
-            );
-            let (futures, makers) = context.exec.producers();
-            let core_use = quote! {
-                    <
-                        #g_brand,
-                        #l_env,
-                        #( #lives, )*
-                        'd,
-                        #( #values, )*
-                        #g_id,
-                        #g_wire,
-                        #ns_fiber::manifold::runtime::Direct,
-                        #g_mode,
-                        #( #futures, )*
-                        #( #makers, )*
-                    >
-            };
-            let app_use = |stamp| quote!(<#core #core_use, #stamp>);
+            let stamp = &plan.stamp;
+            let core_use = dispatch
+                .shape
+                .core
+                .with(quote!(#ns_fiber::manifold::runtime::Direct), &g_mode);
+            let app_use = |stamp: &proc_macro2::TokenStream| quote!(<#core #core_use, #stamp>);
             let (mixed_application_params, mixed_application_generic_use) = plan
                 .cleartext
                 .map(|ns_h2| {
@@ -188,7 +169,7 @@ impl<'a> Types<'a> {
                     };
                     (
                         quote!(#app #g_h2a: #ns_h2::server::app::Spec, #g_h2f,),
-                        app_use(quote!((#stamp, #h2))),
+                        app_use(&quote!((#stamp, #h2))),
                     )
                 })
                 .unwrap_or_default();
@@ -210,21 +191,8 @@ impl<'a> Types<'a> {
             let [v_method, v_result, v_parsed] = symbols.locals(["method", "outcome", "parsed"]);
             let [v_wait, v_turn, v_prior] = symbols.locals(["pending", "turn", "prior"]);
             let g_brand = symbols.lifetime("brand");
-            let ns_http = &paths.http;
-
             let spec = context.plan.spec;
-            let bound = if plan.cleartext.is_some()
-                || matches!(plan.duplex.state(), duplex::State::Enabled)
-            {
-                quote!(#ns_http::o3::buffer::resident::bound::Unbounded)
-            } else {
-                handle::decode::egress(
-                    paths,
-                    spec,
-                    &context.plan.entries,
-                    &syn::Lifetime::new("'d", proc_macro2::Span::call_site()),
-                )
-            };
+            let bound = &plan.egress_bound;
             let task = &context.exec.identity;
             let ended = if context.exec.tasks().is_empty() {
                 quote!(#task<#g_brand, 'd, #g_id>)
@@ -316,7 +284,7 @@ impl<'a> Types<'a> {
         };
         let partial = &plan.head;
         let head = quote!(#partial);
-        let bound = &routing.egress_bound;
+        let bound = routing.egress_bound;
         let rt = &routing.runtime;
         let policy = match duplex {
             duplex::State::Enabled => quote! {
@@ -414,7 +382,7 @@ impl<'a> Types<'a> {
             h2: plan.cleartext,
             protocol: Protocol {
                 duplex,
-                upgrade: context.plan.entries.iter().any(|route| route.entry.upgrade),
+                upgrade: plan.upgrade,
                 duplex_ty: kind,
                 connections: Connections {
                     pending,

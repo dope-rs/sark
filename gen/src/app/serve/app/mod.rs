@@ -4,7 +4,6 @@ use crate::{
     runtime::paths::Paths,
 };
 mod h1;
-mod surfaces;
 
 pub(super) fn build<'source, 'spec>(
     paths: &Paths,
@@ -37,15 +36,12 @@ pub(super) fn build<'source, 'spec>(
     let generics = &spec.state_generics;
     let lives = &generics.lifetimes;
     let decls = &generics.parameters;
-    let values = &generics.arguments;
     let clauses = &generics.predicates;
     let routes = &spec.route_bounds;
     let tasks = exec.tasks();
     let fibers = exec.fibers().len();
     let h1 = surface.is_some();
-    let (futures, makers) = exec.producers();
-    let futures: Vec<_> = futures.collect();
-    let makers: Vec<_> = makers.collect();
+    let (_, makers) = exec.producers();
     let slabs = &exec.slab_bounds;
     let makes: Vec<TokenStream> = exec
         .fibers()
@@ -85,12 +81,12 @@ pub(super) fn build<'source, 'spec>(
     let quota_init = (direct_quota != 0).then(|| quote!(#f_quotas: (),));
     let quota_move = (direct_quota != 0).then(|| quote!(#f_quotas: #v_quotas,));
     let core_def = &shape.core_generic_def;
-    let prod_f = if makers.is_empty() {
+    let prod_f = if fibers == 0 {
         TokenStream::new()
     } else {
         quote! { #f_makers: ( #( #makers, )* ), }
     };
-    let prod_i = if makers.is_empty() {
+    let prod_i = if fibers == 0 {
         TokenStream::new()
     } else {
         quote! { #f_makers: ( #( #makes, )* ), }
@@ -169,7 +165,7 @@ pub(super) fn build<'source, 'spec>(
     });
     let moves = if tasks.is_empty() {
         TokenStream::new()
-    } else if makers.is_empty() {
+    } else if fibers == 0 {
         quote! { #f_tasks: #v_tasks, #ids_mv #quota_move }
     } else {
         quote! { #f_tasks: #v_tasks, #f_makers: #v_maker, #ids_mv #quota_move }
@@ -210,26 +206,11 @@ pub(super) fn build<'source, 'spec>(
     let bounds = &shape.base_bounds;
     let extras = match surface {
         Some(plan) => h1::extras(
-            paths,
-            plan,
-            source,
-            exec,
-            &core_id,
-            &name,
-            surfaces::Binding::new(
-                paths,
-                &core_id,
-                source,
-                &futures,
-                &makers,
-                bounds,
-                (&moves, &ids_prep),
-            ),
-            &tinit[0],
+            paths, plan, source, exec, &core_id, &name, shape, &moves, &ids_prep, &tinit[0],
         ),
-        None => surfaces::Extras::default(),
+        None => h1::Extras::default(),
     };
-    let surfaces::Extras {
+    let h1::Extras {
         definitions: defs,
         core_fields: core_f,
         core_moves: core_mv,
@@ -237,21 +218,11 @@ pub(super) fn build<'source, 'spec>(
         core_initializers: core_i,
     } = extras;
     let proto = &shape.protocol_generic_def;
-    let cold = quote! {
-        <#core_id<
-            #g_brand,
-            #l_env,
-            #( #lives, )*
-            'd,
-            #( #values, )*
-            #g_id,
-            #g_wire,
-            #ns_fiber::manifold::runtime::Multi<#g_target>,
-            #ns_core::life::mode::Disabled,
-            #( #futures, )*
-            #( #makers, )*
-        >, ()>
-    };
+    let cold = shape.core.with(
+        quote!(#ns_fiber::manifold::runtime::Multi<#g_target>),
+        quote!(#ns_core::life::mode::Disabled),
+    );
+    let cold = quote!(<#core_id #cold, ()>);
     let hot = &shape.multiplexed_generic_use;
     let counts = flat::counts(paths, spec, exec, true);
     let empty_quota = (direct_quota != 0 && queued_quota == 0).then(|| quote!(let #v_quotas = [];));

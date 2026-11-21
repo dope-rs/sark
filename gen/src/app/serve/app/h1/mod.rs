@@ -1,27 +1,33 @@
 use crate::{
     app::{
-        serve::{
-            self,
-            app::surfaces,
-            duplex,
-            handle::{self, decode},
-        },
+        serve::{self, duplex, handle},
         spec::Driver,
     },
     macros::tokens::local,
     runtime::paths::Paths,
 };
 
-pub(super) fn extras<'emit, 'source, 'spec>(
+#[derive(Default)]
+pub(super) struct Extras {
+    pub definitions: proc_macro2::TokenStream,
+    pub core_fields: proc_macro2::TokenStream,
+    pub core_moves: proc_macro2::TokenStream,
+    pub public_methods: proc_macro2::TokenStream,
+    pub core_initializers: proc_macro2::TokenStream,
+}
+
+pub(super) fn extras<'source, 'spec>(
     paths: &Paths,
     plan: &handle::H1Plan<'source, 'spec>,
     source: &'source serve::ProtocolPlan<'spec>,
-    exec: &'emit serve::Execution<'source, 'spec>,
+    exec: &serve::Execution<'source, 'spec>,
     core: &syn::Ident,
     inner: &syn::Ident,
-    binding: surfaces::Binding<'emit>,
-    tasks: &'emit proc_macro2::TokenStream,
-) -> surfaces::Extras {
+    shape: &handle::dispatch::Shape,
+    moves: &proc_macro2::TokenStream,
+    prep: &proc_macro2::TokenStream,
+    tasks: &proc_macro2::TokenStream,
+) -> Extras {
     let [f_gzip, f_time] = ["gzip", "timer"].map(local);
     let [f_life, f_state, f_mark] = ["lifecycle", "state", "marker"].map(local);
     let [f_core, f_stamp] = ["core", "stamp"].map(local);
@@ -57,12 +63,8 @@ pub(super) fn extras<'emit, 'source, 'spec>(
     let decls = &symbols.parameters;
     let clauses = &symbols.predicates;
     let routes = &spec.route_bounds;
-    let params = &binding.generic;
-    let cold = &binding.cold_direct;
-    let bound = &binding.bound_direct;
-    let limits = binding.bounds;
-    let moves = binding.task_moves;
-    let prep = binding.task_prepare;
+    let limits = &shape.base_bounds;
+    let task_types = &shape.core.tasks;
     let counts = serve::flat::counts(paths, spec, exec, false);
     let startup = branded.then(|| {
         quote! {
@@ -77,16 +79,7 @@ pub(super) fn extras<'emit, 'source, 'spec>(
     let duplex = plan.duplex.state();
     let input = duplex.input_type(paths);
     let config = duplex.config(paths);
-    let egress_bound = if plan.cleartext.is_some() || matches!(duplex, duplex::State::Enabled) {
-        quote!(#ns_http::o3::buffer::resident::bound::Unbounded)
-    } else {
-        decode::egress(
-            paths,
-            spec,
-            &source.entries,
-            &syn::Lifetime::new("'d", proc_macro2::Span::call_site()),
-        )
-    };
+    let egress_bound = &plan.egress_bound;
     let egress = |tag: proc_macro2::TokenStream| {
         quote! {
             #ns_fiber::dope::net::link::egress::data::Bound<
@@ -100,11 +93,10 @@ pub(super) fn extras<'emit, 'source, 'spec>(
             #ns_fiber::dope::manifold::network::listener::conn::Id<'d, #g_id>,
         >>::TransportTag
     });
-    let upgrade = source.entries.iter().any(|route| route.entry.upgrade);
     let stamp = duplex.stamp(
         quote!(#n_clock),
         quote!(#v_stamp),
-        upgrade.then(|| quote!(::std::vec::Vec::new())),
+        plan.upgrade.then(|| quote!(::std::vec::Vec::new())),
     );
     let (unpack, initial) = match duplex {
         duplex::State::Disabled => (quote!(), quote!(())),
@@ -234,9 +226,20 @@ pub(super) fn extras<'emit, 'source, 'spec>(
         #state_ty: #ns_h1::server::listener::failure::Policy<#g_wire>,
         #wire
     };
+    let cold = shape
+        .core
+        .with(quote!(#ns_fiber::manifold::runtime::Cold), &g_mode);
+    let direct = shape.core.with(
+        quote!(#ns_fiber::manifold::runtime::Direct),
+        quote!(<#g_d as #ns_h1::server::deadline::policies::Policy<'d, #g_id>>::Mode<#g_mode>),
+    );
+    let retention = duplex.retention(paths);
+    let stamp_type = &plan.stamp;
     let binding = quote! {
-        impl #params #ns_h1::server::listener::bind::Bind<#l_wire, 'd, #g_id>
-            for #inner #cold
+        impl<#l_wire, #g_brand: #l_env, #l_env, #( #lives: #l_env, )* 'd: #l_wire + #l_env,
+            #( #decls, )* #g_id: #ns_fiber::Identity,
+            #g_wire: #ns_fiber::dope::net::link::pool::recv::input::Execution + 'd, #g_mode, #task_types>
+            #ns_h1::server::listener::bind::Bind<#l_wire, 'd, #g_id> for #inner<#core #cold, #retention>
         where
             #limits
             #state_ty: #ns_h1::server::listener::failure::Policy<#g_wire>,
@@ -251,7 +254,7 @@ pub(super) fn extras<'emit, 'source, 'spec>(
             type Input = #input;
             type Egress = #bind_egress;
             type Error = #ns_h1::server::listener::bind::Error;
-            type Application<#g_clock, #g_d> = #inner #bound
+            type Application<#g_clock, #g_d> = #inner<#core #direct, #stamp_type>
             where
                 'd: #g_clock,
                 #g_d: #ns_h1::server::deadline::policies::Policy<'d, #g_id>;
@@ -470,7 +473,7 @@ pub(super) fn extras<'emit, 'source, 'spec>(
         }
     };
 
-    surfaces::Extras {
+    Extras {
         definitions: defs,
         core_fields: fields,
         core_moves: owned,

@@ -16,12 +16,29 @@ pub(in crate::app::serve::handle) struct Methods {
 }
 
 pub(in crate::app::serve) struct Shape {
+    pub(in crate::app::serve) core: CoreArgs,
     pub(in crate::app::serve) base_bounds: proc_macro2::TokenStream,
     pub(in crate::app::serve) generic_def: proc_macro2::TokenStream,
     pub(in crate::app::serve) core_generic_def: proc_macro2::TokenStream,
     pub(in crate::app::serve) protocol_generic_def: proc_macro2::TokenStream,
     pub(in crate::app::serve) generic_use: proc_macro2::TokenStream,
     pub(in crate::app::serve) multiplexed_generic_use: proc_macro2::TokenStream,
+}
+
+pub(in crate::app::serve) struct CoreArgs {
+    inputs: proc_macro2::TokenStream,
+    pub(in crate::app::serve) tasks: proc_macro2::TokenStream,
+}
+
+impl CoreArgs {
+    pub(in crate::app::serve) fn with(
+        &self,
+        storage: impl quote::ToTokens,
+        mode: impl quote::ToTokens,
+    ) -> proc_macro2::TokenStream {
+        let Self { inputs, tasks } = self;
+        quote::quote!(<#inputs #storage, #mode, #tasks>)
+    }
 }
 
 impl Methods {
@@ -87,76 +104,31 @@ impl Shape {
         let core = &context.core_ident;
         let slabs = &context.exec.slab_bounds;
         let make_req = &context.exec.producer_bounds;
-        let base = quote! {
-        #( #clauses, )*
-        #( #routes )*
-        #( #make_req )*
-        #( #slabs )*
-        };
-        let generic = |stamp: bool| {
-            let (futures, makers) = context.exec.producers();
-            let stamp = stamp.then_some(&g_stamp);
-            let stamp = stamp.as_slice();
-            quote! {
-            <
-                #g_brand: #l_env,
-                #l_env,
-                #( #lives: #l_env, )*
-                'd: #l_env,
-                #( #decls, )*
-                #g_id: #ns_fiber::Identity,
-                #g_wire: #ns_fiber::dope::net::wire::Spec + #l_env,
-                #g_store: #ns_fiber::manifold::runtime::Storage,
-                #g_mode,
-                #( #stamp, )*
-                #( #futures, )*
-                #( #makers, )*
-            >
-            }
-        };
         let (futures, makers) = context.exec.producers();
-        let proto = quote! {
-            <
-                #g_brand: #l_env,
-                #l_env,
-                #( #lives: #l_env, )*
-                'd: #l_env,
-                #( #decls, )*
-                #g_id: #ns_fiber::Identity,
-                #g_wire: #ns_fiber::dope::net::wire::Spec + #l_env,
-                #g_target: #ns_core::manifold::task::Target + 'd,
-                #( #futures, )*
-                #( #makers, )*
-            >
+        let args = CoreArgs {
+            inputs: quote!(#g_brand, #l_env, #( #lives, )* 'd, #( #values, )* #g_id, #g_wire,),
+            tasks: quote!(#( #futures, )* #( #makers, )*),
         };
-        let (futures, makers) = context.exec.producers();
-        let use_ = quote! {
-            <#core<#g_brand, #l_env, #( #lives, )* 'd, #( #values, )* #g_id, #g_wire, #g_store, #g_mode, #( #futures, )* #( #makers, )*>, #g_stamp>
+        let tasks = &args.tasks;
+        let parameters = quote! {
+            #g_brand: #l_env, #l_env, #( #lives: #l_env, )* 'd: #l_env,
+            #( #decls, )* #g_id: #ns_fiber::Identity,
+            #g_wire: #ns_fiber::dope::net::wire::Spec + #l_env,
         };
-        let (futures, makers) = context.exec.producers();
-        let multi = quote! {
-            <#core<
-                #g_brand,
-                #l_env,
-                #( #lives, )*
-                'd,
-                #( #values, )*
-                #g_id,
-                #g_wire,
-                #ns_fiber::manifold::runtime::Prepared<#g_target>,
-                #ns_core::life::mode::Disabled,
-                #( #futures, )*
-                #( #makers, )*
-            >, ()>
-        };
-
+        let stored = quote!(#parameters #g_store: #ns_fiber::manifold::runtime::Storage, #g_mode,);
+        let app = args.with(g_store, g_mode);
+        let multiplexed = args.with(
+            quote!(#ns_fiber::manifold::runtime::Prepared<#g_target>),
+            quote!(#ns_core::life::mode::Disabled),
+        );
         Self {
-            base_bounds: base,
-            generic_def: generic(true),
-            core_generic_def: generic(false),
-            protocol_generic_def: proto,
-            generic_use: use_,
-            multiplexed_generic_use: multi,
+            base_bounds: quote!(#( #clauses, )* #( #routes )* #( #make_req )* #( #slabs )*),
+            generic_def: quote!(<#stored #g_stamp, #tasks>),
+            core_generic_def: quote!(<#stored #tasks>),
+            protocol_generic_def: quote!(<#parameters #g_target: #ns_core::manifold::task::Target + 'd, #tasks>),
+            generic_use: quote!(<#core #app, #g_stamp>),
+            multiplexed_generic_use: quote!(<#core #multiplexed, ()>),
+            core: args,
         }
     }
 }

@@ -312,7 +312,7 @@ pub(super) fn build(
     let exec = Execution::new(paths, &plan);
     let h1 = match &h1 {
         crate::runtime::H1::Available(cleartext) => {
-            Some(handle::H1Plan::new(&plan, cleartext.as_ref()))
+            Some(handle::H1Plan::new(paths, &plan, cleartext.as_ref()))
         }
         crate::runtime::H1::Missing => None,
     };

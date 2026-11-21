@@ -17,6 +17,9 @@ pub(in crate::app::serve) struct H1Plan<'source, 'spec> {
     pub(in crate::app::serve) cleartext: Option<&'source proc_macro2::TokenStream>,
     pub(in crate::app::serve) duplex: &'source duplex::Plan<'spec>,
     entries: &'source [serve::RouteSpec<'spec, serve::Mode<'spec>>],
+    pub(in crate::app::serve) upgrade: bool,
+    pub(in crate::app::serve) stamp: proc_macro2::TokenStream,
+    pub(in crate::app::serve) egress_bound: proc_macro2::TokenStream,
     pub(super) operations: Vec<usize>,
     pub(in crate::app::serve::handle) continuation: syn::Ident,
     pub(in crate::app::serve::handle) route: syn::Ident,
@@ -26,13 +29,16 @@ pub(in crate::app::serve) struct H1Plan<'source, 'spec> {
 
 impl<'source, 'spec> H1Plan<'source, 'spec> {
     pub(in crate::app::serve) fn new(
+        paths: &Paths,
         plan: &'source serve::ProtocolPlan<'spec>,
         cleartext: Option<&'source proc_macro2::TokenStream>,
     ) -> Self {
+        let mut upgrade = false;
         let mut sync = std::collections::BTreeMap::new();
         let mut operations = Vec::with_capacity(plan.entries.len());
         for (index, route) in plan.entries.iter().enumerate() {
             let entry = route.entry;
+            upgrade |= entry.upgrade;
             let operation = if matches!(route.mode, serve::Mode::Sync)
                 && entry.guards.is_empty()
                 && entry.route.qself.is_none()
@@ -44,8 +50,26 @@ impl<'source, 'spec> H1Plan<'source, 'spec> {
             };
             operations.push(operation);
         }
+        let duplex = plan.duplex.state();
+        let clock = plan.spec.state_generics.lifetime("clock");
+        let h1 = &paths.h1;
+        let stamp = duplex.stamp(
+            quote::quote!(&#clock #h1::server::date::Clock),
+            duplex.retention(paths),
+            upgrade.then(|| quote::quote!(::std::vec::Vec<::core::primitive::u8>)),
+        );
+        let egress_bound = if cleartext.is_some() || matches!(duplex, duplex::State::Enabled) {
+            let http = &paths.http;
+            quote::quote!(#http::o3::buffer::resident::bound::Unbounded)
+        } else {
+            let driver = syn::Lifetime::new("'d", proc_macro2::Span::call_site());
+            serve::handle::decode::egress(paths, plan.spec, &plan.entries, &driver)
+        };
         Self {
             cleartext,
+            upgrade,
+            stamp,
+            egress_bound,
             duplex: &plan.duplex,
             entries: &plan.entries,
             operations,
