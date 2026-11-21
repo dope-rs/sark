@@ -44,11 +44,16 @@ impl Inputs {
         }
     }
 
-    pub(super) fn parse(fun: &mut ItemFn, declared: Option<Type>) -> syn::Result<Self> {
+    pub(super) fn parse(
+        fun: &mut ItemFn,
+        declared: Option<Type>,
+        implicit: bool,
+    ) -> syn::Result<Self> {
         let task = fun.sig.asyncness.is_some();
         let mut index = 0;
         let request = match declared {
             Some(request) => Request::Declared(Self::schema(request)?),
+            None if implicit => Request::Declared(syn::parse_quote!(())),
             None => {
                 let argument = Self::typed(fun, index, "request")?;
                 index += 1;

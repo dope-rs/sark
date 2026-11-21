@@ -11,7 +11,7 @@ use sark_core::{
         admit::{Open, Track},
         credit, flow, input, stream,
     },
-    manifold::{stream::Boundary, task},
+    manifold::stream::Boundary,
     request,
     route::{self, Reject},
 };
@@ -19,7 +19,6 @@ use sark_http::{
     h1::codec::canned,
     payload::{fixed, owned},
 };
-use task::request::Input;
 
 use crate::{
     session,
@@ -349,7 +348,12 @@ impl<'d, R: route::Spec<Request: route::Own>> Streaming<'d, R> {
         mut proof: E,
     ) -> ControlFlow<Ready<'d, R>, session::Outcome<'d, D>>
     where
-        Admit: FnOnce(Input<'d, R>, usize, Context, &mut Runtime) -> session::Outcome<'d, D>,
+        Admit: FnOnce(
+            <R::Request as route::Own>::Input<'d>,
+            usize,
+            Context,
+            &mut Runtime,
+        ) -> session::Outcome<'d, D>,
         E: credit::Evidence,
     {
         let pending = match self.try_exact(done.body_len, &mut proof) {
@@ -383,7 +387,12 @@ impl<'d, R: route::Spec<Request: route::Own>> Ready<'d, R> {
         proof: E,
     ) -> ControlFlow<Self, session::Outcome<'d, D>>
     where
-        Admit: FnOnce(Input<'d, R>, usize, Context, &mut Runtime) -> session::Outcome<'d, D>,
+        Admit: FnOnce(
+            <R::Request as route::Own>::Input<'d>,
+            usize,
+            Context,
+            &mut Runtime,
+        ) -> session::Outcome<'d, D>,
         E: credit::Evidence,
     {
         self.complete(0, rt, admit, proof)
@@ -397,7 +406,12 @@ impl<'d, R: route::Spec<Request: route::Own>> Ready<'d, R> {
         mut proof: E,
     ) -> ControlFlow<Self, session::Outcome<'d, D>>
     where
-        Admit: FnOnce(Input<'d, R>, usize, Context, &mut Runtime) -> session::Outcome<'d, D>,
+        Admit: FnOnce(
+            <R::Request as route::Own>::Input<'d>,
+            usize,
+            Context,
+            &mut Runtime,
+        ) -> session::Outcome<'d, D>,
         E: credit::Evidence,
     {
         let pending = self.pending;
@@ -443,7 +457,7 @@ impl<'d, R: route::Spec<Request: route::Own>> Ready<'d, R> {
                     return Err(session::Outcome::Close(reply));
                 }
             };
-            Err(admit(Input::Ready { request }, used, response, rt))
+            Err(admit(request.into(), used, response, rt))
         });
         match result {
             Ok(pending) => ControlFlow::Break(Self { pending }),

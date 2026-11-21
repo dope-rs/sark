@@ -42,7 +42,7 @@ pub(in crate::app::serve::handle) fn fiber(
         let #n_source = &mut #n_tasks;
         #quota
         move |
-            #n_input: #ns_core::manifold::task::request::Input<'d, #route>,
+            #n_input: <<#route as #ns_core::route::Spec>::Request as #ns_core::route::Own>::Input<'d>,
             #n_used,
             #n_resp: #ns_h1::wire::response::Context,
             #n_run: &mut #runtime,

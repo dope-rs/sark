@@ -15,11 +15,7 @@ pub(super) struct Body {
     pub(super) built_body: proc_macro2::TokenStream,
 }
 
-pub(super) fn build(
-    paths: &Paths,
-    ctx: &handle::Context<'_, '_, '_>,
-    prep: &syn::Ident,
-) -> Body {
+pub(super) fn build(paths: &Paths, ctx: &handle::Context<'_, '_, '_>, prep: &syn::Ident) -> Body {
     let [f_core, f_ids, f_makers] = ["core", "ids", "task_producers"].map(local);
     let [f_state, f_time] = ["state", "timer"].map(local);
     let symbols = &ctx.plan.spec.state_generics;
@@ -295,9 +291,7 @@ pub(super) fn build(
                     #admission
                     let #n_make = #v_this.#f_makers.#field;
                     let #n_task = #n_make((
-                        #ns_core::manifold::task::request::Input::Ready {
-                            request: #v_req,
-                        },
+                        #v_req.into(),
                         *#v_this.#f_state,
                         <#ns_fiber::manifold::runtime::Prepared<
                             #g_target,

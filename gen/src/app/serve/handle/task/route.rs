@@ -27,6 +27,7 @@ pub(super) fn generate(
     let flat = crate::app::serve::flat::name(ctx.plan.spec, true);
     let f_quotas = local("quotas");
     let fibers = ctx.exec.fibers().iter().copied().map(|(task, fiber)| {
+        let route = task.route();
         let var = task.prepared();
         let slot = task.request();
         let field = syn::Index::from(fiber.slot);
@@ -43,10 +44,11 @@ pub(super) fn generate(
                 let #n_id = #v_this.#f_ids.try_next().map_err(
                     #ns_core::manifold::task::Error::Sequence,
                 )?;
-                let #n_req = #v_head.retain().with_id(#n_id).with_body(#n_body);
+                let #n_req: <<#route as #ns_core::route::Spec>::Request as #ns_core::route::Own>::Input<'d> =
+                    #v_head.retain().with_id(#n_id).with_body(#n_body).into();
                 let #n_make = #v_this.#f_makers.#field;
                 let #n_task = #n_make((
-                    #ns_core::manifold::task::request::Input::Buffered(#n_req),
+                    #n_req,
                     *#v_this.#f_state,
                     <#ns_fiber::manifold::runtime::Prepared<
                         #g_target,

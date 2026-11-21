@@ -9,6 +9,7 @@ use crate::{
     request::frame::proof,
 };
 
+mod empty;
 mod error;
 mod input;
 mod never;
@@ -123,6 +124,8 @@ pub trait Own: Schema {
 
     /// User-visible request value backed by retained ingress ownership.
     type Task<'d>;
+    type Input<'d>: From<Built<'d, Self::Task<'d>>>
+        + From<request::raw::Parsed<request::Retained<'d, Self::Frame>, Self>>;
     type Error<'d>;
     type TaskBuilder<'d>: TaskBuild<'d, Task = Self::Task<'d>>;
 

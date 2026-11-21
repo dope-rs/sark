@@ -5,7 +5,7 @@ use dope_fiber::{
     abi,
     task::storage::{fixed, scope},
 };
-use manifold::task::{self, request::Input, response::Output};
+use manifold::task::{self, response::Output};
 use o3::depot::{arena::slab::storage::Heap, capacity::Count};
 use sark_core::{manifold, route};
 
@@ -101,7 +101,11 @@ impl<T: task::Target> Runnable for Prepared<T> {
 
 pub trait TaskRoute<'d, State>: route::Task<'d, State, Request: route::Own> + Sized {
     fn invoke_task<'req>(
-        input: (Input<'d, Self>, &'req State, timer::Timer<'d>),
+        input: (
+            <Self::Request as route::Own>::Input<'d>,
+            &'req State,
+            timer::Timer<'d>,
+        ),
     ) -> impl abi::Fiber<'d, Output = Output<'d, Self, State>> + 'req
     where
         'd: 'req;

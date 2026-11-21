@@ -1,7 +1,7 @@
 use std::{cell::Cell, convert::Infallible, ops::ControlFlow, pin::Pin};
 
 use dope::core::driver::schedule::sequence;
-use sark_core::{body::credit, manifold::task::request::Input, route};
+use sark_core::{body::credit, route};
 use sark_fiber::request::BodyLen;
 use sark_h1::{
     pump,
@@ -107,7 +107,7 @@ type Outcome<'d, R> = session::RouteOutcome<'d, task::Pending<'d, R>>;
 
 pub struct Carrier<'a, 'd, R: route::Spec<Request: route::Own>> {
     id: Id<'d>,
-    input: &'a mut Option<Input<'d, R>>,
+    input: &'a mut Option<<R::Request as route::Own>::Input<'d>>,
     consumed: usize,
     error: Option<Error>,
 }
@@ -131,7 +131,11 @@ impl<'d, R: route::Spec<Request: route::Own<RawParams = (), Mode = route::Stream
         id: Id<'d>,
         wire: &[u8],
         accept: bool,
-    ) -> Result<(Option<Input<'d, R>>, Outcome<'d, R>, usize)> {
+    ) -> Result<(
+        Option<<R::Request as route::Own>::Input<'d>>,
+        Outcome<'d, R>,
+        usize,
+    )> {
         use sark_h1::wire::parsing::raw;
 
         let parsed = parsing::Head::parse(sark_h1::Input::Borrowed(wire), u8::MAX)
@@ -171,9 +175,14 @@ impl<'d, R: route::Spec<Request: route::Own<RawParams = (), Mode = route::Stream
         sequence: &Seq<'d>,
         first: &[u8],
         last: &[u8],
-    ) -> Result<(Input<'d, R>, usize, Input<'d, R>, usize)> {
+    ) -> Result<(
+        <R::Request as route::Own>::Input<'d>,
+        usize,
+        <R::Request as route::Own>::Input<'d>,
+        usize,
+    )> {
         let mut input = None;
-        let mut carrier = Carrier {
+        let mut carrier = Carrier::<R> {
             id: sequence.try_next().map_err(Error::Identity)?,
             input: &mut input,
             consumed: 0,
@@ -210,7 +219,7 @@ impl<'d, R: route::Spec<Request: route::Own<RawParams = (), Mode = route::Stream
 
     fn admit(
         &mut self,
-        input: Input<'d, R>,
+        input: <R::Request as route::Own>::Input<'d>,
         consumed: usize,
         response: Context,
     ) -> session::Outcome<'d> {

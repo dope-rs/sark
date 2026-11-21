@@ -120,7 +120,7 @@ impl Handler {
                 ));
             }
         }
-        let (request, schema, schema_import) = if request.is_none()
+        let implicit = request.is_none()
             && !matches!(mode, Mode::Duplex)
             && fun.sig.inputs.first().is_none_or(|argument| {
                 let FnArg::Typed(argument) = argument else {
@@ -135,23 +135,13 @@ impl Handler {
                         .any(|segment| !matches!(segment.arguments, syn::PathArguments::None)),
                     _ => false,
                 }
-            }) {
-            let request = quote::format_ident!("{}Request", name);
-            let schema = crate::request::build(
-                paths,
-                syn::parse_quote!(),
-                syn::parse_quote!(#[doc(hidden)] #inner_vis struct #request {}),
-            )?;
-            (Some(syn::parse_quote!(#request)), schema, Some(request))
-        } else {
-            (request, TokenStream::new(), None)
-        };
+            });
         let output = match mode {
             Mode::Task => Lifetimes::new(&output).anonymous("d"),
             Mode::Native | Mode::Duplex => output,
         };
         let life = Lifetimes::new(&output);
-        let input = Inputs::parse(&mut fun, request)?;
+        let input = Inputs::parse(&mut fun, request, implicit)?;
         use inputs::{Request, State, Timer};
         let state_lt = match (mode, &input.request, &input.state) {
             (Mode::Duplex, Request::Argument { .. }, State::Argument { lifetime, .. }) => {
@@ -342,7 +332,13 @@ impl Handler {
                 let req_out = life.response(&out_req, Some(&out_d), &state_lives);
                 let request_arg = request.then(|| quote::quote!(#v_rqst,));
                 let state_arg = state_at.map(|_| quote::quote!(#v_state,));
-                let release = (!request).then(|| quote::quote!(::core::mem::drop(#v_rqst);));
+                let binding = if implicit {
+                    quote::quote!(_)
+                } else {
+                    quote::quote!(#v_rqst)
+                };
+                let release =
+                    (!implicit && !request).then(|| quote::quote!(::core::mem::drop(#v_rqst);));
                 quote::quote! {
                     impl #impl_lts #ns_core::manifold::Route<#state> for #name
                     where #( #bounds, )*
@@ -351,7 +347,7 @@ impl Handler {
                         where #out_d: #out_req;
                         #[inline(always)]
                         fn invoke<#inv_req, #inv_d, #borrow>(
-                            #v_rqst: <Self::Request as #ns_core::route::Project>::View<#inv_req, #inv_d>,
+                            #binding: <Self::Request as #ns_core::route::Project>::View<#inv_req, #inv_d>,
                             #v_state: &#borrow #state,
                         ) -> Self::Response<#inv_req, #inv_d>
                         where #inv_req: #borrow, #inv_d: #inv_req
@@ -380,7 +376,7 @@ impl Handler {
                         #[inline(always)]
                         fn invoke_task<#inv_req>(
                             #v_input: (
-                                #ns_core::manifold::task::request::Input<'d, Self>,
+                                <Self::Request as #ns_core::route::Own>::Input<'d>,
                                 &#inv_req #state,
                                 #ns_fiber::driver::schedule::clock::timer::Timer<'d>,
                             ),
@@ -399,7 +395,7 @@ impl Handler {
                     .collect::<Vec<_>>();
                 fun.sig.inputs = syn::parse_quote!(
                     (#v_input, #( #extra, )*):
-                        (#ns_core::manifold::task::request::Input<'d, #name>, #( #extra_types, )*)
+                        (<<#name as #ns_core::route::Spec>::Request as #ns_core::route::Own>::Input<'d>, #( #extra_types, )*)
                 );
                 if matches!(input.state, State::Generic(_)) {
                     fun.sig.generics.params.push(syn::parse_quote!(__SarkState));
@@ -413,54 +409,66 @@ impl Handler {
                     -> #ns_core::manifold::task::response::Output<'d, #name, #state>
                 );
                 let admitted_request = request.then(|| quote::quote!(#call.1,));
-                let (ready, id) = if request {
-                    (quote::quote!(#call.into_parts()), quote::quote!(#call.0))
+                let id = if request {
+                    quote::quote!(#call.0)
                 } else {
-                    (quote::quote!(#call.into_parts().0), quote::quote!(#call))
+                    quote::quote!(#call)
                 };
-                let built = generics.lifetime("__sark_built");
-                let [v_id, v_task, v_error, v_output, v_old, v_yield, v_cx] =
-                    generics.locals(["id", "build", "error", "output", "_build", "yielded", "cx"]);
-                let own = quote::quote!(<<#name as #ns_core::route::Spec>::Request as #ns_core::route::Own>);
-                let input_ty = quote::quote!(#ns_core::manifold::task::request::Input);
                 let output_ty = quote::quote!(#ns_core::manifold::task::response::Output);
-                let step = quote::quote!(#ns_core::body::Step);
-                fun.block = Box::new(syn::parse_quote!({
-                    let #call = #built: {
-                        let #v_req = match #v_input {
-                            #input_ty::Ready { request: #v_req } => break #built #v_req,
-                            #input_ty::Buffered(#v_req) => #v_req,
-                        };
-                        let #v_id = #v_req.owner().id();
-                        let mut #v_task = match #own::start_task(#v_req) {
-                            ::core::result::Result::Ok(#v_task) => #v_task,
-                            ::core::result::Result::Err(#v_error) =>
-                                return #output_ty::rejected(#v_id, #own::reject(#v_error)),
-                        };
-                        loop {
-                            #v_task = match #ns_core::body::Build::step(#v_task, #ns_core::body::DEFAULT_BUILD_STEP_BUDGET) {
-                                #step::Ready { output: #v_output, .. } => break #built #v_output,
-                                #step::Failed { build: #v_task, error: #v_error, .. } =>
-                                    return #output_ty::rejected(#v_id, {
-                                        let #v_old = #v_task;
-                                        <#own::TaskBuilder<'d> as #ns_core::route::TaskBuild>::reject(#v_error)
-                                    }),
-                                #step::NeedInput { build: #v_task, .. }
-                                | #step::Pending { build: #v_task, .. } => #v_task,
-                            };
-                            let mut #v_yield = false;
-                            #ns_fiber::abi::poll_fn(move |#v_cx| {
-                                if #v_yield {
-                                    ::core::task::Poll::Ready(())
-                                } else {
-                                    #v_yield = true;
-                                    #v_cx.wake();
-                                    ::core::task::Poll::Pending
-                                }
-                            }).await;
-                        }
+                let build = if implicit {
+                    quote::quote!(#v_input.into_parts().0)
+                } else {
+                    let ready = if request {
+                        quote::quote!(#call.into_parts())
+                    } else {
+                        quote::quote!(#call.into_parts().0)
                     };
-                    let (#call, #( #extra, )*) = (#ready, #( #extra, )*);
+                    let built = generics.lifetime("__sark_built");
+                    let [v_id, v_task, v_error, v_output, v_old, v_yield, v_cx] = generics
+                        .locals(["id", "build", "error", "output", "_build", "yielded", "cx"]);
+                    let own = quote::quote!(<<#name as #ns_core::route::Spec>::Request as #ns_core::route::Own>);
+                    let input_ty = quote::quote!(#ns_core::manifold::task::request::Input);
+                    let step = quote::quote!(#ns_core::body::Step);
+                    quote::quote!({
+                        let #call = #built: {
+                            let #v_req = match #v_input {
+                                #input_ty::Ready { request: #v_req } => break #built #v_req,
+                                #input_ty::Buffered(#v_req) => #v_req,
+                            };
+                            let #v_id = #v_req.owner().id();
+                            let mut #v_task = match #own::start_task(#v_req) {
+                                ::core::result::Result::Ok(#v_task) => #v_task,
+                                ::core::result::Result::Err(#v_error) =>
+                                    return #output_ty::rejected(#v_id, #own::reject(#v_error)),
+                            };
+                            loop {
+                                #v_task = match #ns_core::body::Build::step(#v_task, #ns_core::body::DEFAULT_BUILD_STEP_BUDGET) {
+                                    #step::Ready { output: #v_output, .. } => break #built #v_output,
+                                    #step::Failed { build: #v_task, error: #v_error, .. } =>
+                                        return #output_ty::rejected(#v_id, {
+                                            let #v_old = #v_task;
+                                            <#own::TaskBuilder<'d> as #ns_core::route::TaskBuild>::reject(#v_error)
+                                        }),
+                                    #step::NeedInput { build: #v_task, .. }
+                                    | #step::Pending { build: #v_task, .. } => #v_task,
+                                };
+                                let mut #v_yield = false;
+                                #ns_fiber::abi::poll_fn(move |#v_cx| {
+                                    if #v_yield {
+                                        ::core::task::Poll::Ready(())
+                                    } else {
+                                        #v_yield = true;
+                                        #v_cx.wake();
+                                        ::core::task::Poll::Pending
+                                    }
+                                }).await;
+                            }
+                        };
+                        #ready
+                    })
+                };
+                fun.block = Box::new(syn::parse_quote!({
+                    let (#call, #( #extra, )*) = (#build, #( #extra, )*);
                     #output_ty::response(#id, async {
                         let (#( #patterns, )*) = (#admitted_request #( #extra, )*);
                         #body
@@ -489,15 +497,12 @@ impl Handler {
                 }
             }
         };
-        let schema_import = schema_import.into_iter();
         Ok(quote::quote! {
             #fun
             #vis use #call::#name;
-            #( #vis use #call::#schema_import; )*
             #spec
             #outer
             mod #call {
-                #schema
                 #inner_vis struct #name;
             }
         })

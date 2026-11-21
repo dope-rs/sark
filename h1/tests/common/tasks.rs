@@ -119,6 +119,7 @@ impl<P: body::Project, M> route::Spec for Request<P, M> {
 impl<P: body::Project> route::Own for Request<P> {
     type Mode = route::Streaming;
     type Task<'d> = owned::Segments<'d>;
+    type Input<'d> = manifold::task::request::Input<'d, Self>;
     type Error<'d> = Infallible;
     type TaskBuilder<'d> = Builder<'d>;
 
@@ -148,6 +149,7 @@ impl<P: body::Project> route::Own for Request<P> {
 impl<P: body::Project> route::Own for Request<P, route::Buffered> {
     type Mode = route::Buffered;
     type Task<'d> = (admit::Stream, owned::Segments<'d>);
+    type Input<'d> = manifold::task::request::Input<'d, Self>;
     type Error<'d> = Infallible;
     type TaskBuilder<'d> = BufferedBuilder<'d>;
 

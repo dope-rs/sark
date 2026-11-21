@@ -153,7 +153,7 @@ impl<'a, 'spec> Execution<'a, 'spec> {
                         #maker: ::core::marker::Copy
                             + #l_env
                             + ::core::ops::FnOnce((
-                                #ns_core::manifold::task::request::Input<'d, #route>,
+                                <<#route as #ns_core::route::Spec>::Request as #ns_core::route::Own>::Input<'d>,
                                 &#l_env #state_ty,
                                 #ns_fiber::driver::schedule::clock::timer::Timer<'d>,
                             )) -> #future,

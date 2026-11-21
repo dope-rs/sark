@@ -419,6 +419,7 @@ pub(super) fn build(
         }
         impl #ns_core::route::Own for #name<'static> {
             type Task<'d> = #name<'d>;
+            type Input<'d> = #ns_core::manifold::task::request::Input<'d, Self>;
             type TaskBuilder<'d> = #task_ty;
             type Mode = #ns_core::route::Streaming;
             #empty

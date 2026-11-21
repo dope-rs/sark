@@ -7,8 +7,7 @@ use sark_core::{
         admit::{Length, Retention},
         credit,
     },
-    manifold::{self, task::request::Input},
-    request, route,
+    manifold, request, route,
     route::Project as _,
 };
 use sark_http::{
@@ -267,7 +266,7 @@ impl<'d, Runtime, Stored, Transitions: switch::Engine, Ready, Heads>
         R: route::Spec<Request: route::Own>,
         <R::Request as route::Own>::Mode: Mode<'d, R>,
         Admit: FnOnce(
-            Input<'d, R>,
+            <R::Request as route::Own>::Input<'d>,
             usize,
             response::Context,
             &mut Runtime,
@@ -362,7 +361,7 @@ impl<'d, Runtime, Stored, Transitions: switch::Engine, Ready, Heads>
                 if let Err(error) = fields.into_frame(total) {
                     return session::Outcome::from(error.into_rejection()).into();
                 }
-                Input::Ready { request }
+                request.into()
             } else {
                 if let Err(error) = source.head.parse_query::<R>(&mut raw) {
                     return session::Outcome::from(error.into_rejection()).into();
@@ -442,7 +441,7 @@ impl<'d, Runtime, Stored, Transitions: switch::Engine, Ready, Heads>
                         break 'request Failure::Bind(request::BindError::Body(rejected.discard()));
                     }
                 };
-                Input::Buffered(request.with_body(body))
+                request.with_body(body).into()
             };
             return admit(input, total, response, &mut self.async_state).into();
         };
