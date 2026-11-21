@@ -13,7 +13,7 @@ use dope_fiber::{
 };
 use dope_test::alloc::Tracker;
 use sark_core::{
-    body::{self, Build as _},
+    body,
     manifold::task::{request::Input, response::Outcome},
     route::Own,
 };
@@ -22,23 +22,30 @@ use sark_fiber::{
     manifold::runtime::TaskRoute as _,
 };
 use sark_h1::session;
-use sark_http::field::head::AcceptEncoding;
 use sark_http::{h1::codec::canned, payload::response::status::Code, request::Seq};
 
 use crate::common::route::glue::{
     empty::{
-        self, __SarkHandlerBuiltX6275696C74, __SarkHandlerInspectX696E7370656374,
-        __SarkHandlerPlainX706C61696E, __SarkHandlerTrackedX747261636B6564, Carrier, DROPS, Head,
-        Inspected,
+        self, __SarkHandlerBuiltX6275696C74, __SarkHandlerPlainX706C61696E,
+        __SarkHandlerTrackedX747261636B6564, DROPS, Head,
     },
     storage::Domain,
 };
-use common::h1::fields;
-use common::route::with_scope;
+use common::{
+    retained,
+    route::{
+        body::discard::PING,
+        chunked::{
+            apps::ChunkedDispatch,
+            peer::{Error, Peer},
+        },
+        with_scope,
+    },
+    server::{MAX_CONNECTIONS, Plan},
+};
 
 type Plain = __SarkHandlerPlainX706C61696E;
 type Tracked = __SarkHandlerTrackedX747261636B6564;
-type Inspect = __SarkHandlerInspectX696E7370656374;
 type Built = __SarkHandlerBuiltX6275696C74;
 
 #[global_allocator]
@@ -52,11 +59,17 @@ fn empty_input_has_no_owner() {
         let binding = Binding::new(timer, owner::Capacity::new(NonZero::<u32>::MIN));
         let ids = Seq::new(binding.sequence());
         let calls = Cell::new(0);
-        for wire in [empty::HEAD, empty::BODY, empty::CHUNKED] {
+        for wire in [
+            empty::HEAD,
+            empty::BODY,
+            empty::CHUNKED,
+            empty::ENCODING_BODY,
+        ] {
+            let packet = [wire, empty::HEAD].concat();
             let (result, allocs) = Tracker::count(|| {
-                Carrier::<Plain>::try_dispatch(
+                empty::try_dispatch::<Plain>(
                     ids.try_next().expect("request identity"),
-                    wire,
+                    &packet,
                     true,
                 )
             });
@@ -78,68 +91,36 @@ fn empty_input_has_no_owner() {
 }
 
 #[test]
-fn discard_keeps_pipeline() {
-    let encoding = AcceptEncoding::try_parse(fields::ENCODING_VALUE).expect("owner admission");
-    with_scope(settings::Config::default(), |scope| {
-        let driver = scope.context();
-        let binding = Binding::new(
-            driver.driver_ref().timer(),
-            owner::Capacity::new(NonZero::<u32>::MIN),
-        );
-        let ids = Seq::new(binding.sequence());
-        for (wire, encoding) in [
-            (empty::BODY, None),
-            (empty::CHUNKED, None),
-            (empty::ENCODING_BODY, Some(encoding)),
+fn discard_keeps_pipeline() -> Result<(), Error> {
+    retained::run::<ChunkedDispatch, _>(Plan::isolated(), MAX_CONNECTIONS, |addr| {
+        let mut peer = Peer::try_connect(addr)?;
+        for (wire, first) in [
+            (empty::BODY, b"body".as_slice()),
+            (empty::CHUNKED, b"body"),
+            (empty::ENCODING_BODY, b"encoded"),
         ] {
-            let head = wire
-                .windows(4)
-                .position(|part| part == b"\r\n\r\n")
-                .expect("request head")
-                + 4;
-            let packet = [wire, empty::HEAD].concat();
-            for split in [packet.len(), head] {
-                let expected = if split == packet.len() {
-                    wire.len()
+            for split in [false, true] {
+                let remaining = if split {
+                    let end = wire
+                        .windows(4)
+                        .position(|w| w == b"\r\n\r\n")
+                        .expect("head")
+                        + 2;
+                    let head = [&wire[..end], b"Expect: 100-continue\r\n\r\n"].concat();
+                    assert_eq!(peer.try_exchange(&head)?, (100, Vec::new()));
+                    &wire[end + 2..]
                 } else {
-                    wire.len() - split
+                    wire
                 };
-                let (input, consumed, pipeline, rest) =
-                    Carrier::<Plain>::try_receive(&ids, &packet[..split], &packet[split..])
-                        .expect("plain pipeline");
-                assert_eq!(consumed, expected);
-                assert_eq!(rest, empty::HEAD.len());
-                drop((input, pipeline));
-
-                let (input, consumed, pipeline, rest) =
-                    Carrier::<Inspect>::try_receive(&ids, &packet[..split], &packet[split..])
-                        .expect("inspected pipeline");
-                assert_eq!(consumed, expected);
-                assert_eq!(rest, empty::HEAD.len());
-                for (input, len, expected) in [(input, 1, encoding), (pipeline, 0, None)] {
-                    let built = match input {
-                        Input::Ready { request } => request,
-                        Input::Buffered(request) => {
-                            let builder =
-                                Inspected::start_task(request).expect("retained header projection");
-                            match builder.step(body::DEFAULT_BUILD_STEP_BUDGET) {
-                                body::Step::Ready { output, .. } => Some(output),
-                                _ => None,
-                            }
-                            .expect("discarded body ready")
-                        }
-                    };
-                    let (_, request) = built.into_parts();
-                    assert_eq!(request.len.len(), len);
-                    assert_eq!(request.encoding, expected);
-                    assert_eq!(
-                        request.proof.as_ref().map(|proof| proof.as_slice()),
-                        Some(b"kept".as_slice())
-                    );
+                let next = b"POST /inspect HTTP/1.1\r\nHost: empty\r\nX-Proof: kept\r\n\r\n";
+                peer.socket.write_all(&[remaining, next, PING].concat())?;
+                for expected in [first, b"empty", b"pong"] {
+                    assert_eq!(peer.try_response()?, (200, expected.to_vec()));
                 }
             }
         }
-    });
+        Ok(())
+    })
 }
 
 #[test]
@@ -171,7 +152,7 @@ fn first_poll_drops_request() {
                 calls.set(0);
                 DROPS.set(0);
                 for accept in [false, true] {
-                    let (input, outcome, attempts) = Carrier::<Tracked>::try_dispatch(
+                    let (input, outcome, attempts) = empty::try_dispatch::<Tracked>(
                         ids.try_next().expect("unpolled identity"),
                         wire,
                         accept,
@@ -196,7 +177,7 @@ fn first_poll_drops_request() {
                     assert_eq!(calls.get(), 0);
                     assert_eq!(DROPS.get(), 0);
                 }
-                let (input, _, _) = Carrier::<Tracked>::try_dispatch(
+                let (input, _, _) = empty::try_dispatch::<Tracked>(
                     ids.try_next().expect("polled identity"),
                     wire,
                     true,
@@ -247,7 +228,7 @@ fn first_poll_drops_request() {
             wire.extend_from_slice(json);
             let id = ids.try_next().expect("yielding request identity");
             let (input, _, _) =
-                Carrier::<Built>::try_dispatch(id, &wire, true).expect("yielding request");
+                empty::try_dispatch::<Built>(id, &wire, true).expect("yielding request");
             let input = input.expect("admitted buffered request");
             assert!(matches!(input, Input::Buffered(_)));
             calls.set(0);

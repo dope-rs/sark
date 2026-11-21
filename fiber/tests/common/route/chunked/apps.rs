@@ -250,6 +250,7 @@ sark_fiber::define_route! {
         POST "/async/segments" => async(capacity = 8, body = segmented) async_segments,
         POST "/async/contiguous" => async(capacity = 8, body = contiguous) async_whole,
         POST "/async/json" => async(capacity = 8, body = json) async_json,
+        POST "/inspect" => request(header) async(capacity = 1, body = discarded) crate::common::route::glue::empty::inspect,
         POST "/async/discard" => async(capacity = 8, body = discarded) async_discard,
         POST "/discard" => discard,
         POST "/discard/large" => large_discard,

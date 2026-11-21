@@ -18,8 +18,7 @@ use sark_http::field::metadata::block;
 
 use crate::common::{
     h1::{
-        DUPLEX_STATE, FiberApplication, Layout as _, MultiDuplexApplication, PortableRouter,
-        Session, SingleDuplexApplication,
+        DUPLEX_STATE, Layout as _, MultiDuplexApplication, Session, SingleDuplexApplication,
     },
     h2::{
         apps::Layout as _,
@@ -29,6 +28,7 @@ use crate::common::{
         body::tunnels::{self, ConnectFirst, WebsocketFirst, WebsocketOnly},
         glue::agnostic::{self, AgnApp},
         metadata::{DecodeExt as _, EntriesExt as _},
+        skip::SkipDispatch,
     },
 };
 use common::route::with_scope;
@@ -37,14 +37,9 @@ use common::route::with_scope;
 static ALLOCATOR: Tracker = Tracker::new();
 
 #[test]
-fn router_is_zst() {
-    assert_eq!(mem::size_of::<PortableRouter>(), 0);
-}
-
-#[test]
 fn duplex_layout_is_exact() {
     let layout = Brand::with(|brand| {
-        FiberApplication::new::<Identity, KeyTag<0>>(brand, EmptyState::REF, Config::new(1))
+        SkipDispatch::new::<Identity, KeyTag<0>>(brand, &(), Config::new(1))
             .dimensions(policies::HeadOnly)
     });
     let budget = Budget::new(Bound::new(4096), 0);

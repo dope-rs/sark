@@ -1,35 +1,23 @@
-use core::BranchError;
-use std::{convert, time::Duration};
+use std::{convert, fmt, time::Duration};
 
 use dope::{
-    core::{
-        self,
-        driver::{
-            self, route,
-            route::{KeyTag, indices::SlotIndex},
-            settings,
-            settings::{claim, errors},
-            storage,
-        },
+    core::driver::{
+        self, route,
+        route::{KeyTag, indices::SlotIndex},
+        settings,
+        settings::{claim, errors},
+        storage,
     },
     manifold::{
-        self,
         app::{creation, dispatch},
         timing::{interval, interval::Component},
     },
-    net::{wire, wire::domain},
     runtime::{
         client::{Bound, Context, Provider},
         executor::{self, drive, session},
         topology::{self, lending},
     },
 };
-use dope_tls::tls::{self, endpoint, roles};
-use sark_fiber::{Config, Throughput};
-use sark_h1::server::{date, listener::bind, run};
-use support::{Routes, server};
-
-use crate::common::support;
 type ID = KeyTag<2>;
 
 #[pin_project::pin_project]
@@ -118,7 +106,41 @@ impl<'d> Provider<'d> for Tick<'d> {
 }
 
 type Driven = (Result<(), drive::Error>, bool);
-type Run<'report> = Result<Driven, lending::Error<'report, convert::Infallible, Driven>>;
+
+impl<'d> Tick<'d> {
+    pub fn serve<S: storage::Plan + 'd, Q: executor::Startup>(
+        self,
+        app: impl executor::raw::App<'d>,
+        stage: &mut lending::Stage<'_, '_, '_, '_, 'd, S, Q>,
+    ) {
+        let target = self.target;
+        let mut finish = session::Completion::new();
+        let (drive, matched) = stage
+            .lend_for(
+                &mut finish,
+                self,
+                Serve { app, target },
+                Duration::from_secs(2),
+            )
+            .expect("provider session");
+        assert!(matched, "client must retain the installed interval route");
+        drive.expect("HTTP listener drive");
+    }
+}
+
+pub fn completed<I: fmt::Debug, O, Q>(
+    outcome: Result<
+        Result<(), I>,
+        topology::EnterError<'_, convert::Infallible, O, Result<(), I>, Q>,
+    >,
+) {
+    outcome
+        .as_ref()
+        .map_err(topology::EnterError::kind)
+        .expect("resource topology")
+        .as_ref()
+        .expect("interval and HTTP installation");
+}
 
 struct Serve<'d, A> {
     app: A,
@@ -165,118 +187,5 @@ where
         'life: 'run,
     {
         (app.run().map(|_| ()), matched)
-    }
-}
-
-pub struct Plain<'state, F> {
-    pub plan: run::Plan<KeyTag<0>, KeyTag<1>, Throughput>,
-    pub state: server::State<'state>,
-    pub finish: F,
-}
-
-impl<F> settings::Resource for Plain<'_, F> {
-    fn include_in(&self, needs: claim::Needs) -> Result<claim::Needs, errors::Claim> {
-        settings::Resource::include_in(&self.plan, needs)
-    }
-}
-
-impl<'scope, 'life: 'scope, 'e: 'life, 'd: 'e, Q, F>
-    lending::Compose<'scope, 'life, 'e, 'd, storage::With<(), date::Clock>, Q, Tick<'d>>
-    for Plain<'_, F>
-where
-    Q: executor::Startup,
-    F: for<'report> FnOnce(Run<'report>),
-{
-    type Output = Result<(), BranchError<convert::Infallible, manifold::BuildError<bind::Error>>>;
-
-    fn compose(
-        self,
-        owner: Tick<'d>,
-        stage: &mut lending::Stage<'_, 'scope, 'life, 'e, 'd, storage::With<(), date::Clock>, Q>,
-    ) -> Self::Output {
-        let mut finish = session::Completion::new();
-        let target = owner.target;
-        let app = Routes::new::<wire::Identity, _>(&self.state, Config::new(server::MAX_CONNECTIONS));
-        self.plan
-            .install(
-                stage,
-                domain::Local::new(wire::Identity),
-                app,
-                |root, _wait, stage| {
-                    let build = Serve { app: root, target };
-                    (self.finish)(stage.lend_for(
-                        &mut finish,
-                        owner,
-                        build,
-                        Duration::from_secs(2),
-                    ));
-                },
-            )
-            .map_err(BranchError::Second)
-    }
-}
-
-pub struct Tls<'state, F> {
-    pub plan: run::Plan<KeyTag<0>, KeyTag<1>, Throughput>,
-    pub wire: endpoint::Config<roles::Server>,
-    pub state: server::State<'state>,
-    pub finish: F,
-}
-
-impl<F> settings::Resource for Tls<'_, F> {
-    fn include_in(&self, needs: claim::Needs) -> Result<claim::Needs, errors::Claim> {
-        settings::Resource::include_in(&self.plan, needs)
-    }
-}
-
-impl<'scope, 'life: 'scope, 'e: 'life, 'd: 'e, Q, F>
-    lending::Compose<
-        'scope,
-        'life,
-        'e,
-        'd,
-        storage::With<
-            storage::Value<domain::Owner<tls::Tls<roles::Server>, KeyTag<0>>>,
-            date::Clock,
-        >,
-        Q,
-        Tick<'d>,
-    > for Tls<'_, F>
-where
-    Q: executor::Startup,
-    F: for<'report> FnOnce(Run<'report>),
-{
-    type Output = Result<(), BranchError<convert::Infallible, manifold::BuildError<bind::Error>>>;
-
-    fn compose(
-        self,
-        owner: Tick<'d>,
-        stage: &mut lending::Stage<
-            '_,
-            'scope,
-            'life,
-            'e,
-            'd,
-            storage::With<
-                storage::Value<domain::Owner<tls::Tls<roles::Server>, KeyTag<0>>>,
-                date::Clock,
-            >,
-            Q,
-        >,
-    ) -> Self::Output {
-        let mut finish = session::Completion::new();
-        let target = owner.target;
-        let app = Routes::new(&self.state, Config::new(server::MAX_CONNECTIONS));
-        let wire = stage
-            .storage()
-            .0
-            .bind(self.wire)
-            .map_err(BranchError::First)?;
-        self.plan
-            .install(stage, wire, app, |root, _wait, stage| {
-                let build = Serve { app: root, target };
-                (self.finish)(stage.lend_for(&mut finish, owner, build, Duration::from_secs(2)));
-            })
-            .map_err(BranchError::Second)
     }
 }

@@ -37,18 +37,6 @@ fn show<'d>(request: Request) -> Response<'d> {
     }
 }
 
-#[sark_fiber::handler(pub)]
-async fn show_async<'d>(request: Request) -> Response<'d> {
-    Response {
-        status: if request.req == 0 {
-            Code::NOT_FOUND
-        } else {
-            Code::OK
-        },
-        body: fixed::Body::new(b"async"),
-    }
-}
-
 #[sark_fiber::request]
 pub struct Connect {}
 
@@ -67,19 +55,6 @@ where
     C: Identity,
 {
     Session(PhantomData)
-}
-
-sark_fiber::define_router! {
-    pub PortableRouter => {
-        GET "/items/:req" => request(path) show,
-    }
-}
-
-sark_fiber::define_route! {
-    pub FiberApplication: sark_fiber::EmptyState => {
-        GET "/items/:req" => request(path) show,
-        GET "/async/:req" => request(path) async(capacity = 1, body = discarded) show_async,
-    }
 }
 
 sark_fiber::define_route! {
