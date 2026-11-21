@@ -1,7 +1,6 @@
 use common::client::assert_shutdown;
 use common::client::runtime::peer;
 use dope_test::harness::{
-    GUARD,
     peer::{AcceptScript, TcpAcceptor},
     scenario::run::{Entry, Task as _},
 };
@@ -11,24 +10,18 @@ use std::{convert::Infallible, net::TcpListener, time::Duration};
 
 use common::client::{
     config::FLAVORS,
-    retry::AGGRESSIVE,
-    runtime::{
-        cases::{Flavor, request::Request},
-        origins, pools,
-    },
+    retry::{self, AGGRESSIVE, Post},
+    runtime::{cases::Flavor, origins, pools},
 };
 use dope::{manifold::client::attempt, net::link::event};
-use dope_fiber::{BlockOn as _, task::time::budget};
+use dope_fiber::BlockOn as _;
 use sark::client::protocol::retry::Policy;
-use sark_client::{Error, RequestError, Safety, conn, connect, protocol, timeout};
+use sark_client::{Error, RequestError, Safety, conn, connect, protocol};
 use sark_fiber::client::{
     config::Config,
     process::{self, Process as _},
 };
-use sark_http::{
-    h1::{field::syntax, head},
-    method::Method,
-};
+use sark_http::method::Method;
 
 #[test]
 fn observed_reconnect_keeps_commitment() {
@@ -112,39 +105,16 @@ fn post_is_not_replayed() {
                 let config = Config::new(address.to_string())
                     .retry(policy)
                     .timeout(Duration::from_secs(3));
-                let outcome = Request::new(
-                    flavor,
-                    address,
-                    config,
-                    Method::POST,
-                    "/effect",
-                    &[],
-                    b"effect",
-                )
-                .try_run(|outcome| {
-                    let error = (outcome).err().expect("a response-free close must fail");
-                    (
-                        matches!(
-                            error.cause(),
-                            Error::Transport(error) if error.kind() == conn::Kind::RemoteEof
-                        ),
-                        error.safety(),
-                    )
-                })
-                .expect("HTTP request execution");
-                assert!((outcome) == (true, Safety::PossiblyCommitted));
+                retry::effect(flavor, address, config)
+                    .try_run(|result| {
+                        let failure = result.err().expect("a response-free close must fail");
+                        assert!(failure.safety() == Safety::PossiblyCommitted);
+                        assert!(matches!(failure.cause(),
+                            Error::Transport(error) if error.kind() == conn::Kind::RemoteEof));
+                    })
+                    .expect("HTTP request execution");
             })
-            .with(|| -> Result<(), peer::Error> {
-                let accepted = acceptor.accept_for(GUARD)?.expect("client before deadline");
-                accepted.read_wait(Some(GUARD))?;
-                accepted.write_wait(Some(GUARD))?;
-                accepted.set_nodelay(true)?;
-                let mut conn = peer::Conn::new(&accepted);
-                assert!(conn.try_request()?.expect("submitted post").is_effect());
-                peer::try_shutdown(&accepted)?;
-                peer::closed(&mut conn)?;
-                Ok(())
-            })
+            .with(|| Post::Disconnect.serve(&mut acceptor))
             .expect("client worker");
             served.expect("peer exchange");
             peer::empty(&mut acceptor).expect("no replayed requests");
@@ -153,54 +123,29 @@ fn post_is_not_replayed() {
 }
 
 #[test]
-fn buffered_timeout_commits() {
+fn buffered_and_scoped_timeouts_commit() {
     for flavor in FLAVORS {
-        let mut acceptor = TcpAcceptor::bind(([127, 0, 0, 1], 0).into()).expect("peer listener");
-        let address = acceptor.local_addr().expect("peer address");
-        let (served, ()) = Entry(move || {
-            let config = Config::new(address.to_string())
-                .retry(AGGRESSIVE)
-                .timeout(Duration::from_millis(50));
-            let outcome = Request::new(
-                flavor,
-                address,
-                config,
-                Method::POST,
-                "/effect",
-                &[],
-                b"effect",
-            )
-            .try_run(|outcome| {
-                let error = (outcome)
-                    .err()
-                    .expect("a response timeout after submission must fail");
-                (
-                    matches!(
-                        error.cause(),
-                        Error::Timeout(error)
-                            if error.phase() == timeout::Phase::Head
-                                && error.elapsed() == budget::Elapsed::Budget
-                    ),
-                    error.safety(),
-                )
+        for scoped in [false, true] {
+            let mut acceptor =
+                TcpAcceptor::bind(([127, 0, 0, 1], 0).into()).expect("peer listener");
+            let address = acceptor.local_addr().expect("peer address");
+            let (served, ()) = Entry(move || {
+                let config = Config::new(address.to_string())
+                    .retry(AGGRESSIVE)
+                    .timeout(Duration::from_millis(50));
+                let request = retry::effect(flavor, address, config);
+                if scoped {
+                    request.try_scoped(|result| retry::assert_timeout(result))
+                } else {
+                    request.try_run(|result| retry::assert_timeout(result))
+                }
+                .expect("timed POST execution");
             })
-            .expect("HTTP request execution");
-            assert!((outcome) == (true, Safety::PossiblyCommitted));
-        })
-        .with(|| -> Result<(), peer::Error> {
-            let accepted = acceptor.accept_for(GUARD)?.expect("client before deadline");
-            accepted.read_wait(Some(GUARD))?;
-            accepted.write_wait(Some(GUARD))?;
-            accepted.set_nodelay(true)?;
-            let mut conn = peer::Conn::new(&accepted);
-            assert!(conn.try_request()?.expect("submitted post").is_effect());
-            peer::closed(&mut conn)?;
-            peer::try_shutdown(&accepted)?;
-            Ok(())
-        })
-        .expect("client worker");
-        served.expect("peer exchange");
-        peer::empty(&mut acceptor).expect("no replayed requests");
+            .with(|| Post::Timeout.serve(&mut acceptor))
+            .expect("client worker");
+            served.expect("peer exchange");
+            peer::empty(&mut acceptor).expect("no replayed requests");
+        }
     }
 }
 
@@ -219,36 +164,13 @@ fn stream_failure_commits() {
                     .enter(
                         (),
                         |mut app| {
-                            let client = app.handle;
                             app.wait().expect("fixed stream failure readiness");
-                            let mut response = app
+                            let response = app
                                 .app
-                                .block_on(client.stream(Method::POST, "/effect", b"effect"))
+                                .block_on(app.handle.stream(Method::POST, "/effect", b"effect"))
                                 .expect("fixed stream failure driver")
                                 .expect("fixed response stream");
-                            loop {
-                                match app
-                                    .app
-                                    .block_on(response.next_event())
-                                    .expect("fixed response event driver")
-                                    .expect("malformed fixed response must fail before completion")
-                                {
-                                    Ok(_) => {}
-                                    Err(failure) => {
-                                        assert!(failure.safety() == Safety::PossiblyCommitted);
-                                        assert!(matches!(
-                                            failure.cause(),
-                                            Error::Protocol(protocol::Error::Head(
-                                                head::ParseError::Field(syntax::Error::Name {
-                                                    offset: 20,
-                                                    actual: b' '
-                                                })
-                                            ))
-                                        ));
-                                        break;
-                                    }
-                                }
-                            }
+                            retry::assert_invalid_head(&mut app.app, response);
                         },
                         assert_shutdown,
                     )
@@ -258,52 +180,21 @@ fn stream_failure_commits() {
                     .enter(
                         (),
                         |mut app| {
-                            let client = app.handle;
-                            let mut response = app
+                            let response = app
                                 .app
-                                .block_on(client.stream(Method::POST, "/effect", b"effect"))
+                                .block_on(app.handle.stream(Method::POST, "/effect", b"effect"))
                                 .expect("on-demand stream failure driver")
                                 .expect("on-demand response stream");
-                            loop {
-                                match app
-                                    .app
-                                    .block_on(response.next_event())
-                                    .expect("on-demand response event driver")
-                                    .expect(
-                                        "malformed on-demand response must fail before completion",
-                                    ) {
-                                    Ok(_) => {}
-                                    Err(failure) => {
-                                        assert!(failure.safety() == Safety::PossiblyCommitted);
-                                        assert!(matches!(
-                                            failure.cause(),
-                                            Error::Protocol(protocol::Error::Head(
-                                                head::ParseError::Field(syntax::Error::Name {
-                                                    offset: 20,
-                                                    actual: b' '
-                                                })
-                                            ))
-                                        ));
-                                        break;
-                                    }
-                                }
-                            }
+                            retry::assert_invalid_head(&mut app.app, response);
                         },
                         assert_shutdown,
                     )
                     .expect("on-demand stream failure shutdown"),
             }
         })
-        .with(|| -> Result<(), peer::Error> {
-            let accepted = acceptor.accept_for(GUARD)?.expect("client before deadline");
-            accepted.read_wait(Some(GUARD))?;
-            accepted.write_wait(Some(GUARD))?;
-            accepted.set_nodelay(true)?;
-            let mut conn = peer::Conn::new(&accepted);
-            assert!(conn.try_request()?.expect("submitted post").is_effect());
-            conn.write_all(b"HTTP/1.1 200 OK\r\nBad Name: value\r\nContent-Length: 0\r\n\r\n")?;
-            peer::closed(&mut conn)?;
-            Ok(())
+        .with(|| {
+            Post::Reply(b"HTTP/1.1 200 OK\r\nBad Name: value\r\nContent-Length: 0\r\n\r\n")
+                .serve(&mut acceptor)
         })
         .expect("client worker");
         served.expect("peer exchange");
@@ -318,7 +209,6 @@ fn redirect_failure_commits() {
             let listener = TcpListener::bind("127.0.0.1:0").expect("unavailable redirect target");
             listener.local_addr().expect("redirect target address")
         };
-
         let response = format!(
             "HTTP/1.1 307 Temporary Redirect\r\nLocation: http://{target}/next\r\nContent-Length: 0\r\n\r\n"
         );
@@ -328,87 +218,15 @@ fn redirect_failure_commits() {
             let config = Config::new(address.to_string())
                 .retry(AGGRESSIVE)
                 .timeout(Duration::from_millis(200));
-            Request::new(
-                flavor,
-                address,
-                config,
-                Method::POST,
-                "/effect",
-                &[],
-                b"effect",
-            )
-            .try_run(|outcome| {
-                let failure = (outcome).err().expect("redirect follow must fail");
-                assert!((failure.safety()) == (Safety::PossiblyCommitted));
-                assert!(matches!(
-                    failure.cause(),
-                    Error::Request(RequestError::CrossOrigin)
-                ));
-            })
-            .expect("HTTP request execution");
+            retry::effect(flavor, address, config)
+                .try_run(|result| {
+                    let failure = result.err().expect("redirect follow must fail");
+                    assert!(failure.safety() == Safety::PossiblyCommitted);
+                    assert!(matches!(failure.cause(), Error::Request(RequestError::CrossOrigin)));
+                })
+                .expect("HTTP request execution");
         })
-        .with(|| -> Result<(), peer::Error> {
-            let accepted = acceptor.accept_for(GUARD)?.expect("client before deadline");
-            accepted.read_wait(Some(GUARD))?;
-            accepted.write_wait(Some(GUARD))?;
-            accepted.set_nodelay(true)?;
-            let mut conn = peer::Conn::new(&accepted);
-            assert!(conn.try_request()?.expect("submitted post").is_effect());
-            conn.write_all(response.as_bytes())?;
-            peer::closed(&mut conn)?;
-            Ok(())
-        })
-        .expect("client worker");
-        served.expect("peer exchange");
-        peer::empty(&mut acceptor).expect("no replayed requests");
-    }
-}
-
-#[test]
-fn scoped_timeout_commits() {
-    for flavor in FLAVORS {
-        let mut acceptor = TcpAcceptor::bind(([127, 0, 0, 1], 0).into()).expect("peer listener");
-        let address = acceptor.local_addr().expect("peer address");
-        let (served, ()) = Entry(move || {
-            let config = Config::new(address.to_string())
-                .retry(AGGRESSIVE)
-                .timeout(Duration::from_millis(50));
-
-            let outcome = Request::new(
-                flavor,
-                address,
-                config,
-                Method::POST,
-                "/effect",
-                &[],
-                b"effect",
-            )
-            .try_scoped(|result| {
-                let failure = result.err().expect("scoped request must fail");
-                (
-                    matches!(
-                        failure.cause(),
-                        Error::Timeout(error)
-                            if error.phase() == timeout::Phase::Head
-                                && error.elapsed() == budget::Elapsed::Budget
-                    ),
-                    failure.safety(),
-                )
-            })
-            .expect("scoped request execution");
-            assert!((outcome) == (true, Safety::PossiblyCommitted));
-        })
-        .with(|| -> Result<(), peer::Error> {
-            let accepted = acceptor.accept_for(GUARD)?.expect("client before deadline");
-            accepted.read_wait(Some(GUARD))?;
-            accepted.write_wait(Some(GUARD))?;
-            accepted.set_nodelay(true)?;
-            let mut conn = peer::Conn::new(&accepted);
-            assert!(conn.try_request()?.expect("submitted post").is_effect());
-            peer::closed(&mut conn)?;
-            peer::try_shutdown(&accepted)?;
-            Ok(())
-        })
+        .with(|| Post::Reply(response.as_bytes()).serve(&mut acceptor))
         .expect("client worker");
         served.expect("peer exchange");
         peer::empty(&mut acceptor).expect("no replayed requests");
@@ -425,38 +243,17 @@ fn scoped_capacity_commits() {
                 .retry(AGGRESSIVE)
                 .wire_limit(4)
                 .timeout(Duration::from_secs(3));
-
-            let outcome = Request::new(
-                flavor,
-                address,
-                config,
-                Method::POST,
-                "/effect",
-                &[],
-                b"effect",
-            )
-            .try_scoped(|result| {
-                let failure = result.err().expect("scoped request must fail");
-                (
-                    matches!(failure.cause(), Error::Protocol(protocol::Error::BodyLimit)),
-                    failure.safety(),
-                )
-            })
-            .expect("scoped request execution");
-            assert!((outcome) == (true, Safety::PossiblyCommitted));
+            retry::effect(flavor, address, config)
+                .try_scoped(|result| {
+                    let failure = result.err().expect("scoped request must fail");
+                    assert!(failure.safety() == Safety::PossiblyCommitted);
+                    assert!(matches!(failure.cause(), Error::Protocol(protocol::Error::BodyLimit)));
+                })
+                .expect("scoped request execution");
         })
-        .with(|| -> Result<(), peer::Error> {
-            let accepted = acceptor.accept_for(GUARD)?.expect("client before deadline");
-            accepted.read_wait(Some(GUARD))?;
-            accepted.write_wait(Some(GUARD))?;
-            accepted.set_nodelay(true)?;
-            let mut conn = peer::Conn::new(&accepted);
-            assert!(conn.try_request()?.expect("submitted post").is_effect());
-            conn.write_all(
-                b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\nConnection: close\r\n\r\nlarge",
-            )?;
-            peer::closed(&mut conn)?;
-            Ok(())
+        .with(|| {
+            Post::Reply(b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\nConnection: close\r\n\r\nlarge")
+                .serve(&mut acceptor)
         })
         .expect("client worker");
         served.expect("peer exchange");
