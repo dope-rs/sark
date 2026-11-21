@@ -23,11 +23,7 @@ use sark_http::{
             section::storage,
         },
     },
-    payload::response::headers::{
-        self, Error, Name,
-        head::{Head, Template},
-        set::Set,
-    },
+    payload::response::headers::{self, Error, Name},
 };
 
 #[global_allocator]
@@ -193,14 +189,13 @@ fn retains_never_index() {
             .with_index(entry.indexing)
         })
         .collect::<Vec<_>>();
-    let template = Template::new(&entries);
     let mut output = map::Fields::new();
     let mut store = indexing::Store {
         fields: &mut output,
         result: Ok(()),
     };
-    Head::new(&template, Set::<0>::new()).emit(&mut store);
-    store.result.expect("stored template fields");
+    entries.emit(&mut store);
+    store.result.expect("stored fields");
     assert!(output.iter().eq(indexing::FIELDS));
 }
 

@@ -3,7 +3,7 @@ pub mod common;
 use std::{cell::Cell, str};
 
 use common::{
-    body::{COMPRESSIBLE, Counted, TEMPLATE, replies},
+    body::{COMPRESSIBLE, Counted, FIELDS, replies},
     fields::{self, DATE, ENTRIES},
 };
 use dope_test::alloc::Tracker;
@@ -22,11 +22,7 @@ use sark_http::{
     payload::{
         compress::{self, Compression, Gzip, Output},
         fixed::Body,
-        response::{
-            Bounded, Exact, Fixed, Static, exact,
-            headers::{self, head::Head, set},
-            status::Code,
-        },
+        response::{Bounded, Exact, Fixed, Static, exact, headers, status::Code},
     },
 };
 
@@ -73,11 +69,7 @@ fn frames_compressed() {
     let payload = COMPRESSIBLE;
     let result = storage::Shared::try_copy(payload);
     let body = result.expect("fixture body fits shared storage");
-    let response = Fixed::new(
-        Code::OK,
-        Head::new(&TEMPLATE, set::Set::from_items([])),
-        body,
-    );
+    let response = Fixed::new(Code::OK, FIELDS, body);
     let date = b"Mon, 01 Jan 2026 00:00:00 GMT";
     let mut bytes = [0; 1024];
     let mut writer = Slice::new(&mut bytes);
@@ -248,7 +240,7 @@ fn identity_refusal_preserves_prior_errors() {
     for capacity in [0, bytes.len()] {
         let mut writer = Slice::new(&mut bytes[..capacity]);
         let outcome = output::Egress::new(writer.reborrow(), DATE, context).try_route(
-            Counted::exact(&TEMPLATE, b"plain", &encodes),
+            Counted::exact(FIELDS, b"plain", &encodes),
             &mut (),
             common::fields::PLAIN,
         );

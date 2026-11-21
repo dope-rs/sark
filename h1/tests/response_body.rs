@@ -3,16 +3,13 @@ pub mod common;
 use std::{cell::Cell, str};
 
 use common::{
-    body::{Counted, TEMPLATE},
+    body::{Counted, FIELDS},
     fields::{self, DATE, GZIP_POLICY, GZIP_RESPONSE, IDENTITY},
 };
 use dope_test::alloc::Tracker;
 use o3::buffer::write::Slice;
 use sark_h1::wire::output;
-use sark_http::payload::{
-    compress::{Compression, Gzip},
-    response::headers::head::Template,
-};
+use sark_http::payload::compress::{Compression, Gzip};
 
 #[global_allocator]
 static ALLOCATOR: Tracker = Tracker::new();
@@ -20,9 +17,8 @@ static ALLOCATOR: Tracker = Tracker::new();
 #[test]
 fn preencoded_inline() {
     let fields = [IDENTITY];
-    let template = Template::new(&fields);
     let encodes = Cell::new(0);
-    let response = Counted::exact(&template, b"encoded", &encodes);
+    let response = Counted::exact(&fields, b"encoded", &encodes);
     let mut bytes = [0; 512];
     let mut writer = Slice::new(&mut bytes);
     let mut gzip = Gzip::try_new().expect("test gzip allocation");
@@ -49,7 +45,7 @@ fn plain_compressor() {
     let mut writer = Slice::new(&mut bytes);
     let (outcome, allocs) = Tracker::count(|| {
         <() as Compression>::try_new().expect("plain policy");
-        let response = Counted::exact(&TEMPLATE, b"plain", &encodes);
+        let response = Counted::exact(FIELDS, b"plain", &encodes);
         output::Egress::new(writer.reborrow(), DATE, GZIP_RESPONSE).try_route(
             response,
             &mut (),
@@ -69,7 +65,7 @@ fn plain_compressor() {
 fn reuses_inline_on_limit() {
     let encodes = Cell::new(0);
     let body = vec![b'x'; 300 * 1024];
-    let response = Counted::exact(&TEMPLATE, &body, &encodes);
+    let response = Counted::exact(FIELDS, &body, &encodes);
     let date = b"Mon, 01 Jan 2026 00:00:00 GMT";
     let mut bytes = vec![0; body.len() + 1024];
     let mut writer = Slice::new(&mut bytes);

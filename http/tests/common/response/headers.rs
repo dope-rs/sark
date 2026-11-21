@@ -8,7 +8,7 @@ use sark_http::{
     },
     payload::response::{
         Method,
-        headers::{Entry, Error, Name, head::Template},
+        headers::{Entry, Error, Name},
     },
 };
 
@@ -145,16 +145,10 @@ pub const STANDARD: [&str; 83] = [
 
 pub const PRIVATE: &str = "X-Private";
 
-const STATIC_FIELDS: &[Entry<'static>] = &[
+pub const STATIC: &[Entry<'static>] = &[
     field::literal!(entry(b"content-type", b"text/plain")),
-    field::literal!(entry(b"x-static", b"yes")),
+    field::literal!(entry(b"x-static", b" yes")),
 ];
-pub const STATIC: Template = Template::new(STATIC_FIELDS);
-const SEMANTIC_FIELDS: &[Entry<'static>] = &[
-    field::literal!(entry(b"x-first", b"one")),
-    field::literal!(entry(b"x-second", b" two")),
-];
-pub const SEMANTIC: Template = Template::new(SEMANTIC_FIELDS);
 
 pub trait Admit: Sized {
     fn h3(connect: Connect, fields: &[(head::Name, &[u8])]) -> (Option<block::Plan>, Validation);

@@ -29,7 +29,7 @@ pub(crate) fn xml() -> XmlReply {
 }
 
 #[sark_fiber::handler(pub)]
-pub(crate) fn chunk() -> Stream<'req, IterStream<array::IntoIter<Chunk<'d>, 1>>> {
+pub(crate) fn chunk() -> Stream<IterStream<array::IntoIter<Chunk<'d>, 1>>> {
     [Chunk::from(b"ok")].into_stream()
 }
 

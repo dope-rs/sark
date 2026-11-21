@@ -261,7 +261,7 @@ impl<const PRESENT: bool> PolicyOf for Streaming<PRESENT> {
 }
 impl<const PRESENT: bool> manifold::Route<Cell<usize>> for Streaming<PRESENT> {
     type Response<'req, 'd>
-        = dispatch::Stream<'req, ()>
+        = dispatch::Stream<()>
     where
         'd: 'req;
     fn invoke<'req, 'd, 'state>(

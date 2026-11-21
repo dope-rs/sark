@@ -9,19 +9,15 @@ use o3::buffer::write::{Sink, consume};
 pub use retain::Retain;
 use sark_http::{
     field,
-    payload::response::{
-        Bounded, Encode, Exact, bounded, exact,
-        headers::{self, head::Template},
-        status::Code,
-    },
+    payload::response::{Bounded, Encode, Exact, bounded, exact, headers, status::Code},
 };
 
 pub const COMPRESSIBLE: &[u8] = &[b'x'; 512];
 
-pub static TEMPLATE: Template = Template::new(&[headers::Entry::new(
+pub const FIELDS: &[headers::Entry<'static>] = &[headers::Entry::new(
     field::literal!(headers::Name::try_bytes(b"content-type")),
     field::literal!(field::Value::try_bytes(b"application/json")),
-)]);
+)];
 
 pub struct Counted<'a> {
     pub bytes: &'a [u8],
@@ -30,27 +26,18 @@ pub struct Counted<'a> {
 
 impl<'a> Counted<'a> {
     pub fn exact<'h>(
-        template: &'h Template<'h>,
+        fields: &'h [headers::Entry<'h>],
         bytes: &'a [u8],
         encodes: &'a Cell<usize>,
-    ) -> Exact<headers::head::Head<'h, 0>, Self> {
-        Exact::new(
-            Code::OK,
-            headers::head::Head::new(template, headers::set::Set::new()),
-            Self { bytes, encodes },
-        )
+    ) -> Exact<&'h [headers::Entry<'h>], Self> {
+        Exact::new(Code::OK, fields, Self { bytes, encodes })
     }
 
     pub fn bounded(
         bytes: &'a [u8],
         encodes: &'a Cell<usize>,
-    ) -> Bounded<headers::head::Head<'static, 0>, Self> {
-        let body = Self { bytes, encodes };
-        Bounded::new(
-            Code::OK,
-            headers::head::Head::new(&TEMPLATE, headers::set::Set::new()),
-            body,
-        )
+    ) -> Bounded<&'static [headers::Entry<'static>], Self> {
+        Bounded::new(Code::OK, FIELDS, Self { bytes, encodes })
     }
 }
 

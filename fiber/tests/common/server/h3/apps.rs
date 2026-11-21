@@ -253,7 +253,7 @@ pub enum StreamError<'d> {
 pub(crate) async fn stream_h<'d>(
     req: StreamReq,
     state: &State<'_>,
-) -> Stream<'static, Chunks<Result<Chunk<'d>, StreamError<'d>>>> {
+) -> Stream<Chunks<Result<Chunk<'d>, StreamError<'d>>>> {
     let before = req.payload.as_slice().as_ptr();
     Yield::new().await;
     let payload = match state

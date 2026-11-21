@@ -57,7 +57,7 @@ async fn held_handler<'state>(state: &State<'state>, timer: Timer<'_>) -> Output
 }
 
 #[sark_fiber::handler(pub)]
-fn stream_handler() -> Stream<'req, IterStream<array::IntoIter<Chunk<'d>, 1>>> {
+fn stream_handler() -> Stream<IterStream<array::IntoIter<Chunk<'d>, 1>>> {
     [Chunk::from(b"stream")].into_stream()
 }
 

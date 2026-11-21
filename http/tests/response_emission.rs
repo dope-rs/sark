@@ -5,7 +5,7 @@ use std::{cell::Cell, num::NonZero};
 use common::response::{
     self, Capture,
     body::{Checked, Counted, Short},
-    headers::{SEMANTIC, STATIC},
+    headers::STATIC,
     status,
 };
 use dope_test::alloc::Tracker;
@@ -24,7 +24,7 @@ use sark_http::{
             dispatch::{self, Complete},
             encoded::Plan,
             exact,
-            headers::{Name, head::Head, set::Set, value::Item},
+            headers::{Entry, Name},
             status::Code,
         },
     },
@@ -34,27 +34,14 @@ use sark_http::{
 static ALLOCATOR: Tracker = Tracker::new();
 
 #[test]
-fn sets_borrow_name_proofs() {
-    let raw = field::Name::try_bytes(b"X-Upper").expect("field name");
-    let name = Name::new(Lower::try_from(raw).expect("normalized owner")).expect("response name");
-    let (item, allocs) =
-        Tracker::usage(|| Item::borrow(name.borrow(), field::literal!(Value::try_bytes(b"value"))));
-    assert_eq!(allocs, (0, 0));
-    assert_eq!(item.name_bytes(), b"x-upper");
-    assert_eq!(item.name_bytes().as_ptr(), name.as_bytes().as_ptr());
-}
-
-#[test]
 fn headers_stay_structured() {
     let raw = field::Name::try_bytes(b"X-Dynamic").expect("field name");
     let name = Name::new(Lower::try_from(raw).expect("normalized owner")).expect("response name");
-    let result = Shared::try_copy(b"body");
-    let body = result.expect("the response body must allocate");
-    let dynamic = Set::from_items([Item::from_str(
-        name.borrow(),
-        Value::new("value").expect("field value"),
-    )]);
-    let response = Fixed::new(Code::CREATED, Head::new(&STATIC, dynamic), body);
+    let (field, allocs) =
+        Tracker::usage(|| Entry::new(name.borrow(), field::literal!(Value::try_bytes(b"value"))));
+    assert_eq!(allocs, (0, 0));
+    assert_eq!(field.name().as_ptr(), name.as_bytes().as_ptr());
+    let response = Fixed::new(Code::CREATED, (STATIC, [field]), Body::new(b"body"));
 
     let capture = response
         .complete(Capture::default())
@@ -64,30 +51,11 @@ fn headers_stay_structured() {
         capture.fields(),
         [
             (b"content-type".to_vec(), b"text/plain".to_vec()),
-            (b"x-static".to_vec(), b"yes".to_vec()),
+            (b"x-static".to_vec(), b" yes".to_vec()),
             (b"x-dynamic".to_vec(), b"value".to_vec()),
         ]
     );
     assert_eq!(capture.body(), b"body");
-}
-
-#[test]
-fn templates_stay_semantic() {
-    let result = Shared::try_copy(b"semantic");
-    let body = result.expect("the response body must allocate");
-    let response = Fixed::new(Code::OK, Head::new(&SEMANTIC, Set::<0>::new()), body);
-
-    let capture = response
-        .complete(Capture::default())
-        .expect("response encoding");
-    assert_eq!(
-        capture.fields(),
-        [
-            (b"x-first".to_vec(), b"one".to_vec()),
-            (b"x-second".to_vec(), b" two".to_vec()),
-        ]
-    );
-    assert_eq!(capture.body(), b"semantic");
 }
 
 #[test]
@@ -162,23 +130,27 @@ fn result_keeps_bound() {
 fn stream_keeps_headers() {
     let value = *b"on";
     let stream = &value[..];
-    let fields = Set::from_optional([
-        None,
-        Some(Item::borrow(
-            field::literal!(Name::try_bytes(b"x-stream")),
-            Value::try_bytes(&value).expect("stream field"),
-        )),
-        None,
-    ]);
-    let output = dispatch::Stream::new(Some(stream))
-        .with_status(Code::CREATED)
-        .headers(fields);
-    let (capture, retained) =
-        dispatch::Emit::emit(output, Capture::default()).expect("stream response");
-    assert_eq!(capture.status(), Some(Code::CREATED));
-    assert_eq!(capture.fields(), [(b"x-stream".to_vec(), value.to_vec())]);
-    assert_eq!(capture.calls(), 1);
-    assert!(matches!(retained, Some(body) if std::ptr::eq(body, stream)));
+    let field = Entry::new(
+        field::literal!(Name::try_bytes(b"x-stream")),
+        Value::try_bytes(&value).expect("stream field"),
+    );
+    for header in [None, Some(field)] {
+        let output = dispatch::Stream::new(Some(stream))
+            .with_status(Code::CREATED)
+            .headers(header);
+        let (capture, retained) =
+            dispatch::Emit::emit(output, Capture::default()).expect("stream response");
+        assert_eq!(capture.status(), Some(Code::CREATED));
+        assert!(
+            capture
+                .fields()
+                .iter()
+                .map(|(n, v)| (n.as_slice(), v.as_slice()))
+                .eq(header.map(|_| (b"x-stream".as_slice(), stream)))
+        );
+        assert_eq!(capture.calls(), 1);
+        assert!(matches!(retained, Some(body) if std::ptr::eq(body, stream)));
+    }
 }
 
 #[test]

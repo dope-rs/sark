@@ -4,11 +4,7 @@ use crate::{
     field, payload,
     payload::{
         fixed::Body,
-        response::{
-            self, encoded,
-            headers::{self, set},
-            status::Code,
-        },
+        response::{self, encoded, headers, status::Code},
     },
 };
 
@@ -178,29 +174,29 @@ where
     }
 }
 
-pub struct Stream<'req, S, const N: usize = 0> {
+pub struct Stream<S, H = ()> {
     status: Code,
-    headers: set::Set<'req, N>,
+    headers: H,
     stream: Option<S>,
 }
 
-impl<S, const N: usize> Stream<'_, S, N> {
+impl<S, H> Stream<S, H> {
     pub fn with_status(mut self, status: Code) -> Self {
         self.status = status;
         self
     }
 }
 
-impl<'req, S> Stream<'req, S, 0> {
+impl<S> Stream<S> {
     pub fn new(stream: Option<S>) -> Self {
         Self {
             status: Code::OK,
-            headers: set::Set::new(),
+            headers: (),
             stream,
         }
     }
 
-    pub fn headers<const N: usize>(self, headers: set::Set<'req, N>) -> Stream<'req, S, N> {
+    pub fn headers<H: field::Source<headers::Application>>(self, headers: H) -> Stream<S, H> {
         Stream {
             status: self.status,
             headers,
@@ -209,7 +205,7 @@ impl<'req, S> Stream<'req, S, 0> {
     }
 }
 
-impl<'req, 'd, 'head: 'req, S, const N: usize> Emit<'req, 'd> for Stream<'head, S, N> {
+impl<'req, 'd, S, H: field::Source<headers::Application>> Emit<'req, 'd> for Stream<S, H> {
     type Kind = Polled;
     type Stream = S;
     type Bound = bound::Unbounded;

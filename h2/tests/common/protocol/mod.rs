@@ -18,7 +18,7 @@ use sark_http::{
         self,
         metadata::section::rules::{Policy, Push, RejectPush, RetainRaw},
     },
-    payload::response::{dispatch::Accept, headers::set::Set, status::Code},
+    payload::response::{dispatch::Accept, status::Code},
     request::body::Ref,
 };
 
@@ -155,7 +155,7 @@ impl<'d, P: Policy> Session<'_, ServerRole, P, resident::Shared<'d>, RejectPush>
             _ => return Err(ReplyError::MissingHeaders),
         };
         let encoder = Encoder::new(conn, id, Ref::from_slice(&[]));
-        let prepared = Accept::fixed(encoder, Code::NO_CONTENT, Set::<0>::new(), Vec::new())
+        let prepared = Accept::fixed(encoder, Code::NO_CONTENT, (), Vec::new())
             .map_err(|(error, stream)| ReplyError::Prepare(error, stream))?;
         let pending = prepared.finish().map_err(ReplyError::Protocol)?;
         conn.transfer().drain(usize::MAX);

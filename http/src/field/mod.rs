@@ -161,6 +161,19 @@ impl<Scope: Copy, S: Source<Scope> + ?Sized> Source<Scope> for &S {
     }
 }
 
+impl<Scope: Copy, A: Source<Scope>, B: Source<Scope>> Source<Scope> for (A, B) {
+    fn emit<'field>(&'field self, sink: &mut impl Sink<'field, Scope>) {
+        self.0.emit(sink);
+        self.1.emit(sink);
+    }
+}
+
+impl<Scope: Copy> Source<Scope> for Option<Entry<'_, Scope>> {
+    fn emit<'field>(&'field self, sink: &mut impl Sink<'field, Scope>) {
+        self.as_slice().emit(sink);
+    }
+}
+
 impl<Scope: Copy> Source<Scope> for [Entry<'_, Scope>] {
     fn emit<'field>(&'field self, sink: &mut impl Sink<'field, Scope>) {
         for field in self {

@@ -1,9 +1,6 @@
 //! Admitted application response headers and their emission contract.
 
-pub mod head;
 mod list;
-pub mod set;
-pub mod value;
 
 pub use list::List;
 

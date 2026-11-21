@@ -22,7 +22,7 @@ use dope::{
 };
 use sark::http::payload::response::{
     dispatch::{Stream, chunk::Chunk},
-    headers::{set, value::Item},
+    headers::Entry,
 };
 use sark_fiber::server::Serve as _;
 use sark_fiber::{
@@ -85,16 +85,16 @@ impl<'d> Iterator for Chunks<'d> {
 }
 
 #[sark::handler]
-fn download(request: Request) -> Stream<'req, IterStream<Chunks<'d>>, 1> {
+fn download(request: Request) -> Stream<IterStream<Chunks<'d>>, [Entry<'static>; 1]> {
     Chunks {
         remaining: request.n.min(10_000),
         marker: marker::PhantomData,
     }
     .into_stream()
-    .headers(set::Set::from_items([Item::borrow(
+    .headers([Entry::new(
         sark::header_name!("content-type"),
         field::literal!(Value::try_bytes(b"text/plain; charset=utf-8")),
-    )]))
+    )])
 }
 
 sark::define_route! {

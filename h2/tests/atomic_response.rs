@@ -12,7 +12,7 @@ use sark_h2::{
 };
 use sark_http::{
     field::{self, Entry, Pseudo, Value},
-    payload::response::{dispatch::Accept, headers::set::Set, status::Code},
+    payload::response::{dispatch::Accept, status::Code},
     request::body::Ref,
 };
 
@@ -26,7 +26,7 @@ fn discards_partial_head() {
             .expect("ingress capacity");
         let (mut server, stream) = Session::try_request(budget).expect("request connection");
         let encoder = response::Encoder::new(&mut server, stream, Ref::from_slice(&[]));
-        let prepared = Accept::fixed(encoder, Code::OK, Set::<'static, 0>::new(), Vec::new());
+        let prepared = Accept::fixed(encoder, Code::OK, (), Vec::new());
         let prepared = prepared.expect("first response must prepare");
         drop(prepared);
 
@@ -62,7 +62,7 @@ fn commits_head_body() {
         let prepared = Accept::fixed(
             encoder,
             Code::OK,
-            Set::<'static, 0>::new(),
+            (),
             b"response".to_vec(),
         );
         let prepared = prepared.expect("response must prepare");
@@ -123,7 +123,7 @@ fn restores_owner() {
             let (mut server, stream) = Session::try_request(budget).expect("request connection");
             let encoder = response::Encoder::new(&mut server, stream, Ref::from_slice(&[]));
             let prepared =
-                Accept::fixed(encoder, Code::OK, Set::<'static, 0>::new(), vec![b'x'; len]);
+                Accept::fixed(encoder, Code::OK, (), vec![b'x'; len]);
             let prepared = prepared.expect("response must prepare");
             let pending = prepared.finish();
             let mut pending = pending

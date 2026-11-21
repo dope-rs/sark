@@ -11,7 +11,7 @@ use sark::http::payload::response::{
         Stream,
         chunk::{self, Chunk},
     },
-    headers::{set, value::Item},
+    headers::Entry,
 };
 use sark_core::life::{self, audit};
 use sark_fiber::fiber::{IntoStream, IterStream};
@@ -28,22 +28,22 @@ pub struct EchoReq {
 }
 
 #[sark_fiber::handler(pub)]
-fn greeting() -> Stream<'req, IterStream<array::IntoIter<Chunk<'d>, 2>>, 1> {
+fn greeting() -> Stream<IterStream<array::IntoIter<Chunk<'d>, 2>>, [Entry<'static>; 1]> {
     [Chunk::from(b"hello"), Chunk::from(b" world")]
         .into_stream()
-        .headers(set::Set::from_items([Item::borrow(
+        .headers([Entry::new(
             sark_fiber::header_name!("content-type"),
             field::literal!(Value::try_bytes(b"text/plain")),
-        )]))
+        )])
 }
 
 #[sark_fiber::handler(pub)]
-fn array_handler() -> Stream<'req, IterStream<array::IntoIter<Chunk<'d>, 2>>> {
+fn array_handler() -> Stream<IterStream<array::IntoIter<Chunk<'d>, 2>>> {
     [Chunk::from(b"hello "), Chunk::from(b"world!")].into_stream()
 }
 
 #[sark_fiber::handler(pub)]
-async fn empty() -> Stream<'static, IterStream<array::IntoIter<Chunk<'d>, 0>>> {
+async fn empty() -> Stream<IterStream<array::IntoIter<Chunk<'d>, 0>>> {
     Yield::new().await;
     [].into_stream()
 }
@@ -58,16 +58,14 @@ where
             Shared::try_copy(request.payload).map_err(Error::Copy)?,
         ))
         .map_err(Error::Empty)?;
-        Ok([chunk]
-            .into_stream()
-            .headers(set::Set::from_items([Item::borrow(
-                sark_fiber::header_name!("x-echo"),
-                Value::try_bytes(request.echo).map_err(Error::Header)?,
-            )])))
+        Ok([chunk].into_stream().headers([Entry::new(
+            sark_fiber::header_name!("x-echo"),
+            Value::try_bytes(request.echo).map_err(Error::Header)?,
+        )]))
     })())
 }
 
-type Output<'req, 'd> = Stream<'req, IterStream<array::IntoIter<Chunk<'d>, 1>>, 1>;
+type Output<'req, 'd> = Stream<IterStream<array::IntoIter<Chunk<'d>, 1>>, [Entry<'req>; 1]>;
 
 pub struct State<F>(pub F)
 where
@@ -91,7 +89,7 @@ sark_fiber::define_route! {
 }
 
 #[sark_fiber::handler(pub)]
-fn pending() -> Stream<'req, Chunks<Chunk<'d>>, 1> {
+fn pending() -> Stream<Chunks<Chunk<'d>>, [Entry<'static>; 1]> {
     Stream::new(Some(Chunks::new(
         [
             Chunk::from(b"alpha"),
@@ -100,10 +98,10 @@ fn pending() -> Stream<'req, Chunks<Chunk<'d>>, 1> {
         ],
         None,
     )))
-    .headers(set::Set::from_items([Item::borrow(
+    .headers([Entry::new(
         sark_fiber::header_name!("content-type"),
         field::literal!(Value::try_bytes(b"text/plain")),
-    )]))
+    )])
 }
 
 sark_fiber::define_route! {
@@ -156,10 +154,7 @@ impl<C: Copy, S: Copy> life::Observer<C, S> for Observer<'_> {
 }
 
 impl Failure<'_> {
-    fn stream<'a, 'd>(
-        &self,
-        cause: &'a str,
-    ) -> Stream<'static, Chunks<Result<Chunk<'d>, &'a str>>> {
+    fn stream<'a, 'd>(&self, cause: &'a str) -> Stream<Chunks<Result<Chunk<'d>, &'a str>>> {
         Stream::new(Some(Chunks::new(
             [Ok(Chunk::from(b"before-error")), Err(cause)],
             Some(Rc::clone(&self.trace)),
@@ -168,12 +163,12 @@ impl Failure<'_> {
 }
 
 #[sark_fiber::handler(pub)]
-fn failing(state: &Failure<'_>) -> Stream<'static, Chunks<Result<Chunk<'d>, &'static str>>> {
+fn failing(state: &Failure<'_>) -> Stream<Chunks<Result<Chunk<'d>, &'static str>>> {
     state.stream("read-failed")
 }
 
 #[sark_fiber::handler(pub)]
-async fn later<'a>(state: &Failure<'a>) -> Stream<'static, Chunks<Result<Chunk<'d>, &'a str>>> {
+async fn later<'a>(state: &Failure<'a>) -> Stream<Chunks<Result<Chunk<'d>, &'a str>>> {
     Yield::new().await;
     dope_fiber::abi::poll_fn(|context| {
         let work = context.as_ref().work();
