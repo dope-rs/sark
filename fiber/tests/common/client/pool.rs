@@ -15,3 +15,13 @@ pub const SATURATION_LAST_RESPONSE: &[u8] =
 
 pub const BURST: usize = 4;
 pub const WINDOW: Duration = Duration::from_millis(1_500);
+
+pub fn excess_response() -> Vec<u8> {
+    let mut wire = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n".to_vec();
+    // The head, each chunk and the terminator each consume one decode permit.
+    for _ in 0..dope::core::driver::schedule::LIMIT - 2 {
+        wire.extend_from_slice(b"1\r\nx\r\n");
+    }
+    wire.extend_from_slice(b"0\r\n\r\nHTTP/1.1 299 Unsolicited\r\nContent-Length: 0\r\n\r\n");
+    wire
+}

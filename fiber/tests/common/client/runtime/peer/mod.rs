@@ -1,4 +1,4 @@
-use std::{io, net, num::NonZero};
+use std::{io, net};
 
 use dope_test::harness::{
     GUARD,
@@ -97,24 +97,30 @@ pub fn serve_each(
     Ok(())
 }
 
-/// Counts connections while serving an exact nonzero request budget.
-pub fn counted(
-    acceptor: &mut TcpAcceptor<'_>,
-    requests: NonZero<usize>,
-    mut reply: impl FnMut(&mut Conn<&Stream<'_>>, usize) -> Result<(), Error>,
-) -> Result<usize, Error> {
-    let mut count = 0;
-    let mut done = 0;
-    while done < requests.get() {
-        let accepted = acceptor.accept().map_err(Error::Io)?;
-        let mut conn = Conn::new(&accepted);
-        count += 1;
-        while done < requests.get() && conn.try_request()?.is_some() {
-            done += 1;
-            reply(&mut conn, done)?;
-        }
-    }
-    Ok(count)
+pub fn counted(mut replies: &[&[u8]], run: impl FnOnce(net::SocketAddr)) -> usize {
+    peer::AcceptScript::with(
+        move |acceptor| {
+            let mut count = 0;
+            while !replies.is_empty() {
+                let accepted = acceptor.accept().map_err(Error::Io)?;
+                let mut conn = Conn::new(&accepted);
+                count += 1;
+                while let Some((reply, rest)) = replies.split_first() {
+                    if conn.try_request()?.is_none() {
+                        break;
+                    }
+                    conn.write_all(reply).map_err(Error::Io)?;
+                    replies = rest;
+                }
+            }
+            Ok::<_, Error>(count)
+        },
+        |server| {
+            run(server.addr());
+            server.finish().expect("peer thread").expect("pool peer")
+        },
+    )
+    .expect("spawn pool peer")
 }
 
 /// After client teardown, checks every queued connection for submitted bytes.

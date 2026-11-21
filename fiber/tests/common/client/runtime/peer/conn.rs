@@ -4,7 +4,7 @@ use crate::common::client::{
     pool,
     runtime::{
         calls,
-        peer::{Error, Request, Response as _, Socket, input},
+        peer::{Error, Request, Socket, input},
     },
 };
 
@@ -66,68 +66,6 @@ impl<S: Socket> Conn<S> {
             self.write_all(pool::SATURATION_RESPONSE)?;
         }
         Ok(())
-    }
-
-    pub fn try_final(&mut self, request: usize) -> Result<(), Error<S::Error>> {
-        let headers = if request == 2 {
-            &[("Connection", "close"), ("Content-Length", "2")][..]
-        } else {
-            &[("Content-Length", "2")][..]
-        };
-        self.write_all(&"HTTP/1.1 200 OK".response(headers, b"ok"))
-            .map_err(Error::Io)
-    }
-
-    pub fn try_excess_response(&mut self, request: usize) -> Result<(), Error<S::Error>> {
-        if request == 2 {
-            return self
-                .write_all(
-                    b"HTTP/1.1 201 Created\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
-                )
-                .map_err(Error::Io);
-        }
-        let mut wire = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n".to_vec();
-        // The head, each chunk and the terminator each consume one decode permit.
-        for _ in 0..dope::core::driver::schedule::LIMIT - 2 {
-            wire.extend_from_slice(b"1\r\nx\r\n");
-        }
-        wire.extend_from_slice(b"0\r\n\r\nHTTP/1.1 299 Unsolicited\r\nContent-Length: 0\r\n\r\n");
-        self.write_all(&wire).map_err(Error::Io)
-    }
-
-    pub fn try_http10(&mut self, request: usize, persist: bool) -> Result<(), Error<S::Error>> {
-        let headers = if request == 1 && persist {
-            &[("Connection", "keep-alive"), ("Content-Length", "2")][..]
-        } else if request == 1 {
-            &[("Content-Length", "2")][..]
-        } else {
-            &[("Connection", "close"), ("Content-Length", "2")][..]
-        };
-        self.write_all(&"HTTP/1.0 200 OK".response(headers, b"ok"))
-            .map_err(Error::Io)
-    }
-
-    pub fn try_bounded(&mut self, request: usize) -> Result<(), Error<S::Error>> {
-        let headers = if request == 1 {
-            &[
-                ("Keep-Alive", "timeout=18446744073709551615"),
-                ("Content-Length", "2"),
-            ][..]
-        } else {
-            &[("Connection", "close"), ("Content-Length", "2")][..]
-        };
-        self.write_all(&"HTTP/1.1 200 OK".response(headers, b"ok"))
-            .map_err(Error::Io)
-    }
-
-    pub fn try_reset(&mut self, request: usize) -> Result<(), Error<S::Error>> {
-        let headers = match request {
-            1 => &[("Keep-Alive", "timeout=2"), ("Content-Length", "2")][..],
-            2 => &[("Content-Length", "2")][..],
-            _ => &[("Connection", "close"), ("Content-Length", "2")][..],
-        };
-        self.write_all(&"HTTP/1.1 200 OK".response(headers, b"ok"))
-            .map_err(Error::Io)
     }
 
     /// Sends a chunked response followed by an empty pipelined response.

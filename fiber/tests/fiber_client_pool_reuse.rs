@@ -1,107 +1,59 @@
 use common::client::assert_shutdown;
 use common::client::runtime::peer;
-use dope_test::harness::peer::{AcceptScript, Stream};
+use dope_test::harness::peer::AcceptScript;
 pub mod common;
 
 use std::{num::NonZero, time::Duration};
 
 use common::client::{
     config::{Config as _, FLAVORS},
-    runtime::{
-        cases::Flavor,
-        peer::Response as _,
-    },
+    pool::{self, SATURATION_LAST_RESPONSE as CLOSE, SATURATION_RESPONSE as OK},
+    runtime::cases::Flavor,
 };
 use sark_fiber::client::config::Config;
 
 #[test]
 fn survives_peer_close() {
-    AcceptScript::with(
-        move |acceptor| {
-            peer::serve_each(
-                acceptor,
-                |stream: &mut &Stream<'_>, request: peer::Request<'_>| {
+    let short: &[&str] = &["/1", "/2", "/3", "/4", "/5", "/6"];
+    let long: &[&str] = &["/a", "/b", "/c", "/d", "/e", "/f", "/g", "/h", "/i", "/j"];
+    let done: &[u8] = b"HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Length: 4\r\n\r\ndone";
+    for (paths, capacity, reply) in [(short, 2, CLOSE), (long, 4, done)] {
+        AcceptScript::with(
+            |acceptor| {
+                peer::serve_each(acceptor, |stream, request| {
                     assert_eq!(request.method(), "GET");
-                    let response = "HTTP/1.1 200 OK"
-                        .response(&[("Connection", "close"), ("Content-Length", "2")], b"ok");
-                    stream.write_all(response.as_slice())
-                },
-            )
-        },
-        |server| {
-            let addr = server.addr();
-
-            let codes = Flavor::Fixed.try_gets(
-                addr,
-                Config::try_new("127.0.0.1").expect("HTTP host allocation"),
-                NonZero::new(2).expect("client capacity"),
-                &["/1", "/2", "/3", "/4", "/5", "/6"],
-                &[],
-                None,
-            )
-            .expect("client scenario");
-            assert_eq!(codes, vec![200, 200, 200, 200, 200, 200]);
-            server
-                .stop()
-                .expect("peer thread")
-                .expect("stop close-after-response peer");
-        },
-    )
-    .expect("spawn close-after-response peer")
-}
-
-#[test]
-fn drains_long_sequence() {
-    AcceptScript::with(
-        move |acceptor| {
-            peer::serve_each(
-                acceptor,
-                |stream: &mut &Stream<'_>, request: peer::Request<'_>| {
-                    assert_eq!(request.method(), "GET");
-                    let response = "HTTP/1.1 200 OK"
-                        .response(&[("Connection", "close"), ("Content-Length", "4")], b"done");
-                    stream.write_all(response.as_slice())
-                },
-            )
-        },
-        |server| {
-            let addr = server.addr();
-
-            let paths: &[&str] = &["/a", "/b", "/c", "/d", "/e", "/f", "/g", "/h", "/i", "/j"];
-            let codes = Flavor::Fixed.try_gets(
-                addr,
-                Config::try_new("127.0.0.1").expect("HTTP host allocation"),
-                NonZero::new(4).expect("client capacity"),
-                paths,
-                &[],
-                None,
-            )
-            .expect("client scenario");
-            assert_eq!(codes.len(), 10);
-            assert!(codes.iter().all(|&c| c == 200), "all 200: {codes:?}");
-            server
-                .stop()
-                .expect("peer thread")
-                .expect("stop long-sequence peer");
-        },
-    )
-    .expect("spawn long-sequence peer")
+                    stream.write_all(reply)
+                })
+            },
+            |server| {
+                let codes = Flavor::Fixed
+                    .try_gets(
+                        server.addr(),
+                        Config::try_new("127.0.0.1").expect("HTTP host allocation"),
+                        NonZero::new(capacity).expect("client capacity"),
+                        paths,
+                        &[],
+                        None,
+                    )
+                    .expect("client scenario");
+                assert_eq!(codes.len(), paths.len());
+                assert!(codes.iter().all(|&code| code == 200), "{codes:?}");
+                server
+                    .stop()
+                    .expect("peer thread")
+                    .expect("close-after-response peer");
+            },
+        )
+        .expect("spawn close-after-response peer");
+    }
 }
 
 #[test]
 fn reuses_one_slot() {
     for flavor in FLAVORS {
-        AcceptScript::with(
-            move |acceptor| {
-                peer::counted(
-                    acceptor,
-                    NonZero::new(2).expect("nonzero request budget"),
-                    |conn, request| conn.try_final(request),
-                )
-            },
-            |server| {
-                let addr = server.addr();
-                let codes = flavor.try_gets(
+        let count = peer::counted(&[OK, CLOSE], |addr| {
+            let codes = flavor
+                .try_gets(
                     addr,
                     flavor
                         .try_config(addr)
@@ -115,17 +67,9 @@ fn reuses_one_slot() {
                     None,
                 )
                 .expect("client scenario");
-                assert!((codes) == ([200, 200]));
-                assert_eq!(
-                    server
-                        .finish()
-                        .expect("peer thread")
-                        .expect("one-slot peer"),
-                    1
-                );
-            },
-        )
-        .expect("connection-counting peer")
+            assert_eq!(codes, [200, 200]);
+        });
+        assert_eq!(count, 1);
     }
 }
 
@@ -134,16 +78,12 @@ fn rejects_excess_response_before_reusing_one_slot() {
     use common::client::runtime::pools;
     use dope_fiber::BlockOn as _;
 
-    AcceptScript::with(
-        |acceptor| {
-            peer::counted(
-                acceptor,
-                NonZero::new(2).expect("request count"),
-                |conn, request| conn.try_excess_response(request),
-            )
-        },
-        |server| {
-            let addr = server.addr();
+    peer::counted(
+        &[
+            &pool::excess_response(),
+            b"HTTP/1.1 201 Created\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+        ],
+        |addr| {
             let codes = pools::Plan::new(
                 addr,
                 Config::try_new("127.0.0.1")
@@ -172,48 +112,39 @@ fn rejects_excess_response_before_reusing_one_slot() {
             )
             .expect("client scenario");
             assert_eq!(codes, [200, 201]);
-            server
-                .finish()
-                .expect("peer thread")
-                .expect("excess-response peer");
         },
-    )
-    .expect("connection-counting peer");
+    );
 }
 
 #[test]
 fn http10_needs_persistence() {
     for flavor in FLAVORS {
         for (persist, expected) in [(false, 2), (true, 1)] {
-            let count = AcceptScript::with(
-                move |acceptor| {
-                    peer::counted(
-                        acceptor,
-                        NonZero::new(2).expect("nonzero request budget"),
-                        |conn, request| conn.try_http10(request, persist),
-                    )
-                },
-                |server| {
-                    let addr = server.addr();
-
+            let first: &[u8] = if persist {
+                b"HTTP/1.0 200 OK\r\nConnection: keep-alive\r\nContent-Length: 2\r\n\r\nok"
+            } else {
+                b"HTTP/1.0 200 OK\r\nContent-Length: 2\r\n\r\nok"
+            };
+            let count = peer::counted(
+                &[
+                    first,
+                    b"HTTP/1.0 200 OK\r\nConnection: close\r\nContent-Length: 2\r\n\r\nok",
+                ],
+                |addr| {
                     let paths = &["/first", "/second"];
-                    let codes = flavor.try_gets(
-                        addr,
-                        flavor.try_config(addr).expect("HTTP host allocation"),
-                        NonZero::new(1).expect("client capacity"),
-                        paths,
-                        &[],
-                        None,
-                    )
-                    .expect("client scenario");
+                    let codes = flavor
+                        .try_gets(
+                            addr,
+                            flavor.try_config(addr).expect("HTTP host allocation"),
+                            NonZero::new(1).expect("client capacity"),
+                            paths,
+                            &[],
+                            None,
+                        )
+                        .expect("client scenario");
                     assert_eq!(codes, [200, 200]);
-                    server
-                        .finish()
-                        .expect("peer thread")
-                        .expect("HTTP/1.0 persistence probe")
                 },
-            )
-            .expect("connection-counting peer");
+            );
             assert_eq!(count, expected);
         }
     }
@@ -222,39 +153,23 @@ fn http10_needs_persistence() {
 #[test]
 fn bounds_peer_timeout() {
     for flavor in FLAVORS {
-        let count = AcceptScript::with(
-            move |acceptor| {
-                peer::counted(
-                    acceptor,
-                    NonZero::new(2).expect("nonzero request budget"),
-                    |conn, request| conn.try_bounded(request),
-                )
-            },
-            |server| {
-                let addr = server.addr();
-
-                let config = flavor
-                    .try_config(addr)
-                    .expect("HTTP host allocation")
-                    .timeout(Duration::from_secs(2))
-                    .idle_timeout(Duration::from_millis(100));
-                let codes = flavor.try_gets(
-                    addr,
-                    config,
-                    NonZero::new(1).expect("client capacity"),
-                    &["/first"],
-                    &["/second"],
-                    Some(Duration::from_millis(300)),
-                )
-                .expect("client scenario");
-                assert_eq!(codes, [200, 200]);
-                server
-                    .finish()
-                    .expect("peer thread")
-                    .expect("reuse lease probe")
-            },
-        )
-        .expect("connection-counting peer");
+        let count = peer::counted(&[b"HTTP/1.1 200 OK\r\nKeep-Alive: timeout=18446744073709551615\r\nContent-Length: 2\r\n\r\nok", CLOSE], |addr| {
+            let config = flavor
+                .try_config(addr)
+                .expect("HTTP host allocation")
+                .timeout(Duration::from_secs(2))
+                .idle_timeout(Duration::from_millis(100));
+            let codes = flavor.try_gets(
+                addr,
+                config,
+                NonZero::new(1).expect("client capacity"),
+                &["/first"],
+                &["/second"],
+                Some(Duration::from_millis(300)),
+            )
+            .expect("client scenario");
+            assert_eq!(codes, [200, 200]);
+        });
         assert_eq!(count, 2);
     }
 }
@@ -266,17 +181,9 @@ fn clock_governs_reuse() {
             (Duration::from_secs(10) - Duration::from_nanos(1), 1),
             (Duration::from_secs(10), 2),
         ] {
-            let count = AcceptScript::with(
-                move |acceptor| {
-                    peer::counted(
-                        acceptor,
-                        NonZero::new(2).expect("nonzero request budget"),
-                        |conn, request| conn.try_final(request),
-                    )
-                },
-                |server| {
-                    let addr = server.addr();
-                    let codes = flavor.try_timed_pair(
+            let count = peer::counted(&[OK, CLOSE], |addr| {
+                let codes = flavor
+                    .try_timed_pair(
                         addr,
                         flavor
                             .try_config(addr)
@@ -286,14 +193,8 @@ fn clock_governs_reuse() {
                         gap,
                     )
                     .expect("client scenario");
-                    assert!((codes) == ([200, 200]));
-                    server
-                        .finish()
-                        .expect("peer thread")
-                        .expect("manual-clock lease peer")
-                },
-            )
-            .expect("connection-counting peer");
+                assert_eq!(codes, [200, 200]);
+            });
             assert_eq!(count, expected);
         }
     }
@@ -302,17 +203,9 @@ fn clock_governs_reuse() {
 #[test]
 fn zero_disables_reuse() {
     for flavor in FLAVORS {
-        let count = AcceptScript::with(
-            move |acceptor| {
-                peer::counted(
-                    acceptor,
-                    NonZero::new(2).expect("nonzero request budget"),
-                    |conn, request| conn.try_final(request),
-                )
-            },
-            |server| {
-                let addr = server.addr();
-                let codes = flavor.try_gets(
+        let count = peer::counted(&[OK, CLOSE], |addr| {
+            let codes = flavor
+                .try_gets(
                     addr,
                     flavor
                         .try_config(addr)
@@ -325,14 +218,8 @@ fn zero_disables_reuse() {
                     None,
                 )
                 .expect("client scenario");
-                assert_eq!(codes, [200, 200]);
-                server
-                    .finish()
-                    .expect("peer thread")
-                    .expect("zero idle timeout probe")
-            },
-        )
-        .expect("connection-counting peer");
+            assert_eq!(codes, [200, 200]);
+        });
         assert_eq!(count, 2);
     }
 }
@@ -340,59 +227,40 @@ fn zero_disables_reuse() {
 #[test]
 fn missing_hint_resets() {
     for flavor in FLAVORS {
-        let count = AcceptScript::with(
-            move |acceptor| {
-                peer::counted(
-                    acceptor,
-                    NonZero::new(3).expect("nonzero request budget"),
-                    |conn, request| conn.try_reset(request),
-                )
-            },
-            |server| {
-                let addr = server.addr();
-
+        let count = peer::counted(
+            &[
+                b"HTTP/1.1 200 OK\r\nKeep-Alive: timeout=2\r\nContent-Length: 2\r\n\r\nok",
+                OK,
+                CLOSE,
+            ],
+            |addr| {
                 let config = flavor
                     .try_config(addr)
                     .expect("HTTP host allocation")
                     .timeout(Duration::from_secs(3))
                     .idle_timeout(Duration::from_millis(1_800));
-                let codes = flavor.try_gets(
-                    addr,
-                    config,
-                    NonZero::new(1).expect("client capacity"),
-                    &["/hint", "/reset"],
-                    &["/after-gap"],
-                    Some(Duration::from_millis(1_200)),
-                )
-                .expect("client scenario");
+                let codes = flavor
+                    .try_gets(
+                        addr,
+                        config,
+                        NonZero::new(1).expect("client capacity"),
+                        &["/hint", "/reset"],
+                        &["/after-gap"],
+                        Some(Duration::from_millis(1_200)),
+                    )
+                    .expect("client scenario");
                 assert_eq!(codes, [200, 200, 200]);
-                server
-                    .finish()
-                    .expect("peer thread")
-                    .expect("sticky lease probe")
             },
-        )
-        .expect("connection-counting peer");
+        );
         assert_eq!(count, 1);
     }
 }
 
 #[test]
 fn recovers_silent_close() {
-    AcceptScript::with(
-        move |acceptor| {
-            peer::serve_each(
-                acceptor,
-                |stream: &mut &Stream<'_>, _: peer::Request<'_>| {
-                    let response = "HTTP/1.1 200 OK".response(&[("Content-Length", "2")], b"ok");
-                    stream.write_all(response.as_slice())
-                },
-            )
-        },
-        |server| {
-            let addr = server.addr();
-
-            let codes = Flavor::Fixed.try_gets(
+    peer::with_wire(&[], OK, |addr| {
+        let codes = Flavor::Fixed
+            .try_gets(
                 addr,
                 Config::try_new("127.0.0.1")
                     .expect("HTTP host allocation")
@@ -404,12 +272,6 @@ fn recovers_silent_close() {
                 None,
             )
             .expect("client scenario");
-            assert_eq!(codes, vec![200, 200, 200, 200, 200, 200, 200, 200]);
-            server
-                .stop()
-                .expect("peer thread")
-                .expect("stop silent-close peer");
-        },
-    )
-    .expect("spawn silent-close peer")
+        assert_eq!(codes, [200; 8]);
+    });
 }
