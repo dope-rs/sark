@@ -60,30 +60,27 @@ pub(super) fn start(
     } else {
         quote!(#ns_h1::wire::parsing::raw::Bound::<_, #route>::empty(#parsed))
     };
-    if owned {
-        quote! {
-            return match #ns_h1::wire::parsing::framing::PendingHead::try_start(
-                #found, |#n_shead| #complete,
-            ) {
-                ::core::result::Result::Ok(::core::ops::ControlFlow::Continue(#v_result)) => #v_result,
-                ::core::result::Result::Ok(::core::ops::ControlFlow::Break(#v_wait)) => {
-                    #v_turn.await_head(#heads::#head(#v_wait))
-                }
-                ::core::result::Result::Err(#v_error) => {
-                    #v_turn.reject_head(#v_error.into_rejection())
-                }
-            };
-        }
+    let (start, binding, finish) = if owned {
+        (
+            quote!(#ns_h1::wire::parsing::framing::PendingHead::try_start(#found, |#n_shead| #complete)),
+            &v_result,
+            quote!(#v_result),
+        )
     } else {
-        quote! {
-            return match #ns_h1::wire::parsing::framing::Head::start(#found) {
-                ::core::result::Result::Ok(#ns_h1::wire::parsing::framing::HeadProgress::Complete(#n_shead)) => #complete,
-                ::core::result::Result::Ok(#ns_h1::wire::parsing::framing::HeadProgress::Pending(#v_wait)) => {
-                    #v_turn.await_head(#heads::#head(#v_wait))
-                }
-                ::core::result::Result::Err(#v_error) => #v_turn.reject_head(#v_error.into_rejection()),
-            };
-        }
+        (
+            quote!(#ns_h1::wire::parsing::framing::Head::start(#found)),
+            &n_shead,
+            complete,
+        )
+    };
+    quote! {
+        return match #start {
+            ::core::result::Result::Ok(::core::ops::ControlFlow::Continue(#binding)) => #finish,
+            ::core::result::Result::Ok(::core::ops::ControlFlow::Break(#v_wait)) => {
+                #v_turn.await_head(#heads::#head(#v_wait))
+            }
+            ::core::result::Result::Err(#v_error) => #v_turn.reject_head(#v_error.into_rejection()),
+        };
     }
 }
 

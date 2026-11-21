@@ -72,11 +72,7 @@ fn retains_fragmented_head() {
             .expect("fields")
     });
     assert!(usage.allocated_bytes <= split + 64);
-    let pending = match progress {
-        framing::HeadProgress::Pending(pending) => Some(pending),
-        framing::HeadProgress::Complete(_) => None,
-    }
-    .expect("pending head");
+    let pending = progress.break_value().expect("pending head");
     input.fill(0);
     let mut fixture = Retain::try_new().expect("response resources");
     let mut conn = session::Conn::default();

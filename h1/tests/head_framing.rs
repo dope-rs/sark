@@ -1,18 +1,17 @@
 pub mod common;
 
-use std::{convert::Infallible, num::NonZero, ops::ControlFlow, slice};
+use std::{num::NonZero, ops::ControlFlow, slice};
 
 use common::head::{self, OWNED_PREFIX, OWNED_SUFFIX, OWNED_TAIL, Request, SETS};
 use dope_test::alloc::Tracker;
 use o3::buffer::write::Sink as _;
 use sark_h1::{
     Input,
-    session::Outcome,
     wire::{
         head::{Block, Error, line},
         parsing::{
-            self,
-            framing::{Head, HeadProgress, PendingHead},
+            self, Rejection,
+            framing::{Head, PendingHead},
             raw,
         },
     },
@@ -31,14 +30,10 @@ fn setters_and_owner() {
     SETS.set(Vec::new());
     let mut input = b"GET / HTTP/1.1\r\nHost: local\r\nX-Count: once\r\nX-Other: ".to_vec();
     let source = head::parsed(Input::Borrowed(&input), u8::MAX);
-    let mut pending =
-        match Head::<Request, head::Admission>::start::<false>(raw::Bound::empty(&source))
-            .ok()
-            .expect("fields")
-        {
-            HeadProgress::Pending(pending) => Some(pending),
-            HeadProgress::Complete(_) => None,
-        }
+    let mut pending = Head::<Request, head::Admission>::start::<false>(raw::Bound::empty(&source))
+        .ok()
+        .expect("fields")
+        .break_value()
         .expect("pending fields");
     let values = SETS.take();
     assert_eq!(values.as_slice(), [b"once"]);
@@ -92,8 +87,8 @@ fn captured_list_members() {
             .ok()
             .expect("admitted field")
         {
-            HeadProgress::Complete(_) => assert_eq!(split, wire.len()),
-            HeadProgress::Pending(pending) => {
+            ControlFlow::Continue(_) => assert_eq!(split, wire.len()),
+            ControlFlow::Break(pending) => {
                 let outcome = pending.try_resume(Input::Borrowed(&wire[split..]), |_| ());
                 assert!(matches!(outcome, Ok(ControlFlow::Continue(()))));
             }
@@ -109,14 +104,11 @@ fn bad_field_rejects() {
         Input::Borrowed(b"GET / HTTP/1.1\r\nHost: local\r\nContent-Length: "),
         u8::MAX,
     );
-    let pending = match Head::<Request>::start::<false>(raw::Bound::empty(&source))
+    let pending = Head::<Request>::start::<false>(raw::Bound::empty(&source))
         .ok()
         .expect("fields")
-    {
-        HeadProgress::Pending(pending) => Some(pending),
-        HeadProgress::Complete(_) => None,
-    }
-    .expect("pending fields");
+        .break_value()
+        .expect("pending fields");
     let outcome = pending.try_resume(Input::Borrowed(b"invalid\r\n"), |_| ());
     assert!(matches!(
         outcome,
@@ -157,14 +149,14 @@ fn upgrade_errors_follow_canonical_field_admission() {
                 raw::Bound::empty(&source),
             ) {
                 Err(error) => error,
-                Ok(HeadProgress::Pending(pending)) => match pending
+                Ok(ControlFlow::Break(pending)) => match pending
                     .try_resume(Input::Borrowed(&wire[split..]), |_| {
                         panic!("invalid opening reached the handler")
                     }) {
                     Err(error) => error,
                     Ok(_) => panic!("invalid opening did not fail immediately"),
                 },
-                Ok(HeadProgress::Complete(_)) => panic!("invalid opening admitted"),
+                Ok(ControlFlow::Continue(_)) => panic!("invalid opening admitted"),
             };
             let allocation = measurement.finish();
             assert!(
@@ -182,9 +174,11 @@ fn upgrade_errors_follow_canonical_field_admission() {
                     )
                 ));
             }
-            let actual = match error.into_consume::<Infallible>() {
-                Outcome::Failed(sark_h1::wire::Failure::Upgrade(error)) => Some(error),
-                Outcome::Close(reply) if reply.as_slice() == canned::BAD_REQUEST.as_slice() => None,
+            let actual = match error.into_rejection() {
+                Rejection::Failed(sark_h1::wire::Failure::Upgrade(error)) => Some(error),
+                Rejection::Close(reply) if reply.as_slice() == canned::BAD_REQUEST.as_slice() => {
+                    None
+                }
                 _ => panic!("opening error lost"),
             };
             assert_eq!(actual, expected);
@@ -199,8 +193,8 @@ fn transfer_coding_admission() {
         for split in Request::TRANSFER_PREFIX.len()..=wire.len() {
             let source = head::parsed(Input::Borrowed(&wire[..split]), u8::MAX);
             let result = match Head::<Request>::start::<false>(raw::Bound::empty(&source)) {
-                Ok(HeadProgress::Complete(_)) => Ok(()),
-                Ok(HeadProgress::Pending(pending)) => pending
+                Ok(ControlFlow::Continue(_)) => Ok(()),
+                Ok(ControlFlow::Break(pending)) => pending
                     .try_resume(Input::Borrowed(&wire[split..]), |_| {
                         assert!(supported, "unsupported coding reached the handler");
                     })
@@ -218,8 +212,8 @@ fn transfer_coding_admission() {
                         parsing::Request::Head(Error::UnsupportedTransferEncoding)
                     ));
                     assert!(matches!(
-                        error.into_consume::<Infallible>(),
-                        Outcome::Close(reply)
+                        error.into_rejection(),
+                        Rejection::Close(reply)
                             if reply.as_slice() == canned::NOT_IMPLEMENTED.as_slice()
                     ));
                 }
@@ -239,8 +233,8 @@ fn http10_ignores_upgrade() {
             .ok()
             .expect("HTTP/1.0 fields")
         {
-            HeadProgress::Complete(_) => assert_eq!(split, wire.len()),
-            HeadProgress::Pending(pending) => {
+            ControlFlow::Continue(_) => assert_eq!(split, wire.len()),
+            ControlFlow::Break(pending) => {
                 let outcome = pending.try_resume(Input::Borrowed(&wire[split..]), |head| {
                     assert_eq!(head.source().request().version(), Version::Ten);
                 });
@@ -254,14 +248,11 @@ fn http10_ignores_upgrade() {
         Input::Borrowed(b"GET / HTTP/1.0\r\nHost: local\r\nUpgrade: web"),
         u8::MAX,
     );
-    let pending = match Head::<Request>::start::<false>(raw::Bound::empty(&source))
+    let pending = Head::<Request>::start::<false>(raw::Bound::empty(&source))
         .ok()
         .expect("pending fields")
-    {
-        HeadProgress::Pending(pending) => Some(pending),
-        HeadProgress::Complete(_) => None,
-    }
-    .expect("fragmented field");
+        .break_value()
+        .expect("fragmented field");
     let outcome = pending.try_resume(Input::Borrowed(b"\0socket\r\n\r\n"), |_| ());
     assert!(matches!(
         outcome,
@@ -280,14 +271,14 @@ fn whole_and_split() {
             let source = head::parsed(Input::Borrowed(&input), u8::MAX);
             let complete = Head::<Request>::start::<false>(raw::Bound::empty(&source));
             assert_eq!(
-                matches!(complete, Ok(HeadProgress::Complete(_))),
+                matches!(complete, Ok(ControlFlow::Continue(_))),
                 width <= 8192
             );
             assert!(SETS.take().is_empty());
             for split in [Request::PREFIX.len() + field.len(), input.len() - 3] {
                 let source = head::parsed(Input::Borrowed(&input[..split]), u8::MAX);
                 let pending = match Head::<Request>::start::<false>(raw::Bound::empty(&source)) {
-                    Ok(HeadProgress::Pending(pending)) => Some(pending),
+                    Ok(ControlFlow::Break(pending)) => Some(pending),
                     Err(parsing::Request::Head(Error::Line(line::Error::Limit {
                         observed: 8194,
                         limit: 8192,
@@ -366,12 +357,12 @@ fn route_bound_precedes_retention() {
                 Head::<Request, head::Admission>::start::<false>(raw::Bound::empty(&source));
             let allocation = measurement.finish();
             match (split == wire.len(), started) {
-                (true, Ok(HeadProgress::Complete(head))) => {
+                (true, Ok(ControlFlow::Continue(head))) => {
                     assert_eq!(extra, 0);
                     assert_eq!(allocation.allocations, 0);
                     assert_eq!(head.into_admission().1.finishes, 1);
                 }
-                (false, Ok(HeadProgress::Pending(pending))) => {
+                (false, Ok(ControlFlow::Break(pending))) => {
                     let measurement = Tracker::begin();
                     let outcome = pending.try_resume(Input::Borrowed(&wire[split..]), |head| {
                         assert_eq!(extra, 0);

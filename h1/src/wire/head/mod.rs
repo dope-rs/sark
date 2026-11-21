@@ -1,4 +1,4 @@
-use std::{convert::Infallible, mem, num::NonZero};
+use std::{convert::Infallible, mem, num::NonZero, ops::ControlFlow};
 
 use header::Policy as _;
 use o3::buffer::storage;
@@ -22,7 +22,8 @@ use crate::wire::{Failure, parsing, recv, response};
 
 pub mod line;
 mod pending;
-pub(crate) use pending::{Partial, Pending, Progress};
+use pending::Partial;
+pub(crate) use pending::{Pending, Progress};
 
 /// Route-local admission over the canonical HTTP/1 field scan.
 pub trait Admission: Default {
@@ -70,11 +71,6 @@ pub struct Block<H, A = ()> {
     admission: A,
     fields: Fields,
     len: NonZero<u32>,
-}
-
-pub(crate) enum Scanned<'input, H, A = ()> {
-    Complete(Block<H, A>),
-    Pending(Partial<'input, H, A>),
 }
 
 /// Persistence selected by one admitted HTTP/1 request head.
@@ -171,20 +167,15 @@ impl<H, A: Admission> Block<H, A> {
         H: Default,
         R: route::Schema<RawHeaders = H>,
     {
-        Ok(
-            match Self::scan::<R, NEGOTIATE>(input, start, limit, version)? {
-                Scanned::Complete(block) => Some(block),
-                Scanned::Pending(_) => None,
-            },
-        )
+        Ok(Self::scan::<R, NEGOTIATE>(input, start, limit, version)?.continue_value())
     }
 
-    pub(crate) fn scan<'input, R, const NEGOTIATE: bool>(
-        input: &'input [u8],
+    pub(crate) fn scan<R, const NEGOTIATE: bool>(
+        input: &[u8],
         start: usize,
         limit: usize,
         version: Version,
-    ) -> Result<Scanned<'input, H, A>, Error<R>>
+    ) -> Result<ControlFlow<Partial<H, A, NEGOTIATE>, Self>, Error<R>>
     where
         H: Default,
         R: route::Schema<RawHeaders = H>,
@@ -242,19 +233,17 @@ impl<H, A: Admission> Block<H, A> {
             if available > maximum {
                 return Err(Error::Length { len: available });
             }
-            return Ok(Scanned::Pending(Partial {
-                input,
+            return Ok(ControlFlow::Break(Partial {
+                cursor: (pos, count),
                 headers,
                 admission,
                 fields,
                 flags,
-                count,
-                pos,
             }));
         };
         const { assert!(recv::HEAD_CAPACITY <= u32::MAX as usize) };
         let len = NonZero::new(len as u32).ok_or(Error::Length { len })?;
-        Ok(Scanned::Complete(Self {
+        Ok(ControlFlow::Continue(Self {
             headers,
             admission,
             fields,

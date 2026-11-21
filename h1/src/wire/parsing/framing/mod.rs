@@ -27,17 +27,6 @@ pub enum Progress<T, R: route::Spec> {
 
 const MAX_HEADER_COUNT: usize = 128;
 
-pub enum HeadProgress<
-    'a,
-    'req,
-    R: route::Spec,
-    A: head::Admission = (),
-    const NEGOTIATE: bool = false,
-> {
-    Complete(Head<'a, 'req, R, A>),
-    Pending(PendingHead<R, A, NEGOTIATE>),
-}
-
 /// Complete typed request headers tied to their admitted input window.
 /// Body admission rejects GET/HEAD with a nonempty fixed body or any chunked body.
 /// A fixed length above the route limit is rejected first as too large.
@@ -74,7 +63,7 @@ impl<'a, 'req, R: route::Spec, A: head::Admission> Head<'a, 'req, R, A> {
 
     pub fn start<const NEGOTIATE: bool>(
         source: parsing::raw::Bound<&'a parsing::Head<'req>, R>,
-    ) -> Result<HeadProgress<'a, 'req, R, A, NEGOTIATE>, parsing::Request<R::Request>> {
+    ) -> Result<ControlFlow<PendingHead<R, A, NEGOTIATE>, Self>, parsing::Request<R::Request>> {
         let parsed = head::Block::<<R::Request as route::Schema>::RawHeaders, A>::scan::<
             R::Request,
             NEGOTIATE,
@@ -86,16 +75,16 @@ impl<'a, 'req, R: route::Spec, A: head::Admission> Head<'a, 'req, R, A> {
         )
         .map_err(parsing::Request::Head)?;
         Ok(match parsed {
-            head::Scanned::Complete(block) => {
+            ControlFlow::Continue(block) => {
                 let parsed = head::Parsed::from_block::<R::Request>(block, source.head.request())
                     .map_err(parsing::Request::Head)?;
-                HeadProgress::Complete(Self::new(source, parsed))
+                ControlFlow::Continue(Self::new(source, parsed))
             }
-            head::Scanned::Pending(partial) => {
+            ControlFlow::Break(partial) => {
                 let fields = partial
-                    .retain::<R::Request, NEGOTIATE>(*source.head.request(), MAX_HEADER_COUNT)
+                    .retain::<R::Request>(source.head, MAX_HEADER_COUNT)
                     .map_err(parsing::Request::Head)?;
-                HeadProgress::Pending(PendingHead {
+                ControlFlow::Break(PendingHead {
                     fields,
                     params: source.params,
                 })
@@ -206,8 +195,8 @@ impl<R: route::Spec, A: head::Admission, const NEGOTIATE: bool> PendingHead<R, A
         complete: impl FnOnce(Head<'_, '_, R, A>) -> T,
     ) -> ControlFlow<Self, T> {
         match progress {
-            head::Progress::Pending(fields) => ControlFlow::Break(Self { fields, params }),
-            head::Progress::Complete(owner, parsed) => owner.with_shared(|view, request| {
+            ControlFlow::Break(fields) => ControlFlow::Break(Self { fields, params }),
+            ControlFlow::Continue((owner, parsed)) => owner.with_shared(|view, request| {
                 let head = parsing::Head {
                     input: crate::Input::Buffered(view),
                     request,
