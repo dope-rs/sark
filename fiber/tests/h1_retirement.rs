@@ -9,7 +9,7 @@ use std::{
 
 use common::{
     route::{
-        body::session::LifetimeDispatch,
+        body::length::ClOverflowDispatch,
         chunked::peer::Peer,
         keep::{
             KeepAliveDispatch,
@@ -30,7 +30,6 @@ use dope_test::{
     harness::{peer::Peer as TcpPeer, server::Pair, signals::LocalGate},
 };
 use o3::base::time::Positive;
-use sark_fiber::server::Serve as _;
 use sark_core::{
     deadline::{self, config},
     life::session::Config,
@@ -141,33 +140,15 @@ fn retires_idle_generation() {
         (Positive::try_new(Duration::from_millis(100))).expect("the fixture window is positive");
     let drain =
         (Positive::try_new(Duration::from_millis(250))).expect("the fixture window is positive");
-    let harness = Pair::bind().expect("bind H1 lifetime listener");
-    let bind = harness.addr();
-    let lifetime = Config::new(age, drain);
-    let server = server::Plan::new(bind, Duration::from_secs(10))
-        .build()
-        .session(lifetime);
+    let (harness, plan) = Plan::isolated();
+    let server = plan.session(Config::new(age, drain));
 
     harness
-        .check(
+        .run(
             |context, listener| {
-                let mut reports = Plan::try_reports(&server).expect("server descriptor claims");
-                let result = LifetimeDispatch::serve(
-                    server.with_bound(listener),
-                    context,
-                    (),
-                    sark_fiber::Config::new(server::MAX_CONNECTIONS),
-                    server::reporting(&mut reports),
-                    |result| {
-                        result
-                            .as_ref()
-                            .map(|_| ())
-                            .map_err(|error| error.cause())
-                            .expect("server teardown")
-                    },
-                );
-                server::reclaimed(&reports);
-                result
+                server::try_serve::<ClOverflowDispatch, _>(
+                    server, context, listener, (), server::MAX_CONNECTIONS,
+                )
             },
             |bind| {
                 let mut first = TcpPeer::at(bind)
@@ -202,13 +183,6 @@ fn retires_idle_generation() {
                         .try_response()
                         .expect("lifetime response"),
                     (200, b"pong".to_vec())
-                );
-            },
-            |result| {
-                assert!(
-                    result.is_ok(),
-                    "retires_idle_generation server shutdown: {:?}",
-                    result.err()
                 );
             },
         )

@@ -6,10 +6,14 @@ use std::{
     time::Duration,
 };
 
-use common::route::{body::discard::*, chunked::peer::Peer};
-use common::server::recover;
-
-use dope_test::harness::{peer::Peer as TcpPeer, server::Pair};
+use common::{
+    route::{
+        body::{__SarkHandlerPingX70696E67, discard::*},
+        chunked::peer::Peer,
+    },
+    server::{self, MAX_CONNECTIONS, Plan},
+};
+use dope_test::harness::peer::Peer as TcpPeer;
 use sark_core::{body::admit::Retention, route::Schema};
 
 #[test]
@@ -22,24 +26,14 @@ fn discard_policy_is_static() {
 }
 
 fn serve(client: impl FnOnce(SocketAddr)) {
-    Pair::bind()
-        .expect("bind test harness")
-        .check(
-            |context, listener| {
-                try_serve(context, listener, recover, |result| {
-                    result.expect("server execution")
-                })
-            },
-            client,
-            |result| {
-                let reports = result.expect("discard server shutdown");
-                assert!(
-                    reports.events().expect("reclaimed resources").is_empty(),
-                    "unexpected reports server operations: {reports:?}"
-                );
-            },
-        )
-        .expect("run test server");
+    let (pair, plan) = Plan::isolated();
+    pair.run(
+        |context, listener| {
+            server::try_serve::<StreamDiscardDispatch, _>(plan, context, listener, (), MAX_CONNECTIONS)
+        },
+        client,
+    )
+    .expect("run test server");
 }
 
 #[test]

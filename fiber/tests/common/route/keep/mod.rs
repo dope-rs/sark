@@ -34,14 +34,6 @@ pub struct StaticReply<'d> {
 }
 
 #[sark_fiber::handler(pub)]
-fn ping() -> OwnedReply {
-    OwnedReply {
-        status: status::Code::OK,
-        body: b"pong".to_vec(),
-    }
-}
-
-#[sark_fiber::handler(pub)]
 fn body(req: BodyReq) -> OwnedReply {
     OwnedReply {
         status: status::Code::OK,
@@ -67,7 +59,7 @@ fn large_static() -> StaticReply<'d> {
 
 sark_fiber::define_route! {
     pub KeepAliveDispatch: () => {
-        GET "/ping" => ping,
+        GET "/ping" => crate::common::route::body::ping,
         GET "/large" => large,
         GET "/large-static" => large_static,
         POST "/body" => body,

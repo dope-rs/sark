@@ -14,36 +14,21 @@ use common::{
     server::{self, Plan},
 };
 use dope::core::driver::life::recovery::Policy;
-use dope_test::harness::server::Pair;
 
 #[test]
 fn terminal_stops_pipeline() {
-    let pair = Pair::bind().expect("listener");
-    let plan = Plan::new(pair.addr(), Duration::from_secs(10)).build();
-    pair.check(
+    let (pair, plan) = Plan::isolated();
+    pair.run(
         |context, listener| {
             let calls = Cell::new(0);
-            let mut reports = Plan::try_reports(&plan).expect("claims");
-            let result = App::serve(
-                plan.with_bound(listener),
-                context,
-                __W(&calls),
-                sark_fiber::Config::new(server::MAX_CONNECTIONS),
-                Policy::new(|event| reports.push(event), recover),
-                |result| {
-                    result
-                        .as_ref()
-                        .map(|_| ())
-                        .map_err(|error| error.cause())
-                        .expect("server teardown")
-                },
+            let result = server::try_serve::<App, _>(
+                plan, context, listener, __W(&calls), server::MAX_CONNECTIONS,
             );
             assert_eq!(
                 calls.get(),
                 1,
                 "only the successful response resumes ingress"
             );
-            assert!(reports.events().expect("reclaimed resources").is_empty());
             result
         },
         |address| {
@@ -65,7 +50,6 @@ fn terminal_stops_pipeline() {
                 );
             }
         },
-        |result| result.expect("server"),
     )
     .expect("pair");
 }

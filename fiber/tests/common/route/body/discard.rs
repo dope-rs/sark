@@ -1,64 +1,9 @@
-use std::{convert::Infallible, time::Duration};
-
-use dope::{
-    core::{
-        BranchError,
-        driver::{life::recovery, settings::errors},
-        io::socket::Listener,
-    },
-    manifold::BuildError,
-    runtime::shutdown,
-};
-use dope_test::reclaim;
-use sark_fiber::server::Serve as _;
-use sark_fiber::{Config, request::BodyLen};
-use sark_h1::server::{
-    listener::bind,
-    run::{self, prepare},
-};
+use sark_fiber::request::BodyLen;
 use sark_http::payload::response::status;
 
-use crate::common::{route::body::OwnedReply, server};
-
-#[derive(Debug)]
-pub enum Error {
-    Claim(errors::Claim),
-    Prepare(BranchError<prepare::Error, errors::Claim>),
-}
-
-pub fn try_serve(
-    context: shutdown::ReadySource,
-    listener: Listener,
-    recover: impl recovery::Recover,
-    finish: impl for<'a> FnOnce(
-        Result<(), run::RunCause<'a, Infallible, BranchError<Infallible, BuildError<bind::Error>>>>,
-    ),
-) -> Result<reclaim::Reports<1>, Error> {
-    let server = server::Plan::new(listener.local_addr(), Duration::from_secs(10)).build();
-    let mut reports = server::Plan::try_reports(&server).map_err(Error::Claim)?;
-    StreamDiscardDispatch::serve(
-        server.with_bound(listener),
-        context,
-        (),
-        Config::new(server::MAX_CONNECTIONS),
-        recovery::Policy::new(|event| reports.push(event), recover),
-        |outcome| finish(outcome.as_ref().map(|_| ()).map_err(|error| error.cause())),
-    )
-    .map_err(Error::Prepare)?;
-    Ok(reports)
-}
+use super::OwnedReply;
 
 pub const PING: &[u8] = b"GET /ping HTTP/1.1\r\nHost: x\r\n\r\n";
-
-#[sark_fiber::handler(pub)]
-fn ping() -> OwnedReply {
-    let mut body = Vec::new();
-    body.extend_from_slice(b"pong");
-    OwnedReply {
-        status: status::Code::OK,
-        body,
-    }
-}
 
 #[sark_fiber::request]
 pub struct UpReq {
@@ -79,7 +24,7 @@ fn up(req: UpReq) -> OwnedReply {
 
 sark_fiber::define_route! {
     pub StreamDiscardDispatch: () => {
-        GET "/ping" => ping,
+        GET "/ping" => crate::common::route::body::ping,
         POST "/up" => up,
     }
 }

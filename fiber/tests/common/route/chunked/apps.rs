@@ -244,14 +244,6 @@ fn limited(request: DiscardReq) -> OwnedReply {
     }
 }
 
-#[sark_fiber::handler(pub)]
-fn ping() -> OwnedReply {
-    OwnedReply {
-        status: status::Code::OK,
-        body: b"pong".to_vec(),
-    }
-}
-
 sark_fiber::define_route! {
     pub ChunkedDispatch<'state>: State<'state> => {
         POST "/sync" => sync_segments,
@@ -263,6 +255,6 @@ sark_fiber::define_route! {
         POST "/discard/large" => large_discard,
         POST "/expect" => fixed_echo,
         POST "/limited" => limited,
-        GET "/ping" => ping,
+        GET "/ping" => crate::common::route::body::ping,
     }
 }

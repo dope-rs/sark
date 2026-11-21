@@ -2,16 +2,6 @@ use super::OwnedReply;
 use sark_http::payload::response::status;
 
 #[sark_fiber::handler(pub)]
-fn ping() -> OwnedReply {
-    let mut body = Vec::new();
-    body.extend_from_slice(b"pong");
-    OwnedReply {
-        status: status::Code::OK,
-        body,
-    }
-}
-
-#[sark_fiber::handler(pub)]
 fn echo() -> OwnedReply {
     OwnedReply {
         status: status::Code::OK,
@@ -21,7 +11,7 @@ fn echo() -> OwnedReply {
 
 sark_fiber::define_route! {
     pub ClOverflowDispatch: () => {
-        GET "/ping" => ping,
+        GET "/ping" => crate::common::route::body::ping,
         POST "/echo" => echo,
     }
 }
