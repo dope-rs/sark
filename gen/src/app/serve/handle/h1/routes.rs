@@ -15,6 +15,7 @@ pub(super) struct Routes {
     pub(super) body_work_arms: proc_macro2::TokenStream,
     pub(super) pending_resume_arms: proc_macro2::TokenStream,
     pub(super) finish_arms: proc_macro2::TokenStream,
+    pub(super) finish_settles: bool,
     pub(super) resume_arms: proc_macro2::TokenStream,
     pub(super) cancel_arms: proc_macro2::TokenStream,
     pub(super) ready_cancel_arms: proc_macro2::TokenStream,
@@ -35,6 +36,8 @@ impl Routes {
         let v_wait = symbols.local("pending");
         let [v_ready, v_run, v_sess] = symbols.locals(["ready", "runtime", "session"]);
         let [v_this, v_write] = symbols.locals(["this", "write"]);
+        let [turn, used, reply, connection] =
+            symbols.locals(["turn", "used", "reply", "connection"]);
         let ns_core = &paths.core;
         let ns_fiber = &paths.fiber;
         let ns_h1 = &paths.h1;
@@ -51,6 +54,7 @@ impl Routes {
         let mut has_non_fiber = false;
         for route in h1.bodies() {
             let pending = &route.prepared;
+            routes.finish_settles |= !matches!(route.mode, serve::Mode::Sync);
             if let serve::Mode::Fiber { fiber, .. } = &route.mode {
                 let feed = match fiber.body {
                     inputs::Body::Discarded => quote!(try_discard),
@@ -87,14 +91,23 @@ impl Routes {
             let finish = match &route.mode {
                 serve::Mode::Sync => quote! {
                     #owner::#pending(#v_wait) => {
-                        #v_wait.respond::<#state_ty, _, _>(
-                            #v_body,
+                        return match #v_wait.respond::<#state_ty, _>(
+                            #v_body.body_len,
                             *#v_this.#f_state,
                             #v_write,
                             #v_date,
                             #v_this.#f_gzip,
                             #evidence,
-                        )
+                        ) {
+                            ::core::result::Result::Ok((#reply, #connection)) => {
+                                #reply.finish::<false, _, _>(#v_this.#f_life, #v_run.session_mut(), #v_exch);
+                                #turn.complete(#ns_h1::session::Consumption::Buffered(#used), #reply, #connection, 0)
+                            }
+                            ::core::result::Result::Err(#v_error) => {
+                                #v_exch.retire(#v_this.#f_life, #ns_core::life::Outcome::Rejected);
+                                #turn.rejected(#v_error)
+                            }
+                        };
                     }
                 },
                 serve::Mode::Fiber { task, fiber } => {
@@ -118,40 +131,31 @@ impl Routes {
                         },
                         quote!(#v_this.#f_makers.#prod),
                     );
-                    let settle = quote! {
-                        match #v_result {
-                            #ns_h1::session::BodyOutcome::Complete(#v_result) => #v_result,
-                            #ns_h1::session::BodyOutcome::Pending(#v_wait) => {
-                                return #ns_h1::session::BodyOutcome::Pending(#continuation {
-                                    exchange: #v_exch,
-                                    route: #built::#pending(#v_wait),
-                                });
+                    let [finish, resume] = [
+                        quote!(finish(#v_body, #v_run, #source, #evidence)),
+                        quote!(resume(#v_run, #source, #evidence)),
+                    ]
+                    .map(|call| {
+                        quote! {{
+                            let #v_result = {
+                                let mut #n_tasks = #tasks;
+                                #v_wait.#call
+                            };
+                            match #v_result {
+                                ::core::ops::ControlFlow::Continue(#v_result) => #v_result,
+                                ::core::ops::ControlFlow::Break(#v_wait) => {
+                                    return #turn.await_ready(#continuation {
+                                        exchange: #v_exch,
+                                        route: #built::#pending(#v_wait),
+                                    }, #used);
+                                }
                             }
-                        }
-                    };
-                    routes.resume_arms.extend(quote! {
-                        #built::#pending(#v_wait) => {
-                            let mut #n_tasks = #tasks;
-                            let #v_result = #v_wait.resume(
-                                #v_run,
-                                #source,
-                                #evidence,
-                            );
-                            #settle
-                        },
+                        }}
                     });
-                    quote! {
-                        #owner::#pending(#v_wait) => {
-                            let mut #n_tasks = #tasks;
-                            let #v_result = #v_wait.finish(
-                                #v_body,
-                                #v_run,
-                                #source,
-                                #evidence,
-                            );
-                            #settle
-                        }
-                    }
+                    routes
+                        .resume_arms
+                        .extend(quote!(#built::#pending(#v_wait) => #resume,));
+                    quote!(#owner::#pending(#v_wait) => #finish)
                 }
                 serve::Mode::Stream { task } => {
                     let task = serve::Task::new(route, task);

@@ -16,7 +16,7 @@ use common::{
         chunked::peer::Peer,
         keep::{
             self, KeepAliveDispatch, LARGE_STATIC_BODY,
-            events::{Identity, IdentityLog, Log, diagnose},
+            events::{Identity, IdentityLog, Log},
         },
     },
     server,
@@ -136,7 +136,7 @@ fn orders_owner_release() {
                     server,
                     context,
                     listener,
-                    IdentityLog(Cell::from_mut(&mut events), &audits, diagnose),
+                    IdentityLog(Cell::from_mut(&mut events), &audits),
                     &audits,
                 )
             },
@@ -170,76 +170,20 @@ fn orders_owner_release() {
         )
         .expect("orders_owner_release server shutdown");
 
-    let opened = Identity::select(&events, |event| match event {
-        Identity::Opened(ordinal) => Some(ordinal),
-        _ => None,
-    });
-    let handoffs = Identity::select(&events, |event| match event {
-        Identity::Handoff(ordinal, _) => Some(ordinal),
-        _ => None,
-    });
-    let released = Identity::select(&events, |event| match event {
-        Identity::Released(ordinal, _) => Some(ordinal),
-        _ => None,
-    });
-    let retired = Identity::select(&events, |event| match event {
-        Identity::Retired(ordinal) => Some(ordinal),
-        _ => None,
-    });
-    assert_eq!(opened, [1, 2], "pipelined exchanges");
-    assert_eq!(
-        Identity::select(&events, |event| match event {
-            Identity::Committed(ordinal) => Some(ordinal),
-            _ => None,
-        }),
-        [1, 2]
-    );
-    assert!(
-        !events
-            .iter()
-            .any(|event| matches!(event, Identity::StagingReleased(_)))
-    );
-    assert_eq!(handoffs, [1, 2], "pipelined handoffs");
-    assert_eq!(released, [1, 2], "pipelined final owners");
-    assert_eq!(retired, [1, 2], "pipelined retirements");
-    let handed = Identity::select(&events, |event| match event {
-        Identity::Handoff(_, charge) => Some(charge),
-        _ => None,
-    });
-    let released = Identity::select(&events, |event| match event {
-        Identity::Released(_, charge) => Some(charge),
-        _ => None,
-    });
-    assert!(handed == released, "transport charge drift");
-    assert!(
-        handed
-            .iter()
-            .all(|charge| !charge.is_empty() && charge.owners == 1),
-        "large responses must carry one exact runtime owner",
-    );
-    let first = events
-        .iter()
-        .position(|event| matches!(event, Identity::Released(1, _)))
-        .expect("first final-owner release");
-    let second = events
-        .iter()
-        .position(|event| *event == Identity::Opened(2))
-        .expect("second exchange open");
-    assert!(
-        first < second,
-        "the second H1 identity advanced while the first owner was live: {events:?}",
-    );
-    let last = events
-        .iter()
-        .position(|event| matches!(event, Identity::Released(2, _)))
-        .expect("second final-owner release");
-    assert!(
-        last < events
-            .iter()
-            .position(|event| *event == Identity::Closed)
-            .expect("pipelined H1 session close"),
-        "the H1 session retired before its last owner: {events:?}",
-    );
+    let mut events = events.into_iter();
+    for id in [1, 2] {
+        assert_eq!(events.next(), Some(Identity::Opened(id)));
+        assert_eq!(events.next(), Some(Identity::Committed(id)));
+        assert_eq!(events.next(), Some(Identity::Retired(id)));
+        let Some(Identity::Handoff(sent, charge)) = events.next() else {
+            panic!("missing transport handoff for exchange {id}");
+        };
+        assert_eq!(sent, id);
+        assert!(!charge.is_empty() && charge.owners == 1);
+        assert_eq!(events.next(), Some(Identity::Released(id, charge)));
+    }
+    assert_eq!(events.next(), Some(Identity::Closed));
+    assert_eq!(events.next(), None);
 }
 
 #[test]
@@ -285,7 +229,7 @@ fn disabled_omits_ledger() {
     );
     let events = Cell::new(Vec::new());
     let audits = Cell::new(None);
-    let observer = Log(&events, &audits, diagnose);
+    let observer = Log(&events, &audits);
     let observed = KeepAliveDispatch::with_observer::<wire::Identity, KeyTag<0>, _>(
         &(),
         Config::new(server::MAX_CONNECTIONS),

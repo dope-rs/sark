@@ -1,4 +1,4 @@
-use core::pin;
+use core::{ops::ControlFlow, pin};
 
 use o3::buffer::{
     Complete as _,
@@ -8,8 +8,7 @@ use sark_http::{h1::codec::canned, payload::fixed::Body};
 
 use super::{Conn, Consumption, Dispatch, Outcome, ingress::Protocol};
 use crate::{
-    Input,
-    pump::{self, Egress},
+    Input, pump,
     server::deadline,
     session, switch,
     wire::{head, output, parsing, recv},
@@ -18,7 +17,8 @@ use crate::{
 const MAX_PIPELINE: u32 = 32;
 
 enum Stop<'d> {
-    Output(Egress<'d>),
+    Output(output::Complete<'d>),
+    Wake,
     Streamed,
     Park,
     Close(Body<'d>),
@@ -136,6 +136,14 @@ impl<'input, 'd, R, P, T: switch::Engine, D: Dispatch<'d, R, P, T>>
         Flow::Fields
     }
 
+    pub fn await_ready(&mut self, ready: D::Ready, used: usize) -> Flow {
+        if let Err(end) = self.consume(Consumption::Buffered(used), 0) {
+            return end;
+        }
+        self.conn.ingress.park(Protocol::Ready(ready));
+        self.stop(Stop::Wake)
+    }
+
     pub fn await_line(&mut self) -> Flow {
         match parsing::Line::start(*self.rest) {
             Ok(line) => self.conn.ingress.park(Protocol::Line(line)),
@@ -172,12 +180,12 @@ impl<'input, 'd, R, P, T: switch::Engine, D: Dispatch<'d, R, P, T>>
             return self.close(canned::BAD_REQUEST);
         }
         if expectation.is_continue() {
-            return self.stop(Stop::Output(Egress::Static {
+            return self.stop(Stop::Output(output::Complete::Static {
                 body: crate::CONTINUE_100,
             }));
         }
         if self.conn.ingress.is_ready() {
-            return self.stop(Stop::Output(Egress::Wake));
+            return self.stop(Stop::Wake);
         }
         Flow::End
     }
@@ -204,7 +212,7 @@ impl<'input, 'd, R, P, T: switch::Engine, D: Dispatch<'d, R, P, T>>
             output::Complete::Static { body }
                 if self.output.write_slice(body.as_slice()).is_ok() => {}
             body => {
-                self.state.stop = Stop::Output(body.into());
+                self.state.stop = Stop::Output(body);
                 return Flow::Sent;
             }
         }
@@ -234,9 +242,9 @@ impl<'input, 'd, R, P, T: switch::Engine, D: Dispatch<'d, R, P, T>>
                     output::Switch::Static(body)
                         if self.output.write_slice(body.as_slice()).is_err() =>
                     {
-                        Egress::Static { body }
+                        output::Complete::Static { body }
                     }
-                    _ => Egress::None,
+                    _ => output::Complete::Inline,
                 };
                 self.state.stop = Stop::Output(egress);
                 Flow::Sent
@@ -273,19 +281,19 @@ impl<'d, Runtime: pump::Tasks, Pending, Transitions: switch::Engine, Ready, Head
         mut disp: pin::Pin<&mut D>,
         input: &[u8],
         mut write: Slice<'_, &mut usize>,
-    ) -> pump::Cycle<'d, Transitions::Staged>
+        tail: &mut pump::Tail<Transitions::Staged>,
+    ) -> Result<
+        (
+            ControlFlow<(), output::Complete<'d>>,
+            head::Connection,
+            deadline::Progress,
+        ),
+        pump::Reject,
+    >
     where
         D: Dispatch<'d, Runtime, Pending, Transitions, Ready = Ready, Head = Heads>,
     {
-        let snapshot = match self.ingress.recv.prepare(input) {
-            Ok(snapshot) => snapshot,
-            Err(error) => {
-                return pump::Cycle::rejected(
-                    error,
-                    deadline::Progress::new(deadline::Head::Ready, deadline::Body::None),
-                );
-            }
-        };
+        let snapshot = self.ingress.recv.prepare(input)?;
         let mut rest = match &snapshot {
             Some(buffer) => Input::Buffered(buffer.view()),
             None => Input::Borrowed(input),
@@ -297,7 +305,7 @@ impl<'d, Runtime: pump::Tasks, Pending, Transitions: switch::Engine, Ready, Head
         let mut state = State {
             connection: self.deferred,
             handoff: None,
-            stop: Stop::Output(Egress::None),
+            stop: Stop::Output(output::Complete::Inline),
         };
         let mut head_progress = deadline::Head::Unchanged;
         let mut body_progress = deadline::Body::None;
@@ -324,124 +332,93 @@ impl<'d, Runtime: pump::Tasks, Pending, Transitions: switch::Engine, Ready, Head
                         let input = turn.input();
                         break D::try_consume(input, &mut turn, 0);
                     };
-                    let (body, consumed) = 'body: {
-                        let line = match pending.take().0 {
-                            Protocol::PendingHead(pending) => {
-                                break 'frame D::resume_head(pending, &mut turn);
-                            }
-                            Protocol::Reject(pending) => {
-                                let input = turn.input();
-                                break 'frame turn.reject(pending.resume(input));
-                            }
-                            Protocol::Line(line) => line.advance(turn.input()),
-                            Protocol::Prefix(prefix) => {
-                                parsing::Line::prefixed(prefix, turn.input())
-                            }
-                            Protocol::Body(task) => {
-                                let done =
-                                    match turn.conn.ingress.resume_frame(turn.rest.as_slice()) {
-                                        Ok(done) => done,
-                                        Err(error) => {
-                                            turn.conn.ingress.park(Protocol::Body(task));
-                                            break 'turn Stop::Close(
-                                                turn.router.as_mut().abort_body(turn.conn, error),
-                                            );
-                                        }
-                                    };
-                                body_progress = deadline::Body::Progress;
-                                let body = turn.conn.ingress.payload.take();
-                                let task = match turn.router.as_mut().body_data(
-                                    task,
-                                    body,
-                                    &mut turn.conn.async_state,
-                                ) {
-                                    Ok(task) => task,
-                                    Err(reason) => {
-                                        turn.conn.ingress.finish_frame();
-                                        break 'turn Stop::Close(reason);
-                                    }
-                                };
-                                let Some(done) = done else {
-                                    turn.rest.consume_max(usize::MAX);
-                                    if D::has_body_work(&task) {
-                                        turn.conn.ingress.park(Protocol::Working(task));
-                                        break 'turn Stop::Output(Egress::Wake);
-                                    }
+                    let line = match pending.take().0 {
+                        Protocol::PendingHead(pending) => {
+                            break 'frame D::resume_head(pending, &mut turn);
+                        }
+                        Protocol::Reject(pending) => {
+                            let input = turn.input();
+                            break 'frame turn.reject(pending.resume(input));
+                        }
+                        Protocol::Line(line) => line.advance(turn.input()),
+                        Protocol::Prefix(prefix) => parsing::Line::prefixed(prefix, turn.input()),
+                        Protocol::Body(task) => {
+                            let done = match turn.conn.ingress.resume_frame(turn.rest.as_slice()) {
+                                Ok(done) => done,
+                                Err(error) => {
                                     turn.conn.ingress.park(Protocol::Body(task));
-                                    break 'requests;
-                                };
-                                let used = done.consumed;
-                                break 'body (
-                                    turn.router.as_mut().finish_body(
-                                        task,
-                                        done,
-                                        turn.output.reborrow(),
-                                        &mut turn.conn.async_state,
-                                    ),
-                                    used,
-                                );
-                            }
-                            Protocol::Ready(task) => {
-                                break 'body (
-                                    turn.router.as_mut().resume_body(
-                                        task,
-                                        turn.output.reborrow(),
-                                        &mut turn.conn.async_state,
-                                    ),
-                                    0,
-                                );
-                            }
-                            Protocol::Working(task) => {
-                                let task = match turn
-                                    .router
-                                    .as_mut()
-                                    .resume_pending(task, &mut turn.conn.async_state)
-                                {
-                                    Ok(task) => task,
-                                    Err(reason) => {
-                                        turn.conn.ingress.finish_frame();
-                                        break 'turn Stop::Close(reason);
-                                    }
-                                };
+                                    break 'turn Stop::Close(
+                                        turn.router.as_mut().abort_body(turn.conn, error),
+                                    );
+                                }
+                            };
+                            body_progress = deadline::Body::Progress;
+                            let body = turn.conn.ingress.payload.take();
+                            let task = match turn.router.as_mut().body_data(
+                                task,
+                                body,
+                                &mut turn.conn.async_state,
+                            ) {
+                                Ok(task) => task,
+                                Err(reason) => {
+                                    turn.conn.ingress.finish_frame();
+                                    break 'turn Stop::Close(reason);
+                                }
+                            };
+                            let Some(done) = done else {
+                                turn.rest.consume_max(usize::MAX);
                                 if D::has_body_work(&task) {
                                     turn.conn.ingress.park(Protocol::Working(task));
-                                    break 'turn Stop::Output(Egress::Wake);
+                                    break 'turn Stop::Wake;
                                 }
                                 turn.conn.ingress.park(Protocol::Body(task));
-                                continue 'requests;
-                            }
-                        };
-                        match line {
-                            Ok(parsing::LineProgress::Pending(line)) => {
-                                turn.conn.ingress.park(Protocol::Line(line));
-                                turn.rest.consume_max(usize::MAX);
-                                head_progress = deadline::Head::Pending;
                                 break 'requests;
-                            }
-                            Ok(parsing::LineProgress::Complete {
-                                source,
-                                prior,
-                                used,
-                            }) => {
-                                let result = D::consume_line(source, &mut turn, prior);
-                                if matches!(result, Flow::Fields) && used < rest.as_slice().len() {
-                                    rest.consume_max(used);
-                                    continue 'frame;
+                            };
+                            break 'frame D::finish_body(task, done, &mut turn);
+                        }
+                        Protocol::Ready(task) => {
+                            break 'frame D::resume_body(task, &mut turn);
+                        }
+                        Protocol::Working(task) => {
+                            let task = match turn
+                                .router
+                                .as_mut()
+                                .resume_pending(task, &mut turn.conn.async_state)
+                            {
+                                Ok(task) => task,
+                                Err(reason) => {
+                                    turn.conn.ingress.finish_frame();
+                                    break 'turn Stop::Close(reason);
                                 }
-                                break 'frame result;
+                            };
+                            if D::has_body_work(&task) {
+                                turn.conn.ingress.park(Protocol::Working(task));
+                                break 'turn Stop::Wake;
                             }
-                            Err(error) => break 'frame turn.reject_head(error),
+                            turn.conn.ingress.park(Protocol::Body(task));
+                            continue 'requests;
                         }
                     };
-                    match body {
-                        session::BodyOutcome::Complete(result) => break turn.apply(result, 0),
-                        session::BodyOutcome::Pending(task) => {
-                            if let Err(end) = turn.consume(Consumption::Buffered(consumed), 0) {
-                                break end;
-                            }
-                            turn.conn.ingress.park(Protocol::Ready(task));
-                            break 'turn Stop::Output(Egress::Wake);
+                    match line {
+                        Ok(parsing::LineProgress::Pending(line)) => {
+                            turn.conn.ingress.park(Protocol::Line(line));
+                            turn.rest.consume_max(usize::MAX);
+                            head_progress = deadline::Head::Pending;
+                            break 'requests;
                         }
+                        Ok(parsing::LineProgress::Complete {
+                            source,
+                            prior,
+                            used,
+                        }) => {
+                            let result = D::consume_line(source, &mut turn, prior);
+                            if matches!(result, Flow::Fields) && used < rest.as_slice().len() {
+                                rest.consume_max(used);
+                                continue 'frame;
+                            }
+                            break 'frame result;
+                        }
+                        Err(error) => break 'frame turn.reject_head(error),
                     }
                 };
                 match result {
@@ -471,8 +448,7 @@ impl<'d, Runtime: pump::Tasks, Pending, Transitions: switch::Engine, Ready, Head
         if self.ingress.is_discard() || matches!(self.ingress.window(), recv::Window::Body) {
             head_progress = deadline::Head::Body;
         }
-        let progress = deadline::Progress::new(head_progress, body_progress);
-        let tail = match (rest, handoff) {
+        let handoff = match (rest, handoff) {
             (_, None)
                 if matches!(connection, head::Connection::Close)
                     || matches!(stop, Stop::Close(_) | Stop::Rejected(_)) =>
@@ -484,9 +460,7 @@ impl<'d, Runtime: pump::Tasks, Pending, Transitions: switch::Engine, Ready, Head
             (Input::Buffered(view), _) => {
                 let used = extent - view.len();
                 drop(snapshot);
-                if let Err(error) = self.ingress.recv.consume(used) {
-                    return pump::Cycle::rejected(error, progress);
-                }
+                self.ingress.recv.consume(used)?;
                 pump::Tail::Empty
             }
             (Input::Borrowed(bytes), Some(staged)) if !bytes.is_empty() => pump::Tail::Handoff {
@@ -495,43 +469,44 @@ impl<'d, Runtime: pump::Tasks, Pending, Transitions: switch::Engine, Ready, Head
             },
             (Input::Borrowed(_), Some(_)) => pump::Tail::Empty,
             (Input::Borrowed(bytes), None) => {
-                if let Err(error) = self.ingress.absorb(bytes) {
-                    return pump::Cycle::rejected(error, progress);
-                }
+                self.ingress.absorb(bytes)?;
                 pump::Tail::Empty
             }
         };
         self.deferred = connection;
         let written = !output.is_empty();
-        let (egress, intent) = match (self.async_state.activity(), stop) {
-            (pump::Activity::Task | pump::Activity::Stream, Stop::Streamed) => {
-                (Egress::Inline, head::Connection::KeepAlive)
-            }
+        let (state, intent) = match (self.async_state.activity(), stop) {
+            (pump::Activity::Task | pump::Activity::Stream, Stop::Streamed) => (
+                ControlFlow::Continue(output::Complete::Inline),
+                head::Connection::KeepAlive,
+            ),
             (pump::Activity::Task | pump::Activity::Stream, Stop::Park) => {
-                (Egress::Wake, head::Connection::KeepAlive)
+                (ControlFlow::Break(()), head::Connection::KeepAlive)
             }
-            (_, Stop::Streamed) => (Egress::Inline, connection),
-            (_, Stop::Park | Stop::Output(Egress::None | Egress::Wake)) if written => {
-                (Egress::Inline, connection)
+            (_, Stop::Wake) if !written => (ControlFlow::Break(()), connection),
+            (_, Stop::Streamed | Stop::Park | Stop::Wake) => {
+                (ControlFlow::Continue(output::Complete::Inline), connection)
             }
-            (_, Stop::Park) => (Egress::None, connection),
-            (_, Stop::Output(egress)) => (egress, connection),
+            (_, Stop::Output(reply)) => (ControlFlow::Continue(reply), connection),
             (_, Stop::Close(reason)) if written => {
                 self.deferred_action = Some(reason);
-                (Egress::Inline, connection)
+                (ControlFlow::Continue(output::Complete::Inline), connection)
             }
             (_, Stop::Close(reason)) => {
                 self.deferred = head::Connection::Close;
-                Egress::close(reason)
+                (
+                    ControlFlow::Continue(output::Complete::fixed(reason)),
+                    self.deferred,
+                )
             }
-            (_, Stop::Rejected(error)) => return pump::Cycle::rejected(error, progress),
+            (_, Stop::Rejected(error)) => return Err(error),
         };
         transaction.commit();
-        pump::Cycle {
-            state: Ok(egress),
-            progress,
-            connection: intent,
-            tail,
-        }
+        *tail = handoff;
+        Ok((
+            state,
+            intent,
+            deadline::Progress::new(head_progress, body_progress),
+        ))
     }
 }

@@ -50,17 +50,13 @@ pub(super) fn methods(
             Ok((body, stream)) => {
                 let held = body.retention();
                 body.observe_copy(observer, exchange);
-                (Some(held), #h1::pump::Egress::from(body), deferred, stream)
+                (Some(held), body, deferred, stream)
             }
             Err(error) => {
-                let (egress, intent) = #h1::pump::Egress::close(error.body());
-                (None, egress, intent, None)
+                (None, #h1::wire::output::Complete::fixed(error.body()), #h1::wire::head::Connection::Close, None)
             }
         };
-        let charge = match held {
-            Some(#h1::wire::output::Origin::Response(owner) | #h1::wire::output::Origin::Linked(owner)) => owner.charge,
-            None => #ns::o3::buffer::hold::Charge::default(),
-        };
+        let charge = held.map(#h1::wire::output::Origin::charge).unwrap_or_default();
         state.settle(intent);
         let tag = if charge.resident_bytes == 0 {
             <<#mode as #core::life::sequence::Mode<_>>::TransportTag as Default>::default()

@@ -1,4 +1,4 @@
-use std::{cell::Cell, convert, pin::Pin};
+use std::{cell::Cell, convert, ops::ControlFlow, pin::Pin};
 
 use super::Frame;
 use conn::write;
@@ -152,6 +152,7 @@ impl<'observe: 'd, 'd, ID: route::Identity> handler::Borrowed<'d, ID> for App<'o
         let mut native = conn
             .try_output(driver, &mut native_slot)
             .expect("switch output admission");
+        let mut tail = pump::Tail::Empty;
         let receipt = {
             let (http, writer) = native.get_mut().parts();
             let mut disp = Frame {
@@ -168,15 +169,14 @@ impl<'observe: 'd, 'd, ID: route::Identity> handler::Borrowed<'d, ID> for App<'o
                 }),
                 ..Frame::default()
             };
-            http.drive(Pin::new(&mut disp), bytes, writer)
+            http.drive(Pin::new(&mut disp), bytes, writer, &mut tail)
         };
-        assert!(matches!(receipt.connection, head::Connection::KeepAlive));
-        assert!(
-            matches!(&receipt.state, Ok(pump::Egress::Static { .. })),
-            "switch must publish its exact static response owner"
-        );
-        let egress = receipt.state.expect("switch protocol state");
-        let result = payload::write::try_publish(native, egress.into_body(()), receipt.connection);
+        let (response, connection, _) = receipt.expect("protocol drive");
+        assert!(matches!(connection, head::Connection::KeepAlive));
+        let ControlFlow::Continue(body @ output::Complete::Static { .. }) = response else {
+            return receive::Outcome::Failed(receive::Failure::Contract);
+        };
+        let result = payload::write::try_publish(native, body.into_body(()), connection);
         result
             .map_err(|cause| match cause {
                 write::body::Failure::Payload(cause) => format!("payload: {cause:?}"),
@@ -188,7 +188,7 @@ impl<'observe: 'd, 'd, ID: route::Identity> handler::Borrowed<'d, ID> for App<'o
                 }
             })
             .expect("switch output");
-        let pump::Tail::Handoff { range, .. } = receipt.tail else {
+        let pump::Tail::Handoff { range, .. } = tail else {
             return receive::Outcome::Failed(receive::Failure::Contract);
         };
         let tail = chunk

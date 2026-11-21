@@ -3,7 +3,7 @@ use o3::base::cell::region;
 use sark_http::payload::response::Body as _;
 mod buffered;
 
-use std::convert;
+use std::{convert, ops::ControlFlow};
 
 use sark_core::{
     body::{
@@ -347,7 +347,7 @@ impl<'d, R: route::Spec<Request: route::Own>> Streaming<'d, R> {
         rt: &mut Runtime,
         admit: Admit,
         mut proof: E,
-    ) -> session::BodyOutcome<'d, Ready<'d, R>, D>
+    ) -> ControlFlow<Ready<'d, R>, session::Outcome<'d, D>>
     where
         Admit: FnOnce(Input<'d, R>, usize, Context, &mut Runtime) -> session::Outcome<'d, D>,
         E: credit::Evidence,
@@ -355,7 +355,7 @@ impl<'d, R: route::Spec<Request: route::Own>> Streaming<'d, R> {
         let pending = match self.try_exact(done.body_len, &mut proof) {
             Ok(pending) => pending,
             Err(reply) => {
-                return session::BodyOutcome::Complete(session::Outcome::Close(reply));
+                return ControlFlow::Continue(session::Outcome::Close(reply));
             }
         };
         Ready { pending }.complete(done.consumed, rt, admit, proof)
@@ -381,7 +381,7 @@ impl<'d, R: route::Spec<Request: route::Own>> Ready<'d, R> {
         rt: &mut Runtime,
         admit: Admit,
         proof: E,
-    ) -> session::BodyOutcome<'d, Self, D>
+    ) -> ControlFlow<Self, session::Outcome<'d, D>>
     where
         Admit: FnOnce(Input<'d, R>, usize, Context, &mut Runtime) -> session::Outcome<'d, D>,
         E: credit::Evidence,
@@ -395,7 +395,7 @@ impl<'d, R: route::Spec<Request: route::Own>> Ready<'d, R> {
         rt: &mut Runtime,
         admit: Admit,
         mut proof: E,
-    ) -> session::BodyOutcome<'d, Self, D>
+    ) -> ControlFlow<Self, session::Outcome<'d, D>>
     where
         Admit: FnOnce(Input<'d, R>, usize, Context, &mut Runtime) -> session::Outcome<'d, D>,
         E: credit::Evidence,
@@ -446,8 +446,8 @@ impl<'d, R: route::Spec<Request: route::Own>> Ready<'d, R> {
             Err(admit(Input::Ready { request }, used, response, rt))
         });
         match result {
-            Ok(pending) => session::BodyOutcome::Pending(Self { pending }),
-            Err(outcome) => session::BodyOutcome::Complete(outcome),
+            Ok(pending) => ControlFlow::Break(Self { pending }),
+            Err(outcome) => ControlFlow::Continue(outcome),
         }
     }
 }

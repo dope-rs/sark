@@ -18,23 +18,28 @@ use o3::{
 };
 use write::body;
 
-use crate::{pump, server::payload, wire::head};
+use crate::{
+    server::payload,
+    wire::{head, output::Complete},
+};
 
-impl<'d> pump::Egress<'d> {
+impl<'d> Complete<'d> {
     #[inline(always)]
     pub fn into_body<K: Copy>(self, tag: K) -> Option<payload::Body<'d, K>> {
         match self {
-            Self::None | Self::Wake | Self::Inline => None,
+            Self::Inline | Self::Copy { .. } => None,
             Self::Static { body } => Some(payload::Body::Shared {
                 owner: resident::Shared::from(body.as_slice()),
                 tag,
             }),
-            Self::Shared { body } => Some(payload::Body::Shared {
+            Self::Shared { body } | Self::Owned { body, .. } => Some(payload::Body::Shared {
                 owner: resident::Shared::from(body),
                 tag,
             }),
-            Self::Frozen { body } => Some(payload::Body::Frozen { owner: body, tag }),
-            Self::Segmented { body } => body.take().map(|body| payload::Body::duplex(body, tag)),
+            Self::Compressed { body, .. } => Some(payload::Body::Frozen { owner: body, tag }),
+            Self::Segments { body } | Self::Linked { body } => {
+                body.take().map(|body| payload::Body::duplex(body, tag))
+            }
         }
     }
 }

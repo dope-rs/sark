@@ -13,7 +13,7 @@ use common::{
         chunked::peer::Peer,
         keep::{
             KeepAliveDispatch,
-            events::{Log, MALFORMED_CHUNK, PENDING, Reservation, diagnose, diagnose_h1},
+            events::{Log, MALFORMED_CHUNK, PENDING, Reservation, diagnose_h1},
         },
     },
     server::{self, Plan},
@@ -56,7 +56,7 @@ fn retires_body() {
                     &(),
                     sark_fiber::Config::new(server::MAX_CONNECTIONS),
                     Reservation::new(
-                        Log(&events, &audits, diagnose),
+                        Log(&events, &audits),
                         ready.handle(),
                         closed.handle(),
                         &balance,
@@ -346,7 +346,7 @@ fn resume_failure() {
                 context,
                 listener,
                 &state,
-                Log(&log, &audits, diagnose),
+                Log(&log, &audits),
                 server::reporting(&mut reports),
                 |result| result.expect("observed server"),
             )

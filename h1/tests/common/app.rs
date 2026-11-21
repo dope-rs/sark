@@ -267,21 +267,17 @@ impl<'a: 'd, 'd> session::Dispatch<'d, (), Infallible> for App<'a> {
     }
 
     fn finish_body(
-        self: Pin<&mut Self>,
         wait: Infallible,
         _: session::Complete,
-        _: o3::buffer::write::Slice<'_, &mut usize>,
-        _: &mut (),
-    ) -> session::BodyOutcome<'d, Self::Ready> {
+        _: &mut session::Turn<'_, '_, 'd, (), Infallible, sark_h1::switch::Disabled, Self>,
+    ) -> session::Flow {
         match wait {}
     }
 
     fn resume_body(
-        self: Pin<&mut Self>,
         ready: Self::Ready,
-        _: o3::buffer::write::Slice<'_, &mut usize>,
-        _: &mut (),
-    ) -> session::BodyOutcome<'d, Self::Ready> {
+        _: &mut session::Turn<'_, '_, 'd, (), Infallible, sark_h1::switch::Disabled, Self>,
+    ) -> session::Flow {
         match ready {}
     }
 }

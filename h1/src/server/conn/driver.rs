@@ -1,4 +1,4 @@
-use std::{mem, pin};
+use std::{mem, ops::ControlFlow, pin};
 
 use conn::write::{self, body};
 use dope::{
@@ -9,7 +9,7 @@ use dope::{
         wire,
     },
 };
-use o3::buffer::{hold, resident};
+use o3::buffer::resident;
 use wire::receive::discard;
 
 use crate::{
@@ -168,39 +168,34 @@ where
             Ok(native) => native,
             Err(cause) => break 'output cause,
         };
-        let (cycle, tag, sent) = {
-            let (state, writer) = native.get_mut().parts();
-            let cycle = state.drive(routes.as_mut(), bytes, writer);
-            let charge = match cycle.state.as_ref() {
-                Ok(pump::Egress::Shared { body }) => {
-                    crate::wire::output::Owner::shared(body).charge
+        let (state, writer) = native.get_mut().parts();
+        let mut drive = Drive::new(Flow::Continue);
+        let (body, sent, wake, connection) =
+            match state.drive(routes.as_mut(), bytes, writer, &mut drive.tail) {
+                Ok((reply, connection, progress)) => {
+                    drive.progress = progress;
+                    match reply {
+                        ControlFlow::Continue(crate::wire::output::Complete::Inline) => {
+                            (None, None, Ok(false), connection)
+                        }
+                        ControlFlow::Continue(reply) => {
+                            let charge = reply.retention().charge();
+                            let sent = (charge.resident_bytes != 0).then(|| {
+                                routes.as_mut().response_tag(&mut state.async_state, charge)
+                            });
+                            (
+                                reply.into_body(sent.unwrap_or_default()),
+                                sent,
+                                Ok(false),
+                                connection,
+                            )
+                        }
+                        ControlFlow::Break(()) => (None, None, Ok(true), connection),
+                    }
                 }
-                Ok(pump::Egress::Frozen { body }) => {
-                    crate::wire::output::Owner::shared(body).charge
-                }
-                Ok(pump::Egress::Segmented { body }) => body.charge(),
-                _ => hold::Charge::default(),
+                Err(cause) => (None, None, Err(cause), crate::wire::head::Connection::Close),
             };
-            let (tag, sent) = if charge.resident_bytes == 0 {
-                (H::TransportTag::default(), None)
-            } else {
-                let tag = routes.as_mut().response_tag(&mut state.async_state, charge);
-                (tag, Some(tag))
-            };
-            (cycle, tag, sent)
-        };
-        let pump::Cycle {
-            progress,
-            state,
-            connection,
-            tail,
-        } = cycle;
-        let (egress, state) = match state {
-            Ok(egress) => (egress, Ok(())),
-            Err(cause) => (pump::Egress::None, Err(cause)),
-        };
-        let wake = matches!(egress, pump::Egress::Wake);
-        if let Err(cause) = payload::write::try_publish(native, egress.into_body(tag), connection) {
+        if let Err(cause) = payload::write::try_publish(native, body, connection) {
             if let Some(tag) = sent {
                 routes
                     .as_mut()
@@ -209,13 +204,14 @@ where
             conn.reject_write(cause);
             return Drive::new(Flow::Closed);
         }
-        if wake {
-            conn.wake_target().wake();
-        }
-        if let Err(error) = state {
-            routes.as_mut().failure(&crate::wire::Failure::Pump(error));
-            conn.close_after();
-            return Drive::new(Flow::Closed);
+        match wake {
+            Ok(true) => conn.wake_target().wake(),
+            Ok(false) => {}
+            Err(error) => {
+                routes.as_mut().failure(&crate::wire::Failure::Pump(error));
+                conn.close_after();
+                return Drive::new(Flow::Closed);
+            }
         }
         if let Some(tag) = sent {
             routes
@@ -227,11 +223,7 @@ where
         {
             conn.state_mut().ingress.end_discard();
         }
-        return Drive {
-            flow: Flow::Continue,
-            tail,
-            progress,
-        };
+        return drive;
     };
     match admission {
         write::error::Admission::Deferred(_) => {

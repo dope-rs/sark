@@ -3,16 +3,9 @@
 use core::convert::Infallible;
 use std::{mem, ops};
 
-use o3::buffer::storage;
-use sark_http::{
-    h1::switch::Kind,
-    payload::{compress, fixed, owned},
-};
+use sark_http::{h1::switch::Kind, payload::fixed};
 
-use crate::{
-    server::deadline,
-    wire::{head, output},
-};
+use crate::server::deadline;
 
 mod reject;
 
@@ -76,50 +69,6 @@ impl Tasks for () {
 
 const _: () = assert!(mem::size_of::<Activity>() == 1);
 
-/// Transport-independent command produced by one pump cycle.
-pub enum Egress<'d> {
-    None,
-    /// The runtime parked work and needs its target scheduled.
-    Wake,
-    Inline,
-    Static {
-        body: fixed::Body<'d>,
-    },
-    Shared {
-        body: storage::Shared,
-    },
-    Frozen {
-        body: compress::Frozen,
-    },
-    Segmented {
-        body: owned::Segments<'d>,
-    },
-}
-
-impl<'d> From<output::Complete<'d>> for Egress<'d> {
-    fn from(response: output::Complete<'d>) -> Self {
-        use output::Complete;
-        match response {
-            Complete::Inline | Complete::Copy { .. } => Self::Inline,
-            Complete::Static { body } => Self::Static { body },
-            Complete::Shared { body } | Complete::Owned { body, .. } => Self::Shared { body },
-            Complete::Compressed { body, .. } => Self::Frozen { body },
-            Complete::Segments { body } | Complete::Linked { body } => Self::Segmented { body },
-        }
-    }
-}
-
-impl<'d> Egress<'d> {
-    pub fn close(reason: fixed::Body<'d>) -> (Self, head::Connection) {
-        let action = if reason.is_empty() {
-            Self::None
-        } else {
-            Self::Static { body: reason }
-        };
-        (action, head::Connection::Close)
-    }
-}
-
 /// Exact bounded-retention result before any transport output is constructed.
 pub struct Retention {
     pub(crate) state: Result<(), Reject>,
@@ -137,26 +86,6 @@ const _: () = {
     assert!(mem::align_of::<Tail>() == mem::align_of::<usize>());
     assert!(mem::size_of::<Tail<Infallible>>() <= mem::size_of::<Tail<()>>());
 };
-
-/// Result of one ingress or buffered-resume transaction.
-#[must_use = "the pump cycle contains transport output and connection intents"]
-pub struct Cycle<'d, H = Infallible> {
-    pub state: Result<Egress<'d>, Reject>,
-    pub progress: deadline::Progress,
-    pub connection: head::Connection,
-    pub tail: Tail<H>,
-}
-
-impl<'d, H> Cycle<'d, H> {
-    pub(crate) fn rejected(error: Reject, progress: deadline::Progress) -> Self {
-        Self {
-            state: Err(error),
-            progress,
-            connection: head::Connection::Close,
-            tail: Tail::Empty,
-        }
-    }
-}
 
 /// Work that cannot commit a raw-protocol switch.
 #[must_use = "send completion may require a close response or buffered-input resume"]

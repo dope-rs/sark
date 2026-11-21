@@ -5,12 +5,10 @@ use std::mem;
 use common::{Request, body::Retain};
 use dope_test::alloc::Tracker;
 use o3::buffer::{Complete as _, storage};
-use sark_core::body::credit;
 use sark_h1::{
     Input, session,
     wire::parsing::{self, framing, raw},
 };
-use sark_http::payload::owned;
 
 #[global_allocator]
 static ALLOCATOR: Tracker = Tracker::new();
@@ -39,25 +37,14 @@ fn retention_follows_window() {
         });
         assert_eq!(allocs, expected);
         assert!(fixture.state.get().0.is_null());
-        let mut pending = pending.ok().expect("pending body");
+        let pending = pending.ok().expect("pending body");
         assert_eq!(pending.head_len() as usize, Request::HEAD.len());
         conn.retire();
         drop(owner);
         input.fill(0);
 
-        let body = storage::Shared::try_copy(b"z").expect("body storage");
-        assert!(
-            pending
-                .push_body(owned::Segments::from(body), credit::Disabled::new())
-                .is_ok()
-        );
-        let (outcome, allocs) = Tracker::count(|| fixture.finish(pending));
-        assert_eq!(allocs, 0);
-        assert!(matches!(outcome, session::Outcome::Complete { .. }));
-        let (retained, headers, body) = fixture.state.get();
-        assert!(!retained.is_null());
+        let retained = fixture.finish(pending);
         assert_eq!(retained == pointer, expected == 0);
-        assert!(headers && body, "retained request headers and body");
     }
 }
 
@@ -82,24 +69,13 @@ fn retains_fragmented_head() {
         })
         .ok()
         .expect("head resumed");
-    let mut pending = outcome
+    let pending = outcome
         .continue_value()
         .expect("completed head")
         .ok()
         .expect("pending body");
     conn.retire();
-    let body = storage::Shared::try_copy(b"z").expect("body storage");
-    assert!(
-        pending
-            .push_body(owned::Segments::from(body), credit::Disabled::new())
-            .is_ok()
-    );
-    let (outcome, allocs) = Tracker::count(|| fixture.finish(pending));
-    assert_eq!(allocs, 0);
-    assert!(matches!(outcome, session::Outcome::Complete { .. }));
-    let (pointer, headers, body) = fixture.state.get();
-    assert!(!pointer.is_null());
-    assert!(headers && body, "retained request headers and body");
+    fixture.finish(pending);
 }
 
 const _: () = {

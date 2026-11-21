@@ -76,7 +76,7 @@ pub fn record(client: impl FnOnce(std::net::SocketAddr)) -> Vec<&'static str> {
                 plan,
                 context,
                 listener,
-                events::Log(Cell::from_mut(&mut events), &audits, events::diagnose),
+                events::Log(Cell::from_mut(&mut events), &audits),
                 &audits,
             )
         },

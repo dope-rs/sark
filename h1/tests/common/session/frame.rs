@@ -2,7 +2,7 @@ use std::{convert::Infallible, pin::Pin};
 
 use o3::buffer::storage::range;
 use sark_h1::{
-    Input, pump, session,
+    Input, session,
     session::{Conn, Consumption, Dispatch, Outcome},
     switch,
     wire::{Failure, InputError, head, output},
@@ -46,12 +46,30 @@ impl<'d> Frame<'d> {
         &mut self,
         conn: &mut Conn<'d, (), Infallible, T>,
         input: &[u8],
-    ) -> pump::Cycle<'d, T::Staged> {
-        conn.drive(
-            Pin::new(self),
-            input,
-            o3::buffer::write::Slice::new(&mut [0; 2048]).reborrow(),
+    ) -> (output::Complete<'d>, head::Connection) {
+        let (reply, connection, _) = conn
+            .drive(
+                Pin::new(self),
+                input,
+                o3::buffer::write::Slice::new(&mut [0; 2048]).reborrow(),
+                &mut sark_h1::pump::Tail::Empty,
+            )
+            .expect("protocol drive");
+        (
+            reply.continue_value().expect("immediate response"),
+            connection,
         )
+    }
+
+    pub fn rejects<T: switch::Engine<Raw = Infallible>>(
+        &mut self,
+        conn: &mut Conn<'d, (), Infallible, T>,
+        input: &[u8],
+    ) {
+        let (reply, connection) = self.drive(conn, input);
+        assert!(matches!(connection, head::Connection::Close));
+        assert!(matches!(reply, output::Complete::Static { body }
+            if body.as_slice() == canned::BAD_REQUEST.as_slice()));
     }
 }
 
@@ -127,21 +145,17 @@ impl<'d, Raw: Unpin, Head: Unpin, T: switch::Engine<Raw = Raw>> Dispatch<'d, (),
     }
 
     fn finish_body(
-        self: Pin<&mut Self>,
         pending: Infallible,
         _: session::Complete,
-        _: o3::buffer::write::Slice<'_, &mut usize>,
-        _: &mut (),
-    ) -> session::BodyOutcome<'d, Self::Ready, Raw> {
+        _: &mut session::Turn<'_, '_, 'd, (), Infallible, T, Self>,
+    ) -> session::Flow {
         match pending {}
     }
 
     fn resume_body(
-        self: Pin<&mut Self>,
         ready: Self::Ready,
-        _: o3::buffer::write::Slice<'_, &mut usize>,
-        _: &mut (),
-    ) -> session::BodyOutcome<'d, Self::Ready, Raw> {
+        _: &mut session::Turn<'_, '_, 'd, (), Infallible, T, Self>,
+    ) -> session::Flow {
         match ready {}
     }
 }

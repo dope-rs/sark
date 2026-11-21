@@ -1,6 +1,6 @@
 //! HTTP/1 routing contracts and connection ownership.
 use core::{convert::Infallible, pin};
-use o3::buffer::{Complete as _, hold, write::Slice};
+use o3::buffer::{Complete as _, hold};
 
 use sark_core::life::{self, exchange, sequence};
 use sark_http::{
@@ -144,12 +144,6 @@ pub struct Complete {
     pub consumed: usize,
 }
 
-/// One bounded step after request framing has completed.
-pub enum BodyOutcome<'d, P, D = Infallible> {
-    Complete(Outcome<'d, D>),
-    Pending(P),
-}
-
 /// Static dispatch seam between the protocol and generated router.
 pub trait Dispatch<'d, Runtime, Pending = (), Transitions: switch::Engine = switch::Disabled>:
     Sized
@@ -213,17 +207,13 @@ pub trait Dispatch<'d, Runtime, Pending = (), Transitions: switch::Engine = swit
     ) -> Result<Pending, fixed::Body<'d>>;
 
     fn finish_body(
-        self: pin::Pin<&mut Self>,
         pending: Pending,
         complete: Complete,
-        write: Slice<'_, &mut usize>,
-        runtime: &mut Runtime,
-    ) -> BodyOutcome<'d, Self::Ready, Transitions::Raw>;
+        turn: &mut Turn<'_, '_, 'd, Runtime, Pending, Transitions, Self>,
+    ) -> Flow;
 
     fn resume_body(
-        self: pin::Pin<&mut Self>,
         ready: Self::Ready,
-        write: Slice<'_, &mut usize>,
-        runtime: &mut Runtime,
-    ) -> BodyOutcome<'d, Self::Ready, Transitions::Raw>;
+        turn: &mut Turn<'_, '_, 'd, Runtime, Pending, Transitions, Self>,
+    ) -> Flow;
 }

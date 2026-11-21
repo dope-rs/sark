@@ -44,7 +44,6 @@ pub(super) fn build<'view, 'source>(
     let wait = &proto.connections.pending;
     let policy = &proto.transition_policy;
     let egress = types.routing.egress_bound;
-    let raw = quote!(<#policy as #ns_h1::switch::Engine>::Raw);
     let conn = &proto.connections.http_connection;
     let rt = &route.runtime;
     let turn = quote!(#ns_h1::session::Turn<'_, '_, 'd, #rt, #wait, #policy, Self>);
@@ -68,16 +67,24 @@ pub(super) fn build<'view, 'source>(
     let ready = &proto.connections.ready;
     let head = &proto.connections.head;
     let resume = &routes.resume_arms;
+    let used = symbols.local("used");
     let settled = quote! {
         #v_result.settle::<false, _, _>(#v_this.#f_life, #v_run.session_mut(), #v_exch);
-        #ns_h1::session::BodyOutcome::Complete(#v_result)
+        #v_turn.apply(#v_result, 0)
     };
-    let finish_body = (!finish.is_empty()).then_some(&settled);
+    let finish_body = quote!(match #v_wait.route { #finish });
+    let finish_body = if routes.finish_settles {
+        quote! { let #v_result = #finish_body; #settled }
+    } else {
+        finish_body
+    };
     let build = if resume.is_empty() {
         quote!(match #v_ready {})
     } else {
         quote! {
-            let mut #v_this = #v_routes.as_mut().project();
+            let mut #v_this = #v_turn.router.as_mut().get_mut().app.as_mut().project();
+            let #v_run = &mut #v_turn.conn.async_state;
+            let #used = 0;
             let #v_exch = #v_ready.exchange;
             let #v_result = match #v_ready.route { #resume };
             #settled
@@ -245,35 +252,28 @@ pub(super) fn build<'view, 'source>(
             }
 
             fn finish_body(
-                self: ::core::pin::Pin<&mut Self>,
                 #v_wait: #wait,
                 #v_body: #ns_h1::session::Complete,
-                #v_write: #ns_http::o3::buffer::write::Slice<'_, &mut usize>,
-                #v_run: &mut #rt,
-            ) -> #ns_h1::session::BodyOutcome<'d, #ready, #raw> {
-                let #v_routes = self.get_mut();
-                let #v_date = #v_routes.date.load();
-                let #v_date = &#v_date;
-                let mut #v_routes = #v_routes.app.as_mut();
-                let mut #v_this = #v_routes.as_mut().project();
+                #v_turn: &mut #turn,
+            ) -> #ns_h1::session::Flow {
+                let #v_routes = #v_turn.router.as_mut().get_mut();
+                let #v_date = &#v_routes.date.load();
+                let mut #v_this = #v_routes.app.as_mut().project();
+                let #v_run = &mut #v_turn.conn.async_state;
+                let #v_write = #v_turn.output.reborrow();
+                let #used = #v_body.consumed;
                 let #v_exch = #v_wait.exchange;
                 #ns_core::life::Mode::observe(
                     #v_this.#f_life,
                     #ns_core::life::Event::InputFinished(#v_exch),
                 );
-                let #v_result = match #v_wait.route {
-                    #finish
-                };
                 #finish_body
             }
 
             fn resume_body(
-                self: ::core::pin::Pin<&mut Self>,
                 #v_ready: Self::Ready,
-                _: #ns_http::o3::buffer::write::Slice<'_, &mut usize>,
-                #v_run: &mut #rt,
-            ) -> #ns_h1::session::BodyOutcome<'d, #ready, #raw> {
-                let mut #v_routes = self.get_mut().app.as_mut();
+                #v_turn: &mut #turn,
+            ) -> #ns_h1::session::Flow {
                 #build
             }
 

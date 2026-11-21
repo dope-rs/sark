@@ -43,6 +43,13 @@ pub enum Origin {
     Linked(Owner),
 }
 
+impl Origin {
+    pub const fn charge(self) -> hold::Charge {
+        let (Self::Response(owner) | Self::Linked(owner)) = self;
+        owner.charge
+    }
+}
+
 /// Encoded response body and its ownership evidence.
 pub enum Complete<'d> {
     Inline,
@@ -72,6 +79,14 @@ pub enum Complete<'d> {
 }
 
 impl<'d> Complete<'d> {
+    pub fn fixed(body: fixed::Body<'d>) -> Self {
+        if body.is_empty() {
+            Self::Inline
+        } else {
+            Self::Static { body }
+        }
+    }
+
     const fn copied(len: usize) -> Self {
         Self::Copy {
             copy: evidence::Copy {

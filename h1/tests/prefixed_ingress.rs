@@ -4,11 +4,8 @@ use std::convert::Infallible;
 
 use common::session::Frame;
 use dope_test::alloc::Tracker;
-use sark_h1::{pump, session::Conn, wire::head};
-use sark_http::{
-    h1::codec::canned,
-    preface::{Prefix, Read},
-};
+use sark_h1::{session::Conn, wire::output};
+use sark_http::preface::{Prefix, Read};
 
 #[global_allocator]
 static ALLOCATOR: Tracker = Tracker::new();
@@ -22,13 +19,11 @@ fn joins_the_prior_prefix_at_the_existing_line_owner() {
         let valid = prefix.as_ref() == b"P";
         let mut handler = Frame::reject();
         handler.input = valid.then_some(b"POST /x HTTP/1.1\r\n".as_slice());
-        let (cycle, allocations) = Tracker::count(|| {
+        let ((), allocations) = Tracker::count(|| {
             let mut conn = Conn::<(), Infallible>::prefixed(prefix);
-            handler.drive(&mut conn, b"OST /x HTTP/1.1\r\nHost: x\r\n\r\nbody")
+            handler.rejects(&mut conn, b"OST /x HTTP/1.1\r\nHost: x\r\n\r\nbody")
         });
         assert_eq!(handler.calls, usize::from(valid));
-        assert!(matches!(cycle.state, Ok(pump::Egress::Static { body, .. })
-            if body.as_slice() == canned::BAD_REQUEST.as_slice()));
         assert_eq!(allocations, usize::from(valid));
     }
 }
@@ -42,10 +37,8 @@ fn retains_prefix_until_output_capacity_returns() {
     conn.retain(b"OST /x HTTP/1.1\r\nHost: x\r\n\r\n");
     let mut handler = Frame::reject();
     handler.input = Some(b"POST /x HTTP/1.1\r\n");
-    let cycle = handler.drive(&mut conn, &[]);
+    handler.rejects(&mut conn, &[]);
     assert_eq!(handler.calls, 1);
-    assert!(matches!(cycle.state, Ok(pump::Egress::Static { body, .. })
-        if body.as_slice() == canned::BAD_REQUEST.as_slice()));
 }
 
 #[test]
@@ -62,14 +55,11 @@ fn resumes_only_through_the_first_line_ending() {
             let mut handler = Frame::reject();
             handler.input = Some(expected);
             let mut conn = Conn::<(), Infallible>::prefixed(prefix);
-            let first = handler.drive(&mut conn, &tail[..split]);
-            assert!(matches!(first.state, Ok(pump::Egress::None)));
+            let (first, _) = handler.drive(&mut conn, &tail[..split]);
+            assert!(matches!(first, output::Complete::Inline));
             assert_eq!(handler.calls, 0);
-            let cycle = handler.drive(&mut conn, &tail[split..]);
+            handler.rejects(&mut conn, &tail[split..]);
             assert_eq!(handler.calls, usize::from(ending == b'\n'));
-            assert!(matches!(cycle.connection, head::Connection::Close));
-            assert!(matches!(cycle.state, Ok(pump::Egress::Static { body, .. })
-                if body.as_slice() == canned::BAD_REQUEST.as_slice()));
         }
     }
 }

@@ -1,4 +1,4 @@
-use std::{cell::Cell, convert::Infallible, pin::Pin};
+use std::{cell::Cell, convert::Infallible, ops::ControlFlow, pin::Pin};
 
 use dope::core::driver::schedule::sequence;
 use sark_core::{body::credit, manifold::task::request::Input, route};
@@ -181,34 +181,31 @@ impl<'d, R: route::Spec<Request: route::Own<RawParams = (), Mode = route::Stream
         };
         let mut conn = Connection::default();
         for part in [first, last].into_iter().filter(|part| !part.is_empty()) {
-            let cycle = conn.drive(
-                Pin::new(&mut carrier),
-                part,
-                o3::buffer::write::Slice::new(&mut [0; 2048]).reborrow(),
-            );
-            if let Some(error) = carrier.error.take() {
-                return Err(error);
-            }
-            cycle.state.map_err(Error::Ingress)?;
+            carrier.receive(&mut conn, part)?;
         }
         let consumed = carrier.consumed;
         let input = carrier.input.take().ok_or(Error::Input { request: 0 })?;
         carrier.id = sequence.try_next().map_err(Error::Identity)?;
-        let cycle = conn.drive(
-            Pin::new(&mut carrier),
-            &[],
-            o3::buffer::write::Slice::new(&mut [0; 2048]).reborrow(),
-        );
-        if let Some(error) = carrier.error.take() {
-            return Err(error);
-        }
-        cycle.state.map_err(Error::Ingress)?;
+        carrier.receive(&mut conn, &[])?;
         Ok((
             input,
             consumed,
             carrier.input.take().ok_or(Error::Input { request: 1 })?,
             carrier.consumed,
         ))
+    }
+
+    fn receive(&mut self, conn: &mut Connection<'d, R>, bytes: &[u8]) -> Result<()> {
+        let result = conn.drive(
+            Pin::new(&mut *self),
+            bytes,
+            o3::buffer::write::Slice::new(&mut [0; 2048]).reborrow(),
+            &mut pump::Tail::Empty,
+        );
+        if let Some(error) = self.error.take() {
+            return Err(error);
+        }
+        result.map(|_| ()).map_err(Error::Ingress)
     }
 
     fn admit(
@@ -304,25 +301,37 @@ where
     }
 
     fn finish_body(
-        self: Pin<&mut Self>,
         pending: task::Pending<'d, R>,
         complete: session::Complete,
-        _: o3::buffer::write::Slice<'_, &mut usize>,
-        runtime: &mut (),
-    ) -> session::BodyOutcome<'d, Self::Ready> {
-        let this = self.get_mut();
-        let admit = |input, consumed, response, _: &mut ()| this.admit(input, consumed, response);
-        pending.finish(complete, runtime, admit, credit::Disabled::new())
+        turn: &mut session::Turn<'_, '_, 'd, (), task::Pending<'d, R>, switch::Disabled, Self>,
+    ) -> session::Flow {
+        let used = complete.consumed;
+        let this = turn.router.as_mut().get_mut();
+        let result = pending.finish(
+            complete,
+            &mut turn.conn.async_state,
+            |input, consumed, response, _| this.admit(input, consumed, response),
+            credit::Disabled::new(),
+        );
+        match result {
+            ControlFlow::Continue(action) => turn.apply(action, 0),
+            ControlFlow::Break(ready) => turn.await_ready(ready, used),
+        }
     }
 
     fn resume_body(
-        self: Pin<&mut Self>,
         ready: Self::Ready,
-        _: o3::buffer::write::Slice<'_, &mut usize>,
-        runtime: &mut (),
-    ) -> session::BodyOutcome<'d, Self::Ready> {
-        let this = self.get_mut();
-        let admit = |input, consumed, response, _: &mut ()| this.admit(input, consumed, response);
-        ready.resume(runtime, admit, credit::Disabled::new())
+        turn: &mut session::Turn<'_, '_, 'd, (), task::Pending<'d, R>, switch::Disabled, Self>,
+    ) -> session::Flow {
+        let this = turn.router.as_mut().get_mut();
+        let result = ready.resume(
+            &mut turn.conn.async_state,
+            |input, consumed, response, _| this.admit(input, consumed, response),
+            credit::Disabled::new(),
+        );
+        match result {
+            ControlFlow::Continue(action) => turn.apply(action, 0),
+            ControlFlow::Break(ready) => turn.await_ready(ready, 0),
+        }
     }
 }

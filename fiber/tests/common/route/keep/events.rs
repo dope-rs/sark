@@ -30,10 +30,9 @@ fn write(message: fmt::Arguments<'_>) {
 }
 
 #[derive(Clone, Copy)]
-pub struct Log<'a, 'name, D>(
+pub struct Log<'a, 'name>(
     pub &'a Cell<Vec<&'name str>>,
     pub &'a Cell<Option<audit::Snapshot>>,
-    pub D,
 );
 
 type Counts = (usize, u32);
@@ -153,49 +152,27 @@ pub enum Identity {
     Closed,
 }
 
-impl Identity {
-    pub fn select<T>(events: &[Identity], op: impl FnMut(Identity) -> Option<T>) -> Vec<T> {
-        events.iter().copied().filter_map(op).collect()
-    }
-}
-
 #[derive(Clone, Copy)]
-pub struct IdentityLog<'a, D>(
+pub struct IdentityLog<'a>(
     pub &'a Cell<Vec<Identity>>,
     pub &'a Cell<Option<audit::Snapshot>>,
-    pub D,
 );
 
-impl<'d, ID: route::Identity, D: Fn(&dyn fmt::Debug)> life::Observer<conn::Id<'d, ID>, u64>
-    for IdentityLog<'_, D>
-{
+impl<'d, ID: route::Identity> life::Observer<conn::Id<'d, ID>, u64> for IdentityLog<'_> {
     fn observe(&mut self, event: life::Event<conn::Id<'d, ID>, u64>) {
         use sark_core::life::Event;
-        use sark_http::owner::{Change, cause};
+        use sark_http::owner::Change;
 
         let fact = match event {
             Event::ExchangeOpened(exchange) => Identity::Opened(exchange.stream()),
             Event::ResponseCommitted { exchange, .. } => Identity::Committed(exchange.stream()),
             Event::ResponseOwnership(effect) => match effect.change() {
-                Change::StagingAcquired(
-                    cause::Acquire::Committed | cause::Acquire::Split | cause::Acquire::StreamChunk,
-                ) => return,
+                Change::StagingAcquired(_) => return,
                 Change::Handoff => Identity::Handoff(effect.key().stream(), effect.charge()),
-                Change::StagingReleased(
-                    cause::Staging::TransportAccepted
-                    | cause::Staging::Buffered
-                    | cause::Staging::Reset
-                    | cause::Staging::Closed
-                    | cause::Staging::PeerRetired,
-                ) => Identity::StagingReleased(effect.key().stream()),
-                Change::TransportReleased(
-                    cause::Transport::Sent
-                    | cause::Transport::Acked
-                    | cause::Transport::Stopped
-                    | cause::Transport::Reset
-                    | cause::Transport::Closed
-                    | cause::Transport::PeerRetired,
-                ) => Identity::Released(effect.key().stream(), effect.charge()),
+                Change::StagingReleased(_) => Identity::StagingReleased(effect.key().stream()),
+                Change::TransportReleased(_) => {
+                    Identity::Released(effect.key().stream(), effect.charge())
+                }
             },
             Event::ExchangeRetired(exchange) => Identity::Retired(exchange.stream()),
             Event::SessionClosed(_) => Identity::Closed,
@@ -205,7 +182,7 @@ impl<'d, ID: route::Identity, D: Fn(&dyn fmt::Debug)> life::Observer<conn::Id<'d
     }
 
     fn diagnostic<E: fmt::Debug>(&mut self, cause: &E) {
-        (self.2)(cause);
+        diagnose(cause);
     }
 
     fn audit(&mut self, _: conn::Id<'d, ID>, state: audit::Snapshot) {
@@ -213,11 +190,9 @@ impl<'d, ID: route::Identity, D: Fn(&dyn fmt::Debug)> life::Observer<conn::Id<'d
     }
 }
 
-impl<'d, ID: route::Identity, D: Fn(&dyn fmt::Debug)> life::Observer<conn::Id<'d, ID>, u64>
-    for Log<'_, '_, D>
-{
+impl<'d, ID: route::Identity> life::Observer<conn::Id<'d, ID>, u64> for Log<'_, '_> {
     fn observe(&mut self, event: life::Event<conn::Id<'d, ID>, u64>) {
-        use sark_http::owner::{Change, cause};
+        use sark_http::owner::Change;
 
         let name = match event {
             life::Event::SessionOpened(_) => "session-opened",
@@ -231,25 +206,10 @@ impl<'d, ID: route::Identity, D: Fn(&dyn fmt::Debug)> life::Observer<conn::Id<'d
             life::Event::InputFinished(_) => "input-finished",
             life::Event::ResponseCommitted { .. } => "response-committed",
             life::Event::ResponseOwnership(effect) => match effect.change() {
-                Change::StagingAcquired(
-                    cause::Acquire::Committed | cause::Acquire::Split | cause::Acquire::StreamChunk,
-                ) => return,
+                Change::StagingAcquired(_) => return,
                 Change::Handoff => "response-handoff",
-                Change::StagingReleased(
-                    cause::Staging::TransportAccepted
-                    | cause::Staging::Buffered
-                    | cause::Staging::Reset
-                    | cause::Staging::Closed
-                    | cause::Staging::PeerRetired,
-                ) => return,
-                Change::TransportReleased(
-                    cause::Transport::Sent
-                    | cause::Transport::Acked
-                    | cause::Transport::Stopped
-                    | cause::Transport::Reset
-                    | cause::Transport::Closed
-                    | cause::Transport::PeerRetired,
-                ) => "response-transport-released",
+                Change::StagingReleased(_) => return,
+                Change::TransportReleased(_) => "response-transport-released",
             },
             life::Event::Terminal { .. } => "terminal",
             life::Event::ExchangeRetired(_) => "exchange-retired",
@@ -260,7 +220,7 @@ impl<'d, ID: route::Identity, D: Fn(&dyn fmt::Debug)> life::Observer<conn::Id<'d
     }
 
     fn diagnostic<E: fmt::Debug>(&mut self, cause: &E) {
-        (self.2)(cause);
+        diagnose(cause);
     }
 
     fn audit(&mut self, _: conn::Id<'d, ID>, state: audit::Snapshot) {

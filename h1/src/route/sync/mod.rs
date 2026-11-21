@@ -14,20 +14,19 @@ use sark_http::{
 
 use crate::{
     route::{Pending, PolicyOf},
-    session,
-    wire::{Failure, output},
+    wire::{Failure, head, output, parsing::Rejection},
 };
 
 impl<'d, R: route::Spec> Pending<'d, R> {
-    pub fn respond<S, E, D>(
+    pub fn respond<S, E>(
         self,
-        done: session::Complete,
+        body_len: usize,
         state: &S,
         write: Slice<'_, &mut usize>,
         date: &[u8; 29],
         gzip: &mut impl compress::Compression,
         mut proof: E,
-    ) -> session::Outcome<'d, D>
+    ) -> Result<(output::Complete<'d>, head::Connection), Rejection<'d>>
     where
         E: credit::Evidence,
         R: manifold::Route<S> + route::Spec<Kind = dispatch::Sync> + PolicyOf,
@@ -38,11 +37,8 @@ impl<'d, R: route::Spec> Pending<'d, R> {
             content_length,
             body: mut owner,
         } = self;
-        let mut body = match Self::admit(&mut owner, done.body_len, content_length, &mut proof) {
-            Ok(body) => body,
-            Err(error) => return error.into(),
-        };
-        let ready = match <<R::Request as route::Schema>::Body as body::Project>::try_project(
+        let mut body = Self::admit(&mut owner, body_len, content_length, &mut proof)?;
+        let ready = <<R::Request as route::Schema>::Body as body::Project>::try_project(
             &mut body,
             (
                 head.borrow(),
@@ -62,13 +58,9 @@ impl<'d, R: route::Spec> Pending<'d, R> {
                     R::POLICY,
                 )
             },
-        ) {
-            Ok(Ok(ready)) => ready,
-            Ok(Err(error)) => return session::Outcome::Failed(error),
-            Err(failure) => {
-                return session::Outcome::Failed(Failure::Projection(failure.discard()));
-            }
-        };
+        )
+        .map_err(|failure| Rejection::Failed(Failure::Projection(failure.discard())))?
+        .map_err(Rejection::Failed)?;
         let ready = match ready {
             ControlFlow::Continue(ready) => {
                 drop(owner);
@@ -78,16 +70,13 @@ impl<'d, R: route::Spec> Pending<'d, R> {
                 let body = owner;
                 let actual = body.len();
                 if actual != declared {
-                    return session::Outcome::Failed(Failure::Admission(
+                    return Err(Rejection::Failed(Failure::Admission(
                         body::Error::LengthMismatch { actual, declared },
-                    ));
+                    )));
                 }
                 output::Complete::Linked { body }
             }
         };
-        ready.into_consume(
-            session::Consumption::Buffered(done.consumed),
-            response.connection(),
-        )
+        Ok((ready, response.connection()))
     }
 }

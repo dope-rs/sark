@@ -4,6 +4,7 @@ use std::{
     cell::Cell,
     convert::{self, Infallible},
     num::NonZero,
+    ops::ControlFlow,
     str,
 };
 
@@ -238,7 +239,7 @@ fn body_yields() {
                 },
                 &mut evidence,
             );
-            let session::BodyOutcome::Pending(ready) = outcome else {
+            let ControlFlow::Break(ready) = outcome else {
                 panic!("body assembly must yield on its first step");
             };
             assert_eq!(STEPS.get(), 1);
@@ -251,7 +252,7 @@ fn body_yields() {
                 },
                 &mut evidence,
             );
-            let session::BodyOutcome::Pending(ready) = outcome else {
+            let ControlFlow::Break(ready) = outcome else {
                 panic!("body assembly must yield on its second step");
             };
             assert_eq!(STEPS.get(), 2);
@@ -277,7 +278,7 @@ fn body_yields() {
             );
             assert!(matches!(
                 outcome,
-                session::BodyOutcome::Complete(session::Outcome::Park { consumed: 0, .. })
+                ControlFlow::Continue(session::Outcome::Park { consumed: 0, .. })
             ));
             assert_eq!(STEPS.get(), 3);
             assert_eq!(FINISHES.get(), 1);
@@ -378,7 +379,7 @@ fn buffered_body_starts_at_fin() {
                             tasks::admit_buffered,
                             &mut evidence,
                         );
-                        let session::BodyOutcome::Complete(outcome) = outcome else {
+                        let ControlFlow::Continue(outcome) = outcome else {
                             panic!("buffered input admits directly at FIN");
                         };
                         let retained = credit::Amount::new(1, segments::Count::ONE);

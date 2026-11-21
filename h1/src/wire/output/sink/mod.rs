@@ -195,11 +195,7 @@ where
         let (_, encoded) = emit_head::<_, bool>(self.out, self.date, status, &fields, body.len())
             .map_err(Error::Wire)?;
         identity(self.date.response, encoded)?;
-        Ok(ControlFlow::Continue(if body.is_empty() {
-            Complete::Inline
-        } else {
-            Complete::Static { body }
-        }))
+        Ok(ControlFlow::Continue(Complete::fixed(body)))
     }
 
     fn encoded<const EXACT: bool>(

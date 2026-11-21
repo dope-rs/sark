@@ -1,3 +1,5 @@
+use std::ops::ControlFlow;
+
 use o3::buffer::segments::assembly;
 use sark_core::{
     body::{self, admit, buffered, credit, input},
@@ -117,7 +119,7 @@ impl<'d, R: route::Spec<Request: route::Own>> Pending<'d, R> {
         rt: &mut Runtime,
         admit: Admit,
         mut proof: E,
-    ) -> session::BodyOutcome<'d, super::Ready<'d, R>, D>
+    ) -> ControlFlow<super::Ready<'d, R>, session::Outcome<'d, D>>
     where
         Admit: FnOnce(Input<'d, R>, usize, Context, &mut Runtime) -> session::Outcome<'d, D>,
         E: credit::Evidence,
@@ -167,7 +169,7 @@ impl<'d, R: route::Spec<Request: route::Own>> Pending<'d, R> {
                 rt,
             )
         });
-        session::BodyOutcome::Complete(result)
+        ControlFlow::Continue(result)
     }
 }
 

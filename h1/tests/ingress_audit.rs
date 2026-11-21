@@ -17,8 +17,9 @@ fn bounded_head_total() {
         Pin::new(&mut pending),
         b"head",
         o3::buffer::write::Slice::new(&mut [0; 1]).reborrow(),
+        &mut sark_h1::pump::Tail::Empty,
     );
-    assert!(cycle.state.is_ok());
+    assert!(cycle.is_ok());
     let _ = conn.retain(b"x");
 
     let snapshot = conn.ingress.audit(|_| 0, |_| 0, |_| u32::MAX);
