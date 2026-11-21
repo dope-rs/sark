@@ -4,9 +4,12 @@ use data::compose;
 use dope::{
     core::driver::{self, route::Identity},
     manifold::network::listener::{conn, handler},
-    net::{link::egress::data, wire},
+    net::{
+        link::{egress::data, slot::types::CloseGate},
+        wire,
+    },
 };
-use o3::buffer::resident::bound;
+use o3::buffer::{resident::bound, storage};
 use sark_core::duplex::{self, machine};
 
 use crate::{
@@ -14,6 +17,89 @@ use crate::{
     server::{duplex::Runtime, payload},
     session, switch,
 };
+
+impl<'d, State: pump::Tasks, Pending, Transitions: switch::Engine, Ready, Heads>
+    session::Conn<'d, State, Pending, Transitions, Ready, Heads>
+{
+    pub fn http_close_gate(&self) -> CloseGate {
+        if self.ingress.is_discard() || self.has_http_work() {
+            CloseGate::Deferred
+        } else {
+            CloseGate::Immediate
+        }
+    }
+}
+
+impl<'d, State, Pending, D, Ready, Heads>
+    session::Conn<'d, State, Pending, switch::Enabled<D>, Ready, Heads>
+{
+    /// Transfers the staged protocol and retained input on the final transport drain.
+    pub fn finish_switch<'a, ID: Identity, W: wire::Spec, B: data::raw::Payload<'d>>(
+        conn: &'a mut conn::Drained<'_, '_, '_, '_, '_, 'd, ID, W, Self, B>,
+    ) -> Option<(&'a mut D, Option<storage::Shared>)> {
+        let state = conn.state_mut();
+        let raw = state.transitions.commit()?;
+        Some((raw, state.ingress.recv.take_ready()))
+    }
+}
+
+impl<'d, State: pump::Tasks, Pending, D: duplex::Session<'d>, Ready, Heads>
+    session::Conn<'d, State, Pending, switch::Enabled<machine::Machine<'d, D>>, Ready, Heads>
+{
+    pub fn close_gate(&self) -> CloseGate {
+        if self.http_close_gate() == CloseGate::Deferred {
+            return CloseGate::Deferred;
+        }
+        match self.raw() {
+            Ok(raw) if raw.progress() == machine::Progress::Finished => CloseGate::Immediate,
+            Err(switch::Mode::Http) => CloseGate::Immediate,
+            Ok(_) | Err(switch::Mode::Switching(_)) => CloseGate::Deferred,
+        }
+    }
+
+    pub fn is_blocked(&self) -> bool {
+        match self.raw() {
+            Ok(raw) => {
+                raw.hold() == machine::Hold::Held
+                    || matches!(raw.access(), machine::Access::Blocked)
+            }
+            Err(switch::Mode::Http) => false,
+            Err(switch::Mode::Switching(_)) => true,
+        }
+    }
+
+    #[inline(always)]
+    pub fn send_drained<ID: Identity, W: wire::Spec, B: data::raw::Payload<'d>>(
+        mut conn: conn::Drained<'_, '_, '_, '_, '_, 'd, ID, W, Self, B>,
+    ) -> handler::PostDrain {
+        let progress = if let Some((raw, tail)) = Self::finish_switch(&mut conn) {
+            if let Some(tail) = tail {
+                match raw.input() {
+                    machine::Access::Vacant(slot) => slot.commit(tail.into()),
+                    machine::Access::Blocked => {
+                        conn.close_after();
+                        return handler::PostDrain::Idle;
+                    }
+                }
+            }
+            raw.progress()
+        } else {
+            if conn.state_mut().resume_after_drain() {
+                return handler::PostDrain::Activate;
+            }
+            match conn.state().raw() {
+                Ok(raw) => raw.progress(),
+                Err(switch::Mode::Http | switch::Mode::Switching(_)) => {
+                    return handler::PostDrain::Idle;
+                }
+            }
+        };
+        match progress {
+            machine::Progress::Turn => handler::PostDrain::Activate,
+            machine::Progress::Idle | machine::Progress::Finished => handler::PostDrain::Idle,
+        }
+    }
+}
 
 /// Applies listener lifetime events to one exact H1 connection.
 pub trait Drain<'d, ID: Identity, B, K = ()>: Sized
@@ -38,15 +124,10 @@ where
         _: &mut driver::Context<'_, 'd>,
         _: &mut Vec<u8>,
     ) -> handler::Drain {
-        let state = conn.state();
-        if state.can_resume() {
-            conn.close_after();
-            return handler::Drain::Pending;
-        }
-        let result = match (state.async_state.activity(), state.deferred_action.as_ref()) {
-            (pump::Activity::Idle, None) => handler::Drain::Complete,
-            (pump::Activity::Idle, Some(_))
-            | (pump::Activity::Task | pump::Activity::Stream, _) => handler::Drain::Pending,
+        let result = if conn.state().has_http_work() {
+            handler::Drain::Pending
+        } else {
+            handler::Drain::Complete
         };
         conn.close_after();
         result
@@ -88,34 +169,23 @@ where
         scratch: &mut Vec<u8>,
     ) -> handler::Drain {
         conn.close_after();
-        let mode = conn.state().mode();
-        if matches!(mode, switch::Mode::Raw(_)) {
+        if matches!(conn.state().mode(), switch::Mode::Raw(_)) {
             return Runtime::<_, K>::new(&mut conn, scratch).finish_input(driver);
         }
         let state = conn.state_mut();
         if state.can_resume() {
             return handler::Drain::Pending;
         }
-        match state.transitions.active_mut() {
-            Ok(raw) => match raw.finish(()) {
-                Ok((finish, ())) => finish.commit(),
-                Err((machine::FinishError::Finished | machine::FinishError::Closed, ())) => {}
-            },
-            Err(switch::Mode::Http) => {}
+        if let Ok(raw) = state.staged_mut() {
+            if let Ok((finish, ())) = raw.finish(()) {
+                finish.commit();
+            }
+            return handler::Drain::Pending;
         }
-        match (
-            state.async_state.activity(),
-            state.deferred_action.as_ref(),
-            mode,
-        ) {
-            (pump::Activity::Idle, None, switch::Mode::Http) => handler::Drain::Complete,
-            (
-                pump::Activity::Idle,
-                None | Some(_),
-                switch::Mode::Switching(_) | switch::Mode::Raw(_),
-            )
-            | (pump::Activity::Idle, Some(_), switch::Mode::Http)
-            | (pump::Activity::Task | pump::Activity::Stream, _, _) => handler::Drain::Pending,
+        if state.deferred_action.is_some() || state.async_state.activity() != pump::Activity::Idle {
+            handler::Drain::Pending
+        } else {
+            handler::Drain::Complete
         }
     }
 }

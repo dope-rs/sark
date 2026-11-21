@@ -24,18 +24,12 @@ fn resumes_stream_after_final_drain() {
     conn.async_state.insert(runtime::Running::Body(()));
     conn.settle(head::Connection::Close);
     conn.defer(canned::BAD_REQUEST);
-    assert!(matches!(pump::Drain::progress(&mut conn), pump::Next::None));
-    assert!(matches!(
-        pump::Drain::complete(&mut conn),
-        pump::Completion::Resume
-    ));
+    assert!(matches!(conn.write_progress(), pump::Next::None));
+    assert!(conn.resume_after_drain());
     assert!(conn.async_state.take().is_some());
+    assert!(conn.resume_after_drain());
     assert!(matches!(
-        pump::Drain::complete(&mut conn),
-        pump::Completion::Resume
-    ));
-    assert!(matches!(
-        pump::Drain::progress(&mut conn),
+        conn.write_progress(),
         pump::Next::Close(reason) if reason == canned::BAD_REQUEST
     ));
     assert!(conn.action().is_some());
@@ -55,8 +49,8 @@ fn http_stays_closed() {
     ));
     assert_eq!(handler.calls, 1);
     assert!(handler.reported.is_none());
-    assert!(matches!(pump::Drain::progress(&mut conn), pump::Next::None));
-    assert!(matches!(pump::Drain::progress(&mut conn), pump::Next::None));
+    assert!(matches!(conn.write_progress(), pump::Next::None));
+    assert!(matches!(conn.write_progress(), pump::Next::None));
 }
 
 #[test]
@@ -73,11 +67,8 @@ fn switching_stays_closed() {
     ));
     assert_eq!(handler.calls, 1);
     assert!(handler.reported.is_none());
-    assert!(matches!(pump::Drain::progress(&mut conn), pump::Next::None));
-    assert!(matches!(
-        pump::Drain::complete(&mut conn),
-        pump::Completion::None
-    ));
+    assert!(matches!(conn.write_progress(), pump::Next::None));
+    assert!(!conn.resume_after_drain());
     assert!(matches!(conn.mode(), switch::Mode::Http));
 }
 
@@ -165,10 +156,8 @@ fn rejects_terminal_cursor() {
         let reason = conn.action().expect("pending close").as_slice();
         assert_eq!(reason, canned::BAD_REQUEST.as_slice());
         for _ in 0..2 {
-            assert!(
-                matches!(pump::Drain::progress(&mut conn), pump::Next::Close(body)
-                if std::ptr::eq(body.as_slice(), reason))
-            );
+            assert!(matches!(conn.write_progress(), pump::Next::Close(body)
+                if std::ptr::eq(body.as_slice(), reason)));
         }
     }
 }

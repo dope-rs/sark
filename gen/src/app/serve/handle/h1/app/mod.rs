@@ -325,7 +325,7 @@ pub(super) fn build(
             let [n_prog, v_action] = symbols.locals(["__progress", "action"]);
             let [v_bytes, v_chunk] = symbols.locals(["bytes", "chunk"]);
             let v_prefix = symbols.local("prefix");
-            let [v_raw, v_tail] = symbols.locals(["raw", "tail"]);
+            let v_raw = symbols.local("raw");
             let [l_wire, l_scope] = symbols.lives(["__w", "__scope"]);
             let g_r = types.names.generics.ident("__R");
             let ns_http = &paths.http;
@@ -377,7 +377,7 @@ pub(super) fn build(
             let http_drained = enter(
                 None,
                 quote!(#ns_fiber::dope::manifold::network::listener::handler::PostDrain::Idle),
-                &h1_mut,
+                &quote!(let #v_link = #v_link.map_state(#mixed_conn::h1_mut);),
             );
             let h1_stamp = mixed.then(|| {
                 quote! {
@@ -483,73 +483,17 @@ pub(super) fn build(
                     }
                 },
             };
-            let pending = quote! {
-                #v_link.state().can_resume()
-                    || #v_link.state().action().is_some()
-                    || ::core::matches!(
-                        #ns_h1::pump::Tasks::activity(&#v_link.state().async_state),
-                        #ns_h1::pump::Activity::Task | #ns_h1::pump::Activity::Stream
-                    )
-            };
-            let eof = match duplex {
-                duplex::State::Enabled => quote! {
-                    if !(#pending) && ::core::matches!(
-                        #v_link.state().mode(),
-                        #ns_h1::switch::Mode::Raw(_)
-                    ) {
-                        #ns_h1::server::duplex::Runtime::<_, #tag>::new(&mut #v_link, #scratch)
-                            .finish_input(#v_driver);
-                    }
-                },
-                duplex::State::Disabled => proc_macro2::TokenStream::new(),
-            };
-            let eof = quote! {
-                #v_link.state_mut().ingress.end_discard();
-                #eof
-            };
-            let gate = match duplex {
-                duplex::State::Enabled => quote! {
-                    match #v_link.state().raw() {
-                        ::core::result::Result::Ok(#v_raw) => match #v_raw.progress() {
-                            #ns_core::duplex::machine::Progress::Finished => {
-                                #ns_fiber::dope::net::link::slot::types::CloseGate::Immediate
-                            }
-                            #ns_core::duplex::machine::Progress::Idle
-                            | #ns_core::duplex::machine::Progress::Turn => {
-                                #ns_fiber::dope::net::link::slot::types::CloseGate::Deferred
-                            }
-                        },
-                        ::core::result::Result::Err(#ns_h1::switch::Mode::Http) => {
-                            #ns_fiber::dope::net::link::slot::types::CloseGate::Immediate
-                        }
-                        ::core::result::Result::Err(#ns_h1::switch::Mode::Switching(_)) => {
-                            #ns_fiber::dope::net::link::slot::types::CloseGate::Deferred
-                        }
-                    }
-                },
-                duplex::State::Disabled => {
-                    quote!(#ns_fiber::dope::net::link::slot::types::CloseGate::Immediate)
-                }
-            };
-            let gate = quote! {
-                if #v_link.state().ingress.is_discard() || #pending {
-                    #ns_fiber::dope::net::link::slot::types::CloseGate::Deferred
-                } else {
-                    #gate
-                }
-            };
-            let recv = match duplex {
-                duplex::State::Enabled => quote! {
-                        match #v_link.state().raw() {
-                            ::core::result::Result::Ok(#v_raw) => {
-                                ::core::matches!(#v_raw.hold(), #ns_core::duplex::machine::Hold::Held)
-                                    || ::core::matches!(#v_raw.access(), #ns_core::duplex::machine::Access::Blocked)
-                            }
-                            ::core::result::Result::Err(#ns_h1::switch::Mode::Http) => false,
-                            ::core::result::Result::Err(#ns_h1::switch::Mode::Switching(_)) => true,
-                        }
-                },
-                duplex::State::Disabled => quote!(false),
+            let (eof, gate, recv) = match duplex {
+                duplex::State::Enabled => (
+                    quote!(#ns_h1::server::duplex::Runtime::<_, #tag>::new(&mut #v_link, #scratch).eof(#v_driver);),
+                    quote!(#v_link.state().close_gate()),
+                    quote!(#v_link.state().is_blocked()),
+                ),
+                duplex::State::Disabled => (
+                    quote!(#v_link.state_mut().ingress.end_discard();),
+                    quote!(#v_link.state().http_close_gate()),
+                    quote!(false),
+                ),
             };
             let recv = (mixed || matches!(duplex, duplex::State::Enabled)).then(|| {
                 quote! {
@@ -848,17 +792,6 @@ pub(super) fn build(
                     }
                 },
             };
-            let progress = quote! {
-                match #v_raw.progress() {
-                    #ns_core::duplex::machine::Progress::Turn => {
-                        #ns_fiber::dope::manifold::network::listener::handler::PostDrain::Activate
-                    }
-                    #ns_core::duplex::machine::Progress::Idle
-                    | #ns_core::duplex::machine::Progress::Finished => {
-                        #ns_fiber::dope::manifold::network::listener::handler::PostDrain::Idle
-                    }
-                }
-            };
             let drains = mixed.then(|| {
                 quote! {
                     fn drains(#v_link: &Self::Conn) -> ::core::primitive::bool {
@@ -879,7 +812,7 @@ pub(super) fn build(
 
                         fn send_drained<#g_event>(
                             self: ::core::pin::Pin<&mut Self>,
-                            mut #v_link: #ns_fiber::dope::manifold::network::listener::conn::Drained<
+                            #v_link: #ns_fiber::dope::manifold::network::listener::conn::Drained<
                                 #g_event,
                                 '_,
                                 '_,
@@ -893,45 +826,7 @@ pub(super) fn build(
                             >,
                         ) -> #ns_fiber::dope::manifold::network::listener::handler::PostDrain {
                             #http_drained
-                            match #ns_h1::pump::Drain::complete(#v_link.state_mut()) {
-                                    #ns_h1::pump::Completion::None => {
-                                        match #v_link.state().raw() {
-                                            ::core::result::Result::Ok(#v_raw) => { #progress }
-                                            ::core::result::Result::Err(#ns_h1::switch::Mode::Http
-                                            | #ns_h1::switch::Mode::Switching(_)) => {
-                                                #ns_fiber::dope::manifold::network::listener::handler::PostDrain::Idle
-                                            }
-                                        }
-                                    }
-                                    #ns_h1::pump::Completion::Resume => {
-                                        #ns_fiber::dope::manifold::network::listener::handler::PostDrain::Activate
-                                    }
-                                    #ns_h1::pump::Completion::Switch => {
-                                        let #v_tail = #v_link.state_mut().take_input();
-                                        match #v_link.state_mut().raw_mut() {
-                                            ::core::result::Result::Ok(#v_raw) => {
-                                                match #v_tail {
-                                                    ::core::option::Option::Some(#v_tail) => match #v_raw.input() {
-                                                        #ns_core::duplex::machine::Access::Vacant(#v_slot) => {
-                                                            #v_slot.commit(#ns_http::payload::owned::Segments::from(#v_tail));
-                                                            { #progress }
-                                                        }
-                                                        #ns_core::duplex::machine::Access::Blocked => {
-                                                            #v_link.close_after();
-                                                            #ns_fiber::dope::manifold::network::listener::handler::PostDrain::Idle
-                                                        }
-                                                    },
-                                                    ::core::option::Option::None => { #progress },
-                                                }
-                                            }
-                                            ::core::result::Result::Err(#ns_h1::switch::Mode::Http
-                                            | #ns_h1::switch::Mode::Switching(_)) => {
-                                                #v_link.close_after();
-                                                #ns_fiber::dope::manifold::network::listener::handler::PostDrain::Idle
-                                            }
-                                        }
-                                    }
-                            }
+                            #ns_h1::session::Conn::send_drained(#v_link)
                         }
                     }
                 },

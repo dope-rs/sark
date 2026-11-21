@@ -14,10 +14,8 @@ use crate::{
     wire::{head, output},
 };
 
-mod drain;
 mod reject;
 
-pub use drain::Drain;
 pub use reject::Reject;
 
 /// Exact disposition before an HTTP ingress drive acquires transport output.
@@ -158,15 +156,6 @@ impl<'d, H> Cycle<'d, H> {
             tail: Tail::Empty,
         }
     }
-}
-
-/// Work after the transport completes a write submission.
-#[must_use = "final drain may require another turn or a protocol switch"]
-pub enum Completion {
-    None,
-    Resume,
-    /// A switching response committed its raw-protocol owner.
-    Switch,
 }
 
 /// Work that cannot commit a raw-protocol switch.

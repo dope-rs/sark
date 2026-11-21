@@ -20,11 +20,6 @@ pub enum Mode<R = Kind, S = Kind> {
     Raw(R),
 }
 
-pub enum Commit {
-    Ordinary,
-    Switch,
-}
-
 enum Phase {
     Switching,
     Raw,
@@ -64,13 +59,6 @@ impl<D> Enabled<D> {
         match &mut self.0 {
             Some((Phase::Raw, _, duplex)) => Ok(duplex),
             Some((Phase::Switching, kind, _)) => Err(Mode::Switching(*kind)),
-            None => Err(Mode::Http),
-        }
-    }
-
-    pub(crate) fn active_mut(&mut self) -> Result<&mut D, Mode<Infallible, Infallible>> {
-        match &mut self.0 {
-            Some((_, _, duplex)) => Ok(duplex),
             None => Err(Mode::Http),
         }
     }

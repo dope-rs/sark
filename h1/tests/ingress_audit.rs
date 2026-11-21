@@ -2,14 +2,17 @@ pub mod common;
 
 use std::{convert::Infallible, pin::Pin};
 
-use common::session::audit::Pending;
+use common::session::Frame;
 use sark_core::life::audit::Snapshot;
 use sark_h1::{session, switch};
 
 #[test]
 fn bounded_head_total() {
     let mut conn = session::Conn::<(), Infallible, switch::Disabled, Infallible, ()>::default();
-    let mut pending = Pending;
+    let mut pending = Frame {
+        head: Some(()),
+        ..Frame::default()
+    };
     let cycle = conn.drive(
         Pin::new(&mut pending),
         b"head",

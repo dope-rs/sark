@@ -1,7 +1,6 @@
 //! HTTP/1 connection root.
 use core::{convert::Infallible, mem};
 
-use o3::buffer::storage;
 use sark_http::{h1::switch::Kind, payload::fixed};
 
 use crate::{
@@ -206,13 +205,41 @@ impl<'d, Runtime, Pending, D, Ready, Heads>
     pub fn staged_mut(&mut self) -> Result<&mut D, switch::Mode<Kind, Infallible>> {
         self.transitions.staged_mut()
     }
+}
 
-    /// Takes input received after the HTTP request boundary, or `None` for the
-    /// HTTP and switching modes, which own no tail to hand over.
-    pub fn take_input(&mut self) -> Option<storage::Shared> {
-        match switch::Engine::mode(&self.transitions) {
-            switch::Mode::Raw(_) => self.ingress.recv.take_ready(),
-            switch::Mode::Http | switch::Mode::Switching(_) => None,
+impl<'d, Runtime: pump::Tasks, Pending, Transitions: switch::Engine, Ready, Heads>
+    Conn<'d, Runtime, Pending, Transitions, Ready, Heads>
+{
+    pub(crate) fn has_http_work(&self) -> bool {
+        self.can_resume()
+            || self.deferred_action.is_some()
+            || self.async_state.activity() != pump::Activity::Idle
+    }
+
+    pub fn write_progress(&mut self) -> pump::Next<'d> {
+        if matches!(self.mode(), switch::Mode::Switching(_))
+            || self.async_state.activity() == pump::Activity::Stream
+        {
+            return pump::Next::None;
+        }
+        self.pending_write()
+    }
+
+    /// HTTP work to activate once every transport output owner has drained.
+    pub fn resume_after_drain(&mut self) -> bool {
+        self.async_state.activity() == pump::Activity::Stream
+            || !matches!(self.pending_write(), pump::Next::None)
+    }
+
+    fn pending_write(&mut self) -> pump::Next<'d> {
+        if let Some(reason) = self.deferred_action {
+            self.deferred = head::Connection::Close;
+            return pump::Next::Close(reason);
+        }
+        if self.deferred == head::Connection::KeepAlive && self.can_resume() {
+            pump::Next::Resume
+        } else {
+            pump::Next::None
         }
     }
 }

@@ -12,13 +12,26 @@ use sark_http::{
     payload::{fixed, owned},
 };
 
-#[derive(Default)]
-pub struct Frame<'d> {
-    pub next: Option<Outcome<'d>>,
+pub struct Frame<'d, Raw = Infallible, Head = Infallible> {
+    pub next: Option<Outcome<'d, Raw>>,
+    pub head: Option<Head>,
     pub after: usize,
     pub input: Option<&'d [u8]>,
     pub calls: usize,
     pub reported: Option<Option<range::Error>>,
+}
+
+impl<Raw, Head> Default for Frame<'_, Raw, Head> {
+    fn default() -> Self {
+        Self {
+            next: None,
+            head: None,
+            after: 0,
+            input: None,
+            calls: 0,
+            reported: None,
+        }
+    }
 }
 
 impl<'d> Frame<'d> {
@@ -42,9 +55,11 @@ impl<'d> Frame<'d> {
     }
 }
 
-impl<'d, T: switch::Engine<Raw = Infallible>> Dispatch<'d, (), Infallible, T> for Frame<'d> {
+impl<'d, Raw: Unpin, Head: Unpin, T: switch::Engine<Raw = Raw>> Dispatch<'d, (), Infallible, T>
+    for Frame<'d, Raw, Head>
+{
     type Ready = Infallible;
-    type Head = Infallible;
+    type Head = Head;
 
     fn failure(self: Pin<&mut Self>, cause: &Failure) -> fixed::Body<'d> {
         let range = match cause {
@@ -58,12 +73,12 @@ impl<'d, T: switch::Engine<Raw = Infallible>> Dispatch<'d, (), Infallible, T> fo
     fn resume_head(
         self: Pin<&mut Self>,
         pending: Self::Head,
-        _: Permit,
+        permit: Permit,
         _: Input<'_>,
         _: o3::buffer::write::Slice<'_, &mut usize>,
-        _: &mut Conn<'d, (), Infallible, T>,
-    ) -> session::RouteOutcome<'d, Infallible, Infallible, Self::Head, parsing::Rejected<'d>> {
-        match pending {}
+        _: &mut Conn<'d, (), Infallible, T, Infallible, Head>,
+    ) -> session::RouteOutcome<'d, Infallible, Raw, Head, parsing::Rejected<'d>> {
+        session::RouteOutcome::AwaitHead { permit, pending }
     }
 
     fn try_consume(
@@ -71,12 +86,15 @@ impl<'d, T: switch::Engine<Raw = Infallible>> Dispatch<'d, (), Infallible, T> fo
         permit: Permit,
         input: Input<'_>,
         mut write: o3::buffer::write::Slice<'_, &mut usize>,
-        _: &mut Conn<'d, (), Infallible, T>,
-    ) -> session::RouteOutcome<'d, Infallible, Infallible, Self::Head, parsing::Rejected<'d>> {
+        _: &mut Conn<'d, (), Infallible, T, Infallible, Head>,
+    ) -> session::RouteOutcome<'d, Infallible, Raw, Head, parsing::Rejected<'d>> {
         let this = self.get_mut();
         this.calls += 1;
         if let Some(expected) = this.input {
             assert_eq!(input.as_slice(), expected);
+        }
+        if let Some(pending) = this.head.take() {
+            return session::RouteOutcome::AwaitHead { permit, pending };
         }
         if this.calls > this.after
             && let Some(next) = this.next.take()
@@ -121,7 +139,7 @@ impl<'d, T: switch::Engine<Raw = Infallible>> Dispatch<'d, (), Infallible, T> fo
         _: Permit,
         _: o3::buffer::write::Slice<'_, &mut usize>,
         _: &mut (),
-    ) -> session::BodyOutcome<'d, Self::Ready> {
+    ) -> session::BodyOutcome<'d, Self::Ready, Raw> {
         match pending {}
     }
 
@@ -131,7 +149,7 @@ impl<'d, T: switch::Engine<Raw = Infallible>> Dispatch<'d, (), Infallible, T> fo
         _: session::Permit,
         _: o3::buffer::write::Slice<'_, &mut usize>,
         _: &mut (),
-    ) -> session::BodyOutcome<'d, Self::Ready> {
+    ) -> session::BodyOutcome<'d, Self::Ready, Raw> {
         match ready {}
     }
 }

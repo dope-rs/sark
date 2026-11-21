@@ -15,7 +15,6 @@ pub trait Engine {
         &mut self,
         next: switch::Transition<Self::Raw>,
     ) -> Result<Self::Staged, switch::Error<Self::Raw>>;
-    fn commit(&mut self) -> switch::Commit;
 }
 
 impl Engine for switch::Disabled {
@@ -31,10 +30,6 @@ impl Engine for switch::Disabled {
         next: switch::Transition<Self::Raw>,
     ) -> Result<Self::Staged, switch::Error<Self::Raw>> {
         match next.duplex {}
-    }
-
-    fn commit(&mut self) -> switch::Commit {
-        switch::Commit::Ordinary
     }
 }
 
@@ -61,14 +56,14 @@ impl<D> Engine for switch::Enabled<D> {
         self.0 = Some((Phase::Switching, next.kind, next.duplex));
         Ok(())
     }
+}
 
-    fn commit(&mut self) -> switch::Commit {
-        match &mut self.0 {
-            Some((phase @ Phase::Switching, ..)) => {
-                *phase = Phase::Raw;
-                switch::Commit::Switch
-            }
-            _ => switch::Commit::Ordinary,
-        }
+impl<D> switch::Enabled<D> {
+    pub(crate) fn commit(&mut self) -> Option<&mut D> {
+        let (phase @ Phase::Switching, _, raw) = self.0.as_mut()? else {
+            return None;
+        };
+        *phase = Phase::Raw;
+        Some(raw)
     }
 }

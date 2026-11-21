@@ -139,6 +139,17 @@ where
         receive::Outcome::Continue
     }
 
+    pub fn eof(self, driver: &mut driver::Context<'_, 'd>)
+    where
+        State: crate::pump::Tasks,
+    {
+        let state = self.conn.state_mut();
+        state.ingress.end_discard();
+        if !state.has_http_work() {
+            self.finish_input(driver);
+        }
+    }
+
     /// Delivers an orderly peer input finish without closing live output.
     pub fn finish_input(mut self, driver: &mut driver::Context<'_, 'd>) -> handler::Drain {
         let raw = match self.conn.state_mut().raw_mut() {

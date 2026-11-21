@@ -272,7 +272,7 @@ where
     Runtime: pump::Tasks,
     W: wire::Spec,
 {
-    let reason = match pump::Drain::progress(conn.state_mut()) {
+    let reason = match conn.state_mut().write_progress() {
         pump::Next::None => return Settled::new(Flow::Continue),
         pump::Next::Resume => return resume(routes, conn, driver),
         pump::Next::Close(reason) => reason,
