@@ -93,12 +93,11 @@ impl<'d, Runtime: pump::Tasks, Pending, Transitions: switch::Engine, Ready, Head
                                 );
                             }
                             Protocol::Reject(pending) => {
-                                break 'head disp.as_mut().resume_error(
+                                break 'head disp.as_mut().resume_rejection(
                                     pending,
                                     permit,
                                     rest,
-                                    target.reborrow(),
-                                    self,
+                                    &mut self.async_state,
                                 );
                             }
                             Protocol::Line(line) => line.advance(rest),
@@ -210,21 +209,22 @@ impl<'d, Runtime: pump::Tasks, Pending, Transitions: switch::Engine, Ready, Head
                                         if used < rest.as_slice().len() =>
                                     {
                                         rest.consume_max(used);
-                                        disp.as_mut().resume_error(
+                                        disp.as_mut().resume_rejection(
                                             pending,
                                             permit,
                                             rest,
-                                            target.reborrow(),
-                                            self,
+                                            &mut self.async_state,
                                         )
                                     }
                                     route => route,
                                 }
                             }
-                            Err(error) => {
-                                Outcome::Close(disp.as_mut().reject_line(permit, self, error))
-                                    .into()
-                            }
+                            Err(error) => Outcome::Close(disp.as_mut().reject_line(
+                                permit,
+                                &mut self.async_state,
+                                error,
+                            ))
+                            .into(),
                         }
                     };
                     self.ingress.protocol = match route {
@@ -298,9 +298,11 @@ impl<'d, Runtime: pump::Tasks, Pending, Transitions: switch::Engine, Ready, Head
                                 let line = match parsing::Line::start(rest) {
                                     Ok(line) => line,
                                     Err(error) => {
-                                        break 'turn Stop::Close(
-                                            disp.as_mut().reject_line(permit, self, error),
-                                        );
+                                        break 'turn Stop::Close(disp.as_mut().reject_line(
+                                            permit,
+                                            &mut self.async_state,
+                                            error,
+                                        ));
                                     }
                                 };
                                 self.ingress.protocol = Protocol::Line(line);

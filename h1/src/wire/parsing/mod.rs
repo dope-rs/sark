@@ -265,7 +265,7 @@ impl<'d> Rejected<'d> {
 }
 
 fn failed<'d, D>(error: storage::AllocError) -> session::Outcome<'d, D> {
-    session::Outcome::Failed(Failure::Input(InputError::Storage(error)))
+    Rejection::from(error).into()
 }
 
 pub(super) fn rejection<'d>(cause: ParseError<Infallible>) -> fixed::Body<'d> {
@@ -312,12 +312,9 @@ impl<'d, D> From<Rejection<'d>> for session::Outcome<'d, D> {
     }
 }
 
-impl<'d> Rejection<'d> {
-    pub fn response(self, failure: impl FnOnce(&Failure) -> fixed::Body<'d>) -> fixed::Body<'d> {
-        match self {
-            Self::Close(body) => body,
-            Self::Failed(error) => failure(&error),
-        }
+impl From<storage::AllocError> for Rejection<'_> {
+    fn from(error: storage::AllocError) -> Self {
+        Self::Failed(Failure::Input(InputError::Storage(error)))
     }
 }
 
@@ -337,15 +334,11 @@ impl Line {
 
     fn snapshot<'d>(input: &[u8], extra: usize) -> Result<Self, Rejection<'d>> {
         if input.len() > recv::HEAD_CAPACITY {
-            return Err(Rejection::Close(rejection(ParseError::too_large(
-                input.len(),
-                recv::HEAD_CAPACITY,
-            ))));
+            return Err(Rejection::Close(canned::PAYLOAD_TOO_LARGE));
         }
-        line::Request::try_partial(input)
-            .map_err(|_| Rejection::Close(rejection(ParseError::invalid())))?;
+        line::Request::try_partial(input).map_err(|_| Rejection::Close(canned::BAD_REQUEST))?;
         let capacity = NonZero::new(input.len() + extra).unwrap_or(NonZero::<usize>::MIN);
-        let source = Source::try_copy(input, capacity).map_err(line_failure)?;
+        let source = Source::try_copy(input, capacity)?;
         Ok(Self { source })
     }
 
@@ -364,10 +357,7 @@ impl Line {
         };
         let actual = prior.len().saturating_add(end);
         if actual > recv::HEAD_CAPACITY {
-            return Err(Rejection::Close(rejection(ParseError::too_large(
-                actual,
-                recv::HEAD_CAPACITY,
-            ))));
+            return Err(Rejection::Close(canned::PAYLOAD_TOO_LARGE));
         }
         Ok(&input[..end.min(input.len())])
     }
@@ -393,19 +383,15 @@ impl Line {
 
     fn extend<'d>(mut self, fragment: &[u8]) -> Result<LineProgress, Rejection<'d>> {
         let prior = self.len();
-        self.source.write_slice(fragment).map_err(line_failure)?;
+        self.source.write_slice(fragment)?;
         match self.source.as_ref() {
             [.., b'\r', b'\n'] => Ok(LineProgress::Complete {
                 source: self.source,
                 prior,
                 used: fragment.len(),
             }),
-            [.., b'\r', _] => Err(Rejection::Close(rejection(ParseError::invalid()))),
+            [.., b'\r', _] => Err(Rejection::Close(canned::BAD_REQUEST)),
             _ => Ok(LineProgress::Pending(self)),
         }
     }
-}
-
-fn line_failure<'d>(error: storage::AllocError) -> Rejection<'d> {
-    Rejection::Failed(Failure::Input(InputError::Storage(error)))
 }

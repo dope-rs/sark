@@ -19,7 +19,7 @@ pub(super) fn build<'view, 'source>(
     let [v_method, v_result, v_parsed] = symbols.locals(["method", "outcome", "parsed"]);
     let [v_wait, v_permit, v_ready] = symbols.locals(["pending", "permit", "ready"]);
     let [v_run, v_source] = symbols.locals(["runtime", "source"]);
-    let [v_stamp, v_this] = symbols.locals(["stamp", "this"]);
+    let v_this = symbols.local("this");
     let [v_write, v_routes] = symbols.locals(["write", "routes"]);
     let [g_id, g_mode] = types.names.generics.idents(["__ID", "__M"]);
     let ns_core = &paths.core;
@@ -46,9 +46,8 @@ pub(super) fn build<'view, 'source>(
     let egress = &types.routing.egress_bound;
     let raw = quote!(<#policy as #ns_h1::switch::Engine>::Raw);
     let conn = &proto.connections.http_connection;
-    let terminal = terminal::routes(paths, types.names.generics, conn);
-    let rejected = terminal::rejected(paths, types.names.generics);
     let rt = &route.runtime;
+    let terminal = terminal::routes(paths, types.names.generics, conn, rt);
     let data = &routes.body_data_arms;
     let work = &routes.body_work_arms;
     let pending = &routes.pending_resume_arms;
@@ -111,22 +110,12 @@ pub(super) fn build<'view, 'source>(
         };
         quote! {
             fn #method(
-                self: ::core::pin::Pin<&mut Self>,
+                mut self: ::core::pin::Pin<&mut Self>,
                 #v_permit: #ns_h1::session::Permit,
                 #input,
                 #v_write: #ns_http::o3::buffer::write::Slice<'_, &mut usize>,
                 #v_conn: &mut #conn,
-            ) -> #ns_h1::session::RouteOutcome<
-                'd,
-                #wait,
-                #raw,
-                #head,
-                #ns_h1::wire::parsing::Rejected<'d>,
-            > {
-                let #v_routes = self.get_mut();
-                let #v_link = #v_routes.id;
-                let #v_stamp = #v_routes.date;
-                let mut #v_routes = #v_routes.app.as_mut();
+            ) -> #ns_h1::session::RouteOutcome<'d, #wait, #raw, #head, #ns_h1::wire::parsing::Rejected<'d>> {
                 let #v_parsed = match #parse {
                     ::core::result::Result::Ok(#complete) => #v_parsed,
                     ::core::result::Result::Ok(#pending) => {
@@ -136,36 +125,24 @@ pub(super) fn build<'view, 'source>(
                         }.into();
                     }
                     ::core::result::Result::Err(#v_error) => {
-                        let mut #v_this = #v_routes.as_mut().project();
                         let (#request::Syntax | #request::Target(..) | #request::Span(..)) = #error;
-                        let #v_exch = #ns_core::life::sequence::Mode::open(
-                            #v_this.#f_life,
-                            #v_conn.async_state.session_mut(),
-                            #v_link,
-                        );
-                        #ns_core::life::sequence::Mode::reject(
-                            #v_this.#f_life,
-                            #v_exch,
-                        );
+                        self.reject_head(&mut #v_conn.async_state);
                         return #ns_h1::session::Outcome::Close(
                             #ns_http::h1::codec::canned::BAD_REQUEST,
                         ).into();
                     }
                 };
-                let ::core::option::Option::Some(#v_method) = #v_parsed.request().matched() else {
-                    let #v_result = #reject(
-                        #retained,
-                        #v_permit,
-                        #ns_http::h1::codec::canned::NOT_FOUND,
-                    );
-                    let mut #v_this = #v_routes.as_mut().project();
-                    #rejected
-                    return #v_result.into();
-                };
-                let #v_date = #v_stamp.load();
                 let #v_head = #v_parsed.request();
-                let #v_date = &#v_date;
-                #body
+                if let ::core::option::Option::Some(#v_method) = #v_head.matched() {
+                    let #v_routes = self.as_mut().get_mut();
+                    let #v_link = #v_routes.id;
+                    let #v_date = &#v_routes.date.load();
+                    let mut #v_routes = #v_routes.app.as_mut();
+                    #body
+                }
+                let #v_result = #reject(#retained, #v_permit, #ns_http::h1::codec::canned::NOT_FOUND);
+                self.reject_if_terminal(&mut #v_conn.async_state, &#v_result);
+                #v_result
             }
         }
     });
@@ -243,22 +220,6 @@ pub(super) fn build<'view, 'source>(
                 let #v_date = &#v_date;
                 let mut #v_routes = #v_routes.app.as_mut();
                 #headers
-            }
-
-            fn resume_error(
-                self: ::core::pin::Pin<&mut Self>,
-                #v_wait: #ns_h1::wire::parsing::Rejected<'d>,
-                #v_permit: #ns_h1::session::Permit,
-                #v_input: #ns_h1::Input<'_>,
-                _: #ns_http::o3::buffer::write::Slice<'_, &mut usize>,
-                #v_conn: &mut #conn,
-            ) -> #ns_h1::session::RouteOutcome<'d, #wait, #raw, #head, #ns_h1::wire::parsing::Rejected<'d>> {
-                let #v_this = self.get_mut();
-                let #v_link = #v_this.id;
-                let mut #v_this = #v_this.app.as_mut().project();
-                let #v_result = #v_wait.resume(#v_input, #v_permit);
-                #rejected
-                #v_result
             }
 
             fn body_data(

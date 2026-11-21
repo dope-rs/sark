@@ -209,7 +209,7 @@ impl<'a> Types<'a> {
             let [n_shead, n_target] = symbols.locals(["__sark_head", "__target"]);
             let [v_error, v_head, v_input] = symbols.locals(["error", "head", "input"]);
             let [v_method, v_result, v_parsed] = symbols.locals(["method", "outcome", "parsed"]);
-            let [v_wait, v_permit, v_target] = symbols.locals(["pending", "permit", "target"]);
+            let [v_wait, v_permit] = symbols.locals(["pending", "permit"]);
             let [v_this, v_routes] = symbols.locals(["this", "routes"]);
             let g_brand = symbols.lifetime("brand");
             let ns_http = &paths.http;
@@ -250,31 +250,21 @@ impl<'a> Types<'a> {
                     #ended,
                 >
             };
-            let rejected = terminal::rejected(paths, &context.plan.spec.state_generics);
             let build = |owned: bool| {
-                let (source, start, input, target) = match owned {
-                    false => (
-                        route::Source::Borrowed,
-                        quote!(#ns_h1::wire::parsing::Rejected::start),
-                        quote!(&#v_parsed),
-                        quote!(#v_head.plan().route_path(#v_input.as_slice())),
-                    ),
-                    true => (
+                let (source, target) = if owned {
+                    (
                         route::Source::Owned,
-                        quote!(#ns_h1::wire::parsing::Rejected::start_owned),
-                        quote!(#v_parsed),
                         quote!(#v_head.plan().route_path(#v_parsed.as_ref())),
-                    ),
+                    )
+                } else {
+                    (
+                        route::Source::Borrowed,
+                        quote!(#v_head.plan().route_path(#v_input.as_slice())),
+                    )
                 };
                 let emit = |index, params| {
                     route::emit(paths, context, plan, index, params, &runtime, source)
                 };
-                let reject = quote! {{
-                    let #v_result = #start(#input, #v_permit, #ns_http::h1::codec::canned::NOT_FOUND);
-                    let mut #v_this = #v_routes.as_mut().project();
-                    #rejected
-                    #v_result.into()
-                }};
                 let trie = spec
                     .route_plan
                     .compile(paths, &spec.state_generics, |index, parts| {
@@ -295,15 +285,12 @@ impl<'a> Types<'a> {
                         }
                     });
                 quote! {
-                        let ::core::option::Option::Some(#v_target) = #target else {
-                            return #reject;
-                        };
+                    if let ::core::option::Option::Some(#n_target) = #target {
                         let #n_method = #v_method;
-                        let #n_target = #v_target;
                         let #n_rproto: ::core::option::Option<&[::core::primitive::u8]> =
                             ::core::option::Option::None;
                         #trie
-                        #reject
+                    }
                 }
             };
             let body = build(false);

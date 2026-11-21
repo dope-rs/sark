@@ -314,13 +314,19 @@ pub trait Dispatch<'d, Runtime, Pending = (), Transitions: switch::Engine = swit
         cause.body()
     }
 
+    fn reject_head(self: pin::Pin<&mut Self>, _: &mut Runtime) {}
+
     fn reject_line(
-        self: pin::Pin<&mut Self>,
+        mut self: pin::Pin<&mut Self>,
         _: Permit,
-        _: &mut Conn<'d, Runtime, Pending, Transitions, Self::Ready, Self::Head>,
+        runtime: &mut Runtime,
         error: parsing::Rejection<'d>,
     ) -> fixed::Body<'d> {
-        error.response(|cause| self.failure(cause))
+        self.as_mut().reject_head(runtime);
+        match error {
+            parsing::Rejection::Close(reply) => reply,
+            parsing::Rejection::Failed(cause) => self.failure(&cause),
+        }
     }
 
     /// Settles a framing failure while ingress still owns its pending route.
@@ -362,15 +368,29 @@ pub trait Dispatch<'d, Runtime, Pending = (), Transitions: switch::Engine = swit
         conn: &mut Conn<'d, Runtime, Pending, Transitions, Self::Ready, Self::Head>,
     ) -> RouteOutcome<'d, Pending, Transitions::Raw, Self::Head, parsing::Rejected<'d>>;
 
-    fn resume_error(
+    fn reject_if_terminal(
+        self: pin::Pin<&mut Self>,
+        runtime: &mut Runtime,
+        result: &RouteOutcome<'d, Pending, Transitions::Raw, Self::Head, parsing::Rejected<'d>>,
+    ) {
+        if matches!(
+            result,
+            RouteOutcome::Outcome(Outcome::Close(_) | Outcome::Failed(_))
+        ) {
+            self.reject_head(runtime);
+        }
+    }
+
+    fn resume_rejection(
         self: pin::Pin<&mut Self>,
         pending: parsing::Rejected<'d>,
         permit: Permit,
         input: crate::Input<'_>,
-        _: Slice<'_, &mut usize>,
-        _: &mut Conn<'d, Runtime, Pending, Transitions, Self::Ready, Self::Head>,
+        runtime: &mut Runtime,
     ) -> RouteOutcome<'d, Pending, Transitions::Raw, Self::Head, parsing::Rejected<'d>> {
-        pending.resume(input, permit)
+        let result = pending.resume(input, permit);
+        self.reject_if_terminal(runtime, &result);
+        result
     }
 
     fn body_data(

@@ -11,15 +11,16 @@ pub(super) fn routes(
     paths: &Paths,
     generics: &crate::types::Generics,
     conn: &TokenStream,
+    runtime: &TokenStream,
 ) -> TokenStream {
     let f_life = local("lifecycle");
     let [v_cause, v_conn, v_error] = generics.locals(["cause", "conn", "error"]);
     let [v_wait, v_this] = generics.locals(["pending", "this"]);
     let [v_link, v_exch] = generics.locals(["connection", "exchange"]);
+    let v_run = generics.local("runtime");
     let ns_core = &paths.core;
     let ns_h1 = &paths.h1;
     let ns_http = &paths.http;
-    let open = open(paths, generics);
     quote! {
         fn failure(
             self: ::core::pin::Pin<&mut Self>,
@@ -30,20 +31,14 @@ pub(super) fn routes(
             #v_cause.body()
         }
 
-        fn reject_line(
-            mut self: ::core::pin::Pin<&mut Self>,
-            _: #ns_h1::session::Permit,
-            #v_conn: &mut #conn,
-            #v_error: #ns_h1::wire::parsing::Rejection<'d>,
-        ) -> #ns_http::payload::fixed::Body<'d> {
-            let #v_this = self.as_mut().get_mut();
+        fn reject_head(self: ::core::pin::Pin<&mut Self>, #v_run: &mut #runtime) {
+            let #v_this = self.get_mut();
             let #v_link = #v_this.id;
             let #v_this = #v_this.app.as_mut().project();
-            #open
+            let #v_exch = #ns_core::life::sequence::Mode::open(
+                #v_this.#f_life, #v_run.session_mut(), #v_link,
+            );
             #ns_core::life::sequence::Mode::reject(#v_this.#f_life, #v_exch);
-            #v_error.response(|#v_cause| {
-                #ns_h1::session::Dispatch::failure(self, #v_cause)
-            })
         }
 
         fn abort_body(
@@ -83,26 +78,6 @@ pub(super) fn failed(paths: &Paths, generics: &crate::types::Generics) -> TokenS
         #open
         #ns_core::life::sequence::Mode::reject(#v_this.#f_life, #v_exch);
         #v_error.into_consume().into()
-    }
-}
-
-pub(super) fn rejected(paths: &Paths, generics: &crate::types::Generics) -> TokenStream {
-    let f_life = local("lifecycle");
-    let [v_exch, v_result, v_this] = generics.locals(["exchange", "outcome", "this"]);
-    let ns_core = &paths.core;
-    let ns_h1 = &paths.h1;
-    let open = open(paths, generics);
-    quote! {
-        if ::core::matches!(
-            &#v_result,
-            #ns_h1::session::RouteOutcome::Outcome(
-                #ns_h1::session::Outcome::Close(_)
-                | #ns_h1::session::Outcome::Failed(_),
-            )
-        ) {
-            #open
-            #ns_core::life::sequence::Mode::reject(#v_this.#f_life, #v_exch);
-        }
     }
 }
 
