@@ -1,33 +1,3 @@
-use crate::common::client::runtime::peer::Request;
-
-pub struct Seen {
-    method: String,
-    target: String,
-    body: Vec<u8>,
-}
-
-impl From<Request<'_>> for Seen {
-    fn from(request: Request<'_>) -> Self {
-        Self {
-            method: request.method().to_owned(),
-            target: request.target().to_owned(),
-            body: request.body().to_vec(),
-        }
-    }
-}
-
-impl Seen {
-    pub fn method(&self) -> &str {
-        &self.method
-    }
-    pub fn target(&self) -> &str {
-        &self.target
-    }
-    pub fn body(&self) -> &[u8] {
-        &self.body
-    }
-}
-
 pub const CROSS_ORIGIN: &[u8] = b"HTTP/1.1 302 Found\r\nLocation: http://other.example/x\r\nContent-Length: 0\r\nConnection: keep-alive\r\n\r\n";
 
 pub const OK: &[u8] = b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok";

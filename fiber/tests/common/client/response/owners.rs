@@ -1,7 +1,5 @@
 //! Response detach ownership, failure, and allocation contracts.
 
-use std::num::NonZero;
-
 use dope::runtime::executor::drive;
 use dope_fiber::{BlockOn, abi::Fiber};
 use dope_test::alloc::Tracker;
@@ -68,17 +66,16 @@ where
     Ok([scoped, retained, flat])
 }
 
-pub fn wire(chunk: NonZero<usize>) -> Vec<u8> {
-    let chunk = chunk.get();
-    let mut wire = Vec::with_capacity(chunk * 2 + 256);
+pub fn wire() -> Vec<u8> {
+    let mut wire = Vec::with_capacity(BODY_LEN + 256);
     wire.extend_from_slice(
         b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: keep-alive\r\nX-Origin: fixture\r\nTrailer: X-Checksum\r\n\r\n",
     );
-    wire.extend_from_slice(format!("{chunk:x}\r\n").as_bytes());
-    wire.resize(wire.len() + chunk, b'a');
+    wire.extend_from_slice(format!("{CHUNK:x}\r\n").as_bytes());
+    wire.resize(wire.len() + CHUNK, b'a');
     wire.extend_from_slice(b"\r\n");
-    wire.extend_from_slice(format!("{chunk:x}\r\n").as_bytes());
-    wire.resize(wire.len() + chunk, b'b');
+    wire.extend_from_slice(format!("{CHUNK:x}\r\n").as_bytes());
+    wire.resize(wire.len() + CHUNK, b'b');
     wire.extend_from_slice(b"\r\n0\r\nX-Checksum: 42\r\n\r\n");
     wire
 }

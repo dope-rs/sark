@@ -1,6 +1,6 @@
 use std::str;
 
-use crate::common::client::{pool, routes, runtime::peer::Error};
+use crate::common::client::{pool, runtime::peer::Error};
 
 /// Borrowed view of one fully framed HTTP/1 request.
 #[derive(Clone, Copy, Eq, PartialEq)]
@@ -68,60 +68,6 @@ impl<'a> Request<'a> {
                 actual: self.head.to_owned(),
                 expected,
             })
-        }
-    }
-
-    pub fn origin(request: Request<'_>) -> Vec<u8> {
-        if request.target() == "/start" {
-            b"HTTP/1.1 302 Found\r\nLocation: /final\r\nContent-Length: 0\r\nConnection: keep-alive\r\n\r\n".to_vec()
-        } else {
-            b"HTTP/1.1 200 OK\r\nContent-Length: 7\r\nConnection: keep-alive\r\n\r\narrived"
-                .to_vec()
-        }
-    }
-
-    pub fn chain(request: Request<'_>) -> Vec<u8> {
-        match request.target() {
-            "/a" => b"HTTP/1.1 302 Found\r\nLocation: /b\r\nContent-Length: 0\r\nConnection: keep-alive\r\n\r\n".to_vec(),
-            "/b" => b"HTTP/1.1 301 Moved Permanently\r\nLocation: /c\r\nContent-Length: 0\r\nConnection: keep-alive\r\n\r\n".to_vec(),
-            _ => b"HTTP/1.1 200 OK\r\nContent-Length: 4\r\nConnection: keep-alive\r\n\r\ndone".to_vec(),
-        }
-    }
-
-    pub fn relative(request: Request<'_>) -> Vec<u8> {
-        if request.target() == "/dir/start" {
-            b"HTTP/1.1 302 Found\r\nLocation: next\r\nContent-Length: 0\r\nConnection: keep-alive\r\n\r\n".to_vec()
-        } else if request.target() == "/dir/next" {
-            b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: keep-alive\r\n\r\nok".to_vec()
-        } else {
-            b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: keep-alive\r\n\r\n"
-                .to_vec()
-        }
-    }
-
-    pub fn query_path(request: Request<'_>) -> Vec<u8> {
-        if request.target() == "/item?step=1" {
-            b"HTTP/1.1 302 Found\r\nLocation: ?step=2\r\nContent-Length: 0\r\nConnection: keep-alive\r\n\r\n".to_vec()
-        } else if request.target() == "/item?step=2" {
-            b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: keep-alive\r\n\r\nok".to_vec()
-        } else {
-            b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: keep-alive\r\n\r\n"
-                .to_vec()
-        }
-    }
-
-    pub fn looping(request: Request<'_>) -> Vec<u8> {
-        match request.target() {
-            "/a" => b"HTTP/1.1 302 Found\r\nLocation: /b\r\nContent-Length: 0\r\nConnection: keep-alive\r\n\r\n".to_vec(),
-            _ => b"HTTP/1.1 302 Found\r\nLocation: /a\r\nContent-Length: 0\r\nConnection: keep-alive\r\n\r\n".to_vec(),
-        }
-    }
-
-    pub fn policy_reply(self, status: u16) -> Vec<u8> {
-        if self.target() == "/start" {
-            format!("HTTP/1.1 {status} Redirect\r\nLocation: /final\r\nContent-Length: 0\r\nConnection: keep-alive\r\n\r\n").into_bytes()
-        } else {
-            routes::OK.to_vec()
         }
     }
 }

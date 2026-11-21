@@ -12,163 +12,89 @@ use common::client::{
 };
 use dope_test::harness::{
     GUARD,
-    peer::{AcceptScript, TcpAcceptor},
+    peer::TcpAcceptor,
     scenario::run::{self, Task as _},
 };
 use sark_client::{Error, RequestError, Safety, protocol::redirect};
 use sark_fiber::client::config::Config;
-use sark_http::{method::Method, payload::response::status};
+use sark_http::{method::Known, payload::response::status};
+
+const TO_B: &[u8] =
+    b"HTTP/1.1 302 Found\r\nLocation: /b\r\nContent-Length: 0\r\nConnection: keep-alive\r\n\r\n";
+const KEEP_OK: &[u8] = b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: keep-alive\r\n\r\nok";
+const MISSING: &[u8] =
+    b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: keep-alive\r\n\r\n";
 
 #[test]
-fn follows_origin() {
-    AcceptScript::with(
-        |acceptor| peer::serve(acceptor, peer::Request::origin),
-        |server| {
+fn follows_same_origin_redirects() {
+    let cases: &[(&[(&str, &[u8])], &[u8])] = &[
+        (&[
+            ("/start", b"HTTP/1.1 302 Found\r\nLocation: /final\r\nContent-Length: 0\r\nConnection: keep-alive\r\n\r\n"),
+            ("/final", b"HTTP/1.1 200 OK\r\nContent-Length: 7\r\nConnection: keep-alive\r\n\r\narrived"),
+        ], b"arrived"),
+        (&[
+            ("/a", TO_B),
+            ("/b", b"HTTP/1.1 301 Moved Permanently\r\nLocation: /c\r\nContent-Length: 0\r\nConnection: keep-alive\r\n\r\n"),
+            ("/c", b"HTTP/1.1 200 OK\r\nContent-Length: 4\r\nConnection: keep-alive\r\n\r\ndone"),
+        ], b"done"),
+        (&[
+            ("/dir/start", b"HTTP/1.1 302 Found\r\nLocation: next\r\nContent-Length: 0\r\nConnection: keep-alive\r\n\r\n"),
+            ("/dir/next", KEEP_OK),
+        ], b"ok"),
+        (&[
+            ("/item?step=1", b"HTTP/1.1 302 Found\r\nLocation: ?step=2\r\nContent-Length: 0\r\nConnection: keep-alive\r\n\r\n"),
+            ("/item?step=2", KEEP_OK),
+        ], b"ok"),
+    ];
+    for &(routes, expected) in cases {
+        let path = routes[0].0;
+        peer::with_get(routes, MISSING, |addr| {
             for flavor in FLAVORS {
-                let resp = flavor
-                    .get(server.addr(), "/start")
-                    .collect();
-                assert_eq!(resp.status().as_u16(), 200);
-                assert_eq!(
-                    str::from_utf8(resp.body().as_slice()).expect("response body is UTF-8"),
-                    "arrived"
-                );
+                let response = flavor.get(addr, path).collect();
+                assert_eq!(response.status(), status::Code::OK, "{path}");
+                assert_eq!(response.body().as_slice(), expected, "{path}");
             }
-            server
-                .stop()
-                .expect("peer thread")
-                .expect("stop redirect peer");
-        },
-    )
-    .expect("spawn redirect peer");
-}
-
-#[test]
-fn redirect_chain_followed() {
-    AcceptScript::with(
-        |acceptor| peer::serve(acceptor, peer::Request::chain),
-        |server| {
-            for flavor in FLAVORS {
-                let resp = flavor
-                    .get(server.addr(), "/a")
-                    .collect();
-                assert_eq!(resp.status().as_u16(), 200);
-                assert_eq!(
-                    str::from_utf8(resp.body().as_slice()).expect("response body is UTF-8"),
-                    "done"
-                );
-            }
-            server
-                .stop()
-                .expect("peer thread")
-                .expect("stop redirect peer");
-        },
-    )
-    .expect("spawn redirect peer");
-}
-
-#[test]
-fn resolves_relative() {
-    AcceptScript::with(
-        |acceptor| peer::serve(acceptor, peer::Request::relative),
-        |server| {
-            for flavor in FLAVORS {
-                let response = flavor
-                    .get(server.addr(), "/dir/start")
-                    .collect();
-                assert_eq!(response.status().as_u16(), 200);
-                assert_eq!(response.body().as_slice(), b"ok");
-            }
-            server
-                .stop()
-                .expect("peer thread")
-                .expect("stop redirect peer");
-        },
-    )
-    .expect("spawn redirect peer");
-}
-
-#[test]
-fn keeps_query_path() {
-    AcceptScript::with(
-        |acceptor| peer::serve(acceptor, peer::Request::query_path),
-        |server| {
-            for flavor in FLAVORS {
-                let response = flavor
-                    .get(server.addr(), "/item?step=1")
-                    .collect();
-                assert_eq!(response.status().as_u16(), 200);
-                assert_eq!(response.body().as_slice(), b"ok");
-            }
-            server
-                .stop()
-                .expect("peer thread")
-                .expect("stop redirect peer");
-        },
-    )
-    .expect("spawn redirect peer");
+        });
+    }
 }
 
 #[test]
 fn redirect_loop_rejected() {
-    AcceptScript::with(
-        |acceptor| peer::serve(acceptor, peer::Request::looping),
-        |server| {
-            for flavor in FLAVORS {
-                Request::get(
-                    flavor,
-                    server.addr(),
-                    Config::new(server.addr().to_string()),
-                    "/a",
-                )
+    let to_a = b"HTTP/1.1 302 Found\r\nLocation: /a\r\nContent-Length: 0\r\nConnection: keep-alive\r\n\r\n";
+    peer::with_get(&[("/a", TO_B), ("/b", to_a)], MISSING, |addr| {
+        for flavor in FLAVORS {
+            flavor
+                .get(addr, "/a")
                 .try_run(|outcome| {
-                    let failure = (outcome).err().expect("redirect loop must be rejected");
-                    assert!((failure.safety()) == (Safety::PossiblyCommitted));
+                    let failure = outcome.err().expect("redirect loop must be rejected");
+                    assert!(failure.safety() == Safety::PossiblyCommitted);
                     assert!(matches!(
                         failure.cause(),
                         Error::Redirect(redirect::Error::Loop)
                     ));
                 })
                 .expect("HTTP request execution");
-            }
-            server
-                .stop()
-                .expect("peer thread")
-                .expect("stop redirect peer");
-        },
-    )
-    .expect("spawn redirect peer");
+        }
+    });
 }
 
 #[test]
 fn rejects_cross_origin() {
-    AcceptScript::with(
-        |acceptor| peer::serve(acceptor, |_: peer::Request<'_>| CROSS_ORIGIN.to_vec()),
-        |server| {
-            Request::get(
-                Flavor::Fixed,
-                server.addr(),
-                Config::new(server.addr().to_string()),
-                "/start",
-            )
+    peer::with_get(&[("/start", CROSS_ORIGIN)], MISSING, |addr| {
+        Flavor::Fixed
+            .get(addr, "/start")
             .try_run(|outcome| {
-                let failure = (outcome)
+                let failure = outcome
                     .err()
                     .expect("cross-origin redirect must be rejected");
-                assert!((failure.safety()) == (Safety::PossiblyCommitted));
+                assert!(failure.safety() == Safety::PossiblyCommitted);
                 assert!(matches!(
                     failure.cause(),
                     Error::Request(RequestError::CrossOrigin)
                 ));
             })
             .expect("HTTP request execution");
-            server
-                .stop()
-                .expect("peer thread")
-                .expect("stop redirect peer");
-        },
-    )
-    .expect("spawn redirect peer");
+    });
 }
 
 #[test]
@@ -216,20 +142,19 @@ fn preserves_method_policy() {
     ];
     for flavor in FLAVORS {
         for (status, initial, expected, retain) in [
-            (302, Method::POST, "GET", false),
-            (307, Method::POST, "POST", true),
-            (307, Method::GET, "GET", true),
+            (302, Known::Post, "GET", false),
+            (307, Known::Post, "POST", true),
+            (307, Known::Get, "GET", true),
         ] {
-            let initial_get = initial == Method::GET;
             let mut acceptor =
                 TcpAcceptor::bind(([127, 0, 0, 1], 0).into()).expect("policy listener");
             let addr = acceptor.local_addr().expect("listener address");
-            let (observed, ()) = run::Entry(move || {
+            let (served, ()) = run::Entry(move || {
                 let response = Request::new(
                     flavor,
                     addr,
                     Config::new(addr.to_string()),
-                    initial,
+                    initial.into(),
                     "/start",
                     &headers,
                     b"payload",
@@ -238,7 +163,8 @@ fn preserves_method_policy() {
                 assert_eq!(response.status(), status::Code::OK);
             })
             .with(|| {
-                let mut observed = Vec::new();
+                let first_reply = format!("HTTP/1.1 {status} Redirect\r\nLocation: /final\r\nContent-Length: 0\r\nConnection: keep-alive\r\n\r\n");
+                let mut count = 0;
                 loop {
                     let accepted = acceptor.accept_for(GUARD)?.expect("policy connection");
                     accepted.read_wait(Some(GUARD))?;
@@ -250,41 +176,32 @@ fn preserves_method_policy() {
                         for (name, _) in headers {
                             assert_eq!(
                                 wire.contains(&format!("\r\n{name}: ")),
-                                observed.is_empty() || retain || name == "X-Metadata",
+                                count == 0 || retain || name == "X-Metadata",
                                 "redirect content policy for {name}",
                             );
                         }
-                        let response = if !retain && request.target() == "/final" {
-                            b"HTTP/1.1 307 Temporary Redirect\r\nLocation: /after\r\nContent-Length: 0\r\nConnection: keep-alive\r\n\r\n".to_vec()
-                        } else {
-                            request.policy_reply(status)
+                        let first = count == 0;
+                        let method = if first { initial.as_str() } else { expected };
+                        assert_eq!(request.method(), method);
+                        assert_eq!(request.body(), if first || retain { b"payload".as_slice() } else { &[] });
+                        let (target, reply) = match count {
+                            0 => ("/start", first_reply.as_bytes()),
+                            1 if !retain => ("/final", b"HTTP/1.1 307 Temporary Redirect\r\nLocation: /after\r\nContent-Length: 0\r\nConnection: keep-alive\r\n\r\n".as_slice()),
+                            1 => ("/final", OK),
+                            _ => ("/after", OK),
                         };
-                        observed.push(Seen::from(request));
-                        conn.write_all(&response)?;
-                        if observed.len() == if retain { 2 } else { 3 } {
-                            peer::closed(&mut conn)?;
-                            return Ok::<_, peer::Error>(observed);
+                        assert_eq!(request.target(), target);
+                        conn.write_all(reply)?;
+                        count += 1;
+                        if count == if retain { 2 } else { 3 } {
+                            return peer::closed(&mut conn);
                         }
                     }
                 }
             })
             .expect("client worker");
-            let observed = observed.expect("redirect policy must finish");
+            served.expect("redirect policy must finish");
             peer::empty(&mut acceptor).expect("no extra redirect requests");
-            assert_eq!(
-                observed[0].method(),
-                if initial_get { "GET" } else { "POST" }
-            );
-            assert_eq!(observed[0].target(), "/start");
-            assert_eq!(observed[0].body(), b"payload");
-            assert_eq!(observed[1].target(), "/final");
-            for request in observed.iter().skip(1) {
-                assert_eq!(request.method(), expected);
-                assert_eq!(
-                    request.body(),
-                    if retain { &b"payload"[..] } else { &[][..] }
-                );
-            }
         }
     }
 }

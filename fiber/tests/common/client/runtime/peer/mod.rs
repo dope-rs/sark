@@ -45,9 +45,30 @@ pub fn with_wire(paths: &[&str], wire: &[u8], run: impl FnOnce(net::SocketAddr))
     .expect("spawn response peer");
 }
 
-pub fn serve(
+pub fn with_get(routes: &[(&str, &[u8])], fallback: &[u8], run: impl FnOnce(net::SocketAddr)) {
+    peer::AcceptScript::with(
+        |acceptor| {
+            serve(acceptor, |request| {
+                assert_eq!(request.method(), "GET");
+                assert!(request.body().is_empty());
+                let target = request.target();
+                routes
+                    .iter()
+                    .find_map(|&(path, wire)| (target == path).then_some(wire))
+                    .unwrap_or(fallback)
+            })
+        },
+        |server| {
+            run(server.addr());
+            server.stop().expect("peer thread").expect("response peer");
+        },
+    )
+    .expect("spawn response peer");
+}
+
+pub fn serve<B: AsRef<[u8]>>(
     acceptor: &mut TcpAcceptor<'_>,
-    mut reply: impl for<'a> FnMut(Request<'a>) -> Vec<u8>,
+    mut reply: impl for<'a> FnMut(Request<'a>) -> B,
 ) -> Result<(), Error> {
     while let Some(accepted) = accept(acceptor)? {
         let stream = &accepted;
@@ -55,7 +76,7 @@ pub fn serve(
         while let Some(frame) = next(&mut input, stream)? {
             let output = reply(input.request(frame)?);
             input.consume(frame);
-            stream.write_all(&output).map_err(Error::Io)?;
+            stream.write_all(output.as_ref()).map_err(Error::Io)?;
         }
     }
     Ok(())
