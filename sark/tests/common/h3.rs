@@ -1,9 +1,13 @@
 use std::collections::BTreeMap;
 
 use dope_quic::wire::stream::Id;
+use o3::mem::Rejected;
 use sark_core::{
-    body::admit::{Finished, Open, Track},
-    decode::{Decode, exec, request, state},
+    body::{
+        self,
+        admit::{Finished, Open, Track},
+    },
+    decode::{Decode, exec, request, state, state::Homogeneous as _},
     manifold::stream::Boundary,
 };
 use sark_h3::{
@@ -16,11 +20,16 @@ use sark_h3::{
     },
     frame::{self, Payload, TYPE_HEADERS},
     link::{Outcome, Transport},
+    manifold,
     qpack::encoder::{self, Encoder},
+    stream::Target,
 };
 use sark_http::{
-    field::{self, Entry, Pseudo, Value, metadata::section::storage::Block},
-    payload::{fixed, response::status::Code},
+    field::{
+        self, Entry, Pseudo, Value,
+        metadata::section::{self, state::RetainedHead, storage::Block},
+    },
+    payload::{fixed, owned, response::status::Code},
 };
 
 pub trait Routing: Decode + Sized {
@@ -128,6 +137,51 @@ sark::define_router! {
     }
 }
 
+type Plan = <H3Router as Decode>::Plan;
+
+impl H3Router {
+    pub fn respond(
+        &self,
+        server: &mut Connection<'_, Plan>,
+        head: RetainedHead<<Plan as section::Policy>::Block, section::state::Selected<Plan>>,
+    ) {
+        let method = head.control().method();
+        let head = self.try_head(head).expect("known route");
+        let started = request::Head::try_start(head, 0, Boundary::End)
+            .map_err(Rejected::discard)
+            .expect("empty GET body")
+            .into_state();
+        let admitted = state::Admission::<state::Admitted>::admit(started);
+        let request =
+            H3RouterRequestFamily::fold(admitted, Complete).expect("GET body must be complete");
+        let request = request
+            .try_map_body(|done| body::Body::try_new(done, owned::Segments::new()))
+            .map_err(|failure| failure.discard().discard())
+            .expect("finished body");
+        request.with_input(|prepared, input| {
+            let (response, owner) = self
+                .try_project(prepared, input, |scoped| {
+                    let (request, slot) = scoped.into_parts();
+                    let encoder = manifold::encoder::Encoder::from_slot(
+                        server,
+                        Target::new(Id::ZERO),
+                        method,
+                        slot,
+                    );
+                    self.try_dispatch(request, encoder)
+                        .map(|response| response.detach())
+                        .map_err(|(error, target)| (error.narrow(), target.stream_id().get()))
+                })
+                .map_err(Rejected::discard)
+                .expect("matching route projection");
+            response
+                .expect("synchronous dispatch")
+                .finish_with(owner)
+                .expect("atomic H3 response");
+        });
+    }
+}
+
 pub trait Framing {
     fn try_frame(&mut self, stream: Id, fields: impl field::Source) -> Result<Vec<u8>, Build>;
 }
@@ -180,16 +234,16 @@ impl<'d> Transport<'d> for Wire {
     }
 }
 
-pub struct Selected;
+struct Complete;
 
-impl<P> exec::Fold<P, state::Admitted, exec::Sync> for Selected {
-    type Output = state::Uniform<P, state::Admitted>;
+impl<P> exec::Fold<P, state::Admitted, exec::Sync> for Complete {
+    type Output = Result<request::Admitted<exec::Sync, P, Track<Finished>>, body::Error>;
 
-    fn open<S: state::Slot<P>>(self, slot: S, body: Track<Open>) -> Self::Output {
-        state::Uniform::new(slot.prepare(), request::Body::Open(body))
+    fn open<S: state::Slot<P>>(self, _: S, _: Track<Open>) -> Self::Output {
+        Err(body::Error::InputIncomplete)
     }
 
     fn finished<S: state::Slot<P>>(self, slot: S, body: Track<Finished>) -> Self::Output {
-        state::Uniform::new(slot.prepare(), request::Body::Finished(body))
+        Ok(slot.admit(body))
     }
 }

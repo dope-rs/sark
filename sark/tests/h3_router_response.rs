@@ -3,12 +3,8 @@ use sark_h3::qpack::encoder::Encoder;
 pub mod common;
 
 use dope_quic::wire::stream::Id;
-use o3::{buffer::pool, mem::Rejected};
-use sark_core::{
-    body,
-    decode::{Decode, request, state, state::Homogeneous as _},
-    manifold::stream::Boundary,
-};
+use o3::buffer::pool;
+use sark_core::{decode::Decode, manifold::stream::Boundary};
 use sark_h3::{
     conn::{
         Connection,
@@ -16,8 +12,6 @@ use sark_h3::{
         io::{Receive, Send, Step},
     },
     link::{Flush, Transport},
-    manifold::encoder,
-    stream::Target,
 };
 use sark_http::field::{
     self, Entry, Pseudo, Value,
@@ -34,9 +28,7 @@ use sark_http::field::{
     },
 };
 
-use crate::common::h3::{
-    Capture, Framing, H3PlainRouter, H3Router, H3RouterRequestFamily, Routing, Selected, Wire,
-};
+use crate::common::h3::{Capture, Framing, H3PlainRouter, H3Router, Routing, Wire};
 
 #[test]
 fn retained_range_mismatch() {
@@ -172,37 +164,7 @@ fn routes_response() {
         if let Completion::End(stream) = done {
             assert!(stream == Id::ZERO.into());
             let head = pending.take().expect("headers before finish");
-            let method = head.control().method();
-            let prepared = app.try_head(head).expect("known route");
-            let started = request::Head::try_start(prepared, 0, Boundary::End)
-                .map_err(Rejected::discard)
-                .expect("empty GET body")
-                .into_state();
-            let admitted = state::Admission::<state::Admitted>::admit(started);
-            let request = match H3RouterRequestFamily::fold(admitted, Selected).into_request() {
-                request::Body::Finished(request) => Some(request),
-                request::Body::Open(_) => None,
-            }
-            .expect("GET body must be complete");
-            let request = request
-                .try_map_body(|done| body::Body::try_new(done, &[][..]))
-                .ok()
-                .expect("finished body");
-            let (response, _) = request
-                .try_project(&app, |request| {
-                    app.try_dispatch(
-                        request.into_inner(),
-                        encoder::Encoder::new(&mut server, Target::new(Id::ZERO), method),
-                    )
-                    .map(|prepared| prepared.finish())
-                    .map_err(|(error, target)| (error.narrow(), target))
-                })
-                .map_err(Rejected::discard)
-                .expect("matching route projection");
-            response
-                .ok()
-                .expect("synchronous dispatch")
-                .expect("atomic H3 response");
+            app.respond(&mut server, head);
             routed = true;
         }
     }
@@ -316,37 +278,7 @@ fn decodes_huffman_plan() {
         }
     }
     let head = planned.expect("decoded request head");
-    let method = head.control().method();
-    let prepared = app.try_head(head).expect("known route");
-    let started = request::Head::try_start(prepared, 0, Boundary::End)
-        .map_err(Rejected::discard)
-        .expect("empty GET body")
-        .into_state();
-    let admitted = state::Admission::<state::Admitted>::admit(started);
-    let request = match H3RouterRequestFamily::fold(admitted, Selected).into_request() {
-        request::Body::Finished(request) => Some(request),
-        request::Body::Open(_) => None,
-    }
-    .expect("GET body must be complete");
-    let request = request
-        .try_map_body(|done| body::Body::try_new(done, &[][..]))
-        .ok()
-        .expect("finished body");
-    let (response, _) = request
-        .try_project(&app, |request| {
-            app.try_dispatch(
-                request.into_inner(),
-                encoder::Encoder::new(&mut server, Target::new(Id::ZERO), method),
-            )
-            .map(|prepared| prepared.finish())
-            .map_err(|(error, target)| (error.narrow(), target))
-        })
-        .map_err(Rejected::discard)
-        .expect("matching route projection");
-    response
-        .ok()
-        .expect("synchronous dispatch")
-        .expect("atomic H3 response");
+    app.respond(&mut server, head);
 
     let mut sent = Wire::default();
     assert!(

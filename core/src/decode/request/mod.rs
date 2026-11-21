@@ -1,12 +1,11 @@
 use core::{convert::Infallible, marker::PhantomData};
 
 use o3::mem::Rejected;
-use request::body::Source;
-use sark_http::{method::Method, owner::handoff::input, payload::owned, request};
+use sark_http::{method::Method, owner::handoff::input, payload::owned};
 
 use crate::{
     body,
-    decode::{Decode, Scoped, exec, state},
+    decode::{exec, state},
     manifold::stream::Boundary,
 };
 
@@ -71,33 +70,6 @@ impl<K, P, S> Admitted<K, P, body::Body<S>> {
 impl<P, B> Admitted<exec::Task, P, B> {
     pub fn into_parts(self) -> (P, B) {
         (self.prepared, self.body)
-    }
-}
-
-impl<P, S> Admitted<exec::Sync, P, body::Body<S>> {
-    /// Borrows this completed body only for its matching selected request.
-    ///
-    pub fn try_project<'d, D, T, F>(
-        self,
-        decoder: &D,
-        project: F,
-    ) -> Result<(T, body::Body<S>), Rejected<Self, request::body::Error>>
-    where
-        S: Source<'d>,
-        D: Decode<Prepared = P>,
-        F: for<'a> FnOnce(Scoped<'a, 'd, D>) -> T,
-    {
-        let Self {
-            prepared, mut body, ..
-        } = self;
-        let output = match decoder.try_project(prepared, body.input(), project) {
-            Ok((output, ())) => output,
-            Err(failure) => {
-                let ((prepared, _), error) = failure.into_parts();
-                return Err(Rejected::new(Self::new(prepared, body), error));
-            }
-        };
-        Ok((output, body))
     }
 }
 
