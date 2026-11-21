@@ -26,33 +26,25 @@ use sark_fiber::Config;
 
 #[test]
 fn rejects_one_exchange() {
-    let (harness, server) = server::Plan::isolated();
-    let mut events = Vec::new();
+    let events = keep::record(|bind| {
+        let mut socket = TcpStream::connect(bind).expect("connect observed H1 rejection");
+        socket
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .expect("set rejection deadline");
+        socket
+            .write_all(b"GET /missing HTTP/1.1\r\nHo")
+            .expect("write partial rejected head");
+        thread::sleep(Duration::from_millis(20));
+        socket
+            .write_all(b"st: x\r\nConnection: close\r\n\r\n")
+            .expect("finish rejected head");
 
-    harness
-        .run(
-            |context, listener| keep::try_record(server, context, listener, &mut events),
-            |bind| {
-                let mut socket = TcpStream::connect(bind).expect("connect observed H1 rejection");
-                socket
-                    .set_read_timeout(Some(Duration::from_secs(2)))
-                    .expect("set rejection deadline");
-                socket
-                    .write_all(b"GET /missing HTTP/1.1\r\nHo")
-                    .expect("write partial rejected head");
-                thread::sleep(Duration::from_millis(20));
-                socket
-                    .write_all(b"st: x\r\nConnection: close\r\n\r\n")
-                    .expect("finish rejected head");
-
-                let mut response = String::new();
-                socket
-                    .read_to_string(&mut response)
-                    .expect("read rejection response");
-                assert!(response.contains("404 Not Found"), "response: {response}");
-            },
-        )
-        .expect("rejects_one_exchange server shutdown");
+        let mut response = String::new();
+        socket
+            .read_to_string(&mut response)
+            .expect("read rejection response");
+        assert!(response.contains("404 Not Found"), "response: {response}");
+    });
 
     for expected in [
         "exchange-opened",
@@ -78,43 +70,32 @@ fn rejects_one_exchange() {
 
 #[test]
 fn keeps_connection_open() {
-    let (harness, server) = server::Plan::isolated();
-    let mut events = Vec::new();
+    let events = keep::record(|bind| {
+        let socket = TcpPeer::at(bind)
+            .try_read(Duration::from_secs(2))
+            .expect("keep-alive peer");
+        let mut peer = Peer::new(socket);
+        for turn in 1..=2 {
+            let (status, body) = peer
+                .try_exchange(b"GET /ping HTTP/1.1\r\nHost: x\r\n\r\n")
+                .expect("keep-alive response");
+            assert_eq!(
+                (status, body.as_slice()),
+                (200, b"pong".as_slice()),
+                "request {turn}"
+            );
+        }
 
-    harness
-        .run(
-            |context, listener| keep::try_record(server, context, listener, &mut events),
-            |bind| {
-                let mut sock = TcpPeer::at(bind).try_connect().expect("connect");
-                sock.read_wait(Some(Duration::from_secs(2)))
-                    .expect("set keep-alive deadline");
-
-                sock.write_all(b"GET /ping HTTP/1.1\r\nHost: x\r\n\r\n")
-                    .expect("write first keep-alive request");
-                let mut buffered = Vec::new();
-                let (status, body) = Peer::new(&mut sock, &mut buffered)
-                    .try_response()
-                    .expect("first keep-alive response");
-                assert_eq!(status, 200);
-                assert_eq!(body, b"pong");
-
-                sock.write_all(b"GET /ping HTTP/1.1\r\nHost: x\r\n\r\n")
-                    .expect("write second keep-alive request");
-                let (status, body) = Peer::new(&mut sock, &mut buffered)
-                    .try_response()
-                    .expect("second keep-alive response");
-                assert_eq!(status, 200);
-                assert_eq!(body, b"pong");
-
-                sock.write_all(b"GET /ping HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n")
-                    .expect("write closing request");
-                let mut last = Vec::new();
-                sock.read_to_end(&mut last).expect("read closing response");
-                let last = String::from_utf8(last).expect("closing response text");
-                assert!(last.contains("200 OK"), "last: {}", last);
-            },
-        )
-        .expect("keeps_connection_open server shutdown");
+        peer.socket
+            .write_all(b"GET /ping HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n")
+            .expect("write closing request");
+        let mut last = Vec::new();
+        peer.socket
+            .read_to_end(&mut last)
+            .expect("read closing response");
+        let last = String::from_utf8(last).expect("closing response text");
+        assert!(last.contains("200 OK"), "last: {}", last);
+    });
 
     for expected in ["session-opened", "session-established", "session-closed"] {
         assert!(events.contains(&expected), "missing {expected}: {events:?}");
@@ -263,39 +244,29 @@ fn orders_owner_release() {
 
 #[test]
 fn static_stays_borrowed() {
-    let (harness, server) = server::Plan::isolated();
-    let mut events = Vec::new();
-
-    harness
-        .run(
-            |context, listener| keep::try_record(server, context, listener, &mut events),
-            |bind| {
-                let mut socket = TcpStream::connect(bind).expect("connect static H1 client");
-                socket
-                    .set_read_timeout(Some(Duration::from_secs(2)))
-                    .expect("set static response deadline");
-                socket
-                    .write_all(
-                        b"GET /large-static HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n",
-                    )
-                    .expect("write static request");
-                let mut response = Vec::new();
-                socket
-                    .read_to_end(&mut response)
-                    .expect("read static response");
-                assert!(
-                    response.windows(6).any(|window| window == b"200 OK"),
-                    "missing success response",
-                );
-                let body = response
-                    .windows(4)
-                    .position(|window| window == b"\r\n\r\n")
-                    .map(|head_end| &response[head_end + 4..])
-                    .expect("complete response head");
-                assert_eq!(body, LARGE_STATIC_BODY);
-            },
-        )
-        .expect("static_stays_borrowed server shutdown");
+    let events = keep::record(|bind| {
+        let mut socket = TcpStream::connect(bind).expect("connect static H1 client");
+        socket
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .expect("set static response deadline");
+        socket
+            .write_all(b"GET /large-static HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n")
+            .expect("write static request");
+        let mut response = Vec::new();
+        socket
+            .read_to_end(&mut response)
+            .expect("read static response");
+        assert!(
+            response.windows(6).any(|window| window == b"200 OK"),
+            "missing success response",
+        );
+        let body = response
+            .windows(4)
+            .position(|window| window == b"\r\n\r\n")
+            .map(|head_end| &response[head_end + 4..])
+            .expect("complete response head");
+        assert_eq!(body, LARGE_STATIC_BODY);
+    });
 
     for name in ["response-handoff", "response-transport-released"] {
         assert_eq!(
@@ -328,38 +299,30 @@ fn disabled_omits_ledger() {
 
 #[test]
 fn suspended_body_owns() {
-    let (harness, server) = server::Plan::isolated();
-    let mut events = Vec::new();
+    let events = keep::record(|bind| {
+        let mut socket = TcpStream::connect(bind).expect("connect observed H1 body");
+        socket
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .expect("set body response deadline");
+        socket
+            .write_all(b"POST /body HTTP/1.1\r\nHost: x\r\nContent-Len")
+            .expect("write partial body head");
+        thread::sleep(Duration::from_millis(20));
+        socket
+            .write_all(b"gth: 12\r\nConnection: close\r\n\r\n")
+            .expect("finish body head");
+        thread::sleep(Duration::from_millis(20));
+        socket.write_all(b"first-").expect("write first body part");
+        thread::sleep(Duration::from_millis(20));
+        socket.write_all(b"second").expect("write second body part");
 
-    harness
-        .run(
-            |context, listener| keep::try_record(server, context, listener, &mut events),
-            |bind| {
-                let mut socket = TcpStream::connect(bind).expect("connect observed H1 body");
-                socket
-                    .set_read_timeout(Some(Duration::from_secs(2)))
-                    .expect("set body response deadline");
-                socket
-                    .write_all(b"POST /body HTTP/1.1\r\nHost: x\r\nContent-Len")
-                    .expect("write partial body head");
-                thread::sleep(Duration::from_millis(20));
-                socket
-                    .write_all(b"gth: 12\r\nConnection: close\r\n\r\n")
-                    .expect("finish body head");
-                thread::sleep(Duration::from_millis(20));
-                socket.write_all(b"first-").expect("write first body part");
-                thread::sleep(Duration::from_millis(20));
-                socket.write_all(b"second").expect("write second body part");
-
-                let mut response = String::new();
-                socket
-                    .read_to_string(&mut response)
-                    .expect("read body response");
-                assert!(response.contains("200 OK"), "response: {response}");
-                assert!(response.ends_with("body:12"), "response: {response}");
-            },
-        )
-        .expect("suspended_body_owns server shutdown");
+        let mut response = String::new();
+        socket
+            .read_to_string(&mut response)
+            .expect("read body response");
+        assert!(response.contains("200 OK"), "response: {response}");
+        assert!(response.ends_with("body:12"), "response: {response}");
+    });
 
     let reserved = events
         .iter()

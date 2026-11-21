@@ -66,20 +66,24 @@ sark_fiber::define_route! {
     }
 }
 
-pub fn try_record(
-    plan: server::Http1Plan,
-    context: ReadySource<'_>,
-    listener: Listener,
-    events: &mut Vec<&'static str>,
-) -> Result<(), BranchError<prepare::Error, Claim>> {
-    let audits = Cell::new(None);
-    try_run(
-        plan,
-        context,
-        listener,
-        events::Log(Cell::from_mut(events), &audits, events::diagnose),
-        &audits,
+pub fn record(client: impl FnOnce(std::net::SocketAddr)) -> Vec<&'static str> {
+    let (pair, plan) = server::Plan::isolated();
+    let mut events = Vec::new();
+    pair.run(
+        |context, listener| {
+            let audits = Cell::new(None);
+            try_run(
+                plan,
+                context,
+                listener,
+                events::Log(Cell::from_mut(&mut events), &audits, events::diagnose),
+                &audits,
+            )
+        },
+        client,
     )
+    .expect("observed H1 server");
+    events
 }
 
 pub fn try_run(

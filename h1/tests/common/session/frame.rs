@@ -3,9 +3,9 @@ use std::{convert::Infallible, pin::Pin};
 use o3::buffer::storage::range;
 use sark_h1::{
     Input, pump, session,
-    session::{Buffered, Conn, Consumption, Dispatch, Outcome, Permit},
+    session::{Conn, Consumption, Dispatch, Outcome},
     switch,
-    wire::{Failure, InputError, head, output, parsing},
+    wire::{Failure, InputError, head, output},
 };
 use sark_http::{
     h1::codec::canned,
@@ -71,44 +71,38 @@ impl<'d, Raw: Unpin, Head: Unpin, T: switch::Engine<Raw = Raw>> Dispatch<'d, (),
     }
 
     fn resume_head(
-        self: Pin<&mut Self>,
         pending: Self::Head,
-        permit: Permit,
-        _: Input<'_>,
-        _: o3::buffer::write::Slice<'_, &mut usize>,
-        _: &mut Conn<'d, (), Infallible, T, Infallible, Head>,
-    ) -> session::RouteOutcome<'d, Infallible, Raw, Head, parsing::Rejected<'d>> {
-        session::RouteOutcome::AwaitHead { permit, pending }
+        turn: &mut session::Turn<'_, '_, 'd, (), Infallible, T, Self>,
+    ) -> session::Flow {
+        turn.await_head(pending)
     }
 
     fn try_consume(
-        self: Pin<&mut Self>,
-        permit: Permit,
         input: Input<'_>,
-        mut write: o3::buffer::write::Slice<'_, &mut usize>,
-        _: &mut Conn<'d, (), Infallible, T, Infallible, Head>,
-    ) -> session::RouteOutcome<'d, Infallible, Raw, Head, parsing::Rejected<'d>> {
-        let this = self.get_mut();
+        turn: &mut session::Turn<'_, '_, 'd, (), Infallible, T, Self>,
+        prior: usize,
+    ) -> session::Flow {
+        let this = turn.router.as_mut().get_mut();
         this.calls += 1;
         if let Some(expected) = this.input {
             assert_eq!(input.as_slice(), expected);
         }
         if let Some(pending) = this.head.take() {
-            return session::RouteOutcome::AwaitHead { permit, pending };
+            return turn.await_head(pending);
         }
         if this.calls > this.after
             && let Some(next) = this.next.take()
         {
-            return next.into();
+            return turn.apply(next, prior);
         }
-        o3::buffer::write::Sink::write_byte(&mut write, input.as_slice()[0]).expect("inline frame");
-        Outcome::Complete {
-            permit,
-            consumption: Consumption::Buffered(Buffered::new(1)),
-            response: output::Complete::Inline,
-            connection: head::Connection::KeepAlive,
-        }
-        .into()
+        o3::buffer::write::Sink::write_byte(&mut turn.output, input.as_slice()[0])
+            .expect("inline frame");
+        turn.complete(
+            Consumption::Buffered(1),
+            output::Complete::Inline,
+            head::Connection::KeepAlive,
+            prior,
+        )
     }
 
     fn body_data(
@@ -136,7 +130,6 @@ impl<'d, Raw: Unpin, Head: Unpin, T: switch::Engine<Raw = Raw>> Dispatch<'d, (),
         self: Pin<&mut Self>,
         pending: Infallible,
         _: session::Complete,
-        _: Permit,
         _: o3::buffer::write::Slice<'_, &mut usize>,
         _: &mut (),
     ) -> session::BodyOutcome<'d, Self::Ready, Raw> {
@@ -146,7 +139,6 @@ impl<'d, Raw: Unpin, Head: Unpin, T: switch::Engine<Raw = Raw>> Dispatch<'d, (),
     fn resume_body(
         self: Pin<&mut Self>,
         ready: Self::Ready,
-        _: session::Permit,
         _: o3::buffer::write::Slice<'_, &mut usize>,
         _: &mut (),
     ) -> session::BodyOutcome<'d, Self::Ready, Raw> {

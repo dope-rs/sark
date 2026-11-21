@@ -163,7 +163,7 @@ impl<'observe: 'd, 'd, ID: route::Identity> handler::Borrowed<'d, ID> for App<'o
                             tail: None,
                         },
                     ),
-                    buffered: session::Buffered::new(1),
+                    consumed: 1,
                     response: output::Switch::Static(fixed::Body::new(&SWITCH_BYTES)),
                 }),
                 ..Frame::default()

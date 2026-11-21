@@ -29,7 +29,7 @@ use sark_h1::{
         payload,
     },
     session,
-    wire::{Failure, InputError, head, output, parsing, response},
+    wire::{Failure, InputError, head, output, response},
 };
 use sark_http::payload::{fixed, owned};
 use settings::{claim, errors};
@@ -191,70 +191,58 @@ impl<'a: 'd, 'd> session::Dispatch<'d, (), Infallible> for App<'a> {
     type Head = Infallible;
 
     fn resume_head(
-        self: Pin<&mut Self>,
         pending: Self::Head,
-        _: session::Permit,
-        _: Input<'_>,
-        _: o3::buffer::write::Slice<'_, &mut usize>,
-        _: &mut session::Conn<'d, (), Infallible>,
-    ) -> session::RouteOutcome<'d, Infallible, Infallible, Self::Head, parsing::Rejected<'d>> {
+        _: &mut session::Turn<'_, '_, 'd, (), Infallible, sark_h1::switch::Disabled, Self>,
+    ) -> session::Flow {
         match pending {}
     }
 
     fn try_consume(
-        self: Pin<&mut Self>,
-        permit: session::Permit,
         input: Input<'_>,
-        mut output: o3::buffer::write::Slice<'_, &mut usize>,
-        _: &mut session::Conn<'d, (), Infallible>,
-    ) -> session::RouteOutcome<'d, Infallible, Infallible, Self::Head, parsing::Rejected<'d>> {
-        match input.as_slice().first() {
-            Some(b'A') if input.as_slice().len() < 2 => session::Outcome::NeedMore {
-                permit,
-                state: session::NeedMore::Head,
+        turn: &mut session::Turn<'_, '_, 'd, (), Infallible, sark_h1::switch::Disabled, Self>,
+        prior: usize,
+    ) -> session::Flow {
+        let response = match input.as_slice().first() {
+            Some(b'A') if input.as_slice().len() < 2 => {
+                return session::Flow::Head;
             }
-            .into(),
             Some(b'A') => {
-                self.facts.routed.set(self.facts.routed.get() + 1);
-                if let Err(error) = o3::buffer::write::Sink::write_slice(&mut output, PREFIX) {
-                    return session::Outcome::Failed(Failure::Output(output::Error::Wire(
+                turn.router
+                    .facts
+                    .routed
+                    .set(turn.router.facts.routed.get() + 1);
+                if let Err(error) = o3::buffer::write::Sink::write_slice(&mut turn.output, PREFIX) {
+                    return turn.failed(Failure::Output(output::Error::Wire(
                         response::Error::ValueCapacity(error),
-                    )))
-                    .into();
+                    )));
                 }
-                session::Outcome::Complete {
-                    permit,
-                    consumption: session::Consumption::Buffered(session::Buffered::new(1)),
-                    response: output::Complete::Inline,
-                    connection: head::Connection::KeepAlive,
-                }
-                .into()
+                output::Complete::Inline
             }
             Some(b'C') => {
-                self.facts.routed.set(self.facts.routed.get() + 1);
-                let body = match storage::Shared::try_copy(b"bound-owner") {
-                    Ok(body) => body,
-                    Err(error) => {
-                        return session::Outcome::Failed(Failure::Input(InputError::Storage(
-                            error,
-                        )))
-                        .into();
-                    }
-                };
-                session::Outcome::Complete {
-                    permit,
-                    consumption: session::Consumption::Buffered(session::Buffered::new(1)),
-                    response: output::Complete::Shared { body },
-                    connection: head::Connection::KeepAlive,
+                turn.router
+                    .facts
+                    .routed
+                    .set(turn.router.facts.routed.get() + 1);
+                match storage::Shared::try_copy(b"bound-owner") {
+                    Ok(body) => output::Complete::Shared { body },
+                    Err(error) => return turn.failed(Failure::Input(InputError::Storage(error))),
                 }
-                .into()
             }
             Some(b'B') => {
-                self.facts.rejected.set(self.facts.rejected.get() + 1);
-                session::Outcome::Close(fixed::Body::new(self.reason)).into()
+                turn.router
+                    .facts
+                    .rejected
+                    .set(turn.router.facts.rejected.get() + 1);
+                return turn.close(fixed::Body::new(turn.router.reason));
             }
-            _ => session::Outcome::Failed(Failure::BadRequest).into(),
-        }
+            _ => return turn.failed(Failure::BadRequest),
+        };
+        turn.complete(
+            session::Consumption::Buffered(1),
+            response,
+            head::Connection::KeepAlive,
+            prior,
+        )
     }
 
     fn body_data(
@@ -282,7 +270,6 @@ impl<'a: 'd, 'd> session::Dispatch<'d, (), Infallible> for App<'a> {
         self: Pin<&mut Self>,
         wait: Infallible,
         _: session::Complete,
-        _: session::Permit,
         _: o3::buffer::write::Slice<'_, &mut usize>,
         _: &mut (),
     ) -> session::BodyOutcome<'d, Self::Ready> {
@@ -292,7 +279,6 @@ impl<'a: 'd, 'd> session::Dispatch<'d, (), Infallible> for App<'a> {
     fn resume_body(
         self: Pin<&mut Self>,
         ready: Self::Ready,
-        _: session::Permit,
         _: o3::buffer::write::Slice<'_, &mut usize>,
         _: &mut (),
     ) -> session::BodyOutcome<'d, Self::Ready> {

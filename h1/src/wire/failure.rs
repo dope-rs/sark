@@ -44,6 +44,10 @@ pub enum Failure {
 }
 
 impl Failure {
+    pub(crate) fn route<R: route::Project>(error: <R as route::Project>::Error<'_>) -> Self {
+        Self::Route(R::reject(error))
+    }
+
     pub(crate) fn reject(error: admit::Error<View<'_, '_>>) -> Self {
         let cause = match &error {
             admit::Error::Admission(failure) => failure.error(),

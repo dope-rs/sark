@@ -87,7 +87,6 @@ fn absent_stream_completes_with_zero_length() {
         let mut bytes = [0; 128];
         let mut writer = Slice::new(&mut bytes);
         let outcome = conn.dispatch_stream::<Streaming<false>, _, _, _, _>(
-            session::Permit::new(),
             head,
             &Cell::new(0),
             writer.reborrow(),

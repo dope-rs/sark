@@ -7,41 +7,32 @@ use std::{
     time::Duration,
 };
 
-use common::{
-    route::keep::{self, events::REJECTED_REQUESTS},
-    server,
-};
+use common::route::keep::{self, events::REJECTED_REQUESTS};
 
 #[test]
 fn rejects_head_once() {
-    let (pair, plan) = server::Plan::isolated();
-    let mut events = Vec::new();
-    pair.run(
-        |context, listener| keep::try_record(plan, context, listener, &mut events),
-        |address| {
-            for (prefix, suffix) in REJECTED_REQUESTS {
-                for split in [false, true] {
-                    let mut socket = TcpStream::connect(address).expect("connect");
+    let events = keep::record(|address| {
+        for (prefix, suffix) in REJECTED_REQUESTS {
+            for split in [false, true] {
+                let mut socket = TcpStream::connect(address).expect("connect");
+                socket
+                    .set_read_timeout(Some(Duration::from_secs(2)))
+                    .expect("response deadline");
+                if split {
+                    socket.write_all(prefix).expect("pending head");
+                    thread::sleep(Duration::from_millis(20));
+                    socket.write_all(suffix).expect("rejected continuation");
+                } else {
                     socket
-                        .set_read_timeout(Some(Duration::from_secs(2)))
-                        .expect("response deadline");
-                    if split {
-                        socket.write_all(prefix).expect("pending head");
-                        thread::sleep(Duration::from_millis(20));
-                        socket.write_all(suffix).expect("rejected continuation");
-                    } else {
-                        socket
-                            .write_all(&[prefix, suffix].concat())
-                            .expect("rejected request");
-                    }
-                    let mut response = Vec::new();
-                    socket.read_to_end(&mut response).expect("closed response");
-                    assert!(response.starts_with(b"HTTP/1.1 400 "));
+                        .write_all(&[prefix, suffix].concat())
+                        .expect("rejected request");
                 }
+                let mut response = Vec::new();
+                socket.read_to_end(&mut response).expect("closed response");
+                assert!(response.starts_with(b"HTTP/1.1 400 "));
             }
-        },
-    )
-    .expect("observed H1 runtime");
+        }
+    });
 
     let events: Vec<_> = events
         .into_iter()

@@ -93,13 +93,6 @@ pub trait Captured {
     fn captured(&self) -> Self::Output;
 }
 
-impl<'req> Captured for HdrReqHeaders<'req> {
-    type Output = (&'req [u8], Option<AcceptEncoding>);
-    fn captured(&self) -> Self::Output {
-        (self.x_token, self.encoding)
-    }
-}
-
 impl Captured for EncodingReqHeadersRaw {
     type Output = Option<Span>;
     fn captured(&self) -> Self::Output {

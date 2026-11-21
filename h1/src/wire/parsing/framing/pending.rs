@@ -5,18 +5,17 @@ use sark_http::h1::field::expect;
 use crate::{
     session,
     wire::{
-        head, parsing,
+        parsing,
         parsing::{framing, framing::Parsed},
         response,
     },
 };
 
-pub(crate) struct Pending<R: route::Spec> {
+pub struct Pending<R: route::Spec> {
     pub(crate) head: Parsed<storage::Shared, R>,
     pub(crate) state: session::BodyAwait,
     pub(crate) expectation: expect::Decision,
     pub(crate) declared_body_len: Length,
-    pub(crate) connection: head::Connection,
     pub(crate) response: response::Context,
 }
 
@@ -32,7 +31,6 @@ impl<R: route::Spec> Pending<R> {
             state: session::BodyAwait::new(consumed),
             expectation: base.expectation,
             declared_body_len: length,
-            connection: base.connection,
             response: base.response,
         })
     }

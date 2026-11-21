@@ -13,7 +13,7 @@ use sark_http::{
     field::metadata::{map::record, section::storage},
     h1::{framing::RequestBody, head::line},
     payload::response::dispatch,
-    request::{body::Ref, span::Span},
+    request::span::Span,
 };
 
 pub fn parsed(input: sark_h1::Input<'_>, methods: u8) -> sark_h1::wire::parsing::Head<'_> {
@@ -193,35 +193,19 @@ impl<const START: usize> route::Schema for Request<START> {
 }
 
 impl<const START: usize> route::Project for Request<START> {
-    type Params<'req> = ();
-    type Headers<'req> = ();
     type Error<'req> = Infallible;
     type View<'req, 'd>
-        = usize
-    where
-        'd: 'req;
-    type ParsedBody<'req, 'd>
         = usize
     where
         'd: 'req;
     fn reject(error: Infallible) -> route::Reject {
         match error {}
     }
-    fn from_params<'req, 'body>(
-        _: &request::raw::Parsed<request::Head<&'req [u8], Self::Frame>, Self>,
-    ) -> Result<Self::Params<'req>, <Self as route::Project>::Error<'body>> {
-        Ok(())
-    }
-    fn from_headers<'req, 'body>(
-        _: &request::raw::Parsed<request::Head<&'req [u8], Self::Frame>, Self>,
-    ) -> Result<Self::Headers<'req>, <Self as route::Project>::Error<'body>> {
-        Ok(())
-    }
-    fn parse_body<'req, 'd: 'req>(body: body::Len) -> Result<usize, Infallible> {
-        Ok(Ref::from(body).len())
-    }
-    fn from_parts<'req, 'd: 'req>(_: (), _: (), body: usize, _: &request::View<'req, 'd>) -> usize {
-        body
+    fn try_view<'req, 'body: 'req, 'd: 'body>(
+        _: &request::raw::Parsed<request::Head<&'req [u8]>, Self>,
+        body: body::Scoped<'body, 'd, body::Discarded>,
+    ) -> Result<usize, Infallible> {
+        Ok(body.body().len())
     }
 }
 

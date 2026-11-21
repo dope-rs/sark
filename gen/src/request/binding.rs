@@ -135,7 +135,9 @@ pub(super) fn build<'a>(
     fields: &'a fields::Fields,
     ordered: bool,
     symbols: &types::Generics,
+    view_fields: &mut Vec<proc_macro2::TokenStream>,
 ) -> syn::Result<(
+    proc_macro2::TokenStream,
     proc_macro2::TokenStream,
     proc_macro2::TokenStream,
     Vec<types::ValueKind>,
@@ -154,15 +156,7 @@ pub(super) fn build<'a>(
         .map(|index| symbols.local(&format!("__sark_field{index}")))
         .collect();
     let tys: Vec<&Type> = entries.clone().map(|field| &field.ty).collect();
-    let mode = quote::format_ident!("M");
-    let modes: Vec<Type> = tys
-        .iter()
-        .map(|ty| {
-            let mut ty = (*ty).clone();
-            types::Edit::new(&mut ty).retained(paths, types::RetainedAs::Mode(&mode));
-            ty
-        })
-        .collect();
+    let modes: Vec<Type> = tys.iter().map(|ty| types::retained(ty, paths)).collect();
     let mut kinds = Vec::with_capacity(tys.len());
     let raw_ty: Vec<Type> = tys
         .iter()
@@ -201,39 +195,28 @@ pub(super) fn build<'a>(
         }
     });
     let frame = quote::quote!(<#schema<'static> as #ns_core::route::Schema>::Frame);
+    view_fields.extend(
+        names
+            .iter()
+            .zip(&locals)
+            .map(|(name, value)| quote::quote!(#name: #value)),
+    );
+    let project = quote::quote! {
+        #read
+        #( let #locals = #views; )*
+    };
     let declaration = quote::quote! {
-        #vis struct #inner<
-            'd,
-            M: #ns_core::request::mode::Mode<'d> =
-                #ns_core::request::mode::Ref<'d>,
-        > {
+        #vis struct #inner<'d> {
             #( #names: #modes, )*
             #[doc(hidden)]
-            #marker: ::core::marker::PhantomData<fn(&'d (), M) -> (&'d (), M)>,
+            #marker: ::core::marker::PhantomData<fn(&'d ()) -> &'d ()>,
         }
 
         #[derive(::core::clone::Clone, ::core::marker::Copy, ::core::default::Default)]
         #vis struct #raw { #( #names: #raw_ty, )* #state }
     };
     let code = quote::quote! {
-        impl<'req> #inner<
-            'req,
-            #ns_core::request::mode::Ref<'req>,
-        > {
-            fn from_head(
-                #request: &#ns_core::request::raw::Parsed<
-                    #ns_core::request::Head<&'req [::core::primitive::u8], #frame>, #schema<'static>,
-                >,
-            ) -> Self {
-                #read
-                Self {
-                    #( #names: #views, )*
-                    #marker: ::core::marker::PhantomData,
-                }
-            }
-        }
-
-        impl<'d> #inner<'d, #ns_core::request::mode::Own> {
+        impl<'d> #inner<'d> {
             fn try_from_task(
                 #request: &#ns_core::request::raw::Parsed<
                     #ns_core::request::Parts<'d, #frame>, #schema<'static>,
@@ -247,5 +230,5 @@ pub(super) fn build<'a>(
             }
         }
     };
-    Ok((declaration, code, kinds, raw))
+    Ok((declaration, code, project, kinds, raw))
 }

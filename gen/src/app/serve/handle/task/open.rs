@@ -14,7 +14,7 @@ pub(super) fn generate(
 ) -> Vec<proc_macro2::TokenStream> {
     let [f_core, f_state] = ["core", "state"].map(local);
     let symbols = &ctx.plan.spec.state_generics;
-    let [n_body, n_call] = symbols.locals(["__body", "__call"]);
+    let [n_body, n_view] = symbols.locals(["__body", "__view"]);
     let [n_sess, v_cause] = symbols.locals(["__session", "cause"]);
     let [v_len, v_head] = symbols.locals(["content_length", "head"]);
     use quote::{format_ident, quote};
@@ -70,17 +70,15 @@ pub(super) fn generate(
                                 <<<#route as #ns_core::route::Spec>::Request
                                     as #ns_core::route::Schema>::Body
                                     as #ns_core::body::Project>::empty::<'_, 'd>();
-                            let #n_call = #ns_core::decode::Call::new(
-                                #v_head.borrow(),
-                                #n_body,
-                            );
-                            let #n_sess = #n_call.try_open::<#route, #state_ty>(
-                                self.#f_core.#f_state,
-                            ).map_err(|#v_cause| {
+                            let #n_view = <<#route as #ns_core::route::Spec>::Request
+                                as #ns_core::route::Project>::try_view(&#v_head.borrow(), #n_body)
+                            .map_err(|#v_cause| {
                                 #ns_core::duplex::OpenError::InvalidRequest(
                                     #error::#variant(#v_cause),
                                 )
                             })?;
+                            let #n_sess = <#route as #ns_core::duplex::Route<'_, #state_ty>>
+                                ::open(#n_view, self.#f_core.#f_state);
                             ::core::result::Result::Ok(#wrapped)
                         }
                     }

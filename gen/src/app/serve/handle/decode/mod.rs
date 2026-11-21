@@ -122,9 +122,8 @@ impl Decode {
         let [v_error] = symbols.locals(["error"]);
         let [n_call, n_error, n_fail] = symbols.locals(["__call", "__error", "__failure"]);
         let [n_ghead, n_input, n_result] = symbols.locals(["__guard_head", "__input", "__outcome"]);
-        let [n_resp, n_scope, n_slot] = symbols.locals(["__response", "__scope", "__slot"]);
+        let [n_scope, n_slot] = symbols.locals(["__scope", "__slot"]);
         let [n_source, v_len, v_head] = symbols.locals(["__source", "content_length", "head"]);
-        let [n_hdrs, n_params, n_view] = symbols.locals(["__headers", "__params", "__view"]);
         let [l_driver, l_req, l_out, l_input] =
             spec.state_generics
                 .lives(["__sark_driver", "__sark_request", "o", "req"]);
@@ -308,48 +307,30 @@ impl Decode {
                                 #n_encode,
                                 #v_head.owner().owner().view(),
                             );
-                            let #n_head = #v_head.borrow();
-                            let #n_resp = (|| {
-                                let #n_body = #n_body.into_inner();
-                                let #n_view = #n_body.into();
-                                let #n_params = <<#route as #ns_core::route::Spec>::Request
-                                    as #ns_core::route::Project>::from_params(&#n_head)?;
-                                let #n_hdrs = <<#route as #ns_core::route::Spec>::Request
-                                    as #ns_core::route::Project>::from_headers(&#n_head)?;
-                                let #n_body = <<#route as #ns_core::route::Spec>::Request
-                                    as #ns_core::route::Project>::parse_body(#n_body)?;
-                                let #n_req = #ns_core::request::View::from_head(
-                                    #n_head.into_owner(), #n_view,
-                                );
-                                ::core::result::Result::Ok(
-                                    <#route as #ns_core::manifold::Route<#state_ty>>::invoke(
-                                        (#n_params, &#n_req, #n_hdrs, #n_body, #app),
-                                    ),
-                                )
-                        })();
-                        let #n_prep = match #n_resp {
-                            ::core::result::Result::Ok(#n_resp) =>
-                                #ns_http::payload::response::dispatch::Complete::complete(
-                                    #n_resp,
-                                    #n_encode,
-                                ).map_err(|(#n_error, #n_encode)| (
-                                    #ns_core::decode::dispatch::Error::Encode(#n_error),
-                                    #n_encode,
-                                )),
-                            ::core::result::Result::Err(#n_error) =>
-                                ::core::result::Result::Err((
-                                    #ns_core::decode::dispatch::Error::Invalid(
-                                        #error_id::#variant(#n_error),
-                                    ),
-                                    #ns_core::decode::Cancel::cancel(#n_encode),
-                                )),
-                        }?;
-                        let #n_prep =
-                            #ns_core::decode::Lineage::resolve_head(
+                            let #n_prep = match <#schema as #ns_core::route::Project>
+                                ::try_view(&#v_head.borrow(), #n_body)
+                            {
+                                ::core::result::Result::Ok(#n_req) =>
+                                    #ns_http::payload::response::dispatch::Complete::complete(
+                                        <#route as #ns_core::manifold::Route<#state_ty>>
+                                            ::invoke(#n_req, #app),
+                                        #n_encode,
+                                    ).map_err(|(#n_error, #n_target)| (
+                                        #ns_core::decode::dispatch::Error::Encode(#n_error),
+                                        #n_target,
+                                    )),
+                                ::core::result::Result::Err(#n_error) =>
+                                    ::core::result::Result::Err((
+                                        #ns_core::decode::dispatch::Error::Invalid(
+                                            #error_id::#variant(#n_error),
+                                        ),
+                                        #ns_core::decode::Cancel::cancel(#n_encode),
+                                    )),
+                            }?;
+                            ::core::result::Result::Ok(#ns_core::decode::Lineage::resolve_head(
                                 #n_prep,
                                 #v_head.into_owner(),
-                            );
-                        ::core::result::Result::Ok(#n_prep)
+                            ))
                         })
                     },
                 },

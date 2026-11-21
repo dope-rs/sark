@@ -277,13 +277,13 @@ pub(super) fn build(
         impl #ns_json::parsing::Request for #name {
                 type View<'req> = #view<'req>;
 
-                fn prefix<'req>(
-                    #v_raw: &'req [::core::primitive::u8],
+                fn prefix<'req, 'input: 'req>(
+                    #v_raw: &'input [::core::primitive::u8],
                     mut #v_idx: ::core::primitive::usize,
                     #v_depth: #ns_json::parsing::Depth,
                 ) -> ::core::result::Result<
                     (Self::View<'req>, ::core::primitive::usize),
-                    #ns_json::parsing::Error<'req>,
+                    #ns_json::parsing::Error<'input>,
                 > {
                     #ns_json::input::Input::ws(#v_raw, &mut #v_idx);
                     #ns_json::input::Input::expect_byte(#v_raw, &mut #v_idx, b'{')?;
@@ -299,13 +299,13 @@ pub(super) fn build(
             impl<'view> #ns_json::parsing::Request for #view<'view> {
                 type View<'req> = #view<'req>;
 
-                fn prefix<'req>(
-                    #v_raw: &'req [::core::primitive::u8],
+                fn prefix<'req, 'input: 'req>(
+                    #v_raw: &'input [::core::primitive::u8],
                     #v_idx: ::core::primitive::usize,
                     #v_depth: #ns_json::parsing::Depth,
                 ) -> ::core::result::Result<
                     (Self::View<'req>, ::core::primitive::usize),
-                    #ns_json::parsing::Error<'req>,
+                    #ns_json::parsing::Error<'input>,
                 > {
                     <#name as #ns_json::parsing::Request>::prefix(#v_raw, #v_idx, #v_depth)
                 }

@@ -1,8 +1,7 @@
 use o3::buffer::write::Slice;
-use std::convert::Infallible;
 
 use duplex::machine;
-use sark_core::{body, body::credit, decode::Call, duplex, route};
+use sark_core::{body, body::credit, duplex, route, route::Project as _};
 use sark_http::{
     h1::{
         framing::RequestBody,
@@ -59,7 +58,6 @@ impl<'d, R: route::Spec> Pending<'d, R> {
     pub fn connect<'env, S, D, Wrap, E>(
         self,
         done: session::Complete,
-        permit: session::Permit,
         state: &'env S,
         wrap: Wrap,
         mut proof: E,
@@ -82,15 +80,7 @@ impl<'d, R: route::Spec> Pending<'d, R> {
             Ok(body) => body,
             Err(error) => return error.into(),
         };
-        construct::<R, S, D, Wrap>(
-            head.borrow(),
-            body,
-            state,
-            response,
-            wrap,
-            done.consumed,
-            permit,
-        )
+        construct::<R, S, D, Wrap>(head.borrow(), body, state, response, wrap, done.consumed)
     }
 }
 
@@ -99,7 +89,6 @@ impl<'d, Runtime, Stored, D: duplex::Session<'d>, Ready, Heads>
 {
     pub fn dispatch_connect<'env, R, S, Wrap, E>(
         &mut self,
-        permit: session::Permit,
         found: framing::Head<'_, '_, R>,
         state: &'env S,
         wrap: Wrap,
@@ -113,34 +102,34 @@ impl<'d, Runtime, Stored, D: duplex::Session<'d>, Ready, Heads>
         E: credit::Evidence,
         'd: 'env,
     {
-        if matches!(found.connection(), head::Connection::Close) {
+        if matches!(found.response().connection(), head::Connection::Close) {
             return session::Outcome::Failed(Failure::BadRequest).into();
         }
-        let frame = match framing::Frame::drive(found, &mut self.ingress, &mut proof) {
+        let (request, body, total, response) = match found.request(&mut self.ingress, &mut proof) {
             Ok(framing::Progress::Complete(frame)) => frame,
             Ok(framing::Progress::Pending(wait)) => {
-                return Pending::start(wait, self.ingress.payload.take(), permit, proof);
+                let (state, expectation, pending) = wait.retain(&mut self.ingress, proof);
+                return session::RouteOutcome::AwaitBody {
+                    state,
+                    expectation,
+                    pending,
+                };
             }
             Err(reason) => {
-                return reason.into_consume().into();
+                return session::Outcome::from(reason.into_rejection()).into();
             }
         };
-        let (request, body, total, _, response) = match frame.into_parts() {
-            Ok(parts) => parts,
-            Err(error) => return error.into_consume().into(),
-        };
-        construct::<R, S, D, Wrap>(request, body, state, response, wrap, total, permit).into()
+        construct::<R, S, D, Wrap>(request, body, state, response, wrap, total).into()
     }
 
     pub fn upgrade_websocket<'env, R, S, Wrap, E>(
         &mut self,
-        permit: session::Permit,
         found: framing::Head<'_, '_, R, Upgrade>,
         state: &'env S,
         write: Slice<'_, &mut usize>,
         wrap: Wrap,
         mut proof: E,
-    ) -> session::RouteOutcome<'d, Infallible, machine::Machine<'d, D>>
+    ) -> session::Outcome<'d, machine::Machine<'d, D>>
     where
         R: duplex::Route<'env, S>,
         R::Session: WebSocket + duplex::Session<'d>,
@@ -153,21 +142,17 @@ impl<'d, Runtime, Stored, D: duplex::Session<'d>, Ready, Heads>
         let input = source.input().as_slice();
         let target = source.request().target();
         let (found, (accept, origin, cookie)) = found.into_admission();
-        let frame = match framing::Frame::drive(found, &mut self.ingress, &mut proof) {
+        let (request, body, used, _) = match found.request(&mut self.ingress, &mut proof) {
             Ok(framing::Progress::Complete(frame)) => frame,
             Ok(framing::Progress::Pending(_)) => {
-                return session::Outcome::Failed(Failure::BadRequest).into();
+                return session::Outcome::Failed(Failure::BadRequest);
             }
-            Err(reason) => return reason.into_consume().into(),
-        };
-        let (request, body, used, _, _) = match frame.into_parts() {
-            Ok(parts) => parts,
-            Err(error) => return error.into_consume().into(),
+            Err(reason) => return reason.into_rejection().into(),
         };
         let authority = request.owner().authority();
         let raw = match open::<R, S>(request, body, state) {
             Ok(raw) => raw,
-            Err(error) => return session::Outcome::Failed(error).into(),
+            Err(error) => return session::Outcome::Failed(error),
         };
         match ws::Response::upgrade_into(write, &accept) {
             Ok(_) => {}
@@ -175,15 +160,14 @@ impl<'d, Runtime, Stored, D: duplex::Session<'d>, Ready, Heads>
                 raw.handler().failed(ws::Error::Capacity(error));
                 return session::Outcome::Failed(Failure::Output(
                     response::Error::ValueCapacity(error).into(),
-                ))
-                .into();
+                ));
             }
         };
         let (Some(authority), Ok(target)) = (authority, std::str::from_utf8(target)) else {
-            return session::Outcome::Failed(Failure::BadRequest).into();
+            return session::Outcome::Failed(Failure::BadRequest);
         };
         let Ok(authority) = std::str::from_utf8(authority) else {
-            return session::Outcome::Failed(Failure::BadRequest).into();
+            return session::Outcome::Failed(Failure::BadRequest);
         };
         let field = |span: Span| span.get(input).unwrap_or_else(|| unreachable!("opening"));
         if let Err(error) = raw.handler().opening(ws::Opening {
@@ -193,15 +177,13 @@ impl<'d, Runtime, Stored, D: duplex::Session<'d>, Ready, Heads>
             cookie: cookie.map(field),
         }) {
             raw.handler().failed(error);
-            return session::Outcome::Close(fixed::Body::new(ws::Response::FORBIDDEN)).into();
+            return session::Outcome::Close(fixed::Body::new(ws::Response::FORBIDDEN));
         }
-        permit
-            .switch(
-                switch::Transition::new(Kind::Upgrade, machine::Machine::new(wrap(raw))),
-                session::Buffered::new(used),
-                output::Switch::Inline,
-            )
-            .into()
+        session::Outcome::Switch {
+            next: switch::Transition::new(Kind::Upgrade, machine::Machine::new(wrap(raw))),
+            consumed: used,
+            response: output::Switch::Inline,
+        }
     }
 }
 
@@ -212,7 +194,6 @@ fn construct<'head, 'body, 'env, 'd, R, S, D, Wrap>(
     response: response::Context,
     wrap: Wrap,
     used: usize,
-    permit: session::Permit,
 ) -> session::Outcome<'d, machine::Machine<'d, D>>
 where
     R: duplex::Route<'env, S>,
@@ -225,11 +206,11 @@ where
         Ok(open) => machine::Machine::new(wrap(open)),
         Err(error) => return session::Outcome::Failed(error),
     };
-    permit.switch(
-        switch::Transition::new(Kind::Connect, raw),
-        session::Buffered::new(used),
-        output::Switch::Static(fixed::Body::new(response.version().connect())),
-    )
+    session::Outcome::Switch {
+        next: switch::Transition::new(Kind::Connect, raw),
+        consumed: used,
+        response: output::Switch::Static(fixed::Body::new(response.version().connect())),
+    }
 }
 
 fn open<'head, 'body, 'env, 'd, R, S>(
@@ -247,9 +228,9 @@ where
         (request, state),
         |scope| -> Result<_, Failure> {
             let ((request, state), view) = scope.into_parts();
-            let call = Call::new(request, view);
-            call.try_open::<R, S>(state)
-                .map_err(|error| Failure::Route(<R::Request as route::Project>::reject(error)))
+            let request =
+                R::Request::try_view(&request, view).map_err(Failure::route::<R::Request>)?;
+            Ok(R::open(request, state))
         },
     ) {
         Ok(result) => result,

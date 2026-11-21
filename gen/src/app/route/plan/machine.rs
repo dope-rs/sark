@@ -17,7 +17,7 @@ struct StateKey<'a> {
 pub(super) struct State {
     pub(super) depth: usize,
     pub(super) accept: Vec<usize>,
-    pub(super) literals: collections::BTreeMap<Vec<u8>, usize>,
+    pub(super) literals: Vec<(Vec<u8>, usize)>,
     pub(super) fallback: Option<usize>,
 }
 

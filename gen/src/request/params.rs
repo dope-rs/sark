@@ -18,10 +18,11 @@ impl Expansion {
         inner: &syn::Ident,
         raw: &syn::Ident,
         symbols: &types::Generics,
+        view_fields: &mut Vec<proc_macro2::TokenStream>,
     ) -> syn::Result<Self> {
         let ns_core = &paths.core;
-        let [v_params, v_err, v_rqst, v_req, v_caps] =
-            ["params", "error", "request", "req", "captures"].map(local);
+        let [v_params, v_err, v_rqst, v_caps] =
+            ["params", "error", "request", "captures"].map(local);
         if fields.is_empty() {
             return Ok(Self {
                 declaration: proc_macro2::TokenStream::new(),
@@ -44,14 +45,9 @@ impl Expansion {
                 syn::LitByteStr::new(field.path.value().as_bytes(), field.path.span())
             })
             .collect();
-        let mode = quote::format_ident!("M");
         let modes: Vec<syn::Type> = fields
             .iter()
-            .map(|(field, _)| {
-                let mut ty = field.ty.clone();
-                types::Edit::new(&mut ty).retained(paths, types::RetainedAs::Mode(&mode));
-                ty
-            })
+            .map(|(field, _)| types::retained(&field.ty, paths))
             .collect();
         let fallible = fields
             .iter()
@@ -73,76 +69,43 @@ impl Expansion {
             .map(|idx| symbols.local(&format!("cap{idx}")))
             .collect();
         let cap_ty = vec![quote::quote!(#ns_core::route::raw::PathCapture); captures.len()];
-        let frame = quote::quote!(<#schema<'static> as #ns_core::route::Schema>::Frame);
-        let body = quote::quote! {
-            let #raw { #( #names: #locals, )* } = *#req.params();
-            Self {
-                #( #values, )*
-                #marker: ::core::marker::PhantomData,
-            }
-        };
-        let bind = if fallible {
-            quote::quote! {
-                fn try_from_head(
-                    #req: &#ns_core::request::raw::Parsed<
-                        #ns_core::request::Head<&'req [::core::primitive::u8], #frame>, #schema<'static>,
-                    >,
-                ) -> ::core::result::Result<Self, <#schema<'static> as #ns_core::route::Schema>::Error> {
-                    ::core::result::Result::Ok({ #body })
-                }
-            }
-        } else {
-            quote::quote! {
-                fn from_head(
-                    #req: &#ns_core::request::raw::Parsed<
-                        #ns_core::request::Head<&'req [::core::primitive::u8], #frame>, #schema<'static>,
-                    >,
-                ) -> Self {
-                    #body
-                }
-            }
+        let read = quote::quote!(let #raw { #( #names: #locals, )* } = *#req.params(););
+        view_fields.extend(
+            names
+                .iter()
+                .zip(&locals)
+                .map(|(name, value)| quote::quote!(#name: #value)),
+        );
+        let view = quote::quote! {
+            #read
+            #( let #locals = #values; )*
         };
         let start = quote::quote! {
             let #v_params = {
                 let #req = &#v_rqst;
-                let #raw { #( #names: #locals, )* } = *#req.params();
-                #inner::<'d, #ns_core::request::mode::Own> {
-                    #( #owned, )*
+                #read
+                #inner::<'d> {
+                    #( #names: #owned, )*
                     #marker: ::core::marker::PhantomData,
                 }
             };
         };
-        let (error, reject, view) = if fallible {
+        let (error, reject) = if fallible {
             (
                 quote::quote!(<#schema<'static> as #ns_core::route::Schema>::Error),
                 quote::quote!(#v_err.reject()),
-                quote::quote! {
-                    #inner::<'req, #ns_core::request::mode::Ref<'req>>
-                        ::try_from_head(#v_req)
-                        .map_err(#ns_core::route::Input::Params)
-                },
             )
         } else {
             (
                 quote::quote!(::core::convert::Infallible),
                 quote::quote!(match #v_err {}),
-                quote::quote! {
-                    ::core::result::Result::Ok(
-                        #inner::<'req, #ns_core::request::mode::Ref<'req>>
-                            ::from_head(#v_req),
-                    )
-                },
             )
         };
         let declaration = quote::quote! {
-            #vis struct #inner<
-                'd,
-                M: #ns_core::request::mode::Mode<'d> =
-                    #ns_core::request::mode::Ref<'d>,
-            > {
+            #vis struct #inner<'d> {
                 #( pub #names: #modes, )*
                 #[doc(hidden)]
-                pub #marker: ::core::marker::PhantomData<fn(&'d (), M) -> (&'d (), M)>,
+                pub #marker: ::core::marker::PhantomData<fn(&'d ()) -> &'d ()>,
             }
 
             #[derive(::core::clone::Clone, ::core::marker::Copy)]
@@ -159,13 +122,6 @@ impl Expansion {
                     let ( #( #captures, )* ) = #v_caps;
                     Self { #( #names: #captures, )* }
                 }
-            }
-
-            impl<'req> #inner<
-                'req,
-                #ns_core::request::mode::Ref<'req>,
-            > {
-                #bind
             }
 
         };
@@ -189,7 +145,6 @@ impl Expansion {
         req: &syn::Ident,
     ) -> syn::Result<proc_macro2::TokenStream> {
         let ns_core = &paths.core;
-        let ident = &field.ident;
         let cause = local("cause");
         Ok(match kind {
             types::ValueKind::Bytes => {
@@ -199,24 +154,22 @@ impl Expansion {
                     quote::quote!(get())
                 };
                 quote::quote! {
-                    #ident: unsafe {
+                    unsafe {
                         #ns_core::request::frame::raw::Path::new(#req, #value)
                     }.#read
                 }
             }
             types::ValueKind::Usize => {
                 let slot = quote::format_ident!("Path{idx}");
-                let convert =
-                    owned.then(|| quote::quote!(.map_err(#ns_core::route::Input::Params)));
                 quote::quote! {
-                    #ident: unsafe {
+                    unsafe {
                         #ns_core::request::frame::raw::Path::new(#req, #value)
                     }
                     .try_parse()
                     .map_err(|#cause| #ns_core::route::Error::Path {
                         field: <<#schema<'static> as #ns_core::route::Fields>::Identity>::#slot,
                         cause: #cause,
-                    })#convert?
+                    }).map_err(#ns_core::route::Input::Params)?
                 }
             }
             _ => {

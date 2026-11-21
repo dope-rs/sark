@@ -1,5 +1,5 @@
 use crate::{
-    app::serve::{self, app, duplex, handle::h1::plan},
+    app::serve::{self, app},
     runtime::paths::Paths,
 };
 
@@ -11,19 +11,13 @@ pub(in crate::app) mod router;
 mod task;
 mod tasks;
 
+pub(super) use h1::plan::H1Plan;
+
 pub(super) struct Context<'view, 'source, 'spec> {
     pub(super) plan: &'source serve::ProtocolPlan<'spec>,
     pub(super) name: syn::Ident,
     pub(super) core_ident: syn::Ident,
     pub(super) exec: &'view serve::Execution<'source, 'spec>,
-}
-
-/// H1-only route state. Task-only expansion has no value of this type, making
-/// continuation, guard, and duplex planning unreachable there.
-pub(in crate::app::serve) struct H1Plan<'source, 'spec> {
-    pub(super) cleartext: Option<&'source proc_macro2::TokenStream>,
-    pub(super) duplex: &'source duplex::Plan<'spec>,
-    pub(super) continuations: plan::Plan<'source, 'spec>,
 }
 
 fn guard_rejection(
@@ -62,19 +56,6 @@ impl<'view, 'source, 'spec> Context<'view, 'source, 'spec> {
             name,
             core_ident: core,
             exec,
-        }
-    }
-}
-
-impl<'source, 'spec> H1Plan<'source, 'spec> {
-    pub(in crate::app::serve) fn new(
-        plan: &'source serve::ProtocolPlan<'spec>,
-        cleartext: Option<&'source proc_macro2::TokenStream>,
-    ) -> Self {
-        Self {
-            cleartext,
-            duplex: &plan.duplex,
-            continuations: plan::Plan::full(plan),
         }
     }
 }

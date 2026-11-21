@@ -3,20 +3,12 @@ pub mod common;
 use std::{hint, mem, num::NonZero};
 
 use dope::{
-    core::{
-        BranchError,
-        driver::{
-            Binding, life::recovery::Policy, route::KeyTag, schedule::ready::task::owner, settings,
-        },
-    },
+    core::driver::{Binding, route::KeyTag, schedule::ready::task::owner, settings},
     manifold::app::receive::limits::Budget,
     net::wire::{self, Identity},
 };
 use dope_fiber::task::storage::scope::Brand;
-use dope_test::{
-    alloc::Tracker,
-    scope::{Driver, Error},
-};
+use dope_test::alloc::Tracker;
 use o3::buffer::hold::limits::Bound;
 use sark_core::{decode::Decode, duplex};
 use sark_fiber::{Config, EmptyState};
@@ -39,7 +31,7 @@ use crate::common::{
         metadata::{DecodeExt as _, EntriesExt as _},
     },
 };
-use common::server::recover;
+use common::route::with_scope;
 
 #[global_allocator]
 static ALLOCATOR: Tracker = Tracker::new();
@@ -139,9 +131,10 @@ fn duplex_layout_is_exact() {
 
 #[test]
 fn duplex_bind_no_gzip() {
-    let mut reports = Vec::new();
-    Driver::new(settings::Config::for_profile::<sark_fiber::Throughput>()).with_driver(
-        |driver| {
+    with_scope(
+        settings::Config::for_profile::<sark_fiber::Throughput>(),
+        |scope| {
+            let driver = scope.context();
             let clock = date::Clock::new().expect("HTTP date clock");
             let binding = Binding::new(
                 driver.driver_ref().timer(),
@@ -162,25 +155,15 @@ fn duplex_bind_no_gzip() {
             assert_eq!(allocs, 0);
             hint::black_box(&bound);
         },
-        Policy::new(|event| reports.push(event), recover),
-        |result| {
-            result
-                .as_ref()
-                .map_err(|error| match error {
-                    Error::Create(error) => BranchError::First(error.kind()),
-                    Error::Close(error) => BranchError::Second(error.cause()),
-                })
-                .expect("driver");
-        },
     );
-    assert!(reports.is_empty(), "driver retirement: {reports:?}");
 }
 
 #[test]
 fn routes_without_alloc() {
-    let mut reports3 = Vec::new();
-    Driver::new(settings::Config::for_profile::<sark_fiber::Throughput>()).with_driver(
-        |driver| {
+    with_scope(
+        settings::Config::for_profile::<sark_fiber::Throughput>(),
+        |scope| {
+            let driver = scope.context();
             let binding = Binding::new(
                 driver.driver_ref().timer(),
                 owner::Capacity::new(NonZero::<u32>::MIN),
@@ -248,20 +231,6 @@ fn routes_without_alloc() {
                 ));
             }
         },
-        Policy::new(|event| reports3.push(event), recover),
-        |result| {
-            result
-                .as_ref()
-                .map_err(|error| match error {
-                    Error::Create(error) => BranchError::First(error.kind()),
-                    Error::Close(error) => BranchError::Second(error.cause()),
-                })
-                .expect("driver");
-        },
-    );
-    assert!(
-        reports3.is_empty(),
-        "identity-only scope returned I/O: {reports3:?}"
     );
 }
 

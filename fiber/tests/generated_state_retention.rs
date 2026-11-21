@@ -1,27 +1,17 @@
 pub mod common;
 
-use std::{
-    cell::Cell,
-    convert::Infallible,
-    io::{Read, Write},
-    marker::PhantomData,
-    net::TcpStream,
-    time::Duration,
-};
+use std::{cell::Cell, convert::Infallible, marker::PhantomData, time::Duration};
 
-use common::server::recover;
 use common::{
     route::glue::task::{self, generics},
-    server::{self, Plan},
+    server::{self, peer::request_to_eof},
 };
 use dope::{
-    core::driver::life::recovery::Policy,
     net::wire::{self, domain},
     runtime::executor::session,
 };
 use dope_fiber::task::storage::scope::Brand;
 use dope_test::harness::server::Pair;
-use sark_fiber::server::Serve as _;
 use sark_fiber::Config;
 
 #[test]
@@ -29,7 +19,7 @@ fn retains_generic_body() {
     let harness = Pair::bind().expect("bind isolated listener");
     let plan = server::Plan::new(harness.addr(), Duration::from_secs(5)).build();
     harness
-        .check(
+        .run(
             |context, listener| {
                 let first = String::from("generic ");
                 let second = String::from("response");
@@ -41,70 +31,20 @@ fn retains_generic_body() {
                         encoded: &encoded,
                     },
                 };
-                let mut reports =
-                    server::Plan::try_reports(&plan).expect("server descriptor claims");
-                let result = plan.with_bound(listener).prepare(()).map(|prepared| {
-                    let mut finish = session::Completion::new();
-                    prepared.enter_with(
-                        context,
-                        {
-                            let (state, config, report) =
-                                (&state, Config::new(server::MAX_CONNECTIONS), &mut finish);
-                            move |worker| {
-                                worker.lend(|plan, stage| {
-                                    let wire =
-                                        domain::Local::new(wire::Identity);
-                                    Brand::with(|brand| {
-                                        let app = generics::App::new(brand, state, config);
-                                        plan.install(stage, wire, app, |root, _wait, stage| {
-                                            let result = stage.request(report, root);
-                                            result
-                                                .as_ref()
-                                                .map_err(|error| error.cause())
-                                                .expect("session");
-                                            result.ok().expect("checked session").expect("drive")
-                                        })
-                                    })
-                                })
-                            }
-                        },
-                        Policy::new(|event| reports.push(event), recover),
-                        |result| {
-                            result
-                                .as_ref()
-                                .map_err(|error| error.cause())
-                                .expect("topology");
-                            drop(result.ok().expect("checked topology").expect("install"));
-                        },
-                    )
-                });
-                assert!(
-                    reports.events().expect("reclaimed resources").is_empty(),
-                    "server retirement: {reports:?}"
+                let result = server::try_serve::<generics::App, _>(
+                    plan,
+                    context,
+                    listener,
+                    state,
+                    server::MAX_CONNECTIONS,
                 );
                 assert_eq!(encoded.get(), 1);
                 result
             },
             |address| {
-                let mut socket = TcpStream::connect(address).expect("connect generic task client");
-                socket
-                    .set_read_timeout(Some(Duration::from_secs(3)))
-                    .expect("set response deadline");
-                socket
-                    .write_all(b"GET / HTTP/1.1\r\nHost: task\r\nConnection: close\r\n\r\n")
-                    .expect("write task request");
-                let mut response = Vec::new();
-                socket
-                    .read_to_end(&mut response)
-                    .expect("read completed response");
+                let response = request_to_eof(address, task::CASES[0].0, Duration::from_secs(3))
+                    .expect("generic response");
                 assert!(response.ends_with(b"generic response"));
-            },
-            |result| {
-                assert!(
-                    result.is_ok(),
-                    "server preparation failed: {:?}",
-                    result.err()
-                )
             },
         )
         .expect("generic task harness");
@@ -166,36 +106,22 @@ fn retains_scoped_body() {
                             result
                         })
                     },
-                    Policy::new(|event| reports.push(event), recover),
+                    server::reporting(&mut reports),
                     |result| {
                         result
                             .as_ref()
-                            .map_err(|error| {
-                                error.kind().map(|output| output.as_ref().map(|_| ()))
-                            })
+                            .map_err(|error| error.kind().map(|output| output.as_ref().map(|_| ())))
                             .expect("topology")
                             .as_ref()
                             .expect("worker");
                     },
                 );
-                assert!(
-                    reports.events().expect("reclaimed resources").is_empty(),
-                    "server retirement: {reports:?}"
-                );
+                server::reclaimed(&reports);
                 Ok::<(), Infallible>(())
             },
             |address| {
-                let mut socket = TcpStream::connect(address).expect("connect scoped task client");
-                socket
-                    .set_read_timeout(Some(Duration::from_secs(3)))
-                    .expect("set response deadline");
-                socket
-                    .write_all(b"GET / HTTP/1.1\r\nHost: task\r\nConnection: close\r\n\r\n")
-                    .expect("write task request");
-                let mut response = Vec::new();
-                socket
-                    .read_to_end(&mut response)
-                    .expect("read scoped response");
+                let response = request_to_eof(address, task::CASES[0].0, Duration::from_secs(3))
+                    .expect("scoped response");
                 assert!(response.ends_with(b"scoped response"));
             },
         )
@@ -207,7 +133,7 @@ fn retains_state_to_finish() {
     let harness = Pair::bind().expect("bind isolated listener");
     let plan = server::Plan::new(harness.addr(), Duration::from_secs(5)).build();
     harness
-        .check(
+        .run(
             |context, listener| {
                 let first = String::from("retained ");
                 let second = String::from("response");
@@ -217,39 +143,20 @@ fn retains_state_to_finish() {
                     second: second.as_bytes(),
                     encoded: &encoded,
                 };
-                let mut reports = Plan::try_reports(&plan).expect("server descriptor claims");
-                let result = task::App::serve(
-                    plan.with_bound(listener),
+                let result = server::try_serve::<task::App, _>(
+                    plan,
                     context,
+                    listener,
                     state,
-                    Config::new(server::MAX_CONNECTIONS),
-                    Policy::new(|event| reports.push(event), recover),
-                    |result| {
-                        result
-                            .as_ref()
-                            .map(|_| ())
-                            .map_err(|error| error.cause())
-                            .expect("server")
-                    },
-                );
-                assert!(
-                    reports.events().expect("reclaimed resources").is_empty(),
-                    "server retirement: {reports:?}"
+                    server::MAX_CONNECTIONS,
                 );
                 assert_eq!(encoded.get(), task::CASES.len());
                 result
             },
             |address| {
                 for (request, status) in task::CASES {
-                    let mut socket = TcpStream::connect(address).expect("connect task client");
-                    socket
-                        .set_read_timeout(Some(Duration::from_secs(3)))
-                        .expect("set response deadline");
-                    socket.write_all(request).expect("write task request");
-                    let mut response = Vec::new();
-                    socket
-                        .read_to_end(&mut response)
-                        .expect("read completed response");
+                    let response = request_to_eof(address, request, Duration::from_secs(3))
+                        .expect("task response");
                     assert!(response.starts_with(status));
                     let body = response
                         .windows(4)
@@ -258,13 +165,6 @@ fn retains_state_to_finish() {
                         + 4;
                     assert_eq!(&response[body..], b"retained response");
                 }
-            },
-            |result| {
-                assert!(
-                    result.is_ok(),
-                    "server preparation failed: {:?}",
-                    result.err()
-                );
             },
         )
         .expect("task harness");

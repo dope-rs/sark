@@ -21,7 +21,7 @@ pub(super) fn build(
     let [v_cause, v_link] = symbols.locals(["cause", "connection"]);
     let [v_linkid, v_core, v_date] = symbols.locals(["connection_id", "core", "date"]);
     let [v_driver, v_error, v_exch] = symbols.locals(["driver", "error", "exchange"]);
-    let [v_result, v_wait, v_ready] = symbols.locals(["outcome", "pending", "ready"]);
+    let [v_wait, v_ready] = symbols.locals(["pending", "ready"]);
     let [v_this] = symbols.locals(["this"]);
     let [l_a, l_w, g_event] = types.names.generics.lives(["__a", "__wire", "e"]);
     let [g_id, g_mode, g_wire] = types.names.generics.idents(["__ID", "__M", "__W"]);
@@ -54,9 +54,19 @@ pub(super) fn build(
     let close = &tasks.close_body;
     let task_methods = &types.task_methods;
     let cancel = &routes.cancel_arms;
-    let retire_pending =
-        (!cancel.is_empty()).then(|| quote::quote!(#v_exch.retire(#v_this.#f_life, #v_result);));
-    let cancelrd = &routes.ready_cancel;
+    let retired = quote!(#v_exch.retire(#v_this.#f_life, #ns_core::life::Outcome::Cancelled););
+    let retire_pending = (!cancel.is_empty()).then_some(&retired);
+    let ready_cancel = &routes.ready_cancel_arms;
+    let cancel_ready = if ready_cancel.is_empty() {
+        quote!(match #v_ready {})
+    } else {
+        quote! {
+            let mut #v_this = self.as_mut().project();
+            let #v_exch = #v_ready.exchange;
+            match #v_ready.route { #ready_cancel }
+            #retired
+        }
+    };
     let ed = match proto.duplex {
         duplex::State::Enabled => quote!(#v_driver),
         duplex::State::Disabled => quote!(_),
@@ -117,9 +127,7 @@ pub(super) fn build(
             fn __cancel_pending(self: ::core::pin::Pin<&mut Self>, #v_wait: #pending) {
                 let mut #v_this = self.project();
                 let #v_exch = #v_wait.exchange;
-                let #v_result = match #v_wait.route {
-                    #cancel
-                };
+                match #v_wait.route { #cancel }
                 #retire_pending
             }
 
@@ -135,8 +143,7 @@ pub(super) fn build(
                 if let ::core::option::Option::Some(#v_ready) =
                     #edit.ingress.take_ready()
                 {
-                    let mut #v_this = self.as_mut().project();
-                    #cancelrd
+                    #cancel_ready
                 }
                 #close
                 #edit.retire();

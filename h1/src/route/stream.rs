@@ -1,7 +1,7 @@
 //! Streaming route execution over borrowed HTTP/1 protocol storage.
 use o3::buffer::write::Slice;
 
-use sark_core::{body, body::credit, decode::Call, manifold, route};
+use sark_core::{body, body::credit, manifold, route, route::Project as _};
 use sark_http::{
     h1::codec::canned,
     payload::response::{Method, dispatch},
@@ -23,19 +23,18 @@ fn finish<'req, 'd: 'req, R, S, Runtime, Source, Admit, D>(
     date: &[u8; 29],
     response: response::Context,
     used: usize,
-    permit: session::Permit,
 ) -> session::Outcome<'d, D>
 where
     R: route::Spec<Kind = dispatch::Polled> + manifold::Route<S> + crate::route::PolicyOf,
     Source: FnOnce() -> Option<Admit>,
     Admit: FnOnce(R::Stream<'d>, &mut Runtime, response::Context),
 {
-    let admit = match (response.method(), tasks) {
-        (Method::Head, _) => Some(output::Admit::Head),
-        (Method::Other | Method::Connect, tasks) => tasks().map(output::Admit::Body),
-    };
-    let Some(admit) = admit else {
-        return session::Outcome::Close(canned::SERVICE_UNAVAILABLE);
+    let admit = match response.method() {
+        Method::Head => None,
+        Method::Other | Method::Connect => match tasks() {
+            Some(admit) => Some(admit),
+            None => return session::Outcome::Close(canned::SERVICE_UNAVAILABLE),
+        },
     };
     let streamed = match <<R::Request as route::Schema>::Body as body::Project>::try_project(
         body,
@@ -47,11 +46,9 @@ where
         ),
         |scope| -> Result<_, Failure> {
             let ((request, state, egress, admit), view) = scope.into_parts();
-            let call = Call::new(request, view);
-            let reply = call
-                .try_invoke::<R, S>(state)
-                .map_err(|error| Failure::Route(<R::Request as route::Project>::reject(error)))?;
-            egress.stream(reply, R::POLICY, admit)
+            let request =
+                R::Request::try_view(&request, view).map_err(Failure::route::<R::Request>)?;
+            egress.stream(R::invoke(request, state), R::POLICY, admit)
         },
     ) {
         Ok(Ok(streamed)) => streamed,
@@ -61,13 +58,9 @@ where
         }
     };
     let Some((admit, stream)) = streamed else {
-        return output::Complete::Inline.into_consume(
-            permit,
-            session::Consumption::Buffered(session::Buffered::new(used)),
-            response.connection(),
-        );
+        return output::Complete::Inline
+            .into_consume(session::Consumption::Buffered(used), response.connection());
     };
-    permit.commit();
     admit(stream, runtime, response);
     session::Outcome::Streamed {
         consumed: used,
@@ -79,7 +72,6 @@ impl<'d, R: route::Spec> Pending<'d, R> {
     pub fn stream<S, Runtime, Source, Admit, E, D>(
         self,
         done: session::Complete,
-        permit: session::Permit,
         state: &S,
         write: Slice<'_, &mut usize>,
         date: &[u8; 29],
@@ -113,7 +105,6 @@ impl<'d, R: route::Spec> Pending<'d, R> {
             date,
             response,
             done.consumed,
-            permit,
         )
     }
 }
@@ -123,7 +114,6 @@ impl<'d, Runtime, Stored, Transitions: switch::Engine, Ready, Heads>
 {
     pub fn dispatch_stream<R, S, Source, Admit, E>(
         &mut self,
-        permit: session::Permit,
         found: framing::Head<'_, '_, R>,
         state: &S,
         write: Slice<'_, &mut usize>,
@@ -137,19 +127,21 @@ impl<'d, Runtime, Stored, Transitions: switch::Engine, Ready, Heads>
         Admit: FnOnce(R::Stream<'d>, &mut Runtime, response::Context),
         E: credit::Evidence,
     {
-        let frame = match framing::Frame::drive(found, &mut self.ingress, &mut proof) {
-            Ok(framing::Progress::Complete(frame)) => frame,
-            Ok(framing::Progress::Pending(wait)) => {
-                return Pending::start(wait, self.ingress.payload.take(), permit, proof);
-            }
-            Err(reason) => {
-                return reason.into_consume().into();
-            }
-        };
-        let (request, mut body, total, _, response) = match frame.into_parts() {
-            Ok(parts) => parts,
-            Err(error) => return error.into_consume().into(),
-        };
+        let (request, mut body, total, response) =
+            match found.request(&mut self.ingress, &mut proof) {
+                Ok(framing::Progress::Complete(frame)) => frame,
+                Ok(framing::Progress::Pending(wait)) => {
+                    let (state, expectation, pending) = wait.retain(&mut self.ingress, proof);
+                    return session::RouteOutcome::AwaitBody {
+                        state,
+                        expectation,
+                        pending,
+                    };
+                }
+                Err(reason) => {
+                    return session::Outcome::from(reason.into_rejection()).into();
+                }
+            };
         finish::<R, _, _, _, _, Transitions::Raw>(
             request,
             &mut body,
@@ -160,7 +152,6 @@ impl<'d, Runtime, Stored, Transitions: switch::Engine, Ready, Heads>
             date,
             response,
             total,
-            permit,
         )
         .into()
     }

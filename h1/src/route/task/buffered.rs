@@ -9,7 +9,7 @@ use sark_http::payload::{fixed, owned, response::Body as _};
 
 use crate::{
     session,
-    wire::{Failure, head, response::Context},
+    wire::{Failure, response::Context},
 };
 
 use super::Streaming;
@@ -19,7 +19,6 @@ pub struct Pending<'d, R: route::Spec<Request: route::Own>> {
     head: Parsed<Parts<'d, <R::Request as route::Schema>::Frame>, R::Request>,
     body: buffered::State<owned::Segments<'d>>,
     account: credit::raw::Account,
-    connection: head::Connection,
     response: Context,
 }
 
@@ -27,14 +26,12 @@ impl<'d, R: route::Spec<Request: route::Own>> Pending<'d, R> {
     pub(super) fn new(
         head: Parsed<Parts<'d, <R::Request as route::Schema>::Frame>, R::Request>,
         open: admit::Track<admit::Open>,
-        connection: head::Connection,
         response: Context,
     ) -> Self {
         Self {
             head,
             body: buffered::State::new(open),
             account: credit::raw::Account::new(),
-            connection,
             response,
         }
     }
@@ -56,7 +53,6 @@ impl<'d, R: route::Spec<Request: route::Own>> Pending<'d, R> {
             head,
             body,
             mut account,
-            connection,
             response,
         } = self;
         let bytes = parts.len();
@@ -95,7 +91,6 @@ impl<'d, R: route::Spec<Request: route::Own>> Pending<'d, R> {
             head,
             body,
             account,
-            connection,
             response,
         })
     }
@@ -119,26 +114,18 @@ impl<'d, R: route::Spec<Request: route::Own>> Pending<'d, R> {
     pub fn finish<Runtime, Admit, E, D>(
         self,
         done: session::Complete,
-        permit: session::Permit,
         rt: &mut Runtime,
         admit: Admit,
         mut proof: E,
     ) -> session::BodyOutcome<'d, super::Ready<'d, R>, D>
     where
-        Admit: FnOnce(
-            Input<'d, R>,
-            usize,
-            head::Connection,
-            Context,
-            &mut Runtime,
-        ) -> session::Outcome<'d, D>,
+        Admit: FnOnce(Input<'d, R>, usize, Context, &mut Runtime) -> session::Outcome<'d, D>,
         E: credit::Evidence,
     {
         let Self {
             head,
             body,
             mut account,
-            connection,
             response,
         } = self;
         let result = account.scope(|mut ledger| {
@@ -156,7 +143,6 @@ impl<'d, R: route::Spec<Request: route::Own>> Pending<'d, R> {
                     ));
                 }
             };
-            permit.commit();
             let body = match body.try_finish(&mut ledger, &mut proof) {
                 Ok(body) => body,
                 Err(failure) => {
@@ -177,7 +163,6 @@ impl<'d, R: route::Spec<Request: route::Own>> Pending<'d, R> {
             admit(
                 Input::Buffered(head.with_body(body)),
                 done.consumed,
-                connection,
                 response,
                 rt,
             )

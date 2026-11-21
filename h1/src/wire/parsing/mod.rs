@@ -1,5 +1,5 @@
 //! Request routing context and HTTP/1 body framing.
-use core::convert::Infallible;
+use core::{convert::Infallible, ops::ControlFlow};
 use std::num::NonZero;
 
 use o3::buffer::{bytes::window::Snapshot, storage, write::Sink as _};
@@ -67,19 +67,19 @@ impl<R: route::Schema> Request<R> {
         Self::Wire(Failure::Bind(error))
     }
 
-    pub fn into_consume<'d, D>(self) -> crate::session::Outcome<'d, D> {
+    pub fn into_rejection<'d>(self) -> Rejection<'d> {
         match self {
             Self::Wire(error)
             | Self::Head(head::Error::Line(head::line::Error::Admission(error))) => {
-                crate::session::Outcome::Failed(error)
+                Rejection::Failed(error)
             }
             Self::Head(head::Error::Storage(error)) => {
-                crate::session::Outcome::Failed(Failure::Input(InputError::Storage(error)))
+                Rejection::Failed(Failure::Input(InputError::Storage(error)))
             }
             Self::Head(head::Error::UnsupportedTransferEncoding) => {
-                crate::session::Outcome::Close(canned::NOT_IMPLEMENTED)
+                Rejection::Close(canned::NOT_IMPLEMENTED)
             }
-            Self::Head(_) | Self::Query(_) => crate::session::Outcome::Close(canned::BAD_REQUEST),
+            Self::Head(_) | Self::Query(_) => Rejection::Close(canned::BAD_REQUEST),
         }
     }
 }
@@ -194,78 +194,56 @@ impl<'d> Rejected<'d> {
         self.len() == 0
     }
 
-    pub fn start<P, D, H>(
-        head: &Head<'_>,
-        permit: session::Permit,
-        reply: fixed::Body<'d>,
-    ) -> session::RouteOutcome<'d, P, D, H, Self> {
+    pub fn start(head: &Head<'_>, reply: fixed::Body<'d>) -> ControlFlow<Self, Rejection<'d>> {
         let source = match scan::State::try_request(
             *head.request(),
             Limit::DEFAULT.with_bytes(recv::HEAD_CAPACITY),
         ) {
             Ok(source) => source,
-            Err(error) => return session::Outcome::Close(rejection(error)).into(),
+            Err(error) => return ControlFlow::Continue(Rejection::Close(rejection(error))),
         };
         match source.advance(|_| Ok::<_, Infallible>(())) {
-            Ok(scan::Progress::Complete(_)) => session::Outcome::Close(reply).into(),
-            Err((_, error)) => session::Outcome::Close(rejection(error)).into(),
+            Ok(scan::Progress::Complete(_)) => ControlFlow::Continue(Rejection::Close(reply)),
+            Err((_, error)) => ControlFlow::Continue(Rejection::Close(rejection(error))),
             Ok(scan::Progress::More(source)) => {
                 let capacity = NonZero::new(source.as_ref().len()).unwrap_or(NonZero::<usize>::MIN);
                 match source.try_snapshot(capacity) {
-                    Ok(source) => session::RouteOutcome::AwaitReject {
-                        permit,
-                        pending: Self { source, reply },
-                    },
-                    Err(error) => failed(error).into(),
+                    Ok(source) => ControlFlow::Break(Self { source, reply }),
+                    Err(error) => ControlFlow::Continue(error.into()),
                 }
             }
         }
     }
 
-    pub fn start_owned<P, D, H>(
-        source: Owned,
-        permit: session::Permit,
-        reply: fixed::Body<'d>,
-    ) -> session::RouteOutcome<'d, P, D, H, Self> {
+    pub fn start_owned(source: Owned, reply: fixed::Body<'d>) -> ControlFlow<Self, Rejection<'d>> {
         let source =
             match scan::State::try_line(source, Limit::DEFAULT.with_bytes(recv::HEAD_CAPACITY)) {
                 Ok(source) => source,
                 Err(rejected) => {
                     let (_, error) = rejected.into_parts();
-                    return session::Outcome::Close(rejection(error)).into();
+                    return ControlFlow::Continue(Rejection::Close(rejection(error)));
                 }
             };
-        Self { source, reply }.advance(permit)
+        Self { source, reply }.advance()
     }
 
-    pub fn resume<P, D, H>(
-        mut self,
-        input: Input<'_>,
-        permit: session::Permit,
-    ) -> session::RouteOutcome<'d, P, D, H, Self> {
+    pub fn resume(mut self, input: Input<'_>) -> ControlFlow<Self, Rejection<'d>> {
         let input = input.as_slice();
         let limit = recv::HEAD_CAPACITY + 1 - self.len();
         if let Err(error) = self.source.try_extend(&input[..input.len().min(limit)]) {
-            return failed(error).into();
+            return ControlFlow::Continue(error.into());
         }
-        self.advance(permit)
+        self.advance()
     }
 
-    fn advance<P, D, H>(self, permit: session::Permit) -> session::RouteOutcome<'d, P, D, H, Self> {
+    fn advance(self) -> ControlFlow<Self, Rejection<'d>> {
         let Self { source, reply } = self;
         match source.advance(|_| Ok::<_, Infallible>(())) {
-            Ok(scan::Progress::Complete(_)) => session::Outcome::Close(reply).into(),
-            Err((_, error)) => session::Outcome::Close(rejection(error)).into(),
-            Ok(scan::Progress::More(source)) => session::RouteOutcome::AwaitReject {
-                permit,
-                pending: Self { source, reply },
-            },
+            Ok(scan::Progress::Complete(_)) => ControlFlow::Continue(Rejection::Close(reply)),
+            Err((_, error)) => ControlFlow::Continue(Rejection::Close(rejection(error))),
+            Ok(scan::Progress::More(source)) => ControlFlow::Break(Self { source, reply }),
         }
     }
-}
-
-fn failed<'d, D>(error: storage::AllocError) -> session::Outcome<'d, D> {
-    Rejection::from(error).into()
 }
 
 pub(super) fn rejection<'d>(cause: ParseError<Infallible>) -> fixed::Body<'d> {

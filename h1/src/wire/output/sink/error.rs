@@ -59,6 +59,12 @@ impl Error {
     }
 }
 
+impl From<Error> for crate::wire::Failure {
+    fn from(error: Error) -> Self {
+        Self::Output(error)
+    }
+}
+
 impl From<response::Error> for Error {
     fn from(error: response::Error) -> Self {
         Self::Wire(error)

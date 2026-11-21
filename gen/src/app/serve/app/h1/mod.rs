@@ -73,7 +73,7 @@ pub(super) fn extras<'emit, 'source, 'spec>(
             let #v_tasks = #ns_fiber::dope_fiber::task::storage::scope::Owned::new(#v_tasks, #v_brand);
         }
     });
-    let pending = plan.continuations.definitions(paths);
+    let pending = plan.definitions(paths, exec);
     let duplex = plan.duplex.state();
     let input = duplex.input_type(paths);
     let config = duplex.config(paths);

@@ -105,7 +105,6 @@ pub struct Parsed<H, A: Admission = ()> {
     body: RequestBody,
     expectation: expect::Decision,
     layout: Layout,
-    connection: Connection,
     response: response::Context,
 }
 
@@ -132,10 +131,6 @@ impl<H, A: Admission> Parsed<H, A> {
 
     pub const fn layout(&self) -> Layout {
         self.layout
-    }
-
-    pub(crate) const fn connection(&self) -> Connection {
-        self.connection
     }
 }
 
@@ -333,7 +328,6 @@ impl<H, A: Admission> Parsed<H, A> {
             body: admit.body(),
             expectation: admit.expectation(),
             layout,
-            connection: conn,
             response: response
                 .with_connection(conn)
                 .with_coding(fields.message.coding()),

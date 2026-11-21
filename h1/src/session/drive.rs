@@ -1,4 +1,4 @@
-use core::{mem, pin};
+use core::pin;
 
 use o3::buffer::{
     Complete as _,
@@ -6,7 +6,7 @@ use o3::buffer::{
 };
 use sark_http::{h1::codec::canned, payload::fixed::Body};
 
-use super::{Buffered, Conn, Consumption, Dispatch, Outcome, RouteOutcome, ingress::Protocol};
+use super::{Conn, Consumption, Dispatch, Outcome, ingress::Protocol};
 use crate::{
     Input,
     pump::{self, Egress},
@@ -23,6 +23,245 @@ enum Stop<'d> {
     Park,
     Close(Body<'d>),
     Rejected(pump::Reject),
+}
+
+pub enum Flow {
+    Next,
+    Sent,
+    End,
+    Head,
+    Fields,
+}
+
+struct State<'d, H> {
+    connection: head::Connection,
+    handoff: Option<H>,
+    stop: Stop<'d>,
+}
+
+/// One request's loan of the connection, input cursor and unpublished output.
+pub struct Turn<'a, 'input, 'd, R, P, T: switch::Engine, D: Dispatch<'d, R, P, T>> {
+    pub conn: &'a mut Conn<'d, R, P, T, D::Ready, D::Head>,
+    pub router: pin::Pin<&'a mut D>,
+    pub output: Slice<'a, &'a mut usize>,
+    rest: &'a mut Input<'input>,
+    state: &'a mut State<'d, T::Staged>,
+}
+
+impl<'input, 'd, R, P, T: switch::Engine, D: Dispatch<'d, R, P, T>>
+    Turn<'_, 'input, 'd, R, P, T, D>
+{
+    pub fn input(&self) -> Input<'input> {
+        *self.rest
+    }
+
+    fn stop(&mut self, reason: Stop<'d>) -> Flow {
+        self.state.stop = reason;
+        Flow::End
+    }
+
+    pub fn close(&mut self, reason: Body<'d>) -> Flow {
+        self.stop(Stop::Close(reason))
+    }
+
+    pub fn failed(&mut self, cause: crate::wire::Failure) -> Flow {
+        let reason = self.router.as_mut().failure(&cause);
+        self.close(reason)
+    }
+
+    fn abort(&mut self, error: crate::wire::Failure) -> Flow {
+        let reason = self.router.as_mut().abort_body(self.conn, error);
+        self.close(reason)
+    }
+
+    fn after_head(&mut self, used: &mut usize, prior: usize) -> Result<(), Flow> {
+        match used.checked_sub(prior) {
+            Some(rest) => {
+                *used = rest;
+                Ok(())
+            }
+            None => {
+                let error = o3::buffer::storage::range::Error::new(0..prior, *used);
+                self.conn.ingress.protocol = o3::mem::slot::Storage::new(());
+                Err(
+                    self.failed(crate::wire::Failure::Input(crate::wire::InputError::Range(
+                        error,
+                    ))),
+                )
+            }
+        }
+    }
+
+    fn consume(&mut self, mut frame: Consumption, prior: usize) -> Result<bool, Flow> {
+        if prior != 0 {
+            let used = match &mut frame {
+                Consumption::Buffered(used) => used,
+                Consumption::Discard(frame) => &mut frame.head,
+            };
+            self.after_head(used, prior)?;
+        }
+        match self.conn.ingress.consume(frame, self.rest) {
+            Ok(complete) => Ok(complete),
+            Err(cause) => Err(self.abort(cause)),
+        }
+    }
+
+    pub fn rejected(&mut self, error: parsing::Rejection<'d>) -> Flow {
+        match error {
+            parsing::Rejection::Close(reason) => self.close(reason),
+            parsing::Rejection::Failed(cause) => self.failed(cause),
+        }
+    }
+
+    pub fn reject_head(&mut self, error: parsing::Rejection<'d>) -> Flow {
+        self.router.as_mut().reject_head(&mut self.conn.async_state);
+        self.rejected(error)
+    }
+
+    pub fn reject(
+        &mut self,
+        progress: core::ops::ControlFlow<parsing::Rejected<'d>, parsing::Rejection<'d>>,
+    ) -> Flow {
+        match progress {
+            core::ops::ControlFlow::Continue(error) => self.reject_head(error),
+            core::ops::ControlFlow::Break(pending) => {
+                self.conn.ingress.park(Protocol::Reject(pending));
+                Flow::Fields
+            }
+        }
+    }
+
+    pub fn await_head(&mut self, pending: D::Head) -> Flow {
+        self.conn.ingress.park(Protocol::PendingHead(pending));
+        Flow::Fields
+    }
+
+    pub fn await_line(&mut self) -> Flow {
+        match parsing::Line::start(*self.rest) {
+            Ok(line) => self.conn.ingress.park(Protocol::Line(line)),
+            Err(error) => return self.reject_head(error),
+        }
+        self.rest.consume_max(usize::MAX);
+        Flow::Head
+    }
+
+    pub fn await_body(
+        &mut self,
+        mut state: session::BodyAwait,
+        expectation: sark_http::h1::field::expect::Decision,
+        pending: P,
+        prior: usize,
+    ) -> Flow {
+        self.conn.ingress.park(if D::has_body_work(&pending) {
+            Protocol::Working(pending)
+        } else {
+            Protocol::Body(pending)
+        });
+        if let Err(end) = self.after_head(&mut state.consumed, prior) {
+            return end;
+        }
+        if self.rest.advance(state.consumed).is_err() {
+            let pending = self
+                .conn
+                .ingress
+                .protocol
+                .occupied()
+                .map(|slot| slot.take().0);
+            self.conn.ingress.finish_frame();
+            drop(pending);
+            return self.close(canned::BAD_REQUEST);
+        }
+        if expectation.is_continue() {
+            return self.stop(Stop::Output(Egress::Static {
+                body: crate::CONTINUE_100,
+            }));
+        }
+        if self.conn.ingress.is_ready() {
+            return self.stop(Stop::Output(Egress::Wake));
+        }
+        Flow::End
+    }
+
+    pub fn complete(
+        &mut self,
+        used: Consumption,
+        response: output::Complete<'d>,
+        next: head::Connection,
+        prior: usize,
+    ) -> Flow {
+        let prior = if matches!(used, Consumption::Buffered(0)) && next == head::Connection::Close {
+            0
+        } else {
+            prior
+        };
+        let complete = match self.consume(used, prior) {
+            Ok(complete) => complete,
+            Err(end) => return end,
+        };
+        self.state.connection = self.state.connection.join(next);
+        match response {
+            output::Complete::Inline | output::Complete::Copy { .. } => {}
+            output::Complete::Static { body }
+                if self.output.write_slice(body.as_slice()).is_ok() => {}
+            body => {
+                self.state.stop = Stop::Output(body.into());
+                return Flow::Sent;
+            }
+        }
+        if complete { Flow::Next } else { Flow::Sent }
+    }
+
+    pub fn apply(&mut self, action: Outcome<'d, T::Raw>, prior: usize) -> Flow {
+        match action {
+            Outcome::Switch {
+                next,
+                consumed,
+                response,
+            } => {
+                if let Err(end) = self.consume(Consumption::Buffered(consumed), prior) {
+                    return end;
+                }
+                self.state.handoff = match self.conn.transitions.try_stage(next) {
+                    Ok(staged) => Some(staged),
+                    Err(error) => {
+                        return self.stop(Stop::Rejected(pump::Reject::Switch {
+                            actual: error.mode(),
+                            attempted: error.attempted(),
+                        }));
+                    }
+                };
+                let egress = match response {
+                    output::Switch::Static(body)
+                        if self.output.write_slice(body.as_slice()).is_err() =>
+                    {
+                        Egress::Static { body }
+                    }
+                    _ => Egress::None,
+                };
+                self.state.stop = Stop::Output(egress);
+                Flow::Sent
+            }
+            Outcome::Streamed { consumed, close } | Outcome::Park { consumed, close } => {
+                if let Err(end) = self.consume(Consumption::Buffered(consumed), prior) {
+                    return end;
+                }
+                self.state.connection = self.state.connection.join(close);
+                if matches!(action, Outcome::Streamed { .. }) {
+                    self.state.stop = Stop::Streamed;
+                    Flow::Sent
+                } else {
+                    self.stop(Stop::Park)
+                }
+            }
+            Outcome::Failed(cause) => self.failed(cause),
+            Outcome::Close(reason) => self.close(reason),
+            Outcome::Complete {
+                consumption,
+                response,
+                connection,
+            } => self.complete(consumption, response, connection, prior),
+        }
+    }
 }
 
 impl<'d, Runtime: pump::Tasks, Pending, Transitions: switch::Engine, Ready, Heads>
@@ -55,131 +294,127 @@ impl<'d, Runtime: pump::Tasks, Pending, Transitions: switch::Engine, Ready, Head
         let mut transaction = write.stage();
         let mut output = transaction.body();
         let minimum = output.remaining().min(1024);
-        let mut connection = self.deferred;
+        let mut state = State {
+            connection: self.deferred,
+            handoff: None,
+            stop: Stop::Output(Egress::None),
+        };
         let mut head_progress = deadline::Head::Unchanged;
         let mut body_progress = deadline::Body::None;
-        let mut handoff = None;
-        let mut permit = session::Permit::new();
 
         let stop = 'turn: {
             'requests: for _ in 0..MAX_PIPELINE {
                 if output.remaining() < minimum
-                    || matches!(connection, head::Connection::Close)
+                    || matches!(state.connection, head::Connection::Close)
                     || (rest.as_slice().is_empty() && !self.ingress.is_ready())
                 {
                     break;
                 }
-                let mut staged = output.stage();
-                let mut target = staged.body();
                 head_progress = deadline::Head::Ready;
-                let (result, consumed) = 'frame: {
-                    let route = 'head: {
-                        let line = match mem::take(&mut self.ingress.protocol) {
-                            Protocol::Head => {
-                                break 'head disp.as_mut().try_consume(
-                                    permit,
-                                    rest,
-                                    target.reborrow(),
-                                    self,
-                                );
-                            }
+                let mut staged = output.stage();
+                let result = 'frame: loop {
+                    let mut turn = Turn {
+                        conn: &mut *self,
+                        router: disp.as_mut(),
+                        output: staged.body(),
+                        rest: &mut rest,
+                        state: &mut state,
+                    };
+                    let Some(pending) = turn.conn.ingress.protocol.occupied() else {
+                        let input = turn.input();
+                        break D::try_consume(input, &mut turn, 0);
+                    };
+                    let (body, consumed) = 'body: {
+                        let line = match pending.take().0 {
                             Protocol::PendingHead(pending) => {
-                                break 'head disp.as_mut().resume_head(
-                                    pending,
-                                    permit,
-                                    rest,
-                                    target.reborrow(),
-                                    self,
-                                );
+                                break 'frame D::resume_head(pending, &mut turn);
                             }
                             Protocol::Reject(pending) => {
-                                break 'head disp.as_mut().resume_rejection(
-                                    pending,
-                                    permit,
-                                    rest,
-                                    &mut self.async_state,
-                                );
+                                let input = turn.input();
+                                break 'frame turn.reject(pending.resume(input));
                             }
-                            Protocol::Line(line) => line.advance(rest),
-                            Protocol::Prefix(prefix) => parsing::Line::prefixed(prefix, rest),
+                            Protocol::Line(line) => line.advance(turn.input()),
+                            Protocol::Prefix(prefix) => {
+                                parsing::Line::prefixed(prefix, turn.input())
+                            }
                             Protocol::Body(task) => {
-                                let done = match self.ingress.resume_frame(rest.as_slice()) {
-                                    Ok(done) => done,
-                                    Err(error) => {
-                                        self.ingress.protocol = Protocol::Body(task);
-                                        break 'turn Stop::Close(
-                                            disp.as_mut().abort_body(self, error),
-                                        );
-                                    }
-                                };
+                                let done =
+                                    match turn.conn.ingress.resume_frame(turn.rest.as_slice()) {
+                                        Ok(done) => done,
+                                        Err(error) => {
+                                            turn.conn.ingress.park(Protocol::Body(task));
+                                            break 'turn Stop::Close(
+                                                turn.router.as_mut().abort_body(turn.conn, error),
+                                            );
+                                        }
+                                    };
                                 body_progress = deadline::Body::Progress;
-                                let body = self.ingress.payload.take();
-                                let task = match disp.as_mut().body_data(
+                                let body = turn.conn.ingress.payload.take();
+                                let task = match turn.router.as_mut().body_data(
                                     task,
                                     body,
-                                    &mut self.async_state,
+                                    &mut turn.conn.async_state,
                                 ) {
                                     Ok(task) => task,
                                     Err(reason) => {
-                                        self.ingress.finish_frame();
+                                        turn.conn.ingress.finish_frame();
                                         break 'turn Stop::Close(reason);
                                     }
                                 };
                                 let Some(done) = done else {
-                                    rest.consume_max(usize::MAX);
+                                    turn.rest.consume_max(usize::MAX);
                                     if D::has_body_work(&task) {
-                                        self.ingress.protocol = Protocol::Working(task);
+                                        turn.conn.ingress.park(Protocol::Working(task));
                                         break 'turn Stop::Output(Egress::Wake);
                                     }
-                                    self.ingress.protocol = Protocol::Body(task);
+                                    turn.conn.ingress.park(Protocol::Body(task));
                                     break 'requests;
                                 };
                                 let used = done.consumed;
-                                break 'frame (
-                                    disp.as_mut().finish_body(
+                                break 'body (
+                                    turn.router.as_mut().finish_body(
                                         task,
                                         done,
-                                        permit,
-                                        target.reborrow(),
-                                        &mut self.async_state,
+                                        turn.output.reborrow(),
+                                        &mut turn.conn.async_state,
                                     ),
                                     used,
                                 );
                             }
                             Protocol::Ready(task) => {
-                                break 'frame (
-                                    disp.as_mut().resume_body(
+                                break 'body (
+                                    turn.router.as_mut().resume_body(
                                         task,
-                                        permit,
-                                        target.reborrow(),
-                                        &mut self.async_state,
+                                        turn.output.reborrow(),
+                                        &mut turn.conn.async_state,
                                     ),
                                     0,
                                 );
                             }
                             Protocol::Working(task) => {
-                                let task =
-                                    match disp.as_mut().resume_pending(task, &mut self.async_state)
-                                    {
-                                        Ok(task) => task,
-                                        Err(reason) => {
-                                            self.ingress.finish_frame();
-                                            break 'turn Stop::Close(reason);
-                                        }
-                                    };
+                                let task = match turn
+                                    .router
+                                    .as_mut()
+                                    .resume_pending(task, &mut turn.conn.async_state)
+                                {
+                                    Ok(task) => task,
+                                    Err(reason) => {
+                                        turn.conn.ingress.finish_frame();
+                                        break 'turn Stop::Close(reason);
+                                    }
+                                };
                                 if D::has_body_work(&task) {
-                                    self.ingress.protocol = Protocol::Working(task);
+                                    turn.conn.ingress.park(Protocol::Working(task));
                                     break 'turn Stop::Output(Egress::Wake);
                                 }
-                                self.ingress.protocol = Protocol::Body(task);
+                                turn.conn.ingress.park(Protocol::Body(task));
                                 continue 'requests;
                             }
                         };
                         match line {
                             Ok(parsing::LineProgress::Pending(line)) => {
-                                permit.defer();
-                                self.ingress.protocol = Protocol::Line(line);
-                                rest.consume_max(usize::MAX);
+                                turn.conn.ingress.park(Protocol::Line(line));
+                                turn.rest.consume_max(usize::MAX);
                                 head_progress = deadline::Head::Pending;
                                 break 'requests;
                             }
@@ -188,224 +423,52 @@ impl<'d, Runtime: pump::Tasks, Pending, Transitions: switch::Engine, Ready, Head
                                 prior,
                                 used,
                             }) => {
-                                let route = disp
-                                    .as_mut()
-                                    .consume_line(permit, source, target.reborrow(), self)
-                                    .after_line(prior);
-                                match route {
-                                    RouteOutcome::AwaitHead { permit, pending }
-                                        if used < rest.as_slice().len() =>
-                                    {
-                                        rest.consume_max(used);
-                                        disp.as_mut().resume_head(
-                                            pending,
-                                            permit,
-                                            rest,
-                                            target.reborrow(),
-                                            self,
-                                        )
-                                    }
-                                    RouteOutcome::AwaitReject { permit, pending }
-                                        if used < rest.as_slice().len() =>
-                                    {
-                                        rest.consume_max(used);
-                                        disp.as_mut().resume_rejection(
-                                            pending,
-                                            permit,
-                                            rest,
-                                            &mut self.async_state,
-                                        )
-                                    }
-                                    route => route,
+                                let result = D::consume_line(source, &mut turn, prior);
+                                if matches!(result, Flow::Fields) && used < rest.as_slice().len() {
+                                    rest.consume_max(used);
+                                    continue 'frame;
                                 }
+                                break 'frame result;
                             }
-                            Err(error) => Outcome::Close(disp.as_mut().reject_line(
-                                permit,
-                                &mut self.async_state,
-                                error,
-                            ))
-                            .into(),
+                            Err(error) => break 'frame turn.reject_head(error),
                         }
                     };
-                    self.ingress.protocol = match route {
-                        RouteOutcome::AwaitHead { permit, pending } => {
-                            permit.defer();
-                            Protocol::PendingHead(pending)
-                        }
-                        RouteOutcome::AwaitReject { permit, pending } => {
-                            permit.defer();
-                            Protocol::Reject(pending)
-                        }
-                        RouteOutcome::Outcome(result) => {
-                            break 'frame (session::BodyOutcome::Complete(result), 0);
-                        }
-                        RouteOutcome::AwaitBody {
-                            state,
-                            expectation,
-                            pending,
-                        } => {
-                            if rest.advance(state.consumed()).is_err() {
-                                self.ingress.finish_frame();
-                                break 'turn Stop::Close(canned::BAD_REQUEST);
+                    match body {
+                        session::BodyOutcome::Complete(result) => break turn.apply(result, 0),
+                        session::BodyOutcome::Pending(task) => {
+                            if let Err(end) = turn.consume(Consumption::Buffered(consumed), 0) {
+                                break end;
                             }
-                            let work = D::has_body_work(&pending);
-                            self.ingress.protocol = if work {
-                                Protocol::Working(pending)
-                            } else {
-                                Protocol::Body(pending)
-                            };
-                            if expectation.is_continue() {
-                                break 'turn Stop::Output(Egress::Static {
-                                    body: crate::CONTINUE_100,
-                                });
-                            }
-                            if work {
-                                break 'turn Stop::Output(Egress::Wake);
-                            }
-                            break 'requests;
+                            turn.conn.ingress.park(Protocol::Ready(task));
+                            break 'turn Stop::Output(Egress::Wake);
                         }
-                    };
-                    rest.consume_max(usize::MAX);
-                    head_progress = deadline::Head::Pending;
-                    break 'requests;
-                };
-                let result = match result {
-                    session::BodyOutcome::Complete(result) => result,
-                    session::BodyOutcome::Pending(task) => {
-                        if let Err(error) = self
-                            .ingress
-                            .consume(Consumption::Buffered(Buffered::new(consumed)), &mut rest)
-                        {
-                            break 'turn Stop::Close(disp.as_mut().abort_body(self, error));
-                        }
-                        self.ingress.protocol = Protocol::Ready(task);
-                        break 'turn Stop::Output(Egress::Wake);
                     }
                 };
-                if let Outcome::Streamed { consumed: used, .. }
-                | Outcome::Park { consumed: used, .. } = &result
-                    && let Err(error) = self
-                        .ingress
-                        .consume(Consumption::Buffered(Buffered::new(*used)), &mut rest)
-                {
-                    break 'turn Stop::Close(disp.as_mut().abort_body(self, error));
-                }
-                permit = match result {
-                    Outcome::NeedMore { permit, state } => {
-                        match state {
-                            session::NeedMore::Head => self.ingress.protocol = Protocol::Head,
-                            session::NeedMore::Line => {
-                                let line = match parsing::Line::start(rest) {
-                                    Ok(line) => line,
-                                    Err(error) => {
-                                        break 'turn Stop::Close(disp.as_mut().reject_line(
-                                            permit,
-                                            &mut self.async_state,
-                                            error,
-                                        ));
-                                    }
-                                };
-                                self.ingress.protocol = Protocol::Line(line);
-                                rest.consume_max(usize::MAX);
-                            }
+                match result {
+                    Flow::Next => staged.commit(),
+                    Flow::Sent => {
+                        staged.commit();
+                        break;
+                    }
+                    Flow::Head | Flow::Fields => {
+                        if matches!(result, Flow::Fields) {
+                            rest.consume_max(usize::MAX);
                         }
                         head_progress = deadline::Head::Pending;
-                        permit.defer();
-                        break 'requests;
+                        break;
                     }
-                    Outcome::Complete {
-                        permit,
-                        consumption,
-                        response,
-                        connection: next,
-                    } => {
-                        let complete = match self.ingress.consume(consumption, &mut rest) {
-                            Ok(complete) => complete,
-                            Err(error) => {
-                                break 'turn Stop::Close(disp.as_mut().abort_body(self, error));
-                            }
-                        };
-                        connection = connection.join(next);
-                        let body = match response {
-                            output::Complete::Inline | output::Complete::Copy { .. } => None,
-                            output::Complete::Static { body }
-                                if target.write_slice(body.as_slice()).is_ok() =>
-                            {
-                                None
-                            }
-                            output::Complete::Static { body } => Some(Egress::Static { body }),
-                            output::Complete::Shared { body }
-                            | output::Complete::Owned { body, .. } => Some(Egress::Shared { body }),
-                            output::Complete::Compressed { body, .. } => {
-                                Some(Egress::Frozen { body })
-                            }
-                            output::Complete::Segments { body }
-                            | output::Complete::Linked { body } => Some(Egress::Segmented { body }),
-                        };
-                        staged.commit();
-                        if let Some(body) = body {
-                            break 'turn Stop::Output(body);
-                        }
-                        if !complete {
-                            break 'requests;
-                        }
-                        permit
-                    }
-                    Outcome::Switch {
-                        next,
-                        buffered,
-                        response,
-                    } => {
-                        if let Err(error) = self
-                            .ingress
-                            .consume(Consumption::Buffered(buffered), &mut rest)
-                        {
-                            break 'turn Stop::Close(disp.as_mut().abort_body(self, error));
-                        }
-                        handoff = match self.transitions.try_stage(next) {
-                            Ok(staged) => Some(staged),
-                            Err(error) => {
-                                break 'turn Stop::Rejected(pump::Reject::Switch {
-                                    actual: error.mode(),
-                                    attempted: error.attempted(),
-                                });
-                            }
-                        };
-                        let egress = match response {
-                            output::Switch::Static(body)
-                                if target.write_slice(body.as_slice()).is_err() =>
-                            {
-                                Egress::Static { body }
-                            }
-                            _ => Egress::None,
-                        };
-                        staged.commit();
-                        break 'turn Stop::Output(egress);
-                    }
-                    Outcome::Streamed { close, .. } => {
-                        connection = connection.join(close);
-                        staged.commit();
-                        break 'turn Stop::Streamed;
-                    }
-                    Outcome::Park { close, .. } => {
-                        connection = connection.join(close);
-                        break 'turn Stop::Park;
-                    }
-                    Outcome::Failed(error) => {
-                        break 'turn Stop::Close(disp.as_mut().failure(&error));
-                    }
-                    Outcome::Close(reason) => break 'turn Stop::Close(reason),
-                };
+                    Flow::End => break,
+                }
             }
-            Stop::Output(Egress::None)
+            state.stop
         };
+        let State {
+            connection,
+            handoff,
+            ..
+        } = state;
 
-        if self.ingress.is_discard()
-            || matches!(
-                self.ingress.protocol,
-                Protocol::Body(_) | Protocol::Working(_)
-            )
-        {
+        if self.ingress.is_discard() || matches!(self.ingress.window(), recv::Window::Body) {
             head_progress = deadline::Head::Body;
         }
         let progress = deadline::Progress::new(head_progress, body_progress);

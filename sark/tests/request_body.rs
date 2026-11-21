@@ -1,11 +1,8 @@
 pub mod common;
 use common::request::*;
-use sark::{
-    core::{
-        body::admit::Retention,
-        route::{Project, Schema},
-    },
-    http::request::body,
+use sark::core::{
+    body::{Contiguous, Project as _, admit::Retention},
+    route::{Project, Schema},
 };
 
 #[test]
@@ -17,16 +14,22 @@ fn selects_storage() {
 
 #[test]
 fn decodes_json() {
-    let parsed = <Json as Project>::parse_body(body::View::Slice(br#"{"value":42}"#))
-        .expect("JSON request projection");
-    assert_eq!(parsed.value, 42);
+    let (head, mut body) = projection::<Json>(br#"{"value":42}"#);
+    Contiguous::try_project(&mut body, (), |scope| {
+        let request = Json::try_view(&head, scope).expect("JSON request");
+        assert_eq!(request.body.value, 42);
+    })
+    .expect("contiguous body");
 }
 
 #[test]
 fn borrowed_json_is_wired() {
     let bytes = br#"{"text":"alpha","number":42}"#;
-    let body =
-        <Plain as Project>::parse_body(body::View::Slice(bytes)).expect("request body parses");
-    assert!(std::ptr::eq(body.text.as_slice(), &bytes[9..14]));
-    assert!(std::ptr::eq(body.number.as_slice(), &bytes[25..27]));
+    let (head, mut body) = projection::<Plain>(bytes);
+    Contiguous::try_project(&mut body, (), |scope| {
+        let request = Plain::try_view(&head, scope).expect("borrowed JSON request");
+        assert!(std::ptr::eq(request.body.text.as_slice(), &bytes[9..14]));
+        assert!(std::ptr::eq(request.body.number.as_slice(), &bytes[25..27]));
+    })
+    .expect("contiguous body");
 }

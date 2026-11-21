@@ -1,18 +1,13 @@
 pub mod common;
 
-use std::{
-    convert::{self, Infallible},
-    num::NonZero,
-    ops::ControlFlow,
-    slice,
-};
+use std::{convert::Infallible, num::NonZero, ops::ControlFlow, slice};
 
 use common::head::{self, OWNED_PREFIX, OWNED_SUFFIX, OWNED_TAIL, Request, SETS};
 use dope_test::alloc::Tracker;
 use o3::buffer::write::Sink as _;
 use sark_h1::{
     Input,
-    session::{Outcome, Permit, RouteOutcome},
+    session::Outcome,
     wire::{
         head::{Block, Error, line},
         parsing::{
@@ -25,10 +20,7 @@ use sark_h1::{
 
 use sark_http::{
     field::{head::Error::ContentLength, text::IntError},
-    h1::{
-        codec::canned,
-        head::line::Version,
-    },
+    h1::{codec::canned, head::line::Version},
 };
 
 #[global_allocator]
@@ -54,54 +46,39 @@ fn setters_and_owner() {
     input.fill(b'!');
     for byte in b"fragmented" {
         let outcome = pending
-            .try_resume::<Infallible, Infallible, _>(
-                Input::Borrowed(slice::from_ref(byte)),
-                Permit::new(),
-                convert::identity,
-                |_, _| Outcome::Close(canned::NOT_FOUND).into(),
-            )
+            .try_resume(Input::Borrowed(slice::from_ref(byte)), |_| ())
             .ok()
             .expect("head resumed");
-        pending = match outcome {
-            RouteOutcome::AwaitHead { pending, .. } => Some(pending),
-            _ => None,
-        }
-        .expect("pending field");
+        pending = outcome.break_value().expect("pending field");
     }
     let outcome = pending
-        .try_resume::<Infallible, Infallible, _>(
-            Input::Borrowed(b"\r\n\r\n"),
-            Permit::new(),
-            convert::identity,
-            |head, _| {
-                let (head, admission) = head.into_admission();
-                assert_eq!((admission.fields, admission.finishes), (3, 1));
-                assert_eq!(
-                    admission
-                        .other
-                        .expect("field span")
-                        .get(head.source().input().as_slice()),
-                    Some(b"fragmented".as_slice())
-                );
-                let whole = Head::<common::Request, head::Admission>::parse::<false>(
-                    raw::Bound::empty(head.source()),
-                )
-                .ok()
-                .flatten()
-                .expect("whole head");
-                assert_eq!(whole.into_admission().1.other, admission.other);
-                assert!(
-                    head.source()
-                        .input()
-                        .as_slice()
-                        .starts_with(b"GET / HTTP/1.1\r\nHost: local\r\nX-Count: once\r\n")
-                );
-                Outcome::Close(canned::NOT_FOUND).into()
-            },
-        )
+        .try_resume(Input::Borrowed(b"\r\n\r\n"), |head| {
+            let (head, admission) = head.into_admission();
+            assert_eq!((admission.fields, admission.finishes), (3, 1));
+            assert_eq!(
+                admission
+                    .other
+                    .expect("field span")
+                    .get(head.source().input().as_slice()),
+                Some(b"fragmented".as_slice())
+            );
+            let whole = Head::<common::Request, head::Admission>::parse::<false>(
+                raw::Bound::empty(head.source()),
+            )
+            .ok()
+            .flatten()
+            .expect("whole head");
+            assert_eq!(whole.into_admission().1.other, admission.other);
+            assert!(
+                head.source()
+                    .input()
+                    .as_slice()
+                    .starts_with(b"GET / HTTP/1.1\r\nHost: local\r\nX-Count: once\r\n")
+            );
+        })
         .ok()
         .expect("head resumed");
-    assert!(matches!(outcome, RouteOutcome::Outcome(Outcome::Close(_))));
+    assert!(matches!(outcome, ControlFlow::Continue(())));
     assert_eq!(SETS.take().as_slice(), [b"once"]);
 }
 
@@ -117,16 +94,8 @@ fn captured_list_members() {
         {
             HeadProgress::Complete(_) => assert_eq!(split, wire.len()),
             HeadProgress::Pending(pending) => {
-                let outcome = pending.try_resume::<Infallible, Infallible, _>(
-                    Input::Borrowed(&wire[split..]),
-                    Permit::new(),
-                    convert::identity,
-                    |_, _| Outcome::Close(canned::NOT_FOUND).into(),
-                );
-                assert!(matches!(
-                    outcome,
-                    Ok(RouteOutcome::Outcome(Outcome::Close(_)))
-                ));
+                let outcome = pending.try_resume(Input::Borrowed(&wire[split..]), |_| ());
+                assert!(matches!(outcome, Ok(ControlFlow::Continue(()))));
             }
         }
         assert_eq!(SETS.take().as_slice(), [b",gzip,"]);
@@ -148,12 +117,7 @@ fn bad_field_rejects() {
         HeadProgress::Complete(_) => None,
     }
     .expect("pending fields");
-    let outcome = pending.try_resume::<Infallible, Infallible, _>(
-        Input::Borrowed(b"invalid\r\n"),
-        Permit::new(),
-        convert::identity,
-        |_, _| Outcome::Close(canned::NOT_FOUND).into(),
-    );
+    let outcome = pending.try_resume(Input::Borrowed(b"invalid\r\n"), |_| ());
     assert!(matches!(
         outcome,
         Err(parsing::Request::Head(Error::Line(line::Error::Field {
@@ -194,19 +158,19 @@ fn upgrade_errors_follow_canonical_field_admission() {
             ) {
                 Err(error) => error,
                 Ok(HeadProgress::Pending(pending)) => match pending
-                    .try_resume::<Infallible, Infallible, _>(
-                        Input::Borrowed(&wire[split..]),
-                        Permit::new(),
-                        convert::identity,
-                        |_, _| panic!("invalid opening reached the handler"),
-                    ) {
+                    .try_resume(Input::Borrowed(&wire[split..]), |_| {
+                        panic!("invalid opening reached the handler")
+                    }) {
                     Err(error) => error,
                     Ok(_) => panic!("invalid opening did not fail immediately"),
                 },
                 Ok(HeadProgress::Complete(_)) => panic!("invalid opening admitted"),
             };
             let allocation = measurement.finish();
-            assert!(allocation.allocated_bytes < 32 * 1024 + 256, "{allocation:?}");
+            assert!(
+                allocation.allocated_bytes < 32 * 1024 + 256,
+                "{allocation:?}"
+            );
             if expected.is_none() {
                 assert!(matches!(
                     error,
@@ -237,21 +201,11 @@ fn transfer_coding_admission() {
             let result = match Head::<Request>::start::<false>(raw::Bound::empty(&source)) {
                 Ok(HeadProgress::Complete(_)) => Ok(()),
                 Ok(HeadProgress::Pending(pending)) => pending
-                    .try_resume::<Infallible, Infallible, _>(
-                        Input::Borrowed(&wire[split..]),
-                        Permit::new(),
-                        convert::identity,
-                        |_, _| {
-                            assert!(supported, "unsupported coding reached the handler");
-                            Outcome::Close(canned::NOT_FOUND).into()
-                        },
-                    )
+                    .try_resume(Input::Borrowed(&wire[split..]), |_| {
+                        assert!(supported, "unsupported coding reached the handler");
+                    })
                     .map(|outcome| {
-                        assert!(matches!(
-                            outcome,
-                            RouteOutcome::Outcome(Outcome::Close(reply))
-                                if reply.as_slice() == canned::NOT_FOUND.as_slice()
-                        ));
+                        assert!(matches!(outcome, ControlFlow::Continue(())));
                     }),
                 Err(error) => Err(error),
             };
@@ -287,19 +241,10 @@ fn http10_ignores_upgrade() {
         {
             HeadProgress::Complete(_) => assert_eq!(split, wire.len()),
             HeadProgress::Pending(pending) => {
-                let outcome = pending.try_resume::<Infallible, Infallible, _>(
-                    Input::Borrowed(&wire[split..]),
-                    Permit::new(),
-                    convert::identity,
-                    |head, _| {
-                        assert_eq!(head.source().request().version(), Version::Ten);
-                        Outcome::Close(canned::NOT_FOUND).into()
-                    },
-                );
-                assert!(matches!(
-                    outcome,
-                    Ok(RouteOutcome::Outcome(Outcome::Close(_)))
-                ));
+                let outcome = pending.try_resume(Input::Borrowed(&wire[split..]), |head| {
+                    assert_eq!(head.source().request().version(), Version::Ten);
+                });
+                assert!(matches!(outcome, Ok(ControlFlow::Continue(()))));
             }
         }
         assert_eq!(SETS.take().as_slice(), [b"web socket"]);
@@ -317,12 +262,7 @@ fn http10_ignores_upgrade() {
         HeadProgress::Complete(_) => None,
     }
     .expect("fragmented field");
-    let outcome = pending.try_resume::<Infallible, Infallible, _>(
-        Input::Borrowed(b"\0socket\r\n\r\n"),
-        Permit::new(),
-        convert::identity,
-        |_, _| Outcome::Close(canned::NOT_FOUND).into(),
-    );
+    let outcome = pending.try_resume(Input::Borrowed(b"\0socket\r\n\r\n"), |_| ());
     assert!(matches!(
         outcome,
         Err(parsing::Request::Head(Error::Syntax(
@@ -355,15 +295,9 @@ fn whole_and_split() {
                     _ => None,
                 }
                 .expect("pending field");
-                let outcome = pending.try_resume::<Infallible, Infallible, _>(
-                    Input::Borrowed(&input[split..]),
-                    Permit::new(),
-                    convert::identity,
-                    |_, _| Outcome::Close(canned::NOT_FOUND).into(),
-                );
+                let outcome = pending.try_resume(Input::Borrowed(&input[split..]), |_| ());
                 assert!(if width <= 8192 {
-                    matches!(outcome, Ok(RouteOutcome::Outcome(Outcome::Close(reply)))
-                        if reply.as_slice() == canned::NOT_FOUND.as_slice())
+                    matches!(outcome, Ok(ControlFlow::Continue(())))
                 } else {
                     matches!(
                         outcome,
@@ -393,33 +327,15 @@ fn owned_line_keeps_head() {
         ControlFlow::Break(_) => None,
     }
     .expect("complete");
-    let outcome = PendingHead::<Request>::try_start::<Infallible, Infallible, _>(
-        raw::Bound::empty(source),
-        Permit::new(),
-        convert::identity,
-        |_, _| Outcome::Close(canned::BAD_REQUEST).into(),
-    )
-    .ok()
-    .expect("headers");
-    let pending = match outcome {
-        RouteOutcome::AwaitHead { pending, .. } => Some(pending),
-        _ => None,
-    }
-    .expect("pending");
-    let outcome = pending.try_resume::<Infallible, Infallible, _>(
-        Input::Borrowed(OWNED_SUFFIX),
-        Permit::new(),
-        convert::identity,
-        |head, _| {
-            assert_eq!(head.source().input().as_slice().as_ptr(), pointer);
-            assert!(head.source().input().as_slice().ends_with(OWNED_TAIL));
-            Outcome::Close(canned::NOT_FOUND).into()
-        },
-    );
-    assert!(
-        matches!(outcome, Ok(RouteOutcome::Outcome(Outcome::Close(reply)))
-        if reply.as_slice() == canned::NOT_FOUND.as_slice())
-    );
+    let outcome = PendingHead::<Request>::try_start(raw::Bound::empty(source), |_| ())
+        .ok()
+        .expect("headers");
+    let pending = outcome.break_value().expect("pending");
+    let outcome = pending.try_resume(Input::Borrowed(OWNED_SUFFIX), |head| {
+        assert_eq!(head.source().input().as_slice().as_ptr(), pointer);
+        assert!(head.source().input().as_slice().ends_with(OWNED_TAIL));
+    });
+    assert!(matches!(outcome, Ok(ControlFlow::Continue(()))));
     assert_eq!(SETS.take().as_slice(), [b"once"]);
 }
 
@@ -446,7 +362,8 @@ fn route_bound_precedes_retention() {
         for split in [16, LIMIT - 2, wire.len()] {
             let source = head::parsed(Input::Borrowed(&wire[..split]), u8::MAX);
             let measurement = Tracker::begin();
-            let started = Head::<Request, head::Admission>::start::<false>(raw::Bound::empty(&source));
+            let started =
+                Head::<Request, head::Admission>::start::<false>(raw::Bound::empty(&source));
             let allocation = measurement.finish();
             match (split == wire.len(), started) {
                 (true, Ok(HeadProgress::Complete(head))) => {
@@ -456,24 +373,15 @@ fn route_bound_precedes_retention() {
                 }
                 (false, Ok(HeadProgress::Pending(pending))) => {
                     let measurement = Tracker::begin();
-                    let outcome = pending.try_resume::<Infallible, Infallible, _>(
-                        Input::Borrowed(&wire[split..]),
-                        Permit::new(),
-                        convert::identity,
-                        |head, _| {
-                            assert_eq!(extra, 0);
-                            let (head, admission) = head.into_admission();
-                            assert_eq!(admission.finishes, 1);
-                            assert_eq!(head.source().input().as_slice(), wire);
-                            Outcome::Close(canned::NOT_FOUND).into()
-                        },
-                    );
+                    let outcome = pending.try_resume(Input::Borrowed(&wire[split..]), |head| {
+                        assert_eq!(extra, 0);
+                        let (head, admission) = head.into_admission();
+                        assert_eq!(admission.finishes, 1);
+                        assert_eq!(head.source().input().as_slice(), wire);
+                    });
                     let allocation = measurement.finish();
                     if extra == 0 {
-                        assert!(matches!(
-                            outcome,
-                            Ok(RouteOutcome::Outcome(Outcome::Close(_)))
-                        ));
+                        assert!(matches!(outcome, Ok(ControlFlow::Continue(()))));
                     } else {
                         assert!(
                             matches!(outcome, Err(parsing::Request::Head(Error::Length { len })) if len == wire.len())
@@ -497,20 +405,12 @@ fn route_bound_precedes_retention() {
     for extra in [0, 1] {
         let wire = Request::bounded(limit, extra);
         let source = head::parsed(Input::Borrowed(&wire[..16]), u8::MAX);
-        let RouteOutcome::AwaitReject { pending, .. } =
-            parsing::Rejected::start::<Infallible, Infallible, Infallible>(
-                &source,
-                Permit::new(),
-                canned::NOT_FOUND,
-            )
+        let ControlFlow::Break(pending) = parsing::Rejected::start(&source, canned::NOT_FOUND)
         else {
             panic!("pending rejected head");
         };
         let measurement = Tracker::begin();
-        let outcome = pending.resume::<Infallible, Infallible, Infallible>(
-            Input::Borrowed(&wire[16..]),
-            Permit::new(),
-        );
+        let outcome = pending.resume(Input::Borrowed(&wire[16..]));
         let allocation = measurement.finish();
         let expected = if extra == 0 {
             canned::NOT_FOUND
@@ -519,7 +419,7 @@ fn route_bound_precedes_retention() {
         };
         assert!(matches!(
             outcome,
-            RouteOutcome::Outcome(Outcome::Close(reply)) if reply.as_slice() == expected.as_slice()
+            ControlFlow::Continue(parsing::Rejection::Close(reply)) if reply.as_slice() == expected.as_slice()
         ));
         assert!(
             allocation.allocated_bytes < 2 * limit + 256,
@@ -532,33 +432,18 @@ fn route_bound_precedes_retention() {
 fn keeps_prefix_cursor() {
     SETS.set(Vec::new());
     assert!(matches!(
-        Block::<()>::parse::<head::Request<4>, false>(
-            head::PREFIX_HOST,
-            0,
-            16,
-            Version::Eleven
-        ),
+        Block::<()>::parse::<head::Request<4>, false>(head::PREFIX_HOST, 0, 16, Version::Eleven),
         Ok(Some(_))
     ));
     assert!(matches!(
-        Block::<()>::parse::<head::Request<5>, false>(
-            head::PREFIX_HOST,
-            0,
-            16,
-            Version::Eleven
-        ),
+        Block::<()>::parse::<head::Request<5>, false>(head::PREFIX_HOST, 0, 16, Version::Eleven),
         Err(Error::Line(line::Error::Name {
             offset: 5,
             actual: b' '
         }))
     ));
     assert!(matches!(
-        Block::<()>::parse::<head::Request<8>, false>(
-            head::PREFIX_LENGTH,
-            0,
-            16,
-            Version::Eleven
-        ),
+        Block::<()>::parse::<head::Request<8>, false>(head::PREFIX_LENGTH, 0, 16, Version::Eleven),
         Err(Error::Line(line::Error::Field {
             cause: ContentLength(IntError::InvalidByte),
             ..

@@ -20,8 +20,6 @@ use crate::{body, request::frame::proof};
 
 pub mod field;
 pub mod frame;
-#[doc(hidden)]
-pub mod mode;
 pub mod path;
 pub mod raw;
 mod view;

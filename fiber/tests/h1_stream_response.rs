@@ -28,34 +28,19 @@ use sark_h1::server::run;
 
 #[test]
 fn pending_chunks_complete() {
-    let (harness, server) = Plan::isolated();
+    Plan::serve::<StreamPendingDispatch>(|bind| {
+        let resp = bind.try_get("/stream").expect("complete pending stream");
+        let resp_str = String::from_utf8_lossy(&resp);
 
-    harness
-        .run(
-            |context, listener| {
-                try_serve::<StreamPendingDispatch, _>(
-                    server,
-                    context,
-                    listener,
-                    (),
-                    MAX_CONNECTIONS,
-                )
-            },
-            |bind| {
-                let resp = bind.try_get("/stream").expect("complete pending stream");
-                let resp_str = String::from_utf8_lossy(&resp);
-
-                assert!(resp_str.contains("200 OK"), "resp: {resp_str}");
-                assert!(
-                    resp_str
-                        .to_lowercase()
-                        .contains("transfer-encoding: chunked"),
-                    "resp: {resp_str}"
-                );
-                assert!(resp.ends_with(b"5\r\nalpha\r\n5\r\n-beta\r\n6\r\n-gamma\r\n0\r\n\r\n"));
-            },
-        )
-        .expect("harness");
+        assert!(resp_str.contains("200 OK"), "resp: {resp_str}");
+        assert!(
+            resp_str
+                .to_lowercase()
+                .contains("transfer-encoding: chunked"),
+            "resp: {resp_str}"
+        );
+        assert!(resp.ends_with(b"5\r\nalpha\r\n5\r\n-beta\r\n6\r\n-gamma\r\n0\r\n\r\n"));
+    });
 }
 
 #[test]

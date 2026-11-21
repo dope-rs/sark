@@ -1,5 +1,7 @@
-use o3::buffer::bytes::scope;
+use std::{convert::Infallible, ops::ControlFlow};
+
 use o3::buffer::write::Slice;
+use o3::buffer::{bytes::scope, storage};
 use sark_http::{
     field,
     h1::head::{
@@ -7,7 +9,7 @@ use sark_http::{
         request::Coding,
         response::{Date, Server},
     },
-    owner::{handoff, handoff::stage},
+    owner::{evidence, handoff, handoff::stage},
     payload::{
         compress::{self, Compression},
         fixed::Body,
@@ -16,19 +18,18 @@ use sark_http::{
 };
 
 use crate::wire::{
-    output::Admit,
+    Failure,
+    output::Complete,
     response::{Context, framing},
 };
 
 pub(super) mod error;
 mod gzip;
 mod head;
-pub(super) mod written;
 
 use error::Error;
 use gzip::{compress_body, compress_bounded, compress_exact};
 use head::{Pending, emit_framed_head, emit_head};
-use written::Written;
 
 pub(super) enum Mode<'a, C: Compression> {
     Plain,
@@ -77,55 +78,37 @@ pub(super) struct Sink<
     Q: scope::Source,
     O: stage::Body<'req, 'd>,
     C: Compression,
-    A = (),
+    A = Infallible,
 > {
     out: Slice<'a, &'a mut usize>,
     date: Headers<'a>,
     mode: Mode<'a, C>,
     slot: handoff::Slot<'req, 'd, Q, O>,
-    admit: A,
-}
-
-impl<'a, 'req, 'd, Q: scope::Source, O: stage::Body<'req, 'd>, C: Compression>
-    Sink<'a, 'req, 'd, Q, O, C>
-{
-    pub(super) const fn new(
-        out: Slice<'a, &'a mut usize>,
-        date: &'a [u8; 29],
-        response: Context,
-        mode: Mode<'a, C>,
-        slot: handoff::Slot<'req, 'd, Q, O>,
-    ) -> Self {
-        Self {
-            out,
-            date: Headers {
-                value: date,
-                dated: Date::Include,
-                server: Server::Include,
-                response,
-            },
-            mode,
-            slot,
-            admit: (),
-        }
-    }
+    admit: Option<A>,
 }
 
 impl<'a, 'req, 'd, Q: scope::Source, O: stage::Body<'req, 'd>, C: Compression, A>
     Sink<'a, 'req, 'd, Q, O, C, A>
 {
-    pub(super) fn with_policy(mut self, policy: crate::route::Policy) -> Self {
-        self.date.dated = policy.date;
-        self.date.server = policy.server;
-        self
-    }
-
-    pub(super) fn with_admit<T>(self, admit: T) -> Sink<'a, 'req, 'd, Q, O, C, T> {
-        Sink {
-            out: self.out,
-            date: self.date,
-            mode: self.mode,
-            slot: self.slot,
+    pub(super) const fn new(
+        out: Slice<'a, &'a mut usize>,
+        date: &'a [u8; 29],
+        response: Context,
+        policy: crate::route::Policy,
+        mode: Mode<'a, C>,
+        slot: handoff::Slot<'req, 'd, Q, O>,
+        admit: Option<A>,
+    ) -> Self {
+        Self {
+            out,
+            date: Headers {
+                value: date,
+                dated: policy.date,
+                server: policy.server,
+                response,
+            },
+            mode,
+            slot,
             admit,
         }
     }
@@ -149,19 +132,20 @@ impl<'a, 'req, 'd, Q: scope::Source, O: stage::Body<'req, 'd>, C: Compression, A
         status: Code,
         fields: &H,
         frame: framing::Empty,
-    ) -> Result<Written<'d, O::Deferred, Q::Selection>, Error> {
-        emit_framed_head::<_, _, ()>(self.out, self.date, status, fields, frame)?;
-        Ok(Written::Body {
-            body: handoff::Ready::Empty,
-        })
+    ) -> Result<ControlFlow<O::Deferred, Complete<'d>>, Failure> {
+        emit_framed_head::<_, _, ()>(self.out, self.date, status, fields, frame)
+            .map_err(Error::Wire)?;
+        Ok(ControlFlow::Continue(Complete::Inline))
     }
 }
 
-impl<'req, 'd: 'req, Q: scope::Source, O: stage::Body<'req, 'd>, C: Compression, A>
+impl<'input, 'req, 'd: 'req, Q: scope::Source, O: stage::Body<'req, 'd>, C: Compression, A>
     dispatch::Accept<'d> for Sink<'_, 'req, 'd, Q, O, C, A>
+where
+    Q::Selection: Into<crate::Input<'input>>,
 {
-    type Output = Written<'d, O::Deferred, Q::Selection>;
-    type Error = Error;
+    type Output = ControlFlow<O::Deferred, Complete<'d>>;
+    type Error = Failure;
 
     fn fixed<H, B>(self, status: Code, fields: H, body: B) -> Result<Self::Output, Self::Error>
     where
@@ -208,10 +192,14 @@ impl<'req, 'd: 'req, Q: scope::Source, O: stage::Body<'req, 'd>, C: Compression,
                 self.out, self.date, status, &fields, body, gzip, true, self.slot,
             );
         }
-        let (_, encoded) = emit_head::<_, bool>(self.out, self.date, status, &fields, body.len())?;
-        let written = stage(self.slot, body)?;
+        let (_, encoded) = emit_head::<_, bool>(self.out, self.date, status, &fields, body.len())
+            .map_err(Error::Wire)?;
         identity(self.date.response, encoded)?;
-        Ok(written)
+        Ok(ControlFlow::Continue(if body.is_empty() {
+            Complete::Inline
+        } else {
+            Complete::Static { body }
+        }))
     }
 
     fn encoded<const EXACT: bool>(
@@ -224,52 +212,26 @@ impl<'req, 'd: 'req, Q: scope::Source, O: stage::Body<'req, 'd>, C: Compression,
             return self.empty(status, &fields, frame);
         }
         let plan = body.try_plan().map_err(|error| Error::Size(error.into()))?;
-        let Self {
-            out,
-            date,
-            mode,
-            slot,
-            ..
-        } = self;
-        match mode {
+        let out = self.out;
+        let date = self.date;
+        let ready = match self.mode {
             Mode::Compress { gzip, required } if EXACT => {
-                compress_exact(out, date, status, &fields, plan, gzip, required, slot)
+                compress_exact(out, date, status, &fields, plan, gzip, required)?
             }
             Mode::Compress { gzip, required } => {
-                compress_bounded(out, date, status, &fields, plan, gzip, required, slot)
+                compress_bounded(out, date, status, &fields, plan, gzip, required)?
             }
-            Mode::Plain if EXACT => finish_exact(out, date, status, &fields, plan, slot),
-            Mode::Plain => finish_bounded(out, date, status, &fields, plan, slot),
-        }
-    }
-}
-
-impl<'req, 'd: 'req, Q: scope::Source, O: stage::Body<'req, 'd>, C: Compression> dispatch::Sink<'d>
-    for Sink<'_, 'req, 'd, Q, O, C>
-{
-    type Stream<S> = Option<S>;
-
-    fn stream<H, S>(
-        self,
-        status: Code,
-        fields: H,
-        stream: Option<S>,
-    ) -> Result<Self::Stream<S>, Self::Error>
-    where
-        H: field::Source<headers::Application>,
-    {
-        let admit = match self.date.response.method() {
-            response::Method::Head => Admit::Head,
-            response::Method::Other | response::Method::Connect => Admit::Body(()),
+            Mode::Plain if EXACT => finish_exact(out, date, status, &fields, plan)?,
+            Mode::Plain => finish_bounded(out, date, status, &fields, plan)?,
         };
-        self.with_admit(admit)
-            .stream(status, fields, stream)
-            .map(|body| body.map(|((), stream)| stream))
+        Ok(ControlFlow::Continue(ready))
     }
 }
 
-impl<'req, 'd: 'req, Q: scope::Source, O: stage::Body<'req, 'd>, C: Compression, A>
-    dispatch::Sink<'d> for Sink<'_, 'req, 'd, Q, O, C, Admit<A>>
+impl<'input, 'req, 'd: 'req, Q: scope::Source, O: stage::Body<'req, 'd>, C: Compression, A>
+    dispatch::Sink<'d> for Sink<'_, 'req, 'd, Q, O, C, A>
+where
+    Q::Selection: Into<crate::Input<'input>>,
 {
     type Stream<S> = Option<(A, S)>;
 
@@ -284,14 +246,14 @@ impl<'req, 'd: 'req, Q: scope::Source, O: stage::Body<'req, 'd>, C: Compression,
     {
         let frame = self.omission(status)?;
         let frame = match self.admit {
-            Admit::Head => framing::Empty::Unframed,
-            Admit::Body(admit) => match frame {
+            None => framing::Empty::Unframed,
+            Some(admit) => match frame {
                 Some(frame) => frame,
                 None => match stream {
                     None => framing::Empty::Zero,
                     Some(stream) => {
                         if self.date.response.version() == Version::Ten {
-                            return Err(Error::StreamingVersion(Version::Ten));
+                            return Err(Error::StreamingVersion(Version::Ten).into());
                         }
                         let (_, encoded) = emit_framed_head::<_, _, bool>(
                             self.out,
@@ -299,9 +261,10 @@ impl<'req, 'd: 'req, Q: scope::Source, O: stage::Body<'req, 'd>, C: Compression,
                             status,
                             &fields,
                             framing::Chunked,
-                        )?;
+                        )
+                        .map_err(Error::Wire)?;
                         if matches!(self.mode, Mode::Compress { required: true, .. }) {
-                            return Err(Error::Compression(compress::Error::Unavailable));
+                            return Err(Error::Compression(compress::Error::Unavailable).into());
                         }
                         identity(self.date.response, encoded)?;
                         return Ok(Some((admit, stream)));
@@ -309,24 +272,27 @@ impl<'req, 'd: 'req, Q: scope::Source, O: stage::Body<'req, 'd>, C: Compression,
                 },
             },
         };
-        emit_framed_head::<_, _, ()>(self.out, self.date, status, &fields, frame)?;
+        emit_framed_head::<_, _, ()>(self.out, self.date, status, &fields, frame)
+            .map_err(Error::Wire)?;
         Ok(None)
     }
 }
 
-fn plain_body<'req, 'd, H, B, Q: scope::Source, O: stage::Body<'req, 'd>>(
+fn plain_body<'input, 'req, 'd, H, B, Q: scope::Source, O: stage::Body<'req, 'd>>(
     mut out: Slice<'_, &mut usize>,
     date: Headers<'_>,
     status: Code,
     fields: &H,
     body: B,
     slot: handoff::Slot<'req, 'd, Q, O>,
-) -> Result<Written<'d, O::Deferred, Q::Selection>, Error>
+) -> Result<ControlFlow<O::Deferred, Complete<'d>>, Failure>
 where
     H: field::Source<headers::Application>,
     B: response::Body<'d>,
+    Q::Selection: Into<crate::Input<'input>>,
 {
-    let (head, encoded) = emit_head::<_, bool>(out.reborrow(), date, status, fields, body.len())?;
+    let (head, encoded) = emit_head::<_, bool>(out.reborrow(), date, status, fields, body.len())
+        .map_err(Error::Wire)?;
     let inline = if B::INLINE { body.as_slice() } else { None };
     if let Some(raw) = inline {
         head.checked_add(raw.len()).ok_or(Error::Overflow {
@@ -335,50 +301,33 @@ where
         })?;
         if o3::buffer::write::Sink::write_slice(&mut out, raw).is_ok() {
             identity(date.response, encoded)?;
-            return Ok(Written::inline(raw.len()));
+            return Ok(ControlFlow::Continue(Complete::copied(raw.len())));
         }
     }
-    let written = stage(slot, body)?;
+    let plan = body.try_resolve(&slot).map_err(Error::Owner)?;
     identity(date.response, encoded)?;
-    Ok(written)
+    finish(plan)
 }
 
-fn finish_exact<
-    'req,
-    'd,
-    H: field::Source<headers::Application>,
-    B: Encode,
-    const EXACT: bool,
-    Q: scope::Source,
-    O: stage::Body<'req, 'd>,
->(
+fn finish_exact<'d, H: field::Source<headers::Application>, B: Encode, const EXACT: bool>(
     mut out: Slice<'_, &mut usize>,
     date: Headers<'_>,
     status: Code,
     fields: &H,
     plan: encoded::Plan<B, EXACT>,
-    slot: handoff::Slot<'req, 'd, Q, O>,
-) -> Result<Written<'d, O::Deferred, Q::Selection>, Error> {
+) -> Result<Complete<'d>, Error> {
     let len = plan.limit();
     let (head, encoded) = emit_head::<_, bool>(out.reborrow(), date, status, fields, len)?;
-    let written = place_exact(out, head, plan, slot)?;
+    let written = place_exact(out, head, plan)?;
     identity(date.response, encoded)?;
     Ok(written)
 }
 
-fn place_exact<
-    'req,
-    'd,
-    B: Encode,
-    const EXACT: bool,
-    Q: scope::Source,
-    O: stage::Body<'req, 'd>,
->(
+fn place_exact<'d, B: Encode, const EXACT: bool>(
     mut out: Slice<'_, &mut usize>,
     head: usize,
     plan: encoded::Plan<B, EXACT>,
-    slot: handoff::Slot<'req, 'd, Q, O>,
-) -> Result<Written<'d, O::Deferred, Q::Selection>, Error> {
+) -> Result<Complete<'d>, Error> {
     let len = plan.limit();
     head.checked_add(len).ok_or(Error::Overflow {
         base: head,
@@ -386,60 +335,70 @@ fn place_exact<
     })?;
     if len <= out.remaining() {
         plan.write(&mut out)?;
-        return Ok(Written::inline(len));
+        return Ok(Complete::copied(len));
     }
-    let body = plan.into_shared()?;
-    stage(slot, body)
+    Ok(Complete::shared(plan.into_shared()?))
 }
 
 fn finish_bounded<
     'out,
-    'req,
     'd,
     H: field::Source<headers::Application>,
     B: Encode,
     const EXACT: bool,
-    Q: scope::Source,
-    O: stage::Body<'req, 'd>,
 >(
     mut out: Slice<'out, &'out mut usize>,
     date: Headers<'_>,
     status: Code,
     fields: &H,
     plan: encoded::Plan<B, EXACT>,
-    slot: handoff::Slot<'req, 'd, Q, O>,
-) -> Result<Written<'d, O::Deferred, Q::Selection>, Error> {
+) -> Result<Complete<'d>, Error> {
     let max = plan.limit();
     if let Some(mut pending) = Pending::try_place(&mut out, date, status, fields, max)? {
         let len = pending.encode(plan.into_body())?;
         let encoded = pending.finish::<bool>()?;
         identity(date.response, encoded)?;
-        return Ok(Written::inline(len));
+        return Ok(Complete::copied(len));
     }
     let body = plan.into_shared()?;
     let (_, encoded) = emit_head::<_, bool>(out, date, status, fields, body.len())?;
-    let written = stage(slot, body)?;
     identity(date.response, encoded)?;
-    Ok(written)
+    Ok(Complete::shared(body))
 }
 
-fn stage<'req, 'd, B, Q: scope::Source, O: stage::Body<'req, 'd>>(
-    slot: handoff::Slot<'req, 'd, Q, O>,
-    body: B,
-) -> Result<Written<'d, O::Deferred, Q::Selection>, Error>
-where
-    B: response::Body<'d>,
-{
-    let plan = response::Body::try_resolve(body, &slot)?;
-    Ok(staged(plan.stage()))
-}
-
-fn staged<'req, 'd, H, B: stage::Body<'req, 'd>>(
-    body: stage::State<'d, H, B>,
-) -> Written<'d, B::Deferred, H> {
-    match body {
-        stage::State::Body(body) => Written::RequestBody { body: body.defer() },
-        stage::State::Ready(body) => Written::Body { body },
-        stage::State::Head(input) => Written::Head { input },
-    }
+fn finish<'input, 'req, 'd, H: Into<crate::Input<'input>>, B: stage::Body<'req, 'd>>(
+    plan: handoff::Plan<'req, 'd, H, B>,
+) -> Result<ControlFlow<B::Deferred, Complete<'d>>, Failure> {
+    let ready = match plan.stage() {
+        stage::State::Body(body) => return Ok(ControlFlow::Break(body.defer())),
+        stage::State::Head(input) => {
+            let input = input.into();
+            let body = input.try_retain().map_err(Failure::Input)?;
+            match input {
+                crate::Input::Borrowed(_) => Complete::Owned {
+                    body,
+                    cause: evidence::Cause::Borrowed,
+                },
+                crate::Input::Buffered(_) => Complete::Shared { body },
+            }
+        }
+        stage::State::Ready(body) => match body {
+            handoff::Ready::Empty => Complete::Inline,
+            handoff::Ready::Owned(mut body) => Complete::Shared {
+                body: storage::Shared::try_from(&mut body).map_err(Error::Allocation)?,
+            },
+            handoff::Ready::Copied(body) => {
+                let (body, copy) = body.into_parts();
+                Complete::Owned {
+                    body,
+                    cause: copy.cause,
+                }
+            }
+            handoff::Ready::Retained(body) => Complete::Shared { body },
+            handoff::Ready::Segmented(body) => Complete::Segments { body },
+            handoff::Ready::Linked(body) => Complete::Linked { body },
+            handoff::Ready::Fixed(body) => Complete::Static { body },
+        },
+    };
+    Ok(ControlFlow::Continue(ready))
 }

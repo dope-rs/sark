@@ -11,10 +11,7 @@ use common::{
     retained,
     route::{
         chunked::{apps::ChunkedDispatch, peer::Peer},
-        glue::{
-            hello::HelloDispatch,
-            timer::Chain,
-        },
+        glue::{hello::HelloDispatch, timer::Chain},
     },
     server::{self, MAX_CONNECTIONS, Plan, peer::Receive as _, try_serve},
 };
@@ -42,37 +39,28 @@ use sark_h1::server::{date, run::prepare::Error};
 
 #[test]
 fn waits_after_eof() {
-    let (harness, server) = Plan::isolated();
+    retained::run::<Chain, _>(Plan::isolated(), MAX_CONNECTIONS, |bind| {
+        let mut stream = TcpStream::connect(bind).expect("connect");
+        stream
+            .set_read_timeout(Some(Duration::from_secs(3)))
+            .expect("bound response wait");
+        let start = Instant::now();
+        stream
+            .write_all(b"GET /chain HTTP/1.1\r\nHost: x\r\n\r\n")
+            .expect("write complete request");
+        stream
+            .shutdown(Shutdown::Write)
+            .expect("finish request input");
+        let mut response = String::new();
+        stream
+            .read_to_string(&mut response)
+            .expect("read response through close");
+        let elapsed = start.elapsed();
 
-    harness
-        .run(
-            |context, listener| {
-                retained::try_serve::<Chain>(server, context, listener, MAX_CONNECTIONS)
-            },
-            |bind| {
-                let mut stream = TcpStream::connect(bind).expect("connect");
-                stream
-                    .set_read_timeout(Some(Duration::from_secs(3)))
-                    .expect("bound response wait");
-                let start = Instant::now();
-                stream
-                    .write_all(b"GET /chain HTTP/1.1\r\nHost: x\r\n\r\n")
-                    .expect("write complete request");
-                stream
-                    .shutdown(Shutdown::Write)
-                    .expect("finish request input");
-                let mut response = String::new();
-                stream
-                    .read_to_string(&mut response)
-                    .expect("read response through close");
-                let elapsed = start.elapsed();
-
-                assert!(elapsed >= Duration::from_millis(90), "elapsed: {elapsed:?}",);
-                assert!(response.contains("200 OK"), "response: {response}");
-                assert!(response.ends_with("two slept"), "response: {response}");
-            },
-        )
-        .expect("waits_after_eof server shutdown");
+        assert!(elapsed >= Duration::from_millis(90), "elapsed: {elapsed:?}",);
+        assert!(response.contains("200 OK"), "response: {response}");
+        assert!(response.ends_with("two slept"), "response: {response}");
+    });
 }
 
 const HEAD_TIMEOUT: Duration = Duration::from_millis(500);
@@ -81,102 +69,93 @@ const HEAD_TIMEOUT: Duration = Duration::from_millis(500);
 fn input_deadline_spans_body() {
     let pair = Pair::bind().expect("body deadline listener");
     let plan = Plan::new(pair.addr(), HEAD_TIMEOUT).build();
-    pair.run(
-        |context, listener| {
-            retained::try_serve::<ChunkedDispatch>(plan, context, listener, MAX_CONNECTIONS)
-        },
-        |address| {
-            for (head, dribble) in [
-                (
-                    &b"POST /expect HTTP/1.1\r\nHost: local\r\nContent-Length: 4096\r\n\r\n"[..],
-                    &b""[..],
-                ),
-                (
-                    &b"POST /expect HTTP/1.1\r\nHost: local\r\nTransfer-Encoding: chunked\r\n\r\n"
-                        [..],
-                    &b"1\r\nx\r\n"[..],
-                ),
-                (
-                    &b"POST /discard HTTP/1.1\r\nHost: local\r\nContent-Length: 4096\r\n\r\n"[..],
-                    &b"x"[..],
-                ),
-            ] {
-                let socket = Peer::try_connect(address).expect("body peer");
-                socket
-                    .read_wait(Some(Duration::from_millis(50)))
-                    .expect("dribble interval");
-                socket.write_all(head).expect("admit body");
-                let started = Instant::now();
-                loop {
-                    assert!(
-                        started.elapsed() < Duration::from_secs(3),
-                        "input window renewed"
-                    );
-                    match socket.read(&mut [0; 512]) {
-                        Ok(0) => break,
-                        Ok(_) => {}
-                        Err(PeerError::Syscall(error)) if error.is_reset() => break,
-                        Err(PeerError::TimedOut) => {
-                            if !dribble.is_empty() {
-                                match socket.write_all(dribble) {
-                                    Ok(()) => {}
-                                    Err(PeerError::Syscall(error))
-                                        if error.is_pipe() || error.is_reset() =>
-                                    {
-                                        break;
-                                    }
-                                    Err(error) => panic!("body dribble: {error:?}"),
+    retained::run::<ChunkedDispatch, _>((pair, plan), MAX_CONNECTIONS, |address| {
+        for (head, dribble) in [
+            (
+                &b"POST /expect HTTP/1.1\r\nHost: local\r\nContent-Length: 4096\r\n\r\n"[..],
+                &b""[..],
+            ),
+            (
+                &b"POST /expect HTTP/1.1\r\nHost: local\r\nTransfer-Encoding: chunked\r\n\r\n"[..],
+                &b"1\r\nx\r\n"[..],
+            ),
+            (
+                &b"POST /discard HTTP/1.1\r\nHost: local\r\nContent-Length: 4096\r\n\r\n"[..],
+                &b"x"[..],
+            ),
+        ] {
+            let socket = Peer::try_connect(address).expect("body peer").socket;
+            socket
+                .read_wait(Some(Duration::from_millis(50)))
+                .expect("dribble interval");
+            socket.write_all(head).expect("admit body");
+            let started = Instant::now();
+            loop {
+                assert!(
+                    started.elapsed() < Duration::from_secs(3),
+                    "input window renewed"
+                );
+                match socket.read(&mut [0; 512]) {
+                    Ok(0) => break,
+                    Ok(_) => {}
+                    Err(PeerError::Syscall(error)) if error.is_reset() => break,
+                    Err(PeerError::TimedOut) => {
+                        if !dribble.is_empty() {
+                            match socket.write_all(dribble) {
+                                Ok(()) => {}
+                                Err(PeerError::Syscall(error))
+                                    if error.is_pipe() || error.is_reset() =>
+                                {
+                                    break;
                                 }
+                                Err(error) => panic!("body dribble: {error:?}"),
                             }
                         }
-                        Err(error) => panic!("body deadline: {error:?}"),
                     }
+                    Err(error) => panic!("body deadline: {error:?}"),
                 }
-                assert!(
-                    started.elapsed() >= HEAD_TIMEOUT / 2,
-                    "body rejected before its deadline"
-                );
             }
+            assert!(
+                started.elapsed() >= HEAD_TIMEOUT / 2,
+                "body rejected before its deadline"
+            );
+        }
 
-            for (head, response, early) in [
-                (
-                    &b"POST /expect HTTP/1.1\r\nHost: local\r\nContent-Length: 2\r\n\r\na"[..],
-                    &b"ab"[..],
-                    false,
-                ),
-                (
-                    &b"POST /discard HTTP/1.1\r\nHost: local\r\nContent-Length: 2\r\n\r\na"[..],
-                    &b"2"[..],
-                    true,
-                ),
-            ] {
-                let mut socket = Peer::try_connect(address).expect("completed body peer");
-                socket.write_all(head).expect("partial body");
-                if !early {
-                    thread::sleep(Duration::from_millis(100));
-                    socket.write_all(b"b").expect("complete body");
-                }
-                let mut buffered = Vec::new();
-                assert_eq!(
-                    Peer::new(&mut socket, &mut buffered)
-                        .try_response()
-                        .expect("body response"),
-                    (200, response.to_vec()),
-                );
-                if early {
-                    socket.write_all(b"b").expect("complete native discard");
-                }
-                thread::sleep(HEAD_TIMEOUT + Duration::from_millis(100));
-                assert_eq!(
-                    Peer::new(&mut socket, &mut buffered)
-                        .try_exchange(b"GET /ping HTTP/1.1\r\nHost: local\r\n\r\n")
-                        .expect("completed input cleared the lease"),
-                    (200, b"pong".to_vec()),
-                );
+        for (head, response, early) in [
+            (
+                &b"POST /expect HTTP/1.1\r\nHost: local\r\nContent-Length: 2\r\n\r\na"[..],
+                &b"ab"[..],
+                false,
+            ),
+            (
+                &b"POST /discard HTTP/1.1\r\nHost: local\r\nContent-Length: 2\r\n\r\na"[..],
+                &b"2"[..],
+                true,
+            ),
+        ] {
+            let mut peer = Peer::try_connect(address).expect("completed body peer");
+            peer.socket.write_all(head).expect("partial body");
+            if !early {
+                thread::sleep(Duration::from_millis(100));
+                peer.socket.write_all(b"b").expect("complete body");
             }
-        },
-    )
-    .expect("body deadline runtime");
+            assert_eq!(
+                peer.try_response().expect("body response"),
+                (200, response.to_vec()),
+            );
+            if early {
+                peer.socket
+                    .write_all(b"b")
+                    .expect("complete native discard");
+            }
+            thread::sleep(HEAD_TIMEOUT + Duration::from_millis(100));
+            assert_eq!(
+                peer.try_exchange(b"GET /ping HTTP/1.1\r\nHost: local\r\n\r\n")
+                    .expect("completed input cleared the lease"),
+                (200, b"pong".to_vec()),
+            );
+        }
+    });
 }
 
 #[test]
@@ -297,9 +276,7 @@ fn timer_floor_covers_all() {
                 let prepared = topology::Plan::new(storage, plan)
                     .with_install(baseline)
                     .map_err(core::BranchError::Second)?;
-                assert!(
-                    prepared.layout().schedule().timers().count().get() > MAX_CONNECTIONS,
-                );
+                assert!(prepared.layout().schedule().timers().count().get() > MAX_CONNECTIONS,);
                 {
                     let mut reports = reclaim::Reports::new(
                         prepared.layout(),

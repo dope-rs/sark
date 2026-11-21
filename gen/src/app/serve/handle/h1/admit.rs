@@ -17,7 +17,7 @@ pub(in crate::app::serve::handle) fn fiber(
     let flat = serve::flat::name(context.plan.spec, false);
     let variant = task.phase("Future");
     let route = task.route();
-    let [n_admit, n_close] = generics.locals(["__admission", "__close"]);
+    let n_admit = generics.local("__admission");
     let [n_used, n_input] = generics.locals(["__consumed", "__input"]);
     let [n_resp, n_run] = generics.locals(["__response", "__runtime"]);
     let [n_source, n_task] = generics.locals(["__source", "__task"]);
@@ -44,7 +44,6 @@ pub(in crate::app::serve::handle) fn fiber(
         move |
             #n_input: #ns_core::manifold::task::request::Input<'d, #route>,
             #n_used,
-            #n_close,
             #n_resp: #ns_h1::wire::response::Context,
             #n_run: &mut #runtime,
         | {
@@ -59,10 +58,7 @@ pub(in crate::app::serve::handle) fn fiber(
             let #n_task = #n_admit.insert(#flat::#variant(#n_task));
             #debit
             #n_run.insert(#ns_h1::server::task::runtime::Running::Future(#n_resp, #n_task));
-            #ns_h1::session::Outcome::Park {
-                consumed: #n_used,
-                close: #n_close,
-            }
+            #ns_h1::session::Outcome::park(#n_used, #n_resp)
         }
     }}
 }

@@ -1,15 +1,13 @@
 pub mod common;
 
-use std::{convert, mem};
+use std::mem;
 
 use common::{Request, body::Retain};
 use dope_test::alloc::Tracker;
 use o3::buffer::{Complete as _, storage};
 use sark_core::body::credit;
 use sark_h1::{
-    Input,
-    route::Pending,
-    session,
+    Input, session,
     wire::parsing::{self, framing, raw},
 };
 use sark_http::payload::owned;
@@ -32,20 +30,16 @@ fn retention_follows_window() {
         let parsed = common::head::parsed(head, u8::MAX);
         let mut fixture = Retain::try_new().expect("response resources");
         let mut conn = session::Conn::default();
-        let (outcome, allocs) = Tracker::count(|| {
+        let (pending, allocs) = Tracker::count(|| {
             let head = framing::Head::<Request>::parse::<false>(raw::Bound::empty(&parsed))
                 .ok()
                 .flatten()
                 .expect("complete framing");
-            fixture.dispatch(&mut conn, session::Permit::new(), head)
+            fixture.pending(&mut conn, head)
         });
         assert_eq!(allocs, expected);
         assert!(fixture.state.get().0.is_null());
-        let mut pending: Pending<'static, Request> = match outcome {
-            session::RouteOutcome::AwaitBody { pending, .. } => Some(pending),
-            _ => None,
-        }
-        .expect("pending request body");
+        let mut pending = pending.ok().expect("pending body");
         assert_eq!(pending.head_len() as usize, Request::HEAD.len());
         conn.retire();
         drop(owner);
@@ -87,19 +81,16 @@ fn retains_fragmented_head() {
     let mut fixture = Retain::try_new().expect("response resources");
     let mut conn = session::Conn::default();
     let outcome = pending
-        .try_resume(
-            Input::Borrowed(&Request::HEAD[split..]),
-            session::Permit::new(),
-            convert::identity,
-            |head, permit| fixture.dispatch(&mut conn, permit, head).with_head(),
-        )
+        .try_resume(Input::Borrowed(&Request::HEAD[split..]), |head| {
+            fixture.pending(&mut conn, head)
+        })
         .ok()
         .expect("head resumed");
-    let mut pending: Pending<'static, Request> = match outcome {
-        session::RouteOutcome::AwaitBody { pending, .. } => Some(pending),
-        _ => None,
-    }
-    .expect("pending body");
+    let mut pending = outcome
+        .continue_value()
+        .expect("completed head")
+        .ok()
+        .expect("pending body");
     conn.retire();
     let body = storage::Shared::try_copy(b"z").expect("body storage");
     assert!(

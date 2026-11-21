@@ -241,9 +241,8 @@ impl Handler {
         let env = generics.lifetime("env");
         let out_req = generics.lifetime("__req");
         let out_d = generics.lifetime("__d");
-        let [v_params, v_req, v_heads, v_body] =
-            generics.locals(["params", "req", "headers", "parsed_body"]);
-        let [v_state, v_rqst, v_input] = generics.locals(["state", "request", "input"]);
+        let [v_req, v_state, v_rqst, v_input] =
+            generics.locals(["req", "__sark_state", "request", "input"]);
         let lts = &generics.lifetimes;
         let params = &generics.parameters;
         let bounds = &generics.predicates;
@@ -341,18 +340,9 @@ impl Handler {
         let outer = match mode {
             Mode::Native => {
                 let req_out = life.response(&out_req, Some(&out_d), &state_lives);
-                let request_arg = request.then(|| quote::quote!(#v_input.0,));
-                let state_arg = state_at.map(|_| quote::quote!(#v_input.1,));
-                let projected = quote::quote!(
-                    <Self::Request as #ns_core::route::Project>::from_parts(
-                        #v_input.0, #v_input.2, #v_input.3, #v_input.1,
-                    )
-                );
-                let projected = if request {
-                    projected
-                } else {
-                    quote::quote!({ #projected; })
-                };
+                let request_arg = request.then(|| quote::quote!(#v_rqst,));
+                let state_arg = state_at.map(|_| quote::quote!(#v_state,));
+                let release = (!request).then(|| quote::quote!(::core::mem::drop(#v_rqst);));
                 quote::quote! {
                     impl #impl_lts #ns_core::manifold::Route<#state> for #name
                     where #( #bounds, )*
@@ -361,13 +351,12 @@ impl Handler {
                         where #out_d: #out_req;
                         #[inline(always)]
                         fn invoke<#inv_req, #inv_d, #borrow>(
-                            #v_input: #ns_core::manifold::Args<
-                                '_, #inv_req, #inv_d, #borrow, Self::Request, #state,
-                            >,
+                            #v_rqst: <Self::Request as #ns_core::route::Project>::View<#inv_req, #inv_d>,
+                            #v_state: &#borrow #state,
                         ) -> Self::Response<#inv_req, #inv_d>
                         where #inv_req: #borrow, #inv_d: #inv_req
                         {
-                            let #v_input = (#projected, #v_input.4);
+                            #release
                             #call((#request_arg #state_arg))
                         }
                     }
@@ -489,17 +478,11 @@ impl Handler {
                         type Session = #session;
                         #[inline(always)]
                         fn open<#inv_req, #inv_d>(
-                            #v_params: <Self::Request as #ns_core::route::Project>::Params<#inv_req>,
-                            #v_req: &#ns_core::request::View<#inv_req, #inv_d, <Self::Request as #ns_core::route::Schema>::Frame>,
-                            #v_heads: <Self::Request as #ns_core::route::Project>::Headers<#inv_req>,
-                            #v_body: <Self::Request as #ns_core::route::Project>::ParsedBody<#inv_req, #inv_d>,
+                            #v_rqst: <Self::Request as #ns_core::route::Project>::View<#inv_req, #inv_d>,
                             #v_state: &#env #state,
                         ) -> Self::Session
                         where #inv_d: #inv_req + #env, Self::Session: #ns_core::duplex::Session<#inv_d>
                         {
-                            let #v_rqst = <Self::Request as #ns_core::route::Project>::from_parts(
-                                #v_params, #v_heads, #v_body, #v_req,
-                            );
                             #call((#v_rqst, #v_state))
                         }
                     }

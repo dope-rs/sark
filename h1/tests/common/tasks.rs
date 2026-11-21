@@ -18,7 +18,6 @@ use sark_h1::{
     route::{Mode, Policy, PolicyOf},
     session,
     wire::{
-        head::Connection,
         parsing::{self, framing, raw},
         response::Context,
     },
@@ -26,7 +25,7 @@ use sark_h1::{
 use sark_http::{
     h1::head::response::{Date, Server},
     payload::{owned, response::dispatch},
-    request::{Id, body::Ref},
+    request::Id,
 };
 
 thread_local! {
@@ -42,13 +41,12 @@ pub type BufferedState<'d> = (usize, Option<manifold::task::request::Input<'d, B
 pub fn admit_buffered<'d>(
     input: manifold::task::request::Input<'d, Buffered>,
     consumed: usize,
-    close: Connection,
-    _: Context,
+    response: Context,
     state: &mut BufferedState<'d>,
 ) -> session::Outcome<'d> {
     state.0 += 1;
     state.1 = Some(input);
-    session::Outcome::Park { consumed, close }
+    session::Outcome::park(consumed, response)
 }
 
 pub const HEAD: &[u8] = b"POST / HTTP/1.1\r\nHost: local\r\nContent-Length: 1\r\n\r\n";
@@ -96,37 +94,19 @@ impl<P: body::Project, M> route::Schema for Request<P, M> {
 }
 
 impl<P: body::Project, M> route::Project for Request<P, M> {
-    type Params<'req> = ();
-    type Headers<'req> = ();
     type Error<'req> = Infallible;
     type View<'req, 'd>
         = usize
     where
         'd: 'req;
-    type ParsedBody<'req, 'd>
-        = usize
-    where
-        'd: 'req;
-
     fn reject(error: Infallible) -> route::Reject {
         match error {}
     }
-    fn from_params<'body>(
-        _: &request::raw::Parsed<request::Head<&[u8]>, Self>,
-    ) -> Result<(), <Self as route::Project>::Error<'body>> {
-        Ok(())
-    }
-    fn from_headers<'body>(
-        _: &request::raw::Parsed<request::Head<&[u8]>, Self>,
-    ) -> Result<(), <Self as route::Project>::Error<'body>> {
-        Ok(())
-    }
-    fn parse_body<'req, 'd: 'req>(body: P::View<'req, 'd>) -> Result<usize, Infallible> {
-        let body: Ref<'req, 'd> = body.into();
-        Ok(body.len())
-    }
-    fn from_parts<'req, 'd: 'req>(_: (), _: (), len: usize, _: &request::View<'req, 'd>) -> usize {
-        len
+    fn try_view<'req, 'body: 'req, 'd: 'body>(
+        _: &request::raw::Parsed<request::Head<&'req [u8]>, Self>,
+        body: body::Scoped<'body, 'd, P>,
+    ) -> Result<usize, Infallible> {
+        Ok(body.body().len())
     }
 }
 
@@ -246,7 +226,6 @@ pub fn try_dispatch_stream(
     let date = super::fields::DATE;
     Ok(Some(
         match conn.dispatch_stream::<Streaming, _, _, _, _>(
-            session::Permit::new(),
             head,
             state,
             writer.reborrow(),
@@ -260,7 +239,6 @@ pub fn try_dispatch_stream(
                     body_len: 1,
                     consumed: 1,
                 },
-                session::Permit::new(),
                 state,
                 writer.reborrow(),
                 date,
@@ -268,8 +246,6 @@ pub fn try_dispatch_stream(
                 reserve,
                 credit::Disabled,
             ),
-            session::RouteOutcome::AwaitHead { pending, .. } => match pending {},
-            session::RouteOutcome::AwaitReject { pending, .. } => match pending {},
         },
     ))
 }
@@ -287,7 +263,8 @@ impl<const PRESENT: bool> manifold::Route<Cell<usize>> for Streaming<PRESENT> {
     where
         'd: 'req;
     fn invoke<'req, 'd, 'state>(
-        (_, _, _, body, state): manifold::Args<'_, 'req, 'd, 'state, Self::Request, Cell<usize>>,
+        body: <Self::Request as route::Project>::View<'req, 'd>,
+        state: &'state Cell<usize>,
     ) -> Self::Response<'req, 'd>
     where
         'req: 'state,
@@ -307,10 +284,7 @@ impl route::Spec for Connect {
 impl<'state> duplex::Route<'state, ()> for Connect {
     type Session = Session;
     fn open<'req, 'd>(
-        _: (),
-        _: &request::View<'req, 'd>,
-        _: (),
-        _: usize,
+        _: <Self::Request as route::Project>::View<'req, 'd>,
         _: &'state (),
     ) -> Self::Session
     where

@@ -3,13 +3,7 @@ use std::{collections, mem};
 use sark_core::body::admit::Retention;
 use sark_http::h1::chunk::{self, Boundary};
 
-use crate::wire::body::{Payload, fixed, ingress, shape::Shape};
-
-pub(crate) struct Complete<'frame, 'd> {
-    /// Wire bytes consumed from the current transport input.
-    pub(crate) consumed: usize,
-    pub(crate) body: Payload<'frame, 'd>,
-}
+use crate::wire::body::{Frame, Payload, fixed, ingress, shape::Shape};
 
 /// The exact completed decoder, frozen until its source-bound frame is consumed.
 pub(crate) struct Borrowed<'frame> {
@@ -86,7 +80,7 @@ impl Chunked {
         max: usize,
         keep: Retention,
         store: &'frame mut ingress::Ingress<'d>,
-    ) -> Result<Option<Complete<'frame, 'd>>, Decode> {
+    ) -> Result<Option<Frame<'frame, 'd>>, Decode> {
         if !matches!(self.progress, Progress::Idle) {
             return Err(Decode::Framing);
         }
@@ -115,7 +109,7 @@ impl Chunked {
         keep: Retention,
         mut flow: Flow,
         store: &'frame mut ingress::Ingress<'d>,
-    ) -> Result<Option<Complete<'frame, 'd>>, Decode> {
+    ) -> Result<Option<Frame<'frame, 'd>>, Decode> {
         let req = input.as_slice();
 
         let consumed = if let Retention::Discarded = keep {
@@ -181,24 +175,24 @@ impl Chunked {
         let body = match (flow, keep) {
             (Flow::Borrowed, Retention::Retained) => {
                 self.progress = Progress::Complete;
-                Payload::Chunked(Borrowed { source: self }, ())
+                Payload::Chunked(Borrowed { source: self })
             }
             (Flow::Borrowed, Retention::Discarded) => {
                 self.progress = Progress::Complete;
-                Payload::Discarded(body_len, ())
+                Payload::Discarded(body_len)
             }
             (Flow::Streamed, Retention::Retained) => {
                 let body = store.finish()?;
                 self.progress = Progress::Complete;
-                Payload::Streamed(body, ())
+                Payload::Streamed(body)
             }
             (Flow::Streamed, Retention::Discarded) => {
                 store.finish()?;
                 self.progress = Progress::Complete;
-                Payload::Discarded(body_len, ())
+                Payload::Discarded(body_len)
             }
         };
-        Ok(Some(Complete { consumed, body }))
+        Ok(Some(Frame { consumed, body }))
     }
 
     pub(crate) fn resume(
@@ -275,15 +269,15 @@ impl Chunked {
         Ok(())
     }
 
-    pub(crate) fn into_ranges(mut self) -> Vec<(u32, u32)> {
+    pub(crate) fn take_ranges(&mut self) -> Vec<(u32, u32)> {
         self.ranges.clear();
-        self.ranges
+        mem::take(&mut self.ranges)
     }
 }
 
 const _: () = {
     assert!(mem::size_of::<Flow>() == 1);
-    assert!(mem::size_of::<Complete<'static, 'static>>() == 3 * mem::size_of::<usize>());
+    assert!(mem::size_of::<Frame<'static, 'static>>() == 3 * mem::size_of::<usize>());
     assert!(mem::size_of::<Progress>() == 1);
     assert!(mem::size_of::<Borrowed<'static>>() == mem::size_of::<usize>());
 };

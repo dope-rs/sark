@@ -11,7 +11,7 @@ pub mod machine;
 use crate::{
     decode,
     decode::{exec, request::Admitted},
-    request, route,
+    route,
 };
 
 /// Response-shape marker for a route which establishes a duplex byte stream.
@@ -151,10 +151,7 @@ pub trait Route<'state, State>: route::Spec<Kind = Shape> {
     type Session: 'state;
 
     fn open<'req, 'd>(
-        params: <Self::Request as route::Project>::Params<'req>,
-        req: &request::View<'req, 'd, <Self::Request as route::Schema>::Frame>,
-        head: <Self::Request as route::Project>::Headers<'req>,
-        body: <Self::Request as route::Project>::ParsedBody<'req, 'd>,
+        request: <Self::Request as route::Project>::View<'req, 'd>,
         state: &'state State,
     ) -> Self::Session
     where

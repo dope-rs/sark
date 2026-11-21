@@ -31,12 +31,7 @@ fn keeps_cause_and_credit() {
         .expect("complete framing");
     let mut fixture = Retain::try_new().expect("response resources");
     let mut conn: session::Conn = session::Conn::default();
-    let outcome = fixture.dispatch(&mut conn, session::Permit::new(), head);
-    let mut pending = match outcome {
-        session::RouteOutcome::AwaitBody { pending, .. } => Some(pending),
-        _ => None,
-    }
-    .expect("pending body");
+    let mut pending = fixture.pending(&mut conn, head).ok().expect("pending body");
     conn.retire();
 
     let mut evidence = Credits(Vec::with_capacity(3));

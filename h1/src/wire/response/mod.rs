@@ -87,7 +87,7 @@ impl Context {
         self
     }
 
-    pub(crate) const fn connection(self) -> Connection {
+    pub const fn connection(self) -> Connection {
         match self.version {
             Version::Ten | Version::ElevenClose => Connection::Close,
             Version::TenKeepAlive | Version::Eleven => Connection::KeepAlive,

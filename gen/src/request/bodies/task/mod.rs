@@ -216,10 +216,10 @@ impl Task<'_> {
         let field = self.authority.map(|peer| quote::quote!(authority: #peer,));
         let vis = self.vis;
         let mut output = match source {
-            Source::Json(json) => json::build(self, paths, &json.ty),
-            Source::Raw(raw) => Retain {
+            Source::Json(ty) => json::build(self, paths, ty),
+            Source::Raw { segmented, .. } => Retain {
                 task: self,
-                segmented: raw.segmented,
+                segmented: *segmented,
             }
             .build(paths),
             Source::Discarded => self.discard(paths),

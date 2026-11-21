@@ -28,25 +28,21 @@ pub(super) fn build(
     };
     let [
         v_auth,
-        v_req,
         v_rqst,
         v_parts,
         v_heads,
         v_input,
         v_range,
         v_id,
-        v_params,
         v_err,
     ] = [
         "__sark_authority",
-        "req",
         "request",
         "parts",
         "headers",
         "input",
         "range",
         "id",
-        "params",
         "error",
     ]
     .map(local);
@@ -58,8 +54,6 @@ pub(super) fn build(
     let headers = format_ident!("{}Headers", name);
     let params = format_ident!("{}Params", name);
     let builder = format_ident!("{}TaskBuilder", name);
-    let storage = format_ident!("__{}Mode", name);
-    let mode_ty = format_ident!("__{}Storage", name);
     let mut body = Plan::from_attrs(&st.attrs)?;
     let json = body.scope(&name);
     let module = format_ident!(
@@ -76,6 +70,10 @@ pub(super) fn build(
     let mut symbols = types::Generics::new(st.generics.clone());
     symbols.reserve().visit_item_struct(&st);
     let marker = symbols.ident("__sark_mode");
+    let [bytes_param, body_param] = symbols.idents(["__SarkBytes", "__SarkBody"]);
+    let v_req = symbols.local("req");
+    let v_body = symbols.local("__sark_request_body");
+    let mut view_fields = Vec::new();
     let Fields::Named(named) = &mut st.fields else {
         use proc_macro2::Span;
 
@@ -85,7 +83,7 @@ pub(super) fn build(
         ));
     };
 
-    let fields = fields::Fields::collect(paths, named, body)?;
+    let fields = fields::Fields::collect(&body_param, named, body)?;
 
     let has_peer = fields.peer.is_some();
     let frame = match has_peer {
@@ -113,19 +111,26 @@ pub(super) fn build(
     } else {
         None
     };
-    let peer_ty = fields.peer.as_ref().map(|ty| {
-        let mut ty = ty.clone();
-        types::Edit::new(&mut ty).retained(paths, types::RetainedAs::Request);
-        ty
+    let peer_ty = fields.peer.as_ref().map(|(ident, ty)| {
+        view_fields.push(quote!(#ident: #v_auth));
+        types::retained(ty, paths)
     });
-    let (headdecl, headcode, kinds, raw_head) =
-        binding::build(paths, &vis, &name, &headers, &fields, ordered, &symbols)?;
+    let (headdecl, headcode, read_headers, kinds, raw_head) = binding::build(
+        paths,
+        &vis,
+        &name,
+        &headers,
+        &fields,
+        ordered,
+        &symbols,
+        &mut view_fields,
+    )?;
     imports.push(raw_head.clone());
     let fields::Fields {
         headers: head,
         queries,
         paths: captures,
-        init: mut ref_init,
+        init: mut own_init,
         body,
         ..
     } = fields;
@@ -238,14 +243,16 @@ pub(super) fn build(
             },
         )
     };
-    let build = quote! {
-        #headers::<
-            'req,
-            #ns_core::request::mode::Ref<'req>,
-        >::from_head(#v_req)
-    };
-    let expand =
-        params::Expansion::try_new(paths, &captures, &vis, &name, &params, &raw_path, &symbols)?;
+    let expand = params::Expansion::try_new(
+        paths,
+        &captures,
+        &vis,
+        &name,
+        &params,
+        &raw_path,
+        &symbols,
+        &mut view_fields,
+    )?;
     if !captures.is_empty() {
         imports.extend([params.clone(), raw_path.clone()]);
     }
@@ -255,7 +262,7 @@ pub(super) fn build(
     let p_reject = &expand.reject;
     let ref_p = &expand.view;
     fields::Fields::commit(&mut st.attrs, named);
-    body.append_json(named, &vis);
+    let storage = body.storage(paths, named, &vis, &body_param);
     let empty = named.named.is_empty().then(|| {
         quote! {
             fn empty_task<'d>(
@@ -275,9 +282,7 @@ pub(super) fn build(
             }
         }
     });
-    let mut own_init = ref_init.clone();
     let body_len = local("__sark_body_len");
-    ref_init.extend(body.fields(paths, local("parsed_body"), quote!(#v_req.body_len())));
     own_init.extend(body.fields(paths, local("__sark_task_body"), quote!(#body_len)));
     if !st
         .generics
@@ -287,79 +292,46 @@ pub(super) fn build(
         st.generics.params.insert(0, syn::parse_quote!('d));
     }
     st.generics.params.push(syn::parse_quote!(
-        #mode_ty: #storage<'d> = #ns_core::request::mode::Own
+        #bytes_param = #ns_http::request::Bytes<'d>
     ));
+    let bytes_ref = quote!(&'req [::core::primitive::u8]);
+    let (view_args, storage_args) = match storage {
+        Some((owned, borrowed)) => {
+            st.generics
+                .params
+                .push(syn::parse_quote!(#body_param = #owned));
+            (
+                quote!(#bytes_ref, #borrowed),
+                quote!(#bytes_param, #body_param),
+            )
+        }
+        None => (bytes_ref, quote!(#bytes_param)),
+    };
     for field in &mut named.named {
-        body.rewrite(field, &storage, &mode_ty);
-        types::Edit::new(&mut field.ty).retained(paths, types::RetainedAs::Mode(&mode_ty));
+        if let Some(bytes) = types::shared_bytes(&mut field.ty) {
+            *bytes = syn::parse_quote!(#bytes_param);
+        }
     }
     named.named.push(syn::parse_quote! {
         #[doc(hidden)]
         pub #marker: ::core::marker::PhantomData<
-            fn(&'d (), #mode_ty) -> (&'d (), #mode_ty)
+            fn(&'d (), #storage_args) -> (&'d (), #storage_args)
         >
     });
-    ref_init.push(quote!(#marker: ::core::marker::PhantomData));
     own_init.push(quote!(#marker: ::core::marker::PhantomData));
-    let modes = body.mode_impls(paths, &vis, &storage);
-    let (in_err, parsed, body_arg) = body.parsing(paths, path_err);
+    let (in_err, read_body) = body.project(paths, path_err, &v_body, &mut view_fields);
     let (body_ty, source) = body.task(paths);
 
-    let (raw_ty, path_ty, own_path, path_api) = if captures.is_empty() {
-        (
-            quote!(()),
-            quote!(()),
-            quote!(()),
-            quote! {
-                type Params<'req> = ();
-
-                fn from_params<'req, 'body>(
-                    _: &#ns_core::request::raw::Parsed<
-                        #ns_core::request::Head<&'req [::core::primitive::u8], #frame>, Self,
-                    >,
-                ) -> ::core::result::Result<
-                    Self::Params<'req>,
-                    <Self as #ns_core::route::Project>::Error<'body>,
-                > {
-                    ::core::result::Result::Ok(())
-                }
-            },
-        )
+    let (raw_ty, own_path) = if captures.is_empty() {
+        (quote!(()), quote!(()))
     } else {
-        (
-            quote!(#raw_path),
-            quote! {
-                #params<'req, #ns_core::request::mode::Ref<'req>>
-            },
-            quote! {
-                #params<'d, #ns_core::request::mode::Own>
-            },
-            quote! {
-                type Params<'req> = #params<
-                    'req,
-                    #ns_core::request::mode::Ref<'req>,
-                >;
-
-                fn from_params<'req, 'body>(
-                    #v_req: &#ns_core::request::raw::Parsed<
-                        #ns_core::request::Head<&'req [::core::primitive::u8], #frame>, Self,
-                    >,
-                ) -> ::core::result::Result<
-                    Self::Params<'req>,
-                    <Self as #ns_core::route::Project>::Error<'body>,
-                > {
-                    #ref_p
-                }
-            },
-        )
+        (quote!(#raw_path), quote!(#params<'d>))
     };
-    let own_head = quote! {
-        #headers<'d, #ns_core::request::mode::Own>
-    };
+    let own_head = quote!(#headers<'d>);
     let pstart = &expand.start;
     let owned = quote! {
         #pstart
-        let #v_heads = #headers::<'d, #ns_core::request::mode::Own>
+        let #v_heads = #headers::<'d>
             ::try_from_task(&#v_rqst).map_err(#ns_core::route::Input::Retain)?;
         #own_peer
     };
@@ -383,63 +355,9 @@ pub(super) fn build(
         ty: task_ty,
         start,
     } = task.build(paths, source);
-    let path_in = if captures.is_empty() {
-        quote!(())
-    } else {
-        quote!(#v_params)
-    };
-    let hbind = if head.is_empty() && queries.is_empty() {
-        quote!(_)
-    } else {
-        quote!(#v_heads)
-    };
-    let head_in = match has_peer {
-        true => quote!((#hbind, #v_auth)),
-        false => hbind,
-    };
-    let hbase = quote! {
-        #headers<'req, #ns_core::request::mode::Ref<'req>>
-    };
-    let head_ty = match has_peer {
-        true => quote! {
-            (#hbase, &'req [::core::primitive::u8],)
-        },
-        false => hbase,
-    };
-    let head_out = match has_peer {
-        true => quote! {
-            let #v_heads = #build;
-            #ref_peer
-            ::core::result::Result::Ok((#v_heads, #v_auth))
-        },
-        false => quote!(::core::result::Result::Ok(#build)),
-    };
-    let body_in = body.input();
-    let req_in = body.request();
-    let project = quote! {
-            type View<'req, 'd> =
-                #name<'d, #ns_core::request::mode::Ref<'req>>
-            where
-                'd: 'req;
-
-            fn from_parts<'req, 'd>(
-                #path_in: #path_ty,
-                #head_in: #head_ty,
-                #body_in: #body_arg,
-                #req_in: &#ns_core::request::View<'req, 'd, #frame>,
-            ) -> Self::View<'req, 'd>
-            where
-                'd: 'req,
-            {
-                #name::<'d, #ns_core::request::mode::Ref<'req>> {
-                    #(#ref_init,)*
-                }
-            }
-    };
     Ok(quote! {
         #( #admitted )*
         #json_decl
-        #modes
         #st
         #headdecl
         #paramdecl
@@ -471,8 +389,6 @@ pub(super) fn build(
         }
         #proof
         impl #ns_core::route::Project for #name<'static> {
-            #path_api
-            type Headers<'req> = #head_ty;
             type Error<'req> = #in_err;
             fn reject<'req>(
                 #v_err: <Self as #ns_core::route::Project>::Error<'req>,
@@ -483,17 +399,22 @@ pub(super) fn build(
                     #ns_core::route::Input::Retain(#v_err) => match #v_err {},
                 }
             }
-            #project
-            #parsed
-            fn from_headers<'req, 'body>(
+            type View<'req, 'd> = #name<'d, #view_args> where 'd: 'req;
+
+            fn try_view<'req, 'body: 'req, 'd: 'body>(
                 #v_req: &#ns_core::request::raw::Parsed<
                     #ns_core::request::Head<&'req [::core::primitive::u8], #frame>, Self,
                 >,
-            ) -> ::core::result::Result<
-                Self::Headers<'req>,
-                <Self as #ns_core::route::Project>::Error<'body>,
-            > {
-                #head_out
+                #v_body: #ns_core::body::Scoped<'body, 'd, Self::Body>,
+            ) -> ::core::result::Result<Self::View<'req, 'd>, <Self as #ns_core::route::Project>::Error<'body>> {
+                #ref_p
+                #read_headers
+                #ref_peer
+                #read_body
+                ::core::result::Result::Ok(#name {
+                    #(#view_fields,)*
+                    #marker: ::core::marker::PhantomData,
+                })
             }
         }
         impl #ns_core::route::Own for #name<'static> {

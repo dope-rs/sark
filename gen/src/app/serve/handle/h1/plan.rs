@@ -1,101 +1,90 @@
 use crate::{
-    app::{serve, spec},
+    app::{serve, serve::duplex, spec},
     runtime::paths::Paths,
 };
 
-pub(super) fn negotiate(
-    paths: &Paths,
-    entry: &serve::RouteSpec<'_, serve::Mode<'_>>,
-) -> proc_macro2::TokenStream {
-    let ns_h1 = &paths.h1;
-    let route = &entry.entry.route;
-    if matches!(entry.mode, serve::Mode::Sync) {
-        quote::quote!(::core::matches!(
-            <#route as #ns_h1::route::PolicyOf>::POLICY.mode,
-            #ns_h1::route::Mode::Gzip | #ns_h1::route::Mode::RequiredGzip,
-        ))
-    } else {
-        quote::quote!(false)
+impl serve::RouteSpec<'_, serve::Mode<'_>> {
+    pub(super) fn empty_sync(&self) -> bool {
+        use crate::app::route::Method;
+        matches!(self.mode, serve::Mode::Sync)
+            && matches!(self.entry.method, Method::Get | Method::Head)
     }
 }
 
-/// Closed generated ownership of every routed H1 continuation.
-pub(in crate::app::serve) struct Plan<'source, 'spec> {
-    generics: &'spec crate::types::Generics,
+/// H1-only route state. Task-only expansion has no value of this type, making
+/// continuation, guard, and duplex planning unreachable there.
+pub(in crate::app::serve) struct H1Plan<'source, 'spec> {
+    pub(in crate::app::serve) cleartext: Option<&'source proc_macro2::TokenStream>,
+    pub(in crate::app::serve) duplex: &'source duplex::Plan<'spec>,
     entries: &'source [serve::RouteSpec<'spec, serve::Mode<'spec>>],
-    name: syn::Ident,
-    route: syn::Ident,
-    ready: syn::Ident,
-    ready_route: syn::Ident,
-    head: syn::Ident,
+    pub(super) operations: Vec<usize>,
+    pub(in crate::app::serve::handle) continuation: syn::Ident,
+    pub(in crate::app::serve::handle) route: syn::Ident,
+    pub(in crate::app::serve::handle) ready_route: syn::Ident,
+    pub(in crate::app::serve::handle) head: syn::Ident,
 }
 
-impl<'source, 'spec> Plan<'source, 'spec> {
-    pub(in crate::app::serve) fn full(plan: &'source serve::ProtocolPlan<'spec>) -> Self {
+impl<'source, 'spec> H1Plan<'source, 'spec> {
+    pub(in crate::app::serve) fn new(
+        plan: &'source serve::ProtocolPlan<'spec>,
+        cleartext: Option<&'source proc_macro2::TokenStream>,
+    ) -> Self {
+        let mut sync = std::collections::BTreeMap::new();
+        let mut operations = Vec::with_capacity(plan.entries.len());
+        for (index, route) in plan.entries.iter().enumerate() {
+            let entry = route.entry;
+            let operation = if matches!(route.mode, serve::Mode::Sync)
+                && entry.guards.is_empty()
+                && entry.route.qself.is_none()
+                && let Some(handler) = entry.route.path.get_ident()
+            {
+                *sync.entry((entry.method, handler)).or_insert(index)
+            } else {
+                index
+            };
+            operations.push(operation);
+        }
         Self {
-            generics: &plan.spec.state_generics,
+            cleartext,
+            duplex: &plan.duplex,
             entries: &plan.entries,
-            name: quote::format_ident!("__{}H1Pending", plan.spec.name),
+            operations,
+            continuation: quote::format_ident!("__{}H1Continuation", plan.spec.name),
             route: quote::format_ident!("__{}H1Route", plan.spec.name),
-            ready: quote::format_ident!("__{}H1Ready", plan.spec.name),
             ready_route: quote::format_ident!("__{}H1ReadyRoute", plan.spec.name),
             head: quote::format_ident!("__{}H1Head", plan.spec.name),
         }
     }
 
-    pub(in crate::app::serve::handle) fn name(&self) -> &syn::Ident {
-        &self.name
-    }
-
-    pub(in crate::app::serve::handle) fn route(&self) -> &syn::Ident {
-        &self.route
+    pub(super) fn heads(
+        &self,
+    ) -> impl Iterator<Item = (usize, &serve::RouteSpec<'spec, serve::Mode<'spec>>)> {
+        self.entries
+            .iter()
+            .enumerate()
+            .filter(|(index, _)| self.operations[*index] == *index)
     }
 
     pub(in crate::app::serve::handle) fn bodies(
         &self,
     ) -> impl Iterator<Item = &serve::RouteSpec<'spec, serve::Mode<'spec>>> {
-        self.entries.iter().filter(|item| !item.entry.upgrade)
-    }
-
-    pub(in crate::app::serve) fn head(&self) -> &syn::Ident {
-        &self.head
-    }
-
-    pub(in crate::app::serve) fn ty(&self) -> proc_macro2::TokenStream {
-        let g_id = self.generics.ident("__ID");
-        let name = &self.name;
-        quote::quote!(#name<'d, #g_id>)
-    }
-
-    pub(in crate::app::serve::handle) fn ready(&self) -> &syn::Ident {
-        &self.ready
-    }
-
-    pub(in crate::app::serve::handle) fn ready_route(&self) -> &syn::Ident {
-        &self.ready_route
-    }
-
-    pub(in crate::app::serve) fn ready_ty(&self) -> proc_macro2::TokenStream {
-        let g_id = self.generics.ident("__ID");
-        if !self
-            .entries
-            .iter()
-            .any(|item| item.kind == spec::Kind::Fiber)
-        {
-            return quote::quote!(::core::convert::Infallible);
-        }
-        let ready = &self.ready;
-        quote::quote!(#ready<'d, #g_id>)
+        self.heads()
+            .map(|(_, item)| item)
+            .filter(|item| !item.entry.upgrade && !item.empty_sync())
     }
 
     /// Emits the exact continuation sum stored by each connection.
-    pub(in crate::app::serve) fn definitions(&self, paths: &Paths) -> proc_macro2::TokenStream {
+    pub(in crate::app::serve) fn definitions(
+        &self,
+        paths: &Paths,
+        exec: &serve::Execution<'source, 'spec>,
+    ) -> proc_macro2::TokenStream {
         let ns_core = &paths.core;
         let ns_fiber = &paths.fiber;
         let ns_h1 = &paths.h1;
         let life = self.bodies().next().map(|_| quote::quote!(<'d>));
         let entries = self.bodies().map(|item| {
-            let variant = &item.pending_variant;
+            let variant = &item.prepared;
             let route = &item.entry.route;
             let pending = match item.kind {
                 spec::Kind::Fiber => quote::quote!(#ns_h1::route::task::Pending<'d, #route>),
@@ -105,51 +94,36 @@ impl<'source, 'spec> Plan<'source, 'spec> {
             };
             quote::quote!(#variant(#pending),)
         });
-        let name = &self.name;
+        let continuation = &self.continuation;
         let route = &self.route;
-        let ready = &self.ready;
         let built = &self.ready_route;
         let head = &self.head;
-        let headers = self.entries.iter().map(|item| {
-            let variant = &item.pending_variant;
+        let headers = self.heads().map(|(_, item)| {
+            let variant = &item.prepared;
             let route = &item.entry.route;
             let admission = if item.entry.upgrade {
                 quote::quote!(#ns_h1::route::duplex::Upgrade)
             } else {
                 quote::quote!(())
             };
-            let negotiate = negotiate(paths, item);
+            let negotiate = if matches!(item.mode, serve::Mode::Sync) {
+                quote::quote!(::core::matches!(<#route as #ns_h1::route::PolicyOf>::POLICY.mode,
+                    #ns_h1::route::Mode::Gzip | #ns_h1::route::Mode::RequiredGzip))
+            } else {
+                quote::quote!(false)
+            };
             quote::quote!(#variant(#ns_h1::wire::parsing::framing::PendingHead<#route, #admission, { #negotiate }>),)
         });
-        let builders: Vec<_> = self
-            .entries
-            .iter()
-            .filter_map(|item| {
-                if item.kind != spec::Kind::Fiber {
-                    return None;
-                }
-                let variant = &item.pending_variant;
-                let route = &item.entry.route;
-                Some(quote::quote!(#variant(#ns_h1::route::task::Ready<'d, #route>),))
-            })
-            .collect();
-        let builds = (!builders.is_empty()).then(|| {
-            quote::quote! {
-                struct #ready<'d, ID: #ns_fiber::Identity> {
-                    exchange: #ns_core::life::exchange::Id<
-                        #ns_fiber::dope::manifold::network::listener::conn::Id<'d, ID>,
-                        ::core::primitive::u64,
-                    >,
-                    route: #built<'d>,
-                }
-
-                enum #built<'d> {
-                    #( #builders )*
-                }
-            }
+        let builds = (!exec.fibers().is_empty()).then(|| {
+            let builders = exec.fibers().iter().map(|(task, _)| {
+                let variant = &task.route.prepared;
+                let route = task.route();
+                quote::quote!(#variant(#ns_h1::route::task::Ready<'d, #route>),)
+            });
+            quote::quote!(enum #built<'d> { #( #builders )* })
         });
         quote::quote! {
-            struct #name<'d, ID: #ns_fiber::Identity> {
+            struct #continuation<'d, ID: #ns_fiber::Identity, R = #route #life> {
                 exchange: #ns_core::life::exchange::Id<
                     #ns_fiber::dope::manifold::network::listener::conn::Id<
                         'd,
@@ -157,7 +131,7 @@ impl<'source, 'spec> Plan<'source, 'spec> {
                     >,
                     ::core::primitive::u64,
                 >,
-                route: #route #life,
+                route: R,
             }
 
             enum #route #life {

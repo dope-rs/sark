@@ -1,21 +1,19 @@
 //! Connection-local request ingress ownership.
 use std::{convert::Infallible, mem};
 
+use o3::mem::slot::Storage;
 use sark_core::{body::admit::Retention, life::audit};
 
 use crate::{
     pump, session,
     wire::{
         Failure,
-        body::{chunked, fixed, ingress},
+        body::{Frame, chunked, fixed, ingress},
         parsing, recv,
     },
 };
 
-#[derive(Default)]
 pub(super) enum Protocol<'d, P, R, H> {
-    #[default]
-    Head,
     Body(P),
     Working(P),
     Ready(R),
@@ -23,20 +21,6 @@ pub(super) enum Protocol<'d, P, R, H> {
     Line(parsing::Line),
     Prefix(sark_http::preface::Prefix),
     Reject(parsing::Rejected<'d>),
-}
-
-impl<'d, P, R, H> Protocol<'d, P, R, H> {
-    pub(super) const fn window(&self) -> recv::Window {
-        match self {
-            Self::Head
-            | Self::Ready(_)
-            | Self::PendingHead(_)
-            | Self::Line(_)
-            | Self::Prefix(_)
-            | Self::Reject(_) => recv::Window::Head,
-            Self::Body(_) | Self::Working(_) => recv::Window::Body,
-        }
-    }
 }
 
 enum FramingState {
@@ -76,12 +60,14 @@ impl FramingState {
         }
     }
 
-    fn reset(&mut self) {
-        let ranges = match mem::take(self) {
-            Self::Empty(ranges) | Self::Fixed(_, ranges) => ranges,
-            Self::Chunked(state) => state.into_ranges(),
+    fn finish(&mut self, payload: &mut ingress::Ingress<'_>) {
+        let ranges = match self {
+            Self::Empty(_) => return,
+            Self::Fixed(_, ranges) => mem::take(ranges),
+            Self::Chunked(state) => state.take_ranges(),
         };
         *self = Self::Empty(ranges);
+        payload.reset();
     }
 }
 
@@ -90,31 +76,41 @@ pub struct Ingress<'d, Pending, Ready = Infallible, Heads = Infallible> {
     pub(crate) recv: recv::Buffer,
     framing: FramingState,
     pub(crate) payload: ingress::Ingress<'d>,
-    pub(super) protocol: Protocol<'d, Pending, Ready, Heads>,
+    pub(super) protocol: Storage<Protocol<'d, Pending, Ready, Heads>>,
     pub(crate) discard_remaining: usize,
 }
 
 impl<'d, Pending, Ready, Heads> Default for Ingress<'d, Pending, Ready, Heads> {
     fn default() -> Self {
-        Self::new(Protocol::default())
-    }
-}
-
-impl<'d, Pending, Ready, Heads> Ingress<'d, Pending, Ready, Heads> {
-    pub(super) fn new(protocol: Protocol<'d, Pending, Ready, Heads>) -> Self {
         Self {
             recv: recv::Buffer::default(),
             framing: FramingState::default(),
             payload: ingress::Ingress::default(),
-            protocol,
+            protocol: Storage::new(()),
             discard_remaining: 0,
+        }
+    }
+}
+
+impl<'d, Pending, Ready, Heads> Ingress<'d, Pending, Ready, Heads> {
+    pub(super) fn park(&mut self, pending: Protocol<'d, Pending, Ready, Heads>) {
+        self.protocol = Storage::filled(pending, ());
+    }
+
+    pub(super) fn window(&self) -> recv::Window {
+        match self.protocol.get() {
+            Some(Protocol::Body(_) | Protocol::Working(_)) => recv::Window::Body,
+            _ => recv::Window::Head,
         }
     }
 
     /// A continuation still owns work which does not require another input byte.
     #[doc(hidden)]
     pub fn is_ready(&self) -> bool {
-        matches!(self.protocol, Protocol::Ready(_) | Protocol::Working(_))
+        matches!(
+            self.protocol.get(),
+            Some(Protocol::Ready(_) | Protocol::Working(_))
+        )
     }
 
     /// Whether admitted request bytes still belong to the HTTP discard path.
@@ -131,10 +127,11 @@ impl<'d, Pending, Ready, Heads> Ingress<'d, Pending, Ready, Heads> {
 
     /// Removes the exact continuation during connection retirement.
     pub fn take_pending(&mut self) -> Option<Pending> {
-        match mem::replace(&mut self.protocol, Protocol::Head) {
+        let (pending, vacant) = self.protocol.occupied()?.take();
+        match pending {
             Protocol::Body(body) | Protocol::Working(body) => Some(body),
             pending => {
-                self.protocol = pending;
+                let _ = vacant.insert(pending);
                 None
             }
         }
@@ -142,10 +139,11 @@ impl<'d, Pending, Ready, Heads> Ingress<'d, Pending, Ready, Heads> {
 
     /// Removes a framed continuation during connection retirement.
     pub fn take_ready(&mut self) -> Option<Ready> {
-        match mem::replace(&mut self.protocol, Protocol::Head) {
+        let (pending, vacant) = self.protocol.occupied()?.take();
+        match pending {
             Protocol::Ready(ready) => Some(ready),
             pending => {
-                self.protocol = pending;
+                let _ = vacant.insert(pending);
                 None
             }
         }
@@ -153,19 +151,20 @@ impl<'d, Pending, Ready, Heads> Ingress<'d, Pending, Ready, Heads> {
 
     /// Drops protocol-local ingress after route cancellation.
     pub fn retire(&mut self) {
-        if matches!(
-            self.protocol,
-            Protocol::PendingHead(_)
-                | Protocol::Line(_)
-                | Protocol::Prefix(_)
-                | Protocol::Reject(_)
-        ) {
-            self.protocol = Protocol::Head;
+        if let Some(pending) = self.protocol.occupied()
+            && matches!(
+                pending.get(),
+                Protocol::PendingHead(_)
+                    | Protocol::Line(_)
+                    | Protocol::Prefix(_)
+                    | Protocol::Reject(_)
+            )
+        {
+            pending.clear();
         }
         self.recv = recv::Buffer::default();
         self.end_discard();
-        self.framing.reset();
-        self.payload.reset();
+        self.framing.finish(&mut self.payload);
     }
 
     /// Samples exact ingress roots with admitted `u32` callback lengths.
@@ -177,14 +176,16 @@ impl<'d, Pending, Ready, Heads> Ingress<'d, Pending, Ready, Heads> {
         ready: impl FnOnce(&Ready) -> u32,
         pending: impl FnOnce(&Heads) -> u32,
     ) -> audit::Snapshot {
-        let (roots, head) = match &self.protocol {
-            Protocol::Head => (0, 0),
-            Protocol::Body(pending) | Protocol::Working(pending) => (1, head(pending) as usize),
-            Protocol::Ready(pending) => (1, ready(pending) as usize),
-            Protocol::PendingHead(value) => (1, pending(value) as usize),
-            Protocol::Line(line) => (1, line.len()),
-            Protocol::Prefix(prefix) => (1, prefix.as_ref().len()),
-            Protocol::Reject(reject) => (1, reject.len()),
+        let (roots, head) = match self.protocol.get() {
+            None => (0, 0),
+            Some(Protocol::Body(pending) | Protocol::Working(pending)) => {
+                (1, head(pending) as usize)
+            }
+            Some(Protocol::Ready(pending)) => (1, ready(pending) as usize),
+            Some(Protocol::PendingHead(value)) => (1, pending(value) as usize),
+            Some(Protocol::Line(line)) => (1, line.len()),
+            Some(Protocol::Prefix(prefix)) => (1, prefix.as_ref().len()),
+            Some(Protocol::Reject(reject)) => (1, reject.len()),
         };
         audit::Snapshot::default().request(
             roots,
@@ -218,7 +219,7 @@ impl<'d, Pending, Ready, Heads> Ingress<'d, Pending, Ready, Heads> {
         head: usize,
         limit: usize,
         keep: Retention,
-    ) -> Result<Option<chunked::Complete<'frame, 'd>>, chunked::Decode> {
+    ) -> Result<Option<Frame<'frame, 'd>>, chunked::Decode> {
         self.framing
             .chunked()
             .ok_or(chunked::Decode::Framing)?
@@ -251,14 +252,14 @@ impl<'d, Pending, Ready, Heads> Ingress<'d, Pending, Ready, Heads> {
         window: &mut crate::Input<'_>,
     ) -> Result<bool, Failure> {
         let used = match frame {
-            session::Consumption::Buffered(buffered) => buffered.used(),
-            session::Consumption::Discard(discard) => discard.head(),
+            session::Consumption::Buffered(used) => used,
+            session::Consumption::Discard(discard) => discard.head,
         };
         window.advance(used).map_err(Failure::Input)?;
         let complete = match frame {
             session::Consumption::Buffered(_) => true,
             session::Consumption::Discard(discard) => {
-                self.discard_remaining = discard.body() - window.consume_max(discard.body());
+                self.discard_remaining = discard.body - window.consume_max(discard.body);
                 self.discard_remaining == 0
             }
         };
@@ -267,8 +268,7 @@ impl<'d, Pending, Ready, Heads> Ingress<'d, Pending, Ready, Heads> {
     }
 
     pub fn finish_frame(&mut self) {
-        self.protocol = Protocol::Head;
-        self.framing.reset();
-        self.payload.reset();
+        self.protocol = Storage::new(());
+        self.framing.finish(&mut self.payload);
     }
 }

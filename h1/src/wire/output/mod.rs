@@ -13,12 +13,10 @@ use sark_http::{
 
 use crate::{session, wire::head};
 
-mod admit;
 mod egress;
 mod owner;
 mod sink;
 
-pub(crate) use admit::Admit;
 pub use egress::Egress;
 pub use owner::Owner;
 pub use sink::error::Error;
@@ -74,6 +72,24 @@ pub enum Complete<'d> {
 }
 
 impl<'d> Complete<'d> {
+    const fn copied(len: usize) -> Self {
+        Self::Copy {
+            copy: evidence::Copy {
+                read: len,
+                written: len,
+                cause: evidence::Cause::Inline,
+            },
+        }
+    }
+
+    fn shared(body: storage::Shared) -> Self {
+        if body.is_empty() {
+            Self::Inline
+        } else {
+            Self::Shared { body }
+        }
+    }
+
     /// Projects owner without cloning or moving the response body.
     pub fn retention(&self) -> Origin {
         match self {
@@ -139,14 +155,26 @@ impl<'d> Complete<'d> {
         mode.commit_link(session, id, owner.len, owner.charge, linked);
     }
 
+    pub fn finish<const AT_HEAD: bool, C: Copy, M: sequence::Mode<C>>(
+        &self,
+        mode: &mut M,
+        session: &mut M::Session,
+        id: exchange::Id<C, u64>,
+    ) {
+        if AT_HEAD {
+            mode.observe(life::Event::InputFinished(id));
+        }
+        self.observe_copy(mode.observer(), id);
+        self.commit_retention(mode, session, id);
+        id.retire(mode, life::Outcome::Completed);
+    }
+
     pub fn into_consume<D>(
         self,
-        permit: session::Permit,
         consumption: session::Consumption,
         connection: head::Connection,
     ) -> session::Outcome<'d, D> {
         session::Outcome::Complete {
-            permit,
             consumption,
             response: self,
             connection,

@@ -8,61 +8,6 @@ use crate::{
     request::body::{self, Source as _},
 };
 
-/// A projection from a borrowed source; it cannot defer ownership transfer.
-pub struct Borrowed<'a, S>(&'a mut S);
-
-impl<'a, S> Borrowed<'a, S> {
-    pub const fn new(source: &'a mut S) -> Self {
-        Self(source)
-    }
-}
-
-impl<'a, 'd, S: body::Source<'d>> Project<'d> for Borrowed<'a, S> {
-    type Proof = ();
-    type Owner = ();
-
-    fn contiguous<V, T>(
-        self,
-        value: V,
-        project: impl for<'req> FnOnce(
-            V,
-            body::View<'req, 'd>,
-            Slot<'req, 'd, (), Bound<'req, 'd, ()>>,
-        ) -> T,
-    ) -> Result<(T, ()), (Self, V, body::Error)> {
-        match self.0.try_project(value, |value, view| {
-            project(value, view, Bound::slot(view.into(), ()))
-        }) {
-            Ok(output) => Ok((output, ())),
-            Err((value, error)) => Err((self, value, error)),
-        }
-    }
-
-    fn segmented<V, T>(
-        self,
-        value: V,
-        project: impl for<'req> FnOnce(
-            V,
-            body::Ref<'req, 'd>,
-            Slot<'req, 'd, (), Bound<'req, 'd, ()>>,
-        ) -> T,
-    ) -> (T, ()) {
-        let view = self.0.body().into();
-        (project(value, view, Bound::slot(view, ())), ())
-    }
-
-    fn discarded<V, T>(
-        self,
-        value: V,
-        project: impl for<'req> FnOnce(V, Slot<'req, 'd, (), Bound<'req, 'd, ()>>) -> T,
-    ) -> (T, ()) {
-        (
-            project(value, Bound::slot(body::Ref::from_slice(&[]), ())),
-            (),
-        )
-    }
-}
-
 /// The original source, before its one selected projection.
 pub struct Input<'owner, 'd>(scope::Owner<'owner, ()>, owned::Segments<'d>);
 

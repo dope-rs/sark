@@ -1,23 +1,17 @@
 use std::{cell::Cell, net::SocketAddr, time::Duration};
 
-use crate::common::{route::body::OwnedReply as Reply, server};
-use dope::{
-    core::{
-        BranchError,
-        driver::{schedule::clock::timer::Timer, settings::errors::Claim},
-        io::socket::Listener,
-    },
-    manifold::app::receive::Coupled,
-    runtime::shutdown,
+use crate::common::{
+    route::{body::OwnedReply as Reply, chunked::peer::Peer},
+    server,
 };
+use dope::{core::driver::schedule::clock::timer::Timer, manifold::app::receive::Coupled};
 use dope_fiber::{
     abi::Fiber,
     task::time::sleep::{self, TimerExt as _},
 };
-use dope_test::harness::{observe::VecCellExt as _, peer};
+use dope_test::harness::{observe::VecCellExt as _, peer, server::Pair};
 use o3::buffer::{segments, storage};
 use sark_fiber::{Config, server::Serve};
-use sark_h1::server::run::prepare;
 use sark_http::{payload::response::status, request};
 
 #[derive(Debug)]
@@ -46,27 +40,32 @@ pub enum Failure {
 
 pub struct State<'a>(pub &'a Cell<Vec<Failure>>);
 
-pub fn try_serve<A>(
-    plan: server::Http1Plan,
-    context: shutdown::ReadySource<'_>,
-    listener: Listener,
+pub fn run<A, R>(
+    (pair, plan): (Pair, server::Http1Plan),
     tasks: usize,
-) -> Result<(), BranchError<prepare::Error, Claim>>
+    client: impl FnOnce(SocketAddr) -> R,
+) -> R
 where
     A: for<'a> Serve<State<'a>, Input = Coupled, Config = Config>,
 {
-    let failures = Cell::new(Vec::new());
-    let result = server::try_serve::<A, _>(plan, context, listener, State(&failures), tasks);
-    let failures = failures.into_inner();
-    assert!(failures.is_empty(), "retention: {failures:?}");
-    result
+    pair.run(
+        |context, listener| {
+            let failures = Cell::new(Vec::new());
+            let result =
+                server::try_serve::<A, _>(plan, context, listener, State(&failures), tasks);
+            let failures = failures.into_inner();
+            assert!(failures.is_empty(), "retention: {failures:?}");
+            result
+        },
+        client,
+    )
+    .expect("retained server")
 }
 
-pub fn try_connect(bind: SocketAddr) -> Result<peer::Stream<'static>, peer::Error> {
-    let socket = peer::Peer::at(bind).try_connect()?;
-    socket.read_wait(Some(Duration::from_secs(3)))?;
+pub fn try_connect(bind: SocketAddr) -> Result<Peer, peer::Error> {
+    let socket = peer::Peer::at(bind).try_read(Duration::from_secs(3))?;
     socket.set_nodelay(true)?;
-    Ok(socket)
+    Ok(Peer::new(socket))
 }
 
 impl State<'_> {

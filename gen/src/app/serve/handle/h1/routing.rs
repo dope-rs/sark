@@ -13,11 +13,11 @@ pub(super) fn build<'view, 'source>(
     let f_life = local("lifecycle");
     let symbols = &types.names.generics;
     let [v_route, v_tag, v_trans] = symbols.locals(["route", "tag", "transport"]);
-    let [v_body, v_charge, v_conn] = symbols.locals(["body", "charge", "conn"]);
+    let [v_body, v_charge, v_turn, v_prior] = symbols.locals(["body", "charge", "turn", "prior"]);
     let [v_link, v_date, v_error] = symbols.locals(["connection", "date", "error"]);
     let [v_exch, v_head, v_input] = symbols.locals(["exchange", "head", "input"]);
     let [v_method, v_result, v_parsed] = symbols.locals(["method", "outcome", "parsed"]);
-    let [v_wait, v_permit, v_ready] = symbols.locals(["pending", "permit", "ready"]);
+    let [v_wait, v_ready] = symbols.locals(["pending", "ready"]);
     let [v_run, v_source] = symbols.locals(["runtime", "source"]);
     let v_this = symbols.local("this");
     let [v_write, v_routes] = symbols.locals(["write", "routes"]);
@@ -47,6 +47,7 @@ pub(super) fn build<'view, 'source>(
     let raw = quote!(<#policy as #ns_h1::switch::Engine>::Raw);
     let conn = &proto.connections.http_connection;
     let rt = &route.runtime;
+    let turn = quote!(#ns_h1::session::Turn<'_, '_, 'd, #rt, #wait, #policy, Self>);
     let terminal = terminal::routes(paths, types.names.generics, conn, rt);
     let data = &routes.body_data_arms;
     let work = &routes.body_work_arms;
@@ -108,41 +109,37 @@ pub(super) fn build<'view, 'source>(
                 &route.dispatch_body,
             )
         };
+        let incomplete = if owned {
+            quote!(#v_turn.failed(#ns_h1::wire::Failure::BadRequest))
+        } else {
+            quote!(#v_turn.await_line())
+        };
         quote! {
             fn #method(
-                mut self: ::core::pin::Pin<&mut Self>,
-                #v_permit: #ns_h1::session::Permit,
                 #input,
-                #v_write: #ns_http::o3::buffer::write::Slice<'_, &mut usize>,
-                #v_conn: &mut #conn,
-            ) -> #ns_h1::session::RouteOutcome<'d, #wait, #raw, #head, #ns_h1::wire::parsing::Rejected<'d>> {
+                #v_turn: &mut #turn,
+                #v_prior: ::core::primitive::usize,
+            ) -> #ns_h1::session::Flow {
                 let #v_parsed = match #parse {
                     ::core::result::Result::Ok(#complete) => #v_parsed,
                     ::core::result::Result::Ok(#pending) => {
-                        return #ns_h1::session::Outcome::NeedMore {
-                            permit: #v_permit,
-                            state: #ns_h1::session::NeedMore::Line,
-                        }.into();
+                        return #incomplete;
                     }
                     ::core::result::Result::Err(#v_error) => {
                         let (#request::Syntax | #request::Target(..) | #request::Span(..)) = #error;
-                        self.reject_head(&mut #v_conn.async_state);
-                        return #ns_h1::session::Outcome::Close(
+                        #v_turn.router.as_mut().reject_head(&mut #v_turn.conn.async_state);
+                        return #v_turn.close(
                             #ns_http::h1::codec::canned::BAD_REQUEST,
-                        ).into();
+                        );
                     }
                 };
                 let #v_head = #v_parsed.request();
                 if let ::core::option::Option::Some(#v_method) = #v_head.matched() {
-                    let #v_routes = self.as_mut().get_mut();
-                    let #v_link = #v_routes.id;
-                    let #v_date = &#v_routes.date.load();
-                    let mut #v_routes = #v_routes.app.as_mut();
+                    let #v_date = &#v_turn.router.date.load();
                     #body
                 }
-                let #v_result = #reject(#retained, #v_permit, #ns_http::h1::codec::canned::NOT_FOUND);
-                self.reject_if_terminal(&mut #v_conn.async_state, &#v_result);
-                #v_result
+                let #v_result = #reject(#retained, #ns_http::h1::codec::canned::NOT_FOUND);
+                #v_turn.reject(#v_result)
             }
         }
     });
@@ -184,7 +181,7 @@ pub(super) fn build<'view, 'source>(
             date: &#g_turn #ns_h1::server::date::Clock,
         }
 
-        impl<#def> #core #uses
+        impl<#g_turn, #def> #dispatch<#g_turn, 'd, #core #uses, #g_id>
         where
             #bounds
             #g_mode: #ns_h1::server::deadline::Mode<'d, #g_id>,
@@ -207,18 +204,11 @@ pub(super) fn build<'view, 'source>(
             #( #consume )*
 
             fn resume_head(
-                self: ::core::pin::Pin<&mut Self>,
                 #v_wait: #head,
-                #v_permit: #ns_h1::session::Permit,
-                #v_input: #ns_h1::Input<'_>,
-                #v_write: #ns_http::o3::buffer::write::Slice<'_, &mut usize>,
-                #v_conn: &mut #conn,
-            ) -> #ns_h1::session::RouteOutcome<'d, #wait, #raw, #head, #ns_h1::wire::parsing::Rejected<'d>> {
-                let #v_routes = self.get_mut();
-                let #v_link = #v_routes.id;
-                let #v_date = #v_routes.date.load();
-                let #v_date = &#v_date;
-                let mut #v_routes = #v_routes.app.as_mut();
+                #v_turn: &mut #turn,
+            ) -> #ns_h1::session::Flow {
+                let #v_input = #v_turn.input();
+                let #v_date = &#v_turn.router.date.load();
                 #headers
             }
 
@@ -258,7 +248,6 @@ pub(super) fn build<'view, 'source>(
                 self: ::core::pin::Pin<&mut Self>,
                 #v_wait: #wait,
                 #v_body: #ns_h1::session::Complete,
-                #v_permit: #ns_h1::session::Permit,
                 #v_write: #ns_http::o3::buffer::write::Slice<'_, &mut usize>,
                 #v_run: &mut #rt,
             ) -> #ns_h1::session::BodyOutcome<'d, #ready, #raw> {
@@ -281,7 +270,6 @@ pub(super) fn build<'view, 'source>(
             fn resume_body(
                 self: ::core::pin::Pin<&mut Self>,
                 #v_ready: Self::Ready,
-                #v_permit: #ns_h1::session::Permit,
                 _: #ns_http::o3::buffer::write::Slice<'_, &mut usize>,
                 #v_run: &mut #rt,
             ) -> #ns_h1::session::BodyOutcome<'d, #ready, #raw> {

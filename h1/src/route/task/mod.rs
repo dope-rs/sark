@@ -2,7 +2,6 @@
 use o3::base::cell::region;
 use sark_http::payload::response::Body as _;
 mod buffered;
-mod endpoint;
 
 use std::convert;
 
@@ -24,7 +23,7 @@ use task::request::Input;
 
 use crate::{
     session,
-    wire::{Failure, head, response::Context},
+    wire::{Failure, response::Context},
 };
 
 type Origin<'id> = region::Identity<'id>;
@@ -44,7 +43,6 @@ pub trait Mode<'d, R: route::Spec<Request: route::Own<Mode = Self>>>: route::Mod
             R::Request,
         >,
         open: Track<Open>,
-        connection: head::Connection,
         response: Context,
     ) -> Result<Self::Pending, <R::Request as route::Own>::Error<'d>>;
 }
@@ -60,11 +58,10 @@ impl<'d, R: route::Spec<Request: route::Own<Mode = route::Streaming>>> Mode<'d, 
             R::Request,
         >,
         open: Track<Open>,
-        connection: head::Connection,
         response: Context,
     ) -> Result<Self::Pending, <R::Request as route::Own>::Error<'d>> {
         let build = <R::Request as route::Own>::start_stream(head)?;
-        Ok(Streaming::new(build, open, connection, response))
+        Ok(Streaming::new(build, open, response))
     }
 }
 
@@ -79,10 +76,9 @@ impl<'d, R: route::Spec<Request: route::Own<Mode = route::Buffered>>> Mode<'d, R
             R::Request,
         >,
         open: Track<Open>,
-        connection: head::Connection,
         response: Context,
     ) -> Result<Self::Pending, <R::Request as route::Own>::Error<'d>> {
-        Ok(buffered::Pending::new(head, open, connection, response))
+        Ok(buffered::Pending::new(head, open, response))
     }
 }
 
@@ -90,7 +86,6 @@ impl<'d, R: route::Spec<Request: route::Own<Mode = route::Buffered>>> Mode<'d, R
 pub struct Streaming<'d, R: route::Spec<Request: route::Own>> {
     stream: stream::Stream<'d, <R::Request as route::Own>::TaskBuilder<'d>>,
     account: credit::raw::Account,
-    connection: head::Connection,
     response: Context,
     work: bool,
 }
@@ -108,13 +103,11 @@ impl<'d, R: route::Spec<Request: route::Own>> Streaming<'d, R> {
     fn new(
         build: <R::Request as route::Own>::TaskBuilder<'d>,
         open: Track<Open>,
-        close: head::Connection,
         response: Context,
     ) -> Self {
         Self {
             stream: stream::Stream::new(open, build),
             account: credit::raw::Account::new(),
-            connection: close,
             response,
             work: false,
         }
@@ -136,7 +129,6 @@ impl<'d, R: route::Spec<Request: route::Own>> Streaming<'d, R> {
         let Self {
             stream,
             mut account,
-            connection: conn,
             response,
             mut work,
         } = self;
@@ -152,7 +144,6 @@ impl<'d, R: route::Spec<Request: route::Own>> Streaming<'d, R> {
         Ok(Self {
             stream,
             account,
-            connection: conn,
             response,
             work,
         })
@@ -353,19 +344,12 @@ impl<'d, R: route::Spec<Request: route::Own>> Streaming<'d, R> {
     pub fn finish<Runtime, Admit, E, D>(
         self,
         done: session::Complete,
-        permit: session::Permit,
         rt: &mut Runtime,
         admit: Admit,
         mut proof: E,
     ) -> session::BodyOutcome<'d, Ready<'d, R>, D>
     where
-        Admit: FnOnce(
-            Input<'d, R>,
-            usize,
-            head::Connection,
-            Context,
-            &mut Runtime,
-        ) -> session::Outcome<'d, D>,
+        Admit: FnOnce(Input<'d, R>, usize, Context, &mut Runtime) -> session::Outcome<'d, D>,
         E: credit::Evidence,
     {
         let pending = match self.try_exact(done.body_len, &mut proof) {
@@ -374,7 +358,7 @@ impl<'d, R: route::Spec<Request: route::Own>> Streaming<'d, R> {
                 return session::BodyOutcome::Complete(session::Outcome::Close(reply));
             }
         };
-        Ready { pending }.complete(done.consumed, permit, rt, admit, proof)
+        Ready { pending }.complete(done.consumed, rt, admit, proof)
     }
 }
 
@@ -394,48 +378,32 @@ impl<'d, R: route::Spec<Request: route::Own>> Ready<'d, R> {
 
     pub fn resume<Runtime, Admit, E, D>(
         self,
-        permit: session::Permit,
         rt: &mut Runtime,
         admit: Admit,
         proof: E,
     ) -> session::BodyOutcome<'d, Self, D>
     where
-        Admit: FnOnce(
-            Input<'d, R>,
-            usize,
-            head::Connection,
-            Context,
-            &mut Runtime,
-        ) -> session::Outcome<'d, D>,
+        Admit: FnOnce(Input<'d, R>, usize, Context, &mut Runtime) -> session::Outcome<'d, D>,
         E: credit::Evidence,
     {
-        self.complete(0, permit, rt, admit, proof)
+        self.complete(0, rt, admit, proof)
     }
 
     fn complete<Runtime, Admit, E, D>(
         self,
         used: usize,
-        permit: session::Permit,
         rt: &mut Runtime,
         admit: Admit,
         mut proof: E,
     ) -> session::BodyOutcome<'d, Self, D>
     where
-        Admit: FnOnce(
-            Input<'d, R>,
-            usize,
-            head::Connection,
-            Context,
-            &mut Runtime,
-        ) -> session::Outcome<'d, D>,
+        Admit: FnOnce(Input<'d, R>, usize, Context, &mut Runtime) -> session::Outcome<'d, D>,
         E: credit::Evidence,
     {
         let pending = self.pending;
-        let close = pending.connection;
         let response = pending.response;
         let result = pending.try_with(|stream, ledger, _| {
             let progress = stream.try_step(ledger, &mut proof, body::DEFAULT_BUILD_STEP_BUDGET);
-            permit.commit();
             let ready = match progress {
                 stream::Drive::Ready(ready) => ready,
                 stream::Drive::Pending(stream) => return Ok(stream),
@@ -475,7 +443,7 @@ impl<'d, R: route::Spec<Request: route::Own>> Ready<'d, R> {
                     return Err(session::Outcome::Close(reply));
                 }
             };
-            Err(admit(Input::Ready { request }, used, close, response, rt))
+            Err(admit(Input::Ready { request }, used, response, rt))
         });
         match result {
             Ok(pending) => session::BodyOutcome::Pending(Self { pending }),

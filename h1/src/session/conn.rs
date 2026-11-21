@@ -41,13 +41,12 @@ impl<'d, Runtime: Default, Pending, Transitions: Default, Ready, Heads>
     Conn<'d, Runtime, Pending, Transitions, Ready, Heads>
 {
     pub fn prefixed(prefix: sark_http::preface::Prefix) -> Self {
-        let protocol = if prefix.as_ref().is_empty() {
-            super::ingress::Protocol::Head
-        } else {
-            super::ingress::Protocol::Prefix(prefix)
-        };
+        let mut ingress = Ingress::default();
+        if !prefix.as_ref().is_empty() {
+            ingress.park(super::ingress::Protocol::Prefix(prefix));
+        }
         Self {
-            ingress: Ingress::new(protocol),
+            ingress,
             async_state: Runtime::default(),
             deferred_action: None,
             deferred: head::Connection::KeepAlive,
@@ -111,7 +110,7 @@ impl<'d, Runtime, Pending, Transitions: switch::Engine, Ready, Heads>
 
     /// Retains ingress while transport write capacity is unavailable.
     pub fn retain(&mut self, input: &[u8]) -> pump::Retention {
-        let window = self.ingress.protocol.window();
+        let window = self.ingress.window();
         let progress = match (input.is_empty(), window) {
             (false, recv::Window::Head) => {
                 deadline::Progress::new(deadline::Head::Pending, deadline::Body::None)

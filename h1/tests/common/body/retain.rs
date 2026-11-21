@@ -2,17 +2,10 @@ use std::{cell::Cell, convert::Infallible, ptr};
 
 use o3::alloc;
 use sark_core::body::credit;
-use sark_h1::{
-    route::{Pending, sync},
-    session,
-    wire::{output, parsing::framing},
-};
+use sark_h1::{route::Pending, session, wire::parsing::framing};
 use sark_http::payload::compress::{Compression as _, Gzip};
 
-use crate::common::{
-    Request,
-    fields::{DATE, RESPONSE},
-};
+use crate::common::{Request, fields::DATE};
 
 /// Exclusively owned response resources for the retained-request fixtures.
 pub struct Retain {
@@ -36,24 +29,28 @@ impl Retain {
         })
     }
 
-    pub fn dispatch<'d>(
+    pub fn pending<'d>(
         &mut self,
         conn: &mut session::Conn<'d>,
-        permit: session::Permit,
         head: framing::Head<'_, '_, Request>,
-    ) -> session::RouteOutcome<'d, Pending<'d, Request>> {
-        sync::Endpoint::new(
-            sync::Egress::new(
-                output::Egress::new(
-                    o3::buffer::write::Slice::new(&mut self.write).reborrow(),
-                    DATE,
-                    head.response(),
-                ),
-                &mut self.gzip,
-            ),
-            conn,
-        )
-        .dispatch::<Request, _, _>(permit, head, &self.state, credit::Disabled::new())
+    ) -> Result<Pending<'d, Request>, session::Outcome<'d>> {
+        let mut proof = credit::Disabled::new();
+        let response = head.response();
+        let mut output = o3::buffer::write::Slice::new(&mut self.write);
+        let egress = sark_h1::wire::output::Egress::new(output.reborrow(), DATE, response);
+        match head.sync(
+            &mut conn.ingress,
+            &mut proof,
+            &self.state,
+            egress,
+            &mut self.gzip,
+        ) {
+            Ok(framing::Progress::Pending(wait)) => Ok(wait.retain(&mut conn.ingress, proof).2),
+            Ok(framing::Progress::Complete((used, reply))) => {
+                Err(reply.into_consume(used, response.connection()))
+            }
+            Err(error) => Err(error.into_rejection().into()),
+        }
     }
 
     pub fn finish<'d>(
@@ -65,16 +62,10 @@ impl Retain {
                 consumed: 1,
                 body_len: 1,
             },
-            session::Permit::new(),
             &self.state,
-            sync::Egress::new(
-                output::Egress::new(
-                    o3::buffer::write::Slice::new(&mut self.write).reborrow(),
-                    DATE,
-                    RESPONSE,
-                ),
-                &mut self.gzip,
-            ),
+            o3::buffer::write::Slice::new(&mut self.write).reborrow(),
+            DATE,
+            &mut self.gzip,
             credit::Disabled::new(),
         )
     }

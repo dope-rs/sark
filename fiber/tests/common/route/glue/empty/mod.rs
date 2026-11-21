@@ -8,8 +8,8 @@ use sark_h1::{
     route::task,
     session, switch,
     wire::{
-        head,
         parsing::{self, framing},
+        response::Context,
     },
 };
 use sark_http::{
@@ -103,8 +103,7 @@ async fn built(
 type Connection<'d, R> =
     session::Conn<'d, (), task::Pending<'d, R>, switch::Disabled, task::Ready<'d, R>>;
 
-type Outcome<'d, R, Rejected = Infallible> =
-    session::RouteOutcome<'d, task::Pending<'d, R>, Infallible, Infallible, Rejected>;
+type Outcome<'d, R> = session::RouteOutcome<'d, task::Pending<'d, R>>;
 
 pub struct Carrier<'a, 'd, R: route::Spec<Request: route::Own>> {
     id: Id<'d>,
@@ -143,7 +142,7 @@ impl<'d, R: route::Spec<Request: route::Own<RawParams = (), Mode = route::Stream
             Err(error) => {
                 return Ok((
                     None,
-                    session::RouteOutcome::Outcome(error.into_consume()),
+                    session::RouteOutcome::Outcome(error.into_rejection().into()),
                     0,
                 ));
             }
@@ -153,15 +152,14 @@ impl<'d, R: route::Spec<Request: route::Own<RawParams = (), Mode = route::Stream
         let mut attempts = 0;
         let outcome = conn.dispatch_task::<R, _, _, _>(
             id,
-            session::Permit::new(),
             head,
-            |request, consumed, close, _, _: &mut ()| {
+            |request, consumed, response, _: &mut ()| {
                 attempts += 1;
                 if !accept {
                     return session::Outcome::Close(canned::SERVICE_UNAVAILABLE);
                 }
                 input = Some(request);
-                session::Outcome::<Infallible>::Park { consumed, close }
+                session::Outcome::park(consumed, response)
             },
             |pending, parts, proof| pending.try_discard(parts, proof),
             credit::Disabled::new(),
@@ -217,11 +215,11 @@ impl<'d, R: route::Spec<Request: route::Own<RawParams = (), Mode = route::Stream
         &mut self,
         input: Input<'d, R>,
         consumed: usize,
-        close: head::Connection,
+        response: Context,
     ) -> session::Outcome<'d> {
         *self.input = Some(input);
         self.consumed = consumed;
-        session::Outcome::Park { consumed, close }
+        session::Outcome::park(consumed, response)
     }
 }
 
@@ -233,15 +231,13 @@ where
     type Head = Infallible;
 
     fn try_consume(
-        self: Pin<&mut Self>,
-        permit: session::Permit,
         input: sark_h1::Input<'_>,
-        _: o3::buffer::write::Slice<'_, &mut usize>,
-        conn: &mut Connection<'d, R>,
-    ) -> Outcome<'d, R, parsing::Rejected<'d>> {
+        turn: &mut session::Turn<'_, '_, 'd, (), task::Pending<'d, R>, switch::Disabled, Self>,
+        prior: usize,
+    ) -> session::Flow {
         use sark_h1::wire::parsing::raw;
 
-        let this = self.get_mut();
+        let this = turn.router.as_mut().get_mut();
         let parsed = match parsing::Head::parse(input, u8::MAX)
             .map_err(Error::Line)
             .and_then(|head| head.ok_or(Error::IncompleteLine))
@@ -249,38 +245,40 @@ where
             Ok(parsed) => parsed,
             Err(error) => {
                 this.error.get_or_insert(error);
-                return session::Outcome::Close(canned::BAD_REQUEST).into();
+                return turn.close(canned::BAD_REQUEST);
             }
         };
         let head = match framing::Head::<R>::parse::<false>(raw::Bound::empty(&parsed)) {
             Ok(Some(head)) => head,
             Ok(None) => {
                 this.error.get_or_insert(Error::IncompleteHead);
-                return session::Outcome::Close(canned::BAD_REQUEST).into();
+                return turn.close(canned::BAD_REQUEST);
             }
-            Err(error) => return error.into_consume().into(),
+            Err(error) => return turn.rejected(error.into_rejection()),
         };
         let id = this.id;
-        let admit = |input, consumed, close, _, _: &mut ()| this.admit(input, consumed, close);
-        conn.dispatch_task::<R, _, _, _>(
+        let admit = |input, consumed, response, _: &mut ()| this.admit(input, consumed, response);
+        let result = match turn.conn.dispatch_task::<R, _, _, _>(
             id,
-            permit,
             head,
             admit,
             |pending, parts, proof| pending.try_discard(parts, proof),
             credit::Disabled::new(),
-        )
-        .with_head()
+        ) {
+            session::RouteOutcome::Outcome(outcome) => outcome,
+            session::RouteOutcome::AwaitBody {
+                state,
+                expectation,
+                pending,
+            } => return turn.await_body(state, expectation, pending, prior),
+        };
+        turn.apply(result, prior)
     }
 
     fn resume_head(
-        self: Pin<&mut Self>,
         pending: Self::Head,
-        _: session::Permit,
-        _: sark_h1::Input<'_>,
-        _: o3::buffer::write::Slice<'_, &mut usize>,
-        _: &mut Connection<'d, R>,
-    ) -> Outcome<'d, R, parsing::Rejected<'d>> {
+        _: &mut session::Turn<'_, '_, 'd, (), task::Pending<'d, R>, switch::Disabled, Self>,
+    ) -> session::Flow {
         match pending {}
     }
 
@@ -309,24 +307,22 @@ where
         self: Pin<&mut Self>,
         pending: task::Pending<'d, R>,
         complete: session::Complete,
-        permit: session::Permit,
         _: o3::buffer::write::Slice<'_, &mut usize>,
         runtime: &mut (),
     ) -> session::BodyOutcome<'d, Self::Ready> {
         let this = self.get_mut();
-        let admit = |input, consumed, close, _, _: &mut ()| this.admit(input, consumed, close);
-        pending.finish(complete, permit, runtime, admit, credit::Disabled::new())
+        let admit = |input, consumed, response, _: &mut ()| this.admit(input, consumed, response);
+        pending.finish(complete, runtime, admit, credit::Disabled::new())
     }
 
     fn resume_body(
         self: Pin<&mut Self>,
         ready: Self::Ready,
-        permit: session::Permit,
         _: o3::buffer::write::Slice<'_, &mut usize>,
         runtime: &mut (),
     ) -> session::BodyOutcome<'d, Self::Ready> {
         let this = self.get_mut();
-        let admit = |input, consumed, close, _, _: &mut ()| this.admit(input, consumed, close);
-        ready.resume(permit, runtime, admit, credit::Disabled::new())
+        let admit = |input, consumed, response, _: &mut ()| this.admit(input, consumed, response);
+        ready.resume(runtime, admit, credit::Disabled::new())
     }
 }

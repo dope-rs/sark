@@ -2,10 +2,7 @@ use core::{fmt, marker, num::NonZero};
 
 use o3::mem::Rejected;
 use sark_http::{
-    owner::handoff::{
-        self,
-        input::{Borrowed, Bound},
-    },
+    owner::handoff::{self, input::Bound},
     payload::owned,
     request::body,
 };
@@ -35,26 +32,11 @@ pub trait Project: Sized {
 
     fn empty<'req, 'd: 'req>() -> Scoped<'req, 'd, Self>;
 
-    fn try_project<'a, 'd, S, V, T>(
-        body: &'a mut Body<S>,
+    fn try_project<'d, S: body::Source<'d>, V, T>(
+        body: &mut Body<S>,
         value: V,
         project: impl for<'view> FnOnce(Scoped<'view, 'd, Self, V>) -> T,
-    ) -> Result<T, Rejected<V, body::Error>>
-    where
-        S: body::Source<'d>,
-        'd: 'a,
-    {
-        let input = body.input();
-        Self::try_input(input, value, |scope| {
-            let (value, body) = scope.into_parts();
-            project(Scoped::new(body.value, value))
-        })
-        .map(|(output, ())| output)
-        .map_err(|failure| {
-            let ((_, value), error) = failure.into_parts();
-            Rejected::new(value, error)
-        })
-    }
+    ) -> Result<T, Rejected<V, body::Error>>;
 
     /// Projects one affine source and returns its exact final owner.
     fn try_input<'d, I, V, T>(
@@ -80,6 +62,16 @@ impl Project for Contiguous {
 
     fn empty<'req, 'd: 'req>() -> Scoped<'req, 'd, Self> {
         Scoped::<Self>::new(body::View::Slice(&[]), ())
+    }
+
+    fn try_project<'d, S: body::Source<'d>, V, T>(
+        body: &mut Body<S>,
+        value: V,
+        project: impl for<'view> FnOnce(Scoped<'view, 'd, Self, V>) -> T,
+    ) -> Result<T, Rejected<V, body::Error>> {
+        body.source
+            .try_project(value, |value, view| project(Scoped::new(view, value)))
+            .map_err(|(value, error)| Rejected::new(value, error))
     }
 
     fn try_input<'d, I, V, T>(
@@ -115,6 +107,14 @@ impl Project for Discarded {
         Scoped::<Self>::new(Len(0), ())
     }
 
+    fn try_project<'d, S: body::Source<'d>, V, T>(
+        body: &mut Body<S>,
+        value: V,
+        project: impl for<'view> FnOnce(Scoped<'view, 'd, Self, V>) -> T,
+    ) -> Result<T, Rejected<V, body::Error>> {
+        Ok(project(Scoped::new(Len(body.len), value)))
+    }
+
     fn try_input<'d, I, V, T>(
         input: Input<I>,
         value: V,
@@ -144,6 +144,14 @@ impl Project for Segmented {
 
     fn empty<'req, 'd: 'req>() -> Scoped<'req, 'd, Self> {
         Scoped::<Self>::new(body::Ref::from_slice(&[]), ())
+    }
+
+    fn try_project<'d, S: body::Source<'d>, V, T>(
+        body: &mut Body<S>,
+        value: V,
+        project: impl for<'view> FnOnce(Scoped<'view, 'd, Self, V>) -> T,
+    ) -> Result<T, Rejected<V, body::Error>> {
+        Ok(project(Scoped::new(body.source.body().into(), value)))
     }
 
     fn try_input<'d, I, V, T>(
@@ -276,13 +284,6 @@ impl<S> Body<S> {
 
     pub fn into_source(self) -> S {
         self.source
-    }
-
-    pub fn input(&mut self) -> Input<Borrowed<'_, S>> {
-        Input {
-            source: Borrowed::new(&mut self.source),
-            len: self.len,
-        }
     }
 }
 

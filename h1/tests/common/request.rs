@@ -10,7 +10,6 @@ use sark_http::{
         fixed,
         response::{Static, dispatch, headers, status::Code},
     },
-    request::body,
 };
 
 pub struct Request;
@@ -47,45 +46,20 @@ impl route::Schema for Request {
 }
 
 impl route::Project for Request {
-    type Params<'req> = ();
-    type Headers<'req> = &'req [u8];
     type Error<'req> = frame::Error;
     type View<'req, 'd>
         = (&'req [u8], &'req [u8])
     where
         'd: 'req;
-    type ParsedBody<'req, 'd>
-        = &'req [u8]
-    where
-        'd: 'req;
-
     fn reject(_: frame::Error) -> route::Reject {
         route::Reject::BadRequest
     }
 
-    fn from_params<'body>(
-        _: &request::raw::Parsed<request::Head<&[u8]>, Self>,
-    ) -> Result<(), <Self as route::Project>::Error<'body>> {
-        Ok(())
-    }
-
-    fn parse_body<'req, 'd: 'req>(body: body::View<'req, 'd>) -> Result<&'req [u8], frame::Error> {
-        Ok(body.as_slice())
-    }
-
-    fn from_parts<'req, 'd: 'req>(
-        _: (),
-        headers: &'req [u8],
-        body: &'req [u8],
-        _: &request::View<'req, 'd>,
-    ) -> Self::View<'req, 'd> {
-        (headers, body)
-    }
-
-    fn from_headers<'req, 'body>(
+    fn try_view<'req, 'body: 'req, 'd: 'body>(
         request: &request::raw::Parsed<request::Head<&'req [u8]>, Self>,
-    ) -> Result<&'req [u8], <Self as route::Project>::Error<'body>> {
-        Ok(*request.owner().owner())
+        body: sark_core::body::Scoped<'body, 'd, Contiguous>,
+    ) -> Result<Self::View<'req, 'd>, frame::Error> {
+        Ok((*request.owner().owner(), body.into_inner().as_slice()))
     }
 }
 
@@ -101,14 +75,8 @@ impl manifold::Route<Cell<(*const u8, bool, bool)>> for Request {
     where
         'd: 'req;
     fn invoke<'req, 'd, 'state>(
-        (_, _, headers, body, state): manifold::Args<
-            '_,
-            'req,
-            'd,
-            'state,
-            Self::Request,
-            Cell<(*const u8, bool, bool)>,
-        >,
+        (headers, body): <Self::Request as route::Project>::View<'req, 'd>,
+        state: &'state Cell<(*const u8, bool, bool)>,
     ) -> Self::Response<'req, 'd>
     where
         'req: 'state,

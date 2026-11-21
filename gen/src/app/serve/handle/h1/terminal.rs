@@ -69,18 +69,6 @@ pub(super) fn open(paths: &Paths, generics: &crate::types::Generics) -> TokenStr
     }
 }
 
-pub(super) fn failed(paths: &Paths, generics: &crate::types::Generics) -> TokenStream {
-    let f_life = local("lifecycle");
-    let [v_error, v_exch, v_this] = generics.locals(["error", "exchange", "this"]);
-    let ns_core = &paths.core;
-    let open = open(paths, generics);
-    quote! {
-        #open
-        #ns_core::life::sequence::Mode::reject(#v_this.#f_life, #v_exch);
-        #v_error.into_consume().into()
-    }
-}
-
 pub(super) fn guard(
     paths: &Paths,
     generics: &crate::types::Generics,
@@ -100,8 +88,8 @@ pub(super) fn guard(
     let [n_resp, v_conn, v_date] = generics.locals(["__response", "conn", "date"]);
     let [v_exch, v_head, v_parsed, n_shead] =
         generics.locals(["exchange", "head", "parsed", "__sark_head"]);
-    let [v_permit, v_state, v_this] = generics.locals(["permit", "state", "this"]);
-    let [v_write] = generics.locals(["write"]);
+    let [v_state, v_this] = generics.locals(["state", "this"]);
+    let [v_write, v_turn, v_prior] = generics.locals(["write", "turn", "prior"]);
     let ns_core = &paths.core;
     let ns_h1 = &paths.h1;
     let ns_http = &paths.http;
@@ -143,19 +131,17 @@ pub(super) fn guard(
             #ns_core::life::Event::HeadAdmitted(#v_exch),
         );
         let #observer = #ns_core::life::Mode::observer(#v_this.#f_life);
-        let #n_gout = match #n_gout {
-            ::core::result::Result::Ok(#n_body) => {
-                #n_body.observe_copy(#observer, #v_exch);
-                #n_body.commit_retention(#v_this.#f_life, #v_conn.async_state.session_mut(), #v_exch);
-                #n_body.into_consume(
-                    #v_permit,
-                    #ns_h1::session::Consumption::Buffered(#ns_h1::session::Buffered::new(0)),
-                    #ns_h1::wire::head::Connection::Close,
-                )
-            }
-            ::core::result::Result::Err(#n_error) => #ns_h1::session::Outcome::Failed(#n_error),
-        };
+        if let ::core::result::Result::Ok(#n_body) = &#n_gout {
+            #n_body.observe_copy(#observer, #v_exch);
+            #n_body.commit_retention(#v_this.#f_life, #v_conn.async_state.session_mut(), #v_exch);
+        }
         #v_exch.retire(#v_this.#f_life, #ns_core::life::Outcome::Rejected);
-        return #n_gout.into();
+        return match #n_gout {
+            ::core::result::Result::Ok(#n_body) => #v_turn.complete(
+                #ns_h1::session::Consumption::Buffered(0),
+                #n_body, #ns_h1::wire::head::Connection::Close, #v_prior,
+            ),
+            ::core::result::Result::Err(#n_error) => #v_turn.failed(#n_error),
+        };
     } })
 }

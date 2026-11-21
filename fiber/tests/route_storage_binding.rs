@@ -3,19 +3,11 @@ pub mod common;
 use std::{cell::Cell, hint, num};
 
 use dope::{
-    core::{
-        BranchError,
-        driver::{
-            self, life::recovery::Policy, route::KeyTag, schedule::ready::task::owner, settings,
-        },
-    },
+    core::driver::{self, route::KeyTag, schedule::ready::task::owner, settings},
     net::wire,
 };
 use dope_fiber::task::storage::scope::Brand;
-use dope_test::{
-    alloc::Tracker,
-    scope::{Driver, Error},
-};
+use dope_test::alloc::Tracker;
 use o3::alloc;
 use sark_core::manifold::task::app::Bind as _;
 use sark_fiber::Config;
@@ -26,7 +18,7 @@ use crate::common::{
     retained::State,
     route::glue::storage::{GlobalBudgetApp, MixedStorageApp},
 };
-use common::server::recover;
+use common::route::with_scope;
 
 #[global_allocator]
 static ALLOCATOR: Tracker = Tracker::new();
@@ -74,9 +66,10 @@ fn construction_is_lazy() {
 fn listener_prepares() {
     let failures = Cell::new(Vec::new());
     let state = State(&failures);
-    let mut reports = Vec::new();
-    Driver::new(settings::Config::for_profile::<sark_fiber::Throughput>()).with_driver(
-        |driver| {
+    with_scope(
+        settings::Config::for_profile::<sark_fiber::Throughput>(),
+        |scope| {
+            let driver = scope.context();
             let clock = date::Clock::new().expect("HTTP date clock");
             let owners = owner::Capacity::new(num::NonZero::<u32>::MIN);
             Brand::with(|brand| {
@@ -114,18 +107,7 @@ fn listener_prepares() {
                 hint::black_box(&runtime);
             });
         },
-        Policy::new(|event| reports.push(event), recover),
-        |result| {
-            result
-                .as_ref()
-                .map_err(|error| match error {
-                    Error::Create(error) => BranchError::First(error.kind()),
-                    Error::Close(error) => BranchError::Second(error.cause()),
-                })
-                .expect("driver");
-        },
     );
-    assert!(reports.is_empty(), "driver retirement: {reports:?}");
 }
 
 #[test]
@@ -133,9 +115,10 @@ fn driver_prepares_storage() {
     let failures = Cell::new(Vec::new());
     let state = State(&failures);
 
-    let mut reports = Vec::new();
-    Driver::new(settings::Config::for_profile::<sark_fiber::Throughput>()).with_driver(
-        |driver| {
+    with_scope(
+        settings::Config::for_profile::<sark_fiber::Throughput>(),
+        |scope| {
+            let driver = scope.context();
             Brand::with(|brand| {
                 let app = MixedStorageApp::multiplexed::<
                     wire::Identity,
@@ -158,19 +141,5 @@ fn driver_prepares_storage() {
                 hint::black_box(&runtime);
             })
         },
-        Policy::new(|event| reports.push(event), recover),
-        |result| {
-            result
-                .as_ref()
-                .map_err(|error| match error {
-                    Error::Create(error) => BranchError::First(error.kind()),
-                    Error::Close(error) => BranchError::Second(error.cause()),
-                })
-                .expect("driver");
-        },
-    );
-    assert!(
-        reports.is_empty(),
-        "metadata-only storage emitted completion: {reports:?}"
     );
 }

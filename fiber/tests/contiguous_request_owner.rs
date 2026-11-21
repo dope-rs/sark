@@ -2,14 +2,8 @@ pub mod common;
 
 use std::num::NonZero;
 
-use dope::core::{
-    BranchError,
-    driver::{self, life::recovery::Policy, schedule::ready::task::owner, settings},
-};
-use dope_test::{
-    alloc::Tracker,
-    scope::{Driver, Error},
-};
+use dope::core::driver::{self, schedule::ready::task::owner, settings};
+use dope_test::alloc::Tracker;
 use o3::buffer::{resident, storage};
 use sark_core::body::{Build as _, Push as _, Step, Transfer};
 use sark_http::{
@@ -21,16 +15,17 @@ use crate::common::{
     h1::chunked,
     route::chunked::apps::{SegmentedReq, WholeReq},
 };
-use common::server::recover;
+use common::route::with_scope;
 
 #[global_allocator]
 static ALLOCATOR: Tracker = Tracker::new();
 
 #[test]
 fn bounded_owner_transfer() {
-    let mut reports = Vec::new();
-    Driver::new(settings::Config::for_profile::<sark_fiber::Throughput>()).with_driver(
-        |driver| {
+    with_scope(
+        settings::Config::for_profile::<sark_fiber::Throughput>(),
+        |scope| {
+            let driver = scope.context();
             let binding = driver::Binding::new(
                 driver.driver_ref().timer(),
                 owner::Capacity::new(NonZero::<u32>::MIN),
@@ -202,19 +197,5 @@ fn bounded_owner_transfer() {
             assert_eq!(allocs, 0);
             assert_eq!(output.into_parts().1.payload.as_slice().as_ptr(), pointer);
         },
-        Policy::new(|event| reports.push(event), recover),
-        |result| {
-            result
-                .as_ref()
-                .map_err(|error| match error {
-                    Error::Create(error) => BranchError::First(error.kind()),
-                    Error::Close(error) => BranchError::Second(error.cause()),
-                })
-                .expect("driver");
-        },
-    );
-    assert!(
-        reports.is_empty(),
-        "identity-only scope returned I/O: {reports:?}"
     );
 }

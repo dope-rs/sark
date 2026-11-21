@@ -147,41 +147,37 @@ fn retires_idle_generation() {
         .run(
             |context, listener| {
                 server::try_serve::<ClOverflowDispatch, _>(
-                    server, context, listener, (), server::MAX_CONNECTIONS,
+                    server,
+                    context,
+                    listener,
+                    (),
+                    server::MAX_CONNECTIONS,
                 )
             },
             |bind| {
-                let mut first = TcpPeer::at(bind)
-                    .try_connect()
-                    .expect("connect first H1 generation");
-                first
-                    .read_wait(Some(Duration::from_secs(2)))
-                    .expect("bound first-generation read timeout");
-                first
-                    .write_all(b"GET /ping HTTP/1.1\r\nHost: lifetime\r\n\r\n")
-                    .expect("request");
+                let request = b"GET /ping HTTP/1.1\r\nHost: lifetime\r\n\r\n";
+                let address = TcpPeer::at(bind);
+                let socket = address
+                    .try_read(Duration::from_secs(2))
+                    .expect("first H1 generation");
+                let mut first = Peer::new(socket);
                 assert_eq!(
-                    Peer::new(&mut first, &mut Vec::new())
-                        .try_response()
-                        .expect("lifetime response"),
+                    first.try_exchange(request).expect("lifetime response"),
                     (200, b"pong".to_vec())
                 );
+                drop(first.buffered);
                 let mut eof = [0_u8; 1];
-                assert_eq!(first.read(&mut eof).expect("read server-driven EOF"), 0);
-
-                let mut second = TcpPeer::at(bind)
-                    .try_connect()
-                    .expect("connect second H1 generation");
-                second
-                    .read_wait(Some(Duration::from_secs(2)))
-                    .expect("bound second-generation read timeout");
-                second
-                    .write_all(b"GET /ping HTTP/1.1\r\nHost: lifetime\r\n\r\n")
-                    .expect("request");
                 assert_eq!(
-                    Peer::new(&mut second, &mut Vec::new())
-                        .try_response()
-                        .expect("lifetime response"),
+                    first.socket.read(&mut eof).expect("read server-driven EOF"),
+                    0
+                );
+
+                let socket = address
+                    .try_read(Duration::from_secs(2))
+                    .expect("second H1 generation");
+                let mut second = Peer::new(socket);
+                assert_eq!(
+                    second.try_exchange(request).expect("lifetime response"),
                     (200, b"pong".to_vec())
                 );
             },

@@ -110,7 +110,6 @@ fn omits_stream() {
             drops: &drops,
         };
         let result = conn.dispatch_stream::<Streaming, _, _, _, _>(
-            session::Permit::new(),
             head,
             &state,
             writer.reborrow(),

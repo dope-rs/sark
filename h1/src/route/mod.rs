@@ -7,7 +7,7 @@ use sark_http::h1::head::response::{Date, Server};
 pub mod duplex;
 mod pending;
 mod stream;
-pub mod sync;
+mod sync;
 pub mod task;
 
 pub use pending::Pending;

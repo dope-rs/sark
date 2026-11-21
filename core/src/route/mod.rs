@@ -77,40 +77,16 @@ pub trait Fields: Schema<Error = Error<Self::Identity>> {
 
 /// Borrowed request projection used by synchronous and duplex routes.
 pub trait Project: Schema {
-    type Params<'req>;
-    type Headers<'req>;
     type Error<'req>;
     type View<'req, 'd>
     where
         'd: 'req;
-    type ParsedBody<'req, 'd>
-    where
-        'd: 'req;
-
     fn reject<'req>(error: <Self as Project>::Error<'req>) -> Reject;
 
-    fn from_params<'req, 'body>(
+    fn try_view<'req, 'body: 'req, 'd: 'body>(
         request: &request::raw::Parsed<request::Head<&'req [u8], Self::Frame>, Self>,
-    ) -> Result<Self::Params<'req>, <Self as Project>::Error<'body>>;
-
-    fn parse_body<'req, 'd>(
-        body: <Self::Body as body::Project>::View<'req, 'd>,
-    ) -> Result<Self::ParsedBody<'req, 'd>, <Self as Project>::Error<'req>>
-    where
-        'd: 'req;
-
-    fn from_parts<'req, 'd>(
-        params: Self::Params<'req>,
-        headers: Self::Headers<'req>,
-        body: Self::ParsedBody<'req, 'd>,
-        request: &request::View<'req, 'd, Self::Frame>,
-    ) -> Self::View<'req, 'd>
-    where
-        'd: 'req;
-
-    fn from_headers<'req, 'body>(
-        request: &request::raw::Parsed<request::Head<&'req [u8], Self::Frame>, Self>,
-    ) -> Result<Self::Headers<'req>, <Self as Project>::Error<'body>>;
+        body: body::Scoped<'body, 'd, Self::Body>,
+    ) -> Result<Self::View<'req, 'd>, <Self as Project>::Error<'body>>;
 }
 
 /// Body-input strategy selected by an owned request schema.

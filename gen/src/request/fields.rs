@@ -1,6 +1,6 @@
 use syn::ext::IdentExt as _;
 
-use crate::{macros::tokens::local, request::bodies, runtime::paths::Paths, types};
+use crate::{macros::tokens::local, request::bodies, types};
 
 struct FieldAttr {
     name: syn::LitStr,
@@ -163,15 +163,15 @@ pub(super) struct Fields {
     pub(super) headers: Vec<Field>,
     pub(super) queries: Vec<Field>,
     pub(super) paths: Vec<Path>,
-    pub(super) peer: Option<syn::Type>,
+    pub(super) peer: Option<(syn::Ident, syn::Type)>,
     pub(super) init: Vec<proc_macro2::TokenStream>,
     pub(super) body: bodies::Plan,
 }
 
 impl Fields {
     pub(super) fn collect(
-        paths: &Paths,
-        named: &syn::FieldsNamed,
+        body_param: &syn::Ident,
+        named: &mut syn::FieldsNamed,
         body: bodies::Plan,
     ) -> syn::Result<Self> {
         let [v_heads, v_params, v_auth] = ["headers", "params", "__sark_authority"].map(local);
@@ -190,19 +190,19 @@ impl Fields {
             }
         })?;
         let body =
-            named.named.iter().try_fold(body, |body, field| {
+            named.named.iter_mut().try_fold(body, |body, field| {
                 if is_only(&field.attrs, "raw_body") {
                     body.try_raw(
-                        paths,
+                        body_param,
                         field.ident.clone().ok_or_else(|| {
-                            syn::Error::new_spanned(field, "named field required")
+                            syn::Error::new_spanned(&*field, "named field required")
                         })?,
-                        &field.ty,
+                        &mut field.ty,
                     )
                 } else if is_only(&field.attrs, "body_len") {
                     body.try_len(
                         field.ident.clone().ok_or_else(|| {
-                            syn::Error::new_spanned(field, "named field required")
+                            syn::Error::new_spanned(&*field, "named field required")
                         })?,
                         &field.ty,
                     )
@@ -319,7 +319,7 @@ impl Fields {
                 init.push(quote::quote!(#ident: #v_params.#ident));
             } else if raw || len {
             } else if auth {
-                if let Some(first) = &peer {
+                if let Some((_, first)) = &peer {
                     let mut error = syn::Error::new_spanned(
                         field,
                         "request can contain only one #[authority] field",
@@ -330,7 +330,7 @@ impl Fields {
                     ));
                     return Err(error);
                 }
-                peer = Some(field.ty.clone());
+                peer = Some((ident.clone(), field.ty.clone()));
                 init.push(quote::quote!(#ident: #v_auth));
             } else {
                 return Err(syn::Error::new_spanned(

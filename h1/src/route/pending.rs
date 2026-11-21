@@ -6,7 +6,7 @@ use sark_core::{
     route,
 };
 use sark_http::{
-    h1::codec::canned,
+    h1::{codec::canned, field::expect},
     payload::{owned, response::Body as _},
 };
 
@@ -27,31 +27,28 @@ pub struct Pending<'d, R: route::Spec> {
     pub(super) body: owned::Segments<'d>,
 }
 
-impl<'d, R: route::Spec> Pending<'d, R> {
-    pub(super) fn start<D, E: credit::Evidence>(
-        frame: framing::Pending<R>,
-        body: owned::Segments<'d>,
-        permit: session::Permit,
+impl<R: route::Spec> framing::Pending<R> {
+    pub fn retain<'d, P, Ready, H, E: credit::Evidence>(
+        self,
+        ingress: &mut session::Ingress<'d, P, Ready, H>,
         mut proof: E,
-    ) -> session::RouteOutcome<'d, Self, D> {
+    ) -> (session::BodyAwait, expect::Decision, Pending<'d, R>) {
+        let body = ingress.payload.take();
         proof.reserved(E::credit(body.len(), body.count()));
-        permit.commit();
-        session::RouteOutcome::AwaitBody {
-            state: frame.state,
-            expectation: frame.expectation,
-            pending: Self {
-                head: frame.head,
-                response: frame.response,
-                content_length: frame.declared_body_len,
+        (
+            self.state,
+            self.expectation,
+            Pending {
+                head: self.head,
+                response: self.response,
+                content_length: self.declared_body_len,
                 body,
             },
-        }
+        )
     }
+}
 
-    pub const fn response(&self) -> response::Context {
-        self.response
-    }
-
+impl<'d, R: route::Spec> Pending<'d, R> {
     /// Framing admission bounded this immutable head by HEAD_CAPACITY.
     pub fn head_len(&self) -> u32 {
         self.head.owner().as_ref().len() as u32

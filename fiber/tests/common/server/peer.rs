@@ -56,16 +56,24 @@ impl Endpoint for net::SocketAddr {
     }
 
     fn try_exchange(self, target: &[u8]) -> io::Result<Vec<u8>> {
-        let mut stream = TcpStream::connect(self)?;
-        stream.set_read_timeout(Some(Duration::from_secs(2)))?;
         let mut request = b"GET ".to_vec();
         request.extend_from_slice(target);
         request.extend_from_slice(b" HTTP/1.1\r\nHost: example\r\nConnection: close\r\n\r\n");
-        stream.write_all(&request)?;
-        let mut response = Vec::new();
-        stream.read_to_end(&mut response)?;
-        Ok(response)
+        request_to_eof(self, &request, Duration::from_secs(2))
     }
+}
+
+pub fn request_to_eof(
+    addr: net::SocketAddr,
+    request: &[u8],
+    timeout: Duration,
+) -> io::Result<Vec<u8>> {
+    let mut stream = TcpStream::connect(addr)?;
+    stream.set_read_timeout(Some(timeout))?;
+    stream.write_all(request)?;
+    let mut response = Vec::new();
+    stream.read_to_end(&mut response)?;
+    Ok(response)
 }
 
 fn body_start(buf: &[u8]) -> Option<usize> {

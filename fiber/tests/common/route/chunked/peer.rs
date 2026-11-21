@@ -20,43 +20,50 @@ impl From<peer::Error> for Error {
     }
 }
 
-pub struct Peer<'a> {
-    socket: &'a mut Stream<'static>,
-    buffered: &'a mut Vec<u8>,
+pub struct Peer {
+    pub(crate) socket: Stream<'static>,
+    pub(crate) buffered: Vec<u8>,
 }
 
-impl<'a> Peer<'a> {
-    pub fn new(socket: &'a mut Stream<'static>, buffered: &'a mut Vec<u8>) -> Self {
-        Self { socket, buffered }
+impl Peer {
+    pub fn new(socket: Stream<'static>) -> Self {
+        Self {
+            socket,
+            buffered: Vec::new(),
+        }
     }
 
-    pub fn try_connect(bind: SocketAddr) -> Result<Stream<'static>, peer::Error> {
+    pub fn try_connect(bind: SocketAddr) -> Result<Self, peer::Error> {
         let socket = peer::Peer::at(bind).try_connect()?;
         socket.set_nodelay(true)?;
         socket.read_wait(Some(Duration::from_secs(5)))?;
-        Ok(socket)
+        Ok(Self::new(socket))
     }
 
-    pub fn try_bounded(bind: SocketAddr) -> Result<Stream<'static>, peer::Error> {
+    pub fn try_bounded(bind: SocketAddr) -> Result<Self, peer::Error> {
         use dope::core::{Backend, dope_sys::io::socket::option};
-        let socket = Self::try_connect(bind)?;
+        let peer = Self::try_connect(bind)?;
         for kind in [option::Kind::RecvBuffer, option::Kind::SendBuffer] {
-            <Backend as option::Source>::set(socket.as_fd(), kind, &option::Value::new(16 * 1024))?;
+            <Backend as option::Source>::set(
+                peer.socket.as_fd(),
+                kind,
+                &option::Value::new(16 * 1024),
+            )?;
         }
-        Ok(socket)
+        Ok(peer)
     }
 
-    pub fn try_text(self) -> Result<(u16, String), Error> {
+    pub fn try_text(&mut self) -> Result<(u16, String), Error> {
         let (status, body) = self.try_response()?;
         Ok((status, String::from_utf8(body).map_err(Error::Body)?))
     }
 
-    pub fn try_exchange(self, wire: &[u8]) -> Result<(u16, Vec<u8>), Error> {
+    pub fn try_exchange(&mut self, wire: &[u8]) -> Result<(u16, Vec<u8>), Error> {
         self.socket.write_all(wire)?;
         self.try_response()
     }
 
-    pub fn try_response(mut self) -> Result<(u16, Vec<u8>), Error> {
+    pub fn try_response(&mut self) -> Result<(u16, Vec<u8>), Error> {
         let mut incoming = [0u8; 4096];
         let mut start = 0;
         let end = loop {

@@ -256,5 +256,6 @@ sark_fiber::define_route! {
         POST "/expect" => fixed_echo,
         POST "/limited" => limited,
         GET "/ping" => crate::common::route::body::ping,
+        POST "/public/expect" => fixed_echo,
     }
 }

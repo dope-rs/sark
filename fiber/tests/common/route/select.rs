@@ -50,8 +50,10 @@ sark_fiber::define_route! {
         GET "/minimal" => minimal,
         GET "/full" => full,
         GET "/items/:id" => request(path, query) routed,
+        GET "/number/:req" => request(path) crate::common::h1::show,
         GET "/items/new" => minimal,
         GET "/items/42suffix" => minimal,
         GET "/items/42suffix.gz" => full,
+        GET "/public/items/:id" => request(path, query) routed,
     }
 }

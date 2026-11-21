@@ -3,7 +3,7 @@ use core::mem;
 use o3::buffer::{resident, segments};
 use sark_http::{payload, payload::response::dispatch};
 
-use crate::{request, route};
+use crate::route;
 
 pub mod client;
 pub mod raw;
@@ -58,22 +58,14 @@ impl EmptyState {
     pub const REF: &'static Self = &Self;
 }
 
-/// Projected request parts and the independently borrowed application state.
-pub type Args<'view, 'req, 'd, 'state, R, State> = (
-    <R as route::Project>::Params<'req>,
-    &'view request::View<'req, 'd, <R as route::Schema>::Frame>,
-    <R as route::Project>::Headers<'req>,
-    <R as route::Project>::ParsedBody<'req, 'd>,
-    &'state State,
-);
-
 pub trait Route<State>: route::Spec<Kind: dispatch::Dispatch> {
     type Response<'req, 'd>: dispatch::Emit<'req, 'd, Kind = Self::Kind, Stream = Self::Stream<'d>>
     where
         'd: 'req;
 
     fn invoke<'req, 'd, 'state>(
-        input: Args<'_, 'req, 'd, 'state, Self::Request, State>,
+        request: <Self::Request as route::Project>::View<'req, 'd>,
+        state: &'state State,
     ) -> Self::Response<'req, 'd>
     where
         'req: 'state,

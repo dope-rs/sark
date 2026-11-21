@@ -47,7 +47,7 @@ pub trait Decode: Sized {
 pub trait Request {
     type View<'req>: writing::TryEncode;
 
-    fn decode<'req>(input: &'req [u8]) -> Result<Self::View<'req>, Error<'req>> {
+    fn decode<'req, 'input: 'req>(input: &'input [u8]) -> Result<Self::View<'req>, Error<'input>> {
         let (view, mut index) = Self::prefix(input, 0, Depth::ROOT)?;
         crate::input::Input::finish(input, &mut index)?;
         Ok(view)
@@ -56,9 +56,9 @@ pub trait Request {
     /// Decodes one object prefix using the budget below that object.
     /// Callers entering a nested object must first consume [`Depth::child`].
     #[doc(hidden)]
-    fn prefix<'req>(
-        input: &'req [u8],
+    fn prefix<'req, 'input: 'req>(
+        input: &'input [u8],
         index: usize,
         depth: Depth,
-    ) -> Result<(Self::View<'req>, usize), Error<'req>>;
+    ) -> Result<(Self::View<'req>, usize), Error<'input>>;
 }

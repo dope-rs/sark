@@ -19,25 +19,6 @@ pub(super) enum ValueKind {
     Encoding,
 }
 
-#[derive(Clone, Copy)]
-pub(crate) enum RetainedAs<'a> {
-    Mode(&'a proc_macro2::Ident),
-    Request,
-}
-
-impl RetainedAs<'_> {
-    fn ty(self, paths: &Paths) -> syn::Type {
-        let ns_core = &paths.core;
-        let ns_http = &paths.http;
-        match self {
-            Self::Mode(mode) => syn::parse_quote!(
-                <#mode as #ns_core::request::mode::Mode<'d>>::Bytes
-            ),
-            Self::Request => syn::parse_quote!(#ns_http::request::Bytes<'d>),
-        }
-    }
-}
-
 #[repr(transparent)]
 pub(super) struct View<'a> {
     ty: &'a syn::Type,
@@ -145,46 +126,36 @@ impl<'a> View<'a> {
     }
 }
 
-#[repr(transparent)]
-pub(crate) struct Edit<'a> {
-    ty: &'a mut syn::Type,
+pub(super) fn retained(ty: &syn::Type, paths: &Paths) -> syn::Type {
+    let mut owned = ty.clone();
+    if let Some(bytes) = shared_bytes(&mut owned) {
+        let http = &paths.http;
+        *bytes = syn::parse_quote!(#http::request::Bytes<'d>);
+    }
+    owned
 }
 
-impl<'a> Edit<'a> {
-    pub(crate) fn new(ty: &'a mut syn::Type) -> Self {
-        Self { ty }
+pub(super) fn shared_bytes(ty: &mut syn::Type) -> Option<&mut syn::Type> {
+    if View::new(ty).is_named("Shared") {
+        return Some(ty);
     }
-
-    pub(crate) fn retained(self, paths: &Paths, to: RetainedAs<'_>) {
-        if View::new(self.ty).is_named("Shared") {
-            *self.ty = to.ty(paths);
-            return;
-        }
-        let syn::Type::Path(path) = self.ty else {
-            return;
-        };
-        let Some(seg) = path.path.segments.last_mut() else {
-            return;
-        };
-        if seg.ident.unraw() != "Option" {
-            return;
-        }
-        let syn::PathArguments::AngleBracketed(args) = &mut seg.arguments else {
-            return;
-        };
-        if args.args.len() != 1 {
-            return;
-        }
-        let Some(arg) = args.args.first_mut() else {
-            return;
-        };
-        let syn::GenericArgument::Type(inner) = arg else {
-            return;
-        };
-        if View::new(inner).is_named("Shared") {
-            *inner = to.ty(paths);
-        }
+    let syn::Type::Path(path) = ty else {
+        return None;
+    };
+    let segment = path.path.segments.last_mut()?;
+    if segment.ident.unraw() != "Option" {
+        return None;
     }
+    let syn::PathArguments::AngleBracketed(args) = &mut segment.arguments else {
+        return None;
+    };
+    if args.args.len() != 1 {
+        return None;
+    }
+    let syn::GenericArgument::Type(inner) = args.args.first_mut()? else {
+        return None;
+    };
+    View::new(inner).is_named("Shared").then_some(inner)
 }
 
 fn generic_inner<'a>(ty: &'a syn::Type, want: &str) -> Option<&'a syn::Type> {

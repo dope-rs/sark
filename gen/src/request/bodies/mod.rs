@@ -4,44 +4,8 @@ pub(super) mod task;
 
 pub(super) enum Source {
     Discarded,
-    Raw(Raw),
-    Json(Json),
-}
-
-pub(super) struct Json {
-    ident: syn::Ident,
-    ty: syn::Type,
-}
-
-pub(super) struct Raw {
-    ident: syn::Ident,
-    borrowed_ty: syn::Type,
-    segmented: bool,
-}
-
-impl Raw {
-    fn new(paths: &Paths, ident: syn::Ident, ty: &syn::Type) -> syn::Result<Self> {
-        let ns_http = &paths.http;
-        let view = types::View::new(ty);
-        let segments = view.is_named("Segments");
-        let valid = segments || view.is_named("Shared");
-        if !valid {
-            return Err(syn::Error::new_spanned(
-                ty,
-                "#[raw_body] field type must be owned::Segments or Shared",
-            ));
-        }
-        let borrowed = if segments {
-            syn::parse_quote!(#ns_http::request::body::Ref<'req, 'd>)
-        } else {
-            syn::parse_quote!(&'req [::core::primitive::u8])
-        };
-        Ok(Self {
-            ident,
-            borrowed_ty: borrowed,
-            segmented: segments,
-        })
-    }
+    Raw { ident: syn::Ident, segmented: bool },
+    Json(syn::Type),
 }
 
 pub(super) struct Plan {
@@ -54,72 +18,44 @@ impl Plan {
         &mut self,
         request: &syn::Ident,
     ) -> Option<(syn::Ident, proc_macro2::TokenStream)> {
-        let Source::Json(json) = &mut self.source else {
+        let Source::Json(ty) = &mut self.source else {
             return None;
         };
         let name = quote::format_ident!("__{}Json", request);
-        let ty = &json.ty;
         let declaration = quote::quote!(type #name = #ty;);
-        json.ty = syn::parse_quote!(#name);
+        *ty = syn::parse_quote!(#name);
         Some((name, declaration))
     }
 
-    pub(super) fn mode_impls(
+    pub(super) fn storage(
         &self,
         paths: &Paths,
+        named: &mut syn::FieldsNamed,
         vis: &syn::Visibility,
-        mode: &syn::Ident,
-    ) -> proc_macro2::TokenStream {
-        let ns_core = &paths.core;
-        let ns_http = &paths.http;
-        let ns_json = &paths.json;
-        let (borrowed, owned) = match &self.source {
-            Source::Discarded => (quote::quote!(()), quote::quote!(())),
-            Source::Raw(raw) => {
-                let borrowed = &raw.borrowed_ty;
-                let owned = if raw.segmented {
-                    quote::quote!(#ns_http::request::Segments<'d>)
-                } else {
-                    quote::quote!(#ns_http::request::Bytes<'d>)
-                };
-                (quote::quote!(#borrowed), owned)
+        param: &syn::Ident,
+    ) -> Option<(proc_macro2::TokenStream, proc_macro2::TokenStream)> {
+        match &self.source {
+            Source::Raw {
+                segmented: true, ..
+            } => {
+                let http = &paths.http;
+                Some((
+                    quote::quote!(#http::request::Segments<'d>),
+                    quote::quote!(#http::request::body::Ref<'req, 'd>),
+                ))
             }
-            Source::Json(json) => {
-                let ty = &json.ty;
-                (
-                    quote::quote!(
-                        <#ty as #ns_json::parsing::Request>::View<'req>
-                    ),
-                    quote::quote!(
-                        <#ty as #ns_json::segment::IntoRequest>::Request<'d>
-                    ),
-                )
+            Source::Json(ty) => {
+                let json = &paths.json;
+                named.named.push(syn::parse_quote!(#vis body: #param));
+                Some((
+                    quote::quote!(<#ty as #json::segment::IntoRequest>::Request<'d>),
+                    quote::quote!(<#ty as #json::parsing::Request>::View<'req>),
+                ))
             }
-        };
-        quote::quote! {
-            #[doc(hidden)]
-            #vis trait #mode<'d>: #ns_core::request::mode::Mode<'d> {
-                type Body;
-            }
-
-            impl<'req, 'd: 'req> #mode<'d> for #ns_core::request::mode::Ref<'req> {
-                type Body = #borrowed;
-            }
-
-            impl<'d> #mode<'d> for #ns_core::request::mode::Own {
-                type Body = #owned;
-            }
-        }
-    }
-
-    pub(super) fn rewrite(&self, field: &mut syn::Field, mode: &syn::Ident, param: &syn::Ident) {
-        let body = match &self.source {
-            Source::Raw(raw) => field.ident.as_ref() == Some(&raw.ident),
-            Source::Json(json) => field.ident.as_ref() == Some(&json.ident),
-            Source::Discarded => false,
-        };
-        if body {
-            field.ty = syn::parse_quote!(<#param as #mode<'d>>::Body);
+            Source::Discarded
+            | Source::Raw {
+                segmented: false, ..
+            } => None,
         }
     }
 
@@ -139,29 +75,35 @@ impl Plan {
             }
         }
         Ok(Self {
-            source: match json {
-                Some(ty) => Source::Json(Json {
-                    ident: syn::Ident::new("body", proc_macro2::Span::call_site()),
-                    ty,
-                }),
-                None => Source::Discarded,
-            },
+            source: json.map_or(Source::Discarded, Source::Json),
             length: None,
         })
     }
 
     pub(super) fn try_raw(
         self,
-        paths: &Paths,
+        param: &syn::Ident,
         ident: syn::Ident,
-        ty: &syn::Type,
+        ty: &mut syn::Type,
     ) -> syn::Result<Self> {
         let source = match self.source {
-            Source::Discarded => Source::Raw(Raw::new(paths, ident, ty)?),
-            Source::Raw(raw) => {
+            Source::Discarded => {
+                let view = types::View::new(ty);
+                let segmented = view.is_named("Segments");
+                if segmented {
+                    *ty = syn::parse_quote!(#param);
+                } else if !view.is_named("Shared") {
+                    return Err(syn::Error::new_spanned(
+                        ty,
+                        "#[raw_body] field type must be owned::Segments or Shared",
+                    ));
+                }
+                Source::Raw { ident, segmented }
+            }
+            Source::Raw { ident: first, .. } => {
                 let mut error = syn::Error::new_spanned(ty, "duplicate #[raw_body]");
                 error.combine(syn::Error::new_spanned(
-                    raw.ident,
+                    first,
                     "first #[raw_body] declared here",
                 ));
                 return Err(error);
@@ -172,7 +114,7 @@ impl Plan {
                     "#[json_body(...)] and #[raw_body] are mutually exclusive",
                 );
                 error.combine(syn::Error::new_spanned(
-                    json.ty,
+                    json,
                     "#[json_body(...)] declared here",
                 ));
                 return Err(error);
@@ -205,15 +147,6 @@ impl Plan {
         })
     }
 
-    pub(super) fn append_json(&self, named: &mut syn::FieldsNamed, vis: &syn::Visibility) {
-        let Source::Json(json) = &self.source else {
-            return;
-        };
-        let ident = &json.ident;
-        let ty = &json.ty;
-        named.named.push(syn::parse_quote!(#vis #ident: #ty));
-    }
-
     pub(super) fn fields(
         &self,
         paths: &Paths,
@@ -223,14 +156,8 @@ impl Plan {
         let ns_core = &paths.core;
         let mut fields = Vec::with_capacity(2);
         match &self.source {
-            Source::Raw(raw) => {
-                let ident = &raw.ident;
-                fields.push(quote::quote!(#ident: #body));
-            }
-            Source::Json(json) => {
-                let ident = &json.ident;
-                fields.push(quote::quote!(#ident: #body));
-            }
+            Source::Raw { ident, .. } => fields.push(quote::quote!(#ident: #body)),
+            Source::Json(_) => fields.push(quote::quote!(body: #body)),
             Source::Discarded => {}
         }
         if let Some(ident) = &self.length {
@@ -242,100 +169,60 @@ impl Plan {
     pub(super) fn task(&self, paths: &Paths) -> (proc_macro2::TokenStream, &Source) {
         let ns_core = &paths.core;
         let body = match &self.source {
-            Source::Json(_) => quote::quote!(#ns_core::body::Contiguous),
-            Source::Raw(raw) => {
-                if raw.segmented {
-                    quote::quote!(#ns_core::body::Segmented)
-                } else {
-                    quote::quote!(#ns_core::body::Contiguous)
-                }
+            Source::Raw {
+                segmented: true, ..
+            } => quote::quote!(#ns_core::body::Segmented),
+            Source::Json(_)
+            | Source::Raw {
+                segmented: false, ..
+            } => {
+                quote::quote!(#ns_core::body::Contiguous)
             }
             Source::Discarded => quote::quote!(#ns_core::body::Discarded),
         };
         (body, &self.source)
     }
 
-    pub(super) fn parsing(
+    pub(super) fn project(
         &self,
         paths: &Paths,
-        path: &proc_macro2::TokenStream,
-    ) -> (
-        proc_macro2::TokenStream,
-        proc_macro2::TokenStream,
-        proc_macro2::TokenStream,
-    ) {
+        path_error: &proc_macro2::TokenStream,
+        input: &syn::Ident,
+        fields: &mut Vec<proc_macro2::TokenStream>,
+    ) -> (proc_macro2::TokenStream, proc_macro2::TokenStream) {
         let ns_core = &paths.core;
         let ns_json = &paths.json;
-        let body = local("body");
-        let (cause, param, value) = match &self.source {
-            Source::Json(json) => {
-                let ty = &json.ty;
-                (
-                    quote::quote!(#ns_json::parsing::Error<'req>),
-                    quote::quote!(<#ty as #ns_json::parsing::Request>::View<'req>),
-                    quote::quote! {
-                        <#ty as #ns_json::parsing::Request>::decode(#body.as_slice())
-                            .map_err(#ns_core::route::Input::Body)
-                    },
-                )
-            }
-            Source::Raw(raw) => {
-                let ty = &raw.borrowed_ty;
-                let value = if raw.segmented {
-                    quote::quote!(::core::result::Result::Ok(#body))
-                } else {
-                    quote::quote!(::core::result::Result::Ok(#body.as_slice()))
-                };
+        let parsed = local("__sark_parsed_body");
+        let len = local("__sark_body_len");
+        let length = self
+            .length
+            .as_ref()
+            .map(|_| quote::quote!(let #len = #input.body().len();));
+        let (error, read) = match &self.source {
+            Source::Json(ty) => (
+                quote::quote!(#ns_json::parsing::Error<'req>),
+                quote::quote! {
+                    let #parsed = <#ty as #ns_json::parsing::Request>::decode(
+                        #input.into_inner().as_slice(),
+                    ).map_err(#ns_core::route::Input::Body)?;
+                },
+            ),
+            Source::Raw { segmented, .. } => {
+                let slice = (!*segmented).then(|| quote::quote!(.as_slice()));
                 (
                     quote::quote!(::core::convert::Infallible),
-                    quote::quote!(#ty),
-                    value,
+                    quote::quote!(let #parsed = #input.into_inner()#slice;),
                 )
             }
             Source::Discarded => (
                 quote::quote!(::core::convert::Infallible),
-                quote::quote!(()),
-                quote::quote!(::core::result::Result::Ok(())),
+                proc_macro2::TokenStream::new(),
             ),
         };
-        let input = match &self.source {
-            Source::Discarded => quote::quote!(_),
-            Source::Raw(_) | Source::Json(_) => quote::quote!(#body),
-        };
-        let error = quote::quote!(#ns_core::route::Input<#path, #cause,>);
-        let parsed = quote::quote! {
-            type ParsedBody<'req, 'd> = #param
-            where
-                'd: 'req;
-
-            fn parse_body<'req, 'd>(
-                #input: <Self::Body as #ns_core::body::Project>::View<'req, 'd>,
-            ) -> ::core::result::Result<
-                Self::ParsedBody<'req, 'd>,
-                #error,
-            >
-            where
-                'd: 'req,
-            {
-                #value
-            }
-        };
-        (error, parsed, param)
-    }
-
-    pub(super) fn request(&self) -> proc_macro2::TokenStream {
-        let req = local("req");
-        match &self.length {
-            Some(_) => quote::quote!(#req),
-            None => quote::quote!(_),
-        }
-    }
-
-    pub(super) fn input(&self) -> proc_macro2::TokenStream {
-        let body = local("parsed_body");
-        match &self.source {
-            Source::Raw(_) | Source::Json(_) => quote::quote!(#body),
-            Source::Discarded => quote::quote!(_),
-        }
+        fields.extend(self.fields(paths, parsed, quote::quote!(#len)));
+        (
+            quote::quote!(#ns_core::route::Input<#path_error, #error>),
+            quote::quote!(#length #read),
+        )
     }
 }

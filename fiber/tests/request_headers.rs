@@ -2,6 +2,7 @@ use crate::common::h1::{fields, fields::Headers as _};
 pub mod common;
 
 use sark_core::{
+    body::{Discarded, Project as _},
     request::raw,
     route::{
         Project, Schema,
@@ -60,11 +61,10 @@ fn defaults_header() {
         // SAFETY: HdrReq parsed these headers from this exact retained input;
         // its generated parameter schema is the empty tuple.
         let request = unsafe { raw::Parsed::<_, HdrReq>::new(owner, (), block.into_headers()) };
-        let parsed = <HdrReq as Project>::from_headers(&request)
+        let parsed = <HdrReq as Project>::try_view(&request, Discarded::empty())
             .expect("absent header field falls back to default");
-        let (token, encoding) = parsed.captured();
-        assert_eq!(token, fields::DEFAULT);
-        assert_eq!(encoding, expected);
+        assert_eq!(parsed.x_token, fields::DEFAULT);
+        assert_eq!(parsed.encoding, expected);
     }
     assert!(matches!(
         Wire::new(fields::BAD_ENCODING).try_request::<HdrReq>(16),

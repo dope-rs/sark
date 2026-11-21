@@ -7,7 +7,7 @@ use crate::app::serve::{
     self, duplex,
     handle::{
         self, dispatch,
-        h1::{app, route, routes, routing, terminal},
+        h1::{app, route, routes, routing},
     },
 };
 
@@ -203,18 +203,16 @@ impl<'a> Types<'a> {
             }
         };
         let routing = {
-            let [n_method, n_raw] = symbols.locals(["__method", "__raw"]);
+            let n_method = symbols.local("__method");
             let [n_rproto] = symbols.locals(["__route_protocol"]);
             let [n_shead, n_target] = symbols.locals(["__sark_head", "__target"]);
             let [v_error, v_head, v_input] = symbols.locals(["error", "head", "input"]);
             let [v_method, v_result, v_parsed] = symbols.locals(["method", "outcome", "parsed"]);
-            let [v_wait, v_permit] = symbols.locals(["pending", "permit"]);
-            let [v_this, v_routes] = symbols.locals(["this", "routes"]);
+            let [v_wait, v_turn, v_prior] = symbols.locals(["pending", "turn", "prior"]);
             let g_brand = symbols.lifetime("brand");
             let ns_http = &paths.http;
 
             let spec = context.plan.spec;
-            let routes = &spec.route_specs;
             let bound = if plan.cleartext.is_some()
                 || matches!(plan.duplex.state(), duplex::State::Enabled)
             {
@@ -250,39 +248,14 @@ impl<'a> Types<'a> {
                 >
             };
             let build = |owned: bool| {
-                let (source, target) = if owned {
-                    (
-                        route::Source::Owned,
-                        quote!(#v_head.plan().route_path(#v_parsed.as_ref())),
-                    )
+                let target = if owned {
+                    quote!(#v_head.plan().route_path(#v_parsed.as_ref()))
                 } else {
-                    (
-                        route::Source::Borrowed,
-                        quote!(#v_head.plan().route_path(#v_input.as_slice())),
-                    )
+                    quote!(#v_head.plan().route_path(#v_input.as_slice()))
                 };
-                let emit = |index, params| {
-                    route::emit(paths, context, plan, index, params, &runtime, source)
-                };
-                let trie = spec
-                    .route_plan
-                    .compile(paths, &spec.state_generics, |index, parts| {
-                        let route = &routes[index].route;
-                        if spec.route_plan.has_params(index) {
-                            let call = emit(index, quote!(#n_raw));
-                            quote! {
-                                let #n_raw =
-                                    <<<#route as #ns_core::route::Spec>::Request
-                                        as #ns_core::route::Schema>::RawParams
-                                        as #ns_core::route::Params>::from_match(
-                                        #parts,
-                                    );
-                                #call
-                            }
-                        } else {
-                            emit(index, quote!(()))
-                        }
-                    });
+                let trie = spec.route_plan.compile(paths, symbols, |index, parts| {
+                    route::start(paths, context, plan, index, parts, owned)
+                });
                 quote! {
                     if let ::core::option::Option::Some(#n_target) = #target {
                         let #n_method = #v_method;
@@ -295,32 +268,25 @@ impl<'a> Types<'a> {
             let body = build(false);
             let line = build(true);
 
-            let heads = plan.continuations.head();
-            let failed = terminal::failed(paths, &context.plan.spec.state_generics);
-            let resume = context
-                .plan
-                .entries
-                .iter()
-                .enumerate()
+            let heads = &plan.head;
+            let resume = plan.heads()
                 .map(|(index, item)| {
-                    let variant = &item.pending_variant;
+                    let variant = &item.prepared;
                     let complete =
-                        route::complete(index, &context.plan.spec.state_generics, &v_routes);
+                        route::complete(index, &context.plan.spec.state_generics);
                     quote! {
-                        #heads::#variant(#v_wait) => match #v_wait.try_resume(
-                            #v_input,
-                            #v_permit,
-                            #heads::#variant,
-                            |#n_shead, #v_permit| {
-                                #complete
-                            },
-                        ) {
-                            ::core::result::Result::Ok(#v_result) => #v_result,
-                            ::core::result::Result::Err(#v_error) => {
-                                let mut #v_this = #v_routes.as_mut().project();
-                                #failed
+                        #heads::#variant(#v_wait) => {
+                            let #v_prior = #v_wait.len() as usize;
+                            match #v_wait.try_resume(#v_input, |#n_shead| #complete) {
+                                ::core::result::Result::Ok(::core::ops::ControlFlow::Continue(#v_result)) => #v_result,
+                                ::core::result::Result::Ok(::core::ops::ControlFlow::Break(#v_wait)) => {
+                                    #v_turn.await_head(#heads::#variant(#v_wait))
+                                }
+                                ::core::result::Result::Err(#v_error) => {
+                                    #v_turn.reject_head(#v_error.into_rejection())
+                                }
                             }
-                        },
+                        }
                     }
                 });
             let headers = quote!(match #v_wait { #( #resume )* });
@@ -340,9 +306,15 @@ impl<'a> Types<'a> {
         let duplex = plan.duplex.state();
         let edit = quote!((#v_link.state_mut()));
         let kind = plan.duplex.ty(paths, false);
-        let pending = plan.continuations.ty();
-        let ready = plan.continuations.ready_ty();
-        let partial = plan.continuations.head();
+        let continuation = &plan.continuation;
+        let pending = quote!(#continuation<'d, #g_id>);
+        let ready = if context.exec.fibers().is_empty() {
+            quote!(::core::convert::Infallible)
+        } else {
+            let built = &plan.ready_route;
+            quote!(#continuation<'d, #g_id, #built<'d>>)
+        };
+        let partial = &plan.head;
         let head = quote!(#partial);
         let bound = &routing.egress_bound;
         let rt = &routing.runtime;
@@ -387,20 +359,18 @@ impl<'a> Types<'a> {
                 #egress,
             >
         };
-        let owner = plan.continuations.route();
-        let heads = plan.continuations.bodies().map(|route| {
-            let variant = &route.pending_variant;
+        let owner = &plan.route;
+        let heads = plan.bodies().map(|route| {
+            let variant = &route.prepared;
             match route.mode {
                 serve::Mode::Fiber { .. } => quote!(#owner::#variant(_) => 0,),
-                serve::Mode::Sync
-                | serve::Mode::Stream { .. }
-                | serve::Mode::Duplex { .. } => {
+                serve::Mode::Sync | serve::Mode::Stream { .. } | serve::Mode::Duplex { .. } => {
                     quote!(#owner::#variant(ref #v_wait) => #v_wait.head_len(),)
                 }
             }
         });
-        let lengths = context.plan.entries.iter().map(|route| {
-            let variant = &route.pending_variant;
+        let lengths = plan.heads().map(|(_, route)| {
+            let variant = &route.prepared;
             quote!(#partial::#variant(#v_wait) => #v_wait.len(),)
         });
         let probe = quote! {

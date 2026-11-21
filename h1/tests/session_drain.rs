@@ -120,8 +120,7 @@ fn pump_ingress_allocations() {
 fn rejects_terminal_cursor() {
     for next in [
         session::Outcome::Complete {
-            permit: session::Permit::new(),
-            consumption: session::Consumption::Buffered(session::Buffered::new(usize::MAX)),
+            consumption: session::Consumption::Buffered(usize::MAX),
             response: output::Complete::Inline,
             connection: head::Connection::KeepAlive,
         },

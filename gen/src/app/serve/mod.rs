@@ -19,7 +19,6 @@ pub(in crate::app::serve) struct RouteSpec<'a, M> {
     pub(in crate::app::serve) entry: &'a spec::Entry,
     pub(in crate::app::serve) kind: spec::Kind,
     pub(in crate::app::serve) mode: M,
-    pending_variant: syn::Ident,
     prepared: syn::Ident,
     request: syn::Ident,
 }
@@ -36,7 +35,6 @@ impl<'a, M> RouteSpec<'a, M> {
             entry,
             kind,
             mode,
-            pending_variant: quote::format_ident!("R{index}"),
             prepared: quote::format_ident!("R{index:04}"),
             request: quote::format_ident!("__{}Request{index:04}", owner),
         }
@@ -292,13 +290,6 @@ impl<'spec> ProtocolPlan<'spec> {
                 RouteSpec::new(owner, index, entry, kind, mode)
             })
             .collect()
-    }
-
-    pub(in crate::app::serve) fn route(
-        &self,
-        index: usize,
-    ) -> Option<&RouteSpec<'spec, Mode<'spec>>> {
-        self.entries.get(index)
     }
 
     fn new(spec: &'spec spec::Spec) -> Self {

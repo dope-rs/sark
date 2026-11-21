@@ -225,10 +225,8 @@ impl Plan {
             let method = method.key_token(paths);
             quote!(#method => ::core::option::Option::Some(#state))
         });
-        let asterisk = machine
-            .asterisk
-            .iter()
-            .map(|(method, routes)| {
+        let asterisk = (!machine.asterisk.is_empty()).then(|| {
+            let methods = machine.asterisk.iter().map(|(method, routes)| {
                 let method = method.key_token(paths);
                 let bodies = routes.iter().map(|&index| {
                     let protocol = self.guard(index, &v_proto);
@@ -241,14 +239,19 @@ impl Plan {
                     }
                 });
                 quote!(#method => { #( #bodies )* })
-            })
-            .collect::<Vec<_>>();
-        let steps = machine.states.iter().enumerate().map(|(id, state)| {
-            let mut radix = radix::Radix::default();
-            for (literal, next) in &state.literals {
-                radix.insert(literal, *next);
+            });
+            quote! {
+                if #v_target == b"*" {
+                    match #v_method {
+                        #( #methods, )*
+                        _ => {}
+                    }
+                    break '__sark_route_match;
+                }
             }
-            let scan = radix.emit_scan(paths, generics, state.fallback);
+        });
+        let steps = machine.states.iter().enumerate().map(|(id, state)| {
+            let scan = radix::emit_scan(&state.literals, state.fallback, paths, generics);
             let capture = if state.fallback.is_some() {
                 let slot = slots[&state.depth];
                 quote! {
@@ -342,13 +345,7 @@ impl Plan {
 
         quote! {
             '__sark_route_match: {
-                if #v_target == b"*" {
-                    match #v_method {
-                        #( #asterisk, )*
-                        _ => {}
-                    }
-                    break '__sark_route_match;
-                }
+                #asterisk
                 #paths
             }
         }

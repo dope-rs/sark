@@ -1,20 +1,19 @@
 use o3::buffer::write::Slice;
 use std::{convert::Infallible, mem, ops::ControlFlow};
 
-use o3::buffer::storage;
 use sark_core::{manifold::task, route::guard};
 use sark_http::{
-    owner::{evidence, handoff, handoff::stage},
+    owner::{handoff, handoff::stage},
     payload::{
         compress::Compression,
         response::{dispatch, dispatch::Emit},
     },
 };
-use sink::{Mode, Sink, written::Written};
+use sink::{Mode, Sink};
 
 use crate::{
     route,
-    wire::{Failure, InputError, head, output, output::sink, response},
+    wire::{Failure, head, output, output::sink, response},
 };
 
 /// Writes response decisions into the caller-provided egress region.
@@ -37,11 +36,6 @@ impl<'a> Egress<'a> {
             input: (),
             response,
         }
-    }
-
-    pub(crate) fn with_context(mut self, response: response::Context) -> Self {
-        self.response = response;
-        self
     }
 
     pub fn try_route<'req, 'd: 'req, R>(
@@ -69,8 +63,16 @@ impl<'a> Egress<'a> {
         R: dispatch::Emit<'req, 'd, Kind = dispatch::Sync>,
     {
         let mode = Mode::new(policy.mode, self.response.coding(), gzip);
-        let sink = Sink::new(self.write, self.date, self.response, mode, slot).with_policy(policy);
-        Self::try_finish(reply.emit(sink).map_err(Failure::Output)?)
+        let sink = Sink::new(
+            self.write,
+            self.date,
+            self.response,
+            policy,
+            mode,
+            slot,
+            None::<Infallible>,
+        );
+        reply.emit(sink)
     }
 
     pub fn try_task<'d, R: sark_core::route::Task<'d, A> + route::PolicyOf, A>(
@@ -100,19 +102,20 @@ impl<'a> Egress<'a> {
             self.write,
             self.date,
             self.response.with_connection(conn),
+            R::POLICY,
             mode,
             handoff::Slot::ready(Some(id)),
-        )
-        .with_policy(R::POLICY);
-        let written = reply.emit(sink).map_err(Failure::Output)?;
+            Some(()),
+        );
+        let written = reply.emit(sink)?;
         <<R::Output as Emit<'d, 'd>>::Kind as dispatch::Dispatch>::fold::<
-            Sink<'_, 'd, 'd, (), Infallible, ()>,
+            Sink<'_, 'd, 'd, (), Infallible, (), ()>,
             task::response::Stream<'d, R, A>,
             _,
         >(
             written,
-            |written| Ok((Self::try_ready(written)?, None)),
-            |stream| Ok((output::Complete::Inline, stream)),
+            |ControlFlow::Continue(ready)| Ok((ready, None)),
+            |stream| Ok((output::Complete::Inline, stream.map(|((), stream)| stream))),
         )
     }
 
@@ -121,7 +124,7 @@ impl<'a> Egress<'a> {
         self,
         reply: S,
         policy: route::Policy,
-        admit: output::Admit<A>,
+        admit: Option<A>,
     ) -> Result<Option<(A, S::Stream)>, Failure>
     where
         'd: 'req,
@@ -136,61 +139,12 @@ impl<'a> Egress<'a> {
             self.write,
             self.date,
             self.response,
+            policy,
             mode,
             handoff::Slot::ready(None),
-        )
-        .with_policy(policy)
-        .with_admit(admit);
-        reply.emit(sink).map_err(Failure::Output)
-    }
-
-    fn try_ready<'input, 'd, H: Into<crate::Input<'input>>>(
-        written: Written<'d, Infallible, H>,
-    ) -> Result<output::Complete<'d>, Failure> {
-        let ControlFlow::Continue(ready) = Self::try_finish(written)?;
-        Ok(ready)
-    }
-
-    fn try_finish<'input, 'd, P, H: Into<crate::Input<'input>>>(
-        written: Written<'d, P, H>,
-    ) -> Result<ControlFlow<P, output::Complete<'d>>, Failure> {
-        use output::Complete;
-        let ready = match written {
-            Written::Inline { copy } => Complete::Copy { copy },
-            Written::Compressed { body, read } => Complete::Compressed { body, read },
-            Written::RequestBody { body } => return Ok(ControlFlow::Break(body)),
-            Written::Head { input } => match input.into() {
-                crate::Input::Borrowed(bytes) => Complete::Owned {
-                    body: storage::Shared::try_copy(bytes)
-                        .map_err(|error| Failure::Input(InputError::Storage(error)))?,
-                    cause: evidence::Cause::Borrowed,
-                },
-                crate::Input::Buffered(view) => Complete::Shared {
-                    body: view
-                        .try_retain()
-                        .map_err(|error| Failure::Input(InputError::Share(error)))?,
-                },
-            },
-            Written::Body { body } => match body {
-                handoff::Ready::Empty => Complete::Inline,
-                handoff::Ready::Owned(mut body) => Complete::Shared {
-                    body: storage::Shared::try_from(&mut body)
-                        .map_err(|error| Failure::Output(output::Error::Allocation(error)))?,
-                },
-                handoff::Ready::Copied(body) => {
-                    let (body, copy) = body.into_parts();
-                    Complete::Owned {
-                        body,
-                        cause: copy.cause,
-                    }
-                }
-                handoff::Ready::Retained(body) => Complete::Shared { body },
-                handoff::Ready::Segmented(body) => Complete::Segments { body },
-                handoff::Ready::Linked(body) => Complete::Linked { body },
-                handoff::Ready::Fixed(body) => Complete::Static { body },
-            },
-        };
-        Ok(ControlFlow::Continue(ready))
+            admit,
+        );
+        reply.emit(sink)
     }
 }
 
@@ -222,10 +176,17 @@ impl<'input, 'req, 'd: 'req> guard::Reject<'req, 'd> for Egress<'_, crate::Input
             self.write,
             self.date,
             self.response.with_connection(head::Connection::Close),
+            route::Policy::new(
+                route::Mode::Plain,
+                sark_http::h1::head::response::Date::Include,
+                sark_http::h1::head::response::Server::Include,
+            ),
             Mode::<()>::Plain,
             slot,
+            None::<Infallible>,
         );
-        Egress::try_ready(response.complete(sink).map_err(Failure::Output)?)
+        let ControlFlow::Continue(ready) = response.complete(sink)?;
+        Ok(ready)
     }
 }
 

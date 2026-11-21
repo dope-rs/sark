@@ -2,14 +2,15 @@ use crate::common::h1::fields;
 pub mod common;
 
 use sark_core::{
-    request::{self, field, raw},
+    body::{Discarded, Project as _},
+    request::{field, raw},
     route::{
         self, Project, Schema,
         field::query::{self, Fields as _},
     },
 };
 use sark_fiber::request::Head;
-use sark_http::request::{Form, Layout, body, span::Span};
+use sark_http::request::{Form, Layout, span::Span};
 
 use crate::common::route::glue::{
     Ordered, OrderedHeadersRaw, QueryReq, QueryReqHeadersRaw, QueryReqIdentity,
@@ -33,9 +34,7 @@ fn parses_unordered_query() {
     // SAFETY: QueryReq parsed these fields from this exact input;
     // its generated parameter schema is the empty tuple.
     let raw = unsafe { raw::Parsed::<_, QueryReq>::new(owner, (), headers) };
-    let headers = <QueryReq as Project>::from_headers(&raw).expect("query headers");
-    let view = request::View::from_head(raw.into_owner(), body::Ref::from_slice(&[]));
-    let request = <QueryReq as Project>::from_parts((), headers, (), &view);
+    let request = <QueryReq as Project>::try_view(&raw, Discarded::empty()).expect("query request");
     assert_eq!((request.count, request.limit, request.flag), (41, 7, true));
 }
 
@@ -57,9 +56,7 @@ fn parses_ordered_query() {
     // SAFETY: Ordered parsed these fields from this exact input;
     // its generated parameter schema is the empty tuple.
     let raw = unsafe { raw::Parsed::<_, Ordered>::new(owner, (), headers) };
-    let headers = <Ordered as Project>::from_headers(&raw).expect("query headers");
-    let view = request::View::from_head(raw.into_owner(), body::Ref::from_slice(&[]));
-    let request = <Ordered as Project>::from_parts((), headers, (), &view);
+    let request = <Ordered as Project>::try_view(&raw, Discarded::empty()).expect("query request");
     assert_eq!((request.count, request.limit), (41, 7));
 }
 

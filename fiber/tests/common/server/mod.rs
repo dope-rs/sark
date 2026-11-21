@@ -97,6 +97,17 @@ impl Plan {
         (pair, plan)
     }
 
+    pub fn serve<A: Serve<(), Input = receive::Coupled, Config = Config>>(
+        client: impl FnOnce(net::SocketAddr),
+    ) {
+        let (pair, plan) = Self::isolated();
+        pair.run(
+            |context, listener| try_serve::<A, _>(plan, context, listener, (), MAX_CONNECTIONS),
+            client,
+        )
+        .expect("H1 test server");
+    }
+
     /// Observes retirement against this server's resolved descriptor allocation.
     pub fn try_reports(plan: &impl settings::Resource) -> Result<Reports<1>, errors::Claim> {
         Ok(Reports::new(

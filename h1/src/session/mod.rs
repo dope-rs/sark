@@ -2,7 +2,6 @@
 use core::{convert::Infallible, pin};
 use o3::buffer::{Complete as _, hold, write::Slice};
 
-use o3::buffer::storage::range;
 use sark_core::life::{self, exchange, sequence};
 use sark_http::{
     h1::field::expect,
@@ -11,7 +10,7 @@ use sark_http::{
 
 use crate::{
     switch,
-    wire::{InputError, head, output, parsing},
+    wire::{head, output, parsing},
 };
 
 mod conn;
@@ -19,13 +18,8 @@ mod drive;
 mod ingress;
 
 pub use conn::Conn;
+pub use drive::{Flow, Turn};
 pub use ingress::Ingress;
-
-#[derive(Clone, Copy, PartialEq, Eq)]
-pub enum NeedMore {
-    Head,
-    Line,
-}
 
 /// Framing proof attached to a route suspended for body input.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -37,36 +31,14 @@ impl BodyAwait {
     pub(crate) const fn new(used: usize) -> Self {
         Self { consumed: used }
     }
-
-    pub(super) const fn consumed(self) -> usize {
-        self.consumed
-    }
 }
 
 pub enum Consumption {
-    Buffered(Buffered),
+    Buffered(usize),
     Discard(Discarded),
 }
 
 const _: () = assert!(core::mem::size_of::<Consumption>() == 3 * core::mem::size_of::<usize>());
-
-/// Buffered request bytes consumed by a protocol switch.
-#[derive(Clone, Copy)]
-pub struct Buffered {
-    used: usize,
-}
-
-impl Buffered {
-    pub const fn new(used: usize) -> Self {
-        Self { used }
-    }
-
-    pub(super) const fn used(self) -> usize {
-        self.used
-    }
-}
-
-const _: () = assert!(core::mem::size_of::<Buffered>() == core::mem::size_of::<usize>());
 
 /// Validated head and body bytes discarded from one request frame.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -79,64 +51,12 @@ impl Discarded {
     pub(crate) const fn new(head: usize, body: usize) -> Self {
         Self { head, body }
     }
-
-    pub(crate) const fn head(self) -> usize {
-        self.head
-    }
-
-    pub(crate) const fn body(self) -> usize {
-        self.body
-    }
 }
 
 const _: () = assert!(core::mem::size_of::<Discarded>() == 2 * core::mem::size_of::<usize>());
 
-/// Linear permission for exactly one synchronous dispatch.
-pub struct Permit {
-    proof: (),
-}
-
-impl Permit {
-    pub const fn new() -> Self {
-        Self { proof: () }
-    }
-
-    pub(crate) fn defer(self) {
-        let Self { proof: () } = self;
-    }
-
-    pub(crate) fn commit(self) {
-        let Self { proof: () } = self;
-    }
-
-    pub(crate) fn switch<'d, D>(
-        self,
-        next: switch::Transition<D>,
-        buffered: Buffered,
-        response: output::Switch<'d>,
-    ) -> Outcome<'d, D> {
-        let Self { proof: () } = self;
-        Outcome::Switch {
-            next,
-            buffered,
-            response,
-        }
-    }
-}
-
-impl Default for Permit {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 pub enum Outcome<'d, D = Infallible> {
-    NeedMore {
-        permit: Permit,
-        state: NeedMore,
-    },
     Complete {
-        permit: Permit,
         consumption: Consumption,
         response: output::Complete<'d>,
         connection: head::Connection,
@@ -144,7 +64,7 @@ pub enum Outcome<'d, D = Infallible> {
     /// Switching response paired with its affine raw owner.
     Switch {
         next: switch::Transition<D>,
-        buffered: Buffered,
+        consumed: usize,
         response: output::Switch<'d>,
     },
     Streamed {
@@ -160,6 +80,13 @@ pub enum Outcome<'d, D = Infallible> {
 }
 
 impl<D> Outcome<'_, D> {
+    pub const fn park(consumed: usize, response: crate::wire::response::Context) -> Self {
+        Self::Park {
+            consumed,
+            close: response.connection(),
+        }
+    }
+
     pub fn settle<const AT_HEAD: bool, C: Copy, M: sequence::Mode<C>>(
         &self,
         mode: &mut M,
@@ -167,16 +94,12 @@ impl<D> Outcome<'_, D> {
         id: exchange::Id<C, u64>,
     ) {
         match self {
-            Self::Complete { .. } | Self::Switch { .. } => {
+            Self::Complete { response, .. } => response.finish::<AT_HEAD, _, _>(mode, session, id),
+            Self::Switch { .. } => {
                 if AT_HEAD {
                     mode.observe(life::Event::InputFinished(id));
                 }
-                if let Self::Complete { response, .. } = self {
-                    response.observe_copy(mode.observer(), id);
-                    response.commit_retention(mode, session, id);
-                } else {
-                    mode.commit(session, id, 0, hold::Charge::default());
-                }
+                mode.commit(session, id, 0, hold::Charge::default());
                 id.retire(mode, life::Outcome::Completed);
             }
             Self::Park { .. } | Self::Streamed { .. } => {
@@ -195,22 +118,13 @@ impl<D> Outcome<'_, D> {
                     id.retire(mode, life::Outcome::Rejected);
                 }
             }
-            Self::NeedMore { .. } => {}
         }
     }
 }
 
 /// Result of the only routing pass for a request head.
-pub enum RouteOutcome<'d, P, D = Infallible, H = Infallible, Rejected = Infallible> {
+pub enum RouteOutcome<'d, P, D = Infallible> {
     Outcome(Outcome<'d, D>),
-    AwaitReject {
-        permit: Permit,
-        pending: Rejected,
-    },
-    AwaitHead {
-        permit: Permit,
-        pending: H,
-    },
     AwaitBody {
         state: BodyAwait,
         expectation: expect::Decision,
@@ -218,78 +132,10 @@ pub enum RouteOutcome<'d, P, D = Infallible, H = Infallible, Rejected = Infallib
     },
 }
 
-impl<'d, P, D, H, Rejected> From<Outcome<'d, D>> for RouteOutcome<'d, P, D, H, Rejected> {
+impl<'d, P, D> From<Outcome<'d, D>> for RouteOutcome<'d, P, D> {
     fn from(ready: Outcome<'d, D>) -> Self {
         Self::Outcome(ready)
     }
-}
-
-impl<'d, P, D> RouteOutcome<'d, P, D> {
-    pub fn with_head<H, Rejected>(self) -> RouteOutcome<'d, P, D, H, Rejected> {
-        match self {
-            Self::Outcome(outcome) => RouteOutcome::Outcome(outcome),
-            Self::AwaitBody {
-                state,
-                expectation: expect,
-                pending,
-            } => RouteOutcome::AwaitBody {
-                state,
-                expectation: expect,
-                pending,
-            },
-            Self::AwaitHead { pending, .. } => match pending {},
-            Self::AwaitReject { pending, .. } => match pending {},
-        }
-    }
-}
-
-impl<'d, P, D, H, Rejected> RouteOutcome<'d, P, D, H, Rejected> {
-    pub(crate) fn after_line(self, prior: usize) -> Self {
-        match self {
-            Self::AwaitHead { .. } | Self::AwaitReject { .. } => self,
-            outcome => outcome.after_head(prior),
-        }
-    }
-
-    pub(crate) fn after_head(mut self, prior: usize) -> Self {
-        let result = match &mut self {
-            Self::Outcome(Outcome::Complete {
-                consumption: frame,
-                connection: conn,
-                ..
-            }) => match frame {
-                Consumption::Buffered(buffered)
-                    if buffered.used == 0 && *conn == head::Connection::Close =>
-                {
-                    Ok(())
-                }
-                Consumption::Buffered(buffered) => subtract_head(&mut buffered.used, prior),
-                Consumption::Discard(frame) => subtract_head(&mut frame.head, prior),
-            },
-            Self::Outcome(Outcome::Switch { buffered, .. }) => {
-                subtract_head(&mut buffered.used, prior)
-            }
-            Self::Outcome(Outcome::Streamed { consumed, .. } | Outcome::Park { consumed, .. }) => {
-                subtract_head(consumed, prior)
-            }
-            Self::AwaitBody { state, .. } => subtract_head(&mut state.consumed, prior),
-            Self::Outcome(Outcome::Close(_) | Outcome::Failed(_)) => Ok(()),
-            Self::Outcome(Outcome::NeedMore { .. })
-            | Self::AwaitHead { .. }
-            | Self::AwaitReject { .. } => Err(crate::wire::Failure::BadRequest),
-        };
-        match result {
-            Ok(()) => self,
-            Err(error) => Self::Outcome(Outcome::Failed(error)),
-        }
-    }
-}
-
-fn subtract_head(used: &mut usize, prior: usize) -> Result<(), crate::wire::Failure> {
-    *used = used.checked_sub(prior).ok_or_else(|| {
-        crate::wire::Failure::Input(InputError::Range(range::Error::new(0..prior, *used)))
-    })?;
-    Ok(())
 }
 
 /// Terminal body framing counts.
@@ -305,7 +151,9 @@ pub enum BodyOutcome<'d, P, D = Infallible> {
 }
 
 /// Static dispatch seam between the protocol and generated router.
-pub trait Dispatch<'d, Runtime, Pending = (), Transitions: switch::Engine = switch::Disabled> {
+pub trait Dispatch<'d, Runtime, Pending = (), Transitions: switch::Engine = switch::Disabled>:
+    Sized
+{
     type Ready;
     type Head;
 
@@ -315,19 +163,6 @@ pub trait Dispatch<'d, Runtime, Pending = (), Transitions: switch::Engine = swit
     }
 
     fn reject_head(self: pin::Pin<&mut Self>, _: &mut Runtime) {}
-
-    fn reject_line(
-        mut self: pin::Pin<&mut Self>,
-        _: Permit,
-        runtime: &mut Runtime,
-        error: parsing::Rejection<'d>,
-    ) -> fixed::Body<'d> {
-        self.as_mut().reject_head(runtime);
-        match error {
-            parsing::Rejection::Close(reply) => reply,
-            parsing::Rejection::Failed(cause) => self.failure(&cause),
-        }
-    }
 
     /// Settles a framing failure while ingress still owns its pending route.
     /// Implementations with route accounting must cancel it before resetting ingress.
@@ -341,57 +176,24 @@ pub trait Dispatch<'d, Runtime, Pending = (), Transitions: switch::Engine = swit
     }
 
     fn try_consume(
-        self: pin::Pin<&mut Self>,
-        permit: Permit,
         input: crate::Input<'_>,
-        write: Slice<'_, &mut usize>,
-        conn: &mut Conn<'d, Runtime, Pending, Transitions, Self::Ready, Self::Head>,
-    ) -> RouteOutcome<'d, Pending, Transitions::Raw, Self::Head, parsing::Rejected<'d>>;
+        turn: &mut Turn<'_, '_, 'd, Runtime, Pending, Transitions, Self>,
+        prior: usize,
+    ) -> Flow;
 
     fn consume_line(
-        self: pin::Pin<&mut Self>,
-        permit: Permit,
         source: parsing::Source,
-        write: Slice<'_, &mut usize>,
-        conn: &mut Conn<'d, Runtime, Pending, Transitions, Self::Ready, Self::Head>,
-    ) -> RouteOutcome<'d, Pending, Transitions::Raw, Self::Head, parsing::Rejected<'d>> {
+        turn: &mut Turn<'_, '_, 'd, Runtime, Pending, Transitions, Self>,
+        prior: usize,
+    ) -> Flow {
         let source = source.freeze();
-        self.try_consume(permit, crate::Input::Buffered(source.view()), write, conn)
+        Self::try_consume(crate::Input::Buffered(source.view()), turn, prior)
     }
 
     fn resume_head(
-        self: pin::Pin<&mut Self>,
         pending: Self::Head,
-        permit: Permit,
-        input: crate::Input<'_>,
-        write: Slice<'_, &mut usize>,
-        conn: &mut Conn<'d, Runtime, Pending, Transitions, Self::Ready, Self::Head>,
-    ) -> RouteOutcome<'d, Pending, Transitions::Raw, Self::Head, parsing::Rejected<'d>>;
-
-    fn reject_if_terminal(
-        self: pin::Pin<&mut Self>,
-        runtime: &mut Runtime,
-        result: &RouteOutcome<'d, Pending, Transitions::Raw, Self::Head, parsing::Rejected<'d>>,
-    ) {
-        if matches!(
-            result,
-            RouteOutcome::Outcome(Outcome::Close(_) | Outcome::Failed(_))
-        ) {
-            self.reject_head(runtime);
-        }
-    }
-
-    fn resume_rejection(
-        self: pin::Pin<&mut Self>,
-        pending: parsing::Rejected<'d>,
-        permit: Permit,
-        input: crate::Input<'_>,
-        runtime: &mut Runtime,
-    ) -> RouteOutcome<'d, Pending, Transitions::Raw, Self::Head, parsing::Rejected<'d>> {
-        let result = pending.resume(input, permit);
-        self.reject_if_terminal(runtime, &result);
-        result
-    }
+        turn: &mut Turn<'_, '_, 'd, Runtime, Pending, Transitions, Self>,
+    ) -> Flow;
 
     fn body_data(
         self: pin::Pin<&mut Self>,
@@ -414,7 +216,6 @@ pub trait Dispatch<'d, Runtime, Pending = (), Transitions: switch::Engine = swit
         self: pin::Pin<&mut Self>,
         pending: Pending,
         complete: Complete,
-        permit: Permit,
         write: Slice<'_, &mut usize>,
         runtime: &mut Runtime,
     ) -> BodyOutcome<'d, Self::Ready, Transitions::Raw>;
@@ -422,7 +223,6 @@ pub trait Dispatch<'d, Runtime, Pending = (), Transitions: switch::Engine = swit
     fn resume_body(
         self: pin::Pin<&mut Self>,
         ready: Self::Ready,
-        permit: Permit,
         write: Slice<'_, &mut usize>,
         runtime: &mut Runtime,
     ) -> BodyOutcome<'d, Self::Ready, Transitions::Raw>;

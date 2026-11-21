@@ -57,6 +57,12 @@ impl<'a> Input<'a> {
         }
     }
 
+    pub(crate) fn try_retain_prefix(self, len: usize) -> Result<storage::Shared, InputError> {
+        self.try_get(0..len)
+            .map_err(InputError::Range)?
+            .try_retain()
+    }
+
     pub(crate) fn try_head(self, len: NonZero<u32>) -> Result<storage::Shared, InputError> {
         use crate::wire::body::ingress;
 
